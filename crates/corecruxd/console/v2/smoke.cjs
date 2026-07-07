@@ -1242,14 +1242,23 @@ function extractThemeVars(theme) {
   global.document = { createElement: mkEl, createElementNS: function (ns, tag) { return mkEl(tag); }, createTextNode: function (t) { return { nodeType: 3, textContent: String(t), childNodes: [] }; } };
   global.window = { CruxApi: { get: function () { return new Promise(function () { /* daemon hang — never resolves */ }); } } };
   try {
+    // (M14) #/documents with no docId lands on the corpus tile canvas — its
+    // zero-network base set (reference docs + Explorer) must paint before any
+    // fetch resolves, preserving the daemon-hang guarantee for the landing.
     const host = mkEl('div');
     const rail = mkEl('nav');
     render.renderDocuments(host, { summary: null, docId: null, railHost: rail });
-    // SYNCHRONOUS assertions — the reader must exist before any fetch resolves.
-    check(host.querySelectorAll('.doc-main').length === 1, '[documents] renderDocuments must paint a .doc-main synchronously (daemon-hang case)');
-    check(host.querySelectorAll('.doc-reader').length === 1, '[documents] renderDocuments must paint the reader synchronously');
-    check(rail.querySelectorAll('.nav-item').length >= 3, '[documents] renderDocuments must populate the Explore rail synchronously (Explorer + surface pages, >=3 nav-items)');
-    notes.push('documents reader (M11): renderDocuments paints .doc-main + a >=3-item Explore rail (Explorer + surface Pages, Command .nav-item style) synchronously under a never-resolving daemon. Docs/corpora reached via Explorer results, not the menu.');
+    check(host.querySelectorAll('.doc-reader').length === 1, '[documents] renderDocuments must paint the reader shell synchronously');
+    check(host.querySelectorAll('.cvx-surface').length === 1, '[documents] the #/documents landing must paint the corpus tile canvas synchronously (M14)');
+    check(host.querySelectorAll('.cvx-node').length >= 4, '[documents] the corpus canvas must paint its zero-network tiles synchronously (reference docs + Explorer)');
+    check(rail.querySelectorAll('.nav-item').length >= 3, '[documents] renderDocuments must populate the Explore rail synchronously (Canvas + Explorer + surface pages, >=3 nav-items)');
+    // The 3-zone reader stays intact for explicit reader docs (M11 guarantee).
+    const host2 = mkEl('div');
+    const rail2 = mkEl('nav');
+    render.renderDocuments(host2, { summary: null, docId: 'proof', railHost: rail2 });
+    check(host2.querySelectorAll('.doc-main').length === 1, '[documents] renderDocuments must still paint a .doc-main synchronously for reader docs (daemon-hang case)');
+    check(host2.querySelectorAll('.doc-reader').length === 1, '[documents] renderDocuments must paint the reader synchronously for reader docs');
+    notes.push('documents (M11+M14): #/documents lands on the corpus tile canvas (zero-network tiles paint synchronously); reader docs still paint .doc-main + a >=3-item Explore rail under a never-resolving daemon. Docs/corpora reached via tiles + Explorer results.');
   } catch (e) {
     check(false, '[documents] renderDocuments threw on the synchronous paint: ' + e.message);
   } finally {
@@ -1727,13 +1736,94 @@ function extractThemeVars(theme) {
   }
 })();
 
+// =========================================================================
+//  Check 40 — (M14) WebCrux tile canvas port. The canvas tile pattern from
+//  WebCrux-aurora (useCanvasState/CanvasView/CanvasNode; grammar per
+//  Unified-Web-Direction §07 + Aurora-Spec-2026-07-07) is the Canvas board and
+//  the Documents landing. (a) The pure grid/state engine is exported: tileSnap
+//  rounds to the 20px grid; TILE_SIZE_MAP carries the four shapes × four sizes
+//  (hero-lg 600×320); tileAutoLayout is deterministic, never overlaps tiles,
+//  and preserves manual positions verbatim. (b) The measured interaction
+//  grammar ships in shell.html CSS: cubic-bezier(.16,1,.3,1) easing, entry
+//  scale(.92)+8px rise over .4s, exit .25s (.cvx-leave), hover −3px lift,
+//  sibling dim blur(18px) saturate(.2) opacity .15, 20px snap-grid dots, a
+//  reduced-motion fallback that drops the dim blur. (c) Pan mechanics: shared
+//  4px deadzone, auto-pan target {20,20}, layer transition off while panning.
+//  (d) Wiring: renderCanvasBoard renders the widget registry as tiles;
+//  renderDocCanvas is the documents corpus canvas; the form/stack view kicks
+//  in under 640px.
+// =========================================================================
+(function checkTileCanvas() {
+  // (a) Pure engine exports.
+  check(typeof render.tileSnap === 'function', '[tiles] render.js must export the pure tileSnap(v)');
+  if (typeof render.tileSnap === 'function') {
+    check(render.tileSnap(23) === 20 && render.tileSnap(31) === 40 && render.tileSnap(0) === 0 && render.tileSnap(-9) === 0,
+      '[tiles] tileSnap must round to the 20px grid');
+  }
+  const sm = render.TILE_SIZE_MAP;
+  check(!!sm && !!sm.square && !!sm.wide && !!sm.tall && !!sm.hero, '[tiles] TILE_SIZE_MAP must carry square/wide/tall/hero');
+  check(!!sm && ['sm', 'md', 'lg', 'xl'].every(function (s) { return sm.hero[s] && sm.hero[s].w > 0; }),
+    '[tiles] each TILE_SIZE_MAP shape must carry sm/md/lg/xl');
+  check(!!sm && sm.hero.lg.w === 600 && sm.hero.lg.h === 320, '[tiles] TILE_SIZE_MAP hero.lg must be 600×320 (the WebCrux anchor)');
+  check(typeof render.tileAutoLayout === 'function', '[tiles] render.js must export the pure tileAutoLayout');
+  if (typeof render.tileAutoLayout === 'function') {
+    const sample = [
+      { id: 'a', shape: 'hero', size: 'lg' }, { id: 'b', shape: 'wide', size: 'md' },
+      { id: 'c', shape: 'square', size: 'md' }, { id: 'd', shape: 'tall', size: 'md' },
+      { id: 'e', shape: 'square', size: 'sm' }
+    ];
+    const p1 = render.tileAutoLayout(sample, undefined);
+    const p2 = render.tileAutoLayout(sample, undefined);
+    check(JSON.stringify(p1) === JSON.stringify(p2), '[tiles] tileAutoLayout must be deterministic (same input → same layout)');
+    const ids = Object.keys(p1);
+    check(ids.length === sample.length, '[tiles] tileAutoLayout must place every card');
+    let overlap = false;
+    for (let i = 0; i < ids.length; i++) {
+      for (let j = i + 1; j < ids.length; j++) {
+        const a = p1[ids[i]], b = p1[ids[j]];
+        if (a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h) { overlap = true; }
+      }
+    }
+    check(!overlap, '[tiles] tileAutoLayout must never overlap tiles');
+    const p3 = render.tileAutoLayout(sample, { c: { x: 400, y: 220, manual: true } });
+    check(p3.c && p3.c.x === 400 && p3.c.y === 220 && p3.c.manual === true,
+      '[tiles] manual positions must be preserved verbatim (auto tiles re-flow around them)');
+  }
+  // (b) The measured grammar in shell.html CSS.
+  check(/cubic-bezier\(\.16,\s*1,\s*\.3,\s*1\)/.test(shellHtml), '[tiles] shell.html must ease the canvas on cubic-bezier(.16,1,.3,1)');
+  check(/scale\(\.92\) translateY\(8px\)/.test(shellHtml), '[tiles] tile entry must rise from scale(.92)+8px');
+  check(/cvx-enter \.4s/.test(shellHtml), '[tiles] tile entry must run .4s');
+  check(/cvx-leave\b/.test(shellHtml) && /opacity \.25s ease, transform \.25s ease/.test(shellHtml),
+    '[tiles] tile exit must run .25s (.cvx-leave)');
+  check(/blur\(18px\) saturate\(\.2\)/.test(shellHtml) && /\.cvx-node\.cvx-dim\s*\{[^}]*opacity:\s*\.15/.test(shellHtml),
+    '[tiles] sibling dim must be blur(18px) saturate(.2) opacity .15 (the measured grammar)');
+  check(/translateY\(-3px\)/.test(shellHtml), '[tiles] tile hover lift must be −3px (shared with Aurora cards)');
+  check(/\.cvx-grid\s*\{[^}]*background-size:\s*20px 20px/.test(shellHtml), '[tiles] the snap-grid dots must be 20px cells');
+  check(/prefers-reduced-motion[^}]*\}[\s\S]*\.cvx-node\.cvx-dim\s*\{\s*filter:\s*none/.test(shellHtml) || /\.cvx-node\.cvx-dim\s*\{\s*filter:\s*none;\s*opacity:\s*\.3/.test(shellHtml),
+    '[tiles] reduced motion must drop the dim blur (context stays readable)');
+  // (c) Pan mechanics in render.js.
+  check(/TILE_PAN_DEAD_ZONE = 4/.test(renderSrc), '[tiles] the pan/drag deadzone must be 4px');
+  check(/TILE_PAN_TARGET = \{ x: 20, y: 20 \}/.test(renderSrc), '[tiles] the expand auto-pan target must be {20,20}');
+  check(/\.cvx-surface\.cvx-panning \.cvx-layer\s*\{\s*transition:\s*none/.test(shellHtml),
+    '[tiles] the layer transition must switch off while actively panning');
+  check(/Math\.min\(0, pan\.px \+ dx\)/.test(renderSrc), '[tiles] manual pan must clamp the translate ≤ 0 (pan right/down only)');
+  // (d) Wiring: board + documents + the form stack.
+  const boardBody = funcBody(renderSrc, 'renderCanvasBoard') || '';
+  check(/renderTileCanvas\(/.test(boardBody), '[tiles] renderCanvasBoard must render the widget registry on the tile canvas');
+  check(/function renderDocCanvas/.test(renderSrc), '[tiles] render.js must define renderDocCanvas (the documents corpus canvas)');
+  check(/TILE_FORM_BREAK = 640/.test(renderSrc) && /function renderTileStack/.test(renderSrc),
+    '[tiles] the form/stack view must kick in under 640px (renderTileStack)');
+  check(/grid-template-columns:\s*repeat\(12, 1fr\)/.test(shellHtml), '[tiles] the form view must be a 12-col grid (PageView port)');
+  notes.push('tile canvas (M14): WebCrux grammar ported — 20px snap grid + SIZE_MAP + deterministic onion-layer auto-layout (pure, unit-tested), 4px-deadzone pan + {20,20} auto-pan, sibling dim blur(18px)/saturate(.2)/opacity(.15), entry .4s / exit .25s on cubic-bezier(.16,1,.3,1), hover −3px, form stack <640px; board = widget registry as tiles, documents landing = corpus canvas.');
+})();
+
 // ---- Report -------------------------------------------------------------
-console.log('unified-shell-console v2 — M13b (live mutation wiring) smoke');
+console.log('unified-shell-console v2 — M14 (WebCrux tile canvas) smoke');
 notes.forEach(function (n) { console.log('  · ' + n); });
 if (failures.length) {
   console.error('\nFAIL (' + failures.length + '):');
   failures.forEach(function (f) { console.error('  ✗ ' + f); });
   process.exit(1);
 }
-console.log('\nPASS — all gates green (26/26 ids incl. pill:false landing-render + 4 Pro-ported legacy pages, control coverage, theme contrast, posture gate, no external deps, through-client fetches, gated-mutations audit, posture derivation, engine mediation, PWA manifest, service worker, phone tier, demo-mode gating, unified buttons, collapsible rail, status pill + chips, charts, board strips, nav-family consolidation + rail-at-rest-borderless, projects disclosure + repo grid, topbar chip height, legacy LED toggle + squarer topbar chips + list-row language, M8 mode system + posture-independence, M8 legacy port-checklist integrity, M9 canvas board (canvasTier + widget registry), M9 canvas graph (real-edge-only model + focus parser + launch points), M10 documents mode (3-mode reader + ~72ch measure + evidence panel + real sources + demo Proof fixture + deep-link-out auto-switch), M10 legacy retirement (retired_at + fallback copy + console.rs DEPRECATED comment), M12 11-surface JSX port (DOC_SURFACES + JSX_PORT + rail nav + #/documents/<id> routes + real-vs-demo honesty), M13a safe control parity + native workbench port (CONTROL_DIFF covers all 26 CX pages; cx-workbench loads /v1/workbench/contract + 5 GET read tools via a GET-only self-loader), M13b live mutation wiring (19 write controls live behind the guard harness — operatorGatedCall→CruxApiGated + bound-passport Art.14 refusal + confirm dialog on the destructive/spend subset + real receipt; 22 curated GATED_MUTATIONS; 8 controls stay operator-gated + disabled for documented ungroundable/invariant reasons; customer posture hides AND refuses every write)).');
+console.log('\nPASS — all gates green (26/26 ids incl. pill:false landing-render + 4 Pro-ported legacy pages, control coverage, theme contrast, posture gate, no external deps, through-client fetches, gated-mutations audit, posture derivation, engine mediation, PWA manifest, service worker, phone tier, demo-mode gating, unified buttons, collapsible rail, status pill + chips, charts, board strips, nav-family consolidation + rail-at-rest-borderless, projects disclosure + repo grid, topbar chip height, legacy LED toggle + squarer topbar chips + list-row language, M8 mode system + posture-independence, M8 legacy port-checklist integrity, M9 canvas board (canvasTier + widget registry), M9 canvas graph (real-edge-only model + focus parser + launch points), M10 documents mode (3-mode reader + ~72ch measure + evidence panel + real sources + demo Proof fixture + deep-link-out auto-switch), M10 legacy retirement (retired_at + fallback copy + console.rs DEPRECATED comment), M12 11-surface JSX port (DOC_SURFACES + JSX_PORT + rail nav + #/documents/<id> routes + real-vs-demo honesty), M13a safe control parity + native workbench port (CONTROL_DIFF covers all 26 CX pages; cx-workbench loads /v1/workbench/contract + 5 GET read tools via a GET-only self-loader), M13b live mutation wiring (19 write controls live behind the guard harness — operatorGatedCall→CruxApiGated + bound-passport Art.14 refusal + confirm dialog on the destructive/spend subset + real receipt; 22 curated GATED_MUTATIONS; 8 controls stay operator-gated + disabled for documented ungroundable/invariant reasons; customer posture hides AND refuses every write), M14 WebCrux tile canvas (pure 20px-grid engine + onion-layer auto-layout + measured interaction grammar CSS + board-as-tiles + documents corpus canvas + <640px form stack)).');
 process.exit(0);

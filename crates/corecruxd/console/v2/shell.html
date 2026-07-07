@@ -1406,35 +1406,194 @@
   /* ---- Canvas (M9) — size-adaptive board + relation graph ---------------
      The board is a CSS-grid of self-contained cells (auto-fill + span classes);
      the tier (xs/s/m/l/xl) is picked by the pure canvasTier() and drives which
-     widgets appear — a 4K+ viewport fills the full board. No animated reflow:
-     recompose is instant (reduced-motion-safe). The graph is a no-dependency
-     inline SVG with drag-pan + wheel-zoom; every node colour is a theme token. */
+     widgets appear — a 4K+ viewport fills the full board. The board itself is
+     the WebCrux tile canvas (M14, .cvx-* below): onion-layer tiles you drag,
+     pan, and expand in place. The graph is a no-dependency inline SVG with
+     drag-pan + wheel-zoom; every node colour is a theme token. */
   .canvas-region { display: flex; flex-direction: column; gap: 16px; }
   .canvas-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   .canvas-seg { flex: none; }
-  .canvas-board {
-    display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-    gap: 14px; align-items: start; grid-auto-flow: row dense;
+  /* ---- WebCrux tile canvas (M14) — §07 interaction grammar, ported ------- */
+  /* The measured values ARE the spec: easing cubic-bezier(.16,1,.3,1)
+     everywhere; entry scale(.92)+8px rise .4s (70ms stagger) · exit .25s;
+     hover lift −3px; sibling dim blur(18px) saturate(.2) opacity .15; 20px
+     snap-grid dots; form/stack breakpoints 768/640. Every colour resolves to a
+     theme token — the three themes restyle the canvas wholesale. */
+  .cvx-board { min-width: 0; }
+  .cvx-board-meta { margin-top: 8px; }
+  .cvx-surface {
+    position: relative; overflow: hidden; cursor: grab;
+    height: calc(100vh - 210px); min-height: 540px;
+    border-radius: var(--radius);
   }
-  .canvas-cell {
-    padding: 16px 18px; border: 1px solid var(--edge); border-radius: var(--radius);
-    background: var(--surface); box-shadow: var(--card-shadow);
+  .cvx-surface.cvx-panning { cursor: grabbing; }
+  .cvx-surface.cvx-has-exp { cursor: default; }
+  /* Backdrop darkens softly behind an expanded tile. */
+  .cvx-surface::before {
+    content: ''; position: absolute; inset: 0; background: var(--bg);
+    opacity: 0; z-index: 1; pointer-events: none; transition: opacity .4s ease;
+  }
+  .cvx-surface.cvx-has-exp::before { opacity: .3; }
+  :root[data-theme="light"] .cvx-surface.cvx-has-exp::before { opacity: .15; }
+  /* The 20px snap grid — tile positions round to these cells. */
+  .cvx-grid {
+    position: absolute; inset: 0; pointer-events: none; z-index: 0;
+    background-image: radial-gradient(circle, var(--edge) 1px, transparent 1px);
+    background-size: 20px 20px;
+  }
+  /* The pannable layer: eased for auto-pan on expand; transition OFF while
+     actively panning so the drag tracks 1:1; GPU-promoted only during pan/
+     expand (a permanent will-change blurs composited text). */
+  .cvx-layer {
+    position: relative; width: 100%; min-height: 100%; z-index: 2;
+    transition: transform .6s cubic-bezier(.16,1,.3,1);
+  }
+  .cvx-surface.cvx-has-exp .cvx-layer,
+  .cvx-surface.cvx-panning .cvx-layer { will-change: transform; }
+  .cvx-surface.cvx-panning .cvx-layer { transition: none; }
+  /* ── Tiles ── */
+  .cvx-node {
+    position: absolute; display: flex; flex-direction: column; overflow: hidden;
+    background: var(--surface); border: 1px solid var(--edge); border-radius: var(--radius);
+    box-shadow: var(--card-shadow);
     backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
-    min-width: 0; display: flex; flex-direction: column; gap: 10px; overflow: hidden;
+    cursor: grab; user-select: none; -webkit-user-select: none; outline: none;
+    transition:
+      transform .4s cubic-bezier(.16,1,.3,1),
+      box-shadow .2s ease,
+      opacity .4s ease,
+      filter .4s ease,
+      width .5s cubic-bezier(.16,1,.3,1),
+      height .5s cubic-bezier(.16,1,.3,1),
+      top .5s cubic-bezier(.16,1,.3,1),
+      left .5s cubic-bezier(.16,1,.3,1);
+    animation: cvx-enter .4s cubic-bezier(.16,1,.3,1) both;
   }
-  .canvas-cell[data-span="2"] { grid-column: span 2; }
-  .canvas-cell[data-span="3"] { grid-column: span 3; }
-  .canvas-cell[data-span="4"] { grid-column: span 4; }
-  .canvas-cell-body { min-width: 0; display: flex; flex-direction: column; gap: 12px; }
-  /* Cells host reused surfaces flush (no nested card chrome). */
-  .canvas-cell .v2card, .canvas-cell .chart-card {
+  @keyframes cvx-enter {
+    from { opacity: 0; transform: scale(.92) translateY(8px); }
+    to { opacity: 1; transform: none; }
+  }
+  .cvx-node:hover:not(.cvx-exp):not(.cvx-dim):not(.cvx-dragging):not(.cvx-chromeless) {
+    transform: translateY(-3px);   /* the Aurora lift */
+    border-color: var(--edge-strong);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.07), 0 20px 48px rgba(0,0,0,.5);
+  }
+  :root[data-theme="light"] .cvx-node:hover:not(.cvx-exp):not(.cvx-dim):not(.cvx-dragging):not(.cvx-chromeless) {
+    box-shadow: 0 2px 4px rgba(27,39,51,.06), 0 24px 52px rgba(27,39,51,.16);
+  }
+  .cvx-node:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; }
+  .cvx-node.cvx-dragging { cursor: grabbing; z-index: 50; transition: box-shadow .15s ease; }
+  .cvx-node.cvx-exp {
+    cursor: default; z-index: 100; border-color: var(--edge-strong);
+    box-shadow: 0 0 0 1px rgba(0,0,0,.05), 0 8px 16px -4px rgba(0,0,0,.2),
+      0 20px 40px -8px rgba(0,0,0,.35), 0 40px 80px -16px rgba(0,0,0,.45);
+  }
+  :root[data-theme="light"] .cvx-node.cvx-exp {
+    box-shadow: 0 0 0 1px rgba(27,39,51,.06), 0 8px 16px -4px rgba(27,39,51,.10), 0 24px 52px rgba(27,39,51,.16);
+  }
+  /* Sibling dim on expand — blur 18px · saturate .2 · opacity .15 (measured). */
+  .cvx-node.cvx-dim {
+    filter: blur(18px) saturate(.2) brightness(.6);
+    opacity: .15; transform: scale(.9); pointer-events: none;
+  }
+  /* Exit — .25s out (tiles leaving on a re-flow). */
+  .cvx-node.cvx-leave {
+    opacity: 0; transform: scale(.95); pointer-events: none;
+    transition: opacity .25s ease, transform .25s ease;
+  }
+  /* Accent top edge (3px) — keyed to theme tokens via data-accent. */
+  .cvx-accent {
+    position: absolute; top: 0; left: 0; right: 0; height: 3px;
+    background: var(--cvx-acc, var(--ink3)); opacity: .8; z-index: 3;
+  }
+  .cvx-node[data-accent="acc"] { --cvx-acc: var(--acc); }
+  .cvx-node[data-accent="ok"] { --cvx-acc: var(--ok); }
+  .cvx-node[data-accent="warn"] { --cvx-acc: var(--warn); }
+  .cvx-node[data-accent="crit"] { --cvx-acc: var(--crit); }
+  .cvx-node[data-accent="trust"] { --cvx-acc: var(--trust); }
+  .cvx-content {
+    padding: 13px 15px; flex: 1; min-height: 0;
+    display: flex; flex-direction: column; gap: 6px; overflow: hidden;
+  }
+  .cvx-node.cvx-exp .cvx-content { overflow-y: auto; padding: 15px 17px; }
+  .cvx-eyebrow { font: 600 9.5px var(--font-mono); letter-spacing: .12em; color: var(--ink3); text-transform: uppercase; }
+  .cvx-title { margin: 0; font-size: 15.5px; font-weight: 750; letter-spacing: -.015em; color: var(--ink); line-height: 1.25; }
+  .cvx-hero .cvx-title { font-size: 19px; }
+  .cvx-sub { margin: 0; font-size: 11.5px; font-weight: 500; color: var(--cvx-acc, var(--ink2)); line-height: 1.4; }
+  .cvx-node[data-accent="neutral"] .cvx-sub { color: var(--ink2); }
+  .cvx-body {
+    margin: 0; font-size: 12px; color: var(--ink2); line-height: 1.45;
+    overflow: hidden; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3;
+  }
+  .cvx-node.cvx-exp .cvx-body { display: block; -webkit-line-clamp: unset; overflow: visible; }
+  /* Drill-in body — hidden at base level, revealed on expand. */
+  .cvx-expbody { display: none; }
+  .cvx-node.cvx-exp .cvx-expbody {
+    display: flex; flex-direction: column; gap: 8px;
+    margin-top: 4px; padding-top: 8px; border-top: 1px solid var(--edge);
+  }
+  .cvx-expbody p { margin: 0; font-size: 12px; line-height: 1.6; color: var(--ink2); }
+  /* Live widget bodies — reused console surfaces render flush (no nested chrome). */
+  .cvx-live { flex: 1; min-width: 0; min-height: 0; overflow: hidden; display: flex; flex-direction: column; gap: 10px; }
+  .cvx-node.cvx-exp .cvx-live { overflow: visible; }
+  .cvx-live .v2card, .cvx-live .chart-card {
     background: none; border: none; box-shadow: none;
     backdrop-filter: none; -webkit-backdrop-filter: none; padding: 0;
   }
-  /* xs tier (<720w): a single column — spans collapse. */
-  @media (max-width: 720px) {
-    .canvas-board { grid-template-columns: 1fr; }
-    .canvas-cell[data-span] { grid-column: auto; }
+  .canvas-cell-body { min-width: 0; display: flex; flex-direction: column; gap: 12px; }
+  /* Receipt chip — mono, ✓ in --ok, scheme in --trust (the Aurora signature). */
+  .cvx-chip {
+    margin-top: auto; align-self: flex-start; display: inline-flex; gap: 7px; align-items: center;
+    font: 500 10px var(--font-mono); color: var(--ink2);
+    border: 1px solid var(--edge); border-radius: 8px; padding: 4px 9px; background: var(--surface2);
+    max-width: 100%; overflow: hidden; white-space: nowrap;
+  }
+  .cvx-chip-ok { color: var(--ok); }
+  .cvx-chip-sig { color: var(--trust); }
+  /* Chromeless — text straight on the canvas, no card chrome, never interactive. */
+  .cvx-node.cvx-chromeless {
+    background: transparent; border-color: transparent; box-shadow: none;
+    backdrop-filter: none; -webkit-backdrop-filter: none;
+    overflow: visible; pointer-events: none; cursor: default;
+  }
+  .cvx-node.cvx-chromeless .cvx-title { font-size: 26px; font-weight: 800; letter-spacing: -.03em; line-height: 1.1; }
+  .cvx-node.cvx-chromeless .cvx-sub { font-size: 13px; color: var(--ink2); }
+  .cvx-node.cvx-chromeless .cvx-body { color: var(--ink3); max-width: 42ch; }
+  /* Documents-mode canvas zone — full-width main column (a canvas, not prose;
+     the reader keeps its ~72ch measure). */
+  .doc-canvas { flex: 1; min-width: 0; }
+  .doc-canvas .cvx-surface { height: calc(100vh - 150px); }
+  /* ── Form / stack view (<640px — the PageView port: 12-col spans) ── */
+  .cvx-pv { max-width: 1024px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+  .cvx-pv-intro { padding: 4px 0 8px; }
+  .cvx-pv-title { margin: 0; font-size: 24px; font-weight: 800; letter-spacing: -.02em; color: var(--ink); line-height: 1.15; }
+  .cvx-pv-sub { margin: 6px 0 0; font-size: 13px; color: var(--ink2); }
+  .cvx-pv-body { margin: 8px 0 0; font-size: 12.5px; color: var(--ink3); max-width: 64ch; }
+  .cvx-pv-nav { display: flex; align-items: center; gap: 10px; }
+  .cvx-pv-grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 14px; }
+  .cvx-pv-grid .cvx-node, .cvx-pv .cvx-node.cvx-pv-focus {
+    position: relative; left: auto; top: auto; width: auto; height: auto;
+    min-height: 120px; cursor: pointer;
+  }
+  .cvx-pv-grid .cvx-node[data-span="4"] { grid-column: span 4; }
+  .cvx-pv-grid .cvx-node[data-span="6"] { grid-column: span 6; }
+  .cvx-pv-grid .cvx-node[data-span="8"] { grid-column: span 8; }
+  .cvx-pv-grid .cvx-node[data-span="12"] { grid-column: span 12; }
+  .cvx-pv .cvx-node.cvx-pv-focus { cursor: default; }
+  @media (max-width: 768px) {
+    .cvx-pv-grid .cvx-node[data-span] { grid-column: span 12; }
+    .cvx-pv-grid .cvx-node[data-span="6"] { grid-column: span 6; }
+  }
+  @media (max-width: 640px) {
+    .cvx-pv-grid { gap: 12px; }
+    .cvx-pv-grid .cvx-node[data-span] { grid-column: span 12; }
+  }
+  /* Reduced motion: the global reduce rule already kills every animation and
+     transition; the dim fallback additionally drops the blur so the dimmed
+     context stays readable (grammar-demo parity). */
+  @media (prefers-reduced-motion: reduce) {
+    .cvx-node { animation: none; }
+    .cvx-node.cvx-dim { filter: none; opacity: .3; transform: none; }
   }
 
   /* ---- Canvas relation graph — card nodes + node inspector --------------- */
@@ -2441,7 +2600,7 @@
       document.getElementById('destTitle').textContent = dest.label;
       document.getElementById('destSub').textContent = cr.view === 'graph'
         ? 'Relation graph — real edges only (projects ⋈ work ⋈ gates ⋈ passports ⋈ sessions)'
-        : 'Size-adaptive dashboard — composes to your viewport (4K+ = the full board)';
+        : 'Tile canvas — drag, pan, expand in place; composes to your viewport (4K+ = the full board)';
       var canvasHost = el('div', { 'class': 'canvas-region-host', id: 'canvasHost' });
       content.appendChild(canvasHost);
       if (window.CruxRender && window.CruxRender.renderCanvas) {
@@ -2714,7 +2873,7 @@
 <script>
 (function () {
   'use strict';
-  var SW_REV = 'ushell-v2-r1';   // keep in lock-step with /console-v2/sw.js
+  var SW_REV = 'ushell-v2-r2';   // keep in lock-step with /console-v2/sw.js
   if (!('serviceWorker' in navigator)) { return; }
   // Dev bypass — when the daemon serves this shell from CORECRUXD_CONSOLE_DEV_PATH
   // it stamps window.__CRUX_CONSOLE_DEV__ (see console.rs inject_console_dev_flag).

@@ -1829,6 +1829,541 @@
     return { type: type, id: id };
   }
 
+  // =======================================================================
+  //  WebCrux tile canvas (M14) — the canvas tile pattern ported from
+  //  WebCrux-aurora (useCanvasState.ts · CanvasView.vue · CanvasNode.vue), the
+  //  interaction grammar per Unified-Web-Direction §07 / Aurora-Spec-2026-07-07.
+  //  The measured values ARE the spec:
+  //    · SIZE_MAP tiles (square/wide/tall/hero × sm/md/lg/xl) on a 20px snap grid
+  //    · onion-layer auto-layout — Chebyshev rings out from the anchor hero
+  //    · drag-to-pan with a 4px deadzone (translate clamped ≤ 0, right/down only)
+  //    · click-to-expand in place: siblings dim (blur 18px · saturate .2 ·
+  //      opacity .15) and the layer auto-pans so the card lands at {20,20}
+  //    · entry scale(.92)+8px rise .4s (70ms stagger) · exit .25s · easing
+  //      cubic-bezier(.16,1,.3,1) everywhere · hover lift −3px
+  //    · form/stack view under 640px (12-col spans — the PageView.vue port)
+  //  Vanilla port: no framework, no randomness (layout is a pure function of
+  //  card order + saved positions, so smoke-26 determinism holds console-wide),
+  //  reduced-motion-safe (the global reduce rule kills animation/transition; a
+  //  dedicated fallback drops the dim blur so context stays readable). The
+  //  synchronous first paint runs under the smoke's minimal DOM: no classList,
+  //  no querySelector, no localStorage, no document-level listeners until the
+  //  environment actually provides them.
+  // =======================================================================
+
+  var TILE_GRID = 20;
+  function tileSnap(v) { return Math.round((Number(v) || 0) / TILE_GRID) * TILE_GRID; }
+
+  // Base px dimensions per shape+size combo (SIZE_MAP, ported verbatim).
+  var TILE_SIZE_MAP = {
+    square: { sm: { w: 180, h: 180 }, md: { w: 240, h: 240 }, lg: { w: 320, h: 320 }, xl: { w: 400, h: 400 } },
+    wide:   { sm: { w: 260, h: 140 }, md: { w: 360, h: 180 }, lg: { w: 480, h: 220 }, xl: { w: 600, h: 260 } },
+    tall:   { sm: { w: 180, h: 260 }, md: { w: 220, h: 360 }, lg: { w: 280, h: 440 }, xl: { w: 320, h: 520 } },
+    hero:   { sm: { w: 360, h: 200 }, md: { w: 480, h: 260 }, lg: { w: 600, h: 320 }, xl: { w: 720, h: 380 } }
+  };
+  var TILE_PAN_TARGET = { x: 20, y: 20 };   // auto-pan target on expand
+  var TILE_PAN_DEAD_ZONE = 4;               // px — shared pan/drag deadzone
+  var TILE_LAYOUT_PAD = 35, TILE_LAYOUT_GAP = 24, TILE_MAX_GRID_ROWS = 60;
+  var TILE_FORM_BREAK = 640;                // below this width: the form stack
+
+  function tileDims(shape, size) {
+    var byShape = TILE_SIZE_MAP[shape] || TILE_SIZE_MAP.square;
+    return byShape[size] || byShape.md;
+  }
+  // Rendered dims — grid-derived overrideW/H win over the SIZE_MAP base.
+  function tileRenderedDims(card) {
+    var base = tileDims(card.shape, card.size);
+    return {
+      w: card.overrideW != null ? card.overrideW : base.w,
+      h: card.overrideH != null ? card.overrideH : base.h
+    };
+  }
+
+  // Shape → grid span at quarter-anchor resolution (getGridSpan, ported; the
+  // 16:9-image row expansion is dropped — console tiles carry no images).
+  function tileGridSpan(card) {
+    switch (card.shape) {
+      case 'hero': return [4, 4];
+      case 'wide': return [4, 2];
+      case 'tall': return [2, 4];
+      default: return [2, 2];
+    }
+  }
+  function tileSpanToPixel(cols, rows, cellW, cellH, gap) {
+    return { w: cols * cellW + (cols - 1) * gap, h: rows * cellH + (rows - 1) * gap };
+  }
+
+  // Onion-layer auto-layout (autoLayoutCards, ported). Manual + pinned cards
+  // keep their positions; the rest sort chromeless → hero → original order and
+  // the first becomes the ANCHOR defining a quarter-anchor cell grid
+  // (cell = (anchor − 3·gap) / 4). Free cells are scanned in Chebyshev-distance
+  // rings from the origin — first fit wins, radiating a tight onion pattern out
+  // from the hero. Pure and deterministic: no randomness, no DOM.
+  function tileAutoLayout(cards, saved) {
+    var pad = TILE_LAYOUT_PAD, gap = TILE_LAYOUT_GAP;
+    var result = {}, locked = {};
+    (cards || []).forEach(function (card) {
+      var pos = saved && saved[card.id];
+      if (pos && pos.manual) {
+        locked[card.id] = true;
+        result[card.id] = { x: pos.x, y: pos.y, manual: true, w: pos.w, h: pos.h };
+      } else if (card.pinned) {
+        locked[card.id] = true;
+        result[card.id] = { x: card.x || 0, y: card.y || 0 };
+      }
+    });
+    var autoCards = (cards || []).filter(function (c) { return !locked[c.id]; });
+    if (!autoCards.length) { return result; }
+    autoCards = autoCards.slice().sort(function (a, b) {
+      var ap = a.chromeless ? 0 : (a.shape === 'hero' ? 1 : 2);
+      var bp = b.chromeless ? 0 : (b.shape === 'hero' ? 1 : 2);
+      return ap - bp;
+    });
+    var anchorDim = tileRenderedDims(autoCards[0]);
+    var cellW = Math.floor((anchorDim.w - 3 * gap) / 4);
+    var cellH = Math.floor((anchorDim.h - 3 * gap) / 4);
+    var spans = {}, totalCells = 0;
+    autoCards.forEach(function (card) {
+      var span = tileGridSpan(card);
+      spans[card.id] = span;
+      totalCells += span[0] * span[1];
+    });
+    // Dynamic maxCols: enough Chebyshev layers that (d+1)² covers every cell.
+    var maxCols = Math.min(Math.max(Math.ceil(Math.sqrt(totalCells)) + 2, 3), TILE_MAX_GRID_ROWS);
+    var occupied = {};
+    function cellKey(c, r) { return c + ',' + r; }
+    (cards || []).forEach(function (card) {
+      if (!locked[card.id]) { return; }
+      var pos = result[card.id];
+      if (!pos) { return; }
+      var dim = tileRenderedDims(card);
+      var c0 = Math.max(0, Math.floor((pos.x - pad) / (cellW + gap)));
+      var r0 = Math.max(0, Math.floor((pos.y - pad) / (cellH + gap)));
+      var c1 = Math.ceil((pos.x - pad + dim.w) / (cellW + gap));
+      var r1 = Math.ceil((pos.y - pad + dim.h) / (cellH + gap));
+      for (var c = c0; c < Math.min(c1, maxCols); c++) {
+        for (var r = r0; r < Math.min(r1, TILE_MAX_GRID_ROWS); r++) { occupied[cellKey(c, r)] = true; }
+      }
+    });
+    function canPlace(col, row, cols, rows) {
+      if (col + cols > maxCols || row + rows > TILE_MAX_GRID_ROWS) { return false; }
+      for (var c = col; c < col + cols; c++) {
+        for (var r = row; r < row + rows; r++) { if (occupied[cellKey(c, r)]) { return false; } }
+      }
+      return true;
+    }
+    function markOccupied(col, row, cols, rows) {
+      for (var c = col; c < col + cols; c++) {
+        for (var r = row; r < row + rows; r++) { occupied[cellKey(c, r)] = true; }
+      }
+    }
+    // Grid math produces exact, consistent gaps — no snap needed here.
+    function gridToPixel(col, row) { return { x: pad + col * (cellW + gap), y: pad + row * (cellH + gap) }; }
+    var scanOrder = [];
+    for (var sr = 0; sr < TILE_MAX_GRID_ROWS; sr++) {
+      for (var sc = 0; sc < maxCols; sc++) { scanOrder.push([sc, sr]); }
+    }
+    scanOrder.sort(function (a, b) {
+      var da = Math.max(a[0], a[1]), db = Math.max(b[0], b[1]);
+      if (da !== db) { return da - db; }
+      if (a[1] !== b[1]) { return a[1] - b[1]; }
+      return a[0] - b[0];
+    });
+    autoCards.forEach(function (card) {
+      var span = spans[card.id];
+      var dim = tileSpanToPixel(span[0], span[1], cellW, cellH, gap);
+      var placed = false;
+      for (var i = 0; i < scanOrder.length; i++) {
+        var col = scanOrder[i][0], row = scanOrder[i][1];
+        if (canPlace(col, row, span[0], span[1])) {
+          markOccupied(col, row, span[0], span[1]);
+          var pos = gridToPixel(col, row);
+          result[card.id] = { x: pos.x, y: pos.y, w: dim.w, h: dim.h };
+          placed = true;
+          break;
+        }
+      }
+      if (!placed) {   // grid full — stack below every occupied cell
+        var maxR = 0;
+        Object.keys(occupied).forEach(function (k) {
+          var rr = parseInt(k.split(',')[1], 10);
+          if (isFinite(rr) && rr > maxR) { maxR = rr; }
+        });
+        markOccupied(0, maxR + 1, span[0], span[1]);
+        var p2 = gridToPixel(0, maxR + 1);
+        result[card.id] = { x: p2.x, y: p2.y, w: dim.w, h: dim.h };
+      }
+    });
+    return result;
+  }
+
+  // Expanded dimensions (getExpandedDimensions, ported): content-estimated from
+  // the card's own text (~7.5px/char, 18px lines, clamped 300px…90% viewport),
+  // or a padded viewport fill for card.fill (the board's widget dashboards).
+  function tileExpandedDims(vpW, vpH, card) {
+    if (card.fill) {
+      var fpad = 40;
+      return { w: Math.max(320, vpW - fpad * 2), h: Math.max(300, vpH - fpad) };
+    }
+    var w = Math.max(Math.floor(vpW * 0.45), 440);
+    if (w > vpW - 40) { w = Math.max(280, vpW - 40); }
+    var charsPerLine = Math.max(Math.floor(w / 7.5), 40);
+    var h = 48 + 28;
+    if (card.subtitle) { h += 20; }
+    if (card.body) { h += Math.ceil(String(card.body).length / charsPerLine) * 18 + 8; }
+    (card.expandedParas || []).forEach(function (p) {
+      h += Math.ceil(String(p).length / charsPerLine) * 18 + 16;
+    });
+    h = Math.max(h, 300);
+    h = Math.min(h, Math.floor(vpH * 0.9));
+    return { w: w, h: h };
+  }
+
+  // Manual tile positions persist per surface (drag-end snaps to the 20px grid
+  // and marks manual; auto tiles re-flow around them on the next layout).
+  function tileLoadPositions(storeKey) {
+    try {
+      var raw = localStorage.getItem('crux.console.tiles.' + storeKey);
+      return raw ? JSON.parse(raw) : {};
+    } catch (e) { return {}; }
+  }
+  function tileSavePositions(storeKey, positions) {
+    try { localStorage.setItem('crux.console.tiles.' + storeKey, JSON.stringify(positions)); }
+    catch (e) { /* quota / private mode — positions just don't persist */ }
+  }
+
+  // Build one tile node. The class string is assembled up front — no classList
+  // on the first paint (the smoke's minimal DOM exercises the synchronous path).
+  // Card shape: { id, eyebrow, title, subtitle, body, expandedParas, build(host),
+  // shape, size, accent (theme-token key), chip {id,sig}, routeLink, chromeless,
+  // pinned, fill }.
+  function tileNode(card, idx, extraClass) {
+    var cls = 'cvx-node';
+    if (card.chromeless) { cls += ' cvx-chromeless'; }
+    if (card.shape === 'hero') { cls += ' cvx-hero'; }
+    if (extraClass) { cls += ' ' + extraClass; }
+    var node = el('article', {
+      'class': cls, 'data-id': card.id, 'data-accent': card.accent || 'neutral',
+      tabindex: card.chromeless ? null : '0', role: card.chromeless ? null : 'button'
+    });
+    node.style.animationDelay = (Math.min(idx || 0, 12) * 70) + 'ms';   // entry stagger
+    if (!card.chromeless) { node.appendChild(el('span', { 'class': 'cvx-accent', 'aria-hidden': 'true' })); }
+    var content = el('div', { 'class': 'cvx-content' });
+    if (card.eyebrow) { content.appendChild(el('div', { 'class': 'cvx-eyebrow', text: card.eyebrow })); }
+    content.appendChild(el('h3', { 'class': 'cvx-title', text: card.title || card.id }));
+    if (card.subtitle) { content.appendChild(el('p', { 'class': 'cvx-sub', text: card.subtitle })); }
+    if (card.body) { content.appendChild(el('p', { 'class': 'cvx-body', text: card.body })); }
+    if (typeof card.build === 'function') {
+      // Live tile body — a reused console surface paints here (one failed feed
+      // degrades one tile, never the canvas).
+      var live = el('div', { 'class': 'cvx-live' });
+      content.appendChild(live);
+      try { card.build(live); }
+      catch (e) { live.appendChild(el('p', { 'class': 'ctl-desc', text: 'tile unavailable' })); }
+    }
+    var paras = card.expandedParas || [];
+    if (paras.length) {
+      // Richer drill-in content — CSS-hidden at base level, shown on expand.
+      var exp = el('div', { 'class': 'cvx-expbody' });
+      paras.forEach(function (p) { exp.appendChild(el('p', { text: String(p) })); });
+      content.appendChild(exp);
+    }
+    if (card.chip && card.chip.id) {
+      // Receipt chip (Aurora signature): ✓ in --ok, id, scheme in --trust —
+      // rendered ONLY for a real receipt id, never fabricated.
+      var chip = el('span', { 'class': 'cvx-chip' }, [
+        el('span', { 'class': 'cvx-chip-ok', text: '✓' }),
+        el('span', { text: String(card.chip.id) })
+      ]);
+      if (card.chip.sig) { chip.appendChild(el('span', { 'class': 'cvx-chip-sig', text: String(card.chip.sig) })); }
+      content.appendChild(chip);
+    }
+    node.appendChild(content);
+    return node;
+  }
+
+  // ---- The canvas view (CanvasView.vue, ported) ---------------------------
+  // One live instance at a time (route-driven, like the graph): the next call
+  // releases the previous instance's document-level listeners.
+  var __tileCleanup = null;
+  function renderTileCanvas(host, cards, opts) {
+    opts = opts || {};
+    if (__tileCleanup) { __tileCleanup(); __tileCleanup = null; }
+    host.textContent = '';
+    var hostW = host.clientWidth || (typeof window !== 'undefined' && window.innerWidth) || 1280;
+    if (hostW < TILE_FORM_BREAK) { return renderTileStack(host, cards, opts); }
+
+    var surface = el('div', { 'class': 'cvx-surface' });
+    surface.appendChild(el('div', { 'class': 'cvx-grid', 'aria-hidden': 'true' }));
+    var layer = el('div', { 'class': 'cvx-layer' });
+    surface.appendChild(layer);
+    host.appendChild(surface);
+    function vp() {
+      return {
+        w: surface.clientWidth || hostW,
+        h: surface.clientHeight || 640
+      };
+    }
+
+    var nodes = {};
+    var expandedId = null;
+    var manualPan = { x: 0, y: 0 };
+    var squelchClick = false;
+
+    function setClass(n, cls, on) { if (n && n.classList) { n.classList.toggle(cls, !!on); } }
+    function findCard(id) {
+      for (var i = 0; i < cards.length; i++) { if (cards[i].id === id) { return cards[i]; } }
+      return null;
+    }
+    function applyLayerPan(x, y) {
+      // Whole pixels only — sub-pixel translate blurs composited text.
+      layer.style.transform = (x === 0 && y === 0) ? '' : 'translate(' + Math.round(x) + 'px, ' + Math.round(y) + 'px)';
+    }
+
+    function placeNode(card, node) {
+      var dim = tileRenderedDims(card);
+      node.style.left = card.x + 'px';
+      node.style.top = card.y + 'px';
+      node.style.width = dim.w + 'px';
+      node.style.height = dim.h + 'px';
+    }
+
+    function collapse() {
+      if (!expandedId) { return; }
+      var card = findCard(expandedId), node = nodes[expandedId];
+      expandedId = null;
+      setClass(surface, 'cvx-has-exp', false);
+      if (node && card) { setClass(node, 'cvx-exp', false); placeNode(card, node); }
+      Object.keys(nodes).forEach(function (k) { setClass(nodes[k], 'cvx-dim', false); });
+      manualPan = { x: 0, y: 0 };   // returning to base resets the pan to origin
+      applyLayerPan(0, 0);
+    }
+
+    function expand(card) {
+      if (card.routeLink) { if (typeof location !== 'undefined') { location.hash = card.routeLink; } return; }
+      if (card.chromeless) { return; }
+      if (expandedId === card.id) { collapse(); return; }
+      if (expandedId) {
+        // Direct hand-off between tiles: swap without the full collapse reset.
+        var prev = findCard(expandedId), prevNode = nodes[expandedId];
+        if (prevNode && prev) { setClass(prevNode, 'cvx-exp', false); placeNode(prev, prevNode); }
+      }
+      expandedId = card.id;
+      var node = nodes[card.id];
+      var v = vp();
+      var exp = tileExpandedDims(v.w, v.h, card);
+      setClass(surface, 'cvx-has-exp', true);
+      setClass(node, 'cvx-exp', true);
+      node.style.width = exp.w + 'px';
+      node.style.height = exp.h + 'px';
+      Object.keys(nodes).forEach(function (k) { setClass(nodes[k], 'cvx-dim', k !== card.id); });
+      // Auto-pan the layer so the expanded card lands at {20,20}.
+      applyLayerPan(TILE_PAN_TARGET.x - card.x, TILE_PAN_TARGET.y - card.y);
+    }
+
+    function mountCard(card, idx) {
+      var node = tileNode(card, idx);
+      placeNode(card, node);
+      nodes[card.id] = node;
+      layer.appendChild(node);
+      node.addEventListener('pointerdown', function (ev) {
+        if (expandedId || card.chromeless || card.pinned) { return; }
+        if (ev.target && ev.target.closest && ev.target.closest('button, a, input, select, textarea, details')) { return; }
+        drag = { x: ev.clientX, y: ev.clientY, cx: card.x, cy: card.y, card: card, node: node, moved: false };
+        setClass(node, 'cvx-dragging', true);
+      });
+      node.addEventListener('click', function (ev) {
+        if (ev.stopPropagation) { ev.stopPropagation(); }
+        if (squelchClick) { squelchClick = false; return; }
+        if (ev.target && ev.target.closest && ev.target.closest('button, a, input, select, textarea, details')) { return; }
+        expand(card);
+      });
+      node.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Enter' || ev.key === ' ') { if (ev.preventDefault) { ev.preventDefault(); } expand(card); }
+      });
+    }
+
+    function layoutAndMount() {
+      var saved = opts.storeKey ? tileLoadPositions(opts.storeKey) : {};
+      var positions = tileAutoLayout(cards, saved);
+      cards.forEach(function (card, i) {
+        var pos = positions[card.id] || { x: TILE_LAYOUT_PAD, y: TILE_LAYOUT_PAD };
+        card.x = pos.x; card.y = pos.y;
+        if (pos.w != null) { card.overrideW = pos.w; }
+        if (pos.h != null) { card.overrideH = pos.h; }
+        if (nodes[card.id]) { placeNode(card, nodes[card.id]); }
+        else { mountCard(card, i); }
+      });
+    }
+    layoutAndMount();
+
+    // Manual pan — pointer-drag on empty surface, 4px deadzone, translate
+    // clamped ≤ 0 (pan right/down only); the layer transition is CSS-disabled
+    // while .cvx-panning so the drag tracks 1:1.
+    var pan = null, drag = null;
+    surface.addEventListener('pointerdown', function (ev) {
+      if (ev.target && ev.target.closest && ev.target.closest('.cvx-node')) { return; }
+      if (expandedId) { return; }   // manual pan is a base-level gesture
+      pan = { x: ev.clientX, y: ev.clientY, px: manualPan.x, py: manualPan.y, moved: false };
+      setClass(surface, 'cvx-panning', true);
+    });
+    surface.addEventListener('click', function (ev) {
+      if (ev.target && ev.target.closest && ev.target.closest('.cvx-node')) { return; }
+      if (squelchClick) { squelchClick = false; return; }
+      if (expandedId) { collapse(); }   // click on empty canvas releases
+    });
+    function onPointerMove(ev) {
+      if (pan) {
+        var dx = ev.clientX - pan.x, dy = ev.clientY - pan.y;
+        if (!pan.moved && Math.abs(dx) < TILE_PAN_DEAD_ZONE && Math.abs(dy) < TILE_PAN_DEAD_ZONE) { return; }
+        pan.moved = true;
+        manualPan = { x: Math.min(0, pan.px + dx), y: Math.min(0, pan.py + dy) };
+        applyLayerPan(manualPan.x, manualPan.y);
+        return;
+      }
+      if (drag) {
+        var ddx = ev.clientX - drag.x, ddy = ev.clientY - drag.y;
+        if (!drag.moved && Math.abs(ddx) < TILE_PAN_DEAD_ZONE && Math.abs(ddy) < TILE_PAN_DEAD_ZONE) { return; }
+        drag.moved = true;
+        drag.card.x = tileSnap(drag.cx + ddx);   // live snap to the 20px grid
+        drag.card.y = tileSnap(drag.cy + ddy);
+        drag.node.style.left = drag.card.x + 'px';
+        drag.node.style.top = drag.card.y + 'px';
+      }
+    }
+    function onPointerUp() {
+      if (pan) {
+        squelchClick = pan.moved;
+        pan = null;
+        setClass(surface, 'cvx-panning', false);
+      }
+      if (drag) {
+        var d = drag;
+        drag = null;
+        setClass(d.node, 'cvx-dragging', false);
+        squelchClick = squelchClick || d.moved;
+        if (d.moved && opts.storeKey) {
+          var saved = tileLoadPositions(opts.storeKey);
+          var prev = saved[d.card.id] || {};
+          saved[d.card.id] = {
+            x: d.card.x, y: d.card.y, manual: true,
+            // Preserve grid-derived dims so the tile doesn't snap back to SIZE_MAP size.
+            w: prev.w != null ? prev.w : d.card.overrideW,
+            h: prev.h != null ? prev.h : d.card.overrideH
+          };
+          tileSavePositions(opts.storeKey, saved);
+        }
+      }
+    }
+    function onKeyDown(ev) { if (ev.key === 'Escape' && expandedId) { collapse(); } }
+    var d0 = doc();
+    if (d0 && typeof d0.addEventListener === 'function') {
+      d0.addEventListener('pointermove', onPointerMove);
+      d0.addEventListener('pointerup', onPointerUp);
+      d0.addEventListener('keydown', onKeyDown);
+      __tileCleanup = function () {
+        d0.removeEventListener('pointermove', onPointerMove);
+        d0.removeEventListener('pointerup', onPointerUp);
+        d0.removeEventListener('keydown', onKeyDown);
+      };
+    }
+
+    return {
+      // Re-flow with an updated card list (live tiles landing after their real
+      // reads). Removed tiles leave over .25s (.cvx-leave); manual positions are
+      // preserved; new tiles mount with the entry animation.
+      relayout: function (nextCards) {
+        var nextIds = {};
+        nextCards.forEach(function (c) { nextIds[c.id] = true; });
+        var leaving = [];
+        Object.keys(nodes).forEach(function (id) {
+          if (!nextIds[id]) { leaving.push(id); }
+        });
+        function finish() {
+          leaving.forEach(function (id) {
+            var n = nodes[id];
+            if (n && n.parentNode && n.parentNode.removeChild) { n.parentNode.removeChild(n); }
+            delete nodes[id];
+          });
+          cards = nextCards;
+          layoutAndMount();
+        }
+        if (leaving.length && typeof setTimeout === 'function') {
+          leaving.forEach(function (id) { setClass(nodes[id], 'cvx-leave', true); });
+          setTimeout(finish, 250);   // the measured exit: .25s out
+        } else { finish(); }
+      },
+      collapse: collapse
+    };
+  }
+
+  // ---- The form / stack view (<640px — PageView.vue, ported) --------------
+  // 12-col grid: hero 12 · wide 8 · square 6 · tall 4 (CSS collapses spans at
+  // the 768/640 breakpoints). Click drills into a focused span-12 card with a
+  // Back control; chromeless cards render as intro headers.
+  function renderTileStack(host, cards, opts) {
+    host.textContent = '';
+    var wrap = el('div', { 'class': 'cvx-pv' });
+    host.appendChild(wrap);
+    function spanFor(card) {
+      switch (card.shape) {
+        case 'hero': return 12;
+        case 'wide': return 8;
+        case 'tall': return 4;
+        default: return 6;
+      }
+    }
+    var current = cards;
+    function paintBase() {
+      wrap.textContent = '';
+      current.forEach(function (card) {
+        if (!card.chromeless) { return; }
+        var intro = el('div', { 'class': 'cvx-pv-intro' });
+        intro.appendChild(el('h1', { 'class': 'cvx-pv-title', text: card.title || '' }));
+        if (card.subtitle) { intro.appendChild(el('p', { 'class': 'cvx-pv-sub', text: card.subtitle })); }
+        if (card.body) { intro.appendChild(el('p', { 'class': 'cvx-pv-body', text: card.body })); }
+        wrap.appendChild(intro);
+      });
+      var grid = el('div', { 'class': 'cvx-pv-grid' });
+      wrap.appendChild(grid);
+      current.forEach(function (card, i) {
+        if (card.chromeless) { return; }
+        var node = tileNode(card, i);
+        node.setAttribute('data-span', String(spanFor(card)));
+        node.addEventListener('click', function (ev) {
+          if (ev.stopPropagation) { ev.stopPropagation(); }
+          if (ev.target && ev.target.closest && ev.target.closest('button, a, input, select, textarea, details')) { return; }
+          if (card.routeLink) { if (typeof location !== 'undefined') { location.hash = card.routeLink; } return; }
+          paintFocused(card);
+        });
+        node.addEventListener('keydown', function (ev) {
+          if (ev.key === 'Enter' || ev.key === ' ') {
+            if (ev.preventDefault) { ev.preventDefault(); }
+            if (card.routeLink) { if (typeof location !== 'undefined') { location.hash = card.routeLink; } return; }
+            paintFocused(card);
+          }
+        });
+        grid.appendChild(node);
+      });
+    }
+    function paintFocused(card) {
+      wrap.textContent = '';
+      var nav = el('div', { 'class': 'cvx-pv-nav' });
+      var back = el('button', { 'class': 'btn-quiet', type: 'button' }, ['← Back']);
+      back.addEventListener('click', function () { paintBase(); });
+      nav.appendChild(back);
+      wrap.appendChild(nav);
+      var node = tileNode(card, 0, 'cvx-exp cvx-pv-focus');
+      node.setAttribute('data-span', '12');
+      wrap.appendChild(node);
+    }
+    paintBase();
+    return {
+      relayout: function (nextCards) { current = nextCards; paintBase(); },
+      collapse: paintBase
+    };
+  }
+
   // ---- Board cell builders (reuse existing surfaces) ---------------------
   function canvasCellHead(cell, title) { cell.appendChild(el('h3', { 'class': 'v2card-h', text: title })); }
 
@@ -1874,34 +2409,42 @@
   }
 
   // ---- Widget registry (smoke check 25) ----------------------------------
-  // { id, span, minTier, build }. minTier gates a widget IN at that tier and up.
-  // Cumulative counts: xs 4 · s 6 · m 10 · l 14 · xl 18 (the 4K+ board).
+  // { id, span, minTier, build } — the audited contract; minTier gates a widget
+  // IN at that tier and up. Cumulative counts: xs 4 · s 6 · m 10 · l 14 · xl 18
+  // (the 4K+ board). M14 adds presentation-only tile metadata: { eyebrow, tile:
+  // {shape,size}, accent } feed the WebCrux tile canvas (span stays the ported
+  // grid weight and the smoke's integrity key — untouched).
   var CANVAS_WIDGETS = [
-    { id: 'stat-tiles', span: 2, minTier: 'xs', title: 'Daemon at a glance', build: function (cell) { return canvasPageCell(cell, 'cx-overview'); } },
-    { id: 'needs-you', span: 2, minTier: 'xs', title: 'Needs you', build: function (cell) { return canvasPanelCell(cell, 'Needs you', fillNeedsYou, 'loading gate queue…'); } },
-    { id: 'fleet', span: 1, minTier: 'xs', title: 'Fleet', build: function (cell) { return canvasPanelCell(cell, 'Fleet', fillFleet, 'loading fleet…'); } },
-    { id: 'activity', span: 1, minTier: 'xs', title: 'Activity', build: function (cell) { return canvasPanelCell(cell, 'Activity', fillActivity, 'loading…'); } },
-    { id: 'cost-chart', span: 2, minTier: 's', title: 'Token burn', build: function (cell) { return canvasChartCell(cell, 'Token burn', 'costSeries'); } },
-    { id: 'work', span: 2, minTier: 's', title: 'ExecPlans', build: function (cell) { return canvasPageCell(cell, 'cx-work'); } },
-    { id: 'usage-chart', span: 2, minTier: 'm', title: 'Token usage', build: function (cell) { return canvasChartCell(cell, 'Token usage', 'usageSeries'); } },
-    { id: 'facts', span: 2, minTier: 'm', title: 'Facts', build: function (cell) { return canvasPageCell(cell, 'cx-facts'); } },
-    { id: 'engine', span: 1, minTier: 'm', title: 'Engine', build: function (cell) { return canvasPanelCell(cell, 'Engine', fillEngine, 'checking mediation…'); } },
-    { id: 'dashboard-strip', span: 4, minTier: 'm', title: 'Fleet dashboard', build: function (cell, ctx) { return canvasDashCell(cell, ctx); } },
-    { id: 'projects', span: 2, minTier: 'l', title: 'Projects', build: function (cell) { return canvasPageCell(cell, 'cx-projects'); } },
-    { id: 'sessions', span: 2, minTier: 'l', title: 'Sessions', build: function (cell) { return canvasPageCell(cell, 'cx-sessions'); } },
-    { id: 'tenants', span: 2, minTier: 'l', title: 'Tenants', build: function (cell) { return canvasPageCell(cell, 'cx-tenants'); } },
-    { id: 'live-board', span: 2, minTier: 'l', title: 'Live board', build: function (cell) { return canvasPageCell(cell, 'cx-coord'); } },
-    { id: 'passports', span: 1, minTier: 'xl', title: 'Passports', build: function (cell) { return canvasPageCell(cell, 'cx-passport'); } },
-    { id: 'gates', span: 2, minTier: 'xl', title: 'Gates', build: function (cell) { return canvasPageCell(cell, 'cx-gates'); } },
-    { id: 'orchestrators', span: 1, minTier: 'xl', title: 'Orchestrators', build: function (cell) { return canvasPageCell(cell, 'cx-orchestrators'); } },
-    { id: 'integrations', span: 1, minTier: 'xl', title: 'Integrations', build: function (cell) { return canvasPageCell(cell, 'cx-integrations'); } }
+    { id: 'stat-tiles', span: 2, minTier: 'xs', title: 'Daemon at a glance', eyebrow: 'OVERWATCH · GLANCE', tile: { shape: 'hero', size: 'lg' }, accent: 'acc', build: function (cell) { return canvasPageCell(cell, 'cx-overview'); } },
+    { id: 'needs-you', span: 2, minTier: 'xs', title: 'Needs you', eyebrow: 'OVERWATCH · ART.14', tile: { shape: 'wide', size: 'lg' }, accent: 'warn', build: function (cell) { return canvasPanelCell(cell, 'Needs you', fillNeedsYou, 'loading gate queue…'); } },
+    { id: 'fleet', span: 1, minTier: 'xs', title: 'Fleet', eyebrow: 'OVERWATCH · FLEET', tile: { shape: 'tall', size: 'md' }, accent: 'ok', build: function (cell) { return canvasPanelCell(cell, 'Fleet', fillFleet, 'loading fleet…'); } },
+    { id: 'activity', span: 1, minTier: 'xs', title: 'Activity', eyebrow: 'OVERWATCH · LIVE', tile: { shape: 'tall', size: 'md' }, accent: 'trust', build: function (cell) { return canvasPanelCell(cell, 'Activity', fillActivity, 'loading…'); } },
+    { id: 'cost-chart', span: 2, minTier: 's', title: 'Token burn', eyebrow: 'METERS · COST', tile: { shape: 'wide', size: 'lg' }, accent: 'acc', build: function (cell) { return canvasChartCell(cell, 'Token burn', 'costSeries'); } },
+    { id: 'work', span: 2, minTier: 's', title: 'ExecPlans', eyebrow: 'WORK · PLANS', tile: { shape: 'wide', size: 'lg' }, accent: 'acc', build: function (cell) { return canvasPageCell(cell, 'cx-work'); } },
+    { id: 'usage-chart', span: 2, minTier: 'm', title: 'Token usage', eyebrow: 'METERS · USAGE', tile: { shape: 'wide', size: 'md' }, accent: 'acc', build: function (cell) { return canvasChartCell(cell, 'Token usage', 'usageSeries'); } },
+    { id: 'facts', span: 2, minTier: 'm', title: 'Facts', eyebrow: 'MEMORY · FACTS', tile: { shape: 'wide', size: 'md' }, accent: 'acc', build: function (cell) { return canvasPageCell(cell, 'cx-facts'); } },
+    { id: 'engine', span: 1, minTier: 'm', title: 'Engine', eyebrow: 'SYSTEM · MEDIATED', tile: { shape: 'square', size: 'md' }, accent: 'trust', build: function (cell) { return canvasPanelCell(cell, 'Engine', fillEngine, 'checking mediation…'); } },
+    { id: 'dashboard-strip', span: 4, minTier: 'm', title: 'Fleet dashboard', eyebrow: 'OVERWATCH · DASH', tile: { shape: 'hero', size: 'md' }, accent: 'ok', build: function (cell, ctx) { return canvasDashCell(cell, ctx); } },
+    { id: 'projects', span: 2, minTier: 'l', title: 'Projects', eyebrow: 'WORK · PROJECTS', tile: { shape: 'wide', size: 'md' }, accent: 'acc', build: function (cell) { return canvasPageCell(cell, 'cx-projects'); } },
+    { id: 'sessions', span: 2, minTier: 'l', title: 'Sessions', eyebrow: 'WORK · SESSIONS', tile: { shape: 'wide', size: 'md' }, accent: 'ok', build: function (cell) { return canvasPageCell(cell, 'cx-sessions'); } },
+    { id: 'tenants', span: 2, minTier: 'l', title: 'Tenants', eyebrow: 'MEMORY · CORPORA', tile: { shape: 'wide', size: 'md' }, accent: 'trust', build: function (cell) { return canvasPageCell(cell, 'cx-tenants'); } },
+    { id: 'live-board', span: 2, minTier: 'l', title: 'Live board', eyebrow: 'WORK · COORD', tile: { shape: 'wide', size: 'md' }, accent: 'ok', build: function (cell) { return canvasPageCell(cell, 'cx-coord'); } },
+    { id: 'passports', span: 1, minTier: 'xl', title: 'Passports', eyebrow: 'TRUST · IDENTITY', tile: { shape: 'square', size: 'md' }, accent: 'trust', build: function (cell) { return canvasPageCell(cell, 'cx-passport'); } },
+    { id: 'gates', span: 2, minTier: 'xl', title: 'Gates', eyebrow: 'TRUST · ART.14', tile: { shape: 'wide', size: 'md' }, accent: 'warn', build: function (cell) { return canvasPageCell(cell, 'cx-gates'); } },
+    { id: 'orchestrators', span: 1, minTier: 'xl', title: 'Orchestrators', eyebrow: 'WORK · ORCS', tile: { shape: 'square', size: 'md' }, accent: 'ok', build: function (cell) { return canvasPageCell(cell, 'cx-orchestrators'); } },
+    { id: 'integrations', span: 1, minTier: 'xl', title: 'Integrations', eyebrow: 'SYSTEM · LINKS', tile: { shape: 'square', size: 'md' }, accent: 'neutral', build: function (cell) { return canvasPageCell(cell, 'cx-integrations'); } }
   ];
 
-  // ---- Board renderer — recompose on (debounced) resize, tier-driven -----
+  // ---- Board renderer (M14) — the widget registry on the tile canvas -----
+  // The pure canvasTier still decides WHICH widgets compose in (the size-
+  // adaptive contract, smoke 25); the WebCrux tile canvas decides HOW they lay
+  // out (onion-layer rings from the hero anchor, drag/pan/expand grammar).
+  // Recompose on a debounced resize; under 640px renderTileCanvas falls through
+  // to the form stack by itself.
   var __canvasResizeHandler = null;
   function renderCanvasBoard(host, ctx) {
     ctx = ctx || {};
-    var lastTier = null;
+    var lastKey = null;
     function viewport() {
       var W = (typeof window !== 'undefined' && window.innerWidth) || 1280;
       var H = (typeof window !== 'undefined' && window.innerHeight) || 800;
@@ -1916,28 +2459,39 @@
       }
       var vp = viewport();
       var tier = canvasTier(vp.W, vp.H);
-      if (tier === lastTier) { return; }   // only recompose on a real tier change (no churn)
-      lastTier = tier;
+      var mode = vp.W < TILE_FORM_BREAK ? 'stack' : 'canvas';
+      var key = tier + ':' + mode;
+      if (key === lastKey) { return; }   // only recompose on a real tier/mode change (no churn)
+      lastKey = key;
       host.textContent = '';
       host.setAttribute('data-tier', tier);
       var maxIdx = CANVAS_TIER_ORDER.indexOf(tier);
-      var board = el('div', { 'class': 'canvas-board' });
-      host.appendChild(board);
-      var shown = 0;
+      var tiles = [];
       CANVAS_WIDGETS.forEach(function (w) {
         if (CANVAS_TIER_ORDER.indexOf(w.minTier) > maxIdx) { return; }
-        shown++;
-        var cell = el('div', { 'class': 'canvas-cell', 'data-span': String(w.span), 'data-widget': w.id });
-        board.appendChild(cell);
-        try { w.build(cell, ctx); }
-        catch (e) { cell.textContent = ''; canvasCellHead(cell, w.title || w.id); cell.appendChild(el('p', { 'class': 'ctl-desc', text: 'widget unavailable' })); }
+        tiles.push({
+          id: w.id,
+          eyebrow: w.eyebrow || 'console',
+          title: w.title || w.id,
+          shape: (w.tile && w.tile.shape) || (w.span >= 4 ? 'hero' : (w.span === 2 ? 'wide' : 'square')),
+          size: (w.tile && w.tile.size) || (w.span === 2 ? 'lg' : 'md'),
+          accent: w.accent || 'neutral',
+          fill: true,   // widgets expand to a padded viewport fill (dashboards need room)
+          build: function (cell) {
+            try { return w.build(cell, ctx); }
+            catch (e) { cell.appendChild(el('p', { 'class': 'ctl-desc', text: 'widget unavailable' })); }
+          }
+        });
       });
-      var meta = el('p', { 'class': 'ctl-desc', text: tier + ' tier · ' + shown + ' widget' + (shown === 1 ? '' : 's') + ' · resize to recompose' });
-      host.appendChild(meta);
+      var boardHost = el('div', { 'class': 'cvx-board' });
+      host.appendChild(boardHost);
+      renderTileCanvas(boardHost, tiles, { storeKey: 'board-' + tier });
+      host.appendChild(el('p', { 'class': 'ctl-desc cvx-board-meta', text: tier + ' tier · ' + tiles.length + ' widget' + (tiles.length === 1 ? '' : 's') + ' · drag a tile to place it · drag the canvas to pan · click to expand in place' }));
     }
     paint();
-    // Debounced resize recompose (no animated reflow — reduced-motion-safe by
-    // construction: the grid re-lays out instantly, nothing is transitioned).
+    // Debounced resize recompose. Tier/mode changes repaint instantly (no
+    // animated reflow); within a tier the tile transitions carry the motion —
+    // and the global prefers-reduced-motion rule switches those off wholesale.
     if (__canvasResizeHandler && typeof window !== 'undefined') { window.removeEventListener('resize', __canvasResizeHandler); }
     var t = null;
     __canvasResizeHandler = function () { if (t) { clearTimeout(t); } t = setTimeout(paint, 200); };
@@ -2425,6 +2979,7 @@
   // (viewBox 0 0 24 24, stroke currentColor, stroke-width 1.8, round caps) so the
   // two menus read as one family. Keyed by surface id (+ 'explorer' for the pin).
   var SURFACE_ICONS = {
+    canvas: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="8" height="8" rx="1.5"/><rect x="15" y="3" width="6" height="11" rx="1.5"/><rect x="3" y="15" width="11" height="6" rx="1.5"/><rect x="18" y="18" width="3" height="3" rx="1"/></svg>',
     explorer: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>',
     proof: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h8l4 4v13a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/><path d="M14 3v4h4"/><path d="M8.5 13.6l2.2 2.2 4-4.3"/></svg>',
     watch: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>',
@@ -3114,11 +3669,14 @@
       b.addEventListener('click', function () { location.hash = target; });
       host.appendChild(b);
     }
-    // Explorer + the surfaces all live in one flat list (no group label). Icons
-    // are keyed by surface id (Explorer uses the magnifier, matching Command).
+    // Canvas (M14 — the corpus tile landing) + Explorer + the surfaces all live
+    // in one flat list (no group label). Icons are keyed by surface id
+    // (Explorer uses the magnifier, matching Command).
+    var isCanvas = (activeId === 'canvas');
+    navItem('Canvas', 'canvas', isCanvas, '#/documents');
     navItem('Explorer', 'explorer', isExplorer, '#/documents/explorer');
     DOC_SURFACES.forEach(function (s) {
-      navItem(s.label, s.id, !isExplorer && s.id === activeSurface, '#/documents/' + s.id);
+      navItem(s.label, s.id, !isExplorer && !isCanvas && s.id === activeSurface, '#/documents/' + s.id);
     });
   }
 
@@ -3262,6 +3820,108 @@
     }
   }
 
+  // ---- Documents corpus canvas (M14) — the #/documents landing -----------
+  // The corpus browsed as WebCrux tiles. The zero-network base set (bundled
+  // reference docs + Explorer + the demo Proof doc when demo is on) paints
+  // SYNCHRONOUSLY; live corpora / facts / receipts tiles land as their real
+  // reads resolve and re-flow around any manually-placed tiles. Document tiles
+  // navigate into the 3-zone reader (#/documents/<docId>); fact and receipt
+  // tiles expand in place, surfacing REAL fields only (a receipt chip renders
+  // only for a real receipt id). Presentation only — no posture side effects.
+  function docCanvasBaseCards() {
+    var cards = [
+      { id: 'doc-intro', chromeless: true, shape: 'hero', size: 'md', accent: 'neutral',
+        title: 'Documents',
+        subtitle: 'the corpus as a canvas',
+        body: 'Click a tile to read · drag a tile to place it · drag the canvas to pan.' },
+      { id: 'doc-explorer', eyebrow: 'SEARCH · CORPUS', title: 'Explorer',
+        subtitle: 'Local BM25 · WikiCrux mediated',
+        body: 'Search the corpus — results open in the reader.',
+        shape: 'square', size: 'md', accent: 'acc', routeLink: '#/documents/explorer' }
+    ];
+    DOC_REFERENCE.forEach(function (d, i) {
+      cards.push({
+        id: 'doc-ref-' + d.slug, eyebrow: 'DOCS · REFERENCE',
+        title: d.title, subtitle: d.subtitle,
+        body: (d.sections && d.sections[0] && d.sections[0].body && d.sections[0].body[0]) || null,
+        shape: i === 0 ? 'hero' : 'wide', size: 'md', accent: 'trust',
+        routeLink: '#/documents/ref:' + d.slug
+      });
+    });
+    if (demoOn() && demoData('docsReader')) {
+      cards.push({
+        id: 'doc-demo-proof', eyebrow: 'PROOF · DEMO',
+        title: 'Proof reader (demo)', subtitle: 'the full Proof composition — demo fixture',
+        shape: 'wide', size: 'md', accent: 'warn', routeLink: '#/documents/demo:proof'
+      });
+    }
+    return cards;
+  }
+  function renderDocCanvas(mount, ctx) {
+    var cards = docCanvasBaseCards();
+    var canvas = renderTileCanvas(mount, cards, { storeKey: 'documents' });
+    var api = (typeof window !== 'undefined') ? window.CruxApi : null;
+    // Live corpora — one tile per tenant (real list only; empty adds nothing).
+    fetchVia(api && typeof api.consoleTenants === 'function' ? function () { return api.consoleTenants(); } : null)
+      .then(function (res) {
+        var tenants = (res.ok && res.data && (res.data.tenants || res.data.items)) || [];
+        if (!tenants.length) { return; }
+        __docCache.tenants = tenants;
+        tenants.slice(0, 8).forEach(function (t) {
+          var tid = t.tenant_id || t.id;
+          if (tid == null || tid === '') { return; }
+          cards.push({
+            id: 'doc-tenant-' + tid, eyebrow: 'CORPUS · TENANT',
+            title: String(tid),
+            subtitle: t.chunk_count != null ? (t.chunk_count + ' chunks') : (t.category || null),
+            body: 'What the daemon has read into this tenant.',
+            shape: 'square', size: 'md', accent: 'ok',
+            routeLink: '#/documents/tenant:' + tid
+          });
+        });
+        canvas.relayout(cards);
+      });
+    // Related facts — expand in place to the full real value.
+    fetchVia(api && typeof api.consoleFacts === 'function' ? function () { return api.consoleFacts({ top_k: 6 }); } : null)
+      .then(function (res) {
+        var facts = (res.ok && res.data && res.data.facts) || [];
+        if (!facts.length) { return; }
+        facts.slice(0, 6).forEach(function (f, i) {
+          var paras = [];
+          if (f.value != null) { paras.push(String(f.value)); }
+          if (f.stored_at) { paras.push('stored ' + String(f.stored_at)); }
+          cards.push({
+            id: 'doc-fact-' + String(f.fact_id || f.id || i), eyebrow: 'MEMORY · FACT',
+            title: String(f.entity || 'fact') + (f.key ? ' · ' + String(f.key) : ''),
+            body: f.value != null ? String(f.value).slice(0, 140) : null,
+            expandedParas: paras,
+            shape: 'square', size: 'sm', accent: 'acc'
+          });
+        });
+        canvas.relayout(cards);
+      });
+    // Receipt-backed activity — the chip carries the REAL receipt id.
+    activityRows({ tenant_id: 'default', token_budget: 1500 }).then(function (res) {
+      var rows = (res.ok && res.data && res.data.rows) || [];
+      var seen = {}, added = 0;
+      rows.forEach(function (r0) {
+        var rid = (r0.receipt_ids || [])[0] || r0.receipt_id;
+        if (!rid || seen[rid] || added >= 4) { return; }
+        seen[rid] = true; added++;
+        cards.push({
+          id: 'doc-receipt-' + rid, eyebrow: 'TRUST · RECEIPT',
+          title: (r0.kind || 'event') + (r0.tool ? ' · ' + r0.tool : ''),
+          subtitle: r0.ts ? String(r0.ts) : null,
+          body: r0.preview ? String(r0.preview).slice(0, 120) : null,
+          expandedParas: [r0.preview ? String(r0.preview) : 'Receipt-backed activity event.'],
+          chip: { id: rid, sig: 'ed25519' },
+          shape: 'wide', size: 'sm', accent: 'ok'
+        });
+      });
+      if (added) { canvas.relayout(cards); }
+    });
+  }
+
   // ---- Documents entry point (the shell routes documents mode here) ------
   // ctx: { summary, docId, railHost }. Builds the rail document tree (left zone),
   // the ~72ch reading surface (centre), and the evidence panel (right zone /
@@ -3287,6 +3947,29 @@
         exWrap.appendChild(exMain);
         host.appendChild(exWrap);
         renderExplorer(exMain, ctx);
+        return;
+      }
+      // M14 — the corpus tile canvas IS the #/documents landing (no docId, or
+      // the explicit #/documents/canvas route). Reader docs stay at
+      // #/documents/<docId>; the canvas paints its zero-network base set
+      // synchronously, so the daemon-hang guarantee below still holds.
+      if (raw == null || raw === '' || raw === 'canvas') {
+        activeDocId = 'canvas';
+        treeHosts = [];
+        if (ctx.railHost) { buildDocTree(ctx.railHost, tenants, 'canvas'); treeHosts.push(ctx.railHost); }
+        // doc-surface-wrap collapses the reader grid to one full-width column
+        // (the canvas needs the whole measure; no evidence rail at base level).
+        var cvReader = el('div', { 'class': 'doc-reader doc-surface-wrap doc-canvas-wrap' });
+        var cvSheet = el('details', { 'class': 'doc-sources-sheet' });
+        cvSheet.appendChild(el('summary', { 'class': 'doc-sources-summary', text: 'Surfaces & sources' }));
+        var cvTree = el('div', { 'class': 'doc-tree' });
+        buildDocTree(cvTree, tenants, 'canvas'); treeHosts.push(cvTree);
+        cvSheet.appendChild(cvTree);
+        cvReader.appendChild(cvSheet);
+        var cvMain = el('main', { 'class': 'doc-canvas' });
+        cvReader.appendChild(cvMain);
+        host.appendChild(cvReader);
+        renderDocCanvas(cvMain, ctx);
         return;
       }
       var surfaceId = (raw && isDocSurface(raw) && raw !== 'proof') ? raw : null;
@@ -3780,6 +4463,14 @@
     canvasTier: canvasTier,
     parseFocus: parseFocus,
     CANVAS_WIDGETS: CANVAS_WIDGETS,
+    // M14 — the WebCrux tile canvas engine (pure grid/state fns + the view;
+    // the smoke unit-tests the pure subset and audits the grammar CSS).
+    tileSnap: tileSnap,
+    TILE_SIZE_MAP: TILE_SIZE_MAP,
+    tileAutoLayout: tileAutoLayout,
+    tileRenderedDims: tileRenderedDims,
+    tileExpandedDims: tileExpandedDims,
+    renderTileCanvas: renderTileCanvas,
     buildGraphModel: buildGraphModel,
     renderCanvas: renderCanvas,
     renderPage: renderPage,
