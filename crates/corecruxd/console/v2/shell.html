@@ -1703,7 +1703,7 @@
        backing raises the card clearly above the near-black canvas, while the
        backdrop blur still softens any wire passing UNDER it. */
     background:
-      linear-gradient(0deg, color-mix(in srgb, var(--ink2) 16%, transparent), color-mix(in srgb, var(--ink2) 16%, transparent)),
+      linear-gradient(90deg, color-mix(in srgb, var(--cv-c, var(--ink2)) 16%, transparent), color-mix(in srgb, var(--ink2) 5%, transparent) 65%),
       color-mix(in srgb, var(--bg) 78%, transparent);
     backdrop-filter: blur(8px) saturate(1.15); -webkit-backdrop-filter: blur(8px) saturate(1.15);
     box-shadow: 0 6px 18px rgba(0,0,0,.45); cursor: grab; outline: none; user-select: none;
@@ -2973,7 +2973,7 @@
 <script>
 (function () {
   'use strict';
-  var SW_REV = 'ushell-v2-r5';   // keep in lock-step with /console-v2/sw.js
+  var SW_REV = 'ushell-v2-r6';   // keep in lock-step with /console-v2/sw.js
   if (!('serviceWorker' in navigator)) { return; }
   // Dev bypass — when the daemon serves this shell from CORECRUXD_CONSOLE_DEV_PATH
   // it stamps window.__CRUX_CONSOLE_DEV__ (see console.rs inject_console_dev_flag).
