@@ -1682,24 +1682,16 @@
   .canvas-graph-stage:active { cursor: grabbing; }
   .cv-graph-layer { position: absolute; top: 0; left: 0; transform-origin: 0 0; }
   .cv-graph-edges { position: absolute; top: 0; left: 0; overflow: visible; pointer-events: none; }
-  /* Directional flow edges: a dashed stroke that marches from source → target
-     (stroke-dashoffset animation), tipped with an arrowhead marker. The head
-     tracks the edge stroke via context-stroke, so it recolours when hot. */
-  /* Dark casing painted under each edge: reads as a distinct connector layer in
-     the open channels between columns (behind-box runs are occluded by the
-     opaque cards, so only the transition segments show). */
-  .cv-gedge-casing { stroke: var(--bg); stroke-width: 5; fill: none; stroke-linecap: round; opacity: .9; }
-  .cv-gedge-casing.is-dim { opacity: .08; }
-  .cv-gedge {
-    stroke: var(--edge-strong); stroke-width: 2.2; fill: none; opacity: .95;
-    stroke-linecap: round; stroke-dasharray: 5 7;
-    animation: cv-flow 1.4s linear infinite;
-  }
-  .cv-arrowhead { fill: context-stroke; stroke: none; }
-  .cv-gedge.is-hot { stroke: var(--acc); opacity: 1; stroke-width: 2.8; animation-duration: .7s; }
-  .cv-gedge.is-dim { opacity: .12; animation: none; stroke-dasharray: none; }
-  @keyframes cv-flow { to { stroke-dashoffset: -24; } }
-  @media (prefers-reduced-motion: reduce) { .cv-gedge { animation: none; stroke-dasharray: none; } }
+  /* Straight solid wires tipped with a solid arrowhead at the target box edge; a
+     pulse dot travels each wire source → target to show flow (JS-driven). */
+  .cv-gedge { stroke: var(--edge-strong); stroke-width: 2; fill: none; opacity: .85; stroke-linecap: round; }
+  .cv-gedge.is-hot { stroke: var(--acc); opacity: 1; stroke-width: 2.6; }
+  .cv-gedge.is-dim { opacity: .1; }
+  .cv-arrowhead { fill: var(--edge-strong); stroke: none; }
+  .cv-arrowhead-hot { fill: var(--acc); }
+  .cv-pulse { fill: var(--acc); filter: drop-shadow(0 0 3px color-mix(in srgb, var(--acc) 60%, transparent)); }
+  .cv-pulse.is-hot { r: 4; }
+  .cv-pulse.is-dim { opacity: 0 !important; }
   /* Node cards */
   .cv-card {
     position: absolute; width: 300px; box-sizing: border-box; padding: 12px 14px;
@@ -1708,10 +1700,11 @@
        fully hidden — only the open-channel segments of an edge stay visible, so
        the connector layer reads cleanly instead of bleeding through the cards. */
     background-color: var(--bg); background-image: linear-gradient(0deg, var(--surface), var(--surface));
-    box-shadow: var(--card-shadow); cursor: pointer; outline: none;
+    box-shadow: var(--card-shadow); cursor: grab; outline: none; user-select: none;
     transition: border-color .12s ease, box-shadow .15s ease, transform .12s ease;
   }
   .cv-card:hover, .cv-card:focus-visible { transform: translateY(-2px); box-shadow: 0 14px 30px rgba(0,0,0,.4); }
+  .cv-card.is-dragging { cursor: grabbing; transform: none; box-shadow: 0 18px 40px rgba(0,0,0,.5); z-index: 50; transition: none; }
   .cv-card.is-sel { border-color: var(--acc); box-shadow: 0 0 0 1px var(--acc), 0 14px 30px rgba(0,0,0,.45); }
   .cv-card.is-dim { opacity: .3; }
   .cv-card[data-type="session"] { --cv-c: var(--ok); }

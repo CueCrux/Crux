@@ -2778,50 +2778,66 @@
     var layer = el('div', { 'class': 'cv-graph-layer' });
     layer.style.width = dims.width + 'px'; layer.style.height = dims.height + 'px';
     var svg = svgEl('svg', { 'class': 'cv-graph-edges', width: dims.width, height: dims.height, 'aria-hidden': 'true' });
-    // Arrowhead marker (userSpaceOnUse so it stays a constant size regardless of
-    // stroke width). Its fill tracks the edge stroke via context-stroke, so the
-    // head recolours when an edge lights up on selection.
+    // Two solid arrowhead markers (idle + hot) — userSpaceOnUse keeps them a
+    // constant size regardless of stroke width; fill is set per class in CSS.
     var defs = svgEl('defs');
-    var marker = svgEl('marker', { id: 'cvArrow', viewBox: '0 0 10 10', refX: '9', refY: '5', markerWidth: '11', markerHeight: '11', orient: 'auto-start-reverse', markerUnits: 'userSpaceOnUse' });
-    marker.appendChild(svgEl('path', { 'class': 'cv-arrowhead', d: 'M1 1 L9.5 5 L1 9 L3 5 z' }));
-    defs.appendChild(marker); svg.appendChild(defs);
-    layer.appendChild(svg);
-    function cx(n) { return n.x + (n.w || 300) / 2; }
-    function cy(n) { return n.y + (n.h || 106) / 2; }
-    // Where the segment from a node's centre toward (tx,ty) exits its card rect —
-    // so edges start/end on the card border (arrowheads land on the edge, and the
-    // line never disappears under a card).
-    function borderPoint(n, tx, ty) {
-      var ox = cx(n), oy = cy(n), dx = tx - ox, dy = ty - oy;
-      if (!dx && !dy) { return { x: ox, y: oy }; }
-      var hw = (n.w || 300) / 2, hh = (n.h || 106) / 2;
-      var s = Math.min(dx ? hw / Math.abs(dx) : Infinity, dy ? hh / Math.abs(dy) : Infinity);
-      return { x: ox + dx * s, y: oy + dy * s };
-    }
-    var edgeEls = [];
-    model.edges.forEach(function (e) {
-      var a = index[e.from], b = index[e.to]; if (!a || !b) { return; }
-      var p0 = borderPoint(a, cx(b), cy(b)), pe = borderPoint(b, cx(a), cy(a));
-      // Pull the endpoint a few px OUT of the target card so the arrowhead lands
-      // in the open channel at the box edge — the cards paint on top of the edge
-      // layer, so a head sitting on the border would be hidden under the box.
-      var vx = pe.x - p0.x, vy = pe.y - p0.y, vlen = Math.sqrt(vx * vx + vy * vy) || 1;
-      var GAP = 11;
-      var p1 = { x: pe.x - (vx / vlen) * GAP, y: pe.y - (vy / vlen) * GAP };
-      // Gentle horizontal S-curve (control points share each endpoint's y at the
-      // midpoint x) — reads cleanly in the column layout.
-      var mx = (p0.x + p1.x) / 2;
-      var d = 'M' + p0.x.toFixed(1) + ' ' + p0.y.toFixed(1) +
-        ' C' + mx.toFixed(1) + ' ' + p0.y.toFixed(1) + ' ' + mx.toFixed(1) + ' ' + p1.y.toFixed(1) + ' ' + p1.x.toFixed(1) + ' ' + p1.y.toFixed(1);
-      // A dark casing under the coloured dash makes each edge read as its own
-      // layer where it crosses open space (behind-box segments are occluded by
-      // the opaque cards, so the visible run is the transition channel).
-      var casing = svgEl('path', { 'class': 'cv-gedge-casing', d: d });
-      var ln = svgEl('path', { 'class': 'cv-gedge', d: d, 'marker-end': 'url(#cvArrow)' });
-      if (e.kind) { ln.setAttribute('data-kind', e.kind); }
-      ln.__from = e.from; ln.__to = e.to; ln.__casing = casing;
-      svg.appendChild(casing); svg.appendChild(ln); edgeEls.push(ln);
+    [['cvArrow', 'cv-arrowhead'], ['cvArrowHot', 'cv-arrowhead cv-arrowhead-hot']].forEach(function (m) {
+      var mk = svgEl('marker', { id: m[0], viewBox: '0 0 10 10', refX: '8', refY: '5', markerWidth: '9', markerHeight: '9', orient: 'auto-start-reverse', markerUnits: 'userSpaceOnUse' });
+      mk.appendChild(svgEl('path', { 'class': m[1], d: 'M0.5 0.5 L9.5 5 L0.5 9.5 z' }));
+      defs.appendChild(mk);
     });
+    svg.appendChild(defs);
+    layer.appendChild(svg);
+    var reduceMotion = (typeof window !== 'undefined' && window.matchMedia) ? window.matchMedia('(prefers-reduced-motion: reduce)').matches : false;
+    function nodeC(n) { var w = n.w || 300, h = n.h || 106; return { x: n.x + w / 2, y: n.y + h / 2, w: w, h: h }; }
+    // Exit point on a node's rect toward (tx,ty), OUTSET a few px so a straight
+    // wire stops just past the border and the arrowhead lands right at the box
+    // edge (the MediaCrux diagram-builder model).
+    function edgePoint(c, tx, ty) {
+      var dx = tx - c.x, dy = ty - c.y; if (!dx && !dy) { return { x: c.x, y: c.y }; }
+      var hw = c.w / 2 + 7, hh = c.h / 2 + 7;
+      var s = Math.min(hw / Math.abs(dx || 1e-6), hh / Math.abs(dy || 1e-6));
+      return { x: c.x + dx * s, y: c.y + dy * s };
+    }
+    // Straight wire between two nodes' border-exit points — recomputed live while a
+    // node is dragged so wires + pulses follow it.
+    function layoutEdge(eo) {
+      var a = index[eo.from], b = index[eo.to]; if (!a || !b) { return; }
+      var ca = nodeC(a), cb = nodeC(b);
+      var p1 = edgePoint(ca, cb.x, cb.y), p2 = edgePoint(cb, ca.x, ca.y);
+      eo.wire.setAttribute('d', 'M' + p1.x.toFixed(1) + ' ' + p1.y.toFixed(1) + ' L' + p2.x.toFixed(1) + ' ' + p2.y.toFixed(1));
+      eo.p1 = p1; eo.p2 = p2;
+      if (eo.pulse) { eo.pulse.setAttribute('cx', p1.x.toFixed(1)); eo.pulse.setAttribute('cy', p1.y.toFixed(1)); }
+    }
+    var edgeObjs = [], edgeEls = [];
+    model.edges.forEach(function (e, i) {
+      var a = index[e.from], b = index[e.to]; if (!a || !b) { return; }
+      var wire = svgEl('path', { 'class': 'cv-gedge', 'marker-end': 'url(#cvArrow)' });
+      if (e.kind) { wire.setAttribute('data-kind', e.kind); }
+      wire.__from = e.from; wire.__to = e.to;
+      svg.appendChild(wire);
+      var eo = { from: e.from, to: e.to, wire: wire, pulse: null, phase: (i % 10) / 10 };
+      if (!reduceMotion) { var pulse = svgEl('circle', { 'class': 'cv-pulse', r: '3.2' }); svg.appendChild(pulse); eo.pulse = pulse; }
+      layoutEdge(eo);
+      wire.__eo = eo; edgeObjs.push(eo); edgeEls.push(wire);
+    });
+    function relayoutEdges() { edgeObjs.forEach(layoutEdge); }
+    // Flow pulses travel source → target along each wire, fading in/out at the ends.
+    var rafId = null;
+    if (!reduceMotion && edgeObjs.length && typeof window !== 'undefined' && window.requestAnimationFrame) {
+      var tick = function (ts) {
+        var t = (ts || 0) / 2200;
+        edgeObjs.forEach(function (eo) {
+          if (!eo.pulse || !eo.p1) { return; }
+          var u = (t + eo.phase) % 1;
+          eo.pulse.setAttribute('cx', (eo.p1.x + (eo.p2.x - eo.p1.x) * u).toFixed(1));
+          eo.pulse.setAttribute('cy', (eo.p1.y + (eo.p2.y - eo.p1.y) * u).toFixed(1));
+          eo.pulse.setAttribute('opacity', u < 0.12 ? (u / 0.12).toFixed(2) : (u > 0.88 ? ((1 - u) / 0.12).toFixed(2) : '1'));
+        });
+        rafId = window.requestAnimationFrame(tick);
+      };
+      rafId = window.requestAnimationFrame(tick);
+    }
     var cardEls = {};
     model.nodes.forEach(function (n) {
       var card = el('div', { 'class': 'cv-card', 'data-type': n.type, role: 'button', tabindex: '0' });
@@ -2845,7 +2861,27 @@
       var idline = (n.extra && n.extra.session_id) || (n.type === 'work' ? n.id : null);
       if (idline) { card.appendChild(el('div', { 'class': 'cv-card-id', text: idline })); }
       function open() { select(n.key); onSelect(n); }
-      card.addEventListener('click', function (ev) { ev.stopPropagation(); open(); });
+      // Drag to move: delta ÷ view.scale → layer space; wires reflow every frame.
+      // A ≤3px press is a click (select + inspect); a real drag just repositions.
+      card.addEventListener('mousedown', function (ev) {
+        if (ev.button !== 0) { return; }
+        ev.stopPropagation();
+        var sx = ev.clientX, sy = ev.clientY, ox = n.x, oy = n.y, moved = false;
+        card.classList.add('is-dragging');
+        function mv(e) {
+          if (Math.abs(e.clientX - sx) + Math.abs(e.clientY - sy) > 3) { moved = true; }
+          n.x = Math.max(0, ox + (e.clientX - sx) / view.scale);
+          n.y = Math.max(0, oy + (e.clientY - sy) / view.scale);
+          card.style.left = n.x + 'px'; card.style.top = n.y + 'px';
+          relayoutEdges();
+        }
+        function up() {
+          window.removeEventListener('mousemove', mv); window.removeEventListener('mouseup', up);
+          card.classList.remove('is-dragging');
+          if (!moved) { open(); }
+        }
+        window.addEventListener('mousemove', mv); window.addEventListener('mouseup', up);
+      });
       card.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); open(); } });
       layer.appendChild(card); cardEls[n.key] = card;
     });
@@ -2870,7 +2906,10 @@
     function select(key) {
       if (key == null) {
         Object.keys(cardEls).forEach(function (k) { cardEls[k].classList.remove('is-sel'); cardEls[k].classList.remove('is-dim'); });
-        edgeEls.forEach(function (ln) { ln.classList.remove('is-dim'); ln.classList.remove('is-hot'); if (ln.__casing) { ln.__casing.classList.remove('is-dim'); } });
+        edgeEls.forEach(function (ln) {
+          ln.classList.remove('is-dim'); ln.classList.remove('is-hot'); ln.setAttribute('marker-end', 'url(#cvArrow)');
+          if (ln.__eo && ln.__eo.pulse) { ln.__eo.pulse.classList.remove('is-dim'); ln.__eo.pulse.classList.remove('is-hot'); }
+        });
         return;
       }
       var nbr = graphNeighbourhood(model.edges, key); nbr[key] = true;
@@ -2884,7 +2923,8 @@
         var dim = hasLinks && !(nbr[ln.__from] && nbr[ln.__to]);
         ln.classList.toggle('is-hot', touches);   // the selected node's own edges light up + flow faster
         ln.classList.toggle('is-dim', dim);
-        if (ln.__casing) { ln.__casing.classList.toggle('is-dim', dim); }
+        ln.setAttribute('marker-end', touches ? 'url(#cvArrowHot)' : 'url(#cvArrow)');
+        if (ln.__eo && ln.__eo.pulse) { ln.__eo.pulse.classList.toggle('is-hot', touches); ln.__eo.pulse.classList.toggle('is-dim', dim); }
       });
     }
 
@@ -2897,7 +2937,10 @@
     function onUp() { drag = null; }
     stage.addEventListener('wheel', function (ev) { ev.preventDefault(); var f = ev.deltaY < 0 ? 1.1 : 0.9; view.scale = Math.max(0.4, Math.min(2.2, view.scale * f)); apply(); });
     if (typeof window !== 'undefined') { window.addEventListener('mousemove', onMove); window.addEventListener('mouseup', onUp); }
-    __canvasGraphCleanup = function () { if (typeof window !== 'undefined') { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); } };
+    __canvasGraphCleanup = function () {
+      if (rafId != null && typeof window !== 'undefined' && window.cancelAnimationFrame) { window.cancelAnimationFrame(rafId); rafId = null; }
+      if (typeof window !== 'undefined') { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); }
+    };
 
     // Focus deep-link: select + highlight the node's neighbourhood + open panel.
     if (focus && focus.type && focus.id != null) {
