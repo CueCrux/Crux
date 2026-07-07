@@ -137,6 +137,21 @@ def sorted_counts(counts: Counter[str]) -> dict[str, int]:
     return {key: counts[key] for key in sorted(counts)}
 
 
+def response_count_map(payload: dict[str, Any], key: str) -> dict[str, int] | None:
+    raw = payload.get(key)
+    if not isinstance(raw, dict):
+        return None
+    counts: dict[str, int] = {}
+    for label, value in raw.items():
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            continue
+        if count > 0:
+            counts[str(label)] = count
+    return {label: counts[label] for label in sorted(counts)}
+
+
 def proxy_conclusion(
     provider_family_counts: Counter[str],
     actor_family_counts: Counter[str],
@@ -342,8 +357,15 @@ def fetch_inputs(args: argparse.Namespace) -> tuple[dict[str, Any], list[dict[st
             headers,
             args.timeout,
         )
-        provider_breakdown, provider_warnings = fetch_provider_breakdown(args, headers, aggregate)
-        principal_breakdown = {}
+        provider_breakdown = response_count_map(aggregate, "provider_counts")
+        principal_breakdown = response_count_map(aggregate, "principal_counts") or {}
+        provider_warnings = []
+        if provider_breakdown is None:
+            provider_breakdown, provider_warnings = fetch_provider_breakdown(args, headers, aggregate)
+        elif args.until_was_explicit:
+            provider_warnings.append(
+                "HTTP provider counts are exact for the since lower bound only; /v1/observations/aggregate has no until filter"
+            )
         observation_mode = "http"
     facts = fetch_fact_export(args, headers)
     return aggregate, facts, provider_breakdown, principal_breakdown, provider_warnings, observation_mode

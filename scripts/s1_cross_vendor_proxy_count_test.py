@@ -72,6 +72,36 @@ class S1CrossVendorProxyCountTest(unittest.TestCase):
         self.assertFalse(summary["proxy_cross_vendor_activity"])
         self.assertEqual(summary["known_vendor_families"], ["anthropic"])
 
+    def test_response_count_map_normalizes_aggregate_breakdowns(self) -> None:
+        counts = module.response_count_map(
+            {
+                "provider_counts": {
+                    "openai": "2",
+                    "claude-code": 3,
+                    "zero": 0,
+                    "bad": "not-a-number",
+                }
+            },
+            "provider_counts",
+        )
+
+        self.assertEqual(counts, {"claude-code": 3, "openai": 2})
+
+    def test_summarize_uses_exact_provider_breakdown_when_sample_is_limited(self) -> None:
+        summary = module.summarize(
+            {"matched": 42, "returned": 1, "observations": []},
+            [],
+            since="2026-07-01T00:00:00Z",
+            until="2026-07-02T00:00:00Z",
+            provider_breakdown={"claude-code": 40, "openai": 2},
+            principal_breakdown={"claude-work": 40, "codex-work": 2},
+        )
+
+        self.assertEqual(summary["observations"]["provider_counts"], {"claude-code": 40, "openai": 2})
+        self.assertEqual(summary["observations"]["principal_counts"], {"claude-work": 40, "codex-work": 2})
+        self.assertEqual(summary["observations"]["sample_counted_in_window"], 0)
+        self.assertTrue(summary["proxy_cross_vendor_activity"])
+
     def test_data_dir_scan_counts_exact_providers_without_payload_leak(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             observations = pathlib.Path(tmp) / "observations"
