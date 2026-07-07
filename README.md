@@ -16,7 +16,7 @@ how much context every model call re-read, where it went, and what to change to 
 retrieval under hard token budgets, and an Ed25519 receipt for every write.
 One binary. No API keys. Nothing leaves your machine.
 
-[Quickstart](#quickstart) · [Console](#the-console) · [How it works](#how-it-works) ·
+[Quickstart](#quickstart) · [Docs](docs/README.md) · [Console](#the-console) · [How it works](#how-it-works) ·
 [Capabilities](#what-you-get) · [Verify releases](docs/verify-release.md) ·
 [Security](SECURITY.md) · [Support](#support--security) · [Licence](#licence)
 
@@ -58,6 +58,8 @@ No signup. No OpenAI key. BM25 retrieval works out of the box — embeddings are
 pluggable when you want them.
 
 **Two steps to live:** bring the daemon up, then run the one on-ramp command.
+For the longer install path, start at [docs/getting-started.md](docs/getting-started.md);
+the public docs index is [docs/README.md](docs/README.md).
 
 **1 — bring the daemon up** (Docker recommended):
 
@@ -73,7 +75,7 @@ the embedded console walks you through one-time setup and becomes your local das
 ```bash
 curl -sSL https://github.com/CueCrux/Crux/releases/latest/download/crux-linux-amd64 -o crux
 chmod +x crux
-CORECRUXD_AUTH_MODE=off CORECRUXD_DATA_DIR=./data ./crux
+CORECRUXD_AUTH_MODE=dev_scopes CORECRUXD_DATA_DIR=./data ./crux
 ```
 
 **From source** (Rust 1.88+, `protobuf-compiler`):
@@ -81,7 +83,7 @@ CORECRUXD_AUTH_MODE=off CORECRUXD_DATA_DIR=./data ./crux
 ```bash
 git clone https://github.com/CueCrux/Crux.git && cd Crux
 cargo build --release
-CORECRUXD_AUTH_MODE=off CORECRUXD_DATA_DIR=./data ./target/release/corecruxd
+CORECRUXD_AUTH_MODE=dev_scopes CORECRUXD_DATA_DIR=./data ./target/release/corecruxd
 ```
 
 **2 — get live (one command):**
@@ -112,7 +114,8 @@ rail:
   Ready-made connector configs live in [`examples/mcp-configs/`](examples/mcp-configs/).
 </details>
 
-`CORECRUXD_AUTH_MODE` is required; use `off` only for local development.
+`CORECRUXD_AUTH_MODE` is required; `dev_scopes` is the single-user loopback
+quickstart rail. Use `off` only for throwaway local development.
 
 **Local storage boundary:** Crux receipts and BLAKE3 chains prove integrity,
 not confidentiality. The daemon data directory is not encrypted by Crux; use
