@@ -17,7 +17,8 @@ retrieval under hard token budgets, and an Ed25519 receipt for every write.
 One binary. No API keys. Nothing leaves your machine.
 
 [Quickstart](#quickstart) · [Console](#the-console) · [How it works](#how-it-works) ·
-[Capabilities](#what-you-get) · [EU AI Act](#eu-ai-act) · [Licence](#licence)
+[Capabilities](#what-you-get) · [Verify releases](docs/verify-release.md) ·
+[Security](SECURITY.md) · [Support](#support--security) · [Licence](#licence)
 
 [![CI](https://github.com/CueCrux/Crux/actions/workflows/ci.yml/badge.svg)](https://github.com/CueCrux/Crux/actions/workflows/ci.yml)
 [![Coverage](https://img.shields.io/badge/coverage-CI%20gated-green)](https://github.com/CueCrux/Crux/actions/workflows/coverage-attestation.yml)
@@ -559,6 +560,16 @@ Built in the open, verified in the open.
 [Contributing](CONTRIBUTING.md) · [Security policy](SECURITY.md) ·
 [Code of conduct](CODE_OF_CONDUCT.md) · [Changelog](CHANGELOG.md) ·
 [Trust Contract](TRUST-CONTRACT.md)
+
+## Support & security
+
+- Before running a release artifact, verify its signature, SBOM and provenance with
+  [`docs/verify-release.md`](docs/verify-release.md).
+- Report vulnerabilities privately through [`SECURITY.md`](SECURITY.md); do not open a public
+  issue for security bugs.
+- For non-security bugs or feature requests, use the GitHub issue templates:
+  [bug report](.github/ISSUE_TEMPLATE/bug_report.yml) or
+  [feature request](.github/ISSUE_TEMPLATE/feature_request.yml).
 
 ## Licence
 
