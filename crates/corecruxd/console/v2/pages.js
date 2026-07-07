@@ -256,6 +256,9 @@
   }
 
   function buildSessions(res) {
+    // Demo mode: real saved sessions are bare id rows locally, so a demoOn()-guarded
+    // fixture paints richer resume/audit detail (execplan · passport · turns).
+    if (typeof window !== 'undefined' && window.CRUX_DEMO && CruxDemo.sessions) { res = { ok: true, data: { sessions: CruxDemo.sessions } }; }
     if (!res.ok || !res.data) { return [{ h: 'Sessions', wide: true, controls: [{ t: 'search', ph: 'Filter sessions…' }].concat(degraded(res.status, 'Sessions unavailable — GET /v1/console/sessions')) }]; }
     var list = arr(res.data.sessions || res.data.items || res.data);
     var live = list.filter(function (s) { return !s.archived; });
@@ -317,8 +320,10 @@
 
   function buildWork(res) {
     var head = { h: 'ExecPlans', sub: 'list view — same data as the kanban · /v1/work?source=all', wide: true, controls: [{ t: 'search', ph: 'Filter plans…' }] };
-    if (!res.ok || !res.data) { return [head, { h: 'Work', wide: true, controls: degraded(res.status, 'Work board unavailable — GET /v1/work?source=all') }]; }
-    var items = arr(res.data.work || res.data.items);
+    var items = (res && res.ok && res.data) ? arr(res.data.work || res.data.items) : [];
+    // Demo mode: fall back to the demoOn()-guarded work fixture when the board is empty.
+    if (!items.length && typeof window !== 'undefined' && window.CRUX_DEMO && CruxDemo.work) { items = CruxDemo.work; }
+    if (!items.length) { return [head, { h: 'Work', wide: true, controls: degraded((res && res.status) || 0, 'Work board unavailable — GET /v1/work?source=all') }]; }
     var mk = function (w) {
       var stage = workStageOf(w);   // planned | in_progress | blocked | done — drives the left strip (item 7)
       return { t: 'exp', strip: stage, label: w.title || w.id, sub: (w.milestones_total ? ('M ' + (w.milestones_done || 0) + '/' + w.milestones_total) : '') || w.current_milestone || w.plan_path || '', badge: stage.replace('_', ' '),
@@ -1348,10 +1353,20 @@
       engineLatencySeries: wave(12, 41, 9, 11),
       // Representative work + memory states (fixtures kept complete).
       work: [
-        { id: 'execplan:unified-shell-console', title: 'unified-shell-console', state: 'in_progress', risk_class: 'medium', current_milestone: 'M7', milestones_total: 8, milestones_done: 6 },
-        { id: 'execplan:corecrux-trait-expansion', title: 'corecrux-trait-expansion', state: 'blocked', risk_class: 'high', current_milestone: 'M3' },
-        { id: 'execplan:cruxengine-carry-all', title: 'cruxengine-carry-all', state: 'planned', risk_class: 'low' },
-        { id: 'execplan:context-custody-surface', title: 'context-custody-surface', state: 'done', risk_class: 'medium' }
+        { id: 'execplan:unified-shell-console', title: 'unified-shell-console', state: 'in_progress', risk_class: 'medium', current_milestone: 'M7', milestones_total: 8, milestones_done: 6, plan_path: '.agent/execplans/unified-shell-console.md', assignee_passport: 'p_opus_local', linked_pr: 'CueCrux/Crux#332', updated_at: new Date(NOW - 8 * MIN).toISOString() },
+        { id: 'execplan:corecrux-trait-expansion', title: 'corecrux-trait-expansion', state: 'blocked', risk_class: 'high', current_milestone: 'M3', milestones_total: 5, milestones_done: 2, plan_path: '.agent/execplans/corecrux-trait-expansion.md', assignee_passport: 'p_sonnet_ce4e6c', updated_at: new Date(NOW - 41 * MIN).toISOString() },
+        { id: 'execplan:cruxengine-carry-all', title: 'cruxengine-carry-all', state: 'planned', risk_class: 'low', current_milestone: 'M1', milestones_total: 6, milestones_done: 0, plan_path: '.agent/execplans/cruxengine-carry-all.md', updated_at: new Date(NOW - 3 * HOUR).toISOString() },
+        { id: 'execplan:context-custody-surface', title: 'context-custody-surface', state: 'done', risk_class: 'medium', current_milestone: 'M4', milestones_total: 4, milestones_done: 4, plan_path: '.agent/execplans/context-custody-surface.md', assignee_passport: 'p_opus_local', linked_pr: 'CueCrux/Crux#318', updated_at: new Date(NOW - 2 * DAY).toISOString() }
+      ],
+      // Saved sessions — richer than the bare id rows a fresh local daemon holds,
+      // so the resume/audit surface reads well in demo mode.
+      sessions: [
+        { session_id: 'sess_7f3a1c2b', execplan_slug: 'unified-shell-console', passport_id: 'p_opus_local', status: 'active', turn_count: 214, tenant_id: 'default', updated_at: new Date(NOW - 4 * MIN).toISOString() },
+        { session_id: 'sess_2be40d19', execplan_slug: 'corecrux-trait-expansion', passport_id: 'p_sonnet_ce4e6c', status: 'active', turn_count: 89, tenant_id: 'default', updated_at: new Date(NOW - 12 * MIN).toISOString() },
+        { session_id: 'handoff:context-custody', execplan_slug: 'context-custody-surface', passport_id: 'p_opus_local', status: 'idle', turn_count: 47, tenant_id: 'default', updated_at: new Date(NOW - 2 * HOUR).toISOString() },
+        { session_id: 'sess_a1b2c3d4', execplan_slug: 'cruxengine-carry-all', passport_id: 'p_haiku_bench', status: 'idle', turn_count: 12, tenant_id: 'bench', updated_at: new Date(NOW - 6 * HOUR).toISOString() },
+        { session_id: 'sess_9c5a9271', execplan_slug: 'unified-shell-console', passport_id: 'p_opus_local', status: 'idle', turn_count: 156, tenant_id: 'default', updated_at: new Date(NOW - 1 * DAY).toISOString() },
+        { session_id: 'sess_e6f81234', execplan_slug: 'wikicrux-agent-first', passport_id: 'p_sonnet_ce4e6c', status: 'archived', archived: true, turn_count: 73, tenant_id: 'default', updated_at: new Date(NOW - 3 * DAY).toISOString() }
       ],
       facts: [
         { entity: 'execplan:unified-shell-console', key: 'gate:M6', value: '{ status: passing, commit_sha: 1a60d25 }', stored_at: new Date(NOW - 3 * HOUR).toISOString() },
