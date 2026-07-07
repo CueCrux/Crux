@@ -1704,7 +1704,11 @@
   .cv-card {
     position: absolute; width: 300px; box-sizing: border-box; padding: 12px 14px;
     border: 1px solid var(--edge); border-left: 3px solid var(--cv-c, var(--ink3)); border-radius: 12px;
-    background: var(--surface); box-shadow: var(--card-shadow); cursor: pointer; outline: none;
+    /* Opaque backing (bg) under the glass tint so edges routed BEHIND a card are
+       fully hidden — only the open-channel segments of an edge stay visible, so
+       the connector layer reads cleanly instead of bleeding through the cards. */
+    background-color: var(--bg); background-image: linear-gradient(0deg, var(--surface), var(--surface));
+    box-shadow: var(--card-shadow); cursor: pointer; outline: none;
     transition: border-color .12s ease, box-shadow .15s ease, transform .12s ease;
   }
   .cv-card:hover, .cv-card:focus-visible { transform: translateY(-2px); box-shadow: 0 14px 30px rgba(0,0,0,.4); }
