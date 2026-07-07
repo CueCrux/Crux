@@ -17,6 +17,8 @@ server run on your machine without a hosted account.
 
 - [Operations guide](ops-guide.md) - daemon operation, backups, upgrades, and
   production-minded checks.
+- [Incident communications](incident-comms.md) - paid-tenant incident timeline
+  and update templates.
 - [Release packaging](release-packaging.md) - supported launch artifacts and
   installer posture.
 - [Update channel](update-channel.md) - explicit upgrade behavior and version
