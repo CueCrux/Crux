@@ -122,6 +122,27 @@ pub fn list_repos(store: &FactStore, tenant_id: &str) -> Vec<RepoRegistration> {
     repos
 }
 
+pub fn list_all_repos(store: &FactStore) -> Vec<RepoRegistration> {
+    let result = store.query(&FactQuery {
+        query: None,
+        entity: None,
+        entity_prefix: Some(format!("{REPO_REGISTRY_PREFIX}::")),
+        top_k: 10_000,
+        token_budget: None,
+    });
+    let mut repos = Vec::new();
+    for fact in crate::fact_helpers::dedup_latest(result.facts) {
+        if fact.key != REPO_FACT_KEY {
+            continue;
+        }
+        if let Ok(registration) = serde_json::from_str::<RepoRegistration>(&fact.value) {
+            repos.push(registration);
+        }
+    }
+    repos.sort_by(|a, b| a.tenant_id.cmp(&b.tenant_id).then_with(|| a.repo_id.cmp(&b.repo_id)));
+    repos
+}
+
 pub fn get_repo(store: &FactStore, tenant_id: &str, repo_id: &str) -> Option<RepoRegistration> {
     let entity = registry_entity(tenant_id, repo_id);
     let result = store.query(&FactQuery {

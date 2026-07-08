@@ -1471,6 +1471,7 @@ pub(crate) fn parse_file_doc_header(src: &str) -> (Option<String>, Option<String
 
 /// Parsed representation of a `.route("/path", METHOD(handler))` line. The
 /// caller resolves `handler_fn` to a definition file via the symbol index.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ParsedRoute {
     pub(crate) method: String,
     pub(crate) path: String,

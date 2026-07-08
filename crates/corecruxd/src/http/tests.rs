@@ -426,6 +426,7 @@ pub(super) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         retention_days: None,
         retrieval_index: Arc::new(RwLock::new(corecrux_retrieval::IndexManager::new())),
         fact_store: Arc::new(RwLock::new(corecrux_memory::FactStore::new())),
+        repo_watch: None,
         extension_rate_table: Arc::new(crate::extension_outbound::RateTable::new()),
         #[cfg(feature = "wasm-extensions")]
         wasm_engine: None,

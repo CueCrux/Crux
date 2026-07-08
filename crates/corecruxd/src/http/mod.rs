@@ -304,6 +304,9 @@ pub struct AppState {
     pub retrieval_index: Arc<RwLock<corecrux_retrieval::IndexManager>>,
     /// Crux Daemon fact store (receipted entity memory).
     pub fact_store: Arc<RwLock<corecrux_memory::FactStore>>,
+    /// Optional active repository watcher. `None` unless
+    /// `CORECRUXD_REPO_WATCH` is truthy at daemon startup.
+    pub repo_watch: Option<crate::repo_watch::RepoWatchService>,
     /// Process-wide rate-limit table for community-extension dispatch
     /// (M4 Phase A). Sliding 60-second window keyed by
     /// (extension_id, passport_fpr); cap is per-grant or daemon default.

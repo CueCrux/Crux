@@ -15,8 +15,8 @@ use syn::visit::Visit;
 
 use crate::workspace_scan::{
     parse_crate_name, parse_file_doc_header, parse_internal_path_deps, parse_routes_in_source, parse_stub_line,
-    walk_dir, CrateInfo, DeadSymbol, DepEdge, FileInfo, FileReference, RouteHit, ScanDiagnostics, ScanError, ScanStats,
-    StubHit, SymbolInfo, UnresolvedRoute, WorkspaceScan,
+    walk_dir, CrateInfo, DeadSymbol, DepEdge, FileInfo, FileReference, ParsedRoute, RouteHit, ScanDiagnostics,
+    ScanError, ScanStats, StubHit, SymbolInfo, UnresolvedRoute, WorkspaceScan,
 };
 
 pub(crate) fn run_scan_ast_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
@@ -24,120 +24,284 @@ pub(crate) fn run_scan_ast_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
     let started_inst = std::time::Instant::now();
-    let scan_id = format!("ws_{started_ms}");
+    let cache = AstScanCache::from_root(root)?;
+    let mut scan = assemble_scan(root, &cache);
+    reset_scan_start(&mut scan, started_ms);
+    finish_scan_timing(&mut scan, started_inst);
+    Ok(scan)
+}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IncrementalUpdateStats {
+    pub files_reparsed: usize,
+    pub cache_hits: usize,
+    pub files_dropped: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct IncrementalScanResult {
+    pub scan: WorkspaceScan,
+    pub stats: IncrementalUpdateStats,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AstScanCache {
+    pub root_path: PathBuf,
+    crate_dirs: BTreeMap<String, PathBuf>,
+    crate_internal_deps: BTreeMap<String, Vec<String>>,
+    crate_order: Vec<String>,
+    pub files: BTreeMap<String, CachedFile>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CachedFile {
+    pub rel_path: String,
+    pub crate_name: String,
+    pub module_path: String,
+    pub mtime_ms: u64,
+    pub len: u64,
+    pub content_hash: String,
+    pub loc: usize,
+    pub doc_summary: Option<String>,
+    pub doc_full: Option<String>,
+    pub is_test_file: bool,
+    pub stubs: Vec<StubHit>,
+    pub symbols: Vec<SymbolInfo>,
+    fns: Vec<CachedFnDef>,
+    deps: Vec<DepEdge>,
+    routes: Vec<ParsedRoute>,
+    ident_refs: HashMap<String, usize>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedFnDef {
+    qualified: String,
+    simple: String,
+    crate_name: String,
+    module_path: String,
+    file: String,
+    local_symbol_idx: usize,
+    calls: Vec<CallRef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileSignature {
+    mtime_ms: u64,
+    len: u64,
+}
+
+impl AstScanCache {
+    pub(crate) fn from_root(root: &Path) -> Result<Self, ScanError> {
+        let workspace = discover_workspace(root)?;
+        let known_crate_names: BTreeSet<String> = workspace.crate_dirs.keys().cloned().collect();
+        let mut files = BTreeMap::new();
+        for (cname, crate_files) in &workspace.files_by_crate {
+            let Some(crate_root) = workspace.crate_dirs.get(cname) else {
+                continue;
+            };
+            for abs in crate_files {
+                let cached = parse_file_ast(root, cname, crate_root, abs, &known_crate_names)?;
+                files.insert(cached.rel_path.clone(), cached);
+            }
+        }
+        Ok(Self {
+            root_path: root.to_path_buf(),
+            crate_dirs: workspace.crate_dirs,
+            crate_internal_deps: workspace.crate_internal_deps,
+            crate_order: workspace.files_by_crate.keys().cloned().collect(),
+            files,
+        })
+    }
+}
+
+pub(crate) fn assemble_scan(root: &Path, cache: &AstScanCache) -> WorkspaceScan {
+    let started_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    assemble_scan_at(root, cache, started_ms)
+}
+
+pub(crate) fn update_cache_incremental(
+    root: &Path,
+    cache: &mut AstScanCache,
+    changed_paths: &[PathBuf],
+) -> Result<IncrementalScanResult, ScanError> {
+    let started_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let started_inst = std::time::Instant::now();
+    let stats = refresh_cache(root, cache, changed_paths)?;
+    let mut scan = assemble_scan(root, cache);
+    reset_scan_start(&mut scan, started_ms);
+    finish_scan_timing(&mut scan, started_inst);
+    Ok(IncrementalScanResult { scan, stats })
+}
+
+fn reset_scan_start(scan: &mut WorkspaceScan, started_ms: u64) {
+    scan.scan_id = format!("ws_{started_ms}");
+    scan.started_at_unix_ms = started_ms;
+}
+
+fn finish_scan_timing(scan: &mut WorkspaceScan, started_inst: std::time::Instant) {
+    let elapsed_ms = started_inst.elapsed().as_millis() as u64;
+    scan.finished_at_unix_ms = scan.started_at_unix_ms + elapsed_ms;
+    scan.duration_ms = elapsed_ms;
+}
+
+fn assemble_scan_at(root: &Path, cache: &AstScanCache, started_ms: u64) -> WorkspaceScan {
     let mut scan = WorkspaceScan {
-        scan_id,
+        scan_id: format!("ws_{started_ms}"),
         root_path: root.display().to_string(),
         started_at_unix_ms: started_ms,
         diagnostics: ScanDiagnostics::default(),
         ..Default::default()
     };
-
-    let workspace = discover_workspace(root)?;
-    let known_crate_names: BTreeSet<String> = workspace.crate_dirs.keys().cloned().collect();
     let mut index = Index::default();
     let mut file_idx_by_path: HashMap<String, usize> = HashMap::new();
+    let mut local_symbol_to_global: HashMap<(String, usize), usize> = HashMap::new();
     let mut ident_refs: HashMap<String, usize> = HashMap::new();
 
-    for (cname, files) in &workspace.files_by_crate {
-        let Some(crate_root) = workspace.crate_dirs.get(cname) else {
+    for cname in &cache.crate_order {
+        let Some(crate_root) = cache.crate_dirs.get(cname) else {
             continue;
         };
         let mut crate_loc = 0usize;
         let mut crate_file_count = 0usize;
-
-        for abs in files {
-            let rel = abs.strip_prefix(root).map_or_else(|_| abs.clone(), Path::to_path_buf);
-            let rel_str = rel.display().to_string();
-            let module_path = crate::workspace_scan::infer_module_path(cname, crate_root, abs);
-            let src = std::fs::read_to_string(abs).unwrap_or_default();
-            let loc = src.lines().count();
-            let (doc_full, doc_summary) = parse_file_doc_header(&src);
-            let is_test_file = crate::workspace_scan::looks_like_test_file(&rel_str, &src);
+        for file in cache.files.values().filter(|f| &f.crate_name == cname) {
             let file_idx = scan.files.len();
-            file_idx_by_path.insert(rel_str.clone(), file_idx);
-
-            crate_loc += loc;
+            file_idx_by_path.insert(file.rel_path.clone(), file_idx);
+            crate_loc += file.loc;
             crate_file_count += 1;
             scan.files.push(FileInfo {
-                rel_path: rel_str.clone(),
-                crate_name: cname.clone(),
-                module_path: module_path.clone(),
-                loc,
-                symbol_count: 0,
-                stub_count: 0,
-                doc_summary,
-                doc_full,
+                rel_path: file.rel_path.clone(),
+                crate_name: file.crate_name.clone(),
+                module_path: file.module_path.clone(),
+                loc: file.loc,
+                symbol_count: file.symbols.len(),
+                stub_count: file.stubs.len(),
+                doc_summary: file.doc_summary.clone(),
+                doc_full: file.doc_full.clone(),
                 defines: Vec::new(),
                 references: Vec::new(),
                 referenced_by: Vec::new(),
-                is_test_file,
+                is_test_file: file.is_test_file,
             });
-
-            let is_scanner_source = rel_str.ends_with("corecruxd/src/workspace_scan.rs")
-                || rel_str.ends_with("corecruxd/src/workspace_scan_ast.rs");
-            if !is_scanner_source {
-                for (line_no, line) in src.lines().enumerate() {
-                    if let Some((kind, snippet)) = parse_stub_line(line) {
-                        scan.stubs.push(StubHit {
-                            crate_name: cname.clone(),
-                            file_rel_path: rel_str.clone(),
-                            line: line_no + 1,
-                            kind: kind.to_string(),
-                            snippet,
-                        });
-                        scan.files[file_idx].stub_count += 1;
-                    }
-                }
+            scan.stubs.extend(file.stubs.iter().cloned());
+            scan.deps.extend(file.deps.iter().cloned());
+            for (local_idx, symbol) in file.symbols.iter().cloned().enumerate() {
+                let global_idx = scan.symbols.len();
+                scan.symbols.push(symbol);
+                local_symbol_to_global.insert((file.rel_path.clone(), local_idx), global_idx);
             }
-
-            let parsed = match syn::parse_file(&src) {
-                Ok(parsed) => parsed,
-                Err(_) => continue,
-            };
-            collect_identifier_refs(&parsed, &mut ident_refs);
-            let mut line_lookup = LineLookup::new(&src);
-            index_items(
-                &mut scan,
-                &mut index,
-                &mut file_idx_by_path,
-                &known_crate_names,
-                &mut line_lookup,
-                &parsed.items,
-                FileCtx {
-                    crate_name: cname,
-                    crate_root,
-                    rel_path: &rel_str,
-                    module_path: &module_path,
-                    file_idx,
-                },
-            );
+            for (ident, count) in &file.ident_refs {
+                *ident_refs.entry(ident.clone()).or_insert(0) += *count;
+            }
         }
-
-        let crate_root = crate_root.clone();
         scan.crates.push(CrateInfo {
             name: cname.clone(),
             rel_path: crate_root
                 .strip_prefix(root)
                 .map_or_else(|_| crate_root.display().to_string(), |p| p.display().to_string()),
-            internal_deps: workspace.crate_internal_deps.get(cname).cloned().unwrap_or_default(),
+            internal_deps: cache.crate_internal_deps.get(cname).cloned().unwrap_or_default(),
             file_count: crate_file_count,
             total_loc: crate_loc,
         });
     }
 
+    for file in cache.files.values() {
+        for def in &file.fns {
+            let Some(symbol_idx) = local_symbol_to_global
+                .get(&(file.rel_path.clone(), def.local_symbol_idx))
+                .copied()
+            else {
+                continue;
+            };
+            index.push(FnDef {
+                qualified: def.qualified.clone(),
+                simple: def.simple.clone(),
+                crate_name: def.crate_name.clone(),
+                module_path: def.module_path.clone(),
+                file: def.file.clone(),
+                symbol_idx,
+                calls: def.calls.clone(),
+            });
+        }
+    }
+
     denormalize_defines(&mut scan, &file_idx_by_path);
-    resolve_routes(root, &workspace, &index, &mut scan, &file_idx_by_path);
+    resolve_routes_from_cache(cache, &index, &mut scan);
     resolve_references(&mut scan, &index, &file_idx_by_path);
     build_referenced_by(&mut scan);
     compute_dead_code(&mut scan, &ident_refs);
     roll_up_stats(&mut scan);
+    scan
+}
 
-    let elapsed_ms = started_inst.elapsed().as_millis() as u64;
-    scan.finished_at_unix_ms = scan.started_at_unix_ms + elapsed_ms;
-    scan.duration_ms = elapsed_ms;
-    Ok(scan)
+fn refresh_cache(
+    root: &Path,
+    cache: &mut AstScanCache,
+    changed_paths: &[PathBuf],
+) -> Result<IncrementalUpdateStats, ScanError> {
+    let workspace = discover_workspace(root)?;
+    let known_crate_names: BTreeSet<String> = workspace.crate_dirs.keys().cloned().collect();
+    cache.root_path = root.to_path_buf();
+    cache.crate_dirs = workspace.crate_dirs.clone();
+    cache.crate_internal_deps = workspace.crate_internal_deps.clone();
+    cache.crate_order = workspace.files_by_crate.keys().cloned().collect();
+
+    let changed: BTreeSet<PathBuf> = changed_paths.iter().map(|p| absolutize(root, p)).collect();
+    let mut current = BTreeSet::new();
+    let mut stats = IncrementalUpdateStats {
+        files_reparsed: 0,
+        cache_hits: 0,
+        files_dropped: 0,
+    };
+
+    for (cname, files) in &workspace.files_by_crate {
+        let Some(crate_root) = workspace.crate_dirs.get(cname) else {
+            continue;
+        };
+        for abs in files {
+            let rel = rel_string(root, abs);
+            if !is_rs_path(abs) || should_ignore_path(Path::new(&rel)) {
+                continue;
+            }
+            current.insert(rel.clone());
+            let signature = file_signature(abs)?;
+            let changed_explicitly = changed.contains(&absolutize(root, abs));
+            if let Some(cached) = cache.files.get(&rel) {
+                if cached.mtime_ms == signature.mtime_ms && cached.len == signature.len {
+                    if changed_explicitly {
+                        let src = std::fs::read(abs).unwrap_or_default();
+                        let content_hash = blake3::hash(&src).to_hex().to_string();
+                        if content_hash != cached.content_hash {
+                            let cached = parse_file_ast(root, cname, crate_root, abs, &known_crate_names)?;
+                            cache.files.insert(rel, cached);
+                            stats.files_reparsed += 1;
+                            continue;
+                        }
+                    }
+                    stats.cache_hits += 1;
+                    continue;
+                }
+            }
+            let cached = parse_file_ast(root, cname, crate_root, abs, &known_crate_names)?;
+            cache.files.insert(rel, cached);
+            stats.files_reparsed += 1;
+        }
+    }
+
+    let stale: Vec<String> = cache
+        .files
+        .keys()
+        .filter(|rel| !current.contains(*rel))
+        .cloned()
+        .collect();
+    for rel in stale {
+        cache.files.remove(&rel);
+        stats.files_dropped += 1;
+    }
+    Ok(stats)
 }
 
 #[derive(Default)]
@@ -195,7 +359,13 @@ struct FileCtx<'a> {
     crate_root: &'a Path,
     rel_path: &'a str,
     module_path: &'a str,
-    file_idx: usize,
+}
+
+#[derive(Default)]
+struct ParsedFileParts {
+    symbols: Vec<SymbolInfo>,
+    fns: Vec<CachedFnDef>,
+    deps: Vec<DepEdge>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -400,10 +570,97 @@ fn collect_identifier_refs(file: &syn::File, into: &mut HashMap<String, usize>) 
     }
 }
 
+fn parse_file_ast(
+    root: &Path,
+    crate_name: &str,
+    crate_root: &Path,
+    abs: &Path,
+    known_crates: &BTreeSet<String>,
+) -> Result<CachedFile, ScanError> {
+    let rel_str = rel_string(root, abs);
+    let module_path = crate::workspace_scan::infer_module_path(crate_name, crate_root, abs);
+    let src = std::fs::read_to_string(abs).unwrap_or_default();
+    let signature = file_signature(abs)?;
+    let loc = src.lines().count();
+    let content_hash = blake3::hash(src.as_bytes()).to_hex().to_string();
+    let (doc_full, doc_summary) = parse_file_doc_header(&src);
+    let is_test_file = crate::workspace_scan::looks_like_test_file(&rel_str, &src);
+    let mut stubs = Vec::new();
+    let is_scanner_source = rel_str.ends_with("corecruxd/src/workspace_scan.rs")
+        || rel_str.ends_with("corecruxd/src/workspace_scan_ast.rs");
+    if !is_scanner_source {
+        for (line_no, line) in src.lines().enumerate() {
+            if let Some((kind, snippet)) = parse_stub_line(line) {
+                stubs.push(StubHit {
+                    crate_name: crate_name.to_string(),
+                    file_rel_path: rel_str.clone(),
+                    line: line_no + 1,
+                    kind: kind.to_string(),
+                    snippet,
+                });
+            }
+        }
+    }
+
+    let mut parts = ParsedFileParts::default();
+    if let Ok(parsed) = syn::parse_file(&src) {
+        let mut ident_refs = HashMap::new();
+        collect_identifier_refs(&parsed, &mut ident_refs);
+        let mut line_lookup = LineLookup::new(&src);
+        index_items(
+            &mut parts,
+            known_crates,
+            &mut line_lookup,
+            &parsed.items,
+            FileCtx {
+                crate_name,
+                crate_root,
+                rel_path: &rel_str,
+                module_path: &module_path,
+            },
+        );
+        Ok(CachedFile {
+            rel_path: rel_str.clone(),
+            crate_name: crate_name.to_string(),
+            module_path,
+            mtime_ms: signature.mtime_ms,
+            len: signature.len,
+            content_hash,
+            loc,
+            doc_summary,
+            doc_full,
+            is_test_file,
+            stubs,
+            symbols: parts.symbols,
+            fns: parts.fns,
+            deps: parts.deps,
+            routes: parse_routes_in_source(&src, &rel_str),
+            ident_refs,
+        })
+    } else {
+        Ok(CachedFile {
+            rel_path: rel_str.clone(),
+            crate_name: crate_name.to_string(),
+            module_path,
+            mtime_ms: signature.mtime_ms,
+            len: signature.len,
+            content_hash,
+            loc,
+            doc_summary,
+            doc_full,
+            is_test_file,
+            stubs,
+            symbols: Vec::new(),
+            fns: Vec::new(),
+            deps: Vec::new(),
+            routes: parse_routes_in_source(&src, &rel_str),
+            ident_refs: HashMap::new(),
+        })
+    }
+}
+
 fn index_items(
-    scan: &mut WorkspaceScan,
-    index: &mut Index,
-    file_idx_by_path: &mut HashMap<String, usize>,
+    parts: &mut ParsedFileParts,
     known_crates: &BTreeSet<String>,
     line_lookup: &mut LineLookup,
     items: &[syn::Item],
@@ -413,59 +670,51 @@ fn index_items(
         match item {
             syn::Item::Fn(f) => {
                 let name = f.sig.ident.to_string();
-                let symbol_idx = push_symbol(scan, ctx, line_lookup, "fn", &name, is_pub(&f.vis));
-                index.push(FnDef {
+                let local_symbol_idx = push_symbol(parts, ctx, line_lookup, "fn", &name, is_pub(&f.vis));
+                parts.fns.push(CachedFnDef {
                     qualified: qualify(ctx.module_path, &name),
                     simple: name,
                     crate_name: ctx.crate_name.to_string(),
                     module_path: ctx.module_path.to_string(),
                     file: ctx.rel_path.to_string(),
-                    symbol_idx,
+                    local_symbol_idx,
                     calls: collect_calls(&f.block),
                 });
             }
             syn::Item::Struct(s) => {
                 let name = s.ident.to_string();
-                push_symbol(scan, ctx, line_lookup, "struct", &name, is_pub(&s.vis));
+                push_symbol(parts, ctx, line_lookup, "struct", &name, is_pub(&s.vis));
             }
             syn::Item::Enum(e) => {
                 let name = e.ident.to_string();
-                push_symbol(scan, ctx, line_lookup, "enum", &name, is_pub(&e.vis));
+                push_symbol(parts, ctx, line_lookup, "enum", &name, is_pub(&e.vis));
             }
             syn::Item::Trait(t) => {
                 let name = t.ident.to_string();
-                push_symbol(scan, ctx, line_lookup, "trait", &name, is_pub(&t.vis));
+                push_symbol(parts, ctx, line_lookup, "trait", &name, is_pub(&t.vis));
             }
             syn::Item::Type(t) => {
                 let name = t.ident.to_string();
-                push_symbol(scan, ctx, line_lookup, "type", &name, is_pub(&t.vis));
+                push_symbol(parts, ctx, line_lookup, "type", &name, is_pub(&t.vis));
             }
             syn::Item::Const(c) => {
                 let name = c.ident.to_string();
-                push_symbol(scan, ctx, line_lookup, "const", &name, is_pub(&c.vis));
+                push_symbol(parts, ctx, line_lookup, "const", &name, is_pub(&c.vis));
             }
             syn::Item::Static(s) => {
                 let name = s.ident.to_string();
-                push_symbol(scan, ctx, line_lookup, "static", &name, is_pub(&s.vis));
+                push_symbol(parts, ctx, line_lookup, "static", &name, is_pub(&s.vis));
             }
             syn::Item::Mod(m) => {
                 let name = m.ident.to_string();
-                push_symbol(scan, ctx, line_lookup, "mod", &name, is_pub(&m.vis));
+                push_symbol(parts, ctx, line_lookup, "mod", &name, is_pub(&m.vis));
                 if let Some((_, inner)) = &m.content {
                     let nested = qualify(ctx.module_path, &name);
                     let nested_ctx = FileCtx {
                         module_path: &nested,
                         ..ctx
                     };
-                    index_items(
-                        scan,
-                        index,
-                        file_idx_by_path,
-                        known_crates,
-                        line_lookup,
-                        inner,
-                        nested_ctx,
-                    );
+                    index_items(parts, known_crates, line_lookup, inner, nested_ctx);
                 }
             }
             syn::Item::Impl(im) => {
@@ -476,14 +725,14 @@ fn index_items(
                 for ii in &im.items {
                     if let syn::ImplItem::Fn(f) = ii {
                         let name = f.sig.ident.to_string();
-                        let symbol_idx = push_symbol(scan, ctx, line_lookup, "fn", &name, is_pub(&f.vis));
-                        index.push(FnDef {
+                        let local_symbol_idx = push_symbol(parts, ctx, line_lookup, "fn", &name, is_pub(&f.vis));
+                        parts.fns.push(CachedFnDef {
                             qualified: qualify(&impl_base, &name),
                             simple: name,
                             crate_name: ctx.crate_name.to_string(),
                             module_path: ctx.module_path.to_string(),
                             file: ctx.rel_path.to_string(),
-                            symbol_idx,
+                            local_symbol_idx,
                             calls: collect_calls(&f.block),
                         });
                     }
@@ -492,7 +741,7 @@ fn index_items(
             syn::Item::Use(u) => {
                 for raw in use_tree_paths(&u.tree) {
                     if let Some(to_module) = use_path_to_module(&raw, ctx.crate_name, known_crates) {
-                        scan.deps.push(DepEdge {
+                        parts.deps.push(DepEdge {
                             from_crate: ctx.crate_name.to_string(),
                             from_file: ctx.rel_path.to_string(),
                             to_module,
@@ -506,19 +755,18 @@ fn index_items(
     }
 
     let _ = ctx.crate_root;
-    let _ = file_idx_by_path;
 }
 
 fn push_symbol(
-    scan: &mut WorkspaceScan,
+    parts: &mut ParsedFileParts,
     ctx: FileCtx<'_>,
     line_lookup: &mut LineLookup,
     kind: &str,
     name: &str,
     is_pub: bool,
 ) -> usize {
-    let symbol_idx = scan.symbols.len();
-    scan.symbols.push(SymbolInfo {
+    let symbol_idx = parts.symbols.len();
+    parts.symbols.push(SymbolInfo {
         crate_name: ctx.crate_name.to_string(),
         module_path: ctx.module_path.to_string(),
         file_rel_path: ctx.rel_path.to_string(),
@@ -527,7 +775,6 @@ fn push_symbol(
         name: name.to_string(),
         is_pub,
     });
-    scan.files[ctx.file_idx].symbol_count += 1;
     symbol_idx
 }
 
@@ -661,6 +908,45 @@ fn use_path_to_module(raw: &str, from_crate: &str, known_crates: &BTreeSet<Strin
     None
 }
 
+fn rel_string(root: &Path, abs: &Path) -> String {
+    abs.strip_prefix(root)
+        .map_or_else(|_| abs.to_path_buf(), Path::to_path_buf)
+        .display()
+        .to_string()
+}
+
+fn absolutize(root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    }
+}
+
+fn file_signature(path: &Path) -> Result<FileSignature, ScanError> {
+    let metadata = std::fs::metadata(path)?;
+    let mtime_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_millis() as u64);
+    Ok(FileSignature {
+        mtime_ms,
+        len: metadata.len(),
+    })
+}
+
+fn is_rs_path(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("rs")
+}
+
+pub(crate) fn should_ignore_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        let name = component.as_os_str().to_string_lossy();
+        name.starts_with('.') || matches!(name.as_ref(), "target" | "node_modules" | ".git" | ".worktrees")
+    })
+}
+
 fn normalize_call_segs(segs: &[String], from: &FnDef) -> Vec<String> {
     if segs.is_empty() {
         return Vec::new();
@@ -698,69 +984,55 @@ fn denormalize_defines(scan: &mut WorkspaceScan, file_idx_by_path: &HashMap<Stri
     }
 }
 
-fn resolve_routes(
-    root: &Path,
-    workspace: &WorkspaceFiles,
-    index: &Index,
-    scan: &mut WorkspaceScan,
-    _file_idx_by_path: &HashMap<String, usize>,
-) {
-    for (cname, files) in &workspace.files_by_crate {
-        for abs in files {
-            let rel = abs.strip_prefix(root).map_or_else(|_| abs.clone(), Path::to_path_buf);
-            let rel_str = rel.display().to_string();
-            let src = std::fs::read_to_string(abs).unwrap_or_default();
-            if !src.contains(".route(") {
-                continue;
-            }
-            for route in parse_routes_in_source(&src, &rel_str) {
-                let mut resolved_file = None;
-                let mut resolved_line = None;
-                let mut diag_reason = None;
-                match index.by_simple.get(&route.handler_fn) {
-                    None => diag_reason = Some("not_found"),
-                    Some(candidates) => {
-                        let same_crate: Vec<usize> = candidates
-                            .iter()
-                            .copied()
-                            .filter(|idx| index.defs[*idx].crate_name == *cname)
-                            .collect();
-                        let pick = if let [one] = same_crate.as_slice() {
-                            Some(*one)
-                        } else if let [one] = candidates.as_slice() {
-                            Some(*one)
-                        } else {
-                            None
-                        };
-                        if let Some(def_idx) = pick {
-                            let sym = &scan.symbols[index.defs[def_idx].symbol_idx];
-                            resolved_file = Some(sym.file_rel_path.clone());
-                            resolved_line = Some(sym.line);
-                        } else {
-                            diag_reason = Some("ambiguous");
-                        }
+fn resolve_routes_from_cache(cache: &AstScanCache, index: &Index, scan: &mut WorkspaceScan) {
+    for file in cache.files.values() {
+        for route in &file.routes {
+            let mut resolved_file = None;
+            let mut resolved_line = None;
+            let mut diag_reason = None;
+            match index.by_simple.get(&route.handler_fn) {
+                None => diag_reason = Some("not_found"),
+                Some(candidates) => {
+                    let same_crate: Vec<usize> = candidates
+                        .iter()
+                        .copied()
+                        .filter(|idx| index.defs[*idx].crate_name == file.crate_name)
+                        .collect();
+                    let pick = if let [one] = same_crate.as_slice() {
+                        Some(*one)
+                    } else if let [one] = candidates.as_slice() {
+                        Some(*one)
+                    } else {
+                        None
+                    };
+                    if let Some(def_idx) = pick {
+                        let sym = &scan.symbols[index.defs[def_idx].symbol_idx];
+                        resolved_file = Some(sym.file_rel_path.clone());
+                        resolved_line = Some(sym.line);
+                    } else {
+                        diag_reason = Some("ambiguous");
                     }
                 }
-                if let Some(reason) = diag_reason {
-                    scan.diagnostics.unresolved_routes.push(UnresolvedRoute {
-                        method: route.method.clone(),
-                        path: route.path.clone(),
-                        handler_fn: route.handler_fn.clone(),
-                        source_file: route.source_file.clone(),
-                        source_line: route.source_line,
-                        reason: reason.to_string(),
-                    });
-                }
-                scan.routes.push(RouteHit {
-                    method: route.method,
-                    path: route.path,
-                    handler_fn: route.handler_fn,
-                    handler_file: resolved_file,
-                    handler_line: resolved_line,
-                    source_file: route.source_file,
+            }
+            if let Some(reason) = diag_reason {
+                scan.diagnostics.unresolved_routes.push(UnresolvedRoute {
+                    method: route.method.clone(),
+                    path: route.path.clone(),
+                    handler_fn: route.handler_fn.clone(),
+                    source_file: route.source_file.clone(),
                     source_line: route.source_line,
+                    reason: reason.to_string(),
                 });
             }
+            scan.routes.push(RouteHit {
+                method: route.method.clone(),
+                path: route.path.clone(),
+                handler_fn: route.handler_fn.clone(),
+                handler_file: resolved_file,
+                handler_line: resolved_line,
+                source_file: route.source_file.clone(),
+                source_line: route.source_line,
+            });
         }
     }
 }
@@ -959,5 +1231,105 @@ pub fn called() {}
         assert!(scan.dead_code.iter().any(|d| d.name == "UnusedStruct"));
         assert!(!scan.dead_code.iter().any(|d| d.name == "Visible"));
         assert!(!scan.dead_code.iter().any(|d| d.name == "called"));
+    }
+
+    fn normalize_scan(mut scan: WorkspaceScan) -> WorkspaceScan {
+        scan.scan_id.clear();
+        scan.started_at_unix_ms = 0;
+        scan.finished_at_unix_ms = 0;
+        scan.duration_ms = 0;
+        scan
+    }
+
+    #[test]
+    fn incremental_reparse_only_changed_file_and_updates_symbol_edge() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_fixture(tmp.path());
+        let mut cache = AstScanCache::from_root(tmp.path()).expect("full cache");
+        let total = cache.files.len();
+        let changed = tmp.path().join("crates/demo/src/a.rs");
+        std::fs::write(
+            &changed,
+            r#"//! A module.
+use crate::b::called;
+
+pub fn entry() {
+    crate::b::called();
+}
+
+pub fn new_entry() {
+    crate::b::called();
+}
+
+pub fn dead_pub() {}
+fn takes_visible(_: crate::Visible) {}
+fn private_helper() {}
+"#,
+        )
+        .expect("rewrite changed file");
+
+        let result = update_cache_incremental(tmp.path(), &mut cache, std::slice::from_ref(&changed))
+            .expect("incremental update");
+        assert_eq!(result.stats.files_reparsed, 1);
+        assert_eq!(result.stats.cache_hits, total - 1);
+        assert_eq!(result.stats.files_dropped, 0);
+        assert!(result
+            .scan
+            .symbols
+            .iter()
+            .any(|s| s.name == "new_entry" && s.kind == "fn"));
+        let a = result
+            .scan
+            .files
+            .iter()
+            .find(|f| f.rel_path.ends_with("crates/demo/src/a.rs"))
+            .expect("a.rs");
+        assert!(a.references.iter().any(|r| {
+            r.to_file.ends_with("crates/demo/src/b.rs")
+                && r.to_symbol == "called"
+                && r.from_symbol.as_deref() == Some("new_entry")
+        }));
+    }
+
+    #[test]
+    fn incremental_delete_drops_symbols_and_edges() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_fixture(tmp.path());
+        let mut cache = AstScanCache::from_root(tmp.path()).expect("full cache");
+        let deleted = tmp.path().join("crates/demo/src/b.rs");
+        std::fs::remove_file(&deleted).expect("delete b.rs");
+
+        let result = update_cache_incremental(tmp.path(), &mut cache, std::slice::from_ref(&deleted))
+            .expect("incremental delete");
+        assert_eq!(result.stats.files_dropped, 1);
+        assert!(!result
+            .scan
+            .symbols
+            .iter()
+            .any(|s| s.file_rel_path.ends_with("crates/demo/src/b.rs")));
+        assert!(!result
+            .scan
+            .files
+            .iter()
+            .any(|f| f.rel_path.ends_with("crates/demo/src/b.rs")));
+        assert!(!result
+            .scan
+            .files
+            .iter()
+            .flat_map(|f| &f.references)
+            .any(|r| { r.to_file.ends_with("crates/demo/src/b.rs") || r.to_symbol == "called" }));
+    }
+
+    #[test]
+    fn assemble_from_cache_matches_fresh_ast_scan() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_fixture(tmp.path());
+        let cache = AstScanCache::from_root(tmp.path()).expect("full cache");
+        let assembled = normalize_scan(assemble_scan(tmp.path(), &cache));
+        let fresh = normalize_scan(run_scan_ast_at(tmp.path()).expect("fresh scan"));
+        assert_eq!(
+            serde_json::to_value(assembled).expect("assembled json"),
+            serde_json::to_value(fresh).expect("fresh json")
+        );
     }
 }

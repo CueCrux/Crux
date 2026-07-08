@@ -135,6 +135,9 @@ pub(super) async fn post_repo(
         crate::repo_registry::store_scan_json(&mut store, &tenant_id, &repo_id, json);
     }
     drop(store);
+    if let Some(watcher) = &state.repo_watch {
+        watcher.start_repo(registration.clone()).await;
+    }
 
     (
         StatusCode::OK,
@@ -191,7 +194,12 @@ pub(super) async fn delete_repo(
     let result = crate::repo_registry::delete_repo(&mut store, &tenant_id, &repo_id);
     drop(store);
     match result {
-        Ok(()) => (StatusCode::NO_CONTENT, ()).into_response(),
+        Ok(()) => {
+            if let Some(watcher) = &state.repo_watch {
+                watcher.stop_repo(&tenant_id, &repo_id).await;
+            }
+            (StatusCode::NO_CONTENT, ()).into_response()
+        }
         Err(err) => map_registry_error(err),
     }
 }
