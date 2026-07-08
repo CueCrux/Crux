@@ -391,6 +391,7 @@ pub(super) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         assembly_cache: None,
         quota_hosted_surfaces: Arc::new(Vec::new()),
         quota_ledger: Arc::new(std::sync::Mutex::new(crux_router::quota::QuotaLedger::new())),
+        credit_meter: None,
         openai_shim_enabled: false,
         memory_import_enabled: true,
         identity_links_enabled: true,

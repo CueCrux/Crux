@@ -339,6 +339,14 @@ fn classify_route(method: &str, path: &str) -> Option<RouteAuthContract> {
         ));
     }
 
+    if path.starts_with("/v1/credits/") {
+        return Some(RouteAuthContract::gated(
+            RouteAuthClass::FeatureGated,
+            &["admin:write"],
+            "CORECRUXD_CREDIT_METER",
+        ));
+    }
+
     if path.starts_with("/v1/coord/") {
         let scopes = if method == "GET" {
             &["admin:read", "sessions:read"][..]
@@ -557,6 +565,12 @@ mod tests {
                 "/v1/gpu1/answer",
                 RouteAuthClass::FeatureGated,
                 &["query:read", "admin:read"][..],
+            ),
+            (
+                "POST",
+                "/v1/credits/spend",
+                RouteAuthClass::FeatureGated,
+                &["admin:write"][..],
             ),
             (
                 "GET",

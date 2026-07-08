@@ -502,6 +502,9 @@ pub struct Config {
     // Path prefixes classified as hosted (quota-limited) surfaces.
     // Comma-separated; empty default = everything is local compute.
     pub quota_hosted_surfaces: Vec<String>,
+    // Credit-burn Meter M1b (`crate::http::credit_meter`). Default OFF and
+    // comped-wallet only; real fiat/Paddle mint remains gated by M2.
+    pub credit_meter_enabled: bool,
 
     // OpenAI function-calling shim over the MCP tool surface
     // (`crate::http::openai_shim`). Default OFF.
@@ -1206,6 +1209,7 @@ pub fn load_config() -> Config {
                     .collect()
             })
             .unwrap_or_default(),
+        credit_meter_enabled: env_bool("CORECRUXD_CREDIT_METER").unwrap_or(false),
         memory_import_enabled: env_bool("CRUX_MEMORY_IMPORT").unwrap_or(false),
         identity_links_enabled: env_bool("CORECRUXD_IDENTITY_LINKS").unwrap_or(false),
         openai_shim_enabled: env_bool("CORECRUXD_OPENAI_SHIM").unwrap_or(false),
@@ -1659,6 +1663,8 @@ mod tests {
         assert_eq!(cfg.coord_presence_ttl_secs, crate::coord::DEFAULT_PRESENCE_TTL_SECS);
         // Phase T S1 handoff observations are default OFF.
         assert!(!cfg.handoff_observations_enabled);
+        // Credit Meter M1b is default OFF; comped-wallet spends must opt in.
+        assert!(!cfg.credit_meter_enabled);
     }
 
     #[test]
@@ -1797,6 +1803,7 @@ mod tests {
         std::env::set_var("CORECRUXD_SCRUB_SAMPLE_RATE", "0.5");
         std::env::set_var("CORECRUXD_ENABLE_DIRECTORY_COMPACTION", "true");
         std::env::set_var("CORECRUXD_DIR_L0_MAX_RUNS", "16");
+        std::env::set_var("CORECRUXD_CREDIT_METER", "true");
 
         let cfg = super::load_config();
 
@@ -1881,6 +1888,7 @@ mod tests {
         assert!((cfg.scrub_sample_rate - 0.5).abs() < 0.001);
         assert!(cfg.enable_directory_compaction);
         assert_eq!(cfg.dir_l0_max_runs, 16);
+        assert!(cfg.credit_meter_enabled);
 
         // Clean up
         clear_corecruxd_env();

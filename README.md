@@ -432,6 +432,7 @@ Config via environment variables or YAML (`config.example.env`, `config.example.
 | `CORECRUXD_MCP_PORT` | `14801` | MCP server port. |
 | `CORECRUXD_MCP_ENABLED` | `true` | Enable the built-in MCP server. |
 | `CORECRUXD_BUILD_CCXI` | `0` | Build `.ccxi` indexes at seal time. |
+| `CORECRUXD_CREDIT_METER` | `false` | Enable the default-off comped-wallet credit meter and `/v1/credits/spend` test rail. |
 | `CORECRUXD_EMBEDDING_URL` | unset | Enables dense fact retrieval. |
 | `CORECRUXD_EMBEDDING_MODEL` | `nomic-embed-text` | Embedding model name. |
 | `CORECRUXD_CORECRUX_BASE_URL` | unset | CoreCrux admin base URL for `/console` lane-weight controls. |
@@ -447,6 +448,10 @@ Usage receipts (adoption signal) are **opt-in and off by default** — the daemo
 signal unless you set an `https://` collector endpoint *and* record consent. See
 [`docs/usage-receipts.md`](docs/usage-receipts.md) (`CORECRUXD_USAGE_RECEIPTS_SUBMIT` /
 `_ENDPOINT` / `_CONSENT_AT`).
+
+Credit Meter is also **opt-in and off by default**. `CORECRUXD_CREDIT_METER=1` enables only the
+seeded comped-wallet spend rail for pinned quotes and signed spend receipts; fiat minting, Paddle,
+and production billing remain separately gated.
 
 </details>
 

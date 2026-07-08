@@ -17,6 +17,7 @@ mod console;
 mod context_surface;
 mod coord;
 mod cost;
+mod credit_meter;
 mod dataplane;
 mod dossier;
 mod engrams;
@@ -244,6 +245,10 @@ pub struct AppState {
     /// Deliberately ephemeral: a restart refills everyone (errs toward
     /// the user).
     pub quota_ledger: Arc<std::sync::Mutex<crux_router::quota::QuotaLedger>>,
+    /// Credit-burn Meter M1b: persistent comped-wallet ledger. Default OFF
+    /// (`CORECRUXD_CREDIT_METER=1`); when absent `/v1/credits/spend` returns
+    /// 404 and no request path can burn credits.
+    pub credit_meter: Option<Arc<std::sync::Mutex<crate::credit_meter::CreditMeterStore>>>,
     /// G21b assembly cache over
     /// `corecrux_projections::assembly_cache::AssemblyCache` — memoizes
     /// assembled `/v1/context` bundles keyed by
@@ -729,6 +734,11 @@ pub fn router(state: AppState, case_store: self::cases::SharedCaseStore) -> Rout
         .route("/v1/openapi.json", get(self::openapi::openapi_json))
         // G20 quota state (gated by CORECRUXD_QUOTA, default OFF → 404).
         .route("/v1/quota", get(self::quota::get_quota))
+        // Credit-burn Meter M1b. Default OFF and comped-wallet only.
+        .route(
+            "/v1/credits/spend",
+            axum::routing::post(self::credit_meter::post_credit_spend),
+        )
         // Provider-agnostic injection-bundle surface (context_bundle/v1).
         // Gated by CORECRUXD_CONTEXT_SURFACE (default OFF → 404).
         .route("/v1/context", get(self::context_surface::get_context))
@@ -1434,6 +1444,12 @@ fn problem_for_status(status: StatusCode, detail: impl Into<String>) -> ProblemR
             StatusCode::UNAUTHORIZED.as_u16(),
             "https://errors.cuecrux.com/unauthorized",
             "Unauthorized",
+        )
+        .with_detail(detail),
+        StatusCode::PAYMENT_REQUIRED => ProblemDetails::new(
+            StatusCode::PAYMENT_REQUIRED.as_u16(),
+            "https://errors.cuecrux.com/payment-required",
+            "Payment Required",
         )
         .with_detail(detail),
         StatusCode::TOO_MANY_REQUESTS => ProblemDetails::new(

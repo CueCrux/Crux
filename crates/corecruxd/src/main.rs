@@ -573,6 +573,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     /// for a per-(passport, session, chain-head) memo on a local daemon.
     const ASSEMBLY_CACHE_MAX_ENTRIES: usize = 256;
 
+    let credit_meter = if config.credit_meter_enabled {
+        Some(Arc::new(std::sync::Mutex::new(
+            crate::credit_meter::CreditMeterStore::open(config.data_dir.join("credit-meter.jsonl"))?,
+        )))
+    } else {
+        None
+    };
+
     let state = AppState {
         lock_held: true,
         build: build.clone(),
@@ -614,6 +622,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }),
         quota_hosted_surfaces: Arc::new(config.quota_hosted_surfaces.clone()),
         quota_ledger: Arc::new(std::sync::Mutex::new(crux_router::quota::QuotaLedger::new())),
+        credit_meter,
         openai_shim_enabled: config.openai_shim_enabled,
         memory_import_enabled: config.memory_import_enabled,
         identity_links_enabled: config.identity_links_enabled,
@@ -4197,6 +4206,7 @@ mod tests {
             assembly_cache: None,
             quota_hosted_surfaces: std::sync::Arc::new(Vec::new()),
             quota_ledger: std::sync::Arc::new(std::sync::Mutex::new(crux_router::quota::QuotaLedger::new())),
+            credit_meter: None,
             openai_shim_enabled: false,
             memory_import_enabled: false,
             identity_links_enabled: false,

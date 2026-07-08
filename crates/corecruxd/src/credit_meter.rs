@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const SCHEMA_V1: &str = "crux.credit_meter.event.v1";
+const QUOTE_SCHEMA_V1: &str = "crux.credit_quote.v1";
+const SPEND_RECEIPT_SCHEMA_V1: &str = "crux.credit_spend_receipt.v1";
 
 #[derive(Debug, Error)]
 pub(crate) enum CreditMeterError {
@@ -53,6 +55,12 @@ pub(crate) enum CreditMeterError {
     },
     #[error("reservation {reservation_id} was voided: {reason}")]
     ReservationVoided { reservation_id: String, reason: String },
+    #[error("invalid credit quote: {reason}")]
+    InvalidQuote { reason: String },
+    #[error("credit quote does not match reservation: {reason}")]
+    QuoteReservationMismatch { reason: String },
+    #[error("credit spend receipt build failed: {0}")]
+    ReceiptBuild(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +80,97 @@ pub(crate) struct CreditSpend {
     pub cost: u64,
     pub spend_receipt: String,
     pub balance_after: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PinnedCreditQuote {
+    pub schema: String,
+    pub quote_id: String,
+    pub tenant_id: String,
+    pub operation_id: String,
+    pub capability: String,
+    pub credits: u64,
+    pub price_list_hash: String,
+}
+
+impl PinnedCreditQuote {
+    pub(crate) fn new(
+        quote_id: impl Into<String>,
+        tenant_id: impl Into<String>,
+        operation_id: impl Into<String>,
+        capability: impl Into<String>,
+        credits: u64,
+        price_list_hash: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema: QUOTE_SCHEMA_V1.to_string(),
+            quote_id: quote_id.into(),
+            tenant_id: tenant_id.into(),
+            operation_id: operation_id.into(),
+            capability: capability.into(),
+            credits,
+            price_list_hash: price_list_hash.into(),
+        }
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), CreditMeterError> {
+        if self.schema != QUOTE_SCHEMA_V1 {
+            return Err(CreditMeterError::InvalidQuote {
+                reason: format!("schema must be {QUOTE_SCHEMA_V1}"),
+            });
+        }
+        for (name, value) in [
+            ("quote_id", &self.quote_id),
+            ("tenant_id", &self.tenant_id),
+            ("operation_id", &self.operation_id),
+            ("capability", &self.capability),
+        ] {
+            if value.trim().is_empty() {
+                return Err(CreditMeterError::InvalidQuote {
+                    reason: format!("{name} must not be empty"),
+                });
+            }
+        }
+        if self.credits == 0 {
+            return Err(CreditMeterError::InvalidQuote {
+                reason: "credits must be > 0".to_string(),
+            });
+        }
+        if !is_blake3_hash_ref(&self.price_list_hash) {
+            return Err(CreditMeterError::InvalidQuote {
+                reason: "price_list_hash must be blake3:<64-hex>".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CreditSpendReceiptBodyV1 {
+    pub schema: String,
+    pub receipt_id: String,
+    pub tenant_id: String,
+    pub operation_id: String,
+    pub reservation_id: String,
+    pub quote_id: String,
+    pub capability: String,
+    pub credits: u64,
+    pub price_list_hash: String,
+    pub balance_after: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CreditSpendReceiptSignatureV1 {
+    pub alg: String,
+    pub signed_by: String,
+    pub body_hash: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CreditSpendReceiptEnvelopeV1 {
+    pub body: CreditSpendReceiptBodyV1,
+    pub receipt: CreditSpendReceiptSignatureV1,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -446,6 +545,91 @@ fn reservation_id_for(tenant_id: &str, operation_id: &str, cost: u64) -> String 
     format!("crxres_{}", hash.to_hex())
 }
 
+pub(crate) fn mint_spend_receipt(
+    quote: &PinnedCreditQuote,
+    reservation: &CreditReservation,
+    key: &crux_session::LocalPassportKey,
+) -> Result<CreditSpendReceiptEnvelopeV1, CreditMeterError> {
+    quote.validate()?;
+    if quote.tenant_id != reservation.tenant_id {
+        return Err(CreditMeterError::QuoteReservationMismatch {
+            reason: format!(
+                "quote tenant {} != reservation tenant {}",
+                quote.tenant_id, reservation.tenant_id
+            ),
+        });
+    }
+    if quote.operation_id != reservation.operation_id {
+        return Err(CreditMeterError::QuoteReservationMismatch {
+            reason: format!(
+                "quote operation {} != reservation operation {}",
+                quote.operation_id, reservation.operation_id
+            ),
+        });
+    }
+    if quote.credits != reservation.cost {
+        return Err(CreditMeterError::QuoteReservationMismatch {
+            reason: format!(
+                "quote credits {} != reservation cost {}",
+                quote.credits, reservation.cost
+            ),
+        });
+    }
+
+    let receipt_id = spend_receipt_id_for(quote, &reservation.reservation_id);
+    let body = CreditSpendReceiptBodyV1 {
+        schema: SPEND_RECEIPT_SCHEMA_V1.to_string(),
+        receipt_id,
+        tenant_id: quote.tenant_id.clone(),
+        operation_id: quote.operation_id.clone(),
+        reservation_id: reservation.reservation_id.clone(),
+        quote_id: quote.quote_id.clone(),
+        capability: quote.capability.clone(),
+        credits: quote.credits,
+        price_list_hash: quote.price_list_hash.clone(),
+        balance_after: reservation.balance_after,
+    };
+    let body_bytes = serde_json::to_vec(&body).map_err(|err| CreditMeterError::ReceiptBuild(err.to_string()))?;
+    let hash = blake3::hash(&body_bytes);
+    let signature = key.sign_hash(hash.as_bytes());
+    Ok(CreditSpendReceiptEnvelopeV1 {
+        body,
+        receipt: CreditSpendReceiptSignatureV1 {
+            alg: "ed25519".to_string(),
+            signed_by: key.passport_fpr().to_string(),
+            body_hash: format!("blake3:{}", hex::encode(hash.as_bytes())),
+            signature: hex::encode(signature),
+        },
+    })
+}
+
+fn spend_receipt_id_for(quote: &PinnedCreditQuote, reservation_id: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(SPEND_RECEIPT_SCHEMA_V1.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(quote.quote_id.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(quote.tenant_id.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(quote.operation_id.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(quote.capability.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(&quote.credits.to_le_bytes());
+    hasher.update(b"\n");
+    hasher.update(quote.price_list_hash.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(reservation_id.as_bytes());
+    format!("crxspend_{}", hasher.finalize().to_hex())
+}
+
+fn is_blake3_hash_ref(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("blake3:") else {
+        return false;
+    };
+    hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,5 +766,78 @@ mod tests {
         assert_eq!(successes, 3);
         assert_eq!(guard.available_balance("tenant-a"), 1);
         Ok(())
+    }
+
+    #[test]
+    fn quote_validation_requires_pinned_price_list_hash() {
+        let quote = PinnedCreditQuote::new("q-1", "tenant-a", "op-1", "capability", 1, "not-a-hash");
+        assert!(matches!(quote.validate(), Err(CreditMeterError::InvalidQuote { .. })));
+
+        let quote = PinnedCreditQuote::new("q-1", "tenant-a", "op-1", "capability", 1, blake3_ref("price-list"));
+        assert!(quote.validate().is_ok());
+    }
+
+    #[test]
+    fn spend_receipt_is_signed_and_bound_to_quote() -> Result<(), CreditMeterError> {
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("credit-meter.jsonl");
+        let mut meter = CreditMeterStore::open(&path)?;
+        meter.seed_comped_wallet("tenant-a", 10, "seed-1")?;
+        let quote = PinnedCreditQuote::new(
+            "quote-1",
+            "tenant-a",
+            "op-1",
+            "context.attestation",
+            4,
+            blake3_ref("price-list"),
+        );
+        let reservation = meter.reserve("tenant-a", "op-1", quote.credits)?;
+        let key = crux_session::LocalPassportKey::from_seed([7_u8; 32])
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
+
+        let receipt = mint_spend_receipt(&quote, &reservation, &key)?;
+        assert_eq!(receipt.body.schema, SPEND_RECEIPT_SCHEMA_V1);
+        assert_eq!(receipt.body.quote_id, "quote-1");
+        assert_eq!(receipt.body.reservation_id, reservation.reservation_id);
+        assert_eq!(receipt.receipt.alg, "ed25519");
+        assert_eq!(receipt.receipt.signed_by, key.passport_fpr());
+        assert!(receipt.receipt.body_hash.starts_with("blake3:"));
+        assert_eq!(receipt.receipt.signature.len(), 128);
+
+        let spend = meter.spend("tenant-a", &reservation.reservation_id, &receipt.body.receipt_id)?;
+        assert_eq!(spend.spend_receipt, receipt.body.receipt_id);
+        let retry = meter.spend("tenant-a", &reservation.reservation_id, "crxspend_wrong")?;
+        assert_eq!(retry.spend_receipt, receipt.body.receipt_id);
+        Ok(())
+    }
+
+    #[test]
+    fn spend_receipt_refuses_quote_reservation_mismatch() -> Result<(), CreditMeterError> {
+        let reservation = CreditReservation {
+            tenant_id: "tenant-a".to_string(),
+            operation_id: "op-1".to_string(),
+            reservation_id: "res-1".to_string(),
+            cost: 4,
+            balance_after: 6,
+        };
+        let quote = PinnedCreditQuote::new(
+            "quote-1",
+            "tenant-a",
+            "op-1",
+            "context.attestation",
+            5,
+            blake3_ref("price-list"),
+        );
+        let key = crux_session::LocalPassportKey::from_seed([7_u8; 32])
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
+        assert!(matches!(
+            mint_spend_receipt(&quote, &reservation, &key),
+            Err(CreditMeterError::QuoteReservationMismatch { .. })
+        ));
+        Ok(())
+    }
+
+    fn blake3_ref(input: &str) -> String {
+        format!("blake3:{}", blake3::hash(input.as_bytes()).to_hex())
     }
 }
