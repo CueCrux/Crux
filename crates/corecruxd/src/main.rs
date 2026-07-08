@@ -102,6 +102,7 @@ mod work;
 mod work_execplans;
 mod workspace_scan;
 mod workspace_scan_ast;
+mod workspace_scan_polyglot;
 
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;

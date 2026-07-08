@@ -87,6 +87,9 @@ sha2 = "0.11"
 # with a dedicated P-256 key. Already a workspace dep via corecrux-receipts.
 p256 = { version = "0.13.2", default-features = false, features = ["std", "ecdsa", "pem"] }
 notify = "6"
+tree-sitter = "0.26.10"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-python = "0.25.0"
 
 [dev-dependencies]
 corecrux-index = { path = "../corecrux-index" }

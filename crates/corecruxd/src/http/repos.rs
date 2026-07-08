@@ -4,7 +4,7 @@
 
 //! HTTP CRUD for tenant-scoped repository registrations.
 
-use std::path::{Path as FsPath, PathBuf};
+use std::path::PathBuf;
 
 use super::{
     problem_response, require_http_scopes_for_tenant, AppState, HeaderMap, IntoResponse, Json, Path, Query, State,
@@ -97,7 +97,7 @@ pub(super) async fn post_repo(
             return problem_response(StatusCode::NOT_FOUND, format!("root_path '{path}' not found"));
         }
         let scan_result =
-            tokio::task::spawn_blocking(move || crate::workspace_scan::run_scan_at(FsPath::new(&path_buf)))
+            tokio::task::spawn_blocking(move || crate::workspace_scan_polyglot::run_repo_scan_at(&path_buf))
                 .await
                 .map_err(|err| problem_response(StatusCode::INTERNAL_SERVER_ERROR, format!("scan task failed: {err}")));
         let scan = match scan_result {

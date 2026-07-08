@@ -4,7 +4,7 @@
 
 //! Feature-gated active watch loop for registered local repositories.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -110,29 +110,54 @@ async fn watch_repo_task(
     root: PathBuf,
     fact_store: Arc<RwLock<corecrux_memory::FactStore>>,
 ) -> Result<(), String> {
-    let mut cache = crate::workspace_scan_ast::AstScanCache::from_root(&root).map_err(|err| err.to_string())?;
     tracing::info!(repo_id=%registration.repo_id, tenant_id=%registration.tenant_id, root=?root, "repo-watch-starting");
+    let mode = if crate::workspace_scan_polyglot::should_use_rust_workspace_scan(&root) {
+        WatchMode::Rust {
+            cache: crate::workspace_scan_ast::AstScanCache::from_root(&root).map_err(|err| err.to_string())?,
+        }
+    } else {
+        WatchMode::Polyglot {
+            snapshot: polyglot_snapshot(&root),
+        }
+    };
 
     if should_use_polling(&root) {
         tracing::info!(repo_id=%registration.repo_id, tenant_id=%registration.tenant_id, root=?root, "repo-watch-polling-backend");
-        return poll_watch_loop(registration, root, fact_store, cache).await;
+        return poll_watch_loop(registration, root, fact_store, mode).await;
     }
 
-    match notify_watch_loop(registration.clone(), root.clone(), fact_store.clone(), cache).await {
+    match notify_watch_loop(registration.clone(), root.clone(), fact_store.clone(), mode).await {
         Ok(()) => Ok(()),
         Err(err) => {
             tracing::warn!(?err, repo_id=%registration.repo_id, tenant_id=%registration.tenant_id, root=?root, "repo-watch-notify-start-failed-falling-back-to-poll");
-            cache = crate::workspace_scan_ast::AstScanCache::from_root(&root).map_err(|err| err.to_string())?;
-            poll_watch_loop(registration, root, fact_store, cache).await
+            let mode = if crate::workspace_scan_polyglot::should_use_rust_workspace_scan(&root) {
+                WatchMode::Rust {
+                    cache: crate::workspace_scan_ast::AstScanCache::from_root(&root).map_err(|err| err.to_string())?,
+                }
+            } else {
+                WatchMode::Polyglot {
+                    snapshot: polyglot_snapshot(&root),
+                }
+            };
+            poll_watch_loop(registration, root, fact_store, mode).await
         }
     }
+}
+
+enum WatchMode {
+    Rust {
+        cache: crate::workspace_scan_ast::AstScanCache,
+    },
+    Polyglot {
+        snapshot: BTreeMap<String, (u64, u64)>,
+    },
 }
 
 async fn notify_watch_loop(
     registration: RepoRegistration,
     root: PathBuf,
     fact_store: Arc<RwLock<corecrux_memory::FactStore>>,
-    mut cache: crate::workspace_scan_ast::AstScanCache,
+    mut mode: WatchMode,
 ) -> Result<(), String> {
     let (tx, mut rx) = mpsc::unbounded_channel::<PathBuf>();
     let tx_events = tx.clone();
@@ -159,7 +184,7 @@ async fn notify_watch_loop(
         if paths.is_empty() {
             continue;
         }
-        run_incremental_and_store(&registration, &root, &fact_store, &mut cache, &paths).await?;
+        run_scan_and_store(&registration, &root, &fact_store, &mut mode, &paths).await?;
     }
     drop(watcher);
     Ok(())
@@ -169,7 +194,7 @@ async fn poll_watch_loop(
     registration: RepoRegistration,
     root: PathBuf,
     fact_store: Arc<RwLock<corecrux_memory::FactStore>>,
-    mut cache: crate::workspace_scan_ast::AstScanCache,
+    mut mode: WatchMode,
 ) -> Result<(), String> {
     // Fallback for WSL `/mnt/*` paths and explicit `CORECRUXD_REPO_WATCH_POLL=1`.
     // Native inotify often misses or coalesces Windows-host filesystem events
@@ -177,7 +202,7 @@ async fn poll_watch_loop(
     // correctly with notify's recommended watcher.
     loop {
         tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
-        run_incremental_and_store(&registration, &root, &fact_store, &mut cache, &[]).await?;
+        run_scan_and_store(&registration, &root, &fact_store, &mut mode, &[]).await?;
     }
 }
 
@@ -188,20 +213,46 @@ pub(crate) fn construct_notify_watcher_for_smoke(root: &std::path::Path) -> Resu
     Ok(())
 }
 
-async fn run_incremental_and_store(
+async fn run_scan_and_store(
     registration: &RepoRegistration,
     root: &Path,
     fact_store: &Arc<RwLock<corecrux_memory::FactStore>>,
-    cache: &mut crate::workspace_scan_ast::AstScanCache,
+    mode: &mut WatchMode,
     paths: &[PathBuf],
 ) -> Result<(), String> {
-    let result =
-        crate::workspace_scan_ast::update_cache_incremental(root, cache, paths).map_err(|err| err.to_string())?;
-    if result.stats.files_reparsed == 0 && result.stats.files_dropped == 0 {
-        return Ok(());
-    }
-    let scan_id = result.scan.scan_id.clone();
-    let scan_json = serde_json::to_string(&result.scan).map_err(|err| err.to_string())?;
+    let (scan, files_reparsed, cache_hits, files_dropped) = match mode {
+        WatchMode::Rust { cache } => {
+            let result = crate::workspace_scan_ast::update_cache_incremental(root, cache, paths)
+                .map_err(|err| err.to_string())?;
+            if result.stats.files_reparsed == 0 && result.stats.files_dropped == 0 {
+                return Ok(());
+            }
+            (
+                result.scan,
+                result.stats.files_reparsed,
+                result.stats.cache_hits,
+                result.stats.files_dropped,
+            )
+        }
+        WatchMode::Polyglot { snapshot } => {
+            let changed_count = if paths.is_empty() {
+                let next = polyglot_snapshot(root);
+                let changed = count_snapshot_changes(snapshot, &next);
+                if changed == 0 {
+                    return Ok(());
+                }
+                *snapshot = next;
+                changed
+            } else {
+                *snapshot = polyglot_snapshot(root);
+                paths.len()
+            };
+            let scan = crate::workspace_scan_polyglot::run_polyglot_scan_at(root).map_err(|err| err.to_string())?;
+            (scan, changed_count, 0, 0)
+        }
+    };
+    let scan_id = scan.scan_id.clone();
+    let scan_json = serde_json::to_string(&scan).map_err(|err| err.to_string())?;
     {
         let mut store = fact_store.write().await;
         crate::repo_registry::store_scan_json(&mut store, &registration.tenant_id, &registration.repo_id, scan_json);
@@ -210,9 +261,9 @@ async fn run_incremental_and_store(
         repo_id=%registration.repo_id,
         tenant_id=%registration.tenant_id,
         scan_id,
-        files_reparsed=result.stats.files_reparsed,
-        cache_hits=result.stats.cache_hits,
-        files_dropped=result.stats.files_dropped,
+        files_reparsed,
+        cache_hits,
+        files_dropped,
         "repo-watch-incremental-scan-stored"
     );
     Ok(())
@@ -229,11 +280,37 @@ fn filter_event_paths(root: &Path, paths: Vec<PathBuf>) -> Vec<PathBuf> {
         if crate::workspace_scan_ast::should_ignore_path(rel) {
             continue;
         }
-        if path.extension().and_then(|e| e.to_str()) == Some("rs") || !path.exists() {
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
+        if matches!(ext, "rs" | "ts" | "tsx" | "py" | "vue") || !path.exists() {
             out.insert(path);
         }
     }
     out.into_iter().collect()
+}
+
+fn polyglot_snapshot(root: &Path) -> BTreeMap<String, (u64, u64)> {
+    let mut out = BTreeMap::new();
+    let _ = crate::workspace_scan::walk_dir(root, root, &mut |_rel, abs| {
+        let ext = abs.extension().and_then(|e| e.to_str()).unwrap_or_default();
+        if !matches!(ext, "rs" | "ts" | "tsx" | "py" | "vue") {
+            return;
+        }
+        if let Ok(meta) = std::fs::metadata(abs) {
+            let mtime_ms = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_millis() as u64);
+            out.insert(abs.display().to_string(), (mtime_ms, meta.len()));
+        }
+    });
+    out
+}
+
+fn count_snapshot_changes(old: &BTreeMap<String, (u64, u64)>, new: &BTreeMap<String, (u64, u64)>) -> usize {
+    let added_or_changed = new.iter().filter(|(path, sig)| old.get(*path) != Some(*sig)).count();
+    let removed = old.keys().filter(|path| !new.contains_key(*path)).count();
+    added_or_changed + removed
 }
 
 #[cfg(test)]
