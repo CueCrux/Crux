@@ -28,6 +28,8 @@ server run on your machine without a hosted account.
 
 ## Developer and Agent Integration
 
+- [Developer portal](developer-portal.md) - OpenAPI, RFC 7807 errors,
+  receipt verification, SDKs, and contracts.
 - [API reference](api-reference.md) - HTTP, gRPC, and MCP surfaces.
 - [Agent guide](agent-guide.md) - using Crux as an agent memory and retrieval
   backend.

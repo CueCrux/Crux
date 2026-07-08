@@ -16,7 +16,7 @@ how much context every model call re-read, where it went, and what to change to 
 retrieval under hard token budgets, and an Ed25519 receipt for every write.
 One binary. No API keys. Nothing leaves your machine.
 
-[Quickstart](#quickstart) · [Docs](docs/README.md) · [Console](#the-console) · [How it works](#how-it-works) ·
+[Quickstart](#quickstart) · [Docs](docs/README.md) · [Developers](docs/developer-portal.md) · [Console](#the-console) · [How it works](#how-it-works) ·
 [Capabilities](#what-you-get) · [Verify releases](docs/verify-release.md) ·
 [Security](SECURITY.md) · [Support](#support--security) · [Licence](#licence)
 
