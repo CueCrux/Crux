@@ -929,11 +929,11 @@ mod tests {
     #[test]
     fn relation_type_u8_roundtrip() {
         use crate::state::RelationTypeV1;
-        for i in 0..=7u8 {
+        for i in 0..=11u8 {
             let rt = RelationTypeV1::from_u8(i).unwrap();
             assert_eq!(rt.to_u8(), i);
         }
-        assert!(RelationTypeV1::from_u8(8).is_none());
+        assert!(RelationTypeV1::from_u8(12).is_none());
     }
 
     #[test]
@@ -948,6 +948,10 @@ mod tests {
             "derived_from",
             "cites",
             "about_same_entity",
+            "calls",
+            "imports",
+            "defines",
+            "depends_on",
         ];
         for s in &strs {
             let rt = RelationTypeV1::from_engine_str(s).unwrap();

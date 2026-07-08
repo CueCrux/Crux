@@ -40,6 +40,8 @@ pub(crate) struct RepoWatchService {
 
 struct RepoWatchInner {
     fact_store: Arc<RwLock<corecrux_memory::FactStore>>,
+    projection_state: Arc<RwLock<corecrux_projections::ProjectionState>>,
+    data_dir: PathBuf,
     tasks: Mutex<HashMap<String, WatchTask>>,
 }
 
@@ -54,10 +56,16 @@ impl Drop for WatchTask {
 }
 
 impl RepoWatchService {
-    pub(crate) fn maybe_new(fact_store: Arc<RwLock<corecrux_memory::FactStore>>) -> Option<Self> {
+    pub(crate) fn maybe_new(
+        fact_store: Arc<RwLock<corecrux_memory::FactStore>>,
+        projection_state: Arc<RwLock<corecrux_projections::ProjectionState>>,
+        data_dir: PathBuf,
+    ) -> Option<Self> {
         enabled_from_env().then(|| Self {
             inner: Arc::new(RepoWatchInner {
                 fact_store,
+                projection_state,
+                data_dir,
                 tasks: Mutex::new(HashMap::new()),
             }),
         })
@@ -78,8 +86,10 @@ impl RepoWatchService {
         let key = repo_key(&registration.tenant_id, &registration.repo_id);
         self.stop_repo(&registration.tenant_id, &registration.repo_id).await;
         let fact_store = self.inner.fact_store.clone();
+        let projection_state = self.inner.projection_state.clone();
+        let data_dir = self.inner.data_dir.clone();
         let handle = tokio::spawn(async move {
-            if let Err(err) = watch_repo_task(registration, root, fact_store).await {
+            if let Err(err) = watch_repo_task(registration, root, fact_store, projection_state, data_dir).await {
                 tracing::warn!(?err, "repo-watch-task-exited");
             }
         });
@@ -109,6 +119,8 @@ async fn watch_repo_task(
     registration: RepoRegistration,
     root: PathBuf,
     fact_store: Arc<RwLock<corecrux_memory::FactStore>>,
+    projection_state: Arc<RwLock<corecrux_projections::ProjectionState>>,
+    data_dir: PathBuf,
 ) -> Result<(), String> {
     tracing::info!(repo_id=%registration.repo_id, tenant_id=%registration.tenant_id, root=?root, "repo-watch-starting");
     let mode = if crate::workspace_scan_polyglot::should_use_rust_workspace_scan(&root) {
@@ -123,10 +135,19 @@ async fn watch_repo_task(
 
     if should_use_polling(&root) {
         tracing::info!(repo_id=%registration.repo_id, tenant_id=%registration.tenant_id, root=?root, "repo-watch-polling-backend");
-        return poll_watch_loop(registration, root, fact_store, mode).await;
+        return poll_watch_loop(registration, root, fact_store, projection_state, data_dir, mode).await;
     }
 
-    match notify_watch_loop(registration.clone(), root.clone(), fact_store.clone(), mode).await {
+    match notify_watch_loop(
+        registration.clone(),
+        root.clone(),
+        fact_store.clone(),
+        projection_state.clone(),
+        data_dir.clone(),
+        mode,
+    )
+    .await
+    {
         Ok(()) => Ok(()),
         Err(err) => {
             tracing::warn!(?err, repo_id=%registration.repo_id, tenant_id=%registration.tenant_id, root=?root, "repo-watch-notify-start-failed-falling-back-to-poll");
@@ -139,7 +160,7 @@ async fn watch_repo_task(
                     snapshot: polyglot_snapshot(&root),
                 }
             };
-            poll_watch_loop(registration, root, fact_store, mode).await
+            poll_watch_loop(registration, root, fact_store, projection_state, data_dir, mode).await
         }
     }
 }
@@ -157,6 +178,8 @@ async fn notify_watch_loop(
     registration: RepoRegistration,
     root: PathBuf,
     fact_store: Arc<RwLock<corecrux_memory::FactStore>>,
+    projection_state: Arc<RwLock<corecrux_projections::ProjectionState>>,
+    data_dir: PathBuf,
     mut mode: WatchMode,
 ) -> Result<(), String> {
     let (tx, mut rx) = mpsc::unbounded_channel::<PathBuf>();
@@ -184,7 +207,16 @@ async fn notify_watch_loop(
         if paths.is_empty() {
             continue;
         }
-        run_scan_and_store(&registration, &root, &fact_store, &mut mode, &paths).await?;
+        run_scan_and_store(
+            &registration,
+            &root,
+            &fact_store,
+            &projection_state,
+            &data_dir,
+            &mut mode,
+            &paths,
+        )
+        .await?;
     }
     drop(watcher);
     Ok(())
@@ -194,6 +226,8 @@ async fn poll_watch_loop(
     registration: RepoRegistration,
     root: PathBuf,
     fact_store: Arc<RwLock<corecrux_memory::FactStore>>,
+    projection_state: Arc<RwLock<corecrux_projections::ProjectionState>>,
+    data_dir: PathBuf,
     mut mode: WatchMode,
 ) -> Result<(), String> {
     // Fallback for WSL `/mnt/*` paths and explicit `CORECRUXD_REPO_WATCH_POLL=1`.
@@ -202,7 +236,16 @@ async fn poll_watch_loop(
     // correctly with notify's recommended watcher.
     loop {
         tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
-        run_scan_and_store(&registration, &root, &fact_store, &mut mode, &[]).await?;
+        run_scan_and_store(
+            &registration,
+            &root,
+            &fact_store,
+            &projection_state,
+            &data_dir,
+            &mut mode,
+            &[],
+        )
+        .await?;
     }
 }
 
@@ -217,6 +260,8 @@ async fn run_scan_and_store(
     registration: &RepoRegistration,
     root: &Path,
     fact_store: &Arc<RwLock<corecrux_memory::FactStore>>,
+    projection_state: &Arc<RwLock<corecrux_projections::ProjectionState>>,
+    data_dir: &Path,
     mode: &mut WatchMode,
     paths: &[PathBuf],
 ) -> Result<(), String> {
@@ -256,6 +301,23 @@ async fn run_scan_and_store(
     {
         let mut store = fact_store.write().await;
         crate::repo_registry::store_scan_json(&mut store, &registration.tenant_id, &registration.repo_id, scan_json);
+    }
+    if let Err(err) = crate::repo_codegraph::maybe_emit_codegraph_edges(
+        fact_store,
+        projection_state,
+        data_dir,
+        &registration.tenant_id,
+        &registration.repo_id,
+        &scan,
+    )
+    .await
+    {
+        tracing::warn!(
+            ?err,
+            repo_id=%registration.repo_id,
+            tenant_id=%registration.tenant_id,
+            "repo-watch-codegraph-edge-emission-failed"
+        );
     }
     tracing::info!(
         repo_id=%registration.repo_id,

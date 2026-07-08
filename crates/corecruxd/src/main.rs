@@ -81,6 +81,7 @@ mod projects;
 mod protocol_posture;
 mod redaction;
 mod relations;
+mod repo_codegraph;
 mod repo_registry;
 mod repo_watch;
 mod session_bindings;
@@ -578,7 +579,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         corecrux_memory::FactStore::new()
     }));
-    let repo_watch = crate::repo_watch::RepoWatchService::maybe_new(fact_store.clone());
+    let projection_state = {
+        let mut ps = corecrux_projections::ProjectionState::default();
+        match crate::relations::load_into_state(&config.data_dir, &mut ps) {
+            Ok(n) => tracing::info!(loaded = n, "relations.jsonl replayed into ProjectionState"),
+            Err(err) => tracing::warn!(?err, "relations replay failed; starting empty"),
+        }
+        Arc::new(RwLock::new(ps))
+    };
+    let repo_watch = crate::repo_watch::RepoWatchService::maybe_new(
+        fact_store.clone(),
+        projection_state.clone(),
+        config.data_dir.clone(),
+    );
 
     let state = AppState {
         lock_held: true,
@@ -747,14 +760,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             fact_privacy::install_global(p.clone());
             p
         },
-        projection_state: {
-            let mut ps = corecrux_projections::ProjectionState::default();
-            match crate::relations::load_into_state(&config.data_dir, &mut ps) {
-                Ok(n) => tracing::info!(loaded = n, "relations.jsonl replayed into ProjectionState"),
-                Err(err) => tracing::warn!(?err, "relations replay failed; starting empty"),
-            }
-            Arc::new(RwLock::new(ps))
-        },
+        projection_state: projection_state.clone(),
     };
 
     // Wire the shared event bus into both stores so mutations emit SSE events.

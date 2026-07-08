@@ -98,6 +98,7 @@ fn is_prefix_grantable(prefix: &str) -> bool {
         "__workspace_scan__::",
         "__repo_registry__::",
         "__repo_scan__::",
+        "__repo_codegraph_ids__::",
         "__storybook__::",
         "__dossier__::",
         "__project_repo_link__::",

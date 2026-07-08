@@ -87,6 +87,7 @@ pub(super) async fn post_repo(
 
     let mut note = None;
     let mut scan_json = None;
+    let mut scan_for_codegraph = None;
     let mut last_scan_id = None;
     if let Some(path) = root_path.as_deref() {
         let path_buf = PathBuf::from(path);
@@ -112,6 +113,7 @@ pub(super) async fn post_repo(
                 return problem_response(StatusCode::INTERNAL_SERVER_ERROR, format!("scan encode failed: {err}"))
             }
         }
+        scan_for_codegraph = Some(scan);
     } else {
         note = Some("clone_url registered; cloning and scan are deferred".to_string());
     }
@@ -135,6 +137,20 @@ pub(super) async fn post_repo(
         crate::repo_registry::store_scan_json(&mut store, &tenant_id, &repo_id, json);
     }
     drop(store);
+    if let Some(scan) = scan_for_codegraph.as_ref() {
+        if let Err(err) = crate::repo_codegraph::maybe_emit_codegraph_edges(
+            &state.fact_store,
+            &state.projection_state,
+            &state.data_dir,
+            &tenant_id,
+            &repo_id,
+            scan,
+        )
+        .await
+        {
+            tracing::warn!(?err, tenant_id, repo_id, "repo-codegraph-edge-emission-failed");
+        }
+    }
     if let Some(watcher) = &state.repo_watch {
         watcher.start_repo(registration.clone()).await;
     }

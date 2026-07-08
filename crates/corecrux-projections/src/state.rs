@@ -90,6 +90,10 @@ pub enum RelationTypeV1 {
     DerivedFrom,
     Cites,
     AboutSameEntity,
+    Calls,
+    Imports,
+    Defines,
+    DependsOn,
 }
 
 impl RelationTypeV1 {
@@ -103,6 +107,10 @@ impl RelationTypeV1 {
             5 => Some(Self::DerivedFrom),
             6 => Some(Self::Cites),
             7 => Some(Self::AboutSameEntity),
+            8 => Some(Self::Calls),
+            9 => Some(Self::Imports),
+            10 => Some(Self::Defines),
+            11 => Some(Self::DependsOn),
             _ => None,
         }
     }
@@ -117,6 +125,10 @@ impl RelationTypeV1 {
             Self::DerivedFrom => 5,
             Self::Cites => 6,
             Self::AboutSameEntity => 7,
+            Self::Calls => 8,
+            Self::Imports => 9,
+            Self::Defines => 10,
+            Self::DependsOn => 11,
         }
     }
 
@@ -130,6 +142,10 @@ impl RelationTypeV1 {
             "derived_from" => Some(Self::DerivedFrom),
             "cites" => Some(Self::Cites),
             "about_same_entity" => Some(Self::AboutSameEntity),
+            "calls" => Some(Self::Calls),
+            "imports" => Some(Self::Imports),
+            "defines" => Some(Self::Defines),
+            "depends_on" => Some(Self::DependsOn),
             _ => None,
         }
     }
@@ -144,6 +160,51 @@ impl RelationTypeV1 {
             Self::DerivedFrom => "derived_from",
             Self::Cites => "cites",
             Self::AboutSameEntity => "about_same_entity",
+            Self::Calls => "calls",
+            Self::Imports => "imports",
+            Self::Defines => "defines",
+            Self::DependsOn => "depends_on",
+        }
+    }
+}
+
+#[cfg(test)]
+mod relation_type_tests {
+    use super::RelationTypeV1;
+
+    #[test]
+    fn relation_type_v1_existing_wire_mapping_is_append_only() {
+        let existing = [
+            (0, RelationTypeV1::Supports, "supports"),
+            (1, RelationTypeV1::Contradicts, "contradicts"),
+            (2, RelationTypeV1::Supersedes, "supersedes"),
+            (3, RelationTypeV1::Duplicates, "duplicates"),
+            (4, RelationTypeV1::Elaborates, "elaborates"),
+            (5, RelationTypeV1::DerivedFrom, "derived_from"),
+            (6, RelationTypeV1::Cites, "cites"),
+            (7, RelationTypeV1::AboutSameEntity, "about_same_entity"),
+        ];
+        for (wire, relation_type, engine) in existing {
+            assert_eq!(RelationTypeV1::from_u8(wire), Some(relation_type));
+            assert_eq!(relation_type.to_u8(), wire);
+            assert_eq!(RelationTypeV1::from_engine_str(engine), Some(relation_type));
+            assert_eq!(relation_type.as_engine_str(), engine);
+        }
+    }
+
+    #[test]
+    fn relation_type_v1_code_graph_wire_mapping_is_appended() {
+        let appended = [
+            (8, RelationTypeV1::Calls, "calls"),
+            (9, RelationTypeV1::Imports, "imports"),
+            (10, RelationTypeV1::Defines, "defines"),
+            (11, RelationTypeV1::DependsOn, "depends_on"),
+        ];
+        for (wire, relation_type, engine) in appended {
+            assert_eq!(RelationTypeV1::from_u8(wire), Some(relation_type));
+            assert_eq!(relation_type.to_u8(), wire);
+            assert_eq!(RelationTypeV1::from_engine_str(engine), Some(relation_type));
+            assert_eq!(relation_type.as_engine_str(), engine);
         }
     }
 }
