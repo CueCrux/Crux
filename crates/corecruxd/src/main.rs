@@ -99,6 +99,7 @@ mod witness_submit;
 mod work;
 mod work_execplans;
 mod workspace_scan;
+mod workspace_scan_ast;
 
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;

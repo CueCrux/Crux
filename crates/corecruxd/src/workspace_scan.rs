@@ -258,6 +258,20 @@ pub fn run_scan() -> Result<WorkspaceScan, ScanError> {
 }
 
 pub fn run_scan_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
+    if ast_scan_enabled_from_env() {
+        return crate::workspace_scan_ast::run_scan_ast_at(root);
+    }
+    run_scan_regex_at(root)
+}
+
+pub(crate) fn ast_scan_enabled_from_env() -> bool {
+    std::env::var("CORECRUXD_AST_SCAN").ok().is_some_and(|v| {
+        let v = v.trim().to_ascii_lowercase();
+        !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
+    })
+}
+
+pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
     let started_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
@@ -1228,7 +1242,7 @@ fn collect_chain_ids(node: &StorylineNode, id_by_path: &HashMap<String, usize>, 
 
 /// Recursive-but-cheap directory walker. Skips `target/` and dot-dirs.
 #[allow(clippy::unnecessary_wraps)] // Result kept for symmetry + future fallibility (e.g. fs error propagation if we stop swallowing read_dir failures).
-fn walk_dir<F: FnMut(&Path, &Path)>(root: &Path, base: &Path, visit: &mut F) -> Result<(), ScanError> {
+pub(crate) fn walk_dir<F: FnMut(&Path, &Path)>(root: &Path, base: &Path, visit: &mut F) -> Result<(), ScanError> {
     let mut stack = vec![base.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
@@ -1252,7 +1266,7 @@ fn walk_dir<F: FnMut(&Path, &Path)>(root: &Path, base: &Path, visit: &mut F) -> 
     Ok(())
 }
 
-fn parse_crate_name(toml: &str) -> Option<String> {
+pub(crate) fn parse_crate_name(toml: &str) -> Option<String> {
     // Find the `[package]` section then `name = "..."`.
     let mut in_package = false;
     for raw in toml.lines() {
@@ -1278,7 +1292,7 @@ fn parse_crate_name(toml: &str) -> Option<String> {
     None
 }
 
-fn parse_internal_path_deps(toml: &str) -> Vec<String> {
+pub(crate) fn parse_internal_path_deps(toml: &str) -> Vec<String> {
     // Find lines like `crux-mcp = { path = "../crux-mcp" }` or
     // `crux-mcp = { workspace = true }` — both indicate workspace deps.
     let mut out = Vec::new();
@@ -1302,7 +1316,7 @@ fn parse_internal_path_deps(toml: &str) -> Vec<String> {
 }
 
 /// Infer a module path like `corecruxd::http::admin` from a file path.
-fn infer_module_path(crate_name: &str, crate_root: &Path, file: &Path) -> String {
+pub(crate) fn infer_module_path(crate_name: &str, crate_root: &Path, file: &Path) -> String {
     let src = crate_root.join("src");
     let rel = match file.strip_prefix(&src) {
         Ok(r) => r,
@@ -1375,7 +1389,7 @@ fn parse_symbol_line(line: &str) -> Option<(&'static str, String, bool)> {
 /// - path contains a `/tests/` segment (integration test directory),
 /// - filename ends with `_tests.rs` or is exactly `tests.rs`,
 /// - first non-blank, non-comment line is `#![cfg(test)]` (rare, but legal).
-fn looks_like_test_file(rel_path: &str, src: &str) -> bool {
+pub(crate) fn looks_like_test_file(rel_path: &str, src: &str) -> bool {
     let path_match = rel_path.contains("/tests/") || rel_path.ends_with("/tests.rs") || rel_path.ends_with("_tests.rs");
     if path_match {
         return true;
@@ -1402,7 +1416,7 @@ fn looks_like_test_file(rel_path: &str, src: &str) -> bool {
 /// `(full, summary)` where `summary` is the first sentence (≤80 chars).
 /// Skips a leading copyright `//` block and blank lines so the doc starts
 /// where the developer actually wrote `//!`.
-fn parse_file_doc_header(src: &str) -> (Option<String>, Option<String>) {
+pub(crate) fn parse_file_doc_header(src: &str) -> (Option<String>, Option<String>) {
     let mut full = String::new();
     let mut started = false;
     for line in src.lines() {
@@ -1457,12 +1471,12 @@ fn parse_file_doc_header(src: &str) -> (Option<String>, Option<String>) {
 
 /// Parsed representation of a `.route("/path", METHOD(handler))` line. The
 /// caller resolves `handler_fn` to a definition file via the symbol index.
-struct ParsedRoute {
-    method: String,
-    path: String,
-    handler_fn: String,
-    source_file: String,
-    source_line: usize,
+pub(crate) struct ParsedRoute {
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) handler_fn: String,
+    pub(crate) source_file: String,
+    pub(crate) source_line: usize,
 }
 
 /// Parse one route declaration (which may span multiple lines after `.route(`).
@@ -1509,7 +1523,7 @@ fn parse_route_chunk(chunk: &str, source_file: &str, source_line: usize) -> Opti
 
 /// Walk a whole source file looking for `.route(...)` declarations, including
 /// multi-line ones. Returns every route found in source order.
-fn parse_routes_in_source(src: &str, source_file: &str) -> Vec<ParsedRoute> {
+pub(crate) fn parse_routes_in_source(src: &str, source_file: &str) -> Vec<ParsedRoute> {
     let mut out = Vec::new();
     let bytes = src.as_bytes();
     let mut i = 0usize;
@@ -1678,7 +1692,7 @@ fn scan_call_sites(line: &str) -> Vec<String> {
     out
 }
 
-fn parse_stub_line(line: &str) -> Option<(&'static str, String)> {
+pub(crate) fn parse_stub_line(line: &str) -> Option<(&'static str, String)> {
     let trimmed = line.trim();
     if trimmed.starts_with("//") {
         return None;
@@ -1699,7 +1713,7 @@ fn parse_stub_line(line: &str) -> Option<(&'static str, String)> {
     None
 }
 
-fn parse_use_target(line: &str, from_crate: &str, known_crates: &BTreeSet<String>) -> Option<String> {
+pub(crate) fn parse_use_target(line: &str, from_crate: &str, known_crates: &BTreeSet<String>) -> Option<String> {
     let trimmed = line.trim();
     if trimmed.starts_with("//") {
         return None;
@@ -2217,5 +2231,53 @@ fn build() {
             self_stubs.len(),
             self_stubs.iter().map(|s| s.line).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn flag_off_invokes_regex_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let crate_dir = tmp.path().join("crates/demo");
+        std::fs::create_dir_all(crate_dir.join("src")).expect("fixture dirs");
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/demo\"]\n",
+        )
+        .expect("workspace toml");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("crate toml");
+        std::fs::write(
+            crate_dir.join("src/lib.rs"),
+            "//! Demo.\n\npub fn entry() { helper(); }\nfn helper() {}\n",
+        )
+        .expect("lib");
+
+        std::env::remove_var("CORECRUXD_AST_SCAN");
+        assert!(!ast_scan_enabled_from_env());
+        let via_flag = run_scan_at(tmp.path()).expect("flag-off scan");
+        let direct_regex = run_scan_regex_at(tmp.path()).expect("direct regex scan");
+
+        let mut via_flag = serde_json::to_value(via_flag).expect("flag json");
+        let mut direct_regex = serde_json::to_value(direct_regex).expect("regex json");
+        for value in [&mut via_flag, &mut direct_regex] {
+            let obj = value.as_object_mut().expect("scan object");
+            obj.insert(
+                "scan_id".to_string(),
+                serde_json::Value::String("normalized".to_string()),
+            );
+            obj.insert("started_at_unix_ms".to_string(), serde_json::Value::from(0));
+            obj.insert("finished_at_unix_ms".to_string(), serde_json::Value::from(0));
+            obj.insert("duration_ms".to_string(), serde_json::Value::from(0));
+        }
+        assert_eq!(via_flag, direct_regex);
+
+        std::env::set_var("CORECRUXD_AST_SCAN", "0");
+        assert!(!ast_scan_enabled_from_env());
+        std::env::set_var("CORECRUXD_AST_SCAN", "1");
+        assert!(ast_scan_enabled_from_env());
+        std::env::remove_var("CORECRUXD_AST_SCAN");
     }
 }
