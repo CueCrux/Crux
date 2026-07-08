@@ -10919,6 +10919,119 @@ async fn workspace_routes_report_catalog_and_missing_scan_states() {
     assert_eq!(unconfigured.status(), StatusCode::PRECONDITION_FAILED);
 }
 
+fn tiny_rust_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).expect("src dir");
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"repo-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(src.join("lib.rs"), "pub struct Used;\npub fn call() -> Used { Used }\n").expect("lib");
+    dir
+}
+
+#[tokio::test]
+async fn repo_add_local_path_persists_registration_and_scan() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let repo = tiny_rust_repo();
+    let root_path = repo.path().to_string_lossy().to_string();
+
+    let resp = super::repos::post_repo(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        Json(super::repos::CreateRepoBody {
+            repo_id: Some("fixture".to_string()),
+            tenant_id: "tenant-a".to_string(),
+            root_path: Some(root_path),
+            clone_url: None,
+            languages: vec!["rust".to_string()],
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["repo"]["repo_id"], "fixture");
+    assert!(body["repo"]["last_scan_id"].as_str().is_some());
+
+    let store = state.fact_store.read().await;
+    let registry_entity = crate::repo_registry::registry_entity("tenant-a", "fixture");
+    let scan_entity = crate::repo_registry::scan_entity("tenant-a", "fixture");
+    assert!(!store.get_by_entity(&registry_entity).is_empty());
+    assert!(!store.get_by_entity(&scan_entity).is_empty());
+    let persisted = crate::repo_registry::get_repo(&store, "tenant-a", "fixture").expect("repo persisted");
+    assert_eq!(persisted.repo_id, "fixture");
+    assert!(persisted.last_scan_id.is_some());
+}
+
+#[tokio::test]
+async fn repo_list_get_and_delete_are_tenant_scoped() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    for (tenant, repo_id) in [("tenant-a", "alpha"), ("tenant-b", "bravo")] {
+        let resp = super::repos::post_repo(
+            State(state.clone()),
+            dev_scope_headers("admin:write"),
+            Json(super::repos::CreateRepoBody {
+                repo_id: Some(repo_id.to_string()),
+                tenant_id: tenant.to_string(),
+                root_path: None,
+                clone_url: Some(format!("https://example.invalid/{repo_id}.git")),
+                languages: vec!["rust".to_string()],
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    let list_a = super::repos::get_repos(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::RepoTenantQuery {
+            tenant_id: "tenant-a".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    let body = json_body(list_a).await;
+    let repos = body["repos"].as_array().expect("repos array");
+    assert_eq!(repos.len(), 1);
+    assert_eq!(repos[0]["repo_id"], "alpha");
+
+    let cross_read = super::repos::get_repo(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::RepoTenantQuery {
+            tenant_id: "tenant-b".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(cross_read.status(), StatusCode::NOT_FOUND);
+
+    let delete = super::repos::delete_repo(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:write"),
+        Query(super::repos::RepoTenantQuery {
+            tenant_id: "tenant-a".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+
+    let store = state.fact_store.read().await;
+    assert!(crate::repo_registry::get_repo(&store, "tenant-a", "alpha").is_none());
+    assert!(store
+        .get_by_entity(&crate::repo_registry::scan_entity("tenant-a", "alpha"))
+        .is_empty());
+    assert!(crate::repo_registry::get_repo(&store, "tenant-b", "bravo").is_some());
+}
+
 #[tokio::test]
 async fn embedding_probe_rejects_empty_url() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);

@@ -81,6 +81,7 @@ mod projects;
 mod protocol_posture;
 mod redaction;
 mod relations;
+mod repo_registry;
 mod session_bindings;
 mod shard_map;
 mod status_feed;

@@ -45,6 +45,7 @@ pub mod passport;
 pub mod punchcards;
 pub mod query;
 pub mod receipt_verify;
+pub mod repos;
 pub mod resolve_principal;
 pub mod sessions;
 pub mod storyline;
@@ -1843,6 +1844,16 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
             description: storyline::description().to_string(),
             input_schema: storyline::input_schema(),
         },
+        ToolDefinition {
+            name: "register_repo".to_string(),
+            description: repos::register_description().to_string(),
+            input_schema: repos::register_schema(),
+        },
+        ToolDefinition {
+            name: "list_repos".to_string(),
+            description: repos::list_description().to_string(),
+            input_schema: repos::list_schema(),
+        },
         // ── Substrate: entities / edges / kinds (M1) ──────────────
         ToolDefinition {
             name: "entity_upsert".to_string(),
@@ -2826,6 +2837,8 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "github_comments_since" => github::handle_github_comments_since(args, ctx).await,
         // Workspace storyline (HTTP loopback to corecruxd).
         "get_workspace_storyline" => storyline::handle_get_workspace_storyline(args, ctx).await,
+        "register_repo" => repos::handle_register_repo(args, ctx).await,
+        "list_repos" => repos::handle_list_repos(args, ctx).await,
         // Substrate (M1).
         "entity_upsert" => entities::handle_entity_upsert(args, ctx).await,
         "entity_get" => entities::handle_entity_get(args, ctx).await,

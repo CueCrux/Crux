@@ -84,6 +84,8 @@ const DEFAULT_PRIVATE_PREFIXES: &[&str] = &[
     "__plane_layer__::",
     "__workspace__::",
     "__workspace_scan__::",
+    "__repo_registry__::",
+    "__repo_scan__::",
     "__storybook__::",
     "__dossier__::",
     "__project_repo_link__::",

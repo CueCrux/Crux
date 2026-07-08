@@ -49,6 +49,7 @@ pub mod quickstart;
 pub mod receipts;
 pub mod reconcile;
 pub mod replay;
+pub mod repo;
 pub mod session_sync;
 pub mod shard;
 pub mod shardmap;
