@@ -7,68 +7,73 @@
 
 # CRUX
 
-### Know what every coding session **cost** — then prove what your agent **did**.
+### One binary. Your whole memory.
 
-Crux opens on the one number you can't easily get anywhere else — your session's **token burn**:
-how much context every model call re-read, where it went, and what to change to cut it
-(`corecruxctl session cost`, or the **Token burn** console page). Underneath, it's a local-first
-**signed recorder** for AI agents — fact storage with deterministic freshness decay, BM25 + graph
-retrieval under hard token budgets, and an Ed25519 receipt for every write.
-One binary. No API keys. Nothing leaves your machine.
+**Crux is a local-first memory daemon for AI agents** — a versioned fact store, token-budgeted
+BM25 + graph retrieval, and an Ed25519-signed receipt for every write. 100+ MCP tools, agent
+passports, portable `.cruxpack` export. No account. No API keys. Nothing leaves your machine.
 
-[Quickstart](#quickstart) · [Docs](docs/README.md) · [Developers](docs/developer-portal.md) · [Console](#the-console) · [How it works](#how-it-works) ·
-[Capabilities](#what-you-get) · [Verify releases](docs/verify-release.md) ·
-[Security](SECURITY.md) · [Support](#support--security) · [Licence](#licence)
+[**Up and running in 60 seconds**](#up-and-running-in-60-seconds) ·
+[The console](#the-console) · [How it works](#how-it-works) ·
+[MCP tools](#100-mcp-tools-memory-first) ·
+[Platform](#standalone-by-design-platform-by-choice) · [Docs](docs/README.md)
 
 [![CI](https://github.com/CueCrux/Crux/actions/workflows/ci.yml/badge.svg)](https://github.com/CueCrux/Crux/actions/workflows/ci.yml)
 [![Coverage](https://img.shields.io/badge/coverage-CI%20gated-green)](https://github.com/CueCrux/Crux/actions/workflows/coverage-attestation.yml)
-[![MCP](https://img.shields.io/badge/MCP-native-blue)](#mcp-server-for-agents)
-[![MSRV](https://img.shields.io/badge/MSRV-1.88.0-orange)](rust-toolchain.toml)
+[![MCP](https://img.shields.io/badge/MCP-native-blue)](#100-mcp-tools-memory-first)
 [![Licence: CCL-1.0 (source-available)](https://img.shields.io/badge/licence-CCL--1.0_(source--available)-blue)](LICENCE.md)
+
+<img src="docs/Images/readme/console-overwatch.png" alt="Crux console Overwatch view: a gate queue of decisions that need you, a live fleet of agent sessions, and a rolling receipted activity ticker" width="88%">
+
+<sub><b>Overwatch</b> — the gates that need you, the live fleet, every action receipted.
+Ships inside the daemon at <code>localhost:14800</code> — no account, no cloud dashboard.</sub>
 
 </div>
 
-## The console
+## Why Crux
 
-The console ships **inside the daemon** — served from `:14800/console`, all local, no cloud
-dashboard. Including a 3D view of your work graph and your receipt chain.
+- **Memory that ages honestly.** Facts carry confidence, provenance and a freshness horizon
+  (volatile ~24 h · medium ~35 d · stable ~1 y). A deterministic decay engine downranks stale
+  claims instead of serving them as truth — reversible via `memory_reverify`, with scoped
+  forget + dry-run for GDPR Art. 17.
+- **Retrieval on a token budget.** `token_budget` is a first-class parameter, not a hope.
+  BM25 + graph fusion returns metadata and token counts first, content only inside budget —
+  **60–80% fewer tokens** than naive top-K context stuffing. Dense lanes are bring-your-own
+  and never required.
+- **Receipts, not vibes.** Every mutation emits a **CROWN receipt**: Ed25519-signed,
+  hash-bound, independently verifiable offline. Store integrity is checked separately with
+  `corecruxctl verify-store --strict`.
+- **Identity agents earn.** Every agent carries a passport with a five-tier reputation ladder;
+  verified receipts accrue as track record, and capability tokens expire instead of leaking.
+- **Policy over memory.** Declare organisational constraints once; proposed actions are checked
+  against them — pass, warn, or block — before they execute.
+- **Your memory follows you.** Export everything as a self-certifying `.cruxpack` — signed,
+  offline-verifiable, importable into any other daemon. Leaving is a command, not a ticket.
+- **Know what every session cost.** `corecruxctl session cost` and the console's token-burn
+  page show how much context every model call re-read, where it went, and what to change.
 
-<table>
-  <tr>
-    <td width="50%"><img src="docs/Images/readme/console-dashboard.png" alt="Crux console dashboard: passport, fact totals, token usage in/out, pending gates, live board and sessions on one screen"></td>
-    <td width="50%"><img src="docs/Images/readme/console-work.png" alt="ExecPlan focus view: the plan document, milestone cards with gate states, and a node inspector"></td>
-  </tr>
-  <tr>
-    <td align="center"><sub><b>the cockpit</b> — passport, facts, token in/out, gates, live board</sub></td>
-    <td align="center"><sub><b>plans as living documents</b> — milestones, gates and their receipts</sub></td>
-  </tr>
-  <tr>
-    <td width="50%"><img src="docs/Images/readme/console-workgraph-3d.png" alt="Isometric 3D work graph: execplan, session and handoff nodes as connected blocks, with a node inspector showing passport, milestone and linked receipts"></td>
-    <td width="50%"><img src="docs/Images/readme/console-receipts-3d.png" alt="3D receipt chain: a green receipt block linked to a chain of further receipt blocks, with an inspector showing the gate verdict and linked chain"></td>
-  </tr>
-  <tr>
-    <td align="center"><sub><b>the work graph, in 3D</b> — plans, sessions, handoffs, receipts as connected blocks</sub></td>
-    <td align="center"><sub><b>receipts as a literal chain</b> — click any block, inspect the proof</sub></td>
-  </tr>
-</table>
+## Up and running in 60 seconds
 
-## Quickstart
+The lowest-friction install is to just ask your agent. Paste this into any coding agent —
+it reviews the source, installs and runs the daemon, then Crux's setup wizard wires it into
+your session: the MCP surface connected, a passport minted, a first fact round-tripped.
 
-No signup. No OpenAI key. BM25 retrieval works out of the box — embeddings are optional and
-pluggable when you want them.
+```text
+Review and install the Crux Daemon from github.com/CueCrux/Crux — read the README and
+LICENCE first, run it locally, then use its setup wizard to connect the daemon to this
+session and confirm the console is up at http://localhost:14800.
+```
 
-**Two steps to live:** bring the daemon up, then run the one on-ramp command.
-For the longer install path, start at [docs/getting-started.md](docs/getting-started.md);
-the public docs index is [docs/README.md](docs/README.md).
-
-**1 — bring the daemon up** (Docker recommended):
+**Prefer to do it yourself?** Bring the daemon up on any of three rails:
 
 ```bash
+# Docker (recommended)
+git clone https://github.com/CueCrux/Crux.git && cd Crux
 docker compose up -d
 ```
 
-HTTP binds `127.0.0.1:14800`, MCP binds `127.0.0.1:14801`. Open `http://127.0.0.1:14800` —
-the embedded console walks you through one-time setup and becomes your local dashboard.
+<details>
+<summary>From a release binary, or from source</summary>
 
 **From a release** (binaries are cosign-signed with SBOMs — [verify them](docs/verify-release.md)):
 
@@ -86,7 +91,12 @@ cargo build --release
 CORECRUXD_AUTH_MODE=dev_scopes CORECRUXD_DATA_DIR=./data ./target/release/corecruxd
 ```
 
-**2 — get live (one command):**
+`CORECRUXD_AUTH_MODE` is required; `dev_scopes` is the single-user loopback quickstart rail.
+Use `off` only for throwaway local development.
+</details>
+
+HTTP binds `127.0.0.1:14800`, MCP binds `127.0.0.1:14801`. Open `http://127.0.0.1:14800` —
+the embedded console walks you through one-time setup — then get live with one command:
 
 ```bash
 corecruxctl start
@@ -94,48 +104,38 @@ corecruxctl start
 
 `start` is the canonical on-ramp: it detects the daemon, authenticates on the lowest-friction
 secure rail, wires the MCP endpoint + Claude Code hooks, round-trips a first fact, and prints a
-single "you're live" summary. That's the whole first loop.
+single "you're live" summary. Longer install path: [docs/getting-started.md](docs/getting-started.md) ·
+guided rails: `corecruxctl login`, `corecruxctl quickstart` · ready-made MCP connector configs
+for Claude Code, Claude Desktop and Cursor: [`examples/mcp-configs/`](examples/mcp-configs/).
 
-<details>
-<summary>Advanced / specific rails</summary>
+> [!NOTE]
+> Crux receipts and BLAKE3 chains prove **integrity, not confidentiality**. The daemon data
+> directory is not encrypted by Crux; use filesystem encryption (LUKS, FileVault, BitLocker)
+> when the machine, volume, or backup location is outside your trusted boundary.
 
-`start` wraps the lower-level entry points; reach for them directly only when you need a specific
-rail:
+## The console
 
-- `corecruxctl login` — pick an explicit auth rail (`--token` for CI/headless, `--device`, …).
-- `corecruxctl quickstart` — guided store→query→cleanup walkthrough.
-- **Connect an agent manually** (any MCP client — Claude Code, Claude Desktop, Cursor):
+Every daemon ships a local operator console at `localhost:14800` — watch your fleet, your
+plans, and your memory, every action receipted.
 
-  ```jsonc
-  // .mcp.json
-  { "crux": { "url": "http://127.0.0.1:14801/mcp" } }
-  ```
-
-  Ready-made connector configs live in [`examples/mcp-configs/`](examples/mcp-configs/).
-</details>
-
-`CORECRUXD_AUTH_MODE` is required; `dev_scopes` is the single-user loopback
-quickstart rail. Use `off` only for throwaway local development.
-
-**Local storage boundary:** Crux receipts and BLAKE3 chains prove integrity,
-not confidentiality. The daemon data directory is not encrypted by Crux; use
-filesystem encryption such as LUKS, dm-crypt, FileVault, or BitLocker when the
-machine, volume, or backup location is outside your trusted boundary.
-
-## Three planes, one daemon
-
-**🟢 Memory that ages honestly.** Facts carry confidence, provenance and a freshness horizon.
-A deterministic decay engine downranks stale claims instead of serving them as truth —
-reversible via `memory_reverify`. Scoped forget with dry-run for GDPR Art. 17.
-
-**🔵 Retrieval on a token budget.** `token_budget` is a first-class parameter, not a hope.
-BM25 + graph fusion returns metadata and token counts first, content only inside budget —
-**60–80% fewer tokens** than naive top-K context stuffing. Dense lanes optional, never required.
-
-**🟠 Receipts, not vibes.** Receipt streams use **CROWN receipts**: Ed25519-signed,
-hash-bound, and independently verifiable by the receipt verifier. Store integrity is checked
-separately: `corecruxctl verify-store` checks manifest/frame structure, and `--strict`
-also recomputes sealed-segment BLAKE3 hashes against the manifest.
+<table>
+  <tr>
+    <td width="50%"><img src="docs/Images/readme/console-canvas.png" alt="Crux console Canvas board: a size-adaptive tile board of sessions, plans and gates that can be dragged, panned and expanded"></td>
+    <td width="50%"><img src="docs/Images/readme/console-graph.png" alt="Crux console relation graph: sessions, work items, gates, projects and passports as draggable nodes with flow-traced edges"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><b>Canvas</b> — your whole operation as a size-adaptive board</sub></td>
+    <td align="center"><sub><b>the relation graph</b> — sessions, work, gates and passports, flow-traced</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/Images/readme/console-execplans.png" alt="Crux console ExecPlans kanban: planned, in-progress, blocked and shipped plan cards with risk class, current milestone and progress"></td>
+    <td width="50%"><img src="docs/Images/readme/console-sessions.png" alt="Crux console Sessions view: saved sessions for resume and audit, each with its attached plan, passport, token usage and progress"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><b>plans as living documents</b> — milestones, gates, risk, progress</sub></td>
+    <td align="center"><sub><b>sessions that survive restarts</b> — resume, audit, attribute token spend</sub></td>
+  </tr>
+</table>
 
 ## Don't believe this README
 
@@ -155,11 +155,11 @@ subcommands.
 The verifier is ~1,250 lines of Rust at
 [`crates/corecrux-receipts/src/verify_v1.rs`](crates/corecrux-receipts/src/verify_v1.rs):
 `ed25519-dalek::verify_strict` (rejects malleable signatures and small-order keys), with the
-signature bound to both receipt ID and payload hash so it can't be transplanted. Tamper tests live in
-[`crates/corecrux-receipts/src/tests.rs`](crates/corecrux-receipts/src/tests.rs).
+signature bound to both receipt ID and payload hash so it can't be transplanted. Tamper tests
+live in [`crates/corecrux-receipts/src/tests.rs`](crates/corecrux-receipts/src/tests.rs).
 
 And you can run **the same exit test we run in CI** — export everything the daemon knows (facts +
-sessions) and everything it did (signed journal + receipt refs) into one passport-signed bundle, then
+sessions) and everything it did (signed journal + receipt refs) into one passport-signed bundle,
 verify that bundle **offline**, and watch the verifier reject a tampered byte:
 
 ```bash
@@ -167,19 +167,23 @@ corecruxctl context export --data-dir <dir> --out ./bundle   # signed=true
 corecruxctl context verify ./bundle --json                   # ok=true, offline, no network
 ```
 
-There is no lock-in: the answer to *"can you export it?"* and *"can you prove what it saw and did?"*
-is a command, not a support ticket. We run this same export → offline-verify → tamper-rejection cycle
-as a release-blocking CI gate, so every published build has passed its own exit test.
+There is no lock-in: the answer to *"can you export it?"* and *"can you prove what it saw and
+did?"* is a command, not a support ticket. This export → offline-verify → tamper-rejection cycle
+is a release-blocking CI gate, so every published build has passed its own exit test. Release
+artifacts are signed and attested end-to-end — cosign keyless signatures, CycloneDX SBOMs, SLSA
+provenance ([docs/verify-release.md](docs/verify-release.md)). Found something?
+Report it privately per the [security policy](SECURITY.md).
 
-Release artifacts are signed and attested end-to-end: cosign keyless signatures + CycloneDX SBOMs
-on every binary and image, SLSA provenance on every release — [docs/verify-release.md](docs/verify-release.md).
-Found something? Report it privately per the [security policy](SECURITY.md).
+<div align="center">
+<img src="docs/Images/readme/console-receipts-3d.png" alt="3D receipt chain in the Crux console: a green receipt block linked to a chain of further receipt blocks, with an inspector showing the gate verdict and linked chain" width="80%">
 
-**Testing & coverage:** **4,489** tests and **~87%** CI-gated region coverage, with per-crate floors
+<sub><b>receipts as a literal chain</b> — click any block in the console, inspect the proof</sub>
+</div>
+
+**Testing & coverage:** 5,000+ tests and **~87%** CI-gated region coverage, with per-crate floors
 on the trust core (`corecrux-receipts` / `-segment` / `-storage`) and the ungated total reported
-alongside so exclusions can't hide low-coverage code. How it's measured, exactly what's excluded and
-why, and an honest account of why the number sits where it does:
-[docs/testing-and-coverage.md](docs/testing-and-coverage.md).
+alongside so exclusions can't hide low-coverage code. How it's measured and exactly what's
+excluded: [docs/testing-and-coverage.md](docs/testing-and-coverage.md).
 
 ## Your context window is the scarce resource
 
@@ -204,15 +208,15 @@ earns its tokens.
 All daemon performance numbers are reproducible from [`docs/benchmarks.md`](docs/benchmarks.md)
 with pinned baselines, regression-gated in CI.
 
-<sub>¹ Internal runs via the CoreCrux retrieval substrate (paid tier; see the
-[CoreCrux / AMR section](#corecrux--amr-frontier-grade-recall-zero-custody)),
-not the bare local daemon. Strict scoring, no partial credit. Treat this as
-preliminary until a public evidence pack with corpus, run ID, lane flags, and
-commit SHA is published.</sub>
+<sub>¹ Internal runs via the CoreCrux retrieval substrate (paid tier; see
+[the platform section](#standalone-by-design-platform-by-choice)), not the bare local daemon.
+Strict scoring, no partial credit. Treat this as preliminary until a public evidence pack with
+corpus, run ID, lane flags, and commit SHA is published.</sub>
 
 ## How it works
 
-One daemon, three planes, an append-only spine. No cloud in this diagram — that's the point.
+One daemon, three planes — memory, retrieval, receipts — on an append-only spine. No cloud in
+this diagram; that's the point.
 
 ```mermaid
 graph TD
@@ -252,7 +256,7 @@ graph TD
 
 More detail: [`docs/architecture.md`](docs/architecture.md).
 
-## Passports — identity agents earn
+## Passports, and how the line is drawn
 
 API keys say *something with this string called us*. A passport says *this agent, at this trust
 tier, with these grants, did this* — and the receipts prove it.
@@ -261,15 +265,45 @@ tier, with these grants, did this* — and the receipts prove it.
    unattributed calls are operator-tagged, never silently allowed.
 2. **Carry** — every tool call rides the passport. RCX mints short-lived capability tokens
    against it — scoped to tools, tenant and tier — so access expires instead of leaking.
-3. **Earn** — verified receipts accrue to the passport as reputation; tiers climb the capability
-   ladder and unlock more autonomy. Trust is a ledger, not a checkbox.
+3. **Earn** — verified receipts accrue to the passport as reputation; five tiers climb the
+   capability ladder and unlock more autonomy. Trust is a ledger, not a checkbox.
 4. **Answer** — any receipt, any time later, resolves back to the passport that produced it:
    who acted, at what tier, under which grants.
 
-**The RCX protocol** is the policy layer behind this: every request resolves a principal
-(`crux-router`), walks the capability ladder, and is allowed or denied per tool — and the decision
-itself lands in the receipt. Capability tokens (`rcx-capability-token`) are short-lived signed
-JWTs, verifiable offline with the same machinery as everything else.
+The same daemon binary runs on every tier. What changes is a signed **RCX capability token** —
+the policy layer that says which backends the daemon may call and what data may cross the wire.
+**Enforcement is a property of the wire, not a crippled binary.** Tokens are self-issued locally,
+verifiable offline with the same machinery as everything else, and refusals are fail-closed with
+a signed `RefusalReceipt` carrying a reason code — never a bare 403 or a silent downgrade.
+
+## What you get
+
+| Capability | Local daemon | Bring your own | Hosted / managed |
+|---|:---:|:---:|:---:|
+| Append-only event store with BLAKE3 integrity | yes | | |
+| CROWN receipts and offline receipt verification | yes | | |
+| Versioned fact store with freshness decay + `memory_reverify` | yes | | |
+| Scoped forget with dry-run (GDPR Art. 17) | yes | | |
+| Sessions, checkpoints and cross-session handoffs | yes | | |
+| ExecPlans + live work board | yes | | |
+| Decision records + constraint governance | yes | | |
+| `.cruxpack` export + offline import | yes | | |
+| Built-in MCP server, 100+ token-filtered tools | yes | | |
+| Agent passports (five-tier reputation) + RCX capability tokens | yes | | |
+| Live multi-session coordination board | yes | | |
+| Typed action traces (reasoning refs — never raw CoT) | yes·flag | | |
+| C2PA output attestation | yes·flag | | |
+| HTTP, gRPC, health, readiness, and metrics | yes | | |
+| `corecruxctl` verification and replay tooling | yes | | |
+| BM25 text search with `.ccxi` companion indexes | yes | | |
+| Dense fact retrieval via embeddings | | Ollama, vLLM, TEI, llama.cpp, LiteLLM | |
+| Hosted team sync, multi-device passports, billing | | | yes |
+| GPU/CUDA fused retrieval + AMR routing | | | yes |
+| LLM entity/relation extraction + better-dense rerank | | | yes |
+| Fleet governance: attribution, policy gates, revocation | | | yes |
+
+`yes·flag` = ships in this repo behind a default-off feature flag — your traces and attestations
+are opt-in, like everything else. `/v1/version` reports which features are active.
 
 ## Standalone by design, platform by choice
 
@@ -292,19 +326,20 @@ flowchart LR
     plan --- crux
 ```
 
-## CoreCrux + AMR: frontier-grade recall, zero custody
+**Free forever** — the full local daemon: receipts, retrieval, passports, console. **Pro**
+(£19/user·mo) adds hosted sync, multi-device passports, and better-dense rerank. **Governance**
+(£49/user·mo) adds fleet-wide attribution, policy gates, and revocation that propagates with
+proof. Metered **credits** (~£0.01/Cr) buy the heavy lifts — dense rerank, extraction,
+attestations. The local dense lane is **never** metered: credits buy the step-up, not your own
+machine. The local daemon is the acquisition, not the upsell.
+Full ladder: [memorycrux.com/pricing](https://memorycrux.com/pricing).
 
-You can pay for frontier-model ingest and extraction over your corpus. You cannot pay us to hold
-your data — there is no such product.
+**You cannot pay us to hold your data — there is no such product.** Paid frontier ingest and
+extraction is processed in flight, never parked: enrichment lands back in *your* store —
+process, return, delete. Every hop carries a receipt. Local-first isn't a pricing tier; it's
+the architecture. The promises are written down in the [Trust Contract](TRUST-CONTRACT.md).
 
-1. **Your store** — facts, documents and sessions live in your `/data`. This never changes.
-2. **Frontier ingest (paid)** — frontier models extract entities, events, traits and summaries —
-   processed in flight, never parked. Every hop carries a receipt.
-3. **Returned & deleted** — enrichment lands back in *your* store. Process, return, delete.
-
-Local-first isn't a pricing tier — it's the architecture. The paid lane rents compute, not custody.
-
-**The lane stack** (the parts we can show — each lane is a different way of remembering):
+**The lane stack** (each lane is a different way of remembering):
 
 | Lane | What it remembers | Tier |
 |---|---|---|
@@ -317,38 +352,11 @@ Local-first isn't a pricing tier — it's the architecture. The paid lane rents 
 | verbatim pointers | exact-quote recall without duplicating content | free · local |
 | *+ several more* | *the ones we don't blog about* | — |
 
-**AMR — Adaptive Manifest Routing.** Every query is different, so AMR reads the lane manifest and
-routes each one automatically — fusing the lanes that earn their tokens, skipping the ones that
-don't, learning from per-request outcomes. No knobs, no lane config. Automatic, and opt-in: it
-switches on with a subscription and stays off otherwise — like everything else in Crux.
-
-Without a subscription you still run the full local daemon: lexical lane, graph fusion, token
-budgets, receipts. That's not a demo — it's the same engine the paid lanes plug into.
-
-## What you get
-
-| Capability | Local daemon | Bring your own | Hosted / managed |
-|---|:---:|:---:|:---:|
-| Append-only event store with BLAKE3 integrity | yes | | |
-| CROWN receipts and receipt verification | yes | | |
-| Local fact store with freshness decay + `memory_reverify` | yes | | |
-| Scoped forget with dry-run (GDPR Art. 17) | yes | | |
-| Local session store + cross-session handoffs | yes | | |
-| Built-in MCP server, token-filtered tools | yes | | |
-| Agent passports + RCX capability tokens | yes | | |
-| Live multi-session coordination board | yes | | |
-| Typed action traces (reasoning refs — never raw CoT) | yes·flag | | |
-| C2PA output attestation | yes·flag | | |
-| HTTP, gRPC, health, readiness, and metrics | yes | | |
-| `corecruxctl` verification and replay tooling | yes | | |
-| BM25 text search with `.ccxi` companion indexes | yes | | |
-| Dense fact retrieval via embeddings | | Ollama, vLLM, TEI, llama.cpp, LiteLLM | |
-| Hosted team sync, billing, marketplace, credential broker | | | yes |
-| GPU/CUDA fused retrieval + AMR | | | yes |
-| Cross-principal aggregation and hosted Signals | | | yes |
-
-`yes·flag` = ships in this repo behind a default-off feature flag — your traces and attestations
-are opt-in, like everything else. `/v1/version` reports which features are active.
+**AMR — Adaptive Manifest Routing** reads the lane manifest and routes each query automatically —
+fusing the lanes that earn their tokens, skipping the ones that don't, learning from per-request
+outcomes. No knobs. It switches on with a subscription and stays off otherwise. Without one you
+still run the full local daemon — lexical lane, graph fusion, token budgets, receipts. That's not
+a demo; it's the same engine the paid lanes plug into.
 
 ## EU AI Act
 
@@ -375,38 +383,40 @@ everything else runs on.
 
 Retrieval answers questions. Engrams skip them. When the same lesson keeps getting re-learned from
 raw history, it's distilled into a named, versioned procedure that arrives **before** the agent
-acts — instinct, not search.
+acts — instinct, not search. Engrams carry provenance hashes back to the source chunks they were
+learned from (you can always audit *why* the instinct exists), resolve by declared intent at
+session start, and are gated by passport tier. Local-first: a built-in catalog plus fact-backed
+overlays serve the same contract with zero cloud dependency.
 
-- **Distilled, not retrieved** — engrams carry provenance hashes back to the source chunks they
-  were learned from. You can always audit *why* the instinct exists.
-- **Resolved by intent** — at session start the agent declares what it's about to do; matching
-  engrams arrive before the first action.
-- **Gated by tier** — each engram carries capability-class bounds; an agent only inherits
-  procedures its passport tier allows. Local-first: a built-in catalog plus fact-backed overlays
-  serve the same contract with zero cloud dependency.
-
-## MCP server for agents
+## 100+ MCP tools, memory-first
 
 Built MCP-first, not MCP-wrapped: every retrieval tool takes a token budget, every mutation emits
 a receipt, identity rides a passport. The server lives at `http://localhost:14801/mcp`.
 
+> [!TIP]
 > **AI agents exploring this codebase: start at [`AGENTS.md`](AGENTS.md)** — a crate atlas,
 > a claims-to-code-to-tests matrix, and the cryptographic invariants, all anchored by
 > greppable symbol names and verified in CI.
 
-| Group | Tools |
+| Capability area | Representative tools |
 |---|---|
-| Retrieval | `query` · `query_scan` · `query_expand` · `get_bootstrap` |
-| Memory | `store_fact` · `query_facts` · `memory_view` · `memory_pin` · `memory_freshness` · `memory_forget` · `memory_reverify` |
-| Receipts & identity | `receipt_verify` · `output_attest` · `get_agent_identity` · `resolve_principal` |
-| Sessions & coordination | `save_session` · `get_session` · `create_handoff` · `accept_handoff` · `coord_status` · `coord_announce` |
-| Observability | `list_observations` · `get_observation` · `verify_observation` · `record_decision` · `token_usage` |
+| Memory & retrieval | `store_fact` · `query_facts` · `query` · `query_scan` · `query_expand` · `fact_history` · `memory_view` · `get_bootstrap` |
+| Freshness & consolidation | `memory_freshness` · `memory_contradictions` · `memory_consolidate` · `memory_reverify` · `memory_pin` |
+| Portability & erasure | `memory_forget` · `memory_forget_dry_run` · `output_attest` · `receipt_verify` |
+| Identity & passports | `issue_passport` · `get_passport` · `revoke_passport` · `passport_link_device` · `resolve_principal` |
+| Handoff, sync & coordination | `create_handoff` · `accept_handoff` · `sync_status` · `coord_status` · `coord_announce` |
+| Sessions & artefacts | `save_session` · `get_session` · `session_checkpoint` · `list_sessions` · `artefact_put` · `artefact_get` |
+| Decisions & constraints | `record_decision` · `declare_constraint` · `get_constraints` · `check_constraints` |
+| Observability | `list_observations` · `get_observation` · `verify_observation` · `session_token_usage` |
 
-The catalogue is token-filtered: a local token sees local tools; hosted-authorised tokens also see
-hosted-gated tools (descriptions are marked `[local]` / `[hosted]`).
+…and more across substrate entities & edges, work & coordination, and orchestration — 100+
+tools today, and counting. The catalogue is token-filtered: a local token sees local tools;
+hosted-authorised tokens also see hosted-gated tools (descriptions are marked `[local]` /
+`[hosted]`).
 
 Recommended first calls: `cuecrux_session` → `get_bootstrap(topic="patterns")` →
-`store_fact(...)` → `query_facts(...)`. Full guidance: [`docs/agent-guide.md`](docs/agent-guide.md).
+`store_fact(...)` → `query_facts(...)`. Full guidance: [`docs/agent-guide.md`](docs/agent-guide.md) ·
+API surface: [`docs/developer-portal.md`](docs/developer-portal.md).
 
 ## Operations reference
 
@@ -563,13 +573,11 @@ here, the hosted half via the published Trust Contract and the receipts your dae
 
 ## Community
 
-Built in the open, verified in the open.
+Built in the open, verified in the open. If Crux is useful to you, a star helps others find it.
 
 [Contributing](CONTRIBUTING.md) · [Security policy](SECURITY.md) ·
 [Code of conduct](CODE_OF_CONDUCT.md) · [Changelog](CHANGELOG.md) ·
 [Trust Contract](TRUST-CONTRACT.md)
-
-## Support & security
 
 - Before running a release artifact, verify its signature, SBOM and provenance with
   [`docs/verify-release.md`](docs/verify-release.md).
