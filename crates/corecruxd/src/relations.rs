@@ -149,6 +149,10 @@ pub fn supported_edge_types() -> &'static [&'static str] {
         "derived_from",
         "cites",
         "about_same_entity",
+        "calls",
+        "imports",
+        "defines",
+        "depends_on",
     ]
 }
 

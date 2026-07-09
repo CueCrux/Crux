@@ -272,6 +272,20 @@ fn classify_route(method: &str, path: &str) -> Option<RouteAuthContract> {
         return Some(RouteAuthContract::new(class, scopes));
     }
 
+    if path.starts_with("/v1/repos") {
+        let class = if method == "GET" {
+            RouteAuthClass::AdminRead
+        } else {
+            RouteAuthClass::AdminWrite
+        };
+        let scopes = if method == "GET" {
+            &["admin:read"][..]
+        } else {
+            &["admin:write"][..]
+        };
+        return Some(RouteAuthContract::new(class, scopes));
+    }
+
     if path.starts_with("/v1/work")
         || path.starts_with("/v1/status-feed")
         || path.starts_with("/v1/projects")
