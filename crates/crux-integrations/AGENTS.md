@@ -1,0 +1,23 @@
+# crux-integrations — agent notes
+
+> Root `AGENTS.md` and `CLAUDE.md` still apply; this file adds crate-local context.
+
+Declarative manifest contract for Crux Daemon integration packs (schema
+`crux.integration.v1`). Packs describe MCP, HTTP, SDK, CLI, file-watcher, and
+webhook recipes — they never execute code inside the daemon process. Also
+covers manifest signing/verification and the community-extensions registry
+index schema (`crux.community-extensions.index.v1`).
+
+## Key symbols
+- `IntegrationManifest` — top-level pack manifest; validated against `INTEGRATION_SCHEMA_V1`.
+- `IntegrationEntry` / `EntryKind` — one recipe per entry, typed by kind (MCP, HTTP, ...).
+- `SafetyPolicy` — per-pack safety constraints; part of the v1 contract.
+- `sign_manifest` / `TrustedKeyring` (`signing.rs`) — Ed25519 manifest signing and curator-key verification.
+- `ALLOWED_CAPABILITIES` — the closed capability vocabulary; unknown capability strings are rejected (`IntegrationError::UnknownCapability` path).
+
+## Test & verify
+- `cargo test -p crux-integrations`
+
+## Local rules
+- The contract is declarative by design: do not add an `EntryKind` or field that implies in-daemon code execution.
+- Capability strings must come from `ALLOWED_CAPABILITIES`; extending that list is a contract change — treat it as schema evolution, not a casual edit.
