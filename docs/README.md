@@ -42,6 +42,10 @@ server run on your machine without a hosted account.
 ## Trust Surface
 
 - [Threat model](THREAT_MODEL.md) - security assumptions and boundaries.
+- [Trust Contract](../TRUST-CONTRACT.md) - the promises the daemon makes,
+  each verifiable from this repository's source.
+- [Agent codebase docs](../AGENTS.md) - reading order, crate atlas, claims,
+  and invariants for AI agents exploring or modifying this repo.
 - [Usage receipts](usage-receipts.md) - consent-gated, signed usage pings.
 - [Activity log](activity-log.md) - signed activity and receipt timelines.
 - [Benchmarks](benchmarks.md) - reproducible performance baselines.

@@ -6,9 +6,9 @@
 
 ## Agent docs
 - [AGENTS.md](AGENTS.md): entry point — reading order, trust-core tour, verify commands
-- [CODEMAP](docs/agent/CODEMAP.md): crate atlas (27 crates → purpose, symbols, deps)
+- [CODEMAP](docs/agent/CODEMAP.md): crate atlas (28 crates → purpose, symbols, deps)
 - [CLAIMS](docs/agent/CLAIMS.md): product claim → enforcing symbol → proving test
-- [INVARIANTS](docs/agent/INVARIANTS.md): cryptographic + data guarantees I1–I4
+- [INVARIANTS](docs/agent/INVARIANTS.md): cryptographic + data guarantees I1–I6
 - [GLOSSARY](docs/agent/GLOSSARY.md): CROWN, CCXI, CRC-v1, cruxpack, lane, passport
 - [repo-manifest.yaml](docs/agent/repo-manifest.yaml): machine-readable index + CI assertions
 
@@ -16,10 +16,22 @@
 - [THREAT_MODEL](docs/THREAT_MODEL.md): trust boundaries and stated limitations
 - [receipt-v1 spec](docs/spec/receipt-v1.md): on-the-wire receipt format
 - [audit-bundle-v1 spec](docs/spec/audit-bundle-v1.md): BYO audit-trail export bundle
+- [Trust Contract](TRUST-CONTRACT.md): the promises the daemon makes, verifiable in this tree
 - [ADRs](docs/adr/): 001 append-only sealed segments, 002 CROWN receipts, 003 CPU-only daemon
+
+## Use & integrate
+- [getting started](docs/getting-started.md): install paths + the first loop
+- [developer portal](docs/developer-portal.md): HTTP/MCP base URLs, OpenAPI, offline verify, SDKs
+- [API reference](docs/api-reference.md): route notes
+- [agent guide](docs/agent-guide.md): how agents call the daemon — budgets, sessions, handoffs
+- [MCP system prompt](docs/mcp-system-prompt.md): drop-in prompt covering the full tool surface
+- [architecture](docs/architecture.md): daemon planes and crate boundaries
+- [verify releases](docs/verify-release.md): cosign signatures, SBOMs, SLSA provenance
+- [usage receipts](docs/usage-receipts.md): the opt-in, metadata-only adoption signal
 
 ## Verify
 - [testing & coverage](docs/testing-and-coverage.md): how tests + the coverage gate work, what's excluded and why
+- [benchmarks](docs/benchmarks.md): pinned baselines, regression-gated in CI
 - `cargo test --workspace`
 - `corecruxctl verify-store --strict` — per-segment BLAKE3 + chain walk
 - `corecruxctl replay --strict` — recompute + compare

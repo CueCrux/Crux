@@ -4,7 +4,7 @@
 > Anchored by **symbol name** (greppable), not line number (rots). Verified against
 > the tree by `scripts/check-agent-docs.sh` in CI.
 
-The workspace has **27 cargo crates** under `crates/`. (`crux-console-ui` is a built
+The workspace has **28 cargo crates** under `crates/`. (`crux-console-ui` is a built
 SPA — `dist/` only, not a cargo member — and is excluded below.)
 
 ## Trust core (read these first)
@@ -56,6 +56,7 @@ SPA — `dist/` only, not a cargo member — and is excluded below.)
 | `crux-config-wizard` | Composes `CLAUDE.md`/`AGENTS.md` config from versioned profile fragments | `Target` enum *(also a binary)* | crux-claude-hooks | 1.8k |
 | `crux-claude-hooks` | Claude Code lifecycle hook binaries (`crux-hook`, `crux-llm-shim`) | *(binaries + `crux_claude_hooks` lib)* | — | 5.0k |
 | `crux-contrib` | Contribution-manifest builder + Ed25519 envelope signing | `build_manifest`, `ContributionManifest`, `Provenance` | — | 0.2k |
+| `crux-cost` | Ground-truth token-burn cost lens: parses a Claude Code transcript for measured usage, attributes carried context cost per source; shared `CostReport` contract for CLI (producer) and daemon (reader) | `analyze_file`, `analyze_str`, `CostReport` | corecruxctl, corecruxd | 2.2k |
 | `crux-sync` | Offline-first outbox sync client to the VaultCrux API | `Outbox`/`OutboxEntry`, `push_contributions`/`query_commons` | — | 0.7k |
 | `crux-integration-tests` | Cross-crate integration tests (consumes corecrux-proto) | *(test-only crate)* | — | 2.2k |
 

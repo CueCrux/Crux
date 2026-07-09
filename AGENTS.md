@@ -11,15 +11,19 @@ CI-verified, so you can trust the references — but verify the claims yourself 
 
 ## Reading order (start here)
 
-1. `docs/agent/CODEMAP.md` — what each of the 27 crates owns + key symbols.
+1. `docs/agent/CODEMAP.md` — what each of the 28 crates owns + key symbols.
 2. `docs/agent/CLAIMS.md` — each product claim mapped to the code and the **test** that proves it.
-3. `docs/agent/INVARIANTS.md` — the cryptographic + data guarantees (I1–I4) and where they hold.
+3. `docs/agent/INVARIANTS.md` — the cryptographic + data guarantees (I1–I6) and where they hold.
 4. `docs/THREAT_MODEL.md` — trust boundaries and stated limitations.
 5. `docs/spec/receipt-v1.md` — the on-the-wire receipt format.
 
 Machine-readable index (parse this, no NL needed): `docs/agent/repo-manifest.yaml`.
 Link map: `/llms.txt`. Vocabulary (CROWN, CCXI, CRC-v1, cruxpack, lane, passport):
 `docs/agent/GLOSSARY.md`.
+
+**Building against the daemon instead of modifying it?** Different docs: connect via MCP and
+read `docs/agent-guide.md` (budgets, sessions, handoffs) and `docs/mcp-system-prompt.md`
+(the full tool surface); HTTP/SDK integration starts at `docs/developer-portal.md`.
 
 ## Verify the claims yourself (do not trust this file)
 
@@ -43,11 +47,29 @@ To understand what makes this tamper-evident, read these symbols in order:
 
 ## Build / test
 
-- MSRV: **1.88.0** (`rust-toolchain.toml`); edition 2021; workspace version 0.3.1.
+- MSRV: **1.88.0** (`rust-toolchain.toml`); edition 2021; workspace version 0.5.37
+  (`[workspace.package]` in `Cargo.toml` is authoritative).
 - `cargo build --workspace --locked`
 - `cargo test --workspace`
+- `cargo fmt --check` and `cargo clippy --workspace -- -D warnings` (both CI-gated)
 - CI: `.github/workflows/ci.yml` (lint + test + msrv + coverage), `fuzz.yml` (scheduled),
   `agent-docs.yml` (this doc set's symbol/test existence check).
+
+## Boundaries
+
+**Always:** anchor doc references by symbol name; keep the CCL licence header on every `.rs`
+file (`grep -rL "Licensed under" crates/**/*.rs` must return nothing); test and lint before
+committing.
+
+**Ask first:** changing any default port (HTTP `14800`, gRPC `4007`, MCP `14801`); changing
+receipt formats, seal material, or anything under `crates/corecrux-receipts/`,
+`-segment/`, `-storage/` that an invariant (I1–I6) names; adding a new on-disk artifact type
+(update all three wiring points: storage allowlist, projection registry, load-at-startup).
+
+**Never:** GPU/CUDA code, `--features cuda`, or GPU readiness checks (this repo is CPU-only —
+ADR 003); references to proprietary crates (`corecrux-analytics`, `corecrux-decision`,
+`corecrux-coordinator` do not exist here); line-number anchors in agent docs; deleting live
+shard data by hand.
 
 ## Maintenance contract
 
