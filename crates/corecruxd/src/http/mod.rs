@@ -814,6 +814,12 @@ pub fn router(state: AppState, case_store: self::cases::SharedCaseStore) -> Rout
             "/v1/repos/{repo_id}",
             axum::routing::delete(self::repos::delete_repo),
         )
+        // AST-derived code map for a registered repo — the read side of the
+        // registration-time scan (dogfood: register this repo, serve its map).
+        .route(
+            "/v1/repos/{repo_id}/codemap",
+            get(self::repos::get_repo_codemap),
+        )
         .route(
             "/v1/projects/{id}/tenants/{tenantId}",
             axum::routing::delete(self::projects::delete_project_tenant),

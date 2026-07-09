@@ -11098,6 +11098,165 @@ async fn repo_list_get_and_delete_are_tenant_scoped() {
     assert!(crate::repo_registry::get_repo(&store, "tenant-b", "bravo").is_some());
 }
 
+/// A workspace-layout fixture: the scanner intentionally skips the root
+/// manifest, so symbols only appear for member crates.
+fn tiny_rust_workspace() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\nmembers = [\"mini\"]\n").expect("ws manifest");
+    let member = dir.path().join("mini");
+    std::fs::create_dir_all(member.join("src")).expect("member src");
+    std::fs::write(
+        member.join("Cargo.toml"),
+        "[package]\nname = \"mini\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("member manifest");
+    std::fs::write(
+        member.join("src").join("lib.rs"),
+        "pub struct Used;\npub fn call() -> Used { Used }\n",
+    )
+    .expect("member lib");
+    dir
+}
+
+#[tokio::test]
+async fn repo_codemap_serves_summary_and_full() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let repo = tiny_rust_workspace();
+    let root_path = repo.path().to_string_lossy().to_string();
+
+    let created = super::repos::post_repo(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        Json(super::repos::CreateRepoBody {
+            repo_id: Some("fixture".to_string()),
+            tenant_id: "tenant-a".to_string(),
+            root_path: Some(root_path),
+            clone_url: None,
+            languages: vec!["rust".to_string()],
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created_body = json_body(created).await;
+    let scan_id = created_body["repo"]["last_scan_id"].as_str().expect("scan id").to_string();
+
+    // Default format is the summary: stats + per-crate rollup, no file list.
+    let summary = super::repos::get_repo_codemap(
+        State(state.clone()),
+        Path("fixture".to_string()),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::CodemapQuery {
+            tenant_id: "tenant-a".to_string(),
+            format: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(summary.status(), StatusCode::OK);
+    let summary_body = json_body(summary).await;
+    assert_eq!(summary_body["repo_id"], "fixture");
+    assert_eq!(summary_body["scan_id"], scan_id.as_str());
+    assert!(summary_body["stats"]["symbol_count"].as_u64().unwrap() >= 1);
+    assert!(summary_body["crates"].as_array().is_some_and(|c| !c.is_empty()));
+    assert!(summary_body.get("scan").is_none());
+
+    // Full format round-trips the persisted WorkspaceScan.
+    let full = super::repos::get_repo_codemap(
+        State(state.clone()),
+        Path("fixture".to_string()),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::CodemapQuery {
+            tenant_id: "tenant-a".to_string(),
+            format: Some("full".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(full.status(), StatusCode::OK);
+    let full_body = json_body(full).await;
+    assert_eq!(full_body["scan"]["scan_id"], scan_id.as_str());
+    assert!(full_body["scan"]["files"].as_array().is_some_and(|f| !f.is_empty()));
+    assert!(full_body["scan"]["symbols"].as_array().is_some_and(|s| !s.is_empty()));
+
+    // Unknown format is rejected, not silently defaulted.
+    let bad_format = super::repos::get_repo_codemap(
+        State(state.clone()),
+        Path("fixture".to_string()),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::CodemapQuery {
+            tenant_id: "tenant-a".to_string(),
+            format: Some("csv".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(bad_format.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn repo_codemap_not_found_paths_are_distinct() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    // Unregistered repo → repo not found.
+    let missing = super::repos::get_repo_codemap(
+        State(state.clone()),
+        Path("ghost".to_string()),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::CodemapQuery {
+            tenant_id: "tenant-a".to_string(),
+            format: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    // clone_url-only registration → registered but never scanned; the 404
+    // hint tells the caller how to get a scan.
+    let created = super::repos::post_repo(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        Json(super::repos::CreateRepoBody {
+            repo_id: Some("deferred".to_string()),
+            tenant_id: "tenant-a".to_string(),
+            root_path: None,
+            clone_url: Some("https://example.invalid/deferred.git".to_string()),
+            languages: vec![],
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(created.status(), StatusCode::OK);
+
+    let unscanned = super::repos::get_repo_codemap(
+        State(state.clone()),
+        Path("deferred".to_string()),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::CodemapQuery {
+            tenant_id: "tenant-a".to_string(),
+            format: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(unscanned.status(), StatusCode::NOT_FOUND);
+
+    // Cross-tenant read cannot see another tenant's repo (or its scan).
+    let cross = super::repos::get_repo_codemap(
+        State(state.clone()),
+        Path("deferred".to_string()),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::CodemapQuery {
+            tenant_id: "tenant-b".to_string(),
+            format: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(cross.status(), StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 async fn embedding_probe_rejects_empty_url() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);

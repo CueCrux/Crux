@@ -196,6 +196,105 @@ pub(super) async fn get_repo(
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct CodemapQuery {
+    pub tenant_id: String,
+    /// `summary` (default) → scan stats + per-crate rollup.
+    /// `full` → the entire persisted `WorkspaceScan` (files, symbols, deps, routes).
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+/// `GET /v1/repos/{repo_id}/codemap` — serve the AST-derived code map the
+/// daemon persisted when the repo was registered (or last re-indexed by the
+/// watch loop). This is the read side of the `POST /v1/repos` scan: same
+/// tenant scoping, same auth as the sibling repo reads.
+pub(super) async fn get_repo_codemap(
+    State(state): State<AppState>,
+    Path(repo_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<CodemapQuery>,
+) -> impl IntoResponse {
+    let tenant_id = query.tenant_id.trim().to_string();
+    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &tenant_id) {
+        return problem.into_response();
+    }
+    let format = query.format.as_deref().unwrap_or("summary");
+    if !matches!(format, "summary" | "full") {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            format!("unknown format '{format}'; expected 'summary' or 'full'"),
+        );
+    }
+
+    let store = state.fact_store.read().await;
+    let Some(repo) = crate::repo_registry::get_repo(&store, &tenant_id, &repo_id) else {
+        drop(store);
+        return problem_response(StatusCode::NOT_FOUND, "repo not found");
+    };
+    let scan_json = crate::repo_registry::load_scan_json(&store, &tenant_id, &repo_id);
+    drop(store);
+
+    let Some(scan_json) = scan_json else {
+        return problem_response(
+            StatusCode::NOT_FOUND,
+            "no scan persisted for this repo. Register with root_path (POST /v1/repos) to run a scan; clone_url-only registrations defer scanning.",
+        );
+    };
+    let scan: crate::workspace_scan::WorkspaceScan = match serde_json::from_str(&scan_json) {
+        Ok(scan) => scan,
+        Err(err) => {
+            return problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("persisted scan failed to decode: {err}"),
+            )
+        }
+    };
+
+    if format == "full" {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "repo_id": repo.repo_id,
+                "tenant_id": repo.tenant_id,
+                "languages": repo.languages,
+                "scan": scan,
+            })),
+        )
+            .into_response();
+    }
+
+    let crates: Vec<serde_json::Value> = scan
+        .crates
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "name": c.name,
+                "rel_path": c.rel_path,
+                "file_count": c.file_count,
+                "total_loc": c.total_loc,
+                "internal_deps": c.internal_deps,
+            })
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "repo_id": repo.repo_id,
+            "tenant_id": repo.tenant_id,
+            "languages": repo.languages,
+            "scan_id": scan.scan_id,
+            "root_path": scan.root_path,
+            "started_at_unix_ms": scan.started_at_unix_ms,
+            "duration_ms": scan.duration_ms,
+            "stats": scan.stats,
+            "crates": crates,
+            "hint": "pass format=full for files, symbols, deps and routes",
+        })),
+    )
+        .into_response()
+}
+
 pub(super) async fn delete_repo(
     State(state): State<AppState>,
     Path(repo_id): Path<String>,

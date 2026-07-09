@@ -21,6 +21,12 @@ Machine-readable index (parse this, no NL needed): `docs/agent/repo-manifest.yam
 Link map: `/llms.txt`. Vocabulary (CROWN, CCXI, CRC-v1, cruxpack, lane, passport):
 `docs/agent/GLOSSARY.md`.
 
+**Live code map (dogfood).** A running daemon can serve this repo's AST-derived structure
+back to you: register the checkout (`POST /v1/repos` with `root_path`), then
+`GET /v1/repos/{id}/codemap?tenant_id=…&format=summary|full` — same scanner as
+`/console/codegraph`. The curated CODEMAP.md is the reading order; the endpoint is ground
+truth. Per-crate context lives in `crates/<name>/AGENTS.md` (nearest file wins).
+
 **Building against the daemon instead of modifying it?** Different docs: connect via MCP and
 read `docs/agent-guide.md` (budgets, sessions, handoffs) and `docs/mcp-system-prompt.md`
 (the full tool surface); HTTP/SDK integration starts at `docs/developer-portal.md`.
