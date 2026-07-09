@@ -292,7 +292,10 @@ async fn run_scan_and_store(
                 *snapshot = polyglot_snapshot(root);
                 paths.len()
             };
-            let scan = crate::workspace_scan_polyglot::run_polyglot_scan_at(root).map_err(|err| err.to_string())?;
+            // run_repo_scan_at, not run_polyglot_scan_at: a cargo-workspace repo
+            // with polyglot files re-indexes as a merged scan (crates + routes
+            // preserved), identical to what registration produced.
+            let scan = crate::workspace_scan_polyglot::run_repo_scan_at(root).map_err(|err| err.to_string())?;
             (scan, changed_count, 0, 0)
         }
     };

@@ -51,23 +51,57 @@ struct CallSite {
 
 pub(crate) fn run_repo_scan_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
     if should_use_rust_workspace_scan(root) {
-        crate::workspace_scan::run_scan_at(root)
-    } else {
-        run_polyglot_scan_at(root)
+        return crate::workspace_scan::run_scan_at(root);
     }
+    if has_rust_workspace(root) {
+        // Cargo workspace + polyglot files: scan the cargo tree natively so
+        // crate structure and route extraction survive, then merge the
+        // tree-sitter extraction of the non-Rust files on top. Without this a
+        // single stray .ts/.py file used to flatten a 28-crate workspace into
+        // one package with zero routes.
+        let mut scan = crate::workspace_scan::run_scan_at(root)?;
+        let poly = run_polyglot_scan_inner(root, false)?;
+        merge_polyglot_scan(&mut scan, poly);
+        return Ok(scan);
+    }
+    run_polyglot_scan_at(root)
+}
+
+pub(crate) fn has_rust_workspace(root: &Path) -> bool {
+    root.join("Cargo.toml").exists() && has_supported_file(root, &[Some("rs")])
 }
 
 pub(crate) fn should_use_rust_workspace_scan(root: &Path) -> bool {
-    root.join("Cargo.toml").exists() && has_supported_file(root, &[Some("rs")]) && !has_polyglot_non_rust_files(root)
+    has_rust_workspace(root) && !has_polyglot_non_rust_files(root)
+}
+
+/// Fold a rust-excluded polyglot scan into a native Rust workspace scan.
+/// Crates, routes, stubs and dead-code stay authoritative from the Rust side;
+/// files/symbols/deps are unioned and the stats re-rolled from the merged
+/// contents.
+fn merge_polyglot_scan(scan: &mut WorkspaceScan, poly: WorkspaceScan) {
+    let existing: std::collections::BTreeSet<String> = scan.crates.iter().map(|c| c.name.clone()).collect();
+    scan.crates
+        .extend(poly.crates.into_iter().filter(|c| !existing.contains(&c.name)));
+    scan.files.extend(poly.files);
+    scan.symbols.extend(poly.symbols);
+    scan.deps.extend(poly.deps);
+    scan.duration_ms += poly.duration_ms;
+    scan.finished_at_unix_ms = scan.finished_at_unix_ms.max(poly.finished_at_unix_ms);
+    roll_up_stats(scan);
 }
 
 pub(crate) fn run_polyglot_scan_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
+    run_polyglot_scan_inner(root, true)
+}
+
+fn run_polyglot_scan_inner(root: &Path, include_rust: bool) -> Result<WorkspaceScan, ScanError> {
     let started_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
     let started_inst = std::time::Instant::now();
     let package_name = discover_package_name(root);
-    let files = supported_files(root)?;
+    let files = supported_files(root, include_rust)?;
     let mut extracted = Vec::new();
     for (abs, lang) in files {
         if let Some(file) = extract_file(root, &abs, lang, &package_name)? {
@@ -121,11 +155,13 @@ pub(crate) fn run_polyglot_scan_at(root: &Path) -> Result<WorkspaceScan, ScanErr
     Ok(scan)
 }
 
-fn supported_files(root: &Path) -> Result<Vec<(PathBuf, LanguageKind)>, ScanError> {
+fn supported_files(root: &Path, include_rust: bool) -> Result<Vec<(PathBuf, LanguageKind)>, ScanError> {
     let mut files = Vec::new();
     walk_dir(root, root, &mut |_rel, abs| {
         if let Some(lang) = language_for_path(abs) {
-            files.push((abs.to_path_buf(), lang));
+            if include_rust || lang != LanguageKind::Rust {
+                files.push((abs.to_path_buf(), lang));
+            }
         }
     })?;
     files.sort_by(|a, b| a.0.cmp(&b.0));
@@ -849,5 +885,43 @@ function useWidget() {
         assert!(scan.symbols.iter().any(|s| s.name == "rust_fn"));
         assert!(scan.symbols.iter().any(|s| s.name == "tsFn"));
         assert!(scan.symbols.iter().any(|s| s.name == "py_fn"));
+    }
+
+    #[test]
+    fn cargo_workspace_with_polyglot_files_keeps_crates_and_merges() {
+        // A cargo workspace with one member crate plus a stray TS file must
+        // NOT flatten into a single polyglot package: the merged scan keeps
+        // the cargo crate structure and adds the non-Rust extraction.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\nmembers = [\"mini\"]\n").expect("ws");
+        let member = tmp.path().join("mini");
+        std::fs::create_dir_all(member.join("src")).expect("src");
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"mini\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("manifest");
+        std::fs::write(member.join("src").join("lib.rs"), "pub fn rust_fn() {}\n").expect("lib");
+        let web = tmp.path().join("web");
+        std::fs::create_dir_all(&web).expect("web");
+        std::fs::write(web.join("app.ts"), "export function tsFn() {}\n").expect("ts");
+
+        assert!(!should_use_rust_workspace_scan(tmp.path()));
+        assert!(has_rust_workspace(tmp.path()));
+
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        assert!(
+            scan.crates.iter().any(|c| c.name == "mini"),
+            "cargo crate survives the merge; got {:?}",
+            scan.crates.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        );
+        assert!(scan.symbols.iter().any(|s| s.name == "rust_fn"));
+        assert!(scan.symbols.iter().any(|s| s.name == "tsFn"));
+        assert!(scan.files.iter().any(|f| f.rel_path == "web/app.ts"));
+        // The rust file is extracted exactly once (native scan), never again
+        // by the polyglot pass.
+        assert_eq!(scan.symbols.iter().filter(|s| s.name == "rust_fn").count(), 1);
+        assert_eq!(scan.stats.crate_count, scan.crates.len());
+        assert_eq!(scan.stats.symbol_count, scan.symbols.len());
     }
 }
