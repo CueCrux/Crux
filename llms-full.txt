@@ -139,6 +139,12 @@ test, crate, and fuzz target these docs reference. `scripts/check-agent-docs.sh`
 tree for each on every PR; a rename that orphans a reference fails the build. Anchor new
 references by **symbol name, never line number**, and add them to `ci_assertions`.
 
+The same gate also enforces: every local `llms.txt` link resolves; every crate ships a
+nested `AGENTS.md` (≤60 lines); `llms-full.txt` matches its generator
+(`scripts/build-llms-full.sh --check`); and, in CI (`--exec`), the cheap documented
+commands actually run. Editing any doc linked from `llms.txt` requires regenerating
+`llms-full.txt`.
+
 # ============================================================
 # BEGIN docs/agent/CODEMAP.md
 # ============================================================
