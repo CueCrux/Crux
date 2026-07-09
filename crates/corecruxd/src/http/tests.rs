@@ -11139,7 +11139,10 @@ async fn repo_codemap_serves_summary_and_full() {
     .into_response();
     assert_eq!(created.status(), StatusCode::OK);
     let created_body = json_body(created).await;
-    let scan_id = created_body["repo"]["last_scan_id"].as_str().expect("scan id").to_string();
+    let scan_id = created_body["repo"]["last_scan_id"]
+        .as_str()
+        .expect("scan id")
+        .to_string();
 
     // Default format is the summary: stats + per-crate rollup, no file list.
     let summary = super::repos::get_repo_codemap(
