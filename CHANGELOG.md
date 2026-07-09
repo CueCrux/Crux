@@ -11,6 +11,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **AST-derived code-structure scanner.** Behind `CORECRUXD_AST_SCAN`, the
+  workspace scanner produces the `WorkspaceScan` shape from a `syn` AST pass
+  instead of the regex scanner (flag-off byte-identical). ~17× faster on the
+  Crux tree (p95 ~0.9 s vs ~15 s) and more accurate: call-edges resolved
+  module-qualified, dead-code by AST identifier-reachability rather than the
+  O(n²) substring pass. Context-graph edges fold in as `Extracted` confidence.
+- **Watched repositories.** `POST/GET/DELETE /v1/repos` register a repo the
+  daemon should know about (tenant-scoped; `corecruxctl repo add|list|remove`;
+  MCP `register_repo` / `list_repos`). Registering a local path runs a one-shot
+  scan. An active file-watch loop (`CORECRUXD_REPO_WATCH`, default off) keeps a
+  repo's graph current via incremental re-index — a single-file edit re-parses
+  only that file — using `notify` with a WSL `/mnt` polling fallback.
+- **Polyglot extraction.** TypeScript/TSX, Vue (`<script>` blocks) and Python
+  via `tree-sitter`, alongside Rust via `syn`; a language-agnostic repo walk
+  scans repositories that are not Cargo workspaces.
+- **Typed code edges in the relation graph.** `RelationTypeV1` gains
+  `Calls` / `Imports` / `Defines` / `DependsOn` (append-only); behind
+  `CORECRUXD_CODEGRAPH_EDGES` a repo's code graph is emitted as tenant-scoped,
+  temporal relation edges and traversable via `POST /v1/relations/expand`.
+- **Code-graph retrieval boost (spike).** A code-graph adjacency closure for
+  `fused_retrieve`'s graph lane, behind `CORECRUXD_CODEGRAPH_FUSION`
+  (default off; no recall study yet — see the ExecPlan).
+- **Console code-graph view.** `/console/codegraph` renders the typed code+claim
+  graph with node/edge/confidence visual language, focus + inspector, and
+  `file:line` deep-links.
+
+  _ExecPlan: `ast-polyglot-code-graph-and-repo-watch-2026-07-08` (M0–M8);
+  supersedes `workspace-scan-storyline-improvements-2026-05-03` and
+  `crux-code-intelligence-2026-06-12`._
+
 ## [0.5.36] - 2026-07-03
 
 ### Added

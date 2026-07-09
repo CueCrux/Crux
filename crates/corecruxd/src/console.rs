@@ -27,6 +27,11 @@ const ACTIVITY_HTML: &str = include_str!("../console/activity.html");
 // the right column is a clearly-labelled static mock of a typical vendor
 // console. No external runtime deps, same posture as the console shell.
 const RECEIPTS_VS_CONSOLE_HTML: &str = include_str!("../console/receipts-vs-console.html");
+// Code-structure graph view (ExecPlan ast-polyglot-code-graph-and-repo-watch-2026-07-08,
+// M8). A self-contained page served at `/console/codegraph` that renders the real
+// typed code+claim graph from `/v1/projects/{id}/context-graph`. Reuses the console
+// design tokens; falls back to a demo graph when the daemon endpoint is unavailable.
+const CODEGRAPH_HTML: &str = include_str!("../console/codegraph.html");
 const CONSOLE_DEV_PATH_ENV: &str = "CORECRUXD_CONSOLE_DEV_PATH";
 
 // Bundled PNG assets — embedded so the binary can serve them with no on-disk
@@ -89,6 +94,22 @@ async fn serve_receipts_vs_console() -> impl IntoResponse {
         }
     }
     Html(RECEIPTS_VS_CONSOLE_HTML).into_response()
+}
+
+/// Code-structure graph view (M8), served at `/console/codegraph`. Same
+/// dev-override story as the activity page so the page can be iterated
+/// without a rebuild.
+async fn serve_codegraph() -> impl IntoResponse {
+    if let Some(dev_path) = std::env::var(CONSOLE_DEV_PATH_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        let file_path = resolve_dev_html_path(Path::new(dev_path.trim())).with_file_name("codegraph.html");
+        if let Ok(contents) = std::fs::read_to_string(&file_path) {
+            return Html(contents).into_response();
+        }
+    }
+    Html(CODEGRAPH_HTML).into_response()
 }
 
 async fn redirect_to_console() -> impl IntoResponse {
@@ -177,6 +198,7 @@ pub fn routes(enabled: bool) -> Router {
         .route("/console", get(serve_console))
         .route("/console/activity", get(serve_activity))
         .route("/console/receipts-vs-console", get(serve_receipts_vs_console))
+        .route("/console/codegraph", get(serve_codegraph))
         .route("/console-assets/{name}", get(serve_console_asset))
         .route("/console-3d/{*path}", get(serve_console3d))
         // Device-grant approval page (ExecPlan crux-unified-login-rails, M3).

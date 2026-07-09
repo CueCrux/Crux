@@ -18,8 +18,8 @@ use clap::{Parser, Subcommand};
 use corecruxctl::{
     admin, audit_export, audit_pack, c2pa_x509, code_chain, code_health, config_bundle, cost, evidence, explain,
     export, extensions, fixture_digest, gaps, hooks, identity_cli, inspect_receipt, learn, login, machine, memory,
-    memory_pack, observe_ingest, output_verify, parity, projections, receipts, reconcile, replay, session_sync, shard,
-    shardmap, smoke, snapshot, stage1_import, start, storage, structured_log, tooling_env, verify_store,
+    memory_pack, observe_ingest, output_verify, parity, projections, receipts, reconcile, replay, repo, session_sync,
+    shard, shardmap, smoke, snapshot, stage1_import, start, storage, structured_log, tooling_env, verify_store,
 };
 
 #[derive(Debug, Parser)]
@@ -475,6 +475,12 @@ enum Command {
     CodeHealth {
         #[command(subcommand)]
         command: CodeHealthCommand,
+    },
+
+    /// Register repositories with the local daemon.
+    Repo {
+        #[command(subcommand)]
+        command: RepoCommand,
     },
 
     /// (advanced) Interactive quickstart wizard for new users.
@@ -933,6 +939,60 @@ enum CodeHealthCommand {
         #[arg(long, default_value = "http://127.0.0.1:14800")]
         http: String,
         /// Bearer token file for `--push`.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RepoCommand {
+    /// Register a local path or clone URL for one tenant. Local paths are scanned immediately.
+    Add {
+        /// Tenant id that owns the repository registration.
+        #[arg(long)]
+        tenant: String,
+        /// Optional repo id; defaults to a slug derived from --path or --clone-url.
+        #[arg(long)]
+        id: Option<String>,
+        /// Local absolute repository path to scan immediately.
+        #[arg(long)]
+        path: Option<String>,
+        /// Remote clone URL to register without cloning yet.
+        #[arg(long)]
+        clone_url: Option<String>,
+        /// Language tag; may be repeated.
+        #[arg(long = "language")]
+        languages: Vec<String>,
+        /// Daemon HTTP base URL.
+        #[arg(long, default_value = "http://127.0.0.1:14800")]
+        http: String,
+        /// Bearer token file.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+    },
+    /// List repository registrations for a tenant.
+    List {
+        /// Tenant id to list.
+        #[arg(long)]
+        tenant: String,
+        /// Daemon HTTP base URL.
+        #[arg(long, default_value = "http://127.0.0.1:14800")]
+        http: String,
+        /// Bearer token file.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+    },
+    /// Remove a repository registration and its latest scan fact.
+    Remove {
+        /// Repo id to remove.
+        repo_id: String,
+        /// Tenant id that owns the registration.
+        #[arg(long)]
+        tenant: String,
+        /// Daemon HTTP base URL.
+        #[arg(long, default_value = "http://127.0.0.1:14800")]
+        http: String,
+        /// Bearer token file.
         #[arg(long)]
         token_file: Option<PathBuf>,
     },
@@ -3620,6 +3680,38 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 token_file,
             } => {
                 code_chain::run_trace(&repo, &root, &format, max_depth, push, &http, token_file.as_deref())?;
+                Ok(())
+            }
+        },
+
+        Command::Repo { command } => match command {
+            RepoCommand::Add {
+                tenant,
+                id,
+                path,
+                clone_url,
+                languages,
+                http,
+                token_file,
+            } => {
+                repo::run_add(&http, token_file.as_deref(), tenant, id, path, clone_url, languages)?;
+                Ok(())
+            }
+            RepoCommand::List {
+                tenant,
+                http,
+                token_file,
+            } => {
+                repo::run_list(&http, token_file.as_deref(), &tenant)?;
+                Ok(())
+            }
+            RepoCommand::Remove {
+                repo_id,
+                tenant,
+                http,
+                token_file,
+            } => {
+                repo::run_remove(&http, token_file.as_deref(), &tenant, &repo_id)?;
                 Ok(())
             }
         },
