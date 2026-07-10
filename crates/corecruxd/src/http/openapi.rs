@@ -348,6 +348,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/receipts/{receiptId}/signature", methods: &["GET"], tag: "Receipts", auth: "read", summary: "Receipts {receiptId} signature" },
     RouteEntry { path: "/v1/receipts/{receiptId}/verification", methods: &["GET"], tag: "Receipts", auth: "read", summary: "Receipts {receiptId} verification" },
     RouteEntry { path: "/v1/relations", methods: &["GET", "POST"], tag: "Relations", auth: "read-write", summary: "Relations" },
+    RouteEntry { path: "/v1/relations/incoming", methods: &["GET"], tag: "Relations", auth: "admin-read", summary: "Relations incoming" },
     RouteEntry { path: "/v1/relations/expand", methods: &["POST"], tag: "Relations", auth: "write", summary: "Relations expand" },
     RouteEntry { path: "/v1/replay/answers/{answerId}", methods: &["GET"], tag: "Replay", auth: "read", summary: "Replay answers {answerId}" },
     RouteEntry { path: "/v1/replay/answers/{answerId}/validity", methods: &["GET"], tag: "Replay", auth: "read", summary: "Replay answers {answerId} validity" },

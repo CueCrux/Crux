@@ -1170,6 +1170,10 @@ pub fn router(state: AppState, case_store: self::cases::SharedCaseStore) -> Rout
         )
         .route("/v1/relations", get(self::relations::get_relations))
         .route(
+            "/v1/relations/incoming",
+            get(self::relations::get_incoming_relations),
+        )
+        .route(
             "/v1/relations/expand",
             axum::routing::post(self::relations::post_expand),
         )

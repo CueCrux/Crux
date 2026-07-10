@@ -9260,6 +9260,180 @@ async fn relation_expand_walks_two_hops() {
 }
 
 #[tokio::test]
+async fn relation_incoming_paginates_filters_and_requires_admin_read() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut projection = state.projection_state.write().await;
+        for from_id in 101u32..=107 {
+            crate::relations::apply_record(
+                &mut projection,
+                &crate::relations::RelationRecord {
+                    tenant_id: "alpha".to_string(),
+                    from_id,
+                    to_id: 500,
+                    edge_type: "depends_on".to_string(),
+                    confidence_bp: 7000,
+                    created_at_micros: 1,
+                    updated_at_micros: 2,
+                },
+            )
+            .expect("apply depends_on");
+        }
+        crate::relations::apply_record(
+            &mut projection,
+            &crate::relations::RelationRecord {
+                tenant_id: "alpha".to_string(),
+                from_id: 201,
+                to_id: 500,
+                edge_type: "calls".to_string(),
+                confidence_bp: 9000,
+                created_at_micros: 3,
+                updated_at_micros: 4,
+            },
+        )
+        .expect("apply calls");
+    }
+
+    let unauthorized = super::relations::get_incoming_relations(
+        State(state.clone()),
+        Query(super::relations::IncomingRelationsQuery {
+            tenant_id: "alpha".to_string(),
+            to_id: 500,
+            edge_type: Some("depends_on".to_string()),
+            cursor: None,
+            limit: Some(3),
+        }),
+        HeaderMap::new(),
+    )
+    .await
+    .into_response();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let mut cursor = None;
+    let mut pages = Vec::new();
+    let mut all_from_ids = Vec::new();
+    loop {
+        let resp = super::relations::get_incoming_relations(
+            State(state.clone()),
+            Query(super::relations::IncomingRelationsQuery {
+                tenant_id: "alpha".to_string(),
+                to_id: 500,
+                edge_type: Some("depends_on".to_string()),
+                cursor: cursor.clone(),
+                limit: Some(3),
+            }),
+            dev_scope_headers("admin:read"),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        let edges = body["edges"].as_array().expect("edges");
+        pages.push(edges.len());
+        all_from_ids.extend(edges.iter().map(|edge| edge["from_id"].as_u64().unwrap_or_default()));
+        cursor = body["next_cursor"].as_str().map(str::to_string);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(pages, vec![3, 3, 1]);
+    assert_eq!(all_from_ids, vec![101, 102, 103, 104, 105, 106, 107]);
+
+    let calls = super::relations::get_incoming_relations(
+        State(state),
+        Query(super::relations::IncomingRelationsQuery {
+            tenant_id: "alpha".to_string(),
+            to_id: 500,
+            edge_type: Some("calls".to_string()),
+            cursor: None,
+            limit: Some(500),
+        }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    let body = json_body(calls).await;
+    let edges = body["edges"].as_array().expect("edges");
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0]["from_id"], 201);
+    assert_eq!(edges[0]["edge_type"], "calls");
+}
+
+#[tokio::test]
+async fn relation_incoming_cursor_keeps_same_source_different_edge_types() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut projection = state.projection_state.write().await;
+        for edge_type in ["calls", "depends_on"] {
+            crate::relations::apply_record(
+                &mut projection,
+                &crate::relations::RelationRecord {
+                    tenant_id: "alpha".to_string(),
+                    from_id: 5,
+                    to_id: 500,
+                    edge_type: edge_type.to_string(),
+                    confidence_bp: 9000,
+                    created_at_micros: 1,
+                    updated_at_micros: 2,
+                },
+            )
+            .expect("apply relation");
+        }
+    }
+
+    let page1 = super::relations::get_incoming_relations(
+        State(state.clone()),
+        Query(super::relations::IncomingRelationsQuery {
+            tenant_id: "alpha".to_string(),
+            to_id: 500,
+            edge_type: None,
+            cursor: None,
+            limit: Some(1),
+        }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(page1.status(), StatusCode::OK);
+    let page1_body = json_body(page1).await;
+    let page1_edges = page1_body["edges"].as_array().expect("page 1 edges");
+    assert_eq!(page1_edges.len(), 1);
+    assert_eq!(page1_edges[0]["from_id"], 5);
+    let cursor = page1_body["next_cursor"]
+        .as_str()
+        .expect("page 1 next cursor")
+        .to_string();
+    assert!(cursor.starts_with("5:"), "cursor must carry the shared source id");
+
+    let page2 = super::relations::get_incoming_relations(
+        State(state),
+        Query(super::relations::IncomingRelationsQuery {
+            tenant_id: "alpha".to_string(),
+            to_id: 500,
+            edge_type: None,
+            cursor: Some(cursor),
+            limit: Some(1),
+        }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(page2.status(), StatusCode::OK);
+    let page2_body = json_body(page2).await;
+    assert!(page2_body["next_cursor"].is_null());
+    let page2_edges = page2_body["edges"].as_array().expect("page 2 edges");
+    assert_eq!(page2_edges.len(), 1);
+    assert_eq!(page2_edges[0]["from_id"], 5);
+
+    let seen: std::collections::BTreeSet<_> = page1_edges
+        .iter()
+        .chain(page2_edges)
+        .map(|edge| edge["edge_type"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(seen, std::collections::BTreeSet::from(["calls", "depends_on"]));
+}
+
+#[tokio::test]
 async fn console_storage_breakdown_graph_kind_reflects_relation_posts() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
 

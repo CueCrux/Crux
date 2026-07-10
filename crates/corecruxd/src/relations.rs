@@ -14,7 +14,7 @@
 #![allow(clippy::type_complexity)] // BTreeMap<(String,String,String), Vec<RelationFact>> is the natural shape; alias would obscure
 
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use corecrux_projections::{
@@ -104,14 +104,25 @@ pub fn load_into_state(data_dir: &Path, state: &mut ProjectionState) -> Result<u
 }
 
 pub fn append_record(data_dir: &Path, record: &RelationRecord) -> Result<(), RelationsError> {
+    append_records(data_dir, std::slice::from_ref(record))
+}
+
+pub fn append_records(data_dir: &Path, records: &[RelationRecord]) -> Result<(), RelationsError> {
+    if records.is_empty() {
+        return Ok(());
+    }
     let path = jsonl_path(data_dir);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-    let mut line = serde_json::to_vec(record)?;
-    line.push(b'\n');
-    file.write_all(&line)?;
+    let file = OpenOptions::new().create(true).append(true).open(&path)?;
+    let mut writer = BufWriter::new(file);
+    for record in records {
+        let mut line = serde_json::to_vec(record)?;
+        line.push(b'\n');
+        writer.write_all(&line)?;
+    }
+    writer.flush()?;
     Ok(())
 }
 
@@ -131,6 +142,41 @@ pub fn list_outgoing(
     state
         .relations
         .range((tenant_hash, from_id, 0u32, 0u8)..=(tenant_hash, from_id, u32::MAX, u8::MAX))
+        .map(|(k, v)| (*k, v))
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IncomingCursor {
+    pub from_id: u32,
+    pub edge_type_u8: u8,
+}
+
+impl IncomingCursor {
+    pub fn encode(self) -> String {
+        format!("{}:{}", self.from_id, self.edge_type_u8)
+    }
+}
+
+pub fn list_incoming(
+    state: &ProjectionState,
+    tenant_hash: u64,
+    to_id: u32,
+    edge_type: Option<RelationTypeV1>,
+    cursor: Option<IncomingCursor>,
+    limit: usize,
+) -> Vec<((u64, u32, u32, u8), &RelationEdgeV1)> {
+    let edge_type_u8 = edge_type.map(RelationTypeV1::to_u8);
+    state
+        .relations
+        .range((tenant_hash, 0u32, 0u32, 0u8)..=(tenant_hash, u32::MAX, u32::MAX, u8::MAX))
+        .filter(|((_, from_id, candidate_to_id, candidate_edge_type), _)| {
+            let candidate_cursor = (*from_id, *candidate_edge_type);
+            *candidate_to_id == to_id
+                && cursor.is_none_or(|last| candidate_cursor > (last.from_id, last.edge_type_u8))
+                && edge_type_u8.is_none_or(|wanted| *candidate_edge_type == wanted)
+        })
+        .take(limit)
         .map(|(k, v)| (*k, v))
         .collect()
 }
@@ -216,6 +262,72 @@ mod tests {
         let outgoing_from_1 = list_outgoing(&state, alpha_hash, 1);
         assert_eq!(outgoing_from_1.len(), 2, "two outgoing edges from alpha:1");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_incoming_paginates_by_source_id() {
+        let mut state = ProjectionState::default();
+        for from_id in 1u32..=5 {
+            apply_record(&mut state, &sample("alpha", from_id, 99, "depends_on")).expect("apply");
+        }
+        apply_record(&mut state, &sample("alpha", 6, 99, "calls")).expect("apply calls");
+        apply_record(&mut state, &sample("beta", 7, 99, "depends_on")).expect("apply beta");
+
+        let alpha_hash = tenant_hash_xxhash64("alpha");
+        let page1 = list_incoming(&state, alpha_hash, 99, Some(RelationTypeV1::DependsOn), None, 2);
+        let page1_from_ids: Vec<u32> = page1.iter().map(|((_, from_id, _, _), _)| *from_id).collect();
+        assert_eq!(page1_from_ids, vec![1, 2]);
+
+        let page2 = list_incoming(
+            &state,
+            alpha_hash,
+            99,
+            Some(RelationTypeV1::DependsOn),
+            Some(IncomingCursor {
+                from_id: 2,
+                edge_type_u8: RelationTypeV1::DependsOn.to_u8(),
+            }),
+            10,
+        );
+        let page2_from_ids: Vec<u32> = page2.iter().map(|((_, from_id, _, _), _)| *from_id).collect();
+        assert_eq!(page2_from_ids, vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn list_incoming_cursor_keeps_same_source_different_edge_types() {
+        let mut state = ProjectionState::default();
+        apply_record(&mut state, &sample("alpha", 5, 99, "calls")).expect("apply calls");
+        apply_record(&mut state, &sample("alpha", 5, 99, "depends_on")).expect("apply depends_on");
+
+        let alpha_hash = tenant_hash_xxhash64("alpha");
+        let page1 = list_incoming(&state, alpha_hash, 99, None, None, 1);
+        assert_eq!(page1.len(), 1);
+        let ((_, page1_from_id, _, page1_edge_type), _) = page1[0];
+        assert_eq!(page1_from_id, 5);
+
+        let page2 = list_incoming(
+            &state,
+            alpha_hash,
+            99,
+            None,
+            Some(IncomingCursor {
+                from_id: page1_from_id,
+                edge_type_u8: page1_edge_type,
+            }),
+            1,
+        );
+        assert_eq!(page2.len(), 1);
+
+        let seen: std::collections::BTreeSet<_> = page1
+            .into_iter()
+            .chain(page2)
+            .map(|((_, from_id, _, edge_type), _)| (from_id, edge_type))
+            .collect();
+        let expected = std::collections::BTreeSet::from([
+            (5, RelationTypeV1::Calls.to_u8()),
+            (5, RelationTypeV1::DependsOn.to_u8()),
+        ]);
+        assert_eq!(seen, expected);
     }
 
     #[test]
