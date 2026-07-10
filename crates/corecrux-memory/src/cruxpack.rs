@@ -73,6 +73,7 @@ pub const CRUXPACK_RESERVED_PREFIXES: &[&str] = &[
     "__repo_registry__::",
     "__repo_scan__::",
     "__repo_codegraph_ids__::",
+    "__repo_extdeps__::",
     "__extension__::",
     "__extension_grant__::",
     "__work__::",
