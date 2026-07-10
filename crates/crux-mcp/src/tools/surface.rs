@@ -15,7 +15,7 @@
 //!
 //! Modes (process flag `CORECRUXD_TOOL_SURFACE`, default `full`):
 //! - `full` — unchanged ~100-tool surface (byte-for-byte the pre-M1 behaviour).
-//! - `minimal` (M1) — the [`CORE_FLOOR`] only (~14 tools), so a cold agent can
+//! - `minimal` (M1) — the [`CORE_FLOOR`] only (~16 tools), so a cold agent can
 //!   still bootstrap (discover → retrieve → remember → session continuity) and
 //!   reach everything else by name.
 //! - `dynamic` (M2/M3/M4) — the floor plus up to [`DYNAMIC_TOP_N`] tools scored
@@ -36,7 +36,7 @@ use super::ToolDefinition;
 use crate::traces::TraceEntry;
 
 /// Count of intent-relevant tools surfaced *beyond* the [`CORE_FLOOR`] in
-/// `dynamic` mode. Floor (~14) + this ≈ a ~26-tool intent-targeted surface —
+/// `dynamic` mode. Floor (~16) + this ≈ a ~28-tool intent-targeted surface —
 /// still a large cut from the full ~95, but with the right tools for the task.
 pub const DYNAMIC_TOP_N: usize = 12;
 
@@ -67,6 +67,12 @@ pub const CORE_FLOOR: &[&str] = &[
     "get_passport",   // identity — bootstrap passport/tier without knowing the tool name
     "receipt_verify", // proof — verify a CROWN receipt offline
     "sync_status",    // ops — daemon sync posture (local_only/degraded) for cold-start decisions
+    // Coordination — cross-session handoff must be discoverable on the
+    // collapsed surface: clients only call advertised tools, and the Phase T
+    // S1 faithful-handoff measurement (`CORECRUXD_HANDOFF_OBSERVATIONS`)
+    // records nothing if no client ever surfaces these.
+    "create_handoff",
+    "accept_handoff",
 ];
 
 /// How the `tools/list` surface is shaped before serialisation.
