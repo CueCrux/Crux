@@ -67,7 +67,7 @@ If the operator approves the switch after legal review, the mechanical changes a
 | Surface | Change |
 |---|---|
 | `LICENCE.md` | Replace with BUSL 1.1 template + filled parameters + Additional Use Grant + warranty disclaimer. |
-| `LICENCE-CONTENT.md` | Unchanged — the Content Licence is separate from the code licence. |
+| `content/LICENCE-CONTENT.md` | Unchanged — the Content Licence is separate from the code licence. |
 | `LICENCE-CODE.md` | Reconcile with `LICENCE.md` (currently both exist; review whether one supersedes the other). |
 | Crate `//` headers | ~250 `.rs` files currently say `Licensed under the CueCrux Community Licence (CCL v1.0)`. Mechanical `sed` to `Licensed under the Business Source License 1.1`. |
 | `Cargo.toml` `license` field | Currently `CCL-1.0` (custom). Change to `BUSL-1.1` (SPDX). |
@@ -89,7 +89,7 @@ If the operator approves the switch after legal review, the mechanical changes a
 4. **Header replacement.** Is `sed`-replacement of `Licensed under the CueCrux Community Licence (CCL v1.0)` → `Licensed under the Business Source License 1.1` in every file's header valid notice, or do existing forks/copies need anything more to maintain licence continuity?
 5. **Trademark continuity.** CCL §3.2 says "no trademark grant." BUSL is silent. Should we add an explicit trademark-reservation clause as an Additional Term, or rely on standard trademark law?
 6. **`LICENCE-CODE.md` reconciliation.** This file exists alongside `LICENCE.md` today. Should the switch make one of them authoritative and remove the other, or maintain a code-vs-content split?
-   *Resolved 2026-07-10 (independent of the BUSL question): `LICENCE-CODE.md` was a three-line stub pointing at `LICENCE.md`; it was removed. `LICENCE.md` is the sole canonical code licence, and release bundles ship `LICENCE.md` + `LICENCE-CONTENT.md` directly.*
+   *Resolved 2026-07-10 (independent of the BUSL question): `LICENCE-CODE.md` was a three-line stub pointing at `LICENCE.md`; it was removed. `LICENCE.md` is the sole canonical code licence. The content licence was then moved from the root to `content/LICENCE-CONTENT.md` (the directory it governs) so GitHub surfaces a single top-level licence tab instead of two; bundles ship it under `content/`.*
 
 ## Alternatives considered
 

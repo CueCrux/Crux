@@ -20,10 +20,10 @@ mkdir -p "$dist/content" "$dist/docs"
 cp "$root/target/release/corecruxd" "$dist/corecruxd-$suffix"
 cp "$root/target/release/corecruxd" "$dist/crux-$suffix"
 cp "$root/target/release/corecruxctl" "$dist/corecruxctl-$suffix"
-cp "$root/LICENCE.md" "$root/LICENCE-CONTENT.md" "$root/TRUST-CONTRACT.md" "$dist/"
+cp "$root/LICENCE.md" "$root/TRUST-CONTRACT.md" "$dist/"
 cp "$root/README.md" "$root/config.example.env" "$root/config.example.yaml" "$dist/"
 cp "$root/docs/release-packaging.md" "$dist/docs/"
-cp "$root/content/MANIFEST.json" "$root/content/README.md" "$dist/content/"
+cp "$root/content/MANIFEST.json" "$root/content/README.md" "$root/content/LICENCE-CONTENT.md" "$dist/content/"
 
 manifest="$dist/RELEASE-MANIFEST-$suffix.txt"
 (

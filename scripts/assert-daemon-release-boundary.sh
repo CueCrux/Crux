@@ -5,7 +5,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 required=(
   "LICENCE.md"
-  "LICENCE-CONTENT.md"
+  "content/LICENCE-CONTENT.md"
   "TRUST-CONTRACT.md"
   "README.md"
   "config.example.env"
@@ -44,7 +44,7 @@ for needle in \
   "crux-" \
   "corecruxctl-" \
   "LICENCE.md" \
-  "LICENCE-CONTENT.md" \
+  "content/LICENCE-CONTENT.md" \
   "TRUST-CONTRACT.md" \
   "config.example.env" \
   "config.example.yaml" \
@@ -66,7 +66,7 @@ if [[ -x "$root/target/release/corecruxd" && -x "$root/target/release/corecruxct
     "crux-boundary-smoke" \
     "corecruxctl-boundary-smoke" \
     "LICENCE.md" \
-    "LICENCE-CONTENT.md" \
+    "content/LICENCE-CONTENT.md" \
     "TRUST-CONTRACT.md" \
     "config.example.env" \
     "config.example.yaml" \
