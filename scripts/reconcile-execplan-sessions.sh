@@ -127,7 +127,7 @@ for slug in "${!ON_DISK[@]}"; do
   # Print-only lint for the historical substring trap. A non-terminal leading
   # declaration containing a terminal state word later in its prose is valid
   # under the exact-token parser, but worth making visible to operators.
-  if grep -qiE '^[[:space:]]*(>[[:space:]]*\*\*Status:\*\*|Status:)[[:space:]]*(Draft|In[ _]progress|Blocked|Parked|Planned|Backlog)\b.*\b(complete(d)?|archived|superseded)\b' <<<"${content}"; then
+  if grep -qiE '^[[:space:]]*(>[[:space:]]*\*\*Status:\*\*|Status:)[[:space:]]*(Draft|In[ _]progress|Blocked|Planned|Backlog)\b.*\b(complete(d)?|archived|superseded)\b' <<<"${content}"; then
     AMBIGUOUS_STATUS+=("${slug}")
   fi
 done

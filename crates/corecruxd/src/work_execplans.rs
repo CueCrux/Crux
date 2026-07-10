@@ -15,14 +15,20 @@
 //! derive_state(file, parsed, sum, now) -> WorkItem            (pure)
 //! ```
 //!
-//! `derive_state` is the deterministic state machine — six rules, no LLM, no
+//! `derive_state` is the deterministic state machine — eight rules, no LLM, no
 //! filesystem, no fact-store. The HTTP layer (M2) is responsible for binding
 //! the IO surface; M1 ships the data-flow + unit tests.
 //!
 //! State derivation rules (in order; first match wins):
 //!
-//! 1. a recognised leading `Status:` token declares state (never trailing prose)
+//! 1. a recognised leading `Status:` token declares state (never trailing prose);
+//!    leading non-terminal tokens (`Blocked`, `In progress`, `Planned`, and
+//!    `Parked`) deliberately short-circuit before fact-derived rules because
+//!    the human declaration outranks facts
 //! 2. `parsed.superseded_by` is set                       → `archive` + `superseded_by`
+//!    (including when the leading status is a completion token)
+//! 3. `Parked` always maps to `archive`, including when milestone facts exist;
+//!    this matches the 2026-07-10 corrected-audit parking of 21 plans
 //! 4. all declared milestones have a gate fact `status=complete` → `complete`
 //! 5. highest milestone with a fact has gate `status=blocked`    → `blocked`
 //! 6. any milestone/gate fact exists                      → `in_progress`
@@ -436,7 +442,7 @@ enum DeclaredStatus {
 }
 
 fn declared_status(value: &str) -> Option<DeclaredStatus> {
-    let value = value.trim_start().to_ascii_lowercase();
+    let value = strip_leading_markup(value).to_ascii_lowercase();
     [
         ("code-complete", DeclaredStatus::Complete),
         ("in_progress", DeclaredStatus::InProgress),
@@ -444,6 +450,11 @@ fn declared_status(value: &str) -> Option<DeclaredStatus> {
         ("superseded", DeclaredStatus::Superseded),
         ("completed", DeclaredStatus::Complete),
         ("complete", DeclaredStatus::Complete),
+        ("deployed", DeclaredStatus::Complete),
+        ("shipped", DeclaredStatus::Complete),
+        ("landed", DeclaredStatus::Complete),
+        ("merged", DeclaredStatus::Complete),
+        ("done", DeclaredStatus::Complete),
         ("archived", DeclaredStatus::Archived),
         ("blocked", DeclaredStatus::Blocked),
         ("parked", DeclaredStatus::Parked),
@@ -795,6 +806,12 @@ pub fn derive_state(
             return mk_item(file, parsed, "archive", None, parsed.superseded_by.clone(), facts);
         }
         Some(DeclaredStatus::Complete) => {
+            // Preserve the historical supersession precedence: a completed
+            // plan may also name its replacement, in which case it archives
+            // and retains that graph edge.
+            if parsed.superseded_by.is_some() {
+                return mk_item(file, parsed, "archive", None, parsed.superseded_by.clone(), facts);
+            }
             return mk_item(file, parsed, "complete", None, None, facts);
         }
         Some(DeclaredStatus::Blocked) => {
@@ -2216,6 +2233,65 @@ mod tests {
         let s = summarise_facts(&[("gate:M1".to_string(), r#"{"status":"complete"}"#.to_string(), ts(2_000))]);
         let item = derive_state(&f, &p, &s, 4_000);
         assert_eq!(item.state, "complete");
+    }
+
+    #[test]
+    fn complete_status_with_standalone_supersession_archives_with_pointer() {
+        // Regression for workspace-scan-storyline-improvements-2026-05-03.md:
+        // its completion declaration and supersession declaration are separate
+        // lines, and both pieces of state must survive projection.
+        let f = file(
+            "workspace-scan-storyline-improvements-2026-05-03",
+            1_000,
+            "# Workspace scan storyline improvements\n\nStatus: Complete (all milestones shipped)\n\nSuperseded by [[workspace-scan-storyline-v2]]\n",
+        );
+        let p = parse_plan(&f.content);
+        assert_eq!(p.superseded_by.as_deref(), Some("workspace-scan-storyline-v2"));
+        let item = derive_state(&f, &p, &ExecplanFactSummary::default(), 2_000);
+        assert_eq!(item.state, "archive");
+        assert_eq!(item.superseded_by.as_deref(), Some("workspace-scan-storyline-v2"));
+    }
+
+    #[test]
+    fn terminal_status_leads_use_exact_token_vocabulary() {
+        for value in [
+            "done",
+            "SHIPPED to production",
+            "Deployed — rollout verified",
+            "landed (main)",
+            "Merged: PR #42",
+            "Done (M1–M5 complete; acceptance evidence recorded)",
+        ] {
+            let f = file("terminal", 1_000, &format!("# Terminal\n\nStatus: {value}\n"));
+            let p = parse_plan(&f.content);
+            assert_eq!(
+                derive_state(&f, &p, &ExecplanFactSummary::default(), 2_000).state,
+                "complete",
+                "{value:?} must be a completion declaration"
+            );
+        }
+    }
+
+    #[test]
+    fn milestone_range_before_complete_is_not_a_status_declaration() {
+        let f = file("range", 1_000, "# Range\n\nStatus: M0–M5 complete\n");
+        let p = parse_plan(&f.content);
+        assert_eq!(declared_status(p.status_line.as_deref().unwrap_or("")), None);
+        assert_eq!(
+            derive_state(&f, &p, &ExecplanFactSummary::default(), 2_000).state,
+            "planned"
+        );
+    }
+
+    #[test]
+    fn status_value_may_wrap_terminal_token_in_bold_markup() {
+        let f = file("bold-complete", 1_000, "# Bold\n\nStatus: **Complete**\n");
+        let p = parse_plan(&f.content);
+        assert_eq!(p.status_line.as_deref(), Some("**Complete**"));
+        assert_eq!(
+            derive_state(&f, &p, &ExecplanFactSummary::default(), 2_000).state,
+            "complete"
+        );
     }
 
     #[test]
