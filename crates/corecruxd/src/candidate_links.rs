@@ -372,7 +372,14 @@ mod tests {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
-        let dir = std::env::temp_dir().join(format!("corecruxd-candidate-links-{name}-{nanos}"));
+        // nanos alone collides on VMs with coarse clocks (parallel tests
+        // land in the same quantum and share a dir) — salt with pid + a counter.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "corecruxd-candidate-links-{name}-{nanos}-{}-{seq}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).expect("mkdir");
         dir
     }

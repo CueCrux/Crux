@@ -217,13 +217,31 @@ fn write_new_passport_seed(path: &Path) -> Result<[u8; 32], SessionError> {
 
     match options.open(path) {
         Ok(mut file) => {
-            file.write_all(hex::encode(seed).as_bytes())
-                .map_err(|e| SessionError::Encode(format!("write passport key: {e}")))?;
-            file.write_all(b"\n")
+            let mut content = hex::encode(seed);
+            content.push('\n');
+            file.write_all(content.as_bytes())
                 .map_err(|e| SessionError::Encode(format!("write passport key: {e}")))?;
             Ok(seed)
         }
-        Err(e) if e.kind() == ErrorKind::AlreadyExists => read_or_init_passport_seed(path),
+        // Another thread/process won the create_new race. Its bytes land right
+        // after its open, but there is a window where the file exists and is
+        // still empty — tolerate it with a bounded retry instead of failing
+        // with "key file is empty".
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            for _ in 0..50 {
+                match fs::read_to_string(path) {
+                    Ok(content) if !content.trim().is_empty() => {
+                        return parse_passport_seed(path, &content);
+                    }
+                    Ok(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
+                    Err(e) if e.kind() == ErrorKind::NotFound => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(e) => return Err(SessionError::Encode(format!("read passport key: {e}"))),
+                }
+            }
+            read_or_init_passport_seed(path)
+        }
         Err(e) => Err(SessionError::Encode(format!("create passport key: {e}"))),
     }
 }

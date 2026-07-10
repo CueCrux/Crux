@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.38] - 2026-07-10
+
 ### Added
 
 - **AST-derived code-structure scanner.** Behind `CORECRUXD_AST_SCAN`, the
@@ -42,6 +44,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   _ExecPlan: `ast-polyglot-code-graph-and-repo-watch-2026-07-08` (M0–M8);
   supersedes `workspace-scan-storyline-improvements-2026-05-03` and
   `crux-code-intelligence-2026-06-12`._
+
+- **Code map serving.** `GET /v1/repos/{repoId}/codemap` (`format=summary|full`)
+  serves the AST scan persisted at registration/re-index — the read side of
+  `POST /v1/repos`. Tenant-scoped `admin:read`; distinct 404s for unregistered
+  vs never-scanned repos. Downstream: the WikiCrux code-maps surface
+  (wiki.cuecrux.com/code, `wiki_codemap` MCP tool) consumes this endpoint.
+  _ExecPlan: `codemap-endpoint-and-agent-docs-hardening-2026-07-10`._
+- **Credit Meter spend rail (default-off).** `CORECRUXD_CREDIT_METER=1` enables
+  the comped-wallet `POST /v1/credits/spend` path: pinned quotes → signed
+  `crux.credit_spend_receipt.v1`, idempotent on retry (no double-debit).
+- **Vendor observations.** Handoff/vendor observation capture with provider
+  breakdowns (`list_observations` / `get_observation` / `verify_observation`);
+  MCP handoffs are observed.
+- **Usage receipts (opt-in).** Signed, metadata-only `usage_ping` receipts with
+  a consent-gated submitter; `/v1/version` gains update/version-notify state.
+- **Agent-docs hardening.** Nested `AGENTS.md` in all 28 crates
+  (symbol-anchored, ≤50 lines); `check-agent-docs.sh` v2 gates llms.txt link
+  parity, nested-file presence, `llms-full.txt` freshness and (in CI) executes
+  the cheap documented commands; deterministic `llms-full.txt` generator;
+  CLAIMS 10–15 and INVARIANTS I5 (witness anchoring) / I6 (custody-proof
+  export); README redesigned around the 60-second agent-first quickstart.
+
+### Fixed
+
+- **Merged scan routing.** A cargo workspace containing any non-Rust supported
+  files no longer flattens to a single polyglot package with zero routes:
+  `run_repo_scan_at` merges the native Rust workspace scan with a
+  rust-excluded tree-sitter pass (self-scan: 29 packages / 319 routes /
+  14,290 symbols), and the watch loop re-indexes through the same path.
+- Stale agent docs: MCP tool `token_usage` → `session_token_usage`; CODEMAP's
+  nonexistent `ShardStorage::append` → `append_batch`/`append_batch_with_stats`.
+- **Passport key create race.** `write_new_passport_seed` losers of the
+  `create_new` race could read the winner's key file before its bytes landed
+  ("key file is empty"); the key is now written in one buffer and the
+  AlreadyExists path retries briefly. Test temp dirs additionally salt
+  nanos with pid + a counter (coarse VM clocks collided parallel tests into
+  one dir — the CI flake behind this).
 
 ## [0.5.36] - 2026-07-03
 
