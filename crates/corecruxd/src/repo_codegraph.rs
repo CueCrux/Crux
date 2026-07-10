@@ -17,7 +17,7 @@ use crate::workspace_scan::{DepEdge, FileInfo, WorkspaceScan};
 
 pub const CODEGRAPH_IDS_PREFIX: &str = "__repo_codegraph_ids__";
 pub const REPO_EXTDEPS_PREFIX: &str = "__repo_extdeps__";
-const CODEGRAPH_IDS_KEY: &str = "content";
+pub(crate) const CODEGRAPH_IDS_KEY: &str = "content";
 const CODEGRAPH_ENV: &str = "CORECRUXD_CODEGRAPH_EDGES";
 const CODEGRAPH_EXTERNAL_ENV: &str = "CORECRUXD_CODEGRAPH_EXTERNAL";
 const SHARED_IDS_REPO_ID: &str = "__shared__";
@@ -312,7 +312,7 @@ fn load_id_store(store: &FactStore, tenant_id: &str, repo_id: &str) -> Result<Co
     load_id_store_entity(store, ids_entity(tenant_id, repo_id))
 }
 
-fn load_shared_id_store(store: &FactStore, tenant_id: &str) -> Result<CodeGraphIdStore, CodeGraphError> {
+pub(crate) fn load_shared_id_store(store: &FactStore, tenant_id: &str) -> Result<CodeGraphIdStore, CodeGraphError> {
     load_id_store_entity(store, shared_ids_entity(tenant_id))
 }
 
@@ -389,6 +389,29 @@ fn store_extdeps(
         actor: None,
     });
     Ok(())
+}
+
+pub(crate) fn load_extdeps(
+    store: &FactStore,
+    tenant_id: &str,
+    repo_id: &str,
+) -> Result<BTreeMap<String, ExternalDepVersionRow>, CodeGraphError> {
+    let result = store.query(&FactQuery {
+        query: None,
+        entity: Some(extdeps_entity(tenant_id, repo_id)),
+        entity_prefix: None,
+        top_k: 10,
+        token_budget: None,
+    });
+    let Some(fact) = crate::fact_helpers::dedup_latest(result.facts)
+        .into_iter()
+        .find(|fact| fact.key == CODEGRAPH_IDS_KEY)
+    else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(serde_json::from_str::<BTreeMap<String, ExternalDepVersionRow>>(
+        &fact.value,
+    )?)
 }
 
 fn tenant_used_ids(store: &FactStore, tenant_id: &str) -> BTreeSet<u32> {
@@ -494,7 +517,7 @@ pub(crate) fn pkg_key(ecosystem: &str, name: &str) -> String {
     format!("pkg:{}", external_dep_map_key(ecosystem, name))
 }
 
-fn external_dep_map_key(ecosystem: &str, name: &str) -> String {
+pub(crate) fn external_dep_map_key(ecosystem: &str, name: &str) -> String {
     format!(
         "{}/{}",
         normalize_external_part(ecosystem),

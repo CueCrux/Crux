@@ -158,6 +158,30 @@ impl IncomingCursor {
     }
 }
 
+pub fn parse_incoming_cursor(raw: Option<&str>) -> Result<Option<IncomingCursor>, String> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let Some((from_id, edge_type_u8)) = raw.split_once(':') else {
+        return Err("cursor must be '<from_id>:<edge_type_u8>'".to_string());
+    };
+    let from_id = from_id
+        .parse::<u32>()
+        .map_err(|_| "cursor from_id must be a u32".to_string())?;
+    let edge_type_u8 = edge_type_u8
+        .parse::<u8>()
+        .map_err(|_| "cursor edge_type_u8 must be a u8".to_string())?;
+    if RelationTypeV1::from_u8(edge_type_u8).is_none() {
+        return Err(format!("cursor edge_type_u8 '{edge_type_u8}' is not supported"));
+    }
+    Ok(Some(IncomingCursor { from_id, edge_type_u8 }))
+}
+
+pub struct IncomingPage<'a> {
+    pub rows: Vec<((u64, u32, u32, u8), &'a RelationEdgeV1)>,
+    pub next_cursor: Option<IncomingCursor>,
+}
+
 pub fn list_incoming(
     state: &ProjectionState,
     tenant_hash: u64,
@@ -179,6 +203,30 @@ pub fn list_incoming(
         .take(limit)
         .map(|(k, v)| (*k, v))
         .collect()
+}
+
+pub fn list_incoming_page(
+    state: &ProjectionState,
+    tenant_hash: u64,
+    to_id: u32,
+    edge_type: Option<RelationTypeV1>,
+    cursor: Option<IncomingCursor>,
+    limit: usize,
+) -> IncomingPage<'_> {
+    let mut rows = list_incoming(state, tenant_hash, to_id, edge_type, cursor, limit.saturating_add(1));
+    let has_more = rows.len() > limit;
+    if has_more {
+        rows.truncate(limit);
+    }
+    let next_cursor = if has_more {
+        rows.last().map(|((_, from_id, _, edge_type_u8), _)| IncomingCursor {
+            from_id: *from_id,
+            edge_type_u8: *edge_type_u8,
+        })
+    } else {
+        None
+    };
+    IncomingPage { rows, next_cursor }
 }
 
 fn jsonl_path(data_dir: &Path) -> PathBuf {

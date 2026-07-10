@@ -11293,6 +11293,112 @@ fn tiny_rust_workspace() -> tempfile::TempDir {
     dir
 }
 
+fn tiny_cargo_dep_workspace(dep_name: &str, version_req: &str, locked_version: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\nmembers = [\"mini\"]\n").expect("ws manifest");
+    let member = dir.path().join("mini");
+    std::fs::create_dir_all(member.join("src")).expect("member src");
+    std::fs::write(
+        member.join("Cargo.toml"),
+        format!(
+            r#"[package]
+name = "mini"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+{dep_name} = "{version_req}"
+"#
+        ),
+    )
+    .expect("member manifest");
+    std::fs::write(
+        member.join("src").join("lib.rs"),
+        "pub struct Used;\npub fn call() -> Used { Used }\n",
+    )
+    .expect("member lib");
+    std::fs::write(
+        dir.path().join("Cargo.lock"),
+        format!(
+            r#"version = 3
+
+[[package]]
+name = "{dep_name}"
+version = "{locked_version}"
+"#
+        ),
+    )
+    .expect("lock");
+    dir
+}
+
+async fn register_local_repo(state: &AppState, tenant_id: &str, repo_id: &str, repo: &tempfile::TempDir) {
+    let root_path = repo.path().to_string_lossy().to_string();
+    let created = super::repos::post_repo(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        Json(super::repos::CreateRepoBody {
+            repo_id: Some(repo_id.to_string()),
+            tenant_id: tenant_id.to_string(),
+            root_path: Some(root_path),
+            clone_url: None,
+            languages: vec!["rust".to_string()],
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(created.status(), StatusCode::OK);
+}
+
+async fn seed_dependents_graph(
+    state: &AppState,
+    tenant_id: &str,
+    ecosystem: &str,
+    name: &str,
+    package_node_id: u32,
+    repos: &[(&str, u32)],
+) {
+    let mut map = std::collections::BTreeMap::new();
+    map.insert(crate::repo_codegraph::pkg_key(ecosystem, name), package_node_id);
+    for (repo_id, repo_node_id) in repos {
+        map.insert(crate::repo_codegraph::repo_key(repo_id), *repo_node_id);
+    }
+    let id_store = crate::repo_codegraph::CodeGraphIdStore {
+        next_id: package_node_id.saturating_sub(1),
+        initialized: true,
+        map,
+    };
+    {
+        let mut store = state.fact_store.write().await;
+        store.store(corecrux_memory::fact_store::StoreFact {
+            entity: crate::repo_codegraph::shared_ids_entity(tenant_id),
+            key: crate::repo_codegraph::CODEGRAPH_IDS_KEY.to_string(),
+            value: serde_json::to_string(&id_store).expect("id store json"),
+            source_receipt: None,
+            confidence: 1.0,
+            private: true,
+            horizon_class: None,
+            actor: None,
+        });
+    }
+    let mut projection = state.projection_state.write().await;
+    for (_, repo_node_id) in repos {
+        crate::relations::apply_record(
+            &mut projection,
+            &crate::relations::RelationRecord {
+                tenant_id: tenant_id.to_string(),
+                from_id: *repo_node_id,
+                to_id: package_node_id,
+                edge_type: "depends_on".to_string(),
+                confidence_bp: 7000,
+                created_at_micros: 1,
+                updated_at_micros: 2,
+            },
+        )
+        .expect("apply depends_on");
+    }
+}
+
 #[tokio::test]
 async fn repo_codemap_serves_summary_and_full() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
@@ -11459,6 +11565,224 @@ async fn repo_codemap_summary_omits_external_deps_when_flag_off() {
     assert!(summary_body.get("external_deps_by_ecosystem").is_none());
     let stats = summary_body["stats"].as_object().expect("stats object");
     assert!(!stats.contains_key("external_dep_count"));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn repo_dependents_real_scans_return_version_rows() {
+    let _deps = EnvVarGuard::set("CORECRUXD_EXTERNAL_DEPS", "1");
+    let _edges = EnvVarGuard::set("CORECRUXD_CODEGRAPH_EDGES", "1");
+    let _external_graph = EnvVarGuard::set("CORECRUXD_CODEGRAPH_EXTERNAL", "1");
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let repo_a = tiny_cargo_dep_workspace("serde", "1", "1.0.200");
+    let repo_b = tiny_cargo_dep_workspace("serde", "1", "1.0.201");
+    register_local_repo(&state, "tenant-a", "repo-a", &repo_a).await;
+    register_local_repo(&state, "tenant-a", "repo-b", &repo_b).await;
+
+    let resp = super::repos::get_repo_dependents(
+        State(state),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::RepoDependentsQuery {
+            tenant_id: "tenant-a".to_string(),
+            ecosystem: "Cargo".to_string(),
+            name: "Serde".to_string(),
+            cursor: None,
+            limit: Some(10),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["tenant_id"], "tenant-a");
+    assert_eq!(body["ecosystem"], "cargo");
+    assert_eq!(body["name"], "serde");
+    assert_eq!(body["package_known"], true);
+    assert!(body["next_cursor"].is_null());
+
+    let dependents = body["dependents"].as_array().expect("dependents array");
+    assert_eq!(dependents.len(), 2);
+    let by_repo: std::collections::BTreeMap<_, _> = dependents
+        .iter()
+        .map(|row| (row["repo_id"].as_str().unwrap_or_default(), row))
+        .collect();
+    assert_eq!(by_repo["repo-a"]["version_req"], "1");
+    assert_eq!(by_repo["repo-a"]["version_locked"], "1.0.200");
+    assert_eq!(by_repo["repo-a"]["kind"], "normal");
+    assert_eq!(by_repo["repo-a"]["source_manifest"], "mini/Cargo.toml");
+    assert_eq!(by_repo["repo-b"]["version_req"], "1");
+    assert_eq!(by_repo["repo-b"]["version_locked"], "1.0.201");
+    assert_eq!(by_repo["repo-b"]["kind"], "normal");
+    assert_eq!(by_repo["repo-b"]["source_manifest"], "mini/Cargo.toml");
+}
+
+#[tokio::test]
+async fn repo_dependents_unknown_package_returns_empty_known_false() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::repos::get_repo_dependents(
+        State(state),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::RepoDependentsQuery {
+            tenant_id: "tenant-a".to_string(),
+            ecosystem: "npm".to_string(),
+            name: "missing".to_string(),
+            cursor: None,
+            limit: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["package_known"], false);
+    assert!(body["dependents"].as_array().expect("dependents").is_empty());
+    assert!(body["next_cursor"].is_null());
+}
+
+#[tokio::test]
+async fn repo_dependents_paginates_without_duplicates_or_gaps() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    seed_dependents_graph(
+        &state,
+        "tenant-a",
+        "cargo",
+        "serde",
+        500,
+        &[
+            ("repo-a", 101),
+            ("repo-b", 102),
+            ("repo-c", 103),
+            ("repo-d", 104),
+            ("repo-e", 105),
+        ],
+    )
+    .await;
+
+    let mut cursor = None;
+    let mut page_sizes = Vec::new();
+    let mut repo_ids = Vec::new();
+    loop {
+        let resp = super::repos::get_repo_dependents(
+            State(state.clone()),
+            dev_scope_headers("admin:read"),
+            Query(super::repos::RepoDependentsQuery {
+                tenant_id: "tenant-a".to_string(),
+                ecosystem: "cargo".to_string(),
+                name: "serde".to_string(),
+                cursor: cursor.clone(),
+                limit: Some(2),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        let dependents = body["dependents"].as_array().expect("dependents");
+        page_sizes.push(dependents.len());
+        repo_ids.extend(
+            dependents
+                .iter()
+                .map(|row| row["repo_id"].as_str().unwrap_or_default().to_string()),
+        );
+        cursor = body["next_cursor"].as_str().map(str::to_string);
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    assert_eq!(page_sizes, vec![2, 2, 1]);
+    assert_eq!(repo_ids, vec!["repo-a", "repo-b", "repo-c", "repo-d", "repo-e"]);
+    let unique: std::collections::BTreeSet<_> = repo_ids.iter().collect();
+    assert_eq!(unique.len(), repo_ids.len(), "no duplicate repos across pages");
+}
+
+#[tokio::test]
+async fn repo_dependents_missing_extdeps_fact_keeps_null_version_fields() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    seed_dependents_graph(
+        &state,
+        "tenant-a",
+        "cargo",
+        "serde",
+        500,
+        &[("repo-missing-versions", 101)],
+    )
+    .await;
+
+    let resp = super::repos::get_repo_dependents(
+        State(state),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::RepoDependentsQuery {
+            tenant_id: "tenant-a".to_string(),
+            ecosystem: "cargo".to_string(),
+            name: "serde".to_string(),
+            cursor: None,
+            limit: Some(10),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let row = &body["dependents"].as_array().expect("dependents")[0];
+    assert_eq!(row["repo_id"], "repo-missing-versions");
+    assert!(row["version_req"].is_null());
+    assert!(row["version_locked"].is_null());
+    assert!(row["kind"].is_null());
+    assert!(row["source_manifest"].is_null());
+}
+
+#[tokio::test]
+async fn repo_dependents_requires_admin_read() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::repos::get_repo_dependents(
+        State(state),
+        HeaderMap::new(),
+        Query(super::repos::RepoDependentsQuery {
+            tenant_id: "tenant-a".to_string(),
+            ecosystem: "cargo".to_string(),
+            name: "serde".to_string(),
+            cursor: None,
+            limit: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn repo_dependents_validates_ecosystem_and_name() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let bad_ecosystem = super::repos::get_repo_dependents(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::RepoDependentsQuery {
+            tenant_id: "tenant-a".to_string(),
+            ecosystem: "rubygems".to_string(),
+            name: "rails".to_string(),
+            cursor: None,
+            limit: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(bad_ecosystem.status(), StatusCode::BAD_REQUEST);
+
+    let empty_name = super::repos::get_repo_dependents(
+        State(state),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::RepoDependentsQuery {
+            tenant_id: "tenant-a".to_string(),
+            ecosystem: "cargo".to_string(),
+            name: "   ".to_string(),
+            cursor: None,
+            limit: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(empty_name.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

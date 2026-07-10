@@ -813,6 +813,7 @@ pub fn router(state: AppState, case_store: self::cases::SharedCaseStore) -> Rout
         // Tenant-scoped repository registry endpoints.
         .route("/v1/repos", get(self::repos::get_repos))
         .route("/v1/repos", axum::routing::post(self::repos::post_repo))
+        .route("/v1/repos/dependents", get(self::repos::get_repo_dependents))
         .route("/v1/repos/{repo_id}", get(self::repos::get_repo))
         .route(
             "/v1/repos/{repo_id}",
