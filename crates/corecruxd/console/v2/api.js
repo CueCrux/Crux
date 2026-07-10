@@ -15,7 +15,7 @@
 // Every call is same-origin credentialed; the browser never holds a bearer
 // token (the daemon authenticates the session at its own origin).
 //
-// 152 read endpoints, generated from the route manifest.
+// 155 read endpoints, generated from the route manifest.
 
 /**
  * Append a plain query object to a path as a URL search string.
@@ -111,6 +111,7 @@ const LITERAL_GET_PATHS = Object.freeze({
   '/v1/punchcards': true,
   '/v1/quota': true,
   '/v1/relations': true,
+  '/v1/repos': true,
   '/v1/route': true,
   '/v1/routing/route': true,
   '/v1/routing/status': true,
@@ -525,6 +526,15 @@ const CruxApi = Object.freeze({
   },
   replayExportsStreamsByStreamTypeByStreamId(streamType, streamId, query) {
     return fetch(withQuery(`/v1/replay/exports/streams/${encodeURIComponent(streamType)}/${encodeURIComponent(streamId)}`, query), { credentials: 'same-origin' });
+  },
+  repos(query) {
+    return fetch(withQuery(`/v1/repos`, query), { credentials: 'same-origin' });
+  },
+  reposByRepoId(repo_id, query) {
+    return fetch(withQuery(`/v1/repos/${encodeURIComponent(repo_id)}`, query), { credentials: 'same-origin' });
+  },
+  reposByRepoIdCodemap(repo_id, query) {
+    return fetch(withQuery(`/v1/repos/${encodeURIComponent(repo_id)}/codemap`, query), { credentials: 'same-origin' });
   },
   route(query) {
     return fetch(withQuery(`/v1/route`, query), { credentials: 'same-origin' });
