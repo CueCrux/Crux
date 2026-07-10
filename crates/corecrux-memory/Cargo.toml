@@ -10,21 +10,21 @@ default = []
 llm = []
 
 [dependencies]
-blake3 = "1.8.5"
-ed25519-dalek = { version = "2.2.0", features = ["std"] }
-hex = "0.4.3"
-utoipa = { version = "5", features = ["chrono"] }
-serde = { version = "1.0.218", features = ["derive"] }
-serde_json = "1.0.150"
-thiserror = "2.0.12"
-tracing = "0.1"
-uuid = { version = "1.23.2", features = ["v4"] }
-chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde"] }
-tokio = { version = "1", features = ["sync"] }
-ureq = { version = "3.3.0", features = ["json"] }
+blake3 = { workspace = true }
+ed25519-dalek = { workspace = true, features = ["std"] }
+hex = { workspace = true }
+utoipa = { workspace = true, features = ["chrono"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+chrono = { workspace = true, features = ["clock", "serde"] }
+tokio = { workspace = true, features = ["sync"] }
+ureq = { workspace = true, features = ["json"] }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

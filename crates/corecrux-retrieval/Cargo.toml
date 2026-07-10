@@ -6,22 +6,22 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-blake3 = "1.8.5"
-serde = { version = "1.0.218", features = ["derive"] }
-serde_json = "1.0.150"
-thiserror = "2.0.11"
-tracing = "0.1.41"
-xxhash-rust = { version = "0.8.12", features = ["xxh64"] }
+blake3 = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+xxhash-rust = { workspace = true, features = ["xxh64"] }
 
 corecrux-index = { path = "../corecrux-index" }
 corecrux-projections = { path = "../corecrux-projections" }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
-serde = { version = "1.0.218", features = ["derive"] }
-serde_json = "1.0.150"
-tempfile = "3.16.0"
-xxhash-rust = { version = "0.8.12", features = ["xxh64"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+xxhash-rust = { workspace = true, features = ["xxh64"] }
 
 [[bench]]
 name = "bm25_bench"

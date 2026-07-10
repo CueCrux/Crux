@@ -6,17 +6,17 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-blake3 = "1.8.5"
-crc32c = "0.6.8"
-crc32fast = "1.4.2"
-lz4_flex = "0.13.1"
-thiserror = "2.0.12"
-tracing = "0.1.41"
-xxhash-rust = { version = "0.8.12", features = ["xxh64"] }
+blake3 = { workspace = true }
+crc32c = { workspace = true }
+crc32fast = { workspace = true }
+lz4_flex = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+xxhash-rust = { workspace = true, features = ["xxh64"] }
 
 [dev-dependencies]
 corecrux-frame = { path = "../corecrux-frame" }
-proptest = "1"
+proptest = { workspace = true }
 
 [lints]
 workspace = true

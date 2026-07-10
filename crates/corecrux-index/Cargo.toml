@@ -6,16 +6,16 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-blake3 = "1.8.5"
-thiserror = "2.0.11"
-xxhash-rust = { version = "0.8.12", features = ["xxh64"] }
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+xxhash-rust = { workspace = true, features = ["xxh64"] }
 
 corecrux-frame = { path = "../corecrux-frame" }
 corecrux-segment = { path = "../corecrux-segment" }
 
 [dev-dependencies]
-proptest = "1.6.0"
-tempfile = "3.16.0"
+proptest = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

@@ -6,25 +6,26 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-axum = "0.8.9"
-blake3 = "1.8.5"
-chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde"] }
-base64 = "0.22.1"
-ed25519-dalek = { version = "2.2.0", features = ["std"] }
-hex = "0.4.3"
-jsonwebtoken = { version = "10.3.0", default-features = false, features = ["use_pem", "aws_lc_rs"] }
-prometheus = { version = "0.13.4", default-features = false }
-rand = "0.10.1"
-regex = "1.11"
-serde = { version = "1.0.218", features = ["derive"] }
-serde_json = "1.0.150"
-thiserror = "2.0.12"
-tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "sync"] }
-tokio-stream = "0.1.17"
-tracing = "0.1.41"
-ureq = { version = "3.3.0", features = ["json"] }
-uuid = { version = "1.23.2", features = ["v4"] }
-xxhash-rust = { version = "0.8.12", features = ["xxh64"] }
+axum = { workspace = true }
+blake3 = { workspace = true }
+chrono = { workspace = true, features = ["clock", "serde"] }
+base64 = { workspace = true }
+ed25519-dalek = { workspace = true, features = ["std"] }
+hex = { workspace = true }
+jsonwebtoken = { workspace = true, features = ["use_pem", "aws_lc_rs"] }
+prometheus = { workspace = true }
+rand = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+tokio-stream = { workspace = true }
+tracing = { workspace = true }
+ureq = { workspace = true, features = ["json"] }
+uuid = { workspace = true, features = ["v4"] }
+xxhash-rust = { workspace = true, features = ["xxh64"] }
 corecrux-memory = { path = "../corecrux-memory" }
 corecrux-projections = { path = "../corecrux-projections" }
 corecrux-receipts = { path = "../corecrux-receipts" }
@@ -42,12 +43,12 @@ vaultcrux-local = { path = "../vaultcrux-local" }
 # agent-passport M5 T.1 regression suite builds a real `.ccxi` segment to prove
 # the `query` retrieval path's tenant-hash isolation end-to-end.
 corecrux-index = { path = "../corecrux-index" }
-http-body-util = "0.1"
-tempfile = "3"
-tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "test-util"] }
-tower = { version = "0.5", features = ["util"] }
-zstd = "0.13.3"
-tar = "0.4.44"
+http-body-util = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tower = { workspace = true, features = ["util"] }
+zstd = { workspace = true }
+tar = { workspace = true }
 
 [lints]
 workspace = true

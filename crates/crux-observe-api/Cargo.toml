@@ -11,10 +11,10 @@ license.workspace = true
 description = "Shared serde wire types for the agent audit-chain data contract (agent_trace_node): inputs → reasoning → output → CROWN receipt."
 
 [dependencies]
-serde = { version = "1.0.218", features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
-serde_json = "1.0.150"
+serde_json = { workspace = true }
 
 [lints]
 workspace = true
