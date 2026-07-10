@@ -191,22 +191,13 @@ Most memory layers measure recall. Crux also measures what recall *costs*: every
 takes a hard `token_budget`, and the daemon trims to fit — metadata first, content only when it
 earns its tokens.
 
-<table>
-  <tr>
-    <td width="50%"><img src="docs/Images/readme/chart-token-budget.svg" alt="Bar chart: naive top-K returns about 18,400 tokens per query; token budget 4000 returns 3,900; budget 2000 returns 1,940; budget 500 returns 480"></td>
-    <td width="50%"><img src="docs/Images/readme/chart-bm25-latency.svg" alt="Bar chart: BM25 median search latency is 583 nanoseconds at 100 docs, 2.62 microseconds at 1,000 docs, 23.1 microseconds at 10,000 docs"></td>
-  </tr>
-</table>
+<img src="docs/Images/readme/benchmarks.svg" width="1160"
+     alt="Benchmark spread, four panels. Tokens returned per query: naive top-K about 18,400; token budget 4000 returns 3,900; budget 2000 returns 1,940; budget 500 returns 480 — budgets enforced server-side. Same answer, a fraction of the tokens: vendor-native memory scored 97/100 using 8,428 context tokens, Crux scored 95/100 using 1,263 — 15% of the tokens for 98% of the score (ScoreCrux context benchmark, sonnet-5 arm). More context makes it worse: with 3,346 docs and 2M+ tokens, stuffed recall fell 44% to 28% on one model and 28% to 8% on another while tool-mediated retrieval held 80–100% (ScoreCrux scale benchmark). Daemon CI perf gates: 25,422 events/sec append at p95 9.98 ms, 21,328 replay reads/sec at p95 0.52 ms, BM25 median 583 ns at 100 docs and 23.1 µs at 10,000, 60–80% fewer tokens than top-K stuffing">
 
-| | |
-|---|---|
-| **25,422 ev/s** | append throughput (CI perf gate, p95 9.98 ms) |
-| **21,328 rd/s** | replay reads (p95 0.52 ms) |
-| **60–80%** | token reduction vs top-K context stuffing |
-| **~91%** | preliminary hosted retrieval eval, strict scoring¹ |
-
-All daemon performance numbers are reproducible from [`docs/benchmarks.md`](docs/benchmarks.md)
-with pinned baselines, regression-gated in CI.
+All daemon numbers are reproducible from [`docs/benchmarks.md`](docs/benchmarks.md) with pinned
+baselines, regression-gated in CI. ScoreCrux methodology, negative controls and per-model runs:
+[scorecrux.com/context](https://scorecrux.com/context) · [scorecrux.com/scale](https://scorecrux.com/scale).
+Early hosted-retrieval evals via the CoreCrux substrate score ~91% under strict scoring¹.
 
 <sub>¹ Internal runs via the CoreCrux retrieval substrate (paid tier; see
 [the platform section](#standalone-by-design-platform-by-choice)), not the bare local daemon.
