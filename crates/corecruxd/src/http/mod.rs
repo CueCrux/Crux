@@ -55,6 +55,7 @@ mod rcx_publish;
 mod receipts;
 mod relations;
 mod replay;
+mod repos;
 mod result_envelope;
 #[cfg(test)]
 mod route_auth;
@@ -313,6 +314,9 @@ pub struct AppState {
     pub retrieval_index: Arc<RwLock<corecrux_retrieval::IndexManager>>,
     /// Crux Daemon fact store (receipted entity memory).
     pub fact_store: Arc<RwLock<corecrux_memory::FactStore>>,
+    /// Optional active repository watcher. `None` unless
+    /// `CORECRUXD_REPO_WATCH` is truthy at daemon startup.
+    pub repo_watch: Option<crate::repo_watch::RepoWatchService>,
     /// Process-wide rate-limit table for community-extension dispatch
     /// (M4 Phase A). Sliding 60-second window keyed by
     /// (extension_id, passport_fpr); cap is per-grant or daemon default.
@@ -801,6 +805,14 @@ pub fn router(state: AppState, case_store: self::cases::SharedCaseStore) -> Rout
         .route(
             "/v1/projects/{id}/tenants",
             axum::routing::post(self::projects::post_project_tenant),
+        )
+        // Tenant-scoped repository registry endpoints.
+        .route("/v1/repos", get(self::repos::get_repos))
+        .route("/v1/repos", axum::routing::post(self::repos::post_repo))
+        .route("/v1/repos/{repo_id}", get(self::repos::get_repo))
+        .route(
+            "/v1/repos/{repo_id}",
+            axum::routing::delete(self::repos::delete_repo),
         )
         .route(
             "/v1/projects/{id}/tenants/{tenantId}",

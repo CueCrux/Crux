@@ -26,6 +26,7 @@
 mod activity;
 mod agentgraph_kinds;
 mod auth;
+mod codegraph_fusion;
 mod config;
 mod console_index;
 mod consolidation_scheduler;
@@ -85,6 +86,9 @@ mod projects;
 mod protocol_posture;
 mod redaction;
 mod relations;
+mod repo_codegraph;
+mod repo_registry;
+mod repo_watch;
 mod session_bindings;
 mod shard_map;
 mod status_feed;
@@ -103,6 +107,8 @@ mod witness_submit;
 mod work;
 mod work_execplans;
 mod workspace_scan;
+mod workspace_scan_ast;
+mod workspace_scan_polyglot;
 
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;
@@ -581,6 +587,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None
     };
 
+    let fact_store = Arc::new(RwLock::new(if config.fact_persistence_enabled {
+        corecrux_memory::FactStore::with_persistence(&config.data_dir)?
+    } else {
+        corecrux_memory::FactStore::new()
+    }));
+    let projection_state = {
+        let mut ps = corecrux_projections::ProjectionState::default();
+        match crate::relations::load_into_state(&config.data_dir, &mut ps) {
+            Ok(n) => tracing::info!(loaded = n, "relations.jsonl replayed into ProjectionState"),
+            Err(err) => tracing::warn!(?err, "relations replay failed; starting empty"),
+        }
+        Arc::new(RwLock::new(ps))
+    };
+    let repo_watch = crate::repo_watch::RepoWatchService::maybe_new(
+        fact_store.clone(),
+        projection_state.clone(),
+        config.data_dir.clone(),
+    );
+
     let state = AppState {
         lock_held: true,
         build: build.clone(),
@@ -682,11 +707,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             Arc::new(RwLock::new(idx))
         },
-        fact_store: Arc::new(RwLock::new(if config.fact_persistence_enabled {
-            corecrux_memory::FactStore::with_persistence(&config.data_dir)?
-        } else {
-            corecrux_memory::FactStore::new()
-        })),
+        fact_store: fact_store.clone(),
+        repo_watch: repo_watch.clone(),
         extension_rate_table: Arc::new(crate::extension_outbound::RateTable::new()),
         #[cfg(feature = "wasm-extensions")]
         wasm_engine: build_wasm_engine_for_appstate(),
@@ -753,19 +775,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             fact_privacy::install_global(p.clone());
             p
         },
-        projection_state: {
-            let mut ps = corecrux_projections::ProjectionState::default();
-            match crate::relations::load_into_state(&config.data_dir, &mut ps) {
-                Ok(n) => tracing::info!(loaded = n, "relations.jsonl replayed into ProjectionState"),
-                Err(err) => tracing::warn!(?err, "relations replay failed; starting empty"),
-            }
-            Arc::new(RwLock::new(ps))
-        },
+        projection_state: projection_state.clone(),
     };
 
     // Wire the shared event bus into both stores so mutations emit SSE events.
     state.fact_store.write().await.set_event_bus(state.event_bus.clone());
     state.session_store.write().await.set_event_bus(state.event_bus.clone());
+    if let Some(watcher) = &state.repo_watch {
+        watcher.start_existing_repos().await;
+    }
 
     // Wire optional embedding client for dense vector retrieval on facts.
     if let Some(ref embedding_url) = config.embedding_url {
@@ -4244,6 +4262,7 @@ mod tests {
             retention_days: None,
             retrieval_index: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_retrieval::IndexManager::new())),
             fact_store: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::FactStore::new())),
+            repo_watch: None,
             extension_rate_table: std::sync::Arc::new(crate::extension_outbound::RateTable::new()),
             #[cfg(feature = "wasm-extensions")]
             wasm_engine: None,
