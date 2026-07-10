@@ -4,9 +4,9 @@
 
 //! Append-only comped-wallet meter primitive for the credit-burn rail.
 //!
-//! This is deliberately not wired into request paths yet. It provides the
-//! crash-replayable, idempotent reserve/spend state machine M1 needs before a
-//! handler can safely burn credits.
+//! The default-off admin spend rail and metered rerank path share this
+//! crash-replayable, idempotent reserve/spend state machine and deterministic
+//! signed spend-receipt format.
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -19,6 +19,8 @@ use thiserror::Error;
 const SCHEMA_V1: &str = "crux.credit_meter.event.v1";
 const QUOTE_SCHEMA_V1: &str = "crux.credit_quote.v1";
 const SPEND_RECEIPT_SCHEMA_V1: &str = "crux.credit_spend_receipt.v1";
+const DEFAULT_RESERVATION_TTL_SECS: u64 = 3_600;
+const STALE_RESERVATION_GC_REASON: &str = "stale_reservation_gc";
 
 #[derive(Debug, Error)]
 pub(crate) enum CreditMeterError {
@@ -52,6 +54,21 @@ pub(crate) enum CreditMeterError {
         operation_id: String,
         existing_cost: u64,
         requested_cost: u64,
+    },
+    #[error(
+        "operation {operation_id} for tenant {tenant_id} is reserved for payload {existing_payload_hash}, not {requested_payload_hash}"
+    )]
+    OperationPayloadMismatch {
+        tenant_id: String,
+        operation_id: String,
+        existing_payload_hash: String,
+        requested_payload_hash: String,
+    },
+    #[error("operation {operation_id} for tenant {tenant_id} was already spent with receipt {spend_receipt}")]
+    OperationAlreadySpent {
+        tenant_id: String,
+        operation_id: String,
+        spend_receipt: String,
     },
     #[error("reservation {reservation_id} was voided: {reason}")]
     ReservationVoided { reservation_id: String, reason: String },
@@ -186,6 +203,8 @@ struct ReservationState {
     reservation_id: String,
     cost: u64,
     balance_after: u64,
+    payload_hash: Option<String>,
+    created_at_unix: Option<u64>,
     spent_receipt: Option<String>,
     voided_reason: Option<String>,
 }
@@ -206,6 +225,10 @@ enum CreditMeterEvent {
         reservation_id: String,
         cost: u64,
         balance_after: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload_hash: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        created_at_unix: Option<u64>,
     },
     Spend {
         schema: String,
@@ -234,6 +257,13 @@ pub(crate) struct CreditMeterStore {
 
 impl CreditMeterStore {
     pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self, CreditMeterError> {
+        Self::open_with_reservation_ttl(path, DEFAULT_RESERVATION_TTL_SECS)
+    }
+
+    pub(crate) fn open_with_reservation_ttl(
+        path: impl AsRef<Path>,
+        reservation_ttl_secs: u64,
+    ) -> Result<Self, CreditMeterError> {
         let path = path.as_ref().to_path_buf();
         let mut store = Self {
             path,
@@ -243,6 +273,7 @@ impl CreditMeterStore {
             reservations: BTreeMap::new(),
         };
         store.replay()?;
+        store.gc_stale_reservations(reservation_ttl_secs)?;
         Ok(store)
     }
 
@@ -279,25 +310,42 @@ impl CreditMeterStore {
         tenant_id: &str,
         operation_id: &str,
         cost: u64,
+        payload_hash: &str,
     ) -> Result<CreditReservation, CreditMeterError> {
         let key = (tenant_id.to_string(), operation_id.to_string());
         if let Some(existing_id) = self.reservations_by_operation.get(&key) {
             if let Some(existing) = self.reservations.get(existing_id) {
-                if let Some(reason) = existing.voided_reason.clone() {
-                    return Err(CreditMeterError::ReservationVoided {
-                        reservation_id: existing.reservation_id.clone(),
-                        reason,
-                    });
-                }
-                if existing.cost != cost {
-                    return Err(CreditMeterError::OperationConflict {
+                if existing.voided_reason.is_some() {
+                    // A failed attempt released its hold. Fall through and bind a
+                    // distinct fresh reservation to this retry's payload.
+                } else if let Some(spend_receipt) = existing.spent_receipt.clone() {
+                    return Err(CreditMeterError::OperationAlreadySpent {
                         tenant_id: tenant_id.to_string(),
                         operation_id: operation_id.to_string(),
-                        existing_cost: existing.cost,
-                        requested_cost: cost,
+                        spend_receipt,
                     });
+                } else {
+                    if existing.cost != cost {
+                        return Err(CreditMeterError::OperationConflict {
+                            tenant_id: tenant_id.to_string(),
+                            operation_id: operation_id.to_string(),
+                            existing_cost: existing.cost,
+                            requested_cost: cost,
+                        });
+                    }
+                    if existing.payload_hash.as_deref() != Some(payload_hash) {
+                        return Err(CreditMeterError::OperationPayloadMismatch {
+                            tenant_id: tenant_id.to_string(),
+                            operation_id: operation_id.to_string(),
+                            existing_payload_hash: existing
+                                .payload_hash
+                                .clone()
+                                .unwrap_or_else(|| "unbound:legacy".to_string()),
+                            requested_payload_hash: payload_hash.to_string(),
+                        });
+                    }
+                    return Ok(reservation_view(existing));
                 }
-                return Ok(reservation_view(existing));
             }
         }
 
@@ -310,7 +358,7 @@ impl CreditMeterStore {
             });
         }
 
-        let reservation_id = reservation_id_for(tenant_id, operation_id, cost);
+        let reservation_id = self.fresh_reservation_id(tenant_id, operation_id, cost, payload_hash);
         let balance_after = available.saturating_sub(cost);
         let event = CreditMeterEvent::Reserve {
             schema: SCHEMA_V1.to_string(),
@@ -319,6 +367,8 @@ impl CreditMeterStore {
             reservation_id: reservation_id.clone(),
             cost,
             balance_after,
+            payload_hash: Some(payload_hash.to_string()),
+            created_at_unix: Some(current_unix_seconds()),
         };
         self.append_and_apply(&event)?;
         self.reservations
@@ -437,6 +487,54 @@ impl CreditMeterStore {
         Ok(())
     }
 
+    fn gc_stale_reservations(&mut self, reservation_ttl_secs: u64) -> Result<(), CreditMeterError> {
+        let now = current_unix_seconds();
+        let stale = self
+            .reservations
+            .values()
+            .filter(|reservation| {
+                reservation.spent_receipt.is_none()
+                    && reservation.voided_reason.is_none()
+                    && reservation
+                        .created_at_unix
+                        .is_none_or(|created_at| now.saturating_sub(created_at) > reservation_ttl_secs)
+            })
+            .map(|reservation| {
+                (
+                    reservation.tenant_id.clone(),
+                    reservation.operation_id.clone(),
+                    reservation.reservation_id.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for (tenant_id, operation_id, reservation_id) in stale {
+            self.append_and_apply(&CreditMeterEvent::Void {
+                schema: SCHEMA_V1.to_string(),
+                tenant_id,
+                operation_id,
+                reservation_id,
+                reason: STALE_RESERVATION_GC_REASON.to_string(),
+            })?;
+        }
+        Ok(())
+    }
+
+    fn fresh_reservation_id(&self, tenant_id: &str, operation_id: &str, cost: u64, payload_hash: &str) -> String {
+        let mut attempt = self
+            .reservations
+            .values()
+            .filter(|reservation| reservation.tenant_id == tenant_id && reservation.operation_id == operation_id)
+            .count() as u64;
+        loop {
+            let reservation_id = reservation_id_for(tenant_id, operation_id, cost, payload_hash, attempt);
+            if !self.reservations.contains_key(&reservation_id) {
+                return reservation_id;
+            }
+            attempt = attempt.saturating_add(1);
+        }
+    }
+
     fn append_and_apply(&mut self, event: &CreditMeterEvent) -> Result<(), CreditMeterError> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
@@ -472,6 +570,8 @@ impl CreditMeterStore {
                 reservation_id,
                 cost,
                 balance_after,
+                payload_hash,
+                created_at_unix,
                 ..
             } => {
                 if self.reservations.contains_key(reservation_id) {
@@ -485,6 +585,8 @@ impl CreditMeterStore {
                     reservation_id: reservation_id.clone(),
                     cost: *cost,
                     balance_after: *balance_after,
+                    payload_hash: payload_hash.clone(),
+                    created_at_unix: *created_at_unix,
                     spent_receipt: None,
                     voided_reason: None,
                 };
@@ -540,9 +642,16 @@ fn spend_view(reservation: &ReservationState, spend_receipt: &str) -> CreditSpen
     }
 }
 
-fn reservation_id_for(tenant_id: &str, operation_id: &str, cost: u64) -> String {
-    let hash = blake3::hash(format!("{tenant_id}\n{operation_id}\n{cost}").as_bytes());
+fn reservation_id_for(tenant_id: &str, operation_id: &str, cost: u64, payload_hash: &str, attempt: u64) -> String {
+    let hash = blake3::hash(format!("{tenant_id}\n{operation_id}\n{cost}\n{payload_hash}\n{attempt}").as_bytes());
     format!("crxres_{}", hash.to_hex())
+}
+
+fn current_unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 pub(crate) fn mint_spend_receipt(
@@ -633,16 +742,17 @@ fn is_blake3_hash_ref(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::sync::{Arc, Mutex};
     use std::thread;
 
     #[test]
-    fn reserve_and_spend_survive_reopen() -> Result<(), CreditMeterError> {
+    fn reserve_and_spend_survive_reopen_and_spent_reserve_is_refused() -> Result<(), CreditMeterError> {
         let tmp = tempfile::tempdir()?;
         let path = tmp.path().join("credit-meter.jsonl");
         let mut meter = CreditMeterStore::open(&path)?;
         assert_eq!(meter.seed_comped_wallet("tenant-a", 10, "seed-1")?, 10);
-        let reserved = meter.reserve("tenant-a", "op-1", 4)?;
+        let reserved = meter.reserve("tenant-a", "op-1", 4, &blake3_ref("payload-1"))?;
         assert_eq!(reserved.balance_after, 6);
         let spent = meter.spend("tenant-a", &reserved.reservation_id, "crown:r_1")?;
         assert_eq!(spent.spend_receipt, "crown:r_1");
@@ -650,8 +760,17 @@ mod tests {
 
         let mut reopened = CreditMeterStore::open(&path)?;
         assert_eq!(reopened.available_balance("tenant-a"), 6);
-        let retry = reopened.reserve("tenant-a", "op-1", 4)?;
-        assert_eq!(retry.reservation_id, reserved.reservation_id);
+        assert!(matches!(
+            reopened.reserve("tenant-a", "op-1", 4, &blake3_ref("payload-1")),
+            Err(CreditMeterError::OperationAlreadySpent {
+                ref spend_receipt,
+                ..
+            }) if spend_receipt == "crown:r_1"
+        ));
+        assert!(matches!(
+            reopened.reserve("tenant-a", "op-1", 4, &blake3_ref("payload-2")),
+            Err(CreditMeterError::OperationAlreadySpent { .. })
+        ));
         let spend_retry = reopened.spend("tenant-a", &reserved.reservation_id, "crown:r_2")?;
         assert_eq!(spend_retry.spend_receipt, "crown:r_1");
         Ok(())
@@ -663,7 +782,7 @@ mod tests {
         let path = tmp.path().join("credit-meter.jsonl");
         let mut meter = CreditMeterStore::open(&path)?;
         meter.seed_comped_wallet("tenant-a", 2, "seed-1")?;
-        let denied = meter.reserve("tenant-a", "op-1", 3);
+        let denied = meter.reserve("tenant-a", "op-1", 3, &blake3_ref("payload-1"));
         assert!(matches!(
             denied,
             Err(CreditMeterError::InsufficientCredit {
@@ -693,8 +812,9 @@ mod tests {
         let path = tmp.path().join("credit-meter.jsonl");
         let mut meter = CreditMeterStore::open(&path)?;
         meter.seed_comped_wallet("tenant-a", 10, "seed-1")?;
-        let reserved = meter.reserve("tenant-a", "op-1", 4)?;
-        let conflict = meter.reserve("tenant-a", "op-1", 5);
+        let payload_hash = blake3_ref("payload-1");
+        let reserved = meter.reserve("tenant-a", "op-1", 4, &payload_hash)?;
+        let conflict = meter.reserve("tenant-a", "op-1", 5, &payload_hash);
         assert!(matches!(
             conflict,
             Err(CreditMeterError::OperationConflict {
@@ -705,9 +825,49 @@ mod tests {
         ));
         assert_eq!(meter.available_balance("tenant-a"), 6);
         assert_eq!(
-            meter.reserve("tenant-a", "op-1", 4)?.reservation_id,
+            meter.reserve("tenant-a", "op-1", 4, &payload_hash)?.reservation_id,
             reserved.reservation_id
         );
+        Ok(())
+    }
+
+    #[test]
+    fn active_same_payload_is_an_idempotent_retry() -> Result<(), CreditMeterError> {
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("credit-meter.jsonl");
+        let mut meter = CreditMeterStore::open(&path)?;
+        meter.seed_comped_wallet("tenant-a", 10, "seed-1")?;
+        let payload_hash = blake3_ref("payload-1");
+
+        let first = meter.reserve("tenant-a", "op-1", 4, &payload_hash)?;
+        let retry = meter.reserve("tenant-a", "op-1", 4, &payload_hash)?;
+
+        assert_eq!(retry, first);
+        assert_eq!(meter.available_balance("tenant-a"), 6);
+        let log = std::fs::read_to_string(path)?;
+        assert_eq!(log.matches("\"event\":\"Reserve\"").count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn active_different_payload_is_rejected() -> Result<(), CreditMeterError> {
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("credit-meter.jsonl");
+        let mut meter = CreditMeterStore::open(&path)?;
+        meter.seed_comped_wallet("tenant-a", 10, "seed-1")?;
+        let existing_payload_hash = blake3_ref("payload-1");
+        let requested_payload_hash = blake3_ref("payload-2");
+        meter.reserve("tenant-a", "op-1", 4, &existing_payload_hash)?;
+
+        assert!(matches!(
+            meter.reserve("tenant-a", "op-1", 4, &requested_payload_hash),
+            Err(CreditMeterError::OperationPayloadMismatch {
+                existing_payload_hash: ref existing,
+                requested_payload_hash: ref requested,
+                ..
+            }) if existing == &existing_payload_hash && requested == &requested_payload_hash
+        ));
+        assert_eq!(meter.available_balance("tenant-a"), 6);
         Ok(())
     }
 
@@ -717,7 +877,7 @@ mod tests {
         let path = tmp.path().join("credit-meter.jsonl");
         let mut meter = CreditMeterStore::open(&path)?;
         meter.seed_comped_wallet("tenant-a", 10, "seed-1")?;
-        let reserved = meter.reserve("tenant-a", "op-1", 4)?;
+        let reserved = meter.reserve("tenant-a", "op-1", 4, &blake3_ref("payload-1"))?;
         assert_eq!(meter.available_balance("tenant-a"), 6);
         meter.void_reservation("tenant-a", &reserved.reservation_id, "remote_failed")?;
         assert_eq!(meter.available_balance("tenant-a"), 10);
@@ -725,10 +885,147 @@ mod tests {
             meter.spend("tenant-a", &reserved.reservation_id, "crown:r_1"),
             Err(CreditMeterError::ReservationVoided { .. })
         ));
+        let retried = meter.reserve("tenant-a", "op-1", 4, &blake3_ref("payload-2"))?;
+        assert_ne!(retried.reservation_id, reserved.reservation_id);
+        assert_eq!(meter.available_balance("tenant-a"), 6);
+        let retried_state = meter
+            .reservations
+            .get(&retried.reservation_id)
+            .expect("retried reservation");
+        assert_eq!(
+            retried_state.payload_hash.as_deref(),
+            Some(blake3_ref("payload-2").as_str())
+        );
         drop(meter);
 
         let reopened = CreditMeterStore::open(&path)?;
-        assert_eq!(reopened.available_balance("tenant-a"), 10);
+        assert_eq!(reopened.available_balance("tenant-a"), 6);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_reserve_event_line_replays_without_binding_fields() -> Result<(), CreditMeterError> {
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("credit-meter.jsonl");
+        let events = [
+            json!({
+                "event": "SeedCompedWallet",
+                "schema": SCHEMA_V1,
+                "event_id": "legacy-seed",
+                "tenant_id": "tenant-a",
+                "amount": 10,
+            }),
+            json!({
+                "event": "Reserve",
+                "schema": SCHEMA_V1,
+                "tenant_id": "tenant-a",
+                "operation_id": "legacy-op",
+                "reservation_id": "legacy-reservation",
+                "cost": 4,
+                "balance_after": 6,
+            }),
+            json!({
+                "event": "Spend",
+                "schema": SCHEMA_V1,
+                "tenant_id": "tenant-a",
+                "operation_id": "legacy-op",
+                "reservation_id": "legacy-reservation",
+                "spend_receipt": "legacy-spend-receipt",
+            }),
+        ];
+        let log = events
+            .iter()
+            .map(|event| serde_json::to_string(event).expect("serialize legacy meter event"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, format!("{log}\n"))?;
+
+        let meter = CreditMeterStore::open(&path)?;
+
+        assert_eq!(meter.available_balance("tenant-a"), 6);
+        let legacy = meter
+            .reservations
+            .get("legacy-reservation")
+            .expect("legacy reservation");
+        assert_eq!(legacy.payload_hash, None);
+        assert_eq!(legacy.created_at_unix, None);
+        assert_eq!(legacy.spent_receipt.as_deref(), Some("legacy-spend-receipt"));
+        Ok(())
+    }
+
+    #[test]
+    fn open_gc_voids_legacy_and_stale_active_reservations_but_keeps_recent() -> Result<(), CreditMeterError> {
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("credit-meter.jsonl");
+        let now = current_unix_seconds();
+        let events = [
+            json!({
+                "event": "SeedCompedWallet",
+                "schema": SCHEMA_V1,
+                "event_id": "seed-1",
+                "tenant_id": "tenant-a",
+                "amount": 20,
+            }),
+            json!({
+                "event": "Reserve",
+                "schema": SCHEMA_V1,
+                "tenant_id": "tenant-a",
+                "operation_id": "legacy-op",
+                "reservation_id": "legacy-reservation",
+                "cost": 2,
+                "balance_after": 18,
+            }),
+            json!({
+                "event": "Reserve",
+                "schema": SCHEMA_V1,
+                "tenant_id": "tenant-a",
+                "operation_id": "stale-op",
+                "reservation_id": "stale-reservation",
+                "cost": 3,
+                "balance_after": 15,
+                "payload_hash": blake3_ref("stale-payload"),
+                "created_at_unix": now.saturating_sub(61),
+            }),
+            json!({
+                "event": "Reserve",
+                "schema": SCHEMA_V1,
+                "tenant_id": "tenant-a",
+                "operation_id": "recent-op",
+                "reservation_id": "recent-reservation",
+                "cost": 4,
+                "balance_after": 11,
+                "payload_hash": blake3_ref("recent-payload"),
+                "created_at_unix": now,
+            }),
+        ];
+        let log = events
+            .iter()
+            .map(|event| serde_json::to_string(event).expect("serialize meter event"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, format!("{log}\n"))?;
+
+        let meter = CreditMeterStore::open_with_reservation_ttl(&path, 60)?;
+
+        assert_eq!(meter.available_balance("tenant-a"), 16);
+        for reservation_id in ["legacy-reservation", "stale-reservation"] {
+            assert_eq!(
+                meter
+                    .reservations
+                    .get(reservation_id)
+                    .and_then(|reservation| reservation.voided_reason.as_deref()),
+                Some(STALE_RESERVATION_GC_REASON)
+            );
+        }
+        assert_eq!(
+            meter
+                .reservations
+                .get("recent-reservation")
+                .and_then(|reservation| reservation.voided_reason.as_deref()),
+            None
+        );
+        let replayed_log = std::fs::read_to_string(path)?;
+        assert_eq!(replayed_log.matches(STALE_RESERVATION_GC_REASON).count(), 2);
         Ok(())
     }
 
@@ -750,7 +1047,9 @@ mod tests {
                     Ok(guard) => guard,
                     Err(_) => return false,
                 };
-                guard.reserve("tenant-a", &format!("op-{i}"), 3).is_ok()
+                guard
+                    .reserve("tenant-a", &format!("op-{i}"), 3, &blake3_ref(&format!("payload-{i}")))
+                    .is_ok()
             }));
         }
 
@@ -791,7 +1090,7 @@ mod tests {
             4,
             blake3_ref("price-list"),
         );
-        let reservation = meter.reserve("tenant-a", "op-1", quote.credits)?;
+        let reservation = meter.reserve("tenant-a", "op-1", quote.credits, &blake3_ref("payload-1"))?;
         let key = crux_session::LocalPassportKey::from_seed([7_u8; 32])
             .map_err(|err| std::io::Error::other(err.to_string()))?;
 

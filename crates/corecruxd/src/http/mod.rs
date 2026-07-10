@@ -246,9 +246,12 @@ pub struct AppState {
     /// Deliberately ephemeral: a restart refills everyone (errs toward
     /// the user).
     pub quota_ledger: Arc<std::sync::Mutex<crux_router::quota::QuotaLedger>>,
-    /// Credit-burn Meter M1b: persistent comped-wallet ledger. Default OFF
+    /// Persistent comped-wallet credit ledger. Default OFF
     /// (`CORECRUXD_CREDIT_METER=1`); when absent `/v1/credits/spend` returns
-    /// 404 and no request path can burn credits.
+    /// 404 and metered capability paths preserve their legacy no-burn shape.
+    /// A poisoned mutex deliberately fails every metered request closed with
+    /// 500 until restart; recovering potentially inconsistent money-path state
+    /// could otherwise permit an untracked debit or compute without a debit.
     pub credit_meter: Option<Arc<std::sync::Mutex<crate::credit_meter::CreditMeterStore>>>,
     /// G21b assembly cache over
     /// `corecrux_projections::assembly_cache::AssemblyCache` — memoizes
