@@ -34,8 +34,8 @@ mod control;
 mod coord;
 mod cost;
 mod cost_attribution;
-// Credit-burn M1a staged primitive; wired into request paths in a later
-// gated milestone after the money-path design review.
+// Default-off, append-only comped-wallet meter shared by the explicit spend
+// rail and metered capability paths.
 #[allow(dead_code)]
 mod credit_meter;
 // Dataplane store stubs: proprietary edition provides the real implementation.

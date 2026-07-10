@@ -16,10 +16,11 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use corecruxctl::{
-    admin, audit_export, audit_pack, c2pa_x509, code_chain, code_health, config_bundle, cost, evidence, explain,
-    export, extensions, fixture_digest, gaps, hooks, identity_cli, inspect_receipt, learn, login, machine, memory,
-    memory_pack, observe_ingest, output_verify, parity, projections, receipts, reconcile, replay, repo, session_sync,
-    shard, shardmap, smoke, snapshot, stage1_import, start, storage, structured_log, tooling_env, verify_store,
+    admin, audit_export, audit_pack, c2pa_x509, code_chain, code_health, config_bundle, cost, deploy_audit, evidence,
+    explain, export, extensions, fixture_digest, gaps, hooks, identity_cli, inspect_receipt, learn, login, machine,
+    memory, memory_pack, observe_ingest, output_verify, parity, projections, receipts, reconcile, replay, repo,
+    session_sync, shard, shardmap, smoke, snapshot, stage1_import, start, storage, structured_log, tooling_env,
+    verify_store,
 };
 
 #[derive(Debug, Parser)]
@@ -33,6 +34,31 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 #[allow(clippy::large_enum_variant)] // CLI subcommands — allocation cost is negligible at startup
 enum Command {
+    /// Audit the target daemon's bind/auth posture before a networked deployment.
+    #[command(name = "deploy-audit")]
+    DeployAudit {
+        /// Daemon YAML config. Defaults to CORECRUXD_CONFIG_PATH, then
+        /// $XDG_CONFIG_HOME/crux/config.yaml, matching corecruxd.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Override the resolved auth mode for this audit.
+        #[arg(long)]
+        auth_mode: Option<String>,
+        /// Override the resolved HTTP bind host/address for this audit.
+        #[arg(long)]
+        http_bind: Option<String>,
+        /// Override the resolved gRPC bind host/address for this audit.
+        #[arg(long)]
+        grpc_bind: Option<String>,
+        /// Treat the daemon as network-exposed even when it binds loopback
+        /// (for example behind a reverse proxy, port forward, or hosted rail).
+        #[arg(long, default_value_t = false)]
+        network_exposed: bool,
+        /// Emit a machine-readable report.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
     /// START HERE — the one command to get live: detect daemon, authenticate,
     /// wire MCP + hooks, round-trip a first fact, print a "you're live" summary.
     ///
@@ -2314,6 +2340,21 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match cli.command {
+        Command::DeployAudit {
+            config,
+            auth_mode,
+            http_bind,
+            grpc_bind,
+            network_exposed,
+            json,
+        } => deploy_audit::run(deploy_audit::DeployAuditOptions {
+            config_path: config,
+            auth_mode,
+            http_bind,
+            grpc_bind,
+            network_exposed,
+            json,
+        }),
         Command::Start { url, token } => start::run(start::StartArgs { url, token }),
         Command::Login {
             url,

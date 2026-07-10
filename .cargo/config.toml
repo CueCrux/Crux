@@ -1,2 +1,8 @@
 [build]
 # Use default parallelism (num CPUs)
+
+[env]
+# The corecruxctl CLI command tree is large enough that clap's debug-build
+# parser overflows the default 2 MiB test-thread stack (first hit when the
+# deploy-audit subcommand landed). Applies to cargo-spawned processes only.
+RUST_MIN_STACK = "8388608"

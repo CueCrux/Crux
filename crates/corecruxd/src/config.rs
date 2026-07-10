@@ -502,7 +502,7 @@ pub struct Config {
     // Path prefixes classified as hosted (quota-limited) surfaces.
     // Comma-separated; empty default = everything is local compute.
     pub quota_hosted_surfaces: Vec<String>,
-    // Credit-burn Meter M1b (`crate::http::credit_meter`). Default OFF and
+    // Credit-burn Meter M1b (`crate::credit_meter`). Default OFF and
     // comped-wallet only; real fiat/Paddle mint remains gated by M2.
     pub credit_meter_enabled: bool,
 
