@@ -4,6 +4,7 @@
 
 //! HTTP CRUD for tenant-scoped repository registrations.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use super::{
@@ -27,6 +28,17 @@ pub(super) struct CreateRepoBody {
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct RepoTenantQuery {
     pub tenant_id: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct RepoDependentsQuery {
+    pub tenant_id: String,
+    pub ecosystem: String,
+    pub name: String,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 fn now_unix_ms() -> u64 {
@@ -175,6 +187,131 @@ pub(super) async fn get_repos(
     let repos = crate::repo_registry::list_repos(&store, &tenant_id);
     drop(store);
     (StatusCode::OK, Json(serde_json::json!({ "repos": repos }))).into_response()
+}
+
+/// `GET /v1/repos/dependents` — daemon-owned package reverse-dependency
+/// lookup. Version requirements are returned as raw manifest strings only;
+/// version range semantics and filtering live in upstream clients/proxies.
+pub(super) async fn get_repo_dependents(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<RepoDependentsQuery>,
+) -> impl IntoResponse {
+    let tenant_id = query.tenant_id.trim().to_string();
+    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &tenant_id) {
+        return problem.into_response();
+    }
+    if tenant_id.is_empty() {
+        return problem_response(StatusCode::BAD_REQUEST, "tenant_id must not be empty");
+    }
+
+    let ecosystem = normalize_package_query_part(&query.ecosystem);
+    if !matches!(ecosystem.as_str(), "cargo" | "npm" | "pypi" | "go") {
+        return problem_response(StatusCode::BAD_REQUEST, "ecosystem must be one of cargo, npm, pypi, go");
+    }
+    let name = normalize_package_query_part(&query.name);
+    if name.is_empty() {
+        return problem_response(StatusCode::BAD_REQUEST, "name must not be empty");
+    }
+    let cursor = match crate::relations::parse_incoming_cursor(query.cursor.as_deref()) {
+        Ok(cursor) => cursor,
+        Err(message) => return problem_response(StatusCode::BAD_REQUEST, message),
+    };
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    let package_map_key = crate::repo_codegraph::external_dep_map_key(&ecosystem, &name);
+    let package_node_key = crate::repo_codegraph::pkg_key(&ecosystem, &name);
+
+    let store = state.fact_store.read().await;
+    let shared_ids = match crate::repo_codegraph::load_shared_id_store(&store, &tenant_id) {
+        Ok(ids) => ids,
+        Err(err) => {
+            drop(store);
+            return problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("shared codegraph id store failed to decode: {err}"),
+            );
+        }
+    };
+    let Some(package_node_id) = shared_ids.map.get(&package_node_key).copied() else {
+        drop(store);
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "tenant_id": tenant_id,
+                "ecosystem": ecosystem,
+                "name": name,
+                "package_known": false,
+                "dependents": [],
+                "next_cursor": null,
+            })),
+        )
+            .into_response();
+    };
+    let repo_by_node_id = repo_reverse_map(&shared_ids);
+    drop(store);
+
+    let tenant_hash = corecrux_projections::tenant_hash_xxhash64(&tenant_id);
+    let ps = state.projection_state.read().await;
+    let page = crate::relations::list_incoming_page(
+        &ps,
+        tenant_hash,
+        package_node_id,
+        Some(corecrux_projections::RelationTypeV1::DependsOn),
+        cursor,
+        limit,
+    );
+    let next_cursor = page.next_cursor.map(crate::relations::IncomingCursor::encode);
+    let from_ids: Vec<u32> = page.rows.into_iter().map(|((_, from_id, _, _), _)| from_id).collect();
+    drop(ps);
+
+    let store = state.fact_store.read().await;
+    let mut dependents = Vec::new();
+    for from_id in from_ids {
+        let Some(repo_id) = repo_by_node_id.get(&from_id) else {
+            continue;
+        };
+        let version_map = match crate::repo_codegraph::load_extdeps(&store, &tenant_id, repo_id) {
+            Ok(version_map) => version_map,
+            Err(err) => {
+                tracing::warn!(?err, tenant_id, repo_id, "repo-extdeps-version-join-failed");
+                BTreeMap::new()
+            }
+        };
+        let version = version_map.get(&package_map_key);
+        dependents.push(serde_json::json!({
+            "repo_id": repo_id,
+            "version_req": version.and_then(|row| row.version_req.as_deref()),
+            "version_locked": version.and_then(|row| row.version_locked.as_deref()),
+            "kind": version.map(|row| row.kind.as_str()),
+            "source_manifest": version.map(|row| row.source_manifest.as_str()),
+        }));
+    }
+    drop(store);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "tenant_id": tenant_id,
+            "ecosystem": ecosystem,
+            "name": name,
+            "package_known": true,
+            "dependents": dependents,
+            "next_cursor": next_cursor,
+        })),
+    )
+        .into_response()
+}
+
+fn normalize_package_query_part(value: &str) -> String {
+    value.trim().replace('\\', "/").to_ascii_lowercase()
+}
+
+fn repo_reverse_map(id_store: &crate::repo_codegraph::CodeGraphIdStore) -> BTreeMap<u32, String> {
+    id_store
+        .map
+        .iter()
+        .filter_map(|(key, id)| key.strip_prefix("repo:").map(|repo_id| (*id, repo_id.to_string())))
+        .collect()
 }
 
 pub(super) async fn get_repo(

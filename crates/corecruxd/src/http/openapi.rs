@@ -357,6 +357,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/replay/exports/receipts/{receiptId}", methods: &["GET"], tag: "Replay", auth: "read", summary: "Replay exports receipts {receiptId}" },
     RouteEntry { path: "/v1/replay/exports/streams/{streamType}/{streamId}", methods: &["GET"], tag: "Replay", auth: "read", summary: "Replay exports streams {streamType} {streamId}" },
     RouteEntry { path: "/v1/repos", methods: &["GET", "POST"], tag: "Repos", auth: "admin", summary: "Repos" },
+    RouteEntry { path: "/v1/repos/dependents", methods: &["GET"], tag: "Repos", auth: "admin-read", summary: "Repos dependents" },
     RouteEntry { path: "/v1/repos/{repo_id}", methods: &["GET", "DELETE"], tag: "Repos", auth: "admin", summary: "Repos {repo_id}" },
     RouteEntry { path: "/v1/repos/{repo_id}/codemap", methods: &["GET"], tag: "Repos", auth: "admin-read", summary: "Repos {repo_id} codemap" },
     RouteEntry { path: "/v1/result-envelope/import", methods: &["POST"], tag: "ResultEnvelope", auth: "write", summary: "Result envelope import" },

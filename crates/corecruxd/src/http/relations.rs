@@ -181,37 +181,17 @@ pub(super) async fn get_incoming_relations(
         },
         None => None,
     };
-    let cursor = match parse_incoming_cursor(query.cursor.as_deref()) {
+    let cursor = match crate::relations::parse_incoming_cursor(query.cursor.as_deref()) {
         Ok(cursor) => cursor,
         Err(message) => return problem_response(StatusCode::BAD_REQUEST, message),
     };
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
     let tenant_hash = tenant_hash_xxhash64(query.tenant_id.trim());
     let ps = state.projection_state.read().await;
-    let mut rows = crate::relations::list_incoming(
-        &ps,
-        tenant_hash,
-        query.to_id,
-        edge_type,
-        cursor,
-        limit.saturating_add(1),
-    );
-    let has_more = rows.len() > limit;
-    if has_more {
-        rows.truncate(limit);
-    }
-    let next_cursor = if has_more {
-        rows.last().map(|((_, from_id, _, edge_type_u8), _)| {
-            crate::relations::IncomingCursor {
-                from_id: *from_id,
-                edge_type_u8: *edge_type_u8,
-            }
-            .encode()
-        })
-    } else {
-        None
-    };
-    let edges: Vec<_> = rows
+    let page = crate::relations::list_incoming_page(&ps, tenant_hash, query.to_id, edge_type, cursor, limit);
+    let next_cursor = page.next_cursor.map(crate::relations::IncomingCursor::encode);
+    let edges: Vec<_> = page
+        .rows
         .into_iter()
         .filter_map(|((_, from_id, to_id, etype_u8), edge)| {
             RelationTypeV1::from_u8(etype_u8).map(|etype| {
@@ -241,25 +221,6 @@ pub(super) async fn get_incoming_relations(
         })),
     )
         .into_response()
-}
-
-fn parse_incoming_cursor(raw: Option<&str>) -> Result<Option<crate::relations::IncomingCursor>, String> {
-    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(None);
-    };
-    let Some((from_id, edge_type_u8)) = raw.split_once(':') else {
-        return Err("cursor must be '<from_id>:<edge_type_u8>'".to_string());
-    };
-    let from_id = from_id
-        .parse::<u32>()
-        .map_err(|_| "cursor from_id must be a u32".to_string())?;
-    let edge_type_u8 = edge_type_u8
-        .parse::<u8>()
-        .map_err(|_| "cursor edge_type_u8 must be a u8".to_string())?;
-    if RelationTypeV1::from_u8(edge_type_u8).is_none() {
-        return Err(format!("cursor edge_type_u8 '{edge_type_u8}' is not supported"));
-    }
-    Ok(Some(crate::relations::IncomingCursor { from_id, edge_type_u8 }))
 }
 
 pub(super) async fn post_expand(
