@@ -1,4 +1,5 @@
 // Copyright (c) 2026 CueCrux Ltd. All rights reserved.
+// SPDX-License-Identifier: LicenseRef-CCL-1.0
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 
 use std::process::{Command, Output};

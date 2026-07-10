@@ -127,6 +127,7 @@ jobs:
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - run: cargo fmt --check
       - run: typos
+      - run: bash scripts/check-licence-headers.sh
       - run: bash scripts/assert-daemon-release-boundary.sh
       - run: bash scripts/ci-cargo-with-fallback.sh clippy --workspace -- -D warnings
       - name: Reclaim per-job CARGO_HOME

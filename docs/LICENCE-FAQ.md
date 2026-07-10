@@ -103,3 +103,24 @@ Software." Saying "built on Crux Daemon" is fine; calling your product
 
 No. The **Disclaimer of Warranty** section applies: the software is provided
 "AS IS", without warranty of any kind.
+
+## How do licence scanners see this? (machine-readable metadata)
+
+The CCL is a custom licence, so GitHub's `licensee` and similar heuristic
+detectors will report the repository licence as "Unknown" — that is expected
+and accepted; it does not mean the code is unlicensed. Two machine-readable
+signals are published so SBOM/compliance tooling gets a parseable answer:
+
+1. **SPDX identifier `LicenseRef-CCL-1.0`.** `LicenseRef-` is SPDX's standard
+   prefix for a licence with no SPDX-registered ID. It appears as the second
+   line of every `.rs` source header
+   (`// SPDX-License-Identifier: LicenseRef-CCL-1.0`) and as the `license`
+   field in every crate manifest.
+2. **Cargo manifest metadata.** The workspace sets
+   `license = "LicenseRef-CCL-1.0"` in `[workspace.package]`; every member
+   crate inherits it via `license.workspace = true`. So `cargo metadata` and
+   any SBOM generator that reads it (e.g. `cargo-sbom`, `syn`-based scanners,
+   CycloneDX) report `LicenseRef-CCL-1.0` for all crates rather than a blank.
+
+Scanners that resolve `LicenseRef-` identifiers back to text should point at
+[`LICENCE.md`](../LICENCE.md), the authoritative CCL text.
