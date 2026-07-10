@@ -4,7 +4,7 @@
 > Anchored by **symbol name** (greppable), not line number (rots). Verified against
 > the tree by `scripts/check-agent-docs.sh` in CI.
 
-The workspace has **27 cargo crates** under `crates/`. (`crux-console-ui` is a built
+The workspace has **28 cargo crates** under `crates/`. (`crux-console-ui` is a built
 SPA — `dist/` only, not a cargo member — and is excluded below.)
 
 ## Trust core (read these first)
@@ -12,7 +12,7 @@ SPA — `dist/` only, not a cargo member — and is excluded below.)
 | Crate | Purpose | Key public symbols | Used by | ~LOC |
 |---|---|---|---|---|
 | `corecrux-segment` | Sealed segment format (`.ccxseg`) — build / seal / decode + hash binding | `build_segment_v1`, `seal_segment_v1_from_record_area`, `decode_segment_v1`, `SegmentError` | corecrux-storage, corecrux-index, corecrux-projections, corecruxctl, corecruxd | 4.1k |
-| `corecrux-storage` | Append-only shard store; sealing, integrity scan, seal material | `ShardStorage::append`, `SegmentSealMaterialV1`, `integrity_scan_stats_all`, `verify_segment_hashes_all` | corecrux-projections, corecruxctl, corecruxd | 12.4k |
+| `corecrux-storage` | Append-only shard store; sealing, integrity scan, seal material | `append_batch`/`append_batch_with_stats`, `SegmentSealMaterialV1`, `integrity_scan_stats_all`, `verify_segment_hashes_all` | corecrux-projections, corecruxctl, corecruxd | 12.4k |
 | `corecrux-receipts` | Receipt formats, Ed25519 signing, strict verification, witness anchoring, export bundles | `verify_receipt_v1`, `build_c2pa_manifest_v1`/`verify_c2pa_manifest_v1`, `build_bundle_v1`/`verify_bundle_v1`, `build_external_anchor_body_v1`/`verify_rfc6962_inclusion_proof_v1`, `sign_stream_v1` | crux-integrations, crux-mcp, corecruxctl, corecruxd | 12.0k |
 | `corecrux-frame` | Canonical v1 frame encoding + hash helpers (header / payload / stream) | `canonical_header_bytes_v1`, `compute_header_hash`, `compute_payload_hash`, `decode_canonical_header_bytes_v1` | corecrux-{index,projections,storage,segment}, corecruxctl, corecruxd | 0.3k |
 | `rcx-capability-token` | RCX capability token v1.0 (schema-lock, CBOR/JSON mirror, validation) | `RcxCapabilityToken`, `verify_token`, `validate_basic`, `RcxTier`, `ReceiptClass` | crux-enterprise-shim, crux-mcp, crux-router | 1.1k |
@@ -56,6 +56,7 @@ SPA — `dist/` only, not a cargo member — and is excluded below.)
 | `crux-config-wizard` | Composes `CLAUDE.md`/`AGENTS.md` config from versioned profile fragments | `Target` enum *(also a binary)* | crux-claude-hooks | 1.8k |
 | `crux-claude-hooks` | Claude Code lifecycle hook binaries (`crux-hook`, `crux-llm-shim`) | *(binaries + `crux_claude_hooks` lib)* | — | 5.0k |
 | `crux-contrib` | Contribution-manifest builder + Ed25519 envelope signing | `build_manifest`, `ContributionManifest`, `Provenance` | — | 0.2k |
+| `crux-cost` | Ground-truth token-burn cost lens: parses a Claude Code transcript for measured usage, attributes carried context cost per source; shared `CostReport` contract for CLI (producer) and daemon (reader) | `analyze_file`, `analyze_str`, `CostReport` | corecruxctl, corecruxd | 2.2k |
 | `crux-sync` | Offline-first outbox sync client to the VaultCrux API | `Outbox`/`OutboxEntry`, `push_contributions`/`query_commons` | — | 0.7k |
 | `crux-integration-tests` | Cross-crate integration tests (consumes corecrux-proto) | *(test-only crate)* | — | 2.2k |
 

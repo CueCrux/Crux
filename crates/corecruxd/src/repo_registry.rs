@@ -185,6 +185,24 @@ pub fn create_repo(store: &mut FactStore, registration: &RepoRegistration) -> Re
     store_repo(store, registration)
 }
 
+/// Read back the latest persisted scan JSON for a registered repo — the
+/// mirror of [`store_scan_json`]. `None` when the repo was registered by
+/// `clone_url` only (scan deferred) or has never been scanned.
+pub fn load_scan_json(store: &FactStore, tenant_id: &str, repo_id: &str) -> Option<String> {
+    let entity = scan_entity(tenant_id, repo_id);
+    let result = store.query(&FactQuery {
+        query: None,
+        entity: Some(entity),
+        entity_prefix: None,
+        top_k: 10,
+        token_budget: None,
+    });
+    crate::fact_helpers::dedup_latest(result.facts)
+        .into_iter()
+        .find(|fact| fact.key == REPO_FACT_KEY)
+        .map(|fact| fact.value)
+}
+
 pub fn store_scan_json(store: &mut FactStore, tenant_id: &str, repo_id: &str, scan_json: String) {
     store.store(StoreFact {
         entity: scan_entity(tenant_id, repo_id),

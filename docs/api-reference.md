@@ -106,6 +106,25 @@ visibility are MCP-only features.
 
 \* Requires a dataplane-enabled deployment. Returns 501 in Crux Daemon.
 
+### Repos & Code Map
+
+AST-derived code structure for registered repositories. Registration with a
+`root_path` runs a one-shot scan (Rust natively; TS/TSX/Vue/Python via
+tree-sitter) and persists it; the repo watch loop re-indexes on change. The
+codemap endpoint is the read side — the daemon serving its own code
+understanding back to agents.
+
+| Method | Path | Description | Auth Scope |
+|--------|------|-------------|------------|
+| GET | `/v1/repos?tenant_id=…` | List registered repos for a tenant | `admin:read` |
+| POST | `/v1/repos` | Register a repo (`root_path` scans now; `clone_url` defers) | `admin:write` |
+| GET | `/v1/repos/{repoId}?tenant_id=…` | One registration | `admin:read` |
+| DELETE | `/v1/repos/{repoId}?tenant_id=…` | Unregister (stops watch) | `admin:write` |
+| GET | `/v1/repos/{repoId}/codemap?tenant_id=…&format=summary\|full` | AST code map: `summary` = stats + per-crate rollup; `full` = files, symbols, deps, routes | `admin:read` |
+| POST | `/v1/workspace/scan` | Scan the daemon's own workspace (`CORECRUXD_WORKSPACE_PATH`) | `admin:read` |
+| GET | `/v1/workspace/scan` | Latest self-scan in full | `admin:read` |
+| GET | `/v1/workspace/storyline?format=tree\|json` | Per-route call trees from the self-scan | `admin:read` |
+
 ### Routing & Shards
 
 | Method | Path | Description | Auth Scope |

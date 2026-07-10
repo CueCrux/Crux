@@ -16,17 +16,27 @@ private memory, or handoff between agents.
 New to CoreCrux? Start here:
 
 ```
-1. get_bootstrap("patterns")
+1. get_bootstrap("patterns", token_budget=500)
    → Learn token reduction, scan-expand, fact memory, and session patterns.
 
 2. store_fact(entity="test", key="hello", value="world")
    → Store your first fact. Confirm you get a fact_id back.
 
-3. query_facts(query="hello")
+3. query_facts(query="hello", token_budget=500)
    → Retrieve it. You should see your fact with confidence=1.0.
 ```
 
+(Pass `token_budget` on every retrieval call, including these — it is the convention this
+guide teaches throughout.)
+
 That's it — you're connected and working. Read on for authentication, tool selection, and advanced patterns.
+
+This guide covers the core memory loop. The wider tool surface — constraints
+(`declare_constraint` / `check_constraints`), passports (`issue_passport`), `.cruxpack`
+portability, substrate entities/edges, the coordination board, and per-session token
+accounting (`session_token_usage`) — is catalogued in
+[`mcp-system-prompt.md`](mcp-system-prompt.md). From a shell, `corecruxctl start` is the
+canonical zero-to-first-loop on-ramp.
 
 ## Platform Availability and Onboarding
 

@@ -1,6 +1,6 @@
 # Contributing to Crux Daemon
 
-Thank you for your interest in contributing to CoreCrux.
+Thank you for your interest in contributing to Crux Daemon.
 
 ## Building from Source
 
