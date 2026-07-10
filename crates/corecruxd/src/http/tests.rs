@@ -17,6 +17,7 @@ use super::*;
 
 use crate::auth::AuthMode;
 use crate::shard_map::LoadedShardMap;
+use crate::test_support::EnvVarGuard;
 use axum::body::to_bytes;
 use corecrux_types::{
     compute_shard_map_v1_blake3_hex, format_u64_hex, HashRange, KnowledgeAuthorityModeV1, KnowledgeRolloutStageV1,
@@ -11195,6 +11196,95 @@ async fn repo_codemap_serves_summary_and_full() {
     .await
     .into_response();
     assert_eq!(bad_format.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn repo_codemap_summary_counts_external_deps_by_ecosystem() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let repo = tiny_rust_workspace();
+    let manifest = repo.path().join("mini/Cargo.toml");
+    let mut manifest_body = std::fs::read_to_string(&manifest).expect("read manifest");
+    manifest_body.push_str("\n[dependencies]\nserde = \"1\"\n");
+    std::fs::write(&manifest, manifest_body).expect("write manifest");
+    let root_path = repo.path().to_string_lossy().to_string();
+
+    let _env = EnvVarGuard::set("CORECRUXD_EXTERNAL_DEPS", "1");
+    let created = super::repos::post_repo(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        Json(super::repos::CreateRepoBody {
+            repo_id: Some("fixture-deps".to_string()),
+            tenant_id: "tenant-a".to_string(),
+            root_path: Some(root_path),
+            clone_url: None,
+            languages: vec!["rust".to_string()],
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(created.status(), StatusCode::OK);
+
+    let summary = super::repos::get_repo_codemap(
+        State(state),
+        Path("fixture-deps".to_string()),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::CodemapQuery {
+            tenant_id: "tenant-a".to_string(),
+            format: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(summary.status(), StatusCode::OK);
+    let summary_body = json_body(summary).await;
+    assert_eq!(summary_body["stats"]["external_dep_count"], 1);
+    assert_eq!(summary_body["external_deps_by_ecosystem"]["cargo"], 1);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn repo_codemap_summary_omits_external_deps_when_flag_off() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let repo = tiny_rust_workspace();
+    let manifest = repo.path().join("mini/Cargo.toml");
+    let mut manifest_body = std::fs::read_to_string(&manifest).expect("read manifest");
+    manifest_body.push_str("\n[dependencies]\nserde = \"1\"\n");
+    std::fs::write(&manifest, manifest_body).expect("write manifest");
+    let root_path = repo.path().to_string_lossy().to_string();
+
+    let _env = EnvVarGuard::unset("CORECRUXD_EXTERNAL_DEPS");
+    let created = super::repos::post_repo(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        Json(super::repos::CreateRepoBody {
+            repo_id: Some("fixture-deps-off".to_string()),
+            tenant_id: "tenant-a".to_string(),
+            root_path: Some(root_path),
+            clone_url: None,
+            languages: vec!["rust".to_string()],
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(created.status(), StatusCode::OK);
+
+    let summary = super::repos::get_repo_codemap(
+        State(state),
+        Path("fixture-deps-off".to_string()),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::CodemapQuery {
+            tenant_id: "tenant-a".to_string(),
+            format: Some("summary".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(summary.status(), StatusCode::OK);
+    let summary_body = json_body(summary).await;
+    assert!(summary_body.get("external_deps_by_ecosystem").is_none());
+    let stats = summary_body["stats"].as_object().expect("stats object");
+    assert!(!stats.contains_key("external_dep_count"));
 }
 
 #[tokio::test]

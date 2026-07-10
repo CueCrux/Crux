@@ -18,6 +18,8 @@ mod fact_helpers {
 mod workspace_scan;
 #[path = "../src/workspace_scan_ast.rs"]
 mod workspace_scan_ast;
+#[path = "../src/workspace_scan_manifests.rs"]
+mod workspace_scan_manifests;
 
 use workspace_scan::WorkspaceScan;
 

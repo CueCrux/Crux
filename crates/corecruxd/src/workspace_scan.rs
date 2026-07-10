@@ -28,6 +28,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
+use crate::workspace_scan_manifests::ExternalDep;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ScanError {
     #[error("workspace path not configured (CORECRUXD_WORKSPACE_PATH unset or empty)")]
@@ -62,6 +64,8 @@ pub struct WorkspaceScan {
     /// to resolve, etc.).
     #[serde(default, skip_serializing_if = "ScanDiagnostics::is_empty")]
     pub diagnostics: ScanDiagnostics,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_deps: Vec<ExternalDep>,
     pub stats: ScanStats,
 }
 
@@ -110,6 +114,8 @@ pub struct ScanStats {
     pub route_count: usize,
     #[serde(default)]
     pub file_reference_count: usize,
+    #[serde(default, skip_serializing_if = "usize_is_zero")]
+    pub external_dep_count: usize,
     /// Number of files with a `//!` header that produced a `doc_summary`.
     /// Denominator is `file_count`; the ratio is the workspace doc-coverage
     /// percentage. Surfaced in the console Story panel header.
@@ -121,6 +127,10 @@ pub struct ScanStats {
     /// .unresolved_routes` to surface those).
     #[serde(default)]
     pub routes_by_crate: std::collections::BTreeMap<String, usize>,
+}
+
+fn usize_is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -773,6 +783,7 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
         dead_code_count: scan.dead_code.len(),
         route_count,
         file_reference_count,
+        external_dep_count: scan.external_deps.len(),
         doc_coverage_files,
         routes_by_crate,
     };

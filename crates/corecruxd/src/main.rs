@@ -95,6 +95,8 @@ mod status_feed;
 mod storybook;
 mod structured_log;
 mod tenant_metadata;
+#[cfg(test)]
+mod test_support;
 mod update;
 mod usage_submit;
 #[cfg(feature = "wasm-extensions")]
@@ -108,6 +110,7 @@ mod work;
 mod work_execplans;
 mod workspace_scan;
 mod workspace_scan_ast;
+mod workspace_scan_manifests;
 mod workspace_scan_polyglot;
 
 use std::fs::{create_dir_all, OpenOptions};
