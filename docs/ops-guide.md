@@ -1,5 +1,44 @@
 # Operations Guide
 
+## Networked Deployment Auth Preflight
+
+Before exposing a Crux Daemon beyond the host, run the deploy audit in the
+same environment that will launch `corecruxd`:
+
+```bash
+corecruxctl deploy-audit --network-exposed
+```
+
+The command resolves `CORECRUXD_AUTH_MODE`, `CORECRUXD_HTTP_HOST`, and
+`CORECRUXD_GRPC_HOST` with the daemon's environment-over-YAML precedence. Use
+`--config /path/to/config.yaml` when auditing a config outside
+`CORECRUXD_CONFIG_PATH` / `$XDG_CONFIG_HOME/crux/config.yaml`. Explicit
+`--auth-mode`, `--http-bind`, and `--grpc-bind` overrides are available for
+rendered container or service-manager configuration. `--json` emits a report
+suitable for deployment logs.
+
+| Effective listeners / surface | `dev_scopes` (including the unset audit default) | `jwt_hs256` / `jwt_jwks` | `off` |
+|---|---|---|---|
+| Loopback (`127.0.0.0/8`, `::1`) or Unix socket | PASS (with proxy-exposure warning) | PASS | WARN (throwaway local development only) |
+| Non-loopback, enterprise/hosted mode, or `--network-exposed` | **FAIL** | PASS | **FAIL** |
+| Unclassifiable bind | WARN | PASS | WARN |
+
+`dev_scopes` trusts caller-provided scope headers and therefore disables the
+tenant guard at a network trust boundary. The audit exits non-zero for unsafe
+or invalid configurations; warnings remain zero-exit so operators can handle
+environment-specific uncertainty explicitly.
+`CORECRUXD_ALLOW_INSECURE_DEV_AUTH_BIND=1` is a daemon development escape hatch,
+not a deploy-audit waiver: network-exposed `dev_scopes` still fails this check.
+JWT secret/JWKS validity remains enforced by daemon startup; this assertion is
+specifically the required bind-by-auth-mode deployment gate.
+
+The daemon's public `/healthz`, `/readyz`, and redacted `/v1/version` responses
+do not report auth mode, so the audit does not try to infer it over HTTP. A
+loopback listener may still be exposed by a reverse proxy, container port
+publication, SSH tunnel, or service mesh; pass `--network-exposed` in those
+deployments. This operator preflight is intentionally not a CI gate because CI
+cannot know a target host's network topology.
+
 ## Incident Communications
 
 Paid-tenant incidents use the customer-facing template in
