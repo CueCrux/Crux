@@ -25,23 +25,23 @@ name = "crux_claude_hooks"
 path = "src/lib.rs"
 
 [dependencies]
-anyhow = "1.0.97"
-clap = { version = "4.5.20", features = ["derive"] }
-serde = { version = "1.0.218", features = ["derive"] }
-serde_json = "1.0.150"
-ureq = { version = "3.3.0", features = ["json"] }
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+ureq = { workspace = true, features = ["json"] }
 # code-intelligence M5: encode `code:<repo>:<path>` entities into the facts URL.
 # Already in the workspace lockfile (corecruxctl) — no new network fetch.
-urlencoding = "2.1"
-sha2 = "0.11"
+urlencoding = { workspace = true }
+sha2 = { workspace = true }
 # B4 file-modification ledger: content-address Edit/Write before/after for the
 # observe lane. Pinned to the workspace version already in Cargo.lock (corecruxd,
 # corecrux-storage, …) so this adds zero new network fetch / lockfile delta.
-blake3 = "1.8.5"
+blake3 = { workspace = true }
 crux-config-wizard = { path = "../crux-config-wizard" }
 
 [dev-dependencies]
-tempfile = "3.14.0"
+tempfile = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"

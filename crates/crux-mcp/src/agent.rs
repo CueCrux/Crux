@@ -10,6 +10,8 @@
 
 use std::env;
 
+use subtle::ConstantTimeEq;
+
 const MIN_AGENT_TOKEN_BYTES: usize = 32;
 const MAX_AGENT_TOKEN_BYTES: usize = 256;
 const MAX_AGENT_NAME_BYTES: usize = 64;
@@ -176,7 +178,7 @@ impl AgentRegistry {
         let hash: [u8; 32] = blake3::hash(token.as_bytes()).into();
         self.agents
             .iter()
-            .find(|agent| constant_time_eq(&agent.token_hash, &hash))
+            .find(|agent| bool::from(agent.token_hash.ct_eq(&hash)))
     }
 
     /// Returns `true` if no agents are registered (single-user mode).
@@ -203,10 +205,6 @@ fn is_safe_agent_token(token: &str) -> bool {
         && token
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'~' | b'-'))
-}
-
-fn constant_time_eq<const N: usize>(left: &[u8; N], right: &[u8; N]) -> bool {
-    left.iter().zip(right.iter()).fold(0_u8, |diff, (a, b)| diff | (a ^ b)) == 0
 }
 
 #[cfg(test)]

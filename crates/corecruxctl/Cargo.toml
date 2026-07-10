@@ -7,39 +7,39 @@ license.workspace = true
 build = "build.rs"
 
 [dependencies]
-base64 = "0.22.1"
-blake3 = "1.8.5"
-clap = { version = "4.6.1", features = ["derive"] }
-chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
-ciborium = "0.2.2"
-crc32c = "0.6.8"
-ed25519-dalek = { version = "2.2.0", features = ["std"] }
-fs2 = "0.4.3"
+base64 = { workspace = true }
+blake3 = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+chrono = { workspace = true, default-features = false, features = ["clock"] }
+ciborium = { workspace = true }
+crc32c = { workspace = true }
+ed25519-dalek = { workspace = true, features = ["std"] }
+fs2 = { workspace = true }
 postgres = "0.19.10"
-serde = { version = "1.0.218", features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
 # Code-intelligence chain extractor (code-health trace, M4). Already in the
 # workspace lockfile as a transitive dep — no new network fetch.
-syn = { version = "2.0.117", features = ["full", "visit"] }
-thiserror = "2.0.12"
-hex = "0.4.3"
-serde_json = "1.0.150"
-serde_yaml = "0.9.34"
-tempfile = "3.16.0"
-tokio = { version = "1.52.3", features = ["net", "rt", "time"] }
-tonic = { version = "0.14.6", features = ["transport"] }
-ureq = { version = "3.3.0", features = ["json"] }
-url = "2.5.7"
-urlencoding = "2.1"
-uuid = { version = "1.23.2", features = ["v4"] }
-xxhash-rust = { version = "0.8.10", features = ["xxh64"] }
-zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
-rand = "0.10.1"
-sha2 = "0.11"
+syn = { workspace = true, features = ["full", "visit"] }
+thiserror = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt", "time"] }
+tonic = { workspace = true, features = ["transport"] }
+ureq = { workspace = true, features = ["json"] }
+url = { workspace = true }
+urlencoding = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+xxhash-rust = { workspace = true, features = ["xxh64"] }
+zip = { workspace = true, default-features = false, features = ["deflate-flate2"] }
+rand = { workspace = true }
+sha2 = { workspace = true }
 
 # C2PA X.509 verifier surface (corecruxctl c2pa-verify, c2pa-cert-status,
 # c2pa-rotate-leaf — agent-ux-07 M6). Matches the versions in corecrux-receipts.
-p256 = { version = "0.13.2", default-features = false, features = ["std", "ecdsa", "pem"] }
-x509-cert = { version = "0.2.5", default-features = false, features = ["std", "pem"] }
+p256 = { workspace = true, default-features = false, features = ["std", "ecdsa", "pem"] }
+x509-cert = { workspace = true, default-features = false, features = ["std", "pem"] }
 
 corecrux-frame = { path = "../corecrux-frame" }
 corecrux-index = { path = "../corecrux-index" }
@@ -58,11 +58,11 @@ crux-session = { path = "../crux-session" }
 default = []
 
 [build-dependencies]
-anyhow = "1.0.97"
+anyhow = { workspace = true }
 
 [dev-dependencies]
-serial_test = "3"
-rcgen = { version = "0.14.8", features = ["x509-parser"] }
+serial_test = { workspace = true }
+rcgen = { workspace = true, features = ["x509-parser"] }
 
 [lints]
 workspace = true

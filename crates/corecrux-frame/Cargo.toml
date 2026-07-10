@@ -6,12 +6,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-blake3 = "1.8.5"
-thiserror = "2.0.12"
-xxhash-rust = { version = "0.8.12", features = ["xxh64"] }
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+xxhash-rust = { workspace = true, features = ["xxh64"] }
 
 [dev-dependencies]
-hex = "0.4.3"
+hex = { workspace = true }
 
 
 [lints]
