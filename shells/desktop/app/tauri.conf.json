@@ -1,0 +1,30 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Crux",
+  "version": "0.5.34",
+  "identifier": "com.cuecrux.crux",
+  "build": {
+    "frontendDist": "./dist"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "DeveloperTool",
+    "shortDescription": "Crux desktop shell",
+    "longDescription": "Crux desktop shell — a native window hosting the corecruxd console, served by a bundled loopback sidecar.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "externalBin": ["binaries/corecruxd"]
+  }
+}

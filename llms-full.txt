@@ -1606,6 +1606,13 @@ visibility are MCP-only features.
 |--------|------|-------------|------------|
 | POST | `/v1/credits/spend` | Default-off comped-wallet spend rail. Requires `CORECRUXD_CREDIT_METER=1`; consumes a pinned quote, reserves/spends seeded credits idempotently, and returns a signed `crux.credit_spend_receipt.v1`. Does not mint fiat credits or call Paddle. | `admin:write` |
 
+When `CORECRUXD_CREDIT_METER=1`, successful RCX-verified `POST /v1/gpu1/rerank`
+calls also reserve and spend 3 comped-wallet credits. The pinned
+`crux.credit_quote.v1` rides at `options.credit_quote`; the
+`crux.gpu1.compute_response.v1` envelope adds `credit_spend_receipt`,
+`credits_spent`, and `wallet_balance`. Failed/degraded compute releases the
+reservation and emits no spend stamp.
+
 ### Replay Exports
 
 | Method | Path | Description | Auth Scope |
@@ -3639,7 +3646,9 @@ signal unless you set an `https://` collector endpoint *and* record consent. See
 
 Credit Meter is also **opt-in and off by default**. `CORECRUXD_CREDIT_METER=1` enables only the
 seeded comped-wallet spend rail for pinned quotes and signed spend receipts; fiat minting, Paddle,
-and production billing remain separately gated.
+and production billing remain separately gated. The same flag meters successful RCX-verified
+`/v1/gpu1/rerank` compute: callers carry the pinned quote in `options.credit_quote`, and the result
+adds the spend receipt id, credits spent, and post-spend wallet balance.
 
 </details>
 

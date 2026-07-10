@@ -1,0 +1,23 @@
+# Crux desktop shell — sidecar lifecycle crate.
+#
+# This crate is deliberately:
+#   * detached from the parent daemon workspace (its own [workspace] table), and
+#   * dependency-free (std only — not even tokio),
+# so it compiles and unit-tests on ANY host, including the webkit-less WSL dev
+# box where the Tauri app crate (shells/desktop/app) cannot be built.
+[package]
+name = "crux-shell-lifecycle"
+version = "0.5.34"
+edition = "2021"
+rust-version = "1.88.0"
+license = "LicenseRef-CCL-1.0"
+publish = false
+description = "std-only supervisor for the corecruxd sidecar behind the Crux desktop shell."
+
+# Own workspace root so root Cargo.toml's members/lints/profiles do not apply and
+# this crate resolves standalone from `shells/desktop/lifecycle/Cargo.toml`.
+[workspace]
+
+[lib]
+name = "crux_shell_lifecycle"
+path = "src/lib.rs"

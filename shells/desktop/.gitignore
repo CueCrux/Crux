@@ -1,0 +1,13 @@
+# Build outputs and generated artifacts for the desktop shell crates.
+# The lifecycle crate and the Tauri app each have their own workspace, so each
+# grows its own target/. None of this belongs in source control.
+**/target/
+
+# Tauri-generated files (schemas, capability gen) and the staged sidecar binary
+# copied in by CI before the compile/bundle step.
+app/gen/
+app/binaries/
+
+# Generated icon set — produced by `cargo tauri icon` (see README); the source
+# art lives in crates/corecruxd/console/assets/.
+app/icons/

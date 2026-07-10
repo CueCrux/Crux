@@ -27,6 +27,32 @@ const ACTIVITY_HTML: &str = include_str!("../console/activity.html");
 // the right column is a clearly-labelled static mock of a typical vendor
 // console. No external runtime deps, same posture as the console shell.
 const RECEIPTS_VS_CONSOLE_HTML: &str = include_str!("../console/receipts-vs-console.html");
+// Unified Shell Console v2 (ExecPlan unified-shell-console-2026-07-03, M0). A
+// self-contained, no-build shell embedded alongside the legacy console and
+// selected at `/console` when `CORECRUXD_CONSOLE_V2` is truthy. With the flag
+// off/unset/garbage the `/console` body stays byte-identical to today's console
+// (see `resolve_console_body`). Same embedded, no-on-disk-dependency posture as
+// the sibling `activity.html` / `console-3d/*` assets.
+const CONSOLE_V2_HTML: &str = include_str!("../console/v2/shell.html");
+// Unified Shell Console v2 — no-build module split (M1). The shell references
+// these same-origin at `/console-v2/pages.js` / `/console-v2/render.js`. Same
+// embedded, dev-overridable posture as the shell itself. `pages.js` is the
+// ported 26-page registry; `render.js` is the DSL renderer.
+const CONSOLE_V2_PAGES_JS: &str = include_str!("../console/v2/pages.js");
+const CONSOLE_V2_RENDER_JS: &str = include_str!("../console/v2/render.js");
+// Generated read-only fetch client (M2): produced from the ROUTES manifest by
+// `cargo test -p corecruxd --test route_spec_drift -- --ignored regen_api_js`.
+// GET routes only — the customer-safe posture holds at the client layer too.
+const CONSOLE_V2_API_JS: &str = include_str!("../console/v2/api.js");
+// PWA app-shell assets (M5). Served same-origin at `/console-v2/{name}` alongside
+// the JS modules. `sw.js` is the app-shell service worker (never caches `/v1/*`);
+// `manifest.webmanifest` is the install manifest; `icon.svg` is the app icon.
+// `sw.js` is served with `Service-Worker-Allowed: /console` so a script under
+// `/console-v2/` may control the `/console` scope (see `serve_console_v2_asset`).
+const CONSOLE_V2_SW_JS: &str = include_str!("../console/v2/sw.js");
+const CONSOLE_V2_MANIFEST: &str = include_str!("../console/v2/manifest.webmanifest");
+const CONSOLE_V2_ICON_SVG: &str = include_str!("../console/v2/icon.svg");
+const CONSOLE_V2_ENV: &str = "CORECRUXD_CONSOLE_V2";
 // Code-structure graph view (ExecPlan ast-polyglot-code-graph-and-repo-watch-2026-07-08,
 // M8). A self-contained page served at `/console/codegraph` that renders the real
 // typed code+claim graph from `/v1/projects/{id}/context-graph`. Reuses the console
@@ -61,7 +87,7 @@ fn embedded_asset(name: &str) -> Option<&'static [u8]> {
 }
 
 async fn serve_console() -> impl IntoResponse {
-    Html(resolve_console_html().into_owned())
+    Html(resolve_console_body().into_owned())
 }
 
 /// Activity log human-lane page (M3), served at `/console/activity`. A dev
@@ -114,6 +140,82 @@ async fn serve_codegraph() -> impl IntoResponse {
 
 async fn redirect_to_console() -> impl IntoResponse {
     Redirect::to("/console")
+}
+
+/// `/console/legacy` — the legacy console served unconditionally (the same body
+/// `/console` serves when `CORECRUXD_CONSOLE_V2` is off). Deep-machinery
+/// fallbacks in the v2 shell (e.g. the Workbench card) link here so the full Pro
+/// console stays reachable even while v2 is the default surface.
+///
+/// DEPRECATED (retired 2026-07-03, ExecPlan `unified-shell-console-2026-07-03`,
+/// M10). The unified v2 shell is now THE console surface; this legacy body is
+/// retained only as a fallback for deep-machinery links (the Pro workbench) and
+/// as the flag-off byte-parity baseline. It is not the forward-facing surface
+/// and gains no new features — treat it as frozen. Do not build against it; new
+/// work lands in `crates/corecruxd/console/v2/`. (Comment-only marker: the
+/// flag-off byte-parity test asserts the served body is unchanged.)
+async fn serve_console_legacy() -> impl IntoResponse {
+    Html(resolve_console_html().into_owned())
+}
+
+/// Embedded v2 module + PWA assets (`pages.js`, `render.js`, `api.js`, plus the
+/// M5 `sw.js` / `manifest.webmanifest` / `icon.svg`), served same-origin at
+/// `/console-v2/{name}`. A dev override (`CORECRUXD_CONSOLE_DEV_PATH`) reads
+/// `v2/<name>` next to the console index so the assets can be iterated without a
+/// rebuild — same resolve-then-rewrite pattern as the shell override.
+async fn serve_console_v2_asset(AxumPath(name): AxumPath<String>) -> Response {
+    // Single path segment; be paranoid about traversal anyway.
+    if name.contains('/') || name.contains("..") {
+        return (axum::http::StatusCode::BAD_REQUEST, "invalid asset name").into_response();
+    }
+    // (embedded body, content-type). The three JS modules keep `text/javascript`;
+    // the PWA assets carry their own content-types. `sw.js` additionally gets a
+    // `Service-Worker-Allowed: /console` header in `console_v2_asset_response`.
+    let (embedded, content_type): (&'static str, &'static str) = match name.as_str() {
+        "pages.js" => (CONSOLE_V2_PAGES_JS, "text/javascript; charset=utf-8"),
+        "render.js" => (CONSOLE_V2_RENDER_JS, "text/javascript; charset=utf-8"),
+        "api.js" => (CONSOLE_V2_API_JS, "text/javascript; charset=utf-8"),
+        "sw.js" => (CONSOLE_V2_SW_JS, "application/javascript; charset=utf-8"),
+        "manifest.webmanifest" => (CONSOLE_V2_MANIFEST, "application/manifest+json; charset=utf-8"),
+        "icon.svg" => (CONSOLE_V2_ICON_SVG, "image/svg+xml; charset=utf-8"),
+        _ => return (axum::http::StatusCode::NOT_FOUND, "no such console-v2 asset").into_response(),
+    };
+    // Dev override wins when present.
+    let body = console_v2_dev_asset(&name).unwrap_or_else(|| embedded.to_string());
+    console_v2_asset_response(&name, content_type, body)
+}
+
+/// Read `v2/<name>` under the `CORECRUXD_CONSOLE_DEV_PATH` dir, if set + readable.
+fn console_v2_dev_asset(name: &str) -> Option<String> {
+    let raw = std::env::var(CONSOLE_DEV_PATH_ENV).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let file_path = resolve_dev_html_path(Path::new(trimmed))
+        .with_file_name("v2")
+        .join(name);
+    std::fs::read_to_string(&file_path).ok()
+}
+
+fn console_v2_asset_response(name: &str, content_type: &'static str, body: String) -> Response {
+    let mut resp = (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
+        .into_response();
+    // The service-worker script lives under `/console-v2/`, but it registers for
+    // the `/console` scope; without this header the browser rejects that scope.
+    if name == "sw.js" {
+        resp.headers_mut().insert(
+            header::HeaderName::from_static("service-worker-allowed"),
+            header::HeaderValue::from_static("/console"),
+        );
+    }
+    resp
 }
 
 async fn serve_console_asset(AxumPath(name): AxumPath<String>) -> Response {
@@ -196,10 +298,12 @@ pub fn routes(enabled: bool) -> Router {
     Router::new()
         .route("/", get(redirect_to_console))
         .route("/console", get(serve_console))
+        .route("/console/legacy", get(serve_console_legacy))
         .route("/console/activity", get(serve_activity))
         .route("/console/receipts-vs-console", get(serve_receipts_vs_console))
         .route("/console/codegraph", get(serve_codegraph))
         .route("/console-assets/{name}", get(serve_console_asset))
+        .route("/console-v2/{name}", get(serve_console_v2_asset))
         .route("/console-3d/{*path}", get(serve_console3d))
         // Device-grant approval page (ExecPlan crux-unified-login-rails, M3).
         .route("/activate", get(serve_activate))
@@ -392,6 +496,73 @@ loadTenants();
 </body>
 </html>"#;
 
+/// The `/console` body: v2 shell when `CORECRUXD_CONSOLE_V2` is truthy, else the
+/// legacy console. Flag off/unset/garbage ⇒ byte-identical to today (M0 gate).
+fn resolve_console_body() -> Cow<'static, str> {
+    if console_v2_enabled() {
+        match console_v2_dev_override() {
+            Some(html) => Cow::Owned(inject_console_dev_flag(html)),
+            None => Cow::Borrowed(CONSOLE_V2_HTML),
+        }
+    } else {
+        resolve_console_html()
+    }
+}
+
+/// Dev-only marker: stamp the shell so the client skips PWA service-worker
+/// registration (and tears down any existing worker + its caches). This ONLY
+/// runs on the `console_v2_dev_override` path — i.e. when the shell is being
+/// hot-served from `CORECRUXD_CONSOLE_DEV_PATH` — so an edit under the dev dir
+/// shows on a plain refresh instead of being shadowed by a cached shell. The
+/// embedded (production) `CONSOLE_V2_HTML` never passes through here, so the
+/// shipped console keeps its service worker byte-for-byte.
+fn inject_console_dev_flag(html: String) -> String {
+    const MARK: &str = "<script>window.__CRUX_CONSOLE_DEV__=1;</script>";
+    if html.contains(MARK) {
+        html
+    } else if html.contains("<head>") {
+        html.replacen("<head>", &format!("<head>{MARK}"), 1)
+    } else {
+        format!("{MARK}{html}")
+    }
+}
+
+/// `CORECRUXD_CONSOLE_V2` flag: trimmed, case-insensitive; truthy = 1/true/on.
+/// Anything else (including unset, empty, or garbage) is off.
+fn console_v2_enabled() -> bool {
+    std::env::var(CONSOLE_V2_ENV).is_ok_and(|raw| {
+        let value = raw.trim().to_ascii_lowercase();
+        matches!(value.as_str(), "1" | "true" | "on")
+    })
+}
+
+/// Dev override for the v2 shell: reads `v2/shell.html` relative to the
+/// `CORECRUXD_CONSOLE_DEV_PATH` dir (same resolve-then-rewrite pattern as the
+/// sibling `activity.html` override) so the shell can be iterated without a
+/// rebuild. Unreadable/unset ⇒ fall back to the embedded `CONSOLE_V2_HTML`.
+fn console_v2_dev_override() -> Option<String> {
+    let raw = std::env::var(CONSOLE_DEV_PATH_ENV).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let html_path = resolve_dev_html_path(Path::new(trimmed))
+        .with_file_name("v2")
+        .join("shell.html");
+    match std::fs::read_to_string(&html_path) {
+        Ok(contents) => Some(contents),
+        Err(err) => {
+            tracing::warn!(
+                target: "corecruxd::console",
+                path = %html_path.display(),
+                error = %err,
+                "console v2 dev override unreadable; falling back to embedded HTML"
+            );
+            None
+        }
+    }
+}
+
 fn resolve_console_html() -> Cow<'static, str> {
     match dev_html_override() {
         Some(html) => Cow::Owned(html),
@@ -430,11 +601,20 @@ fn resolve_dev_html_path(base: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{dev_html_override, resolve_console_html, CONSOLE_DEV_PATH_ENV, CONSOLE_HTML};
+    use super::{
+        dev_html_override, resolve_console_body, resolve_console_html, CONSOLE_DEV_PATH_ENV, CONSOLE_HTML,
+        CONSOLE_V2_API_JS, CONSOLE_V2_ENV, CONSOLE_V2_HTML, CONSOLE_V2_ICON_SVG, CONSOLE_V2_MANIFEST,
+        CONSOLE_V2_PAGES_JS, CONSOLE_V2_RENDER_JS, CONSOLE_V2_SW_JS,
+    };
     use std::sync::Mutex;
 
-    // The dev-path env var is process-global; serialise tests that mutate it.
+    // The dev-path / v2 flag env vars are process-global; serialise tests that
+    // mutate either of them. Recover a poisoned lock so one failing env test
+    // does not cascade into the others.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
 
     #[test]
     fn console_asset_budget_stays_lightweight() {
@@ -616,7 +796,7 @@ mod tests {
 
     #[test]
     fn dev_override_unset_returns_embedded_html() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         std::env::remove_var(CONSOLE_DEV_PATH_ENV);
         let html = resolve_console_html();
         assert_eq!(&*html, CONSOLE_HTML);
@@ -624,7 +804,7 @@ mod tests {
 
     #[test]
     fn dev_override_reads_file_when_path_set() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
@@ -643,10 +823,381 @@ mod tests {
 
     #[test]
     fn dev_override_falls_back_when_path_unreadable() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         std::env::set_var(CONSOLE_DEV_PATH_ENV, "/this/path/does/not/exist/index.html");
         let result = dev_html_override();
         std::env::remove_var(CONSOLE_DEV_PATH_ENV);
         assert!(result.is_none(), "missing dev path should fall back to embedded HTML");
+    }
+
+    // ---- Unified Shell Console v2 flag (M0) --------------------------------
+
+    #[test]
+    fn console_v2_flag_unset_serves_legacy_body_byte_identical() {
+        let _guard = env_lock();
+        std::env::remove_var(CONSOLE_DEV_PATH_ENV);
+        std::env::remove_var(CONSOLE_V2_ENV);
+        let body = resolve_console_body();
+        // M0 gate: flag off ⇒ /console body is exactly today's console.
+        assert_eq!(&*body, CONSOLE_HTML);
+    }
+
+    #[test]
+    fn console_v2_flag_truthy_serves_v2_shell() {
+        let _guard = env_lock();
+        std::env::remove_var(CONSOLE_DEV_PATH_ENV);
+        for truthy in ["1", "TRUE", "on", " True ", "ON"] {
+            std::env::set_var(CONSOLE_V2_ENV, truthy);
+            let body = resolve_console_body();
+            assert_eq!(&*body, CONSOLE_V2_HTML, "flag {truthy:?} should serve the v2 shell");
+        }
+        std::env::remove_var(CONSOLE_V2_ENV);
+    }
+
+    #[test]
+    fn console_v2_flag_falsey_or_garbage_serves_legacy_body() {
+        let _guard = env_lock();
+        std::env::remove_var(CONSOLE_DEV_PATH_ENV);
+        for falsey in ["0", "junk", "", "   ", "off", "false", "2", "yes"] {
+            std::env::set_var(CONSOLE_V2_ENV, falsey);
+            let body = resolve_console_body();
+            assert_eq!(&*body, CONSOLE_HTML, "flag {falsey:?} should serve the legacy console");
+        }
+        std::env::remove_var(CONSOLE_V2_ENV);
+    }
+
+    #[test]
+    fn console_v2_shell_has_licence_header_and_no_external_runtime_deps() {
+        // CCL licence header carried in the leading HTML comment.
+        assert!(
+            CONSOLE_V2_HTML.contains("CueCrux Community Licence (CCL v1.0)"),
+            "v2 shell must carry the CCL licence header"
+        );
+        // Same no-external-runtime-deps posture as the console shell.
+        for blocked in [
+            r#"<script src="http"#,
+            r#"<link rel="stylesheet" href="http"#,
+            r#"<iframe src="http"#,
+            "unpkg.com",
+            "jsdelivr.net",
+            "cdnjs.cloudflare",
+            "cdn.jsdelivr",
+            "fonts.googleapis",
+        ] {
+            assert!(
+                !CONSOLE_V2_HTML.contains(blocked),
+                "v2 shell has external runtime dependency: {blocked}"
+            );
+        }
+        // Same-origin plan-driven boot + a11y guardrails are present.
+        for required in [
+            "/v1/console/summary",
+            "/v1/version",
+            "crux.console.theme",
+            "data-requires=\"operator\"",
+            "prefers-reduced-motion",
+            "focus-visible",
+            // M5 PWA + phone tier.
+            "rel=\"manifest\"",
+            "/console-v2/manifest.webmanifest",
+            "name=\"theme-color\"",
+            "serviceWorker.register('/console-v2/sw.js",
+            "id=\"tabbar\"",
+            "SW_REV",
+            "safe-area-inset",
+            "min-height: 44px",
+        ] {
+            assert!(
+                CONSOLE_V2_HTML.contains(required),
+                "v2 shell missing expected marker: {required}"
+            );
+        }
+        // The module split is wired: the shell loads the same-origin modules
+        // (api.js first — pages/render read window.CruxApi).
+        for required in ["/console-v2/api.js", "/console-v2/pages.js", "/console-v2/render.js"] {
+            assert!(
+                CONSOLE_V2_HTML.contains(required),
+                "v2 shell must load the module: {required}"
+            );
+        }
+    }
+
+    // ---- Unified Shell Console v2 modules (M1) -----------------------------
+
+    #[test]
+    fn console_v2_modules_carry_licence_and_no_external_runtime_deps() {
+        // Every v2 file keeps the CCL header + the no-external-runtime-deps posture.
+        for (name, body) in [
+            ("pages.js", CONSOLE_V2_PAGES_JS),
+            ("render.js", CONSOLE_V2_RENDER_JS),
+            ("api.js", CONSOLE_V2_API_JS),
+        ] {
+            assert!(
+                body.contains("CueCrux Community Licence (CCL v1.0)"),
+                "{name} must carry the CCL licence header"
+            );
+            // Block remote loaders + CDN hosts. Bare http(s) literals are NOT
+            // blocked — the embedding-endpoint placeholder (`http://localhost:…`)
+            // is display text, not a runtime dependency (same as the legacy console).
+            for blocked in [
+                "src=\"http",
+                "from \"http",
+                "from 'http",
+                "import(\"http",
+                "import('http",
+                "unpkg.com",
+                "jsdelivr.net",
+                "cdnjs.cloudflare",
+                "cdn.jsdelivr",
+                "fonts.googleapis",
+            ] {
+                assert!(
+                    !body.contains(blocked),
+                    "{name} has an external runtime dependency marker: {blocked}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn console_v2_modules_expose_the_expected_surface() {
+        // pages.js carries all 26 legacy ids + the mutating-action gate list.
+        for id in [
+            "cx-overview",
+            "cx-activity",
+            "cx-cost",
+            "cx-projects",
+            "cx-work",
+            "cx-usage",
+            "cx-documents",
+            "cx-gates",
+            "cx-review",
+            "cx-coord",
+            "cx-sessions",
+            "cx-orchestrators",
+            "cx-punchcards",
+            "cx-passport",
+            "cx-identity",
+            "cx-receipts",
+            "cx-mediation",
+            "cx-workbench",
+            "cx-integrations",
+            "cx-extensions",
+            "cx-facts",
+            "cx-memory",
+            "cx-tenants",
+            "cx-lane-weights",
+            "cx-settings",
+            "cx-raw",
+        ] {
+            assert!(CONSOLE_V2_PAGES_JS.contains(id), "pages.js missing legacy id: {id}");
+        }
+        assert!(
+            CONSOLE_V2_PAGES_JS.contains("MUTATING_ACTIONS"),
+            "pages.js must expose MUTATING_ACTIONS as the posture-gate source of truth"
+        );
+        // render.js implements the DSL control types + the posture gate.
+        for required in ["CONTROL_TYPES", "applyMutationGate", "wired in M3+", "data-requires"] {
+            assert!(
+                CONSOLE_V2_RENDER_JS.contains(required),
+                "render.js missing expected marker: {required}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn console_legacy_route_serves_the_legacy_console() {
+        use tower::ServiceExt;
+        let _guard = env_lock();
+        std::env::remove_var(CONSOLE_DEV_PATH_ENV);
+        std::env::set_var(CONSOLE_V2_ENV, "1"); // even with v2 on, /console/legacy is the old console
+        let resp = super::routes(true)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/console/legacy")
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router response");
+        std::env::remove_var(CONSOLE_V2_ENV);
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        assert_eq!(String::from_utf8(bytes.to_vec()).expect("utf8 body"), CONSOLE_HTML);
+    }
+
+    #[tokio::test]
+    async fn console_v2_asset_route_serves_the_modules() {
+        use tower::ServiceExt;
+        let _guard = env_lock();
+        std::env::remove_var(CONSOLE_DEV_PATH_ENV);
+        for (uri, needle) in [
+            ("/console-v2/pages.js", "MUTATING_ACTIONS"),
+            ("/console-v2/render.js", "CONTROL_TYPES"),
+        ] {
+            let resp = super::routes(true)
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .expect("build request"),
+                )
+                .await
+                .expect("router response");
+            assert_eq!(resp.status(), axum::http::StatusCode::OK, "{uri} should be served");
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            assert!(
+                String::from_utf8(bytes.to_vec()).expect("utf8 body").contains(needle),
+                "{uri} body should contain {needle}"
+            );
+        }
+    }
+
+    // ---- Unified Shell Console v2 PWA + phone tier (M5) --------------------
+
+    /// Pull the `SW_REV = '<value>'` literal from a source string (matches both
+    /// `const SW_REV = '…'` in sw.js and `var SW_REV = '…'` in shell.html).
+    fn sw_rev(src: &str) -> Option<&str> {
+        let marker = "SW_REV = '";
+        let start = src.find(marker)? + marker.len();
+        let rest = &src[start..];
+        let end = rest.find('\'')?;
+        Some(&rest[..end])
+    }
+
+    #[test]
+    fn console_v2_pwa_assets_carry_licence_and_markers() {
+        // sw.js + icon.svg can carry the CCL header as a comment; assert it plus
+        // their structural markers. (manifest.webmanifest is pure JSON — no
+        // comments — so its header is intentionally absent; markers checked below.)
+        for (name, body) in [("sw.js", CONSOLE_V2_SW_JS), ("icon.svg", CONSOLE_V2_ICON_SVG)] {
+            assert!(
+                body.contains("CueCrux Community Licence (CCL v1.0)"),
+                "{name} must carry the CCL licence header"
+            );
+        }
+        for required in [
+            "const SW_REV",
+            "const CACHE_NAME",
+            "const APP_SHELL",
+            "addEventListener('fetch'",
+            "/v1/",
+        ] {
+            assert!(CONSOLE_V2_SW_JS.contains(required), "sw.js missing marker: {required}");
+        }
+        for required in ["viewBox=\"0 0 512 512\"", "#060A12", "Crux Console"] {
+            assert!(
+                CONSOLE_V2_ICON_SVG.contains(required),
+                "icon.svg missing marker: {required}"
+            );
+        }
+        for required in [
+            "\"name\"",
+            "\"Crux Console\"",
+            "\"start_url\"",
+            "\"/console\"",
+            "\"standalone\"",
+            "\"icons\"",
+        ] {
+            assert!(
+                CONSOLE_V2_MANIFEST.contains(required),
+                "manifest missing marker: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn console_v2_sw_rev_matches_shell() {
+        // Bump-together discipline: the no-build cache key lives in two files; a
+        // drift between them means the cache never invalidates. Assert equality.
+        let sw = sw_rev(CONSOLE_V2_SW_JS).expect("sw.js SW_REV literal");
+        let shell = sw_rev(CONSOLE_V2_HTML).expect("shell.html SW_REV literal");
+        assert_eq!(
+            sw, shell,
+            "sw.js and shell.html SW_REV must be bumped together (sw={sw} shell={shell})"
+        );
+    }
+
+    #[test]
+    fn console_v2_sw_never_caches_control_plane() {
+        // Compliance invariant: /v1/* is network-only, never cached. The SW must
+        // bypass it, and no cache write (addAll / .put) may target a /v1/ path.
+        assert!(
+            CONSOLE_V2_SW_JS.contains("startsWith('/v1/')"),
+            "sw.js must bypass /v1/ (network-only passthrough)"
+        );
+        for line in CONSOLE_V2_SW_JS.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue; // comments may legitimately mention /v1/ and cache.put
+            }
+            let is_cache_write = trimmed.contains("addAll(") || trimmed.contains(".put(");
+            assert!(
+                !(is_cache_write && trimmed.contains("/v1/")),
+                "sw.js must never cache a /v1/ path: {line}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn console_v2_pwa_asset_routes_serve_with_content_types() {
+        use tower::ServiceExt;
+        let _guard = env_lock();
+        std::env::remove_var(CONSOLE_DEV_PATH_ENV);
+        for (uri, content_type, needle) in [
+            (
+                "/console-v2/sw.js",
+                "application/javascript; charset=utf-8",
+                "APP_SHELL",
+            ),
+            (
+                "/console-v2/manifest.webmanifest",
+                "application/manifest+json; charset=utf-8",
+                "\"standalone\"",
+            ),
+            ("/console-v2/icon.svg", "image/svg+xml; charset=utf-8", "<svg"),
+        ] {
+            let resp = super::routes(true)
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .expect("build request"),
+                )
+                .await
+                .expect("router response");
+            assert_eq!(resp.status(), axum::http::StatusCode::OK, "{uri} should be served");
+            assert_eq!(
+                resp.headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some(content_type),
+                "{uri} should carry content-type {content_type}"
+            );
+            // The service worker needs the scope-widening header.
+            if uri.ends_with("sw.js") {
+                assert_eq!(
+                    resp.headers()
+                        .get("service-worker-allowed")
+                        .and_then(|v| v.to_str().ok()),
+                    Some("/console"),
+                    "sw.js must be served with Service-Worker-Allowed: /console"
+                );
+            }
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            assert!(
+                String::from_utf8(bytes.to_vec()).expect("utf8 body").contains(needle),
+                "{uri} body should contain {needle}"
+            );
+        }
     }
 }

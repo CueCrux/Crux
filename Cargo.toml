@@ -29,6 +29,12 @@ members = [
   "crates/crux-claude-hooks",
   "crates/crux-integration-tests",
 ]
+# The desktop shell crates (Tauri app + std-only lifecycle supervisor) live
+# in-tree per OD-31 but are EXCLUDED from the daemon workspace: the app pulls the
+# webkit2gtk/tauri stack that cannot build on the CI/self-hosted/WSL toolchains,
+# and each shell crate carries its own [workspace] table. Built separately via
+# .github/workflows/desktop-shell.yml.
+exclude = ["shells/desktop/lifecycle", "shells/desktop/app"]
 resolver = "2"
 
 [workspace.package]

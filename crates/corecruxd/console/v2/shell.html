@@ -1,0 +1,3004 @@
+<!DOCTYPE html>
+<!-- Copyright (c) 2026 CueCrux Ltd. All rights reserved. Licensed under the CueCrux Community Licence (CCL v1.0). -->
+<!-- Unified Shell Console v2 — M0 scaffold (ExecPlan unified-shell-console-2026-07-03).
+     One embedded, no-build SPA shell: 5 destinations (Overwatch · Work · Memory ·
+     Trust · Meters) + a System group, a token-registry theme system (Glass/Dark/
+     Light), plan-driven boot off same-origin GET /v1/version + /v1/console/summary.
+     Self-contained: no external requests of any kind (strict-CSP assumption),
+     vanilla JS, inline SVG icons. Served at /console when CORECRUXD_CONSOLE_V2 is
+     truthy; the legacy console is untouched when the flag is off. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Crux Console — Unified Shell</title>
+<!-- PWA install surface (M5). Same-origin, no external requests. theme-color +
+     background use the Glass theme --bg (#060A12). The service worker is registered
+     from a small script at the end of <body> (feature-detected, secure-context only). -->
+<link rel="manifest" href="/console-v2/manifest.webmanifest">
+<meta name="theme-color" content="#060A12">
+<link rel="icon" type="image/svg+xml" href="/console-v2/icon.svg">
+<link rel="apple-touch-icon" href="/console-assets/CueCrux-Arc-Loop-White.png">
+<!-- Apply the persisted theme before first paint to avoid a flash. Mirrors the
+     THEMES registry below; unknown/absent value falls back to the default. -->
+<script>
+  (function () {
+    try {
+      var allowed = { glass: 1, dark: 1, light: 1 };
+      var t = localStorage.getItem('crux.console.theme');
+      document.documentElement.setAttribute('data-theme', allowed[t] ? t : 'glass');
+    } catch (e) {
+      document.documentElement.setAttribute('data-theme', 'glass');
+    }
+    // Apply the persisted rail state before first paint too (icon-only vs full
+    // rail) so the grid width doesn't jump on load. Mirrors crux.console.rail.
+    try {
+      document.documentElement.setAttribute(
+        'data-rail', localStorage.getItem('crux.console.rail') === 'collapsed' ? 'collapsed' : 'open');
+    } catch (e) {
+      document.documentElement.setAttribute('data-rail', 'open');
+    }
+    // Apply the persisted presentation mode (Standard | Professional | Documents)
+    // before first paint so Pro density / the reader layout don't flash. Mirrors
+    // crux.console.mode. 'documents' (M10) is the console-as-reader. Mode is
+    // PRESENTATION — never posture.
+    try {
+      var m = localStorage.getItem('crux.console.mode');
+      document.documentElement.setAttribute('data-mode', (m === 'professional' || m === 'documents') ? m : 'standard');
+    } catch (e) {
+      document.documentElement.setAttribute('data-mode', 'standard');
+    }
+  })();
+</script>
+<style>
+  /* ---- Base reset -------------------------------------------------------- */
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  :root {
+    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    --radius: 14px;
+    --radius-sm: 10px;
+  }
+
+  /* ---- Theme token registry --------------------------------------------- */
+  /* Adding a 4th theme = one JS THEMES entry + one CSS block here. Nothing
+     else in the shell references literal colours. */
+  :root[data-theme="glass"] {
+    color-scheme: dark;
+    --bg: #060A12;
+    --surface: rgba(255,255,255,.055);
+    --surface2: rgba(255,255,255,.03);
+    --edge: rgba(255,255,255,.10);
+    --edge-strong: rgba(255,255,255,.18);
+    --ink: #EAF0F7;
+    --ink2: #93A4B8;
+    --ink3: #6E7E96;
+    --acc: #6CA8FF;
+    --ok: #3DDC97;
+    --warn: #F5B94B;
+    --crit: #F0716C;
+    --trust: #A78BFA;
+    --approve-a: #43E6A2;
+    --approve-b: #2BB983;
+    --approve-ink: #05261A;
+    --blur: 18px;
+    --card-shadow: none;
+    --aurora-opacity: 1;
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #0D1117;
+    --surface: #161B22;
+    --surface2: #11151C;
+    --edge: #2A313C;
+    --edge-strong: #3D4654;
+    --ink: #E6EDF3;
+    --ink2: #9BA7B4;
+    --ink3: #6E7B8A;
+    --acc: #58A6FF;
+    --ok: #2EA043;
+    --warn: #D29922;
+    --crit: #F85149;
+    --trust: #BC8CFF;
+    --approve-a: #2EA043;
+    --approve-b: #238636;
+    --approve-ink: #FFFFFF;
+    --blur: 0px;
+    --card-shadow: none;
+    --aurora-opacity: 0;
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg: #F4F6F8;
+    --surface: #FFFFFF;
+    --surface2: #EDF1F5;
+    --edge: #D7DEE5;
+    --edge-strong: #B9C4CF;
+    --ink: #1B2733;
+    --ink2: #4A5866;
+    --ink3: #5B6B7D;
+    --acc: #2456A6;
+    --ok: #1A7F4E;
+    --warn: #9A5B00;
+    --crit: #B91C1C;
+    --trust: #6D28D9;
+    --approve-a: #1A7F4E;
+    --approve-b: #14663E;
+    --approve-ink: #FFFFFF;
+    --blur: 0px;
+    --card-shadow: 0 1px 3px rgba(27,39,51,.08);
+    --aurora-opacity: 0;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--ink);
+    background: var(--bg);
+    min-height: 100vh;
+    overflow-x: hidden;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  a { color: var(--acc); text-decoration: none; }
+  button { font: inherit; }
+
+  /* ---- Aurora background (glass theme only) ------------------------------ */
+  .aurora {
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    opacity: var(--aurora-opacity);
+    transition: opacity .4s ease;
+    background:
+      radial-gradient(48rem 48rem at 12% -8%, rgba(108,168,255,.20), transparent 60%),
+      radial-gradient(42rem 42rem at 96% 4%, rgba(167,139,250,.16), transparent 58%),
+      radial-gradient(46rem 46rem at 78% 108%, rgba(61,220,151,.12), transparent 60%);
+  }
+  :root[data-theme="glass"] .aurora {
+    animation: auroraDrift 34s ease-in-out infinite alternate;
+  }
+  @keyframes auroraDrift {
+    from { transform: translate3d(0, 0, 0) scale(1); }
+    to   { transform: translate3d(-1.5%, 1.2%, 0) scale(1.06); }
+  }
+
+  /* ---- App shell layout -------------------------------------------------- */
+  .app { display: grid; grid-template-columns: 240px 1fr; min-height: 100vh; transition: grid-template-columns .2s ease; }
+
+  .rail {
+    position: sticky;
+    top: 0;
+    align-self: start;
+    height: 100vh;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 16px 12px;
+    border-right: 1px solid var(--edge);
+    background: var(--surface);
+    backdrop-filter: blur(var(--blur));
+    -webkit-backdrop-filter: blur(var(--blur));
+    overflow: hidden;
+  }
+
+  /* Rail collapse toggle — a 44px chevron at the rail top. aria-expanded +
+     aria-label are set in JS; the glyph rotates when collapsed. */
+  .rail-toggle {
+    display: flex; align-items: center; justify-content: center; flex: none;
+    min-height: 32px; min-width: 32px; margin-left: auto; margin-right: -2px;
+    background: none; border: 1px solid transparent; border-radius: var(--radius-sm);
+    color: var(--ink3); cursor: pointer;
+    transition: background .18s ease, color .18s ease, border-color .18s ease;
+  }
+  .rail-toggle svg { width: 18px; height: 18px; transition: transform .2s ease; }
+  .rail-toggle:hover { background: var(--surface2); color: var(--ink); border-color: var(--edge-strong); }
+
+  .brand { display: flex; align-items: center; gap: 10px; padding: 4px 8px 12px; }
+  .brand .mark {
+    width: 30px; height: 30px; flex: none; border-radius: 9px;
+    display: grid; place-items: center;
+    background: linear-gradient(140deg, var(--acc), var(--trust));
+    color: #fff;
+  }
+  .brand .mark svg { width: 18px; height: 18px; }
+  .brand .name { font-weight: 700; letter-spacing: -.01em; font-size: 15px; }
+  .brand .name small { display: block; font-weight: 500; font-size: 11px; color: var(--ink3); letter-spacing: .02em; }
+
+  nav { display: flex; flex-direction: column; gap: 3px; overflow-y: auto; }
+  .nav-group-label {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--ink3); font-weight: 600; padding: 14px 10px 6px;
+  }
+  /* ---- Nav-family interactive surface — ONE source of truth --------------
+     The nav-item / button / pill family shares this single glass ruleset:
+     squarer var(--radius-sm) corners, transparent → var(--surface2) on hover,
+     a 1px var(--edge) → var(--edge-strong) border, and an accent icon on the
+     current/pressed item. Each selector then adds ONLY its own layout
+     (size · gap · font) below — no duplicated colour / hover / current blocks.
+     Shape/size/transition/hover/current are shared here; the LEFT RAIL items
+     take one at-rest override just below (they rest borderless — the resting
+     outline belongs to body buttons + sub-nav pills only). .btn-primary (the
+     approve gradient) is the single accent variant and opts out of this tint. */
+  .nav-item, .btn-quiet, .pill {
+    color: var(--ink2); background: transparent;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm);
+    cursor: pointer;
+    transition: background .18s ease, color .18s ease, border-color .18s ease;
+  }
+  .nav-item:hover, .btn-quiet:hover:not(:disabled), .pill:hover {
+    background: var(--surface2); color: var(--ink); border-color: var(--edge-strong);
+  }
+  .nav-item[aria-current="page"], .pill[aria-current="page"], .btn-quiet[aria-pressed="true"] {
+    background: var(--surface2); color: var(--ink); border-color: var(--edge-strong);
+  }
+  .nav-item[aria-current="page"] svg, .pill[aria-current="page"] svg { opacity: 1; color: var(--acc); }
+  /* Left-rail items rest BORDERLESS (transparent) — restored to the pre-round-3
+     look. Body buttons (.btn-quiet) + sub-nav pills keep the shared resting
+     outline; only the rail drops it at rest. The --surface2 fill +
+     --edge-strong border still appear on hover / aria-current (the two
+     rail-scoped selectors below out-specify the family hover/current rules).
+     Everything else (shape/size/transition/current-accent) stays shared above. */
+  .rail .nav-item { border-color: transparent; }
+  .rail .nav-item:hover,
+  .rail .nav-item[aria-current="page"] { border-color: var(--edge-strong); }
+
+  /* nav-item layout only (colour/border/hover live in the shared rule above). */
+  .nav-item {
+    display: flex; align-items: center; gap: 11px;
+    min-height: 44px; padding: 0 12px;
+    width: 100%; text-align: left;
+  }
+  .nav-item svg { width: 18px; height: 18px; flex: none; opacity: .9; }
+  .nav-item .label { flex: 1; font-weight: 500; }
+  .nav-item .kbd {
+    font-family: var(--font-mono); font-size: 11px; color: var(--ink3);
+    border: 1px solid var(--edge); border-radius: 6px; padding: 1px 6px;
+    min-width: 20px; text-align: center;
+  }
+
+  .rail-footer { margin-top: auto; padding-top: 12px; display: flex; flex-direction: column; gap: 10px; }
+  .passport-chip {
+    display: flex; align-items: center; gap: 11px;
+    padding: 9px 11px; border: 1px solid var(--edge); border-radius: var(--radius-sm);
+    background: var(--surface2); width: 100%; text-align: left; font: inherit; cursor: pointer;
+    transition: border-color .15s ease, background .15s ease;
+  }
+  .passport-chip:hover { border-color: var(--edge-strong); background: var(--surface); }
+  .passport-chip .avatar {
+    width: 30px; height: 30px; flex: none; border-radius: 50%;
+    display: grid; place-items: center; color: #fff;
+    background: linear-gradient(140deg, var(--trust), var(--acc));
+  }
+  .passport-chip .avatar svg { width: 16px; height: 16px; }
+  .passport-chip .who { min-width: 0; flex: 1; line-height: 1.3; }
+  .passport-chip .who b {
+    display: block; font-size: 13px; font-weight: 650; letter-spacing: -.01em; color: var(--ink);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .passport-chip .who span {
+    display: block; font-size: 10.5px; color: var(--ink3); letter-spacing: .02em;
+    font-family: var(--font-mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+
+  .theme-switch {
+    display: flex; gap: 4px; padding: 4px;
+    border: 1px solid var(--edge); border-radius: 12px; background: var(--surface2);
+  }
+  .theme-btn {
+    flex: 1; min-height: 44px; min-width: 40px;
+    display: grid; place-items: center;
+    background: none; border: 1px solid transparent; border-radius: 9px;
+    color: var(--ink2); cursor: pointer;
+    transition: background .18s ease, color .18s ease;
+  }
+  .theme-btn svg { width: 18px; height: 18px; }
+  .theme-btn:hover { color: var(--ink); background: var(--surface); }
+  .theme-btn[aria-pressed="true"] { background: var(--acc); color: #fff; }
+
+  /* ---- Collapsed rail (icon-only, ~64px) --------------------------------
+     Guarded to the desktop tier (min-width:721px) so it never fights the
+     phone media query that hides the rail entirely. Toggled via
+     :root[data-rail="collapsed"]; state persists in localStorage
+     (crux.console.rail). Labels, group labels, kbd hints, the brand name, the
+     passport identity text and the footer collapse; nav items keep a title
+     tooltip (set in JS) and the theme switch stacks its icons vertically. */
+  @media (min-width: 721px) {
+    :root[data-rail="collapsed"] .app { grid-template-columns: 64px 1fr; }
+    :root[data-rail="collapsed"] .rail { padding: 16px 8px; align-items: stretch; }
+    :root[data-rail="collapsed"] .rail-toggle { margin: -4px auto 2px; }
+    :root[data-rail="collapsed"] .rail-toggle svg { transform: rotate(180deg); }
+    :root[data-rail="collapsed"] .brand { flex-direction: column; justify-content: center; padding: 4px 0 12px; gap: 6px; }
+    :root[data-rail="collapsed"] .brand .name { display: none; }
+    :root[data-rail="collapsed"] .rail-toggle { margin: 0 auto; }
+    :root[data-rail="collapsed"] .nav-item { justify-content: center; padding: 0; gap: 0; }
+    :root[data-rail="collapsed"] .nav-item .label,
+    :root[data-rail="collapsed"] .nav-item .kbd,
+    :root[data-rail="collapsed"] .nav-group-label { display: none; }
+    :root[data-rail="collapsed"] .passport-chip { justify-content: center; padding: 8px 0; gap: 0; }
+    :root[data-rail="collapsed"] .passport-chip .who { display: none; }
+    :root[data-rail="collapsed"] .theme-switch { flex-direction: column; }
+  }
+
+  /* ---- Main column ------------------------------------------------------- */
+  .main { min-width: 0; display: flex; flex-direction: column; }
+  .topbar {
+    display: flex; align-items: center; gap: 16px;
+    padding: 18px 28px; border-bottom: 1px solid transparent;
+    position: sticky; top: 0; z-index: 4;
+    background: transparent;
+    transition: background .25s ease, border-color .25s ease, backdrop-filter .25s ease;
+  }
+  /* Glass only once the view scrolls under it (toggled by wireTopbarScroll). */
+  .topbar.scrolled {
+    border-bottom-color: var(--edge);
+    background: color-mix(in srgb, var(--bg) 82%, transparent);
+    backdrop-filter: blur(var(--blur));
+    -webkit-backdrop-filter: blur(var(--blur));
+  }
+  .topbar h1 { margin: 0; font-size: 18px; font-weight: 700; letter-spacing: -.01em; }
+  .topbar .sub { margin: 2px 0 0; font-size: 12.5px; color: var(--ink2); }
+
+  /* Right cluster: compact mono chips (build · auth · dataplane · optional DEMO)
+     then the status pill. Chips ride the same pill language as the health pill. */
+  .topbar-right { margin-left: auto; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+  .topchips { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .topchips:empty { display: none; }
+  /* Every topbar chip AND the status pill share ONE height + padding + font
+     metric so they baseline-align in the .topbar-right cluster (item 3):
+     32px min-height, 0 12px padding, 11.5px/1 text. They now carry the same
+     squarer var(--radius-sm) corners as the rest of the family (no longer a
+     rounded 999px pill). Per-chip rules below only add family colour (mono
+     chips, DEMO warn, health dot). */
+  .topchip, .health {
+    display: inline-flex; align-items: center;
+    min-height: 32px; padding: 0 12px;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm);
+    font-size: 11.5px; line-height: 1; white-space: nowrap;
+    color: var(--ink2); background: var(--surface2);
+  }
+  .topchip { font-family: var(--font-mono); letter-spacing: .02em; }
+  .topchip.demo {
+    color: var(--warn); font-weight: 600; letter-spacing: .08em;
+    background: color-mix(in srgb, var(--warn) 13%, transparent);
+    border-color: color-mix(in srgb, var(--warn) 34%, transparent);
+  }
+
+  /* ---- Compact rail meta — the old top bar, condensed under the brand ------
+     A full-width Command | Explore surface toggle, then extremely compact
+     wrapped status chips + the connection pill. Hidden when the rail collapses
+     to icon-only. */
+  .rail-meta {
+    display: flex; flex-direction: column; gap: 8px;
+    padding: 2px 8px 12px; margin-bottom: 4px; border-bottom: 1px solid var(--edge);
+  }
+  .railseg { display: flex; gap: 3px; padding: 3px; }
+  .railseg .modeseg-btn { flex: 1; justify-content: center; min-height: 28px; padding: 0 8px; font-size: 12px; }
+  .rail-chips { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+  .rail-meta .topchips { display: flex; flex-wrap: wrap; gap: 4px; }
+  .rail-meta .topchip, .rail-meta .health {
+    min-height: 20px; padding: 0 6px; font-size: 9.5px; border-radius: 6px; gap: 5px;
+  }
+  .rail-meta .health .dot { width: 7px; height: 7px; }
+  /* auth + dataplane as compact icon chips (value in the title tooltip). */
+  .rail-meta .icon-chip { padding: 0; min-width: 22px; justify-content: center; color: var(--ink3); }
+  .rail-meta .icon-chip svg { width: 13px; height: 13px; }
+  .rail-meta .icon-chip.on { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 34%, var(--edge)); }
+  /* Theme quick-cycle icon — lives in the chips row, sized like the status chips. */
+  .rail-theme-cycle {
+    flex: none; min-height: 20px; min-width: 22px; padding: 0 5px;
+    display: inline-flex; align-items: center; justify-content: center;
+    border: 1px solid var(--edge); border-radius: 6px; background: var(--surface2);
+    color: var(--ink2); cursor: pointer; transition: background .18s ease, color .18s ease, border-color .18s ease;
+  }
+  .rail-theme-cycle:hover { color: var(--ink); border-color: var(--edge-strong); background: var(--surface); }
+  .rail-theme-cycle svg { width: 13px; height: 13px; }
+  /* Bottom account roll-up menu (Settings · Language · Log out) — the System button. */
+  .acct-menu-wrap { position: relative; }
+  .passport-chip { width: 100%; font: inherit; cursor: pointer; }
+  .passport-chip[aria-expanded="true"] { border-color: var(--edge-strong); }
+  .passport-chip .acct-caret { margin-left: auto; display: inline-flex; width: 14px; height: 14px; color: var(--ink3); flex: none; }
+  .passport-chip .acct-caret svg { width: 14px; height: 14px; transform: rotate(-90deg); }
+  .passport-chip[aria-expanded="true"] .acct-caret svg { transform: rotate(90deg); }
+  .acct-menu {
+    position: absolute; left: 0; right: 0; bottom: calc(100% + 8px); z-index: 30;
+    display: flex; flex-direction: column; gap: 2px; padding: 6px;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm);
+    background: var(--surface); box-shadow: var(--card-shadow);
+    backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
+  }
+  .acct-menu[hidden] { display: none; }
+  .acct-item {
+    display: flex; align-items: center; gap: 11px; width: 100%; min-height: 38px; padding: 8px 10px;
+    border: 0; border-radius: 8px; background: none; color: var(--ink);
+    font: inherit; font-size: 13px; text-align: left; cursor: pointer;
+  }
+  .acct-item:hover { background: var(--surface2); }
+  .acct-ico { display: inline-flex; width: 16px; height: 16px; flex: none; color: var(--ink2); }
+  .acct-ico svg { width: 16px; height: 16px; }
+  .acct-sep { height: 1px; margin: 4px 2px; background: var(--edge); }
+  .acct-code { margin-left: auto; font-family: var(--font-mono); font-size: 9.5px; color: var(--ink3); border: 1px solid var(--edge); border-radius: 5px; padding: 1px 6px; }
+  /* Settings › Theme picker */
+  .theme-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+  .theme-opt { display: flex; flex-direction: column; gap: 8px; }
+  .theme-opt-btn {
+    display: flex; align-items: center; gap: 10px; min-height: 48px; padding: 0 14px;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2);
+    color: var(--ink2); cursor: pointer; font-weight: 500;
+  }
+  .theme-opt-btn svg { width: 18px; height: 18px; flex: none; }
+  .theme-opt-btn[aria-pressed="true"] { color: var(--ink); border-color: var(--acc); background: color-mix(in srgb, var(--acc) 12%, var(--surface2)); }
+  .theme-cycle-toggle { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: var(--ink3); cursor: pointer; }
+  @media (min-width: 721px) {
+    :root[data-rail="collapsed"] .rail-meta { display: none; }
+  }
+
+  /* ---- Top-bar search stub (page header left · search right) -------------- */
+  .topbar-title { min-width: 0; }
+  .searchstub {
+    margin-left: auto; display: inline-flex; align-items: center; gap: 10px;
+    height: 38px; padding: 0 14px; width: 320px; max-width: 42%;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm);
+    background: var(--surface2); color: var(--ink3); font-size: 13px;
+    transition: border-color .18s ease, color .18s ease;
+  }
+  .searchstub:focus-within { border-color: var(--edge-strong); color: var(--ink2); }
+  .searchstub .ss-ico { display: inline-flex; width: 15px; height: 15px; flex: none; }
+  .searchstub .ss-ico svg { width: 15px; height: 15px; }
+  .searchstub .ss-input {
+    flex: 1; min-width: 0; border: 0; background: none; outline: none;
+    color: var(--ink); font: inherit; font-size: 13px;
+  }
+  .searchstub .ss-input::placeholder { color: var(--ink3); }
+  .searchstub kbd {
+    font-family: var(--font-mono); font-size: 10px; color: var(--ink2); flex: none;
+    padding: 2px 6px; border: 1px solid var(--edge); border-radius: 5px;
+  }
+  /* Explore rail reuses the Command .nav-item look; the surface glyph sits in the
+     icon slot (sized to match the 18px SVG icons of the Command rail). */
+  .nav-item .nav-glyph {
+    width: 18px; height: 18px; flex: none; display: inline-flex;
+    align-items: center; justify-content: center; font-size: 14px; line-height: 1; opacity: .9;
+  }
+  .nav-item[aria-current="page"] .nav-glyph { opacity: 1; color: var(--acc); }
+  /* Explorer surface — centred in the page and wider than the default surface
+     column (overrides the 920/900 surface widths for the search experience). */
+  .doc-surface-main.explorer-surface { width: 100%; max-width: 1240px; margin: 0 auto; }
+  .doc-surface-main.explorer-surface .explorer-region { max-width: 100%; }
+  .explorer-region.explorer-empty { min-height: 60vh; display: flex; flex-direction: column; justify-content: center; }
+  .explorer-region .explorer-controls { max-width: 1120px; width: 100%; margin: 0 auto; }
+  .explorer-region .explorer-results,
+  .explorer-region .explorer-detail { max-width: 1120px; width: 100%; margin: 0 auto; }
+  .explorer-region.explorer-empty .explorer-results { text-align: center; }
+  /* Result cards are clickable → open the detail page. */
+  .explorer-card { cursor: pointer; transition: border-color .15s ease, background .15s ease; }
+  .explorer-card:hover { border-color: var(--edge-strong); background: var(--surface); }
+  .explorer-back { margin-bottom: 14px; }
+  .explorer-detail-head { display: flex; align-items: baseline; gap: 12px; }
+  .explorer-detail-head h2 { margin: 0; font-size: 20px; font-weight: 650; }
+  .explorer-detail-body { margin: 12px 0; font-size: 14px; line-height: 1.6; color: var(--ink); }
+  .health { gap: 8px; }
+  .health .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ink3); flex: none; }
+  .health.ok .dot { background: var(--ok); }
+  .health.degraded .dot { background: var(--warn); }
+  .health.down .dot { background: var(--crit); }
+
+  .content { padding: 26px 28px 48px; }
+
+  /* ---- Stat tiles (Overwatch boot readout) ------------------------------ */
+  .stats {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(158px, 1fr));
+    gap: 12px; margin-bottom: 26px;
+  }
+  .stat {
+    padding: 14px 16px; border: 1px solid var(--edge); border-radius: var(--radius);
+    background: var(--surface); box-shadow: var(--card-shadow);
+    backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
+  }
+  .stat .k { font-size: 11.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--ink3); font-weight: 600; }
+  .stat .v {
+    margin-top: 6px; font-size: 22px; font-weight: 650; color: var(--ink);
+    font-variant-numeric: tabular-nums; word-break: break-word;
+  }
+  .stat .v small { font-size: 12px; font-weight: 500; color: var(--ink2); }
+
+  .degraded-card {
+    border: 1px solid var(--edge); border-left: 3px solid var(--warn);
+    border-radius: var(--radius); background: var(--surface); padding: 18px 20px; margin-bottom: 26px;
+  }
+  .degraded-card.down { border-left-color: var(--crit); }
+  .degraded-card h3 { margin: 0 0 6px; font-size: 14px; }
+  .degraded-card p { margin: 0; color: var(--ink2); font-size: 13px; }
+
+  /* ---- Destination card grid -------------------------------------------- */
+  .section-label {
+    font-size: 12px; text-transform: uppercase; letter-spacing: .05em;
+    color: var(--ink3); font-weight: 600; margin: 0 0 12px;
+  }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(244px, 1fr)); gap: 14px; }
+  .card {
+    padding: 16px 18px; border: 1px solid var(--edge); border-radius: var(--radius);
+    background: var(--surface); box-shadow: var(--card-shadow);
+    backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .card .card-top { display: flex; align-items: center; gap: 10px; }
+  .card .glyph {
+    width: 30px; height: 30px; flex: none; border-radius: 9px;
+    display: grid; place-items: center;
+    background: var(--surface2); border: 1px solid var(--edge); color: var(--acc);
+  }
+  .card .glyph svg { width: 16px; height: 16px; }
+  .card h3 { margin: 0; font-size: 14.5px; font-weight: 650; }
+  .card p { margin: 0; font-size: 12.5px; color: var(--ink2); }
+  .card .soon {
+    align-self: flex-start; margin-top: 2px;
+    font-size: 10.5px; letter-spacing: .04em; text-transform: uppercase; font-weight: 600;
+    color: var(--trust); background: color-mix(in srgb, var(--trust) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--trust) 30%, transparent);
+    padding: 2px 8px; border-radius: 999px;
+  }
+
+  /* ---- Sub-nav pill row (destination → pages) --------------------------- */
+  .subnav {
+    display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 22px;
+    padding-bottom: 16px; border-bottom: 1px solid var(--edge);
+  }
+  /* Sub-nav page pills — layout only; the glass look + current state come from
+     the shared nav-family ruleset above (squarer, edge → edge-strong, accent on
+     the current page — no longer a rounded solid-accent fill). */
+  .pill {
+    min-height: 36px; padding: 0 14px;
+    display: inline-flex; align-items: center; gap: 8px;
+    font-weight: 500; font-size: 13px;
+  }
+  .pill svg { width: 16px; height: 16px; flex: none; opacity: .9; }
+
+  /* ---- Page card grid + control DSL ------------------------------------- */
+  .page-host { min-height: 40px; }
+  .v2grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; align-items: start; }
+  .v2card {
+    padding: 16px 18px; border: 1px solid var(--edge); border-radius: var(--radius);
+    background: var(--surface); box-shadow: var(--card-shadow);
+    backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
+    min-width: 0;
+  }
+  .v2card.wide { grid-column: 1 / -1; }
+  .v2card-h { margin: 0; font-size: 14.5px; font-weight: 650; }
+  .v2card-sub { margin: 4px 0 0; font-size: 12.5px; color: var(--ink2); }
+  .v2card-body { display: flex; flex-direction: column; gap: 12px; margin-top: 14px; }
+  .v2card-body:empty { margin-top: 0; }
+
+  .ctl-row { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+  .ctl-label { font-size: 11.5px; font-weight: 600; color: var(--ink3); text-transform: uppercase; letter-spacing: .04em; }
+  .ctl-desc { margin: 0; font-size: 12px; color: var(--ink3); line-height: 1.45; }
+  .ctl-input {
+    width: 100%; min-height: 40px; padding: 8px 11px;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm);
+    background: var(--surface2); color: var(--ink); font: inherit;
+  }
+  .ctl-input.mono { font-family: var(--font-mono); font-size: 12.5px; }
+  .ctl-textarea { min-height: 68px; resize: vertical; line-height: 1.5; }
+  .ctl-input:disabled { opacity: .72; cursor: not-allowed; }
+  .ctl-input::placeholder { color: var(--ink3); }
+  /* Native <select> theming: a custom chevron replaces the OS control art, and a
+     theme-matched `color-scheme` (set per theme below) fixes the broken light /
+     blue popup + option list in dark mode. Options are explicitly re-coloured too
+     (Chromium/Windows honours these on the option list). */
+  .ctl-select {
+    -webkit-appearance: none; -moz-appearance: none; appearance: none;
+    padding-right: 32px; cursor: pointer;
+    background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%237E8CA0' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 10px center;
+  }
+  .ctl-select:hover { border-color: var(--edge-strong); }
+  .ctl-select:focus-visible { border-color: var(--acc); outline: none; }
+  .ctl-select option { background: var(--surface); color: var(--ink); }
+
+  .ctl-info {
+    display: flex; align-items: baseline; gap: 12px; justify-content: space-between;
+    padding: 8px 10px; border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2);
+  }
+  .ctl-info-k { font-size: 12px; color: var(--ink3); font-weight: 500; flex: none; }
+  .ctl-info-v { font-size: 12.5px; color: var(--ink); text-align: right; word-break: break-word; font-variant-numeric: tabular-nums; }
+
+  /* ---- LED toggle — ported from the legacy console .active-toggle -----------
+     (crates/corecruxd/console/index.html:388-392). A compact squarer chip with
+     an 8px LED dot that glows when on. The v2 DSL `toggle` renders this: LED +
+     label, family shape (var(--radius-sm), NOT a rounded 999px pill). On-state
+     (.on, set from control.v) = accent border + a glowing --ok LED (index.html
+     used --run; the operator asked for --ok here); off = an --ink3 LED. The
+     glow is a static box-shadow — no animation, so it survives reduced-motion
+     untouched. Toggle semantics/gating are unchanged: mut toggles stay
+     operator-gated and disabled (the input is disabled by applyMutationGate). */
+  .ctl-toggle {
+    display: inline-flex; align-items: center; gap: 8px; align-self: flex-start;
+    padding: 5px 11px; border: 1px solid var(--edge); border-radius: var(--radius-sm);
+    background: var(--surface2); color: var(--ink2);
+    font-size: 12.5px; font-weight: 600; cursor: pointer;
+    transition: color .18s ease, border-color .18s ease, background .18s ease;
+  }
+  .ctl-toggle input { position: absolute; opacity: 0; width: 0; height: 0; }
+  .ctl-toggle:hover { color: var(--ink); border-color: var(--edge-strong); }
+  .ctl-toggle .led {
+    width: 8px; height: 8px; flex: none; border-radius: 50%; background: var(--ink3);
+    transition: background .18s ease, box-shadow .18s ease;
+  }
+  .ctl-toggle.on { color: var(--ink); border-color: var(--acc); }
+  .ctl-toggle.on .led { background: var(--ok); box-shadow: 0 0 7px var(--ok); }
+  .ctl-toggle input:disabled ~ .ctl-toggle-label { opacity: .72; }
+  .ctl-toggle-label { font-size: 12.5px; color: inherit; }
+
+  /* ---- Unified buttons — exactly two families console-wide ---------------
+     Every button in the console is one of two families:
+       .btn-quiet   — the nav-item look (transparent → var(--surface2) on hover,
+                      1px var(--edge) → var(--edge-strong), radius-sm, 44px, 150–
+                      300ms). Used for the DSL `btn`, page-level buttons, deep-
+                      machinery links, chart range toggles, and the gate "return".
+       .btn-primary — the approve gradient (--approve-a/-b/-ink). Used only where
+                      an action is the primary affirmative (the gate "Approve").
+     `.danger` on .btn-quiet is a colour cue (crit text/edge), not a third family. */
+  /* Button box model. .btn-quiet's glass tint (bg/border/hover/pressed) comes
+     from the shared nav-family ruleset near the rail; this only owns the button
+     geometry + font. .btn-primary keeps its own (gradient) surface below. */
+  .btn-primary, .btn-quiet {
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+    min-height: 44px; padding: 0 16px; border-radius: var(--radius-sm);
+    font: inherit; font-weight: 600; font-size: 13px; cursor: pointer;
+    text-decoration: none;
+    transition: background .2s ease, color .2s ease, border-color .2s ease, filter .2s ease;
+  }
+  .btn-primary svg, .btn-quiet svg { width: 15px; height: 15px; flex: none; }
+  .btn-quiet.danger { color: var(--crit); border-color: color-mix(in srgb, var(--crit) 45%, var(--edge)); }
+  .btn-primary { background: linear-gradient(180deg, var(--approve-a), var(--approve-b)); color: var(--approve-ink); border: 1px solid transparent; }
+  .btn-primary:hover:not(:disabled) { filter: brightness(1.07); }
+  .btn-primary:disabled, .btn-quiet:disabled { opacity: .55; cursor: not-allowed; }
+  /* In a stacked control row a button hugs the start rather than stretching. */
+  .ctl-row > .btn-primary, .ctl-row > .btn-quiet { align-self: flex-start; }
+
+  .gate-tag {
+    margin-left: 8px; font-size: 10px; letter-spacing: .04em; text-transform: uppercase; font-weight: 600;
+    color: var(--trust); background: color-mix(in srgb, var(--trust) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--trust) 30%, transparent); padding: 1px 7px; border-radius: 999px;
+  }
+  .ctl-row.is-gated, .exp.is-gated { position: relative; }
+
+  /* M13b live-write harness: result line + two-step confirm dialog. */
+  .wired-out { margin-top: 6px; }
+  .wired-result { margin: 0; font-size: 12px; line-height: 1.45; font-variant-numeric: tabular-nums; }
+  .wired-result.is-ok { color: var(--ok); }
+  .wired-result.is-err { color: var(--crit); }
+  .wired-confirm {
+    margin-top: 6px; padding: 10px 12px; border-radius: 10px;
+    background: color-mix(in srgb, var(--crit) 8%, var(--surface));
+    border: 1px solid color-mix(in srgb, var(--crit) 32%, transparent);
+  }
+  .wired-confirm-msg { margin: 0 0 9px; font-size: 12.5px; line-height: 1.5; color: var(--ink); }
+  .wired-confirm-actions { display: flex; gap: 8px; justify-content: flex-end; }
+
+  .ctl-bar { display: flex; flex-direction: column; gap: 6px; }
+  .ctl-bar-head { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--ink2); }
+  .ctl-bar-val { color: var(--ink); font-variant-numeric: tabular-nums; }
+  .ctl-bar-track { height: 10px; border-radius: 999px; background: var(--surface2); border: 1px solid var(--edge); overflow: hidden; }
+  .ctl-bar-fill { height: 100%; background: var(--acc); border-radius: 999px; }
+  .ctl-bar-fill.ok { background: var(--ok); }
+  .ctl-bar-fill.err { background: var(--crit); }
+  /* Gradient bar fills (Sessions token/progress bars) — a horizontal gradient
+     reading cool→accent for progress and accent→warm for token burn. */
+  .ctl-bar-fill.grad-prog { background: linear-gradient(90deg, var(--ok), var(--acc)); }
+  .ctl-bar-fill.grad-tok { background: linear-gradient(90deg, var(--acc), var(--warn)); }
+
+  /* ---- ExecPlans kanban board (cx-work) --------------------------------- */
+  .cvx-kanban { display: flex; gap: 12px; align-items: flex-start; overflow-x: auto; padding-bottom: 6px; }
+  .cvx-kcol { flex: 1 1 0; min-width: 224px; display: flex; flex-direction: column; gap: 10px; }
+  .cvx-kcol-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 2px 8px; border-bottom: 1px solid var(--edge); }
+  .cvx-kcol-title { font-size: 11.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--ink2); }
+  .cvx-kcol-count { font-size: 11px; font-variant-numeric: tabular-nums; color: var(--ink3); background: var(--surface2); border: 1px solid var(--edge); border-radius: 999px; padding: 1px 8px; }
+  .cvx-kcol-body { display: flex; flex-direction: column; gap: 10px; min-height: 8px; }
+  .cvx-kempty { margin: 0; font-size: 12px; color: var(--ink3); padding: 8px 2px; }
+  .cvx-kcard {
+    position: relative; overflow: hidden; padding: 11px 13px 10px 15px; display: flex; flex-direction: column; gap: 7px;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface); box-shadow: var(--card-shadow);
+  }
+  .cvx-kcard::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--ink3); }
+  .cvx-kcard[data-strip="in_progress"]::before { background: var(--acc); }
+  .cvx-kcard[data-strip="blocked"]::before { background: var(--warn); }
+  .cvx-kcard[data-strip="done"]::before { background: var(--ok); }
+  .cvx-kcard[data-strip="planned"]::before { background: var(--ink3); }
+  .cvx-kcard-top { display: flex; align-items: center; gap: 6px; }
+  .cvx-krisk { font-size: 9.5px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; padding: 2px 7px; border-radius: 999px; border: 1px solid var(--edge); color: var(--ink2); background: var(--surface2); }
+  .cvx-krisk.risk-high { color: var(--crit); border-color: color-mix(in srgb, var(--crit) 45%, transparent); background: color-mix(in srgb, var(--crit) 12%, transparent); }
+  .cvx-krisk.risk-medium { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); background: color-mix(in srgb, var(--warn) 12%, transparent); }
+  .cvx-krisk.risk-low { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 42%, transparent); background: color-mix(in srgb, var(--ok) 11%, transparent); }
+  .cvx-kms { margin-left: auto; font-family: var(--font-mono); font-size: 10.5px; font-weight: 650; color: var(--ink2); background: var(--surface2); border: 1px solid var(--edge); border-radius: 999px; padding: 1px 7px; }
+  .cvx-kslug { font-family: var(--font-mono); font-size: 11px; color: var(--ink3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .cvx-ktitle { font-size: 13.5px; font-weight: 650; line-height: 1.3; color: var(--ink); }
+  .cvx-kprog { display: flex; align-items: center; gap: 8px; }
+  .cvx-ktrack { flex: 1; height: 6px; border-radius: 999px; background: var(--surface2); border: 1px solid var(--edge); overflow: hidden; }
+  .cvx-kfill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--ok), var(--acc)); }
+  .cvx-kprogv { font-size: 10.5px; font-variant-numeric: tabular-nums; color: var(--ink2); flex: none; }
+  .cvx-kcard-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 1px; }
+  .cvx-kpass { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+  .cvx-knote { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink3); }
+  .cvx-kgraph { margin-left: auto; }
+
+  /* ---- Session cards (cx-sessions) — token/progress gradient bars -------- */
+  .sess-card {
+    position: relative; overflow: hidden; padding: 12px 14px 11px 16px; display: flex; flex-direction: column; gap: 9px;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface); box-shadow: var(--card-shadow);
+  }
+  .sess-card::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--ink3); }
+  .sess-card[data-strip="in_progress"]::before { background: var(--acc); }
+  .sess-card[data-strip="done"]::before { background: var(--ok); }
+  .sess-card[data-strip="planned"]::before { background: var(--ink3); }
+  .sess-card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .sess-id { font-family: var(--font-mono); font-size: 13px; font-weight: 600; color: var(--ink); word-break: break-all; }
+  .sess-card-meta { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+  .sess-chip { font-family: var(--font-mono); font-size: 11px; color: var(--ink2); background: var(--surface2); border: 1px solid var(--edge); border-radius: 999px; padding: 2px 9px; }
+  .sess-chip-plan { color: var(--acc); border-color: color-mix(in srgb, var(--acc) 34%, transparent); background: color-mix(in srgb, var(--acc) 11%, transparent); }
+  .sess-chip-pass { color: var(--trust); border-color: color-mix(in srgb, var(--trust) 30%, transparent); background: color-mix(in srgb, var(--trust) 11%, transparent); }
+  .sess-bar { gap: 5px; }
+  .sess-bar .ctl-bar-head { font-size: 11.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--ink3); }
+  .sess-bar .ctl-bar-track { height: 8px; }
+  .sess-card-foot { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 1px; }
+  .sess-foot-k { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink3); }
+  .sess-card-foot .cx-graphlink { margin-left: auto; }
+
+  .ctl-rpcout {
+    margin: 0; padding: 12px; min-height: 90px; max-height: 300px; overflow: auto;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2);
+    font-family: var(--font-mono); font-size: 12px; color: var(--ink2); white-space: pre-wrap; word-break: break-word;
+  }
+
+  /* ---- List rows — legacy list-page language ported (item 3b) --------------
+     Ported from the legacy searchable list rows (.sp-exp / .sp-exphead /
+     .sp-expname / .sp-expbody, crates/corecruxd/console/index.html:514-524):
+     the row rhythm (compact 8px 12px head), the hover treatment (the whole row
+     head lifts to a brighter surface on hover), mono metadata columns (the sub
+     line is mono + ellipsised, as the legacy .sp-expname small was), and a
+     top-border separator between the head and the body. Extracted into v2
+     tokens — no legacy var names copied. */
+  .exp { border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2); overflow: hidden; }
+  .exp-sum {
+    list-style: none; cursor: pointer; padding: 8px 12px;
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    transition: background .16s ease;
+  }
+  .exp-sum:hover { background: var(--surface); }
+  .exp-sum::-webkit-details-marker { display: none; }
+  .exp-label { font-weight: 600; font-size: 13px; color: var(--ink); }
+  .exp-sub {
+    font-family: var(--font-mono); font-size: 11px; color: var(--ink3);
+    flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .exp-badge {
+    font-size: 10.5px; letter-spacing: .03em; text-transform: uppercase; font-weight: 600; color: var(--ink2);
+    border: 1px solid var(--edge); border-radius: 999px; padding: 1px 8px; background: var(--surface);
+  }
+  .exp[open] > .exp-sum { border-bottom: 1px solid var(--edge); }
+  .exp-body { padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; }
+
+  /* ---- Pro-board card strips — one consistent left-strip system ----------
+     Work items + plan rows carry a 3px left strip keyed by state, matching the
+     Overwatch gate card's ::before geometry (same 3px width, radius-clipped by
+     the card). planned → ink3 · in_progress → acc · blocked/review → warn ·
+     done → ok. The strip rides inside the rounded, overflow:hidden .exp. */
+  .exp-strip { position: relative; }
+  .exp-strip::before {
+    content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--ink3); z-index: 1;
+  }
+  .exp-strip[data-strip="in_progress"]::before { background: var(--acc); }
+  .exp-strip[data-strip="blocked"]::before,
+  .exp-strip[data-strip="review"]::before { background: var(--warn); }
+  .exp-strip[data-strip="done"]::before { background: var(--ok); }
+  .exp-strip[data-strip="planned"]::before { background: var(--ink3); }
+  .exp-strip > .exp-sum { padding-left: 15px; }
+
+  /* ---- Projects — progressive disclosure + repo card grid (item 2) -------
+     "＋ New project" / "＋ Add repos" are nav-family buttons (.btn-quiet) that
+     reveal their form on click; the panel collapses on a second click or Esc.
+     A project's repos render as a small card grid inside its expanded card. */
+  .ctl-disclose { display: flex; flex-direction: column; gap: 8px; }
+  .ctl-disclose-btn { align-self: flex-start; }
+  .ctl-disclose-panel {
+    display: flex; flex-direction: column; gap: 12px; padding: 12px;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2);
+  }
+  .ctl-disclose-panel[hidden] { display: none; }
+  .repogrid-host { display: flex; flex-direction: column; gap: 8px; }
+  .repo-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+  .repo-card {
+    padding: 10px 12px; border: 1px solid var(--edge); border-radius: var(--radius-sm);
+    background: var(--surface); box-shadow: var(--card-shadow); min-width: 0;
+  }
+  .repo-card-name { font-size: 12.5px; font-weight: 600; color: var(--ink); word-break: break-word; }
+  .repo-card-meta { margin-top: 3px; font-family: var(--font-mono); font-size: 10px; color: var(--ink3); }
+
+  /* ---- Overwatch landing — Overwatch-concept restyle (post-M6) ----------
+     Ports the concept's Overwatch view: a full-width stat-tile row, then a
+     7fr/5fr split — NEEDS YOU gate cards on the left, FLEET + ACTIVITY ticker
+     on the right. Every colour comes from a theme token (the approve gradient
+     via --approve-a/-b/-ink), so all three themes render correctly. Behaviour
+     (render.js) is unchanged; this is look only. */
+  .ow-landing-region { margin-bottom: 22px; }
+  .ow-landing { display: flex; flex-direction: column; gap: 2px; }
+
+  /* Tagline subtitle introducing the Overwatch view (concept apphead sub). */
+  .ow-tagline { margin: 0 2px 16px; font-size: 13px; color: var(--ink2); }
+
+  /* Section header: mono · uppercase · wide tracking, with a right-aligned
+     count/hint (concept .sechead). */
+  .ow-sec { display: flex; align-items: baseline; gap: 10px; margin: 18px 2px 10px; }
+  .ow-sec.first { margin-top: 2px; }
+  .ow-sec h2 {
+    margin: 0; font-family: var(--font-mono); font-size: 10.5px; font-weight: 600;
+    letter-spacing: .22em; text-transform: uppercase; color: var(--ink2);
+  }
+  .ow-ct { font-family: var(--font-mono); font-size: 10px; color: var(--ink3); }
+  .ow-ct:empty { display: none; }
+  .ow-sec .ow-link { margin-left: auto; font-size: 11.5px; color: var(--acc); cursor: pointer; text-decoration: none; }
+  .ow-sec .ow-link:hover { text-decoration: underline; }
+
+  /* Two-column grid — 7fr left (needs-you → fleet) / 5fr right (page nav). */
+  .ow-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+  /* Overwatch view tabs (under Daemon-at-a-glance) — swap the content below. */
+  .ow-tabs { display: flex; gap: 2px; margin: 8px 0 18px; border-bottom: 1px solid var(--edge); flex-wrap: wrap; }
+  .ow-tab {
+    min-height: 40px; padding: 0 16px; margin-bottom: -1px;
+    background: none; border: 0; border-bottom: 2px solid transparent;
+    color: var(--ink2); font: inherit; font-size: 13.5px; font-weight: 600; cursor: pointer;
+    transition: color .15s ease, border-color .15s ease;
+  }
+  .ow-tab:hover { color: var(--ink); }
+  .ow-tab[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--acc); }
+  .ow-tabcontent { min-height: 200px; }
+  .ow-col { min-width: 0; }
+
+  /* Stat tiles — reused from the cx-overview build so the readout never drifts
+     from the page; styled to the concept .tile look, scoped to the landing so
+     the Overview page itself is untouched. */
+  .ow-tiles .v2card {
+    background: none; border: none; box-shadow: none; backdrop-filter: none;
+    -webkit-backdrop-filter: none; padding: 0; min-width: 0;
+  }
+  .ow-tiles .v2card-h {
+    font-family: var(--font-mono); font-size: 10.5px; font-weight: 600;
+    letter-spacing: .22em; text-transform: uppercase; color: var(--ink2);
+  }
+  .ow-tiles .v2card-sub { font-family: var(--font-mono); font-size: 10px; color: var(--ink3); }
+  .ow-tiles .v2card-body { margin-top: 12px; }
+  .ow-tiles .stats { gap: 14px; grid-template-columns: repeat(auto-fill, minmax(184px, 1fr)); }
+  .ow-tiles .stat { padding: 13px 15px; border-radius: var(--radius-sm); }
+  .ow-tiles .stat .k {
+    font-family: var(--font-mono); font-size: 9.5px; letter-spacing: .16em;
+    text-transform: uppercase; color: var(--ink3); font-weight: 600;
+  }
+  .ow-tiles .stat .v { margin-top: 5px; font-size: 23px; letter-spacing: -.02em; }
+  .ow-tiles .stat .v small { font-size: 11px; color: var(--ink3); }
+  /* Identity tiles (Facts · Sessions · ExecPlans) carry the LEGACY card
+     stat-number size — matches index.html renderDash .dash-num (44px/800/-.025em). */
+  .ow-tiles .stat.stat-lg .v { font-size: 44px; font-weight: 800; letter-spacing: -.025em; line-height: 1; }
+  .ow-tiles .stat.stat-lg .v small { display: block; margin-top: 7px; font-size: 10.5px; font-weight: 500; letter-spacing: 0; }
+  /* Honest gauge/meter for a REAL ratio tile (Storage free) — the measured
+     free-space fraction, never a fabricated series. */
+  .ow-tiles .tile-meter { margin-top: 10px; height: 6px; border-radius: 999px; background: var(--surface2); border: 1px solid var(--edge); overflow: hidden; }
+  .ow-tiles .tile-meter-fill { height: 100%; background: var(--acc); border-radius: 999px; }
+
+  /* ---- Glance tiles as gradient hero cards (ref: "Today at a glance") -----
+     Each card overrides --acc, which recolours BOTH the background wash and the
+     area chart (chart-line/fill + meter all read var(--acc)) in one place. The
+     appended spark chart is stretched full-bleed along the card bottom. */
+  .ow-tiles .stat {
+    position: relative; overflow: hidden;
+    min-height: 150px; padding: 15px 17px 14px; border-radius: 16px;
+    border: 1px solid color-mix(in srgb, var(--acc) 24%, var(--edge));
+    background:
+      radial-gradient(130% 100% at 100% 105%, color-mix(in srgb, var(--acc) 22%, transparent), transparent 62%),
+      linear-gradient(158deg, color-mix(in srgb, var(--acc) 11%, var(--surface)), var(--surface) 58%);
+  }
+  .ow-tiles .stat .k { position: relative; z-index: 1; color: color-mix(in srgb, var(--acc) 55%, var(--ink2)); }
+  .ow-tiles .stat .v { position: relative; z-index: 1; }
+  /* full-bleed area chart anchored to the card bottom (stretched via
+     preserveAspectRatio="none" on the spark svg) */
+  .ow-tiles .stat .chart-svg.spark {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    width: 100%; height: 48px; margin: 0; opacity: .92;
+  }
+  .ow-tiles .stat .chart-line { stroke-width: 2; }
+  .ow-tiles .stat .chart-dot { display: none; }
+  /* per-card accent hue cycle (top row lands orange · green · violet, matching ref) */
+  .ow-tiles .stat:nth-child(6n+1) { --acc: #e8823c; }
+  .ow-tiles .stat:nth-child(6n+2) { --acc: #34c790; }
+  .ow-tiles .stat:nth-child(6n+3) { --acc: #7c6cf0; }
+  .ow-tiles .stat:nth-child(6n+4) { --acc: #4a9ff0; }
+  .ow-tiles .stat:nth-child(6n+5) { --acc: #e6608a; }
+  .ow-tiles .stat:nth-child(6n+6) { --acc: #d9b23a; }
+  /* Glance header row: title left, Day/Week/Month range toggle pushed right. */
+  .v2card-head-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+  .v2card-head-row .v2card-h { margin: 0; }
+  /* Header action button — a "+" (reveal a card below) or ⚙ cog (reveal above). */
+  .v2card-head-actions { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; }
+  .v2card-head-actions .ctl-row.in-head { flex-direction: row; gap: 0; margin: 0; }
+  .v2card-head-actions .ctl-row.in-head .ctl-desc { display: none; }
+  .v2card-addbtn {
+    flex: 0 0 auto; width: 28px; height: 28px; padding: 0; line-height: 1;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 18px; font-weight: 500; color: var(--ink2);
+    background: var(--surface); border: 1px solid var(--edge); border-radius: var(--radius-sm);
+    cursor: pointer; transition: color .12s, border-color .12s, background .12s, transform .18s;
+  }
+  .v2card-addbtn.cog { font-size: 15px; }
+  .v2card-addbtn:hover { color: var(--ink); border-color: var(--acc); }
+  .v2card-addbtn.is-on { color: var(--acc); border-color: var(--acc); }
+  .v2card-addbtn.plus.is-on { transform: rotate(45deg); }
+  .v2card-addbtn.cog.is-on { transform: rotate(90deg); }
+  .v2card.is-collapsed { display: none; }
+  .exp.is-hidden { display: none; }
+
+  /* ---- Site map destination (ported from the unified-shell concept) ------
+     A two-column card grid: each destination is a card with a coloured left
+     rail (--sec-c), a mono tagline, and a list of pages with provenance chips
+     and annotation badges. Closes with the census note. */
+  .map-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .map-sec {
+    position: relative; overflow: hidden; padding: 15px 17px 6px;
+    border: 1px solid var(--edge); border-radius: var(--radius);
+    background: var(--surface); box-shadow: var(--card-shadow);
+  }
+  .map-sec::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--sec-c, var(--acc)); }
+  .map-sec > h3 { margin: 0 0 2px; font-size: 14.5px; font-weight: 650; display: flex; align-items: center; gap: 9px; }
+  .map-ico { display: inline-flex; width: 16px; height: 16px; color: var(--sec-c, var(--acc)); flex: none; }
+  .map-ico svg { width: 16px; height: 16px; }
+  .map-h-note { font-family: var(--font-mono); font-size: 9px; color: var(--ink3); font-weight: 500; }
+  .map-sec > .tag { font-family: var(--font-mono); font-size: 9.5px; color: var(--ink3); margin-bottom: 10px; }
+  .map-page { padding: 9px 0; border-top: 1px solid var(--edge); }
+  .map-page b { font-size: 12.5px; font-weight: 600; display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+  .map-page .why { font-size: 11px; color: var(--ink2); margin-top: 3px; line-height: 1.5; }
+  .provs { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+  .prov {
+    font-family: var(--font-mono); font-size: 9px; padding: 1.5px 7px; border-radius: 6px;
+    border: 1px solid var(--edge); color: var(--ink3); background: var(--surface2);
+  }
+  .prov.new { border-color: color-mix(in srgb, var(--trust) 35%, transparent); color: var(--trust); }
+  .anno { font-family: var(--font-mono); font-size: 8.5px; font-weight: 600; letter-spacing: .1em; padding: 2px 7px; border-radius: 6px; }
+  .anno.merge { background: color-mix(in srgb, var(--acc) 14%, transparent); color: var(--acc); }
+  .anno.promote { background: color-mix(in srgb, var(--ok) 14%, transparent); color: var(--ok); }
+  .anno.new { background: color-mix(in srgb, var(--trust) 15%, transparent); color: var(--trust); }
+  .anno.vsw { background: var(--surface2); color: var(--ink2); }
+  .anno.adv { background: color-mix(in srgb, var(--warn) 14%, transparent); color: var(--warn); }
+  .map-note {
+    margin-top: 14px; padding: 14px 17px; border-radius: var(--radius);
+    border: 1px solid var(--edge); background: var(--surface); box-shadow: var(--card-shadow);
+    font-size: 12px; color: var(--ink2); line-height: 1.6;
+  }
+  .map-note b { color: var(--ink); }
+  .map-note .mono { font-family: var(--font-mono); font-size: 10px; color: var(--ink2); }
+  @media (max-width: 900px) { .map-grid { grid-template-columns: 1fr; } }
+
+  /* Overwatch page nav (right column) — the nav-family section that replaces the
+     suppressed sub-nav pill row. Pills stack; active state via the shared .pill
+     rule. 44px targets for the primary nav. */
+  .ow-pagenav { display: flex; flex-direction: column; gap: 6px; }
+  .ow-pagenav .pill { min-height: 44px; width: 100%; justify-content: flex-start; }
+
+  /* Source chips (which fleet sources answered) + enrich meta chips. */
+  .ow-srcchips, .ow-meta { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 10px; }
+  .ow-chip {
+    font-family: var(--font-mono); font-size: 10px; color: var(--ink2); background: var(--surface2);
+    border: 1px solid var(--edge); border-radius: 999px; padding: 2px 9px; white-space: nowrap;
+  }
+
+  /* ---- Gate card (Art.14 human gate) — concept .gate anatomy ------------- */
+  .ow-gate {
+    position: relative; overflow: hidden; padding: 15px 17px; margin-bottom: 12px;
+    border: 1px solid var(--edge); border-radius: var(--radius);
+    background: var(--surface); box-shadow: var(--card-shadow);
+    backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
+    transition: opacity .3s ease, border-color .3s ease;
+  }
+  .ow-gate::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--warn); }
+  .ow-gate.is-resolved::before { background: var(--ok); }
+  .ow-gate.is-resolved { opacity: .8; border-color: color-mix(in srgb, var(--ok) 40%, var(--edge)); }
+  .ow-gate-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .ow-badge {
+    font-family: var(--font-mono); font-size: 9px; font-weight: 600; letter-spacing: .12em;
+    text-transform: uppercase; padding: 3px 8px; border-radius: 7px;
+    color: var(--trust); background: color-mix(in srgb, var(--trust) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--trust) 28%, transparent);
+  }
+  .ow-badge.risk {
+    color: var(--warn); background: color-mix(in srgb, var(--warn) 13%, transparent);
+    border-color: color-mix(in srgb, var(--warn) 30%, transparent);
+  }
+  .ow-slug {
+    font-family: var(--font-mono); font-size: 10.5px; color: var(--ink3);
+    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .ow-gate h3 { margin: 10px 0 3px; font-size: 15px; font-weight: 650; letter-spacing: -.01em; }
+  .ow-gate-action { font-family: var(--font-mono); font-size: 11px; color: var(--ink2); margin: 0 0 4px; }
+
+  /* Consequences block (only when /v1/actions/enrich returns). */
+  .ow-conseq {
+    display: flex; flex-direction: column; gap: 6px; margin: 10px 0;
+    padding: 10px 12px; border-radius: var(--radius-sm);
+    background: var(--surface2); border: 1px solid var(--edge);
+  }
+  .ow-narrative { color: var(--ink2); font-size: 12.5px; margin: 0; line-height: 1.45; }
+  .ow-conseq-row { display: flex; gap: 9px; font-size: 12.5px; color: var(--ink2); line-height: 1.4; }
+  .ow-conseq-row::before {
+    content: ""; flex: none; width: 6px; height: 6px; margin-top: 6px; border-radius: 50%; background: var(--trust);
+  }
+  .ow-conseq-row b { color: var(--ink); font-weight: 600; }
+
+  /* Attribution line — mono, with a mini gradient avatar. */
+  .ow-attr {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    font-family: var(--font-mono); font-size: 10px; color: var(--ink3); margin: 10px 0;
+  }
+  .ow-avatar {
+    width: 18px; height: 18px; flex: none; border-radius: 50%; display: grid; place-items: center;
+    font-size: 8px; font-weight: 700; color: #fff; font-family: var(--font-sans);
+    background: linear-gradient(135deg, var(--trust), var(--acc));
+  }
+
+  /* Action row: primary approve · quiet return · inline note (concept .actions).
+     The buttons themselves are the two unified families (.btn-primary /
+     .btn-quiet) defined above — this row only owns the layout. */
+  .ow-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+  .ow-note {
+    width: 100%; min-height: 40px; margin-top: 8px; padding: 8px 11px;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm);
+    background: var(--surface2); color: var(--ink); font: inherit; font-size: 12.5px;
+  }
+  .ow-note::placeholder { color: var(--ink3); }
+  .ow-status:empty { display: none; }
+  .ow-status { color: var(--warn); font-size: 12px; margin: 6px 0 0; }
+  .ow-await { color: var(--ink3); font-size: 12.5px; margin: 8px 0 0; }
+
+  /* Post-approve done-line (concept .doneline). */
+  .ow-done { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; color: var(--ok); margin-top: 4px; }
+  .ow-done svg { width: 16px; height: 16px; flex: none; }
+  .ow-done.returned { color: var(--warn); }
+  .ow-done .ow-hash {
+    font-family: var(--font-mono); font-size: 10.5px; color: var(--ink2);
+    background: color-mix(in srgb, var(--ok) 9%, transparent);
+    border: 1px solid color-mix(in srgb, var(--ok) 25%, transparent);
+    padding: 2px 8px; border-radius: 7px;
+  }
+
+  /* All-clear empty state (concept "all clear — agents unblocked"). */
+  .ow-allclear {
+    display: flex; align-items: center; gap: 10px; padding: 16px 18px;
+    border: 1px solid color-mix(in srgb, var(--ok) 30%, var(--edge)); border-radius: var(--radius);
+    background: color-mix(in srgb, var(--ok) 6%, var(--surface));
+  }
+  .ow-allclear svg { width: 20px; height: 20px; flex: none; color: var(--ok); }
+  .ow-allclear b { display: block; font-size: 13.5px; color: var(--ink); }
+  .ow-allclear span { font-size: 12px; color: var(--ink3); }
+
+  /* ---- Fleet rows (concept .sess) --------------------------------------- */
+  .ow-fleet-row {
+    display: flex; align-items: flex-start; gap: 12px; padding: 12px 14px; margin-bottom: 9px;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm);
+    background: var(--surface); box-shadow: var(--card-shadow);
+  }
+  .ow-dot { width: 8px; height: 8px; flex: none; margin-top: 5px; border-radius: 50%; background: var(--ok); }
+  .ow-dot.pulse { animation: owPulse 2s ease-in-out infinite; }
+  .ow-dot.idle { background: var(--ink3); }
+  @keyframes owPulse { 50% { box-shadow: 0 0 0 5px color-mix(in srgb, var(--ok) 14%, transparent); } }
+  .ow-fleet-meta { min-width: 0; flex: 1; }
+  .ow-fleet-meta b { font-size: 13px; display: block; }
+  .ow-focus {
+    font-family: var(--font-mono); font-size: 10px; color: var(--ink3); margin-top: 3px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .ow-leases { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+  .ow-lease {
+    font-family: var(--font-mono); font-size: 9px; color: var(--ink2);
+    background: var(--surface2); border: 1px solid var(--edge); padding: 2px 7px; border-radius: 6px;
+  }
+  .ow-lease.ov {
+    color: var(--warn); background: color-mix(in srgb, var(--warn) 8%, transparent);
+    border-color: color-mix(in srgb, var(--warn) 35%, transparent);
+  }
+  .ow-fleet-side { font-family: var(--font-mono); font-size: 9.5px; color: var(--ink3); text-align: right; flex: none; max-width: 42%; }
+  .ow-fleet-side div { margin-top: 2px; word-break: break-word; }
+
+  /* ---- Activity ticker (concept trust ticker) --------------------------- */
+  .ow-ticker {
+    border: 1px solid var(--edge); border-radius: var(--radius);
+    background: var(--surface); box-shadow: var(--card-shadow);
+    backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
+    padding: 4px 14px;
+  }
+  .ow-tick { display: flex; align-items: center; gap: 9px; padding: 9px 0; border-bottom: 1px solid var(--edge); font-size: 12px; }
+  .ow-tick:last-child { border-bottom: none; }
+  .ow-tick-label { color: var(--ink2); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ow-tick-ts { margin-left: auto; font-family: var(--font-mono); font-size: 9.5px; color: var(--ink3); flex: none; }
+  .ow-hash {
+    font-family: var(--font-mono); font-size: 10px; color: var(--trust);
+    background: color-mix(in srgb, var(--trust) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--trust) 25%, transparent);
+    padding: 2px 8px; border-radius: 7px; white-space: nowrap; flex: none;
+  }
+
+  /* ---- Engine-mediated card (right column; only when it answers) -------- */
+  .ow-engine {
+    border: 1px solid var(--edge); border-radius: var(--radius);
+    background: var(--surface); box-shadow: var(--card-shadow);
+    backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
+    padding: 12px 15px; display: flex; flex-direction: column; gap: 8px;
+  }
+  .ow-body .ctl-info { margin-bottom: 0; }
+
+  /* Phone (<720px): columns stack, action buttons go full-width. */
+  @media (max-width: 720px) {
+    .ow-cols { grid-template-columns: 1fr; }
+    .ow-actions .btn-primary, .ow-actions .btn-quiet { flex: 1; }
+    .ow-fleet-side { max-width: none; }
+  }
+
+  /* ---- Charts (single-series area/line, no dependency) ------------------
+     Rendered by CruxRender.areaChart(). One series only: a 2px var(--acc)
+     stroke over an area fill (svg gradient --acc→transparent), faint var(--edge)
+     gridlines, an emphasised endpoint dot, and NO legend (the title names the
+     series). Value labels are ink tokens, tabular-nums — never the series
+     colour. Range = a row of three .btn-quiet toggles above the chart. */
+  .chart-card {
+    padding: 16px 18px; border: 1px solid var(--edge); border-radius: var(--radius);
+    background: var(--surface); box-shadow: var(--card-shadow);
+    backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
+    display: flex; flex-direction: column; gap: 12px; position: relative; min-width: 0;
+  }
+  .chart-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  .chart-title { margin: 0; font-size: 14.5px; font-weight: 650; }
+  .chart-sub { margin: 0; font-size: 12px; color: var(--ink2); }
+  .chart-latest {
+    margin-left: auto; font-variant-numeric: tabular-nums;
+    font-size: 18px; font-weight: 650; color: var(--ink);
+  }
+  .chart-range { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chart-range .btn-quiet { min-height: 30px; padding: 0 12px; font-size: 12px; }
+  .chart-figure { width: 100%; }
+  .chart-svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .chart-grid { stroke: var(--edge); stroke-width: 1; }
+  .chart-line { fill: none; stroke: var(--acc); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+  .chart-dot { fill: var(--acc); }
+  .chart-dot-ring { fill: none; stroke: var(--acc); stroke-width: 1.5; opacity: .35; }
+  .chart-axis { fill: var(--ink3); font-family: var(--font-mono); font-size: 9px; font-variant-numeric: tabular-nums; }
+  .chart-empty { font-size: 12.5px; color: var(--ink3); padding: 18px 2px; }
+  .spark { display: block; width: 76px; height: 24px; margin-top: 8px; overflow: visible; }
+  .spark .chart-line { stroke-width: 1.6; }
+
+  /* Demo-mode corner chip — marks any panel whose data came from fixtures. */
+  .demo-chip {
+    position: absolute; top: 10px; right: 12px;
+    font-family: var(--font-mono); font-size: 8.5px; font-weight: 600; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--warn);
+    background: color-mix(in srgb, var(--warn) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warn) 30%, transparent);
+    border-radius: 6px; padding: 1px 6px; pointer-events: none;
+  }
+  .ow-panel { position: relative; }
+  .demo-chip.inline { position: static; align-self: flex-start; }
+
+  /* ---- Presentation mode: Standard | Professional (M8) ------------------
+     Mode is PRESENTATION only — the security boundary is posture, which is
+     independent of mode (a customer sees the SAME gated surface in either
+     mode). Standard is the curated forward-facing view; Professional adds
+     legacy-style density, extra mono metadata on list rows, Pro-only sections
+     /pages, and the full sub-nav pill row. Every colour is a theme token. */
+
+  /* Topbar segmented control (nav-family look, aria-pressed), sat left of the
+     chip cluster in .topbar-right. */
+  .modeseg {
+    display: inline-flex; gap: 3px; padding: 3px; flex: none;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2);
+  }
+  .modeseg-btn {
+    min-height: 26px; padding: 0 11px; font-size: 11.5px; font-weight: 600;
+    border: 1px solid transparent; border-radius: 8px; background: none; color: var(--ink2);
+    cursor: pointer; white-space: nowrap;
+    transition: background .18s ease, color .18s ease, border-color .18s ease;
+  }
+  .modeseg-btn:hover:not(:disabled) { color: var(--ink); }
+  .modeseg-btn[aria-pressed="true"] { background: var(--surface); color: var(--ink); border-color: var(--edge-strong); }
+  .modeseg-btn:disabled { opacity: .5; cursor: not-allowed; }
+
+  /* Extra mono metadata on list rows — hidden in Standard, revealed in Pro. */
+  .exp-meta {
+    display: none; font-family: var(--font-mono); font-size: 10px; color: var(--ink3);
+    min-width: 0; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+
+  /* Pro-mode dashboard strip — the home for the legacy CX-landing top cards
+     (daemon · execplans · token usage · MCP gateway). Rendered by render.js
+     renderDashStrip() only in Professional mode. */
+  .ow-dashstrip { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin: 0 0 18px; }
+  .ow-dashcard {
+    position: relative; padding: 13px 15px; border: 1px solid var(--edge); border-radius: var(--radius);
+    background: var(--surface); box-shadow: var(--card-shadow);
+    backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
+    display: flex; flex-direction: column; gap: 7px; min-width: 0;
+  }
+  .ow-dashcard-k { font-family: var(--font-mono); font-size: 9.5px; font-weight: 600; letter-spacing: .16em; text-transform: uppercase; color: var(--ink3); }
+  .ow-dashcard-v { font-size: 20px; font-weight: 650; color: var(--ink); font-variant-numeric: tabular-nums; letter-spacing: -.01em; word-break: break-word; }
+  .ow-dashcard-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+
+  /* Professional density — tighter rhythm across cards / rows / tiles, and the
+     mono metadata revealed. Standard keeps the roomier forward-facing look. */
+  :root[data-mode="professional"] .v2card { padding: 12px 14px; }
+  :root[data-mode="professional"] .v2card-body { gap: 8px; margin-top: 10px; }
+  :root[data-mode="professional"] .v2grid { gap: 10px; }
+  :root[data-mode="professional"] .exp-sum { padding: 6px 10px; }
+  :root[data-mode="professional"] .exp-strip > .exp-sum { padding-left: 13px; }
+  :root[data-mode="professional"] .exp-body { padding: 8px 10px; gap: 7px; }
+  :root[data-mode="professional"] .stat { padding: 10px 12px; }
+  :root[data-mode="professional"] .card { padding: 12px 14px; }
+  :root[data-mode="professional"] .ow-fleet-row { padding: 9px 11px; margin-bottom: 7px; }
+  :root[data-mode="professional"] .ow-gate { padding: 12px 14px; }
+  :root[data-mode="professional"] .exp-meta { display: inline-block; }
+
+  /* ---- Documents mode (M10) — the console-as-reader ---------------------
+     Ported COMPOSITION + MATERIAL from the WebCrux Proof reader
+     (webcrux-surfaces-demo-v3.jsx): the Section/Card reading composition, the
+     EvidenceCard side surface, Receipt chips, and coverage/progress affordances
+     — rebuilt in v2 tokens (every colour is a theme token, so all three themes
+     render). Under [data-mode="documents"] the console becomes a READER: the
+     rail slims to a document tree, the main column is a ~72ch reading surface,
+     and the right panel (≥1280px; stacked below on phone) is the evidence
+     material. Mode is presentation only — posture is untouched. */
+
+  /* The rail hosts the document tree in place of the destination nav. */
+  :root[data-mode="documents"] .rail nav { gap: 1px; }
+  .doc-tree-group {
+    font-size: 10px; text-transform: uppercase; letter-spacing: .12em; font-family: var(--font-mono);
+    color: var(--ink3); font-weight: 600; padding: 14px 8px 5px;
+  }
+  .doc-tree-item {
+    display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+    width: 100%; text-align: left; min-height: 40px; padding: 7px 10px;
+    color: var(--ink2); background: transparent;
+    border: 1px solid transparent; border-radius: var(--radius-sm); cursor: pointer;
+    transition: background .16s ease, color .16s ease, border-color .16s ease;
+  }
+  .doc-tree-item:hover { background: var(--surface2); color: var(--ink); border-color: var(--edge-strong); }
+  .doc-tree-item[aria-current="page"] { background: var(--surface2); color: var(--ink); border-color: var(--edge-strong); }
+  .doc-tree-item[aria-current="page"] .doc-tree-label { color: var(--acc); }
+  .doc-tree-label { font-weight: 600; font-size: 12.5px; }
+  .doc-tree-sub {
+    font-family: var(--font-mono); font-size: 9.5px; color: var(--ink3);
+    max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .doc-tree-empty { padding: 8px 10px; }
+  :root[data-rail="collapsed"] .doc-tree-sub, :root[data-rail="collapsed"] .doc-tree-group { display: none; }
+
+  /* 3-zone reader inside the content column: reading surface + evidence panel.
+     A single column below 1280px (the evidence stacks under the reading). */
+  .doc-reader { display: grid; grid-template-columns: 1fr; gap: 22px; align-items: start; }
+  @media (min-width: 1280px) {
+    .doc-reader { grid-template-columns: minmax(0, 1fr) 320px; }
+    .doc-evidence { position: sticky; top: 92px; }
+  }
+
+  /* Reading surface — a ~72ch measure with generous line-height (the ported
+     Proof reading column). 72ch is the reading measure token/rule. */
+  .doc-main { min-width: 0; max-width: 72ch; }
+  .doc-read-head { margin-bottom: 18px; padding-bottom: 12px; border-bottom: 1px solid var(--edge); }
+  .doc-read-title { margin: 0; font-size: 22px; font-weight: 700; letter-spacing: -.01em; line-height: 1.3; }
+  .doc-read-sub { margin: 4px 0 0; font-size: 13px; color: var(--ink2); }
+  .doc-read-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+
+  /* Section micro-label (ported Section) — mono · uppercase · wide tracking. */
+  .doc-sec {
+    font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .14em;
+    font-family: var(--font-mono); color: var(--ink3);
+    margin: 22px 0 8px; padding-bottom: 4px; border-bottom: 1px solid var(--edge);
+  }
+  .doc-card {
+    padding: 14px 16px; border: 1px solid var(--edge); border-radius: var(--radius);
+    background: var(--surface); box-shadow: var(--card-shadow);
+    backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  /* A reading chunk with a state-keyed left strip (matches the pro-board 3px). */
+  .doc-chunk { position: relative; padding: 10px 14px; margin-bottom: 6px; border-radius: var(--radius-sm); }
+  .doc-chunk::before { content: ""; position: absolute; inset: 2px auto 2px 0; width: 3px; border-radius: 2px; background: var(--ink3); }
+  .doc-chunk-ok::before { background: var(--ok); }
+  .doc-chunk-warn::before { background: var(--warn); }
+  .doc-chunk-crit::before { background: var(--crit); }
+  .doc-chunk-text { margin: 0; font-size: 14px; line-height: 1.75; color: var(--ink); }
+  .doc-card .doc-chunk-text + .doc-chunk-text { margin-top: 10px; }
+  .doc-chunk-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; }
+  .doc-chunk-claims { font-family: var(--font-mono); font-size: 9.5px; color: var(--ink3); }
+
+  /* Coverage / label badge (ported CovBadge/Badge) — squarer family pill. */
+  .doc-cov {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-family: var(--font-mono); font-size: 9.5px; font-weight: 600; letter-spacing: .04em;
+    text-transform: uppercase; padding: 2px 8px; border-radius: 999px; white-space: nowrap;
+    color: var(--ink2); background: var(--surface2); border: 1px solid var(--edge);
+  }
+  .doc-cov-ok { color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); border-color: color-mix(in srgb, var(--ok) 30%, transparent); }
+  .doc-cov-warn { color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); border-color: color-mix(in srgb, var(--warn) 30%, transparent); }
+  .doc-cov-crit { color: var(--crit); background: color-mix(in srgb, var(--crit) 12%, transparent); border-color: color-mix(in srgb, var(--crit) 30%, transparent); }
+  .doc-cov-trust { color: var(--trust); background: color-mix(in srgb, var(--trust) 12%, transparent); border-color: color-mix(in srgb, var(--trust) 30%, transparent); }
+
+  /* Evidence panel (right zone). */
+  .doc-evidence { min-width: 0; display: flex; flex-direction: column; }
+  .doc-ev-host { display: flex; flex-direction: column; gap: 8px; }
+  /* EvidenceCard (ported) — a card with a role-keyed left strip. */
+  .doc-evcard {
+    position: relative; padding: 11px 13px 11px 15px; margin-bottom: 8px;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm);
+    background: var(--surface); box-shadow: var(--card-shadow);
+  }
+  .doc-evcard::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 2px; border-radius: 2px 0 0 2px; background: var(--ink3); }
+  .doc-ev-ok::before { background: var(--ok); }
+  .doc-ev-trust::before { background: var(--trust); }
+  .doc-ev-warn::before { background: var(--warn); }
+  .doc-evcard-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 5px; }
+  .doc-evcard-domain { font-family: var(--font-mono); font-size: 10px; font-weight: 600; color: var(--acc); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .doc-evcard-quote {
+    font-size: 11.5px; font-style: italic; line-height: 1.5; color: var(--ink);
+    padding: 5px 9px; margin-bottom: 6px; border-radius: 0 6px 6px 0;
+    border-left: 2px solid color-mix(in srgb, var(--acc) 40%, transparent);
+    background: color-mix(in srgb, var(--acc) 7%, transparent);
+  }
+  .doc-evcard-summary { font-size: 11.5px; line-height: 1.5; color: var(--ink2); margin-bottom: 6px; }
+  .doc-evcard-foot { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-top: 4px; font-size: 10px; color: var(--ink3); }
+  .doc-evcard-ts { font-family: var(--font-mono); font-size: 9px; color: var(--ink3); flex: none; }
+
+  /* Receipt chip (ported Receipt) — mono ⛓ hash rows. */
+  .doc-receipt {
+    display: flex; align-items: center; gap: 8px; padding: 7px 10px; margin-bottom: 6px;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2);
+  }
+  .doc-receipt-id { font-family: var(--font-mono); font-size: 10.5px; color: var(--trust); flex: none; }
+  .doc-receipt-label { font-size: 11px; color: var(--ink2); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .doc-receipt-ts { margin-left: auto; font-family: var(--font-mono); font-size: 9px; color: var(--ink3); flex: none; }
+
+  /* Phone sources sheet — the reader's document list as a collapsible sheet.
+     Hidden on the desktop tier (the rail tree is the source list there). */
+  .doc-sources-sheet { display: none; }
+  @media (max-width: 720px) {
+    .doc-sources-sheet {
+      display: block; margin-bottom: 16px;
+      border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2);
+    }
+    .doc-sources-summary {
+      list-style: none; cursor: pointer; padding: 11px 14px; min-height: 44px;
+      display: flex; align-items: center; font-weight: 600; font-size: 13px; color: var(--ink);
+    }
+    .doc-sources-summary::-webkit-details-marker { display: none; }
+    .doc-sources-sheet[open] .doc-sources-summary { border-bottom: 1px solid var(--edge); }
+    .doc-sources-sheet .doc-tree { padding: 6px 8px 10px; }
+    .doc-main { max-width: none; }
+  }
+
+  /* ---- Documents-mode surfaces (M12) — the 11 ported WebCrux Proof surfaces
+     (webcrux-surfaces-demo-v3.jsx) rebuilt in v2 tokens. Every colour below is a
+     theme token (var(--…)) — the smoke (check 33) scans this delimited block and
+     rejects any hex/rgb literal. The composition (Section/Card rows, stat tiles,
+     coloured dots/badges, state strips) mirrors the JSX micro-kit. */
+  /* M12-SURFACE-CSS-START */
+  .doc-surface-wrap { grid-template-columns: 1fr; }
+  @media (min-width: 1280px) { .doc-surface-wrap { grid-template-columns: 1fr; } }
+  .doc-surface-main { min-width: 0; max-width: 920px; }
+  .doc-surface-note { margin: 4px 0 0; font-family: var(--font-mono); font-size: 10px; color: var(--ink3); }
+  .doc-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--ink3); flex: none; }
+  .doc-dot-ok { background: var(--ok); }
+  .doc-dot-warn { background: var(--warn); }
+  .doc-dot-crit { background: var(--crit); }
+  .doc-dot-trust { background: var(--trust); }
+  .doc-tiles { display: flex; flex-wrap: wrap; gap: 22px; }
+  .doc-tile-v { font-size: 20px; font-weight: 700; color: var(--ink); font-variant-numeric: tabular-nums; line-height: 1.1; }
+  .doc-tile-k { font-size: 10px; color: var(--ink3); text-transform: uppercase; letter-spacing: .06em; margin-top: 2px; }
+  .doc-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+  .doc-row-title { font-size: 13px; font-weight: 600; color: var(--ink); line-height: 1.4; }
+  .doc-row-text { font-size: 12.5px; color: var(--ink2); line-height: 1.55; }
+  .doc-arrow { color: var(--ink3); font-size: 13px; padding: 0 2px; }
+  /* A list/detail card (ported <Card> row) — a native disclosure. */
+  .doc-list-card { cursor: default; }
+  .doc-list-card > .doc-list-sum { list-style: none; cursor: pointer; display: block; }
+  .doc-list-card > .doc-list-sum::-webkit-details-marker { display: none; }
+  .doc-surface-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+  .doc-surface-row-main { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 6px; }
+  .doc-surface-row-side { flex: none; text-align: right; display: flex; flex-direction: column; gap: 3px; align-items: flex-end; font-family: var(--font-mono); font-size: 10px; color: var(--ink3); }
+  .doc-list-body { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--edge); }
+  .doc-list-card[open] > .doc-list-sum { margin-bottom: 2px; }
+  /* State-keyed 3px left strip (shares the pro-board geometry). */
+  .doc-strip { position: relative; padding-left: 16px; }
+  .doc-strip::before { content: ""; position: absolute; inset: 2px auto 2px 0; width: 3px; border-radius: 2px; background: var(--ink3); }
+  .doc-strip-ok::before { background: var(--ok); }
+  .doc-strip-warn::before { background: var(--warn); }
+  .doc-strip-crit::before { background: var(--crit); }
+  .doc-strip-trust::before { background: var(--trust); }
+  .doc-claim-row { display: flex; align-items: flex-start; gap: 8px; padding: 5px 0; border-bottom: 1px solid var(--edge); }
+  .doc-claim-row .doc-chunk-claims { margin-left: auto; }
+  .doc-dep-node { padding: 8px 10px; margin-bottom: 4px; border-left: 1px solid var(--edge); display: flex; flex-direction: column; gap: 5px; }
+  .doc-btn-row { display: flex; flex-wrap: wrap; gap: 8px; }
+  .doc-surface-empty { padding: 26px 16px; text-align: center; border: 1px dashed var(--edge); border-radius: var(--radius-sm); background: var(--surface2); }
+  .doc-diff-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .doc-diff-row { display: grid; grid-template-columns: 84px 1fr 1fr 52px; align-items: center; gap: 8px; }
+  @media (max-width: 560px) { .doc-diff-grid { grid-template-columns: 1fr; } .doc-diff-row { grid-template-columns: 1fr; } }
+  /* M12-SURFACE-CSS-END */
+
+  /* ---- Explorer (M11) — corpus search surface --------------------------
+     A query box + a Local | WikiCrux backend toggle (nav-family .btn-quiet,
+     aria-pressed) + a budget control, above a results column of cards. Cards
+     reuse .doc-card material; every field shown is real. Reads only, so it is
+     posture-independent. */
+  .explorer-region { display: flex; flex-direction: column; gap: 16px; max-width: 900px; }
+  .explorer-controls { display: flex; flex-direction: column; gap: 12px; }
+  .explorer-search { display: flex; gap: 10px; flex-wrap: nowrap; align-items: center; }
+  .explorer-input {
+    flex: 1 1 auto; min-width: 0; min-height: 42px; padding: 0 14px;
+    background: var(--surface2); border: 1px solid var(--edge); border-radius: 8px;
+    color: var(--ink); font: inherit; font-size: 14px;
+  }
+  .explorer-input:focus { border-color: var(--edge-strong); outline: none; }
+  /* Local | WikiCrux backend selector — a segmented toggle pinned to the right end. */
+  .explorer-toggle {
+    display: inline-flex; gap: 3px; flex: none; padding: 3px;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2);
+  }
+  .explorer-toggle .btn-quiet {
+    min-height: 34px; padding: 0 14px; font-size: 12.5px;
+    border: 1px solid transparent; border-radius: 8px;
+  }
+  .explorer-toggle .btn-quiet[aria-pressed="true"] {
+    background: var(--surface); color: var(--ink); border-color: var(--edge-strong);
+  }
+  @media (max-width: 620px) { .explorer-search { flex-wrap: wrap; } }
+  .explorer-budget { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--ink3); }
+  .explorer-budget input {
+    width: 84px; min-height: 32px; padding: 0 8px; background: var(--surface2);
+    border: 1px solid var(--edge); border-radius: 6px; color: var(--ink); font: inherit;
+  }
+  .explorer-results { display: flex; flex-direction: column; gap: 10px; }
+  .explorer-card {
+    padding: 12px 14px; border: 1px solid var(--edge); border-radius: var(--radius);
+    background: var(--surface); display: flex; flex-direction: column; gap: 6px; min-width: 0;
+  }
+  .explorer-card-top { display: flex; align-items: baseline; gap: 10px; justify-content: space-between; }
+  .explorer-card-title { font-weight: 600; font-size: 14px; color: var(--ink); min-width: 0; overflow-wrap: anywhere; }
+  .explorer-card-snippet { font-size: 13px; color: var(--ink2); line-height: 1.5; overflow-wrap: anywhere; }
+  .explorer-card-meta { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+
+  /* ---- Accessibility & motion ------------------------------------------- */
+  .skip {
+    position: absolute; left: -9999px; top: 0; z-index: 100;
+    padding: 10px 14px; background: var(--acc); color: #fff; border-radius: 0 0 8px 0; font-weight: 600;
+  }
+  .skip:focus { left: 0; }
+  *:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; border-radius: 6px; }
+  a:focus:not(:focus-visible), button:focus:not(:focus-visible) { outline: none; }
+
+  /* ---- Canvas (M9) — size-adaptive board + relation graph ---------------
+     The board is a CSS-grid of self-contained cells (auto-fill + span classes);
+     the tier (xs/s/m/l/xl) is picked by the pure canvasTier() and drives which
+     widgets appear — a 4K+ viewport fills the full board. The board itself is
+     the WebCrux tile canvas (M14, .cvx-* below): onion-layer tiles you drag,
+     pan, and expand in place. The graph is a no-dependency inline SVG with
+     drag-pan + wheel-zoom; every node colour is a theme token. */
+  .canvas-region { display: flex; flex-direction: column; gap: 16px; }
+  .canvas-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .canvas-seg { flex: none; }
+  /* ---- WebCrux tile canvas (M14) — §07 interaction grammar, ported ------- */
+  /* The measured values ARE the spec: easing cubic-bezier(.16,1,.3,1)
+     everywhere; entry scale(.92)+8px rise .4s (70ms stagger) · exit .25s;
+     hover lift −3px; sibling dim blur(18px) saturate(.2) opacity .15; 20px
+     snap-grid dots; form/stack breakpoints 768/640. Every colour resolves to a
+     theme token — the three themes restyle the canvas wholesale. */
+  .cvx-board { min-width: 0; }
+  .cvx-board-meta { margin-top: 8px; }
+  .cvx-surface {
+    position: relative; overflow: hidden; cursor: grab;
+    height: calc(100vh - 210px); min-height: 540px;
+    border-radius: var(--radius);
+  }
+  .cvx-surface.cvx-panning { cursor: grabbing; }
+  .cvx-surface.cvx-has-exp { cursor: default; }
+  /* Backdrop darkens softly behind an expanded tile. */
+  .cvx-surface::before {
+    content: ''; position: absolute; inset: 0; background: var(--bg);
+    opacity: 0; z-index: 1; pointer-events: none; transition: opacity .4s ease;
+  }
+  .cvx-surface.cvx-has-exp::before { opacity: .3; }
+  :root[data-theme="light"] .cvx-surface.cvx-has-exp::before { opacity: .15; }
+  /* The 20px snap grid — tile positions round to these cells. */
+  .cvx-grid {
+    position: absolute; inset: 0; pointer-events: none; z-index: 0;
+    background-image: radial-gradient(circle, var(--edge) 1px, transparent 1px);
+    background-size: 20px 20px;
+  }
+  /* The pannable layer: eased for auto-pan on expand; transition OFF while
+     actively panning so the drag tracks 1:1; GPU-promoted only during pan/
+     expand (a permanent will-change blurs composited text). */
+  .cvx-layer {
+    position: relative; width: 100%; min-height: 100%; z-index: 2;
+    transition: transform .6s cubic-bezier(.16,1,.3,1);
+  }
+  .cvx-surface.cvx-has-exp .cvx-layer,
+  .cvx-surface.cvx-panning .cvx-layer { will-change: transform; }
+  .cvx-surface.cvx-panning .cvx-layer { transition: none; }
+  /* ── Tiles ── */
+  .cvx-node {
+    position: absolute; display: flex; flex-direction: column; overflow: hidden;
+    background: var(--surface); border: 1px solid var(--edge); border-radius: var(--radius);
+    box-shadow: var(--card-shadow);
+    backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
+    cursor: grab; user-select: none; -webkit-user-select: none; outline: none;
+    transition:
+      transform .4s cubic-bezier(.16,1,.3,1),
+      box-shadow .2s ease,
+      opacity .4s ease,
+      filter .4s ease,
+      width .5s cubic-bezier(.16,1,.3,1),
+      height .5s cubic-bezier(.16,1,.3,1),
+      top .5s cubic-bezier(.16,1,.3,1),
+      left .5s cubic-bezier(.16,1,.3,1);
+    animation: cvx-enter .4s cubic-bezier(.16,1,.3,1) both;
+  }
+  @keyframes cvx-enter {
+    from { opacity: 0; transform: scale(.92) translateY(8px); }
+    to { opacity: 1; transform: none; }
+  }
+  .cvx-node:hover:not(.cvx-exp):not(.cvx-dim):not(.cvx-dragging):not(.cvx-chromeless) {
+    transform: translateY(-3px);   /* the Aurora lift */
+    border-color: var(--edge-strong);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.07), 0 20px 48px rgba(0,0,0,.5);
+  }
+  :root[data-theme="light"] .cvx-node:hover:not(.cvx-exp):not(.cvx-dim):not(.cvx-dragging):not(.cvx-chromeless) {
+    box-shadow: 0 2px 4px rgba(27,39,51,.06), 0 24px 52px rgba(27,39,51,.16);
+  }
+  .cvx-node:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; }
+  .cvx-node.cvx-dragging { cursor: grabbing; z-index: 50; transition: box-shadow .15s ease; }
+  .cvx-node.cvx-exp {
+    cursor: default; z-index: 100; border-color: var(--edge-strong);
+    box-shadow: 0 0 0 1px rgba(0,0,0,.05), 0 8px 16px -4px rgba(0,0,0,.2),
+      0 20px 40px -8px rgba(0,0,0,.35), 0 40px 80px -16px rgba(0,0,0,.45);
+  }
+  :root[data-theme="light"] .cvx-node.cvx-exp {
+    box-shadow: 0 0 0 1px rgba(27,39,51,.06), 0 8px 16px -4px rgba(27,39,51,.10), 0 24px 52px rgba(27,39,51,.16);
+  }
+  /* Sibling dim on expand — blur 18px · saturate .2 · opacity .15 (measured). */
+  .cvx-node.cvx-dim {
+    filter: blur(18px) saturate(.2) brightness(.6);
+    opacity: .15; transform: scale(.9); pointer-events: none;
+  }
+  /* Exit — .25s out (tiles leaving on a re-flow). */
+  .cvx-node.cvx-leave {
+    opacity: 0; transform: scale(.95); pointer-events: none;
+    transition: opacity .25s ease, transform .25s ease;
+  }
+  /* Accent top edge (3px) — keyed to theme tokens via data-accent. */
+  .cvx-accent {
+    position: absolute; top: 0; left: 0; right: 0; height: 3px;
+    background: var(--cvx-acc, var(--ink3)); opacity: .8; z-index: 3;
+  }
+  .cvx-node[data-accent="acc"] { --cvx-acc: var(--acc); }
+  .cvx-node[data-accent="ok"] { --cvx-acc: var(--ok); }
+  .cvx-node[data-accent="warn"] { --cvx-acc: var(--warn); }
+  .cvx-node[data-accent="crit"] { --cvx-acc: var(--crit); }
+  .cvx-node[data-accent="trust"] { --cvx-acc: var(--trust); }
+  .cvx-content {
+    padding: 13px 15px; flex: 1; min-height: 0;
+    display: flex; flex-direction: column; gap: 6px; overflow: hidden;
+  }
+  .cvx-node.cvx-exp .cvx-content { overflow-y: auto; padding: 15px 17px; }
+  .cvx-eyebrow { font: 600 9.5px var(--font-mono); letter-spacing: .12em; color: var(--ink3); text-transform: uppercase; }
+  .cvx-title { margin: 0; font-size: 15.5px; font-weight: 750; letter-spacing: -.015em; color: var(--ink); line-height: 1.25; }
+  .cvx-hero .cvx-title { font-size: 19px; }
+  .cvx-sub { margin: 0; font-size: 11.5px; font-weight: 500; color: var(--cvx-acc, var(--ink2)); line-height: 1.4; }
+  .cvx-node[data-accent="neutral"] .cvx-sub { color: var(--ink2); }
+  .cvx-body {
+    margin: 0; font-size: 12px; color: var(--ink2); line-height: 1.45;
+    overflow: hidden; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3;
+  }
+  .cvx-node.cvx-exp .cvx-body { display: block; -webkit-line-clamp: unset; overflow: visible; }
+  /* Drill-in body — hidden at base level, revealed on expand. */
+  .cvx-expbody { display: none; }
+  .cvx-node.cvx-exp .cvx-expbody {
+    display: flex; flex-direction: column; gap: 8px;
+    margin-top: 4px; padding-top: 8px; border-top: 1px solid var(--edge);
+  }
+  .cvx-expbody p { margin: 0; font-size: 12px; line-height: 1.6; color: var(--ink2); }
+  /* Live widget bodies — reused console surfaces render flush (no nested chrome). */
+  .cvx-live { flex: 1; min-width: 0; min-height: 0; overflow: hidden; display: flex; flex-direction: column; gap: 10px; }
+  .cvx-node.cvx-exp .cvx-live { overflow: visible; }
+  .cvx-live .v2card, .cvx-live .chart-card {
+    background: none; border: none; box-shadow: none;
+    backdrop-filter: none; -webkit-backdrop-filter: none; padding: 0;
+  }
+  .canvas-cell-body { min-width: 0; display: flex; flex-direction: column; gap: 12px; }
+  /* Receipt chip — mono, ✓ in --ok, scheme in --trust (the Aurora signature). */
+  .cvx-chip {
+    margin-top: auto; align-self: flex-start; display: inline-flex; gap: 7px; align-items: center;
+    font: 500 10px var(--font-mono); color: var(--ink2);
+    border: 1px solid var(--edge); border-radius: 8px; padding: 4px 9px; background: var(--surface2);
+    max-width: 100%; overflow: hidden; white-space: nowrap;
+  }
+  .cvx-chip-ok { color: var(--ok); }
+  .cvx-chip-sig { color: var(--trust); }
+  /* Chromeless — text straight on the canvas, no card chrome, never interactive. */
+  .cvx-node.cvx-chromeless {
+    background: transparent; border-color: transparent; box-shadow: none;
+    backdrop-filter: none; -webkit-backdrop-filter: none;
+    overflow: visible; pointer-events: none; cursor: default;
+  }
+  .cvx-node.cvx-chromeless .cvx-title { font-size: 26px; font-weight: 800; letter-spacing: -.03em; line-height: 1.1; }
+  .cvx-node.cvx-chromeless .cvx-sub { font-size: 13px; color: var(--ink2); }
+  .cvx-node.cvx-chromeless .cvx-body { color: var(--ink3); max-width: 42ch; }
+  /* Documents-mode canvas zone — full-width main column (a canvas, not prose;
+     the reader keeps its ~72ch measure). */
+  .doc-canvas { flex: 1; min-width: 0; }
+  .doc-canvas .cvx-surface { height: calc(100vh - 150px); }
+  /* ── Form / stack view (<640px — the PageView port: 12-col spans) ── */
+  .cvx-pv { max-width: 1024px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+  .cvx-pv-intro { padding: 4px 0 8px; }
+  .cvx-pv-title { margin: 0; font-size: 24px; font-weight: 800; letter-spacing: -.02em; color: var(--ink); line-height: 1.15; }
+  .cvx-pv-sub { margin: 6px 0 0; font-size: 13px; color: var(--ink2); }
+  .cvx-pv-body { margin: 8px 0 0; font-size: 12.5px; color: var(--ink3); max-width: 64ch; }
+  .cvx-pv-nav { display: flex; align-items: center; gap: 10px; }
+  .cvx-pv-grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 14px; }
+  .cvx-pv-grid .cvx-node, .cvx-pv .cvx-node.cvx-pv-focus {
+    position: relative; left: auto; top: auto; width: auto; height: auto;
+    min-height: 120px; cursor: pointer;
+  }
+  .cvx-pv-grid .cvx-node[data-span="4"] { grid-column: span 4; }
+  .cvx-pv-grid .cvx-node[data-span="6"] { grid-column: span 6; }
+  .cvx-pv-grid .cvx-node[data-span="8"] { grid-column: span 8; }
+  .cvx-pv-grid .cvx-node[data-span="12"] { grid-column: span 12; }
+  .cvx-pv .cvx-node.cvx-pv-focus { cursor: default; }
+  @media (max-width: 768px) {
+    .cvx-pv-grid .cvx-node[data-span] { grid-column: span 12; }
+    .cvx-pv-grid .cvx-node[data-span="6"] { grid-column: span 6; }
+  }
+  @media (max-width: 640px) {
+    .cvx-pv-grid { gap: 12px; }
+    .cvx-pv-grid .cvx-node[data-span] { grid-column: span 12; }
+  }
+  /* Reduced motion: the global reduce rule already kills every animation and
+     transition; the dim fallback additionally drops the blur so the dimmed
+     context stays readable (grammar-demo parity). */
+  @media (prefers-reduced-motion: reduce) {
+    .cvx-node { animation: none; }
+    .cvx-node.cvx-dim { filter: none; opacity: .3; transform: none; }
+  }
+
+  /* ---- Canvas relation graph — card nodes + node inspector --------------- */
+  .canvas-graph { position: relative; }
+  /* No frame — nodes drop straight onto the page; the stage is just the pannable area. */
+  .canvas-graph-stage {
+    position: relative; min-height: 640px; height: 74vh; overflow: hidden;
+    touch-action: none; cursor: grab;
+  }
+  .canvas-graph-stage:active { cursor: grabbing; }
+  .cv-graph-layer { position: absolute; top: 0; left: 0; transform-origin: 0 0; }
+  .cv-graph-edges { position: absolute; top: 0; left: 0; overflow: visible; pointer-events: none; }
+  /* Straight solid wires tipped with a solid arrowhead at the target box edge; a
+     pulse dot travels each wire source → target to show flow (JS-driven). */
+  .cv-gedge { stroke: var(--edge-strong); stroke-width: 2; fill: none; opacity: .85; stroke-linecap: round; }
+  .cv-gedge.is-hot { stroke: var(--acc); opacity: 1; stroke-width: 2.6; }
+  .cv-gedge.is-dim { opacity: .1; }
+  .cv-arrowhead { fill: var(--edge-strong); stroke: none; }
+  .cv-arrowhead-hot { fill: var(--acc); }
+  .cv-pulse { fill: var(--acc); filter: drop-shadow(0 0 3px color-mix(in srgb, var(--acc) 60%, transparent)); }
+  .cv-pulse.is-hot { r: 4; }
+  .cv-pulse.is-dim { opacity: 0 !important; }
+  /* Node cards */
+  .cv-card {
+    position: absolute; width: 300px; height: 128px; box-sizing: border-box; padding: 12px 14px;
+    /* Uniform height (matches CARD_H in render.js) so every node's edge ports line
+       up; content is vertically centred so short nodes don't read as top-heavy. */
+    display: flex; flex-direction: column; justify-content: center; overflow: hidden;
+    border: 1px solid var(--edge-strong); border-left: 3px solid var(--cv-c, var(--ink3)); border-radius: 12px;
+    /* Frosted glass, but lifted for contrast: a light tint over a semi-opaque
+       backing raises the card clearly above the near-black canvas, while the
+       backdrop blur still softens any wire passing UNDER it. */
+    background:
+      linear-gradient(90deg, color-mix(in srgb, var(--cv-c, var(--ink2)) 16%, transparent), color-mix(in srgb, var(--ink2) 5%, transparent) 65%),
+      color-mix(in srgb, var(--bg) 78%, transparent);
+    backdrop-filter: blur(8px) saturate(1.15); -webkit-backdrop-filter: blur(8px) saturate(1.15);
+    box-shadow: 0 6px 18px rgba(0,0,0,.45); cursor: grab; outline: none; user-select: none;
+    transition: border-color .12s ease, box-shadow .15s ease, transform .12s ease;
+  }
+  .cv-card:hover, .cv-card:focus-visible { transform: translateY(-2px); box-shadow: 0 14px 30px rgba(0,0,0,.4); }
+  .cv-card.is-dragging { cursor: grabbing; transform: none; box-shadow: 0 18px 40px rgba(0,0,0,.5); z-index: 50; transition: none; }
+  .cv-card.is-sel { border-color: var(--acc); box-shadow: 0 0 0 1px var(--acc), 0 14px 30px rgba(0,0,0,.45); }
+  .cv-card.is-dim { opacity: .3; }
+  .cv-card[data-type="session"] { --cv-c: var(--ok); }
+  .cv-card[data-type="work"] { --cv-c: var(--acc); }
+  .cv-card[data-type="work"][data-strip="blocked"], .cv-card[data-type="work"][data-strip="review"] { --cv-c: var(--warn); }
+  .cv-card[data-type="work"][data-strip="done"] { --cv-c: var(--ok); }
+  .cv-card[data-type="gate"] { --cv-c: var(--warn); }
+  .cv-card[data-type="passport"] { --cv-c: var(--trust); }
+  .cv-card[data-type="project"] { --cv-c: var(--acc); }
+  .cv-card-head { display: flex; align-items: center; gap: 8px; }
+  .cv-card-kind { font-family: var(--font-mono); font-size: 9px; letter-spacing: .14em; text-transform: uppercase; color: var(--ink3); font-weight: 600; }
+  .cv-card-badge { margin-left: auto; font-family: var(--font-mono); font-size: 9px; padding: 1px 8px; border-radius: 999px; background: var(--surface2); color: var(--ink2); border: 1px solid var(--edge); }
+  .cv-card-title { margin-top: 5px; font-size: 13px; font-weight: 640; line-height: 1.3; color: var(--ink); display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; word-break: break-word; }
+  .cv-card-sub { margin-top: 4px; font-size: 11px; color: var(--ink3); }
+  .cv-card-id { margin-top: 6px; font-family: var(--font-mono); font-size: 9.5px; color: var(--ink3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* Milestone progress on work / session nodes — fill uses the node's own accent. */
+  .cv-card-progrow { display: flex; align-items: center; gap: 7px; margin-top: 8px; }
+  .cv-card-prog { flex: 1; height: 5px; border-radius: 999px; background: var(--surface2); border: 1px solid var(--edge); overflow: hidden; }
+  .cv-card-prog-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, color-mix(in srgb, var(--cv-c, var(--acc)) 50%, var(--acc)), var(--cv-c, var(--acc))); }
+  .cv-card-progv { font-family: var(--font-mono); font-size: 9px; color: var(--ink3); white-space: nowrap; }
+  /* Node inspector — slides in from the right edge on node click; pin keeps it. */
+  .canvas-graph-inspector {
+    position: absolute; top: 0; right: 0; bottom: 0; width: 420px; max-width: 92%;
+    display: flex; flex-direction: column; min-width: 0; z-index: 4;
+    border: 1px solid var(--edge); border-radius: var(--radius);
+    /* Opaque — the surface tint composited over the page bg so nodes don't show through. */
+    background: linear-gradient(var(--surface), var(--surface)), var(--bg);
+    box-shadow: -14px 0 44px rgba(0,0,0,.42);
+    transform: translateX(calc(100% + 28px)); opacity: 0; pointer-events: none;
+    transition: transform .28s cubic-bezier(.4,0,.2,1), opacity .24s ease;
+  }
+  .canvas-graph-inspector.is-open { transform: translateX(0); opacity: 1; pointer-events: auto; }
+  .cv-insp-topbar { display: flex; align-items: center; gap: 8px; padding: 13px 14px 11px; border-bottom: 1px solid var(--edge); flex: none; }
+  .cv-insp-topbar .canvas-insp-type { flex: 1; }
+  .cv-insp-btn { width: 28px; height: 28px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid transparent; border-radius: 7px; background: none; color: var(--ink3); cursor: pointer; transition: color .15s ease, background .15s ease, border-color .15s ease; }
+  .cv-insp-btn:hover { color: var(--ink); background: var(--surface2); border-color: var(--edge); }
+  .cv-insp-btn svg { width: 15px; height: 15px; }
+  .cv-insp-pin[aria-pressed="true"] { color: var(--acc); background: color-mix(in srgb, var(--acc) 14%, transparent); border-color: color-mix(in srgb, var(--acc) 40%, transparent); }
+  .cv-insp-body { flex: 1; overflow: auto; padding: 14px 16px 18px; display: flex; flex-direction: column; gap: 10px; }
+  .canvas-insp-type { font-family: var(--font-mono); font-size: 9.5px; letter-spacing: .14em; text-transform: uppercase; color: var(--ink3); font-weight: 600; }
+  .cv-insp-badges { display: flex; gap: 6px; align-items: center; }
+  .cv-badge { font-family: var(--font-mono); font-size: 9px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; padding: 2px 8px; border-radius: 999px; }
+  .cv-badge-type { background: color-mix(in srgb, var(--acc) 16%, transparent); color: var(--acc); }
+  .cv-badge-state { background: var(--surface2); color: var(--ink2); border: 1px solid var(--edge); }
+  .cv-insp-title { margin: 2px 0 0; font-family: var(--font-mono); font-size: 15px; font-weight: 700; color: var(--ink); word-break: break-word; }
+  .cv-insp-sub { margin: 0; font-size: 12px; color: var(--ink3); }
+  .cv-insp-fields { display: flex; flex-direction: column; border-top: 1px solid var(--edge); padding-top: 6px; }
+  .cv-field { display: flex; gap: 12px; padding: 6px 0; border-bottom: 1px solid color-mix(in srgb, var(--edge) 55%, transparent); }
+  .cv-field-k { font-family: var(--font-mono); font-size: 10px; color: var(--ink3); min-width: 92px; flex: none; }
+  .cv-field-v { font-family: var(--font-mono); font-size: 11px; color: var(--ink); word-break: break-all; }
+  .cv-insp-json { margin: 4px 0 0; padding: 12px; border-radius: 10px; background: var(--surface2); border: 1px solid var(--edge); font-family: var(--font-mono); font-size: 10.5px; line-height: 1.5; color: var(--ink2); overflow-x: auto; white-space: pre; }
+  .cv-insp-linked-h { font-family: var(--font-mono); font-size: 9.5px; letter-spacing: .14em; text-transform: uppercase; color: var(--ink3); font-weight: 600; margin-top: 4px; }
+  .cv-linked-item { display: flex; gap: 8px; align-items: center; padding: 6px 0; cursor: pointer; border-bottom: 1px solid color-mix(in srgb, var(--edge) 55%, transparent); }
+  .cv-linked-item:hover .cv-linked-label { color: var(--acc); }
+  .cv-linked-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--acc); flex: none; }
+  .cv-linked-label { font-family: var(--font-mono); font-size: 11px; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cv-linked-sub { margin-left: auto; font-family: var(--font-mono); font-size: 9.5px; color: var(--ink3); flex: none; }
+  /* "View graph" cross-feature launch link — a small nav-family button. */
+  .cx-graphlink { min-height: 30px; padding: 0 11px; font-size: 12px; align-self: flex-start; }
+  @media (max-width: 720px) { .canvas-graph-inspector { width: 100%; max-width: 100%; } }
+
+  /* ---- Activity log (Work › Activity) — v2-themed rolling activity surface --- */
+  .act-log { display: flex; flex-direction: column; gap: 12px; }
+  .act-controls { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+  .act-field { display: flex; flex-direction: column; gap: 3px; font-family: var(--font-mono); font-size: 10px; color: var(--ink3); }
+  .act-input { min-height: 34px; min-width: 170px; padding: 0 10px; border: 1px solid var(--edge); border-radius: 8px; background: var(--surface2); color: var(--ink); font: inherit; font-size: 13px; }
+  .act-input.act-budget { min-width: 90px; }
+  .act-input:focus { border-color: var(--edge-strong); outline: none; }
+  .act-kinds { display: flex; gap: 5px; flex-wrap: wrap; align-self: center; }
+  .act-kchip { font-family: var(--font-mono); font-size: 10.5px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--edge); background: none; color: var(--ink3); cursor: pointer; }
+  .act-kchip.on { color: var(--ink); border-color: currentColor; }
+  .act-kchip.k-question.on { color: var(--acc); }
+  .act-kchip.k-answer.on { color: var(--ok); }
+  .act-kchip.k-command.on { color: var(--warn); }
+  .act-kchip.k-fact.on { color: var(--trust); }
+  .act-kchip.k-execplan.on, .act-kchip.k-handoff.on { color: #5EC2E7; }
+  .act-kchip.k-error.on { color: var(--crit); }
+  .act-status { display: flex; align-items: center; gap: 8px; font-family: var(--font-mono); font-size: 11px; color: var(--ink3); }
+  .act-livedot { width: 8px; height: 8px; border-radius: 999px; background: var(--ink3); flex: none; }
+  .act-livedot.on { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+  .act-list { display: flex; flex-direction: column; gap: 8px; }
+  .act-row { border: 1px solid var(--edge); border-left: 4px solid var(--ink3); border-radius: 10px; padding: 10px 13px; background: var(--surface); cursor: pointer; }
+  .act-row:hover { border-color: var(--edge-strong); }
+  .act-meta { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-family: var(--font-mono); font-size: 10.5px; color: var(--ink3); }
+  .act-kind { font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--ink2); }
+  .act-preview { margin-top: 4px; color: var(--ink2); white-space: pre-wrap; word-break: break-word; font-size: 13px; }
+  .act-expand { margin-top: 8px; border-top: 1px dashed var(--edge); padding-top: 8px; display: none; }
+  .act-row.open .act-expand { display: block; }
+  .act-verbatim { font-family: var(--font-mono); font-size: 12px; background: var(--surface2); border: 1px solid var(--edge); border-radius: 8px; padding: 10px; white-space: pre-wrap; word-break: break-word; color: var(--ink2); }
+  .act-receipts { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 5px; }
+  .act-badge { font-family: var(--font-mono); font-size: 10px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--edge); color: var(--ink3); }
+  .act-badge.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--edge)); }
+  .act-badge.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--edge)); }
+  .act-badge.err { color: var(--crit); border-color: color-mix(in srgb, var(--crit) 45%, var(--edge)); }
+  .act-row.k-question { border-left-color: var(--acc); }
+  .act-row.k-answer { border-left-color: var(--ok); }
+  .act-row.k-command { border-left-color: var(--warn); }
+  .act-row.k-fact { border-left-color: var(--trust); }
+  .act-row.k-execplan, .act-row.k-handoff { border-left-color: #5EC2E7; }
+  .act-row.k-error { border-left-color: var(--crit); }
+  .act-row.k-reasoning { border-left-color: var(--ink3); }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+    .aurora { animation: none !important; }
+  }
+
+  /* ---- Phone tier: bottom tab bar + "More" sheet (max-width:720px) ------ */
+  /* Desktop/tablet: the mobile chrome is inert (never painted); the rail is the
+     nav. All phone-tier colour comes from theme tokens, so every theme is right. */
+  .tabbar, .sheet, .sheet-scrim { display: none; }
+
+  @media (max-width: 720px) {
+    .app { grid-template-columns: 1fr; }
+    .rail { display: none; }                 /* hide the desktop rail entirely */
+    .content, .topbar { padding-left: 16px; padding-right: 16px; }
+    /* Reserve room so content never hides behind the fixed tab bar; add the iOS
+       home-indicator inset (env(safe-area-inset-bottom)). */
+    .content { padding-bottom: calc(66px + env(safe-area-inset-bottom, 0px) + 20px); }
+
+    /* Fixed bottom tab bar: four equal touch targets (≥44px). */
+    .tabbar {
+      display: flex;
+      position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
+      padding: 6px 6px calc(6px + env(safe-area-inset-bottom, 0px));
+      background: color-mix(in srgb, var(--bg) 90%, transparent);
+      border-top: 1px solid var(--edge);
+      backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
+    }
+    .tab {
+      flex: 1; min-height: 44px;
+      display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
+      padding: 4px 2px; border: 1px solid transparent; border-radius: var(--radius-sm);
+      background: none; color: var(--ink3); cursor: pointer;
+      transition: color .16s ease, background .16s ease;
+    }
+    .tab svg { width: 22px; height: 22px; }
+    .tab .tab-label { font-size: 10.5px; font-weight: 600; letter-spacing: .01em; }
+    .tab:hover { color: var(--ink2); }
+    .tab[aria-current="page"] { color: var(--acc); }
+    .tab[aria-current="page"] svg { opacity: 1; }
+
+    /* "More" bottom sheet + scrim. */
+    .sheet-scrim {
+      display: block; position: fixed; inset: 0; z-index: 25;
+      background: rgba(2, 5, 12, .5);
+    }
+    .sheet {
+      display: flex; flex-direction: column; gap: 14px;
+      position: fixed; left: 0; right: 0; bottom: 0; z-index: 26;
+      max-height: 80vh; overflow-y: auto;
+      padding: 10px 16px calc(20px + env(safe-area-inset-bottom, 0px));
+      background: var(--surface); border-top: 1px solid var(--edge-strong);
+      border-radius: 18px 18px 0 0;
+      backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
+    }
+    .sheet[hidden], .sheet-scrim[hidden] { display: none; }
+    .sheet-handle {
+      width: 40px; height: 4px; border-radius: 999px; background: var(--edge-strong);
+      margin: 2px auto 2px;
+    }
+    .sheet-title {
+      font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+      color: var(--ink3); font-weight: 600; padding: 0 2px 2px;
+    }
+    .sheet-nav { display: flex; flex-direction: column; gap: 4px; }
+    .sheet-item {
+      display: flex; align-items: center; gap: 12px;
+      min-height: 44px; padding: 0 12px; width: 100%; text-align: left;
+      border: 1px solid transparent; border-radius: var(--radius-sm);
+      background: none; color: var(--ink2); cursor: pointer; font: inherit;
+      transition: background .16s ease, color .16s ease;
+    }
+    .sheet-item svg { width: 20px; height: 20px; flex: none; opacity: .9; }
+    .sheet-item .label { flex: 1; font-weight: 500; }
+    .sheet-item:hover { background: var(--surface2); color: var(--ink); }
+    .sheet-item[aria-current="page"] { background: var(--surface2); color: var(--ink); border-color: var(--edge-strong); }
+    .sheet-item[aria-current="page"] svg { opacity: 1; color: var(--acc); }
+    .sheet-chrome { display: flex; flex-direction: column; gap: 10px; padding-top: 6px; border-top: 1px solid var(--edge); }
+  }
+</style>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to console content</a>
+  <div class="aurora" aria-hidden="true"></div>
+
+  <div class="app">
+    <aside class="rail">
+      <div class="brand">
+        <span class="mark" aria-hidden="true"></span>
+        <span class="name">Crux Console<small>Unified shell · v2</small></span>
+        <button class="rail-toggle" id="railToggle" type="button" aria-expanded="true" aria-label="Collapse navigation" title="Collapse navigation"></button>
+      </div>
+      <!-- Compact meta cluster (condensed from the old top bar): the Command |
+           Explore surface toggle + the status chips + the connection pill. -->
+      <div class="rail-meta" id="railMeta">
+        <div class="modeseg railseg" id="modeSeg" role="group" aria-label="Surface"></div>
+        <div class="rail-chips">
+          <div class="topchips" id="topchips"></div>
+          <span class="health" id="health" role="status" aria-live="polite">
+            <span class="dot" aria-hidden="true"></span>
+            <span id="healthText">Connecting…</span>
+          </span>
+          <button class="rail-theme-cycle" id="themeCycle" type="button" title="Cycle theme" aria-label="Cycle theme"></button>
+        </div>
+      </div>
+      <nav id="nav" aria-label="Primary"></nav>
+      <div class="rail-footer">
+        <div class="acct-menu-wrap" id="acctWrap">
+          <div class="acct-menu" id="acctMenu" role="menu" aria-label="Account &amp; system" hidden>
+            <button class="acct-item" type="button" data-acct="settings" role="menuitem"><span class="acct-ico" data-ico="settings" aria-hidden="true"></span>Settings</button>
+            <button class="acct-item" type="button" data-acct="language" role="menuitem"><span class="acct-ico" data-ico="globe" aria-hidden="true"></span>Language<span class="acct-code" id="acctLangCode">EN</span></button>
+            <div class="acct-sep"></div>
+            <button class="acct-item" type="button" data-acct="logout" role="menuitem"><span class="acct-ico" data-ico="logout" aria-hidden="true"></span>Log out</button>
+          </div>
+          <button class="passport-chip" id="passportChip" type="button" aria-haspopup="menu" aria-expanded="false" title="Account &amp; system">
+            <span class="avatar" aria-hidden="true"></span>
+            <span class="who">
+              <b id="passportName">Passport</b>
+              <span id="passportSub">not yet wired</span>
+            </span>
+            <span class="acct-caret" aria-hidden="true"></span>
+          </button>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main" id="main">
+      <div class="topbar">
+        <div class="topbar-title">
+          <h1 id="destTitle">Overwatch</h1>
+          <p class="sub" id="destSub">Loading…</p>
+        </div>
+        <form class="searchstub" id="searchStub" role="search" aria-label="Search">
+          <span class="ss-ico" aria-hidden="true"></span>
+          <input class="ss-input" id="searchStubInput" type="search" placeholder="Search facts, plans, receipts…" aria-label="Search query" autocomplete="off">
+          <kbd>⌘K</kbd>
+        </form>
+      </div>
+      <div class="content" id="content"></div>
+    </main>
+  </div>
+
+  <!-- Phone tier (max-width:720px): fixed bottom tab bar + "More" bottom sheet.
+       Inert on desktop (CSS display:none). The tab bar carries four ≥44px targets
+       (Overwatch · Work · Trust · More); "More" opens the sheet, which lists the
+       remaining destinations (Memory · Meters · System) plus the passport chip +
+       theme switch relocated from the rail. Built + wired by the script below. -->
+  <nav class="tabbar" id="tabbar" aria-label="Primary (mobile)"></nav>
+  <div class="sheet-scrim" id="sheetScrim" hidden></div>
+  <aside class="sheet" id="moreSheet" role="dialog" aria-modal="true" aria-label="More destinations" hidden>
+    <div class="sheet-handle" aria-hidden="true"></div>
+    <div class="sheet-title">More</div>
+    <div class="sheet-nav" id="sheetNav"></div>
+    <div class="sheet-chrome" id="sheetChromeSlot"></div>
+  </aside>
+
+<!-- No-build module split, served same-origin (console.rs embeds these). api.js
+     is the generated allowlist fetch client (must load first — pages/render use
+     window.CruxApi); pages.js carries the ported 26-page registry; render.js is
+     the DSL renderer. -->
+<script src="/console-v2/api.js"></script>
+<script src="/console-v2/pages.js"></script>
+<script src="/console-v2/render.js"></script>
+<script>
+"use strict";
+(function () {
+  // ---- Inline SVG icon set (no emoji, no external assets) ----------------
+  var ICONS = {
+    logo: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 1 0 9 9"/><path d="M12 3v9l6 3"/></svg>',
+    overwatch: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/></svg>',
+    work: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="5" height="16" rx="1"/><rect x="10" y="4" width="5" height="10" rx="1"/><rect x="17" y="4" width="4" height="13" rx="1"/></svg>',
+    memory: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>',
+    trust: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"/><path d="M9 12l2 2 4-4"/></svg>',
+    meters: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19a8 8 0 0 1 16 0"/><path d="M12 19l4-5"/><circle cx="12" cy="19" r="1.4"/></svg>',
+    canvas: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>',
+    search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>',
+    map: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="5" rx="1.4"/><rect x="3" y="16" width="6" height="5" rx="1.4"/><rect x="15" y="16" width="6" height="5" rx="1.4"/><path d="M12 8v4M6 16v-2.5h12V16"/></svg>',
+    lock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>',
+    palette: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 1 0 0 18c1 0 1.6-.8 1.6-1.7 0-.5-.2-.9-.5-1.2-.3-.3-.5-.7-.5-1.1 0-.9.8-1.7 1.7-1.7H16a5 5 0 0 0 5-5c0-4.1-4-7.3-9-7.3z"/><circle cx="7.5" cy="11.5" r="1"/><circle cx="12" cy="8" r="1"/><circle cx="16.5" cy="11.5" r="1"/></svg>',
+    globe: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.6 2.5 4 5.6 4 9s-1.4 6.5-4 9c-2.6-2.5-4-5.6-4-9s1.4-6.5 4-9z"/></svg>',
+    logout: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3"/><path d="M10 17l-5-5 5-5"/><path d="M5 12h11"/></svg>',
+    dataplane: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 12a7.5 7.5 0 0 1 15 0"/><path d="M8 12a4 4 0 0 1 8 0"/><circle cx="12" cy="12" r="1.3" fill="currentColor" stroke="none"/></svg>',
+    settings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.6 1.6 0 0 0-1-1.5 1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.6 1.6 0 0 0 1.5-1 1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H9a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V9a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z"/></svg>',
+    integrations: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v6"/><path d="M8 9V5M16 9V5"/><rect x="6" y="9" width="12" height="6" rx="2"/><path d="M12 15v3a3 3 0 0 0 3 3"/></svg>',
+    developer: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 9l-4 3 4 3"/><path d="M16 9l4 3-4 3"/><path d="M13 6l-2 12"/></svg>',
+    passport: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="9" r="3"/><path d="M6 20a6 6 0 0 1 12 0"/></svg>',
+    more: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="19" cy="12" r="1.4"/></svg>',
+    chevron: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"/></svg>',
+    glass: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l2.2 4.8L19 9l-3.5 3.4.9 4.9L12 15l-4.4 2.3.9-4.9L5 9l4.8-1.2z"/></svg>',
+    dark: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a7 7 0 1 0 10.5 10.5z"/></svg>',
+    light: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4.2"/><path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M19.1 4.9l-1.8 1.8M6.7 17.3l-1.8 1.8"/></svg>'
+  };
+
+  // ---- Theme registry ----------------------------------------------------
+  // Adding a theme = one entry here + one CSS block in <style>. `tokens`
+  // documents the palette the CSS block sets and drives no colour by itself.
+  var LS_THEME = 'crux.console.theme';
+  var DEFAULT_THEME = 'glass';
+  var THEMES = [
+    { id: 'glass', label: 'Glass', icon: 'glass', tokens: {
+      bg: '#060A12', surface: 'rgba(255,255,255,.055)', surface2: 'rgba(255,255,255,.03)',
+      edge: 'rgba(255,255,255,.10)', edgeStrong: 'rgba(255,255,255,.18)',
+      ink: '#EAF0F7', ink2: '#93A4B8', ink3: '#6E7E96',
+      acc: '#6CA8FF', ok: '#3DDC97', warn: '#F5B94B', crit: '#F0716C', trust: '#A78BFA',
+      approveA: '#43E6A2', approveB: '#2BB983', approveInk: '#05261A', blur: '18px' } },
+    { id: 'dark', label: 'Dark', icon: 'dark', tokens: {
+      bg: '#0D1117', surface: '#161B22', surface2: '#11151C',
+      edge: '#2A313C', edgeStrong: '#3D4654',
+      ink: '#E6EDF3', ink2: '#9BA7B4', ink3: '#6E7B8A',
+      acc: '#58A6FF', ok: '#2EA043', warn: '#D29922', crit: '#F85149', trust: '#BC8CFF',
+      approveA: '#2EA043', approveB: '#238636', approveInk: '#FFFFFF', blur: '0px' } },
+    { id: 'light', label: 'Light', icon: 'light', tokens: {
+      bg: '#F4F6F8', surface: '#FFFFFF', surface2: '#EDF1F5',
+      edge: '#D7DEE5', edgeStrong: '#B9C4CF',
+      ink: '#1B2733', ink2: '#4A5866', ink3: '#5B6B7D',
+      acc: '#2456A6', ok: '#1A7F4E', warn: '#9A5B00', crit: '#B91C1C', trust: '#6D28D9',
+      approveA: '#1A7F4E', approveB: '#14663E', approveInk: '#FFFFFF', blur: '0px' } }
+  ];
+  function themeById(id) {
+    for (var i = 0; i < THEMES.length; i++) { if (THEMES[i].id === id) return THEMES[i]; }
+    return null;
+  }
+  function readTheme() {
+    try { var t = localStorage.getItem(LS_THEME); return themeById(t) ? t : DEFAULT_THEME; }
+    catch (e) { return DEFAULT_THEME; }
+  }
+  // Which themes the rail quick-cycle button rotates through (allocated in
+  // System › Settings › Theme). Defaults to all themes; never empty.
+  var LS_THEME_CYCLE = 'crux.console.theme.cycle';
+  function allThemeIds() { return THEMES.map(function (t) { return t.id; }); }
+  function readThemeCycle() {
+    try {
+      var raw = localStorage.getItem(LS_THEME_CYCLE);
+      if (!raw) { return allThemeIds(); }
+      var ids = raw.split(',').filter(function (id) { return themeById(id); });
+      return ids.length ? ids : allThemeIds();
+    } catch (e) { return allThemeIds(); }
+  }
+  function writeThemeCycle(ids) { try { localStorage.setItem(LS_THEME_CYCLE, ids.join(',')); } catch (e) { /* private mode */ } }
+  function applyTheme(id) {
+    if (!themeById(id)) id = DEFAULT_THEME;
+    document.documentElement.setAttribute('data-theme', id);
+    try { localStorage.setItem(LS_THEME, id); } catch (e) { /* private mode: in-memory only */ }
+    var btns = document.querySelectorAll('.theme-btn');
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].setAttribute('aria-pressed', btns[i].getAttribute('data-theme') === id ? 'true' : 'false');
+    }
+    var cyc = document.getElementById('themeCycle');
+    if (cyc) { var t = themeById(id); cyc.title = 'Theme: ' + (t ? t.label : id) + ' — click to cycle'; }
+  }
+  // Advance to the next allocated theme (rail cycle button).
+  function cycleTheme() {
+    var cycle = readThemeCycle();
+    if (!cycle.length) { return; }
+    var idx = cycle.indexOf(readTheme());
+    applyTheme(cycle[(idx + 1) % cycle.length]);
+  }
+  function initThemeCycle() {
+    var cyc = document.getElementById('themeCycle');
+    if (!cyc) { return; }
+    cyc.innerHTML = ICONS.palette || '';
+    cyc.addEventListener('click', cycleTheme);
+    applyTheme(readTheme());   // set the tooltip
+  }
+  // System › Settings › Theme — the theme picker (moved off the rail footer) plus
+  // per-theme "in cycle" allocation for the rail quick-cycle button.
+  function buildThemeCard() {
+    var card = el('div', { 'class': 'v2card wide theme-card' });
+    card.appendChild(el('h3', { 'class': 'v2card-h' }, ['Theme']));
+    card.appendChild(el('p', { 'class': 'v2card-sub' }, ['Pick the console theme, and choose which themes the quick-cycle button (top of the rail) rotates through.']));
+    var body = el('div', { 'class': 'v2card-body' });
+    var cur = readTheme();
+    var cycle = readThemeCycle();
+    var grid = el('div', { 'class': 'theme-grid' });
+    THEMES.forEach(function (t) {
+      var btn = el('button', { 'class': 'theme-btn theme-opt-btn', type: 'button', 'data-theme': t.id, 'aria-pressed': cur === t.id ? 'true' : 'false', title: t.label + ' theme' });
+      btn.innerHTML = ICONS[t.icon] || '';
+      btn.appendChild(el('span', { 'class': 'theme-opt-label', text: t.label }));
+      btn.addEventListener('click', function () { applyTheme(t.id); });
+      var cb = el('input', { type: 'checkbox' });
+      cb.checked = cycle.indexOf(t.id) >= 0;
+      cb.addEventListener('change', function () {
+        var want = readThemeCycle();
+        want = allThemeIds().filter(function (id) { return id === t.id ? cb.checked : want.indexOf(id) >= 0; });
+        if (!want.length) { want = [t.id]; cb.checked = true; }
+        writeThemeCycle(want);
+      });
+      var inc = el('label', { 'class': 'theme-cycle-toggle' }, [cb, el('span', { text: 'in cycle' })]);
+      grid.appendChild(el('div', { 'class': 'theme-opt' }, [btn, inc]));
+    });
+    body.appendChild(grid);
+    card.appendChild(body);
+    return card;
+  }
+  // Bottom account roll-up menu (Settings · Language · Log out) — the System
+  // destination moved here, Claude-desktop style. Settings routes to System ›
+  // Settings; Language + Log out are placeholders until platform auth is wired
+  // (a local daemon has no session to end).
+  function initAcctMenu() {
+    var btn = document.getElementById('passportChip');
+    var menu = document.getElementById('acctMenu');
+    if (!btn || !menu) { return; }
+    var icons = menu.querySelectorAll('.acct-ico');
+    for (var i = 0; i < icons.length; i++) { icons[i].innerHTML = ICONS[icons[i].getAttribute('data-ico')] || ''; }
+    var caret = btn.querySelector('.acct-caret'); if (caret) { caret.innerHTML = ICONS.chevron || ''; }
+    function closeMenu() { menu.hidden = true; btn.setAttribute('aria-expanded', 'false'); }
+    function openMenu() { menu.hidden = false; btn.setAttribute('aria-expanded', 'true'); }
+    btn.addEventListener('click', function (e) { e.stopPropagation(); if (menu.hidden) { openMenu(); } else { closeMenu(); } });
+    menu.addEventListener('click', function (e) {
+      var item = (e.target && e.target.closest) ? e.target.closest('.acct-item') : null;
+      if (!item) { return; }
+      closeMenu();
+      if (item.getAttribute('data-acct') === 'settings') { location.hash = '#/system/cx-settings'; }
+      // language / logout — placeholders (a local daemon has no session).
+    });
+    document.addEventListener('click', function () { if (!menu.hidden) { closeMenu(); } });
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !menu.hidden) { closeMenu(); } });
+  }
+
+  // ---- Presentation mode registry (Standard | Professional | Documents) --
+  // Mode is PRESENTATION, never posture: a customer sees the SAME gated surface
+  // in every mode. Standard is the curated forward-facing view; Professional
+  // adds density + the full page/section surface + the full pill row. 'documents'
+  // (activated in M10) turns the console into a READER — a slimmed document-tree
+  // rail, a ~72ch reading surface, and an evidence side panel. All three modes
+  // are now selectable. applyMode NEVER touches posture (no setPosture /
+  // isOperator / CRUX_POSTURE) — the two axes are strictly independent (smoke
+  // check 23). Standard/Professional destinations are hidden while in Documents;
+  // the mode segment is the way back, and a deep link to any #/<destination>
+  // auto-switches the mode back to standard (see route()).
+  var LS_MODE = 'crux.console.mode';
+  var LS_DENSITY = 'crux.console.density';
+  var DEFAULT_MODE = 'standard';
+  var DEFAULT_DENSITY = 'standard';
+  // Top-level surface toggle: Command (the ops console) | Explore (the reader).
+  // Command's DENSITY (Standard | Professional) is a preference set in System ›
+  // Settings, NOT a top-level button. Explore == the old 'documents' reader
+  // surface. data-mode still carries standard|professional|documents underneath,
+  // so every existing density CSS rule + render.js proMode()/documents path is
+  // untouched — only the visible control is re-shaped.
+  var SURFACES = [
+    { id: 'command', label: 'Command' },
+    { id: 'explore', label: 'Explore' }
+  ];
+  function isSelectableMode(id) { return id === 'professional' || id === 'documents' || id === DEFAULT_MODE; }
+  function readMode() {
+    try { var m = localStorage.getItem(LS_MODE); return isSelectableMode(m) ? m : DEFAULT_MODE; }
+    catch (e) { return DEFAULT_MODE; }
+  }
+  function readDensity() {
+    try { return localStorage.getItem(LS_DENSITY) === 'professional' ? 'professional' : DEFAULT_DENSITY; }
+    catch (e) { return DEFAULT_DENSITY; }
+  }
+  function surfaceOf(mode) { return mode === 'documents' ? 'explore' : 'command'; }
+  function syncModeSeg(mode) {
+    var surface = surfaceOf(mode);
+    var btns = document.querySelectorAll('#modeSeg .modeseg-btn');
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].setAttribute('aria-pressed', btns[i].getAttribute('data-surface') === surface ? 'true' : 'false');
+    }
+  }
+  function buildModeSeg() {
+    var wrap = document.getElementById('modeSeg');
+    if (!wrap) { return; }
+    wrap.textContent = '';
+    for (var i = 0; i < SURFACES.length; i++) {
+      var s = SURFACES[i];
+      var b = el('button', {
+        'class': 'modeseg-btn', type: 'button', 'data-surface': s.id, 'aria-pressed': 'false',
+        title: s.label
+      }, [s.label]);
+      (function (id) { b.addEventListener('click', function () { applySurface(id); }); })(s.id);
+      wrap.appendChild(b);
+    }
+  }
+  // Set the mode WITHOUT re-rendering (used by route() when a deep link to a real
+  // destination auto-switches the reader back to a console density). Presentation only.
+  function setModeSilently(id) {
+    if (!isSelectableMode(id)) { id = DEFAULT_MODE; }
+    document.documentElement.setAttribute('data-mode', id);
+    try { localStorage.setItem(LS_MODE, id); } catch (e) { /* private mode */ }
+    if (typeof window !== 'undefined') { window.CRUX_MODE = id; }
+    syncModeSeg(id);
+  }
+  function applyMode(id) {
+    // Underlying modes: standard | professional | documents. Presentation only —
+    // no posture side effects. Documents drives the hash to the reader
+    // (#/documents); leaving Documents returns to the default destination.
+    if (!isSelectableMode(id)) { id = DEFAULT_MODE; }
+    setModeSilently(id);
+    if (id === 'documents') {
+      if (!/^#\/documents/.test(location.hash || '')) { location.hash = '#/documents'; return; }   // hashchange → route()
+    } else if (/^#\/documents/.test(location.hash || '')) {
+      location.hash = '#/' + (DESTS[0] && DESTS[0].id); return;   // hashchange → route()
+    }
+    route();   // re-render: density change / Pro-only surface, or the reader
+  }
+  // Top-level surface switch. Command → the density-selected console (standard |
+  // professional, per the Settings preference); Explore → the documents reader.
+  function applySurface(id) {
+    if (id !== 'explore') { applyMode(readDensity()); return; }
+    // Explore lands on the Explorer search — its centred entry surface. Staying
+    // within #/documents keeps whatever Explore page is already open.
+    setModeSilently('documents');
+    if (/^#\/documents/.test(location.hash || '')) { route(); }
+    else { location.hash = '#/documents/explorer'; }
+  }
+  // Command density (Standard | Professional), set from System › Settings. Applies
+  // live when currently on the Command surface; always persisted for next entry.
+  function setDensity(d) {
+    d = (d === 'professional') ? 'professional' : 'standard';
+    try { localStorage.setItem(LS_DENSITY, d); } catch (e) { /* private mode */ }
+    var cur = (typeof window !== 'undefined' && window.CRUX_MODE) || readMode();
+    if (cur !== 'documents') { applyMode(d); }
+    syncDensitySegs();
+  }
+  function syncDensitySegs() {
+    var d = readDensity();
+    var btns = document.querySelectorAll('.densityseg .modeseg-btn');
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].setAttribute('aria-pressed', btns[i].getAttribute('data-density') === d ? 'true' : 'false');
+    }
+  }
+  function initMode() {
+    var m = readMode();
+    if (typeof window !== 'undefined') { window.CRUX_MODE = m; }
+    document.documentElement.setAttribute('data-mode', m);
+    buildModeSeg();
+    syncModeSeg(m);
+  }
+  // The top bar is transparent until the view scrolls under it, then goes glass.
+  // The window is the scroll container (rail is sticky, content has no overflow).
+  function wireTopbarScroll() {
+    var bar = document.querySelector('.topbar');
+    if (!bar) { return; }
+    var onScroll = function () {
+      var y = window.scrollY || document.documentElement.scrollTop || 0;
+      bar.classList.toggle('scrolled', y > 4);
+    };
+    window.addEventListener('scroll', onScroll, { passive: true });
+    onScroll();
+  }
+  // Top-right search field. Type + Enter (submit) carries the query into the
+  // Explorer surface (via CRUX_PENDING_QUERY, consumed by render.renderExplorer).
+  // ⌘K / Ctrl+K focuses the field.
+  function initSearchStub() {
+    var form = document.getElementById('searchStub');
+    if (!form) { return; }
+    var ico = form.querySelector('.ss-ico');
+    if (ico) { ico.innerHTML = ICONS.search; }
+    var input = document.getElementById('searchStubInput');
+    form.addEventListener('submit', function (e) {
+      e.preventDefault();
+      var q = (input && input.value || '').trim();
+      if (typeof window !== 'undefined') { window.CRUX_PENDING_QUERY = q; }
+      if (input) { input.value = ''; input.blur(); }
+      if (/^#\/documents\/explorer/.test(location.hash || '')) { route(); }
+      else { location.hash = '#/documents/explorer'; }
+    });
+    document.addEventListener('keydown', function (e) {
+      if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
+        e.preventDefault(); if (input) { input.focus(); input.select(); }
+      }
+    });
+  }
+  // The Command-density preference control, injected at the top of System ›
+  // Settings (Standard | Professional). Presentation only — never posture.
+  function buildDensityCard() {
+    var card = el('div', { 'class': 'v2card wide density-card' });
+    card.appendChild(el('h3', { 'class': 'v2card-h' }, ['Command density']));
+    card.appendChild(el('p', { 'class': 'v2card-sub' }, ['How dense the Command surface renders. Presentation only — it never changes what you can access.']));
+    var seg = el('div', { 'class': 'modeseg densityseg', role: 'group', 'aria-label': 'Command density' });
+    [['standard', 'Standard'], ['professional', 'Professional']].forEach(function (d) {
+      var b = el('button', { 'class': 'modeseg-btn', type: 'button', 'data-density': d[0], 'aria-pressed': readDensity() === d[0] ? 'true' : 'false' }, [d[1]]);
+      (function (id) { b.addEventListener('click', function () { setDensity(id); }); })(d[0]);
+      seg.appendChild(b);
+    });
+    var body = el('div', { 'class': 'v2card-body' }); body.appendChild(seg);
+    card.appendChild(body);
+    return card;
+  }
+
+  // ---- Posture (customer-safe, server-derived) ---------------------------
+  // Posture is a SERVER property, derived fresh at boot (see boot()) and cached
+  // in memory only — never localStorage. Default 'customer' until derivation
+  // completes; any element tagged data-requires="operator" is hidden unless
+  // POSTURE === 'operator'. render.js reads window.CRUX_POSTURE for the same call.
+  var POSTURE = 'customer';
+  if (typeof window !== 'undefined') { window.CRUX_POSTURE = POSTURE; }
+  function setPosture(p) {
+    POSTURE = (p === 'operator') ? 'operator' : 'customer';
+    if (typeof window !== 'undefined') { window.CRUX_POSTURE = POSTURE; }
+  }
+  function applyPosture(root) {
+    var scope = root || document;
+    var gated = scope.querySelectorAll('[data-requires="operator"]');
+    for (var i = 0; i < gated.length; i++) {
+      gated[i].hidden = (POSTURE !== 'operator');
+    }
+  }
+
+  // ---- Navigation model — sourced from the ported page registry ----------
+  // The 6 destinations + 26 pages live in pages.js (CruxPages). Each dest shows
+  // its real pages as a sub-nav pill row; pages render via render.js (CruxRender).
+  var CP = (typeof window !== 'undefined' && window.CruxPages) || { PAGES: {}, DESTS: [], LEGACY_IDS: [], MUTATING_ACTIONS: [] };
+  var DESTS = CP.DESTS;
+  var PAGES = CP.PAGES;
+  var DEST_INDEX = {};
+  for (var _di = 0; _di < DESTS.length; _di++) { DEST_INDEX[DESTS[_di].id] = DESTS[_di]; }
+  var PAGES_BY_DEST = {};
+  (function indexPages() {
+    for (var id in PAGES) {
+      var p = PAGES[id];
+      (PAGES_BY_DEST[p.dest] = PAGES_BY_DEST[p.dest] || []).push(p);
+    }
+  })();
+  function pagesForDest(destId) { return PAGES_BY_DEST[destId] || []; }
+  function firstPageId(destId) {
+    var list = pagesForDest(destId);
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].pill === false) { continue; }   // folded out of the pill row (reachable via the landing) — never the default
+      if (list[i].pro === true) { continue; }     // Pro-only ported page — never the default (stable across modes)
+      if (!(list[i].operatorOnly && POSTURE !== 'operator')) { return list[i].id; }
+    }
+    return list.length ? list[0].id : null;
+  }
+  var KEY_TO_DEST = {};
+  for (var _ki = 0; _ki < DESTS.length; _ki++) { if (DESTS[_ki].key) { KEY_TO_DEST[DESTS[_ki].key] = DESTS[_ki].id; } }
+
+  // ---- Boot state --------------------------------------------------------
+  var BOOT = { version: null, summary: null, health: 'loading', reason: '' };
+  // Which content the left rail currently holds: 'dest' (the destination nav) or
+  // 'docs' (the Documents-mode tree). renderDestination restores 'dest' when it
+  // finds the rail swapped to the tree (leaving Documents mode).
+  var RAIL_MODE = 'dest';
+
+  // ---- Small DOM + format helpers ---------------------------------------
+  function el(tag, attrs, children) {
+    var node = document.createElement(tag);
+    if (attrs) {
+      for (var k in attrs) {
+        if (k === 'html') { node.innerHTML = attrs[k]; }
+        else if (k === 'text') { node.textContent = attrs[k]; }
+        else if (attrs[k] != null) { node.setAttribute(k, attrs[k]); }
+      }
+    }
+    if (children) {
+      for (var i = 0; i < children.length; i++) {
+        var c = children[i];
+        if (c == null) continue;
+        node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+      }
+    }
+    return node;
+  }
+  function get(obj, path) {
+    var cur = obj;
+    for (var i = 0; i < path.length; i++) {
+      if (cur == null) return undefined;
+      cur = cur[path[i]];
+    }
+    return cur;
+  }
+  function fmtNum(n) {
+    if (typeof n !== 'number' || !isFinite(n)) return '—';
+    try { return n.toLocaleString('en-US'); } catch (e) { return String(n); }
+  }
+  function fmtPct(ratio) {
+    if (typeof ratio !== 'number' || !isFinite(ratio)) return '—';
+    return (ratio * 100).toFixed(ratio < 0.1 ? 1 : 0) + '%';
+  }
+  function fmtBytes(b) {
+    if (typeof b !== 'number' || !isFinite(b) || b < 0) return '—';
+    var u = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'], i = 0, v = b;
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+    return (v >= 10 || i === 0 ? Math.round(v) : v.toFixed(1)) + ' ' + u[i];
+  }
+  function str(v) { return (v == null || v === '') ? '—' : String(v); }
+
+  // ---- Network: never throws, never spams the console. Reads go through the
+  // generated allowlist client (window.CruxApi) — no raw fetches (M2 gate).
+  function fetchJSON(url) {
+    var api = (typeof window !== 'undefined') ? window.CruxApi : null;
+    if (!api || typeof api.get !== 'function') { return Promise.resolve({ ok: false, status: 0, data: null }); }
+    return api.get(url)
+      .then(function (r) {
+        return r.json().then(
+          function (data) { return { ok: r.ok, status: r.status, data: data }; },
+          function () { return { ok: r.ok, status: r.status, data: null }; }
+        );
+      })
+      .catch(function () { return { ok: false, status: 0, data: null }; });
+  }
+
+  // ---- Renderers ---------------------------------------------------------
+  function buildRail() {
+    var nav = document.getElementById('nav');
+    nav.textContent = '';
+    RAIL_MODE = 'dest';   // restored to the destination nav
+    for (var i = 0; i < DESTS.length; i++) {
+      var item = DESTS[i];
+      if (item.railHidden) { continue; }   // reachable via search / Explore menu, not the Command rail
+      var btn = el('button', {
+        'class': 'nav-item', type: 'button', 'data-dest': item.id, 'aria-current': 'false',
+        title: item.label   // tooltip — the only label shown when the rail is collapsed
+      });
+      btn.innerHTML = ICONS[item.icon] || '';   // inline SVG glyph
+      btn.appendChild(el('span', { 'class': 'label', text: item.label }));
+      if (item.key) { btn.appendChild(el('span', { 'class': 'kbd', text: item.key })); }
+      (function (id) {
+        btn.addEventListener('click', function () { location.hash = '#/' + id; });
+      })(item.id);
+      nav.appendChild(btn);
+    }
+    applyPosture(nav);
+  }
+
+  function buildThemeSwitch() {
+    var wrap = document.getElementById('themeSwitch');
+    wrap.textContent = '';
+    for (var i = 0; i < THEMES.length; i++) {
+      var t = THEMES[i];
+      var b = el('button', {
+        'class': 'theme-btn', type: 'button', 'data-theme': t.id,
+        'aria-pressed': 'false', 'aria-label': t.label + ' theme', title: t.label + ' theme',
+        html: ICONS[t.icon] || ''
+      });
+      (function (id) {
+        b.addEventListener('click', function () { applyTheme(id); });
+      })(t.id);
+      wrap.appendChild(b);
+    }
+  }
+
+  function setHealth(kind, text) {
+    var box = document.getElementById('health');
+    box.className = 'health ' + kind;
+    document.getElementById('healthText').textContent = text;
+  }
+
+  // ---- Status pill (top-right) -------------------------------------------
+  // No address / node-id in the text — origin + node id now live on the System
+  // destination. States: Connected · Local (auth 'off') / Connected · Platform
+  // (any other auth) / Degraded (reachable, no summary) / Offline (unreachable);
+  // a "· read-only" suffix rides along whenever posture is customer.
+  function setStatusPill() {
+    var authMode = get(BOOT.summary, ['daemon', 'auth_mode']);
+    var kind, text;
+    if (BOOT.health === 'down') { kind = 'down'; text = 'Offline'; }
+    else if (BOOT.health === 'degraded') { kind = 'degraded'; text = 'Degraded'; }
+    else { kind = 'ok'; text = 'Connected · ' + (authMode === 'off' ? 'Local' : 'Platform'); }
+    if (POSTURE === 'customer') { text += ' · read-only'; }
+    setHealth(kind, text);
+  }
+
+  // ---- Top-bar chips -----------------------------------------------------
+  // Compact mono chips in the right cluster: the build / auth-mode / dataplane
+  // facts that used to be landing tiles, plus the DEMO DATA chip when demo mode
+  // is on. Every chip is real boot data; a chip is omitted when its value is
+  // unknown (never fabricated).
+  function iconChip(iconKey, title, on) {
+    var c = el('span', { 'class': 'topchip icon-chip' + (on ? ' on' : ''), title: title, role: 'img', 'aria-label': title });
+    c.innerHTML = ICONS[iconKey] || '';
+    return c;
+  }
+  function setTopChips() {
+    var host = document.getElementById('topchips');
+    if (!host) { return; }
+    host.textContent = '';
+    // auth + dataplane as icon chips (real boot facts; value in the tooltip).
+    // DEMO DATA + version chips are gone — demo shows per-tile, version is in the brand.
+    var authMode = get(BOOT.summary, ['daemon', 'auth_mode']);
+    var dataplane = get(BOOT.summary, ['daemon', 'dataplane_enabled']);
+    if (authMode != null) { host.appendChild(iconChip('lock', 'auth: ' + authMode, authMode !== 'off')); }
+    if (dataplane != null) { host.appendChild(iconChip('dataplane', 'dataplane: ' + (dataplane ? 'on' : 'off'), !!dataplane)); }
+  }
+  // Brand identity: "Crux Console" when hosted from a platform (auth on), "Crux
+  // Daemon" when served by a local daemon (auth off). Subtitle carries the version.
+  function setBrand() {
+    var nameEl = document.querySelector('.brand .name');
+    if (!nameEl) { return; }
+    var authMode = get(BOOT.summary, ['daemon', 'auth_mode']);
+    var hosted = authMode != null && authMode !== 'off';
+    var version = get(BOOT.version, ['version']) || get(BOOT.summary, ['daemon', 'build', 'version']);
+    var verStr = version ? ('v' + String(version).replace(/^v/, '')) : 'v2';
+    nameEl.textContent = hosted ? 'Crux Console' : 'Crux Daemon';
+    nameEl.appendChild(el('small', { text: 'Unified ' + verStr }));
+  }
+
+  // ---- Collapsible rail --------------------------------------------------
+  // A chevron toggle collapses the rail to an icon-only ~64px column. State
+  // persists in localStorage (crux.console.rail); a pre-paint script mirrors it
+  // onto <html data-rail> before first paint. Phone tier (<720px) hides the
+  // rail entirely, so this is desktop-only (CSS guards to min-width:721px).
+  var LS_RAIL = 'crux.console.rail';
+  function readRail() {
+    try { return localStorage.getItem(LS_RAIL) === 'collapsed' ? 'collapsed' : 'open'; }
+    catch (e) { return 'open'; }
+  }
+  function applyRail(state) {
+    var collapsed = state === 'collapsed';
+    document.documentElement.setAttribute('data-rail', collapsed ? 'collapsed' : 'open');
+    try { localStorage.setItem(LS_RAIL, collapsed ? 'collapsed' : 'open'); } catch (e) { /* private mode */ }
+    var btn = document.getElementById('railToggle');
+    if (btn) {
+      var lbl = collapsed ? 'Expand navigation' : 'Collapse navigation';
+      btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+      btn.setAttribute('aria-label', lbl);
+      btn.setAttribute('title', lbl);
+    }
+  }
+  function initRail() {
+    var btn = document.getElementById('railToggle');
+    if (btn) {
+      btn.innerHTML = ICONS.chevron;
+      btn.addEventListener('click', function () {
+        applyRail(document.documentElement.getAttribute('data-rail') === 'collapsed' ? 'open' : 'collapsed');
+      });
+    }
+    applyRail(readRail());
+  }
+
+  // ---- Demo mode (labelled, gated) --------------------------------------
+  // ?demo=1 turns on labelled demo fixtures (persisted to localStorage); ?demo=0
+  // clears. The flag lives on window.CRUX_DEMO. Fixtures themselves live in
+  // CruxDemo (pages.js) and are read ONLY by render.js behind this flag; real
+  // data always wins where an endpoint answers.
+  var LS_DEMO = 'crux.console.demo';
+  function initDemo() {
+    var on = false;
+    try {
+      var q = location.search || '';
+      if (/[?&]demo=1\b/.test(q)) { localStorage.setItem(LS_DEMO, '1'); }
+      else if (/[?&]demo=0\b/.test(q)) { localStorage.removeItem(LS_DEMO); }
+      on = localStorage.getItem(LS_DEMO) === '1';
+    } catch (e) { on = /[?&]demo=1\b/.test(location.search || ''); }
+    if (typeof window !== 'undefined') { window.CRUX_DEMO = on; }
+  }
+
+  // ---- Phone tier: bottom tab bar + "More" sheet ------------------------
+  // The tab bar mirrors three destinations directly (Overwatch · Work · Trust);
+  // every other destination (Memory · Meters · System) lives behind "More". The
+  // set is data-driven from DESTS so a new destination is one registry edit.
+  var TAB_DEST_IDS = ['overwatch', 'work', 'trust'];   // the three direct tabs; rest → "More"
+  function isMoreDest(id) { return TAB_DEST_IDS.indexOf(id) < 0; }
+
+  function buildTabbar() {
+    var bar = document.getElementById('tabbar');
+    if (!bar) { return; }
+    bar.textContent = '';
+    var tabs = [];
+    for (var i = 0; i < TAB_DEST_IDS.length; i++) {
+      var d = DEST_INDEX[TAB_DEST_IDS[i]];
+      if (d) { tabs.push({ kind: 'dest', id: d.id, label: d.label, icon: d.icon }); }
+    }
+    tabs.push({ kind: 'more', id: 'more', label: 'More', icon: 'more' });   // 4th tab
+    for (var j = 0; j < tabs.length; j++) {
+      var t = tabs[j];
+      var btn = el('button', { 'class': 'tab', type: 'button', 'data-tab': t.id, 'aria-current': 'false' });
+      btn.innerHTML = ICONS[t.icon] || '';
+      btn.appendChild(el('span', { 'class': 'tab-label', text: t.label }));
+      (function (tab) {
+        btn.addEventListener('click', function () {
+          if (tab.kind === 'more') { openSheet(); }
+          else { closeSheet(); location.hash = '#/' + tab.id; }
+        });
+      })(t);
+      bar.appendChild(btn);
+    }
+  }
+
+  function buildSheetNav() {
+    var host = document.getElementById('sheetNav');
+    if (!host) { return; }
+    host.textContent = '';
+    for (var i = 0; i < DESTS.length; i++) {
+      var d = DESTS[i];
+      if (!isMoreDest(d.id) || d.railHidden) { continue; }   // only non-tab, non-rail-hidden destinations
+      var btn = el('button', { 'class': 'sheet-item', type: 'button', 'data-dest': d.id, 'aria-current': 'false' });
+      btn.innerHTML = ICONS[d.icon] || '';
+      btn.appendChild(el('span', { 'class': 'label', text: d.label }));
+      (function (id) {
+        btn.addEventListener('click', function () { closeSheet(); location.hash = '#/' + id; });
+      })(d.id);
+      host.appendChild(btn);
+    }
+  }
+
+  function openSheet() {
+    var sheet = document.getElementById('moreSheet');
+    var scrim = document.getElementById('sheetScrim');
+    if (sheet) { sheet.hidden = false; }
+    if (scrim) { scrim.hidden = false; }
+  }
+  function closeSheet() {
+    var sheet = document.getElementById('moreSheet');
+    var scrim = document.getElementById('sheetScrim');
+    if (sheet) { sheet.hidden = true; }
+    if (scrim) { scrim.hidden = true; }
+  }
+
+  // Reflect the active destination in the tab bar + sheet (mirrors aria-current).
+  // The "More" tab is current whenever the active destination lives in the sheet.
+  function syncMobileChrome(destId) {
+    var tabs = document.querySelectorAll('#tabbar .tab');
+    for (var i = 0; i < tabs.length; i++) {
+      var id = tabs[i].getAttribute('data-tab');
+      var on = (id === 'more') ? isMoreDest(destId) : (id === destId);
+      tabs[i].setAttribute('aria-current', on ? 'page' : 'false');
+    }
+    var items = document.querySelectorAll('#sheetNav .sheet-item');
+    for (var j = 0; j < items.length; j++) {
+      items[j].setAttribute('aria-current', items[j].getAttribute('data-dest') === destId ? 'page' : 'false');
+    }
+  }
+
+  // Relocate the SAME passport-chip + theme-switch nodes between the rail footer
+  // (desktop) and the sheet (phone) — one instance, so applyTheme's #themeSwitch
+  // query and passport updates keep working after the move.
+  function placeMobileChrome(isPhone) {
+    var acct = document.getElementById('acctWrap');
+    var slot = document.getElementById('sheetChromeSlot');
+    var footer = document.querySelector('.rail-footer');
+    if (!acct) { return; }
+    if (isPhone && slot) { slot.appendChild(acct); }
+    else if (footer) { footer.appendChild(acct); }
+  }
+
+  // ---- Sub-nav (pill row) + page render ----------------------------------
+  function buildSubnav(destId, activePageId) {
+    var row = el('div', { 'class': 'subnav', role: 'tablist', 'aria-label': 'Pages in this destination' });
+    var list = pagesForDest(destId);
+    var pro = (typeof window !== 'undefined' && window.CRUX_MODE === 'professional');
+    for (var i = 0; i < list.length; i++) {
+      var p = list[i];
+      // Standard mode: pages tagged pill:false are folded out of the pill row
+      // (reachable via the landing / direct hash), and pro:true ported pages are
+      // hidden entirely. Professional mode shows ALL pages of the destination as
+      // pills — incl. the pill:false cx-overview and the ported Pro pages.
+      if (!pro) {
+        if (p.pill === false) { continue; }
+        if (p.pro === true) { continue; }
+      }
+      var pill = el('button', {
+        'class': 'pill', type: 'button', 'data-page': p.id,
+        'aria-current': p.id === activePageId ? 'page' : 'false'
+      }, [p.title]);
+      if (p.operatorOnly) { pill.setAttribute('data-requires', 'operator'); }   // hidden for customers
+      (function (dest, pid) {
+        pill.addEventListener('click', function () { location.hash = '#/' + dest + '/' + pid; });
+      })(destId, p.id);
+      row.appendChild(pill);
+    }
+    applyPosture(row);
+    return row;
+  }
+
+  function renderDestination(destId, pageId) {
+    // Leaving Documents mode: restore the destination nav into the rail (it was
+    // swapped to the document tree by renderDocumentsRoute).
+    if (RAIL_MODE === 'docs') { buildRail(); }
+    var dest = DEST_INDEX[destId] || DESTS[0];
+    destId = dest.id;
+    var page = PAGES[pageId];
+    if (!page || page.dest !== destId) { pageId = firstPageId(destId); page = PAGES[pageId]; }
+    // A Pro-only page directly routed in Standard mode redirects to the
+    // destination's default page (presentation gate — never a posture gate).
+    if (page && page.pro === true && !(typeof window !== 'undefined' && window.CRUX_MODE === 'professional')) {
+      pageId = firstPageId(destId); page = PAGES[pageId];
+    }
+
+    // Rail active state.
+    var btns = document.querySelectorAll('#nav .nav-item');
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].setAttribute('aria-current', btns[i].getAttribute('data-dest') === destId ? 'page' : 'false');
+    }
+    syncMobileChrome(destId);   // mirror active dest into the phone tab bar + sheet
+
+    var content = document.getElementById('content');
+    content.textContent = '';
+
+    // Canvas (M9): no sub-pills — Canvas IS the page. Parse view + focus from the
+    // live hash and hand off to render.js renderCanvas (Board | Graph).
+    if (destId === 'canvas') {
+      var cr = parseCanvasHash(location.hash);
+      document.getElementById('destTitle').textContent = dest.label;
+      document.getElementById('destSub').textContent = cr.view === 'graph'
+        ? 'Relation graph — real edges only (projects ⋈ work ⋈ gates ⋈ passports ⋈ sessions)'
+        : 'Tile canvas — drag, pan, expand in place; composes to your viewport (4K+ = the full board)';
+      var canvasHost = el('div', { 'class': 'canvas-region-host', id: 'canvasHost' });
+      content.appendChild(canvasHost);
+      if (window.CruxRender && window.CruxRender.renderCanvas) {
+        window.CruxRender.renderCanvas(canvasHost, { summary: BOOT.summary, view: cr.view, focus: cr.focus });
+      } else {
+        canvasHost.appendChild(el('p', { 'class': 'v2card-sub', text: 'Renderer module unavailable.' }));
+      }
+      applyPosture(content);
+      if (typeof content.scrollTo === 'function') { content.scrollTo(0, 0); }
+      return;
+    }
+
+    // Explorer (M11): no sub-pills — Explorer IS the page. A search box + a
+    // Local | WikiCrux backend toggle + a budget control; results render as
+    // cards. Reads only, so it shows in every posture. Delegates to render.js
+    // renderExplorer (search runs through render.js's curated read-POST client).
+    if (destId === 'explorer') {
+      document.getElementById('destTitle').textContent = dest.label;
+      document.getElementById('destSub').textContent = dest.sub || '';
+      var explorerHost = el('div', { 'class': 'explorer-region-host', id: 'explorerHost' });
+      content.appendChild(explorerHost);
+      if (window.CruxRender && window.CruxRender.renderExplorer) {
+        window.CruxRender.renderExplorer(explorerHost, { summary: BOOT.summary });
+      } else {
+        explorerHost.appendChild(el('p', { 'class': 'v2card-sub', text: 'Renderer module unavailable.' }));
+      }
+      applyPosture(content);
+      if (typeof content.scrollTo === 'function') { content.scrollTo(0, 0); }
+      return;
+    }
+
+    // Site map — no sub-pills: it IS a static reference page (the flat rail
+    // rearranged into 5 destinations + System). Reads nothing; every posture.
+    if (destId === 'sitemap') {
+      document.getElementById('destTitle').textContent = dest.label;
+      document.getElementById('destSub').textContent = dest.sub || '';
+      var mapHost = el('div', { 'class': 'sitemap-region-host', id: 'sitemapHost' });
+      content.appendChild(mapHost);
+      if (window.CruxRender && window.CruxRender.renderSiteMap) {
+        window.CruxRender.renderSiteMap(mapHost, { summary: BOOT.summary });
+      } else {
+        mapHost.appendChild(el('p', { 'class': 'v2card-sub', text: 'Renderer module unavailable.' }));
+      }
+      applyPosture(content);
+      if (typeof content.scrollTo === 'function') { content.scrollTo(0, 0); }
+      return;
+    }
+
+    document.getElementById('destTitle').textContent = page ? page.title : dest.label;
+    document.getElementById('destSub').textContent = page ? (page.sub || '') : (dest.sub || '');
+    // Overwatch is the real landing: Daemon-at-a-glance tiles → Needs-you + Fleet
+    // (left) → the destination page nav (right). The page nav lives IN the landing
+    // (owPageNav), so the top sub-nav pill row is suppressed for overwatch only —
+    // every other destination keeps its pills. cx-overview etc. still render below.
+    if (destId === 'overwatch' && window.CruxRender && window.CruxRender.renderOverwatchLanding) {
+      var landing = el('div', { 'class': 'ow-landing-region', id: 'owLanding' });
+      content.appendChild(landing);
+      window.CruxRender.renderOverwatchLanding(landing, { summary: BOOT.summary });
+    }
+    if (destId !== 'overwatch') { content.appendChild(buildSubnav(destId, pageId)); }
+    // Settings owns the Command-density switch (moved off the top-level toggle).
+    if (destId === 'system' && page && page.id === 'cx-settings') { content.appendChild(buildDensityCard()); content.appendChild(buildThemeCard()); }
+    // Overwatch IS its landing (tiles + view tabs) — don't also render the resolved
+    // page below it (that duplicated the Activity page's Live-activity card).
+    if (destId !== 'overwatch') {
+      var host = el('div', { 'class': 'page-host', id: 'pageHost' });
+      content.appendChild(host);
+      if (window.CruxRender && page) { window.CruxRender.renderPage(page, host); }
+      else if (page) { host.appendChild(el('p', { 'class': 'v2card-sub', text: 'Renderer module unavailable.' })); }
+    }
+    applyPosture(content);
+    if (typeof content.scrollTo === 'function') { content.scrollTo(0, 0); }
+  }
+
+  function currentRoute() {
+    var h = (location.hash || '').replace(/^#\/?/, '');
+    var qi = h.indexOf('?');
+    if (qi >= 0) { h = h.slice(0, qi); }   // strip a query (Canvas graph carries ?focus=)
+    var parts = h.split('/').filter(Boolean);
+    var destId = DEST_INDEX[parts[0]] ? parts[0] : (DESTS[0] && DESTS[0].id);
+    var pageId = (parts[1] && PAGES[parts[1]] && PAGES[parts[1]].dest === destId) ? parts[1] : firstPageId(destId);
+    return { dest: destId, page: pageId };
+  }
+
+  // Canvas (M9) parses its own hash: #/canvas/<view>?focus=<type>:<id>. The view
+  // is the nav-family Board|Graph switch; the focus (graph only) is parsed by the
+  // pure render.js parseFocus so board/graph share one deep-link grammar.
+  function parseCanvasHash(hash) {
+    var h = (hash || '').replace(/^#\/?/, '');
+    var q = '';
+    var qi = h.indexOf('?');
+    if (qi >= 0) { q = h.slice(qi + 1); h = h.slice(0, qi); }
+    var parts = h.split('/').filter(Boolean);
+    var view = (parts[1] === 'graph') ? 'graph' : 'board';
+    var focus = null;
+    var m = q.match(/(?:^|&)focus=([^&]+)/);
+    if (m) {
+      var raw;
+      try { raw = decodeURIComponent(m[1]); } catch (e) { raw = m[1]; }
+      focus = (window.CruxRender && window.CruxRender.parseFocus) ? window.CruxRender.parseFocus(raw) : null;
+    }
+    return { view: view, focus: focus };
+  }
+
+  // Route. Documents mode (M10) is presentation: it renders the reader instead of
+  // a destination surface, entered via the mode segment (#/documents) or by being
+  // in documents mode. A deep link to any real #/<destination> while in Documents
+  // mode AUTO-SWITCHES the mode back to standard (destinations win over the reader
+  // — mode is presentation, not a route). #/documents[/<docId>] keeps the reader.
+  function route() {
+    var h = (location.hash || '').replace(/^#\/?/, '');
+    var qi = h.indexOf('?'); if (qi >= 0) { h = h.slice(0, qi); }
+    var parts = h.split('/').filter(Boolean);
+    var first = parts[0];
+    var inDocsMode = (typeof window !== 'undefined' && window.CRUX_MODE === 'documents');
+    var docsHash = first === 'documents';
+    if (docsHash || inDocsMode) {
+      if (first && !docsHash && DEST_INDEX[first]) {
+        if (inDocsMode) { setModeSilently('standard'); }   // deep-link-out auto-switch
+        // fall through to the normal destination render below
+      } else {
+        if (!inDocsMode) { setModeSilently('documents'); }
+        renderDocumentsRoute(parts[1]);
+        return;
+      }
+    }
+    var r = currentRoute();
+    renderDestination(r.dest, r.page);
+  }
+
+  // Documents-mode render: swap the rail to the document tree (render.js builds
+  // it into #nav) and render the reader into #content. Presentation only.
+  function renderDocumentsRoute(docId) {
+    RAIL_MODE = 'docs';
+    var isExplorer = (docId === 'explorer');
+    document.getElementById('destTitle').textContent = isExplorer ? 'Explorer' : 'Documents';
+    document.getElementById('destSub').textContent = isExplorer
+      ? 'search facts, living objects and articles across the corpus'
+      : 'Reader — real corpora + bundled reference docs';
+    var content = document.getElementById('content');
+    content.textContent = '';
+    var host = el('div', { 'class': 'doc-region-host', id: 'docHost' });
+    content.appendChild(host);
+    var nav = document.getElementById('nav');
+    if (window.CruxRender && window.CruxRender.renderDocuments) {
+      window.CruxRender.renderDocuments(host, {
+        summary: BOOT.summary,
+        docId: docId ? decodeURIComponent(docId) : null,
+        railHost: nav
+      });
+    } else {
+      host.appendChild(el('p', { 'class': 'v2card-sub', text: 'Renderer module unavailable.' }));
+    }
+    syncMobileChrome(null);   // no destination is active in the phone tab bar
+    if (typeof content.scrollTo === 'function') { content.scrollTo(0, 0); }
+  }
+
+  // ---- Keyboard shortcuts 1..5 ------------------------------------------
+  function onKey(ev) {
+    if (ev.defaultPrevented || ev.metaKey || ev.ctrlKey || ev.altKey) return;
+    var tag = (ev.target && ev.target.tagName) ? ev.target.tagName.toLowerCase() : '';
+    if (tag === 'input' || tag === 'textarea' || tag === 'select' || (ev.target && ev.target.isContentEditable)) return;
+    var dest = KEY_TO_DEST[ev.key];
+    if (dest) { location.hash = '#/' + dest; ev.preventDefault(); }
+  }
+
+  // ---- Boot --------------------------------------------------------------
+  function boot() {
+    return Promise.all([fetchJSON('/v1/version'), fetchJSON('/v1/console/summary')])
+      .then(function (res) {
+        var ver = res[0], sum = res[1];
+        if (ver && ver.data) { BOOT.version = ver.data; }
+        if (sum && sum.ok && sum.data) { BOOT.summary = sum.data; }
+        var reachable = (ver && ver.status !== 0) || (sum && sum.status !== 0);
+        if (!reachable) {
+          BOOT.health = 'down';
+        } else if (BOOT.summary) {
+          BOOT.health = 'ok';
+          var pv = get(BOOT.version, ['version']) || get(BOOT.summary, ['daemon', 'build', 'version']);
+          if (pv) { document.getElementById('passportSub').textContent = 'node build ' + pv; }
+        } else {
+          BOOT.health = 'degraded';
+        }
+        setStatusPill();
+        setTopChips();
+        setBrand();
+        route();
+        // Derive posture from the server, then re-render with it (nav + pills +
+        // landing + mutating controls all follow). Never blocks the first paint.
+        return derivePostureFromServer().then(applyDerivedPosture);
+      });
+  }
+
+  // operator ⟺ auth_mode 'off' (unauthenticated local instance) OR the admin-scoped capability probe
+  // (GET /v1/admin/version) resolves 200. The derivation logic itself lives in
+  // render.js (derivePosture, unit-tested); this only feeds it the probe.
+  function derivePostureFromServer() {
+    var authMode = get(BOOT.summary, ['daemon', 'auth_mode']);
+    var derive = (window.CruxRender && window.CruxRender.derivePosture)
+      || function (p) { return (p && (p.authMode === 'off' || p.adminProbeStatus === 200)) ? 'operator' : 'customer'; };
+    if (authMode === 'off') {
+      return Promise.resolve(derive({ authMode: authMode }));
+    }
+    return fetchJSON('/v1/admin/version').then(function (r) {
+      return derive({ authMode: authMode, adminProbeStatus: r.status });
+    });
+  }
+
+  function applyDerivedPosture(p) {
+    setPosture(p);
+    var authMode = get(BOOT.summary, ['daemon', 'auth_mode']);
+    var name = (p === 'operator') ? 'Operator' : 'Customer';
+    var sub = (p === 'operator') ? (authMode === 'off' ? 'operator · local' : 'operator · admin') : 'customer view';
+    var nameEl = document.getElementById('passportName');
+    var subEl = document.getElementById('passportSub');
+    if (nameEl) { nameEl.textContent = name; }
+    if (subEl) { subEl.textContent = sub; }
+    setStatusPill();   // posture drives the "· read-only" suffix
+    applyPosture(document);
+    route();   // re-render nav/pills/landing under the derived posture
+  }
+
+  // ---- Init --------------------------------------------------------------
+  function init() {
+    initDemo();   // set window.CRUX_DEMO before any module render reads it
+    initMode();   // set window.CRUX_MODE + build the mode segmented control before first render
+    document.querySelector('.brand .mark').innerHTML = ICONS.logo;
+    document.querySelector('.passport-chip .avatar').innerHTML = ICONS.passport;
+    initSearchStub();   // wire the top-right search stub → Explorer
+    wireTopbarScroll(); // transparent top bar → glass on scroll
+    buildRail();
+    initThemeCycle();          // rail theme-cycle icon (theme picker lives in Settings)
+    applyTheme(readTheme());
+    initAcctMenu();            // bottom account roll-up (Settings · Language · Log out)
+    initRail();       // collapsible rail (persisted, desktop-only)
+    setTopChips();    // paint the DEMO chip (+ any cached facts) immediately
+    // Phone tier: build the tab bar + sheet, place the passport/theme chrome for
+    // the current breakpoint, and keep it in sync as the viewport crosses 720px.
+    buildTabbar();
+    buildSheetNav();
+    var mqPhone = window.matchMedia ? window.matchMedia('(max-width: 720px)') : null;
+    placeMobileChrome(!!(mqPhone && mqPhone.matches));
+    if (mqPhone) {
+      var onMq = function (e) { placeMobileChrome(e.matches); if (!e.matches) { closeSheet(); } };
+      if (mqPhone.addEventListener) { mqPhone.addEventListener('change', onMq); }
+      else if (mqPhone.addListener) { mqPhone.addListener(onMq); }   // Safari < 14
+    }
+    var scrim = document.getElementById('sheetScrim');
+    if (scrim) { scrim.addEventListener('click', closeSheet); }
+    window.addEventListener('hashchange', route);
+    document.addEventListener('keydown', onKey);
+    document.addEventListener('keydown', function (ev) { if (ev.key === 'Escape') { closeSheet(); } });
+    route();   // paint the shell immediately; boot() fills in live data
+    boot();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+})();
+</script>
+<!-- PWA service-worker registration (M5). Feature-detected; secure-context only
+     (https or localhost); silent on every path — a console SPA must never spam the
+     console. SW_REV MUST stay byte-equal to sw.js's SW_REV (a console.rs marker
+     test + smoke.cjs assert equality; bump both together — no build step injects a
+     hash). We register with scope '/console' (the daemon serves sw.js with
+     Service-Worker-Allowed: /console) and cache-bust the script URL with ?rev. -->
+<script>
+(function () {
+  'use strict';
+  var SW_REV = 'ushell-v2-r6';   // keep in lock-step with /console-v2/sw.js
+  if (!('serviceWorker' in navigator)) { return; }
+  // Dev bypass — when the daemon serves this shell from CORECRUXD_CONSOLE_DEV_PATH
+  // it stamps window.__CRUX_CONSOLE_DEV__ (see console.rs inject_console_dev_flag).
+  // In that mode never register a worker, and tear down any existing worker + its
+  // caches, so hot-reloaded edits always show on a plain refresh. Production never
+  // sets the flag, so the PWA service worker behaves exactly as before.
+  if (window.__CRUX_CONSOLE_DEV__) {
+    navigator.serviceWorker.getRegistrations().then(function (rs) {
+      for (var i = 0; i < rs.length; i++) { rs[i].unregister(); }
+    }, function () {});
+    if (window.caches && caches.keys) {
+      caches.keys().then(function (ks) {
+        for (var j = 0; j < ks.length; j++) { caches.delete(ks[j]); }
+      }, function () {});
+    }
+    return;
+  }
+  var host = location.hostname;
+  var secure = location.protocol === 'https:' || host === 'localhost' || host === '127.0.0.1' || host === '[::1]';
+  if (!secure) { return; }
+  window.addEventListener('load', function () {
+    navigator.serviceWorker.register('/console-v2/sw.js?rev=' + encodeURIComponent(SW_REV), { scope: '/console' })
+      .then(function () {}, function () {});   // silent on success + failure
+  });
+})();
+</script>
+</body>
+</html>

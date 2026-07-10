@@ -1,0 +1,27 @@
+{
+  "name": "Crux Console",
+  "short_name": "Crux",
+  "description": "Local-first memory, retrieval, and receipts for the CueCrux daemon — Overwatch, Work, Memory, Trust, and Meters in one console.",
+  "id": "/console",
+  "start_url": "/console",
+  "scope": "/console",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#060A12",
+  "theme_color": "#060A12",
+  "categories": ["productivity", "developer", "utilities"],
+  "icons": [
+    {
+      "src": "/console-v2/icon.svg",
+      "type": "image/svg+xml",
+      "sizes": "any",
+      "purpose": "any"
+    },
+    {
+      "src": "/console-assets/CueCrux-Arc-Loop-White.png",
+      "type": "image/png",
+      "sizes": "660x660",
+      "purpose": "any"
+    }
+  ]
+}
