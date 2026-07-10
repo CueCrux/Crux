@@ -3569,10 +3569,10 @@
       host.appendChild(docSection('Assumption-loaded tree · demo'));
       host.appendChild(el('div', { 'class': 'doc-chips' }, [docBandBadge(null, d.root.confidence), docBadge('fragility ' + Math.round(d.root.fragility * 100) + '%', d.root.fragility > 0.5 ? 'crit' : 'warn'), demoChip(true)]));
       host.appendChild(el('div', { 'class': 'doc-card' }, [el('div', { 'class': 'doc-row-text', text: d.query })]));
-      var assumTone = function (load) { return load <= 0.25 ? 'ok' : (load <= 0.5 ? 'warn' : 'crit'); };
+      var assumptionTone = function (load) { return load <= 0.25 ? 'ok' : (load <= 0.5 ? 'warn' : 'crit'); };
       (function walkNode(node, depth) {
         var row = el('div', { 'class': 'doc-dep-node', style: 'margin-left:' + (depth * 16) + 'px' });
-        row.appendChild(el('div', { 'class': 'doc-chips' }, [docDot(assumTone(node.assumptionLoad)), el('span', { 'class': 'doc-row-title', text: node.label }), node.trunkTier ? docBadge('T' + node.trunkTier, '') : null, docBadge(node.type, node.type === 'assumption' ? 'warn' : '')].filter(Boolean)));
+        row.appendChild(el('div', { 'class': 'doc-chips' }, [docDot(assumptionTone(node.assumptionLoad)), el('span', { 'class': 'doc-row-title', text: node.label }), node.trunkTier ? docBadge('T' + node.trunkTier, '') : null, docBadge(node.type, node.type === 'assumption' ? 'warn' : '')].filter(Boolean)));
         if (node.sublabel) { row.appendChild(el('div', { 'class': 'doc-row-text', text: node.sublabel })); }
         row.appendChild(docCovBar('confidence', node.confidence));
         host.appendChild(row);

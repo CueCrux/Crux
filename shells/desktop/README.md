@@ -126,11 +126,11 @@ items so a single operator pass covers both. Run it against the bundle from the
 
 - [ ] **Fresh VM, no prior install.** Clean OS image; confirm no `corecruxd` on
       `PATH`, no `~/.local/share/Crux` (or platform app-data equivalent), no
-      existing process: `pgrep -laf corecruxd` returns nothing.
+      existing process: `pgrep -a -l -f corecruxd` returns nothing.
 - [ ] **Install the artifact.** Install the `.dmg`/`.msi`/`.AppImage`/`.deb`.
 - [ ] **App boots the daemon + console with no prior setup.** Launch Crux; the
       window loads the console (Overwatch landing). Confirm the sidecar came up:
-      `pgrep -laf corecruxd` shows exactly one, bound to a loopback port.
+      `pgrep -a -l -f corecruxd` shows exactly one, bound to a loopback port.
 - [ ] **Sidecar sha matches its release tag.** Verify the bundled binary is the
       attested release build, not a local rebuild:
       ```bash
@@ -139,7 +139,7 @@ items so a single operator pass covers both. Run it against the bundle from the
       ```
 - [ ] **Quit leaves no orphan daemon (the gate).** Close the window / Quit, then:
       ```bash
-      sleep 2; pgrep -laf corecruxd     # must return NOTHING
+      sleep 2; pgrep -a -l -f corecruxd     # must return NOTHING
       ```
       Repeat for force-quit of the app window to confirm Drop/exit handlers fire.
 - [ ] **Failure dialog.** Simulate a daemon that never becomes healthy (e.g.

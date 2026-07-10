@@ -53,6 +53,19 @@ jobs:
             libjavascriptcoregtk-4.1-dev \
             build-essential curl wget file libxdo-dev libssl-dev pkg-config
 
+      - name: install tauri-cli v2
+        run: cargo install tauri-cli --version "^2.0" --locked
+
+      # Icons are generated, not committed (see shells/desktop/README.md). The
+      # compile gate runs `tauri::generate_context!()`, which opens the icon set
+      # at build time, so the icons must exist before `cargo build` — mirror the
+      # bundle job's generation step here or the proc macro panics on a missing
+      # icons/32x32.png.
+      - name: generate icon set from the CueCrux arc-loop art
+        run: |
+          cargo tauri icon crates/corecruxd/console/assets/CueCrux-Arc-Loop.png \
+            --output shells/desktop/app/icons
+
       - name: build corecruxd sidecar (release, CPU-only)
         run: cargo build --locked --release --bin corecruxd
 
