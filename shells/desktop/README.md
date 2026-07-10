@@ -6,8 +6,7 @@ auth off, waits for it to become healthy, then loads
 `http://127.0.0.1:<port>/console` in a native window. On quit it shuts the daemon
 down; no orphan daemon survives the shell.
 
-This is the **desktop shell (M6)** of ExecPlan
-[`unified-shell-console-2026-07-03`](../../../PlanCrux/.agent/execplans/unified-shell-console-2026-07-03.md),
+This is the **desktop shell (M6)** of the unified-shell console work,
 housed **in-tree, workspace-excluded** per decision **OD-31**.
 
 ## Architecture
