@@ -233,6 +233,7 @@ fn assemble_scan_at(root: &Path, cache: &AstScanCache, started_ms: u64) -> Works
     resolve_references(&mut scan, &index, &file_idx_by_path);
     build_referenced_by(&mut scan);
     compute_dead_code(&mut scan, &ident_refs);
+    crate::workspace_scan_manifests::attach_external_deps_if_enabled(root, &mut scan);
     roll_up_stats(&mut scan);
     scan
 }
@@ -1142,6 +1143,7 @@ fn roll_up_stats(scan: &mut WorkspaceScan) {
         dead_code_count: scan.dead_code.len(),
         route_count,
         file_reference_count,
+        external_dep_count: scan.external_deps.len(),
         doc_coverage_files,
         routes_by_crate,
     };
@@ -1150,6 +1152,7 @@ fn roll_up_stats(scan: &mut WorkspaceScan) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::EnvVarGuard;
 
     fn write_fixture(root: &Path) {
         let crate_dir = root.join("crates/demo");
@@ -1241,6 +1244,13 @@ pub fn called() {}
         scan
     }
 
+    fn append_external_dep_fixture(root: &Path) {
+        let manifest = root.join("crates/demo/Cargo.toml");
+        let mut current = std::fs::read_to_string(&manifest).expect("read manifest");
+        current.push_str("\n[dependencies]\nserde = \"1\"\n");
+        std::fs::write(&manifest, current).expect("write manifest");
+    }
+
     #[test]
     fn incremental_reparse_only_changed_file_and_updates_symbol_edge() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1321,12 +1331,66 @@ fn private_helper() {}
     }
 
     #[test]
+    #[serial_test::serial]
+    fn flag_off_ast_scan_serializes_without_external_dependency_fields() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_fixture(tmp.path());
+        append_external_dep_fixture(tmp.path());
+
+        let _env = EnvVarGuard::unset("CORECRUXD_EXTERNAL_DEPS");
+        let scan = run_scan_ast_at(tmp.path()).expect("ast scan");
+        let json = serde_json::to_string(&scan).expect("scan json");
+        assert!(!json.contains("external_deps"));
+        assert!(!json.contains("external_dep_count"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn watch_reindex_preserves_external_deps() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_fixture(tmp.path());
+        append_external_dep_fixture(tmp.path());
+
+        let _env = EnvVarGuard::set("CORECRUXD_EXTERNAL_DEPS", "1");
+        let initial = run_scan_ast_at(tmp.path()).expect("initial scan");
+        assert!(!initial.external_deps.is_empty());
+        assert_eq!(initial.stats.external_dep_count, initial.external_deps.len());
+
+        let mut cache = AstScanCache::from_root(tmp.path()).expect("full cache");
+        let changed = tmp.path().join("crates/demo/src/a.rs");
+        std::fs::write(
+            &changed,
+            r#"//! A module.
+use crate::b::called;
+
+pub fn entry() {
+    crate::b::called();
+}
+
+pub fn dead_pub() {}
+fn takes_visible(_: crate::Visible) {}
+fn private_helper() {}
+"#,
+        )
+        .expect("rewrite changed file");
+        let result = update_cache_incremental(tmp.path(), &mut cache, std::slice::from_ref(&changed))
+            .expect("incremental update");
+        assert_eq!(result.scan.external_deps, initial.external_deps);
+        assert_eq!(result.scan.stats.external_dep_count, result.scan.external_deps.len());
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn assemble_from_cache_matches_fresh_ast_scan() {
         let tmp = tempfile::tempdir().expect("tempdir");
         write_fixture(tmp.path());
+        append_external_dep_fixture(tmp.path());
+        let _env = EnvVarGuard::set("CORECRUXD_EXTERNAL_DEPS", "1");
         let cache = AstScanCache::from_root(tmp.path()).expect("full cache");
         let assembled = normalize_scan(assemble_scan(tmp.path(), &cache));
         let fresh = normalize_scan(run_scan_ast_at(tmp.path()).expect("fresh scan"));
+        assert!(!assembled.external_deps.is_empty());
+        assert_eq!(assembled.stats.external_dep_count, assembled.external_deps.len());
         assert_eq!(
             serde_json::to_value(assembled).expect("assembled json"),
             serde_json::to_value(fresh).expect("fresh json")

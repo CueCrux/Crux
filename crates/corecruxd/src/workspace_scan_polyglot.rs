@@ -50,10 +50,9 @@ struct CallSite {
 }
 
 pub(crate) fn run_repo_scan_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
-    if should_use_rust_workspace_scan(root) {
-        return crate::workspace_scan::run_scan_at(root);
-    }
-    if has_rust_workspace(root) {
+    let mut scan = if should_use_rust_workspace_scan(root) {
+        crate::workspace_scan::run_scan_at(root)?
+    } else if has_rust_workspace(root) {
         // Cargo workspace + polyglot files: scan the cargo tree natively so
         // crate structure and route extraction survive, then merge the
         // tree-sitter extraction of the non-Rust files on top. Without this a
@@ -62,9 +61,12 @@ pub(crate) fn run_repo_scan_at(root: &Path) -> Result<WorkspaceScan, ScanError> 
         let mut scan = crate::workspace_scan::run_scan_at(root)?;
         let poly = run_polyglot_scan_inner(root, false)?;
         merge_polyglot_scan(&mut scan, poly);
-        return Ok(scan);
-    }
-    run_polyglot_scan_at(root)
+        scan
+    } else {
+        run_polyglot_scan_at(root)?
+    };
+    crate::workspace_scan_manifests::attach_external_deps_if_enabled(root, &mut scan);
+    Ok(scan)
 }
 
 pub(crate) fn has_rust_workspace(root: &Path) -> bool {
@@ -604,6 +606,7 @@ fn roll_up_stats(scan: &mut WorkspaceScan) {
         dead_code_count: scan.dead_code.len(),
         route_count: scan.routes.len(),
         file_reference_count: scan.files.iter().map(|f| f.references.len()).sum(),
+        external_dep_count: scan.external_deps.len(),
         doc_coverage_files: scan.files.iter().filter(|f| f.doc_summary.is_some()).count(),
         routes_by_crate,
     };

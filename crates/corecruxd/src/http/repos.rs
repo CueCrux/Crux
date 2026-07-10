@@ -277,22 +277,31 @@ pub(super) async fn get_repo_codemap(
             })
         })
         .collect();
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "repo_id": repo.repo_id,
-            "tenant_id": repo.tenant_id,
-            "languages": repo.languages,
-            "scan_id": scan.scan_id,
-            "root_path": scan.root_path,
-            "started_at_unix_ms": scan.started_at_unix_ms,
-            "duration_ms": scan.duration_ms,
-            "stats": scan.stats,
-            "crates": crates,
-            "hint": "pass format=full for files, symbols, deps and routes",
-        })),
-    )
-        .into_response()
+    let mut body = serde_json::json!({
+        "repo_id": repo.repo_id,
+        "tenant_id": repo.tenant_id,
+        "languages": repo.languages,
+        "scan_id": scan.scan_id,
+        "root_path": scan.root_path,
+        "started_at_unix_ms": scan.started_at_unix_ms,
+        "duration_ms": scan.duration_ms,
+        "stats": scan.stats,
+        "crates": crates,
+        "hint": "pass format=full for files, symbols, deps and routes",
+    });
+    if !scan.external_deps.is_empty() {
+        let mut by_ecosystem = std::collections::BTreeMap::new();
+        for dep in &scan.external_deps {
+            *by_ecosystem.entry(dep.ecosystem.clone()).or_insert(0usize) += 1;
+        }
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "external_deps_by_ecosystem".to_string(),
+                serde_json::json!(by_ecosystem),
+            );
+        }
+    }
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 pub(super) async fn delete_repo(
