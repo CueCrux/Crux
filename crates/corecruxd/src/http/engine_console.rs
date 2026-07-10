@@ -481,18 +481,47 @@ mod tests {
     }
 
     // ── Minimal one-shot HTTP stub upstream (mirrors the console proxy tests) ──
+    //
+    // Reads the full request — headers AND any `Content-Length` body — before the
+    // caller writes its response and drops the stream. Draining the body first
+    // matters for the POST search tests: if the stub closed the socket while the
+    // client was still writing its JSON body, the client would see ECONNRESET and
+    // report a transport error (surfacing as a spurious 502). GET tests carry no
+    // body, so only the POST path exposed the race.
     fn read_request(stream: &mut std::net::TcpStream) -> String {
         let mut bytes = Vec::new();
         let mut buf = [0u8; 1024];
-        loop {
-            let n = stream.read(&mut buf).expect("read request");
+        // 1) Read at least through the end of the header block.
+        let header_end = loop {
+            if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+            let n = stream.read(&mut buf).expect("read request headers");
+            if n == 0 {
+                break bytes.len();
+            }
+            bytes.extend_from_slice(&buf[..n]);
+        };
+        // 2) If the request declares a body, drain exactly that many more bytes so
+        //    the client finishes writing before we respond and close.
+        let headers = String::from_utf8_lossy(&bytes[..header_end.min(bytes.len())]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        let want = header_end + content_length;
+        while bytes.len() < want {
+            let n = stream.read(&mut buf).expect("read request body");
             if n == 0 {
                 break;
             }
             bytes.extend_from_slice(&buf[..n]);
-            if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
-            }
         }
         String::from_utf8_lossy(&bytes).to_string()
     }
