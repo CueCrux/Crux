@@ -3400,43 +3400,71 @@ corpus, run ID, lane flags, and commit SHA is published.</sub>
 
 ## How it works
 
-One daemon, three planes — memory, retrieval, receipts — on an append-only spine. No cloud in
-this diagram; that's the point.
+One daemon, three planes — memory, retrieval, receipts — on an append-only spine. The colours
+below are the console's own: violet for memory, amber for retrieval, mint for receipts. No cloud
+in this diagram; that's the point.
 
 ```mermaid
-graph TD
-    mcp[crux-mcp<br/>MCP server]
-    daemon[corecruxd<br/>HTTP + gRPC daemon]
-    ctl[corecruxctl<br/>operations CLI]
-    router[crux-router<br/>RCX policy]
-    vault[vaultcrux-local<br/>local tool/content boundary]
-    memory[corecrux-memory<br/>facts + sessions]
-    retrieval[corecrux-retrieval<br/>BM25 retrieval]
-    projections[corecrux-projections<br/>derived state]
-    receipts[corecrux-receipts<br/>CROWN receipts]
-    storage[corecrux-storage<br/>shards]
-    segment[corecrux-segment<br/>sealed segments]
-    index[corecrux-index<br/>.ccxi indexes]
-    embeddings[embedding endpoint<br/>optional]
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"ui-monospace,SFMono-Regular,Menlo,Consolas,monospace","fontSize":"13px","primaryColor":"#0D1726","primaryTextColor":"#EAF0F7","primaryBorderColor":"#31445F","lineColor":"#5D7290","clusterBkg":"#0A111E","clusterBorder":"#22314A","titleColor":"#93A4B8","edgeLabelBackground":"#0A111E","tertiaryTextColor":"#93A4B8"}}}%%
+flowchart TD
+    agent(["your agent<br/>MCP / HTTP / gRPC"])
+    mcp["crux-mcp<br/>100+ budgeted tools"]
+    ctl["corecruxctl<br/>verify · replay · audit"]
+    daemon["corecruxd<br/>one binary · :14800"]
+    router["crux-router<br/>RCX capability tokens"]
+    vault["vaultcrux-local<br/>tool & content boundary"]
 
-    daemon --> mcp
-    daemon --> router
-    daemon --> vault
-    daemon --> memory
+    subgraph retplane["RETRIEVAL PLANE"]
+        retrieval["corecrux-retrieval<br/>BM25 + graph fusion"]
+        index["corecrux-index<br/>.ccxi indexes"]
+        codemap["repo code maps<br/>AST · typed graph"]
+    end
+
+    subgraph memplane["MEMORY PLANE"]
+        memory["corecrux-memory<br/>facts · sessions · handoffs"]
+        projections["corecrux-projections<br/>derived state · work board"]
+    end
+
+    subgraph recplane["RECEIPT PLANE"]
+        receipts["corecrux-receipts<br/>CROWN · Ed25519<br/>offline verify"]
+    end
+
+    subgraph spine["APPEND-ONLY SPINE"]
+        storage["corecrux-storage<br/>shards · BLAKE3"]
+        segment["corecrux-segment<br/>sealed segments"]
+    end
+
+    embeddings["embeddings<br/>optional · BYO"]
+
+    agent --> mcp --> daemon
+    ctl --> daemon
+    daemon --> router --> vault
     daemon --> retrieval
-    daemon --> projections
+    daemon --> memory
     daemon --> receipts
-    daemon --> storage
-    ctl --> storage
-    ctl --> receipts
-    mcp --> router
-    mcp --> memory
-    mcp --> retrieval
+    memory --> projections
     retrieval --> index
-    retrieval --> projections
+    retrieval --> codemap
+    memory --> storage
+    receipts --> storage
     storage --> segment
-    index --> segment
-    memory -.-> embeddings
+    retrieval -. "dense lane" .-> embeddings
+
+    classDef glass fill:#0D1726,stroke:#31445F,color:#EAF0F7
+    classDef entry fill:#060A12,stroke:#6CA8FF,color:#EAF0F7,stroke-dasharray:4 3
+    classDef hub fill:#0D1726,stroke:#6CA8FF,color:#EAF0F7,stroke-width:2.5px
+    classDef mem fill:#0D1726,stroke:#7C6CF0,color:#EAF0F7
+    classDef ret fill:#0D1726,stroke:#E8823C,color:#EAF0F7
+    classDef rec fill:#0D1726,stroke:#3DDC97,color:#EAF0F7
+    classDef dim fill:#0A111E,stroke:#22314A,color:#93A4B8
+
+    class agent entry
+    class daemon hub
+    class mcp,ctl,router,vault glass
+    class memory,projections mem
+    class retrieval,index,codemap ret
+    class receipts rec
+    class storage,segment,embeddings dim
 ```
 
 More detail: [`docs/architecture.md`](docs/architecture.md).
@@ -3481,6 +3509,7 @@ a signed `RefusalReceipt` carrying a reason code — never a bare 403 or a silen
 | HTTP, gRPC, health, readiness, and metrics | yes | | |
 | `corecruxctl` verification and replay tooling | yes | | |
 | BM25 text search with `.ccxi` companion indexes | yes | | |
+| AST code maps: register a repo, get a typed code-structure graph (Rust · TS · Python · Vue) | yes | | |
 | Dense fact retrieval via embeddings | | Ollama, vLLM, TEI, llama.cpp, LiteLLM | |
 | Hosted team sync, multi-device passports, billing | | | yes |
 | GPU/CUDA fused retrieval + AMR routing | | | yes |
@@ -3496,10 +3525,12 @@ Crux is complete on its own. When you want more, it's the memory spine of the Cu
 same receipts, same passports, every hop attributable.
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"ui-monospace,SFMono-Regular,Menlo,Consolas,monospace","fontSize":"13px","primaryColor":"#0D1726","primaryTextColor":"#EAF0F7","primaryBorderColor":"#31445F","lineColor":"#5D7290","edgeLabelBackground":"#0A111E","tertiaryTextColor":"#93A4B8"}}}%%
 flowchart LR
-    engine["CruxEngine<br/>frontier ingest · extraction<br/>opt-in hosted sync"]
+    engine["CruxEngine<br/>frontier ingest · extraction<br/>process → return → delete"]
     core["CoreCrux<br/>GPU database spine<br/>dense · graph · event lanes + AMR"]
     score["ScoreCrux<br/>benchmarks · evals"]
+    wiki["WikiCrux · wiki.cuecrux.com<br/>public wiki + live code maps<br/>served by this daemon"]
     rcx["RCX Environment<br/>MCP → RCX graph tooling"]
     plan["Your planning repo<br/>ExecPlans · work board"]
     crux(["Crux<br/>memory · retrieval · receipts<br/>runs on your machine"])
@@ -3507,8 +3538,17 @@ flowchart LR
     engine -. "sync: off by default" .-> crux
     core --- crux
     score --- crux
+    crux -- "dogfooding in public" --> wiki
     crux -- "every call rides a passport" --> rcx
     plan --- crux
+
+    classDef glass fill:#0D1726,stroke:#31445F,color:#EAF0F7
+    classDef hub fill:#060A12,stroke:#6CA8FF,color:#EAF0F7,stroke-width:2.5px
+    classDef live fill:#0D1726,stroke:#3DDC97,color:#EAF0F7
+
+    class engine,core,score,rcx,plan glass
+    class wiki live
+    class crux hub
 ```
 
 **Free forever** — the full local daemon: receipts, retrieval, passports, console. **Pro**
@@ -3516,7 +3556,8 @@ flowchart LR
 (£49/user·mo) adds fleet-wide attribution, policy gates, and revocation that propagates with
 proof. Metered **credits** (~£0.01/Cr) buy the heavy lifts — dense rerank, extraction,
 attestations. The local dense lane is **never** metered: credits buy the step-up, not your own
-machine. The local daemon is the acquisition, not the upsell.
+machine. Every credit spend mints a signed receipt (`crux.credit_spend_receipt.v1`) — even the
+meter is auditable. The local daemon is the acquisition, not the upsell.
 Full ladder: [memorycrux.com/pricing](https://memorycrux.com/pricing).
 
 **You cannot pay us to hold your data — there is no such product.** Paid frontier ingest and
