@@ -3860,6 +3860,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   14,290 symbols), and the watch loop re-indexes through the same path.
 - Stale agent docs: MCP tool `token_usage` → `session_token_usage`; CODEMAP's
   nonexistent `ShardStorage::append` → `append_batch`/`append_batch_with_stats`.
+- **Passport key create race.** `write_new_passport_seed` losers of the
+  `create_new` race could read the winner's key file before its bytes landed
+  ("key file is empty"); the key is now written in one buffer and the
+  AlreadyExists path retries briefly. Test temp dirs additionally salt
+  nanos with pid + a counter (coarse VM clocks collided parallel tests into
+  one dir — the CI flake behind this).
 
 ## [0.5.36] - 2026-07-03
 
