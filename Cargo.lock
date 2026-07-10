@@ -930,6 +930,7 @@ dependencies = [
  "prometheus",
  "prost",
  "rand 0.10.1",
+ "rcx-capability-token",
  "serde",
  "serde_json",
  "serde_yaml",

@@ -6,14 +6,14 @@
 
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::credit_meter::{mint_spend_receipt, CreditMeterError, PinnedCreditQuote};
 
 use super::{problem_response, require_http_any_scope, AppState, HeaderMap, State, StatusCode};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(super) struct SpendCreditsBody {
     pub quote: PinnedCreditQuote,
 }
@@ -39,10 +39,8 @@ pub(super) async fn post_credit_spend(
     let key = match crux_session::LocalPassportKey::from_path(&state.passport_key_path) {
         Ok(key) => key,
         Err(err) => {
-            return problem_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("passport key load failed: {err}"),
-            );
+            tracing::error!(error = %err, "credit spend passport signing key load failed");
+            return problem_response(StatusCode::INTERNAL_SERVER_ERROR, "passport signing key unavailable");
         }
     };
     if key.passport_fpr() != state.passport_fpr {
@@ -66,7 +64,13 @@ pub(super) async fn post_credit_spend(
         }
     };
 
-    let reservation = match guard.reserve(&body.quote.tenant_id, &body.quote.operation_id, body.quote.credits) {
+    let payload_hash = hash_json(&json!(body));
+    let reservation = match guard.reserve(
+        &body.quote.tenant_id,
+        &body.quote.operation_id,
+        body.quote.credits,
+        &payload_hash,
+    ) {
         Ok(reservation) => reservation,
         Err(err) => return meter_error_response(err),
     };
@@ -115,6 +119,8 @@ fn meter_error_response(err: CreditMeterError) -> Response {
             problem_response(StatusCode::BAD_REQUEST, err.to_string())
         }
         CreditMeterError::OperationConflict { .. }
+        | CreditMeterError::OperationPayloadMismatch { .. }
+        | CreditMeterError::OperationAlreadySpent { .. }
         | CreditMeterError::ReservationVoided { .. }
         | CreditMeterError::TenantMismatch { .. } => problem_response(StatusCode::CONFLICT, err.to_string()),
         CreditMeterError::ReservationNotFound { .. } => problem_response(StatusCode::NOT_FOUND, err.to_string()),
@@ -122,6 +128,11 @@ fn meter_error_response(err: CreditMeterError) -> Response {
             problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
         }
     }
+}
+
+fn hash_json(value: &serde_json::Value) -> String {
+    let bytes = serde_json::to_vec(value).unwrap_or_default();
+    format!("blake3:{}", blake3::hash(&bytes).to_hex())
 }
 
 #[cfg(test)]
@@ -180,7 +191,6 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::CREATED);
         let body = body_json(resp).await;
-        let receipt_id = body["credit_spend_receipt"].as_str().unwrap().to_string();
         assert_eq!(
             body["credit_spend_receipt"],
             body["spend_receipt"]["body"]["receipt_id"]
@@ -206,9 +216,7 @@ mod tests {
             Json(SpendCreditsBody { quote: quote(4) }),
         )
         .await;
-        assert_eq!(retry.status(), StatusCode::CREATED);
-        let retry_body = body_json(retry).await;
-        assert_eq!(retry_body["credit_spend_receipt"], receipt_id);
+        assert_eq!(retry.status(), StatusCode::CONFLICT);
         let guard = state.credit_meter.as_ref().unwrap().lock().unwrap();
         assert_eq!(guard.available_balance("tenant-a"), 6);
     }

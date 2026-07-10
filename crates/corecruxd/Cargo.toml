@@ -76,6 +76,7 @@ crux-integrations = { path = "../crux-integrations" }
 crux-lens-features = { path = "../crux-lens-features" }
 crux-mcp = { path = "../crux-mcp" }
 crux-router = { path = "../crux-router" }
+rcx-capability-token = { path = "../rcx-capability-token" }
 crux-session = { path = "../crux-session" }
 crux-enterprise-shim = { path = "../crux-enterprise-shim" }
 vaultcrux-local = { path = "../vaultcrux-local" }

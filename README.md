@@ -451,7 +451,9 @@ signal unless you set an `https://` collector endpoint *and* record consent. See
 
 Credit Meter is also **opt-in and off by default**. `CORECRUXD_CREDIT_METER=1` enables only the
 seeded comped-wallet spend rail for pinned quotes and signed spend receipts; fiat minting, Paddle,
-and production billing remain separately gated.
+and production billing remain separately gated. The same flag meters successful RCX-verified
+`/v1/gpu1/rerank` compute: callers carry the pinned quote in `options.credit_quote`, and the result
+adds the spend receipt id, credits spent, and post-spend wallet balance.
 
 </details>
 

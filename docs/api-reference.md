@@ -71,6 +71,13 @@ visibility are MCP-only features.
 |--------|------|-------------|------------|
 | POST | `/v1/credits/spend` | Default-off comped-wallet spend rail. Requires `CORECRUXD_CREDIT_METER=1`; consumes a pinned quote, reserves/spends seeded credits idempotently, and returns a signed `crux.credit_spend_receipt.v1`. Does not mint fiat credits or call Paddle. | `admin:write` |
 
+When `CORECRUXD_CREDIT_METER=1`, successful RCX-verified `POST /v1/gpu1/rerank`
+calls also reserve and spend 3 comped-wallet credits. The pinned
+`crux.credit_quote.v1` rides at `options.credit_quote`; the
+`crux.gpu1.compute_response.v1` envelope adds `credit_spend_receipt`,
+`credits_spent`, and `wallet_balance`. Failed/degraded compute releases the
+reservation and emits no spend stamp.
+
 ### Replay Exports
 
 | Method | Path | Description | Auth Scope |
