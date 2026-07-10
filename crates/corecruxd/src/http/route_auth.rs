@@ -272,6 +272,20 @@ fn classify_route(method: &str, path: &str) -> Option<RouteAuthContract> {
         return Some(RouteAuthContract::new(class, scopes));
     }
 
+    if path.starts_with("/v1/repos") {
+        let class = if method == "GET" {
+            RouteAuthClass::AdminRead
+        } else {
+            RouteAuthClass::AdminWrite
+        };
+        let scopes = if method == "GET" {
+            &["admin:read"][..]
+        } else {
+            &["admin:write"][..]
+        };
+        return Some(RouteAuthContract::new(class, scopes));
+    }
+
     if path.starts_with("/v1/work")
         || path.starts_with("/v1/status-feed")
         || path.starts_with("/v1/projects")
@@ -336,6 +350,14 @@ fn classify_route(method: &str, path: &str) -> Option<RouteAuthContract> {
             RouteAuthClass::FeatureGated,
             &["query:read", "admin:read"],
             "CORECRUXD_QUOTA",
+        ));
+    }
+
+    if path.starts_with("/v1/credits/") {
+        return Some(RouteAuthContract::gated(
+            RouteAuthClass::FeatureGated,
+            &["admin:write"],
+            "CORECRUXD_CREDIT_METER",
         ));
     }
 
@@ -557,6 +579,12 @@ mod tests {
                 "/v1/gpu1/answer",
                 RouteAuthClass::FeatureGated,
                 &["query:read", "admin:read"][..],
+            ),
+            (
+                "POST",
+                "/v1/credits/spend",
+                RouteAuthClass::FeatureGated,
+                &["admin:write"][..],
             ),
             (
                 "GET",

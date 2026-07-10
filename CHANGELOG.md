@@ -11,18 +11,132 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Licence file layout deduplicated.** `LICENCE-CODE.md` (a three-line stub
+  pointing at `LICENCE.md`) is removed; `LICENCE.md` is the sole canonical
+  code-licence text and release bundles now ship `LICENCE.md` +
+  `LICENCE-CONTENT.md` directly. Previously bundles shipped the stub but not
+  the file it pointed at. GitHub's licence tabs now show the two real
+  licences instead of a pointer.
+
 ### Added
 
-- *(unmerged branch `feat/openapi-m0`)* OpenAPI: receipts routes covered in
-  `/v1/openapi.json` plus a route-level contract test (M0).
-- *(unmerged branch `feat/upgrade-aware-501s`)* Upgrade-aware `501` responses
-  on platform-only endpoints (HTTP + MCP) that signpost the hosted platform
-  instead of a bare not-implemented (W1.A3).
-- Workspace wizard: live-session coordination protocol in `workspace-cuecrux`
-  (v2 → v3).
+- **`CITATION.cff`.** Machine-readable citation metadata (GitHub "Cite this
+  repository" button), matching the CCL v1.0 academic-use attribution
+  condition.
+
+## [0.5.38] - 2026-07-10
+
+### Added
+
+- **AST-derived code-structure scanner.** Behind `CORECRUXD_AST_SCAN`, the
+  workspace scanner produces the `WorkspaceScan` shape from a `syn` AST pass
+  instead of the regex scanner (flag-off byte-identical). ~17× faster on the
+  Crux tree (p95 ~0.9 s vs ~15 s) and more accurate: call-edges resolved
+  module-qualified, dead-code by AST identifier-reachability rather than the
+  O(n²) substring pass. Context-graph edges fold in as `Extracted` confidence.
+- **Watched repositories.** `POST/GET/DELETE /v1/repos` register a repo the
+  daemon should know about (tenant-scoped; `corecruxctl repo add|list|remove`;
+  MCP `register_repo` / `list_repos`). Registering a local path runs a one-shot
+  scan. An active file-watch loop (`CORECRUXD_REPO_WATCH`, default off) keeps a
+  repo's graph current via incremental re-index — a single-file edit re-parses
+  only that file — using `notify` with a WSL `/mnt` polling fallback.
+- **Polyglot extraction.** TypeScript/TSX, Vue (`<script>` blocks) and Python
+  via `tree-sitter`, alongside Rust via `syn`; a language-agnostic repo walk
+  scans repositories that are not Cargo workspaces.
+- **Typed code edges in the relation graph.** `RelationTypeV1` gains
+  `Calls` / `Imports` / `Defines` / `DependsOn` (append-only); behind
+  `CORECRUXD_CODEGRAPH_EDGES` a repo's code graph is emitted as tenant-scoped,
+  temporal relation edges and traversable via `POST /v1/relations/expand`.
+- **Code-graph retrieval boost (spike).** A code-graph adjacency closure for
+  `fused_retrieve`'s graph lane, behind `CORECRUXD_CODEGRAPH_FUSION`
+  (default off; no recall study yet — see the ExecPlan).
+- **Console code-graph view.** `/console/codegraph` renders the typed code+claim
+  graph with node/edge/confidence visual language, focus + inspector, and
+  `file:line` deep-links.
+
+  _ExecPlan: `ast-polyglot-code-graph-and-repo-watch-2026-07-08` (M0–M8);
+  supersedes `workspace-scan-storyline-improvements-2026-05-03` and
+  `crux-code-intelligence-2026-06-12`._
+
+- **Code map serving.** `GET /v1/repos/{repoId}/codemap` (`format=summary|full`)
+  serves the AST scan persisted at registration/re-index — the read side of
+  `POST /v1/repos`. Tenant-scoped `admin:read`; distinct 404s for unregistered
+  vs never-scanned repos. Downstream: the WikiCrux code-maps surface
+  (wiki.cuecrux.com/code, `wiki_codemap` MCP tool) consumes this endpoint.
+  _ExecPlan: `codemap-endpoint-and-agent-docs-hardening-2026-07-10`._
+- **Credit Meter spend rail (default-off).** `CORECRUXD_CREDIT_METER=1` enables
+  the comped-wallet `POST /v1/credits/spend` path: pinned quotes → signed
+  `crux.credit_spend_receipt.v1`, idempotent on retry (no double-debit).
+- **Vendor observations.** Handoff/vendor observation capture with provider
+  breakdowns (`list_observations` / `get_observation` / `verify_observation`);
+  MCP handoffs are observed.
+- **Usage receipts (opt-in).** Signed, metadata-only `usage_ping` receipts with
+  a consent-gated submitter; `/v1/version` gains update/version-notify state.
+- **Agent-docs hardening.** Nested `AGENTS.md` in all 28 crates
+  (symbol-anchored, ≤50 lines); `check-agent-docs.sh` v2 gates llms.txt link
+  parity, nested-file presence, `llms-full.txt` freshness and (in CI) executes
+  the cheap documented commands; deterministic `llms-full.txt` generator;
+  CLAIMS 10–15 and INVARIANTS I5 (witness anchoring) / I6 (custody-proof
+  export); README redesigned around the 60-second agent-first quickstart.
+
+### Fixed
+
+- **Merged scan routing.** A cargo workspace containing any non-Rust supported
+  files no longer flattens to a single polyglot package with zero routes:
+  `run_repo_scan_at` merges the native Rust workspace scan with a
+  rust-excluded tree-sitter pass (self-scan: 29 packages / 319 routes /
+  14,290 symbols), and the watch loop re-indexes through the same path.
+- Stale agent docs: MCP tool `token_usage` → `session_token_usage`; CODEMAP's
+  nonexistent `ShardStorage::append` → `append_batch`/`append_batch_with_stats`.
+- **Passport key create race.** `write_new_passport_seed` losers of the
+  `create_new` race could read the winner's key file before its bytes landed
+  ("key file is empty"); the key is now written in one buffer and the
+  AlreadyExists path retries briefly. Test temp dirs additionally salt
+  nanos with pid + a counter (coarse VM clocks collided parallel tests into
+  one dir — the CI flake behind this).
+
+## [0.5.36] - 2026-07-03
+
+### Added
+
+- **Usage receipts self-populate.** The daemon now auto-emits one `usage_ping`
+  (`event_class=daemon_start`, keyed to the root passport) on startup — but only
+  when the operator has opted into submission (the three-way consent gate).
+  Default installs still dial nothing (`assert-no-phone-home` stays green); once
+  opted in, the adoption signal registers on every boot with no manual mint (#322).
+- **Version-notify.** The usage-receipt collector's response advertises the
+  latest Crux release; the daemon compares it to its own version and, when
+  behind, logs a warning and surfaces `update.latest_release` / `update.behind`
+  on `/v1/version` (#322).
+
+## [0.5.35] - 2026-07-03
+
+### Added
+
+- **Opt-in signed usage receipts (Phase T).** A local, signed, metadata-only
+  `usage_ping` CROWN receipt (default-OFF), plus a consent-gated, verifiable
+  opt-in submitter — the daemon's only sanctioned outbound signal, gated behind
+  `CORECRUXD_USAGE_RECEIPTS_{SUBMIT,ENDPOINT,CONSENT_AT}`; inert under default
+  config so `assert-no-phone-home` stays green (#315, #317, #318). See
+  `docs/usage-receipts.md`.
+- **Side-by-side demo** — `/console/receipts-vs-console`: the CROWN
+  receipts-as-debugging timeline next to a vendor free-console mock (#316).
+- OpenAPI: receipts routes covered in `/v1/openapi.json` plus a route-level
+  contract test (#168).
+- Upgrade-aware `501` responses on platform-only endpoints (HTTP + MCP) that
+  signpost the hosted platform instead of a bare not-implemented (#169).
+- Workspace wizard: live-session coordination protocol (`workspace-cuecrux` v2 → v3).
 
 ### Changed
 
+- **Launch defaults ON** — coordination plane (`CORECRUXD_COORD`),
+  passport-revocation enforcement (`CRUX_PASSPORT_REVOCATION`), agent-card
+  discovery (`CRUX_AGENT_CARD`), and scoped-forget default to ON for fresh
+  installs; typed action traces + activity signing remain documented opt-in (#314).
+- Trust surface: `assert-no-phone-home.sh` + the CROWN receipt-tamper demo are
+  now release-blocking gates in `release.yml` (#313).
 - CI: `paths-ignore` replaced with a skip-but-report change-scope gate.
 
 ## [0.4.6] - 2026-06-11

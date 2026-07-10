@@ -15,7 +15,7 @@ cargo clippy --workspace -- -D warnings  # Lint
 
 ## Architecture
 
-- 17 Rust crates in a workspace under `crates/`
+- 28 Rust crates in a workspace under `crates/` — full atlas: `docs/agent/CODEMAP.md` (see `AGENTS.md` for the agent reading order)
 - `corecruxd` — HTTP (axum, port 14800) + gRPC (tonic) daemon
 - `corecruxctl` — CLI tool with subcommands
 - `corecrux-retrieval` — BM25 + graph + dense-cosine signal fusion (CPU path). The dense lane is a free, **uncapped** local capability via a pluggable `DenseProvider` (exact CPU cosine in the CE; GPU `.ccxe` in the dataplane). Better dense (reranking) and extraction are the metered upsell — never a clip on local dense. See ExecPlan `dense-lane-and-extraction-upsell-2026-06-26`.

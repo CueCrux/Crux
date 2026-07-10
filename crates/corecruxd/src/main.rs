@@ -26,6 +26,7 @@
 mod activity;
 mod agentgraph_kinds;
 mod auth;
+mod codegraph_fusion;
 mod config;
 mod console_index;
 mod consolidation_scheduler;
@@ -33,6 +34,10 @@ mod control;
 mod coord;
 mod cost;
 mod cost_attribution;
+// Credit-burn M1a staged primitive; wired into request paths in a later
+// gated milestone after the money-path design review.
+#[allow(dead_code)]
+mod credit_meter;
 // Dataplane store stubs: proprietary edition provides the real implementation.
 #[allow(dead_code)]
 mod dataplane_store;
@@ -81,6 +86,9 @@ mod projects;
 mod protocol_posture;
 mod redaction;
 mod relations;
+mod repo_codegraph;
+mod repo_registry;
+mod repo_watch;
 mod session_bindings;
 mod shard_map;
 mod status_feed;
@@ -99,6 +107,8 @@ mod witness_submit;
 mod work;
 mod work_execplans;
 mod workspace_scan;
+mod workspace_scan_ast;
+mod workspace_scan_polyglot;
 
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;
@@ -569,6 +579,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     /// for a per-(passport, session, chain-head) memo on a local daemon.
     const ASSEMBLY_CACHE_MAX_ENTRIES: usize = 256;
 
+    let credit_meter = if config.credit_meter_enabled {
+        Some(Arc::new(std::sync::Mutex::new(
+            crate::credit_meter::CreditMeterStore::open(config.data_dir.join("credit-meter.jsonl"))?,
+        )))
+    } else {
+        None
+    };
+
+    let fact_store = Arc::new(RwLock::new(if config.fact_persistence_enabled {
+        corecrux_memory::FactStore::with_persistence(&config.data_dir)?
+    } else {
+        corecrux_memory::FactStore::new()
+    }));
+    let projection_state = {
+        let mut ps = corecrux_projections::ProjectionState::default();
+        match crate::relations::load_into_state(&config.data_dir, &mut ps) {
+            Ok(n) => tracing::info!(loaded = n, "relations.jsonl replayed into ProjectionState"),
+            Err(err) => tracing::warn!(?err, "relations replay failed; starting empty"),
+        }
+        Arc::new(RwLock::new(ps))
+    };
+    let repo_watch = crate::repo_watch::RepoWatchService::maybe_new(
+        fact_store.clone(),
+        projection_state.clone(),
+        config.data_dir.clone(),
+    );
+
     let state = AppState {
         lock_held: true,
         build: build.clone(),
@@ -597,7 +634,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         local_ingest_enabled: config.local_ingest_enabled,
         stream_receipts_enabled: config.stream_receipts_enabled,
         usage_receipts_enabled: config.usage_receipts_enabled,
+        handoff_observations_enabled: config.handoff_observations_enabled,
         usage_submit: config.usage_submit.clone(),
+        // Phase T (M2) version-notify slot; the consent-gated usage submitter
+        // writes the collector-reported latest release here, `/v1/version` reads it.
+        latest_release: Arc::new(std::sync::RwLock::new(None)),
         quota_enabled: config.quota_enabled,
         assembly_cache: config.assembly_cache_enabled.then(|| {
             Arc::new(std::sync::Mutex::new(
@@ -606,6 +647,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }),
         quota_hosted_surfaces: Arc::new(config.quota_hosted_surfaces.clone()),
         quota_ledger: Arc::new(std::sync::Mutex::new(crux_router::quota::QuotaLedger::new())),
+        credit_meter,
         openai_shim_enabled: config.openai_shim_enabled,
         memory_import_enabled: config.memory_import_enabled,
         identity_links_enabled: config.identity_links_enabled,
@@ -665,11 +707,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             Arc::new(RwLock::new(idx))
         },
-        fact_store: Arc::new(RwLock::new(if config.fact_persistence_enabled {
-            corecrux_memory::FactStore::with_persistence(&config.data_dir)?
-        } else {
-            corecrux_memory::FactStore::new()
-        })),
+        fact_store: fact_store.clone(),
+        repo_watch: repo_watch.clone(),
         extension_rate_table: Arc::new(crate::extension_outbound::RateTable::new()),
         #[cfg(feature = "wasm-extensions")]
         wasm_engine: build_wasm_engine_for_appstate(),
@@ -736,19 +775,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             fact_privacy::install_global(p.clone());
             p
         },
-        projection_state: {
-            let mut ps = corecrux_projections::ProjectionState::default();
-            match crate::relations::load_into_state(&config.data_dir, &mut ps) {
-                Ok(n) => tracing::info!(loaded = n, "relations.jsonl replayed into ProjectionState"),
-                Err(err) => tracing::warn!(?err, "relations replay failed; starting empty"),
-            }
-            Arc::new(RwLock::new(ps))
-        },
+        projection_state: projection_state.clone(),
     };
 
     // Wire the shared event bus into both stores so mutations emit SSE events.
     state.fact_store.write().await.set_event_bus(state.event_bus.clone());
     state.session_store.write().await.set_event_bus(state.event_bus.clone());
+    if let Some(watcher) = &state.repo_watch {
+        watcher.start_existing_repos().await;
+    }
 
     // Wire optional embedding client for dense vector retrieval on facts.
     if let Some(ref embedding_url) = config.embedding_url {
@@ -884,8 +919,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     crux_mcp::agent_passport::AgentPassportMap::empty()
                 },
             )
-            // passport-revocation M3: refuse revoked passports' calls when
-            // CRUX_PASSPORT_REVOCATION=1 (default-off).
+            // passport-revocation M3: refuse revoked passports' calls —
+            // launch default ON; CRUX_PASSPORT_REVOCATION=0 disables it.
             .with_revocation_enforced(crux_mcp::dispatch::revocation_enforced_from_env())
             .with_substrate(
                 state.entity_store.clone(),
@@ -912,6 +947,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         corecrux_memory::CaseStore::new()
     }));
+    // Phase T (M1): clone the assembled AppState for the once-per-boot
+    // `daemon_start` usage-ping emit *before* `state` is moved into the router.
+    // The emit itself is fired only after the HTTP server is serving (below).
+    let boot_emit_state = state.clone();
     let app: Router =
         http::ingress::apply_ingress_limits(http::router(state, case_store), &config.ingress, Some(&metrics))
             .layer(TraceLayer::new_for_http());
@@ -1154,6 +1193,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let drain_cap = config.ingress.shutdown_drain_cap();
         tokio::spawn(async move { serve_http(http_addr, app, rx, drain_cap).await })
     };
+
+    // Phase T (M1): now that the HTTP server is serving, emit exactly one
+    // consent-gated `daemon_start` usage ping keyed to the daemon root passport.
+    // A no-op with ZERO network under default config — `emit_daemon_start_usage_ping`
+    // returns before any mint or network task unless the three-way submit gate
+    // (`CORECRUXD_USAGE_RECEIPTS_SUBMIT` + `_ENDPOINT` + `_CONSENT_AT`) is fully
+    // set, so `assert-no-phone-home.sh` stays green. Spawned on the blocking pool
+    // so the boot path is never blocked; fires at most once per boot.
+    tokio::task::spawn_blocking(move || {
+        http::emit_daemon_start_usage_ping(&boot_emit_state);
+    });
 
     let grpc_task = {
         let mut rx = shutdown_tx.subscribe();
@@ -4167,11 +4217,14 @@ mod tests {
             local_ingest_enabled: false,
             stream_receipts_enabled: false,
             usage_receipts_enabled: false,
+            handoff_observations_enabled: false,
             usage_submit: crate::usage_submit::UsageSubmitConfig::default(),
+            latest_release: std::sync::Arc::new(std::sync::RwLock::new(None)),
             quota_enabled: false,
             assembly_cache: None,
             quota_hosted_surfaces: std::sync::Arc::new(Vec::new()),
             quota_ledger: std::sync::Arc::new(std::sync::Mutex::new(crux_router::quota::QuotaLedger::new())),
+            credit_meter: None,
             openai_shim_enabled: false,
             memory_import_enabled: false,
             identity_links_enabled: false,
@@ -4209,6 +4262,7 @@ mod tests {
             retention_days: None,
             retrieval_index: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_retrieval::IndexManager::new())),
             fact_store: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::FactStore::new())),
+            repo_watch: None,
             extension_rate_table: std::sync::Arc::new(crate::extension_outbound::RateTable::new()),
             #[cfg(feature = "wasm-extensions")]
             wasm_engine: None,

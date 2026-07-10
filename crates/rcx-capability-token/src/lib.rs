@@ -59,9 +59,23 @@ pub fn corecrux_lane_capability(slug: &str) -> String {
     format!("{CORECRUX_LANE_CAPABILITY_PREFIX}{slug}")
 }
 
-/// Permitted-capability set for a PAID token: every premium lane, each costing
-/// `per_call_cost` credits per call (Text egress). Free tokens carry none of
-/// these, so their premium lanes are hard-gated off in CoreCrux.
+/// Per-call credit cost for a premium lane. Most premium lanes use the token's
+/// base `per_call_cost`; the metered dense lanes are priced explicitly (3:1):
+/// `rerank` = 3 (a K-pass cross-encoder over the candidate window, heavy per
+/// query) vs `dense_managed` = 1 (a single hosted query embedding). MUST match
+/// the hosted TS minter (`@cuecrux-shared/contracts::CORECRUX_LANE_CREDIT_COST`).
+pub fn corecrux_lane_credit_cost(slug: &str, per_call_cost: u64) -> u64 {
+    match slug {
+        "rerank" => 3,
+        "dense_managed" => 1,
+        _ => per_call_cost,
+    }
+}
+
+/// Permitted-capability set for a PAID token: every premium lane (Text egress).
+/// Most cost `per_call_cost` credits/call; the metered dense lanes are priced by
+/// [`corecrux_lane_credit_cost`]. Free tokens carry none of these, so their
+/// premium lanes are hard-gated off in CoreCrux.
 pub fn corecrux_premium_lane_capabilities(per_call_cost: u64) -> Vec<PermittedCapability> {
     CORECRUX_PREMIUM_LANE_SLUGS
         .iter()
@@ -71,7 +85,7 @@ pub fn corecrux_premium_lane_capabilities(per_call_cost: u64) -> Vec<PermittedCa
             required_attestations: Vec::new(),
             credit_cost: Some(CreditCost {
                 unit: CreditCostUnit::Call,
-                cost: per_call_cost,
+                cost: corecrux_lane_credit_cost(slug, per_call_cost),
             }),
         })
         .collect()
@@ -898,16 +912,19 @@ mod tests {
         assert_eq!(caps.len(), 13, "exactly 13 premium lanes");
         for (cap, slug) in caps.iter().zip(CORECRUX_PREMIUM_LANE_SLUGS) {
             assert_eq!(cap.capability, format!("corecrux.lane.{slug}"));
-            assert_eq!(cap.credit_cost.as_ref().map(|c| c.cost), Some(3));
+            assert_eq!(
+                cap.credit_cost.as_ref().map(|c| c.cost),
+                Some(corecrux_lane_credit_cost(slug, 3))
+            );
             assert_eq!(cap.data_egress_classes, vec![DataEgressClass::Text]);
         }
-        // the metered dense-service lanes are present and premium
-        for slug in ["rerank", "dense_managed"] {
-            assert!(
-                CORECRUX_PREMIUM_LANE_SLUGS.contains(&slug),
-                "{slug} should be a premium lane"
-            );
-        }
+        // the metered dense-service lanes are premium and priced 3:1
+        assert!(CORECRUX_PREMIUM_LANE_SLUGS.contains(&"rerank"));
+        assert!(CORECRUX_PREMIUM_LANE_SLUGS.contains(&"dense_managed"));
+        assert_eq!(corecrux_lane_credit_cost("rerank", 3), 3);
+        assert_eq!(corecrux_lane_credit_cost("dense_managed", 3), 1);
+        // other premium lanes keep the token's base per-call cost
+        assert_eq!(corecrux_lane_credit_cost("topology", 7), 7);
         // free baseline must NOT appear in the premium registry
         for free in ["bm25", "dense", "sparse"] {
             assert!(

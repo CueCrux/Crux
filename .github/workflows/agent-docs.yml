@@ -26,4 +26,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Check agent docs
-        run: bash scripts/check-agent-docs.sh
+        # --exec also runs the cheap documented commands (cargo fmt --check);
+        # heavyweight build/test/clippy stay in ci.yml.
+        run: bash scripts/check-agent-docs.sh --exec

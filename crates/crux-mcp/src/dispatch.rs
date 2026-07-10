@@ -84,7 +84,7 @@ pub struct McpContext {
     /// passport-revocation M3: when true, `call_tool` refuses calls from a
     /// REVOKED passport (except a tiny read-only allowlist so the agent can
     /// learn it was revoked — M4). Wired from `corecruxd::main` off
-    /// `CRUX_PASSPORT_REVOCATION`; default false (no enforcement).
+    /// `CRUX_PASSPORT_REVOCATION` — **launch default ON**; `=0` disables enforcement.
     pub revocation_enforced: bool,
 }
 
@@ -387,8 +387,10 @@ pub async fn dispatch(req: JsonRpcRequest, ctx: &McpContext, _agent: Option<&Age
             }),
         ),
 
-        // Notification — no response required, but we return null result
-        // so the HTTP layer can still send a 200.
+        // Notification — no response is required. The HTTP layer
+        // (`handle_mcp_post`) short-circuits notifications (`id` is `None`) to an
+        // empty `202 Accepted` before dispatch is reached, so this arm is a
+        // defensive fallback for any non-HTTP caller; it returns a null result.
         "notifications/initialized" => JsonRpcResponse::success(req.id, json!(null)),
 
         // ── Tool surface ───────────────────────────────────────────────

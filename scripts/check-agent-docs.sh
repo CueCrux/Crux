@@ -9,7 +9,15 @@
 # the doc set from "hopefully current" to "provably current" — the same standard the
 # product itself sells. A rename that orphans a doc reference fails the build here.
 #
-# Usage: bash scripts/check-agent-docs.sh
+# v2 additionally asserts:
+#   - every local link in llms.txt resolves (link parity),
+#   - every cargo crate under crates/ ships a nested AGENTS.md, small enough to stay
+#     under harness truncation limits (≤60 lines hard),
+#   - llms-full.txt is fresh (regenerate-and-diff via scripts/build-llms-full.sh --check).
+#
+# Usage: bash scripts/check-agent-docs.sh [--exec]
+#   --exec  additionally EXECUTE the cheap documented commands (cargo fmt --check).
+#           Heavyweight commands (build/test/clippy) stay in ci.yml where they already run.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -81,12 +89,57 @@ done < <(yaml_list fuzz_targets)
 
 echo "==> referenced docs exist"
 for d in \
-  AGENTS.md llms.txt \
+  AGENTS.md llms.txt llms-full.txt \
   docs/agent/CODEMAP.md docs/agent/CLAIMS.md docs/agent/INVARIANTS.md \
   docs/agent/GLOSSARY.md docs/agent/repo-manifest.yaml \
   docs/THREAT_MODEL.md docs/spec/receipt-v1.md; do
   [[ -f "$ROOT/$d" ]] && check doc "$d" ok || check doc "$d" miss
 done
+
+echo "==> llms.txt link parity (every local link resolves)"
+while IFS= read -r target; do
+  [[ -z "$target" ]] && continue
+  case "$target" in
+    http://*|https://*|mailto:*) continue ;;
+  esac
+  if [[ -f "$ROOT/$target" || -d "$ROOT/${target%/}" ]]; then
+    check link "$target" ok
+  else
+    check link "$target" miss
+  fi
+done < <(grep -oE '\]\([^)]+\)' "$ROOT/llms.txt" | sed 's/^](\(.*\))$/\1/')
+
+echo "==> nested per-crate AGENTS.md (present, ≤60 lines)"
+for crate_dir in "$ROOT"/crates/*/; do
+  name="$(basename "$crate_dir")"
+  agents="$crate_dir/AGENTS.md"
+  if [[ ! -f "$agents" ]]; then
+    check agents.md "crates/$name" miss
+    continue
+  fi
+  lines=$(wc -l < "$agents")
+  if (( lines > 60 )); then
+    check agents.md "crates/$name (${lines} lines > 60)" miss
+  else
+    check agents.md "crates/$name" ok
+  fi
+done
+
+echo "==> llms-full.txt freshness"
+if bash "$ROOT/scripts/build-llms-full.sh" --check >/dev/null 2>&1; then
+  check freshness llms-full.txt ok
+else
+  check freshness "llms-full.txt (stale — run scripts/build-llms-full.sh)" miss
+fi
+
+if [[ "${1:-}" == "--exec" ]]; then
+  echo "==> exec: cheap documented commands"
+  if (cd "$ROOT" && cargo fmt --check >/dev/null 2>&1); then
+    check exec "cargo fmt --check" ok
+  else
+    check exec "cargo fmt --check" miss
+  fi
+fi
 
 echo
 if [[ "$fail" -ne 0 ]]; then

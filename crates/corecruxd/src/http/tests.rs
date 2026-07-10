@@ -384,11 +384,14 @@ pub(super) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         local_ingest_enabled: false,
         stream_receipts_enabled: false,
         usage_receipts_enabled: false,
+        handoff_observations_enabled: false,
         usage_submit: crate::usage_submit::UsageSubmitConfig::default(),
+        latest_release: Arc::new(std::sync::RwLock::new(None)),
         quota_enabled: false,
         assembly_cache: None,
         quota_hosted_surfaces: Arc::new(Vec::new()),
         quota_ledger: Arc::new(std::sync::Mutex::new(crux_router::quota::QuotaLedger::new())),
+        credit_meter: None,
         openai_shim_enabled: false,
         memory_import_enabled: true,
         identity_links_enabled: true,
@@ -425,6 +428,7 @@ pub(super) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         retention_days: None,
         retrieval_index: Arc::new(RwLock::new(corecrux_retrieval::IndexManager::new())),
         fact_store: Arc::new(RwLock::new(corecrux_memory::FactStore::new())),
+        repo_watch: None,
         extension_rate_table: Arc::new(crate::extension_outbound::RateTable::new()),
         #[cfg(feature = "wasm-extensions")]
         wasm_engine: None,
@@ -6828,6 +6832,69 @@ async fn workbench_context_pack_and_command_ledger_store_private_receipts() {
     assert!(facts.facts.iter().all(|fact| fact.private));
 }
 
+#[tokio::test]
+async fn workbench_handoff_observations_are_default_off_and_flagged_on() {
+    let mut off_state = pro_workbench_state(&["handoff:v2"]);
+    bind_test_state_to_root_passport_key(&mut off_state);
+    let off_resp = super::workbench::post_handoff_v2(
+        State(off_state.clone()),
+        HeaderMap::new(),
+        Json(super::workbench::HandoffV2Body {
+            tenant_id: "business::acme".to_string(),
+            goal: "handoff without observation".to_string(),
+            session_id: Some("sess-h".to_string()),
+            project_id: Some("proj".to_string()),
+            source_agent: Some("anthropic".to_string()),
+            target_agent: Some("openai".to_string()),
+            evidence_refs: Vec::new(),
+            next_actions: Vec::new(),
+        }),
+    )
+    .await;
+    assert_eq!(off_resp.status(), StatusCode::OK);
+    let off_body = json_body(off_resp).await;
+    assert!(off_body.get("handoff_observation_id").is_none());
+    let obs_path = super::observations::observation_file_path(&off_state.data_dir, "handoff::business::acme::sess-h");
+    assert!(!obs_path.exists(), "flag-off handoff must not write observations");
+
+    let mut on_state = pro_workbench_state(&["handoff:v2"]);
+    bind_test_state_to_root_passport_key(&mut on_state);
+    on_state.handoff_observations_enabled = true;
+    let on_resp = super::workbench::post_handoff_v2(
+        State(on_state.clone()),
+        HeaderMap::new(),
+        Json(super::workbench::HandoffV2Body {
+            tenant_id: "business::acme".to_string(),
+            goal: "handoff with observation".to_string(),
+            session_id: Some("sess-h".to_string()),
+            project_id: Some("proj".to_string()),
+            source_agent: Some("anthropic".to_string()),
+            target_agent: Some("openai".to_string()),
+            evidence_refs: Vec::new(),
+            next_actions: Vec::new(),
+        }),
+    )
+    .await;
+    assert_eq!(on_resp.status(), StatusCode::OK);
+    let on_body = json_body(on_resp).await;
+    assert!(on_body["handoff_observation_id"].as_str().is_some());
+
+    let obs_path = super::observations::observation_file_path(&on_state.data_dir, "handoff::business::acme::sess-h");
+    let line = std::fs::read_to_string(obs_path)
+        .expect("handoff observation JSONL")
+        .lines()
+        .next()
+        .expect("one handoff observation")
+        .to_string();
+    let record: serde_json::Value = serde_json::from_str(&line).expect("observation json");
+    assert_eq!(record["kind"], "handoff");
+    assert_eq!(record["provider"], "crux-handoff");
+    assert_eq!(record["principal"], "claude-work");
+    assert_eq!(record["payload"]["source_passport"], "claude-work");
+    assert_eq!(record["payload"]["target_passport"], "codex-work");
+    assert_eq!(record["payload"]["cross_vendor"], true);
+}
+
 #[serial_test::serial]
 #[tokio::test]
 async fn workbench_context_pack_honors_jwt_tenant_binding() {
@@ -10916,6 +10983,281 @@ async fn workspace_routes_report_catalog_and_missing_scan_states() {
         .await
         .into_response();
     assert_eq!(unconfigured.status(), StatusCode::PRECONDITION_FAILED);
+}
+
+fn tiny_rust_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).expect("src dir");
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"repo-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(src.join("lib.rs"), "pub struct Used;\npub fn call() -> Used { Used }\n").expect("lib");
+    dir
+}
+
+#[tokio::test]
+async fn repo_add_local_path_persists_registration_and_scan() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let repo = tiny_rust_repo();
+    let root_path = repo.path().to_string_lossy().to_string();
+
+    let resp = super::repos::post_repo(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        Json(super::repos::CreateRepoBody {
+            repo_id: Some("fixture".to_string()),
+            tenant_id: "tenant-a".to_string(),
+            root_path: Some(root_path),
+            clone_url: None,
+            languages: vec!["rust".to_string()],
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["repo"]["repo_id"], "fixture");
+    assert!(body["repo"]["last_scan_id"].as_str().is_some());
+
+    let store = state.fact_store.read().await;
+    let registry_entity = crate::repo_registry::registry_entity("tenant-a", "fixture");
+    let scan_entity = crate::repo_registry::scan_entity("tenant-a", "fixture");
+    assert!(!store.get_by_entity(&registry_entity).is_empty());
+    assert!(!store.get_by_entity(&scan_entity).is_empty());
+    let persisted = crate::repo_registry::get_repo(&store, "tenant-a", "fixture").expect("repo persisted");
+    assert_eq!(persisted.repo_id, "fixture");
+    assert!(persisted.last_scan_id.is_some());
+}
+
+#[tokio::test]
+async fn repo_list_get_and_delete_are_tenant_scoped() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    for (tenant, repo_id) in [("tenant-a", "alpha"), ("tenant-b", "bravo")] {
+        let resp = super::repos::post_repo(
+            State(state.clone()),
+            dev_scope_headers("admin:write"),
+            Json(super::repos::CreateRepoBody {
+                repo_id: Some(repo_id.to_string()),
+                tenant_id: tenant.to_string(),
+                root_path: None,
+                clone_url: Some(format!("https://example.invalid/{repo_id}.git")),
+                languages: vec!["rust".to_string()],
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    let list_a = super::repos::get_repos(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::RepoTenantQuery {
+            tenant_id: "tenant-a".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    let body = json_body(list_a).await;
+    let repos = body["repos"].as_array().expect("repos array");
+    assert_eq!(repos.len(), 1);
+    assert_eq!(repos[0]["repo_id"], "alpha");
+
+    let cross_read = super::repos::get_repo(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::RepoTenantQuery {
+            tenant_id: "tenant-b".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(cross_read.status(), StatusCode::NOT_FOUND);
+
+    let delete = super::repos::delete_repo(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:write"),
+        Query(super::repos::RepoTenantQuery {
+            tenant_id: "tenant-a".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+
+    let store = state.fact_store.read().await;
+    assert!(crate::repo_registry::get_repo(&store, "tenant-a", "alpha").is_none());
+    assert!(store
+        .get_by_entity(&crate::repo_registry::scan_entity("tenant-a", "alpha"))
+        .is_empty());
+    assert!(crate::repo_registry::get_repo(&store, "tenant-b", "bravo").is_some());
+}
+
+/// A workspace-layout fixture: the scanner intentionally skips the root
+/// manifest, so symbols only appear for member crates.
+fn tiny_rust_workspace() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\nmembers = [\"mini\"]\n").expect("ws manifest");
+    let member = dir.path().join("mini");
+    std::fs::create_dir_all(member.join("src")).expect("member src");
+    std::fs::write(
+        member.join("Cargo.toml"),
+        "[package]\nname = \"mini\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("member manifest");
+    std::fs::write(
+        member.join("src").join("lib.rs"),
+        "pub struct Used;\npub fn call() -> Used { Used }\n",
+    )
+    .expect("member lib");
+    dir
+}
+
+#[tokio::test]
+async fn repo_codemap_serves_summary_and_full() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let repo = tiny_rust_workspace();
+    let root_path = repo.path().to_string_lossy().to_string();
+
+    let created = super::repos::post_repo(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        Json(super::repos::CreateRepoBody {
+            repo_id: Some("fixture".to_string()),
+            tenant_id: "tenant-a".to_string(),
+            root_path: Some(root_path),
+            clone_url: None,
+            languages: vec!["rust".to_string()],
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created_body = json_body(created).await;
+    let scan_id = created_body["repo"]["last_scan_id"]
+        .as_str()
+        .expect("scan id")
+        .to_string();
+
+    // Default format is the summary: stats + per-crate rollup, no file list.
+    let summary = super::repos::get_repo_codemap(
+        State(state.clone()),
+        Path("fixture".to_string()),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::CodemapQuery {
+            tenant_id: "tenant-a".to_string(),
+            format: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(summary.status(), StatusCode::OK);
+    let summary_body = json_body(summary).await;
+    assert_eq!(summary_body["repo_id"], "fixture");
+    assert_eq!(summary_body["scan_id"], scan_id.as_str());
+    assert!(summary_body["stats"]["symbol_count"].as_u64().unwrap() >= 1);
+    assert!(summary_body["crates"].as_array().is_some_and(|c| !c.is_empty()));
+    assert!(summary_body.get("scan").is_none());
+
+    // Full format round-trips the persisted WorkspaceScan.
+    let full = super::repos::get_repo_codemap(
+        State(state.clone()),
+        Path("fixture".to_string()),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::CodemapQuery {
+            tenant_id: "tenant-a".to_string(),
+            format: Some("full".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(full.status(), StatusCode::OK);
+    let full_body = json_body(full).await;
+    assert_eq!(full_body["scan"]["scan_id"], scan_id.as_str());
+    assert!(full_body["scan"]["files"].as_array().is_some_and(|f| !f.is_empty()));
+    assert!(full_body["scan"]["symbols"].as_array().is_some_and(|s| !s.is_empty()));
+
+    // Unknown format is rejected, not silently defaulted.
+    let bad_format = super::repos::get_repo_codemap(
+        State(state.clone()),
+        Path("fixture".to_string()),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::CodemapQuery {
+            tenant_id: "tenant-a".to_string(),
+            format: Some("csv".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(bad_format.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn repo_codemap_not_found_paths_are_distinct() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    // Unregistered repo → repo not found.
+    let missing = super::repos::get_repo_codemap(
+        State(state.clone()),
+        Path("ghost".to_string()),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::CodemapQuery {
+            tenant_id: "tenant-a".to_string(),
+            format: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    // clone_url-only registration → registered but never scanned; the 404
+    // hint tells the caller how to get a scan.
+    let created = super::repos::post_repo(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        Json(super::repos::CreateRepoBody {
+            repo_id: Some("deferred".to_string()),
+            tenant_id: "tenant-a".to_string(),
+            root_path: None,
+            clone_url: Some("https://example.invalid/deferred.git".to_string()),
+            languages: vec![],
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(created.status(), StatusCode::OK);
+
+    let unscanned = super::repos::get_repo_codemap(
+        State(state.clone()),
+        Path("deferred".to_string()),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::CodemapQuery {
+            tenant_id: "tenant-a".to_string(),
+            format: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(unscanned.status(), StatusCode::NOT_FOUND);
+
+    // Cross-tenant read cannot see another tenant's repo (or its scan).
+    let cross = super::repos::get_repo_codemap(
+        State(state.clone()),
+        Path("deferred".to_string()),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::CodemapQuery {
+            tenant_id: "tenant-b".to_string(),
+            format: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(cross.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

@@ -17,6 +17,7 @@ mod console;
 mod context_surface;
 mod coord;
 mod cost;
+mod credit_meter;
 mod dataplane;
 mod dossier;
 mod engine_console;
@@ -55,6 +56,7 @@ mod rcx_publish;
 mod receipts;
 mod relations;
 mod replay;
+mod repos;
 mod result_envelope;
 #[cfg(test)]
 mod route_auth;
@@ -74,6 +76,9 @@ mod workspace;
 pub mod session_metrics;
 
 pub(crate) use admin::AdminActionRecord;
+// Phase T M1 daemon-boot auto-emit — called once per boot from main.rs after
+// the HTTP server is serving.
+pub(crate) use stream_receipts::emit_daemon_start_usage_ping;
 // HttpDataplane trait re-exported for test fakes (FakeHttpDataplane in tests.rs).
 #[allow(unused_imports)]
 pub(crate) use dataplane::{pool_backed_http_dataplane, HttpDataplane, HttpDataplaneError, SharedHttpDataplane};
@@ -210,12 +215,25 @@ pub struct AppState {
     /// (`CORECRUXD_FEATURE_USAGE_RECEIPTS=1`); when off the draft hits the
     /// legacy tool-mediation parse and is rejected, exactly as before.
     pub usage_receipts_enabled: bool,
+    /// Phase T S1 faithful handoff measurement. Default OFF
+    /// (`CORECRUXD_HANDOFF_OBSERVATIONS=1`); when enabled,
+    /// `/v1/workbench/handoff-v2` writes a local signed `kind="handoff"`
+    /// observation with source/target vendor passport attribution.
+    pub handoff_observations_enabled: bool,
     /// Phase T (M1) consent-gated opt-in usage-ping *submitter* config — the
     /// daemon's only sanctioned outbound signal. Default-absent on every leg
     /// (`CORECRUXD_USAGE_RECEIPTS_SUBMIT` / `_ENDPOINT` / `_CONSENT_AT`); the
     /// submitter fires only on an explicit `usage_ping` mint, after local
     /// persist, and only when all three are set. See `crate::usage_submit`.
     pub usage_submit: crate::usage_submit::UsageSubmitConfig,
+    /// Phase T (M2) version-notify — the last `latest_version` release string
+    /// the consent-gated usage submitter saw in a collector 2xx response, if
+    /// any. Written by the submit task (`crate::usage_submit`), read by
+    /// `/v1/version` to surface an "update available" notice. `None` until the
+    /// first successful submit whose response carried `latest_version`; never
+    /// populated on a default (un-opted-in) install, since the submitter never
+    /// runs there.
+    pub latest_release: Arc<std::sync::RwLock<Option<String>>>,
     /// G20 per-surface request quota (`GET /v1/quota` + middleware over
     /// `crux_router::quota::QuotaLedger`). Default OFF
     /// (`CORECRUXD_QUOTA=1`); when off the middleware passes through and
@@ -229,6 +247,10 @@ pub struct AppState {
     /// Deliberately ephemeral: a restart refills everyone (errs toward
     /// the user).
     pub quota_ledger: Arc<std::sync::Mutex<crux_router::quota::QuotaLedger>>,
+    /// Credit-burn Meter M1b: persistent comped-wallet ledger. Default OFF
+    /// (`CORECRUXD_CREDIT_METER=1`); when absent `/v1/credits/spend` returns
+    /// 404 and no request path can burn credits.
+    pub credit_meter: Option<Arc<std::sync::Mutex<crate::credit_meter::CreditMeterStore>>>,
     /// G21b assembly cache over
     /// `corecrux_projections::assembly_cache::AssemblyCache` — memoizes
     /// assembled `/v1/context` bundles keyed by
@@ -293,6 +315,9 @@ pub struct AppState {
     pub retrieval_index: Arc<RwLock<corecrux_retrieval::IndexManager>>,
     /// Crux Daemon fact store (receipted entity memory).
     pub fact_store: Arc<RwLock<corecrux_memory::FactStore>>,
+    /// Optional active repository watcher. `None` unless
+    /// `CORECRUXD_REPO_WATCH` is truthy at daemon startup.
+    pub repo_watch: Option<crate::repo_watch::RepoWatchService>,
     /// Process-wide rate-limit table for community-extension dispatch
     /// (M4 Phase A). Sliding 60-second window keyed by
     /// (extension_id, passport_fpr); cap is per-grant or daemon default.
@@ -714,6 +739,11 @@ pub fn router(state: AppState, case_store: self::cases::SharedCaseStore) -> Rout
         .route("/v1/openapi.json", get(self::openapi::openapi_json))
         // G20 quota state (gated by CORECRUXD_QUOTA, default OFF → 404).
         .route("/v1/quota", get(self::quota::get_quota))
+        // Credit-burn Meter M1b. Default OFF and comped-wallet only.
+        .route(
+            "/v1/credits/spend",
+            axum::routing::post(self::credit_meter::post_credit_spend),
+        )
         // Provider-agnostic injection-bundle surface (context_bundle/v1).
         // Gated by CORECRUXD_CONTEXT_SURFACE (default OFF → 404).
         .route("/v1/context", get(self::context_surface::get_context))
@@ -776,6 +806,20 @@ pub fn router(state: AppState, case_store: self::cases::SharedCaseStore) -> Rout
         .route(
             "/v1/projects/{id}/tenants",
             axum::routing::post(self::projects::post_project_tenant),
+        )
+        // Tenant-scoped repository registry endpoints.
+        .route("/v1/repos", get(self::repos::get_repos))
+        .route("/v1/repos", axum::routing::post(self::repos::post_repo))
+        .route("/v1/repos/{repo_id}", get(self::repos::get_repo))
+        .route(
+            "/v1/repos/{repo_id}",
+            axum::routing::delete(self::repos::delete_repo),
+        )
+        // AST-derived code map for a registered repo — the read side of the
+        // registration-time scan (dogfood: register this repo, serve its map).
+        .route(
+            "/v1/repos/{repo_id}/codemap",
+            get(self::repos::get_repo_codemap),
         )
         .route(
             "/v1/projects/{id}/tenants/{tenantId}",
@@ -1434,6 +1478,12 @@ fn problem_for_status(status: StatusCode, detail: impl Into<String>) -> ProblemR
             StatusCode::UNAUTHORIZED.as_u16(),
             "https://errors.cuecrux.com/unauthorized",
             "Unauthorized",
+        )
+        .with_detail(detail),
+        StatusCode::PAYMENT_REQUIRED => ProblemDetails::new(
+            StatusCode::PAYMENT_REQUIRED.as_u16(),
+            "https://errors.cuecrux.com/payment-required",
+            "Payment Required",
         )
         .with_detail(detail),
         StatusCode::TOO_MANY_REQUESTS => ProblemDetails::new(

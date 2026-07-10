@@ -210,6 +210,12 @@ pub(super) struct AggregateObservationsQuery {
 #[derive(Debug, Serialize)]
 pub(super) struct AggregateObservationsResponse {
     pub observations: Vec<ObservationRecordV1>,
+    /// Exact counts over the full matched set before `limit` truncation.
+    /// Lets read-only auditors enumerate providers without guessing labels
+    /// from the sampled response body.
+    pub provider_counts: std::collections::BTreeMap<String, usize>,
+    pub principal_counts: std::collections::BTreeMap<String, usize>,
+    pub kind_counts: std::collections::BTreeMap<String, usize>,
     /// Per-session chain status keyed by `session_id`. Lets a caller spot
     /// "the aggregate is fresh data, but session X's chain is broken on
     /// disk" without a follow-up call.
@@ -227,6 +233,12 @@ pub(super) struct ListObservationsResponse {
     /// the returned records. `chain.status` is one of `"no_chain"`, `"ok"`,
     /// or `"broken"`. Clients that don't need this can ignore it.
     pub chain: ChainStatusJson,
+}
+
+fn count_observation_field(counts: &mut std::collections::BTreeMap<String, usize>, value: &str, missing_label: &str) {
+    let label = value.trim();
+    let key = if label.is_empty() { missing_label } else { label };
+    *counts.entry(key.to_string()).or_insert(0) += 1;
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -998,6 +1010,14 @@ pub(super) async fn get_observations_aggregate(
     }
 
     let matched = all.len();
+    let mut provider_counts = std::collections::BTreeMap::new();
+    let mut principal_counts = std::collections::BTreeMap::new();
+    let mut kind_counts = std::collections::BTreeMap::new();
+    for record in &all {
+        count_observation_field(&mut provider_counts, &record.provider, "(missing)");
+        count_observation_field(&mut principal_counts, &record.principal, "(missing)");
+        count_observation_field(&mut kind_counts, &record.kind, "(missing)");
+    }
     all.sort_by(|a, b| b.ts.cmp(&a.ts));
     let limit = params.limit.unwrap_or(DEFAULT_AGGREGATE_LIMIT).min(MAX_AGGREGATE_LIMIT);
     if all.len() > limit {
@@ -1009,6 +1029,9 @@ pub(super) async fn get_observations_aggregate(
         StatusCode::OK,
         Json(AggregateObservationsResponse {
             observations: all,
+            provider_counts,
+            principal_counts,
+            kind_counts,
             chains,
             matched,
             returned,
@@ -2083,6 +2106,11 @@ mod tests {
         let body = response_to_json(resp).await;
         assert_eq!(body["matched"], 4);
         assert_eq!(body["returned"], 4);
+        assert_eq!(body["provider_counts"]["claude-code"], 2);
+        assert_eq!(body["provider_counts"]["openai"], 2);
+        assert_eq!(body["principal_counts"][key.passport_fpr()], 4);
+        assert_eq!(body["kind_counts"]["tool_use"], 2);
+        assert_eq!(body["kind_counts"]["model_response"], 2);
         assert_eq!(body["chains"].as_object().unwrap().len(), 2);
 
         // provider=openai filter
@@ -2100,6 +2128,8 @@ mod tests {
         .await;
         let body = response_to_json(resp).await;
         assert_eq!(body["matched"], 2);
+        assert_eq!(body["provider_counts"]["openai"], 2);
+        assert!(body["provider_counts"].get("claude-code").is_none());
         for o in body["observations"].as_array().unwrap() {
             assert_eq!(o["provider"], "openai");
         }
@@ -2164,6 +2194,8 @@ mod tests {
         assert_eq!(body["matched"], 4);
         assert_eq!(body["returned"], 1);
         assert_eq!(body["observations"].as_array().unwrap().len(), 1);
+        assert_eq!(body["provider_counts"]["claude-code"], 2);
+        assert_eq!(body["provider_counts"]["openai"], 2);
     }
 
     #[tokio::test]

@@ -76,8 +76,16 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
     // `order_sections` floats `Stable` ahead of `Volatile` (unconditional since CO-5).
     let mut sections: Vec<(Stability, String)> = Vec::new();
 
+    // Boot observations for the wizard self-check (see the block near the end).
+    // `sync_degraded` is assigned on the only path that survives the match (the
+    // `Err` arm returns), so it needs no dead initialiser; `bootstrap_loaded`
+    // stays false unless the playbook actually renders.
+    let sync_degraded;
+    let mut bootstrap_loaded = false;
+
     match mcp_client::call_tool("sync_status", json!({})) {
         Ok(result) => {
+            sync_degraded = sync_reports_degraded(&result);
             let summary = render_sync_status(&result);
             // Volatile: timestamps, local_fact_count, sync mode all change boot-to-boot.
             sections.push((Stability::Volatile, format!("**Crux sync_status**\n{summary}")));
@@ -91,6 +99,7 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
                     Ok(boot) => {
                         let text = extract_text(&boot);
                         if !text.is_empty() {
+                            bootstrap_loaded = true;
                             // Stable: playbook/patterns — identical session-to-session.
                             sections.push((Stability::Stable, format!("**Crux bootstrap (patterns)**\n{text}")));
                         }
@@ -153,6 +162,32 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
             Err(err) => {
                 eprintln!("crux-hook session-start: wizard drift check failed: {err}");
             }
+        }
+    }
+
+    // Boot self-check: catch the class of failure where the daemon is healthy
+    // but the banner silently loses content — a hook regression suppressing the
+    // playbook, or a stale hook binary skewed from the daemon version. The policy
+    // lives in the wizard (`selfcheck`), pure + unit-tested; this block only does
+    // the daemon I/O (a best-effort `initialize` for the daemon version) and feeds
+    // observations in. Gated by the same flag as the drift check. Reaching here
+    // means `sync_status` succeeded (the `Err` arm returned early), so the daemon
+    // was reachable this boot.
+    if std::env::var("CRUX_HOOK_WIZARD_CHECK").as_deref() != Ok("off") {
+        let hook_version = env!("CARGO_PKG_VERSION");
+        let daemon_version = mcp_client::server_version();
+        let obs = crux_config_wizard::selfcheck::BootObservations {
+            hook_version,
+            daemon_version: daemon_version.as_deref(),
+            sync_reachable: true,
+            sync_degraded,
+            bootstrap_loaded,
+        };
+        if let Some(section) =
+            crux_config_wizard::selfcheck::render_section(&crux_config_wizard::selfcheck::evaluate(&obs))
+        {
+            // Volatile: reflects live daemon/hook state, not stable playbook text.
+            sections.push((Stability::Volatile, section));
         }
     }
 
@@ -251,11 +286,39 @@ fn render_sync_status(result: &Value) -> String {
     }
 }
 
-/// `sync_status` is "healthy" if it does not contain `degraded` or `behind`
-/// strings. Heuristic; conservative — when in doubt, skip bootstrap fetch.
+/// Whether sync state is healthy enough to fetch the patterns bootstrap.
+///
+/// The real signal is the `degraded` boolean the daemon reports, not a substring
+/// scan of the payload: `sync_status` *always* embeds the literal `"degraded":
+/// false` and a `"degraded_reason"` field, so the old `text.contains("degraded")`
+/// heuristic fired on every healthy boot and permanently suppressed the banner.
+/// `local_only` is a normal steady state — the patterns playbook is still useful
+/// there (the daemon's own welcome hint tells cold starts to fetch it), so mode
+/// alone does not gate the fetch; only an actually-degraded daemon does.
+///
+/// Falls back to the conservative substring heuristic when the payload is not the
+/// expected JSON object (defensive; keeps behaviour sane for stub responses).
 fn sync_is_healthy(result: &Value) -> bool {
-    let text = extract_text(result).to_lowercase();
-    !text.contains("degraded") && !text.contains("behind") && !text.contains("diverged")
+    let text = extract_text(result);
+    if let Ok(v) = serde_json::from_str::<Value>(&text) {
+        return !v.get("degraded").and_then(Value::as_bool).unwrap_or(false);
+    }
+    // Fallback: payload was not the expected JSON object (stub / plain text).
+    let lower = text.to_lowercase();
+    !lower.contains("degraded") && !lower.contains("behind") && !lower.contains("diverged")
+}
+
+/// The daemon's own `degraded` verdict from a `sync_status` payload — the parsed
+/// boolean, defaulting to `false` when the field or JSON is absent. Distinct from
+/// [`sync_is_healthy`]: this reports *what the daemon said*, used by the boot
+/// self-check to tell a genuinely-degraded daemon (legitimately no playbook) from
+/// a healthy one whose banner was silently suppressed (an anomaly worth warning).
+fn sync_reports_degraded(result: &Value) -> bool {
+    let text = extract_text(result);
+    serde_json::from_str::<Value>(&text)
+        .ok()
+        .and_then(|v| v.get("degraded").and_then(Value::as_bool))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -265,6 +328,12 @@ mod tests {
 
     #[test]
     fn empty_stdin_is_handled() {
+        // Serialize with every other test that mutates the process-global
+        // CRUX_MCP_URL (e.g. observe_post's mock-server tests). Without this
+        // guard, `run` here calls `sync_status` against whatever URL is live at
+        // the instant it reads the env — which, mid-race, can be another test's
+        // mock MCP server, tripping that test's "zero MCP calls" assertion.
+        let _env = crate::test_support::env_guard();
         // Without a daemon, this is a graceful no-op.
         let prev = std::env::var("CRUX_MCP_URL").ok();
         std::env::set_var("CRUX_MCP_URL", "http://127.0.0.1:1/mcp");
@@ -306,6 +375,32 @@ mod tests {
     #[test]
     fn sync_unhealthy_when_behind() {
         let r = json!({"content": [{"text": "Sync is BEHIND remote"}]});
+        assert!(!sync_is_healthy(&r));
+    }
+
+    /// Regression: the real `sync_status` payload is a JSON object that always
+    /// carries `"degraded": false` and a `"degraded_reason"` string. The old
+    /// substring heuristic matched "degraded" here and suppressed the bootstrap
+    /// banner on every healthy boot. Parsing the boolean fixes it.
+    #[test]
+    fn sync_healthy_when_local_only_degraded_false_json() {
+        let payload = r#"{
+            "mode": "local_only",
+            "configured": false,
+            "degraded": false,
+            "degraded_reason": "remote sync is not configured; continuing with the local fact and session store only"
+        }"#;
+        let r = json!({"content": [{"text": payload}]});
+        assert!(
+            sync_is_healthy(&r),
+            "local_only with degraded:false must fetch the patterns bootstrap"
+        );
+    }
+
+    #[test]
+    fn sync_unhealthy_when_degraded_true_json() {
+        let payload = r#"{"mode": "remote", "degraded": true, "degraded_reason": "remote unreachable"}"#;
+        let r = json!({"content": [{"text": payload}]});
         assert!(!sync_is_healthy(&r));
     }
 

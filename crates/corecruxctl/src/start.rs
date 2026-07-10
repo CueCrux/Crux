@@ -89,7 +89,7 @@ fn daemon_unreachable_hint(err: &DynErr) -> String {
     format!(
         "{err}\n\nCrux isn't reachable yet. Bring the daemon up, then re-run `corecruxctl start`:\n  \
          docker compose up -d                                  # recommended\n  \
-         CORECRUXD_AUTH_MODE=off CORECRUXD_DATA_DIR=./data ./corecruxd   # or run the binary"
+         CORECRUXD_AUTH_MODE=dev_scopes CORECRUXD_DATA_DIR=./data ./corecruxd   # or run the binary"
     )
 }
 
@@ -120,6 +120,7 @@ mod tests {
         let hint = daemon_unreachable_hint(&err);
         assert!(hint.contains("no reachable daemon"));
         assert!(hint.contains("docker compose up -d"));
+        assert!(hint.contains("CORECRUXD_AUTH_MODE=dev_scopes"));
         assert!(hint.contains("corecruxctl start"));
     }
 }

@@ -1,5 +1,14 @@
 # Operations Guide
 
+## Incident Communications
+
+Paid-tenant incidents use the customer-facing template in
+[incident-comms.md](incident-comms.md). Keep the technical incident record in
+Crux facts or the owning ExecPlan, but publish customer updates from that
+template so the external timeline, impact statement, mitigation, and next
+update time stay consistent. The status-page provider and staffing owner are a
+launch gate, not a daemon code default.
+
 ## Rate Limiting
 
 Crux Daemon includes a transport-level global request cap and a coarse

@@ -88,7 +88,12 @@ fn edge_boost(rt: RelationTypeV1) -> f32 {
         RelationTypeV1::Supersedes | RelationTypeV1::DerivedFrom => 1.3,
         RelationTypeV1::Cites => 1.2,
         RelationTypeV1::AboutSameEntity => 1.4,
-        RelationTypeV1::Elaborates | RelationTypeV1::Duplicates => 1.0,
+        RelationTypeV1::Elaborates
+        | RelationTypeV1::Duplicates
+        | RelationTypeV1::Calls
+        | RelationTypeV1::Imports
+        | RelationTypeV1::Defines
+        | RelationTypeV1::DependsOn => 1.0,
     }
 }
 

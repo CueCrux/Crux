@@ -70,7 +70,38 @@ First version = 1.
   full chain. Tests: `store_same_key_auto_supersedes_prior_version_in_recall`,
   `auto_supersede_survives_replay`, `consolidate_facts_v1_supersedes_targets_without_deleting_history`.
 
+## I5 — external witness anchoring
+
+```
+external_anchor_body commits to (field set includes): receipt_id, tenant_id, anchor_id,
+actor_passport, transparency_log, log_url, leaf_hash, log_index, tree_size, root_hash,
+and the RFC-6962 inclusion proof
+```
+
+An anchored CROWN chain head is bound to an external transparency-log entry: the inclusion
+proof must verify leaf → root, and the anchor body commits to the proof, so neither can be
+swapped independently.
+
+- **established:** `corecrux-receipts/src/witness_v1.rs` (`build_external_anchor_body_v1`).
+- **checked:** `verify_rfc6962_inclusion_proof_v1`; tests
+  `rfc6962_inclusion_proof_verifies_two_leaf_tree`,
+  `external_anchor_body_binds_inclusion_proof`, and the RFC-3161 variant
+  `rfc3161_timestamp_body_binds_token_hash_and_imprint`.
+
+## I6 — custody-proof export
+
+An exported context bundle (facts + sessions + signed journal + receipt refs) is
+passport-signed; verification is offline and fail-closed — any tampered component or signed
+field fails the check.
+
+- **established:** `corecruxctl/src/export.rs` (`run_context_export`).
+- **checked:** `run_context_verify` (offline, no network); tests
+  `context_export_round_trips_and_is_a_signed_custody_proof`,
+  `tampered_component_fails_verification`, `tampered_signed_field_fails_signature`.
+  The export → offline-verify → tamper-rejection cycle is a release-blocking CI gate.
+
 ---
 
-*All four formulas above are quoted from current source. The audit's guessed forms for I1
-and I3 matched the implementation verbatim; I2/I4 field names confirmed exact.*
+*The I1–I4 formulas are quoted from current source (the audit's guessed forms for I1 and I3
+matched the implementation verbatim; I2/I4 field names confirmed exact). I5–I6 statements are
+derived from the named builders/verifiers and their proving tests, not quoted formulas.*

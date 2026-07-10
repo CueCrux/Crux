@@ -183,6 +183,7 @@ mod tests {
     use axum::body::{to_bytes, Body};
     use axum::http::Request as HttpRequest;
     use crux_router::quota::QuotaPolicy;
+    use tokio::task::JoinSet;
     use tower::ServiceExt as _;
 
     fn quota_state(hosted: &[&str]) -> AppState {
@@ -309,6 +310,76 @@ mod tests {
             headers.get("Retry-After").is_some(),
             "429 must carry Retry-After (spec backpressure contract)"
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_hosted_burst_is_capped_per_passport() {
+        let state = quota_state(&["/healthz"]);
+        {
+            let mut ledger = state.quota_ledger.lock().expect("lock");
+            ledger.set_policy(
+                "/healthz",
+                QuotaPolicy {
+                    capacity: 8,
+                    refill_per_minute: 1,
+                },
+            );
+        }
+        let app = crate::http::router(
+            state.clone(),
+            std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::CaseStore::new())),
+        );
+
+        let mut tasks = JoinSet::new();
+        for _ in 0..32 {
+            let app = app.clone();
+            tasks.spawn(async move {
+                let response = app
+                    .oneshot(
+                        HttpRequest::get("/healthz")
+                            .header("x-corecrux-passport-id", "paid-passport")
+                            .body(Body::empty())
+                            .expect("request"),
+                    )
+                    .await
+                    .expect("infallible");
+                (
+                    response.status(),
+                    response
+                        .headers()
+                        .get("X-Crux-Quota-Remaining")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string),
+                )
+            });
+        }
+
+        let mut ok = 0usize;
+        let mut denied = 0usize;
+        let mut denied_remaining_headers = Vec::new();
+        while let Some(joined) = tasks.join_next().await {
+            let (status, remaining) = joined.expect("task joined");
+            match status {
+                StatusCode::OK => ok += 1,
+                StatusCode::TOO_MANY_REQUESTS => {
+                    denied += 1;
+                    denied_remaining_headers.push(remaining);
+                }
+                other => panic!("unexpected status under quota load: {other}"),
+            }
+        }
+
+        assert_eq!(ok, 8, "hosted burst must admit exactly bucket capacity");
+        assert_eq!(denied, 24, "excess hosted requests must receive 429");
+        assert!(
+            denied_remaining_headers.iter().all(|h| h.as_deref() == Some("0")),
+            "all denials must carry exhausted remaining-quota headers"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-corecrux-passport-id", "paid-passport".parse().unwrap());
+        let body = body_json(get_quota(State(state), headers).await).await;
+        assert_eq!(body["surfaces"][0]["remaining"], 0);
     }
 
     #[tokio::test]

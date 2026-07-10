@@ -45,6 +45,7 @@ pub mod passport;
 pub mod punchcards;
 pub mod query;
 pub mod receipt_verify;
+pub mod repos;
 pub mod resolve_principal;
 pub mod sessions;
 pub mod storyline;
@@ -1843,6 +1844,16 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
             description: storyline::description().to_string(),
             input_schema: storyline::input_schema(),
         },
+        ToolDefinition {
+            name: "register_repo".to_string(),
+            description: repos::register_description().to_string(),
+            input_schema: repos::register_schema(),
+        },
+        ToolDefinition {
+            name: "list_repos".to_string(),
+            description: repos::list_description().to_string(),
+            input_schema: repos::list_schema(),
+        },
         // ── Substrate: entities / edges / kinds (M1) ──────────────
         ToolDefinition {
             name: "entity_upsert".to_string(),
@@ -2688,7 +2699,9 @@ pub fn tool_output_docs() -> Value {
         { "tool": "punch_out",                "output": "Released punchcard record (status=released, released_at_unix_ms, release_commit_sha?, receipt_release). (Package S scaffold: 501 until shipped.)" },
         { "tool": "list_punchcards",          "output": "{ count, punchcards: [Punchcard] }. (Package S scaffold: 501 until shipped.)" },
         { "tool": "force_release",            "output": "Force-released punchcard record (status=force_released, force_released_by, receipt_release). Requires confirm=true (Art.14)." },
-        { "tool": "check_punchcard",          "output": "Lease probe { held_by_other, enforce, holder_passport, resource, mode, expires_at_unix_ms }. Always 200 (fail-open); the PreToolUse hook denies only when held_by_other && enforce." }
+        { "tool": "check_punchcard",          "output": "Lease probe { held_by_other, enforce, holder_passport, resource, mode, expires_at_unix_ms }. Always 200 (fail-open); the PreToolUse hook denies only when held_by_other && enforce." },
+        { "tool": "register_repo",            "output": "Proxied POST /v1/repos: the registration { repo_id, tenant_id, root_path?, clone_url?, languages: [string], enabled, added_at_unix_ms, last_scan_id? }. Registering a local root_path runs a one-shot scan and sets last_scan_id; clone_url registration defers the scan." },
+        { "tool": "list_repos",               "output": "Proxied GET /v1/repos?tenant_id=…: { repos: [{ repo_id, tenant_id, root_path?, clone_url?, languages, enabled, last_scan_id? }] } scoped to the caller's tenant." }
     ])
 }
 
@@ -2826,6 +2839,8 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "github_comments_since" => github::handle_github_comments_since(args, ctx).await,
         // Workspace storyline (HTTP loopback to corecruxd).
         "get_workspace_storyline" => storyline::handle_get_workspace_storyline(args, ctx).await,
+        "register_repo" => repos::handle_register_repo(args, ctx).await,
+        "list_repos" => repos::handle_list_repos(args, ctx).await,
         // Substrate (M1).
         "entity_upsert" => entities::handle_entity_upsert(args, ctx).await,
         "entity_get" => entities::handle_entity_get(args, ctx).await,
@@ -2943,7 +2958,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 114; // +1 status_feed (open-engine-coordination-surfaces M3). +1 context_custody_audit (race-to-context positioning). +1 revoke_passport (passport-revocation M2). main 94 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check + 2 coord-plane: coord_status + coord_announce + session_token_usage (action-ledger M1)) + 2 session-archive (archive_session + unarchive_session) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard) + 1 activity (activity_recent, crux-dual-surface-activity-log M2) + 2 consolidation (memory_contradictions + memory_consolidate, audit-ii M4) + 1 session-mining (learn, token-efficiency M4) + 1 holdout (token_savings, token-efficiency cutover CO-4).
+    const TOOL_COUNT: usize = 116; // +2 register_repo + list_repos (repo-watch M3). +1 status_feed (open-engine-coordination-surfaces M3). +1 context_custody_audit (race-to-context positioning). +1 revoke_passport (passport-revocation M2). main 94 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check + 2 coord-plane: coord_status + coord_announce + session_token_usage (action-ledger M1)) + 2 session-archive (archive_session + unarchive_session) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard) + 1 activity (activity_recent, crux-dual-surface-activity-log M2) + 2 consolidation (memory_contradictions + memory_consolidate, audit-ii M4) + 1 session-mining (learn, token-efficiency M4) + 1 holdout (token_savings, token-efficiency cutover CO-4).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")

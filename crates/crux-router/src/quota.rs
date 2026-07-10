@@ -309,6 +309,39 @@ mod tests {
     }
 
     #[test]
+    fn hosted_burst_load_admits_exact_capacity() {
+        let mut ledger = QuotaLedger::new();
+        ledger.set_policy(
+            "hosted_offload",
+            QuotaPolicy {
+                capacity: 128,
+                refill_per_minute: 1,
+            },
+        );
+
+        let decisions: Vec<_> = (0..256)
+            .map(|_| ledger.check("paid-passport", "hosted_offload", SurfaceClass::Hosted, T0))
+            .collect();
+        let allowed = decisions.iter().filter(|decision| decision.is_allowed()).count();
+        let denied = decisions.len() - allowed;
+
+        assert_eq!(allowed, 128);
+        assert_eq!(denied, 128);
+        assert!(decisions[128..].iter().all(|decision| {
+            matches!(
+                decision,
+                QuotaDecision::Denied {
+                    retry_after_secs: 60,
+                    limit: 128
+                }
+            )
+        }));
+        let snapshot = ledger.snapshot("paid-passport", T0);
+        assert_eq!(snapshot[0].remaining, 0);
+        assert_eq!(snapshot[0].limit, 128);
+    }
+
+    #[test]
     fn refill_restores_admission() {
         let mut ledger = QuotaLedger::new();
         ledger.set_policy(

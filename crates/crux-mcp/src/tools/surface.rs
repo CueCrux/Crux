@@ -213,7 +213,9 @@ pub fn tool_affinity(tool: &str) -> &'static str {
         | "cuecrux_session"
         | "create_handoff"
         | "accept_handoff"
-        | "get_workspace_storyline" => "session",
+        | "get_workspace_storyline"
+        | "register_repo"
+        | "list_repos" => "session",
         "audit_config"
         | "check_config_audit"
         | "audit_export_bundle"

@@ -18,11 +18,13 @@ pub mod compose;
 pub mod config;
 pub mod drift;
 pub mod profile;
+pub mod selfcheck;
 
 pub use compose::{compose_file, ComposeError, ComposeReport};
 pub use config::{AgentProfileConfig, ConfigError, ProfileEntry};
 pub use drift::{check_workspace, DriftReport};
 pub use profile::{load_bundled_profiles, ProfileError, ProfileFragment, ProfileFrontmatter};
+pub use selfcheck::{evaluate as evaluate_boot, BootObservations};
 
 /// Default profile set for the CueCrux workspace, per the M6 of the
 /// agent-config-wizard ExecPlan. Other workspaces opt in to whichever subset

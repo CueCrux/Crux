@@ -65,6 +65,12 @@ visibility are MCP-only features.
 | GET | `/v1/receipts/{receiptId}/signature` | Retrieve receipt Ed25519 signature | `events:read` |
 | GET | `/v1/receipts/{receiptId}/verification` | Verify receipt signature and chain | `events:read` |
 
+### Credits
+
+| Method | Path | Description | Auth Scope |
+|--------|------|-------------|------------|
+| POST | `/v1/credits/spend` | Default-off comped-wallet spend rail. Requires `CORECRUXD_CREDIT_METER=1`; consumes a pinned quote, reserves/spends seeded credits idempotently, and returns a signed `crux.credit_spend_receipt.v1`. Does not mint fiat credits or call Paddle. | `admin:write` |
+
 ### Replay Exports
 
 | Method | Path | Description | Auth Scope |
@@ -99,6 +105,25 @@ visibility are MCP-only features.
 | GET | `/v1/admin/projections/artifacts/{artifactId}/pressure-events` | Artifact pressure events | `admin:read` * |
 
 \* Requires a dataplane-enabled deployment. Returns 501 in Crux Daemon.
+
+### Repos & Code Map
+
+AST-derived code structure for registered repositories. Registration with a
+`root_path` runs a one-shot scan (Rust natively; TS/TSX/Vue/Python via
+tree-sitter) and persists it; the repo watch loop re-indexes on change. The
+codemap endpoint is the read side — the daemon serving its own code
+understanding back to agents.
+
+| Method | Path | Description | Auth Scope |
+|--------|------|-------------|------------|
+| GET | `/v1/repos?tenant_id=…` | List registered repos for a tenant | `admin:read` |
+| POST | `/v1/repos` | Register a repo (`root_path` scans now; `clone_url` defers) | `admin:write` |
+| GET | `/v1/repos/{repoId}?tenant_id=…` | One registration | `admin:read` |
+| DELETE | `/v1/repos/{repoId}?tenant_id=…` | Unregister (stops watch) | `admin:write` |
+| GET | `/v1/repos/{repoId}/codemap?tenant_id=…&format=summary\|full` | AST code map: `summary` = stats + per-crate rollup; `full` = files, symbols, deps, routes | `admin:read` |
+| POST | `/v1/workspace/scan` | Scan the daemon's own workspace (`CORECRUXD_WORKSPACE_PATH`) | `admin:read` |
+| GET | `/v1/workspace/scan` | Latest self-scan in full | `admin:read` |
+| GET | `/v1/workspace/storyline?format=tree\|json` | Per-route call trees from the self-scan | `admin:read` |
 
 ### Routing & Shards
 

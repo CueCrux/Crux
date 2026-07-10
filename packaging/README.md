@@ -10,7 +10,7 @@ verification *before* install, no phone-home, nothing auto-starts.
 | `systemd/crux.service` | System-wide unit (shipped in the .deb; `DynamicUser` + `StateDirectory=crux`). `install.sh --with-service` writes a per-user unit instead. |
 | `homebrew/crux.rb` | Formula **template** for `CueCrux/homebrew-tap`; rendered per release by `scripts/generate-homebrew-formula.sh` from the *verified* signed manifests. |
 | `deb/` | nfpm config + maintainer scripts + `build-deb.sh` for the `.deb` attached to releases (no apt repo in v1 — see header comment in `deb/nfpm.yaml`). |
-| `tests/install-smoke.sh` | Clean-VM gate: install → ready → MCP handshake → uninstall (data preserved). Operator-run against a published release. |
+| `tests/install-smoke.sh` | Clean-VM gate: install → ready → MCP handshake → fact round-trip → uninstall (data preserved). Operator-run against a published release. |
 
 Posture rules every installer here follows:
 

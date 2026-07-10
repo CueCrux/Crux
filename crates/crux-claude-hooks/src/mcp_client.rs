@@ -87,6 +87,48 @@ pub fn call_tool_at_with_token<A: Serialize>(
         .ok_or_else(|| anyhow::anyhow!("mcp response missing `result`"))
 }
 
+/// Best-effort: fetch the daemon's reported version via an MCP `initialize`
+/// handshake (`result.serverInfo.version`). Returns `None` on any error — this
+/// feeds only advisory version-skew warnings and must never gate control flow
+/// or block startup.
+pub fn server_version() -> Option<String> {
+    server_version_at_with_token(&mcp_url(), mcp_token())
+}
+
+/// Explicit-URL/-token variant of [`server_version`], for tests against a mock.
+pub fn server_version_at_with_token(url: &str, token: Option<String>) -> Option<String> {
+    let envelope = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "crux-hook", "version": env!("CARGO_PKG_VERSION")},
+        }
+    });
+
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(MCP_TIMEOUT_SECS)))
+        .build()
+        .into();
+
+    let mut request = agent
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json");
+    if let Some(t) = token {
+        request = request.header("Authorization", &format!("Bearer {t}"));
+    }
+    let mut response = request.send_json(&envelope).ok()?;
+    let body: Value = response.body_mut().read_json().ok()?;
+    body.get("result")?
+        .get("serverInfo")?
+        .get("version")?
+        .as_str()
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
