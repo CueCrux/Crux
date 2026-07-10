@@ -26,11 +26,15 @@ pub struct ExternalDep {
     pub kind: String,
 }
 
-pub(crate) fn external_deps_enabled_from_env() -> bool {
-    std::env::var(EXTERNAL_DEPS_ENV).ok().is_some_and(|v| {
+pub(crate) fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name).ok().is_some_and(|v| {
         let v = v.trim().to_ascii_lowercase();
         !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
     })
+}
+
+pub(crate) fn external_deps_enabled_from_env() -> bool {
+    env_flag_enabled(EXTERNAL_DEPS_ENV)
 }
 
 pub(crate) fn attach_external_deps_if_enabled(root: &Path, scan: &mut crate::workspace_scan::WorkspaceScan) {
