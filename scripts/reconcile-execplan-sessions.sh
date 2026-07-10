@@ -107,6 +107,7 @@ registry_count="${#IN_REGISTRY[@]}"
 declare -a ORPHANS=()        # registry only
 declare -a SESSIONLESS=()    # on-disk only
 declare -a UNPARSABLE=()    # on-disk but missing both title and risk class
+declare -a AMBIGUOUS_STATUS=() # leading state token plus conflicting trailing state prose
 declare -a BOTH=()           # registry + on-disk
 
 for slug in "${!ON_DISK[@]}"; do
@@ -122,6 +123,12 @@ for slug in "${!ON_DISK[@]}"; do
   if grep -qiE '\*\*?Risk class:[[:space:]]*(low|medium|high)' <<<"${content}"; then has_risk=1; fi
   if [[ "${has_title}" == "0" && "${has_risk}" == "0" ]]; then
     UNPARSABLE+=("${slug}")
+  fi
+  # Print-only lint for the historical substring trap. A non-terminal leading
+  # declaration containing a terminal state word later in its prose is valid
+  # under the exact-token parser, but worth making visible to operators.
+  if grep -qiE '^[[:space:]]*(>[[:space:]]*\*\*Status:\*\*|Status:)[[:space:]]*(Draft|In[ _]progress|Blocked|Planned|Backlog)\b.*\b(complete(d)?|archived|superseded)\b' <<<"${content}"; then
+    AMBIGUOUS_STATUS+=("${slug}")
   fi
 done
 
@@ -147,6 +154,7 @@ printf 'Both              : %d\n' "${#BOTH[@]}"
 printf 'Sessionless plans : %d (info — aggregator picks these up via files alone)\n' "${#SESSIONLESS[@]}"
 printf 'Orphan sessions   : %d (registry entry, no .md file — candidates for delete_session)\n' "${#ORPHANS[@]}"
 printf 'Unparsable plans : %d (no title and no risk class — consider _<slug>.md scratch rename)\n' "${#UNPARSABLE[@]}"
+printf 'Ambiguous Status : %d (safe exact-token parse; trailing terminal-state prose)\n' "${#AMBIGUOUS_STATUS[@]}"
 printf '\n'
 
 if (( ${#ORPHANS[@]} > 0 )); then
@@ -168,6 +176,14 @@ if (( ${#UNPARSABLE[@]} > 0 )); then
   for slug in "${UNPARSABLE[@]}"; do
     printf '    mv %q %q\n' "${ON_DISK[${slug}]}" "${PLAN_DIR}/_${slug}.md"
   done
+  printf '\n'
+fi
+
+if (( ${#AMBIGUOUS_STATUS[@]} > 0 )); then
+  printf '── Ambiguous Status lines (print-only lint) ──\n'
+  for slug in "${AMBIGUOUS_STATUS[@]}"; do
+    printf '%s  (%s)\n' "${slug}" "${ON_DISK[${slug}]}"
+  done | sort
   printf '\n'
 fi
 
