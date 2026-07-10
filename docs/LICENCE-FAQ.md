@@ -3,8 +3,8 @@
 Plain-English answers about the licence that covers the code in this
 repository. The full text is [`LICENCE.md`](../LICENCE.md); curated content
 under `content/` is covered separately by
-[`LICENCE-CONTENT.md`](../LICENCE-CONTENT.md). If this page and `LICENCE.md`
-ever disagree, `LICENCE.md` wins.
+[`content/LICENCE-CONTENT.md`](../content/LICENCE-CONTENT.md). If this page and
+`LICENCE.md` ever disagree, `LICENCE.md` wins.
 
 ## Is this open source?
 

@@ -74,4 +74,8 @@ IN THE SOFTWARE.
 This licence is modelled on the Business Source License 1.1 with
 CueCrux-specific terms. It is not an OSI-approved open-source licence.
 
+This licence covers the daemon **code**. The curated content assets under
+`content/` are covered separately by the CueCrux Content Licence v1.0
+([`content/LICENCE-CONTENT.md`](content/LICENCE-CONTENT.md)).
+
 Copyright (c) 2026 CueCrux Ltd. All rights reserved.

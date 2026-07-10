@@ -13,12 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Licence file layout deduplicated.** `LICENCE-CODE.md` (a three-line stub
-  pointing at `LICENCE.md`) is removed; `LICENCE.md` is the sole canonical
-  code-licence text and release bundles now ship `LICENCE.md` +
-  `LICENCE-CONTENT.md` directly. Previously bundles shipped the stub but not
-  the file it pointed at. GitHub's licence tabs now show the two real
-  licences instead of a pointer.
+- **Licence file layout deduplicated to a single GitHub licence tab.**
+  `LICENCE-CODE.md` (a three-line stub pointing at `LICENCE.md`) is removed, and
+  the content licence moved from the root to `content/LICENCE-CONTENT.md` — the
+  directory it governs. GitHub's licence detector scans only the repository
+  root, so it now surfaces one top-level licence (`LICENCE.md`, the code
+  licence) instead of two tabs. `LICENCE.md` links to the content licence, and
+  release bundles ship it under `content/` alongside the assets it covers.
 
 ### Added
 
