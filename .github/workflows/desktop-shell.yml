@@ -3,16 +3,23 @@
 # The desktop app pulls the webkit2gtk / GTK stack and cannot build on the
 # headless CueCrux CI *self-hosted* runners or the WSL dev box, so this workflow
 # runs on GitHub-hosted `ubuntu-latest` and installs the Tauri v2 Linux
-# prerequisites itself. It is NOT part of the required `ci.yml` gate — it fires
-# only on desktop-shell changes and on manual dispatch. No release/deploy steps.
+# prerequisites itself. No release/deploy steps.
+#
+# `desktop app compile gate (linux)` is a REQUIRED status check. To be requirable
+# without deadlocking the merge queue, the workflow must ALWAYS trigger (so the
+# check reports on every PR and on the `merge_group` speculative ref) and skip the
+# heavy build via a job-level `if:` when nothing under `shells/desktop/**` changed.
+# A path filter on the trigger cannot do this: a workflow that never runs never
+# reports, and the queue hangs on the missing check. A job SKIPPED by `if:`,
+# by contrast, reports as skipped — which GitHub counts as a passing required
+# check (same pattern `ci.yml` uses for its docs-only skips).
 name: desktop-shell
 
 on:
   workflow_dispatch:
   pull_request:
-    paths:
-      - "shells/desktop/**"
-      - ".github/workflows/desktop-shell.yml"
+    branches: [main]
+  merge_group:
 
 permissions:
   contents: read
@@ -22,9 +29,51 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # 0) Detect whether this change touches the desktop shell. The heavy jobs skip
+  #    (and report skipped = pass) when it does not, so the required compile gate
+  #    always reports without running a ~10-minute webkit build on unrelated PRs.
+  changes:
+    name: Detect desktop change scope
+    runs-on: ubuntu-latest
+    outputs:
+      desktop: ${{ steps.scope.outputs.desktop }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Classify changed files
+        id: scope
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "merge_group" ]; then
+            base="${{ github.event.merge_group.base_sha }}"
+            head="${{ github.event.merge_group.head_sha }}"
+            if [ -n "$base" ] && git cat-file -e "$base" 2>/dev/null; then
+              files=$(git diff --name-only "$base".."$head")
+            else
+              files=""
+            fi
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="origin/${{ github.base_ref }}"
+            git fetch --quiet origin "${{ github.base_ref }}"
+            files=$(git diff --name-only "$(git merge-base "$base" HEAD)"..HEAD)
+          else
+            files=""
+          fi
+          echo "changed files:"; echo "$files" | sed 's/^/  /'
+          # Empty diff (couldn't classify) is the safe default: run the gate.
+          if [ -z "$files" ] || echo "$files" | grep -qE '^shells/desktop/|^\.github/workflows/desktop-shell\.yml$'; then
+            echo "desktop=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "desktop=false" >> "$GITHUB_OUTPUT"
+            echo "no desktop-shell changes — heavy jobs will skip (report skipped = pass)"
+          fi
+
   # 1) The std-only lifecycle crate: fully unit-tested (also green on the dev box).
   lifecycle:
     name: lifecycle crate (std-only unit tests)
+    needs: changes
+    if: needs.changes.outputs.desktop == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -36,6 +85,8 @@ jobs:
   #    stages it into the externalBin slot, then compiles the app crate.
   app-compile:
     name: desktop app compile gate (linux)
+    needs: changes
+    if: needs.changes.outputs.desktop == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -83,6 +134,8 @@ jobs:
   #    icon pipeline and per-platform bundlers are finalised.
   app-bundle:
     name: desktop bundle (follow-up, non-blocking)
+    needs: changes
+    if: needs.changes.outputs.desktop == 'true'
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
