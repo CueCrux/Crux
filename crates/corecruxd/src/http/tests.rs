@@ -14584,3 +14584,231 @@ async fn identity_link_forged_signature_rejected() {
         .into_response();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// M3 — deny-by-default route authorization middleware
+// (ExecPlan crux-external-findings-remediation-2026-07-10).
+//
+// The contract-classification tests (matrix completeness, scope hygiene) live
+// in `route_auth::tests`; these exercise the runtime middleware end-to-end via
+// `oneshot`, following the router-test idiom used throughout this file.
+// ─────────────────────────────────────────────────────────────────────────
+
+use super::route_auth::RouteAuthMode;
+
+/// A trivial always-200 handler for the isolated route-auth test routers.
+async fn route_auth_ok_handler() -> StatusCode {
+    StatusCode::OK
+}
+
+/// Dev-scope header string broad enough to satisfy every contract's any-of set
+/// (and the downstream handler's own scope check) so the "sufficient" leg is
+/// admitted by the middleware and not rejected by the handler for auth reasons.
+const ROUTE_AUTH_BROAD_SCOPES: &str = "admin:read admin:write query:read facts:read facts:write \
+sessions:read sessions:write replication:write integrations:install";
+
+/// A scope no contract accepts — guarantees the middleware's insufficient-scope
+/// path regardless of which route it is applied to.
+const ROUTE_AUTH_BOGUS_SCOPE: &str = "totally:bogus";
+
+/// Mount a single route with NO entry in the `classify_route` contract table,
+/// wrapped by the route-auth middleware in `mode`. Isolates fail-closed / shadow
+/// behaviour on an uncontracted route from the real (fully classified) route set.
+fn route_auth_uncontracted_app(mode: RouteAuthMode) -> Router {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    Router::new()
+        .route("/totally/unregistered/{id}", get(route_auth_ok_handler))
+        .layer(middleware::from_fn_with_state(
+            (state.clone(), mode),
+            super::route_auth::route_auth_middleware,
+        ))
+        .with_state(state)
+}
+
+/// Mount our own always-200 handler at a path the contract DOES recognise
+/// (`GET /v1/facts` ⇒ Read, any-of {query:read, admin:read}). Because the
+/// handler ignores auth, only the MIDDLEWARE can reject — isolating its decision
+/// from any handler-level check so shadow vs enforce is unambiguous.
+fn route_auth_contracted_app(mode: RouteAuthMode) -> Router {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    Router::new()
+        .route("/v1/facts", get(route_auth_ok_handler))
+        .layer(middleware::from_fn_with_state(
+            (state.clone(), mode),
+            super::route_auth::route_auth_middleware,
+        ))
+        .with_state(state)
+}
+
+fn route_auth_request(method: &str, uri: &str, scopes: Option<&str>) -> axum::http::Request<axum::body::Body> {
+    let mut builder = axum::http::Request::builder().method(method).uri(uri);
+    if let Some(s) = scopes {
+        builder = builder.header("x-corecrux-scopes", s);
+    }
+    builder.body(axum::body::Body::empty()).expect("build request")
+}
+
+/// (b) Enforce mode fails closed on a route with no contract entry, even when
+/// the caller presents ample scopes.
+#[tokio::test]
+async fn route_auth_enforce_fails_closed_on_uncontracted_route() {
+    use tower::ServiceExt;
+    let app = route_auth_uncontracted_app(RouteAuthMode::Enforce);
+    let resp = app
+        .oneshot(route_auth_request(
+            "GET",
+            "/totally/unregistered/xyz",
+            Some(ROUTE_AUTH_BROAD_SCOPES),
+        ))
+        .await
+        .expect("resp");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "an uncontracted route must fail closed (403) in enforce mode"
+    );
+}
+
+/// (d) Shadow mode never blocks: the SAME uncontracted request that fails closed
+/// in enforce reaches the handler (200) in shadow — the middleware did not
+/// produce a rejection.
+#[tokio::test]
+async fn route_auth_shadow_passes_uncontracted_route_through() {
+    use tower::ServiceExt;
+    let app = route_auth_uncontracted_app(RouteAuthMode::Shadow);
+    let resp = app
+        .oneshot(route_auth_request(
+            "GET",
+            "/totally/unregistered/xyz",
+            Some(ROUTE_AUTH_BROAD_SCOPES),
+        ))
+        .await
+        .expect("resp");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "shadow mode must pass an uncontracted route through to the handler"
+    );
+}
+
+/// (d) Shadow never blocks an insufficient-scope request either: on a contracted
+/// route whose handler ignores auth, the exact request that 403s in enforce
+/// passes through (200) in shadow.
+#[tokio::test]
+async fn route_auth_shadow_passes_insufficient_scope_through() {
+    use tower::ServiceExt;
+
+    let enforce = route_auth_contracted_app(RouteAuthMode::Enforce);
+    let denied = enforce
+        .oneshot(route_auth_request("GET", "/v1/facts", Some(ROUTE_AUTH_BOGUS_SCOPE)))
+        .await
+        .expect("resp");
+    assert_eq!(
+        denied.status(),
+        StatusCode::FORBIDDEN,
+        "insufficient scope must be denied by the middleware in enforce mode"
+    );
+
+    let shadow = route_auth_contracted_app(RouteAuthMode::Shadow);
+    let admitted = shadow
+        .oneshot(route_auth_request("GET", "/v1/facts", Some(ROUTE_AUTH_BOGUS_SCOPE)))
+        .await
+        .expect("resp");
+    assert_eq!(
+        admitted.status(),
+        StatusCode::OK,
+        "shadow mode must not produce the rejection — the handler is reached"
+    );
+}
+
+/// (e) Public routes pass with NO auth headers in enforce mode — monitors depend
+/// on this.
+#[tokio::test]
+async fn route_auth_enforce_admits_public_routes_without_auth() {
+    use tower::ServiceExt;
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let app = router_with_route_auth(state, test_case_store(), RouteAuthMode::Enforce);
+
+    let healthz = app
+        .clone()
+        .oneshot(route_auth_request("GET", "/healthz", None))
+        .await
+        .expect("healthz");
+    assert_eq!(
+        healthz.status(),
+        StatusCode::OK,
+        "healthz must pass with no auth in enforce"
+    );
+
+    let readyz = app
+        .oneshot(route_auth_request("GET", "/readyz", None))
+        .await
+        .expect("readyz");
+    assert!(
+        readyz.status() != StatusCode::UNAUTHORIZED && readyz.status() != StatusCode::FORBIDDEN,
+        "readyz must not be blocked by route auth in enforce, got {}",
+        readyz.status()
+    );
+}
+
+/// (c) Contract-driven matrix over the REAL router in enforce mode, one route
+/// per `RouteAuthClass`: no token ⇒ 401/403; a sufficient scope ⇒ NOT 401/403
+/// (the middleware admits; the handler may return any other status); an
+/// insufficient-only scope ⇒ 401/403.
+#[tokio::test]
+async fn route_auth_enforce_contract_matrix() {
+    use tower::ServiceExt;
+
+    // (class label, method, uri) — one representative per class. Public is
+    // covered by the dedicated smoke test above.
+    let cases: &[(&str, &str, &str)] = &[
+        ("Read", "GET", "/v1/facts?tenant_id=t&token_budget=500"),
+        ("Write", "PUT", "/v1/facts"),
+        ("AdminRead", "GET", "/v1/identity/candidates"),
+        ("AdminWrite", "POST", "/v1/console/embedding/probe"),
+        ("InternalReplication", "POST", "/v1/internal/replication/segments"),
+        ("FeatureGated", "POST", "/v1/gpu1/answer"),
+    ];
+
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let app = router_with_route_auth(state, test_case_store(), RouteAuthMode::Enforce);
+
+    for (label, method, uri) in cases {
+        // No token ⇒ middleware rejects before the handler (401 in DevScopes).
+        let no_token = app
+            .clone()
+            .oneshot(route_auth_request(method, uri, None))
+            .await
+            .expect("no-token resp");
+        assert!(
+            no_token.status() == StatusCode::UNAUTHORIZED || no_token.status() == StatusCode::FORBIDDEN,
+            "[{label}] {method} {uri} with no token must be 401/403, got {}",
+            no_token.status()
+        );
+
+        // Insufficient scope ⇒ middleware 403 before the handler.
+        let insufficient = app
+            .clone()
+            .oneshot(route_auth_request(method, uri, Some(ROUTE_AUTH_BOGUS_SCOPE)))
+            .await
+            .expect("insufficient resp");
+        assert!(
+            insufficient.status() == StatusCode::UNAUTHORIZED || insufficient.status() == StatusCode::FORBIDDEN,
+            "[{label}] {method} {uri} with insufficient scope must be 401/403, got {}",
+            insufficient.status()
+        );
+
+        // Sufficient scope ⇒ middleware admits; the handler may return any other
+        // status, but never 401/403 for an auth reason.
+        let sufficient = app
+            .clone()
+            .oneshot(route_auth_request(method, uri, Some(ROUTE_AUTH_BROAD_SCOPES)))
+            .await
+            .expect("sufficient resp");
+        assert!(
+            sufficient.status() != StatusCode::UNAUTHORIZED && sufficient.status() != StatusCode::FORBIDDEN,
+            "[{label}] {method} {uri} with a sufficient scope must be admitted (not 401/403), got {}",
+            sufficient.status()
+        );
+    }
+}

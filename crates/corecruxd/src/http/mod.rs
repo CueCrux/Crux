@@ -58,7 +58,6 @@ mod relations;
 mod replay;
 mod repos;
 mod result_envelope;
-#[cfg(test)]
 mod route_auth;
 mod routing;
 pub mod session;
@@ -392,7 +391,22 @@ pub struct AppState {
 }
 
 pub fn router(state: AppState, case_store: self::cases::SharedCaseStore) -> Router {
+    // Route-authorization posture is read ONCE here, at router build time, not
+    // per request. Tests build the router via `router_with_route_auth` to pin an
+    // explicit mode without touching the process-global env.
+    router_with_route_auth(state, case_store, self::route_auth::RouteAuthMode::from_env())
+}
+
+pub(crate) fn router_with_route_auth(
+    state: AppState,
+    case_store: self::cases::SharedCaseStore,
+    route_auth_mode: self::route_auth::RouteAuthMode,
+) -> Router {
     let console_enabled = state.console_enabled;
+    tracing::debug!(
+        route_auth_mode = route_auth_mode.as_str(),
+        "corecruxd route authorization mode"
+    );
     Router::new()
         .route("/healthz", get(self::health::healthz))
         .route("/readyz", get(self::health::readyz))
@@ -1287,6 +1301,17 @@ pub fn router(state: AppState, case_store: self::cases::SharedCaseStore) -> Rout
         // G20 per-surface request quota (pass-through unless CORECRUXD_QUOTA=1
         // AND the path matches a configured hosted-surface prefix).
         .layer(middleware::from_fn_with_state(state.clone(), self::quota::quota_middleware))
+        // M3 deny-by-default route authorization. Sits OUTSIDE quota/presence so
+        // a would-deny short-circuits before any accounting or presence writes;
+        // sits over the same route set (main `/v1/*` plane + merged agent-graph
+        // surfaces), so it reads the `MatchedPath` template axum populates during
+        // routing. Static console assets (merged after `with_state`) are not in
+        // the contract and are intentionally out of scope. Handler-level scope
+        // checks remain in place as defence in depth.
+        .layer(middleware::from_fn_with_state(
+            (state.clone(), route_auth_mode),
+            self::route_auth::route_auth_middleware,
+        ))
         .with_state(state)
         // Built-in web console (stateless, merged after with_state)
         .merge(crate::console::routes(console_enabled))
