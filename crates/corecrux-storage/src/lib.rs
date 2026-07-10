@@ -1377,7 +1377,23 @@ impl ShardStorage {
             .write(true)
             .open(&paths.lock_path)
             .map_err(io_err)?;
-        lock_file.try_lock_exclusive().map_err(io_err)?;
+        // The kernel may release a dropped handle's flock asynchronously
+        // (deferred fput after close), so a reopen immediately following a
+        // previous close can transiently see WouldBlock even though nothing
+        // holds the shard. Absorb that sub-millisecond window with a bounded
+        // retry; a genuinely held lock still fails fast once the budget is
+        // exhausted.
+        let mut lock_attempts = 0u32;
+        loop {
+            match lock_file.try_lock_exclusive() {
+                Ok(()) => break,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock && lock_attempts < 10 => {
+                    lock_attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(err) => return Err(io_err(err)),
+            }
+        }
 
         let mut manifest = OpenOptions::new()
             .create(true)
