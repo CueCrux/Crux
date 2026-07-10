@@ -15,15 +15,20 @@
 //! derive_state(file, parsed, sum, now) -> WorkItem            (pure)
 //! ```
 //!
-//! `derive_state` is the deterministic state machine — six rules, no LLM, no
+//! `derive_state` is the deterministic state machine — eight rules, no LLM, no
 //! filesystem, no fact-store. The HTTP layer (M2) is responsible for binding
 //! the IO surface; M1 ships the data-flow + unit tests.
 //!
 //! State derivation rules (in order; first match wins):
 //!
-//! 1. `parsed.status_line` contains "archived"            → `archive`
+//! 1. a recognised leading `Status:` token declares state (never trailing prose);
+//!    leading non-terminal tokens (`Blocked`, `In progress`, `Planned`, and
+//!    `Parked`) deliberately short-circuit before fact-derived rules because
+//!    the human declaration outranks facts
 //! 2. `parsed.superseded_by` is set                       → `archive` + `superseded_by`
-//! 3. `parsed.status_line` contains "complete"            → `complete`
+//!    (including when the leading status is a completion token)
+//! 3. `Parked` always maps to `archive`, including when milestone facts exist;
+//!    this matches the 2026-07-10 corrected-audit parking of 21 plans
 //! 4. all declared milestones have a gate fact `status=complete` → `complete`
 //! 5. highest milestone with a fact has gate `status=blocked`    → `blocked`
 //! 6. any milestone/gate fact exists                      → `in_progress`
@@ -417,6 +422,56 @@ fn find_ci(haystack: &str, needle_lower: &str) -> Option<usize> {
     hl.find(needle_lower)
 }
 
+/// State tags accepted at the start of a parsed `Status:` value.
+///
+/// Matching is ASCII-case-insensitive and requires a token boundary after the
+/// tag. Text after that boundary is descriptive prose and cannot change the
+/// declaration. This is deliberately separate from [`is_complete_status`]:
+/// gate facts have a broad completion vocabulary, while plan headers have a
+/// small, explicit grammar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeclaredStatus {
+    Draft,
+    Planned,
+    InProgress,
+    Blocked,
+    Parked,
+    Archived,
+    Superseded,
+    Complete,
+}
+
+fn declared_status(value: &str) -> Option<DeclaredStatus> {
+    let value = strip_leading_markup(value).to_ascii_lowercase();
+    [
+        ("code-complete", DeclaredStatus::Complete),
+        ("in_progress", DeclaredStatus::InProgress),
+        ("in progress", DeclaredStatus::InProgress),
+        ("superseded", DeclaredStatus::Superseded),
+        ("completed", DeclaredStatus::Complete),
+        ("complete", DeclaredStatus::Complete),
+        ("deployed", DeclaredStatus::Complete),
+        ("shipped", DeclaredStatus::Complete),
+        ("landed", DeclaredStatus::Complete),
+        ("merged", DeclaredStatus::Complete),
+        ("done", DeclaredStatus::Complete),
+        ("archived", DeclaredStatus::Archived),
+        ("blocked", DeclaredStatus::Blocked),
+        ("parked", DeclaredStatus::Parked),
+        ("planned", DeclaredStatus::Planned),
+        ("backlog", DeclaredStatus::Planned),
+        ("draft", DeclaredStatus::Draft),
+    ]
+    .into_iter()
+    .find_map(|(token, status)| {
+        value.strip_prefix(token).and_then(|rest| {
+            rest.chars().next().map_or(Some(status), |next| {
+                (!next.is_ascii_alphanumeric() && next != '_').then_some(status)
+            })
+        })
+    })
+}
+
 /// Strip leading markdown markup so we can ask "does this line *declare*
 /// X, or merely mention X mid-prose?". Removes leading whitespace, blockquote
 /// arrows, bulleted / numbered list markers, bold asterisks, and an optional
@@ -735,34 +790,60 @@ pub fn derive_state(
     now_unix_ms: u64,
 ) -> WorkItem {
     let status_lc = parsed.status_line.as_deref().unwrap_or("").to_ascii_lowercase();
+    let declared = parsed.status_line.as_deref().and_then(declared_status);
 
-    // Rule 0 (A4, flag-gated, default OFF): a plan whose declarative `Status:`
-    // line value *equals* "draft" (trimmed, ASCII-case-insensitive) projects as
-    // `drafting`. The status_line is captured only from declarative `Status:` /
-    // `> **Status:**` lines outside fenced code blocks (see `parse_plan`'s
-    // `in_fence` guard), never mid-prose. We require an EXACT-value match — not a
-    // prefix — so a code-span / diagram value like "Draft)", "Draft → a new …",
-    // or "in draft review" is rejected, while a real declarative `Status: Draft`
-    // (value "Draft") still matches. This mirrors how the archived/complete
-    // Status values are interpreted (a declarative value, not a prose mention).
-    // Gated so the flag-off derive path is byte-identical to before.
-    if drafting_state_enabled() && status_lc.trim() == "draft" {
+    // Rule 0 (A4, flag-gated, default OFF): `Draft` is a leading declaration
+    // token. A prose trailer is allowed; words in that trailer are never parsed
+    // as another state declaration.
+    if drafting_state_enabled() && declared == Some(DeclaredStatus::Draft) {
         return mk_item(file, parsed, "drafting", None, None, facts);
     }
 
-    // Rule 1: explicit Archived status overrides everything else.
-    if status_lc.contains("archived") {
-        return mk_item(file, parsed, "archive", None, parsed.superseded_by.clone(), facts);
+    // Rules 1–3: only the leading Status token is authoritative. In particular,
+    // `Status: In progress — M0 complete` remains live.
+    match declared {
+        Some(DeclaredStatus::Archived | DeclaredStatus::Parked | DeclaredStatus::Superseded) => {
+            return mk_item(file, parsed, "archive", None, parsed.superseded_by.clone(), facts);
+        }
+        Some(DeclaredStatus::Complete) => {
+            // Preserve the historical supersession precedence: a completed
+            // plan may also name its replacement, in which case it archives
+            // and retains that graph edge.
+            if parsed.superseded_by.is_some() {
+                return mk_item(file, parsed, "archive", None, parsed.superseded_by.clone(), facts);
+            }
+            return mk_item(file, parsed, "complete", None, None, facts);
+        }
+        Some(DeclaredStatus::Blocked) => {
+            let mut item = mk_item(file, parsed, "blocked", None, None, facts);
+            item.blocker_reason = Some("ExecPlan Status declares Blocked".to_string());
+            item.blocker_kind = Some(if status_lc.contains("approval") || status_lc.contains("hold") {
+                BlockerKind::NeedsApproval
+            } else {
+                BlockerKind::NeedsInfo
+            });
+            return item;
+        }
+        Some(DeclaredStatus::InProgress) => {
+            let current = facts.highest_milestone_with_fact.map(|n| format!("M{n}"));
+            let mut item = mk_item(file, parsed, "in_progress", current, None, facts);
+            let last_activity = facts
+                .last_fact_at_unix_ms
+                .unwrap_or(file.mtime_unix_ms)
+                .max(file.mtime_unix_ms);
+            item.stale = Some(now_unix_ms.saturating_sub(last_activity) > STALE_AGE_MS);
+            return item;
+        }
+        Some(DeclaredStatus::Planned) => {
+            return mk_item(file, parsed, "planned", None, None, facts);
+        }
+        Some(DeclaredStatus::Draft) | None => {}
     }
 
-    // Rule 2: explicit supersession.
+    // Rule 2 back-compat: standalone `Superseded by ...` declarations do not
+    // have a Status value, but remain authoritative.
     if parsed.superseded_by.is_some() {
         return mk_item(file, parsed, "archive", None, parsed.superseded_by.clone(), facts);
-    }
-
-    // Rule 3: explicit Complete status.
-    if status_lc.contains("complete") && !status_lc.contains("incomplete") {
-        return mk_item(file, parsed, "complete", None, None, facts);
     }
 
     // Rule 4: all declared milestones complete — via gate facts (any "done"
@@ -2155,6 +2236,116 @@ mod tests {
     }
 
     #[test]
+    fn complete_status_with_standalone_supersession_archives_with_pointer() {
+        // Regression for workspace-scan-storyline-improvements-2026-05-03.md:
+        // its completion declaration and supersession declaration are separate
+        // lines, and both pieces of state must survive projection.
+        let f = file(
+            "workspace-scan-storyline-improvements-2026-05-03",
+            1_000,
+            "# Workspace scan storyline improvements\n\nStatus: Complete (all milestones shipped)\n\nSuperseded by [[workspace-scan-storyline-v2]]\n",
+        );
+        let p = parse_plan(&f.content);
+        assert_eq!(p.superseded_by.as_deref(), Some("workspace-scan-storyline-v2"));
+        let item = derive_state(&f, &p, &ExecplanFactSummary::default(), 2_000);
+        assert_eq!(item.state, "archive");
+        assert_eq!(item.superseded_by.as_deref(), Some("workspace-scan-storyline-v2"));
+    }
+
+    #[test]
+    fn terminal_status_leads_use_exact_token_vocabulary() {
+        for value in [
+            "done",
+            "SHIPPED to production",
+            "Deployed — rollout verified",
+            "landed (main)",
+            "Merged: PR #42",
+            "Done (M1–M5 complete; acceptance evidence recorded)",
+        ] {
+            let f = file("terminal", 1_000, &format!("# Terminal\n\nStatus: {value}\n"));
+            let p = parse_plan(&f.content);
+            assert_eq!(
+                derive_state(&f, &p, &ExecplanFactSummary::default(), 2_000).state,
+                "complete",
+                "{value:?} must be a completion declaration"
+            );
+        }
+    }
+
+    #[test]
+    fn milestone_range_before_complete_is_not_a_status_declaration() {
+        let f = file("range", 1_000, "# Range\n\nStatus: M0–M5 complete\n");
+        let p = parse_plan(&f.content);
+        assert_eq!(declared_status(p.status_line.as_deref().unwrap_or("")), None);
+        assert_eq!(
+            derive_state(&f, &p, &ExecplanFactSummary::default(), 2_000).state,
+            "planned"
+        );
+    }
+
+    #[test]
+    fn status_value_may_wrap_terminal_token_in_bold_markup() {
+        let f = file("bold-complete", 1_000, "# Bold\n\nStatus: **Complete**\n");
+        let p = parse_plan(&f.content);
+        assert_eq!(p.status_line.as_deref(), Some("**Complete**"));
+        assert_eq!(
+            derive_state(&f, &p, &ExecplanFactSummary::default(), 2_000).state,
+            "complete"
+        );
+    }
+
+    #[test]
+    fn status_in_progress_ignores_complete_in_trailing_prose() {
+        let f = file(
+            "live",
+            1_000,
+            "# Live\n\nStatus: In progress — M0 complete; M1 is active\n## Milestones\n- M0\n- M1\n",
+        );
+        let p = parse_plan(&f.content);
+        let s = summarise_facts(&[("milestone:M0".to_string(), "{}".to_string(), ts(2_000))]);
+        assert_eq!(derive_state(&f, &p, &s, 3_000).state, "in_progress");
+    }
+
+    #[test]
+    fn complete_in_non_status_line_does_not_change_declared_state() {
+        let f = file(
+            "live",
+            1_000,
+            "# Live\n\nStatus: In progress\n\nEvidence note: COMPLETE is the expected gate token.\n",
+        );
+        let p = parse_plan(&f.content);
+        assert_eq!(
+            derive_state(&f, &p, &ExecplanFactSummary::default(), 2_000).state,
+            "in_progress"
+        );
+    }
+
+    #[test]
+    fn superseded_prose_is_not_a_declaration_but_status_supersession_is() {
+        let live = file(
+            "live",
+            1_000,
+            "# Live\n\nStatus: In progress — superseded by is discussed in the decision log\n",
+        );
+        let parsed_live = parse_plan(&live.content);
+        assert_eq!(parsed_live.superseded_by, None);
+        assert_eq!(
+            derive_state(&live, &parsed_live, &ExecplanFactSummary::default(), 2_000).state,
+            "in_progress"
+        );
+
+        let replaced = file(
+            "old",
+            1_000,
+            "# Old\n\nStatus: Superseded by [[replacement-plan]] — scope moved\n",
+        );
+        let parsed_replaced = parse_plan(&replaced.content);
+        let item = derive_state(&replaced, &parsed_replaced, &ExecplanFactSummary::default(), 2_000);
+        assert_eq!(item.state, "archive");
+        assert_eq!(item.superseded_by.as_deref(), Some("replacement-plan"));
+    }
+
+    #[test]
     fn empty_milestones_with_in_progress_facts_uses_rule_6_not_rule_4() {
         // A plan without a Milestones section must NOT trip rule 4 (vacuous truth).
         let f = file("nodecl", 1_000, "# NoDecl\n\nFreeform body.\n");
@@ -2566,14 +2757,27 @@ mod tests {
     }
 
     #[test]
-    fn drafting_rejects_value_with_trailer() {
-        // A trailer after the word ("Draft → a new state", "Draft)", "in draft
-        // review") means the value is NOT exactly "draft"; under the exact-match
-        // discipline none of these derive drafting (falls through → planned for a
-        // recent fact-less plan). This is the A4 false-positive fix.
+    fn drafting_accepts_prose_trailer_after_token() {
+        let _flag = FlagOn::set(DRAFTING_STATE_FLAG_ENV);
+        let f = file(
+            "d",
+            1_000,
+            "# D\n\nStatus: Draft — awaiting operator go (audit M0 closed out)\n",
+        );
+        let p = parse_plan(&f.content);
+        assert_eq!(
+            derive_state(&f, &p, &ExecplanFactSummary::default(), 2_000).state,
+            "drafting"
+        );
+    }
+
+    #[test]
+    fn drafting_rejects_non_token_prefixes() {
+        // The declaration must start with the token and end it at a word
+        // boundary; prose before it and longer words do not declare Draft.
         let _flag = FlagOn::set(DRAFTING_STATE_FLAG_ENV);
         let now: u64 = 10 * 24 * 60 * 60 * 1000;
-        for value in ["in draft review", "Draft → a new state", "Draft)"] {
+        for value in ["in draft review", "Drafting", "redrafted"] {
             let f = file(
                 "d",
                 now - 5 * 24 * 60 * 60 * 1000,

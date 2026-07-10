@@ -7,12 +7,12 @@ license.workspace = true
 build = "build.rs"
 
 [dependencies]
-prost = "0.14.4"
-tonic = "0.14.6"
+prost = { workspace = true }
+tonic = { workspace = true }
 tonic-prost = "0.14.5"
 
 [build-dependencies]
-anyhow = "1.0.97"
+anyhow = { workspace = true }
 protoc-bin-vendored = "3.2.0"
 tonic-build = "0.14.6"
 tonic-prost-build = "0.14.5"

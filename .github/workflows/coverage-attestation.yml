@@ -64,8 +64,16 @@ jobs:
       - name: Generate coverage reports
         run: |
           set -euo pipefail
-          bash scripts/ci-cargo-with-fallback.sh llvm-cov --workspace --ignore-filename-regex "$COVERAGE_IGNORE_REGEX" --lcov --output-path lcov.info
+          bash scripts/ci-cargo-with-fallback.sh llvm-cov --workspace --ignore-filename-regex "$COVERAGE_IGNORE_REGEX" --lcov --output-path lcov.info 2>&1 | tee llvm-cov-run.log
           cargo llvm-cov report --ignore-filename-regex "$COVERAGE_IGNORE_REGEX" --summary-only | tee coverage-summary.txt
+
+      - name: Guard README coverage/test-count claims against drift
+        run: |
+          set -euo pipefail
+          # Cheap measured test count: sum "test result: ok. N passed" lines from
+          # the coverage run above (no extra test invocation).
+          MEASURED_TESTS="$(awk '/test result: ok\./ { for (i = 1; i <= NF; i++) if ($i == "passed;") s += $(i - 1) } END { print s + 0 }' llvm-cov-run.log)"
+          bash scripts/coverage-readme-drift.sh coverage-summary.txt "$MEASURED_TESTS"
 
       - name: Build coverage attestation
         run: bash scripts/coverage-attest-ci.sh
