@@ -26,6 +26,7 @@ pub mod code_chain;
 pub mod code_health;
 pub mod config_bundle;
 pub mod cost;
+pub mod deploy_audit;
 pub mod evidence;
 pub mod explain;
 pub mod export;
