@@ -128,6 +128,8 @@ jobs:
       - run: cargo fmt --check
       - run: typos
       - run: bash scripts/check-licence-headers.sh
+      - name: Unwrap/expect ratchet
+        run: bash scripts/unwrap-ratchet.sh
       - run: bash scripts/assert-daemon-release-boundary.sh
       - run: bash scripts/ci-cargo-with-fallback.sh clippy --workspace -- -D warnings
       - name: Reclaim per-job CARGO_HOME

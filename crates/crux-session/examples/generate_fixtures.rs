@@ -3,6 +3,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 //! Golden-fixture generator for the VaultCrux Session Handshake schema.
 //!
 //! Run manually when the schema or encoder changes:
@@ -25,20 +27,20 @@ use crux_session::plan::{
 };
 use crux_session::receipt::plan_receipt_hash;
 
-fn main() {
-    let fixtures_dir = fixtures_dir();
-    fs::create_dir_all(&fixtures_dir).expect("create fixtures dir");
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let fixtures_dir = fixtures_dir()?;
+    fs::create_dir_all(&fixtures_dir)?;
 
     let specs = all_fixtures();
     let mut index_lines = Vec::new();
     for spec in specs {
         let dir = fixtures_dir.join(spec.name);
-        fs::create_dir_all(&dir).expect("create fixture dir");
+        fs::create_dir_all(&dir)?;
         let plan = spec.build();
         let cbor = plan.to_canonical_cbor();
         let json = plan.to_canonical_json();
-        fs::write(dir.join("plan.cbor"), &cbor).expect("write plan.cbor");
-        fs::write(dir.join("plan.json"), &json).expect("write plan.json");
+        fs::write(dir.join("plan.cbor"), &cbor)?;
+        fs::write(dir.join("plan.json"), &json)?;
         let meta = serde_json::json!({
             "name": spec.name,
             "description": spec.description,
@@ -48,8 +50,8 @@ fn main() {
             "expected_json_len": json.len(),
             "signer_public_key_hex": spec.signer_public_key_hex,
         });
-        let meta_str = serde_json::to_string_pretty(&meta).expect("meta json");
-        fs::write(dir.join("meta.json"), format!("{meta_str}\n")).expect("write meta.json");
+        let meta_str = serde_json::to_string_pretty(&meta)?;
+        fs::write(dir.join("meta.json"), format!("{meta_str}\n"))?;
         index_lines.push(format!(
             "{} ({}): {} bytes cbor, hash {}",
             spec.name,
@@ -59,19 +61,20 @@ fn main() {
         ));
     }
 
-    fs::write(fixtures_dir.join("INDEX.txt"), format!("{}\n", index_lines.join("\n"))).expect("write INDEX.txt");
+    fs::write(fixtures_dir.join("INDEX.txt"), format!("{}\n", index_lines.join("\n")))?;
     println!("wrote {} fixtures to {}", index_lines.len(), fixtures_dir.display());
+    Ok(())
 }
 
-fn fixtures_dir() -> PathBuf {
+fn fixtures_dir() -> Result<PathBuf, std::io::Error> {
     // Crate root is Crux/crates/crux-session; fixtures live at
     // CueCrux-Shared/packages/session/fixtures relative to repo root.
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    crate_dir
+    let repo_root = crate_dir
         .ancestors()
         .nth(3)
-        .expect("repo root")
-        .join("CueCrux-Shared/packages/session/fixtures")
+        .ok_or_else(|| std::io::Error::other("crate directory has no repository-root ancestor"))?;
+    Ok(repo_root.join("CueCrux-Shared/packages/session/fixtures"))
 }
 
 struct FixtureSpec {

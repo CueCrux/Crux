@@ -3,6 +3,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 //! RCX Capability Token v1.0 schema-lock crate.
 //!
 //! Phase 1 intentionally keeps this crate pure: it defines the token model,

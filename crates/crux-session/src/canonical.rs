@@ -257,9 +257,7 @@ pub fn to_canonical_json(value: &CborValue) -> String {
     // is responsible for supplying keys already sorted per JCS (UTF-16 order).
     // For the ASCII-only keys in our schema, UTF-16 order equals bytewise
     // order, so the same sort we use for CBOR works here.
-    // serde_json::to_string only fails on non-string map keys / io errors —
-    // neither is reachable for a tree built from CborValue by to_json_value.
-    #[allow(clippy::expect_used)]
+    #[allow(clippy::expect_used)] // serialization invariant: JSON values have string keys and String output cannot fail
     let out = serde_json::to_string(&json).expect("serde_json never fails on known value tree");
     out
 }

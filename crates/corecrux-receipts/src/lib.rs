@@ -3,6 +3,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 //! CoreCrux v3 Phase 8: receipts (bytes-first) + signature verification + export bundles.
 //!
 //! Invariants (per Phase 8 doc):
