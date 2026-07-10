@@ -1,0 +1,35 @@
+# Non-test unwrap()/expect() baseline per crate.
+# Captured 2026-07-10 at commit 59e9f26 (main).
+# Method: count .unwrap()/.expect( occurrences in crates/<crate>/**/*.rs,
+#   excluding */tests/* paths and lines after an inline #[cfg(test)] marker.
+# Consumer: scripts/unwrap-ratchet.sh (M5 of ExecPlan
+#   crux-external-findings-remediation-2026-07-10). CI fails if any crate
+#   exceeds its baseline; lowering a count updates this file in the same PR.
+corecruxd 721
+crux-mcp 114
+corecrux-receipts 88
+corecrux-projections 51
+corecrux-storage 48
+corecrux-segment 32
+crux-session 9
+crux-observe 9
+corecruxctl 9
+crux-config-wizard 8
+crux-integration-tests 7
+corecrux-index 3
+corecrux-retrieval 2
+crux-claude-hooks 1
+corecrux-types 1
+vaultcrux-local 0
+rcx-capability-token 0
+crux-sync 0
+crux-router 0
+crux-observe-api 0
+crux-lens-features 0
+crux-integrations 0
+crux-enterprise-shim 0
+crux-cost 0
+crux-contrib 0
+corecrux-proto 0
+corecrux-memory 0
+corecrux-frame 0
