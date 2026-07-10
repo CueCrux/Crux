@@ -89,6 +89,7 @@ If the operator approves the switch after legal review, the mechanical changes a
 4. **Header replacement.** Is `sed`-replacement of `Licensed under the CueCrux Community Licence (CCL v1.0)` → `Licensed under the Business Source License 1.1` in every file's header valid notice, or do existing forks/copies need anything more to maintain licence continuity?
 5. **Trademark continuity.** CCL §3.2 says "no trademark grant." BUSL is silent. Should we add an explicit trademark-reservation clause as an Additional Term, or rely on standard trademark law?
 6. **`LICENCE-CODE.md` reconciliation.** This file exists alongside `LICENCE.md` today. Should the switch make one of them authoritative and remove the other, or maintain a code-vs-content split?
+   *Resolved 2026-07-10 (independent of the BUSL question): `LICENCE-CODE.md` was a three-line stub pointing at `LICENCE.md`; it was removed. `LICENCE.md` is the sole canonical code licence, and release bundles ship `LICENCE.md` + `LICENCE-CONTENT.md` directly.*
 
 ## Alternatives considered
 
