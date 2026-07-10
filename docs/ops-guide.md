@@ -39,6 +39,27 @@ publication, SSH tunnel, or service mesh; pass `--network-exposed` in those
 deployments. This operator preflight is intentionally not a CI gate because CI
 cannot know a target host's network topology.
 
+## Route Authorization Gate (`CORECRUXD_ROUTE_AUTH`)
+
+Separate from `CORECRUXD_AUTH_MODE`, the daemon runs a deny-by-default route
+authorization middleware in front of the per-handler scope checks. It classifies
+every routed request against a route contract (accepted any-of scope set per
+route template + method) and is controlled by `CORECRUXD_ROUTE_AUTH`, read once
+at startup:
+
+- `off` — pass-through.
+- `shadow` (default) — evaluate the contract and log a structured
+  `route_auth_shadow_mismatch` warning on any would-deny, but never block. Grep
+  the daemon logs for that marker to find routes that would be denied before you
+  flip to `enforce`.
+- `enforce` — public probes and the `/v1/auth/*` bootstrap rails pass without
+  auth; every other route requires one of its contract scopes; a route with no
+  contract entry fails closed with `403`.
+
+Handler-level scope checks remain in place as defence in depth. The gate
+authorizes scopes only — feature-flag gating for optional surfaces stays in the
+handler. Roll it out `shadow` → (triage warnings) → `enforce`.
+
 ## Incident Communications
 
 Paid-tenant incidents use the customer-facing template in

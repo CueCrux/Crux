@@ -3,10 +3,36 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
-//! Test-only route authorization contract for the daemon HTTP surface.
+//! Route authorization contract for the daemon HTTP surface, plus the
+//! deny-by-default enforcement middleware that promotes it from a test-only
+//! matrix into a runtime gate.
+//!
+//! The contract ([`classify_route`]) maps `(method, route-template)` to a
+//! [`RouteAuthContract`] — the accepted (any-of) scope set for that route and
+//! its [`RouteAuthClass`]. [`route_auth_middleware`] evaluates that contract
+//! before handler dispatch:
+//!
+//! * `off` — pass-through.
+//! * `shadow` — evaluate the contract; on a would-deny, emit a structured
+//!   `route_auth_shadow_mismatch` warning and continue (DEFAULT).
+//! * `enforce` — Public routes pass with no auth; classified routes require the
+//!   contract's scopes via the same `auth.rs` primitive handlers use; an
+//!   unclassified route (or a request with no matched path) fails closed with
+//!   `403`.
+//!
+//! Handler-level scope checks stay in place as defence in depth — this layer is
+//! a coarse deny-by-default gate in front of them, never a replacement.
+
+use axum::extract::{MatchedPath, Request, State};
+use axum::http::StatusCode;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+
+use super::{problem_response, AppState};
+use crate::auth::require_http_any_scope;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RouteAuthClass {
+pub(crate) enum RouteAuthClass {
     Public,
     Read,
     Write,
@@ -17,9 +43,14 @@ enum RouteAuthClass {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RouteAuthContract {
+pub(crate) struct RouteAuthContract {
     class: RouteAuthClass,
     scopes: &'static [&'static str],
+    // The feature flag whose handler gates a `FeatureGated` route. Recorded for
+    // documentation/audit; the middleware never reads it — flag gating stays in
+    // the handler (M3 contract: the route-auth layer authorizes scopes only, it
+    // does not replicate feature-flag logic).
+    #[allow(dead_code)]
     feature_gate: Option<&'static str>,
 }
 
@@ -41,7 +72,7 @@ impl RouteAuthContract {
     }
 }
 
-fn classify_route(method: &str, path: &str) -> Option<RouteAuthContract> {
+pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContract> {
     let method = method.to_ascii_uppercase();
     let method = method.as_str();
 
@@ -76,10 +107,12 @@ fn classify_route(method: &str, path: &str) -> Option<RouteAuthContract> {
     }
 
     if path.starts_with("/v1/admin/") || matches!(path, "/v1/shard-map" | "/v1/gpus" | "/v1/shards" | "/v1/route") {
-        let write = method != "GET" && !matches!(path, "/v1/admin/sharing/backfill" | "/v1/admin/restart");
-        let class = if write {
-            RouteAuthClass::AdminWrite
-        } else if method == "POST" && matches!(path, "/v1/admin/sharing/backfill" | "/v1/admin/restart") {
+        // `sharing/backfill` and `restart` are POST-triggered admin mutations
+        // even though a plain-GET admin route would read; every other non-GET
+        // admin method is a write. (Behaviour-preserving: same class decision as
+        // before, flattened to satisfy `clippy::if_same_then_else`.)
+        let special_write = matches!(path, "/v1/admin/sharing/backfill" | "/v1/admin/restart");
+        let class = if (method != "GET" && !special_write) || (method == "POST" && special_write) {
             RouteAuthClass::AdminWrite
         } else {
             RouteAuthClass::AdminRead
@@ -418,6 +451,136 @@ fn classify_route(method: &str, path: &str) -> Option<RouteAuthContract> {
     }
 
     None
+}
+
+/// Enforcement posture for the route-authorization middleware. Parsed once from
+/// `CORECRUXD_ROUTE_AUTH` at router build time (never per request).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RouteAuthMode {
+    /// Pass-through: the middleware does nothing.
+    Off,
+    /// Evaluate the contract and log would-denies, but never block. DEFAULT.
+    Shadow,
+    /// Deny by default: classified routes require their scopes; unclassified
+    /// routes and requests with no matched route template fail closed.
+    Enforce,
+}
+
+impl RouteAuthMode {
+    /// Read `CORECRUXD_ROUTE_AUTH` once. `off` / `enforce` are explicit;
+    /// anything else (including unset) is the safe `shadow` default.
+    pub(crate) fn from_env() -> Self {
+        match std::env::var("CORECRUXD_ROUTE_AUTH")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("off") => Self::Off,
+            Some("enforce") => Self::Enforce,
+            // "shadow", the empty string, an unknown value, or unset.
+            _ => Self::Shadow,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Shadow => "shadow",
+            Self::Enforce => "enforce",
+        }
+    }
+}
+
+/// Deny-by-default route-authorization middleware.
+///
+/// Runs before handler dispatch on every classified plane. Uses the axum
+/// [`MatchedPath`] extension (the route *template*, e.g.
+/// `/v1/identity/candidates/{candidateId}/confirm`) so the path matches the
+/// [`classify_route`] contract-table keys, plus the request method. The
+/// enforcement mode is captured in the layer state at build time.
+pub(crate) async fn route_auth_middleware(
+    State((state, mode)): State<(AppState, RouteAuthMode)>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if mode == RouteAuthMode::Off {
+        return next.run(req).await;
+    }
+
+    let method = req.method().as_str().to_ascii_uppercase();
+    let matched = req.extensions().get::<MatchedPath>().map(|m| m.as_str().to_string());
+
+    // No matched route template. For a routed request axum always populates
+    // `MatchedPath`, so this is the pathological case — fail closed in enforce.
+    let Some(path) = matched else {
+        return match mode {
+            RouteAuthMode::Enforce => problem_response(
+                StatusCode::FORBIDDEN,
+                format!("route has no authorization contract: {method} request has no matched path"),
+            ),
+            _ => {
+                tracing::warn!(
+                    marker = "route_auth_shadow_mismatch",
+                    method = %method,
+                    reason = "missing_matched_path",
+                    "route authorization: request has no matched route template (shadow mode)"
+                );
+                next.run(req).await
+            }
+        };
+    };
+
+    let Some(contract) = classify_route(&method, &path) else {
+        // Unclassified route: FAIL CLOSED in enforce; observe in shadow.
+        return match mode {
+            RouteAuthMode::Enforce => problem_response(
+                StatusCode::FORBIDDEN,
+                format!("route has no authorization contract: {method} {path}"),
+            ),
+            _ => {
+                tracing::warn!(
+                    marker = "route_auth_shadow_mismatch",
+                    method = %method,
+                    route = %path,
+                    reason = "no_contract",
+                    "route has no authorization contract (shadow mode)"
+                );
+                next.run(req).await
+            }
+        };
+    };
+
+    // Public routes pass with no auth headers in every mode — monitors and the
+    // unauthenticated bootstrap rails depend on this.
+    if contract.class == RouteAuthClass::Public {
+        return next.run(req).await;
+    }
+
+    // Classified route: require any-of the contract's accepted scope set via the
+    // SAME primitive the handlers use. The contract lists scopes as an any-of
+    // accepted set (read classes union read+admin scopes; write classes union
+    // the write scopes that authorize the mutation), so `require_http_any_scope`
+    // is the faithful check. `require_http_any_scope` returns `Ok` when the
+    // daemon's own auth mode is `off`, and a `401` (no/invalid token) or `403`
+    // (insufficient scope) problem otherwise — exactly the handler semantics.
+    match require_http_any_scope(&state.auth, req.headers(), contract.scopes) {
+        Ok(()) => next.run(req).await,
+        Err(problem) => match mode {
+            RouteAuthMode::Enforce => problem.into_response(),
+            _ => {
+                tracing::warn!(
+                    marker = "route_auth_shadow_mismatch",
+                    method = %method,
+                    route = %path,
+                    class = ?contract.class,
+                    scopes = ?contract.scopes,
+                    reason = "insufficient_scope",
+                    "route authorization contract would deny (shadow mode)"
+                );
+                next.run(req).await
+            }
+        },
+    }
 }
 
 #[cfg(test)]

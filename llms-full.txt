@@ -1779,6 +1779,24 @@ Configured via `CORECRUXD_AUTH_MODE`:
 
 Scopes are passed via `Authorization: Bearer <token>` header. Required scopes are listed per endpoint above.
 
+### Route authorization gate (`CORECRUXD_ROUTE_AUTH`)
+
+Independently of `CORECRUXD_AUTH_MODE`, the daemon runs a deny-by-default route
+authorization layer as HTTP middleware, in front of (and in addition to) the
+per-handler scope checks. It maps every routed request to a route contract — the
+accepted (any-of) scope set for that route template and method — and is
+controlled by `CORECRUXD_ROUTE_AUTH` (read once at startup):
+
+| Value | Behaviour |
+|-------|-----------|
+| `off` | Pass-through; the middleware does nothing. |
+| `shadow` (default) | Evaluates the contract and logs a structured `route_auth_shadow_mismatch` warning on any would-deny, but never blocks. Use it to observe coverage before switching to `enforce`. |
+| `enforce` | Public routes (`/healthz`, `/readyz`, `/metrics`, `/session`, `/invocation/verify`, `/v1/openapi.json`, `/v1/version`, `/v1/witness/smoke`, and the `/v1/auth/*` bootstrap rails) pass with no auth headers. Every other route requires one of its contract scopes via the same primitive the handlers use. A route with **no** contract entry — or a request axum could not match to a route template — **fails closed with `403`**. |
+
+The gate authorizes scopes only; feature-flag gating for optional surfaces stays
+in the handler. When `CORECRUXD_AUTH_MODE=off`, the scope check is a no-op (there
+is nothing to enforce), but `enforce` still fails closed on uncontracted routes.
+
 ---
 
 ## Error Format
