@@ -7,7 +7,7 @@ Each target bundle includes:
 - `corecruxd-<target>` as the canonical daemon binary.
 - `crux-<target>` as the user-facing alias for the same daemon binary.
 - `corecruxctl-<target>` for administrative checks and store verification.
-- `LICENCE-CODE.md`, `LICENCE-CONTENT.md`, and `TRUST-CONTRACT.md`.
+- `LICENCE.md` (code licence), `LICENCE-CONTENT.md`, and `TRUST-CONTRACT.md`.
 - `README.md` and `config.example.yaml`.
 - `content/MANIFEST.json` and `content/README.md`.
 - `RELEASE-MANIFEST-<target>.txt` with SHA-256 checksums for staged files.

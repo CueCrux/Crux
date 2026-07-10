@@ -4,7 +4,7 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 required=(
-  "LICENCE-CODE.md"
+  "LICENCE.md"
   "LICENCE-CONTENT.md"
   "TRUST-CONTRACT.md"
   "README.md"
@@ -43,7 +43,7 @@ for needle in \
   "corecruxd-" \
   "crux-" \
   "corecruxctl-" \
-  "LICENCE-CODE.md" \
+  "LICENCE.md" \
   "LICENCE-CONTENT.md" \
   "TRUST-CONTRACT.md" \
   "config.example.env" \
@@ -65,7 +65,7 @@ if [[ -x "$root/target/release/corecruxd" && -x "$root/target/release/corecruxct
     "corecruxd-boundary-smoke" \
     "crux-boundary-smoke" \
     "corecruxctl-boundary-smoke" \
-    "LICENCE-CODE.md" \
+    "LICENCE.md" \
     "LICENCE-CONTENT.md" \
     "TRUST-CONTRACT.md" \
     "config.example.env" \
