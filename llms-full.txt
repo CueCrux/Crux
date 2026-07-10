@@ -3796,6 +3796,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Licence file layout deduplicated.** `LICENCE-CODE.md` (a three-line stub
+  pointing at `LICENCE.md`) is removed; `LICENCE.md` is the sole canonical
+  code-licence text and release bundles now ship `LICENCE.md` +
+  `LICENCE-CONTENT.md` directly. Previously bundles shipped the stub but not
+  the file it pointed at. GitHub's licence tabs now show the two real
+  licences instead of a pointer.
+
+### Added
+
+- **`CITATION.cff`.** Machine-readable citation metadata (GitHub "Cite this
+  repository" button), matching the CCL v1.0 academic-use attribution
+  condition.
+
 ## [0.5.38] - 2026-07-10
 
 ### Added
