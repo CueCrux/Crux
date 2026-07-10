@@ -1,0 +1,132 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 1160 620" width="1160" role="img" aria-label="Crux benchmark spread: token budgets cut per-query tokens from ~18,400 to as low as 480; ScoreCrux shows Crux scoring 95/100 on 1,263 context tokens against a vendor-native 97/100 on 8,428; context stuffing collapses recall while tool-mediated retrieval holds 80–100%; daemon gates: 25,422 events/sec append, 21,328 reads/sec replay, sub-microsecond BM25" xmlns="http://www.w3.org/2000/svg">
+  <title>The cost of recall, measured — token budgets, ScoreCrux evals, daemon perf gates</title>
+  <defs>
+    <radialGradient id="bmA1" cx="12%" cy="-8%" r="65%">
+      <stop offset="0%" stop-color="#6CA8FF" stop-opacity=".22"/><stop offset="60%" stop-color="#6CA8FF" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="bmA2" cx="96%" cy="4%" r="55%">
+      <stop offset="0%" stop-color="#A78BFA" stop-opacity=".18"/><stop offset="58%" stop-color="#A78BFA" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="bmA3" cx="78%" cy="108%" r="60%">
+      <stop offset="0%" stop-color="#3DDC97" stop-opacity=".13"/><stop offset="60%" stop-color="#3DDC97" stop-opacity="0"/>
+    </radialGradient>
+    <style>
+      .t{font-family:ui-monospace,'SF Mono',SFMono-Regular,Menlo,Consolas,monospace}
+      .lbl{fill:#93A4B8;font-size:10.5px;letter-spacing:.18em;font-weight:600}
+      .row{fill:#93A4B8;font-size:11.5px}
+      .val{fill:#EAF0F7;font-size:11.5px;font-weight:600}
+      .sub{fill:#6E7E96;font-size:10.5px}
+      .big{fill:#EAF0F7;font-size:23px;font-weight:600}
+      .glass{fill:rgba(255,255,255,.045);stroke:rgba(255,255,255,.10)}
+      .tile{fill:#0D1726;stroke:#31445F}
+    </style>
+  </defs>
+
+  <!-- panel + aurora -->
+  <rect x="1" y="1" width="1158" height="618" rx="18" fill="#060A12" stroke="rgba(255,255,255,.13)"/>
+  <rect x="1" y="1" width="1158" height="618" rx="18" fill="url(#bmA1)"/>
+  <rect x="1" y="1" width="1158" height="618" rx="18" fill="url(#bmA2)"/>
+  <rect x="1" y="1" width="1158" height="618" rx="18" fill="url(#bmA3)"/>
+
+  <!-- header -->
+  <text class="t lbl" x="36" y="44">THE COST OF RECALL · MEASURED</text>
+  <g class="t">
+    <rect x="762" y="26" width="228" height="26" rx="13" fill="rgba(108,168,255,.08)" stroke="rgba(108,168,255,.35)"/>
+    <text x="876" y="43" text-anchor="middle" fill="#6CA8FF" font-size="11.5">docs/benchmarks.md · CI-gated</text>
+    <rect x="1000" y="26" width="126" height="26" rx="13" fill="rgba(124,108,240,.10)" stroke="rgba(124,108,240,.45)"/>
+    <text x="1063" y="43" text-anchor="middle" fill="#A99DF5" font-size="11.5">scorecrux.com</text>
+  </g>
+
+  <!-- ── panel 1 · tokens per query ─────────────────────────────── -->
+  <g class="t">
+    <rect class="glass" x="36" y="66" width="536" height="234" rx="14"/>
+    <rect x="36" y="66" width="536" height="3" rx="1.5" fill="#E8823C"/>
+    <text class="lbl" x="52" y="96" fill="#F0A369">TOKENS RETURNED PER QUERY</text>
+
+    <text class="row" x="52" y="130">top-K · no budget</text>
+    <rect x="186" y="118" width="296" height="18" rx="4" fill="#F0716C" opacity=".9"/>
+    <text class="val" x="334" y="131" text-anchor="middle" fill="#060A12">~18,400 tk</text>
+
+    <text class="row" x="52" y="174">budget = 4000</text>
+    <rect x="186" y="162" width="63" height="18" rx="4" fill="#6CA8FF"/>
+    <text class="val" x="257" y="175" fill="#6CA8FF">3,900</text>
+
+    <text class="row" x="52" y="218">budget = 2000</text>
+    <rect x="186" y="206" width="31" height="18" rx="4" fill="#6CA8FF"/>
+    <text class="val" x="225" y="219" fill="#6CA8FF">1,940</text>
+
+    <text class="row" x="52" y="262">budget = 500</text>
+    <rect x="186" y="250" width="8" height="18" rx="4" fill="#3DDC97"/>
+    <text class="val" x="202" y="263" fill="#3DDC97">480</text>
+
+    <text class="sub" x="52" y="288">budgets enforced server-side — the model never sees the overflow</text>
+  </g>
+
+  <!-- ── panel 2 · scorecrux context: parity at a fraction ───────── -->
+  <g class="t">
+    <rect class="glass" x="588" y="66" width="536" height="234" rx="14"/>
+    <rect x="588" y="66" width="536" height="3" rx="1.5" fill="#3DDC97"/>
+    <text class="lbl" x="604" y="96" fill="#6FE7B4">SAME ANSWER · A FRACTION OF THE TOKENS</text>
+
+    <text class="row" x="604" y="126">vendor-native memory · scored 97/100</text>
+    <rect x="604" y="134" width="440" height="18" rx="4" fill="#6E7E96" opacity=".75"/>
+    <text class="val" x="824" y="147" text-anchor="middle" fill="#060A12">8,428 context tokens</text>
+
+    <text class="row" x="604" y="186">Crux · scored 95/100</text>
+    <rect x="604" y="194" width="66" height="18" rx="4" fill="#3DDC97"/>
+    <text class="val" x="680" y="207" fill="#3DDC97">1,263</text>
+
+    <text class="big" x="604" y="254" fill="#3DDC97" font-size="19">15% of the tokens · 98% of the score</text>
+    <text class="sub" x="604" y="284">ScoreCrux context benchmark · sonnet-5 arm · scorecrux.com/context</text>
+  </g>
+
+  <!-- ── panel 3 · scorecrux scale: stuffing collapses recall ────── -->
+  <g class="t">
+    <rect class="glass" x="36" y="316" width="536" height="234" rx="14"/>
+    <rect x="36" y="316" width="536" height="3" rx="1.5" fill="#7C6CF0"/>
+    <text class="lbl" x="52" y="346" fill="#A99DF5">MORE CONTEXT MAKES IT WORSE</text>
+
+    <text class="row" x="52" y="382">stuffed · model A</text>
+    <rect x="206" y="368" width="106" height="9" rx="3" fill="#6E7E96" opacity=".6"/>
+    <rect x="206" y="380" width="67" height="9" rx="3" fill="#F0716C"/>
+    <text class="val" x="322" y="389" fill="#F0716C">44% → 28%</text>
+
+    <text class="row" x="52" y="438">stuffed · model B</text>
+    <rect x="206" y="424" width="67" height="9" rx="3" fill="#6E7E96" opacity=".6"/>
+    <rect x="206" y="436" width="19" height="9" rx="3" fill="#F0716C"/>
+    <text class="val" x="284" y="445" fill="#F0716C">28% → 8%</text>
+
+    <text class="row" x="52" y="492">tool-mediated</text>
+    <rect x="206" y="480" width="192" height="18" rx="4" fill="#3DDC97"/>
+    <rect x="398" y="480" width="48" height="18" rx="4" fill="#3DDC97" opacity=".35"/>
+    <text class="val" x="456" y="493" fill="#3DDC97">80–100%</text>
+
+    <text class="sub" x="52" y="530">recall of buried facts · 3,346 docs · 2M+ tokens · scorecrux.com/scale</text>
+  </g>
+
+  <!-- ── panel 4 · daemon gates ──────────────────────────────────── -->
+  <g class="t">
+    <rect class="glass" x="588" y="316" width="536" height="234" rx="14"/>
+    <rect x="588" y="316" width="536" height="3" rx="1.5" fill="#6CA8FF"/>
+    <text class="lbl" x="604" y="346" fill="#6CA8FF">THE DAEMON ITSELF · CI PERF GATES</text>
+
+    <rect class="tile" x="604" y="362" width="248" height="80" rx="10"/>
+    <text class="big" x="620" y="398">25,422 ev/s</text>
+    <text class="sub" x="620" y="420">append · p95 9.98 ms</text>
+
+    <rect class="tile" x="864" y="362" width="244" height="80" rx="10"/>
+    <text class="big" x="880" y="398">21,328 rd/s</text>
+    <text class="sub" x="880" y="420">replay reads · p95 0.52 ms</text>
+
+    <rect class="tile" x="604" y="454" width="248" height="80" rx="10"/>
+    <text class="big" x="620" y="490">583 ns</text>
+    <text class="sub" x="620" y="512">BM25 @ 100 docs · 23.1 µs @ 10k</text>
+
+    <rect class="tile" x="864" y="454" width="244" height="80" rx="10"/>
+    <text class="big" x="880" y="490">60–80%</text>
+    <text class="sub" x="880" y="512">fewer tokens vs top-K stuffing</text>
+  </g>
+
+  <text class="t sub" x="1124" y="590" text-anchor="end">reproducible · pinned baselines · regression-gated in CI</text>
+</svg>
