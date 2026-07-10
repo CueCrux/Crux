@@ -384,12 +384,14 @@ pub(super) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         local_ingest_enabled: false,
         stream_receipts_enabled: false,
         usage_receipts_enabled: false,
+        handoff_observations_enabled: false,
         usage_submit: crate::usage_submit::UsageSubmitConfig::default(),
         latest_release: Arc::new(std::sync::RwLock::new(None)),
         quota_enabled: false,
         assembly_cache: None,
         quota_hosted_surfaces: Arc::new(Vec::new()),
         quota_ledger: Arc::new(std::sync::Mutex::new(crux_router::quota::QuotaLedger::new())),
+        credit_meter: None,
         openai_shim_enabled: false,
         memory_import_enabled: true,
         identity_links_enabled: true,
@@ -6828,6 +6830,69 @@ async fn workbench_context_pack_and_command_ledger_store_private_receipts() {
     });
     assert_eq!(facts.facts.len(), 2);
     assert!(facts.facts.iter().all(|fact| fact.private));
+}
+
+#[tokio::test]
+async fn workbench_handoff_observations_are_default_off_and_flagged_on() {
+    let mut off_state = pro_workbench_state(&["handoff:v2"]);
+    bind_test_state_to_root_passport_key(&mut off_state);
+    let off_resp = super::workbench::post_handoff_v2(
+        State(off_state.clone()),
+        HeaderMap::new(),
+        Json(super::workbench::HandoffV2Body {
+            tenant_id: "business::acme".to_string(),
+            goal: "handoff without observation".to_string(),
+            session_id: Some("sess-h".to_string()),
+            project_id: Some("proj".to_string()),
+            source_agent: Some("anthropic".to_string()),
+            target_agent: Some("openai".to_string()),
+            evidence_refs: Vec::new(),
+            next_actions: Vec::new(),
+        }),
+    )
+    .await;
+    assert_eq!(off_resp.status(), StatusCode::OK);
+    let off_body = json_body(off_resp).await;
+    assert!(off_body.get("handoff_observation_id").is_none());
+    let obs_path = super::observations::observation_file_path(&off_state.data_dir, "handoff::business::acme::sess-h");
+    assert!(!obs_path.exists(), "flag-off handoff must not write observations");
+
+    let mut on_state = pro_workbench_state(&["handoff:v2"]);
+    bind_test_state_to_root_passport_key(&mut on_state);
+    on_state.handoff_observations_enabled = true;
+    let on_resp = super::workbench::post_handoff_v2(
+        State(on_state.clone()),
+        HeaderMap::new(),
+        Json(super::workbench::HandoffV2Body {
+            tenant_id: "business::acme".to_string(),
+            goal: "handoff with observation".to_string(),
+            session_id: Some("sess-h".to_string()),
+            project_id: Some("proj".to_string()),
+            source_agent: Some("anthropic".to_string()),
+            target_agent: Some("openai".to_string()),
+            evidence_refs: Vec::new(),
+            next_actions: Vec::new(),
+        }),
+    )
+    .await;
+    assert_eq!(on_resp.status(), StatusCode::OK);
+    let on_body = json_body(on_resp).await;
+    assert!(on_body["handoff_observation_id"].as_str().is_some());
+
+    let obs_path = super::observations::observation_file_path(&on_state.data_dir, "handoff::business::acme::sess-h");
+    let line = std::fs::read_to_string(obs_path)
+        .expect("handoff observation JSONL")
+        .lines()
+        .next()
+        .expect("one handoff observation")
+        .to_string();
+    let record: serde_json::Value = serde_json::from_str(&line).expect("observation json");
+    assert_eq!(record["kind"], "handoff");
+    assert_eq!(record["provider"], "crux-handoff");
+    assert_eq!(record["principal"], "claude-work");
+    assert_eq!(record["payload"]["source_passport"], "claude-work");
+    assert_eq!(record["payload"]["target_passport"], "codex-work");
+    assert_eq!(record["payload"]["cross_vendor"], true);
 }
 
 #[serial_test::serial]

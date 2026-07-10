@@ -28,12 +28,12 @@ pub fn run(http_base: &str, non_interactive: bool) -> Result<(), Box<dyn std::er
 
     if non_interactive {
         data_dir = "./data".to_string();
-        auth_mode = "off".to_string();
+        auth_mode = "dev_scopes".to_string();
         build_ccxi = "Y".to_string();
-        eprintln!("    Using defaults (non-interactive): data_dir=./data, auth=off, ccxi=Y");
+        eprintln!("    Using defaults (non-interactive): data_dir=./data, auth=dev_scopes, ccxi=Y");
     } else {
         data_dir = prompt("Data directory", "./data");
-        auth_mode = prompt("Auth mode (off / dev_scopes / jwt_hs256 / jwt_jwks)", "off");
+        auth_mode = prompt("Auth mode (off / dev_scopes / jwt_hs256 / jwt_jwks)", "dev_scopes");
         build_ccxi = prompt("Build CCXI companion indexes?", "Y");
     }
 
@@ -72,7 +72,11 @@ pub fn run(http_base: &str, non_interactive: bool) -> Result<(), Box<dyn std::er
         "confidence": 1.0
     });
 
-    let mut put_resp = ureq::put(&facts_url)
+    let mut put_req = ureq::put(&facts_url);
+    if auth_mode == "dev_scopes" {
+        put_req = put_req.header("x-corecrux-scopes", "facts:write");
+    }
+    let mut put_resp = put_req
         .send_json(body)
         .map_err(|e| format!("PUT {facts_url} failed: {e}"))?;
 
@@ -94,8 +98,12 @@ pub fn run(http_base: &str, non_interactive: bool) -> Result<(), Box<dyn std::er
     // ── Step 4: Query it back ───────────────────────────────────────────
     eprintln!("  [4/5] Querying the test fact");
 
-    let query_url = format!("{base}/v1/facts?query=quickstart+greeting");
-    match ureq::get(&query_url).call() {
+    let query_url = format!("{base}/v1/facts?query=quickstart+greeting&token_budget=500");
+    let mut get_req = ureq::get(&query_url);
+    if auth_mode == "dev_scopes" {
+        get_req = get_req.header("x-corecrux-scopes", "query:read");
+    }
+    match get_req.call() {
         Ok(mut resp) => {
             let query_json: serde_json::Value = resp.body_mut().read_json()?;
             eprintln!("    Query result: {query_json}");
@@ -111,7 +119,11 @@ pub fn run(http_base: &str, non_interactive: bool) -> Result<(), Box<dyn std::er
 
     if !fact_id.is_empty() {
         let delete_url = format!("{base}/v1/facts/{fact_id}");
-        match ureq::delete(&delete_url).call() {
+        let mut delete_req = ureq::delete(&delete_url);
+        if auth_mode == "dev_scopes" {
+            delete_req = delete_req.header("x-corecrux-scopes", "facts:write");
+        }
+        match delete_req.call() {
             Ok(_) => eprintln!("    Deleted test fact {fact_id}"),
             Err(e) => eprintln!("    Warning: cleanup DELETE failed: {e}"),
         }
@@ -195,10 +207,20 @@ mod tests {
             (200, "{}".to_string()),
         ]);
         run(&format!("http://127.0.0.1:{port}"), true).expect("quickstart ok");
-        h.join().ok();
+        let captured = h.join().unwrap();
         assert!(std::path::Path::new("config.env").exists());
         let cfg = std::fs::read_to_string("config.env").unwrap();
-        assert!(cfg.contains("CORECRUXD_AUTH_MODE=off"));
+        assert!(cfg.contains("CORECRUXD_AUTH_MODE=dev_scopes"));
+        assert!(captured[1]
+            .to_ascii_lowercase()
+            .contains("x-corecrux-scopes: facts:write"));
+        assert!(captured[2].contains("GET /v1/facts?query=quickstart+greeting&token_budget=500"));
+        assert!(captured[2]
+            .to_ascii_lowercase()
+            .contains("x-corecrux-scopes: query:read"));
+        assert!(captured[3]
+            .to_ascii_lowercase()
+            .contains("x-corecrux-scopes: facts:write"));
     }
 
     #[test]
@@ -211,14 +233,14 @@ mod tests {
 
     #[test]
     fn config_env_content() {
-        let content = build_config_env("./data", "off", "Y");
+        let content = build_config_env("./data", "dev_scopes", "Y");
         assert!(content.contains("CORECRUXD_DATA_DIR=./data"));
-        assert!(content.contains("CORECRUXD_AUTH_MODE=off"));
+        assert!(content.contains("CORECRUXD_AUTH_MODE=dev_scopes"));
         assert!(content.contains("CORECRUXD_BUILD_CCXI=true"));
 
-        let content_no = build_config_env("/srv/corecrux", "dev_scopes", "N");
+        let content_no = build_config_env("/srv/corecrux", "off", "N");
         assert!(content_no.contains("CORECRUXD_DATA_DIR=/srv/corecrux"));
-        assert!(content_no.contains("CORECRUXD_AUTH_MODE=dev_scopes"));
+        assert!(content_no.contains("CORECRUXD_AUTH_MODE=off"));
         assert!(content_no.contains("CORECRUXD_BUILD_CCXI=false"));
     }
 

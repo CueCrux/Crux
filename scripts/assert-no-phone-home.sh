@@ -30,10 +30,9 @@
 #   1  egress detected / daemon failed offline boot (release blocker)
 #   2  prerequisites missing (binary / curl / both trace mechanisms)
 #
-# CI wiring note: intended as a release-blocking job once the supply-chain
-# workflow changes from PR #172 land (this script deliberately ships without
-# its own workflow file — see ExecPlan daemon-distribution-packaging-2026-06-11
-# decision log).
+# CI wiring note: release-blocking in `.github/workflows/release.yml` on the
+# linux release leg. PR-time coverage stays limited to pure-offline trust gates
+# because shared self-hosted runners can retain daemon ports between jobs.
 set -euo pipefail
 
 BINARY="${1:-target/release/corecruxd}"

@@ -65,6 +65,12 @@ visibility are MCP-only features.
 | GET | `/v1/receipts/{receiptId}/signature` | Retrieve receipt Ed25519 signature | `events:read` |
 | GET | `/v1/receipts/{receiptId}/verification` | Verify receipt signature and chain | `events:read` |
 
+### Credits
+
+| Method | Path | Description | Auth Scope |
+|--------|------|-------------|------------|
+| POST | `/v1/credits/spend` | Default-off comped-wallet spend rail. Requires `CORECRUXD_CREDIT_METER=1`; consumes a pinned quote, reserves/spends seeded credits idempotently, and returns a signed `crux.credit_spend_receipt.v1`. Does not mint fiat credits or call Paddle. | `admin:write` |
+
 ### Replay Exports
 
 | Method | Path | Description | Auth Scope |

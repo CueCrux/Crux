@@ -16,8 +16,9 @@ how much context every model call re-read, where it went, and what to change to 
 retrieval under hard token budgets, and an Ed25519 receipt for every write.
 One binary. No API keys. Nothing leaves your machine.
 
-[Quickstart](#quickstart) · [Console](#the-console) · [How it works](#how-it-works) ·
-[Capabilities](#what-you-get) · [EU AI Act](#eu-ai-act) · [Licence](#licence)
+[Quickstart](#quickstart) · [Docs](docs/README.md) · [Developers](docs/developer-portal.md) · [Console](#the-console) · [How it works](#how-it-works) ·
+[Capabilities](#what-you-get) · [Verify releases](docs/verify-release.md) ·
+[Security](SECURITY.md) · [Support](#support--security) · [Licence](#licence)
 
 [![CI](https://github.com/CueCrux/Crux/actions/workflows/ci.yml/badge.svg)](https://github.com/CueCrux/Crux/actions/workflows/ci.yml)
 [![Coverage](https://img.shields.io/badge/coverage-CI%20gated-green)](https://github.com/CueCrux/Crux/actions/workflows/coverage-attestation.yml)
@@ -57,6 +58,8 @@ No signup. No OpenAI key. BM25 retrieval works out of the box — embeddings are
 pluggable when you want them.
 
 **Two steps to live:** bring the daemon up, then run the one on-ramp command.
+For the longer install path, start at [docs/getting-started.md](docs/getting-started.md);
+the public docs index is [docs/README.md](docs/README.md).
 
 **1 — bring the daemon up** (Docker recommended):
 
@@ -72,7 +75,7 @@ the embedded console walks you through one-time setup and becomes your local das
 ```bash
 curl -sSL https://github.com/CueCrux/Crux/releases/latest/download/crux-linux-amd64 -o crux
 chmod +x crux
-CORECRUXD_AUTH_MODE=off CORECRUXD_DATA_DIR=./data ./crux
+CORECRUXD_AUTH_MODE=dev_scopes CORECRUXD_DATA_DIR=./data ./crux
 ```
 
 **From source** (Rust 1.88+, `protobuf-compiler`):
@@ -80,7 +83,7 @@ CORECRUXD_AUTH_MODE=off CORECRUXD_DATA_DIR=./data ./crux
 ```bash
 git clone https://github.com/CueCrux/Crux.git && cd Crux
 cargo build --release
-CORECRUXD_AUTH_MODE=off CORECRUXD_DATA_DIR=./data ./target/release/corecruxd
+CORECRUXD_AUTH_MODE=dev_scopes CORECRUXD_DATA_DIR=./data ./target/release/corecruxd
 ```
 
 **2 — get live (one command):**
@@ -111,7 +114,8 @@ rail:
   Ready-made connector configs live in [`examples/mcp-configs/`](examples/mcp-configs/).
 </details>
 
-`CORECRUXD_AUTH_MODE` is required; use `off` only for local development.
+`CORECRUXD_AUTH_MODE` is required; `dev_scopes` is the single-user loopback
+quickstart rail. Use `off` only for throwaway local development.
 
 **Local storage boundary:** Crux receipts and BLAKE3 chains prove integrity,
 not confidentiality. The daemon data directory is not encrypted by Crux; use
@@ -428,6 +432,7 @@ Config via environment variables or YAML (`config.example.env`, `config.example.
 | `CORECRUXD_MCP_PORT` | `14801` | MCP server port. |
 | `CORECRUXD_MCP_ENABLED` | `true` | Enable the built-in MCP server. |
 | `CORECRUXD_BUILD_CCXI` | `0` | Build `.ccxi` indexes at seal time. |
+| `CORECRUXD_CREDIT_METER` | `false` | Enable the default-off comped-wallet credit meter and `/v1/credits/spend` test rail. |
 | `CORECRUXD_EMBEDDING_URL` | unset | Enables dense fact retrieval. |
 | `CORECRUXD_EMBEDDING_MODEL` | `nomic-embed-text` | Embedding model name. |
 | `CORECRUXD_CORECRUX_BASE_URL` | unset | CoreCrux admin base URL for `/console` lane-weight controls. |
@@ -443,6 +448,10 @@ Usage receipts (adoption signal) are **opt-in and off by default** — the daemo
 signal unless you set an `https://` collector endpoint *and* record consent. See
 [`docs/usage-receipts.md`](docs/usage-receipts.md) (`CORECRUXD_USAGE_RECEIPTS_SUBMIT` /
 `_ENDPOINT` / `_CONSENT_AT`).
+
+Credit Meter is also **opt-in and off by default**. `CORECRUXD_CREDIT_METER=1` enables only the
+seeded comped-wallet spend rail for pinned quotes and signed spend receipts; fiat minting, Paddle,
+and production billing remain separately gated.
 
 </details>
 
@@ -559,6 +568,16 @@ Built in the open, verified in the open.
 [Contributing](CONTRIBUTING.md) · [Security policy](SECURITY.md) ·
 [Code of conduct](CODE_OF_CONDUCT.md) · [Changelog](CHANGELOG.md) ·
 [Trust Contract](TRUST-CONTRACT.md)
+
+## Support & security
+
+- Before running a release artifact, verify its signature, SBOM and provenance with
+  [`docs/verify-release.md`](docs/verify-release.md).
+- Report vulnerabilities privately through [`SECURITY.md`](SECURITY.md); do not open a public
+  issue for security bugs.
+- For non-security bugs or feature requests, use the GitHub issue templates:
+  [bug report](.github/ISSUE_TEMPLATE/bug_report.yml) or
+  [feature request](.github/ISSUE_TEMPLATE/feature_request.yml).
 
 ## Licence
 

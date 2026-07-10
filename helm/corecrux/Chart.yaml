@@ -4,6 +4,7 @@ description: Crux Daemon — append-only event store with BM25 retrieval and CRO
 type: application
 version: 0.1.0
 appVersion: "0.1.0"
+deprecated: true
 home: https://github.com/CueCrux/Crux
 sources:
   - https://github.com/CueCrux/Crux

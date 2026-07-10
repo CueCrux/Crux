@@ -34,6 +34,10 @@ mod control;
 mod coord;
 mod cost;
 mod cost_attribution;
+// Credit-burn M1a staged primitive; wired into request paths in a later
+// gated milestone after the money-path design review.
+#[allow(dead_code)]
+mod credit_meter;
 // Dataplane store stubs: proprietary edition provides the real implementation.
 #[allow(dead_code)]
 mod dataplane_store;
@@ -575,6 +579,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     /// for a per-(passport, session, chain-head) memo on a local daemon.
     const ASSEMBLY_CACHE_MAX_ENTRIES: usize = 256;
 
+    let credit_meter = if config.credit_meter_enabled {
+        Some(Arc::new(std::sync::Mutex::new(
+            crate::credit_meter::CreditMeterStore::open(config.data_dir.join("credit-meter.jsonl"))?,
+        )))
+    } else {
+        None
+    };
+
     let fact_store = Arc::new(RwLock::new(if config.fact_persistence_enabled {
         corecrux_memory::FactStore::with_persistence(&config.data_dir)?
     } else {
@@ -622,6 +634,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         local_ingest_enabled: config.local_ingest_enabled,
         stream_receipts_enabled: config.stream_receipts_enabled,
         usage_receipts_enabled: config.usage_receipts_enabled,
+        handoff_observations_enabled: config.handoff_observations_enabled,
         usage_submit: config.usage_submit.clone(),
         // Phase T (M2) version-notify slot; the consent-gated usage submitter
         // writes the collector-reported latest release here, `/v1/version` reads it.
@@ -634,6 +647,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }),
         quota_hosted_surfaces: Arc::new(config.quota_hosted_surfaces.clone()),
         quota_ledger: Arc::new(std::sync::Mutex::new(crux_router::quota::QuotaLedger::new())),
+        credit_meter,
         openai_shim_enabled: config.openai_shim_enabled,
         memory_import_enabled: config.memory_import_enabled,
         identity_links_enabled: config.identity_links_enabled,
@@ -4203,12 +4217,14 @@ mod tests {
             local_ingest_enabled: false,
             stream_receipts_enabled: false,
             usage_receipts_enabled: false,
+            handoff_observations_enabled: false,
             usage_submit: crate::usage_submit::UsageSubmitConfig::default(),
             latest_release: std::sync::Arc::new(std::sync::RwLock::new(None)),
             quota_enabled: false,
             assembly_cache: None,
             quota_hosted_surfaces: std::sync::Arc::new(Vec::new()),
             quota_ledger: std::sync::Arc::new(std::sync::Mutex::new(crux_router::quota::QuotaLedger::new())),
+            credit_meter: None,
             openai_shim_enabled: false,
             memory_import_enabled: false,
             identity_links_enabled: false,

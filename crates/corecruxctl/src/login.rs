@@ -606,6 +606,8 @@ fn verify_fact_roundtrip(agent: &ureq::Agent, http_base: &str, bearer: Option<&s
     let mut put = agent.put(&put_url).header("content-type", "application/json");
     if let Some(t) = bearer {
         put = put.header("authorization", format!("Bearer {t}"));
+    } else {
+        put = put.header("x-corecrux-scopes", "facts:write");
     }
     match put.send_json(put_body) {
         Ok(_) => {}
@@ -618,9 +620,12 @@ fn verify_fact_roundtrip(agent: &ureq::Agent, http_base: &str, bearer: Option<&s
         .get(&get_url)
         .query("entity", entity)
         .query("top_k", "5")
+        .query("token_budget", "500")
         .header("accept", "application/json");
     if let Some(t) = bearer {
         get = get.header("authorization", format!("Bearer {t}"));
+    } else {
+        get = get.header("x-corecrux-scopes", "query:read");
     }
     let text = match get.call() {
         Ok(resp) => resp.into_body().read_to_string()?,
@@ -1300,6 +1305,27 @@ mod tests {
         assert!(Rail::StaticToken.is_implemented());
         assert!(Rail::Tailscale.is_implemented());
         assert!(Rail::Device.is_implemented());
+    }
+
+    #[test]
+    fn fact_roundtrip_without_bearer_uses_dev_scope_headers_and_budget() {
+        let (port, handle) = crate::test_support::serve_responses(vec![
+            (200, "{}".to_string()),
+            (200, r#"{"facts":[{"key":"last_login_probe"}]}"#.to_string()),
+        ]);
+        let agent = http_agent();
+        verify_fact_roundtrip(&agent, &format!("http://127.0.0.1:{port}"), None).unwrap();
+
+        let captured = handle.join().unwrap();
+        assert!(captured[0].contains("PUT /v1/facts"));
+        assert!(captured[0]
+            .to_ascii_lowercase()
+            .contains("x-corecrux-scopes: facts:write"));
+        assert!(captured[1].contains("GET /v1/facts?entity=__crux_login_selfcheck"));
+        assert!(captured[1].contains("token_budget=500"));
+        assert!(captured[1]
+            .to_ascii_lowercase()
+            .contains("x-corecrux-scopes: query:read"));
     }
 
     // ── URL helpers ──

@@ -9,6 +9,7 @@
 //! local receipts, command metadata, and constraints. Free keeps the safety
 //! primitives; this module gates the acceleration/provenance workbench layer.
 
+use super::observations::{append_one, PostObservationBody};
 use super::*;
 use corecrux_memory::action_enrichment::{enrich_action, hash_json, ActionEnrichmentInput, Materiality};
 use corecrux_memory::fact_store::{Fact, FactQuery, FactStore, StoreFact};
@@ -174,6 +175,10 @@ pub(super) struct HandoffV2Body {
     pub session_id: Option<String>,
     #[serde(default)]
     pub project_id: Option<String>,
+    #[serde(default)]
+    pub source_agent: Option<String>,
+    #[serde(default)]
+    pub target_agent: Option<String>,
     #[serde(default)]
     pub evidence_refs: Vec<String>,
     #[serde(default)]
@@ -571,19 +576,40 @@ pub(super) async fn post_handoff_v2(
     let package = json!({
         "schema": "crux.agent_workbench.handoff_v2.v1",
         "tenant_id": tenant_id,
-        "goal": body.goal,
-        "session_id": body.session_id,
+        "goal": &body.goal,
+        "session_id": &body.session_id,
         "session_state": session_state,
-        "project_id": body.project_id,
+        "project_id": &body.project_id,
+        "source_agent": &body.source_agent,
+        "target_agent": &body.target_agent,
         "constraints": constraints,
         "open_decisions": decisions,
-        "evidence_refs": body.evidence_refs,
+        "evidence_refs": &body.evidence_refs,
         "command_ledger_summary": command_summary,
-        "next_actions": body.next_actions,
+        "next_actions": &body.next_actions,
         "created_at_unix_ms": crate::ops_events::now_unix_ms(),
     });
     let receipt = workbench_receipt("handoff_v2", &tenant_id, &package);
-    let response = json!({ "status": "ok", "package": package, "receipt": receipt });
+    let mut response = json!({ "status": "ok", "package": package, "receipt": receipt });
+    if state.handoff_observations_enabled {
+        let obs = handoff_observation_body(&tenant_id, &body, &receipt);
+        let scoped_session = body.session_id.as_deref().map_or_else(
+            || format!("handoff::{tenant_id}"),
+            |session_id| format!("handoff::{tenant_id}::{session_id}"),
+        );
+        let principal = obs
+            .payload
+            .get("source_passport")
+            .and_then(Value::as_str)
+            .unwrap_or(&state.passport_fpr)
+            .to_string();
+        match append_one(&state, &scoped_session, &principal, obs, None) {
+            Ok((observation, _tip)) => {
+                response["handoff_observation_id"] = json!(observation.observation_id);
+            }
+            Err((status, msg)) => return problem_response(status, msg),
+        }
+    }
     if let Err(err) = store_workbench_fact(&state, &tenant_id, HANDOFF_KEY, &receipt, &response).await {
         return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
     }
@@ -843,6 +869,61 @@ fn workbench_receipt(kind: &str, tenant_id: &str, payload: &Value) -> Value {
         "payload_hash": payload_hash,
         "created_at_unix_ms": crate::ops_events::now_unix_ms(),
     })
+}
+
+fn normalize_handoff_agent(agent: Option<&str>) -> Option<String> {
+    let trimmed = agent?.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_ascii_lowercase())
+    }
+}
+
+fn handoff_agent_lookup_key(agent: &str) -> &str {
+    match agent {
+        "claude" | "claude-code" | "anthropic" => "anthropic",
+        "codex" | "codex-cli" | "openai" => "openai",
+        other => other,
+    }
+}
+
+fn resolve_handoff_agent_passport(agent: &str) -> Option<String> {
+    let map = crux_mcp::agent_passport::AgentPassportMap::from_env_or_default();
+    crux_mcp::agent_passport::resolve_agent_passport(handoff_agent_lookup_key(agent), &map).or_else(|| {
+        let fallback = crux_mcp::agent_passport::AgentPassportMap::builtin_default();
+        crux_mcp::agent_passport::resolve_agent_passport(handoff_agent_lookup_key(agent), &fallback)
+    })
+}
+
+fn handoff_observation_body(tenant_id: &str, body: &HandoffV2Body, receipt: &Value) -> PostObservationBody {
+    let source_agent = normalize_handoff_agent(body.source_agent.as_deref());
+    let target_agent = normalize_handoff_agent(body.target_agent.as_deref());
+    let source_passport = source_agent.as_deref().and_then(resolve_handoff_agent_passport);
+    let target_passport = target_agent.as_deref().and_then(resolve_handoff_agent_passport);
+    let cross_vendor = match (&source_passport, &target_passport) {
+        (Some(source), Some(target)) => Some(source != target),
+        _ => None,
+    };
+    PostObservationBody {
+        kind: "handoff".to_string(),
+        provider: "crux-handoff".to_string(),
+        client_ts: None,
+        payload: json!({
+            "schema": "crux.s1.handoff_observation.v1",
+            "tenant_id": tenant_id,
+            "session_id": &body.session_id,
+            "project_id": &body.project_id,
+            "goal_hash": hash_text(&body.goal),
+            "source_agent": source_agent,
+            "target_agent": target_agent,
+            "source_passport": source_passport,
+            "target_passport": target_passport,
+            "cross_vendor": cross_vendor,
+            "handoff_receipt_id": receipt.get("receipt_id").and_then(Value::as_str),
+            "handoff_payload_hash": receipt.get("payload_hash").and_then(Value::as_str),
+        }),
+    }
 }
 
 fn query_facts(store: &FactStore, query: Option<&str>, entity_prefix: Option<&str>, top_k: usize) -> Vec<Fact> {
@@ -1615,6 +1696,54 @@ mod helper_tests {
         assert_eq!(r["event_type"], "agent_workbench_brief");
         assert!(r["receipt_id"].as_str().unwrap().starts_with("workbench:brief:"));
         assert!(r["payload_hash"].as_str().unwrap().starts_with("blake3:"));
+    }
+
+    #[test]
+    fn handoff_observation_payload_marks_cross_vendor() {
+        let body = HandoffV2Body {
+            tenant_id: "work".to_string(),
+            goal: "move the work".to_string(),
+            session_id: Some("s1".to_string()),
+            project_id: Some("p1".to_string()),
+            source_agent: Some("anthropic".to_string()),
+            target_agent: Some("openai".to_string()),
+            evidence_refs: Vec::new(),
+            next_actions: Vec::new(),
+        };
+        let obs = handoff_observation_body("work", &body, &workbench_receipt("handoff_v2", "work", &json!({})));
+        assert_eq!(obs.kind, "handoff");
+        assert_eq!(obs.provider, "crux-handoff");
+        assert_eq!(obs.payload["source_passport"], "claude-work");
+        assert_eq!(obs.payload["target_passport"], "codex-work");
+        assert_eq!(obs.payload["cross_vendor"], true);
+    }
+
+    #[test]
+    fn handoff_observation_payload_marks_same_vendor_and_unknown_target() {
+        let same = HandoffV2Body {
+            tenant_id: "work".to_string(),
+            goal: "same vendor".to_string(),
+            session_id: None,
+            project_id: None,
+            source_agent: Some("claude-code".to_string()),
+            target_agent: Some("anthropic".to_string()),
+            evidence_refs: Vec::new(),
+            next_actions: Vec::new(),
+        };
+        let same_obs = handoff_observation_body("work", &same, &workbench_receipt("handoff_v2", "work", &json!({})));
+        assert_eq!(same_obs.payload["source_passport"], "claude-work");
+        assert_eq!(same_obs.payload["target_passport"], "claude-work");
+        assert_eq!(same_obs.payload["cross_vendor"], false);
+
+        let unknown = HandoffV2Body {
+            target_agent: Some("unknown-agent".to_string()),
+            ..same
+        };
+        let unknown_obs =
+            handoff_observation_body("work", &unknown, &workbench_receipt("handoff_v2", "work", &json!({})));
+        assert_eq!(unknown_obs.payload["source_passport"], "claude-work");
+        assert!(unknown_obs.payload["target_passport"].is_null());
+        assert!(unknown_obs.payload["cross_vendor"].is_null());
     }
 
     #[test]
