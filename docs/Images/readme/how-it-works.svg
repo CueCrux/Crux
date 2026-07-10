@@ -1,0 +1,152 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 1160 640" width="1160" role="img" aria-label="Crux architecture: your agent talks to one corecruxd binary; three planes — memory, retrieval, receipts — sit on an append-only spine" xmlns="http://www.w3.org/2000/svg">
+  <title>Crux: one daemon, three planes on an append-only spine</title>
+  <defs>
+    <radialGradient id="hwA1" cx="12%" cy="-8%" r="65%">
+      <stop offset="0%" stop-color="#6CA8FF" stop-opacity=".22"/><stop offset="60%" stop-color="#6CA8FF" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="hwA2" cx="96%" cy="4%" r="55%">
+      <stop offset="0%" stop-color="#A78BFA" stop-opacity=".18"/><stop offset="58%" stop-color="#A78BFA" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="hwA3" cx="78%" cy="108%" r="60%">
+      <stop offset="0%" stop-color="#3DDC97" stop-opacity=".13"/><stop offset="60%" stop-color="#3DDC97" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="hwGlow" x="-60%" y="-60%" width="220%" height="220%">
+      <feDropShadow dx="0" dy="0" stdDeviation="10" flood-color="#6CA8FF" flood-opacity=".55"/>
+    </filter>
+    <style>
+      .t{font-family:ui-monospace,'SF Mono',SFMono-Regular,Menlo,Consolas,monospace}
+      .name{fill:#EAF0F7;font-size:14px;font-weight:600}
+      .sub{fill:#93A4B8;font-size:11.5px}
+      .lbl{fill:#93A4B8;font-size:10.5px;letter-spacing:.18em;font-weight:600}
+      .cap{fill:#6E7E96;font-size:11px}
+      .wire{stroke:#5D7290;stroke-width:1.2;fill:none}
+      .glass{fill:rgba(255,255,255,.045);stroke:rgba(255,255,255,.10)}
+      .card{fill:#0D1726;stroke:#31445F}
+    </style>
+  </defs>
+
+  <!-- panel + aurora -->
+  <rect x="1" y="1" width="1158" height="638" rx="18" fill="#060A12" stroke="rgba(255,255,255,.13)"/>
+  <rect x="1" y="1" width="1158" height="638" rx="18" fill="url(#hwA1)"/>
+  <rect x="1" y="1" width="1158" height="638" rx="18" fill="url(#hwA2)"/>
+  <rect x="1" y="1" width="1158" height="638" rx="18" fill="url(#hwA3)"/>
+
+  <!-- header strip -->
+  <text class="t lbl" x="36" y="44">CRUX · ONE DAEMON · THREE PLANES</text>
+  <g class="t">
+    <rect x="872" y="26" width="128" height="26" rx="13" fill="rgba(108,168,255,.08)" stroke="rgba(108,168,255,.35)"/>
+    <text x="936" y="43" text-anchor="middle" fill="#6CA8FF" font-size="11.5">127.0.0.1:14800</text>
+    <rect x="1008" y="26" width="118" height="26" rx="13" fill="rgba(61,220,151,.07)" stroke="rgba(61,220,151,.35)"/>
+    <text x="1067" y="43" text-anchor="middle" fill="#3DDC97" font-size="11.5">no cloud here</text>
+  </g>
+
+  <!-- agent pill -->
+  <g class="t">
+    <rect x="447" y="66" width="266" height="40" rx="20" fill="#060A12" stroke="#6CA8FF" stroke-dasharray="5 4" stroke-width="1.3"/>
+    <text class="name" x="580" y="87" text-anchor="middle">your agent</text>
+    <text class="sub" x="580" y="99" text-anchor="middle" font-size="10.5">MCP · HTTP · gRPC</text>
+  </g>
+  <path class="wire" d="M580 106 V132" marker-end="none"/>
+
+  <!-- interfaces -->
+  <g class="t">
+    <rect class="card" x="306" y="140" width="180" height="46" rx="10"/>
+    <text class="name" x="396" y="160" text-anchor="middle" font-size="13">crux-mcp</text>
+    <text class="sub" x="396" y="175" text-anchor="middle">100+ budgeted tools</text>
+    <rect class="card" x="674" y="140" width="180" height="46" rx="10"/>
+    <text class="name" x="764" y="160" text-anchor="middle" font-size="13">corecruxctl</text>
+    <text class="sub" x="764" y="175" text-anchor="middle">verify · replay · audit</text>
+  </g>
+  <path class="wire" d="M486 163 H520"/>
+  <path class="wire" d="M674 163 H640"/>
+
+  <!-- hub -->
+  <g class="t">
+    <rect x="520" y="132" width="120" height="62" rx="12" fill="#0D1726" stroke="#6CA8FF" stroke-width="2" filter="url(#hwGlow)"/>
+    <text class="name" x="580" y="158" text-anchor="middle">corecruxd</text>
+    <text class="sub" x="580" y="174" text-anchor="middle">one binary</text>
+  </g>
+
+  <!-- policy rail -->
+  <g class="t">
+    <rect class="glass" x="36" y="132" width="196" height="62" rx="12"/>
+    <rect x="36" y="132" width="3" height="62" rx="1.5" fill="#6CA8FF" opacity=".8"/>
+    <text class="name" x="52" y="156" font-size="12.5">crux-router · RCX</text>
+    <text class="sub" x="52" y="172">capability tokens expire</text>
+    <text class="sub" x="52" y="185" fill="#6E7E96" font-size="10.5">vaultcrux-local boundary</text>
+  </g>
+  <path class="wire" d="M306 163 H232" stroke-dasharray="4 4"/>
+
+  <!-- fan-out wires to planes -->
+  <path class="wire" d="M552 194 C500 232 348 218 240 250"/>
+  <path class="wire" d="M580 194 V250"/>
+  <path class="wire" d="M608 194 C660 232 812 218 920 250"/>
+
+  <!-- MEMORY plane -->
+  <g class="t">
+    <rect class="glass" x="60" y="250" width="330" height="212" rx="14"/>
+    <rect x="60" y="250" width="330" height="3" rx="1.5" fill="#7C6CF0"/>
+    <text class="lbl" x="76" y="281" fill="#A99DF5">MEMORY</text>
+    <rect class="card" x="76" y="296" width="298" height="60" rx="10" stroke="#7C6CF0" stroke-opacity=".65"/>
+    <text class="name" x="90" y="320" font-size="13">corecrux-memory</text>
+    <text class="sub" x="90" y="337">versioned facts · sessions · handoffs</text>
+    <rect class="card" x="76" y="368" width="298" height="60" rx="10" stroke="#7C6CF0" stroke-opacity=".35"/>
+    <text class="name" x="90" y="392" font-size="13">corecrux-projections</text>
+    <text class="sub" x="90" y="409">derived state · live work board</text>
+  </g>
+
+  <!-- RETRIEVAL plane -->
+  <g class="t">
+    <rect class="glass" x="415" y="250" width="330" height="212" rx="14"/>
+    <rect x="415" y="250" width="330" height="3" rx="1.5" fill="#E8823C"/>
+    <text class="lbl" x="431" y="281" fill="#F0A369">RETRIEVAL</text>
+    <rect class="card" x="431" y="296" width="298" height="60" rx="10" stroke="#E8823C" stroke-opacity=".65"/>
+    <text class="name" x="445" y="320" font-size="13">corecrux-retrieval</text>
+    <text class="sub" x="445" y="337">BM25 + graph fusion · token-budgeted</text>
+    <rect class="card" x="431" y="368" width="143" height="60" rx="10" stroke="#E8823C" stroke-opacity=".35"/>
+    <text class="name" x="443" y="392" font-size="12.5">corecrux-index</text>
+    <text class="sub" x="443" y="409">.ccxi indexes</text>
+    <rect class="card" x="586" y="368" width="143" height="60" rx="10" stroke="#E8823C" stroke-opacity=".35"/>
+    <text class="name" x="598" y="392" font-size="12.5">repo code maps</text>
+    <text class="sub" x="598" y="409">AST · typed graph</text>
+  </g>
+
+  <!-- RECEIPTS plane -->
+  <g class="t">
+    <rect class="glass" x="770" y="250" width="330" height="212" rx="14"/>
+    <rect x="770" y="250" width="330" height="3" rx="1.5" fill="#3DDC97"/>
+    <text class="lbl" x="786" y="281" fill="#6FE7B4">RECEIPTS</text>
+    <rect class="card" x="786" y="296" width="298" height="60" rx="10" stroke="#3DDC97" stroke-opacity=".65"/>
+    <text class="name" x="800" y="320" font-size="13">corecrux-receipts</text>
+    <text class="sub" x="800" y="337">CROWN · Ed25519-signed</text>
+    <g>
+      <rect x="786" y="368" width="298" height="60" rx="10" fill="rgba(61,220,151,.06)" stroke="#3DDC97" stroke-opacity=".4"/>
+      <text class="name" x="800" y="392" font-size="12.5" fill="#3DDC97">✓ verify offline</text>
+      <text class="sub" x="800" y="409">every mutation mints a receipt</text>
+    </g>
+  </g>
+
+  <!-- embeddings satellite -->
+  <g class="t">
+    <rect x="415" y="474" width="330" height="34" rx="17" fill="#0A111E" stroke="#22314A" stroke-dasharray="4 4"/>
+    <text class="sub" x="580" y="495" text-anchor="middle">dense lane → embeddings · optional · BYO</text>
+  </g>
+  <path class="wire" d="M580 462 V474" stroke-dasharray="4 4"/>
+
+  <!-- spine -->
+  <path class="wire" d="M225 462 V530"/>
+  <path class="wire" d="M935 462 V530"/>
+  <g class="t">
+    <rect x="60" y="530" width="1040" height="64" rx="14" fill="#0A111E" stroke="#22314A"/>
+    <text class="lbl" x="84" y="558">APPEND-ONLY SPINE</text>
+    <text class="sub" x="84" y="577">corecrux-storage — BLAKE3 hash chains ▸ corecrux-segment — sealed segments</text>
+    <g fill="#31445F">
+      <path d="M880 552 l10 10 -10 10 v-6 l4 -4 -4 -4 z"/><path d="M902 552 l10 10 -10 10 v-6 l4 -4 -4 -4 z"/>
+      <path d="M924 552 l10 10 -10 10 v-6 l4 -4 -4 -4 z"/><path d="M946 552 l10 10 -10 10 v-6 l4 -4 -4 -4 z"/>
+      <path d="M968 552 l10 10 -10 10 v-6 l4 -4 -4 -4 z"/><path d="M990 552 l10 10 -10 10 v-6 l4 -4 -4 -4 z"/>
+      <path d="M1012 552 l10 10 -10 10 v-6 l4 -4 -4 -4 z"/><path d="M1034 552 l10 10 -10 10 v-6 l4 -4 -4 -4 z"/>
+    </g>
+  </g>
+  <text class="t cap" x="1100" y="620" text-anchor="end">tamper shows. gaps are detectable, not deniable.</text>
+</svg>

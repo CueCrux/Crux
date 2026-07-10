@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 1160 440" width="1160" role="img" aria-label="Crux platform: the daemon runs on your machine; CruxEngine, CoreCrux, ScoreCrux and your planning repo on one side; WikiCrux and the RCX environment on the other" xmlns="http://www.w3.org/2000/svg">
+  <title>Crux standalone on your machine; the CueCrux platform by choice</title>
+  <defs>
+    <radialGradient id="pfA1" cx="10%" cy="-10%" r="60%">
+      <stop offset="0%" stop-color="#6CA8FF" stop-opacity=".2"/><stop offset="60%" stop-color="#6CA8FF" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="pfA2" cx="92%" cy="110%" r="60%">
+      <stop offset="0%" stop-color="#3DDC97" stop-opacity=".12"/><stop offset="60%" stop-color="#3DDC97" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="pfGlow" x="-60%" y="-60%" width="220%" height="220%">
+      <feDropShadow dx="0" dy="0" stdDeviation="12" flood-color="#6CA8FF" flood-opacity=".5"/>
+    </filter>
+    <style>
+      .t{font-family:ui-monospace,'SF Mono',SFMono-Regular,Menlo,Consolas,monospace}
+      .name{fill:#EAF0F7;font-size:14px;font-weight:600}
+      .sub{fill:#93A4B8;font-size:11.5px}
+      .lbl{fill:#93A4B8;font-size:10.5px;letter-spacing:.18em;font-weight:600}
+      .wire{stroke:#5D7290;stroke-width:1.2;fill:none}
+      .elbl{fill:#93A4B8;font-size:11px}
+      .card{fill:#0D1726;stroke:#31445F}
+    </style>
+  </defs>
+
+  <rect x="1" y="1" width="1158" height="438" rx="18" fill="#060A12" stroke="rgba(255,255,255,.13)"/>
+  <rect x="1" y="1" width="1158" height="438" rx="18" fill="url(#pfA1)"/>
+  <rect x="1" y="1" width="1158" height="438" rx="18" fill="url(#pfA2)"/>
+
+  <text class="t lbl" x="36" y="44">STANDALONE BY DESIGN · PLATFORM BY CHOICE</text>
+
+  <!-- left satellites -->
+  <g class="t">
+    <rect class="card" x="48" y="76" width="240" height="64" rx="12"/>
+    <text class="name" x="64" y="102">CruxEngine</text>
+    <text class="sub" x="64" y="119">process → return → delete</text>
+
+    <rect class="card" x="48" y="156" width="240" height="64" rx="12"/>
+    <text class="name" x="64" y="182">CoreCrux</text>
+    <text class="sub" x="64" y="199">dense · graph · event + AMR</text>
+
+    <rect class="card" x="48" y="236" width="240" height="64" rx="12"/>
+    <text class="name" x="64" y="262">ScoreCrux</text>
+    <text class="sub" x="64" y="279">benchmarks · evals</text>
+
+    <rect class="card" x="48" y="316" width="240" height="64" rx="12"/>
+    <text class="name" x="64" y="342">your planning repo</text>
+    <text class="sub" x="64" y="359">ExecPlans · live work board</text>
+  </g>
+
+  <!-- your-machine boundary -->
+  <g class="t">
+    <rect x="422" y="118" width="316" height="220" rx="16" fill="none" stroke="#6CA8FF" stroke-opacity=".45" stroke-dasharray="6 5"/>
+    <text class="lbl" x="440" y="146" fill="#6CA8FF" fill-opacity=".8">YOUR MACHINE</text>
+    <rect x="452" y="168" width="256" height="128" rx="14" fill="#0D1726" stroke="#6CA8FF" stroke-width="2" filter="url(#pfGlow)"/>
+    <text class="name" x="580" y="212" text-anchor="middle" font-size="17">Crux</text>
+    <text class="sub" x="580" y="234" text-anchor="middle">memory · retrieval · receipts</text>
+    <text class="sub" x="580" y="252" text-anchor="middle" fill="#6E7E96">free forever · no account</text>
+  </g>
+
+  <!-- right satellites -->
+  <g class="t">
+    <rect x="872" y="116" width="240" height="78" rx="12" fill="#0D1726" stroke="#3DDC97" stroke-opacity=".7"/>
+    <text class="name" x="888" y="142">WikiCrux</text>
+    <text class="sub" x="888" y="159">wiki.cuecrux.com · code maps</text>
+    <text class="sub" x="888" y="176" fill="#3DDC97" fill-opacity=".9">served by this daemon</text>
+
+    <rect class="card" x="872" y="252" width="240" height="64" rx="12"/>
+    <text class="name" x="888" y="278">RCX Environment</text>
+    <text class="sub" x="888" y="295">MCP → RCX graph tooling</text>
+  </g>
+
+  <!-- wires -->
+  <path class="wire" d="M288 108 C360 116 396 150 422 172" stroke-dasharray="5 4"/>
+  <text class="t elbl" x="318" y="98">sync: off by default</text>
+  <path class="wire" d="M288 188 C348 194 392 208 422 218"/>
+  <path class="wire" d="M288 268 C348 262 392 248 422 238"/>
+  <path class="wire" d="M288 348 C360 340 396 306 422 284"/>
+
+  <path class="wire" d="M738 180 C790 170 828 162 872 156"/>
+  <text class="t elbl" x="746" y="104">dogfooding in public</text>
+  <path class="wire" d="M738 276 C790 280 828 282 872 284"/>
+  <text class="t elbl" x="712" y="338">every call rides a passport</text>
+
+  <text class="t elbl" x="1112" y="412" text-anchor="end" fill="#6E7E96">same receipts · same passports · every hop attributable</text>
+</svg>
