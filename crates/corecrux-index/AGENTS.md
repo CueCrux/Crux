@@ -26,5 +26,5 @@ per-document metadata (length, tenant hash), and a vocabulary table. It powers B
   existing files, or bump `CCXI_VERSION` and handle the old version in `CcxiReader` —
   silently changing encode output orphans every sealed index in the fleet.
 - Don't change `tokenize` semantics unilaterally — indexes built with the old tokenizer
-  will mis-match queries tokenised with the new one (same rebuild-the-world cost).
+  will mismatch queries tokenised with the new one (same rebuild-the-world cost).
 - Keep this crate CPU-only and dependency-light; GPU loading lives in the dataplane, not here.
