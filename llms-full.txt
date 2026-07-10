@@ -3208,7 +3208,10 @@ CORECRUXD_DATA_DIR=./data cargo run --release --bin corecruxctl -- verify-store 
   <img src="docs/Images/readme/CueCrux-Arc-Loop.png" alt="CueCrux arc-loop mark" width="96">
 </picture>
 
-# CRUX
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/Images/readme/crux-dark.svg">
+  <img src="docs/Images/readme/crux-light.svg" alt="CRUX" width="216">
+</picture>
 
 ### One binary. Your whole memory.
 
