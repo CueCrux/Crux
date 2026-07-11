@@ -45,6 +45,7 @@ pub mod edge_store;
 pub mod embeddings;
 pub mod entity_store;
 pub mod events;
+pub mod fact_privacy;
 pub mod fact_store;
 pub mod identity_link;
 pub mod kind_registry;

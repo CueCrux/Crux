@@ -741,7 +741,8 @@ impl FactStore {
     /// Store a fact and return it. If a fact with the same (entity, key) already
     /// exists, the new fact is assigned the next version number and links to the
     /// previous version via `supersedes`.
-    pub fn store(&mut self, req: StoreFact) -> Fact {
+    pub fn store(&mut self, mut req: StoreFact) -> Fact {
+        crate::fact_privacy::enforce_global(&mut req);
         let fact = self.build_fact(req);
         self.insert_fact_indexes(&fact);
         if let Err(err) = self.append_journal(&JournalEvent::Store { fact: fact.clone() }) {
@@ -753,7 +754,8 @@ impl FactStore {
     }
 
     /// Store a fact only after its journal event has been durably appended.
-    pub fn try_store(&mut self, req: StoreFact) -> std::io::Result<Fact> {
+    pub fn try_store(&mut self, mut req: StoreFact) -> std::io::Result<Fact> {
+        crate::fact_privacy::enforce_global(&mut req);
         let fact = self.build_fact(req);
         self.append_journal(&JournalEvent::Store { fact: fact.clone() })?;
         self.insert_fact_indexes(&fact);
@@ -789,7 +791,13 @@ impl FactStore {
 
     /// Store multiple facts, aborting before mutation if any journal append fails.
     pub fn try_store_bulk(&mut self, reqs: Vec<StoreFact>) -> std::io::Result<Vec<Fact>> {
-        let facts: Vec<Fact> = reqs.into_iter().map(|req| self.build_fact(req)).collect();
+        let facts: Vec<Fact> = reqs
+            .into_iter()
+            .map(|mut req| {
+                crate::fact_privacy::enforce_global(&mut req);
+                self.build_fact(req)
+            })
+            .collect();
         self.append_journal(&JournalEvent::StoreBatch { facts: facts.clone() })?;
         for fact in &facts {
             self.insert_fact_indexes(fact);
@@ -1488,6 +1496,35 @@ mod tests {
 
         let retrieved = store.get(&fact.fact_id).unwrap();
         assert_eq!(retrieved.value, "canary deployment with evaluator programme");
+    }
+
+    #[test]
+    fn fact_store_enforces_born_private_policy_at_every_request_entry_point() {
+        let request = |entity: &str, private| StoreFact {
+            entity: entity.to_string(),
+            key: "record".to_string(),
+            value: "sensitive".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private,
+            horizon_class: None,
+            actor: None,
+        };
+        let mut store = FactStore::new();
+
+        let stored = store.store(request("__passport__::alice", false));
+        let try_stored = store
+            .try_store(request("__constraints__::no-public-write", false))
+            .expect("in-memory try_store should succeed");
+        let bulk_stored = store
+            .try_store_bulk(vec![request("__ops__::coverage::retrieval", false)])
+            .expect("in-memory try_store_bulk should succeed");
+        let already_private = store.store(request("public::explicitly-private", true));
+
+        assert!(stored.private);
+        assert!(try_stored.private);
+        assert!(bulk_stored[0].private);
+        assert!(already_private.private);
     }
 
     #[test]

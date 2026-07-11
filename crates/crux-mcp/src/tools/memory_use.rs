@@ -447,10 +447,19 @@ mod tests {
 
         assert_eq!(res["feature_enabled"], true);
         assert_eq!(res["filtered_count"], 1, "only project-x must survive filtering");
-        assert_eq!(res["redacted_count"], 2, "ops + bootstrap entries must be redacted");
+        // Post-C6, reserved-prefix facts are born-private, matching the HTTP write path,
+        // so they are excluded at the visibility layer rather than the redaction layer.
+        // Redaction remains defense-in-depth for any still-public reserved fact (for
+        // example, one written before migration).
+        assert_eq!(res["not_visible_count"], 2, "ops + bootstrap entries must be hidden");
+        assert_eq!(res["redacted_count"], 0, "born-private facts must not reach redaction");
+        assert_eq!(res["not_found_count"], 0, "all supplied fact IDs must resolve");
         let mems = res["memories_used"].as_array().unwrap();
         assert_eq!(mems.len(), 1);
         assert_eq!(mems[0]["topic"], "project-x");
+        let serialized_mems = serde_json::to_string(mems).unwrap();
+        assert!(!serialized_mems.contains("__ops::config-audit"));
+        assert!(!serialized_mems.contains("__bootstrap__::pattern:x"));
         for m in mems {
             let topic = m["topic"].as_str().unwrap();
             assert!(!topic.starts_with("__"), "ack must not expose reserved entity {topic}");
