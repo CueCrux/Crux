@@ -1314,6 +1314,22 @@ first-class, continuously-dogfooded path. WSL2 specifics are in
 Rust 1.88+, `protobuf-compiler`, then `cargo build --locked --release`. See
 the [README Quickstart](../README.md#quickstart).
 
+#### Cargo feature flags
+
+The default build is the Community Edition daemon. All optional surfaces are
+off by default; enable them with `--features`:
+
+| Feature | Default | What it adds |
+|---|---|---|
+| `hosted-surfaces` | off | Hosted-service HTTP surfaces: the Pro GPU-1 compute bridge (`/v1/gpu1/*`) and the Pro cloud access posture (`GET /v1/cloud/access-contract`). Compiled entirely out of the default Community Edition binary — the routes 404 and their handler code is absent — so a stock build advertises and serves neither. |
+| `wasm-extensions` | off | wasmtime-backed host for `kind: wasm` community extensions. |
+| `otel` | off | OpenTelemetry OTLP export. |
+
+Runtime env flags (e.g. `CORECRUXD_CONTEXT_SURFACE`, `CORECRUXD_QUOTA`) gate
+routes that are always *compiled in* but return 404 until enabled; the
+`hosted-surfaces` cargo feature is different — it removes the routes and
+handlers from the binary at build time.
+
 ## 2. First boot
 
 If you installed a service unit, start it (`systemctl --user enable --now

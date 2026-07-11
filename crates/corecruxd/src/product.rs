@@ -637,6 +637,11 @@ fn hosted_rest_endpoints() -> Vec<RestEndpointContract> {
             local_path: Some("/v1/replay/answers/{answerId}/validity"),
             scopes: vec!["replay:answer"],
         },
+        // GPU-1 local-path pointers name the hosted-surface routes
+        // (`/v1/gpu1/*`) that are compiled out of the default Community Edition
+        // binary (ExecPlan crux-external-findings-remediation M4). Advertise
+        // them only when those routes are actually mounted.
+        #[cfg(feature = "hosted-surfaces")]
         RestEndpointContract {
             name: "gpu1_answer",
             method: "POST",
@@ -644,6 +649,7 @@ fn hosted_rest_endpoints() -> Vec<RestEndpointContract> {
             local_path: Some("/v1/gpu1/answer"),
             scopes: vec!["gpu1:answer"],
         },
+        #[cfg(feature = "hosted-surfaces")]
         RestEndpointContract {
             name: "gpu1_rerank",
             method: "POST",
@@ -651,6 +657,7 @@ fn hosted_rest_endpoints() -> Vec<RestEndpointContract> {
             local_path: Some("/v1/gpu1/rerank"),
             scopes: vec!["gpu1:rerank"],
         },
+        #[cfg(feature = "hosted-surfaces")]
         RestEndpointContract {
             name: "gpu1_enrich",
             method: "POST",
@@ -658,6 +665,7 @@ fn hosted_rest_endpoints() -> Vec<RestEndpointContract> {
             local_path: Some("/v1/gpu1/enrich"),
             scopes: vec!["gpu1:enrich"],
         },
+        #[cfg(feature = "hosted-surfaces")]
         RestEndpointContract {
             name: "gpu1_coverage",
             method: "POST",
@@ -665,6 +673,7 @@ fn hosted_rest_endpoints() -> Vec<RestEndpointContract> {
             local_path: Some("/v1/gpu1/coverage"),
             scopes: vec!["gpu1:coverage"],
         },
+        #[cfg(feature = "hosted-surfaces")]
         RestEndpointContract {
             name: "gpu1_developer",
             method: "POST",

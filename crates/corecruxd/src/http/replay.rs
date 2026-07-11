@@ -128,6 +128,11 @@ pub(super) async fn get_answer_replay_validity(
     .into_response()
 }
 
+// In the default Community Edition binary the only writer of answer-replay
+// capsules is the Pro GPU-1 answer path (`http::gpu1`), which is compiled out
+// (ExecPlan crux-external-findings-remediation M4); the replay READ endpoints
+// remain mounted. Test builds still exercise this writer directly.
+#[cfg_attr(not(feature = "hosted-surfaces"), allow(dead_code))]
 pub(super) async fn store_answer_capsule(state: &AppState, capsule: &AnswerReplayCapsule) -> std::io::Result<()> {
     let mut fact = StoreFact {
         entity: answer_capsule_entity(&capsule.tenant_id, &capsule.answer_id),

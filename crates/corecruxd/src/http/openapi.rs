@@ -179,6 +179,8 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/bootstrap/status", methods: &["GET"], tag: "Bootstrap", auth: "read", summary: "Bootstrap status" },
     RouteEntry { path: "/v1/cases", methods: &["POST"], tag: "Cases", auth: "write", summary: "Cases" },
     RouteEntry { path: "/v1/cases/retrieve", methods: &["POST"], tag: "Cases", auth: "read", summary: "Cases retrieve" },
+    // Hosted-service surface (ExecPlan crux-external-findings-remediation M4): compiled out of CE.
+    #[cfg(feature = "hosted-surfaces")]
     RouteEntry { path: "/v1/cloud/access-contract", methods: &["GET"], tag: "Cloud", auth: "read", summary: "Cloud access contract" },
     RouteEntry { path: "/v1/console/chunks/{chunkDigest}", methods: &["GET"], tag: "Console", auth: "admin-read", summary: "Console chunks {chunkDigest}" },
     RouteEntry { path: "/v1/console/chunks/{chunkDigest}/preview", methods: &["GET"], tag: "Console", auth: "admin-read", summary: "Console chunks {chunkDigest} preview" },
@@ -240,11 +242,18 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/features/capabilities/{id}", methods: &["GET"], tag: "Features", auth: "read", summary: "Features capabilities {id}" },
     RouteEntry { path: "/v1/features/capabilities/{id}/audit", methods: &["POST"], tag: "Features", auth: "write", summary: "Features capabilities {id} audit" },
     RouteEntry { path: "/v1/features/capabilities/{id}/tree", methods: &["GET"], tag: "Features", auth: "read", summary: "Features capabilities {id} tree" },
+    // Hosted-service surface (ExecPlan crux-external-findings-remediation M4): compiled out of CE.
+    #[cfg(feature = "hosted-surfaces")]
     RouteEntry { path: "/v1/gpu1/answer", methods: &["POST"], tag: "GPU1", auth: "feature-gated", summary: "Gpu1 answer" },
+    #[cfg(feature = "hosted-surfaces")]
     RouteEntry { path: "/v1/gpu1/contract", methods: &["GET"], tag: "GPU1", auth: "feature-gated", summary: "Gpu1 contract" },
+    #[cfg(feature = "hosted-surfaces")]
     RouteEntry { path: "/v1/gpu1/coverage", methods: &["POST"], tag: "GPU1", auth: "feature-gated", summary: "Gpu1 coverage" },
+    #[cfg(feature = "hosted-surfaces")]
     RouteEntry { path: "/v1/gpu1/developer", methods: &["POST"], tag: "GPU1", auth: "feature-gated", summary: "Gpu1 developer" },
+    #[cfg(feature = "hosted-surfaces")]
     RouteEntry { path: "/v1/gpu1/enrich", methods: &["POST"], tag: "GPU1", auth: "feature-gated", summary: "Gpu1 enrich" },
+    #[cfg(feature = "hosted-surfaces")]
     RouteEntry { path: "/v1/gpu1/rerank", methods: &["POST"], tag: "GPU1", auth: "feature-gated", summary: "Gpu1 rerank" },
     RouteEntry { path: "/v1/gpus", methods: &["GET"], tag: "Routing", auth: "admin-read", summary: "Gpus" },
     RouteEntry { path: "/v1/identity/candidates", methods: &["GET"], tag: "Identity", auth: "admin-read", summary: "Identity candidates" },

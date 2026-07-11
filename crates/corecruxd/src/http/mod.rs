@@ -13,6 +13,10 @@ mod append;
 mod auth_device;
 mod auth_rails;
 mod cases;
+// Hosted-service HTTP surface (ExecPlan crux-external-findings-remediation M4):
+// Pro cloud access posture (`GET /v1/cloud/access-contract`). Compiled out of
+// the default Community Edition binary; see the `hosted-surfaces` feature.
+#[cfg(feature = "hosted-surfaces")]
 mod cloud;
 mod console;
 mod context_surface;
@@ -28,6 +32,10 @@ mod events;
 mod extensions;
 mod facts;
 mod features;
+// Hosted-service HTTP surface (ExecPlan crux-external-findings-remediation M4):
+// Pro GPU-1 compute bridge (`/v1/gpu1/*`). Compiled out of the default
+// Community Edition binary; see the `hosted-surfaces` feature.
+#[cfg(feature = "hosted-surfaces")]
 mod gpu1;
 mod health;
 mod identity_links;
@@ -408,7 +416,7 @@ pub(crate) fn router_with_route_auth(
         route_auth_mode = route_auth_mode.as_str(),
         "corecruxd route authorization mode"
     );
-    Router::new()
+    let router = Router::new()
         .route("/healthz", get(self::health::healthz))
         .route("/readyz", get(self::health::readyz))
         .route("/metrics", get(self::health::metrics))
@@ -709,7 +717,6 @@ pub(crate) fn router_with_route_auth(
         )
         // Production hardening: version endpoint
         .route("/v1/version", get(self::health::get_version))
-        .route("/v1/cloud/access-contract", get(self::cloud::get_cloud_access_contract))
         .route("/v1/actions/enrich", axum::routing::post(self::actions::post_action_enrich))
         .route("/v1/workbench/contract", get(self::workbench::get_workbench_contract))
         .route("/v1/workbench/brief", get(self::workbench::get_agent_brief))
@@ -743,15 +750,6 @@ pub(crate) fn router_with_route_auth(
         .route(
             "/v1/workbench/policy-simulation",
             axum::routing::post(self::workbench::post_policy_simulation),
-        )
-        .route("/v1/gpu1/contract", get(self::gpu1::get_gpu1_contract))
-        .route("/v1/gpu1/answer", axum::routing::post(self::gpu1::post_gpu1_answer))
-        .route("/v1/gpu1/rerank", axum::routing::post(self::gpu1::post_gpu1_rerank))
-        .route("/v1/gpu1/enrich", axum::routing::post(self::gpu1::post_gpu1_enrich))
-        .route("/v1/gpu1/coverage", axum::routing::post(self::gpu1::post_gpu1_coverage))
-        .route(
-            "/v1/gpu1/developer",
-            axum::routing::post(self::gpu1::post_gpu1_developer),
         )
         // OpenAPI spec
         .route("/v1/openapi.json", get(self::openapi::openapi_json))
@@ -1296,7 +1294,30 @@ pub(crate) fn router_with_route_auth(
         // supplied via an Extension layer (handlers also extract State<AppState>
         // for scope auth), so this adds no field to AppState's ~25 call sites.
         .route("/v1/cases", axum::routing::post(self::cases::record_case))
-        .route("/v1/cases/retrieve", axum::routing::post(self::cases::retrieve_cases))
+        .route("/v1/cases/retrieve", axum::routing::post(self::cases::retrieve_cases));
+
+    // Hosted-service HTTP surfaces (ExecPlan crux-external-findings-remediation
+    // M4): the Pro GPU-1 compute bridge and Pro cloud access posture are mounted
+    // only when built with the `hosted-surfaces` feature, so the default
+    // Community Edition binary carries neither the routes nor their handlers.
+    // Kept as a separate cfg'd block (rather than inline in the chain above) so
+    // the `.route(...)` templates still appear verbatim in this file's source —
+    // the route-auth completeness matrix and the route-spec drift test parse
+    // source text, not the compiled router, and stay green in both configs.
+    #[cfg(feature = "hosted-surfaces")]
+    let router = router
+        .route("/v1/cloud/access-contract", get(self::cloud::get_cloud_access_contract))
+        .route("/v1/gpu1/contract", get(self::gpu1::get_gpu1_contract))
+        .route("/v1/gpu1/answer", axum::routing::post(self::gpu1::post_gpu1_answer))
+        .route("/v1/gpu1/rerank", axum::routing::post(self::gpu1::post_gpu1_rerank))
+        .route("/v1/gpu1/enrich", axum::routing::post(self::gpu1::post_gpu1_enrich))
+        .route("/v1/gpu1/coverage", axum::routing::post(self::gpu1::post_gpu1_coverage))
+        .route(
+            "/v1/gpu1/developer",
+            axum::routing::post(self::gpu1::post_gpu1_developer),
+        );
+
+    router
         .layer(axum::Extension(case_store))
         .layer(middleware::from_fn_with_state(state.clone(), presence_middleware))
         // G20 per-surface request quota (pass-through unless CORECRUXD_QUOTA=1
