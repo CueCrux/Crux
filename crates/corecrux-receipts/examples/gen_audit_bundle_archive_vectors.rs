@@ -3,6 +3,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 //! Generate archive-level Audit Bundle v1 vectors from the unpacked fixtures.
 //!
 //! The JSON/CBOR files under `vectors/audit-bundle-v1/*/` remain the reviewable

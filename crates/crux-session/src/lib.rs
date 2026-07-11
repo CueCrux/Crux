@@ -3,6 +3,9 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
+
 //! VaultCrux Session Handshake v1 — schema-lock crate.
 //!
 //! Implements the canonical CBOR encoder, JSON mirror (RFC 8785 JCS), BLAKE3

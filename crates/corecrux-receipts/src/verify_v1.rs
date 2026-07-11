@@ -355,12 +355,9 @@ pub fn verify_receipt_v1(input: VerifyReceiptInput<'_>) -> Result<VerificationRe
         err_msg = Some(format!(
             "signed_payload_hash mismatch: expected {} got {}",
             hex32(&input.stored_body_payload_hash),
-            if sig.signed_payload_hash.len() == 32 {
-                // SAFETY: Length is checked to be exactly 32 on the line above.
-                #[allow(clippy::unwrap_used)]
-                hex32(sig.signed_payload_hash.as_slice().try_into().unwrap())
-            } else {
-                format!("len({})", sig.signed_payload_hash.len())
+            match <&[u8; 32]>::try_from(sig.signed_payload_hash.as_slice()) {
+                Ok(hash) => hex32(hash),
+                Err(_) => format!("len({})", sig.signed_payload_hash.len()),
             }
         ));
         return Ok(VerificationReportV1 {

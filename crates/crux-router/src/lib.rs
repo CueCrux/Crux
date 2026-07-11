@@ -3,6 +3,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 //! RCX daemon router primitives.
 //!
 //! This crate is deliberately pure for Phase 1: it consumes an
