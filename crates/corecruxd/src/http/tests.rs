@@ -6329,7 +6329,11 @@ async fn version_public_view_is_redacted() {
     assert_eq!(body["product"]["mode"], "free_local");
     assert_eq!(body["product"]["tier"], "free");
     assert_eq!(body["product"]["free_safety_baseline_active"], true);
+    #[cfg(feature = "hosted-surfaces")]
     assert_eq!(body["cloud_access"]["contract_path"], "/v1/cloud/access-contract");
+    // CE: the cloud access-contract route is compiled out, so its pointer is null.
+    #[cfg(not(feature = "hosted-surfaces"))]
+    assert!(body["cloud_access"]["contract_path"].is_null());
     assert_eq!(body["agent_workbench"]["contract_path"], "/v1/workbench/contract");
     assert!(body["product"]["enabled_capability_claims"]
         .as_array()
@@ -6416,10 +6420,18 @@ async fn version_admin_view_includes_operational_details() {
     assert_eq!(body["commit"], "test");
     assert_eq!(body["passport"]["alg"], "ed25519");
     assert_eq!(body["cloud"]["tenant_connectivity"], "not_configured");
+    #[cfg(feature = "hosted-surfaces")]
     assert_eq!(body["cloud_access"]["contract_path"], "/v1/cloud/access-contract");
+    // CE: the cloud access-contract route is compiled out, so its pointer is null.
+    #[cfg(not(feature = "hosted-surfaces"))]
+    assert!(body["cloud_access"]["contract_path"].is_null());
     assert_eq!(body["action_enrichment"]["contract_path"], "/v1/actions/enrich");
     assert_eq!(body["agent_workbench"]["contract_path"], "/v1/workbench/contract");
+    #[cfg(feature = "hosted-surfaces")]
     assert_eq!(body["gpu1_compute"]["contract_path"], "/v1/gpu1/contract");
+    // CE: the GPU-1 compute bridge is compiled out, so its posture block is null.
+    #[cfg(not(feature = "hosted-surfaces"))]
+    assert!(body["gpu1_compute"].is_null());
     assert_eq!(body["update"]["state"], "current");
     assert_eq!(body["update"]["tracking_ref"], "origin/main");
     assert_eq!(body["update"]["current_commit"], "abc123");
@@ -6512,6 +6524,8 @@ async fn version_endpoint_reports_pro_agent_workbench_posture() {
     assert_eq!(body["cloud_access"]["mode_switching_supported"], true);
 }
 
+// Exercises the `http::cloud` handler directly — hosted-surface only (M4).
+#[cfg(feature = "hosted-surfaces")]
 #[serial_test::serial]
 #[tokio::test]
 async fn cloud_access_contract_reports_cloud_only_no_daemon_path() {
@@ -6571,6 +6585,8 @@ async fn cloud_access_contract_reports_cloud_only_no_daemon_path() {
     std::env::remove_var("CORECRUXD_SYNC_API_KEY");
 }
 
+// Exercises the `http::cloud` handler directly — hosted-surface only (M4).
+#[cfg(feature = "hosted-surfaces")]
 #[tokio::test]
 async fn cloud_access_contract_is_visible_in_free_but_not_entitled() {
     let state = test_app_state(16);
@@ -7161,6 +7177,8 @@ async fn workbench_audit_triage_groups_replay_failures() {
         .any(|category| category == "fact_superseded"));
 }
 
+// Drives the `http::cloud` and `http::gpu1` handlers directly — hosted-surface only (M4).
+#[cfg(feature = "hosted-surfaces")]
 #[serial_test::serial]
 #[tokio::test]
 async fn m11_closure_suite_exercises_hybrid_workbench_replay_and_offboarding() {
@@ -7376,6 +7394,8 @@ async fn workbench_policy_simulation_blocks_matching_critical_constraint() {
         .starts_with("workbench:policy_simulation:"));
 }
 
+// Exercises the `http::gpu1` handler directly — hosted-surface only (M4).
+#[cfg(feature = "hosted-surfaces")]
 #[serial_test::serial]
 #[tokio::test]
 async fn gpu1_contract_reports_enabled_degraded_without_endpoint() {
@@ -7407,6 +7427,8 @@ async fn gpu1_contract_reports_enabled_degraded_without_endpoint() {
     }));
 }
 
+// Exercises the `http::gpu1` handler directly — hosted-surface only (M4).
+#[cfg(feature = "hosted-surfaces")]
 #[tokio::test]
 async fn gpu1_answer_requires_enabled_pro_service() {
     let state = test_app_state(16);
@@ -7431,6 +7453,8 @@ async fn gpu1_answer_requires_enabled_pro_service() {
     assert_eq!(body["remote_memory_sync_required"], false);
 }
 
+// Exercises the `http::gpu1` handler directly — hosted-surface only (M4).
+#[cfg(feature = "hosted-surfaces")]
 #[serial_test::serial]
 #[tokio::test]
 async fn gpu1_answer_falls_back_without_endpoint_and_stores_private_receipt() {
@@ -7494,6 +7518,8 @@ async fn gpu1_answer_falls_back_without_endpoint_and_stores_private_receipt() {
     assert_eq!(capsules[0].key, "capsule");
 }
 
+// Uses the `http::gpu1` answer handler to seed the replay capsule — hosted-surface only (M4).
+#[cfg(feature = "hosted-surfaces")]
 #[serial_test::serial]
 #[tokio::test]
 async fn answer_replay_renders_stored_answer_and_validity_detects_superseded_evidence() {
@@ -7682,6 +7708,8 @@ async fn answer_replay_renders_stored_answer_and_validity_detects_superseded_evi
     assert_eq!(validity_body["historical_replay_available"], true);
 }
 
+// Uses the `http::gpu1` answer handler to seed the replay capsule — hosted-surface only (M4).
+#[cfg(feature = "hosted-surfaces")]
 #[serial_test::serial]
 #[tokio::test]
 async fn answer_replay_export_uses_local_capsule_without_dataplane() {
@@ -7733,6 +7761,8 @@ async fn answer_replay_export_uses_local_capsule_without_dataplane() {
     assert!(bytes.starts_with(b"PK"));
 }
 
+// Exercises the `http::gpu1` handler directly — hosted-surface only (M4).
+#[cfg(feature = "hosted-surfaces")]
 #[serial_test::serial]
 #[tokio::test]
 async fn gpu1_coverage_local_fallback_is_deterministic() {
@@ -14768,7 +14798,16 @@ async fn route_auth_enforce_contract_matrix() {
         ("AdminRead", "GET", "/v1/identity/candidates"),
         ("AdminWrite", "POST", "/v1/console/embedding/probe"),
         ("InternalReplication", "POST", "/v1/internal/replication/segments"),
+        // FeatureGated representative. The GPU-1 compute bridge is compiled out
+        // of CE (ExecPlan crux-external-findings-remediation M4), so under the
+        // default build the router has no `/v1/gpu1/*` route and enforce mode
+        // would 403 on the missing MatchedPath even with a sufficient scope.
+        // Use the always-compiled (runtime-flag-gated) `/v1/context` surface as
+        // the CE stand-in; both classify FeatureGated with the same scope set.
+        #[cfg(feature = "hosted-surfaces")]
         ("FeatureGated", "POST", "/v1/gpu1/answer"),
+        #[cfg(not(feature = "hosted-surfaces"))]
+        ("FeatureGated", "GET", "/v1/context"),
     ];
 
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);

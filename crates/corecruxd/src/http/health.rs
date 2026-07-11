@@ -382,6 +382,46 @@ pub(super) fn handle_panic(err: Box<dyn std::any::Any + Send + 'static>) -> Resp
 
 // ── Production hardening: /v1/version endpoint ──────────────────────
 
+/// Route pointer for the Pro cloud access contract, surfaced in the version
+/// payloads. `Null` in the default Community Edition build, where the
+/// `/v1/cloud/access-contract` route and its `http::cloud` handler are compiled
+/// out (ExecPlan crux-external-findings-remediation M4); the real path under
+/// `--features hosted-surfaces`.
+fn cloud_access_contract_path() -> serde_json::Value {
+    #[cfg(feature = "hosted-surfaces")]
+    {
+        serde_json::json!("/v1/cloud/access-contract")
+    }
+    #[cfg(not(feature = "hosted-surfaces"))]
+    {
+        serde_json::Value::Null
+    }
+}
+
+/// GPU-1 compute posture block for the admin version payload. `Null` in the
+/// default Community Edition build, where the Pro GPU-1 compute bridge
+/// (`/v1/gpu1/*`, `http::gpu1`) is compiled out (ExecPlan
+/// crux-external-findings-remediation M4). Populated under
+/// `--features hosted-surfaces`.
+#[cfg(feature = "hosted-surfaces")]
+fn gpu1_compute_view(state: &AppState) -> serde_json::Value {
+    let gpu1_compute = super::gpu1::compute_posture(state);
+    serde_json::json!({
+        "schema": gpu1_compute.schema,
+        "contract_path": "/v1/gpu1/contract",
+        "endpoint_configured": gpu1_compute.endpoint_configured,
+        "api_key_configured": gpu1_compute.api_key_configured,
+        "enabled_services": gpu1_compute.enabled_services,
+        "remote_memory_sync_required": gpu1_compute.remote_memory_sync_required,
+        "payload_policy": gpu1_compute.payload_policy,
+    })
+}
+
+#[cfg(not(feature = "hosted-surfaces"))]
+fn gpu1_compute_view(_state: &AppState) -> serde_json::Value {
+    serde_json::Value::Null
+}
+
 #[utoipa::path(
     get,
     path = "/v1/version",
@@ -434,7 +474,7 @@ pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoRespo
         "product": product,
         "cloud_access": {
             "schema": cloud_access.schema,
-            "contract_path": "/v1/cloud/access-contract",
+            "contract_path": cloud_access_contract_path(),
             "cloud_only_entitled": cloud_access.cloud_only_entitled,
             "cloud_only_active": cloud_access.cloud_only_active,
             "local_daemon_required_for_current_mode": cloud_access.local_daemon_required_for_current_mode,
@@ -475,7 +515,6 @@ pub(super) async fn get_admin_version(State(state): State<AppState>, headers: He
         crate::product::CloudAccessContract::new(state.operating_mode, &state.enabled_pro_services, &cloud);
     let action_enrichment = super::actions::action_enrichment_posture(&state);
     let agent_workbench = super::workbench::workbench_posture(&state);
-    let gpu1_compute = super::gpu1::compute_posture(&state);
     let (embeddings_enabled, semantic_profile) = {
         let store = state.fact_store.read().await;
         (store.embeddings_enabled(), store.semantic_profile())
@@ -500,7 +539,7 @@ pub(super) async fn get_admin_version(State(state): State<AppState>, headers: He
         "cloud": cloud,
         "cloud_access": {
             "schema": cloud_access.schema,
-            "contract_path": "/v1/cloud/access-contract",
+            "contract_path": cloud_access_contract_path(),
             "cloud_only_entitled": cloud_access.cloud_only_entitled,
             "cloud_only_active": cloud_access.cloud_only_active,
             "local_daemon_required_for_current_mode": cloud_access.local_daemon_required_for_current_mode,
@@ -508,15 +547,7 @@ pub(super) async fn get_admin_version(State(state): State<AppState>, headers: He
         },
         "action_enrichment": action_enrichment,
         "agent_workbench": agent_workbench,
-        "gpu1_compute": {
-            "schema": gpu1_compute.schema,
-            "contract_path": "/v1/gpu1/contract",
-            "endpoint_configured": gpu1_compute.endpoint_configured,
-            "api_key_configured": gpu1_compute.api_key_configured,
-            "enabled_services": gpu1_compute.enabled_services,
-            "remote_memory_sync_required": gpu1_compute.remote_memory_sync_required,
-            "payload_policy": gpu1_compute.payload_policy,
-        },
+        "gpu1_compute": gpu1_compute_view(&state),
         "semantic_profile": semantic_profile,
         "protocol_contracts": protocol_contracts,
         "features": {

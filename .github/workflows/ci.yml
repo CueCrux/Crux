@@ -176,6 +176,16 @@ jobs:
         run: bash scripts/ci-cargo-with-fallback.sh test -p corecruxd route_auth
       - name: HTTP boundary smoke contracts
         run: bash scripts/ci-cargo-with-fallback.sh test -p corecruxd http_boundary_contracts
+      # ExecPlan crux-external-findings-remediation M4: the hosted-service HTTP
+      # surfaces (`/v1/gpu1/*`, `/v1/cloud/access-contract`) are compiled OUT of
+      # the default Community Edition build (the `hosted-surfaces` feature is
+      # OFF by default). `cargo test --workspace` above already exercises the
+      # full suite in that default OFF config; here we only need a cheap `check`
+      # that the ON config still compiles, so a route regression that skips the
+      # feature gate is caught. (A full `test --features hosted-surfaces` was
+      # run locally and passes; kept out of CI to hold the critical path down.)
+      - name: Hosted-surfaces feature compiles
+        run: bash scripts/ci-cargo-with-fallback.sh check -p corecruxd --features hosted-surfaces
       # `cargo test --workspace` (next step) already covers
       # `crux-integrations::community_packs`; the explicit invocation here
       # was duplicating that target's execution. Drop it.

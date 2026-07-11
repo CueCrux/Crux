@@ -19,6 +19,12 @@ otel = [
 # only use Phase A external-tool extensions don't pay the wasmtime build
 # cost (~30s cold + ~60MB binary growth).
 wasm-extensions = ["dep:wasmtime"]
+# ExecPlan crux-external-findings-remediation M4: hosted-service HTTP surfaces
+# — the Pro GPU-1 compute bridge (`/v1/gpu1/*`, `src/http/gpu1.rs`) and the Pro
+# cloud access posture (`GET /v1/cloud/access-contract`, `src/http/cloud.rs`) —
+# are compiled OUT of the default Community Edition binary. OFF by default;
+# NOT part of any default feature list. Enable to build the hosted daemon.
+hosted-surfaces = []
 
 [dependencies]
 axum = { workspace = true }
