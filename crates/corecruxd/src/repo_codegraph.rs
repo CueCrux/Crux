@@ -100,7 +100,7 @@ pub(crate) async fn maybe_emit_codegraph_edges(
     repo_id: &str,
     scan: &WorkspaceScan,
 ) -> Result<Option<CodeGraphEmitReport>, CodeGraphError> {
-    if !enabled_from_env() {
+    if !enabled_from_env() && !external_enabled_from_env() {
         return Ok(None);
     }
     let mut store = fact_store.write().await;
@@ -116,6 +116,7 @@ pub(crate) fn emit_codegraph_edges(
     repo_id: &str,
     scan: &WorkspaceScan,
 ) -> Result<CodeGraphEmitReport, CodeGraphError> {
+    let intra_enabled = enabled_from_env();
     let external_enabled = external_enabled_from_env();
     let mut id_store = load_id_store(store, tenant_id, repo_id)?;
     if id_store.next_id == 0 {
@@ -138,15 +139,23 @@ pub(crate) fn emit_codegraph_edges(
     let mut file_ids = BTreeMap::new();
     let mut symbol_ids = BTreeMap::new();
 
-    for file in &scan.files {
-        let key = file_key(&file.rel_path);
-        let id = allocate_id(&mut id_store, &mut used_ids, key.clone());
-        file_ids.insert(file.rel_path.clone(), id);
-    }
-    for symbol in &scan.symbols {
-        let key = symbol_key(&symbol.file_rel_path, &symbol.name);
-        let id = allocate_id(&mut id_store, &mut used_ids, key.clone());
-        symbol_ids.insert((symbol.file_rel_path.clone(), symbol.name.clone()), id);
+    if intra_enabled {
+        for file in &scan.files {
+            let key = file_key(&file.rel_path);
+            let id = allocate_id(&mut id_store, &mut used_ids, key.clone());
+            file_ids.insert(file.rel_path.clone(), id);
+        }
+        for symbol in &scan.symbols {
+            let key = symbol_key(&symbol.file_rel_path, &symbol.name);
+            let id = allocate_id(&mut id_store, &mut used_ids, key.clone());
+            symbol_ids.insert((symbol.file_rel_path.clone(), symbol.name.clone()), id);
+        }
+    } else if external_enabled {
+        for rel_path in crate_root_file_paths(scan).values() {
+            let key = file_key(rel_path);
+            let id = allocate_id(&mut id_store, &mut used_ids, key.clone());
+            file_ids.insert(rel_path.clone(), id);
+        }
     }
 
     let external_deps = if external_enabled {
@@ -182,94 +191,99 @@ pub(crate) fn emit_codegraph_edges(
         ids_by_key,
         ..CodeGraphEmitReport::default()
     };
-    let file_by_rel: BTreeMap<&str, &FileInfo> = scan.files.iter().map(|file| (file.rel_path.as_str(), file)).collect();
     let mut records = Vec::new();
 
-    for symbol in &scan.symbols {
-        let Some(from_id) = file_ids.get(&symbol.file_rel_path).copied() else {
-            continue;
-        };
-        let Some(to_id) = symbol_ids
-            .get(&(symbol.file_rel_path.clone(), symbol.name.clone()))
-            .copied()
-        else {
-            continue;
-        };
-        records.push(relation_record(
-            tenant_id,
-            from_id,
-            to_id,
-            RelationTypeV1::Defines,
-            10_000,
-            now,
-        ));
-        report.defines += 1;
-    }
-
-    for file in &scan.files {
-        let Some(from_file_id) = file_ids.get(&file.rel_path).copied() else {
-            continue;
-        };
-        for reference in &file.references {
+    if intra_enabled {
+        let file_by_rel: BTreeMap<&str, &FileInfo> =
+            scan.files.iter().map(|file| (file.rel_path.as_str(), file)).collect();
+        for symbol in &scan.symbols {
+            let Some(from_id) = file_ids.get(&symbol.file_rel_path).copied() else {
+                continue;
+            };
             let Some(to_id) = symbol_ids
-                .get(&(reference.to_file.clone(), reference.to_symbol.clone()))
+                .get(&(symbol.file_rel_path.clone(), symbol.name.clone()))
                 .copied()
             else {
                 continue;
             };
-            let from_id = reference
-                .from_symbol
-                .as_ref()
-                .and_then(|name| symbol_ids.get(&(file.rel_path.clone(), name.clone())).copied())
-                .unwrap_or(from_file_id);
             records.push(relation_record(
                 tenant_id,
                 from_id,
                 to_id,
-                RelationTypeV1::Calls,
-                call_confidence_bp(reference.call_count),
+                RelationTypeV1::Defines,
+                10_000,
                 now,
             ));
-            report.calls += 1;
+            report.defines += 1;
         }
-    }
 
-    for dep in &scan.deps {
-        let Some(from_id) = file_ids.get(&dep.from_file).copied() else {
-            continue;
-        };
-        let Some(to_id) = resolve_dep_target_file(dep, &file_ids, &file_by_rel) else {
-            continue;
-        };
-        records.push(relation_record(
-            tenant_id,
-            from_id,
-            to_id,
-            RelationTypeV1::Imports,
-            8_000,
-            now,
-        ));
-        report.imports += 1;
-    }
+        for file in &scan.files {
+            let Some(from_file_id) = file_ids.get(&file.rel_path).copied() else {
+                continue;
+            };
+            for reference in &file.references {
+                let Some(to_id) = symbol_ids
+                    .get(&(reference.to_file.clone(), reference.to_symbol.clone()))
+                    .copied()
+                else {
+                    continue;
+                };
+                let from_id = reference
+                    .from_symbol
+                    .as_ref()
+                    .and_then(|name| symbol_ids.get(&(file.rel_path.clone(), name.clone())).copied())
+                    .unwrap_or(from_file_id);
+                records.push(relation_record(
+                    tenant_id,
+                    from_id,
+                    to_id,
+                    RelationTypeV1::Calls,
+                    call_confidence_bp(reference.call_count),
+                    now,
+                ));
+                report.calls += 1;
+            }
+        }
 
-    let crate_roots = crate_root_files(scan, &file_ids);
-    for krate in &scan.crates {
-        let Some(from_id) = crate_roots.get(&krate.name).copied() else {
-            continue;
-        };
-        for dep_name in &krate.internal_deps {
-            let Some(to_id) = crate_roots.get(dep_name).copied() else {
+        for dep in &scan.deps {
+            let Some(from_id) = file_ids.get(&dep.from_file).copied() else {
+                continue;
+            };
+            let Some(to_id) = resolve_dep_target_file(dep, &file_ids, &file_by_rel) else {
                 continue;
             };
             records.push(relation_record(
                 tenant_id,
                 from_id,
                 to_id,
-                RelationTypeV1::DependsOn,
-                7_000,
+                RelationTypeV1::Imports,
+                8_000,
                 now,
             ));
-            report.depends_on += 1;
+            report.imports += 1;
+        }
+    }
+
+    let crate_roots = crate_root_files(scan, &file_ids);
+    if intra_enabled {
+        for krate in &scan.crates {
+            let Some(from_id) = crate_roots.get(&krate.name).copied() else {
+                continue;
+            };
+            for dep_name in &krate.internal_deps {
+                let Some(to_id) = crate_roots.get(dep_name).copied() else {
+                    continue;
+                };
+                records.push(relation_record(
+                    tenant_id,
+                    from_id,
+                    to_id,
+                    RelationTypeV1::DependsOn,
+                    7_000,
+                    now,
+                ));
+                report.depends_on += 1;
+            }
         }
     }
 
@@ -670,7 +684,7 @@ fn has_supported_extension(path: &str) -> bool {
         .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "rs" | "ts" | "tsx" | "py" | "vue"))
 }
 
-fn crate_root_files(scan: &WorkspaceScan, file_ids: &BTreeMap<String, u32>) -> BTreeMap<String, u32> {
+fn crate_root_file_paths(scan: &WorkspaceScan) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for krate in &scan.crates {
         let mut candidates: Vec<_> = scan.files.iter().filter(|file| file.crate_name == krate.name).collect();
@@ -683,12 +697,17 @@ fn crate_root_files(scan: &WorkspaceScan, file_ids: &BTreeMap<String, u32>) -> B
             )
         });
         if let Some(file) = candidates.first() {
-            if let Some(id) = file_ids.get(&file.rel_path).copied() {
-                out.insert(krate.name.clone(), id);
-            }
+            out.insert(krate.name.clone(), file.rel_path.clone());
         }
     }
     out
+}
+
+fn crate_root_files(scan: &WorkspaceScan, file_ids: &BTreeMap<String, u32>) -> BTreeMap<String, u32> {
+    crate_root_file_paths(scan)
+        .into_iter()
+        .filter_map(|(name, rel_path)| file_ids.get(&rel_path).copied().map(|id| (name, id)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -797,6 +816,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn emits_defines_and_calls_into_graph_expand() {
+        let _edges = EnvVarGuard::set(CODEGRAPH_ENV, "1");
         let _external = EnvVarGuard::unset(CODEGRAPH_EXTERNAL_ENV);
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut store = FactStore::new();
@@ -852,6 +872,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn interner_reuses_ids_across_scans() {
+        let _edges = EnvVarGuard::set(CODEGRAPH_ENV, "1");
         let _external = EnvVarGuard::unset(CODEGRAPH_EXTERNAL_ENV);
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut store = FactStore::new();
@@ -883,6 +904,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn new_edge_types_replay_from_relations_jsonl() {
+        let _edges = EnvVarGuard::set(CODEGRAPH_ENV, "1");
         let _external = EnvVarGuard::unset(CODEGRAPH_EXTERNAL_ENV);
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut store = FactStore::new();
@@ -914,6 +936,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn shared_pkg_id_reaches_both_repos_through_reverse_expand() {
+        let _edges = EnvVarGuard::unset(CODEGRAPH_ENV);
         let _external = EnvVarGuard::set(CODEGRAPH_EXTERNAL_ENV, "1");
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut store = FactStore::new();
@@ -1085,6 +1108,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn emit_appends_records_before_applying_projection_edges() {
+        let _edges = EnvVarGuard::set(CODEGRAPH_ENV, "1");
         let _external = EnvVarGuard::unset(CODEGRAPH_EXTERNAL_ENV);
         let data_file = tempfile::NamedTempFile::new().expect("data file");
         let mut store = FactStore::new();
@@ -1154,6 +1178,69 @@ mod tests {
         assert_eq!(with.external_pkgs, 1);
         assert_eq!(with.external_edges, 1);
         assert!(with.ids_by_key.contains_key(&pkg_key("npm", "express")));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn external_only_maybe_emit_emits_only_repo_and_pkg_edges() {
+        let _edges = EnvVarGuard::unset(CODEGRAPH_ENV);
+        let _external_emit = EnvVarGuard::set(CODEGRAPH_EXTERNAL_ENV, "1");
+        let _scan_deps = EnvVarGuard::set("CORECRUXD_EXTERNAL_DEPS", "1");
+        let fixture = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            fixture.path().join("package.json"),
+            r#"{"dependencies":{"express":"^4.18.0"}}"#,
+        )
+        .expect("package json");
+        let mut scan = sample_scan();
+        crate::workspace_scan_manifests::attach_external_deps_if_enabled(fixture.path(), &mut scan);
+        assert!(!scan.external_deps.is_empty());
+
+        let tmp = tempfile::tempdir().expect("data dir");
+        let fact_store = Arc::new(RwLock::new(FactStore::new()));
+        let projection = Arc::new(RwLock::new(ProjectionState::default()));
+        let report =
+            maybe_emit_codegraph_edges(&fact_store, &projection, tmp.path(), "tenant-t", "repo-external", &scan)
+                .await
+                .expect("maybe emit")
+                .expect("external enabled");
+
+        assert_eq!(report.defines, 1);
+        assert_eq!(report.calls, 0);
+        assert_eq!(report.imports, 0);
+        assert_eq!(report.depends_on, 0);
+        assert_eq!(report.repo_roots, 1);
+        assert_eq!(report.external_pkgs, 1);
+        assert_eq!(report.external_edges, 1);
+        assert!(!report.ids_by_key.contains_key(&file_key("src/target.rs")));
+        assert!(!report.ids_by_key.contains_key(&symbol_key("src/lib.rs", "caller")));
+        assert!(!report.ids_by_key.contains_key(&symbol_key("src/target.rs", "target")));
+
+        let repo_root_id = report.ids_by_key[&repo_key("repo-external")];
+        let crate_root_id = report.ids_by_key[&file_key("src/lib.rs")];
+        let pkg_id = report.ids_by_key[&pkg_key("npm", "express")];
+        let records_jsonl = std::fs::read_to_string(tmp.path().join("relations.jsonl")).expect("relations jsonl");
+        let records: Vec<crate::relations::RelationRecord> = records_jsonl
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("relation record"))
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(projection.read().await.relations.len(), 2);
+        assert!(records.iter().any(|record| {
+            record.from_id == repo_root_id
+                && record.to_id == crate_root_id
+                && record.edge_type == RelationTypeV1::Defines.as_engine_str()
+        }));
+        assert!(records.iter().any(|record| {
+            record.from_id == repo_root_id
+                && record.to_id == pkg_id
+                && record.edge_type == RelationTypeV1::DependsOn.as_engine_str()
+        }));
+        assert!(records.iter().all(|record| {
+            record.from_id == repo_root_id
+                && ((record.to_id == crate_root_id && record.edge_type == RelationTypeV1::Defines.as_engine_str())
+                    || (record.to_id == pkg_id && record.edge_type == RelationTypeV1::DependsOn.as_engine_str()))
+        }));
     }
 
     #[tokio::test]
