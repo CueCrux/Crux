@@ -179,8 +179,9 @@ pub struct PolicySnapshot {
     pub share_overrides: Vec<String>,
 }
 
-/// In-place enforcer — call this immediately before `FactStore::store(fact)`.
-/// If the entity is covered by the policy, sets `private=true`.
+/// In-place enforcer used by `FactStore` before persistence. Callers may also
+/// apply it earlier as defence in depth. If the entity is covered by the
+/// policy, sets `private=true`.
 pub fn enforce(policy: &PrivacyPolicy, fact: &mut StoreFact) {
     if policy.is_always_private(&fact.entity) {
         fact.private = true;

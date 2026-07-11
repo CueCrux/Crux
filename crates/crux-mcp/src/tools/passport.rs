@@ -666,6 +666,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn issue_passport_is_born_private() {
+        let ctx = test_ctx();
+        let alice = alice_ctx(&ctx);
+
+        handle_issue_passport(&json!({}), &alice).await.unwrap();
+
+        let store = alice.fact_store.read().await;
+        let fact_id = store
+            .all_facts()
+            .find(|fact| fact.entity == "__passport__::alice" && fact.key == "passport")
+            .map(|fact| fact.fact_id.clone())
+            .expect("passport handler should persist a passport fact");
+        let fact = store.get(&fact_id).expect("persisted passport fact should be readable");
+        assert!(fact.private, "passport facts must be private from their first write");
+    }
+
+    #[tokio::test]
     async fn issue_passport_with_sponsor() {
         let ctx = test_ctx();
         let alice = alice_ctx(&ctx);
