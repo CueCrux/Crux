@@ -16,6 +16,9 @@ use crate::workspace_scan::{
 };
 
 const POLYGLOT_V2_ENV: &str = "CORECRUXD_POLYGLOT_V2";
+pub(crate) const POLYGLOT_AST_MAX_DEPTH: usize = 512;
+pub(crate) const POLYGLOT_JS_MAX_BYTES: usize = 1024 * 1024;
+pub(crate) const POLYGLOT_JS_MAX_LINE_BYTES: usize = 10_000;
 
 #[derive(Debug, Clone, Copy)]
 struct PolyglotScanOptions {
@@ -64,6 +67,7 @@ struct ExtractedFile {
     deps: Vec<DepEdge>,
     calls: Vec<CallSite>,
     routes: Vec<RouteCandidate>,
+    ast_depth_limit_hits: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +94,21 @@ struct RouteCandidate {
 enum RouteHandler {
     Named(String),
     Inline,
+}
+
+#[derive(Debug, Default)]
+struct AstWalkGuard {
+    depth_limit_hits: usize,
+}
+
+impl AstWalkGuard {
+    fn allow_depth(&mut self, depth: usize) -> bool {
+        if depth <= POLYGLOT_AST_MAX_DEPTH {
+            return true;
+        }
+        self.depth_limit_hits += 1;
+        false
+    }
 }
 
 pub(crate) fn run_repo_scan_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
@@ -280,6 +299,9 @@ fn extract_file(
 ) -> Result<Option<ExtractedFile>, ScanError> {
     let src = std::fs::read_to_string(abs).unwrap_or_default();
     let rel_path = rel_string(root, abs);
+    if should_skip_pathological_v2_js(&rel_path, &src, options) {
+        return Ok(None);
+    }
     let loc = src.lines().count();
     let (doc_full, doc_summary) = parse_file_doc_header(&src);
     let is_test_file = crate::workspace_scan::looks_like_test_file(&rel_path, &src)
@@ -304,24 +326,72 @@ fn extract_file(
         deps: Vec::new(),
         calls: Vec::new(),
         routes: Vec::new(),
+        ast_depth_limit_hits: 0,
     };
+    let mut guard = AstWalkGuard::default();
 
     match lang {
-        LanguageKind::Rust => extract_rust_file(&src, &mut file),
-        LanguageKind::TypeScript => extract_ts_block(&src, 0, false, &mut file, options)?,
-        LanguageKind::Tsx => extract_ts_block(&src, 0, true, &mut file, options)?,
-        LanguageKind::Python => extract_python_file(&src, &mut file, options)?,
+        LanguageKind::Rust => extract_rust_file(&src, &mut file, &mut guard),
+        LanguageKind::TypeScript => extract_ts_block(&src, 0, false, &mut file, options, &mut guard)?,
+        LanguageKind::Tsx => extract_ts_block(&src, 0, true, &mut file, options, &mut guard)?,
+        LanguageKind::Python => extract_python_file(&src, &mut file, options, &mut guard)?,
         LanguageKind::Vue => {
             for block in vue_script_blocks(&src) {
-                extract_ts_block(&block.text, block.start_line_offset, false, &mut file, options)?;
+                extract_ts_block(
+                    &block.text,
+                    block.start_line_offset,
+                    false,
+                    &mut file,
+                    options,
+                    &mut guard,
+                )?;
             }
         }
-        LanguageKind::Go => extract_go_file(&src, &mut file, options)?,
+        LanguageKind::Go => extract_go_file(&src, &mut file, options, &mut guard)?,
+    }
+    file.ast_depth_limit_hits = guard.depth_limit_hits;
+    if file.ast_depth_limit_hits > 0 {
+        tracing::warn!(
+            file = %file.rel_path,
+            max_depth = POLYGLOT_AST_MAX_DEPTH,
+            depth_limit_hits = file.ast_depth_limit_hits,
+            "polyglot ast walk depth limit reached; stopped descending"
+        );
     }
     Ok(Some(file))
 }
 
-fn extract_rust_file(src: &str, file: &mut ExtractedFile) {
+fn should_skip_pathological_v2_js(rel_path: &str, src: &str, options: PolyglotScanOptions) -> bool {
+    if !options.v2_enabled || !is_v2_js_path(rel_path) {
+        return false;
+    }
+    let byte_len = src.len();
+    let longest_line = src.lines().map(str::len).max().unwrap_or(0);
+    if byte_len <= POLYGLOT_JS_MAX_BYTES && longest_line <= POLYGLOT_JS_MAX_LINE_BYTES {
+        return false;
+    }
+    tracing::warn!(
+        file = %rel_path,
+        bytes = byte_len,
+        max_bytes = POLYGLOT_JS_MAX_BYTES,
+        longest_line_bytes = longest_line,
+        max_line_bytes = POLYGLOT_JS_MAX_LINE_BYTES,
+        "polyglot v2 js file skipped before parsing"
+    );
+    true
+}
+
+fn is_v2_js_path(path: &str) -> bool {
+    matches!(
+        Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or_default(),
+        "js" | "jsx" | "mjs" | "cjs"
+    )
+}
+
+fn extract_rust_file(src: &str, file: &mut ExtractedFile, guard: &mut AstWalkGuard) {
     let Ok(parsed) = syn::parse_file(src) else {
         return;
     };
@@ -370,7 +440,7 @@ fn extract_rust_file(src: &str, file: &mut ExtractedFile) {
                 is_pub(&c.vis),
             ),
             syn::Item::Use(u) => {
-                for raw in rust_use_paths(&u.tree) {
+                for raw in rust_use_paths(&u.tree, guard) {
                     file.deps.push(DepEdge {
                         from_crate: file.package_name.clone(),
                         from_file: file.rel_path.clone(),
@@ -384,11 +454,21 @@ fn extract_rust_file(src: &str, file: &mut ExtractedFile) {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct TsWalkContext<'a> {
-    src: &'a [u8],
+#[derive(Debug)]
+struct TsWalkContext<'src, 'guard> {
+    src: &'src [u8],
     line_offset: usize,
     options: PolyglotScanOptions,
+    guard: &'guard mut AstWalkGuard,
+}
+
+#[derive(Debug, Clone)]
+struct TsWalkState {
+    current_fn: Option<String>,
+    exported: bool,
+    controller_prefix: Option<String>,
+    top_level: bool,
+    depth: usize,
 }
 
 fn extract_ts_block(
@@ -397,6 +477,7 @@ fn extract_ts_block(
     tsx: bool,
     file: &mut ExtractedFile,
     options: PolyglotScanOptions,
+    guard: &mut AstWalkGuard,
 ) -> Result<(), ScanError> {
     let mut parser = Parser::new();
     let language = if tsx {
@@ -411,33 +492,40 @@ fn extract_ts_block(
         return Ok(());
     };
     let bytes = src.as_bytes();
-    let ctx = TsWalkContext {
+    let mut ctx = TsWalkContext {
         src: bytes,
         line_offset,
         options,
+        guard,
     };
-    walk_ts_node(tree.root_node(), ctx, file, None, false, None, true);
+    walk_ts_node(
+        tree.root_node(),
+        &mut ctx,
+        file,
+        TsWalkState {
+            current_fn: None,
+            exported: false,
+            controller_prefix: None,
+            top_level: true,
+            depth: 0,
+        },
+    );
     Ok(())
 }
 
-fn walk_ts_node(
-    node: Node<'_>,
-    ctx: TsWalkContext<'_>,
-    file: &mut ExtractedFile,
-    current_fn: Option<String>,
-    exported: bool,
-    controller_prefix: Option<String>,
-    top_level: bool,
-) {
+fn walk_ts_node(node: Node<'_>, ctx: &mut TsWalkContext<'_, '_>, file: &mut ExtractedFile, state: TsWalkState) {
+    if !ctx.guard.allow_depth(state.depth) {
+        return;
+    }
     let src = ctx.src;
     let line_offset = ctx.line_offset;
     let options = ctx.options;
     let kind = node.kind();
-    let is_export = exported || kind == "export_statement";
+    let is_export = state.exported || kind == "export_statement";
     match kind {
         "function_declaration" | "function_signature" => {
             if let Some(name) = field_ident(node, src, "name") {
-                if top_level {
+                if state.top_level {
                     push_local_binding(file, &name, line_offset + node.start_position().row + 1);
                 }
                 push_symbol(
@@ -447,7 +535,18 @@ fn walk_ts_node(
                     line_offset + node.start_position().row + 1,
                     is_export || !name.starts_with('_'),
                 );
-                walk_children(node, ctx, file, Some(name), is_export, controller_prefix, false);
+                walk_children(
+                    node,
+                    ctx,
+                    file,
+                    TsWalkState {
+                        current_fn: Some(name),
+                        exported: is_export,
+                        controller_prefix: state.controller_prefix,
+                        top_level: false,
+                        depth: state.depth + 1,
+                    },
+                );
                 return;
             }
         }
@@ -461,9 +560,20 @@ fn walk_ts_node(
                     is_export || !name.starts_with('_'),
                 );
                 if options.v2_enabled && !file.is_test_file {
-                    collect_nest_routes(node, src, line_offset, file, controller_prefix.as_deref(), &name);
+                    collect_nest_routes(node, src, line_offset, file, state.controller_prefix.as_deref(), &name);
                 }
-                walk_children(node, ctx, file, Some(name), is_export, controller_prefix, false);
+                walk_children(
+                    node,
+                    ctx,
+                    file,
+                    TsWalkState {
+                        current_fn: Some(name),
+                        exported: is_export,
+                        controller_prefix: state.controller_prefix,
+                        top_level: false,
+                        depth: state.depth + 1,
+                    },
+                );
                 return;
             }
         }
@@ -478,11 +588,22 @@ fn walk_ts_node(
                 );
             }
             let nested_controller_prefix = if options.v2_enabled {
-                nest_controller_prefix(node, src).or(controller_prefix)
+                nest_controller_prefix(node, src).or(state.controller_prefix)
             } else {
-                controller_prefix
+                state.controller_prefix
             };
-            walk_children(node, ctx, file, current_fn, is_export, nested_controller_prefix, false);
+            walk_children(
+                node,
+                ctx,
+                file,
+                TsWalkState {
+                    current_fn: state.current_fn,
+                    exported: is_export,
+                    controller_prefix: nested_controller_prefix,
+                    top_level: false,
+                    depth: state.depth + 1,
+                },
+            );
             return;
         }
         "interface_declaration" => {
@@ -508,8 +629,8 @@ fn walk_ts_node(
             }
         }
         "lexical_declaration" | "variable_declaration" => {
-            let declared_names = ts_declared_names(node, src);
-            if top_level {
+            let declared_names = ts_declared_names(node, src, ctx.guard, state.depth + 1);
+            if state.top_level {
                 for name in &declared_names {
                     push_local_binding(file, name, line_offset + node.start_position().row + 1);
                 }
@@ -519,11 +640,22 @@ fn walk_ts_node(
                     push_symbol(file, "const", &name, line_offset + node.start_position().row + 1, true);
                 }
             }
-            walk_children(node, ctx, file, current_fn, is_export, controller_prefix, false);
+            walk_children(
+                node,
+                ctx,
+                file,
+                TsWalkState {
+                    current_fn: state.current_fn,
+                    exported: is_export,
+                    controller_prefix: state.controller_prefix,
+                    top_level: false,
+                    depth: state.depth + 1,
+                },
+            );
             return;
         }
         "import_statement" => {
-            if let Some(module) = quoted_child_text(node, src) {
+            if let Some(module) = quoted_child_text(node, src, ctx.guard, state.depth + 1) {
                 file.deps.push(DepEdge {
                     from_crate: file.package_name.clone(),
                     from_file: file.rel_path.clone(),
@@ -538,7 +670,7 @@ fn walk_ts_node(
                 if !name.is_empty() {
                     file.calls.push(CallSite {
                         name: name.clone(),
-                        from_symbol: current_fn.clone(),
+                        from_symbol: state.current_fn.clone(),
                     });
                 }
                 if options.v2_enabled && name == "require" {
@@ -553,47 +685,42 @@ fn walk_ts_node(
                 }
             }
             if options.v2_enabled && !file.is_test_file {
-                collect_ts_express_route(node, src, line_offset, file);
+                collect_ts_express_route(node, src, line_offset, file, ctx.guard, state.depth + 1);
             }
         }
         _ => {}
     }
-    let child_top_level = top_level && matches!(kind, "program" | "export_statement");
+    let child_top_level = state.top_level && matches!(kind, "program" | "export_statement");
     walk_children(
         node,
         ctx,
         file,
-        current_fn,
-        is_export,
-        controller_prefix,
-        child_top_level,
+        TsWalkState {
+            current_fn: state.current_fn,
+            exported: is_export,
+            controller_prefix: state.controller_prefix,
+            top_level: child_top_level,
+            depth: state.depth + 1,
+        },
     );
 }
 
-fn walk_children(
-    node: Node<'_>,
-    ctx: TsWalkContext<'_>,
-    file: &mut ExtractedFile,
-    current_fn: Option<String>,
-    exported: bool,
-    controller_prefix: Option<String>,
-    top_level: bool,
-) {
+fn walk_children(node: Node<'_>, ctx: &mut TsWalkContext<'_, '_>, file: &mut ExtractedFile, state: TsWalkState) {
+    if !ctx.guard.allow_depth(state.depth) {
+        return;
+    }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk_ts_node(
-            child,
-            ctx,
-            file,
-            current_fn.clone(),
-            exported,
-            controller_prefix.clone(),
-            top_level,
-        );
+        walk_ts_node(child, ctx, file, state.clone());
     }
 }
 
-fn extract_python_file(src: &str, file: &mut ExtractedFile, options: PolyglotScanOptions) -> Result<(), ScanError> {
+fn extract_python_file(
+    src: &str,
+    file: &mut ExtractedFile,
+    options: PolyglotScanOptions,
+    guard: &mut AstWalkGuard,
+) -> Result<(), ScanError> {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_python::LANGUAGE.into())
@@ -602,7 +729,7 @@ fn extract_python_file(src: &str, file: &mut ExtractedFile, options: PolyglotSca
         return Ok(());
     };
     let bytes = src.as_bytes();
-    walk_py_node(tree.root_node(), bytes, file, None, options);
+    walk_py_node(tree.root_node(), bytes, file, None, options, guard, 0);
     Ok(())
 }
 
@@ -612,17 +739,22 @@ fn walk_py_node(
     file: &mut ExtractedFile,
     current_fn: Option<String>,
     options: PolyglotScanOptions,
+    guard: &mut AstWalkGuard,
+    depth: usize,
 ) {
+    if !guard.allow_depth(depth) {
+        return;
+    }
     match node.kind() {
         "decorated_definition" => {
             if options.v2_enabled && !file.is_test_file {
-                collect_python_routes(node, src, file);
+                collect_python_routes(node, src, file, guard, depth + 1);
             }
         }
         "function_definition" => {
             if let Some(name) = field_ident(node, src, "name") {
                 push_symbol(file, "fn", &name, node.start_position().row + 1, !name.starts_with('_'));
-                walk_py_children(node, src, file, Some(name), options);
+                walk_py_children(node, src, file, Some(name), options, guard, depth + 1);
                 return;
             }
         }
@@ -664,7 +796,7 @@ fn walk_py_node(
         }
         _ => {}
     }
-    walk_py_children(node, src, file, current_fn, options);
+    walk_py_children(node, src, file, current_fn, options, guard, depth + 1);
 }
 
 fn walk_py_children(
@@ -673,14 +805,24 @@ fn walk_py_children(
     file: &mut ExtractedFile,
     current_fn: Option<String>,
     options: PolyglotScanOptions,
+    guard: &mut AstWalkGuard,
+    depth: usize,
 ) {
+    if !guard.allow_depth(depth) {
+        return;
+    }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk_py_node(child, src, file, current_fn.clone(), options);
+        walk_py_node(child, src, file, current_fn.clone(), options, guard, depth);
     }
 }
 
-fn extract_go_file(src: &str, file: &mut ExtractedFile, options: PolyglotScanOptions) -> Result<(), ScanError> {
+fn extract_go_file(
+    src: &str,
+    file: &mut ExtractedFile,
+    options: PolyglotScanOptions,
+    guard: &mut AstWalkGuard,
+) -> Result<(), ScanError> {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_go::LANGUAGE.into())
@@ -689,28 +831,62 @@ fn extract_go_file(src: &str, file: &mut ExtractedFile, options: PolyglotScanOpt
         return Ok(());
     };
     let bytes = src.as_bytes();
-    if let Some(package_name) = go_package_name(tree.root_node(), bytes) {
+    if let Some(package_name) = go_package_name(tree.root_node(), bytes, guard) {
         file.package_name = package_name;
         file.module_path = module_path(&file.package_name, &file.rel_path);
     }
-    let group_prefixes = collect_go_group_prefixes(tree.root_node(), bytes);
-    walk_go_node(tree.root_node(), bytes, file, None, options, &group_prefixes);
+    let group_prefixes = collect_go_group_prefixes(tree.root_node(), bytes, guard);
+    let mut ctx = GoWalkContext {
+        src: bytes,
+        options,
+        group_prefixes: &group_prefixes,
+        guard,
+    };
+    walk_go_node(
+        tree.root_node(),
+        &mut ctx,
+        file,
+        GoWalkState {
+            current_fn: None,
+            depth: 0,
+        },
+    );
     Ok(())
 }
 
-fn walk_go_node(
-    node: Node<'_>,
-    src: &[u8],
-    file: &mut ExtractedFile,
-    current_fn: Option<String>,
+#[derive(Debug)]
+struct GoWalkContext<'src, 'groups, 'guard> {
+    src: &'src [u8],
     options: PolyglotScanOptions,
-    group_prefixes: &HashMap<String, String>,
-) {
+    group_prefixes: &'groups HashMap<String, String>,
+    guard: &'guard mut AstWalkGuard,
+}
+
+#[derive(Debug, Clone)]
+struct GoWalkState {
+    current_fn: Option<String>,
+    depth: usize,
+}
+
+fn walk_go_node(node: Node<'_>, ctx: &mut GoWalkContext<'_, '_, '_>, file: &mut ExtractedFile, state: GoWalkState) {
+    if !ctx.guard.allow_depth(state.depth) {
+        return;
+    }
+    let src = ctx.src;
+    let options = ctx.options;
     match node.kind() {
         "function_declaration" => {
             if let Some(name) = field_ident(node, src, "name") {
                 push_symbol(file, "fn", &name, node.start_position().row + 1, go_is_pub(&name));
-                walk_go_children(node, src, file, Some(name), options, group_prefixes);
+                walk_go_children(
+                    node,
+                    ctx,
+                    file,
+                    GoWalkState {
+                        current_fn: Some(name),
+                        depth: state.depth + 1,
+                    },
+                );
                 return;
             }
         }
@@ -724,15 +900,23 @@ fn walk_go_node(
                     node.start_position().row + 1,
                     go_is_pub(&name),
                 );
-                walk_go_children(node, src, file, Some(symbol_name), options, group_prefixes);
+                walk_go_children(
+                    node,
+                    ctx,
+                    file,
+                    GoWalkState {
+                        current_fn: Some(symbol_name),
+                        depth: state.depth + 1,
+                    },
+                );
                 return;
             }
         }
         "type_declaration" => {
-            collect_go_types(node, src, file);
+            collect_go_types(node, src, file, ctx.guard, state.depth + 1);
         }
         "import_declaration" => {
-            collect_go_imports(node, src, file);
+            collect_go_imports(node, src, file, ctx.guard, state.depth + 1);
         }
         "call_expression" => {
             if let Some(function) = node.child_by_field_name("function") {
@@ -740,34 +924,38 @@ fn walk_go_node(
                 if !name.is_empty() {
                     file.calls.push(CallSite {
                         name,
-                        from_symbol: current_fn.clone(),
+                        from_symbol: state.current_fn.clone(),
                     });
                 }
             }
             if options.v2_enabled && !file.is_test_file {
-                collect_go_route(node, src, file, group_prefixes);
+                collect_go_route(node, src, file, ctx.group_prefixes, ctx.guard, state.depth + 1);
             }
         }
         _ => {}
     }
-    walk_go_children(node, src, file, current_fn, options, group_prefixes);
+    walk_go_children(
+        node,
+        ctx,
+        file,
+        GoWalkState {
+            current_fn: state.current_fn,
+            depth: state.depth + 1,
+        },
+    );
 }
 
-fn walk_go_children(
-    node: Node<'_>,
-    src: &[u8],
-    file: &mut ExtractedFile,
-    current_fn: Option<String>,
-    options: PolyglotScanOptions,
-    group_prefixes: &HashMap<String, String>,
-) {
+fn walk_go_children(node: Node<'_>, ctx: &mut GoWalkContext<'_, '_, '_>, file: &mut ExtractedFile, state: GoWalkState) {
+    if !ctx.guard.allow_depth(state.depth) {
+        return;
+    }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk_go_node(child, src, file, current_fn.clone(), options, group_prefixes);
+        walk_go_node(child, ctx, file, state.clone());
     }
 }
 
-fn collect_python_routes(node: Node<'_>, src: &[u8], file: &mut ExtractedFile) {
+fn collect_python_routes(node: Node<'_>, src: &[u8], file: &mut ExtractedFile, guard: &mut AstWalkGuard, depth: usize) {
     let mut decorators = Vec::new();
     let mut function_node = None;
     let mut cursor = node.walk();
@@ -785,7 +973,7 @@ fn collect_python_routes(node: Node<'_>, src: &[u8], file: &mut ExtractedFile) {
         return;
     };
     for decorator in decorators {
-        for (method, path) in parse_python_route_decorator(decorator, src) {
+        for (method, path) in parse_python_route_decorator(decorator, src, guard, depth + 1) {
             push_route_candidate(
                 file,
                 method,
@@ -797,8 +985,13 @@ fn collect_python_routes(node: Node<'_>, src: &[u8], file: &mut ExtractedFile) {
     }
 }
 
-fn parse_python_route_decorator(decorator: Node<'_>, src: &[u8]) -> Vec<(String, String)> {
-    let Some(call) = first_node_by_kind(decorator, "call") else {
+fn parse_python_route_decorator(
+    decorator: Node<'_>,
+    src: &[u8],
+    guard: &mut AstWalkGuard,
+    depth: usize,
+) -> Vec<(String, String)> {
+    let Some(call) = first_node_by_kind(decorator, "call", guard, depth + 1) else {
         return Vec::new();
     };
     let Some(function) = call.child_by_field_name("function") else {
@@ -935,7 +1128,14 @@ fn python_add_url_rule_handler(args: &[Node<'_>], src: &[u8]) -> Option<RouteHan
         .and_then(|handler| route_handler_from_arg(handler, src))
 }
 
-fn collect_ts_express_route(node: Node<'_>, src: &[u8], line_offset: usize, file: &mut ExtractedFile) {
+fn collect_ts_express_route(
+    node: Node<'_>,
+    src: &[u8],
+    line_offset: usize,
+    file: &mut ExtractedFile,
+    guard: &mut AstWalkGuard,
+    depth: usize,
+) {
     let Some(function) = node.child_by_field_name("function") else {
         return;
     };
@@ -971,7 +1171,7 @@ fn collect_ts_express_route(node: Node<'_>, src: &[u8], line_offset: usize, file
         return;
     }
 
-    if let Some(path) = express_route_chain_path(object, src) {
+    if let Some(path) = express_route_chain_path(object, src, guard, depth + 1) {
         let args = argument_nodes(node);
         let Some(handler_node) = args.first().copied() else {
             return;
@@ -982,7 +1182,10 @@ fn collect_ts_express_route(node: Node<'_>, src: &[u8], line_offset: usize, file
     }
 }
 
-fn express_route_chain_path(node: Node<'_>, src: &[u8]) -> Option<String> {
+fn express_route_chain_path(node: Node<'_>, src: &[u8], guard: &mut AstWalkGuard, depth: usize) -> Option<String> {
+    if !guard.allow_depth(depth) {
+        return None;
+    }
     if node.kind() != "call_expression" {
         return None;
     }
@@ -1002,7 +1205,7 @@ fn express_route_chain_path(node: Node<'_>, src: &[u8]) -> Option<String> {
         return path.starts_with('/').then_some(path);
     }
     if express_method(&method).is_some() {
-        return express_route_chain_path(object, src);
+        return express_route_chain_path(object, src, guard, depth + 1);
     }
     None
 }
@@ -1071,7 +1274,14 @@ fn parse_nest_method_decorator(raw: &str) -> Option<(String, String)> {
     Some((method.to_string(), path))
 }
 
-fn collect_go_route(node: Node<'_>, src: &[u8], file: &mut ExtractedFile, group_prefixes: &HashMap<String, String>) {
+fn collect_go_route(
+    node: Node<'_>,
+    src: &[u8],
+    file: &mut ExtractedFile,
+    group_prefixes: &HashMap<String, String>,
+    guard: &mut AstWalkGuard,
+    depth: usize,
+) {
     let Some(function) = node.child_by_field_name("function") else {
         return;
     };
@@ -1110,7 +1320,7 @@ fn collect_go_route(node: Node<'_>, src: &[u8], file: &mut ExtractedFile, group_
                 }
             }
             "call_expression" => {
-                let Some(prefix) = go_group_call_prefix(operand, src, group_prefixes) else {
+                let Some(prefix) = go_group_call_prefix(operand, src, group_prefixes, guard, depth + 1) else {
                     return;
                 };
                 route_prefix = prefix;
@@ -1134,9 +1344,9 @@ fn collect_go_route(node: Node<'_>, src: &[u8], file: &mut ExtractedFile, group_
     }
 }
 
-fn collect_go_group_prefixes(root: Node<'_>, src: &[u8]) -> HashMap<String, String> {
+fn collect_go_group_prefixes(root: Node<'_>, src: &[u8], guard: &mut AstWalkGuard) -> HashMap<String, String> {
     let mut assignments = Vec::new();
-    collect_go_group_assignment_nodes(root, src, &mut assignments);
+    collect_go_group_assignment_nodes(root, src, &mut assignments, guard, 0);
     let mut prefixes = HashMap::new();
     let mut changed = true;
     while changed {
@@ -1145,7 +1355,7 @@ fn collect_go_group_prefixes(root: Node<'_>, src: &[u8]) -> HashMap<String, Stri
             if prefixes.contains_key(name) {
                 continue;
             }
-            if let Some(prefix) = go_group_call_prefix(*call, src, &prefixes) {
+            if let Some(prefix) = go_group_call_prefix(*call, src, &prefixes, guard, 0) {
                 prefixes.insert(name.clone(), prefix);
                 changed = true;
             }
@@ -1154,31 +1364,52 @@ fn collect_go_group_prefixes(root: Node<'_>, src: &[u8]) -> HashMap<String, Stri
     prefixes
 }
 
-fn collect_go_group_assignment_nodes<'a>(node: Node<'a>, src: &[u8], out: &mut Vec<(String, Node<'a>)>) {
+fn collect_go_group_assignment_nodes<'a>(
+    node: Node<'a>,
+    src: &[u8],
+    out: &mut Vec<(String, Node<'a>)>,
+    guard: &mut AstWalkGuard,
+    depth: usize,
+) {
+    if !guard.allow_depth(depth) {
+        return;
+    }
     if matches!(
         node.kind(),
         "short_var_declaration" | "assignment_statement" | "var_spec"
     ) {
-        if let Some((name, call)) = go_group_assignment_node(node, src) {
+        if let Some((name, call)) = go_group_assignment_node(node, src, guard, depth + 1) {
             out.push((name, call));
         }
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_go_group_assignment_nodes(child, src, out);
+        collect_go_group_assignment_nodes(child, src, out, guard, depth + 1);
     }
 }
 
-fn go_group_assignment_node<'a>(node: Node<'a>, src: &[u8]) -> Option<(String, Node<'a>)> {
+fn go_group_assignment_node<'a>(
+    node: Node<'a>,
+    src: &[u8],
+    guard: &mut AstWalkGuard,
+    depth: usize,
+) -> Option<(String, Node<'a>)> {
     let mut cursor = node.walk();
     let children: Vec<Node<'a>> = node.named_children(&mut cursor).collect();
     let lhs = children.first().copied()?;
-    let name = single_identifier_under(lhs, src)?;
-    let call = children.iter().skip(1).copied().find_map(go_direct_group_call_node)?;
+    let name = single_identifier_under(lhs, src, guard, depth + 1)?;
+    let call = children
+        .iter()
+        .skip(1)
+        .copied()
+        .find_map(|child| go_direct_group_call_node(child, guard, depth + 1))?;
     Some((name, call))
 }
 
-fn go_direct_group_call_node(node: Node<'_>) -> Option<Node<'_>> {
+fn go_direct_group_call_node<'a>(node: Node<'a>, guard: &mut AstWalkGuard, depth: usize) -> Option<Node<'a>> {
+    if !guard.allow_depth(depth) {
+        return None;
+    }
     if is_go_group_call_node(node) {
         return Some(node);
     }
@@ -1186,7 +1417,7 @@ fn go_direct_group_call_node(node: Node<'_>) -> Option<Node<'_>> {
         let mut cursor = node.walk();
         let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
         if children.len() == 1 {
-            return go_direct_group_call_node(children[0]);
+            return go_direct_group_call_node(children[0], guard, depth + 1);
         }
     }
     None
@@ -1207,7 +1438,16 @@ fn is_go_group_call_node(node: Node<'_>) -> bool {
         .is_some_and(|field| field.kind() == "field_identifier")
 }
 
-fn go_group_call_prefix(call: Node<'_>, src: &[u8], group_prefixes: &HashMap<String, String>) -> Option<String> {
+fn go_group_call_prefix(
+    call: Node<'_>,
+    src: &[u8],
+    group_prefixes: &HashMap<String, String>,
+    guard: &mut AstWalkGuard,
+    depth: usize,
+) -> Option<String> {
+    if !guard.allow_depth(depth) {
+        return None;
+    }
     if call.kind() != "call_expression" {
         return None;
     }
@@ -1227,7 +1467,7 @@ fn go_group_call_prefix(call: Node<'_>, src: &[u8], group_prefixes: &HashMap<Str
                 return None;
             }
         }
-        "call_expression" => go_group_call_prefix(object, src, group_prefixes)?,
+        "call_expression" => go_group_call_prefix(object, src, group_prefixes, guard, depth + 1)?,
         _ => return None,
     };
     let args = argument_nodes(call);
@@ -1238,9 +1478,9 @@ fn go_group_call_prefix(call: Node<'_>, src: &[u8], group_prefixes: &HashMap<Str
     path.starts_with('/').then(|| join_route_paths(&base_prefix, &path))
 }
 
-fn collect_go_types(node: Node<'_>, src: &[u8], file: &mut ExtractedFile) {
+fn collect_go_types(node: Node<'_>, src: &[u8], file: &mut ExtractedFile, guard: &mut AstWalkGuard, depth: usize) {
     let mut specs = Vec::new();
-    collect_nodes_by_kind(node, "type_spec", &mut specs);
+    collect_nodes_by_kind(node, "type_spec", &mut specs, guard, depth);
     for spec in specs {
         let Some(name) = field_ident(spec, src, "name") else {
             continue;
@@ -1256,9 +1496,9 @@ fn collect_go_types(node: Node<'_>, src: &[u8], file: &mut ExtractedFile) {
     }
 }
 
-fn collect_go_imports(node: Node<'_>, src: &[u8], file: &mut ExtractedFile) {
+fn collect_go_imports(node: Node<'_>, src: &[u8], file: &mut ExtractedFile, guard: &mut AstWalkGuard, depth: usize) {
     let mut specs = Vec::new();
-    collect_nodes_by_kind(node, "import_spec", &mut specs);
+    collect_nodes_by_kind(node, "import_spec", &mut specs, guard, depth);
     for spec in specs {
         let Some(path_node) = spec.child_by_field_name("path") else {
             continue;
@@ -1275,9 +1515,9 @@ fn collect_go_imports(node: Node<'_>, src: &[u8], file: &mut ExtractedFile) {
     }
 }
 
-fn go_package_name(node: Node<'_>, src: &[u8]) -> Option<String> {
+fn go_package_name(node: Node<'_>, src: &[u8], guard: &mut AstWalkGuard) -> Option<String> {
     let mut packages = Vec::new();
-    collect_nodes_by_kind(node, "package_clause", &mut packages);
+    collect_nodes_by_kind(node, "package_clause", &mut packages, guard, 0);
     let package = packages.first().copied()?;
     let mut cursor = package.walk();
     for child in package.named_children(&mut cursor) {
@@ -1426,13 +1666,16 @@ fn keyword_argument_value(node: Node<'_>) -> Option<Node<'_>> {
     node.named_children(&mut cursor).last()
 }
 
-fn first_node_by_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+fn first_node_by_kind<'a>(node: Node<'a>, kind: &str, guard: &mut AstWalkGuard, depth: usize) -> Option<Node<'a>> {
+    if !guard.allow_depth(depth) {
+        return None;
+    }
     if node.kind() == kind {
         return Some(node);
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        if let Some(found) = first_node_by_kind(child, kind) {
+        if let Some(found) = first_node_by_kind(child, kind, guard, depth + 1) {
             return Some(found);
         }
     }
@@ -1468,13 +1711,22 @@ fn decorator_nodes(node: Node<'_>) -> Vec<Node<'_>> {
     out
 }
 
-fn collect_nodes_by_kind<'a>(node: Node<'a>, kind: &str, out: &mut Vec<Node<'a>>) {
+fn collect_nodes_by_kind<'a>(
+    node: Node<'a>,
+    kind: &str,
+    out: &mut Vec<Node<'a>>,
+    guard: &mut AstWalkGuard,
+    depth: usize,
+) {
+    if !guard.allow_depth(depth) {
+        return;
+    }
     if node.kind() == kind {
         out.push(node);
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_nodes_by_kind(child, kind, out);
+        collect_nodes_by_kind(child, kind, out, guard, depth + 1);
     }
 }
 
@@ -1905,42 +2157,48 @@ fn field_ident(node: Node<'_>, src: &[u8], field: &str) -> Option<String> {
     node.child_by_field_name(field).map(|n| node_text(n, src))
 }
 
-fn quoted_child_text(node: Node<'_>, src: &[u8]) -> Option<String> {
+fn quoted_child_text(node: Node<'_>, src: &[u8], guard: &mut AstWalkGuard, depth: usize) -> Option<String> {
+    if !guard.allow_depth(depth) {
+        return None;
+    }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         let text = node_text(child, src);
         if (text.starts_with('"') && text.ends_with('"')) || (text.starts_with('\'') && text.ends_with('\'')) {
             return Some(text.trim_matches('"').trim_matches('\'').to_string());
         }
-        if let Some(inner) = quoted_child_text(child, src) {
+        if let Some(inner) = quoted_child_text(child, src, guard, depth + 1) {
             return Some(inner);
         }
     }
     None
 }
 
-fn identifiers_under(node: Node<'_>, src: &[u8]) -> Vec<String> {
+fn identifiers_under(node: Node<'_>, src: &[u8], guard: &mut AstWalkGuard, depth: usize) -> Vec<String> {
+    if !guard.allow_depth(depth) {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     if node.kind() == "identifier" {
         out.push(node_text(node, src));
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        out.extend(identifiers_under(child, src));
+        out.extend(identifiers_under(child, src, guard, depth + 1));
     }
     out
 }
 
-fn ts_declared_names(node: Node<'_>, src: &[u8]) -> Vec<String> {
+fn ts_declared_names(node: Node<'_>, src: &[u8], guard: &mut AstWalkGuard, depth: usize) -> Vec<String> {
     let mut declarators = Vec::new();
-    collect_nodes_by_kind(node, "variable_declarator", &mut declarators);
+    collect_nodes_by_kind(node, "variable_declarator", &mut declarators, guard, depth);
     if declarators.is_empty() && matches!(node.kind(), "lexical_declaration" | "variable_declaration") {
-        return identifiers_under(node, src);
+        return identifiers_under(node, src, guard, depth);
     }
     let mut out = Vec::new();
     for declarator in declarators {
         if let Some(name_node) = declarator.child_by_field_name("name") {
-            out.extend(identifiers_under(name_node, src));
+            out.extend(identifiers_under(name_node, src, guard, depth + 1));
         }
     }
     out.sort();
@@ -1948,8 +2206,8 @@ fn ts_declared_names(node: Node<'_>, src: &[u8]) -> Vec<String> {
     out
 }
 
-fn single_identifier_under(node: Node<'_>, src: &[u8]) -> Option<String> {
-    let mut names = identifiers_under(node, src);
+fn single_identifier_under(node: Node<'_>, src: &[u8], guard: &mut AstWalkGuard, depth: usize) -> Option<String> {
+    let mut names = identifiers_under(node, src, guard, depth);
     names.sort();
     names.dedup();
     if names.len() == 1 {
@@ -1976,12 +2234,21 @@ fn python_import_module(raw: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn rust_use_paths(tree: &syn::UseTree) -> Vec<String> {
-    fn walk(prefix: &mut Vec<String>, tree: &syn::UseTree, out: &mut Vec<String>) {
+fn rust_use_paths(tree: &syn::UseTree, guard: &mut AstWalkGuard) -> Vec<String> {
+    fn walk(
+        prefix: &mut Vec<String>,
+        tree: &syn::UseTree,
+        out: &mut Vec<String>,
+        guard: &mut AstWalkGuard,
+        depth: usize,
+    ) {
+        if !guard.allow_depth(depth) {
+            return;
+        }
         match tree {
             syn::UseTree::Path(p) => {
                 prefix.push(p.ident.to_string());
-                walk(prefix, &p.tree, out);
+                walk(prefix, &p.tree, out, guard, depth + 1);
                 prefix.pop();
             }
             syn::UseTree::Name(n) => {
@@ -2001,13 +2268,13 @@ fn rust_use_paths(tree: &syn::UseTree) -> Vec<String> {
             }
             syn::UseTree::Group(g) => {
                 for item in &g.items {
-                    walk(prefix, item, out);
+                    walk(prefix, item, out, guard, depth + 1);
                 }
             }
         }
     }
     let mut out = Vec::new();
-    walk(&mut Vec::new(), tree, &mut out);
+    walk(&mut Vec::new(), tree, &mut out, guard, 0);
     out
 }
 
@@ -2038,6 +2305,18 @@ mod tests {
         (method.to_string(), path.to_string(), handler.to_string())
     }
 
+    fn deep_call_source(nesting: usize) -> String {
+        let mut src = String::from("export function shallow() { return 1; }\n");
+        for _ in 0..nesting {
+            src.push_str("f(\n");
+        }
+        src.push_str("1\n");
+        for _ in 0..nesting {
+            src.push_str(")\n");
+        }
+        src
+    }
+
     fn stable_scan_json(mut scan: WorkspaceScan) -> String {
         scan.scan_id = "ws_test".to_string();
         scan.started_at_unix_ms = 1;
@@ -2063,6 +2342,46 @@ export function run(input: Thing) { return helper(input.id); }
         assert!(scan.symbols.iter().any(|s| s.name == "run" && s.kind == "fn"));
         assert!(scan.symbols.iter().any(|s| s.name == "Thing" && s.kind == "interface"));
         assert!(scan.deps.iter().any(|d| d.to_module == "./helper"));
+    }
+
+    #[test]
+    fn ts_deep_walk_is_bounded_and_ts_is_not_pathology_skipped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("package.json"), r#"{"name":"deep-ts"}"#).expect("package");
+        let deep_src = deep_call_source(POLYGLOT_AST_MAX_DEPTH + 256);
+        std::fs::write(tmp.path().join("deep.ts"), &deep_src).expect("deep ts");
+        let long_ts = format!(
+            "export const longValue = \"{}\";\n",
+            "x".repeat(POLYGLOT_JS_MAX_LINE_BYTES + 1)
+        );
+        assert!(long_ts.lines().next().map_or(0, str::len) > POLYGLOT_JS_MAX_LINE_BYTES);
+        std::fs::write(tmp.path().join("long.ts"), long_ts).expect("long ts");
+
+        let scan = run_polyglot_scan_at(tmp.path()).expect("scan");
+        assert!(scan.files.iter().any(|file| file.rel_path == "deep.ts"));
+        assert!(scan.files.iter().any(|file| file.rel_path == "long.ts"));
+        assert!(scan
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "shallow" && symbol.file_rel_path == "deep.ts"));
+        assert!(scan
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "longValue" && symbol.file_rel_path == "long.ts"));
+
+        let extracted = extract_file(
+            tmp.path(),
+            &tmp.path().join("deep.ts"),
+            LanguageKind::TypeScript,
+            "deep-ts",
+            PolyglotScanOptions { v2_enabled: false },
+        )
+        .expect("extract")
+        .expect("not skipped");
+        assert!(
+            extracted.ast_depth_limit_hits > 0,
+            "deep TypeScript should hit the walker depth cap"
+        );
     }
 
     #[test]
@@ -2249,6 +2568,60 @@ app.get("/dist", handler);
         );
         assert!(scan.files.iter().any(|file| file.rel_path == "src/app.js"));
         assert!(!scan.files.iter().any(|file| file.rel_path == "dist/app.js"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v2_deep_js_walk_is_depth_bounded_without_minified_skip() {
+        let _env = EnvVarGuard::set(POLYGLOT_V2_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("package.json"), r#"{"name":"deep-js"}"#).expect("package");
+        let src = deep_call_source(POLYGLOT_AST_MAX_DEPTH + 256);
+        assert!(src.len() < POLYGLOT_JS_MAX_BYTES);
+        assert!(src.lines().map(str::len).max().unwrap_or(0) < POLYGLOT_JS_MAX_LINE_BYTES);
+        std::fs::write(tmp.path().join("app.js"), &src).expect("js");
+
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        assert!(scan.files.iter().any(|file| file.rel_path == "app.js"));
+        assert!(scan
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "shallow" && symbol.file_rel_path == "app.js"));
+        assert!(scan.symbols.len() <= 2);
+
+        let extracted = extract_file(
+            tmp.path(),
+            &tmp.path().join("app.js"),
+            LanguageKind::TypeScript,
+            "deep-js",
+            PolyglotScanOptions { v2_enabled: true },
+        )
+        .expect("extract")
+        .expect("not skipped");
+        assert!(
+            extracted.ast_depth_limit_hits > 0,
+            "deep multiline JS should hit the walker depth cap"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v2_pathological_single_line_js_is_skipped() {
+        let _env = EnvVarGuard::set(POLYGLOT_V2_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("package.json"), r#"{"name":"minified-js"}"#).expect("package");
+        let src = format!(
+            "function handler() {{}} app.get(\"/too-long\", handler); //{}\n",
+            "x".repeat(POLYGLOT_JS_MAX_LINE_BYTES + 1)
+        );
+        assert!(src.lines().next().map_or(0, str::len) > POLYGLOT_JS_MAX_LINE_BYTES);
+        std::fs::write(tmp.path().join("app.js"), src).expect("js");
+
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        assert!(scan.files.is_empty());
+        assert!(scan.symbols.is_empty());
+        assert!(scan.routes.is_empty());
+        assert_eq!(scan.stats.file_count, 0);
     }
 
     #[test]
