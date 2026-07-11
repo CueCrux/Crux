@@ -79,16 +79,14 @@ fn raw_admin_write(ctx: &crate::auth::HttpScopeContext) -> bool {
 
 /// Resolve the trusted tenant stamp for an HTTP write.
 ///
-/// HTTP auth context has no tenant claim yet, so current deployments resolve
-/// to `default`. When a real tenant source is added here, three other surfaces
-/// must be revisited in the SAME change or they become a stamping/read bypass:
-///   1. `FactStore::store_synced` (sync-pull) inserts a peer-supplied `Fact`
-///      verbatim — a peer-controlled `tenant_hash` would survive; validate it.
-///   2. The unfiltered read helpers (`all_facts`, `get`, `get_by_entity`,
-///      `fact_history`, export) do not apply the tenant filter — no-op while
-///      everything is `default`, but they must gain a tenant predicate.
-///   3. MCP `handle_store_fact`'s equivalent hook.
-/// (Tracked in security-critical-7-tenant-isolation C5 follow-ups.)
+/// HTTP auth context has no tenant claim yet, so current deployments resolve to
+/// `default`. When a real tenant source is added here, three other surfaces must
+/// be revisited in the SAME change or they become a stamping/read bypass (tracked
+/// as security-critical-7-tenant-isolation C5 follow-ups):
+///
+/// - `FactStore::store_synced` (sync-pull) inserts a peer-supplied `Fact` verbatim, so a peer-controlled `tenant_hash` would survive — validate or re-stamp it.
+/// - The unfiltered read helpers (`all_facts`, `get`, `get_by_entity`, `fact_history`, export) do not apply the tenant filter — no-op while everything is `default`, but they must gain a tenant predicate.
+/// - MCP `handle_store_fact`'s equivalent write hook.
 fn tenant_hash_for_write_context(_ctx: &crate::auth::HttpScopeContext) -> String {
     corecrux_memory::fact_store::default_tenant_hash()
 }
