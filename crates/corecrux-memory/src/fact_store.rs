@@ -1255,6 +1255,11 @@ impl FactStore {
     /// Insert a fact directly with its original identity (fact_id, version,
     /// timestamps). Used for facts arriving from a remote sync — skips version
     /// chain logic but DOES append to the journal for persistence.
+    ///
+    /// TODO(multi-tenant, C5 follow-up): this trusts the peer-supplied
+    /// `fact.tenant_hash` verbatim. Harmless while every fact is `default`, but
+    /// once `tenant_hash` is meaningful this is a stamping bypass — validate or
+    /// re-stamp against the peer's authorized tenant here.
     pub fn store_synced(&mut self, fact: Fact) {
         let fact_id = fact.fact_id.clone();
         let entity = fact.entity.clone();
