@@ -4,7 +4,7 @@
   <source media="(prefers-color-scheme: dark)" srcset="docs/Images/readme/CueCrux-Arc-Loop-White.png">
   <img src="docs/Images/readme/CueCrux-Arc-Loop.png" alt="CueCrux arc-loop mark" width="96">
 </picture>
-
+<br /><br />
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/Images/readme/crux-dark.svg">
   <img src="docs/Images/readme/crux-light.svg" alt="CRUX" width="216">
