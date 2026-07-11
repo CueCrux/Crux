@@ -262,6 +262,7 @@ mod tests {
     fn seed_store(dir: &Path) {
         let mut store = FactStore::with_persistence(dir).expect("store");
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "project-alpha".into(),
             key: "status".into(),
             value: "public-value".into(),
@@ -272,6 +273,7 @@ mod tests {
             actor: None,
         });
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "secret".into(),
             key: "k".into(),
             value: "private-value-stays-home".into(),
@@ -282,6 +284,7 @@ mod tests {
             actor: None,
         });
         let erased = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "gone".into(),
             key: "k".into(),
             value: "erased-value".into(),

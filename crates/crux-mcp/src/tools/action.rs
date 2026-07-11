@@ -54,6 +54,7 @@ async fn store_enrichment_capsule(ctx: &McpContext, proposal: &EnrichedActionPro
         }
     };
     let fact = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: format!(
             "{ACTION_ENRICHMENT_RECEIPT_ENTITY_PREFIX}::{}::{}",
             proposal.tenant_id, receipt.receipt_id
@@ -101,6 +102,7 @@ mod tests {
 
         let store = ctx.fact_store.read().await;
         let facts = store.query(&corecrux_memory::fact_store::FactQuery {
+            tenant_hash: None,
             query: Some(ACTION_ENRICHMENT_RECEIPT_ENTITY_PREFIX.to_string()),
             entity: None,
             entity_prefix: Some(format!("{ACTION_ENRICHMENT_RECEIPT_ENTITY_PREFIX}::business::acme")),

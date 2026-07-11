@@ -91,6 +91,7 @@ impl BootstrapSeeder {
     pub async fn is_seeded(&self) -> bool {
         let store = self.fact_store.read().await;
         let result = store.query(&FactQuery {
+            tenant_hash: None,
             query: None,
             entity: Some(SENTINEL_ENTITY.to_string()),
             entity_prefix: None,
@@ -124,6 +125,7 @@ impl BootstrapSeeder {
 
         if !already_seeded {
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: SENTINEL_ENTITY.to_string(),
                 key: SENTINEL_KEY.to_string(),
                 value: Utc::now().to_rfc3339(),
@@ -148,6 +150,7 @@ impl BootstrapSeeder {
         let store = self.fact_store.read().await;
         let seeded = {
             let result = store.query(&FactQuery {
+                tenant_hash: None,
                 query: None,
                 entity: Some(SENTINEL_ENTITY.to_string()),
                 entity_prefix: None,
@@ -159,6 +162,7 @@ impl BootstrapSeeder {
 
         // Query all bootstrap facts
         let result = store.query(&FactQuery {
+            tenant_hash: None,
             query: None,
             entity: None,
             entity_prefix: Some(BOOTSTRAP_PREFIX.to_string()),
@@ -209,6 +213,7 @@ fn embedded_bootstrap_facts() -> Vec<StoreFact> {
 
     for doc in &docs {
         reqs.push(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: bootstrap_entity("doc", &doc.slug),
             key: doc.title.clone(),
             value: doc.content.clone(),
@@ -222,6 +227,7 @@ fn embedded_bootstrap_facts() -> Vec<StoreFact> {
 
     for pat in &patterns {
         reqs.push(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: bootstrap_entity("pattern", &pat.slug),
             key: pat.title.clone(),
             value: pat.content.clone(),
@@ -235,6 +241,7 @@ fn embedded_bootstrap_facts() -> Vec<StoreFact> {
 
     for res in &resolutions {
         reqs.push(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: bootstrap_entity("resolution", &res.code),
             key: res.title.clone(),
             value: res.content.clone(),
@@ -248,6 +255,7 @@ fn embedded_bootstrap_facts() -> Vec<StoreFact> {
 
     for to in &tool_outputs {
         reqs.push(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: bootstrap_entity("tool-output", &to.tool),
             key: format!("{} output schema", to.tool),
             value: to.output.clone(),
@@ -361,6 +369,7 @@ mod tests {
         {
             let mut guard = store.write().await;
             guard.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: SENTINEL_ENTITY.to_string(),
                 key: SENTINEL_KEY.to_string(),
                 value: Utc::now().to_rfc3339(),
@@ -371,6 +380,7 @@ mod tests {
                 actor: None,
             });
             guard.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: bootstrap_entity("doc", "quickstart"),
                 key: "Five-Minute Quickstart".to_string(),
                 value: "already present".to_string(),
@@ -391,6 +401,7 @@ mod tests {
 
         let guard = store.read().await;
         let first_connect = guard.query(&FactQuery {
+            tenant_hash: None,
             query: None,
             entity: Some(bootstrap_entity("doc", "first-connect-agent")),
             entity_prefix: None,
@@ -400,6 +411,7 @@ mod tests {
         assert_eq!(first_connect.facts.len(), 1);
 
         let quickstart = guard.query(&FactQuery {
+            tenant_hash: None,
             query: None,
             entity: Some(bootstrap_entity("doc", "quickstart")),
             entity_prefix: None,

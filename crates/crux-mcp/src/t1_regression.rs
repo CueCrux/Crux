@@ -87,6 +87,7 @@ async fn seed_passport(ctx: &McpContext, id: &str, category: &str) {
     });
     let mut store = ctx.fact_store.write().await;
     store.store(StoreFact {
+        tenant_hash: "default".to_string(),
         entity: format!("__passport__::{id}"),
         key: "record".to_string(),
         value: record.to_string(),

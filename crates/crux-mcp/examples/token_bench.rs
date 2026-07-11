@@ -114,6 +114,7 @@ async fn seed(ctx: &McpContext) {
         let mut store = ctx.fact_store.write().await;
         for i in 0..N_DOCS {
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: CORPUS.to_string(),
                 key: format!("k{i:02}"),
                 value: body("needle", i, varied_len(i)),
@@ -127,6 +128,7 @@ async fn seed(ctx: &McpContext) {
         // ── Bootstrap plane: a handful of pattern playbooks (no budget knob) ──
         for i in 0..8 {
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: format!("__bootstrap__::pattern:p{i}"),
                 key: "playbook".to_string(),
                 value: body("pattern", i, 60),

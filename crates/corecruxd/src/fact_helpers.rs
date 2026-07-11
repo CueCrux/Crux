@@ -38,6 +38,7 @@ mod tests {
     fn fact(id: &str, entity: &str, key: &str, version: u32) -> Fact {
         Fact {
             fact_id: id.to_string(),
+            tenant_hash: "default".to_string(),
             entity: entity.to_string(),
             key: key.to_string(),
             value: format!("v{version}"),

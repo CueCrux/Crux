@@ -234,6 +234,7 @@ pub(super) async fn post_tenant_offboard(
     {
         let mut store = state.fact_store.write().await;
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: format!("__sync_wipe_receipt__::{tenant_id}"),
             key: receipt.receipt_hash.clone(),
             value: receipt_json,

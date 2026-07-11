@@ -69,6 +69,7 @@ pub async fn handle_audit_config(args: &Value, ctx: &McpContext) -> Result<Value
     let canonical = serde_json::to_string(&record).unwrap_or_default();
 
     let req = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: AUDIT_ENTITY.to_string(),
         key: format!("{AUDIT_KEY_PREFIX}{sha256}"),
         value: canonical,
@@ -109,6 +110,7 @@ pub async fn handle_check_config_audit(args: &Value, ctx: &McpContext) -> Result
 
     // Load all audit records once; lookup by exact key.
     let q = FactQuery {
+        tenant_hash: None,
         query: None,
         entity: Some(AUDIT_ENTITY.to_string()),
         entity_prefix: None,

@@ -305,6 +305,7 @@ mod tests {
     fn fact(value: &str) -> Fact {
         Fact {
             fact_id: "f_1".to_string(),
+            tenant_hash: "default".to_string(),
             entity: "business::acme::note".to_string(),
             key: "summary".to_string(),
             value: value.to_string(),

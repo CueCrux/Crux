@@ -152,6 +152,7 @@ fn clean_meta(v: Option<String>) -> Option<String> {
 
 pub fn list_passports(store: &FactStore, category_filter: Option<&str>) -> Vec<PassportRecord> {
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: None,
         entity: None,
         entity_prefix: Some(format!("{PASSPORT_ENTITY_PREFIX}::")),
@@ -276,6 +277,7 @@ pub fn delete_passport(store: &mut FactStore, id: &str) -> Result<(), PassportsE
     let record = get_passport(store, id).ok_or_else(|| PassportsError::NotFound(id.to_string()))?;
     let entity = format!("{PASSPORT_ENTITY_PREFIX}::{}", record.id);
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: None,
         entity: Some(entity),
         entity_prefix: None,
@@ -348,6 +350,7 @@ fn clear_default_for_category(store: &mut FactStore, category: &str, except_id: 
 fn write_record(store: &mut FactStore, record: &PassportRecord) -> Result<(), PassportsError> {
     let value = serde_json::to_string(record)?;
     let mut sf = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: format!("{PASSPORT_ENTITY_PREFIX}::{}", record.id),
         key: PASSPORT_RECORD_KEY.to_string(),
         value,

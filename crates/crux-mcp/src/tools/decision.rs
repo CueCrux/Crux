@@ -55,6 +55,7 @@ pub async fn handle_record_decision(args: &Value, ctx: &McpContext) -> Result<Va
     // Store as a fact under __decisions__::{session_id}
     let entity = format!("__decisions__::{session_id}");
     let req = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: entity.clone(),
         key: decision_id.clone(),
         value: canonical,

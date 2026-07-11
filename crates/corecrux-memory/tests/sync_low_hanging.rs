@@ -255,6 +255,7 @@ fn push_tenant_promotion_posts_collection_records() {
     let client = SyncClient::new(&base_url, "test-key", dir.path());
     let fact = Fact {
         fact_id: "f_local_promotion".to_string(),
+        tenant_hash: "default".to_string(),
         entity: "business::acme::note".to_string(),
         key: "summary".to_string(),
         value: "promote".to_string(),
@@ -320,6 +321,7 @@ fn push_preview_counts_pushable_private_synced_and_deleted_facts() {
     let mut store = FactStore::new();
 
     store.store(StoreFact {
+        tenant_hash: "default".to_string(),
         entity: "alpha".to_string(),
         key: "k1".to_string(),
         value: "one".to_string(),
@@ -330,6 +332,7 @@ fn push_preview_counts_pushable_private_synced_and_deleted_facts() {
         actor: None,
     });
     store.store(StoreFact {
+        tenant_hash: "default".to_string(),
         entity: "alpha".to_string(),
         key: "k2".to_string(),
         value: "two".to_string(),
@@ -340,6 +343,7 @@ fn push_preview_counts_pushable_private_synced_and_deleted_facts() {
         actor: None,
     });
     store.store(StoreFact {
+        tenant_hash: "default".to_string(),
         entity: "beta".to_string(),
         key: "k3".to_string(),
         value: "three".to_string(),
@@ -350,6 +354,7 @@ fn push_preview_counts_pushable_private_synced_and_deleted_facts() {
         actor: None,
     });
     store.store(StoreFact {
+        tenant_hash: "default".to_string(),
         entity: "finance:ledger".to_string(),
         key: "k4".to_string(),
         value: "secret".to_string(),
@@ -360,6 +365,7 @@ fn push_preview_counts_pushable_private_synced_and_deleted_facts() {
         actor: None,
     });
     store.store(StoreFact {
+        tenant_hash: "default".to_string(),
         entity: "flagged".to_string(),
         key: "k5".to_string(),
         value: "private".to_string(),
@@ -372,6 +378,7 @@ fn push_preview_counts_pushable_private_synced_and_deleted_facts() {
 
     store.store_synced(Fact {
         fact_id: "f_synced_preview".to_string(),
+        tenant_hash: "default".to_string(),
         entity: "remote".to_string(),
         key: "k6".to_string(),
         value: "synced".to_string(),
@@ -394,6 +401,7 @@ fn push_preview_counts_pushable_private_synced_and_deleted_facts() {
     });
 
     let deleted = store.store(StoreFact {
+        tenant_hash: "default".to_string(),
         entity: "deleted".to_string(),
         key: "k7".to_string(),
         value: "gone".to_string(),
@@ -420,6 +428,7 @@ fn push_returns_zero_when_no_non_private_local_facts_exist() {
     let mut store = FactStore::new();
 
     store.store(StoreFact {
+        tenant_hash: "default".to_string(),
         entity: "finance:payroll".to_string(),
         key: "k1".to_string(),
         value: "private".to_string(),
@@ -432,6 +441,7 @@ fn push_returns_zero_when_no_non_private_local_facts_exist() {
 
     store.store_synced(Fact {
         fact_id: "f_synced_only".to_string(),
+        tenant_hash: "default".to_string(),
         entity: "remote".to_string(),
         key: "k2".to_string(),
         value: "synced".to_string(),
@@ -454,6 +464,7 @@ fn push_returns_zero_when_no_non_private_local_facts_exist() {
     });
 
     let deleted = store.store(StoreFact {
+        tenant_hash: "default".to_string(),
         entity: "deleted".to_string(),
         key: "k3".to_string(),
         value: "gone".to_string(),
@@ -588,6 +599,7 @@ fn push_batches_local_facts_and_updates_cursor() {
 
     for index in 0..501 {
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: format!("entity-{}", index % 3),
             key: format!("key-{index}"),
             value: format!("value-{index}"),
@@ -599,6 +611,7 @@ fn push_batches_local_facts_and_updates_cursor() {
         });
     }
     store.store(StoreFact {
+        tenant_hash: "default".to_string(),
         entity: "finance:payroll".to_string(),
         key: "private".to_string(),
         value: "skip".to_string(),
@@ -610,6 +623,7 @@ fn push_batches_local_facts_and_updates_cursor() {
     });
     store.store_synced(Fact {
         fact_id: "f_synced_skip".to_string(),
+        tenant_hash: "default".to_string(),
         entity: "remote".to_string(),
         key: "k".to_string(),
         value: "synced".to_string(),

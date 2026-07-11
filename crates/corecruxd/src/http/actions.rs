@@ -119,6 +119,7 @@ async fn store_enrichment_capsule(state: &AppState, proposal: &EnrichedActionPro
         return Ok(());
     };
     let mut fact = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: format!(
             "{ACTION_ENRICHMENT_RECEIPT_ENTITY_PREFIX}::{}::{}",
             proposal.tenant_id, receipt.receipt_id

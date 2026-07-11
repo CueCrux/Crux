@@ -23,6 +23,7 @@ pub async fn handle_get_gaps(args: &Value, ctx: &McpContext) -> Result<Value, Js
     let filter = args.get("query").and_then(|v| v.as_str()).map(|s| s.to_string());
 
     let q = FactQuery {
+        tenant_hash: None,
         query: filter.clone(),
         entity: None,
         entity_prefix: Some(OPS_COVERAGE_PREFIX.to_string()),
@@ -92,6 +93,7 @@ mod tests {
         {
             let mut store = ctx.fact_store.write().await;
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "__ops__::coverage::retrieval".to_string(),
                 key: "gap_query".to_string(),
                 value: "no results for terraform drift detection".to_string(),
@@ -103,6 +105,7 @@ mod tests {
             });
             // A non-ops fact should not appear.
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "project".to_string(),
                 key: "name".to_string(),
                 value: "CueCrux".to_string(),
@@ -127,6 +130,7 @@ mod tests {
         {
             let mut store = ctx.fact_store.write().await;
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "__ops__::coverage::retrieval".to_string(),
                 key: "gap".to_string(),
                 value: "terraform drift missing".to_string(),
@@ -137,6 +141,7 @@ mod tests {
                 actor: None,
             });
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "__ops__::coverage::retrieval".to_string(),
                 key: "gap".to_string(),
                 value: "kubernetes scheduling unindexed".to_string(),

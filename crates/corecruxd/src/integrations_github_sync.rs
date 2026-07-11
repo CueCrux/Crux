@@ -112,6 +112,7 @@ fn sync_one_repo(
                 }
                 let value = serde_json::to_string(&commit).unwrap_or_default();
                 store.store(StoreFact {
+                    tenant_hash: "default".to_string(),
                     entity,
                     key: "record".to_string(),
                     value,
@@ -138,6 +139,7 @@ fn sync_one_repo(
                 let entity = format!("{entity_prefix}::pr/{}", pr.number);
                 let value = serde_json::to_string(&pr).unwrap_or_default();
                 store.store(StoreFact {
+                    tenant_hash: "default".to_string(),
                     entity,
                     key: "record".to_string(),
                     value,
@@ -164,6 +166,7 @@ fn sync_one_repo(
                 let entity = format!("{entity_prefix}::issue/{}", issue.number);
                 let value = serde_json::to_string(&issue).unwrap_or_default();
                 store.store(StoreFact {
+                    tenant_hash: "default".to_string(),
                     entity,
                     key: "record".to_string(),
                     value,
@@ -193,6 +196,7 @@ fn sync_one_repo(
                 }
                 let value = serde_json::to_string(&c).unwrap_or_default();
                 store.store(StoreFact {
+                    tenant_hash: "default".to_string(),
                     entity,
                     key: "record".to_string(),
                     value,
@@ -218,6 +222,7 @@ fn sync_one_repo(
 
 fn record_exists(store: &FactStore, entity: &str) -> bool {
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
+        tenant_hash: None,
         query: None,
         entity: Some(entity.to_string()),
         entity_prefix: None,

@@ -194,6 +194,7 @@ mod tests {
 
     fn make(entity: &str) -> StoreFact {
         StoreFact {
+            tenant_hash: "default".to_string(),
             entity: entity.to_string(),
             key: "content".into(),
             value: "x".into(),

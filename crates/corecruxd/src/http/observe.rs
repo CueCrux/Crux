@@ -33,6 +33,7 @@ pub(super) async fn query_ops_facts(
         return observe_not_enabled_response();
     }
     let q = corecrux_memory::fact_store::FactQuery {
+        tenant_hash: None,
         query: params.get("query").cloned(),
         entity: None,
         entity_prefix: Some(crux_observe::schema::OPS_PREFIX.to_string()),
@@ -65,6 +66,7 @@ pub(super) async fn query_ops_errors(
         return observe_not_enabled_response();
     }
     let q = corecrux_memory::fact_store::FactQuery {
+        tenant_hash: None,
         query: params.get("query").cloned(),
         entity: None,
         entity_prefix: Some("__ops__::error".to_string()),
@@ -106,6 +108,7 @@ pub(super) async fn get_ops_health(State(state): State<AppState>, headers: Heade
         return observe_not_enabled_response();
     }
     let q = corecrux_memory::fact_store::FactQuery {
+        tenant_hash: None,
         query: None,
         entity: None,
         entity_prefix: Some("__ops__::health".to_string()),

@@ -90,6 +90,7 @@ pub fn set_tenant_category_override(
         return Err(TenantMetadataError::SystemPrefixTarget(tenant_id.to_string()));
     }
     let mut sf = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: entity_for(tenant_id),
         key: CATEGORY_KEY.to_string(),
         value: category.as_str().to_string(),
@@ -213,6 +214,7 @@ mod tests {
         let mut store = fresh_store();
         // Bypass set_*'s validation to plant a corrupt override.
         let mut sf = StoreFact {
+            tenant_hash: "default".to_string(),
             entity: entity_for("execplan"),
             key: CATEGORY_KEY.to_string(),
             value: "rubbish".to_string(),

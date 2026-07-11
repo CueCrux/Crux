@@ -135,6 +135,7 @@ pub(super) async fn get_answer_replay_validity(
 #[cfg_attr(not(feature = "hosted-surfaces"), allow(dead_code))]
 pub(super) async fn store_answer_capsule(state: &AppState, capsule: &AnswerReplayCapsule) -> std::io::Result<()> {
     let mut fact = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: answer_capsule_entity(&capsule.tenant_id, &capsule.answer_id),
         key: "capsule".to_string(),
         value: serde_json::to_string(capsule).map_err(std::io::Error::other)?,
@@ -1046,6 +1047,7 @@ mod tests {
     fn evidence_validity_marks_superseded_fact() {
         let mut store = FactStore::new();
         let first = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "tenant-a::doc".to_string(),
             key: "content".to_string(),
             value: "old answer context".to_string(),
@@ -1056,6 +1058,7 @@ mod tests {
             actor: None,
         });
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "tenant-a::doc".to_string(),
             key: "content".to_string(),
             value: "new answer context".to_string(),

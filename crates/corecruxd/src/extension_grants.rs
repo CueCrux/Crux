@@ -185,6 +185,7 @@ pub fn issue_grant(
     };
     let value = serde_json::to_string(&grant)?;
     let mut sf = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: entity_for(&input.extension_id, &input.passport_fpr),
         key: GRANT_RECORD_KEY.to_string(),
         value,
@@ -204,6 +205,7 @@ pub fn revoke_grant(store: &mut FactStore, extension_id: &str, passport_fpr: &st
         return Err(GrantError::NotFound(extension_id.to_string(), passport_fpr.to_string()));
     }
     let mut sf = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: entity_for(extension_id, passport_fpr),
         key: GRANT_RECORD_KEY.to_string(),
         value: String::new(),
@@ -227,6 +229,7 @@ pub fn get_grant(store: &FactStore, extension_id: &str, passport_fpr: &str) -> O
 pub fn list_grants_for_extension(store: &FactStore, extension_id: &str) -> Vec<ExtensionGrant> {
     let prefix = format!("{GRANT_ENTITY_PREFIX}::{extension_id}::");
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: Some(prefix.clone()),
         entity: None,
         entity_prefix: None,
@@ -252,6 +255,7 @@ pub fn list_grants_for_passport(store: &FactStore, passport_fpr: &str) -> Vec<Ex
     // Cheap: per-daemon grant counts are expected to be ≤ low hundreds.
     let prefix = format!("{GRANT_ENTITY_PREFIX}::");
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: Some(prefix.clone()),
         entity: None,
         entity_prefix: None,

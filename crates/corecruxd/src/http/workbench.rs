@@ -841,6 +841,7 @@ async fn store_workbench_fact(
         .unwrap_or("unsealed")
         .to_string();
     let mut fact = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: format!("{WORKBENCH_FACT_PREFIX}::{tenant_id}::{key}::{receipt_id}"),
         key: key.to_string(),
         value: serde_json::to_string(value).map_err(std::io::Error::other)?,
@@ -931,6 +932,7 @@ fn query_facts(store: &FactStore, query: Option<&str>, entity_prefix: Option<&st
     crate::fact_helpers::dedup_latest(
         store
             .query(&FactQuery {
+                tenant_hash: None,
                 query: query.map(str::to_string),
                 entity: None,
                 entity_prefix: entity_prefix.map(str::to_string),
@@ -1647,6 +1649,7 @@ mod helper_tests {
 
     fn seed(store: &mut FactStore, entity: &str, key: &str, value: &str) {
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: entity.to_string(),
             key: key.to_string(),
             value: value.to_string(),

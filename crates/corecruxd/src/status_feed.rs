@@ -120,6 +120,7 @@ pub fn status_feed(store: &FactStore, work_id: Option<&str>, limit: usize) -> Ve
         None => format!("{WORK_TRANSITION_ENTITY_PREFIX}::"),
     };
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: None,
         entity: None,
         entity_prefix: Some(prefix),

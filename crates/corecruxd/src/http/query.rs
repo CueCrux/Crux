@@ -780,6 +780,7 @@ pub(super) async fn post_query_text_search_expand(
 fn query_coverage_store_fact(value: String, score: f32) -> corecrux_memory::fact_store::StoreFact {
     let entity = crux_observe::schema::ops_entity("coverage", &uuid::Uuid::new_v4().to_string());
     let mut sf = corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "default".to_string(),
         entity,
         key: crux_observe::schema::EVT_OPS_QUERY_COVERAGE_V1.to_string(),
         value,

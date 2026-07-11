@@ -468,6 +468,7 @@ mod tests {
             let mut store = ctx.fact_store.write().await;
             for i in 0..receipt_count {
                 store.store(StoreFact {
+                    tenant_hash: "default".to_string(),
                     entity: format!("__tier_seed__::{name}::{i}"),
                     key: "r".to_string(),
                     value: "v".to_string(),
@@ -602,6 +603,7 @@ mod tests {
         {
             let mut store = ctx.fact_store.write().await;
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "test".to_string(),
                 key: "k".to_string(),
                 value: "v".to_string(),
@@ -712,6 +714,7 @@ mod tests {
         {
             let mut store = ctx.fact_store.write().await;
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "deploy".to_string(),
                 key: "status".to_string(),
                 value: "green".to_string(),
@@ -722,6 +725,7 @@ mod tests {
                 actor: None,
             });
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "private:salary".to_string(),
                 key: "amount".to_string(),
                 value: "redacted".to_string(),
@@ -732,6 +736,7 @@ mod tests {
                 actor: None,
             });
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "deploy".to_string(),
                 key: "source".to_string(),
                 value: "remote".to_string(),
@@ -769,6 +774,7 @@ mod tests {
         {
             let mut store = ctx.fact_store.write().await;
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "business::acme::note".to_string(),
                 key: "summary".to_string(),
                 value: "promote".to_string(),
@@ -779,6 +785,7 @@ mod tests {
                 actor: None,
             });
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "business::acme::constraint::deploy".to_string(),
                 key: "constraint".to_string(),
                 value: "skip by allowlist".to_string(),
@@ -875,6 +882,7 @@ mod tests {
         {
             let mut store = ctx.fact_store.write().await;
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "deploy".to_string(),
                 key: "status".to_string(),
                 value: "green".to_string(),

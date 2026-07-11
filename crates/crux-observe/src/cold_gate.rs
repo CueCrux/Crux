@@ -36,6 +36,7 @@ impl ColdGate {
     pub async fn pull(&self, query: &str, top_k: usize, token_budget: Option<usize>) -> ColdPullResult {
         let store = self.fact_store.read().await;
         let result = store.query(&FactQuery {
+            tenant_hash: None,
             query: Some(query.to_string()),
             entity: None,
             entity_prefix: Some(BOOTSTRAP_PREFIX.to_string()),
@@ -86,6 +87,7 @@ mod tests {
         {
             let mut s = store.write().await;
             s.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "__ops__::error:e1".to_string(),
                 key: "disk error".to_string(),
                 value: "Segment file read failed on shard 3".to_string(),

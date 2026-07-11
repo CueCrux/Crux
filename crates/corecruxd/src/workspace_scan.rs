@@ -801,6 +801,7 @@ pub async fn load_latest(
 ) -> Option<WorkspaceScan> {
     let store = fact_store.read().await;
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
+        tenant_hash: None,
         query: Some("__workspace_scan__::latest".to_string()),
         entity: None,
         entity_prefix: None,

@@ -1658,6 +1658,7 @@ pub(super) async fn get_console_facts(
 
     let store = state.fact_store.read().await;
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
+        tenant_hash: None,
         query: q.clone(),
         entity: None,
         entity_prefix: None,
@@ -1718,6 +1719,7 @@ pub(super) async fn post_console_fact_add(
         return problem_response(StatusCode::FORBIDDEN, e.to_string());
     }
     let mut sf = corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "default".to_string(),
         entity: entity.to_string(),
         key: key.to_string(),
         value: value.to_string(),

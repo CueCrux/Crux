@@ -76,6 +76,7 @@ pub fn resolve(store: &FactStore, input: ResolveInput<'_>) -> Result<SessionBind
 pub fn write_binding(store: &mut FactStore, binding: &SessionBinding) -> Result<(), SessionBindingsError> {
     let value = serde_json::to_string(binding)?;
     let mut sf = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: format!("{SESSION_BINDING_ENTITY_PREFIX}::{}", binding.session_id_hex),
         key: SESSION_BINDING_RECORD_KEY.to_string(),
         value,
@@ -92,6 +93,7 @@ pub fn write_binding(store: &mut FactStore, binding: &SessionBinding) -> Result<
 
 pub fn list_bindings(store: &FactStore) -> Vec<SessionBinding> {
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: None,
         entity: None,
         entity_prefix: Some(format!("{SESSION_BINDING_ENTITY_PREFIX}::")),
@@ -150,6 +152,7 @@ pub struct BindingCounts {
 /// already knows the session id (the `resolve_principal` path).
 pub fn get_binding(store: &FactStore, session_id_hex: &str) -> Option<SessionBinding> {
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: None,
         entity: Some(format!("{SESSION_BINDING_ENTITY_PREFIX}::{session_id_hex}")),
         entity_prefix: None,

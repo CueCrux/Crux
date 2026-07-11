@@ -102,6 +102,7 @@ async fn sync_manifest_and_collection_page_are_tenant_scoped() {
     {
         let mut store = state.fact_store.write().await;
         store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "business::acme::note".to_string(),
             key: "summary".to_string(),
             value: "shared tenant fact".to_string(),
@@ -112,6 +113,7 @@ async fn sync_manifest_and_collection_page_are_tenant_scoped() {
             actor: None,
         });
         store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "business::other::note".to_string(),
             key: "summary".to_string(),
             value: "other tenant fact".to_string(),
@@ -164,6 +166,7 @@ async fn sync_promotion_preview_respects_allowlist() {
     {
         let mut store = state.fact_store.write().await;
         store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "business::acme::note".to_string(),
             key: "summary".to_string(),
             value: "promote".to_string(),
@@ -174,6 +177,7 @@ async fn sync_promotion_preview_respects_allowlist() {
             actor: None,
         });
         store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "business::acme::constraint::deploy".to_string(),
             key: "constraint".to_string(),
             value: "skip by allowlist".to_string(),
@@ -209,6 +213,7 @@ async fn sync_promotion_confirm_applies_remote_records() {
     let state = test_app_state(1);
     let fact = corecrux_memory::fact_store::Fact {
         fact_id: "f_promoted_remote".to_string(),
+        tenant_hash: "default".to_string(),
         entity: "business::acme::note".to_string(),
         key: "summary".to_string(),
         value: "cloud promoted".to_string(),
@@ -277,6 +282,7 @@ async fn sync_offboard_signs_wipe_receipt_and_stores_proof() {
         let mut store = state.fact_store.write().await;
         store.store_synced(corecrux_memory::fact_store::Fact {
             fact_id: "f_acme_mirror".to_string(),
+            tenant_hash: "default".to_string(),
             entity: "business::acme::remote".to_string(),
             key: "summary".to_string(),
             value: "mirrored".to_string(),
@@ -1257,6 +1263,7 @@ async fn console_redacts_private_facts_and_session_state() {
     {
         let mut facts = state.fact_store.write().await;
         facts.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "tenant-a::service".to_string(),
             key: "public".to_string(),
             value: "safe value".to_string(),
@@ -1267,6 +1274,7 @@ async fn console_redacts_private_facts_and_session_state() {
             actor: None,
         });
         facts.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "tenant-a::service".to_string(),
             key: "api_key".to_string(),
             value: "secret-token-123".to_string(),
@@ -1595,6 +1603,7 @@ async fn console_chunk_index_lists_metadata_and_scoped_redacted_preview() {
 async fn put_fact_returns_created() {
     let state = test_app_state(16);
     let body = corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "client-supplied-must-be-ignored".to_string(),
         entity: "server".to_string(),
         key: "role".to_string(),
         value: "database primary".to_string(),
@@ -1611,6 +1620,7 @@ async fn put_fact_returns_created() {
     assert_eq!(resp.status(), StatusCode::CREATED);
     let body = json_body(resp).await;
     assert!(body["fact_id"].as_str().unwrap().starts_with("f_"));
+    assert_eq!(body["tenant_hash"], "default");
     assert_eq!(body["entity"], "server");
     assert_eq!(body["key"], "role");
     assert_eq!(body["value"], "database primary");
@@ -1622,6 +1632,7 @@ async fn put_fact_returns_created() {
 async fn put_fact_rejects_private_true_over_http() {
     let state = test_app_state(16);
     let body = corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "default".to_string(),
         entity: "server".to_string(),
         key: "internal".to_string(),
         value: "secret".to_string(),
@@ -1648,6 +1659,7 @@ async fn put_facts_bulk_rejects_private_true_over_http() {
     let state = test_app_state(16);
     let body = vec![
         corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "server".to_string(),
             key: "role".to_string(),
             value: "primary".to_string(),
@@ -1658,6 +1670,7 @@ async fn put_facts_bulk_rejects_private_true_over_http() {
             actor: None,
         },
         corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "server".to_string(),
             key: "internal".to_string(),
             value: "secret".to_string(),
@@ -1684,6 +1697,7 @@ async fn put_facts_bulk_rejects_private_true_over_http() {
 async fn put_fact_forces_reserved_prefix_private_before_store() {
     let state = test_app_state(16);
     let body = corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "default".to_string(),
         entity: "__ops__::deploy".to_string(),
         key: "status".to_string(),
         value: "ready".to_string(),
@@ -1708,6 +1722,7 @@ async fn put_facts_bulk_forces_reserved_prefix_private_before_store() {
     let state = test_app_state(16);
     let body = vec![
         corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "__bootstrap__::patterns".to_string(),
             key: "p1".to_string(),
             value: "pattern".to_string(),
@@ -1718,6 +1733,7 @@ async fn put_facts_bulk_forces_reserved_prefix_private_before_store() {
             actor: None,
         },
         corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "public".to_string(),
             key: "k".to_string(),
             value: "v".to_string(),
@@ -1749,6 +1765,7 @@ async fn put_facts_bulk_forces_reserved_prefix_private_before_store() {
 async fn get_fact_returns_stored_fact() {
     let state = test_app_state(16);
     let body = corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "default".to_string(),
         entity: "deploy".to_string(),
         key: "strategy".to_string(),
         value: "canary".to_string(),
@@ -1791,6 +1808,7 @@ async fn get_fact_not_found() {
 async fn delete_fact_soft_deletes() {
     let state = test_app_state(16);
     let body = corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "default".to_string(),
         entity: "e".to_string(),
         key: "k".to_string(),
         value: "v".to_string(),
@@ -1842,6 +1860,7 @@ async fn get_facts_by_entity_returns_matching() {
         ("proj-b", "name", "beta"),
     ] {
         let body = corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: entity.to_string(),
             key: key.to_string(),
             value: value.to_string(),
@@ -1884,6 +1903,7 @@ async fn bulk_store_facts() {
     let state = test_app_state(16);
     let facts = vec![
         corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "client-tenant-a".to_string(),
             entity: "a".to_string(),
             key: "k1".to_string(),
             value: "v1".to_string(),
@@ -1894,6 +1914,7 @@ async fn bulk_store_facts() {
             actor: None,
         },
         corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "client-tenant-b".to_string(),
             entity: "b".to_string(),
             key: "k2".to_string(),
             value: "v2".to_string(),
@@ -1912,6 +1933,7 @@ async fn bulk_store_facts() {
     let body = json_body(resp).await;
     let stored = body["facts"].as_array().expect("facts array");
     assert_eq!(stored.len(), 2);
+    assert!(stored.iter().all(|fact| fact["tenant_hash"] == "default"));
     assert_eq!(stored[0]["entity"], "a");
     assert_eq!(stored[1]["entity"], "b");
 
@@ -1930,6 +1952,7 @@ async fn query_facts_by_keyword() {
         ("testing", "approach", "integration tests"),
     ] {
         let body = corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: entity.to_string(),
             key: key.to_string(),
             value: value.to_string(),
@@ -1974,6 +1997,7 @@ async fn query_facts_as_of_filters_world_time() {
     };
     for value in ["London", "Berlin"] {
         let body = corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "person:zoe".to_string(),
             key: "city".to_string(),
             value: value.to_string(),
@@ -2051,6 +2075,7 @@ async fn query_facts_no_params_returns_all() {
     let state = test_app_state(16);
     for i in 0..3 {
         let body = corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: format!("e{}", i),
             key: "k".to_string(),
             value: format!("val{}", i),
@@ -2157,6 +2182,7 @@ async fn cases_record_and_retrieve_similar() {
 async fn query_facts_accepts_admin_read_fallback_in_dev_scopes_mode() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     let body = corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "default".to_string(),
         entity: "deploy".to_string(),
         key: "status".to_string(),
         value: "green".to_string(),
@@ -2192,6 +2218,7 @@ async fn export_facts_handles_invalid_since_and_limit_and_skips_private() {
     {
         let mut store = state.fact_store.write().await;
         store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "public".to_string(),
             key: "status".to_string(),
             value: "green".to_string(),
@@ -2202,6 +2229,7 @@ async fn export_facts_handles_invalid_since_and_limit_and_skips_private() {
             actor: None,
         });
         store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "secret".to_string(),
             key: "salary".to_string(),
             value: "redacted".to_string(),
@@ -2237,6 +2265,7 @@ async fn export_facts_honors_cursor_and_reports_next_cursor() {
     for value in ["one", "two", "three"] {
         let mut store = state.fact_store.write().await;
         let fact = store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "deploy".to_string(),
             key: value.to_string(),
             value: value.to_string(),
@@ -2390,6 +2419,7 @@ async fn fact_and_session_endpoints_use_read_and_write_scopes_in_dev_scopes_mode
         State(state.clone()),
         admin_headers.clone(),
         Json(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "proj-admin".to_string(),
             key: "status".to_string(),
             value: "green".to_string(),
@@ -2411,6 +2441,7 @@ async fn fact_and_session_endpoints_use_read_and_write_scopes_in_dev_scopes_mode
         admin_headers.clone(),
         Json(vec![
             corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "proj-admin".to_string(),
                 key: "owner".to_string(),
                 value: "ops".to_string(),
@@ -2421,6 +2452,7 @@ async fn fact_and_session_endpoints_use_read_and_write_scopes_in_dev_scopes_mode
                 actor: None,
             },
             corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "proj-admin:beta".to_string(),
                 key: "status".to_string(),
                 value: "yellow".to_string(),
@@ -2496,6 +2528,7 @@ async fn query_facts_supports_entity_prefix_top_k_and_token_budget() {
             State(state.clone()),
             HeaderMap::new(),
             Json(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: entity.to_string(),
                 key: key.to_string(),
                 value: value.to_string(),
@@ -2536,6 +2569,7 @@ async fn query_facts_applies_passport_private_visibility() {
     {
         let mut store = state.fact_store.write().await;
         store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "public".to_string(),
             key: "status".to_string(),
             value: "shared".to_string(),
@@ -2546,6 +2580,7 @@ async fn query_facts_applies_passport_private_visibility() {
             actor: None,
         });
         store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: crux_mcp::scope::private_entity_for_agent("alice", "notes"),
             key: "secret".to_string(),
             value: "alice-only".to_string(),
@@ -2556,6 +2591,7 @@ async fn query_facts_applies_passport_private_visibility() {
             actor: None,
         });
         store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: crux_mcp::scope::private_entity_for_agent("bob", "notes"),
             key: "secret".to_string(),
             value: "bob-only".to_string(),
@@ -3113,6 +3149,7 @@ async fn fact_endpoints_require_auth_in_dev_scopes_mode() {
 
     // PUT /v1/facts — no scopes → 401
     let body = corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "default".to_string(),
         entity: "e".to_string(),
         key: "k".to_string(),
         value: "v".to_string(),
@@ -3129,6 +3166,7 @@ async fn fact_endpoints_require_auth_in_dev_scopes_mode() {
 
     // PUT /v1/facts — with query:read only → 403
     let body2 = corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "default".to_string(),
         entity: "e".to_string(),
         key: "k".to_string(),
         value: "v".to_string(),
@@ -6117,6 +6155,7 @@ async fn ops_errors_returns_facts_when_enabled() {
     {
         let mut store = state.fact_store.write().await;
         store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "__ops__::error:test-err-1".to_string(),
             key: "test error".to_string(),
             value: "something went wrong".to_string(),
@@ -6146,6 +6185,7 @@ async fn ops_health_returns_latest_per_component() {
     {
         let mut store = state.fact_store.write().await;
         store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "__ops__::health:shard_store".to_string(),
             key: "health".to_string(),
             value: "degraded".to_string(),
@@ -6156,6 +6196,7 @@ async fn ops_health_returns_latest_per_component() {
             actor: None,
         });
         store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "__ops__::health:shard_store".to_string(),
             key: "health".to_string(),
             value: "healthy".to_string(),
@@ -6639,6 +6680,7 @@ async fn action_enrich_basic_is_free_and_stores_private_receipt() {
 
     let store = shared.fact_store.read().await;
     let facts = store.query(&corecrux_memory::fact_store::FactQuery {
+        tenant_hash: None,
         query: None,
         entity: None,
         entity_prefix: Some("__action_enrichment_receipt__::business::acme".to_string()),
@@ -6683,6 +6725,7 @@ async fn action_enrich_first_party_uses_local_tenant_context_when_enabled() {
         .write()
         .await
         .store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "business::acme::customer::cfo".to_string(),
             key: "constraint".to_string(),
             value: "Customer meeting conflicts with Sarah's preparation block".to_string(),
@@ -6768,6 +6811,7 @@ async fn workbench_context_pack_and_command_ledger_store_private_receipts() {
     {
         let mut store = shared.fact_store.write().await;
         store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "business::acme::memory::route-scope".to_string(),
             key: "summary".to_string(),
             value: "business::acme route scope drift context for command ledger".to_string(),
@@ -6840,6 +6884,7 @@ async fn workbench_context_pack_and_command_ledger_store_private_receipts() {
 
     let store = shared.fact_store.read().await;
     let facts = store.query(&corecrux_memory::fact_store::FactQuery {
+        tenant_hash: None,
         query: None,
         entity: None,
         entity_prefix: Some("__workbench__::business::acme::".to_string()),
@@ -6998,6 +7043,7 @@ async fn workbench_route_probe_and_api_drift_use_workspace_scan() {
         .write()
         .await
         .store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "__workspace_scan__::latest".to_string(),
             key: "content".to_string(),
             value: serde_json::to_string(&scan).expect("serialize scan"),
@@ -7092,6 +7138,7 @@ async fn workbench_audit_triage_groups_replay_failures() {
     let evidence = {
         let mut store = state.fact_store.write().await;
         store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "business::acme::doc::answer-source".to_string(),
             key: "summary".to_string(),
             value: "original answer source".to_string(),
@@ -7137,6 +7184,7 @@ async fn workbench_audit_triage_groups_replay_failures() {
             .write()
             .await
             .store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "business::acme::doc::answer-source".to_string(),
                 key: "summary".to_string(),
                 value: "updated answer source".to_string(),
@@ -7195,6 +7243,7 @@ async fn m11_closure_suite_exercises_hybrid_workbench_replay_and_offboarding() {
     let evidence = {
         let mut store = state.fact_store.write().await;
         let evidence = store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "business::acme::doc::m11-source".to_string(),
             key: "summary".to_string(),
             value: "business::acme closure context for deterministic replay".to_string(),
@@ -7297,6 +7346,7 @@ async fn m11_closure_suite_exercises_hybrid_workbench_replay_and_offboarding() {
         .write()
         .await
         .store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: evidence.entity.clone(),
             key: evidence.key.clone(),
             value: "business::acme closure context changed after answer".to_string(),
@@ -7347,6 +7397,7 @@ async fn workbench_policy_simulation_blocks_matching_critical_constraint() {
         .write()
         .await
         .store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "__constraints__::business::acme::no-prod-deploy".to_string(),
             key: "constraint".to_string(),
             value: serde_json::json!({
@@ -7533,6 +7584,7 @@ async fn answer_replay_renders_stored_answer_and_validity_detects_superseded_evi
         .write()
         .await
         .store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "tenant-a::doc::route-scope".to_string(),
             key: "content".to_string(),
             value: "The route changed auth scopes.".to_string(),
@@ -7601,6 +7653,7 @@ async fn answer_replay_renders_stored_answer_and_validity_detects_superseded_evi
         .write()
         .await
         .store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: evidence_fact.entity.clone(),
             key: evidence_fact.key.clone(),
             value: "The route changed auth scopes and tenant checks.".to_string(),
@@ -8115,6 +8168,7 @@ async fn console_tenants_classify_by_prefix_and_filter() {
             "myproject::status", // unknown prefix → work (default flipped by ExecPlan crux-tenant-category-model-2026-05-22)
         ] {
             facts.store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: entity.to_string(),
                 key: "x".to_string(),
                 value: "v".to_string(),
@@ -8219,6 +8273,7 @@ async fn console_tenant_category_patch_sets_override_then_get_reflects_it() {
     {
         let mut facts = state.fact_store.write().await;
         facts.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "execplan::foo".to_string(),
             key: "x".to_string(),
             value: "v".to_string(),
@@ -8357,6 +8412,7 @@ async fn put_fact_personal_passport_blocked_on_work_entity() {
         crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
     }
     let body = corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "default".to_string(),
         entity: "work::team::status".to_string(),
         key: "x".to_string(),
         value: "v".to_string(),
@@ -8384,6 +8440,7 @@ async fn put_fact_work_passport_allowed_on_work_entity() {
         crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
     }
     let body = corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "default".to_string(),
         entity: "work::team::status".to_string(),
         key: "x".to_string(),
         value: "v".to_string(),
@@ -8412,6 +8469,7 @@ async fn put_fact_personal_passport_blocked_on_untagged_entity_post_default_flip
         crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
     }
     let body = corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "default".to_string(),
         entity: "execplan::foo".to_string(),
         key: "x".to_string(),
         value: "v".to_string(),
@@ -8442,6 +8500,7 @@ async fn put_fact_no_passport_id_header_bypasses_enforcement() {
         crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
     }
     let body = corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "default".to_string(),
         entity: "work::team::status".to_string(),
         key: "x".to_string(),
         value: "v".to_string(),
@@ -8465,6 +8524,7 @@ async fn put_fact_system_entity_exempt_from_passport_category() {
         crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
     }
     let body = corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "default".to_string(),
         entity: "__bootstrap__::seed".to_string(),
         key: "x".to_string(),
         value: "v".to_string(),
@@ -8493,6 +8553,7 @@ async fn put_fact_unknown_passport_id_rejected_as_legacy() {
         crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
     }
     let body = corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "default".to_string(),
         entity: "work::team::status".to_string(),
         key: "x".to_string(),
         value: "v".to_string(),
@@ -8521,6 +8582,7 @@ async fn put_facts_bulk_rejects_when_any_entity_violates_category() {
     }
     let bulk = vec![
         corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "personal::a".to_string(),
             key: "x".to_string(),
             value: "1".to_string(),
@@ -8533,6 +8595,7 @@ async fn put_facts_bulk_rejects_when_any_entity_violates_category() {
         // This second entity is Work; personal-default cannot write it →
         // the entire bulk is refused.
         corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "work::b".to_string(),
             key: "x".to_string(),
             value: "1".to_string(),
@@ -8599,6 +8662,7 @@ async fn console_fact_add_override_to_personal_lets_personal_passport_write_agai
     .into_response();
     // personal-default writes myproject::foo → allowed (overridden to Personal)
     let body = corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "default".to_string(),
         entity: "myproject::foo".to_string(),
         key: "x".to_string(),
         value: "v".to_string(),
@@ -8618,6 +8682,7 @@ async fn console_fact_add_override_to_personal_lets_personal_passport_write_agai
     assert_eq!(resp.status(), StatusCode::CREATED, "personal can write after override");
     // work-default writes myproject::bar → blocked now
     let body = corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "default".to_string(),
         entity: "myproject::bar".to_string(),
         key: "x".to_string(),
         value: "v".to_string(),
@@ -8981,6 +9046,7 @@ async fn console_review_contradictions_returns_factstore_candidates() {
     let (first_id, second_id) = {
         let mut store = state.fact_store.write().await;
         let first = store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "service:api".to_string(),
             key: "enabled".to_string(),
             value: "enabled".to_string(),
@@ -8991,6 +9057,7 @@ async fn console_review_contradictions_returns_factstore_candidates() {
             actor: None,
         });
         let second = store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "service:api".to_string(),
             key: "enabled".to_string(),
             value: "disabled".to_string(),
@@ -9026,6 +9093,7 @@ async fn console_review_consolidation_supersedes_targets_with_actor() {
     let (old_id, newer_id) = {
         let mut store = state.fact_store.write().await;
         let old = store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "proj".to_string(),
             key: "status".to_string(),
             value: "blocked".to_string(),
@@ -9036,6 +9104,7 @@ async fn console_review_consolidation_supersedes_targets_with_actor() {
             actor: None,
         });
         let newer = store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "proj".to_string(),
             key: "status".to_string(),
             value: "active".to_string(),
@@ -9097,6 +9166,7 @@ async fn console_review_consolidation_rejects_receipt_linked_targets() {
         let mut store = state.fact_store.write().await;
         store
             .store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "proj".to_string(),
                 key: "decision".to_string(),
                 value: "approved".to_string(),
@@ -10193,6 +10263,7 @@ async fn rcx_publish_project_emit_stores_local_receipt() {
 
     let store = state.fact_store.read().await;
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
+        tenant_hash: None,
         query: None,
         entity: Some("__rcx_publish__::project::alpha".to_string()),
         entity_prefix: None,
@@ -11402,6 +11473,7 @@ async fn seed_dependents_graph(
     {
         let mut store = state.fact_store.write().await;
         store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: crate::repo_codegraph::shared_ids_entity(tenant_id),
             key: crate::repo_codegraph::CODEGRAPH_IDS_KEY.to_string(),
             value: serde_json::to_string(&id_store).expect("id store json"),
@@ -13158,6 +13230,7 @@ async fn wasm_summarise_extension_end_to_end_or_skip() {
             ),
         ] {
             let mut sf = corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "personal::notes::misc".to_string(),
                 key: key.to_string(),
                 value: val.to_string(),
@@ -13895,6 +13968,7 @@ fn build_test_pack(facts: Vec<(&str, &str, &str)>, tenant: &str) -> corecrux_mem
     let mut source = corecrux_memory::FactStore::new();
     for (entity, key, value) in facts {
         source.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: entity.to_string(),
             key: key.to_string(),
             value: value.to_string(),
@@ -14015,6 +14089,7 @@ async fn memory_import_collision_supersedes_never_overwrites() {
     {
         let mut store = state.fact_store.write().await;
         store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "shared".to_string(),
             key: "k".to_string(),
             value: "local-value".to_string(),

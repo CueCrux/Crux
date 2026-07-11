@@ -174,6 +174,7 @@ async fn after_mutation(state: &AppState, id: &str, actor: &str) {
     match serde_json::to_string(&receipt) {
         Ok(value) => {
             let mut fact = corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: format!("__orchestrator_receipt__::{id}"),
                 key: "record".to_string(),
                 value,
@@ -996,6 +997,7 @@ mod tests {
             "issued_at_unix_ms": 1u64,
         });
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "__passport__::claude-work".to_string(),
             key: "record".to_string(),
             value: rec.to_string(),
@@ -1058,6 +1060,7 @@ mod tests {
             "issued_at_unix_ms": 1u64,
         });
         st.fact_store.write().await.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: format!("__passport__::{id}"),
             key: "record".to_string(),
             value: rec.to_string(),

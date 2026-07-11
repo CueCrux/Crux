@@ -110,6 +110,7 @@ fn tenant_entity(project_id: &str, plane_id: &str, tenant_id: &str) -> String {
 pub fn list_planes(store: &FactStore, project_id: &str) -> Vec<PlaneRecord> {
     let prefix = format!("{PLANE_ENTITY_PREFIX}::{project_id}::");
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: None,
         entity: None,
         entity_prefix: Some(prefix.clone()),
@@ -137,6 +138,7 @@ pub fn list_planes(store: &FactStore, project_id: &str) -> Vec<PlaneRecord> {
 
 pub fn get_plane(store: &FactStore, project_id: &str, plane_id: &str) -> Option<PlaneRecord> {
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: None,
         entity: Some(record_entity(project_id, plane_id)),
         entity_prefix: None,
@@ -153,6 +155,7 @@ pub fn get_plane(store: &FactStore, project_id: &str, plane_id: &str) -> Option<
 pub fn list_members(store: &FactStore, project_id: &str, plane_id: &str) -> Vec<PlaneMember> {
     let prefix = format!("{PLANE_ENTITY_PREFIX}::{project_id}::{plane_id}::passport::");
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: None,
         entity: None,
         entity_prefix: Some(prefix),
@@ -170,6 +173,7 @@ pub fn list_members(store: &FactStore, project_id: &str, plane_id: &str) -> Vec<
 pub fn list_tenants(store: &FactStore, project_id: &str, plane_id: &str) -> Vec<PlaneTenant> {
     let prefix = format!("{PLANE_ENTITY_PREFIX}::{project_id}::{plane_id}::tenant::");
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: None,
         entity: None,
         entity_prefix: Some(prefix),
@@ -232,6 +236,7 @@ pub fn delete_plane(store: &mut FactStore, project_id: &str, plane_id: &str) -> 
         format!("{PLANE_ENTITY_PREFIX}::{project_id}::{plane_id}::tenant::"),
     ];
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: None,
         entity: None,
         entity_prefix: Some(format!("{PLANE_ENTITY_PREFIX}::{project_id}::{plane_id}")),
@@ -243,6 +248,7 @@ pub fn delete_plane(store: &mut FactStore, project_id: &str, plane_id: &str) -> 
         if fact.entity == prefixes[0] || fact.entity.starts_with(&prefixes[1]) || fact.entity.starts_with(&prefixes[2])
         {
             let mut sf = StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: fact.entity,
                 key: fact.key,
                 value: String::new(),
@@ -282,6 +288,7 @@ pub fn add_member(
     };
     let value = serde_json::to_string(&member)?;
     let mut sf = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: member_entity(project_id, plane_id, passport_id),
         key: PLANE_RECORD_KEY.to_string(),
         value,
@@ -303,6 +310,7 @@ pub fn remove_member(
     passport_id: &str,
 ) -> Result<(), PlanesError> {
     let mut sf = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: member_entity(project_id, plane_id, passport_id),
         key: PLANE_RECORD_KEY.to_string(),
         value: String::new(),
@@ -335,6 +343,7 @@ pub fn add_tenant(
     };
     let value = serde_json::to_string(&t)?;
     let mut sf = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: tenant_entity(project_id, plane_id, tenant_id),
         key: PLANE_RECORD_KEY.to_string(),
         value,
@@ -356,6 +365,7 @@ pub fn remove_tenant(
     tenant_id: &str,
 ) -> Result<(), PlanesError> {
     let mut sf = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: tenant_entity(project_id, plane_id, tenant_id),
         key: PLANE_RECORD_KEY.to_string(),
         value: String::new(),
@@ -373,6 +383,7 @@ pub fn remove_tenant(
 fn write_plane_record(store: &mut FactStore, record: &PlaneRecord) -> Result<(), PlanesError> {
     let value = serde_json::to_string(record)?;
     let mut sf = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: record_entity(&record.project_id, &record.id),
         key: PLANE_RECORD_KEY.to_string(),
         value,

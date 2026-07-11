@@ -159,6 +159,7 @@ pub fn install_extension(
     };
     let value = serde_json::to_string(&record)?;
     let mut sf = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: entity_for(&manifest.id),
         key: EXTENSION_RECORD_KEY.to_string(),
         value,
@@ -178,6 +179,7 @@ pub fn install_extension(
 pub fn list_extensions(store: &FactStore) -> Vec<InstalledExtension> {
     let prefix = format!("{EXTENSION_ENTITY_PREFIX}::");
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: Some(prefix.clone()),
         entity: None,
         entity_prefix: None,
@@ -204,6 +206,7 @@ pub fn delete_extension(store: &mut FactStore, id: &str) -> Result<(), Extension
     }
     // Tombstone via empty-value write; same pattern as project_repo_links.
     let mut sf = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: entity_for(id),
         key: EXTENSION_RECORD_KEY.to_string(),
         value: String::new(),

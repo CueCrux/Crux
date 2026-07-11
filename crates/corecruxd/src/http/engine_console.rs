@@ -418,6 +418,7 @@ fn write_access_trail(state: &AppState, route_path: &'static str, status: u16, a
         }))
         .unwrap_or_default();
         let mut fact = StoreFact {
+            tenant_hash: "default".to_string(),
             entity: ACCESS_TRAIL_ENTITY.to_string(),
             key: format!("access:{route_path}"),
             value,
@@ -678,6 +679,7 @@ mod tests {
         let mut found: Option<Value> = None;
         for _ in 0..500 {
             let query = corecrux_memory::fact_store::FactQuery {
+                tenant_hash: None,
                 query: None,
                 entity: Some(ACCESS_TRAIL_ENTITY.to_string()),
                 entity_prefix: None,
@@ -831,6 +833,7 @@ mod tests {
         let mut found: Option<Value> = None;
         for _ in 0..500 {
             let query = corecrux_memory::fact_store::FactQuery {
+                tenant_hash: None,
                 query: None,
                 entity: Some(ACCESS_TRAIL_ENTITY.to_string()),
                 entity_prefix: None,

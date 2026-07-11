@@ -140,6 +140,7 @@ async fn load_passport(ctx: &McpContext, principal_id: &str) -> Option<PassportR
 async fn load_passport_raw(ctx: &McpContext, principal_id: &str) -> Option<PassportRecord> {
     let entity = format!("{PASSPORT_PREFIX}{principal_id}");
     let q = FactQuery {
+        tenant_hash: None,
         query: None,
         entity: Some(entity),
         entity_prefix: None,
@@ -158,6 +159,7 @@ async fn load_passport_raw(ctx: &McpContext, principal_id: &str) -> Option<Passp
 async fn is_retired(ctx: &McpContext, principal_id: &str) -> bool {
     let entity = format!("{PASSPORT_PREFIX}{principal_id}");
     let q = FactQuery {
+        tenant_hash: None,
         query: None,
         entity: Some(entity),
         entity_prefix: None,
@@ -312,6 +314,7 @@ pub async fn handle_passport_split(args: &Value, ctx: &McpContext) -> Result<Val
 
     let mut store = ctx.fact_store.write().await;
     store.store(StoreFact {
+        tenant_hash: "default".to_string(),
         entity: new_entity.clone(),
         key: "passport".to_string(),
         value: canonical,
@@ -324,6 +327,7 @@ pub async fn handle_passport_split(args: &Value, ctx: &McpContext) -> Result<Val
     // Record the split lineage on BOTH passports so future reads can
     // resolve the read-through chain.
     store.store(StoreFact {
+        tenant_hash: "default".to_string(),
         entity: new_entity,
         key: KEY_SPLIT_LINEAGE.to_string(),
         value: json!({
@@ -340,6 +344,7 @@ pub async fn handle_passport_split(args: &Value, ctx: &McpContext) -> Result<Val
         actor: None,
     });
     store.store(StoreFact {
+        tenant_hash: "default".to_string(),
         entity: format!("{PASSPORT_PREFIX}{}", source.principal_id),
         key: format!("split_into:{new_name}"),
         value: json!({
@@ -550,6 +555,7 @@ pub async fn handle_passport_merge(args: &Value, ctx: &McpContext) -> Result<Val
     let mut store = ctx.fact_store.write().await;
     let source_entity = format!("{PASSPORT_PREFIX}{}", source.principal_id);
     store.store(StoreFact {
+        tenant_hash: "default".to_string(),
         entity: source_entity.clone(),
         key: KEY_RETIRED.to_string(),
         value: "true".to_string(),
@@ -560,6 +566,7 @@ pub async fn handle_passport_merge(args: &Value, ctx: &McpContext) -> Result<Val
         actor: None,
     });
     store.store(StoreFact {
+        tenant_hash: "default".to_string(),
         entity: source_entity,
         key: KEY_MERGE_STATE.to_string(),
         value: json!({
@@ -577,6 +584,7 @@ pub async fn handle_passport_merge(args: &Value, ctx: &McpContext) -> Result<Val
     });
     // Record on the target too.
     store.store(StoreFact {
+        tenant_hash: "default".to_string(),
         entity: format!("{PASSPORT_PREFIX}{}", target.principal_id),
         key: format!("merged_from:{}", source.principal_id),
         value: json!({
@@ -722,6 +730,7 @@ pub async fn handle_passport_link_device(args: &Value, ctx: &McpContext) -> Resu
 
     let mut store = ctx.fact_store.write().await;
     store.store(StoreFact {
+        tenant_hash: "default".to_string(),
         entity: format!("{PASSPORT_PREFIX}{}", passport.principal_id),
         key: format!("{KEY_LINKED_DEVICE_PREFIX}{device_fingerprint}"),
         value: json!({
@@ -824,6 +833,7 @@ pub(crate) mod tests {
             let mut store = ctx.fact_store.write().await;
             for i in 0..500 {
                 store.store(StoreFact {
+                    tenant_hash: "default".to_string(),
                     entity: format!("seed-{i}"),
                     key: "k".to_string(),
                     value: "v".to_string(),
@@ -989,6 +999,7 @@ pub(crate) mod tests {
         {
             let mut store = ctx.fact_store.write().await;
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity,
                 key: "passport".to_string(),
                 value: serde_json::to_string(&PassportRecord {
@@ -1054,6 +1065,7 @@ pub(crate) mod tests {
         {
             let mut store = ctx.fact_store.write().await;
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: format!("{PASSPORT_PREFIX}business::acme::root"),
                 key: "passport".to_string(),
                 value: serde_json::to_string(&PassportRecord {
@@ -1101,6 +1113,7 @@ pub(crate) mod tests {
         {
             let mut store = ctx.fact_store.write().await;
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: format!("{PASSPORT_PREFIX}personal::alice-old"),
                 key: "passport".to_string(),
                 value: serde_json::to_string(&PassportRecord {
@@ -1124,6 +1137,7 @@ pub(crate) mod tests {
             // Create conflict: both passports have an `__agent::<name>::prefs`
             // entity with key=city, different values.
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "__agent::personal::alice-old::prefs".to_string(),
                 key: "city".to_string(),
                 value: "Munich".to_string(),
@@ -1134,6 +1148,7 @@ pub(crate) mod tests {
                 actor: None,
             });
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "__agent::personal::alice::prefs".to_string(),
                 key: "city".to_string(),
                 value: "Berlin".to_string(),
@@ -1170,6 +1185,7 @@ pub(crate) mod tests {
         {
             let mut store = ctx.fact_store.write().await;
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: format!("{PASSPORT_PREFIX}personal::alice-old"),
                 key: "passport".to_string(),
                 value: serde_json::to_string(&PassportRecord {
@@ -1191,6 +1207,7 @@ pub(crate) mod tests {
                 actor: None,
             });
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "__agent::personal::alice-old::prefs".to_string(),
                 key: "city".to_string(),
                 value: "Munich".to_string(),
@@ -1201,6 +1218,7 @@ pub(crate) mod tests {
                 actor: None,
             });
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "__agent::personal::alice::prefs".to_string(),
                 key: "city".to_string(),
                 value: "Berlin".to_string(),
@@ -1253,6 +1271,7 @@ pub(crate) mod tests {
             let mut store = ctx.fact_store.write().await;
             for name in ["personal::alice", "personal::alice-old"] {
                 store.store(StoreFact {
+                    tenant_hash: "default".to_string(),
                     entity: format!("{PASSPORT_PREFIX}{name}"),
                     key: "passport".to_string(),
                     value: serde_json::to_string(&PassportRecord {

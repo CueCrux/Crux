@@ -199,6 +199,7 @@ fn calling_passport_fpr(ctx: &McpContext) -> Option<String> {
 
 fn installed_extensions(store: &corecrux_memory::FactStore) -> Vec<InstalledExtension> {
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
+        tenant_hash: None,
         query: None,
         entity: None,
         entity_prefix: Some(EXTENSION_ENTITY_PREFIX.to_string()),
@@ -214,6 +215,7 @@ fn installed_extensions(store: &corecrux_memory::FactStore) -> Vec<InstalledExte
 
 fn grants_for_passport(store: &corecrux_memory::FactStore, passport_fpr: &str) -> Vec<ExtensionGrant> {
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
+        tenant_hash: None,
         query: None,
         entity: None,
         entity_prefix: Some(GRANT_ENTITY_PREFIX.to_string()),
@@ -328,6 +330,7 @@ mod tests {
         });
         let mut store = ctx.fact_store.write().await;
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "__extension__::ext.example.quote".to_string(),
             key: "record".to_string(),
             value: serde_json::to_string(&installed).expect("installed json"),
@@ -338,6 +341,7 @@ mod tests {
             actor: None,
         });
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: format!("__extension_grant__::ext.example.quote::{TEST_PASSPORT}"),
             key: "record".to_string(),
             value: serde_json::to_string(&grant).expect("grant json"),

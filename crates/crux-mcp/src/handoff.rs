@@ -259,6 +259,7 @@ pub fn accept_handoff(
         };
 
         fact_store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity,
             key: fact.key,
             value: fact.value,
@@ -419,6 +420,7 @@ mod tests {
 
         let mut facts = FactStore::new();
         facts.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "sess_handoff".to_string(),
             key: "summary".to_string(),
             value: "handoff summary".to_string(),
@@ -429,6 +431,7 @@ mod tests {
             actor: None,
         });
         facts.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "__decisions__::sess_handoff".to_string(),
             key: "decision".to_string(),
             value: "Use canary rollout".to_string(),
@@ -439,6 +442,7 @@ mod tests {
             actor: None,
         });
         let linked = facts.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "deploy".to_string(),
             key: "approach".to_string(),
             value: "linked by fact id".to_string(),
@@ -453,6 +457,7 @@ mod tests {
         sessions.put("sess_handoff", session, None);
 
         facts.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "testing".to_string(),
             key: "approach".to_string(),
             value: "unrelated fact".to_string(),
@@ -463,6 +468,7 @@ mod tests {
             actor: None,
         });
         facts.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: scope::private_entity_for_agent("agent-alpha", "notes"),
             key: "internal".to_string(),
             value: "private note".to_string(),
@@ -689,6 +695,7 @@ mod tests {
         // A bundled __work__ record fact contributes a third work id.
         let mut fs = FactStore::new();
         let work_fact = fs.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "__work__::default::w_gamma".to_string(),
             key: "record".to_string(),
             value: "{}".to_string(),

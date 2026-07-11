@@ -1940,6 +1940,7 @@ mod tests {
             let mut store = ctx.fact_store.write().await;
             for i in 0..500 {
                 store.store(corecrux_memory::fact_store::StoreFact {
+                    tenant_hash: "default".to_string(),
                     entity: format!("seed-{i}"),
                     key: "k".to_string(),
                     value: "v".to_string(),
@@ -2014,6 +2015,7 @@ mod tests {
             let mut store = ctx.fact_store.write().await;
             for i in 0..500 {
                 store.store(corecrux_memory::fact_store::StoreFact {
+                    tenant_hash: "default".to_string(),
                     entity: format!("seed-{i}"),
                     key: "k".to_string(),
                     value: "v".to_string(),
@@ -2028,6 +2030,7 @@ mod tests {
             // merge call succeeds.
             use crate::tools::passport::PassportRecord;
             store.store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "__passport__::personal::alice-old".to_string(),
                 key: "passport".to_string(),
                 value: serde_json::to_string(&PassportRecord {
@@ -2111,6 +2114,7 @@ mod tests {
             let mut store = ctx.fact_store.write().await;
             for i in 0..500 {
                 store.store(corecrux_memory::fact_store::StoreFact {
+                    tenant_hash: "default".to_string(),
                     entity: format!("seed-{i}"),
                     key: "k".to_string(),
                     value: "v".to_string(),

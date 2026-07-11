@@ -431,6 +431,7 @@ pub(super) async fn get_project_layers(
     // Pull a generous slice — facts are stored append-only so the same layer
     // can have many versions; we'll dedupe to the latest below.
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
+        tenant_hash: None,
         query: Some(prefix.clone()),
         entity: None,
         entity_prefix: None,
@@ -499,6 +500,7 @@ pub(super) async fn put_project_layer(
     }
     let mut store = state.fact_store.write().await;
     let mut sf = corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "default".to_string(),
         entity: layer_entity(&id, layer),
         key: "content".to_string(),
         value: body.content,
@@ -573,6 +575,7 @@ pub(super) async fn delete_project_layer(
     let mut store = state.fact_store.write().await;
     // The fact store is append-only with versioning, so "delete" is "store empty".
     let mut sf = corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "default".to_string(),
         entity: layer_entity(&id, &layer),
         key: "content".to_string(),
         value: String::new(),

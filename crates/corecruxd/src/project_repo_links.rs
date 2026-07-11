@@ -96,6 +96,7 @@ pub fn link_repo(
     };
     let value = serde_json::to_string(&link)?;
     let mut sf = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: entity(project_id, &owner, &repo),
         key: REPO_LINK_KEY.to_string(),
         value,
@@ -113,6 +114,7 @@ pub fn link_repo(
 pub fn unlink_repo(store: &mut FactStore, project_id: &str, repo_slug: &str) -> Result<(), RepoLinkError> {
     let (owner, repo) = validate_repo_slug(repo_slug)?;
     let mut sf = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: entity(project_id, &owner, &repo),
         key: REPO_LINK_KEY.to_string(),
         value: String::new(),
@@ -130,6 +132,7 @@ pub fn unlink_repo(store: &mut FactStore, project_id: &str, repo_slug: &str) -> 
 pub fn list_links(store: &FactStore, project_id: &str) -> Vec<RepoLink> {
     let prefix = format!("{REPO_LINK_PREFIX}::{project_id}::");
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: Some(prefix.clone()),
         entity: None,
         entity_prefix: None,

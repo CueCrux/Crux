@@ -425,6 +425,7 @@ pub fn offboard_tenant_mirror(store: &mut FactStore, tenant_id: &str, membership
                 deleted_this_collection += 1;
                 deleted_fact_ids.push(fact.fact_id.clone());
                 let tombstone = store.store(crate::fact_store::StoreFact {
+                    tenant_hash: crate::fact_store::default_tenant_hash(),
                     entity: format!("__sync_tombstone__::{tenant_id}::{}", fact.fact_id),
                     key: "record".to_string(),
                     value: serde_json::json!({
@@ -1224,6 +1225,7 @@ mod tests {
         let client = SyncClient::new("http://localhost:14800", "test-key", dir.path());
         let mut store = FactStore::new();
         let fact = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "__passport__::victim".to_string(),
             key: "record".to_string(),
             value: "x".to_string(),
@@ -1283,6 +1285,7 @@ mod tests {
 
         let fact = Fact {
             fact_id: original_id.clone(),
+            tenant_hash: "default".to_string(),
             entity: "proj".to_string(),
             key: "status".to_string(),
             value: "active".to_string(),
@@ -1327,6 +1330,7 @@ mod tests {
             let mut store = FactStore::with_persistence(dir.path()).unwrap();
             let fact = Fact {
                 fact_id: original_id.clone(),
+                tenant_hash: "default".to_string(),
                 entity: "e".to_string(),
                 key: "k".to_string(),
                 value: "v".to_string(),
@@ -1389,6 +1393,7 @@ mod tests {
 
         // Store a local fact
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "local".to_string(),
             key: "k".to_string(),
             value: "v".to_string(),
@@ -1402,6 +1407,7 @@ mod tests {
         // Store a synced fact (should be excluded from push)
         let synced = Fact {
             fact_id: "f_synced_remote".to_string(),
+            tenant_hash: "default".to_string(),
             entity: "remote".to_string(),
             key: "k".to_string(),
             value: "v".to_string(),
@@ -1440,6 +1446,7 @@ mod tests {
     fn tenant_manifest_tracks_collection_hashes_and_membership() {
         let mut store = FactStore::new();
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "work::acme::topic".to_string(),
             key: "summary".to_string(),
             value: "shared project context".to_string(),
@@ -1450,6 +1457,7 @@ mod tests {
             actor: None,
         });
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "work::acme::constraint::deploy".to_string(),
             key: "constraint".to_string(),
             value: "deploys require approval".to_string(),
@@ -1502,6 +1510,7 @@ mod tests {
         let mut store = FactStore::new();
         for idx in 0..3 {
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: format!("personal::one::note::{idx}"),
                 key: "note".to_string(),
                 value: format!("value {idx}"),
@@ -1540,6 +1549,7 @@ mod tests {
     fn promotion_preview_respects_allowlist_and_skip_rules() {
         let mut store = FactStore::new();
         let local = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "business::acme::memory".to_string(),
             key: "summary".to_string(),
             value: "promote me".to_string(),
@@ -1550,6 +1560,7 @@ mod tests {
             actor: None,
         });
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "business::acme::private".to_string(),
             key: "summary".to_string(),
             value: "do not promote".to_string(),
@@ -1561,6 +1572,7 @@ mod tests {
         });
         store.store_synced(Fact {
             fact_id: "f_synced_business".to_string(),
+            tenant_hash: "default".to_string(),
             entity: "business::acme::remote".to_string(),
             key: "summary".to_string(),
             value: "already synced".to_string(),
@@ -1582,6 +1594,7 @@ mod tests {
             last_accessed_at: None,
         });
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "business::acme::constraint::deploy".to_string(),
             key: "constraint".to_string(),
             value: "not allowlisted".to_string(),
@@ -1608,6 +1621,7 @@ mod tests {
     fn offboard_tenant_mirror_deletes_only_synced_tenant_data_and_writes_tombstones() {
         let mut store = FactStore::new();
         let local = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "business::acme::local".to_string(),
             key: "summary".to_string(),
             value: "local-only should stay".to_string(),
@@ -1618,6 +1632,7 @@ mod tests {
             actor: None,
         });
         let other = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "business::other::remote".to_string(),
             key: "summary".to_string(),
             value: "other tenant should stay".to_string(),
@@ -1629,6 +1644,7 @@ mod tests {
         });
         store.store_synced(Fact {
             fact_id: "f_mirror_fact".to_string(),
+            tenant_hash: "default".to_string(),
             entity: "business::acme::remote".to_string(),
             key: "summary".to_string(),
             value: "delete mirrored fact".to_string(),
