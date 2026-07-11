@@ -17,9 +17,11 @@ use serde::{Deserialize, Serialize};
 use crate::fact_store::{Fact, FactStore};
 use crate::semantic::MemoryRecord;
 
-/// Default entity prefixes that are never pushed to remote. Users can add
-/// more via `CORECRUXD_SYNC_PRIVATE_PREFIXES`.
-const DEFAULT_PRIVATE_PREFIXES: &[&str] = &[
+/// Additional sensitive-data prefixes that are never pushed to remote.
+/// The born-private reserved prefixes come from
+/// [`crate::fact_privacy::DEFAULT_PRIVATE_PREFIXES`] so the two policies
+/// cannot drift. Users can add more via `CORECRUXD_SYNC_PRIVATE_PREFIXES`.
+const SYNC_ONLY_PRIVATE_PREFIXES: &[&str] = &[
     "finance:",
     "health:",
     "medical:",
@@ -32,8 +34,6 @@ const DEFAULT_PRIVATE_PREFIXES: &[&str] = &[
     "secret:",
     "ssn:",
     "bank:",
-    "__ops__::",
-    "__bootstrap__::",
 ];
 
 /// Client that synchronises facts between a local FactStore and a remote
@@ -852,7 +852,11 @@ impl SyncClient {
     /// * `data_dir` — directory where `sync-cursor.json` is persisted
     pub fn new(remote_url: &str, api_key: &str, data_dir: &std::path::Path) -> Self {
         // Merge default private prefixes with user-configured ones.
-        let mut prefixes: Vec<String> = DEFAULT_PRIVATE_PREFIXES.iter().map(|s| (*s).to_string()).collect();
+        let mut prefixes: Vec<String> = crate::fact_privacy::DEFAULT_PRIVATE_PREFIXES
+            .iter()
+            .chain(SYNC_ONLY_PRIVATE_PREFIXES)
+            .map(|s| (*s).to_string())
+            .collect();
         if let Ok(extra) = std::env::var("CORECRUXD_SYNC_PRIVATE_PREFIXES") {
             for p in extra.split(',') {
                 let p = p.trim();
@@ -1213,6 +1217,29 @@ impl SyncClient {
 mod tests {
     use super::*;
     use crate::fact_store::StoreFact;
+
+    #[test]
+    fn sync_defaults_cover_born_private_prefixes() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let client = SyncClient::new("http://localhost:14800", "test-key", dir.path());
+        let mut store = FactStore::new();
+        let fact = store.store(StoreFact {
+            entity: "__passport__::victim".to_string(),
+            key: "record".to_string(),
+            value: "x".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+
+        assert!(client.is_private(&fact));
+        for prefix in crate::fact_privacy::DEFAULT_PRIVATE_PREFIXES {
+            assert!(client.private_prefixes.iter().any(|candidate| candidate == prefix));
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_sync_cursor_roundtrip() {

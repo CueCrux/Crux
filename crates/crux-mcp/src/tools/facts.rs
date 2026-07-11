@@ -192,7 +192,7 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
         entity.clone()
     };
 
-    let req = StoreFact {
+    let mut req = StoreFact {
         entity,
         key: key.to_string(),
         value: value.to_string(),
@@ -241,6 +241,7 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
         }
     }
 
+    corecrux_memory::fact_privacy::enforce_global(&mut req);
     let fact = store.try_store(req).map_err(|err| JsonRpcError {
         code: INTERNAL_ERROR,
         message: "fact journal append failed".to_string(),
@@ -1018,6 +1019,22 @@ mod tests {
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.starts_with("stored fact f_"));
         assert!(text.contains("entity=proj"));
+    }
+
+    #[tokio::test]
+    async fn store_fact_born_private_reserved_prefix() {
+        let ctx = test_ctx();
+        let result = handle_store_fact(
+            &json!({"entity": "__passport__::victim", "key": "record", "value": "x"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let fact_id = result["structuredContent"]["fact_id"].as_str().unwrap();
+        let store = ctx.fact_store.read().await;
+        let fact = store.get(fact_id).unwrap();
+        assert!(fact.private, "reserved-prefix facts must be born private");
     }
 
     #[tokio::test]
