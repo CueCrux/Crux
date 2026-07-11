@@ -180,6 +180,7 @@ pub async fn handle_memory_view(args: &Value, ctx: &McpContext) -> Result<Value,
     let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
 
     let q = FactQuery {
+        tenant_hash: None,
         query: None,
         entity: entity.clone(),
         entity_prefix: None,
@@ -382,6 +383,7 @@ pub async fn handle_memory_edit(args: &Value, ctx: &McpContext) -> Result<Value,
     // audit trail is intact; the prior horizon_class is preserved so an edit
     // doesn't silently reset a pinned/overridden decay horizon.
     let req = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: existing.entity.clone(),
         key: existing.key.clone(),
         value: new_value.to_string(),
@@ -402,6 +404,7 @@ pub async fn handle_memory_edit(args: &Value, ctx: &McpContext) -> Result<Value,
     if was_pinned {
         let new_pin_entity = pin_entity(agent_name, &new_fact.fact_id);
         if let Err(err) = store.try_store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: new_pin_entity,
             key: "pinned".to_string(),
             value: "1".to_string(),
@@ -477,6 +480,7 @@ pub async fn handle_memory_pin(args: &Value, ctx: &McpContext) -> Result<Value, 
     let pin_entity_name = pin_entity(agent_name, fact_id);
     let value_str = if pinned { "1" } else { "0" };
     let req = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: pin_entity_name.clone(),
         key: "pinned".to_string(),
         value: value_str.to_string(),
@@ -649,6 +653,7 @@ mod tests {
         });
         let mut store = ctx.fact_store.write().await;
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: format!("__passport__::{id}"),
             key: "record".to_string(),
             value: record.to_string(),

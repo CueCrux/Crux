@@ -73,6 +73,7 @@ fn insert_at(
     );
     let fact = Fact {
         fact_id: format!("{fact_id}_{}", stored_at.timestamp_millis()),
+        tenant_hash: "default".to_string(),
         entity: entity.to_string(),
         key: key.to_string(),
         value: value.to_string(),
@@ -125,6 +126,7 @@ fn recall_at_k_over_locomo_style_fixture() {
     ];
     for (entity, key, value) in knowledge {
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: (*entity).to_string(),
             key: (*key).to_string(),
             value: (*value).to_string(),
@@ -152,6 +154,7 @@ fn recall_at_k_over_locomo_style_fixture() {
         let mut hits = 0usize;
         for (query, expected) in probes {
             let q = FactQuery {
+                tenant_hash: None,
                 query: Some((*query).to_string()),
                 entity: None,
                 entity_prefix: None,
@@ -258,6 +261,7 @@ fn stale_leak_rate_is_zero_after_correction() {
         insert_at(&mut s, entity, key, fresh_value, 1.0, *horizon, now);
 
         let q = FactQuery {
+            tenant_hash: None,
             query: Some((*key).to_string()),
             entity: Some((*entity).to_string()),
             entity_prefix: None,
@@ -305,6 +309,7 @@ fn bitemporal_as_of_recovers_world_state() {
         .with_timezone(&Utc);
 
     let old = store.store(StoreFact {
+        tenant_hash: "default".to_string(),
         entity: "person:alice".into(),
         key: "home_city".into(),
         value: "London".into(),
@@ -315,6 +320,7 @@ fn bitemporal_as_of_recovers_world_state() {
         actor: None,
     });
     let new = store.store(StoreFact {
+        tenant_hash: "default".to_string(),
         entity: "person:alice".into(),
         key: "home_city".into(),
         value: "Berlin".into(),
@@ -348,6 +354,7 @@ fn bitemporal_as_of_recovers_world_state() {
     );
 
     let q = FactQuery {
+        tenant_hash: None,
         query: None,
         entity: Some("person:alice".into()),
         entity_prefix: None,

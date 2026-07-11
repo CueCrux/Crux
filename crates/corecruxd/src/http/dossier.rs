@@ -50,6 +50,7 @@ async fn persist_dossier(
     let entity = entity_for(&dossier.project_id, &dossier.dossier_id);
     let mut store = fact_store.write().await;
     let mut sf = corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "default".to_string(),
         entity,
         key: DOSSIER_KEY.to_string(),
         value,
@@ -144,6 +145,7 @@ async fn list_dossier_ids_internal(
     let store = fact_store.read().await;
     let prefix = format!("{DOSSIER_PREFIX}::{project_id}::");
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
+        tenant_hash: None,
         query: Some(prefix.clone()),
         entity: None,
         entity_prefix: None,
@@ -178,6 +180,7 @@ async fn load_dossier(
     let store = fact_store.read().await;
     let entity = entity_for(project_id, dossier_id);
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
+        tenant_hash: None,
         query: None,
         entity: Some(entity.clone()),
         entity_prefix: None,

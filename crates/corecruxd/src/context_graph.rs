@@ -444,6 +444,7 @@ pub fn build_for_project_with_opts(store: &FactStore, project_id: &str, opts: &G
 fn query_prefix(store: &FactStore, prefix: &str, top_k: usize) -> Vec<corecrux_memory::fact_store::Fact> {
     store
         .query(&FactQuery {
+            tenant_hash: None,
             query: Some(prefix.to_string()),
             entity: None,
             entity_prefix: None,
@@ -465,6 +466,7 @@ pub fn load_latest_workspace_blocking_pub(store: &FactStore) -> Option<crate::wo
 
 fn load_latest_workspace_blocking(store: &FactStore) -> Option<crate::workspace_scan::WorkspaceScan> {
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: Some("__workspace_scan__::latest".to_string()),
         entity: None,
         entity_prefix: None,
@@ -662,6 +664,7 @@ fn fold_workspace_into_graph(g: &mut ContextGraph, scan: &crate::workspace_scan:
 
 fn count_facts_with_prefix(store: &FactStore, prefix: &str) -> usize {
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: Some(prefix.to_string()),
         entity: None,
         entity_prefix: None,

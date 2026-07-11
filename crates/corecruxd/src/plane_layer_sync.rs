@@ -294,6 +294,7 @@ pub fn run_sync(
         if confirm {
             let entity = format!("__plane_layer__::{}::{}::{}", project_id, plane.id, layer);
             let mut sf = corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
                 entity,
                 key: "content".to_string(),
                 value: payload.clone(),

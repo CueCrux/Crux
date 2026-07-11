@@ -244,6 +244,7 @@ pub(super) async fn get_plane_layers(
     let store = state.fact_store.read().await;
     let prefix = format!("{PLANE_LAYER_PREFIX}::{project_id}::{plane_id}::");
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
+        tenant_hash: None,
         query: Some(prefix.clone()),
         entity: None,
         entity_prefix: None,
@@ -310,6 +311,7 @@ pub(super) async fn put_plane_layer(
     }
     let mut store = state.fact_store.write().await;
     let mut sf = corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "default".to_string(),
         entity: plane_layer_entity(&project_id, &plane_id, layer),
         key: "content".to_string(),
         value: body.content,
@@ -404,6 +406,7 @@ pub(super) async fn delete_plane_layer(
     }
     let mut store = state.fact_store.write().await;
     let mut sf = corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "default".to_string(),
         entity: plane_layer_entity(&project_id, &plane_id, &layer),
         key: "content".to_string(),
         value: String::new(),

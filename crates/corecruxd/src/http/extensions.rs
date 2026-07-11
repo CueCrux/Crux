@@ -726,6 +726,7 @@ pub(super) async fn invoke_extension_tool(
                 continue; // already counted as dropped
             }
             let mut sf = corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: w.entity.clone(),
                 key: w.key.clone(),
                 value: w.value.clone(),

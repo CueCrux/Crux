@@ -193,6 +193,7 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
     };
 
     let mut req = StoreFact {
+        tenant_hash: tenant_hash_for_write_context(ctx),
         entity,
         key: key.to_string(),
         value: value.to_string(),
@@ -350,6 +351,14 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
     }))
 }
 
+/// Resolve the trusted tenant stamp for an MCP write.
+///
+/// Authenticated MCP context has no tenant claim yet, so current deployments
+/// resolve to `default`. When one is added, only this helper needs to change.
+fn tenant_hash_for_write_context(_ctx: &McpContext) -> String {
+    corecrux_memory::fact_store::default_tenant_hash()
+}
+
 /// `fact_history` — return the full version chain for a given (entity, key) pair.
 pub async fn handle_fact_history(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let entity = require_str(args, "entity")?;
@@ -440,6 +449,7 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
     // legacy budget-drop.
     let reversible = !unshaped && token_budget.is_some() && crate::crc_v1::enabled(args);
     let q = FactQuery {
+        tenant_hash: None,
         // cloned so `query`/`entity` remain available for the CRC-v1 reshape below
         query: query.clone(),
         entity: entity.clone(),
@@ -677,6 +687,7 @@ fn query_visible_facts_opts_as_of(
         .filter(|fact| as_of.is_none_or(|instant| fact.valid_at(instant)))
         .filter(|fact| include_superseded || fact.superseded_by.is_none())
         .filter(|fact| scope::fact_visible_to_identity(fact, identity, aliases))
+        .filter(|fact| q.tenant_hash.as_ref().is_none_or(|tenant| fact.tenant_hash == *tenant))
         .filter(|fact| {
             q.entity_prefix
                 .as_ref()
@@ -776,6 +787,7 @@ pub async fn handle_get_bootstrap(args: &Value, ctx: &McpContext) -> Result<Valu
     };
 
     let q = FactQuery {
+        tenant_hash: None,
         query,
         entity: None,
         entity_prefix: Some(prefix),
@@ -861,6 +873,7 @@ mod tests {
             // Six facts with longish values so a tight budget cuts the tail.
             for i in 0..6 {
                 store.store(StoreFact {
+                    tenant_hash: "default".to_string(),
                     entity: "proj".to_string(),
                     key: format!("k{i}"),
                     value: format!("needle {}", "lorem ipsum dolor sit amet ".repeat(8)),
@@ -999,6 +1012,7 @@ mod tests {
         });
         let mut store = ctx.fact_store.write().await;
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: format!("__passport__::{id}"),
             key: "record".to_string(),
             value: record.to_string(),
@@ -1019,6 +1033,8 @@ mod tests {
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.starts_with("stored fact f_"));
         assert!(text.contains("entity=proj"));
+        let store = ctx.fact_store.read().await;
+        assert!(store.all_facts().all(|fact| fact.tenant_hash == "default"));
     }
 
     #[tokio::test]
@@ -1729,6 +1745,7 @@ mod tests {
     ) -> Fact {
         Fact {
             fact_id: fact_id.to_string(),
+            tenant_hash: "default".to_string(),
             entity: entity.to_string(),
             key: "state".to_string(),
             value: value.to_string(),

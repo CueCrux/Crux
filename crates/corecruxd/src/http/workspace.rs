@@ -50,6 +50,7 @@ pub(super) async fn post_scan(State(state): State<AppState>, headers: HeaderMap)
     {
         let mut store = state.fact_store.write().await;
         let mut sf = corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: LATEST_SCAN_ENTITY.to_string(),
             key: SCAN_KEY.to_string(),
             value,

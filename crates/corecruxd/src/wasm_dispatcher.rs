@@ -169,6 +169,7 @@ impl HostFactStore for WasmFactStoreAdapter {
     fn read_fact(&self, entity: &str, key: &str) -> Option<HostFact> {
         let store = self.store.blocking_read();
         let result = store.query(&FactQuery {
+            tenant_hash: None,
             query: None,
             entity: Some(entity.to_string()),
             entity_prefix: None,
@@ -182,6 +183,7 @@ impl HostFactStore for WasmFactStoreAdapter {
     fn store_fact(&self, req: HostStoreFact) -> Result<HostFact, String> {
         let mut store = self.store.blocking_write();
         let mut sf = StoreFact {
+            tenant_hash: "default".to_string(),
             entity: req.entity,
             key: req.key,
             value: req.value,
@@ -200,6 +202,7 @@ impl HostFactStore for WasmFactStoreAdapter {
     fn query_facts(&self, q: HostFactQuery) -> Vec<HostFact> {
         let store = self.store.blocking_read();
         let result = store.query(&FactQuery {
+            tenant_hash: None,
             query: q.query,
             entity: None,
             entity_prefix: q.entity_prefix,

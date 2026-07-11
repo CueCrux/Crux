@@ -104,6 +104,7 @@ pub fn validate_repo_id(id: &str) -> Result<(), RepoRegistryError> {
 pub fn list_repos(store: &FactStore, tenant_id: &str) -> Vec<RepoRegistration> {
     let prefix = format!("{REPO_REGISTRY_PREFIX}::{tenant_id}::");
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: None,
         entity: None,
         entity_prefix: Some(prefix),
@@ -125,6 +126,7 @@ pub fn list_repos(store: &FactStore, tenant_id: &str) -> Vec<RepoRegistration> {
 
 pub fn list_all_repos(store: &FactStore) -> Vec<RepoRegistration> {
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: None,
         entity: None,
         entity_prefix: Some(format!("{REPO_REGISTRY_PREFIX}::")),
@@ -147,6 +149,7 @@ pub fn list_all_repos(store: &FactStore) -> Vec<RepoRegistration> {
 pub fn get_repo(store: &FactStore, tenant_id: &str, repo_id: &str) -> Option<RepoRegistration> {
     let entity = registry_entity(tenant_id, repo_id);
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: None,
         entity: Some(entity),
         entity_prefix: None,
@@ -164,6 +167,7 @@ pub fn store_repo(store: &mut FactStore, registration: &RepoRegistration) -> Res
     validate_repo_id(&registration.repo_id)?;
     let value = serde_json::to_string(registration)?;
     store.store(StoreFact {
+        tenant_hash: "default".to_string(),
         entity: registry_entity(&registration.tenant_id, &registration.repo_id),
         key: REPO_FACT_KEY.to_string(),
         value,
@@ -192,6 +196,7 @@ pub fn create_repo(store: &mut FactStore, registration: &RepoRegistration) -> Re
 pub fn load_scan_json(store: &FactStore, tenant_id: &str, repo_id: &str) -> Option<String> {
     let entity = scan_entity(tenant_id, repo_id);
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: None,
         entity: Some(entity),
         entity_prefix: None,
@@ -206,6 +211,7 @@ pub fn load_scan_json(store: &FactStore, tenant_id: &str, repo_id: &str) -> Opti
 
 pub fn store_scan_json(store: &mut FactStore, tenant_id: &str, repo_id: &str, scan_json: String) {
     store.store(StoreFact {
+        tenant_hash: "default".to_string(),
         entity: scan_entity(tenant_id, repo_id),
         key: REPO_FACT_KEY.to_string(),
         value: scan_json,

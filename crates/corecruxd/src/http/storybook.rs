@@ -73,6 +73,7 @@ pub(super) async fn post_generate(
     {
         let mut store = state.fact_store.write().await;
         let mut sf = corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: entity_for(&project_id, now_ms),
             key: STORYBOOK_KEY.to_string(),
             value,
@@ -104,6 +105,7 @@ async fn list_storybook_versions_internal(
     let store = fact_store.read().await;
     let prefix = format!("{STORYBOOK_PREFIX}::{project_id}::");
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
+        tenant_hash: None,
         query: Some(prefix.clone()),
         entity: None,
         entity_prefix: None,
@@ -128,6 +130,7 @@ async fn load_storybook(
     let store = fact_store.read().await;
     let entity = entity_for(project_id, ts);
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
+        tenant_hash: None,
         query: None,
         entity: Some(entity.clone()),
         entity_prefix: None,

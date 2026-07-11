@@ -450,6 +450,7 @@ pub async fn handle_memory_reverify(args: &Value, ctx: &McpContext) -> Result<Va
         "reverified_at": now.to_rfc3339(),
     });
     let req = corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "default".to_string(),
         entity: format!("__reverify_receipts__::{fact_id}"),
         key: receipt_id.clone(),
         value: receipt_body.to_string(),
@@ -851,6 +852,7 @@ mod tests {
         // since reserved is a runtime check on entity strings).
         let mut store = alice.fact_store.write().await;
         let f = store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "__ops::leak".to_string(),
             key: "k".to_string(),
             value: "v".to_string(),

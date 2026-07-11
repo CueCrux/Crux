@@ -77,6 +77,20 @@ fn raw_admin_write(ctx: &crate::auth::HttpScopeContext) -> bool {
     ctx.passport_id.is_none() && ctx.has_scope("admin:write")
 }
 
+/// Resolve the trusted tenant stamp for an HTTP write.
+///
+/// HTTP auth context has no tenant claim yet, so current deployments resolve to
+/// `default`. When a real tenant source is added here, three other surfaces must
+/// be revisited in the SAME change or they become a stamping/read bypass (tracked
+/// as security-critical-7-tenant-isolation C5 follow-ups):
+///
+/// - `FactStore::store_synced` (sync-pull) inserts a peer-supplied `Fact` verbatim, so a peer-controlled `tenant_hash` would survive — validate or re-stamp it.
+/// - The unfiltered read helpers (`all_facts`, `get`, `get_by_entity`, `fact_history`, export) do not apply the tenant filter — no-op while everything is `default`, but they must gain a tenant predicate.
+/// - MCP `handle_store_fact`'s equivalent write hook.
+fn tenant_hash_for_write_context(_ctx: &crate::auth::HttpScopeContext) -> String {
+    corecrux_memory::fact_store::default_tenant_hash()
+}
+
 fn render_fact_for_http(
     fact: &corecrux_memory::fact_store::Fact,
     ctx: &crate::auth::HttpScopeContext,
@@ -101,6 +115,8 @@ fn prepare_fact_write_checked(
     ctx: &crate::auth::HttpScopeContext,
     mut fact: corecrux_memory::fact_store::StoreFact,
 ) -> Result<corecrux_memory::fact_store::StoreFact, Response> {
+    // Never trust a client-supplied tenant stamp; derive it from auth context.
+    fact.tenant_hash = tenant_hash_for_write_context(ctx);
     if fact.private {
         return Err(problem_response(
             StatusCode::BAD_REQUEST,
@@ -173,6 +189,7 @@ pub(super) fn query_visible_http_facts_as_of(
         .filter(|fact| !fact.deleted)
         .filter(|fact| as_of.is_none_or(|instant| fact.valid_at(instant)))
         .filter(|fact| crux_mcp::scope::fact_visible_to_agent(fact, agent_name))
+        .filter(|fact| q.tenant_hash.as_ref().is_none_or(|tenant| fact.tenant_hash == *tenant))
         .filter(|fact| {
             q.entity_prefix
                 .as_ref()
@@ -434,6 +451,7 @@ pub(super) async fn query_facts(
     let q = corecrux_memory::fact_store::FactQuery {
         query: params.query,
         entity: params.entity,
+        tenant_hash: None,
         entity_prefix: params.entity_prefix,
         top_k: params.top_k.unwrap_or(10).clamp(1, MAX_FACT_QUERY_TOP_K),
         token_budget: params.token_budget,

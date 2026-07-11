@@ -156,6 +156,7 @@ pub(crate) async fn get_agent_passport(ctx: &McpContext) -> Option<PassportRecor
 pub(crate) async fn get_passport_by_name(ctx: &McpContext, name: &str) -> Option<PassportRecord> {
     let entity = format!("{PASSPORT_PREFIX}{name}");
     let q = FactQuery {
+        tenant_hash: None,
         query: None,
         entity: Some(entity),
         entity_prefix: None,
@@ -320,6 +321,7 @@ async fn mint_passport(
     let entity = format!("{PASSPORT_PREFIX}{principal}");
 
     let req = StoreFact {
+        tenant_hash: "default".to_string(),
         entity,
         key: "passport".to_string(),
         value: canonical,
@@ -405,6 +407,7 @@ pub async fn handle_get_passport(_args: &Value, ctx: &McpContext) -> Result<Valu
                 let canonical = serde_json::to_string(&record).unwrap_or_default();
                 let entity = format!("{PASSPORT_PREFIX}{agent_name}");
                 let req = StoreFact {
+                    tenant_hash: "default".to_string(),
                     entity,
                     key: "passport".to_string(),
                     value: canonical,
@@ -537,6 +540,7 @@ pub async fn handle_revoke_passport(args: &Value, ctx: &McpContext) -> Result<Va
         let mut store = ctx.fact_store.write().await;
         // 1. Mark the passport record revoked.
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: entity.clone(),
             key: "passport".to_string(),
             value: canonical,
@@ -549,6 +553,7 @@ pub async fn handle_revoke_passport(args: &Value, ctx: &McpContext) -> Result<Va
         // 2. Receipted audit record of the revocation event (QC.3-attributed,
         //    T.4 audit trail via the store's append/receipt path).
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity,
             key: "revocation".to_string(),
             value: event.to_string(),
@@ -754,6 +759,7 @@ mod tests {
             let mut store = ctx.fact_store.write().await;
             for i in 0..10 {
                 store.store(StoreFact {
+                    tenant_hash: "default".to_string(),
                     entity: format!("test-{i}"),
                     key: "k".to_string(),
                     value: "v".to_string(),
@@ -898,6 +904,7 @@ mod tests {
             let mut store = base.fact_store.write().await;
             for i in 0..10 {
                 store.store(StoreFact {
+                    tenant_hash: "default".to_string(),
                     entity: format!("rcpt-{i}"),
                     key: "k".to_string(),
                     value: "v".to_string(),
@@ -1013,6 +1020,7 @@ mod tests {
             let mut store = base.fact_store.write().await;
             for i in 0..10 {
                 store.store(StoreFact {
+                    tenant_hash: "default".to_string(),
                     entity: format!("rcpt-{i}"),
                     key: "k".to_string(),
                     value: "v".to_string(),
@@ -1236,6 +1244,7 @@ mod tests {
             let mut store = ctx.fact_store.write().await;
             for i in 0..10 {
                 store.store(StoreFact {
+                    tenant_hash: "default".to_string(),
                     entity: format!("r-{i}"),
                     key: "k".to_string(),
                     value: "v".to_string(),

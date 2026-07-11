@@ -199,6 +199,7 @@ mod tests {
 
     fn store_fact(store: &mut FactStore, entity: &str, key: &str, private: bool) -> Fact {
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: entity.to_string(),
             key: key.to_string(),
             value: "{}".to_string(),
@@ -216,6 +217,7 @@ mod tests {
     fn fact(entity: &str, fact_id: &str, stored_at: DateTime<Utc>, private: bool) -> Fact {
         Fact {
             fact_id: fact_id.to_string(),
+            tenant_hash: "default".to_string(),
             entity: entity.to_string(),
             key: "record".to_string(),
             value: "{}".to_string(),
@@ -247,6 +249,7 @@ mod tests {
         );
         Fact {
             fact_id: fact_id.to_string(),
+            tenant_hash: "default".to_string(),
             entity: format!("__session_binding__::{session_hex}"),
             key: "record".to_string(),
             value,
@@ -404,6 +407,7 @@ mod tests {
         {
             let mut g = store.write().await;
             g.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "__session_binding__::z".to_string(),
                 key: "record".to_string(),
                 value: r#"{"session_id_hex":"z","project_id":null,"tenant_id":"personal","passport_id":"personal-default","passport_category":"personal","agent_work_gate":false,"bound_at_unix_ms":0}"#.to_string(),

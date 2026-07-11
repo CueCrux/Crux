@@ -128,6 +128,7 @@ impl MetricsSampler {
 
             let value = serde_json::to_string(&evt).unwrap_or_default();
             let fact = store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity,
                 key: EVT_OPS_METRIC_V1.to_string(),
                 value,

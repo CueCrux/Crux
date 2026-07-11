@@ -126,6 +126,7 @@ pub fn list_projects(store: &FactStore) -> Vec<ProjectRecord> {
     // the project descriptor's entity is exactly `__project__::{id}` (no further
     // `::passport::` or `::tenant::` segments).
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: None,
         entity: None,
         entity_prefix: Some(format!("{PROJECT_ENTITY_PREFIX}::")),
@@ -160,6 +161,7 @@ pub fn get_project(store: &FactStore, id: &str) -> Option<ProjectRecord> {
 pub fn list_members(store: &FactStore, project_id: &str) -> Vec<ProjectMember> {
     let prefix = format!("{PROJECT_ENTITY_PREFIX}::{project_id}::passport::");
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: None,
         entity: None,
         entity_prefix: Some(prefix),
@@ -182,6 +184,7 @@ pub fn list_members(store: &FactStore, project_id: &str) -> Vec<ProjectMember> {
 pub fn list_tenants(store: &FactStore, project_id: &str) -> Vec<ProjectTenant> {
     let prefix = format!("{PROJECT_ENTITY_PREFIX}::{project_id}::tenant::");
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: None,
         entity: None,
         entity_prefix: Some(prefix),
@@ -331,6 +334,7 @@ pub fn delete_project(store: &mut FactStore, id: &str) -> Result<(), ProjectsErr
     ];
     for prefix in prefixes {
         let result = store.query(&FactQuery {
+            tenant_hash: None,
             query: None,
             entity: None,
             entity_prefix: Some(prefix.clone()),
@@ -375,6 +379,7 @@ pub fn add_member(
     };
     let value = serde_json::to_string(&member)?;
     let mut sf = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: format!("{PROJECT_ENTITY_PREFIX}::{project_id}::passport::{passport_id}"),
         key: PROJECT_RECORD_KEY.to_string(),
         value,
@@ -392,6 +397,7 @@ pub fn add_member(
 pub fn remove_member(store: &mut FactStore, project_id: &str, passport_id: &str) -> Result<(), ProjectsError> {
     let entity = format!("{PROJECT_ENTITY_PREFIX}::{project_id}::passport::{passport_id}");
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: None,
         entity: Some(entity),
         entity_prefix: None,
@@ -423,6 +429,7 @@ pub fn add_tenant(
     };
     let value = serde_json::to_string(&t)?;
     let mut sf = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: format!("{PROJECT_ENTITY_PREFIX}::{project_id}::tenant::{tenant_id}"),
         key: PROJECT_RECORD_KEY.to_string(),
         value,
@@ -440,6 +447,7 @@ pub fn add_tenant(
 pub fn remove_tenant(store: &mut FactStore, project_id: &str, tenant_id: &str) -> Result<(), ProjectsError> {
     let entity = format!("{PROJECT_ENTITY_PREFIX}::{project_id}::tenant::{tenant_id}");
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: None,
         entity: Some(entity),
         entity_prefix: None,
@@ -477,6 +485,7 @@ pub fn seed_default_if_missing(store: &mut FactStore, now_unix_ms: u64) -> Resul
 fn write_record(store: &mut FactStore, record: &ProjectRecord) -> Result<(), ProjectsError> {
     let value = serde_json::to_string(record)?;
     let mut sf = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: format!("{PROJECT_ENTITY_PREFIX}::{}", record.id),
         key: PROJECT_RECORD_KEY.to_string(),
         value,

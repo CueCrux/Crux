@@ -623,6 +623,7 @@ pub fn plan_import(
             .as_ref()
             .map(|a| opts.principal_map.get(a).cloned().unwrap_or_else(|| a.clone()));
         plan.to_store.push(StoreFact {
+            tenant_hash: fact.tenant_hash.clone(),
             entity: fact.entity.clone(),
             key: fact.key.clone(),
             value: fact.value.clone(),
@@ -680,6 +681,7 @@ mod tests {
 
     fn sf(entity: &str, key: &str, value: &str, private: bool) -> StoreFact {
         StoreFact {
+            tenant_hash: "default".to_string(),
             entity: entity.into(),
             key: key.into(),
             value: value.into(),

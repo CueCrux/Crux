@@ -139,6 +139,10 @@ impl Default for HorizonClass {
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Fact {
     pub fact_id: String,
+    /// Tenant isolation stamp. Historical facts deserialize into the single-
+    /// tenant `default` namespace, so no backfill or down-migration is needed.
+    #[serde(default = "default_tenant_hash")]
+    pub tenant_hash: String,
     pub entity: String,
     pub key: String,
     pub value: String,
@@ -227,6 +231,14 @@ fn default_version() -> u32 {
     1
 }
 
+/// Tenant namespace used until authenticated contexts carry a tenant claim.
+///
+/// Keeping the fallback in one helper makes future context-derived stamping a
+/// one-line change while preserving existing single-tenant query behaviour.
+pub fn default_tenant_hash() -> String {
+    "default".to_string()
+}
+
 impl Fact {
     /// Bi-temporal predicate: was this fact true IN THE WORLD at `instant`?
     ///
@@ -245,6 +257,11 @@ impl Fact {
 /// Request to store a new fact.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct StoreFact {
+    /// Tenant stamp supplied by the trusted write path. JSON callers cannot
+    /// bypass isolation because daemon/MCP handlers overwrite it from their
+    /// authenticated context before storage.
+    #[serde(default = "default_tenant_hash")]
+    pub tenant_hash: String,
     pub entity: String,
     pub key: String,
     pub value: String,
@@ -346,6 +363,10 @@ fn default_confidence() -> f32 {
 pub struct FactQuery {
     pub query: Option<String>,
     pub entity: Option<String>,
+    /// Optional tenant filter. `None` preserves the historical single-tenant
+    /// result set; `Some` restricts results to the matching tenant stamp.
+    #[serde(default)]
+    pub tenant_hash: Option<String>,
     /// Filter entities starting with this prefix (e.g., `__ops__::` or `__bootstrap__::`)
     #[serde(default)]
     pub entity_prefix: Option<String>,
@@ -534,6 +555,7 @@ impl FactStore {
 
         Fact {
             fact_id: fact_id.clone(),
+            tenant_hash: req.tenant_hash,
             entity: req.entity.clone(),
             key: req.key.clone(),
             value: req.value,
@@ -890,6 +912,7 @@ impl FactStore {
             .facts
             .values()
             .filter(|f| !f.deleted)
+            .filter(|f| q.tenant_hash.as_ref().is_none_or(|tenant| f.tenant_hash == *tenant))
             .filter(|f| match as_of {
                 Some(instant) => f.valid_at(instant),
                 None => true,
@@ -1232,6 +1255,11 @@ impl FactStore {
     /// Insert a fact directly with its original identity (fact_id, version,
     /// timestamps). Used for facts arriving from a remote sync — skips version
     /// chain logic but DOES append to the journal for persistence.
+    ///
+    /// TODO(multi-tenant, C5 follow-up): this trusts the peer-supplied
+    /// `fact.tenant_hash` verbatim. Harmless while every fact is `default`, but
+    /// once `tenant_hash` is meaningful this is a stamping bypass — validate or
+    /// re-stamp against the peer's authorized tenant here.
     pub fn store_synced(&mut self, fact: Fact) {
         let fact_id = fact.fact_id.clone();
         let entity = fact.entity.clone();
@@ -1363,6 +1391,7 @@ impl FactStore {
 
         let canonical = self
             .try_store(StoreFact {
+                tenant_hash: default_tenant_hash(),
                 entity: req.entity.clone(),
                 key: req.key.clone(),
                 value: req.canonical_value,
@@ -1469,6 +1498,7 @@ mod tests {
             "deleted": false
         }"#;
         let fact: Fact = serde_json::from_str(json).expect("legacy fact must deserialize");
+        assert_eq!(fact.tenant_hash, "default");
         assert_eq!(fact.actor, None, "legacy facts must load with actor = None");
         // And it must not re-serialize the key (skip_serializing_if).
         let round = serde_json::to_string(&fact).unwrap();
@@ -1480,6 +1510,7 @@ mod tests {
         let mut store = FactStore::new();
 
         let fact = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "deployment".to_string(),
             key: "strategy".to_string(),
             value: "canary deployment with evaluator programme".to_string(),
@@ -1501,6 +1532,7 @@ mod tests {
     #[test]
     fn fact_store_enforces_born_private_policy_at_every_request_entry_point() {
         let request = |entity: &str, private| StoreFact {
+            tenant_hash: "default".to_string(),
             entity: entity.to_string(),
             key: "record".to_string(),
             value: "sensitive".to_string(),
@@ -1532,6 +1564,7 @@ mod tests {
         let mut store = FactStore::new();
 
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "deployment".to_string(),
             key: "strategy".to_string(),
             value: "canary deployment".to_string(),
@@ -1542,6 +1575,7 @@ mod tests {
             actor: None,
         });
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "testing".to_string(),
             key: "approach".to_string(),
             value: "integration tests with real database".to_string(),
@@ -1553,6 +1587,7 @@ mod tests {
         });
 
         let result = store.query(&FactQuery {
+            tenant_hash: None,
             entity_prefix: None,
             query: Some("deployment".to_string()),
             entity: None,
@@ -1569,6 +1604,7 @@ mod tests {
         let mut store = FactStore::new();
 
         let first = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "service:api".to_string(),
             key: "enabled".to_string(),
             value: "enabled".to_string(),
@@ -1579,6 +1615,7 @@ mod tests {
             actor: None,
         });
         let second = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "service:api".to_string(),
             key: "enabled".to_string(),
             value: "disabled".to_string(),
@@ -1607,6 +1644,7 @@ mod tests {
         let mut store = FactStore::new();
 
         let old = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "proj".to_string(),
             key: "status".to_string(),
             value: "blocked".to_string(),
@@ -1617,6 +1655,7 @@ mod tests {
             actor: None,
         });
         let newer = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "proj".to_string(),
             key: "status".to_string(),
             value: "active".to_string(),
@@ -1664,6 +1703,7 @@ mod tests {
     fn consolidate_facts_v1_rejects_protected_targets() {
         let mut store = FactStore::new();
         let linked = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "proj".to_string(),
             key: "decision".to_string(),
             value: "approved".to_string(),
@@ -1698,6 +1738,7 @@ mod tests {
         let mut store = FactStore::new();
 
         let fact = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "test".to_string(),
             key: "key".to_string(),
             value: "value".to_string(),
@@ -1721,6 +1762,7 @@ mod tests {
         // Each value is ~10 tokens (40 bytes)
         for i in 0..10 {
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "item".to_string(),
                 key: format!("key_{}", i),
                 value: format!("this is a value with about forty bytes here-{:02}", i),
@@ -1733,6 +1775,7 @@ mod tests {
         }
 
         let result = store.query(&FactQuery {
+            tenant_hash: None,
             entity_prefix: None,
             query: None,
             entity: Some("item".to_string()),
@@ -1755,6 +1798,7 @@ mod tests {
         let mut store = FactStore::new();
 
         let f1 = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "proj".to_string(),
             key: "name".to_string(),
             value: "alpha".to_string(),
@@ -1765,6 +1809,7 @@ mod tests {
             actor: None,
         });
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "proj".to_string(),
             key: "status".to_string(),
             value: "active".to_string(),
@@ -1787,6 +1832,7 @@ mod tests {
 
         let reqs = vec![
             StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "a".to_string(),
                 key: "k1".to_string(),
                 value: "v1".to_string(),
@@ -1797,6 +1843,7 @@ mod tests {
                 actor: None,
             },
             StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "b".to_string(),
                 key: "k2".to_string(),
                 value: "v2".to_string(),
@@ -1820,6 +1867,7 @@ mod tests {
         let mut store = FactStore::new();
 
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "alpha".to_string(),
             key: "info".to_string(),
             value: "shared keyword here".to_string(),
@@ -1830,6 +1878,7 @@ mod tests {
             actor: None,
         });
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "beta".to_string(),
             key: "info".to_string(),
             value: "shared keyword here".to_string(),
@@ -1841,6 +1890,7 @@ mod tests {
         });
 
         let result = store.query(&FactQuery {
+            tenant_hash: None,
             entity_prefix: None,
             query: Some("keyword".to_string()),
             entity: Some("alpha".to_string()),
@@ -1858,6 +1908,7 @@ mod tests {
 
         for i in 0..3 {
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: format!("e{}", i),
                 key: "k".to_string(),
                 value: format!("val{}", i),
@@ -1870,6 +1921,7 @@ mod tests {
         }
 
         let result = store.query(&FactQuery {
+            tenant_hash: None,
             entity_prefix: None,
             query: None,
             entity: None,
@@ -1881,10 +1933,72 @@ mod tests {
     }
 
     #[test]
+    fn query_tenant_hash_returns_only_matching_tenant() {
+        let mut store = FactStore::new();
+        let request = |tenant_hash: &str| StoreFact {
+            tenant_hash: tenant_hash.to_string(),
+            entity: "shared-entity".to_string(),
+            key: "shared-key".to_string(),
+            value: "shared-value".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        };
+
+        store.store(request("tenant-a"));
+        store.store(request("tenant-b"));
+
+        let result = store.query(&FactQuery {
+            query: None,
+            entity: None,
+            tenant_hash: Some("tenant-a".to_string()),
+            entity_prefix: None,
+            top_k: 10,
+            token_budget: None,
+        });
+
+        assert_eq!(result.facts.len(), 1);
+        assert_eq!(result.facts[0].tenant_hash, "tenant-a");
+    }
+
+    #[test]
+    fn query_without_tenant_hash_preserves_single_tenant_result_set() {
+        let mut store = FactStore::new();
+        for key in ["first", "second"] {
+            store.store(StoreFact {
+                tenant_hash: default_tenant_hash(),
+                entity: "single-tenant".to_string(),
+                key: key.to_string(),
+                value: "value".to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            });
+        }
+
+        let result = store.query(&FactQuery {
+            query: None,
+            entity: None,
+            tenant_hash: None,
+            entity_prefix: None,
+            top_k: 10,
+            token_budget: None,
+        });
+
+        assert_eq!(result.facts.len(), 2);
+        assert!(result.facts.iter().all(|fact| fact.tenant_hash == "default"));
+    }
+
+    #[test]
     fn query_empty_store() {
         let store = FactStore::new();
 
         let result = store.query(&FactQuery {
+            tenant_hash: None,
             entity_prefix: None,
             query: Some("anything".to_string()),
             entity: None,
@@ -1913,6 +2027,7 @@ mod tests {
         let mut store = FactStore::new();
 
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "server".to_string(),
             key: "deployment_strategy".to_string(),
             value: "unrelated text".to_string(),
@@ -1925,6 +2040,7 @@ mod tests {
 
         // Query matching key name
         let result = store.query(&FactQuery {
+            tenant_hash: None,
             entity_prefix: None,
             query: Some("deployment".to_string()),
             entity: None,
@@ -1935,6 +2051,7 @@ mod tests {
 
         // Query matching entity name
         let result = store.query(&FactQuery {
+            tenant_hash: None,
             entity_prefix: None,
             query: Some("server".to_string()),
             entity: None,
@@ -1949,6 +2066,7 @@ mod tests {
         let mut store = FactStore::new();
 
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "alpha".to_string(),
             key: "info".to_string(),
             value: "some value".to_string(),
@@ -1960,6 +2078,7 @@ mod tests {
         });
 
         let result = store.query(&FactQuery {
+            tenant_hash: None,
             entity_prefix: None,
             query: Some("zzz_nonexistent_zzz".to_string()),
             entity: None,
@@ -1974,6 +2093,7 @@ mod tests {
         let mut store = FactStore::new();
 
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "e".to_string(),
             key: "k".to_string(),
             value: "match low".to_string(),
@@ -1984,6 +2104,7 @@ mod tests {
             actor: None,
         });
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "e".to_string(),
             key: "k".to_string(),
             value: "match high".to_string(),
@@ -1995,6 +2116,7 @@ mod tests {
         });
 
         let result = store.query(&FactQuery {
+            tenant_hash: None,
             entity_prefix: None,
             query: Some("match".to_string()),
             entity: None,
@@ -2012,6 +2134,7 @@ mod tests {
 
         for i in 0..5 {
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "e".to_string(),
                 key: format!("k{}", i),
                 value: format!("shared term {}", i),
@@ -2024,6 +2147,7 @@ mod tests {
         }
 
         let result = store.query(&FactQuery {
+            tenant_hash: None,
             entity_prefix: None,
             query: Some("shared".to_string()),
             entity: None,
@@ -2040,6 +2164,7 @@ mod tests {
 
         // Store one fact with a large value (many tokens)
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "e".to_string(),
             key: "k".to_string(),
             value: "a".repeat(100), // 25 tokens
@@ -2052,6 +2177,7 @@ mod tests {
 
         // Token budget smaller than the single fact — should still include it
         let result = store.query(&FactQuery {
+            tenant_hash: None,
             entity_prefix: None,
             query: None,
             entity: None,
@@ -2083,6 +2209,7 @@ mod tests {
     fn fact_serde_roundtrip() {
         let mut store = FactStore::new();
         let fact = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "e".to_string(),
             key: "k".to_string(),
             value: "v".to_string(),
@@ -2119,6 +2246,7 @@ mod tests {
         {
             let mut store = FactStore::with_persistence(dir.path()).unwrap();
             let f1 = store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "proj".into(),
                 key: "name".into(),
                 value: "alpha".into(),
@@ -2129,6 +2257,7 @@ mod tests {
                 actor: None,
             });
             let f2 = store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "proj".into(),
                 key: "status".into(),
                 value: "active".into(),
@@ -2139,6 +2268,7 @@ mod tests {
                 actor: None,
             });
             let f3 = store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "other".into(),
                 key: "info".into(),
                 value: "details".into(),
@@ -2174,6 +2304,7 @@ mod tests {
         {
             let mut store = FactStore::with_persistence(dir.path()).unwrap();
             let fact = store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "e".into(),
                 key: "k".into(),
                 value: "v".into(),
@@ -2211,6 +2342,7 @@ mod tests {
         {
             let mut store = FactStore::with_persistence(dir.path()).unwrap();
             let to_delete = store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "e".into(),
                 key: "erase-me".into(),
                 value: "highly-sensitive-erased-value".into(),
@@ -2221,6 +2353,7 @@ mod tests {
                 actor: None,
             });
             let to_keep = store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "e".into(),
                 key: "keep-me".into(),
                 value: "surviving-value".into(),
@@ -2273,6 +2406,7 @@ mod tests {
         {
             let mut store = FactStore::with_persistence(dir.path()).unwrap();
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "proj".into(),
                 key: "status".into(),
                 value: "v1".into(),
@@ -2283,6 +2417,7 @@ mod tests {
                 actor: None,
             });
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "proj".into(),
                 key: "status".into(),
                 value: "v2".into(),
@@ -2316,6 +2451,7 @@ mod tests {
         // following compaction removes their content. Fresh facts survive.
         let mut store = FactStore::new();
         let mut old = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "e".into(),
             key: "old".into(),
             value: "old-value".into(),
@@ -2326,6 +2462,7 @@ mod tests {
             actor: None,
         });
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "e".into(),
             key: "new".into(),
             value: "new-value".into(),
@@ -2353,6 +2490,7 @@ mod tests {
         {
             let mut store = FactStore::with_persistence(dir.path()).unwrap();
             let v1 = store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "proj".into(),
                 key: "status".into(),
                 value: "draft".into(),
@@ -2363,6 +2501,7 @@ mod tests {
                 actor: None,
             });
             let v2 = store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "proj".into(),
                 key: "status".into(),
                 value: "active".into(),
@@ -2398,6 +2537,7 @@ mod tests {
             let facts = store
                 .try_store_bulk(vec![
                     StoreFact {
+                        tenant_hash: "default".to_string(),
                         entity: "a".into(),
                         key: "k1".into(),
                         value: "v1".into(),
@@ -2408,6 +2548,7 @@ mod tests {
                         actor: None,
                     },
                     StoreFact {
+                        tenant_hash: "default".to_string(),
                         entity: "b".into(),
                         key: "k2".into(),
                         value: "v2".into(),
@@ -2438,6 +2579,7 @@ mod tests {
 
         let mut store = FactStore::new();
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "e".into(),
             key: "k".into(),
             value: "v".into(),
@@ -2459,6 +2601,7 @@ mod tests {
         let mut store = FactStore::new();
         for i in 0..5 {
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: format!("e{i}"),
                 key: "k".into(),
                 value: format!("v{i}"),
@@ -2486,6 +2629,7 @@ mod tests {
         let mut store = FactStore::new();
         for i in 0..5 {
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: format!("e{i}"),
                 key: "k".into(),
                 value: format!("v{i}"),
@@ -2533,6 +2677,7 @@ mod tests {
 
         // Store 2 facts, capture a timestamp, then store 3 more
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "e0".into(),
             key: "k".into(),
             value: "v0".into(),
@@ -2543,6 +2688,7 @@ mod tests {
             actor: None,
         });
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "e1".into(),
             key: "k".into(),
             value: "v1".into(),
@@ -2569,6 +2715,7 @@ mod tests {
         // Store 3 more (these will have stored_at = now)
         for i in 2..5 {
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: format!("e{i}"),
                 key: "k".into(),
                 value: format!("v{i}"),
@@ -2596,6 +2743,7 @@ mod tests {
         let mut store = FactStore::new();
 
         let f1 = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "e".into(),
             key: "k1".into(),
             value: "secret-pii-value".into(),
@@ -2606,6 +2754,7 @@ mod tests {
             actor: None,
         });
         let f2 = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "e".into(),
             key: "k2".into(),
             value: "v2".into(),
@@ -2639,6 +2788,7 @@ mod tests {
     fn mark_and_clear_superseded_in_memory() {
         let mut store = FactStore::new();
         let old = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "bench:lme-s".into(),
             key: "baseline".into(),
             value: "86.8%".into(),
@@ -2649,6 +2799,7 @@ mod tests {
             actor: None,
         });
         let new = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "bench:lme-s-v2".into(),
             key: "baseline".into(),
             value: "90.0%".into(),
@@ -2682,6 +2833,7 @@ mod tests {
         {
             let mut store = FactStore::with_persistence(dir.path()).unwrap();
             let old = store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "execplan:a".into(),
                 key: "decision".into(),
                 value: "do X".into(),
@@ -2692,6 +2844,7 @@ mod tests {
                 actor: None,
             });
             let new = store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "execplan:b".into(),
                 key: "decision".into(),
                 value: "do Y instead".into(),
@@ -2723,6 +2876,7 @@ mod tests {
         {
             let mut store = FactStore::with_persistence(dir.path()).unwrap();
             let old = store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "e".into(),
                 key: "k".into(),
                 value: "v".into(),
@@ -2733,6 +2887,7 @@ mod tests {
                 actor: None,
             });
             let new = store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "e2".into(),
                 key: "k".into(),
                 value: "v2".into(),
@@ -2762,6 +2917,7 @@ mod tests {
     fn store_same_key_auto_supersedes_prior_version_in_recall() {
         let mut store = FactStore::new();
         let v1 = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "person:carol".into(),
             key: "city".into(),
             value: "Berlin".into(),
@@ -2775,6 +2931,7 @@ mod tests {
         // memory_edit and any re-store take). The prior version must be
         // retired in the recall plane so query returns latest-wins.
         let v2 = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "person:carol".into(),
             key: "city".into(),
             value: "Munich".into(),
@@ -2802,6 +2959,7 @@ mod tests {
     fn distinct_keys_are_not_auto_superseded() {
         let mut store = FactStore::new();
         let a = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "person:carol".into(),
             key: "city".into(),
             value: "Berlin".into(),
@@ -2812,6 +2970,7 @@ mod tests {
             actor: None,
         });
         let b = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "person:carol".into(),
             key: "role".into(),
             value: "PM".into(),
@@ -2835,6 +2994,7 @@ mod tests {
             let mut store = FactStore::with_persistence(dir.path()).unwrap();
             let v1 = store
                 .try_store(StoreFact {
+                    tenant_hash: "default".to_string(),
                     entity: "test-fixture-x".into(),
                     key: "baseline".into(),
                     value: "86.8%".into(),
@@ -2847,6 +3007,7 @@ mod tests {
                 .unwrap();
             let v2 = store
                 .try_store(StoreFact {
+                    tenant_hash: "default".to_string(),
                     entity: "test-fixture-x".into(),
                     key: "baseline".into(),
                     value: "89.3%".into(),
@@ -2907,6 +3068,7 @@ mod tests {
     fn sample_fact(entity: &str, key: &str, value: &str) -> Fact {
         let mut store = FactStore::new();
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: entity.into(),
             key: key.into(),
             value: value.into(),
@@ -2953,6 +3115,7 @@ mod tests {
         // Two facts under the same entity describing the office at different
         // world-times. Same transaction time (now); different valid time.
         let old = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "person:alice".into(),
             key: "city".into(),
             value: "London".into(),
@@ -2963,6 +3126,7 @@ mod tests {
             actor: None,
         });
         let new = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "person:alice".into(),
             key: "city".into(),
             value: "Berlin".into(),
@@ -2981,6 +3145,7 @@ mod tests {
         assert!(store.set_validity(&new.fact_id, Some(ts("2026-06-01T00:00:00Z")), None));
 
         let q = FactQuery {
+            tenant_hash: None,
             query: None,
             entity: Some("person:alice".into()),
             entity_prefix: None,
@@ -3015,6 +3180,7 @@ mod tests {
         {
             let mut store = FactStore::with_persistence(dir.path()).unwrap();
             let f = store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "person:bob".into(),
                 key: "role".into(),
                 value: "ic".into(),
@@ -3044,6 +3210,7 @@ mod tests {
     fn record_access_increments_count_and_stamps_time() {
         let mut store = FactStore::new();
         let f = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "e".into(),
             key: "k".into(),
             value: "v".into(),
@@ -3075,6 +3242,7 @@ mod tests {
     fn record_access_skips_deleted_facts() {
         let mut store = FactStore::new();
         let f = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "e".into(),
             key: "k".into(),
             value: "v".into(),
@@ -3098,6 +3266,7 @@ mod tests {
         {
             let mut store = FactStore::with_persistence(dir.path()).unwrap();
             let f = store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "e".into(),
                 key: "k".into(),
                 value: "v".into(),

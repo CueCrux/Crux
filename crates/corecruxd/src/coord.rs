@@ -102,6 +102,7 @@ impl CoordIntent {
 pub fn write_intent(store: &mut FactStore, intent: &CoordIntent) -> Result<(), CoordError> {
     let value = serde_json::to_string(intent)?;
     let mut sf = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: format!(
             "{COORD_ENTITY_PREFIX}::{}::{}",
             intent.project_id, intent.session_id_hex
@@ -128,6 +129,7 @@ pub fn list_intents(store: &FactStore, project_id: Option<&str>) -> Vec<CoordInt
         None => format!("{COORD_ENTITY_PREFIX}::"),
     };
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: None,
         entity: None,
         entity_prefix: Some(prefix),

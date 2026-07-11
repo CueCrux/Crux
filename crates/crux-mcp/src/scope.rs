@@ -148,6 +148,7 @@ mod tests {
     fn sample_fact(entity: &str, private: bool) -> Fact {
         Fact {
             fact_id: "f_test".to_string(),
+            tenant_hash: "default".to_string(),
             entity: entity.to_string(),
             key: "k".to_string(),
             value: "v".to_string(),

@@ -333,6 +333,7 @@ pub(crate) fn load_shared_id_store(store: &FactStore, tenant_id: &str) -> Result
 
 fn load_id_store_entity(store: &FactStore, entity: String) -> Result<CodeGraphIdStore, CodeGraphError> {
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: None,
         entity: Some(entity),
         entity_prefix: None,
@@ -371,6 +372,7 @@ fn store_id_store_entity(
     id_store: &CodeGraphIdStore,
 ) -> Result<(), CodeGraphError> {
     store.store(StoreFact {
+        tenant_hash: "default".to_string(),
         entity,
         key: CODEGRAPH_IDS_KEY.to_string(),
         value: serde_json::to_string(id_store)?,
@@ -394,6 +396,7 @@ fn store_extdeps(
         .map(|((ecosystem, name), dep)| (external_dep_map_key(ecosystem, name), dep.clone()))
         .collect();
     store.store(StoreFact {
+        tenant_hash: "default".to_string(),
         entity: extdeps_entity(tenant_id, repo_id),
         key: CODEGRAPH_IDS_KEY.to_string(),
         value: serde_json::to_string(&by_pkg)?,
@@ -412,6 +415,7 @@ pub(crate) fn load_extdeps(
     repo_id: &str,
 ) -> Result<BTreeMap<String, ExternalDepVersionRow>, CodeGraphError> {
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: None,
         entity: Some(extdeps_entity(tenant_id, repo_id)),
         entity_prefix: None,
@@ -994,6 +998,7 @@ mod tests {
             .clone();
         let mut restarted = FactStore::new();
         restarted.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: shared_ids_entity("tenant-t"),
             key: CODEGRAPH_IDS_KEY.to_string(),
             value: shared_value,

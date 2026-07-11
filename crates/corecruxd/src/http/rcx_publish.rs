@@ -150,6 +150,7 @@ async fn emit_response(
         }
     };
     let mut fact = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: format!("{PUBLISH_ENTITY_PREFIX}::{kind}::{object_id}"),
         key: PUBLISH_RECORD_KEY.to_string(),
         value,

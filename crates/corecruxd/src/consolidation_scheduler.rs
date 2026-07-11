@@ -147,6 +147,7 @@ pub async fn run_review_once(store: &Arc<RwLock<FactStore>>, limit: usize) -> us
     // Append-only receipt fact. Stable (never decays) so an audit replay can
     // always find the surfacing event; the scheduler is the only writer.
     let req = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: format!("{REVIEW_ENTITY_PREFIX}{run_id}"),
         key: "review".to_string(),
         value: body.to_string(),
@@ -210,6 +211,7 @@ mod tests {
 
     fn store_fact(store: &mut FactStore, entity: &str, key: &str, value: &str, confidence: f32, private: bool) -> Fact {
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: entity.to_string(),
             key: key.to_string(),
             value: value.to_string(),

@@ -219,6 +219,7 @@ mod tests {
         {
             let mut store = FactStore::with_persistence(data_td.path()).unwrap();
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "project-x".to_string(),
                 key: "k".to_string(),
                 value: "v".to_string(),
@@ -229,6 +230,7 @@ mod tests {
                 actor: None,
             });
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "__ops::config-audit".to_string(),
                 key: "sha256:abc".to_string(),
                 value: "audited".to_string(),
@@ -273,6 +275,7 @@ mod tests {
         {
             let mut store = FactStore::with_persistence(data_td.path()).unwrap();
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "__ops::config-audit".to_string(),
                 key: "sha256:abc".to_string(),
                 value: "audited".to_string(),
@@ -307,6 +310,7 @@ mod tests {
         {
             let mut store = FactStore::with_persistence(data_td.path()).unwrap();
             store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: "project-x".to_string(),
                 key: "k".to_string(),
                 value: "v".to_string(),

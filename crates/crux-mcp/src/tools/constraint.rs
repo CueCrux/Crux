@@ -100,6 +100,7 @@ pub async fn handle_declare_constraint(args: &Value, ctx: &McpContext) -> Result
 
     let entity = format!("{CONSTRAINT_PREFIX}{constraint_id}");
     let req = StoreFact {
+        tenant_hash: "default".to_string(),
         entity,
         key: "constraint".to_string(),
         value: canonical,
@@ -130,6 +131,7 @@ pub async fn handle_get_constraints(args: &Value, ctx: &McpContext) -> Result<Va
     let filter_status = args.get("status").and_then(|v| v.as_str()).unwrap_or("active");
 
     let q = FactQuery {
+        tenant_hash: None,
         query: None,
         entity: None,
         entity_prefix: Some(CONSTRAINT_PREFIX.to_string()),
@@ -189,6 +191,7 @@ pub async fn handle_check_constraints(args: &Value, ctx: &McpContext) -> Result<
 
     // Load all active constraints.
     let q = FactQuery {
+        tenant_hash: None,
         query: None,
         entity: None,
         entity_prefix: Some(CONSTRAINT_PREFIX.to_string()),

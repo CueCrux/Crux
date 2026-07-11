@@ -201,6 +201,7 @@ where
             let mut store = fact_store.write().await;
 
             let fact = store.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity,
                 key: event_type.to_string(),
                 value,
@@ -326,6 +327,7 @@ mod tests {
         for i in 0..5 {
             let mut s = store.write().await;
             let fact = s.store(StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: format!("__ops__::error:test-{i}"),
                 key: "ops.error.v1".to_string(),
                 value: format!("error {i}"),

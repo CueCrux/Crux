@@ -191,6 +191,7 @@ mod tests {
             "issued_at_unix_ms": 1u64,
         });
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: format!("__passport__::{id}"),
             key: "record".to_string(),
             value: record.to_string(),
@@ -216,6 +217,7 @@ mod tests {
             record["tenant_group"] = serde_json::json!(g);
         }
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: format!("__passport__::{id}"),
             key: "passport".to_string(),
             value: record.to_string(),
@@ -275,6 +277,7 @@ mod tests {
 
     fn set_override(store: &mut FactStore, tenant: &str, cat: TenantCategory) {
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: format!("__tenant_metadata__::{tenant}"),
             key: "category".to_string(),
             value: cat.as_str().to_string(),

@@ -1165,6 +1165,7 @@ async fn store_receipts(state: &AppState, tenant_id: &str, service: Gpu1Service,
         }
     };
     let mut fact = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: format!("{GPU1_RECEIPT_ENTITY_PREFIX}::{tenant_id}::{}", service.operation()),
         key: "receipt_bundle".to_string(),
         value,

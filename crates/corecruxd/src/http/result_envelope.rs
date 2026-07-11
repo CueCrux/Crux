@@ -153,6 +153,7 @@ pub(super) async fn post_result_envelope_import(
             ) {
                 let mut store = state.fact_store.write().await;
                 store.store(StoreFact {
+                    tenant_hash: "default".to_string(),
                     entity: format!("__result_envelope_incident__::{tenant_id}"),
                     key: envelope.job_id.clone(),
                     value: json!({
@@ -224,6 +225,7 @@ pub(super) async fn post_result_envelope_import(
         let reqs: Vec<StoreFact> = facts_in
             .iter()
             .map(|f| StoreFact {
+                tenant_hash: "default".to_string(),
                 entity: f.entity.clone(),
                 key: f.key.clone(),
                 value: f.value.clone(),
@@ -333,6 +335,7 @@ pub(super) async fn post_result_envelope_import(
     {
         let mut store = state.fact_store.write().await;
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: receipt_entity,
             key: envelope.job_id.clone(),
             value: receipt_value.to_string(),

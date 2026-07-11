@@ -334,6 +334,7 @@ pub fn list_work(
         None => format!("{WORK_ENTITY_PREFIX}::"),
     };
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: None,
         entity: None,
         entity_prefix: Some(prefix),
@@ -521,6 +522,7 @@ pub fn add_comment(
     };
     let value = serde_json::to_string(&comment)?;
     let mut sf = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: format!("{WORK_COMMENT_ENTITY_PREFIX}::{}::{}", work_id, comment.id),
         key: RECORD_KEY.to_string(),
         value,
@@ -538,6 +540,7 @@ pub fn add_comment(
 pub fn list_comments(store: &FactStore, work_id: &str) -> Vec<WorkComment> {
     let prefix = format!("{WORK_COMMENT_ENTITY_PREFIX}::{work_id}::");
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: None,
         entity: None,
         entity_prefix: Some(prefix),
@@ -560,6 +563,7 @@ pub fn list_comments(store: &FactStore, work_id: &str) -> Vec<WorkComment> {
 pub fn list_transitions(store: &FactStore, work_id: &str) -> Vec<WorkTransition> {
     let prefix = format!("{WORK_TRANSITION_ENTITY_PREFIX}::{work_id}::");
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: None,
         entity: None,
         entity_prefix: Some(prefix),
@@ -589,6 +593,7 @@ pub fn list_transitions(store: &FactStore, work_id: &str) -> Vec<WorkTransition>
 
 pub fn list_pending_gates(store: &FactStore, by_passport_filter: Option<&str>) -> Vec<PendingGateAction> {
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: None,
         entity: None,
         entity_prefix: Some(format!("{WORK_GATE_ENTITY_PREFIX}::")),
@@ -674,6 +679,7 @@ pub fn resolve_gate(
 
 fn get_gate(store: &FactStore, action_id: &str) -> Option<PendingGateAction> {
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: None,
         entity: Some(format!("{WORK_GATE_ENTITY_PREFIX}::{action_id}")),
         entity_prefix: None,
@@ -702,6 +708,7 @@ pub fn write_work_record(store: &mut FactStore, item: &WorkItem) -> Result<(), W
 fn write_record(store: &mut FactStore, item: &WorkItem) -> Result<(), WorkError> {
     let value = serde_json::to_string(item)?;
     let mut sf = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: format!("{WORK_ENTITY_PREFIX}::{}::{}", item.project_id, item.id),
         key: RECORD_KEY.to_string(),
         value,
@@ -719,6 +726,7 @@ fn write_record(store: &mut FactStore, item: &WorkItem) -> Result<(), WorkError>
 fn write_transition(store: &mut FactStore, tx: &WorkTransition) -> Result<(), WorkError> {
     let value = serde_json::to_string(tx)?;
     let mut sf = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: format!(
             "{WORK_TRANSITION_ENTITY_PREFIX}::{}::{}-{}",
             tx.work_id, tx.at_unix_ms, tx.id
@@ -739,6 +747,7 @@ fn write_transition(store: &mut FactStore, tx: &WorkTransition) -> Result<(), Wo
 fn write_gate(store: &mut FactStore, gate: &PendingGateAction) -> Result<(), WorkError> {
     let value = serde_json::to_string(gate)?;
     let mut sf = StoreFact {
+        tenant_hash: "default".to_string(),
         entity: format!("{WORK_GATE_ENTITY_PREFIX}::{}", gate.action_id),
         key: RECORD_KEY.to_string(),
         value,

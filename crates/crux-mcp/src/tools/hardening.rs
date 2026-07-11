@@ -43,6 +43,7 @@ pub async fn handle_execplan_gate(args: &Value, ctx: &McpContext) -> Result<Valu
     let mut store = ctx.fact_store.write().await;
     let fact = store
         .try_store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: format!("execplan:{slug}"),
             key: key.clone(),
             value: value.to_string(),

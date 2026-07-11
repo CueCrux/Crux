@@ -865,6 +865,7 @@ fn fact_context_for_domain(
     let result = store.query(&FactQuery {
         query: Some(query),
         entity: None,
+        tenant_hash: None,
         entity_prefix: None,
         top_k: 24,
         token_budget: None,
@@ -1160,6 +1161,7 @@ mod tests {
     fn first_party_enrichment_uses_related_facts_without_raw_values() {
         let mut store = FactStore::new();
         let fact = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "business::acme::customer::acme-cfo".to_string(),
             key: "constraint".to_string(),
             value: "Sarah has a Thursday prep constraint for this customer".to_string(),
@@ -1193,6 +1195,7 @@ mod tests {
     fn first_party_enrichment_uses_domain_enricher_boundary() {
         let mut store = FactStore::new();
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "business::acme::calendar::customer-meeting".to_string(),
             key: "availability".to_string(),
             value: "Acme CFO meeting has external customer attendee and conflict context".to_string(),
@@ -1318,6 +1321,7 @@ mod tests {
     fn first_party_enrichers_cover_code_file_crm_and_memory_domains() {
         let mut store = FactStore::new();
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "business::acme::repo::crux".to_string(),
             key: "route".to_string(),
             value: "API route deploy requires command ledger evidence".to_string(),
@@ -1328,6 +1332,7 @@ mod tests {
             actor: None,
         });
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "business::acme::file::plan".to_string(),
             key: "document".to_string(),
             value: "Drive document contains launch checklist".to_string(),
@@ -1338,6 +1343,7 @@ mod tests {
             actor: None,
         });
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "business::acme::customer::acme".to_string(),
             key: "contract".to_string(),
             value: "Customer contract invoice and opportunity context".to_string(),
@@ -1348,6 +1354,7 @@ mod tests {
             actor: None,
         });
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "__constraints__::business::acme::policy".to_string(),
             key: "policy".to_string(),
             value: "Never promote tenant memory without approval".to_string(),
@@ -1358,6 +1365,7 @@ mod tests {
             actor: None,
         });
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: "business::acme::private::session".to_string(),
             key: "memory".to_string(),
             value: "private session memory should be skipped by enrichers".to_string(),

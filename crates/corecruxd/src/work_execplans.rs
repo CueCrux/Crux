@@ -1060,6 +1060,7 @@ pub fn execplans_root_from_env() -> Option<PathBuf> {
 /// instead of N per-slug queries.
 fn collect_execplan_facts(store: &FactStore) -> HashMap<String, Vec<ExecplanFactRow>> {
     let result = store.query(&FactQuery {
+        tenant_hash: None,
         query: None,
         entity: None,
         entity_prefix: Some(EXECPLAN_ENTITY_PREFIX.to_string()),
@@ -2392,6 +2393,7 @@ mod tests {
 
     fn store_fact(store: &mut FactStore, slug: &str, key: &str, value: &str) {
         store.store(StoreFact {
+            tenant_hash: "default".to_string(),
             entity: format!("execplan:{slug}"),
             key: key.to_string(),
             value: value.to_string(),
