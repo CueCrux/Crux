@@ -84,6 +84,7 @@ mod workspace;
 pub mod session_metrics;
 
 pub(crate) use admin::AdminActionRecord;
+pub(crate) use repos::RepoScanJob;
 // Phase T M1 daemon-boot auto-emit — called once per boot from main.rs after
 // the HTTP server is serving.
 pub(crate) use stream_receipts::emit_daemon_start_usage_ping;
@@ -306,10 +307,13 @@ pub struct AppState {
     pub control_path: PathBuf,
     pub action_max_pending: usize,
     pub action_timeout_secs: u64,
+    pub repo_scan_max_pending: usize,
     pub scrub_scope: String,
     pub scrub_mode: String,
     pub scrub_sample_rate: f64,
     pub admin_actions: Arc<RwLock<std::collections::BTreeMap<String, AdminActionRecord>>>,
+    pub repo_scan_jobs: Arc<RwLock<std::collections::BTreeMap<String, RepoScanJob>>>,
+    pub repo_scan_semaphore: Arc<tokio::sync::Semaphore>,
     pub corruption_detected: Arc<RwLock<bool>>,
     pub capacity: Arc<RwLock<CapacityState>>,
     pub admin_force_seal_enabled: bool,
@@ -827,6 +831,10 @@ pub(crate) fn router_with_route_auth(
         .route("/v1/repos", get(self::repos::get_repos))
         .route("/v1/repos", axum::routing::post(self::repos::post_repo))
         .route("/v1/repos/dependents", get(self::repos::get_repo_dependents))
+        .route(
+            "/v1/repos/scan-jobs/{job_id}",
+            get(self::repos::get_repo_scan_job),
+        )
         .route("/v1/repos/{repo_id}", get(self::repos::get_repo))
         .route(
             "/v1/repos/{repo_id}",
