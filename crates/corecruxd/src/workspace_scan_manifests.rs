@@ -6,8 +6,9 @@
 //! Manifest and lockfile extraction for external dependencies.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 const EXTERNAL_DEPS_ENV: &str = "CORECRUXD_EXTERNAL_DEPS";
 const MAX_DEPTH: usize = 12;
@@ -66,6 +67,12 @@ pub fn scan_external_deps(root: &Path) -> Vec<ExternalDep> {
             "package.json" => parse_package_json(root, manifest, &mut deps),
             "pyproject.toml" => parse_pyproject_toml(root, manifest, &mut deps),
             "go.mod" => parse_go_mod(root, manifest, &mut deps),
+            "pom.xml" => parse_maven_pom(root, manifest, &mut deps),
+            "build.gradle" | "build.gradle.kts" => parse_gradle_manifest(root, manifest, &mut deps),
+            "Gemfile" => parse_gemfile(root, manifest, &mut deps),
+            _ if manifest.extension().and_then(|ext| ext.to_str()) == Some("csproj") => {
+                parse_csproj(root, manifest, &mut deps);
+            }
             _ if is_requirements_file(name) || is_requirements_path(manifest) => {
                 parse_requirements_txt(root, manifest, &mut deps);
             }
@@ -122,7 +129,11 @@ fn discover_manifests(root: &Path) -> Vec<PathBuf> {
         }
     }
     out.sort();
-    out
+    // Preserve the pre-M2 cap surface: manifests supported before this
+    // milestone always claim slots before newly supported ecosystems.
+    let (mut pre_m2, m2): (Vec<_>, Vec<_>) = out.into_iter().partition(|path| is_pre_m2_manifest_path(path));
+    pre_m2.extend(m2);
+    pre_m2
 }
 
 fn should_skip_dir(name: &str) -> bool {
@@ -133,7 +144,17 @@ fn should_skip_dir(name: &str) -> bool {
 }
 
 fn is_manifest_name(name: &str) -> bool {
-    matches!(name, "Cargo.toml" | "package.json" | "pyproject.toml" | "go.mod") || is_requirements_file(name)
+    matches!(
+        name,
+        "Cargo.toml"
+            | "package.json"
+            | "pyproject.toml"
+            | "go.mod"
+            | "pom.xml"
+            | "build.gradle"
+            | "build.gradle.kts"
+            | "Gemfile"
+    ) || is_requirements_file(name)
 }
 
 fn is_requirements_file(name: &str) -> bool {
@@ -142,7 +163,16 @@ fn is_requirements_file(name: &str) -> bool {
 
 fn is_manifest_path(path: &Path) -> bool {
     let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
-    is_manifest_name(name) || is_requirements_path(path)
+    is_manifest_name(name)
+        || is_requirements_path(path)
+        || path.extension().and_then(|ext| ext.to_str()) == Some("csproj")
+}
+
+fn is_pre_m2_manifest_path(path: &Path) -> bool {
+    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+    matches!(name, "Cargo.toml" | "package.json" | "pyproject.toml" | "go.mod")
+        || is_requirements_file(name)
+        || is_requirements_path(path)
 }
 
 fn is_requirements_path(path: &Path) -> bool {
@@ -561,7 +591,7 @@ fn package_lock_versions(lock: &Path) -> Option<BTreeMap<String, String>> {
             return None;
         }
     };
-    let mut versions = BTreeMap::new();
+    let mut versions: BTreeMap<String, String> = BTreeMap::new();
     let Some(packages) = value.get("packages").and_then(serde_json::Value::as_object) else {
         if let Some(dependencies) = value.get("dependencies").and_then(serde_json::Value::as_object) {
             for (name, package) in dependencies {
@@ -658,15 +688,18 @@ fn parse_requirements_txt(root: &Path, manifest: &Path, deps: &mut Vec<ExternalD
     let Some(source_manifest) = rel_path(root, manifest) else {
         return;
     };
+    let lock_versions = pypi_lock_versions(root, manifest.parent().unwrap_or(root));
     for line in contents.lines() {
         let Some((name, version_req)) = parse_requirement_line(line, manifest) else {
             continue;
         };
         deps.push(ExternalDep {
-            name,
+            name: name.clone(),
             ecosystem: "pypi".to_string(),
             version_req,
-            version_locked: None,
+            version_locked: lock_versions
+                .as_ref()
+                .and_then(|versions| versions.get(&normalize_pypi_name(&name)).cloned()),
             source_manifest: source_manifest.clone(),
             kind: "normal".to_string(),
         });
@@ -683,6 +716,7 @@ fn parse_pyproject_toml(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep
     let Some(source_manifest) = rel_path(root, manifest) else {
         return;
     };
+    let lock_versions = pypi_lock_versions(root, manifest.parent().unwrap_or(root));
     if let Some(project_deps) = table_at(&value, &["project"])
         .and_then(|project| project.get("dependencies"))
         .and_then(toml::Value::as_array)
@@ -693,10 +727,12 @@ fn parse_pyproject_toml(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep
             };
             if let Some((name, version_req)) = parse_requirement_line(raw, manifest) {
                 deps.push(ExternalDep {
-                    name,
+                    name: name.clone(),
                     ecosystem: "pypi".to_string(),
                     version_req,
-                    version_locked: None,
+                    version_locked: lock_versions
+                        .as_ref()
+                        .and_then(|versions| versions.get(&normalize_pypi_name(&name)).cloned()),
                     source_manifest: source_manifest.clone(),
                     kind: "normal".to_string(),
                 });
@@ -714,10 +750,12 @@ fn parse_pyproject_toml(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep
                 };
                 if let Some((name, version_req)) = parse_requirement_line(raw, manifest) {
                     deps.push(ExternalDep {
-                        name,
+                        name: name.clone(),
                         ecosystem: "pypi".to_string(),
                         version_req,
-                        version_locked: None,
+                        version_locked: lock_versions
+                            .as_ref()
+                            .and_then(|versions| versions.get(&normalize_pypi_name(&name)).cloned()),
                         source_manifest: source_manifest.clone(),
                         kind: "optional".to_string(),
                     });
@@ -739,12 +777,62 @@ fn parse_pyproject_toml(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep
                 name: name.clone(),
                 ecosystem: "pypi".to_string(),
                 version_req,
-                version_locked: None,
+                version_locked: lock_versions
+                    .as_ref()
+                    .and_then(|versions| versions.get(&normalize_pypi_name(name)).cloned()),
                 source_manifest: source_manifest.clone(),
                 kind: if optional { "optional" } else { "normal" }.to_string(),
             });
         }
     }
+}
+
+fn pypi_lock_versions(root: &Path, manifest_dir: &Path) -> Option<BTreeMap<String, String>> {
+    for file_name in ["poetry.lock", "uv.lock"] {
+        if let Some(lock) = find_nearest_file(manifest_dir, root, file_name) {
+            return parse_pypi_toml_lock(&lock, file_name);
+        }
+    }
+    None
+}
+
+fn parse_pypi_toml_lock(lock: &Path, label: &str) -> Option<BTreeMap<String, String>> {
+    let contents = read_utf8_lockfile(lock, label)?;
+    let value = parse_toml(&contents, lock, label)?;
+    let mut versions = BTreeMap::new();
+    let Some(packages) = value.get("package").and_then(toml::Value::as_array) else {
+        return Some(versions);
+    };
+    for package in packages {
+        let Some(package) = package.as_table() else {
+            continue;
+        };
+        let (Some(name), Some(version)) = (
+            package.get("name").and_then(toml::Value::as_str),
+            package.get("version").and_then(toml::Value::as_str),
+        ) else {
+            continue;
+        };
+        versions.insert(normalize_pypi_name(name), version.to_string());
+    }
+    Some(versions)
+}
+
+fn normalize_pypi_name(name: &str) -> String {
+    let mut normalized = String::with_capacity(name.len());
+    let mut separator = false;
+    for ch in name.chars() {
+        if matches!(ch, '-' | '_' | '.') {
+            if !separator {
+                normalized.push('-');
+            }
+            separator = true;
+        } else {
+            normalized.extend(ch.to_lowercase());
+            separator = false;
+        }
+    }
+    normalized
 }
 
 fn poetry_dep_spec(value: &toml::Value) -> (Option<String>, bool) {
@@ -827,7 +915,12 @@ fn looks_like_url_or_local_path(line: &str) -> bool {
 }
 
 fn version_req_from_python_suffix(suffix: &str) -> Option<String> {
-    let suffix = suffix.trim();
+    let mut suffix = suffix.trim();
+    // PEP 508 allows a parenthesized version specifier: `build (>=1.2.1,<2.0.0)`.
+    // Unwrap one level so those declarations keep their version_req.
+    if let Some(inner) = suffix.strip_prefix('(').and_then(|rest| rest.strip_suffix(')')) {
+        suffix = inner.trim();
+    }
     if suffix.is_empty() {
         return None;
     }
@@ -846,6 +939,8 @@ fn parse_go_mod(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>) {
     let Some(source_manifest) = rel_path(root, manifest) else {
         return;
     };
+    let lock_versions =
+        find_nearest_file(manifest.parent().unwrap_or(root), root, "go.sum").and_then(|lock| parse_go_sum(&lock));
     let mut in_require_block = false;
     for raw in contents.lines() {
         let line = raw.trim();
@@ -857,7 +952,7 @@ fn parse_go_mod(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>) {
                 in_require_block = false;
                 continue;
             }
-            parse_go_require_line(line, &source_manifest, deps);
+            parse_go_require_line(line, &source_manifest, lock_versions.as_ref(), deps);
             continue;
         }
         if go_require_block_start(line) {
@@ -865,7 +960,7 @@ fn parse_go_mod(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>) {
             continue;
         }
         if let Some(rest) = line.strip_prefix("require ") {
-            parse_go_require_line(rest.trim(), &source_manifest, deps);
+            parse_go_require_line(rest.trim(), &source_manifest, lock_versions.as_ref(), deps);
         }
     }
 }
@@ -877,7 +972,12 @@ fn go_require_block_start(line: &str) -> bool {
     rest.trim_start().starts_with('(')
 }
 
-fn parse_go_require_line(line: &str, source_manifest: &str, deps: &mut Vec<ExternalDep>) {
+fn parse_go_require_line(
+    line: &str,
+    source_manifest: &str,
+    lock_versions: Option<&BTreeMap<String, BTreeSet<String>>>,
+    deps: &mut Vec<ExternalDep>,
+) {
     if line.starts_with("replace ") || line.starts_with("exclude ") {
         return;
     }
@@ -894,10 +994,496 @@ fn parse_go_require_line(line: &str, source_manifest: &str, deps: &mut Vec<Exter
         name: name.to_string(),
         ecosystem: "go".to_string(),
         version_req: Some(version.to_string()),
-        version_locked: None,
+        version_locked: lock_versions
+            .and_then(|versions| versions.get(name))
+            .and_then(|versions| versions.contains(version).then(|| version.to_string())),
         source_manifest: source_manifest.to_string(),
         kind: if indirect { "indirect" } else { "normal" }.to_string(),
     });
+}
+
+fn parse_go_sum(lock: &Path) -> Option<BTreeMap<String, BTreeSet<String>>> {
+    let contents = read_utf8_lockfile(lock, "go.sum")?;
+    let mut versions: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for line in contents.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(name), Some(raw_version), Some(_hash)) = (fields.next(), fields.next(), fields.next()) else {
+            continue;
+        };
+        if raw_version.ends_with("/go.mod") {
+            continue;
+        }
+        let version = raw_version;
+        versions
+            .entry(name.to_string())
+            .or_default()
+            .insert(version.to_string());
+    }
+    Some(versions)
+}
+
+fn parse_maven_pom(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>) {
+    let Some(contents) = read_utf8_file(manifest, "pom.xml") else {
+        return;
+    };
+    let document = match roxmltree::Document::parse(&contents) {
+        Ok(document) => document,
+        Err(err) => {
+            tracing::warn!(path = %manifest.display(), ?err, "failed to parse pom.xml for external dependency scan");
+            return;
+        }
+    };
+    let Some(source_manifest) = rel_path(root, manifest) else {
+        return;
+    };
+    let project = document.root_element();
+    let mut properties = BTreeMap::new();
+    if let Some(property_node) = xml_child(project, "properties") {
+        for property in property_node.children().filter(roxmltree::Node::is_element) {
+            if let Some(value) = property.text() {
+                properties.insert(property.tag_name().name().to_string(), value.trim().to_string());
+            }
+        }
+    }
+    for dependency in project.descendants().filter(|node| xml_is(*node, "dependency")) {
+        let Some(parent) = dependency.parent() else {
+            continue;
+        };
+        if !xml_is(parent, "dependencies")
+            || dependency.ancestors().any(|ancestor| {
+                xml_is(ancestor, "dependencyManagement") || xml_is(ancestor, "plugin") || xml_is(ancestor, "profile")
+            })
+        {
+            continue;
+        }
+        let (Some(group), Some(artifact)) = (
+            xml_child_text(dependency, "groupId"),
+            xml_child_text(dependency, "artifactId"),
+        ) else {
+            continue;
+        };
+        let group = interpolate_maven_properties(&group, &properties);
+        let artifact = interpolate_maven_properties(&artifact, &properties);
+        let version_req =
+            xml_child_text(dependency, "version").map(|version| interpolate_maven_properties(&version, &properties));
+        let kind = if xml_child_text(dependency, "scope").as_deref() == Some("test") {
+            "dev"
+        } else {
+            "normal"
+        };
+        deps.push(ExternalDep {
+            name: format!("{group}:{artifact}"),
+            ecosystem: "maven".to_string(),
+            version_req,
+            version_locked: None,
+            source_manifest: source_manifest.clone(),
+            kind: kind.to_string(),
+        });
+    }
+}
+
+fn xml_is(node: roxmltree::Node<'_, '_>, name: &str) -> bool {
+    node.is_element() && node.tag_name().name() == name
+}
+
+fn xml_child<'a, 'input>(node: roxmltree::Node<'a, 'input>, name: &str) -> Option<roxmltree::Node<'a, 'input>> {
+    node.children().find(|child| xml_is(*child, name))
+}
+
+fn xml_child_text(node: roxmltree::Node<'_, '_>, name: &str) -> Option<String> {
+    xml_child(node, name)?.text().map(|text| text.trim().to_string())
+}
+
+fn interpolate_maven_properties(value: &str, properties: &BTreeMap<String, String>) -> String {
+    let mut interpolated = value.to_string();
+    let mut search_from = 0usize;
+    for _ in 0..16 {
+        let Some(relative_start) = interpolated[search_from..].find("${") else {
+            break;
+        };
+        let start = search_from + relative_start;
+        let Some(relative_end) = interpolated[start + 2..].find('}') else {
+            break;
+        };
+        let end = start + 2 + relative_end;
+        let key = &interpolated[start + 2..end];
+        if let Some(replacement) = properties.get(key) {
+            interpolated.replace_range(start..=end, replacement);
+            search_from = start;
+        } else {
+            search_from = end + 1;
+        }
+    }
+    interpolated
+}
+
+static GRADLE_DEP_RE: LazyLock<Option<regex::Regex>> = LazyLock::new(|| {
+    regex::Regex::new(
+        r#"^\s*(implementation|api|compileOnly|runtimeOnly|testImplementation|testCompileOnly|testRuntimeOnly|androidTestImplementation|debugImplementation|releaseImplementation)\s*(?:\(\s*)?[\"']([^\"']+)[\"']"#,
+    )
+    .ok()
+});
+
+fn parse_gradle_manifest(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>) {
+    let Some(contents) = read_utf8_file(manifest, "Gradle build file") else {
+        return;
+    };
+    let Some(source_manifest) = rel_path(root, manifest) else {
+        return;
+    };
+    let Some(pattern) = GRADLE_DEP_RE.as_ref() else {
+        tracing::warn!("failed to initialize Gradle dependency pattern");
+        return;
+    };
+    let mut in_block_comment = false;
+    for raw_line in contents.lines() {
+        let uncommented = strip_gradle_comments(raw_line, &mut in_block_comment);
+        let Some(captures) = pattern.captures(&uncommented) else {
+            continue;
+        };
+        let (Some(configuration), Some(coordinates)) = (captures.get(1), captures.get(2)) else {
+            continue;
+        };
+        let parts: Vec<_> = coordinates.as_str().split(':').collect();
+        if parts.len() != 3
+            || parts.iter().any(|part| part.is_empty())
+            || parts
+                .iter()
+                .any(|part| part.chars().any(|ch| matches!(ch, '$' | '{' | '}')))
+            || gradle_version_is_dynamic(parts[2])
+        {
+            continue;
+        }
+        deps.push(ExternalDep {
+            name: format!("{}:{}", parts[0], parts[1]),
+            ecosystem: "maven".to_string(),
+            version_req: Some(parts[2].to_string()),
+            version_locked: None,
+            source_manifest: source_manifest.clone(),
+            kind: if configuration.as_str().to_ascii_lowercase().contains("test") {
+                "dev"
+            } else {
+                "normal"
+            }
+            .to_string(),
+        });
+    }
+}
+
+fn strip_gradle_comments(line: &str, in_block_comment: &mut bool) -> String {
+    let mut output = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    let mut quote = None;
+    let mut escaped = false;
+    while let Some(ch) = chars.next() {
+        if *in_block_comment {
+            if ch == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                *in_block_comment = false;
+            }
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            output.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+            output.push(ch);
+        } else if ch == '/' && chars.peek() == Some(&'/') {
+            break;
+        } else if ch == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            *in_block_comment = true;
+        } else {
+            output.push(ch);
+        }
+    }
+    output
+}
+
+fn gradle_version_is_dynamic(version: &str) -> bool {
+    let lower = version.to_ascii_lowercase();
+    version
+        .chars()
+        .any(|ch| matches!(ch, '$' | '{' | '}' | '+' | '[' | ']' | '(' | ')'))
+        || lower.starts_with("latest.")
+}
+
+static GEM_SPEC_RE: LazyLock<Option<regex::Regex>> =
+    LazyLock::new(|| regex::Regex::new(r"^    ([A-Za-z0-9_.-]+) \(([^ )]+)").ok());
+
+fn parse_gemfile(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>) {
+    let Some(contents) = read_utf8_file(manifest, "Gemfile") else {
+        return;
+    };
+    let Some(source_manifest) = rel_path(root, manifest) else {
+        return;
+    };
+    let lock_versions = find_nearest_file(manifest.parent().unwrap_or(root), root, "Gemfile.lock")
+        .and_then(|lock| parse_gemfile_lock(&lock));
+    let mut block_stack = Vec::new();
+    for raw_line in contents.lines() {
+        let line = raw_line.split_once('#').map_or(raw_line, |(before, _)| before).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with("group ") || line.starts_with("group(") {
+            block_stack.push(line.contains(":test") || line.contains(":development"));
+            continue;
+        }
+        if line == "end" {
+            block_stack.pop();
+            continue;
+        }
+        if line.ends_with(" do") {
+            block_stack.push(false);
+        }
+        let Some(rest) = line
+            .strip_prefix("gem")
+            .filter(|rest| rest.starts_with(char::is_whitespace) || rest.starts_with('('))
+        else {
+            continue;
+        };
+        let quoted = ruby_quoted_literals(rest);
+        let Some(name) = quoted.first() else {
+            continue;
+        };
+        let version_req = gem_version_req(rest, &quoted);
+        deps.push(ExternalDep {
+            name: name.value.clone(),
+            ecosystem: "rubygems".to_string(),
+            version_req,
+            version_locked: lock_versions
+                .as_ref()
+                .and_then(|versions| versions.get(&name.value).cloned()),
+            source_manifest: source_manifest.clone(),
+            kind: if block_stack.iter().any(|is_dev| *is_dev) {
+                "dev"
+            } else {
+                "normal"
+            }
+            .to_string(),
+        });
+    }
+}
+
+#[derive(Debug)]
+struct RubyQuotedLiteral {
+    value: String,
+    start: usize,
+}
+
+fn ruby_quoted_literals(value: &str) -> Vec<RubyQuotedLiteral> {
+    let mut values = Vec::new();
+    let mut chars = value.char_indices().peekable();
+    while let Some((start, ch)) = chars.next() {
+        if ch != '\'' && ch != '"' {
+            continue;
+        }
+        let quote = ch;
+        let mut literal = String::new();
+        let mut escaped = false;
+        for (_, next) in chars.by_ref() {
+            if escaped {
+                literal.push(next);
+                escaped = false;
+            } else if next == '\\' {
+                escaped = true;
+            } else if next == quote {
+                values.push(RubyQuotedLiteral { value: literal, start });
+                break;
+            } else {
+                literal.push(next);
+            }
+        }
+    }
+    values
+}
+
+fn gem_version_req(rest: &str, quoted: &[RubyQuotedLiteral]) -> Option<String> {
+    let name = quoted.first()?;
+    let option_start = gem_option_start(rest).unwrap_or(rest.len());
+    let constraints: Vec<_> = quoted
+        .iter()
+        .skip(1)
+        .take_while(|literal| literal.start < option_start)
+        .map(|literal| literal.value.as_str())
+        .filter(|literal| gem_version_shaped(literal))
+        .collect();
+    if name.start >= option_start || constraints.is_empty() {
+        None
+    } else {
+        Some(constraints.join(", "))
+    }
+}
+
+fn gem_option_start(value: &str) -> Option<usize> {
+    static GEM_OPTION_RE: LazyLock<Option<regex::Regex>> =
+        LazyLock::new(|| regex::Regex::new(r"(?:\b[A-Za-z_][A-Za-z0-9_]*\s*:|:[A-Za-z_][A-Za-z0-9_]*\s*=>)").ok());
+    GEM_OPTION_RE.as_ref()?.find(value).map(|matched| matched.start())
+}
+
+fn gem_version_shaped(value: &str) -> bool {
+    value.starts_with(|ch: char| ch.is_ascii_digit())
+        || ["~>", ">=", "<=", "!=", ">", "<", "="]
+            .iter()
+            .any(|prefix| value.starts_with(prefix))
+}
+
+fn parse_gemfile_lock(lock: &Path) -> Option<BTreeMap<String, String>> {
+    let contents = read_utf8_lockfile(lock, "Gemfile.lock")?;
+    let pattern = GEM_SPEC_RE.as_ref()?;
+    let mut in_gem = false;
+    let mut in_specs = false;
+    let mut versions: BTreeMap<String, String> = BTreeMap::new();
+    for line in contents.lines() {
+        if !line.starts_with(' ') {
+            in_gem = line == "GEM";
+            in_specs = false;
+            continue;
+        }
+        if in_gem && line.trim() == "specs:" {
+            in_specs = true;
+            continue;
+        }
+        if !in_specs {
+            continue;
+        }
+        let Some(captures) = pattern.captures(line) else {
+            continue;
+        };
+        let (Some(name), Some(version)) = (captures.get(1), captures.get(2)) else {
+            continue;
+        };
+        let name = name.as_str();
+        let version = version.as_str();
+        versions
+            .entry(name.to_string())
+            .and_modify(|existing| {
+                if gem_version_is_platform_specific(existing) && !gem_version_is_platform_specific(version) {
+                    *existing = version.to_string();
+                }
+            })
+            .or_insert_with(|| version.to_string());
+    }
+    Some(versions)
+}
+
+fn gem_version_is_platform_specific(version: &str) -> bool {
+    version.split_once('-').is_some_and(|(_, suffix)| {
+        [
+            "linux", "darwin", "mingw", "java", "x86", "arm", "aarch", "mswin", "musl",
+        ]
+        .iter()
+        .any(|platform| suffix.contains(platform))
+    })
+}
+
+fn parse_csproj(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>) {
+    let Some(contents) = read_utf8_file(manifest, "csproj") else {
+        return;
+    };
+    let document = match roxmltree::Document::parse(&contents) {
+        Ok(document) => document,
+        Err(err) => {
+            tracing::warn!(path = %manifest.display(), ?err, "failed to parse csproj for external dependency scan");
+            return;
+        }
+    };
+    let Some(source_manifest) = rel_path(root, manifest) else {
+        return;
+    };
+    let manifest_dir = manifest.parent().unwrap_or(root);
+    let central_versions = find_nearest_file(manifest_dir, root, "Directory.Packages.props")
+        .and_then(|props| parse_nuget_central_versions(&props));
+    let lock_versions =
+        find_nearest_file(manifest_dir, root, "packages.lock.json").and_then(|lock| parse_nuget_lock(&lock));
+    for reference in document.descendants().filter(|node| xml_is(*node, "PackageReference")) {
+        let Some(name) = reference.attribute("Include") else {
+            continue;
+        };
+        if reference.attribute("Remove").is_some() {
+            continue;
+        }
+        let key = name.to_ascii_lowercase();
+        let version_req = reference
+            .attribute("Version")
+            .map(ToString::to_string)
+            .or_else(|| xml_child_text(reference, "Version"))
+            .or_else(|| {
+                central_versions
+                    .as_ref()
+                    .and_then(|versions| versions.get(&key).cloned())
+            });
+        deps.push(ExternalDep {
+            name: name.to_string(),
+            ecosystem: "nuget".to_string(),
+            version_req,
+            version_locked: lock_versions.as_ref().and_then(|versions| versions.get(&key).cloned()),
+            source_manifest: source_manifest.clone(),
+            kind: "normal".to_string(),
+        });
+    }
+}
+
+fn parse_nuget_central_versions(props: &Path) -> Option<BTreeMap<String, String>> {
+    let contents = read_utf8_file(props, "Directory.Packages.props")?;
+    let document = match roxmltree::Document::parse(&contents) {
+        Ok(document) => document,
+        Err(err) => {
+            tracing::warn!(path = %props.display(), ?err, "failed to parse Directory.Packages.props");
+            return None;
+        }
+    };
+    let mut versions = BTreeMap::new();
+    for package in document.descendants().filter(|node| xml_is(*node, "PackageVersion")) {
+        let Some(name) = package.attribute("Include").or_else(|| package.attribute("Update")) else {
+            continue;
+        };
+        let version = package
+            .attribute("Version")
+            .map(ToString::to_string)
+            .or_else(|| xml_child_text(package, "Version"));
+        if let Some(version) = version {
+            versions.insert(name.to_ascii_lowercase(), version);
+        }
+    }
+    Some(versions)
+}
+
+fn parse_nuget_lock(lock: &Path) -> Option<BTreeMap<String, String>> {
+    let contents = read_utf8_lockfile(lock, "packages.lock.json")?;
+    let value = match serde_json::from_str::<serde_json::Value>(&contents) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(path = %lock.display(), ?err, "failed to parse packages.lock.json");
+            return None;
+        }
+    };
+    let mut versions = BTreeMap::new();
+    let Some(frameworks) = value.get("dependencies").and_then(serde_json::Value::as_object) else {
+        return Some(versions);
+    };
+    for packages in frameworks.values().filter_map(serde_json::Value::as_object) {
+        for (name, package) in packages {
+            if package.get("type").and_then(serde_json::Value::as_str) != Some("Direct") {
+                continue;
+            }
+            let Some(version) = package.get("resolved").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            versions.insert(name.to_ascii_lowercase(), version.to_string());
+        }
+    }
+    Some(versions)
 }
 
 #[cfg(test)]
@@ -1239,6 +1825,24 @@ https://example.invalid/pkg.whl
     }
 
     #[test]
+    fn python_parenthesized_pep508_specifiers_keep_version_req() {
+        // poetry's own pyproject declares deps as `build (>=1.2.1,<2.0.0)`.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("requirements.txt"),
+            "build (>=1.2.1,<2.0.0)\nnoversion ()\n",
+        )
+        .expect("requirements");
+
+        let deps = scan_external_deps(tmp.path());
+        assert_eq!(
+            dep(&deps, "pypi", "requirements.txt", "build").version_req.as_deref(),
+            Some(">=1.2.1,<2.0.0")
+        );
+        assert_eq!(dep(&deps, "pypi", "requirements.txt", "noversion").version_req, None);
+    }
+
+    #[test]
     fn python_requirements_directory_files_and_inline_options_are_parsed() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join("requirements")).expect("requirements dir");
@@ -1344,6 +1948,500 @@ exclude github.com/old/pkg v1.0.0
         assert!(deps.iter().all(|dep| dep.name != "github.com/old/pkg"));
     }
 
+    #[test]
+    fn maven_pom_extracts_properties_and_test_scope() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("pom.xml"),
+            r#"<?xml version="1.0"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <properties>
+    <junit.version>5.11.0</junit.version>
+    <lib.group>org.example</lib.group>
+  </properties>
+  <dependencyManagement><dependencies>
+    <dependency><groupId>managed</groupId><artifactId>only</artifactId><version>1</version></dependency>
+  </dependencies></dependencyManagement>
+  <dependencies>
+    <dependency><groupId>${lib.group}</groupId><artifactId>core</artifactId><version>2.4.0</version></dependency>
+    <dependency><groupId>org.junit.jupiter</groupId><artifactId>junit-jupiter</artifactId><version>${junit.version}</version><scope>test</scope></dependency>
+    <dependency><groupId>org.example</groupId><artifactId>inherited</artifactId><version>${unresolved.version}-${junit.version}</version></dependency>
+  </dependencies>
+  <profiles><profile><dependencies>
+    <dependency><groupId>profile</groupId><artifactId>only</artifactId><version>1</version></dependency>
+  </dependencies></profile></profiles>
+</project>"#,
+        )
+        .expect("pom");
+
+        let deps = scan_external_deps(tmp.path());
+        assert_eq!(
+            dep(&deps, "maven", "pom.xml", "org.example:core")
+                .version_req
+                .as_deref(),
+            Some("2.4.0")
+        );
+        let junit = dep(&deps, "maven", "pom.xml", "org.junit.jupiter:junit-jupiter");
+        assert_eq!(junit.version_req.as_deref(), Some("5.11.0"));
+        assert_eq!(junit.kind, "dev");
+        assert_eq!(
+            dep(&deps, "maven", "pom.xml", "org.example:inherited")
+                .version_req
+                .as_deref(),
+            Some("${unresolved.version}-5.11.0")
+        );
+        assert!(deps
+            .iter()
+            .all(|dep| dep.name != "managed:only" && dep.name != "profile:only"));
+        assert_eq!(
+            serde_json::to_value(&deps).expect("deps json"),
+            serde_json::json!([
+                {
+                    "name": "org.example:core",
+                    "ecosystem": "maven",
+                    "version_req": "2.4.0",
+                    "source_manifest": "pom.xml",
+                    "kind": "normal"
+                },
+                {
+                    "name": "org.example:inherited",
+                    "ecosystem": "maven",
+                    "version_req": "${unresolved.version}-5.11.0",
+                    "source_manifest": "pom.xml",
+                    "kind": "normal"
+                },
+                {
+                    "name": "org.junit.jupiter:junit-jupiter",
+                    "ecosystem": "maven",
+                    "version_req": "5.11.0",
+                    "source_manifest": "pom.xml",
+                    "kind": "dev"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn gradle_groovy_and_kotlin_extract_static_string_coordinates_only() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("kotlin")).expect("kotlin dir");
+        std::fs::write(
+            tmp.path().join("build.gradle"),
+            r#"dependencies {
+  implementation "com.google.guava:guava:33.3.0-jre"
+  testImplementation('org.junit.jupiter:junit-jupiter:5.11.0')
+  implementation "org.dynamic:plus:1.+"
+  implementation libs.bundles.testing
+  implementation "org.variable:dep:$version"
+  implementation "$group:guava:33.0"
+  // implementation "commented:out:1.0"
+  println("x") /*
+  implementation "ghost:lib:9.9.9"
+  */
+}"#,
+        )
+        .expect("gradle");
+        std::fs::write(
+            tmp.path().join("kotlin/build.gradle.kts"),
+            r#"dependencies {
+  api("org.jetbrains.kotlin:kotlin-stdlib:2.0.20")
+  testRuntimeOnly("org.junit.platform:junit-platform-launcher:1.11.0")
+  implementation("org.range:dep:[1,2)")
+}"#,
+        )
+        .expect("gradle kts");
+
+        let deps = scan_external_deps(tmp.path());
+        assert_eq!(
+            dep(&deps, "maven", "build.gradle", "com.google.guava:guava")
+                .version_req
+                .as_deref(),
+            Some("33.3.0-jre")
+        );
+        assert_eq!(
+            dep(&deps, "maven", "build.gradle", "org.junit.jupiter:junit-jupiter").kind,
+            "dev"
+        );
+        assert_eq!(
+            dep(
+                &deps,
+                "maven",
+                "kotlin/build.gradle.kts",
+                "org.jetbrains.kotlin:kotlin-stdlib"
+            )
+            .kind,
+            "normal"
+        );
+        assert_eq!(
+            dep(
+                &deps,
+                "maven",
+                "kotlin/build.gradle.kts",
+                "org.junit.platform:junit-platform-launcher"
+            )
+            .kind,
+            "dev"
+        );
+        assert_eq!(deps.len(), 4);
+        assert_eq!(
+            serde_json::to_value(&deps).expect("deps json"),
+            serde_json::json!([
+                {
+                    "name": "com.google.guava:guava",
+                    "ecosystem": "maven",
+                    "version_req": "33.3.0-jre",
+                    "source_manifest": "build.gradle",
+                    "kind": "normal"
+                },
+                {
+                    "name": "org.junit.jupiter:junit-jupiter",
+                    "ecosystem": "maven",
+                    "version_req": "5.11.0",
+                    "source_manifest": "build.gradle",
+                    "kind": "dev"
+                },
+                {
+                    "name": "org.jetbrains.kotlin:kotlin-stdlib",
+                    "ecosystem": "maven",
+                    "version_req": "2.0.20",
+                    "source_manifest": "kotlin/build.gradle.kts",
+                    "kind": "normal"
+                },
+                {
+                    "name": "org.junit.platform:junit-platform-launcher",
+                    "ecosystem": "maven",
+                    "version_req": "1.11.0",
+                    "source_manifest": "kotlin/build.gradle.kts",
+                    "kind": "dev"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn gemfile_extracts_group_kind_and_closes_from_gemfile_lock() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("Gemfile"),
+            r#"source "https://rubygems.org"
+gem "rails", "~> 7.2"
+gem('puma', '>= 6.4')
+group :development, :test do
+  gem "rspec", "~> 3.13"
+end
+"#,
+        )
+        .expect("Gemfile");
+        std::fs::write(
+            tmp.path().join("Gemfile.lock"),
+            r#"GEM
+  remote: https://rubygems.org/
+  specs:
+    puma (6.4.3)
+    rails (7.2.1)
+      rack (>= 2.2.4)
+    rack (3.1.8)
+    rspec (3.13.0)
+
+DEPENDENCIES
+  puma (>= 6.4)
+  rails (~> 7.2)
+  rspec (~> 3.13)
+"#,
+        )
+        .expect("Gemfile.lock");
+
+        let deps = scan_external_deps(tmp.path());
+        assert_eq!(
+            dep(&deps, "rubygems", "Gemfile", "rails").version_locked.as_deref(),
+            Some("7.2.1")
+        );
+        assert_eq!(
+            dep(&deps, "rubygems", "Gemfile", "puma").version_req.as_deref(),
+            Some(">= 6.4")
+        );
+        assert_eq!(dep(&deps, "rubygems", "Gemfile", "rspec").kind, "dev");
+        assert!(deps.iter().all(|dep| dep.name != "rack"));
+        assert_eq!(
+            serde_json::to_value(&deps).expect("deps json"),
+            serde_json::json!([
+                {
+                    "name": "puma",
+                    "ecosystem": "rubygems",
+                    "version_req": ">= 6.4",
+                    "version_locked": "6.4.3",
+                    "source_manifest": "Gemfile",
+                    "kind": "normal"
+                },
+                {
+                    "name": "rails",
+                    "ecosystem": "rubygems",
+                    "version_req": "~> 7.2",
+                    "version_locked": "7.2.1",
+                    "source_manifest": "Gemfile",
+                    "kind": "normal"
+                },
+                {
+                    "name": "rspec",
+                    "ecosystem": "rubygems",
+                    "version_req": "~> 3.13",
+                    "version_locked": "3.13.0",
+                    "source_manifest": "Gemfile",
+                    "kind": "dev"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn gemfile_options_nested_groups_constraints_and_platform_locks_are_precise() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("Gemfile"),
+            r#"gem "elasticsearch-model", require: "elasticsearch/model"
+gem "source-only", source: "https://gems.example.invalid"
+gem "git-only", :git => "https://git.example.invalid/repo.git"
+gem "rails", ">= 5.0", "< 7", require: false
+gem "nokogiri", ">= 1"
+group :test do
+  group :development do
+    gem "inner"
+  end
+  gem "after-nested"
+end
+"#,
+        )
+        .expect("Gemfile");
+        std::fs::write(
+            tmp.path().join("Gemfile.lock"),
+            r#"GEM
+  specs:
+    nokogiri (1.16.5)
+    nokogiri (1.16.5-x86_64-linux)
+"#,
+        )
+        .expect("Gemfile.lock");
+
+        let deps = scan_external_deps(tmp.path());
+        for name in ["elasticsearch-model", "source-only", "git-only"] {
+            assert!(dep(&deps, "rubygems", "Gemfile", name).version_req.is_none());
+        }
+        assert_eq!(
+            dep(&deps, "rubygems", "Gemfile", "rails").version_req.as_deref(),
+            Some(">= 5.0, < 7")
+        );
+        assert_eq!(dep(&deps, "rubygems", "Gemfile", "inner").kind, "dev");
+        assert_eq!(dep(&deps, "rubygems", "Gemfile", "after-nested").kind, "dev");
+        assert_eq!(
+            dep(&deps, "rubygems", "Gemfile", "nokogiri").version_locked.as_deref(),
+            Some("1.16.5")
+        );
+    }
+
+    #[test]
+    fn nuget_csproj_uses_central_versions_and_direct_lock_entries() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("src/App")).expect("app dir");
+        std::fs::write(
+            tmp.path().join("Directory.Packages.props"),
+            r#"<Project><ItemGroup>
+  <PackageVersion Include="Serilog" Version="4.0.2" />
+</ItemGroup></Project>"#,
+        )
+        .expect("central props");
+        std::fs::write(
+            tmp.path().join("src/App/App.csproj"),
+            r#"<Project Sdk="Microsoft.NET.Sdk"><ItemGroup>
+  <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+  <PackageReference Include="Serilog" />
+  <PackageReference Include="xunit"><Version>2.9.2</Version></PackageReference>
+  <PackageReference Update="Not.A.Direct.Dependency" Version="9.9.9" />
+</ItemGroup></Project>"#,
+        )
+        .expect("csproj");
+        std::fs::write(
+            tmp.path().join("packages.lock.json"),
+            r#"{
+  "version": 1,
+  "dependencies": {
+    "net8.0": {
+      "Newtonsoft.Json": { "type": "Direct", "requested": "[13.0.3, )", "resolved": "13.0.3" },
+      "Serilog": { "type": "Direct", "requested": "[4.0.2, )", "resolved": "4.0.2" },
+      "xunit": { "type": "Direct", "requested": "[2.9.2, )", "resolved": "2.9.2" },
+      "System.Memory": { "type": "Transitive", "resolved": "4.5.5" }
+    }
+  }
+}"#,
+        )
+        .expect("packages lock");
+
+        let deps = scan_external_deps(tmp.path());
+        let source = "src/App/App.csproj";
+        assert_eq!(
+            dep(&deps, "nuget", source, "Serilog").version_req.as_deref(),
+            Some("4.0.2")
+        );
+        assert_eq!(
+            dep(&deps, "nuget", source, "Newtonsoft.Json").version_locked.as_deref(),
+            Some("13.0.3")
+        );
+        assert_eq!(
+            dep(&deps, "nuget", source, "xunit").version_req.as_deref(),
+            Some("2.9.2")
+        );
+        assert!(deps
+            .iter()
+            .all(|dep| dep.name != "System.Memory" && dep.name != "Not.A.Direct.Dependency"));
+        assert_eq!(
+            serde_json::to_value(&deps).expect("deps json"),
+            serde_json::json!([
+                {
+                    "name": "Newtonsoft.Json",
+                    "ecosystem": "nuget",
+                    "version_req": "13.0.3",
+                    "version_locked": "13.0.3",
+                    "source_manifest": "src/App/App.csproj",
+                    "kind": "normal"
+                },
+                {
+                    "name": "Serilog",
+                    "ecosystem": "nuget",
+                    "version_req": "4.0.2",
+                    "version_locked": "4.0.2",
+                    "source_manifest": "src/App/App.csproj",
+                    "kind": "normal"
+                },
+                {
+                    "name": "xunit",
+                    "ecosystem": "nuget",
+                    "version_req": "2.9.2",
+                    "version_locked": "2.9.2",
+                    "source_manifest": "src/App/App.csproj",
+                    "kind": "normal"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn poetry_and_uv_locks_close_declared_python_deps_only() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("poetry")).expect("poetry dir");
+        std::fs::create_dir_all(tmp.path().join("uv")).expect("uv dir");
+        std::fs::write(
+            tmp.path().join("poetry/pyproject.toml"),
+            "[tool.poetry.dependencies]\npython = \"^3.11\"\nRequests = \"^2.32\"\n",
+        )
+        .expect("poetry project");
+        std::fs::write(
+            tmp.path().join("poetry/poetry.lock"),
+            "[[package]]\nname = \"requests\"\nversion = \"2.32.3\"\n\n[[package]]\nname = \"urllib3\"\nversion = \"2.2.3\"\n",
+        )
+        .expect("poetry lock");
+        std::fs::write(tmp.path().join("uv/requirements.txt"), "httpx>=0.27\n").expect("requirements");
+        std::fs::write(
+            tmp.path().join("uv/uv.lock"),
+            "version = 1\n\n[[package]]\nname = \"httpx\"\nversion = \"0.27.2\"\n\n[[package]]\nname = \"anyio\"\nversion = \"4.6.0\"\n",
+        )
+        .expect("uv lock");
+
+        let deps = scan_external_deps(tmp.path());
+        assert_eq!(
+            dep(&deps, "pypi", "poetry/pyproject.toml", "Requests")
+                .version_locked
+                .as_deref(),
+            Some("2.32.3")
+        );
+        assert_eq!(
+            dep(&deps, "pypi", "uv/requirements.txt", "httpx")
+                .version_locked
+                .as_deref(),
+            Some("0.27.2")
+        );
+        assert!(deps.iter().all(|dep| dep.name != "urllib3" && dep.name != "anyio"));
+    }
+
+    #[test]
+    fn go_sum_closes_exact_direct_versions_without_transitive_leakage() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("go.mod"),
+            "module example.com/app\n\nrequire example.com/direct v1.2.3\nrequire example.com/missing v2.0.0\nrequire example.com/metadata-only v1.0.0\n",
+        )
+        .expect("go mod");
+        std::fs::write(
+            tmp.path().join("go.sum"),
+            "example.com/direct v1.2.3 h1:direct\nexample.com/direct v1.2.3/go.mod h1:mod\nexample.com/direct v1.1.0 h1:old\nexample.com/metadata-only v1.0.0/go.mod h1:metadata\nexample.com/transitive v9.9.9 h1:transitive\n",
+        )
+        .expect("go sum");
+
+        let deps = scan_external_deps(tmp.path());
+        assert_eq!(
+            dep(&deps, "go", "go.mod", "example.com/direct")
+                .version_locked
+                .as_deref(),
+            Some("v1.2.3")
+        );
+        assert!(dep(&deps, "go", "go.mod", "example.com/missing")
+            .version_locked
+            .is_none());
+        assert!(dep(&deps, "go", "go.mod", "example.com/metadata-only")
+            .version_locked
+            .is_none());
+        assert!(deps.iter().all(|dep| dep.name != "example.com/transitive"));
+    }
+
+    #[test]
+    fn repos_without_new_manifest_types_keep_existing_dependency_golden() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("requirements.txt"), "requests>=2\n").expect("requirements");
+        std::fs::write(tmp.path().join("package.json"), r#"{"dependencies":{"express":"^4"}}"#).expect("package");
+        std::fs::write(
+            tmp.path().join("go.mod"),
+            "module example.com/app\nrequire golang.org/x/sync v0.7.0\n",
+        )
+        .expect("go mod");
+
+        let json = serde_json::to_string(&scan_external_deps(tmp.path())).expect("deps json");
+        assert_eq!(
+            json,
+            r#"[{"name":"golang.org/x/sync","ecosystem":"go","version_req":"v0.7.0","source_manifest":"go.mod","kind":"normal"},{"name":"express","ecosystem":"npm","version_req":"^4","source_manifest":"package.json","kind":"normal"},{"name":"requests","ecosystem":"pypi","version_req":">=2","source_manifest":"requirements.txt","kind":"normal"}]"#
+        );
+    }
+
+    #[test]
+    fn malformed_and_oversized_new_ecosystem_files_are_skipped_without_panics() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("pom.xml"), "<project><dependencies>").expect("truncated pom");
+        std::fs::write(
+            tmp.path().join("App.csproj"),
+            "<Project><ItemGroup><PackageReference Include=\"Example.Package\" Version=\"1\" /></ItemGroup></Project>",
+        )
+        .expect("csproj");
+        std::fs::write(tmp.path().join("Broken.csproj"), b"\0\xFF\xFE").expect("binary csproj");
+        std::fs::write(tmp.path().join("Gemfile"), "gem \"rack\", \"~> 3\"\n").expect("Gemfile");
+        std::fs::write(tmp.path().join("Gemfile.lock"), b"GEM\n\xFF\xFE\0").expect("binary lock");
+        std::fs::write(tmp.path().join("build.gradle"), "implementation \"a:b:1\"\n").expect("gradle");
+        let oversized = std::fs::OpenOptions::new()
+            .write(true)
+            .open(tmp.path().join("build.gradle"))
+            .expect("open gradle");
+        oversized.set_len(MAX_FILE_BYTES + 1).expect("oversize gradle");
+        std::fs::write(tmp.path().join("packages.lock.json"), r#"{"dependencies":{}}"#).expect("lock");
+        let oversized_lock = std::fs::OpenOptions::new()
+            .write(true)
+            .open(tmp.path().join("packages.lock.json"))
+            .expect("open lock");
+        oversized_lock.set_len(MAX_LOCKFILE_BYTES + 1).expect("oversize lock");
+
+        let deps = scan_external_deps(tmp.path());
+        assert_eq!(deps.len(), 2);
+        assert!(dep(&deps, "nuget", "App.csproj", "Example.Package")
+            .version_locked
+            .is_none());
+        assert!(dep(&deps, "rubygems", "Gemfile", "rack").version_locked.is_none());
+    }
+
     #[cfg(unix)]
     #[test]
     fn symlink_loop_is_skipped() {
@@ -1376,6 +2474,24 @@ exclude github.com/old/pkg v1.0.0
     }
 
     #[test]
+    fn pre_m2_manifests_claim_cap_slots_before_alphabetically_earlier_m2_manifests() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for idx in 0..=MAX_MANIFESTS {
+            std::fs::write(tmp.path().join(format!("A{idx:04}.csproj")), "<Project />").expect("csproj");
+        }
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"dependencies":{"must-survive":"1.2.3"}}"#,
+        )
+        .expect("package");
+
+        let deps = scan_external_deps(tmp.path());
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "must-survive");
+        assert_eq!(deps[0].source_manifest, "package.json");
+    }
+
+    #[test]
     fn manifest_scan_order_is_deterministic() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join("b")).expect("b dir");
@@ -1404,6 +2520,12 @@ exclude github.com/old/pkg v1.0.0
     fn flag_off_scan_serializes_without_external_dependency_fields() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::write(tmp.path().join("package.json"), r#"{"dependencies":{"express":"^4"}}"#).expect("package");
+        std::fs::write(
+            tmp.path().join("pom.xml"),
+            "<project><dependencies><dependency><groupId>org.example</groupId><artifactId>new</artifactId><version>1</version></dependency></dependencies></project>",
+        )
+        .expect("pom");
+        std::fs::write(tmp.path().join("Gemfile"), "gem \"rack\", \"~> 3\"\n").expect("Gemfile");
         std::fs::write(tmp.path().join("main.ts"), "export function main() {}\n").expect("ts");
 
         let _env = EnvVarGuard::unset(EXTERNAL_DEPS_ENV);
@@ -1411,6 +2533,50 @@ exclude github.com/old/pkg v1.0.0
         let json = serde_json::to_string(&scan).expect("scan json");
         assert!(!json.contains("external_deps"));
         assert!(!json.contains("external_dep_count"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn flag_off_full_scan_bytes_are_identical_with_all_m2_manifests_and_locks_present() {
+        fn stable_bytes(mut scan: crate::workspace_scan::WorkspaceScan) -> Vec<u8> {
+            scan.scan_id = "stable".to_string();
+            scan.started_at_unix_ms = 1;
+            scan.finished_at_unix_ms = 2;
+            scan.duration_ms = 1;
+            serde_json::to_vec(&scan).expect("scan json")
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _external_deps = EnvVarGuard::unset(EXTERNAL_DEPS_ENV);
+        let _polyglot = EnvVarGuard::unset("CORECRUXD_POLYGLOT_V2");
+        let baseline =
+            stable_bytes(crate::workspace_scan_polyglot::run_repo_scan_at(tmp.path()).expect("baseline scan"));
+
+        std::fs::write(tmp.path().join("pom.xml"), "<project />").expect("pom");
+        std::fs::write(
+            tmp.path().join("build.gradle"),
+            "implementation \"org.example:core:1\"\n",
+        )
+        .expect("gradle");
+        std::fs::write(tmp.path().join("Gemfile"), "gem \"rack\", \"~> 3\"\n").expect("Gemfile");
+        std::fs::write(tmp.path().join("Gemfile.lock"), "GEM\n  specs:\n    rack (3.1.0)\n").expect("Gemfile.lock");
+        std::fs::write(
+            tmp.path().join("App.csproj"),
+            "<Project><ItemGroup><PackageReference Include=\"Example.Package\" Version=\"1\" /></ItemGroup></Project>",
+        )
+        .expect("csproj");
+        std::fs::write(tmp.path().join("packages.lock.json"), r#"{"dependencies":{}}"#).expect("NuGet lock");
+        std::fs::write(
+            tmp.path().join("poetry.lock"),
+            "[[package]]\nname = \"requests\"\nversion = \"2\"\n",
+        )
+        .expect("poetry lock");
+        std::fs::write(tmp.path().join("uv.lock"), "version = 1\n").expect("uv lock");
+        std::fs::write(tmp.path().join("go.sum"), "example.com/mod v1.0.0 h1:hash\n").expect("go sum");
+
+        let with_m2_files =
+            stable_bytes(crate::workspace_scan_polyglot::run_repo_scan_at(tmp.path()).expect("M2 files scan"));
+        assert_eq!(baseline, with_m2_files);
     }
 
     #[test]
