@@ -168,6 +168,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/admin/version", methods: &["GET"], tag: "Admin", auth: "admin-read", summary: "Admin version" },
     RouteEntry { path: "/v1/agents/{passport}/usage", methods: &["GET"], tag: "Agents", auth: "read", summary: "Agents {passport} usage" },
     RouteEntry { path: "/v1/append", methods: &["POST"], tag: "Append", auth: "write", summary: "Append" },
+    RouteEntry { path: "/v1/audit/bundle/verify", methods: &["POST"], tag: "Audit", auth: "read", summary: "Audit bundle verify" },
     RouteEntry { path: "/v1/auth/device/approve", methods: &["POST"], tag: "Auth", auth: "public", summary: "Auth device approve" },
     RouteEntry { path: "/v1/auth/device/refresh", methods: &["POST"], tag: "Auth", auth: "public", summary: "Auth device refresh" },
     RouteEntry { path: "/v1/auth/device/revoke", methods: &["POST"], tag: "Auth", auth: "public", summary: "Auth device revoke" },
