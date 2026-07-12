@@ -612,6 +612,11 @@ fn collection_records(
     let mut records = store
         .all_facts()
         .filter(|fact| fact_belongs_to_tenant(fact, tenant_id))
+        // C6 defence-in-depth: never surface born-private facts on the collection-sync
+        // path, matching `promotion_preview`'s `if fact.private { skip }` guard. Reserved
+        // `__xxx__::` entities already miss `fact_belongs_to_tenant`; this covers any
+        // tenant-scoped fact an agent stored private.
+        .filter(|fact| !fact.private)
         .filter(|fact| classify_fact_collection(fact) == collection)
         .map(|fact| record_from_fact(tenant_id, fact, collection, include_content))
         .collect::<Vec<_>>();
@@ -1543,6 +1548,47 @@ mod tests {
         assert!(!second.has_more);
         assert!(second.records[0].fact.is_some());
         assert!(second.collection_hash.starts_with("blake3:"));
+    }
+
+    #[test]
+    fn tenant_collection_page_excludes_born_private_facts() {
+        // C6 defence-in-depth (hardening M3): a fact an agent stored private must never
+        // appear on the collection-sync path, even when it belongs to the queried tenant.
+        let mut store = FactStore::new();
+        store.store(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "personal::two::note::public".to_string(),
+            key: "note".to_string(),
+            value: "visible".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        store.store(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "personal::two::note::secret".to_string(),
+            key: "note".to_string(),
+            value: "hidden".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: true,
+            horizon_class: None,
+            actor: None,
+        });
+
+        let page = tenant_collection_page(&store, "personal::two", SYNC_COLLECTION_FACTS, None, 100, true).unwrap();
+        assert_eq!(
+            page.records.len(),
+            1,
+            "born-private fact must be excluded from the collection-sync page (only the public fact remains)"
+        );
+
+        // The cursor/count derivation (collection_records) must agree — no private leak there either.
+        let page_all =
+            tenant_collection_page(&store, "personal::two", SYNC_COLLECTION_FACTS, None, 100, false).unwrap();
+        assert_eq!(page_all.records.len(), 1);
     }
 
     #[test]
