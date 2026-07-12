@@ -5,36 +5,49 @@
 
 //! Polyglot code-structure scanner backed by tree-sitter for non-Rust files.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use tree_sitter::{Node, Parser};
 
 use crate::workspace_scan::{
     parse_file_doc_header, parse_internal_path_deps, walk_dir, CrateInfo, DepEdge, FileInfo, FileReference, RouteHit,
-    ScanDiagnostics, ScanError, ScanStats, SymbolInfo, UnresolvedRoute, WorkspaceScan,
+    ScanDiagnostics, ScanError, ScanStats, SymbolInfo, UnresolvedRoute, V3SkippedFile, WorkspaceScan,
 };
 
 const POLYGLOT_V2_ENV: &str = "CORECRUXD_POLYGLOT_V2";
+const POLYGLOT_V3_ENV: &str = "CORECRUXD_POLYGLOT_V3";
 pub(crate) const POLYGLOT_AST_MAX_DEPTH: usize = 512;
 pub(crate) const POLYGLOT_JS_MAX_BYTES: usize = 1024 * 1024;
 pub(crate) const POLYGLOT_JS_MAX_LINE_BYTES: usize = 10_000;
+pub(crate) const POLYGLOT_JAVA_MAX_BYTES: usize = 1024 * 1024;
+pub(crate) const POLYGLOT_JAVA_MAX_LINE_BYTES: usize = 10_000;
+pub(crate) const POLYGLOT_C_MAX_BYTES: usize = 1024 * 1024;
+pub(crate) const POLYGLOT_C_MAX_LINE_BYTES: usize = 10_000;
+pub(crate) const POLYGLOT_CPP_MAX_BYTES: usize = 1024 * 1024;
+pub(crate) const POLYGLOT_CPP_MAX_LINE_BYTES: usize = 10_000;
 
 #[derive(Debug, Clone, Copy)]
 struct PolyglotScanOptions {
     v2_enabled: bool,
+    v3_enabled: bool,
 }
 
 impl PolyglotScanOptions {
     fn from_env() -> Self {
         Self {
             v2_enabled: polyglot_v2_enabled_from_env(),
+            v3_enabled: polyglot_v3_enabled(),
         }
     }
 }
 
 pub(crate) fn polyglot_v2_enabled_from_env() -> bool {
     crate::workspace_scan_manifests::env_flag_enabled(POLYGLOT_V2_ENV)
+}
+
+pub(crate) fn polyglot_v3_enabled() -> bool {
+    crate::workspace_scan_manifests::env_flag_enabled(POLYGLOT_V3_ENV)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +58,9 @@ enum LanguageKind {
     Python,
     Vue,
     Go,
+    Java,
+    C,
+    Cpp,
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +79,7 @@ struct ExtractedFile {
     doc_full: Option<String>,
     is_test_file: bool,
     symbols: Vec<SymbolInfo>,
+    symbol_keys: HashSet<(String, String)>,
     local_bindings: HashMap<String, LocalBinding>,
     deps: Vec<DepEdge>,
     calls: Vec<CallSite>,
@@ -161,6 +178,11 @@ fn merge_polyglot_scan(scan: &mut WorkspaceScan, poly: WorkspaceScan, options: P
             .unresolved_routes
             .extend(poly.diagnostics.unresolved_routes);
     }
+    if options.v3_enabled {
+        scan.diagnostics
+            .v3_skipped_files
+            .extend(poly.diagnostics.v3_skipped_files);
+    }
     scan.duration_ms += poly.duration_ms;
     scan.finished_at_unix_ms = scan.finished_at_unix_ms.max(poly.finished_at_unix_ms);
     roll_up_stats(scan);
@@ -183,8 +205,11 @@ fn run_polyglot_scan_inner(
     let package_name = discover_package_name(root);
     let files = supported_files(root, include_rust, options)?;
     let mut extracted = Vec::new();
+    let mut v3_skipped_files = Vec::new();
     for (abs, lang) in files {
-        if let Some(file) = extract_file(root, &abs, lang, &package_name, options)? {
+        if let Some(file) =
+            extract_file_recording_skips(root, &abs, lang, &package_name, options, &mut v3_skipped_files)?
+        {
             extracted.push(file);
         }
     }
@@ -193,7 +218,10 @@ fn run_polyglot_scan_inner(
         scan_id: format!("ws_{started_ms}"),
         root_path: root.display().to_string(),
         started_at_unix_ms: started_ms,
-        diagnostics: ScanDiagnostics::default(),
+        diagnostics: ScanDiagnostics {
+            v3_skipped_files,
+            ..ScanDiagnostics::default()
+        },
         ..Default::default()
     };
     let mut file_idx_by_path = HashMap::new();
@@ -245,7 +273,7 @@ fn supported_files(
 ) -> Result<Vec<(PathBuf, LanguageKind)>, ScanError> {
     let mut files = Vec::new();
     walk_dir(root, root, &mut |rel, abs| {
-        if should_skip_generated_js_file(rel, options) {
+        if should_skip_generated_polyglot_file(rel, options) {
             return;
         }
         if let Some(lang) = language_for_path(abs, options) {
@@ -268,28 +296,57 @@ fn language_for_path(path: &Path, options: PolyglotScanOptions) -> Option<Langua
         "js" | "mjs" | "cjs" if options.v2_enabled => Some(LanguageKind::TypeScript),
         "jsx" if options.v2_enabled => Some(LanguageKind::Tsx),
         "go" if options.v2_enabled => Some(LanguageKind::Go),
+        "java" if options.v3_enabled => Some(LanguageKind::Java),
+        "c" if options.v3_enabled => Some(LanguageKind::C),
+        // Ambiguous .h headers enter as C, then a deterministic source sniff
+        // upgrades obvious namespace/template/extern-C++ headers after reading.
+        // Explicit C++ header suffixes map directly to C++.
+        "h" if options.v3_enabled => Some(LanguageKind::C),
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" if options.v3_enabled => Some(LanguageKind::Cpp),
         _ => None,
     }
 }
 
-fn should_skip_generated_js_file(rel: &Path, options: PolyglotScanOptions) -> bool {
-    if !options.v2_enabled {
-        return false;
+fn language_for_source(lang: LanguageKind, path: &Path, src: &str) -> LanguageKind {
+    let is_h_header = path.extension().and_then(|extension| extension.to_str()) == Some("h");
+    if lang == LanguageKind::C && is_h_header && header_looks_cpp(src) {
+        LanguageKind::Cpp
+    } else {
+        lang
     }
-    let is_v2_js = matches!(
-        rel.extension().and_then(|e| e.to_str()).unwrap_or_default(),
-        "js" | "jsx" | "mjs" | "cjs"
-    );
-    is_v2_js
-        && rel.components().any(|component| {
-            let segment = component.as_os_str().to_string_lossy();
-            matches!(
-                segment.as_ref(),
-                "dist" | "build" | "out" | ".next" | ".nuxt" | ".output" | "coverage"
-            )
-        })
 }
 
+fn header_looks_cpp(src: &str) -> bool {
+    // Deliberately a plain, deterministic substring sniff. Comments/strings
+    // can false-positive, but results never depend on filesystem/toolchain state.
+    src.contains("namespace ")
+        || src.contains("template<")
+        || src.contains("template <")
+        || src.contains("extern \"C++\"")
+}
+
+fn should_skip_generated_polyglot_file(rel: &Path, options: PolyglotScanOptions) -> bool {
+    let extension = rel.extension().and_then(|e| e.to_str()).unwrap_or_default();
+    let is_v2_js = options.v2_enabled && matches!(extension, "js" | "jsx" | "mjs" | "cjs");
+    let is_v3_source = options.v3_enabled
+        && matches!(
+            extension,
+            "java" | "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx"
+        );
+    rel.components().any(|component| {
+        let segment = component.as_os_str().to_string_lossy();
+        let existing_generated_dir = matches!(
+            segment.as_ref(),
+            "dist" | "build" | "out" | ".next" | ".nuxt" | ".output" | "coverage"
+        );
+        (is_v2_js && existing_generated_dir)
+            || (is_v3_source
+                && (existing_generated_dir
+                    || matches!(segment.as_ref(), "target" | "vendor" | "vendored" | "third_party")))
+    })
+}
+
+#[cfg(test)]
 fn extract_file(
     root: &Path,
     abs: &Path,
@@ -297,9 +354,35 @@ fn extract_file(
     package_name: &str,
     options: PolyglotScanOptions,
 ) -> Result<Option<ExtractedFile>, ScanError> {
-    let src = std::fs::read_to_string(abs).unwrap_or_default();
+    extract_file_recording_skips(root, abs, lang, package_name, options, &mut Vec::new())
+}
+
+fn extract_file_recording_skips(
+    root: &Path,
+    abs: &Path,
+    lang: LanguageKind,
+    package_name: &str,
+    options: PolyglotScanOptions,
+    v3_skipped_files: &mut Vec<V3SkippedFile>,
+) -> Result<Option<ExtractedFile>, ScanError> {
     let rel_path = rel_string(root, abs);
+    if let Some(reason) = pathological_v3_size_skip_reason(&rel_path, abs, lang, options) {
+        v3_skipped_files.push(V3SkippedFile {
+            rel_path,
+            reason: reason.to_string(),
+        });
+        return Ok(None);
+    }
+    let src = std::fs::read_to_string(abs).unwrap_or_default();
     if should_skip_pathological_v2_js(&rel_path, &src, options) {
+        return Ok(None);
+    }
+    let lang = language_for_source(lang, abs, &src);
+    if let Some(reason) = pathological_v3_source_skip_reason(&rel_path, &src, lang, options) {
+        v3_skipped_files.push(V3SkippedFile {
+            rel_path,
+            reason: reason.to_string(),
+        });
         return Ok(None);
     }
     let loc = src.lines().count();
@@ -322,6 +405,7 @@ fn extract_file(
         doc_full,
         is_test_file,
         symbols: Vec::new(),
+        symbol_keys: HashSet::new(),
         local_bindings: HashMap::new(),
         deps: Vec::new(),
         calls: Vec::new(),
@@ -348,6 +432,9 @@ fn extract_file(
             }
         }
         LanguageKind::Go => extract_go_file(&src, &mut file, options, &mut guard)?,
+        LanguageKind::Java => extract_java_file(&src, &mut file, &mut guard)?,
+        LanguageKind::C => extract_c_family_file(&src, &mut file, false, &mut guard)?,
+        LanguageKind::Cpp => extract_c_family_file(&src, &mut file, true, &mut guard)?,
     }
     file.ast_depth_limit_hits = guard.depth_limit_hits;
     if file.ast_depth_limit_hits > 0 {
@@ -389,6 +476,273 @@ fn is_v2_js_path(path: &str) -> bool {
             .unwrap_or_default(),
         "js" | "jsx" | "mjs" | "cjs"
     )
+}
+
+fn v3_source_limits(lang: LanguageKind) -> Option<(usize, usize)> {
+    match lang {
+        LanguageKind::Java => Some((POLYGLOT_JAVA_MAX_BYTES, POLYGLOT_JAVA_MAX_LINE_BYTES)),
+        LanguageKind::C => Some((POLYGLOT_C_MAX_BYTES, POLYGLOT_C_MAX_LINE_BYTES)),
+        LanguageKind::Cpp => Some((POLYGLOT_CPP_MAX_BYTES, POLYGLOT_CPP_MAX_LINE_BYTES)),
+        _ => None,
+    }
+}
+
+fn pathological_v3_size_skip_reason(
+    rel_path: &str,
+    abs: &Path,
+    lang: LanguageKind,
+    options: PolyglotScanOptions,
+) -> Option<&'static str> {
+    if !options.v3_enabled {
+        return None;
+    }
+    let (max_bytes, _) = v3_source_limits(lang)?;
+    let metadata = match std::fs::symlink_metadata(abs) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            tracing::warn!(file = %rel_path, ?err, "polyglot v3 file skipped before reading; metadata unavailable");
+            return Some("metadata_unavailable");
+        }
+    };
+    if !metadata.file_type().is_file() {
+        tracing::warn!(file = %rel_path, "polyglot v3 non-regular file skipped before reading");
+        return Some("non_regular_file");
+    }
+    let byte_len = metadata.len();
+    if byte_len <= max_bytes as u64 {
+        return None;
+    }
+    tracing::warn!(
+        file = %rel_path,
+        bytes = byte_len,
+        max_bytes,
+        "polyglot v3 file skipped before reading or parsing"
+    );
+    Some("max_bytes")
+}
+
+fn pathological_v3_source_skip_reason(
+    rel_path: &str,
+    src: &str,
+    lang: LanguageKind,
+    options: PolyglotScanOptions,
+) -> Option<&'static str> {
+    if !options.v3_enabled {
+        return None;
+    }
+    let (max_bytes, max_line_bytes) = v3_source_limits(lang)?;
+    let byte_len = src.len();
+    let longest_line = src.lines().map(str::len).max().unwrap_or(0);
+    let delimiter_depth = max_source_delimiter_depth(src, POLYGLOT_AST_MAX_DEPTH, lang);
+    if byte_len <= max_bytes && longest_line <= max_line_bytes && delimiter_depth <= POLYGLOT_AST_MAX_DEPTH {
+        return None;
+    }
+    tracing::warn!(
+        file = %rel_path,
+        bytes = byte_len,
+        max_bytes,
+        longest_line_bytes = longest_line,
+        max_line_bytes,
+        delimiter_depth,
+        max_depth = POLYGLOT_AST_MAX_DEPTH,
+        "polyglot v3 file skipped before parsing"
+    );
+    if byte_len > max_bytes {
+        Some("max_bytes")
+    } else if longest_line > max_line_bytes {
+        Some("max_line_bytes")
+    } else {
+        Some("max_delimiter_depth")
+    }
+}
+
+/// Cheap, non-recursive admission guard for delimiter and template/generic
+/// nesting before native parsing. Deep non-bracket LR chains are intentionally
+/// left to tree-sitter's heap parse stack; the AST walk is separately capped.
+fn max_source_delimiter_depth(src: &str, stop_after: usize, lang: LanguageKind) -> usize {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum LexState {
+        Code,
+        LineComment,
+        BlockComment,
+        SingleQuoted,
+        DoubleQuoted,
+        JavaTextBlock,
+    }
+
+    let bytes = src.as_bytes();
+    let include_angle_brackets = matches!(lang, LanguageKind::Java | LanguageKind::Cpp);
+    let mut state = LexState::Code;
+    let mut escaped = false;
+    let mut depth = 0_usize;
+    let mut angle_depth = 0_usize;
+    let mut max_depth = 0_usize;
+    let mut index = 0_usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let next = bytes.get(index + 1).copied();
+        match state {
+            LexState::Code => match (byte, next) {
+                (b'/', Some(b'/')) => {
+                    state = LexState::LineComment;
+                    index += 1;
+                }
+                (b'/', Some(b'*')) => {
+                    state = LexState::BlockComment;
+                    index += 1;
+                }
+                (b'"', _)
+                    if lang == LanguageKind::Java
+                        && bytes.get(index..).is_some_and(|tail| tail.starts_with(b"\"\"\"")) =>
+                {
+                    state = LexState::JavaTextBlock;
+                    escaped = false;
+                    index += 2;
+                }
+                _ if lang == LanguageKind::Cpp => {
+                    if let Some(end_index) = cpp_raw_string_end(bytes, index) {
+                        index = end_index;
+                    } else if byte == b'\'' && !is_c_family_digit_separator(bytes, index) {
+                        state = LexState::SingleQuoted;
+                        escaped = false;
+                    } else if byte == b'"' {
+                        state = LexState::DoubleQuoted;
+                        escaped = false;
+                    } else {
+                        update_source_delimiter_depth(
+                            byte,
+                            include_angle_brackets,
+                            &mut depth,
+                            &mut angle_depth,
+                            &mut max_depth,
+                        );
+                        if max_depth > stop_after {
+                            return max_depth;
+                        }
+                    }
+                }
+                (b'\'', _) if lang == LanguageKind::C && is_c_family_digit_separator(bytes, index) => {}
+                (b'\'', _) => {
+                    state = LexState::SingleQuoted;
+                    escaped = false;
+                }
+                (b'"', _) => {
+                    state = LexState::DoubleQuoted;
+                    escaped = false;
+                }
+                _ => {
+                    update_source_delimiter_depth(
+                        byte,
+                        include_angle_brackets,
+                        &mut depth,
+                        &mut angle_depth,
+                        &mut max_depth,
+                    );
+                    if max_depth > stop_after {
+                        return max_depth;
+                    }
+                }
+            },
+            LexState::LineComment => {
+                if byte == b'\n' {
+                    state = LexState::Code;
+                }
+            }
+            LexState::BlockComment => {
+                if byte == b'*' && next == Some(b'/') {
+                    state = LexState::Code;
+                    index += 1;
+                }
+            }
+            LexState::SingleQuoted | LexState::DoubleQuoted => {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if (state == LexState::SingleQuoted && byte == b'\'')
+                    || (state == LexState::DoubleQuoted && byte == b'"')
+                {
+                    state = LexState::Code;
+                }
+            }
+            LexState::JavaTextBlock => {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if bytes.get(index..).is_some_and(|tail| tail.starts_with(b"\"\"\"")) {
+                    state = LexState::Code;
+                    index += 2;
+                }
+            }
+        }
+        index += 1;
+    }
+    max_depth
+}
+
+fn update_source_delimiter_depth(
+    byte: u8,
+    include_angle_brackets: bool,
+    depth: &mut usize,
+    angle_depth: &mut usize,
+    max_depth: &mut usize,
+) {
+    match byte {
+        b'(' | b'[' | b'{' => {
+            if include_angle_brackets && byte == b'{' {
+                *angle_depth = 0;
+            }
+            *depth += 1;
+            *max_depth = (*max_depth).max(*depth);
+        }
+        b')' | b']' | b'}' => {
+            if include_angle_brackets && byte == b'}' {
+                *angle_depth = 0;
+            }
+            *depth = depth.saturating_sub(1);
+        }
+        b'<' if include_angle_brackets => {
+            *angle_depth += 1;
+            *max_depth = (*max_depth).max(*angle_depth);
+        }
+        b'>' if include_angle_brackets => *angle_depth = angle_depth.saturating_sub(1),
+        b';' if include_angle_brackets => *angle_depth = 0,
+        _ => {}
+    }
+}
+
+fn is_c_family_digit_separator(bytes: &[u8], index: usize) -> bool {
+    bytes.get(index.wrapping_sub(1)).is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.get(index + 1).is_some_and(u8::is_ascii_alphanumeric)
+}
+
+fn cpp_raw_string_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+        return None;
+    }
+    let prefix = [b"u8R\"".as_slice(), b"uR\"", b"UR\"", b"LR\"", b"R\""]
+        .into_iter()
+        .find(|prefix| bytes.get(start..).is_some_and(|tail| tail.starts_with(prefix)))?;
+    let delimiter_start = start + prefix.len();
+    let open_paren = (delimiter_start..bytes.len().min(delimiter_start + 17)).find(|index| bytes[*index] == b'(')?;
+    let delimiter = &bytes[delimiter_start..open_paren];
+    if delimiter
+        .iter()
+        .any(|byte| byte.is_ascii_whitespace() || matches!(*byte, b'(' | b')' | b'\\'))
+    {
+        return None;
+    }
+    for close_paren in open_paren + 1..bytes.len() {
+        if bytes[close_paren] != b')' {
+            continue;
+        }
+        let delimiter_end = close_paren + 1 + delimiter.len();
+        if bytes.get(close_paren + 1..delimiter_end) == Some(delimiter) && bytes.get(delimiter_end) == Some(&b'"') {
+            return Some(delimiter_end);
+        }
+    }
+    Some(bytes.len().saturating_sub(1))
 }
 
 fn extract_rust_file(src: &str, file: &mut ExtractedFile, guard: &mut AstWalkGuard) {
@@ -953,6 +1307,364 @@ fn walk_go_children(node: Node<'_>, ctx: &mut GoWalkContext<'_, '_, '_>, file: &
     for child in node.named_children(&mut cursor) {
         walk_go_node(child, ctx, file, state.clone());
     }
+}
+
+fn extract_java_file(src: &str, file: &mut ExtractedFile, guard: &mut AstWalkGuard) -> Result<(), ScanError> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_java::LANGUAGE.into())
+        .map_err(|err| ScanError::Io(std::io::Error::other(err.to_string())))?;
+    let Some(tree) = parser.parse(src, None) else {
+        return Ok(());
+    };
+    walk_java_node(tree.root_node(), src.as_bytes(), file, guard, 0);
+    Ok(())
+}
+
+fn walk_java_node(node: Node<'_>, src: &[u8], file: &mut ExtractedFile, guard: &mut AstWalkGuard, depth: usize) {
+    if !guard.allow_depth(depth) {
+        return;
+    }
+    match node.kind() {
+        "class_declaration" => {
+            if let Some(name) = field_ident(node, src, "name") {
+                push_symbol(
+                    file,
+                    "class",
+                    &name,
+                    node.start_position().row + 1,
+                    java_is_public(node, src),
+                );
+            }
+        }
+        "interface_declaration" => {
+            if let Some(name) = field_ident(node, src, "name") {
+                push_symbol(
+                    file,
+                    "interface",
+                    &name,
+                    node.start_position().row + 1,
+                    java_is_public(node, src),
+                );
+            }
+        }
+        "method_declaration" => {
+            if let Some(name) = field_ident(node, src, "name") {
+                push_symbol(
+                    file,
+                    "method",
+                    &name,
+                    node.start_position().row + 1,
+                    java_is_public(node, src),
+                );
+            }
+        }
+        "field_declaration" if java_is_static_final(node, src) => {
+            let mut cursor = node.walk();
+            for declarator in node.children_by_field_name("declarator", &mut cursor) {
+                if let Some(name) = field_ident(declarator, src, "name") {
+                    push_symbol(
+                        file,
+                        "const",
+                        &name,
+                        node.start_position().row + 1,
+                        java_is_public(node, src),
+                    );
+                }
+            }
+        }
+        "constant_declaration" => {
+            let mut cursor = node.walk();
+            for declarator in node.children_by_field_name("declarator", &mut cursor) {
+                if let Some(name) = field_ident(declarator, src, "name") {
+                    push_symbol(file, "const", &name, node.start_position().row + 1, true);
+                }
+            }
+        }
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        walk_java_node(child, src, file, guard, depth + 1);
+    }
+}
+
+fn java_modifiers(node: Node<'_>, src: &[u8]) -> String {
+    let mut cursor = node.walk();
+    let modifiers = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "modifiers")
+        .map_or_else(String::new, |child| node_text(child, src));
+    modifiers
+}
+
+fn java_is_public(node: Node<'_>, src: &[u8]) -> bool {
+    !java_modifiers(node, src)
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .any(|modifier| modifier == "private")
+}
+
+fn java_is_static_final(node: Node<'_>, src: &[u8]) -> bool {
+    let modifiers = java_modifiers(node, src);
+    let words: Vec<&str> = modifiers
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .collect();
+    words.contains(&"static") && words.contains(&"final")
+}
+
+#[derive(Debug, Clone)]
+struct CFamilyWalkState {
+    namespaces: Vec<String>,
+    classes: Vec<String>,
+    in_function: bool,
+    member_is_pub: bool,
+    depth: usize,
+}
+
+impl Default for CFamilyWalkState {
+    fn default() -> Self {
+        Self {
+            namespaces: Vec::new(),
+            classes: Vec::new(),
+            in_function: false,
+            member_is_pub: true,
+            depth: 0,
+        }
+    }
+}
+
+fn extract_c_family_file(
+    src: &str,
+    file: &mut ExtractedFile,
+    cpp: bool,
+    guard: &mut AstWalkGuard,
+) -> Result<(), ScanError> {
+    let mut parser = Parser::new();
+    let language = if cpp {
+        tree_sitter_cpp::LANGUAGE
+    } else {
+        tree_sitter_c::LANGUAGE
+    };
+    parser
+        .set_language(&language.into())
+        .map_err(|err| ScanError::Io(std::io::Error::other(err.to_string())))?;
+    let Some(tree) = parser.parse(src, None) else {
+        return Ok(());
+    };
+    walk_c_family_node(
+        tree.root_node(),
+        src.as_bytes(),
+        file,
+        cpp,
+        guard,
+        CFamilyWalkState::default(),
+    );
+    Ok(())
+}
+
+fn walk_c_family_node(
+    node: Node<'_>,
+    src: &[u8],
+    file: &mut ExtractedFile,
+    cpp: bool,
+    guard: &mut AstWalkGuard,
+    state: CFamilyWalkState,
+) {
+    if !guard.allow_depth(state.depth) {
+        return;
+    }
+
+    if cpp && node.kind() == "field_declaration_list" {
+        let mut member_state = state;
+        member_state.depth += 1;
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "access_specifier" {
+                member_state.member_is_pub = node_text(child, src).trim() == "public";
+            } else {
+                walk_c_family_node(child, src, file, cpp, guard, member_state.clone());
+            }
+        }
+        return;
+    }
+
+    let mut child_state = state.clone();
+    child_state.depth += 1;
+    match node.kind() {
+        "namespace_definition" if cpp => {
+            if let Some(name) = field_ident(node, src, "name") {
+                child_state.namespaces.extend(
+                    name.split("::")
+                        .filter(|part| !part.is_empty())
+                        .map(ToString::to_string),
+                );
+            }
+        }
+        "class_specifier" | "struct_specifier" => {
+            if node.child_by_field_name("body").is_some() {
+                if cpp {
+                    child_state.member_is_pub = node.kind() == "struct_specifier";
+                }
+                if let Some(name) = field_ident(node, src, "name") {
+                    let symbol_name = normalize_c_family_name(&name);
+                    push_symbol(
+                        file,
+                        "class",
+                        &symbol_name,
+                        node.start_position().row + 1,
+                        c_family_is_public(node, src, cpp, &state),
+                    );
+                    if cpp {
+                        child_state.classes.push(symbol_name);
+                    }
+                }
+            }
+        }
+        "enum_specifier" => {
+            if node.child_by_field_name("body").is_some() {
+                if let Some(name) = field_ident(node, src, "name") {
+                    push_symbol(
+                        file,
+                        "class",
+                        &normalize_c_family_name(&name),
+                        node.start_position().row + 1,
+                        c_family_is_public(node, src, cpp, &state),
+                    );
+                }
+            }
+        }
+        "type_definition" => {
+            let mut cursor = node.walk();
+            for declarator in node.children_by_field_name("declarator", &mut cursor) {
+                if let Some(name) = c_declarator_name(declarator, src, guard, state.depth + 1) {
+                    push_symbol(
+                        file,
+                        "type",
+                        &name,
+                        node.start_position().row + 1,
+                        c_family_is_public(node, src, cpp, &state),
+                    );
+                }
+            }
+        }
+        "function_definition" => {
+            if let Some(name) = c_function_name(node, src, guard, state.depth + 1) {
+                let is_method = cpp && (!state.classes.is_empty() || name.contains("::"));
+                let qualified = if cpp { qualify_cpp_callable(&name, &state) } else { name };
+                push_symbol(
+                    file,
+                    if is_method { "method" } else { "fn" },
+                    &qualified,
+                    node.start_position().row + 1,
+                    c_family_is_public(node, src, cpp, &state),
+                );
+            }
+            child_state.in_function = true;
+        }
+        "declaration" if !state.in_function && state.classes.is_empty() => {
+            if let Some(name) = c_function_name(node, src, guard, state.depth + 1) {
+                let is_method = cpp && name.contains("::");
+                let qualified = if cpp { qualify_cpp_callable(&name, &state) } else { name };
+                push_symbol(
+                    file,
+                    if is_method { "method" } else { "fn" },
+                    &qualified,
+                    node.start_position().row + 1,
+                    c_family_is_public(node, src, cpp, &state),
+                );
+            }
+        }
+        "field_declaration" if cpp && !state.classes.is_empty() => {
+            if let Some(name) = c_function_name(node, src, guard, state.depth + 1) {
+                push_symbol(
+                    file,
+                    "method",
+                    &qualify_cpp_callable(&name, &state),
+                    node.start_position().row + 1,
+                    state.member_is_pub,
+                );
+            }
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        walk_c_family_node(child, src, file, cpp, guard, child_state.clone());
+    }
+}
+
+fn c_function_name(node: Node<'_>, src: &[u8], guard: &mut AstWalkGuard, depth: usize) -> Option<String> {
+    let declarator = node.child_by_field_name("declarator")?;
+    let function = first_node_by_kind(declarator, "function_declarator", guard, depth)?;
+    let name_node = function.child_by_field_name("declarator")?;
+    let raw_name = normalize_c_family_name(&node_text(name_node, src));
+    let is_operator = name_node.kind() == "operator_name"
+        || raw_name
+            .rsplit("::")
+            .next()
+            .is_some_and(|segment| segment.starts_with("operator"));
+    if raw_name.contains('*') && !is_operator {
+        return None;
+    }
+    c_declarator_name(name_node, src, guard, depth + 1)
+}
+
+fn c_family_is_public(node: Node<'_>, src: &[u8], cpp: bool, state: &CFamilyWalkState) -> bool {
+    if cpp && !state.classes.is_empty() {
+        return state.member_is_pub;
+    }
+    let mut cursor = node.walk();
+    let has_static_storage = node
+        .named_children(&mut cursor)
+        .any(|child| child.kind() == "storage_class_specifier" && node_text(child, src).trim() == "static");
+    !has_static_storage
+}
+
+fn c_declarator_name(node: Node<'_>, src: &[u8], guard: &mut AstWalkGuard, depth: usize) -> Option<String> {
+    if !guard.allow_depth(depth) {
+        return None;
+    }
+    if matches!(
+        node.kind(),
+        "identifier"
+            | "field_identifier"
+            | "type_identifier"
+            | "qualified_identifier"
+            | "destructor_name"
+            | "operator_name"
+    ) {
+        return Some(normalize_c_family_name(&node_text(node, src)));
+    }
+    if let Some(inner) = node.child_by_field_name("declarator") {
+        return c_declarator_name(inner, src, guard, depth + 1);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(name) = c_declarator_name(child, src, guard, depth + 1) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn normalize_c_family_name(name: &str) -> String {
+    name.chars().filter(|character| !character.is_whitespace()).collect()
+}
+
+fn qualify_cpp_callable(name: &str, state: &CFamilyWalkState) -> String {
+    let name = name.trim_start_matches("::");
+    let namespace = state.namespaces.join("::");
+    if name.contains("::") {
+        if namespace.is_empty() || name == namespace || name.starts_with(&format!("{namespace}::")) {
+            return name.to_string();
+        }
+        return format!("{namespace}::{name}");
+    }
+    let mut qualification = state.namespaces.clone();
+    qualification.extend(state.classes.iter().cloned());
+    qualification.push(name.to_string());
+    qualification.join("::")
 }
 
 fn collect_python_routes(node: Node<'_>, src: &[u8], file: &mut ExtractedFile, guard: &mut AstWalkGuard, depth: usize) {
@@ -1813,7 +2525,11 @@ fn vue_script_blocks(src: &str) -> Vec<SourceBlock> {
 }
 
 fn push_symbol(file: &mut ExtractedFile, kind: &str, name: &str, line: usize, is_pub: bool) {
-    if name.is_empty() || file.symbols.iter().any(|s| s.name == name && s.kind == kind) {
+    if name.is_empty() {
+        return;
+    }
+    let key = (kind.to_string(), name.to_string());
+    if !file.symbol_keys.insert(key.clone()) {
         return;
     }
     file.symbols.push(SymbolInfo {
@@ -1821,8 +2537,8 @@ fn push_symbol(file: &mut ExtractedFile, kind: &str, name: &str, line: usize, is
         module_path: file.module_path.clone(),
         file_rel_path: file.rel_path.clone(),
         line,
-        kind: kind.to_string(),
-        name: name.to_string(),
+        kind: key.0,
+        name: key.1,
         is_pub,
     });
 }
@@ -2106,24 +2822,24 @@ fn has_supported_file(root: &Path, exts: &[Option<&str>]) -> bool {
 }
 
 fn has_polyglot_non_rust_files(root: &Path, options: PolyglotScanOptions) -> bool {
+    let mut extensions = vec![Some("ts"), Some("tsx"), Some("py"), Some("vue")];
     if options.v2_enabled {
-        has_supported_file(
-            root,
-            &[
-                Some("ts"),
-                Some("tsx"),
-                Some("py"),
-                Some("vue"),
-                Some("js"),
-                Some("jsx"),
-                Some("mjs"),
-                Some("cjs"),
-                Some("go"),
-            ],
-        )
-    } else {
-        has_supported_file(root, &[Some("ts"), Some("tsx"), Some("py"), Some("vue")])
+        extensions.extend([Some("js"), Some("jsx"), Some("mjs"), Some("cjs"), Some("go")]);
     }
+    if options.v3_enabled {
+        extensions.extend([
+            Some("java"),
+            Some("c"),
+            Some("h"),
+            Some("cpp"),
+            Some("cc"),
+            Some("cxx"),
+            Some("hpp"),
+            Some("hh"),
+            Some("hxx"),
+        ]);
+    }
+    has_supported_file(root, &extensions)
 }
 
 fn rel_string(root: &Path, abs: &Path) -> String {
@@ -2134,7 +2850,13 @@ fn rel_string(root: &Path, abs: &Path) -> String {
 }
 
 fn module_path(package_name: &str, rel_path: &str) -> String {
-    let clean = rel_path
+    // Strip V3 suffixes before the legacy chain so a V3-dark existing file
+    // such as `web.c.ts` keeps its historical `web.c` module component.
+    let v3_clean = [".java", ".cpp", ".cxx", ".hpp", ".hxx", ".cc", ".hh", ".c", ".h"]
+        .iter()
+        .find_map(|suffix| rel_path.strip_suffix(suffix))
+        .unwrap_or(rel_path);
+    let clean = v3_clean
         .trim_end_matches(".ts")
         .trim_end_matches(".tsx")
         .trim_end_matches(".jsx")
@@ -2325,6 +3047,632 @@ mod tests {
         serde_json::to_string(&scan).expect("scan json")
     }
 
+    fn symbol_set(scan: &WorkspaceScan, rel_path: &str) -> BTreeSet<(String, String)> {
+        scan.symbols
+            .iter()
+            .filter(|symbol| symbol.file_rel_path == rel_path)
+            .map(|symbol| (symbol.kind.clone(), symbol.name.clone()))
+            .collect()
+    }
+
+    fn symbol_is_pub(scan: &WorkspaceScan, rel_path: &str, kind: &str, name: &str) -> bool {
+        scan.symbols
+            .iter()
+            .find(|symbol| symbol.file_rel_path == rel_path && symbol.kind == kind && symbol.name == name)
+            .unwrap_or_else(|| panic!("missing {kind} {name} in {rel_path}"))
+            .is_pub
+    }
+
+    fn write_all_v3_dark_files(root: &Path) {
+        for (name, source) in [
+            ("Dark.java", "class Dark {}\n"),
+            ("dark.c", "int dark_c(void) { return 0; }\n"),
+            ("dark.h", "int dark_h(void);\n"),
+            ("dark.cpp", "int dark_cpp() { return 0; }\n"),
+            ("dark.cc", "int dark_cc() { return 0; }\n"),
+            ("dark.cxx", "int dark_cxx() { return 0; }\n"),
+            ("dark.hpp", "int dark_hpp();\n"),
+            ("dark.hh", "int dark_hh();\n"),
+            ("dark.hxx", "int dark_hxx();\n"),
+        ] {
+            std::fs::write(root.join(name), source).expect("dark V3 source");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_java_fixture_extracts_normalized_symbols() {
+        let _env = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("Service.java"),
+            r#"package demo;
+
+public interface Repository<T> {
+    T find(String id);
+}
+
+interface Config {
+    int TIMEOUT = 30;
+}
+
+public class Service<T extends Comparable<T>> implements Repository<T> {
+    public static final int MAX_ITEMS = 100, MIN_ITEMS = 1;
+    private static final String SECRET = "dark";
+
+    public T find(String id) { return null; }
+    private void helper() {}
+
+    public static class Nested<U> {
+        public U map(U value) { return value; }
+    }
+}
+"#,
+        )
+        .expect("java");
+
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        assert_eq!(
+            symbol_set(&scan, "Service.java"),
+            BTreeSet::from([
+                ("class".to_string(), "Nested".to_string()),
+                ("class".to_string(), "Service".to_string()),
+                ("const".to_string(), "MAX_ITEMS".to_string()),
+                ("const".to_string(), "MIN_ITEMS".to_string()),
+                ("const".to_string(), "SECRET".to_string()),
+                ("const".to_string(), "TIMEOUT".to_string()),
+                ("interface".to_string(), "Config".to_string()),
+                ("interface".to_string(), "Repository".to_string()),
+                ("method".to_string(), "find".to_string()),
+                ("method".to_string(), "helper".to_string()),
+                ("method".to_string(), "map".to_string()),
+            ])
+        );
+        assert!(!symbol_is_pub(&scan, "Service.java", "method", "helper"));
+        assert!(symbol_is_pub(&scan, "Service.java", "const", "TIMEOUT"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_c_fixture_extracts_normalized_symbols() {
+        let _env = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("model.c"),
+            r"typedef unsigned long item_id;
+
+struct Point { int x; int y; };
+enum Status { STATUS_OK, STATUS_ERROR };
+typedef struct { item_id id; } Payload;
+
+static int helper(int value) { return value + 1; }
+int compute(struct Point point) { return helper(point.x); }
+",
+        )
+        .expect("c");
+        std::fs::write(tmp.path().join("model.h"), "int header_fn(item_id id);\n").expect("header");
+
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        assert_eq!(
+            symbol_set(&scan, "model.c"),
+            BTreeSet::from([
+                ("class".to_string(), "Point".to_string()),
+                ("class".to_string(), "Status".to_string()),
+                ("fn".to_string(), "compute".to_string()),
+                ("fn".to_string(), "helper".to_string()),
+                ("type".to_string(), "Payload".to_string()),
+                ("type".to_string(), "item_id".to_string()),
+            ])
+        );
+        assert_eq!(
+            symbol_set(&scan, "model.h"),
+            BTreeSet::from([("fn".to_string(), "header_fn".to_string())])
+        );
+        assert!(!symbol_is_pub(&scan, "model.c", "fn", "helper"));
+        assert!(symbol_is_pub(&scan, "model.c", "fn", "compute"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_cpp_fixture_extracts_qualified_methods_and_templates() {
+        let _env = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("engine.cpp"),
+            r"namespace Acme::Core {
+enum Mode { Fast, Safe };
+typedef struct Legacy { int value; } LegacyHandle;
+
+template <typename T>
+class Box {
+public:
+    T value() const { return value_; }
+private:
+    T value_;
+};
+
+class Engine {
+    friend class Phantom;
+public:
+    void start();
+    Engine operator*(const Engine& rhs) const;
+    Engine& operator*=(const Engine& rhs);
+protected:
+    void pause();
+private:
+    void stop();
+};
+
+class Defaults { void hidden(); };
+struct Open { void visible(); };
+
+void Engine::start() {}
+static int hidden_utility() { return 0; }
+int utility() { return 1; }
+}
+",
+        )
+        .expect("cpp");
+
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        assert_eq!(
+            symbol_set(&scan, "engine.cpp"),
+            BTreeSet::from([
+                ("class".to_string(), "Box".to_string()),
+                ("class".to_string(), "Defaults".to_string()),
+                ("class".to_string(), "Engine".to_string()),
+                ("class".to_string(), "Legacy".to_string()),
+                ("class".to_string(), "Mode".to_string()),
+                ("class".to_string(), "Open".to_string()),
+                ("fn".to_string(), "Acme::Core::hidden_utility".to_string()),
+                ("fn".to_string(), "Acme::Core::utility".to_string()),
+                ("method".to_string(), "Acme::Core::Box::value".to_string()),
+                ("method".to_string(), "Acme::Core::Defaults::hidden".to_string()),
+                ("method".to_string(), "Acme::Core::Engine::operator*".to_string()),
+                ("method".to_string(), "Acme::Core::Engine::operator*=".to_string()),
+                ("method".to_string(), "Acme::Core::Engine::pause".to_string()),
+                ("method".to_string(), "Acme::Core::Engine::start".to_string()),
+                ("method".to_string(), "Acme::Core::Engine::stop".to_string()),
+                ("method".to_string(), "Acme::Core::Open::visible".to_string()),
+                ("type".to_string(), "LegacyHandle".to_string()),
+            ])
+        );
+        assert!(!symbol_is_pub(&scan, "engine.cpp", "fn", "Acme::Core::hidden_utility"));
+        for name in [
+            "Acme::Core::Defaults::hidden",
+            "Acme::Core::Engine::pause",
+            "Acme::Core::Engine::stop",
+        ] {
+            assert!(!symbol_is_pub(&scan, "engine.cpp", "method", name));
+        }
+        for name in [
+            "Acme::Core::Engine::operator*",
+            "Acme::Core::Engine::operator*=",
+            "Acme::Core::Engine::start",
+            "Acme::Core::Open::visible",
+        ] {
+            assert!(symbol_is_pub(&scan, "engine.cpp", "method", name));
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_bodyless_c_family_references_do_not_emit_phantom_classes() {
+        let _env = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("refs.c"),
+            "struct Forward;\nenum Mode;\nvoid uses(const struct Forward *value, enum Mode mode);\n",
+        )
+        .expect("c refs");
+        std::fs::write(
+            tmp.path().join("refs.cpp"),
+            "class Forward;\nstruct Other;\nenum class Mode;\nvoid uses(Forward *a, Other *b, Mode mode);\n",
+        )
+        .expect("cpp refs");
+
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        assert_eq!(
+            symbol_set(&scan, "refs.c"),
+            BTreeSet::from([("fn".to_string(), "uses".to_string())])
+        );
+        assert_eq!(
+            symbol_set(&scan, "refs.cpp"),
+            BTreeSet::from([("fn".to_string(), "uses".to_string())])
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_h_headers_sniff_obvious_cpp_and_keep_plain_c() {
+        let _env = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("plain.h"),
+            "struct CBody { int value; };\nint c_header_fn(struct CBody value);\n",
+        )
+        .expect("c header");
+        std::fs::write(
+            tmp.path().join("obvious_cpp.h"),
+            "namespace HeaderNs { class Header { public: void run(); }; }\n",
+        )
+        .expect("cpp header");
+
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        assert_eq!(
+            symbol_set(&scan, "plain.h"),
+            BTreeSet::from([
+                ("class".to_string(), "CBody".to_string()),
+                ("fn".to_string(), "c_header_fn".to_string()),
+            ])
+        );
+        assert_eq!(
+            symbol_set(&scan, "obvious_cpp.h"),
+            BTreeSet::from([
+                ("class".to_string(), "Header".to_string()),
+                ("method".to_string(), "HeaderNs::Header::run".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_duplicate_heavy_symbols_preserve_first_only_semantics() {
+        let _env = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source = "int duplicate(void);\n".repeat(2_000);
+        std::fs::write(tmp.path().join("duplicates.c"), source).expect("duplicates");
+
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        assert_eq!(
+            symbol_set(&scan, "duplicates.c"),
+            BTreeSet::from([("fn".to_string(), "duplicate".to_string())])
+        );
+        let symbol = scan
+            .symbols
+            .iter()
+            .find(|symbol| symbol.file_rel_path == "duplicates.c")
+            .expect("deduplicated symbol");
+        assert_eq!(symbol.line, 1);
+        assert_eq!(
+            scan.files
+                .iter()
+                .find(|file| file.rel_path == "duplicates.c")
+                .map(|file| file.symbol_count),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn polyglot_v3_extension_gate_defaults_h_to_c() {
+        let enabled = PolyglotScanOptions {
+            v2_enabled: false,
+            v3_enabled: true,
+        };
+        let disabled = PolyglotScanOptions {
+            v2_enabled: false,
+            v3_enabled: false,
+        };
+        assert_eq!(language_for_path(Path::new("api.h"), enabled), Some(LanguageKind::C));
+        assert_eq!(
+            language_for_path(Path::new("api.hpp"), enabled),
+            Some(LanguageKind::Cpp)
+        );
+        assert_eq!(language_for_path(Path::new("Main.java"), disabled), None);
+        assert_eq!(language_for_path(Path::new("main.c"), disabled), None);
+        assert_eq!(language_for_path(Path::new("main.cpp"), disabled), None);
+        for (path, expected) in [
+            ("a.java", "demo::a"),
+            ("a.c", "demo::a"),
+            ("a.h", "demo::a"),
+            ("a.cpp", "demo::a"),
+            ("a.cc", "demo::a"),
+            ("a.cxx", "demo::a"),
+            ("a.hpp", "demo::a"),
+            ("a.hh", "demo::a"),
+            ("a.hxx", "demo::a"),
+            ("a.tsx", "demo::a"),
+            ("b.jsx", "demo::b"),
+            ("c.cxx.ts", "demo::c.cxx"),
+            ("foo.h.ts", "demo::foo.h"),
+        ] {
+            assert_eq!(module_path("demo", path), expected, "{path}");
+        }
+
+        let v2_only = PolyglotScanOptions {
+            v2_enabled: true,
+            v3_enabled: false,
+        };
+        assert!(!should_skip_generated_polyglot_file(
+            Path::new("vendor/app.js"),
+            v2_only
+        ));
+        assert!(should_skip_generated_polyglot_file(Path::new("dist/app.js"), v2_only));
+    }
+
+    #[test]
+    fn polyglot_v3_preparse_depth_guard_ignores_comments_strings_and_comparisons() {
+        let source = r#"
+            // {{{{{{{{{{{{{{{{{{{{
+            /* (((((((((((((((((((( */
+            const char *text = "[[[[[[[[[[[[[[[[[[[[";
+            char brace = '{';
+        "#;
+        assert_eq!(
+            max_source_delimiter_depth(source, POLYGLOT_AST_MAX_DEPTH, LanguageKind::Cpp),
+            0
+        );
+
+        let comparisons = "if (left < right) {}\n".repeat(POLYGLOT_AST_MAX_DEPTH + 100);
+        assert!(
+            max_source_delimiter_depth(&comparisons, POLYGLOT_AST_MAX_DEPTH, LanguageKind::Cpp)
+                < POLYGLOT_AST_MAX_DEPTH
+        );
+
+        let digit_separator_then_depth = format!("1'000;\n{}", "{\n".repeat(POLYGLOT_AST_MAX_DEPTH + 1));
+        assert!(
+            max_source_delimiter_depth(&digit_separator_then_depth, POLYGLOT_AST_MAX_DEPTH, LanguageKind::Cpp,)
+                > POLYGLOT_AST_MAX_DEPTH
+        );
+        assert!(
+            max_source_delimiter_depth(&digit_separator_then_depth, POLYGLOT_AST_MAX_DEPTH, LanguageKind::C,)
+                > POLYGLOT_AST_MAX_DEPTH
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_raw_strings_text_blocks_and_digit_separators_do_not_false_skip() {
+        let _env = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let braces = "{".repeat(POLYGLOT_AST_MAX_DEPTH + 100);
+        std::fs::write(
+            tmp.path().join("literals.cpp"),
+            format!(
+                "int cpp_literal() {{ auto a = u8R\"tag({braces})tag\"; auto b = LR\"x({braces})x\"; return 1'000; }}\n"
+            ),
+        )
+        .expect("cpp literals");
+        std::fs::write(
+            tmp.path().join("TextBlock.java"),
+            format!("class TextBlock {{ String text = \"\"\"\n{braces}\n\"\"\"; void ok() {{}} }}\n"),
+        )
+        .expect("java text block");
+        std::fs::write(tmp.path().join("digits.c"), "int c_digits(void) { return 1'000; }\n").expect("c digits");
+
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        assert_eq!(
+            symbol_set(&scan, "literals.cpp"),
+            BTreeSet::from([("fn".to_string(), "cpp_literal".to_string())])
+        );
+        assert_eq!(
+            symbol_set(&scan, "TextBlock.java"),
+            BTreeSet::from([
+                ("class".to_string(), "TextBlock".to_string()),
+                ("method".to_string(), "ok".to_string()),
+            ])
+        );
+        assert_eq!(
+            symbol_set(&scan, "digits.c"),
+            BTreeSet::from([("fn".to_string(), "c_digits".to_string())])
+        );
+        assert!(scan.diagnostics.v3_skipped_files.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_generated_and_vendored_sources_are_skipped() {
+        let _env = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for directory in ["src", "build", "vendor", "third_party"] {
+            std::fs::create_dir_all(tmp.path().join(directory)).expect("directory");
+        }
+        std::fs::write(tmp.path().join("src/app.c"), "int source_fn(void) { return 1; }\n").expect("src");
+        std::fs::write(
+            tmp.path().join("build/generated.java"),
+            "class Generated { void generated() {} }\n",
+        )
+        .expect("build");
+        std::fs::write(tmp.path().join("vendor/library.cpp"), "int vendored() { return 1; }\n").expect("vendor");
+        std::fs::write(tmp.path().join("third_party/library.h"), "int third_party(void);\n").expect("third party");
+
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        assert_eq!(scan.files.len(), 1);
+        assert_eq!(scan.files[0].rel_path, "src/app.c");
+        assert!(scan.symbols.iter().any(|symbol| symbol.name == "source_fn"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_pathological_java_c_and_cpp_are_skipped_before_parse() {
+        let _env = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for (name, prefix) in [
+            ("Deep.java", "class Deep { void run() {\n"),
+            ("deep.c", "int run(void) {\n"),
+            ("deep.cpp", "template <typename T> int run() {\n"),
+        ] {
+            let mut source = prefix.to_string();
+            for _ in 0..=POLYGLOT_AST_MAX_DEPTH {
+                source.push_str("{\n");
+            }
+            for _ in 0..=POLYGLOT_AST_MAX_DEPTH {
+                source.push_str("}\n");
+            }
+            source.push_str("}\n");
+            assert!(source.len() < POLYGLOT_CPP_MAX_BYTES);
+            assert!(source.lines().map(str::len).max().unwrap_or(0) < POLYGLOT_CPP_MAX_LINE_BYTES);
+            std::fs::write(tmp.path().join(name), source).expect("deep source");
+        }
+        for (name, max_bytes) in [
+            ("Huge.java", POLYGLOT_JAVA_MAX_BYTES),
+            ("huge.c", POLYGLOT_C_MAX_BYTES),
+            ("huge.cpp", POLYGLOT_CPP_MAX_BYTES),
+        ] {
+            std::fs::write(tmp.path().join(name), vec![b' '; max_bytes + 1]).expect("huge source");
+        }
+        for (name, max_line_bytes) in [
+            ("LongLine.java", POLYGLOT_JAVA_MAX_LINE_BYTES),
+            ("long_line.c", POLYGLOT_C_MAX_LINE_BYTES),
+            ("long_line.cpp", POLYGLOT_CPP_MAX_LINE_BYTES),
+        ] {
+            let source = format!("//{}\n", "x".repeat(max_line_bytes + 1));
+            assert!(source.len() < POLYGLOT_CPP_MAX_BYTES);
+            std::fs::write(tmp.path().join(name), source).expect("long line source");
+        }
+        let mut template_storm = String::from("template <typename T> struct A {};\nusing Storm = ");
+        for _ in 0..=POLYGLOT_AST_MAX_DEPTH {
+            template_storm.push_str("A<\n");
+        }
+        template_storm.push_str("int\n");
+        for _ in 0..=POLYGLOT_AST_MAX_DEPTH {
+            template_storm.push_str(">\n");
+        }
+        template_storm.push_str(";\n");
+        assert!(template_storm.len() < POLYGLOT_CPP_MAX_BYTES);
+        std::fs::write(tmp.path().join("template_storm.cpp"), template_storm).expect("template storm");
+
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        assert!(scan.files.is_empty());
+        assert!(scan.symbols.is_empty());
+        assert_eq!(scan.stats.file_count, 0);
+        assert_eq!(
+            scan.diagnostics
+                .v3_skipped_files
+                .iter()
+                .map(|skipped| (skipped.rel_path.clone(), skipped.reason.clone()))
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                ("Deep.java".to_string(), "max_delimiter_depth".to_string()),
+                ("Huge.java".to_string(), "max_bytes".to_string()),
+                ("LongLine.java".to_string(), "max_line_bytes".to_string()),
+                ("deep.c".to_string(), "max_delimiter_depth".to_string()),
+                ("deep.cpp".to_string(), "max_delimiter_depth".to_string()),
+                ("huge.c".to_string(), "max_bytes".to_string()),
+                ("huge.cpp".to_string(), "max_bytes".to_string()),
+                ("long_line.c".to_string(), "max_line_bytes".to_string()),
+                ("long_line.cpp".to_string(), "max_line_bytes".to_string()),
+                ("template_storm.cpp".to_string(), "max_delimiter_depth".to_string()),
+            ])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_symlink_to_device_is_skipped_without_reading() {
+        let _env = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink("/dev/zero", tmp.path().join("zero.c")).expect("device symlink");
+
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        assert!(scan.files.is_empty());
+        assert_eq!(
+            scan.diagnostics.v3_skipped_files,
+            vec![V3SkippedFile {
+                rel_path: "zero.c".to_string(),
+                reason: "non_regular_file".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_skip_diagnostics_survive_rust_hybrid_merge() {
+        let _env = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\nmembers = [\"mini\"]\n").expect("workspace");
+        let member = tmp.path().join("mini");
+        std::fs::create_dir_all(member.join("src")).expect("src");
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"mini\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("manifest");
+        std::fs::write(member.join("src/lib.rs"), "pub fn rust_fn() {}\n").expect("rust");
+        std::fs::write(tmp.path().join("huge.c"), vec![b' '; POLYGLOT_C_MAX_BYTES + 1]).expect("huge c");
+
+        let scan = run_repo_scan_at(tmp.path()).expect("hybrid scan");
+        assert!(scan.files.iter().any(|file| file.rel_path == "mini/src/lib.rs"));
+        assert_eq!(
+            scan.diagnostics.v3_skipped_files,
+            vec![V3SkippedFile {
+                rel_path: "huge.c".to_string(),
+                reason: "max_bytes".to_string(),
+            }]
+        );
+        let json = serde_json::to_string(&scan).expect("scan json");
+        assert!(json.contains("v3_skipped_files"));
+        assert!(json.contains("max_bytes"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_dark_files_are_byte_identical_through_hybrid_merge() {
+        let _v2 = EnvVarGuard::unset(POLYGLOT_V2_ENV);
+        let _v3 = EnvVarGuard::unset(POLYGLOT_V3_ENV);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\nmembers = [\"mini\"]\n").expect("ws");
+        let member = tmp.path().join("mini");
+        std::fs::create_dir_all(member.join("src")).expect("src");
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"mini\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("manifest");
+        std::fs::write(member.join("src/lib.rs"), "pub fn rust_fn() {}\n").expect("rust");
+        std::fs::write(tmp.path().join("foo.h.ts"), "export function webFn() {}\n").expect("ts");
+
+        let before = stable_scan_json(run_repo_scan_at(tmp.path()).expect("baseline scan"));
+        write_all_v3_dark_files(tmp.path());
+
+        let unset = stable_scan_json(run_repo_scan_at(tmp.path()).expect("unset scan"));
+        let zero = {
+            let _zero = EnvVarGuard::set(POLYGLOT_V3_ENV, "0");
+            stable_scan_json(run_repo_scan_at(tmp.path()).expect("zero scan"))
+        };
+        assert_eq!(before.as_bytes(), unset.as_bytes());
+        assert_eq!(before.as_bytes(), zero.as_bytes());
+        for name in [
+            "Dark.java",
+            "dark.c",
+            "dark.h",
+            "dark.cpp",
+            "dark.cc",
+            "dark.cxx",
+            "dark.hpp",
+            "dark.hh",
+            "dark.hxx",
+        ] {
+            assert!(!unset.contains(name), "dark payload leaked {name}");
+        }
+        assert!(unset.contains("foo.h.ts"));
+        assert!(!unset.contains(POLYGLOT_V3_ENV));
+        assert!(!unset.contains("v3_skipped_files"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_dark_is_byte_identical_with_v2_enabled() {
+        let _v2 = EnvVarGuard::set(POLYGLOT_V2_ENV, "1");
+        let _v3 = EnvVarGuard::unset(POLYGLOT_V3_ENV);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("package.json"), r#"{"name":"dark-v2"}"#).expect("package");
+        std::fs::write(tmp.path().join("app.js"), "function jsHandler() {}\n").expect("js");
+        std::fs::write(tmp.path().join("main.go"), "package main\nfunc goHandler() {}\n").expect("go");
+        std::fs::write(tmp.path().join("foo.h.ts"), "export function tsHandler() {}\n").expect("ts");
+
+        let before = stable_scan_json(run_repo_scan_at(tmp.path()).expect("V2 baseline"));
+        write_all_v3_dark_files(tmp.path());
+        let after = stable_scan_json(run_repo_scan_at(tmp.path()).expect("V2 plus dark V3"));
+
+        assert_eq!(before.as_bytes(), after.as_bytes());
+        assert!(after.contains("app.js"));
+        assert!(after.contains("main.go"));
+        assert!(after.contains("foo.h.ts"));
+        assert!(!after.contains("v3_skipped_files"));
+    }
+
     #[test]
     fn ts_fixture_extracts_symbols_and_deps() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2374,7 +3722,10 @@ export function run(input: Thing) { return helper(input.id); }
             &tmp.path().join("deep.ts"),
             LanguageKind::TypeScript,
             "deep-ts",
-            PolyglotScanOptions { v2_enabled: false },
+            PolyglotScanOptions {
+                v2_enabled: false,
+                v3_enabled: false,
+            },
         )
         .expect("extract")
         .expect("not skipped");
@@ -2594,7 +3945,10 @@ app.get("/dist", handler);
             &tmp.path().join("app.js"),
             LanguageKind::TypeScript,
             "deep-js",
-            PolyglotScanOptions { v2_enabled: true },
+            PolyglotScanOptions {
+                v2_enabled: true,
+                v3_enabled: false,
+            },
         )
         .expect("extract")
         .expect("not skipped");
