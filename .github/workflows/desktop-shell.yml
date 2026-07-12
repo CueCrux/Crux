@@ -176,7 +176,7 @@ jobs:
         run: cargo tauri build
 
       - name: upload bundle artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: crux-desktop-shell-linux
           path: |
