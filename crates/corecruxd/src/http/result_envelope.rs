@@ -436,7 +436,7 @@ mod tests {
             purpose_tag: "projection".into(),
             fetch_url: Some("https://platform.example/a".into()),
         }];
-        let content_hash = result_envelope_content_hash(&payload, &artifacts);
+        let content_hash = result_envelope_content_hash(&payload, &artifacts).expect("hash");
         let raw = hex::decode(content_hash.strip_prefix("blake3:").unwrap()).unwrap();
         let mut hash = [0_u8; 32];
         hash.copy_from_slice(&raw);

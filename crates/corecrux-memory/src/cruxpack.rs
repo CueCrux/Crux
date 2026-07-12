@@ -203,7 +203,7 @@ impl CruxPack {
 /// as `blake3:<64-hex>`. Same idiom as `result_envelope_content_hash`
 /// (PR #188) via the shared [`crate::signed_bundle`] helper: stable serde
 /// JSON serialization in fixed field order, then blake3.
-pub fn cruxpack_content_hash(manifest: &PackManifest, sections: &PackSections) -> String {
+pub fn cruxpack_content_hash(manifest: &PackManifest, sections: &PackSections) -> Result<String, serde_json::Error> {
     crate::signed_bundle::content_hash_json(&serde_json::json!({
         "manifest": manifest,
         "sections": sections,
@@ -380,7 +380,8 @@ pub fn sign_pack(
     sections: PackSections,
     sign: impl FnOnce(&[u8; 32]) -> [u8; 64],
 ) -> Result<CruxPack, PackVerifyError> {
-    let content_hash = cruxpack_content_hash(&manifest, &sections);
+    let content_hash = cruxpack_content_hash(&manifest, &sections)
+        .map_err(|err| PackVerifyError::ContentSerialization(err.to_string()))?;
     let hash = decode_content_hash(&content_hash)?;
     let signature = sign(&hash);
     let passport_fpr = manifest.passport_fpr.clone();
@@ -405,6 +406,8 @@ pub fn sign_pack(
 pub enum PackVerifyError {
     #[error("unsupported schema_version: {0}")]
     UnsupportedSchema(String),
+    #[error("content serialization failed: {0}")]
+    ContentSerialization(String),
     #[error("recomputed content hash {recomputed} != stated {stated}")]
     HashMismatch { stated: String, recomputed: String },
     #[error("malformed content hash: {0}")]
@@ -492,7 +495,8 @@ pub fn verify_pack(pack: &CruxPack) -> Result<[u8; 32], PackVerifyError> {
     }
 
     // 5) Recompute + compare content hash.
-    let recomputed = cruxpack_content_hash(&pack.manifest, &pack.sections);
+    let recomputed = cruxpack_content_hash(&pack.manifest, &pack.sections)
+        .map_err(|err| PackVerifyError::ContentSerialization(err.to_string()))?;
     if recomputed != pack.blake3_content_hash {
         return Err(PackVerifyError::HashMismatch {
             stated: pack.blake3_content_hash.clone(),
