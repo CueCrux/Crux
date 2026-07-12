@@ -4,6 +4,28 @@
 // See LICENCE.md in the repository root.
 
 //! Polyglot code-structure scanner backed by tree-sitter for non-Rust files.
+//!
+//! `CORECRUXD_POLYGLOT_V3` long-tail precision contract:
+//! - C# methods use `Namespace.Class.Method`; absent member modifiers are private and
+//!   absent top-level type modifiers are internal, so both serialize as non-public.
+//! - Ruby instance methods use `Module::Class#method` and `def self.x` uses
+//!   `Module::Class.x`. Bare `private`/`protected` section markers are tracked, but
+//!   metaprogrammed visibility (`private :name`, `send`, refinements) is deliberately
+//!   not inferred because Ruby visibility is dynamic.
+//! - PHP callables use `Namespace\\Class::method` / `Namespace\\function`.
+//! - ASP.NET recognition requires a controller base or `[ApiController]`; client HTTP
+//!   calls never enter the attribute-only detector.
+//! - Rails scanning is restricted to `config/routes.rb`. It accepts static literal
+//!   verb routes, static `namespace`/`scope` blocks, multiple resource names, and
+//!   `only:`/`except:` resource filters. Unfiltered resources expand to seven
+//!   conventional REST actions (PATCH is the single update route). Conditional or
+//!   dynamic declarations are diagnostics, not guessed routes; arbitrary Ruby DSL
+//!   metaprogramming is outside the precision bar.
+//! - Laravel scanning is restricted to `routes/*.php`. It accepts static `Route::verb`,
+//!   array/closure handlers, array and fluent groups, seven-route `resource` expansion
+//!   (PUT is the single update route), and five-route `apiResource` expansion. Custom
+//!   macros and dynamic arguments are outside the precision bar and are skipped or
+//!   diagnosed.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -26,6 +48,14 @@ pub(crate) const POLYGLOT_C_MAX_BYTES: usize = 1024 * 1024;
 pub(crate) const POLYGLOT_C_MAX_LINE_BYTES: usize = 10_000;
 pub(crate) const POLYGLOT_CPP_MAX_BYTES: usize = 1024 * 1024;
 pub(crate) const POLYGLOT_CPP_MAX_LINE_BYTES: usize = 10_000;
+pub(crate) const POLYGLOT_CSHARP_MAX_BYTES: usize = 1024 * 1024;
+pub(crate) const POLYGLOT_CSHARP_MAX_LINE_BYTES: usize = 10_000;
+pub(crate) const POLYGLOT_RUBY_MAX_BYTES: usize = 1024 * 1024;
+pub(crate) const POLYGLOT_RUBY_MAX_LINE_BYTES: usize = 10_000;
+pub(crate) const POLYGLOT_SWIFT_MAX_BYTES: usize = 1024 * 1024;
+pub(crate) const POLYGLOT_SWIFT_MAX_LINE_BYTES: usize = 10_000;
+pub(crate) const POLYGLOT_PHP_MAX_BYTES: usize = 1024 * 1024;
+pub(crate) const POLYGLOT_PHP_MAX_LINE_BYTES: usize = 10_000;
 
 #[derive(Debug, Clone, Copy)]
 struct PolyglotScanOptions {
@@ -62,6 +92,10 @@ enum LanguageKind {
     Java,
     C,
     Cpp,
+    CSharp,
+    Ruby,
+    Swift,
+    Php,
 }
 
 #[derive(Debug, Clone)]
@@ -327,6 +361,10 @@ fn language_for_path(path: &Path, options: PolyglotScanOptions) -> Option<Langua
         // Explicit C++ header suffixes map directly to C++.
         "h" if options.v3_enabled => Some(LanguageKind::C),
         "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" if options.v3_enabled => Some(LanguageKind::Cpp),
+        "cs" if options.v3_enabled => Some(LanguageKind::CSharp),
+        "rb" if options.v3_enabled => Some(LanguageKind::Ruby),
+        "swift" if options.v3_enabled => Some(LanguageKind::Swift),
+        "php" if options.v3_enabled => Some(LanguageKind::Php),
         _ => None,
     }
 }
@@ -355,7 +393,7 @@ fn should_skip_generated_polyglot_file(rel: &Path, options: PolyglotScanOptions)
     let is_v3_source = options.v3_enabled
         && matches!(
             extension,
-            "svelte" | "java" | "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx"
+            "svelte" | "java" | "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" | "cs" | "rb" | "swift" | "php"
         );
     rel.components().any(|component| {
         let segment = component.as_os_str().to_string_lossy();
@@ -462,6 +500,10 @@ fn extract_file_recording_skips(
         LanguageKind::Java => extract_java_file(&src, &mut file, &mut guard)?,
         LanguageKind::C => extract_c_family_file(&src, &mut file, false, &mut guard)?,
         LanguageKind::Cpp => extract_c_family_file(&src, &mut file, true, &mut guard)?,
+        LanguageKind::CSharp => extract_csharp_file(&src, &mut file, &mut guard)?,
+        LanguageKind::Ruby => extract_ruby_file(&src, &mut file, &mut guard)?,
+        LanguageKind::Swift => extract_swift_file(&src, &mut file, &mut guard)?,
+        LanguageKind::Php => extract_php_file(&src, &mut file, &mut guard)?,
     }
     file.ast_depth_limit_hits = guard.depth_limit_hits;
     if file.ast_depth_limit_hits > 0 {
@@ -511,6 +553,10 @@ fn v3_source_limits(lang: LanguageKind) -> Option<(usize, usize)> {
         LanguageKind::C => Some((POLYGLOT_C_MAX_BYTES, POLYGLOT_C_MAX_LINE_BYTES)),
         LanguageKind::Cpp => Some((POLYGLOT_CPP_MAX_BYTES, POLYGLOT_CPP_MAX_LINE_BYTES)),
         LanguageKind::Svelte => None,
+        LanguageKind::CSharp => Some((POLYGLOT_CSHARP_MAX_BYTES, POLYGLOT_CSHARP_MAX_LINE_BYTES)),
+        LanguageKind::Ruby => Some((POLYGLOT_RUBY_MAX_BYTES, POLYGLOT_RUBY_MAX_LINE_BYTES)),
+        LanguageKind::Swift => Some((POLYGLOT_SWIFT_MAX_BYTES, POLYGLOT_SWIFT_MAX_LINE_BYTES)),
+        LanguageKind::Php => Some((POLYGLOT_PHP_MAX_BYTES, POLYGLOT_PHP_MAX_LINE_BYTES)),
         _ => None,
     }
 }
@@ -599,7 +645,7 @@ fn max_source_delimiter_depth(src: &str, stop_after: usize, lang: LanguageKind) 
     }
 
     let bytes = src.as_bytes();
-    let include_angle_brackets = matches!(lang, LanguageKind::Java | LanguageKind::Cpp);
+    let include_angle_brackets = matches!(lang, LanguageKind::Java | LanguageKind::Cpp | LanguageKind::CSharp);
     let mut state = LexState::Code;
     let mut escaped = false;
     let mut depth = 0_usize;
@@ -611,6 +657,9 @@ fn max_source_delimiter_depth(src: &str, stop_after: usize, lang: LanguageKind) 
         let next = bytes.get(index + 1).copied();
         match state {
             LexState::Code => match (byte, next) {
+                (b'#', _) if matches!(lang, LanguageKind::Ruby | LanguageKind::Php) => {
+                    state = LexState::LineComment;
+                }
                 (b'/', Some(b'/')) => {
                     state = LexState::LineComment;
                     index += 1;
@@ -2051,6 +2100,1490 @@ fn join_spring_paths(prefix: &str, path: &str) -> String {
     } else {
         joined
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct CSharpWalkState {
+    namespaces: Vec<String>,
+    classes: Vec<String>,
+    depth: usize,
+}
+
+fn extract_csharp_file(src: &str, file: &mut ExtractedFile, guard: &mut AstWalkGuard) -> Result<(), ScanError> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+        .map_err(|err| ScanError::Io(std::io::Error::other(err.to_string())))?;
+    let Some(tree) = parser.parse(src, None) else {
+        return Ok(());
+    };
+    let root = tree.root_node();
+    let mut state = CSharpWalkState::default();
+    let mut cursor = root.walk();
+    if let Some(namespace) = root
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "file_scoped_namespace_declaration")
+        .and_then(|node| field_ident(node, src.as_bytes(), "name"))
+    {
+        state.namespaces = namespace.split('.').map(ToString::to_string).collect();
+    }
+    walk_csharp_node(root, src.as_bytes(), file, guard, state);
+    Ok(())
+}
+
+fn walk_csharp_node(
+    node: Node<'_>,
+    src: &[u8],
+    file: &mut ExtractedFile,
+    guard: &mut AstWalkGuard,
+    state: CSharpWalkState,
+) {
+    if !guard.allow_depth(state.depth) {
+        return;
+    }
+    let mut child_state = state.clone();
+    child_state.depth += 1;
+    match node.kind() {
+        "namespace_declaration" | "file_scoped_namespace_declaration" => {
+            if let Some(name) = field_ident(node, src, "name") {
+                child_state.namespaces = name.split('.').map(ToString::to_string).collect();
+            }
+        }
+        "class_declaration" | "struct_declaration" | "record_declaration" | "interface_declaration" => {
+            if let Some(name) = field_ident(node, src, "name") {
+                let kind = if node.kind() == "interface_declaration" {
+                    "interface"
+                } else {
+                    "class"
+                };
+                push_symbol(
+                    file,
+                    kind,
+                    &name,
+                    node.start_position().row + 1,
+                    csharp_is_public(node, src),
+                );
+                if node.kind() == "class_declaration" && !file.is_test_file {
+                    collect_aspnet_routes(node, src, file, &state.namespaces, &name);
+                }
+                child_state.classes.push(name);
+            }
+        }
+        "enum_declaration" => {
+            if let Some(name) = field_ident(node, src, "name") {
+                push_symbol(
+                    file,
+                    "class",
+                    &name,
+                    node.start_position().row + 1,
+                    csharp_is_public(node, src),
+                );
+            }
+        }
+        "method_declaration" => {
+            if let Some(name) = field_ident(node, src, "name") {
+                let qualified = qualify_parts(&state.namespaces, &state.classes, &name, ".");
+                push_symbol(
+                    file,
+                    "method",
+                    &qualified,
+                    node.start_position().row + 1,
+                    csharp_is_public(node, src),
+                );
+            }
+        }
+        "field_declaration" if csharp_is_const_field(node, src) => {
+            if let Some(declaration) = direct_named_child(node, "variable_declaration") {
+                let mut cursor = declaration.walk();
+                for declarator in declaration.named_children(&mut cursor) {
+                    if declarator.kind() == "variable_declarator" {
+                        if let Some(name) = field_ident(declarator, src, "name") {
+                            push_symbol(
+                                file,
+                                "const",
+                                &name,
+                                node.start_position().row + 1,
+                                csharp_is_public(node, src),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        "delegate_declaration" => {
+            if let Some(name) = field_ident(node, src, "name") {
+                push_symbol(
+                    file,
+                    "type",
+                    &name,
+                    node.start_position().row + 1,
+                    csharp_is_public(node, src),
+                );
+            }
+        }
+        "using_directive" => {
+            if node_text(node, src).contains('=') {
+                if let Some(name) = field_ident(node, src, "name") {
+                    push_symbol(file, "type", &name, node.start_position().row + 1, false);
+                }
+            }
+        }
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        walk_csharp_node(child, src, file, guard, child_state.clone());
+    }
+}
+
+fn csharp_modifier_words(node: Node<'_>, src: &[u8]) -> Vec<String> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| child.kind() == "modifier")
+        .map(|child| node_text(child, src))
+        .collect()
+}
+
+fn csharp_is_public(node: Node<'_>, src: &[u8]) -> bool {
+    csharp_modifier_words(node, src).iter().any(|word| word == "public")
+}
+
+fn csharp_is_const_field(node: Node<'_>, src: &[u8]) -> bool {
+    let modifiers = csharp_modifier_words(node, src);
+    modifiers.iter().any(|word| word == "const")
+        || (modifiers.iter().any(|word| word == "static") && modifiers.iter().any(|word| word == "readonly"))
+}
+
+#[derive(Debug, Clone)]
+struct RubyWalkState {
+    classes: Vec<String>,
+    visibility: &'static str,
+    in_method: bool,
+    in_singleton_class: bool,
+    depth: usize,
+}
+
+impl Default for RubyWalkState {
+    fn default() -> Self {
+        Self {
+            classes: Vec::new(),
+            visibility: "public",
+            in_method: false,
+            in_singleton_class: false,
+            depth: 0,
+        }
+    }
+}
+
+fn extract_ruby_file(src: &str, file: &mut ExtractedFile, guard: &mut AstWalkGuard) -> Result<(), ScanError> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_ruby::LANGUAGE.into())
+        .map_err(|err| ScanError::Io(std::io::Error::other(err.to_string())))?;
+    let Some(tree) = parser.parse(src, None) else {
+        return Ok(());
+    };
+    walk_ruby_node(tree.root_node(), src.as_bytes(), file, guard, RubyWalkState::default());
+    if is_rails_routes_path(&file.rel_path) && !file.is_test_file {
+        collect_rails_routes(src, file);
+    }
+    Ok(())
+}
+
+fn walk_ruby_node(
+    node: Node<'_>,
+    src: &[u8],
+    file: &mut ExtractedFile,
+    guard: &mut AstWalkGuard,
+    state: RubyWalkState,
+) {
+    if !guard.allow_depth(state.depth) {
+        return;
+    }
+    if node.kind() == "body_statement" || node.kind() == "program" {
+        let mut sequence_state = state;
+        sequence_state.depth += 1;
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if let Some(visibility) = ruby_visibility_marker(child, src) {
+                sequence_state.visibility = visibility;
+            } else {
+                walk_ruby_node(child, src, file, guard, sequence_state.clone());
+            }
+        }
+        return;
+    }
+    let mut child_state = state.clone();
+    child_state.depth += 1;
+    match node.kind() {
+        "class" | "module" => {
+            if let Some(name) = field_ident(node, src, "name") {
+                let short_name = name.rsplit("::").next().unwrap_or(name.as_str()).to_string();
+                push_symbol(file, "class", &short_name, node.start_position().row + 1, true);
+                child_state.classes.extend(
+                    name.split("::")
+                        .filter(|part| !part.is_empty())
+                        .map(ToString::to_string),
+                );
+                child_state.visibility = "public";
+                child_state.in_singleton_class = false;
+            }
+        }
+        "singleton_class" => {
+            child_state.in_singleton_class = node
+                .child_by_field_name("value")
+                .is_some_and(|value| node_text(value, src).trim() == "self");
+        }
+        "method" => {
+            if let Some(name) = field_ident(node, src, "name") {
+                let qualified = if state.classes.is_empty() {
+                    name
+                } else if state.in_singleton_class {
+                    format!("{}.{name}", state.classes.join("::"))
+                } else {
+                    format!("{}#{name}", state.classes.join("::"))
+                };
+                push_symbol(
+                    file,
+                    "method",
+                    &qualified,
+                    node.start_position().row + 1,
+                    state.visibility == "public",
+                );
+                child_state.in_method = true;
+            }
+        }
+        "singleton_method" => {
+            if let Some(name) = field_ident(node, src, "name") {
+                let receiver = node
+                    .child_by_field_name("object")
+                    .map_or_else(String::new, |object| node_text(object, src));
+                let owner = if receiver == "self" && !state.classes.is_empty() {
+                    state.classes.join("::")
+                } else {
+                    receiver
+                };
+                let qualified = if owner.is_empty() {
+                    name
+                } else {
+                    format!("{owner}.{name}")
+                };
+                push_symbol(
+                    file,
+                    "method",
+                    &qualified,
+                    node.start_position().row + 1,
+                    state.visibility == "public",
+                );
+                child_state.in_method = true;
+            }
+        }
+        "assignment" if !state.in_method && !state.classes.is_empty() => {
+            if let Some(left) = node.child_by_field_name("left") {
+                if matches!(left.kind(), "constant" | "scope_resolution") {
+                    let raw = node_text(left, src);
+                    let name = raw.rsplit("::").next().unwrap_or(raw.as_str());
+                    push_symbol(
+                        file,
+                        "const",
+                        name,
+                        node.start_position().row + 1,
+                        state.visibility == "public",
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        walk_ruby_node(child, src, file, guard, child_state.clone());
+    }
+}
+
+fn ruby_visibility_marker(node: Node<'_>, src: &[u8]) -> Option<&'static str> {
+    if node.kind() == "identifier" {
+        return match node_text(node, src).as_str() {
+            "public" => Some("public"),
+            "private" => Some("private"),
+            "protected" => Some("protected"),
+            _ => None,
+        };
+    }
+    if node.kind() != "call" || node.child_by_field_name("receiver").is_some() {
+        return None;
+    }
+    let method = node
+        .child_by_field_name("method")
+        .map(|method| node_text(method, src))?;
+    match method.as_str() {
+        "public" => Some("public"),
+        "private" => Some("private"),
+        "protected" => Some("protected"),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct SwiftWalkState {
+    types: Vec<String>,
+    in_function: bool,
+    depth: usize,
+}
+
+fn extract_swift_file(src: &str, file: &mut ExtractedFile, guard: &mut AstWalkGuard) -> Result<(), ScanError> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_swift::LANGUAGE.into())
+        .map_err(|err| ScanError::Io(std::io::Error::other(err.to_string())))?;
+    let Some(tree) = parser.parse(src, None) else {
+        return Ok(());
+    };
+    walk_swift_node(tree.root_node(), src.as_bytes(), file, guard, SwiftWalkState::default());
+    Ok(())
+}
+
+fn walk_swift_node(
+    node: Node<'_>,
+    src: &[u8],
+    file: &mut ExtractedFile,
+    guard: &mut AstWalkGuard,
+    state: SwiftWalkState,
+) {
+    if !guard.allow_depth(state.depth) {
+        return;
+    }
+    let mut child_state = state.clone();
+    child_state.depth += 1;
+    match node.kind() {
+        "class_declaration" => {
+            let declaration_kind = node
+                .child_by_field_name("declaration_kind")
+                .map_or_else(String::new, |kind| node_text(kind, src));
+            if let Some(name) = field_ident(node, src, "name") {
+                if matches!(declaration_kind.as_str(), "class" | "struct" | "enum" | "actor") {
+                    push_symbol(
+                        file,
+                        "class",
+                        &name,
+                        node.start_position().row + 1,
+                        swift_is_public(node, src),
+                    );
+                }
+                if declaration_kind != "enum" || !name.is_empty() {
+                    child_state.types.push(name);
+                }
+            }
+        }
+        "protocol_declaration" => {
+            if let Some(name) = field_ident(node, src, "name") {
+                push_symbol(
+                    file,
+                    "interface",
+                    &name,
+                    node.start_position().row + 1,
+                    swift_is_public(node, src),
+                );
+                child_state.types.push(name);
+            }
+        }
+        "function_declaration" | "protocol_function_declaration" => {
+            if let Some(name) = field_ident(node, src, "name") {
+                let kind = if state.types.is_empty() { "fn" } else { "method" };
+                push_symbol(
+                    file,
+                    kind,
+                    &name,
+                    node.start_position().row + 1,
+                    swift_is_public(node, src),
+                );
+                child_state.in_function = true;
+            }
+        }
+        "property_declaration" if !state.types.is_empty() && !state.in_function && swift_is_let(node, src) => {
+            if let Some(pattern) = node.child_by_field_name("name") {
+                if let Some(name) = first_source_identifier(&node_text(pattern, src)) {
+                    push_symbol(
+                        file,
+                        "const",
+                        &name,
+                        node.start_position().row + 1,
+                        swift_is_public(node, src),
+                    );
+                }
+            }
+        }
+        "typealias_declaration" => {
+            if let Some(name) = field_ident(node, src, "name") {
+                push_symbol(
+                    file,
+                    "type",
+                    &name,
+                    node.start_position().row + 1,
+                    swift_is_public(node, src),
+                );
+            }
+        }
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        walk_swift_node(child, src, file, guard, child_state.clone());
+    }
+}
+
+fn swift_is_public(node: Node<'_>, src: &[u8]) -> bool {
+    let mut cursor = node.walk();
+    let is_public = node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "modifiers")
+        .any(|modifiers| source_words(&node_text(modifiers, src)).any(|word| matches!(word, "public" | "open")));
+    is_public
+}
+
+fn swift_is_let(node: Node<'_>, src: &[u8]) -> bool {
+    let mut cursor = node.walk();
+    let is_let = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "value_binding_pattern")
+        .is_some_and(|binding| source_words(&node_text(binding, src)).any(|word| word == "let"));
+    is_let
+}
+
+#[derive(Debug, Clone, Default)]
+struct PhpWalkState {
+    namespaces: Vec<String>,
+    classes: Vec<String>,
+    depth: usize,
+}
+
+fn extract_php_file(src: &str, file: &mut ExtractedFile, guard: &mut AstWalkGuard) -> Result<(), ScanError> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+        .map_err(|err| ScanError::Io(std::io::Error::other(err.to_string())))?;
+    let Some(tree) = parser.parse(src, None) else {
+        return Ok(());
+    };
+    let root = tree.root_node();
+    let mut state = PhpWalkState::default();
+    let mut cursor = root.walk();
+    if let Some(namespace) = root
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "namespace_definition" && child.child_by_field_name("body").is_none())
+        .and_then(|node| field_ident(node, src.as_bytes(), "name"))
+    {
+        state.namespaces = namespace
+            .split('\\')
+            .filter(|part| !part.is_empty())
+            .map(ToString::to_string)
+            .collect();
+    }
+    walk_php_node(root, src.as_bytes(), file, guard, state);
+    if is_laravel_routes_path(&file.rel_path) && !file.is_test_file {
+        collect_laravel_routes(src, file);
+    }
+    Ok(())
+}
+
+fn walk_php_node(node: Node<'_>, src: &[u8], file: &mut ExtractedFile, guard: &mut AstWalkGuard, state: PhpWalkState) {
+    if !guard.allow_depth(state.depth) {
+        return;
+    }
+    let mut child_state = state.clone();
+    child_state.depth += 1;
+    match node.kind() {
+        "namespace_definition" => {
+            if let Some(name) = field_ident(node, src, "name") {
+                child_state.namespaces = name
+                    .split('\\')
+                    .filter(|part| !part.is_empty())
+                    .map(ToString::to_string)
+                    .collect();
+            }
+        }
+        "class_declaration" | "trait_declaration" | "interface_declaration" => {
+            if let Some(name) = field_ident(node, src, "name") {
+                let kind = if node.kind() == "interface_declaration" {
+                    "interface"
+                } else {
+                    "class"
+                };
+                push_symbol(file, kind, &name, node.start_position().row + 1, true);
+                child_state.classes.push(name);
+            }
+        }
+        "method_declaration" => {
+            if let Some(name) = field_ident(node, src, "name") {
+                let owner = qualify_parts(&state.namespaces, &state.classes, "", "\\");
+                let qualified = if owner.is_empty() {
+                    name
+                } else {
+                    format!("{owner}::{name}")
+                };
+                push_symbol(
+                    file,
+                    "method",
+                    &qualified,
+                    node.start_position().row + 1,
+                    php_is_public(node, src),
+                );
+            }
+        }
+        "function_definition" => {
+            if let Some(name) = field_ident(node, src, "name") {
+                let qualified = qualify_parts(&state.namespaces, &[], &name, "\\");
+                push_symbol(file, "fn", &qualified, node.start_position().row + 1, true);
+            }
+        }
+        "const_declaration" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() == "const_element" {
+                    let mut element_cursor = child.walk();
+                    if let Some(name_node) = child
+                        .named_children(&mut element_cursor)
+                        .find(|element| element.kind() == "name")
+                    {
+                        push_symbol(
+                            file,
+                            "const",
+                            &node_text(name_node, src),
+                            node.start_position().row + 1,
+                            php_is_public(node, src),
+                        );
+                    };
+                }
+            }
+        }
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        walk_php_node(child, src, file, guard, child_state.clone());
+    }
+}
+
+fn php_is_public(node: Node<'_>, src: &[u8]) -> bool {
+    let mut cursor = node.walk();
+    let visibility = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "visibility_modifier")
+        .map(|modifier| node_text(modifier, src));
+    !visibility
+        .as_deref()
+        .is_some_and(|modifier| matches!(modifier.trim(), "private" | "protected"))
+}
+
+fn direct_named_child<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    let mut cursor = node.walk();
+    let child = node.named_children(&mut cursor).find(|child| child.kind() == kind);
+    child
+}
+
+fn qualify_parts(namespaces: &[String], types: &[String], name: &str, separator: &str) -> String {
+    let mut parts = namespaces.to_vec();
+    parts.extend(types.iter().cloned());
+    if !name.is_empty() {
+        parts.push(name.to_string());
+    }
+    parts.join(separator)
+}
+
+fn source_words(source: &str) -> impl Iterator<Item = &str> {
+    source.split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+}
+
+fn first_source_identifier(source: &str) -> Option<String> {
+    source_words(source)
+        .find(|word| !word.is_empty() && !matches!(*word, "let" | "var" | "static" | "class" | "public" | "private"))
+        .map(ToString::to_string)
+}
+
+#[derive(Debug, Clone)]
+struct CSharpAttribute {
+    name: String,
+    positional_string: Option<String>,
+    has_positional_argument: bool,
+}
+
+fn collect_aspnet_routes(
+    class_node: Node<'_>,
+    src: &[u8],
+    file: &mut ExtractedFile,
+    namespaces: &[String],
+    class_name: &str,
+) {
+    let attributes = csharp_attributes(class_node, src);
+    let is_controller = attributes.iter().any(|attribute| attribute.name == "ApiController")
+        || direct_named_child(class_node, "base_list").is_some_and(|base| {
+            source_words(&node_text(base, src)).any(|word| matches!(word, "Controller" | "ControllerBase"))
+        });
+    if !is_controller {
+        return;
+    }
+    let controller_token = class_name.strip_suffix("Controller").unwrap_or(class_name);
+    let class_prefix = attributes
+        .iter()
+        .find(|attribute| attribute.name == "Route")
+        .and_then(|attribute| attribute.positional_string.clone())
+        .unwrap_or_default()
+        .replace("[controller]", controller_token)
+        .replace("[Controller]", controller_token);
+    let Some(body) = class_node.child_by_field_name("body") else {
+        return;
+    };
+    let mut cursor = body.walk();
+    for method_node in body.named_children(&mut cursor) {
+        if method_node.kind() != "method_declaration" {
+            continue;
+        }
+        let Some(method_name) = field_ident(method_node, src, "name") else {
+            continue;
+        };
+        let handler = qualify_parts(namespaces, &[class_name.to_string()], &method_name, ".");
+        for attribute in csharp_attributes(method_node, src) {
+            let method = match attribute.name.as_str() {
+                "HttpGet" => Some("GET"),
+                "HttpPost" => Some("POST"),
+                "HttpPut" => Some("PUT"),
+                "HttpPatch" => Some("PATCH"),
+                "HttpDelete" => Some("DELETE"),
+                "HttpHead" => Some("HEAD"),
+                "HttpOptions" => Some("OPTIONS"),
+                _ => None,
+            };
+            let Some(method) = method else {
+                continue;
+            };
+            let Some(path) = attribute.positional_string else {
+                if attribute.has_positional_argument {
+                    push_unresolved_route(file, method, "<dynamic>", &handler, method_node, "dynamic");
+                    continue;
+                }
+                push_framework_route_candidate(
+                    file,
+                    "aspnet",
+                    method.to_string(),
+                    join_route_paths(&class_prefix, ""),
+                    RouteHandler::Named(handler.clone()),
+                    method_node.start_position().row + 1,
+                );
+                continue;
+            };
+            let path = aspnet_route_path(&class_prefix, &path, controller_token, &method_name);
+            push_framework_route_candidate(
+                file,
+                "aspnet",
+                method.to_string(),
+                path,
+                RouteHandler::Named(handler.clone()),
+                method_node.start_position().row + 1,
+            );
+        }
+    }
+}
+
+fn aspnet_route_path(class_prefix: &str, method_template: &str, controller: &str, action: &str) -> String {
+    let substitute_tokens = |value: &str| {
+        value
+            .replace("[controller]", controller)
+            .replace("[Controller]", controller)
+            .replace("[action]", action)
+            .replace("[Action]", action)
+        // `[area]` needs controller-model metadata that this file-local
+        // detector does not have, so it is deliberately left unresolved.
+    };
+    let template = substitute_tokens(method_template);
+    if let Some(absolute) = template.strip_prefix("~/") {
+        return join_route_paths("", absolute);
+    }
+    if template.starts_with('/') {
+        return join_route_paths("", &template);
+    }
+    join_route_paths(&substitute_tokens(class_prefix), &template)
+}
+
+fn csharp_attributes(node: Node<'_>, src: &[u8]) -> Vec<CSharpAttribute> {
+    let mut attributes = Vec::new();
+    let mut cursor = node.walk();
+    for list in node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "attribute_list")
+    {
+        let mut list_cursor = list.walk();
+        for attribute in list
+            .named_children(&mut list_cursor)
+            .filter(|child| child.kind() == "attribute")
+        {
+            let Some(mut name) = field_ident(attribute, src, "name") else {
+                continue;
+            };
+            if let Some(short) = name.rsplit('.').next() {
+                name = short.trim_end_matches("Attribute").to_string();
+            }
+            let mut positional_string = None;
+            let mut has_positional_argument = false;
+            if let Some(arguments) = direct_named_child(attribute, "attribute_argument_list") {
+                let mut argument_cursor = arguments.walk();
+                for argument in arguments
+                    .named_children(&mut argument_cursor)
+                    .filter(|argument| argument.kind() == "attribute_argument")
+                {
+                    if argument.child_by_field_name("name").is_some() {
+                        continue;
+                    }
+                    has_positional_argument = true;
+                    let mut value_cursor = argument.walk();
+                    positional_string = argument
+                        .named_children(&mut value_cursor)
+                        .next()
+                        .and_then(|value| csharp_string_literal_value(value, src, 0));
+                    break;
+                }
+            }
+            attributes.push(CSharpAttribute {
+                name,
+                positional_string,
+                has_positional_argument,
+            });
+        }
+    }
+    attributes
+}
+
+fn csharp_string_literal_value(node: Node<'_>, src: &[u8], depth: usize) -> Option<String> {
+    if depth > 8 {
+        return None;
+    }
+    let text = node_text(node, src);
+    match node.kind() {
+        "string_literal" => literal_text_value(&text, false),
+        "verbatim_string_literal" => text
+            .strip_prefix('@')
+            .and_then(|literal| literal_text_value(literal, false)),
+        "interpolated_string_expression" | "raw_string_literal" => None,
+        _ => {
+            let mut cursor = node.walk();
+            let value = node
+                .named_children(&mut cursor)
+                .find_map(|child| csharp_string_literal_value(child, src, depth + 1));
+            value
+        }
+    }
+}
+
+fn is_rails_routes_path(path: &str) -> bool {
+    path == "config/routes.rb" || path.ends_with("/config/routes.rb")
+}
+
+#[derive(Debug, Clone)]
+struct RailsRouteFrame {
+    path_prefix: String,
+    controller_prefix: Option<String>,
+    conditional: bool,
+}
+
+fn collect_rails_routes(src: &str, file: &mut ExtractedFile) {
+    let mut frames: Vec<RailsRouteFrame> = Vec::new();
+    for (line_index, raw_line) in src.lines().enumerate() {
+        let line = strip_hash_comment(raw_line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == "end" || line.starts_with("end ") {
+            frames.pop();
+            continue;
+        }
+        if let Some(namespace) = rails_symbol_argument(line, "namespace") {
+            frames.push(RailsRouteFrame {
+                path_prefix: namespace.clone(),
+                controller_prefix: Some(namespace),
+                conditional: false,
+            });
+            continue;
+        }
+        if line.starts_with("scope") && line.ends_with(" do") {
+            frames.push(RailsRouteFrame {
+                path_prefix: rails_scope_path(line).unwrap_or_default(),
+                controller_prefix: rails_option_value(line, "module"),
+                conditional: false,
+            });
+            continue;
+        }
+        let conditional =
+            frames.iter().any(|frame| frame.conditional) || line.contains(" if ") || line.contains(" unless ");
+        let prefix = frames
+            .iter()
+            .map(|frame| frame.path_prefix.as_str())
+            .fold(String::new(), |joined, component| join_route_paths(&joined, component));
+        let controller_namespace = frames
+            .iter()
+            .filter_map(|frame| frame.controller_prefix.as_deref())
+            .filter(|component| !component.is_empty())
+            .collect::<Vec<_>>()
+            .join("/");
+        let resources = rails_resource_names(line);
+        if !resources.is_empty() {
+            if conditional {
+                for resource in resources {
+                    push_unresolved_route_at(
+                        file,
+                        "ANY",
+                        &join_route_paths(&prefix, &resource),
+                        "resources",
+                        line_index + 1,
+                        "dynamic",
+                    );
+                }
+            } else {
+                let actions = rails_resource_actions(line);
+                for resource in resources {
+                    let handler_owner = if controller_namespace.is_empty() {
+                        resource.clone()
+                    } else {
+                        format!("{controller_namespace}/{resource}")
+                    };
+                    push_resource_routes(
+                        file,
+                        &prefix,
+                        &resource,
+                        &handler_owner,
+                        line_index + 1,
+                        ResourceStyle::Rails,
+                        Some(&actions),
+                    );
+                }
+            }
+        } else if let Some((method, rest)) = rails_route_method(line) {
+            let literals = quoted_literals(rest);
+            let path_is_literal = rest
+                .trim_start()
+                .trim_start_matches('(')
+                .trim_start()
+                .starts_with(['\'', '"']);
+            let path = path_is_literal.then(|| literals.first().cloned()).flatten();
+            let handler = if path_is_literal {
+                literals.get(1).cloned()
+            } else {
+                literals.first().cloned()
+            }
+            .map(|handler| {
+                if controller_namespace.is_empty() {
+                    handler
+                } else {
+                    format!("{controller_namespace}/{handler}")
+                }
+            });
+            match (path, handler, conditional) {
+                (Some(path), Some(handler), false) => push_framework_route_candidate(
+                    file,
+                    "rails",
+                    method.to_string(),
+                    join_route_paths(&prefix, &path),
+                    RouteHandler::Named(handler),
+                    line_index + 1,
+                ),
+                (path, handler, _) => push_unresolved_route_at(
+                    file,
+                    method,
+                    &path.map_or_else(|| "<dynamic>".to_string(), |path| join_route_paths(&prefix, &path)),
+                    handler.as_deref().unwrap_or("<dynamic>"),
+                    line_index + 1,
+                    "dynamic",
+                ),
+            }
+        }
+        if line.ends_with(" do") {
+            let is_conditional = line.starts_with("if ")
+                || line.starts_with("unless ")
+                || line.starts_with("case ")
+                || line.starts_with("while ");
+            frames.push(RailsRouteFrame {
+                path_prefix: String::new(),
+                controller_prefix: None,
+                conditional: is_conditional,
+            });
+        }
+    }
+}
+
+fn rails_scope_path(line: &str) -> Option<String> {
+    let rest = line
+        .strip_prefix("scope")?
+        .trim_start()
+        .trim_start_matches('(')
+        .trim_start();
+    if rest.starts_with(['\'', '"']) {
+        return quoted_literals(rest).into_iter().next();
+    }
+    rails_option_value(line, "path")
+}
+
+fn rails_option_value(line: &str, option: &str) -> Option<String> {
+    let marker = format!("{option}:");
+    let value = line.split_once(&marker)?.1.trim_start();
+    if value.starts_with(['\'', '"']) {
+        return quoted_literals(value).into_iter().next();
+    }
+    let symbol = value.strip_prefix(':')?;
+    let value: String = symbol
+        .chars()
+        .take_while(|character| character.is_ascii_alphanumeric() || matches!(*character, '_' | '-'))
+        .collect();
+    (!value.is_empty()).then_some(value)
+}
+
+fn rails_resource_names(line: &str) -> Vec<String> {
+    let Some(rest) = line.strip_prefix("resources") else {
+        return Vec::new();
+    };
+    if !(rest.starts_with(char::is_whitespace) || rest.starts_with('(')) {
+        return Vec::new();
+    }
+    let option_start = ["only:", "except:", "path:", "controller:", "as:", "param:"]
+        .iter()
+        .filter_map(|option| rest.find(option))
+        .min()
+        .unwrap_or(rest.len());
+    ruby_static_literals(&rest[..option_start])
+}
+
+fn rails_resource_actions(line: &str) -> HashSet<String> {
+    let all: HashSet<String> = ["index", "show", "new", "create", "edit", "update", "destroy"]
+        .into_iter()
+        .map(ToString::to_string)
+        .collect();
+    if let Some(only) = rails_option_symbols(line, "only") {
+        return only.into_iter().filter(|action| all.contains(action)).collect();
+    }
+    if let Some(except) = rails_option_symbols(line, "except") {
+        return all.difference(&except).cloned().collect();
+    }
+    all
+}
+
+fn rails_option_symbols(line: &str, option: &str) -> Option<HashSet<String>> {
+    let marker = format!("{option}:");
+    let after = line.split_once(&marker)?.1.trim_start();
+    let value = if let Some(array) = after.strip_prefix('[') {
+        array.split_once(']').map_or(array, |(value, _)| value)
+    } else {
+        after.split_once(',').map_or(after, |(value, _)| value)
+    };
+    Some(ruby_static_literals(value).into_iter().collect())
+}
+
+fn ruby_static_literals(source: &str) -> Vec<String> {
+    let bytes = source.as_bytes();
+    let mut values = Vec::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if matches!(bytes[index], b'\'' | b'"') {
+            let quote = bytes[index];
+            let body_start = index + 1;
+            let Some(end) = find_closing_quote(&source[body_start..], quote) else {
+                break;
+            };
+            values.push(source[body_start..body_start + end].to_string());
+            index = body_start + end + 1;
+            continue;
+        }
+        if bytes[index] == b':' && bytes.get(index.wrapping_sub(1)) != Some(&b':') {
+            let start = index + 1;
+            let mut end = start;
+            while bytes
+                .get(end)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-'))
+            {
+                end += 1;
+            }
+            if end > start {
+                values.push(source[start..end].to_string());
+                index = end;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    values
+}
+
+fn rails_route_method(line: &str) -> Option<(&'static str, &str)> {
+    for (name, method) in [
+        ("get", "GET"),
+        ("post", "POST"),
+        ("put", "PUT"),
+        ("patch", "PATCH"),
+        ("delete", "DELETE"),
+    ] {
+        if let Some(rest) = line.strip_prefix(name) {
+            if rest.starts_with(char::is_whitespace) || rest.starts_with('(') {
+                return Some((method, rest));
+            }
+        }
+    }
+    None
+}
+
+fn rails_symbol_argument(line: &str, call: &str) -> Option<String> {
+    let rest = line.strip_prefix(call)?;
+    if !(rest.starts_with(char::is_whitespace) || rest.starts_with('(')) {
+        return None;
+    }
+    if let Some(quoted) = quoted_literals(rest).first() {
+        return Some(quoted.clone());
+    }
+    let colon = rest.find(':')? + 1;
+    let symbol: String = rest[colon..]
+        .chars()
+        .take_while(|character| character.is_ascii_alphanumeric() || matches!(*character, '_' | '-'))
+        .collect();
+    (!symbol.is_empty()).then_some(symbol)
+}
+
+fn is_laravel_routes_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("php"))
+        && (path.starts_with("routes/") || path.contains("/routes/"))
+}
+
+#[derive(Debug, Clone)]
+struct LaravelGroupFrame {
+    prefix: String,
+    body_depth: usize,
+}
+
+fn collect_laravel_routes(src: &str, file: &mut ExtractedFile) {
+    let mut groups: Vec<LaravelGroupFrame> = Vec::new();
+    let mut brace_depth = 0usize;
+    for (line_index, raw_line) in src.lines().enumerate() {
+        let line = strip_php_line_comment(raw_line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        let brace_delta = source_brace_delta(line);
+        if let Some(prefix) = laravel_group_prefix(line) {
+            let body_depth = if brace_delta > 0 {
+                brace_depth.saturating_add(brace_delta as usize)
+            } else {
+                brace_depth.saturating_add(1)
+            };
+            groups.push(LaravelGroupFrame { prefix, body_depth });
+            brace_depth = apply_brace_delta(brace_depth, brace_delta);
+            while groups.last().is_some_and(|group| group.body_depth > brace_depth) {
+                groups.pop();
+            }
+            continue;
+        }
+        let prefix = groups
+            .iter()
+            .map(|group| group.prefix.as_str())
+            .fold(String::new(), |joined, component| join_route_paths(&joined, component));
+        let resource = line
+            .strip_prefix("Route::apiResource")
+            .map(|rest| (rest, ResourceStyle::LaravelApi))
+            .or_else(|| {
+                line.strip_prefix("Route::resource")
+                    .map(|rest| (rest, ResourceStyle::Laravel))
+            });
+        if let Some((rest, style)) = resource {
+            let Some((resource, controller)) = laravel_resource_arguments(rest) else {
+                push_unresolved_route_at(file, "ANY", "<dynamic>", "<dynamic>", line_index + 1, "dynamic");
+                brace_depth = apply_brace_delta(brace_depth, brace_delta);
+                continue;
+            };
+            push_resource_routes(file, &prefix, &resource, &controller, line_index + 1, style, None);
+            brace_depth = apply_brace_delta(brace_depth, brace_delta);
+            while groups.last().is_some_and(|group| group.body_depth > brace_depth) {
+                groups.pop();
+            }
+            continue;
+        }
+        if let Some((method, rest)) = laravel_route_method(line) {
+            let arguments = laravel_call_arguments(rest);
+            let path = arguments
+                .first()
+                .and_then(|argument| literal_text_value(argument, false));
+            let handler = arguments.get(1).and_then(|argument| laravel_handler(argument));
+            match (path, handler) {
+                (Some(path), Some(handler)) => push_framework_route_candidate(
+                    file,
+                    "laravel",
+                    method.to_string(),
+                    join_route_paths(&prefix, &path),
+                    RouteHandler::Named(handler),
+                    line_index + 1,
+                ),
+                (path, handler) => push_unresolved_route_at(
+                    file,
+                    method,
+                    &path.map_or_else(|| "<dynamic>".to_string(), |path| join_route_paths(&prefix, &path)),
+                    handler.as_deref().unwrap_or("<dynamic>"),
+                    line_index + 1,
+                    "dynamic",
+                ),
+            }
+        }
+        brace_depth = apply_brace_delta(brace_depth, brace_delta);
+        while groups.last().is_some_and(|group| group.body_depth > brace_depth) {
+            groups.pop();
+        }
+    }
+}
+
+fn laravel_group_prefix(line: &str) -> Option<String> {
+    let is_array_group = line.starts_with("Route::group") && line.contains('(');
+    let is_fluent_group = line
+        .find("->group")
+        .and_then(|index| line.get(index + "->group".len()..))
+        .is_some_and(|tail| tail.trim_start().starts_with('('));
+    if !is_array_group && !is_fluent_group {
+        return None;
+    }
+    if is_array_group {
+        let literals = quoted_literals(line);
+        return Some(
+            literals
+                .iter()
+                .position(|literal| literal == "prefix")
+                .and_then(|index| literals.get(index + 1))
+                .cloned()
+                .unwrap_or_default(),
+        );
+    }
+    Some(laravel_fluent_prefix(line).unwrap_or_default())
+}
+
+fn laravel_fluent_prefix(line: &str) -> Option<String> {
+    let marker = "prefix";
+    let mut search_from = 0usize;
+    while let Some(relative) = line[search_from..].find(marker) {
+        let start = search_from + relative + marker.len();
+        let tail = line.get(start..)?.trim_start();
+        if tail.starts_with('(') {
+            return quoted_literals(tail).into_iter().next();
+        }
+        search_from = start;
+    }
+    None
+}
+
+fn laravel_resource_arguments(source: &str) -> Option<(String, String)> {
+    let arguments = laravel_call_arguments(source);
+    let resource = arguments
+        .first()
+        .and_then(|argument| literal_text_value(argument, false))?;
+    let controller = arguments.get(1).and_then(|argument| php_class_literal(argument))?;
+    Some((resource, controller))
+}
+
+fn laravel_handler(argument: &str) -> Option<String> {
+    let handler = argument.trim_start();
+    let handler = handler.strip_prefix("static ").unwrap_or(handler).trim_start();
+    if handler.starts_with("function") || handler.starts_with("fn ") || handler.starts_with("fn(") {
+        Some("closure".to_string())
+    } else {
+        laravel_array_handler(handler)
+    }
+}
+
+fn laravel_call_arguments(source: &str) -> Vec<String> {
+    let Some(open) = source.find('(') else {
+        return Vec::new();
+    };
+    let mut arguments = Vec::new();
+    let mut start = open + 1;
+    let mut paren_depth = 1usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (relative, character) in source[open + 1..].char_indices() {
+        let index = open + 1 + relative;
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            continue;
+        }
+        match character {
+            '(' => paren_depth += 1,
+            ')' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                if paren_depth == 0 {
+                    arguments.push(source[start..index].trim().to_string());
+                    return arguments;
+                }
+            }
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            ',' if paren_depth == 1 && bracket_depth == 0 && brace_depth == 0 => {
+                arguments.push(source[start..index].trim().to_string());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < source.len() {
+        arguments.push(source[start..].trim().to_string());
+    }
+    arguments
+}
+
+fn source_brace_delta(source: &str) -> isize {
+    let mut delta = 0isize;
+    let mut quote = None;
+    let mut escaped = false;
+    for character in source.chars() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == active_quote {
+                quote = None;
+            }
+        } else if matches!(character, '\'' | '"') {
+            quote = Some(character);
+        } else if character == '{' {
+            delta += 1;
+        } else if character == '}' {
+            delta -= 1;
+        }
+    }
+    delta
+}
+
+fn apply_brace_delta(depth: usize, delta: isize) -> usize {
+    if delta >= 0 {
+        depth.saturating_add(delta as usize)
+    } else {
+        depth.saturating_sub(delta.unsigned_abs())
+    }
+}
+
+fn laravel_array_handler(source: &str) -> Option<String> {
+    let array_start = source.find('[')?;
+    let array_end = source[array_start + 1..].find(']')? + array_start + 1;
+    let array = &source[array_start + 1..array_end];
+    let class = php_class_literal(array)?;
+    let method = quoted_literals(array).into_iter().next()?;
+    Some(format!("{class}::{method}"))
+}
+
+fn laravel_route_method(line: &str) -> Option<(&'static str, &str)> {
+    for (name, method) in [
+        ("get", "GET"),
+        ("post", "POST"),
+        ("put", "PUT"),
+        ("patch", "PATCH"),
+        ("delete", "DELETE"),
+    ] {
+        if let Some(rest) = line.strip_prefix(&format!("Route::{name}")) {
+            if rest.trim_start().starts_with('(') {
+                return Some((method, rest));
+            }
+        }
+    }
+    None
+}
+
+fn php_class_literal(source: &str) -> Option<String> {
+    let before = source.split_once("::class")?.0;
+    let class: String = before
+        .chars()
+        .rev()
+        .take_while(|character| character.is_ascii_alphanumeric() || matches!(*character, '_' | '\\'))
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    (!class.is_empty()).then_some(class)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ResourceStyle {
+    Rails,
+    Laravel,
+    LaravelApi,
+}
+
+fn push_resource_routes(
+    file: &mut ExtractedFile,
+    prefix: &str,
+    resource: &str,
+    handler_owner: &str,
+    source_line: usize,
+    style: ResourceStyle,
+    allowed_actions: Option<&HashSet<String>>,
+) {
+    let base = join_route_paths(prefix, resource);
+    let singular = resource.trim_end_matches('s');
+    let parameter = match style {
+        ResourceStyle::Rails => ":id".to_string(),
+        ResourceStyle::Laravel | ResourceStyle::LaravelApi => format!("{{{singular}}}"),
+    };
+    let separator = match style {
+        ResourceStyle::Rails => "#",
+        ResourceStyle::Laravel | ResourceStyle::LaravelApi => "::",
+    };
+    let framework = match style {
+        ResourceStyle::Rails => "rails",
+        ResourceStyle::Laravel | ResourceStyle::LaravelApi => "laravel",
+    };
+    let actions: Vec<(&str, String, &str)> = match style {
+        ResourceStyle::Rails => vec![
+            ("GET", base.clone(), "index"),
+            ("GET", format!("{base}/{parameter}"), "show"),
+            ("GET", format!("{base}/new"), "new"),
+            ("POST", base.clone(), "create"),
+            ("GET", format!("{base}/{parameter}/edit"), "edit"),
+            ("PATCH", format!("{base}/{parameter}"), "update"),
+            ("DELETE", format!("{base}/{parameter}"), "destroy"),
+        ],
+        ResourceStyle::Laravel => vec![
+            ("GET", base.clone(), "index"),
+            ("GET", format!("{base}/create"), "create"),
+            ("POST", base.clone(), "store"),
+            ("GET", format!("{base}/{parameter}"), "show"),
+            ("GET", format!("{base}/{parameter}/edit"), "edit"),
+            ("PUT", format!("{base}/{parameter}"), "update"),
+            ("DELETE", format!("{base}/{parameter}"), "destroy"),
+        ],
+        ResourceStyle::LaravelApi => vec![
+            ("GET", base.clone(), "index"),
+            ("POST", base.clone(), "store"),
+            ("GET", format!("{base}/{parameter}"), "show"),
+            ("PUT", format!("{base}/{parameter}"), "update"),
+            ("DELETE", format!("{base}/{parameter}"), "destroy"),
+        ],
+    };
+    for (method, path, action) in actions {
+        if allowed_actions.is_some_and(|allowed| !allowed.contains(action)) {
+            continue;
+        }
+        push_framework_route_candidate(
+            file,
+            framework,
+            method.to_string(),
+            path,
+            RouteHandler::Named(format!("{handler_owner}{separator}{action}")),
+            source_line,
+        );
+    }
+}
+
+fn push_unresolved_route(
+    file: &mut ExtractedFile,
+    method: &str,
+    path: &str,
+    handler: &str,
+    node: Node<'_>,
+    reason: &str,
+) {
+    push_unresolved_route_at(file, method, path, handler, node.start_position().row + 1, reason);
+}
+
+fn push_unresolved_route_at(
+    file: &mut ExtractedFile,
+    method: &str,
+    path: &str,
+    handler: &str,
+    source_line: usize,
+    reason: &str,
+) {
+    file.unresolved_routes.push(UnresolvedRoute {
+        method: method.to_string(),
+        path: path.to_string(),
+        handler_fn: handler.to_string(),
+        source_file: file.rel_path.clone(),
+        source_line,
+        reason: reason.to_string(),
+    });
+}
+
+fn quoted_literals(source: &str) -> Vec<String> {
+    let bytes = source.as_bytes();
+    let mut literals = Vec::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let quote = bytes[index];
+        if !matches!(quote, b'\'' | b'"') {
+            index += 1;
+            continue;
+        }
+        let body_start = index + 1;
+        let Some(end) = find_closing_quote(&source[body_start..], quote) else {
+            break;
+        };
+        literals.push(source[body_start..body_start + end].to_string());
+        index = body_start + end + 1;
+    }
+    literals
+}
+
+fn strip_hash_comment(line: &str) -> &str {
+    strip_line_comment_outside_quotes(line, '#')
+}
+
+fn strip_php_line_comment(line: &str) -> &str {
+    let hash_stripped = strip_line_comment_outside_quotes(line, '#');
+    strip_double_slash_comment(hash_stripped)
+}
+
+fn strip_line_comment_outside_quotes(line: &str, marker: char) -> &str {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == active_quote {
+                quote = None;
+            }
+        } else if matches!(character, '\'' | '"') {
+            quote = Some(character);
+        } else if character == marker {
+            return &line[..index];
+        }
+    }
+    line
+}
+
+fn strip_double_slash_comment(line: &str) -> &str {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut chars = line.char_indices().peekable();
+    while let Some((index, character)) = chars.next() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == active_quote {
+                quote = None;
+            }
+        } else if matches!(character, '\'' | '"') {
+            quote = Some(character);
+        } else if character == '/' && chars.peek().is_some_and(|(_, next)| *next == '/') {
+            return &line[..index];
+        }
+    }
+    line
 }
 
 fn collect_python_routes(node: Node<'_>, src: &[u8], file: &mut ExtractedFile, guard: &mut AstWalkGuard, depth: usize) {
@@ -3746,6 +5279,10 @@ fn has_polyglot_non_rust_files(root: &Path, options: PolyglotScanOptions) -> boo
             Some("hpp"),
             Some("hh"),
             Some("hxx"),
+            Some("cs"),
+            Some("rb"),
+            Some("swift"),
+            Some("php"),
         ]);
     }
     has_supported_file(root, &extensions)
@@ -3761,10 +5298,12 @@ fn rel_string(root: &Path, abs: &Path) -> String {
 fn module_path(package_name: &str, rel_path: &str) -> String {
     // Strip V3 suffixes before the legacy chain so a V3-dark existing file
     // such as `web.c.ts` keeps its historical `web.c` module component.
-    let v3_clean = [".java", ".cpp", ".cxx", ".hpp", ".hxx", ".cc", ".hh", ".c", ".h"]
-        .iter()
-        .find_map(|suffix| rel_path.strip_suffix(suffix))
-        .unwrap_or(rel_path);
+    let v3_clean = [
+        ".java", ".swift", ".php", ".cpp", ".cxx", ".hpp", ".hxx", ".cc", ".cs", ".rb", ".hh", ".c", ".h",
+    ]
+    .iter()
+    .find_map(|suffix| rel_path.strip_suffix(suffix))
+    .unwrap_or(rel_path);
     let clean = v3_clean
         .trim_end_matches(".ts")
         .trim_end_matches(".tsx")
@@ -4012,9 +5551,386 @@ mod tests {
             ("dark.hpp", "int dark_hpp();\n"),
             ("dark.hh", "int dark_hh();\n"),
             ("dark.hxx", "int dark_hxx();\n"),
+            ("Dark.cs", "class DarkCs {}\n"),
+            ("dark.rb", "class DarkRuby; end\n"),
+            ("Dark.swift", "class DarkSwift {}\n"),
+            ("dark.php", "<?php class DarkPhp {}\n"),
         ] {
             std::fs::write(root.join(name), source).expect("dark V3 source");
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_csharp_fixture_extracts_exact_qualified_symbols() {
+        let _env = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("Service.cs"),
+            r#"using Clock = System.DateTime;
+namespace Demo.Api;
+public interface IRepository { void Find(); }
+internal struct HiddenStruct { }
+public record Item(string Id);
+public enum State { Ready }
+public delegate void Changed();
+public class Service {
+    public const int Max = 10;
+    private static readonly string Secret = "x";
+    public void Run() {}
+    void Hidden() {}
+    private Item referenced;
+}
+"#,
+        )
+        .expect("csharp");
+
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        assert_eq!(
+            symbol_set(&scan, "Service.cs"),
+            BTreeSet::from([
+                ("class".to_string(), "HiddenStruct".to_string()),
+                ("class".to_string(), "Item".to_string()),
+                ("class".to_string(), "Service".to_string()),
+                ("class".to_string(), "State".to_string()),
+                ("const".to_string(), "Max".to_string()),
+                ("const".to_string(), "Secret".to_string()),
+                ("interface".to_string(), "IRepository".to_string()),
+                ("method".to_string(), "Demo.Api.IRepository.Find".to_string()),
+                ("method".to_string(), "Demo.Api.Service.Hidden".to_string()),
+                ("method".to_string(), "Demo.Api.Service.Run".to_string()),
+                ("type".to_string(), "Changed".to_string()),
+                ("type".to_string(), "Clock".to_string()),
+            ])
+        );
+        assert!(!symbol_is_pub(&scan, "Service.cs", "class", "HiddenStruct"));
+        assert!(!symbol_is_pub(&scan, "Service.cs", "method", "Demo.Api.Service.Hidden"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_ruby_fixture_extracts_exact_qualified_symbols() {
+        let _env = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("service.rb"),
+            r#"module Demo
+  class Service
+    LIMIT = 10
+    def run; end
+    def self.build; end
+    class << self
+      def configured; end
+    end
+    private
+    def helper
+      Phantom = 1
+    end
+  end
+end
+Referenced::Only
+"#,
+        )
+        .expect("ruby");
+
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        assert_eq!(
+            symbol_set(&scan, "service.rb"),
+            BTreeSet::from([
+                ("class".to_string(), "Demo".to_string()),
+                ("class".to_string(), "Service".to_string()),
+                ("const".to_string(), "LIMIT".to_string()),
+                ("method".to_string(), "Demo::Service#helper".to_string()),
+                ("method".to_string(), "Demo::Service#run".to_string()),
+                ("method".to_string(), "Demo::Service.build".to_string()),
+                ("method".to_string(), "Demo::Service.configured".to_string()),
+            ])
+        );
+        assert!(!symbol_is_pub(&scan, "service.rb", "method", "Demo::Service#helper"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_swift_fixture_extracts_exact_symbols() {
+        let _env = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("Service.swift"),
+            r#"public protocol Repository { func find() }
+public struct Item { public let id: String; var mutable: Int }
+enum State { case ready }
+public class Service {
+    public static let limit = 10
+    public func run() {}
+}
+public actor Worker { public func work() {} }
+public typealias Identifier = String
+public func topLevel() {}
+let referenceOnly = Service.self
+"#,
+        )
+        .expect("swift");
+
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        assert_eq!(
+            symbol_set(&scan, "Service.swift"),
+            BTreeSet::from([
+                ("class".to_string(), "Item".to_string()),
+                ("class".to_string(), "Service".to_string()),
+                ("class".to_string(), "State".to_string()),
+                ("class".to_string(), "Worker".to_string()),
+                ("const".to_string(), "id".to_string()),
+                ("const".to_string(), "limit".to_string()),
+                ("fn".to_string(), "topLevel".to_string()),
+                ("interface".to_string(), "Repository".to_string()),
+                ("method".to_string(), "find".to_string()),
+                ("method".to_string(), "run".to_string()),
+                ("method".to_string(), "work".to_string()),
+                ("type".to_string(), "Identifier".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_php_fixture_extracts_exact_qualified_symbols() {
+        let _env = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("Service.php"),
+            r#"<?php
+namespace Demo\Api;
+interface Repository { public function find(); }
+trait Logs { protected function log() {} }
+class Service {
+    public const LIMIT = 10;
+    private const SECRET = 1;
+    public function run() {}
+    public function visible(string $private = 'protected') { $private = 1; }
+    private function helper() {}
+}
+function utility() {}
+$phantom = Service::class;
+"#,
+        )
+        .expect("php");
+
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        assert_eq!(
+            symbol_set(&scan, "Service.php"),
+            BTreeSet::from([
+                ("class".to_string(), "Logs".to_string()),
+                ("class".to_string(), "Service".to_string()),
+                ("const".to_string(), "LIMIT".to_string()),
+                ("const".to_string(), "SECRET".to_string()),
+                ("fn".to_string(), "Demo\\Api\\utility".to_string()),
+                ("interface".to_string(), "Repository".to_string()),
+                ("method".to_string(), "Demo\\Api\\Logs::log".to_string()),
+                ("method".to_string(), "Demo\\Api\\Repository::find".to_string()),
+                ("method".to_string(), "Demo\\Api\\Service::helper".to_string()),
+                ("method".to_string(), "Demo\\Api\\Service::run".to_string()),
+                ("method".to_string(), "Demo\\Api\\Service::visible".to_string()),
+            ])
+        );
+        assert!(!symbol_is_pub(
+            &scan,
+            "Service.php",
+            "method",
+            "Demo\\Api\\Service::helper"
+        ));
+        assert!(symbol_is_pub(
+            &scan,
+            "Service.php",
+            "method",
+            "Demo\\Api\\Service::visible"
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_aspnet_routes_are_precise_and_ignore_http_clients() {
+        let _env = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("UsersController.cs"),
+            r#"namespace Demo.Api;
+[ApiController]
+[Route("api/[controller]")]
+public class UsersController : ControllerBase {
+  [HttpGet]
+  public void List() {}
+  [HttpPost("{id}")]
+  public void Update() {}
+  [HttpGet(Name = "named-route")]
+  public void Named() {}
+  [HttpGet("tpl", Name = "templated-route")]
+  public void Templated() {}
+  [HttpGet("/absolute/[action]")]
+  public void Absolute() {}
+  [HttpGet("~/root/[controller]/[action]")]
+  public void Tilde() {}
+}
+public class Client {
+  public void Call() { client.GetAsync("/phantom"); }
+}
+"#,
+        )
+        .expect("csharp");
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        assert_eq!(
+            route_set(&scan),
+            BTreeSet::from([
+                route_tuple("GET", "/api/Users", "Demo.Api.UsersController.List"),
+                route_tuple("GET", "/api/Users", "Demo.Api.UsersController.Named"),
+                route_tuple("POST", "/api/Users/{id}", "Demo.Api.UsersController.Update"),
+                route_tuple("GET", "/api/Users/tpl", "Demo.Api.UsersController.Templated"),
+                route_tuple("GET", "/absolute/Absolute", "Demo.Api.UsersController.Absolute"),
+                route_tuple("GET", "/root/Users/Tilde", "Demo.Api.UsersController.Tilde"),
+            ])
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_rails_routes_expand_resources_and_track_prefixes() {
+        let _env = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("config")).expect("config");
+        std::fs::write(
+            tmp.path().join("config/routes.rb"),
+            r#"Rails.application.routes.draw do
+  get "/health" => "health#show"
+  post "/login", to: "sessions#create"
+  namespace :api do
+    scope "/v2" do
+      get "/status" => "status#show"
+    end
+    resources :widgets
+  end
+  resources :photos, only: [:index]
+  resources :albums, except: [:destroy]
+  resources :cats, :dogs, only: :show
+  scope module: "admin" do
+    get "/module-only" => "dashboard#show"
+  end
+  scope as: "admin" do
+    get "/as-only" => "plain#show"
+  end
+  get dynamic_path, to: "dynamic#show"
+end
+"#,
+        )
+        .expect("routes");
+        std::fs::write(tmp.path().join("routes.rb"), "get \"/ignored\" => \"x#y\"\n").expect("outside routes");
+        std::fs::write(tmp.path().join("client.rb"), "client.get(\"/phantom\")\n").expect("client");
+
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        let mut expected = BTreeSet::from([
+            route_tuple("GET", "/health", "health#show"),
+            route_tuple("POST", "/login", "sessions#create"),
+            route_tuple("GET", "/api/v2/status", "api/status#show"),
+            route_tuple("GET", "/photos", "photos#index"),
+            route_tuple("GET", "/cats/:id", "cats#show"),
+            route_tuple("GET", "/dogs/:id", "dogs#show"),
+            route_tuple("GET", "/module-only", "admin/dashboard#show"),
+            route_tuple("GET", "/as-only", "plain#show"),
+        ]);
+        for route in [
+            route_tuple("GET", "/api/widgets", "api/widgets#index"),
+            route_tuple("GET", "/api/widgets/:id", "api/widgets#show"),
+            route_tuple("GET", "/api/widgets/new", "api/widgets#new"),
+            route_tuple("POST", "/api/widgets", "api/widgets#create"),
+            route_tuple("GET", "/api/widgets/:id/edit", "api/widgets#edit"),
+            route_tuple("PATCH", "/api/widgets/:id", "api/widgets#update"),
+            route_tuple("DELETE", "/api/widgets/:id", "api/widgets#destroy"),
+        ] {
+            expected.insert(route);
+        }
+        for route in [
+            route_tuple("GET", "/albums", "albums#index"),
+            route_tuple("GET", "/albums/:id", "albums#show"),
+            route_tuple("GET", "/albums/new", "albums#new"),
+            route_tuple("POST", "/albums", "albums#create"),
+            route_tuple("GET", "/albums/:id/edit", "albums#edit"),
+            route_tuple("PATCH", "/albums/:id", "albums#update"),
+        ] {
+            expected.insert(route);
+        }
+        assert_eq!(route_set(&scan), expected);
+        assert!(scan
+            .diagnostics
+            .unresolved_routes
+            .iter()
+            .any(|route| route.path == "<dynamic>" && route.reason == "dynamic"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_laravel_routes_expand_resources_and_track_groups() {
+        let _env = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("routes")).expect("routes");
+        std::fs::write(
+            tmp.path().join("routes/api.php"),
+            r#"<?php
+Route::get('/health', function () { return 'ok'; });
+Route::post('/users', [UserController::class, 'store']);
+Route::group(['prefix' => 'admin'], function () {
+    Route::prefix('v1')->group(function () {
+        Route::get('/functions', [Ctrl::class, 'index']);
+        Route::get('/multi', function () {
+            return [];
+        });
+        Route::get('/after-multi', [Ctrl::class, 'after']);
+        Route::resource('photos', PhotoController::class);
+        Route::apiResource('events', EventController::class);
+    });
+    Route::middleware('auth')->group(function () {
+        Route::get('/guarded', [GuardController::class, 'index']);
+    });
+    Route::controller(Ctrl::class)->group(function () {
+        Route::get('/controlled', [Ctrl::class, 'controlled']);
+    });
+    Route::get('/sibling', [SiblingController::class, 'index']);
+});
+Http::get('/phantom');
+$client->post('/phantom');
+"#,
+        )
+        .expect("routes");
+
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        let mut expected = BTreeSet::from([
+            route_tuple("GET", "/health", "closure"),
+            route_tuple("POST", "/users", "UserController::store"),
+            route_tuple("GET", "/admin/v1/functions", "Ctrl::index"),
+            route_tuple("GET", "/admin/v1/multi", "closure"),
+            route_tuple("GET", "/admin/v1/after-multi", "Ctrl::after"),
+            route_tuple("GET", "/admin/guarded", "GuardController::index"),
+            route_tuple("GET", "/admin/controlled", "Ctrl::controlled"),
+            route_tuple("GET", "/admin/sibling", "SiblingController::index"),
+        ]);
+        for route in [
+            route_tuple("GET", "/admin/v1/photos", "PhotoController::index"),
+            route_tuple("GET", "/admin/v1/photos/create", "PhotoController::create"),
+            route_tuple("POST", "/admin/v1/photos", "PhotoController::store"),
+            route_tuple("GET", "/admin/v1/photos/{photo}", "PhotoController::show"),
+            route_tuple("GET", "/admin/v1/photos/{photo}/edit", "PhotoController::edit"),
+            route_tuple("PUT", "/admin/v1/photos/{photo}", "PhotoController::update"),
+            route_tuple("DELETE", "/admin/v1/photos/{photo}", "PhotoController::destroy"),
+        ] {
+            expected.insert(route);
+        }
+        for route in [
+            route_tuple("GET", "/admin/v1/events", "EventController::index"),
+            route_tuple("POST", "/admin/v1/events", "EventController::store"),
+            route_tuple("GET", "/admin/v1/events/{event}", "EventController::show"),
+            route_tuple("PUT", "/admin/v1/events/{event}", "EventController::update"),
+            route_tuple("DELETE", "/admin/v1/events/{event}", "EventController::destroy"),
+        ] {
+            expected.insert(route);
+        }
+        assert_eq!(route_set(&scan), expected);
     }
 
     #[test]
@@ -4299,6 +6215,11 @@ int utility() { return 1; }
         assert_eq!(language_for_path(Path::new("Main.java"), disabled), None);
         assert_eq!(language_for_path(Path::new("main.c"), disabled), None);
         assert_eq!(language_for_path(Path::new("main.cpp"), disabled), None);
+        assert_eq!(
+            language_for_path(Path::new("Main.cs"), enabled),
+            Some(LanguageKind::CSharp)
+        );
+        assert_eq!(language_for_path(Path::new("main.rb"), disabled), None);
         for (path, expected) in [
             ("a.java", "demo::a"),
             ("a.c", "demo::a"),
@@ -4309,10 +6230,18 @@ int utility() { return 1; }
             ("a.hpp", "demo::a"),
             ("a.hh", "demo::a"),
             ("a.hxx", "demo::a"),
+            ("a.cs", "demo::a"),
+            ("a.rb", "demo::a"),
+            ("a.swift", "demo::a"),
+            ("a.php", "demo::a"),
             ("a.tsx", "demo::a"),
             ("b.jsx", "demo::b"),
             ("c.cxx.ts", "demo::c.cxx"),
             ("foo.h.ts", "demo::foo.h"),
+            ("x.cs.ts", "demo::x.cs"),
+            ("x.rb.mjs", "demo::x.rb"),
+            ("y.php.js", "demo::y.php"),
+            ("z.swift.ts", "demo::z.swift"),
         ] {
             assert_eq!(module_path("demo", path), expected, "{path}");
         }
@@ -4413,6 +6342,14 @@ int utility() { return 1; }
         .expect("build");
         std::fs::write(tmp.path().join("vendor/library.cpp"), "int vendored() { return 1; }\n").expect("vendor");
         std::fs::write(tmp.path().join("third_party/library.h"), "int third_party(void);\n").expect("third party");
+        std::fs::write(tmp.path().join("build/generated.cs"), "class GeneratedCs {}\n").expect("generated cs");
+        std::fs::write(tmp.path().join("vendor/library.rb"), "class VendoredRuby; end\n").expect("vendor rb");
+        std::fs::write(
+            tmp.path().join("third_party/library.swift"),
+            "class ThirdPartySwift {}\n",
+        )
+        .expect("third party swift");
+        std::fs::write(tmp.path().join("build/generated.php"), "<?php class GeneratedPhp {}\n").expect("generated php");
 
         let scan = run_repo_scan_at(tmp.path()).expect("scan");
         assert_eq!(scan.files.len(), 1);
@@ -4422,13 +6359,17 @@ int utility() { return 1; }
 
     #[test]
     #[serial_test::serial]
-    fn polyglot_v3_pathological_java_c_and_cpp_are_skipped_before_parse() {
+    fn polyglot_v3_pathological_all_v3_languages_are_skipped_before_parse() {
         let _env = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
         let tmp = tempfile::tempdir().expect("tempdir");
         for (name, prefix) in [
             ("Deep.java", "class Deep { void run() {\n"),
             ("deep.c", "int run(void) {\n"),
             ("deep.cpp", "template <typename T> int run() {\n"),
+            ("Deep.cs", "class Deep { void Run() {\n"),
+            ("deep.rb", "def run\n"),
+            ("Deep.swift", "class Deep { func run() {\n"),
+            ("deep.php", "<?php function run() {\n"),
         ] {
             let mut source = prefix.to_string();
             for _ in 0..=POLYGLOT_AST_MAX_DEPTH {
@@ -4446,6 +6387,10 @@ int utility() { return 1; }
             ("Huge.java", POLYGLOT_JAVA_MAX_BYTES),
             ("huge.c", POLYGLOT_C_MAX_BYTES),
             ("huge.cpp", POLYGLOT_CPP_MAX_BYTES),
+            ("Huge.cs", POLYGLOT_CSHARP_MAX_BYTES),
+            ("huge.rb", POLYGLOT_RUBY_MAX_BYTES),
+            ("Huge.swift", POLYGLOT_SWIFT_MAX_BYTES),
+            ("huge.php", POLYGLOT_PHP_MAX_BYTES),
         ] {
             std::fs::write(tmp.path().join(name), vec![b' '; max_bytes + 1]).expect("huge source");
         }
@@ -4453,6 +6398,10 @@ int utility() { return 1; }
             ("LongLine.java", POLYGLOT_JAVA_MAX_LINE_BYTES),
             ("long_line.c", POLYGLOT_C_MAX_LINE_BYTES),
             ("long_line.cpp", POLYGLOT_CPP_MAX_LINE_BYTES),
+            ("LongLine.cs", POLYGLOT_CSHARP_MAX_LINE_BYTES),
+            ("long_line.rb", POLYGLOT_RUBY_MAX_LINE_BYTES),
+            ("LongLine.swift", POLYGLOT_SWIFT_MAX_LINE_BYTES),
+            ("long_line.php", POLYGLOT_PHP_MAX_LINE_BYTES),
         ] {
             let source = format!("//{}\n", "x".repeat(max_line_bytes + 1));
             assert!(source.len() < POLYGLOT_CPP_MAX_BYTES);
@@ -4482,14 +6431,26 @@ int utility() { return 1; }
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from([
                 ("Deep.java".to_string(), "max_delimiter_depth".to_string()),
+                ("Deep.cs".to_string(), "max_delimiter_depth".to_string()),
+                ("Deep.swift".to_string(), "max_delimiter_depth".to_string()),
                 ("Huge.java".to_string(), "max_bytes".to_string()),
+                ("Huge.cs".to_string(), "max_bytes".to_string()),
+                ("Huge.swift".to_string(), "max_bytes".to_string()),
                 ("LongLine.java".to_string(), "max_line_bytes".to_string()),
+                ("LongLine.cs".to_string(), "max_line_bytes".to_string()),
+                ("LongLine.swift".to_string(), "max_line_bytes".to_string()),
                 ("deep.c".to_string(), "max_delimiter_depth".to_string()),
                 ("deep.cpp".to_string(), "max_delimiter_depth".to_string()),
+                ("deep.php".to_string(), "max_delimiter_depth".to_string()),
+                ("deep.rb".to_string(), "max_delimiter_depth".to_string()),
                 ("huge.c".to_string(), "max_bytes".to_string()),
                 ("huge.cpp".to_string(), "max_bytes".to_string()),
+                ("huge.php".to_string(), "max_bytes".to_string()),
+                ("huge.rb".to_string(), "max_bytes".to_string()),
                 ("long_line.c".to_string(), "max_line_bytes".to_string()),
                 ("long_line.cpp".to_string(), "max_line_bytes".to_string()),
+                ("long_line.php".to_string(), "max_line_bytes".to_string()),
+                ("long_line.rb".to_string(), "max_line_bytes".to_string()),
                 ("template_storm.cpp".to_string(), "max_delimiter_depth".to_string()),
             ])
         );
@@ -5094,6 +7055,18 @@ class TestController {
 
         let before = stable_scan_json(run_repo_scan_at(tmp.path()).expect("baseline scan"));
         write_all_v3_dark_files(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("config")).expect("config");
+        std::fs::create_dir_all(tmp.path().join("routes")).expect("routes");
+        std::fs::write(
+            tmp.path().join("config/routes.rb"),
+            "get \"/dark-rails\" => \"dark#show\"\n",
+        )
+        .expect("dark rails route");
+        std::fs::write(
+            tmp.path().join("routes/api.php"),
+            "<?php Route::get('/dark-laravel', function () {});\n",
+        )
+        .expect("dark laravel route");
 
         let unset = stable_scan_json(run_repo_scan_at(tmp.path()).expect("unset scan"));
         let zero = {
@@ -5112,12 +7085,18 @@ class TestController {
             "dark.hpp",
             "dark.hh",
             "dark.hxx",
+            "Dark.cs",
+            "dark.rb",
+            "Dark.swift",
+            "dark.php",
         ] {
             assert!(!unset.contains(name), "dark payload leaked {name}");
         }
         assert!(unset.contains("foo.h.ts"));
         assert!(!unset.contains(POLYGLOT_V3_ENV));
         assert!(!unset.contains("v3_skipped_files"));
+        assert!(!unset.contains("dark-rails"));
+        assert!(!unset.contains("dark-laravel"));
     }
 
     #[test]
@@ -5133,6 +7112,18 @@ class TestController {
 
         let before = stable_scan_json(run_repo_scan_at(tmp.path()).expect("V2 baseline"));
         write_all_v3_dark_files(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("config")).expect("config");
+        std::fs::create_dir_all(tmp.path().join("routes")).expect("routes");
+        std::fs::write(
+            tmp.path().join("config/routes.rb"),
+            "get \"/dark-v2-rails\" => \"dark#show\"\n",
+        )
+        .expect("dark V2 rails route");
+        std::fs::write(
+            tmp.path().join("routes/api.php"),
+            "<?php Route::get('/dark-v2-laravel', function () {});\n",
+        )
+        .expect("dark V2 laravel route");
         let after = stable_scan_json(run_repo_scan_at(tmp.path()).expect("V2 plus dark V3"));
 
         assert_eq!(before.as_bytes(), after.as_bytes());
@@ -5140,6 +7131,8 @@ class TestController {
         assert!(after.contains("main.go"));
         assert!(after.contains("foo.h.ts"));
         assert!(!after.contains("v3_skipped_files"));
+        assert!(!after.contains("dark-v2-rails"));
+        assert!(!after.contains("dark-v2-laravel"));
     }
 
     #[test]

@@ -70,6 +70,8 @@ pub fn scan_external_deps(root: &Path) -> Vec<ExternalDep> {
             "pom.xml" => parse_maven_pom(root, manifest, &mut deps),
             "build.gradle" | "build.gradle.kts" => parse_gradle_manifest(root, manifest, &mut deps),
             "Gemfile" => parse_gemfile(root, manifest, &mut deps),
+            "Package.swift" => parse_swift_package(root, manifest, &mut deps),
+            "composer.json" => parse_composer_manifest(root, manifest, &mut deps),
             _ if manifest.extension().and_then(|ext| ext.to_str()) == Some("csproj") => {
                 parse_csproj(root, manifest, &mut deps);
             }
@@ -131,8 +133,10 @@ fn discover_manifests(root: &Path) -> Vec<PathBuf> {
     out.sort();
     // Preserve the pre-M2 cap surface: manifests supported before this
     // milestone always claim slots before newly supported ecosystems.
-    let (mut pre_m2, m2): (Vec<_>, Vec<_>) = out.into_iter().partition(|path| is_pre_m2_manifest_path(path));
+    let (mut pre_m2, later): (Vec<_>, Vec<_>) = out.into_iter().partition(|path| is_pre_m2_manifest_path(path));
+    let (m2, m4): (Vec<_>, Vec<_>) = later.into_iter().partition(|path| is_m2_manifest_path(path));
     pre_m2.extend(m2);
+    pre_m2.extend(m4);
     pre_m2
 }
 
@@ -154,6 +158,8 @@ fn is_manifest_name(name: &str) -> bool {
             | "build.gradle"
             | "build.gradle.kts"
             | "Gemfile"
+            | "Package.swift"
+            | "composer.json"
     ) || is_requirements_file(name)
 }
 
@@ -173,6 +179,12 @@ fn is_pre_m2_manifest_path(path: &Path) -> bool {
     matches!(name, "Cargo.toml" | "package.json" | "pyproject.toml" | "go.mod")
         || is_requirements_file(name)
         || is_requirements_path(path)
+}
+
+fn is_m2_manifest_path(path: &Path) -> bool {
+    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+    matches!(name, "pom.xml" | "build.gradle" | "build.gradle.kts" | "Gemfile")
+        || path.extension().and_then(|ext| ext.to_str()) == Some("csproj")
 }
 
 fn is_requirements_path(path: &Path) -> bool {
@@ -1486,6 +1498,200 @@ fn parse_nuget_lock(lock: &Path) -> Option<BTreeMap<String, String>> {
     Some(versions)
 }
 
+static SWIFTPM_PACKAGE_RE: LazyLock<Option<regex::Regex>> =
+    LazyLock::new(|| regex::Regex::new(r"(?s)\.package\s*\((.*?)\)").ok());
+static SWIFTPM_URL_RE: LazyLock<Option<regex::Regex>> =
+    LazyLock::new(|| regex::Regex::new(r#"url\s*:\s*\"([^\"]+)\""#).ok());
+static SWIFTPM_REQUIREMENT_RE: LazyLock<Option<regex::Regex>> =
+    LazyLock::new(|| regex::Regex::new(r#"\b(from|exact|branch|revision)\s*:\s*\"([^\"]+)\""#).ok());
+
+fn parse_swift_package(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>) {
+    let Some(contents) = read_utf8_file(manifest, "Package.swift") else {
+        return;
+    };
+    let Some(source_manifest) = rel_path(root, manifest) else {
+        return;
+    };
+    let Some(package_pattern) = SWIFTPM_PACKAGE_RE.as_ref() else {
+        tracing::warn!("failed to initialize SwiftPM package pattern");
+        return;
+    };
+    let Some(url_pattern) = SWIFTPM_URL_RE.as_ref() else {
+        tracing::warn!("failed to initialize SwiftPM URL pattern");
+        return;
+    };
+    let lock_versions = find_nearest_file(manifest.parent().unwrap_or(root), root, "Package.resolved")
+        .and_then(|lock| parse_swift_package_resolved(&lock));
+    for capture in package_pattern.captures_iter(&contents) {
+        let Some(arguments) = capture.get(1).map(|matched| matched.as_str()) else {
+            continue;
+        };
+        let Some(url) = url_pattern
+            .captures(arguments)
+            .and_then(|captures| captures.get(1))
+            .map(|matched| matched.as_str())
+        else {
+            continue;
+        };
+        let Some(name) = package_name_from_url(url) else {
+            continue;
+        };
+        let version_req = SWIFTPM_REQUIREMENT_RE.as_ref().and_then(|pattern| {
+            pattern.captures(arguments).and_then(|captures| {
+                let label = captures.get(1)?.as_str();
+                let value = captures.get(2)?.as_str();
+                Some(format!("{label}: {value}"))
+            })
+        });
+        deps.push(ExternalDep {
+            name: name.clone(),
+            ecosystem: "swiftpm".to_string(),
+            version_req,
+            version_locked: lock_versions
+                .as_ref()
+                .and_then(|versions| versions.get(&name.to_ascii_lowercase()).cloned()),
+            source_manifest: source_manifest.clone(),
+            kind: "normal".to_string(),
+        });
+    }
+}
+
+fn package_name_from_url(url: &str) -> Option<String> {
+    let trimmed = url.trim_end_matches('/');
+    let name = trimmed.rsplit('/').next()?.trim_end_matches(".git");
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn parse_swift_package_resolved(lock: &Path) -> Option<BTreeMap<String, String>> {
+    let contents = read_utf8_lockfile(lock, "Package.resolved")?;
+    let value = match serde_json::from_str::<serde_json::Value>(&contents) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(path = %lock.display(), ?err, "failed to parse Package.resolved");
+            return None;
+        }
+    };
+    let mut versions = BTreeMap::new();
+    let pins = value
+        .get("pins")
+        .or_else(|| value.get("object").and_then(|object| object.get("pins")))
+        .and_then(serde_json::Value::as_array);
+    let Some(pins) = pins else {
+        return Some(versions);
+    };
+    for pin in pins {
+        let name = pin
+            .get("identity")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string)
+            .or_else(|| {
+                pin.get("package")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .or_else(|| {
+                pin.get("location")
+                    .or_else(|| pin.get("repositoryURL"))
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(package_name_from_url)
+            });
+        let version = pin
+            .get("state")
+            .and_then(|state| state.get("version"))
+            .and_then(serde_json::Value::as_str);
+        if let (Some(name), Some(version)) = (name, version) {
+            versions.insert(name.to_ascii_lowercase(), version.to_string());
+        }
+    }
+    Some(versions)
+}
+
+fn parse_composer_manifest(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>) {
+    let Some(contents) = read_utf8_file(manifest, "composer.json") else {
+        return;
+    };
+    let value = match serde_json::from_str::<serde_json::Value>(&contents) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(path = %manifest.display(), ?err, "failed to parse composer.json");
+            return;
+        }
+    };
+    let Some(source_manifest) = rel_path(root, manifest) else {
+        return;
+    };
+    let lock_versions = find_nearest_file(manifest.parent().unwrap_or(root), root, "composer.lock")
+        .and_then(|lock| parse_composer_lock(&lock));
+    for (section, kind) in [("require", "normal"), ("require-dev", "dev")] {
+        let Some(requirements) = value.get(section).and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        for (name, requirement) in requirements {
+            let lower = name.to_ascii_lowercase();
+            if is_composer_platform_package(&lower) {
+                continue;
+            }
+            let Some(version_req) = requirement.as_str() else {
+                tracing::warn!(path = %manifest.display(), dependency = %name, "skipping non-string Composer requirement");
+                continue;
+            };
+            deps.push(ExternalDep {
+                name: name.clone(),
+                ecosystem: "composer".to_string(),
+                version_req: Some(version_req.to_string()),
+                version_locked: lock_versions
+                    .as_ref()
+                    .and_then(|versions| versions.get(&lower).cloned()),
+                source_manifest: source_manifest.clone(),
+                kind: kind.to_string(),
+            });
+        }
+    }
+}
+
+fn is_composer_platform_package(name: &str) -> bool {
+    matches!(
+        name,
+        "php"
+            | "php-64bit"
+            | "php-ipv6"
+            | "php-zts"
+            | "php-debug"
+            | "hhvm"
+            | "composer"
+            | "composer-plugin-api"
+            | "composer-runtime-api"
+    ) || name.starts_with("ext-")
+        || name.starts_with("lib-")
+}
+
+fn parse_composer_lock(lock: &Path) -> Option<BTreeMap<String, String>> {
+    let contents = read_utf8_lockfile(lock, "composer.lock")?;
+    let value = match serde_json::from_str::<serde_json::Value>(&contents) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(path = %lock.display(), ?err, "failed to parse composer.lock");
+            return None;
+        }
+    };
+    let mut versions = BTreeMap::new();
+    for section in ["packages", "packages-dev"] {
+        let Some(packages) = value.get(section).and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for package in packages {
+            let (Some(name), Some(version)) = (
+                package.get("name").and_then(serde_json::Value::as_str),
+                package.get("version").and_then(serde_json::Value::as_str),
+            ) else {
+                continue;
+            };
+            versions.insert(name.to_ascii_lowercase(), version.to_string());
+        }
+    }
+    Some(versions)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2324,6 +2530,104 @@ end
     }
 
     #[test]
+    fn swiftpm_extracts_url_requirements_and_v2_v3_lock_versions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("Package.swift"),
+            r#"// swift-tools-version: 5.9
+import PackageDescription
+let package = Package(
+  name: "Demo",
+  dependencies: [
+    .package(url: "https://github.com/apple/swift-nio.git", from: "2.70.0"),
+    .package(url: "https://github.com/pointfreeco/swift-composable-architecture", exact: "1.15.0"),
+    .package(url: "https://github.com/acme/BranchKit.git", branch: "main"),
+    .package(url: "https://github.com/acme/RevisionKit.git", revision: "abc123")
+  ]
+)
+"#,
+        )
+        .expect("Package.swift");
+        std::fs::write(
+            tmp.path().join("Package.resolved"),
+            r#"{"version":3,"pins":[
+{"identity":"swift-nio","location":"https://github.com/apple/swift-nio.git","state":{"version":"2.70.1"}},
+{"identity":"swift-composable-architecture","location":"https://github.com/pointfreeco/swift-composable-architecture","state":{"version":"1.15.0"}},
+{"identity":"transitive","location":"https://example.invalid/transitive.git","state":{"version":"9.9.9"}}
+]}"#,
+        )
+        .expect("Package.resolved");
+        let deps = scan_external_deps(tmp.path());
+        assert_eq!(deps.len(), 4);
+        assert_eq!(
+            dep(&deps, "swiftpm", "Package.swift", "swift-nio")
+                .version_req
+                .as_deref(),
+            Some("from: 2.70.0")
+        );
+        assert_eq!(
+            dep(&deps, "swiftpm", "Package.swift", "swift-nio")
+                .version_locked
+                .as_deref(),
+            Some("2.70.1")
+        );
+        assert_eq!(
+            dep(&deps, "swiftpm", "Package.swift", "BranchKit")
+                .version_req
+                .as_deref(),
+            Some("branch: main")
+        );
+        assert!(deps.iter().all(|dep| dep.name != "transitive"));
+    }
+
+    #[test]
+    fn composer_extracts_require_kinds_skips_platform_and_closes_direct_locks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("composer.json"),
+            r#"{"require":{"php":"^8.3","ext-json":"*","Composer-Plugin-API":"^2","lib-openssl":"*","laravel/framework":"^12.0","guzzlehttp/guzzle":"^7.9"},"require-dev":{"phpunit/phpunit":"^11.0"}}"#,
+        )
+        .expect("composer.json");
+        std::fs::write(
+            tmp.path().join("composer.lock"),
+            r#"{"packages":[{"name":"laravel/framework","version":"v12.1.2"},{"name":"guzzlehttp/guzzle","version":"7.9.2"},{"name":"psr/http-message","version":"2.0"}],"packages-dev":[{"name":"phpunit/phpunit","version":"11.5.0"}]}"#,
+        )
+        .expect("composer.lock");
+        let deps = scan_external_deps(tmp.path());
+        assert_eq!(deps.len(), 3);
+        assert_eq!(dep(&deps, "composer", "composer.json", "phpunit/phpunit").kind, "dev");
+        assert_eq!(
+            dep(&deps, "composer", "composer.json", "laravel/framework")
+                .version_locked
+                .as_deref(),
+            Some("v12.1.2")
+        );
+        assert!(deps.iter().all(|dep| !matches!(
+            dep.name.as_str(),
+            "php" | "ext-json" | "Composer-Plugin-API" | "lib-openssl" | "psr/http-message"
+        )));
+    }
+
+    #[test]
+    fn malformed_and_oversized_m4_ecosystem_files_are_skipped_without_panics() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("composer.json"), "{").expect("malformed composer");
+        std::fs::write(tmp.path().join("composer.lock"), b"\0\xFF").expect("binary composer lock");
+        std::fs::write(
+            tmp.path().join("Package.swift"),
+            ".package(url: \"https://example.invalid/Good.git\", from: \"1\")\n",
+        )
+        .expect("Package.swift");
+        std::fs::write(tmp.path().join("Package.resolved"), "{").expect("malformed resolved");
+        let oversized = std::fs::OpenOptions::new()
+            .write(true)
+            .open(tmp.path().join("Package.swift"))
+            .expect("open Package.swift");
+        oversized.set_len(MAX_FILE_BYTES + 1).expect("oversize Package.swift");
+        assert!(scan_external_deps(tmp.path()).is_empty());
+    }
+
+    #[test]
     fn poetry_and_uv_locks_close_declared_python_deps_only() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join("poetry")).expect("poetry dir");
@@ -2410,6 +2714,22 @@ end
     }
 
     #[test]
+    fn repos_without_m4_manifest_types_keep_m2_dependency_golden_byte_identical() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("Gemfile"), "gem \"rails\", \"~> 7.2\"\n").expect("Gemfile");
+        std::fs::write(
+            tmp.path().join("App.csproj"),
+            "<Project><ItemGroup><PackageReference Include=\"Serilog\" Version=\"4\" /></ItemGroup></Project>",
+        )
+        .expect("csproj");
+        let json = serde_json::to_string(&scan_external_deps(tmp.path())).expect("deps json");
+        assert_eq!(
+            json,
+            r#"[{"name":"Serilog","ecosystem":"nuget","version_req":"4","source_manifest":"App.csproj","kind":"normal"},{"name":"rails","ecosystem":"rubygems","version_req":"~> 7.2","source_manifest":"Gemfile","kind":"normal"}]"#
+        );
+    }
+
+    #[test]
     fn malformed_and_oversized_new_ecosystem_files_are_skipped_without_panics() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::write(tmp.path().join("pom.xml"), "<project><dependencies>").expect("truncated pom");
@@ -2489,6 +2809,30 @@ end
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "must-survive");
         assert_eq!(deps[0].source_manifest, "package.json");
+    }
+
+    #[test]
+    fn pre_m4_manifest_tiers_claim_cap_slots_before_m4_manifests() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for idx in 0..=MAX_MANIFESTS {
+            let dir = tmp.path().join(format!("a{idx:04}"));
+            std::fs::create_dir_all(&dir).expect("composer dir");
+            std::fs::write(dir.join("composer.json"), r#"{"require":{"acme/m4":"1"}}"#).expect("composer");
+        }
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"dependencies":{"pre-m2-must-survive":"1"}}"#,
+        )
+        .expect("package");
+        std::fs::write(tmp.path().join("Gemfile"), "gem \"m2-must-survive\", \"1\"\n").expect("Gemfile");
+
+        let deps = scan_external_deps(tmp.path());
+        assert!(deps.iter().any(|dep| dep.name == "pre-m2-must-survive"));
+        assert!(deps.iter().any(|dep| dep.name == "m2-must-survive"));
+        assert_eq!(
+            deps.iter().filter(|dep| dep.ecosystem == "composer").count(),
+            MAX_MANIFESTS - 2
+        );
     }
 
     #[test]
@@ -2573,6 +2917,10 @@ end
         .expect("poetry lock");
         std::fs::write(tmp.path().join("uv.lock"), "version = 1\n").expect("uv lock");
         std::fs::write(tmp.path().join("go.sum"), "example.com/mod v1.0.0 h1:hash\n").expect("go sum");
+        std::fs::write(tmp.path().join("Package.swift"), "// swift manifest\n").expect("Package.swift");
+        std::fs::write(tmp.path().join("Package.resolved"), r#"{"version":3,"pins":[]}"#).expect("Package.resolved");
+        std::fs::write(tmp.path().join("composer.json"), r#"{"require":{"acme/package":"1"}}"#).expect("composer.json");
+        std::fs::write(tmp.path().join("composer.lock"), r#"{"packages":[]}"#).expect("composer.lock");
 
         let with_m2_files =
             stable_bytes(crate::workspace_scan_polyglot::run_repo_scan_at(tmp.path()).expect("M2 files scan"));
