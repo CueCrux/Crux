@@ -30,9 +30,13 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 /// `blake3:<64-hex>` over the stable serde JSON serialization of a
 /// canonical document (the caller fixes field order by constructing the
 /// `serde_json::Value` itself — `json!` object order is preserved).
-pub fn content_hash_json(canonical: &serde_json::Value) -> String {
-    let bytes = serde_json::to_vec(canonical).unwrap_or_default();
-    format!("blake3:{}", blake3::hash(&bytes).to_hex())
+///
+/// Returns the serialization error rather than defaulting to empty bytes: a
+/// content-addressed integrity primitive must never let a failed serialise and
+/// a genuinely-empty document collide on the same hash.
+pub fn content_hash_json(canonical: &serde_json::Value) -> Result<String, serde_json::Error> {
+    let bytes = serde_json::to_vec(canonical)?;
+    Ok(format!("blake3:{}", blake3::hash(&bytes).to_hex()))
 }
 
 /// Decode a stated `blake3:<hex>` content hash (prefix optional) into the
@@ -92,8 +96,8 @@ mod tests {
     #[test]
     fn content_hash_is_deterministic_and_prefixed() {
         let doc = serde_json::json!({"a": [1, 2, 3], "b": {"c": "d"}});
-        let h1 = content_hash_json(&doc);
-        let h2 = content_hash_json(&doc);
+        let h1 = content_hash_json(&doc).expect("hash");
+        let h2 = content_hash_json(&doc).expect("hash");
         assert_eq!(h1, h2);
         assert!(h1.starts_with("blake3:"));
         assert_eq!(h1.len(), "blake3:".len() + 64);
@@ -121,7 +125,7 @@ mod tests {
     #[test]
     fn sign_verify_tamper_roundtrip() {
         let key = SigningKey::from_bytes(&[11_u8; 32]);
-        let stated = content_hash_json(&serde_json::json!({"payload": "x"}));
+        let stated = content_hash_json(&serde_json::json!({"payload": "x"})).expect("hash");
         let hash = decode_content_hash(&stated).expect("hash");
         let sig: [u8; 64] = key.sign(&hash).to_bytes();
 

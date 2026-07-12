@@ -153,6 +153,8 @@ pub struct TrustedPlatformKey {
 pub enum EnvelopeVerifyError {
     #[error("unsupported schema_version: {0}")]
     UnsupportedSchema(String),
+    #[error("content serialization failed: {0}")]
+    ContentSerialization(String),
     #[error("recomputed content hash {recomputed} != stated {stated}")]
     HashMismatch { stated: String, recomputed: String },
     #[error("malformed content hash: {0}")]
@@ -173,7 +175,10 @@ pub enum EnvelopeVerifyError {
 /// then blake3 (via the shared [`crate::signed_bundle`] idiom). The platform
 /// emits a deterministic array order (§2 ordering rule); the importer hashes
 /// the bytes exactly as received.
-pub fn result_envelope_content_hash(payload: &EnvelopePayload, companion_artifacts: &[CompanionArtifact]) -> String {
+pub fn result_envelope_content_hash(
+    payload: &EnvelopePayload,
+    companion_artifacts: &[CompanionArtifact],
+) -> Result<String, serde_json::Error> {
     crate::signed_bundle::content_hash_json(&serde_json::json!({
         "payload": payload,
         "companion_artifacts": companion_artifacts,
@@ -204,7 +209,8 @@ pub fn verify_result_envelope(
     }
 
     // 2) Recompute + compare content hash.
-    let recomputed = result_envelope_content_hash(&envelope.payload, &envelope.companion_artifacts);
+    let recomputed = result_envelope_content_hash(&envelope.payload, &envelope.companion_artifacts)
+        .map_err(|err| EnvelopeVerifyError::ContentSerialization(err.to_string()))?;
     if recomputed != envelope.blake3_content_hash {
         return Err(EnvelopeVerifyError::HashMismatch {
             stated: envelope.blake3_content_hash.clone(),
@@ -288,7 +294,7 @@ mod tests {
             purpose_tag: "projection".into(),
             fetch_url: Some("https://platform.example/a".into()),
         }];
-        let content_hash = result_envelope_content_hash(&payload, &artifacts);
+        let content_hash = result_envelope_content_hash(&payload, &artifacts).expect("hash");
         let raw = hex::decode(content_hash.strip_prefix("blake3:").unwrap()).unwrap();
         let mut hash = [0_u8; 32];
         hash.copy_from_slice(&raw);
@@ -375,8 +381,8 @@ mod tests {
         let payload = sample_payload();
         let arts: Vec<CompanionArtifact> = vec![];
         assert_eq!(
-            result_envelope_content_hash(&payload, &arts),
-            result_envelope_content_hash(&payload, &arts)
+            result_envelope_content_hash(&payload, &arts).expect("hash"),
+            result_envelope_content_hash(&payload, &arts).expect("hash")
         );
     }
 }
