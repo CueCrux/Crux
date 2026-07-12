@@ -35,6 +35,7 @@ mod features;
 // Hosted-service HTTP surface (ExecPlan crux-external-findings-remediation M4):
 // Pro GPU-1 compute bridge (`/v1/gpu1/*`). Compiled out of the default
 // Community Edition binary; see the `hosted-surfaces` feature.
+mod audit_verify;
 #[cfg(feature = "hosted-surfaces")]
 mod gpu1;
 mod health;
@@ -427,6 +428,12 @@ pub(crate) fn router_with_route_auth(
         .route("/v1/gpus", get(self::routing::get_gpus))
         .route("/v1/shards", get(self::routing::get_shards))
         .route("/v1/route", get(self::routing::route_v1))
+        .route(
+            "/v1/audit/bundle/verify",
+            axum::routing::post(self::audit_verify::post_audit_bundle_verify).layer(
+                axum::extract::DefaultBodyLimit::max(self::audit_verify::AUDIT_BUNDLE_MAX_UPLOAD_BYTES),
+            ),
+        )
         .route("/v1/receipts/{receiptId}", get(self::receipts::get_receipt_body_v1))
         .route(
             "/v1/receipts/{receiptId}/signature",
