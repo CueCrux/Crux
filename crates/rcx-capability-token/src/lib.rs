@@ -420,7 +420,25 @@ impl RcxCapabilityToken {
         hex::encode(self.token_hash())
     }
 
+    /// Default clock-skew tolerance (seconds) applied to the `issued_at` and
+    /// `expires_at` comparisons. Matches the JWT auth path
+    /// (`corecruxd::auth`, `validation.leeway = 30`): in a federated deployment
+    /// the issuer and verifier are different machines, so a token minted on a
+    /// slightly-fast node must not be rejected as future-dated by a
+    /// slightly-slow verifier (and symmetrically at expiry).
+    pub const DEFAULT_CLOCK_SKEW_LEEWAY_SECS: u64 = 30;
+
+    /// Structural + temporal validation using the default clock-skew leeway
+    /// ([`Self::DEFAULT_CLOCK_SKEW_LEEWAY_SECS`]). This is the entry point the
+    /// verification path (`verify_token`) uses.
     pub fn validate_basic(&self, now_unix_seconds: u64) -> TokenValidationResult {
+        self.validate_basic_with_leeway(now_unix_seconds, Self::DEFAULT_CLOCK_SKEW_LEEWAY_SECS)
+    }
+
+    /// As [`Self::validate_basic`], but with an explicit clock-skew tolerance
+    /// (seconds) applied symmetrically to the not-yet-valid and expired
+    /// comparisons. Pass `0` for exact-boundary semantics.
+    pub fn validate_basic_with_leeway(&self, now_unix_seconds: u64, leeway_seconds: u64) -> TokenValidationResult {
         let mut issues = Vec::new();
         if self.spec_version != RCX_CT_SPEC_VERSION {
             issues.push(TokenValidationIssue::new(
@@ -431,13 +449,13 @@ impl RcxCapabilityToken {
         if self.token_id.trim().is_empty() {
             issues.push(TokenValidationIssue::new("missing_token_id", "token_id is required"));
         }
-        if self.issued_at > now_unix_seconds {
+        if self.issued_at > now_unix_seconds.saturating_add(leeway_seconds) {
             issues.push(TokenValidationIssue::new(
                 "token_not_yet_valid",
                 "issued_at must be at or before the validation time",
             ));
         }
-        if self.expires_at <= now_unix_seconds {
+        if self.expires_at.saturating_add(leeway_seconds) <= now_unix_seconds {
             issues.push(TokenValidationIssue::new("token_expired", "token has expired"));
         }
         if self.refresh_hint_at >= self.expires_at {
@@ -961,9 +979,53 @@ mod tests {
         assert_eq!(ok.token_hash, FREE_LOCAL_VERIFIED_TOKEN_HASH);
 
         token.expires_at = 1;
-        let expired = token.validate_basic(2);
+        // Exact-boundary check (no skew tolerance): expired one second before `now`.
+        let expired = token.validate_basic_with_leeway(2, 0);
         assert!(!expired.valid);
         assert!(expired.issues.iter().any(|issue| issue.code == "token_expired"));
+    }
+
+    #[test]
+    fn default_leeway_absorbs_small_clock_skew() {
+        let token = free_local_verified_fixture();
+        // Verifier clock 5s behind the issuer: issued_at looks 5s in the future.
+        let now_behind = token.issued_at - 5;
+        assert!(
+            token.validate_basic(now_behind).valid,
+            "issued_at 5s in the future must pass within the default 30s leeway"
+        );
+        // Verifier clock 5s ahead at expiry: the token looks 5s expired.
+        let now_ahead = token.expires_at + 5;
+        assert!(
+            token.validate_basic(now_ahead).valid,
+            "expiry 5s in the past must pass within the default 30s leeway"
+        );
+    }
+
+    #[test]
+    fn leeway_still_rejects_skew_beyond_tolerance() {
+        let token = free_local_verified_fixture();
+        let leeway = RcxCapabilityToken::DEFAULT_CLOCK_SKEW_LEEWAY_SECS;
+
+        let too_early = token.issued_at - leeway - 5;
+        assert!(
+            token
+                .validate_basic(too_early)
+                .issues
+                .iter()
+                .any(|issue| issue.code == "token_not_yet_valid"),
+            "issued_at beyond the leeway window must still be rejected"
+        );
+
+        let too_late = token.expires_at + leeway + 5;
+        assert!(
+            token
+                .validate_basic(too_late)
+                .issues
+                .iter()
+                .any(|issue| issue.code == "token_expired"),
+            "expiry beyond the leeway window must still be rejected"
+        );
     }
 
     #[test]

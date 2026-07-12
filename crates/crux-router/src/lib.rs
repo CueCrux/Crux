@@ -1009,7 +1009,9 @@ mod tests {
 
     #[test]
     fn expired_token_fails_closed() {
-        let decision = router().decide(&CallContext::local("corecrux.query.local"), 1_780_143_201);
+        // `now` is >30s past the fixture expiry (1_780_143_200) so the token stays
+        // expired under the capability-token clock-skew leeway.
+        let decision = router().decide(&CallContext::local("corecrux.query.local"), 1_780_143_301);
         assert!(!decision.authorised);
         assert_eq!(decision.reason_code.as_deref(), Some("denied:token_expired"));
         assert_eq!(decision.stamp.mode, "refused");
@@ -1075,7 +1077,8 @@ mod tests {
             None,
             Some(10),
         )
-        .decide(&hosted_retrieve_call(1, true), 1_780_143_201);
+        // >30s past expiry so it stays expired under the clock-skew leeway.
+        .decide(&hosted_retrieve_call(1, true), 1_780_143_301);
 
         assert!(decision.authorised);
         assert_eq!(decision.mode, RouterMode::DegradedLocal);
