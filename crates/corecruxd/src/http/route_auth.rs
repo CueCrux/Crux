@@ -157,6 +157,11 @@ pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContra
         || path.starts_with("/v1/observations/")
         || path.starts_with("/v1/ops/")
         || path.starts_with("/v1/bootstrap/")
+        // Offline audit-bundle verification over caller-supplied bytes. Read
+        // class: it mutates no daemon state and only reports a verdict, but it
+        // is not an open surface — a read scope is required, and the upload is
+        // size-capped at the route (compressed) and in the verifier (decompressed).
+        || path.starts_with("/v1/audit/")
     {
         return Some(RouteAuthContract::new(
             RouteAuthClass::Read,
