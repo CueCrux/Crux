@@ -1077,6 +1077,20 @@ mod tests {
     }
 
     #[test]
+    fn packaged_valid_minimal_v2_vector_verifies() {
+        // A v2 bundle signed by the *independent* Python generator
+        // (`tools/gen_audit_bundle_vectors.py`) must verify under the Rust
+        // verifier — proving the v2 domain-tagged, key-canonical signing bytes
+        // are byte-identical across the two implementations.
+        let bytes = include_bytes!("../vectors/audit-bundle-v1/valid-minimal-v2/audit-bundle.tar.zst");
+        let report = verify_bundle_v1(bytes).expect("verify packaged v2 vector");
+        assert!(report.ok, "v2 archive vector failed: {report:?}");
+        assert_eq!(report.bundle_format_version, BUNDLE_FORMAT_VERSION);
+        assert_eq!(report.bundle_id, "vector-valid-minimal-v2");
+        assert!(report.signature_valid);
+    }
+
+    #[test]
     fn packaged_invalid_events_hash_vector_fails() {
         let bytes = include_bytes!("../vectors/audit-bundle-v1/invalid-events-hash/audit-bundle.tar.zst");
         let report = verify_bundle_v1(bytes).expect("verify packaged invalid vector");

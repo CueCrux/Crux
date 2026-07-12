@@ -14,7 +14,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const VECTOR_NAMES: &[&str] = &["valid-minimal", "invalid-events-hash"];
+const VECTOR_NAMES: &[&str] = &["valid-minimal", "invalid-events-hash", "valid-minimal-v2"];
 const BUNDLE_MEMBERS: &[&str] = &["manifest.json", "events.jsonl", "receipts.cbor"];
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

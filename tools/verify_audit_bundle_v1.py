@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Independent Audit Bundle v1 vector verifier.
+"""Independent Audit Bundle vector verifier (formats v1 and v2).
 
-This verifier intentionally supports unpacked vector directories. It mirrors the
-documented v1 checks without using the Rust implementation.
+This verifier intentionally supports unpacked vector directories and `.tar.zst`
+archives. It mirrors the documented checks without using the Rust implementation,
+including both signing formats: v1 (struct-order JSON, no domain tag) and v2
+(the `cuecrux.audit_bundle.v2` domain tag followed by key-canonical JSON), so it
+can verify the bundles the daemon now emits by default.
 """
 
 from __future__ import annotations
@@ -24,12 +27,34 @@ from cryptography.hazmat.primitives.asymmetric import ec, ed25519
 from cryptography.hazmat.primitives.serialization import load_der_public_key, load_pem_public_key
 
 
-SUPPORTED_VERSION = 1
+LEGACY_VERSION = 1
+CURRENT_VERSION = 2
+SUPPORTED_VERSIONS = (LEGACY_VERSION, CURRENT_VERSION)
+
+# Domain-separation tag prefixed to the v2 signing input. Mirrors
+# corecrux_receipts::audit_bundle_v1::AUDIT_BUNDLE_SIGNING_DOMAIN
+# (b"cuecrux.audit_bundle.v2\0").
+AUDIT_BUNDLE_SIGNING_DOMAIN_V2 = b"cuecrux.audit_bundle.v2\x00"
 
 
 def canonical_manifest_bytes(manifest: dict) -> bytes:
+    """Reproduce the Ed25519 sign/verify input for the manifest, selected by
+    ``bundle_format_version`` (mirrors ``AuditBundleManifestV1::canonical_signing_bytes``):
+
+    * **v1** (legacy): compact JSON in the manifest's own field order, no domain tag.
+    * **v2** (current): the domain tag followed by compact JSON with object keys
+      sorted **recursively**, so the signed bytes are independent of field order.
+      Python's ``json.dumps(sort_keys=True)`` matches the Rust ``canonical_json_bytes``
+      recursive key sort; the manifest carries only strings/integers/nested objects
+      (no floats), so number/string formatting is identical across the two.
+    """
     signing_manifest = dict(manifest)
     signing_manifest["signature_b64"] = ""
+    if manifest.get("bundle_format_version") == CURRENT_VERSION:
+        canonical = json.dumps(
+            signing_manifest, separators=(",", ":"), ensure_ascii=False, sort_keys=True
+        ).encode("utf-8")
+        return AUDIT_BUNDLE_SIGNING_DOMAIN_V2 + canonical
     return json.dumps(signing_manifest, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
@@ -267,7 +292,7 @@ def read_unpacked_members(path: Path) -> tuple[dict, bytes, bytes, bytes | None]
         return fail(None, "missing manifest.json")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
-    if manifest.get("bundle_format_version") != SUPPORTED_VERSION:
+    if manifest.get("bundle_format_version") not in SUPPORTED_VERSIONS:
         return fail(manifest, f"unsupported bundle_format_version: {manifest.get('bundle_format_version')}")
     if not events_path.exists():
         return fail(manifest, "missing events.jsonl")
@@ -296,7 +321,7 @@ def verify_vector(path: Path, rekor_pubkey: bytes | None = None) -> dict:
         return loaded
     manifest, events, receipts, witness = loaded
 
-    if manifest.get("bundle_format_version") != SUPPORTED_VERSION:
+    if manifest.get("bundle_format_version") not in SUPPORTED_VERSIONS:
         return fail(manifest, f"unsupported bundle_format_version: {manifest.get('bundle_format_version')}")
 
     events_hash = hashlib.sha256(events).hexdigest()

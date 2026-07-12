@@ -47,9 +47,22 @@ ARCHIVE_FILENAME = "audit-bundle.tar.zst"
 BUNDLE_MEMBERS = ("manifest.json", "events.jsonl", "receipts.cbor")
 
 
+# Domain-separation tag prefixed to the v2 signing input; mirrors
+# corecrux_receipts::audit_bundle_v1::AUDIT_BUNDLE_SIGNING_DOMAIN and the verifier.
+AUDIT_BUNDLE_SIGNING_DOMAIN_V2 = b"cuecrux.audit_bundle.v2\x00"
+
+
 def canonical_manifest_bytes(manifest: dict) -> bytes:
+    """Ed25519 sign/verify input selected by ``bundle_format_version`` (v1: field
+    order, no tag; v2: domain tag + recursively key-sorted compact JSON). Kept
+    identical to ``tools/verify_audit_bundle_v1.py``."""
     signing_manifest = dict(manifest)
     signing_manifest["signature_b64"] = ""
+    if manifest.get("bundle_format_version") == 2:
+        canonical = json.dumps(
+            signing_manifest, separators=(",", ":"), ensure_ascii=False, sort_keys=True
+        ).encode("utf-8")
+        return AUDIT_BUNDLE_SIGNING_DOMAIN_V2 + canonical
     return json.dumps(signing_manifest, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
@@ -57,15 +70,15 @@ def write_json(path: Path, obj: dict) -> None:
     path.write_text(json.dumps(obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-def build_manifest(events: bytes, receipts: bytes) -> dict:
+def build_manifest(events: bytes, receipts: bytes, *, version: int = 1, bundle_id: str = "vector-valid-minimal") -> dict:
     private_key = ed25519.Ed25519PrivateKey.from_private_bytes(bytes([0x42]) * 32)
     public_key = private_key.public_key().public_bytes(
         encoding=serialization.Encoding.Raw,
         format=serialization.PublicFormat.Raw,
     )
     manifest = {
-        "bundle_format_version": 1,
-        "bundle_id": "vector-valid-minimal",
+        "bundle_format_version": version,
+        "bundle_id": bundle_id,
         "since": "2026-06-14T00:00:00Z",
         "until": "2026-06-14T00:01:00Z",
         "generated_at": "2026-06-14T00:01:00Z",
@@ -159,6 +172,17 @@ def main() -> None:
         events=events.replace(b"shipped", b"tampered"),
         receipts=receipts,
         expected={"ok": False, "failure_reason_contains": "events.jsonl sha256 mismatch"},
+    )
+
+    # v2 (current format): domain-separated, key-canonical signing input. Proves
+    # the independent verifier accepts the format the daemon now emits.
+    manifest_v2 = build_manifest(events, receipts, version=2, bundle_id="vector-valid-minimal-v2")
+    write_vector(
+        VECTORS / "valid-minimal-v2",
+        manifest=manifest_v2,
+        events=events,
+        receipts=receipts,
+        expected={"ok": True},
     )
 
 
