@@ -971,11 +971,52 @@ pub async fn serve(
         .http2_keepalive_interval(ingress.grpc_keepalive_interval())
         .http2_keepalive_timeout(ingress.grpc_keepalive_timeout())
         .max_concurrent_streams(ingress.grpc_max_streams())
+        // Recover handler panics into a clean gRPC INTERNAL status, mirroring
+        // the HTTP path's `CatchPanicLayer` (`http::health::handle_panic`).
+        // Without this a panic in a tonic handler aborts the task and drops the
+        // connection instead of returning a status.
+        .layer(tower_http::catch_panic::CatchPanicLayer::custom(handle_grpc_panic))
         .add_service(CoreCruxDataPlaneV1Server::new(svc))
         .add_service(CoreCruxExportV1Server::new(export_svc))
         .serve_with_shutdown(addr, shutdown)
         .await?;
     Ok(())
+}
+
+/// Map a recovered gRPC handler panic to a clean gRPC `INTERNAL` status.
+///
+/// The HTTP path recovers handler panics via `CatchPanicLayer`
+/// (`http::health::handle_panic`); the gRPC path had no equivalent, so
+/// a panic in a tonic handler aborted the task and dropped the connection
+/// instead of returning a status. This produces a trailers-only response
+/// carrying `grpc-status: 13` (INTERNAL), which tonic clients surface as
+/// `Status::internal`. Both the daemon and the connection survive.
+fn handle_grpc_panic(
+    err: Box<dyn std::any::Any + Send + 'static>,
+) -> axum::http::Response<http_body_util::Empty<axum::body::Bytes>> {
+    let msg = if let Some(s) = err.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = err.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else {
+        "unknown panic".to_string()
+    };
+    tracing::error!(panic = %msg, "gRPC handler panicked");
+
+    let mut response = axum::http::Response::new(http_body_util::Empty::new());
+    *response.status_mut() = axum::http::StatusCode::OK;
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/grpc"),
+    );
+    // gRPC status code 13 = INTERNAL.
+    headers.insert("grpc-status", axum::http::HeaderValue::from_static("13"));
+    headers.insert(
+        "grpc-message",
+        axum::http::HeaderValue::from_static("internal error (panic recovered)"),
+    );
+    response
 }
 
 #[derive(Debug, Default)]
@@ -3746,5 +3787,39 @@ mod tests {
         // When unset, defaults to "Bearer replication:write"
         assert!(val.starts_with("Bearer "), "expected Bearer prefix, got: {val}");
         assert!(val.contains("replication:write"));
+    }
+
+    /// H2: a panic inside a gRPC handler is caught by the `CatchPanicLayer` and
+    /// mapped to a trailers-only `grpc-status: 13` (INTERNAL) response instead
+    /// of unwinding the task and dropping the connection.
+    #[tokio::test]
+    async fn grpc_handler_panic_maps_to_internal_status() {
+        use tower::{Layer as _, Service as _, ServiceExt as _};
+
+        async fn panicking_handler(
+            _req: axum::http::Request<http_body_util::Empty<axum::body::Bytes>>,
+        ) -> Result<axum::http::Response<http_body_util::Full<axum::body::Bytes>>, std::convert::Infallible> {
+            panic!("boom in gRPC handler");
+        }
+
+        let mut svc = tower_http::catch_panic::CatchPanicLayer::custom(super::handle_grpc_panic)
+            .layer(tower::service_fn(panicking_handler));
+
+        let response = svc
+            .ready()
+            .await
+            .expect("service ready")
+            .call(axum::http::Request::new(http_body_util::Empty::new()))
+            .await
+            .expect("catch-panic must recover the unwind into a response");
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("grpc-status")
+                .expect("grpc-status header present"),
+            "13",
+        );
     }
 }
