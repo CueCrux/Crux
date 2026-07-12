@@ -8,23 +8,50 @@
 use serde::{Deserialize, Serialize};
 
 /// Sync token issued by VaultCrux.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncToken {
     pub token: String,
     pub scopes: Vec<String>,
     pub expires_at: String,
 }
 
-/// Parse a VaultCrux auth response JSON into a `SyncToken`.
-pub fn parse_auth_response(resp: &serde_json::Value) -> SyncToken {
-    SyncToken {
-        token: resp["sync_token"].as_str().unwrap_or("").to_string(),
+/// Failure parsing a VaultCrux auth response. A missing or non-string
+/// `sync_token` / `expires_at` fails fast here at the auth boundary rather than
+/// coercing to an empty string and constructing a token that fails confusingly
+/// downstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncAuthError {
+    /// `sync_token` was absent or not a JSON string.
+    MissingSyncToken,
+    /// `expires_at` was absent or not a JSON string.
+    MissingExpiresAt,
+}
+
+impl std::fmt::Display for SyncAuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingSyncToken => f.write_str("auth response missing a string `sync_token`"),
+            Self::MissingExpiresAt => f.write_str("auth response missing a string `expires_at`"),
+        }
+    }
+}
+
+impl std::error::Error for SyncAuthError {}
+
+/// Parse a VaultCrux auth response JSON into a `SyncToken`, failing fast when
+/// the token or its expiry are absent or non-string. `scopes` stays lenient
+/// (absent/null → empty).
+pub fn parse_auth_response(resp: &serde_json::Value) -> Result<SyncToken, SyncAuthError> {
+    let token = resp["sync_token"].as_str().ok_or(SyncAuthError::MissingSyncToken)?;
+    let expires_at = resp["expires_at"].as_str().ok_or(SyncAuthError::MissingExpiresAt)?;
+    Ok(SyncToken {
+        token: token.to_string(),
         scopes: resp["scopes"]
             .as_array()
             .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
             .unwrap_or_default(),
-        expires_at: resp["expires_at"].as_str().unwrap_or("").to_string(),
-    }
+        expires_at: expires_at.to_string(),
+    })
 }
 
 /// Authenticate with VaultCrux to obtain a sync token.
@@ -37,7 +64,7 @@ pub fn authenticate(endpoint: &str, email: &str) -> Result<SyncToken, Box<dyn st
         .into_body()
         .read_json()?;
 
-    Ok(parse_auth_response(&resp))
+    parse_auth_response(&resp).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -109,7 +136,7 @@ mod tests {
             "expires_at": "2027-04-03T00:00:00Z"
         });
 
-        let token = parse_auth_response(&resp);
+        let token = parse_auth_response(&resp).unwrap();
         assert_eq!(token.token, "vcx_cs_abc123");
         assert_eq!(token.scopes.len(), 3);
         assert_eq!(token.scopes[0], "community:sync");
@@ -117,13 +144,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_auth_response_missing_fields() {
+    fn parse_auth_response_missing_sync_token_fails_fast() {
+        // A missing `sync_token` now errors at the auth boundary instead of
+        // yielding an empty-token client.
         let resp = serde_json::json!({});
+        assert_eq!(parse_auth_response(&resp), Err(SyncAuthError::MissingSyncToken));
+    }
 
-        let token = parse_auth_response(&resp);
-        assert_eq!(token.token, "");
-        assert!(token.scopes.is_empty());
-        assert_eq!(token.expires_at, "");
+    #[test]
+    fn parse_auth_response_missing_expires_at_fails_fast() {
+        let resp = serde_json::json!({ "sync_token": "tok" });
+        assert_eq!(parse_auth_response(&resp), Err(SyncAuthError::MissingExpiresAt));
     }
 
     #[test]
@@ -134,7 +165,7 @@ mod tests {
             "expires_at": "2027-01-01T00:00:00Z"
         });
 
-        let token = parse_auth_response(&resp);
+        let token = parse_auth_response(&resp).unwrap();
         assert_eq!(token.token, "tok");
         assert!(token.scopes.is_empty());
     }
