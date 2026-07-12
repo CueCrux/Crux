@@ -1030,6 +1030,7 @@ fn resolve_routes_from_cache(cache: &AstScanCache, index: &Index, scan: &mut Wor
                 method: route.method.clone(),
                 path: route.path.clone(),
                 handler_fn: route.handler_fn.clone(),
+                framework: None,
                 handler_file: resolved_file,
                 handler_line: resolved_line,
                 source_file: route.source_file.clone(),
