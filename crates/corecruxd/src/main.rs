@@ -678,10 +678,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         control_path: control_path.clone(),
         action_max_pending: config.operator_action_max_pending,
         action_timeout_secs: config.operator_action_timeout_secs,
+        repo_scan_max_pending: 32,
         scrub_scope: config.scrub_scope.clone(),
         scrub_mode: config.scrub_mode.clone(),
         scrub_sample_rate: config.scrub_sample_rate,
         admin_actions: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
+        repo_scan_jobs: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
+        repo_scan_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
         corruption_detected,
         capacity,
         admin_force_seal_enabled: config.admin_force_seal_enabled,
@@ -785,6 +788,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Wire the shared event bus into both stores so mutations emit SSE events.
     state.fact_store.write().await.set_event_bus(state.event_bus.clone());
     state.session_store.write().await.set_event_bus(state.event_bus.clone());
+    {
+        let mut store = state.fact_store.write().await;
+        match crate::repo_registry::fail_incomplete_scans(
+            &mut store,
+            "daemon restarted before scan completed",
+            crate::ops_events::now_unix_ms(),
+        ) {
+            Ok(count) if count > 0 => {
+                tracing::warn!(count, "repo-scan-incomplete-jobs-marked-failed-after-restart");
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(?err, "repo-scan-restart-recovery-failed");
+            }
+        }
+    }
     if let Some(watcher) = &state.repo_watch {
         watcher.start_existing_repos().await;
     }
@@ -4255,10 +4274,13 @@ mod tests {
             control_path: tmp.path().join("CONTROL.json"),
             action_max_pending: 10,
             action_timeout_secs: 60,
+            repo_scan_max_pending: 32,
             scrub_scope: "recent".to_string(),
             scrub_mode: "sampled".to_string(),
             scrub_sample_rate: 0.25,
             admin_actions: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::BTreeMap::new())),
+            repo_scan_jobs: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::BTreeMap::new())),
+            repo_scan_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             corruption_detected: std::sync::Arc::new(tokio::sync::RwLock::new(false)),
             capacity: std::sync::Arc::new(tokio::sync::RwLock::new(crate::http::CapacityState::default())),
             admin_force_seal_enabled: false,

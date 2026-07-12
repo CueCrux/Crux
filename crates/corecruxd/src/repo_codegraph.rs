@@ -1296,6 +1296,10 @@ mod tests {
                 enabled: true,
                 added_at_unix_ms: 1,
                 last_scan_id: None,
+                scan_status: None,
+                scan_error: None,
+                scan_queued_at_unix_ms: None,
+                scan_finished_at_unix_ms: None,
             },
         )
         .expect("store repo");
