@@ -426,10 +426,13 @@ pub(super) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         control_path,
         action_max_pending,
         action_timeout_secs: 5,
+        repo_scan_max_pending: 32,
         scrub_scope: "recent".to_string(),
         scrub_mode: "sampled".to_string(),
         scrub_sample_rate: 0.25,
         admin_actions: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
+        repo_scan_jobs: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
+        repo_scan_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
         corruption_detected: Arc::new(RwLock::new(false)),
         admin_force_seal_enabled: false,
         local_ingest_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
@@ -11275,6 +11278,40 @@ fn tiny_rust_repo() -> tempfile::TempDir {
     dir
 }
 
+async fn repo_scan_job_json(state: AppState, tenant_id: &str, job_id: &str) -> (StatusCode, serde_json::Value) {
+    let resp = super::repos::get_repo_scan_job(
+        State(state),
+        dev_scope_headers("admin:read"),
+        Path(job_id.to_string()),
+        Query(super::repos::RepoTenantQuery {
+            tenant_id: tenant_id.to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    let status = resp.status();
+    let body = json_body(resp).await;
+    (status, body)
+}
+
+async fn wait_for_repo_scan_job(
+    state: AppState,
+    tenant_id: &str,
+    job_id: &str,
+    expected_status: &str,
+) -> serde_json::Value {
+    for _ in 0..100 {
+        let (status, body) = repo_scan_job_json(state.clone(), tenant_id, job_id).await;
+        assert_eq!(status, StatusCode::OK);
+        if body["status"] == expected_status {
+            return body;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let (_, body) = repo_scan_job_json(state, tenant_id, job_id).await;
+    panic!("repo scan job {job_id} did not reach {expected_status}; last body: {body}");
+}
+
 #[tokio::test]
 async fn repo_add_local_path_persists_registration_and_scan() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
@@ -11290,6 +11327,7 @@ async fn repo_add_local_path_persists_registration_and_scan() {
             root_path: Some(root_path),
             clone_url: None,
             languages: vec!["rust".to_string()],
+            scan_mode: None,
         }),
     )
     .await
@@ -11310,6 +11348,220 @@ async fn repo_add_local_path_persists_registration_and_scan() {
 }
 
 #[tokio::test]
+async fn repo_add_local_path_async_persists_registration_scan_and_codemap() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let repo = tiny_rust_workspace();
+    let root_path = repo.path().to_string_lossy().to_string();
+
+    let resp = super::repos::post_repo(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        Json(super::repos::CreateRepoBody {
+            repo_id: Some("async-fixture".to_string()),
+            tenant_id: "tenant-a".to_string(),
+            root_path: Some(root_path),
+            clone_url: None,
+            languages: vec!["rust".to_string()],
+            scan_mode: Some("async".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body = json_body(resp).await;
+    let job_id = body["job_id"].as_str().expect("job id").to_string();
+    assert_eq!(body["note"], "scan queued");
+    assert_eq!(body["repo"]["scan_status"], "pending");
+    assert!(body["repo"]["last_scan_id"].is_null());
+
+    let job = wait_for_repo_scan_job(state.clone(), "tenant-a", &job_id, "succeeded").await;
+    assert!(job["started_at_unix_ms"].as_u64().is_some());
+    assert!(job["finished_at_unix_ms"].as_u64().is_some());
+
+    let scan_id = {
+        let store = state.fact_store.read().await;
+        let persisted = crate::repo_registry::get_repo(&store, "tenant-a", "async-fixture").expect("repo persisted");
+        assert_eq!(persisted.scan_status.as_deref(), Some("done"));
+        assert!(persisted.scan_error.is_none());
+        persisted.last_scan_id.expect("last scan id")
+    };
+
+    let summary = super::repos::get_repo_codemap(
+        State(state),
+        Path("async-fixture".to_string()),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::CodemapQuery {
+            tenant_id: "tenant-a".to_string(),
+            format: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(summary.status(), StatusCode::OK);
+    let summary_body = json_body(summary).await;
+    assert_eq!(summary_body["scan_id"], scan_id);
+    assert!(summary_body["stats"]["symbol_count"].as_u64().unwrap_or(0) >= 1);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn repo_add_local_path_async_failure_keeps_registered_repo() {
+    let mut hook = super::repos::RepoScanTestHook::default();
+    hook.errors_by_repo.insert(
+        "async-fail".to_string(),
+        "forced repo scan failure for test".to_string(),
+    );
+    let _guard = super::repos::RepoScanTestHookGuard::install(hook);
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let repo = tiny_rust_repo();
+    let root_path = repo.path().to_string_lossy().to_string();
+
+    let resp = super::repos::post_repo(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        Json(super::repos::CreateRepoBody {
+            repo_id: Some("async-fail".to_string()),
+            tenant_id: "tenant-a".to_string(),
+            root_path: Some(root_path),
+            clone_url: None,
+            languages: vec!["rust".to_string()],
+            scan_mode: Some("async".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body = json_body(resp).await;
+    let job_id = body["job_id"].as_str().expect("job id").to_string();
+
+    let job = wait_for_repo_scan_job(state.clone(), "tenant-a", &job_id, "failed").await;
+    assert_eq!(job["error"], "forced repo scan failure for test");
+
+    let store = state.fact_store.read().await;
+    let persisted = crate::repo_registry::get_repo(&store, "tenant-a", "async-fail").expect("repo persisted");
+    assert_eq!(persisted.scan_status.as_deref(), Some("failed"));
+    assert_eq!(
+        persisted.scan_error.as_deref(),
+        Some("forced repo scan failure for test")
+    );
+    assert!(persisted.last_scan_id.is_none());
+}
+
+#[tokio::test]
+async fn repo_add_local_path_async_backpressure_rejects_when_queue_full() {
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    state.repo_scan_max_pending = 1;
+    let permit = state
+        .repo_scan_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("hold repo scan semaphore");
+    let repo_a = tiny_rust_repo();
+    let repo_b = tiny_rust_repo();
+
+    let first = super::repos::post_repo(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        Json(super::repos::CreateRepoBody {
+            repo_id: Some("queued-a".to_string()),
+            tenant_id: "tenant-a".to_string(),
+            root_path: Some(repo_a.path().to_string_lossy().to_string()),
+            clone_url: None,
+            languages: vec!["rust".to_string()],
+            scan_mode: Some("async".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+
+    let second = super::repos::post_repo(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        Json(super::repos::CreateRepoBody {
+            repo_id: Some("queued-b".to_string()),
+            tenant_id: "tenant-a".to_string(),
+            root_path: Some(repo_b.path().to_string_lossy().to_string()),
+            clone_url: None,
+            languages: vec!["rust".to_string()],
+            scan_mode: Some("async".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    {
+        let store = state.fact_store.read().await;
+        assert!(crate::repo_registry::get_repo(&store, "tenant-a", "queued-a").is_some());
+        assert!(crate::repo_registry::get_repo(&store, "tenant-a", "queued-b").is_none());
+    }
+    drop(permit);
+    let first_body = json_body(first).await;
+    let job_id = first_body["job_id"].as_str().expect("job id").to_string();
+    let _ = wait_for_repo_scan_job(state, "tenant-a", &job_id, "succeeded").await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn repo_add_local_path_async_jobs_are_serialized() {
+    let mut hook = super::repos::RepoScanTestHook::default();
+    hook.delay_ms_by_repo.insert("slow-scan".to_string(), 1_000);
+    let _guard = super::repos::RepoScanTestHookGuard::install(hook);
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let slow_repo = tiny_rust_repo();
+    let fast_repo = tiny_rust_repo();
+
+    let slow = super::repos::post_repo(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        Json(super::repos::CreateRepoBody {
+            repo_id: Some("slow-scan".to_string()),
+            tenant_id: "tenant-a".to_string(),
+            root_path: Some(slow_repo.path().to_string_lossy().to_string()),
+            clone_url: None,
+            languages: vec!["rust".to_string()],
+            scan_mode: Some("async".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(slow.status(), StatusCode::ACCEPTED);
+    let slow_body = json_body(slow).await;
+    let slow_job_id = slow_body["job_id"].as_str().expect("slow job id").to_string();
+    let _ = wait_for_repo_scan_job(state.clone(), "tenant-a", &slow_job_id, "running").await;
+
+    let fast = super::repos::post_repo(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        Json(super::repos::CreateRepoBody {
+            repo_id: Some("fast-scan".to_string()),
+            tenant_id: "tenant-a".to_string(),
+            root_path: Some(fast_repo.path().to_string_lossy().to_string()),
+            clone_url: None,
+            languages: vec!["rust".to_string()],
+            scan_mode: Some("async".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(fast.status(), StatusCode::ACCEPTED);
+    let fast_body = json_body(fast).await;
+    let fast_job_id = fast_body["job_id"].as_str().expect("fast job id").to_string();
+
+    let (_, queued_fast) = repo_scan_job_json(state.clone(), "tenant-a", &fast_job_id).await;
+    assert_eq!(queued_fast["status"], "submitted");
+    assert!(queued_fast["started_at_unix_ms"].is_null());
+
+    let slow_done = wait_for_repo_scan_job(state.clone(), "tenant-a", &slow_job_id, "succeeded").await;
+    let fast_done = wait_for_repo_scan_job(state, "tenant-a", &fast_job_id, "succeeded").await;
+    let slow_finished = slow_done["finished_at_unix_ms"].as_u64().expect("slow finished");
+    let fast_started = fast_done["started_at_unix_ms"].as_u64().expect("fast started");
+    assert!(fast_started >= slow_finished);
+}
+
+#[tokio::test]
 async fn repo_list_get_and_delete_are_tenant_scoped() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     for (tenant, repo_id) in [("tenant-a", "alpha"), ("tenant-b", "bravo")] {
@@ -11322,6 +11574,7 @@ async fn repo_list_get_and_delete_are_tenant_scoped() {
                 root_path: None,
                 clone_url: Some(format!("https://example.invalid/{repo_id}.git")),
                 languages: vec!["rust".to_string()],
+                scan_mode: None,
             }),
         )
         .await
@@ -11445,6 +11698,7 @@ async fn register_local_repo(state: &AppState, tenant_id: &str, repo_id: &str, r
             root_path: Some(root_path),
             clone_url: None,
             languages: vec!["rust".to_string()],
+            scan_mode: None,
         }),
     )
     .await
@@ -11517,6 +11771,7 @@ async fn repo_codemap_serves_summary_and_full() {
             root_path: Some(root_path),
             clone_url: None,
             languages: vec!["rust".to_string()],
+            scan_mode: None,
         }),
     )
     .await
@@ -11602,6 +11857,7 @@ async fn repo_codemap_summary_counts_external_deps_by_ecosystem() {
             root_path: Some(root_path),
             clone_url: None,
             languages: vec!["rust".to_string()],
+            scan_mode: None,
         }),
     )
     .await
@@ -11646,6 +11902,7 @@ async fn repo_codemap_summary_omits_external_deps_when_flag_off() {
             root_path: Some(root_path),
             clone_url: None,
             languages: vec!["rust".to_string()],
+            scan_mode: None,
         }),
     )
     .await
@@ -11917,6 +12174,7 @@ async fn repo_codemap_not_found_paths_are_distinct() {
             root_path: None,
             clone_url: Some("https://example.invalid/deferred.git".to_string()),
             languages: vec![],
+            scan_mode: None,
         }),
     )
     .await

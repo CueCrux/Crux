@@ -24,6 +24,40 @@ pub(super) struct CreateRepoBody {
     pub clone_url: Option<String>,
     #[serde(default)]
     pub languages: Vec<String>,
+    #[serde(default)]
+    pub scan_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanMode {
+    Inline,
+    Async,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RepoScanJobStatus {
+    Submitted,
+    Running,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct RepoScanJob {
+    pub(crate) job_id: String,
+    pub(crate) tenant_id: String,
+    pub(crate) repo_id: String,
+    pub(crate) status: RepoScanJobStatus,
+    pub(crate) submitted_at_unix_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) started_at_unix_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) finished_at_unix_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<String>,
+    #[serde(skip)]
+    pub(crate) root_path: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -50,6 +84,15 @@ fn now_unix_ms() -> u64 {
 
 fn clean_opt(value: Option<String>) -> Option<String> {
     value.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+fn parse_scan_mode(value: Option<&str>) -> Result<ScanMode, String> {
+    match value.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(ScanMode::Inline),
+        Some("inline") => Ok(ScanMode::Inline),
+        Some("async") => Ok(ScanMode::Async),
+        Some(other) => Err(format!("unknown scan_mode '{other}'; expected 'inline' or 'async'")),
+    }
 }
 
 fn body_repo_id(body: &CreateRepoBody, root_path: Option<&str>, clone_url: Option<&str>) -> String {
@@ -92,17 +135,20 @@ pub(super) async fn post_repo(
             "exactly one of root_path or clone_url is required",
         );
     }
+    let scan_mode = match parse_scan_mode(body.scan_mode.as_deref()) {
+        Ok(mode) => mode,
+        Err(err) => return problem_response(StatusCode::BAD_REQUEST, err),
+    };
+    if scan_mode == ScanMode::Async && clone_url.is_some() {
+        return problem_response(StatusCode::BAD_REQUEST, "scan_mode async requires root_path");
+    }
 
     let repo_id = body_repo_id(&body, root_path.as_deref(), clone_url.as_deref());
     if let Err(err) = crate::repo_registry::validate_repo_id(&repo_id) {
         return map_registry_error(err);
     }
 
-    let mut note = None;
-    let mut scan_json = None;
-    let mut scan_for_codegraph = None;
-    let mut last_scan_id = None;
-    if let Some(path) = root_path.as_deref() {
+    let root_path_buf = if let Some(path) = root_path.as_deref() {
         let path_buf = PathBuf::from(path);
         if !path_buf.is_absolute() {
             return problem_response(StatusCode::BAD_REQUEST, "root_path must be an absolute path");
@@ -110,6 +156,23 @@ pub(super) async fn post_repo(
         if !path_buf.exists() {
             return problem_response(StatusCode::NOT_FOUND, format!("root_path '{path}' not found"));
         }
+        Some(path_buf)
+    } else {
+        None
+    };
+
+    if scan_mode == ScanMode::Async {
+        let Some(path_buf) = root_path_buf else {
+            return problem_response(StatusCode::BAD_REQUEST, "scan_mode async requires root_path");
+        };
+        return enqueue_repo_scan(state, tenant_id, repo_id, root_path, body.languages, path_buf).await;
+    }
+
+    let mut note = None;
+    let mut scan_json = None;
+    let mut scan_for_codegraph = None;
+    let mut last_scan_id = None;
+    if let Some(path_buf) = root_path_buf {
         let scan_result =
             tokio::task::spawn_blocking(move || crate::workspace_scan_polyglot::run_repo_scan_at(&path_buf))
                 .await
@@ -140,6 +203,10 @@ pub(super) async fn post_repo(
         enabled: true,
         added_at_unix_ms: now_unix_ms(),
         last_scan_id,
+        scan_status: None,
+        scan_error: None,
+        scan_queued_at_unix_ms: None,
+        scan_finished_at_unix_ms: None,
     };
 
     let mut store = state.fact_store.write().await;
@@ -175,6 +242,332 @@ pub(super) async fn post_repo(
         .into_response()
 }
 
+async fn enqueue_repo_scan(
+    state: AppState,
+    tenant_id: String,
+    repo_id: String,
+    root_path: Option<String>,
+    languages: Vec<String>,
+    path_buf: PathBuf,
+) -> axum::response::Response {
+    // Async scans intentionally register first. If the background scan fails,
+    // the repo remains registered with scan_status="failed"; the default inline
+    // path keeps its historical all-or-nothing behavior.
+    let queued_at = now_unix_ms();
+    let registration = crate::repo_registry::RepoRegistration {
+        repo_id: repo_id.clone(),
+        tenant_id: tenant_id.clone(),
+        root_path,
+        clone_url: None,
+        languages,
+        enabled: true,
+        added_at_unix_ms: queued_at,
+        last_scan_id: None,
+        scan_status: Some("pending".to_string()),
+        scan_error: None,
+        scan_queued_at_unix_ms: Some(queued_at),
+        scan_finished_at_unix_ms: None,
+    };
+    let job_id = format!("repo_scan_{}", uuid::Uuid::new_v4());
+    let job = RepoScanJob {
+        job_id: job_id.clone(),
+        tenant_id: tenant_id.clone(),
+        repo_id: repo_id.clone(),
+        status: RepoScanJobStatus::Submitted,
+        submitted_at_unix_ms: queued_at,
+        started_at_unix_ms: None,
+        finished_at_unix_ms: None,
+        error: None,
+        root_path: path_buf.display().to_string(),
+    };
+
+    let mut jobs = state.repo_scan_jobs.write().await;
+    let pending_count = jobs
+        .values()
+        .filter(|r| matches!(r.status, RepoScanJobStatus::Submitted | RepoScanJobStatus::Running))
+        .count();
+    if pending_count >= state.repo_scan_max_pending {
+        return problem_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "repo scan queue is full (pending={pending_count}, limit={})",
+                state.repo_scan_max_pending
+            ),
+        );
+    }
+
+    {
+        let mut store = state.fact_store.write().await;
+        if let Err(err) = crate::repo_registry::create_repo(&mut store, &registration) {
+            return map_registry_error(err);
+        }
+    }
+
+    jobs.insert(job_id.clone(), job.clone());
+    gc_finished_repo_scan_jobs(&mut jobs, state.repo_scan_max_pending);
+    drop(jobs);
+
+    let task_state = state.clone();
+    let task_job_id = job_id.clone();
+    tokio::spawn(async move {
+        run_repo_scan_job(task_state, task_job_id).await;
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "repo": registration,
+            "job_id": job_id,
+            "note": "scan queued",
+        })),
+    )
+        .into_response()
+}
+
+fn gc_finished_repo_scan_jobs(jobs: &mut BTreeMap<String, RepoScanJob>, max_pending: usize) {
+    let retain_limit = max_pending.saturating_mul(8).max(256);
+    if jobs.len() <= retain_limit {
+        return;
+    }
+    let mut finished: Vec<(String, u64)> = jobs
+        .iter()
+        .filter_map(|(id, rec)| {
+            if matches!(rec.status, RepoScanJobStatus::Succeeded | RepoScanJobStatus::Failed) {
+                Some((id.clone(), rec.finished_at_unix_ms.unwrap_or(0)))
+            } else {
+                None
+            }
+        })
+        .collect();
+    finished.sort_by_key(|(_, ts)| *ts);
+    let to_remove = jobs.len().saturating_sub(retain_limit);
+    for (id, _) in finished.into_iter().take(to_remove) {
+        jobs.remove(&id);
+    }
+}
+
+async fn run_repo_scan_job(state: AppState, job_id: String) {
+    let permit = match state.repo_scan_semaphore.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(_) => {
+            finish_repo_scan_job(
+                &state,
+                &job_id,
+                RepoScanJobStatus::Failed,
+                Some("repo scan queue shut down".to_string()),
+            )
+            .await;
+            return;
+        }
+    };
+    let started_at = now_unix_ms();
+    let (tenant_id, repo_id, root_path) = {
+        let mut jobs = state.repo_scan_jobs.write().await;
+        let Some(rec) = jobs.get_mut(&job_id) else {
+            drop(permit);
+            return;
+        };
+        if rec.status != RepoScanJobStatus::Submitted {
+            drop(permit);
+            return;
+        }
+        rec.status = RepoScanJobStatus::Running;
+        rec.started_at_unix_ms = Some(started_at);
+        (rec.tenant_id.clone(), rec.repo_id.clone(), rec.root_path.clone())
+    };
+
+    if let Err(err) = update_repo_scan_registration(&state, &tenant_id, &repo_id, |registration| {
+        registration.scan_status = Some("running".to_string());
+        registration.scan_error = None;
+    })
+    .await
+    {
+        tracing::warn!(
+            ?err,
+            tenant_id,
+            repo_id,
+            job_id,
+            "repo-scan-running-status-update-failed"
+        );
+    }
+
+    #[cfg(test)]
+    if let Some(hook) = repo_scan_test_hook(&repo_id) {
+        if let Some(delay_ms) = hook.delay_ms {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+        if let Some(error) = hook.error {
+            finish_failed_repo_scan(&state, &job_id, &tenant_id, &repo_id, error).await;
+            drop(permit);
+            return;
+        }
+    }
+
+    let scan_result = run_repo_scan_for_job(&root_path).await;
+    match scan_result {
+        Ok(scan) => {
+            let scan_id = scan.scan_id.clone();
+            let finished_at = now_unix_ms();
+            match persist_successful_repo_scan(&state, &tenant_id, &repo_id, scan, finished_at).await {
+                Ok(()) => {
+                    tracing::info!(tenant_id, repo_id, job_id, scan_id, "repo-scan-job-succeeded");
+                    finish_repo_scan_job(&state, &job_id, RepoScanJobStatus::Succeeded, None).await;
+                }
+                Err(err) => {
+                    finish_failed_repo_scan(&state, &job_id, &tenant_id, &repo_id, err).await;
+                }
+            }
+        }
+        Err(err) => {
+            finish_failed_repo_scan(&state, &job_id, &tenant_id, &repo_id, err).await;
+        }
+    }
+    drop(permit);
+}
+
+async fn run_repo_scan_for_job(root_path: &str) -> Result<crate::workspace_scan::WorkspaceScan, String> {
+    let path_buf = PathBuf::from(root_path);
+    let scan_result = tokio::task::spawn_blocking(move || crate::workspace_scan_polyglot::run_repo_scan_at(&path_buf))
+        .await
+        .map_err(|err| format!("scan task failed: {err}"))?;
+    scan_result.map_err(|err| format!("repo scan failed: {err}"))
+}
+
+async fn persist_successful_repo_scan(
+    state: &AppState,
+    tenant_id: &str,
+    repo_id: &str,
+    scan: crate::workspace_scan::WorkspaceScan,
+    finished_at_unix_ms: u64,
+) -> Result<(), String> {
+    let scan_id = scan.scan_id.clone();
+    let scan_json = serde_json::to_string(&scan).map_err(|err| format!("scan encode failed: {err}"))?;
+    let registration = {
+        let mut store = state.fact_store.write().await;
+        crate::repo_registry::store_scan_json(&mut store, tenant_id, repo_id, scan_json);
+        let Some(mut registration) = crate::repo_registry::get_repo(&store, tenant_id, repo_id) else {
+            return Err("repo disappeared before scan completed".to_string());
+        };
+        registration.last_scan_id = Some(scan_id);
+        registration.scan_status = Some("done".to_string());
+        registration.scan_error = None;
+        registration.scan_finished_at_unix_ms = Some(finished_at_unix_ms);
+        crate::repo_registry::store_repo(&mut store, &registration).map_err(|err| err.to_string())?;
+        registration
+    };
+    if let Err(err) = crate::repo_codegraph::maybe_emit_codegraph_edges(
+        &state.fact_store,
+        &state.projection_state,
+        &state.data_dir,
+        tenant_id,
+        repo_id,
+        &scan,
+    )
+    .await
+    {
+        tracing::warn!(?err, tenant_id, repo_id, "repo-scan-codegraph-edge-emission-failed");
+    }
+    if let Some(watcher) = &state.repo_watch {
+        watcher.start_repo(registration).await;
+    }
+    Ok(())
+}
+
+async fn finish_failed_repo_scan(state: &AppState, job_id: &str, tenant_id: &str, repo_id: &str, error: String) {
+    let finished_at = now_unix_ms();
+    if let Err(err) = update_repo_scan_registration(state, tenant_id, repo_id, |registration| {
+        registration.scan_status = Some("failed".to_string());
+        registration.scan_error = Some(error.clone());
+        registration.scan_finished_at_unix_ms = Some(finished_at);
+    })
+    .await
+    {
+        tracing::warn!(
+            ?err,
+            tenant_id,
+            repo_id,
+            job_id,
+            "repo-scan-failed-status-update-failed"
+        );
+    }
+    finish_repo_scan_job(state, job_id, RepoScanJobStatus::Failed, Some(error)).await;
+}
+
+async fn finish_repo_scan_job(state: &AppState, job_id: &str, status: RepoScanJobStatus, error: Option<String>) {
+    let finished_at = now_unix_ms();
+    let mut jobs = state.repo_scan_jobs.write().await;
+    if let Some(rec) = jobs.get_mut(job_id) {
+        rec.status = status;
+        rec.finished_at_unix_ms = Some(finished_at);
+        rec.error = error;
+    }
+}
+
+async fn update_repo_scan_registration<F>(
+    state: &AppState,
+    tenant_id: &str,
+    repo_id: &str,
+    update: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&mut crate::repo_registry::RepoRegistration),
+{
+    let mut store = state.fact_store.write().await;
+    let Some(mut registration) = crate::repo_registry::get_repo(&store, tenant_id, repo_id) else {
+        return Err("repo not found".to_string());
+    };
+    update(&mut registration);
+    crate::repo_registry::store_repo(&mut store, &registration).map_err(|err| err.to_string())
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+pub(super) struct RepoScanTestHook {
+    pub(super) delay_ms_by_repo: BTreeMap<String, u64>,
+    pub(super) errors_by_repo: BTreeMap<String, String>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct RepoScanTestOutcome {
+    delay_ms: Option<u64>,
+    error: Option<String>,
+}
+
+#[cfg(test)]
+static REPO_SCAN_TEST_HOOK: std::sync::Mutex<Option<RepoScanTestHook>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(super) struct RepoScanTestHookGuard;
+
+#[cfg(test)]
+impl RepoScanTestHookGuard {
+    pub(super) fn install(hook: RepoScanTestHook) -> Self {
+        if let Ok(mut slot) = REPO_SCAN_TEST_HOOK.lock() {
+            *slot = Some(hook);
+        }
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for RepoScanTestHookGuard {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = REPO_SCAN_TEST_HOOK.lock() {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn repo_scan_test_hook(repo_id: &str) -> Option<RepoScanTestOutcome> {
+    let hook = REPO_SCAN_TEST_HOOK.lock().ok().and_then(|slot| slot.clone())?;
+    Some(RepoScanTestOutcome {
+        delay_ms: hook.delay_ms_by_repo.get(repo_id).copied(),
+        error: hook.errors_by_repo.get(repo_id).cloned(),
+    })
+}
+
 pub(super) async fn get_repos(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -188,6 +581,23 @@ pub(super) async fn get_repos(
     let repos = crate::repo_registry::list_repos(&store, &tenant_id);
     drop(store);
     (StatusCode::OK, Json(serde_json::json!({ "repos": repos }))).into_response()
+}
+
+pub(super) async fn get_repo_scan_job(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    Query(query): Query<RepoTenantQuery>,
+) -> impl IntoResponse {
+    let tenant_id = query.tenant_id.trim().to_string();
+    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &tenant_id) {
+        return problem.into_response();
+    }
+    let jobs = state.repo_scan_jobs.read().await;
+    match jobs.get(&job_id).filter(|job| job.tenant_id == tenant_id) {
+        Some(job) => (StatusCode::OK, Json(job.clone())).into_response(),
+        None => problem_response(StatusCode::NOT_FOUND, format!("repo scan job '{job_id}' not found")),
+    }
 }
 
 /// `GET /v1/repos/dependents` — daemon-owned package reverse-dependency

@@ -26,6 +26,14 @@ pub struct RepoRegistration {
     pub added_at_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_scan_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_queued_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_finished_at_unix_ms: Option<u64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -190,6 +198,28 @@ pub fn create_repo(store: &mut FactStore, registration: &RepoRegistration) -> Re
     store_repo(store, registration)
 }
 
+pub fn fail_incomplete_scans(
+    store: &mut FactStore,
+    error: &str,
+    finished_at_unix_ms: u64,
+) -> Result<usize, RepoRegistryError> {
+    let mut updated = 0usize;
+    for mut registration in list_all_repos(store) {
+        let Some(status) = registration.scan_status.as_deref() else {
+            continue;
+        };
+        if !matches!(status, "pending" | "running") {
+            continue;
+        }
+        registration.scan_status = Some("failed".to_string());
+        registration.scan_error = Some(error.to_string());
+        registration.scan_finished_at_unix_ms = Some(finished_at_unix_ms);
+        store_repo(store, &registration)?;
+        updated = updated.saturating_add(1);
+    }
+    Ok(updated)
+}
+
 /// Read back the latest persisted scan JSON for a registered repo — the
 /// mirror of [`store_scan_json`]. `None` when the repo was registered by
 /// `clone_url` only (scan deferred) or has never been scanned.
@@ -243,4 +273,80 @@ pub fn delete_repo(store: &mut FactStore, tenant_id: &str, repo_id: &str) -> Res
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registration(repo_id: &str, status: Option<&str>) -> RepoRegistration {
+        RepoRegistration {
+            repo_id: repo_id.to_string(),
+            tenant_id: "tenant-a".to_string(),
+            root_path: Some("/tmp/repo".to_string()),
+            clone_url: None,
+            languages: vec!["rust".to_string()],
+            enabled: true,
+            added_at_unix_ms: 1,
+            last_scan_id: None,
+            scan_status: status.map(str::to_string),
+            scan_error: None,
+            scan_queued_at_unix_ms: Some(2),
+            scan_finished_at_unix_ms: None,
+        }
+    }
+
+    #[test]
+    fn old_registration_json_decodes_without_scan_fields() {
+        let json = r#"{
+            "repo_id":"fixture",
+            "tenant_id":"tenant-a",
+            "root_path":"/tmp/fixture",
+            "languages":["rust"],
+            "enabled":true,
+            "added_at_unix_ms":1,
+            "last_scan_id":"ws_1"
+        }"#;
+        let decoded: RepoRegistration = serde_json::from_str(json).expect("decode old registration");
+        assert_eq!(decoded.repo_id, "fixture");
+        assert_eq!(decoded.last_scan_id.as_deref(), Some("ws_1"));
+        assert!(decoded.scan_status.is_none());
+        assert!(decoded.scan_error.is_none());
+        assert!(decoded.scan_queued_at_unix_ms.is_none());
+        assert!(decoded.scan_finished_at_unix_ms.is_none());
+    }
+
+    #[test]
+    fn fail_incomplete_scans_marks_pending_and_running_failed() {
+        let mut store = FactStore::new();
+        for reg in [
+            registration("pending", Some("pending")),
+            registration("running", Some("running")),
+            registration("done", Some("done")),
+            registration("legacy", None),
+        ] {
+            store_repo(&mut store, &reg).expect("store repo");
+        }
+
+        let count = fail_incomplete_scans(&mut store, "daemon restarted before scan completed", 99)
+            .expect("recover incomplete scans");
+        assert_eq!(count, 2);
+
+        let pending = get_repo(&store, "tenant-a", "pending").expect("pending repo");
+        assert_eq!(pending.scan_status.as_deref(), Some("failed"));
+        assert_eq!(
+            pending.scan_error.as_deref(),
+            Some("daemon restarted before scan completed")
+        );
+        assert_eq!(pending.scan_finished_at_unix_ms, Some(99));
+
+        let running = get_repo(&store, "tenant-a", "running").expect("running repo");
+        assert_eq!(running.scan_status.as_deref(), Some("failed"));
+
+        let done = get_repo(&store, "tenant-a", "done").expect("done repo");
+        assert_eq!(done.scan_status.as_deref(), Some("done"));
+
+        let legacy = get_repo(&store, "tenant-a", "legacy").expect("legacy repo");
+        assert!(legacy.scan_status.is_none());
+    }
 }
