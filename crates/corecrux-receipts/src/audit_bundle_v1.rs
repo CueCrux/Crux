@@ -3,7 +3,7 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
-//! BYO Audit Trail bundle (agent-ux-11) — `bundle_format_version: 1`.
+//! BYO Audit Trail bundle (agent-ux-11) — `bundle_format_version: 2`.
 //!
 //! Bundle layout (tar.zst):
 //!
@@ -24,8 +24,10 @@
 //!   `SigningKey` type used by `corecruxd::grpc::load_write_confirmation_signing_key`
 //!   (env var `CORECRUXD_WRITE_CONFIRMATION_SIGNING_KEY_B64`). Master plan
 //!   explicitly forbids introducing a new key class for Wave 2.
-//! - **Schema-versioned**: `bundle_format_version: 1`. The verifier
-//!   rejects anything else.
+//! - **Schema-versioned**: `bundle_format_version: 2` — the v2 signing input is
+//!   a domain-separated (`AUDIT_BUNDLE_SIGNING_DOMAIN`), key-canonical encoding
+//!   of the manifest. The verifier still accepts legacy v1 bundles
+//!   (struct-order JSON, no domain tag); it rejects any other version.
 
 use std::io::{Read, Write};
 
@@ -39,8 +41,30 @@ use crate::witness_v1::{
     verify_rekor_checkpoint, verify_witness_binding_v1, verify_witness_proof_v1, WitnessLogPublicKeyV1, WitnessProofV1,
 };
 
-/// Schema version. Bumping this requires a verifier upgrade.
-pub const BUNDLE_FORMAT_VERSION: u32 = 1;
+/// Legacy bundle format (v1): the signing input was struct-declaration-order
+/// JSON with no domain-separation tag. Still accepted by the verifier so
+/// bundles exported before the v2 canonicalisation continue to verify.
+pub const BUNDLE_FORMAT_V1: u32 = 1;
+
+/// Current schema/signing version. v2 signs a domain-separated, key-canonical
+/// encoding of the manifest (see [`AuditBundleManifestV1::canonical_signing_bytes`]).
+/// New bundles are always emitted at this version; bumping it requires a
+/// verifier upgrade.
+pub const BUNDLE_FORMAT_VERSION: u32 = 2;
+
+/// Domain-separation tag prefixed to the v2 signing input, mirroring the
+/// `crypto_shred_v1` convention (`b"cuecrux.crypto_shred..."`). Binding the
+/// signature to this per-type, per-version label prevents a signature over an
+/// audit-bundle manifest from ever verifying as a different receipt type, and
+/// vice-versa.
+pub const AUDIT_BUNDLE_SIGNING_DOMAIN: &[u8] = b"cuecrux.audit_bundle.v2\0";
+
+/// Hard cap on the decompressed size the verifier will materialise from a
+/// `tar.zst` bundle (256 MiB). A bundle that expands beyond this is rejected
+/// before the oversized buffer is allocated, bounding the zstd
+/// decompression-bomb / OOM surface if the offline verifier is ever fed
+/// caller-supplied bytes (e.g. a future "upload a bundle to verify" endpoint).
+pub const MAX_DECOMPRESSED_BUNDLE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// File-name constants — third-party tooling can `tar -tf` and look for these.
 pub const MANIFEST_FILENAME: &str = "manifest.json";
@@ -67,8 +91,12 @@ pub enum AuditBundleError {
     Signature(#[from] ed25519_dalek::SignatureError),
     #[error("base64 decode error: {0}")]
     Base64(#[from] base64::DecodeError),
-    #[error("unsupported bundle_format_version: {0} (verifier supports {BUNDLE_FORMAT_VERSION})")]
+    #[error(
+        "unsupported bundle_format_version: {0} (verifier supports {BUNDLE_FORMAT_V1} and {BUNDLE_FORMAT_VERSION})"
+    )]
     UnsupportedVersion(u32),
+    #[error("decompressed bundle exceeds the {MAX_DECOMPRESSED_BUNDLE_BYTES}-byte cap")]
+    DecompressedTooLarge,
     #[error("manifest missing required field: {0}")]
     MissingField(&'static str),
     #[error("content hash mismatch for {file}: expected {expected}, got {actual}")]
@@ -172,20 +200,60 @@ pub struct AuditBundleManifestV1 {
 }
 
 impl AuditBundleManifestV1 {
-    /// Canonical bytes used as the Ed25519 sign/verify input. We strip
-    /// `signature_b64` (set to empty string) and emit deterministic JSON
-    /// via `serde_json::to_vec` against a `BTreeMap`-flavoured tree so
-    /// field order matches across signer/verifier.
+    /// Bytes used as the Ed25519 sign/verify input, with `signature_b64`
+    /// cleared. The encoding is selected by `bundle_format_version` so old and
+    /// new bundles both verify:
+    ///
+    /// - **v2+** (current): `AUDIT_BUNDLE_SIGNING_DOMAIN` followed by a
+    ///   key-canonical JSON encoding of the manifest (`canonical_json_bytes`).
+    ///   The domain tag gives per-type/per-version separation (no cross-type
+    ///   replay); the recursive key sort makes the signed bytes independent of
+    ///   struct field order — necessary because `serde_json` is built with
+    ///   `preserve_order`, so a plain serialize is declaration-ordered, not
+    ///   canonical.
+    /// - **v1** (legacy): plain `serde_json::to_vec`, struct-declaration order,
+    ///   no domain tag — reproduced verbatim so bundles signed before v2 still
+    ///   verify.
     pub fn canonical_signing_bytes(&self) -> Result<Vec<u8>, AuditBundleError> {
         let mut clone = self.clone();
         clone.signature_b64.clear();
-        // serde_json emits fields in struct-declaration order which is
-        // deterministic AND human-debuggable. We don't need a full
-        // BTreeMap canonicalisation here — the struct is the single
-        // source of truth for field order across signer + verifier.
-        let bytes = serde_json::to_vec(&clone)?;
-        Ok(bytes)
+        if self.bundle_format_version >= BUNDLE_FORMAT_VERSION {
+            let value = serde_json::to_value(&clone)?;
+            let canonical = canonical_json_bytes(&value)?;
+            let mut bytes = Vec::with_capacity(AUDIT_BUNDLE_SIGNING_DOMAIN.len() + canonical.len());
+            bytes.extend_from_slice(AUDIT_BUNDLE_SIGNING_DOMAIN);
+            bytes.extend_from_slice(&canonical);
+            Ok(bytes)
+        } else {
+            Ok(serde_json::to_vec(&clone)?)
+        }
     }
+}
+
+/// Serialise a JSON value with object keys sorted recursively, so the bytes are
+/// independent of field/insertion order. `serde_json` runs with `preserve_order`
+/// workspace-wide (its `Map` is insertion-ordered), so this explicit sort is
+/// what makes the v2 signing input canonical. Array order is preserved (it is
+/// semantically significant). This is sufficient canonicalisation for a single
+/// Rust signer + verifier; it is intentionally not a full RFC 8785 JCS (number
+/// and string re-canonicalisation) as no cross-implementation verifier exists.
+fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, serde_json::Error> {
+    fn canonicalise(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(b.0));
+                let mut sorted = serde_json::Map::new();
+                for (key, child) in entries {
+                    sorted.insert(key.clone(), canonicalise(child));
+                }
+                serde_json::Value::Object(sorted)
+            }
+            serde_json::Value::Array(items) => serde_json::Value::Array(items.iter().map(canonicalise).collect()),
+            other => other.clone(),
+        }
+    }
+    serde_json::to_vec(&canonicalise(value))
 }
 
 /// Inputs to `build_bundle_v1`. Caller provides the filtered + sorted
@@ -337,6 +405,24 @@ pub struct VerifyReportV1 {
     pub failure_reason: Option<String>,
 }
 
+/// Streaming zstd decode with a hard cap on the decompressed size. Reads
+/// through a `zstd::Decoder` into a buffer that can grow to at most
+/// `max_bytes + 1`, then rejects if the stream is over the cap — so a
+/// decompression bomb can never allocate an unbounded buffer. Replaces the
+/// unbounded `zstd::stream::decode_all`.
+fn decode_all_bounded(compressed: &[u8], max_bytes: u64) -> Result<Vec<u8>, AuditBundleError> {
+    use std::io::Read as _;
+    // `take(max_bytes + 1)`: if that last byte is readable, the decompressed
+    // stream is over the cap. `saturating_add` guards the (theoretical) overflow.
+    let mut limited = zstd::stream::read::Decoder::new(compressed)?.take(max_bytes.saturating_add(1));
+    let mut decoded = Vec::new();
+    limited.read_to_end(&mut decoded)?;
+    if decoded.len() as u64 > max_bytes {
+        return Err(AuditBundleError::DecompressedTooLarge);
+    }
+    Ok(decoded)
+}
+
 /// Verify a `tar.zst` bundle from raw bytes. OFFLINE — does not touch the
 /// network or any daemon. The verifier:
 ///
@@ -363,7 +449,7 @@ pub fn verify_bundle_with_trust_roots_v1(
     tar_zst_bytes: &[u8],
     log_key: Option<&WitnessLogPublicKeyV1>,
 ) -> Result<VerifyReportV1, AuditBundleError> {
-    let decoded = zstd::stream::decode_all(tar_zst_bytes)?;
+    let decoded = decode_all_bounded(tar_zst_bytes, MAX_DECOMPRESSED_BUNDLE_BYTES)?;
     let mut archive = tar::Archive::new(decoded.as_slice());
 
     let mut manifest_bytes: Option<Vec<u8>> = None;
@@ -391,7 +477,7 @@ pub fn verify_bundle_with_trust_roots_v1(
     let receipts = receipts_bytes.ok_or(AuditBundleError::MissingMember(RECEIPTS_FILENAME))?;
 
     let manifest: AuditBundleManifestV1 = serde_json::from_slice(&manifest_raw)?;
-    if manifest.bundle_format_version != BUNDLE_FORMAT_VERSION {
+    if !matches!(manifest.bundle_format_version, BUNDLE_FORMAT_V1 | BUNDLE_FORMAT_VERSION) {
         return Err(AuditBundleError::UnsupportedVersion(manifest.bundle_format_version));
     }
 
@@ -854,6 +940,128 @@ mod tests {
                 Err(_) => {}
                 Ok(report) => panic!("truncation to {cut} bytes verified: {report:?}"),
             }
+        }
+    }
+
+    // ---- H1: canonicalisation + domain separation (audit 2026-07-11) ----
+
+    #[test]
+    fn v2_signing_bytes_are_domain_tagged() {
+        let built = build_bundle_v1(sample_input()).expect("build");
+        assert_eq!(built.manifest.bundle_format_version, BUNDLE_FORMAT_VERSION);
+        let signed = built.manifest.canonical_signing_bytes().expect("signing bytes");
+        assert!(
+            signed.starts_with(AUDIT_BUNDLE_SIGNING_DOMAIN),
+            "v2 signing input must start with the domain tag"
+        );
+    }
+
+    #[test]
+    fn v1_signing_bytes_stay_legacy_struct_order() {
+        // A v1 manifest must reproduce the exact pre-v2 bytes (plain to_vec, no
+        // domain tag) so bundles signed before v2 still verify (the committed
+        // golden vector is v1 — see `packaged_valid_minimal_vector_verifies`).
+        let mut manifest = build_bundle_v1(sample_input()).expect("build").manifest;
+        manifest.bundle_format_version = BUNDLE_FORMAT_V1;
+        let mut expected = manifest.clone();
+        expected.signature_b64.clear();
+        let legacy = serde_json::to_vec(&expected).expect("legacy bytes");
+        let actual = manifest.canonical_signing_bytes().expect("bytes");
+        assert_eq!(actual, legacy);
+        assert!(
+            !actual.starts_with(AUDIT_BUNDLE_SIGNING_DOMAIN),
+            "v1 signing input must NOT be domain-tagged"
+        );
+    }
+
+    #[test]
+    fn canonical_json_bytes_is_field_order_invariant() {
+        // preserve_order is on workspace-wide, so these two values differ in key
+        // insertion order; the canonical encoding must erase that difference.
+        let a = serde_json::json!({"b": 2, "a": 1, "nested": {"y": true, "x": [3, 2, 1]}});
+        let b = serde_json::json!({"nested": {"x": [3, 2, 1], "y": true}, "a": 1, "b": 2});
+        assert_eq!(
+            canonical_json_bytes(&a).expect("a"),
+            canonical_json_bytes(&b).expect("b")
+        );
+        // Array order remains significant.
+        let c = serde_json::json!({"x": [1, 2, 3]});
+        let d = serde_json::json!({"x": [3, 2, 1]});
+        assert_ne!(
+            canonical_json_bytes(&c).expect("c"),
+            canonical_json_bytes(&d).expect("d")
+        );
+    }
+
+    #[test]
+    fn v2_signature_is_domain_bound_rejecting_cross_type_replay() {
+        use ed25519_dalek::Verifier as _;
+        let built = build_bundle_v1(sample_input()).expect("build");
+        let vk = sample_signing_key().verifying_key();
+
+        let sig_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&built.manifest.signature_b64)
+            .expect("sig b64");
+        let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into().expect("64-byte sig");
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+
+        // Sanity: verifies over the real domain-tagged signing bytes.
+        let signed = built.manifest.canonical_signing_bytes().expect("signed");
+        assert!(vk.verify(&signed, &sig).is_ok());
+
+        // The same manifest canonical bytes WITHOUT the domain tag (what a naive
+        // verifier or a different receipt type would present) must not verify.
+        let mut unsigned = built.manifest.clone();
+        unsigned.signature_b64.clear();
+        let no_domain = canonical_json_bytes(&serde_json::to_value(&unsigned).expect("value")).expect("canon");
+        assert!(
+            vk.verify(&no_domain, &sig).is_err(),
+            "must not verify without the domain tag"
+        );
+
+        // Presented under a foreign receipt-type domain, it must also fail.
+        let mut foreign = b"cuecrux.some_other_receipt.v1\0".to_vec();
+        foreign.extend_from_slice(&no_domain);
+        assert!(
+            vk.verify(&foreign, &sig).is_err(),
+            "must not verify under a foreign domain"
+        );
+    }
+
+    // ---- L1: bounded decompression (audit 2026-07-11) ----
+
+    #[test]
+    fn decode_all_bounded_rejects_oversized_stream() {
+        // 1 MiB of zeros: tiny compressed, 1 MiB decompressed.
+        let raw = vec![0u8; 1024 * 1024];
+        let compressed = zstd::stream::encode_all(raw.as_slice(), 3).expect("compress");
+        // Cap below the decompressed size → rejected without materialising it all.
+        let err = decode_all_bounded(&compressed, 64 * 1024).unwrap_err();
+        assert!(matches!(err, AuditBundleError::DecompressedTooLarge));
+        // Cap above the size → decodes fully.
+        let decoded = decode_all_bounded(&compressed, 4 * 1024 * 1024).expect("decode");
+        assert_eq!(decoded.len(), raw.len());
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn canonical_json_bytes_invariant_under_key_permutation(
+            entries in proptest::collection::hash_map("[a-z]{1,8}", proptest::prelude::any::<i64>(), 1..12)
+        ) {
+            let mut keys: Vec<String> = entries.keys().cloned().collect();
+            keys.sort();
+            let mut forward = serde_json::Map::new();
+            for k in &keys {
+                forward.insert(k.clone(), serde_json::json!(entries[k]));
+            }
+            let mut reversed = serde_json::Map::new();
+            for k in keys.iter().rev() {
+                reversed.insert(k.clone(), serde_json::json!(entries[k]));
+            }
+            proptest::prop_assert_eq!(
+                canonical_json_bytes(&serde_json::Value::Object(forward)).unwrap(),
+                canonical_json_bytes(&serde_json::Value::Object(reversed)).unwrap()
+            );
         }
     }
 

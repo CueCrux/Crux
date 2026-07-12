@@ -578,7 +578,8 @@ mod tests {
                 use std::io::Read as _;
                 entry.read_to_string(&mut s).unwrap();
                 let m: AuditBundleManifestV1 = serde_json::from_str(&s).unwrap();
-                assert_eq!(m.bundle_format_version, 1);
+                // v2: domain-separated, key-canonical signing input (audit H1).
+                assert_eq!(m.bundle_format_version, corecrux_receipts::BUNDLE_FORMAT_VERSION);
                 assert_eq!(m.fact_count, 1);
                 assert_eq!(m.receipt_count, 1);
                 assert!(!m.signature_b64.is_empty());
