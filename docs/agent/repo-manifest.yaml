@@ -143,6 +143,7 @@ ci_assertions:
     - crux-router
     - crux-session
     - crux-mcp
+    - crux-observe
     - corecruxd
     - corecruxctl
     - crux-cost
@@ -188,6 +189,7 @@ ci_assertions:
     - handle_issue_passport
     - handle_declare_constraint
     - write_ccxv
+    - BootstrapSeeder
   tests:
     - tampering_with_signature_breaks_signature_check
     - wrong_verifying_key_fails

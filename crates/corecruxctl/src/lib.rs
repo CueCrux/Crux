@@ -11,10 +11,10 @@
 //!
 //! Subcommands cover admin tasks (segment fingerprints, projection meta,
 //! shard map, force-seal), receipt verification + export, audit packs,
-//! benchmark drivers, parity smoke tests, and replay tooling. Reads and
-//! writes through the same on-disk substrate as `corecruxd`, but never
-//! over the network — operators run it locally against a stopped or
-//! quiesced daemon.
+//! benchmark drivers, parity smoke tests, replay tooling, and daemon-facing
+//! onboarding commands. Trust tools such as replay and store verification stay
+//! offline; commands such as ingest, memory, and repo registration use the
+//! daemon's authenticated HTTP surface.
 //!
 //! See `corecruxctl --help` for the live subcommand listing.
 
@@ -36,6 +36,7 @@ pub mod fixture_digest;
 pub mod gaps;
 pub mod hooks;
 pub mod identity_cli;
+pub mod ingest;
 pub mod inspect_receipt;
 pub mod learn;
 pub mod login;
