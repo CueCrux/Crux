@@ -1,7 +1,8 @@
 # Audit Bundle v1
 
-`audit-bundle-v1` is the offline BYO audit-trail bundle format produced by
-`corecruxctl audit-export` and verified by `corecruxctl audit-verify`.
+`audit-bundle-v1` is the offline BYO audit-trail bundle family produced by
+`corecruxctl audit-export` and verified by `corecruxctl audit-verify`. New
+bundles use `bundle_format_version: 3`; the verifier retains v1 and v2 support.
 
 ## Container
 
@@ -18,9 +19,13 @@ offline: no daemon, network, or key fetch is allowed.
 
 ## Manifest
 
-`manifest.json` is signed Ed25519 over canonical JSON bytes. The signing input
-is the manifest object with `signature_b64` set to the empty string, serialized
-without extra whitespace and with fields in this order:
+`manifest.json` is signed Ed25519 over canonical JSON bytes. For v3 the signing
+input is `cuecrux.audit_bundle.v3\0` followed by the manifest object with
+`signature_b64` set to the empty string, serialized without extra whitespace
+and with object keys sorted recursively. Field declaration order is not
+load-bearing.
+
+The signed manifest fields are:
 
 1. `bundle_format_version`
 2. `bundle_id`
@@ -34,9 +39,22 @@ without extra whitespace and with fields in this order:
 10. `receipts_cbor_sha256`
 11. `signer_public_key_b64`
 12. `signer_key_id`
-13. `signature_b64`
+13. `key_class`
+14. `signature_b64`
 
-`bundle_format_version` is `1`. Verifiers must reject any other version.
+`bundle_format_version` is `3` for new bundles. `key_class` is one of
+`persistent`, `env`, or `ephemeral`: `persistent` means the issuer key was
+generated once and stored owner-only in the daemon data directory; `env` means
+the operator supplied `CORECRUXD_AUDIT_EXPORT_SIGNING_KEY_B64`; and `ephemeral`
+is the fallback only when no data directory is available. The embedded
+`signer_public_key_b64` remains the key used for offline cryptographic
+verification; `key_class` records signed provenance rather than replacing that
+check.
+
+Compatibility is fail-closed and version-specific: v1 uses declaration-order
+compact JSON without a domain tag; v2 uses recursively key-sorted compact JSON
+prefixed by `cuecrux.audit_bundle.v2\0`; and v3 uses the equivalent v3 domain
+and requires `key_class`. Verifiers reject any other version.
 
 `scope` records the export slice. Its current fields are:
 
@@ -77,7 +95,8 @@ matching `AuditEventV1` in `corecrux-receipts`:
 A conforming verifier must:
 
 1. Load exactly the required members.
-2. Reject unsupported `bundle_format_version`.
+2. Reject unsupported `bundle_format_version`, and reject v3 without a valid
+   `key_class`.
 3. Recompute SHA-256 over the raw `events.jsonl` bytes.
 4. Recompute SHA-256 over the raw `receipts.cbor` bytes.
 5. Decode `signer_public_key_b64` as a 32-byte Ed25519 public key.
@@ -89,7 +108,8 @@ A conforming verifier must:
 ## Conformance Vectors
 
 Text-friendly vector directories live under
-`crates/corecrux-receipts/vectors/audit-bundle-v1/`. Each vector contains the
+`crates/corecrux-receipts/vectors/audit-bundle-v1/`. The v1, v2, and v3 valid
+vectors preserve compatibility across all supported signing inputs. Each vector contains the
 three bundle members plus `expected.json`, and a packed `audit-bundle.tar.zst`
 holding the same three members in the production archive layout.
 

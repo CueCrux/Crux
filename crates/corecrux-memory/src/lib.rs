@@ -49,6 +49,7 @@ pub mod fact_privacy;
 pub mod fact_store;
 pub mod identity_link;
 pub mod kind_registry;
+pub mod legal_hold;
 pub mod replay;
 pub mod result_envelope;
 pub mod semantic;
@@ -67,6 +68,10 @@ pub use edge_store::{EdgeError, EdgeQuery, EdgeRecord, EdgeStore};
 pub use entity_store::{EntityError, EntityQuery, EntityRecord, EntityStore};
 pub use fact_store::{Fact, FactStore, HorizonClass};
 pub use kind_registry::{KindError, KindRegistration, KindRegistry};
+pub use legal_hold::{
+    LegalHold, LegalHoldError, LegalHoldMutation, LegalHoldReceiptKind, LegalHoldReceiptV1, PlaceLegalHold,
+    LEGAL_HOLD_ENTITY_PREFIX, LEGAL_HOLD_RECEIPT_ENTITY_PREFIX, LEGAL_HOLD_RECEIPT_SCHEMA_V1, LEGAL_HOLD_SCHEMA_V1,
+};
 pub use result_envelope::{
     result_envelope_content_hash, verify_result_envelope, CompanionArtifact, EnvelopeEdge, EnvelopeEntity,
     EnvelopeFact, EnvelopePayload, EnvelopeVerifyError, PlatformSignature, ResultEnvelope, TrustedPlatformKey,

@@ -18,9 +18,9 @@ use clap::{Parser, Subcommand};
 
 use corecruxctl::{
     admin, audit_export, audit_pack, c2pa_x509, code_chain, code_health, config_bundle, cost, deploy_audit, evidence,
-    explain, export, extensions, fixture_digest, gaps, hooks, identity_cli, inspect_receipt, learn, login, machine,
-    memory, memory_pack, observe_ingest, output_verify, parity, projections, receipts, reconcile, replay, repo,
-    session_sync, shard, shardmap, smoke, snapshot, stage1_import, start, storage, structured_log, tooling_env,
+    explain, export, extensions, fixture_digest, gaps, hooks, identity_cli, incident, inspect_receipt, learn, login,
+    machine, memory, memory_pack, observe_ingest, output_verify, parity, projections, receipts, reconcile, replay,
+    repo, session_sync, shard, shardmap, smoke, snapshot, stage1_import, start, storage, structured_log, tooling_env,
     verify_store,
 };
 
@@ -578,6 +578,13 @@ enum Command {
         command: ContextCommand,
     },
 
+    /// Governance-tier incident reconstruction against a running daemon.
+    #[command(name = "incident")]
+    Incident {
+        #[command(subcommand)]
+        command: IncidentCommand,
+    },
+
     /// BYO Audit Trail export (agent-ux-11). Builds a signed,
     /// third-party-verifiable tar.zst from the on-disk fact journal.
     /// Read-only against the data dir — safe to run while the daemon
@@ -754,6 +761,51 @@ enum ContextCommand {
         /// Emit the verification report as JSON.
         #[arg(long, default_value_t = false)]
         json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum IncidentCommand {
+    /// Create and persist a merged incident-reconstruction case.
+    Create {
+        /// Explicit daemon URL; omit to use normal daemon discovery.
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        tenant_id: String,
+        #[arg(long)]
+        title: String,
+        /// Incident window lower bound (RFC3339, inclusive).
+        #[arg(long)]
+        from: String,
+        /// Incident window upper bound (RFC3339, exclusive).
+        #[arg(long)]
+        to: String,
+        /// Session selector; repeat for multiple sessions.
+        #[arg(long)]
+        session_id: Vec<String>,
+        /// Agent/passport selector; repeat for multiple actors.
+        #[arg(long)]
+        agent_id: Vec<String>,
+        /// Entity-timeline selector; repeat for multiple entities.
+        #[arg(long)]
+        entity: Vec<String>,
+        #[arg(long)]
+        notes: Option<String>,
+    },
+    /// Show a full persisted incident case.
+    Show {
+        #[arg(long)]
+        url: Option<String>,
+        id: String,
+    },
+    /// Export a certified offline-verifiable evidence bundle.
+    Export {
+        #[arg(long)]
+        url: Option<String>,
+        id: String,
+        #[arg(long)]
+        out: PathBuf,
     },
 }
 
@@ -4090,6 +4142,21 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     Err("context verify failed".into())
                 }
             }
+        },
+        Command::Incident { command } => match command {
+            IncidentCommand::Create {
+                url,
+                tenant_id,
+                title,
+                from,
+                to,
+                session_id,
+                agent_id,
+                entity,
+                notes,
+            } => incident::run_create(url, tenant_id, title, from, to, session_id, agent_id, entity, notes),
+            IncidentCommand::Show { url, id } => incident::run_show(url, id),
+            IncidentCommand::Export { url, id, out } => incident::run_export(url, id, out),
         },
         Command::AuditExport {
             data_dir,

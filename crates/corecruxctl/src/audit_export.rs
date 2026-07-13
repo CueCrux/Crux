@@ -17,17 +17,14 @@
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use ed25519_dalek::SigningKey;
 
 use corecrux_memory::FactStore;
 use corecrux_receipts::{
-    build_bundle_v1, verify_bundle_with_trust_roots_v1, AuditBundleScopeV1, AuditEventV1, AuditReceiptRefV1,
-    BuildBundleInputV1, VerifyReportV1, WitnessLogPublicKeyV1,
+    build_bundle_v1, resolve_audit_export_signing_key, verify_bundle_with_trust_roots_v1, AuditBundleScopeV1,
+    AuditEventV1, AuditReceiptRefV1, BuildBundleInputV1, VerifyReportV1, WitnessLogPublicKeyV1,
 };
 
 const RESERVED_PREFIXES: &[&str] = &["__agent::", "__ops::", "__bootstrap__::", "__agent_session::"];
-const SIGNING_KEY_ENV: &str = "CORECRUXD_AUDIT_EXPORT_SIGNING_KEY_B64";
-const SIGNING_KEY_ID_ENV: &str = "CORECRUXD_AUDIT_EXPORT_KEY_ID";
 
 #[derive(Debug, Clone)]
 pub struct AuditExportArgs {
@@ -106,7 +103,7 @@ pub fn run_audit_export(args: AuditExportArgs) -> Result<(u64, u64, String), Box
         caller: args.caller,
     };
     let bundle_id = format!("bundle-{}", uuid::Uuid::new_v4().simple());
-    let (signing_key, signer_key_id) = load_signing_key();
+    let resolved_key = resolve_audit_export_signing_key(Some(&args.data_dir))?;
 
     let built = build_bundle_v1(BuildBundleInputV1 {
         bundle_id: bundle_id.clone(),
@@ -119,8 +116,9 @@ pub fn run_audit_export(args: AuditExportArgs) -> Result<(u64, u64, String), Box
         // corecruxctl exports facts only; witness proofs are populated by the
         // daemon-side assembler (it has the witness store / data_dir).
         witness_proofs: Vec::new(),
-        signing_key: &signing_key,
-        signer_key_id,
+        signing_key: &resolved_key.signing_key,
+        signer_key_id: resolved_key.signer_key_id,
+        key_class: resolved_key.key_class,
     })?;
 
     if let Some(parent) = args.out.parent() {
@@ -177,34 +175,6 @@ fn parse_rfc3339(value: Option<&str>) -> Result<Option<DateTime<Utc>>, Box<dyn s
 
 fn is_reserved(entity: &str) -> bool {
     RESERVED_PREFIXES.iter().any(|p| entity.starts_with(p))
-}
-
-fn load_signing_key() -> (SigningKey, String) {
-    use base64::Engine as _;
-    let key_id = std::env::var(SIGNING_KEY_ID_ENV).unwrap_or_default();
-    if let Ok(b64) = std::env::var(SIGNING_KEY_ENV) {
-        let raw = b64.trim();
-        for engine in [
-            base64::engine::general_purpose::STANDARD,
-            base64::engine::general_purpose::STANDARD_NO_PAD,
-            base64::engine::general_purpose::URL_SAFE,
-            base64::engine::general_purpose::URL_SAFE_NO_PAD,
-        ] {
-            if let Ok(decoded) = engine.decode(raw) {
-                if decoded.len() >= 32 {
-                    let mut secret = [0u8; 32];
-                    secret.copy_from_slice(&decoded[..32]);
-                    return (SigningKey::from_bytes(&secret), key_id);
-                }
-            }
-        }
-    }
-    // Ephemeral fallback — public key is pinned in the manifest so
-    // verification still works offline.
-    let mut secret = [0u8; 32];
-    use rand::Rng as _;
-    rand::rng().fill_bytes(&mut secret);
-    (SigningKey::from_bytes(&secret), key_id)
 }
 
 #[cfg(test)]

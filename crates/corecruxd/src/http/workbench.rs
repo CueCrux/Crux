@@ -1512,7 +1512,7 @@ fn replay_failure_severity(items: &[Value]) -> &'static str {
     }
 }
 
-fn timeline_events(store: &FactStore, tenant_id: &str, limit: usize) -> Vec<Value> {
+pub(super) fn timeline_events(store: &FactStore, tenant_id: &str, limit: usize) -> Vec<Value> {
     let mut events = Vec::new();
     for (prefix, kind) in [
         (

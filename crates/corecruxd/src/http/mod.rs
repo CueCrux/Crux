@@ -40,11 +40,13 @@ mod audit_verify;
 mod gpu1;
 mod health;
 mod identity_links;
+mod incidents;
 mod infra;
 pub mod ingress;
 mod integrations_github;
 mod integrations_openai;
 pub mod invocation;
+mod legal_holds;
 mod local_ingest;
 mod memory_import;
 pub(crate) mod observations;
@@ -433,6 +435,20 @@ pub(crate) fn router_with_route_auth(
             axum::routing::post(self::audit_verify::post_audit_bundle_verify).layer(
                 axum::extract::DefaultBodyLimit::max(self::audit_verify::AUDIT_BUNDLE_MAX_UPLOAD_BYTES),
             ),
+        )
+        .route("/v1/legal-holds", axum::routing::post(self::legal_holds::post_legal_hold))
+        .route(
+            "/v1/legal-holds/{id}",
+            axum::routing::delete(self::legal_holds::delete_legal_hold),
+        )
+        .route(
+            "/v1/incidents",
+            get(self::incidents::list_incidents).post(self::incidents::post_incident),
+        )
+        .route("/v1/incidents/{id}", get(self::incidents::get_incident))
+        .route(
+            "/v1/incidents/{id}/export",
+            axum::routing::post(self::incidents::export_incident),
         )
         .route("/v1/receipts/{receiptId}", get(self::receipts::get_receipt_body_v1))
         .route(

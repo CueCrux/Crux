@@ -367,7 +367,7 @@ pub(super) fn observation_file_path(data_dir: &Path, scoped_session_id: &str) ->
 /// daemon's struct field order or the DateTime format choice, because the
 /// only thing that travels through the hash is the bytes produced by this
 /// same operation.
-fn canonical_body_bytes(record: &ObservationRecordV1) -> Result<Vec<u8>, String> {
+pub(super) fn canonical_body_bytes(record: &ObservationRecordV1) -> Result<Vec<u8>, String> {
     let mut value = serde_json::to_value(record).map_err(|err| format!("to_value: {err}"))?;
     if let serde_json::Value::Object(obj) = &mut value {
         obj.remove("receipt");
@@ -505,6 +505,17 @@ fn read_observations(file_path: &Path) -> std::io::Result<Vec<ObservationRecordV
         }
     }
     Ok(out)
+}
+
+/// Read every active observation JSONL record. Incident reconstruction uses
+/// this narrow helper so it shares the observation parser and malformed-line
+/// policy without exposing filesystem layout details to another HTTP module.
+pub(super) fn read_all_observations(data_dir: &Path) -> std::io::Result<Vec<ObservationRecordV1>> {
+    let mut records = Vec::new();
+    for path in list_observation_files(data_dir)? {
+        records.extend(read_observations(&path)?);
+    }
+    Ok(records)
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────

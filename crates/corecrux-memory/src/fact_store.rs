@@ -1131,6 +1131,58 @@ impl FactStore {
     /// Returns a [`CompactionReport`] describing what was removed. No-op (returns
     /// a zeroed report) when the store has no journal (pure in-memory mode).
     pub fn compact_journal(&self) -> std::io::Result<CompactionReport> {
+        let covered = self.deleted_facts_covered_by_legal_holds();
+        if !covered.is_empty() {
+            let hold_ids: std::collections::BTreeSet<&str> = covered
+                .iter()
+                .flat_map(|(_, ids)| ids.iter().map(String::as_str))
+                .collect();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "hard erasure blocked by active legal hold(s): {}",
+                    hold_ids.into_iter().collect::<Vec<_>>().join(",")
+                ),
+            ));
+        }
+        self.compact_journal_unchecked()
+    }
+
+    /// Run compaction after the caller has durably emitted an explicit
+    /// `legal_hold_overridden` receipt for a full-tenant GDPR erasure.
+    ///
+    /// The supplied receipt must enumerate every covered deleted fact and
+    /// every blocking hold. This guarded API keeps the ordinary compaction
+    /// path fail-closed while preserving the higher-priority GDPR primitive.
+    pub fn compact_journal_after_legal_hold_override_receipt(
+        &self,
+        receipt: &crate::legal_hold::LegalHoldReceiptV1,
+    ) -> std::io::Result<CompactionReport> {
+        if receipt.kind != crate::legal_hold::LegalHoldReceiptKind::Overridden {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "legal-hold override requires a legal_hold_overridden receipt",
+            ));
+        }
+        let covered = self.deleted_facts_covered_by_legal_holds();
+        let receipt_fact_ids: std::collections::BTreeSet<&str> = receipt.fact_ids.iter().map(String::as_str).collect();
+        let receipt_hold_ids: std::collections::BTreeSet<&str> = receipt.hold_ids.iter().map(String::as_str).collect();
+        let fully_covered = covered.iter().all(|(fact_id, hold_ids)| {
+            receipt_fact_ids.contains(fact_id.as_str())
+                && hold_ids
+                    .iter()
+                    .all(|hold_id| receipt_hold_ids.contains(hold_id.as_str()))
+        });
+        if !fully_covered {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "legal_hold_overridden receipt does not cover every blocked fact and hold",
+            ));
+        }
+        self.compact_journal_unchecked()
+    }
+
+    fn compact_journal_unchecked(&self) -> std::io::Result<CompactionReport> {
         let Some(path) = self.journal_path.clone() else {
             return Ok(CompactionReport::default());
         };
@@ -1239,11 +1291,13 @@ impl FactStore {
     /// the content is not removed from disk until `compact_journal` runs, which
     /// the caller invokes explicitly.
     pub fn mark_retention_eligible(&mut self, cutoff: DateTime<Utc>) -> Vec<String> {
+        let holds = self.active_legal_holds();
         let to_delete: Vec<String> = self
             .facts
             .values()
             .filter(|f| !f.deleted && !f.private && f.stored_at < cutoff)
             .filter(|f| !f.entity.starts_with("__sync_tombstone__::"))
+            .filter(|f| !holds.iter().any(|hold| hold.covers_fact(f)))
             .map(|f| f.fact_id.clone())
             .collect();
         for fact_id in &to_delete {
