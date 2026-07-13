@@ -8,27 +8,158 @@
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
-use ed25519_dalek::{Signer as _, SigningKey};
+use ed25519_dalek::{Signer as _, SigningKey, VerifyingKey};
 use sha2::{Digest as _, Sha256};
 
 use corecrux_frame::{decode_canonical_header_bytes_v1, stream_hash_xxhash64};
 use corecrux_receipts::{
     assert_coverage_window_kind_v1, assert_external_anchor_kind_v1, assert_rfc3161_timestamp_kind_v1,
     build_crypto_shred_destroy_marker_v1, coverage_window_chain_fold_v1, coverage_window_chain_head_hex_v1,
-    coverage_window_report_canonical_json_v1, extract_linked_receipts_v1, seal_crypto_shred_payload_v1,
-    update_subject_index_v1, verify_chain_reanchor_body_v1, verify_coverage_window_body_v1,
-    verify_external_anchor_body_v1, verify_rfc3161_timestamp_token_binding_v1,
+    coverage_window_report_canonical_json_v1, encode_cose_sign1_v1, extract_linked_receipts_v1,
+    seal_crypto_shred_payload_v1, update_subject_index_v1, verify_chain_reanchor_body_v1, verify_cose_sign1,
+    verify_coverage_window_body_v1, verify_external_anchor_body_v1, verify_rfc3161_timestamp_token_binding_v1,
     verify_rfc3161_timestamp_token_strict_v1, ChainReanchorBodyInputV1, CoverageAttestationBodyInputV1,
-    CoverageWindowBodyInputV1, CoverageWindowCountsV1, CoverageWindowReportV1, CryptoShredDestroyMarkerInputV1,
-    CryptoShredSealInputV1, Ed25519KeyEntryV1, Ed25519KeyRingV1, ExternalAnchorBodyInputV1, ReceiptSigV1,
-    RedactionReceiptBodyInputV1, Rfc3161StrictValidationOptionsV1, Rfc3161StrictValidationReportV1,
-    Rfc3161TimestampBodyInputV1, CONTENT_TYPE_RECEIPT_BODY_V1, CONTENT_TYPE_RECEIPT_SIG_V1, EVT_RECEIPT_BODY_V1,
-    EVT_RECEIPT_SIG_V1, STREAM_TYPE_RECEIPT,
+    CoverageWindowBodyInputV1, CoverageWindowCountsV1, CoverageWindowReportV1, CrownReceiptV1,
+    CryptoShredDestroyMarkerInputV1, CryptoShredSealInputV1, Ed25519KeyEntryV1, Ed25519KeyRingV1,
+    ExternalAnchorBodyInputV1, ReceiptSigV1, RedactionReceiptBodyInputV1, Rfc3161StrictValidationOptionsV1,
+    Rfc3161StrictValidationReportV1, Rfc3161TimestampBodyInputV1, CONTENT_TYPE_RECEIPT_BODY_V1,
+    CONTENT_TYPE_RECEIPT_SIG_V1, EVT_RECEIPT_BODY_V1, EVT_RECEIPT_SIG_V1, STREAM_TYPE_RECEIPT,
 };
 use corecrux_segment::decode_frame_v1;
 use corecrux_storage::{AppendEventInput, ShardStorage, ShardStorageOptions};
 
 type ReceiptSignerV1 = fn(&str, &[u8], [u8; 32], &SigningKey, &str, &str) -> ReceiptSigV1;
+
+/// Deterministic throwaway signing seed used only by
+/// `receipts export-cose --gen-dev-key` and the corresponding keyless
+/// development verification
+/// path. This is the public ResearchCrux test seed, not production key
+/// material.
+const COSE_DEV_SIGNING_KEY_BYTES: [u8; 32] = [
+    0x0f, 0x1f, 0x4b, 0xcf, 0x72, 0xc9, 0xec, 0x25, 0x6b, 0x59, 0xb4, 0x5b, 0xdd, 0x94, 0x89, 0x09, 0x57, 0xee, 0x93,
+    0x2b, 0x19, 0xc4, 0xee, 0xaa, 0x15, 0xd7, 0xd8, 0xd2, 0x96, 0xb3, 0x54, 0x7b,
+];
+
+#[derive(Debug, Clone)]
+pub struct CoseExportOptionsV1<'a> {
+    pub input: &'a Path,
+    pub out: Option<&'a Path>,
+    pub key_b64: Option<&'a str>,
+    pub key_file: Option<&'a Path>,
+    pub gen_dev_key: bool,
+    pub issuer: &'a str,
+    pub kid: &'a str,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CoseExportReportV1 {
+    pub input_path: String,
+    pub output_path: String,
+    pub snap_id: String,
+    pub issuer: String,
+    pub kid: String,
+    pub bytes_written: usize,
+    pub public_key_b64: String,
+    pub development_key: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CoseVerifyReportV1 {
+    pub input_path: String,
+    pub snap_id: String,
+    pub issuer: String,
+    pub kid: String,
+    pub public_key_b64: String,
+    pub development_key: bool,
+}
+
+/// Read a daemon/ResearchCrux JSON receipt and export the exact CROWN SCITT
+/// Application Profile v0.2 COSE_Sign1 bytes.
+pub fn export_cose_file_v1(
+    opts: &CoseExportOptionsV1<'_>,
+) -> Result<CoseExportReportV1, Box<dyn std::error::Error + Send + Sync>> {
+    let source = std::fs::read(opts.input)?;
+    let source_value: serde_json::Value = serde_json::from_slice(&source)?;
+    let receipt_value = source_value.get("receipt").unwrap_or(&source_value).clone();
+    let receipt: CrownReceiptV1 = serde_json::from_value(receipt_value)?;
+    let (signing_key, development_key) = resolve_cose_signing_key_v1(opts)?;
+    let cose = encode_cose_sign1_v1(&receipt, &signing_key, opts.issuer, opts.kid.as_bytes())?;
+    let output_path = opts
+        .out
+        .map_or_else(|| opts.input.with_extension("cose"), Path::to_path_buf);
+    write_parented(&output_path, &cose)?;
+
+    Ok(CoseExportReportV1 {
+        input_path: opts.input.display().to_string(),
+        output_path: output_path.display().to_string(),
+        snap_id: receipt.snap_id,
+        issuer: opts.issuer.to_string(),
+        kid: opts.kid.to_string(),
+        bytes_written: cose.len(),
+        public_key_b64: base64::engine::general_purpose::STANDARD.encode(signing_key.verifying_key().as_bytes()),
+        development_key,
+    })
+}
+
+/// Verify a CROWN COSE_Sign1 file. Omitting `pubkey_b64` deliberately selects
+/// only the fixed, documented development key; no key is trusted from the
+/// statement itself.
+pub fn verify_cose_file_v1(
+    input: &Path,
+    pubkey_b64: Option<&str>,
+) -> Result<CoseVerifyReportV1, Box<dyn std::error::Error + Send + Sync>> {
+    let cose = std::fs::read(input)?;
+    let (verifying_key, development_key) = match pubkey_b64 {
+        Some(value) => {
+            let bytes = decode_fixed_32_b64("pubkey-b64", value.trim())?;
+            (VerifyingKey::from_bytes(&bytes)?, false)
+        }
+        None => (
+            SigningKey::from_bytes(&COSE_DEV_SIGNING_KEY_BYTES).verifying_key(),
+            true,
+        ),
+    };
+    let verified = verify_cose_sign1(&cose, &verifying_key)?;
+    let kid = String::from_utf8(verified.protected.kid)
+        .map_err(|_| "COSE protected-header kid is not valid UTF-8 as required by the CROWN profile")?;
+
+    Ok(CoseVerifyReportV1 {
+        input_path: input.display().to_string(),
+        snap_id: verified.receipt.snap_id,
+        issuer: verified.protected.issuer,
+        kid,
+        public_key_b64: base64::engine::general_purpose::STANDARD.encode(verifying_key.as_bytes()),
+        development_key,
+    })
+}
+
+fn resolve_cose_signing_key_v1(
+    opts: &CoseExportOptionsV1<'_>,
+) -> Result<(SigningKey, bool), Box<dyn std::error::Error + Send + Sync>> {
+    let source_count =
+        usize::from(opts.key_b64.is_some()) + usize::from(opts.key_file.is_some()) + usize::from(opts.gen_dev_key);
+    if source_count != 1 {
+        return Err("use exactly one of --key-b64, --key-file, or --gen-dev-key".into());
+    }
+    if let Some(value) = opts.key_b64 {
+        let bytes = decode_fixed_32_b64("key-b64", value.trim())?;
+        return Ok((SigningKey::from_bytes(&bytes), false));
+    }
+    if let Some(path) = opts.key_file {
+        let raw = std::fs::read(path)?;
+        let bytes: [u8; 32] = if raw.len() == 32 {
+            raw.as_slice()
+                .try_into()
+                .map_err(|_| "key-file must contain a raw 32-byte Ed25519 signing seed")?
+        } else {
+            let text = std::str::from_utf8(&raw)
+                .map_err(|_| "key-file must contain a raw 32-byte seed or its base64 encoding")?;
+            decode_fixed_32_b64("key-file", text.trim())?
+        };
+        return Ok((SigningKey::from_bytes(&bytes), false));
+    }
+    Ok((SigningKey::from_bytes(&COSE_DEV_SIGNING_KEY_BYTES), true))
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ReceiptsSeedReportV1 {

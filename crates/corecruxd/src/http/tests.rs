@@ -2712,14 +2712,12 @@ async fn http_session_state_with_passport_uses_mcp_session_scope() {
 
 // ── Text Search (POST /v1/query/text-search) ────────────────────
 //
-// NOTE: text-search tests rely on the CORECRUXD_QUERY_TEXT_SEARCH env var
-// which is process-global. These tests set it to "1" and must be run with
-// --test-threads=1 if the feature-gate-off test is included. The enable
-// helper sets it once at the start of each test to minimise races.
+// Text search is available by default. These serialized tests clear the
+// process-wide override before exercising that default.
 
 #[allow(deprecated)]
-fn enable_text_search() {
-    std::env::set_var("CORECRUXD_QUERY_TEXT_SEARCH", "1");
+fn use_default_text_search() {
+    std::env::remove_var("CORECRUXD_QUERY_TEXT_SEARCH");
 }
 
 fn build_test_ccxi(docs: &[&str]) -> Vec<u8> {
@@ -2737,8 +2735,9 @@ async fn load_test_index(state: &AppState, ccxi_bytes: &[u8]) {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn text_search_empty_index_returns_empty_results() {
-    enable_text_search();
+    use_default_text_search();
 
     let state = test_app_state(16);
     let body = query::TextSearchBody {
@@ -2772,8 +2771,9 @@ async fn text_search_empty_index_returns_empty_results() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn text_search_reports_local_semantic_profile_when_embeddings_configured() {
-    enable_text_search();
+    use_default_text_search();
 
     let state = test_app_state(16);
     state
@@ -2814,8 +2814,9 @@ async fn text_search_reports_local_semantic_profile_when_embeddings_configured()
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn text_search_with_rcx_router_sets_mode_header() {
-    enable_text_search();
+    use_default_text_search();
 
     let mut state = test_app_state(16);
     state.rcx_router = Some(test_rcx_router(vec!["corecrux.query.local"]));
@@ -2837,8 +2838,9 @@ async fn text_search_with_rcx_router_sets_mode_header() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn text_search_denied_by_rcx_router_returns_refusal_receipt() {
-    enable_text_search();
+    use_default_text_search();
 
     let mut state = test_app_state(16);
     state.rcx_router = Some(test_rcx_router(vec!["crux-mcp.store_fact"]));
@@ -2864,8 +2866,9 @@ async fn text_search_denied_by_rcx_router_returns_refusal_receipt() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn text_search_empty_query_returns_400() {
-    enable_text_search();
+    use_default_text_search();
 
     let state = test_app_state(16);
     let body = query::TextSearchBody {
@@ -2885,8 +2888,9 @@ async fn text_search_empty_query_returns_400() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn text_search_query_read_requires_non_empty_tenant_id() {
-    enable_text_search();
+    use_default_text_search();
 
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     let body = query::TextSearchBody {
@@ -2906,8 +2910,9 @@ async fn text_search_query_read_requires_non_empty_tenant_id() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn text_search_admin_can_explicitly_query_all_tenants() {
-    enable_text_search();
+    use_default_text_search();
 
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     let ccxi_bytes = build_test_ccxi(&["hello world test document"]);
@@ -2931,14 +2936,22 @@ async fn text_search_admin_can_explicitly_query_all_tenants() {
 }
 
 #[test]
-fn is_query_feature_disabled_by_default() {
-    // Test the feature gate logic directly without env var mutation (avoids races)
-    assert!(!is_query_feature_enabled("CORECRUXD_QUERY_TEXT_SEARCH_TEST_FAKE_ENV"));
+fn opt_in_query_features_remain_disabled_by_default() {
+    assert!(!is_query_feature_enabled("CORECRUXD_QUERY_GRAPH_EXPAND_TEST_FAKE_ENV"));
+    assert!(!is_query_feature_enabled("CORECRUXD_QUERY_TIME_RANGE_TEST_FAKE_ENV"));
+}
+
+#[test]
+#[serial_test::serial]
+fn text_search_is_enabled_by_default() {
+    use_default_text_search();
+    assert!(is_query_feature_enabled("CORECRUXD_QUERY_TEXT_SEARCH"));
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn text_search_with_index_returns_hits() {
-    enable_text_search();
+    use_default_text_search();
 
     let state = test_app_state(16);
     let ccxi_bytes = build_test_ccxi(&[
@@ -2980,8 +2993,9 @@ async fn text_search_with_index_returns_hits() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn text_search_scan_mode() {
-    enable_text_search();
+    use_default_text_search();
 
     let state = test_app_state(16);
     let ccxi_bytes = build_test_ccxi(&["hello world test document"]);
@@ -3006,8 +3020,9 @@ async fn text_search_scan_mode() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn text_search_with_token_budget() {
-    enable_text_search();
+    use_default_text_search();
 
     let state = test_app_state(16);
     let ccxi_bytes = build_test_ccxi(&[
@@ -3039,8 +3054,9 @@ async fn text_search_with_token_budget() {
 // ── Text Search Expand (POST /v1/query/text-search/expand) ──────
 
 #[tokio::test]
+#[serial_test::serial]
 async fn text_search_expand_returns_chunks() {
-    enable_text_search();
+    use_default_text_search();
 
     let state = test_app_state(16);
     let ccxi_bytes = build_test_ccxi(&["hello world test", "another document here"]);
@@ -3077,8 +3093,9 @@ async fn text_search_expand_returns_chunks() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn text_search_expand_skips_invalid_ids() {
-    enable_text_search();
+    use_default_text_search();
 
     let state = test_app_state(16);
     let ccxi_bytes = build_test_ccxi(&["only doc"]);
@@ -3112,8 +3129,9 @@ async fn text_search_expand_skips_invalid_ids() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn text_search_expand_empty_index() {
-    enable_text_search();
+    use_default_text_search();
 
     let state = test_app_state(16);
 
@@ -5619,8 +5637,9 @@ async fn runtime_knob_update_throttle_params() {
 // ── text search with min_score ─────────────────────────────────
 
 #[tokio::test]
+#[serial_test::serial]
 async fn text_search_with_min_score_filters() {
-    enable_text_search();
+    use_default_text_search();
 
     let state = test_app_state(16);
     let ccxi_bytes = build_test_ccxi(&["the rust programming language", "unrelated document about cooking"]);
@@ -6429,6 +6448,29 @@ async fn version_public_view_is_redacted() {
     assert_eq!(body["sync"]["mode"], "local_only");
     assert_eq!(body["sync"]["configured"], false);
     assert_eq!(body["sync"]["remote_url_redacted"], false);
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn version_reports_text_search_default_and_explicit_off() {
+    std::env::remove_var("CORECRUXD_QUERY_TEXT_SEARCH");
+    let resp = get_version(State(test_app_state(16))).await.into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["features"]["text_search"], true);
+
+    for value in ["0", "false"] {
+        std::env::set_var("CORECRUXD_QUERY_TEXT_SEARCH", value);
+        let resp = get_version(State(test_app_state(16))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(
+            body["features"]["text_search"], false,
+            "{value} must be reported as off"
+        );
+    }
+
+    std::env::remove_var("CORECRUXD_QUERY_TEXT_SEARCH");
 }
 
 #[serial_test::serial]

@@ -585,6 +585,7 @@ ci_assertions:
     - crux-router
     - crux-session
     - crux-mcp
+    - crux-observe
     - corecruxd
     - corecruxctl
     - crux-cost
@@ -630,6 +631,7 @@ ci_assertions:
     - handle_issue_passport
     - handle_declare_constraint
     - write_ccxv
+    - BootstrapSeeder
   tests:
     - tampering_with_signature_breaks_signature_check
     - wrong_verifying_key_fails
@@ -866,6 +868,41 @@ tests pin representative scope contracts and high-risk HTTP boundary routes.
 Receipt v1 is bytes-first: receipt bodies are stored and verified as opaque
 canonical bytes. Producers are responsible for body canonicalization; verifiers
 must not reserialize a receipt body and then verify the new bytes.
+
+## COSE_Sign1 SCITT export
+
+Crux can export a compatible CROWN retrieval receipt as a COSE_Sign1 signed
+statement conforming to the published
+[CROWN SCITT Application Profile v0.2](https://github.com/CueCrux/ResearchCrux/blob/main/protocol/scitt-compat/crown-scitt-profile.md)
+and its normative
+[CROWN receipt CDDL](https://github.com/CueCrux/ResearchCrux/blob/main/protocol/scitt-compat/crown-receipt.cddl).
+The `.cose` file is an export representation for SCITT interoperability; it does
+not replace the stored, bytes-first receipt body and detached signature described
+below.
+
+Export a receipt from JSON and verify the resulting signed statement offline:
+
+```bash
+corecruxctl receipts export-cose receipt.json \
+  --out receipt.cose \
+  --key-file ed25519.key \
+  --iss https://crux.local \
+  --kid crux-export-v1
+corecruxctl receipts verify-cose receipt.cose --pubkey-b64 <BASE64_ED25519_PUBLIC_KEY>
+```
+
+`export-cose` accepts exactly one of `--key-b64`, `--key-file`, or
+`--gen-dev-key`; `--iss` defaults to `https://crux.local`. `verify-cose` accepts
+an optional `--pubkey-b64`; omitting it selects only the fixed development key.
+The deterministic `--gen-dev-key` is public test material for fixtures and local
+interop checks. Never use it to sign production receipts.
+
+The CDDL's float16 fields must already be exactly representable as float16;
+export rejects lossy conversion rather than changing a value committed by
+`receipt-hash`. `verify-cose` verifies the COSE signature, profile structure,
+typed payload, and CWT subject binding. Legacy canonical-JSON `receipt-hash`
+recomputation and SCITT Transparency Service inclusion verification remain
+separate checks.
 
 ## Body Event
 
@@ -1924,10 +1961,11 @@ Use `update_status` like this:
 - `ahead` or `diverged`: do not ask for a blind pull; switch to a human-reviewed upgrade flow.
 - `disabled`, `unavailable`, or `error`: tell the human how to configure the git update-check inputs, but keep serving traffic locally.
 
-The onboarding playbooks are maintained in-repo at
-`crates/crux-observe/bootstrap_data/docs.json`, then seeded into the local fact
-store on startup so agents can pull them at runtime without a hosted
-dependency.
+The compact onboarding starter pack is compiled into `BootstrapSeeder` in
+`crates/crux-observe/src/bootstrap.rs` and seeded only when the local fact
+store has no existing `__bootstrap__::` facts, so agents can pull it at
+runtime without a hosted dependency. Set `CORECRUXD_SEED_BOOTSTRAP=0` to leave
+a cold store unseeded.
 
 ## First Connect Endpoint Selection
 

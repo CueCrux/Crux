@@ -18,10 +18,10 @@ use clap::{Parser, Subcommand};
 
 use corecruxctl::{
     admin, audit_export, audit_pack, c2pa_x509, code_chain, code_health, config_bundle, cost, deploy_audit, evidence,
-    explain, export, extensions, fixture_digest, gaps, hooks, identity_cli, incident, inspect_receipt, learn, login,
-    machine, memory, memory_pack, observe_ingest, output_verify, parity, projections, receipts, reconcile, replay,
-    repo, session_sync, shard, shardmap, smoke, snapshot, stage1_import, start, storage, structured_log, tooling_env,
-    verify_store,
+    explain, export, extensions, fixture_digest, gaps, hooks, identity_cli, incident, ingest, inspect_receipt, learn,
+    login, machine, memory, memory_pack, observe_ingest, output_verify, parity, projections, receipts, reconcile,
+    replay, repo, session_sync, shard, shardmap, smoke, snapshot, stage1_import, start, storage, structured_log,
+    tooling_env, verify_store,
 };
 
 #[derive(Debug, Parser)]
@@ -508,6 +508,27 @@ enum Command {
     Repo {
         #[command(subcommand)]
         command: RepoCommand,
+    },
+
+    /// Ingest a text file or directory into the daemon's local BM25 index.
+    Ingest {
+        /// File or directory to ingest recursively.
+        path: PathBuf,
+        /// Tenant that owns the ingested documents.
+        #[arg(long, default_value = "local")]
+        tenant: String,
+        /// Corpus (stream type) used for the ingested documents.
+        #[arg(long, default_value = "docs")]
+        corpus: String,
+        /// Crux Daemon HTTP base URL.
+        #[arg(long, default_value = "http://127.0.0.1:14800")]
+        daemon_url: String,
+        /// Walk and chunk files, but perform no network calls or writes.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Embed each chunk through CORECRUXD_EMBEDDING_URL before ingest.
+        #[arg(long, default_value_t = false)]
+        embed: bool,
     },
 
     /// (advanced) Interactive quickstart wizard for new users.
@@ -1794,6 +1815,41 @@ enum ParityCommand {
 
 #[derive(Debug, Subcommand)]
 enum ReceiptsCommand {
+    /// Export a CROWN JSON receipt as a CROWN SCITT Profile v0.2 COSE_Sign1 statement.
+    #[command(name = "export-cose")]
+    ExportCose {
+        /// JSON receipt path. Accepts a direct receipt or `{ "receipt": ... }` wrapper.
+        input: PathBuf,
+        /// Output path. Defaults to the input path with a `.cose` extension.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Standard-base64 32-byte Ed25519 signing seed.
+        #[arg(long, conflicts_with_all = ["key_file", "gen_dev_key"], required_unless_present_any = ["key_file", "gen_dev_key"])]
+        key_b64: Option<String>,
+        /// File containing a raw 32-byte Ed25519 seed or its standard-base64 encoding.
+        #[arg(long, conflicts_with_all = ["key_b64", "gen_dev_key"])]
+        key_file: Option<PathBuf>,
+        /// Use the documented deterministic ResearchCrux development key.
+        #[arg(long, default_value_t = false, conflicts_with_all = ["key_b64", "key_file"])]
+        gen_dev_key: bool,
+        /// Absolute issuer URI placed in the protected CWT claims.
+        #[arg(long, default_value = "https://crux.local")]
+        iss: String,
+        /// Key identifier placed in protected header label 4.
+        #[arg(long)]
+        kid: String,
+    },
+
+    /// Verify a CROWN SCITT Profile v0.2 COSE_Sign1 statement offline.
+    #[command(name = "verify-cose")]
+    VerifyCose {
+        /// COSE_Sign1 statement path.
+        input: PathBuf,
+        /// Standard-base64 32-byte Ed25519 public key. Omit only for the fixed development key.
+        #[arg(long)]
+        pubkey_b64: Option<String>,
+    },
+
     /// Seed a minimal receipt body+sig into a shard directory (offline, dev-only).
     #[command(name = "seed-minimal")]
     SeedMinimal {
@@ -3145,6 +3201,38 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
         Command::Receipts { command } => match command {
+            ReceiptsCommand::ExportCose {
+                input,
+                out,
+                key_b64,
+                key_file,
+                gen_dev_key,
+                iss,
+                kid,
+            } => {
+                let report = receipts::export_cose_file_v1(&receipts::CoseExportOptionsV1 {
+                    input: &input,
+                    out: out.as_deref(),
+                    key_b64: key_b64.as_deref(),
+                    key_file: key_file.as_deref(),
+                    gen_dev_key,
+                    issuer: &iss,
+                    kid: &kid,
+                })?;
+                println!(
+                    "COSE_Sign1 exported: snap-id={} kid={} bytes={} dev-key={} out={}",
+                    report.snap_id, report.kid, report.bytes_written, report.development_key, report.output_path
+                );
+                Ok(())
+            }
+            ReceiptsCommand::VerifyCose { input, pubkey_b64 } => {
+                let report = receipts::verify_cose_file_v1(&input, pubkey_b64.as_deref())?;
+                println!(
+                    "COSE_Sign1 verification OK: snap-id={} kid={} iss={} dev-key={} file={}",
+                    report.snap_id, report.kid, report.issuer, report.development_key, report.input_path
+                );
+                Ok(())
+            }
             ReceiptsCommand::SeedMinimal {
                 data_dir,
                 shard,
@@ -3809,6 +3897,22 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Ok(())
             }
         },
+
+        Command::Ingest {
+            path,
+            tenant,
+            corpus,
+            daemon_url,
+            dry_run,
+            embed,
+        } => ingest::run(&ingest::IngestOptions {
+            path,
+            tenant,
+            corpus,
+            daemon_url,
+            dry_run,
+            embed,
+        }),
 
         Command::Quickstart { http, non_interactive } => {
             corecruxctl::quickstart::run(&http, non_interactive)?;
@@ -4633,6 +4737,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_ingest_defaults() {
+        let cli = Cli::try_parse_from(["corecruxctl", "ingest", "./docs", "--dry-run"]).unwrap();
+        match cli.command {
+            Command::Ingest {
+                path,
+                tenant,
+                corpus,
+                daemon_url,
+                dry_run,
+                embed,
+            } => {
+                assert_eq!(path, PathBuf::from("./docs"));
+                assert_eq!(tenant, "local");
+                assert_eq!(corpus, "docs");
+                assert_eq!(daemon_url, "http://127.0.0.1:14800");
+                assert!(dry_run);
+                assert!(!embed);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_identity_candidate_commands() {
         let cli = Cli::try_parse_from([
             "corecruxctl",
@@ -5256,6 +5383,92 @@ mod tests {
                 assert!(dry_run);
                 assert_eq!(min_age_seconds, 300);
                 assert_eq!(max_delete, 0);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_receipts_export_cose() {
+        let cli = Cli::try_parse_from([
+            "corecruxctl",
+            "receipts",
+            "export-cose",
+            "/tmp/receipt.json",
+            "--out",
+            "/tmp/receipt.cose",
+            "--gen-dev-key",
+            "--kid",
+            "dev:v1",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Receipts {
+                command:
+                    ReceiptsCommand::ExportCose {
+                        input,
+                        out,
+                        key_b64,
+                        key_file,
+                        gen_dev_key,
+                        iss,
+                        kid,
+                    },
+            } => {
+                assert_eq!(input, PathBuf::from("/tmp/receipt.json"));
+                assert_eq!(out, Some(PathBuf::from("/tmp/receipt.cose")));
+                assert!(key_b64.is_none());
+                assert!(key_file.is_none());
+                assert!(gen_dev_key);
+                assert_eq!(iss, "https://crux.local");
+                assert_eq!(kid, "dev:v1");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_receipts_export_cose_requires_one_key_source() {
+        assert!(Cli::try_parse_from([
+            "corecruxctl",
+            "receipts",
+            "export-cose",
+            "/tmp/receipt.json",
+            "--kid",
+            "dev:v1",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "corecruxctl",
+            "receipts",
+            "export-cose",
+            "/tmp/receipt.json",
+            "--key-b64",
+            "AA==",
+            "--gen-dev-key",
+            "--kid",
+            "dev:v1",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn parse_receipts_verify_cose() {
+        let cli = Cli::try_parse_from([
+            "corecruxctl",
+            "receipts",
+            "verify-cose",
+            "/tmp/receipt.cose",
+            "--pubkey-b64",
+            "AA==",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Receipts {
+                command: ReceiptsCommand::VerifyCose { input, pubkey_b64 },
+            } => {
+                assert_eq!(input, PathBuf::from("/tmp/receipt.cose"));
+                assert_eq!(pubkey_b64.as_deref(), Some("AA=="));
             }
             other => panic!("unexpected command: {other:?}"),
         }

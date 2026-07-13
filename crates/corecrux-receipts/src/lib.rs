@@ -20,6 +20,7 @@ mod body_v1;
 mod c2pa_manifest_v1;
 mod candidate_digest_v1;
 mod chain_reanchor_v1;
+mod cose_sign1_v1;
 mod crypto_shred_v1;
 mod export_v1;
 mod forget_v1;
@@ -77,6 +78,12 @@ pub use chain_reanchor_v1::{
     verify_chain_signature_reanchor_hybrid_v1, verify_chain_signature_reanchor_v1, ChainSignatureReanchorBodyInputV1,
     ChainSignatureReanchorVerifyReportV1, ReanchorSigningKeyV1, ReanchorVerifyingKeyV1, ALG_ED25519_V1,
     ALG_P256_ECDSA_SHA256_V1, CHAIN_SIGNATURE_REANCHOR_BODY_SCHEMA_V1, CHAIN_SIGNATURE_REANCHOR_KIND_V1,
+};
+pub use cose_sign1_v1::{
+    decode_cose_sign1, encode_cose_sign1_v1, verify_cose_sign1, CoseProtectedHeaderV1, CoseSign1Error,
+    CrownCandidateEntryV1, CrownCounterfactualV1, CrownFusionV1, CrownKnowledgeStateCursorV1, CrownReceiptV1,
+    CrownRetrievalV1, CrownSelectionV1, CrownTimingsV1, DecodedCoseSign1V1, TextOrNullV1, VerifiedCoseSign1V1,
+    COSE_ALG_EDDSA, COSE_SIGN1_CBOR_TAG, CROWN_RECEIPT_CBOR_CONTENT_TYPE,
 };
 pub use crypto_shred_v1::{
     build_crypto_shred_destroy_marker_v1, open_crypto_shred_payload_v1, seal_crypto_shred_payload_v1,

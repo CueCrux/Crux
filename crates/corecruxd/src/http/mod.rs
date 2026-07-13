@@ -213,7 +213,8 @@ pub struct AppState {
     pub context_surface_enabled: bool,
     /// Local CPU prose-ingest door (`/v1/local/ingest`). Seals pre-formatted
     /// prose payloads into local segments served over BM25 — no GPU dataplane.
-    /// Default OFF (`CORECRUXD_LOCAL_INGEST=1`); when off, the route returns 404.
+    /// Default ON; `CORECRUXD_LOCAL_INGEST=0` or `false` disables it and makes
+    /// the route return 404.
     pub local_ingest_enabled: bool,
     /// G19 stream/context receipt wiring (`Streaming-Receipts-Spec` §5):
     /// `/v1/mediation/receipts` lifts `context_injected` /
@@ -1648,9 +1649,13 @@ struct ProjMetaQuery {
 }
 
 fn is_query_feature_enabled(env_var: &str) -> bool {
-    std::env::var(env_var)
-        .ok()
-        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    if env_var == "CORECRUXD_QUERY_TEXT_SEARCH" {
+        return crate::config::env_default_on(env_var);
+    }
+    match std::env::var(env_var) {
+        Ok(value) => value == "1" || value.eq_ignore_ascii_case("true"),
+        Err(_) => false,
+    }
 }
 
 fn hex16(bytes: &[u8; 16]) -> String {
