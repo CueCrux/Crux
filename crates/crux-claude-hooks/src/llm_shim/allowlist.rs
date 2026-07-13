@@ -19,6 +19,63 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 
+/// Pinned production cloud upstreams supported by witness mode.
+///
+/// The enum deliberately carries no arbitrary URL variant: production cloud
+/// traffic can only go to the two provider origins named here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudUpstream {
+    /// Anthropic Messages API at `https://api.anthropic.com`.
+    Anthropic,
+    /// OpenAI APIs at `https://api.openai.com`.
+    OpenAi,
+}
+
+impl CloudUpstream {
+    /// Provider label stamped into witness records.
+    pub const fn provider(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenAi => "openai",
+        }
+    }
+
+    /// Exact pinned production origin for this provider.
+    pub const fn base_url(self) -> &'static str {
+        match self {
+            Self::Anthropic => "https://api.anthropic.com",
+            Self::OpenAi => "https://api.openai.com",
+        }
+    }
+
+    /// Whether `method` and `path` are covered by the M2 witness contract.
+    pub fn witnesses(self, method: &str, path: &str) -> bool {
+        if method != "POST" {
+            return false;
+        }
+        match self {
+            Self::Anthropic => path == "/v1/messages",
+            Self::OpenAi => matches!(path, "/v1/chat/completions" | "/v1/responses"),
+        }
+    }
+}
+
+/// Validate the deliberately insecure HTTP override used by cloud-witness
+/// tests. Only a loopback literal or `localhost` base URL is accepted.
+///
+/// Production callers never use this function: [`CloudUpstream::base_url`]
+/// is the sole production origin source.
+pub fn validate_insecure_test_upstream(url: &str) -> anyhow::Result<String> {
+    let (host, _port, rest) = split_http_url(url)?;
+    let loopback = host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    anyhow::ensure!(loopback, "insecure test upstream must be loopback (got '{host}')");
+    anyhow::ensure!(
+        rest.is_empty() || rest == "/",
+        "insecure test upstream must be a base URL without a path (got trailing '{rest}')"
+    );
+    Ok(url.trim_end_matches('/').to_string())
+}
+
 /// Validate a shim upstream base URL. Returns the normalized base (no
 /// trailing slash) or an error explaining the refusal.
 pub fn validate_upstream(url: &str) -> anyhow::Result<String> {
@@ -65,12 +122,16 @@ fn split_http_url(url: &str) -> anyhow::Result<(String, Option<u16>, String)> {
             anyhow::bail!("unterminated IPv6 literal in '{url}'");
         };
         let host = &stripped[..end];
-        let port = match stripped[end + 1..].strip_prefix(':') {
-            Some(p) => Some(
-                p.parse::<u16>()
+        let suffix = &stripped[end + 1..];
+        let port = if suffix.is_empty() {
+            None
+        } else if let Some(port) = suffix.strip_prefix(':') {
+            Some(
+                port.parse::<u16>()
                     .map_err(|_| anyhow::anyhow!("invalid port in '{url}'"))?,
-            ),
-            None => None,
+            )
+        } else {
+            anyhow::bail!("invalid characters after IPv6 literal in '{url}'");
         };
         return Ok((host.to_string(), port, rest.to_string()));
     }
@@ -161,5 +222,39 @@ mod tests {
     fn local_url_allows_daemon_paths() {
         assert!(validate_local_url("http://127.0.0.1:14800/v1/context").is_ok());
         assert!(validate_local_url("http://example.com/v1/context").is_err());
+    }
+
+    #[test]
+    fn cloud_upstreams_are_exactly_pinned() {
+        assert_eq!(CloudUpstream::Anthropic.base_url(), "https://api.anthropic.com");
+        assert_eq!(CloudUpstream::OpenAi.base_url(), "https://api.openai.com");
+        assert_eq!(CloudUpstream::Anthropic.provider(), "anthropic");
+        assert_eq!(CloudUpstream::OpenAi.provider(), "openai");
+    }
+
+    #[test]
+    fn cloud_path_matrix_is_provider_specific() {
+        assert!(CloudUpstream::Anthropic.witnesses("POST", "/v1/messages"));
+        assert!(!CloudUpstream::Anthropic.witnesses("POST", "/v1/chat/completions"));
+        assert!(CloudUpstream::OpenAi.witnesses("POST", "/v1/chat/completions"));
+        assert!(CloudUpstream::OpenAi.witnesses("POST", "/v1/responses"));
+        assert!(!CloudUpstream::OpenAi.witnesses("GET", "/v1/responses"));
+    }
+
+    #[test]
+    fn insecure_test_upstream_is_loopback_http_only() {
+        assert_eq!(
+            validate_insecure_test_upstream("http://127.0.0.1:8123/").unwrap(),
+            "http://127.0.0.1:8123"
+        );
+        for url in [
+            "https://127.0.0.1:8123",
+            "http://192.168.1.4:8123",
+            "http://api.openai.com",
+            "http://127.0.0.1:8123/v1",
+            "http://[::1]suffix",
+        ] {
+            assert!(validate_insecure_test_upstream(url).is_err(), "should refuse {url}");
+        }
     }
 }

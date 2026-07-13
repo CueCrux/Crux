@@ -3371,7 +3371,9 @@ for Claude Code, Claude Desktop and Cursor: [`examples/mcp-configs/`](examples/m
 > [!NOTE]
 > Crux receipts and BLAKE3 chains prove **integrity, not confidentiality**. The daemon data
 > directory is not encrypted by Crux; use filesystem encryption (LUKS, FileVault, BitLocker)
-> when the machine, volume, or backup location is outside your trusted boundary.
+> when the machine, volume, or backup location is outside your trusted boundary. Per-event-class
+> assurance (what is captured, what can bypass capture, what a receipt does and does not prove):
+> [docs/assurance-coverage-matrix.md](docs/assurance-coverage-matrix.md).
 
 ## The console
 
@@ -3478,7 +3480,11 @@ More detail: [`docs/architecture.md`](docs/architecture.md).
 ## Passports, and how the line is drawn
 
 API keys say *something with this string called us*. A passport says *this agent, at this trust
-tier, with these grants, did this* — and the receipts prove it.
+tier, with these grants, made this call* — identity and constraint, receipted as a verifiable
+record. What a receipt proves (and what it deliberately does not) is spelled out per event class
+in the [assurance & coverage matrix](docs/assurance-coverage-matrix.md); forgery-resistant
+*evidence* of model traffic comes from the [mediated witness path](docs/llm-shim.md), whose key
+the agent never holds.
 
 1. **Bind** — the session handshake binds every connection to a passport. No anonymous writes;
    unattributed calls are operator-tagged, never silently allowed.
