@@ -665,7 +665,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "corecrux-frame"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "blake3",
  "hex",
@@ -675,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "corecrux-index"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "blake3",
  "corecrux-frame",
@@ -688,7 +688,7 @@ dependencies = [
 
 [[package]]
 name = "corecrux-memory"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "blake3",
  "chrono",
@@ -707,7 +707,7 @@ dependencies = [
 
 [[package]]
 name = "corecrux-projections"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "blake3",
  "chrono",
@@ -725,7 +725,7 @@ dependencies = [
 
 [[package]]
 name = "corecrux-proto"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "anyhow",
  "prost",
@@ -738,7 +738,7 @@ dependencies = [
 
 [[package]]
 name = "corecrux-receipts"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "base64",
  "blake3",
@@ -777,7 +777,7 @@ dependencies = [
 
 [[package]]
 name = "corecrux-retrieval"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "blake3",
  "corecrux-index",
@@ -793,7 +793,7 @@ dependencies = [
 
 [[package]]
 name = "corecrux-segment"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "blake3",
  "corecrux-frame",
@@ -808,7 +808,7 @@ dependencies = [
 
 [[package]]
 name = "corecrux-storage"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "blake3",
  "corecrux-frame",
@@ -828,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "corecrux-types"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "anyhow",
  "blake3",
@@ -839,7 +839,7 @@ dependencies = [
 
 [[package]]
 name = "corecruxctl"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "anyhow",
  "base64",
@@ -888,7 +888,7 @@ dependencies = [
 
 [[package]]
 name = "corecruxd"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "anyhow",
  "axum",
@@ -1238,7 +1238,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "crux-claude-hooks"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "anyhow",
  "base64",
@@ -1259,7 +1259,7 @@ dependencies = [
 
 [[package]]
 name = "crux-config-wizard"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "blake3",
  "chrono",
@@ -1274,7 +1274,7 @@ dependencies = [
 
 [[package]]
 name = "crux-contrib"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "blake3",
  "chrono",
@@ -1285,7 +1285,7 @@ dependencies = [
 
 [[package]]
 name = "crux-cost"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "serde",
  "serde_json",
@@ -1293,14 +1293,14 @@ dependencies = [
 
 [[package]]
 name = "crux-enterprise-shim"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "rcx-capability-token",
 ]
 
 [[package]]
 name = "crux-integration-tests"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "corecrux-proto",
  "portpicker",
@@ -1315,7 +1315,7 @@ dependencies = [
 
 [[package]]
 name = "crux-integrations"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "base64",
  "blake3",
@@ -1332,7 +1332,7 @@ dependencies = [
 
 [[package]]
 name = "crux-lens-features"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "chrono",
  "corecrux-memory",
@@ -1342,7 +1342,7 @@ dependencies = [
 
 [[package]]
 name = "crux-mcp"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "axum",
  "base64",
@@ -1386,7 +1386,7 @@ dependencies = [
 
 [[package]]
 name = "crux-observe"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "blake3",
  "chrono",
@@ -1402,7 +1402,7 @@ dependencies = [
 
 [[package]]
 name = "crux-observe-api"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "serde",
  "serde_json",
@@ -1410,7 +1410,7 @@ dependencies = [
 
 [[package]]
 name = "crux-router"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -1419,7 +1419,7 @@ dependencies = [
 
 [[package]]
 name = "crux-session"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "blake3",
  "corecrux-projections",
@@ -1434,7 +1434,7 @@ dependencies = [
 
 [[package]]
 name = "crux-sync"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "blake3",
  "chrono",
@@ -3586,7 +3586,7 @@ dependencies = [
 
 [[package]]
 name = "rcx-capability-token"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "blake3",
  "crux-session",
@@ -5073,7 +5073,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vaultcrux-local"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "blake3",
  "ed25519-dalek",
