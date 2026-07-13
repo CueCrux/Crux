@@ -20,15 +20,22 @@
 //!    ([`sign_stream_v1`]), and records it
 //!    through the signed-observation path (`append_one` — never a raw
 //!    store write, T.4).
-//! 2. **SSE abort hooks** — [`SseAbortGuard`] is attached to the daemon's
+//! 2. **Cloud-witness delivery** — the mediation route recognizes nested
+//!    `cuecrux.mediation.witness.v1` envelopes before top-level-kind dispatch,
+//!    verifies their Ed25519 signature server-side, and records the
+//!    metadata-only envelope through the same `append_one` path. This path is
+//!    implemented in `observations::handle_witness_receipt` because witness
+//!    records are already signed evidence, not stream-v1 receipt drafts.
+//! 3. **SSE abort hooks** — [`SseAbortGuard`] is attached to the daemon's
 //!    SSE surfaces; when a client disconnects mid-stream the guard's `Drop`
 //!    mints a `stream_aborted` receipt, closing the "abandoned streams
 //!    leave no trail" gap (spec §3).
 //!
 //! Gating: `CORECRUXD_STREAM_RECEIPTS=1`, default OFF. When off, the
-//! mediation route treats stream-kind drafts exactly as before this module
-//! existed (the legacy tool-mediation parse rejects them, so a shim falls
-//! back to its local JSONL spool), and the SSE guard is inert.
+//! mediation route treats stream-kind drafts and cloud-witness envelopes
+//! exactly as before this wiring existed (the legacy tool-mediation parse
+//! rejects them, so a shim falls back to its local JSONL spool), and the SSE
+//! guard is inert.
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};

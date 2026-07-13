@@ -219,7 +219,9 @@ pub struct AppState {
     /// G19 stream/context receipt wiring (`Streaming-Receipts-Spec` §5):
     /// `/v1/mediation/receipts` lifts `context_injected` /
     /// `stream_completed` / `stream_aborted` drafts into canonical signed
-    /// receipts, and SSE surfaces mint `stream_aborted` on disconnect.
+    /// receipts, verifies nested cloud-witness v1 envelopes into signed
+    /// mediation observations, and SSE surfaces mint `stream_aborted` on
+    /// disconnect.
     /// Default OFF (`CORECRUXD_STREAM_RECEIPTS=1`).
     pub stream_receipts_enabled: bool,
     /// Phase T opt-in usage-ping receipts: `/v1/mediation/receipts` accepts a

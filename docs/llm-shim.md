@@ -98,9 +98,26 @@ Witnessing is fail-soft. A key, signing, daemon-delivery, or spool failure must
 not turn into a model outage: the provider call is still forwarded and the
 shim best-effort emits a `witness_degraded` record. Receipt delivery uses the
 same `POST /v1/mediation/receipts` then JSONL-spool fallback as local mode.
-The cloud delivery queue is bounded and non-blocking; concurrent processes
-lock each JSONL append so separate local/Anthropic/OpenAI instances cannot
-interleave record framing.
+With `CORECRUXD_STREAM_RECEIPTS=1`, the daemon recognises the nested
+`{record,witness}` envelope, verifies the Ed25519 signature over recursively
+key-sorted canonical JSON of `record` against the embedded public key, and
+checks that `kid` is derived from that key. It then retains the exact
+metadata-only envelope as the payload of a daemon-signed mediation
+observation. The observation lane feeds incident reconstruction; its
+best-effort dataplane stream and entity projection are populated only when a
+dataplane is configured. A non-successful or unavailable daemon delivery still
+falls back to the local JSONL spool.
+
+The daemon check establishes that the record is internally consistent with
+the key carried by the envelope; it does **not** enrol or pin that key as a
+trusted witness identity. An operator or offline verifier must separately pin
+the expected witness identity to reject wholesale replacement of the key,
+`kid`, record, and signature. Daemon delivery also adds no nonce, sequence,
+freshness check, or replay guard, and it does not authenticate the
+caller-supplied session hint. The same-UID key-custody and bypass limits above
+therefore remain unchanged. The cloud delivery queue is bounded and
+non-blocking; concurrent processes lock each JSONL append so separate
+local/Anthropic/OpenAI instances cannot interleave record framing.
 
 ### Anthropic quickstart
 

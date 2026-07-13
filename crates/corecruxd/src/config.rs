@@ -476,8 +476,9 @@ pub struct Config {
     // return 404.
     pub local_ingest_enabled: bool,
 
-    // G19 stream/context receipt wiring (`crate::http::stream_receipts`).
-    // Default OFF.
+    // G19 stream/context receipt wiring (`crate::http::stream_receipts`) plus
+    // verified cloud-witness envelope ingestion on the shared mediation
+    // route. Default OFF (`CORECRUXD_STREAM_RECEIPTS=1`).
     pub stream_receipts_enabled: bool,
 
     // Phase T opt-in usage-ping receipts (`crate::http::stream_receipts` usage
