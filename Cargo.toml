@@ -99,7 +99,7 @@ url = "2.5.7"
 urlencoding = "2.1"
 utoipa = "5"
 uuid = "1.23.2"
-x509-cert = { version = "0.2.5", default-features = false }
+x509-cert = { version = "0.3.0", default-features = false }
 xxhash-rust = "0.8.12"
 zip = { version = "8.6.0", default-features = false }
 zstd = "0.13.3"

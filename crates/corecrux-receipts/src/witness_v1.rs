@@ -31,7 +31,7 @@ use p256::ecdsa::signature::Verifier as _;
 use p256::pkcs8::DecodePublicKey as _;
 use ring::signature;
 use sha2::{Digest as _, Sha256, Sha384, Sha512};
-use x509_cert::{der::Encode as X509Cert02Encode, Certificate as PemCertificate};
+use x509_cert::Certificate as PemCertificate;
 use x509_parser::der_parser::{
     ber::{BerObjectContent, Tag as DerTag},
     der::parse_der_sequence,
