@@ -96,7 +96,7 @@ sha2 = { workspace = true }
 # ECDSA P-256 (the daemon seal key is Ed25519), so the witness signs entries
 # with a dedicated P-256 key. Already a workspace dep via corecrux-receipts.
 p256 = { workspace = true, default-features = false, features = ["std", "ecdsa", "pem"] }
-notify = "6"
+notify = "8"
 tree-sitter = "0.26.10"
 tree-sitter-typescript = "0.23.2"
 tree-sitter-python = "0.25.0"
