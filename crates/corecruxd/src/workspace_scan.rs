@@ -78,12 +78,22 @@ pub struct ScanDiagnostics {
     /// `reason` so the human / agent surface can explain the gap.
     #[serde(default)]
     pub unresolved_routes: Vec<UnresolvedRoute>,
+    /// V3 source files deliberately omitted before parsing by a safety cap or
+    /// non-regular-file check. Empty/off remains absent from serialized scans.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub v3_skipped_files: Vec<V3SkippedFile>,
 }
 
 impl ScanDiagnostics {
     pub fn is_empty(&self) -> bool {
-        self.unresolved_routes.is_empty()
+        self.unresolved_routes.is_empty() && self.v3_skipped_files.is_empty()
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct V3SkippedFile {
+    pub rel_path: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
