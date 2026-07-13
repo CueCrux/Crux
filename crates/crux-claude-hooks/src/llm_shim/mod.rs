@@ -35,9 +35,11 @@
 //! spooled draft into a signed receipt without remapping.
 
 pub mod allowlist;
+pub mod cloud_witness;
 pub mod http;
 pub mod inject;
 pub mod receipts;
+pub mod witness;
 
 use std::io::Read;
 use std::net::TcpListener;
@@ -50,8 +52,18 @@ use anyhow::Context as _;
 /// Env flag gating the shim (default-OFF per the plan's rollout posture).
 pub const ENABLE_ENV: &str = "CRUX_LLM_SHIM";
 
+/// Env flag gating cloud witness mode independently from local injection.
+pub const CLOUD_WITNESS_ENABLE_ENV: &str = "CRUX_CLOUD_WITNESS";
+
+/// Test-only upstream override read by the CLI only when the loud insecure
+/// flag is present (or directly by unit tests compiled with `cfg(test)`).
+pub const CLOUD_WITNESS_TEST_UPSTREAM_ENV: &str = "CRUX_CLOUD_WITNESS_TEST_UPSTREAM";
+
 /// Schema tag stamped on every shim-emitted receipt record.
 pub const SHIM_RECEIPT_SCHEMA: &str = "cuecrux.mediation.shim.v1";
+
+/// Schema tag stamped on cloud witness records before signing.
+pub const WITNESS_RECEIPT_SCHEMA: &str = "cuecrux.mediation.witness.v1";
 
 /// Bundle contract version the shim injects (owned by the M1 spec).
 pub const BUNDLE_VERSION: &str = "context_bundle/v1";
@@ -74,6 +86,63 @@ pub struct ShimConfig {
     pub receipts_spool: PathBuf,
     /// Post receipt records to `POST /v1/mediation/receipts` (best-effort).
     pub daemon_receipts: bool,
+}
+
+/// Resolved cloud witness configuration (post CLI mode selection).
+#[derive(Debug, Clone)]
+pub struct CloudWitnessConfig {
+    /// Pinned cloud provider whose API origin receives traffic.
+    pub provider: allowlist::CloudUpstream,
+    /// Loopback listen address used as the SDK base URL.
+    pub listen: String,
+    /// Persistent Ed25519 witness seed path.
+    pub witness_key: PathBuf,
+    /// Shared mediation JSONL spool path.
+    pub receipts_spool: PathBuf,
+    /// Whether to attempt daemon delivery before the JSONL fallback.
+    pub daemon_receipts: bool,
+    /// Validated loopback HTTP override installed only through the loud
+    /// [`CloudWitnessConfig::with_insecure_test_upstream`] opt-in.
+    insecure_test_upstream: Option<String>,
+}
+
+impl CloudWitnessConfig {
+    /// Build production cloud-witness configuration using the provider's
+    /// pinned TLS origin.
+    pub fn new(
+        provider: allowlist::CloudUpstream,
+        listen: String,
+        witness_key: PathBuf,
+        receipts_spool: PathBuf,
+        daemon_receipts: bool,
+    ) -> Self {
+        Self {
+            provider,
+            listen,
+            witness_key,
+            receipts_spool,
+            daemon_receipts,
+            insecure_test_upstream: None,
+        }
+    }
+
+    /// Replace the pinned TLS origin with a loopback-only HTTP test upstream.
+    ///
+    /// This is intentionally loud: it validates the URL, prints an
+    /// unmistakable warning, and causes every record to carry
+    /// `test_upstream:true`. Production callers should never invoke it.
+    #[allow(clippy::print_stderr)]
+    pub fn with_insecure_test_upstream(mut self, url: &str) -> anyhow::Result<Self> {
+        let validated = allowlist::validate_insecure_test_upstream(url)?;
+        eprintln!("!!! CRUX CLOUD WITNESS INSECURE TEST UPSTREAM ENABLED: {validated} — TEST RECORDS ONLY !!!");
+        self.insecure_test_upstream = Some(validated);
+        Ok(self)
+    }
+
+    /// Return the insecure test origin when the explicit test opt-in is active.
+    pub fn insecure_test_upstream(&self) -> Option<&str> {
+        self.insecure_test_upstream.as_deref()
+    }
 }
 
 /// Where the injected bundle came from, plus its identity fields.
@@ -131,6 +200,29 @@ pub fn ensure_enabled() -> anyhow::Result<()> {
              See docs/master-plan/shared/Context-Mediation-Points.md §3."
         ),
     }
+}
+
+/// Default-OFF gate: `CRUX_CLOUD_WITNESS` must be `1` or `true`.
+pub fn ensure_cloud_witness_enabled() -> anyhow::Result<()> {
+    match std::env::var(CLOUD_WITNESS_ENABLE_ENV) {
+        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => Ok(()),
+        _ => anyhow::bail!("cloud witness mode is default-OFF. Set {CLOUD_WITNESS_ENABLE_ENV}=1 to enable"),
+    }
+}
+
+/// Resolve the insecure loopback test upstream from the environment.
+///
+/// In production builds `allow_insecure` must come from the loud CLI flag.
+/// Unit tests may exercise the environment-only path under `cfg(test)`.
+pub fn cloud_test_upstream_from_env(allow_insecure: bool) -> anyhow::Result<Option<String>> {
+    let permitted = allow_insecure || cfg!(test);
+    if !permitted {
+        return Ok(None);
+    }
+    std::env::var(CLOUD_WITNESS_TEST_UPSTREAM_ENV)
+        .ok()
+        .map(|url| allowlist::validate_insecure_test_upstream(&url))
+        .transpose()
 }
 
 /// Load a bundle from a file path (markdown, injected verbatim).
@@ -255,6 +347,43 @@ pub fn serve(config: ShimConfig) -> anyhow::Result<ShimHandle> {
     })
 }
 
+/// Validate configuration and start cloud witness mode on a background
+/// loopback-only accept loop.
+///
+/// A persistent-key failure is deliberately not a startup failure. The
+/// runtime forwards traffic and emits `witness_degraded` records instead.
+pub fn serve_cloud_witness(config: CloudWitnessConfig) -> anyhow::Result<ShimHandle> {
+    ensure_cloud_witness_enabled()?;
+    let runtime = cloud_witness::CloudWitnessRuntime::new(config)?;
+    let listener = TcpListener::bind(&runtime.config().listen)
+        .with_context(|| format!("binding listen address {}", runtime.config().listen))?;
+    let addr = listener.local_addr().context("resolving bound listen address")?;
+    anyhow::ensure!(
+        addr.ip().is_loopback(),
+        "listen address must be loopback (got {addr}); cloud witness is a local-only surface"
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_accept = Arc::clone(&stop);
+    let shared = Arc::new(runtime);
+    let join = std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            if stop_accept.load(Ordering::SeqCst) {
+                break;
+            }
+            let Ok(stream) = stream else { continue };
+            let conn_runtime = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                cloud_witness::handle_connection(stream, &conn_runtime);
+            });
+        }
+    });
+    Ok(ShimHandle {
+        addr,
+        stop,
+        join: Some(join),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,6 +413,50 @@ mod tests {
         std::env::set_var(ENABLE_ENV, "true");
         assert!(ensure_enabled().is_ok());
         std::env::remove_var(ENABLE_ENV);
+    }
+
+    #[test]
+    fn cloud_gate_is_independent_from_local_gate() {
+        let _guard = crate::test_support::env_guard();
+        std::env::remove_var(ENABLE_ENV);
+        std::env::remove_var(CLOUD_WITNESS_ENABLE_ENV);
+        assert!(ensure_cloud_witness_enabled().is_err());
+        std::env::set_var(ENABLE_ENV, "1");
+        assert!(ensure_cloud_witness_enabled().is_err());
+        std::env::remove_var(ENABLE_ENV);
+        std::env::set_var(CLOUD_WITNESS_ENABLE_ENV, "1");
+        assert!(ensure_cloud_witness_enabled().is_ok());
+        assert!(ensure_enabled().is_err());
+        std::env::remove_var(CLOUD_WITNESS_ENABLE_ENV);
+    }
+
+    #[test]
+    fn unit_tests_may_resolve_loopback_test_upstream_without_cli_flag() {
+        let _guard = crate::test_support::env_guard();
+        std::env::set_var(CLOUD_WITNESS_TEST_UPSTREAM_ENV, "http://127.0.0.1:8123");
+        assert_eq!(
+            cloud_test_upstream_from_env(false).unwrap().as_deref(),
+            Some("http://127.0.0.1:8123")
+        );
+        std::env::remove_var(CLOUD_WITNESS_TEST_UPSTREAM_ENV);
+    }
+
+    #[test]
+    fn cloud_config_is_pinned_until_loud_test_opt_in() {
+        let config = CloudWitnessConfig::new(
+            allowlist::CloudUpstream::Anthropic,
+            "127.0.0.1:0".into(),
+            PathBuf::from("witness.key"),
+            PathBuf::from("receipts.jsonl"),
+            false,
+        );
+        assert!(config.insecure_test_upstream().is_none());
+        assert!(config
+            .clone()
+            .with_insecure_test_upstream("http://attacker.example")
+            .is_err());
+        let test_config = config.with_insecure_test_upstream("http://127.0.0.1:8123").unwrap();
+        assert_eq!(test_config.insecure_test_upstream(), Some("http://127.0.0.1:8123"));
     }
 
     #[test]

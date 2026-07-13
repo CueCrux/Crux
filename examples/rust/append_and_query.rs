@@ -10,7 +10,7 @@
 //!
 //! ```bash
 //! # Terminal 1 — start the daemon
-//! CORECRUXD_AUTH_MODE=off CORECRUXD_QUERY_TEXT_SEARCH=1 CORECRUXD_DATA_DIR=./data ./target/release/corecruxd
+//! CORECRUXD_AUTH_MODE=off CORECRUXD_DATA_DIR=./data ./target/release/corecruxd
 //!
 //! # Terminal 2 — run this example
 //! cd examples/rust

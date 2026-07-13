@@ -9,7 +9,6 @@ set -euo pipefail
 CORECRUXD_DATA_DIR=/tmp/crux-demo
 CORECRUXD_HTTP_PORT=14800
 CORECRUXD_AUTH_MODE=off   # Local demo only — use jwt_hs256 or jwt_jwks in production.
-CORECRUXD_QUERY_TEXT_SEARCH=1
 BASE="http://localhost:${CORECRUXD_HTTP_PORT}"
 MCP_URL="http://localhost:14801/mcp"
 
@@ -39,7 +38,6 @@ fi
 echo "==> Starting corecruxd..."
 CORECRUXD_DATA_DIR="$CORECRUXD_DATA_DIR" \
   CORECRUXD_AUTH_MODE="$CORECRUXD_AUTH_MODE" \
-  CORECRUXD_QUERY_TEXT_SEARCH="$CORECRUXD_QUERY_TEXT_SEARCH" \
   "$BINARY" &
 DAEMON_PID=$!
 

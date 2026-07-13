@@ -1,0 +1,8 @@
+{
+  "title": "Fixture records",
+  "records": [
+    { "body": "The first record is flattened into prose." },
+    { "body": "The second record is flattened too." }
+  ],
+  "count": 2
+}

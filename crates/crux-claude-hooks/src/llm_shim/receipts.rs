@@ -143,10 +143,7 @@ pub fn stream_end_record(config: &ShimConfig, end: &StreamEnd<'_>, receipt_id: &
 /// Deliver a record: best-effort daemon POST, JSONL spool fallback. Never
 /// blocks or fails the mediated request.
 pub fn emit(config: &ShimConfig, record: &Value) {
-    if config.daemon_receipts && crate::daemon_client::post_json("/v1/mediation/receipts", record).is_ok() {
-        return;
-    }
-    if let Err(err) = append_jsonl(&config.receipts_spool, record) {
+    if let Err(err) = deliver_record(config.daemon_receipts, &config.receipts_spool, record) {
         eprintln!(
             "crux-llm-shim: receipt spool write failed ({}): {err}",
             config.receipts_spool.display()
@@ -154,14 +151,31 @@ pub fn emit(config: &ShimConfig, record: &Value) {
     }
 }
 
+/// Deliver any mediation record through the shared daemon-first, JSONL-spool
+/// fallback used by both local injection and cloud witness modes.
+///
+/// The returned error means both durable paths failed. Cloud witness mode runs
+/// this function on its receipt worker so delivery stalls and failures never
+/// block provider traffic.
+pub fn deliver_record(daemon_receipts: bool, spool: &Path, record: &Value) -> anyhow::Result<()> {
+    if daemon_receipts && crate::daemon_client::post_json("/v1/mediation/receipts", record).is_ok() {
+        return Ok(());
+    }
+    append_jsonl(spool, record)
+}
+
 fn append_jsonl(path: &Path, record: &Value) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-    let line = serde_json::to_string(record)?;
-    file.write_all(line.as_bytes())?;
-    file.write_all(b"\n")?;
+    let mut line = serde_json::to_vec(record)?;
+    line.push(b'\n');
+    fs2::FileExt::lock_exclusive(&file)?;
+    let write_result = file.write_all(&line);
+    let unlock_result = fs2::FileExt::unlock(&file);
+    write_result?;
+    unlock_result?;
     Ok(())
 }
 
@@ -240,5 +254,26 @@ mod tests {
         assert_eq!(lines.len(), 2);
         let first: Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(first["kind"], "context_injected");
+    }
+
+    #[test]
+    fn concurrent_appenders_preserve_jsonl_framing() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = std::sync::Arc::new(dir.path().join("receipts.jsonl"));
+        let mut joins = Vec::new();
+        for writer in 0..8 {
+            let spool = std::sync::Arc::clone(&spool);
+            joins.push(std::thread::spawn(move || {
+                for sequence in 0..100 {
+                    append_jsonl(&spool, &json!({"writer": writer, "sequence": sequence})).unwrap();
+                }
+            }));
+        }
+        for join in joins {
+            join.join().unwrap();
+        }
+        let text = std::fs::read_to_string(spool.as_ref()).unwrap();
+        let records: Vec<Value> = text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(records.len(), 800);
     }
 }
