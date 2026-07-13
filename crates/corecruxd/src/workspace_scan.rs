@@ -213,6 +213,10 @@ pub struct RouteHit {
     pub method: String,     // GET / POST / PATCH / DELETE / PUT
     pub path: String,       // "/v1/projects/{id}"
     pub handler_fn: String, // post_project
+    /// Framework that supplied this route when detection is framework-specific.
+    /// Omitted for legacy/Rust hits so dark feature gates preserve serialized bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub framework: Option<String>,
     /// Where the handler function is defined. None if the symbol couldn't be
     /// resolved (e.g. handler comes from a re-exported module behind a macro).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -575,6 +579,7 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
                             method: route.method,
                             path: route.path,
                             handler_fn: route.handler_fn,
+                            framework: None,
                             handler_file: resolved_file,
                             handler_line: resolved_line,
                             source_file: route.source_file,
@@ -1235,13 +1240,17 @@ pub fn storyline_compact_json(scan: &WorkspaceScan, include_tests: bool) -> serd
             }
             None => Vec::new(),
         };
-        routes_block.push(serde_json::json!({
+        let mut route_block = serde_json::json!({
             "m": route.method,
             "p": route.path,
             "h": route.handler_fn,
             "f": route.handler_file.as_ref().and_then(|p| id_by_path.get(p)),
             "chain": chain,
-        }));
+        });
+        if let Some(framework) = &route.framework {
+            route_block["fw"] = serde_json::Value::String(framework.clone());
+        }
+        routes_block.push(route_block);
     }
     serde_json::json!({
         "files": files_block,
@@ -1410,10 +1419,18 @@ fn parse_symbol_line(line: &str) -> Option<(&'static str, String, bool)> {
 
 /// Test-file heuristic — true if any of:
 /// - path contains a `/tests/` segment (integration test directory),
+/// - path is under a conventional `src/test`, `src/androidTest`, or
+///   `src/integrationTest` source set,
 /// - filename ends with `_tests.rs` or is exactly `tests.rs`,
 /// - first non-blank, non-comment line is `#![cfg(test)]` (rare, but legal).
 pub(crate) fn looks_like_test_file(rel_path: &str, src: &str) -> bool {
-    let path_match = rel_path.contains("/tests/") || rel_path.ends_with("/tests.rs") || rel_path.ends_with("_tests.rs");
+    let normalized = rel_path.replace('\\', "/");
+    let path_match = normalized.contains("/tests/")
+        || normalized.ends_with("/tests.rs")
+        || normalized.ends_with("_tests.rs")
+        || ["src/test/", "src/androidTest/", "src/integrationTest/"]
+            .iter()
+            .any(|source_set| normalized.starts_with(source_set) || normalized.contains(&format!("/{source_set}")));
     if path_match {
         return true;
     }
@@ -1927,6 +1944,15 @@ version = "0.1.0"
         assert!(looks_like_test_file("crates/foo/tests/integration.rs", ""));
         assert!(looks_like_test_file("crates/foo/src/foo_tests.rs", ""));
         assert!(looks_like_test_file("crates/foo/src/tests.rs", ""));
+        assert!(looks_like_test_file("src/test/java/com/acme/AppTest.java", ""));
+        assert!(looks_like_test_file(
+            "app/src/androidTest/java/com/acme/AppTest.java",
+            ""
+        ));
+        assert!(looks_like_test_file(
+            "service/src/integrationTest/java/com/acme/AppTest.java",
+            ""
+        ));
         assert!(!looks_like_test_file("crates/foo/src/foo.rs", "fn x() {}"));
         // First non-comment line is `#![cfg(test)]` → counts as test file.
         let attr_src = "// Copyright\n\n#![cfg(test)]\nfn x() {}\n";
@@ -1934,6 +1960,36 @@ version = "0.1.0"
         // Otherwise normal source.
         let normal = "//! Module docs.\nuse foo::bar;\nfn x() {}\n";
         assert!(!looks_like_test_file("crates/foo/src/lib.rs", normal));
+    }
+
+    #[test]
+    fn route_hit_without_framework_preserves_frozen_wire_shape() {
+        let route = RouteHit {
+            method: "GET".to_string(),
+            path: "/frozen".to_string(),
+            handler_fn: "frozen_handler".to_string(),
+            framework: None,
+            handler_file: Some("src/handler.rs".to_string()),
+            handler_line: Some(7),
+            source_file: "src/routes.rs".to_string(),
+            source_line: 3,
+        };
+        assert_eq!(
+            serde_json::to_string(&route).expect("route json"),
+            r#"{"method":"GET","path":"/frozen","handler_fn":"frozen_handler","handler_file":"src/handler.rs","handler_line":7,"source_file":"src/routes.rs","source_line":3}"#
+        );
+
+        let mut scan = WorkspaceScan::default();
+        scan.routes.push(RouteHit {
+            handler_file: None,
+            handler_line: None,
+            ..route
+        });
+        let compact = storyline_compact_json(&scan, false);
+        assert_eq!(
+            serde_json::to_string(&compact["routes"][0]).expect("compact route json"),
+            r#"{"m":"GET","p":"/frozen","h":"frozen_handler","f":null,"chain":[]}"#
+        );
     }
 
     #[test]

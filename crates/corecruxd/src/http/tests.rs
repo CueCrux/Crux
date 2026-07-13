@@ -7066,6 +7066,7 @@ async fn workbench_route_probe_and_api_drift_use_workspace_scan() {
         method: "POST".to_string(),
         path: "/v1/work".to_string(),
         handler_fn: "post_work".to_string(),
+        framework: None,
         handler_file: Some("crates/corecruxd/src/http/work.rs".to_string()),
         handler_line: Some(120),
         source_file: "crates/corecruxd/src/http/mod.rs".to_string(),

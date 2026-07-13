@@ -57,6 +57,7 @@ enum LanguageKind {
     Tsx,
     Python,
     Vue,
+    Svelte,
     Go,
     Java,
     C,
@@ -84,6 +85,8 @@ struct ExtractedFile {
     deps: Vec<DepEdge>,
     calls: Vec<CallSite>,
     routes: Vec<RouteCandidate>,
+    django_includes: Vec<DjangoIncludeCandidate>,
+    unresolved_routes: Vec<UnresolvedRoute>,
     ast_depth_limit_hits: usize,
 }
 
@@ -103,6 +106,7 @@ struct RouteCandidate {
     method: String,
     path: String,
     handler: RouteHandler,
+    framework: Option<String>,
     source_file: String,
     source_line: usize,
 }
@@ -111,6 +115,22 @@ struct RouteCandidate {
 enum RouteHandler {
     Named(String),
     Inline,
+    Resolved { name: String, file: String, line: usize },
+    Django(String),
+}
+
+#[derive(Debug, Clone)]
+struct DjangoIncludeCandidate {
+    prefix: String,
+    target: DjangoIncludeTarget,
+    source_file: String,
+    source_line: usize,
+}
+
+#[derive(Debug, Clone)]
+enum DjangoIncludeTarget {
+    Module(String),
+    Dynamic(String),
 }
 
 #[derive(Debug, Default)]
@@ -172,7 +192,7 @@ fn merge_polyglot_scan(scan: &mut WorkspaceScan, poly: WorkspaceScan, options: P
     scan.files.extend(poly.files);
     scan.symbols.extend(poly.symbols);
     scan.deps.extend(poly.deps);
-    if options.v2_enabled {
+    if options.v2_enabled || options.v3_enabled {
         scan.routes.extend(poly.routes);
         scan.diagnostics
             .unresolved_routes
@@ -256,8 +276,11 @@ fn run_polyglot_scan_inner(
     resolve_polyglot_references(&mut scan, &extracted, &file_idx_by_path, &symbol_by_name);
     build_referenced_by(&mut scan);
     scan.crates = package_infos(root, &scan, &package_name);
-    if options.v2_enabled {
+    if options.v2_enabled || options.v3_enabled {
         resolve_polyglot_routes(&mut scan, &extracted, &symbol_by_name);
+    }
+    if options.v3_enabled {
+        collect_file_based_routes(root, &extracted, &mut scan);
     }
     roll_up_stats(&mut scan);
     let elapsed_ms = started_inst.elapsed().as_millis() as u64;
@@ -293,8 +316,9 @@ fn language_for_path(path: &Path, options: PolyglotScanOptions) -> Option<Langua
         "tsx" => Some(LanguageKind::Tsx),
         "py" => Some(LanguageKind::Python),
         "vue" => Some(LanguageKind::Vue),
-        "js" | "mjs" | "cjs" if options.v2_enabled => Some(LanguageKind::TypeScript),
-        "jsx" if options.v2_enabled => Some(LanguageKind::Tsx),
+        "svelte" if options.v3_enabled => Some(LanguageKind::Svelte),
+        "js" | "mjs" | "cjs" if options.v2_enabled || options.v3_enabled => Some(LanguageKind::TypeScript),
+        "jsx" if options.v2_enabled || options.v3_enabled => Some(LanguageKind::Tsx),
         "go" if options.v2_enabled => Some(LanguageKind::Go),
         "java" if options.v3_enabled => Some(LanguageKind::Java),
         "c" if options.v3_enabled => Some(LanguageKind::C),
@@ -327,11 +351,11 @@ fn header_looks_cpp(src: &str) -> bool {
 
 fn should_skip_generated_polyglot_file(rel: &Path, options: PolyglotScanOptions) -> bool {
     let extension = rel.extension().and_then(|e| e.to_str()).unwrap_or_default();
-    let is_v2_js = options.v2_enabled && matches!(extension, "js" | "jsx" | "mjs" | "cjs");
+    let is_v2_js = (options.v2_enabled || options.v3_enabled) && matches!(extension, "js" | "jsx" | "mjs" | "cjs");
     let is_v3_source = options.v3_enabled
         && matches!(
             extension,
-            "java" | "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx"
+            "svelte" | "java" | "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx"
         );
     rel.components().any(|component| {
         let segment = component.as_os_str().to_string_lossy();
@@ -410,6 +434,8 @@ fn extract_file_recording_skips(
         deps: Vec::new(),
         calls: Vec::new(),
         routes: Vec::new(),
+        django_includes: Vec::new(),
+        unresolved_routes: Vec::new(),
         ast_depth_limit_hits: 0,
     };
     let mut guard = AstWalkGuard::default();
@@ -431,6 +457,7 @@ fn extract_file_recording_skips(
                 )?;
             }
         }
+        LanguageKind::Svelte => {}
         LanguageKind::Go => extract_go_file(&src, &mut file, options, &mut guard)?,
         LanguageKind::Java => extract_java_file(&src, &mut file, &mut guard)?,
         LanguageKind::C => extract_c_family_file(&src, &mut file, false, &mut guard)?,
@@ -449,7 +476,7 @@ fn extract_file_recording_skips(
 }
 
 fn should_skip_pathological_v2_js(rel_path: &str, src: &str, options: PolyglotScanOptions) -> bool {
-    if !options.v2_enabled || !is_v2_js_path(rel_path) {
+    if !(options.v2_enabled || options.v3_enabled) || !is_v2_js_path(rel_path) {
         return false;
     }
     let byte_len = src.len();
@@ -483,6 +510,7 @@ fn v3_source_limits(lang: LanguageKind) -> Option<(usize, usize)> {
         LanguageKind::Java => Some((POLYGLOT_JAVA_MAX_BYTES, POLYGLOT_JAVA_MAX_LINE_BYTES)),
         LanguageKind::C => Some((POLYGLOT_C_MAX_BYTES, POLYGLOT_C_MAX_LINE_BYTES)),
         LanguageKind::Cpp => Some((POLYGLOT_CPP_MAX_BYTES, POLYGLOT_CPP_MAX_LINE_BYTES)),
+        LanguageKind::Svelte => None,
         _ => None,
     }
 }
@@ -1083,6 +1111,9 @@ fn extract_python_file(
         return Ok(());
     };
     let bytes = src.as_bytes();
+    if options.v3_enabled && file.rel_path.ends_with("urls.py") && !file.is_test_file {
+        collect_django_urlpatterns(tree.root_node(), bytes, file, guard, 0);
+    }
     walk_py_node(tree.root_node(), bytes, file, None, options, guard, 0);
     Ok(())
 }
@@ -1317,7 +1348,9 @@ fn extract_java_file(src: &str, file: &mut ExtractedFile, guard: &mut AstWalkGua
     let Some(tree) = parser.parse(src, None) else {
         return Ok(());
     };
-    walk_java_node(tree.root_node(), src.as_bytes(), file, guard, 0);
+    let bytes = src.as_bytes();
+    collect_spring_controllers(tree.root_node(), bytes, file, guard, 0);
+    walk_java_node(tree.root_node(), bytes, file, guard, 0);
     Ok(())
 }
 
@@ -1665,6 +1698,359 @@ fn qualify_cpp_callable(name: &str, state: &CFamilyWalkState) -> String {
     qualification.extend(state.classes.iter().cloned());
     qualification.push(name.to_string());
     qualification.join("::")
+}
+
+/// Django precision bar: only static calls inside a literal
+/// `urlpatterns = [...]` in `urls.py` are admitted. Include targets must be a
+/// string module with exactly one repo-local `<module path>.py` suffix match;
+/// dynamic lists/import aliases are left unresolved rather than guessed.
+fn collect_django_urlpatterns(
+    node: Node<'_>,
+    src: &[u8],
+    file: &mut ExtractedFile,
+    guard: &mut AstWalkGuard,
+    depth: usize,
+) {
+    if !guard.allow_depth(depth) {
+        return;
+    }
+    if node.kind() == "assignment" {
+        let is_urlpatterns = node
+            .child_by_field_name("left")
+            .is_some_and(|left| node_text(left, src).trim() == "urlpatterns");
+        if is_urlpatterns {
+            if let Some(value) = node.child_by_field_name("right") {
+                collect_django_pattern_list(value, src, file);
+            }
+            return;
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_django_urlpatterns(child, src, file, guard, depth + 1);
+    }
+}
+
+fn collect_django_pattern_list(value: Node<'_>, src: &[u8], file: &mut ExtractedFile) {
+    if value.kind() != "list" {
+        return;
+    }
+    let mut cursor = value.walk();
+    for entry in value.named_children(&mut cursor) {
+        if entry.kind() != "call" {
+            continue;
+        }
+        let Some(function) = entry.child_by_field_name("function") else {
+            continue;
+        };
+        if !matches!(last_ident_text(function, src).as_str(), "path" | "re_path" | "url") {
+            continue;
+        }
+        let args = argument_nodes(entry);
+        let positional: Vec<Node<'_>> = args
+            .iter()
+            .copied()
+            .filter(|argument| argument.kind() != "keyword_argument")
+            .collect();
+        let (Some(path_node), Some(handler_node)) = (positional.first().copied(), positional.get(1).copied()) else {
+            continue;
+        };
+        let Some(path) = string_literal_value(path_node, src, false) else {
+            continue;
+        };
+        if handler_node.kind() == "call"
+            && handler_node
+                .child_by_field_name("function")
+                .is_some_and(|include_fn| last_ident_text(include_fn, src) == "include")
+        {
+            let include_args = argument_nodes(handler_node);
+            let Some(target_node) = include_args.first().copied() else {
+                continue;
+            };
+            let target = string_literal_value(target_node, src, false).map_or_else(
+                || DjangoIncludeTarget::Dynamic(node_text(target_node, src).trim().to_string()),
+                DjangoIncludeTarget::Module,
+            );
+            file.django_includes.push(DjangoIncludeCandidate {
+                prefix: path,
+                target,
+                source_file: file.rel_path.clone(),
+                source_line: entry.start_position().row + 1,
+            });
+            continue;
+        }
+        let handler = string_literal_value(handler_node, src, false)
+            .unwrap_or_else(|| node_text(handler_node, src).trim().to_string());
+        if handler.is_empty() {
+            continue;
+        }
+        push_framework_route_candidate(
+            file,
+            "django",
+            "ANY".to_string(),
+            path,
+            RouteHandler::Django(handler),
+            entry.start_position().row + 1,
+        );
+    }
+}
+
+/// Spring precision bar: controller evidence is mandatory and only the
+/// built-in mapping annotations with literal value/path strings are expanded.
+/// Constants, meta/composed annotations and inherited mappings are not guessed.
+fn collect_spring_controllers(
+    node: Node<'_>,
+    src: &[u8],
+    file: &mut ExtractedFile,
+    guard: &mut AstWalkGuard,
+    depth: usize,
+) {
+    if file.is_test_file || !guard.allow_depth(depth) {
+        return;
+    }
+    if node.kind() == "class_declaration" {
+        collect_spring_controller(node, src, file);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_spring_controllers(child, src, file, guard, depth + 1);
+    }
+}
+
+fn collect_spring_controller(class: Node<'_>, src: &[u8], file: &mut ExtractedFile) {
+    let annotations = java_annotations(class, src);
+    if !annotations
+        .iter()
+        .any(|(raw, _)| matches!(spring_annotation_name(raw).as_str(), "RestController" | "Controller"))
+    {
+        return;
+    }
+    let Some(class_name) = field_ident(class, src, "name") else {
+        return;
+    };
+    let class_paths = annotations
+        .iter()
+        .find(|(raw, _)| spring_annotation_name(raw) == "RequestMapping")
+        .map_or_else(
+            || SpringAnnotationPaths::Static(vec![String::new()]),
+            |(raw, _)| spring_annotation_paths(raw),
+        );
+    let SpringAnnotationPaths::Static(class_paths) = class_paths else {
+        return;
+    };
+    let Some(body) = class.child_by_field_name("body") else {
+        return;
+    };
+    let mut cursor = body.walk();
+    for method_node in body
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "method_declaration")
+    {
+        let Some(method_name) = field_ident(method_node, src, "name") else {
+            continue;
+        };
+        for (annotation, line) in java_annotations(method_node, src) {
+            let annotation_name = spring_annotation_name(&annotation);
+            let methods = match annotation_name.as_str() {
+                "GetMapping" => vec!["GET".to_string()],
+                "PostMapping" => vec!["POST".to_string()],
+                "PutMapping" => vec!["PUT".to_string()],
+                "DeleteMapping" => vec!["DELETE".to_string()],
+                "PatchMapping" => vec!["PATCH".to_string()],
+                "RequestMapping" => spring_request_methods(&annotation),
+                _ => continue,
+            };
+            let method_paths = match spring_annotation_paths(&annotation) {
+                SpringAnnotationPaths::Static(paths) => paths,
+                SpringAnnotationPaths::Dynamic => {
+                    for http_method in &methods {
+                        file.unresolved_routes.push(UnresolvedRoute {
+                            method: http_method.clone(),
+                            path: class_paths.first().cloned().unwrap_or_default(),
+                            handler_fn: format!("{class_name}.{method_name}"),
+                            source_file: file.rel_path.clone(),
+                            source_line: line,
+                            reason: "annotation_dynamic".to_string(),
+                        });
+                    }
+                    continue;
+                }
+            };
+            for class_path in &class_paths {
+                for method_path in &method_paths {
+                    for http_method in &methods {
+                        push_framework_route_candidate(
+                            file,
+                            "spring",
+                            http_method.clone(),
+                            join_spring_paths(class_path, method_path),
+                            RouteHandler::Resolved {
+                                name: format!("{class_name}.{method_name}"),
+                                file: file.rel_path.clone(),
+                                line: method_node.start_position().row + 1,
+                            },
+                            line,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn java_annotations(node: Node<'_>, src: &[u8]) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+    let mut cursor = node.walk();
+    let Some(modifiers) = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "modifiers")
+    else {
+        return out;
+    };
+    let mut modifier_cursor = modifiers.walk();
+    for child in modifiers.named_children(&mut modifier_cursor) {
+        if matches!(child.kind(), "annotation" | "marker_annotation") {
+            out.push((node_text(child, src), child.start_position().row + 1));
+        }
+    }
+    out
+}
+
+fn spring_annotation_name(raw: &str) -> String {
+    raw.trim()
+        .trim_start_matches('@')
+        .split(['(', ' ', '\t', '\r', '\n'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn spring_annotation_args(raw: &str) -> &str {
+    raw.find('(')
+        .and_then(|start| raw.rfind(')').map(|end| &raw[start + 1..end]))
+        .unwrap_or_default()
+}
+
+enum SpringAnnotationPaths {
+    Static(Vec<String>),
+    Dynamic,
+}
+
+fn spring_annotation_paths(raw: &str) -> SpringAnnotationPaths {
+    let args = spring_annotation_args(raw);
+    if args.trim().is_empty() {
+        return SpringAnnotationPaths::Static(vec![String::new()]);
+    }
+    let mut paths = Vec::new();
+    let mut has_path_argument = false;
+    for argument in split_top_level_args(args) {
+        let (name, value) = argument
+            .split_once('=')
+            .map_or((None, argument), |(name, value)| (Some(name.trim()), value));
+        if name.is_none() || matches!(name, Some("value" | "path")) {
+            has_path_argument = true;
+            paths.extend(all_literal_values(value));
+        }
+    }
+    if paths.is_empty() {
+        if has_path_argument {
+            SpringAnnotationPaths::Dynamic
+        } else {
+            SpringAnnotationPaths::Static(vec![String::new()])
+        }
+    } else {
+        SpringAnnotationPaths::Static(paths)
+    }
+}
+
+fn spring_request_methods(raw: &str) -> Vec<String> {
+    let args = spring_annotation_args(raw);
+    let method_value = split_top_level_args(args).into_iter().find_map(|argument| {
+        argument
+            .split_once('=')
+            .filter(|(name, _)| name.trim() == "method")
+            .map(|(_, value)| value)
+    });
+    let Some(method_value) = method_value else {
+        return vec!["ANY".to_string()];
+    };
+    let mut methods = Vec::new();
+    for method in ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"] {
+        if method_value
+            .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+            .any(|token| token == method)
+        {
+            methods.push(method.to_string());
+        }
+    }
+    if methods.is_empty() {
+        vec!["ANY".to_string()]
+    } else {
+        methods
+    }
+}
+
+fn split_top_level_args(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in text.char_indices() {
+        if let Some(active_quote) = quote {
+            if character == '\\' && !escaped {
+                escaped = true;
+                continue;
+            }
+            if character == active_quote && !escaped {
+                quote = None;
+            }
+            escaped = false;
+            continue;
+        }
+        match character {
+            '"' | '\'' => quote = Some(character),
+            '(' | '{' | '[' => depth += 1,
+            ')' | '}' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                out.push(text[start..index].trim());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(text[start..].trim());
+    out
+}
+
+fn all_literal_values(text: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut remaining = text;
+    while let Some(quote_index) = remaining.find(['"', '\'']) {
+        let literal = &remaining[quote_index..];
+        let Some(value) = literal_text_value(literal, false) else {
+            break;
+        };
+        let consumed = value.len() + 2;
+        values.push(value);
+        if consumed >= literal.len() {
+            break;
+        }
+        remaining = &literal[consumed..];
+    }
+    values
+}
+
+fn join_spring_paths(prefix: &str, path: &str) -> String {
+    let joined = join_route_paths(prefix, path);
+    if joined.is_empty() {
+        "/".to_string()
+    } else {
+        joined
+    }
 }
 
 fn collect_python_routes(node: Node<'_>, src: &[u8], file: &mut ExtractedFile, guard: &mut AstWalkGuard, depth: usize) {
@@ -2274,6 +2660,25 @@ fn push_route_candidate(
         method,
         path,
         handler,
+        framework: None,
+        source_file: file.rel_path.clone(),
+        source_line,
+    });
+}
+
+fn push_framework_route_candidate(
+    file: &mut ExtractedFile,
+    framework: &str,
+    method: String,
+    path: String,
+    handler: RouteHandler,
+    source_line: usize,
+) {
+    file.routes.push(RouteCandidate {
+        method,
+        path,
+        handler,
+        framework: Some(framework.to_string()),
         source_file: file.rel_path.clone(),
         source_line,
     });
@@ -2588,13 +2993,23 @@ fn resolve_polyglot_routes(
     symbol_by_name: &HashMap<String, Vec<SymbolInfo>>,
 ) {
     for file in extracted {
+        scan.diagnostics
+            .unresolved_routes
+            .extend(file.unresolved_routes.iter().cloned());
+    }
+    resolve_django_routes(scan, extracted, symbol_by_name);
+    for file in extracted {
         for route in &file.routes {
+            if route.framework.as_deref() == Some("django") {
+                continue;
+            }
             match &route.handler {
                 RouteHandler::Inline => {
                     scan.routes.push(RouteHit {
                         method: route.method.clone(),
                         path: route.path.clone(),
                         handler_fn: "<inline>".to_string(),
+                        framework: route.framework.clone(),
                         handler_file: Some(route.source_file.clone()),
                         handler_line: Some(route.source_line),
                         source_file: route.source_file.clone(),
@@ -2617,15 +3032,234 @@ fn resolve_polyglot_routes(
                         method: route.method.clone(),
                         path: route.path.clone(),
                         handler_fn: handler_fn.clone(),
+                        framework: route.framework.clone(),
                         handler_file,
                         handler_line,
                         source_file: route.source_file.clone(),
                         source_line: route.source_line,
                     });
                 }
+                RouteHandler::Resolved { name, file, line } => {
+                    scan.routes.push(RouteHit {
+                        method: route.method.clone(),
+                        path: route.path.clone(),
+                        handler_fn: name.clone(),
+                        framework: route.framework.clone(),
+                        handler_file: Some(file.clone()),
+                        handler_line: Some(*line),
+                        source_file: route.source_file.clone(),
+                        source_line: route.source_line,
+                    });
+                }
+                RouteHandler::Django(_) => {}
             }
         }
     }
+}
+
+fn resolve_django_routes(
+    scan: &mut WorkspaceScan,
+    extracted: &[ExtractedFile],
+    symbol_by_name: &HashMap<String, Vec<SymbolInfo>>,
+) {
+    let django_files: Vec<&ExtractedFile> = extracted
+        .iter()
+        .filter(|file| {
+            file.routes
+                .iter()
+                .any(|route| route.framework.as_deref() == Some("django"))
+                || !file.django_includes.is_empty()
+        })
+        .collect();
+    if django_files.is_empty() {
+        return;
+    }
+    let mut claimed_files = HashSet::new();
+    let mut dynamic_include_sources = HashSet::new();
+    for file in &django_files {
+        for include in &file.django_includes {
+            match &include.target {
+                DjangoIncludeTarget::Module(module) => {
+                    let matches = django_module_matches(module, &django_files);
+                    claimed_files.extend(matches.iter().map(|target| target.rel_path.clone()));
+                    if matches.len() != 1 {
+                        scan.diagnostics.unresolved_routes.push(UnresolvedRoute {
+                            method: "ANY".to_string(),
+                            path: include.prefix.clone(),
+                            handler_fn: format!("include(\"{module}\")"),
+                            source_file: include.source_file.clone(),
+                            source_line: include.source_line,
+                            reason: if matches.is_empty() {
+                                "include_not_found"
+                            } else {
+                                "include_ambiguous"
+                            }
+                            .to_string(),
+                        });
+                    }
+                }
+                DjangoIncludeTarget::Dynamic(expression) => {
+                    dynamic_include_sources.insert(include.source_file.clone());
+                    scan.diagnostics.unresolved_routes.push(UnresolvedRoute {
+                        method: "ANY".to_string(),
+                        path: include.prefix.clone(),
+                        handler_fn: format!("include({expression})"),
+                        source_file: include.source_file.clone(),
+                        source_line: include.source_line,
+                        reason: "include_dynamic".to_string(),
+                    });
+                }
+            }
+        }
+    }
+    let settings_roots: Vec<&ExtractedFile> = django_files
+        .iter()
+        .copied()
+        .filter(|file| has_sibling_settings(file, extracted))
+        .collect();
+    let roots: Vec<&ExtractedFile> = if settings_roots.is_empty() {
+        django_files
+            .iter()
+            .copied()
+            .filter(|file| {
+                !claimed_files.contains(&file.rel_path)
+                    && (dynamic_include_sources.is_empty() || dynamic_include_sources.contains(&file.rel_path))
+            })
+            .collect()
+    } else {
+        settings_roots
+    };
+    for root in roots {
+        let mut stack = HashSet::new();
+        expand_django_routes(root, "", &django_files, symbol_by_name, scan, &mut stack);
+    }
+}
+
+fn has_sibling_settings(file: &ExtractedFile, extracted: &[ExtractedFile]) -> bool {
+    let settings = Path::new(&file.rel_path)
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join("settings.py")
+        .display()
+        .to_string();
+    extracted.iter().any(|candidate| candidate.rel_path == settings)
+}
+
+fn expand_django_routes(
+    file: &ExtractedFile,
+    prefix: &str,
+    django_files: &[&ExtractedFile],
+    symbol_by_name: &HashMap<String, Vec<SymbolInfo>>,
+    scan: &mut WorkspaceScan,
+    stack: &mut HashSet<String>,
+) {
+    if !stack.insert(file.rel_path.clone()) {
+        return;
+    }
+    for route in file
+        .routes
+        .iter()
+        .filter(|route| route.framework.as_deref() == Some("django"))
+    {
+        let RouteHandler::Django(handler) = &route.handler else {
+            continue;
+        };
+        let (handler_file, handler_line, reason) = resolve_django_handler(handler, file, symbol_by_name);
+        let path = join_django_paths(prefix, &route.path);
+        if let Some(reason) = reason {
+            scan.diagnostics.unresolved_routes.push(UnresolvedRoute {
+                method: route.method.clone(),
+                path: path.clone(),
+                handler_fn: handler.clone(),
+                source_file: route.source_file.clone(),
+                source_line: route.source_line,
+                reason: reason.to_string(),
+            });
+        }
+        scan.routes.push(RouteHit {
+            method: route.method.clone(),
+            path,
+            handler_fn: handler.clone(),
+            framework: Some("django".to_string()),
+            handler_file,
+            handler_line,
+            source_file: route.source_file.clone(),
+            source_line: route.source_line,
+        });
+    }
+    for include in &file.django_includes {
+        let DjangoIncludeTarget::Module(module) = &include.target else {
+            continue;
+        };
+        let matches = django_module_matches(module, django_files);
+        if matches.len() == 1 {
+            let target = matches[0];
+            expand_django_routes(
+                target,
+                &join_django_paths(prefix, &include.prefix),
+                django_files,
+                symbol_by_name,
+                scan,
+                stack,
+            );
+        }
+    }
+    stack.remove(&file.rel_path);
+}
+
+fn django_module_matches<'a>(module: &str, files: &'a [&ExtractedFile]) -> Vec<&'a ExtractedFile> {
+    let expected = format!("{}.py", module.replace('.', "/"));
+    files
+        .iter()
+        .copied()
+        .filter(|file| file.rel_path == expected || file.rel_path.ends_with(&format!("/{expected}")))
+        .collect()
+}
+
+fn resolve_django_handler(
+    handler: &str,
+    source_file: &ExtractedFile,
+    symbol_by_name: &HashMap<String, Vec<SymbolInfo>>,
+) -> (Option<String>, Option<usize>, Option<&'static str>) {
+    let trimmed = handler.trim();
+    let expression = trimmed
+        .find(".as_view(")
+        .map_or(trimmed, |as_view_index| &trimmed[..as_view_index]);
+    let lookup = expression.rsplit('.').next().unwrap_or(expression);
+    let Some(candidates) = symbol_by_name.get(lookup) else {
+        return (None, None, Some("not_found"));
+    };
+    if let Some(module_hint) = expression
+        .rsplit_once('.')
+        .map(|(module, _)| module.rsplit('.').next().unwrap_or(module))
+    {
+        let expected = format!("/{module_hint}.py");
+        let hinted: Vec<&SymbolInfo> = candidates
+            .iter()
+            .filter(|symbol| {
+                (symbol.file_rel_path.ends_with(&expected) || symbol.file_rel_path == format!("{module_hint}.py"))
+                    && symbol.crate_name == source_file.package_name
+            })
+            .collect();
+        if hinted.len() == 1 {
+            return (Some(hinted[0].file_rel_path.clone()), Some(hinted[0].line), None);
+        }
+    }
+    resolve_route_handler(lookup, source_file, symbol_by_name)
+}
+
+fn join_django_paths(prefix: &str, path: &str) -> String {
+    if prefix.is_empty() {
+        return path.to_string();
+    }
+    if path.is_empty() {
+        return prefix.to_string();
+    }
+    let child = path
+        .trim_start_matches('/')
+        .strip_prefix('^')
+        .unwrap_or(path.trim_start_matches('/'));
+    format!("{}/{child}", prefix.trim_end_matches('/'))
 }
 
 fn resolve_route_handler(
@@ -2704,6 +3338,276 @@ fn build_referenced_by(scan: &mut WorkspaceScan) {
             file.referenced_by = refs;
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct FileRouteFrameworks {
+    nextjs: bool,
+    nuxt: bool,
+    sveltekit: bool,
+}
+
+#[derive(Debug, Clone)]
+struct FileRouteScope {
+    directory: PathBuf,
+    frameworks: FileRouteFrameworks,
+}
+
+/// File-route precision bar: path conventions activate only below a package
+/// scope whose dependency maps name the corresponding framework. Dynamic
+/// `[param]` segments stay verbatim; route/server methods narrow only when an
+/// exported HTTP-verb symbol was already extracted from that same file.
+fn collect_file_based_routes(root: &Path, extracted: &[ExtractedFile], scan: &mut WorkspaceScan) {
+    let package_scopes = package_framework_scopes(root);
+    for file in extracted {
+        let Some(scope) = framework_scope_for_file(&file.rel_path, &package_scopes) else {
+            continue;
+        };
+        let scope_relative = Path::new(&file.rel_path)
+            .strip_prefix(&scope.directory)
+            .unwrap_or_else(|_| Path::new(&file.rel_path))
+            .display()
+            .to_string();
+        if scope.frameworks.nextjs {
+            if let Some((path, narrow_methods)) = nextjs_file_route(&scope_relative) {
+                push_file_route_hits(scan, file, "nextjs", path, narrow_methods);
+            }
+        }
+        if scope.frameworks.nuxt {
+            if let Some(path) = nuxt_file_route(&scope_relative) {
+                push_file_route_hits(scan, file, "nuxt", path, false);
+            }
+        }
+        if scope.frameworks.sveltekit {
+            if let Some((path, narrow_methods)) = sveltekit_file_route(&scope_relative) {
+                push_file_route_hits(scan, file, "sveltekit", path, narrow_methods);
+            }
+        }
+    }
+}
+
+fn package_framework_scopes(root: &Path) -> Vec<FileRouteScope> {
+    let mut scopes = Vec::new();
+    let _ = walk_dir(root, root, &mut |rel, abs| {
+        if rel.file_name().and_then(|name| name.to_str()) != Some("package.json") {
+            return;
+        }
+        let directory = rel.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+        scopes.push(FileRouteScope {
+            directory,
+            frameworks: package_json_frameworks(abs),
+        });
+    });
+    scopes.sort_by(|left, right| {
+        right
+            .directory
+            .components()
+            .count()
+            .cmp(&left.directory.components().count())
+    });
+    scopes
+}
+
+fn package_json_frameworks(path: &Path) -> FileRouteFrameworks {
+    let Some(json) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+    else {
+        return FileRouteFrameworks::default();
+    };
+    let mut names = HashSet::new();
+    for section in [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ] {
+        if let Some(dependencies) = json.get(section).and_then(serde_json::Value::as_object) {
+            names.extend(dependencies.keys().cloned());
+        }
+    }
+    FileRouteFrameworks {
+        nextjs: names.contains("next"),
+        nuxt: names.contains("nuxt"),
+        sveltekit: names.contains("@sveltejs/kit"),
+    }
+}
+
+fn framework_scope_for_file<'a>(rel_path: &str, scopes: &'a [FileRouteScope]) -> Option<&'a FileRouteScope> {
+    let path = Path::new(rel_path);
+    scopes
+        .iter()
+        .find(|scope| scope.directory.as_os_str().is_empty() || path.starts_with(&scope.directory))
+}
+
+fn nextjs_file_route(rel_path: &str) -> Option<(String, bool)> {
+    let parts = path_parts(rel_path);
+    let file_name = parts.last()?;
+    let extension = Path::new(file_name).extension()?.to_str()?;
+    let stem = Path::new(file_name).file_stem()?.to_str()?;
+    if matches!(extension, "js" | "jsx" | "ts" | "tsx") {
+        if let Some(pages_index) = router_root_index(&parts, "pages") {
+            if matches!(stem, "_app" | "_document" | "_error") {
+                return None;
+            }
+            let is_api = parts.get(pages_index + 1) == Some(&"api");
+            if is_api && stem.starts_with('_') {
+                return None;
+            }
+            let path = conventional_page_path(&parts[pages_index + 1..], stem);
+            return Some((path, is_api));
+        }
+    }
+    let app_index = router_root_index(&parts, "app")?;
+    if stem == "page" && matches!(extension, "js" | "jsx" | "ts" | "tsx") {
+        let segments = normalize_next_app_segments(&parts[app_index + 1..parts.len() - 1]);
+        return Some((owned_segments_to_route_path(&segments), false));
+    }
+    if stem == "route" && matches!(extension, "js" | "ts") {
+        let segments = normalize_next_app_segments(&parts[app_index + 1..parts.len() - 1]);
+        return Some((owned_segments_to_route_path(&segments), true));
+    }
+    None
+}
+
+fn nuxt_file_route(rel_path: &str) -> Option<String> {
+    let parts = path_parts(rel_path);
+    let file_name = parts.last()?;
+    if Path::new(file_name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        != Some("vue")
+    {
+        return None;
+    }
+    let stem = Path::new(file_name).file_stem()?.to_str()?;
+    let pages_index = router_root_index(&parts, "pages")?;
+    Some(conventional_page_path(&parts[pages_index + 1..], stem))
+}
+
+fn sveltekit_file_route(rel_path: &str) -> Option<(String, bool)> {
+    let parts = path_parts(rel_path);
+    if parts.first() != Some(&"src") || parts.get(1) != Some(&"routes") {
+        return None;
+    }
+    let routes_index = 1;
+    let file_name = parts.last()?;
+    let is_page = *file_name == "+page.svelte";
+    let is_server = matches!(*file_name, "+server.js" | "+server.ts");
+    if !is_page && !is_server {
+        return None;
+    }
+    let segments: Vec<&str> = parts[routes_index + 1..parts.len() - 1]
+        .iter()
+        .copied()
+        .filter(|segment| !(segment.starts_with('(') && segment.ends_with(')')))
+        .collect();
+    Some((segments_to_route_path(&segments), is_server))
+}
+
+fn router_root_index(parts: &[&str], directory: &str) -> Option<usize> {
+    if parts.first() == Some(&directory) {
+        Some(0)
+    } else if parts.first() == Some(&"src") && parts.get(1) == Some(&directory) {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+fn normalize_next_app_segments(segments: &[&str]) -> Vec<String> {
+    segments
+        .iter()
+        .filter_map(|segment| {
+            if segment.starts_with('@') {
+                return None;
+            }
+            for marker in ["(..)(..)", "(...)", "(..)", "(.)"] {
+                if let Some(name) = segment.strip_prefix(marker) {
+                    return (!name.is_empty()).then(|| name.to_string());
+                }
+            }
+            if segment.starts_with('(') && segment.ends_with(')') {
+                None
+            } else {
+                Some((*segment).to_string())
+            }
+        })
+        .collect()
+}
+
+fn path_parts(path: &str) -> Vec<&str> {
+    path.split(['/', '\\']).filter(|part| !part.is_empty()).collect()
+}
+
+fn conventional_page_path(parts_after_pages: &[&str], stem: &str) -> String {
+    let mut segments = parts_after_pages[..parts_after_pages.len().saturating_sub(1)].to_vec();
+    if stem != "index" {
+        segments.push(stem);
+    }
+    segments_to_route_path(&segments)
+}
+
+fn segments_to_route_path(segments: &[&str]) -> String {
+    if segments.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", segments.join("/"))
+    }
+}
+
+fn owned_segments_to_route_path(segments: &[String]) -> String {
+    if segments.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", segments.join("/"))
+    }
+}
+
+fn push_file_route_hits(
+    scan: &mut WorkspaceScan,
+    file: &ExtractedFile,
+    framework: &str,
+    path: String,
+    narrow_methods: bool,
+) {
+    let methods = if narrow_methods {
+        exported_http_methods(file)
+    } else {
+        Vec::new()
+    };
+    let methods = if methods.is_empty() {
+        vec![("ANY".to_string(), 1)]
+    } else {
+        methods
+    };
+    for (method, line) in methods {
+        scan.routes.push(RouteHit {
+            method,
+            path: path.clone(),
+            handler_fn: file.rel_path.clone(),
+            framework: Some(framework.to_string()),
+            handler_file: Some(file.rel_path.clone()),
+            handler_line: Some(line),
+            source_file: file.rel_path.clone(),
+            source_line: line,
+        });
+    }
+}
+
+fn exported_http_methods(file: &ExtractedFile) -> Vec<(String, usize)> {
+    // Re-export-only handlers (`export { GET } from "./shared"`) do not create
+    // a definition symbol in this file, so the deliberate fallback is ANY.
+    const METHODS: [&str; 7] = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
+    METHODS
+        .iter()
+        .filter_map(|method| {
+            file.symbols
+                .iter()
+                .find(|symbol| symbol.is_pub && symbol.name == *method)
+                .map(|symbol| ((*method).to_string(), symbol.line))
+        })
+        .collect()
 }
 
 fn roll_up_stats(scan: &mut WorkspaceScan) {
@@ -2828,6 +3732,11 @@ fn has_polyglot_non_rust_files(root: &Path, options: PolyglotScanOptions) -> boo
     }
     if options.v3_enabled {
         extensions.extend([
+            Some("js"),
+            Some("jsx"),
+            Some("mjs"),
+            Some("cjs"),
+            Some("svelte"),
             Some("java"),
             Some("c"),
             Some("h"),
@@ -2865,6 +3774,7 @@ fn module_path(package_name: &str, rel_path: &str) -> String {
         .trim_end_matches(".js")
         .trim_end_matches(".py")
         .trim_end_matches(".vue")
+        .trim_end_matches(".svelte")
         .trim_end_matches(".go")
         .trim_end_matches(".rs")
         .replace(['/', '\\', '-'], "::");
@@ -3025,6 +3935,34 @@ mod tests {
 
     fn route_tuple(method: &str, path: &str, handler: &str) -> (String, String, String) {
         (method.to_string(), path.to_string(), handler.to_string())
+    }
+
+    fn framework_route_set(scan: &WorkspaceScan) -> BTreeSet<(String, String, String, String)> {
+        scan.routes
+            .iter()
+            .filter_map(|route| {
+                Some((
+                    route.method.clone(),
+                    route.path.clone(),
+                    route.handler_fn.clone(),
+                    route.framework.clone()?,
+                ))
+            })
+            .collect()
+    }
+
+    fn framework_route_tuple(
+        method: &str,
+        path: &str,
+        handler: &str,
+        framework: &str,
+    ) -> (String, String, String, String) {
+        (
+            method.to_string(),
+            path.to_string(),
+            handler.to_string(),
+            framework.to_string(),
+        )
     }
 
     fn deep_call_source(nesting: usize) -> String {
@@ -3604,6 +4542,537 @@ int utility() { return 1; }
         let json = serde_json::to_string(&scan).expect("scan json");
         assert!(json.contains("v3_skipped_files"));
         assert!(json.contains("max_bytes"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_django_urlpatterns_include_and_handlers_are_precise() {
+        let _v2 = EnvVarGuard::unset(POLYGLOT_V2_ENV);
+        let _v3 = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("blog")).expect("blog dir");
+        std::fs::write(
+            tmp.path().join("urls.py"),
+            r#"from django.urls import include, path, re_path
+from . import views
+
+urlpatterns = [
+    path("health/", views.health),
+    re_path(r"^legacy/(?P<id>\d+)/$", views.legacy),
+    path("detail/", DetailView.as_view()),
+    path("api/", include("blog.urls")),
+    path("missing/", include("missing.urls")),
+]
+"#,
+        )
+        .expect("root urls");
+        std::fs::write(
+            tmp.path().join("views.py"),
+            "def health():\n    pass\ndef legacy():\n    pass\nclass DetailView:\n    pass\n",
+        )
+        .expect("root views");
+        std::fs::write(
+            tmp.path().join("blog/urls.py"),
+            r#"from django.urls import path
+from django.conf.urls import url
+from . import views
+
+urlpatterns = [
+    path("posts/", views.posts),
+    url(r"^old/$", views.old),
+]
+"#,
+        )
+        .expect("blog urls");
+        std::fs::write(
+            tmp.path().join("blog/views.py"),
+            "def posts():\n    pass\ndef old():\n    pass\n",
+        )
+        .expect("blog views");
+
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        assert_eq!(
+            framework_route_set(&scan),
+            BTreeSet::from([
+                framework_route_tuple("ANY", "health/", "views.health", "django"),
+                framework_route_tuple("ANY", r"^legacy/(?P<id>\d+)/$", "views.legacy", "django"),
+                framework_route_tuple("ANY", "detail/", "DetailView.as_view()", "django"),
+                framework_route_tuple("ANY", "api/posts/", "views.posts", "django"),
+                framework_route_tuple("ANY", "api/old/$", "views.old", "django"),
+            ])
+        );
+        assert!(scan
+            .routes
+            .iter()
+            .any(|route| { route.path == "api/posts/" && route.handler_file.as_deref() == Some("blog/views.py") }));
+        assert_eq!(scan.diagnostics.unresolved_routes.len(), 1);
+        let unresolved = &scan.diagnostics.unresolved_routes[0];
+        assert_eq!(unresolved.reason, "include_not_found");
+        assert_eq!(unresolved.path, "missing/");
+        assert_eq!(unresolved.handler_fn, "include(\"missing.urls\")");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_django_ambiguous_include_claims_all_matching_urlconfs() {
+        let _v3 = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for directory in ["project", "one/shared", "two/shared"] {
+            std::fs::create_dir_all(tmp.path().join(directory)).expect("urlconf dir");
+        }
+        std::fs::write(
+            tmp.path().join("project/settings.py"),
+            "ROOT_URLCONF = 'project.urls'\n",
+        )
+        .expect("settings");
+        std::fs::write(
+            tmp.path().join("project/urls.py"),
+            "from django.urls import include, path\nurlpatterns = [path('shared/', include('shared.urls'))]\n",
+        )
+        .expect("project urls");
+        for (directory, path) in [("one/shared", "one/"), ("two/shared", "two/")] {
+            std::fs::write(
+                tmp.path().join(directory).join("urls.py"),
+                format!("from django.urls import path\nurlpatterns = [path('{path}', views.child)]\n"),
+            )
+            .expect("ambiguous child urls");
+        }
+
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        assert!(framework_route_set(&scan).is_empty());
+        assert_eq!(scan.diagnostics.unresolved_routes.len(), 1);
+        assert_eq!(scan.diagnostics.unresolved_routes[0].reason, "include_ambiguous");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_django_identifier_include_is_diagnostic_not_child_root() {
+        let _v3 = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for directory in ["project", "blog"] {
+            std::fs::create_dir_all(tmp.path().join(directory)).expect("urlconf dir");
+        }
+        std::fs::write(
+            tmp.path().join("project/settings.py"),
+            "ROOT_URLCONF = 'project.urls'\n",
+        )
+        .expect("settings");
+        std::fs::write(
+            tmp.path().join("project/urls.py"),
+            "from django.urls import include, path\nfrom blog import urls as blog_urls\nurlpatterns = [path('blog/', include(blog_urls))]\n",
+        )
+        .expect("project urls");
+        std::fs::write(
+            tmp.path().join("blog/urls.py"),
+            "from django.urls import path\nurlpatterns = [path('posts/', views.posts)]\n",
+        )
+        .expect("blog urls");
+
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        assert!(framework_route_set(&scan).is_empty());
+        assert_eq!(scan.diagnostics.unresolved_routes.len(), 1);
+        assert_eq!(scan.diagnostics.unresolved_routes[0].reason, "include_dynamic");
+        assert_eq!(scan.diagnostics.unresolved_routes[0].handler_fn, "include(blog_urls)");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_spring_controller_mappings_and_arrays_are_precise() {
+        let _v3 = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("UsersController.java"),
+            r#"import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping(path = {"/api", "/admin"})
+public class UsersController {
+    @GetMapping(value = {"/users", "/people"})
+    public void list() {}
+
+    @PostMapping(path = "/users")
+    public void create() {}
+
+    @RequestMapping(path = "/search", method = RequestMethod.GET)
+    public void search() {}
+
+    @RequestMapping(value = "/multi", method = {RequestMethod.GET, RequestMethod.POST})
+    public void multi() {}
+
+    @RequestMapping
+    public void root() {}
+
+    @GetMapping
+    public void noPath() {}
+
+    @GetMapping(ApiPaths.USERS)
+    public void dynamicPath() {}
+}
+
+class LibraryOnly {
+    @GetMapping("/phantom")
+    public void helper() {}
+}
+"#,
+        )
+        .expect("controller");
+
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        let mut expected = BTreeSet::new();
+        for prefix in ["/api", "/admin"] {
+            for path in ["/users", "/people"] {
+                expected.insert(framework_route_tuple(
+                    "GET",
+                    &format!("{prefix}{path}"),
+                    "UsersController.list",
+                    "spring",
+                ));
+            }
+            expected.insert(framework_route_tuple(
+                "POST",
+                &format!("{prefix}/users"),
+                "UsersController.create",
+                "spring",
+            ));
+            expected.insert(framework_route_tuple(
+                "GET",
+                &format!("{prefix}/search"),
+                "UsersController.search",
+                "spring",
+            ));
+            for method in ["GET", "POST"] {
+                expected.insert(framework_route_tuple(
+                    method,
+                    &format!("{prefix}/multi"),
+                    "UsersController.multi",
+                    "spring",
+                ));
+            }
+            expected.insert(framework_route_tuple("ANY", prefix, "UsersController.root", "spring"));
+            expected.insert(framework_route_tuple("GET", prefix, "UsersController.noPath", "spring"));
+        }
+        assert_eq!(framework_route_set(&scan), expected);
+        assert!(scan.routes.iter().all(|route| route.path != "/phantom"));
+        assert!(scan.routes.iter().all(|route| {
+            route.framework.as_deref() != Some("spring")
+                || route.handler_file.as_deref() == Some("UsersController.java")
+        }));
+        let dynamic = scan
+            .diagnostics
+            .unresolved_routes
+            .iter()
+            .find(|route| route.handler_fn == "UsersController.dynamicPath")
+            .expect("dynamic Spring annotation diagnostic");
+        assert_eq!(dynamic.method, "GET");
+        assert_eq!(dynamic.reason, "annotation_dynamic");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_spring_test_source_controllers_are_suppressed() {
+        let _v3 = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let test_dir = tmp.path().join("src/test/java/com/acme");
+        std::fs::create_dir_all(&test_dir).expect("test source dir");
+        std::fs::write(
+            test_dir.join("TestController.java"),
+            r#"@RestController
+class TestController {
+    @GetMapping("/test-only")
+    void testOnly() {}
+}
+"#,
+        )
+        .expect("test controller");
+
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        assert!(scan.routes.is_empty());
+        assert!(scan
+            .files
+            .iter()
+            .find(|file| file.rel_path.ends_with("TestController.java"))
+            .is_some_and(|file| file.is_test_file));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_nextjs_file_routes_are_dependency_gated_and_precise() {
+        let _v2 = EnvVarGuard::unset(POLYGLOT_V2_ENV);
+        let _v3 = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"name":"next-fixture","dependencies":{"next":"15.0.0"}}"#,
+        )
+        .expect("package");
+        for directory in [
+            "pages/blog",
+            "pages/api",
+            "app/(marketing)/about",
+            "app/dashboard",
+            "app/api/items",
+            "app/@analytics",
+            "app/feed/(.)photo",
+            "app/archive/(..)(..)photo",
+            "app/pages/[slug]",
+            "src/components/pages",
+            "components",
+        ] {
+            std::fs::create_dir_all(tmp.path().join(directory)).expect("route dir");
+        }
+        for (path, source) in [
+            ("pages/index.tsx", "export default function Home() { return null; }\n"),
+            (
+                "pages/blog/[slug].tsx",
+                "export default function Blog() { return null; }\n",
+            ),
+            ("pages/_app.tsx", "export default function App() { return null; }\n"),
+            (
+                "pages/api/users.ts",
+                "export function GET() {}\nexport const POST = () => {};\n",
+            ),
+            ("pages/api/_internal.ts", "export function GET() {}\n"),
+            (
+                "app/(marketing)/about/page.tsx",
+                "export default function About() { return null; }\n",
+            ),
+            (
+                "app/dashboard/page.jsx",
+                "export default function Dashboard() { return null; }\n",
+            ),
+            (
+                "app/api/items/route.ts",
+                "export async function GET() {}\nexport const POST = () => {};\n",
+            ),
+            ("app/@analytics/page.tsx", "export default function Analytics() {}\n"),
+            ("app/feed/(.)photo/page.tsx", "export default function Photo() {}\n"),
+            (
+                "app/archive/(..)(..)photo/page.tsx",
+                "export default function ArchivePhoto() {}\n",
+            ),
+            ("app/pages/[slug]/page.tsx", "export default function NestedPage() {}\n"),
+            ("src/components/pages/Card.tsx", "export function Card() {}\n"),
+            (
+                "components/client.ts",
+                "fetch('/client-only');\naxios.get('/api/not-a-server-route');\n",
+            ),
+        ] {
+            std::fs::write(tmp.path().join(path), source).expect("fixture source");
+        }
+
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        assert_eq!(
+            framework_route_set(&scan),
+            BTreeSet::from([
+                framework_route_tuple("ANY", "/", "pages/index.tsx", "nextjs"),
+                framework_route_tuple("ANY", "/blog/[slug]", "pages/blog/[slug].tsx", "nextjs"),
+                framework_route_tuple("GET", "/api/users", "pages/api/users.ts", "nextjs"),
+                framework_route_tuple("POST", "/api/users", "pages/api/users.ts", "nextjs"),
+                framework_route_tuple("ANY", "/about", "app/(marketing)/about/page.tsx", "nextjs"),
+                framework_route_tuple("ANY", "/dashboard", "app/dashboard/page.jsx", "nextjs"),
+                framework_route_tuple("GET", "/api/items", "app/api/items/route.ts", "nextjs"),
+                framework_route_tuple("POST", "/api/items", "app/api/items/route.ts", "nextjs"),
+                framework_route_tuple("ANY", "/", "app/@analytics/page.tsx", "nextjs"),
+                framework_route_tuple("ANY", "/feed/photo", "app/feed/(.)photo/page.tsx", "nextjs"),
+                framework_route_tuple("ANY", "/archive/photo", "app/archive/(..)(..)photo/page.tsx", "nextjs",),
+                framework_route_tuple("ANY", "/pages/[slug]", "app/pages/[slug]/page.tsx", "nextjs",),
+            ])
+        );
+        assert!(scan.routes.iter().all(|route| !route.path.contains("client-only")));
+        assert!(scan
+            .routes
+            .iter()
+            .all(|route| !route.path.contains("not-a-server-route")));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_nuxt_file_routes_are_precise() {
+        let _v3 = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("package.json"), r#"{"dependencies":{"nuxt":"4.0.0"}}"#).expect("package");
+        std::fs::create_dir_all(tmp.path().join("pages/users")).expect("pages");
+        std::fs::create_dir_all(tmp.path().join("src/components/pages")).expect("components");
+        std::fs::write(tmp.path().join("pages/index.vue"), "<template>home</template>\n").expect("index");
+        std::fs::write(tmp.path().join("pages/users/[id].vue"), "<template>user</template>\n").expect("user");
+        std::fs::write(
+            tmp.path().join("src/components/pages/Card.vue"),
+            "<template>not a route</template>\n",
+        )
+        .expect("component");
+
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        assert_eq!(
+            framework_route_set(&scan),
+            BTreeSet::from([
+                framework_route_tuple("ANY", "/", "pages/index.vue", "nuxt"),
+                framework_route_tuple("ANY", "/users/[id]", "pages/users/[id].vue", "nuxt"),
+            ])
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_sveltekit_file_routes_and_exported_verbs_are_precise() {
+        let _v3 = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"devDependencies":{"@sveltejs/kit":"2.0.0"}}"#,
+        )
+        .expect("package");
+        for directory in [
+            "src/routes",
+            "src/routes/blog/[slug]",
+            "src/routes/api/items",
+            "src/routes/(app)/dashboard",
+            "src/routes/(api)/grouped",
+        ] {
+            std::fs::create_dir_all(tmp.path().join(directory)).expect("route dir");
+        }
+        std::fs::write(tmp.path().join("src/routes/+page.svelte"), "<h1>Home</h1>\n").expect("root page");
+        std::fs::write(
+            tmp.path().join("src/routes/blog/[slug]/+page.svelte"),
+            "<h1>Blog</h1>\n",
+        )
+        .expect("blog page");
+        std::fs::write(
+            tmp.path().join("src/routes/api/items/+server.ts"),
+            "export function GET() {}\nexport const DELETE = () => {};\n",
+        )
+        .expect("server");
+        std::fs::write(
+            tmp.path().join("src/routes/(app)/dashboard/+page.svelte"),
+            "<h1>Dashboard</h1>\n",
+        )
+        .expect("grouped page");
+        std::fs::write(
+            tmp.path().join("src/routes/(api)/grouped/+server.ts"),
+            "export function POST() {}\n",
+        )
+        .expect("grouped server");
+
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        assert_eq!(
+            framework_route_set(&scan),
+            BTreeSet::from([
+                framework_route_tuple("ANY", "/", "src/routes/+page.svelte", "sveltekit"),
+                framework_route_tuple(
+                    "ANY",
+                    "/blog/[slug]",
+                    "src/routes/blog/[slug]/+page.svelte",
+                    "sveltekit",
+                ),
+                framework_route_tuple("GET", "/api/items", "src/routes/api/items/+server.ts", "sveltekit"),
+                framework_route_tuple("DELETE", "/api/items", "src/routes/api/items/+server.ts", "sveltekit",),
+                framework_route_tuple(
+                    "ANY",
+                    "/dashboard",
+                    "src/routes/(app)/dashboard/+page.svelte",
+                    "sveltekit",
+                ),
+                framework_route_tuple("POST", "/grouped", "src/routes/(api)/grouped/+server.ts", "sveltekit",),
+            ])
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_file_routes_require_framework_dependency() {
+        let _v3 = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"dependencies":{"react":"19.0.0"}}"#,
+        )
+        .expect("package");
+        std::fs::create_dir_all(tmp.path().join("pages")).expect("pages");
+        std::fs::write(
+            tmp.path().join("pages/index.tsx"),
+            "export default function Page() {}\n",
+        )
+        .expect("page");
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        assert!(framework_route_set(&scan).is_empty());
+        assert!(scan.routes.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_nested_package_without_framework_shadows_parent_scope() {
+        let _v3 = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("package.json"), r#"{"dependencies":{"next":"15.0.0"}}"#).expect("root package");
+        std::fs::create_dir_all(tmp.path().join("pages")).expect("root pages");
+        std::fs::write(
+            tmp.path().join("pages/index.tsx"),
+            "export default function Home() {}\n",
+        )
+        .expect("home");
+        std::fs::create_dir_all(tmp.path().join("docs/pages")).expect("docs pages");
+        std::fs::write(
+            tmp.path().join("docs/package.json"),
+            r#"{"dependencies":{"react":"19.0.0"}}"#,
+        )
+        .expect("docs package");
+        std::fs::write(
+            tmp.path().join("docs/pages/intro.tsx"),
+            "export default function Intro() {}\n",
+        )
+        .expect("intro");
+
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        assert_eq!(
+            framework_route_set(&scan),
+            BTreeSet::from([framework_route_tuple("ANY", "/", "pages/index.tsx", "nextjs")])
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_dark_route_trees_unset_and_zero_are_byte_identical() {
+        let _v2 = EnvVarGuard::unset(POLYGLOT_V2_ENV);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"dependencies":{"next":"15","nuxt":"4","@sveltejs/kit":"2"}}"#,
+        )
+        .expect("package");
+        for directory in ["pages", "app/api", "src/routes", "django", "spring"] {
+            std::fs::create_dir_all(tmp.path().join(directory)).expect("dark dir");
+        }
+        std::fs::write(
+            tmp.path().join("pages/index.tsx"),
+            "export default function Page() {}\n",
+        )
+        .expect("next");
+        std::fs::write(tmp.path().join("pages/nuxt.vue"), "<template>dark</template>\n").expect("nuxt");
+        std::fs::write(tmp.path().join("app/api/route.ts"), "export function GET() {}\n").expect("app");
+        std::fs::write(tmp.path().join("src/routes/+page.svelte"), "<p>dark</p>\n").expect("svelte");
+        std::fs::write(
+            tmp.path().join("django/urls.py"),
+            "from django.urls import path\nurlpatterns = [path('x/', views.x)]\n",
+        )
+        .expect("django");
+        std::fs::write(
+            tmp.path().join("spring/DarkController.java"),
+            "@RestController class DarkController { @GetMapping(\"/x\") void x() {} }\n",
+        )
+        .expect("spring");
+
+        let unset = {
+            let _v3 = EnvVarGuard::unset(POLYGLOT_V3_ENV);
+            stable_scan_json(run_repo_scan_at(tmp.path()).expect("unset scan"))
+        };
+        let zero = {
+            let _v3 = EnvVarGuard::set(POLYGLOT_V3_ENV, "0");
+            stable_scan_json(run_repo_scan_at(tmp.path()).expect("zero scan"))
+        };
+        assert_eq!(unset.as_bytes(), zero.as_bytes());
+        assert!(!unset.contains("nextjs"));
+        assert!(!unset.contains("\"framework\":\"django\""));
+        assert!(!unset.contains("\"framework\":\"spring\""));
+        assert!(!unset.contains(POLYGLOT_V3_ENV));
     }
 
     #[test]
