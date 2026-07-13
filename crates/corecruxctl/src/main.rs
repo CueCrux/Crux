@@ -1763,6 +1763,41 @@ enum ParityCommand {
 
 #[derive(Debug, Subcommand)]
 enum ReceiptsCommand {
+    /// Export a CROWN JSON receipt as a CROWN SCITT Profile v0.2 COSE_Sign1 statement.
+    #[command(name = "export-cose")]
+    ExportCose {
+        /// JSON receipt path. Accepts a direct receipt or `{ "receipt": ... }` wrapper.
+        input: PathBuf,
+        /// Output path. Defaults to the input path with a `.cose` extension.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Standard-base64 32-byte Ed25519 signing seed.
+        #[arg(long, conflicts_with_all = ["key_file", "gen_dev_key"], required_unless_present_any = ["key_file", "gen_dev_key"])]
+        key_b64: Option<String>,
+        /// File containing a raw 32-byte Ed25519 seed or its standard-base64 encoding.
+        #[arg(long, conflicts_with_all = ["key_b64", "gen_dev_key"])]
+        key_file: Option<PathBuf>,
+        /// Use the documented deterministic ResearchCrux development key.
+        #[arg(long, default_value_t = false, conflicts_with_all = ["key_b64", "key_file"])]
+        gen_dev_key: bool,
+        /// Absolute issuer URI placed in the protected CWT claims.
+        #[arg(long, default_value = "https://crux.local")]
+        iss: String,
+        /// Key identifier placed in protected header label 4.
+        #[arg(long)]
+        kid: String,
+    },
+
+    /// Verify a CROWN SCITT Profile v0.2 COSE_Sign1 statement offline.
+    #[command(name = "verify-cose")]
+    VerifyCose {
+        /// COSE_Sign1 statement path.
+        input: PathBuf,
+        /// Standard-base64 32-byte Ed25519 public key. Omit only for the fixed development key.
+        #[arg(long)]
+        pubkey_b64: Option<String>,
+    },
+
     /// Seed a minimal receipt body+sig into a shard directory (offline, dev-only).
     #[command(name = "seed-minimal")]
     SeedMinimal {
@@ -3114,6 +3149,38 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
         Command::Receipts { command } => match command {
+            ReceiptsCommand::ExportCose {
+                input,
+                out,
+                key_b64,
+                key_file,
+                gen_dev_key,
+                iss,
+                kid,
+            } => {
+                let report = receipts::export_cose_file_v1(&receipts::CoseExportOptionsV1 {
+                    input: &input,
+                    out: out.as_deref(),
+                    key_b64: key_b64.as_deref(),
+                    key_file: key_file.as_deref(),
+                    gen_dev_key,
+                    issuer: &iss,
+                    kid: &kid,
+                })?;
+                println!(
+                    "COSE_Sign1 exported: snap-id={} kid={} bytes={} dev-key={} out={}",
+                    report.snap_id, report.kid, report.bytes_written, report.development_key, report.output_path
+                );
+                Ok(())
+            }
+            ReceiptsCommand::VerifyCose { input, pubkey_b64 } => {
+                let report = receipts::verify_cose_file_v1(&input, pubkey_b64.as_deref())?;
+                println!(
+                    "COSE_Sign1 verification OK: snap-id={} kid={} iss={} dev-key={} file={}",
+                    report.snap_id, report.kid, report.issuer, report.development_key, report.input_path
+                );
+                Ok(())
+            }
             ReceiptsCommand::SeedMinimal {
                 data_dir,
                 shard,
@@ -5249,6 +5316,92 @@ mod tests {
                 assert!(dry_run);
                 assert_eq!(min_age_seconds, 300);
                 assert_eq!(max_delete, 0);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_receipts_export_cose() {
+        let cli = Cli::try_parse_from([
+            "corecruxctl",
+            "receipts",
+            "export-cose",
+            "/tmp/receipt.json",
+            "--out",
+            "/tmp/receipt.cose",
+            "--gen-dev-key",
+            "--kid",
+            "dev:v1",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Receipts {
+                command:
+                    ReceiptsCommand::ExportCose {
+                        input,
+                        out,
+                        key_b64,
+                        key_file,
+                        gen_dev_key,
+                        iss,
+                        kid,
+                    },
+            } => {
+                assert_eq!(input, PathBuf::from("/tmp/receipt.json"));
+                assert_eq!(out, Some(PathBuf::from("/tmp/receipt.cose")));
+                assert!(key_b64.is_none());
+                assert!(key_file.is_none());
+                assert!(gen_dev_key);
+                assert_eq!(iss, "https://crux.local");
+                assert_eq!(kid, "dev:v1");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_receipts_export_cose_requires_one_key_source() {
+        assert!(Cli::try_parse_from([
+            "corecruxctl",
+            "receipts",
+            "export-cose",
+            "/tmp/receipt.json",
+            "--kid",
+            "dev:v1",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "corecruxctl",
+            "receipts",
+            "export-cose",
+            "/tmp/receipt.json",
+            "--key-b64",
+            "AA==",
+            "--gen-dev-key",
+            "--kid",
+            "dev:v1",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn parse_receipts_verify_cose() {
+        let cli = Cli::try_parse_from([
+            "corecruxctl",
+            "receipts",
+            "verify-cose",
+            "/tmp/receipt.cose",
+            "--pubkey-b64",
+            "AA==",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Receipts {
+                command: ReceiptsCommand::VerifyCose { input, pubkey_b64 },
+            } => {
+                assert_eq!(input, PathBuf::from("/tmp/receipt.cose"));
+                assert_eq!(pubkey_b64.as_deref(), Some("AA=="));
             }
             other => panic!("unexpected command: {other:?}"),
         }

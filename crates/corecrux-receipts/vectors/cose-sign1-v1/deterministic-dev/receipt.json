@@ -1,0 +1,63 @@
+{
+  "receiptId": "interop-receipt-001",
+  "snapshotId": "d0000001-0001-4000-8000-000000000001",
+  "answerId": "c0000001-0001-4000-8000-000000000001",
+  "parentSnapId": null,
+  "generatedAt": "2026-03-24T12:00:01.000Z",
+  "mode": "verified",
+  "modeRequested": "verified",
+  "queryHash": "blake3:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+  "queryText": "Which CROWN claims support this answer?",
+  "receiptHash": "blake3:6d23e12072d137add0f8e63bea288812bdf50901801970eb8bd0ca906d050505",
+  "fusion": {
+    "w_bm25": 0.5,
+    "w_vec": 0.5,
+    "rrf_k": 60
+  },
+  "retrieval": {
+    "topK": 10,
+    "rerank": true,
+    "minDomains": 1,
+    "budget": "standard"
+  },
+  "selection": {
+    "miSESSize": 2,
+    "citationIds": [
+      "doc-interop-001",
+      "doc-interop-002"
+    ],
+    "coverage": {
+      "crown-profile": [
+        "doc-interop-001",
+        "doc-interop-002"
+      ]
+    },
+    "distinctDomains": 1,
+    "fragilityScore": 0.25,
+    "loadBearingCitations": [
+      "doc-interop-001"
+    ]
+  },
+  "timings": {
+    "retrieveMs": 120,
+    "rerankMs": 35,
+    "llmMs": 950,
+    "totalMs": 1105
+  },
+  "knowledgeStateCursor": {
+    "shardId": 1,
+    "epoch": 3,
+    "segmentSeq": 42,
+    "offset": 7
+  },
+  "tenantId": "tenant-interop",
+  "llmModel": "interop-model-v1",
+  "llmRequestId": "request-interop-001",
+  "evidence": [
+    {
+      "sourceId": "doc-interop-001",
+      "role": "support",
+      "quoteHash": "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    }
+  ]
+}
