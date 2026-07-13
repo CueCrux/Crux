@@ -11,9 +11,10 @@
 //! and **without** a GPU. This is the CPU "store + serve" half of the
 //! "process in the platform, serve on your node" split.
 //!
-//! Gating: `CORECRUXD_LOCAL_INGEST=1`, default OFF. When off the route returns
-//! 404 so the surface is invisible rather than half-alive (same convention as
-//! the coord/context-surface planes). `/v1/append` behaviour is unchanged.
+//! Gating: default ON; `CORECRUXD_LOCAL_INGEST=0` or `false` disables the
+//! route. When off it returns 404 so the surface is invisible rather than
+//! half-alive (same convention as the coord/context-surface planes).
+//! `/v1/append` behaviour is unchanged.
 //!
 //! ExecPlan `cpu-prose-ingest-door-2026-07-01`:
 //! - M1: payload contract + flagged endpoint skeleton (validate + tenant-scope
@@ -176,7 +177,7 @@ pub(super) fn validate_payload(body: &LocalIngestBody) -> Result<AcceptedCounts,
 fn local_ingest_disabled_response() -> Response {
     problem_response(
         StatusCode::NOT_FOUND,
-        "local ingest disabled (set CORECRUXD_LOCAL_INGEST=1)".to_string(),
+        "local ingest disabled by CORECRUXD_LOCAL_INGEST=0/false".to_string(),
     )
 }
 
@@ -438,17 +439,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flag_off_returns_404() {
-        // Default test auth mode is Off; flag defaults off.
-        let state = super::super::tests::test_app_state(16);
+    #[serial_test::serial]
+    async fn default_config_accepts_ingest() {
+        std::env::remove_var("CORECRUXD_LOCAL_INGEST");
+        let config = crate::config::load_config();
+        assert!(config.local_ingest_enabled);
+
+        let mut state = super::super::tests::test_app_state(16);
+        state.local_ingest_enabled = config.local_ingest_enabled;
         let resp = post_local_ingest(State(state), HeaderMap::new(), Json(valid_body()))
             .await
             .into_response();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn explicit_zero_disables_ingest_with_404() {
+        std::env::set_var("CORECRUXD_LOCAL_INGEST", "0");
+        let config = crate::config::load_config();
+        assert!(!config.local_ingest_enabled);
+
+        let mut state = super::super::tests::test_app_state(16);
+        state.local_ingest_enabled = config.local_ingest_enabled;
+        let resp = post_local_ingest(State(state), HeaderMap::new(), Json(valid_body()))
+            .await
+            .into_response();
+        std::env::remove_var("CORECRUXD_LOCAL_INGEST");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
-    async fn flag_on_valid_returns_202() {
+    async fn enabled_state_valid_returns_202() {
         // AuthMode::Off short-circuits scope/tenant checks.
         let mut state = super::super::tests::test_app_state(16);
         state.local_ingest_enabled = true;

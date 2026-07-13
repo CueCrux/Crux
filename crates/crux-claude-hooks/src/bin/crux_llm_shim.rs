@@ -24,20 +24,45 @@
 
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use crux_claude_hooks::llm_shim;
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CloudProvider {
+    Anthropic,
+    Openai,
+}
+
+impl From<CloudProvider> for llm_shim::allowlist::CloudUpstream {
+    fn from(provider: CloudProvider) -> Self {
+        match provider {
+            CloudProvider::Anthropic => Self::Anthropic,
+            CloudProvider::Openai => Self::OpenAi,
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
     name = "crux-llm-shim",
-    about = "Local-LLM context-injection shim for the Crux Daemon (experimental, default-OFF).",
+    about = "Crux local context-injection shim and cloud traffic witness (experimental, default-OFF).",
     version
 )]
 struct Cli {
     /// Upstream model server base URL. Allowlist: localhost / loopback /
     /// RFC1918 literal IPs only, plain http. Cloud upstreams are refused.
-    #[arg(long)]
-    upstream: String,
+    #[arg(long, required_unless_present = "cloud_witness", conflicts_with = "cloud_witness")]
+    upstream: Option<String>,
+
+    /// Run forgery-resistant cloud witness mode. Requires the independent
+    /// CRUX_CLOUD_WITNESS=1 gate and --cloud-upstream.
+    #[arg(long, conflicts_with_all = ["bundle_file", "context_endpoint"])]
+    cloud_witness: bool,
+
+    /// Pinned cloud provider: anthropic or openai. No arbitrary cloud URL is
+    /// accepted in production.
+    #[arg(long, value_enum, requires = "cloud_witness")]
+    cloud_upstream: Option<CloudProvider>,
 
     /// Loopback address to listen on.
     #[arg(long, default_value = "127.0.0.1:11435")]
@@ -54,13 +79,23 @@ struct Cli {
     context_endpoint: Option<String>,
 
     /// Session id stamped on receipt records. Default: `shim-<pid>-<epoch>`.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "cloud_witness")]
     session_id: Option<String>,
 
     /// JSONL spool for receipt records when the daemon is unreachable (or
     /// --no-daemon-receipts is set).
     #[arg(long)]
     receipts_spool: Option<PathBuf>,
+
+    /// Persistent Ed25519 cloud-witness seed. Created owner-only on first
+    /// witness start and reused thereafter.
+    #[arg(long, requires = "cloud_witness")]
+    witness_key: Option<PathBuf>,
+
+    /// DANGER: honor CRUX_CLOUD_WITNESS_TEST_UPSTREAM as an insecure loopback
+    /// HTTP upstream. Tests only; every emitted record is stamped accordingly.
+    #[arg(long, requires = "cloud_witness")]
+    insecure_test_upstream: bool,
 
     /// Disable best-effort POSTs to the daemon's /v1/mediation/receipts
     /// (records then go to the local spool only).
@@ -76,6 +111,14 @@ fn default_spool() -> PathBuf {
     base.join("crux/llm-shim/receipts.jsonl")
 }
 
+fn default_witness_key() -> PathBuf {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("crux/llm-shim/witness.key")
+}
+
 fn main() {
     let cli = Cli::parse();
     if let Err(err) = run(cli) {
@@ -85,8 +128,19 @@ fn main() {
 }
 
 fn run(cli: Cli) -> anyhow::Result<()> {
+    if cli.cloud_witness {
+        return run_cloud_witness(cli);
+    }
+    run_local_shim(cli)
+}
+
+fn run_local_shim(cli: Cli) -> anyhow::Result<()> {
     llm_shim::ensure_enabled()?;
-    let upstream = llm_shim::allowlist::validate_upstream(&cli.upstream)?;
+    let upstream_arg = cli
+        .upstream
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--upstream is required in local shim mode"))?;
+    let upstream = llm_shim::allowlist::validate_upstream(upstream_arg)?;
 
     let bundle = match (&cli.bundle_file, &cli.context_endpoint) {
         (Some(path), _) => Some(llm_shim::bundle_from_file(path)?),
@@ -136,6 +190,48 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     let handle = llm_shim::serve(config)?;
     eprintln!("crux-llm-shim: listening on {}", handle.addr);
     // Run until killed; the accept loop owns the listener thread.
+    loop {
+        std::thread::park();
+    }
+}
+
+fn run_cloud_witness(cli: Cli) -> anyhow::Result<()> {
+    llm_shim::ensure_cloud_witness_enabled()?;
+    let provider = cli
+        .cloud_upstream
+        .ok_or_else(|| anyhow::anyhow!("--cloud-upstream is required with --cloud-witness"))?;
+    let insecure_test_upstream = llm_shim::cloud_test_upstream_from_env(cli.insecure_test_upstream)?;
+    let mut config = llm_shim::CloudWitnessConfig::new(
+        provider.into(),
+        cli.listen,
+        cli.witness_key.unwrap_or_else(default_witness_key),
+        cli.receipts_spool.unwrap_or_else(default_spool),
+        !cli.no_daemon_receipts,
+    );
+    if cli.insecure_test_upstream {
+        let test_url = insecure_test_upstream
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--insecure-test-upstream requires CRUX_CLOUD_WITNESS_TEST_UPSTREAM"))?;
+        config = config.with_insecure_test_upstream(test_url)?;
+    }
+    let upstream_label = config
+        .insecure_test_upstream()
+        .unwrap_or_else(|| config.provider.base_url());
+    eprintln!(
+        "crux-llm-shim (CLOUD WITNESS): {} -> {} | provider: {} | key: {} | receipts: {}{}",
+        config.listen,
+        upstream_label,
+        config.provider.provider(),
+        config.witness_key.display(),
+        if config.daemon_receipts {
+            "daemon+spool "
+        } else {
+            "spool-only "
+        },
+        config.receipts_spool.display()
+    );
+    let handle = llm_shim::serve_cloud_witness(config)?;
+    eprintln!("crux-llm-shim: cloud witness listening on {}", handle.addr);
     loop {
         std::thread::park();
     }

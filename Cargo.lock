@@ -749,12 +749,15 @@ dependencies = [
  "base64",
  "blake3",
  "chacha20poly1305",
+ "chrono",
  "ciborium",
+ "ciborium-ll",
  "cms",
  "const-oid 0.10.2",
  "corecrux-types",
  "der 0.7.10",
  "ed25519-dalek",
+ "half",
  "p256",
  "parking_lot",
  "proptest",
@@ -771,6 +774,7 @@ dependencies = [
  "thiserror 2.0.18",
  "ureq 2.12.1",
  "url",
+ "uuid",
  "x509-cert 0.2.5",
  "x509-parser",
  "zip",
@@ -1246,9 +1250,14 @@ name = "crux-claude-hooks"
 version = "0.5.40"
 dependencies = [
  "anyhow",
+ "base64",
  "blake3",
  "clap",
  "crux-config-wizard",
+ "ed25519-dalek",
+ "fs2",
+ "hex",
+ "rand 0.10.2",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -1822,7 +1831,6 @@ version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
- "crc32fast",
  "miniz_oxide",
  "zlib-rs",
 ]
@@ -4928,7 +4936,6 @@ checksum = "dea7109cdcd5864d4eeb1b58a1648dc9bf520360d7af16ec26d0a9354bafcfc0"
 dependencies = [
  "base64",
  "cookie_store",
- "flate2",
  "log",
  "percent-encoding",
  "rustls",

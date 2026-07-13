@@ -4,6 +4,10 @@
 // See LICENCE.md in the repository root.
 
 //! Retrieval routes — `/v1/query/text-search`, `/text-search/expand`, `/graph-expand`, `/time-range`.
+//!
+//! Text search is available by default; set `CORECRUXD_QUERY_TEXT_SEARCH=0`
+//! or `false` to make both text-search routes return 404. Graph expansion and
+//! time-range queries remain opt-in.
 
 use super::*;
 use corecrux_memory::semantic::{MIXED_PROFILE_MERGE_RULE, SCORE_MERGE_RULE_SINGLE_SPACE, SCORE_SPACE_BM25_LEXICAL};
@@ -395,7 +399,7 @@ pub(super) fn default_text_search_limit() -> usize {
         (status = 200, description = "Text search results"),
         (status = 400, description = "Invalid request"),
         (status = 401, description = "Unauthorized"),
-        (status = 404, description = "Feature not enabled"),
+        (status = 404, description = "Text search explicitly disabled"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -698,7 +702,7 @@ pub(super) struct ExpandResultId {
     responses(
         (status = 200, description = "Expanded text search results"),
         (status = 401, description = "Unauthorized"),
-        (status = 404, description = "Feature not enabled"),
+        (status = 404, description = "Text search explicitly disabled"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -902,9 +906,9 @@ mod query_tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn text_search_feature_gate_off_is_404() {
+    async fn text_search_is_on_by_default_and_explicitly_disabled() {
         std::env::remove_var("CORECRUXD_QUERY_TEXT_SEARCH");
-        let body = TextSearchBody {
+        let body = || TextSearchBody {
             tenant_id: "t1".to_string(),
             query: "hello".to_string(),
             limit: 10,
@@ -913,9 +917,24 @@ mod query_tests {
             mode: None,
             include_receipt: None,
         };
-        let resp = post_query_text_search(State(enabled()), HeaderMap::new(), Json(body))
+
+        let resp = post_query_text_search(State(enabled()), HeaderMap::new(), Json(body()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        std::env::set_var("CORECRUXD_QUERY_TEXT_SEARCH", "0");
+        let resp = post_query_text_search(State(enabled()), HeaderMap::new(), Json(body()))
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        std::env::set_var("CORECRUXD_QUERY_TEXT_SEARCH", "false");
+        let resp = post_query_text_search(State(enabled()), HeaderMap::new(), Json(body()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        std::env::remove_var("CORECRUXD_QUERY_TEXT_SEARCH");
     }
 }
