@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Independent Audit Bundle vector verifier (formats v1 and v2).
+"""Independent Audit Bundle vector verifier (formats v1, v2, and v3).
 
 This verifier intentionally supports unpacked vector directories and `.tar.zst`
 archives. It mirrors the documented checks without using the Rust implementation,
-including both signing formats: v1 (struct-order JSON, no domain tag) and v2
-(the `cuecrux.audit_bundle.v2` domain tag followed by key-canonical JSON), so it
+including all signing formats: v1 (struct-order JSON, no domain tag), v2
+(the `cuecrux.audit_bundle.v2` domain tag followed by key-canonical JSON), and
+v3 (the equivalent v3 domain plus signed key provenance), so it
 can verify the bundles the daemon now emits by default.
 """
 
@@ -28,13 +29,15 @@ from cryptography.hazmat.primitives.serialization import load_der_public_key, lo
 
 
 LEGACY_VERSION = 1
-CURRENT_VERSION = 2
-SUPPORTED_VERSIONS = (LEGACY_VERSION, CURRENT_VERSION)
+VERSION_2 = 2
+CURRENT_VERSION = 3
+SUPPORTED_VERSIONS = (LEGACY_VERSION, VERSION_2, CURRENT_VERSION)
 
 # Domain-separation tag prefixed to the v2 signing input. Mirrors
 # corecrux_receipts::audit_bundle_v1::AUDIT_BUNDLE_SIGNING_DOMAIN
 # (b"cuecrux.audit_bundle.v2\0").
 AUDIT_BUNDLE_SIGNING_DOMAIN_V2 = b"cuecrux.audit_bundle.v2\x00"
+AUDIT_BUNDLE_SIGNING_DOMAIN_V3 = b"cuecrux.audit_bundle.v3\x00"
 
 
 def canonical_manifest_bytes(manifest: dict) -> bytes:
@@ -42,7 +45,7 @@ def canonical_manifest_bytes(manifest: dict) -> bytes:
     ``bundle_format_version`` (mirrors ``AuditBundleManifestV1::canonical_signing_bytes``):
 
     * **v1** (legacy): compact JSON in the manifest's own field order, no domain tag.
-    * **v2** (current): the domain tag followed by compact JSON with object keys
+    * **v2/v3**: the versioned domain tag followed by compact JSON with object keys
       sorted **recursively**, so the signed bytes are independent of field order.
       Python's ``json.dumps(sort_keys=True)`` matches the Rust ``canonical_json_bytes``
       recursive key sort; the manifest carries only strings/integers/nested objects
@@ -50,11 +53,13 @@ def canonical_manifest_bytes(manifest: dict) -> bytes:
     """
     signing_manifest = dict(manifest)
     signing_manifest["signature_b64"] = ""
-    if manifest.get("bundle_format_version") == CURRENT_VERSION:
+    version = manifest.get("bundle_format_version")
+    if version in (VERSION_2, CURRENT_VERSION):
         canonical = json.dumps(
             signing_manifest, separators=(",", ":"), ensure_ascii=False, sort_keys=True
         ).encode("utf-8")
-        return AUDIT_BUNDLE_SIGNING_DOMAIN_V2 + canonical
+        domain = AUDIT_BUNDLE_SIGNING_DOMAIN_V2 if version == VERSION_2 else AUDIT_BUNDLE_SIGNING_DOMAIN_V3
+        return domain + canonical
     return json.dumps(signing_manifest, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
@@ -294,6 +299,12 @@ def read_unpacked_members(path: Path) -> tuple[dict, bytes, bytes, bytes | None]
 
     if manifest.get("bundle_format_version") not in SUPPORTED_VERSIONS:
         return fail(manifest, f"unsupported bundle_format_version: {manifest.get('bundle_format_version')}")
+    if manifest.get("bundle_format_version") == CURRENT_VERSION and manifest.get("key_class") not in {
+        "persistent",
+        "env",
+        "ephemeral",
+    }:
+        return fail(manifest, "manifest missing or invalid required field: key_class")
     if not events_path.exists():
         return fail(manifest, "missing events.jsonl")
     if not receipts_path.exists():
@@ -323,6 +334,12 @@ def verify_vector(path: Path, rekor_pubkey: bytes | None = None) -> dict:
 
     if manifest.get("bundle_format_version") not in SUPPORTED_VERSIONS:
         return fail(manifest, f"unsupported bundle_format_version: {manifest.get('bundle_format_version')}")
+    if manifest.get("bundle_format_version") == CURRENT_VERSION and manifest.get("key_class") not in {
+        "persistent",
+        "env",
+        "ephemeral",
+    }:
+        return fail(manifest, "manifest missing or invalid required field: key_class")
 
     events_hash = hashlib.sha256(events).hexdigest()
     receipts_hash = hashlib.sha256(receipts).hexdigest()

@@ -36,6 +36,7 @@ pub mod fixture_digest;
 pub mod gaps;
 pub mod hooks;
 pub mod identity_cli;
+pub mod incident;
 pub mod ingest;
 pub mod inspect_receipt;
 pub mod learn;

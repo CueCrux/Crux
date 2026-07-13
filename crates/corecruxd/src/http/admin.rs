@@ -1041,6 +1041,13 @@ pub(super) async fn execute_admin_action(
             let apply_retention = read_param_bool(params, "applyRetention")
                 .or_else(|| read_param_bool(params, "apply_retention"))
                 .unwrap_or(false);
+            // Legal holds block ordinary hard deletion. GDPR/RTBF remains the
+            // higher-priority full-tenant primitive, but the override must be
+            // explicit (never inferred from free-text reason) and produces a
+            // durable signed `legal_hold_overridden` observation receipt.
+            let gdpr_full_tenant_erasure = read_param_bool(params, "gdprFullTenantErasure")
+                .or_else(|| read_param_bool(params, "gdpr_full_tenant_erasure"))
+                .unwrap_or(false);
 
             let started = std::time::Instant::now();
             let mut retention_marked: Vec<String> = Vec::new();
@@ -1048,8 +1055,19 @@ pub(super) async fn execute_admin_action(
 
             // Mark-then-compact under a single write lock so the on-disk journal
             // reflects exactly the marks we just made.
-            let report = {
+            let (report, legal_hold_override_receipt) = {
                 let mut store = state.fact_store.write().await;
+                let covered = store.deleted_facts_covered_by_legal_holds();
+                if !covered.is_empty() && !gdpr_full_tenant_erasure {
+                    let hold_ids: std::collections::BTreeSet<&str> = covered
+                        .iter()
+                        .flat_map(|(_, ids)| ids.iter().map(String::as_str))
+                        .collect();
+                    return Err(admin_action_error(format!(
+                        "hard erasure blocked by active legal hold(s): {}; set gdprFullTenantErasure=true with tenantId only for a full-tenant GDPR erasure",
+                        hold_ids.into_iter().collect::<Vec<_>>().join(",")
+                    )));
+                }
                 if apply_retention {
                     match state.retention_days {
                         Some(days) => {
@@ -1064,9 +1082,68 @@ pub(super) async fn execute_admin_action(
                         }
                     }
                 }
-                store
-                    .compact_journal()
-                    .map_err(|e| admin_action_error(format!("journal compaction failed: {e}")))?
+                if covered.is_empty() {
+                    let report = store
+                        .compact_journal()
+                        .map_err(|e| admin_action_error(format!("journal compaction failed: {e}")))?;
+                    (report, None)
+                } else {
+                    let tenant_id = read_param_str(params, "tenantId")
+                        .or_else(|| read_param_str(params, "tenant_id"))
+                        .ok_or_else(|| {
+                            admin_action_error("tenantId is required when gdprFullTenantErasure overrides a legal hold")
+                        })?;
+                    let active_holds = store.active_legal_holds();
+                    let mut hold_ids: Vec<String> = covered.iter().flat_map(|(_, ids)| ids.iter().cloned()).collect();
+                    hold_ids.sort();
+                    hold_ids.dedup();
+                    let outside_tenant = active_holds
+                        .iter()
+                        .any(|hold| hold_ids.contains(&hold.hold_id) && hold.tenant_id != tenant_id);
+                    if outside_tenant {
+                        return Err(admin_action_error(
+                            "full-tenant GDPR override cannot cover legal holds belonging to another tenant",
+                        ));
+                    }
+                    let mut fact_ids: Vec<String> = covered.iter().map(|(fact_id, _)| fact_id.clone()).collect();
+                    fact_ids.sort();
+                    fact_ids.dedup();
+                    let actor = read_param_str(params, "actor")
+                        .map(str::to_string)
+                        .or_else(|| auth_context.and_then(|context| context.subject.clone()))
+                        .unwrap_or_else(|| state.passport_fpr.clone());
+                    let override_material = store
+                        .record_legal_hold_override(tenant_id, hold_ids, fact_ids, &reason, &actor)
+                        .map_err(|err| {
+                            admin_action_error(format!("legal-hold override receipt persistence failed: {err}"))
+                        })?;
+                    drop(store);
+
+                    let receipt_body = super::observations::PostObservationBody {
+                        kind: "legal_hold_overridden".to_string(),
+                        provider: "corecruxd".to_string(),
+                        client_ts: None,
+                        payload: serde_json::to_value(&override_material).map_err(|err| {
+                            admin_action_error(format!("legal-hold override receipt encode failed: {err}"))
+                        })?,
+                    };
+                    let (signed_receipt, _) = super::observations::append_one(
+                        state,
+                        "__governance__::legal-holds",
+                        &actor,
+                        receipt_body,
+                        None,
+                    )
+                    .map_err(|(_, detail)| {
+                        admin_action_error(format!("legal-hold override receipt signing failed: {detail}"))
+                    })?;
+
+                    let store = state.fact_store.write().await;
+                    let report = store
+                        .compact_journal_after_legal_hold_override_receipt(&override_material)
+                        .map_err(|e| admin_action_error(format!("journal compaction failed: {e}")))?;
+                    (report, Some(signed_receipt))
+                }
             };
 
             let took_ms = started.elapsed().as_millis() as u64;
@@ -1082,6 +1159,7 @@ pub(super) async fn execute_admin_action(
                 tombstones_kept = report.tombstones_kept,
                 retention_marked = retention_marked.len(),
                 retention_days = ?retention_days_used,
+                legal_hold_overridden = legal_hold_override_receipt.is_some(),
                 took_ms,
                 "erasure: fact-journal compaction removed deleted content"
             );
@@ -1095,6 +1173,9 @@ pub(super) async fn execute_admin_action(
                     "tombstonesKept": report.tombstones_kept,
                     "retentionMarked": retention_marked.len(),
                     "retentionDays": retention_days_used,
+                    "legalHoldOverridden": legal_hold_override_receipt.is_some(),
+                    "legalHoldOverrideReceiptRecordId": legal_hold_override_receipt.as_ref().map(|receipt| &receipt.observation_id),
+                    "legalHoldOverrideReceipt": legal_hold_override_receipt.as_ref().map(|receipt| &receipt.receipt),
                     "tookMs": took_ms,
                 }),
                 mutation_event_id: None,
@@ -2514,6 +2595,71 @@ mod compact_facts_tests {
             .await
             .unwrap_err();
         assert!(err.contains("reason is required"));
+    }
+
+    #[tokio::test]
+    async fn held_hard_erasure_refuses_unless_explicit_gdpr_override_is_signed() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("facts.jsonl");
+        let mut state = crate::http::tests::test_app_state(4);
+        let key = crux_session::LocalPassportKey::from_path(&state.passport_key_path).unwrap();
+        state.passport_fpr = key.passport_fpr().to_string();
+        state.passport_public_key_hex = key.public_key_hex().to_string();
+        let mut fs = FactStore::with_persistence(dir.path()).unwrap();
+        let held = fs.store(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "customer::42::profile".to_string(),
+            key: "pii".to_string(),
+            value: "held-sensitive-value".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        let placed = fs
+            .place_legal_hold(corecrux_memory::PlaceLegalHold {
+                tenant_id: "default".to_string(),
+                entity_prefixes: vec!["customer::42::".to_string()],
+                reason: "litigation".to_string(),
+                actor: Some("p_legal".to_string()),
+            })
+            .unwrap();
+        assert!(fs.delete(&held.fact_id));
+        state.fact_store = std::sync::Arc::new(tokio::sync::RwLock::new(fs));
+
+        let ordinary = serde_json::json!({"reason": "ordinary hard deletion"});
+        let err = execute_admin_action(&state, "act-held", "compact-facts", Some(&ordinary), None, None)
+            .await
+            .unwrap_err();
+        assert!(err.contains(&placed.hold.hold_id));
+        assert!(std::fs::read_to_string(&journal)
+            .unwrap()
+            .contains("held-sensitive-value"));
+
+        let gdpr = serde_json::json!({
+            "reason": "GDPR Article 17 full-tenant erasure",
+            "gdprFullTenantErasure": true,
+            "tenantId": "default",
+            "actor": "p_dpo",
+        });
+        let result = execute_admin_action(&state, "act-gdpr", "compact-facts", Some(&gdpr), None, None)
+            .await
+            .unwrap();
+        assert_eq!(result.result["legalHoldOverridden"], true);
+        assert_eq!(result.result["legalHoldOverrideReceipt"]["alg"], "ed25519");
+        assert!(result.result["legalHoldOverrideReceipt"]["signature"]
+            .as_str()
+            .is_some_and(|signature| !signature.is_empty()));
+        assert!(!std::fs::read_to_string(&journal)
+            .unwrap()
+            .contains("held-sensitive-value"));
+
+        let governance_log =
+            super::super::observations::observation_file_path(&state.data_dir, "__governance__::legal-holds");
+        let records = std::fs::read_to_string(governance_log).unwrap();
+        assert!(records.contains("legal_hold_overridden"));
+        assert!(records.contains(&placed.hold.hold_id));
     }
 
     #[tokio::test]

@@ -85,6 +85,9 @@ pub const CRUXPACK_RESERVED_PREFIXES: &[&str] = &[
     "__passport__::",
     "__session_binding__::",
     "__coord__::",
+    "__incident__::",
+    "__legal_hold__::",
+    "__legal_hold_receipt__::",
     "__bootstrap__::",
     "__project__::",
     "__tenant_metadata__::",
@@ -742,7 +745,10 @@ mod tests {
     fn reserved_prefix_excluded_even_when_private_flag_false() {
         // A reserved-prefix fact written before fact_privacy enforcement
         // existed (private == false) must still be held back.
-        let store = store_with(vec![sf("__ops::deploy", "state", "pre-enforcement-secret", false)]);
+        let store = store_with(vec![
+            sf("__ops::deploy", "state", "pre-enforcement-secret", false),
+            sf("__incident__::inc_1", "case", "private-incident", false),
+        ]);
         let (sections, _) = build_pack_sections(&store, None, &opts("local"));
         assert!(sections.facts.is_empty());
     }

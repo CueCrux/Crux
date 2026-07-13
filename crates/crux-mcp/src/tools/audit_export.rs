@@ -31,7 +31,6 @@ use std::env;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
-use ed25519_dalek::SigningKey;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -39,19 +38,18 @@ use crate::dispatch::McpContext;
 use crate::protocol::{JsonRpcError, INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND};
 use crate::scope;
 use corecrux_memory::fact_store::Fact;
-use corecrux_receipts::{build_bundle_v1, AuditBundleScopeV1, AuditEventV1, AuditReceiptRefV1, BuildBundleInputV1};
+use corecrux_receipts::{
+    build_bundle_v1, resolve_audit_export_signing_key, AuditBundleScopeV1, AuditEventV1, AuditReceiptRefV1,
+    BuildBundleInputV1,
+};
 
 /// Feature flag.
 pub const FEATURE_FLAG_ENV: &str = "CORECRUXD_FEATURE_AUDIT_EXPORT";
-/// Environment variable carrying the base64 ed25519 secret (same shape as
-/// `CORECRUXD_WRITE_CONFIRMATION_SIGNING_KEY_B64`). When unset, we
-/// auto-generate a one-shot key per bundle — the public key is embedded
-/// in the manifest, so verification still works, but the key won't match
-/// the daemon's published passport key (operator must wire the env to get
-/// passport-attributed audit bundles).
-pub const SIGNING_KEY_ENV: &str = "CORECRUXD_AUDIT_EXPORT_SIGNING_KEY_B64";
+/// Environment variable carrying the base64 Ed25519 secret. Re-exported from
+/// `corecrux-receipts`, which owns the shared env/persistent/ephemeral resolver.
+pub const SIGNING_KEY_ENV: &str = corecrux_receipts::AUDIT_EXPORT_SIGNING_KEY_ENV;
 /// Optional human-readable signer key id (echoed in the manifest).
-pub const SIGNING_KEY_ID_ENV: &str = "CORECRUXD_AUDIT_EXPORT_KEY_ID";
+pub const SIGNING_KEY_ID_ENV: &str = corecrux_receipts::AUDIT_EXPORT_SIGNING_KEY_ID_ENV;
 /// Directory under which bundle artefacts are written.
 pub const EXPORT_DIR_ENV: &str = "CORECRUXD_AUDIT_EXPORT_DIR";
 
@@ -90,37 +88,6 @@ fn export_dir() -> PathBuf {
         }
     }
     std::env::temp_dir().join("crux-audit-export")
-}
-
-/// Load the signing key from the env. Falls back to an ephemeral one-shot
-/// key when the env is unset — the public key is embedded in the manifest
-/// regardless, so offline verification still works.
-fn load_signing_key() -> (SigningKey, String) {
-    use base64::Engine as _;
-    let key_id = env::var(SIGNING_KEY_ID_ENV).unwrap_or_else(|_| String::new());
-    if let Ok(b64) = env::var(SIGNING_KEY_ENV) {
-        let raw = b64.trim();
-        for engine in [
-            base64::engine::general_purpose::STANDARD,
-            base64::engine::general_purpose::STANDARD_NO_PAD,
-            base64::engine::general_purpose::URL_SAFE,
-            base64::engine::general_purpose::URL_SAFE_NO_PAD,
-        ] {
-            if let Ok(decoded) = engine.decode(raw) {
-                if decoded.len() >= 32 {
-                    let mut secret = [0u8; 32];
-                    secret.copy_from_slice(&decoded[..32]);
-                    return (SigningKey::from_bytes(&secret), key_id);
-                }
-            }
-        }
-    }
-    // Ephemeral fallback — deterministic per-bundle is fine because the
-    // public key is captured in the manifest.
-    let mut secret = [0u8; 32];
-    use rand::Rng as _;
-    rand::rng().fill_bytes(&mut secret);
-    (SigningKey::from_bytes(&secret), key_id)
 }
 
 /// `audit_export_bundle` handler. Returns:
@@ -281,7 +248,11 @@ pub async fn handle_audit_export_bundle(args: &Value, ctx: &McpContext) -> Resul
         .map(|dir| corecrux_receipts::read_witnessed_proofs_jsonl(&dir.join("witness_proofs.jsonl")))
         .unwrap_or_default();
 
-    let (signing_key, signer_key_id) = load_signing_key();
+    let resolved_key = resolve_audit_export_signing_key(ctx.data_dir.as_deref()).map_err(|err| JsonRpcError {
+        code: INTERNAL_ERROR,
+        message: format!("audit bundle signing key resolution failed: {err}"),
+        data: None,
+    })?;
     let built = build_bundle_v1(BuildBundleInputV1 {
         bundle_id: bundle_id.clone(),
         since_rfc3339: since_rfc3339.clone(),
@@ -291,8 +262,9 @@ pub async fn handle_audit_export_bundle(args: &Value, ctx: &McpContext) -> Resul
         events,
         receipt_refs,
         witness_proofs,
-        signing_key: &signing_key,
-        signer_key_id,
+        signing_key: &resolved_key.signing_key,
+        signer_key_id: resolved_key.signer_key_id,
+        key_class: resolved_key.key_class,
     })
     .map_err(|err| JsonRpcError {
         code: INTERNAL_ERROR,
@@ -341,6 +313,7 @@ pub async fn handle_audit_export_bundle(args: &Value, ctx: &McpContext) -> Resul
         "until": built.manifest.until,
         "events_jsonl_sha256": built.manifest.events_jsonl_sha256,
         "receipts_cbor_sha256": built.manifest.receipts_cbor_sha256,
+        "key_class": built.manifest.key_class,
     }))
 }
 
@@ -366,11 +339,15 @@ mod tests {
     impl FeatureFlagGuard {
         async fn enabled() -> Self {
             let lock = flag_lock().lock().await;
+            env::remove_var(SIGNING_KEY_ENV);
+            env::remove_var(SIGNING_KEY_ID_ENV);
             env::set_var(FEATURE_FLAG_ENV, "1");
             Self { _lock: lock }
         }
         async fn disabled() -> Self {
             let lock = flag_lock().lock().await;
+            env::remove_var(SIGNING_KEY_ENV);
+            env::remove_var(SIGNING_KEY_ID_ENV);
             env::remove_var(FEATURE_FLAG_ENV);
             Self { _lock: lock }
         }
@@ -378,6 +355,9 @@ mod tests {
     impl Drop for FeatureFlagGuard {
         fn drop(&mut self) {
             env::remove_var(FEATURE_FLAG_ENV);
+            env::remove_var(SIGNING_KEY_ENV);
+            env::remove_var(SIGNING_KEY_ID_ENV);
+            env::remove_var(EXPORT_DIR_ENV);
         }
     }
 
@@ -582,8 +562,61 @@ mod tests {
                 assert_eq!(m.bundle_format_version, corecrux_receipts::BUNDLE_FORMAT_VERSION);
                 assert_eq!(m.fact_count, 1);
                 assert_eq!(m.receipt_count, 1);
+                assert_eq!(m.key_class, Some(corecrux_receipts::AuditBundleKeyClassV1::Ephemeral));
                 assert!(!m.signature_b64.is_empty());
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persistent_signing_key_is_created_owner_only_and_reused() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _g = FeatureFlagGuard::enabled().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let first = resolve_audit_export_signing_key(Some(data_dir.path())).unwrap();
+        assert_eq!(first.key_class, corecrux_receipts::AuditBundleKeyClassV1::Persistent);
+
+        let key_path = corecrux_receipts::persistent_audit_export_signing_key_path(data_dir.path());
+        assert_eq!(
+            std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read(&key_path).unwrap(), first.signing_key.to_bytes());
+
+        let second = resolve_audit_export_signing_key(Some(data_dir.path())).unwrap();
+        assert_eq!(second.key_class, corecrux_receipts::AuditBundleKeyClassV1::Persistent);
+        assert_eq!(second.signing_key.to_bytes(), first.signing_key.to_bytes());
+        assert_eq!(second.signing_key.verifying_key(), first.signing_key.verifying_key());
+    }
+
+    #[tokio::test]
+    async fn environment_signing_key_overrides_persistent_key() {
+        use base64::Engine as _;
+
+        let _g = FeatureFlagGuard::enabled().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let persistent = resolve_audit_export_signing_key(Some(data_dir.path())).unwrap();
+
+        let env_secret = [0x77_u8; 32];
+        env::set_var(
+            SIGNING_KEY_ENV,
+            base64::engine::general_purpose::STANDARD.encode(env_secret),
+        );
+        env::set_var(SIGNING_KEY_ID_ENV, "configured-audit-issuer");
+        let configured = resolve_audit_export_signing_key(Some(data_dir.path())).unwrap();
+
+        assert_eq!(configured.key_class, corecrux_receipts::AuditBundleKeyClassV1::Env);
+        assert_eq!(configured.signing_key.to_bytes(), env_secret);
+        assert_eq!(configured.signer_key_id, "configured-audit-issuer");
+        assert_ne!(configured.signing_key.to_bytes(), persistent.signing_key.to_bytes());
+        assert_eq!(
+            std::fs::read(corecrux_receipts::persistent_audit_export_signing_key_path(
+                data_dir.path()
+            ))
+            .unwrap(),
+            persistent.signing_key.to_bytes()
+        );
     }
 }

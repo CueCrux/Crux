@@ -50,11 +50,12 @@ BUNDLE_MEMBERS = ("manifest.json", "events.jsonl", "receipts.cbor")
 # Domain-separation tag prefixed to the v2 signing input; mirrors
 # corecrux_receipts::audit_bundle_v1::AUDIT_BUNDLE_SIGNING_DOMAIN and the verifier.
 AUDIT_BUNDLE_SIGNING_DOMAIN_V2 = b"cuecrux.audit_bundle.v2\x00"
+AUDIT_BUNDLE_SIGNING_DOMAIN_V3 = b"cuecrux.audit_bundle.v3\x00"
 
 
 def canonical_manifest_bytes(manifest: dict) -> bytes:
     """Ed25519 sign/verify input selected by ``bundle_format_version`` (v1: field
-    order, no tag; v2: domain tag + recursively key-sorted compact JSON). Kept
+    order, no tag; v2/v3: versioned domain tag + recursively key-sorted compact JSON). Kept
     identical to ``tools/verify_audit_bundle_v1.py``."""
     signing_manifest = dict(manifest)
     signing_manifest["signature_b64"] = ""
@@ -63,6 +64,11 @@ def canonical_manifest_bytes(manifest: dict) -> bytes:
             signing_manifest, separators=(",", ":"), ensure_ascii=False, sort_keys=True
         ).encode("utf-8")
         return AUDIT_BUNDLE_SIGNING_DOMAIN_V2 + canonical
+    if manifest.get("bundle_format_version") == 3:
+        canonical = json.dumps(
+            signing_manifest, separators=(",", ":"), ensure_ascii=False, sort_keys=True
+        ).encode("utf-8")
+        return AUDIT_BUNDLE_SIGNING_DOMAIN_V3 + canonical
     return json.dumps(signing_manifest, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
@@ -93,6 +99,8 @@ def build_manifest(events: bytes, receipts: bytes, *, version: int = 1, bundle_i
         "signer_key_id": "vector-ed25519-42",
         "signature_b64": "",
     }
+    if version >= 3:
+        manifest["key_class"] = "persistent"
     signature = private_key.sign(canonical_manifest_bytes(manifest))
     manifest["signature_b64"] = base64.b64encode(signature).decode("ascii")
     return manifest
@@ -174,12 +182,22 @@ def main() -> None:
         expected={"ok": False, "failure_reason_contains": "events.jsonl sha256 mismatch"},
     )
 
-    # v2 (current format): domain-separated, key-canonical signing input. Proves
-    # the independent verifier accepts the format the daemon now emits.
+    # v2 (previous format): domain-separated, key-canonical signing input.
+    # Retained to prove compatibility with bundles emitted before key provenance.
     manifest_v2 = build_manifest(events, receipts, version=2, bundle_id="vector-valid-minimal-v2")
     write_vector(
         VECTORS / "valid-minimal-v2",
         manifest=manifest_v2,
+        events=events,
+        receipts=receipts,
+        expected={"ok": True},
+    )
+
+    # v3 (current format): adds the signed key-provenance marker.
+    manifest_v3 = build_manifest(events, receipts, version=3, bundle_id="vector-valid-minimal-v3")
+    write_vector(
+        VECTORS / "valid-minimal-v3",
+        manifest=manifest_v3,
         events=events,
         receipts=receipts,
         expected={"ok": True},

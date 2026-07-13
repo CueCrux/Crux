@@ -400,6 +400,27 @@ pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContra
         ));
     }
 
+    if path.starts_with("/v1/incidents") {
+        let scopes = if method == "GET" || path.ends_with("/export") {
+            &["query:read", "exports:read", "admin:read"][..]
+        } else {
+            &["facts:write", "admin:write"][..]
+        };
+        return Some(RouteAuthContract::gated(
+            RouteAuthClass::FeatureGated,
+            scopes,
+            "CORECRUXD_FEATURE_INCIDENTS",
+        ));
+    }
+
+    if path.starts_with("/v1/legal-holds") {
+        return Some(RouteAuthContract::gated(
+            RouteAuthClass::FeatureGated,
+            &["admin:write"],
+            "CORECRUXD_FEATURE_LEGAL_HOLD",
+        ));
+    }
+
     if path.starts_with("/v1/coord/") {
         let scopes = if method == "GET" {
             &["admin:read", "sessions:read"][..]
@@ -880,6 +901,9 @@ mod tests {
         // write scope and reject read-only scopes on the write branch.
         let gated_mutations = [
             ("POST", "/v1/coord/lease"),
+            ("POST", "/v1/incidents"),
+            ("POST", "/v1/legal-holds"),
+            ("DELETE", "/v1/legal-holds/lh_123"),
             ("POST", "/v1/observe/sessions/abc/event"),
             ("POST", "/v1/orchestrators/run"),
             ("POST", "/v1/punchcards/x"),

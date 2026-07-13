@@ -59,7 +59,7 @@ pub async fn post_audit_bundle_verify(body: Bytes) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use corecrux_receipts::{build_bundle_v1, AuditBundleScopeV1, BuildBundleInputV1};
+    use corecrux_receipts::{build_bundle_v1, AuditBundleKeyClassV1, AuditBundleScopeV1, BuildBundleInputV1};
     use ed25519_dalek::SigningKey;
 
     fn valid_bundle_bytes() -> Vec<u8> {
@@ -75,6 +75,7 @@ mod tests {
             witness_proofs: vec![],
             signing_key: &sk,
             signer_key_id: "k1".into(),
+            key_class: AuditBundleKeyClassV1::Ephemeral,
         })
         .expect("build bundle");
         let mut buf = Vec::new();

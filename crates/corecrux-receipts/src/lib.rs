@@ -15,6 +15,7 @@
 mod approval_decision_v1;
 mod audit_bundle_v1;
 mod audit_gap_v1;
+mod audit_signing_key;
 mod body_v1;
 mod c2pa_manifest_v1;
 mod candidate_digest_v1;
@@ -41,8 +42,9 @@ pub use approval_decision_v1::{
 };
 pub use audit_bundle_v1::{
     build_bundle_v1, decode_receipts_cbor, verify_bundle_v1, verify_bundle_with_trust_roots_v1, AuditBundleError,
-    AuditBundleManifestV1, AuditBundleScopeV1, AuditEventV1, AuditReceiptRefV1, BuildBundleInputV1, BuiltBundleV1,
-    VerifyReportV1, BUNDLE_FORMAT_VERSION, EVENTS_FILENAME, MANIFEST_FILENAME, RECEIPTS_FILENAME,
+    AuditBundleKeyClassV1, AuditBundleManifestV1, AuditBundleScopeV1, AuditEventV1, AuditReceiptRefV1,
+    BuildBundleInputV1, BuiltBundleV1, VerifyReportV1, BUNDLE_FORMAT_VERSION, EVENTS_FILENAME, MANIFEST_FILENAME,
+    RECEIPTS_FILENAME,
 };
 pub use audit_gap_v1::{
     assert_chain_reanchor_kind_v1, assert_consolidation_kind_v1, assert_coverage_attestation_kind_v1,
@@ -56,6 +58,11 @@ pub use audit_gap_v1::{
     CoverageWindowCountsV1, CoverageWindowReportV1, ModelInvocationBodyInputV1, RedactionReceiptBodyInputV1,
     AUDIT_GAP_BODY_SCHEMA_V1, CHAIN_REANCHOR_KIND_V1, CONSOLIDATION_KIND_V1, COVERAGE_ATTESTATION_KIND_V1,
     COVERAGE_WINDOW_KIND_V1, COVERAGE_WINDOW_REPORT_SCHEMA_V1, MODEL_INVOCATION_KIND_V1, REDACTION_RECEIPT_KIND_V1,
+};
+pub use audit_signing_key::{
+    persistent_audit_export_signing_key_path, resolve_audit_export_signing_key, AuditSigningKeyError,
+    ResolvedAuditSigningKey, AUDIT_EXPORT_SIGNING_KEY_ENV, AUDIT_EXPORT_SIGNING_KEY_FILENAME,
+    AUDIT_EXPORT_SIGNING_KEY_ID_ENV,
 };
 pub use body_v1::{extract_body_index_v1, extract_linked_receipts_v1, ReceiptBodyIndexV1};
 pub use c2pa_manifest_v1::{
@@ -130,7 +137,10 @@ pub use usage_receipt_v1::{
     assert_usage_ping_kind_v1, build_usage_ping_body_v1, sign_usage_ping_v1, UsageEventClassV1, UsagePingBodyInputV1,
     USAGE_EVENT_CLASSES_V1, USAGE_PING_ALLOWED_KEYS_V1, USAGE_PING_BODY_SCHEMA_V1, USAGE_PING_KIND_V1,
 };
-pub use verify_v1::{verify_receipt_v1, ReceiptSigV1, VerificationReportV1, VerifyErrorCodeV1, VerifyReceiptInput};
+pub use verify_v1::{
+    verify_receipt_v1, ReceiptSigV1, VerificationIntegrityV1, VerificationReportV1, VerificationSigInfoV1,
+    VerificationTraceChecksV1, VerificationTraceSummaryV1, VerifyErrorCodeV1, VerifyReceiptInput,
+};
 pub use witness_v1::{
     assert_external_anchor_kind_v1, assert_rfc3161_timestamp_kind_v1, build_external_anchor_body_v1,
     build_rfc3161_timestamp_body_v1, is_valid_object_identifier_text_v1, parse_x509_certs_der_or_pem_v1,

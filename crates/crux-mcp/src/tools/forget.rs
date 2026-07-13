@@ -41,6 +41,10 @@ use corecrux_receipts::{
 /// Feature flag for the mutating `memory_forget` tool.
 pub const FEATURE_FLAG_ENV: &str = "CORECRUXD_FEATURE_SCOPED_FORGET";
 
+/// Application error used when an otherwise-valid forget is blocked by a
+/// governance legal hold. JSON-RPC reserves -32000..=-32099 for server errors.
+const LEGAL_HOLD_ACTIVE_ERROR: i32 = -32044;
+
 /// Reserved entity prefixes that scoped-forget MUST NOT touch through
 /// the user-facing surface. Operator-only override is out of scope here.
 /// `__memory_pin::` is included so a scope can never erase the pin records
@@ -421,9 +425,9 @@ pub async fn handle_memory_forget(args: &Value, ctx: &McpContext) -> Result<Valu
     // Resolve matches under a read lock first so we can compute the
     // pre-forget value hashes before we mutate (the value disappears on
     // soft-delete + journal append).
-    let to_forget: Vec<Fact> = {
+    let (to_forget, blocking_holds): (Vec<Fact>, Vec<corecrux_memory::LegalHold>) = {
         let store = ctx.fact_store.read().await;
-        resolve_scope(
+        let facts: Vec<Fact> = resolve_scope(
             &store,
             &scope,
             id_ref,
@@ -434,8 +438,36 @@ pub async fn handle_memory_forget(args: &Value, ctx: &McpContext) -> Result<Valu
         )
         .into_iter()
         .cloned()
-        .collect()
+        .collect();
+        let mut holds = std::collections::BTreeMap::new();
+        for fact in &facts {
+            for hold in store.covering_legal_holds(&fact.tenant_hash, &fact.entity) {
+                holds.insert(hold.hold_id.clone(), hold);
+            }
+        }
+        (facts, holds.into_values().collect())
     };
+
+    if !blocking_holds.is_empty() {
+        return Err(JsonRpcError {
+            code: LEGAL_HOLD_ACTIVE_ERROR,
+            message: format!(
+                "memory_forget refused: {} active legal hold(s) cover the requested facts",
+                blocking_holds.len()
+            ),
+            data: Some(json!({
+                "error": "LEGAL_HOLD_ACTIVE",
+                "hold_ids": blocking_holds.iter().map(|hold| hold.hold_id.as_str()).collect::<Vec<_>>(),
+                "holds": blocking_holds.iter().map(|hold| json!({
+                    "hold_id": hold.hold_id,
+                    "tenant_id": hold.tenant_id,
+                    "entity_prefixes": hold.entity_prefixes,
+                    "reason": hold.reason,
+                })).collect::<Vec<_>>(),
+                "facts_blocked": to_forget.len(),
+            })),
+        });
+    }
 
     let now = Utc::now();
     let body = build_receipt_body(
@@ -710,6 +742,52 @@ mod tests {
             .await
             .unwrap();
         assert!(q["content"][0]["text"].as_str().unwrap().contains("production-x"));
+    }
+
+    #[tokio::test]
+    async fn memory_forget_refuses_facts_covered_by_legal_hold() {
+        let _guard = FeatureFlagGuard::enabled().await;
+        let ctx = agent_ctx("alice");
+        handle_store_fact(
+            &json!({"entity": "case-client-42", "key": "pii", "value": "retain"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let hold_id = {
+            let mut store = ctx.fact_store.write().await;
+            store
+                .place_legal_hold(corecrux_memory::PlaceLegalHold {
+                    tenant_id: "default".to_string(),
+                    entity_prefixes: vec!["case-client-42".to_string()],
+                    reason: "active litigation".to_string(),
+                    actor: Some("p_dpo".to_string()),
+                })
+                .unwrap()
+                .hold
+                .hold_id
+        };
+
+        let err = handle_memory_forget(
+            &json!({
+                "scope": {"type": "entity_prefix", "value": "case-client-42"},
+                "reason": "user request",
+                "include_pinned": true,
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, LEGAL_HOLD_ACTIVE_ERROR);
+        let data = err.data.unwrap();
+        assert_eq!(data["error"], "LEGAL_HOLD_ACTIVE");
+        assert_eq!(data["hold_ids"][0], hold_id);
+        assert_eq!(data["facts_blocked"], 1);
+
+        let q = handle_query_facts(&json!({"entity": "case-client-42"}), &ctx)
+            .await
+            .unwrap();
+        assert!(q["content"][0]["text"].as_str().unwrap().contains("retain"));
     }
 
     #[tokio::test]

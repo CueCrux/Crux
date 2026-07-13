@@ -3,7 +3,7 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
-//! BYO Audit Trail bundle (agent-ux-11) — `bundle_format_version: 2`.
+//! BYO Audit Trail bundle (agent-ux-11) — `bundle_format_version: 3`.
 //!
 //! Bundle layout (tar.zst):
 //!
@@ -20,14 +20,13 @@
 //!   manifest digest, and verifies the Ed25519 signature against the
 //!   pinned `signer_public_key_b64` embedded in the manifest. No network,
 //!   no daemon, no key fetch.
-//! - **Reuses the daemon's existing CROWN signer key class** — same
-//!   `SigningKey` type used by `corecruxd::grpc::load_write_confirmation_signing_key`
-//!   (env var `CORECRUXD_WRITE_CONFIRMATION_SIGNING_KEY_B64`). Master plan
-//!   explicitly forbids introducing a new key class for Wave 2.
-//! - **Schema-versioned**: `bundle_format_version: 2` — the v2 signing input is
-//!   a domain-separated (`AUDIT_BUNDLE_SIGNING_DOMAIN`), key-canonical encoding
-//!   of the manifest. The verifier still accepts legacy v1 bundles
-//!   (struct-order JSON, no domain tag); it rejects any other version.
+//! - **Stable, pinnable issuer**: the manifest embeds both the Ed25519 public
+//!   key and its signed provisioning class. Key resolution is shared by daemon
+//!   and CLI through `resolve_audit_export_signing_key`.
+//! - **Schema-versioned**: `bundle_format_version: 3` — v3 adds the signed
+//!   audit-export signing-key class. The verifier still accepts legacy v1
+//!   bundles (struct-order JSON, no domain tag) and v2 bundles (domain-separated,
+//!   key-canonical JSON); it rejects any other version.
 
 use std::io::{Read, Write};
 
@@ -46,18 +45,24 @@ use crate::witness_v1::{
 /// bundles exported before the v2 canonicalisation continue to verify.
 pub const BUNDLE_FORMAT_V1: u32 = 1;
 
-/// Current schema/signing version. v2 signs a domain-separated, key-canonical
-/// encoding of the manifest (see [`AuditBundleManifestV1::canonical_signing_bytes`]).
-/// New bundles are always emitted at this version; bumping it requires a
-/// verifier upgrade.
-pub const BUNDLE_FORMAT_VERSION: u32 = 2;
+/// Previous bundle format (v2): domain-separated, key-canonical manifest
+/// signing, before the signed `key_class` marker was introduced.
+pub const BUNDLE_FORMAT_V2: u32 = 2;
 
-/// Domain-separation tag prefixed to the v2 signing input, mirroring the
+/// Current schema/signing version. v3 adds a signed marker describing whether
+/// the embedded issuer public key came from an environment override, a
+/// data-dir-persistent key, or an ephemeral fallback.
+pub const BUNDLE_FORMAT_VERSION: u32 = 3;
+
+/// Domain-separation tag prefixed to the legacy v2 signing input, mirroring the
 /// `crypto_shred_v1` convention (`b"cuecrux.crypto_shred..."`). Binding the
 /// signature to this per-type, per-version label prevents a signature over an
 /// audit-bundle manifest from ever verifying as a different receipt type, and
 /// vice-versa.
-pub const AUDIT_BUNDLE_SIGNING_DOMAIN: &[u8] = b"cuecrux.audit_bundle.v2\0";
+pub const AUDIT_BUNDLE_SIGNING_DOMAIN_V2: &[u8] = b"cuecrux.audit_bundle.v2\0";
+
+/// Domain-separation tag for newly emitted v3 bundles.
+pub const AUDIT_BUNDLE_SIGNING_DOMAIN: &[u8] = b"cuecrux.audit_bundle.v3\0";
 
 /// Hard cap on the decompressed size the verifier will materialise from a
 /// `tar.zst` bundle (256 MiB). A bundle that expands beyond this is rejected
@@ -92,7 +97,7 @@ pub enum AuditBundleError {
     #[error("base64 decode error: {0}")]
     Base64(#[from] base64::DecodeError),
     #[error(
-        "unsupported bundle_format_version: {0} (verifier supports {BUNDLE_FORMAT_V1} and {BUNDLE_FORMAT_VERSION})"
+        "unsupported bundle_format_version: {0} (verifier supports {BUNDLE_FORMAT_V1}, {BUNDLE_FORMAT_V2}, and {BUNDLE_FORMAT_VERSION})"
     )]
     UnsupportedVersion(u32),
     #[error("decompressed bundle exceeds the {MAX_DECOMPRESSED_BUNDLE_BYTES}-byte cap")]
@@ -162,6 +167,21 @@ pub struct AuditBundleScopeV1 {
     pub caller: Option<String>,
 }
 
+/// Provenance class for the key that signed an audit bundle.
+///
+/// This is assurance metadata, not a verification shortcut: offline
+/// verification always uses the public key embedded in the signed manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditBundleKeyClassV1 {
+    /// Key loaded from `CORECRUXD_AUDIT_EXPORT_SIGNING_KEY_B64`.
+    Env,
+    /// Stable key generated once and stored in the daemon data directory.
+    Persistent,
+    /// One-shot key used only when no data directory is available.
+    Ephemeral,
+}
+
 /// The signed manifest. Canonical-JSON of this struct WITH `signature_b64`
 /// cleared is the input to Ed25519 sign/verify.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,6 +213,10 @@ pub struct AuditBundleManifestV1 {
     /// Free-form key identifier. Default empty; not load-bearing for
     /// verification (the public key is what matters).
     pub signer_key_id: String,
+    /// How the signer key was provisioned. Absent only on legacy v1/v2
+    /// bundles created before this signed provenance marker existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_class: Option<AuditBundleKeyClassV1>,
     /// Base64 (standard, padded) Ed25519 signature — 64 bytes. Empty
     /// during signing input construction.
     #[serde(default)]
@@ -204,7 +228,9 @@ impl AuditBundleManifestV1 {
     /// cleared. The encoding is selected by `bundle_format_version` so old and
     /// new bundles both verify:
     ///
-    /// - **v2+** (current): `AUDIT_BUNDLE_SIGNING_DOMAIN` followed by a
+    /// - **v3** (current): `AUDIT_BUNDLE_SIGNING_DOMAIN` followed by a
+    ///   key-canonical JSON encoding of the manifest.
+    /// - **v2**: `AUDIT_BUNDLE_SIGNING_DOMAIN_V2` followed by a
     ///   key-canonical JSON encoding of the manifest (`canonical_json_bytes`).
     ///   The domain tag gives per-type/per-version separation (no cross-type
     ///   replay); the recursive key sort makes the signed bytes independent of
@@ -222,6 +248,13 @@ impl AuditBundleManifestV1 {
             let canonical = canonical_json_bytes(&value)?;
             let mut bytes = Vec::with_capacity(AUDIT_BUNDLE_SIGNING_DOMAIN.len() + canonical.len());
             bytes.extend_from_slice(AUDIT_BUNDLE_SIGNING_DOMAIN);
+            bytes.extend_from_slice(&canonical);
+            Ok(bytes)
+        } else if self.bundle_format_version == BUNDLE_FORMAT_V2 {
+            let value = serde_json::to_value(&clone)?;
+            let canonical = canonical_json_bytes(&value)?;
+            let mut bytes = Vec::with_capacity(AUDIT_BUNDLE_SIGNING_DOMAIN_V2.len() + canonical.len());
+            bytes.extend_from_slice(AUDIT_BUNDLE_SIGNING_DOMAIN_V2);
             bytes.extend_from_slice(&canonical);
             Ok(bytes)
         } else {
@@ -271,6 +304,7 @@ pub struct BuildBundleInputV1<'a> {
     pub witness_proofs: Vec<WitnessProofV1>,
     pub signing_key: &'a SigningKey,
     pub signer_key_id: String,
+    pub key_class: AuditBundleKeyClassV1,
 }
 
 /// Built bundle, ready to be written to disk.
@@ -359,6 +393,7 @@ pub fn build_bundle_v1(input: BuildBundleInputV1<'_>) -> Result<BuiltBundleV1, A
         witness_proofs_sha256,
         signer_public_key_b64,
         signer_key_id: input.signer_key_id,
+        key_class: Some(input.key_class),
         signature_b64: String::new(),
     };
 
@@ -477,8 +512,14 @@ pub fn verify_bundle_with_trust_roots_v1(
     let receipts = receipts_bytes.ok_or(AuditBundleError::MissingMember(RECEIPTS_FILENAME))?;
 
     let manifest: AuditBundleManifestV1 = serde_json::from_slice(&manifest_raw)?;
-    if !matches!(manifest.bundle_format_version, BUNDLE_FORMAT_V1 | BUNDLE_FORMAT_VERSION) {
+    if !matches!(
+        manifest.bundle_format_version,
+        BUNDLE_FORMAT_V1 | BUNDLE_FORMAT_V2 | BUNDLE_FORMAT_VERSION
+    ) {
         return Err(AuditBundleError::UnsupportedVersion(manifest.bundle_format_version));
+    }
+    if manifest.bundle_format_version == BUNDLE_FORMAT_VERSION && manifest.key_class.is_none() {
+        return Err(AuditBundleError::MissingField("key_class"));
     }
 
     let events_hash = hex_sha256(&events);
@@ -778,6 +819,7 @@ mod tests {
             witness_proofs: vec![],
             signing_key: sk,
             signer_key_id: "test-key-1".to_string(),
+            key_class: AuditBundleKeyClassV1::Persistent,
         }
     }
 
@@ -787,6 +829,7 @@ mod tests {
         assert_eq!(built.manifest.bundle_format_version, BUNDLE_FORMAT_VERSION);
         assert_eq!(built.manifest.fact_count, 2);
         assert_eq!(built.manifest.receipt_count, 1);
+        assert_eq!(built.manifest.key_class, Some(AuditBundleKeyClassV1::Persistent));
 
         let mut tar_bytes = Vec::new();
         built.write_tar_zst(&mut tar_bytes).unwrap();
@@ -866,6 +909,30 @@ mod tests {
     }
 
     #[test]
+    fn tamper_with_key_class_breaks_manifest_signature() {
+        let built = build_bundle_v1(sample_input()).expect("build");
+        let mut manifest = built.manifest.clone();
+        manifest.key_class = Some(AuditBundleKeyClassV1::Env);
+        let tampered_manifest = serde_json::to_vec_pretty(&manifest).unwrap();
+
+        let mut tar_bytes: Vec<u8> = Vec::new();
+        {
+            let zstd_enc = zstd::stream::write::Encoder::new(&mut tar_bytes, 3)
+                .unwrap()
+                .auto_finish();
+            let mut builder = tar::Builder::new(zstd_enc);
+            write_tar_entry(&mut builder, MANIFEST_FILENAME, &tampered_manifest).unwrap();
+            write_tar_entry(&mut builder, EVENTS_FILENAME, &built.events_jsonl).unwrap();
+            write_tar_entry(&mut builder, RECEIPTS_FILENAME, &built.receipts_cbor).unwrap();
+            builder.finish().unwrap();
+        }
+
+        let report = verify_bundle_v1(&tar_bytes).expect("verify");
+        assert!(!report.ok, "key provenance is signed and must not be mutable");
+        assert!(!report.signature_valid);
+    }
+
+    #[test]
     fn unsupported_bundle_format_version_is_rejected() {
         let built = build_bundle_v1(sample_input()).expect("build");
         let mut manifest = built.manifest.clone();
@@ -890,6 +957,29 @@ mod tests {
 
         let err = verify_bundle_v1(&tar_bytes).unwrap_err();
         assert!(matches!(err, AuditBundleError::UnsupportedVersion(999)));
+    }
+
+    #[test]
+    fn v3_manifest_without_key_class_is_rejected() {
+        let built = build_bundle_v1(sample_input()).expect("build");
+        let mut manifest = built.manifest.clone();
+        manifest.key_class = None;
+        let malformed_manifest = serde_json::to_vec_pretty(&manifest).unwrap();
+
+        let mut tar_bytes: Vec<u8> = Vec::new();
+        {
+            let zstd_enc = zstd::stream::write::Encoder::new(&mut tar_bytes, 3)
+                .unwrap()
+                .auto_finish();
+            let mut builder = tar::Builder::new(zstd_enc);
+            write_tar_entry(&mut builder, MANIFEST_FILENAME, &malformed_manifest).unwrap();
+            write_tar_entry(&mut builder, EVENTS_FILENAME, &built.events_jsonl).unwrap();
+            write_tar_entry(&mut builder, RECEIPTS_FILENAME, &built.receipts_cbor).unwrap();
+            builder.finish().unwrap();
+        }
+
+        let err = verify_bundle_v1(&tar_bytes).unwrap_err();
+        assert!(matches!(err, AuditBundleError::MissingField("key_class")));
     }
 
     #[test]
@@ -946,14 +1036,24 @@ mod tests {
     // ---- H1: canonicalisation + domain separation (audit 2026-07-11) ----
 
     #[test]
-    fn v2_signing_bytes_are_domain_tagged() {
+    fn current_signing_bytes_are_v3_domain_tagged() {
         let built = build_bundle_v1(sample_input()).expect("build");
         assert_eq!(built.manifest.bundle_format_version, BUNDLE_FORMAT_VERSION);
         let signed = built.manifest.canonical_signing_bytes().expect("signing bytes");
         assert!(
             signed.starts_with(AUDIT_BUNDLE_SIGNING_DOMAIN),
-            "v2 signing input must start with the domain tag"
+            "v3 signing input must start with the domain tag"
         );
+    }
+
+    #[test]
+    fn v2_signing_bytes_keep_the_v2_domain_tag() {
+        let mut manifest = build_bundle_v1(sample_input()).expect("build").manifest;
+        manifest.bundle_format_version = BUNDLE_FORMAT_V2;
+        manifest.key_class = None;
+        let signed = manifest.canonical_signing_bytes().expect("signing bytes");
+        assert!(signed.starts_with(AUDIT_BUNDLE_SIGNING_DOMAIN_V2));
+        assert!(!signed.starts_with(AUDIT_BUNDLE_SIGNING_DOMAIN));
     }
 
     #[test]
@@ -1085,8 +1185,18 @@ mod tests {
         let bytes = include_bytes!("../vectors/audit-bundle-v1/valid-minimal-v2/audit-bundle.tar.zst");
         let report = verify_bundle_v1(bytes).expect("verify packaged v2 vector");
         assert!(report.ok, "v2 archive vector failed: {report:?}");
-        assert_eq!(report.bundle_format_version, BUNDLE_FORMAT_VERSION);
+        assert_eq!(report.bundle_format_version, BUNDLE_FORMAT_V2);
         assert_eq!(report.bundle_id, "vector-valid-minimal-v2");
+        assert!(report.signature_valid);
+    }
+
+    #[test]
+    fn packaged_valid_minimal_v3_vector_verifies() {
+        let bytes = include_bytes!("../vectors/audit-bundle-v1/valid-minimal-v3/audit-bundle.tar.zst");
+        let report = verify_bundle_v1(bytes).expect("verify packaged v3 vector");
+        assert!(report.ok, "v3 archive vector failed: {report:?}");
+        assert_eq!(report.bundle_format_version, BUNDLE_FORMAT_VERSION);
+        assert_eq!(report.bundle_id, "vector-valid-minimal-v3");
         assert!(report.signature_valid);
     }
 

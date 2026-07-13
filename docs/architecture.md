@@ -80,6 +80,15 @@ requires a dataplane-enabled deployment.
 3. BM25 keyword search over fact values.
 4. Token-budgeted retrieval of facts.
 
+### Fleet coordination
+
+The local coordination plane (`/v1/coord/*`) ships in the free daemon and is
+enabled by default. It provides the operator's presence-joined session board
+and advisory local claims; it is not tier-gated. Governance packaging applies
+only to hosted fleet-wide aggregation, attribution, and policy enforcement in
+CruxEngine, outside this repository. A local daemon therefore keeps its full
+coordination surface whether or not it is connected to hosted services.
+
 ## Crate Responsibilities
 
 ### Core Storage Layer

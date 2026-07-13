@@ -27,6 +27,7 @@
 //! - `__work__::`            — work items
 //! - `__work_transition__::` — work state transitions
 //! - `__workbench__::`       — Pro workbench context packs, ledgers, handoffs
+//! - `__incident__::`        — private governance incident reconstructions
 //! - `__answer_replay_capsule__::` — deterministic answer replay capsules
 //! - `__passport__::`        — passport metadata (already shouldn't sync)
 //! - `__bootstrap__::`       — first-run setup state
@@ -103,6 +104,9 @@ pub const DEFAULT_PRIVATE_PREFIXES: &[&str] = &[
     "__passport__::",
     "__session_binding__::",
     "__coord__::",
+    "__incident__::",
+    "__legal_hold__::",
+    "__legal_hold_receipt__::",
     "__bootstrap__::",
     "__project__::",
     "__tenant_metadata__::",
@@ -223,6 +227,7 @@ mod tests {
         // Coord intents/claims name sessions, passports, and repo paths —
         // strictly local, born private (coordination-plane ExecPlan T.1).
         assert!(p.is_always_private("__coord__::proj::deadbeef"));
+        assert!(p.is_always_private("__incident__::inc_deadbeef"));
     }
 
     #[test]
