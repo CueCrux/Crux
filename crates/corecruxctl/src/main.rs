@@ -18,9 +18,9 @@ use clap::{Parser, Subcommand};
 
 use corecruxctl::{
     admin, audit_export, audit_pack, c2pa_x509, code_chain, code_health, config_bundle, cost, deploy_audit, evidence,
-    explain, export, extensions, fixture_digest, gaps, hooks, identity_cli, inspect_receipt, learn, login, machine,
-    memory, memory_pack, observe_ingest, output_verify, parity, projections, receipts, reconcile, replay, repo,
-    session_sync, shard, shardmap, smoke, snapshot, stage1_import, start, storage, structured_log, tooling_env,
+    explain, export, extensions, fixture_digest, gaps, hooks, identity_cli, ingest, inspect_receipt, learn, login,
+    machine, memory, memory_pack, observe_ingest, output_verify, parity, projections, receipts, reconcile, replay,
+    repo, session_sync, shard, shardmap, smoke, snapshot, stage1_import, start, storage, structured_log, tooling_env,
     verify_store,
 };
 
@@ -508,6 +508,27 @@ enum Command {
     Repo {
         #[command(subcommand)]
         command: RepoCommand,
+    },
+
+    /// Ingest a text file or directory into the daemon's local BM25 index.
+    Ingest {
+        /// File or directory to ingest recursively.
+        path: PathBuf,
+        /// Tenant that owns the ingested documents.
+        #[arg(long, default_value = "local")]
+        tenant: String,
+        /// Corpus (stream type) used for the ingested documents.
+        #[arg(long, default_value = "docs")]
+        corpus: String,
+        /// Crux Daemon HTTP base URL.
+        #[arg(long, default_value = "http://127.0.0.1:14800")]
+        daemon_url: String,
+        /// Walk and chunk files, but perform no network calls or writes.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Embed each chunk through CORECRUXD_EMBEDDING_URL before ingest.
+        #[arg(long, default_value_t = false)]
+        embed: bool,
     },
 
     /// (advanced) Interactive quickstart wizard for new users.
@@ -3758,6 +3779,22 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         },
 
+        Command::Ingest {
+            path,
+            tenant,
+            corpus,
+            daemon_url,
+            dry_run,
+            embed,
+        } => ingest::run(&ingest::IngestOptions {
+            path,
+            tenant,
+            corpus,
+            daemon_url,
+            dry_run,
+            embed,
+        }),
+
         Command::Quickstart { http, non_interactive } => {
             corecruxctl::quickstart::run(&http, non_interactive)?;
             Ok(())
@@ -4560,6 +4597,29 @@ mod tests {
                 assert_eq!(mode, "sampled");
                 assert!((sample_rate - 0.25).abs() < f64::EPSILON);
                 assert!(!strict);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_ingest_defaults() {
+        let cli = Cli::try_parse_from(["corecruxctl", "ingest", "./docs", "--dry-run"]).unwrap();
+        match cli.command {
+            Command::Ingest {
+                path,
+                tenant,
+                corpus,
+                daemon_url,
+                dry_run,
+                embed,
+            } => {
+                assert_eq!(path, PathBuf::from("./docs"));
+                assert_eq!(tenant, "local");
+                assert_eq!(corpus, "docs");
+                assert_eq!(daemon_url, "http://127.0.0.1:14800");
+                assert!(dry_run);
+                assert!(!embed);
             }
             other => panic!("unexpected command: {other:?}"),
         }

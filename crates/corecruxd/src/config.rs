@@ -471,8 +471,9 @@ pub struct Config {
 
     // Local CPU prose-ingest door (`/v1/local/ingest`,
     // `crate::http::local_ingest`). Seals pre-formatted prose payloads into
-    // local segments served over BM25 — no GPU dataplane. Default OFF
-    // (`CORECRUXD_LOCAL_INGEST=1`); when off, the route returns 404.
+    // local segments served over BM25 — no GPU dataplane. Default ON;
+    // `CORECRUXD_LOCAL_INGEST=0` or `false` disables it and makes the route
+    // return 404.
     pub local_ingest_enabled: bool,
 
     // G19 stream/context receipt wiring (`crate::http::stream_receipts`).
@@ -630,6 +631,17 @@ fn env_string(key: &str) -> Option<String> {
 
 fn env_bool(key: &str) -> Option<bool> {
     std::env::var(key).ok().map(|value| bool_value(&value))
+}
+
+/// Read a default-on environment flag. Only an explicit `0` or `false`
+/// (case-insensitive, with surrounding whitespace ignored) disables it.
+pub(crate) fn env_default_on(key: &str) -> bool {
+    std::env::var(key)
+        .map(|value| {
+            let value = value.trim();
+            value != "0" && !value.eq_ignore_ascii_case("false")
+        })
+        .unwrap_or(true)
 }
 
 fn env_csv(key: &str) -> Option<Vec<String>> {
@@ -1181,7 +1193,7 @@ pub fn load_config() -> Config {
             .unwrap_or(crate::coord::DEFAULT_PRESENCE_TTL_SECS)
             .clamp(60, crate::coord::MAX_TTL_SECS),
         context_surface_enabled: env_bool("CORECRUXD_CONTEXT_SURFACE").unwrap_or(false),
-        local_ingest_enabled: env_bool("CORECRUXD_LOCAL_INGEST").unwrap_or(false),
+        local_ingest_enabled: env_default_on("CORECRUXD_LOCAL_INGEST"),
         stream_receipts_enabled: env_bool("CORECRUXD_STREAM_RECEIPTS").unwrap_or(false),
         usage_receipts_enabled: env_bool("CORECRUXD_FEATURE_USAGE_RECEIPTS").unwrap_or(false),
         handoff_observations_enabled: env_bool("CORECRUXD_HANDOFF_OBSERVATIONS").unwrap_or(false),
@@ -1662,10 +1674,51 @@ mod tests {
         // to 15 min. Explicit `CORECRUXD_COORD=0` disables it.
         assert!(cfg.coord_enabled);
         assert_eq!(cfg.coord_presence_ttl_secs, crate::coord::DEFAULT_PRESENCE_TTL_SECS);
+        // The local CPU ingest door is available on a stock daemon.
+        assert!(cfg.local_ingest_enabled);
         // Phase T S1 handoff observations are default OFF.
         assert!(!cfg.handoff_observations_enabled);
         // Credit Meter M1b is default OFF; comped-wallet spends must opt in.
         assert!(!cfg.credit_meter_enabled);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_config_local_ingest_can_be_disabled() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+        for value in ["0", "false"] {
+            clear_corecruxd_env();
+            std::env::set_var("CORECRUXD_LOCAL_INGEST", value);
+            let cfg = super::load_config();
+            assert!(!cfg.local_ingest_enabled, "{value} must disable local ingest");
+        }
+        clear_corecruxd_env();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn default_on_env_flags_only_honor_explicit_off_values() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        const KEY: &str = "CORECRUXD_TEST_DEFAULT_ON";
+
+        std::env::remove_var(KEY);
+        assert!(super::env_default_on(KEY));
+
+        for value in ["0", "false", "FALSE", " false "] {
+            std::env::set_var(KEY, value);
+            assert!(!super::env_default_on(KEY), "{value:?} must disable a default-on flag");
+        }
+        for value in ["1", "true", "yes", "", "unexpected"] {
+            std::env::set_var(KEY, value);
+            assert!(
+                super::env_default_on(KEY),
+                "{value:?} must leave a default-on flag enabled"
+            );
+        }
+
+        std::env::remove_var(KEY);
     }
 
     #[test]

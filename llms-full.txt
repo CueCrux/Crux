@@ -585,6 +585,7 @@ ci_assertions:
     - crux-router
     - crux-session
     - crux-mcp
+    - crux-observe
     - corecruxd
     - corecruxctl
     - crux-cost
@@ -630,6 +631,7 @@ ci_assertions:
     - handle_issue_passport
     - handle_declare_constraint
     - write_ccxv
+    - BootstrapSeeder
   tests:
     - tampering_with_signature_breaks_signature_check
     - wrong_verifying_key_fails
@@ -1904,10 +1906,11 @@ Use `update_status` like this:
 - `ahead` or `diverged`: do not ask for a blind pull; switch to a human-reviewed upgrade flow.
 - `disabled`, `unavailable`, or `error`: tell the human how to configure the git update-check inputs, but keep serving traffic locally.
 
-The onboarding playbooks are maintained in-repo at
-`crates/crux-observe/bootstrap_data/docs.json`, then seeded into the local fact
-store on startup so agents can pull them at runtime without a hosted
-dependency.
+The compact onboarding starter pack is compiled into `BootstrapSeeder` in
+`crates/crux-observe/src/bootstrap.rs` and seeded only when the local fact
+store has no existing `__bootstrap__::` facts, so agents can pull it at
+runtime without a hosted dependency. Set `CORECRUXD_SEED_BOOTSTRAP=0` to leave
+a cold store unseeded.
 
 ## First Connect Endpoint Selection
 
