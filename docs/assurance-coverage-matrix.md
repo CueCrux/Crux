@@ -12,10 +12,18 @@
    **not** forgery-resistant against a compromise of that same domain. This is
    what the free daemon mints for memory/retrieval operations.
 2. **Mediated evidence** — a record minted by a *witness process* that sits on
-   the traffic path and holds its **own** signing key the agent never has
-   (`crux-llm-shim` local mode; cloud witness mode). A compromised agent cannot
-   forge these; it can only avoid them (see "bypass" per row — avoidance is
-   detectable absence, not forgeable presence).
+   the traffic path and holds its **own** signing key in a separate process
+   (`crux-llm-shim` local mode; cloud witness mode). The witness key is not held
+   by the agent's own logic, and the signature is forgery-resistant against a
+   *different-user* or *remote* attacker. **Honest limit:** the key is an
+   on-disk `0600` file under the invoking user's home, so a compromise running
+   as the **same OS user** as the witness can read `witness.key` and forge
+   records. Mediation therefore raises the bar from "the agent rewrites its own
+   story in-process" to "only a same-UID-or-higher host compromise can forge" —
+   it is *not* proof against a fully compromised host account. True
+   forgery-resistance against a same-host attacker needs a hardware key store or
+   an off-host witness (class 3), neither of which ships here. Bypass (unsetting
+   the base URL) remains detectable absence, not forgeable presence.
 3. **External attestation** — counter-signature or anchoring by a party off the
    host (hosted aggregation, transparency-log registration per the SCITT
    mapping). **Not shipped in the free daemon**; the Governance tier's hosted
@@ -32,7 +40,7 @@ external attestation (class 3) addresses.
 
 | Event class | Captured by (default?) | Trust boundary of capture | Signed with | Bypassable how | A receipt PROVES | A receipt does NOT prove |
 |---|---|---|---|---|---|---|
-| **Cloud model call — Anthropic `/v1/messages`, OpenAI `/v1/chat/completions`·`/v1/responses`** | Cloud witness mode of `crux-llm-shim` (opt-in: `CRUX_CLOUD_WITNESS=1` + client `ANTHROPIC_BASE_URL`/`OPENAI_BASE_URL` → loopback listener) | Witness process, separate from the agent process; dedicated key the agent never holds | Witness Ed25519 key (`witness.key`, 0600) | Agent/user unsets the base-URL env → calls stop appearing in the witness ledger (detectable absence); host-root can read the key | An identified client sent a request with digest X to provider Y at time T and received a response with digest Z, with the recorded model/usage/end-state, **through the witness** | That the agent had no other channel to the provider; anything about content semantics (digests only); that the host itself was uncompromised |
+| **Cloud model call — Anthropic `/v1/messages`, OpenAI `/v1/chat/completions`·`/v1/responses`** | Cloud witness mode of `crux-llm-shim` (opt-in: `CRUX_CLOUD_WITNESS=1` + client `ANTHROPIC_BASE_URL`/`OPENAI_BASE_URL` → loopback listener) | Witness process, separate from the agent process; key is a `0600` file (same-UID readable — see class 2 honest limit) | Witness Ed25519 key (`witness.key`, 0600) | Agent/user unsets the base-URL env → calls stop appearing in the witness ledger (detectable absence); a **same-UID** compromise can read the key and forge; the listener is unauthenticated loopback, so the attributed `x-crux-session-id` is caller-supplied (not an authenticated identity), and records carry no nonce/sequence so a same-host caller can replay | A request with digest X was sent to provider Y at time T through the witness and a response with digest Z (model/usage/end-state as recorded) came back — signed by *this witness key* | That a *specific* authenticated client made it (session id is self-asserted); that the request is unique (no replay guard); that the agent had no other channel; content semantics (digests only); that the host/user account was uncompromised. **Delivery note:** records currently land in the local JSONL spool — daemon-timeline/ledger delivery of the `{record,witness}` envelope is not yet wired (see M2 PR follow-up), so these do not yet feed incident reconstruction automatically |
 | **Local model call (Ollama/vLLM/llama.cpp)** | `crux-llm-shim` local mode (opt-in: `CRUX_LLM_SHIM=1`) | Same as above (witness class) | Shim receipt records; witness-signed in witness-enabled runs | Client points at the model server directly instead of the shim | Context injected (stable_hash/bundle_digest) + request/response digests + stream end-state through the shim | Same limits as cloud row |
 | **Agent tool calls / file edits / shell (Claude Code)** | `crux-observe.sh` hook snippet → `/v1/sessions/{id}/observations` (near-default once installed); `crux-hook observe-pre/post` signed trace nodes with BLAKE3 file before/after (flag-gated) | **Inside the agent's own harness** — hooks run in the agent's environment | Daemon receipts on storage; trace nodes carry hashes | A compromised agent can suppress, reorder, or fabricate hook events **before** they reach the daemon | That the daemon *received and durably stored* these self-reports at time T (storage is class-1 verifiable record) | **What the agent actually did.** This lane is self-reported telemetry, not evidence — never market it as proof of conduct |
 | **Codex sessions** | `codex-tailer.py` (opt-in script tailing `~/.codex` rollouts) | Same-host script reading agent-written files | Daemon receipts on storage | Agent/user edits or truncates rollout files before tailing | Daemon received these observations at time T | What the Codex agent actually did (same self-report limit as above) |

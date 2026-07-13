@@ -36,8 +36,13 @@ ExecPlan: `tier-packaging-and-site-reframe-2026-07-13`, M2
   The `wit_…` key id is the first 16 lowercase hex characters of SHA-256 over
   RFC 8410 Ed25519 SPKI DER.
 - Added recursively sorted canonical-JSON signing and identity-pinned strict
-  verification. The verifier rejects record alteration, stale signatures,
-  key-id mismatch, and attacker re-signing with a different key.
+  verification. The verifier rejects record alteration, key-id mismatch, and
+  attacker re-signing with a different key. **It does NOT reject replay**: there
+  is no nonce/sequence/timestamp-freshness check, so a valid envelope can be
+  re-submitted. Nor does the same-UID key custody stop a same-user compromise
+  from forging (the `0600` key is readable by the invoking user). Both limits
+  are stated in the assurance/coverage matrix; closing them (hardware key store
+  or off-host witness; a replay guard) is follow-up work, not claimed here.
 - Extended the existing daemon-first `/v1/mediation/receipts` plus JSONL spool
   fallback. Cloud delivery uses a bounded, non-blocking ordered queue so
   daemon/filesystem stalls cannot create unbounded memory growth or delay
