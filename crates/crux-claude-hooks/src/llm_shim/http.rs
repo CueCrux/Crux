@@ -90,22 +90,22 @@ pub fn handle_connection(stream: TcpStream, config: &ShimConfig) {
     forward(config, &request, &injection, &path_only, &mut writer);
 }
 
-struct Request {
-    method: String,
-    target: String,
+pub(super) struct Request {
+    pub(super) method: String,
+    pub(super) target: String,
     /// (name-lowercase, value) pairs in arrival order.
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
+    pub(super) headers: Vec<(String, String)>,
+    pub(super) body: Vec<u8>,
 }
 
-enum RequestError {
+pub(super) enum RequestError {
     BadRequest(String),
     LengthRequired,
     TooLarge,
     Io,
 }
 
-fn read_request(reader: &mut impl BufRead) -> Result<Request, RequestError> {
+pub(super) fn read_request(reader: &mut impl BufRead) -> Result<Request, RequestError> {
     let mut line = String::new();
     if reader.read_line(&mut line).map_err(|_| RequestError::Io)? == 0 {
         return Err(RequestError::Io);
@@ -115,6 +115,11 @@ fn read_request(reader: &mut impl BufRead) -> Result<Request, RequestError> {
         (Some(m), Some(t)) => (m.to_uppercase(), t.to_string()),
         _ => return Err(RequestError::BadRequest("malformed request line".into())),
     };
+    if !target.starts_with('/') || target.starts_with("//") {
+        return Err(RequestError::BadRequest(
+            "request target must be an origin-form path beginning with exactly one '/'".into(),
+        ));
+    }
 
     let mut headers = Vec::new();
     let mut head_bytes = line.len();
@@ -162,17 +167,25 @@ fn read_request(reader: &mut impl BufRead) -> Result<Request, RequestError> {
     })
 }
 
-/// Request headers the proxy owns (everything else is forwarded verbatim).
-fn header_is_hop_by_hop(name: &str) -> bool {
+/// True for RFC hop-by-hop headers, including names nominated by the
+/// request's `Connection` header.
+pub(super) fn header_is_hop_by_hop(name: &str, headers: &[(String, String)]) -> bool {
+    if headers
+        .iter()
+        .filter(|(header_name, _)| header_name == "connection")
+        .flat_map(|(_, value)| value.split(','))
+        .any(|token| token.trim().eq_ignore_ascii_case(name))
+    {
+        return true;
+    }
     matches!(
         name,
-        "host"
-            | "connection"
-            | "content-length"
+        "connection"
             | "transfer-encoding"
-            | "accept-encoding"
             | "keep-alive"
             | "proxy-connection"
+            | "proxy-authenticate"
+            | "proxy-authorization"
             | "upgrade"
             | "te"
             | "trailer"
@@ -197,7 +210,9 @@ fn forward(
     };
     let mut req_builder = ureq::http::Request::builder().method(method).uri(&url);
     for (name, value) in &request.headers {
-        if !header_is_hop_by_hop(name) {
+        if !matches!(name.as_str(), "host" | "content-length" | "accept-encoding")
+            && !header_is_hop_by_hop(name, &request.headers)
+        {
             req_builder = req_builder.header(name.as_str(), value.as_str());
         }
     }
@@ -328,7 +343,7 @@ fn pump_body(upstream_reader: &mut impl Read, writer: &mut TcpStream) -> PumpOut
     }
 }
 
-fn respond_error(writer: &mut TcpStream, code: u16, reason: &str, message: &str) {
+pub(super) fn respond_error(writer: &mut TcpStream, code: u16, reason: &str, message: &str) {
     let body = serde_json::json!({ "error": { "message": message, "type": "crux_llm_shim" } });
     let body = body.to_string();
     let head = format!(
@@ -338,4 +353,38 @@ fn respond_error(writer: &mut TcpStream, code: u16, reason: &str, message: &str)
     let _ = writer.write_all(head.as_bytes());
     let _ = writer.write_all(body.as_bytes());
     let _ = writer.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hop_by_hop_filter_honors_connection_tokens() {
+        let headers = vec![
+            ("connection".to_string(), "keep-alive, x-drop".to_string()),
+            ("x-drop".to_string(), "secret".to_string()),
+            ("authorization".to_string(), "Bearer forwarded".to_string()),
+        ];
+        assert!(header_is_hop_by_hop("connection", &headers));
+        assert!(header_is_hop_by_hop("x-drop", &headers));
+        assert!(header_is_hop_by_hop("proxy-authorization", &headers));
+        assert!(!header_is_hop_by_hop("authorization", &headers));
+    }
+
+    #[test]
+    fn request_parser_rejects_authority_smuggling_targets() {
+        for target in [
+            ".attacker.example/steal",
+            "@attacker.example/steal",
+            "//attacker.example/steal",
+            "https://attacker.example/steal",
+        ] {
+            let request = format!("GET {target} HTTP/1.1\r\nHost: witness\r\n\r\n");
+            let mut cursor = std::io::Cursor::new(request.into_bytes());
+            assert!(matches!(read_request(&mut cursor), Err(RequestError::BadRequest(_))));
+        }
+        let mut valid = std::io::Cursor::new(b"GET /v1/models?limit=1 HTTP/1.1\r\nHost: witness\r\n\r\n".to_vec());
+        assert!(read_request(&mut valid).is_ok());
+    }
 }

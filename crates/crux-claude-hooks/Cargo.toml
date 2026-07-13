@@ -30,6 +30,11 @@ clap = { workspace = true, features = ["derive"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 ureq = { workspace = true, features = ["json"] }
+base64 = { workspace = true }
+ed25519-dalek = { workspace = true, features = ["std", "pkcs8"] }
+fs2 = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
 # code-intelligence M5: encode `code:<repo>:<path>` entities into the facts URL.
 # Already in the workspace lockfile (corecruxctl) — no new network fetch.
 urlencoding = { workspace = true }

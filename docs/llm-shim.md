@@ -38,6 +38,106 @@ shim is the only viable injection point. The normative rationale (and the
   failure records append to a local JSONL spool
   (`~/.local/state/crux/llm-shim/receipts.jsonl` by default).
 
+## Cloud witness mode
+
+Cloud witness mode is a separate, explicit operating mode for observing
+Anthropic and OpenAI traffic. **Witnessing is not injection:** the witness
+never adds Crux context and never modifies a request or response payload. It
+forwards the call, hashes the exact payload bytes it observes, and emits a
+signed metadata-only trail.
+
+The mode is default-OFF and requires `CRUX_CLOUD_WITNESS=1` plus
+`--cloud-witness`. Its production upstream allowlist is pinned to exactly
+`https://api.anthropic.com` and `https://api.openai.com`; there is no arbitrary
+cloud-host option. The client-facing listener remains loopback-only, and the
+upstream connection uses TLS certificate verification. Redirects are not
+followed, and only origin-form request targets beginning with one `/` are
+accepted, so the pinned authority cannot be replaced by a crafted request
+line. Authentication headers
+(`x-api-key` and `Authorization`) are forwarded to the selected provider but
+are never logged, persisted, or included in a digest.
+
+Witnessed calls are:
+
+- Anthropic `POST /v1/messages`;
+- OpenAI `POST /v1/chat/completions`;
+- OpenAI `POST /v1/responses`.
+
+Other paths are still forwarded and produce only a lightweight
+`passthrough_unwitnessed` record containing the path and timestamp. No request
+or response content is stored for any path.
+
+For a witnessed call, the shim emits linked `cloud_request_witnessed` and
+`cloud_response_witnessed` records under
+`cuecrux.mediation.witness.v1`. They contain SHA-256 request/output digests,
+provider and model metadata, tool names without arguments, stream state,
+timing, status, and usage/stop metadata when parseable. Each record is signed
+with a dedicated Ed25519 witness key. The key is created with mode `0600` on
+first use at `~/.local/state/crux/llm-shim/witness.key`, then reused; override
+the location with `--witness-key <path>`. The signed envelope carries its key
+id and public key so records can be checked offline against the expected,
+pinned witness public key. A symlink/non-regular key, a key that is
+group/world-accessible when loaded, or a group/world-writable key directory
+degrades the witness instead of silently reusing unsafe custody.
+
+What this proves: the holder of the pinned witness key observed bytes matching
+the committed request and response digests and linked them to the recorded
+request/response lifecycle and end-state while connecting to the selected
+pinned TLS upstream. Altering a signed record or committed digest invalidates
+verification.
+
+What this does **not** prove: that the provider used a particular internal
+model or tool, that an answer is correct, that the local host or witness key
+was uncompromised, or that every cloud call was routed through the witness.
+The witness cannot prevent bypass. A bypass instead creates a detectable
+absence when the witness trail is reconciled with an independently known
+session or invocation sequence; a standalone receipt set cannot prove that
+unrecorded calls never occurred.
+
+Witnessing is fail-soft. A key, signing, daemon-delivery, or spool failure must
+not turn into a model outage: the provider call is still forwarded and the
+shim best-effort emits a `witness_degraded` record. Receipt delivery uses the
+same `POST /v1/mediation/receipts` then JSONL-spool fallback as local mode.
+The cloud delivery queue is bounded and non-blocking; concurrent processes
+lock each JSONL append so separate local/Anthropic/OpenAI instances cannot
+interleave record framing.
+
+### Anthropic quickstart
+
+Run a witness instance on a port distinct from any local injection shim, then
+point the Anthropic client at its loopback listener:
+
+```bash
+CRUX_CLOUD_WITNESS=1 crux-llm-shim \
+  --cloud-witness \
+  --cloud-upstream anthropic \
+  --listen 127.0.0.1:11436
+
+export ANTHROPIC_BASE_URL=http://127.0.0.1:11436
+# Run the Anthropic client normally; keep ANTHROPIC_API_KEY configured as usual.
+```
+
+### OpenAI quickstart
+
+```bash
+CRUX_CLOUD_WITNESS=1 crux-llm-shim \
+  --cloud-witness \
+  --cloud-upstream openai \
+  --listen 127.0.0.1:11437
+
+export OPENAI_BASE_URL=http://127.0.0.1:11437/v1
+# Run the OpenAI client normally; keep OPENAI_API_KEY configured as usual.
+```
+
+Local injection mode and cloud witness mode have independent enable flags and
+can run concurrently as separate instances of the same binary on different
+loopback ports. The insecure HTTP test-upstream override is intentionally not
+a production escape hatch: it requires the loud
+`--insecure-test-upstream` opt-in and stamps every resulting record
+`test_upstream: true`. The override URL must be supplied separately as
+`CRUX_CLOUD_WITNESS_TEST_UPSTREAM=http://127.0.0.1:<port>` and is restricted
+to loopback HTTP.
+
 ## Install & run
 
 ```bash
