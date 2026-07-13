@@ -291,8 +291,8 @@ fn verify_x509_envelope(
         .collect::<Result<_, _>>()?;
     let leaf = Certificate::from_der(&chain_der[0])?;
     let leaf_spki = leaf
-        .tbs_certificate
-        .subject_public_key_info
+        .tbs_certificate()
+        .subject_public_key_info()
         .subject_public_key
         .as_bytes()
         .ok_or("leaf subject_public_key has non-octet bits")?
@@ -322,10 +322,10 @@ fn verify_x509_envelope(
                 // here — see notes — but we do check the chain
                 // links and reject mismatched names.
                 let mut valid = true;
-                let mut prev_issuer: Option<String> = Some(leaf.tbs_certificate.issuer.to_string());
+                let mut prev_issuer: Option<String> = Some(leaf.tbs_certificate().issuer().to_string());
                 for der in &chain_der[1..] {
                     let cert = Certificate::from_der(der)?;
-                    let subj = cert.tbs_certificate.subject.to_string();
+                    let subj = cert.tbs_certificate().subject().to_string();
                     if prev_issuer.as_deref() != Some(subj.as_str()) {
                         valid = false;
                         notes.push(format!(
@@ -334,11 +334,11 @@ fn verify_x509_envelope(
                         ));
                         break;
                     }
-                    prev_issuer = Some(cert.tbs_certificate.issuer.to_string());
+                    prev_issuer = Some(cert.tbs_certificate().issuer().to_string());
                 }
                 // Last-link check: prev_issuer must equal anchor subject.
                 let anchor_cert = Certificate::from_der(&anchor_der)?;
-                let anchor_subj = anchor_cert.tbs_certificate.subject.to_string();
+                let anchor_subj = anchor_cert.tbs_certificate().subject().to_string();
                 if valid && prev_issuer.as_deref() != Some(anchor_subj.as_str()) {
                     valid = false;
                     notes.push(format!(
@@ -381,10 +381,16 @@ fn canonical_hash_matches(parsed: &C2paSignedManifestV1) -> bool {
 
 fn summarise_cert(der: &[u8]) -> Result<CertSummary, Box<dyn std::error::Error + Send + Sync>> {
     let cert = Certificate::from_der(der)?;
-    let subject = cert.tbs_certificate.subject.to_string();
-    let issuer = cert.tbs_certificate.issuer.to_string();
-    let not_before = format_validity(cert.tbs_certificate.validity.not_before.to_unix_duration().as_secs());
-    let not_after_secs = cert.tbs_certificate.validity.not_after.to_unix_duration().as_secs();
+    let subject = cert.tbs_certificate().subject().to_string();
+    let issuer = cert.tbs_certificate().issuer().to_string();
+    let not_before = format_validity(
+        cert.tbs_certificate()
+            .validity()
+            .not_before
+            .to_unix_duration()
+            .as_secs(),
+    );
+    let not_after_secs = cert.tbs_certificate().validity().not_after.to_unix_duration().as_secs();
     let not_after = format_validity(not_after_secs);
     let now_secs = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
