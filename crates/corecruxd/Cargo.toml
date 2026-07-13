@@ -42,6 +42,8 @@ prometheus = { workspace = true, default-features = false }
 chacha20poly1305 = { workspace = true }
 prost = { workspace = true }
 rand = { workspace = true }
+regex = { workspace = true }
+roxmltree = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
