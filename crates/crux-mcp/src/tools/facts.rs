@@ -114,6 +114,18 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
     let entity_raw = require_str(args, "entity")?;
     let key = require_str(args, "key")?;
     let value = require_str(args, "value")?;
+    if let Some(prefix) = corecrux_memory::fact_privacy::daemon_owned_entity_prefix(entity_raw) {
+        return Err(JsonRpcError {
+            code: INVALID_PARAMS,
+            message: format!("entity uses reserved daemon-owned prefix `{prefix}`"),
+            data: Some(json!({
+                "error_code": "RESERVED_ENTITY_PREFIX",
+                "param": "entity",
+                "entity": entity_raw,
+                "reserved_prefix": prefix,
+            })),
+        });
+    }
     let source_receipt = args
         .get("source_receipt")
         .and_then(|v| v.as_str())
@@ -1051,6 +1063,40 @@ mod tests {
         let store = ctx.fact_store.read().await;
         let fact = store.get(fact_id).unwrap();
         assert!(fact.private, "reserved-prefix facts must be born private");
+    }
+
+    #[tokio::test]
+    async fn store_fact_passport_rejects_daemon_owned_entity_prefixes() {
+        let map = crate::agent_passport::AgentPassportMap::builtin_default();
+        let ctx = test_ctx().with_agent_passports(true, map).with_agent(AgentIdentity {
+            name: "openai".to_string(),
+            token_hash: [7u8; 32],
+        });
+        seed_passport(&ctx, "codex-work", "work").await;
+
+        for entity in [
+            "__legal_hold__::hold-1",
+            "__legal_hold_receipt__::receipt-1",
+            "__incident__::incident-1",
+        ] {
+            let err = handle_store_fact(&json!({"entity": entity, "key": "state", "value": "attacker"}), &ctx)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, INVALID_PARAMS);
+            assert_eq!(
+                err.data.as_ref().and_then(|data| data["error_code"].as_str()),
+                Some("RESERVED_ENTITY_PREFIX")
+            );
+            assert_eq!(err.data.as_ref().and_then(|data| data["entity"].as_str()), Some(entity));
+        }
+
+        let store = ctx.fact_store.read().await;
+        assert!(
+            store
+                .all_facts()
+                .all(|fact| corecrux_memory::fact_privacy::daemon_owned_entity_prefix(&fact.entity).is_none()),
+            "client attempts must not persist daemon-owned facts"
+        );
     }
 
     #[tokio::test]

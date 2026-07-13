@@ -109,6 +109,10 @@ pub enum LegalHoldError {
     NotFound(String),
     #[error("legal hold is already released: {0}")]
     AlreadyReleased(String),
+    #[error("legal hold release requires a durable signed receipt id")]
+    MissingDurableReceipt,
+    #[error("legal hold changed before release could be committed: {0}")]
+    StateChanged(String),
     #[error("legal hold persistence failed: {0}")]
     Persistence(#[from] std::io::Error),
     #[error("legal hold serialization failed: {0}")]
@@ -128,6 +132,58 @@ fn normalize_prefixes(prefixes: Vec<String>) -> Vec<String> {
     prefixes.sort();
     prefixes.dedup();
     prefixes
+}
+
+/// Resolve a hold from its complete state history, including tombstoned rows.
+///
+/// A malformed newest version must not hide an older valid state. If every
+/// stored version is malformed, synthesize a tenant-wide active marker from
+/// the fact envelope so enforcement remains fail-closed.
+fn resolve_legal_hold_state<'a>(hold_id: &str, states: impl IntoIterator<Item = &'a Fact>) -> Option<LegalHold> {
+    let mut states: Vec<&Fact> = states.into_iter().collect();
+    states.sort_by(|left, right| {
+        right
+            .version
+            .cmp(&left.version)
+            .then_with(|| right.stored_at.cmp(&left.stored_at))
+            .then_with(|| right.fact_id.cmp(&left.fact_id))
+    });
+
+    let newest = *states.first()?;
+    for fact in &states {
+        match serde_json::from_str::<LegalHold>(&fact.value) {
+            Ok(hold) => return Some(hold),
+            Err(err) => {
+                tracing::error!(
+                    hold_id,
+                    fact_id = %fact.fact_id,
+                    state_version = fact.version,
+                    ?err,
+                    "legal-hold-state-parse-failed"
+                );
+            }
+        }
+    }
+
+    tracing::error!(
+        hold_id,
+        state_versions = states.len(),
+        "legal-hold-state-unparsable-enforced-fail-closed"
+    );
+    Some(LegalHold {
+        schema: LEGAL_HOLD_SCHEMA_V1.to_string(),
+        hold_id: hold_id.to_string(),
+        tenant_id: newest.tenant_hash.clone(),
+        // The original scope is unknowable, so cover the entire tenant.
+        entity_prefixes: Vec::new(),
+        reason: "stored legal-hold state is unparsable; enforcing tenant-wide fail-closed marker".to_string(),
+        placed_at: newest.stored_at,
+        placed_by: newest.actor.clone().unwrap_or_else(|| "unresolved".to_string()),
+        place_receipt_id: newest.source_receipt.clone().unwrap_or_else(|| newest.fact_id.clone()),
+        released_at: None,
+        released_by: None,
+        release_receipt_id: None,
+    })
 }
 
 impl FactStore {
@@ -185,8 +241,11 @@ impl FactStore {
         Ok(LegalHoldMutation { hold, receipt })
     }
 
-    pub fn release_legal_hold(
-        &mut self,
+    /// Build release receipt material without changing the durable hold state.
+    /// The daemon persists and signs this material before calling
+    /// [`FactStore::release_legal_hold`] to commit the release.
+    pub fn prepare_legal_hold_release(
+        &self,
         hold_id: &str,
         actor: Option<&str>,
     ) -> Result<LegalHoldMutation, LegalHoldError> {
@@ -214,19 +273,64 @@ impl FactStore {
             fact_ids: Vec::new(),
             recorded_at: now,
         };
-        let value = serde_json::to_string(&hold)?;
+        Ok(LegalHoldMutation { hold, receipt })
+    }
+
+    /// Commit a previously prepared release only after its signed observation
+    /// receipt has been durably persisted by the daemon. The current hold is
+    /// revalidated so a stale prepared mutation cannot overwrite a concurrent
+    /// state change. A failed state write leaves the hold active and the
+    /// already-persisted receipt orphaned, which is the fail-closed direction.
+    pub fn release_legal_hold(
+        &mut self,
+        prepared: &LegalHoldMutation,
+        durable_signed_receipt_id: &str,
+    ) -> Result<LegalHoldMutation, LegalHoldError> {
+        if durable_signed_receipt_id.trim().is_empty() {
+            return Err(LegalHoldError::MissingDurableReceipt);
+        }
+        if prepared.receipt.kind != LegalHoldReceiptKind::Released {
+            return Err(LegalHoldError::StateChanged(prepared.hold.hold_id.clone()));
+        }
+
+        let current = self
+            .legal_hold(&prepared.hold.hold_id)
+            .ok_or_else(|| LegalHoldError::NotFound(prepared.hold.hold_id.clone()))?;
+        if !current.active() {
+            return Err(LegalHoldError::AlreadyReleased(prepared.hold.hold_id.clone()));
+        }
+        let mut expected_current = prepared.hold.clone();
+        expected_current.released_at = None;
+        expected_current.released_by = None;
+        expected_current.release_receipt_id = None;
+        if current != expected_current
+            || prepared.receipt.hold_ids.len() != 1
+            || prepared.receipt.hold_ids.first() != Some(&prepared.hold.hold_id)
+            || prepared.receipt.tenant_id != prepared.hold.tenant_id
+            || prepared.receipt.entity_prefixes != prepared.hold.entity_prefixes
+            || prepared.receipt.reason != prepared.hold.reason
+            || prepared.hold.released_by.as_deref() != Some(prepared.receipt.actor.as_str())
+            || prepared.hold.released_at.as_ref() != Some(&prepared.receipt.recorded_at)
+            || prepared.hold.release_receipt_id.as_deref() != Some(prepared.receipt.receipt_id.as_str())
+        {
+            return Err(LegalHoldError::StateChanged(prepared.hold.hold_id.clone()));
+        }
+
+        let mut committed = prepared.clone();
+        committed.hold.release_receipt_id = Some(durable_signed_receipt_id.to_string());
+        let value = serde_json::to_string(&committed.hold)?;
         self.try_store(StoreFact {
-            tenant_hash: hold.tenant_id.clone(),
-            entity: format!("{LEGAL_HOLD_ENTITY_PREFIX}{}", hold.hold_id),
+            tenant_hash: committed.hold.tenant_id.clone(),
+            entity: format!("{LEGAL_HOLD_ENTITY_PREFIX}{}", committed.hold.hold_id),
             key: "state".to_string(),
             value,
-            source_receipt: Some(receipt_id),
+            source_receipt: Some(durable_signed_receipt_id.to_string()),
             confidence: 1.0,
             private: true,
             horizon_class: Some(HorizonClass::None),
-            actor: Some(actor),
+            actor: committed.hold.released_by.clone(),
         })?;
-        Ok(LegalHoldMutation { hold, receipt })
+        Ok(committed)
     }
 
     /// Bind the durable signed observation record produced by the daemon to
@@ -261,31 +365,30 @@ impl FactStore {
         Ok(hold)
     }
 
-    pub fn legal_hold(&self, hold_id: &str) -> Option<LegalHold> {
+    fn active_hold_state(&self, hold_id: &str) -> Option<LegalHold> {
         let entity = format!("{LEGAL_HOLD_ENTITY_PREFIX}{hold_id}");
-        self.get_by_entity(&entity)
-            .into_iter()
-            .filter(|fact| fact.key == "state" && fact.superseded_by.is_none())
-            .max_by(|left, right| left.version.cmp(&right.version))
-            .and_then(|fact| serde_json::from_str(&fact.value).ok())
+        resolve_legal_hold_state(
+            hold_id,
+            self.all_facts()
+                .filter(|fact| fact.entity == entity && fact.key == "state"),
+        )
+    }
+
+    pub fn legal_hold(&self, hold_id: &str) -> Option<LegalHold> {
+        self.active_hold_state(hold_id)
     }
 
     pub fn legal_holds(&self) -> Vec<LegalHold> {
-        let mut holds: Vec<LegalHold> = self
-            .all_facts()
-            .filter(|fact| {
-                !fact.deleted
-                    && fact.superseded_by.is_none()
-                    && fact.key == "state"
-                    && fact.entity.starts_with(LEGAL_HOLD_ENTITY_PREFIX)
-            })
-            .filter_map(|fact| match serde_json::from_str(&fact.value) {
-                Ok(hold) => Some(hold),
-                Err(err) => {
-                    tracing::warn!(fact_id = %fact.fact_id, ?err, "legal-hold-state-parse-skip");
-                    None
-                }
-            })
+        let mut states_by_hold: std::collections::BTreeMap<&str, Vec<&Fact>> = std::collections::BTreeMap::new();
+        for fact in self.all_facts().filter(|fact| fact.key == "state") {
+            if let Some(hold_id) = fact.entity.strip_prefix(LEGAL_HOLD_ENTITY_PREFIX) {
+                states_by_hold.entry(hold_id).or_default().push(fact);
+            }
+        }
+
+        let mut holds: Vec<LegalHold> = states_by_hold
+            .into_iter()
+            .filter_map(|(hold_id, states)| resolve_legal_hold_state(hold_id, states))
             .collect();
         holds.sort_by(|left, right| {
             left.placed_at
@@ -314,7 +417,10 @@ impl FactStore {
             .filter_map(|fact| {
                 let hold_ids: Vec<String> = holds
                     .iter()
-                    .filter(|hold| hold.covers_fact(fact))
+                    .filter(|hold| {
+                        hold.covers_fact(fact)
+                            || fact.entity.strip_prefix(LEGAL_HOLD_ENTITY_PREFIX) == Some(hold.hold_id.as_str())
+                    })
                     .map(|hold| hold.hold_id.clone())
                     .collect();
                 (!hold_ids.is_empty()).then(|| (fact.fact_id.clone(), hold_ids))
@@ -380,6 +486,20 @@ mod tests {
         }
     }
 
+    fn malformed_hold_state(tenant: &str, hold_id: &str) -> StoreFact {
+        StoreFact {
+            tenant_hash: tenant.to_string(),
+            entity: format!("{LEGAL_HOLD_ENTITY_PREFIX}{hold_id}"),
+            key: "state".to_string(),
+            value: "{malformed-json".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: true,
+            horizon_class: Some(HorizonClass::None),
+            actor: Some("bypass-attempt".to_string()),
+        }
+    }
+
     #[test]
     fn place_release_are_private_receipted_and_survive_replay() {
         let dir = tempdir().unwrap();
@@ -404,9 +524,12 @@ mod tests {
                 Some(placed.receipt.receipt_id.as_str())
             );
 
-            let released = store.release_legal_hold(&hold_id, Some("p_operator")).unwrap();
+            let prepared = store.prepare_legal_hold_release(&hold_id, Some("p_operator")).unwrap();
+            assert!(store.legal_hold(&hold_id).unwrap().active());
+            let released = store.release_legal_hold(&prepared, "obs_release_durable").unwrap();
             assert_eq!(released.receipt.kind, LegalHoldReceiptKind::Released);
             assert!(!released.hold.active());
+            assert_eq!(released.hold.release_receipt_id.as_deref(), Some("obs_release_durable"));
         }
 
         let replayed = FactStore::with_persistence(dir.path()).unwrap();
@@ -454,6 +577,99 @@ mod tests {
         assert!(marked.contains(&unheld.fact_id));
         assert!(store.get(&held.fact_id).is_some());
         assert!(store.get(&unheld.fact_id).is_none());
+    }
+
+    #[test]
+    fn malformed_newest_hold_state_falls_back_and_still_blocks_retention_and_hard_erasure() {
+        let dir = tempdir().unwrap();
+        let mut store = FactStore::with_persistence(dir.path()).unwrap();
+        let held = store.store(fact("tenant-a", "customer::42::profile", "held"));
+        let placed = store
+            .place_legal_hold(PlaceLegalHold {
+                tenant_id: "tenant-a".to_string(),
+                entity_prefixes: vec!["customer::42::".to_string()],
+                reason: "litigation".to_string(),
+                actor: Some("p_operator".to_string()),
+            })
+            .unwrap();
+
+        // Simulate an internal boundary bypass: the malformed state becomes
+        // the latest version and supersedes the valid state in normal recall.
+        let malformed = store.store(malformed_hold_state("tenant-a", &placed.hold.hold_id));
+        assert_eq!(malformed.version, 2);
+
+        assert_eq!(store.legal_hold(&placed.hold.hold_id), Some(placed.hold.clone()));
+        assert_eq!(store.legal_holds(), vec![placed.hold.clone()]);
+        assert_eq!(
+            store.covering_legal_holds("tenant-a", "customer::42::profile"),
+            vec![placed.hold.clone()]
+        );
+
+        let marked = store.mark_retention_eligible(Utc::now() + chrono::Duration::seconds(1));
+        assert!(!marked.contains(&held.fact_id));
+        assert!(store.get(&held.fact_id).is_some());
+
+        assert!(store.delete(&held.fact_id));
+        let err = store.compact_journal().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains(&placed.hold.hold_id));
+    }
+
+    #[test]
+    fn only_unparsable_hold_state_synthesizes_tenant_wide_active_marker() {
+        let dir = tempdir().unwrap();
+        let mut store = FactStore::with_persistence(dir.path()).unwrap();
+        let held = store.store(fact("tenant-a", "customer::42::profile", "held"));
+        let other_tenant = store.store(fact("tenant-b", "customer::42::profile", "ordinary"));
+        let hold_id = "lh_unparsable_only";
+        let malformed = store.store(malformed_hold_state("tenant-a", hold_id));
+        assert_eq!(malformed.version, 1);
+        assert!(store.delete(&malformed.fact_id));
+
+        let marker = store.legal_hold(hold_id).unwrap();
+        assert_eq!(marker.hold_id, hold_id);
+        assert_eq!(marker.tenant_id, "tenant-a");
+        assert!(marker.entity_prefixes.is_empty());
+        assert!(marker.active());
+        assert_eq!(store.legal_holds(), vec![marker.clone()]);
+        assert_eq!(store.covering_legal_holds("tenant-a", "any-entity"), vec![marker]);
+        assert!(store.covering_legal_holds("tenant-b", "any-entity").is_empty());
+
+        let marked = store.mark_retention_eligible(Utc::now() + chrono::Duration::seconds(1));
+        assert!(!marked.contains(&held.fact_id));
+        assert!(marked.contains(&other_tenant.fact_id));
+
+        assert!(store.delete(&held.fact_id));
+        let err = store.compact_journal().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains(hold_id));
+    }
+
+    #[test]
+    fn tombstoned_active_hold_state_still_enforces_and_blocks_compaction() {
+        let dir = tempdir().unwrap();
+        let mut store = FactStore::with_persistence(dir.path()).unwrap();
+        let placed = store
+            .place_legal_hold(PlaceLegalHold {
+                tenant_id: "tenant-a".to_string(),
+                entity_prefixes: vec!["customer::42::".to_string()],
+                reason: "litigation".to_string(),
+                actor: Some("p_operator".to_string()),
+            })
+            .unwrap();
+        let state_fact_id = store.get_by_entity(&format!("{LEGAL_HOLD_ENTITY_PREFIX}{}", placed.hold.hold_id))[0]
+            .fact_id
+            .clone();
+        assert!(store.delete(&state_fact_id));
+
+        assert_eq!(store.legal_hold(&placed.hold.hold_id), Some(placed.hold.clone()));
+        assert_eq!(
+            store.covering_legal_holds("tenant-a", "customer::42::profile"),
+            vec![placed.hold.clone()]
+        );
+        let err = store.compact_journal().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains(&placed.hold.hold_id));
     }
 
     #[test]

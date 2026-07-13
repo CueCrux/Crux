@@ -15,7 +15,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 
-use super::observations::{append_one, PostObservationBody, PostObservationResponse};
+use super::observations::{append_one_durable, PostObservationBody, PostObservationResponse};
 use super::{problem_response, require_http_scopes, AppState};
 use corecrux_memory::{LegalHoldMutation, LegalHoldReceiptKind, PlaceLegalHold};
 
@@ -71,14 +71,55 @@ fn sign_mutation(
             "receipt_material": mutation.receipt,
         }),
     };
-    append_one(state, GOVERNANCE_RECEIPT_SESSION, actor, body, None)
+    append_one_durable(state, GOVERNANCE_RECEIPT_SESSION, actor, body, None)
         .map(|(response, _)| response)
         .map_err(|(status, detail)| {
             Box::new(problem_response(
                 status,
-                format!("legal hold persisted but receipt signing failed: {detail}"),
+                format!("legal-hold receipt signing or persistence failed: {detail}"),
             ))
         })
+}
+
+fn release_error_response(err: corecrux_memory::LegalHoldError) -> Response {
+    match err {
+        corecrux_memory::LegalHoldError::NotFound(hold_id) => {
+            problem_response(StatusCode::NOT_FOUND, format!("legal hold not found: {hold_id}"))
+        }
+        corecrux_memory::LegalHoldError::AlreadyReleased(hold_id) => {
+            problem_response(StatusCode::CONFLICT, format!("legal hold already released: {hold_id}"))
+        }
+        err => problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
+}
+
+/// Persist the signed release observation before committing released state.
+/// Receipt failure therefore leaves the hold active; commit failure can only
+/// leave an orphaned receipt, never an unreceipted release.
+async fn release_with_signed_receipt(
+    state: &AppState,
+    hold_id: &str,
+    actor: &str,
+) -> Result<(corecrux_memory::LegalHold, PostObservationResponse), Response> {
+    let prepared = state
+        .fact_store
+        .read()
+        .await
+        .prepare_legal_hold_release(hold_id, Some(actor))
+        .map_err(release_error_response)?;
+
+    // sign_mutation signs, appends, and fsyncs the observation JSONL record.
+    // Do not acquire the state write lock or mark the hold released before
+    // this durable operation succeeds.
+    let signed =
+        sign_mutation(state, actor, LegalHoldReceiptKind::Released, &prepared).map_err(|response| *response)?;
+    let committed = state
+        .fact_store
+        .write()
+        .await
+        .release_legal_hold(&prepared, &signed.observation_id)
+        .map_err(release_error_response)?;
+    Ok((committed.hold, signed))
 }
 
 async fn persist_signed_receipt(
@@ -181,28 +222,9 @@ pub(super) async fn delete_legal_hold(
         Ok(actor) => actor,
         Err(response) => return *response,
     };
-    let mutation = match state
-        .fact_store
-        .write()
-        .await
-        .release_legal_hold(&hold_id, Some(&actor))
-    {
-        Ok(mutation) => mutation,
-        Err(corecrux_memory::LegalHoldError::NotFound(_)) => {
-            return problem_response(StatusCode::NOT_FOUND, format!("legal hold not found: {hold_id}"));
-        }
-        Err(corecrux_memory::LegalHoldError::AlreadyReleased(_)) => {
-            return problem_response(StatusCode::CONFLICT, format!("legal hold already released: {hold_id}"));
-        }
-        Err(err) => return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
-    };
-    let signed = match sign_mutation(&state, &actor, LegalHoldReceiptKind::Released, &mutation) {
-        Ok(signed) => signed,
-        Err(response) => return *response,
-    };
-    let hold = match persist_signed_receipt(&state, &hold_id, LegalHoldReceiptKind::Released, &signed).await {
-        Ok(hold) => hold,
-        Err(response) => return *response,
+    let (hold, signed) = match release_with_signed_receipt(&state, &hold_id, &actor).await {
+        Ok(released) => released,
+        Err(response) => return response,
     };
     (
         StatusCode::OK,
@@ -247,18 +269,9 @@ mod tests {
             .unwrap();
         assert_eq!(hold.place_receipt_id, placed.observation_id);
 
-        let released = state
-            .fact_store
-            .write()
-            .await
-            .release_legal_hold(&hold.hold_id, Some(actor))
-            .unwrap();
-        let signed_release = sign_mutation(&state, actor, LegalHoldReceiptKind::Released, &released).unwrap();
+        let (hold, signed_release) = release_with_signed_receipt(&state, &hold.hold_id, actor).await.unwrap();
         assert_eq!(signed_release.receipt.alg, "ed25519");
         assert!(!signed_release.receipt.signature.is_empty());
-        let hold = persist_signed_receipt(&state, &hold.hold_id, LegalHoldReceiptKind::Released, &signed_release)
-            .await
-            .unwrap();
         assert_eq!(
             hold.release_receipt_id.as_deref(),
             Some(signed_release.observation_id.as_str())
@@ -269,5 +282,45 @@ mod tests {
         let records = std::fs::read_to_string(observation_file).unwrap();
         assert!(records.contains("legal_hold_placed"));
         assert!(records.contains("legal_hold_released"));
+    }
+
+    #[tokio::test]
+    async fn release_receipt_persist_failure_keeps_hold_active() {
+        let mut state = crate::http::tests::test_app_state(4);
+        let key = crux_session::LocalPassportKey::from_path(&state.passport_key_path).unwrap();
+        state.passport_fpr = key.passport_fpr().to_string();
+        state.passport_public_key_hex = key.public_key_hex().to_string();
+        let placed = state
+            .fact_store
+            .write()
+            .await
+            .place_legal_hold(PlaceLegalHold {
+                tenant_id: "default".to_string(),
+                entity_prefixes: vec!["customer::42::".to_string()],
+                reason: "litigation".to_string(),
+                actor: Some("p_dpo".to_string()),
+            })
+            .unwrap();
+
+        // An empty, read-only observation file lets chain-tip resolution and
+        // receipt minting succeed, then forces the append itself to fail.
+        let observation_file =
+            super::super::observations::observation_file_path(&state.data_dir, GOVERNANCE_RECEIPT_SESSION);
+        std::fs::create_dir_all(observation_file.parent().unwrap()).unwrap();
+        std::fs::write(&observation_file, b"").unwrap();
+        let mut permissions = std::fs::metadata(&observation_file).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&observation_file, permissions).unwrap();
+
+        let err = release_with_signed_receipt(&state, &placed.hold.hold_id, "p_dpo")
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let error_body = axum::body::to_bytes(err.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&error_body).contains("append observation"));
+        let hold = state.fact_store.read().await.legal_hold(&placed.hold.hold_id).unwrap();
+        assert!(hold.active());
+        assert!(hold.released_at.is_none());
+        assert!(hold.release_receipt_id.is_none());
     }
 }

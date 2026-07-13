@@ -379,6 +379,17 @@ pub async fn handle_memory_forget_dry_run(args: &Value, ctx: &McpContext) -> Res
 /// `memory_forget` — soft-delete every fact matching the scope, emit a
 /// `Forget` receipt body, and return the receipt id + affected count.
 pub async fn handle_memory_forget(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
+    handle_memory_forget_after_resolution(args, ctx, std::future::ready(())).await
+}
+
+async fn handle_memory_forget_after_resolution<F>(
+    args: &Value,
+    ctx: &McpContext,
+    after_resolution: F,
+) -> Result<Value, JsonRpcError>
+where
+    F: std::future::Future<Output = ()>,
+{
     if !feature_enabled() {
         return Err(JsonRpcError {
             code: METHOD_NOT_FOUND,
@@ -425,9 +436,9 @@ pub async fn handle_memory_forget(args: &Value, ctx: &McpContext) -> Result<Valu
     // Resolve matches under a read lock first so we can compute the
     // pre-forget value hashes before we mutate (the value disappears on
     // soft-delete + journal append).
-    let (to_forget, blocking_holds): (Vec<Fact>, Vec<corecrux_memory::LegalHold>) = {
+    let to_forget: Vec<Fact> = {
         let store = ctx.fact_store.read().await;
-        let facts: Vec<Fact> = resolve_scope(
+        resolve_scope(
             &store,
             &scope,
             id_ref,
@@ -438,36 +449,13 @@ pub async fn handle_memory_forget(args: &Value, ctx: &McpContext) -> Result<Valu
         )
         .into_iter()
         .cloned()
-        .collect();
-        let mut holds = std::collections::BTreeMap::new();
-        for fact in &facts {
-            for hold in store.covering_legal_holds(&fact.tenant_hash, &fact.entity) {
-                holds.insert(hold.hold_id.clone(), hold);
-            }
-        }
-        (facts, holds.into_values().collect())
+        .collect()
     };
 
-    if !blocking_holds.is_empty() {
-        return Err(JsonRpcError {
-            code: LEGAL_HOLD_ACTIVE_ERROR,
-            message: format!(
-                "memory_forget refused: {} active legal hold(s) cover the requested facts",
-                blocking_holds.len()
-            ),
-            data: Some(json!({
-                "error": "LEGAL_HOLD_ACTIVE",
-                "hold_ids": blocking_holds.iter().map(|hold| hold.hold_id.as_str()).collect::<Vec<_>>(),
-                "holds": blocking_holds.iter().map(|hold| json!({
-                    "hold_id": hold.hold_id,
-                    "tenant_id": hold.tenant_id,
-                    "entity_prefixes": hold.entity_prefixes,
-                    "reason": hold.reason,
-                })).collect::<Vec<_>>(),
-                "facts_blocked": to_forget.len(),
-            })),
-        });
-    }
+    // Kept as an injectable future so the regression test can deterministically
+    // place a hold in the former read-lock/write-lock gap while exercising this
+    // exact handler path. Production supplies an immediately-ready future.
+    after_resolution.await;
 
     let now = Utc::now();
     let body = build_receipt_body(
@@ -485,25 +473,11 @@ pub async fn handle_memory_forget(args: &Value, ctx: &McpContext) -> Result<Valu
     })?;
     let body_hash_hex = blake3::hash(&body_bytes).to_hex().to_string();
 
-    // Mutate.
+    // Re-check every governance guard after acquiring the same write lock
+    // that performs the delete. A hold placed after scope resolution must be
+    // observed before any fact is mutated (fail closed against TOCTOU).
     let mut store = ctx.fact_store.write().await;
-    let mut forgotten = 0usize;
-    for f in &to_forget {
-        // Re-check visibility under the write lock; another concurrent
-        // forget could have already soft-deleted this fact_id.
-        let still_visible = store
-            .get(&f.fact_id)
-            .is_some_and(|cur| !cur.deleted && scope::fact_visible_to_identity(cur, id_ref, &alias_refs));
-        if still_visible
-            && store.try_delete(&f.fact_id).map_err(|err| JsonRpcError {
-                code: INTERNAL_ERROR,
-                message: "fact journal append failed".to_string(),
-                data: Some(json!({"error": err.to_string()})),
-            })?
-        {
-            forgotten += 1;
-        }
-    }
+    let forgotten = forget_resolved_facts_under_lock(&mut store, &to_forget, id_ref, &alias_refs)?;
     drop(store);
 
     let recovery_window_seconds = recovery_window().num_seconds();
@@ -528,6 +502,68 @@ pub async fn handle_memory_forget(args: &Value, ctx: &McpContext) -> Result<Valu
         "scope": scope,
         "passport_id": passport_id,
     }))
+}
+
+fn forget_resolved_facts_under_lock(
+    store: &mut corecrux_memory::FactStore,
+    facts: &[Fact],
+    identity: Option<&str>,
+    aliases: &[&str],
+) -> Result<usize, JsonRpcError> {
+    let blocking_holds = blocking_legal_holds(store, facts);
+    if !blocking_holds.is_empty() {
+        return Err(legal_hold_active_error(facts, &blocking_holds));
+    }
+
+    let mut forgotten = 0usize;
+    for fact in facts {
+        // Re-check visibility under the write lock; another concurrent
+        // forget could have already soft-deleted this fact_id.
+        let still_visible = store
+            .get(&fact.fact_id)
+            .is_some_and(|current| !current.deleted && scope::fact_visible_to_identity(current, identity, aliases));
+        if still_visible
+            && store.try_delete(&fact.fact_id).map_err(|err| JsonRpcError {
+                code: INTERNAL_ERROR,
+                message: "fact journal append failed".to_string(),
+                data: Some(json!({"error": err.to_string()})),
+            })?
+        {
+            forgotten += 1;
+        }
+    }
+    Ok(forgotten)
+}
+
+fn blocking_legal_holds(store: &corecrux_memory::FactStore, facts: &[Fact]) -> Vec<corecrux_memory::LegalHold> {
+    let mut holds = std::collections::BTreeMap::new();
+    for fact in facts {
+        for hold in store.covering_legal_holds(&fact.tenant_hash, &fact.entity) {
+            holds.insert(hold.hold_id.clone(), hold);
+        }
+    }
+    holds.into_values().collect()
+}
+
+fn legal_hold_active_error(facts: &[Fact], blocking_holds: &[corecrux_memory::LegalHold]) -> JsonRpcError {
+    JsonRpcError {
+        code: LEGAL_HOLD_ACTIVE_ERROR,
+        message: format!(
+            "memory_forget refused: {} active legal hold(s) cover the requested facts",
+            blocking_holds.len()
+        ),
+        data: Some(json!({
+            "error": "LEGAL_HOLD_ACTIVE",
+            "hold_ids": blocking_holds.iter().map(|hold| hold.hold_id.as_str()).collect::<Vec<_>>(),
+            "holds": blocking_holds.iter().map(|hold| json!({
+                "hold_id": hold.hold_id,
+                "tenant_id": hold.tenant_id,
+                "entity_prefixes": hold.entity_prefixes,
+                "reason": hold.reason,
+            })).collect::<Vec<_>>(),
+            "facts_blocked": facts.len(),
+        })),
+    }
 }
 
 #[cfg(test)]
@@ -745,7 +781,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_forget_refuses_facts_covered_by_legal_hold() {
+    async fn memory_forget_refuses_when_newest_legal_hold_state_is_malformed() {
         let _guard = FeatureFlagGuard::enabled().await;
         let ctx = agent_ctx("alice");
         handle_store_fact(
@@ -756,7 +792,7 @@ mod tests {
         .unwrap();
         let hold_id = {
             let mut store = ctx.fact_store.write().await;
-            store
+            let placed = store
                 .place_legal_hold(corecrux_memory::PlaceLegalHold {
                     tenant_id: "default".to_string(),
                     entity_prefixes: vec!["case-client-42".to_string()],
@@ -764,8 +800,21 @@ mod tests {
                     actor: Some("p_dpo".to_string()),
                 })
                 .unwrap()
-                .hold
-                .hold_id
+                .hold;
+            let hold_id = placed.hold_id;
+            let malformed = store.store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: format!("{}{hold_id}", corecrux_memory::LEGAL_HOLD_ENTITY_PREFIX),
+                key: "state".to_string(),
+                value: "{malformed-json".to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: true,
+                horizon_class: Some(corecrux_memory::HorizonClass::None),
+                actor: Some("bypass-attempt".to_string()),
+            });
+            assert_eq!(malformed.version, 2);
+            hold_id
         };
 
         let err = handle_memory_forget(
@@ -788,6 +837,55 @@ mod tests {
             .await
             .unwrap();
         assert!(q["content"][0]["text"].as_str().unwrap().contains("retain"));
+    }
+
+    #[tokio::test]
+    async fn hold_placed_between_scope_resolution_and_delete_is_refused() {
+        let _guard = FeatureFlagGuard::enabled().await;
+        let ctx = agent_ctx("alice");
+        handle_store_fact(
+            &json!({"entity": "case-client-race", "key": "pii", "value": "retain"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        // The injected future runs after the public handler has resolved its
+        // target set and before it acquires the mutating lock. This is the
+        // exact interleaving that previously bypassed a newly placed hold.
+        let fact_store = std::sync::Arc::clone(&ctx.fact_store);
+        let place_hold_in_gap = async move {
+            fact_store
+                .write()
+                .await
+                .place_legal_hold(corecrux_memory::PlaceLegalHold {
+                    tenant_id: "default".to_string(),
+                    entity_prefixes: vec!["case-client-race".to_string()],
+                    reason: "hold won the race".to_string(),
+                    actor: Some("p_dpo".to_string()),
+                })
+                .unwrap();
+        };
+        let err = handle_memory_forget_after_resolution(
+            &json!({
+                "scope": {"type": "entity_prefix", "value": "case-client-race"},
+                "reason": "user request",
+                "include_pinned": true,
+            }),
+            &ctx,
+            place_hold_in_gap,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, LEGAL_HOLD_ACTIVE_ERROR);
+        let store = ctx.fact_store.read().await;
+        let hold_id = store.active_legal_holds()[0].hold_id.clone();
+        assert_eq!(err.data.as_ref().unwrap()["hold_ids"][0], hold_id);
+        let retained = store
+            .all_facts()
+            .find(|fact| fact.entity == "case-client-race")
+            .unwrap();
+        assert!(!retained.deleted);
     }
 
     #[tokio::test]
