@@ -134,6 +134,9 @@ pub async fn handle_query_scan(params: &Value, ctx: &McpContext) -> Result<Value
     let tenant_hash = require_tenant_hash(params)?;
     let query = require_str(params, "query")?;
     let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+    // buyer-fit M4: mandatory-when-set token_budget caps the returned scan by
+    // cumulative doc tokens (honest, bounded cost), mirroring `query`.
+    let token_budget = params.get("token_budget").and_then(|v| v.as_u64()).map(|v| v as usize);
     let semantic_profile = ctx.fact_store.read().await.semantic_profile();
     let local_semantic_profile_id = semantic_profile.as_ref().map(|profile| profile.profile_id.clone());
     let embedding_fingerprint = semantic_profile
@@ -150,29 +153,38 @@ pub async fn handle_query_scan(params: &Value, ctx: &McpContext) -> Result<Value
     let readers = index.readers();
     let result = bm25::bm25_search(&readers, query, limit, Some(tenant_hash), &Bm25Params::default(), None);
 
-    let scan: Vec<Value> = result
-        .hits
-        .iter()
-        .enumerate()
-        .map(|(idx, h)| {
-            json!({
-                "result_id": format!("{}:{}", h.segment_index, h.doc_id),
-                "rank": idx + 1,
-                "score": h.score,
-                "source_label": "local_tenant_index",
-                "score_space": SCORE_SPACE_BM25_LEXICAL,
-                "semantic_profile_id": null,
-                "local_semantic_profile_id": local_semantic_profile_id.clone(),
-                "segment_index": h.segment_index,
-                "doc_id": h.doc_id,
-                "doc_length_tokens": h.doc_length_tokens,
-            })
-        })
-        .collect();
+    let mut tokens_returned = 0usize;
+    let mut budget_truncated = false;
+    let mut scan: Vec<Value> = Vec::new();
+    for (idx, h) in result.hits.iter().enumerate() {
+        let doc_tokens = h.doc_length_tokens as usize;
+        if let Some(budget) = token_budget {
+            // Always return at least one hit; then stop before exceeding budget.
+            if !scan.is_empty() && tokens_returned + doc_tokens > budget {
+                budget_truncated = true;
+                break;
+            }
+        }
+        tokens_returned += doc_tokens;
+        scan.push(json!({
+            "result_id": format!("{}:{}", h.segment_index, h.doc_id),
+            "rank": idx + 1,
+            "score": h.score,
+            "source_label": "local_tenant_index",
+            "score_space": SCORE_SPACE_BM25_LEXICAL,
+            "semantic_profile_id": null,
+            "local_semantic_profile_id": local_semantic_profile_id.clone(),
+            "segment_index": h.segment_index,
+            "doc_id": h.doc_id,
+            "doc_length_tokens": h.doc_length_tokens,
+        }));
+    }
 
     let mut inner = json!({
         "scan": scan,
         "total_candidates": result.total_candidates,
+        "tokens_returned": tokens_returned,
+        "budget_truncated": budget_truncated,
         "meta": {
             "source_label": "local_tenant_index",
             "score_space": SCORE_SPACE_BM25_LEXICAL,

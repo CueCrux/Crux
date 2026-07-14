@@ -512,6 +512,21 @@ pub(super) async fn query_facts(
         .into_response()
 }
 
+/// `POST /v1/facts/aggregate` — deterministic, 0-LLM aggregate lane (buyer-fit
+/// M4, knock-out #5). Answers count / sum_numeric / distinct / temporal_diff
+/// over the visible fact set, under an optional `token_budget`. No model call.
+pub(super) async fn post_aggregate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<corecrux_memory::fact_store::AggregateRequestV1>,
+) -> impl IntoResponse {
+    if let Err(response) = require_fact_read_ctx(&state, &headers) {
+        return response;
+    }
+    let store = state.fact_store.read().await;
+    Json(store.aggregate_v1(&req)).into_response()
+}
+
 #[utoipa::path(
     get,
     path = "/v1/facts/export",

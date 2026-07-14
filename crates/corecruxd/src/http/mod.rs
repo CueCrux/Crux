@@ -616,6 +616,7 @@ pub(crate) fn router_with_route_auth(
         .route("/v1/facts", axum::routing::put(self::facts::put_fact))
         .route("/v1/facts", get(self::facts::query_facts))
         .route("/v1/facts/bulk", axum::routing::put(self::facts::put_facts_bulk))
+        .route("/v1/facts/aggregate", axum::routing::post(self::facts::post_aggregate))
         .route("/v1/memory/import", axum::routing::post(self::memory_import::post_memory_import))
         .route(
             "/v1/identity/links",
