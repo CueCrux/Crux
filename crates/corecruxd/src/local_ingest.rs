@@ -282,9 +282,8 @@ fn write_ccxv(path: &Path, dim: u32, entries: &[(u32, Vec<f32>)]) -> std::io::Re
 /// Read a `.ccxv` companion → (dim, [(doc_id, vector)]). Returns `None` on a bad
 /// magic/version or a truncated file (treated as absent rather than fatal).
 ///
-/// Serve-side (consumed by [`build_dense_provider`]): exercised by M3 tests and
-/// the deferred query-embedding track; not on the daemon's default query path.
-#[allow(dead_code)]
+/// Serve-side (consumed by [`build_dense_provider`]): live on the prose
+/// text-search query path when a node embedder is configured (buyer-fit M3.2).
 fn read_ccxv(path: &Path) -> Option<(u32, DenseEntries)> {
     let bytes = std::fs::read(path).ok()?;
     if bytes.len() < 14 {
@@ -323,9 +322,9 @@ fn read_ccxv(path: &Path) -> Option<(u32, DenseEntries)> {
 /// ascending `segment_seq`). Returns `None` when no dense vectors are stored, so
 /// the caller leaves the dense lane inert.
 ///
-/// Consumed by the M3 fusion fixture tests and by the deferred query-embedding
-/// track (`cruxengine-prose-payload-processor`); the daemon does not embed queries.
-#[allow(dead_code)]
+/// Consumed live by the prose text-search query path (buyer-fit M3.2): when a
+/// node embedder is configured the query is embedded and this builds the
+/// `CosineDenseProvider` over the corpus `.ccxv` companions for dense re-rank.
 pub fn build_dense_provider(
     index_mgr: &corecrux_retrieval::IndexManager,
     data_dir: &Path,
@@ -356,7 +355,6 @@ pub fn build_dense_provider(
 }
 
 /// Locate the `.ccxv` companion for a segment sequence across all shards.
-#[allow(dead_code)]
 fn find_ccxv_for_seq(shards_dir: &Path, seq: u64) -> Option<std::path::PathBuf> {
     let prefix = format!("seg-{seq:020}-");
     let shard_entries = std::fs::read_dir(shards_dir).ok()?;

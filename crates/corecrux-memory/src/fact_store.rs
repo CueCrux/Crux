@@ -438,6 +438,35 @@ impl FactStore {
         self.embedder.as_ref().map(|embedder| embedder.semantic_profile())
     }
 
+    /// Embed a single text with the node's embedder, or `None` when no embedder
+    /// is configured or the embed fails. Used by the prose lane (buyer-fit M3.2)
+    /// so document and query vectors come from the SAME embedder as the fact
+    /// lane — a shared node-wide embedder keeps them fingerprint-compatible.
+    pub fn embed_text(&self, text: &str) -> Option<Vec<f32>> {
+        let embedder = self.embedder.as_ref()?;
+        match embedder.embed_one(text) {
+            Ok(vec) => Some(vec),
+            Err(err) => {
+                tracing::warn!(?err, "prose-embed-failed");
+                None
+            }
+        }
+    }
+
+    /// Batch form of [`Self::embed_text`]. Returns `None` when no embedder is
+    /// configured; on a batch error, returns `None` (callers fall back to
+    /// BM25-only rather than a partially-embedded corpus).
+    pub fn embed_texts(&self, texts: &[&str]) -> Option<Vec<Vec<f32>>> {
+        let embedder = self.embedder.as_ref()?;
+        match embedder.embed_batch(texts) {
+            Ok(vecs) => Some(vecs),
+            Err(err) => {
+                tracing::warn!(?err, count = texts.len(), "prose-embed-batch-failed");
+                None
+            }
+        }
+    }
+
     /// Create a fact store backed by a JSONL journal in `data_dir`.
     ///
     /// If `data_dir/facts.jsonl` exists, it is replayed to rebuild in-memory

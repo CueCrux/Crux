@@ -204,23 +204,55 @@ pub(super) async fn post_local_ingest(
         return problem_response(status, detail);
     }
 
-    // Map the wire payload to the seal-core document model.
-    let documents: Vec<ProseDocument> = body
+    // Server-side local embedding (buyer-fit M3.2): when the caller supplied no
+    // dense vectors at all and the node has an embedder (the pure-Rust
+    // LocalHashEmbedder by default), embed every chunk here so the `.ccxv`
+    // companion is written and prose dense recall works offline with zero
+    // external service. If the caller supplied ANY vector we respect theirs and
+    // do not mix a local 256-dim vector into a foreign-dimension batch (the seal
+    // path rejects mixed dimensions).
+    let has_client_vectors = body
         .documents
         .iter()
-        .map(|d| ProseDocument {
-            doc_id: d.doc_id.clone(),
-            chunks: d
-                .chunks
-                .iter()
-                .map(|c| ProseChunk {
-                    chunk_id: c.chunk_id.clone(),
-                    text: c.text.clone(),
-                    dense_vector: c.dense_vector.clone(),
-                })
-                .collect(),
-        })
-        .collect();
+        .flat_map(|d| &d.chunks)
+        .any(|c| c.dense_vector.is_some());
+    let server_embed = !has_client_vectors && state.fact_store.read().await.embeddings_enabled();
+
+    // Map the wire payload to the seal-core document model.
+    let documents: Vec<ProseDocument> = if server_embed {
+        let store = state.fact_store.read().await;
+        body.documents
+            .iter()
+            .map(|d| ProseDocument {
+                doc_id: d.doc_id.clone(),
+                chunks: d
+                    .chunks
+                    .iter()
+                    .map(|c| ProseChunk {
+                        chunk_id: c.chunk_id.clone(),
+                        text: c.text.clone(),
+                        dense_vector: store.embed_text(&c.text),
+                    })
+                    .collect(),
+            })
+            .collect()
+    } else {
+        body.documents
+            .iter()
+            .map(|d| ProseDocument {
+                doc_id: d.doc_id.clone(),
+                chunks: d
+                    .chunks
+                    .iter()
+                    .map(|c| ProseChunk {
+                        chunk_id: c.chunk_id.clone(),
+                        text: c.text.clone(),
+                        dense_vector: c.dense_vector.clone(),
+                    })
+                    .collect(),
+            })
+            .collect()
+    };
 
     let data_dir = state.data_dir.clone();
     let tenant = body.tenant_id.clone();
@@ -688,5 +720,134 @@ mod tests {
         // Timeline row recorded in the console chunk index for this tenant.
         let page = crate::console_index::list_chunks(&data_dir, "tenant-t4", 100, None).unwrap();
         assert!(!page.chunks.is_empty(), "a timeline row must be recorded (T.4)");
+    }
+
+    /// buyer-fit M3.2 (Track B): with the node's local embedder wired and NO
+    /// client-supplied vectors, ingest embeds every chunk server-side, writes the
+    /// `.ccxv` companion, and the prose text-search path dense-re-ranks the query
+    /// — all with no external embedding service.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn m3_server_side_local_embedding_writes_ccxv_and_query_dense_reranks() {
+        std::env::remove_var("CORECRUXD_QUERY_TEXT_SEARCH");
+        let mut state = super::super::tests::test_app_state(16);
+        state.local_ingest_enabled = true;
+        // Wire the pure-Rust default embedder — the "works offline by default" path.
+        state
+            .fact_store
+            .write()
+            .await
+            .set_embedder(Box::new(corecrux_memory::embeddings::LocalHashEmbedder::default()));
+        let data_dir = state.data_dir.clone();
+
+        // No dense_vector on any chunk → the handler embeds them server-side.
+        let body = body_with(
+            "tenant-m3",
+            "docs",
+            &[
+                ("d1", "terraform module drift detection for cloud infrastructure"),
+                ("d2", "developer onboarding and local setup instructions"),
+            ],
+        );
+        let resp = post_local_ingest(State(state.clone()), HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            json["dense_vectors"],
+            serde_json::json!(2),
+            "both chunks embedded server-side"
+        );
+        assert_eq!(
+            json["dense_dim"],
+            serde_json::json!(256),
+            "local embedder dimension persisted"
+        );
+
+        // The `.ccxv` companion landed next to the sealed segment.
+        let seg_dir = data_dir.join("shards").join("shard-0000").join("segments");
+        let has_ccxv = std::fs::read_dir(&seg_dir)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().ends_with(".ccxv"));
+        assert!(has_ccxv, ".ccxv dense companion must be written at ingest");
+
+        // Text-search now dense-re-ranks: the fused score space is reported and
+        // the dense lane is active — with no external embedder configured.
+        let ts_body = crate::http::query::TextSearchBody {
+            tenant_id: "tenant-m3".to_string(),
+            query: "terraform infrastructure drift".to_string(),
+            limit: 10,
+            token_budget: None,
+            min_score: None,
+            mode: None,
+            include_receipt: None,
+        };
+        let qresp = crate::http::query::post_query_text_search(State(state), HeaderMap::new(), Json(ts_body))
+            .await
+            .into_response();
+        assert_eq!(qresp.status(), StatusCode::OK);
+        let qbytes = axum::body::to_bytes(qresp.into_body(), usize::MAX).await.unwrap();
+        let qjson: serde_json::Value = serde_json::from_slice(&qbytes).unwrap();
+        assert_eq!(
+            qjson["meta"]["dense_lane_active"],
+            serde_json::json!(true),
+            "dense lane active on the offline local path"
+        );
+        assert_eq!(
+            qjson["meta"]["score_space"], "bm25_dense_fused",
+            "query reports the fused score space"
+        );
+        assert!(
+            qjson["results"].as_array().is_some_and(|r| !r.is_empty()),
+            "dense-reranked query returns results"
+        );
+    }
+
+    /// A prose ingest with NO embedder wired stays BM25-only: no `.ccxv`, and the
+    /// query path leaves the dense lane inert (bit-identical to the prior path).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn m3_no_embedder_leaves_prose_bm25_only() {
+        std::env::remove_var("CORECRUXD_QUERY_TEXT_SEARCH");
+        let mut state = super::super::tests::test_app_state(16);
+        state.local_ingest_enabled = true; // no embedder wired
+        let data_dir = state.data_dir.clone();
+
+        let body = body_with("tenant-noemb", "docs", &[("d1", "plain prose without any vectors")]);
+        let resp = post_local_ingest(State(state.clone()), HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["dense_vectors"], serde_json::json!(0), "no embedder ⇒ no vectors");
+
+        let seg_dir = data_dir.join("shards").join("shard-0000").join("segments");
+        let has_ccxv = std::fs::read_dir(&seg_dir)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().ends_with(".ccxv"));
+        assert!(!has_ccxv, "no .ccxv without an embedder");
+
+        let ts_body = crate::http::query::TextSearchBody {
+            tenant_id: "tenant-noemb".to_string(),
+            query: "plain prose".to_string(),
+            limit: 10,
+            token_budget: None,
+            min_score: None,
+            mode: None,
+            include_receipt: None,
+        };
+        let qresp = crate::http::query::post_query_text_search(State(state), HeaderMap::new(), Json(ts_body))
+            .await
+            .into_response();
+        assert_eq!(qresp.status(), StatusCode::OK);
+        let qbytes = axum::body::to_bytes(qresp.into_body(), usize::MAX).await.unwrap();
+        let qjson: serde_json::Value = serde_json::from_slice(&qbytes).unwrap();
+        assert_eq!(qjson["meta"]["dense_lane_active"], serde_json::json!(false));
+        assert_eq!(qjson["meta"]["score_space"], "bm25_lexical");
     }
 }
