@@ -1314,7 +1314,9 @@ impl FactStore {
     /// `fact.tenant_hash` verbatim. Harmless while every fact is `default`, but
     /// once `tenant_hash` is meaningful this is a stamping bypass — validate or
     /// re-stamp against the peer's authorized tenant here.
-    pub fn store_synced(&mut self, fact: Fact) {
+    pub fn store_synced(&mut self, mut fact: Fact) {
+        crate::fact_privacy::enforce_global_fact(&mut fact);
+
         let fact_id = fact.fact_id.clone();
         let entity = fact.entity.clone();
         let key = fact.key.clone();

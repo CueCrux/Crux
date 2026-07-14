@@ -1281,6 +1281,32 @@ mod tests {
         assert_eq!(loaded.push_count, 10);
     }
 
+    fn synced_fact(fact_id: &str, entity: &str) -> Fact {
+        Fact {
+            fact_id: fact_id.to_string(),
+            tenant_hash: "default".to_string(),
+            entity: entity.to_string(),
+            key: "status".to_string(),
+            value: "active".to_string(),
+            source_receipt: Some(format!("sync:http://remote:14800:{fact_id}")),
+            confidence: 1.0,
+            stored_at: Utc::now(),
+            tokens: 1,
+            deleted: false,
+            version: 1,
+            supersedes: None,
+            private: false,
+            horizon_class: crate::fact_store::HorizonClass::None,
+            reverified_at: None,
+            superseded_by: None,
+            actor: None,
+            valid_from: None,
+            valid_to: None,
+            access_count: 0,
+            last_accessed_at: None,
+        }
+    }
+
     #[test]
     fn test_store_synced_preserves_identity() {
         let mut store = FactStore::new();
@@ -1324,6 +1350,32 @@ mod tests {
         assert_eq!(retrieved.key, "status");
         assert_eq!(retrieved.value, "active");
         assert_eq!(retrieved.confidence, 0.95);
+    }
+
+    #[test]
+    fn test_store_synced_forces_reserved_fact_private_before_journal_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let fact_id = "f_synced_reserved_private";
+
+        {
+            let mut store = FactStore::with_persistence(dir.path()).unwrap();
+            store.store_synced(synced_fact(fact_id, "__passport__::peerX"));
+
+            assert!(store.get(fact_id).unwrap().private);
+        }
+
+        let store = FactStore::with_persistence(dir.path()).unwrap();
+        assert!(store.get(fact_id).unwrap().private);
+    }
+
+    #[test]
+    fn test_store_synced_keeps_non_reserved_fact_public() {
+        let mut store = FactStore::new();
+        let fact_id = "f_synced_public";
+
+        store.store_synced(synced_fact(fact_id, "project-alpha"));
+
+        assert!(!store.get(fact_id).unwrap().private);
     }
 
     #[test]

@@ -46,7 +46,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use der::Decode as _;
 use p256::ecdsa::signature::hazmat::PrehashSigner;
 use p256::ecdsa::SigningKey as P256SigningKey;
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
@@ -54,6 +53,7 @@ use p256::SecretKey;
 use parking_lot::RwLock;
 use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
 use thiserror::Error;
+use x509_cert::der::Decode as _;
 use x509_cert::Certificate;
 
 /// Default Vault PKI mount path (matches the prod setup from
@@ -592,7 +592,7 @@ fn needs_rotation(not_after: SystemTime, threshold_hours: u64) -> bool {
 }
 
 fn system_time_from_validity(cert: &Certificate) -> SystemTime {
-    let not_after = cert.tbs_certificate.validity.not_after;
+    let not_after = cert.tbs_certificate().validity().not_after;
     let unix = not_after.to_unix_duration();
     UNIX_EPOCH + unix
 }
@@ -666,7 +666,7 @@ fn is_root_cert_pem(pem: &str) -> Result<bool> {
     let der = pem_to_der(pem)?;
     let cert = Certificate::from_der(&der).map_err(|e| VaultPkiSignerError::CertParse(e.to_string()))?;
     // Self-signed → issuer == subject (RDN sequence equality).
-    Ok(cert.tbs_certificate.issuer == cert.tbs_certificate.subject)
+    Ok(cert.tbs_certificate().issuer() == cert.tbs_certificate().subject())
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -852,8 +852,8 @@ mod tests {
         let pki = TestPki::new();
         let der = pem_to_der(&pki.root_pem).unwrap();
         let cert = Certificate::from_der(&der).unwrap();
-        assert_eq!(cert.tbs_certificate.issuer, cert.tbs_certificate.subject);
-        let subject = cert.tbs_certificate.subject.to_string();
+        assert_eq!(cert.tbs_certificate().issuer(), cert.tbs_certificate().subject());
+        let subject = cert.tbs_certificate().subject().to_string();
         assert!(subject.contains("CueCrux C2PA Root TEST"), "got subject: {subject}");
         // is_root_cert_pem agrees.
         assert!(is_root_cert_pem(&pki.root_pem).unwrap());
@@ -927,7 +927,7 @@ mod tests {
         let der = pem_to_der(&pki.root_pem).unwrap();
         assert!(!der.is_empty());
         let cert = Certificate::from_der(&der).unwrap();
-        assert!(cert.tbs_certificate.serial_number.as_bytes().len() > 0);
+        assert!(cert.tbs_certificate().serial_number().as_bytes().len() > 0);
     }
 
     #[test]
@@ -981,7 +981,7 @@ mod tests {
         // Walk the extensions and confirm any BasicConstraints
         // extension says CA:FALSE.
         // OID 2.5.29.19 = id-ce-basicConstraints.
-        if let Some(exts) = &leaf.tbs_certificate.extensions {
+        if let Some(exts) = leaf.tbs_certificate().extensions() {
             for ext in exts {
                 if ext.extn_id.to_string() == "2.5.29.19" {
                     // The DER for BasicConstraints CA:FALSE is
@@ -996,7 +996,7 @@ mod tests {
             }
         }
         // And subject CN matches what we requested.
-        let subject = leaf.tbs_certificate.subject.to_string();
+        let subject = leaf.tbs_certificate().subject().to_string();
         assert!(
             subject.contains(DEFAULT_LEAF_CN),
             "leaf subject CN must match config, got: {subject}"

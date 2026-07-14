@@ -42,7 +42,7 @@ edition = "2021"
 # Kept in lock-step with the release tag (v<MAJOR.MINOR.PATCH>). Bump via
 # scripts/cut-release.sh; the version-sync CI gate (.github/workflows/version-sync.yml)
 # fails any v* tag whose workspace version != the tag.
-version = "0.5.40"
+version = "0.5.41"
 license = "LicenseRef-CCL-1.0"
 rust-version = "1.88.0"
 # CCL crates are source-available and never published to a registry. Marking
@@ -99,7 +99,7 @@ url = "2.5.7"
 urlencoding = "2.1"
 utoipa = "5"
 uuid = "1.23.2"
-x509-cert = { version = "0.2.5", default-features = false }
+x509-cert = { version = "0.3.0", default-features = false }
 xxhash-rust = "0.8.12"
 zip = { version = "8.6.0", default-features = false }
 zstd = "0.13.3"
