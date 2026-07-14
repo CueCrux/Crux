@@ -27,13 +27,11 @@ COPY integrations/ integrations/
 ARG GIT_SHA=unknown
 ENV CORECRUX_GIT_SHA=${GIT_SHA}
 
-# Stamp the release version into the embedded console footer. Set to the git tag
-# (e.g. v0.5.17) on tag builds, empty on main/edge and plain `docker build`. The
-# `__CRUX_RELEASE__` placeholder lives in the console HTML and is compiled into
-# corecruxd via include_str!, so it must be substituted before `cargo build`.
-# Empty value → the console footer falls back to the build commit.
+# Release version: the v2 console reports the version at runtime (via the daemon
+# API), so no build-time HTML stamping is needed. RELEASE_VERSION is retained as
+# an accepted build-arg for CI compatibility (the removed v1 console footer used
+# a `__CRUX_RELEASE__` placeholder; v2 has none).
 ARG RELEASE_VERSION=
-RUN sed -i "s|__CRUX_RELEASE__|${RELEASE_VERSION}|g" crates/corecruxd/console/index.html
 
 RUN cargo build --locked --release --bin corecruxd --bin corecruxctl
 
