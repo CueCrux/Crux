@@ -630,6 +630,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             },
         )),
+        cloud_witness_replay_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         mcp_enabled: config.mcp_enabled,
         console_enabled: config.console_enabled,
         coord_enabled: config.coord_enabled,
@@ -4233,6 +4234,7 @@ mod tests {
             witness_proofs: std::sync::Arc::new(tokio::sync::RwLock::new(
                 crate::witness_proofs::WitnessProofStore::default(),
             )),
+            cloud_witness_replay_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             mcp_enabled: true,
             console_enabled: true,
             coord_enabled: false,

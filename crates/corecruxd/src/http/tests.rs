@@ -384,6 +384,7 @@ pub(super) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         witness_proofs: std::sync::Arc::new(tokio::sync::RwLock::new(
             crate::witness_proofs::WitnessProofStore::default(),
         )),
+        cloud_witness_replay_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         mcp_enabled: true,
         console_enabled: true,
         coord_enabled: true,

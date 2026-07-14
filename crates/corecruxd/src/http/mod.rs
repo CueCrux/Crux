@@ -201,6 +201,8 @@ pub struct AppState {
     pub data_dir: PathBuf,
     pub witness: crate::witness::WitnessRuntimeConfigV1,
     pub witness_proofs: Arc<RwLock<crate::witness_proofs::WitnessProofStore>>,
+    /// Ephemeral, bounded replay keys for verified cloud-witness records.
+    pub cloud_witness_replay_cache: Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>>,
     pub mcp_enabled: bool,
     pub console_enabled: bool,
     /// Multi-agent coordination plane (`/v1/coord/*`). Default ON; explicit
