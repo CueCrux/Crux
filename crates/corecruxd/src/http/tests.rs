@@ -390,6 +390,7 @@ pub(super) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         coord_presence_ttl_secs: crate::coord::DEFAULT_PRESENCE_TTL_SECS,
         consolidation_scheduler_enabled: false,
         context_surface_enabled: true,
+        auto_capture_enabled: true,
         local_ingest_enabled: false,
         stream_receipts_enabled: false,
         usage_receipts_enabled: false,

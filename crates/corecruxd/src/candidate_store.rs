@@ -28,8 +28,9 @@
 //! module sets `private: true` **explicitly**; the prefix registration is
 //! defence in depth, not the primary guarantee.
 //!
-//! Promotion/rejection (the review lifecycle + fail-closed gate) lands in M1.3;
-//! this module owns the schema, the write, and the read-back.
+//! This module owns the whole candidate domain: the schema, the born-private
+//! write, the read-back, and the review lifecycle ([`promote`]/[`reject`]) with
+//! the fail-closed gate ([`PromotionMode`]).
 
 use corecrux_memory::fact_store::StoreFact;
 use corecrux_memory::{Fact, FactStore, HorizonClass};

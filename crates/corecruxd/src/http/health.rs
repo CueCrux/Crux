@@ -498,6 +498,7 @@ pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoRespo
             "consolidation_scheduler": { "enabled": state.consolidation_scheduler_enabled },
             "context_surface": { "enabled": state.context_surface_enabled },
             "local_ingest": { "enabled": state.local_ingest_enabled },
+            "auto_capture": { "enabled": state.auto_capture_enabled },
             "status_feed": { "enabled": crate::status_feed::status_feed_enabled() },
             "activity_log": { "enabled": crate::activity::activity_log_enabled() },
         },

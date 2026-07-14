@@ -53,7 +53,6 @@ mod local_ingest;
 #[allow(dead_code)]
 mod candidate_links;
 mod candidate_store;
-mod memory_extract;
 mod context_graph;
 mod dossier;
 mod encrypted_secrets;
@@ -68,6 +67,7 @@ mod integrations_github;
 mod integrations_github_sync;
 mod integrations_openai;
 mod mcp_stdio;
+mod memory_extract;
 // metrics: Prometheus register!() macros use expect() at init — safe, panics
 // only on duplicate registration (programmer error caught in tests).
 mod console;
@@ -638,6 +638,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         consolidation_scheduler_enabled: config.consolidation_scheduler_enabled,
         coord_presence_ttl_secs: config.coord_presence_ttl_secs,
         context_surface_enabled: config.context_surface_enabled,
+        auto_capture_enabled: config.auto_capture_enabled,
         local_ingest_enabled: config.local_ingest_enabled,
         stream_receipts_enabled: config.stream_receipts_enabled,
         usage_receipts_enabled: config.usage_receipts_enabled,
@@ -4241,6 +4242,7 @@ mod tests {
             consolidation_scheduler_enabled: false,
             coord_presence_ttl_secs: crate::coord::DEFAULT_PRESENCE_TTL_SECS,
             context_surface_enabled: false,
+            auto_capture_enabled: false,
             local_ingest_enabled: false,
             stream_receipts_enabled: false,
             usage_receipts_enabled: false,

@@ -32,6 +32,7 @@ mod events;
 mod extensions;
 mod facts;
 mod features;
+mod memory_capture;
 // Hosted-service HTTP surface (ExecPlan crux-external-findings-remediation M4):
 // Pro GPU-1 compute bridge (`/v1/gpu1/*`). Compiled out of the default
 // Community Edition binary; see the `hosted-surfaces` feature.
@@ -221,6 +222,11 @@ pub struct AppState {
     /// Default ON; `CORECRUXD_LOCAL_INGEST=0` or `false` disables it and makes
     /// the route return 404.
     pub local_ingest_enabled: bool,
+    /// Gated auto-capture surface (`/v1/memory/extract` + candidate review).
+    /// Default OFF (`CORECRUXD_AUTO_CAPTURE=1`); when off, the routes return
+    /// 404. Auto-extracted facts land as review-only candidates and only reach
+    /// recall via an explicit promotion (see `crate::candidate_store`).
+    pub auto_capture_enabled: bool,
     /// G19 stream/context receipt wiring (`Streaming-Receipts-Spec` §5):
     /// `/v1/mediation/receipts` lifts `context_injected` /
     /// `stream_completed` / `stream_aborted` drafts into canonical signed
@@ -799,6 +805,19 @@ pub(crate) fn router_with_route_auth(
         // Gated by CORECRUXD_CONTEXT_SURFACE (default OFF → 404).
         .route("/v1/context", get(self::context_surface::get_context))
         .route("/v1/context", axum::routing::post(self::context_surface::post_context))
+        // Gated auto-capture (ExecPlan buyer-fit M1). Extract review-only
+        // candidates + review them. Gated by CORECRUXD_AUTO_CAPTURE (default
+        // OFF → 404). A promoted candidate is the only path to recall.
+        .route("/v1/memory/extract", axum::routing::post(self::memory_capture::post_extract))
+        .route("/v1/memory/candidates", get(self::memory_capture::get_candidates))
+        .route(
+            "/v1/memory/candidates/{id}/promote",
+            axum::routing::post(self::memory_capture::post_promote),
+        )
+        .route(
+            "/v1/memory/candidates/{id}/reject",
+            axum::routing::post(self::memory_capture::post_reject),
+        )
         // OpenAI function-calling shim over the MCP tool surface.
         // Gated by CORECRUXD_OPENAI_SHIM (default OFF → 404).
         .route("/v1/openai/tools.json", get(self::openai_shim::get_tools_json))
@@ -1554,6 +1573,12 @@ fn problem_for_status(status: StatusCode, detail: impl Into<String>) -> ProblemR
             StatusCode::CONFLICT.as_u16(),
             "https://errors.cuecrux.com/conflict",
             "Conflict",
+        )
+        .with_detail(detail),
+        StatusCode::UNPROCESSABLE_ENTITY => ProblemDetails::new(
+            StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
+            "https://errors.cuecrux.com/unprocessable-entity",
+            "Unprocessable Entity",
         )
         .with_detail(detail),
         StatusCode::BAD_GATEWAY => ProblemDetails::new(
