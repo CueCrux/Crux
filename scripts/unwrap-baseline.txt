@@ -24,7 +24,7 @@ corecrux-segment 32
 corecrux-storage 48
 corecrux-types 1
 corecruxctl 9
-corecruxd 743
+corecruxd 744
 crux-claude-hooks 1
 crux-config-wizard 8
 crux-contrib 0
