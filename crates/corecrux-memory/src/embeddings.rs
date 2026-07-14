@@ -90,6 +90,160 @@ impl SemanticProfile {
     }
 }
 
+impl SemanticProfile {
+    /// Derive a profile directly from model parts (for local embedders that
+    /// have no `EmbeddingConfig`/base_url). Fingerprint is stable per
+    /// (model, dims, tokenizer, template, normalisation) — identical hashing to
+    /// [`SemanticProfile::from_embedding_config`] so the two are comparable.
+    pub fn from_parts(
+        model: &str,
+        dimensions: usize,
+        tokenizer: &str,
+        prompt_template_version: &str,
+        normalisation: &str,
+    ) -> Self {
+        let hash_material = format!("{model}\n{dimensions}\n{tokenizer}\n{prompt_template_version}\n{normalisation}");
+        let hash = blake3::hash(hash_material.as_bytes()).to_hex().to_string();
+        let fingerprint_id = format!("efp_{}", &hash[..24]);
+        let profile_id = format!("sp_{}", &hash[..24]);
+        Self {
+            schema: SEMANTIC_PROFILE_SCHEMA_V1.to_string(),
+            profile_id,
+            model: model.to_string(),
+            dimensions,
+            tokenizer: tokenizer.to_string(),
+            prompt_template_version: prompt_template_version.to_string(),
+            normalisation: normalisation.to_string(),
+            embedding_fingerprint: EmbeddingFingerprint {
+                schema: EMBEDDING_FINGERPRINT_SCHEMA_V1.to_string(),
+                fingerprint_id,
+                model: model.to_string(),
+                dimensions,
+                tokenizer: tokenizer.to_string(),
+                prompt_template_version: prompt_template_version.to_string(),
+                normalisation: normalisation.to_string(),
+                hash,
+            },
+        }
+    }
+}
+
+/// The provider contract shared by every embedder (buyer-fit M3). A dense lane
+/// records the provider's [`SemanticProfile`] so document and query vectors can
+/// be checked for compatibility (same model/dimension/fingerprint) and an
+/// incompatible vector refused rather than silently mis-scored.
+pub trait Embedder: Send + Sync {
+    /// Embed a batch of texts — one vector per input, in order.
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError>;
+    /// Embed one text.
+    fn embed_one(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        let mut vecs = self.embed_batch(&[text])?;
+        vecs.pop().ok_or(EmbeddingError::EmptyResponse)
+    }
+    /// Output dimensionality.
+    fn dimensions(&self) -> usize;
+    /// Model identifier.
+    fn model(&self) -> &str;
+    /// This embedder's semantic profile (model/dim/fingerprint).
+    fn semantic_profile(&self) -> SemanticProfile;
+}
+
+impl Embedder for EmbeddingClient {
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        EmbeddingClient::embed_batch(self, texts)
+    }
+    fn dimensions(&self) -> usize {
+        EmbeddingClient::dimensions(self)
+    }
+    fn model(&self) -> &str {
+        EmbeddingClient::model(self)
+    }
+    fn semantic_profile(&self) -> SemanticProfile {
+        EmbeddingClient::semantic_profile(self)
+    }
+}
+
+/// Pure-Rust, dependency-free, deterministic CPU embedder (buyer-fit M3
+/// default). Feature-hashing ("hashing trick") over lowercased word unigrams +
+/// adjacent bigrams into a fixed-dimension L2-normalised vector, so lexically
+/// overlapping texts score high cosine. Zero deps, zero download, fully offline
+/// — this is what makes local dense "work by default". Better semantic recall
+/// is the opt-in real model / metered upsell, never a clip on this.
+pub struct LocalHashEmbedder {
+    dimensions: usize,
+}
+
+pub const LOCAL_HASH_EMBEDDER_MODEL: &str = "crux-local-hash-v1";
+const LOCAL_HASH_DEFAULT_DIM: usize = 256;
+
+impl Default for LocalHashEmbedder {
+    fn default() -> Self {
+        Self {
+            dimensions: LOCAL_HASH_DEFAULT_DIM,
+        }
+    }
+}
+
+impl LocalHashEmbedder {
+    pub fn new(dimensions: usize) -> Self {
+        Self {
+            dimensions: dimensions.max(1),
+        }
+    }
+
+    fn embed(&self, text: &str) -> Vec<f32> {
+        let mut v = vec![0.0f32; self.dimensions];
+        let tokens: Vec<String> = text
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .map(|t| t.to_lowercase())
+            .collect();
+        let add = |feature: &str, v: &mut [f32]| {
+            let h = blake3::hash(feature.as_bytes());
+            let bytes = h.as_bytes();
+            let idx = (u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize) % self.dimensions;
+            // Sign hashing reduces collision bias.
+            let sign = if bytes[4] & 1 == 0 { 1.0 } else { -1.0 };
+            v[idx] += sign;
+        };
+        for (i, tok) in tokens.iter().enumerate() {
+            add(tok, &mut v);
+            if i + 1 < tokens.len() {
+                add(&format!("{tok}_{}", tokens[i + 1]), &mut v);
+            }
+        }
+        // L2 normalise (unit vector ⇒ cosine == dot).
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 1e-12 {
+            for x in &mut v {
+                *x /= norm;
+            }
+        }
+        v
+    }
+}
+
+impl Embedder for LocalHashEmbedder {
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        Ok(texts.iter().map(|t| self.embed(t)).collect())
+    }
+    fn dimensions(&self) -> usize {
+        self.dimensions
+    }
+    fn model(&self) -> &str {
+        LOCAL_HASH_EMBEDDER_MODEL
+    }
+    fn semantic_profile(&self) -> SemanticProfile {
+        SemanticProfile::from_parts(
+            LOCAL_HASH_EMBEDDER_MODEL,
+            self.dimensions,
+            "whitespace_ngram_v1",
+            "none",
+            "l2",
+        )
+    }
+}
+
 #[derive(Serialize)]
 struct OllamaEmbedRequest<'a> {
     model: &'a str,
@@ -273,6 +427,54 @@ mod tests {
         assert_eq!(a.embedding_fingerprint.schema, EMBEDDING_FINGERPRINT_SCHEMA_V1);
         assert!(a.profile_id.starts_with("sp_"));
         assert!(a.embedding_fingerprint.fingerprint_id.starts_with("efp_"));
+    }
+
+    #[test]
+    fn local_hash_embedder_is_deterministic_and_unit_norm() {
+        let e = LocalHashEmbedder::default();
+        let a = e.embed_one("the quick brown fox").unwrap();
+        let b = e.embed_one("the quick brown fox").unwrap();
+        assert_eq!(a, b, "same text ⇒ identical vector");
+        assert_eq!(a.len(), 256);
+        let norm: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "unit-normalised");
+    }
+
+    #[test]
+    fn local_hash_embedder_lexical_overlap_scores_higher() {
+        let e = LocalHashEmbedder::default();
+        let base = e.embed_one("the cat sat on the mat").unwrap();
+        let near = e.embed_one("a cat sat on a mat").unwrap();
+        let far = e.embed_one("quantum chromodynamics lecture notes").unwrap();
+        let sim_near = cosine_similarity(&base, &near);
+        let sim_far = cosine_similarity(&base, &far);
+        assert!(sim_near > sim_far, "overlapping text closer: {sim_near} vs {sim_far}");
+        assert!(sim_near > 0.4, "strong overlap ⇒ high cosine: {sim_near}");
+    }
+
+    #[test]
+    fn local_hash_embedder_profile_is_stable_and_named() {
+        let e = LocalHashEmbedder::default();
+        assert_eq!(e.model(), LOCAL_HASH_EMBEDDER_MODEL);
+        let p = e.semantic_profile();
+        assert_eq!(p.model, LOCAL_HASH_EMBEDDER_MODEL);
+        assert_eq!(p.dimensions, 256);
+        assert_eq!(p, LocalHashEmbedder::default().semantic_profile(), "profile stable");
+        // A different-dimension local embedder has a different fingerprint.
+        assert_ne!(
+            p.embedding_fingerprint.hash,
+            LocalHashEmbedder::new(384)
+                .semantic_profile()
+                .embedding_fingerprint
+                .hash
+        );
+    }
+
+    #[test]
+    fn embedder_trait_is_object_safe_and_covers_both_impls() {
+        let local: Box<dyn Embedder> = Box::new(LocalHashEmbedder::default());
+        assert_eq!(local.dimensions(), 256);
+        assert!(!local.embed_one("hello world").unwrap().is_empty());
     }
 
     #[test]
