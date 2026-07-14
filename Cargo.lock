@@ -571,7 +571,7 @@ dependencies = [
  "const-oid 0.10.2",
  "der 0.8.0",
  "spki 0.8.0",
- "x509-cert 0.3.0-rc.4",
+ "x509-cert",
 ]
 
 [[package]]
@@ -665,7 +665,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "corecrux-frame"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "blake3",
  "hex",
@@ -675,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "corecrux-index"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "blake3",
  "corecrux-frame",
@@ -688,7 +688,7 @@ dependencies = [
 
 [[package]]
 name = "corecrux-memory"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "blake3",
  "chrono",
@@ -707,7 +707,7 @@ dependencies = [
 
 [[package]]
 name = "corecrux-projections"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "blake3",
  "chrono",
@@ -725,7 +725,7 @@ dependencies = [
 
 [[package]]
 name = "corecrux-proto"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "anyhow",
  "prost",
@@ -738,7 +738,7 @@ dependencies = [
 
 [[package]]
 name = "corecrux-receipts"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "base64",
  "blake3",
@@ -769,7 +769,7 @@ dependencies = [
  "ureq 2.12.1",
  "url",
  "uuid",
- "x509-cert 0.2.5",
+ "x509-cert",
  "x509-parser",
  "zip",
  "zstd",
@@ -777,7 +777,7 @@ dependencies = [
 
 [[package]]
 name = "corecrux-retrieval"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "blake3",
  "corecrux-index",
@@ -793,7 +793,7 @@ dependencies = [
 
 [[package]]
 name = "corecrux-segment"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "blake3",
  "corecrux-frame",
@@ -808,7 +808,7 @@ dependencies = [
 
 [[package]]
 name = "corecrux-storage"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "blake3",
  "corecrux-frame",
@@ -828,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "corecrux-types"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "anyhow",
  "blake3",
@@ -839,7 +839,7 @@ dependencies = [
 
 [[package]]
 name = "corecruxctl"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "anyhow",
  "base64",
@@ -881,14 +881,14 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
- "x509-cert 0.2.5",
+ "x509-cert",
  "xxhash-rust",
  "zip",
 ]
 
 [[package]]
 name = "corecruxd"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "anyhow",
  "axum",
@@ -1238,7 +1238,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "crux-claude-hooks"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "anyhow",
  "base64",
@@ -1259,7 +1259,7 @@ dependencies = [
 
 [[package]]
 name = "crux-config-wizard"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "blake3",
  "chrono",
@@ -1274,7 +1274,7 @@ dependencies = [
 
 [[package]]
 name = "crux-contrib"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "blake3",
  "chrono",
@@ -1285,7 +1285,7 @@ dependencies = [
 
 [[package]]
 name = "crux-cost"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "serde",
  "serde_json",
@@ -1293,14 +1293,14 @@ dependencies = [
 
 [[package]]
 name = "crux-enterprise-shim"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "rcx-capability-token",
 ]
 
 [[package]]
 name = "crux-integration-tests"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "corecrux-proto",
  "portpicker",
@@ -1315,7 +1315,7 @@ dependencies = [
 
 [[package]]
 name = "crux-integrations"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "base64",
  "blake3",
@@ -1332,7 +1332,7 @@ dependencies = [
 
 [[package]]
 name = "crux-lens-features"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "chrono",
  "corecrux-memory",
@@ -1342,7 +1342,7 @@ dependencies = [
 
 [[package]]
 name = "crux-mcp"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "axum",
  "base64",
@@ -1386,7 +1386,7 @@ dependencies = [
 
 [[package]]
 name = "crux-observe"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "blake3",
  "chrono",
@@ -1402,7 +1402,7 @@ dependencies = [
 
 [[package]]
 name = "crux-observe-api"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "serde",
  "serde_json",
@@ -1410,7 +1410,7 @@ dependencies = [
 
 [[package]]
 name = "crux-router"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -1419,7 +1419,7 @@ dependencies = [
 
 [[package]]
 name = "crux-session"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "blake3",
  "corecrux-projections",
@@ -1434,7 +1434,7 @@ dependencies = [
 
 [[package]]
 name = "crux-sync"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "blake3",
  "chrono",
@@ -1535,9 +1535,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
 dependencies = [
  "const-oid 0.9.6",
- "der_derive 0.7.3",
- "flagset",
- "pem-rfc7468",
+ "pem-rfc7468 0.7.0",
  "zeroize",
 ]
 
@@ -1548,8 +1546,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71fd89660b2dc699704064e59e9dba0147b903e85319429e131620d022be411b"
 dependencies = [
  "const-oid 0.10.2",
- "der_derive 0.8.0",
+ "der_derive",
  "flagset",
+ "pem-rfc7468 1.0.0",
  "zeroize",
 ]
 
@@ -1565,17 +1564,6 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "rusticata-macros",
-]
-
-[[package]]
-name = "der_derive"
-version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8034092389675178f570469e6c3b0465d3d30b4505c294a6550db47f3c17ad18"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]
@@ -1718,7 +1706,7 @@ dependencies = [
  "ff",
  "generic-array",
  "group",
- "pem-rfc7468",
+ "pem-rfc7468 0.7.0",
  "pkcs8",
  "rand_core 0.6.4",
  "sec1",
@@ -3002,6 +2990,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pem-rfc7468"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6305423e0e7738146434843d1694d621cce767262b2a86910beab705e4493d9"
+dependencies = [
+ "base64ct",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3586,7 +3583,7 @@ dependencies = [
 
 [[package]]
 name = "rcx-capability-token"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "blake3",
  "crux-session",
@@ -5073,7 +5070,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vaultcrux-local"
-version = "0.5.40"
+version = "0.5.41"
 dependencies = [
  "blake3",
  "ed25519-dalek",
@@ -5905,21 +5902,9 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "x509-cert"
-version = "0.2.5"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1301e935010a701ae5f8655edc0ad17c44bad3ac5ce8c39185f75453b720ae94"
-dependencies = [
- "const-oid 0.9.6",
- "der 0.7.10",
- "spki 0.7.3",
- "tls_codec",
-]
-
-[[package]]
-name = "x509-cert"
-version = "0.3.0-rc.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e21aad3a769f25f3d2d0cbf30ea8b50a1d602354bd6ab687fad112821608ba6"
+checksum = "105ef4642d9cb137ef83d623d0e4bf08b8adf69e9918ca904a174adb6d3d038b"
 dependencies = [
  "const-oid 0.10.2",
  "der 0.8.0",

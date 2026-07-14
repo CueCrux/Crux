@@ -50,7 +50,7 @@
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
-use crate::fact_store::StoreFact;
+use crate::fact_store::{Fact, StoreFact};
 
 /// Process-global policy. Set once at startup via `install_global()` so every
 /// write path can call `enforce_global(&mut fact)` without threading an
@@ -70,6 +70,15 @@ pub fn install_global(policy: PrivacyPolicy) {
 pub fn enforce_global(fact: &mut StoreFact) {
     let policy = GLOBAL_POLICY.get_or_init(PrivacyPolicy::from_env);
     enforce(policy, fact);
+}
+
+/// Enforce the process-global privacy policy on a fully built fact, such as
+/// one received from a sync peer.
+pub fn enforce_global_fact(fact: &mut Fact) {
+    let policy = GLOBAL_POLICY.get_or_init(PrivacyPolicy::from_env);
+    if policy.is_always_private(&fact.entity) {
+        fact.private = true;
+    }
 }
 
 /// Read the live global policy (initialises from env on first read if
