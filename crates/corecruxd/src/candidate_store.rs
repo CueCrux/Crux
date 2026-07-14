@@ -191,9 +191,149 @@ pub fn list_candidates(store: &FactStore, status: Option<CandidateStatus>) -> Ve
         .collect()
 }
 
+/// Latest version of a single candidate by id (None if absent/superseded away).
+pub fn get_candidate(store: &FactStore, candidate_id: &str) -> Option<MemoryCandidateV1> {
+    let entity = candidate_entity(candidate_id);
+    store
+        .all_facts()
+        .find(|f| f.entity == entity && f.key == CANDIDATE_KEY && !f.deleted && f.superseded_by.is_none())
+        .and_then(|f| serde_json::from_str::<MemoryCandidateV1>(&f.value).ok())
+}
+
+/// How a promotion is authorised — the distinction IS the fail-closed gate.
+pub enum PromotionMode {
+    /// An explicit human/agent review decision. Always permitted (a reviewer is
+    /// on the hook). `reviewer` is recorded in the promoted fact's `actor`.
+    Explicit { reviewer: String },
+    /// Automatic promotion. Permitted ONLY when the candidate carries a
+    /// `verifier_score` at or above `score_threshold`. An unscored or
+    /// below-threshold candidate is REFUSED and stays review-only — the exact
+    /// inversion of CruxEngine's fail-open verifier (unscored ⇒ promote).
+    Auto { score_threshold: f32 },
+}
+
+/// Outcome of a failed promote/reject.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReviewError {
+    /// No live candidate with that id.
+    NotFound,
+    /// The candidate is already promoted.
+    AlreadyPromoted,
+    /// Auto-promotion refused: unscored or below threshold. The candidate is
+    /// unchanged and remains review-only.
+    FailClosed(String),
+    /// Underlying store write failed.
+    Store(String),
+}
+
+impl std::fmt::Display for ReviewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReviewError::NotFound => write!(f, "candidate not found"),
+            ReviewError::AlreadyPromoted => write!(f, "candidate already promoted"),
+            ReviewError::FailClosed(why) => write!(f, "promotion refused (fail-closed): {why}"),
+            ReviewError::Store(e) => write!(f, "candidate store error: {e}"),
+        }
+    }
+}
+impl std::error::Error for ReviewError {}
+
+/// Promote a candidate: write the proposed fact into the real (recallable)
+/// store, then record the candidate as `promoted`. Returns the new fact id.
+///
+/// The **fail-closed gate**: an `Auto` promotion of an unscored (or
+/// below-threshold) candidate is refused — it stays a review-only candidate.
+/// An `Explicit` promotion is always honoured (a human/agent decided). Callable
+/// from `candidate` or (re-promote) `rejected` state, but not `promoted`.
+pub fn promote(
+    store: &mut FactStore,
+    candidate_id: &str,
+    mode: PromotionMode,
+    reviewed_at: &str,
+) -> Result<String, ReviewError> {
+    let cand = get_candidate(store, candidate_id).ok_or(ReviewError::NotFound)?;
+    if cand.status == CandidateStatus::Promoted {
+        return Err(ReviewError::AlreadyPromoted);
+    }
+    if let PromotionMode::Auto { score_threshold } = &mode {
+        match cand.verifier_score {
+            Some(score) if score >= *score_threshold => {}
+            Some(score) => {
+                return Err(ReviewError::FailClosed(format!(
+                    "verifier_score {score} < threshold {score_threshold}"
+                )));
+            }
+            None => {
+                return Err(ReviewError::FailClosed(
+                    "unscored candidate cannot be auto-promoted (review-only)".to_string(),
+                ));
+            }
+        }
+    }
+
+    // Write the real fact under its true entity/key. It goes through the normal
+    // store, so it is recallable. Born-private only if the proposed entity is
+    // itself a reserved prefix (defence in depth).
+    let horizon = HorizonClass::parse(&cand.decay_class)
+        .unwrap_or_else(|| HorizonClass::default_for_entity(&cand.proposed_entity));
+    let private = corecrux_memory::fact_privacy::global_policy().is_always_private(&cand.proposed_entity);
+    let actor = match &mode {
+        PromotionMode::Explicit { reviewer } => format!("auto-capture:promoted-by:{reviewer}"),
+        PromotionMode::Auto { .. } => "auto-capture:auto-promoted".to_string(),
+    };
+    let real = StoreFact {
+        tenant_hash: "default".to_string(),
+        entity: cand.proposed_entity.clone(),
+        key: cand.proposed_key.clone(),
+        value: cand.proposed_value.clone(),
+        // Link the promoted fact back to its originating candidate (which carries
+        // the CROWN receipt), so provenance is recoverable.
+        source_receipt: Some(candidate_entity(candidate_id)),
+        confidence: cand.confidence,
+        private,
+        horizon_class: Some(horizon),
+        actor: Some(actor),
+    };
+    let promoted = store.try_store(real).map_err(|e| ReviewError::Store(e.to_string()))?;
+
+    // Record the candidate transition as a new same-(entity,key) version.
+    let mut updated = cand;
+    updated.status = CandidateStatus::Promoted;
+    updated.promoted_fact_id = Some(promoted.fact_id.clone());
+    updated.reject_reason = None;
+    updated.created_at = reviewed_at.to_string();
+    write_candidate(store, &updated, None).map_err(ReviewError::Store)?;
+    Ok(promoted.fact_id)
+}
+
+/// Reject a candidate: record it as `rejected` with a reason. Reversible — a
+/// rejected candidate can later be re-promoted. Refuses a `promoted` candidate
+/// (retract the promoted fact directly via supersession instead).
+pub fn reject(store: &mut FactStore, candidate_id: &str, reason: &str, reviewed_at: &str) -> Result<(), ReviewError> {
+    let cand = get_candidate(store, candidate_id).ok_or(ReviewError::NotFound)?;
+    if cand.status == CandidateStatus::Promoted {
+        return Err(ReviewError::AlreadyPromoted);
+    }
+    let mut updated = cand;
+    updated.status = CandidateStatus::Rejected;
+    updated.reject_reason = Some(reason.to_string());
+    updated.promoted_fact_id = None;
+    updated.created_at = reviewed_at.to_string();
+    write_candidate(store, &updated, None).map_err(ReviewError::Store)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Is the proposed fact visible in normal (non-admin) recall?
+    fn real_fact_present(store: &FactStore, entity: &str, key: &str) -> Option<Fact> {
+        store
+            .all_facts()
+            .find(|f| f.entity == entity && f.key == key && !f.deleted && f.superseded_by.is_none())
+            .cloned()
+    }
 
     fn sample_body(id: &str) -> MemoryCandidateV1 {
         MemoryCandidateV1::new_candidate(
@@ -251,5 +391,134 @@ mod tests {
         // No promoted candidates yet.
         assert!(list_candidates(&store, Some(CandidateStatus::Promoted)).is_empty());
         assert_eq!(list_candidates(&store, Some(CandidateStatus::Candidate)).len(), 1);
+    }
+
+    fn scored_body(id: &str, score: f32) -> MemoryCandidateV1 {
+        let mut b = sample_body(id);
+        b.verifier_score = Some(score);
+        b
+    }
+
+    #[test]
+    fn auto_promote_refuses_unscored_candidate_fail_closed() {
+        let mut store = FactStore::new();
+        write_candidate(&mut store, &sample_body("c1"), None).unwrap();
+        // Unscored + Auto ⇒ refused, and the candidate is left untouched.
+        let err = promote(&mut store, "c1", PromotionMode::Auto { score_threshold: 0.5 }, "t").unwrap_err();
+        assert!(
+            matches!(err, ReviewError::FailClosed(_)),
+            "unscored auto-promote must fail closed"
+        );
+        assert_eq!(get_candidate(&store, "c1").unwrap().status, CandidateStatus::Candidate);
+        // No real fact leaked into recall.
+        assert!(real_fact_present(&store, "person:user", "owns_cat_count").is_none());
+    }
+
+    #[test]
+    fn auto_promote_refuses_below_threshold() {
+        let mut store = FactStore::new();
+        write_candidate(&mut store, &scored_body("c1", 0.10), None).unwrap();
+        let err = promote(&mut store, "c1", PromotionMode::Auto { score_threshold: 0.5 }, "t").unwrap_err();
+        assert!(matches!(err, ReviewError::FailClosed(_)));
+        assert!(real_fact_present(&store, "person:user", "owns_cat_count").is_none());
+    }
+
+    #[test]
+    fn auto_promote_succeeds_when_scored_above_threshold() {
+        let mut store = FactStore::new();
+        write_candidate(&mut store, &scored_body("c1", 0.90), None).unwrap();
+        let fid = promote(&mut store, "c1", PromotionMode::Auto { score_threshold: 0.5 }, "t").unwrap();
+        assert!(!fid.is_empty());
+        // The real fact is now present and recallable (NOT private).
+        let real = real_fact_present(&store, "person:user", "owns_cat_count").expect("promoted fact present");
+        assert_eq!(real.value, "3");
+        assert!(!real.private, "a promoted normal fact must be recallable, not private");
+        assert!(real.source_receipt.as_deref() == Some("__candidate_fact__::c1"));
+        assert_eq!(get_candidate(&store, "c1").unwrap().status, CandidateStatus::Promoted);
+    }
+
+    #[test]
+    fn explicit_promote_always_succeeds_even_unscored() {
+        let mut store = FactStore::new();
+        write_candidate(&mut store, &sample_body("c1"), None).unwrap();
+        let fid = promote(
+            &mut store,
+            "c1",
+            PromotionMode::Explicit {
+                reviewer: "myles".to_string(),
+            },
+            "t",
+        )
+        .unwrap();
+        assert!(!fid.is_empty());
+        let real = real_fact_present(&store, "person:user", "owns_cat_count").expect("promoted fact present");
+        assert_eq!(real.actor.as_deref(), Some("auto-capture:promoted-by:myles"));
+        assert_eq!(get_candidate(&store, "c1").unwrap().status, CandidateStatus::Promoted);
+    }
+
+    #[test]
+    fn reject_then_repromote_is_reversible() {
+        let mut store = FactStore::new();
+        write_candidate(&mut store, &sample_body("c1"), None).unwrap();
+        reject(&mut store, "c1", "hallucinated", "t").unwrap();
+        let c = get_candidate(&store, "c1").unwrap();
+        assert_eq!(c.status, CandidateStatus::Rejected);
+        assert_eq!(c.reject_reason.as_deref(), Some("hallucinated"));
+        assert!(real_fact_present(&store, "person:user", "owns_cat_count").is_none());
+        // Reversible: re-promote a rejected candidate.
+        promote(
+            &mut store,
+            "c1",
+            PromotionMode::Explicit {
+                reviewer: "myles".to_string(),
+            },
+            "t2",
+        )
+        .unwrap();
+        assert_eq!(get_candidate(&store, "c1").unwrap().status, CandidateStatus::Promoted);
+        assert!(real_fact_present(&store, "person:user", "owns_cat_count").is_some());
+    }
+
+    #[test]
+    fn promote_twice_and_reject_promoted_are_refused() {
+        let mut store = FactStore::new();
+        write_candidate(&mut store, &sample_body("c1"), None).unwrap();
+        promote(
+            &mut store,
+            "c1",
+            PromotionMode::Explicit {
+                reviewer: "m".to_string(),
+            },
+            "t",
+        )
+        .unwrap();
+        assert_eq!(
+            promote(
+                &mut store,
+                "c1",
+                PromotionMode::Explicit {
+                    reviewer: "m".to_string()
+                },
+                "t"
+            ),
+            Err(ReviewError::AlreadyPromoted)
+        );
+        assert_eq!(reject(&mut store, "c1", "x", "t"), Err(ReviewError::AlreadyPromoted));
+    }
+
+    #[test]
+    fn promote_missing_candidate_is_not_found() {
+        let mut store = FactStore::new();
+        assert_eq!(
+            promote(
+                &mut store,
+                "nope",
+                PromotionMode::Explicit {
+                    reviewer: "m".to_string()
+                },
+                "t"
+            ),
+            Err(ReviewError::NotFound)
+        );
     }
 }
