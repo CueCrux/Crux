@@ -57,6 +57,9 @@ pub const CRUXPACK_SOURCE_RECEIPT_PREFIX: &str = "cruxpack:";
 /// privacy policy stays a subset of this list, so a new born-private prefix
 /// cannot silently become exportable.
 pub const CRUXPACK_RESERVED_PREFIXES: &[&str] = &[
+    // Auto-capture review-only candidates (M1) — must mirror the daemon
+    // born-private prefix in fact_privacy::DEFAULT_PRIVATE_PREFIXES.
+    "__candidate_fact__::",
     "__agent::",
     "__ops::",
     "__ops__::",

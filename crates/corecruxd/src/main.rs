@@ -52,6 +52,7 @@ mod local_ingest;
 // exercise creation/proposal before daemon startup wires automatic proposer runs.
 #[allow(dead_code)]
 mod candidate_links;
+mod candidate_store;
 mod context_graph;
 mod dossier;
 mod encrypted_secrets;
