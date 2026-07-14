@@ -492,9 +492,14 @@ pub(super) async fn post_query_text_search(
         let store = state.fact_store.read().await;
         store.embed_text(&body.query)
     };
-    let dense_provider = query_embedding
-        .as_ref()
-        .and_then(|qe| crate::local_ingest::build_dense_provider(&index, &state.data_dir, qe));
+    let dense_provider = query_embedding.as_ref().and_then(|qe| {
+        crate::local_ingest::build_dense_provider(
+            &index,
+            &state.data_dir,
+            qe,
+            embedding_fingerprint.as_ref().map(|f| f.hash.as_str()),
+        )
+    });
     let dense_lane_active = dense_provider.is_some();
     if let Some(provider) = dense_provider.as_ref() {
         use corecrux_retrieval::dense::DenseProvider;

@@ -122,6 +122,7 @@ const HEAD_MAX_RECORD_BYTES: usize = 256 * 1024 * 1024;
 /// The `.ccxi` tenant filter is keyed on `xxh64(tenant_id)` (computed inside the
 /// companion builder from each frame's canonical header), matching the tenant
 /// filter used by `bm25_search`.
+#[allow(clippy::too_many_arguments)] // cohesive seal params; bundling them is churn for no clarity
 pub fn seal_prose_documents(
     data_dir: &Path,
     shard_id: u32,
@@ -130,6 +131,7 @@ pub fn seal_prose_documents(
     corpus_id: &str,
     ingested_at_rfc3339: &str,
     documents: &[ProseDocument],
+    dense_profile: Option<&corecrux_memory::embeddings::SemanticProfile>,
 ) -> Result<SealSummary, LocalIngestError> {
     let shards_root = data_dir.join("shards");
     let options = ShardStorageOptions {
@@ -218,6 +220,10 @@ pub fn seal_prose_documents(
 
     // M3: persist the dense companion (`.ccxv`) alongside the sealed segment,
     // named with the same stem as its `.ccxseg` so the loader can find it by seq.
+    // M3.3: also persist the `.ccxp` profile sidecar (the SemanticProfile that
+    // produced these vectors) so the query path can refuse to score a segment
+    // whose embedding fingerprint differs from the query embedder's, rather than
+    // silently mis-scoring across incompatible vector spaces.
     let mut dense_written = 0usize;
     if seal.sealed && !dense_entries.is_empty() {
         if let (Some(receipt), Some(dim)) = (seal.seal_receipt.as_ref(), dense_dim) {
@@ -226,6 +232,10 @@ pub fn seal_prose_documents(
             let path = segments_dir.join(format!("{stem}.ccxv"));
             write_ccxv(&path, dim as u32, &dense_entries).map_err(|e| LocalIngestError::DenseIo(e.to_string()))?;
             dense_written = dense_entries.len();
+            if let Some(profile) = dense_profile {
+                let profile_path = segments_dir.join(format!("{stem}.ccxp"));
+                write_ccxp(&profile_path, profile).map_err(|e| LocalIngestError::DenseIo(e.to_string()))?;
+            }
         }
     }
 
@@ -279,6 +289,25 @@ fn write_ccxv(path: &Path, dim: u32, entries: &[(u32, Vec<f32>)]) -> std::io::Re
     Ok(())
 }
 
+/// Write the `.ccxp` profile sidecar (JSON [`corecrux_memory::embeddings::SemanticProfile`])
+/// atomically alongside a segment's `.ccxv` (buyer-fit M3.3). Records which
+/// embedder produced the segment's vectors so the query path can refuse to score
+/// an incompatible vector space.
+fn write_ccxp(path: &Path, profile: &corecrux_memory::embeddings::SemanticProfile) -> std::io::Result<()> {
+    let json = serde_json::to_vec_pretty(profile).map_err(std::io::Error::other)?;
+    let tmp = path.with_extension("ccxp.partial");
+    std::fs::write(&tmp, &json)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Read a `.ccxp` profile sidecar. Returns `None` when absent or unparyable
+/// (treated as an unknown/legacy profile rather than fatal).
+fn read_ccxp(path: &Path) -> Option<corecrux_memory::embeddings::SemanticProfile> {
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
 /// Read a `.ccxv` companion → (dim, [(doc_id, vector)]). Returns `None` on a bad
 /// magic/version or a truncated file (treated as absent rather than fatal).
 ///
@@ -325,10 +354,16 @@ fn read_ccxv(path: &Path) -> Option<(u32, DenseEntries)> {
 /// Consumed live by the prose text-search query path (buyer-fit M3.2): when a
 /// node embedder is configured the query is embedded and this builds the
 /// `CosineDenseProvider` over the corpus `.ccxv` companions for dense re-rank.
+/// `expected_fingerprint` (buyer-fit M3.3): when `Some`, a segment whose `.ccxp`
+/// profile records a DIFFERENT embedding fingerprint is skipped — its vectors
+/// live in an incompatible space and must not be cosine-scored against this
+/// query. A segment with no `.ccxp` (legacy) is included; the `CosineDenseProvider`
+/// still guards on dimension. `None` includes every segment (fixture callers).
 pub fn build_dense_provider(
     index_mgr: &corecrux_retrieval::IndexManager,
     data_dir: &Path,
     query_embedding: &[f32],
+    expected_fingerprint: Option<&str>,
 ) -> Option<corecrux_retrieval::CosineDenseProvider> {
     use std::collections::HashMap;
 
@@ -340,6 +375,14 @@ pub fn build_dense_provider(
         let Some(path) = find_ccxv_for_seq(&shards_dir, seq) else {
             continue;
         };
+        // Skip segments whose recorded profile is incompatible with the query.
+        if let Some(expected) = expected_fingerprint {
+            if let Some(profile) = read_ccxp(&path.with_extension("ccxp")) {
+                if profile.embedding_fingerprint.hash != expected {
+                    continue;
+                }
+            }
+        }
         let Some((_dim, entries)) = read_ccxv(&path) else {
             continue;
         };
@@ -431,6 +474,7 @@ mod tests {
             "mediacrux-archive",
             "2026-07-01T00:00:00Z",
             &docs,
+            None,
         )
         .expect("seal should succeed on CPU");
 
@@ -500,6 +544,7 @@ mod tests {
             "corpus",
             "2026-07-01T00:00:00Z",
             &batch("d1", "alpha centauri star system"),
+            None,
         )
         .expect("first seal");
         seal_prose_documents(
@@ -510,6 +555,7 @@ mod tests {
             "corpus",
             "2026-07-01T00:00:01Z",
             &batch("d2", "betelgeuse red supergiant"),
+            None,
         )
         .expect("second seal");
 
@@ -580,7 +626,7 @@ mod tests {
                 chunks: vec![dense_chunk("doc-b::0", "shared keyword beta", vec![0.0, 1.0])],
             },
         ];
-        let summary = seal_prose_documents(data_dir, 0, 1, tenant, "corpus", "2026-07-01T00:00:00Z", &docs)
+        let summary = seal_prose_documents(data_dir, 0, 1, tenant, "corpus", "2026-07-01T00:00:00Z", &docs, None)
             .expect("seal with vectors");
         assert_eq!(summary.dense_dim, Some(2));
         assert_eq!(summary.dense_vectors, 2);
@@ -590,7 +636,7 @@ mod tests {
         mgr.scan_and_load(&segments_dir).expect("scan");
 
         // Query embedding aligned to doc B (doc_id 1). Weight dense heavily.
-        let provider = build_dense_provider(&mgr, data_dir, &[0.0, 1.0]).expect("provider from .ccxv");
+        let provider = build_dense_provider(&mgr, data_dir, &[0.0, 1.0], None).expect("provider from .ccxv");
         assert_eq!(provider.len(), 2);
         let weights = FusionWeights {
             bm25: 0.1,
@@ -623,7 +669,7 @@ mod tests {
                 chunks: vec![dense_chunk("d2::0", "text two", vec![1.0, 0.0, 0.0])],
             },
         ];
-        let err = seal_prose_documents(tmp.path(), 0, 1, "t", "corpus", "2026-07-01T00:00:00Z", &docs)
+        let err = seal_prose_documents(tmp.path(), 0, 1, "t", "corpus", "2026-07-01T00:00:00Z", &docs, None)
             .expect_err("dim mismatch must be rejected");
         match err {
             LocalIngestError::DenseDimMismatch { expected, found } => {
@@ -650,7 +696,7 @@ mod tests {
                 dense_vector: None,
             }],
         }];
-        let summary = seal_prose_documents(data_dir, 0, 1, tenant, "corpus", "2026-07-01T00:00:00Z", &docs)
+        let summary = seal_prose_documents(data_dir, 0, 1, tenant, "corpus", "2026-07-01T00:00:00Z", &docs, None)
             .expect("seal no vectors");
         assert_eq!(summary.dense_vectors, 0);
         assert_eq!(summary.dense_dim, None);
@@ -660,7 +706,7 @@ mod tests {
         mgr.scan_and_load(&segments_dir).expect("scan");
 
         // No .ccxv → no provider.
-        assert!(build_dense_provider(&mgr, data_dir, &[0.0, 1.0]).is_none());
+        assert!(build_dense_provider(&mgr, data_dir, &[0.0, 1.0], None).is_none());
 
         // BM25-only fused retrieval still returns the doc (dense lane inert).
         let req = fused_req(tenant, "bm25 document", vec![0.0], FusionWeights::default());
@@ -688,10 +734,10 @@ mod tests {
             }],
         }];
 
-        let s1 = seal_prose_documents(data_dir, 0, 1, tenant, "corpus", "2026-07-01T00:00:00Z", &docs)
+        let s1 = seal_prose_documents(data_dir, 0, 1, tenant, "corpus", "2026-07-01T00:00:00Z", &docs, None)
             .expect("first ingest");
         assert!(s1.sealed);
-        let s2 = seal_prose_documents(data_dir, 0, 1, tenant, "corpus", "2026-07-01T00:00:05Z", &docs)
+        let s2 = seal_prose_documents(data_dir, 0, 1, tenant, "corpus", "2026-07-01T00:00:05Z", &docs, None)
             .expect("second ingest of the same doc");
 
         // The second ingest must not produce a second live frame: either it seals
@@ -740,6 +786,7 @@ mod tests {
             "corpus",
             "2026-07-01T00:00:00Z",
             &mk("common secret alpha-only"),
+            None,
         )
         .expect("tenant a");
         seal_prose_documents(
@@ -750,6 +797,7 @@ mod tests {
             "corpus",
             "2026-07-01T00:00:01Z",
             &mk("common secret beta-only"),
+            None,
         )
         .expect("tenant b");
 
