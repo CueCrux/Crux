@@ -203,6 +203,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/console/onboarding/restart", methods: &["POST"], tag: "Console", auth: "admin-write", summary: "Console onboarding restart" },
     RouteEntry { path: "/v1/console/passports", methods: &["GET"], tag: "Console", auth: "admin-read", summary: "Console passports" },
     RouteEntry { path: "/v1/console/review/consolidations", methods: &["POST"], tag: "Console", auth: "admin-write", summary: "Console review consolidations" },
+    RouteEntry { path: "/v1/console/review/consolidations/undo", methods: &["POST"], tag: "Console", auth: "admin-write", summary: "Undo a consolidation (atomic + receipted)" },
     RouteEntry { path: "/v1/console/review/contradictions", methods: &["GET"], tag: "Console", auth: "admin-read", summary: "Console review contradictions" },
     RouteEntry { path: "/v1/console/sessions", methods: &["GET"], tag: "Console", auth: "admin-read", summary: "Console sessions" },
     RouteEntry { path: "/v1/console/settings", methods: &["GET", "PUT"], tag: "Console", auth: "admin", summary: "Console settings" },
