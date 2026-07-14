@@ -1,0 +1,61 @@
+{
+  "corpus": "buyer-fit-m0-baseline-v1",
+  "purpose": "Small, labeled, reproducible corpus establishing M0 baselines (latency, recall@k, recall-per-token, stale/contradiction handling) so M1-M6 have regression gates. Corpus identity is fixed; do not mutate in place - version-bump to v2 if content changes.",
+  "notes": "Facts are deliberate store_fact-style rows (entity/key/value). Queries carry ground-truth relevant fact ids. Stale/contradiction pairs test that retrieval prefers the fresh fact and hides the superseded one (freshness decay + supersession are existing daemon behaviour; this measures the pre-M1 baseline).",
+  "tenant_id": "eval-buyer-fit-m0",
+  "facts": [
+    { "id": "f01", "entity": "service:corecruxd", "key": "port:http", "value": "corecruxd serves its HTTP API on port 14800" },
+    { "id": "f02", "entity": "service:corecruxd", "key": "port:grpc", "value": "corecruxd serves gRPC on port 4007 for append, replay, and export" },
+    { "id": "f03", "entity": "service:corecruxd", "key": "port:mcp", "value": "the built-in MCP server listens on port 14801" },
+    { "id": "f04", "entity": "retrieval:lanes", "key": "bm25", "value": "BM25 text search runs over sealed .ccxi companion indexes, zero LLM calls" },
+    { "id": "f05", "entity": "retrieval:lanes", "key": "dense", "value": "the dense lane is a free uncapped local CPU cosine capability via a pluggable DenseProvider" },
+    { "id": "f06", "entity": "retrieval:budget", "key": "token_budget", "value": "every retrieval call takes a mandatory token_budget that caps returned context deterministically" },
+    { "id": "f07", "entity": "receipts:crown", "key": "signer", "value": "CROWN receipts are Ed25519-signed and offline-verifiable with no daemon" },
+    { "id": "f08", "entity": "memory:decay", "key": "freshness", "value": "facts decay by a deterministic freshness horizon; stale facts are demoted in ranking but never hard-deleted" },
+    { "id": "f09", "entity": "memory:supersede", "key": "reversible", "value": "consolidation supersedes facts reversibly; the input store is never modified in place" },
+    { "id": "f10", "entity": "coord:plane", "key": "default", "value": "the multi-agent coordination plane is enabled by default and stores coordination as born-private facts" },
+    { "id": "f11", "entity": "coord:plane", "key": "primitives", "value": "coordination offers presence, a work board, signed handoffs, and path leases" },
+    { "id": "f12", "entity": "packs:trust", "key": "model", "value": "community packs run out-of-process or WASM-sandboxed with per-passport capability grants and signed pinned artifacts" },
+    { "id": "f13", "entity": "ingest:local", "key": "endpoint", "value": "the sealed local ingest door accepts folder and file payloads at /v1/local/ingest" },
+    { "id": "f14", "entity": "context:surface", "key": "endpoint", "value": "the provider-neutral context bundle is served at /v1/context for cross-provider recall" },
+    { "id": "f15", "entity": "activity:log", "key": "signed", "value": "the activity log is replayable and each turn can be co-signed for tamper-evidence" },
+    { "id": "f16", "entity": "extraction:candidate", "key": "lifecycle", "value": "auto-extracted facts land as reviewable candidates in a review namespace and are never promoted unscored" },
+    { "id": "f17", "entity": "sdk:surface", "key": "rest", "value": "two REST SDKs cover facts, sessions, and query against the daemon" },
+    { "id": "f18", "entity": "bench:corpus", "key": "identity", "value": "every benchmark result must name its corpus by identity or the number is unattributable" },
+    { "id": "f19", "entity": "deploy:host", "key": "crux", "value": "the production daemon is deployed on host crux under /opt/crux and tracks tagged releases" },
+    { "id": "f20", "entity": "licence:ccl", "key": "posture", "value": "the daemon is source-available under the CueCrux Community Licence, not open-source" }
+  ],
+  "stale_contradiction_pairs": [
+    {
+      "entity": "config:consolidation", "key": "interval",
+      "stale_value": "the consolidation review scheduler runs every 3600 seconds by default",
+      "fresh_value": "the buyer-fit eval profile runs the consolidation review scheduler every 900 seconds",
+      "expect": "a query for the review interval returns the fresh 900s fact; the stale 3600s fact is demoted/superseded, not surfaced as current"
+    },
+    {
+      "entity": "config:local_ingest", "key": "default",
+      "stale_value": "local ingest defaults to OFF and its route returns 404",
+      "fresh_value": "local ingest defaults to ON via env_default_on; its route is live unless explicitly disabled",
+      "expect": "a query for the local-ingest default returns the fresh ON fact; the stale OFF fact is not surfaced as current"
+    }
+  ],
+  "queries": [
+    { "q": "what port does the HTTP API use", "relevant": ["f01"] },
+    { "q": "how does text search avoid LLM calls", "relevant": ["f04", "f06"] },
+    { "q": "are CROWN receipts verifiable offline", "relevant": ["f07"] },
+    { "q": "what happens to stale facts", "relevant": ["f08", "f09"] },
+    { "q": "what coordination primitives exist", "relevant": ["f11", "f10"] },
+    { "q": "how are community packs sandboxed", "relevant": ["f12"] },
+    { "q": "where do auto-extracted facts go before promotion", "relevant": ["f16"] },
+    { "q": "why must a benchmark name its corpus", "relevant": ["f18"] },
+    { "q": "how often does the consolidation review scheduler run under the eval profile", "relevant": ["stale_contradiction:config:consolidation"] },
+    { "q": "is local ingest on or off by default", "relevant": ["stale_contradiction:config:local_ingest"] }
+  ],
+  "metrics_to_capture": {
+    "latency_ms": "p50 and p95 over all queries, measured client-side",
+    "recall_at_5": "fraction of queries whose relevant ids all appear in the top 5 results",
+    "recall_per_token": "recall_at_5 divided by mean returned-context tokens (honest accounting; token_budget fixed at 500)",
+    "stale_contradiction_recall": "fraction of the 2 stale/contradiction queries that return the FRESH fact and NOT the stale one as current",
+    "capture_reliability": "N/A at M0 - auto-extraction does not exist yet (this is the M1 build); recorded as the zero point"
+  }
+}

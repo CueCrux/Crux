@@ -1,0 +1,128 @@
+{
+  "corpus": "buyer-fit-m0-baseline-v1",
+  "retrieval_lane": "keyword fact lane (GET /v1/facts, token_budget) \u2014 pre-M3, NOT dense semantic",
+  "token_budget": 500,
+  "top_k": 5,
+  "facts_loaded": 20,
+  "load_failures": [],
+  "latency_ms": {
+    "p50": 2.0,
+    "p95": 2.5,
+    "mean": 2.1
+  },
+  "recall_at_5": 1.0,
+  "recall_queries": 8,
+  "mean_returned_tokens": 457,
+  "recall_per_1k_tokens": 2.188,
+  "fresh_ranked_above_stale": 1.0,
+  "fresh_ranked_above_stale_cases": "2/2",
+  "note_superseded_suppression": "the raw keyword GET /v1/facts lane returns superseded rows alongside fresh ones (fresh ranks first but stale is not suppressed). The MCP query_facts tool hides superseded by default; this HTTP lane does not. Baseline signal for M1/M2/M3.",
+  "capture_reliability": "N/A at M0 \u2014 auto-extraction does not exist yet (M1 build); this is the zero point",
+  "per_query": [
+    {
+      "q": "what port does the HTTP API use",
+      "type": "recall",
+      "want": [
+        "service:corecruxd/port:http"
+      ],
+      "recall_at_5": true,
+      "latency_ms": 2.2,
+      "tokens": 472
+    },
+    {
+      "q": "how does text search avoid LLM calls",
+      "type": "recall",
+      "want": [
+        "retrieval:lanes/bm25",
+        "retrieval:budget/token_budget"
+      ],
+      "recall_at_5": true,
+      "latency_ms": 2.2,
+      "tokens": 495
+    },
+    {
+      "q": "are CROWN receipts verifiable offline",
+      "type": "recall",
+      "want": [
+        "receipts:crown/signer"
+      ],
+      "recall_at_5": true,
+      "latency_ms": 1.8,
+      "tokens": 430
+    },
+    {
+      "q": "what happens to stale facts",
+      "type": "recall",
+      "want": [
+        "memory:supersede/reversible",
+        "memory:decay/freshness"
+      ],
+      "recall_at_5": true,
+      "latency_ms": 2.0,
+      "tokens": 499
+    },
+    {
+      "q": "what coordination primitives exist",
+      "type": "recall",
+      "want": [
+        "coord:plane/default",
+        "coord:plane/primitives"
+      ],
+      "recall_at_5": true,
+      "latency_ms": 2.1,
+      "tokens": 218
+    },
+    {
+      "q": "how are community packs sandboxed",
+      "type": "recall",
+      "want": [
+        "packs:trust/model"
+      ],
+      "recall_at_5": true,
+      "latency_ms": 2.1,
+      "tokens": 500
+    },
+    {
+      "q": "where do auto-extracted facts go before promotion",
+      "type": "recall",
+      "want": [
+        "extraction:candidate/lifecycle"
+      ],
+      "recall_at_5": true,
+      "latency_ms": 2.0,
+      "tokens": 473
+    },
+    {
+      "q": "why must a benchmark name its corpus",
+      "type": "recall",
+      "want": [
+        "bench:corpus/identity"
+      ],
+      "recall_at_5": true,
+      "latency_ms": 2.0,
+      "tokens": 493
+    },
+    {
+      "q": "how often does the consolidation review scheduler run under the eval profile",
+      "type": "stale_contradiction",
+      "fresh_returned": true,
+      "fresh_rank": 0,
+      "stale_rank": 1,
+      "stale_suppressed": false,
+      "fresh_ranked_above_stale": true,
+      "latency_ms": 2.5,
+      "tokens": 494
+    },
+    {
+      "q": "is local ingest on or off by default",
+      "type": "stale_contradiction",
+      "fresh_returned": true,
+      "fresh_rank": 0,
+      "stale_rank": 1,
+      "stale_suppressed": false,
+      "fresh_ranked_above_stale": true,
+      "latency_ms": 1.9,
+      "tokens": 496
+    }
+  ]
+}

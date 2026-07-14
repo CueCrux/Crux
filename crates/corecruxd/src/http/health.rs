@@ -488,6 +488,19 @@ pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoRespo
             "mcp": state.mcp_enabled,
             "embeddings": embeddings_enabled,
         },
+        // Buyer-fit evaluation capabilities (ExecPlan
+        // crux-daemon-buyer-fit-buildout-2026-07-13, M0). Each field reflects
+        // the SAME gate its endpoints check, so `/v1/version` cannot drift from
+        // actual routing behaviour and the eval profile is machine-verifiable.
+        // See examples/eval-profiles/buyer-fit-m0.env.
+        "capabilities": {
+            "coordination": { "enabled": state.coord_enabled },
+            "consolidation_scheduler": { "enabled": state.consolidation_scheduler_enabled },
+            "context_surface": { "enabled": state.context_surface_enabled },
+            "local_ingest": { "enabled": state.local_ingest_enabled },
+            "status_feed": { "enabled": crate::status_feed::status_feed_enabled() },
+            "activity_log": { "enabled": crate::activity::activity_log_enabled() },
+        },
         "semantic_profile": semantic_profile,
         "protocol_contracts": protocol_contracts,
         "sync": {
