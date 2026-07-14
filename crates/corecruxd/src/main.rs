@@ -809,7 +809,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         watcher.start_existing_repos().await;
     }
 
-    // Wire optional embedding client for dense vector retrieval on facts.
+    // Wire the dense embedder for fact retrieval. An external `embedding_url`
+    // selects the HTTP client (BYOE/paid, better vectors). Otherwise, unless
+    // explicitly disabled, wire the pure-Rust `LocalHashEmbedder` so dense
+    // recall works offline by default (buyer-fit M3.2 — dense ON by default).
     if let Some(ref embedding_url) = config.embedding_url {
         let client = corecrux_memory::embeddings::EmbeddingClient::new(corecrux_memory::embeddings::EmbeddingConfig {
             base_url: embedding_url.clone(),
@@ -821,7 +824,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             embedding_model = %config.embedding_model,
             "embedding-client-configured"
         );
-        state.fact_store.write().await.set_embedding_client(client);
+        state.fact_store.write().await.set_embedder(Box::new(client));
+    } else if config.local_embedder_enabled {
+        use corecrux_memory::embeddings::Embedder as _;
+        let local = corecrux_memory::embeddings::LocalHashEmbedder::default();
+        info!(
+            model = %corecrux_memory::embeddings::LOCAL_HASH_EMBEDDER_MODEL,
+            dimensions = local.dimensions(),
+            "local-embedder-configured (offline dense default)"
+        );
+        state.fact_store.write().await.set_embedder(Box::new(local));
     }
 
     // Bootstrap: always seed agent-facing documentation on startup (idempotent).

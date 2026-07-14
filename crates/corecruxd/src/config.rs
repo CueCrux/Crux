@@ -432,6 +432,11 @@ pub struct Config {
     // Optional embedding endpoint for dense vector retrieval on facts.
     pub embedding_url: Option<String>,
     pub embedding_model: String,
+    // Pure-Rust offline dense embedder (buyer-fit M3.2). Default ON: when no
+    // external `embedding_url` is set, facts are embedded with the zero-dep
+    // `LocalHashEmbedder` so dense recall works with no external service. Set
+    // `CORECRUXD_LOCAL_EMBEDDER=0` to keep the fact lane keyword-only.
+    pub local_embedder_enabled: bool,
 
     // Background sync: pull/push facts to a remote CoreCrux instance.
     pub sync_enabled: bool,
@@ -1153,6 +1158,7 @@ pub fn load_config() -> Config {
 
         embedding_url: std::env::var("CORECRUXD_EMBEDDING_URL").ok().filter(|s| !s.is_empty()),
         embedding_model: std::env::var("CORECRUXD_EMBEDDING_MODEL").unwrap_or_else(|_| "nomic-embed-text".to_string()),
+        local_embedder_enabled: env_default_on("CORECRUXD_LOCAL_EMBEDDER"),
 
         sync_enabled: std::env::var("CORECRUXD_SYNC_ENABLED")
             .ok()

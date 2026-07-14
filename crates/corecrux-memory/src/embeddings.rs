@@ -132,7 +132,10 @@ impl SemanticProfile {
 /// records the provider's [`SemanticProfile`] so document and query vectors can
 /// be checked for compatibility (same model/dimension/fingerprint) and an
 /// incompatible vector refused rather than silently mis-scored.
-pub trait Embedder: Send + Sync {
+///
+/// `Debug` is a supertrait so a `Box<dyn Embedder>` can live inside a
+/// `#[derive(Debug)]` struct (e.g. [`crate::fact_store::FactStore`]).
+pub trait Embedder: Send + Sync + std::fmt::Debug {
     /// Embed a batch of texts — one vector per input, in order.
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError>;
     /// Embed one text.
@@ -169,6 +172,7 @@ impl Embedder for EmbeddingClient {
 /// overlapping texts score high cosine. Zero deps, zero download, fully offline
 /// — this is what makes local dense "work by default". Better semantic recall
 /// is the opt-in real model / metered upsell, never a clip on this.
+#[derive(Debug, Clone)]
 pub struct LocalHashEmbedder {
     dimensions: usize,
 }

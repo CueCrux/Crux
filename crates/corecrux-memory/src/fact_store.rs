@@ -390,8 +390,11 @@ pub struct FactStore {
     journal_path: Option<PathBuf>,
     /// Optional event bus for real-time mutation notifications.
     event_bus: Option<crate::events::EventBus>,
-    /// Optional embedding client for dense vector retrieval.
-    embedding_client: Option<crate::embeddings::EmbeddingClient>,
+    /// Optional embedder for dense vector retrieval. Any [`crate::embeddings::Embedder`]:
+    /// an external HTTP `EmbeddingClient` (BYOE/paid) or the pure-Rust
+    /// `LocalHashEmbedder` wired by default when no external URL is set
+    /// (buyer-fit M3.2 — dense works offline by default).
+    embedder: Option<Box<dyn crate::embeddings::Embedder>>,
     /// Stored embeddings keyed by fact_id.
     embeddings: HashMap<String, Vec<f32>>,
 }
@@ -406,26 +409,33 @@ impl FactStore {
         self.event_bus = Some(bus);
     }
 
-    /// Attach an embedding client for dense vector retrieval.
+    /// Attach an embedder for dense vector retrieval. Any [`crate::embeddings::Embedder`]
+    /// — the external HTTP `EmbeddingClient` or the pure-Rust `LocalHashEmbedder`.
     /// When set, facts are embedded at store time and queries use cosine
-    /// similarity blended with keyword matching for ranking.
-    pub fn set_embedding_client(&mut self, client: crate::embeddings::EmbeddingClient) {
+    /// similarity blended with confidence for ranking.
+    pub fn set_embedder(&mut self, embedder: Box<dyn crate::embeddings::Embedder>) {
         tracing::info!(
-            model = %client.model(),
-            base_url = %client.base_url(),
+            model = %embedder.model(),
+            dimensions = embedder.dimensions(),
             "fact-store-embeddings-enabled"
         );
-        self.embedding_client = Some(client);
+        self.embedder = Some(embedder);
     }
 
-    /// Returns true if an embedding client is configured.
+    /// Attach an external HTTP embedding client. Thin wrapper over
+    /// [`Self::set_embedder`] retained for existing call sites.
+    pub fn set_embedding_client(&mut self, client: crate::embeddings::EmbeddingClient) {
+        self.set_embedder(Box::new(client));
+    }
+
+    /// Returns true if an embedder is configured.
     pub fn embeddings_enabled(&self) -> bool {
-        self.embedding_client.is_some()
+        self.embedder.is_some()
     }
 
-    /// Return the semantic profile for the configured embedding client.
+    /// Return the semantic profile for the configured embedder.
     pub fn semantic_profile(&self) -> Option<crate::embeddings::SemanticProfile> {
-        self.embedding_client.as_ref().map(|client| client.semantic_profile())
+        self.embedder.as_ref().map(|embedder| embedder.semantic_profile())
     }
 
     /// Create a fact store backed by a JSONL journal in `data_dir`.
@@ -441,7 +451,7 @@ impl FactStore {
             key_index: HashMap::new(),
             journal_path: Some(journal_path.clone()),
             event_bus: None,
-            embedding_client: None,
+            embedder: None,
             embeddings: HashMap::new(),
         };
         if journal_path.exists() {
@@ -734,9 +744,9 @@ impl FactStore {
     }
 
     fn after_fact_stored(&mut self, fact: &Fact) {
-        if let Some(client) = &self.embedding_client {
+        if let Some(embedder) = &self.embedder {
             let text = format!("{} {} {}", fact.entity, fact.key, fact.value);
-            match client.embed_one(&text) {
+            match embedder.embed_one(&text) {
                 Ok(vec) => {
                     // Free, Bring-Your-Own-embedder dense lane. This store is
                     // deliberately **uncapped** (ExecPlan
@@ -946,7 +956,7 @@ impl FactStore {
             .filter(|f| {
                 // When embeddings are enabled, skip keyword filtering — cosine
                 // similarity handles relevance ranking instead.
-                if self.embedding_client.is_some() {
+                if self.embedder.is_some() {
                     return true;
                 }
                 if let Some(query) = &q.query {
@@ -967,8 +977,8 @@ impl FactStore {
         // If embeddings are available and a query is provided, compute cosine
         // similarity and blend it with confidence for ranking. Otherwise fall
         // back to confidence + recency.
-        let query_embedding = match (&self.embedding_client, &q.query) {
-            (Some(client), Some(query_text)) if !query_text.is_empty() => match client.embed_one(query_text) {
+        let query_embedding = match (&self.embedder, &q.query) {
+            (Some(embedder), Some(query_text)) if !query_text.is_empty() => match embedder.embed_one(query_text) {
                 Ok(vec) => Some(vec),
                 Err(err) => {
                     tracing::warn!(?err, "query-embed-failed");
@@ -1601,6 +1611,63 @@ mod tests {
 
         let retrieved = store.get(&fact.fact_id).unwrap();
         assert_eq!(retrieved.value, "canary deployment with evaluator programme");
+    }
+
+    #[test]
+    fn local_embedder_makes_dense_ranking_the_default_with_no_external_service() {
+        // buyer-fit M3.2: a FactStore wired with the pure-Rust LocalHashEmbedder
+        // (no external URL) ranks by cosine similarity — dense ON by default.
+        let mut store = FactStore::new();
+        store.set_embedder(Box::new(crate::embeddings::LocalHashEmbedder::default()));
+        assert!(store.embeddings_enabled(), "local embedder ⇒ dense enabled");
+        assert_eq!(
+            store.semantic_profile().unwrap().model,
+            crate::embeddings::LOCAL_HASH_EMBEDDER_MODEL,
+            "profile reports the local model"
+        );
+
+        let mk = |entity: &str, key: &str, value: &str| StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: entity.to_string(),
+            key: key.to_string(),
+            value: value.to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        };
+        store.store(mk(
+            "infra",
+            "terraform",
+            "terraform module drift detection infrastructure",
+        ));
+        store.store(mk(
+            "ci",
+            "pipeline",
+            "continuous integration deployment pipeline automation",
+        ));
+        store.store(mk(
+            "docs",
+            "onboarding",
+            "developer onboarding guide and setup instructions",
+        ));
+
+        // A lexically-overlapping query must surface the terraform fact first,
+        // ranked by cosine (keyword substring filtering is bypassed when dense).
+        let result = store.query(&FactQuery {
+            query: Some("terraform infrastructure drift".to_string()),
+            entity: None,
+            tenant_hash: None,
+            entity_prefix: None,
+            top_k: 3,
+            token_budget: None,
+        });
+        assert!(!result.facts.is_empty(), "dense query returns results");
+        assert_eq!(
+            result.facts[0].key, "terraform",
+            "highest-cosine fact ranks first via the local embedder"
+        );
     }
 
     #[test]
