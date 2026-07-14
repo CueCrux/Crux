@@ -19,6 +19,7 @@ mod cases;
 #[cfg(feature = "hosted-surfaces")]
 mod cloud;
 mod console;
+mod consolidation_receipt;
 mod context_surface;
 mod coord;
 mod cost;
@@ -1253,6 +1254,10 @@ pub(crate) fn router_with_route_auth(
         .route(
             "/v1/console/review/consolidations",
             axum::routing::post(self::console::post_console_review_consolidation),
+        )
+        .route(
+            "/v1/console/review/consolidations/undo",
+            axum::routing::post(self::console::post_console_review_consolidation_undo),
         )
         // First-run onboarding state for the embedded console.
         .route("/v1/console/onboarding", get(self::console::get_console_onboarding))
