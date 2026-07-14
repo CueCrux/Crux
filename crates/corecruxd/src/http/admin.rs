@@ -43,6 +43,9 @@ pub(crate) struct AdminActionRecord {
     pub(crate) auth_context: Option<EvidenceAuthContextV1>,
     #[serde(skip)]
     pub(crate) request_context: Option<EvidenceRequestContextV1>,
+    /// Passport bound by the admin auth layer. Never populated from request JSON.
+    #[serde(skip)]
+    pub(crate) authenticated_passport: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -430,6 +433,7 @@ pub(super) async fn execute_admin_action(
     params: Option<&serde_json::Value>,
     auth_context: Option<&EvidenceAuthContextV1>,
     request_context: Option<&EvidenceRequestContextV1>,
+    authenticated_passport: Option<&str>,
 ) -> Result<AdminActionExecutionResult, String> {
     match action_type {
         "verify-store" => {
@@ -1108,7 +1112,10 @@ pub(super) async fn execute_admin_action(
                     let mut fact_ids: Vec<String> = covered.iter().map(|(fact_id, _)| fact_id.clone()).collect();
                     fact_ids.sort();
                     fact_ids.dedup();
-                    let actor = read_param_str(params, "actor")
+                    // Attribution is security-sensitive: request params may describe
+                    // an operator, but only the passport bound at authentication is
+                    // allowed to become the override receipt's actor.
+                    let actor = authenticated_passport
                         .map(str::to_string)
                         .or_else(|| auth_context.and_then(|context| context.subject.clone()))
                         .unwrap_or_else(|| state.passport_fpr.clone());
@@ -1190,7 +1197,7 @@ pub(super) async fn execute_admin_action(
 
 pub(super) async fn run_admin_action(state: AppState, action_id: String) {
     let started_at_ms = now_unix_ms();
-    let (action_type, params, auth_context, request_context) = {
+    let (action_type, params, auth_context, request_context, authenticated_passport) = {
         let mut actions = state.admin_actions.write().await;
         let Some(rec) = actions.get_mut(&action_id) else {
             return;
@@ -1205,6 +1212,7 @@ pub(super) async fn run_admin_action(state: AppState, action_id: String) {
             rec.params.clone(),
             rec.auth_context.clone(),
             rec.request_context.clone(),
+            rec.authenticated_passport.clone(),
         )
     };
 
@@ -1232,6 +1240,7 @@ pub(super) async fn run_admin_action(state: AppState, action_id: String) {
             params.as_ref(),
             auth_context.as_ref(),
             request_context.as_ref(),
+            authenticated_passport.as_deref(),
         ),
     )
     .await;
@@ -1362,6 +1371,10 @@ pub(super) async fn post_admin_action(
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
+    let authenticated_passport = match http_scope_context(&state.auth, &headers) {
+        Ok(context) => context.passport_id.unwrap_or_else(|| state.passport_fpr.clone()),
+        Err(problem) => return problem.into_response(),
+    };
 
     let action_type = req.action_type.trim();
     if action_type.is_empty() {
@@ -1429,6 +1442,7 @@ pub(super) async fn post_admin_action(
         error: None,
         auth_context: None,
         request_context: None,
+        authenticated_passport: Some(authenticated_passport),
     };
 
     let auth_context = match describe_http_evidence(&state.auth, &headers) {
@@ -2576,7 +2590,7 @@ mod compact_facts_tests {
         assert!(std::fs::read_to_string(&journal).unwrap().contains("erase-this-pii"));
 
         let params = serde_json::json!({ "reason": "gdpr-erasure-test" });
-        let result = execute_admin_action(&state, "act-1", "compact-facts", Some(&params), None, None)
+        let result = execute_admin_action(&state, "act-1", "compact-facts", Some(&params), None, None, None)
             .await
             .expect("compact-facts action succeeds");
         assert_eq!(result.result["factsDropped"], 1);
@@ -2591,17 +2605,17 @@ mod compact_facts_tests {
     #[tokio::test]
     async fn compact_facts_action_requires_reason() {
         let state = crate::http::tests::test_app_state(4);
-        let err = execute_admin_action(&state, "act-2", "compact-facts", None, None, None)
+        let err = execute_admin_action(&state, "act-2", "compact-facts", None, None, None, None)
             .await
             .unwrap_err();
         assert!(err.contains("reason is required"));
     }
 
     #[tokio::test]
-    async fn held_hard_erasure_refuses_unless_explicit_gdpr_override_is_signed() {
+    async fn held_hard_erasure_override_is_signed_and_bound_to_authenticated_passport() {
         let dir = tempfile::tempdir().unwrap();
         let journal = dir.path().join("facts.jsonl");
-        let mut state = crate::http::tests::test_app_state(4);
+        let mut state = crate::http::tests::test_app_state_with_auth(4, crate::auth::AuthMode::DevScopes);
         let key = crux_session::LocalPassportKey::from_path(&state.passport_key_path).unwrap();
         state.passport_fpr = key.passport_fpr().to_string();
         state.passport_public_key_hex = key.public_key_hex().to_string();
@@ -2629,7 +2643,7 @@ mod compact_facts_tests {
         state.fact_store = std::sync::Arc::new(tokio::sync::RwLock::new(fs));
 
         let ordinary = serde_json::json!({"reason": "ordinary hard deletion"});
-        let err = execute_admin_action(&state, "act-held", "compact-facts", Some(&ordinary), None, None)
+        let err = execute_admin_action(&state, "act-held", "compact-facts", Some(&ordinary), None, None, None)
             .await
             .unwrap_err();
         assert!(err.contains(&placed.hold.hold_id));
@@ -2641,14 +2655,46 @@ mod compact_facts_tests {
             "reason": "GDPR Article 17 full-tenant erasure",
             "gdprFullTenantErasure": true,
             "tenantId": "default",
-            "actor": "p_dpo",
+            "actor": "p_spoofed_dpo",
         });
-        let result = execute_admin_action(&state, "act-gdpr", "compact-facts", Some(&gdpr), None, None)
-            .await
-            .unwrap();
-        assert_eq!(result.result["legalHoldOverridden"], true);
-        assert_eq!(result.result["legalHoldOverrideReceipt"]["alg"], "ed25519");
-        assert!(result.result["legalHoldOverrideReceipt"]["signature"]
+        let authenticated_passport = "p_authenticated_dpo";
+        let mut headers = HeaderMap::new();
+        headers.insert("x-corecrux-scopes", HeaderValue::from_static("admin:write"));
+        headers.insert(
+            "x-corecrux-passport-id",
+            HeaderValue::from_static(authenticated_passport),
+        );
+        let response = post_admin_action(
+            State(state.clone()),
+            headers,
+            Json(PostAdminActionRequest {
+                action_id: Some("act-gdpr".to_string()),
+                action_type: "compact-facts".to_string(),
+                actor: Some("p_spoofed_action_actor".to_string()),
+                reason: Some("caller-supplied metadata".to_string()),
+                params: Some(gdpr),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let action = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+            loop {
+                let action = state.admin_actions.read().await.get("act-gdpr").cloned().unwrap();
+                if matches!(&action.status, AdminActionStatus::Succeeded | AdminActionStatus::Failed) {
+                    break action;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(action.status, AdminActionStatus::Succeeded, "{:?}", action.error);
+        let result = action.result.unwrap();
+        assert_eq!(result["legalHoldOverridden"], true);
+        assert_eq!(result["legalHoldOverrideReceipt"]["alg"], "ed25519");
+        assert!(result["legalHoldOverrideReceipt"]["signature"]
             .as_str()
             .is_some_and(|signature| !signature.is_empty()));
         assert!(!std::fs::read_to_string(&journal)
@@ -2660,6 +2706,11 @@ mod compact_facts_tests {
         let records = std::fs::read_to_string(governance_log).unwrap();
         assert!(records.contains("legal_hold_overridden"));
         assert!(records.contains(&placed.hold.hold_id));
+        assert!(!records.contains("p_spoofed_dpo"));
+        assert!(!records.contains("p_spoofed_action_actor"));
+        let override_record: serde_json::Value = serde_json::from_str(records.lines().last().unwrap()).unwrap();
+        assert_eq!(override_record["principal"], authenticated_passport);
+        assert_eq!(override_record["payload"]["actor"], authenticated_passport);
     }
 
     #[tokio::test]
@@ -2671,7 +2722,7 @@ mod compact_facts_tests {
         ));
         // retention_days is None on the test state.
         let params = serde_json::json!({ "reason": "r", "applyRetention": true });
-        let err = execute_admin_action(&state, "act-3", "compact-facts", Some(&params), None, None)
+        let err = execute_admin_action(&state, "act-3", "compact-facts", Some(&params), None, None, None)
             .await
             .unwrap_err();
         assert!(err.contains("CORECRUXD_RETENTION_DAYS is unset"));

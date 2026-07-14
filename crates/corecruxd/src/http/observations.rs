@@ -63,6 +63,11 @@ const MAX_AGGREGATE_LIMIT: usize = 1000;
 /// Subdirectory under `data_dir` for observation JSONL files.
 const OBS_SUBDIR: &str = "observations";
 
+/// Serializes chain-tip read + append so concurrent singleton receipt writes
+/// cannot derive the same sequence number and previous hash.
+static OBSERVATION_APPEND_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
 /// Cloud-witness record schema emitted by `crux-llm-shim --cloud-witness`.
 ///
 /// This value intentionally lives here as a wire-contract constant rather
@@ -495,6 +500,24 @@ fn append_observation(file_path: &Path, line: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+fn sync_observation(file_path: &Path) -> std::io::Result<()> {
+    std::fs::OpenOptions::new().write(true).open(file_path)?.sync_all()?;
+
+    // On Unix, fsync the directory entries as well as the file contents. The
+    // observations directory may have been created by append_observation, so
+    // also sync data_dir to make that directory entry crash-durable.
+    #[cfg(unix)]
+    {
+        if let Some(parent) = file_path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+            if let Some(data_dir) = parent.parent() {
+                std::fs::File::open(data_dir)?.sync_all()?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Chain-tip info returned by `read_chain_tip`: the previous record's
 /// `seq` (or `None` if it was a pre-M5e legacy record), and its
 /// `body_hash` hex without the `blake3:` prefix. `None` from the function
@@ -609,6 +632,45 @@ pub(super) fn read_all_observations(data_dir: &Path) -> std::io::Result<Vec<Obse
 /// Returns the response *plus* the new chain tip so the batch loop can
 /// thread it forward.
 pub(super) fn append_one(
+    state: &AppState,
+    scoped_session_id: &str,
+    principal: &str,
+    body: PostObservationBody,
+    chain_tip: Option<ChainTip>,
+) -> Result<(PostObservationResponse, ChainTip), (StatusCode, String)> {
+    let _guard = OBSERVATION_APPEND_LOCK.lock().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "observation append lock poisoned".to_string(),
+        )
+    })?;
+    append_one_unlocked(state, scoped_session_id, principal, body, chain_tip)
+}
+
+/// Append a signed observation and fsync its file and directory entries before
+/// returning. Legal-hold release uses this stronger boundary so released state
+/// can never commit ahead of a crash-durable receipt.
+pub(super) fn append_one_durable(
+    state: &AppState,
+    scoped_session_id: &str,
+    principal: &str,
+    body: PostObservationBody,
+    chain_tip: Option<ChainTip>,
+) -> Result<(PostObservationResponse, ChainTip), (StatusCode, String)> {
+    let _guard = OBSERVATION_APPEND_LOCK.lock().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "observation append lock poisoned".to_string(),
+        )
+    })?;
+    let appended = append_one_unlocked(state, scoped_session_id, principal, body, chain_tip)?;
+    let file_path = observation_file_path(&state.data_dir, scoped_session_id);
+    sync_observation(&file_path)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("sync observation: {err}")))?;
+    Ok(appended)
+}
+
+fn append_one_unlocked(
     state: &AppState,
     scoped_session_id: &str,
     principal: &str,

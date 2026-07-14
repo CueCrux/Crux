@@ -822,6 +822,7 @@ async fn runtime_knob_update_updates_knowledge_authority() {
         Some(&params),
         None,
         None,
+        None,
     )
     .await
     .expect("runtime knob update succeeds");
@@ -885,6 +886,7 @@ async fn runtime_knob_update_updates_tenant_throttles() {
         Some(&params),
         None,
         None,
+        None,
     )
     .await
     .expect("runtime knob update succeeds");
@@ -917,6 +919,7 @@ async fn runtime_knob_update_clears_knowledge_parity_outcome() {
         })),
         None,
         None,
+        None,
     )
     .await
     .expect("seed parity outcome");
@@ -930,6 +933,7 @@ async fn runtime_knob_update_clears_knowledge_parity_outcome() {
             "reason": "clear-parity",
             "knowledgeClearParityOutcome": true
         })),
+        None,
         None,
         None,
     )
@@ -1760,6 +1764,82 @@ async fn put_facts_bulk_forces_reserved_prefix_private_before_store() {
     assert!(reserved.private);
     let public = store.all_facts().find(|fact| fact.entity == "public").unwrap();
     assert!(!public.private);
+}
+
+#[tokio::test]
+async fn put_fact_passport_rejects_daemon_owned_entity_prefix() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+    let body = corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "client-supplied-must-be-ignored".to_string(),
+        entity: "__legal_hold__::hold-1".to_string(),
+        key: "state".to_string(),
+        value: "attacker".to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        private: false,
+        horizon_class: None,
+        actor: None,
+    };
+
+    let resp = facts::put_fact(
+        State(state.clone()),
+        dev_scope_passport_headers("facts:write", "work-default"),
+        Json(body),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = json_body(resp).await;
+    assert_eq!(body["code"], "RESERVED_ENTITY_PREFIX");
+    assert_eq!(body["reserved_prefix"], "__legal_hold__::");
+    assert!(state
+        .fact_store
+        .read()
+        .await
+        .get_by_entity("__legal_hold__::hold-1")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn put_facts_bulk_rejects_daemon_owned_entity_prefix_atomically() {
+    let state = test_app_state(16);
+    let body = vec![
+        corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "public".to_string(),
+            key: "safe".to_string(),
+            value: "must-not-partially-store".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        },
+        corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "__incident__::incident-1".to_string(),
+            key: "state".to_string(),
+            value: "attacker".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        },
+    ];
+
+    let resp = facts::put_facts_bulk(State(state.clone()), HeaderMap::new(), Json(body))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = json_body(resp).await;
+    assert_eq!(body["code"], "RESERVED_ENTITY_PREFIX");
+    assert_eq!(body["reserved_prefix"], "__incident__::");
+    assert_eq!(state.fact_store.read().await.all_facts().count(), 0);
 }
 
 // ── Fact Store (GET /v1/facts/{factId}) ─────────────────────────
@@ -4637,6 +4717,7 @@ async fn post_admin_action_queue_full_returns_503() {
                 error: None,
                 auth_context: None,
                 request_context: None,
+                authenticated_passport: None,
             },
         );
     }
@@ -5619,6 +5700,7 @@ async fn runtime_knob_update_throttle_params() {
         "act-throttle-1",
         "runtime-knob-update",
         Some(&params),
+        None,
         None,
         None,
     )

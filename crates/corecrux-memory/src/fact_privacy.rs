@@ -28,6 +28,8 @@
 //! - `__work_transition__::` — work state transitions
 //! - `__workbench__::`       — Pro workbench context packs, ledgers, handoffs
 //! - `__incident__::`        — private governance incident reconstructions
+//! - `__legal_hold__::`      — daemon-owned legal-hold state
+//! - `__legal_hold_receipt__::` — daemon-owned legal-hold audit records
 //! - `__answer_replay_capsule__::` — deterministic answer replay capsules
 //! - `__passport__::`        — passport metadata (already shouldn't sync)
 //! - `__bootstrap__::`       — first-run setup state
@@ -122,6 +124,24 @@ pub const DEFAULT_PRIVATE_PREFIXES: &[&str] = &[
     "decisions::",
     "github::",
 ];
+
+/// Reserved entity namespaces owned exclusively by daemon governance flows.
+///
+/// Client-facing fact-write handlers must reject these prefixes before they
+/// reach [`crate::fact_store::FactStore`]. The core store deliberately does
+/// not enforce this policy because legal-hold and incident implementations
+/// persist their own state through direct store calls.
+pub const DAEMON_OWNED_ENTITY_PREFIXES: &[&str] = &["__legal_hold__::", "__legal_hold_receipt__::", "__incident__::"];
+
+/// Return the daemon-owned prefix covering `entity`, if any.
+///
+/// This is the canonical client-boundary write guard shared by MCP and HTTP.
+pub fn daemon_owned_entity_prefix(entity: &str) -> Option<&'static str> {
+    DAEMON_OWNED_ENTITY_PREFIXES
+        .iter()
+        .copied()
+        .find(|prefix| entity.starts_with(prefix))
+}
 
 /// Privacy policy resolved at process start. Cheap to clone (it's just two
 /// `BTreeSet<String>` of small string keys).
@@ -237,6 +257,47 @@ mod tests {
         // strictly local, born private (coordination-plane ExecPlan T.1).
         assert!(p.is_always_private("__coord__::proj::deadbeef"));
         assert!(p.is_always_private("__incident__::inc_deadbeef"));
+    }
+
+    #[test]
+    fn daemon_owned_prefixes_are_write_protected_at_client_boundaries() {
+        for prefix in DAEMON_OWNED_ENTITY_PREFIXES {
+            let entity = format!("{prefix}owned");
+            assert_eq!(daemon_owned_entity_prefix(&entity), Some(*prefix));
+            assert!(DEFAULT_PRIVATE_PREFIXES.contains(prefix));
+        }
+        assert_eq!(
+            daemon_owned_entity_prefix("__legal_hold__lookalike::x"),
+            None,
+            "only the exact reserved namespace must match"
+        );
+        assert_eq!(daemon_owned_entity_prefix("project::incident"), None);
+    }
+
+    #[test]
+    fn legal_hold_prefix_constants_match_the_client_write_guard() {
+        assert!(DAEMON_OWNED_ENTITY_PREFIXES.contains(&crate::legal_hold::LEGAL_HOLD_ENTITY_PREFIX));
+        assert!(DAEMON_OWNED_ENTITY_PREFIXES.contains(&crate::legal_hold::LEGAL_HOLD_RECEIPT_ENTITY_PREFIX));
+    }
+
+    #[test]
+    fn daemon_internal_legal_hold_placement_remains_available() {
+        let mut store = crate::FactStore::new();
+        let placed = store
+            .place_legal_hold(crate::legal_hold::PlaceLegalHold {
+                tenant_id: "tenant-a".to_string(),
+                entity_prefixes: vec!["customer::42::".to_string()],
+                reason: "litigation".to_string(),
+                actor: Some("p_operator".to_string()),
+            })
+            .unwrap();
+
+        let entity = format!("{}{}", crate::legal_hold::LEGAL_HOLD_ENTITY_PREFIX, placed.hold.hold_id);
+        assert_eq!(
+            daemon_owned_entity_prefix(&entity),
+            Some(crate::legal_hold::LEGAL_HOLD_ENTITY_PREFIX)
+        );
+        assert!(store.legal_hold(&placed.hold.hold_id).is_some());
     }
 
     #[test]

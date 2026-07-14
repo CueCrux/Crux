@@ -117,6 +117,18 @@ fn prepare_fact_write_checked(
 ) -> Result<corecrux_memory::fact_store::StoreFact, Response> {
     // Never trust a client-supplied tenant stamp; derive it from auth context.
     fact.tenant_hash = tenant_hash_for_write_context(ctx);
+    if let Some(prefix) = crate::fact_privacy::daemon_owned_entity_prefix(&fact.entity) {
+        return Err(ProblemResponse(
+            ProblemDetails::forbidden(format!("entity uses reserved daemon-owned prefix `{prefix}`")).with_extensions(
+                serde_json::json!({
+                    "code": "RESERVED_ENTITY_PREFIX",
+                    "entity": fact.entity,
+                    "reserved_prefix": prefix,
+                }),
+            ),
+        )
+        .into_response());
+    }
     if fact.private {
         return Err(problem_response(
             StatusCode::BAD_REQUEST,
