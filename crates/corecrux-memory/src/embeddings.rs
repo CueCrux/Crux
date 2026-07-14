@@ -248,6 +248,80 @@ impl Embedder for LocalHashEmbedder {
     }
 }
 
+/// Optional real CPU embedding model (buyer-fit M3.4), behind the
+/// `dense-embed-model` feature. Wraps fastembed (ONNX Runtime) with
+/// all-MiniLM-L6-v2, downloaded on first use into the given cache dir. This is
+/// the opt-in "better vectors" path over the always-on [`LocalHashEmbedder`];
+/// the free offline path never requires it, and the default build never
+/// compiles or downloads it.
+#[cfg(feature = "dense-embed-model")]
+pub struct FastEmbedEmbedder {
+    // `TextEmbedding::embed` takes `&mut self`; the `Embedder` trait is `&self`
+    // (it lives behind a shared `Box<dyn Embedder>`), so guard it with a Mutex.
+    inner: Mutex<fastembed::TextEmbedding>,
+    dimensions: usize,
+    model_id: String,
+}
+
+/// Stable model id used in the [`FastEmbedEmbedder`] semantic profile.
+#[cfg(feature = "dense-embed-model")]
+pub const FASTEMBED_MODEL_ID: &str = "fastembed-all-minilm-l6-v2";
+#[cfg(feature = "dense-embed-model")]
+const FASTEMBED_DIMENSIONS: usize = 384;
+
+#[cfg(feature = "dense-embed-model")]
+impl std::fmt::Debug for FastEmbedEmbedder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FastEmbedEmbedder")
+            .field("model", &self.model_id)
+            .field("dimensions", &self.dimensions)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "dense-embed-model")]
+impl FastEmbedEmbedder {
+    /// Initialise the model, downloading it on first use into `cache_dir`.
+    pub fn new(cache_dir: &std::path::Path) -> Result<Self, EmbeddingError> {
+        use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+        let options = InitOptions::new(EmbeddingModel::AllMiniLML6V2)
+            .with_cache_dir(cache_dir.to_path_buf())
+            .with_show_download_progress(false);
+        let inner = TextEmbedding::try_new(options).map_err(|e| EmbeddingError::Model(e.to_string()))?;
+        Ok(Self {
+            inner: Mutex::new(inner),
+            dimensions: FASTEMBED_DIMENSIONS,
+            model_id: FASTEMBED_MODEL_ID.to_string(),
+        })
+    }
+}
+
+#[cfg(feature = "dense-embed-model")]
+impl Embedder for FastEmbedEmbedder {
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let docs: Vec<&str> = texts.to_vec();
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| EmbeddingError::Model(format!("embedder lock poisoned: {e}")))?;
+        inner
+            .embed(docs, None)
+            .map_err(|e| EmbeddingError::Model(e.to_string()))
+    }
+    fn dimensions(&self) -> usize {
+        self.dimensions
+    }
+    fn model(&self) -> &str {
+        &self.model_id
+    }
+    fn semantic_profile(&self) -> SemanticProfile {
+        SemanticProfile::from_parts(&self.model_id, self.dimensions, "bert_wordpiece", "none", "l2")
+    }
+}
+
 #[derive(Serialize)]
 struct OllamaEmbedRequest<'a> {
     model: &'a str,
@@ -388,6 +462,8 @@ pub enum EmbeddingError {
     EmptyResponse,
     #[error("embedding length mismatch: expected {expected}, got {got}")]
     LengthMismatch { expected: usize, got: usize },
+    #[error("embedding model error: {0}")]
+    Model(String),
 }
 
 #[cfg(test)]

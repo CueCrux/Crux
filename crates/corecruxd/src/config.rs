@@ -437,6 +437,11 @@ pub struct Config {
     // `LocalHashEmbedder` so dense recall works with no external service. Set
     // `CORECRUXD_LOCAL_EMBEDDER=0` to keep the fact lane keyword-only.
     pub local_embedder_enabled: bool,
+    // Optional real local embedding model (buyer-fit M3.4). `CORECRUXD_DENSE_MODEL=fastembed`
+    // selects the feature-gated `FastEmbedEmbedder` (requires the daemon built
+    // with `--features dense-embed-model`); unset/other keeps the LocalHashEmbedder.
+    // Only consulted when no external `embedding_url` is set.
+    pub dense_model: Option<String>,
 
     // Background sync: pull/push facts to a remote CoreCrux instance.
     pub sync_enabled: bool,
@@ -1159,6 +1164,7 @@ pub fn load_config() -> Config {
         embedding_url: std::env::var("CORECRUXD_EMBEDDING_URL").ok().filter(|s| !s.is_empty()),
         embedding_model: std::env::var("CORECRUXD_EMBEDDING_MODEL").unwrap_or_else(|_| "nomic-embed-text".to_string()),
         local_embedder_enabled: env_default_on("CORECRUXD_LOCAL_EMBEDDER"),
+        dense_model: std::env::var("CORECRUXD_DENSE_MODEL").ok().filter(|s| !s.is_empty()),
 
         sync_enabled: std::env::var("CORECRUXD_SYNC_ENABLED")
             .ok()

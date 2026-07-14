@@ -826,14 +826,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
         state.fact_store.write().await.set_embedder(Box::new(client));
     } else if config.local_embedder_enabled {
-        use corecrux_memory::embeddings::Embedder as _;
-        let local = corecrux_memory::embeddings::LocalHashEmbedder::default();
-        info!(
-            model = %corecrux_memory::embeddings::LOCAL_HASH_EMBEDDER_MODEL,
-            dimensions = local.dimensions(),
-            "local-embedder-configured (offline dense default)"
-        );
-        state.fact_store.write().await.set_embedder(Box::new(local));
+        // Optional real model (buyer-fit M3.4, feature `dense-embed-model`): when
+        // `CORECRUXD_DENSE_MODEL=fastembed` and the daemon was built with the
+        // feature, use FastEmbedEmbedder; on init failure (e.g. model download)
+        // fall back to the always-on pure-Rust LocalHashEmbedder so the offline
+        // default never breaks.
+        let embedder: Box<dyn corecrux_memory::embeddings::Embedder> = {
+            #[cfg(feature = "dense-embed-model")]
+            {
+                if config.dense_model.as_deref() == Some("fastembed") {
+                    match corecrux_memory::embeddings::FastEmbedEmbedder::new(&config.data_dir) {
+                        Ok(model) => {
+                            info!(
+                                model = corecrux_memory::embeddings::FASTEMBED_MODEL_ID,
+                                "fastembed-embedder-configured"
+                            );
+                            Box::new(model)
+                        }
+                        Err(err) => {
+                            tracing::warn!(?err, "fastembed-init-failed; falling back to local hash embedder");
+                            Box::new(corecrux_memory::embeddings::LocalHashEmbedder::default())
+                        }
+                    }
+                } else {
+                    Box::new(corecrux_memory::embeddings::LocalHashEmbedder::default())
+                }
+            }
+            #[cfg(not(feature = "dense-embed-model"))]
+            {
+                if config.dense_model.as_deref() == Some("fastembed") {
+                    tracing::warn!("CORECRUXD_DENSE_MODEL=fastembed but daemon built without the dense-embed-model feature; using local hash embedder");
+                }
+                Box::new(corecrux_memory::embeddings::LocalHashEmbedder::default())
+            }
+        };
+        info!(model = %embedder.model(), dimensions = embedder.dimensions(), "dense-embedder-configured (offline default)");
+        state.fact_store.write().await.set_embedder(embedder);
     }
 
     // Bootstrap: always seed agent-facing documentation on startup (idempotent).
