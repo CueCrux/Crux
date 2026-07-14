@@ -32,9 +32,8 @@
 //!   (same entity+key → higher version wins); expiry is read-time via
 //!   `expires_at_unix_ms`, so no sweeper is needed.
 //!
-//! Gated by `CORECRUXD_COORD` — **launch default ON** (proven live on host
-//! crux); `CORECRUXD_COORD=0` disables it.
-//! ([`crate::config::Config::coord_enabled`]).
+//! Gated by `CORECRUXD_COORD` (default ON); explicit `CORECRUXD_COORD=0`
+//! disables it ([`crate::config::Config::coord_enabled`]).
 
 use corecrux_memory::fact_store::{FactQuery, FactStore, StoreFact};
 use serde::{Deserialize, Serialize};

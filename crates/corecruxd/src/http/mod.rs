@@ -203,11 +203,16 @@ pub struct AppState {
     pub witness_proofs: Arc<RwLock<crate::witness_proofs::WitnessProofStore>>,
     pub mcp_enabled: bool,
     pub console_enabled: bool,
-    /// Multi-agent coordination plane (`/v1/coord/*`). Default OFF
-    /// (`CORECRUXD_COORD=1`); when off, coord routes return 404.
+    /// Multi-agent coordination plane (`/v1/coord/*`). Default ON; explicit
+    /// `CORECRUXD_COORD=0` disables it and makes coord routes return 404.
     pub coord_enabled: bool,
     /// Liveness horizon for the coord active view, in seconds.
     pub coord_presence_ttl_secs: u64,
+    /// Periodic consolidation review scheduler (`consolidation_scheduler`).
+    /// Detect-and-surface only — never auto-resolves. Default OFF
+    /// (`CORECRUXD_CONSOLIDATION_SCHEDULER=1`). Carried here so `/v1/version`
+    /// can report its enabled state without re-parsing the environment.
+    pub consolidation_scheduler_enabled: bool,
     /// Provider-agnostic injection-bundle surface (`/v1/context`). Default
     /// OFF (`CORECRUXD_CONTEXT_SURFACE=1`); when off, routes return 404.
     pub context_surface_enabled: bool,
