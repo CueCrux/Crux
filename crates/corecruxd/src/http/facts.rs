@@ -91,6 +91,10 @@ fn tenant_hash_for_write_context(_ctx: &crate::auth::HttpScopeContext) -> String
     corecrux_memory::fact_store::default_tenant_hash()
 }
 
+pub(super) fn tenant_hash_for_read_context(_ctx: &crate::auth::HttpScopeContext) -> String {
+    corecrux_memory::fact_store::default_tenant_hash()
+}
+
 fn render_fact_for_http(
     fact: &corecrux_memory::fact_store::Fact,
     ctx: &crate::auth::HttpScopeContext,
@@ -196,8 +200,9 @@ pub(super) fn query_visible_http_facts_as_of(
     }
 
     let agent_name = ctx.passport_id.as_deref();
+    let tenant_hash = tenant_hash_for_read_context(ctx);
     let mut results: Vec<&corecrux_memory::fact_store::Fact> = store
-        .all_facts()
+        .all_facts_for_tenant(&tenant_hash)
         .filter(|fact| !fact.deleted)
         .filter(|fact| as_of.is_none_or(|instant| fact.valid_at(instant)))
         .filter(|fact| crux_mcp::scope::fact_visible_to_agent(fact, agent_name))
@@ -360,7 +365,13 @@ pub(super) async fn get_fact(
         Err(response) => return response,
     };
     let store = state.fact_store.read().await;
-    match store.get(&fact_id).and_then(|fact| render_fact_for_http(fact, &ctx)) {
+    let tenant_hash = tenant_hash_for_read_context(&ctx);
+    let fact = if raw_admin_read(&ctx) {
+        store.get(&fact_id)
+    } else {
+        store.get_for_tenant(&fact_id, &tenant_hash)
+    };
+    match fact.and_then(|fact| render_fact_for_http(fact, &ctx)) {
         Some(fact) => (StatusCode::OK, axum::Json(serde_json::json!(fact))).into_response(),
         None => problem_response(StatusCode::NOT_FOUND, format!("fact '{}' not found", fact_id)),
     }
@@ -388,9 +399,13 @@ pub(super) async fn delete_fact(
         Err(response) => return response,
     };
     let mut store = state.fact_store.write().await;
-    let visible = store
-        .get(&fact_id)
-        .is_some_and(|fact| fact_visible_for_http_write(fact, &ctx));
+    let tenant_hash = tenant_hash_for_read_context(&ctx);
+    let fact = if raw_admin_write(&ctx) {
+        store.get(&fact_id)
+    } else {
+        store.get_for_tenant(&fact_id, &tenant_hash)
+    };
+    let visible = fact.is_some_and(|fact| fact_visible_for_http_write(fact, &ctx));
     let deleted = if visible {
         match store.try_delete(&fact_id) {
             Ok(deleted) => deleted,
@@ -427,11 +442,12 @@ pub(super) async fn get_facts_by_entity(
         Err(response) => return response,
     };
     let store = state.fact_store.read().await;
+    let tenant_hash = tenant_hash_for_read_context(&ctx);
     let facts: Vec<_> = if raw_admin_read(&ctx) {
         store.get_by_entity(&entity).into_iter().cloned().collect()
     } else {
         store
-            .all_facts()
+            .all_facts_for_tenant(&tenant_hash)
             .filter(|fact| !fact.deleted)
             .filter(|fact| crux_mcp::scope::entity_matches_for_agent(fact, &entity, ctx.passport_id.as_deref()))
             .filter_map(|fact| render_fact_for_http(fact, &ctx))

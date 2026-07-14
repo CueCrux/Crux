@@ -109,15 +109,13 @@ pub(super) async fn post_result_envelope_import(
     if envelope.job_id.trim().is_empty() || envelope.job_id.len() > 128 {
         return problem_response(StatusCode::BAD_REQUEST, "job_id must be non-empty and <= 128 chars");
     }
-    {
-        let ctx = match crate::auth::http_scope_context(&state.auth, &headers) {
-            Ok(ctx) => ctx,
-            Err(err) => return err.into_response(),
-        };
-        if !ctx.has_scope("admin:write") {
-            if let Err(err) = require_http_scopes_for_tenant(&state.auth, &headers, &["facts:write"], &tenant_id) {
-                return err.into_response();
-            }
+    let ctx = match crate::auth::http_scope_context(&state.auth, &headers) {
+        Ok(ctx) => ctx,
+        Err(err) => return err.into_response(),
+    };
+    if !ctx.has_scope("admin:write") {
+        if let Err(err) = require_http_scopes_for_tenant(&state.auth, &headers, &["facts:write"], &tenant_id) {
+            return err.into_response();
         }
     }
 
@@ -177,9 +175,10 @@ pub(super) async fn post_result_envelope_import(
 
     // ---- Idempotency: prior receipt for this job_id with matching hash ------
     let receipt_entity = import_receipt_entity(&tenant_id);
+    let tenant_hash = super::facts::tenant_hash_for_read_context(&ctx);
     {
         let store = state.fact_store.read().await;
-        for fact in store.get_by_entity(&receipt_entity) {
+        for fact in store.get_by_entity_for_tenant(&receipt_entity, &tenant_hash) {
             if fact.key != envelope.job_id {
                 continue;
             }

@@ -653,6 +653,15 @@
     <button class="cdb-recheck" id="cdbRecheck" type="button">Re-check</button>
   </div>
 
+  <div id="cruxAuthBanner" class="crux-degraded-banner" role="alert" hidden>
+    <span class="cdb-icon" aria-hidden="true">🔑</span>
+    <div class="cdb-body">
+      <strong>Live data needs a console token</strong>
+      <div class="cdb-hint">This daemon requires authentication — panels are showing sample (demo) data until you set a console bearer token.</div>
+    </div>
+    <button class="cdb-recheck" id="cxAuthSetToken" type="button">Set token</button>
+  </div>
+
   <div class="toolbar">
     <div class="crumbs" id="breadcrumb"></div>
     <button class="focus-exit" id="focusExit" style="display:none">← back</button>
@@ -1299,6 +1308,7 @@ const workStages={planned:true, in_progress:true, blocked:true, done:true};   //
    Panels lazy-load from /v1/* on first expand; render()/childrenOf/focus/search/loop-guard
    stay UNCHANGED because children are merged into N before childrenOf runs. */
 let LIVE = false;                 // true after a successful /readyz probe
+let AUTH_REQUIRED = false;        // true once a /v1/* fetch was rejected 401/403 — daemon needs a console token (cleared by reload after setConsoleToken)
 let DEGRADED = false;             // true when a live daemon reports a problem (/healthz)
 let DEGRADED_REASONS = [];        // human-readable reasons the daemon is degraded
 const loadState = {};             // node id -> 'loading'|'done'|'error'|'unavailable'
@@ -1320,7 +1330,8 @@ function apiHeaders(){
 async function api(path){
   const r=await fetch(path,{headers:apiHeaders()});
   const text=await r.text(); let data; try{ data=JSON.parse(text); }catch{ data={text}; }
-  if(!r.ok) throw {status:r.status, data}; return data;
+  if(!r.ok){ if((r.status===401||r.status===403)&&!AUTH_REQUIRED){ AUTH_REQUIRED=true; try{ updateLiveBadge(); updateAuthBanner(); }catch{} } throw {status:r.status, data}; }
+  return data;
 }
 async function postApi(path, body){
   const h=apiHeaders(); h['Content-Type']='application/json';
@@ -1391,15 +1402,29 @@ function prefetchScope(id){ const sc=SCOPES.find(s=>s.id===id); if(!sc) return; 
 function updateLiveBadge(){
   const b=document.getElementById('liveBadge');
   if(b){
-    if(LIVE && DEGRADED){
-      b.textContent='degraded'; b.classList.remove('on'); b.classList.add('degraded');
+    if(LIVE && AUTH_REQUIRED){
+      b.textContent='auth'; b.classList.remove('on'); b.classList.add('degraded'); b.style.cursor='pointer';
+      b.title='Daemon requires a console token — showing demo data. Click to set a token.';
+    } else if(LIVE && DEGRADED){
+      b.textContent='degraded'; b.classList.remove('on'); b.classList.add('degraded'); b.style.cursor='';
       b.title=DEGRADED_REASONS.length? ('Daemon degraded — '+DEGRADED_REASONS.join('; ')) : 'Daemon reports a degraded state';
     } else {
-      b.textContent=LIVE?'live':'demo'; b.classList.toggle('on', LIVE); b.classList.remove('degraded');
+      b.textContent=LIVE?'live':'demo'; b.classList.toggle('on', LIVE); b.classList.remove('degraded'); b.style.cursor='';
       b.title='live = connected to the daemon · demo = sample data';
     }
   }
-  announce(LIVE? (DEGRADED?'Connected — daemon DEGRADED':'Connected — live data') : 'Demo data');
+  announce(LIVE? (AUTH_REQUIRED?'Connected — needs a console token (demo data shown)':(DEGRADED?'Connected — daemon DEGRADED':'Connected — live data')) : 'Demo data');
+}
+// Shown when the daemon is reachable (/readyz ok) but /v1/* fetches are unauthorized:
+// make the auth requirement explicit instead of silently degrading to demo data.
+function updateAuthBanner(){
+  const el=document.getElementById('cruxAuthBanner');
+  if(el) el.hidden=!(LIVE && AUTH_REQUIRED);
+}
+function promptSetToken(){
+  let t=null;
+  try{ t=window.prompt('Paste a daemon JWT (console bearer token) to load live data:', currentConsoleToken()||''); }catch{}
+  if(t!==null){ setConsoleToken(t); location.reload(); }
 }
 
 // Poll the daemon's unauthenticated /healthz and fold ok + engaged valves into
@@ -1933,6 +1958,8 @@ async function bootProbe(){
   if(LIVE){ prefetchScope(activeScope); startEventStream(); }
   // Degraded-health: probe now, re-check on a 15s cadence, and on demand.
   const rc=document.getElementById('cdbRecheck'); if(rc) rc.addEventListener('click', cruxHealthPoll);
+  const at=document.getElementById('cxAuthSetToken'); if(at) at.addEventListener('click', promptSetToken);
+  const lb=document.getElementById('liveBadge'); if(lb) lb.addEventListener('click', ()=>{ if(AUTH_REQUIRED) promptSetToken(); });
   cruxHealthPoll();
   if(typeof setInterval==='function'){ setInterval(cruxHealthPoll, 15000); }
   initFooter();

@@ -34,7 +34,12 @@ pub(super) async fn get_answer_replay(
     if let Some(response) = require_answer_replay(&state, &headers, &q.tenant_id) {
         return response;
     }
-    let Some(capsule) = load_answer_capsule(&state, &q.tenant_id, &answer_id).await else {
+    let ctx = match http_scope_context(&state.auth, &headers) {
+        Ok(ctx) => ctx,
+        Err(problem) => return problem.into_response(),
+    };
+    let tenant_hash = super::facts::tenant_hash_for_read_context(&ctx);
+    let Some(capsule) = load_answer_capsule(&state, &q.tenant_id, &answer_id, &tenant_hash).await else {
         return problem_response(StatusCode::NOT_FOUND, "answer replay capsule not found");
     };
 
@@ -63,14 +68,19 @@ pub(super) async fn get_answer_replay_validity(
     if let Some(response) = require_answer_replay(&state, &headers, &q.tenant_id) {
         return response;
     }
-    let Some(capsule) = load_answer_capsule(&state, &q.tenant_id, &answer_id).await else {
+    let ctx = match http_scope_context(&state.auth, &headers) {
+        Ok(ctx) => ctx,
+        Err(problem) => return problem.into_response(),
+    };
+    let tenant_hash = super::facts::tenant_hash_for_read_context(&ctx);
+    let Some(capsule) = load_answer_capsule(&state, &q.tenant_id, &answer_id, &tenant_hash).await else {
         return problem_response(StatusCode::NOT_FOUND, "answer replay capsule not found");
     };
 
     let (evidence_status, semantic_profile_status) = {
         let store = state.fact_store.read().await;
         (
-            evidence_validity(&store, &capsule),
+            evidence_validity(&store, &capsule, &tenant_hash),
             semantic_profile_validity(&store, &capsule),
         )
     };
@@ -154,25 +164,32 @@ pub(super) async fn load_answer_capsule(
     state: &AppState,
     tenant_id: &str,
     answer_id: &str,
+    tenant_hash: &str,
 ) -> Option<AnswerReplayCapsule> {
     let store = state.fact_store.read().await;
-    load_answer_capsule_from_store(&store, tenant_id, answer_id)
+    load_answer_capsule_from_store(&store, tenant_id, answer_id, tenant_hash)
 }
 
 pub(super) async fn export_answer_capsule_if_present(
     state: &AppState,
     tenant_id: &str,
     answer_id: &str,
+    tenant_hash: &str,
     opts: ReceiptExportOptionsV1,
 ) -> Option<Response> {
-    let capsule = load_answer_capsule(state, tenant_id, answer_id).await?;
+    let capsule = load_answer_capsule(state, tenant_id, answer_id, tenant_hash).await?;
     Some(export_answer_capsule(state, &capsule, opts))
 }
 
-fn load_answer_capsule_from_store(store: &FactStore, tenant_id: &str, answer_id: &str) -> Option<AnswerReplayCapsule> {
+fn load_answer_capsule_from_store(
+    store: &FactStore,
+    tenant_id: &str,
+    answer_id: &str,
+    tenant_hash: &str,
+) -> Option<AnswerReplayCapsule> {
     let entity = answer_capsule_entity(tenant_id, answer_id);
     store
-        .get_by_entity(&entity)
+        .get_by_entity_for_tenant(&entity, tenant_hash)
         .into_iter()
         .filter(|fact| fact.key == "capsule")
         .max_by_key(|fact| fact.version)
@@ -214,16 +231,16 @@ fn require_answer_replay(state: &AppState, headers: &HeaderMap, tenant_id: &str)
     None
 }
 
-fn evidence_validity(store: &FactStore, capsule: &AnswerReplayCapsule) -> Vec<Value> {
+fn evidence_validity(store: &FactStore, capsule: &AnswerReplayCapsule, tenant_hash: &str) -> Vec<Value> {
     capsule
         .evidence
         .iter()
-        .map(|evidence| evidence_ref_validity(store, evidence))
+        .map(|evidence| evidence_ref_validity(store, evidence, tenant_hash))
         .collect()
 }
 
-fn evidence_ref_validity(store: &FactStore, evidence: &ReplayEvidenceRef) -> Value {
-    let Some(fact) = store.get(&evidence.record_id) else {
+fn evidence_ref_validity(store: &FactStore, evidence: &ReplayEvidenceRef, tenant_hash: &str) -> Value {
+    let Some(fact) = store.get_for_tenant(&evidence.record_id, tenant_hash) else {
         return json!({
             "record_id": evidence.record_id,
             "artifact_id": evidence.artifact_id,
@@ -234,7 +251,7 @@ fn evidence_ref_validity(store: &FactStore, evidence: &ReplayEvidenceRef) -> Val
         });
     };
     let current_text_hash = hash_text(&fact.value);
-    let latest = latest_fact_for_entity_key(store, fact);
+    let latest = latest_fact_for_entity_key(store, fact, tenant_hash);
     let latest_id = latest.map(|fact| fact.fact_id.clone());
     let captured_hash = evidence.text_hash.as_ref().or(evidence.content_hash.as_ref());
     let hash_matches = captured_hash.is_some_and(|hash| hash == &current_text_hash)
@@ -266,21 +283,21 @@ fn evidence_ref_validity(store: &FactStore, evidence: &ReplayEvidenceRef) -> Val
         "current_text_hash": current_text_hash,
         "source_label": evidence.source_label,
         "receipt_id": evidence.receipt_id,
-        "supersession_chain": supersession_chain_for_entity_key(store, fact),
+        "supersession_chain": supersession_chain_for_entity_key(store, fact, tenant_hash),
     })
 }
 
-fn latest_fact_for_entity_key<'a>(store: &'a FactStore, fact: &Fact) -> Option<&'a Fact> {
+fn latest_fact_for_entity_key<'a>(store: &'a FactStore, fact: &Fact, tenant_hash: &str) -> Option<&'a Fact> {
     store
-        .get_by_entity(&fact.entity)
+        .get_by_entity_for_tenant(&fact.entity, tenant_hash)
         .into_iter()
         .filter(|candidate| candidate.key == fact.key)
         .max_by_key(|candidate| candidate.version)
 }
 
-fn supersession_chain_for_entity_key(store: &FactStore, fact: &Fact) -> Vec<Value> {
+fn supersession_chain_for_entity_key(store: &FactStore, fact: &Fact, tenant_hash: &str) -> Vec<Value> {
     let mut chain = store
-        .get_by_entity(&fact.entity)
+        .get_by_entity_for_tenant(&fact.entity, tenant_hash)
         .into_iter()
         .filter(|candidate| candidate.key == fact.key)
         .collect::<Vec<_>>();
@@ -1105,7 +1122,7 @@ mod tests {
             created_at: "2026-05-07T00:00:00Z".to_string(),
         });
 
-        let status = evidence_validity(&store, &capsule);
+        let status = evidence_validity(&store, &capsule, "default");
         assert_eq!(status[0]["status"], "superseded");
     }
 }

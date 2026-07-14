@@ -309,6 +309,11 @@ pub(super) async fn get_answer_export_v1(
     {
         return problem.into_response();
     }
+    let ctx = match http_scope_context(&state.auth, &headers) {
+        Ok(ctx) => ctx,
+        Err(problem) => return problem.into_response(),
+    };
+    let tenant_hash = super::facts::tenant_hash_for_read_context(&ctx);
 
     let opts = match parse_receipt_export_options_v1(q.include.as_deref(), q.redaction.as_deref(), q.format.as_deref())
     {
@@ -316,7 +321,8 @@ pub(super) async fn get_answer_export_v1(
         Err(msg) => return problem_response(StatusCode::BAD_REQUEST, msg),
     };
     if let Some(response) =
-        super::replay::export_answer_capsule_if_present(&state, &q.tenant_id, &answer_id, opts.clone()).await
+        super::replay::export_answer_capsule_if_present(&state, &q.tenant_id, &answer_id, &tenant_hash, opts.clone())
+            .await
     {
         return response;
     }

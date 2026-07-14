@@ -501,11 +501,16 @@ pub(super) async fn get_audit_triage(
     {
         return response;
     }
+    let ctx = match http_scope_context(&state.auth, &headers) {
+        Ok(ctx) => ctx,
+        Err(problem) => return problem.into_response(),
+    };
+    let tenant_hash = super::facts::tenant_hash_for_read_context(&ctx);
     let sync_status = super::health::sync_runtime_status();
     let scan = crate::workspace_scan::load_latest(&state.fact_store).await;
     let queues = {
         let store = state.fact_store.read().await;
-        audit_queues(&store, &tenant_id, &sync_status, scan.as_ref())
+        audit_queues(&store, &tenant_id, &tenant_hash, &sync_status, scan.as_ref())
     };
     Json(json!({
         "schema": "crux.agent_workbench.audit_triage.v1",
@@ -1244,6 +1249,7 @@ fn normalize_path(path: &str) -> String {
 fn audit_queues(
     store: &FactStore,
     tenant_id: &str,
+    tenant_hash: &str,
     sync_status: &corecrux_memory::sync::SyncRuntimeStatus,
     scan: Option<&crate::workspace_scan::WorkspaceScan>,
 ) -> Vec<Value> {
@@ -1262,7 +1268,7 @@ fn audit_queues(
     let unresolved_routes = scan
         .map(|scan| scan.diagnostics.unresolved_routes.len())
         .unwrap_or_default();
-    let replay_failures = replay_failure_items(store, tenant_id, 50);
+    let replay_failures = replay_failure_items(store, tenant_id, tenant_hash, 50);
     let replay_failure_severity = replay_failure_severity(&replay_failures);
     vec![
         json!({
@@ -1363,20 +1369,20 @@ fn living_status_drift_category(status: corecrux_projections::LivingStatusV1) ->
     }
 }
 
-fn replay_failure_items(store: &FactStore, tenant_id: &str, limit: usize) -> Vec<Value> {
+fn replay_failure_items(store: &FactStore, tenant_id: &str, tenant_hash: &str, limit: usize) -> Vec<Value> {
     let prefix = format!("{ANSWER_REPLAY_CAPSULE_ENTITY_PREFIX}::{tenant_id}::");
     query_facts(store, None, Some(&prefix), limit)
         .into_iter()
         .filter_map(|fact| serde_json::from_str::<AnswerReplayCapsule>(&fact.value).ok())
-        .filter_map(|capsule| replay_failure_item(store, capsule))
+        .filter_map(|capsule| replay_failure_item(store, capsule, tenant_hash))
         .take(limit)
         .collect()
 }
 
-fn replay_failure_item(store: &FactStore, capsule: AnswerReplayCapsule) -> Option<Value> {
+fn replay_failure_item(store: &FactStore, capsule: AnswerReplayCapsule, tenant_hash: &str) -> Option<Value> {
     let mut categories = BTreeSet::new();
     for evidence in &capsule.evidence {
-        if let Some(category) = replay_evidence_drift_category(store, evidence) {
+        if let Some(category) = replay_evidence_drift_category(store, evidence, tenant_hash) {
             categories.insert(category);
         }
     }
@@ -1403,11 +1409,12 @@ fn replay_failure_item(store: &FactStore, capsule: AnswerReplayCapsule) -> Optio
 fn replay_evidence_drift_category(
     store: &FactStore,
     evidence: &corecrux_memory::replay::ReplayEvidenceRef,
+    tenant_hash: &str,
 ) -> Option<String> {
-    let Some(fact) = store.get(&evidence.record_id) else {
+    let Some(fact) = store.get_for_tenant(&evidence.record_id, tenant_hash) else {
         return Some("fact_missing".to_string());
     };
-    let latest_id = latest_fact_for_entity_key(store, fact).map(|latest| latest.fact_id.as_str());
+    let latest_id = latest_fact_for_entity_key(store, fact, tenant_hash).map(|latest| latest.fact_id.as_str());
     if latest_id.is_some_and(|id| id != evidence.record_id) {
         return Some("fact_superseded".to_string());
     }
@@ -1422,9 +1429,9 @@ fn replay_evidence_drift_category(
     }
 }
 
-fn latest_fact_for_entity_key<'a>(store: &'a FactStore, fact: &Fact) -> Option<&'a Fact> {
+fn latest_fact_for_entity_key<'a>(store: &'a FactStore, fact: &Fact, tenant_hash: &str) -> Option<&'a Fact> {
     store
-        .get_by_entity(&fact.entity)
+        .get_by_entity_for_tenant(&fact.entity, tenant_hash)
         .into_iter()
         .filter(|candidate| candidate.key == fact.key)
         .max_by_key(|candidate| candidate.version)

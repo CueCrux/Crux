@@ -229,6 +229,7 @@ fn selector_match(haystack: &str, selectors: &[String]) -> bool {
 
 fn reasoning_events(
     store: &corecrux_memory::FactStore,
+    tenant_hash: &str,
     tenant_id: &str,
     window: &IncidentWindow,
     session_ids: &[String],
@@ -240,7 +241,7 @@ fn reasoning_events(
         .filter_map(|event| event.get("fact_id").and_then(Value::as_str))
         .collect();
     store
-        .all_facts()
+        .all_facts_for_tenant(tenant_hash)
         .filter(|fact| fact_ids.contains(fact.fact_id.as_str()) && !fact.deleted && window.contains(fact.stored_at))
         .filter_map(|fact| {
             let haystack = format!("{}\n{}\n{}", fact.entity, fact.key, fact.value);
@@ -537,18 +538,24 @@ async fn incident_cost_totals(tenant_id: &str, session_ids: &[String], window: &
     totals
 }
 
-async fn assemble_case(state: &AppState, body: CreateIncidentBody, created_by: String) -> Result<IncidentCase, String> {
+async fn assemble_case(
+    state: &AppState,
+    body: CreateIncidentBody,
+    created_by: String,
+    tenant_hash: &str,
+) -> Result<IncidentCase, String> {
     validate_create(&body)?;
     let (mut events, coord_facts, bindings) = {
         let store = state.fact_store.read().await;
         let reasoning = reasoning_events(
             &store,
+            tenant_hash,
             &body.tenant_id,
             &body.window,
             &body.session_ids,
             &body.agent_ids,
         );
-        let facts = store.all_facts().cloned().collect::<Vec<_>>();
+        let facts = store.all_facts_for_tenant(tenant_hash).cloned().collect::<Vec<_>>();
         let bindings = crate::session_bindings::list_bindings(&store)
             .into_iter()
             .map(|binding| (binding.session_id_hex.clone(), binding))
@@ -857,11 +864,13 @@ pub(super) async fn post_incident(
     {
         return problem.into_response();
     }
-    let created_by = http_scope_context(&state.auth, &headers)
-        .ok()
-        .and_then(|context| context.passport_id)
-        .unwrap_or_else(|| state.passport_fpr.clone());
-    let case = match assemble_case(&state, body, created_by.clone()).await {
+    let ctx = match http_scope_context(&state.auth, &headers) {
+        Ok(ctx) => ctx,
+        Err(problem) => return problem.into_response(),
+    };
+    let tenant_hash = super::facts::tenant_hash_for_read_context(&ctx);
+    let created_by = ctx.passport_id.unwrap_or_else(|| state.passport_fpr.clone());
+    let case = match assemble_case(&state, body, created_by.clone(), &tenant_hash).await {
         Ok(case) => case,
         Err(error) => return problem_response(StatusCode::INTERNAL_SERVER_ERROR, error),
     };
@@ -1111,7 +1120,7 @@ mod tests {
             entities: Vec::new(),
             notes: Some("fixture".to_string()),
         };
-        let case = assemble_case(&state, body, "p_seed".to_string())
+        let case = assemble_case(&state, body, "p_seed".to_string(), "tenant-a")
             .await
             .expect("assemble case");
         assert!(case
