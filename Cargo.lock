@@ -1438,7 +1438,11 @@ version = "0.5.41"
 dependencies = [
  "blake3",
  "chrono",
+ "crux-session",
+ "ed25519-dalek",
+ "hex",
  "mockito",
+ "rcx-capability-token",
  "serde",
  "serde_json",
  "tempfile",
