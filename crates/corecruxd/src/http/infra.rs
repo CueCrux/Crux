@@ -27,10 +27,11 @@ const SESSIONS_ENTITY: &str = "__infra__::sessions";
 fn latest_by_key<F: Fn(&str, &corecrux_memory::fact_store::Fact, &serde_json::Value) -> serde_json::Value>(
     store: &corecrux_memory::FactStore,
     entity: &str,
+    tenant_hash: &str,
     f: F,
 ) -> Vec<serde_json::Value> {
     let mut latest: BTreeMap<String, &corecrux_memory::fact_store::Fact> = BTreeMap::new();
-    for fact in store.get_by_entity(entity) {
+    for fact in store.get_by_entity_for_tenant(entity, tenant_hash) {
         if fact.deleted {
             continue;
         }
@@ -56,6 +57,11 @@ pub(super) async fn get_infra_summary(State(state): State<AppState>, headers: He
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
     }
+    let ctx = match crate::auth::http_scope_context(&state.auth, &headers) {
+        Ok(ctx) => ctx,
+        Err(problem) => return problem.into_response(),
+    };
+    let tenant_hash = super::facts::tenant_hash_for_read_context(&ctx);
 
     let rails = serde_json::json!({
         "tailscale": env_flag_enabled("CORECRUXD_TS_IDENTITY_ENABLED"),
@@ -70,9 +76,10 @@ pub(super) async fn get_infra_summary(State(state): State<AppState>, headers: He
         let machines = latest_by_key(
             &store,
             MACHINES_ENTITY,
+            &tenant_hash,
             |key, fact, record| serde_json::json!({ "id": key, "record": record, "updated_at": fact.stored_at }),
         );
-        let configs = latest_by_key(&store, CONFIGS_ENTITY, |key, fact, b| {
+        let configs = latest_by_key(&store, CONFIGS_ENTITY, &tenant_hash, |key, fact, b| {
             serde_json::json!({
                 "name": key,
                 "source_host": b.get("source_host"),
@@ -80,7 +87,7 @@ pub(super) async fn get_infra_summary(State(state): State<AppState>, headers: He
                 "updated_at": fact.stored_at,
             })
         });
-        let sessions = latest_by_key(&store, SESSIONS_ENTITY, |key, fact, snap| {
+        let sessions = latest_by_key(&store, SESSIONS_ENTITY, &tenant_hash, |key, fact, snap| {
             serde_json::json!({
                 "id": key,
                 "source_host": snap.get("source_host"),
