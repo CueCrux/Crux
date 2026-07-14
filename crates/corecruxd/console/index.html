@@ -3543,6 +3543,7 @@ const PAGES={
   {h:'New passport',sub:'mint a passport and attach who owns it (POST /v1/passports)',wide:true,controls:[
    {t:'input',k:'pp_id',label:'id',ph:'lowercase, digits, - or _',mono:true},
    {t:'select',k:'pp_category',label:'category',options:[{v:'work',label:'work'},{v:'personal',label:'personal'},{v:'public',label:'public'}],v:'work'},
+   {t:'select',k:'pp_gate',label:'work-gate',options:[{v:'no',label:'no · ungated'},{v:'yes',label:'yes · state moves need approval'}],v:'no'},
    {t:'input',k:'pp_name',label:'name',ph:'display name'},
    {t:'input',k:'pp_owner',label:'owner',ph:'who owns / manages this passport'},
    {t:'input',k:'pp_position',label:'position',ph:'role / title'},
@@ -4534,10 +4535,11 @@ const PAGE_WIRES={
     const r=await api('/v1/passports'); const ps=r.passports||[];
     const head=def.sections[1].controls.filter(c=>c.t==='search'||(c.t==='btn'&&c.action==='graph'));
     const rows=ps.map(p=>({t:'exp',label:(p.name?(p.name+' · '+p.id):p.id),
-      sub:[p.position,p.company,p.category,p.reputation_tier].filter(Boolean).join(' · '),
-      controls:[['id',p.id],['name',p.name],['owner',p.owner],['position',p.position],['company',p.company],['category',p.category],['tier',p.reputation_tier],['receipts',p.receipt_count]]
+      sub:[p.position,p.company,p.category,p.reputation_tier,(p.agent_work_gate?'gated':null)].filter(Boolean).join(' · '),
+      controls:[['id',p.id],['name',p.name],['owner',p.owner],['position',p.position],['company',p.company],['category',p.category],['work-gate',p.agent_work_gate?'yes · state moves need approval':'no'],['tier',p.reputation_tier],['receipts',p.receipt_count]]
         .filter(([,v])=>v!=null&&v!=='').map(([k,v])=>infoRow(k,String(v)))
-        .concat(p.notes?[infoRow('notes',String(p.notes))]:[])}));
+        .concat(p.notes?[infoRow('notes',String(p.notes))]:[])
+        .concat([{t:'btn',label:(p.agent_work_gate?'Ungate ':'Gate ')+p.id,hint:(p.agent_work_gate?'stop gating — state moves auto-apply':'gate — state moves need operator approval')+' · PATCH /v1/passports/'+p.id}])}));
     def.sections[1].sub=ps.length+' passport'+(ps.length===1?'':'s');
     def.sections[1].controls=head.filter(c=>c.t==='search')
       .concat(rows.length?rows:[infoRow('none','no passports yet')])
@@ -4549,10 +4551,17 @@ const PAGE_WIRES={
     const category=(pageVal('cx-passport','pp_category')||'work').trim();
     const meta=k=>{ const v=(pageVal('cx-passport','pp_'+k)||'').trim(); return v||null; };
     const r=await postApi('/v1/passports',{ id, category,
+      agent_work_gate: (pageVal('cx-passport','pp_gate')||'no')==='yes',
       name:meta('name'), owner:meta('owner'), position:meta('position'), company:meta('company'), notes:meta('notes') });
     await PAGE_WIRES['cx-passport'].load(PAGES['cx-passport']);
     ctx.reopen(); return 'created passport '+((r&&r.id)||id);
-  } }},
+  } },
+  actAny:(label,ctx)=>{
+    const m=label.match(/^(Gate|Ungate) (.+)$/); if(!m) return null;
+    const want=(m[1]==='Gate');
+    return patchApi('/v1/passports/'+encodeURIComponent(m[2]),{agent_work_gate:want})
+      .then(w=>{ ctx.reload(); return (want?'gated ':'ungated ')+m[2]+' · state moves now '+(want?'need operator approval':'auto-apply'); });
+  }},
  'cx-review':{
   load: async def=>{
     const r=await api('/v1/console/review/contradictions?limit=50');
