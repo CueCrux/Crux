@@ -44,7 +44,7 @@ pub(super) struct LocalIngestBody {
     /// Optional declared [`SemanticProfile`] for caller-supplied `dense_vector`s
     /// (buyer-fit M3.3). When present and the node has a dense embedder whose
     /// fingerprint differs, the ingest is refused (422) rather than storing an
-    /// unqueryable, silently-mis-scored vector space. Ignored for server-embedded
+    /// unqueryable, silently mismatched vector space. Ignored for server-embedded
     /// or BM25-only ingests.
     #[serde(default)]
     pub(super) semantic_profile: Option<SemanticProfile>,

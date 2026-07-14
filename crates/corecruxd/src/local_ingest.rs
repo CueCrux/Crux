@@ -223,7 +223,7 @@ pub fn seal_prose_documents(
     // M3.3: also persist the `.ccxp` profile sidecar (the SemanticProfile that
     // produced these vectors) so the query path can refuse to score a segment
     // whose embedding fingerprint differs from the query embedder's, rather than
-    // silently mis-scoring across incompatible vector spaces.
+    // silently scoring across incompatible vector spaces.
     let mut dense_written = 0usize;
     if seal.sealed && !dense_entries.is_empty() {
         if let (Some(receipt), Some(dim)) = (seal.seal_receipt.as_ref(), dense_dim) {
@@ -301,7 +301,7 @@ fn write_ccxp(path: &Path, profile: &corecrux_memory::embeddings::SemanticProfil
     Ok(())
 }
 
-/// Read a `.ccxp` profile sidecar. Returns `None` when absent or unparyable
+/// Read a `.ccxp` profile sidecar. Returns `None` when absent or unparsable
 /// (treated as an unknown/legacy profile rather than fatal).
 fn read_ccxp(path: &Path) -> Option<corecrux_memory::embeddings::SemanticProfile> {
     let bytes = std::fs::read(path).ok()?;

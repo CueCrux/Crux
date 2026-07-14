@@ -131,7 +131,7 @@ impl SemanticProfile {
 /// The provider contract shared by every embedder (buyer-fit M3). A dense lane
 /// records the provider's [`SemanticProfile`] so document and query vectors can
 /// be checked for compatibility (same model/dimension/fingerprint) and an
-/// incompatible vector refused rather than silently mis-scored.
+/// incompatible vector refused rather than silently scored in the wrong space.
 ///
 /// `Debug` is a supertrait so a `Box<dyn Embedder>` can live inside a
 /// `#[derive(Debug)]` struct (e.g. [`crate::fact_store::FactStore`]).
