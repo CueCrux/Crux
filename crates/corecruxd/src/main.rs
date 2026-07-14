@@ -53,6 +53,7 @@ mod local_ingest;
 #[allow(dead_code)]
 mod candidate_links;
 mod candidate_store;
+mod memory_extract;
 mod context_graph;
 mod dossier;
 mod encrypted_secrets;
