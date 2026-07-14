@@ -964,6 +964,7 @@ impl SyncClient {
             for mut fact in facts {
                 // Tag as synced so we don't push it back
                 fact.source_receipt = Some(format!("sync:{}:{}", self.remote_url, fact.fact_id));
+                fact.tenant_hash = crate::fact_store::default_tenant_hash();
                 store.store_synced(fact);
                 total_pulled += 1;
             }
@@ -1042,6 +1043,7 @@ impl SyncClient {
                         continue;
                     };
                     fact.source_receipt = Some(format!("sync:{}:{}", self.remote_url, fact.fact_id));
+                    fact.tenant_hash = tenant_id.to_string();
                     store.store_synced(fact);
                     total_pulled += 1;
                 }
@@ -1223,6 +1225,44 @@ impl SyncClient {
 mod tests {
     use super::*;
     use crate::fact_store::StoreFact;
+    use std::io::Read as _;
+    use std::net::TcpListener;
+
+    fn start_json_mock_server(responses: Vec<serde_json::Value>) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock sync server");
+        let address = listener.local_addr().expect("read mock sync server address");
+        let handle = std::thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("accept mock sync request");
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .expect("set mock sync request timeout");
+
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0u8; 1024];
+                    let read = stream.read(&mut chunk).expect("read mock sync request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+
+                let body = response.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).expect("write mock sync response");
+                stream.flush().expect("flush mock sync response");
+            }
+        });
+
+        (format!("http://{address}"), handle)
+    }
 
     #[test]
     fn sync_defaults_cover_born_private_prefixes() -> Result<(), Box<dyn std::error::Error>> {
@@ -1305,6 +1345,99 @@ mod tests {
             access_count: 0,
             last_accessed_at: None,
         }
+    }
+
+    #[test]
+    fn pull_tenant_mirror_restamps_remote_tenant_hash_to_requested_tenant() {
+        let mut remote_fact = synced_fact("f_tenant_restamp", "tenant-acme::note");
+        remote_fact.tenant_hash = "attacker".to_string();
+        remote_fact.source_receipt = None;
+        let updated_at = remote_fact.stored_at.to_rfc3339();
+        let (remote_url, server) = start_json_mock_server(vec![
+            serde_json::json!({
+                "schema": TENANT_SYNC_MANIFEST_SCHEMA,
+                "tenant_id": "tenant-acme",
+                "tenant_category": "personal",
+                "owner_hash": "blake3:owner",
+                "membership_epoch": 1,
+                "membership_hash": "blake3:membership",
+                "role_grant_hash": "blake3:roles",
+                "generated_at": "2026-07-15T00:00:00Z",
+                "collections": [{
+                    "collection": SYNC_COLLECTION_FACTS,
+                    "cursor": null,
+                    "updated_since": null,
+                    "record_count": 1,
+                    "tombstone_count": 0,
+                    "content_hash": "blake3:facts"
+                }],
+                "manifest_hash": "blake3:manifest"
+            }),
+            serde_json::json!({
+                "schema": TENANT_COLLECTION_PAGE_SCHEMA,
+                "tenant_id": "tenant-acme",
+                "collection": SYNC_COLLECTION_FACTS,
+                "records": [{
+                    "collection": SYNC_COLLECTION_FACTS,
+                    "record_id": "f_tenant_restamp",
+                    "entity": "tenant-acme::note",
+                    "key": "status",
+                    "value_hash": "blake3:value",
+                    "updated_at": updated_at,
+                    "deleted": false,
+                    "fact": remote_fact
+                }],
+                "next_cursor": null,
+                "has_more": false,
+                "collection_hash": "blake3:page"
+            }),
+        ]);
+        let dir = tempfile::tempdir().expect("create sync cursor directory");
+        let client = SyncClient::new(&remote_url, "test-key", dir.path());
+        let mut store = FactStore::new();
+
+        let result = client
+            .pull_tenant_mirror(&mut store, "tenant-acme")
+            .expect("pull tenant mirror");
+        server.join().expect("join mock sync server");
+
+        assert_eq!(result.facts_pulled, 1);
+        assert_eq!(
+            store
+                .get("f_tenant_restamp")
+                .expect("stored tenant mirror fact")
+                .tenant_hash
+                .as_str(),
+            "tenant-acme"
+        );
+    }
+
+    #[test]
+    fn pull_restamps_remote_tenant_hash_to_default() {
+        let mut remote_fact = synced_fact("f_default_restamp", "remote-note");
+        remote_fact.tenant_hash = "attacker".to_string();
+        remote_fact.source_receipt = None;
+        let (remote_url, server) = start_json_mock_server(vec![serde_json::json!({
+            "facts": [remote_fact],
+            "has_more": false,
+            "next_cursor": null
+        })]);
+        let dir = tempfile::tempdir().expect("create sync cursor directory");
+        let client = SyncClient::new(&remote_url, "test-key", dir.path());
+        let mut store = FactStore::new();
+
+        let result = client.pull(&mut store).expect("pull default tenant facts");
+        server.join().expect("join mock sync server");
+
+        assert_eq!(result.facts_pulled, 1);
+        assert_eq!(
+            store
+                .get("f_default_restamp")
+                .expect("stored default tenant fact")
+                .tenant_hash
+                .as_str(),
+            "default"
+        );
     }
 
     #[test]

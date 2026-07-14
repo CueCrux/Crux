@@ -1328,10 +1328,10 @@ impl FactStore {
     /// timestamps). Used for facts arriving from a remote sync — skips version
     /// chain logic but DOES append to the journal for persistence.
     ///
-    /// TODO(multi-tenant, C5 follow-up): this trusts the peer-supplied
-    /// `fact.tenant_hash` verbatim. Harmless while every fact is `default`, but
-    /// once `tenant_hash` is meaningful this is a stamping bypass — validate or
-    /// re-stamp against the peer's authorized tenant here.
+    /// Tenant boundary: sync pull callers (`SyncClient::pull` and
+    /// `SyncClient::pull_tenant_mirror`) re-stamp `fact.tenant_hash` from the
+    /// locally requested tenant before invoking this low-level primitive. Other
+    /// callers remain responsible for supplying an authoritative tenant stamp.
     pub fn store_synced(&mut self, mut fact: Fact) {
         crate::fact_privacy::enforce_global_fact(&mut fact);
 
