@@ -212,8 +212,9 @@ async fn assembly_cache_key(
 ) -> AssemblyKey {
     let mut per_fact: Vec<[u8; 32]> = {
         let store = state.fact_store.read().await;
+        let tenant_hash = super::facts::tenant_hash_for_read_context(ctx);
         store
-            .all_facts()
+            .all_facts_for_tenant(&tenant_hash)
             .map(|f| {
                 let mut h = blake3::Hasher::new();
                 h.update(f.fact_id.as_bytes());

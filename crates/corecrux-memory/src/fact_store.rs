@@ -873,11 +873,17 @@ impl FactStore {
     }
 
     /// Get a single fact by ID.
+    /// Unfiltered — internal / admin only; does NOT apply the tenant filter. Request-path callers must use the *_for_tenant variant (audit H2).
     pub fn get(&self, fact_id: &str) -> Option<&Fact> {
         self.facts.get(fact_id).filter(|f| !f.deleted)
     }
 
+    pub fn get_for_tenant(&self, fact_id: &str, tenant_hash: &str) -> Option<&Fact> {
+        self.get(fact_id).filter(|f| f.tenant_hash == tenant_hash)
+    }
+
     /// Get all facts for an entity.
+    /// Unfiltered — internal / admin only; does NOT apply the tenant filter. Request-path callers must use the *_for_tenant variant (audit H2).
     pub fn get_by_entity(&self, entity: &str) -> Vec<&Fact> {
         self.entity_index
             .get(entity)
@@ -888,6 +894,13 @@ impl FactStore {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    pub fn get_by_entity_for_tenant(&self, entity: &str, tenant_hash: &str) -> Vec<&Fact> {
+        self.get_by_entity(entity)
+            .into_iter()
+            .filter(|f| f.tenant_hash == tenant_hash)
+            .collect()
     }
 
     /// Query facts by keyword match (simple substring search).
@@ -1046,8 +1059,13 @@ impl FactStore {
     }
 
     /// Return an iterator over ALL facts (including deleted).
+    /// Unfiltered — internal / admin only; does NOT apply the tenant filter. Request-path callers must use the *_for_tenant variant (audit H2).
     pub fn all_facts(&self) -> impl Iterator<Item = &Fact> {
         self.facts.values()
+    }
+
+    pub fn all_facts_for_tenant<'a>(&'a self, tenant_hash: &'a str) -> impl Iterator<Item = &'a Fact> + 'a {
+        self.all_facts().filter(move |f| f.tenant_hash == tenant_hash)
     }
 
     /// Paginated export of facts for the sync push path.
@@ -2017,6 +2035,36 @@ mod tests {
 
         assert_eq!(result.facts.len(), 1);
         assert_eq!(result.facts[0].tenant_hash, "tenant-a");
+    }
+
+    #[test]
+    fn tenant_filtered_reads_isolate_cross_tenant() {
+        let mut store = FactStore::new();
+        let request = |tenant_hash: &str, key: &str| StoreFact {
+            tenant_hash: tenant_hash.to_string(),
+            entity: "shared-entity".to_string(),
+            key: key.to_string(),
+            value: "shared-value".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        };
+
+        let tenant_a = store.store(request("tenant-a", "tenant-a-key"));
+        let tenant_b = store.store(request("tenant-b", "tenant-b-key"));
+
+        let entity_facts = store.get_by_entity_for_tenant("shared-entity", "tenant-a");
+        assert_eq!(entity_facts.len(), 1);
+        assert_eq!(entity_facts[0].fact_id, tenant_a.fact_id);
+
+        let all_facts = store.all_facts_for_tenant("tenant-a").collect::<Vec<_>>();
+        assert_eq!(all_facts.len(), 1);
+        assert!(all_facts.iter().all(|fact| fact.tenant_hash == "tenant-a"));
+        assert!(all_facts.iter().all(|fact| fact.fact_id != tenant_b.fact_id));
+
+        assert!(store.get_for_tenant(&tenant_b.fact_id, "tenant-a").is_none());
     }
 
     #[test]
