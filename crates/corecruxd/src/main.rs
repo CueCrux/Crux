@@ -864,6 +864,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         state.fact_store.write().await.set_embedder(embedder);
     }
 
+    // Store-time semantic near-duplicate detection (buyer-fit M3.5). Only
+    // effective when a dense embedder is configured above.
+    if let Some(threshold) = config.semantic_dedup_threshold {
+        let mut store = state.fact_store.write().await;
+        if store.embeddings_enabled() {
+            store.set_semantic_dedup(threshold);
+        } else {
+            tracing::warn!("CORECRUXD_SEMANTIC_DEDUP set but no dense embedder configured; semantic dedup inactive");
+        }
+    }
+
     // Bootstrap: always seed agent-facing documentation on startup (idempotent).
     // Self-observation (ops error/warning capture) still requires CRUX_SELF_OBSERVE=true.
     {

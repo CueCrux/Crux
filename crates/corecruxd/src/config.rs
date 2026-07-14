@@ -442,6 +442,11 @@ pub struct Config {
     // with `--features dense-embed-model`); unset/other keeps the LocalHashEmbedder.
     // Only consulted when no external `embedding_url` is set.
     pub dense_model: Option<String>,
+    // Store-time semantic near-duplicate detection cosine threshold (buyer-fit
+    // M3.5). `None` = off (default). Enabled by `CORECRUXD_SEMANTIC_DEDUP=1`
+    // (threshold from `CORECRUXD_SEMANTIC_DEDUP_THRESHOLD`, default 0.95). Only
+    // effective when a dense embedder is configured.
+    pub semantic_dedup_threshold: Option<f32>,
 
     // Background sync: pull/push facts to a remote CoreCrux instance.
     pub sync_enabled: bool,
@@ -1165,6 +1170,17 @@ pub fn load_config() -> Config {
         embedding_model: std::env::var("CORECRUXD_EMBEDDING_MODEL").unwrap_or_else(|_| "nomic-embed-text".to_string()),
         local_embedder_enabled: env_default_on("CORECRUXD_LOCAL_EMBEDDER"),
         dense_model: std::env::var("CORECRUXD_DENSE_MODEL").ok().filter(|s| !s.is_empty()),
+        semantic_dedup_threshold: {
+            let enabled = std::env::var("CORECRUXD_SEMANTIC_DEDUP")
+                .ok()
+                .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
+            enabled.then(|| {
+                std::env::var("CORECRUXD_SEMANTIC_DEDUP_THRESHOLD")
+                    .ok()
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .unwrap_or(0.95)
+            })
+        },
 
         sync_enabled: std::env::var("CORECRUXD_SYNC_ENABLED")
             .ok()

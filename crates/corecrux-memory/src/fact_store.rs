@@ -397,6 +397,24 @@ pub struct FactStore {
     embedder: Option<Box<dyn crate::embeddings::Embedder>>,
     /// Stored embeddings keyed by fact_id.
     embeddings: HashMap<String, Vec<f32>>,
+    /// Cosine threshold for store-time semantic-dedup (buyer-fit M3.5). `None`
+    /// disables it. When set (and an embedder is present), a newly stored fact
+    /// whose vector is ≥ threshold cosine to an existing DISTINCT fact is flagged
+    /// as a near-duplicate review candidate.
+    dedup_threshold: Option<f32>,
+    /// In-memory near-duplicate flags (buyer-fit M3.5). Ephemeral review signal.
+    /// Follow-up (post-M1): route these into the `__candidate_fact__::` review
+    /// queue instead of an in-memory Vec.
+    near_duplicates: Vec<NearDuplicate>,
+}
+
+/// A store-time semantic near-duplicate flag (buyer-fit M3.5): `fact_id` is a
+/// near-duplicate of the already-stored `similar_to` at cosine `score`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NearDuplicate {
+    pub fact_id: String,
+    pub similar_to: String,
+    pub score: f32,
 }
 
 impl FactStore {
@@ -431,6 +449,43 @@ impl FactStore {
     /// Returns true if an embedder is configured.
     pub fn embeddings_enabled(&self) -> bool {
         self.embedder.is_some()
+    }
+
+    /// Enable store-time semantic near-duplicate detection at `threshold` cosine
+    /// (buyer-fit M3.5). Only effective when an embedder is also configured.
+    pub fn set_semantic_dedup(&mut self, threshold: f32) {
+        tracing::info!(threshold, "fact-store-semantic-dedup-enabled");
+        self.dedup_threshold = Some(threshold);
+    }
+
+    /// The near-duplicate review flags recorded so far (buyer-fit M3.5).
+    /// Ephemeral in-memory signal; see the `near_duplicates` field note.
+    pub fn near_duplicates(&self) -> &[NearDuplicate] {
+        &self.near_duplicates
+    }
+
+    /// Find the highest-cosine existing DISTINCT fact for `fact` at or above the
+    /// dedup threshold (buyer-fit M3.5). Same-`(entity, key)` facts are skipped —
+    /// those are version-chain updates, not semantic duplicates. Read-only.
+    fn detect_near_duplicate(&self, fact: &Fact, threshold: f32) -> Option<(String, f32)> {
+        let new_vec = self.embeddings.get(&fact.fact_id)?;
+        let mut best: Option<(String, f32)> = None;
+        for (other_id, other_vec) in &self.embeddings {
+            if other_id == &fact.fact_id {
+                continue;
+            }
+            let Some(other) = self.facts.get(other_id) else {
+                continue;
+            };
+            if other.deleted || (other.entity == fact.entity && other.key == fact.key) {
+                continue;
+            }
+            let sim = crate::embeddings::cosine_similarity(new_vec, other_vec);
+            if sim >= threshold && best.as_ref().is_none_or(|(_, s)| sim > *s) {
+                best = Some((other_id.clone(), sim));
+            }
+        }
+        best
     }
 
     /// Return the semantic profile for the configured embedder.
@@ -482,6 +537,8 @@ impl FactStore {
             event_bus: None,
             embedder: None,
             embeddings: HashMap::new(),
+            dedup_threshold: None,
+            near_duplicates: Vec::new(),
         };
         if journal_path.exists() {
             store.replay_journal(&journal_path)?;
@@ -783,6 +840,26 @@ impl FactStore {
                     // do NOT add a corpus cap or eviction here. Scale/quality is
                     // the metered upsell, never a clip on local dense.
                     self.embeddings.insert(fact.fact_id.clone(), vec);
+
+                    // M3.5: store-time semantic near-duplicate detection. Flags a
+                    // near-dup as a review candidate (log + queryable record); it
+                    // never mutates or drops the fact — dedup is advisory review,
+                    // not silent deletion.
+                    if let Some(threshold) = self.dedup_threshold {
+                        if let Some((similar_to, score)) = self.detect_near_duplicate(fact, threshold) {
+                            tracing::warn!(
+                                fact_id = %fact.fact_id,
+                                similar_to = %similar_to,
+                                score,
+                                "fact-near-duplicate-detected (M3.5 review candidate)"
+                            );
+                            self.near_duplicates.push(NearDuplicate {
+                                fact_id: fact.fact_id.clone(),
+                                similar_to,
+                                score,
+                            });
+                        }
+                    }
                 }
                 Err(err) => {
                     tracing::warn!(?err, fact_id = %fact.fact_id, "fact-embed-failed");
@@ -1697,6 +1774,65 @@ mod tests {
             result.facts[0].key, "terraform",
             "highest-cosine fact ranks first via the local embedder"
         );
+    }
+
+    #[test]
+    fn semantic_dedup_flags_near_duplicate_as_review_candidate() {
+        // buyer-fit M3.5: with an embedder + dedup enabled, a semantically-near
+        // fact under a DIFFERENT entity/key is flagged (never dropped); a version
+        // update of the same (entity,key) is NOT flagged; an unrelated fact isn't.
+        let mut store = FactStore::new();
+        store.set_embedder(Box::new(crate::embeddings::LocalHashEmbedder::default()));
+        store.set_semantic_dedup(0.8);
+
+        let mk = |entity: &str, key: &str, value: &str| StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: entity.to_string(),
+            key: key.to_string(),
+            value: value.to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        };
+
+        let value =
+            "the production deployment uses a canary rollout strategy with automatic rollback on error budget breach";
+        let original = store.store(mk("svc-a", "note", value));
+        assert!(
+            store.near_duplicates().is_empty(),
+            "first fact has nothing to duplicate"
+        );
+
+        // Unrelated fact — not flagged.
+        store.store(mk(
+            "svc-b",
+            "misc",
+            "quantum chromodynamics lecture notes and problem sets for graduate physics",
+        ));
+        assert!(
+            store.near_duplicates().is_empty(),
+            "unrelated fact is not a near-duplicate"
+        );
+
+        // Version update of the SAME (entity,key) — not flagged (version chain).
+        store.store(mk("svc-a", "note", &format!("{value} now")));
+        assert!(
+            store.near_duplicates().is_empty(),
+            "same entity+key update is a version, not a dup"
+        );
+
+        // Same entity, DIFFERENT key, identical value — a genuine near-duplicate,
+        // flagged as a review candidate.
+        let dup = store.store(mk("svc-a", "summary", value));
+        let flags = store.near_duplicates();
+        assert_eq!(flags.len(), 1, "the near-duplicate is flagged");
+        assert_eq!(flags[0].fact_id, dup.fact_id);
+        assert!(flags[0].score >= 0.9, "flagged at/above threshold: {}", flags[0].score);
+        // The fact itself is preserved — dedup is advisory, never a silent delete.
+        assert!(store.get(&dup.fact_id).is_some());
+        assert!(store.get(&original.fact_id).is_some());
     }
 
     #[test]
