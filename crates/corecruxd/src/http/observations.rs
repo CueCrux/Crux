@@ -20,8 +20,12 @@ use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use base64::Engine as _;
 use chrono::{DateTime, Utc};
+use ed25519_dalek::pkcs8::EncodePublicKey as _;
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use super::facts::{require_fact_read_ctx, require_session_write_ctx, scoped_session_id_for_http};
 use super::{problem_response, AppState};
@@ -63,6 +67,18 @@ const OBS_SUBDIR: &str = "observations";
 /// cannot derive the same sequence number and previous hash.
 static OBSERVATION_APPEND_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+/// Cloud-witness record schema emitted by `crux-llm-shim --cloud-witness`.
+///
+/// This value intentionally lives here as a wire-contract constant rather
+/// than introducing a daemon -> hook-crate dependency. The producer's source
+/// of truth is `crux_claude_hooks::llm_shim::WITNESS_RECEIPT_SCHEMA`.
+const CLOUD_WITNESS_SCHEMA_V1: &str = "cuecrux.mediation.witness.v1";
+const CLOUD_REQUEST_WITNESSED_KIND_V1: &str = "cloud_request_witnessed";
+const CLOUD_RESPONSE_WITNESSED_KIND_V1: &str = "cloud_response_witnessed";
+const WITNESS_PUBLIC_KEY_BYTES: usize = 32;
+const WITNESS_SIGNATURE_BYTES: usize = 64;
+const WITNESS_KID_HEX_CHARS: usize = 16;
 
 // ── Request / response shapes ─────────────────────────────────────────────
 
@@ -116,6 +132,69 @@ pub(super) struct PostMediationReceiptBody {
     /// Originating agent session id — used only to group the mediation log.
     #[serde(default)]
     pub session_id: Option<String>,
+}
+
+/// Detached witness signature carried beside a cloud-witness record.
+#[derive(Debug, Clone, Deserialize)]
+struct CloudWitnessSignatureV1 {
+    alg: String,
+    kid: String,
+    public_key_b64: String,
+    sig_b64: String,
+}
+
+/// Signed envelope emitted by cloud-witness mode. Only `record` is covered by
+/// the witness signature; the daemon verifies the inline key id before using
+/// any envelope metadata.
+#[derive(Debug, Clone, Deserialize)]
+struct CloudWitnessEnvelopeV1 {
+    record: serde_json::Value,
+    witness: CloudWitnessSignatureV1,
+}
+
+/// Metadata-only v1 record accepted after the envelope signature verifies.
+/// Unknown signed fields are rejected before the exact record is copied to the
+/// observation payload, which keeps this ingest path incapable of persisting
+/// prompt or response content.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CloudWitnessRecordV1 {
+    schema: String,
+    kind: String,
+    receipt_id: String,
+    provider: String,
+    path: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    request_digest: Option<String>,
+    #[serde(default)]
+    output_digest: Option<String>,
+    #[serde(default)]
+    request_receipt_id: Option<String>,
+    #[serde(default)]
+    usage: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default)]
+    tool_names: Vec<String>,
+    #[serde(default)]
+    stream: Option<bool>,
+    #[serde(default)]
+    session_hint: Option<String>,
+    #[serde(default)]
+    upstream_status: Option<u16>,
+    #[serde(default)]
+    stop_reason: Option<String>,
+    #[serde(default)]
+    finish_reason: Option<String>,
+    #[serde(default)]
+    first_byte_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    ended_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    end_state: Option<String>,
+    created_at: DateTime<Utc>,
+    #[serde(default)]
+    test_upstream: bool,
 }
 
 /// Receipt envelope returned to the caller.
@@ -838,6 +917,332 @@ fn mediation_observation(body: &PostMediationReceiptBody) -> (String, PostObserv
     (scoped, obs)
 }
 
+/// True only for the nested cloud-witness envelope discriminator. Kept pure
+/// so routing order is covered without an HTTP server or loopback bind.
+fn is_cloud_witness_envelope(raw: &serde_json::Value) -> bool {
+    raw.get("witness").is_some_and(serde_json::Value::is_object)
+        && raw
+            .get("record")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|record| record.get("schema"))
+            .and_then(serde_json::Value::as_str)
+            == Some(CLOUD_WITNESS_SCHEMA_V1)
+}
+
+/// Exact cloud-witness signature canonicalization used by
+/// `crux_claude_hooks::llm_shim::witness::canonical_json_bytes`: recursively
+/// sort object keys with Rust string ordering, preserve array order, leave
+/// scalar values unchanged, then compact-serialize with `serde_json::to_vec`.
+/// This is deliberately not described as RFC 8785/JCS.
+fn canonical_witness_record_bytes(value: &serde_json::Value) -> Result<Vec<u8>, String> {
+    fn canonicalize(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+                entries.sort_by(|left, right| left.0.cmp(right.0));
+                let mut sorted = serde_json::Map::new();
+                for (key, child) in entries {
+                    sorted.insert(key.clone(), canonicalize(child));
+                }
+                serde_json::Value::Object(sorted)
+            }
+            serde_json::Value::Array(items) => serde_json::Value::Array(items.iter().map(canonicalize).collect()),
+            scalar => scalar.clone(),
+        }
+    }
+
+    serde_json::to_vec(&canonicalize(value))
+        .map_err(|err| format!("canonical witness JSON serialization failed: {err}"))
+}
+
+fn witness_kid(verifying_key: &VerifyingKey) -> Result<String, String> {
+    let spki = verifying_key
+        .to_public_key_der()
+        .map_err(|err| format!("Ed25519 SPKI encoding failed: {err}"))?;
+    let digest = Sha256::digest(spki.as_bytes());
+    let digest_hex = hex::encode(digest);
+    let suffix = digest_hex
+        .get(..WITNESS_KID_HEX_CHARS)
+        .ok_or_else(|| "SHA-256 digest was unexpectedly short".to_string())?;
+    Ok(format!("wit_{suffix}"))
+}
+
+#[derive(Debug)]
+enum CloudWitnessVerifyError {
+    InvalidEnvelope(String),
+    SignatureInvalid,
+    Internal(String),
+}
+
+fn verify_cloud_witness_envelope(raw: &serde_json::Value) -> Result<CloudWitnessEnvelopeV1, CloudWitnessVerifyError> {
+    let envelope: CloudWitnessEnvelopeV1 = serde_json::from_value(raw.clone())
+        .map_err(|err| CloudWitnessVerifyError::InvalidEnvelope(format!("malformed cloud-witness envelope: {err}")))?;
+    if envelope.witness.alg != "ed25519" {
+        return Err(CloudWitnessVerifyError::InvalidEnvelope(
+            "witness.alg must be 'ed25519'".to_string(),
+        ));
+    }
+    if envelope.witness.kid.trim().is_empty() {
+        return Err(CloudWitnessVerifyError::InvalidEnvelope(
+            "witness.kid must not be empty".to_string(),
+        ));
+    }
+
+    let public_key = base64::engine::general_purpose::STANDARD
+        .decode(&envelope.witness.public_key_b64)
+        .map_err(|err| CloudWitnessVerifyError::InvalidEnvelope(format!("invalid witness public-key base64: {err}")))?;
+    let public_key: [u8; WITNESS_PUBLIC_KEY_BYTES] = public_key.try_into().map_err(|bytes: Vec<u8>| {
+        CloudWitnessVerifyError::InvalidEnvelope(format!(
+            "witness public key is {} bytes, expected {WITNESS_PUBLIC_KEY_BYTES}",
+            bytes.len()
+        ))
+    })?;
+    let verifying_key = VerifyingKey::from_bytes(&public_key)
+        .map_err(|err| CloudWitnessVerifyError::InvalidEnvelope(format!("invalid Ed25519 public key: {err}")))?;
+    let derived_kid = witness_kid(&verifying_key).map_err(CloudWitnessVerifyError::Internal)?;
+    if envelope.witness.kid != derived_kid {
+        return Err(CloudWitnessVerifyError::InvalidEnvelope(
+            "witness kid does not match the inline public key".to_string(),
+        ));
+    }
+
+    let signature = base64::engine::general_purpose::STANDARD
+        .decode(&envelope.witness.sig_b64)
+        .map_err(|err| CloudWitnessVerifyError::InvalidEnvelope(format!("invalid witness signature base64: {err}")))?;
+    let signature: [u8; WITNESS_SIGNATURE_BYTES] = signature.try_into().map_err(|bytes: Vec<u8>| {
+        CloudWitnessVerifyError::InvalidEnvelope(format!(
+            "witness signature is {} bytes, expected {WITNESS_SIGNATURE_BYTES}",
+            bytes.len()
+        ))
+    })?;
+    let signature = Signature::from_bytes(&signature);
+    let signing_bytes = canonical_witness_record_bytes(&envelope.record).map_err(CloudWitnessVerifyError::Internal)?;
+    if signing_bytes.len() > *MAX_PAYLOAD_BYTES {
+        return Err(CloudWitnessVerifyError::InvalidEnvelope(format!(
+            "canonical witness record is {} bytes, exceeds {}-byte cap",
+            signing_bytes.len(),
+            *MAX_PAYLOAD_BYTES
+        )));
+    }
+    verifying_key
+        .verify_strict(&signing_bytes, &signature)
+        .map_err(|_| CloudWitnessVerifyError::SignatureInvalid)?;
+    Ok(envelope)
+}
+
+fn validate_cloud_witness_record(record: &CloudWitnessRecordV1) -> Result<(), String> {
+    fn nonempty_bounded(label: &str, value: &str, max: usize) -> Result<(), String> {
+        if value.trim().is_empty() || value.len() > max {
+            return Err(format!("{label} must be non-empty and at most {max} bytes"));
+        }
+        Ok(())
+    }
+
+    fn sha256_digest(label: &str, value: &str) -> Result<(), String> {
+        let Some(hex) = value.strip_prefix("sha256:") else {
+            return Err(format!("{label} must use the sha256:<hex> form"));
+        };
+        if hex.len() != 64
+            || !hex
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(format!("{label} must contain 64 lowercase hexadecimal digits"));
+        }
+        Ok(())
+    }
+
+    if record.schema != CLOUD_WITNESS_SCHEMA_V1 {
+        return Err(format!("record.schema must be '{CLOUD_WITNESS_SCHEMA_V1}'"));
+    }
+    if !matches!(
+        record.kind.as_str(),
+        CLOUD_REQUEST_WITNESSED_KIND_V1 | CLOUD_RESPONSE_WITNESSED_KIND_V1
+    ) {
+        return Err("record.kind is not a persisted cloud-witness kind".to_string());
+    }
+    nonempty_bounded("record.receipt_id", &record.receipt_id, 256)?;
+    nonempty_bounded("record.provider", &record.provider, 32)?;
+    nonempty_bounded("record.path", &record.path, 128)?;
+    let supported_path = matches!(
+        (record.provider.as_str(), record.path.as_str()),
+        ("anthropic", "/v1/messages") | ("openai", "/v1/chat/completions") | ("openai", "/v1/responses")
+    );
+    if !supported_path {
+        return Err("record provider/path is outside the cloud-witness allowlist".to_string());
+    }
+    if record.model.as_ref().is_some_and(|model| model.len() > 256) {
+        return Err("record.model exceeds 256 bytes".to_string());
+    }
+    if record
+        .session_hint
+        .as_ref()
+        .is_some_and(|session| session.trim().is_empty() || session.len() > 256)
+    {
+        return Err("record.session_hint must be non-empty and at most 256 bytes when present".to_string());
+    }
+    if record.tool_names.len() > 128
+        || record
+            .tool_names
+            .iter()
+            .any(|name| name.trim().is_empty() || name.len() > 256)
+    {
+        return Err("record.tool_names contains too many or invalid names".to_string());
+    }
+    if let Some(usage) = &record.usage {
+        if usage
+            .iter()
+            .any(|(name, value)| !name.contains("token") || !value.is_number())
+        {
+            return Err("record.usage may contain numeric token counters only".to_string());
+        }
+    }
+    if record.stop_reason.as_ref().is_some_and(|reason| reason.len() > 256)
+        || record.finish_reason.as_ref().is_some_and(|reason| reason.len() > 256)
+        || record.end_state.as_ref().is_some_and(|state| state.len() > 32)
+    {
+        return Err("record response metadata exceeds its size cap".to_string());
+    }
+    // These typed fields are deliberately retained in the exact signed
+    // record below. Reading them here also makes the accepted wire surface
+    // explicit even when no additional semantic restriction is needed.
+    let _typed_metadata = (
+        record.stream,
+        record.upstream_status,
+        record.first_byte_at.as_ref(),
+        record.ended_at.as_ref(),
+        record.test_upstream,
+    );
+
+    match record.kind.as_str() {
+        CLOUD_REQUEST_WITNESSED_KIND_V1 => {
+            let digest = record
+                .request_digest
+                .as_deref()
+                .ok_or_else(|| "cloud request witness requires request_digest".to_string())?;
+            sha256_digest("record.request_digest", digest)?;
+        }
+        CLOUD_RESPONSE_WITNESSED_KIND_V1 => {
+            let request_receipt_id = record
+                .request_receipt_id
+                .as_deref()
+                .ok_or_else(|| "cloud response witness requires request_receipt_id".to_string())?;
+            nonempty_bounded("record.request_receipt_id", request_receipt_id, 256)?;
+            if let Some(digest) = record.output_digest.as_deref() {
+                sha256_digest("record.output_digest", digest)?;
+            }
+            if record
+                .end_state
+                .as_deref()
+                .is_some_and(|state| !matches!(state, "completed" | "aborted" | "upstream_error"))
+            {
+                return Err("record.end_state is invalid".to_string());
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn cloud_witness_problem(status: StatusCode, code: &'static str, detail: impl Into<String>) -> Response {
+    let title = if status == StatusCode::SERVICE_UNAVAILABLE {
+        "Witness Verification Unavailable"
+    } else {
+        "Invalid Cloud-Witness Envelope"
+    };
+    let pd = corecrux_types::ProblemDetails::new(status.as_u16(), format!("https://errors.cuecrux.com/{code}"), title)
+        .with_detail(detail)
+        .with_extensions(serde_json::json!({ "code": code }));
+    crate::problem::ProblemResponse(pd).into_response()
+}
+
+/// Verify and persist a nested cloud-witness envelope through the daemon's
+/// signed-observation path. The original, strictly metadata-only record and
+/// witness proof are retained in the daemon-signed payload so the ingress
+/// verification remains independently reproducible.
+pub(super) fn handle_witness_receipt(state: &AppState, headers: &HeaderMap, raw: &serde_json::Value) -> Response {
+    let ctx = match require_session_write_ctx(state, headers) {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    let envelope = match verify_cloud_witness_envelope(raw) {
+        Ok(envelope) => envelope,
+        Err(CloudWitnessVerifyError::InvalidEnvelope(detail)) => {
+            return cloud_witness_problem(StatusCode::BAD_REQUEST, "witness_envelope_invalid", detail);
+        }
+        Err(CloudWitnessVerifyError::SignatureInvalid) => {
+            return cloud_witness_problem(
+                StatusCode::BAD_REQUEST,
+                "witness_signature_invalid",
+                "cloud-witness Ed25519 signature verification failed",
+            );
+        }
+        Err(CloudWitnessVerifyError::Internal(detail)) => {
+            tracing::warn!(reason = %detail, "cloud-witness verification unavailable; receipt not persisted");
+            // Non-2xx deliberately triggers the shim's durable JSONL fallback.
+            return cloud_witness_problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "witness_verification_unavailable",
+                "cloud-witness verification is temporarily unavailable; retry or use the shim spool",
+            );
+        }
+    };
+    let record: CloudWitnessRecordV1 = match serde_json::from_value(envelope.record.clone()) {
+        Ok(record) => record,
+        Err(err) => {
+            return cloud_witness_problem(
+                StatusCode::BAD_REQUEST,
+                "witness_envelope_invalid",
+                format!("invalid cloud-witness record: {err}"),
+            );
+        }
+    };
+    if let Err(detail) = validate_cloud_witness_record(&record) {
+        return cloud_witness_problem(StatusCode::BAD_REQUEST, "witness_envelope_invalid", detail);
+    }
+
+    let actor = ctx.passport_id.clone().unwrap_or_else(|| "operator".to_string());
+    // Request and response records share a witness key but only requests had
+    // a session hint in the original v1 producer. Grouping on the verified
+    // witness identity keeps linked pairs together; the self-asserted session
+    // hint remains inside the signed record for incident consumers.
+    let witness_kid = envelope.witness.kid.clone();
+    let receipt_id = record.receipt_id.clone();
+    let kind = record.kind.clone();
+    let scoped = format!("mediation::witness::{witness_kid}");
+    let obs_body = PostObservationBody {
+        kind: record.kind.clone(),
+        provider: "crux-cloud-witness".to_string(),
+        client_ts: Some(record.created_at),
+        payload: serde_json::json!({
+            "record": envelope.record,
+            "witness": {
+                "alg": envelope.witness.alg,
+                "kid": witness_kid.clone(),
+                "public_key_b64": envelope.witness.public_key_b64,
+                "sig_b64": envelope.witness.sig_b64,
+            },
+            "witness_verified": true,
+        }),
+    };
+    match append_one(state, &scoped, &actor, obs_body, None) {
+        Ok((response, _tip)) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "receipt_id": receipt_id,
+                "kind": kind,
+                "body_hash": response.receipt.body_hash,
+                "signature_hex": response.receipt.signature,
+                "observation_id": response.observation_id,
+                "signed_by": state.passport_fpr,
+                "witness_kid": witness_kid,
+            })),
+        )
+            .into_response(),
+        Err((status, detail)) => problem_response(status, detail),
+    }
+}
+
 /// `POST /v1/mediation/receipts` — record a CROWN receipt (and, in a
 /// dataplane-enabled deployment, a `/v1/projections/entity/timeline` row via the
 /// observation stream) for an externally-mediated tool call, attributed to a
@@ -858,13 +1263,22 @@ fn mediation_observation(body: &PostMediationReceiptBody) -> (String, PostObserv
 /// signed receipt bodies — see
 /// [`super::stream_receipts`]. With the flag off (default) those drafts hit
 /// the legacy tool-mediation parse and are rejected, exactly as before.
+/// Under the same default-off gate, nested cloud-witness v1 envelopes are
+/// recognized before top-level `kind` dispatch, strictly verified against
+/// their inline Ed25519 public key, and retained as daemon-signed mediation
+/// observations. Invalid signatures are rejected before any append.
 pub(super) async fn post_mediation_receipt(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(raw): Json<serde_json::Value>,
 ) -> Response {
-    // G19 dispatch — flag-gated, kind-discriminated, otherwise inert.
+    // Cloud-witness dispatch must precede top-level `kind`: its discriminator
+    // is the signed `record.schema`, not an envelope-level field.
     if state.stream_receipts_enabled {
+        if is_cloud_witness_envelope(&raw) {
+            return handle_witness_receipt(&state, &headers, &raw);
+        }
+        // G19 stream dispatch — flag-gated, kind-discriminated, otherwise inert.
         if let Some(kind) = raw.get("kind").and_then(serde_json::Value::as_str) {
             if super::stream_receipts::is_stream_receipt_kind(kind) {
                 return super::stream_receipts::handle_stream_receipt_draft(&state, &headers, &raw);
@@ -1333,7 +1747,7 @@ pub(crate) fn run_retention_pass(data_dir: &Path, max_age: chrono::Duration) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier, VerifyingKey};
 
     #[test]
     fn canonical_body_bytes_excludes_receipt() {
@@ -2362,6 +2776,248 @@ mod tests {
     async fn seed_passports_into(state: &AppState) {
         let mut store = state.fact_store.write().await;
         crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+
+    fn cloud_request_record() -> serde_json::Value {
+        serde_json::json!({
+            "schema": CLOUD_WITNESS_SCHEMA_V1,
+            "kind": CLOUD_REQUEST_WITNESSED_KIND_V1,
+            "receipt_id": "wit-request-1",
+            "provider": "anthropic",
+            "path": "/v1/messages",
+            "model": "claude-test",
+            "request_digest": format!("sha256:{}", "11".repeat(32)),
+            "tool_names": ["lookup"],
+            "stream": false,
+            "session_hint": "session-witness-test",
+            "created_at": "2026-07-13T12:00:00Z",
+            "test_upstream": true,
+        })
+    }
+
+    fn cloud_response_record() -> serde_json::Value {
+        serde_json::json!({
+            "schema": CLOUD_WITNESS_SCHEMA_V1,
+            "kind": CLOUD_RESPONSE_WITNESSED_KIND_V1,
+            "receipt_id": "wit-response-1",
+            "request_receipt_id": "wit-request-1",
+            "provider": "anthropic",
+            "path": "/v1/messages",
+            "upstream_status": 200,
+            "output_digest": format!("sha256:{}", "22".repeat(32)),
+            "usage": {
+                "input_tokens": 17,
+                "output_tokens": 5,
+            },
+            "stop_reason": "end_turn",
+            "finish_reason": null,
+            "first_byte_at": "2026-07-13T12:00:01Z",
+            "ended_at": "2026-07-13T12:00:02Z",
+            "end_state": "completed",
+            "created_at": "2026-07-13T12:00:02Z",
+            "test_upstream": true,
+        })
+    }
+
+    fn signed_cloud_witness_envelope(
+        record: serde_json::Value,
+        claimed_key: &SigningKey,
+        signing_key: &SigningKey,
+    ) -> serde_json::Value {
+        let signing_bytes = canonical_witness_record_bytes(&record).expect("canonical witness record");
+        let signature = signing_key.sign(&signing_bytes);
+        let verifying_key = claimed_key.verifying_key();
+        serde_json::json!({
+            "record": record,
+            "witness": {
+                "alg": "ed25519",
+                "kid": witness_kid(&verifying_key).expect("witness kid"),
+                "public_key_b64": base64::engine::general_purpose::STANDARD.encode(verifying_key.to_bytes()),
+                "sig_b64": base64::engine::general_purpose::STANDARD.encode(signature.to_bytes()),
+            }
+        })
+    }
+
+    fn witness_signing_state(tmp: &tempfile::TempDir) -> (AppState, crux_session::LocalPassportKey) {
+        let key_path = tmp.path().join("passport.key");
+        let daemon_key = crux_session::LocalPassportKey::from_path(&key_path).expect("daemon passport key");
+        let mut state = stub_state_with_passport(tmp.path(), &daemon_key);
+        state.stream_receipts_enabled = true;
+        (state, daemon_key)
+    }
+
+    #[test]
+    fn canonical_witness_json_matches_shim_signing_bytes() {
+        let mut nested = serde_json::Map::new();
+        nested.insert("z".to_string(), serde_json::json!(2));
+        nested.insert("a".to_string(), serde_json::json!(1));
+        let mut root = serde_json::Map::new();
+        root.insert("z".to_string(), serde_json::Value::Object(nested));
+        root.insert("a".to_string(), serde_json::json!([{"d": 4, "c": 3}, 2]));
+
+        let bytes = canonical_witness_record_bytes(&serde_json::Value::Object(root)).expect("canonical JSON");
+        assert_eq!(
+            bytes, br#"{"a":[{"c":3,"d":4},2],"z":{"a":1,"z":2}}"#,
+            "must match the shim's recursively sorted compact serde_json encoding"
+        );
+    }
+
+    #[test]
+    fn nested_witness_shape_is_recognized_without_top_level_kind() {
+        let key = SigningKey::from_bytes(&[7_u8; 32]);
+        let envelope = signed_cloud_witness_envelope(cloud_request_record(), &key, &key);
+        assert!(envelope.get("kind").is_none());
+        assert!(is_cloud_witness_envelope(&envelope));
+        assert!(!super::super::stream_receipts::is_stream_receipt_kind(
+            envelope
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+        ));
+    }
+
+    #[tokio::test]
+    async fn valid_witness_pair_routes_verifies_and_persists_for_incidents() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (state, daemon_key) = witness_signing_state(&tmp);
+        let witness_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let witness_kid = witness_kid(&witness_key.verifying_key()).expect("witness kid");
+
+        for (record, expected_kind) in [
+            (cloud_request_record(), CLOUD_REQUEST_WITNESSED_KIND_V1),
+            (cloud_response_record(), CLOUD_RESPONSE_WITNESSED_KIND_V1),
+        ] {
+            let envelope = signed_cloud_witness_envelope(record, &witness_key, &witness_key);
+            let response = post_mediation_receipt(State(state.clone()), HeaderMap::new(), Json(envelope)).await;
+            assert_eq!(response.status(), StatusCode::CREATED);
+            let body = response_to_json(response).await;
+            assert_eq!(body["kind"], expected_kind);
+            assert_eq!(body["signed_by"], daemon_key.passport_fpr());
+            assert_eq!(body["witness_kid"], witness_kid);
+            assert!(body["observation_id"].as_str().is_some_and(|id| !id.is_empty()));
+            assert!(body["body_hash"]
+                .as_str()
+                .is_some_and(|hash| hash.starts_with("blake3:")));
+            assert_eq!(body["signature_hex"].as_str().map(str::len), Some(128));
+        }
+
+        // `incidents::assemble_case` consumes this exact aggregate read path.
+        let records = read_all_observations(&state.data_dir).expect("read signed observations");
+        assert_eq!(records.len(), 2);
+        assert!(records
+            .iter()
+            .all(|record| record.session_id == format!("mediation::witness::{witness_kid}")));
+        assert_eq!(records[0].kind, CLOUD_REQUEST_WITNESSED_KIND_V1);
+        assert_eq!(records[0].provider, "crux-cloud-witness");
+        assert_eq!(records[0].payload["witness"]["kid"], witness_kid);
+        assert_eq!(
+            records[0].payload["record"]["request_digest"],
+            format!("sha256:{}", "11".repeat(32))
+        );
+        assert_eq!(records[1].kind, CLOUD_RESPONSE_WITNESSED_KIND_V1);
+        assert_eq!(records[1].payload["record"]["usage"]["output_tokens"], 5);
+        assert!(records.iter().all(|record| record.payload["witness_verified"] == true));
+    }
+
+    #[tokio::test]
+    async fn altered_witness_record_is_rejected_without_persisting() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (state, _daemon_key) = witness_signing_state(&tmp);
+        let witness_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let mut envelope = signed_cloud_witness_envelope(cloud_request_record(), &witness_key, &witness_key);
+        envelope["record"]["model"] = serde_json::json!("altered-after-signing");
+
+        let response = post_mediation_receipt(State(state.clone()), HeaderMap::new(), Json(envelope)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_to_json(response).await;
+        assert_eq!(body["code"], "witness_signature_invalid");
+        assert!(read_all_observations(&state.data_dir)
+            .expect("read observations")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn wrong_key_witness_signature_is_rejected_without_persisting() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (state, _daemon_key) = witness_signing_state(&tmp);
+        let claimed_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let wrong_signing_key = SigningKey::from_bytes(&[8_u8; 32]);
+        let envelope = signed_cloud_witness_envelope(cloud_request_record(), &claimed_key, &wrong_signing_key);
+
+        let response = post_mediation_receipt(State(state.clone()), HeaderMap::new(), Json(envelope)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_to_json(response).await;
+        assert_eq!(body["code"], "witness_signature_invalid");
+        assert!(read_all_observations(&state.data_dir)
+            .expect("read observations")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn wrong_key_resign_for_existing_kid_is_rejected_without_persisting() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (state, _daemon_key) = witness_signing_state(&tmp);
+        let expected_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let wrong_key = SigningKey::from_bytes(&[8_u8; 32]);
+        let mut envelope = signed_cloud_witness_envelope(cloud_request_record(), &wrong_key, &wrong_key);
+        envelope["witness"]["kid"] =
+            serde_json::json!(witness_kid(&expected_key.verifying_key()).expect("expected witness kid"));
+
+        let response = post_mediation_receipt(State(state.clone()), HeaderMap::new(), Json(envelope)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_to_json(response).await;
+        assert_eq!(body["code"], "witness_envelope_invalid");
+        assert!(read_all_observations(&state.data_dir)
+            .expect("read observations")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn signed_content_bearing_extension_is_rejected_without_persisting() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (state, _daemon_key) = witness_signing_state(&tmp);
+        let witness_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let mut record = cloud_request_record();
+        record["prompt_content"] = serde_json::json!("must-never-persist");
+        let envelope = signed_cloud_witness_envelope(record, &witness_key, &witness_key);
+
+        let response = post_mediation_receipt(State(state.clone()), HeaderMap::new(), Json(envelope)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_to_json(response).await;
+        assert_eq!(body["code"], "witness_envelope_invalid");
+        assert!(read_all_observations(&state.data_dir)
+            .expect("read observations")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn witness_envelope_is_inert_when_stream_receipts_are_disabled() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (mut state, _daemon_key) = witness_signing_state(&tmp);
+        state.stream_receipts_enabled = false;
+        let witness_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let envelope = signed_cloud_witness_envelope(cloud_request_record(), &witness_key, &witness_key);
+
+        let response = post_mediation_receipt(State(state.clone()), HeaderMap::new(), Json(envelope)).await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(read_all_observations(&state.data_dir)
+            .expect("read observations")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn witness_envelope_requires_the_existing_session_write_auth() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (mut state, _daemon_key) = witness_signing_state(&tmp);
+        state.auth = crate::auth::Authz::from_env(crate::auth::AuthMode::DevScopes).expect("dev auth");
+        let witness_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let envelope = signed_cloud_witness_envelope(cloud_request_record(), &witness_key, &witness_key);
+
+        let response = post_mediation_receipt(State(state.clone()), HeaderMap::new(), Json(envelope)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(read_all_observations(&state.data_dir)
+            .expect("read observations")
+            .is_empty());
     }
 
     #[tokio::test]

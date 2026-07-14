@@ -70,6 +70,33 @@ struct StubUpstream {
     captured: mpsc::Receiver<CapturedRequest>,
 }
 
+struct StubDaemon {
+    base_url: String,
+    captured: mpsc::Receiver<Vec<CapturedRequest>>,
+}
+
+struct EnvVarGuard {
+    name: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(name: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(name);
+        std::env::set_var(name, value);
+        Self { name, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => std::env::set_var(self.name, value),
+            None => std::env::remove_var(self.name),
+        }
+    }
+}
+
 fn read_captured_request(stream: &TcpStream) -> CapturedRequest {
     let mut reader = BufReader::new(stream.try_clone().expect("clone stub stream"));
     let mut request_line = String::new();
@@ -130,6 +157,44 @@ fn spawn_buffered_stub_with_headers(
     StubUpstream { addr, captured }
 }
 
+fn spawn_daemon_stub(expected_requests: usize) -> StubDaemon {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("binding daemon receipt stub");
+    let addr = listener.local_addr().expect("daemon stub local address");
+    let (captured_tx, captured) = mpsc::channel();
+    thread::spawn(move || {
+        let mut requests = Vec::with_capacity(expected_requests);
+        for sequence in 0..expected_requests {
+            let (mut stream, _) = listener.accept().expect("accept daemon receipt request");
+            stream
+                .set_read_timeout(Some(IO_TIMEOUT))
+                .expect("daemon stub read timeout");
+            requests.push(read_captured_request(&stream));
+            let response_body = json!({
+                "receipt_id": format!("daemon-receipt-{sequence}"),
+                "signature_hex": "test-signature",
+                "observation_id": format!("daemon-observation-{sequence}"),
+            })
+            .to_string();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response_body.len()
+            );
+            stream
+                .write_all(head.as_bytes())
+                .expect("write daemon stub response head");
+            stream
+                .write_all(response_body.as_bytes())
+                .expect("write daemon stub response body");
+            stream.flush().expect("flush daemon stub response");
+        }
+        captured_tx.send(requests).expect("publish daemon receipt requests");
+    });
+    StubDaemon {
+        base_url: format!("http://{addr}"),
+        captured,
+    }
+}
+
 struct GatedSseStub {
     upstream: StubUpstream,
     first_sent: mpsc::Receiver<()>,
@@ -170,6 +235,17 @@ fn spawn_gated_sse_stub(first: Vec<u8>, rest: Vec<u8>) -> GatedSseStub {
 
 fn witness_config(provider: CloudUpstream, upstream: SocketAddr, key: PathBuf, spool: PathBuf) -> CloudWitnessConfig {
     CloudWitnessConfig::new(provider, "127.0.0.1:0".into(), key, spool, false)
+        .with_insecure_test_upstream(&format!("http://127.0.0.1:{}", upstream.port()))
+        .expect("validated loopback test upstream")
+}
+
+fn witness_config_with_daemon_receipts(
+    provider: CloudUpstream,
+    upstream: SocketAddr,
+    key: PathBuf,
+    spool: PathBuf,
+) -> CloudWitnessConfig {
+    CloudWitnessConfig::new(provider, "127.0.0.1:0".into(), key, spool, true)
         .with_insecure_test_upstream(&format!("http://127.0.0.1:{}", upstream.port()))
         .expect("validated loopback test upstream")
 }
@@ -271,6 +347,76 @@ fn assert_absent_from_spool(path: &Path, canaries: &[&str]) {
     for canary in canaries {
         assert!(!text.contains(canary), "spool leaked canary {canary:?}: {text}");
     }
+}
+
+#[test]
+fn signed_witness_pair_is_delivered_to_daemon_with_auth_without_spool_fallback() {
+    let _guard = test_guard();
+    enable_cloud_witness();
+    let request_body = br#"{"model":"claude-sonnet-4-5","stream":false,"messages":[{"role":"user","content":"DAEMON_DELIVERY_PROMPT_SECRET_54a9"}]}"#;
+    let response_body = br#"{"id":"msg_daemon_delivery","content":[{"type":"text","text":"DAEMON_DELIVERY_RESPONSE_SECRET_a41f"}],"stop_reason":"end_turn","usage":{"input_tokens":7,"output_tokens":3}}"#;
+    let upstream = spawn_buffered_stub("application/json", response_body.to_vec());
+    let daemon = spawn_daemon_stub(2);
+    let _http_url = EnvVarGuard::set("CRUX_HTTP_URL", &daemon.base_url);
+    let _agent_token = EnvVarGuard::set("CRUX_AGENT_TOKEN", "cloud-witness-daemon-e2e-token");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let key = dir.path().join("state/witness.key");
+    let spool = dir.path().join("spool/receipts.jsonl");
+    let shim = llm_shim::serve_cloud_witness(witness_config_with_daemon_receipts(
+        CloudUpstream::Anthropic,
+        upstream.addr,
+        key.clone(),
+        spool.clone(),
+    ))
+    .expect("start daemon-delivery witness");
+
+    let (status, received_body) = raw_post(
+        shim.addr,
+        "/v1/messages",
+        &[("x-api-key", ANTHROPIC_KEY), ("anthropic-version", "2023-06-01")],
+        request_body,
+    );
+    assert!(status.starts_with("HTTP/1.1 200"), "unexpected status: {status}");
+    assert_eq!(received_body, response_body);
+    let forwarded = upstream
+        .captured
+        .recv_timeout(IO_TIMEOUT)
+        .expect("captured daemon-delivery provider request");
+    assert_eq!(forwarded.body, request_body);
+
+    let delivered = daemon
+        .captured
+        .recv_timeout(IO_TIMEOUT)
+        .expect("captured both daemon receipt requests");
+    assert_eq!(delivered.len(), 2, "unexpected daemon requests: {delivered:?}");
+    let envelopes: Vec<Value> = delivered
+        .iter()
+        .map(|request| {
+            assert_eq!(request.request_line, "POST /v1/mediation/receipts HTTP/1.1");
+            assert_eq!(
+                request.header("authorization"),
+                Some("Bearer cloud-witness-daemon-e2e-token")
+            );
+            let envelope: Value = serde_json::from_slice(&request.body).expect("signed witness envelope JSON");
+            assert!(envelope.get("record").is_some_and(Value::is_object));
+            assert!(envelope.get("witness").is_some_and(Value::is_object));
+            assert_eq!(envelope["record"]["schema"], "cuecrux.mediation.witness.v1");
+            assert_eq!(envelope["witness"]["alg"], "ed25519");
+            envelope
+        })
+        .collect();
+    assert_eq!(record(&envelopes[0])["kind"], "cloud_request_witnessed");
+    assert_eq!(record(&envelopes[1])["kind"], "cloud_response_witnessed");
+    assert_linked(&envelopes);
+    verify_signed_pair(&envelopes, &key);
+
+    shim.shutdown();
+    thread::sleep(Duration::from_millis(50));
+    assert!(
+        !spool.exists(),
+        "successful daemon delivery unexpectedly fell back to {}",
+        spool.display()
+    );
 }
 
 #[test]
