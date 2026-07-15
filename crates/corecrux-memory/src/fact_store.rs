@@ -442,9 +442,10 @@ pub struct FactStore {
     /// whose vector is ≥ threshold cosine to an existing DISTINCT fact is flagged
     /// as a near-duplicate review candidate.
     dedup_threshold: Option<f32>,
-    /// In-memory near-duplicate flags (buyer-fit M3.5). Ephemeral review signal.
-    /// Follow-up (post-M1): route these into the `__candidate_fact__::` review
-    /// queue instead of an in-memory Vec.
+    /// Pending near-duplicate flags (buyer-fit M3.5). The daemon drains these via
+    /// [`Self::take_near_duplicates`] after fact writes and files each into the
+    /// `__candidate_fact__::` review queue (buyer-fit FU2); the queue, not this
+    /// Vec, is the durable review record.
     near_duplicates: Vec<NearDuplicate>,
 }
 
@@ -504,10 +505,24 @@ impl FactStore {
         &self.near_duplicates
     }
 
+    /// Drain the accumulated near-duplicate flags (buyer-fit FU2). The daemon
+    /// layer calls this after fact writes and routes each into the
+    /// `__candidate_fact__::` review queue (which this crate cannot reach —
+    /// it lives in `corecruxd`). Draining guarantees each flag is routed once.
+    pub fn take_near_duplicates(&mut self) -> Vec<NearDuplicate> {
+        std::mem::take(&mut self.near_duplicates)
+    }
+
     /// Find the highest-cosine existing DISTINCT fact for `fact` at or above the
     /// dedup threshold (buyer-fit M3.5). Same-`(entity, key)` facts are skipped —
-    /// those are version-chain updates, not semantic duplicates. Read-only.
+    /// those are version-chain updates, not semantic duplicates. Reserved
+    /// (`__…::`) entities — candidates, ops, bootstrap — are excluded on both
+    /// sides so internal/candidate facts are never dedup-reviewed (and the
+    /// candidate rows FU2 writes can't re-trigger detection). Read-only.
     fn detect_near_duplicate(&self, fact: &Fact, threshold: f32) -> Option<(String, f32)> {
+        if fact.entity.starts_with("__") {
+            return None;
+        }
         let new_vec = self.embeddings.get(&fact.fact_id)?;
         let mut best: Option<(String, f32)> = None;
         for (other_id, other_vec) in &self.embeddings {
@@ -517,7 +532,8 @@ impl FactStore {
             let Some(other) = self.facts.get(other_id) else {
                 continue;
             };
-            if other.deleted || (other.entity == fact.entity && other.key == fact.key) {
+            if other.deleted || other.entity.starts_with("__") || (other.entity == fact.entity && other.key == fact.key)
+            {
                 continue;
             }
             let sim = crate::embeddings::cosine_similarity(new_vec, other_vec);

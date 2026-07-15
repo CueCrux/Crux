@@ -324,6 +324,54 @@ pub fn reject(store: &mut FactStore, candidate_id: &str, reason: &str, reviewed_
     Ok(())
 }
 
+/// buyer-fit FU2: drain the fact store's accumulated store-time semantic
+/// near-duplicate flags (M3.5) and file each as a review-only candidate in the
+/// `__candidate_fact__::` queue. `verifier_score` is `None`, so the fail-closed
+/// gate keeps it review-only — a dedup flag is a prompt to reconcile, never an
+/// automatic promote or delete. Returns the number of candidates written.
+///
+/// Recursion-safe: candidate rows live under `__…::`, which
+/// `FactStore::detect_near_duplicate` skips, so writing a candidate never
+/// produces another near-duplicate flag.
+pub fn route_near_duplicates(store: &mut FactStore, now_rfc3339: &str) -> usize {
+    let dups = store.take_near_duplicates();
+    let mut written = 0usize;
+    for d in dups {
+        // The already-stored fact this flag is about; skip if it's since gone.
+        let proposal = {
+            let Some(fact) = store.get(&d.fact_id) else {
+                continue;
+            };
+            (fact.entity.clone(), fact.key.clone(), fact.value.clone())
+        };
+        let (entity, key, value) = proposal;
+        let body = MemoryCandidateV1::new_candidate(
+            format!("neardup-{}-{}", d.fact_id, d.similar_to),
+            entity,
+            key,
+            value,
+            "semantic_dedup".to_string(),
+            d.score,
+            "volatile".to_string(),
+            CandidateSource {
+                evidence: Some(format!(
+                    "near-duplicate of fact {} (cosine {:.4}); review to reconcile or dismiss",
+                    d.similar_to, d.score
+                )),
+                ..Default::default()
+            },
+            None, // verifier_score None ⇒ review-only (fail-closed)
+            None, // receipt minted by the review route layer, not here
+            now_rfc3339.to_string(),
+        );
+        match write_candidate(store, &body, None) {
+            Ok(_) => written += 1,
+            Err(err) => tracing::warn!(err, fact_id = %d.fact_id, "near-duplicate candidate write failed"),
+        }
+    }
+    written
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -521,5 +569,55 @@ mod tests {
             ),
             Err(ReviewError::NotFound)
         );
+    }
+
+    /// buyer-fit FU2: a store-time semantic near-duplicate is drained and filed
+    /// as a review-only `__candidate_fact__::` candidate; routing is recursion-safe.
+    #[test]
+    fn route_near_duplicates_files_review_candidates() {
+        let mut store = FactStore::new();
+        store.set_embedder(Box::new(corecrux_memory::embeddings::LocalHashEmbedder::default()));
+        store.set_semantic_dedup(0.8);
+
+        let mk = |entity: &str, key: &str, value: &str| StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: entity.to_string(),
+            key: key.to_string(),
+            value: value.to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        };
+        let value = "the production deployment uses a canary rollout strategy with automatic rollback on breach";
+        store.store(mk("svc-a", "note", value));
+        // Same entity, different key, identical value ⇒ near-duplicate (M3.5).
+        store.store(mk("svc-a", "summary", value));
+        assert_eq!(store.near_duplicates().len(), 1, "near-duplicate flagged at store time");
+
+        let written = route_near_duplicates(&mut store, "2026-07-15T00:00:00Z");
+        assert_eq!(written, 1, "one review candidate written");
+        assert!(store.near_duplicates().is_empty(), "flags drained after routing");
+
+        let candidates = list_candidates(&store, Some(CandidateStatus::Candidate));
+        assert_eq!(candidates.len(), 1, "candidate visible in the review queue");
+        let c = &candidates[0];
+        assert_eq!(c.rule, "semantic_dedup");
+        assert!(c.verifier_score.is_none(), "unscored ⇒ review-only (fail-closed)");
+        assert!(
+            c.source
+                .evidence
+                .as_deref()
+                .unwrap_or_default()
+                .contains("near-duplicate"),
+            "evidence names the near-duplicate relationship"
+        );
+
+        // Writing the candidate (under __candidate_fact__::) must NOT itself
+        // register a new near-duplicate — the reserved-prefix guard prevents it.
+        assert!(store.near_duplicates().is_empty(), "candidate write did not re-flag");
+        // A second routing pass is a no-op (nothing left to drain).
+        assert_eq!(route_near_duplicates(&mut store, "2026-07-15T00:00:01Z"), 0);
     }
 }
