@@ -345,6 +345,27 @@ fn read_ccxv(path: &Path) -> Option<(u32, DenseEntries)> {
     Some((dim, out))
 }
 
+/// Parsed dense data for one sealed segment (buyer-fit FU3 cache). Sealed
+/// segments are immutable — written once via atomic rename and never modified —
+/// so a per-`(shards_dir, segment_seq)` cache entry never goes stale; new
+/// segments only add entries.
+struct CachedDenseSegment {
+    entries: DenseEntries,
+    profile: Option<corecrux_memory::embeddings::SemanticProfile>,
+}
+
+/// Cache map: `(shards_dir, segment_seq)` → parsed dense segment.
+type DenseSegmentCache = std::collections::HashMap<(std::path::PathBuf, u64), std::sync::Arc<CachedDenseSegment>>;
+
+/// Process-wide cache of parsed `.ccxv`/`.ccxp` companions so the prose
+/// query-dense path does not re-read (and re-`read_dir`) every companion from
+/// disk on every query (buyer-fit FU3). Keyed by `(shards_dir, segment_seq)`:
+/// the shards dir disambiguates otherwise-colliding seqs across data dirs (and
+/// across tests). Pruned to the live segment set of the queried shards dir on
+/// each build, so it stays bounded by the corpus and drops erased segments.
+static DENSE_SEGMENT_CACHE: std::sync::LazyLock<std::sync::Mutex<DenseSegmentCache>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
 /// Build a [`corecrux_retrieval::CosineDenseProvider`] over all sealed `.ccxv` companions, keyed by
 /// `(doc_id, segment_index)` to match [`corecrux_retrieval::fused::fused_retrieve`]'s
 /// enumeration (`segment_index` = position in `index_mgr.readers()`, which is
@@ -365,29 +386,47 @@ pub fn build_dense_provider(
     query_embedding: &[f32],
     expected_fingerprint: Option<&str>,
 ) -> Option<corecrux_retrieval::CosineDenseProvider> {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
 
     let shards_dir = data_dir.join("shards");
-    let mut vectors: HashMap<(u32, usize), Vec<f32>> = HashMap::new();
+    let readers = index_mgr.readers();
 
-    for (segment_index, reader) in index_mgr.readers().iter().enumerate() {
+    // Recover from a poisoned lock rather than panic (a panicking holder would
+    // only have left a partially-updated cache, which is safe to reuse).
+    let mut cache = DENSE_SEGMENT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    // Bound the cache to this shards dir's live segment set; leave other data
+    // dirs' entries untouched.
+    let live: HashSet<u64> = readers.iter().map(|r| r.header.segment_seq).collect();
+    cache.retain(|(sd, seq), _| sd != &shards_dir || live.contains(seq));
+
+    let mut vectors: HashMap<(u32, usize), Vec<f32>> = HashMap::new();
+    for (segment_index, reader) in readers.iter().enumerate() {
         let seq = reader.header.segment_seq;
-        let Some(path) = find_ccxv_for_seq(&shards_dir, seq) else {
-            continue;
+        let cached = if let Some(c) = cache.get(&(shards_dir.clone(), seq)) {
+            Arc::clone(c)
+        } else {
+            let Some(path) = find_ccxv_for_seq(&shards_dir, seq) else {
+                continue;
+            };
+            let Some((_dim, entries)) = read_ccxv(&path) else {
+                continue;
+            };
+            let profile = read_ccxp(&path.with_extension("ccxp"));
+            let c = Arc::new(CachedDenseSegment { entries, profile });
+            cache.insert((shards_dir.clone(), seq), Arc::clone(&c));
+            c
         };
         // Skip segments whose recorded profile is incompatible with the query.
         if let Some(expected) = expected_fingerprint {
-            if let Some(profile) = read_ccxp(&path.with_extension("ccxp")) {
+            if let Some(profile) = &cached.profile {
                 if profile.embedding_fingerprint.hash != expected {
                     continue;
                 }
             }
         }
-        let Some((_dim, entries)) = read_ccxv(&path) else {
-            continue;
-        };
-        for (doc_id, v) in entries {
-            vectors.insert((doc_id, segment_index), v);
+        for (doc_id, v) in &cached.entries {
+            vectors.insert((*doc_id, segment_index), v.clone());
         }
     }
 
@@ -652,6 +691,83 @@ mod tests {
         // doc-b is the 2nd appended frame → doc_id 1, and is query-aligned.
         assert_eq!(resp.results[0].doc_id, 1, "query-aligned doc must rank first");
         assert!(resp.results[0].score_breakdown.dense > 0.99, "top hit dense score ~1.0");
+    }
+
+    /// FU3: `build_dense_provider` caches parsed companions per `(shards_dir,
+    /// seq)`. Repeated builds return identical scores (cache hit), and a
+    /// different data dir reusing the same `segment_seq` does NOT read the first
+    /// corpus's cached vectors.
+    #[test]
+    #[serial_test::serial]
+    fn build_dense_provider_cache_is_consistent_and_dir_scoped() {
+        use corecrux_retrieval::dense::DenseProvider;
+
+        // Corpus A (seq 0): vector aligned to [1, 0].
+        let tmp_a = tempfile::tempdir().unwrap();
+        let docs_a = vec![ProseDocument {
+            doc_id: "a".to_string(),
+            chunks: vec![dense_chunk("a::0", "alpha", vec![1.0, 0.0])],
+        }];
+        seal_prose_documents(
+            tmp_a.path(),
+            0,
+            1,
+            "ta",
+            "corpus",
+            "2026-07-01T00:00:00Z",
+            &docs_a,
+            None,
+        )
+        .unwrap();
+        let mut mgr_a = IndexManager::new();
+        mgr_a
+            .scan_and_load(&tmp_a.path().join("shards").join("shard-0000").join("segments"))
+            .unwrap();
+
+        // Two builds: the second is a cache hit and must match the first.
+        let p1 = build_dense_provider(&mgr_a, tmp_a.path(), &[1.0, 0.0], None).expect("provider a1");
+        let p2 = build_dense_provider(&mgr_a, tmp_a.path(), &[1.0, 0.0], None).expect("provider a2");
+        assert_eq!(p1.len(), 1);
+        assert_eq!(
+            p1.dense_score(0, 0),
+            p2.dense_score(0, 0),
+            "cached build matches fresh build"
+        );
+        assert!(
+            p2.dense_score(0, 0).unwrap() > 0.99,
+            "aligned vector scores ~1.0 from cache"
+        );
+
+        // Corpus B in a DIFFERENT data dir, same seq 0, ORTHOGONAL vector.
+        let tmp_b = tempfile::tempdir().unwrap();
+        let docs_b = vec![ProseDocument {
+            doc_id: "b".to_string(),
+            chunks: vec![dense_chunk("b::0", "beta", vec![0.0, 1.0])],
+        }];
+        seal_prose_documents(
+            tmp_b.path(),
+            0,
+            1,
+            "tb",
+            "corpus",
+            "2026-07-01T00:00:00Z",
+            &docs_b,
+            None,
+        )
+        .unwrap();
+        let mut mgr_b = IndexManager::new();
+        mgr_b
+            .scan_and_load(&tmp_b.path().join("shards").join("shard-0000").join("segments"))
+            .unwrap();
+
+        // Query [1, 0] against corpus B's orthogonal doc → 0.0. If the cache
+        // collided on seq 0 it would wrongly return corpus A's ~1.0.
+        let pb = build_dense_provider(&mgr_b, tmp_b.path(), &[1.0, 0.0], None).expect("provider b");
+        assert_eq!(
+            pb.dense_score(0, 0),
+            Some(0.0),
+            "a different data dir must not read the first corpus's cached vectors"
+        );
     }
 
     /// M3 gate (c): dimension mismatch is rejected cleanly (no partial write).
