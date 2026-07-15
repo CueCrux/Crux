@@ -28,6 +28,22 @@
 //! - `audit` — scan + count per-rule hits, but never alter output (for
 //!   sidecar soak / false-positive tuning before the M4 enforce-flip).
 //! - `on`    — scan, count, and redact.
+//!
+//! ## Limits (audit-v2 L3 — best-effort, not a guarantee)
+//!
+//! Redaction is **pattern- and keyword-based best-effort**, not a cryptographic
+//! guarantee. It catches known secret *shapes* (JWT, `sk-…`, `ghp_…`, AWS
+//! `AKIA…`, PEM blocks) and known *field/key names*. A **high-entropy custom
+//! secret with no recognizable prefix, keyword, or field name is NOT redacted**
+//! and passes through into the (append-only, non-rewritable) log/receipt chain.
+//! Do not rely on this layer as the sole control for novel secret formats.
+//!
+//! **Operator mitigation:** add site-specific value patterns via
+//! `CORECRUXD_REDACT_EXTRA_PATTERNS` — `;;`-separated `id=regex` entries, e.g.
+//! `CORECRUXD_REDACT_EXTRA_PATTERNS='myco=MYCO-[0-9]{6};;legacy=LK_[a-f0-9]{32}'`.
+//! Each becomes an `xtra.<id>` rule applied alongside the built-ins, no code
+//! change or redeploy of the binary required. Invalid regexes are logged and
+//! skipped (they never disable the built-in rules).
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -705,6 +721,28 @@ mod tests {
         let rules = parse_extra_patterns("bad=[unclosed;;good=fixture_[0-9]{4}");
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].id, "xtra.good");
+    }
+
+    #[test]
+    fn documented_limit_high_entropy_secret_without_shape_passes_through() {
+        // L3 limit made executable: a high-entropy secret with no known prefix,
+        // keyword, or field-name shape is NOT redacted by the built-in rules.
+        // This is the documented best-effort boundary (see module docs).
+        let r = on();
+        let opaque = "Zx9Q2m7Kd4Rf8Wp1Nb6Vy3Ht0Lc5Ju"; // 31 random-looking chars, no shape
+        assert_eq!(
+            r.redact_value(opaque),
+            opaque,
+            "unshaped secret is not caught by built-ins"
+        );
+
+        // ...and the operator mitigation closes exactly that gap without a redeploy:
+        let extras = vec![("opaque".to_string(), r"Zx9Q2m7Kd4Rf8Wp1Nb6Vy3Ht0Lc5Ju".to_string())];
+        let r2 = Redactor::with_mode_and_extras(RedactMode::On, &extras);
+        assert!(
+            r2.redact_value(opaque).contains("[REDACTED:xtra.opaque#"),
+            "a custom pattern redacts the previously-unshaped secret"
+        );
     }
 
     #[test]
