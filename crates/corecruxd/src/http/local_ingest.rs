@@ -22,6 +22,7 @@
 
 use super::{problem_response, AppState, HeaderMap, IntoResponse, Json, Response, State, StatusCode};
 use crate::local_ingest::{seal_prose_documents, ProseChunk, ProseDocument};
+use corecrux_memory::embeddings::SemanticProfile;
 
 /// Single-node local ingest writes to shard 0 at a fixed epoch. Segment
 /// sequence auto-increments within the shard and persists via the MANIFEST.
@@ -40,6 +41,13 @@ pub(super) struct LocalIngestBody {
     pub(super) tenant_id: String,
     pub(super) corpus_id: String,
     pub(super) documents: Vec<LocalIngestDocument>,
+    /// Optional declared [`SemanticProfile`] for caller-supplied `dense_vector`s
+    /// (buyer-fit M3.3). When present and the node has a dense embedder whose
+    /// fingerprint differs, the ingest is refused (422) rather than storing an
+    /// unqueryable, silently mismatched vector space. Ignored for server-embedded
+    /// or BM25-only ingests.
+    #[serde(default)]
+    pub(super) semantic_profile: Option<SemanticProfile>,
 }
 
 // `title`/`url`/`source_timestamp` are threaded into frame metadata in M2;
@@ -204,23 +212,97 @@ pub(super) async fn post_local_ingest(
         return problem_response(status, detail);
     }
 
-    // Map the wire payload to the seal-core document model.
-    let documents: Vec<ProseDocument> = body
+    // Server-side local embedding (buyer-fit M3.2): when the caller supplied no
+    // dense vectors at all and the node has an embedder (the pure-Rust
+    // LocalHashEmbedder by default), embed every chunk here so the `.ccxv`
+    // companion is written and prose dense recall works offline with zero
+    // external service. If the caller supplied ANY vector we respect theirs and
+    // do not mix a local 256-dim vector into a foreign-dimension batch (the seal
+    // path rejects mixed dimensions).
+    let has_client_vectors = body
         .documents
         .iter()
-        .map(|d| ProseDocument {
-            doc_id: d.doc_id.clone(),
-            chunks: d
-                .chunks
+        .flat_map(|d| &d.chunks)
+        .any(|c| c.dense_vector.is_some());
+    let node_profile = state.fact_store.read().await.semantic_profile();
+    let server_embed = !has_client_vectors && node_profile.is_some();
+
+    // M3.3 fingerprint refusal: a caller-supplied vector batch that DECLARES a
+    // semantic profile whose embedding fingerprint differs from this node's dense
+    // profile lives in an incompatible vector space — the query path embeds with
+    // the node embedder and would silently skip it. Refuse loudly (422) so the
+    // caller reindexes or configures a matching embedder, rather than storing
+    // dead vectors.
+    if has_client_vectors {
+        if let (Some(declared), Some(node)) = (body.semantic_profile.as_ref(), node_profile.as_ref()) {
+            if declared.embedding_fingerprint.hash != node.embedding_fingerprint.hash {
+                return problem_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!(
+                        "dense_vector embedding fingerprint {} is incompatible with this node's embedding profile {} \
+                         (model {}); reindex against the node embedder or configure a matching one",
+                        declared.embedding_fingerprint.fingerprint_id,
+                        node.embedding_fingerprint.fingerprint_id,
+                        node.model,
+                    ),
+                );
+            }
+        }
+    }
+
+    // The profile to persist alongside the `.ccxv` companion: the node embedder's
+    // for server-embedded ingests; the caller's declared profile for supplied
+    // vectors (or a dimension-only marker when undeclared, so a later query with a
+    // different embedder can still tell the space apart).
+    let dense_profile: Option<SemanticProfile> = if server_embed {
+        node_profile.clone()
+    } else if has_client_vectors {
+        body.semantic_profile.clone().or_else(|| {
+            body.documents
                 .iter()
-                .map(|c| ProseChunk {
-                    chunk_id: c.chunk_id.clone(),
-                    text: c.text.clone(),
-                    dense_vector: c.dense_vector.clone(),
-                })
-                .collect(),
+                .flat_map(|d| &d.chunks)
+                .find_map(|c| c.dense_vector.as_ref())
+                .map(|v| SemanticProfile::from_parts("client-unspecified", v.len(), "unknown", "none", "unknown"))
         })
-        .collect();
+    } else {
+        None
+    };
+
+    // Map the wire payload to the seal-core document model.
+    let documents: Vec<ProseDocument> = if server_embed {
+        let store = state.fact_store.read().await;
+        body.documents
+            .iter()
+            .map(|d| ProseDocument {
+                doc_id: d.doc_id.clone(),
+                chunks: d
+                    .chunks
+                    .iter()
+                    .map(|c| ProseChunk {
+                        chunk_id: c.chunk_id.clone(),
+                        text: c.text.clone(),
+                        dense_vector: store.embed_text(&c.text),
+                    })
+                    .collect(),
+            })
+            .collect()
+    } else {
+        body.documents
+            .iter()
+            .map(|d| ProseDocument {
+                doc_id: d.doc_id.clone(),
+                chunks: d
+                    .chunks
+                    .iter()
+                    .map(|c| ProseChunk {
+                        chunk_id: c.chunk_id.clone(),
+                        text: c.text.clone(),
+                        dense_vector: c.dense_vector.clone(),
+                    })
+                    .collect(),
+            })
+            .collect()
+    };
 
     let data_dir = state.data_dir.clone();
     let tenant = body.tenant_id.clone();
@@ -240,6 +322,7 @@ pub(super) async fn post_local_ingest(
             &corpus,
             &ingested_at,
             &documents,
+            dense_profile.as_ref(),
         )
         .map_err(|e| e.to_string())?;
 
@@ -383,6 +466,7 @@ mod tests {
                 source_timestamp: None,
                 chunks: vec![chunk("doc-1::0", "hello world"), chunk("doc-1::1", "second chunk")],
             }],
+            semantic_profile: None,
         }
     }
 
@@ -530,6 +614,7 @@ mod tests {
                     chunks: vec![chunk(&format!("{doc_id}::0"), text)],
                 })
                 .collect(),
+            semantic_profile: None,
         }
     }
 
@@ -639,6 +724,7 @@ mod tests {
             tenant_id: "mediacrux".to_string(),
             corpus_id: "mediacrux-archive".to_string(),
             documents,
+            semantic_profile: None,
         };
 
         let resp = post_local_ingest(State(state), HeaderMap::new(), Json(body))
@@ -688,5 +774,218 @@ mod tests {
         // Timeline row recorded in the console chunk index for this tenant.
         let page = crate::console_index::list_chunks(&data_dir, "tenant-t4", 100, None).unwrap();
         assert!(!page.chunks.is_empty(), "a timeline row must be recorded (T.4)");
+    }
+
+    /// buyer-fit M3.2 (Track B): with the node's local embedder wired and NO
+    /// client-supplied vectors, ingest embeds every chunk server-side, writes the
+    /// `.ccxv` companion, and the prose text-search path dense-re-ranks the query
+    /// — all with no external embedding service.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn m3_server_side_local_embedding_writes_ccxv_and_query_dense_reranks() {
+        std::env::remove_var("CORECRUXD_QUERY_TEXT_SEARCH");
+        let mut state = super::super::tests::test_app_state(16);
+        state.local_ingest_enabled = true;
+        // Wire the pure-Rust default embedder — the "works offline by default" path.
+        state
+            .fact_store
+            .write()
+            .await
+            .set_embedder(Box::new(corecrux_memory::embeddings::LocalHashEmbedder::default()));
+        let data_dir = state.data_dir.clone();
+
+        // No dense_vector on any chunk → the handler embeds them server-side.
+        let body = body_with(
+            "tenant-m3",
+            "docs",
+            &[
+                ("d1", "terraform module drift detection for cloud infrastructure"),
+                ("d2", "developer onboarding and local setup instructions"),
+            ],
+        );
+        let resp = post_local_ingest(State(state.clone()), HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            json["dense_vectors"],
+            serde_json::json!(2),
+            "both chunks embedded server-side"
+        );
+        assert_eq!(
+            json["dense_dim"],
+            serde_json::json!(256),
+            "local embedder dimension persisted"
+        );
+
+        // The `.ccxv` companion landed next to the sealed segment.
+        let seg_dir = data_dir.join("shards").join("shard-0000").join("segments");
+        let has_ccxv = std::fs::read_dir(&seg_dir)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().ends_with(".ccxv"));
+        assert!(has_ccxv, ".ccxv dense companion must be written at ingest");
+
+        // Text-search now dense-re-ranks: the fused score space is reported and
+        // the dense lane is active — with no external embedder configured.
+        let ts_body = crate::http::query::TextSearchBody {
+            tenant_id: "tenant-m3".to_string(),
+            query: "terraform infrastructure drift".to_string(),
+            limit: 10,
+            token_budget: None,
+            min_score: None,
+            mode: None,
+            include_receipt: None,
+        };
+        let qresp = crate::http::query::post_query_text_search(State(state), HeaderMap::new(), Json(ts_body))
+            .await
+            .into_response();
+        assert_eq!(qresp.status(), StatusCode::OK);
+        let qbytes = axum::body::to_bytes(qresp.into_body(), usize::MAX).await.unwrap();
+        let qjson: serde_json::Value = serde_json::from_slice(&qbytes).unwrap();
+        assert_eq!(
+            qjson["meta"]["dense_lane_active"],
+            serde_json::json!(true),
+            "dense lane active on the offline local path"
+        );
+        assert_eq!(
+            qjson["meta"]["score_space"], "bm25_dense_fused",
+            "query reports the fused score space"
+        );
+        assert!(
+            qjson["results"].as_array().is_some_and(|r| !r.is_empty()),
+            "dense-reranked query returns results"
+        );
+    }
+
+    /// A prose ingest with NO embedder wired stays BM25-only: no `.ccxv`, and the
+    /// query path leaves the dense lane inert (bit-identical to the prior path).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn m3_no_embedder_leaves_prose_bm25_only() {
+        std::env::remove_var("CORECRUXD_QUERY_TEXT_SEARCH");
+        let mut state = super::super::tests::test_app_state(16);
+        state.local_ingest_enabled = true; // no embedder wired
+        let data_dir = state.data_dir.clone();
+
+        let body = body_with("tenant-noemb", "docs", &[("d1", "plain prose without any vectors")]);
+        let resp = post_local_ingest(State(state.clone()), HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["dense_vectors"], serde_json::json!(0), "no embedder ⇒ no vectors");
+
+        let seg_dir = data_dir.join("shards").join("shard-0000").join("segments");
+        let has_ccxv = std::fs::read_dir(&seg_dir)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().ends_with(".ccxv"));
+        assert!(!has_ccxv, "no .ccxv without an embedder");
+
+        let ts_body = crate::http::query::TextSearchBody {
+            tenant_id: "tenant-noemb".to_string(),
+            query: "plain prose".to_string(),
+            limit: 10,
+            token_budget: None,
+            min_score: None,
+            mode: None,
+            include_receipt: None,
+        };
+        let qresp = crate::http::query::post_query_text_search(State(state), HeaderMap::new(), Json(ts_body))
+            .await
+            .into_response();
+        assert_eq!(qresp.status(), StatusCode::OK);
+        let qbytes = axum::body::to_bytes(qresp.into_body(), usize::MAX).await.unwrap();
+        let qjson: serde_json::Value = serde_json::from_slice(&qbytes).unwrap();
+        assert_eq!(qjson["meta"]["dense_lane_active"], serde_json::json!(false));
+        assert_eq!(qjson["meta"]["score_space"], "bm25_lexical");
+    }
+
+    /// buyer-fit M3.3: a caller-supplied dense_vector that declares an embedding
+    /// profile whose fingerprint differs from the node's is refused (422) — the
+    /// refusal is fingerprint-based, not merely dimension-based (dims match here).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn m3_incompatible_client_vector_fingerprint_refused_422() {
+        let mut state = super::super::tests::test_app_state(16);
+        state.local_ingest_enabled = true;
+        // Node embedder: crux-local-hash-v1 @ 256 dims.
+        state
+            .fact_store
+            .write()
+            .await
+            .set_embedder(Box::new(corecrux_memory::embeddings::LocalHashEmbedder::default()));
+
+        // Client supplies a 256-dim vector (dimension MATCHES the node) but
+        // declares a foreign model → different fingerprint → must be refused.
+        let body = LocalIngestBody {
+            tenant_id: "tenant-fp".to_string(),
+            corpus_id: "docs".to_string(),
+            documents: vec![LocalIngestDocument {
+                doc_id: "d1".to_string(),
+                title: None,
+                url: None,
+                source_timestamp: None,
+                chunks: vec![LocalIngestChunk {
+                    chunk_id: "d1::0".to_string(),
+                    text: "some prose".to_string(),
+                    chunk_index: None,
+                    dense_vector: Some(vec![0.1_f32; 256]),
+                    metadata: None,
+                }],
+            }],
+            semantic_profile: Some(SemanticProfile::from_parts(
+                "someone-elses-model",
+                256,
+                "unknown",
+                "none",
+                "unknown",
+            )),
+        };
+        let resp = post_local_ingest(State(state), HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "foreign fingerprint refused"
+        );
+    }
+
+    /// buyer-fit M3.3: a server-embedded ingest writes the `.ccxp` profile sidecar
+    /// recording the node embedder, next to the `.ccxv`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn m3_ccxp_profile_sidecar_written_on_server_embed() {
+        let mut state = super::super::tests::test_app_state(16);
+        state.local_ingest_enabled = true;
+        state
+            .fact_store
+            .write()
+            .await
+            .set_embedder(Box::new(corecrux_memory::embeddings::LocalHashEmbedder::default()));
+        let data_dir = state.data_dir.clone();
+
+        let body = body_with("tenant-ccxp", "docs", &[("d1", "profile sidecar coverage prose")]);
+        let resp = post_local_ingest(State(state), HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let seg_dir = data_dir.join("shards").join("shard-0000").join("segments");
+        let ccxp = std::fs::read_dir(&seg_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "ccxp"))
+            .expect(".ccxp sidecar must be written");
+        let profile: corecrux_memory::embeddings::SemanticProfile =
+            serde_json::from_slice(&std::fs::read(&ccxp).unwrap()).unwrap();
+        assert_eq!(profile.model, corecrux_memory::embeddings::LOCAL_HASH_EMBEDDER_MODEL);
+        assert_eq!(profile.dimensions, 256);
     }
 }

@@ -1594,6 +1594,12 @@ fn problem_for_status(status: StatusCode, detail: impl Into<String>) -> ProblemR
             "No Content",
         )
         .with_detail(detail),
+        StatusCode::UNPROCESSABLE_ENTITY => ProblemDetails::new(
+            StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
+            "https://errors.cuecrux.com/unprocessable-entity",
+            "Unprocessable Entity",
+        )
+        .with_detail(detail),
         _ => ProblemDetails::internal(detail),
     };
     ProblemResponse(pd)

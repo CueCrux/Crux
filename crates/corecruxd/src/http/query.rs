@@ -10,7 +10,10 @@
 //! time-range queries remain opt-in.
 
 use super::*;
-use corecrux_memory::semantic::{MIXED_PROFILE_MERGE_RULE, SCORE_MERGE_RULE_SINGLE_SPACE, SCORE_SPACE_BM25_LEXICAL};
+use corecrux_memory::semantic::{
+    MIXED_PROFILE_MERGE_RULE, SCORE_MERGE_RULE_SINGLE_SPACE, SCORE_MERGE_RULE_WEIGHTED_LINEAR,
+    SCORE_SPACE_BM25_DENSE_FUSED, SCORE_SPACE_BM25_LEXICAL,
+};
 
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 pub(super) struct GraphExpandBody {
@@ -469,7 +472,7 @@ pub(super) async fn post_query_text_search(
     }
 
     // Use the extended search function with min_score and coverage tracking
-    let search_result = corecrux_retrieval::bm25::bm25_search(
+    let mut search_result = corecrux_retrieval::bm25::bm25_search(
         &readers,
         &body.query,
         if body.token_budget.is_some() { 1000 } else { limit },
@@ -477,6 +480,50 @@ pub(super) async fn post_query_text_search(
         &corecrux_retrieval::bm25::Bm25Params::default(),
         body.min_score,
     );
+
+    // Dense re-rank (buyer-fit M3.2): when the node has an embedder (the
+    // pure-Rust LocalHashEmbedder by default) AND this corpus has `.ccxv`
+    // companions, embed the query and re-rank the BM25 candidate pool by a fused
+    // score = 0.7*bm25_norm + 0.3*cosine. Absent an embedder or vectors the lane
+    // stays inert — bit-identical BM25. BM25 coverage reporting is preserved.
+    const BM25_WEIGHT: f32 = 0.7;
+    const DENSE_WEIGHT: f32 = 0.3;
+    let query_embedding = {
+        let store = state.fact_store.read().await;
+        store.embed_text(&body.query)
+    };
+    let dense_provider = query_embedding.as_ref().and_then(|qe| {
+        crate::local_ingest::build_dense_provider(
+            &index,
+            &state.data_dir,
+            qe,
+            embedding_fingerprint.as_ref().map(|f| f.hash.as_str()),
+        )
+    });
+    let dense_lane_active = dense_provider.is_some();
+    if let Some(provider) = dense_provider.as_ref() {
+        use corecrux_retrieval::dense::DenseProvider;
+        let max_bm25 = search_result
+            .hits
+            .iter()
+            .map(|h| h.score)
+            .fold(0.0f32, f32::max)
+            .max(1e-9);
+        for h in &mut search_result.hits {
+            let dense = provider.dense_score(h.doc_id, h.segment_index).unwrap_or(0.0);
+            // Overwrite the reported score with the fused value so ordering and
+            // the per-hit `score` stay consistent (score_space labels it fused).
+            h.score = BM25_WEIGHT * (h.score / max_bm25) + DENSE_WEIGHT * dense;
+        }
+        search_result
+            .hits
+            .sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    let (score_space, score_merge_rule) = if dense_lane_active {
+        (SCORE_SPACE_BM25_DENSE_FUSED, SCORE_MERGE_RULE_WEIGHTED_LINEAR)
+    } else {
+        (SCORE_SPACE_BM25_LEXICAL, SCORE_MERGE_RULE_SINGLE_SPACE)
+    };
 
     let took_ms = t0.elapsed().as_millis();
 
@@ -544,7 +591,7 @@ pub(super) async fn post_query_text_search(
             doc_id: h.doc_id,
             score: h.score,
             source_label: "local_tenant_index",
-            score_space: SCORE_SPACE_BM25_LEXICAL,
+            score_space,
             semantic_profile_id: None,
             local_semantic_profile_id: local_semantic_profile_id.clone(),
             frame_offset: h.frame_offset,
@@ -566,9 +613,10 @@ pub(super) async fn post_query_text_search(
             "total_docs": index.total_docs(),
             "total_candidates": search_result.total_candidates,
             "source_label": "local_tenant_index",
-            "score_space": SCORE_SPACE_BM25_LEXICAL,
-            "score_merge_rule": SCORE_MERGE_RULE_SINGLE_SPACE,
+            "score_space": score_space,
+            "score_merge_rule": score_merge_rule,
             "mixed_profile_merge_rule": MIXED_PROFILE_MERGE_RULE,
+            "dense_lane_active": dense_lane_active,
             "semantic_profile_id": null,
             "local_semantic_profile_id": local_semantic_profile_id,
             "local_semantic_profile": semantic_profile,

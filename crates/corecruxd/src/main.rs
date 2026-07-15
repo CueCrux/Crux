@@ -810,7 +810,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         watcher.start_existing_repos().await;
     }
 
-    // Wire optional embedding client for dense vector retrieval on facts.
+    // Wire the dense embedder for fact retrieval. An external `embedding_url`
+    // selects the HTTP client (BYOE/paid, better vectors). Otherwise, unless
+    // explicitly disabled, wire the pure-Rust `LocalHashEmbedder` so dense
+    // recall works offline by default (buyer-fit M3.2 — dense ON by default).
     if let Some(ref embedding_url) = config.embedding_url {
         let client = corecrux_memory::embeddings::EmbeddingClient::new(corecrux_memory::embeddings::EmbeddingConfig {
             base_url: embedding_url.clone(),
@@ -822,7 +825,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             embedding_model = %config.embedding_model,
             "embedding-client-configured"
         );
-        state.fact_store.write().await.set_embedding_client(client);
+        state.fact_store.write().await.set_embedder(Box::new(client));
+    } else if config.local_embedder_enabled {
+        // Optional real model (buyer-fit M3.4, feature `dense-embed-model`): when
+        // `CORECRUXD_DENSE_MODEL=fastembed` and the daemon was built with the
+        // feature, use FastEmbedEmbedder; on init failure (e.g. model download)
+        // fall back to the always-on pure-Rust LocalHashEmbedder so the offline
+        // default never breaks.
+        let embedder: Box<dyn corecrux_memory::embeddings::Embedder> = {
+            #[cfg(feature = "dense-embed-model")]
+            {
+                if config.dense_model.as_deref() == Some("fastembed") {
+                    match corecrux_memory::embeddings::FastEmbedEmbedder::new(&config.data_dir) {
+                        Ok(model) => {
+                            info!(
+                                model = corecrux_memory::embeddings::FASTEMBED_MODEL_ID,
+                                "fastembed-embedder-configured"
+                            );
+                            Box::new(model)
+                        }
+                        Err(err) => {
+                            tracing::warn!(?err, "fastembed-init-failed; falling back to local hash embedder");
+                            Box::new(corecrux_memory::embeddings::LocalHashEmbedder::default())
+                        }
+                    }
+                } else {
+                    Box::new(corecrux_memory::embeddings::LocalHashEmbedder::default())
+                }
+            }
+            #[cfg(not(feature = "dense-embed-model"))]
+            {
+                if config.dense_model.as_deref() == Some("fastembed") {
+                    tracing::warn!("CORECRUXD_DENSE_MODEL=fastembed but daemon built without the dense-embed-model feature; using local hash embedder");
+                }
+                Box::new(corecrux_memory::embeddings::LocalHashEmbedder::default())
+            }
+        };
+        info!(model = %embedder.model(), dimensions = embedder.dimensions(), "dense-embedder-configured (offline default)");
+        state.fact_store.write().await.set_embedder(embedder);
+    }
+
+    // Store-time semantic near-duplicate detection (buyer-fit M3.5). Only
+    // effective when a dense embedder is configured above.
+    if let Some(threshold) = config.semantic_dedup_threshold {
+        let mut store = state.fact_store.write().await;
+        if store.embeddings_enabled() {
+            store.set_semantic_dedup(threshold);
+        } else {
+            tracing::warn!("CORECRUXD_SEMANTIC_DEDUP set but no dense embedder configured; semantic dedup inactive");
+        }
     }
 
     // Bootstrap: always seed agent-facing documentation on startup (idempotent).
