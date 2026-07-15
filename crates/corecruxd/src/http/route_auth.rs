@@ -86,6 +86,7 @@ pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContra
             | "/v1/openapi.json"
             | "/v1/version"
             | "/v1/witness/smoke"
+            | "/v1/sync/handshake/nonce"
     ) {
         return Some(RouteAuthContract::new(RouteAuthClass::Public, &[]));
     }
@@ -479,6 +480,17 @@ pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContra
     None
 }
 
+fn uses_sync_peer_handshake(path: &str) -> bool {
+    matches!(
+        path,
+        "/v1/sync/tenants/{tenantId}/manifest"
+            | "/v1/sync/tenants/{tenantId}/collections/{collection}"
+            | "/v1/sync/tenants/{tenantId}/promotions/preview"
+            | "/v1/sync/tenants/{tenantId}/promotions/confirm"
+            | "/v1/sync/tenants/{tenantId}/offboard"
+    )
+}
+
 /// Enforcement posture for the route-authorization middleware. Parsed once from
 /// `CORECRUXD_ROUTE_AUTH` at router build time (never per request).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -575,6 +587,15 @@ pub(crate) async fn route_auth_middleware(
             }
         };
     };
+
+    // In mutual-auth mode these exact routes are authorized cryptographically
+    // by require_sync_read/write in the handlers. Requiring an ordinary scope
+    // here would reject a handshake-only peer before verification; accepting
+    // an admin scope here would also risk being mistaken for an auth bypass.
+    // Keep this list exact so future sync routes do not inherit the deferral.
+    if state.sync_mutual_auth && uses_sync_peer_handshake(&path) {
+        return next.run(req).await;
+    }
 
     // Public routes pass with no auth headers in every mode — monitors and the
     // unauthenticated bootstrap rails depend on this.
@@ -734,6 +755,7 @@ mod tests {
     #[test]
     fn route_auth_scope_contracts() {
         let cases = [
+            ("POST", "/v1/sync/handshake/nonce", RouteAuthClass::Public, &[][..]),
             (
                 "GET",
                 "/v1/admin/version",

@@ -35,6 +35,10 @@ const MAX_SSE_LINE_BYTES: usize = 256 * 1024;
 const RECEIPT_QUEUE_CAPACITY: usize = 256;
 /// Client request-read timeout; provider response reads remain unbounded.
 const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Caller header containing the session identity to attribute when authorised.
+const SESSION_ID_HEADER: &str = "x-crux-session-id";
+/// Listener-only credential header; never forward this secret upstream.
+const SESSION_AUTH_HEADER: &str = "x-crux-witness-auth";
 
 static RECEIPT_SEQ: AtomicU64 = AtomicU64::new(1);
 static RECEIPT_INSTANCE: OnceLock<String> = OnceLock::new();
@@ -237,17 +241,20 @@ fn next_receipt_id() -> String {
     format!("wit-{instance}-{sequence}")
 }
 
+fn fresh_nonce() -> String {
+    let mut nonce = [0_u8; 16];
+    rand::rng().fill_bytes(&mut nonce);
+    hex::encode(nonce)
+}
+
 fn cloud_request_record(runtime: &CloudWitnessRuntime, request: &Request, path: &str, receipt_id: &str) -> Value {
     let metadata = RequestMetadata::parse(runtime.config.provider, &request.body);
-    let session_hint = request
-        .headers
-        .iter()
-        .find(|(name, _)| name == "x-crux-session-id")
-        .map(|(_, value)| value.as_str());
+    let session_hint = authenticated_session_hint(&runtime.config, &request.headers);
     json!({
         "schema": WITNESS_RECEIPT_SCHEMA,
         "kind": "cloud_request_witnessed",
         "receipt_id": receipt_id,
+        "nonce": fresh_nonce(),
         "provider": runtime.config.provider.provider(),
         "path": path,
         "model": metadata.model,
@@ -258,6 +265,21 @@ fn cloud_request_record(runtime: &CloudWitnessRuntime, request: &Request, path: 
         "created_at": receipts::now_rfc3339(),
         "test_upstream": runtime.test_upstream,
     })
+}
+
+fn authenticated_session_hint<'a>(config: &CloudWitnessConfig, headers: &'a [(String, String)]) -> Option<&'a str> {
+    let presented = header_value(headers, SESSION_AUTH_HEADER)?;
+    if !config.session_auth_token_matches(presented) {
+        return None;
+    }
+    header_value(headers, SESSION_ID_HEADER)
+}
+
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(candidate, _)| candidate == name)
+        .map(|(_, value)| value.as_str())
 }
 
 fn passthrough_record(path: &str, test_upstream: bool) -> Value {
@@ -343,7 +365,10 @@ fn forward(
     };
     let mut builder = ureq::http::Request::builder().method(method).uri(&url);
     for (name, value) in &request.headers {
-        if !matches!(name.as_str(), "host" | "content-length") && !http::header_is_hop_by_hop(name, &request.headers) {
+        if !matches!(name.as_str(), "host" | "content-length")
+            && name != SESSION_AUTH_HEADER
+            && !http::header_is_hop_by_hop(name, &request.headers)
+        {
             builder = builder.header(name.as_str(), value.as_str());
         }
     }
@@ -567,6 +592,7 @@ fn cloud_response_record(runtime: &CloudWitnessRuntime, input: CloudResponseInpu
         "schema": WITNESS_RECEIPT_SCHEMA,
         "kind": "cloud_response_witnessed",
         "receipt_id": next_receipt_id(),
+        "nonce": fresh_nonce(),
         "request_receipt_id": input.request_receipt_id,
         "provider": runtime.config.provider.provider(),
         "path": input.path,
@@ -751,6 +777,129 @@ fn find_string<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
 mod tests {
     use super::*;
 
+    struct SessionTokenEnvGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl SessionTokenEnvGuard {
+        fn set(value: Option<&str>) -> Self {
+            let previous = std::env::var_os(super::super::CLOUD_WITNESS_SESSION_TOKEN_ENV);
+            match value {
+                Some(value) => std::env::set_var(super::super::CLOUD_WITNESS_SESSION_TOKEN_ENV, value),
+                None => std::env::remove_var(super::super::CLOUD_WITNESS_SESSION_TOKEN_ENV),
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for SessionTokenEnvGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(super::super::CLOUD_WITNESS_SESSION_TOKEN_ENV, value),
+                None => std::env::remove_var(super::super::CLOUD_WITNESS_SESSION_TOKEN_ENV),
+            }
+        }
+    }
+
+    fn test_runtime() -> CloudWitnessRuntime {
+        let directory = tempfile::tempdir().expect("cloud witness test directory");
+        let config = CloudWitnessConfig::new(
+            CloudUpstream::Anthropic,
+            "127.0.0.1:0".to_string(),
+            directory.path().join("witness.key"),
+            directory.path().join("receipts.jsonl"),
+            false,
+        );
+        CloudWitnessRuntime::new(config).expect("cloud witness test runtime")
+    }
+
+    fn test_request(headers: &[(&str, &str)]) -> Request {
+        Request {
+            method: "POST".to_string(),
+            target: "/v1/messages".to_string(),
+            headers: headers
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect(),
+            body: br#"{"model":"claude-test","messages":[]}"#.to_vec(),
+        }
+    }
+
+    #[test]
+    fn session_hint_is_withheld_without_matching_listener_auth() {
+        let _env_guard = crate::test_support::env_guard();
+        let unset_token = SessionTokenEnvGuard::set(None);
+        let runtime = test_runtime();
+        let unauthenticated = test_request(&[
+            (SESSION_ID_HEADER, "session-unproven"),
+            (SESSION_AUTH_HEADER, "caller-chosen"),
+        ]);
+        let record = cloud_request_record(&runtime, &unauthenticated, "/v1/messages", "request-1");
+        assert!(record["session_hint"].is_null());
+        drop(runtime);
+        drop(unset_token);
+
+        let _configured_token = SessionTokenEnvGuard::set(Some("listener-secret"));
+        let runtime = test_runtime();
+        let missing_auth = test_request(&[(SESSION_ID_HEADER, "session-unproven")]);
+        let record = cloud_request_record(&runtime, &missing_auth, "/v1/messages", "request-2");
+        assert!(record["session_hint"].is_null());
+        let incorrect_auth = test_request(&[
+            (SESSION_ID_HEADER, "session-unproven"),
+            (SESSION_AUTH_HEADER, "wrong-secret"),
+        ]);
+        let record = cloud_request_record(&runtime, &incorrect_auth, "/v1/messages", "request-3");
+        assert!(record["session_hint"].is_null());
+    }
+
+    #[test]
+    fn session_hint_is_stamped_with_matching_listener_auth() {
+        let _env_guard = crate::test_support::env_guard();
+        let _configured_token = SessionTokenEnvGuard::set(Some("listener-secret"));
+        let runtime = test_runtime();
+        let authenticated = test_request(&[
+            (SESSION_ID_HEADER, "session-proven"),
+            (SESSION_AUTH_HEADER, "listener-secret"),
+        ]);
+        let record = cloud_request_record(&runtime, &authenticated, "/v1/messages", "request-1");
+        assert_eq!(record["session_hint"], "session-proven");
+    }
+
+    #[test]
+    fn witnessed_records_have_signed_distinct_nonces() {
+        let runtime = test_runtime();
+        let request = test_request(&[]);
+        let request_record = cloud_request_record(&runtime, &request, "/v1/messages", "request-1");
+        let response_record = cloud_response_record(
+            &runtime,
+            CloudResponseInput {
+                path: "/v1/messages",
+                request_receipt_id: "request-1",
+                upstream_status: Some(200),
+                output_digest: Some(sha256_hex_prefixed(b"response")),
+                end_state: ResponseEndState::Completed,
+                first_byte_at: None,
+                metadata: ResponseMetadata::default(),
+            },
+        );
+        let request_nonce = request_record["nonce"].as_str().expect("request nonce");
+        let response_nonce = response_record["nonce"].as_str().expect("response nonce");
+        assert_eq!(request_nonce.len(), 32);
+        assert_eq!(hex::decode(request_nonce).expect("request nonce hex").len(), 16);
+        assert_eq!(response_nonce.len(), 32);
+        assert_eq!(hex::decode(response_nonce).expect("response nonce hex").len(), 16);
+        assert_ne!(request_nonce, response_nonce);
+
+        let key = runtime.witness_key.as_ref().expect("test witness key");
+        let identity = key.identity();
+        for record in [&request_record, &response_record] {
+            let envelope = key.sign_record(record).expect("sign witnessed record");
+            assert_eq!(envelope["record"]["nonce"], record["nonce"]);
+            crate::llm_shim::witness::verify_witness_envelope(&envelope, &identity)
+                .expect("nonce-bearing witness envelope verifies");
+        }
+    }
+
     #[test]
     fn request_metadata_contains_names_only() {
         let anthropic = br#"{"model":"claude-x","stream":true,"tools":[{"name":"lookup","description":"secret","input_schema":{"type":"object"}}]}"#;
@@ -814,6 +963,8 @@ mod tests {
         assert!(record.get("model").is_none());
         assert!(record.get("provider").is_none());
         assert!(record.get("headers").is_none());
+        assert!(record.get("nonce").is_none());
+        assert!(degraded_record("/v1/models", "test", true, true).get("nonce").is_none());
     }
 
     #[test]

@@ -79,6 +79,10 @@ const CLOUD_RESPONSE_WITNESSED_KIND_V1: &str = "cloud_response_witnessed";
 const WITNESS_PUBLIC_KEY_BYTES: usize = 32;
 const WITNESS_SIGNATURE_BYTES: usize = 64;
 const WITNESS_KID_HEX_CHARS: usize = 16;
+const WITNESS_MAX_AGE_SECS: i64 = 10 * 60;
+const WITNESS_MAX_FUTURE_SKEW_SECS: i64 = 60;
+const WITNESS_REPLAY_CACHE_TTL_SECS: u64 = 11 * 60;
+const WITNESS_REPLAY_CACHE_MAX_ENTRIES: usize = 4096;
 
 // ── Request / response shapes ─────────────────────────────────────────────
 
@@ -162,6 +166,8 @@ struct CloudWitnessRecordV1 {
     schema: String,
     kind: String,
     receipt_id: String,
+    #[serde(default)]
+    nonce: Option<String>,
     provider: String,
     path: String,
     #[serde(default)]
@@ -1062,6 +1068,14 @@ fn validate_cloud_witness_record(record: &CloudWitnessRecordV1) -> Result<(), St
         return Err("record.kind is not a persisted cloud-witness kind".to_string());
     }
     nonempty_bounded("record.receipt_id", &record.receipt_id, 256)?;
+    if record.nonce.as_ref().is_some_and(|nonce| {
+        nonce.len() != 32
+            || !nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    }) {
+        return Err("record.nonce must contain 32 lowercase hexadecimal digits when present".to_string());
+    }
     nonempty_bounded("record.provider", &record.provider, 32)?;
     nonempty_bounded("record.path", &record.path, 128)?;
     let supported_path = matches!(
@@ -1201,11 +1215,60 @@ pub(super) fn handle_witness_receipt(state: &AppState, headers: &HeaderMap, raw:
         return cloud_witness_problem(StatusCode::BAD_REQUEST, "witness_envelope_invalid", detail);
     }
 
+    let now = Utc::now();
+    let age = now.signed_duration_since(record.created_at);
+    let accepted_age =
+        chrono::Duration::seconds(-WITNESS_MAX_FUTURE_SKEW_SECS)..=chrono::Duration::seconds(WITNESS_MAX_AGE_SECS);
+    if !accepted_age.contains(&age) {
+        return cloud_witness_problem(
+            StatusCode::BAD_REQUEST,
+            "witness_stale",
+            "cloud-witness record created_at is outside the permitted freshness window",
+        );
+    }
+
+    let replay_key = record.nonce.as_deref().unwrap_or(&record.receipt_id).to_string();
+    {
+        let mut replay_cache = match state.cloud_witness_replay_cache.lock() {
+            Ok(cache) => cache,
+            Err(_) => {
+                return cloud_witness_problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "witness_verification_unavailable",
+                    "cloud-witness replay guard is temporarily unavailable; retry or use the shim spool",
+                );
+            }
+        };
+        let now = std::time::Instant::now();
+        let ttl = std::time::Duration::from_secs(WITNESS_REPLAY_CACHE_TTL_SECS);
+        replay_cache.retain(|_, seen_at| now.saturating_duration_since(*seen_at) <= ttl);
+        let cache_is_full = replay_cache.len() >= WITNESS_REPLAY_CACHE_MAX_ENTRIES;
+        match replay_cache.entry(replay_key) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                return cloud_witness_problem(
+                    StatusCode::CONFLICT,
+                    "witness_replay_rejected",
+                    "cloud-witness record was already accepted",
+                );
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                if cache_is_full {
+                    return cloud_witness_problem(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "witness_verification_unavailable",
+                        "cloud-witness replay guard is temporarily unavailable; retry or use the shim spool",
+                    );
+                }
+                entry.insert(now);
+            }
+        }
+    }
+
     let actor = ctx.passport_id.clone().unwrap_or_else(|| "operator".to_string());
     // Request and response records share a witness key but only requests had
     // a session hint in the original v1 producer. Grouping on the verified
-    // witness identity keeps linked pairs together; the self-asserted session
-    // hint remains inside the signed record for incident consumers.
+    // witness identity keeps linked pairs together; the optional session hint
+    // remains inside the signed record for incident consumers.
     let witness_kid = envelope.witness.kid.clone();
     let receipt_id = record.receipt_id.clone();
     let kind = record.kind.clone();
@@ -2783,6 +2846,7 @@ mod tests {
             "schema": CLOUD_WITNESS_SCHEMA_V1,
             "kind": CLOUD_REQUEST_WITNESSED_KIND_V1,
             "receipt_id": "wit-request-1",
+            "nonce": "11".repeat(16),
             "provider": "anthropic",
             "path": "/v1/messages",
             "model": "claude-test",
@@ -2790,7 +2854,7 @@ mod tests {
             "tool_names": ["lookup"],
             "stream": false,
             "session_hint": "session-witness-test",
-            "created_at": "2026-07-13T12:00:00Z",
+            "created_at": Utc::now(),
             "test_upstream": true,
         })
     }
@@ -2800,6 +2864,7 @@ mod tests {
             "schema": CLOUD_WITNESS_SCHEMA_V1,
             "kind": CLOUD_RESPONSE_WITNESSED_KIND_V1,
             "receipt_id": "wit-response-1",
+            "nonce": "22".repeat(16),
             "request_receipt_id": "wit-request-1",
             "provider": "anthropic",
             "path": "/v1/messages",
@@ -2814,7 +2879,7 @@ mod tests {
             "first_byte_at": "2026-07-13T12:00:01Z",
             "ended_at": "2026-07-13T12:00:02Z",
             "end_state": "completed",
-            "created_at": "2026-07-13T12:00:02Z",
+            "created_at": Utc::now(),
             "test_upstream": true,
         })
     }
@@ -2917,6 +2982,46 @@ mod tests {
         assert_eq!(records[1].kind, CLOUD_RESPONSE_WITNESSED_KIND_V1);
         assert_eq!(records[1].payload["record"]["usage"]["output_tokens"], 5);
         assert!(records.iter().all(|record| record.payload["witness_verified"] == true));
+    }
+
+    #[tokio::test]
+    async fn valid_witness_envelope_is_accepted_once_then_replay_rejected() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (state, _daemon_key) = witness_signing_state(&tmp);
+        let witness_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let envelope = signed_cloud_witness_envelope(cloud_request_record(), &witness_key, &witness_key);
+
+        let response = post_mediation_receipt(State(state.clone()), HeaderMap::new(), Json(envelope.clone())).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let response = post_mediation_receipt(State(state.clone()), HeaderMap::new(), Json(envelope)).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response_to_json(response).await;
+        assert_eq!(body["code"], "witness_replay_rejected");
+        assert_eq!(
+            read_all_observations(&state.data_dir)
+                .expect("read signed observations")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_witness_envelope_is_rejected_without_persisting() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (state, _daemon_key) = witness_signing_state(&tmp);
+        let witness_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let mut record = cloud_request_record();
+        record["created_at"] = serde_json::json!(Utc::now() - chrono::Duration::seconds(WITNESS_MAX_AGE_SECS + 1));
+        let envelope = signed_cloud_witness_envelope(record, &witness_key, &witness_key);
+
+        let response = post_mediation_receipt(State(state.clone()), HeaderMap::new(), Json(envelope)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_to_json(response).await;
+        assert_eq!(body["code"], "witness_stale");
+        assert!(read_all_observations(&state.data_dir)
+            .expect("read observations")
+            .is_empty());
     }
 
     #[tokio::test]

@@ -5,14 +5,185 @@
 
 //! Tenant-aware sync endpoints for local/cloud mirror, explicit promotion, and
 //! business-tenant offboarding receipts.
+//!
+//! With `CORECRUXD_SYNC_MUTUAL_AUTH=1`, every tenant sync endpoint requires
+//! the M2a peer handshake and ordinary/admin scopes cannot bypass it. A peer
+//! first fetches `POST /v1/sync/handshake/nonce`, then presents exactly one of
+//! each header: `x-crux-peer-token` (standard-base64 canonical token JSON),
+//! `x-crux-peer-pubkey` (32-byte hex), `x-crux-peer-nonce` (32-byte hex), and
+//! `x-crux-peer-sig` (64-byte hex). The authenticated token tenant must exactly
+//! equal the tenant path parameter.
 
 use super::*;
+use base64::Engine as _;
 use corecrux_memory::fact_store::StoreFact;
 use corecrux_memory::sync::{
     apply_promoted_records, build_tenant_manifest, offboard_tenant_mirror, promotion_preview, sync_records_hash,
     tenant_collection_page, SyncCollectionRecord, TenantManifestInput,
 };
+use crux_sync::peer_handshake::{verify_peer_handshake, AuthenticatedPeer, PeerAuthError, PeerHandshake};
+use rand::TryRng as _;
+use rcx_capability_token::RcxCapabilityToken;
 use serde_json::json;
+
+const PEER_TOKEN_HEADER: &str = "x-crux-peer-token";
+const PEER_PUBLIC_KEY_HEADER: &str = "x-crux-peer-pubkey";
+const PEER_NONCE_HEADER: &str = "x-crux-peer-nonce";
+const PEER_SIGNATURE_HEADER: &str = "x-crux-peer-sig";
+const MAX_PEER_TOKEN_HEADER_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerHandshakeParseError {
+    Missing,
+    Malformed,
+}
+
+fn current_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn peer_auth_problem(reason_class: &'static str) -> Response {
+    ProblemResponse(
+        ProblemDetails::unauthorized("sync peer authentication failed").with_extensions(json!({
+            "code": "SYNC_PEER_AUTH_FAILED",
+            "reason_class": reason_class,
+        })),
+    )
+    .into_response()
+}
+
+fn peer_tenant_problem() -> Response {
+    ProblemResponse(
+        ProblemDetails::forbidden("sync peer is not authorized for the requested tenant").with_extensions(json!({
+            "code": "SYNC_PEER_TENANT_MISMATCH",
+            "reason_class": "peer_tenant_mismatch",
+        })),
+    )
+    .into_response()
+}
+
+fn peer_verification_unavailable() -> Response {
+    ProblemResponse(
+        ProblemDetails::service_unavailable("sync peer verification is unavailable").with_extensions(json!({
+            "code": "SYNC_PEER_AUTH_UNAVAILABLE",
+            "reason_class": "peer_verification_unavailable",
+        })),
+    )
+    .into_response()
+}
+
+fn required_single_header<'a>(headers: &'a HeaderMap, name: &'static str) -> Result<&'a str, PeerHandshakeParseError> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next().ok_or(PeerHandshakeParseError::Missing)?;
+    if values.next().is_some() {
+        return Err(PeerHandshakeParseError::Malformed);
+    }
+    value.to_str().map_err(|_| PeerHandshakeParseError::Malformed)
+}
+
+fn decode_hex_array<const N: usize>(encoded: &str) -> Result<[u8; N], PeerHandshakeParseError> {
+    let decoded = hex::decode(encoded).map_err(|_| PeerHandshakeParseError::Malformed)?;
+    decoded.try_into().map_err(|_| PeerHandshakeParseError::Malformed)
+}
+
+fn parse_peer_handshake(headers: &HeaderMap) -> Result<PeerHandshake, PeerHandshakeParseError> {
+    let encoded_token = required_single_header(headers, PEER_TOKEN_HEADER)?;
+    if encoded_token.len() > MAX_PEER_TOKEN_HEADER_BYTES {
+        return Err(PeerHandshakeParseError::Malformed);
+    }
+    let token_json = base64::engine::general_purpose::STANDARD
+        .decode(encoded_token.as_bytes())
+        .map_err(|_| PeerHandshakeParseError::Malformed)?;
+    if base64::engine::general_purpose::STANDARD.encode(&token_json) != encoded_token {
+        return Err(PeerHandshakeParseError::Malformed);
+    }
+    let capability_token =
+        serde_json::from_slice::<RcxCapabilityToken>(&token_json).map_err(|_| PeerHandshakeParseError::Malformed)?;
+
+    Ok(PeerHandshake {
+        capability_token,
+        peer_public_key: decode_hex_array(required_single_header(headers, PEER_PUBLIC_KEY_HEADER)?)?,
+        nonce: decode_hex_array::<32>(required_single_header(headers, PEER_NONCE_HEADER)?)?.to_vec(),
+        nonce_signature: decode_hex_array(required_single_header(headers, PEER_SIGNATURE_HEADER)?)?,
+    })
+}
+
+fn peer_rejection_class(error: &PeerAuthError) -> &'static str {
+    match error {
+        PeerAuthError::TokenInvalid(_) => "peer_token_rejected",
+        PeerAuthError::FprMismatch | PeerAuthError::BadPossessionSig => "peer_possession_rejected",
+        PeerAuthError::NonceUnknownOrUsed | PeerAuthError::NonceExpired => "peer_nonce_rejected",
+        PeerAuthError::Revoked => "peer_revoked",
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn require_sync_peer(state: &AppState, headers: &HeaderMap, tenant_id: &str) -> Result<(), Response> {
+    let handshake = parse_peer_handshake(headers).map_err(|error| match error {
+        PeerHandshakeParseError::Missing => peer_auth_problem("missing_peer_handshake"),
+        PeerHandshakeParseError::Malformed => peer_auth_problem("malformed_peer_handshake"),
+    })?;
+    let trust_root = state
+        .sync_peer_trust_root
+        .as_deref()
+        .ok_or_else(|| peer_auth_problem("peer_trust_unavailable"))?;
+    let now = current_unix_seconds();
+    let mut nonce_cache = state
+        .sync_handshake_nonces
+        .lock()
+        .map_err(|_| peer_verification_unavailable())?;
+
+    // Revocation-plane integration is a follow-up. The hook deliberately
+    // returns false until the real passport revocation source is wired.
+    let verification = verify_peer_handshake(&handshake, trust_root, now, &mut nonce_cache, |_| false);
+    nonce_cache.sweep_expired(now);
+    let authenticated = verification.map_err(|error| peer_auth_problem(peer_rejection_class(&error)))?;
+    drop(nonce_cache);
+
+    let AuthenticatedPeer {
+        tenant_id: authenticated_tenant,
+        ..
+    } = authenticated;
+    if authenticated_tenant != tenant_id {
+        return Err(peer_tenant_problem());
+    }
+    Ok(())
+}
+
+pub(super) async fn post_handshake_nonce(State(state): State<AppState>) -> Response {
+    if !state.sync_mutual_auth {
+        return problem_response(StatusCode::NOT_FOUND, "sync mutual authentication is disabled");
+    }
+
+    let mut random_nonce = [0_u8; 32];
+    let mut rng = rand::rngs::SysRng;
+    if let Err(error) = rng.try_fill_bytes(&mut random_nonce) {
+        tracing::error!(?error, "failed to generate sync peer-handshake nonce");
+        return problem_response(StatusCode::INTERNAL_SERVER_ERROR, "sync peer nonce generation failed");
+    }
+
+    let now = current_unix_seconds();
+    let nonce = {
+        let mut nonce_cache = match state.sync_handshake_nonces.lock() {
+            Ok(cache) => cache,
+            Err(_) => return peer_verification_unavailable(),
+        };
+        nonce_cache.sweep_expired(now);
+        nonce_cache.issue(now, random_nonce)
+    };
+    let mut response = Json(json!({
+        "nonce": hex::encode(nonce),
+        "ttl_seconds": SYNC_HANDSHAKE_NONCE_TTL_SECONDS,
+    }))
+    .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
 
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct ManifestQuery {
@@ -73,6 +244,10 @@ fn validate_tenant_id(tenant_id: &str) -> Result<(), Response> {
 
 #[allow(clippy::result_large_err)]
 fn require_sync_read(state: &AppState, headers: &HeaderMap, tenant_id: &str) -> Result<(), Response> {
+    if state.sync_mutual_auth {
+        return require_sync_peer(state, headers, tenant_id);
+    }
+
     let ctx = crate::auth::http_scope_context(&state.auth, headers).map_err(IntoResponse::into_response)?;
     if ctx.has_scope("admin:read") {
         return Ok(());
@@ -83,6 +258,10 @@ fn require_sync_read(state: &AppState, headers: &HeaderMap, tenant_id: &str) -> 
 
 #[allow(clippy::result_large_err)]
 fn require_sync_write(state: &AppState, headers: &HeaderMap, tenant_id: &str) -> Result<(), Response> {
+    if state.sync_mutual_auth {
+        return require_sync_peer(state, headers, tenant_id);
+    }
+
     let ctx = crate::auth::http_scope_context(&state.auth, headers).map_err(IntoResponse::into_response)?;
     if ctx.has_scope("admin:write") {
         return Ok(());

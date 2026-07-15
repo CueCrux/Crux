@@ -8,6 +8,10 @@
 # 2026-07-13 +1 corecruxd: one #[cfg(test)] assertion in http/tests.rs for the
 # legal-hold integrity tests (P1 Track B, PR #393) — reserved-prefix / override
 # attribution test setup; zero production-path additions (verified by diff).
+# 2026-07-15 +14 corecruxd: real-keypair sync mutual-auth handshake tests in
+# http/tests.rs (audit M2b, PR #408) — token/keypair construction + header
+# assembly in the 5 sync_mutual_auth_* tests; zero production-path additions
+# (the require_sync_peer / nonce handler paths use no unwrap/expect; verified by diff).
 # Method: count lines containing .unwrap()/.expect( in crates/<crate>/**/*.rs,
 #   excluding */tests/* paths and lines after an inline #[cfg(test)] marker.
 # Consumer: scripts/unwrap-ratchet.sh (M5 of ExecPlan
@@ -24,7 +28,7 @@ corecrux-segment 32
 corecrux-storage 48
 corecrux-types 1
 corecruxctl 9
-corecruxd 744
+corecruxd 758
 crux-claude-hooks 1
 crux-config-wizard 8
 crux-contrib 0

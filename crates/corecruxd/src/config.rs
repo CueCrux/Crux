@@ -432,12 +432,33 @@ pub struct Config {
     // Optional embedding endpoint for dense vector retrieval on facts.
     pub embedding_url: Option<String>,
     pub embedding_model: String,
+    // Pure-Rust offline dense embedder (buyer-fit M3.2). Default ON: when no
+    // external `embedding_url` is set, facts are embedded with the zero-dep
+    // `LocalHashEmbedder` so dense recall works with no external service. Set
+    // `CORECRUXD_LOCAL_EMBEDDER=0` to keep the fact lane keyword-only.
+    pub local_embedder_enabled: bool,
+    // Optional real local embedding model (buyer-fit M3.4). `CORECRUXD_DENSE_MODEL=fastembed`
+    // selects the feature-gated `FastEmbedEmbedder` (requires the daemon built
+    // with `--features dense-embed-model`); unset/other keeps the LocalHashEmbedder.
+    // Only consulted when no external `embedding_url` is set.
+    pub dense_model: Option<String>,
+    // Store-time semantic near-duplicate detection cosine threshold (buyer-fit
+    // M3.5). `None` = off (default). Enabled by `CORECRUXD_SEMANTIC_DEDUP=1`
+    // (threshold from `CORECRUXD_SEMANTIC_DEDUP_THRESHOLD`, default 0.95). Only
+    // effective when a dense embedder is configured.
+    pub semantic_dedup_threshold: Option<f32>,
 
     // Background sync: pull/push facts to a remote CoreCrux instance.
     pub sync_enabled: bool,
     pub sync_remote_url: String,
     pub sync_api_key: String,
     pub sync_interval_secs: u64,
+    /// Require issuer-signed Ed25519 peer handshakes on sync server routes.
+    /// Default OFF (`CORECRUXD_SYNC_MUTUAL_AUTH=1`).
+    pub sync_mutual_auth: bool,
+    /// VaultCrux/issuer Ed25519 trust-root public key, parsed from exactly
+    /// 64 hexadecimal characters in `CORECRUXD_SYNC_PEER_TRUST_ROOT`.
+    pub sync_peer_trust_root: Option<Vec<u8>>,
 
     // Background update checks against a tracked git ref.
     pub update_check_enabled: bool,
@@ -660,6 +681,10 @@ fn env_csv(key: &str) -> Option<Vec<String>> {
 
 fn bool_value(value: &str) -> bool {
     matches!(value, "1" | "true" | "TRUE" | "yes" | "YES")
+}
+
+fn parse_sync_peer_trust_root(value: &str) -> Option<Vec<u8>> {
+    hex::decode(value.trim()).ok().filter(|bytes| bytes.len() == 32)
 }
 
 fn expand_path(raw: &str) -> PathBuf {
@@ -1155,6 +1180,19 @@ pub fn load_config() -> Config {
 
         embedding_url: std::env::var("CORECRUXD_EMBEDDING_URL").ok().filter(|s| !s.is_empty()),
         embedding_model: std::env::var("CORECRUXD_EMBEDDING_MODEL").unwrap_or_else(|_| "nomic-embed-text".to_string()),
+        local_embedder_enabled: env_default_on("CORECRUXD_LOCAL_EMBEDDER"),
+        dense_model: std::env::var("CORECRUXD_DENSE_MODEL").ok().filter(|s| !s.is_empty()),
+        semantic_dedup_threshold: {
+            let enabled = std::env::var("CORECRUXD_SEMANTIC_DEDUP")
+                .ok()
+                .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
+            enabled.then(|| {
+                std::env::var("CORECRUXD_SEMANTIC_DEDUP_THRESHOLD")
+                    .ok()
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .unwrap_or(0.95)
+            })
+        },
 
         sync_enabled: std::env::var("CORECRUXD_SYNC_ENABLED")
             .ok()
@@ -1166,6 +1204,12 @@ pub fn load_config() -> Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(300)
             .max(10),
+        sync_mutual_auth: std::env::var("CORECRUXD_SYNC_MUTUAL_AUTH")
+            .ok()
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
+        sync_peer_trust_root: env_string("CORECRUXD_SYNC_PEER_TRUST_ROOT")
+            .as_deref()
+            .and_then(parse_sync_peer_trust_root),
         update_check_enabled: std::env::var("CORECRUXD_UPDATE_CHECK_ENABLED")
             .ok()
             .is_none_or(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
@@ -1684,6 +1728,28 @@ mod tests {
         assert!(!cfg.handoff_observations_enabled);
         // Credit Meter M1b is default OFF; comped-wallet spends must opt in.
         assert!(!cfg.credit_meter_enabled);
+        // Peer-handshake auth is separately opt-in from the background client.
+        assert!(!cfg.sync_mutual_auth);
+        assert!(cfg.sync_peer_trust_root.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_config_sync_mutual_auth_parses_flag_and_hex_trust_root() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+        clear_corecruxd_env();
+        std::env::set_var("CORECRUXD_SYNC_MUTUAL_AUTH", "TRUE");
+        std::env::set_var("CORECRUXD_SYNC_PEER_TRUST_ROOT", "ab".repeat(32));
+
+        let cfg = super::load_config();
+        assert!(cfg.sync_mutual_auth);
+        assert_eq!(cfg.sync_peer_trust_root, Some(vec![0xab; 32]));
+
+        std::env::set_var("CORECRUXD_SYNC_PEER_TRUST_ROOT", "ab".repeat(31));
+        let cfg = super::load_config();
+        assert!(cfg.sync_peer_trust_root.is_none());
+        clear_corecruxd_env();
     }
 
     #[test]

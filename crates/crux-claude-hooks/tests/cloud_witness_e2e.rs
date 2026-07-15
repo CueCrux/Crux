@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const ANTHROPIC_KEY: &str = "sk-ant-e2e-NEVER-PERSIST-2b5d6e305cab";
 const OPENAI_TOKEN: &str = "Bearer sk-e2e-NEVER-PERSIST-cc119bd6e460";
+const SESSION_AUTH_TOKEN: &str = "cloud-witness-session-auth-e2e-9f632b";
 const GZIP_RESPONSE: &[u8] = &[
     0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xab, 0x56, 0x2a, 0x2d, 0x4e, 0x4c, 0x4f, 0x55, 0xb2,
     0xaa, 0x56, 0x2a, 0x28, 0xca, 0xcf, 0x2d, 0x28, 0x89, 0x2f, 0xc9, 0xcf, 0x4e, 0xcd, 0x2b, 0x56, 0xb2, 0x32, 0xac,
@@ -423,6 +424,7 @@ fn signed_witness_pair_is_delivered_to_daemon_with_auth_without_spool_fallback()
 fn anthropic_non_stream_is_exact_signed_linked_and_redacted() {
     let _guard = test_guard();
     enable_cloud_witness();
+    let _session_auth = EnvVarGuard::set(llm_shim::CLOUD_WITNESS_SESSION_TOKEN_ENV, SESSION_AUTH_TOKEN);
     let request_body = br#"{"model":"claude-sonnet-4-5","stream":false,"tools":[{"name":"lookup_weather","description":"TOOL_DESCRIPTION_SECRET_6ee5","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"ANTHROPIC_PROMPT_SECRET_8d72"}],"metadata":{"argument":"TOOL_ARGUMENT_SECRET_d293"}}"#;
     let response_body = br#"{"id":"msg_e2e","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"ANTHROPIC_RESPONSE_SECRET_c863"}],"stop_reason":"end_turn","usage":{"input_tokens":17,"output_tokens":5}}"#;
     let stub = spawn_buffered_stub("application/json", response_body.to_vec());
@@ -444,6 +446,7 @@ fn anthropic_non_stream_is_exact_signed_linked_and_redacted() {
             ("x-api-key", ANTHROPIC_KEY),
             ("anthropic-version", "2023-06-01"),
             ("x-crux-session-id", "session-anthropic-e2e"),
+            ("x-crux-witness-auth", SESSION_AUTH_TOKEN),
             ("x-e2e-custom", "forward-me"),
             ("Connection", "x-drop"),
             ("x-drop", "hop-only-canary"),
@@ -461,6 +464,7 @@ fn anthropic_non_stream_is_exact_signed_linked_and_redacted() {
     assert_eq!(captured.header("x-api-key"), Some(ANTHROPIC_KEY));
     assert_eq!(captured.header("anthropic-version"), Some("2023-06-01"));
     assert_eq!(captured.header("x-crux-session-id"), Some("session-anthropic-e2e"));
+    assert_eq!(captured.header("x-crux-witness-auth"), None);
     assert_eq!(captured.header("x-e2e-custom"), Some("forward-me"));
     assert_eq!(captured.header("x-drop"), None);
 
@@ -490,6 +494,8 @@ fn anthropic_non_stream_is_exact_signed_linked_and_redacted() {
         &[
             ANTHROPIC_KEY,
             "x-api-key",
+            SESSION_AUTH_TOKEN,
+            "x-crux-witness-auth",
             "ANTHROPIC_PROMPT_SECRET_8d72",
             "ANTHROPIC_RESPONSE_SECRET_c863",
             "TOOL_DESCRIPTION_SECRET_6ee5",

@@ -27,6 +27,10 @@ pub const SCORE_SPACE_DENSE_COSINE: &str = "dense_cosine";
 pub const SCORE_SPACE_RERANKER: &str = "reranker";
 pub const SCORE_MERGE_RULE_SINGLE_SPACE: &str = "single_score_space";
 pub const SCORE_MERGE_RULE_RANK_FUSION: &str = "reciprocal_rank_fusion";
+/// A single fused score space combining normalised BM25 and dense cosine by a
+/// fixed weighted-linear sum (buyer-fit M3.2 prose dense re-rank).
+pub const SCORE_SPACE_BM25_DENSE_FUSED: &str = "bm25_dense_fused";
+pub const SCORE_MERGE_RULE_WEIGHTED_LINEAR: &str = "weighted_linear_fusion";
 pub const MIXED_PROFILE_MERGE_RULE: &str = "rank_fusion_or_single_profile_rerank_required";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

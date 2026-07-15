@@ -55,6 +55,9 @@ pub const ENABLE_ENV: &str = "CRUX_LLM_SHIM";
 /// Env flag gating cloud witness mode independently from local injection.
 pub const CLOUD_WITNESS_ENABLE_ENV: &str = "CRUX_CLOUD_WITNESS";
 
+/// Optional secret that gates cloud-witness session attribution.
+pub const CLOUD_WITNESS_SESSION_TOKEN_ENV: &str = "CRUX_CLOUD_WITNESS_SESSION_TOKEN";
+
 /// Test-only upstream override read by the CLI only when the loud insecure
 /// flag is present (or directly by unit tests compiled with `cfg(test)`).
 pub const CLOUD_WITNESS_TEST_UPSTREAM_ENV: &str = "CRUX_CLOUD_WITNESS_TEST_UPSTREAM";
@@ -101,9 +104,34 @@ pub struct CloudWitnessConfig {
     pub receipts_spool: PathBuf,
     /// Whether to attempt daemon delivery before the JSONL fallback.
     pub daemon_receipts: bool,
+    /// Hashed listener credential used only to authenticate session hints.
+    session_auth_token: Option<SessionAuthTokenHash>,
     /// Validated loopback HTTP override installed only through the loud
     /// [`CloudWitnessConfig::with_insecure_test_upstream`] opt-in.
     insecure_test_upstream: Option<String>,
+}
+
+#[derive(Clone)]
+struct SessionAuthTokenHash(blake3::Hash);
+
+impl SessionAuthTokenHash {
+    fn from_env() -> Option<Self> {
+        std::env::var(CLOUD_WITNESS_SESSION_TOKEN_ENV)
+            .ok()
+            .filter(|token| !token.is_empty())
+            .map(|token| Self(blake3::hash(token.as_bytes())))
+    }
+
+    fn matches(&self, presented: &str) -> bool {
+        // `blake3::Hash` equality uses a fixed-size constant-time comparison.
+        self.0 == blake3::hash(presented.as_bytes())
+    }
+}
+
+impl std::fmt::Debug for SessionAuthTokenHash {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
 }
 
 impl CloudWitnessConfig {
@@ -122,8 +150,16 @@ impl CloudWitnessConfig {
             witness_key,
             receipts_spool,
             daemon_receipts,
+            session_auth_token: SessionAuthTokenHash::from_env(),
             insecure_test_upstream: None,
         }
+    }
+
+    /// Return whether `presented` proves permission to stamp a session hint.
+    pub(crate) fn session_auth_token_matches(&self, presented: &str) -> bool {
+        self.session_auth_token
+            .as_ref()
+            .is_some_and(|expected| expected.matches(presented))
     }
 
     /// Replace the pinned TLS origin with a loopback-only HTTP test upstream.

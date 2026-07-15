@@ -395,6 +395,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/shard-map", methods: &["GET"], tag: "Routing", auth: "admin-read", summary: "Shard map" },
     RouteEntry { path: "/v1/shards", methods: &["GET"], tag: "Routing", auth: "admin-read", summary: "Shards" },
     RouteEntry { path: "/v1/status-feed", methods: &["GET"], tag: "StatusFeed", auth: "read", summary: "Status feed" },
+    RouteEntry { path: "/v1/sync/handshake/nonce", methods: &["POST"], tag: "Sync", auth: "public", summary: "Issue sync peer handshake nonce" },
     RouteEntry { path: "/v1/sync/tenants/{tenantId}/collections/{collection}", methods: &["GET"], tag: "Sync", auth: "read", summary: "Sync tenants {tenantId} collections {collection}" },
     RouteEntry { path: "/v1/sync/tenants/{tenantId}/manifest", methods: &["GET"], tag: "Sync", auth: "read", summary: "Sync tenants {tenantId} manifest" },
     RouteEntry { path: "/v1/sync/tenants/{tenantId}/offboard", methods: &["POST"], tag: "Sync", auth: "write", summary: "Sync tenants {tenantId} offboard" },
