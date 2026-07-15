@@ -14,6 +14,7 @@
 
 use crux_session::canonical::{to_canonical_json, CborValue};
 use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey};
+use serde::Deserialize;
 
 pub const RCX_CT_SPEC_VERSION: &str = "rcx-ct/1.0";
 pub const RCX_CT_SIGNATURE_LEN: usize = 64;
@@ -94,7 +95,8 @@ pub fn corecrux_premium_lane_capabilities(per_call_cost: u64) -> Vec<PermittedCa
         .collect()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RcxTier {
     Free,
     Pro,
@@ -113,7 +115,8 @@ impl RcxTier {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReceiptClass {
     Verified,
     Dev,
@@ -130,7 +133,8 @@ impl ReceiptClass {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DataEgressClass {
     None,
     Vectors,
@@ -155,7 +159,8 @@ impl DataEgressClass {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CreditCostUnit {
     Call,
     Token,
@@ -172,7 +177,8 @@ impl CreditCostUnit {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RefillPeriod {
     Daily,
     Monthly,
@@ -189,7 +195,8 @@ impl RefillPeriod {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OverdraftPolicy {
     Forbid,
     Warn,
@@ -206,7 +213,8 @@ impl OverdraftPolicy {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FallbackAction {
     DegradeToLocal,
     Refuse,
@@ -223,25 +231,29 @@ impl FallbackAction {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Issuer {
     pub passport_kid: String,
     pub issuer_org: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Subject {
     pub passport_fpr: String,
     pub daemon_instance_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TenantScope {
     pub tenant_id: String,
     pub display_name: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TeamSeatRole {
     Owner,
     Admin,
@@ -260,7 +272,8 @@ impl TeamSeatRole {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TeamScope {
     pub team_id: String,
     pub seat_id: Option<String>,
@@ -269,7 +282,8 @@ pub struct TeamScope {
     pub principal_passport_fprs: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnterpriseScope {
     pub customer_id: String,
     pub contract_id: Option<String>,
@@ -280,13 +294,15 @@ pub struct EnterpriseScope {
     pub cross_signed_by_vaultcrux: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreditCost {
     pub unit: CreditCostUnit,
     pub cost: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PermittedCapability {
     pub capability: String,
     pub data_egress_classes: Vec<DataEgressClass>,
@@ -294,7 +310,8 @@ pub struct PermittedCapability {
     pub credit_cost: Option<CreditCost>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Backend {
     pub backend_id: String,
     pub trust_root_kid: String,
@@ -302,13 +319,15 @@ pub struct Backend {
     pub permitted_capabilities: Vec<PermittedCapability>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreditRefill {
     pub period: RefillPeriod,
     pub amount: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Credits {
     pub balance: Option<u64>,
     pub refill: CreditRefill,
@@ -316,7 +335,8 @@ pub struct Credits {
     pub overdraft_limit: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FallbackPolicy {
     pub on_backend_unreachable: FallbackAction,
     pub on_credits_exhausted: FallbackAction,
@@ -324,20 +344,35 @@ pub struct FallbackPolicy {
     pub queue_ttl_seconds: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Revocation {
     pub crl_url: Option<String>,
     pub push_channel: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Signature {
     pub alg: String,
     pub kid: String,
+    #[serde(deserialize_with = "deserialize_signature_hex")]
     pub sig: [u8; RCX_CT_SIGNATURE_LEN],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+fn deserialize_signature_hex<'de, D>(deserializer: D) -> Result<[u8; RCX_CT_SIGNATURE_LEN], D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let encoded = String::deserialize(deserializer)?;
+    let decoded = hex::decode(encoded).map_err(serde::de::Error::custom)?;
+    decoded
+        .try_into()
+        .map_err(|_| serde::de::Error::custom("signature.sig must be exactly 64 bytes of hex"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RcxCapabilityToken {
     pub spec_version: String,
     pub token_id: String,

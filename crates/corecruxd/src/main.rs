@@ -137,7 +137,7 @@ use corecrux_types::{
 use crate::auth::AuthMode;
 use crate::config::{load_config, CommitLevel};
 use crate::dataplane_store::AppendError;
-use crate::http::{AppState, CapacityState, Readiness};
+use crate::http::{AppState, CapacityState, Readiness, SYNC_HANDSHAKE_NONCE_TTL_SECONDS};
 use crate::metrics::Metrics;
 use crate::ops_events::{append_ops_event, build_node_context, now_unix_ms};
 use crate::shard_map::{RoutingTable, ShardMapStore};
@@ -610,6 +610,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.data_dir.clone(),
     );
 
+    if config.sync_mutual_auth && config.sync_peer_trust_root.is_none() {
+        tracing::warn!(
+            "sync mutual auth is enabled without a valid CORECRUXD_SYNC_PEER_TRUST_ROOT; tenant sync requests will fail closed"
+        );
+    }
+
     let state = AppState {
         lock_held: true,
         build: build.clone(),
@@ -620,6 +626,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         auth: auth.clone(),
         rcx_router: Some(rcx_router.clone()),
         data_dir: config.data_dir.clone(),
+        sync_mutual_auth: config.sync_mutual_auth,
+        sync_peer_trust_root: config.sync_peer_trust_root.clone(),
+        sync_handshake_nonces: Arc::new(std::sync::Mutex::new(crux_sync::peer_handshake::NonceCache::new(
+            SYNC_HANDSHAKE_NONCE_TTL_SECONDS,
+        ))),
         witness: crate::witness::WitnessRuntimeConfigV1::from_config(&config),
         witness_proofs: Arc::new(RwLock::new(
             match crate::witness_proofs::WitnessProofStore::with_persistence(&config.data_dir) {
@@ -4281,6 +4292,11 @@ mod tests {
             auth,
             rcx_router: None,
             data_dir: tmp.path().to_path_buf(),
+            sync_mutual_auth: false,
+            sync_peer_trust_root: None,
+            sync_handshake_nonces: std::sync::Arc::new(std::sync::Mutex::new(
+                crux_sync::peer_handshake::NonceCache::new(crate::http::SYNC_HANDSHAKE_NONCE_TTL_SECONDS),
+            )),
             witness: crate::witness::WitnessRuntimeConfigV1::disabled(),
             witness_proofs: std::sync::Arc::new(tokio::sync::RwLock::new(
                 crate::witness_proofs::WitnessProofStore::default(),

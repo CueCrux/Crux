@@ -143,6 +143,9 @@ use crate::auth::{
 use crate::control::{self, ValveDecision};
 use crate::dataplane_store::AppendError;
 
+/// Lifetime advertised for server-issued peer-handshake challenges.
+pub(crate) const SYNC_HANDSHAKE_NONCE_TTL_SECONDS: u64 = 120;
+
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_field_names)] // Fields share the "control_evidence" domain prefix intentionally
 pub struct Readiness {
@@ -199,6 +202,14 @@ pub struct AppState {
     pub auth: Authz,
     pub rcx_router: Option<Arc<crux_router::RcxRouter>>,
     pub data_dir: PathBuf,
+    /// Require the M2a Ed25519 peer handshake on every tenant sync endpoint.
+    /// Default OFF (`CORECRUXD_SYNC_MUTUAL_AUTH=1`). When enabled, the
+    /// handshake replaces scope auth; even admin scopes cannot bypass it.
+    pub sync_mutual_auth: bool,
+    /// Issuer Ed25519 public key used to validate peer capability tokens.
+    pub sync_peer_trust_root: Option<Vec<u8>>,
+    /// Shared single-use challenge state across cloned Axum application state.
+    pub sync_handshake_nonces: Arc<std::sync::Mutex<crux_sync::peer_handshake::NonceCache>>,
     pub witness: crate::witness::WitnessRuntimeConfigV1,
     pub witness_proofs: Arc<RwLock<crate::witness_proofs::WitnessProofStore>>,
     /// Ephemeral, bounded replay keys for verified cloud-witness records.
@@ -677,6 +688,10 @@ pub(crate) fn router_with_route_auth(
         .route(
             "/v1/features/capabilities/{id}/audit",
             axum::routing::post(self::features::post_audit),
+        )
+        .route(
+            "/v1/sync/handshake/nonce",
+            axum::routing::post(self::sync::post_handshake_nonce),
         )
         .route(
             "/v1/sync/tenants/{tenantId}/manifest",
