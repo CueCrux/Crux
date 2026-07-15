@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
@@ -1024,19 +1024,36 @@ fn probe_embedding_url(policy: &EmbeddingProbePolicy) -> Result<EmbeddingProbeRe
     // fails AND the URL points at localhost, we transparently retry with
     // common Docker-aware fallbacks before giving up.
     let candidates = build_probe_candidates(&policy.base_url);
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(6)))
-        .build()
-        .into();
 
     let probe_endpoints: [(&str, &str); 2] = [("ollama", "/api/tags"), ("openai-compat", "/v1/models")];
     let mut last_error = String::new();
 
     for candidate in &candidates {
-        if let Err(err) = ensure_embedding_probe_candidate_allowed(candidate, policy.allow_private_targets) {
-            last_error = err;
-            continue;
-        }
+        // L1 (DNS-rebind): resolve + validate the host ONCE, then pin the agent
+        // to those exact addresses so the actual fetch cannot re-resolve to a
+        // different (e.g. metadata / CGNAT) IP between the check and the connect.
+        let parsed = match parse_embedding_probe_url(candidate) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                last_error = err;
+                continue;
+            }
+        };
+        let addrs = match resolve_validated_probe_addrs(&parsed, policy.allow_private_targets) {
+            Ok(addrs) => addrs,
+            Err(err) => {
+                last_error = err;
+                continue;
+            }
+        };
+        let config = ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_secs(6)))
+            .build();
+        let agent: ureq::Agent = ureq::Agent::with_parts(
+            config,
+            ureq::unversioned::transport::DefaultConnector::new(),
+            PinnedResolver { addrs },
+        );
         for (shape, path) in probe_endpoints {
             let probe_url = format!("{candidate}{path}");
             match agent.get(&probe_url).header("Accept", "application/json").call() {
@@ -1124,24 +1141,58 @@ fn parse_embedding_probe_url(url: &str) -> Result<url::Url, String> {
     Ok(parsed)
 }
 
-fn ensure_embedding_probe_candidate_allowed(candidate: &str, allow_private_targets: bool) -> Result<(), String> {
-    let parsed = parse_embedding_probe_url(candidate)?;
-    ensure_embedding_probe_addr_allowed(&parsed, allow_private_targets)
+fn ensure_embedding_probe_addr_allowed(parsed: &url::Url, allow_private_targets: bool) -> Result<(), String> {
+    resolve_validated_probe_addrs(parsed, allow_private_targets).map(|_| ())
 }
 
-fn ensure_embedding_probe_addr_allowed(parsed: &url::Url, allow_private_targets: bool) -> Result<(), String> {
+/// Resolve the probe URL's host to concrete socket addresses **once** and
+/// validate every one against the private/CGNAT/metadata denylist, returning the
+/// validated set. The caller pins the ureq agent to exactly these addresses
+/// (via [`PinnedResolver`]) so the fetch cannot re-resolve to a different IP
+/// after the check — closing the DNS-rebind window (L1).
+fn resolve_validated_probe_addrs(parsed: &url::Url, allow_private_targets: bool) -> Result<Vec<SocketAddr>, String> {
     let host = parsed.host_str().ok_or_else(|| "url must include a host".to_string())?;
     let port = parsed.port_or_known_default().unwrap_or(80);
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return ensure_embedding_ip_allowed(ip, allow_private_targets);
+        ensure_embedding_ip_allowed(ip, allow_private_targets)?;
+        return Ok(vec![SocketAddr::new(ip, port)]);
     }
-    for addr in (host, port)
+    let addrs: Vec<SocketAddr> = (host, port)
         .to_socket_addrs()
         .map_err(|e| format!("could not resolve embedding probe host '{host}': {e}"))?
-    {
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("embedding probe host '{host}' resolved to no addresses"));
+    }
+    for addr in &addrs {
         ensure_embedding_ip_allowed(addr.ip(), allow_private_targets)?;
     }
-    Ok(())
+    Ok(addrs)
+}
+
+/// A ureq resolver pinned to a pre-validated set of socket addresses. It ignores
+/// the request URI's host entirely and always returns the addresses validated at
+/// check time, so the transport connects to exactly what was vetted (L1).
+#[derive(Debug)]
+struct PinnedResolver {
+    addrs: Vec<SocketAddr>,
+}
+
+impl ureq::unversioned::resolver::Resolver for PinnedResolver {
+    fn resolve(
+        &self,
+        _uri: &ureq::http::Uri,
+        _config: &ureq::config::Config,
+        _timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+        // `self.addrs` is always non-empty (validated by resolve_validated_probe_addrs).
+        let mut out = self.empty();
+        // ureq's ResolvedSocketAddrs holds at most 16 (MAX_ADDRS) entries.
+        for addr in self.addrs.iter().take(16) {
+            out.push(*addr);
+        }
+        Ok(out)
+    }
 }
 
 fn ensure_embedding_ip_allowed(ip: IpAddr, allow_private_targets: bool) -> Result<(), String> {
@@ -1162,6 +1213,10 @@ fn is_private_probe_ip(ip: IpAddr) -> bool {
                 || v4.is_unspecified()
                 || v4.is_broadcast()
                 || v4.is_multicast()
+                // L2: CGNAT / Tailscale shared range 100.64.0.0/10 (RFC 6598).
+                // `Ipv4Addr::is_shared()` is still unstable, so match the range
+                // directly: first octet 100, second octet 64..=127.
+                || is_cgnat_shared_v4(v4)
         }
         IpAddr::V6(v6) => {
             v6.is_loopback()
@@ -1171,6 +1226,13 @@ fn is_private_probe_ip(ip: IpAddr) -> bool {
                 || v6.is_unicast_link_local()
         }
     }
+}
+
+/// RFC 6598 shared address space `100.64.0.0/10` (carrier-grade NAT; also the
+/// Tailscale CGNAT range). `Ipv4Addr::is_shared()` is unstable, so match by hand.
+fn is_cgnat_shared_v4(v4: std::net::Ipv4Addr) -> bool {
+    let o = v4.octets();
+    o[0] == 100 && (64..=127).contains(&o[1])
 }
 
 fn embedding_probe_private_targets_allowed(parsed: &url::Url) -> bool {
@@ -1264,6 +1326,62 @@ mod probe_candidate_tests {
         let policy = validate_embedding_probe_url("http://127.0.0.1:11434").expect("configured local endpoint");
         assert!(policy.allow_private_targets);
         std::env::remove_var("CORECRUXD_EMBEDDING_URL");
+    }
+
+    // ── M4 L2: CGNAT / Tailscale shared range 100.64.0.0/10 ──────────────
+    #[test]
+    fn cgnat_shared_range_counts_as_private() {
+        use super::is_private_probe_ip;
+        for ip in ["100.64.0.1", "100.100.5.5", "100.127.255.255"] {
+            assert!(
+                is_private_probe_ip(ip.parse().unwrap()),
+                "{ip} is CGNAT (100.64.0.0/10) and must be blocked"
+            );
+        }
+        // Just outside the /10 boundary, and unrelated 100.x — must NOT be flagged CGNAT.
+        for ip in ["100.63.255.255", "100.128.0.0", "99.64.0.0", "101.64.0.0", "8.8.8.8"] {
+            assert!(
+                !is_private_probe_ip(ip.parse().unwrap()),
+                "{ip} is not CGNAT/private and must be allowed"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn embedding_probe_blocks_cgnat_by_default() {
+        std::env::remove_var("CORECRUXD_EMBEDDING_URL");
+        std::env::remove_var("CORECRUXD_EMBEDDING_PROBE_ALLOW_LOCAL");
+        let err = validate_embedding_probe_url("http://100.64.0.5:11434").unwrap_err();
+        assert!(err.contains("private"), "CGNAT target must be rejected: {err}");
+    }
+
+    // ── M4 L1: resolve-once-and-pin (DNS-rebind) ─────────────────────────
+    #[test]
+    fn resolve_validated_probe_addrs_pins_exact_validated_ip() {
+        use super::{parse_embedding_probe_url, resolve_validated_probe_addrs};
+        // A literal public IP resolves to exactly itself — this is the address
+        // the PinnedResolver hands the transport, so the fetch cannot re-resolve
+        // to a different (rebound) IP after the check.
+        let parsed = parse_embedding_probe_url("http://8.8.8.8:11434").unwrap();
+        let addrs = resolve_validated_probe_addrs(&parsed, false).unwrap();
+        assert_eq!(addrs, vec!["8.8.8.8:11434".parse().unwrap()]);
+    }
+
+    #[test]
+    fn resolve_validated_probe_addrs_rejects_blocked_ip() {
+        use super::{parse_embedding_probe_url, resolve_validated_probe_addrs};
+        for url in [
+            "http://100.64.0.9:11434",
+            "http://169.254.169.254:80",
+            "http://10.1.2.3:11434",
+        ] {
+            let parsed = parse_embedding_probe_url(url).unwrap();
+            assert!(
+                resolve_validated_probe_addrs(&parsed, false).is_err(),
+                "{url} must be rejected as private/CGNAT/metadata"
+            );
+        }
     }
 }
 
