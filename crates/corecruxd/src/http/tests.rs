@@ -1466,6 +1466,106 @@ async fn resolve_principal_cross_tenant_denied_t1() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
+async fn tenant_write_stamp_isolates_reads_end_to_end_m1() {
+    // OD-37 / audit-v2 closeout M1: a write authorized for tenant A stamps
+    // tenant_hash == A; a reader in tenant A sees it, a reader in tenant B does not.
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    const TEST_HS256_SECRET: &str = "0123456789abcdef0123456789abcdef";
+
+    std::env::set_var("CORECRUXD_JWT_HS256_SECRET", TEST_HS256_SECRET);
+    std::env::set_var("CORECRUXD_JWT_ISS", "corecrux-test");
+    std::env::set_var("CORECRUXD_JWT_AUD", "corecrux");
+    std::env::set_var("CORECRUXD_TENANT_WRITE_STAMP", "1");
+
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+
+    #[derive(serde::Serialize)]
+    struct Claims<'a> {
+        exp: usize,
+        iss: &'a str,
+        aud: &'a str,
+        scope: &'a str,
+        tenant_id: &'a str,
+    }
+    let bearer = |scope: &str, tenant: &str| {
+        let claims = Claims {
+            exp: (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600) as usize,
+            iss: "corecrux-test",
+            aud: "corecrux",
+            scope,
+            tenant_id: tenant,
+        };
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(TEST_HS256_SECRET.as_bytes()),
+        )
+        .expect("jwt");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        headers
+    };
+
+    let entity = "tenant-iso-m1-widget";
+    let body: corecrux_memory::fact_store::StoreFact =
+        serde_json::from_value(serde_json::json!({ "entity": entity, "key": "k", "value": "v" })).unwrap();
+
+    // Write authorized for tenant A → stamps tenant-a.
+    let resp = facts::put_fact(State(state.clone()), bearer("facts:write", "tenant-a"), Json(body))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED, "authorized write must succeed");
+    let bytes = to_bytes(resp.into_body(), 1_048_576).await.expect("read body");
+    let stored: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(stored["tenant_hash"], "tenant-a", "write must stamp the token's tenant");
+
+    // Reader in tenant A sees it.
+    let resp_a = facts::get_facts_by_entity(
+        State(state.clone()),
+        bearer("query:read", "tenant-a"),
+        Path(entity.to_string()),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp_a.status(), StatusCode::OK);
+    let a: serde_json::Value = serde_json::from_slice(&to_bytes(resp_a.into_body(), 1_048_576).await.unwrap()).unwrap();
+    assert_eq!(
+        a["facts"].as_array().unwrap().len(),
+        1,
+        "same-tenant reader must see the fact"
+    );
+
+    // Reader in tenant B must NOT see it (T.1 cross-tenant read).
+    let resp_b = facts::get_facts_by_entity(
+        State(state.clone()),
+        bearer("query:read", "tenant-b"),
+        Path(entity.to_string()),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp_b.status(), StatusCode::OK);
+    let b: serde_json::Value = serde_json::from_slice(&to_bytes(resp_b.into_body(), 1_048_576).await.unwrap()).unwrap();
+    assert_eq!(
+        b["facts"].as_array().unwrap().len(),
+        0,
+        "cross-tenant reader must NOT see the fact"
+    );
+
+    std::env::remove_var("CORECRUXD_JWT_HS256_SECRET");
+    std::env::remove_var("CORECRUXD_JWT_ISS");
+    std::env::remove_var("CORECRUXD_JWT_AUD");
+    std::env::remove_var("CORECRUXD_TENANT_WRITE_STAMP");
+}
+
+#[tokio::test]
 async fn console_redacts_private_facts_and_session_state() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     {
