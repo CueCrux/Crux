@@ -57,6 +57,20 @@ line. Authentication headers
 (`x-api-key` and `Authorization`) are forwarded to the selected provider but
 are never logged, persisted, or included in a digest.
 
+Session attribution uses a separate, optional listener secret. Set
+`CRUX_CLOUD_WITNESS_SESSION_TOKEN` in the witness process, then have the client
+send both `x-crux-session-id: <session-id>` and
+`x-crux-witness-auth: <same-token>`. The shim copies the session id into the
+signed record only when the presented token matches the configured token. The
+shim stores a BLAKE3 hash of the configured secret and compares fixed-size
+hashes in constant time. If the token is not configured, empty, missing, or
+wrong, `session_hint` is omitted; the request is still forwarded so an
+attribution failure cannot turn into a provider outage.
+`x-crux-witness-auth` is consumed by the loopback listener and is never
+forwarded upstream, logged, persisted, or included in a digest. This token
+proof-gates attribution only; it does not make the listener a general access
+control boundary.
+
 Witnessed calls are:
 
 - Anthropic `POST /v1/messages`;
@@ -71,12 +85,16 @@ For a witnessed call, the shim emits linked `cloud_request_witnessed` and
 `cloud_response_witnessed` records under
 `cuecrux.mediation.witness.v1`. They contain SHA-256 request/output digests,
 provider and model metadata, tool names without arguments, stream state,
-timing, status, and usage/stop metadata when parseable. Each record is signed
-with a dedicated Ed25519 witness key. The key is created with mode `0600` on
-first use at `~/.local/state/crux/llm-shim/witness.key`, then reused; override
-the location with `--witness-key <path>`. The signed envelope carries its key
-id and public key so records can be checked offline against the expected,
-pinned witness public key. A symlink/non-regular key, a key that is
+timing, status, and usage/stop metadata when parseable. Each evidence record
+also carries its own fresh random 128-bit hexadecimal nonce. The nonce is added
+before the record is signed, so it cannot be replaced to evade daemon replay
+deduplication. `passthrough_unwitnessed` and `witness_degraded` records do not
+carry replay-protected nonces. Each evidence record is signed with a dedicated
+Ed25519 witness key. The key is created with mode `0600` on first use at
+`~/.local/state/crux/llm-shim/witness.key`, then reused; override the location
+with `--witness-key <path>`. The signed envelope carries its key id and public
+key so records can be checked offline against the expected, pinned witness
+public key. A symlink/non-regular key, a key that is
 group/world-accessible when loaded, or a group/world-writable key directory
 degrades the witness instead of silently reusing unsafe custody.
 
@@ -84,15 +102,19 @@ What this proves: the holder of the pinned witness key observed bytes matching
 the committed request and response digests and linked them to the recorded
 request/response lifecycle and end-state while connecting to the selected
 pinned TLS upstream. Altering a signed record or committed digest invalidates
-verification.
+verification. The signed nonce makes each evidence record independently
+identifiable; a corresponding daemon-signed mediation observation additionally
+shows that this daemon accepted the nonce once while the record was fresh.
 
 What this does **not** prove: that the provider used a particular internal
 model or tool, that an answer is correct, that the local host or witness key
-was uncompromised, or that every cloud call was routed through the witness.
-The witness cannot prevent bypass. A bypass instead creates a detectable
-absence when the witness trail is reconciled with an independently known
-session or invocation sequence; a standalone receipt set cannot prove that
-unrecorded calls never occurred.
+was uncompromised, or that every cloud call was routed through the witness. A
+`session_hint` proves possession of the shared listener token, not a unique
+person or process; a same-UID compromise can read both that token and the
+witness key. The witness cannot prevent bypass. A bypass instead creates a
+detectable absence when the witness trail is reconciled with an independently
+known session or invocation sequence; a standalone receipt set cannot prove
+that unrecorded calls never occurred.
 
 Witnessing is fail-soft. A key, signing, daemon-delivery, or spool failure must
 not turn into a model outage: the provider call is still forwarded and the
@@ -112,10 +134,17 @@ The daemon check establishes that the record is internally consistent with
 the key carried by the envelope; it does **not** enrol or pin that key as a
 trusted witness identity. An operator or offline verifier must separately pin
 the expected witness identity to reject wholesale replacement of the key,
-`kid`, record, and signature. Daemon delivery also adds no nonce, sequence,
-freshness check, or replay guard, and it does not authenticate the
-caller-supplied session hint. The same-UID key-custody and bypass limits above
-therefore remain unchanged. The cloud delivery queue is bounded and
+`kid`, record, and signature. After signature and schema validation, daemon
+delivery rejects a record more than 10 minutes old or more than 60 seconds in
+the future. Before appending, it deduplicates on the signed nonce, with
+`receipt_id` as a compatibility fallback for legacy spooled records. Seen keys
+live in a bounded, TTL-pruned in-memory cache in daemon application state.
+Consequently, the replay guarantee is local to one running daemon and its
+freshness window: the cache is not durable across restart, and a signed nonce
+alone does not prove global uniqueness. Old spooled records still parse, but
+records outside the freshness window are not accepted into the daemon ledger.
+The same-UID key-custody, independent-key-pinning, content-semantics, and bypass
+limits above remain unchanged. The cloud delivery queue is bounded and
 non-blocking; concurrent processes lock each JSONL append so separate
 local/Anthropic/OpenAI instances cannot interleave record framing.
 
@@ -125,25 +154,31 @@ Run a witness instance on a port distinct from any local injection shim, then
 point the Anthropic client at its loopback listener:
 
 ```bash
-CRUX_CLOUD_WITNESS=1 crux-llm-shim \
+CRUX_CLOUD_WITNESS=1 \
+CRUX_CLOUD_WITNESS_SESSION_TOKEN='<shared-session-token>' \
+crux-llm-shim \
   --cloud-witness \
   --cloud-upstream anthropic \
   --listen 127.0.0.1:11436
 
 export ANTHROPIC_BASE_URL=http://127.0.0.1:11436
-# Run the Anthropic client normally; keep ANTHROPIC_API_KEY configured as usual.
+# Configure the client to send x-crux-session-id and x-crux-witness-auth when
+# session attribution is required. Keep ANTHROPIC_API_KEY configured as usual.
 ```
 
 ### OpenAI quickstart
 
 ```bash
-CRUX_CLOUD_WITNESS=1 crux-llm-shim \
+CRUX_CLOUD_WITNESS=1 \
+CRUX_CLOUD_WITNESS_SESSION_TOKEN='<shared-session-token>' \
+crux-llm-shim \
   --cloud-witness \
   --cloud-upstream openai \
   --listen 127.0.0.1:11437
 
 export OPENAI_BASE_URL=http://127.0.0.1:11437/v1
-# Run the OpenAI client normally; keep OPENAI_API_KEY configured as usual.
+# Configure the client to send x-crux-session-id and x-crux-witness-auth when
+# session attribution is required. Keep OPENAI_API_KEY configured as usual.
 ```
 
 Local injection mode and cloud witness mode have independent enable flags and

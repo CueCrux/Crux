@@ -8,6 +8,12 @@ license.workspace = true
 [features]
 default = []
 llm = []
+# buyer-fit M3.4: optional real CPU embedding model (fastembed / ONNX Runtime).
+# OFF by default — the default binary stays lean and the always-on pure-Rust
+# LocalHashEmbedder is the offline default. Enable for higher-quality vectors
+# (downloads the model on first use into the data dir). Mirrors the daemon's
+# off-by-default `wasm-extensions` feature precedent.
+dense-embed-model = ["dep:fastembed"]
 
 [dependencies]
 blake3 = { workspace = true }
@@ -22,6 +28,14 @@ uuid = { workspace = true, features = ["v4"] }
 chrono = { workspace = true, features = ["clock", "serde"] }
 tokio = { workspace = true, features = ["sync"] }
 ureq = { workspace = true, features = ["json"] }
+# Optional real embedding model (buyer-fit M3.4). Off unless `dense-embed-model`
+# is enabled; the default build never compiles or downloads it. rustls (not
+# native-tls) so it builds without system OpenSSL — correct for minimal /
+# Chainguard runtime images too.
+fastembed = { version = "5", optional = true, default-features = false, features = [
+  "ort-download-binaries-rustls-tls",
+  "hf-hub-rustls-tls",
+] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

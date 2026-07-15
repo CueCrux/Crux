@@ -25,6 +25,8 @@ use corecrux_types::{
     NodeAddr, ShardDescriptor, ShardMapV1, ShardState, DEFAULT_COMPAT_REQUIRES, DEFAULT_SDK_VERSION,
     SHARDMAP_HASH_FN_V1, SHARDMAP_KEY_ENCODING_V1, SHARDMAP_V1,
 };
+use ed25519_dalek::{Signer as _, SigningKey};
+use tower::ServiceExt as _;
 
 fn test_node(node_id: &str, http_addr: &str, grpc_addr: &str) -> NodeAddr {
     NodeAddr {
@@ -94,6 +96,197 @@ pub(super) fn sample_verification_report(receipt_id: &str, tenant_id: &str) -> c
         "verifier_build": "test"
     }))
     .expect("sample verification report")
+}
+
+fn sync_test_passport_fpr(public_key: &[u8; 32]) -> String {
+    let digest = blake3::hash(public_key);
+    format!("p_{}", hex::encode(&digest.as_bytes()[..16]))
+}
+
+fn sync_test_peer(tenant_id: &str) -> (SigningKey, SigningKey, rcx_capability_token::RcxCapabilityToken) {
+    let trust_root = SigningKey::from_bytes(&[0x41; 32]);
+    let subject = SigningKey::from_bytes(&[0x42; 32]);
+    let trust_root_fpr = sync_test_passport_fpr(&trust_root.verifying_key().to_bytes());
+    let mut token = rcx_capability_token::free_local_verified_fixture();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock")
+        .as_secs();
+    token.token_id = "rcxct_peer_handshake_http_test".to_string();
+    token.issued_at = now.saturating_sub(60);
+    token.refresh_hint_at = now.saturating_add(1_800);
+    token.expires_at = now.saturating_add(3_600);
+    token.subject.passport_fpr = sync_test_passport_fpr(&subject.verifying_key().to_bytes());
+    token.tenant_scope.tenant_id = tenant_id.to_string();
+    token.issuer.passport_kid.clone_from(&trust_root_fpr);
+    token.signature.kid.clone_from(&trust_root_fpr);
+    token.backends[0].trust_root_kid = trust_root_fpr;
+    token.signature.sig = trust_root.sign(&token.token_hash()).to_bytes();
+    (trust_root, subject, token)
+}
+
+fn sync_peer_headers(
+    token: &rcx_capability_token::RcxCapabilityToken,
+    subject: &SigningKey,
+    possession_key: &SigningKey,
+    nonce: &[u8],
+) -> HeaderMap {
+    let mut signing_message = crux_sync::peer_handshake::PEER_HANDSHAKE_SIGNING_DOMAIN.to_vec();
+    signing_message.extend_from_slice(token.token_id.as_bytes());
+    signing_message.push(0);
+    signing_message.extend_from_slice(nonce);
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-crux-peer-token",
+        HeaderValue::from_str(&base64::engine::general_purpose::STANDARD.encode(token.to_canonical_json().as_bytes()))
+            .expect("peer token header"),
+    );
+    headers.insert(
+        "x-crux-peer-pubkey",
+        HeaderValue::from_str(&hex::encode(subject.verifying_key().to_bytes())).expect("peer public key header"),
+    );
+    headers.insert(
+        "x-crux-peer-nonce",
+        HeaderValue::from_str(&hex::encode(nonce)).expect("peer nonce header"),
+    );
+    headers.insert(
+        "x-crux-peer-sig",
+        HeaderValue::from_str(&hex::encode(possession_key.sign(&signing_message).to_bytes()))
+            .expect("peer signature header"),
+    );
+    headers
+}
+
+fn sync_http_request(method: &str, uri: &str, headers: HeaderMap) -> axum::http::Request<axum::body::Body> {
+    let mut request = axum::http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(axum::body::Body::empty())
+        .expect("sync request");
+    *request.headers_mut() = headers;
+    request
+}
+
+fn sync_mutual_auth_app(trust_root: &SigningKey) -> Router {
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    state.sync_mutual_auth = true;
+    state.sync_peer_trust_root = Some(trust_root.verifying_key().to_bytes().to_vec());
+    router_with_route_auth(state, test_case_store(), RouteAuthMode::Enforce)
+}
+
+async fn issue_sync_handshake_nonce(app: &Router) -> Vec<u8> {
+    let response = app
+        .clone()
+        .oneshot(sync_http_request("POST", "/v1/sync/handshake/nonce", HeaderMap::new()))
+        .await
+        .expect("nonce response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL),
+        Some(&HeaderValue::from_static("no-store"))
+    );
+    let body = json_body(response).await;
+    assert_eq!(body["ttl_seconds"], SYNC_HANDSHAKE_NONCE_TTL_SECONDS);
+    hex::decode(body["nonce"].as_str().expect("nonce string")).expect("nonce hex")
+}
+
+#[tokio::test]
+async fn sync_mutual_auth_accepts_valid_peer_for_bound_tenant() {
+    let (trust_root, subject, token) = sync_test_peer("tenant-acme");
+    let app = sync_mutual_auth_app(&trust_root);
+    let nonce = issue_sync_handshake_nonce(&app).await;
+    let response = app
+        .oneshot(sync_http_request(
+            "GET",
+            "/v1/sync/tenants/tenant-acme/manifest",
+            sync_peer_headers(&token, &subject, &subject, &nonce),
+        ))
+        .await
+        .expect("manifest response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn sync_mutual_auth_rejects_missing_handshake_headers_even_with_admin_scope() {
+    let (trust_root, _, _) = sync_test_peer("tenant-acme");
+    let app = sync_mutual_auth_app(&trust_root);
+    let response = app
+        .oneshot(sync_http_request(
+            "GET",
+            "/v1/sync/tenants/tenant-acme/manifest",
+            dev_scope_headers("admin:read"),
+        ))
+        .await
+        .expect("manifest response");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = json_body(response).await;
+    assert_eq!(body["code"], "SYNC_PEER_AUTH_FAILED");
+    assert_eq!(body["reason_class"], "missing_peer_handshake");
+}
+
+#[tokio::test]
+async fn sync_mutual_auth_rejects_bad_possession_signature() {
+    let (trust_root, subject, token) = sync_test_peer("tenant-acme");
+    let attacker = SigningKey::from_bytes(&[0x43; 32]);
+    let app = sync_mutual_auth_app(&trust_root);
+    let nonce = issue_sync_handshake_nonce(&app).await;
+    let response = app
+        .oneshot(sync_http_request(
+            "GET",
+            "/v1/sync/tenants/tenant-acme/manifest",
+            sync_peer_headers(&token, &subject, &attacker, &nonce),
+        ))
+        .await
+        .expect("manifest response");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = json_body(response).await;
+    assert_eq!(body["reason_class"], "peer_possession_rejected");
+}
+
+#[tokio::test]
+async fn sync_mutual_auth_rejects_tenant_mismatch() {
+    let (trust_root, subject, token) = sync_test_peer("tenant-acme");
+    let app = sync_mutual_auth_app(&trust_root);
+    let nonce = issue_sync_handshake_nonce(&app).await;
+    let response = app
+        .oneshot(sync_http_request(
+            "GET",
+            "/v1/sync/tenants/tenant-other/manifest",
+            sync_peer_headers(&token, &subject, &subject, &nonce),
+        ))
+        .await
+        .expect("manifest response");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = json_body(response).await;
+    assert_eq!(body["code"], "SYNC_PEER_TENANT_MISMATCH");
+    assert_eq!(body["reason_class"], "peer_tenant_mismatch");
+}
+
+#[tokio::test]
+async fn sync_mutual_auth_flag_off_preserves_scope_auth_and_hides_nonce() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let app = router_with_route_auth(state, test_case_store(), RouteAuthMode::Enforce);
+    let nonce_response = app
+        .clone()
+        .oneshot(sync_http_request("POST", "/v1/sync/handshake/nonce", HeaderMap::new()))
+        .await
+        .expect("nonce response");
+    assert_eq!(nonce_response.status(), StatusCode::NOT_FOUND);
+
+    let manifest_response = app
+        .oneshot(sync_http_request(
+            "GET",
+            "/v1/sync/tenants/tenant-acme/manifest",
+            dev_scope_headers("facts:read"),
+        ))
+        .await
+        .expect("manifest response");
+    assert_eq!(manifest_response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -380,10 +573,16 @@ pub(super) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         auth,
         rcx_router: None,
         data_dir: root.clone(),
+        sync_mutual_auth: false,
+        sync_peer_trust_root: None,
+        sync_handshake_nonces: Arc::new(std::sync::Mutex::new(crux_sync::peer_handshake::NonceCache::new(
+            SYNC_HANDSHAKE_NONCE_TTL_SECONDS,
+        ))),
         witness: crate::witness::WitnessRuntimeConfigV1::disabled(),
         witness_proofs: std::sync::Arc::new(tokio::sync::RwLock::new(
             crate::witness_proofs::WitnessProofStore::default(),
         )),
+        cloud_witness_replay_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         mcp_enabled: true,
         console_enabled: true,
         coord_enabled: true,

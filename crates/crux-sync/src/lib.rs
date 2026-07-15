@@ -11,4 +11,5 @@
 
 pub mod auth;
 pub mod outbox;
+pub mod peer_handshake;
 pub mod sync_client;
