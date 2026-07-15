@@ -121,7 +121,7 @@ fn peer_rejection_class(error: &PeerAuthError) -> &'static str {
 }
 
 #[allow(clippy::result_large_err)]
-fn require_sync_peer(state: &AppState, headers: &HeaderMap, tenant_id: &str) -> Result<(), Response> {
+async fn require_sync_peer(state: &AppState, headers: &HeaderMap, tenant_id: &str) -> Result<(), Response> {
     let handshake = parse_peer_handshake(headers).map_err(|error| match error {
         PeerHandshakeParseError::Missing => peer_auth_problem("missing_peer_handshake"),
         PeerHandshakeParseError::Malformed => peer_auth_problem("malformed_peer_handshake"),
@@ -131,14 +131,30 @@ fn require_sync_peer(state: &AppState, headers: &HeaderMap, tenant_id: &str) -> 
         .as_deref()
         .ok_or_else(|| peer_auth_problem("peer_trust_unavailable"))?;
     let now = current_unix_seconds();
+
+    // M3: resolve peer revocation from the identity-links plane (v0.5.30). Links
+    // are keyed by remote fingerprint; a link with `revoked_at` set revokes that
+    // peer. Fail-open — an unlinked or live peer is not revoked (matches
+    // `caller_revocation_reason`). Only read the store when links are enabled.
+    let revoked_peer_fprs: std::collections::HashSet<String> = if state.identity_links_enabled {
+        let entities = state.entity_store.read().await;
+        crate::identity_links::list_links(&entities)
+            .into_iter()
+            .filter(|(_, link)| link.revoked_at.is_some())
+            .map(|(_, link)| link.remote_fpr)
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
     let mut nonce_cache = state
         .sync_handshake_nonces
         .lock()
         .map_err(|_| peer_verification_unavailable())?;
 
-    // Revocation-plane integration is a follow-up. The hook deliberately
-    // returns false until the real passport revocation source is wired.
-    let verification = verify_peer_handshake(&handshake, trust_root, now, &mut nonce_cache, |_| false);
+    let verification = verify_peer_handshake(&handshake, trust_root, now, &mut nonce_cache, |token| {
+        revoked_peer_fprs.contains(&token.subject.passport_fpr)
+    });
     nonce_cache.sweep_expired(now);
     let authenticated = verification.map_err(|error| peer_auth_problem(peer_rejection_class(&error)))?;
     drop(nonce_cache);
@@ -243,9 +259,9 @@ fn validate_tenant_id(tenant_id: &str) -> Result<(), Response> {
 }
 
 #[allow(clippy::result_large_err)]
-fn require_sync_read(state: &AppState, headers: &HeaderMap, tenant_id: &str) -> Result<(), Response> {
+async fn require_sync_read(state: &AppState, headers: &HeaderMap, tenant_id: &str) -> Result<(), Response> {
     if state.sync_mutual_auth {
-        return require_sync_peer(state, headers, tenant_id);
+        return require_sync_peer(state, headers, tenant_id).await;
     }
 
     let ctx = crate::auth::http_scope_context(&state.auth, headers).map_err(IntoResponse::into_response)?;
@@ -257,9 +273,9 @@ fn require_sync_read(state: &AppState, headers: &HeaderMap, tenant_id: &str) -> 
 }
 
 #[allow(clippy::result_large_err)]
-fn require_sync_write(state: &AppState, headers: &HeaderMap, tenant_id: &str) -> Result<(), Response> {
+async fn require_sync_write(state: &AppState, headers: &HeaderMap, tenant_id: &str) -> Result<(), Response> {
     if state.sync_mutual_auth {
-        return require_sync_peer(state, headers, tenant_id);
+        return require_sync_peer(state, headers, tenant_id).await;
     }
 
     let ctx = crate::auth::http_scope_context(&state.auth, headers).map_err(IntoResponse::into_response)?;
@@ -279,7 +295,7 @@ pub(super) async fn get_tenant_manifest(
     if let Err(problem) = validate_tenant_id(&tenant_id) {
         return problem;
     }
-    if let Err(problem) = require_sync_read(&state, &headers, &tenant_id) {
+    if let Err(problem) = require_sync_read(&state, &headers, &tenant_id).await {
         return problem;
     }
     let store = state.fact_store.read().await;
@@ -305,7 +321,7 @@ pub(super) async fn get_tenant_collection(
     if let Err(problem) = validate_tenant_id(&tenant_id) {
         return problem;
     }
-    if let Err(problem) = require_sync_read(&state, &headers, &tenant_id) {
+    if let Err(problem) = require_sync_read(&state, &headers, &tenant_id).await {
         return problem;
     }
     let store = state.fact_store.read().await;
@@ -331,7 +347,7 @@ pub(super) async fn post_promotion_preview(
     if let Err(problem) = validate_tenant_id(&tenant_id) {
         return problem;
     }
-    if let Err(problem) = require_sync_read(&state, &headers, &tenant_id) {
+    if let Err(problem) = require_sync_read(&state, &headers, &tenant_id).await {
         return problem;
     }
     let store = state.fact_store.read().await;
@@ -348,7 +364,7 @@ pub(super) async fn post_promotion_confirm(
     if let Err(problem) = validate_tenant_id(&tenant_id) {
         return problem;
     }
-    if let Err(problem) = require_sync_write(&state, &headers, &tenant_id) {
+    if let Err(problem) = require_sync_write(&state, &headers, &tenant_id).await {
         return problem;
     }
 
@@ -394,7 +410,7 @@ pub(super) async fn post_tenant_offboard(
     if let Err(problem) = validate_tenant_id(&tenant_id) {
         return problem;
     }
-    if let Err(problem) = require_sync_write(&state, &headers, &tenant_id) {
+    if let Err(problem) = require_sync_write(&state, &headers, &tenant_id).await {
         return problem;
     }
 
