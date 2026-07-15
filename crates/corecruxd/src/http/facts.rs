@@ -299,6 +299,8 @@ pub(super) async fn put_fact(
         Ok(fact) => fact,
         Err(response) => return response,
     };
+    // FU2: file any store-time semantic near-duplicate flags as review candidates.
+    crate::candidate_store::route_near_duplicates(&mut store, &chrono::Utc::now().to_rfc3339());
     (StatusCode::CREATED, axum::Json(serde_json::json!(fact))).into_response()
 }
 
@@ -340,6 +342,8 @@ pub(super) async fn put_facts_bulk(
         Ok(facts) => facts,
         Err(err) => return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     };
+    // FU2: file any store-time semantic near-duplicate flags as review candidates.
+    crate::candidate_store::route_near_duplicates(&mut store, &chrono::Utc::now().to_rfc3339());
     (StatusCode::CREATED, axum::Json(serde_json::json!({"facts": facts}))).into_response()
 }
 
