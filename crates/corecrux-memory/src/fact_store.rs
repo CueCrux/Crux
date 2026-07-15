@@ -58,6 +58,27 @@ enum JournalEvent {
         valid_to: Option<DateTime<Utc>>,
         set_at: String,
     },
+    /// Atomic consolidation (buyer-fit M2). A SINGLE journal event is the whole
+    /// mutation's commit point: it stores the canonical fact and retires every
+    /// `superseded_fact_id` (the consolidation targets PLUS the canonical's own
+    /// prior version). One append ⇒ all-or-nothing; a failed append leaves the
+    /// store untouched (no half-applied consolidation, the pre-M2 gap).
+    #[serde(rename = "consolidate")]
+    Consolidate {
+        canonical: Fact,
+        superseded_fact_ids: Vec<String>,
+        consolidated_at: String,
+    },
+    /// Atomic, reversible undo of a `Consolidate` (buyer-fit M2). Retires the
+    /// generated canonical and restores (`superseded_by = None`) every source.
+    /// One append ⇒ all-or-nothing; idempotent (re-undo of an already-undone
+    /// consolidation is a no-op).
+    #[serde(rename = "consolidate_undo")]
+    ConsolidateUndo {
+        canonical_fact_id: String,
+        restored_fact_ids: Vec<String>,
+        undone_at: String,
+    },
 }
 
 /// Per-fact freshness horizon class (child ExecPlan
@@ -322,6 +343,10 @@ fn default_consolidation_protected_confidence_floor() -> f32 {
 pub struct ConsolidationReceiptV1 {
     pub consolidation_id: String,
     pub canonical_fact_id: String,
+    /// `blake3:<hex>` of the canonical value — the "after" side of the diff,
+    /// carried so the call layer can mint a signed CROWN receipt (M2) without a
+    /// re-read. `superseded_fact_ids` is the "before" side (retrievable rows).
+    pub canonical_hash: String,
     pub superseded_fact_ids: Vec<String>,
     pub source_fact_ids: Vec<String>,
 }
@@ -330,6 +355,16 @@ pub struct ConsolidationReceiptV1 {
 pub struct ConsolidationPassReportV1 {
     pub status: String,
     pub receipt: ConsolidationReceiptV1,
+}
+
+/// Result of [`FactStore::consolidate_undo_v1`] (buyer-fit M2).
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ConsolidationUndoReportV1 {
+    /// `"undone"` or `"already_undone"` (idempotent no-op).
+    pub status: String,
+    pub canonical_fact_id: String,
+    /// The source facts actually restored (`superseded_by` cleared).
+    pub restored_fact_ids: Vec<String>,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -602,6 +637,33 @@ impl FactStore {
                     if let Some(fact) = self.facts.get_mut(&fact_id) {
                         fact.valid_from = valid_from;
                         fact.valid_to = valid_to;
+                    }
+                }
+                Ok(JournalEvent::Consolidate {
+                    canonical,
+                    superseded_fact_ids,
+                    ..
+                }) => {
+                    let canonical_id = canonical.fact_id.clone();
+                    self.replay_journal_insert(canonical);
+                    for id in superseded_fact_ids {
+                        if let Some(fact) = self.facts.get_mut(&id) {
+                            fact.superseded_by = Some(canonical_id.clone());
+                        }
+                    }
+                }
+                Ok(JournalEvent::ConsolidateUndo {
+                    canonical_fact_id,
+                    restored_fact_ids,
+                    ..
+                }) => {
+                    if let Some(fact) = self.facts.get_mut(&canonical_fact_id) {
+                        fact.deleted = true;
+                    }
+                    for id in restored_fact_ids {
+                        if let Some(fact) = self.facts.get_mut(&id) {
+                            fact.superseded_by = None;
+                        }
                     }
                 }
                 Err(err) => {
@@ -1579,38 +1641,127 @@ impl FactStore {
             }
         }
 
-        let canonical = self
-            .try_store(StoreFact {
-                tenant_hash: default_tenant_hash(),
-                entity: req.entity.clone(),
-                key: req.key.clone(),
-                value: req.canonical_value,
-                source_receipt: req.source_receipt.clone().or_else(|| {
-                    if req.consolidation_id.trim().is_empty() {
-                        None
-                    } else {
-                        Some(format!("consolidation:{}", req.consolidation_id))
-                    }
-                }),
-                confidence: req.confidence,
-                private: false,
-                horizon_class: req.horizon_class,
-                actor: req.actor,
-            })
-            .map_err(|err| ConsolidationErrorV1::Journal(err.to_string()))?;
+        // Build the canonical fact WITHOUT storing it yet (computes version +
+        // `supersedes` = the prior (entity,key) version to retire).
+        let canonical_value = req.canonical_value;
+        let canonical_hash = format!(
+            "blake3:{}",
+            hex::encode(blake3::hash(canonical_value.as_bytes()).as_bytes())
+        );
+        let canonical = self.build_fact(StoreFact {
+            tenant_hash: default_tenant_hash(),
+            entity: req.entity.clone(),
+            key: req.key.clone(),
+            value: canonical_value,
+            source_receipt: req.source_receipt.clone().or_else(|| {
+                if req.consolidation_id.trim().is_empty() {
+                    None
+                } else {
+                    Some(format!("consolidation:{}", req.consolidation_id))
+                }
+            }),
+            confidence: req.confidence,
+            private: false,
+            horizon_class: req.horizon_class,
+            actor: req.actor,
+        });
 
-        for fact_id in &req.target_fact_ids {
-            self.mark_superseded(fact_id, &canonical.fact_id);
+        // Superseded set = the consolidation targets PLUS the canonical's own
+        // prior (entity,key) version (what `try_store`/`supersede_prior_version`
+        // would retire). Deduplicated so the receipt is exact.
+        let mut superseded_fact_ids = req.target_fact_ids.clone();
+        if let Some(prior) = canonical.supersedes.clone() {
+            if !superseded_fact_ids.contains(&prior) {
+                superseded_fact_ids.push(prior);
+            }
+        }
+
+        // THE TRANSACTIONAL BOUNDARY: one journal append is the commit point.
+        // On failure nothing is mutated (no half-applied consolidation); the
+        // error is propagated, never warn-only.
+        self.append_journal(&JournalEvent::Consolidate {
+            canonical: canonical.clone(),
+            superseded_fact_ids: superseded_fact_ids.clone(),
+            consolidated_at: Utc::now().to_rfc3339(),
+        })
+        .map_err(|err| ConsolidationErrorV1::Journal(err.to_string()))?;
+
+        // Durable: now apply in-memory (mirrors the replay handler exactly).
+        let canonical_fact_id = canonical.fact_id.clone();
+        self.replay_journal_insert(canonical);
+        for id in &superseded_fact_ids {
+            if let Some(fact) = self.facts.get_mut(id) {
+                fact.superseded_by = Some(canonical_fact_id.clone());
+            }
         }
 
         Ok(ConsolidationPassReportV1 {
             status: "consolidated".to_string(),
             receipt: ConsolidationReceiptV1 {
                 consolidation_id: req.consolidation_id,
-                canonical_fact_id: canonical.fact_id,
-                superseded_fact_ids: req.target_fact_ids.clone(),
+                canonical_fact_id,
+                canonical_hash,
+                superseded_fact_ids,
                 source_fact_ids: req.target_fact_ids,
             },
+        })
+    }
+
+    /// Atomically UNDO a consolidation (buyer-fit M2): retire the generated
+    /// canonical and restore (`superseded_by = None`) every source fact. One
+    /// journal append is the commit point — all-or-nothing, restart-durable.
+    /// Idempotent: undoing an already-undone consolidation (canonical already
+    /// soft-deleted) is a no-op returning `status = "already_undone"`.
+    pub fn consolidate_undo_v1(
+        &mut self,
+        canonical_fact_id: &str,
+        source_fact_ids: &[String],
+    ) -> Result<ConsolidationUndoReportV1, ConsolidationErrorV1> {
+        let canonical = self
+            .facts
+            .get(canonical_fact_id)
+            .ok_or_else(|| ConsolidationErrorV1::TargetNotFound(canonical_fact_id.to_string()))?;
+        if canonical.deleted {
+            return Ok(ConsolidationUndoReportV1 {
+                status: "already_undone".to_string(),
+                canonical_fact_id: canonical_fact_id.to_string(),
+                restored_fact_ids: Vec::new(),
+            });
+        }
+
+        // Only restore sources that are actually superseded by THIS canonical —
+        // never resurrect a fact retired by an unrelated consolidation.
+        let restored: Vec<String> = source_fact_ids
+            .iter()
+            .filter(|id| {
+                self.facts
+                    .get(*id)
+                    .is_some_and(|f| f.superseded_by.as_deref() == Some(canonical_fact_id))
+            })
+            .cloned()
+            .collect();
+
+        // Transactional boundary: single commit-point append.
+        self.append_journal(&JournalEvent::ConsolidateUndo {
+            canonical_fact_id: canonical_fact_id.to_string(),
+            restored_fact_ids: restored.clone(),
+            undone_at: Utc::now().to_rfc3339(),
+        })
+        .map_err(|err| ConsolidationErrorV1::Journal(err.to_string()))?;
+
+        if let Some(fact) = self.facts.get_mut(canonical_fact_id) {
+            fact.deleted = true;
+        }
+        for id in &restored {
+            if let Some(fact) = self.facts.get_mut(id) {
+                fact.superseded_by = None;
+            }
+        }
+
+        Ok(ConsolidationUndoReportV1 {
+            status: "undone".to_string(),
+            canonical_fact_id: canonical_fact_id.to_string(),
+            restored_fact_ids: restored,
         })
     }
 }
@@ -2037,6 +2188,150 @@ mod tests {
             .expect_err("receipt-linked targets are protected");
         assert_eq!(err, ConsolidationErrorV1::TargetReceiptLinked(linked.fact_id.clone()));
         assert!(store.get(&linked.fact_id).unwrap().superseded_by.is_none());
+    }
+
+    // ── buyer-fit M2: atomic consolidation + receipted undo ──────────────
+
+    fn seed_two_active(store: &mut FactStore) -> (String, String) {
+        let a = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "proj".to_string(),
+            key: "status".to_string(),
+            value: "blocked".to_string(),
+            source_receipt: None,
+            confidence: 0.4,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        let b = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "proj".to_string(),
+            key: "status".to_string(),
+            value: "active".to_string(),
+            source_receipt: None,
+            confidence: 0.5,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        // storing b auto-superseded a via the version chain; reactivate it.
+        store.clear_superseded(&a.fact_id);
+        (a.fact_id, b.fact_id)
+    }
+
+    fn consolidate_req(a: &str, b: &str) -> ConsolidationRequestV1 {
+        ConsolidationRequestV1 {
+            consolidation_id: "con-m2".to_string(),
+            entity: "proj".to_string(),
+            key: "status".to_string(),
+            canonical_value: "settled".to_string(),
+            target_fact_ids: vec![a.to_string(), b.to_string()],
+            protected_fact_ids: vec![],
+            confidence: 0.8,
+            source_receipt: None,
+            actor: Some("agent:codex".to_string()),
+            horizon_class: Some(HorizonClass::Stable),
+            protected_confidence_floor: 0.99,
+        }
+    }
+
+    #[test]
+    fn consolidate_is_atomic_and_carries_canonical_hash() {
+        let mut store = FactStore::new();
+        let (a, b) = seed_two_active(&mut store);
+        let report = store
+            .consolidate_facts_v1(consolidate_req(&a, &b))
+            .expect("consolidate");
+        let cid = report.receipt.canonical_fact_id.clone();
+        // The receipt carries the after-side hash for the signed diff.
+        let expected = format!("blake3:{}", hex::encode(blake3::hash(b"settled").as_bytes()));
+        assert_eq!(report.receipt.canonical_hash, expected);
+        // All targets retired under this canonical.
+        assert_eq!(store.get(&a).unwrap().superseded_by.as_deref(), Some(cid.as_str()));
+        assert_eq!(store.get(&b).unwrap().superseded_by.as_deref(), Some(cid.as_str()));
+        // History preserved (nothing hard-deleted).
+        assert_eq!(store.fact_history("proj", "status").len(), 3);
+    }
+
+    #[test]
+    fn consolidate_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, cid);
+        {
+            let mut store = FactStore::with_persistence(dir.path()).unwrap();
+            let (fa, fb) = seed_two_active(&mut store);
+            let report = store
+                .consolidate_facts_v1(consolidate_req(&fa, &fb))
+                .expect("consolidate");
+            (a, b, cid) = (fa, fb, report.receipt.canonical_fact_id);
+        }
+        // Reopen → journal replay must reproduce the exact post-consolidation state.
+        let store = FactStore::with_persistence(dir.path()).unwrap();
+        assert!(store.get(&cid).is_some(), "canonical survives restart");
+        assert_eq!(store.get(&a).unwrap().superseded_by.as_deref(), Some(cid.as_str()));
+        assert_eq!(store.get(&b).unwrap().superseded_by.as_deref(), Some(cid.as_str()));
+    }
+
+    #[test]
+    fn consolidate_undo_restores_sources_and_retires_canonical() {
+        let mut store = FactStore::new();
+        let (a, b) = seed_two_active(&mut store);
+        let report = store
+            .consolidate_facts_v1(consolidate_req(&a, &b))
+            .expect("consolidate");
+        let cid = report.receipt.canonical_fact_id.clone();
+        let undo = store
+            .consolidate_undo_v1(&cid, &report.receipt.source_fact_ids)
+            .expect("undo");
+        assert_eq!(undo.status, "undone");
+        // Canonical retired, sources restored (active again).
+        assert!(store.get(&cid).is_none(), "canonical soft-deleted by undo");
+        assert!(store.get(&a).unwrap().superseded_by.is_none());
+        assert!(store.get(&b).unwrap().superseded_by.is_none());
+    }
+
+    #[test]
+    fn consolidate_undo_is_idempotent() {
+        let mut store = FactStore::new();
+        let (a, b) = seed_two_active(&mut store);
+        let report = store
+            .consolidate_facts_v1(consolidate_req(&a, &b))
+            .expect("consolidate");
+        let cid = report.receipt.canonical_fact_id.clone();
+        store
+            .consolidate_undo_v1(&cid, &report.receipt.source_fact_ids)
+            .unwrap();
+        let again = store
+            .consolidate_undo_v1(&cid, &report.receipt.source_fact_ids)
+            .unwrap();
+        assert_eq!(again.status, "already_undone");
+        assert!(again.restored_fact_ids.is_empty());
+    }
+
+    #[test]
+    fn consolidate_undo_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, cid);
+        {
+            let mut store = FactStore::with_persistence(dir.path()).unwrap();
+            let (fa, fb) = seed_two_active(&mut store);
+            let report = store
+                .consolidate_facts_v1(consolidate_req(&fa, &fb))
+                .expect("consolidate");
+            let c = report.receipt.canonical_fact_id.clone();
+            store
+                .consolidate_undo_v1(&c, &report.receipt.source_fact_ids)
+                .expect("undo");
+            (a, b, cid) = (fa, fb, c);
+        }
+        let store = FactStore::with_persistence(dir.path()).unwrap();
+        assert!(store.get(&cid).is_none(), "undo (canonical retired) survives restart");
+        assert!(
+            store.get(&a).unwrap().superseded_by.is_none(),
+            "restore survives restart"
+        );
+        assert!(store.get(&b).unwrap().superseded_by.is_none());
     }
 
     #[test]

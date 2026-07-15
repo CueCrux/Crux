@@ -489,20 +489,101 @@ pub(super) async fn post_console_review_consolidation(
     if body.actor.as_deref().unwrap_or_default().trim().is_empty() {
         body.actor = Some(console_actor_from_headers(&headers));
     }
+    // Capture the audit fields before the request is moved into the store op.
+    let entity = body.entity.clone();
+    let key = body.key.clone();
+    let actor = body.actor.clone().unwrap_or_else(|| "console".to_string());
     let report = {
         let mut store = state.fact_store.write().await;
         store.consolidate_facts_v1(body)
     };
     match report {
-        Ok(report) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "schema": "crux.console.review.consolidation.v1",
-                "status": report.status,
-                "receipt": report.receipt,
-            })),
-        )
-            .into_response(),
+        Ok(report) => {
+            let now = chrono::Utc::now().to_rfc3339();
+            // M2: emit a signed, offline-verifiable diff receipt.
+            let signed = super::consolidation_receipt::mint_consolidation_receipt(
+                &state,
+                &report.receipt,
+                &entity,
+                &key,
+                &actor,
+                "canonical_merge",
+                &now,
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "schema": "crux.console.review.consolidation.v1",
+                    "status": report.status,
+                    "receipt": report.receipt,
+                    "signed_receipt": signed,
+                })),
+            )
+                .into_response()
+        }
+        Err(err) => consolidation_problem(err),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct ConsolidationUndoRequest {
+    pub canonical_fact_id: String,
+    #[serde(default)]
+    pub source_fact_ids: Vec<String>,
+    #[serde(default)]
+    pub entity: Option<String>,
+    #[serde(default)]
+    pub key: Option<String>,
+}
+
+/// `POST /v1/console/review/consolidations/undo` — atomically reverse a
+/// consolidation (retire the canonical, restore its sources) and emit a signed
+/// undo receipt (M2). Idempotent: undoing an already-undone consolidation
+/// returns `status = "already_undone"`.
+pub(super) async fn post_console_review_consolidation_undo(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ConsolidationUndoRequest>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_console_write(&state, &headers) {
+        return problem.into_response();
+    }
+    let actor = console_actor_from_headers(&headers);
+    let undo = {
+        let mut store = state.fact_store.write().await;
+        store.consolidate_undo_v1(&req.canonical_fact_id, &req.source_fact_ids)
+    };
+    match undo {
+        Ok(undo) => {
+            let now = chrono::Utc::now().to_rfc3339();
+            let receipt = corecrux_memory::fact_store::ConsolidationReceiptV1 {
+                consolidation_id: format!("undo:{}", req.canonical_fact_id),
+                canonical_fact_id: undo.canonical_fact_id.clone(),
+                canonical_hash: String::new(),
+                superseded_fact_ids: undo.restored_fact_ids.clone(),
+                source_fact_ids: undo.restored_fact_ids.clone(),
+            };
+            let signed = super::consolidation_receipt::mint_consolidation_receipt(
+                &state,
+                &receipt,
+                req.entity.as_deref().unwrap_or(""),
+                req.key.as_deref().unwrap_or(""),
+                &actor,
+                "undo",
+                &now,
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "schema": "crux.console.review.consolidation_undo.v1",
+                    "status": undo.status,
+                    "canonical_fact_id": undo.canonical_fact_id,
+                    "restored_fact_ids": undo.restored_fact_ids,
+                    "signed_receipt": signed,
+                })),
+            )
+                .into_response()
+        }
         Err(err) => consolidation_problem(err),
     }
 }
