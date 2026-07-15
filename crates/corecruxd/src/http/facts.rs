@@ -77,22 +77,32 @@ fn raw_admin_write(ctx: &crate::auth::HttpScopeContext) -> bool {
     ctx.passport_id.is_none() && ctx.has_scope("admin:write")
 }
 
-/// Resolve the trusted tenant stamp for an HTTP write.
+/// Resolve the trusted tenant stamp for an HTTP write (OD-37 / audit-v2 closeout M1).
 ///
-/// HTTP auth context has no tenant claim yet, so current deployments resolve to
-/// `default`. When a real tenant source is added here, three other surfaces must
-/// be revisited in the SAME change or they become a stamping/read bypass (tracked
-/// as security-critical-7-tenant-isolation C5 follow-ups):
+/// The tenant is derived from the bearer token's tenant claim (`HttpScopeContext`
+/// carries `tenants`, the same authority the query path authorizes against) plus an
+/// optional `x-corecrux-tenant-id` selector for multi-tenant tokens — never from the
+/// client-supplied fact body. Gated by `CORECRUXD_TENANT_WRITE_STAMP` (default OFF →
+/// `default`, byte-identical to pre-M1). `Err` on an unauthorized/ambiguous selector.
 ///
-/// - `FactStore::store_synced` (sync-pull) inserts a peer-supplied `Fact` verbatim, so a peer-controlled `tenant_hash` would survive — validate or re-stamp it.
-/// - The unfiltered read helpers (`all_facts`, `get`, `get_by_entity`, `fact_history`, export) do not apply the tenant filter — no-op while everything is `default`, but they must gain a tenant predicate.
-/// - MCP `handle_store_fact`'s equivalent write hook.
-fn tenant_hash_for_write_context(_ctx: &crate::auth::HttpScopeContext) -> String {
-    corecrux_memory::fact_store::default_tenant_hash()
+/// Sibling surfaces (kept consistent with this resolver, verified on this base):
+/// - HTTP fact reads (`get_for_tenant` / `all_facts_for_tenant`, and `export_facts`
+///   below) apply the tenant predicate; `tenant_hash_for_read_context` moves in lockstep.
+/// - `FactStore::store_synced` re-stamps peer-supplied `tenant_hash` on pull (audit-v2 M3, #407).
+/// - The MCP write plane has no per-token tenant claim, so it uniformly stamps `default`
+///   (no cross-tenant bypass); MCP-plane multi-tenancy is a scoped follow-up.
+#[allow(clippy::result_large_err)]
+fn tenant_hash_for_write_context(ctx: &crate::auth::HttpScopeContext) -> Result<String, Response> {
+    match ctx.resolve_write_tenant() {
+        Ok(Some(tenant)) => Ok(tenant),
+        Ok(None) => Ok(corecrux_memory::fact_store::default_tenant_hash()),
+        Err(problem) => Err(problem.into_response()),
+    }
 }
 
-pub(super) fn tenant_hash_for_read_context(_ctx: &crate::auth::HttpScopeContext) -> String {
-    corecrux_memory::fact_store::default_tenant_hash()
+pub(super) fn tenant_hash_for_read_context(ctx: &crate::auth::HttpScopeContext) -> String {
+    ctx.resolve_read_tenant()
+        .unwrap_or_else(corecrux_memory::fact_store::default_tenant_hash)
 }
 
 fn render_fact_for_http(
@@ -120,7 +130,7 @@ fn prepare_fact_write_checked(
     mut fact: corecrux_memory::fact_store::StoreFact,
 ) -> Result<corecrux_memory::fact_store::StoreFact, Response> {
     // Never trust a client-supplied tenant stamp; derive it from auth context.
-    fact.tenant_hash = tenant_hash_for_write_context(ctx);
+    fact.tenant_hash = tenant_hash_for_write_context(ctx)?;
     if let Some(prefix) = crate::fact_privacy::daemon_owned_entity_prefix(&fact.entity) {
         return Err(ProblemResponse(
             ProblemDetails::forbidden(format!("entity uses reserved daemon-owned prefix `{prefix}`")).with_extensions(
@@ -561,9 +571,14 @@ pub(super) async fn export_facts(
     let store = state.fact_store.read().await;
     let mut result = store.export(since, cursor, limit);
     if !raw_admin_read(&ctx) {
+        // Tenant predicate (audit-v2 closeout M1): export must not cross the tenant
+        // boundary. No-op while everything is `default`; a hard filter once real
+        // tenants are stamped. Passport/entity visibility is applied on top.
+        let tenant_hash = tenant_hash_for_read_context(&ctx);
         result.facts = result
             .facts
             .iter()
+            .filter(|fact| fact.tenant_hash == tenant_hash)
             .filter_map(|fact| render_fact_for_http(fact, &ctx))
             .collect();
     }

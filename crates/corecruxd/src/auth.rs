@@ -903,11 +903,106 @@ pub struct HttpScopeContext {
     pub scopes: Vec<String>,
     pub passport_id: Option<String>,
     scope_bypass: bool,
+    /// Tenant authority derived from the bearer token's `tenant_id`/`tenants`
+    /// claim (same source the query path authorizes against). Drives the
+    /// write-stamp / read-filter resolvers below (audit-v2 closeout M1 / OD-37).
+    tenants: TenantAllow,
+    /// Optional per-request tenant selector (`x-corecrux-tenant-id`), authorized
+    /// against `tenants` when the token owns more than one tenant.
+    write_tenant_selector: Option<String>,
+}
+
+/// True when write-context tenant stamping is enabled (OD-37 / audit-v2 M1).
+///
+/// Default OFF → every write stamps `default` and every read resolves `default`,
+/// byte-identical to pre-M1 behaviour (the load-bearing backward-compat + rollback
+/// contract). Set `CORECRUXD_TENANT_WRITE_STAMP=1` to stamp/read real tenants
+/// derived from the bearer token's tenant claim.
+pub(crate) fn tenant_write_stamp_enabled() -> bool {
+    std::env::var("CORECRUXD_TENANT_WRITE_STAMP")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Resolve the tenant a writer is authorized to stamp, given its token tenant
+/// authority + an optional request selector. `Ok(None)` means "use the default
+/// tenant" (backward-compat); `Ok(Some(t))` stamps tenant `t`; `Err` rejects an
+/// unauthorized / ambiguous selection. Pure (flag passed in) for unit testing.
+#[allow(clippy::result_large_err)]
+fn resolve_write_tenant_flagged(
+    tenants: &TenantAllow,
+    selector: Option<&str>,
+    flag_on: bool,
+) -> Result<Option<String>, ProblemResponse> {
+    if !flag_on {
+        return Ok(None);
+    }
+    let selector = selector.map(str::trim).filter(|s| !s.is_empty());
+    match tenants {
+        // No tenant claim → single-tenant deployment → default (backward-compat hinge).
+        TenantAllow::Missing => Ok(None),
+        // Wildcard/admin token: a selector picks the target tenant; absent → default
+        // (legacy admin writes keep landing `default`).
+        TenantAllow::Any => Ok(selector.map(str::to_string)),
+        TenantAllow::Only(set) => match selector {
+            Some(sel) => {
+                if set.contains(sel) {
+                    Ok(Some(sel.to_string()))
+                } else {
+                    Err(ProblemResponse(
+                        ProblemDetails::forbidden("write tenant not allowed by token")
+                            .with_extensions(serde_json::json!({ "code": "TENANT_FORBIDDEN", "tenantId": sel })),
+                    ))
+                }
+            }
+            None => {
+                // Unambiguous single-tenant token → that tenant; multi-tenant token
+                // needs an explicit selector so we never guess which tenant to stamp.
+                if set.len() == 1 {
+                    Ok(set.iter().next().cloned())
+                } else {
+                    Err(ProblemResponse(
+                        ProblemDetails::forbidden("multi-tenant token must supply x-corecrux-tenant-id on write")
+                            .with_extensions(serde_json::json!({ "code": "TENANT_SELECTOR_REQUIRED" })),
+                    ))
+                }
+            }
+        },
+    }
+}
+
+/// Resolve the tenant a reader is scoped to. `None` = default. Kept in lockstep
+/// with the write resolver so a writer and reader on the same single-tenant token
+/// agree. Multi-tenant / wildcard tokens read `default` here (their concrete-tenant
+/// reads go through the query path's `tenant_id` body selector or the admin bypass).
+fn resolve_read_tenant_flagged(tenants: &TenantAllow, flag_on: bool) -> Option<String> {
+    if !flag_on {
+        return None;
+    }
+    match tenants {
+        TenantAllow::Only(set) if set.len() == 1 => set.iter().next().cloned(),
+        _ => None,
+    }
 }
 
 impl HttpScopeContext {
     pub fn has_scope(&self, scope: &str) -> bool {
         self.scope_bypass || self.scopes.iter().any(|s| s == scope)
+    }
+
+    /// Tenant to stamp on an HTTP write (OD-37). `Ok(None)` → default tenant.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn resolve_write_tenant(&self) -> Result<Option<String>, ProblemResponse> {
+        resolve_write_tenant_flagged(
+            &self.tenants,
+            self.write_tenant_selector.as_deref(),
+            tenant_write_stamp_enabled(),
+        )
+    }
+
+    /// Tenant an HTTP read is scoped to. `None` → default tenant.
+    pub(crate) fn resolve_read_tenant(&self) -> Option<String> {
+        resolve_read_tenant_flagged(&self.tenants, tenant_write_stamp_enabled())
     }
 }
 
@@ -919,14 +1014,27 @@ pub fn http_passport_id(headers: &HeaderMap) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Per-request write tenant selector (`x-corecrux-tenant-id`), authorized against
+/// the token's tenant claim by the write resolver.
+pub fn http_tenant_selector(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-corecrux-tenant-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 #[allow(clippy::result_large_err)]
 pub fn passport_bound_context(auth: &Authz, headers: &HeaderMap) -> Result<HttpScopeContext, ProblemResponse> {
     let ctx = http_ctx(auth, headers)?;
     let passport_id = bind_http_passport(auth.mode, &ctx, http_passport_id(headers))?;
+    let tenants = ctx.tenants.clone();
     Ok(HttpScopeContext {
         scopes: ctx.scopes.into_iter().collect(),
         passport_id,
         scope_bypass: auth.mode == AuthMode::Off,
+        tenants,
+        write_tenant_selector: http_tenant_selector(headers),
     })
 }
 
@@ -2000,6 +2108,98 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
     fn require_tenant_allowed_missing() {
         let err = require_tenant_allowed(&TenantAllow::Missing, "t1").unwrap_err();
         assert_eq!(err.0.status, 403);
+    }
+
+    // ── OD-37: write/read tenant resolvers (audit-v2 closeout M1) ──────────
+
+    fn only(ids: &[&str]) -> TenantAllow {
+        TenantAllow::Only(ids.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn write_tenant_flag_off_always_default() {
+        // Backward-compat: flag OFF → default regardless of claim/selector.
+        assert_eq!(
+            resolve_write_tenant_flagged(&only(&["t1"]), Some("t1"), false).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_write_tenant_flagged(&TenantAllow::Any, Some("t9"), false).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_write_tenant_flagged(&TenantAllow::Missing, None, false).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn write_tenant_missing_claim_is_default() {
+        // No tenant claim (single-tenant deployment) → default even with flag ON.
+        assert_eq!(
+            resolve_write_tenant_flagged(&TenantAllow::Missing, None, true).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn write_tenant_single_claim_stamps_that_tenant() {
+        assert_eq!(
+            resolve_write_tenant_flagged(&only(&["t1"]), None, true).unwrap(),
+            Some("t1".to_string())
+        );
+        // A matching selector is fine.
+        assert_eq!(
+            resolve_write_tenant_flagged(&only(&["t1"]), Some("t1"), true).unwrap(),
+            Some("t1".to_string())
+        );
+    }
+
+    #[test]
+    fn write_tenant_unauthorized_selector_rejected() {
+        // Adversarial: caller tries to stamp a tenant its token does not own.
+        let err = resolve_write_tenant_flagged(&only(&["t1"]), Some("t2"), true).unwrap_err();
+        assert_eq!(err.0.status, 403);
+    }
+
+    #[test]
+    fn write_tenant_multi_claim_requires_selector() {
+        // Ambiguous multi-tenant token with no selector → rejected (never guess).
+        let err = resolve_write_tenant_flagged(&only(&["t1", "t2"]), None, true).unwrap_err();
+        assert_eq!(err.0.status, 403);
+        // With a valid selector → that tenant.
+        assert_eq!(
+            resolve_write_tenant_flagged(&only(&["t1", "t2"]), Some("t2"), true).unwrap(),
+            Some("t2".to_string())
+        );
+        // Selector outside the set → rejected.
+        assert!(resolve_write_tenant_flagged(&only(&["t1", "t2"]), Some("t3"), true).is_err());
+    }
+
+    #[test]
+    fn write_tenant_wildcard_token_uses_selector_or_default() {
+        // Wildcard/admin: selector picks the tenant; absent → default (legacy admin writes).
+        assert_eq!(
+            resolve_write_tenant_flagged(&TenantAllow::Any, Some("t7"), true).unwrap(),
+            Some("t7".to_string())
+        );
+        assert_eq!(
+            resolve_write_tenant_flagged(&TenantAllow::Any, None, true).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn read_tenant_lockstep_with_write() {
+        // Flag OFF → default; single-tenant token → that tenant; multi/wildcard/missing → default.
+        assert_eq!(resolve_read_tenant_flagged(&only(&["t1"]), false), None);
+        assert_eq!(
+            resolve_read_tenant_flagged(&only(&["t1"]), true),
+            Some("t1".to_string())
+        );
+        assert_eq!(resolve_read_tenant_flagged(&only(&["t1", "t2"]), true), None);
+        assert_eq!(resolve_read_tenant_flagged(&TenantAllow::Any, true), None);
+        assert_eq!(resolve_read_tenant_flagged(&TenantAllow::Missing, true), None);
     }
 
     // ── parse_jwt_algs ────────────────────────────────────────────────────
