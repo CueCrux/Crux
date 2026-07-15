@@ -209,6 +209,59 @@ async fn sync_mutual_auth_accepts_valid_peer_for_bound_tenant() {
 }
 
 #[tokio::test]
+async fn sync_mutual_auth_rejects_peer_with_revoked_identity_link() {
+    // M3: a peer whose identity link carries `revoked_at` is rejected at the sync
+    // boundary with `peer_revoked`, even though its handshake is otherwise valid.
+    let (trust_root, subject, token) = sync_test_peer("tenant-acme");
+
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    state.sync_mutual_auth = true;
+    state.sync_peer_trust_root = Some(trust_root.verifying_key().to_bytes().to_vec());
+    state.identity_links_enabled = true;
+    {
+        let mut entities = state.entity_store.write().await;
+        let revoked = corecrux_memory::identity_link::IdentityLinkPayload {
+            schema_version: "1".to_string(),
+            local_passport_id: "personal-default".to_string(),
+            local_fpr: "local-fpr".to_string(),
+            remote_fpr: token.subject.passport_fpr.clone(),
+            remote_public_key_hex: hex::encode(subject.verifying_key().to_bytes()),
+            subject_kind: "passport".to_string(),
+            scope: "memory.read".to_string(),
+            statement_hash: "blake3:00".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            sig_local: "00".repeat(64),
+            sig_remote: "00".repeat(64),
+            revoked_at: Some("2026-07-16T00:00:00Z".to_string()),
+        };
+        entities
+            .upsert(
+                corecrux_memory::identity_link::IDENTITY_LINK_KIND,
+                "link-revoked-1",
+                serde_json::to_value(&revoked).unwrap(),
+                "test",
+                None,
+            )
+            .unwrap();
+    }
+    let app = router_with_route_auth(state, test_case_store(), RouteAuthMode::Enforce);
+
+    let nonce = issue_sync_handshake_nonce(&app).await;
+    let response = app
+        .oneshot(sync_http_request(
+            "GET",
+            "/v1/sync/tenants/tenant-acme/manifest",
+            sync_peer_headers(&token, &subject, &subject, &nonce),
+        ))
+        .await
+        .expect("manifest response");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = json_body(response).await;
+    assert_eq!(body["reason_class"], "peer_revoked");
+}
+
+#[tokio::test]
 async fn sync_mutual_auth_rejects_missing_handshake_headers_even_with_admin_scope() {
     let (trust_root, _, _) = sync_test_peer("tenant-acme");
     let app = sync_mutual_auth_app(&trust_root);

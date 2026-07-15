@@ -22,6 +22,9 @@
 # Consumer: scripts/unwrap-ratchet.sh (M5 of ExecPlan
 #   crux-external-findings-remediation-2026-07-10). CI fails if any crate
 #   exceeds its baseline; lowering a count updates this file in the same PR.
+# 2026-07-16 +3 corecruxd: audit-v2 M3 revoked-peer HTTP test in http/tests.rs
+#   (entity upsert + serde_json assertions seeding a revoked identity link);
+#   zero production-path additions (require_sync_peer uses Result/Option, no unwrap).
 corecrux-frame 0
 corecrux-index 3
 corecrux-memory 0
@@ -33,7 +36,7 @@ corecrux-segment 32
 corecrux-storage 48
 corecrux-types 1
 corecruxctl 9
-corecruxd 768
+corecruxd 771
 crux-claude-hooks 1
 crux-config-wizard 8
 crux-contrib 0
