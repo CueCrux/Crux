@@ -44,6 +44,16 @@ pub struct SyncClient {
     cursor_path: PathBuf,
     /// Entity prefixes that are never pushed to the remote.
     private_prefixes: Vec<String>,
+    /// M2b mutual-auth: when set, every pull request presents the signed peer
+    /// handshake (a fresh nonce per request). `None` → bearer-only (default).
+    peer_auth: Option<SyncPeerAuth>,
+}
+
+/// Client-side material for the M2b peer handshake: the local subject signing
+/// key and the capability token whose `subject.passport_fpr` matches it.
+pub struct SyncPeerAuth {
+    pub signing_key: ed25519_dalek::SigningKey,
+    pub token: rcx_capability_token::RcxCapabilityToken,
 }
 
 /// Persisted cursor tracking pull/push progress.
@@ -876,7 +886,47 @@ impl SyncClient {
             api_key: api_key.to_string(),
             cursor_path: data_dir.join("sync-cursor.json"),
             private_prefixes: prefixes,
+            peer_auth: None,
         }
+    }
+
+    /// Enable M2b mutual auth: pulls will present the signed peer handshake.
+    pub fn with_peer_auth(
+        mut self,
+        signing_key: ed25519_dalek::SigningKey,
+        token: rcx_capability_token::RcxCapabilityToken,
+    ) -> Self {
+        self.peer_auth = Some(SyncPeerAuth { signing_key, token });
+        self
+    }
+
+    /// Build the `x-crux-peer-*` handshake headers for one request. Fetches a
+    /// fresh single-use nonce from the peer, then signs. Empty when mutual auth
+    /// is not configured (bearer-only path — unchanged).
+    fn peer_headers(&self) -> Result<Vec<(&'static str, String)>, String> {
+        let Some(auth) = &self.peer_auth else {
+            return Ok(Vec::new());
+        };
+        let nonce_url = format!("{}/v1/sync/handshake/nonce", self.remote_url);
+        let mut resp = ureq::post(&nonce_url)
+            .send_json(serde_json::json!({}))
+            .map_err(|e| format!("sync handshake nonce fetch failed: {e}"))?;
+        let body: serde_json::Value = resp
+            .body_mut()
+            .read_json()
+            .map_err(|e| format!("sync handshake nonce parse error: {e}"))?;
+        let nonce_hex = body["nonce"].as_str().ok_or("nonce response missing 'nonce'")?;
+        let nonce = hex::decode(nonce_hex).map_err(|e| format!("nonce hex decode: {e}"))?;
+        let headers = crux_sync::peer_handshake::build_peer_handshake_headers(&auth.token, &auth.signing_key, &nonce)?;
+        Ok(vec![
+            (crux_sync::peer_handshake::PEER_TOKEN_HEADER, headers.token_b64),
+            (
+                crux_sync::peer_handshake::PEER_PUBLIC_KEY_HEADER,
+                headers.public_key_hex,
+            ),
+            (crux_sync::peer_handshake::PEER_NONCE_HEADER, headers.nonce_hex),
+            (crux_sync::peer_handshake::PEER_SIGNATURE_HEADER, headers.signature_hex),
+        ])
     }
 
     /// Check whether a fact should be excluded from sync push.
@@ -948,10 +998,11 @@ impl SyncClient {
                 let _ = write!(url, "&cursor={c}");
             }
 
-            let mut resp = ureq::get(&url)
-                .header("Authorization", &format!("Bearer {}", self.api_key))
-                .call()
-                .map_err(|e| format!("sync pull failed: {e}"))?;
+            let mut req = ureq::get(&url).header("Authorization", &format!("Bearer {}", self.api_key));
+            for (name, value) in self.peer_headers()? {
+                req = req.header(name, &value);
+            }
+            let mut resp = req.call().map_err(|e| format!("sync pull failed: {e}"))?;
 
             let body: serde_json::Value = resp
                 .body_mut()
@@ -1003,8 +1054,11 @@ impl SyncClient {
         }
         let tenant = encode_path_segment(tenant_id);
         let manifest_url = format!("{}/v1/sync/tenants/{tenant}/manifest", self.remote_url);
-        let mut resp = ureq::get(&manifest_url)
-            .header("Authorization", &format!("Bearer {}", self.api_key))
+        let mut manifest_req = ureq::get(&manifest_url).header("Authorization", &format!("Bearer {}", self.api_key));
+        for (name, value) in self.peer_headers()? {
+            manifest_req = manifest_req.header(name, &value);
+        }
+        let mut resp = manifest_req
             .call()
             .map_err(|e| format!("tenant sync manifest pull failed: {e}"))?;
         let manifest: TenantSyncManifest = resp
@@ -1029,8 +1083,11 @@ impl SyncClient {
                     use std::fmt::Write as _;
                     let _ = write!(url, "&cursor={}", encode_path_segment(current));
                 }
-                let mut resp = ureq::get(&url)
-                    .header("Authorization", &format!("Bearer {}", self.api_key))
+                let mut page_req = ureq::get(&url).header("Authorization", &format!("Bearer {}", self.api_key));
+                for (name, value) in self.peer_headers()? {
+                    page_req = page_req.header(name, &value);
+                }
+                let mut resp = page_req
                     .call()
                     .map_err(|e| format!("tenant collection pull failed: {e}"))?;
                 let page: SyncCollectionPage = resp

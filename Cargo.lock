@@ -742,9 +742,11 @@ version = "0.5.42"
 dependencies = [
  "blake3",
  "chrono",
+ "crux-sync",
  "ed25519-dalek",
  "fastembed",
  "hex",
+ "rcx-capability-token",
  "serde",
  "serde_json",
  "tempfile",
@@ -1488,6 +1490,7 @@ dependencies = [
 name = "crux-sync"
 version = "0.5.42"
 dependencies = [
+ "base64 0.22.1",
  "blake3",
  "chrono",
  "crux-session",

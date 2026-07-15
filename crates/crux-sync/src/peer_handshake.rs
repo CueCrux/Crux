@@ -7,7 +7,8 @@
 
 use std::collections::HashMap;
 
-use ed25519_dalek::{Signature, VerifyingKey};
+use base64::Engine as _;
+use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
 use rcx_capability_token::{verify_token, RcxCapabilityToken, VerifyOutcome};
 
 /// Domain separator for peer-handshake possession signatures.
@@ -94,6 +95,59 @@ fn signing_message(token: &RcxCapabilityToken, nonce: &[u8]) -> Vec<u8> {
     message.push(0);
     message.extend_from_slice(nonce);
     message
+}
+
+/// Canonical `x-crux-peer-*` header names for the M2a peer handshake. The server
+/// (`corecruxd::http::sync`) parses exactly these; the client presents them.
+pub const PEER_TOKEN_HEADER: &str = "x-crux-peer-token";
+pub const PEER_PUBLIC_KEY_HEADER: &str = "x-crux-peer-pubkey";
+pub const PEER_NONCE_HEADER: &str = "x-crux-peer-nonce";
+pub const PEER_SIGNATURE_HEADER: &str = "x-crux-peer-sig";
+
+/// The four header values a client presents for the M2a peer handshake, ready to
+/// attach to a sync request. Pair each with the matching `PEER_*_HEADER` name.
+#[derive(Debug, Clone)]
+pub struct PeerHandshakeHeaders {
+    /// `x-crux-peer-token`: STANDARD-base64 of the canonical token JSON.
+    pub token_b64: String,
+    /// `x-crux-peer-pubkey`: hex of the subject signing key's 32-byte public key.
+    pub public_key_hex: String,
+    /// `x-crux-peer-nonce`: hex of the server-issued nonce.
+    pub nonce_hex: String,
+    /// `x-crux-peer-sig`: hex of the Ed25519 signature over the handshake message.
+    pub signature_hex: String,
+}
+
+impl PeerHandshakeHeaders {
+    /// `(name, value)` pairs to set on the outgoing request.
+    pub fn as_pairs(&self) -> [(&'static str, &str); 4] {
+        [
+            (PEER_TOKEN_HEADER, self.token_b64.as_str()),
+            (PEER_PUBLIC_KEY_HEADER, self.public_key_hex.as_str()),
+            (PEER_NONCE_HEADER, self.nonce_hex.as_str()),
+            (PEER_SIGNATURE_HEADER, self.signature_hex.as_str()),
+        ]
+    }
+}
+
+/// Build the client side of the M2a peer handshake (audit-v2 M2b client
+/// presentation): base64 token, hex public key, hex nonce, and the Ed25519
+/// signature over `signing_message(token, nonce)` — exactly what
+/// [`verify_peer_handshake`] checks. `nonce` is the raw bytes returned (hex) by
+/// `POST /v1/sync/handshake/nonce`. The caller must ensure `signing_key`'s public
+/// key matches `token.subject.passport_fpr`, or the server rejects with `FprMismatch`.
+pub fn build_peer_handshake_headers(
+    token: &RcxCapabilityToken,
+    signing_key: &SigningKey,
+    nonce: &[u8],
+) -> Result<PeerHandshakeHeaders, String> {
+    let signature = signing_key.sign(&signing_message(token, nonce));
+    Ok(PeerHandshakeHeaders {
+        token_b64: base64::engine::general_purpose::STANDARD.encode(token.to_canonical_json().as_bytes()),
+        public_key_hex: hex::encode(signing_key.verifying_key().to_bytes()),
+        nonce_hex: hex::encode(nonce),
+        signature_hex: hex::encode(signature.to_bytes()),
+    })
 }
 
 /// Verify issuer authority, subject binding, key possession, revocation, and
@@ -417,6 +471,74 @@ mod tests {
                 |_| false,
             ),
             Err(PeerAuthError::BadPossessionSig)
+        );
+    }
+
+    #[test]
+    fn client_built_handshake_is_accepted_by_verifier() {
+        // M2b client presentation: headers built by the client round-trip through
+        // the server verifier — the two-node accept, proven at the crypto boundary.
+        let trust_root = signing_key(40);
+        let subject = signing_key(41);
+        let token = valid_token(&subject, &trust_root);
+        let mut cache = NonceCache::new(NONCE_TTL);
+        let nonce = cache.issue(NOW, [42; 32]);
+
+        let headers = build_peer_handshake_headers(&token, &subject, &nonce).expect("build headers");
+        // Header names are the canonical ones the server parses.
+        assert_eq!(headers.as_pairs()[0].0, PEER_TOKEN_HEADER);
+        assert_eq!(headers.as_pairs()[3].0, PEER_SIGNATURE_HEADER);
+
+        // Reconstruct the wire handshake exactly as the server would from the headers.
+        let token_json = base64::engine::general_purpose::STANDARD
+            .decode(headers.token_b64.as_bytes())
+            .expect("b64");
+        let wire_token: RcxCapabilityToken = serde_json::from_slice(&token_json).expect("token json");
+        let mut peer_public_key = [0u8; 32];
+        peer_public_key.copy_from_slice(&hex::decode(&headers.public_key_hex).expect("pubkey hex"));
+        let mut nonce_signature = [0u8; 64];
+        nonce_signature.copy_from_slice(&hex::decode(&headers.signature_hex).expect("sig hex"));
+        let hs = PeerHandshake {
+            capability_token: wire_token,
+            peer_public_key,
+            nonce: hex::decode(&headers.nonce_hex).expect("nonce hex"),
+            nonce_signature,
+        };
+
+        let authenticated =
+            verify_peer_handshake(&hs, &trust_root.verifying_key().to_bytes(), NOW, &mut cache, |_| false)
+                .expect("verifier must accept the client-built handshake");
+        assert_eq!(authenticated.tenant_id, TENANT_ID);
+    }
+
+    #[test]
+    fn client_built_handshake_with_wrong_key_is_rejected() {
+        // A signing key that doesn't match the token's passport_fpr → FprMismatch.
+        let trust_root = signing_key(43);
+        let subject = signing_key(44);
+        let attacker = signing_key(45);
+        let token = valid_token(&subject, &trust_root);
+        let mut cache = NonceCache::new(NONCE_TTL);
+        let nonce = cache.issue(NOW, [46; 32]);
+
+        let headers = build_peer_handshake_headers(&token, &attacker, &nonce).expect("build headers");
+        let token_json = base64::engine::general_purpose::STANDARD
+            .decode(headers.token_b64.as_bytes())
+            .expect("b64");
+        let wire_token: RcxCapabilityToken = serde_json::from_slice(&token_json).expect("token json");
+        let mut peer_public_key = [0u8; 32];
+        peer_public_key.copy_from_slice(&hex::decode(&headers.public_key_hex).expect("pubkey hex"));
+        let mut nonce_signature = [0u8; 64];
+        nonce_signature.copy_from_slice(&hex::decode(&headers.signature_hex).expect("sig hex"));
+        let hs = PeerHandshake {
+            capability_token: wire_token,
+            peer_public_key,
+            nonce: hex::decode(&headers.nonce_hex).expect("nonce hex"),
+            nonce_signature,
+        };
+        assert_eq!(
+            verify_peer_handshake(&hs, &trust_root.verifying_key().to_bytes(), NOW, &mut cache, |_| false),
+            Err(PeerAuthError::FprMismatch)
         );
     }
 

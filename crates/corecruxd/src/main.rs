@@ -163,6 +163,40 @@ fn build_wasm_engine_for_appstate() -> Option<std::sync::Arc<crate::wasm_host::W
     }
 }
 
+/// Load M2b sync peer-auth material from env (opt-in). Requires BOTH
+/// `CORECRUXD_SYNC_PEER_SIGNING_KEY` (64-hex Ed25519 seed) and
+/// `CORECRUXD_SYNC_PEER_TOKEN` (canonical capability-token JSON). Absent → bearer
+/// only (unchanged). Misconfiguration logs a warning and falls back to bearer.
+fn load_sync_peer_auth() -> Option<(ed25519_dalek::SigningKey, rcx_capability_token::RcxCapabilityToken)> {
+    let seed_hex = std::env::var("CORECRUXD_SYNC_PEER_SIGNING_KEY").ok()?;
+    let token_json = std::env::var("CORECRUXD_SYNC_PEER_TOKEN").ok()?;
+    let seed = match hex::decode(seed_hex.trim()) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(error = %err, "CORECRUXD_SYNC_PEER_SIGNING_KEY is not valid hex; sync peer auth disabled");
+            return None;
+        }
+    };
+    let seed: [u8; 32] = match seed.try_into() {
+        Ok(seed) => seed,
+        Err(_) => {
+            tracing::warn!("CORECRUXD_SYNC_PEER_SIGNING_KEY must decode to 32 bytes; sync peer auth disabled");
+            return None;
+        }
+    };
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+    match serde_json::from_str::<rcx_capability_token::RcxCapabilityToken>(&token_json) {
+        Ok(token) => {
+            tracing::info!("sync peer auth (M2b) enabled — pulls will present the signed peer handshake");
+            Some((signing_key, token))
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "CORECRUXD_SYNC_PEER_TOKEN is not valid capability-token JSON; sync peer auth disabled");
+            None
+        }
+    }
+}
+
 /// CLI action decided from `corecruxd`'s argv.
 ///
 /// `corecruxd` is an environment-configured daemon with NO argument parsing
@@ -1142,6 +1176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let sync_api_key = config.sync_api_key.clone();
         let sync_data_dir = config.data_dir.clone();
         let sync_interval = config.sync_interval_secs;
+        let sync_peer_auth = load_sync_peer_auth();
         let mut rx = shutdown_tx.subscribe();
 
         tokio::spawn(async move {
@@ -1155,11 +1190,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        let client = corecrux_memory::sync::SyncClient::new(
+                        let mut client = corecrux_memory::sync::SyncClient::new(
                             &sync_remote_url,
                             &sync_api_key,
                             &sync_data_dir,
                         );
+                        // M2b: present the signed peer handshake when configured.
+                        if let Some((ref signing_key, ref token)) = sync_peer_auth {
+                            client = client.with_peer_auth(signing_key.clone(), token.clone());
+                        }
 
                         // Pull first.
                         match client.pull(&mut *sync_fact_store.write().await) {
