@@ -15,7 +15,7 @@
 // Every call is same-origin credentialed; the browser never holds a bearer
 // token (the daemon authenticates the session at its own origin).
 //
-// 160 read endpoints, generated from the route manifest.
+// 161 read endpoints, generated from the route manifest.
 
 /**
  * Append a plain query object to a path as a URL search string.
@@ -94,6 +94,7 @@ const LITERAL_GET_PATHS = Object.freeze({
   '/v1/integrations/openai/status': true,
   '/v1/kinds': true,
   '/v1/mcp/tools': true,
+  '/v1/memory/candidates': true,
   '/v1/observations/aggregate': true,
   '/v1/openai/tools.json': true,
   '/v1/openapi.json': true,
@@ -388,6 +389,9 @@ const CruxApi = Object.freeze({
   },
   mcpTools(query) {
     return fetch(withQuery(`/v1/mcp/tools`, query), { credentials: 'same-origin' });
+  },
+  memoryCandidates(query) {
+    return fetch(withQuery(`/v1/memory/candidates`, query), { credentials: 'same-origin' });
   },
   observationsAggregate(query) {
     return fetch(withQuery(`/v1/observations/aggregate`, query), { credentials: 'same-origin' });

@@ -140,7 +140,12 @@ impl HorizonClass {
             Self::Volatile
         } else if entity.starts_with("bench:") || entity.starts_with("__bootstrap__::") {
             Self::Stable
-        } else if entity.starts_with("execplan:") || entity.starts_with("incident:") {
+        } else if entity.starts_with("execplan:")
+            || entity.starts_with("incident:")
+            || entity.starts_with("__candidate_fact__::")
+        {
+            // Auto-capture candidates (M1) are medium-lived: a pending review
+            // should not decay away in a day, but is not a permanent record.
             Self::Medium
         } else {
             Self::None

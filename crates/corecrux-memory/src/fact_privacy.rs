@@ -88,6 +88,10 @@ pub fn global_policy() -> &'static PrivacyPolicy {
 }
 
 pub const DEFAULT_PRIVATE_PREFIXES: &[&str] = &[
+    // Auto-capture review-only candidates (M1). Born private so a candidate
+    // (possibly poisoned) is never visible to recall until an explicit review
+    // promotes it to a real fact. Also in CRUXPACK_RESERVED_PREFIXES.
+    "__candidate_fact__::",
     "__agent::",
     "__ops::",
     "__ops__::",

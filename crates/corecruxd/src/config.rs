@@ -489,6 +489,8 @@ pub struct Config {
     // Provider-agnostic injection-bundle surface (`/v1/context`,
     // `crate::http::context_surface`). Default OFF.
     pub context_surface_enabled: bool,
+    /// Gated auto-capture surface (`/v1/memory/*`). Default OFF.
+    pub auto_capture_enabled: bool,
 
     // Local CPU prose-ingest door (`/v1/local/ingest`,
     // `crate::http::local_ingest`). Seals pre-formatted prose payloads into
@@ -1238,6 +1240,7 @@ pub fn load_config() -> Config {
             .unwrap_or(crate::coord::DEFAULT_PRESENCE_TTL_SECS)
             .clamp(60, crate::coord::MAX_TTL_SECS),
         context_surface_enabled: env_bool("CORECRUXD_CONTEXT_SURFACE").unwrap_or(false),
+        auto_capture_enabled: env_bool("CORECRUXD_AUTO_CAPTURE").unwrap_or(false),
         local_ingest_enabled: env_default_on("CORECRUXD_LOCAL_INGEST"),
         stream_receipts_enabled: env_bool("CORECRUXD_STREAM_RECEIPTS").unwrap_or(false),
         usage_receipts_enabled: env_bool("CORECRUXD_FEATURE_USAGE_RECEIPTS").unwrap_or(false),
