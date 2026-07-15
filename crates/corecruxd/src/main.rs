@@ -974,6 +974,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         state.fact_store.clone(),
         shutdown_tx.subscribe(),
     );
+
+    // Near-duplicate router (buyer-fit FU2 follow-up). When semantic dedup is
+    // enabled, periodically drain the store-time near-duplicate flags (M3.5)
+    // produced by ANY write path — MCP `store_fact`, sync, extraction — and file
+    // each as a `__candidate_fact__::` review candidate. The HTTP `/v1/facts`
+    // handlers route inline (immediate); this sweep is the catch-all so a flag
+    // from a non-HTTP path never sits unrouted. Gated: with dedup off, no flags
+    // are ever produced, so the task is not spawned.
+    if config.semantic_dedup_threshold.is_some() {
+        let fact_store = state.fact_store.clone();
+        let mut rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(15));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let now = chrono::Utc::now().to_rfc3339();
+                        let filed = {
+                            let mut store = fact_store.write().await;
+                            crate::candidate_store::route_near_duplicates(&mut store, &now)
+                        };
+                        if filed > 0 {
+                            info!(filed, "near-duplicate-router filed review candidates");
+                        }
+                    }
+                    _ = rx.recv() => break,
+                }
+            }
+        });
+    }
+
     let github_fact_store_handle = state.fact_store.clone();
     let github_encryption_key = state.integration_encryption_key.clone();
     // Build the MCP dispatch context once and share it between the MCP
