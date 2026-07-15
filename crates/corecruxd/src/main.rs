@@ -137,7 +137,7 @@ use corecrux_types::{
 use crate::auth::AuthMode;
 use crate::config::{load_config, CommitLevel};
 use crate::dataplane_store::AppendError;
-use crate::http::{AppState, CapacityState, Readiness};
+use crate::http::{AppState, CapacityState, Readiness, SYNC_HANDSHAKE_NONCE_TTL_SECONDS};
 use crate::metrics::Metrics;
 use crate::ops_events::{append_ops_event, build_node_context, now_unix_ms};
 use crate::shard_map::{RoutingTable, ShardMapStore};
@@ -610,6 +610,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.data_dir.clone(),
     );
 
+    if config.sync_mutual_auth && config.sync_peer_trust_root.is_none() {
+        tracing::warn!(
+            "sync mutual auth is enabled without a valid CORECRUXD_SYNC_PEER_TRUST_ROOT; tenant sync requests will fail closed"
+        );
+    }
+
     let state = AppState {
         lock_held: true,
         build: build.clone(),
@@ -620,6 +626,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         auth: auth.clone(),
         rcx_router: Some(rcx_router.clone()),
         data_dir: config.data_dir.clone(),
+        sync_mutual_auth: config.sync_mutual_auth,
+        sync_peer_trust_root: config.sync_peer_trust_root.clone(),
+        sync_handshake_nonces: Arc::new(std::sync::Mutex::new(crux_sync::peer_handshake::NonceCache::new(
+            SYNC_HANDSHAKE_NONCE_TTL_SECONDS,
+        ))),
         witness: crate::witness::WitnessRuntimeConfigV1::from_config(&config),
         witness_proofs: Arc::new(RwLock::new(
             match crate::witness_proofs::WitnessProofStore::with_persistence(&config.data_dir) {
@@ -630,6 +641,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             },
         )),
+        cloud_witness_replay_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         mcp_enabled: config.mcp_enabled,
         console_enabled: config.console_enabled,
         coord_enabled: config.coord_enabled,
@@ -809,7 +821,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         watcher.start_existing_repos().await;
     }
 
-    // Wire optional embedding client for dense vector retrieval on facts.
+    // Wire the dense embedder for fact retrieval. An external `embedding_url`
+    // selects the HTTP client (BYOE/paid, better vectors). Otherwise, unless
+    // explicitly disabled, wire the pure-Rust `LocalHashEmbedder` so dense
+    // recall works offline by default (buyer-fit M3.2 — dense ON by default).
     if let Some(ref embedding_url) = config.embedding_url {
         let client = corecrux_memory::embeddings::EmbeddingClient::new(corecrux_memory::embeddings::EmbeddingConfig {
             base_url: embedding_url.clone(),
@@ -821,7 +836,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             embedding_model = %config.embedding_model,
             "embedding-client-configured"
         );
-        state.fact_store.write().await.set_embedding_client(client);
+        state.fact_store.write().await.set_embedder(Box::new(client));
+    } else if config.local_embedder_enabled {
+        // Optional real model (buyer-fit M3.4, feature `dense-embed-model`): when
+        // `CORECRUXD_DENSE_MODEL=fastembed` and the daemon was built with the
+        // feature, use FastEmbedEmbedder; on init failure (e.g. model download)
+        // fall back to the always-on pure-Rust LocalHashEmbedder so the offline
+        // default never breaks.
+        let embedder: Box<dyn corecrux_memory::embeddings::Embedder> = {
+            #[cfg(feature = "dense-embed-model")]
+            {
+                if config.dense_model.as_deref() == Some("fastembed") {
+                    match corecrux_memory::embeddings::FastEmbedEmbedder::new(&config.data_dir) {
+                        Ok(model) => {
+                            info!(
+                                model = corecrux_memory::embeddings::FASTEMBED_MODEL_ID,
+                                "fastembed-embedder-configured"
+                            );
+                            Box::new(model)
+                        }
+                        Err(err) => {
+                            tracing::warn!(?err, "fastembed-init-failed; falling back to local hash embedder");
+                            Box::new(corecrux_memory::embeddings::LocalHashEmbedder::default())
+                        }
+                    }
+                } else {
+                    Box::new(corecrux_memory::embeddings::LocalHashEmbedder::default())
+                }
+            }
+            #[cfg(not(feature = "dense-embed-model"))]
+            {
+                if config.dense_model.as_deref() == Some("fastembed") {
+                    tracing::warn!("CORECRUXD_DENSE_MODEL=fastembed but daemon built without the dense-embed-model feature; using local hash embedder");
+                }
+                Box::new(corecrux_memory::embeddings::LocalHashEmbedder::default())
+            }
+        };
+        info!(model = %embedder.model(), dimensions = embedder.dimensions(), "dense-embedder-configured (offline default)");
+        state.fact_store.write().await.set_embedder(embedder);
+    }
+
+    // Store-time semantic near-duplicate detection (buyer-fit M3.5). Only
+    // effective when a dense embedder is configured above.
+    if let Some(threshold) = config.semantic_dedup_threshold {
+        let mut store = state.fact_store.write().await;
+        if store.embeddings_enabled() {
+            store.set_semantic_dedup(threshold);
+        } else {
+            tracing::warn!("CORECRUXD_SEMANTIC_DEDUP set but no dense embedder configured; semantic dedup inactive");
+        }
     }
 
     // Bootstrap: always seed agent-facing documentation on startup (idempotent).
@@ -4229,10 +4292,16 @@ mod tests {
             auth,
             rcx_router: None,
             data_dir: tmp.path().to_path_buf(),
+            sync_mutual_auth: false,
+            sync_peer_trust_root: None,
+            sync_handshake_nonces: std::sync::Arc::new(std::sync::Mutex::new(
+                crux_sync::peer_handshake::NonceCache::new(crate::http::SYNC_HANDSHAKE_NONCE_TTL_SECONDS),
+            )),
             witness: crate::witness::WitnessRuntimeConfigV1::disabled(),
             witness_proofs: std::sync::Arc::new(tokio::sync::RwLock::new(
                 crate::witness_proofs::WitnessProofStore::default(),
             )),
+            cloud_witness_replay_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             mcp_enabled: true,
             console_enabled: true,
             coord_enabled: false,

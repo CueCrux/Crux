@@ -11,6 +11,7 @@ blake3 = { workspace = true }
 crux-session = { path = "../crux-session" }
 ed25519-dalek = { workspace = true, features = ["std"] }
 hex = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 proptest = { workspace = true }

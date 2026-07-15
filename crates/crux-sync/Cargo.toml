@@ -7,6 +7,9 @@ license.workspace = true
 
 [dependencies]
 blake3 = { workspace = true }
+ed25519-dalek = { workspace = true, features = ["std"] }
+hex = { workspace = true }
+rcx-capability-token = { path = "../rcx-capability-token" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -15,6 +18,7 @@ uuid = { workspace = true, features = ["v4"] }
 ureq = { workspace = true, features = ["json"] }
 
 [dev-dependencies]
+crux-session = { path = "../crux-session" }
 mockito = "1.7"
 tempfile = { workspace = true }
 

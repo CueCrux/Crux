@@ -19,6 +19,10 @@ otel = [
 # only use Phase A external-tool extensions don't pay the wasmtime build
 # cost (~30s cold + ~60MB binary growth).
 wasm-extensions = ["dep:wasmtime"]
+# buyer-fit M3.4: compile in the optional fastembed (ONNX) embedder. OFF by
+# default — the default binary keeps the always-on pure-Rust LocalHashEmbedder
+# and never links ONNX Runtime. Enable with `CORECRUXD_DENSE_MODEL=fastembed`.
+dense-embed-model = ["corecrux-memory/dense-embed-model"]
 # ExecPlan crux-external-findings-remediation M4: hosted-service HTTP surfaces
 # — the Pro GPU-1 compute bridge (`/v1/gpu1/*`, `src/http/gpu1.rs`) and the Pro
 # cloud access posture (`GET /v1/cloud/access-contract`, `src/http/cloud.rs`) —
@@ -85,6 +89,7 @@ crux-integrations = { path = "../crux-integrations" }
 crux-lens-features = { path = "../crux-lens-features" }
 crux-mcp = { path = "../crux-mcp" }
 crux-router = { path = "../crux-router" }
+crux-sync = { path = "../crux-sync" }
 rcx-capability-token = { path = "../rcx-capability-token" }
 crux-session = { path = "../crux-session" }
 crux-enterprise-shim = { path = "../crux-enterprise-shim" }
