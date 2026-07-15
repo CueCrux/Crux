@@ -234,6 +234,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/extensions/{id}/tools/{tool_name}/invoke", methods: &["POST"], tag: "Extensions", auth: "write", summary: "Extensions {id} tools {tool name} invoke" },
     RouteEntry { path: "/v1/facts", methods: &["GET", "PUT"], tag: "Facts", auth: "read-write", summary: "Facts" },
     RouteEntry { path: "/v1/facts/bulk", methods: &["PUT"], tag: "Facts", auth: "write", summary: "Facts bulk" },
+    RouteEntry { path: "/v1/facts/aggregate", methods: &["POST"], tag: "Facts", auth: "read", summary: "Deterministic 0-LLM aggregate lane" },
     RouteEntry { path: "/v1/facts/entity/{entity}", methods: &["GET"], tag: "Facts", auth: "read", summary: "Facts entity {entity}" },
     RouteEntry { path: "/v1/facts/export", methods: &["GET"], tag: "Facts", auth: "read", summary: "Facts export" },
     RouteEntry { path: "/v1/facts/{factId}", methods: &["GET", "DELETE"], tag: "Facts", auth: "read-write", summary: "Facts {factId}" },

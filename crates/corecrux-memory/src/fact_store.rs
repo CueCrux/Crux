@@ -1236,6 +1236,115 @@ impl FactStore {
         self.facts.values().filter(|f| !f.deleted).count()
     }
 
+    /// Deterministic, 0-LLM aggregate lane (buyer-fit M4, knock-out #5).
+    ///
+    /// Answers `count` / `sum_numeric` / `distinct` / `temporal_diff` over the
+    /// visible (non-deleted, non-superseded, non-private) fact set matching an
+    /// optional `entity` / `key` / case-insensitive `query` substring filter.
+    /// Pure arithmetic — no model call, ever. `token_budget`, when set, caps how
+    /// many candidate facts are scanned (honest, bounded cost); the report says
+    /// whether the answer was budget-truncated.
+    pub fn aggregate_v1(&self, req: &AggregateRequestV1) -> AggregateResultV1 {
+        // Candidate facts: visible latest rows matching the filter, in a stable
+        // order (by fact_id) so the scan + any budget truncation is deterministic.
+        let mut candidates: Vec<&Fact> = self
+            .facts
+            .values()
+            .filter(|f| !f.deleted && f.superseded_by.is_none() && !f.private)
+            .filter(|f| req.entity.as_deref().is_none_or(|e| f.entity == e))
+            .filter(|f| req.key.as_deref().is_none_or(|k| f.key == k))
+            .filter(|f| {
+                req.query
+                    .as_deref()
+                    .is_none_or(|q| f.value.to_lowercase().contains(&q.to_lowercase()))
+            })
+            .collect();
+        candidates.sort_by(|a, b| a.fact_id.cmp(&b.fact_id));
+
+        // Budget: scan at most as many facts as fit under token_budget.
+        let mut tokens_scanned = 0usize;
+        let mut truncated = false;
+        let scanned: Vec<&Fact> = if let Some(budget) = req.token_budget {
+            let mut out = Vec::new();
+            for f in &candidates {
+                if tokens_scanned + f.tokens > budget && !out.is_empty() {
+                    truncated = true;
+                    break;
+                }
+                tokens_scanned += f.tokens;
+                out.push(*f);
+            }
+            out
+        } else {
+            tokens_scanned = candidates.iter().map(|f| f.tokens).sum();
+            candidates
+        };
+
+        let value = match req.op {
+            AggregateOp::Count => serde_json::json!(scanned.len()),
+            AggregateOp::SumNumeric => {
+                let sum: f64 = scanned.iter().filter_map(|f| parse_leading_number(&f.value)).sum();
+                serde_json::json!(sum)
+            }
+            AggregateOp::Distinct => {
+                let set: std::collections::BTreeSet<&str> = scanned.iter().map(|f| f.value.as_str()).collect();
+                serde_json::json!(set.len())
+            }
+            AggregateOp::TemporalDiff => {
+                // Numeric change in an (entity,key)'s value between the value
+                // that was current at `as_of` and the current value. Requires
+                // entity+key; returns null if either endpoint is non-numeric.
+                return self.temporal_diff(req, tokens_scanned);
+            }
+        };
+
+        AggregateResultV1 {
+            op: req.op.as_str().to_string(),
+            matched: scanned.len(),
+            value,
+            llm_calls: 0,
+            tokens_scanned,
+            budget_truncated: truncated,
+        }
+    }
+
+    fn temporal_diff(&self, req: &AggregateRequestV1, tokens_scanned: usize) -> AggregateResultV1 {
+        let base = AggregateResultV1 {
+            op: AggregateOp::TemporalDiff.as_str().to_string(),
+            matched: 0,
+            value: serde_json::Value::Null,
+            llm_calls: 0,
+            tokens_scanned,
+            budget_truncated: false,
+        };
+        let (Some(entity), Some(key)) = (req.entity.as_deref(), req.key.as_deref()) else {
+            return base;
+        };
+        let history = self.fact_history(entity, key);
+        if history.is_empty() {
+            return base;
+        }
+        // Current value = latest by version.
+        let current = history.iter().max_by_key(|f| f.version);
+        // As-of value = the latest version whose stored_at <= as_of.
+        let as_of = req.as_of;
+        let asof = match as_of {
+            Some(ts) => history.iter().filter(|f| f.stored_at <= ts).max_by_key(|f| f.version),
+            None => history.iter().min_by_key(|f| f.version), // no as_of ⇒ diff vs oldest
+        };
+        let (Some(cur), Some(old)) = (current, asof) else {
+            return base;
+        };
+        match (parse_leading_number(&cur.value), parse_leading_number(&old.value)) {
+            (Some(c), Some(o)) => AggregateResultV1 {
+                matched: history.len(),
+                value: serde_json::json!(c - o),
+                ..base
+            },
+            _ => base,
+        }
+    }
+
     /// Return an iterator over ALL facts (including deleted).
     /// Unfiltered — internal / admin only; does NOT apply the tenant filter. Request-path callers must use the *_for_tenant variant (audit H2).
     pub fn all_facts(&self) -> impl Iterator<Item = &Fact> {
@@ -1771,6 +1880,108 @@ impl FactStore {
 pub struct FactQueryResult {
     pub facts: Vec<Fact>,
     pub total_tokens: usize,
+}
+
+/// Deterministic aggregate operation (buyer-fit M4, knock-out #5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AggregateOp {
+    /// Number of matching facts.
+    Count,
+    /// Sum of the leading numeric value of each matching fact.
+    SumNumeric,
+    /// Number of distinct values among matching facts.
+    Distinct,
+    /// Numeric change in an (entity,key) value between `as_of` and now.
+    TemporalDiff,
+}
+
+impl AggregateOp {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AggregateOp::Count => "count",
+            AggregateOp::SumNumeric => "sum_numeric",
+            AggregateOp::Distinct => "distinct",
+            AggregateOp::TemporalDiff => "temporal_diff",
+        }
+    }
+}
+
+/// Request for [`FactStore::aggregate_v1`].
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
+pub struct AggregateRequestV1 {
+    pub op: AggregateOp,
+    #[serde(default)]
+    pub entity: Option<String>,
+    #[serde(default)]
+    pub key: Option<String>,
+    /// Case-insensitive substring filter on the fact value.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// For `temporal_diff`: the world-time anchor to diff against.
+    #[serde(default)]
+    pub as_of: Option<DateTime<Utc>>,
+    /// Cap on the candidate facts scanned (honest, bounded cost).
+    #[serde(default)]
+    pub token_budget: Option<usize>,
+}
+
+/// Result of [`FactStore::aggregate_v1`] — a deterministic, 0-LLM answer.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct AggregateResultV1 {
+    pub op: String,
+    /// Facts that contributed to the answer.
+    pub matched: usize,
+    /// The answer (integer count/distinct, float sum/diff, or null).
+    pub value: serde_json::Value,
+    /// Always 0 — this lane never calls a model. Reported for honesty.
+    pub llm_calls: u32,
+    /// Tokens across the scanned candidate set (honest accounting).
+    pub tokens_scanned: usize,
+    /// True if `token_budget` stopped the scan before all candidates.
+    pub budget_truncated: bool,
+}
+
+/// Parse the leading numeric value out of a fact value, tolerating currency
+/// symbols, thousands separators, and trailing text: `"$450,000 approved"` ⇒
+/// `450000.0`, `"3 cats"` ⇒ `3.0`. Returns `None` when there is no number.
+fn parse_leading_number(value: &str) -> Option<f64> {
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_digit() {
+            break;
+        }
+        if (c == b'-' || c == b'+') && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+            break;
+        }
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    let mut num = String::new();
+    if bytes[i] == b'-' || bytes[i] == b'+' {
+        num.push(bytes[i] as char);
+        i += 1;
+    }
+    let mut seen_dot = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_digit() {
+            num.push(c as char);
+        } else if c == b',' {
+            // thousands separator — skip
+        } else if c == b'.' && !seen_dot {
+            seen_dot = true;
+            num.push('.');
+        } else {
+            break;
+        }
+        i += 1;
+    }
+    num.parse::<f64>().ok()
 }
 
 /// Outcome of a [`FactStore::compact_journal`] pass (launch-gate 5.1 erasure).
@@ -2651,6 +2862,111 @@ mod tests {
     fn count_empty_store() {
         let store = FactStore::new();
         assert_eq!(store.count(), 0);
+    }
+
+    // ── buyer-fit M4: deterministic 0-LLM aggregate lane ─────────────────
+
+    #[test]
+    fn parse_leading_number_handles_currency_and_trailing_text() {
+        assert_eq!(parse_leading_number("$450,000 approved"), Some(450_000.0));
+        assert_eq!(parse_leading_number("3 cats"), Some(3.0));
+        assert_eq!(parse_leading_number("1,250.50"), Some(1250.5));
+        assert_eq!(parse_leading_number("-12.5C"), Some(-12.5));
+        assert_eq!(parse_leading_number("north"), None);
+    }
+
+    fn seed_aggregate_corpus() -> FactStore {
+        // Golden conformance corpus (buyer-fit-m4-aggregate-v1). Fixed content
+        // + fixed expected answers — the shared-schema contract a hosted lane
+        // must also satisfy.
+        let mut store = FactStore::new();
+        for (ent, val) in [
+            ("metric:jan", "100"),
+            ("metric:feb", "150.5"),
+            ("metric:mar", "$1,200"),
+            ("metric:apr", "100"), // duplicate value → distinct = 3
+        ] {
+            store.store(StoreFact {
+                tenant_hash: "default".into(),
+                entity: ent.into(),
+                key: "sales_amount".into(),
+                value: val.into(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            });
+        }
+        store
+    }
+
+    #[test]
+    fn aggregate_count_sum_distinct_are_deterministic_and_0_llm() {
+        let store = seed_aggregate_corpus();
+        let req = |op| AggregateRequestV1 {
+            op,
+            entity: None,
+            key: Some("sales_amount".into()),
+            query: None,
+            as_of: None,
+            token_budget: None,
+        };
+        let c = store.aggregate_v1(&req(AggregateOp::Count));
+        assert_eq!(c.value, serde_json::json!(4));
+        assert_eq!(c.llm_calls, 0);
+
+        let s = store.aggregate_v1(&req(AggregateOp::SumNumeric));
+        assert_eq!(s.value, serde_json::json!(1550.5)); // 100 + 150.5 + 1200 + 100
+        assert_eq!(s.llm_calls, 0);
+
+        let d = store.aggregate_v1(&req(AggregateOp::Distinct));
+        assert_eq!(d.value, serde_json::json!(3)); // {100, 150.5, 1200}
+    }
+
+    #[test]
+    fn aggregate_respects_token_budget() {
+        let store = seed_aggregate_corpus();
+        // A tiny budget scans only the first candidate(s); the count is bounded
+        // and the result is flagged truncated (honest, bounded cost).
+        let r = store.aggregate_v1(&AggregateRequestV1 {
+            op: AggregateOp::Count,
+            entity: None,
+            key: Some("sales_amount".into()),
+            query: None,
+            as_of: None,
+            token_budget: Some(1),
+        });
+        assert!(r.budget_truncated, "tiny budget must truncate the scan");
+        assert!(r.matched < 4, "budget-limited count is below the full 4");
+        assert!(r.tokens_scanned <= 1 + store.get_by_entity("metric:jan").first().map(|f| f.tokens).unwrap_or(0));
+    }
+
+    #[test]
+    fn aggregate_temporal_diff_uses_version_history() {
+        let mut store = FactStore::new();
+        let base = |v: &str| StoreFact {
+            tenant_hash: "default".into(),
+            entity: "metric:price".into(),
+            key: "usd".into(),
+            value: v.into(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        };
+        store.store(base("10"));
+        store.store(base("25")); // v2 supersedes v1 in the chain; both in history
+        let r = store.aggregate_v1(&AggregateRequestV1 {
+            op: AggregateOp::TemporalDiff,
+            entity: Some("metric:price".into()),
+            key: Some("usd".into()),
+            query: None,
+            as_of: None, // diff current vs oldest
+            token_budget: None,
+        });
+        assert_eq!(r.value, serde_json::json!(15.0)); // 25 - 10
     }
 
     #[test]
