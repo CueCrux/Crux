@@ -438,6 +438,12 @@ pub struct Config {
     pub sync_remote_url: String,
     pub sync_api_key: String,
     pub sync_interval_secs: u64,
+    /// Require issuer-signed Ed25519 peer handshakes on sync server routes.
+    /// Default OFF (`CORECRUXD_SYNC_MUTUAL_AUTH=1`).
+    pub sync_mutual_auth: bool,
+    /// VaultCrux/issuer Ed25519 trust-root public key, parsed from exactly
+    /// 64 hexadecimal characters in `CORECRUXD_SYNC_PEER_TRUST_ROOT`.
+    pub sync_peer_trust_root: Option<Vec<u8>>,
 
     // Background update checks against a tracked git ref.
     pub update_check_enabled: bool,
@@ -658,6 +664,10 @@ fn env_csv(key: &str) -> Option<Vec<String>> {
 
 fn bool_value(value: &str) -> bool {
     matches!(value, "1" | "true" | "TRUE" | "yes" | "YES")
+}
+
+fn parse_sync_peer_trust_root(value: &str) -> Option<Vec<u8>> {
+    hex::decode(value.trim()).ok().filter(|bytes| bytes.len() == 32)
 }
 
 fn expand_path(raw: &str) -> PathBuf {
@@ -1164,6 +1174,12 @@ pub fn load_config() -> Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(300)
             .max(10),
+        sync_mutual_auth: std::env::var("CORECRUXD_SYNC_MUTUAL_AUTH")
+            .ok()
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
+        sync_peer_trust_root: env_string("CORECRUXD_SYNC_PEER_TRUST_ROOT")
+            .as_deref()
+            .and_then(parse_sync_peer_trust_root),
         update_check_enabled: std::env::var("CORECRUXD_UPDATE_CHECK_ENABLED")
             .ok()
             .is_none_or(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
@@ -1681,6 +1697,28 @@ mod tests {
         assert!(!cfg.handoff_observations_enabled);
         // Credit Meter M1b is default OFF; comped-wallet spends must opt in.
         assert!(!cfg.credit_meter_enabled);
+        // Peer-handshake auth is separately opt-in from the background client.
+        assert!(!cfg.sync_mutual_auth);
+        assert!(cfg.sync_peer_trust_root.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_config_sync_mutual_auth_parses_flag_and_hex_trust_root() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+        clear_corecruxd_env();
+        std::env::set_var("CORECRUXD_SYNC_MUTUAL_AUTH", "TRUE");
+        std::env::set_var("CORECRUXD_SYNC_PEER_TRUST_ROOT", "ab".repeat(32));
+
+        let cfg = super::load_config();
+        assert!(cfg.sync_mutual_auth);
+        assert_eq!(cfg.sync_peer_trust_root, Some(vec![0xab; 32]));
+
+        std::env::set_var("CORECRUXD_SYNC_PEER_TRUST_ROOT", "ab".repeat(31));
+        let cfg = super::load_config();
+        assert!(cfg.sync_peer_trust_root.is_none());
+        clear_corecruxd_env();
     }
 
     #[test]

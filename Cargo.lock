@@ -916,6 +916,7 @@ dependencies = [
  "crux-observe-api",
  "crux-router",
  "crux-session",
+ "crux-sync",
  "ed25519-dalek",
  "fs2",
  "hex",
@@ -3594,6 +3595,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "proptest",
+ "serde",
 ]
 
 [[package]]
