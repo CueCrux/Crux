@@ -15,25 +15,10 @@ use axum::routing::get;
 use axum::Router;
 use tower_http::cors::CorsLayer;
 
-const CONSOLE_HTML: &str = include_str!("../console/index.html");
-// Activity log human lane (ExecPlan crux-dual-surface-activity-log-2026-06-18,
-// M3). A new self-contained page on the embedded console, served at
-// `/console/activity`. The page itself is inert unless the daemon has
-// `CORECRUXD_FEATURE_ACTIVITY_LOG=1` (its API calls 404 otherwise).
-const ACTIVITY_HTML: &str = include_str!("../console/activity.html");
-// Receipts-vs-console side-by-side demo (roadmap Production-Cutover Phase T /
-// the F3 test). A self-contained page served at `/console/receipts-vs-console`:
-// the left column reuses the activity-log receipt timeline (with an
-// observation-feed fallback when `CORECRUXD_FEATURE_ACTIVITY_LOG` is off) and
-// the right column is a clearly-labelled static mock of a typical vendor
-// console. No external runtime deps, same posture as the console shell.
-const RECEIPTS_VS_CONSOLE_HTML: &str = include_str!("../console/receipts-vs-console.html");
-// Unified Shell Console v2 (ExecPlan unified-shell-console-2026-07-03, M0). A
-// self-contained, no-build shell embedded alongside the legacy console and
-// selected at `/console` when `CORECRUXD_CONSOLE_V2` is truthy. With the flag
-// off/unset/garbage the `/console` body stays byte-identical to today's console
-// (see `resolve_console_body`). Same embedded, no-on-disk-dependency posture as
-// the sibling `activity.html` / `console-3d/*` assets.
+// Unified Shell Console v2 (ExecPlan unified-shell-console-2026-07-03). The
+// self-contained, no-build shell served unconditionally at `/console` — the
+// sole console surface now that the legacy console has been removed. Same
+// embedded, no-on-disk-dependency posture as the sibling `console-3d/*` assets.
 const CONSOLE_V2_HTML: &str = include_str!("../console/v2/shell.html");
 // Unified Shell Console v2 — no-build module split (M1). The shell references
 // these same-origin at `/console-v2/pages.js` / `/console-v2/render.js`. Same
@@ -53,12 +38,6 @@ const CONSOLE_V2_API_JS: &str = include_str!("../console/v2/api.js");
 const CONSOLE_V2_SW_JS: &str = include_str!("../console/v2/sw.js");
 const CONSOLE_V2_MANIFEST: &str = include_str!("../console/v2/manifest.webmanifest");
 const CONSOLE_V2_ICON_SVG: &str = include_str!("../console/v2/icon.svg");
-const CONSOLE_V2_ENV: &str = "CORECRUXD_CONSOLE_V2";
-// Code-structure graph view (ExecPlan ast-polyglot-code-graph-and-repo-watch-2026-07-08,
-// M8). A self-contained page served at `/console/codegraph` that renders the real
-// typed code+claim graph from `/v1/projects/{id}/context-graph`. Reuses the console
-// design tokens; falls back to a demo graph when the daemon endpoint is unavailable.
-const CODEGRAPH_HTML: &str = include_str!("../console/codegraph.html");
 const CONSOLE_DEV_PATH_ENV: &str = "CORECRUXD_CONSOLE_DEV_PATH";
 
 // Bundled PNG assets — embedded so the binary can serve them with no on-disk
@@ -91,72 +70,8 @@ async fn serve_console() -> impl IntoResponse {
     Html(resolve_console_body().into_owned())
 }
 
-/// Activity log human-lane page (M3), served at `/console/activity`. A dev
-/// override (`CORECRUXD_CONSOLE_DEV_PATH`) reads `activity.html` next to the
-/// console index so the page can be iterated without a rebuild.
-async fn serve_activity() -> impl IntoResponse {
-    if let Some(dev_path) = std::env::var(CONSOLE_DEV_PATH_ENV)
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-    {
-        let file_path = resolve_dev_html_path(Path::new(dev_path.trim())).with_file_name("activity.html");
-        if let Ok(contents) = std::fs::read_to_string(&file_path) {
-            return Html(contents).into_response();
-        }
-    }
-    Html(ACTIVITY_HTML).into_response()
-}
-
-/// Receipts-vs-console side-by-side demo, served at
-/// `/console/receipts-vs-console`. Same dev-override story as the activity
-/// page so the page can be iterated without a rebuild.
-async fn serve_receipts_vs_console() -> impl IntoResponse {
-    if let Some(dev_path) = std::env::var(CONSOLE_DEV_PATH_ENV)
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-    {
-        let file_path = resolve_dev_html_path(Path::new(dev_path.trim())).with_file_name("receipts-vs-console.html");
-        if let Ok(contents) = std::fs::read_to_string(&file_path) {
-            return Html(contents).into_response();
-        }
-    }
-    Html(RECEIPTS_VS_CONSOLE_HTML).into_response()
-}
-
-/// Code-structure graph view (M8), served at `/console/codegraph`. Same
-/// dev-override story as the activity page so the page can be iterated
-/// without a rebuild.
-async fn serve_codegraph() -> impl IntoResponse {
-    if let Some(dev_path) = std::env::var(CONSOLE_DEV_PATH_ENV)
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-    {
-        let file_path = resolve_dev_html_path(Path::new(dev_path.trim())).with_file_name("codegraph.html");
-        if let Ok(contents) = std::fs::read_to_string(&file_path) {
-            return Html(contents).into_response();
-        }
-    }
-    Html(CODEGRAPH_HTML).into_response()
-}
-
 async fn redirect_to_console() -> impl IntoResponse {
     Redirect::to("/console")
-}
-
-/// `/console/legacy` — the legacy console served unconditionally (the same body
-/// `/console` serves when `CORECRUXD_CONSOLE_V2` is off). Deep-machinery
-/// fallbacks in the v2 shell (e.g. the Workbench card) link here so the full Pro
-/// console stays reachable even while v2 is the default surface.
-///
-/// DEPRECATED (retired 2026-07-03, ExecPlan `unified-shell-console-2026-07-03`,
-/// M10). The unified v2 shell is now THE console surface; this legacy body is
-/// retained only as a fallback for deep-machinery links (the Pro workbench) and
-/// as the flag-off byte-parity baseline. It is not the forward-facing surface
-/// and gains no new features — treat it as frozen. Do not build against it; new
-/// work lands in `crates/corecruxd/console/v2/`. (Comment-only marker: the
-/// flag-off byte-parity test asserts the served body is unchanged.)
-async fn serve_console_legacy() -> impl IntoResponse {
-    Html(resolve_console_html().into_owned())
 }
 
 /// Embedded v2 module + PWA assets (`pages.js`, `render.js`, `api.js`, plus the
@@ -299,10 +214,6 @@ pub fn routes(enabled: bool) -> Router {
     Router::new()
         .route("/", get(redirect_to_console))
         .route("/console", get(serve_console))
-        .route("/console/legacy", get(serve_console_legacy))
-        .route("/console/activity", get(serve_activity))
-        .route("/console/receipts-vs-console", get(serve_receipts_vs_console))
-        .route("/console/codegraph", get(serve_codegraph))
         .route("/console-assets/{name}", get(serve_console_asset))
         .route("/console-v2/{name}", get(serve_console_v2_asset))
         .route("/console-3d/{*path}", get(serve_console3d))
@@ -497,16 +408,15 @@ loadTenants();
 </body>
 </html>"#;
 
-/// The `/console` body: v2 shell when `CORECRUXD_CONSOLE_V2` is truthy, else the
-/// legacy console. Flag off/unset/garbage ⇒ byte-identical to today (M0 gate).
+/// The `/console` body: the unified v2 shell, unconditionally. The legacy
+/// console has been removed — v2 is the sole surface. A dev override
+/// (`CORECRUXD_CONSOLE_DEV_PATH`) hot-serves `v2/shell.html` from disk (stamped
+/// with the dev flag so the service worker steps aside); otherwise the embedded
+/// `CONSOLE_V2_HTML` is served.
 fn resolve_console_body() -> Cow<'static, str> {
-    if console_v2_enabled() {
-        match console_v2_dev_override() {
-            Some(html) => Cow::Owned(inject_console_dev_flag(html)),
-            None => Cow::Borrowed(CONSOLE_V2_HTML),
-        }
-    } else {
-        resolve_console_html()
+    match console_v2_dev_override() {
+        Some(html) => Cow::Owned(inject_console_dev_flag(html)),
+        None => Cow::Borrowed(CONSOLE_V2_HTML),
     }
 }
 
@@ -526,15 +436,6 @@ fn inject_console_dev_flag(html: String) -> String {
     } else {
         format!("{MARK}{html}")
     }
-}
-
-/// `CORECRUXD_CONSOLE_V2` flag: trimmed, case-insensitive; truthy = 1/true/on.
-/// Anything else (including unset, empty, or garbage) is off.
-fn console_v2_enabled() -> bool {
-    std::env::var(CONSOLE_V2_ENV).is_ok_and(|raw| {
-        let value = raw.trim().to_ascii_lowercase();
-        matches!(value.as_str(), "1" | "true" | "on")
-    })
 }
 
 /// Dev override for the v2 shell: reads `v2/shell.html` relative to the
@@ -564,34 +465,6 @@ fn console_v2_dev_override() -> Option<String> {
     }
 }
 
-fn resolve_console_html() -> Cow<'static, str> {
-    match dev_html_override() {
-        Some(html) => Cow::Owned(html),
-        None => Cow::Borrowed(CONSOLE_HTML),
-    }
-}
-
-fn dev_html_override() -> Option<String> {
-    let raw = std::env::var(CONSOLE_DEV_PATH_ENV).ok()?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let html_path = resolve_dev_html_path(Path::new(trimmed));
-    match std::fs::read_to_string(&html_path) {
-        Ok(contents) => Some(contents),
-        Err(err) => {
-            tracing::warn!(
-                target: "corecruxd::console",
-                path = %html_path.display(),
-                error = %err,
-                "console dev override unreadable; falling back to embedded HTML"
-            );
-            None
-        }
-    }
-}
-
 fn resolve_dev_html_path(base: &Path) -> PathBuf {
     if base.is_dir() {
         base.join("index.html")
@@ -603,9 +476,9 @@ fn resolve_dev_html_path(base: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        dev_html_override, resolve_console_body, resolve_console_html, CONSOLE_DEV_PATH_ENV, CONSOLE_HTML,
-        CONSOLE_V2_API_JS, CONSOLE_V2_ENV, CONSOLE_V2_HTML, CONSOLE_V2_ICON_SVG, CONSOLE_V2_MANIFEST,
-        CONSOLE_V2_PAGES_JS, CONSOLE_V2_RENDER_JS, CONSOLE_V2_SW_JS,
+        resolve_console_body, CONSOLE_DEV_PATH_ENV, CONSOLE_V2_API_JS, CONSOLE_V2_HTML,
+        CONSOLE_V2_ICON_SVG, CONSOLE_V2_MANIFEST, CONSOLE_V2_PAGES_JS, CONSOLE_V2_RENDER_JS,
+        CONSOLE_V2_SW_JS,
     };
     use std::sync::Mutex;
 
@@ -618,253 +491,13 @@ mod tests {
     }
 
     #[test]
-    fn console_asset_budget_stays_lightweight() {
-        // Budget history: 100KB → 200KB (Plan A: Projects/Work/multi-passport) →
-        // 320KB (DX/GX scopes, OpenAI integration, docs panel, Vision/Goals layers) →
-        // 480KB (AX scope: 20-feature agent cockpit). Still tiny by SPA standards;
-        // the guard exists to catch unbounded growth, not to enforce a product
-        // constraint.
-        assert!(
-            CONSOLE_HTML.len() < 480 * 1024,
-            "embedded console shell should stay below 480KB raw HTML/CSS/JS (currently {} bytes)",
-            CONSOLE_HTML.len()
-        );
-    }
-
-    #[test]
-    fn console_shell_has_accessibility_guardrails() {
-        for required in [
-            r#"<meta name="viewport" content="width=device-width, initial-scale=1">"#,
-            "Skip to console content",
-            "aria-live=\"polite\"",
-            "prefers-reduced-motion",
-            "focus-visible",
-            "min-height: 44px",
-        ] {
-            assert!(
-                CONSOLE_HTML.contains(required),
-                "missing accessibility marker: {required}"
-            );
-        }
-    }
-
-    #[test]
-    fn console_shell_has_no_external_runtime_dependencies() {
-        // Block runtime-loading of external assets (scripts/styles/iframes from
-        // CDNs or any remote host). Documentation `<a href="https://...">` links
-        // to ecosystem sites (cuecrux.com, vaultcrux.com, memorycrux.com, etc.)
-        // are FINE — they don't load anything until the user clicks them.
-        for blocked in [
-            r#"<script src="http"#,
-            r#"<link rel="stylesheet" href="http"#,
-            r#"<iframe src="http"#,
-            "unpkg.com",
-            "jsdelivr.net",
-            "cdnjs.cloudflare",
-            "cdn.jsdelivr",
-        ] {
-            assert!(
-                !CONSOLE_HTML.contains(blocked),
-                "external runtime dependency marker found: {blocked}"
-            );
-        }
-    }
-
-    #[test]
-    fn console_lane_weights_has_deeplink_dropdown_presets_and_scoped_reset() {
-        for required in [
-            "function laneWeightsDeepLink()",
-            "#/lane-weights",
-            "tenant_id",
-            "tenant_pick",
-            "api('/v1/console/tenants')",
-            "Stage preset",
-            "Baseline defaults",
-            "Graph/topology trial",
-            "Reset lane weights",
-            "deleteApi(path)",
-            "putApi('/v1/console/corecrux/lane-weights'",
-        ] {
-            assert!(
-                CONSOLE_HTML.contains(required),
-                "missing lane-weight console marker: {required}"
-            );
-        }
-    }
-
-    #[test]
-    fn activity_page_wires_both_lanes_and_stays_dependency_free() {
-        // Capture/agent-lane endpoints + live stream are wired.
-        for required in [
-            "/v1/activity?",
-            "/v1/activity/turn/",
-            "/v1/events/stream?types=activity.appended",
-            "/verify", // M2 ✓verify cross-walk badge (embedded-receipt verify endpoint)
-            "token_budget",
-            "CORECRUXD_FEATURE_ACTIVITY_LOG",
-        ] {
-            assert!(
-                super::ACTIVITY_HTML.contains(required),
-                "activity page missing wiring: {required}"
-            );
-        }
-        // Same security posture as the console shell — no external runtime deps.
-        for blocked in [
-            r#"<script src="http"#,
-            r#"<link rel="stylesheet" href="http"#,
-            r#"<iframe src="http"#,
-            "unpkg.com",
-            "jsdelivr.net",
-            "cdnjs.cloudflare",
-        ] {
-            assert!(
-                !super::ACTIVITY_HTML.contains(blocked),
-                "activity page has external runtime dependency: {blocked}"
-            );
-        }
-        // The main console links to the new page.
-        assert!(
-            super::CONSOLE_HTML.contains(r#"href="/console/activity""#),
-            "console shell should link to the activity page"
-        );
-    }
-
-    #[test]
-    fn receipts_vs_console_demo_wires_both_columns_and_stays_dependency_free() {
-        // Left column reuses the receipt-timeline + verify wiring and the
-        // observation-feed fallback; right column is the labelled vendor mock.
-        for required in [
-            "/v1/activity?",                             // left: backfill the receipt timeline
-            "/v1/activity/turn/",                        // left: row-expand to verbatim
-            "/verify",                                   // left: Ed25519 verify cross-walk badge
-            "/v1/observations/aggregate",                // left: fallback when the flag is off
-            "/v1/events/stream?types=activity.appended", // left: live tail
-            "token_budget",
-            "CORECRUXD_FEATURE_ACTIVITY_LOG",  // caveat surfaced to the operator
-            "CueCrux — receipts as debugging", // left column heading
-            "Your vendor's free console",      // right column heading
-            "No signature to verify",          // honest contrast callouts
-            "No cross-agent handoff",
-            "No cost-per-agent attribution",
-            "Gone when you rotate the key",
-        ] {
-            assert!(
-                super::RECEIPTS_VS_CONSOLE_HTML.contains(required),
-                "receipts-vs-console page missing wiring: {required}"
-            );
-        }
-        // Same security posture as the console shell — no external runtime deps.
-        for blocked in [
-            r#"<script src="http"#,
-            r#"<link rel="stylesheet" href="http"#,
-            r#"<iframe src="http"#,
-            "unpkg.com",
-            "jsdelivr.net",
-            "cdnjs.cloudflare",
-            "cdn.jsdelivr",
-        ] {
-            assert!(
-                !super::RECEIPTS_VS_CONSOLE_HTML.contains(blocked),
-                "receipts-vs-console page has external runtime dependency: {blocked}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn receipts_vs_console_route_serves_the_demo_page() {
-        use tower::ServiceExt;
-
-        let resp = super::routes(true)
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("GET")
-                    .uri("/console/receipts-vs-console")
-                    .body(axum::body::Body::empty())
-                    .expect("build request"),
-            )
-            .await
-            .expect("router response");
-        assert_eq!(resp.status(), axum::http::StatusCode::OK);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("read body");
-        let body = String::from_utf8(bytes.to_vec()).expect("utf8 body");
-        assert!(
-            body.contains("CueCrux — receipts as debugging") && body.contains("Your vendor's free console"),
-            "served page should contain both column headings"
-        );
-    }
-
-    #[test]
-    fn dev_override_unset_returns_embedded_html() {
+    fn console_serves_v2_shell_unconditionally() {
+        // The legacy console is removed; `/console` always serves the v2 shell
+        // (embedded, no dev-path override in effect).
         let _guard = env_lock();
         std::env::remove_var(CONSOLE_DEV_PATH_ENV);
-        let html = resolve_console_html();
-        assert_eq!(&*html, CONSOLE_HTML);
-    }
-
-    #[test]
-    fn dev_override_reads_file_when_path_set() {
-        let _guard = env_lock();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_nanos());
-        let dir = std::env::temp_dir().join(format!("corecruxd-console-dev-{nanos}"));
-        std::fs::create_dir_all(&dir).expect("create dev dir");
-        let html_path = dir.join("index.html");
-        std::fs::write(&html_path, "<html>dev override</html>").expect("write dev html");
-
-        std::env::set_var(CONSOLE_DEV_PATH_ENV, &dir);
-        let resolved = resolve_console_html();
-        std::env::remove_var(CONSOLE_DEV_PATH_ENV);
-
-        assert_eq!(&*resolved, "<html>dev override</html>");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn dev_override_falls_back_when_path_unreadable() {
-        let _guard = env_lock();
-        std::env::set_var(CONSOLE_DEV_PATH_ENV, "/this/path/does/not/exist/index.html");
-        let result = dev_html_override();
-        std::env::remove_var(CONSOLE_DEV_PATH_ENV);
-        assert!(result.is_none(), "missing dev path should fall back to embedded HTML");
-    }
-
-    // ---- Unified Shell Console v2 flag (M0) --------------------------------
-
-    #[test]
-    fn console_v2_flag_unset_serves_legacy_body_byte_identical() {
-        let _guard = env_lock();
-        std::env::remove_var(CONSOLE_DEV_PATH_ENV);
-        std::env::remove_var(CONSOLE_V2_ENV);
         let body = resolve_console_body();
-        // M0 gate: flag off ⇒ /console body is exactly today's console.
-        assert_eq!(&*body, CONSOLE_HTML);
-    }
-
-    #[test]
-    fn console_v2_flag_truthy_serves_v2_shell() {
-        let _guard = env_lock();
-        std::env::remove_var(CONSOLE_DEV_PATH_ENV);
-        for truthy in ["1", "TRUE", "on", " True ", "ON"] {
-            std::env::set_var(CONSOLE_V2_ENV, truthy);
-            let body = resolve_console_body();
-            assert_eq!(&*body, CONSOLE_V2_HTML, "flag {truthy:?} should serve the v2 shell");
-        }
-        std::env::remove_var(CONSOLE_V2_ENV);
-    }
-
-    #[test]
-    fn console_v2_flag_falsey_or_garbage_serves_legacy_body() {
-        let _guard = env_lock();
-        std::env::remove_var(CONSOLE_DEV_PATH_ENV);
-        for falsey in ["0", "junk", "", "   ", "off", "false", "2", "yes"] {
-            std::env::set_var(CONSOLE_V2_ENV, falsey);
-            let body = resolve_console_body();
-            assert_eq!(&*body, CONSOLE_HTML, "flag {falsey:?} should serve the legacy console");
-        }
-        std::env::remove_var(CONSOLE_V2_ENV);
+        assert_eq!(&*body, CONSOLE_V2_HTML, "/console must serve the v2 shell");
     }
 
     #[test]
@@ -1004,30 +637,6 @@ mod tests {
                 "render.js missing expected marker: {required}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn console_legacy_route_serves_the_legacy_console() {
-        use tower::ServiceExt;
-        let _guard = env_lock();
-        std::env::remove_var(CONSOLE_DEV_PATH_ENV);
-        std::env::set_var(CONSOLE_V2_ENV, "1"); // even with v2 on, /console/legacy is the old console
-        let resp = super::routes(true)
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("GET")
-                    .uri("/console/legacy")
-                    .body(axum::body::Body::empty())
-                    .expect("build request"),
-            )
-            .await
-            .expect("router response");
-        std::env::remove_var(CONSOLE_V2_ENV);
-        assert_eq!(resp.status(), axum::http::StatusCode::OK);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("read body");
-        assert_eq!(String::from_utf8(bytes.to_vec()).expect("utf8 body"), CONSOLE_HTML);
     }
 
     #[tokio::test]

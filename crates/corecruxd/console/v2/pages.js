@@ -867,11 +867,10 @@
 
   var STATIC = {
     'cx-activity': [
-      { h: 'Live activity', sub: 'the rolling activity log lives on a dedicated, streaming surface', wide: true,
+      { h: 'Live activity', sub: 'the rolling activity log is folded into Work › Activity in this console', wide: true,
         controls: [
           info('stream', 'GET /v1/events/stream?types=activity.appended'),
-          info('note', 'the full receipt-cross-walked activity log is a dedicated page'),
-          link('Open the activity log', '/console/activity', { hint: 'streams both lanes with ✓verify badges' })
+          info('note', 'the full receipt-cross-walked activity log is the Work › Activity surface in this console — no separate page')
         ] }
     ],
     'cx-usage': [
@@ -1001,13 +1000,14 @@
           info('view', 'entity graph · shard topology · lane overlay'),
           link('Open the 3D substrate', '/console-3d/index.html?embed=1', { hint: 'opens the Pro 3D substrate view' })
         ] },
-      // Retirement (M10) fallback: the deep-machinery workbench is native now, but
-      // the legacy console stays reachable as a fallback (the smoke's retirement
-      // check asserts this copy + the /console/legacy link survive).
-      { h: 'Legacy fallback', sub: 'the workbench is native now; the legacy console remains reachable', wide: true,
+      // Retirement (M10→M12): the deep-machinery workbench is native now, and the
+      // legacy console has been fully removed — /console/legacy now 404s. This v2
+      // console is the sole replacement, not a "kept as fallback" surface (the
+      // smoke's retirement check asserts the removal copy + that no live
+      // /console/legacy link survives).
+      { h: 'Legacy console removed', sub: 'the workbench is native now; the legacy console has been fully removed', wide: true,
         controls: [
-          info('legacy console', '(legacy — retired, kept as fallback)'),
-          link('Open the legacy console', '/console/legacy', { hint: 'the retired legacy workbench (legacy — retired, kept as fallback)' })
+          info('legacy console', '(legacy — removed, fully replaced by this console)')
         ] }
     ],
     // DX / Docs — daemon reference + platform docs. No live docs endpoint on
@@ -1167,10 +1167,10 @@
   // is the machine-readable proof that nothing from /console/legacy was dropped.
   var LEGACY_PORT = {
     // ── Retirement marker (M10) — the top-level metadata key. On this date the
-    // legacy console (crates/corecruxd/src/console.rs serve_console_legacy) was
-    // formally RETIRED: the v2 unified shell is the surface, and the legacy body
-    // is retained only as a fallback (still reachable at /console/legacy). Not a
-    // legacy section — the smoke's port-checklist integrity check skips this key
+    // legacy console was formally RETIRED; it has since been fully REMOVED —
+    // crates/corecruxd/src/console.rs no longer serves it and /console/legacy
+    // now 404s. The v2 unified shell is the sole surface (no fallback body). Not
+    // a legacy section — the smoke's port-checklist integrity check skips this key
     // and asserts its value directly. See ExecPlan unified-shell-console-2026-07-03.
     retired_at: '2026-07-03',
     // ── CX (26) — the forward-facing scope, ported in M1; each keeps its id ──
