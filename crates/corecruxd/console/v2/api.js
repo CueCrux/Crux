@@ -790,12 +790,38 @@ const CruxApiRead = Object.freeze({
   },
 });
 
+// --- Hosted platform session (BFF /api/auth/*) ---------------------------
+// NOT daemon routes and NOT part of the daemon GET/mutation allowlists: on a
+// hosted deployment a BFF fronts the daemon and owns the account session
+// (cookies on the parent domain, CSRF double-submit). On a local daemon these
+// paths 404 — callers treat that as "no session surface, hide the control".
+// Lives here so the through-client rule holds: api.js is the sole network layer.
+const CruxSession = {
+  /** Resolves true when a hosted session surface exists (route present at all). */
+  probe() {
+    return fetch('/api/auth/session', { credentials: 'same-origin' })
+      .then((res) => res.status !== 404)
+      .catch(() => false);
+  },
+  /** POST logout with the CSRF double-submit header; resolves response.ok. */
+  logout() {
+    const m = document.cookie.match(/(?:^|; )cc_csrf=([^;]*)/);
+    const csrf = m ? decodeURIComponent(m[1]) : '';
+    return fetch('/api/auth/logout', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: csrf ? { 'x-csrf-token': csrf } : {},
+    }).then((res) => res.ok);
+  },
+};
+
 // Classic-script globals for the no-build v2 console. No `export` — the
 // console loads this with a plain <script src="/console-v2/api.js">.
 if (typeof window !== 'undefined') {
   window.CruxApi = CruxApi;
   window.CruxApiGated = CruxApiGated;
   window.CruxApiRead = CruxApiRead;
+  window.CruxSession = CruxSession;
   window.CRUX_GATED_MUTATIONS = GATED_MUTATIONS;
   window.CRUX_READ_POST_ROUTES = READ_POST_ROUTES;
 }
