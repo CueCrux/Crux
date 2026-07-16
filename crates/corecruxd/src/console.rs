@@ -476,9 +476,8 @@ fn resolve_dev_html_path(base: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_console_body, CONSOLE_DEV_PATH_ENV, CONSOLE_V2_API_JS, CONSOLE_V2_HTML,
-        CONSOLE_V2_ICON_SVG, CONSOLE_V2_MANIFEST, CONSOLE_V2_PAGES_JS, CONSOLE_V2_RENDER_JS,
-        CONSOLE_V2_SW_JS,
+        resolve_console_body, CONSOLE_DEV_PATH_ENV, CONSOLE_V2_API_JS, CONSOLE_V2_HTML, CONSOLE_V2_ICON_SVG,
+        CONSOLE_V2_MANIFEST, CONSOLE_V2_PAGES_JS, CONSOLE_V2_RENDER_JS, CONSOLE_V2_SW_JS,
     };
     use std::sync::Mutex;
 
