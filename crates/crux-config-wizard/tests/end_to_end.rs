@@ -23,7 +23,7 @@ fn full_init_regenerate_loop() {
     let workspace = dir.path();
 
     let bundled = load_bundled_profiles().expect("bundled profiles parse");
-    assert_eq!(bundled.len(), 9, "9 bundled profiles expected");
+    assert_eq!(bundled.len(), 10, "10 bundled profiles expected");
 
     // init with all defaults.
     let mut cfg = AgentProfileConfig::new(workspace_fingerprint(workspace));
