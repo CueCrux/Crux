@@ -17,8 +17,10 @@ dense-embed-model = ["dep:fastembed"]
 
 [dependencies]
 blake3 = { workspace = true }
+crux-sync = { path = "../crux-sync" }
 ed25519-dalek = { workspace = true, features = ["std"] }
 hex = { workspace = true }
+rcx-capability-token = { path = "../rcx-capability-token" }
 utoipa = { workspace = true, features = ["chrono"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
