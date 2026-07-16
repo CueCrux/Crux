@@ -2108,8 +2108,12 @@
   }
   // Bottom account roll-up menu (Settings · Language · Log out) — the System
   // destination moved here, Claude-desktop style. Settings routes to System ›
-  // Settings; Language + Log out are placeholders until platform auth is wired
-  // (a local daemon has no session to end).
+  // Settings; Language stays a placeholder. Log out is wired to the hosted
+  // BFF session (POST /api/auth/logout, CSRF double-submit): on a hosted
+  // deployment the BFF answers /api/auth/session (200/401) and the item shows;
+  // on a local daemon that path 404s, there is no session to end, and the
+  // item hides. Cookies live on the parent domain, so one logout signs the
+  // account out of every surface.
   function initAcctMenu() {
     var btn = document.getElementById('passportChip');
     var menu = document.getElementById('acctMenu');
@@ -2119,13 +2123,28 @@
     var caret = btn.querySelector('.acct-caret'); if (caret) { caret.innerHTML = ICONS.chevron || ''; }
     function closeMenu() { menu.hidden = true; btn.setAttribute('aria-expanded', 'false'); }
     function openMenu() { menu.hidden = false; btn.setAttribute('aria-expanded', 'true'); }
+    var logoutItem = menu.querySelector('[data-acct="logout"]');
+    if (logoutItem && window.CruxSession) {
+      logoutItem.hidden = true;
+      window.CruxSession.probe().then(function (hosted) { logoutItem.hidden = !hosted; });
+    }
+    function doLogout() {
+      if (!window.CruxSession) { return; }
+      window.CruxSession.logout()
+        .then(function (ok) {
+          if (ok) { location.assign('/'); }
+          else { console.warn('logout failed'); }
+        })
+        .catch(function (err) { console.warn('logout unavailable', err); });
+    }
     btn.addEventListener('click', function (e) { e.stopPropagation(); if (menu.hidden) { openMenu(); } else { closeMenu(); } });
     menu.addEventListener('click', function (e) {
       var item = (e.target && e.target.closest) ? e.target.closest('.acct-item') : null;
       if (!item) { return; }
       closeMenu();
       if (item.getAttribute('data-acct') === 'settings') { location.hash = '#/system/cx-settings'; }
-      // language / logout — placeholders (a local daemon has no session).
+      if (item.getAttribute('data-acct') === 'logout') { doLogout(); }
+      // language — placeholder.
     });
     document.addEventListener('click', function () { if (!menu.hidden) { closeMenu(); } });
     document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !menu.hidden) { closeMenu(); } });

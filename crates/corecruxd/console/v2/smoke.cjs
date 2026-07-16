@@ -416,9 +416,16 @@ function extractThemeVars(theme) {
     ['POST', '/v1/query/time-range'],
     ['POST', '/v1/console/engine/search']
   ];
+  // CruxSession (hosted BFF /api/auth/*) carries exactly ONE non-GET call —
+  // the logout POST. It is a platform-session call, not a daemon mutation, so
+  // it sits outside the gated-write and read-POST allowlists; assert it
+  // explicitly so the daemon-mutation count below stays exact.
+  const SESSION_POSTS = 1;
+  check(/window\.CruxSession\s*=\s*CruxSession/.test(apiSrc) && /'\/api\/auth\/logout'/.test(apiSrc),
+    '[gated] api.js must expose CruxSession with the /api/auth/logout call (hosted logout)');
   const verbCount = (apiSrc.match(/method:\s*'(POST|PUT|PATCH|DELETE)'/g) || []).length;
-  const verbExpected = EXPECTED.length + READ_POST_EXPECTED.length;
-  check(verbCount === verbExpected, '[gated] api.js has ' + verbCount + ' non-GET fetch(es); expected ' + verbExpected + ' (' + EXPECTED.length + ' gated writes + ' + READ_POST_EXPECTED.length + ' curated read POSTs)');
+  const verbExpected = EXPECTED.length + READ_POST_EXPECTED.length + SESSION_POSTS;
+  check(verbCount === verbExpected, '[gated] api.js has ' + verbCount + ' non-GET fetch(es); expected ' + verbExpected + ' (' + EXPECTED.length + ' gated writes + ' + READ_POST_EXPECTED.length + ' curated read POSTs + ' + SESSION_POSTS + ' session logout)');
 
   // Static containment: pages.js + shell.html never touch CruxApiGated; render.js
   // touches it ONLY inside operatorGatedCall (which guards on isOperator()).
