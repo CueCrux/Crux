@@ -315,7 +315,7 @@ pub async fn handle_query_expand(params: &Value, ctx: &McpContext) -> Result<Val
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 /// Extract a required string parameter or return an `INVALID_PARAMS` error.
-fn require_str<'a>(params: &'a Value, field: &str) -> Result<&'a str, JsonRpcError> {
+pub(crate) fn require_str<'a>(params: &'a Value, field: &str) -> Result<&'a str, JsonRpcError> {
     params.get(field).and_then(|v| v.as_str()).ok_or_else(|| JsonRpcError {
         code: INVALID_PARAMS,
         message: format!("missing required param: {field}"),
@@ -323,7 +323,7 @@ fn require_str<'a>(params: &'a Value, field: &str) -> Result<&'a str, JsonRpcErr
     })
 }
 
-fn require_tenant_hash(params: &Value) -> Result<u64, JsonRpcError> {
+pub(crate) fn require_tenant_hash(params: &Value) -> Result<u64, JsonRpcError> {
     let tenant_id = require_str(params, "tenant_id")?.trim();
     if tenant_id.is_empty() || tenant_id == "*" {
         return Err(JsonRpcError {

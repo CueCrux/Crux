@@ -2204,6 +2204,7 @@ mod tests {
         match name {
             "query" | "query_scan" => json!({"tenant_id": "t", "query": "q", "token_budget": 1000}),
             "engram_resolve" => json!({"model_id": "claude-opus-4-8"}),
+            "reuse_check" => json!({"tenant_id": "t", "description": "d"}),
             "query_expand" => json!({"tenant_id": "t", "result_ids": []}),
             "store_fact" => json!({"entity": "e", "key": "k", "value": "v"}),
             "query_facts" => json!({"query": "v", "token_budget": 1000}),
