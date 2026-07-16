@@ -142,7 +142,8 @@ function walkPage(page, fn) {
   // weakening it: any page id neither in the 26 nor in PRO_PORTED_IDS still fails.
   const proPorted = new Set(pages.PRO_PORTED_IDS || []);
   // Declared native v2 pages beyond the legacy 26 (not pro-gated). cx-activity-log
-  // is the Work › Activity log (ported from /console/activity), custom-rendered.
+  // is the Work › Activity log — folded into this console (the standalone
+  // /console/activity page was removed), custom-rendered.
   const nativeExtra = new Set(['cx-activity-log']);
   Object.keys(pages.PAGES).forEach(function (id) {
     if (LEGACY_26.indexOf(id) >= 0) { return; }
@@ -1139,32 +1140,36 @@ function extractThemeVars(theme) {
 })();
 
 // =========================================================================
-//  Check 28 — (M10) legacy retirement. (a) LEGACY_PORT.retired_at marker.
-//  (b) the v2 shell carries the "(legacy — retired, kept as fallback)" copy on
-//  the /console/legacy link (retained as a fallback, not dropped). (c) the
-//  console.rs serve_console_legacy handler carries a DEPRECATED doc-comment
-//  referencing the ExecPlan slug (read via a relative path — comment-only, the
-//  flag-off byte-parity test proves the served body is unchanged).
+//  Check 28 — (M10→M12) legacy retirement + removal. (a) LEGACY_PORT.retired_at
+//  marker survives (the formal retirement date is recorded history, not live
+//  state). (b) the v2 shell no longer carries the old "(legacy — retired, kept
+//  as fallback)" copy nor a live link() to /console/legacy — it now states the
+//  legacy console has been REMOVED and this v2 console is its full replacement.
+//  (c) console.rs no longer defines serve_console_legacy: the route was deleted,
+//  so /console/legacy now 404s (verified structurally — the handler symbol is
+//  absent from the served-console source).
 // =========================================================================
 (function checkRetirement() {
   check(pages.LEGACY_PORT && pages.LEGACY_PORT.retired_at === '2026-07-03',
     '[retire] LEGACY_PORT.retired_at must be "2026-07-03" (the formal legacy-console retirement date)');
-  check(/\(legacy — retired, kept as fallback\)/.test(pagesSrc),
-    '[retire] the v2 /console/legacy link must carry the "(legacy — retired, kept as fallback)" copy');
-  check(pagesSrc.indexOf('/console/legacy') >= 0,
-    '[retire] the v2 shell must keep /console/legacy reachable as a fallback (not removed)');
+  // The old "kept as fallback" copy must be GONE — the legacy console is removed,
+  // not retained as a reachable fallback.
+  check(!/\(legacy — retired, kept as fallback\)/.test(pagesSrc),
+    '[retire] the old "(legacy — retired, kept as fallback)" copy must be gone (legacy console is fully removed, not a fallback)');
+  // …replaced by explicit removal copy.
+  check(/\(legacy — removed, fully replaced by this console\)/.test(pagesSrc),
+    '[retire] the v2 shell must carry the "(legacy — removed, fully replaced by this console)" removal copy');
+  // No LIVE link() to the now-404 /console/legacy route may survive.
+  check(!/link\([^)]*['"]\/console\/legacy['"]/.test(pagesSrc),
+    '[retire] the v2 shell must not render a live link() to the removed /console/legacy route');
   const consoleRsPath = path.join(DIR, '..', '..', 'src', 'console.rs');
   let consoleRs = '';
   try { consoleRs = fs.readFileSync(consoleRsPath, 'utf8'); }
   catch (e) { check(false, '[retire] could not read console.rs at ' + consoleRsPath + ': ' + e.message); }
-  const legAt = consoleRs.indexOf('fn serve_console_legacy');
-  check(legAt >= 0, '[retire] console.rs must define serve_console_legacy');
-  const preamble = legAt >= 0 ? consoleRs.slice(Math.max(0, legAt - 1200), legAt) : '';
-  check(/DEPRECATED/.test(preamble) && /unified-shell-console-2026-07-03/.test(preamble),
-    '[retire] serve_console_legacy must carry a DEPRECATED doc-comment referencing the ExecPlan slug');
-  check(/fallback/.test(preamble),
-    '[retire] the deprecation comment must note the legacy console is retained only as a fallback');
-  notes.push('retirement (M10): LEGACY_PORT.retired_at=2026-07-03 · v2 legacy-fallback copy · console.rs serve_console_legacy DEPRECATED doc-comment (ExecPlan-referenced, comment-only).');
+  // The legacy handler must be GONE — the route was removed, so /console/legacy 404s.
+  check(consoleRs.indexOf('fn serve_console_legacy') < 0,
+    '[retire] console.rs must no longer define serve_console_legacy (legacy route removed → /console/legacy 404s)');
+  notes.push('retirement (M10→M12): LEGACY_PORT.retired_at=2026-07-03 · v2 removal copy (no "kept as fallback", no live /console/legacy link) · console.rs serve_console_legacy handler removed (route 404s).');
 })();
 
 // =========================================================================
@@ -1840,5 +1845,5 @@ if (failures.length) {
   failures.forEach(function (f) { console.error('  ✗ ' + f); });
   process.exit(1);
 }
-console.log('\nPASS — all gates green (26/26 ids incl. pill:false landing-render + 4 Pro-ported legacy pages, control coverage, theme contrast, posture gate, no external deps, through-client fetches, gated-mutations audit, posture derivation, engine mediation, PWA manifest, service worker, phone tier, demo-mode gating, unified buttons, collapsible rail, status pill + chips, charts, board strips, nav-family consolidation + rail-at-rest-borderless, projects disclosure + repo grid, topbar chip height, legacy LED toggle + squarer topbar chips + list-row language, M8 mode system + posture-independence, M8 legacy port-checklist integrity, M9 canvas board (canvasTier + widget registry), M9 canvas graph (real-edge-only model + focus parser + launch points), M10 documents mode (3-mode reader + ~72ch measure + evidence panel + real sources + demo Proof fixture + deep-link-out auto-switch), M10 legacy retirement (retired_at + fallback copy + console.rs DEPRECATED comment), M12 11-surface JSX port (DOC_SURFACES + JSX_PORT + rail nav + #/documents/<id> routes + real-vs-demo honesty), M13a safe control parity + native workbench port (CONTROL_DIFF covers all 26 CX pages; cx-workbench loads /v1/workbench/contract + 5 GET read tools via a GET-only self-loader), M13b live mutation wiring (19 write controls live behind the guard harness — operatorGatedCall→CruxApiGated + bound-passport Art.14 refusal + confirm dialog on the destructive/spend subset + real receipt; 22 curated GATED_MUTATIONS; 8 controls stay operator-gated + disabled for documented ungroundable/invariant reasons; customer posture hides AND refuses every write), M14 WebCrux tile canvas (pure 20px-grid engine + onion-layer auto-layout + measured interaction grammar CSS + board-as-tiles + documents corpus canvas + <640px form stack)).');
+console.log('\nPASS — all gates green (26/26 ids incl. pill:false landing-render + 4 Pro-ported legacy pages, control coverage, theme contrast, posture gate, no external deps, through-client fetches, gated-mutations audit, posture derivation, engine mediation, PWA manifest, service worker, phone tier, demo-mode gating, unified buttons, collapsible rail, status pill + chips, charts, board strips, nav-family consolidation + rail-at-rest-borderless, projects disclosure + repo grid, topbar chip height, legacy LED toggle + squarer topbar chips + list-row language, M8 mode system + posture-independence, M8 legacy port-checklist integrity, M9 canvas board (canvasTier + widget registry), M9 canvas graph (real-edge-only model + focus parser + launch points), M10 documents mode (3-mode reader + ~72ch measure + evidence panel + real sources + demo Proof fixture + deep-link-out auto-switch), M10→M12 legacy retirement + removal (retired_at marker + removal copy, no live /console/legacy link, console.rs serve_console_legacy handler gone → route 404s), M12 11-surface JSX port (DOC_SURFACES + JSX_PORT + rail nav + #/documents/<id> routes + real-vs-demo honesty), M13a safe control parity + native workbench port (CONTROL_DIFF covers all 26 CX pages; cx-workbench loads /v1/workbench/contract + 5 GET read tools via a GET-only self-loader), M13b live mutation wiring (19 write controls live behind the guard harness — operatorGatedCall→CruxApiGated + bound-passport Art.14 refusal + confirm dialog on the destructive/spend subset + real receipt; 22 curated GATED_MUTATIONS; 8 controls stay operator-gated + disabled for documented ungroundable/invariant reasons; customer posture hides AND refuses every write), M14 WebCrux tile canvas (pure 20px-grid engine + onion-layer auto-layout + measured interaction grammar CSS + board-as-tiles + documents corpus canvas + <640px form stack)).');
 process.exit(0);

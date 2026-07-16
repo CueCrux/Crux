@@ -1575,16 +1575,17 @@
   }
 
   // Activity strip: latest N from /v1/activity. When the feature flag is off it
-  // 404s → M1-style link card to the dedicated /console/activity surface.
+  // 404s → static hint pointing at the Work › Activity surface folded into this
+  // console (the standalone /console/activity page has been removed).
   function fillActivity(wrap) {
     var body = wrap.__body;
     return fetchJSON('/v1/activity?tenant_id=default&token_budget=1500').then(function (res) {
       body.textContent = '';
       if (res.status === 404) {
         if (demoActivity(wrap)) { return; }   // demo fills only when the surface is off
-        setCt(wrap, 'dedicated surface');
+        setCt(wrap, 'Work › Activity');
         body.appendChild(kv('stream', 'GET /v1/events/stream?types=activity.appended'));
-        body.appendChild(el('a', { 'class': 'ow-link', href: '/console/activity' }, ['Open the activity log →']));
+        body.appendChild(kv('activity log', 'folded into Work › Activity in this console'));
         return;
       }
       if (!res.ok || !res.data) {
