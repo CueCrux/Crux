@@ -608,12 +608,38 @@ fn generate_api_js() -> String {
     }
     s.push_str("});\n\n");
 
+    s.push_str("// --- Hosted platform session (BFF /api/auth/*) ---------------------------\n");
+    s.push_str("// NOT daemon routes and NOT part of the daemon GET/mutation allowlists: on a\n");
+    s.push_str("// hosted deployment a BFF fronts the daemon and owns the account session\n");
+    s.push_str("// (cookies on the parent domain, CSRF double-submit). On a local daemon these\n");
+    s.push_str("// paths 404 — callers treat that as \"no session surface, hide the control\".\n");
+    s.push_str("// Lives here so the through-client rule holds: api.js is the sole network layer.\n");
+    s.push_str("const CruxSession = {\n");
+    s.push_str("  /** Resolves true when a hosted session surface exists (route present at all). */\n");
+    s.push_str("  probe() {\n");
+    s.push_str("    return fetch('/api/auth/session', { credentials: 'same-origin' })\n");
+    s.push_str("      .then((res) => res.status !== 404)\n");
+    s.push_str("      .catch(() => false);\n");
+    s.push_str("  },\n");
+    s.push_str("  /** POST logout with the CSRF double-submit header; resolves response.ok. */\n");
+    s.push_str("  logout() {\n");
+    s.push_str("    const m = document.cookie.match(/(?:^|; )cc_csrf=([^;]*)/);\n");
+    s.push_str("    const csrf = m ? decodeURIComponent(m[1]) : '';\n");
+    s.push_str("    return fetch('/api/auth/logout', {\n");
+    s.push_str("      method: 'POST',\n");
+    s.push_str("      credentials: 'same-origin',\n");
+    s.push_str("      headers: csrf ? { 'x-csrf-token': csrf } : {},\n");
+    s.push_str("    }).then((res) => res.ok);\n");
+    s.push_str("  },\n");
+    s.push_str("};\n\n");
+
     s.push_str("// Classic-script globals for the no-build v2 console. No `export` — the\n");
     s.push_str("// console loads this with a plain <script src=\"/console-v2/api.js\">.\n");
     s.push_str("if (typeof window !== 'undefined') {\n");
     s.push_str("  window.CruxApi = CruxApi;\n");
     s.push_str("  window.CruxApiGated = CruxApiGated;\n");
     s.push_str("  window.CruxApiRead = CruxApiRead;\n");
+    s.push_str("  window.CruxSession = CruxSession;\n");
     s.push_str("  window.CRUX_GATED_MUTATIONS = GATED_MUTATIONS;\n");
     s.push_str("  window.CRUX_READ_POST_ROUTES = READ_POST_ROUTES;\n");
     s.push_str("}\n");
