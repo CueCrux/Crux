@@ -2086,9 +2086,73 @@ fn polarity_class_v1(value: &str) -> Option<&'static str> {
     }
 }
 
+/// Reduce `facts` to one row per (entity, key) — the row with the highest
+/// `version` wins. Preserves Fact ordering otherwise (callers can re-sort).
+///
+/// `FactStore::query()` returns all live versions of a fact — including
+/// superseded ones. Listing surfaces (passports, projects, work, engram
+/// overlays) want only the latest version per `(entity, key)`.
+pub fn dedup_latest(facts: Vec<Fact>) -> Vec<Fact> {
+    let mut by_key: std::collections::BTreeMap<(String, String), Fact> = std::collections::BTreeMap::new();
+    for fact in facts {
+        let key = (fact.entity.clone(), fact.key.clone());
+        match by_key.get(&key) {
+            Some(existing) if existing.version >= fact.version => {}
+            _ => {
+                by_key.insert(key, fact);
+            }
+        }
+    }
+    by_key.into_values().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dedup_keeps_highest_version_per_entity_and_key() {
+        let mut store = FactStore::new();
+        let mut reqs = Vec::new();
+        for _ in 0..3 {
+            reqs.push(StoreFact {
+            tenant_hash: "default".to_string(),
+                entity: "e1".to_string(),
+                key: "k".to_string(),
+                value: "v".to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            });
+        }
+        reqs.push(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "e2".to_string(),
+            key: "k".to_string(),
+            value: "v".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        let stored = store.store_bulk(reqs);
+        let max_e1_version = stored
+            .iter()
+            .filter(|f| f.entity == "e1")
+            .map(|f| f.version)
+            .max()
+            .unwrap_or(0);
+
+        let mut out = dedup_latest(stored);
+        out.sort_by(|a, b| a.entity.cmp(&b.entity));
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].entity, "e1");
+        assert_eq!(out[0].version, max_e1_version);
+        assert_eq!(out[1].entity, "e2");
+    }
 
     /// Backward-compat (agent-passport M1): a JSON fact written before the
     /// `actor` field existed (e.g. one of the ~2.1k prod facts, or a

@@ -23,6 +23,7 @@ pub mod coordination;
 pub mod cuecrux_session;
 pub mod decision;
 pub mod edges;
+pub mod engrams;
 pub mod entities;
 pub mod extensions;
 pub mod facts;
@@ -153,6 +154,30 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
             name: "autonomy_contract".to_string(),
             description: autonomy::AUTONOMY_CONTRACT_DESCRIPTION.to_string(),
             input_schema: autonomy::tool_input_schema(),
+        },
+        // ── Engrams (pre-execution overlays, minimalism plane M2) ──
+        ToolDefinition {
+            name: "engram_resolve".to_string(),
+            description: "Resolve pre-execution behavioural overlays (engrams) from the local \
+                          catalog. Without `names`: returns the content-free engram manifest for \
+                          your capability class (session discovery). With `names` \
+                          (`name@version`, max 20): returns full engram content when your \
+                          capability class allows. Flag-gated by CORECRUXD_FEATURE_ENGRAM_MCP \
+                          (off by default)."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "names":         { "type": "array", "items": {"type": "string"}, "description": "Optional name@version entries to resolve; omit for manifest mode" },
+                    "model_id":      { "type": "string", "description": "Caller model id — derives capability class (fast/capable/frontier)" },
+                    "intent_bucket": { "type": "string", "description": "Optional filter to one intent bucket" },
+                    "tenant_id":     { "type": "string", "description": "Tenant identifier (default: local)" }
+                },
+                "examples": [
+                    { "model_id": "claude-fable-5" },
+                    { "names": ["code-minimalism@v1"], "model_id": "claude-opus-4-8" }
+                ]
+            }),
         },
         // ── Retrieval ──────────────────────────────────────────────
         ToolDefinition {
@@ -2594,6 +2619,7 @@ pub fn tool_output_docs() -> Value {
     json!([
         { "tool": "cuecrux_session",    "output": "SessionPlan (see agents.cuecrux.com/schemas/SessionPlan.v1). Contains plan_id, session_id, passport, channels {bulk?, mcp}, capability_graph[], receipt {hash, signature?, signer_kid?, mode}, budget, minted_at, session_ttl_s." },
         { "tool": "autonomy_contract",  "output": "{ feature_enabled, passport_id, tier, token_id, token_hash, capabilities: [{name, allowed, scope, backend_id, mode, cost_credits, why_denied?}], summary: {total_tools, returned, allowed, denied, truncated_by_token_budget} }. Disabled when CORECRUXD_FEATURE_AUTONOMY_CONTRACT is off (feature_enabled=false, empty capabilities)." },
+        { "tool": "engram_resolve",     "output": "manifest mode: { schema, capability_class, engram_manifest }; resolve mode: { schema, capability_class, engrams: [{name, version, intent_bucket, content, prompt_hash, applicable_why}], engram_set_hash, manifest_hash }. CAPABILITY_DENIED when CORECRUXD_FEATURE_ENGRAM_MCP is off (default)." },
         { "tool": "query",              "output": "{ results: [{doc_id, score, segment_index, token_count}], coverage: {score, gaps, below_floor}, meta: {backend, took_ms, segments_searched} }" },
         { "tool": "query_scan",         "output": "{ results: [{doc_id, score, token_count}], meta: {took_ms, segments_searched} }" },
         { "tool": "query_expand",       "output": "{ results: [{doc_id, content, token_count}] }" },
@@ -2743,6 +2769,7 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
     match name {
         "cuecrux_session" => cuecrux_session::handle_cuecrux_session(args, ctx).await,
         "autonomy_contract" => autonomy::handle_autonomy_contract(args, ctx).await,
+        "engram_resolve" => engrams::handle_engram_resolve(args, ctx).await,
         "query" => query::handle_query(args, ctx).await,
         "query_scan" => query::handle_query_scan(args, ctx).await,
         "query_expand" => query::handle_query_expand(args, ctx).await,
@@ -2964,7 +2991,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 116; // +2 register_repo + list_repos (repo-watch M3). +1 status_feed (open-engine-coordination-surfaces M3). +1 context_custody_audit (race-to-context positioning). +1 revoke_passport (passport-revocation M2). main 94 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check + 2 coord-plane: coord_status + coord_announce + session_token_usage (action-ledger M1)) + 2 session-archive (archive_session + unarchive_session) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard) + 1 activity (activity_recent, crux-dual-surface-activity-log M2) + 2 consolidation (memory_contradictions + memory_consolidate, audit-ii M4) + 1 session-mining (learn, token-efficiency M4) + 1 holdout (token_savings, token-efficiency cutover CO-4).
+    const TOOL_COUNT: usize = 117; // +1 engram_resolve (minimalism plane M2). +2 register_repo + list_repos (repo-watch M3). +1 status_feed (open-engine-coordination-surfaces M3). +1 context_custody_audit (race-to-context positioning). +1 revoke_passport (passport-revocation M2). main 94 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check + 2 coord-plane: coord_status + coord_announce + session_token_usage (action-ledger M1)) + 2 session-archive (archive_session + unarchive_session) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard) + 1 activity (activity_recent, crux-dual-surface-activity-log M2) + 2 consolidation (memory_contradictions + memory_consolidate, audit-ii M4) + 1 session-mining (learn, token-efficiency M4) + 1 holdout (token_savings, token-efficiency cutover CO-4).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")

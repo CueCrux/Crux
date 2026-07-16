@@ -43,6 +43,7 @@ pub mod case_store;
 pub mod cruxpack;
 pub mod edge_store;
 pub mod embeddings;
+pub mod engrams;
 pub mod entity_store;
 pub mod events;
 pub mod fact_privacy;
