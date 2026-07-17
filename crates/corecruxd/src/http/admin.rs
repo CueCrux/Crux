@@ -426,6 +426,31 @@ pub(super) fn sync_control_metrics(metrics: &Metrics, control: &control::Control
     metrics.set_throttle_ratio(1.0);
 }
 
+/// Build the P4/M6 erasure receipt payload. Counts + reason ONLY — never the
+/// content of any erased fact. Redaction is guaranteed by construction: the
+/// builder receives a [`CompactionReport`] (counts) and the operator's reason
+/// string, not facts. `reason` is the operator's stated justification (required
+/// on the compact-facts action), not erased content. Redaction-tested in
+/// `compact_facts_tests`.
+fn build_erasure_receipt_payload(
+    report: &corecrux_memory::fact_store::CompactionReport,
+    retention_marked: usize,
+    retention_days: Option<u32>,
+    reason: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "crux.erasure_receipt.v1",
+        "op": "compact_facts",
+        "facts_dropped": report.facts_dropped,
+        "facts_retained": report.facts_retained,
+        "tombstones_kept": report.tombstones_kept,
+        "retention_marked": retention_marked,
+        "retention_days": retention_days,
+        "reason": reason,
+        "recorded_at": chrono::Utc::now().to_rfc3339(),
+    })
+}
+
 pub(super) async fn execute_admin_action(
     state: &AppState,
     action_id: &str,
@@ -1057,6 +1082,14 @@ pub(super) async fn execute_admin_action(
             let mut retention_marked: Vec<String> = Vec::new();
             let mut retention_days_used: Option<u32> = None;
 
+            // Attribution is security-sensitive: request params may describe an
+            // operator, but only the passport bound at authentication is allowed
+            // to become an erasure receipt's actor.
+            let actor = authenticated_passport
+                .map(str::to_string)
+                .or_else(|| auth_context.and_then(|context| context.subject.clone()))
+                .unwrap_or_else(|| state.passport_fpr.clone());
+
             // Mark-then-compact under a single write lock so the on-disk journal
             // reflects exactly the marks we just made.
             let (report, legal_hold_override_receipt) = {
@@ -1112,13 +1145,6 @@ pub(super) async fn execute_admin_action(
                     let mut fact_ids: Vec<String> = covered.iter().map(|(fact_id, _)| fact_id.clone()).collect();
                     fact_ids.sort();
                     fact_ids.dedup();
-                    // Attribution is security-sensitive: request params may describe
-                    // an operator, but only the passport bound at authentication is
-                    // allowed to become the override receipt's actor.
-                    let actor = authenticated_passport
-                        .map(str::to_string)
-                        .or_else(|| auth_context.and_then(|context| context.subject.clone()))
-                        .unwrap_or_else(|| state.passport_fpr.clone());
                     let override_material = store
                         .record_legal_hold_override(tenant_id, hold_ids, fact_ids, &reason, &actor)
                         .map_err(|err| {
@@ -1153,6 +1179,23 @@ pub(super) async fn execute_admin_action(
                 }
             };
 
+            // P4/M6: signed CROWN erasure receipt on the ordinary path (the
+            // legal-hold-override path already minted a durable
+            // `legal_hold_overridden` receipt covering the same compaction).
+            // Records counts + actor + reason ONLY — never erased content
+            // (redaction-tested). Best-effort: the erasure is already durable.
+            let erasure_receipt_id = if legal_hold_override_receipt.is_none() {
+                super::observations::mint_governance_receipt(
+                    state,
+                    "__governance__::erasure",
+                    &actor,
+                    "erasure.compact_facts",
+                    build_erasure_receipt_payload(&report, retention_marked.len(), retention_days_used, &reason),
+                )
+            } else {
+                None
+            };
+
             let took_ms = started.elapsed().as_millis() as u64;
 
             // Erasure receipt / audit-trail log line (T.4): records WHAT was
@@ -1183,6 +1226,7 @@ pub(super) async fn execute_admin_action(
                     "legalHoldOverridden": legal_hold_override_receipt.is_some(),
                     "legalHoldOverrideReceiptRecordId": legal_hold_override_receipt.as_ref().map(|receipt| &receipt.observation_id),
                     "legalHoldOverrideReceipt": legal_hold_override_receipt.as_ref().map(|receipt| &receipt.receipt),
+                    "erasureReceiptRecordId": erasure_receipt_id,
                     "tookMs": took_ms,
                 }),
                 mutation_event_id: None,
@@ -2600,6 +2644,90 @@ mod compact_facts_tests {
         let raw = std::fs::read_to_string(&journal).unwrap();
         assert!(!raw.contains("erase-this-pii"), "deleted value still in journal");
         assert!(raw.contains("keep-this"));
+    }
+
+    /// P4/M6: the erasure builder carries counts + reason ONLY. Even when a
+    /// caller has just erased a fact whose value was a secret, that secret can
+    /// never reach the payload — the builder never receives fact content.
+    #[test]
+    fn erasure_receipt_payload_is_content_free() {
+        let report = corecrux_memory::fact_store::CompactionReport {
+            facts_dropped: 3,
+            facts_retained: 5,
+            tombstones_kept: 3,
+        };
+        let payload = build_erasure_receipt_payload(&report, 2, Some(90), "gdpr rtbf request #42");
+        let s = payload.to_string();
+        assert_eq!(payload["facts_dropped"], 3);
+        assert_eq!(payload["retention_marked"], 2);
+        assert_eq!(payload["retention_days"], 90);
+        // The erased fact's value would have been something like this; it is
+        // structurally impossible for it to appear (the builder takes counts).
+        assert!(
+            !s.contains("TOPSECRET_ERASED_PAYLOAD"),
+            "no erased content in receipt: {s}"
+        );
+    }
+
+    /// P4/M6 end-to-end: a real compact-facts erasure mints a signed CROWN
+    /// receipt, and NO file under the daemon data dir (receipt included) carries
+    /// the erased secret value.
+    #[tokio::test]
+    async fn compact_facts_mints_erasure_receipt_without_leaking_content() {
+        const SECRET: &str = "TOPSECRET_ERASED_PAYLOAD_zz9";
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = crate::http::tests::test_app_state_with_auth(4, crate::auth::AuthMode::DevScopes);
+        let key = crux_session::LocalPassportKey::from_path(&state.passport_key_path).unwrap();
+        state.passport_fpr = key.passport_fpr().to_string();
+        state.passport_public_key_hex = key.public_key_hex().to_string();
+
+        let mut fs = FactStore::with_persistence(dir.path()).unwrap();
+        let deleted = fs.store(store_fact(SECRET));
+        fs.store(store_fact("keep-this"));
+        fs.delete(&deleted.fact_id);
+        state.fact_store = std::sync::Arc::new(tokio::sync::RwLock::new(fs));
+
+        let params = serde_json::json!({ "reason": "gdpr-erasure-test" });
+        let result = execute_admin_action(&state, "act-r", "compact-facts", Some(&params), None, None, None)
+            .await
+            .expect("compact-facts action succeeds");
+
+        // A signed erasure receipt was minted.
+        let receipt_id = result.result["erasureReceiptRecordId"]
+            .as_str()
+            .expect("erasure receipt minted");
+        assert!(!receipt_id.is_empty());
+
+        // Sweep the whole daemon data dir: the receipt records the counts + kind
+        // but no file (receipt or otherwise) may contain the erased secret.
+        let mut saw_receipt = false;
+        for entry in walk_files(&state.data_dir) {
+            let body = std::fs::read_to_string(&entry).unwrap_or_default();
+            assert!(!body.contains(SECRET), "erased secret leaked into {}", entry.display());
+            if body.contains("erasure.compact_facts") {
+                saw_receipt = true;
+                assert!(body.contains("\"facts_dropped\":1"), "receipt records the drop count");
+            }
+        }
+        assert!(saw_receipt, "erasure receipt file written under data dir");
+    }
+
+    /// Depth-first list of regular files under `root` (small test tree).
+    fn walk_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(p) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&p) else { continue };
+            for e in rd.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        out
     }
 
     #[tokio::test]

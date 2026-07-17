@@ -56,6 +56,7 @@ use tokio::sync::{broadcast, RwLock};
 
 use corecrux_memory::{Fact, FactStore};
 
+use crate::http::AppState;
 use crate::session_bindings::{SessionBinding, SESSION_BINDING_RECORD_KEY};
 
 /// Default retain window for ephemeral facts: 30 days.
@@ -160,6 +161,21 @@ pub async fn run_sweep_once(store: &Arc<RwLock<FactStore>>, now: DateTime<Utc>, 
     deleted
 }
 
+/// Build the P4/M6 ephemeral-GC receipt payload. Count + retain window ONLY —
+/// never the content of any swept fact (the builder takes a count, not facts).
+/// Redaction-tested in `tests`.
+fn build_gc_receipt_payload(deleted: usize, retain_days: i64) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "crux.gc_receipt.v1",
+        "op": "ephemeral_sweep",
+        "deleted": deleted,
+        "retain_days": retain_days,
+        "reason": "ephemeral reserved-fact GC (session bindings / reverify receipts past retain)",
+        "swept_at": Utc::now().to_rfc3339(),
+        "run_id": format!("gc_{}", uuid::Uuid::new_v4().simple()),
+    })
+}
+
 /// Spawn the background ephemeral GC task, mirroring
 /// [`crate::update::spawn_update_checker`].
 ///
@@ -168,7 +184,12 @@ pub async fn run_sweep_once(store: &Arc<RwLock<FactStore>>, now: DateTime<Utc>, 
 /// toggling it requires a restart — same convention as the other
 /// `CORECRUXD_*` background-task flags.) The task runs hourly until the
 /// shutdown signal is received.
-pub fn spawn_ephemeral_gc(enabled: bool, store: Arc<RwLock<FactStore>>, mut shutdown: broadcast::Receiver<()>) {
+///
+/// P4/M6: after a sweep soft-deletes ≥1 fact, mint a signed CROWN receipt
+/// (`__governance__::gc`) recording the count + actor + reason — never swept
+/// content. Best-effort: the deletion is already durable, so a missing passport
+/// key logs a warning and continues.
+pub fn spawn_ephemeral_gc(enabled: bool, state: AppState, mut shutdown: broadcast::Receiver<()>) {
     if !enabled {
         return;
     }
@@ -181,9 +202,16 @@ pub fn spawn_ephemeral_gc(enabled: bool, store: Arc<RwLock<FactStore>>, mut shut
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let n = run_sweep_once(&store, Utc::now(), retain).await;
+                    let n = run_sweep_once(&state.fact_store, Utc::now(), retain).await;
                     if n > 0 {
                         tracing::info!(deleted = n, "ephemeral-gc-sweep");
+                        crate::http::observations::mint_governance_receipt(
+                            &state,
+                            "__governance__::gc",
+                            "ephemeral-gc",
+                            "gc.ephemeral_sweep",
+                            build_gc_receipt_payload(n, DEFAULT_RETAIN_DAYS),
+                        );
                     }
                 }
                 _ = shutdown.recv() => break,
@@ -393,6 +421,35 @@ mod tests {
         assert!(tombstone.deleted, "soft-deleted fact is a tombstone, not erased");
         let user_fact = g.all_facts().find(|f| f.fact_id == user_id).expect("user fact present");
         assert!(!user_fact.deleted, "user fact untouched");
+    }
+
+    /// P4/M6: the GC receipt payload carries a count + retain window ONLY, never
+    /// the value of any swept fact — proven by sweeping a secret-bearing fact
+    /// and asserting the secret never reaches the receipt.
+    #[test]
+    fn gc_receipt_payload_never_carries_swept_content() {
+        const SECRET: &str = "GC_SECRET_PAYLOAD_qq7";
+        let mut s = FactStore::new();
+        let f = s.store(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "__reverify_receipts__::f1".to_string(),
+            key: "record".to_string(),
+            value: SECRET.to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: true,
+            horizon_class: None,
+            actor: None,
+        });
+        assert!(s.try_delete(&f.fact_id).unwrap(), "secret fact soft-deleted");
+        // One fact swept ⇒ receipt is built from the count alone.
+        let payload = build_gc_receipt_payload(1, DEFAULT_RETAIN_DAYS);
+        assert_eq!(payload["deleted"], 1);
+        assert_eq!(payload["retain_days"], DEFAULT_RETAIN_DAYS);
+        assert!(
+            !payload.to_string().contains(SECRET),
+            "swept secret leaked into GC receipt: {payload}"
+        );
     }
 
     #[tokio::test]

@@ -653,6 +653,38 @@ pub(super) fn append_one(
     append_one_unlocked(state, scoped_session_id, principal, body, chain_tip)
 }
 
+/// Mint a signed governance CROWN receipt over `payload` under the reserved
+/// `session` (e.g. `__governance__::erasure`, `__governance__::gc`), returning
+/// the `observation_id` on success. **Best-effort**: the mutation being
+/// recorded is already durable, so a missing passport key or append failure
+/// logs a warning and returns `None` rather than failing the caller — mirrors
+/// `mint_consolidation_receipt`. P4/M6: the shared minting path for the
+/// erasure (admin) and ephemeral-GC (background) receipt records.
+///
+/// The caller is responsible for the redaction invariant: `payload` must carry
+/// counts + actor + reason ONLY, never erased fact content.
+pub(crate) fn mint_governance_receipt(
+    state: &AppState,
+    session: &str,
+    actor: &str,
+    kind: &str,
+    payload: serde_json::Value,
+) -> Option<String> {
+    let body = PostObservationBody {
+        kind: kind.to_string(),
+        provider: "corecruxd".to_string(),
+        client_ts: None,
+        payload,
+    };
+    match append_one(state, session, actor, body, None) {
+        Ok((resp, _)) => Some(resp.observation_id),
+        Err((_, detail)) => {
+            tracing::warn!(session, reason = %detail, "governance receipt mint failed (best-effort; mutation already durable)");
+            None
+        }
+    }
+}
+
 /// Append a signed observation and fsync its file and directory entries before
 /// returning. Legal-hold release uses this stronger boundary so released state
 /// can never commit ahead of a crash-durable receipt.

@@ -992,11 +992,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // task soft-deletes only `__session_binding__::*` /
     // `__reverify_receipts__::*` facts past retain, via the journaled
     // delete path. See `crate::ephemeral_gc`.
-    ephemeral_gc::spawn_ephemeral_gc(
-        config.ephemeral_gc_enabled,
-        state.fact_store.clone(),
-        shutdown_tx.subscribe(),
-    );
+    ephemeral_gc::spawn_ephemeral_gc(config.ephemeral_gc_enabled, state.clone(), shutdown_tx.subscribe());
     // Consolidation review scheduler (Audit II M4). Gated at spawn by
     // CORECRUXD_CONSOLIDATION_SCHEDULER (default OFF); interval config-driven.
     // Detect+surface only: each tick runs the read-only contradiction pass and

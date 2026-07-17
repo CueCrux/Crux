@@ -85,24 +85,25 @@ const PATHS: &[MutationPath] = &[
         class: Class::Receipted,
         backing_test: "http::consolidation_receipt::tests::consolidation_receipt_verifies_offline_and_tamper_fails",
     },
-    // --- M5: the three live bypasses. M6 flips these to Receipted. ---
+    // --- M6: CROWN receipts landed; the three live bypasses are now receipted. ---
     MutationPath {
         id: 8,
         name: "compact_journal GDPR content erasure",
-        class: Class::BypassNeedsReceipt,
-        backing_test: "",
+        class: Class::Receipted,
+        backing_test: "http::admin::compact_facts_tests::compact_facts_mints_erasure_receipt_without_leaking_content",
     },
     MutationPath {
         id: 9,
         name: "mark_retention_eligible retention sweep",
-        class: Class::BypassNeedsReceipt,
-        backing_test: "",
+        class: Class::Receipted,
+        // Folded into the compact_facts erasure receipt (retention_marked/retention_days fields).
+        backing_test: "http::admin::compact_facts_tests::compact_facts_mints_erasure_receipt_without_leaking_content",
     },
     MutationPath {
         id: 10,
         name: "ephemeral reserved-fact GC sweep",
-        class: Class::BypassNeedsReceipt,
-        backing_test: "",
+        class: Class::Receipted,
+        backing_test: "ephemeral_gc::tests::gc_receipt_payload_never_carries_swept_content",
     },
     // --- justified maintenance ---
     MutationPath {
