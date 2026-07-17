@@ -92,6 +92,7 @@ mod relations;
 mod repo_codegraph;
 mod repo_registry;
 mod repo_watch;
+mod self_update;
 mod session_bindings;
 mod shard_map;
 mod status_feed;
@@ -213,6 +214,9 @@ enum CliAction {
     /// Run the bundled stdio⇄HTTP MCP bridge instead of the daemon
     /// (provider-integration-surfaces M5; see `crate::mcp_stdio`).
     McpStdio,
+    /// `self …` — the explicit self-update subcommand (see
+    /// `crate::self_update`); sub-parsing happens in that module.
+    SelfCmd,
     /// No recognised flag — start the daemon normally.
     Run,
 }
@@ -226,6 +230,7 @@ fn parse_cli_arg(args: &[String]) -> CliAction {
         Some("--version" | "-V" | "version") => CliAction::Version,
         Some("--help" | "-h" | "help") => CliAction::Help,
         Some("mcp-stdio") => CliAction::McpStdio,
+        Some("self") => CliAction::SelfCmd,
         _ => CliAction::Run,
     }
 }
@@ -251,7 +256,9 @@ The only recognised flags are:\n\
   --help, -h       print this message, then exit\n\
   mcp-stdio        run the bundled stdio\u{21c4}HTTP MCP bridge (not the daemon);\n\
                    env: CRUX_MCP_URL (default http://127.0.0.1:14801/mcp),\n\
-                   CRUX_AGENT_TOKEN (optional bearer)\n",
+                   CRUX_AGENT_TOKEN (optional bearer)\n\
+  self update      download, verify (sha256) and install the latest release;\n\
+                   append --check to only report whether a newer one exists\n",
         line = version_line()
     )
 }
@@ -279,6 +286,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         CliAction::McpStdio => {
             std::process::exit(mcp_stdio::run());
+        }
+        CliAction::SelfCmd => {
+            std::process::exit(self_update::run(&args));
         }
         CliAction::Run => {}
     }
@@ -2621,6 +2631,9 @@ mod tests {
         assert_eq!(parse_cli_arg(&[v("--help")]), CliAction::Help);
         assert_eq!(parse_cli_arg(&[v("-h")]), CliAction::Help);
         assert_eq!(parse_cli_arg(&[v("help")]), CliAction::Help);
+        // `self …` routes to the self-update subcommand (sub-parsed in self_update).
+        assert_eq!(parse_cli_arg(&[v("self")]), CliAction::SelfCmd);
+        assert_eq!(parse_cli_arg(&[v("self"), v("update")]), CliAction::SelfCmd);
         // No args → run the daemon.
         assert_eq!(parse_cli_arg(&[]), CliAction::Run);
         // Unrecognised first arg → run (env-only design ignores unknown flags here).
