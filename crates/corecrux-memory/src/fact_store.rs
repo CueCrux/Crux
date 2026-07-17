@@ -2116,7 +2116,7 @@ mod tests {
         let mut reqs = Vec::new();
         for _ in 0..3 {
             reqs.push(StoreFact {
-            tenant_hash: "default".to_string(),
+                tenant_hash: "default".to_string(),
                 entity: "e1".to_string(),
                 key: "k".to_string(),
                 value: "v".to_string(),
