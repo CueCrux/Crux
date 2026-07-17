@@ -912,31 +912,53 @@ pub struct HttpScopeContext {
     write_tenant_selector: Option<String>,
 }
 
-/// True when write-context tenant stamping is enabled (OD-37 / audit-v2 M1).
+/// Enforcement posture for write-context tenant stamping (OD-37 / audit-v2 M1),
+/// parsed from `CORECRUXD_TENANT_WRITE_STAMP`. Mirrors the `RouteAuthMode` /
+/// `RedactMode` off|shadow|on ladder already used elsewhere in the daemon.
 ///
-/// Default OFF → every write stamps `default` and every read resolves `default`,
-/// byte-identical to pre-M1 behaviour (the load-bearing backward-compat + rollback
-/// contract). Set `CORECRUXD_TENANT_WRITE_STAMP=1` to stamp/read real tenants
-/// derived from the bearer token's tenant claim.
-pub(crate) fn tenant_write_stamp_enabled() -> bool {
-    std::env::var("CORECRUXD_TENANT_WRITE_STAMP")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+/// Default **Off** (unlike `RouteAuthMode`, whose default is Shadow) because the
+/// shipped v0.5.43 contract is "stamping is dark until deliberately enabled".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TenantStampMode {
+    /// Every write stamps `default`, every read resolves `default` — byte-identical
+    /// to pre-M1 behaviour. DEFAULT.
+    Off,
+    /// Resolve the tenant and **log what would happen**, but still stamp `default`
+    /// and still read `default`. Observation only — zero behaviour change. Use this
+    /// to prove a window is clean before flipping to `On`.
+    Shadow,
+    /// Stamp/read the real tenant derived from the bearer token's tenant claim.
+    On,
 }
 
-/// Resolve the tenant a writer is authorized to stamp, given its token tenant
-/// authority + an optional request selector. `Ok(None)` means "use the default
-/// tenant" (backward-compat); `Ok(Some(t))` stamps tenant `t`; `Err` rejects an
-/// unauthorized / ambiguous selection. Pure (flag passed in) for unit testing.
-#[allow(clippy::result_large_err)]
-fn resolve_write_tenant_flagged(
-    tenants: &TenantAllow,
-    selector: Option<&str>,
-    flag_on: bool,
-) -> Result<Option<String>, ProblemResponse> {
-    if !flag_on {
-        return Ok(None);
+impl TenantStampMode {
+    pub(crate) fn from_env() -> Self {
+        match std::env::var("CORECRUXD_TENANT_WRITE_STAMP")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("1") | Some("true") | Some("on") | Some("enforce") => Self::On,
+            Some("shadow") | Some("audit") => Self::Shadow,
+            // Anything else (unset, "0", "off", junk) → Off. Fail-safe towards the
+            // shipped behaviour, never towards silently stamping real tenants.
+            _ => Self::Off,
+        }
     }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Shadow => "shadow",
+            Self::On => "on",
+        }
+    }
+}
+
+/// The `On`-mode resolution, independent of posture. Shadow runs this purely to
+/// report what it *would* do; `On` runs it for real.
+#[allow(clippy::result_large_err)]
+fn resolve_write_tenant_on(tenants: &TenantAllow, selector: Option<&str>) -> Result<Option<String>, ProblemResponse> {
     let selector = selector.map(str::trim).filter(|s| !s.is_empty());
     match tenants {
         // No tenant claim → single-tenant deployment → default (backward-compat hinge).
@@ -971,12 +993,53 @@ fn resolve_write_tenant_flagged(
     }
 }
 
+/// Resolve the tenant a writer stamps, honouring the posture.
+///
+/// `Shadow` is the load-bearing case: it runs the full `On` resolution, emits a
+/// `tenant_stamp_shadow_*` warning for the two outcomes that would actually change
+/// behaviour, and then returns `Ok(None)` so the write still stamps `default`.
+/// It is deliberately SILENT when `On` would also have produced `default` — so a
+/// window with zero `tenant_stamp_shadow_*` lines proves the flip is a no-op.
+#[allow(clippy::result_large_err)]
+fn resolve_write_tenant_flagged(
+    tenants: &TenantAllow,
+    selector: Option<&str>,
+    mode: TenantStampMode,
+) -> Result<Option<String>, ProblemResponse> {
+    match mode {
+        TenantStampMode::Off => Ok(None),
+        TenantStampMode::On => resolve_write_tenant_on(tenants, selector),
+        TenantStampMode::Shadow => {
+            match resolve_write_tenant_on(tenants, selector) {
+                // Would orphan: this write would land under a non-default tenant,
+                // and reads would move with it.
+                Ok(Some(would_stamp)) => tracing::warn!(
+                    would_stamp = %would_stamp,
+                    "tenant_stamp_shadow_would_stamp: enabling CORECRUXD_TENANT_WRITE_STAMP=1 would stamp a NON-default tenant here"
+                ),
+                // Would break: this caller would start getting a 4xx.
+                Err(problem) => tracing::warn!(
+                    status = problem.0.status,
+                    detail = %problem.0.detail.as_deref().unwrap_or(""),
+                    "tenant_stamp_shadow_would_reject: enabling CORECRUXD_TENANT_WRITE_STAMP=1 would REJECT this write"
+                ),
+                // Would be `default` anyway — the quiet, safe case. No signal.
+                Ok(None) => {}
+            }
+            Ok(None)
+        }
+    }
+}
+
 /// Resolve the tenant a reader is scoped to. `None` = default. Kept in lockstep
 /// with the write resolver so a writer and reader on the same single-tenant token
 /// agree. Multi-tenant / wildcard tokens read `default` here (their concrete-tenant
 /// reads go through the query path's `tenant_id` body selector or the admin bypass).
-fn resolve_read_tenant_flagged(tenants: &TenantAllow, flag_on: bool) -> Option<String> {
-    if !flag_on {
+///
+/// `Shadow` reads `default` — shadow must not move reads, or it would not be
+/// observation-only.
+fn resolve_read_tenant_flagged(tenants: &TenantAllow, mode: TenantStampMode) -> Option<String> {
+    if mode != TenantStampMode::On {
         return None;
     }
     match tenants {
@@ -996,13 +1059,13 @@ impl HttpScopeContext {
         resolve_write_tenant_flagged(
             &self.tenants,
             self.write_tenant_selector.as_deref(),
-            tenant_write_stamp_enabled(),
+            TenantStampMode::from_env(),
         )
     }
 
     /// Tenant an HTTP read is scoped to. `None` → default tenant.
     pub(crate) fn resolve_read_tenant(&self) -> Option<String> {
-        resolve_read_tenant_flagged(&self.tenants, tenant_write_stamp_enabled())
+        resolve_read_tenant_flagged(&self.tenants, TenantStampMode::from_env())
     }
 }
 
@@ -2117,18 +2180,18 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
     }
 
     #[test]
-    fn write_tenant_flag_off_always_default() {
+    fn write_tenant_mode_off_always_default() {
         // Backward-compat: flag OFF → default regardless of claim/selector.
         assert_eq!(
-            resolve_write_tenant_flagged(&only(&["t1"]), Some("t1"), false).unwrap(),
+            resolve_write_tenant_flagged(&only(&["t1"]), Some("t1"), TenantStampMode::Off).unwrap(),
             None
         );
         assert_eq!(
-            resolve_write_tenant_flagged(&TenantAllow::Any, Some("t9"), false).unwrap(),
+            resolve_write_tenant_flagged(&TenantAllow::Any, Some("t9"), TenantStampMode::Off).unwrap(),
             None
         );
         assert_eq!(
-            resolve_write_tenant_flagged(&TenantAllow::Missing, None, false).unwrap(),
+            resolve_write_tenant_flagged(&TenantAllow::Missing, None, TenantStampMode::Off).unwrap(),
             None
         );
     }
@@ -2137,7 +2200,7 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
     fn write_tenant_missing_claim_is_default() {
         // No tenant claim (single-tenant deployment) → default even with flag ON.
         assert_eq!(
-            resolve_write_tenant_flagged(&TenantAllow::Missing, None, true).unwrap(),
+            resolve_write_tenant_flagged(&TenantAllow::Missing, None, TenantStampMode::On).unwrap(),
             None
         );
     }
@@ -2145,12 +2208,12 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
     #[test]
     fn write_tenant_single_claim_stamps_that_tenant() {
         assert_eq!(
-            resolve_write_tenant_flagged(&only(&["t1"]), None, true).unwrap(),
+            resolve_write_tenant_flagged(&only(&["t1"]), None, TenantStampMode::On).unwrap(),
             Some("t1".to_string())
         );
         // A matching selector is fine.
         assert_eq!(
-            resolve_write_tenant_flagged(&only(&["t1"]), Some("t1"), true).unwrap(),
+            resolve_write_tenant_flagged(&only(&["t1"]), Some("t1"), TenantStampMode::On).unwrap(),
             Some("t1".to_string())
         );
     }
@@ -2158,48 +2221,113 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
     #[test]
     fn write_tenant_unauthorized_selector_rejected() {
         // Adversarial: caller tries to stamp a tenant its token does not own.
-        let err = resolve_write_tenant_flagged(&only(&["t1"]), Some("t2"), true).unwrap_err();
+        let err = resolve_write_tenant_flagged(&only(&["t1"]), Some("t2"), TenantStampMode::On).unwrap_err();
         assert_eq!(err.0.status, 403);
     }
 
     #[test]
     fn write_tenant_multi_claim_requires_selector() {
         // Ambiguous multi-tenant token with no selector → rejected (never guess).
-        let err = resolve_write_tenant_flagged(&only(&["t1", "t2"]), None, true).unwrap_err();
+        let err = resolve_write_tenant_flagged(&only(&["t1", "t2"]), None, TenantStampMode::On).unwrap_err();
         assert_eq!(err.0.status, 403);
         // With a valid selector → that tenant.
         assert_eq!(
-            resolve_write_tenant_flagged(&only(&["t1", "t2"]), Some("t2"), true).unwrap(),
+            resolve_write_tenant_flagged(&only(&["t1", "t2"]), Some("t2"), TenantStampMode::On).unwrap(),
             Some("t2".to_string())
         );
         // Selector outside the set → rejected.
-        assert!(resolve_write_tenant_flagged(&only(&["t1", "t2"]), Some("t3"), true).is_err());
+        assert!(resolve_write_tenant_flagged(&only(&["t1", "t2"]), Some("t3"), TenantStampMode::On).is_err());
     }
 
     #[test]
     fn write_tenant_wildcard_token_uses_selector_or_default() {
         // Wildcard/admin: selector picks the tenant; absent → default (legacy admin writes).
         assert_eq!(
-            resolve_write_tenant_flagged(&TenantAllow::Any, Some("t7"), true).unwrap(),
+            resolve_write_tenant_flagged(&TenantAllow::Any, Some("t7"), TenantStampMode::On).unwrap(),
             Some("t7".to_string())
         );
         assert_eq!(
-            resolve_write_tenant_flagged(&TenantAllow::Any, None, true).unwrap(),
+            resolve_write_tenant_flagged(&TenantAllow::Any, None, TenantStampMode::On).unwrap(),
+            None
+        );
+    }
+
+    // ── Shadow posture: observation only, zero behaviour change ───────────
+
+    #[test]
+    fn shadow_never_changes_write_behaviour() {
+        // Every case that On would stamp or reject, Shadow must still land `default`.
+        for (tenants, sel) in [
+            (only(&["t1"]), None),             // On: stamps t1
+            (only(&["t1", "t2"]), Some("t2")), // On: stamps t2
+            (TenantAllow::Any, Some("t7")),    // On: stamps t7
+            (only(&["t1", "t2"]), None),       // On: REJECTS (selector required)
+            (only(&["t1"]), Some("t2")),       // On: REJECTS (forbidden)
+            (TenantAllow::Missing, None),      // On: default anyway
+        ] {
+            let got = resolve_write_tenant_flagged(&tenants, sel, TenantStampMode::Shadow);
+            assert!(
+                matches!(got, Ok(None)),
+                "shadow must never stamp or reject: {tenants:?} sel={sel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shadow_never_moves_reads() {
+        // If shadow moved reads, it would not be observation-only.
+        assert_eq!(
+            resolve_read_tenant_flagged(&only(&["t1"]), TenantStampMode::Shadow),
+            None
+        );
+        assert_eq!(
+            resolve_read_tenant_flagged(&TenantAllow::Any, TenantStampMode::Shadow),
             None
         );
     }
 
     #[test]
+    fn tenant_stamp_mode_from_env_parsing() {
+        // Pure parse check via the same table from_env uses; fail-safe to Off.
+        for (raw, want) in [
+            ("1", TenantStampMode::On),
+            ("true", TenantStampMode::On),
+            ("on", TenantStampMode::On),
+            ("shadow", TenantStampMode::Shadow),
+            ("audit", TenantStampMode::Shadow),
+            ("0", TenantStampMode::Off),
+            ("off", TenantStampMode::Off),
+            ("banana", TenantStampMode::Off),
+        ] {
+            let got = match raw.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "on" | "enforce" => TenantStampMode::On,
+                "shadow" | "audit" => TenantStampMode::Shadow,
+                _ => TenantStampMode::Off,
+            };
+            assert_eq!(got, want, "parse {raw:?}");
+        }
+    }
+
+    #[test]
     fn read_tenant_lockstep_with_write() {
         // Flag OFF → default; single-tenant token → that tenant; multi/wildcard/missing → default.
-        assert_eq!(resolve_read_tenant_flagged(&only(&["t1"]), false), None);
+        assert_eq!(resolve_read_tenant_flagged(&only(&["t1"]), TenantStampMode::Off), None);
         assert_eq!(
-            resolve_read_tenant_flagged(&only(&["t1"]), true),
+            resolve_read_tenant_flagged(&only(&["t1"]), TenantStampMode::On),
             Some("t1".to_string())
         );
-        assert_eq!(resolve_read_tenant_flagged(&only(&["t1", "t2"]), true), None);
-        assert_eq!(resolve_read_tenant_flagged(&TenantAllow::Any, true), None);
-        assert_eq!(resolve_read_tenant_flagged(&TenantAllow::Missing, true), None);
+        assert_eq!(
+            resolve_read_tenant_flagged(&only(&["t1", "t2"]), TenantStampMode::On),
+            None
+        );
+        assert_eq!(
+            resolve_read_tenant_flagged(&TenantAllow::Any, TenantStampMode::On),
+            None
+        );
+        assert_eq!(
+            resolve_read_tenant_flagged(&TenantAllow::Missing, TenantStampMode::On),
+            None
+        );
     }
 
     // ── parse_jwt_algs ────────────────────────────────────────────────────

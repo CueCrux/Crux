@@ -1341,6 +1341,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         append_lane_enabled = config.append_lane_enabled,
         append_lane_scope = config.append_lane_scope.as_str(),
         follower_reads_enabled = config.follower_reads_enabled,
+        // Surfaced at boot so an operator can tell a CLEAN shadow window (mode
+        // active, zero tenant_stamp_shadow_* warnings) apart from a window that
+        // never ran (flag typo'd / not applied). Shadow is silent on the good
+        // path, so without this the silence is ambiguous.
+        tenant_stamp_mode = crate::auth::TenantStampMode::from_env().as_str(),
         "corecruxd starting"
     );
 
