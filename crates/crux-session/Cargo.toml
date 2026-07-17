@@ -14,6 +14,10 @@ rand = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["preserve_order"] }
 thiserror = { workspace = true }
+# Zeroize sensitive seed material (hex string, decoded bytes) in the passport
+# key loader (crypto-review Finding 3). 1.8.x is already in the workspace lock;
+# version-pinned direct here (no root Cargo.toml entry) to add a single lock edge.
+zeroize = "1.8"
 
 [dev-dependencies]
 corecrux-projections = { path = "../corecrux-projections" }

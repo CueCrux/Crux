@@ -54,15 +54,19 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
         "recovery": recovery,
     });
 
-    let args = json!({
-        "session_id": session_key,
-        "state": state,
-    });
+    // One monotonic-ish counter for this compaction event, shared by both seals
+    // (the session store and the hosted fact) so they carry the same logical
+    // ordering. Only the hosted fact's counter is read on restore; see
+    // `snapshot_crypto::next_counter`.
+    let counter = snapshot_crypto::next_counter();
 
-    // Fire and forget. Daemon-unreachable is non-fatal.
-    if let Err(err) = mcp_client::call_tool("save_session", &args) {
-        eprintln!("crux-hook pre-compact: save_session failed: {err}");
-    }
+    // Finding 1 (crypto-review): the snapshot must never egress in plaintext.
+    // `mcp_client` sends `save_session` to `CRUX_MCP_URL`, which a supported
+    // login flow can point at a REMOTE hosted daemon — so a plaintext state here
+    // leaks cwd/transcript/branch/milestone/recovery. Seal the state with the
+    // passport-derived key so the session store holds only ciphertext, whatever
+    // the endpoint; fall back to plaintext only for a verified-loopback daemon.
+    save_session_sealed(&session_key, &input.session_id, &state, counter);
 
     // Hosted continuity (ExecPlan hosted-compaction-sync-encrypted-2026-07-17):
     // additionally store the snapshot as a CLIENT-SIDE-ENCRYPTED, non-private
@@ -71,7 +75,7 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
     // us"). The free/local path above (`save_session` + the shell preset's `.md`)
     // is untouched; free users skip this silently (no passport seed or no mirror).
     // Best-effort — never blocks or errors the hook.
-    store_encrypted_snapshot(&input.session_id, &state);
+    store_encrypted_snapshot(&input.session_id, &state, counter);
 
     // M3 reasoning pass: attach a reasoning_ref blob pointer to every audit
     // step still missing one, before the turn's reasoning is compacted away.
@@ -84,22 +88,107 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Best-effort hosted-continuity store. Silent no-op unless a passport seed is
-/// readable **and** a hosted mirror is configured; never errors the hook.
+/// Send the PreCompact session snapshot to `save_session`, sealed (Finding 1).
 ///
-/// Order matters for the free path: the passport-seed check is a local file stat
-/// (no network), so free users with no seed skip before any extra MCP round-trip.
-fn store_encrypted_snapshot(session_id: &str, state: &Value) {
-    // Cheap local gate first: no passport seed ⇒ no key ⇒ nothing to encrypt/sync.
-    let Some(key) = snapshot_crypto::derive_snapshot_key() else {
-        return;
+/// The state is encrypted with the passport-derived key so the daemon's session
+/// store holds only ciphertext — even if `CRUX_MCP_URL` is a hosted daemon.
+/// When no passport seed is available (no key to encrypt with), plaintext is
+/// sent ONLY to a verified-loopback daemon; a non-loopback endpoint is skipped
+/// so plaintext never egresses. Best-effort — daemon-unreachable is non-fatal.
+fn save_session_sealed(session_key: &str, session_id: &str, state: &Value, counter: u64) {
+    // Finding 5 synergy + F3: ONE seed read drives both the bearer-reuse guard and
+    // the key derivation (no rotation-between-reads split). If the bearer reuses the
+    // seed, a key derived from it is server-known — encrypting is fake protection —
+    // so treat it as no-key (same as no seed) and the plaintext-to-loopback-only
+    // rule below applies (remote ⇒ skipped).
+    let derived = match snapshot_crypto::resolve_snapshot_key() {
+        snapshot_crypto::SeedResolution::Key(dk) => Some(dk),
+        snapshot_crypto::SeedResolution::BearerReusesSeed | snapshot_crypto::SeedResolution::NoSeed => None,
     };
-    // Then confirm a hosted mirror is configured. Without one the fact would
-    // never sync, and storing it would change the free/local behaviour.
-    if !hosted_sync_active() {
+    let state_field = match derived {
+        Some(dk) => match seal_state_value(&dk.key, &dk.scope, session_id, counter, state) {
+            Ok(enc) => json!({ "enc": enc }),
+            Err(err) => {
+                // Never fall back to plaintext egress on a seal failure.
+                eprintln!("crux-hook pre-compact: seal session state failed: {err}");
+                return;
+            }
+        },
+        None => {
+            if endpoint_is_loopback(&mcp_client::mcp_url()) {
+                // No key, but a loopback daemon is trusted: preserve the
+                // free/local crash-recovery snapshot (byte-for-byte as before).
+                state.clone()
+            } else {
+                eprintln!(
+                    "crux-hook pre-compact: no passport seed and non-loopback MCP endpoint — \
+                     skipping save_session to avoid plaintext egress"
+                );
+                return;
+            }
+        }
+    };
+    let args = json!({ "session_id": session_key, "state": state_field });
+    if let Err(err) = mcp_client::call_tool("save_session", &args) {
+        eprintln!("crux-hook pre-compact: save_session failed: {err}");
+    }
+}
+
+/// Seal `state` for `session_id` and return the opaque base64 fact value.
+fn seal_state_value(
+    key: &[u8; 32],
+    passport_scope: &str,
+    session_id: &str,
+    counter: u64,
+    state: &Value,
+) -> anyhow::Result<String> {
+    let plaintext = serde_json::to_vec(state)?;
+    snapshot_crypto::seal(key, passport_scope, session_id, counter, &plaintext)?.to_fact_value()
+}
+
+/// True only for a loopback MCP endpoint (`127.0.0.0/8`, `::1`, `localhost`).
+/// Strict loopback, NOT RFC1918: a LAN / tailnet / hosted address is a remote
+/// the plaintext session state must never reach. Hostnames other than
+/// `localhost` are refused (not resolved) — no DNS-rebind surface.
+fn endpoint_is_loopback(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = if let Some(after) = authority.strip_prefix('[') {
+        after.split(']').next().unwrap_or("")
+    } else {
+        authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+    };
+    host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Best-effort hosted-continuity store. Silent no-op unless hosted sync is
+/// explicitly enabled AND a passport seed is readable; never errors the hook.
+///
+/// Finding 6: the explicit default-OFF flag is checked FIRST, before any key
+/// derivation or network op — so the free/local path (flag unset) does zero
+/// extra work and stays byte-for-byte unchanged.
+fn store_encrypted_snapshot(session_id: &str, state: &Value, counter: u64) {
+    // Explicit opt-in gate first (no key derivation, no network probe when off).
+    if !snapshot_crypto::hosted_sync_enabled() {
         return;
     }
-    let args = match build_snapshot_fact_args(session_id, state, &key) {
+    // Finding 5 + F3: ONE seed read drives both the bearer-reuse guard and the key
+    // derivation. Bearer reuses the seed ⇒ refuse (the server would then hold the
+    // key material; generic config error, no values echoed). No passport seed ⇒ no
+    // key ⇒ nothing to encrypt/sync (silent skip, local file read only).
+    let dk = match snapshot_crypto::resolve_snapshot_key() {
+        snapshot_crypto::SeedResolution::Key(dk) => dk,
+        snapshot_crypto::SeedResolution::BearerReusesSeed => {
+            eprintln!(
+                "crux-hook pre-compact: refusing hosted snapshot sync — CRUX_AGENT_TOKEN reuses the \
+                 passport seed (config error); the server must never receive the key material"
+            );
+            return;
+        }
+        snapshot_crypto::SeedResolution::NoSeed => return,
+    };
+    let args = match build_snapshot_fact_args(session_id, state, &dk, counter) {
         Ok(args) => args,
         Err(err) => {
             eprintln!("crux-hook pre-compact: seal snapshot failed: {err}");
@@ -115,49 +204,24 @@ fn store_encrypted_snapshot(session_id: &str, state: &Value) {
 ///
 /// The returned payload carries ONLY the sealed envelope in `value`; no snapshot
 /// plaintext appears in the entity, key, value, or metadata — asserted by
-/// `snapshot_fact_args_carry_ciphertext_only`.
-fn build_snapshot_fact_args(session_id: &str, state: &Value, key: &[u8; 32]) -> anyhow::Result<Value> {
+/// `snapshot_fact_args_carry_ciphertext_only`. The envelope binds the passport
+/// scope, session id, and counter into its AAD (v3); the fact is stored under
+/// `key = session_id` so the daemon upserts one row per session (bounded growth)
+/// and the reader's same-session path can find it directly.
+fn build_snapshot_fact_args(
+    session_id: &str,
+    state: &Value,
+    dk: &snapshot_crypto::DerivedSnapshotKey,
+    counter: u64,
+) -> anyhow::Result<Value> {
     let plaintext = serde_json::to_vec(state)?;
-    let envelope = snapshot_crypto::seal(key, &plaintext)?;
+    let envelope = snapshot_crypto::seal(&dk.key, &dk.scope, session_id, counter, &plaintext)?;
     Ok(json!({
         "entity": SNAPSHOT_ENTITY,
         "key": session_id,
         "value": envelope.to_fact_value()?,
         "private": false,
     }))
-}
-
-/// Whether a hosted mirror is configured, so the encrypted snapshot fact will
-/// actually sync. `CRUX_COMPACTION_SYNC=1|on` forces on (opt-in / tests);
-/// `0|off` forces off; otherwise the daemon's `sync_status` decides
-/// (`configured`, or a non-`local_only` mode). Daemon-unreachable ⇒ not hosted.
-fn hosted_sync_active() -> bool {
-    match std::env::var("CRUX_COMPACTION_SYNC").as_deref() {
-        Ok("1" | "on") => return true,
-        Ok("0" | "off") => return false,
-        _ => {}
-    }
-    match mcp_client::call_tool("sync_status", json!({})) {
-        Ok(result) => sync_status_is_hosted(&result),
-        Err(_) => false,
-    }
-}
-
-/// Parse a `sync_status` MCP result: hosted = a remote mirror is `configured`
-/// (or the sync mode is anything other than `local_only`). Tolerates both the
-/// raw object and the MCP `{content:[{text}]}` wrapper.
-fn sync_status_is_hosted(result: &Value) -> bool {
-    let obj = result
-        .get("content")
-        .and_then(Value::as_array)
-        .and_then(|items| items.iter().find_map(|item| item.get("text").and_then(Value::as_str)))
-        .and_then(|text| serde_json::from_str::<Value>(text).ok());
-    let obj = obj.as_ref().unwrap_or(result);
-    obj.get("configured").and_then(Value::as_bool).unwrap_or(false)
-        || obj
-            .get("mode")
-            .and_then(Value::as_str)
-            .is_some_and(|mode| mode != "local_only")
 }
 
 /// Best-effort anchors for mid-ExecPlan crash recovery: HEAD commit, active
@@ -282,9 +346,16 @@ mod tests {
 
     // ---- M2: encrypted snapshot fact (ExecPlan hosted-compaction-sync-...) ----
 
+    fn test_dk(key: [u8; 32], scope: &str) -> snapshot_crypto::DerivedSnapshotKey {
+        snapshot_crypto::DerivedSnapshotKey {
+            scope: scope.to_string(),
+            key: zeroize::Zeroizing::new(key),
+        }
+    }
+
     #[test]
     fn snapshot_fact_args_carry_ciphertext_only() {
-        let key = [3u8; 32];
+        let dk = test_dk([3u8; 32], "passport-fpr-test");
         let state = json!({
             "hook_event": "PreCompact",
             "cwd": "/home/user/SECRET_MARKER_PROJECT",
@@ -296,7 +367,7 @@ mod tests {
             }
         });
 
-        let args = build_snapshot_fact_args("sess-abc-123", &state, &key).unwrap();
+        let args = build_snapshot_fact_args("sess-abc-123", &state, &dk, 42).unwrap();
 
         // Routing fields are the non-sensitive ones the spec allows in clear.
         assert_eq!(args["entity"], SNAPSHOT_ENTITY);
@@ -314,9 +385,13 @@ mod tests {
         let value = args["value"].as_str().unwrap();
         assert!(!value.contains('{'), "value should be opaque base64, not readable JSON");
 
-        // And with the key it decrypts back to exactly the original state.
+        // And with the key it decrypts back to exactly the original state; the
+        // envelope carries the bound scope/session/counter.
         let envelope = snapshot_crypto::Envelope::from_fact_value(value).unwrap();
-        let recovered = snapshot_crypto::open(&key, &envelope).unwrap();
+        assert_eq!(envelope.passport_scope, "passport-fpr-test");
+        assert_eq!(envelope.session_id, "sess-abc-123");
+        assert_eq!(envelope.counter, 42);
+        let recovered = snapshot_crypto::open(&dk.key, &envelope).unwrap();
         let recovered_state: Value = serde_json::from_slice(&recovered).unwrap();
         assert_eq!(recovered_state, state);
     }
@@ -327,7 +402,7 @@ mod tests {
     /// (base64, not readable JSON) — then confirm it still decrypts back.
     #[test]
     fn m4_mirror_payload_is_ciphertext_only() {
-        let key = [77u8; 32];
+        let dk = test_dk([77u8; 32], "passport-fpr-m4");
         let secrets = [
             "AKIA_FAKE_SECRET_ACCESS_KEY",
             "/home/alice/private-repo/billing.ts",
@@ -343,7 +418,7 @@ mod tests {
             "recovery": { "branch": secrets[3], "last_commit_sha": secrets[4] },
         });
 
-        let args = build_snapshot_fact_args("session-xyz", &state, &key).unwrap();
+        let args = build_snapshot_fact_args("session-xyz", &state, &dk, 7).unwrap();
         // The whole serialized args object is what the mirror could read. The
         // only field carrying snapshot content is `value`; assert no secret (or
         // any 8+ char alphanumeric run of one) survives anywhere in the payload.
@@ -367,39 +442,8 @@ mod tests {
         );
         // Round-trip proves it is genuine ciphertext of the exact state, not a redaction.
         let env = snapshot_crypto::Envelope::from_fact_value(value).unwrap();
-        let recovered: Value = serde_json::from_slice(&snapshot_crypto::open(&key, &env).unwrap()).unwrap();
+        let recovered: Value = serde_json::from_slice(&snapshot_crypto::open(&dk.key, &env).unwrap()).unwrap();
         assert_eq!(recovered, state);
-    }
-
-    #[test]
-    fn hosted_sync_active_respects_env_override() {
-        let _env = crate::test_support::env_guard();
-        let prev = std::env::var("CRUX_COMPACTION_SYNC").ok();
-        std::env::set_var("CRUX_COMPACTION_SYNC", "1");
-        assert!(hosted_sync_active(), "explicit on must be honoured without a daemon");
-        std::env::set_var("CRUX_COMPACTION_SYNC", "off");
-        assert!(!hosted_sync_active(), "explicit off must skip");
-        match prev {
-            Some(v) => std::env::set_var("CRUX_COMPACTION_SYNC", v),
-            None => std::env::remove_var("CRUX_COMPACTION_SYNC"),
-        }
-    }
-
-    #[test]
-    fn sync_status_hosted_detection() {
-        // local_only, not configured ⇒ free path (no hosted store).
-        let local = json!({"content": [{"text": "{\"mode\":\"local_only\",\"configured\":false}"}]});
-        assert!(!sync_status_is_hosted(&local));
-        // configured mirror ⇒ hosted.
-        let hosted = json!({"content": [{"text": "{\"mode\":\"cloud_mirror\",\"configured\":true}"}]});
-        assert!(sync_status_is_hosted(&hosted));
-        // raw object (no MCP wrapper) also parsed.
-        assert!(sync_status_is_hosted(
-            &json!({"mode": "background_sync", "configured": true})
-        ));
-        assert!(!sync_status_is_hosted(
-            &json!({"mode": "local_only", "configured": false})
-        ));
     }
 
     #[test]
@@ -416,7 +460,7 @@ mod tests {
         std::env::remove_var("CORECRUXD_DATA_DIR");
         std::env::remove_var("CORECRUXD_PASSPORT_KEY_PATH");
 
-        store_encrypted_snapshot("sess", &json!({"cwd": "/x"}));
+        store_encrypted_snapshot("sess", &json!({"cwd": "/x"}), 1);
 
         for (k, v) in [
             ("CRUX_COMPACTION_SYNC", prev_sync),
@@ -429,6 +473,48 @@ mod tests {
                 None => std::env::remove_var(k),
             }
         }
+    }
+
+    #[test]
+    fn endpoint_is_loopback_is_strict() {
+        // Loopback endpoints may receive plaintext state (no key case).
+        assert!(endpoint_is_loopback("http://127.0.0.1:14801/mcp"));
+        assert!(endpoint_is_loopback("http://localhost:14801/mcp"));
+        assert!(endpoint_is_loopback("http://[::1]:14801/mcp"));
+        assert!(endpoint_is_loopback("http://127.5.4.3/mcp"));
+        // Remotes — CGNAT tailnet, RFC1918 LAN, and public — are NOT loopback.
+        assert!(!endpoint_is_loopback("http://100.70.12.73:14801/mcp"));
+        assert!(!endpoint_is_loopback("http://10.0.0.5:14801/mcp"));
+        assert!(!endpoint_is_loopback("http://192.168.1.9/mcp"));
+        assert!(!endpoint_is_loopback("http://evil.example.com/mcp"));
+        assert!(!endpoint_is_loopback("http://user@127.0.0.1@evil.com/mcp"));
+        // Finding-1 re-verification: spoof shapes must ALL fail closed (treated as
+        // remote ⇒ plaintext skipped). We never resolve DNS and never accept a
+        // non-`::1` IPv6 or a non-literal loopback encoding.
+        assert!(
+            !endpoint_is_loopback("http://[::ffff:127.0.0.1]:14801/mcp"),
+            "IPv4-mapped IPv6 is not ::1 — fail closed"
+        );
+        assert!(
+            !endpoint_is_loopback("http://localhost./mcp"),
+            "trailing-dot host is not resolved"
+        );
+        assert!(
+            !endpoint_is_loopback("http://myhost.local/mcp"),
+            "a hostname is never resolved to loopback (no DNS-rebind surface)"
+        );
+        assert!(
+            !endpoint_is_loopback("http://2130706433/mcp"),
+            "decimal IP form is not parsed as loopback"
+        );
+        assert!(
+            !endpoint_is_loopback("http://127.1/mcp"),
+            "shorthand IP is not parsed as loopback"
+        );
+        // Case-insensitive `localhost`, and userinfo whose real HOST is loopback,
+        // ARE loopback (the actual connection target is 127.0.0.1 / localhost).
+        assert!(endpoint_is_loopback("http://LOCALHOST:8080/mcp"));
+        assert!(endpoint_is_loopback("http://evil.com@127.0.0.1/mcp"));
     }
 
     #[test]

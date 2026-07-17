@@ -77,24 +77,34 @@ Add to `.claude/settings.local.json`:
 | `CRUX_HOOK_CONTEXT_MONITOR` | (unset) | Set to `off` to disable PostToolUse warnings. |
 | `CRUX_HOOK_PRE_COMPACT` | (unset) | Set to `off` to disable PreCompact snapshots. |
 | `CRUX_HOOK_SESSION_START` | (unset) | Set to `off` to disable SessionStart bootstrap. |
-| `CRUX_COMPACTION_SYNC` | (unset) | Hosted snapshot sync: `1`/`on` forces it on, `0`/`off` forces off. Unset ⇒ auto (the daemon's `sync_status.configured` decides). |
+| `CRUX_COMPACTION_SYNC` | (unset) | Hosted encrypted snapshot sync — **explicit default-OFF opt-in**: `1`/`on` enable; `0`/`off`/unset are all off. Checked before any key derivation or network op (no `sync_status` auto-enable). |
 | `CRUX_PASSPORT_KEY_PATH` | (unset) | Explicit path to the passport seed used to derive the snapshot key. Falls back to `CORECRUXD_PASSPORT_KEY_PATH`, then `CORECRUXD_DATA_DIR/passport.key`. Read-only; never created by the hook. |
 
 ## Hosted encrypted snapshot sync (Pro)
 
-Free tier keeps its local baseline unchanged: `pre-compact` writes
-`save_session` to the local daemon and the [free shell preset](../../integrations/claude-code/compaction-survival/)
+Free tier keeps its local baseline: `pre-compact` writes `save_session` to the
+local daemon and the [free shell preset](../../integrations/claude-code/compaction-survival/)
 writes `~/.claude/compaction-snapshots/<session_id>.md`. Nothing leaves the
-machine.
+machine. **The `save_session` state is itself sealed** whenever a passport seed
+is available, so even the session store holds only ciphertext regardless of the
+endpoint; with no seed to encrypt with, plaintext `save_session` is sent **only
+to a verified-loopback daemon** and skipped for any remote endpoint.
 
-On a **Pro / hosted** node (a remote mirror is configured — `sync_status`
-reports `configured: true`) the same `pre-compact` hook *additionally* stores
-the snapshot as a **client-side-encrypted, non-private `session_snapshot`
-fact**. Because `facts` is a synced collection and the fact is non-private, it
-rides the existing per-tenant mirror to the user's other devices — and because
-the value is ciphertext, that is safe. On the other device, a `compact`/`resume`
-`session-start` boot pulls the newest `session_snapshot`, decrypts it locally,
-and re-injects the working state as `additionalContext`.
+When hosted sync is **explicitly enabled** (`CRUX_COMPACTION_SYNC=1|on`; the Pro
+mirror is the product-posture gate on the daemon side) the same `pre-compact`
+hook *additionally* stores the snapshot as a **client-side-encrypted,
+non-private `session_snapshot` fact**. Because `facts` is a synced collection
+and the fact is non-private, it rides the existing per-tenant mirror to the
+user's other devices — and because the value is ciphertext, that is safe. On the
+other device, a `compact`/`resume` `session-start` boot decrypts the snapshot
+locally and re-injects the working state as `additionalContext`. Restore supports
+**both** cross-device flows:
+
+- **Same-session resume** — device B ran `claude --resume <same id>`: the snapshot
+  bound to that session id opens and restores directly.
+- **Fresh-session pickup** — device B starts a *new* session: it restores this
+  passport's **newest** snapshot (highest counter) that authenticates and is
+  strictly newer than a locally-persisted high-water mark.
 
 ### "Unreadable to us" guarantee
 
@@ -109,9 +119,41 @@ value, not the key name, not any metadata. The scheme:
   authenticates with a *separate* bearer token (`CRUX_AGENT_TOKEN`) and never
   receives the seed, so it cannot derive the key. The derived key is computed on
   demand, never persisted or logged.
-- **Envelope:** versioned `{v, alg, nonce, ct}`, base64-wrapped into the fact
-  value. Unknown `v`/`alg` are rejected, so the scheme can evolve without
-  breaking stored blobs.
+- **Envelope:** versioned `{v, alg, passport_scope, session_id, counter, nonce,
+  ct}` (currently **v3**), base64-wrapped into the fact value. Unknown `v`/`alg`
+  are rejected, so the scheme can evolve without breaking stored blobs.
+  `passport_scope`/`session_id`/`counter` are metadata (not secrets) carried in
+  the clear so the reader can select candidates and reconstruct the AAD.
+- **AAD binding (v3):** each seal binds canonical additional-authenticated-data
+  `{v, alg, entity, passport_scope, session_id, counter}` (fixed field order,
+  byte-identical reconstruction on `open` or auth fails). Tampering with any of
+  those fields — including bumping the counter to defeat the rollback check, or
+  relabelling the scope/session to slip past the reader's filters — fails
+  authentication. `passport_scope` is the passport public-key fingerprint (1:1
+  with the seed), which the reader computes locally to bind and to select "this
+  passport's" snapshots.
+- **Rollback / replay defence:** each snapshot carries a per-passport
+  monotonic-ish `counter` (a wall-clock nanosecond timestamp — see below), and the
+  reader persists the highest **accepted** counter as a durable per-passport
+  **high-water mark** (next to `passport.key`, not `TMPDIR`). Fresh-session pickup
+  accepts only a snapshot whose counter is strictly greater than the mark, so an
+  attacker who re-serves an old ciphertext (which they cannot re-sign or
+  re-counter) is rejected. Same-session resume is exempt from the high-water gate
+  (trusted by exact session match + auth) so a legitimate re-resume is never
+  self-blocked. A missing mark is first-run (restore allowed); a corrupt mark
+  fails toward *no restore* for that boot and self-heals.
+- **No key handoff:** if `CRUX_AGENT_TOKEN` is set to the passport seed itself
+  (any hex/base64 form), hosted sync is refused — the server must never receive
+  the material the key is derived from.
+
+> **Counter source + multi-writer.** The counter is a wall-clock nanosecond
+> timestamp — the simplest correct monotonic-ish source, needing no persisted
+> write-side state, and ordering snapshots by real write time (exactly the notion
+> of "latest" restore wants). If two devices ever collide on a counter, restore
+> breaks the tie deterministically by `session_id`. Residual (documented
+> follow-up, not a threat-model hole — the AAD binding means a counter still
+> can't be forged): a backward wall-clock step or cross-device clock skew could
+> misorder snapshots; a hard per-device logical counter is the upgrade path.
 
 ### Same-passport prerequisite
 

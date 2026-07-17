@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use blake3::Hasher;
 use ed25519_dalek::{Signer as DalekSigner, SigningKey};
 use rand::Rng;
+use zeroize::Zeroizing;
 
 use crate::error::SessionError;
 use crate::plan::{Passport, HASH_LEN, SIGNATURE_LEN};
@@ -132,6 +133,23 @@ impl LocalPassportKey {
         Self::from_seed(read_or_init_passport_seed(path)?)
     }
 
+    /// Load the local Passport signing key from an **existing** file, WITHOUT
+    /// ever initialising a new seed. One direct read: a missing (or unreadable)
+    /// file returns an error, unlike [`Self::from_path`], which mints a fresh
+    /// random seed on `NotFound`.
+    ///
+    /// Use this on read-only client paths (e.g. the compaction hook's snapshot
+    /// key) where a `is_file()` pre-check followed by `from_path` is a TOCTOU:
+    /// if the file vanishes in the gap, `from_path` would mint a *different* seed,
+    /// silently breaking cross-device decrypt and handing back a key nobody else
+    /// shares (crypto-review Finding 4).
+    pub fn from_existing_path(path: &Path) -> Result<Self, SessionError> {
+        let content = Zeroizing::new(
+            fs::read_to_string(path).map_err(|e| SessionError::Encode(format!("read passport key: {e}")))?,
+        );
+        Self::from_seed(parse_passport_seed(path, &content)?)
+    }
+
     pub fn from_seed(seed: [u8; 32]) -> Result<Self, SessionError> {
         let signing_key = SigningKey::from_bytes(&seed);
         let verifying_key = signing_key.verifying_key();
@@ -166,14 +184,17 @@ impl LocalPassportKey {
     /// `LocalPassportKey` instance — callers receive a domain-specific output
     /// they can use as a symmetric key.
     pub fn derive_subkey(&self, context: &str) -> [u8; 32] {
-        let seed = self.signing_key.to_bytes();
-        blake3::derive_key(context, &seed)
+        // `as_bytes()` borrows the seed in place; `to_bytes()` would copy it onto
+        // the stack, leaving an un-zeroized clone behind (crypto-review Finding 3).
+        // Output is identical either way — same bytes into the same BLAKE3 KDF.
+        blake3::derive_key(context, self.signing_key.as_bytes())
     }
 }
 
 fn read_or_init_passport_seed(path: &Path) -> Result<[u8; 32], SessionError> {
     match fs::read_to_string(path) {
-        Ok(content) => parse_passport_seed(path, &content),
+        // Wrap the hex seed string so it is wiped from memory on drop (Finding 3).
+        Ok(content) => parse_passport_seed(path, &Zeroizing::new(content)),
         Err(e) if e.kind() == ErrorKind::NotFound => write_new_passport_seed(path),
         Err(e) => Err(SessionError::Encode(format!("read passport key: {e}"))),
     }
@@ -187,7 +208,10 @@ fn parse_passport_seed(path: &Path, content: &str) -> Result<[u8; 32], SessionEr
             path.display()
         )));
     }
-    let decoded = hex::decode(trimmed)?;
+    // The decoded seed bytes are the raw private key material — zeroize on drop
+    // so only the returned `[u8; 32]` (which flows into the zeroizing SigningKey)
+    // survives (crypto-review Finding 3).
+    let decoded = Zeroizing::new(hex::decode(trimmed)?);
     if decoded.len() != 32 {
         return Err(SessionError::ByteArrayLength {
             field: "passport.key",
@@ -218,7 +242,8 @@ fn write_new_passport_seed(path: &Path) -> Result<[u8; 32], SessionError> {
 
     match options.open(path) {
         Ok(mut file) => {
-            let mut content = hex::encode(seed);
+            // The hex encoding of the seed is sensitive — wipe it on drop (Finding 3).
+            let mut content = Zeroizing::new(hex::encode(seed));
             content.push('\n');
             file.write_all(content.as_bytes())
                 .map_err(|e| SessionError::Encode(format!("write passport key: {e}")))?;
@@ -232,7 +257,7 @@ fn write_new_passport_seed(path: &Path) -> Result<[u8; 32], SessionError> {
             for _ in 0..50 {
                 match fs::read_to_string(path) {
                     Ok(content) if !content.trim().is_empty() => {
-                        return parse_passport_seed(path, &content);
+                        return parse_passport_seed(path, &Zeroizing::new(content));
                     }
                     Ok(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
                     Err(e) if e.kind() == ErrorKind::NotFound => {
@@ -376,6 +401,52 @@ mod tests {
         assert!(key_path.exists());
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn derive_subkey_matches_blake3_over_seed_and_is_domain_separated() {
+        // Guards the as_bytes() change (Finding 3): derive_subkey must stay
+        // byte-identical to blake3::derive_key(context, seed) — the exact value
+        // existing callers (e.g. the corecruxd integration-token key) depend on.
+        let seed = [7_u8; 32];
+        let key = LocalPassportKey::from_seed(seed).unwrap();
+        let expected = blake3::derive_key("integration-token-encryption-v1", &seed);
+        assert_eq!(key.derive_subkey("integration-token-encryption-v1"), expected);
+        // Determinism across instances + domain separation across labels.
+        let key2 = LocalPassportKey::from_seed(seed).unwrap();
+        assert_eq!(key.derive_subkey("ctx-a"), key2.derive_subkey("ctx-a"));
+        assert_ne!(key.derive_subkey("ctx-a"), key.derive_subkey("ctx-b"));
+    }
+
+    #[test]
+    fn from_existing_path_does_not_mint_on_missing_file() {
+        // Finding 4: a missing file must error WITHOUT creating a seed (no TOCTOU
+        // mint of a fresh, non-matching key).
+        let tmp = std::env::temp_dir().join(format!("crux-session-fe-{}", rand::random::<u64>()));
+        let key_path = tmp.join("passport.key");
+        assert!(LocalPassportKey::from_existing_path(&key_path).is_err());
+        assert!(!key_path.exists(), "from_existing_path must not create a seed file");
+
+        // Once a seed exists (via the minting loader), from_existing_path loads it
+        // and matches — same identity, no re-mint.
+        let minted = LocalPassportKey::from_path(&key_path).unwrap();
+        let loaded = LocalPassportKey::from_existing_path(&key_path).unwrap();
+        assert_eq!(minted.public_key_hex(), loaded.public_key_hex());
+        assert_eq!(minted.passport_fpr(), loaded.passport_fpr());
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// F4 (hosted-compaction-sync-encrypted review): the 32-byte passport seed
+    /// must be wiped when the key drops. `ed25519_dalek::SigningKey` implements
+    /// `ZeroizeOnDrop` — and its `Drop` zeroizes `secret_key` (the seed) — ONLY
+    /// under the crate's `zeroize` feature. This compile-time bound fails to build
+    /// if that feature is ever disabled (e.g. a stray `default-features = false`),
+    /// which would silently leave the seed un-zeroized on drop.
+    #[test]
+    fn signing_key_zeroizes_seed_on_drop() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<SigningKey>();
     }
 
     #[test]
