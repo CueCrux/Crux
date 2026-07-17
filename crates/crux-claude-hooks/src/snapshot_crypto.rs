@@ -315,55 +315,71 @@ pub fn passport_key_path_from_env() -> Option<PathBuf> {
     None
 }
 
-/// True when `CRUX_AGENT_TOKEN` (the server-visible bearer credential) equals
-/// the passport seed in any canonical representation — lowercase/uppercase hex,
-/// the raw decoded 32 seed bytes, or STANDARD / STANDARD_NO_PAD / URL_SAFE /
-/// URL_SAFE_NO_PAD base64 of those bytes (Finding 5 / F3 review fix).
-///
-/// Reusing the seed as the bearer would hand the server the exact material the
-/// snapshot key is derived from, voiding "unreadable to us". Callers refuse to
-/// enable hosted sync when this returns true. Neither value is logged; both are
-/// held in [`Zeroizing`] while compared, and every comparison fails closed.
-#[must_use]
-pub fn bearer_reuses_passport_seed() -> bool {
+/// Read + parse the passport seed at `path` into the raw 32 seed bytes, wiped on
+/// drop. ONE read; `None` on any error (missing / unreadable / non-hex / wrong
+/// length) so callers silently skip the hosted path. Shared by the bearer-reuse
+/// guard and key derivation so both operate on the SAME in-memory seed — a key
+/// rotation between two separate reads can no longer split them (F3).
+fn read_seed_bytes(path: &Path) -> Option<Zeroizing<[u8; 32]>> {
+    let raw = Zeroizing::new(std::fs::read_to_string(path).ok()?);
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let decoded = Zeroizing::new(hex::decode(trimmed).ok()?);
+    if decoded.len() != 32 {
+        return None;
+    }
+    let mut seed = Zeroizing::new([0u8; 32]);
+    seed.copy_from_slice(&decoded);
+    Some(seed)
+}
+
+/// True when `CRUX_AGENT_TOKEN` equals `seed` in any canonical representation:
+/// lower/upper-case hex, the raw 32 bytes, or STANDARD / STANDARD_NO_PAD /
+/// URL_SAFE / URL_SAFE_NO_PAD base64 of them (Finding 5 / F3). Takes the
+/// already-loaded seed bytes so the caller reads the key file exactly once.
+/// Neither value is logged; the token is held in [`Zeroizing`] while compared and
+/// every comparison fails closed.
+fn bearer_reuses_seed_bytes(seed: &[u8; 32]) -> bool {
+    use base64::engine::general_purpose as gp;
     let Some(token) = std::env::var("CRUX_AGENT_TOKEN").ok().filter(|s| !s.is_empty()) else {
         return false;
     };
     let token = Zeroizing::new(token);
+    let token_trimmed = token.trim();
+    // Hex form: the file is lowercase, but a reused token might be uppercased.
+    let seed_hex = Zeroizing::new(hex::encode(seed));
+    if token_trimmed.eq_ignore_ascii_case(seed_hex.as_str()) {
+        return true;
+    }
+    // The raw seed bytes themselves, plus padded/unpadded standard and URL-safe
+    // base64. A reuse slipped in under any alphabet still hands the server the seed.
+    if token_trimmed.as_bytes() == seed.as_slice() {
+        return true;
+    }
+    let engines = [gp::STANDARD, gp::STANDARD_NO_PAD, gp::URL_SAFE, gp::URL_SAFE_NO_PAD];
+    engines
+        .iter()
+        .any(|e| token_trimmed == Zeroizing::new(e.encode(seed.as_slice())).as_str())
+}
+
+/// True when `CRUX_AGENT_TOKEN` (the server-visible bearer credential) equals the
+/// passport seed in any canonical representation (Finding 5 / F3 review fix).
+///
+/// Reusing the seed as the bearer would hand the server the exact material the
+/// snapshot key is derived from, voiding "unreadable to us". Standalone guard kept
+/// for callers/tests that only need the verdict; the hot paths use
+/// [`resolve_snapshot_key`], which reads the seed ONCE for guard + derive (F3).
+#[must_use]
+pub fn bearer_reuses_passport_seed() -> bool {
     let Some(path) = passport_key_path_from_env() else {
         return false;
     };
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return false;
-    };
-    let raw = Zeroizing::new(raw);
-    let seed_hex = raw.trim();
-    if seed_hex.is_empty() {
-        return false;
+    match read_seed_bytes(&path) {
+        Some(seed) => bearer_reuses_seed_bytes(&seed),
+        None => false,
     }
-    let token_trimmed = token.trim();
-    // Hex form: the file is lowercase, but a reused token might be uppercased.
-    if token_trimmed.eq_ignore_ascii_case(seed_hex) {
-        return true;
-    }
-    // Every canonical encoding of the decoded 32 seed bytes: the raw bytes
-    // themselves, plus padded/unpadded standard and URL-safe base64. A reuse
-    // slipped in under any alphabet still hands the server the seed material.
-    if let Ok(bytes) = hex::decode(seed_hex) {
-        use base64::engine::general_purpose as gp;
-        let bytes = Zeroizing::new(bytes);
-        if token_trimmed.as_bytes() == bytes.as_slice() {
-            return true;
-        }
-        let engines = [gp::STANDARD, gp::STANDARD_NO_PAD, gp::URL_SAFE, gp::URL_SAFE_NO_PAD];
-        if engines
-            .iter()
-            .any(|e| token_trimmed == Zeroizing::new(e.encode(bytes.as_slice())).as_str())
-        {
-            return true;
-        }
-    }
-    false
 }
 
 /// A derived snapshot content key plus the passport scope it belongs to.
@@ -399,6 +415,52 @@ pub fn derive_snapshot_key() -> Option<DerivedSnapshotKey> {
     let path = passport_key_path_from_env()?;
     let passport = crux_session::LocalPassportKey::from_existing_path(&path).ok()?;
     Some(DerivedSnapshotKey {
+        scope: passport.passport_fpr().to_string(),
+        key: Zeroizing::new(passport.derive_subkey(SNAPSHOT_KEY_CONTEXT)),
+    })
+}
+
+/// Outcome of a SINGLE passport-seed read for the snapshot paths: no usable seed,
+/// a bearer that reuses the seed (server-known key — refuse), or a derived key.
+///
+/// Reading once and returning this closes the F3 window where the bearer-reuse
+/// guard and key derivation each read the file: a key rotation landing between the
+/// two reads could otherwise make the guard check seed A while encryption used
+/// seed B.
+pub enum SeedResolution {
+    /// No passport seed available (no path, or a missing/unreadable/malformed file).
+    NoSeed,
+    /// `CRUX_AGENT_TOKEN` reuses the passport seed — the server would hold the key
+    /// material, voiding "unreadable to us". Callers must refuse hosted sync.
+    BearerReusesSeed,
+    /// A usable derived key (the bearer does NOT reuse the seed).
+    Key(DerivedSnapshotKey),
+}
+
+/// Read the passport seed ONCE, then — from that single in-memory seed — run the
+/// bearer-reuse guard AND derive the snapshot content key (F3). Every hot path
+/// should call this instead of pairing [`bearer_reuses_passport_seed`] with
+/// [`derive_snapshot_key`] (two reads, splittable by a mid-op key rotation).
+///
+/// Order is deliberate: guard BEFORE derive, so a seed-reusing bearer returns
+/// [`SeedResolution::BearerReusesSeed`] and no key is handed back. Any read/parse
+/// failure is [`SeedResolution::NoSeed`] (silent skip); no seed material is logged.
+#[must_use]
+pub fn resolve_snapshot_key() -> SeedResolution {
+    let Some(path) = passport_key_path_from_env() else {
+        return SeedResolution::NoSeed;
+    };
+    let Some(seed) = read_seed_bytes(&path) else {
+        return SeedResolution::NoSeed;
+    };
+    // Guard and derive both use THIS seed — one read, no rotation split (F3).
+    if bearer_reuses_seed_bytes(&seed) {
+        return SeedResolution::BearerReusesSeed;
+    }
+    let Ok(passport) = crux_session::LocalPassportKey::from_seed(*seed) else {
+        return SeedResolution::NoSeed;
+    };
+    SeedResolution::Key(DerivedSnapshotKey {
         scope: passport.passport_fpr().to_string(),
         key: Zeroizing::new(passport.derive_subkey(SNAPSHOT_KEY_CONTEXT)),
     })
@@ -451,7 +513,9 @@ struct HighWaterFile {
 /// `TMPDIR`, which resets on reboot and would re-open the rollback window).
 /// `None` when no passport-key path is configured (then there is no seed either,
 /// so restore has already skipped). Scope is sanitised for use as a filename.
-fn high_water_path(scope: &str) -> Option<PathBuf> {
+/// `pub(crate)` so cross-module tests can address the sibling `.lock` file to
+/// simulate a held lock (fail-closed advance test).
+pub(crate) fn high_water_path(scope: &str) -> Option<PathBuf> {
     let dir = passport_key_path_from_env()?.parent()?.to_path_buf();
     let safe: String = scope
         .chars()
@@ -480,45 +544,63 @@ pub fn load_high_water(scope: &str) -> HighWater {
     }
 }
 
-/// Persist `counter` as the high-water mark for `scope` iff it strictly advances
-/// the mark (monotonic; never lowers it). Best-effort: any failure is logged and
-/// ignored — it degrades rollback strictness for one boot but never crashes the
-/// hook.
+/// Persist `counter` as the high-water mark for `scope`, atomically and race-free,
+/// and report whether the mark is **durably ≥ `counter`** on return.
 ///
-/// Anti-rollback correctness (F1 review fix):
-/// - **Atomic:** writes via a same-directory temp file + `rename`, so an
-///   interrupted or racing write never leaves a partial (⇒ `Corrupt`) file.
-/// - **Never regress a `Corrupt` mark:** a `Corrupt` prior state is *unknown but
-///   possibly higher*, so this refuses to write rather than reset it downward and
-///   re-open the replay window. (The old "treat `Corrupt` as 0 / self-heal"
-///   behaviour was the rollback bug.)
-/// - **Race-safe:** the load→max→write is serialised by an advisory exclusive
-///   lock on a sibling `.lock` file, so two concurrent advances cannot lose the
-///   larger update. Lock errors fail open (log-free, proceed best-effort).
-pub fn advance_high_water(scope: &str, counter: u64) {
+/// Returns `true` iff, while holding the exclusive lock, EITHER this call wrote
+/// `counter` (temp-file write + `rename` + parent-dir fsync all succeeded) OR the
+/// mark was already ≥ `counter` (a concurrent advance beat us to it). Either way
+/// the durable mark is ≥ `counter`, so a rollback-gated caller can safely accept
+/// the snapshot at `counter` — it cannot replay next boot.
+///
+/// Returns `false` — FAIL CLOSED, having written nothing — when:
+/// - no high-water path is configured;
+/// - the exclusive lock cannot be acquired (another advance holds it). We must
+///   NOT write unlocked: an unlocked read-modify-write reintroduces the
+///   lost-update race the lock exists to prevent. Failing closed makes the caller
+///   skip the (rollback-gated) restore this boot instead;
+/// - the prior state is `Corrupt` (unknown-but-possibly-higher; never regress it);
+/// - the temp-file write / `rename` / fsync fails.
+///
+/// The fail-closed contract is load-bearing for replay defence: a `false` return
+/// is the signal the fresh-session restore uses to NOT inject a snapshot whose
+/// acceptance was not durably recorded (else it replays next boot). Same-session
+/// resume is not rollback-gated, so it advances best-effort and ignores the bool.
+#[must_use]
+pub fn advance_high_water(scope: &str, counter: u64) -> bool {
     let Some(path) = high_water_path(scope) else {
-        return;
+        return false;
     };
-    // Serialise concurrent advances; held until `_lock` drops at end of scope.
-    // Fail open (None) — never crash the hook over a lock error.
-    let _lock = lock_high_water(&path);
-    let next = match load_high_water(scope) {
-        HighWater::Mark(n) if counter > n => counter,
-        HighWater::FirstRun => counter,
-        // Mark(_) not strictly greater ⇒ nothing to do; Corrupt ⇒ refuse to
-        // regress an unknown-but-possibly-higher mark (fail closed, no reset).
-        HighWater::Mark(_) | HighWater::Corrupt => return,
+    // FAIL CLOSED: the lock serialises load→max→write. If we cannot take it we
+    // must not write (an unlocked write loses the larger update) and must report
+    // failure so a rollback-gated caller skips restore this boot.
+    let Some(_lock) = lock_high_water(&path) else {
+        return false;
     };
-    if let Err(err) = write_high_water_atomic(&path, next) {
-        eprintln!("crux-hook: persist snapshot high-water failed (rollback strictness degraded this boot): {err}");
+    match load_high_water(scope) {
+        // Already durable at ≥ counter (e.g. a concurrent advance committed first).
+        HighWater::Mark(n) if n >= counter => true,
+        // Strictly advances (Mark(n) with n < counter) or first mark: write it,
+        // report success only once it is durably on disk.
+        HighWater::Mark(_) | HighWater::FirstRun => match write_high_water_atomic(&path, counter) {
+            Ok(()) => true,
+            Err(err) => {
+                eprintln!("crux-hook: persist snapshot high-water failed (fail closed — mark not advanced): {err}");
+                false
+            }
+        },
+        // Unknown but possibly higher ⇒ never regress; fail closed.
+        HighWater::Corrupt => false,
     }
 }
 
-/// Best-effort advisory exclusive lock guarding a high-water file's load→max→
-/// write. Locks a sibling `.lock` file (a stable inode — the high-water file
-/// itself is replaced by `rename`, so locking it directly would be pointless).
-/// Returns the locked handle (released on drop) or `None` on any error, so
-/// callers proceed best-effort and never crash the hook.
+/// Advisory exclusive lock guarding a high-water file's load→max→write. Locks a
+/// sibling `.lock` file (a stable inode — the high-water file itself is replaced
+/// by `rename`, so locking it directly would be pointless). Uses a NON-BLOCKING
+/// `try_lock_exclusive`: a hook must never stall a session boot waiting on a peer,
+/// and a caller that cannot take the lock FAILS CLOSED (see [`advance_high_water`])
+/// rather than block or write unlocked. Returns the locked handle (released on
+/// drop) or `None` when the lock is held elsewhere / on any error.
 fn lock_high_water(path: &Path) -> Option<std::fs::File> {
     let lock_path = path.with_extension("lock");
     let file = std::fs::OpenOptions::new()
@@ -528,31 +610,69 @@ fn lock_high_water(path: &Path) -> Option<std::fs::File> {
         .write(true)
         .open(&lock_path)
         .ok()?;
-    fs2::FileExt::lock_exclusive(&file).ok()?;
+    fs2::FileExt::try_lock_exclusive(&file).ok()?;
     Some(file)
 }
 
-/// Atomically persist `high_water` to `path`: write a same-directory temp file
-/// (0600, mirroring the passport key — F2) then `rename` over the target (atomic
-/// on Unix), so an interrupted or concurrent write never leaves a partial file.
-/// The temp name is per-process so a fail-open lock race can't cross-clobber it.
+/// Atomically persist `high_water` to `path`: write an **unpredictable** temp file
+/// (random name, `create_new` = `O_CREAT|O_EXCL`, mode 0600) then `rename` over the
+/// target (atomic on Unix), and fsync the parent directory so the rename survives a
+/// crash. `O_EXCL` refuses to open an existing path — regular file OR symlink — so
+/// no attacker-pre-planted 0644 inode or symlink is ever reused or followed, which
+/// makes the 0600 mode a real guarantee on a fresh inode (closes the F2 gap). The
+/// temp is removed on any write/rename/fsync failure so no stray file survives.
 fn write_high_water_atomic(path: &Path, high_water: u64) -> std::io::Result<()> {
     use std::io::Write as _;
     let body = serde_json::json!({ "high_water": high_water }).to_string();
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "high-water path has no parent"))?;
+
+    // Random, unguessable temp name + O_EXCL create: nothing to pre-plant at a
+    // predictable path for us to follow/truncate. (libc::O_NOFOLLOW would be
+    // belt-and-suspenders, but O_EXCL already fails on an existing symlink and this
+    // crate keeps a deliberate zero-new-dependency footprint — a random name +
+    // O_EXCL is the dep-free equivalent.)
+    let tmp = path.with_extension(format!("tmp.{:016x}", rand::random::<u64>()));
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
-    {
-        let mut file = options.open(&tmp)?;
-        file.write_all(body.as_bytes())?;
-        file.sync_all()?;
+
+    // Write → fsync file → rename → fsync parent dir. The rename is the durability
+    // point; the parent fsync ensures a crash cannot lose it and re-open the
+    // rollback window on next boot.
+    let result = options
+        .open(&tmp)
+        .and_then(|mut file| {
+            file.write_all(body.as_bytes())?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .and_then(|()| fsync_parent_dir(dir));
+    if result.is_err() {
+        // Best-effort cleanup: if anything failed at/before rename the temp still
+        // exists; if rename already succeeded the temp is gone and this no-ops.
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::rename(&tmp, path)
+    result
+}
+
+/// fsync a directory so a preceding `rename` into it is durable. Unix-only work;
+/// a no-op elsewhere (Windows cannot fsync a directory handle).
+fn fsync_parent_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -804,13 +924,13 @@ mod tests {
 
         // Missing file ⇒ FirstRun.
         assert_eq!(load_high_water(scope), HighWater::FirstRun);
-        advance_high_water(scope, 100);
+        assert!(advance_high_water(scope, 100), "first mark commits durably");
         assert_eq!(load_high_water(scope), HighWater::Mark(100));
-        // Lower value must not lower the mark.
-        advance_high_water(scope, 50);
+        // Lower value must not lower the mark (the mark is already durable ≥ 50).
+        let _ = advance_high_water(scope, 50);
         assert_eq!(load_high_water(scope), HighWater::Mark(100));
         // Higher value advances it.
-        advance_high_water(scope, 250);
+        assert!(advance_high_water(scope, 250), "strictly-higher mark commits durably");
         assert_eq!(load_high_water(scope), HighWater::Mark(250));
 
         // Corrupt file ⇒ Corrupt (fail toward no restore).
@@ -820,8 +940,8 @@ mod tests {
         // F1: advance must NOT reset/overwrite a Corrupt mark (that reset was the
         // rollback bug — Mark(0) would accept any authentic counter>0). The mark
         // stays Corrupt: fail closed, never regress an unknown-but-possibly-higher
-        // value.
-        advance_high_water(scope, 300);
+        // value — and advance REPORTS failure (false) over a Corrupt prior state.
+        assert!(!advance_high_water(scope, 300), "advance over Corrupt must fail closed");
         assert_eq!(
             load_high_water(scope),
             HighWater::Corrupt,
@@ -846,7 +966,7 @@ mod tests {
         std::env::set_var("CRUX_PASSPORT_KEY_PATH", &key_file);
         let scope = "scope-atomic";
 
-        advance_high_water(scope, 123);
+        assert!(advance_high_water(scope, 123), "atomic write commits durably");
         assert_eq!(load_high_water(scope), HighWater::Mark(123));
         let dir = high_water_path(scope).unwrap().parent().unwrap().to_path_buf();
         let leftover: Vec<String> = std::fs::read_dir(&dir)
@@ -879,8 +999,10 @@ mod tests {
         std::env::set_var("CRUX_PASSPORT_KEY_PATH", &key_file);
         let scope = "scope-lock";
 
-        advance_high_water(scope, 150);
-        advance_high_water(scope, 120);
+        assert!(advance_high_water(scope, 150), "first advance commits durably");
+        // 120 < 150: the mark is already durable ≥ 120, so this reports success
+        // without lowering it (a lost update would leave 120).
+        let _ = advance_high_water(scope, 120);
         assert_eq!(load_high_water(scope), HighWater::Mark(150));
         let lock = high_water_path(scope).unwrap().with_extension("lock");
         assert!(lock.exists(), "advisory .lock sibling must be created: {lock:?}");
@@ -908,12 +1030,12 @@ mod tests {
         // mark must remain Corrupt, not become Mark(0).
         let path = high_water_path(scope).unwrap();
         std::fs::write(&path, "}{ garbage").unwrap();
-        advance_high_water(scope, 0);
+        assert!(!advance_high_water(scope, 0), "advance over Corrupt fails closed");
         assert_eq!(load_high_water(scope), HighWater::Corrupt, "no reset-to-0 on corrupt");
 
         // Later a genuine higher mark is established (fresh file replaces corrupt).
         std::fs::remove_file(&path).unwrap();
-        advance_high_water(scope, 500);
+        assert!(advance_high_water(scope, 500), "fresh mark commits durably");
         assert_eq!(load_high_water(scope), HighWater::Mark(500));
         // A replay at/under that mark is still rejected (gate closed as intended).
         let dk = DerivedSnapshotKey {
@@ -926,6 +1048,103 @@ mod tests {
             stale.counter <= 500,
             "the replay counter is at/under the mark, so the fresh path must reject it"
         );
+
+        match prev {
+            Some(v) => std::env::set_var("CRUX_PASSPORT_KEY_PATH", v),
+            None => std::env::remove_var("CRUX_PASSPORT_KEY_PATH"),
+        }
+    }
+
+    #[test]
+    fn advance_fails_closed_when_lock_is_held_and_does_not_write() {
+        // Pre-enable fix (item 1): the high-water lock makes load→max→write atomic.
+        // If the exclusive lock cannot be acquired, advance MUST fail closed — return
+        // false AND write nothing — rather than proceed unlocked (which would
+        // reintroduce the lost-update race). Simulate a peer holding the lock via a
+        // separate handle (a distinct open file description ⇒ flock conflicts even
+        // in-process).
+        let _env = crate::test_support::env_guard();
+        let prev = std::env::var("CRUX_PASSPORT_KEY_PATH").ok();
+        let tmp = tempfile::tempdir().unwrap();
+        let key_file = tmp.path().join("passport.key");
+        std::fs::write(&key_file, "aa".repeat(32)).unwrap();
+        std::env::set_var("CRUX_PASSPORT_KEY_PATH", &key_file);
+        let scope = "scope-lock-held";
+
+        // Establish a genuine mark first (lock free).
+        assert!(advance_high_water(scope, 100), "baseline mark commits");
+        assert_eq!(load_high_water(scope), HighWater::Mark(100));
+
+        // Hold the advisory lock through a separate handle (simulates another
+        // process/advance mid read-modify-write).
+        let lock_path = high_water_path(scope).unwrap().with_extension("lock");
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+
+        // A higher advance must FAIL CLOSED: false, and the mark stays 100 (not 500).
+        assert!(
+            !advance_high_water(scope, 500),
+            "advance must fail closed when the lock is held"
+        );
+        assert_eq!(
+            load_high_water(scope),
+            HighWater::Mark(100),
+            "must not write while the lock is held (no unlocked read-modify-write)"
+        );
+
+        // Release the lock; the same advance now succeeds and commits.
+        fs2::FileExt::unlock(&held).unwrap();
+        assert!(advance_high_water(scope, 500), "advance succeeds once the lock frees");
+        assert_eq!(load_high_water(scope), HighWater::Mark(500));
+
+        match prev {
+            Some(v) => std::env::set_var("CRUX_PASSPORT_KEY_PATH", v),
+            None => std::env::remove_var("CRUX_PASSPORT_KEY_PATH"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn advance_replaces_preexisting_world_readable_file_with_0600() {
+        // F2 (item 3): the atomic write uses a random-named `create_new` (O_EXCL)
+        // temp created 0600, then renames it over the target — so the final file is
+        // ALWAYS a fresh 0600 inode, never a reused pre-existing 0644 one. Pre-plant
+        // a world-readable file at the final path and confirm advance replaces it
+        // with 0600 (the 0600 guarantee cannot be defeated by a pre-existing inode).
+        use std::os::unix::fs::PermissionsExt as _;
+        let _env = crate::test_support::env_guard();
+        let prev = std::env::var("CRUX_PASSPORT_KEY_PATH").ok();
+        let tmp = tempfile::tempdir().unwrap();
+        let key_file = tmp.path().join("passport.key");
+        std::fs::write(&key_file, "aa".repeat(32)).unwrap();
+        std::env::set_var("CRUX_PASSPORT_KEY_PATH", &key_file);
+        let scope = "scope-preexisting-0644";
+
+        let path = high_water_path(scope).unwrap();
+        std::fs::write(&path, "{\"high_water\":1}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o644);
+
+        assert!(advance_high_water(scope, 100), "advance over a 0644 file commits");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "F2: replaced file must be a fresh 0600 inode, not the 0644 one"
+        );
+        assert_eq!(load_high_water(scope), HighWater::Mark(100));
+        // And no temp file survives (create_new temp was renamed away or cleaned up).
+        let dir = path.parent().unwrap();
+        let leftover: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftover.is_empty(), "no temp file must survive: {leftover:?}");
 
         match prev {
             Some(v) => std::env::set_var("CRUX_PASSPORT_KEY_PATH", v),
@@ -946,7 +1165,7 @@ mod tests {
         std::env::set_var("CRUX_PASSPORT_KEY_PATH", &key_file);
         let scope = "scope-mode";
 
-        advance_high_water(scope, 42);
+        assert!(advance_high_water(scope, 42), "advance commits durably");
         let path = high_water_path(scope).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "F2: high-water file must not be world-readable");
@@ -1015,6 +1234,61 @@ mod tests {
         assert!(!bearer_reuses_passport_seed());
 
         std::fs::remove_file(&key_file).ok();
+        match prev_tok {
+            Some(v) => std::env::set_var("CRUX_AGENT_TOKEN", v),
+            None => std::env::remove_var("CRUX_AGENT_TOKEN"),
+        }
+        match prev_path {
+            Some(v) => std::env::set_var("CRUX_PASSPORT_KEY_PATH", v),
+            None => std::env::remove_var("CRUX_PASSPORT_KEY_PATH"),
+        }
+    }
+
+    #[test]
+    fn resolve_snapshot_key_reads_seed_once_for_guard_and_derive() {
+        // F3 (item 4): the bearer-reuse guard and key derivation run off ONE seed
+        // read, so a key rotation between two reads can't make the guard check seed A
+        // while encryption uses seed B. Prove structurally: (a) with an unrelated
+        // bearer, the derived key + scope match a key built directly from the on-disk
+        // seed (derive used THAT seed); (b) with the bearer set to that same seed's
+        // hex, the SAME single read makes the guard fire (guard saw THAT seed).
+        use crux_session::LocalPassportKey;
+        let _env = crate::test_support::env_guard();
+        let prev_tok = std::env::var("CRUX_AGENT_TOKEN").ok();
+        let prev_path = std::env::var("CRUX_PASSPORT_KEY_PATH").ok();
+
+        let seed = [0x33u8; 32];
+        let tmp = tempfile::tempdir().unwrap();
+        let key_file = tmp.path().join("passport.key");
+        std::fs::write(&key_file, hex::encode(seed)).unwrap();
+        std::env::set_var("CRUX_PASSPORT_KEY_PATH", &key_file);
+
+        // (a) Unrelated bearer ⇒ resolve derives the key from the on-disk seed.
+        std::env::set_var("CRUX_AGENT_TOKEN", "unrelated-bearer-token-xyz");
+        let want = LocalPassportKey::from_seed(seed).unwrap();
+        match resolve_snapshot_key() {
+            SeedResolution::Key(dk) => {
+                assert_eq!(dk.scope, want.passport_fpr(), "scope must come from the read seed");
+                assert_eq!(
+                    *dk.key,
+                    want.derive_subkey(SNAPSHOT_KEY_CONTEXT),
+                    "key must derive from the SAME read seed the guard checked"
+                );
+            }
+            _ => panic!("expected a derived key for an unrelated bearer"),
+        }
+
+        // (b) Bearer == that seed's hex ⇒ the guard (same single read) fires.
+        std::env::set_var("CRUX_AGENT_TOKEN", hex::encode(seed));
+        assert!(
+            matches!(resolve_snapshot_key(), SeedResolution::BearerReusesSeed),
+            "guard must see the same seed the derive would use"
+        );
+
+        // No seed file ⇒ NoSeed (no derive, no guard state, silent skip).
+        std::fs::remove_file(&key_file).unwrap();
+        assert!(matches!(resolve_snapshot_key(), SeedResolution::NoSeed));
+
         match prev_tok {
             Some(v) => std::env::set_var("CRUX_AGENT_TOKEN", v),
             None => std::env::remove_var("CRUX_AGENT_TOKEN"),

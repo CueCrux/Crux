@@ -96,13 +96,14 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
 /// sent ONLY to a verified-loopback daemon; a non-loopback endpoint is skipped
 /// so plaintext never egresses. Best-effort — daemon-unreachable is non-fatal.
 fn save_session_sealed(session_key: &str, session_id: &str, state: &Value, counter: u64) {
-    // Finding 5 synergy: if the bearer reuses the seed, a key derived from that
-    // seed is server-known — encrypting is fake protection. Treat it as no-key so
-    // the plaintext-to-loopback-only rule below applies (remote ⇒ skipped).
-    let derived = if snapshot_crypto::bearer_reuses_passport_seed() {
-        None
-    } else {
-        snapshot_crypto::derive_snapshot_key()
+    // Finding 5 synergy + F3: ONE seed read drives both the bearer-reuse guard and
+    // the key derivation (no rotation-between-reads split). If the bearer reuses the
+    // seed, a key derived from it is server-known — encrypting is fake protection —
+    // so treat it as no-key (same as no seed) and the plaintext-to-loopback-only
+    // rule below applies (remote ⇒ skipped).
+    let derived = match snapshot_crypto::resolve_snapshot_key() {
+        snapshot_crypto::SeedResolution::Key(dk) => Some(dk),
+        snapshot_crypto::SeedResolution::BearerReusesSeed | snapshot_crypto::SeedResolution::NoSeed => None,
     };
     let state_field = match derived {
         Some(dk) => match seal_state_value(&dk.key, &dk.scope, session_id, counter, state) {
@@ -172,18 +173,20 @@ fn store_encrypted_snapshot(session_id: &str, state: &Value, counter: u64) {
     if !snapshot_crypto::hosted_sync_enabled() {
         return;
     }
-    // Finding 5: refuse if the bearer token IS the passport seed — the server
-    // would then hold the key material. Generic config error, no values echoed.
-    if snapshot_crypto::bearer_reuses_passport_seed() {
-        eprintln!(
-            "crux-hook pre-compact: refusing hosted snapshot sync — CRUX_AGENT_TOKEN reuses the \
-             passport seed (config error); the server must never receive the key material"
-        );
-        return;
-    }
-    // No passport seed ⇒ no key ⇒ nothing to encrypt/sync (local file read only).
-    let Some(dk) = snapshot_crypto::derive_snapshot_key() else {
-        return;
+    // Finding 5 + F3: ONE seed read drives both the bearer-reuse guard and the key
+    // derivation. Bearer reuses the seed ⇒ refuse (the server would then hold the
+    // key material; generic config error, no values echoed). No passport seed ⇒ no
+    // key ⇒ nothing to encrypt/sync (silent skip, local file read only).
+    let dk = match snapshot_crypto::resolve_snapshot_key() {
+        snapshot_crypto::SeedResolution::Key(dk) => dk,
+        snapshot_crypto::SeedResolution::BearerReusesSeed => {
+            eprintln!(
+                "crux-hook pre-compact: refusing hosted snapshot sync — CRUX_AGENT_TOKEN reuses the \
+                 passport seed (config error); the server must never receive the key material"
+            );
+            return;
+        }
+        snapshot_crypto::SeedResolution::NoSeed => return,
     };
     let args = match build_snapshot_fact_args(session_id, state, &dk, counter) {
         Ok(args) => args,

@@ -251,11 +251,15 @@ fn restore_snapshot_section(source: Option<&str>, session_id: &str) -> Option<St
     if !snapshot_crypto::hosted_sync_enabled() {
         return None;
     }
-    // Finding 5: refuse if the bearer token IS the passport seed (server-known key).
-    if snapshot_crypto::bearer_reuses_passport_seed() {
-        return None;
-    }
-    let dk = snapshot_crypto::derive_snapshot_key()?;
+    // Finding 5 + F3: ONE seed read drives both the bearer-reuse guard and the key
+    // derivation (no rotation-between-reads split). No seed, or a bearer that reuses
+    // the seed (server-known key), ⇒ skip restore entirely.
+    let dk = match snapshot_crypto::resolve_snapshot_key() {
+        snapshot_crypto::SeedResolution::Key(dk) => dk,
+        snapshot_crypto::SeedResolution::NoSeed | snapshot_crypto::SeedResolution::BearerReusesSeed => {
+            return None;
+        }
+    };
     let result = mcp_client::call_tool(
         "query_facts",
         json!({
@@ -268,15 +272,17 @@ fn restore_snapshot_section(source: Option<&str>, session_id: &str) -> Option<St
     let envelopes = parse_snapshot_envelopes(&result);
 
     // (1) Same-session resume: a snapshot whose OWN session_id is the current
-    // session. Exact session match + AEAD auth is the trust signal; no high-water
-    // gate (so re-resume of the same session is never self-blocked). Advancing the
-    // mark keeps a later fresh pickup from regressing behind it.
+    // session. Exact session match + AEAD auth is the trust signal; this path is
+    // NOT rollback-gated (so re-resume of the same session is never self-blocked),
+    // so advancing the mark is BEST-EFFORT: attempt it (keeps a later fresh pickup
+    // from regressing behind this counter), but restore even if it fails.
     if let Some(opened) = open_same_session(&envelopes, &dk, session_id) {
-        snapshot_crypto::advance_high_water(&dk.scope, opened.counter);
+        let _ = snapshot_crypto::advance_high_water(&dk.scope, opened.counter);
         return Some(render_snapshot_context(&opened.plaintext));
     }
 
-    // (2) Fresh-session pickup of this passport's latest, rollback-checked.
+    // (2) Fresh-session pickup of this passport's latest, rollback-checked AND
+    // gated on a DURABLE high-water commit (pre-enable fix, item 2).
     let high_water = match snapshot_crypto::load_high_water(&dk.scope) {
         snapshot_crypto::HighWater::Mark(n) => n,
         snapshot_crypto::HighWater::FirstRun => 0,
@@ -293,8 +299,18 @@ fn restore_snapshot_section(source: Option<&str>, session_id: &str) -> Option<St
             return None;
         }
     };
+    // Ordering (item 2): open the chosen snapshot → advance the high-water mark →
+    // inject ONLY IF the advance DURABLY committed. `advance_high_water` returns
+    // false when the lock is unavailable or the write failed (fail closed); in that
+    // case we must NOT inject — a snapshot whose acceptance was not recorded would
+    // otherwise replay on the next boot (the whole point of the rollback gate).
     let opened = open_latest_fresh(&envelopes, &dk, session_id, high_water)?;
-    snapshot_crypto::advance_high_water(&dk.scope, opened.counter);
+    if !snapshot_crypto::advance_high_water(&dk.scope, opened.counter) {
+        eprintln!(
+            "crux-hook session-start: snapshot high-water advance did not durably commit — skipping restore this boot (avoids replay)"
+        );
+        return None;
+    }
     Some(render_snapshot_context(&opened.plaintext))
 }
 
@@ -895,5 +911,129 @@ mod tests {
         assert!(digest.contains("crux-agent-presence-coordination-2026-06-11 @ M5"));
         assert!(digest.contains("holds: tree://crates/crux-claude-hooks"));
         assert!(digest.contains("coord_announce"));
+    }
+
+    /// Pre-enable fix (item 2): a FRESH-session snapshot must be injected ONLY IF
+    /// its high-water advance durably commits. If the advance fails (here: the
+    /// exclusive lock is held by a "peer"), restore returns None — never injecting a
+    /// snapshot whose acceptance was not recorded (it would replay next boot). The
+    /// same run, with the lock free, proves the miss was the fail-closed gate and
+    /// not some unrelated skip (the snapshot IS injected and the mark advances).
+    #[test]
+    fn fresh_restore_returns_none_when_high_water_advance_fails() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let _env = crate::test_support::env_guard();
+
+        // Passport key → derive the exact key/scope the mock envelope is sealed under.
+        let tmp = tempfile::tempdir().unwrap();
+        let key_file = tmp.path().join("passport.key");
+        let seed = [0x5cu8; 32];
+        std::fs::write(&key_file, hex::encode(seed)).unwrap();
+        let passport = crux_session::LocalPassportKey::from_seed(seed).unwrap();
+        let scope = passport.passport_fpr().to_string();
+        let key = zeroize::Zeroizing::new(passport.derive_subkey(snapshot_crypto::SNAPSHOT_KEY_CONTEXT));
+
+        // A fresh snapshot for THIS passport, a DIFFERENT session, counter 4242 > hw(0).
+        let env = snapshot_crypto::seal(&key, &scope, "writer-session", 4242, b"fresh work state").unwrap();
+        let fact_value = env.to_fact_value().unwrap();
+
+        // Mock MCP: answer tools/call with a query_facts-shaped result (one row).
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_t = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            while !stop_t.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut s, _)) => {
+                        let mut buf = [0u8; 4096];
+                        let _ = s.read(&mut buf);
+                        let result = json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "result": { "structuredContent": { "rows": [{ "key": "writer-session", "value": fact_value }] } }
+                        })
+                        .to_string();
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            result.len(),
+                            result
+                        );
+                        let _ = s.write_all(resp.as_bytes());
+                        let _ = s.flush();
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::yield_now(),
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let prev_mcp = std::env::var("CRUX_MCP_URL").ok();
+        let prev_sync = std::env::var("CRUX_COMPACTION_SYNC").ok();
+        let prev_kp = std::env::var("CRUX_PASSPORT_KEY_PATH").ok();
+        let prev_tok = std::env::var("CRUX_AGENT_TOKEN").ok();
+        std::env::set_var("CRUX_MCP_URL", format!("http://127.0.0.1:{port}/mcp"));
+        std::env::set_var("CRUX_COMPACTION_SYNC", "1");
+        std::env::set_var("CRUX_PASSPORT_KEY_PATH", &key_file);
+        std::env::remove_var("CRUX_AGENT_TOKEN");
+
+        // Hold the advisory high-water lock via a separate handle so advance fails.
+        let lock_path = snapshot_crypto::high_water_path(&scope).unwrap().with_extension("lock");
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+
+        // Advance CANNOT commit ⇒ fresh restore must skip (no inject) and NOT write.
+        let blocked = restore_snapshot_section(Some("compact"), "fresh-session");
+        assert!(
+            blocked.is_none(),
+            "must not inject when the high-water advance can't commit"
+        );
+        assert_eq!(
+            snapshot_crypto::load_high_water(&scope),
+            snapshot_crypto::HighWater::FirstRun,
+            "a failed advance must not have written the mark"
+        );
+
+        // Release the lock: now the same fresh snapshot IS injected and the mark advances.
+        fs2::FileExt::unlock(&held).unwrap();
+        let injected = restore_snapshot_section(Some("compact"), "fresh-session");
+        let injected = injected.expect("fresh restore injects once the advance commits");
+        assert!(injected.contains("fresh work state"), "restored plaintext present");
+        assert_eq!(
+            snapshot_crypto::load_high_water(&scope),
+            snapshot_crypto::HighWater::Mark(4242),
+            "a committed advance records the counter"
+        );
+
+        // Restore env before joining the server thread.
+        match prev_mcp {
+            Some(v) => std::env::set_var("CRUX_MCP_URL", v),
+            None => std::env::remove_var("CRUX_MCP_URL"),
+        }
+        match prev_sync {
+            Some(v) => std::env::set_var("CRUX_COMPACTION_SYNC", v),
+            None => std::env::remove_var("CRUX_COMPACTION_SYNC"),
+        }
+        match prev_kp {
+            Some(v) => std::env::set_var("CRUX_PASSPORT_KEY_PATH", v),
+            None => std::env::remove_var("CRUX_PASSPORT_KEY_PATH"),
+        }
+        match prev_tok {
+            Some(v) => std::env::set_var("CRUX_AGENT_TOKEN", v),
+            None => std::env::remove_var("CRUX_AGENT_TOKEN"),
+        }
+        stop.store(true, Ordering::SeqCst);
+        let _ = handle.join();
     }
 }
