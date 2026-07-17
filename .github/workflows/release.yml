@@ -43,11 +43,30 @@ jobs:
             # supported Intel image; probed green on run 27429963193.
             os: macos-15-intel
             suffix: darwin-amd64
+          # --- Linux cross legs (daemon-distribution-packaging M?, GATE-PACKAGE) ---
+          # Both cross-compile on the x86_64 ubuntu runner using a native cross
+          # toolchain (no Docker/qemu): build.rs uses vendored protoc + the cc
+          # crate auto-selects the target C compiler, so only linking targets the
+          # foreign arch. `cross: true` gates the build-only path below (tests
+          # already run on the three native-arch legs; running the workspace
+          # suite under emulation adds hours for no new coverage).
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            suffix: linux-musl-amd64
+            cross: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            suffix: linux-arm64
+            cross: true
     steps:
       - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          # Cross legs need the target's std pre-installed; a no-op for the three
+          # native legs whose target already matches the host toolchain.
+          targets: ${{ matrix.target }}
 
       - name: Install protoc
         uses: arduino/setup-protoc@v3
@@ -57,14 +76,42 @@ jobs:
           # the hosted-runner IP rate limit and flaked v0.4.9 twice (10:40Z, 10:50Z).
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
+      # Native cross toolchain for the linux cross legs (musl + aarch64-gnu).
+      # cc-crate builds pick these up automatically from the target triple; no
+      # Docker/qemu involved (build-only, see the matrix comment).
+      - name: Install cross toolchain
+        if: ${{ matrix.cross }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+
       - name: Run tests
+        # Native legs only: cross legs are build-only (the three native-arch legs
+        # already run the full suite; emulation here adds no coverage).
+        if: ${{ !matrix.cross }}
         run: |
           bash scripts/assert-daemon-release-boundary.sh
           bash scripts/assert-hosted-bridge-contract.sh
           cargo test --locked --workspace
 
       - name: Build release
+        if: ${{ !matrix.cross }}
         run: cargo build --locked --release
+
+      - name: Build release (cross)
+        if: ${{ matrix.cross }}
+        # Build just the two shipped bins for the target, then normalise the
+        # output into target/release/ so package-daemon-release.sh (which reads
+        # target/release/) works unchanged across native and cross legs.
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+        run: |
+          cargo build --locked --release --target ${{ matrix.target }} \
+            --bin corecruxd --bin corecruxctl
+          mkdir -p target/release
+          cp "target/${{ matrix.target }}/release/corecruxd" target/release/corecruxd
+          cp "target/${{ matrix.target }}/release/corecruxctl" target/release/corecruxctl
 
       # --- Trust-surface release gates (roadmap Phase 1.3; production-cutover) ---
       # The "reason people install this" checks, now release-blocking:
@@ -181,9 +228,16 @@ jobs:
           generate_release_notes: true
 
   # --- SLSA provenance (ExecPlan crux-supply-chain-attestation-2026-06-11, M4) ---
-  # The three matrix legs export per-suffix base64(sha256sum) subject blocks;
-  # this job concatenates them into the single base64-subjects input the
+  # The three native matrix legs export per-suffix base64(sha256sum) subject
+  # blocks; this job concatenates them into the single base64-subjects input the
   # generator expects.
+  #
+  # The linux cross legs (musl / aarch64-gnu) are cosign-signed per-artifact like
+  # every other file but are intentionally NOT wired into these SLSA subjects
+  # yet: combine-hashes hard-fails if any leg's block is empty, so coupling the
+  # newer, build-only cross legs in would let one cross-leg flake break
+  # provenance for the whole release. Fold them in once the cross legs prove
+  # stable (add job outputs + two more base64 -d lines below).
   combine-hashes:
     name: Combine provenance subjects
     needs: build
