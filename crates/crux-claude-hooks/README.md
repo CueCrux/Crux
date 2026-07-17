@@ -77,24 +77,28 @@ Add to `.claude/settings.local.json`:
 | `CRUX_HOOK_CONTEXT_MONITOR` | (unset) | Set to `off` to disable PostToolUse warnings. |
 | `CRUX_HOOK_PRE_COMPACT` | (unset) | Set to `off` to disable PreCompact snapshots. |
 | `CRUX_HOOK_SESSION_START` | (unset) | Set to `off` to disable SessionStart bootstrap. |
-| `CRUX_COMPACTION_SYNC` | (unset) | Hosted snapshot sync: `1`/`on` forces it on, `0`/`off` forces off. Unset ⇒ auto (the daemon's `sync_status.configured` decides). |
+| `CRUX_COMPACTION_SYNC` | (unset) | Hosted encrypted snapshot sync — **explicit default-OFF opt-in**: `1`/`on` enable; `0`/`off`/unset are all off. Checked before any key derivation or network op (no `sync_status` auto-enable). |
 | `CRUX_PASSPORT_KEY_PATH` | (unset) | Explicit path to the passport seed used to derive the snapshot key. Falls back to `CORECRUXD_PASSPORT_KEY_PATH`, then `CORECRUXD_DATA_DIR/passport.key`. Read-only; never created by the hook. |
 
 ## Hosted encrypted snapshot sync (Pro)
 
-Free tier keeps its local baseline unchanged: `pre-compact` writes
-`save_session` to the local daemon and the [free shell preset](../../integrations/claude-code/compaction-survival/)
+Free tier keeps its local baseline: `pre-compact` writes `save_session` to the
+local daemon and the [free shell preset](../../integrations/claude-code/compaction-survival/)
 writes `~/.claude/compaction-snapshots/<session_id>.md`. Nothing leaves the
-machine.
+machine. **The `save_session` state is itself sealed** whenever a passport seed
+is available, so even the session store holds only ciphertext regardless of the
+endpoint; with no seed to encrypt with, plaintext `save_session` is sent **only
+to a verified-loopback daemon** and skipped for any remote endpoint.
 
-On a **Pro / hosted** node (a remote mirror is configured — `sync_status`
-reports `configured: true`) the same `pre-compact` hook *additionally* stores
-the snapshot as a **client-side-encrypted, non-private `session_snapshot`
-fact**. Because `facts` is a synced collection and the fact is non-private, it
-rides the existing per-tenant mirror to the user's other devices — and because
-the value is ciphertext, that is safe. On the other device, a `compact`/`resume`
-`session-start` boot pulls the newest `session_snapshot`, decrypts it locally,
-and re-injects the working state as `additionalContext`.
+When hosted sync is **explicitly enabled** (`CRUX_COMPACTION_SYNC=1|on`; the Pro
+mirror is the product-posture gate on the daemon side) the same `pre-compact`
+hook *additionally* stores the snapshot as a **client-side-encrypted,
+non-private `session_snapshot` fact**. Because `facts` is a synced collection
+and the fact is non-private, it rides the existing per-tenant mirror to the
+user's other devices — and because the value is ciphertext, that is safe. On the
+other device, a `compact`/`resume` `session-start` boot pulls the
+`session_snapshot` **for that session id**, decrypts it locally, and re-injects
+the working state as `additionalContext`.
 
 ### "Unreadable to us" guarantee
 
@@ -109,9 +113,25 @@ value, not the key name, not any metadata. The scheme:
   authenticates with a *separate* bearer token (`CRUX_AGENT_TOKEN`) and never
   receives the seed, so it cannot derive the key. The derived key is computed on
   demand, never persisted or logged.
-- **Envelope:** versioned `{v, alg, nonce, ct}`, base64-wrapped into the fact
-  value. Unknown `v`/`alg` are rejected, so the scheme can evolve without
-  breaking stored blobs.
+- **Envelope:** versioned `{v, alg, nonce, ct}` (currently **v2**),
+  base64-wrapped into the fact value. Unknown `v`/`alg` are rejected, so the
+  scheme can evolve without breaking stored blobs.
+- **AAD binding (v2):** each seal binds canonical additional-authenticated-data
+  `{v, alg, entity, session_id}`. Restore is scoped to the exact fact key and
+  reconstructs the same AAD, so an old / other-session / substituted-key envelope
+  under the same seed fails authentication instead of restoring. (Continuity is
+  therefore per-session-id: cross-device restore requires the same session id on
+  both machines, as Claude Code `--resume` provides.)
+- **No key handoff:** if `CRUX_AGENT_TOKEN` is set to the passport seed itself
+  (any hex/base64 form), hosted sync is refused — the server must never receive
+  the material the key is derived from.
+
+> **Known gaps / follow-ups.** (1) A server-side *tenant* id is not cleanly
+> available to the hook, so the AAD binds `session_id` rather than tenant;
+> cross-seed substitution is already prevented by the seed-derived key. (2) The
+> AAD stops substitution but not replay of a legitimately-consistent *old*
+> `(key,value)` blob — a monotonic snapshot counter + per-session high-water mark
+> is deferred (needs local persistent state).
 
 ### Same-passport prerequisite
 
