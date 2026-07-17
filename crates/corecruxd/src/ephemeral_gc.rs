@@ -203,8 +203,8 @@ fn build_gc_receipt(deleted: usize, retain_days: i64) -> GcReceiptV1 {
 /// the fact journal append is not itself fsynced, so like any fact write it is
 /// durable on a clean shutdown, not crash-atomic; the receipt uses the fsynced
 /// durable append. A mint failure is NOT silent: `mint_governance_receipt`
-/// bumps the audit-debt counter and logs at ERROR (see
-/// [`crate::http::observations::receipt_mint_failures`]).
+/// bumps the audit-debt counter and logs at ERROR (the
+/// `RECEIPT_MINT_FAILURES` static in `crate::http::observations`).
 pub fn spawn_ephemeral_gc(enabled: bool, state: AppState, mut shutdown: broadcast::Receiver<()>) {
     if !enabled {
         return;
