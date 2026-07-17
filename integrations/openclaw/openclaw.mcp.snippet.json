@@ -1,0 +1,14 @@
+{
+  "//": "Merge this block into ~/.openclaw/openclaw.json. Canonical OpenClaw MCP shape is mcp.servers.<name> with transport:'streamable-http' (per docs/cli/mcp.md). Local-first HTTP transport to your local Crux daemon MCP — no npm/npx dependency, nothing downloaded at runtime. Restart the OpenClaw gateway after editing.",
+  "mcp": {
+    "servers": {
+      "crux": {
+        "url": "http://127.0.0.1:14801/mcp",
+        "transport": "streamable-http",
+        "headers": {
+          "Authorization": "Bearer ${CRUX_AGENT_TOKEN}"
+        }
+      }
+    }
+  }
+}

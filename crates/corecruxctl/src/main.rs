@@ -19,9 +19,9 @@ use clap::{Parser, Subcommand};
 use corecruxctl::{
     admin, audit_export, audit_pack, c2pa_x509, code_chain, code_health, config_bundle, cost, deploy_audit, evidence,
     explain, export, extensions, fixture_digest, gaps, hooks, identity_cli, incident, ingest, inspect_receipt, learn,
-    login, machine, memory, memory_pack, observe_ingest, output_verify, parity, projections, receipts, reconcile,
-    replay, repo, session_sync, shard, shardmap, smoke, snapshot, stage1_import, start, storage, structured_log,
-    tooling_env, verify_store,
+    login, machine, memory, memory_pack, observe_ingest, openclaw, output_verify, parity, projections, receipts,
+    reconcile, replay, repo, session_sync, shard, shardmap, smoke, snapshot, stage1_import, start, storage,
+    structured_log, tooling_env, verify_store,
 };
 
 #[derive(Debug, Parser)]
@@ -578,6 +578,17 @@ enum Command {
         command: MemoryCommand,
     },
 
+    /// Import + scan OpenClaw/fork agent-memory workspaces (W3 ICP-1). Free,
+    /// local-first funnel: bring an OpenClaw memory dir into the local Crux
+    /// store with provenance, then scan it for unreceipted (MemGhost-style)
+    /// mutations. Operates against the running daemon over HTTP; honours
+    /// CRUX_AGENT_TOKEN.
+    #[command(name = "openclaw")]
+    Openclaw {
+        #[command(subcommand)]
+        command: OpenclawCommand,
+    },
+
     /// Identity-federation helpers — fingerprint card + link-statement
     /// signing (the cross-signature ceremony, G4).
     #[command(name = "identity")]
@@ -1095,6 +1106,48 @@ enum RepoCommand {
         /// Bearer token file.
         #[arg(long)]
         token_file: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum OpenclawCommand {
+    /// Import an OpenClaw workspace directory (markdown memory files; SQLite
+    /// noted but not parsed) into the local Crux store. Each memory becomes a
+    /// fact stamped with provenance (actor=import:openclaw, source path/hash/
+    /// mtime/declared date) and written via the journaled PUT /v1/facts/bulk.
+    Import {
+        /// OpenClaw workspace directory (e.g. ~/.openclaw/workspace).
+        path: PathBuf,
+        /// Crux Daemon HTTP base URL (default: $CORECRUXD_HTTP_URL or
+        /// http://127.0.0.1:14800).
+        #[arg(long)]
+        daemon_url: Option<String>,
+        /// Parse + report only; write nothing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+    /// Scan an already-imported store and emit a markdown memory-scan report:
+    /// per-memory provenance, content-hash verification against the live
+    /// workspace, injected-instruction + integrity findings, and staleness.
+    Scan {
+        /// Crux Daemon HTTP base URL (default: $CORECRUXD_HTTP_URL or
+        /// http://127.0.0.1:14800).
+        #[arg(long)]
+        daemon_url: Option<String>,
+        /// Live OpenClaw workspace to verify each memory's content hash against
+        /// (the authoritative tamper signal). Omit for a store-only advisory scan.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Write the report to a file instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Days a daily log may be modified past its declared date before the
+        /// change is advisory-flagged as a timestamp anomaly.
+        #[arg(long, default_value_t = corecruxctl::openclaw::DEFAULT_MUTATION_GRACE_DAYS)]
+        mutation_grace_days: u32,
+        /// Age (days) past which a memory's declared date is called stale.
+        #[arg(long, default_value_t = corecruxctl::openclaw::DEFAULT_STALE_DAYS)]
+        stale_days: u32,
     },
 }
 
@@ -3983,6 +4036,32 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
                 Ok(())
             }
+        },
+
+        // ── OpenClaw memory funnel (W3 ICP-1) ───────────────────────
+        Command::Openclaw { command } => match command {
+            OpenclawCommand::Import {
+                path,
+                daemon_url,
+                dry_run,
+            } => openclaw::import_run(&openclaw::ImportOptions {
+                path,
+                daemon_url,
+                dry_run,
+            }),
+            OpenclawCommand::Scan {
+                daemon_url,
+                workspace,
+                out,
+                mutation_grace_days,
+                stale_days,
+            } => openclaw::scan_run(&openclaw::ScanOptions {
+                daemon_url,
+                workspace,
+                out,
+                grace_days: mutation_grace_days,
+                stale_days,
+            }),
         },
 
         // ── memory panel (agent-ux-01) ──────────────────────────────
