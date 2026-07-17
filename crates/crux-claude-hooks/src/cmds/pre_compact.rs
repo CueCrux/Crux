@@ -321,6 +321,56 @@ mod tests {
         assert_eq!(recovered_state, state);
     }
 
+    /// M4 mirror-carries-ciphertext proof. The value the hosted mirror receives
+    /// is the ENTIRE `store_fact` args payload; assert that no fragment of any
+    /// sensitive snapshot field survives in it, and that the value is opaque
+    /// (base64, not readable JSON) — then confirm it still decrypts back.
+    #[test]
+    fn m4_mirror_payload_is_ciphertext_only() {
+        let key = [77u8; 32];
+        let secrets = [
+            "AKIA_FAKE_SECRET_ACCESS_KEY",
+            "/home/alice/private-repo/billing.ts",
+            "do not touch production database",
+            "feature/customer-pii-migration",
+            "commit 9f8e7d6c5b4a",
+        ];
+        let state = json!({
+            "hook_event": "PreCompact",
+            "cwd": secrets[1],
+            "note": secrets[0],
+            "plan": secrets[2],
+            "recovery": { "branch": secrets[3], "last_commit_sha": secrets[4] },
+        });
+
+        let args = build_snapshot_fact_args("session-xyz", &state, &key).unwrap();
+        // The whole serialized args object is what the mirror could read. The
+        // only field carrying snapshot content is `value`; assert no secret (or
+        // any 8+ char alphanumeric run of one) survives anywhere in the payload.
+        // (`private`/`entity`/etc. are the args' own structural field names, not
+        // snapshot content — the >=8 window skips those short collisions.)
+        let synced = args.to_string();
+        for secret in secrets {
+            assert!(
+                !synced.contains(secret),
+                "plaintext `{secret}` leaked into synced payload"
+            );
+            for word in secret.split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() >= 8) {
+                assert!(!synced.contains(word), "fragment `{word}` leaked into synced payload");
+            }
+        }
+        // The value must be opaque: base64, NOT readable JSON.
+        let value = args["value"].as_str().unwrap();
+        assert!(
+            !value.contains('{') && !value.contains(':'),
+            "value must be opaque base64"
+        );
+        // Round-trip proves it is genuine ciphertext of the exact state, not a redaction.
+        let env = snapshot_crypto::Envelope::from_fact_value(value).unwrap();
+        let recovered: Value = serde_json::from_slice(&snapshot_crypto::open(&key, &env).unwrap()).unwrap();
+        assert_eq!(recovered, state);
+    }
+
     #[test]
     fn hosted_sync_active_respects_env_override() {
         let _env = crate::test_support::env_guard();

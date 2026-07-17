@@ -11,8 +11,8 @@ missing or unreachable daemon never blocks tool execution.
 | Subcommand | Hook event | Purpose |
 |---|---|---|
 | `context-monitor` | `PostToolUse` | Read-only loop / file-scope warnings. Surfaces inline via `additionalContext`. **Never writes facts** (CueCrux/CLAUDE.md §11.2). |
-| `pre-compact` | `PreCompact` | Snapshots session state to the Crux daemon via MCP `save_session` before harness compaction. |
-| `session-start` | `SessionStart` | Automates the §11.1 session-boot ritual: `sync_status` + `get_bootstrap("patterns")` with `token_budget=500`. Injects result as `additionalContext`. |
+| `pre-compact` | `PreCompact` | Snapshots session state to the Crux daemon via MCP `save_session` before harness compaction. On a hosted (Pro) node it *also* stores a client-side-encrypted `session_snapshot` fact (see [Hosted encrypted snapshot sync](#hosted-encrypted-snapshot-sync-pro)). |
+| `session-start` | `SessionStart` | Automates the §11.1 session-boot ritual: `sync_status` + `get_bootstrap("patterns")` with `token_budget=500`. Injects result as `additionalContext`. On a `compact`/`resume` boot it also restores the hosted encrypted snapshot from another device. |
 
 ## Build
 
@@ -77,6 +77,50 @@ Add to `.claude/settings.local.json`:
 | `CRUX_HOOK_CONTEXT_MONITOR` | (unset) | Set to `off` to disable PostToolUse warnings. |
 | `CRUX_HOOK_PRE_COMPACT` | (unset) | Set to `off` to disable PreCompact snapshots. |
 | `CRUX_HOOK_SESSION_START` | (unset) | Set to `off` to disable SessionStart bootstrap. |
+| `CRUX_COMPACTION_SYNC` | (unset) | Hosted snapshot sync: `1`/`on` forces it on, `0`/`off` forces off. Unset ⇒ auto (the daemon's `sync_status.configured` decides). |
+| `CRUX_PASSPORT_KEY_PATH` | (unset) | Explicit path to the passport seed used to derive the snapshot key. Falls back to `CORECRUXD_PASSPORT_KEY_PATH`, then `CORECRUXD_DATA_DIR/passport.key`. Read-only; never created by the hook. |
+
+## Hosted encrypted snapshot sync (Pro)
+
+Free tier keeps its local baseline unchanged: `pre-compact` writes
+`save_session` to the local daemon and the [free shell preset](../../integrations/claude-code/compaction-survival/)
+writes `~/.claude/compaction-snapshots/<session_id>.md`. Nothing leaves the
+machine.
+
+On a **Pro / hosted** node (a remote mirror is configured — `sync_status`
+reports `configured: true`) the same `pre-compact` hook *additionally* stores
+the snapshot as a **client-side-encrypted, non-private `session_snapshot`
+fact**. Because `facts` is a synced collection and the fact is non-private, it
+rides the existing per-tenant mirror to the user's other devices — and because
+the value is ciphertext, that is safe. On the other device, a `compact`/`resume`
+`session-start` boot pulls the newest `session_snapshot`, decrypts it locally,
+and re-injects the working state as `additionalContext`.
+
+### "Unreadable to us" guarantee
+
+Only a sealed envelope ever occupies a synced or server-readable field — not the
+value, not the key name, not any metadata. The scheme:
+
+- **AEAD:** XChaCha20-Poly1305 (24-byte extended nonce, fresh random nonce per
+  seal). Authenticated: a wrong key or a tampered byte fails to open.
+- **Key:** derived on demand via `blake3::derive_key("crux/compaction-snapshot/v1", passport_seed)`
+  (`crux_session::LocalPassportKey::derive_subkey`). The input is the ed25519
+  **passport seed**, which never leaves the device — the hosted mirror
+  authenticates with a *separate* bearer token (`CRUX_AGENT_TOKEN`) and never
+  receives the seed, so it cannot derive the key. The derived key is computed on
+  demand, never persisted or logged.
+- **Envelope:** versioned `{v, alg, nonce, ct}`, base64-wrapped into the fact
+  value. Unknown `v`/`alg` are rejected, so the scheme can evolve without
+  breaking stored blobs.
+
+### Same-passport prerequisite
+
+Cross-device restore works **iff both devices carry the same passport seed**
+(`passport.key`) — that is the whole "same passport provisioned on both machines"
+Pro continuity story; there is no key-exchange UX. If device B has a *different*
+seed, the AEAD authentication fails and `session-start` simply skips the restore
+(quiet no-op) — it never errors the session. Free/local users with no seed or no
+mirror skip the hosted path entirely.
 
 ## Heuristics (context-monitor)
 
@@ -126,9 +170,13 @@ Lifecycle-hook design patterns inspired by
 snapshot-and-bootstrap pattern from `hooks/memory-persistence/`.
 
 The Crux integration is original Rust and explicitly diverges from ECC where
-the memory models differ: hooks **never** call `store_fact` (CueCrux/CLAUDE.md
-§11.2), and `$ cost` / `context %` metrics are intentionally out of scope
-because the Claude Code harness does not expose them to hook stdin.
+the memory models differ: hooks do not *reflexively* call `store_fact` on every
+tool use (CueCrux/CLAUDE.md §11.2 — that dilutes recall), and `$ cost` /
+`context %` metrics are intentionally out of scope because the Claude Code
+harness does not expose them to hook stdin. The one deliberate, gated exception
+is the hosted encrypted snapshot: `pre-compact` stores a single
+client-side-encrypted `session_snapshot` fact per compaction, only on a
+configured hosted node — an explicit continuity write, not a reflexive one.
 
 ## Licence
 
