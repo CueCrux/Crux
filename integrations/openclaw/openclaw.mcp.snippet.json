@@ -1,0 +1,12 @@
+{
+  "//": "Merge this block into ~/.openclaw/openclaw.json (or ~/.openclaw/mcp.json). Local-first HTTP transport to your local Crux daemon MCP — no npm/npx dependency, nothing downloaded at runtime. Restart the OpenClaw gateway after editing.",
+  "mcpServers": {
+    "crux": {
+      "type": "http",
+      "url": "http://127.0.0.1:14801/mcp",
+      "headers": {
+        "Authorization": "Bearer ${CRUX_AGENT_TOKEN}"
+      }
+    }
+  }
+}
