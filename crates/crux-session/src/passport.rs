@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use blake3::Hasher;
 use ed25519_dalek::{Signer as DalekSigner, SigningKey};
 use rand::Rng;
+use zeroize::Zeroizing;
 
 use crate::error::SessionError;
 use crate::plan::{Passport, HASH_LEN, SIGNATURE_LEN};
@@ -166,14 +167,17 @@ impl LocalPassportKey {
     /// `LocalPassportKey` instance — callers receive a domain-specific output
     /// they can use as a symmetric key.
     pub fn derive_subkey(&self, context: &str) -> [u8; 32] {
-        let seed = self.signing_key.to_bytes();
-        blake3::derive_key(context, &seed)
+        // `as_bytes()` borrows the seed in place; `to_bytes()` would copy it onto
+        // the stack, leaving an un-zeroized clone behind (crypto-review Finding 3).
+        // Output is identical either way — same bytes into the same BLAKE3 KDF.
+        blake3::derive_key(context, self.signing_key.as_bytes())
     }
 }
 
 fn read_or_init_passport_seed(path: &Path) -> Result<[u8; 32], SessionError> {
     match fs::read_to_string(path) {
-        Ok(content) => parse_passport_seed(path, &content),
+        // Wrap the hex seed string so it is wiped from memory on drop (Finding 3).
+        Ok(content) => parse_passport_seed(path, &Zeroizing::new(content)),
         Err(e) if e.kind() == ErrorKind::NotFound => write_new_passport_seed(path),
         Err(e) => Err(SessionError::Encode(format!("read passport key: {e}"))),
     }
@@ -187,7 +191,10 @@ fn parse_passport_seed(path: &Path, content: &str) -> Result<[u8; 32], SessionEr
             path.display()
         )));
     }
-    let decoded = hex::decode(trimmed)?;
+    // The decoded seed bytes are the raw private key material — zeroize on drop
+    // so only the returned `[u8; 32]` (which flows into the zeroizing SigningKey)
+    // survives (crypto-review Finding 3).
+    let decoded = Zeroizing::new(hex::decode(trimmed)?);
     if decoded.len() != 32 {
         return Err(SessionError::ByteArrayLength {
             field: "passport.key",
@@ -218,7 +225,8 @@ fn write_new_passport_seed(path: &Path) -> Result<[u8; 32], SessionError> {
 
     match options.open(path) {
         Ok(mut file) => {
-            let mut content = hex::encode(seed);
+            // The hex encoding of the seed is sensitive — wipe it on drop (Finding 3).
+            let mut content = Zeroizing::new(hex::encode(seed));
             content.push('\n');
             file.write_all(content.as_bytes())
                 .map_err(|e| SessionError::Encode(format!("write passport key: {e}")))?;
@@ -232,7 +240,7 @@ fn write_new_passport_seed(path: &Path) -> Result<[u8; 32], SessionError> {
             for _ in 0..50 {
                 match fs::read_to_string(path) {
                     Ok(content) if !content.trim().is_empty() => {
-                        return parse_passport_seed(path, &content);
+                        return parse_passport_seed(path, &Zeroizing::new(content));
                     }
                     Ok(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
                     Err(e) if e.kind() == ErrorKind::NotFound => {
@@ -376,6 +384,21 @@ mod tests {
         assert!(key_path.exists());
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn derive_subkey_matches_blake3_over_seed_and_is_domain_separated() {
+        // Guards the as_bytes() change (Finding 3): derive_subkey must stay
+        // byte-identical to blake3::derive_key(context, seed) — the exact value
+        // existing callers (e.g. the corecruxd integration-token key) depend on.
+        let seed = [7_u8; 32];
+        let key = LocalPassportKey::from_seed(seed).unwrap();
+        let expected = blake3::derive_key("integration-token-encryption-v1", &seed);
+        assert_eq!(key.derive_subkey("integration-token-encryption-v1"), expected);
+        // Determinism across instances + domain separation across labels.
+        let key2 = LocalPassportKey::from_seed(seed).unwrap();
+        assert_eq!(key.derive_subkey("ctx-a"), key2.derive_subkey("ctx-a"));
+        assert_ne!(key.derive_subkey("ctx-a"), key.derive_subkey("ctx-b"));
     }
 
     #[test]

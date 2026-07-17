@@ -38,7 +38,8 @@ ed25519-dalek = { workspace = true, features = ["std", "pkcs8"] }
 # and deps only blake3+ed25519-dalek, both already direct deps here) — zero new
 # external crate. crux-session provides LocalPassportKey::derive_subkey (the
 # passport-seed KDF used to derive the snapshot content key).
-chacha20poly1305 = { workspace = true }
+# features=["zeroize"] wipes the AEAD cipher's key material on drop (Finding 3).
+chacha20poly1305 = { workspace = true, features = ["zeroize"] }
 # Zeroize the derived snapshot content key on drop (crypto-review follow-up).
 # zeroize 1.8.x is already in the workspace Cargo.lock (pulled by chacha20poly1305
 # et al.) — version-pinned direct here (not `workspace = true`, no root Cargo.toml
