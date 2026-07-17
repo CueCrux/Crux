@@ -399,7 +399,7 @@ fn default_confidence() -> f32 {
 }
 
 /// Query parameters for fact retrieval.
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
 pub struct FactQuery {
     pub query: Option<String>,
     pub entity: Option<String>,
@@ -425,6 +425,23 @@ pub struct FactQuery {
     /// here so those surfaces can pass it through one query struct.
     #[serde(default)]
     pub min_effective_confidence: Option<f32>,
+}
+
+impl Default for FactQuery {
+    /// `top_k` defaults to [`default_top_k`] (10), matching the serde default —
+    /// so `..Default::default()` construction never silently yields `top_k = 0`.
+    /// Future field adds only need a line here, not an edit at every call site.
+    fn default() -> Self {
+        Self {
+            query: None,
+            entity: None,
+            tenant_hash: None,
+            entity_prefix: None,
+            top_k: default_top_k(),
+            token_budget: None,
+            min_effective_confidence: None,
+        }
+    }
 }
 
 fn default_top_k() -> usize {

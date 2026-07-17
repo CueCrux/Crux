@@ -2593,6 +2593,25 @@ async fn query_facts_min_effective_confidence_floor_filters_and_counts() {
     assert_eq!(body["filtered_below_threshold"], 1);
 }
 
+#[tokio::test]
+async fn query_facts_rejects_out_of_range_floor() {
+    // Finding 5: a floor outside 0..=1 is a 400, not a silent all-filtered result.
+    let state = test_app_state(16);
+    let params = QueryFactsParams {
+        min_effective_confidence: Some(1.5),
+        query: None,
+        entity: None,
+        entity_prefix: None,
+        top_k: None,
+        token_budget: None,
+        as_of: None,
+    };
+    let resp = facts::query_facts(State(state), HeaderMap::new(), Query(params))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
 // ── Case store (POST /v1/cases, /v1/cases/retrieve) ─────────────
 
 #[tokio::test]
@@ -9658,6 +9677,11 @@ async fn console_review_queue_lists_surfaced_expiry_runs() {
     let body = json_body(resp).await;
     assert_eq!(body["schema"], "crux.console.review.queue.v1");
     assert_eq!(body["count"], 1);
+    assert_eq!(body["scheduler_enabled"], false, "flag default-OFF (finding 6)");
+    assert!(
+        body["live_contradictions"].is_array(),
+        "live fallback present (finding 6)"
+    );
     assert_eq!(body["runs"][0]["review"]["expiry_count"], 1);
     assert_eq!(
         body["runs"][0]["review"]["expiry_candidates"][0]["reason"],
@@ -9665,34 +9689,38 @@ async fn console_review_queue_lists_surfaced_expiry_runs() {
     );
 }
 
-#[tokio::test]
-async fn console_review_expiries_soft_deletes_via_mark_retention_eligible() {
-    // Wires the previously-unwired mark_retention_eligible: a fact stored before
-    // the cutoff is soft-deleted by the operator apply endpoint.
-    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
-    let fact_id = {
-        let mut store = state.fact_store.write().await;
-        store
-            .store(corecrux_memory::fact_store::StoreFact {
-                tenant_hash: "default".to_string(),
-                entity: "svc".to_string(),
-                key: "old".to_string(),
-                value: "stale".to_string(),
-                source_receipt: None,
-                confidence: 0.5,
-                private: false,
-                horizon_class: None,
-                actor: None,
-            })
-            .fact_id
-    };
+// Helper: store a fact with an explicit confidence + optional receipt, return id.
+async fn seed_fact(state: &AppState, entity: &str, key: &str, confidence: f32, source_receipt: Option<&str>) -> String {
+    state
+        .fact_store
+        .write()
+        .await
+        .store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: entity.to_string(),
+            key: key.to_string(),
+            value: "v".to_string(),
+            source_receipt: source_receipt.map(str::to_string),
+            confidence,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        })
+        .fact_id
+}
 
-    // Cutoff in the near future ⇒ the just-stored fact is older than it.
-    let before = (chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339();
+#[tokio::test]
+async fn console_review_expiries_soft_deletes_reviewed_candidate() {
+    // A genuine low-confidence candidate, requested by id, is soft-deleted.
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let id = seed_fact(&state, "svc", "flag", 0.1, None).await;
+
     let resp = console::post_console_review_expiries(
         State(state.clone()),
         dev_scope_headers("admin:write"),
-        Json(console::ConsoleExpiryApplyRequest { before }),
+        Json(console::ConsoleExpiryApplyRequest {
+            fact_ids: vec![id.clone()],
+        }),
     )
     .await
     .into_response();
@@ -9700,21 +9728,85 @@ async fn console_review_expiries_soft_deletes_via_mark_retention_eligible() {
     let body = json_body(resp).await;
     assert_eq!(body["schema"], "crux.console.review.expiries.v1");
     assert_eq!(body["expired_count"], 1);
-    assert_eq!(body["expired_fact_ids"][0], fact_id);
-    // The fact is now soft-deleted.
+    assert_eq!(body["expired"][0]["fact_id"], id);
+    assert_eq!(body["expired"][0]["reason"], "low_confidence");
+    assert!(
+        state.fact_store.read().await.get(&id).is_none(),
+        "candidate soft-deleted"
+    );
+}
+
+/// Review findings 1 & 2: the apply must NEVER delete a pinned, receipt-linked,
+/// or fresh/high-confidence fact — even when its id is explicitly requested and
+/// even if it became protected after the proposal was surfaced.
+#[tokio::test]
+async fn console_review_expiries_never_deletes_protected_or_fresh() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    // Genuine candidate (low confidence, no protection) → SHOULD be expired.
+    let victim = seed_fact(&state, "svc", "victim", 0.1, None).await;
+    // Receipt-linked but low confidence → protected, MUST survive.
+    let receipted = seed_fact(&state, "svc", "receipted", 0.1, Some("crown:rcpt-1")).await;
+    // Fresh + high confidence → not a candidate, MUST survive.
+    let fresh = seed_fact(&state, "svc", "fresh", 0.95, None).await;
+    // Low confidence but PINNED → protected, MUST survive. Pin marker is a
+    // `__memory_pin::<scope>::<fact_id>` fact with key "pinned" value "1".
+    let pinned = seed_fact(&state, "svc", "pinned", 0.1, None).await;
+    {
+        let mut store = state.fact_store.write().await;
+        store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: format!("__memory_pin::cli::{pinned}"),
+            key: "pinned".to_string(),
+            value: "1".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+    }
+
+    let resp = console::post_console_review_expiries(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        Json(console::ConsoleExpiryApplyRequest {
+            fact_ids: vec![victim.clone(), receipted.clone(), fresh.clone(), pinned.clone()],
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    // Only the genuine candidate was deleted.
+    assert_eq!(body["expired_count"], 1);
+    assert_eq!(body["expired"][0]["fact_id"], victim);
     let store = state.fact_store.read().await;
-    assert!(store.get(&fact_id).is_none(), "fact soft-deleted");
+    assert!(store.get(&victim).is_none(), "genuine candidate expired");
+    // Every protected / fresh fact survives.
+    assert!(store.get(&receipted).is_some(), "receipt-linked fact survives");
+    assert!(store.get(&fresh).is_some(), "fresh high-confidence fact survives");
+    assert!(store.get(&pinned).is_some(), "pinned fact survives");
+    // …and each is reported as skipped with a reason.
+    let skipped: Vec<&str> = body["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["fact_id"].as_str().unwrap())
+        .collect();
+    for id in [&receipted, &fresh, &pinned] {
+        assert!(skipped.contains(&id.as_str()), "{id} reported skipped");
+    }
 }
 
 #[tokio::test]
-async fn console_review_expiries_rejects_bad_timestamp() {
+async fn console_review_expiries_rejects_empty_fact_ids() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     let resp = console::post_console_review_expiries(
         State(state),
         dev_scope_headers("admin:write"),
-        Json(console::ConsoleExpiryApplyRequest {
-            before: "not-a-time".to_string(),
-        }),
+        Json(console::ConsoleExpiryApplyRequest { fact_ids: vec![] }),
     )
     .await
     .into_response();

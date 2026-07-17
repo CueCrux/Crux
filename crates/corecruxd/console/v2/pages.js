@@ -400,10 +400,18 @@
     if (!res.ok || !res.data) {
       candSec = { h: 'Review queue', wide: true, controls: head.concat(degraded(res.status, 'Review queue unavailable — GET /v1/console/review/queue')) };
     } else {
+      var schedOn = res.data.scheduler_enabled === true;
       var runs = arr(res.data.runs);
-      var rows = head.concat([info('surfaced runs', String(res.data.count || runs.length))]);
+      var rows = head.concat([
+        info('scheduler', schedOn ? 'on (CORECRUXD_CONSOLIDATION_SCHEDULER=1)' : 'off — no proposals will be surfaced'),
+        info('surfaced runs', String(res.data.count || runs.length)),
+      ]);
       if (!runs.length) {
-        rows.push(info('queue empty', 'the consolidation scheduler surfaces contradiction + expiry proposals here when CORECRUXD_CONSOLIDATION_SCHEDULER=1'));
+        // Distinct states: scheduler-off (nothing will be surfaced) vs
+        // scheduler-on-but-empty (a clean store) — review finding 6.
+        rows.push(schedOn
+          ? info('queue empty', 'scheduler is on and the store is currently clean — no contradiction or expiry proposals')
+          : info('scheduler off', 'enable CORECRUXD_CONSOLIDATION_SCHEDULER=1 to surface contradiction + expiry proposals; live contradictions are shown below in the meantime'));
       } else {
         runs.forEach(function (run, i) {
           var rv = run.review || {};
@@ -425,6 +433,20 @@
       }
       candSec = { h: 'Review queue', sub: 'surfaced __consolidation_review__:: runs · read-only · ' + (res.data.count || 0) + ' runs', wide: true, controls: rows };
     }
+    // Live contradiction pass — retained so the console still shows current
+    // contradictions when the scheduler is OFF and nothing has been surfaced
+    // (review finding 6). Read-only.
+    var liveSec = null;
+    if (res.ok && res.data) {
+      var live = arr(res.data.live_contradictions);
+      var liveRows = live.length
+        ? live.map(function (c, i) {
+          return { t: 'exp', label: (c.entity || 'entity') + ' · ' + (c.key || 'key'), sub: (c.reason || 'candidate') + ' · ' + (c.polarity_a || '?') + ' vs ' + (c.polarity_b || '?'), badge: 'live ' + (i + 1),
+            controls: [info('fact ids', arr(c.fact_ids).join(', ') || '—'), info('values', arr(c.values).map(function (v) { return clip(v, 80); }).join(' | ') || '—')] };
+        })
+        : [info('none', 'no active opposite-polarity fact pairs right now')];
+      liveSec = { h: 'Live contradictions', sub: 'read-only live pass · ' + (res.data.live_count || 0) + ' found', wide: true, controls: liveRows };
+    }
     var consSec = { h: 'Consolidation', sub: 'creates one canonical fact and supersedes selected targets; protected facts are rejected', wide: true,
       controls: [
         { t: 'input', k: 'cr_entity', label: 'entity', ph: 'service:api', mono: true, mut: true },
@@ -436,7 +458,7 @@
         { t: 'input', k: 'cr_floor', label: 'protect floor', v: '0.99', mono: true, mut: true },
         mbtn('Consolidate facts', { danger: true, hint: 'writes a canonical fact and supersedes selected target facts' })
       ] };
-    return [candSec, consSec];
+    return liveSec ? [candSec, liveSec, consSec] : [candSec, consSec];
   }
 
   function buildIntegrations(res) {

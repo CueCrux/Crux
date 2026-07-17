@@ -219,6 +219,39 @@ fn drop_below_confidence_floor<T: std::borrow::Borrow<corecrux_memory::fact_stor
     before - facts.len()
 }
 
+/// Apply the `token_budget`-then-`top_k` selection to an already-ranked list
+/// (the same rule `FactStore::query` uses internally): fill by descending rank
+/// until the budget is hit, else truncate to `top_k`. Factored out so the
+/// raw-admin path can filter the FULL matched set BEFORE this cut.
+fn take_within_budget(
+    facts: Vec<corecrux_memory::fact_store::Fact>,
+    token_budget: Option<usize>,
+    top_k: usize,
+) -> Vec<corecrux_memory::fact_store::Fact> {
+    match token_budget {
+        Some(budget) => {
+            let mut used = 0usize;
+            let mut selected = Vec::new();
+            for fact in facts {
+                if used + fact.tokens > budget && !selected.is_empty() {
+                    break;
+                }
+                used += fact.tokens;
+                selected.push(fact);
+                if used >= budget {
+                    break;
+                }
+            }
+            selected
+        }
+        None => {
+            let mut facts = facts;
+            facts.truncate(top_k);
+            facts
+        }
+    }
+}
+
 /// As [`query_visible_http_facts`] but with an optional bi-temporal `as_of`
 /// filter (M1): when set, only facts whose valid-time interval contains the
 /// instant are returned. `None` ⇒ identical to the plain variant. Returns the
@@ -230,15 +263,20 @@ pub(super) fn query_visible_http_facts_as_of(
     as_of: Option<chrono::DateTime<chrono::Utc>>,
 ) -> (Vec<corecrux_memory::fact_store::Fact>, usize) {
     if raw_admin_read(ctx) {
+        // Run the floor filter/count over the FULL matched+ranked set, THEN
+        // apply budget/top_k — so a below-floor row never consumes the window
+        // and the count reflects the whole matched set, matching the scoped
+        // path and the M7 contract (review finding 4).
+        let mut unbounded = q.clone();
+        unbounded.top_k = usize::MAX;
+        unbounded.token_budget = None;
+        unbounded.min_effective_confidence = None;
         let mut facts = match as_of {
-            Some(instant) => store.query_as_of(q, instant).facts,
-            None => store.query(q).facts,
+            Some(instant) => store.query_as_of(&unbounded, instant).facts,
+            None => store.query(&unbounded).facts,
         };
-        // ponytail: raw-admin diagnostic path filters the store-limited set, so
-        // the count reflects below-floor facts within that window, not the whole
-        // corpus. Fine for admin; the scoped path below counts pre-truncation.
         let filtered = drop_below_confidence_floor(&mut facts, q.min_effective_confidence);
-        return (facts, filtered);
+        return (take_within_budget(facts, q.token_budget, q.top_k), filtered);
     }
 
     let agent_name = ctx.passport_id.as_deref();
@@ -527,6 +565,16 @@ pub(super) async fn query_facts(
         Ok(ctx) => ctx,
         Err(response) => return response,
     };
+    // P2 floor must be finite and in 0..=1 (review finding 5) — reject nonsense
+    // rather than silently returning "all kept / all filtered".
+    if let Some(floor) = params.min_effective_confidence {
+        if !crux_mcp::tools::freshness::valid_confidence_floor(floor as f64) {
+            return problem_response(
+                StatusCode::BAD_REQUEST,
+                "min_effective_confidence must be a number in 0.0..=1.0",
+            );
+        }
+    }
     let q = corecrux_memory::fact_store::FactQuery {
         min_effective_confidence: params.min_effective_confidence,
         query: params.query,

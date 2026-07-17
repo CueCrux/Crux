@@ -425,11 +425,23 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
     let top_k = args.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
     let token_budget = args.get("token_budget").and_then(|v| v.as_u64()).map(|v| v as usize);
     // P2 confidence floor: drop facts whose recall-time effective confidence is
-    // below this. Absent ⇒ no floor (behaviour unchanged).
-    let min_effective_confidence = args
-        .get("min_effective_confidence")
-        .and_then(|v| v.as_f64())
-        .map(|v| v as f32);
+    // below this. Absent ⇒ no floor (behaviour unchanged). Validate BEFORE the
+    // f32 cast so an out-of-range / non-finite value is rejected, not silently
+    // turned into "all kept / all filtered".
+    let min_effective_confidence = match args.get("min_effective_confidence") {
+        Some(v) => {
+            let f = v
+                .as_f64()
+                .filter(|f| crate::tools::freshness::valid_confidence_floor(*f))
+                .ok_or_else(|| JsonRpcError {
+                    code: INVALID_PARAMS,
+                    message: "min_effective_confidence must be a number in 0.0..=1.0".to_string(),
+                    data: None,
+                })?;
+            Some(f as f32)
+        }
+        None => None,
+    };
     // M6: superseded (cross-entity retired) facts are hidden from recall by
     // default; opt back in with `include_superseded: true`.
     let include_superseded = args
@@ -1960,6 +1972,17 @@ mod tests {
         let result = handle_query_facts(&json!({"entity": "deploy"}), &ctx).await.unwrap();
         assert_eq!(result["structuredContent"]["rows"].as_array().unwrap().len(), 1);
         assert_eq!(result["structuredContent"]["filtered_below_threshold"], 0);
+    }
+
+    #[tokio::test]
+    async fn query_facts_rejects_out_of_range_floor() {
+        let ctx = test_ctx();
+        for bad in [json!(1.5), json!(-0.1)] {
+            let err = handle_query_facts(&json!({"entity": "deploy", "min_effective_confidence": bad}), &ctx)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, INVALID_PARAMS, "floor {bad} must be rejected");
+        }
     }
 
     #[tokio::test]

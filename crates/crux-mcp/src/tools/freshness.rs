@@ -527,6 +527,15 @@ pub fn projection_class_of(c: HorizonClass) -> decay::HorizonClass {
     }
 }
 
+/// A P2 confidence floor must be a finite value in `0.0..=1.0`. Rejecting an
+/// out-of-range floor (negative, `> 1`, overflowed-to-inf, or NaN) keeps a
+/// nonsense request from silently masquerading as a real "all kept / all
+/// filtered" result — the query surfaces return a param error instead
+/// (M7 review finding 5).
+pub fn valid_confidence_floor(v: f64) -> bool {
+    v.is_finite() && (0.0..=1.0).contains(&v)
+}
+
 /// Recall-time EFFECTIVE confidence of a fact: its STORED confidence, demoted
 /// by the stale factor once the fact has decayed to [`decay::Freshness::Stale`]
 /// (salience-aware, matching the ranking key `query_facts` sorts by). Pure —
