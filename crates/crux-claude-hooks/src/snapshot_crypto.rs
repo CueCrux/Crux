@@ -321,11 +321,11 @@ pub fn bearer_reuses_passport_seed() -> bool {
 #[must_use]
 pub fn derive_snapshot_key() -> Option<Zeroizing<[u8; 32]>> {
     let path = passport_key_path_from_env()?;
-    // Read-only: a missing file means "no hosted key here" → skip, don't mint one.
-    if !path.is_file() {
-        return None;
-    }
-    let key = crux_session::LocalPassportKey::from_path(&path).ok()?;
+    // Strict read-only load: a missing/unreadable file returns None and NEVER
+    // mints a seed. `from_existing_path` does one direct open (Finding 4) — no
+    // `is_file()`+`from_path` TOCTOU that could create a fresh, non-matching seed
+    // if the file vanishes between the check and the open.
+    let key = crux_session::LocalPassportKey::from_existing_path(&path).ok()?;
     Some(Zeroizing::new(key.derive_subkey(SNAPSHOT_KEY_CONTEXT)))
 }
 

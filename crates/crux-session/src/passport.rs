@@ -133,6 +133,23 @@ impl LocalPassportKey {
         Self::from_seed(read_or_init_passport_seed(path)?)
     }
 
+    /// Load the local Passport signing key from an **existing** file, WITHOUT
+    /// ever initialising a new seed. One direct read: a missing (or unreadable)
+    /// file returns an error, unlike [`Self::from_path`], which mints a fresh
+    /// random seed on `NotFound`.
+    ///
+    /// Use this on read-only client paths (e.g. the compaction hook's snapshot
+    /// key) where a `is_file()` pre-check followed by `from_path` is a TOCTOU:
+    /// if the file vanishes in the gap, `from_path` would mint a *different* seed,
+    /// silently breaking cross-device decrypt and handing back a key nobody else
+    /// shares (crypto-review Finding 4).
+    pub fn from_existing_path(path: &Path) -> Result<Self, SessionError> {
+        let content = Zeroizing::new(
+            fs::read_to_string(path).map_err(|e| SessionError::Encode(format!("read passport key: {e}")))?,
+        );
+        Self::from_seed(parse_passport_seed(path, &content)?)
+    }
+
     pub fn from_seed(seed: [u8; 32]) -> Result<Self, SessionError> {
         let signing_key = SigningKey::from_bytes(&seed);
         let verifying_key = signing_key.verifying_key();
@@ -399,6 +416,25 @@ mod tests {
         let key2 = LocalPassportKey::from_seed(seed).unwrap();
         assert_eq!(key.derive_subkey("ctx-a"), key2.derive_subkey("ctx-a"));
         assert_ne!(key.derive_subkey("ctx-a"), key.derive_subkey("ctx-b"));
+    }
+
+    #[test]
+    fn from_existing_path_does_not_mint_on_missing_file() {
+        // Finding 4: a missing file must error WITHOUT creating a seed (no TOCTOU
+        // mint of a fresh, non-matching key).
+        let tmp = std::env::temp_dir().join(format!("crux-session-fe-{}", rand::random::<u64>()));
+        let key_path = tmp.join("passport.key");
+        assert!(LocalPassportKey::from_existing_path(&key_path).is_err());
+        assert!(!key_path.exists(), "from_existing_path must not create a seed file");
+
+        // Once a seed exists (via the minting loader), from_existing_path loads it
+        // and matches — same identity, no re-mint.
+        let minted = LocalPassportKey::from_path(&key_path).unwrap();
+        let loaded = LocalPassportKey::from_existing_path(&key_path).unwrap();
+        assert_eq!(minted.public_key_hex(), loaded.public_key_hex());
+        assert_eq!(minted.passport_fpr(), loaded.passport_fpr());
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
