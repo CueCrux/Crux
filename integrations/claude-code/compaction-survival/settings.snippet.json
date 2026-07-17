@@ -1,0 +1,21 @@
+{
+  "_comment": "Compaction-survival preset for Claude Code. Merge the 'hooks' block into your ~/.claude/settings.json (merge per-event if you already have a hooks block). Adjust the command paths to wherever you copied snapshot.sh / restore.sh. Both scripts are fire-and-forget and never block compaction. Requires 'jq' on PATH.",
+  "hooks": {
+    "PreCompact": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "/usr/local/share/crux/integrations/claude-code/compaction-survival/snapshot.sh" }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "/usr/local/share/crux/integrations/claude-code/compaction-survival/restore.sh" }
+        ]
+      }
+    ]
+  }
+}
