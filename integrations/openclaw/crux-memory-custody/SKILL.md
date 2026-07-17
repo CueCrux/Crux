@@ -12,9 +12,9 @@ metadata:
         - CRUX_AGENT_TOKEN
       bins:
         - corecruxctl
+      config:
+        - mcp.servers.crux
     primaryEnv: CRUX_AGENT_TOKEN
-    mcpServers:
-      - crux
 ---
 
 # Crux memory custody

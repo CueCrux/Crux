@@ -1118,30 +1118,36 @@ enum OpenclawCommand {
     Import {
         /// OpenClaw workspace directory (e.g. ~/.openclaw/workspace).
         path: PathBuf,
-        /// Crux Daemon HTTP base URL.
-        #[arg(long, default_value = "http://127.0.0.1:14800")]
-        daemon_url: String,
+        /// Crux Daemon HTTP base URL (default: $CORECRUXD_HTTP_URL or
+        /// http://127.0.0.1:14800).
+        #[arg(long)]
+        daemon_url: Option<String>,
         /// Parse + report only; write nothing.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
     /// Scan an already-imported store and emit a markdown memory-scan report:
-    /// per-memory provenance, apocryphal/unreceipted mutations flagged, and a
-    /// staleness summary.
+    /// per-memory provenance, content-hash verification against the live
+    /// workspace, injected-instruction + integrity findings, and staleness.
     Scan {
-        /// Crux Daemon HTTP base URL.
-        #[arg(long, default_value = "http://127.0.0.1:14800")]
-        daemon_url: String,
+        /// Crux Daemon HTTP base URL (default: $CORECRUXD_HTTP_URL or
+        /// http://127.0.0.1:14800).
+        #[arg(long)]
+        daemon_url: Option<String>,
+        /// Live OpenClaw workspace to verify each memory's content hash against
+        /// (the authoritative tamper signal). Omit for a store-only advisory scan.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
         /// Write the report to a file instead of stdout.
         #[arg(long)]
         out: Option<PathBuf>,
         /// Days a daily log may be modified past its declared date before the
-        /// change is treated as an unreceipted mutation.
+        /// change is advisory-flagged as a timestamp anomaly.
         #[arg(long, default_value_t = corecruxctl::openclaw::DEFAULT_MUTATION_GRACE_DAYS)]
-        mutation_grace_days: i64,
+        mutation_grace_days: u32,
         /// Age (days) past which a memory's declared date is called stale.
         #[arg(long, default_value_t = corecruxctl::openclaw::DEFAULT_STALE_DAYS)]
-        stale_days: i64,
+        stale_days: u32,
     },
 }
 
@@ -4045,11 +4051,13 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }),
             OpenclawCommand::Scan {
                 daemon_url,
+                workspace,
                 out,
                 mutation_grace_days,
                 stale_days,
             } => openclaw::scan_run(&openclaw::ScanOptions {
                 daemon_url,
+                workspace,
                 out,
                 grace_days: mutation_grace_days,
                 stale_days,

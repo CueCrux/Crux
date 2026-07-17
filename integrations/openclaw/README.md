@@ -13,9 +13,11 @@ imported and scanned for MemGhost-style poisoning with `corecruxctl openclaw`.
   [Agent Skill](https://docs.openclaw.ai/clawhub/skill-format): YAML frontmatter
   + instructions that tell an OpenClaw agent to write/recall durable memory
   through the `crux` MCP server, and to run the import/scan on demand.
-- [`openclaw.mcp.snippet.json`](openclaw.mcp.snippet.json) — the `mcpServers`
-  block to merge into `~/.openclaw/openclaw.json`, wiring the `crux` MCP server
-  to your **local** daemon.
+- [`openclaw.mcp.snippet.json`](openclaw.mcp.snippet.json) — the
+  `mcp.servers.crux` block (canonical `transport: "streamable-http"` shape, per
+  [docs/cli/mcp.md](https://github.com/openclaw/openclaw/blob/main/docs/cli/mcp.md))
+  to merge into `~/.openclaw/openclaw.json`, wiring the `crux` MCP server to your
+  **local** daemon.
 
 ## Install
 
@@ -28,7 +30,9 @@ imported and scanned for MemGhost-style poisoning with `corecruxctl openclaw`.
    (published skills are MIT-0).
 4. Seed the store from your existing memory:
    `corecruxctl openclaw import ~/.openclaw/workspace` then
-   `corecruxctl openclaw scan`.
+   `corecruxctl openclaw scan --workspace ~/.openclaw/workspace` (the
+   `--workspace` flag lets the scan verify each memory's content hash against the
+   live files — the authoritative tamper signal).
 
 ## Supply-chain rule (binding)
 
@@ -53,9 +57,9 @@ npm install -g mcp-remote@<pinned-reviewed-version>   # never -y / @latest
 
 ## Skeleton limitations (operator to-do)
 
-- Transport is assumed to be OpenClaw's `type: "http"` MCP support; confirm on
-  your build (tracked upstream at openclaw/openclaw#43509) — otherwise use the
-  pinned stdio bridge above.
+- Uses OpenClaw's `mcp.servers` + `transport: "streamable-http"` HTTP support;
+  confirm on your build (config support tracked upstream at
+  openclaw/openclaw#43509) — otherwise use the pinned stdio bridge above.
 - Not yet published to ClawHub (publishing needs an account + passport-signed
   release); this is a local skeleton for review.
 - The skill instructs the agent to *dual-write* durable memories to Crux; it does
