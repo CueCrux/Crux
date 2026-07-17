@@ -1609,13 +1609,17 @@ impl FactStore {
 
     /// Mark facts whose `stored_at` is older than `cutoff` as deletion-eligible
     /// (retention sweep — W2.E2). Soft-deletes each matching live fact via the
-    /// journaled [`Self::delete`] path (so the deletion survives a restart and a
-    /// later [`Self::compact_journal`] pass removes the content). Private facts
-    /// and the structured `__sync_tombstone__::` records are left alone.
+    /// journaled, **fallible** [`Self::try_delete`] path (so the deletion
+    /// survives a restart and a later [`Self::compact_journal`] pass removes the
+    /// content). Private facts and the structured `__sync_tombstone__::` records
+    /// are left alone.
     ///
-    /// Returns the fact_ids that were newly marked deleted. This only *marks*;
-    /// the content is not removed from disk until `compact_journal` runs, which
-    /// the caller invokes explicitly.
+    /// Returns the fact_ids that were **actually** newly marked deleted — a fact
+    /// whose journal append fails is logged (never silently swallowed) and
+    /// excluded from the result, so a caller's retention receipt count reflects
+    /// only durably-tombstoned facts. This only *marks*; the content is not
+    /// removed from disk until `compact_journal` runs, which the caller invokes
+    /// explicitly.
     pub fn mark_retention_eligible(&mut self, cutoff: DateTime<Utc>) -> Vec<String> {
         let holds = self.active_legal_holds();
         let to_delete: Vec<String> = self
@@ -1626,10 +1630,17 @@ impl FactStore {
             .filter(|f| !holds.iter().any(|hold| hold.covers_fact(f)))
             .map(|f| f.fact_id.clone())
             .collect();
+        let mut deleted = Vec::with_capacity(to_delete.len());
         for fact_id in &to_delete {
-            self.delete(fact_id);
+            match self.try_delete(fact_id) {
+                Ok(true) => deleted.push(fact_id.clone()),
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::error!(?err, %fact_id, "retention sweep: journaled delete failed; fact NOT marked");
+                }
+            }
         }
-        to_delete
+        deleted
     }
 
     /// Insert a fact directly with its original identity (fact_id, version,

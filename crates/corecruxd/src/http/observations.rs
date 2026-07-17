@@ -15,6 +15,7 @@
 //! with no API break (see ExecPlan §Migration).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -439,7 +440,7 @@ fn sanitize_session_id_for_filename(session_id: &str) -> String {
         .collect()
 }
 
-pub(super) fn observation_file_path(data_dir: &Path, scoped_session_id: &str) -> PathBuf {
+pub(crate) fn observation_file_path(data_dir: &Path, scoped_session_id: &str) -> PathBuf {
     let filename = format!("{}.jsonl", sanitize_session_id_for_filename(scoped_session_id));
     observations_dir(data_dir).join(filename)
 }
@@ -653,33 +654,70 @@ pub(super) fn append_one(
     append_one_unlocked(state, scoped_session_id, principal, body, chain_tip)
 }
 
-/// Mint a signed governance CROWN receipt over `payload` under the reserved
-/// `session` (e.g. `__governance__::erasure`, `__governance__::gc`), returning
-/// the `observation_id` on success. **Best-effort**: the mutation being
-/// recorded is already durable, so a missing passport key or append failure
-/// logs a warning and returns `None` rather than failing the caller — mirrors
-/// `mint_consolidation_receipt`. P4/M6: the shared minting path for the
-/// erasure (admin) and ephemeral-GC (background) receipt records.
+/// Process-wide count of governance receipt mint failures (audit debt). A
+/// non-zero value means a durable mutation happened whose CROWN receipt did
+/// NOT get signed/appended — the T.4 silent-gap this milestone exists to close
+/// must never be silent. On failure we also log at ERROR and (for the erasure
+/// request path) surface `receiptStatus: "pending"`.
 ///
-/// The caller is responsible for the redaction invariant: `payload` must carry
-/// counts + actor + reason ONLY, never erased fact content.
-pub(crate) fn mint_governance_receipt(
+/// TODO(P4-followup): promote this to a scraped Prometheus counter and back it
+/// with a durable pending-receipt outbox + retry-until-signed queue so debt is
+/// eventually reconciled, not merely counted (design note in
+/// `docs/receipts-mutation-path-audit-2026-07.md`).
+static RECEIPT_MINT_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// Read the audit-debt counter (test accessor today; promoted to a scraped
+/// Prometheus counter in follow-up F-1).
+#[cfg(test)]
+pub(crate) fn receipt_mint_failures() -> u64 {
+    RECEIPT_MINT_FAILURES.load(Ordering::Relaxed)
+}
+
+/// Mint a signed governance CROWN receipt over a **typed** `payload` under the
+/// reserved `session` (e.g. `__governance__::erasure`, `__governance__::gc`),
+/// returning the `observation_id` on success. Uses the **fsynced** durable
+/// append so the receipt is crash-durable before success is reported.
+///
+/// On any failure (encode / missing passport key / append) it increments the
+/// audit-debt counter and logs at ERROR, then returns `None`. `None` means
+/// "receipt PENDING", never a silent OK — the caller MUST surface it. We do
+/// not fail the caller: the mutation (e.g. a GDPR erasure) has already been
+/// applied and must not be rolled back or blocked for the sake of the audit
+/// record — but the debt is made loud.
+///
+/// The caller owns the redaction invariant: `payload` is a typed struct
+/// carrying counts + bounded reason-code + opaque ids ONLY, never erased
+/// content or operator free-text.
+pub(crate) fn mint_governance_receipt<P: Serialize>(
     state: &AppState,
     session: &str,
     actor: &str,
     kind: &str,
-    payload: serde_json::Value,
+    payload: &P,
 ) -> Option<String> {
+    let payload = match serde_json::to_value(payload) {
+        Ok(v) => v,
+        Err(err) => {
+            RECEIPT_MINT_FAILURES.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(session, %err, "AUDIT DEBT: governance receipt payload encode failed; receipt pending");
+            return None;
+        }
+    };
     let body = PostObservationBody {
         kind: kind.to_string(),
         provider: "corecruxd".to_string(),
         client_ts: None,
         payload,
     };
-    match append_one(state, session, actor, body, None) {
+    match append_one_durable(state, session, actor, body, None) {
         Ok((resp, _)) => Some(resp.observation_id),
         Err((_, detail)) => {
-            tracing::warn!(session, reason = %detail, "governance receipt mint failed (best-effort; mutation already durable)");
+            RECEIPT_MINT_FAILURES.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                session,
+                reason = %detail,
+                "AUDIT DEBT: governance receipt mint failed; mutation already applied, receipt pending"
+            );
             None
         }
     }

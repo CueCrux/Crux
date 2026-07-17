@@ -426,29 +426,49 @@ pub(super) fn sync_control_metrics(metrics: &Metrics, control: &control::Control
     metrics.set_throttle_ratio(1.0);
 }
 
-/// Build the P4/M6 erasure receipt payload. Counts + reason ONLY — never the
-/// content of any erased fact. Redaction is guaranteed by construction: the
-/// builder receives a [`CompactionReport`] (counts) and the operator's reason
-/// string, not facts. `reason` is the operator's stated justification (required
-/// on the compact-facts action), not erased content. Redaction-tested in
-/// `compact_facts_tests`.
-fn build_erasure_receipt_payload(
-    report: &corecrux_memory::fact_store::CompactionReport,
+/// P4/M6 erasure receipt — a **typed** payload carrying counts + a bounded
+/// reason-CODE + an opaque operation id ONLY. Deliberately excludes:
+/// - the operator's free-text `reason` (unbounded, caller-controlled → could
+///   carry PII/erased values; it stays in the local tracing log, never signed);
+/// - `facts_retained` (full-store live count → leaks store cardinality); we
+///   keep only `facts_dropped` (== erased count) + `retention_marked`.
+///
+/// Redaction is guaranteed by construction: no field can hold fact content.
+#[derive(serde::Serialize)]
+struct ErasureReceiptV1<'a> {
+    schema: &'a str,
+    op: &'a str,
+    /// Bounded set: `gdpr_full_tenant_erasure` | `retention_sweep` | `operator_compaction`.
+    reason_code: &'a str,
+    /// Opaque, server-generated admin-action id — not operator text.
+    action_id: &'a str,
+    facts_dropped: usize,
     retention_marked: usize,
     retention_days: Option<u32>,
-    reason: &str,
-) -> serde_json::Value {
-    serde_json::json!({
-        "schema": "crux.erasure_receipt.v1",
-        "op": "compact_facts",
-        "facts_dropped": report.facts_dropped,
-        "facts_retained": report.facts_retained,
-        "tombstones_kept": report.tombstones_kept,
-        "retention_marked": retention_marked,
-        "retention_days": retention_days,
-        "reason": reason,
-        "recorded_at": chrono::Utc::now().to_rfc3339(),
-    })
+    /// `completed` | `failed` (partial: retention marks applied, compaction failed).
+    compaction: &'a str,
+    recorded_at: String,
+}
+
+fn build_erasure_receipt<'a>(
+    facts_dropped: usize,
+    retention_marked: usize,
+    retention_days: Option<u32>,
+    reason_code: &'a str,
+    action_id: &'a str,
+    compaction: &'a str,
+) -> ErasureReceiptV1<'a> {
+    ErasureReceiptV1 {
+        schema: "crux.erasure_receipt.v1",
+        op: "compact_facts",
+        reason_code,
+        action_id,
+        facts_dropped,
+        retention_marked,
+        retention_days,
+        compaction,
+        recorded_at: chrono::Utc::now().to_rfc3339(),
+    }
 }
 
 pub(super) async fn execute_admin_action(
@@ -1089,6 +1109,14 @@ pub(super) async fn execute_admin_action(
                 .map(str::to_string)
                 .or_else(|| auth_context.and_then(|context| context.subject.clone()))
                 .unwrap_or_else(|| state.passport_fpr.clone());
+            // Bounded reason-CODE for the signed receipt (never the free-text reason).
+            let reason_code = if gdpr_full_tenant_erasure {
+                "gdpr_full_tenant_erasure"
+            } else if apply_retention {
+                "retention_sweep"
+            } else {
+                "operator_compaction"
+            };
 
             // Mark-then-compact under a single write lock so the on-disk journal
             // reflects exactly the marks we just made.
@@ -1120,10 +1148,32 @@ pub(super) async fn execute_admin_action(
                     }
                 }
                 if covered.is_empty() {
-                    let report = store
-                        .compact_journal()
-                        .map_err(|e| admin_action_error(format!("journal compaction failed: {e}")))?;
-                    (report, None)
+                    match store.compact_journal() {
+                        Ok(report) => (report, None),
+                        Err(e) => {
+                            // The retention soft-deletes (if any) already
+                            // happened; don't lose their audit record just
+                            // because the follow-on compaction failed. Emit a
+                            // partial (compaction=failed) erasure receipt, then
+                            // propagate the error.
+                            drop(store);
+                            super::observations::mint_governance_receipt(
+                                state,
+                                "__governance__::erasure",
+                                &actor,
+                                "erasure.compact_facts",
+                                &build_erasure_receipt(
+                                    0,
+                                    retention_marked.len(),
+                                    retention_days_used,
+                                    reason_code,
+                                    action_id,
+                                    "failed",
+                                ),
+                            );
+                            return Err(admin_action_error(format!("journal compaction failed: {e}")));
+                        }
+                    }
                 } else {
                     let tenant_id = read_param_str(params, "tenantId")
                         .or_else(|| read_param_str(params, "tenant_id"))
@@ -1179,21 +1229,32 @@ pub(super) async fn execute_admin_action(
                 }
             };
 
-            // P4/M6: signed CROWN erasure receipt on the ordinary path (the
-            // legal-hold-override path already minted a durable
-            // `legal_hold_overridden` receipt covering the same compaction).
-            // Records counts + actor + reason ONLY — never erased content
-            // (redaction-tested). Best-effort: the erasure is already durable.
-            let erasure_receipt_id = if legal_hold_override_receipt.is_none() {
-                super::observations::mint_governance_receipt(
-                    state,
-                    "__governance__::erasure",
-                    &actor,
-                    "erasure.compact_facts",
-                    build_erasure_receipt_payload(&report, retention_marked.len(), retention_days_used, &reason),
-                )
+            // P4/M6: signed CROWN erasure receipt — minted on BOTH the ordinary
+            // and the legal-hold-override paths (the override's
+            // `legal_hold_overridden` receipt is separate authorization
+            // evidence; this count-only governance receipt always accompanies
+            // it). Records counts + reason-code + opaque action_id ONLY — never
+            // erased content or operator free-text. `None` ⇒ receipt PENDING
+            // (loud audit debt, never a silent OK); the erasure itself already
+            // succeeded and is not rolled back.
+            let erasure_receipt_id = super::observations::mint_governance_receipt(
+                state,
+                "__governance__::erasure",
+                &actor,
+                "erasure.compact_facts",
+                &build_erasure_receipt(
+                    report.facts_dropped,
+                    retention_marked.len(),
+                    retention_days_used,
+                    reason_code,
+                    action_id,
+                    "completed",
+                ),
+            );
+            let receipt_status = if erasure_receipt_id.is_some() {
+                "recorded"
             } else {
-                None
+                "pending"
             };
 
             let took_ms = started.elapsed().as_millis() as u64;
@@ -1227,6 +1288,7 @@ pub(super) async fn execute_admin_action(
                     "legalHoldOverrideReceiptRecordId": legal_hold_override_receipt.as_ref().map(|receipt| &receipt.observation_id),
                     "legalHoldOverrideReceipt": legal_hold_override_receipt.as_ref().map(|receipt| &receipt.receipt),
                     "erasureReceiptRecordId": erasure_receipt_id,
+                    "receiptStatus": receipt_status,
                     "tookMs": took_ms,
                 }),
                 mutation_event_id: None,
@@ -2646,23 +2708,27 @@ mod compact_facts_tests {
         assert!(raw.contains("keep-this"));
     }
 
-    /// P4/M6: the erasure builder carries counts + reason ONLY. Even when a
-    /// caller has just erased a fact whose value was a secret, that secret can
-    /// never reach the payload — the builder never receives fact content.
+    /// P4/M6 + review-fix finding 2: the erasure receipt carries a bounded
+    /// reason-code + opaque action id + counts ONLY — no operator free-text, no
+    /// full-store cardinality, and structurally no fact content.
     #[test]
-    fn erasure_receipt_payload_is_content_free() {
-        let report = corecrux_memory::fact_store::CompactionReport {
-            facts_dropped: 3,
-            facts_retained: 5,
-            tombstones_kept: 3,
-        };
-        let payload = build_erasure_receipt_payload(&report, 2, Some(90), "gdpr rtbf request #42");
+    fn erasure_receipt_is_content_and_freetext_free() {
+        let receipt = build_erasure_receipt(3, 2, Some(90), "gdpr_full_tenant_erasure", "act-xyz", "completed");
+        let payload = serde_json::to_value(&receipt).unwrap();
         let s = payload.to_string();
         assert_eq!(payload["facts_dropped"], 3);
         assert_eq!(payload["retention_marked"], 2);
         assert_eq!(payload["retention_days"], 90);
-        // The erased fact's value would have been something like this; it is
-        // structurally impossible for it to appear (the builder takes counts).
+        assert_eq!(payload["reason_code"], "gdpr_full_tenant_erasure");
+        assert_eq!(payload["action_id"], "act-xyz");
+        assert!(
+            payload.get("facts_retained").is_none(),
+            "store cardinality must not be exposed"
+        );
+        assert!(
+            payload.get("reason").is_none(),
+            "operator free-text reason must not be signed"
+        );
         assert!(
             !s.contains("TOPSECRET_ERASED_PAYLOAD"),
             "no erased content in receipt: {s}"
@@ -2692,24 +2758,91 @@ mod compact_facts_tests {
             .await
             .expect("compact-facts action succeeds");
 
-        // A signed erasure receipt was minted.
+        // A signed erasure receipt was minted and reported as recorded.
         let receipt_id = result.result["erasureReceiptRecordId"]
             .as_str()
             .expect("erasure receipt minted");
         assert!(!receipt_id.is_empty());
+        assert_eq!(result.result["receiptStatus"], "recorded");
 
-        // Sweep the whole daemon data dir: the receipt records the counts + kind
-        // but no file (receipt or otherwise) may contain the erased secret.
+        // Sweep the whole daemon data dir: no file (receipt or otherwise) may
+        // contain the erased secret OR the operator's free-text reason.
         let mut saw_receipt = false;
         for entry in walk_files(&state.data_dir) {
             let body = std::fs::read_to_string(&entry).unwrap_or_default();
             assert!(!body.contains(SECRET), "erased secret leaked into {}", entry.display());
+            assert!(
+                !body.contains("gdpr-erasure-test"),
+                "operator free-text reason leaked into {}",
+                entry.display()
+            );
             if body.contains("erasure.compact_facts") {
                 saw_receipt = true;
                 assert!(body.contains("\"facts_dropped\":1"), "receipt records the drop count");
+                assert!(
+                    body.contains("\"reason_code\":\"operator_compaction\""),
+                    "bounded reason-code present"
+                );
             }
         }
         assert!(saw_receipt, "erasure receipt file written under data dir");
+    }
+
+    /// Review-fix finding 5 (verifier interop): a minted erasure receipt is
+    /// verifiable through the supported observation-signature path — recompute
+    /// the canonical body and check the Ed25519 signature against the daemon
+    /// passport public key. (Generic dataplane `receipt_verify` indexing of
+    /// governance observations is a documented follow-up.)
+    #[tokio::test]
+    async fn erasure_receipt_verifies_through_observation_signature_path() {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = crate::http::tests::test_app_state_with_auth(4, crate::auth::AuthMode::DevScopes);
+        let key = crux_session::LocalPassportKey::from_path(&state.passport_key_path).unwrap();
+        state.passport_fpr = key.passport_fpr().to_string();
+        state.passport_public_key_hex = key.public_key_hex().to_string();
+
+        let mut fs = FactStore::with_persistence(dir.path()).unwrap();
+        let d = fs.store(store_fact("verify-me-then-erase"));
+        fs.delete(&d.fact_id);
+        state.fact_store = std::sync::Arc::new(tokio::sync::RwLock::new(fs));
+
+        let params = serde_json::json!({ "reason": "verify-test" });
+        execute_admin_action(&state, "act-v", "compact-facts", Some(&params), None, None, None)
+            .await
+            .expect("compact-facts succeeds");
+
+        // Read the governance erasure observation record back and verify it.
+        let file = crate::http::observations::observation_file_path(&state.data_dir, "__governance__::erasure");
+        let line = std::fs::read_to_string(&file)
+            .unwrap()
+            .lines()
+            .next_back()
+            .expect("one erasure record")
+            .to_string();
+        let record: crate::http::observations::ObservationRecordV1 = serde_json::from_str(&line).unwrap();
+        assert_eq!(record.kind, "erasure.compact_facts");
+
+        // Recompute the canonical body (receipt envelope blanked) and verify the
+        // signature against the published passport public key.
+        let sig_hex = record.receipt.signature.clone();
+        let mut unsigned = record;
+        unsigned.receipt = crate::http::observations::ReceiptEnvelopeV1 {
+            alg: String::new(),
+            signed_by: String::new(),
+            body_hash: String::new(),
+            signature: String::new(),
+        };
+        let body = crate::http::observations::canonical_body_bytes(&unsigned).unwrap();
+        let hash = blake3::hash(&body);
+        let pk = VerifyingKey::from_bytes(
+            &<[u8; 32]>::try_from(hex::decode(&state.passport_public_key_hex).unwrap().as_slice()).unwrap(),
+        )
+        .unwrap();
+        let sig = Signature::from_slice(&hex::decode(&sig_hex).unwrap()).unwrap();
+        pk.verify(hash.as_bytes(), &sig)
+            .expect("erasure receipt verifies against passport key");
     }
 
     /// Depth-first list of regular files under `root` (small test tree).
@@ -2728,6 +2861,29 @@ mod compact_facts_tests {
             }
         }
         out
+    }
+
+    /// Review-fix finding 1/7: a mint failure is LOUD — returns None (⇒ the
+    /// caller surfaces `receiptStatus: "pending"`) and increments the shared
+    /// audit-debt counter. Never a silent drop.
+    #[tokio::test]
+    async fn governance_receipt_failure_is_counted_not_silent() {
+        let mut state = crate::http::tests::test_app_state_with_auth(4, crate::auth::AuthMode::DevScopes);
+        // Force a signer mismatch so minting fails deterministically.
+        state.passport_fpr = "fpr:bogus-mismatch-does-not-match-key".to_string();
+        let before = crate::http::observations::receipt_mint_failures();
+        let out = crate::http::observations::mint_governance_receipt(
+            &state,
+            "__governance__::erasure",
+            "actor:test",
+            "erasure.compact_facts",
+            &build_erasure_receipt(1, 0, None, "operator_compaction", "act-f", "completed"),
+        );
+        assert!(out.is_none(), "mint must fail with a bogus signer");
+        assert!(
+            crate::http::observations::receipt_mint_failures() > before,
+            "mint failure must increment the audit-debt counter (no silent drop)"
+        );
     }
 
     #[tokio::test]

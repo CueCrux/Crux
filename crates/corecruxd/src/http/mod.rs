@@ -1754,4 +1754,4 @@ pub(crate) fn hex32(bytes: &[u8; 32]) -> String {
 
 #[cfg(test)]
 #[path = "tests.rs"]
-mod tests;
+pub(crate) mod tests;
