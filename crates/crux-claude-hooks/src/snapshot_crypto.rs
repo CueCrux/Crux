@@ -23,11 +23,20 @@
 //! Same passport seed on both devices (the "same passport provisioned on both
 //! machines" prerequisite) ⇒ same derived key ⇒ cross-device decrypt. A
 //! different seed ⇒ AEAD authentication fails ⇒ the caller skips quietly.
+//!
+//! - **AAD binding (envelope v2):** every seal/open binds canonical
+//!   additional-authenticated-data `{v, alg, entity, session_id}`. This ties a
+//!   ciphertext to the exact fact carrier and the session it was sealed under,
+//!   so a value moved under a different fact key, a different entity, or a
+//!   different scheme fails authentication (replay / cross-session substitution
+//!   defence — crypto-review Finding 2). The AAD is reconstructed identically on
+//!   `open` from the validated `v`/`alg`, the constant entity, and the caller's
+//!   `session_id`; a mismatch is indistinguishable from a wrong key (auth fail).
 
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
-use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rand::Rng as _;
 use serde::{Deserialize, Serialize};
@@ -39,11 +48,19 @@ use zeroize::Zeroizing;
 pub const SNAPSHOT_ENTITY: &str = "session_snapshot";
 
 /// Domain-separation label for the snapshot content key (BLAKE3 KDF context).
-/// The version suffix moves only alongside an [`ENVELOPE_V`] bump.
+/// The `v1` suffix tracks the *key-derivation* scheme, which is unchanged: it
+/// moves only if the seed→key derivation changes, NOT when [`ENVELOPE_V`] bumps
+/// (the v1→v2 envelope bump added AAD binding but did not touch the KDF, so the
+/// derived key — and any device pairing — stays stable).
 pub const SNAPSHOT_KEY_CONTEXT: &str = "crux/compaction-snapshot/v1";
 
 /// Current envelope version. [`open`] rejects anything else.
-pub const ENVELOPE_V: u8 = 1;
+///
+/// v2 (crypto-review Finding 2) binds canonical AAD `{v, alg, entity,
+/// session_id}` into the AEAD. v1 (no AAD) is intentionally unreadable by this
+/// build — there are no persisted v1 blobs in prod (the feature was never
+/// enabled), so no migration path is needed.
+pub const ENVELOPE_V: u8 = 2;
 
 /// AEAD algorithm tag carried in the envelope. [`open`] rejects anything else.
 pub const ENVELOPE_ALG: &str = "xchacha20poly1305";
@@ -114,20 +131,53 @@ impl Envelope {
     }
 }
 
-/// Seal `plaintext` under `key` with a fresh random nonce.
+/// Canonical additional-authenticated-data for a snapshot envelope, binding the
+/// ciphertext to the scheme (`v`, `alg`), the fact carrier (`entity`), and the
+/// session it was sealed under (`session_id`). Serialized deterministically
+/// (fixed struct-field order, no maps) so `seal` and `open` produce identical
+/// bytes for the same inputs.
+#[derive(Serialize)]
+struct SnapshotAad<'a> {
+    v: u8,
+    alg: &'a str,
+    entity: &'a str,
+    session_id: &'a str,
+}
+
+/// Build the canonical AAD bytes for `session_id` under the current scheme.
+fn snapshot_aad(session_id: &str) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&SnapshotAad {
+        v: ENVELOPE_V,
+        alg: ENVELOPE_ALG,
+        entity: SNAPSHOT_ENTITY,
+        session_id,
+    })
+}
+
+/// Seal `plaintext` under `key` with a fresh random nonce, binding canonical AAD
+/// `{v, alg, entity, session_id}` (envelope v2). `session_id` is the identifier
+/// the envelope is scoped to (the fact key it will be stored under); `open` must
+/// be given the same `session_id` or authentication fails.
 ///
 /// # Errors
-/// Returns an error only if the AEAD encrypt fails (allocation/programmer
-/// error); the hook treats this as best-effort and skips the hosted store.
-pub fn seal(key: &[u8; 32], plaintext: &[u8]) -> anyhow::Result<Envelope> {
+/// Returns an error only if AAD serialization or the AEAD encrypt fails
+/// (allocation/programmer error); the hook treats this as best-effort and skips.
+pub fn seal(key: &[u8; 32], session_id: &str, plaintext: &[u8]) -> anyhow::Result<Envelope> {
     let cipher = XChaCha20Poly1305::new(key.into());
     let mut nonce_bytes = [0u8; NONCE_BYTES];
     rand::rng().fill_bytes(&mut nonce_bytes);
     // `nonce_bytes` is a fixed 24-byte array, so `try_from` never errors here;
     // handled as a Result anyway to stay panic/expect-free (crate lints deny both).
     let nonce = XNonce::try_from(&nonce_bytes[..]).map_err(|_| anyhow::anyhow!("snapshot seal: nonce length"))?;
+    let aad = snapshot_aad(session_id).map_err(|e| anyhow::anyhow!("snapshot seal: aad: {e}"))?;
     let ct = cipher
-        .encrypt(&nonce, plaintext)
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
         .map_err(|_| anyhow::anyhow!("snapshot seal: AEAD encrypt failed"))?;
     Ok(Envelope {
         v: ENVELOPE_V,
@@ -137,13 +187,17 @@ pub fn seal(key: &[u8; 32], plaintext: &[u8]) -> anyhow::Result<Envelope> {
     })
 }
 
-/// Open `envelope` under `key`, returning the recovered plaintext.
+/// Open `envelope` under `key` for `session_id`, returning the recovered
+/// plaintext. The AAD `{v, alg, entity, session_id}` is reconstructed and must
+/// match the seal exactly: a value sealed under a different `session_id` (or a
+/// different scheme/entity) fails authentication just like a wrong key.
 ///
 /// # Errors
 /// - [`SnapshotCryptoError::UnknownVersion`] if `v`/`alg` are not understood.
 /// - [`SnapshotCryptoError::MalformedEnvelope`] on bad base64 / nonce length.
-/// - [`SnapshotCryptoError::DecryptFailed`] on wrong key or tamper (AEAD auth).
-pub fn open(key: &[u8; 32], envelope: &Envelope) -> Result<Vec<u8>, SnapshotCryptoError> {
+/// - [`SnapshotCryptoError::DecryptFailed`] on wrong key, wrong `session_id`, or
+///   tamper (AEAD authentication).
+pub fn open(key: &[u8; 32], session_id: &str, envelope: &Envelope) -> Result<Vec<u8>, SnapshotCryptoError> {
     if envelope.v != ENVELOPE_V || envelope.alg != ENVELOPE_ALG {
         return Err(SnapshotCryptoError::UnknownVersion {
             v: envelope.v,
@@ -157,9 +211,16 @@ pub fn open(key: &[u8; 32], envelope: &Envelope) -> Result<Vec<u8>, SnapshotCryp
     let ct = B64
         .decode(envelope.ct.as_bytes())
         .map_err(|_| SnapshotCryptoError::MalformedEnvelope)?;
+    let aad = snapshot_aad(session_id).map_err(|_| SnapshotCryptoError::MalformedEnvelope)?;
     let cipher = XChaCha20Poly1305::new(key.into());
     cipher
-        .decrypt(&nonce, ct.as_ref())
+        .decrypt(
+            &nonce,
+            Payload {
+                msg: ct.as_ref(),
+                aad: &aad,
+            },
+        )
         .map_err(|_| SnapshotCryptoError::DecryptFailed)
 }
 
@@ -220,58 +281,74 @@ mod tests {
 
     const K1: [u8; 32] = [42u8; 32];
     const K2: [u8; 32] = [7u8; 32];
+    const SID: &str = "session-test-1";
 
     #[test]
     fn round_trip_recovers_plaintext() {
         let pt = b"open todos + git anchor: sha=abc123 branch=main milestone=M2";
-        let env = seal(&K1, pt).expect("seal");
+        let env = seal(&K1, SID, pt).expect("seal");
         assert_eq!(env.v, ENVELOPE_V);
         assert_eq!(env.alg, ENVELOPE_ALG);
-        let recovered = open(&K1, &env).expect("open");
+        let recovered = open(&K1, SID, &env).expect("open");
         assert_eq!(recovered, pt);
     }
 
     #[test]
     fn wrong_key_fails_authentication() {
-        let env = seal(&K1, b"secret snapshot").expect("seal");
-        assert_eq!(open(&K2, &env), Err(SnapshotCryptoError::DecryptFailed));
+        let env = seal(&K1, SID, b"secret snapshot").expect("seal");
+        assert_eq!(open(&K2, SID, &env), Err(SnapshotCryptoError::DecryptFailed));
+    }
+
+    #[test]
+    fn wrong_session_id_fails_authentication() {
+        // Finding 2: the AAD binds session_id. Opening under a different
+        // session_id (an old / other-session / substituted-key envelope) fails
+        // authentication even under the correct key.
+        let env = seal(&K1, "session-A", b"A's working state").expect("seal");
+        assert_eq!(
+            open(&K1, "session-B", &env),
+            Err(SnapshotCryptoError::DecryptFailed),
+            "an envelope sealed for session-A must not open as session-B"
+        );
+        // Same key + same session_id still round-trips.
+        assert_eq!(open(&K1, "session-A", &env).expect("open"), b"A's working state");
     }
 
     #[test]
     fn tampered_ciphertext_fails_authentication() {
-        let mut env = seal(&K1, b"secret snapshot").expect("seal");
+        let mut env = seal(&K1, SID, b"secret snapshot").expect("seal");
         // Flip one byte of the ciphertext (decode, mutate, re-encode).
         let mut ct = B64.decode(env.ct.as_bytes()).expect("decode ct");
         ct[0] ^= 0x01;
         env.ct = B64.encode(&ct);
-        assert_eq!(open(&K1, &env), Err(SnapshotCryptoError::DecryptFailed));
+        assert_eq!(open(&K1, SID, &env), Err(SnapshotCryptoError::DecryptFailed));
     }
 
     #[test]
     fn tampered_nonce_fails_authentication() {
-        let mut env = seal(&K1, b"secret snapshot").expect("seal");
+        let mut env = seal(&K1, SID, b"secret snapshot").expect("seal");
         let mut nonce = B64.decode(env.nonce.as_bytes()).expect("decode nonce");
         nonce[0] ^= 0x01;
         env.nonce = B64.encode(&nonce);
-        assert_eq!(open(&K1, &env), Err(SnapshotCryptoError::DecryptFailed));
+        assert_eq!(open(&K1, SID, &env), Err(SnapshotCryptoError::DecryptFailed));
     }
 
     #[test]
     fn two_seals_of_same_plaintext_use_distinct_nonces() {
-        let a = seal(&K1, b"identical").expect("seal a");
-        let b = seal(&K1, b"identical").expect("seal b");
+        let a = seal(&K1, SID, b"identical").expect("seal a");
+        let b = seal(&K1, SID, b"identical").expect("seal b");
         assert_ne!(a.nonce, b.nonce, "random nonce must differ across seals");
         assert_ne!(a.ct, b.ct, "ciphertext must differ when the nonce differs");
     }
 
     #[test]
     fn unknown_version_is_rejected() {
-        let mut env = seal(&K1, b"x").expect("seal");
-        env.v = 2;
+        let mut env = seal(&K1, SID, b"x").expect("seal");
+        env.v = 99;
         assert_eq!(
-            open(&K1, &env),
+            open(&K1, SID, &env),
             Err(SnapshotCryptoError::UnknownVersion {
-                v: 2,
+                v: 99,
                 alg: ENVELOPE_ALG.to_string()
             })
         );
@@ -279,10 +356,10 @@ mod tests {
 
     #[test]
     fn unknown_alg_is_rejected() {
-        let mut env = seal(&K1, b"x").expect("seal");
+        let mut env = seal(&K1, SID, b"x").expect("seal");
         env.alg = "aes-256-gcm".to_string();
         assert!(matches!(
-            open(&K1, &env),
+            open(&K1, SID, &env),
             Err(SnapshotCryptoError::UnknownVersion { .. })
         ));
     }
@@ -295,7 +372,7 @@ mod tests {
             nonce: "not-base64!!".to_string(),
             ct: "also!!bad".to_string(),
         };
-        assert_eq!(open(&K1, &env), Err(SnapshotCryptoError::MalformedEnvelope));
+        assert_eq!(open(&K1, SID, &env), Err(SnapshotCryptoError::MalformedEnvelope));
 
         // Wrong nonce length (valid base64, but not 24 bytes).
         let short = Envelope {
@@ -304,19 +381,19 @@ mod tests {
             nonce: B64.encode([0u8; 12]),
             ct: B64.encode(b"junk"),
         };
-        assert_eq!(open(&K1, &short), Err(SnapshotCryptoError::MalformedEnvelope));
+        assert_eq!(open(&K1, SID, &short), Err(SnapshotCryptoError::MalformedEnvelope));
     }
 
     #[test]
     fn fact_value_round_trips_and_hides_plaintext() {
         let pt = b"UNIQUE_PLAINTEXT_MARKER_9137";
-        let env = seal(&K1, pt).expect("seal");
+        let env = seal(&K1, SID, pt).expect("seal");
         let value = env.to_fact_value().expect("to_fact_value");
         // The opaque fact value must not contain the plaintext (ciphertext-only).
         assert!(!value.contains("UNIQUE_PLAINTEXT_MARKER_9137"));
         let parsed = Envelope::from_fact_value(&value).expect("from_fact_value");
         assert_eq!(parsed, env);
-        assert_eq!(open(&K1, &parsed).expect("open"), pt);
+        assert_eq!(open(&K1, SID, &parsed).expect("open"), pt);
     }
 
     #[test]
@@ -351,9 +428,9 @@ mod tests {
 
         // End-to-end: device B (same seed) opens device A's envelope; the
         // stranger cannot.
-        let env = seal(&k_a, b"cross-device snapshot").expect("seal");
-        assert_eq!(open(&k_b, &env).expect("open"), b"cross-device snapshot");
-        assert_eq!(open(&k_other, &env), Err(SnapshotCryptoError::DecryptFailed));
+        let env = seal(&k_a, SID, b"cross-device snapshot").expect("seal");
+        assert_eq!(open(&k_b, SID, &env).expect("open"), b"cross-device snapshot");
+        assert_eq!(open(&k_other, SID, &env), Err(SnapshotCryptoError::DecryptFailed));
     }
 
     #[test]

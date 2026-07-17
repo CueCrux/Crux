@@ -92,7 +92,9 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
     // before the banner path so it is attempted even if `sync_status` early-returns.
     // Every failure — no seed, no fact, wrong passport/tenant, decrypt-fail, daemon
     // down — is a quiet skip; it never errors the session.
-    if let Some(section) = restore_snapshot_section(input.as_ref().and_then(|i| i.source.as_deref())) {
+    let source = input.as_ref().and_then(|i| i.source.as_deref());
+    let session_id = input.as_ref().map_or("", |i| i.session_id.as_str());
+    if let Some(section) = restore_snapshot_section(source, session_id) {
         sections.push((Stability::Volatile, section));
     }
 
@@ -223,10 +225,18 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
 /// Build the restored-hosted-snapshot `additionalContext` section, or `None`.
 ///
 /// Only fires on a post-compaction / resume boot. Requires a readable passport
-/// seed (to derive the key) and a matching `session_snapshot` fact reachable via
-/// the daemon. Any miss — wrong source, no seed, no fact, wrong passport/tenant,
-/// decrypt-fail, daemon unreachable — returns `None` (quiet skip).
-fn restore_snapshot_section(source: Option<&str>) -> Option<String> {
+/// seed (to derive the key) and a `session_snapshot` fact stored under **this
+/// session's id** reachable via the daemon. Any miss — wrong source, no seed, no
+/// matching fact, wrong passport, wrong session, decrypt-fail, daemon
+/// unreachable — returns `None` (quiet skip).
+///
+/// Finding 2: restore is scoped to the exact fact key (`session_id`), and the
+/// AAD re-binds `session_id`, so an old / other-session / substituted-key
+/// envelope under the same passport seed is rejected rather than restored. Note
+/// this narrows continuity to the *same* session id on both devices (how Claude
+/// Code `--resume` behaves); a cross-device flow that mints a *new* id would find
+/// no matching row and quietly no-op.
+fn restore_snapshot_section(source: Option<&str>, session_id: &str) -> Option<String> {
     if !matches!(source, Some("compact" | "resume")) {
         return None;
     }
@@ -240,20 +250,25 @@ fn restore_snapshot_section(source: Option<&str>) -> Option<String> {
         }),
     )
     .ok()?;
-    let plaintext = decrypt_newest_snapshot(&result, &key)?;
+    let plaintext = decrypt_session_snapshot(&result, &key, session_id)?;
     Some(render_snapshot_context(&plaintext))
 }
 
-/// From a `query_facts` result, return the plaintext of the newest
-/// `session_snapshot` row that opens with `key`. Rows arrive freshest-first, so
-/// the first that decrypts is the newest one belonging to this passport; rows
-/// that fail to open (foreign passport/tenant, malformed) are skipped.
-fn decrypt_newest_snapshot(result: &Value, key: &[u8; 32]) -> Option<Vec<u8>> {
+/// From a `query_facts` result, return the plaintext of the `session_snapshot`
+/// row whose fact **key** equals `session_id` and that opens with `key` under
+/// the matching AAD. Rows stored under any other key are ignored (Finding 2:
+/// don't restore a value the daemon returned under a different fact key); rows
+/// that fail to open (foreign passport, tampered, wrong session) are skipped.
+fn decrypt_session_snapshot(result: &Value, key: &[u8; 32], session_id: &str) -> Option<Vec<u8>> {
     let rows = result.get("structuredContent")?.get("rows")?.as_array()?;
     rows.iter()
+        // Bind to the exact fact key: only rows stored under THIS session_id are
+        // candidates. The AAD (also bound to session_id) then re-checks it, so a
+        // ciphertext relocated under a matching key still fails authentication.
+        .filter(|row| row.get("key").and_then(Value::as_str) == Some(session_id))
         .filter_map(|row| row.get("value").and_then(Value::as_str))
         .filter_map(|value| snapshot_crypto::Envelope::from_fact_value(value).ok())
-        .find_map(|envelope| snapshot_crypto::open(key, &envelope).ok())
+        .find_map(|envelope| snapshot_crypto::open(key, session_id, &envelope).ok())
 }
 
 /// Render decrypted snapshot plaintext as a fenced, control-char-stripped,
@@ -488,39 +503,73 @@ mod tests {
     #[test]
     fn restore_section_skips_non_compaction_sources() {
         // Wrong source returns before any seed/daemon work.
-        assert!(restore_snapshot_section(Some("startup")).is_none());
-        assert!(restore_snapshot_section(Some("clear")).is_none());
-        assert!(restore_snapshot_section(None).is_none());
+        assert!(restore_snapshot_section(Some("startup"), "s").is_none());
+        assert!(restore_snapshot_section(Some("clear"), "s").is_none());
+        assert!(restore_snapshot_section(None, "s").is_none());
     }
 
     #[test]
-    fn decrypt_newest_snapshot_picks_first_openable_skips_foreign() {
+    fn decrypt_session_snapshot_matches_key_and_opens() {
         let mine = [1u8; 32];
         let theirs = [2u8; 32];
-        let env_theirs = snapshot_crypto::seal(&theirs, b"not mine").unwrap();
-        let env_mine = snapshot_crypto::seal(&mine, b"my working state").unwrap();
-        // Freshest-first: a foreign (undecryptable-by-me) row leads; mine follows.
+        let sid = "sess-1";
+        let env_theirs = snapshot_crypto::seal(&theirs, sid, b"not mine").unwrap();
+        let env_mine = snapshot_crypto::seal(&mine, sid, b"my working state").unwrap();
+        // Both rows carry the current fact key; the foreign one is skipped on
+        // auth-fail, mine opens.
         let result = json!({
             "structuredContent": { "rows": [
-                { "value": env_theirs.to_fact_value().unwrap() },
-                { "value": env_mine.to_fact_value().unwrap() },
+                { "key": sid, "value": env_theirs.to_fact_value().unwrap() },
+                { "key": sid, "value": env_mine.to_fact_value().unwrap() },
             ]}
         });
-        let pt = decrypt_newest_snapshot(&result, &mine).expect("mine decrypts");
+        let pt = decrypt_session_snapshot(&result, &mine, sid).expect("mine decrypts");
         assert_eq!(pt, b"my working state");
     }
 
     #[test]
-    fn decrypt_newest_snapshot_none_when_nothing_opens() {
+    fn decrypt_session_snapshot_ignores_other_session_keys() {
+        // Finding 2: a row stored under a DIFFERENT fact key must not be
+        // restored into this session, even though our key would open it.
         let mine = [1u8; 32];
-        let foreign = snapshot_crypto::seal(&[9u8; 32], b"x").unwrap();
-        let result = json!({"structuredContent": {"rows": [{"value": foreign.to_fact_value().unwrap()}]}});
+        let env = snapshot_crypto::seal(&mine, "other-session", b"other state").unwrap();
+        let result = json!({"structuredContent": {"rows": [
+            {"key": "other-session", "value": env.to_fact_value().unwrap()}
+        ]}});
         assert!(
-            decrypt_newest_snapshot(&result, &mine).is_none(),
+            decrypt_session_snapshot(&result, &mine, "my-session").is_none(),
+            "a row under a foreign fact key must be ignored"
+        );
+    }
+
+    #[test]
+    fn decrypt_session_snapshot_rejects_substituted_ciphertext() {
+        // Finding 2: attacker copies a value sealed for session-A and republishes
+        // it under fact key session-B. Restoring session-B must fail — the AAD
+        // still binds session-A.
+        let key = [1u8; 32];
+        let env_a = snapshot_crypto::seal(&key, "session-A", b"A state").unwrap();
+        let substituted = json!({"structuredContent": {"rows": [
+            {"key": "session-B", "value": env_a.to_fact_value().unwrap()}
+        ]}});
+        assert!(
+            decrypt_session_snapshot(&substituted, &key, "session-B").is_none(),
+            "value sealed for session-A must not open under a substituted key session-B"
+        );
+    }
+
+    #[test]
+    fn decrypt_session_snapshot_none_when_nothing_opens() {
+        let mine = [1u8; 32];
+        let sid = "sess-1";
+        let foreign = snapshot_crypto::seal(&[9u8; 32], sid, b"x").unwrap();
+        let result = json!({"structuredContent": {"rows": [{"key": sid, "value": foreign.to_fact_value().unwrap()}]}});
+        assert!(
+            decrypt_session_snapshot(&result, &mine, sid).is_none(),
             "wrong passport must skip"
         );
-        assert!(decrypt_newest_snapshot(&json!({"structuredContent": {"rows": []}}), &mine).is_none());
-        assert!(decrypt_newest_snapshot(&json!({}), &mine).is_none());
+        assert!(decrypt_session_snapshot(&json!({"structuredContent": {"rows": []}}), &mine, sid).is_none());
+        assert!(decrypt_session_snapshot(&json!({}), &mine, sid).is_none());
     }
 
     #[test]
@@ -538,10 +587,11 @@ mod tests {
     #[test]
     fn render_snapshot_context_round_trips_state_json() {
         let key = [4u8; 32];
+        let sid = "sess-render";
         let state = json!({"cwd": "/proj", "recovery": {"branch": "main", "sha": "abc"}});
-        let env = snapshot_crypto::seal(&key, &serde_json::to_vec(&state).unwrap()).unwrap();
-        let result = json!({"structuredContent": {"rows": [{"value": env.to_fact_value().unwrap()}]}});
-        let pt = decrypt_newest_snapshot(&result, &key).unwrap();
+        let env = snapshot_crypto::seal(&key, sid, &serde_json::to_vec(&state).unwrap()).unwrap();
+        let result = json!({"structuredContent": {"rows": [{"key": sid, "value": env.to_fact_value().unwrap()}]}});
+        let pt = decrypt_session_snapshot(&result, &key, sid).unwrap();
         let ctx = render_snapshot_context(&pt);
         assert!(
             ctx.contains("\"branch\": \"main\""),

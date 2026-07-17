@@ -118,7 +118,10 @@ fn store_encrypted_snapshot(session_id: &str, state: &Value) {
 /// `snapshot_fact_args_carry_ciphertext_only`.
 fn build_snapshot_fact_args(session_id: &str, state: &Value, key: &[u8; 32]) -> anyhow::Result<Value> {
     let plaintext = serde_json::to_vec(state)?;
-    let envelope = snapshot_crypto::seal(key, &plaintext)?;
+    // Bind the envelope to this session_id (the fact key it is stored under):
+    // restore reconstructs the same AAD, so a value moved under a foreign key
+    // fails authentication (crypto-review Finding 2).
+    let envelope = snapshot_crypto::seal(key, session_id, &plaintext)?;
     Ok(json!({
         "entity": SNAPSHOT_ENTITY,
         "key": session_id,
@@ -314,9 +317,10 @@ mod tests {
         let value = args["value"].as_str().unwrap();
         assert!(!value.contains('{'), "value should be opaque base64, not readable JSON");
 
-        // And with the key it decrypts back to exactly the original state.
+        // And with the key + the bound session_id it decrypts back to exactly
+        // the original state.
         let envelope = snapshot_crypto::Envelope::from_fact_value(value).unwrap();
-        let recovered = snapshot_crypto::open(&key, &envelope).unwrap();
+        let recovered = snapshot_crypto::open(&key, "sess-abc-123", &envelope).unwrap();
         let recovered_state: Value = serde_json::from_slice(&recovered).unwrap();
         assert_eq!(recovered_state, state);
     }
@@ -367,7 +371,8 @@ mod tests {
         );
         // Round-trip proves it is genuine ciphertext of the exact state, not a redaction.
         let env = snapshot_crypto::Envelope::from_fact_value(value).unwrap();
-        let recovered: Value = serde_json::from_slice(&snapshot_crypto::open(&key, &env).unwrap()).unwrap();
+        let recovered: Value =
+            serde_json::from_slice(&snapshot_crypto::open(&key, "session-xyz", &env).unwrap()).unwrap();
         assert_eq!(recovered, state);
     }
 
