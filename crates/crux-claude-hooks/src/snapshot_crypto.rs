@@ -317,12 +317,13 @@ pub fn passport_key_path_from_env() -> Option<PathBuf> {
 
 /// True when `CRUX_AGENT_TOKEN` (the server-visible bearer credential) equals
 /// the passport seed in any canonical representation — lowercase/uppercase hex,
-/// or standard base64 of the decoded seed (Finding 5).
+/// the raw decoded 32 seed bytes, or STANDARD / STANDARD_NO_PAD / URL_SAFE /
+/// URL_SAFE_NO_PAD base64 of those bytes (Finding 5 / F3 review fix).
 ///
 /// Reusing the seed as the bearer would hand the server the exact material the
 /// snapshot key is derived from, voiding "unreadable to us". Callers refuse to
 /// enable hosted sync when this returns true. Neither value is logged; both are
-/// held in [`Zeroizing`] while compared.
+/// held in [`Zeroizing`] while compared, and every comparison fails closed.
 #[must_use]
 pub fn bearer_reuses_passport_seed() -> bool {
     let Some(token) = std::env::var("CRUX_AGENT_TOKEN").ok().filter(|s| !s.is_empty()) else {
@@ -340,15 +341,25 @@ pub fn bearer_reuses_passport_seed() -> bool {
     if seed_hex.is_empty() {
         return false;
     }
+    let token_trimmed = token.trim();
     // Hex form: the file is lowercase, but a reused token might be uppercased.
-    if token.trim().eq_ignore_ascii_case(seed_hex) {
+    if token_trimmed.eq_ignore_ascii_case(seed_hex) {
         return true;
     }
-    // Standard base64 of the decoded seed bytes.
+    // Every canonical encoding of the decoded 32 seed bytes: the raw bytes
+    // themselves, plus padded/unpadded standard and URL-safe base64. A reuse
+    // slipped in under any alphabet still hands the server the seed material.
     if let Ok(bytes) = hex::decode(seed_hex) {
+        use base64::engine::general_purpose as gp;
         let bytes = Zeroizing::new(bytes);
-        let b64 = Zeroizing::new(B64.encode(bytes.as_slice()));
-        if token.trim() == b64.as_str() {
+        if token_trimmed.as_bytes() == bytes.as_slice() {
+            return true;
+        }
+        let engines = [gp::STANDARD, gp::STANDARD_NO_PAD, gp::URL_SAFE, gp::URL_SAFE_NO_PAD];
+        if engines
+            .iter()
+            .any(|e| token_trimmed == Zeroizing::new(e.encode(bytes.as_slice())).as_str())
+        {
             return true;
         }
     }
@@ -468,24 +479,79 @@ pub fn load_high_water(scope: &str) -> HighWater {
     }
 }
 
-/// Persist `counter` as the high-water mark for `scope` iff it advances the
-/// mark (monotonic; never lowers it). Best-effort: a write failure is logged and
+/// Persist `counter` as the high-water mark for `scope` iff it strictly advances
+/// the mark (monotonic; never lowers it). Best-effort: any failure is logged and
 /// ignored — it degrades rollback strictness for one boot but never crashes the
-/// hook. A `Corrupt`/missing prior state is treated as 0, so this also self-heals
-/// a corrupt file back to a usable value.
+/// hook.
+///
+/// Anti-rollback correctness (F1 review fix):
+/// - **Atomic:** writes via a same-directory temp file + `rename`, so an
+///   interrupted or racing write never leaves a partial (⇒ `Corrupt`) file.
+/// - **Never regress a `Corrupt` mark:** a `Corrupt` prior state is *unknown but
+///   possibly higher*, so this refuses to write rather than reset it downward and
+///   re-open the replay window. (The old "treat `Corrupt` as 0 / self-heal"
+///   behaviour was the rollback bug.)
+/// - **Race-safe:** the load→max→write is serialised by an advisory exclusive
+///   lock on a sibling `.lock` file, so two concurrent advances cannot lose the
+///   larger update. Lock errors fail open (log-free, proceed best-effort).
 pub fn advance_high_water(scope: &str, counter: u64) {
     let Some(path) = high_water_path(scope) else {
         return;
     };
-    let current = match load_high_water(scope) {
-        HighWater::Mark(n) => n,
-        HighWater::FirstRun | HighWater::Corrupt => 0,
+    // Serialise concurrent advances; held until `_lock` drops at end of scope.
+    // Fail open (None) — never crash the hook over a lock error.
+    let _lock = lock_high_water(&path);
+    let next = match load_high_water(scope) {
+        HighWater::Mark(n) if counter > n => counter,
+        HighWater::FirstRun => counter,
+        // Mark(_) not strictly greater ⇒ nothing to do; Corrupt ⇒ refuse to
+        // regress an unknown-but-possibly-higher mark (fail closed, no reset).
+        HighWater::Mark(_) | HighWater::Corrupt => return,
     };
-    let next = current.max(counter);
-    let body = serde_json::json!({ "high_water": next }).to_string();
-    if let Err(err) = std::fs::write(&path, body) {
+    if let Err(err) = write_high_water_atomic(&path, next) {
         eprintln!("crux-hook: persist snapshot high-water failed (rollback strictness degraded this boot): {err}");
     }
+}
+
+/// Best-effort advisory exclusive lock guarding a high-water file's load→max→
+/// write. Locks a sibling `.lock` file (a stable inode — the high-water file
+/// itself is replaced by `rename`, so locking it directly would be pointless).
+/// Returns the locked handle (released on drop) or `None` on any error, so
+/// callers proceed best-effort and never crash the hook.
+fn lock_high_water(path: &Path) -> Option<std::fs::File> {
+    let lock_path = path.with_extension("lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .ok()?;
+    fs2::FileExt::lock_exclusive(&file).ok()?;
+    Some(file)
+}
+
+/// Atomically persist `high_water` to `path`: write a same-directory temp file
+/// (0600, mirroring the passport key — F2) then `rename` over the target (atomic
+/// on Unix), so an interrupted or concurrent write never leaves a partial file.
+/// The temp name is per-process so a fail-open lock race can't cross-clobber it.
+fn write_high_water_atomic(path: &Path, high_water: u64) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let body = serde_json::json!({ "high_water": high_water }).to_string();
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    {
+        let mut file = options.open(&tmp)?;
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
 }
 
 #[cfg(test)]
@@ -750,9 +816,139 @@ mod tests {
         let path = high_water_path(scope).unwrap();
         std::fs::write(&path, "{ not json").unwrap();
         assert_eq!(load_high_water(scope), HighWater::Corrupt);
-        // advance() self-heals a corrupt file back to a usable value.
+        // F1: advance must NOT reset/overwrite a Corrupt mark (that reset was the
+        // rollback bug — Mark(0) would accept any authentic counter>0). The mark
+        // stays Corrupt: fail closed, never regress an unknown-but-possibly-higher
+        // value.
         advance_high_water(scope, 300);
-        assert_eq!(load_high_water(scope), HighWater::Mark(300));
+        assert_eq!(
+            load_high_water(scope),
+            HighWater::Corrupt,
+            "Corrupt mark must never be silently reset by advance"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("CRUX_PASSPORT_KEY_PATH", v),
+            None => std::env::remove_var("CRUX_PASSPORT_KEY_PATH"),
+        }
+    }
+
+    #[test]
+    fn advance_write_is_atomic_no_temp_left_behind() {
+        // F1(a): a completed advance leaves a cleanly-parseable file (never a
+        // half-written ⇒ Corrupt one) and no stray temp file beside it.
+        let _env = crate::test_support::env_guard();
+        let prev = std::env::var("CRUX_PASSPORT_KEY_PATH").ok();
+        let tmp = tempfile::tempdir().unwrap();
+        let key_file = tmp.path().join("passport.key");
+        std::fs::write(&key_file, "aa".repeat(32)).unwrap();
+        std::env::set_var("CRUX_PASSPORT_KEY_PATH", &key_file);
+        let scope = "scope-atomic";
+
+        advance_high_water(scope, 123);
+        assert_eq!(load_high_water(scope), HighWater::Mark(123));
+        let dir = high_water_path(scope).unwrap().parent().unwrap().to_path_buf();
+        let leftover: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "no temp file must survive an atomic write: {leftover:?}"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("CRUX_PASSPORT_KEY_PATH", v),
+            None => std::env::remove_var("CRUX_PASSPORT_KEY_PATH"),
+        }
+    }
+
+    #[test]
+    fn advance_is_max_monotonic_and_takes_the_lock() {
+        // F1(c): interleaved values (as two concurrent advances would supply) —
+        // the max must win regardless of order (a lost update would leave 120),
+        // and the advisory `.lock` sibling is created (serialisation point).
+        let _env = crate::test_support::env_guard();
+        let prev = std::env::var("CRUX_PASSPORT_KEY_PATH").ok();
+        let tmp = tempfile::tempdir().unwrap();
+        let key_file = tmp.path().join("passport.key");
+        std::fs::write(&key_file, "aa".repeat(32)).unwrap();
+        std::env::set_var("CRUX_PASSPORT_KEY_PATH", &key_file);
+        let scope = "scope-lock";
+
+        advance_high_water(scope, 150);
+        advance_high_water(scope, 120);
+        assert_eq!(load_high_water(scope), HighWater::Mark(150));
+        let lock = high_water_path(scope).unwrap().with_extension("lock");
+        assert!(lock.exists(), "advisory .lock sibling must be created: {lock:?}");
+
+        match prev {
+            Some(v) => std::env::set_var("CRUX_PASSPORT_KEY_PATH", v),
+            None => std::env::remove_var("CRUX_PASSPORT_KEY_PATH"),
+        }
+    }
+
+    #[test]
+    fn fresh_path_stays_closed_after_a_corrupt_boot() {
+        // F1(b) end-to-end: a Corrupt mark is left intact (not reset to 0), and a
+        // *subsequent* boot that establishes a genuine higher mark still rejects a
+        // lower-counter replay — the rollback gate never silently re-opened.
+        let _env = crate::test_support::env_guard();
+        let prev = std::env::var("CRUX_PASSPORT_KEY_PATH").ok();
+        let tmp = tempfile::tempdir().unwrap();
+        let key_file = tmp.path().join("passport.key");
+        std::fs::write(&key_file, "aa".repeat(32)).unwrap();
+        std::env::set_var("CRUX_PASSPORT_KEY_PATH", &key_file);
+        let scope = "scope-fresh-closed";
+
+        // A corrupt file, then an attempted reset-to-0 (the old buggy call): the
+        // mark must remain Corrupt, not become Mark(0).
+        let path = high_water_path(scope).unwrap();
+        std::fs::write(&path, "}{ garbage").unwrap();
+        advance_high_water(scope, 0);
+        assert_eq!(load_high_water(scope), HighWater::Corrupt, "no reset-to-0 on corrupt");
+
+        // Later a genuine higher mark is established (fresh file replaces corrupt).
+        std::fs::remove_file(&path).unwrap();
+        advance_high_water(scope, 500);
+        assert_eq!(load_high_water(scope), HighWater::Mark(500));
+        // A replay at/under that mark is still rejected (gate closed as intended).
+        let dk = DerivedSnapshotKey {
+            scope: scope.to_string(),
+            key: Zeroizing::new([9u8; 32]),
+        };
+        let stale = seal(&dk.key, scope, "sess-x", 400, b"old").unwrap();
+        assert!(open(&dk.key, &stale).is_ok(), "authentic under key");
+        assert!(
+            stale.counter <= 500,
+            "the replay counter is at/under the mark, so the fresh path must reject it"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("CRUX_PASSPORT_KEY_PATH", v),
+            None => std::env::remove_var("CRUX_PASSPORT_KEY_PATH"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn high_water_file_is_mode_0600() {
+        // F2: the mark file sits next to the 0600 passport.key — not world-readable.
+        use std::os::unix::fs::PermissionsExt as _;
+        let _env = crate::test_support::env_guard();
+        let prev = std::env::var("CRUX_PASSPORT_KEY_PATH").ok();
+        let tmp = tempfile::tempdir().unwrap();
+        let key_file = tmp.path().join("passport.key");
+        std::fs::write(&key_file, "aa".repeat(32)).unwrap();
+        std::env::set_var("CRUX_PASSPORT_KEY_PATH", &key_file);
+        let scope = "scope-mode";
+
+        advance_high_water(scope, 42);
+        let path = high_water_path(scope).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "F2: high-water file must not be world-readable");
 
         match prev {
             Some(v) => std::env::set_var("CRUX_PASSPORT_KEY_PATH", v),
@@ -763,6 +959,7 @@ mod tests {
     #[test]
     fn bearer_reuses_passport_seed_detects_hex_and_base64() {
         // Finding 5: reject CRUX_AGENT_TOKEN == passport seed in any canonical form.
+        use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
         let _env = crate::test_support::env_guard();
         let prev_tok = std::env::var("CRUX_AGENT_TOKEN").ok();
         let prev_path = std::env::var("CRUX_PASSPORT_KEY_PATH").ok();
@@ -779,9 +976,31 @@ mod tests {
         std::env::set_var("CRUX_AGENT_TOKEN", seed_hex.to_uppercase());
         assert!(bearer_reuses_passport_seed(), "uppercase hex seed reuse must be caught");
 
-        // Base64-of-seed reuse is caught.
+        // Base64-of-seed reuse is caught (STANDARD).
         std::env::set_var("CRUX_AGENT_TOKEN", B64.encode(seed));
         assert!(bearer_reuses_passport_seed(), "base64 seed reuse must be caught");
+
+        // F3: URL-safe and unpadded base64 variants also trip the guard.
+        std::env::set_var("CRUX_AGENT_TOKEN", URL_SAFE.encode(seed));
+        assert!(
+            bearer_reuses_passport_seed(),
+            "URL_SAFE base64 seed reuse must be caught"
+        );
+        std::env::set_var("CRUX_AGENT_TOKEN", STANDARD_NO_PAD.encode(seed));
+        assert!(
+            bearer_reuses_passport_seed(),
+            "STANDARD_NO_PAD base64 seed reuse must be caught"
+        );
+        std::env::set_var("CRUX_AGENT_TOKEN", URL_SAFE_NO_PAD.encode(seed));
+        assert!(
+            bearer_reuses_passport_seed(),
+            "URL_SAFE_NO_PAD base64 seed reuse must be caught"
+        );
+
+        // F3: the raw decoded seed bytes themselves (here valid UTF-8) trip it.
+        let raw_seed_str = String::from_utf8(seed.to_vec()).unwrap();
+        std::env::set_var("CRUX_AGENT_TOKEN", &raw_seed_str);
+        assert!(bearer_reuses_passport_seed(), "raw seed bytes reuse must be caught");
 
         // A distinct bearer is fine.
         std::env::set_var("CRUX_AGENT_TOKEN", "totally-unrelated-bearer-token-000000");

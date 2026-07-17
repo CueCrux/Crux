@@ -281,10 +281,15 @@ fn restore_snapshot_section(source: Option<&str>, session_id: &str) -> Option<St
         snapshot_crypto::HighWater::Mark(n) => n,
         snapshot_crypto::HighWater::FirstRun => 0,
         snapshot_crypto::HighWater::Corrupt => {
-            // Fail toward no restore for this boot; self-heal the mark so the next
-            // boot is usable again (see `advance_high_water`).
-            eprintln!("crux-hook session-start: snapshot high-water state unreadable — skipping restore this boot");
-            snapshot_crypto::advance_high_water(&dk.scope, 0);
+            // Fail CLOSED: skip restore AND leave the mark intact. Resetting it
+            // (the old `advance_high_water(.., 0)`) re-opened the rollback window —
+            // a hostile mirror could then replay the user's own older snapshots
+            // past a Mark(0) gate (F1 review fix). Same-session resume already ran
+            // above (it precedes this high-water load), so it is unaffected. Atomic
+            // writes keep this file readable in normal operation, so this is rare.
+            eprintln!(
+                "crux-hook session-start: snapshot high-water state unreadable — skipping restore this boot (mark left intact)"
+            );
             return None;
         }
     };
