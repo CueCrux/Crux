@@ -224,18 +224,24 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
 
 /// Build the restored-hosted-snapshot `additionalContext` section, or `None`.
 ///
-/// Only fires on a post-compaction / resume boot. Requires a readable passport
-/// seed (to derive the key) and a `session_snapshot` fact stored under **this
-/// session's id** reachable via the daemon. Any miss — wrong source, no seed, no
-/// matching fact, wrong passport, wrong session, decrypt-fail, daemon
-/// unreachable — returns `None` (quiet skip).
+/// Fires only on a post-compaction / resume boot with a readable passport seed
+/// and hosted sync explicitly enabled. Supports BOTH cross-device flows
+/// (crypto-review Finding 2 redesign):
 ///
-/// Finding 2: restore is scoped to the exact fact key (`session_id`), and the
-/// AAD re-binds `session_id`, so an old / other-session / substituted-key
-/// envelope under the same passport seed is rejected rather than restored. Note
-/// this narrows continuity to the *same* session id on both devices (how Claude
-/// Code `--resume` behaves); a cross-device flow that mints a *new* id would find
-/// no matching row and quietly no-op.
+/// 1. **Same-session resume** — a `session_snapshot` whose bound `session_id`
+///    equals the current session (device B ran `claude --resume <same id>`).
+///    Trusted by the exact session match + AEAD auth; exempt from the high-water
+///    check so a legitimate re-resume is never blocked by its own prior restore.
+/// 2. **Fresh-session pickup** — the newest snapshot for THIS passport (highest
+///    `counter`) that authenticates under our key AND is strictly newer than the
+///    persisted high-water mark. The counter (bound in the AAD, un-forgeable) plus
+///    the local high-water mark are what make "latest for this passport"
+///    trustworthy against an attacker-served old/other blob.
+///
+/// Every miss — wrong source, no seed, no fact, wrong passport, decrypt-fail,
+/// rollback (stale counter), corrupt high-water state, daemon unreachable —
+/// returns `None` (quiet skip); it never errors the session and never injects on
+/// failure.
 fn restore_snapshot_section(source: Option<&str>, session_id: &str) -> Option<String> {
     if !matches!(source, Some("compact" | "resume")) {
         return None;
@@ -249,35 +255,121 @@ fn restore_snapshot_section(source: Option<&str>, session_id: &str) -> Option<St
     if snapshot_crypto::bearer_reuses_passport_seed() {
         return None;
     }
-    let key = snapshot_crypto::derive_snapshot_key()?;
+    let dk = snapshot_crypto::derive_snapshot_key()?;
     let result = mcp_client::call_tool(
         "query_facts",
         json!({
             "entity": snapshot_crypto::SNAPSHOT_ENTITY,
-            "top_k": 5,
+            "top_k": 20,
             "token_budget": SNAPSHOT_RESTORE_TOKEN_BUDGET,
         }),
     )
     .ok()?;
-    let plaintext = decrypt_session_snapshot(&result, &key, session_id)?;
-    Some(render_snapshot_context(&plaintext))
+    let envelopes = parse_snapshot_envelopes(&result);
+
+    // (1) Same-session resume: a snapshot whose OWN session_id is the current
+    // session. Exact session match + AEAD auth is the trust signal; no high-water
+    // gate (so re-resume of the same session is never self-blocked). Advancing the
+    // mark keeps a later fresh pickup from regressing behind it.
+    if let Some(opened) = open_same_session(&envelopes, &dk, session_id) {
+        snapshot_crypto::advance_high_water(&dk.scope, opened.counter);
+        return Some(render_snapshot_context(&opened.plaintext));
+    }
+
+    // (2) Fresh-session pickup of this passport's latest, rollback-checked.
+    let high_water = match snapshot_crypto::load_high_water(&dk.scope) {
+        snapshot_crypto::HighWater::Mark(n) => n,
+        snapshot_crypto::HighWater::FirstRun => 0,
+        snapshot_crypto::HighWater::Corrupt => {
+            // Fail toward no restore for this boot; self-heal the mark so the next
+            // boot is usable again (see `advance_high_water`).
+            eprintln!("crux-hook session-start: snapshot high-water state unreadable — skipping restore this boot");
+            snapshot_crypto::advance_high_water(&dk.scope, 0);
+            return None;
+        }
+    };
+    let opened = open_latest_fresh(&envelopes, &dk, session_id, high_water)?;
+    snapshot_crypto::advance_high_water(&dk.scope, opened.counter);
+    Some(render_snapshot_context(&opened.plaintext))
 }
 
-/// From a `query_facts` result, return the plaintext of the `session_snapshot`
-/// row whose fact **key** equals `session_id` and that opens with `key` under
-/// the matching AAD. Rows stored under any other key are ignored (Finding 2:
-/// don't restore a value the daemon returned under a different fact key); rows
-/// that fail to open (foreign passport, tampered, wrong session) are skipped.
-fn decrypt_session_snapshot(result: &Value, key: &[u8; 32], session_id: &str) -> Option<Vec<u8>> {
-    let rows = result.get("structuredContent")?.get("rows")?.as_array()?;
+/// A decrypted snapshot plus the counter it was sealed with.
+struct OpenedSnapshot {
+    plaintext: Vec<u8>,
+    counter: u64,
+}
+
+/// Parse the `session_snapshot` rows from a `query_facts` result into envelopes,
+/// dropping any row whose value is missing or not a well-formed envelope. The
+/// fact `key` is not trusted for authentication — every binding lives in the
+/// envelope's AAD — so only the `value` is read here.
+fn parse_snapshot_envelopes(result: &Value) -> Vec<snapshot_crypto::Envelope> {
+    let Some(rows) = result
+        .get("structuredContent")
+        .and_then(|s| s.get("rows"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
     rows.iter()
-        // Bind to the exact fact key: only rows stored under THIS session_id are
-        // candidates. The AAD (also bound to session_id) then re-checks it, so a
-        // ciphertext relocated under a matching key still fails authentication.
-        .filter(|row| row.get("key").and_then(Value::as_str) == Some(session_id))
         .filter_map(|row| row.get("value").and_then(Value::as_str))
         .filter_map(|value| snapshot_crypto::Envelope::from_fact_value(value).ok())
-        .find_map(|envelope| snapshot_crypto::open(key, session_id, &envelope).ok())
+        .collect()
+}
+
+/// Same-session candidate: the first envelope whose bound `session_id` is the
+/// current session and that authenticates under our key. A relabelled/relocated
+/// old blob (different bound session_id) is not a same-session candidate and is
+/// left to the rollback-checked fresh path.
+fn open_same_session(
+    envelopes: &[snapshot_crypto::Envelope],
+    dk: &snapshot_crypto::DerivedSnapshotKey,
+    session_id: &str,
+) -> Option<OpenedSnapshot> {
+    envelopes
+        .iter()
+        .filter(|env| env.session_id == session_id)
+        .find_map(|env| {
+            snapshot_crypto::open(&dk.key, env)
+                .ok()
+                .map(|plaintext| OpenedSnapshot {
+                    plaintext,
+                    counter: env.counter,
+                })
+        })
+}
+
+/// Fresh-session candidate: the highest-`counter` envelope for THIS passport
+/// (excluding the current session, handled by the same-session path) that
+/// authenticates under our key, accepted only if its counter is strictly greater
+/// than the high-water mark (rollback / replay defence). Candidates are ordered by
+/// `(counter, session_id)` descending so "latest" is deterministic even if two
+/// writers ever collide on a counter. Rows that fail auth are skipped; the first
+/// that opens is the newest authentic snapshot — if it is not newer than the mark,
+/// there is nothing to restore.
+fn open_latest_fresh(
+    envelopes: &[snapshot_crypto::Envelope],
+    dk: &snapshot_crypto::DerivedSnapshotKey,
+    session_id: &str,
+    high_water: u64,
+) -> Option<OpenedSnapshot> {
+    let mut candidates: Vec<&snapshot_crypto::Envelope> = envelopes
+        .iter()
+        .filter(|env| env.passport_scope == dk.scope && env.session_id != session_id)
+        .collect();
+    // Descending by (counter, session_id): highest counter first, deterministic tie-break.
+    candidates.sort_by(|a, b| b.counter.cmp(&a.counter).then_with(|| b.session_id.cmp(&a.session_id)));
+    let opened = candidates.into_iter().find_map(|env| {
+        snapshot_crypto::open(&dk.key, env)
+            .ok()
+            .map(|plaintext| OpenedSnapshot {
+                plaintext,
+                counter: env.counter,
+            })
+    })?;
+    // Rollback / replay defence: only accept a snapshot strictly newer than
+    // anything already accepted for this passport.
+    (opened.counter > high_water).then_some(opened)
 }
 
 /// Render decrypted snapshot plaintext as a fenced, control-char-stripped,
@@ -533,68 +625,130 @@ mod tests {
         }
     }
 
-    #[test]
-    fn decrypt_session_snapshot_matches_key_and_opens() {
-        let mine = [1u8; 32];
-        let theirs = [2u8; 32];
-        let sid = "sess-1";
-        let env_theirs = snapshot_crypto::seal(&theirs, sid, b"not mine").unwrap();
-        let env_mine = snapshot_crypto::seal(&mine, sid, b"my working state").unwrap();
-        // Both rows carry the current fact key; the foreign one is skipped on
-        // auth-fail, mine opens.
-        let result = json!({
-            "structuredContent": { "rows": [
-                { "key": sid, "value": env_theirs.to_fact_value().unwrap() },
-                { "key": sid, "value": env_mine.to_fact_value().unwrap() },
-            ]}
-        });
-        let pt = decrypt_session_snapshot(&result, &mine, sid).expect("mine decrypts");
-        assert_eq!(pt, b"my working state");
+    // --- Support-both restore selection (F2 redesign) -----------------------
+
+    fn dk(key: [u8; 32], scope: &str) -> snapshot_crypto::DerivedSnapshotKey {
+        snapshot_crypto::DerivedSnapshotKey {
+            scope: scope.to_string(),
+            key: zeroize::Zeroizing::new(key),
+        }
+    }
+
+    /// Build a `query_facts`-shaped result from `(fact_key, value)` rows.
+    fn rows_result(rows: &[(&str, String)]) -> Value {
+        let rows: Vec<Value> = rows.iter().map(|(k, v)| json!({"key": k, "value": v})).collect();
+        json!({ "structuredContent": { "rows": rows } })
     }
 
     #[test]
-    fn decrypt_session_snapshot_ignores_other_session_keys() {
-        // Finding 2: a row stored under a DIFFERENT fact key must not be
-        // restored into this session, even though our key would open it.
-        let mine = [1u8; 32];
-        let env = snapshot_crypto::seal(&mine, "other-session", b"other state").unwrap();
-        let result = json!({"structuredContent": {"rows": [
-            {"key": "other-session", "value": env.to_fact_value().unwrap()}
-        ]}});
+    fn same_session_resume_round_trip() {
+        // Device B resumes the SAME session id: the snapshot bound to that
+        // session opens and restores, regardless of the high-water mark.
+        let dk = dk([1u8; 32], "fpr-a");
+        let sid = "sess-A";
+        let env = snapshot_crypto::seal(&dk.key, "fpr-a", sid, 100, b"A working state").unwrap();
+        let envelopes = vec![env];
+        let opened = open_same_session(&envelopes, &dk, sid).expect("same-session opens");
+        assert_eq!(opened.plaintext, b"A working state");
+        assert_eq!(opened.counter, 100);
+    }
+
+    #[test]
+    fn same_session_not_blocked_by_high_water() {
+        // A prior restore may have advanced the passport high-water past this
+        // session's counter (e.g. a newer OTHER session was picked up). The
+        // same-session path must NOT be gated by high-water, so an explicit
+        // `--resume` of an older session still works and is never self-blocked.
+        let dk = dk([1u8; 32], "fpr-a");
+        let sid = "sess-old";
+        let env = snapshot_crypto::seal(&dk.key, "fpr-a", sid, 5, b"old but mine").unwrap();
+        let envelopes = vec![env];
+        // open_same_session ignores high-water entirely; it opens on auth alone.
+        let opened = open_same_session(&envelopes, &dk, sid).expect("same-session still opens");
+        assert_eq!(opened.plaintext, b"old but mine");
+    }
+
+    #[test]
+    fn fresh_session_picks_up_latest_for_passport() {
+        // Device B starts a NEW session id and picks up the passport's newest
+        // snapshot (highest counter), written by another session/device.
+        let dk = dk([1u8; 32], "fpr-a");
+        let older = snapshot_crypto::seal(&dk.key, "fpr-a", "sess-1", 100, b"older").unwrap();
+        let newer = snapshot_crypto::seal(&dk.key, "fpr-a", "sess-2", 200, b"newest state").unwrap();
+        // Order the rows oldest-first to prove selection sorts by counter, not row order.
+        let envelopes = vec![older, newer];
+        let opened = open_latest_fresh(&envelopes, &dk, "sess-new", 0).expect("latest opens");
+        assert_eq!(opened.plaintext, b"newest state");
+        assert_eq!(opened.counter, 200);
+    }
+
+    #[test]
+    fn fresh_session_rejects_cross_passport_snapshot() {
+        // A snapshot from a DIFFERENT passport (different seed → different key)
+        // must never be restored: it fails both the scope filter and auth.
+        let mine = dk([1u8; 32], "fpr-mine");
+        let theirs_key = [2u8; 32];
+        // Foreign envelope even declares a foreign scope; also would fail auth.
+        let foreign = snapshot_crypto::seal(&theirs_key, "fpr-theirs", "sess-x", 500, b"not yours").unwrap();
+        let envelopes = vec![foreign];
         assert!(
-            decrypt_session_snapshot(&result, &mine, "my-session").is_none(),
-            "a row under a foreign fact key must be ignored"
+            open_latest_fresh(&envelopes, &mine, "sess-new", 0).is_none(),
+            "cross-passport snapshot must be rejected"
         );
     }
 
     #[test]
-    fn decrypt_session_snapshot_rejects_substituted_ciphertext() {
-        // Finding 2: attacker copies a value sealed for session-A and republishes
-        // it under fact key session-B. Restoring session-B must fail — the AAD
-        // still binds session-A.
-        let key = [1u8; 32];
-        let env_a = snapshot_crypto::seal(&key, "session-A", b"A state").unwrap();
-        let substituted = json!({"structuredContent": {"rows": [
-            {"key": "session-B", "value": env_a.to_fact_value().unwrap()}
-        ]}});
+    fn fresh_session_rejects_stale_replayed_blob() {
+        // Rollback / replay defence: an old blob whose counter is at or below the
+        // high-water mark is rejected even though it authenticates under our key.
+        let dk = dk([1u8; 32], "fpr-a");
+        let stale = snapshot_crypto::seal(&dk.key, "fpr-a", "sess-1", 100, b"stale state").unwrap();
+        let envelopes = vec![stale];
+        // high-water already at 100: counter 100 is NOT strictly greater → reject.
         assert!(
-            decrypt_session_snapshot(&substituted, &key, "session-B").is_none(),
-            "value sealed for session-A must not open under a substituted key session-B"
+            open_latest_fresh(&envelopes, &dk, "sess-new", 100).is_none(),
+            "counter <= high-water must be rejected (replay)"
         );
+        // And a strictly-older one below the mark is likewise rejected.
+        assert!(open_latest_fresh(&envelopes, &dk, "sess-new", 150).is_none());
+        // But a newer counter is accepted and advances the story.
+        let newer = snapshot_crypto::seal(&dk.key, "fpr-a", "sess-2", 250, b"fresh state").unwrap();
+        let envelopes = vec![newer];
+        let opened = open_latest_fresh(&envelopes, &dk, "sess-new", 100).expect("newer accepted");
+        assert_eq!(opened.plaintext, b"fresh state");
     }
 
     #[test]
-    fn decrypt_session_snapshot_none_when_nothing_opens() {
-        let mine = [1u8; 32];
-        let sid = "sess-1";
-        let foreign = snapshot_crypto::seal(&[9u8; 32], sid, b"x").unwrap();
-        let result = json!({"structuredContent": {"rows": [{"key": sid, "value": foreign.to_fact_value().unwrap()}]}});
-        assert!(
-            decrypt_session_snapshot(&result, &mine, sid).is_none(),
-            "wrong passport must skip"
-        );
-        assert!(decrypt_session_snapshot(&json!({"structuredContent": {"rows": []}}), &mine, sid).is_none());
-        assert!(decrypt_session_snapshot(&json!({}), &mine, sid).is_none());
+    fn fresh_session_skips_tampered_high_counter_row_then_takes_next_authentic() {
+        // An attacker injects a row with a huge counter but garbage ciphertext to
+        // rank first; it must be skipped (auth fail), and the next authentic row
+        // taken. Injection can neither block restore nor be restored.
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let dk = dk([1u8; 32], "fpr-a");
+        let mut forged = snapshot_crypto::seal(&dk.key, "fpr-a", "sess-evil", 999, b"x").unwrap();
+        // Corrupt the ciphertext so auth fails while the (AAD-bound) counter stays high.
+        let mut ct = b64.decode(forged.ct.as_bytes()).unwrap();
+        ct[0] ^= 0xff;
+        forged.ct = b64.encode(&ct);
+        let good = snapshot_crypto::seal(&dk.key, "fpr-a", "sess-good", 300, b"real latest").unwrap();
+        let envelopes = vec![forged, good];
+        let opened = open_latest_fresh(&envelopes, &dk, "sess-new", 0).expect("authentic row taken");
+        assert_eq!(opened.plaintext, b"real latest");
+        assert_eq!(opened.counter, 300);
+    }
+
+    #[test]
+    fn parse_snapshot_envelopes_drops_garbage_and_handles_missing() {
+        let dk = dk([1u8; 32], "fpr-a");
+        let good = snapshot_crypto::seal(&dk.key, "fpr-a", "s1", 1, b"ok").unwrap();
+        let result = rows_result(&[
+            ("s1", good.to_fact_value().unwrap()),
+            ("s2", "not-a-valid-envelope".to_string()),
+        ]);
+        assert_eq!(parse_snapshot_envelopes(&result).len(), 1, "garbage row dropped");
+        assert!(parse_snapshot_envelopes(&json!({})).is_empty());
+        assert!(parse_snapshot_envelopes(&json!({"structuredContent": {"rows": []}})).is_empty());
     }
 
     #[test]
@@ -611,13 +765,13 @@ mod tests {
 
     #[test]
     fn render_snapshot_context_round_trips_state_json() {
-        let key = [4u8; 32];
+        let dk = dk([4u8; 32], "fpr-render");
         let sid = "sess-render";
         let state = json!({"cwd": "/proj", "recovery": {"branch": "main", "sha": "abc"}});
-        let env = snapshot_crypto::seal(&key, sid, &serde_json::to_vec(&state).unwrap()).unwrap();
-        let result = json!({"structuredContent": {"rows": [{"key": sid, "value": env.to_fact_value().unwrap()}]}});
-        let pt = decrypt_session_snapshot(&result, &key, sid).unwrap();
-        let ctx = render_snapshot_context(&pt);
+        let env = snapshot_crypto::seal(&dk.key, "fpr-render", sid, 1, &serde_json::to_vec(&state).unwrap()).unwrap();
+        let envelopes = vec![env];
+        let opened = open_same_session(&envelopes, &dk, sid).unwrap();
+        let ctx = render_snapshot_context(&opened.plaintext);
         assert!(
             ctx.contains("\"branch\": \"main\""),
             "restored state fields present: {ctx}"
