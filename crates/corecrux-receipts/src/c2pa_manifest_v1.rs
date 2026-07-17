@@ -108,6 +108,8 @@ pub enum C2paManifestError {
     ReceiptIdMismatch { expected: String, actual: String },
     #[error("unsupported manifest version: {0}")]
     UnsupportedVersion(String),
+    #[error("byok key/cert material error: {0}")]
+    KeyParse(String),
 }
 
 /// One C2PA action entry.
@@ -610,12 +612,31 @@ pub fn parse_jumbf_base64(envelope_b64: &str) -> Result<C2paSignedManifestV1, C2
         actions,
     };
     let canonical_body_bytes = canonical_body_bytes_v1(&manifest)?;
-    let canonical_body_hash = *blake3::hash(&canonical_body_bytes).as_bytes();
 
     let sig = json
         .get("signature")
         .ok_or(C2paManifestError::SignatureMissing)?
         .clone();
+
+    // Bind to the TRANSMITTED payload hash, not a recomputation of it: a
+    // verifier compares its own recomputation against THIS value, so a mutated
+    // or absent transmitted hash is caught (previously this was a tautology).
+    let transmitted_hash_b64 = sig
+        .get("signed_payload_hash_b64")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| C2paManifestError::Decode("missing signature.signed_payload_hash_b64".into()))?;
+    let transmitted_hash = base64::engine::general_purpose::STANDARD
+        .decode(transmitted_hash_b64)
+        .map_err(|e| C2paManifestError::Decode(format!("signed_payload_hash_b64 b64: {e}")))?;
+    if transmitted_hash.len() != 32 {
+        return Err(C2paManifestError::Decode(format!(
+            "signed_payload_hash_b64 must decode to 32 bytes, got {}",
+            transmitted_hash.len()
+        )));
+    }
+    let mut canonical_body_hash = [0u8; 32];
+    canonical_body_hash.copy_from_slice(&transmitted_hash);
+
     let sig_b64 = sig
         .get("signature_b64")
         .and_then(|v| v.as_str())
@@ -769,6 +790,201 @@ pub fn assert_crown_receipt_id_v1(
             actual: parsed.manifest.crown_receipt_id.clone(),
         })
     }
+}
+
+// ── BYOK P-256 (es256) signer + verifier ──────────────────────────────────
+//
+// The Vault PKI signer (`vault_pki_x509_signer`) holds keys server-side.
+// The W1 Provenance Marking Gateway is BYOK: the caller supplies their own
+// P-256 signing key + cert chain per request and we never persist it. Both
+// pieces below reuse the shared canonical-body pipeline so a BYOK-signed
+// envelope round-trips through the same `C2paSignedManifestV1` shape the
+// CLI already verifies.
+
+/// Upper bounds on BYOK material (defence against oversized/abusive input).
+pub const MAX_SIGNING_KEY_PEM_BYTES: usize = 16 * 1024;
+/// Upper bound on the total cert-chain PEM size.
+pub const MAX_CERT_CHAIN_BYTES: usize = 64 * 1024;
+/// Upper bound on the number of certs in a BYOK x5chain (leaf + intermediates).
+pub const MAX_X5CHAIN_CERTS: usize = 8;
+
+/// A bring-your-own-key ECDSA P-256 (**true ES256**, ECDSA-P256-SHA256)
+/// [`C2paSigner`]. Built from a PEM private key (PKCS#8 or SEC1) + a PEM cert
+/// chain (leaf first). `from_pem` proves the private key matches the leaf
+/// certificate's public key, so `/sign` cannot emit an envelope that `/verify`
+/// would immediately reject. Key material is never logged or echoed.
+pub struct ByokP256Signer {
+    signing_key: p256::ecdsa::SigningKey,
+    cert_chain_pem: String,
+    key_id: String,
+}
+
+impl ByokP256Signer {
+    /// Parse caller-supplied key + cert material. Accepts PKCS#8
+    /// (`BEGIN PRIVATE KEY`) or SEC1 (`BEGIN EC PRIVATE KEY`) private keys.
+    /// Rejects: oversized inputs, chains longer than `MAX_X5CHAIN_CERTS`,
+    /// a non-P-256 leaf, malformed intermediates, and — critically — a
+    /// private key that does not match the leaf certificate. Only
+    /// parse-failure *shape* is surfaced via [`C2paManifestError::KeyParse`];
+    /// key bytes are never included.
+    pub fn from_pem(
+        signing_key_pem: &str,
+        cert_chain_pem: &str,
+        key_id: impl Into<String>,
+    ) -> Result<Self, C2paManifestError> {
+        use p256::pkcs8::DecodePrivateKey as _;
+        use x509_cert::der::Decode as _;
+
+        if signing_key_pem.len() > MAX_SIGNING_KEY_PEM_BYTES {
+            return Err(C2paManifestError::KeyParse("signing key PEM exceeds size cap".into()));
+        }
+        if cert_chain_pem.len() > MAX_CERT_CHAIN_BYTES {
+            return Err(C2paManifestError::KeyParse("cert chain PEM exceeds size cap".into()));
+        }
+
+        let secret = p256::SecretKey::from_pkcs8_pem(signing_key_pem)
+            .or_else(|_| p256::SecretKey::from_sec1_pem(signing_key_pem))
+            .map_err(|_| C2paManifestError::KeyParse("private key is not a valid PKCS#8 or SEC1 P-256 PEM".into()))?;
+        let signing_key = p256::ecdsa::SigningKey::from(secret);
+        let signer_pub = p256::ecdsa::VerifyingKey::from(&signing_key);
+
+        let chain = split_pem_certs(cert_chain_pem);
+        if chain.is_empty() {
+            return Err(C2paManifestError::KeyParse(
+                "cert_chain_pem contains no CERTIFICATE blocks".into(),
+            ));
+        }
+        if chain.len() > MAX_X5CHAIN_CERTS {
+            return Err(C2paManifestError::KeyParse(
+                "cert chain has too many certificates".into(),
+            ));
+        }
+
+        // Leaf: parse, require a P-256 key, and prove it matches the private key.
+        let leaf_der = pem_cert_to_der(&chain[0])?;
+        let leaf_cert = x509_cert::Certificate::from_der(&leaf_der)
+            .map_err(|e| C2paManifestError::KeyParse(format!("leaf cert DER parse: {e}")))?;
+        let leaf_spki = leaf_cert
+            .tbs_certificate()
+            .subject_public_key_info()
+            .subject_public_key
+            .as_bytes()
+            .ok_or_else(|| C2paManifestError::KeyParse("leaf SPKI has non-octet public key bits".into()))?;
+        let leaf_pub = p256::ecdsa::VerifyingKey::from_sec1_bytes(leaf_spki)
+            .map_err(|_| C2paManifestError::KeyParse("leaf certificate public key is not P-256".into()))?;
+        if leaf_pub != signer_pub {
+            return Err(C2paManifestError::KeyParse(
+                "private key does not match the leaf certificate public key".into(),
+            ));
+        }
+
+        // Intermediates: reject any malformed cert up front.
+        for pem in &chain[1..] {
+            let der = pem_cert_to_der(pem)?;
+            x509_cert::Certificate::from_der(&der)
+                .map_err(|e| C2paManifestError::KeyParse(format!("intermediate cert DER parse: {e}")))?;
+        }
+
+        Ok(Self {
+            signing_key,
+            cert_chain_pem: cert_chain_pem.trim().to_string(),
+            key_id: key_id.into(),
+        })
+    }
+}
+
+impl C2paSigner for ByokP256Signer {
+    fn sign_body(&self, canonical_body_bytes: &[u8]) -> Result<SignedManifestParts, C2paManifestError> {
+        use p256::ecdsa::signature::Signer as _;
+        // True ES256: ECDSA P-256 over SHA-256 of the canonical body bytes —
+        // a real ES256 verifier accepts this given the bytes + leaf cert.
+        // (BLAKE3 stays the SEPARATE envelope-integrity hash in the envelope.)
+        let sig: p256::ecdsa::Signature = self
+            .signing_key
+            .try_sign(canonical_body_bytes)
+            .map_err(|e| C2paManifestError::KeyParse(format!("es256 sign failed: {e}")))?;
+        Ok(SignedManifestParts {
+            signature_bytes: sig.to_der().as_bytes().to_vec(),
+            signature_alg: "es256".to_string(),
+            key_id: self.key_id.clone(),
+            x5chain_pem: Some(format!("{}\n", self.cert_chain_pem)),
+        })
+    }
+}
+
+/// Verify a **true ES256** (ECDSA-P256-SHA256) signed manifest statelessly:
+/// the leaf verifying key is taken from the envelope's own `x5chain`, so this
+/// needs no external key. Rejects any non-`es256` envelope up front (no
+/// algorithm confusion), then checks:
+/// 1. the transmitted BLAKE3 payload hash matches a recomputation
+///    (`canonical_hash_match` — envelope integrity), and
+/// 2. the ECDSA-SHA256 signature over the canonical body verifies against the
+///    leaf key (`signature_valid`).
+///
+/// These are reported as INDEPENDENT fields — neither implies trust.
+///
+/// This only establishes internal consistency against the PRESENTED leaf.
+/// Chain-to-root / trust-list / identity validation is out of scope; the
+/// caller must treat the leaf as untrusted until it applies its own trust
+/// policy (see `corecruxctl c2pa-verify` for the chain walk).
+pub fn verify_c2pa_signed_manifest_es256_v1(
+    parsed: &C2paSignedManifestV1,
+    content_bytes: &[u8],
+) -> Result<C2paVerificationReportV1, C2paManifestError> {
+    use p256::ecdsa::signature::Verifier as _;
+    use x509_cert::der::Decode as _;
+
+    // Reject algorithm confusion before touching the signature bytes.
+    if parsed.signature_alg != "es256" {
+        return Err(C2paManifestError::Decode(format!(
+            "expected an es256 envelope, got alg {:?}",
+            parsed.signature_alg
+        )));
+    }
+
+    // Envelope integrity: recomputed BLAKE3 vs the TRANSMITTED payload hash
+    // (parse now binds `canonical_body_hash` to the transmitted value).
+    let recomputed = blake3::hash(&parsed.canonical_body_bytes);
+    let canonical_hash_match = *recomputed.as_bytes() == parsed.canonical_body_hash;
+
+    let chain_pem = parsed
+        .x5chain_pem
+        .as_deref()
+        .ok_or_else(|| C2paManifestError::Decode("es256 envelope is missing the x5chain".into()))?;
+    let chain = split_pem_certs(chain_pem);
+    let leaf_pem = chain
+        .first()
+        .ok_or_else(|| C2paManifestError::Decode("x5chain contains no certificates".into()))?;
+    let leaf_der = pem_cert_to_der(leaf_pem)?;
+    let leaf = x509_cert::Certificate::from_der(&leaf_der)
+        .map_err(|e| C2paManifestError::Decode(format!("leaf cert DER parse: {e}")))?;
+    let spki_bytes = leaf
+        .tbs_certificate()
+        .subject_public_key_info()
+        .subject_public_key
+        .as_bytes()
+        .ok_or_else(|| C2paManifestError::Decode("leaf SPKI has non-octet public key bits".into()))?;
+    let verifying_key = p256::ecdsa::VerifyingKey::from_sec1_bytes(spki_bytes)
+        .map_err(|e| C2paManifestError::Decode(format!("leaf SPKI is not a P-256 point: {e}")))?;
+    let sig = p256::ecdsa::Signature::from_der(&parsed.signature)
+        .map_err(|e| C2paManifestError::SignatureDecode(format!("es256 signature is not DER ECDSA: {e}")))?;
+
+    // True ES256: verify ECDSA-SHA256 over the canonical body bytes.
+    // Reported independently of the BLAKE3 envelope-integrity check.
+    let signature_valid = verifying_key.verify(&parsed.canonical_body_bytes, &sig).is_ok();
+
+    let content_hash = blake3::hash(content_bytes).to_hex().to_string();
+    let content_hash_match = content_hash == parsed.manifest.content_hash_blake3_hex;
+
+    Ok(C2paVerificationReportV1 {
+        manifest_id: parsed.manifest.manifest_id.clone(),
+        crown_receipt_id: parsed.manifest.crown_receipt_id.clone(),
+        signer_key_id: parsed.key_id.clone(),
+        canonical_hash_match,
+        signature_valid,
+        content_hash_match,
+        ok: canonical_hash_match && signature_valid && content_hash_match,
+    })
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -964,5 +1180,168 @@ mod tests {
         let envelope = base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&bad).unwrap());
         let err = parse_jumbf_base64(&envelope).unwrap_err();
         assert!(matches!(err, C2paManifestError::UnsupportedVersion(_)));
+    }
+
+    // ── BYOK P-256 (es256) round-trips ────────────────────────────────────
+
+    /// Generate a self-signed P-256 leaf + its PKCS#8 private key PEM,
+    /// standing in for the customer's BYOK material.
+    fn byok_material() -> (String, String) {
+        use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
+        let mut params = CertificateParams::new(vec!["byok.test".to_string()]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "byok signer TEST");
+        let kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let cert = params.self_signed(&kp).unwrap();
+        (kp.serialize_pem(), cert.pem())
+    }
+
+    fn byok_input<'a>(content: &'a [u8]) -> C2paManifestInputV1<'a> {
+        C2paManifestInputV1 {
+            content_bytes: content,
+            content_type: Some("image/png"),
+            crown_receipt_id: "r_byok",
+            signer_passport: "passport:byok",
+            claim_generator: "cuecrux/provenance-gateway-test",
+            manifest_id: "urn:cuecrux:c2pa:byok-1",
+            when: "2026-07-17T00:00:00Z",
+            model: None,
+        }
+    }
+
+    #[test]
+    fn byok_sign_verify_round_trip() {
+        let (key_pem, cert_pem) = byok_material();
+        let content = b"provenance-byok-content";
+        let signer = ByokP256Signer::from_pem(&key_pem, &cert_pem, "byok-leaf-1").unwrap();
+        let manifest = build_c2pa_manifest_v1(&byok_input(content));
+        let signed = sign_c2pa_manifest_via_signer(manifest, &signer, "2026-07-17T00:00:00Z").unwrap();
+        assert_eq!(signed.signature_alg, "es256");
+        assert!(signed.x5chain_pem.is_some());
+        // Round-trip through the JUMBF envelope like the HTTP surface does.
+        let parsed = parse_jumbf_base64(&signed.to_jumbf_base64()).unwrap();
+        let report = verify_c2pa_signed_manifest_es256_v1(&parsed, content).unwrap();
+        assert!(report.canonical_hash_match);
+        assert!(
+            report.signature_valid,
+            "BYOK es256 signature must verify from x5chain leaf"
+        );
+        assert!(report.content_hash_match);
+        assert!(report.ok);
+    }
+
+    #[test]
+    fn byok_verify_detects_tampered_content() {
+        let (key_pem, cert_pem) = byok_material();
+        let signer = ByokP256Signer::from_pem(&key_pem, &cert_pem, "k").unwrap();
+        let manifest = build_c2pa_manifest_v1(&byok_input(b"original-bytes"));
+        let signed = sign_c2pa_manifest_via_signer(manifest, &signer, "t").unwrap();
+        let parsed = parse_jumbf_base64(&signed.to_jumbf_base64()).unwrap();
+        // Verify against different content bytes than were signed.
+        let report = verify_c2pa_signed_manifest_es256_v1(&parsed, b"TAMPERED-bytes").unwrap();
+        assert!(report.signature_valid, "manifest signature itself stays valid");
+        assert!(!report.content_hash_match, "tampered content must not match bound hash");
+        assert!(!report.ok);
+    }
+
+    #[test]
+    fn byok_verify_rejects_corrupted_canonical_body() {
+        let (key_pem, cert_pem) = byok_material();
+        let signer = ByokP256Signer::from_pem(&key_pem, &cert_pem, "k").unwrap();
+        let manifest = build_c2pa_manifest_v1(&byok_input(b"x"));
+        let mut signed = sign_c2pa_manifest_via_signer(manifest, &signer, "t").unwrap();
+        // Flip a canonical body byte without updating the stored hash.
+        signed.canonical_body_bytes[0] ^= 0xff;
+        let report = verify_c2pa_signed_manifest_es256_v1(&signed, b"x").unwrap();
+        assert!(!report.canonical_hash_match);
+        assert!(!report.signature_valid, "corrupt canonical body must not validate");
+        assert!(!report.ok);
+    }
+
+    #[test]
+    fn byok_from_pem_rejects_garbage_key() {
+        let (_key_pem, cert_pem) = byok_material();
+        // `matches!` avoids requiring `Debug` on the Ok variant (the signer
+        // holds key material and deliberately does not derive Debug).
+        let res = ByokP256Signer::from_pem(
+            "-----BEGIN PRIVATE KEY-----\nnope\n-----END PRIVATE KEY-----",
+            &cert_pem,
+            "k",
+        );
+        assert!(matches!(res, Err(C2paManifestError::KeyParse(_))));
+    }
+
+    #[test]
+    fn byok_from_pem_rejects_key_cert_mismatch() {
+        // Key from one keypair, cert from another — /sign must not produce an
+        // envelope /verify would reject.
+        let (key_a, _cert_a) = byok_material();
+        let (_key_b, cert_b) = byok_material();
+        let res = ByokP256Signer::from_pem(&key_a, &cert_b, "k");
+        assert!(matches!(res, Err(C2paManifestError::KeyParse(_))));
+    }
+
+    #[test]
+    fn byok_signature_is_genuine_es256_over_sha256() {
+        // Independent test vector (NOT a same-impl round-trip): prove the
+        // signature is ECDSA-P256 over SHA-256 — real ES256 — and specifically
+        // that it is NOT a BLAKE3-prehash signature.
+        use p256::ecdsa::signature::hazmat::PrehashVerifier as _;
+        use sha2::{Digest as _, Sha256};
+        use x509_cert::der::Decode as _;
+
+        let (key_pem, cert_pem) = byok_material();
+        let content = b"es256-vector";
+        let signer = ByokP256Signer::from_pem(&key_pem, &cert_pem, "k").unwrap();
+        let manifest = build_c2pa_manifest_v1(&byok_input(content));
+        let signed = sign_c2pa_manifest_via_signer(manifest, &signer, "t").unwrap();
+
+        let chain = split_pem_certs(signed.x5chain_pem.as_ref().unwrap());
+        let leaf_der = pem_cert_to_der(&chain[0]).unwrap();
+        let leaf = x509_cert::Certificate::from_der(&leaf_der).unwrap();
+        let spki = leaf
+            .tbs_certificate()
+            .subject_public_key_info()
+            .subject_public_key
+            .as_bytes()
+            .unwrap();
+        let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(spki).unwrap();
+        let sig = p256::ecdsa::Signature::from_der(&signed.signature).unwrap();
+
+        let sha = Sha256::digest(&signed.canonical_body_bytes);
+        assert!(
+            vk.verify_prehash(&sha, &sig).is_ok(),
+            "signature must verify as ECDSA over SHA-256 (true ES256)"
+        );
+        let blake = blake3::hash(&signed.canonical_body_bytes);
+        assert!(
+            vk.verify_prehash(blake.as_bytes(), &sig).is_err(),
+            "must NOT verify as a BLAKE3-prehash signature"
+        );
+    }
+
+    #[test]
+    fn byok_verify_rejects_mutated_transmitted_hash() {
+        // Mutating the SERIALIZED envelope's transmitted payload hash (which an
+        // in-memory mutation would miss) must break canonical_hash_match.
+        let (key_pem, cert_pem) = byok_material();
+        let content = b"hash-bind";
+        let signer = ByokP256Signer::from_pem(&key_pem, &cert_pem, "k").unwrap();
+        let manifest = build_c2pa_manifest_v1(&byok_input(content));
+        let signed = sign_c2pa_manifest_via_signer(manifest, &signer, "t").unwrap();
+
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(signed.to_jumbf_base64())
+            .unwrap();
+        let mut env: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        env["signature"]["signed_payload_hash_b64"] =
+            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode([0u8; 32]));
+        let tampered = base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&env).unwrap());
+
+        let parsed = parse_jumbf_base64(&tampered).unwrap();
+        let report = verify_c2pa_signed_manifest_es256_v1(&parsed, content).unwrap();
+        assert!(!report.canonical_hash_match, "mutated transmitted hash must be caught");
+        assert!(!report.ok);
     }
 }
