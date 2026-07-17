@@ -822,7 +822,7 @@ pub struct ByokP256Signer {
 impl ByokP256Signer {
     /// Parse caller-supplied key + cert material. Accepts PKCS#8
     /// (`BEGIN PRIVATE KEY`) or SEC1 (`BEGIN EC PRIVATE KEY`) private keys.
-    /// Rejects: oversized inputs, chains longer than [`MAX_X5CHAIN_CERTS`],
+    /// Rejects: oversized inputs, chains longer than `MAX_X5CHAIN_CERTS`,
     /// a non-P-256 leaf, malformed intermediates, and — critically — a
     /// private key that does not match the leaf certificate. Only
     /// parse-failure *shape* is surfaced via [`C2paManifestError::KeyParse`];
