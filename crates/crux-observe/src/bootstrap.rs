@@ -151,7 +151,7 @@ impl BootstrapSeeder {
         let store = self.fact_store.read().await;
         let seeded = {
             let result = store.query(&FactQuery {
-            min_effective_confidence: None,
+                min_effective_confidence: None,
                 tenant_hash: None,
                 query: None,
                 entity: Some(SENTINEL_ENTITY.to_string()),

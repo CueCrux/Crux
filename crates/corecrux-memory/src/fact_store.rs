@@ -428,7 +428,7 @@ pub struct FactQuery {
 }
 
 impl Default for FactQuery {
-    /// `top_k` defaults to [`default_top_k`] (10), matching the serde default —
+    /// `top_k` defaults to `default_top_k()` (10), matching the serde default —
     /// so `..Default::default()` construction never silently yields `top_k = 0`.
     /// Future field adds only need a line here, not an edit at every call site.
     fn default() -> Self {
