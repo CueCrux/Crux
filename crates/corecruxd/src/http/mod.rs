@@ -63,6 +63,7 @@ mod policy;
 mod principal;
 mod projections;
 mod projects;
+mod provenance;
 mod punchcards;
 mod query;
 mod quota;
@@ -819,6 +820,23 @@ pub(crate) fn router_with_route_auth(
         .route(
             "/v1/credits/spend",
             axum::routing::post(self::credit_meter::post_credit_spend),
+        )
+        // W1 Provenance Marking Gateway (BYOK). Default OFF
+        // (CORECRUXD_FEATURE_PROVENANCE_API); size-capped per route.
+        .route(
+            "/v1/provenance/sign",
+            axum::routing::post(self::provenance::post_provenance_sign)
+                .layer(axum::extract::DefaultBodyLimit::max(self::provenance::PROVENANCE_MAX_UPLOAD_BYTES)),
+        )
+        .route(
+            "/v1/provenance/verify",
+            axum::routing::post(self::provenance::post_provenance_verify)
+                .layer(axum::extract::DefaultBodyLimit::max(self::provenance::PROVENANCE_MAX_UPLOAD_BYTES)),
+        )
+        .route(
+            "/v1/provenance/verify-record",
+            axum::routing::post(self::provenance::post_provenance_verify_record)
+                .layer(axum::extract::DefaultBodyLimit::max(self::provenance::PROVENANCE_MAX_UPLOAD_BYTES)),
         )
         // Provider-agnostic injection-bundle surface (context_bundle/v1).
         // Gated by CORECRUXD_CONTEXT_SURFACE (default OFF → 404).

@@ -983,6 +983,7 @@ dependencies = [
  "prometheus",
  "prost",
  "rand 0.10.2",
+ "rcgen",
  "rcx-capability-token",
  "regex",
  "roxmltree",
