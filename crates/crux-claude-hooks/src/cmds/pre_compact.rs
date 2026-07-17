@@ -90,7 +90,15 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
 /// sent ONLY to a verified-loopback daemon; a non-loopback endpoint is skipped
 /// so plaintext never egresses. Best-effort — daemon-unreachable is non-fatal.
 fn save_session_sealed(session_key: &str, session_id: &str, state: &Value) {
-    let state_field = match snapshot_crypto::derive_snapshot_key() {
+    // Finding 5 synergy: if the bearer reuses the seed, a key derived from that
+    // seed is server-known — encrypting is fake protection. Treat it as no-key so
+    // the plaintext-to-loopback-only rule below applies (remote ⇒ skipped).
+    let derived = if snapshot_crypto::bearer_reuses_passport_seed() {
+        None
+    } else {
+        snapshot_crypto::derive_snapshot_key()
+    };
+    let state_field = match derived {
         Some(key) => match seal_state_value(&key, session_id, state) {
             Ok(enc) => json!({ "enc": enc }),
             Err(err) => {
@@ -150,6 +158,15 @@ fn endpoint_is_loopback(url: &str) -> bool {
 fn store_encrypted_snapshot(session_id: &str, state: &Value) {
     // Explicit opt-in gate first (no key derivation, no network probe when off).
     if !snapshot_crypto::hosted_sync_enabled() {
+        return;
+    }
+    // Finding 5: refuse if the bearer token IS the passport seed — the server
+    // would then hold the key material. Generic config error, no values echoed.
+    if snapshot_crypto::bearer_reuses_passport_seed() {
+        eprintln!(
+            "crux-hook pre-compact: refusing hosted snapshot sync — CRUX_AGENT_TOKEN reuses the \
+             passport seed (config error); the server must never receive the key material"
+        );
         return;
     }
     // No passport seed ⇒ no key ⇒ nothing to encrypt/sync (local file read only).

@@ -217,6 +217,37 @@ fn no_plaintext_egress_in_any_request_with_seed_present() {
 }
 
 #[test]
+fn bearer_equal_to_seed_refuses_hosted_sync() {
+    // Finding 5: if CRUX_AGENT_TOKEN IS the passport seed, the server would hold
+    // the key material — refuse to enable hosted snapshot sync (no store_fact),
+    // even with the flag on. (save_session to this loopback mock is allowed.)
+    let _guard = env_lock().lock().unwrap();
+    let seed_hex = "3a".repeat(32); // valid 64-hex seed
+    let key_file = std::env::temp_dir().join(format!("egress-reuse-passport-{}.key", std::process::id()));
+    std::fs::write(&key_file, &seed_hex).unwrap();
+
+    let mock = CapturingMock::spawn();
+
+    let _e1 = EnvVar::set("CRUX_MCP_URL", &mock.url);
+    let _e2 = EnvVar::set("CRUX_PASSPORT_KEY_PATH", key_file.to_str().unwrap());
+    let _e3 = EnvVar::set("CRUX_COMPACTION_SYNC", "1");
+    let _e4 = EnvVar::set("CRUX_AGENT_TOKEN", &seed_hex); // bearer == seed (the misconfig)
+    let _e5 = EnvVar::unset("CRUX_HOOK_OBSERVE_CAPTURE");
+    let _e6 = EnvVar::unset("CRUX_HOOK_PRE_COMPACT");
+
+    crux_claude_hooks::cmds::pre_compact::run(std::io::Cursor::new(precompact_input())).unwrap();
+
+    let requests = mock.finish();
+    std::fs::remove_file(&key_file).ok();
+
+    let joined = requests.join("\n----\n");
+    assert!(
+        !joined.contains("store_fact"),
+        "hosted snapshot sync must be refused when the bearer reuses the seed:\n{joined}"
+    );
+}
+
+#[test]
 fn flag_off_makes_no_encrypted_fact_calls() {
     // Finding 6: with the sync flag unset, the hosted-fact path must not fire —
     // no sync_status, no store_fact, no query_facts — even with a seed present.

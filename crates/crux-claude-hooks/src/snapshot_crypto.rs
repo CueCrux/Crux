@@ -278,6 +278,46 @@ pub fn passport_key_path_from_env() -> Option<PathBuf> {
 // lives unzeroized inside `crux_session::LocalPassportKey` (shared crate, every
 // `derive_subkey` caller) — a broader hardening tracked separately, out of scope
 // for this hook-local key path.
+/// True when `CRUX_AGENT_TOKEN` (the server-visible bearer credential) equals
+/// the passport seed in any canonical representation — lowercase/uppercase hex,
+/// or standard base64 of the decoded seed (Finding 5).
+///
+/// Reusing the seed as the bearer would hand the server the exact material the
+/// snapshot key is derived from, voiding "unreadable to us". Callers refuse to
+/// enable hosted sync when this returns true. Neither value is logged; both are
+/// held in [`Zeroizing`] while compared.
+#[must_use]
+pub fn bearer_reuses_passport_seed() -> bool {
+    let Some(token) = std::env::var("CRUX_AGENT_TOKEN").ok().filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    let token = Zeroizing::new(token);
+    let Some(path) = passport_key_path_from_env() else {
+        return false;
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let raw = Zeroizing::new(raw);
+    let seed_hex = raw.trim();
+    if seed_hex.is_empty() {
+        return false;
+    }
+    // Hex form: the file is lowercase, but a reused token might be uppercased.
+    if token.trim().eq_ignore_ascii_case(seed_hex) {
+        return true;
+    }
+    // Standard base64 of the decoded seed bytes.
+    if let Ok(bytes) = hex::decode(seed_hex) {
+        let bytes = Zeroizing::new(bytes);
+        let b64 = Zeroizing::new(B64.encode(bytes.as_slice()));
+        if token.trim() == b64.as_str() {
+            return true;
+        }
+    }
+    false
+}
+
 #[must_use]
 pub fn derive_snapshot_key() -> Option<Zeroizing<[u8; 32]>> {
     let path = passport_key_path_from_env()?;
@@ -445,6 +485,51 @@ mod tests {
         let env = seal(&k_a, SID, b"cross-device snapshot").expect("seal");
         assert_eq!(open(&k_b, SID, &env).expect("open"), b"cross-device snapshot");
         assert_eq!(open(&k_other, SID, &env), Err(SnapshotCryptoError::DecryptFailed));
+    }
+
+    #[test]
+    fn bearer_reuses_passport_seed_detects_hex_and_base64() {
+        // Finding 5: reject CRUX_AGENT_TOKEN == passport seed in any canonical form.
+        let _env = crate::test_support::env_guard();
+        let prev_tok = std::env::var("CRUX_AGENT_TOKEN").ok();
+        let prev_path = std::env::var("CRUX_PASSPORT_KEY_PATH").ok();
+
+        let seed = [0x5au8; 32];
+        let seed_hex = hex::encode(seed);
+        let key_file = std::env::temp_dir().join(format!("f5-seed-{}.key", rand::random::<u64>()));
+        std::fs::write(&key_file, &seed_hex).unwrap();
+        std::env::set_var("CRUX_PASSPORT_KEY_PATH", &key_file);
+
+        // Hex reuse (lowercase and uppercase) is caught.
+        std::env::set_var("CRUX_AGENT_TOKEN", &seed_hex);
+        assert!(bearer_reuses_passport_seed(), "lowercase hex seed reuse must be caught");
+        std::env::set_var("CRUX_AGENT_TOKEN", seed_hex.to_uppercase());
+        assert!(bearer_reuses_passport_seed(), "uppercase hex seed reuse must be caught");
+
+        // Base64-of-seed reuse is caught.
+        std::env::set_var("CRUX_AGENT_TOKEN", B64.encode(seed));
+        assert!(bearer_reuses_passport_seed(), "base64 seed reuse must be caught");
+
+        // A distinct bearer is fine.
+        std::env::set_var("CRUX_AGENT_TOKEN", "totally-unrelated-bearer-token-000000");
+        assert!(
+            !bearer_reuses_passport_seed(),
+            "an unrelated bearer must not trip the guard"
+        );
+
+        // No token ⇒ not a conflict.
+        std::env::remove_var("CRUX_AGENT_TOKEN");
+        assert!(!bearer_reuses_passport_seed());
+
+        std::fs::remove_file(&key_file).ok();
+        match prev_tok {
+            Some(v) => std::env::set_var("CRUX_AGENT_TOKEN", v),
+            None => std::env::remove_var("CRUX_AGENT_TOKEN"),
+        }
+        match prev_path {
+            Some(v) => std::env::set_var("CRUX_PASSPORT_KEY_PATH", v),
+            None => std::env::remove_var("CRUX_PASSPORT_KEY_PATH"),
+        }
     }
 
     #[test]

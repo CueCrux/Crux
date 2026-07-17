@@ -245,6 +245,10 @@ fn restore_snapshot_section(source: Option<&str>, session_id: &str) -> Option<St
     if !snapshot_crypto::hosted_sync_enabled() {
         return None;
     }
+    // Finding 5: refuse if the bearer token IS the passport seed (server-known key).
+    if snapshot_crypto::bearer_reuses_passport_seed() {
+        return None;
+    }
     let key = snapshot_crypto::derive_snapshot_key()?;
     let result = mcp_client::call_tool(
         "query_facts",
