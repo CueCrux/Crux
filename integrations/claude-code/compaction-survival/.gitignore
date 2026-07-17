@@ -1,0 +1,3 @@
+# The repo-root .gitignore ignores *.jsonl; re-include the self-test fixture so
+# selftest.sh and the kit's build-zip.sh work from a fresh clone.
+!fixtures/transcript.jsonl
