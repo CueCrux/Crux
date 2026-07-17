@@ -437,6 +437,18 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    /// F4 (hosted-compaction-sync-encrypted review): the 32-byte passport seed
+    /// must be wiped when the key drops. `ed25519_dalek::SigningKey` implements
+    /// `ZeroizeOnDrop` — and its `Drop` zeroizes `secret_key` (the seed) — ONLY
+    /// under the crate's `zeroize` feature. This compile-time bound fails to build
+    /// if that feature is ever disabled (e.g. a stray `default-features = false`),
+    /// which would silently leave the seed un-zeroized on drop.
+    #[test]
+    fn signing_key_zeroizes_seed_on_drop() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<SigningKey>();
+    }
+
     #[test]
     fn passport_key_signs_hash_with_ed25519() {
         use ed25519_dalek::Verifier as _;

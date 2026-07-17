@@ -375,10 +375,11 @@ pub fn bearer_reuses_passport_seed() -> bool {
 /// `Zeroizing<[u8; 32]>` derefs to `[u8; 32]`, so callers pass `&dk.key`
 /// unchanged to [`seal`] / [`open`] via deref coercion.
 ///
-// ponytail: this zeroizes the *derived* key. The passport *seed* itself still
-// lives unzeroized inside `crux_session::LocalPassportKey` (shared crate, every
-// `derive_subkey` caller) — a broader hardening tracked separately, out of scope
-// for this hook-local key path.
+// This zeroizes the *derived* key. The passport *seed* inside
+// `crux_session::LocalPassportKey` is the `secret_key` of an `ed25519_dalek::SigningKey`,
+// which wipes itself on drop via the crate's `zeroize` feature (pinned explicitly in the
+// workspace root; compaction-sync review F4). So both the seed and this derived key are
+// zeroized on drop.
 pub struct DerivedSnapshotKey {
     pub scope: String,
     pub key: Zeroizing<[u8; 32]>,
