@@ -156,6 +156,7 @@ pub(crate) async fn get_agent_passport(ctx: &McpContext) -> Option<PassportRecor
 pub(crate) async fn get_passport_by_name(ctx: &McpContext, name: &str) -> Option<PassportRecord> {
     let entity = format!("{PASSPORT_PREFIX}{name}");
     let q = FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: Some(entity),

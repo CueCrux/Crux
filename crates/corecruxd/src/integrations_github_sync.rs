@@ -222,6 +222,7 @@ fn sync_one_repo(
 
 fn record_exists(store: &FactStore, entity: &str) -> bool {
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: Some(entity.to_string()),

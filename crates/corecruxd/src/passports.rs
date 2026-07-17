@@ -152,6 +152,7 @@ fn clean_meta(v: Option<String>) -> Option<String> {
 
 pub fn list_passports(store: &FactStore, category_filter: Option<&str>) -> Vec<PassportRecord> {
     let result = store.query(&FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: None,
@@ -277,6 +278,7 @@ pub fn delete_passport(store: &mut FactStore, id: &str) -> Result<(), PassportsE
     let record = get_passport(store, id).ok_or_else(|| PassportsError::NotFound(id.to_string()))?;
     let entity = format!("{PASSPORT_ENTITY_PREFIX}::{}", record.id);
     let result = store.query(&FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: Some(entity),

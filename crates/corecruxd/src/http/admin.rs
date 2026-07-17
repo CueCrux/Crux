@@ -2366,6 +2366,7 @@ pub(super) async fn get_sharing_posture(State(state): State<AppState>, headers: 
     // returns all versions; dedup to latest per (entity, key) so the rollup
     // reflects the *current* state, not the journal depth.
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: None,
@@ -2456,6 +2457,7 @@ pub(super) async fn post_sharing_backfill(
     let candidates: Vec<corecrux_memory::fact_store::Fact> = {
         let store = state.fact_store.read().await;
         let result = store.query(&corecrux_memory::fact_store::FactQuery {
+            min_effective_confidence: None,
             tenant_hash: None,
             query: None,
             entity: None,

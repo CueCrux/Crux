@@ -36,6 +36,7 @@ impl ColdGate {
     pub async fn pull(&self, query: &str, top_k: usize, token_budget: Option<usize>) -> ColdPullResult {
         let store = self.fact_store.read().await;
         let result = store.query(&FactQuery {
+            min_effective_confidence: None,
             tenant_hash: None,
             query: Some(query.to_string()),
             entity: None,

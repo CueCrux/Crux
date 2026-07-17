@@ -229,6 +229,7 @@ pub fn get_grant(store: &FactStore, extension_id: &str, passport_fpr: &str) -> O
 pub fn list_grants_for_extension(store: &FactStore, extension_id: &str) -> Vec<ExtensionGrant> {
     let prefix = format!("{GRANT_ENTITY_PREFIX}::{extension_id}::");
     let result = store.query(&FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: Some(prefix.clone()),
         entity: None,
@@ -255,6 +256,7 @@ pub fn list_grants_for_passport(store: &FactStore, passport_fpr: &str) -> Vec<Ex
     // Cheap: per-daemon grant counts are expected to be ≤ low hundreds.
     let prefix = format!("{GRANT_ENTITY_PREFIX}::");
     let result = store.query(&FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: Some(prefix.clone()),
         entity: None,

@@ -863,6 +863,7 @@ fn fact_context_for_domain(
 ) -> DomainContribution {
     let query = first_party_query(tenant_id, input, domain, domain_terms);
     let result = store.query(&FactQuery {
+        min_effective_confidence: None,
         query: Some(query),
         entity: None,
         tenant_hash: None,

@@ -244,6 +244,7 @@ pub(super) async fn get_plane_layers(
     let store = state.fact_store.read().await;
     let prefix = format!("{PLANE_LAYER_PREFIX}::{project_id}::{plane_id}::");
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: Some(prefix.clone()),
         entity: None,

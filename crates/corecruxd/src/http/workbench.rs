@@ -937,6 +937,7 @@ fn query_facts(store: &FactStore, query: Option<&str>, entity_prefix: Option<&st
     crate::fact_helpers::dedup_latest(
         store
             .query(&FactQuery {
+                min_effective_confidence: None,
                 tenant_hash: None,
                 query: query.map(str::to_string),
                 entity: None,

@@ -180,6 +180,7 @@ pub async fn handle_memory_view(args: &Value, ctx: &McpContext) -> Result<Value,
     let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
 
     let q = FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: entity.clone(),

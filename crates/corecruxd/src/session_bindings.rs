@@ -93,6 +93,7 @@ pub fn write_binding(store: &mut FactStore, binding: &SessionBinding) -> Result<
 
 pub fn list_bindings(store: &FactStore) -> Vec<SessionBinding> {
     let result = store.query(&FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: None,
@@ -152,6 +153,7 @@ pub struct BindingCounts {
 /// already knows the session id (the `resolve_principal` path).
 pub fn get_binding(store: &FactStore, session_id_hex: &str) -> Option<SessionBinding> {
     let result = store.query(&FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: Some(format!("{SESSION_BINDING_ENTITY_PREFIX}::{session_id_hex}")),

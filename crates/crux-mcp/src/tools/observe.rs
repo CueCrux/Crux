@@ -23,6 +23,7 @@ pub async fn handle_get_gaps(args: &Value, ctx: &McpContext) -> Result<Value, Js
     let filter = args.get("query").and_then(|v| v.as_str()).map(|s| s.to_string());
 
     let q = FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: filter.clone(),
         entity: None,

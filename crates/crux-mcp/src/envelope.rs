@@ -374,6 +374,7 @@ pub async fn build_envelope_for_query_facts(args: &Value, ctx: &McpContext) -> E
     let agent_name = scope::agent_name(ctx.agent.as_ref());
 
     let q = FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query,
         entity,

@@ -199,6 +199,7 @@ fn calling_passport_fpr(ctx: &McpContext) -> Option<String> {
 
 fn installed_extensions(store: &corecrux_memory::FactStore) -> Vec<InstalledExtension> {
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: None,
@@ -215,6 +216,7 @@ fn installed_extensions(store: &corecrux_memory::FactStore) -> Vec<InstalledExte
 
 fn grants_for_passport(store: &corecrux_memory::FactStore, passport_fpr: &str) -> Vec<ExtensionGrant> {
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: None,

@@ -25,7 +25,7 @@
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 
-use corecrux_memory::fact_store::HorizonClass;
+use corecrux_memory::fact_store::{Fact, HorizonClass};
 use corecrux_projections::decay;
 
 use crate::dispatch::McpContext;
@@ -518,13 +518,47 @@ fn render_freshness_text(rows: &[Value]) -> String {
 /// corecrux-projections::decay's HorizonClass (intentionally separate
 /// to keep `decay` dependency-free). Both encodings carry the same
 /// four variants; this conversion is total and infallible.
-pub(crate) fn projection_class_of(c: HorizonClass) -> decay::HorizonClass {
+pub fn projection_class_of(c: HorizonClass) -> decay::HorizonClass {
     match c {
         HorizonClass::Volatile => decay::HorizonClass::Volatile,
         HorizonClass::Medium => decay::HorizonClass::Medium,
         HorizonClass::Stable => decay::HorizonClass::Stable,
         HorizonClass::None => decay::HorizonClass::None,
     }
+}
+
+/// Recall-time EFFECTIVE confidence of a fact: its STORED confidence, demoted
+/// by the stale factor once the fact has decayed to [`decay::Freshness::Stale`]
+/// (salience-aware, matching the ranking key `query_facts` sorts by). Pure —
+/// never mutates stored confidence.
+///
+/// This is the single source of truth for the value the P2
+/// `min_effective_confidence` floor filters on, shared by the MCP `query_facts`
+/// handler and the `GET /v1/facts` HTTP surface so both agree byte-for-byte.
+pub fn fact_effective_confidence(fact: &Fact, now: DateTime<Utc>, policy: decay::DecayPolicy) -> f64 {
+    let fresh = decay::apply_at_chrono_salient(
+        projection_class_of(fact.horizon_class),
+        fact.stored_at,
+        fact.reverified_at,
+        fact.access_count,
+        now,
+        policy,
+    );
+    decay::effective_confidence(fact.confidence as f64, fresh)
+}
+
+/// Recall-time freshness class of a fact (Fresh / Stale / Unknown),
+/// salience-aware. Reused by the consolidation scheduler's stale-past-horizon
+/// expiry-candidate detection (P1) so "stale" means exactly what recall means.
+pub fn fact_freshness(fact: &Fact, now: DateTime<Utc>, policy: decay::DecayPolicy) -> decay::Freshness {
+    decay::apply_at_chrono_salient(
+        projection_class_of(fact.horizon_class),
+        fact.stored_at,
+        fact.reverified_at,
+        fact.access_count,
+        now,
+        policy,
+    )
 }
 
 /// Test-support hook: shared mutex serializing access to

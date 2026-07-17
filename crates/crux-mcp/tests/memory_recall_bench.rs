@@ -154,6 +154,7 @@ fn recall_at_k_over_locomo_style_fixture() {
         let mut hits = 0usize;
         for (query, expected) in probes {
             let q = FactQuery {
+                min_effective_confidence: None,
                 tenant_hash: None,
                 query: Some((*query).to_string()),
                 entity: None,
@@ -261,6 +262,7 @@ fn stale_leak_rate_is_zero_after_correction() {
         insert_at(&mut s, entity, key, fresh_value, 1.0, *horizon, now);
 
         let q = FactQuery {
+            min_effective_confidence: None,
             tenant_hash: None,
             query: Some((*key).to_string()),
             entity: Some((*entity).to_string()),
@@ -354,6 +356,7 @@ fn bitemporal_as_of_recovers_world_state() {
     );
 
     let q = FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: Some("person:alice".into()),

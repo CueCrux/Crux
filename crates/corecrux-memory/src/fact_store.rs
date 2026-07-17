@@ -413,6 +413,18 @@ pub struct FactQuery {
     #[serde(default = "default_top_k")]
     pub top_k: usize,
     pub token_budget: Option<usize>,
+    /// Confidence floor (P2): drop facts whose recall-time EFFECTIVE
+    /// confidence (stored confidence, stale-demoted per
+    /// `corecrux_projections::decay`) is below this. `None` = no floor
+    /// (default; behaviour unchanged).
+    ///
+    /// NOTE: the store's own [`FactStore::query`] ranks by *raw* confidence
+    /// and does NOT enforce this (the low-level store has no decay dependency).
+    /// It is honoured by the recall surfaces that compute effective confidence:
+    /// the MCP `query_facts` handler and `GET /v1/facts`. The field is carried
+    /// here so those surfaces can pass it through one query struct.
+    #[serde(default)]
+    pub min_effective_confidence: Option<f32>,
 }
 
 fn default_top_k() -> usize {
@@ -2145,6 +2157,7 @@ mod tests {
         // A lexically-overlapping query must surface the terraform fact first,
         // ranked by cosine (keyword substring filtering is bypassed when dense).
         let result = store.query(&FactQuery {
+            min_effective_confidence: None,
             query: Some("terraform infrastructure drift".to_string()),
             entity: None,
             tenant_hash: None,
@@ -2276,6 +2289,7 @@ mod tests {
         });
 
         let result = store.query(&FactQuery {
+            min_effective_confidence: None,
             tenant_hash: None,
             entity_prefix: None,
             query: Some("deployment".to_string()),
@@ -2608,6 +2622,7 @@ mod tests {
         }
 
         let result = store.query(&FactQuery {
+            min_effective_confidence: None,
             tenant_hash: None,
             entity_prefix: None,
             query: None,
@@ -2723,6 +2738,7 @@ mod tests {
         });
 
         let result = store.query(&FactQuery {
+            min_effective_confidence: None,
             tenant_hash: None,
             entity_prefix: None,
             query: Some("keyword".to_string()),
@@ -2754,6 +2770,7 @@ mod tests {
         }
 
         let result = store.query(&FactQuery {
+            min_effective_confidence: None,
             tenant_hash: None,
             entity_prefix: None,
             query: None,
@@ -2784,6 +2801,7 @@ mod tests {
         store.store(request("tenant-b"));
 
         let result = store.query(&FactQuery {
+            min_effective_confidence: None,
             query: None,
             entity: None,
             tenant_hash: Some("tenant-a".to_string()),
@@ -2844,6 +2862,7 @@ mod tests {
         }
 
         let result = store.query(&FactQuery {
+            min_effective_confidence: None,
             query: None,
             entity: None,
             tenant_hash: None,
@@ -2861,6 +2880,7 @@ mod tests {
         let store = FactStore::new();
 
         let result = store.query(&FactQuery {
+            min_effective_confidence: None,
             tenant_hash: None,
             entity_prefix: None,
             query: Some("anything".to_string()),
@@ -3008,6 +3028,7 @@ mod tests {
 
         // Query matching key name
         let result = store.query(&FactQuery {
+            min_effective_confidence: None,
             tenant_hash: None,
             entity_prefix: None,
             query: Some("deployment".to_string()),
@@ -3019,6 +3040,7 @@ mod tests {
 
         // Query matching entity name
         let result = store.query(&FactQuery {
+            min_effective_confidence: None,
             tenant_hash: None,
             entity_prefix: None,
             query: Some("server".to_string()),
@@ -3046,6 +3068,7 @@ mod tests {
         });
 
         let result = store.query(&FactQuery {
+            min_effective_confidence: None,
             tenant_hash: None,
             entity_prefix: None,
             query: Some("zzz_nonexistent_zzz".to_string()),
@@ -3084,6 +3107,7 @@ mod tests {
         });
 
         let result = store.query(&FactQuery {
+            min_effective_confidence: None,
             tenant_hash: None,
             entity_prefix: None,
             query: Some("match".to_string()),
@@ -3115,6 +3139,7 @@ mod tests {
         }
 
         let result = store.query(&FactQuery {
+            min_effective_confidence: None,
             tenant_hash: None,
             entity_prefix: None,
             query: Some("shared".to_string()),
@@ -3145,6 +3170,7 @@ mod tests {
 
         // Token budget smaller than the single fact — should still include it
         let result = store.query(&FactQuery {
+            min_effective_confidence: None,
             tenant_hash: None,
             entity_prefix: None,
             query: None,
@@ -4113,6 +4139,7 @@ mod tests {
         assert!(store.set_validity(&new.fact_id, Some(ts("2026-06-01T00:00:00Z")), None));
 
         let q = FactQuery {
+            min_effective_confidence: None,
             tenant_hash: None,
             query: None,
             entity: Some("person:alice".into()),

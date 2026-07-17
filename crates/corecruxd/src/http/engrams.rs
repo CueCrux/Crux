@@ -283,6 +283,7 @@ pub(super) async fn resolve_engrams(
 fn local_catalog_with_overlays(store: &corecrux_memory::FactStore) -> Vec<LocalEngram> {
     let mut out = builtin_engrams();
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: None,

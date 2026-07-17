@@ -533,6 +533,7 @@ pub fn match_plane_to_modules_pub(
 fn read_project_layers(store: &corecrux_memory::FactStore, project_id: &str) -> BTreeMap<String, String> {
     let prefix = format!("__project_layer__::{project_id}::");
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: Some(prefix.clone()),
         entity: None,
@@ -555,6 +556,7 @@ fn read_project_layers(store: &corecrux_memory::FactStore, project_id: &str) -> 
 fn read_plane_layers(store: &corecrux_memory::FactStore, project_id: &str, plane_id: &str) -> BTreeMap<String, String> {
     let prefix = format!("__plane_layer__::{project_id}::{plane_id}::");
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: Some(prefix.clone()),
         entity: None,

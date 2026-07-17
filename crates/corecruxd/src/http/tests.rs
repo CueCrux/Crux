@@ -2405,6 +2405,7 @@ async fn query_facts_by_keyword() {
     }
 
     let params = QueryFactsParams {
+        min_effective_confidence: None,
         query: Some("canary".to_string()),
         entity: None,
         entity_prefix: None,
@@ -2465,6 +2466,7 @@ async fn query_facts_as_of_filters_world_time() {
     }
 
     let params = QueryFactsParams {
+        min_effective_confidence: None,
         query: None,
         entity: Some("person:zoe".to_string()),
         entity_prefix: None,
@@ -2494,6 +2496,7 @@ async fn query_facts_as_of_filters_world_time() {
 
     // A bad (unparseable) as_of → 400.
     let bad = QueryFactsParams {
+        min_effective_confidence: None,
         query: None,
         entity: None,
         entity_prefix: None,
@@ -2528,6 +2531,7 @@ async fn query_facts_no_params_returns_all() {
     }
 
     let params = QueryFactsParams {
+        min_effective_confidence: None,
         query: None,
         entity: None,
         entity_prefix: None,
@@ -2542,6 +2546,51 @@ async fn query_facts_no_params_returns_all() {
     let body = json_body(resp).await;
     let facts = body["facts"].as_array().expect("facts array");
     assert_eq!(facts.len(), 3);
+}
+
+#[tokio::test]
+async fn query_facts_min_effective_confidence_floor_filters_and_counts() {
+    // P2 (M7): GET /v1/facts?min_effective_confidence drops below-floor facts and
+    // reports `filtered_below_threshold`. Fresh facts have effective == stored
+    // confidence, so a 0.5 floor keeps the 0.9 fact and drops the 0.3 fact.
+    let state = test_app_state(16);
+    for (key, conf) in [("hi", 0.9f32), ("lo", 0.3f32)] {
+        let body = corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "floor-test".to_string(),
+            key: key.to_string(),
+            value: format!("v-{key}"),
+            source_receipt: None,
+            confidence: conf,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        };
+        let _ = facts::put_fact(State(state.clone()), HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+    }
+
+    let params = QueryFactsParams {
+        min_effective_confidence: Some(0.5),
+        query: None,
+        entity: Some("floor-test".to_string()),
+        entity_prefix: None,
+        top_k: None,
+        token_budget: None,
+        as_of: None,
+    };
+    let resp = facts::query_facts(State(state), HeaderMap::new(), Query(params))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["facts"].as_array().unwrap().len(),
+        1,
+        "only the 0.9 fact clears the 0.5 floor"
+    );
+    assert_eq!(body["filtered_below_threshold"], 1);
 }
 
 // ── Case store (POST /v1/cases, /v1/cases/retrieve) ─────────────
@@ -2634,6 +2683,7 @@ async fn query_facts_accepts_admin_read_fallback_in_dev_scopes_mode() {
         .into_response();
 
     let params = QueryFactsParams {
+        min_effective_confidence: None,
         query: Some("green".to_string()),
         entity: None,
         entity_prefix: None,
@@ -2981,6 +3031,7 @@ async fn query_facts_supports_entity_prefix_top_k_and_token_budget() {
     }
 
     let params = QueryFactsParams {
+        min_effective_confidence: None,
         query: None,
         entity: None,
         entity_prefix: Some("proj-a".to_string()),
@@ -3041,6 +3092,7 @@ async fn query_facts_applies_passport_private_visibility() {
     }
 
     let params = QueryFactsParams {
+        min_effective_confidence: None,
         query: None,
         entity: None,
         entity_prefix: None,
@@ -3063,6 +3115,7 @@ async fn query_facts_applies_passport_private_visibility() {
     assert!(!text.contains("bob-only"));
 
     let anonymous_params = QueryFactsParams {
+        min_effective_confidence: None,
         query: None,
         entity: None,
         entity_prefix: None,
@@ -3084,6 +3137,7 @@ async fn query_facts_applies_passport_private_visibility() {
     assert!(!text.contains("bob-only"));
 
     let admin_params = QueryFactsParams {
+        min_effective_confidence: None,
         query: None,
         entity: None,
         entity_prefix: None,
@@ -7161,6 +7215,7 @@ async fn action_enrich_basic_is_free_and_stores_private_receipt() {
 
     let store = shared.fact_store.read().await;
     let facts = store.query(&corecrux_memory::fact_store::FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: None,
@@ -7365,6 +7420,7 @@ async fn workbench_context_pack_and_command_ledger_store_private_receipts() {
 
     let store = shared.fact_store.read().await;
     let facts = store.query(&corecrux_memory::fact_store::FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: None,
@@ -10745,6 +10801,7 @@ async fn rcx_publish_project_emit_stores_local_receipt() {
 
     let store = state.fact_store.read().await;
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: Some("__rcx_publish__::project::alpha".to_string()),

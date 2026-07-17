@@ -679,6 +679,7 @@ mod tests {
         let mut found: Option<Value> = None;
         for _ in 0..500 {
             let query = corecrux_memory::fact_store::FactQuery {
+                min_effective_confidence: None,
                 tenant_hash: None,
                 query: None,
                 entity: Some(ACCESS_TRAIL_ENTITY.to_string()),
@@ -833,6 +834,7 @@ mod tests {
         let mut found: Option<Value> = None;
         for _ in 0..500 {
             let query = corecrux_memory::fact_store::FactQuery {
+                min_effective_confidence: None,
                 tenant_hash: None,
                 query: None,
                 entity: Some(ACCESS_TRAIL_ENTITY.to_string()),

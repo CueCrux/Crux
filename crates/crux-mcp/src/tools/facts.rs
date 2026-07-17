@@ -424,6 +424,12 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
     let entity = args.get("entity").and_then(|v| v.as_str()).map(|s| s.to_string());
     let top_k = args.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
     let token_budget = args.get("token_budget").and_then(|v| v.as_u64()).map(|v| v as usize);
+    // P2 confidence floor: drop facts whose recall-time effective confidence is
+    // below this. Absent ⇒ no floor (behaviour unchanged).
+    let min_effective_confidence = args
+        .get("min_effective_confidence")
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32);
     // M6: superseded (cross-entity retired) facts are hidden from recall by
     // default; opt back in with `include_superseded: true`.
     let include_superseded = args
@@ -461,6 +467,7 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
     // legacy budget-drop.
     let reversible = !unshaped && token_budget.is_some() && crate::crc_v1::enabled(args);
     let q = FactQuery {
+        min_effective_confidence,
         tenant_hash: None,
         // cloned so `query`/`entity` remain available for the CRC-v1 reshape below
         query: query.clone(),
@@ -473,7 +480,8 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
     };
 
     let store = ctx.fact_store.read().await;
-    let visible = query_visible_facts_opts_as_of(&store, &q, id_ref, &alias_refs, include_superseded, as_of);
+    let (visible, filtered_below_threshold) =
+        query_visible_facts_opts_as_of(&store, &q, id_ref, &alias_refs, include_superseded, as_of);
     drop(store);
 
     // M2 salience: record that these facts were just recalled so they decay
@@ -486,8 +494,18 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
     }
 
     if visible.is_empty() {
+        // P2: distinguish "genuinely nothing" from "everything was below the
+        // confidence floor" so the caller can fall back to a non-LLM path
+        // instead of padding context with junk. `filtered_below_threshold` is
+        // surfaced in both the text and structured surfaces.
+        let text = if filtered_below_threshold > 0 {
+            format!("no facts above confidence floor ({filtered_below_threshold} below threshold)")
+        } else {
+            "no facts found".to_string()
+        };
         return Ok(json!({
-            "content": [{ "type": "text", "text": "no facts found" }]
+            "content": [{ "type": "text", "text": text }],
+            "structuredContent": { "rows": [], "filtered_below_threshold": filtered_below_threshold }
         }));
     }
 
@@ -571,13 +589,13 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
         crate::holdout::sample_compaction(&args.to_string(), &crc); // CO-5 compaction-only
         return Ok(json!({
             "content": [{ "type": "text", "text": text }],
-            "structuredContent": { "rows": rows, "crc_v1": crc }
+            "structuredContent": { "rows": rows, "crc_v1": crc, "filtered_below_threshold": filtered_below_threshold }
         }));
     }
 
     Ok(json!({
         "content": [{ "type": "text", "text": lines.join("\n") }],
-        "structuredContent": { "rows": rows }
+        "structuredContent": { "rows": rows, "filtered_below_threshold": filtered_below_threshold }
     }))
 }
 
@@ -680,7 +698,8 @@ fn query_visible_facts_opts(
     aliases: &[&str],
     include_superseded: bool,
 ) -> Vec<Fact> {
-    query_visible_facts_opts_as_of(store, q, identity, aliases, include_superseded, None)
+    // Envelope/internal callers never set a confidence floor; discard the count.
+    query_visible_facts_opts_as_of(store, q, identity, aliases, include_superseded, None).0
 }
 
 /// As [`query_visible_facts_opts`] with an optional bi-temporal `as_of` filter
@@ -692,7 +711,7 @@ fn query_visible_facts_opts_as_of(
     aliases: &[&str],
     include_superseded: bool,
     as_of: Option<DateTime<Utc>>,
-) -> Vec<Fact> {
+) -> (Vec<Fact>, usize) {
     let mut results: Vec<&Fact> = store
         .all_facts()
         .filter(|fact| !fact.deleted)
@@ -728,24 +747,30 @@ fn query_visible_facts_opts_as_of(
     // M2 salience: a frequently-recalled fact decays slower, so it resists the
     // stale demotion longer. `access_count == 0` (every fact until salience is
     // enabled and accrues recalls) makes this identical to `apply_at_chrono`.
-    let eff = |fact: &Fact| -> f64 {
-        let class = crate::tools::freshness::projection_class_of(fact.horizon_class);
-        let fresh = decay::apply_at_chrono_salient(
-            class,
-            fact.stored_at,
-            fact.reverified_at,
-            fact.access_count,
-            now,
-            policy,
-        );
-        decay::effective_confidence(fact.confidence as f64, fresh)
-    };
+    let eff = |fact: &Fact| -> f64 { crate::tools::freshness::fact_effective_confidence(fact, now, policy) };
     results.sort_by(|left, right| {
         eff(right)
             .partial_cmp(&eff(left))
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| right.stored_at.cmp(&left.stored_at))
     });
+
+    // P2 confidence floor: drop facts whose recall-time effective confidence is
+    // below the requested threshold, and count how many were dropped so the
+    // caller can tell "no facts" apart from "nothing above threshold". Counted
+    // over the full matched set BEFORE the budget/top_k cut so an empty result
+    // still reports the true below-threshold count.
+    let mut filtered_below_threshold = 0usize;
+    if let Some(floor) = q.min_effective_confidence {
+        let floor = floor as f64;
+        results.retain(|fact| {
+            let keep = eff(fact) >= floor;
+            if !keep {
+                filtered_below_threshold += 1;
+            }
+            keep
+        });
+    }
 
     if let Some(budget) = q.token_budget {
         let mut used = 0usize;
@@ -760,11 +785,11 @@ fn query_visible_facts_opts_as_of(
                 break;
             }
         }
-        return selected;
+        return (selected, filtered_below_threshold);
     }
 
     results.truncate(q.top_k);
-    results.into_iter().cloned().collect()
+    (results.into_iter().cloned().collect(), filtered_below_threshold)
 }
 
 fn fact_matches_query(fact: &Fact, query: &str, identity: Option<&str>, aliases: &[&str]) -> bool {
@@ -799,6 +824,7 @@ pub async fn handle_get_bootstrap(args: &Value, ctx: &McpContext) -> Result<Valu
     };
 
     let q = FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query,
         entity: None,
@@ -1856,6 +1882,84 @@ mod tests {
         assert_eq!(rows[1]["effective_confidence"], 0.5);
         assert_eq!(rows[0]["confidence"], 1.0);
         assert_eq!(rows[0]["effective_confidence"], 1.0);
+    }
+
+    // ── M7 (P2): min_effective_confidence floor + filtered_below_threshold ──
+
+    #[tokio::test]
+    async fn query_facts_min_effective_confidence_filters_stale_and_counts() {
+        let ctx = test_ctx();
+        let now = Utc::now();
+        {
+            let mut store = ctx.fact_store.write().await;
+            // STALE conf 1.0 → effective 0.5 (below a 0.6 floor).
+            store.store_synced(synth_fact(
+                "f_stale",
+                "deploy",
+                "old",
+                1.0,
+                HorizonClass::Volatile,
+                now - Duration::hours(48),
+                None,
+            ));
+            // FRESH conf 1.0 → effective 1.0 (above the floor).
+            store.store_synced(synth_fact(
+                "f_fresh",
+                "deploy",
+                "new",
+                1.0,
+                HorizonClass::Volatile,
+                now,
+                None,
+            ));
+        }
+
+        let result = handle_query_facts(&json!({"entity": "deploy", "min_effective_confidence": 0.6}), &ctx)
+            .await
+            .unwrap();
+        let rows = result["structuredContent"]["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "only the fresh fact clears the 0.6 floor");
+        assert_eq!(rows[0]["fact_id"], "f_fresh");
+        assert_eq!(result["structuredContent"]["filtered_below_threshold"], 1);
+    }
+
+    #[tokio::test]
+    async fn query_facts_all_below_floor_reports_count_not_empty() {
+        let ctx = test_ctx();
+        let now = Utc::now();
+        {
+            let mut store = ctx.fact_store.write().await;
+            store.store_synced(synth_fact("f_a", "deploy", "a", 0.4, HorizonClass::None, now, None));
+            store.store_synced(synth_fact("f_b", "deploy", "b", 0.3, HorizonClass::None, now, None));
+        }
+
+        // Floor above every fact → zero rows, but the count says WHY (2 facts
+        // existed, all below threshold) so the caller can skip the LLM path.
+        let result = handle_query_facts(&json!({"entity": "deploy", "min_effective_confidence": 0.5}), &ctx)
+            .await
+            .unwrap();
+        assert!(result["structuredContent"]["rows"].as_array().unwrap().is_empty());
+        assert_eq!(result["structuredContent"]["filtered_below_threshold"], 2);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("below threshold"),
+            "text explains the empty result: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_facts_without_floor_reports_zero_filtered() {
+        let ctx = test_ctx();
+        let now = Utc::now();
+        {
+            let mut store = ctx.fact_store.write().await;
+            // A very low-confidence fact that WOULD be filtered by a floor, but
+            // no floor is set — so it is returned and nothing is filtered.
+            store.store_synced(synth_fact("f_low", "deploy", "up", 0.1, HorizonClass::None, now, None));
+        }
+        let result = handle_query_facts(&json!({"entity": "deploy"}), &ctx).await.unwrap();
+        assert_eq!(result["structuredContent"]["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(result["structuredContent"]["filtered_below_threshold"], 0);
     }
 
     #[tokio::test]

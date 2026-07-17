@@ -334,6 +334,7 @@ pub fn list_work(
         None => format!("{WORK_ENTITY_PREFIX}::"),
     };
     let result = store.query(&FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: None,
@@ -540,6 +541,7 @@ pub fn add_comment(
 pub fn list_comments(store: &FactStore, work_id: &str) -> Vec<WorkComment> {
     let prefix = format!("{WORK_COMMENT_ENTITY_PREFIX}::{work_id}::");
     let result = store.query(&FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: None,
@@ -563,6 +565,7 @@ pub fn list_comments(store: &FactStore, work_id: &str) -> Vec<WorkComment> {
 pub fn list_transitions(store: &FactStore, work_id: &str) -> Vec<WorkTransition> {
     let prefix = format!("{WORK_TRANSITION_ENTITY_PREFIX}::{work_id}::");
     let result = store.query(&FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: None,
@@ -593,6 +596,7 @@ pub fn list_transitions(store: &FactStore, work_id: &str) -> Vec<WorkTransition>
 
 pub fn list_pending_gates(store: &FactStore, by_passport_filter: Option<&str>) -> Vec<PendingGateAction> {
     let result = store.query(&FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: None,
@@ -679,6 +683,7 @@ pub fn resolve_gate(
 
 fn get_gate(store: &FactStore, action_id: &str) -> Option<PendingGateAction> {
     let result = store.query(&FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: Some(format!("{WORK_GATE_ENTITY_PREFIX}::{action_id}")),

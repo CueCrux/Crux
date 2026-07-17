@@ -110,6 +110,7 @@ pub async fn handle_check_config_audit(args: &Value, ctx: &McpContext) -> Result
 
     // Load all audit records once; lookup by exact key.
     let q = FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: Some(AUDIT_ENTITY.to_string()),

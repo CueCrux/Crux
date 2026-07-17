@@ -91,6 +91,7 @@ impl BootstrapSeeder {
     pub async fn is_seeded(&self) -> bool {
         let store = self.fact_store.read().await;
         let result = store.query(&FactQuery {
+            min_effective_confidence: None,
             tenant_hash: None,
             query: None,
             entity: Some(SENTINEL_ENTITY.to_string()),
@@ -150,6 +151,7 @@ impl BootstrapSeeder {
         let store = self.fact_store.read().await;
         let seeded = {
             let result = store.query(&FactQuery {
+            min_effective_confidence: None,
                 tenant_hash: None,
                 query: None,
                 entity: Some(SENTINEL_ENTITY.to_string()),
@@ -162,6 +164,7 @@ impl BootstrapSeeder {
 
         // Query all bootstrap facts
         let result = store.query(&FactQuery {
+            min_effective_confidence: None,
             tenant_hash: None,
             query: None,
             entity: None,
@@ -401,6 +404,7 @@ mod tests {
 
         let guard = store.read().await;
         let first_connect = guard.query(&FactQuery {
+            min_effective_confidence: None,
             tenant_hash: None,
             query: None,
             entity: Some(bootstrap_entity("doc", "first-connect-agent")),
@@ -411,6 +415,7 @@ mod tests {
         assert_eq!(first_connect.facts.len(), 1);
 
         let quickstart = guard.query(&FactQuery {
+            min_effective_confidence: None,
             tenant_hash: None,
             query: None,
             entity: Some(bootstrap_entity("doc", "quickstart")),
