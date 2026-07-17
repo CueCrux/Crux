@@ -32,6 +32,9 @@ pub mod class {
     pub const UNUSED_DEP: &str = "unused-dep";
     pub const STUB: &str = "stub";
     pub const TODO: &str = "todo";
+    /// Deliberate shortcut with a named ceiling (`crux-min:` marker from the
+    /// code-minimalism profile) — the debt ledger, distinct from ad-hoc TODOs.
+    pub const DEBT: &str = "debt";
 }
 
 /// One normalized code-health finding.
@@ -78,6 +81,8 @@ type DynErr = Box<dyn std::error::Error + Send + Sync>;
 /// `todo!()` / `unimplemented!()` are *stubs* (compile-but-unfinished);
 /// `TODO` / `FIXME` are *todo* markers; `dbg!()` is a leftover (todo class).
 const MARKERS: &[(&str, &str)] = &[
+    // First so a crux-min line containing "TODO" still classifies as debt.
+    ("crux-min:", class::DEBT),
     ("todo!(", class::STUB),
     ("unimplemented!(", class::STUB),
     ("unreachable!(", class::STUB),
@@ -558,6 +563,7 @@ pub fn is_finding_key(key: &str) -> bool {
         || key.starts_with("stub:")
         || key.starts_with("todo:")
         || key.starts_with("dark:")
+        || key.starts_with("debt:")
 }
 
 /// The minimal write/delete set to make the store reflect exactly the current
@@ -1003,8 +1009,24 @@ mod tests {
     fn is_finding_key_excludes_run_and_unrelated() {
         assert!(is_finding_key("dead:a.rs:1"));
         assert!(is_finding_key("unused-dep:Cargo.toml:regex"));
+        assert!(is_finding_key("debt:a.rs:3"));
         assert!(!is_finding_key("run:2026-06-12"));
         assert!(!is_finding_key("decision:foo"));
+    }
+
+    #[test]
+    fn scan_markers_classifies_crux_min_as_debt_before_todo() {
+        let files = vec![(
+            "src/router.rs".to_string(),
+            // Contains "TODO" too — crux-min must win (debt ledger, not ad-hoc todo).
+            "fn f() {}\n// crux-min: global lock; per-account locks if throughput matters (TODO)\n".to_string(),
+        )];
+        let out = scan_markers(&files, "abc1234");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].class, class::DEBT);
+        assert_eq!(out[0].line, 2);
+        assert_eq!(fact_key(&out[0]), "debt:src/router.rs:2");
+        assert!(out[0].message.contains("per-account locks"), "ceiling text preserved");
     }
 
     #[test]
