@@ -45,6 +45,7 @@ pub mod machine;
 pub mod memory;
 pub mod memory_pack;
 pub mod observe_ingest;
+pub mod openclaw;
 pub mod ops;
 pub mod output_verify;
 pub mod parity;
