@@ -47,6 +47,7 @@ use tokio::sync::{broadcast, RwLock};
 
 use corecrux_memory::fact_store::{ContradictionCandidateV1, StoreFact};
 use corecrux_memory::{Fact, FactStore, HorizonClass};
+use corecrux_projections::decay::{self, Freshness};
 
 /// Receipt-fact entity prefix the scheduler writes each surfaced run under.
 /// Reserved (`__…__::`) so it is born private and is filtered from the
@@ -60,6 +61,12 @@ const MEMORY_PIN_PREFIX: &str = "__memory_pin::";
 /// Confidence at/above which a fact is treated as protected (matches the
 /// `ConsolidationRequestV1::protected_confidence_floor` default).
 pub const PROTECTED_CONFIDENCE_FLOOR: f32 = 0.99;
+
+/// Stored confidence strictly below which an (unprotected) fact is surfaced as
+/// a low-confidence expiry PROPOSAL (P1 widen). Deliberately conservative — the
+/// scheduler only surfaces; the operator applies. ponytail: fixed constant, make
+/// it config-driven only if a workload actually needs a different floor.
+pub const LOW_CONFIDENCE_EXPIRY_CEIL: f32 = 0.3;
 
 /// Default tick interval if the config clamp somehow yields zero: hourly.
 const DEFAULT_INTERVAL_SECS: u64 = 3600;
@@ -118,30 +125,102 @@ pub fn select_actionable_candidates(store: &FactStore, facts: &[Fact], limit: us
         .collect()
 }
 
+/// A read-only expiry PROPOSAL surfaced by the hygiene loop (P1 widen): a fact
+/// the loop suggests retiring, plus the reason. The scheduler NEVER expires
+/// anything — this only lands in the review receipt for an operator to apply
+/// (age-based via `POST /v1/console/review/expiries` → `mark_retention_eligible`,
+/// or per-fact via the existing delete/consolidate surfaces).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ExpiryCandidateV1 {
+    pub fact_id: String,
+    pub entity: String,
+    pub key: String,
+    /// `stale_past_horizon` | `low_confidence` | `stale_and_low_confidence`.
+    pub reason: String,
+    pub confidence: f32,
+    pub stored_at: String,
+}
+
+/// Pure selection: return unprotected, active facts that are stale past their
+/// freshness horizon and/or below the low-confidence ceiling. Read-only; mirrors
+/// exactly what the scheduler surfaces so it is unit-testable without a task.
+///
+/// Protection reuses [`fact_is_protected`] (private, receipt-linked, pinned, or
+/// at/above [`PROTECTED_CONFIDENCE_FLOOR`]) so the loop never proposes retiring
+/// its own bookkeeping receipts, pinned facts, or receipt-linked evidence.
+pub fn select_expiry_candidates(
+    facts: &[Fact],
+    now: chrono::DateTime<Utc>,
+    policy: decay::DecayPolicy,
+    limit: usize,
+) -> Vec<ExpiryCandidateV1> {
+    let pinned = pinned_fact_ids(facts);
+    let mut out = Vec::new();
+    for fact in facts {
+        if out.len() >= limit {
+            break;
+        }
+        if fact.deleted || fact.superseded_by.is_some() || fact_is_protected(fact, &pinned) {
+            continue;
+        }
+        let stale = crux_mcp::tools::freshness::fact_freshness(fact, now, policy) == Freshness::Stale;
+        let low_conf = fact.confidence < LOW_CONFIDENCE_EXPIRY_CEIL;
+        if !stale && !low_conf {
+            continue;
+        }
+        let reason = match (stale, low_conf) {
+            (true, true) => "stale_and_low_confidence",
+            (true, false) => "stale_past_horizon",
+            (false, true) => "low_confidence",
+            (false, false) => unreachable!(),
+        };
+        out.push(ExpiryCandidateV1 {
+            fact_id: fact.fact_id.clone(),
+            entity: fact.entity.clone(),
+            key: fact.key.clone(),
+            reason: reason.to_string(),
+            confidence: fact.confidence,
+            stored_at: fact.stored_at.to_rfc3339(),
+        });
+    }
+    out
+}
+
 /// Run one surfacing pass against the store. Reads candidates under a read
 /// lock, then appends a single review-receipt fact under a write lock.
 /// Returns the number of actionable candidates surfaced (0 = no receipt
 /// written — a clean store produces no noise).
 pub async fn run_review_once(store: &Arc<RwLock<FactStore>>, limit: usize) -> usize {
-    let (candidates, run_id) = {
+    let surfaced_at = Utc::now();
+    let (candidates, expiry_candidates, run_id) = {
         let guard = store.read().await;
         let facts: Vec<Fact> = guard.all_facts().cloned().collect();
         let candidates = select_actionable_candidates(&guard, &facts, limit);
-        (candidates, format!("run_{}", uuid::Uuid::new_v4().simple()))
+        // P1 widen: also propose stale-past-horizon + low-confidence facts as
+        // (read-only) expiry proposals, using the SAME decay logic recall ranks
+        // by so "stale" means one thing across the daemon.
+        let policy = decay::DecayPolicy::from_env();
+        let expiry_candidates = select_expiry_candidates(&facts, surfaced_at, policy, limit);
+        (
+            candidates,
+            expiry_candidates,
+            format!("run_{}", uuid::Uuid::new_v4().simple()),
+        )
     };
-    if candidates.is_empty() {
+    if candidates.is_empty() && expiry_candidates.is_empty() {
         return 0;
     }
 
-    let surfaced_at = Utc::now();
     let body = serde_json::json!({
         "schema": "crux.consolidation_review.v1",
         "run_id": run_id,
         "surfaced_at": surfaced_at.to_rfc3339(),
         "count": candidates.len(),
+        "expiry_count": expiry_candidates.len(),
         "resolution": "explicit",
-        "note": "detect+surface only; resolve via memory_consolidate or the console review route",
+        "note": "detect+surface only; resolve contradictions via memory_consolidate or the console review route; apply expiry proposals via POST /v1/console/review/expiries or per-fact delete",
         "candidates": candidates,
+        "expiry_candidates": expiry_candidates,
     });
 
     // Append-only receipt fact. Stable (never decays) so an audit replay can
@@ -162,7 +241,7 @@ pub async fn run_review_once(store: &Arc<RwLock<FactStore>>, limit: usize) -> us
     if let Err(err) = guard.try_store(req) {
         tracing::warn!(?err, "consolidation-review-receipt-append-failed");
     }
-    candidates.len()
+    candidates.len() + expiry_candidates.len()
 }
 
 /// Spawn the background consolidation-review task, mirroring
@@ -339,5 +418,101 @@ mod tests {
             !g.all_facts().any(|f| f.entity.starts_with(REVIEW_ENTITY_PREFIX)),
             "no receipt for an empty surfacing pass"
         );
+    }
+
+    // ── P1 widen: stale / low-confidence expiry proposals ───────────
+
+    /// Build a Fact directly so `stored_at` can be backdated (mirrors the
+    /// crux-mcp `synth_fact` approach; `store_synced` skips version logic).
+    fn synth(fact_id: &str, entity: &str, conf: f32, horizon: HorizonClass, stored_at: chrono::DateTime<Utc>) -> Fact {
+        Fact {
+            fact_id: fact_id.to_string(),
+            tenant_hash: "default".to_string(),
+            entity: entity.to_string(),
+            key: "state".to_string(),
+            value: "v".to_string(),
+            source_receipt: None,
+            confidence: conf,
+            stored_at,
+            tokens: 4,
+            deleted: false,
+            version: 1,
+            supersedes: None,
+            private: false,
+            horizon_class: horizon,
+            reverified_at: None,
+            superseded_by: None,
+            actor: None,
+            valid_from: None,
+            valid_to: None,
+            access_count: 0,
+            last_accessed_at: None,
+        }
+    }
+
+    #[test]
+    fn expiry_candidates_flag_low_confidence_and_stale() {
+        let now = Utc::now();
+        let policy = decay::DecayPolicy::from_env();
+        let facts = vec![
+            // Low confidence (< 0.3), fresh.
+            synth("f_low", "svc", 0.1, HorizonClass::None, now),
+            // Stale: volatile, 48h old (> 24h horizon), decent confidence.
+            synth(
+                "f_stale",
+                "svc",
+                0.8,
+                HorizonClass::Volatile,
+                now - chrono::Duration::hours(48),
+            ),
+            // Healthy: fresh + confident → not a candidate.
+            synth("f_ok", "svc", 0.8, HorizonClass::None, now),
+        ];
+        let out = select_expiry_candidates(&facts, now, policy, 50);
+        let ids: std::collections::HashSet<&str> = out.iter().map(|c| c.fact_id.as_str()).collect();
+        assert!(ids.contains("f_low"), "low-confidence fact proposed");
+        assert!(ids.contains("f_stale"), "stale fact proposed");
+        assert!(!ids.contains("f_ok"), "fresh confident fact NOT proposed");
+        let low = out.iter().find(|c| c.fact_id == "f_low").unwrap();
+        assert_eq!(low.reason, "low_confidence");
+        let stale = out.iter().find(|c| c.fact_id == "f_stale").unwrap();
+        assert_eq!(stale.reason, "stale_past_horizon");
+    }
+
+    #[test]
+    fn expiry_candidates_skip_protected_facts() {
+        let now = Utc::now();
+        let policy = decay::DecayPolicy::from_env();
+        // High-confidence (>= PROTECTED_CONFIDENCE_FLOOR) but stale → protected,
+        // so never proposed for expiry even though it is stale.
+        let facts = vec![synth(
+            "f_prot",
+            "svc",
+            1.0,
+            HorizonClass::Volatile,
+            now - chrono::Duration::hours(48),
+        )];
+        assert!(select_expiry_candidates(&facts, now, policy, 50).is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_review_once_surfaces_expiry_proposals_without_contradictions() {
+        let store = Arc::new(RwLock::new(FactStore::new()));
+        {
+            let mut g = store.write().await;
+            // A single low-confidence fact: no contradiction, but an expiry proposal.
+            store_fact(&mut g, "svc", "flag", "maybe", 0.1, false);
+        }
+        let n = run_review_once(&store, 200).await;
+        assert_eq!(n, 1, "one expiry proposal surfaced");
+        let g = store.read().await;
+        let receipt = g
+            .all_facts()
+            .find(|f| f.entity.starts_with(REVIEW_ENTITY_PREFIX))
+            .expect("review receipt written");
+        assert!(receipt.value.contains("\"expiry_count\":1"));
+        assert!(receipt.value.contains("low_confidence"));
+        // Detect+surface only: the fact itself is untouched.
+        assert!(g.all_facts().any(|f| f.entity == "svc" && !f.deleted));
     }
 }

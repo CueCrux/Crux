@@ -390,20 +390,40 @@
     return [{ h: 'Awaiting approval', sub: '/v1/work/gate/pending · ' + pend.length + ' pending', wide: true, controls: rows }];
   }
 
+  // Review-queue view (P1 widen): the surfaced `__consolidation_review__::`
+  // runs written by the (default-OFF) consolidation scheduler, each carrying
+  // its contradiction candidates AND expiry proposals (stale / low-confidence).
+  // Read-only — resolution stays an explicit operator action.
   function buildReview(res) {
-    var head = [{ t: 'search', ph: 'Filter candidates…' }];
+    var head = [{ t: 'search', ph: 'Filter runs…' }];
     var candSec;
     if (!res.ok || !res.data) {
-      candSec = { h: 'Contradictions', wide: true, controls: head.concat(degraded(res.status, 'Contradictions unavailable — GET /v1/console/review/contradictions')) };
+      candSec = { h: 'Review queue', wide: true, controls: head.concat(degraded(res.status, 'Review queue unavailable — GET /v1/console/review/queue')) };
     } else {
-      var cands = arr(res.data.candidates);
-      var rows = head.concat([info('candidates', String(res.data.count || cands.length))]).concat(cands.length
-        ? cands.map(function (c, i) {
-          return { t: 'exp', label: (c.entity || 'entity') + ' · ' + (c.key || 'key'), sub: (c.reason || 'candidate') + ' · ' + (c.polarity_a || '?') + ' vs ' + (c.polarity_b || '?'), badge: 'candidate ' + (i + 1),
-            controls: [info('fact ids', arr(c.fact_ids).join(', ') || '—'), info('values', arr(c.values).map(function (v) { return clip(v, 80); }).join(' | ') || '—')] };
-        })
-        : [info('none', 'no active opposite-polarity fact pairs')]);
-      candSec = { h: 'Contradictions', sub: 'read-only candidates · ' + (res.data.count || 0) + ' found', wide: true, controls: rows };
+      var runs = arr(res.data.runs);
+      var rows = head.concat([info('surfaced runs', String(res.data.count || runs.length))]);
+      if (!runs.length) {
+        rows.push(info('queue empty', 'the consolidation scheduler surfaces contradiction + expiry proposals here when CORECRUXD_CONSOLIDATION_SCHEDULER=1'));
+      } else {
+        runs.forEach(function (run, i) {
+          var rv = run.review || {};
+          var cands = arr(rv.candidates);
+          var exps = arr(rv.expiry_candidates);
+          var controls = [
+            info('surfaced', run.surfaced_at || rv.surfaced_at || '—'),
+            info('contradictions', String(rv.count != null ? rv.count : cands.length)),
+            info('expiry proposals', String(rv.expiry_count != null ? rv.expiry_count : exps.length)),
+          ];
+          cands.forEach(function (c) {
+            controls.push(info('contradiction', (c.entity || '?') + ' · ' + (c.key || '?') + ' — ' + (c.polarity_a || '?') + ' vs ' + (c.polarity_b || '?') + ' [' + (arr(c.fact_ids).join(', ') || '—') + ']'));
+          });
+          exps.forEach(function (e) {
+            controls.push(info(e.reason || 'expiry', (e.entity || '?') + ' · ' + (e.key || '?') + ' — conf ' + (e.confidence != null ? e.confidence : '?') + ' · ' + (e.fact_id || '?')));
+          });
+          rows.push({ t: 'exp', label: run.entity || ('run ' + (i + 1)), sub: (rv.count || 0) + ' contradictions · ' + (rv.expiry_count || 0) + ' expiry proposals', badge: 'run ' + (i + 1), controls: controls });
+        });
+      }
+      candSec = { h: 'Review queue', sub: 'surfaced __consolidation_review__:: runs · read-only · ' + (res.data.count || 0) + ' runs', wide: true, controls: rows };
     }
     var consSec = { h: 'Consolidation', sub: 'creates one canonical fact and supersedes selected targets; protected facts are rejected', wide: true,
       controls: [
@@ -1082,7 +1102,7 @@
     'cx-memory': page('cx-memory', 'memory', 'Memory', 'recent facts per tenant — system tenants hidden by default', { load: { endpoint: '/v1/console/facts?top_k=50', build: buildMemory } }),
     'cx-tenants': page('cx-tenants', 'memory', 'Tenants', 'memory stores · AMR lane routing', { load: { endpoint: '/v1/console/tenants', build: buildTenants } }),
     'cx-documents': page('cx-documents', 'memory', 'Documents', 'what the daemon has read, per tenant — and how to feed it more'),
-    'cx-review': page('cx-review', 'memory', 'Review', 'contradiction candidates · guarded fact consolidation', { load: { endpoint: '/v1/console/review/contradictions?limit=50', build: buildReview } }),
+    'cx-review': page('cx-review', 'memory', 'Review', 'surfaced consolidation-review queue · guarded fact consolidation', { load: { endpoint: '/v1/console/review/queue?limit=50', build: buildReview } }),
     'cx-lane-weights': page('cx-lane-weights', 'memory', 'Lane weights', 'CoreCrux RRF overlay · same-origin console proxy', { operatorOnly: true, load: { endpoint: '/v1/console/corecrux/lane-weights', build: buildLaneWeights } }),
     // ---- Trust -----------------------------------------------------------
     'cx-receipts': page('cx-receipts', 'trust', 'Receipts', 'CROWN · verify Ed25519 proofs offline with the key'),

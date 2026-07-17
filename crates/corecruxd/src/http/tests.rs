@@ -9626,6 +9626,102 @@ async fn console_review_contradictions_returns_factstore_candidates() {
 }
 
 #[tokio::test]
+async fn console_review_queue_lists_surfaced_expiry_runs() {
+    // P1 widen: run the scheduler pass over a low-confidence fact to surface a
+    // real `__consolidation_review__::` receipt, then read it back via the queue.
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "svc".to_string(),
+            key: "flag".to_string(),
+            value: "maybe".to_string(),
+            source_receipt: None,
+            confidence: 0.1,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+    }
+    let surfaced = crate::consolidation_scheduler::run_review_once(&state.fact_store, 200).await;
+    assert_eq!(surfaced, 1, "one expiry proposal surfaced");
+
+    let resp = console::get_console_review_queue(
+        State(state),
+        dev_scope_headers("admin:read"),
+        Query(console::ConsoleReviewQuery { limit: Some(10) }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["schema"], "crux.console.review.queue.v1");
+    assert_eq!(body["count"], 1);
+    assert_eq!(body["runs"][0]["review"]["expiry_count"], 1);
+    assert_eq!(
+        body["runs"][0]["review"]["expiry_candidates"][0]["reason"],
+        "low_confidence"
+    );
+}
+
+#[tokio::test]
+async fn console_review_expiries_soft_deletes_via_mark_retention_eligible() {
+    // Wires the previously-unwired mark_retention_eligible: a fact stored before
+    // the cutoff is soft-deleted by the operator apply endpoint.
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let fact_id = {
+        let mut store = state.fact_store.write().await;
+        store
+            .store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: "svc".to_string(),
+                key: "old".to_string(),
+                value: "stale".to_string(),
+                source_receipt: None,
+                confidence: 0.5,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            })
+            .fact_id
+    };
+
+    // Cutoff in the near future ⇒ the just-stored fact is older than it.
+    let before = (chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339();
+    let resp = console::post_console_review_expiries(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        Json(console::ConsoleExpiryApplyRequest { before }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["schema"], "crux.console.review.expiries.v1");
+    assert_eq!(body["expired_count"], 1);
+    assert_eq!(body["expired_fact_ids"][0], fact_id);
+    // The fact is now soft-deleted.
+    let store = state.fact_store.read().await;
+    assert!(store.get(&fact_id).is_none(), "fact soft-deleted");
+}
+
+#[tokio::test]
+async fn console_review_expiries_rejects_bad_timestamp() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::post_console_review_expiries(
+        State(state),
+        dev_scope_headers("admin:write"),
+        Json(console::ConsoleExpiryApplyRequest {
+            before: "not-a-time".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn console_review_consolidation_supersedes_targets_with_actor() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     let (old_id, newer_id) = {

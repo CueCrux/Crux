@@ -475,6 +475,110 @@ pub(super) async fn get_console_review_contradictions(
         .into_response()
 }
 
+/// `GET /v1/console/review/queue` — read-only review-queue view (P1 widen).
+///
+/// Lists the surfaced `__consolidation_review__::<run_id>` receipt facts written
+/// by the (default-OFF) consolidation scheduler, newest first, with the parsed
+/// review body (contradiction + expiry proposals). This is the data the embedded
+/// `/console/review` page renders. Distinct from
+/// `GET /v1/console/review/contradictions`, which runs a LIVE contradiction pass.
+pub(super) async fn get_console_review_queue(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConsoleReviewQuery>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_console_read(&state, &headers) {
+        return problem.into_response();
+    }
+    let limit = query.limit.unwrap_or(50).min(250);
+    let runs: Vec<serde_json::Value> = {
+        let store = state.fact_store.read().await;
+        // Confidence 1.0 on every review receipt ⇒ query_inner's confidence-desc,
+        // stored_at-desc order already yields newest-first.
+        let result = store.query(&corecrux_memory::fact_store::FactQuery {
+            min_effective_confidence: None,
+            query: None,
+            entity: None,
+            tenant_hash: None,
+            entity_prefix: Some(crate::consolidation_scheduler::REVIEW_ENTITY_PREFIX.to_string()),
+            top_k: limit,
+            token_budget: None,
+        });
+        result
+            .facts
+            .iter()
+            .map(|fact| {
+                serde_json::json!({
+                    "fact_id": fact.fact_id,
+                    "entity": fact.entity,
+                    "surfaced_at": fact.stored_at.to_rfc3339(),
+                    // Parsed review body when it is JSON; the raw string otherwise.
+                    "review": serde_json::from_str::<serde_json::Value>(&fact.value)
+                        .unwrap_or_else(|_| serde_json::Value::String(fact.value.clone())),
+                })
+            })
+            .collect()
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "schema": "crux.console.review.queue.v1",
+            "limit": limit,
+            "count": runs.len(),
+            "runs": runs,
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct ConsoleExpiryApplyRequest {
+    /// Soft-delete every retention-eligible fact stored strictly before this
+    /// RFC 3339 instant — the age-based half of the scheduler's expiry proposals.
+    /// Required (no default) so an operator can never accidentally sweep "now".
+    pub before: String,
+}
+
+/// `POST /v1/console/review/expiries` — operator applies age-based expiry
+/// proposals (P1 widen). Wires the previously-unwired
+/// [`corecrux_memory::FactStore::mark_retention_eligible`]: soft-deletes live
+/// non-private facts older than `before` (content is not removed from disk until
+/// a later `compact_journal` pass). Console-write gated; the scheduler itself
+/// NEVER mutates — expiry only happens through this explicit operator action.
+pub(super) async fn post_console_review_expiries(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ConsoleExpiryApplyRequest>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_console_write(&state, &headers) {
+        return problem.into_response();
+    }
+    let cutoff = match chrono::DateTime::parse_from_rfc3339(body.before.trim()) {
+        Ok(dt) => dt.with_timezone(&chrono::Utc),
+        Err(_) => {
+            return problem_response(
+                StatusCode::BAD_REQUEST,
+                "before must be an RFC 3339 timestamp (e.g. 2026-01-15T00:00:00Z)",
+            );
+        }
+    };
+    let expired = {
+        let mut store = state.fact_store.write().await;
+        store.mark_retention_eligible(cutoff)
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "schema": "crux.console.review.expiries.v1",
+            "before": cutoff.to_rfc3339(),
+            "expired_count": expired.len(),
+            "expired_fact_ids": expired,
+            "actor": console_actor_from_headers(&headers),
+        })),
+    )
+        .into_response()
+}
+
 pub(super) async fn post_console_review_consolidation(
     State(state): State<AppState>,
     headers: HeaderMap,
