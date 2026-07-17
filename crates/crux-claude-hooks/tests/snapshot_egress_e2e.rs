@@ -215,3 +215,47 @@ fn no_plaintext_egress_in_any_request_with_seed_present() {
         "store_fact (encrypted snapshot) did not fire:\n{joined}"
     );
 }
+
+#[test]
+fn flag_off_makes_no_encrypted_fact_calls() {
+    // Finding 6: with the sync flag unset, the hosted-fact path must not fire —
+    // no sync_status, no store_fact, no query_facts — even with a seed present.
+    // save_session (the legacy path) still fires, sealed (Finding 1).
+    let _guard = env_lock().lock().unwrap();
+    let seed_hex = "22".repeat(32);
+    let key_file = std::env::temp_dir().join(format!("egress-off-passport-{}.key", std::process::id()));
+    std::fs::write(&key_file, &seed_hex).unwrap();
+
+    let mock = CapturingMock::spawn();
+
+    let _e1 = EnvVar::set("CRUX_MCP_URL", &mock.url);
+    let _e2 = EnvVar::set("CRUX_PASSPORT_KEY_PATH", key_file.to_str().unwrap());
+    let _e3 = EnvVar::unset("CRUX_COMPACTION_SYNC"); // default OFF
+    let _e4 = EnvVar::set("CRUX_AGENT_TOKEN", "bearer-distinct-from-seed-abcdef0123456789");
+    let _e5 = EnvVar::unset("CRUX_HOOK_OBSERVE_CAPTURE");
+    let _e6 = EnvVar::unset("CRUX_HOOK_PRE_COMPACT");
+
+    crux_claude_hooks::cmds::pre_compact::run(std::io::Cursor::new(precompact_input())).unwrap();
+
+    let requests = mock.finish();
+    std::fs::remove_file(&key_file).ok();
+
+    let joined = requests.join("\n----\n");
+    assert!(
+        !joined.contains("store_fact"),
+        "encrypted-fact store_fact must not fire with the sync flag off:\n{joined}"
+    );
+    assert!(
+        !joined.contains("sync_status"),
+        "sync_status must not fire with the sync flag off (no auto-enable):\n{joined}"
+    );
+    assert!(
+        !joined.contains("query_facts"),
+        "query_facts must not fire on the store path:\n{joined}"
+    );
+    // The save_session that does fire still carries no plaintext.
+    assert!(
+        !joined.contains(SECRET_MARKER) && !joined.contains("PII_MARKER"),
+        "plaintext leaked on the flag-off path:\n{joined}"
+    );
+}

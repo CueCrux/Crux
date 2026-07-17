@@ -240,6 +240,11 @@ fn restore_snapshot_section(source: Option<&str>, session_id: &str) -> Option<St
     if !matches!(source, Some("compact" | "resume")) {
         return None;
     }
+    // Finding 6: explicit default-OFF gate BEFORE any key derivation or network
+    // op. Restore is part of the hosted feature — it only runs on opt-in.
+    if !snapshot_crypto::hosted_sync_enabled() {
+        return None;
+    }
     let key = snapshot_crypto::derive_snapshot_key()?;
     let result = mcp_client::call_tool(
         "query_facts",
@@ -506,6 +511,22 @@ mod tests {
         assert!(restore_snapshot_section(Some("startup"), "s").is_none());
         assert!(restore_snapshot_section(Some("clear"), "s").is_none());
         assert!(restore_snapshot_section(None, "s").is_none());
+    }
+
+    #[test]
+    fn restore_section_gated_off_by_default_flag() {
+        // Finding 6: with the sync flag unset (or off), restore no-ops before any
+        // seed/daemon work, even on a compaction/resume boot.
+        let _env = crate::test_support::env_guard();
+        let prev = std::env::var("CRUX_COMPACTION_SYNC").ok();
+        std::env::remove_var("CRUX_COMPACTION_SYNC");
+        assert!(restore_snapshot_section(Some("compact"), "s").is_none());
+        std::env::set_var("CRUX_COMPACTION_SYNC", "off");
+        assert!(restore_snapshot_section(Some("resume"), "s").is_none());
+        match prev {
+            Some(v) => std::env::set_var("CRUX_COMPACTION_SYNC", v),
+            None => std::env::remove_var("CRUX_COMPACTION_SYNC"),
+        }
     }
 
     #[test]

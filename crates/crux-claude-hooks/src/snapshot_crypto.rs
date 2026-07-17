@@ -47,6 +47,20 @@ use zeroize::Zeroizing;
 /// Shared by the PreCompact writer and the SessionStart reader.
 pub const SNAPSHOT_ENTITY: &str = "session_snapshot";
 
+/// Whether hosted encrypted snapshot sync is explicitly enabled (Finding 6).
+///
+/// Strict default-OFF opt-in shared by the store (PreCompact) and restore
+/// (SessionStart) paths: only `CRUX_COMPACTION_SYNC=1|on` turns it on; `0`,
+/// `off`, and unset are all off. Deliberately NOT derived from `sync_status` —
+/// the previous auto-enable let an unset flag silently probe the daemon and turn
+/// hosted egress on. Checked BEFORE any key derivation or network op, so the
+/// free/local path (flag unset) does zero extra work. The Pro mirror
+/// configuration remains the product-posture gate on the daemon side.
+#[must_use]
+pub fn hosted_sync_enabled() -> bool {
+    matches!(std::env::var("CRUX_COMPACTION_SYNC").as_deref(), Ok("1" | "on"))
+}
+
 /// Domain-separation label for the snapshot content key (BLAKE3 KDF context).
 /// The `v1` suffix tracks the *key-derivation* scheme, which is unchanged: it
 /// moves only if the seed→key derivation changes, NOT when [`ENVELOPE_V`] bumps
@@ -431,6 +445,24 @@ mod tests {
         let env = seal(&k_a, SID, b"cross-device snapshot").expect("seal");
         assert_eq!(open(&k_b, SID, &env).expect("open"), b"cross-device snapshot");
         assert_eq!(open(&k_other, SID, &env), Err(SnapshotCryptoError::DecryptFailed));
+    }
+
+    #[test]
+    fn hosted_sync_enabled_is_strict_opt_in() {
+        // Finding 6: only 1|on enable; 0, off, and unset are all off. No daemon
+        // probe happens either way (this runs with no daemon).
+        let _env = crate::test_support::env_guard();
+        let prev = std::env::var("CRUX_COMPACTION_SYNC").ok();
+        for (val, want) in [("1", true), ("on", true), ("0", false), ("off", false)] {
+            std::env::set_var("CRUX_COMPACTION_SYNC", val);
+            assert_eq!(hosted_sync_enabled(), want, "CRUX_COMPACTION_SYNC={val}");
+        }
+        std::env::remove_var("CRUX_COMPACTION_SYNC");
+        assert!(!hosted_sync_enabled(), "unset must be off (no auto-enable)");
+        match prev {
+            Some(v) => std::env::set_var("CRUX_COMPACTION_SYNC", v),
+            None => std::env::remove_var("CRUX_COMPACTION_SYNC"),
+        }
     }
 
     #[test]

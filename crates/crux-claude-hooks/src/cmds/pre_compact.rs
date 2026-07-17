@@ -141,21 +141,21 @@ fn endpoint_is_loopback(url: &str) -> bool {
     host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
-/// Best-effort hosted-continuity store. Silent no-op unless a passport seed is
-/// readable **and** a hosted mirror is configured; never errors the hook.
+/// Best-effort hosted-continuity store. Silent no-op unless hosted sync is
+/// explicitly enabled AND a passport seed is readable; never errors the hook.
 ///
-/// Order matters for the free path: the passport-seed check is a local file stat
-/// (no network), so free users with no seed skip before any extra MCP round-trip.
+/// Finding 6: the explicit default-OFF flag is checked FIRST, before any key
+/// derivation or network op — so the free/local path (flag unset) does zero
+/// extra work and stays byte-for-byte unchanged.
 fn store_encrypted_snapshot(session_id: &str, state: &Value) {
-    // Cheap local gate first: no passport seed ⇒ no key ⇒ nothing to encrypt/sync.
+    // Explicit opt-in gate first (no key derivation, no network probe when off).
+    if !snapshot_crypto::hosted_sync_enabled() {
+        return;
+    }
+    // No passport seed ⇒ no key ⇒ nothing to encrypt/sync (local file read only).
     let Some(key) = snapshot_crypto::derive_snapshot_key() else {
         return;
     };
-    // Then confirm a hosted mirror is configured. Without one the fact would
-    // never sync, and storing it would change the free/local behaviour.
-    if !hosted_sync_active() {
-        return;
-    }
     let args = match build_snapshot_fact_args(session_id, state, &key) {
         Ok(args) => args,
         Err(err) => {
@@ -185,39 +185,6 @@ fn build_snapshot_fact_args(session_id: &str, state: &Value, key: &[u8; 32]) -> 
         "value": envelope.to_fact_value()?,
         "private": false,
     }))
-}
-
-/// Whether a hosted mirror is configured, so the encrypted snapshot fact will
-/// actually sync. `CRUX_COMPACTION_SYNC=1|on` forces on (opt-in / tests);
-/// `0|off` forces off; otherwise the daemon's `sync_status` decides
-/// (`configured`, or a non-`local_only` mode). Daemon-unreachable ⇒ not hosted.
-fn hosted_sync_active() -> bool {
-    match std::env::var("CRUX_COMPACTION_SYNC").as_deref() {
-        Ok("1" | "on") => return true,
-        Ok("0" | "off") => return false,
-        _ => {}
-    }
-    match mcp_client::call_tool("sync_status", json!({})) {
-        Ok(result) => sync_status_is_hosted(&result),
-        Err(_) => false,
-    }
-}
-
-/// Parse a `sync_status` MCP result: hosted = a remote mirror is `configured`
-/// (or the sync mode is anything other than `local_only`). Tolerates both the
-/// raw object and the MCP `{content:[{text}]}` wrapper.
-fn sync_status_is_hosted(result: &Value) -> bool {
-    let obj = result
-        .get("content")
-        .and_then(Value::as_array)
-        .and_then(|items| items.iter().find_map(|item| item.get("text").and_then(Value::as_str)))
-        .and_then(|text| serde_json::from_str::<Value>(text).ok());
-    let obj = obj.as_ref().unwrap_or(result);
-    obj.get("configured").and_then(Value::as_bool).unwrap_or(false)
-        || obj
-            .get("mode")
-            .and_then(Value::as_str)
-            .is_some_and(|mode| mode != "local_only")
 }
 
 /// Best-effort anchors for mid-ExecPlan crash recovery: HEAD commit, active
@@ -431,37 +398,6 @@ mod tests {
         let recovered: Value =
             serde_json::from_slice(&snapshot_crypto::open(&key, "session-xyz", &env).unwrap()).unwrap();
         assert_eq!(recovered, state);
-    }
-
-    #[test]
-    fn hosted_sync_active_respects_env_override() {
-        let _env = crate::test_support::env_guard();
-        let prev = std::env::var("CRUX_COMPACTION_SYNC").ok();
-        std::env::set_var("CRUX_COMPACTION_SYNC", "1");
-        assert!(hosted_sync_active(), "explicit on must be honoured without a daemon");
-        std::env::set_var("CRUX_COMPACTION_SYNC", "off");
-        assert!(!hosted_sync_active(), "explicit off must skip");
-        match prev {
-            Some(v) => std::env::set_var("CRUX_COMPACTION_SYNC", v),
-            None => std::env::remove_var("CRUX_COMPACTION_SYNC"),
-        }
-    }
-
-    #[test]
-    fn sync_status_hosted_detection() {
-        // local_only, not configured ⇒ free path (no hosted store).
-        let local = json!({"content": [{"text": "{\"mode\":\"local_only\",\"configured\":false}"}]});
-        assert!(!sync_status_is_hosted(&local));
-        // configured mirror ⇒ hosted.
-        let hosted = json!({"content": [{"text": "{\"mode\":\"cloud_mirror\",\"configured\":true}"}]});
-        assert!(sync_status_is_hosted(&hosted));
-        // raw object (no MCP wrapper) also parsed.
-        assert!(sync_status_is_hosted(
-            &json!({"mode": "background_sync", "configured": true})
-        ));
-        assert!(!sync_status_is_hosted(
-            &json!({"mode": "local_only", "configured": false})
-        ));
     }
 
     #[test]
