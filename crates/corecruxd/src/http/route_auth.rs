@@ -377,6 +377,16 @@ pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContra
         ));
     }
 
+    if path.starts_with("/v1/provenance/") {
+        // W1 Provenance Marking Gateway (BYOK). Kept in sync with
+        // `http::provenance::PROVENANCE_SCOPES`.
+        return Some(RouteAuthContract::gated(
+            RouteAuthClass::FeatureGated,
+            &["provenance:write", "admin:write"],
+            "CORECRUXD_FEATURE_PROVENANCE_API",
+        ));
+    }
+
     if path.starts_with("/v1/openai/") {
         return Some(RouteAuthContract::gated(
             RouteAuthClass::FeatureGated,

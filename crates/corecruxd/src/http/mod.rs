@@ -821,23 +821,6 @@ pub(crate) fn router_with_route_auth(
             "/v1/credits/spend",
             axum::routing::post(self::credit_meter::post_credit_spend),
         )
-        // W1 Provenance Marking Gateway (BYOK). Default OFF
-        // (CORECRUXD_FEATURE_PROVENANCE_API); size-capped per route.
-        .route(
-            "/v1/provenance/sign",
-            axum::routing::post(self::provenance::post_provenance_sign)
-                .layer(axum::extract::DefaultBodyLimit::max(self::provenance::PROVENANCE_MAX_UPLOAD_BYTES)),
-        )
-        .route(
-            "/v1/provenance/verify",
-            axum::routing::post(self::provenance::post_provenance_verify)
-                .layer(axum::extract::DefaultBodyLimit::max(self::provenance::PROVENANCE_MAX_UPLOAD_BYTES)),
-        )
-        .route(
-            "/v1/provenance/verify-record",
-            axum::routing::post(self::provenance::post_provenance_verify_record)
-                .layer(axum::extract::DefaultBodyLimit::max(self::provenance::PROVENANCE_MAX_UPLOAD_BYTES)),
-        )
         // Provider-agnostic injection-bundle surface (context_bundle/v1).
         // Gated by CORECRUXD_CONTEXT_SURFACE (default OFF → 404).
         .route("/v1/context", get(self::context_surface::get_context))
@@ -1394,6 +1377,37 @@ pub(crate) fn router_with_route_auth(
         // for scope auth), so this adds no field to AppState's ~25 call sites.
         .route("/v1/cases", axum::routing::post(self::cases::record_case))
         .route("/v1/cases/retrieve", axum::routing::post(self::cases::retrieve_cases));
+
+    // W1 Provenance Marking Gateway (BYOK). Mounted only when the flag is
+    // captured ON at startup, so flag-off returns 404 for every provenance
+    // path *before* any request body (incl. key material) is read — a
+    // malformed or oversized flag-off request never reaches an extractor.
+    // Kept as a separate runtime-conditional block (like the hosted-surfaces
+    // block below) so the `.route(...)` templates still appear verbatim in
+    // source for the route-auth matrix + route-spec drift tests.
+    let router = if self::provenance::provenance_api_enabled() {
+        router
+            .route(
+                "/v1/provenance/sign",
+                axum::routing::post(self::provenance::post_provenance_sign).layer(
+                    axum::extract::DefaultBodyLimit::max(self::provenance::PROVENANCE_MAX_UPLOAD_BYTES),
+                ),
+            )
+            .route(
+                "/v1/provenance/verify",
+                axum::routing::post(self::provenance::post_provenance_verify).layer(
+                    axum::extract::DefaultBodyLimit::max(self::provenance::PROVENANCE_MAX_UPLOAD_BYTES),
+                ),
+            )
+            .route(
+                "/v1/provenance/verify-record",
+                axum::routing::post(self::provenance::post_provenance_verify_record).layer(
+                    axum::extract::DefaultBodyLimit::max(self::provenance::PROVENANCE_MAX_UPLOAD_BYTES),
+                ),
+            )
+    } else {
+        router
+    };
 
     // Hosted-service HTTP surfaces (ExecPlan crux-external-findings-remediation
     // M4): the Pro GPU-1 compute bridge and Pro cloud access posture are mounted

@@ -67,20 +67,20 @@ pub(super) fn provenance_api_enabled() -> bool {
 /// truth for that layer.
 pub(super) const PROVENANCE_MAX_UPLOAD_BYTES: usize = 16 * 1024 * 1024;
 
-/// Allowlisted asset content-type prefixes for `sign`. Everything else is
-/// rejected with 415 before any key material is parsed.
-const ALLOWED_CONTENT_TYPE_PREFIXES: &[&str] = &[
-    "image/",
-    "video/",
-    "audio/",
-    "text/",
-    "application/pdf",
-    "application/octet-stream",
-];
+/// Allowlisted asset media families (`<family>/<subtype>`) for `sign`.
+const ALLOWED_CONTENT_TYPE_FAMILIES: &[&str] = &["image/", "video/", "audio/", "text/"];
+/// Exact-match allowlisted content types (a prefix match would let
+/// `application/pdf-evil` through).
+const ALLOWED_CONTENT_TYPES_EXACT: &[&str] = &["application/pdf", "application/octet-stream"];
 
 fn content_type_allowed(ct: &str) -> bool {
     let ct = ct.trim().to_ascii_lowercase();
-    ALLOWED_CONTENT_TYPE_PREFIXES.iter().any(|p| ct.starts_with(p))
+    // Drop any `; charset=...` parameters before matching.
+    let base = ct.split(';').next().unwrap_or("").trim();
+    ALLOWED_CONTENT_TYPES_EXACT.contains(&base)
+        || ALLOWED_CONTENT_TYPE_FAMILIES
+            .iter()
+            .any(|f| base.starts_with(f) && base.len() > f.len())
 }
 
 /// Naive per-key fixed-window rate limiter.
@@ -219,7 +219,14 @@ pub(super) struct ManifestParams {
     pub model: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+// NB: deliberately NOT `Debug`/`Serialize` — this struct holds the caller's
+// private key PEM, and a derived Debug/echo is the classic way key material
+// leaks into a log line or error body.
+// TODO(flag-enable, key-hardening): deserialize `signing_key_pem` into a
+// zeroizing secret wrapper and require loopback or authenticated-TLS
+// termination (startup validation) before the flag may enable, so the raw PEM
+// never rests un-wiped in the Axum JSON buffer. See PR body §remaining.
+#[derive(Deserialize)]
 pub(super) struct SignRequest {
     /// Base64 asset bytes to attest.
     pub content_b64: String,
@@ -254,13 +261,17 @@ pub(super) struct VerifyRequest {
     pub tenant_id: Option<String>,
 }
 
+/// Manifest values are chosen by the caller at sign time and signed with the
+/// caller's own (untrusted) key — they are UNVERIFIED claims, never facts the
+/// gateway attests to. Field names carry the `unverified_` prefix so a machine
+/// consumer can't mistake them for gateway-established identity.
 #[derive(Debug, Serialize)]
-pub(super) struct ManifestSummary {
+pub(super) struct ManifestClaims {
     pub manifest_id: String,
     pub claim_generator: String,
     pub content_type: Option<String>,
-    pub crown_receipt_id: String,
-    pub signer_passport: String,
+    pub unverified_crown_receipt_id: String,
+    pub unverified_signer_passport: String,
     pub signer_key_id: String,
 }
 
@@ -269,12 +280,34 @@ pub(super) struct VerifyResponse {
     /// Was a parseable manifest envelope supplied?
     pub present: bool,
     pub signature_alg: Option<String>,
+    // ── Internal consistency (NOT trust) ──
+    /// Recomputed BLAKE3 matches the transmitted payload hash.
     pub canonical_hash_match: Option<bool>,
+    /// ECDSA-SHA256 signature verifies against the PRESENTED (untrusted) leaf.
     pub signature_valid: Option<bool>,
-    /// `None` when no content was supplied to check the binding.
+    /// `canonical_hash_match && signature_valid` — envelope is internally
+    /// consistent. Does NOT mean the signer is trusted.
+    pub integrity_valid: bool,
+    // ── Asset binding ──
+    /// Were asset bytes supplied so the content binding could be checked?
+    pub asset_binding_checked: bool,
+    /// `None` when no content was supplied.
     pub content_hash_match: Option<bool>,
+    // ── Trust: NOT established by this BYOK skeleton ──
+    /// Machine-readable trust posture. The skeleton never validates the cert
+    /// chain to a root/trust-list, so this is `"untrusted_presented_leaf"`
+    /// (or `"unsigned"` / `"external_key_required"`).
+    pub trust_status: String,
+    /// Always false here — no chain-to-root validation.
+    pub chain_validated: bool,
+    /// Always false here — no identity/trust-list validation.
+    pub identity_trusted: bool,
+    // ── Overall ──
+    /// True ONLY when the envelope is internally consistent AND asset bytes
+    /// were supplied AND they match the bound hash. Never true on
+    /// internal-consistency alone, and never implies trust.
     pub ok: bool,
-    pub manifest_summary: Option<ManifestSummary>,
+    pub manifest_claims: Option<ManifestClaims>,
     pub notes: Vec<String>,
 }
 
@@ -366,15 +399,20 @@ fn verify_inner(req: &VerifyRequest) -> Result<VerifyResponse, ProvErr> {
             signature_alg: None,
             canonical_hash_match: None,
             signature_valid: None,
+            integrity_valid: false,
+            asset_binding_checked: false,
             content_hash_match: None,
+            trust_status: "unsigned".to_string(),
+            chain_validated: false,
+            identity_trusted: false,
             ok: false,
-            manifest_summary: None,
+            manifest_claims: None,
             notes: vec!["no C2PA manifest supplied — asset is unsigned / no provenance present".to_string()],
         });
     };
 
     let parsed = parse_jumbf_base64(envelope_b64)
-        .map_err(|e| ProvErr::new(StatusCode::BAD_REQUEST, format!("manifest envelope did not parse: {e}")))?;
+        .map_err(|_| ProvErr::new(StatusCode::BAD_REQUEST, "manifest envelope did not parse"))?;
 
     let content = match req.content_b64.as_deref() {
         Some(c) => Some(decode_b64("content_b64", c)?),
@@ -382,37 +420,49 @@ fn verify_inner(req: &VerifyRequest) -> Result<VerifyResponse, ProvErr> {
     };
     let content_supplied = content.is_some();
 
-    let summary = ManifestSummary {
+    let claims = ManifestClaims {
         manifest_id: parsed.manifest.manifest_id.clone(),
         claim_generator: parsed.manifest.claim_generator.clone(),
         content_type: parsed.manifest.content_type.clone(),
-        crown_receipt_id: parsed.manifest.crown_receipt_id.clone(),
-        signer_passport: parsed.manifest.signer_passport.clone(),
+        unverified_crown_receipt_id: parsed.manifest.crown_receipt_id.clone(),
+        unverified_signer_passport: parsed.manifest.signer_passport.clone(),
         signer_key_id: parsed.key_id.clone(),
     };
 
     if parsed.signature_alg == "es256" {
-        // BYOK envelopes are self-verifying: the leaf key is in the x5chain.
+        // BYOK envelopes are internally self-verifying: the leaf key is in the
+        // x5chain. This establishes CONSISTENCY only — never trust.
         let report = verify_c2pa_signed_manifest_es256_v1(&parsed, content.as_deref().unwrap_or(&[]))
-            .map_err(|e| ProvErr::new(StatusCode::BAD_REQUEST, format!("es256 verification failed: {e}")))?;
+            .map_err(|_| ProvErr::new(StatusCode::BAD_REQUEST, "es256 verification failed"))?;
+        let integrity_valid = report.canonical_hash_match && report.signature_valid;
         let content_hash_match = content_supplied.then_some(report.content_hash_match);
-        let ok = report.canonical_hash_match && report.signature_valid && content_hash_match.unwrap_or(true);
-        let mut notes = Vec::new();
-        if !content_supplied {
-            notes.push("content bytes not supplied — content binding not checked".to_string());
-        }
-        notes.push(
-            "stateless verify checks cryptographic validity against the presented leaf; anchor/chain trust is caller policy"
+        // Overall ok requires integrity AND a checked+matching asset binding.
+        let ok = integrity_valid && content_hash_match == Some(true);
+        let mut notes = vec![
+            "integrity_valid checks the envelope against the PRESENTED leaf only; the leaf, its chain, \
+             and all manifest_claims are UNTRUSTED — no chain-to-root/identity validation is performed"
                 .to_string(),
-        );
+        ];
+        if !content_supplied {
+            notes.push(
+                "asset bytes not supplied — content binding NOT checked, so overall ok is false; \
+                 re-verify with the asset bytes to establish binding"
+                    .to_string(),
+            );
+        }
         Ok(VerifyResponse {
             present: true,
             signature_alg: Some("es256".to_string()),
             canonical_hash_match: Some(report.canonical_hash_match),
             signature_valid: Some(report.signature_valid),
+            integrity_valid,
+            asset_binding_checked: content_supplied,
             content_hash_match,
+            trust_status: "untrusted_presented_leaf".to_string(),
+            chain_validated: false,
+            identity_trusted: false,
             ok,
-            manifest_summary: Some(summary),
+            manifest_claims: Some(claims),
             notes,
         })
     } else {
@@ -423,14 +473,17 @@ fn verify_inner(req: &VerifyRequest) -> Result<VerifyResponse, ProvErr> {
             signature_alg: Some(parsed.signature_alg.clone()),
             canonical_hash_match: None,
             signature_valid: None,
+            integrity_valid: false,
+            asset_binding_checked: false,
             content_hash_match: None,
+            trust_status: "external_key_required".to_string(),
+            chain_validated: false,
+            identity_trusted: false,
             ok: false,
-            manifest_summary: Some(summary),
-            notes: vec![format!(
-                "envelope alg {:?} is not a self-verifying BYOK (es256) envelope; \
-                 verify with the external verifying key via `corecruxctl output-verify`",
-                parsed.signature_alg
-            )],
+            manifest_claims: Some(claims),
+            notes: vec!["envelope is not a self-verifying BYOK (es256) envelope; \
+                 verify with the external verifying key via `corecruxctl output-verify`"
+                .to_string()],
         })
     }
 }
@@ -462,14 +515,21 @@ fn do_verify_record(
         "tenant_id": tenant,
         "verification": verification,
     });
-    let canonical = serde_json::to_vec(&record_body)
-        .map_err(|e| ProvErr::new(StatusCode::INTERNAL_SERVER_ERROR, format!("record canonicalise: {e}")))?;
-
-    // Mint a passport-signed receipt — same pattern as observation minting.
-    let key = crux_session::LocalPassportKey::from_path(passport_key_path).map_err(|e| {
+    let canonical = serde_json::to_vec(&record_body).map_err(|e| {
+        tracing::error!(error = %e, "provenance record canonicalise failed");
         ProvErr::new(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("passport key load failed: {e}"),
+            "internal error minting verification record",
+        )
+    })?;
+
+    // Mint a passport-signed receipt — same pattern as observation minting.
+    // Sanitize: never surface the internal key path / IO detail to the caller.
+    let key = crux_session::LocalPassportKey::from_path(passport_key_path).map_err(|e| {
+        tracing::error!(error = %e, "provenance passport key load failed");
+        ProvErr::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error minting verification record",
         )
     })?;
     if key.passport_fpr() != passport_fpr {
@@ -495,8 +555,17 @@ fn do_verify_record(
             serde_json::to_value(&receipt).unwrap_or(serde_json::Value::Null),
         );
     }
-    append_record(data_dir, &line)
-        .map_err(|e| ProvErr::new(StatusCode::INTERNAL_SERVER_ERROR, format!("record persist failed: {e}")))?;
+    // TODO(flag-enable, #9): reserve credits BEFORE persisting (idempotent,
+    // keyed by op-id + payload hash) and settle after returning success, so a
+    // retained record can never be minted unpaid. NoopMeter charges nothing,
+    // so append-then-meter is inert in the skeleton.
+    append_record(data_dir, &line).map_err(|e| {
+        tracing::error!(error = %e, "provenance record persist failed");
+        ProvErr::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error persisting verification record",
+        )
+    })?;
 
     meter.on_op(ProvenanceOp::VerifyRecord, tenant);
 
@@ -512,6 +581,10 @@ fn records_path(data_dir: &Path) -> PathBuf {
     data_dir.join("provenance").join("verification-records.jsonl")
 }
 
+// TODO(flag-enable, #10): this is an unbounded, un-rotated, un-quota'd global
+// JSONL with a non-exclusive append. Before flag-enable add per-tenant quota,
+// rotation, an exclusive/durable append (lock + fsync) or reuse the signed
+// append-only substrate, and run the CPU/file work under spawn_blocking.
 fn append_record(data_dir: &Path, line: &serde_json::Value) -> std::io::Result<()> {
     use std::io::Write as _;
     let path = records_path(data_dir);
@@ -544,15 +617,35 @@ fn not_enabled() -> Response {
     )
 }
 
-/// Common pre-handler gate: flag → auth scope → per-key rate limit.
-/// Returns `Some(response)` to short-circuit with that response, `None` to
-/// proceed. (`Option` rather than `Result<(), Response>` — the axum
-/// `Response` error variant is large enough to trip `clippy::result_large_err`.)
-fn guard(state: &AppState, headers: &HeaderMap, scopes: &[&str], tenant: &str) -> Option<Response> {
+/// Any-of scopes accepted across the whole provenance surface. Kept in sync
+/// with the `route_auth::classify_route` contract for `/v1/provenance`.
+const PROVENANCE_SCOPES: &[&str] = &["provenance:write", "admin:write"];
+
+/// Common pre-handler gate: flag → refuse spoofable auth → scope → rate limit.
+/// Returns `Some(response)` to short-circuit, `None` to proceed. (`Option`
+/// rather than `Result<(), Response>` — the axum `Response` error variant is
+/// large enough to trip `clippy::result_large_err`.)
+///
+/// The global `route_auth` middleware also enforces the classify_route
+/// contract before body extraction in `enforce` mode; this in-handler guard is
+/// defence-in-depth (and the sole gate when route_auth is not in enforce mode).
+// TODO(flag-enable, #7): resolve `tenant` from authenticated token claims
+// (require_http_any_scope_for_tenant) rather than trusting the header/body,
+// and key the rate limiter on the authenticated subject + client IP with a
+// bounded/evicting map — the current global map trusts a caller-controlled
+// string and never evicts.
+fn guard(state: &AppState, headers: &HeaderMap, tenant: &str) -> Option<Response> {
     if !provenance_api_enabled() {
         return Some(not_enabled());
     }
-    if let Err(problem) = require_http_any_scope(&state.auth, headers, scopes) {
+    // A metered, key-custody-adjacent surface must not run without real auth.
+    if state.auth.mode() == crate::auth::AuthMode::Off {
+        return Some(problem_response(
+            StatusCode::FORBIDDEN,
+            "provenance API requires an authenticated auth mode (refusing AuthMode::Off)",
+        ));
+    }
+    if let Err(problem) = require_http_any_scope(&state.auth, headers, PROVENANCE_SCOPES) {
         return Some(problem.into_response());
     }
     if !rate_limit_ok(tenant) {
@@ -570,7 +663,7 @@ pub(super) async fn post_provenance_sign(
     Json(body): Json<SignRequest>,
 ) -> Response {
     let tenant = tenant_from(&headers, body.tenant_id.as_deref());
-    if let Some(resp) = guard(&state, &headers, &["provenance:sign", "admin:write"], &tenant) {
+    if let Some(resp) = guard(&state, &headers, &tenant) {
         return resp;
     }
     match do_sign(&NoopMeter, &tenant, &body) {
@@ -585,12 +678,7 @@ pub(super) async fn post_provenance_verify(
     Json(body): Json<VerifyRequest>,
 ) -> Response {
     let tenant = tenant_from(&headers, body.tenant_id.as_deref());
-    if let Some(resp) = guard(
-        &state,
-        &headers,
-        &["provenance:verify", "provenance:sign", "admin:read", "admin:write"],
-        &tenant,
-    ) {
+    if let Some(resp) = guard(&state, &headers, &tenant) {
         return resp;
     }
     match do_verify(&NoopMeter, &tenant, &body) {
@@ -605,7 +693,7 @@ pub(super) async fn post_provenance_verify_record(
     Json(body): Json<VerifyRequest>,
 ) -> Response {
     let tenant = tenant_from(&headers, body.tenant_id.as_deref());
-    if let Some(resp) = guard(&state, &headers, &["provenance:sign", "admin:write"], &tenant) {
+    if let Some(resp) = guard(&state, &headers, &tenant) {
         return resp;
     }
     match do_verify_record(
@@ -711,12 +799,43 @@ mod tests {
         assert!(verify.present);
         assert_eq!(verify.signature_alg.as_deref(), Some("es256"));
         assert_eq!(verify.signature_valid, Some(true));
+        assert!(verify.integrity_valid);
+        assert!(verify.asset_binding_checked);
         assert_eq!(verify.content_hash_match, Some(true));
         assert!(verify.ok);
+        // Honesty: internal consistency is NOT trust.
+        assert_eq!(verify.trust_status, "untrusted_presented_leaf");
+        assert!(!verify.chain_validated);
+        assert!(!verify.identity_trusted);
+        // Manifest values are surfaced as UNVERIFIED claims.
+        assert!(verify.manifest_claims.is_some());
 
         let calls = meter.calls.lock().unwrap();
         assert_eq!(calls[0], ("provenance.sign".to_string(), "tenant-a".to_string()));
         assert_eq!(calls[1], ("provenance.verify".to_string(), "tenant-a".to_string()));
+    }
+
+    #[test]
+    fn verify_of_valid_envelope_without_asset_is_not_ok() {
+        // #1/#2: a valid envelope for ANY asset must NOT yield ok:true when no
+        // asset bytes are supplied — integrity ≠ overall success.
+        let content = b"bound-asset";
+        let meter = RecordingMeter::default();
+        let signed = do_sign(&meter, "t", &sign_req(content, None)).unwrap();
+        let resp = do_verify(
+            &meter,
+            "t",
+            &VerifyRequest {
+                manifest_envelope_b64: Some(signed.manifest_envelope_b64),
+                content_b64: None,
+                tenant_id: None,
+            },
+        )
+        .unwrap();
+        assert!(resp.integrity_valid, "envelope is internally consistent");
+        assert!(!resp.asset_binding_checked, "no asset supplied");
+        assert_eq!(resp.content_hash_match, None);
+        assert!(!resp.ok, "must NOT be ok without a checked+matching asset binding");
     }
 
     #[test]
@@ -839,6 +958,39 @@ mod tests {
         assert_eq!(calls.last().unwrap().0, "provenance.verify_record");
     }
 
+    #[test]
+    fn verify_record_without_asset_cannot_mint_overall_success() {
+        // #1: minting a signed record without the asset must record ok:false,
+        // so a passport-signed record never asserts overall success on
+        // internal-consistency alone.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let key_path = data_dir.join("passport.key");
+        let key = crux_session::LocalPassportKey::from_path(&key_path).unwrap();
+        let fpr = key.passport_fpr().to_string();
+
+        let meter = RecordingMeter::default();
+        let signed = do_sign(&meter, "t", &sign_req(b"asset", None)).unwrap();
+        let resp = do_verify_record(
+            &meter,
+            "t",
+            &VerifyRequest {
+                manifest_envelope_b64: Some(signed.manifest_envelope_b64),
+                content_b64: None, // no asset supplied
+                tenant_id: None,
+            },
+            &key_path,
+            &fpr,
+            data_dir,
+        )
+        .unwrap();
+        assert!(
+            !resp.verification.ok,
+            "record must not claim overall success without asset match"
+        );
+        assert!(!resp.verification.asset_binding_checked);
+    }
+
     // ── flag-off returns 404 at the axum handler ───────────────────────────
 
     #[tokio::test]
@@ -855,13 +1007,47 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn router_flag_off_never_mounts_or_reads_body() {
+        use tower::ServiceExt as _;
+        // Flag OFF at router build → routes not mounted → 404 before any body
+        // extraction, even for a MALFORMED body (which would 400 if extracted).
+        std::env::remove_var(FEATURE_ENV);
+        let state = crate::http::tests::test_app_state(1);
+        let app = crate::http::router(
+            state,
+            std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::CaseStore::new())),
+        );
+        for path in [
+            "/v1/provenance/sign",
+            "/v1/provenance/verify",
+            "/v1/provenance/verify-record",
+        ] {
+            let req = axum::http::Request::post(path)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from("{ this is not json"))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "{path} must 404 (unmounted) when the flag is off, not 400 from body parsing"
+            );
+        }
+    }
+
     #[test]
     fn content_type_allowlist_matches_expected() {
         assert!(content_type_allowed("image/png"));
         assert!(content_type_allowed("video/mp4"));
+        assert!(content_type_allowed("image/png; charset=binary")); // params stripped
         assert!(content_type_allowed("application/pdf"));
         assert!(!content_type_allowed("application/x-msdownload"));
-        assert!(!content_type_allowed("text-but-not/really".trim_start_matches("text-")));
+        // #11: exact-match for application/pdf — a prefix would let this through.
+        assert!(!content_type_allowed("application/pdf-evil"));
+        // Family prefix requires a non-empty subtype.
+        assert!(!content_type_allowed("image/"));
     }
 
     #[test]
