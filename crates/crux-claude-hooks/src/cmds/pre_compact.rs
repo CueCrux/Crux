@@ -54,15 +54,13 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
         "recovery": recovery,
     });
 
-    let args = json!({
-        "session_id": session_key,
-        "state": state,
-    });
-
-    // Fire and forget. Daemon-unreachable is non-fatal.
-    if let Err(err) = mcp_client::call_tool("save_session", &args) {
-        eprintln!("crux-hook pre-compact: save_session failed: {err}");
-    }
+    // Finding 1 (crypto-review): the snapshot must never egress in plaintext.
+    // `mcp_client` sends `save_session` to `CRUX_MCP_URL`, which a supported
+    // login flow can point at a REMOTE hosted daemon — so a plaintext state here
+    // leaks cwd/transcript/branch/milestone/recovery. Seal the state with the
+    // passport-derived key so the session store holds only ciphertext, whatever
+    // the endpoint; fall back to plaintext only for a verified-loopback daemon.
+    save_session_sealed(&session_key, &input.session_id, &state);
 
     // Hosted continuity (ExecPlan hosted-compaction-sync-encrypted-2026-07-17):
     // additionally store the snapshot as a CLIENT-SIDE-ENCRYPTED, non-private
@@ -82,6 +80,65 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
         eprintln!("crux-hook pre-compact: attached reasoning_ref to {patched} audit step(s)");
     }
     Ok(())
+}
+
+/// Send the PreCompact session snapshot to `save_session`, sealed (Finding 1).
+///
+/// The state is encrypted with the passport-derived key so the daemon's session
+/// store holds only ciphertext — even if `CRUX_MCP_URL` is a hosted daemon.
+/// When no passport seed is available (no key to encrypt with), plaintext is
+/// sent ONLY to a verified-loopback daemon; a non-loopback endpoint is skipped
+/// so plaintext never egresses. Best-effort — daemon-unreachable is non-fatal.
+fn save_session_sealed(session_key: &str, session_id: &str, state: &Value) {
+    let state_field = match snapshot_crypto::derive_snapshot_key() {
+        Some(key) => match seal_state_value(&key, session_id, state) {
+            Ok(enc) => json!({ "enc": enc }),
+            Err(err) => {
+                // Never fall back to plaintext egress on a seal failure.
+                eprintln!("crux-hook pre-compact: seal session state failed: {err}");
+                return;
+            }
+        },
+        None => {
+            if endpoint_is_loopback(&mcp_client::mcp_url()) {
+                // No key, but a loopback daemon is trusted: preserve the
+                // free/local crash-recovery snapshot (byte-for-byte as before).
+                state.clone()
+            } else {
+                eprintln!(
+                    "crux-hook pre-compact: no passport seed and non-loopback MCP endpoint — \
+                     skipping save_session to avoid plaintext egress"
+                );
+                return;
+            }
+        }
+    };
+    let args = json!({ "session_id": session_key, "state": state_field });
+    if let Err(err) = mcp_client::call_tool("save_session", &args) {
+        eprintln!("crux-hook pre-compact: save_session failed: {err}");
+    }
+}
+
+/// Seal `state` for `session_id` and return the opaque base64 fact value.
+fn seal_state_value(key: &[u8; 32], session_id: &str, state: &Value) -> anyhow::Result<String> {
+    let plaintext = serde_json::to_vec(state)?;
+    snapshot_crypto::seal(key, session_id, &plaintext)?.to_fact_value()
+}
+
+/// True only for a loopback MCP endpoint (`127.0.0.0/8`, `::1`, `localhost`).
+/// Strict loopback, NOT RFC1918: a LAN / tailnet / hosted address is a remote
+/// the plaintext session state must never reach. Hostnames other than
+/// `localhost` are refused (not resolved) — no DNS-rebind surface.
+fn endpoint_is_loopback(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = if let Some(after) = authority.strip_prefix('[') {
+        after.split(']').next().unwrap_or("")
+    } else {
+        authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+    };
+    host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Best-effort hosted-continuity store. Silent no-op unless a passport seed is
@@ -434,6 +491,21 @@ mod tests {
                 None => std::env::remove_var(k),
             }
         }
+    }
+
+    #[test]
+    fn endpoint_is_loopback_is_strict() {
+        // Loopback endpoints may receive plaintext state (no key case).
+        assert!(endpoint_is_loopback("http://127.0.0.1:14801/mcp"));
+        assert!(endpoint_is_loopback("http://localhost:14801/mcp"));
+        assert!(endpoint_is_loopback("http://[::1]:14801/mcp"));
+        assert!(endpoint_is_loopback("http://127.5.4.3/mcp"));
+        // Remotes — CGNAT tailnet, RFC1918 LAN, and public — are NOT loopback.
+        assert!(!endpoint_is_loopback("http://100.70.12.73:14801/mcp"));
+        assert!(!endpoint_is_loopback("http://10.0.0.5:14801/mcp"));
+        assert!(!endpoint_is_loopback("http://192.168.1.9/mcp"));
+        assert!(!endpoint_is_loopback("http://evil.example.com/mcp"));
+        assert!(!endpoint_is_loopback("http://user@127.0.0.1@evil.com/mcp"));
     }
 
     #[test]
