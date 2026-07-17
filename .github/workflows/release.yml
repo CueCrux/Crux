@@ -98,6 +98,23 @@ jobs:
       - name: Package binaries
         run: bash scripts/package-daemon-release.sh ${{ matrix.suffix }} dist
 
+      # --- Debian package + installer (daemon-distribution-packaging-2026-06-11,
+      #     GATE-PACKAGE: installers built but never attached to releases) ---
+      # Both live only on the linux-amd64 leg: the .deb bundles the amd64 binaries
+      # that package-daemon-release.sh just staged (dist/crux-linux-amd64,
+      # dist/corecruxctl-linux-amd64), and install.sh is platform-agnostic so one
+      # copy suffices. Staged into dist/ so the leg's upload + the release job's
+      # dist/* glob carry them to the release with no upload-list change.
+      - name: Build Debian package + stage installer
+        if: matrix.suffix == 'linux-amd64'
+        run: |
+          set -euo pipefail
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.47.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          CRUX_VERSION="${GITHUB_REF_NAME#v}" bash packaging/deb/build-deb.sh
+          cp packaging/install.sh dist/install.sh
+
       - name: Install cosign
         # sigstore/cosign-installer v4.1.2 (pinned SHA — floating tags are a T.5 vector)
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
@@ -123,6 +140,24 @@ jobs:
             "dist/corecruxctl-${{ matrix.suffix }}" \
             "dist/crux-daemon-${{ matrix.suffix }}.cdx.json" \
             "dist/RELEASE-MANIFEST-${{ matrix.suffix }}.txt"; do
+            test -f "$f"
+            cosign sign-blob --yes \
+              --output-signature "${f}.sig" \
+              --output-certificate "${f}.pem" \
+              "$f"
+          done
+
+      # Sign the .deb + installer with the same keyless flow. linux-amd64 only —
+      # these are single (non-per-suffix) artifacts, so signing them once here
+      # avoids the cross-matrix .sig name collision the shared-file note above
+      # describes. The .deb version is embedded in its filename by build-deb.sh.
+      - name: Sign Debian package + installer (cosign keyless)
+        if: matrix.suffix == 'linux-amd64'
+        run: |
+          set -euo pipefail
+          for f in \
+            "dist/crux-daemon_${GITHUB_REF_NAME#v}_amd64.deb" \
+            "dist/install.sh"; do
             test -f "$f"
             cosign sign-blob --yes \
               --output-signature "${f}.sig" \
