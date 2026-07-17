@@ -1312,6 +1312,7 @@ dependencies = [
  "tempfile",
  "ureq 3.3.0",
  "urlencoding",
+ "zeroize",
 ]
 
 [[package]]

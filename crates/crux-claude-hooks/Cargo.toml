@@ -39,6 +39,12 @@ ed25519-dalek = { workspace = true, features = ["std", "pkcs8"] }
 # external crate. crux-session provides LocalPassportKey::derive_subkey (the
 # passport-seed KDF used to derive the snapshot content key).
 chacha20poly1305 = { workspace = true }
+# Zeroize the derived snapshot content key on drop (crypto-review follow-up).
+# zeroize 1.8.x is already in the workspace Cargo.lock (pulled by chacha20poly1305
+# et al.) — version-pinned direct here (not `workspace = true`, no root Cargo.toml
+# entry) to add only a single lock dep-edge and avoid root/lockfile churn during
+# concurrent agent work, matching this crate's zero-lock-delta convention.
+zeroize = "1.8"
 crux-session = { path = "../crux-session" }
 fs2 = { workspace = true }
 hex = { workspace = true }

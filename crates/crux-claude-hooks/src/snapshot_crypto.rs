@@ -31,6 +31,7 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rand::Rng as _;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 /// Fact entity under which the client-side-encrypted compaction snapshot is
 /// stored (non-private, so it rides the hosted mirror; value is ciphertext only).
@@ -194,19 +195,23 @@ pub fn passport_key_path_from_env() -> Option<PathBuf> {
 /// freshly-minted seed on device B would differ from device A and silently
 /// break cross-device decrypt.
 ///
-// ponytail: derived key is a stack `[u8; 32]`, not zeroize-on-drop — matches
-// the in-tree `encrypted_secrets` precedent (same passport seed lives unzeroized
-// in `LocalPassportKey`). Upgrade path if the threat model tightens: wrap the
-// return + the intermediate in `zeroize::Zeroizing`.
+/// The key is returned in a [`Zeroizing`] wrapper so it is wiped from memory on
+/// drop. `Zeroizing<[u8; 32]>` derefs to `[u8; 32]`, so callers pass `&key`
+/// unchanged to [`seal`] / [`open`] via deref coercion.
+///
+// ponytail: this zeroizes the *derived* key. The passport *seed* itself still
+// lives unzeroized inside `crux_session::LocalPassportKey` (shared crate, every
+// `derive_subkey` caller) — a broader hardening tracked separately, out of scope
+// for this hook-local key path.
 #[must_use]
-pub fn derive_snapshot_key() -> Option<[u8; 32]> {
+pub fn derive_snapshot_key() -> Option<Zeroizing<[u8; 32]>> {
     let path = passport_key_path_from_env()?;
     // Read-only: a missing file means "no hosted key here" → skip, don't mint one.
     if !path.is_file() {
         return None;
     }
     let key = crux_session::LocalPassportKey::from_path(&path).ok()?;
-    Some(key.derive_subkey(SNAPSHOT_KEY_CONTEXT))
+    Some(Zeroizing::new(key.derive_subkey(SNAPSHOT_KEY_CONTEXT)))
 }
 
 #[cfg(test)]
