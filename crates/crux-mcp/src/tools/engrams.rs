@@ -22,8 +22,8 @@ use serde_json::{json, Value};
 use crate::dispatch::{McpContext, CAPABILITY_DENIED};
 use crate::protocol::{JsonRpcError, INVALID_PARAMS};
 use corecrux_memory::engrams::{
-    build_engram_manifest, class_allows, compute_engram_set_hash, local_catalog_with_overlays,
-    model_id_to_capability_class, parse_name_version, prompt_hash, LocalEngram,
+    build_engram_manifest, compute_engram_set_hash, local_catalog_with_overlays, model_id_to_capability_class,
+    prompt_hash, resolve_from_catalog,
 };
 
 pub const FEATURE_FLAG_ENV: &str = "CORECRUXD_FEATURE_ENGRAM_MCP";
@@ -96,16 +96,15 @@ async fn handle_inner(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcEr
         return Ok(json!({ "content": [{ "type": "text", "text": text }] }));
     }
 
-    let resolved = match resolve_from_catalog(&catalog, &names, &capability_class) {
-        Ok(r) => r,
-        Err(missing) => {
-            return Err(JsonRpcError {
-                code: INVALID_PARAMS,
-                message: format!("capability_class_mismatch_or_missing: {}", missing.join(", ")),
-                data: Some(json!({"missing": missing, "capability_class": capability_class})),
-            });
-        }
-    };
+    let outcome = resolve_from_catalog(&catalog, &names, &capability_class);
+    if !outcome.missing.is_empty() {
+        return Err(JsonRpcError {
+            code: INVALID_PARAMS,
+            message: format!("capability_class_mismatch_or_missing: {}", outcome.missing.join(", ")),
+            data: Some(json!({"missing": outcome.missing, "capability_class": capability_class})),
+        });
+    }
+    let resolved = outcome.resolved;
     let engram_set_hash = compute_engram_set_hash(&resolved);
     let text = serde_json::to_string_pretty(&json!({
         "schema": "crux.mcp.engrams.resolve.v1",
@@ -125,80 +124,15 @@ async fn handle_inner(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcEr
     Ok(json!({ "content": [{ "type": "text", "text": text }] }))
 }
 
-/// Resolve `name@version` entries against a catalog under a capability class.
-/// Returns the full missing/denied list (not just the first) so the caller
-/// can fix its request in one round trip.
-fn resolve_from_catalog(
-    catalog: &[LocalEngram],
-    names: &[String],
-    capability_class: &str,
-) -> Result<Vec<LocalEngram>, Vec<String>> {
-    let mut resolved = Vec::new();
-    let mut missing = Vec::new();
-    for name in names {
-        let Some((want_name, want_version)) = parse_name_version(name) else {
-            missing.push(name.clone());
-            continue;
-        };
-        let found = catalog
-            .iter()
-            .find(|e| e.enabled && e.name == want_name && e.version == want_version);
-        match found {
-            Some(e) if class_allows(capability_class, e) => resolved.push(e.clone()),
-            _ => missing.push(name.clone()),
-        }
-    }
-    if missing.is_empty() {
-        Ok(resolved)
-    } else {
-        Err(missing)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use corecrux_memory::engrams::builtin_engrams;
 
     #[test]
     fn flag_defaults_off() {
         // Do not set the env var anywhere in this test binary — parallel
         // tests share the process environment.
         assert!(!engram_mcp_enabled());
-    }
-
-    #[test]
-    fn resolve_finds_builtin_code_minimalism() {
-        let catalog = builtin_engrams();
-        let names = vec!["code-minimalism@v1".to_string()];
-        let resolved = resolve_from_catalog(&catalog, &names, "frontier").expect("resolves");
-        assert_eq!(resolved.len(), 1);
-        assert!(resolved[0].content.contains("crux-min:"));
-    }
-
-    #[test]
-    fn resolve_reports_all_missing_names() {
-        let catalog = builtin_engrams();
-        let names = vec![
-            "code-minimalism@v1".to_string(),
-            "nope@v1".to_string(),
-            "malformed".to_string(),
-        ];
-        let missing = resolve_from_catalog(&catalog, &names, "capable").expect_err("must fail");
-        assert_eq!(missing, vec!["nope@v1".to_string(), "malformed".to_string()]);
-    }
-
-    #[test]
-    fn resolve_denies_below_capability_min() {
-        let mut catalog = builtin_engrams();
-        for e in &mut catalog {
-            if e.name == "code-minimalism" {
-                e.capability_class_min = Some("frontier".to_string());
-            }
-        }
-        let names = vec!["code-minimalism@v1".to_string()];
-        assert!(resolve_from_catalog(&catalog, &names, "fast").is_err());
-        assert!(resolve_from_catalog(&catalog, &names, "frontier").is_ok());
     }
 
     #[tokio::test]

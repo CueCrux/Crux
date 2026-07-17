@@ -17,9 +17,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use corecrux_memory::engrams::{
-    build_engram_manifest, class_allows, compute_engram_set_hash, current_session_procedure, hash_json,
-    local_catalog_with_overlays, model_id_to_capability_class, parse_name_version, prompt_hash,
-    SESSION_PROCEDURE_SCHEMA,
+    build_engram_manifest, compute_engram_set_hash, current_session_procedure, hash_json, local_catalog_with_overlays,
+    model_id_to_capability_class, prompt_hash, resolve_from_catalog, SESSION_PROCEDURE_SCHEMA,
 };
 
 use super::{
@@ -197,26 +196,17 @@ pub(super) async fn resolve_engrams(
         Some(_) => "current",
         None => "unknown",
     };
-    let mut resolved = Vec::new();
-    let mut missing = Vec::new();
-    for name in &body.names {
-        let Some((want_name, want_version)) = parse_name_version(name) else {
-            return problem_response(StatusCode::UNPROCESSABLE_ENTITY, "names must use name@version form");
-        };
-        let found = engrams
-            .iter()
-            .find(|e| e.enabled && e.name == want_name && e.version == want_version);
-        match found {
-            Some(e) if class_allows(&capability_class, e) => resolved.push(e.clone()),
-            _ => missing.push(name.clone()),
-        }
+    let outcome = resolve_from_catalog(&engrams, &body.names, &capability_class);
+    if !outcome.malformed.is_empty() {
+        return problem_response(StatusCode::UNPROCESSABLE_ENTITY, "names must use name@version form");
     }
-    if !missing.is_empty() {
+    if !outcome.missing.is_empty() {
         return problem_response(
             StatusCode::FORBIDDEN,
-            format!("capability_class_mismatch_or_missing: {}", missing.join(", ")),
+            format!("capability_class_mismatch_or_missing: {}", outcome.missing.join(", ")),
         );
     }
+    let resolved = outcome.resolved;
     let engram_set_hash = compute_engram_set_hash(&resolved);
     let receipt_hash = engram_set_hash["hash"].as_str().unwrap_or_default();
     let receipt_suffix: String = receipt_hash.chars().take(16).collect();

@@ -22,7 +22,7 @@ use serde_json::json;
 use crate::fact_store::{dedup_latest, FactQuery, FactStore};
 
 pub const ENGRAM_ENTITY_PREFIX: &str = "__engram__::";
-pub const LOCAL_ENGRAM_MANIFEST_SCHEMA: &str = "crux.local.engram_manifest.v1";
+const LOCAL_ENGRAM_MANIFEST_SCHEMA: &str = "crux.local.engram_manifest.v1";
 pub const SESSION_PROCEDURE_SCHEMA: &str = "cuecrux.memory.session_procedure.v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -225,14 +225,11 @@ pub fn compute_engram_set_hash(engrams: &[LocalEngram]) -> serde_json::Value {
     })
 }
 
-pub fn prompt_hash(content: &str) -> String {
-    format!("blake3:{}", blake3::hash(content.as_bytes()).to_hex())
-}
-
-pub fn hash_json(value: &serde_json::Value) -> String {
-    let bytes = serde_json::to_vec(value).unwrap_or_default();
-    format!("blake3:{}", blake3::hash(&bytes).to_hex())
-}
+// Reuse the crate's existing blake3 helpers rather than adding fresh copies
+// (this crate already had several): `prompt_hash` is replay's text hash under
+// the name the engram wire format uses; `hash_json` is action_enrichment's.
+pub use crate::action_enrichment::hash_json;
+pub use crate::replay::hash_text as prompt_hash;
 
 pub fn parse_name_version(value: &str) -> Option<(&str, &str)> {
     let idx = value.rfind('@')?;
@@ -257,6 +254,43 @@ pub fn model_id_to_capability_class(model_id: Option<&str>) -> String {
     } else {
         "capable".to_string()
     }
+}
+
+/// Outcome of resolving `name@version` entries against a catalog under a
+/// capability class. `missing` collects every unresolvable entry in request
+/// order (malformed, unknown, or class-denied); `malformed` is the subset
+/// that failed `name@version` parsing, kept separately so the HTTP surface
+/// can preserve its 422-on-malformed contract while MCP reports one merged
+/// list.
+pub struct ResolveOutcome {
+    pub resolved: Vec<LocalEngram>,
+    pub missing: Vec<String>,
+    pub malformed: Vec<String>,
+}
+
+/// Shared resolve loop for the HTTP route and the MCP tool — one place for
+/// the enabled-filter and capability gating.
+pub fn resolve_from_catalog(catalog: &[LocalEngram], names: &[String], capability_class: &str) -> ResolveOutcome {
+    let mut out = ResolveOutcome {
+        resolved: Vec::new(),
+        missing: Vec::new(),
+        malformed: Vec::new(),
+    };
+    for name in names {
+        let Some((want_name, want_version)) = parse_name_version(name) else {
+            out.malformed.push(name.clone());
+            out.missing.push(name.clone());
+            continue;
+        };
+        let found = catalog
+            .iter()
+            .find(|e| e.enabled && e.name == want_name && e.version == want_version);
+        match found {
+            Some(e) if class_allows(capability_class, e) => out.resolved.push(e.clone()),
+            _ => out.missing.push(name.clone()),
+        }
+    }
+    out
 }
 
 pub fn class_allows(capability_class: &str, engram: &LocalEngram) -> bool {
@@ -381,6 +415,65 @@ mod tests {
 
         // Unknown class ranks as "capable".
         assert!(class_allows("unknown", &e));
+    }
+
+    #[test]
+    fn resolve_from_catalog_separates_malformed_from_missing() {
+        let catalog = builtin_engrams();
+        let names = vec![
+            "code-minimalism@v1".to_string(),
+            "nope@v1".to_string(),
+            "malformed".to_string(),
+        ];
+        let out = resolve_from_catalog(&catalog, &names, "capable");
+        assert_eq!(out.resolved.len(), 1);
+        assert_eq!(out.missing, vec!["nope@v1".to_string(), "malformed".to_string()]);
+        assert_eq!(out.malformed, vec!["malformed".to_string()]);
+    }
+
+    #[test]
+    fn resolve_denies_below_capability_min() {
+        let mut catalog = builtin_engrams();
+        for e in &mut catalog {
+            if e.name == "code-minimalism" {
+                e.capability_class_min = Some("frontier".to_string());
+            }
+        }
+        let names = vec!["code-minimalism@v1".to_string()];
+        assert!(!resolve_from_catalog(&catalog, &names, "fast").missing.is_empty());
+        assert_eq!(resolve_from_catalog(&catalog, &names, "frontier").resolved.len(), 1);
+    }
+
+    /// The wizard profile (crux-config-wizard/profiles/code-minimalism.md) and
+    /// this builtin engram are deliberately different renderings (full doc vs
+    /// compressed overlay) of the same ruleset. Full single-sourcing is the
+    /// wrong depth; what must never drift is the load-bearing `crux-min:`
+    /// marker token (harvest tooling greps for it) and the 7-rung ladder.
+    #[test]
+    fn profile_and_engram_share_marker_and_rungs() {
+        let profile_md = include_str!("../../crux-config-wizard/profiles/code-minimalism.md");
+        let engram = builtin_engrams()
+            .into_iter()
+            .find(|e| e.name == "code-minimalism")
+            .expect("builtin present");
+        for artefact in [profile_md, engram.content.as_str()] {
+            assert!(
+                artefact.contains("crux-min:"),
+                "shortcut marker token must match in both"
+            );
+        }
+        assert!(engram.content.contains("(7)"), "engram ladder must have 7 rungs");
+        assert_eq!(
+            profile_md.matches("\n1.").count(),
+            1,
+            "profile ladder must start at rung 1"
+        );
+        assert!(profile_md.contains("\n7."), "profile ladder must have 7 rungs");
+        // Carve-outs that must never be minimised away, present in both.
+        for term in ["validation", "security", "accessibility"] {
+            assert!(profile_md.to_lowercase().contains(term), "profile carve-out: {term}");
+            assert!(engram.content.to_lowercase().contains(term), "engram carve-out: {term}");
+        }
     }
 
     #[test]

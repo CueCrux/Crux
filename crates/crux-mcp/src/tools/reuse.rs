@@ -98,37 +98,44 @@ async fn handle_inner(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcEr
     drop(index);
 
     // Source 2: the Features lens — capability name/description/files overlap.
-    let caps: Vec<Value> = {
+    // NOTE: capability entities are workspace-global by design (EntityQuery has
+    // no tenant dimension; feature_file_search behaves the same), so
+    // capability_candidates are NOT tenant-scoped even though the retrieval
+    // half above is. The response labels them accordingly.
+    let terms = tokenize(description);
+    // Score borrowing under the read guard (no awaits inside); deep-clone only
+    // the few fields of the survivors.
+    let capability_hits: Vec<Value> = {
         let store = ctx.entity_store.read().await;
         let q = EntityQuery {
             kind: Some(CAPABILITY_KIND.into()),
             limit: None,
             include_deleted: false,
         };
-        store.list(&q).into_iter().map(|e| e.payload.clone()).collect()
-    };
-    let mut cap_matches: Vec<(usize, &Value)> = caps
-        .iter()
-        .filter_map(|c| {
-            let overlap = capability_overlap(description, c);
-            (overlap > 0).then_some((overlap, c))
-        })
-        .collect();
-    cap_matches.sort_by(|a, b| b.0.cmp(&a.0));
-    let capability_hits: Vec<Value> = cap_matches
-        .into_iter()
-        .take(limit)
-        .map(|(overlap, c)| {
-            json!({
-                "id": c.get("id"),
-                "name": c.get("name"),
-                "system": c.get("system"),
-                "maturity": c.get("maturity"),
-                "files": c.get("files"),
-                "overlap_terms": overlap,
+        let records = store.list(&q);
+        let mut cap_matches: Vec<(usize, &Value)> = records
+            .iter()
+            .filter_map(|r| {
+                let overlap = capability_overlap(&terms, &r.payload);
+                (overlap >= MIN_OVERLAP_TERMS).then_some((overlap, &r.payload))
             })
-        })
-        .collect();
+            .collect();
+        cap_matches.sort_by(|a, b| b.0.cmp(&a.0));
+        cap_matches
+            .into_iter()
+            .take(limit)
+            .map(|(overlap, c)| {
+                json!({
+                    "id": c.get("id"),
+                    "name": c.get("name"),
+                    "system": c.get("system"),
+                    "maturity": c.get("maturity"),
+                    "files": c.get("files"),
+                    "overlap_terms": overlap,
+                })
+            })
+            .collect()
+    };
 
     let verdict = if retrieval_hits.is_empty() && capability_hits.is_empty() {
         "nothing-found"
@@ -148,17 +155,33 @@ async fn handle_inner(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcEr
         "verdict": verdict,
         "retrieval_candidates": retrieval_hits,
         "capability_candidates": capability_hits,
+        "capability_scope": "workspace-global",
         "guidance": guidance,
     }))
     .unwrap_or_default();
     Ok(json!({ "content": [{ "type": "text", "text": text }] }))
 }
 
-/// Count description terms (>= 3 chars, lowercased) appearing in the
-/// capability's name, description, or file paths.
+/// A capability needs at least this many distinct matching terms to count as
+/// a reuse candidate — one shared common word ("for", "add") is noise and
+/// must not flip the verdict.
+const MIN_OVERLAP_TERMS: usize = 2;
+
+/// Lowercased distinct tokens (>= 3 chars) of a text, split on
+/// non-alphanumerics. Whole-token matching, so "add" cannot match "address".
+fn tokenize(text: &str) -> std::collections::BTreeSet<String> {
+    text.to_ascii_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 3)
+        .map(|t| t.to_string())
+        .collect()
+}
+
+/// Count description terms appearing as whole tokens in the capability's
+/// name, description, or file paths.
 // crux-min: naive term-overlap scoring; swap for the retrieval stack's scorer
 // if capability counts grow past a few hundred or precision complaints appear.
-fn capability_overlap(description: &str, capability: &Value) -> usize {
+fn capability_overlap(terms: &std::collections::BTreeSet<String>, capability: &Value) -> usize {
     let hay = format!(
         "{} {} {}",
         capability.get("name").and_then(|v| v.as_str()).unwrap_or(""),
@@ -168,15 +191,9 @@ fn capability_overlap(description: &str, capability: &Value) -> usize {
             .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|f| f.as_str()).collect::<Vec<_>>().join(" "))
             .unwrap_or_default()
-    )
-    .to_ascii_lowercase();
-    let mut seen = std::collections::BTreeSet::new();
-    description
-        .to_ascii_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| t.len() >= 3 && seen.insert((*t).to_string()))
-        .filter(|t| hay.contains(*t))
-        .count()
+    );
+    let hay_tokens = tokenize(&hay);
+    terms.intersection(&hay_tokens).count()
 }
 
 #[cfg(test)]
@@ -189,16 +206,22 @@ mod tests {
     }
 
     #[test]
-    fn overlap_counts_distinct_terms_only() {
+    fn overlap_counts_distinct_whole_tokens_only() {
         let cap = json!({
             "name": "config-hot-reload",
             "description": "Debounced file watcher that reloads configuration",
             "files": ["crates/crux-observe/src/watch.rs"]
         });
-        assert_eq!(capability_overlap("debounced file watcher for config reload", &cap), 5);
-        assert_eq!(capability_overlap("gpu kernel scheduler", &cap), 0);
+        assert_eq!(
+            capability_overlap(&tokenize("debounced file watcher for config reload"), &cap),
+            5
+        );
+        assert_eq!(capability_overlap(&tokenize("gpu kernel scheduler"), &cap), 0);
         // Repeated terms count once.
-        assert_eq!(capability_overlap("watcher watcher watcher", &cap), 1);
+        assert_eq!(capability_overlap(&tokenize("watcher watcher watcher"), &cap), 1);
+        // Whole-token boundary: "add" must not match inside "address".
+        let addr = json!({"name": "address-book", "description": "Postal address storage", "files": []});
+        assert_eq!(capability_overlap(&tokenize("add a user record"), &addr), 0);
     }
 
     #[tokio::test]
@@ -234,7 +257,7 @@ mod tests {
             .unwrap();
         }
         let out = handle_inner(
-            &json!({"tenant_id": "t", "description": "generate a URL slug from a title"}),
+            &json!({"tenant_id": "t", "description": "shared slug generation helper"}),
             &ctx,
         )
         .await
@@ -242,6 +265,14 @@ mod tests {
         let text = out["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("\"verdict\":\"reuse-candidate-found\""));
         assert!(text.contains("cap-slugify"));
+
+        // A single shared common term stays below MIN_OVERLAP_TERMS — no
+        // candidate, no verdict flip.
+        let out = handle_inner(&json!({"tenant_id": "t", "description": "helper for cron jobs"}), &ctx)
+            .await
+            .expect("ok");
+        let text = out["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("\"verdict\":\"nothing-found\""));
     }
 
     #[tokio::test]

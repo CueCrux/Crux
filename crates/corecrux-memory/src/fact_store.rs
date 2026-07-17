@@ -2110,48 +2110,52 @@ pub fn dedup_latest(facts: Vec<Fact>) -> Vec<Fact> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn dedup_keeps_highest_version_per_entity_and_key() {
-        let mut store = FactStore::new();
-        let mut reqs = Vec::new();
-        for _ in 0..3 {
-            reqs.push(StoreFact {
-                tenant_hash: "default".to_string(),
-                entity: "e1".to_string(),
-                key: "k".to_string(),
-                value: "v".to_string(),
-                source_receipt: None,
-                confidence: 1.0,
-                private: false,
-                horizon_class: None,
-                actor: None,
-            });
-        }
-        reqs.push(StoreFact {
+    fn dedup_fixture(id: &str, entity: &str, key: &str, version: u32) -> Fact {
+        Fact {
+            fact_id: id.to_string(),
             tenant_hash: "default".to_string(),
-            entity: "e2".to_string(),
-            key: "k".to_string(),
-            value: "v".to_string(),
+            entity: entity.to_string(),
+            key: key.to_string(),
+            value: format!("v{version}"),
             source_receipt: None,
             confidence: 1.0,
+            stored_at: chrono::Utc::now(),
+            tokens: 1,
+            deleted: false,
+            version,
+            supersedes: if version > 1 { Some("prev".to_string()) } else { None },
             private: false,
-            horizon_class: None,
+            horizon_class: HorizonClass::None,
+            reverified_at: None,
+            superseded_by: None,
             actor: None,
-        });
-        let stored = store.store_bulk(reqs);
-        let max_e1_version = stored
-            .iter()
-            .filter(|f| f.entity == "e1")
-            .map(|f| f.version)
-            .max()
-            .unwrap_or(0);
+            valid_from: None,
+            valid_to: None,
+            access_count: 0,
+            last_accessed_at: None,
+        }
+    }
 
-        let mut out = dedup_latest(stored);
+    /// Versions arrive OUT of order (1, 3, 2) — the highest version must win,
+    /// not the last-seen row. `FactStore::query()` can return superseded
+    /// versions in non-monotonic order, so this distinction is load-bearing
+    /// for overlay listings (engrams, passports, work).
+    #[test]
+    fn dedup_keeps_highest_version_per_entity_and_key() {
+        let input = vec![
+            dedup_fixture("a1", "e1", "k", 1),
+            dedup_fixture("a2", "e1", "k", 3),
+            dedup_fixture("a3", "e1", "k", 2),
+            dedup_fixture("b1", "e2", "k", 5),
+        ];
+        let mut out = dedup_latest(input);
         out.sort_by(|a, b| a.entity.cmp(&b.entity));
         assert_eq!(out.len(), 2);
-        assert_eq!(out[0].entity, "e1");
-        assert_eq!(out[0].version, max_e1_version);
-        assert_eq!(out[1].entity, "e2");
+        assert_eq!(
+            out[0].value, "v3",
+            "e1: highest version wins even when v2 arrives after v3"
+        );
+        assert_eq!(out[1].value, "v5");
     }
 
     /// Backward-compat (agent-passport M1): a JSON fact written before the
