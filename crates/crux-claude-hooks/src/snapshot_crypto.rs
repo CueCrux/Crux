@@ -32,6 +32,11 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rand::Rng as _;
 use serde::{Deserialize, Serialize};
 
+/// Fact entity under which the client-side-encrypted compaction snapshot is
+/// stored (non-private, so it rides the hosted mirror; value is ciphertext only).
+/// Shared by the PreCompact writer and the SessionStart reader.
+pub const SNAPSHOT_ENTITY: &str = "session_snapshot";
+
 /// Domain-separation label for the snapshot content key (BLAKE3 KDF context).
 /// The version suffix moves only alongside an [`ENVELOPE_V`] bump.
 pub const SNAPSHOT_KEY_CONTEXT: &str = "crux/compaction-snapshot/v1";

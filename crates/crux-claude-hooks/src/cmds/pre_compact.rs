@@ -25,11 +25,7 @@ use crate::{hook_input::HookInput, mcp_client, observe_capture, snapshot_crypto}
 /// document. Anything longer is truncated for the payload.
 const MILESTONE_LABEL_MAX_BYTES: usize = 256;
 
-/// Entity under which the client-side-encrypted compaction snapshot is stored
-/// (ExecPlan hosted-compaction-sync-encrypted-2026-07-17). A **non-private**
-/// fact so it rides the hosted per-tenant mirror; its `value` is ciphertext
-/// only, so nothing readable ever leaves the machine.
-const SNAPSHOT_ENTITY: &str = "session_snapshot";
+use snapshot_crypto::SNAPSHOT_ENTITY;
 
 pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
     let Some(input) = HookInput::read_from(reader)? else {
