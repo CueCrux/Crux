@@ -9,11 +9,14 @@ jobs:
   build-and-publish:
     name: Build & Publish
     runs-on: [self-hosted, ci]
-    # Publishes @cuecrux SDK packages using the NPM_TOKEN granular-access
-    # secret (scope @cuecrux, read+write). The token creates the package on
-    # first publish, so no manual workstation publish is needed.
+    # npm Trusted Publishing (OIDC) — no NPM_TOKEN secret. Requires a
+    # (pending) trusted publisher on npmjs.org for the @cuecrux scope:
+    # owner CueCrux, repository Crux, workflow sdk-typescript.yml. Until that
+    # is registered the publish step fails closed — there is no token fallback.
+    # Mirrors sdk-python.yml's move to PyPI trusted publishing.
     permissions:
       contents: read
+      id-token: write # OIDC token for tokenless auth + provenance attestation
     defaults:
       run:
         working-directory: sdks/typescript
@@ -23,8 +26,12 @@ jobs:
         with:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
+      # Trusted publishing (tokenless OIDC auth) needs npm >= 11.5.1; node 22
+      # ships npm 10. Upgrade before publishing so `npm publish` exchanges the
+      # OIDC token itself instead of looking for NODE_AUTH_TOKEN.
+      - run: npm install -g npm@latest
       - run: npm install
       - run: npm run build
-      - run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # --provenance attaches the signed SLSA provenance statement (uses the
+      # same id-token); trusted publishing supplies auth with no secret.
+      - run: npm publish --access public --provenance
