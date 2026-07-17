@@ -56,6 +56,7 @@ use tokio::sync::{broadcast, RwLock};
 
 use corecrux_memory::{Fact, FactStore};
 
+use crate::http::AppState;
 use crate::session_bindings::{SessionBinding, SESSION_BINDING_RECORD_KEY};
 
 /// Default retain window for ephemeral facts: 30 days.
@@ -160,6 +161,33 @@ pub async fn run_sweep_once(store: &Arc<RwLock<FactStore>>, now: DateTime<Utc>, 
     deleted
 }
 
+/// P4/M6 ephemeral-GC receipt — a **typed** payload carrying a count + retain
+/// window + a bounded reason-code ONLY, never the content of any swept fact
+/// (the builder takes a count, not facts). Redaction-tested in `tests`.
+#[derive(serde::Serialize)]
+struct GcReceiptV1 {
+    schema: &'static str,
+    op: &'static str,
+    deleted: usize,
+    retain_days: i64,
+    reason_code: &'static str,
+    swept_at: String,
+    run_id: String,
+}
+
+fn build_gc_receipt(deleted: usize, retain_days: i64) -> GcReceiptV1 {
+    GcReceiptV1 {
+        schema: "crux.gc_receipt.v1",
+        op: "ephemeral_sweep",
+        deleted,
+        retain_days,
+        // Bounded code; the human description lives in docs, not the signed body.
+        reason_code: "ephemeral_reserved_fact_gc",
+        swept_at: Utc::now().to_rfc3339(),
+        run_id: format!("gc_{}", uuid::Uuid::new_v4().simple()),
+    }
+}
+
 /// Spawn the background ephemeral GC task, mirroring
 /// [`crate::update::spawn_update_checker`].
 ///
@@ -168,7 +196,16 @@ pub async fn run_sweep_once(store: &Arc<RwLock<FactStore>>, now: DateTime<Utc>, 
 /// toggling it requires a restart — same convention as the other
 /// `CORECRUXD_*` background-task flags.) The task runs hourly until the
 /// shutdown signal is received.
-pub fn spawn_ephemeral_gc(enabled: bool, store: Arc<RwLock<FactStore>>, mut shutdown: broadcast::Receiver<()>) {
+///
+/// P4/M6: after a sweep soft-deletes ≥1 fact, mint a signed CROWN receipt
+/// (`__governance__::gc`) recording the count + retain window + reason-code —
+/// never swept content. The soft-delete is journaled (a `Delete` tombstone) but
+/// the fact journal append is not itself fsynced, so like any fact write it is
+/// durable on a clean shutdown, not crash-atomic; the receipt uses the fsynced
+/// durable append. A mint failure is NOT silent: `mint_governance_receipt`
+/// bumps the audit-debt counter and logs at ERROR (the
+/// `RECEIPT_MINT_FAILURES` static in `crate::http::observations`).
+pub fn spawn_ephemeral_gc(enabled: bool, state: AppState, mut shutdown: broadcast::Receiver<()>) {
     if !enabled {
         return;
     }
@@ -181,15 +218,31 @@ pub fn spawn_ephemeral_gc(enabled: bool, store: Arc<RwLock<FactStore>>, mut shut
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let n = run_sweep_once(&store, Utc::now(), retain).await;
-                    if n > 0 {
-                        tracing::info!(deleted = n, "ephemeral-gc-sweep");
-                    }
+                    sweep_and_receipt(&state, Utc::now(), retain).await;
                 }
                 _ = shutdown.recv() => break,
             }
         }
     });
+}
+
+/// One sweep plus its CROWN receipt. Returns the number of facts soft-deleted.
+/// Extracted from the spawn loop so the mint path is directly testable without
+/// the interval timer. A non-empty sweep mints a `__governance__::gc` receipt;
+/// a mint failure is loud (audit-debt counter + ERROR), never silent.
+pub(crate) async fn sweep_and_receipt(state: &AppState, now: DateTime<Utc>, retain: Duration) -> usize {
+    let n = run_sweep_once(&state.fact_store, now, retain).await;
+    if n > 0 {
+        tracing::info!(deleted = n, "ephemeral-gc-sweep");
+        crate::http::observations::mint_governance_receipt(
+            state,
+            "__governance__::gc",
+            "ephemeral-gc",
+            "gc.ephemeral_sweep",
+            &build_gc_receipt(n, retain.num_days()),
+        );
+    }
+    n
 }
 
 #[cfg(test)]
@@ -393,6 +446,62 @@ mod tests {
         assert!(tombstone.deleted, "soft-deleted fact is a tombstone, not erased");
         let user_fact = g.all_facts().find(|f| f.fact_id == user_id).expect("user fact present");
         assert!(!user_fact.deleted, "user fact untouched");
+    }
+
+    /// P4/M6: the GC receipt payload carries a count + retain window ONLY, never
+    /// the value of any swept fact — proven by sweeping a secret-bearing fact
+    /// and asserting the secret never reaches the receipt.
+    #[test]
+    fn gc_receipt_payload_never_carries_swept_content() {
+        const SECRET: &str = "GC_SECRET_PAYLOAD_qq7";
+        let mut s = FactStore::new();
+        let f = s.store(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "__reverify_receipts__::f1".to_string(),
+            key: "record".to_string(),
+            value: SECRET.to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: true,
+            horizon_class: None,
+            actor: None,
+        });
+        assert!(s.try_delete(&f.fact_id).unwrap(), "secret fact soft-deleted");
+        // One fact swept ⇒ receipt is built from the count alone.
+        let payload = serde_json::to_value(build_gc_receipt(1, DEFAULT_RETAIN_DAYS)).unwrap();
+        assert_eq!(payload["deleted"], 1);
+        assert_eq!(payload["retain_days"], DEFAULT_RETAIN_DAYS);
+        assert!(
+            !payload.to_string().contains(SECRET),
+            "swept secret leaked into GC receipt: {payload}"
+        );
+    }
+
+    /// Review-fix finding 7: drive the sweep+mint path directly (no interval
+    /// timer) and confirm a real aged fact is swept AND a GC receipt is written.
+    #[tokio::test]
+    async fn sweep_and_receipt_mints_gc_receipt_for_aged_fact() {
+        let mut state = crate::http::tests::test_app_state_with_auth(4, crate::auth::AuthMode::DevScopes);
+        let key = crux_session::LocalPassportKey::from_path(&state.passport_key_path).unwrap();
+        state.passport_fpr = key.passport_fpr().to_string();
+
+        // Seed an aged reverify-receipt fact (store_synced preserves stored_at).
+        let mut store = FactStore::new();
+        store.store_synced(fact(
+            "__reverify_receipts__::old",
+            "r-old",
+            Utc::now() - Duration::days(45),
+            true,
+        ));
+        state.fact_store = std::sync::Arc::new(RwLock::new(store));
+
+        let n = sweep_and_receipt(&state, Utc::now(), Duration::days(DEFAULT_RETAIN_DAYS)).await;
+        assert_eq!(n, 1, "aged ephemeral fact swept");
+
+        let file = crate::http::observations::observation_file_path(&state.data_dir, "__governance__::gc");
+        let body = std::fs::read_to_string(&file).unwrap();
+        assert!(body.contains("gc.ephemeral_sweep"), "GC receipt kind present");
+        assert!(body.contains("\"deleted\":1"), "GC receipt records the swept count");
     }
 
     #[tokio::test]

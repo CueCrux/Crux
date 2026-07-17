@@ -604,7 +604,7 @@ fn test_routing() -> RoutingTable {
     .expect("routing table")
 }
 
-pub(super) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: AuthMode) -> AppState {
+pub(crate) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: AuthMode) -> AppState {
     let build = corecrux_types::BuildInfo {
         version: "test".to_string(),
         commit: "test".to_string(),
