@@ -112,6 +112,7 @@ pub fn validate_repo_id(id: &str) -> Result<(), RepoRegistryError> {
 pub fn list_repos(store: &FactStore, tenant_id: &str) -> Vec<RepoRegistration> {
     let prefix = format!("{REPO_REGISTRY_PREFIX}::{tenant_id}::");
     let result = store.query(&FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: None,
@@ -134,6 +135,7 @@ pub fn list_repos(store: &FactStore, tenant_id: &str) -> Vec<RepoRegistration> {
 
 pub fn list_all_repos(store: &FactStore) -> Vec<RepoRegistration> {
     let result = store.query(&FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: None,
@@ -157,6 +159,7 @@ pub fn list_all_repos(store: &FactStore) -> Vec<RepoRegistration> {
 pub fn get_repo(store: &FactStore, tenant_id: &str, repo_id: &str) -> Option<RepoRegistration> {
     let entity = registry_entity(tenant_id, repo_id);
     let result = store.query(&FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: Some(entity),
@@ -226,6 +229,7 @@ pub fn fail_incomplete_scans(
 pub fn load_scan_json(store: &FactStore, tenant_id: &str, repo_id: &str) -> Option<String> {
     let entity = scan_entity(tenant_id, repo_id);
     let result = store.query(&FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: Some(entity),

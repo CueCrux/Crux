@@ -333,6 +333,7 @@ pub(crate) fn load_shared_id_store(store: &FactStore, tenant_id: &str) -> Result
 
 fn load_id_store_entity(store: &FactStore, entity: String) -> Result<CodeGraphIdStore, CodeGraphError> {
     let result = store.query(&FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: Some(entity),
@@ -415,6 +416,7 @@ pub(crate) fn load_extdeps(
     repo_id: &str,
 ) -> Result<BTreeMap<String, ExternalDepVersionRow>, CodeGraphError> {
     let result = store.query(&FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: Some(extdeps_entity(tenant_id, repo_id)),

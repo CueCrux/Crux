@@ -252,9 +252,12 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
         ToolDefinition {
             name: "query_facts".to_string(),
             description: "Query the fact store by keyword, entity, or both. Results are \
-                          ranked by time-decayed effective confidence (stale facts are \
-                          demoted; stored confidence is preserved). Private facts are \
-                          visible only to their owning agent."
+                          ranked by effective confidence: a fact past its freshness \
+                          horizon is demoted to half its stored confidence for ranking \
+                          only (a binary stale-demotion, not a continuous time-decay \
+                          curve); stored confidence is never mutated. Pass \
+                          `min_effective_confidence` to drop facts below a floor. Private \
+                          facts are visible only to their owning agent."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -264,13 +267,15 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
                     "top_k":        { "type": "integer", "description": "Maximum facts to return", "default": 10 },
                     "token_budget": { "type": "integer", "description": "Optional token budget" },
                     "include_superseded": { "type": "boolean", "description": "If true, also return facts explicitly retired via cross-entity supersession (their `superseded_by` is exposed). Default false (retired facts are hidden).", "default": false },
-                    "as_of": { "type": "string", "description": "Bi-temporal as-of filter (RFC 3339). Return only facts that were TRUE IN THE WORLD at this instant — whose valid-time interval [valid_from, valid_to) contains it — regardless of when they were learned. Omit for present-day recall." }
+                    "as_of": { "type": "string", "description": "Bi-temporal as-of filter (RFC 3339). Return only facts that were TRUE IN THE WORLD at this instant — whose valid-time interval [valid_from, valid_to) contains it — regardless of when they were learned. Omit for present-day recall." },
+                    "min_effective_confidence": { "type": "number", "description": "Confidence floor in 0..1. Drop facts whose recall-time EFFECTIVE confidence (stored confidence, halved once the fact is past its freshness horizon) is below this. The response's structuredContent carries `filtered_below_threshold` so you can tell 'no facts' apart from 'nothing above the floor' and fall back to a non-LLM path. Omit for no floor." }
                 },
                 "examples": [
                     { "query": "deployment strategy", "token_budget": 2000 },
                     { "entity": "project-alpha", "top_k": 5 },
                     { "entity": "bench:lme-s", "include_superseded": true },
-                    { "entity": "person:alice", "as_of": "2026-03-01T00:00:00Z" }
+                    { "entity": "person:alice", "as_of": "2026-03-01T00:00:00Z" },
+                    { "query": "deploy target", "min_effective_confidence": 0.5 }
                 ]
             }),
         },

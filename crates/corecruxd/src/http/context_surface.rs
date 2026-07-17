@@ -119,6 +119,7 @@ async fn gather_facts(
     // 1. Addressed recall first (spec §4 rule 1).
     if let Some(entity) = req.entity.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
         let q = corecrux_memory::fact_store::FactQuery {
+            min_effective_confidence: None,
             tenant_hash: None,
             query: None,
             entity: Some(entity.to_string()),
@@ -139,6 +140,7 @@ async fn gather_facts(
     let keyword = req.query.as_deref().map(str::trim).filter(|q| !q.is_empty());
     if keyword.is_some() || req.entity.is_none() {
         let q = corecrux_memory::fact_store::FactQuery {
+            min_effective_confidence: None,
             tenant_hash: None,
             query: keyword.map(str::to_string),
             entity: None,

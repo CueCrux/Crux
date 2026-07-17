@@ -105,6 +105,7 @@ async fn list_storybook_versions_internal(
     let store = fact_store.read().await;
     let prefix = format!("{STORYBOOK_PREFIX}::{project_id}::");
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: Some(prefix.clone()),
         entity: None,
@@ -130,6 +131,7 @@ async fn load_storybook(
     let store = fact_store.read().await;
     let entity = entity_for(project_id, ts);
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: Some(entity.clone()),

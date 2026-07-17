@@ -621,6 +621,7 @@ fn latest_case_fact(store: &corecrux_memory::FactStore, id: &str) -> Option<(Fac
     let entity = format!("{INCIDENT_ENTITY_PREFIX}::{id}");
     let fact = store
         .query(&FactQuery {
+            min_effective_confidence: None,
             tenant_hash: None,
             query: None,
             entity: Some(entity),
@@ -638,6 +639,7 @@ fn latest_case_fact(store: &corecrux_memory::FactStore, id: &str) -> Option<(Fac
 
 fn list_case_records(store: &corecrux_memory::FactStore, tenant_id: &str) -> Vec<IncidentCase> {
     let result = store.query(&FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: None,

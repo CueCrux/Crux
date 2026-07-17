@@ -1060,6 +1060,7 @@ pub fn execplans_root_from_env() -> Option<PathBuf> {
 /// instead of N per-slug queries.
 fn collect_execplan_facts(store: &FactStore) -> HashMap<String, Vec<ExecplanFactRow>> {
     let result = store.query(&FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: None,

@@ -431,6 +431,7 @@ pub(super) async fn get_project_layers(
     // Pull a generous slice — facts are stored append-only so the same layer
     // can have many versions; we'll dedupe to the latest below.
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: Some(prefix.clone()),
         entity: None,

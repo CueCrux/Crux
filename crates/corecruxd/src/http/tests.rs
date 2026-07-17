@@ -2405,6 +2405,7 @@ async fn query_facts_by_keyword() {
     }
 
     let params = QueryFactsParams {
+        min_effective_confidence: None,
         query: Some("canary".to_string()),
         entity: None,
         entity_prefix: None,
@@ -2465,6 +2466,7 @@ async fn query_facts_as_of_filters_world_time() {
     }
 
     let params = QueryFactsParams {
+        min_effective_confidence: None,
         query: None,
         entity: Some("person:zoe".to_string()),
         entity_prefix: None,
@@ -2494,6 +2496,7 @@ async fn query_facts_as_of_filters_world_time() {
 
     // A bad (unparseable) as_of → 400.
     let bad = QueryFactsParams {
+        min_effective_confidence: None,
         query: None,
         entity: None,
         entity_prefix: None,
@@ -2528,6 +2531,7 @@ async fn query_facts_no_params_returns_all() {
     }
 
     let params = QueryFactsParams {
+        min_effective_confidence: None,
         query: None,
         entity: None,
         entity_prefix: None,
@@ -2542,6 +2546,70 @@ async fn query_facts_no_params_returns_all() {
     let body = json_body(resp).await;
     let facts = body["facts"].as_array().expect("facts array");
     assert_eq!(facts.len(), 3);
+}
+
+#[tokio::test]
+async fn query_facts_min_effective_confidence_floor_filters_and_counts() {
+    // P2 (M7): GET /v1/facts?min_effective_confidence drops below-floor facts and
+    // reports `filtered_below_threshold`. Fresh facts have effective == stored
+    // confidence, so a 0.5 floor keeps the 0.9 fact and drops the 0.3 fact.
+    let state = test_app_state(16);
+    for (key, conf) in [("hi", 0.9f32), ("lo", 0.3f32)] {
+        let body = corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "floor-test".to_string(),
+            key: key.to_string(),
+            value: format!("v-{key}"),
+            source_receipt: None,
+            confidence: conf,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        };
+        let _ = facts::put_fact(State(state.clone()), HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+    }
+
+    let params = QueryFactsParams {
+        min_effective_confidence: Some(0.5),
+        query: None,
+        entity: Some("floor-test".to_string()),
+        entity_prefix: None,
+        top_k: None,
+        token_budget: None,
+        as_of: None,
+    };
+    let resp = facts::query_facts(State(state), HeaderMap::new(), Query(params))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["facts"].as_array().unwrap().len(),
+        1,
+        "only the 0.9 fact clears the 0.5 floor"
+    );
+    assert_eq!(body["filtered_below_threshold"], 1);
+}
+
+#[tokio::test]
+async fn query_facts_rejects_out_of_range_floor() {
+    // Finding 5: a floor outside 0..=1 is a 400, not a silent all-filtered result.
+    let state = test_app_state(16);
+    let params = QueryFactsParams {
+        min_effective_confidence: Some(1.5),
+        query: None,
+        entity: None,
+        entity_prefix: None,
+        top_k: None,
+        token_budget: None,
+        as_of: None,
+    };
+    let resp = facts::query_facts(State(state), HeaderMap::new(), Query(params))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 // ── Case store (POST /v1/cases, /v1/cases/retrieve) ─────────────
@@ -2634,6 +2702,7 @@ async fn query_facts_accepts_admin_read_fallback_in_dev_scopes_mode() {
         .into_response();
 
     let params = QueryFactsParams {
+        min_effective_confidence: None,
         query: Some("green".to_string()),
         entity: None,
         entity_prefix: None,
@@ -2981,6 +3050,7 @@ async fn query_facts_supports_entity_prefix_top_k_and_token_budget() {
     }
 
     let params = QueryFactsParams {
+        min_effective_confidence: None,
         query: None,
         entity: None,
         entity_prefix: Some("proj-a".to_string()),
@@ -3041,6 +3111,7 @@ async fn query_facts_applies_passport_private_visibility() {
     }
 
     let params = QueryFactsParams {
+        min_effective_confidence: None,
         query: None,
         entity: None,
         entity_prefix: None,
@@ -3063,6 +3134,7 @@ async fn query_facts_applies_passport_private_visibility() {
     assert!(!text.contains("bob-only"));
 
     let anonymous_params = QueryFactsParams {
+        min_effective_confidence: None,
         query: None,
         entity: None,
         entity_prefix: None,
@@ -3084,6 +3156,7 @@ async fn query_facts_applies_passport_private_visibility() {
     assert!(!text.contains("bob-only"));
 
     let admin_params = QueryFactsParams {
+        min_effective_confidence: None,
         query: None,
         entity: None,
         entity_prefix: None,
@@ -7161,6 +7234,7 @@ async fn action_enrich_basic_is_free_and_stores_private_receipt() {
 
     let store = shared.fact_store.read().await;
     let facts = store.query(&corecrux_memory::fact_store::FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: None,
@@ -7365,6 +7439,7 @@ async fn workbench_context_pack_and_command_ledger_store_private_receipts() {
 
     let store = shared.fact_store.read().await;
     let facts = store.query(&corecrux_memory::fact_store::FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: None,
@@ -9570,6 +9645,175 @@ async fn console_review_contradictions_returns_factstore_candidates() {
 }
 
 #[tokio::test]
+async fn console_review_queue_lists_surfaced_expiry_runs() {
+    // P1 widen: run the scheduler pass over a low-confidence fact to surface a
+    // real `__consolidation_review__::` receipt, then read it back via the queue.
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "svc".to_string(),
+            key: "flag".to_string(),
+            value: "maybe".to_string(),
+            source_receipt: None,
+            confidence: 0.1,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+    }
+    let surfaced = crate::consolidation_scheduler::run_review_once(&state.fact_store, 200).await;
+    assert_eq!(surfaced, 1, "one expiry proposal surfaced");
+
+    let resp = console::get_console_review_queue(
+        State(state),
+        dev_scope_headers("admin:read"),
+        Query(console::ConsoleReviewQuery { limit: Some(10) }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["schema"], "crux.console.review.queue.v1");
+    assert_eq!(body["count"], 1);
+    assert_eq!(body["scheduler_enabled"], false, "flag default-OFF (finding 6)");
+    assert!(
+        body["live_contradictions"].is_array(),
+        "live fallback present (finding 6)"
+    );
+    assert_eq!(body["runs"][0]["review"]["expiry_count"], 1);
+    assert_eq!(
+        body["runs"][0]["review"]["expiry_candidates"][0]["reason"],
+        "low_confidence"
+    );
+}
+
+// Helper: store a fact with an explicit confidence + optional receipt, return id.
+async fn seed_fact(state: &AppState, entity: &str, key: &str, confidence: f32, source_receipt: Option<&str>) -> String {
+    state
+        .fact_store
+        .write()
+        .await
+        .store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: entity.to_string(),
+            key: key.to_string(),
+            value: "v".to_string(),
+            source_receipt: source_receipt.map(str::to_string),
+            confidence,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        })
+        .fact_id
+}
+
+#[tokio::test]
+async fn console_review_expiries_soft_deletes_reviewed_candidate() {
+    // A genuine low-confidence candidate, requested by id, is soft-deleted.
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let id = seed_fact(&state, "svc", "flag", 0.1, None).await;
+
+    let resp = console::post_console_review_expiries(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        Json(console::ConsoleExpiryApplyRequest {
+            fact_ids: vec![id.clone()],
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["schema"], "crux.console.review.expiries.v1");
+    assert_eq!(body["expired_count"], 1);
+    assert_eq!(body["expired"][0]["fact_id"], id);
+    assert_eq!(body["expired"][0]["reason"], "low_confidence");
+    assert!(
+        state.fact_store.read().await.get(&id).is_none(),
+        "candidate soft-deleted"
+    );
+}
+
+/// Review findings 1 & 2: the apply must NEVER delete a pinned, receipt-linked,
+/// or fresh/high-confidence fact — even when its id is explicitly requested and
+/// even if it became protected after the proposal was surfaced.
+#[tokio::test]
+async fn console_review_expiries_never_deletes_protected_or_fresh() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    // Genuine candidate (low confidence, no protection) → SHOULD be expired.
+    let victim = seed_fact(&state, "svc", "victim", 0.1, None).await;
+    // Receipt-linked but low confidence → protected, MUST survive.
+    let receipted = seed_fact(&state, "svc", "receipted", 0.1, Some("crown:rcpt-1")).await;
+    // Fresh + high confidence → not a candidate, MUST survive.
+    let fresh = seed_fact(&state, "svc", "fresh", 0.95, None).await;
+    // Low confidence but PINNED → protected, MUST survive. Pin marker is a
+    // `__memory_pin::<scope>::<fact_id>` fact with key "pinned" value "1".
+    let pinned = seed_fact(&state, "svc", "pinned", 0.1, None).await;
+    {
+        let mut store = state.fact_store.write().await;
+        store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: format!("__memory_pin::cli::{pinned}"),
+            key: "pinned".to_string(),
+            value: "1".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+    }
+
+    let resp = console::post_console_review_expiries(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        Json(console::ConsoleExpiryApplyRequest {
+            fact_ids: vec![victim.clone(), receipted.clone(), fresh.clone(), pinned.clone()],
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    // Only the genuine candidate was deleted.
+    assert_eq!(body["expired_count"], 1);
+    assert_eq!(body["expired"][0]["fact_id"], victim);
+    let store = state.fact_store.read().await;
+    assert!(store.get(&victim).is_none(), "genuine candidate expired");
+    // Every protected / fresh fact survives.
+    assert!(store.get(&receipted).is_some(), "receipt-linked fact survives");
+    assert!(store.get(&fresh).is_some(), "fresh high-confidence fact survives");
+    assert!(store.get(&pinned).is_some(), "pinned fact survives");
+    // …and each is reported as skipped with a reason.
+    let skipped: Vec<&str> = body["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["fact_id"].as_str().unwrap())
+        .collect();
+    for id in [&receipted, &fresh, &pinned] {
+        assert!(skipped.contains(&id.as_str()), "{id} reported skipped");
+    }
+}
+
+#[tokio::test]
+async fn console_review_expiries_rejects_empty_fact_ids() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::post_console_review_expiries(
+        State(state),
+        dev_scope_headers("admin:write"),
+        Json(console::ConsoleExpiryApplyRequest { fact_ids: vec![] }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn console_review_consolidation_supersedes_targets_with_actor() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     let (old_id, newer_id) = {
@@ -10745,6 +10989,7 @@ async fn rcx_publish_project_emit_stores_local_receipt() {
 
     let store = state.fact_store.read().await;
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: Some("__rcx_publish__::project::alpha".to_string()),

@@ -132,6 +132,7 @@ pub fn unlink_repo(store: &mut FactStore, project_id: &str, repo_slug: &str) -> 
 pub fn list_links(store: &FactStore, project_id: &str) -> Vec<RepoLink> {
     let prefix = format!("{REPO_LINK_PREFIX}::{project_id}::");
     let result = store.query(&FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: Some(prefix.clone()),
         entity: None,

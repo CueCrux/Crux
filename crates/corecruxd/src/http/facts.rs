@@ -22,6 +22,11 @@ pub(super) struct QueryFactsParams {
     pub top_k: Option<usize>,
     /// Token budget — fill results by descending score until exhausted.
     pub token_budget: Option<usize>,
+    /// P2 confidence floor in 0..1: drop facts whose recall-time effective
+    /// confidence (stored confidence, stale-demoted) is below this. The
+    /// response's `filtered_below_threshold` distinguishes "no facts" from
+    /// "nothing above the floor". Omit for no floor.
+    pub min_effective_confidence: Option<f32>,
     /// Bi-temporal as-of filter (RFC 3339). When set, only facts whose
     /// valid-time interval `[valid_from, valid_to)` contains this instant are
     /// returned — i.e. facts that were TRUE IN THE WORLD at `as_of`, regardless
@@ -190,23 +195,88 @@ pub(super) fn query_visible_http_facts(
     q: &corecrux_memory::fact_store::FactQuery,
     ctx: &crate::auth::HttpScopeContext,
 ) -> Vec<corecrux_memory::fact_store::Fact> {
-    query_visible_http_facts_as_of(store, q, ctx, None)
+    // Internal callers (context_surface) never set a confidence floor; drop the count.
+    query_visible_http_facts_as_of(store, q, ctx, None).0
+}
+
+/// P2 confidence floor: drop facts whose recall-time EFFECTIVE confidence
+/// (stored confidence, stale-demoted — the same value `query_facts` ranks by)
+/// is below `floor`. `None` ⇒ keep all. Returns the number of facts dropped so
+/// the caller can surface `filtered_below_threshold`. Generic over owned/borrowed
+/// facts so both the raw-admin and scoped branches share one implementation.
+fn drop_below_confidence_floor<T: std::borrow::Borrow<corecrux_memory::fact_store::Fact>>(
+    facts: &mut Vec<T>,
+    floor: Option<f32>,
+) -> usize {
+    let Some(floor) = floor else {
+        return 0;
+    };
+    let floor = floor as f64;
+    let now = chrono::Utc::now();
+    let policy = corecrux_projections::decay::DecayPolicy::from_env();
+    let before = facts.len();
+    facts.retain(|fact| crux_mcp::tools::freshness::fact_effective_confidence(fact.borrow(), now, policy) >= floor);
+    before - facts.len()
+}
+
+/// Apply the `token_budget`-then-`top_k` selection to an already-ranked list
+/// (the same rule `FactStore::query` uses internally): fill by descending rank
+/// until the budget is hit, else truncate to `top_k`. Factored out so the
+/// raw-admin path can filter the FULL matched set BEFORE this cut.
+fn take_within_budget(
+    facts: Vec<corecrux_memory::fact_store::Fact>,
+    token_budget: Option<usize>,
+    top_k: usize,
+) -> Vec<corecrux_memory::fact_store::Fact> {
+    match token_budget {
+        Some(budget) => {
+            let mut used = 0usize;
+            let mut selected = Vec::new();
+            for fact in facts {
+                if used + fact.tokens > budget && !selected.is_empty() {
+                    break;
+                }
+                used += fact.tokens;
+                selected.push(fact);
+                if used >= budget {
+                    break;
+                }
+            }
+            selected
+        }
+        None => {
+            let mut facts = facts;
+            facts.truncate(top_k);
+            facts
+        }
+    }
 }
 
 /// As [`query_visible_http_facts`] but with an optional bi-temporal `as_of`
 /// filter (M1): when set, only facts whose valid-time interval contains the
-/// instant are returned. `None` ⇒ identical to the plain variant.
+/// instant are returned. `None` ⇒ identical to the plain variant. Returns the
+/// visible facts plus the P2 `filtered_below_threshold` count.
 pub(super) fn query_visible_http_facts_as_of(
     store: &corecrux_memory::FactStore,
     q: &corecrux_memory::fact_store::FactQuery,
     ctx: &crate::auth::HttpScopeContext,
     as_of: Option<chrono::DateTime<chrono::Utc>>,
-) -> Vec<corecrux_memory::fact_store::Fact> {
+) -> (Vec<corecrux_memory::fact_store::Fact>, usize) {
     if raw_admin_read(ctx) {
-        return match as_of {
-            Some(instant) => store.query_as_of(q, instant).facts,
-            None => store.query(q).facts,
+        // Run the floor filter/count over the FULL matched+ranked set, THEN
+        // apply budget/top_k — so a below-floor row never consumes the window
+        // and the count reflects the whole matched set, matching the scoped
+        // path and the M7 contract (review finding 4).
+        let mut unbounded = q.clone();
+        unbounded.top_k = usize::MAX;
+        unbounded.token_budget = None;
+        unbounded.min_effective_confidence = None;
+        let mut facts = match as_of {
+            Some(instant) => store.query_as_of(&unbounded, instant).facts,
+            None => store.query(&unbounded).facts,
         };
+        let filtered = drop_below_confidence_floor(&mut facts, q.min_effective_confidence);
+        return (take_within_budget(facts, q.token_budget, q.top_k), filtered);
     }
 
     let agent_name = ctx.passport_id.as_deref();
@@ -233,6 +303,10 @@ pub(super) fn query_visible_http_facts_as_of(
                 .is_none_or(|query| fact_matches_query(fact, query, agent_name))
         })
         .collect();
+
+    // P2 confidence floor — counted over the full matched set BEFORE the
+    // budget/top_k cut so an empty result still reports the true count.
+    let filtered_below_threshold = drop_below_confidence_floor(&mut results, q.min_effective_confidence);
 
     results.sort_by(|left, right| {
         right
@@ -261,10 +335,11 @@ pub(super) fn query_visible_http_facts_as_of(
         results
     };
 
-    selected
+    let rendered = selected
         .into_iter()
         .filter_map(|fact| render_fact_for_http(fact, ctx))
-        .collect()
+        .collect();
+    (rendered, filtered_below_threshold)
 }
 
 pub(super) fn scoped_session_id_for_http(ctx: &crate::auth::HttpScopeContext, session_id: &str) -> String {
@@ -490,7 +565,18 @@ pub(super) async fn query_facts(
         Ok(ctx) => ctx,
         Err(response) => return response,
     };
+    // P2 floor must be finite and in 0..=1 (review finding 5) — reject nonsense
+    // rather than silently returning "all kept / all filtered".
+    if let Some(floor) = params.min_effective_confidence {
+        if !crux_mcp::tools::freshness::valid_confidence_floor(floor as f64) {
+            return problem_response(
+                StatusCode::BAD_REQUEST,
+                "min_effective_confidence must be a number in 0.0..=1.0",
+            );
+        }
+    }
     let q = corecrux_memory::fact_store::FactQuery {
+        min_effective_confidence: params.min_effective_confidence,
         query: params.query,
         entity: params.entity,
         tenant_hash: None,
@@ -514,13 +600,15 @@ pub(super) async fn query_facts(
         None => None,
     };
     let store = state.fact_store.read().await;
-    let facts = query_visible_http_facts_as_of(&store, &q, &ctx, as_of);
+    let (facts, filtered_below_threshold) = query_visible_http_facts_as_of(&store, &q, &ctx, as_of);
     let total_tokens = facts.iter().map(|fact| fact.tokens).sum::<usize>();
     (
         StatusCode::OK,
         axum::Json(serde_json::json!({
             "facts": facts,
             "total_tokens": total_tokens,
+            // P2: distinguishes "no facts" from "nothing above the floor".
+            "filtered_below_threshold": filtered_below_threshold,
         })),
     )
         .into_response()

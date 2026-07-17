@@ -110,6 +110,7 @@ fn tenant_entity(project_id: &str, plane_id: &str, tenant_id: &str) -> String {
 pub fn list_planes(store: &FactStore, project_id: &str) -> Vec<PlaneRecord> {
     let prefix = format!("{PLANE_ENTITY_PREFIX}::{project_id}::");
     let result = store.query(&FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: None,
@@ -138,6 +139,7 @@ pub fn list_planes(store: &FactStore, project_id: &str) -> Vec<PlaneRecord> {
 
 pub fn get_plane(store: &FactStore, project_id: &str, plane_id: &str) -> Option<PlaneRecord> {
     let result = store.query(&FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: Some(record_entity(project_id, plane_id)),
@@ -155,6 +157,7 @@ pub fn get_plane(store: &FactStore, project_id: &str, plane_id: &str) -> Option<
 pub fn list_members(store: &FactStore, project_id: &str, plane_id: &str) -> Vec<PlaneMember> {
     let prefix = format!("{PLANE_ENTITY_PREFIX}::{project_id}::{plane_id}::passport::");
     let result = store.query(&FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: None,
@@ -173,6 +176,7 @@ pub fn list_members(store: &FactStore, project_id: &str, plane_id: &str) -> Vec<
 pub fn list_tenants(store: &FactStore, project_id: &str, plane_id: &str) -> Vec<PlaneTenant> {
     let prefix = format!("{PLANE_ENTITY_PREFIX}::{project_id}::{plane_id}::tenant::");
     let result = store.query(&FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: None,
@@ -236,6 +240,7 @@ pub fn delete_plane(store: &mut FactStore, project_id: &str, plane_id: &str) -> 
         format!("{PLANE_ENTITY_PREFIX}::{project_id}::{plane_id}::tenant::"),
     ];
     let result = store.query(&FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: None,

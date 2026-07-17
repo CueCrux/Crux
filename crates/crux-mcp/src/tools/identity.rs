@@ -140,6 +140,7 @@ async fn load_passport(ctx: &McpContext, principal_id: &str) -> Option<PassportR
 async fn load_passport_raw(ctx: &McpContext, principal_id: &str) -> Option<PassportRecord> {
     let entity = format!("{PASSPORT_PREFIX}{principal_id}");
     let q = FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: Some(entity),
@@ -159,6 +160,7 @@ async fn load_passport_raw(ctx: &McpContext, principal_id: &str) -> Option<Passp
 async fn is_retired(ctx: &McpContext, principal_id: &str) -> bool {
     let entity = format!("{PASSPORT_PREFIX}{principal_id}");
     let q = FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: Some(entity),

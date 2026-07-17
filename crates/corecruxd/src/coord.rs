@@ -128,6 +128,7 @@ pub fn list_intents(store: &FactStore, project_id: Option<&str>) -> Vec<CoordInt
         None => format!("{COORD_ENTITY_PREFIX}::"),
     };
     let result = store.query(&FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: None,

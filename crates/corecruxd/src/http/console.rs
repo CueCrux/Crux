@@ -475,6 +475,165 @@ pub(super) async fn get_console_review_contradictions(
         .into_response()
 }
 
+/// `GET /v1/console/review/queue` — read-only review-queue view (P1 widen).
+///
+/// Lists the surfaced `__consolidation_review__::<run_id>` receipt facts written
+/// by the (default-OFF) consolidation scheduler, newest first, with the parsed
+/// review body (contradiction + expiry proposals). This is the data the embedded
+/// `/console/review` page renders. Distinct from
+/// `GET /v1/console/review/contradictions`, which runs a LIVE contradiction pass.
+pub(super) async fn get_console_review_queue(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConsoleReviewQuery>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_console_read(&state, &headers) {
+        return problem.into_response();
+    }
+    let limit = query.limit.unwrap_or(50).min(250);
+    let (runs, live_contradictions) = {
+        let store = state.fact_store.read().await;
+        // Confidence 1.0 on every review receipt ⇒ query_inner's confidence-desc,
+        // stored_at-desc order already yields newest-first.
+        let result = store.query(&corecrux_memory::fact_store::FactQuery {
+            entity_prefix: Some(crate::consolidation_scheduler::REVIEW_ENTITY_PREFIX.to_string()),
+            top_k: limit,
+            ..Default::default()
+        });
+        let runs: Vec<serde_json::Value> = result
+            .facts
+            .iter()
+            .map(|fact| {
+                serde_json::json!({
+                    "fact_id": fact.fact_id,
+                    "entity": fact.entity,
+                    "surfaced_at": fact.stored_at.to_rfc3339(),
+                    // Parsed review body when it is JSON; the raw string otherwise.
+                    "review": serde_json::from_str::<serde_json::Value>(&fact.value)
+                        .unwrap_or_else(|_| serde_json::Value::String(fact.value.clone())),
+                })
+            })
+            .collect();
+        // Live contradiction pass so the console still shows current
+        // contradictions even when the scheduler is OFF (nothing surfaced yet) —
+        // repointing the page to the queue must not hide them (review finding 6).
+        let live = store.contradiction_candidates_v1(limit);
+        (runs, live)
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "schema": "crux.console.review.queue.v1",
+            // Lets the page tell "scheduler off, nothing surfaced" apart from
+            // "scheduler on, genuinely empty" (review finding 6).
+            "scheduler_enabled": state.consolidation_scheduler_enabled,
+            "limit": limit,
+            "count": runs.len(),
+            "runs": runs,
+            "live_contradictions": live_contradictions,
+            "live_count": live_contradictions.len(),
+        })),
+    )
+        .into_response()
+}
+
+/// Per-request cap on the expiry batch so one call can never sweep an unbounded
+/// set of facts (review finding 2).
+const MAX_EXPIRY_BATCH: usize = 500;
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct ConsoleExpiryApplyRequest {
+    /// Explicit fact_ids to expire — the operator's selection from the surfaced
+    /// expiry proposals. Every id is RE-VALIDATED at apply time (see the handler)
+    /// before it is soft-deleted; there is deliberately no blanket cutoff.
+    pub fact_ids: Vec<String>,
+}
+
+/// `POST /v1/console/review/expiries` — operator applies REVIEWED expiry
+/// proposals (P1 widen). Console-write gated; the scheduler itself never mutates.
+///
+/// Safety (review findings 1 & 2): the apply takes an explicit, bounded list of
+/// fact_ids and, under the write lock, recomputes the CURRENT expiry-candidate
+/// set (`select_expiry_candidates`) — which enforces the exact same protections
+/// the scheduler applied at proposal time (private / receipt-linked / pinned /
+/// `>= PROTECTED_CONFIDENCE_FLOOR`) AND re-checks staleness / low-confidence NOW.
+/// Any requested id that is no longer a live candidate (became protected, was
+/// re-verified fresh, gained confidence, or never qualified) is SKIPPED, never
+/// deleted. There is no cutoff, so a future timestamp can no longer mass-delete.
+/// Deletion uses the fallible [`corecrux_memory::FactStore::try_delete`] so an
+/// unpersisted tombstone is reported as skipped, not expired (finding 3).
+pub(super) async fn post_console_review_expiries(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ConsoleExpiryApplyRequest>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_console_write(&state, &headers) {
+        return problem.into_response();
+    }
+    if body.fact_ids.is_empty() {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "fact_ids must be a non-empty list of proposed expiry-candidate ids",
+        );
+    }
+    if body.fact_ids.len() > MAX_EXPIRY_BATCH {
+        return problem_response(StatusCode::BAD_REQUEST, "fact_ids exceeds the 500-id per-request cap");
+    }
+    let actor = console_actor_from_headers(&headers);
+    let (expired, skipped) = {
+        let mut store = state.fact_store.write().await;
+        // Recompute the live candidate set under the SAME write lock we delete
+        // under — atomic revalidation, no TOCTOU. `select_expiry_candidates`
+        // applies the protection + stale/low-confidence rules exactly as the
+        // scheduler does at proposal time.
+        let facts: Vec<corecrux_memory::Fact> = store.all_facts().cloned().collect();
+        let now = chrono::Utc::now();
+        let policy = corecrux_projections::decay::DecayPolicy::from_env();
+        let current: std::collections::HashMap<String, String> =
+            crate::consolidation_scheduler::select_expiry_candidates(&facts, now, policy, usize::MAX)
+                .into_iter()
+                .map(|candidate| (candidate.fact_id, candidate.reason))
+                .collect();
+
+        let mut expired = Vec::new();
+        let mut skipped = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for id in &body.fact_ids {
+            if !seen.insert(id.as_str()) {
+                continue; // de-dup so a repeated id is counted once
+            }
+            match current.get(id) {
+                Some(reason) => match store.try_delete(id) {
+                    Ok(true) => expired.push(serde_json::json!({ "fact_id": id, "reason": reason })),
+                    Ok(false) => {
+                        skipped.push(serde_json::json!({ "fact_id": id, "reason": "not_found_or_already_deleted" }));
+                    }
+                    Err(err) => {
+                        tracing::warn!(?err, %id, "expiry-soft-delete-journal-append-failed");
+                        skipped.push(serde_json::json!({ "fact_id": id, "reason": "journal_append_failed" }));
+                    }
+                },
+                // Protected / re-verified fresh / gained confidence / never a
+                // candidate → refuse to delete (findings 1 & 2).
+                None => skipped.push(serde_json::json!({ "fact_id": id, "reason": "not_a_current_expiry_candidate" })),
+            }
+        }
+        (expired, skipped)
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "schema": "crux.console.review.expiries.v1",
+            "expired_count": expired.len(),
+            "skipped_count": skipped.len(),
+            "expired": expired,
+            "skipped": skipped,
+            "actor": actor,
+        })),
+    )
+        .into_response()
+}
+
 pub(super) async fn post_console_review_consolidation(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1857,6 +2016,7 @@ pub(super) async fn get_console_facts(
 
     let store = state.fact_store.read().await;
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: q.clone(),
         entity: None,

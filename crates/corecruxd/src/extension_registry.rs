@@ -179,6 +179,7 @@ pub fn install_extension(
 pub fn list_extensions(store: &FactStore) -> Vec<InstalledExtension> {
     let prefix = format!("{EXTENSION_ENTITY_PREFIX}::");
     let result = store.query(&FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: Some(prefix.clone()),
         entity: None,

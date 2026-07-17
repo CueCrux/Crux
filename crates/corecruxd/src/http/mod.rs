@@ -1288,6 +1288,17 @@ pub(crate) fn router_with_route_auth(
             "/v1/console/review/contradictions",
             get(self::console::get_console_review_contradictions),
         )
+        // Read-only review-queue view over surfaced `__consolidation_review__::`
+        // receipts (P1 widen); backs the embedded `/console/review` page.
+        .route(
+            "/v1/console/review/queue",
+            get(self::console::get_console_review_queue),
+        )
+        // Operator applies age-based expiry proposals (wires mark_retention_eligible).
+        .route(
+            "/v1/console/review/expiries",
+            axum::routing::post(self::console::post_console_review_expiries),
+        )
         .route(
             "/v1/console/review/consolidations",
             axum::routing::post(self::console::post_console_review_consolidation),

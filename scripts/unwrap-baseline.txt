@@ -25,6 +25,11 @@
 # 2026-07-16 +3 corecruxd: audit-v2 M3 revoked-peer HTTP test in http/tests.rs
 #   (entity upsert + serde_json assertions seeding a revoked identity link);
 #   zero production-path additions (require_sync_peer uses Result/Option, no unwrap).
+# 2026-07-17 +3 corecruxd: PR #423 P2/P1 HTTP tests in http/tests.rs — the
+#   min_effective_confidence floor test + console review-queue/expiry tests
+#   (serde_json response-body assertions). tests.rs is #[cfg(test)] via an
+#   out-of-file #[path] mod decl so the ratchet counts its unwraps; zero
+#   production-path additions (the recall floor uses Option, no unwrap).
 corecrux-frame 0
 corecrux-index 3
 corecrux-memory 0
@@ -36,7 +41,7 @@ corecrux-segment 32
 corecrux-storage 48
 corecrux-types 1
 corecruxctl 9
-corecruxd 771
+corecruxd 774
 crux-claude-hooks 1
 crux-config-wizard 8
 crux-contrib 0

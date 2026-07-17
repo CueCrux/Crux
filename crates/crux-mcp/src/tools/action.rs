@@ -102,6 +102,7 @@ mod tests {
 
         let store = ctx.fact_store.read().await;
         let facts = store.query(&corecrux_memory::fact_store::FactQuery {
+            min_effective_confidence: None,
             tenant_hash: None,
             query: Some(ACTION_ENRICHMENT_RECEIPT_ENTITY_PREFIX.to_string()),
             entity: None,

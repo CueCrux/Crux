@@ -131,6 +131,7 @@ pub async fn handle_get_constraints(args: &Value, ctx: &McpContext) -> Result<Va
     let filter_status = args.get("status").and_then(|v| v.as_str()).unwrap_or("active");
 
     let q = FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: None,
@@ -191,6 +192,7 @@ pub async fn handle_check_constraints(args: &Value, ctx: &McpContext) -> Result<
 
     // Load all active constraints.
     let q = FactQuery {
+        min_effective_confidence: None,
         tenant_hash: None,
         query: None,
         entity: None,
