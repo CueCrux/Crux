@@ -1,17 +1,19 @@
 {
-  "_comment": "Codex CLI hooks for compaction-survival. Merge into ~/.codex/hooks.json (the installer does this for you). Codex has no PreCompact event, so we restore on SessionStart and take a rolling best-effort snapshot on UserPromptSubmit. Full pre-compaction capture is Claude Code only — see COMPARISON.md. Fix the command paths to your install dir. Requires jq.",
+  "_comment": "Codex CLI hooks for compaction-survival. Merge into ~/.codex/hooks.json (the installer does this). Codex exposes the same PreCompact + SessionStart contract as Claude Code (PreCompact added in openai/codex PR #19905), so we snapshot on PreCompact and restore on SessionStart(source=compact). NOTE: Codex's transcript format is explicitly NOT a stable interface, so snapshot capture is best-effort on Codex — restore always works. Fix the command paths to your install dir (single-quote if the path has spaces). Requires jq.",
   "hooks": {
-    "SessionStart": [
+    "PreCompact": [
       {
+        "matcher": "",
         "hooks": [
-          { "type": "command", "command": "$HOME/.local/share/crux-compaction/restore.sh", "async": false, "timeout": 8 }
+          { "type": "command", "command": "$HOME/.local/share/crux-compaction/snapshot.sh", "timeout": 10 }
         ]
       }
     ],
-    "UserPromptSubmit": [
+    "SessionStart": [
       {
+        "matcher": "",
         "hooks": [
-          { "type": "command", "command": "$HOME/.local/share/crux-compaction/snapshot.sh", "async": false, "timeout": 8 }
+          { "type": "command", "command": "$HOME/.local/share/crux-compaction/restore.sh", "timeout": 10 }
         ]
       }
     ]

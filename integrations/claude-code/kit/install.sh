@@ -4,74 +4,79 @@
 #
 # Compaction Survival Kit — one-command installer.
 # Installs the FREE compaction-survival preset (also source-available in the
-# Crux repo, integrations/claude-code/compaction-survival/) and wires tested
-# Claude Code AND Codex hook configs. Idempotent — safe to re-run.
+# Crux repo, integrations/claude-code/compaction-survival/) and wires the same
+# PreCompact + SessionStart hooks for BOTH Claude Code and OpenAI Codex — both
+# now expose that contract. Idempotent; safe to re-run.
 #
-# Env overrides:
-#   CRUX_COMPACTION_INSTALL_DIR (default ~/.local/share/crux-compaction)
-#   CLAUDE_SETTINGS             (default ~/.claude/settings.json)
-#   CODEX_HOOKS                 (default ~/.codex/hooks.json)
+# Security: umask 077; refuses to modify a symlinked settings file; writes via a
+# same-dir temp + atomic rename at 0600; single-quotes the hook path so spaces /
+# metacharacters in it stay literal.
+#
+# Env overrides: CRUX_COMPACTION_INSTALL_DIR (~/.local/share/crux-compaction),
+#   CLAUDE_SETTINGS (~/.claude/settings.json), CODEX_HOOKS (~/.codex/hooks.json).
 set -euo pipefail
+umask 077
 here="$(cd "$(dirname "$0")" && pwd)"
-INSTALL_DIR="${CRUX_COMPACTION_INSTALL_DIR:-$HOME/.local/share/crux-compaction}"
-CLAUDE_SETTINGS="${CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
-CODEX_HOOKS="${CODEX_HOOKS:-$HOME/.codex/hooks.json}"
+HOME_DIR="${HOME:-/tmp}"
+INSTALL_DIR="${CRUX_COMPACTION_INSTALL_DIR:-$HOME_DIR/.local/share/crux-compaction}"
+CLAUDE_SETTINGS="${CLAUDE_SETTINGS:-$HOME_DIR/.claude/settings.json}"
+CODEX_HOOKS="${CODEX_HOOKS:-$HOME_DIR/.codex/hooks.json}"
 
 command -v jq >/dev/null 2>&1 || { echo "error: jq is required (https://jqlang.github.io/jq/)." >&2; exit 1; }
 
 # 1) install the hook scripts
 mkdir -p "$INSTALL_DIR"
 cp "$here/hooks/snapshot.sh" "$here/hooks/restore.sh" "$INSTALL_DIR/"
-chmod +x "$INSTALL_DIR/snapshot.sh" "$INSTALL_DIR/restore.sh"
-snap_cmd="$INSTALL_DIR/snapshot.sh"
-restore_cmd="$INSTALL_DIR/restore.sh"
+chmod 0755 "$INSTALL_DIR/snapshot.sh" "$INSTALL_DIR/restore.sh"
+snap_path="$INSTALL_DIR/snapshot.sh"
+restore_path="$INSTALL_DIR/restore.sh"
+case "$snap_path$restore_path" in *[$'\n\r']*) echo "error: install path contains control characters." >&2; exit 1 ;; esac
 echo "installed hooks         -> $INSTALL_DIR"
 
-# jq program: append a hook group for (event, command) only if absent (idempotent).
-read -r -d '' CLAUDE_JQ <<'JQ' || true
+# POSIX single-quote a path so the stored shell-form command is space/metachar safe.
+sq(){ printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+snap_cmd="$(sq "$snap_path")"
+restore_cmd="$(sq "$restore_path")"
+
+# Append a hook group for (event, command) only if that exact command is absent.
+JQ_PROG='
 def ensure(ev; cmd):
   (.hooks[ev] // []) as $a
   | if ($a | any(.hooks[]?.command == cmd)) then .
-    else .hooks[ev] = ($a + [{"matcher":"", "hooks":[{"type":"command","command":cmd}]}]) end;
-ensure("PreCompact"; $sc) | ensure("SessionStart"; $rc)
-JQ
+    else .hooks[ev] = ($a + [{"matcher":"", "hooks":[{"type":"command","command":cmd,"timeout":10}]}]) end;
+ensure("PreCompact"; $sc) | ensure("SessionStart"; $rc)'
 
-read -r -d '' CODEX_JQ <<'JQ' || true
-def ensure(ev; cmd):
-  (.hooks[ev] // []) as $a
-  | if ($a | any(.hooks[]?.command == cmd)) then .
-    else .hooks[ev] = ($a + [{"hooks":[{"type":"command","command":cmd,"async":false,"timeout":8}]}]) end;
-ensure("SessionStart"; $rc) | ensure("UserPromptSubmit"; $sc)
-JQ
-
-wire() { # <settings-file> <jq-program>
-  local f="$1" prog="$2" base='{}'
-  mkdir -p "$(dirname "$f")"
-  [ -f "$f" ] && base="$(cat "$f")"
-  printf '%s' "$base" | jq --arg sc "$snap_cmd" --arg rc "$restore_cmd" "$prog" > "$f.tmp"
-  jq empty "$f.tmp"                    # fail loudly rather than write invalid JSON
-  mv "$f.tmp" "$f"
+wire(){ # <settings-file>
+  local f="$1" dir base tmp
+  dir="$(dirname "$f")"; mkdir -p "$dir"
+  [ -L "$f" ] && { echo "error: $f is a symlink; refusing to modify it. Resolve the link and re-run." >&2; exit 1; }
+  base='{}'; [ -f "$f" ] && base="$(cat "$f")"
+  tmp="$(mktemp "$dir/.cfg.XXXXXX")" || { echo "error: mktemp failed in $dir" >&2; exit 1; }
+  if printf '%s' "$base" | jq --arg sc "$snap_cmd" --arg rc "$restore_cmd" "$JQ_PROG" > "$tmp" && jq empty "$tmp"; then
+    chmod 0600 "$tmp"; mv -f "$tmp" "$f"
+  else
+    rm -f "$tmp"; echo "error: failed to update $f (is the existing file valid JSON?)." >&2; exit 1
+  fi
 }
 
-# 2) Claude Code: snapshot on PreCompact, restore on SessionStart.
-wire "$CLAUDE_SETTINGS" "$CLAUDE_JQ"
-echo "wired Claude Code       -> $CLAUDE_SETTINGS"
-
-# 3) Codex: restore on SessionStart + best-effort snapshot on UserPromptSubmit.
-#    Codex has no PreCompact event, so full pre-compaction capture is Claude Code
-#    only; this keeps a rolling snapshot and restores it on resume. (See COMPARISON.md.)
-wire "$CODEX_HOOKS" "$CODEX_JQ"
-echo "wired Codex             -> $CODEX_HOOKS"
+# 2) wire Claude Code, 3) wire Codex — same PreCompact + SessionStart hooks.
+wire "$CLAUDE_SETTINGS"; echo "wired Claude Code       -> $CLAUDE_SETTINGS"
+wire "$CODEX_HOOKS";     echo "wired Codex             -> $CODEX_HOOKS"
 
 cat <<EOF
 
 Done. Restart Claude Code (and/or Codex).
 
-  Verify the capability:  bash "$here/hooks/proof.sh"
-  Human-readable report:  bash "$here/proof-report.sh"
+  Self-test the hooks:  bash "$here/hooks/selftest.sh"
+  Local event report:   bash "$here/event-report.sh"
 
-The compaction-survival capability is FREE and source-available in the Crux
-repo (integrations/claude-code/compaction-survival/). This kit packages the
-tested installer, the dual-agent (Claude Code + Codex) configs, the proof-report
-generator, and the comparison doc — it does not gate the capability.
+The compaction-survival capability is free and source-available in the Crux
+repo (integrations/claude-code/compaction-survival/) under the CueCrux Community
+Licence; the standalone proof-of-loss mini-repo is MIT-licensed. This kit
+packages the tested installer, the dual-agent configs, the event report, and
+the comparison doc — it does not gate the capability.
+
+Note: Codex uses the same PreCompact/SessionStart hooks, but Codex's transcript
+format is not a stable interface, so snapshot *capture* on Codex is best-effort;
+restore always works. See COMPARISON.md.
 EOF

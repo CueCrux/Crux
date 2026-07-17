@@ -11,12 +11,14 @@ that snapshot that working state **before** compaction and hand it back
 ## What's in the box
 
 - **`install.sh`** — one command. Installs the hooks and wires **both** Claude
-  Code and Codex, idempotently, validating the JSON it writes.
+  Code and Codex, idempotently, validating the JSON it writes and never
+  clobbering existing hooks.
 - **Tested configs** — `claude-settings.snippet.json` and
   `codex-hooks.snippet.json`, known-good.
-- **`hooks/proof.sh`** — assert-based proof the capability works on your machine.
-- **`proof-report.sh`** — renders your capture/restore log into a readable
-  markdown report.
+- **`hooks/selftest.sh`** — assert-based self-test that the capability works on
+  your machine (loss-without vs survival-with, plus the security guards).
+- **`event-report.sh`** — renders your local capture/restore log into a readable
+  markdown report (metadata by default; snapshot bodies stay private on disk).
 - **`COMPARISON.md`** — an honest kit-vs-free breakdown.
 - 7 days of support.
 
@@ -30,22 +32,26 @@ bash install.sh
 Then restart Claude Code / Codex. That's it.
 
 ```bash
-bash hooks/proof.sh      # prove it works
-bash proof-report.sh     # readable report of what it captured
+bash hooks/selftest.sh   # verify the hooks behave
+bash event-report.sh     # readable report of what it has captured
 ```
 
 ## The capability is free
 
 **To be completely clear: the compaction-survival capability is free and
 source-available** in the Crux repo at
-`integrations/claude-code/compaction-survival/`, and MIT-licensed in the
-standalone `proof-of-loss-hook` mini-repo. You can wire it up yourself for
-nothing. This kit sells the *packaging* — the one-command dual-agent installer,
-the tested Codex config, the proof report, and support — not the trick. See
-[`COMPARISON.md`](COMPARISON.md) for exactly what you're paying for.
+`integrations/claude-code/compaction-survival/` under the CueCrux Community
+Licence (CCL), and separately MIT-licensed in the standalone `proof-of-loss-hook`
+mini-repo. You can wire it up yourself for nothing. This kit sells the
+*packaging* — the one-command dual-agent installer, the tested Codex config, the
+event report, and support — not the trick. See [`COMPARISON.md`](COMPARISON.md)
+for exactly what you're paying for.
 
-("Free" / "source-available" — the Crux repo is under the CueCrux Community
-Licence, not open-source; the mini-repo is MIT.)
+## Codex note
+
+Codex exposes the same PreCompact + SessionStart hooks as Claude Code, so the
+kit wires both the same way. Codex's transcript format is not a stable
+interface, so snapshot *capture* on Codex is best-effort; restore always works.
 
 ## Requires
 

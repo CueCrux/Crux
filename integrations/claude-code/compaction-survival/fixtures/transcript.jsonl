@@ -1,0 +1,5 @@
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Fix the login bug."}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"TodoWrite","input":{"todos":[{"content":"read the auth module","status":"completed","activeForm":"reading the auth module"},{"content":"fix the auth token refresh bug in auth.ts","status":"in_progress","activeForm":"fixing the auth token refresh bug"},{"content":"add a regression test for refreshToken()","status":"pending","activeForm":"adding a regression test"}]}}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Read","input":{"file_path":"/repo/src/auth.ts"}}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Read","input":{"file_path":"/repo/src/billing.ts"}}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Plan: patch refreshToken() in auth.ts so it retries once on a 401, then add a regression test. IMPORTANT: do NOT touch billing.ts — the flaky charge path there is unrelated and out of scope for this ticket."}]}}
