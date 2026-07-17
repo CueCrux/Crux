@@ -32,6 +32,14 @@ serde_json = { workspace = true }
 ureq = { workspace = true, features = ["json"] }
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["std", "pkcs8"] }
+# Hosted compaction-snapshot sync (ExecPlan hosted-compaction-sync-encrypted-2026-07-17):
+# client-side AEAD envelope. Both are already in the workspace Cargo.lock
+# (chacha20poly1305 via corecruxd/crux-mcp/crux-sync; crux-session is in-workspace
+# and deps only blake3+ed25519-dalek, both already direct deps here) — zero new
+# external crate. crux-session provides LocalPassportKey::derive_subkey (the
+# passport-seed KDF used to derive the snapshot content key).
+chacha20poly1305 = { workspace = true }
+crux-session = { path = "../crux-session" }
 fs2 = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
