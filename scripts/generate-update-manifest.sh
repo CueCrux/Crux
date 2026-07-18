@@ -42,7 +42,9 @@ for suffix in "${SUFFIXES[@]}"; do
     "${WORK}/${manifest}" >/dev/null
 
   name="crux-${suffix}"
-  sha="$(awk -v f="$name" '$2 == f || $2 == "*"f {print $1}' "${WORK}/${manifest}")"
+  # RELEASE-MANIFEST paths are ./-prefixed (sha256sum run in the package dir);
+  # v0.5.45's manifest job failed on the bare-name-only match.
+  sha="$(awk -v f="$name" '$2 == f || $2 == "*"f || $2 == "./"f {print $1}' "${WORK}/${manifest}")"
   [ -n "$sha" ] || { echo "ERROR: ${name} not found in ${manifest}" >&2; exit 1; }
   artifacts="$(jq -c --arg n "$name" --arg s "$sha" '. + [{name:$n, sha256:$s}]' <<<"$artifacts")"
 done
