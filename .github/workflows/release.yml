@@ -84,6 +84,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+          # rust-toolchain.toml pins the build toolchain (1.88.0), so the
+          # Install Rust step's `targets:` lands on `stable`, not the pin —
+          # v0.5.45 run 29626417383 failed with E0463 (target std missing).
+          # Add the target against the toolchain cargo actually resolves here.
+          rustup target add ${{ matrix.target }}
 
       - name: Run tests
         # Native legs only: cross legs are build-only (the three native-arch legs
