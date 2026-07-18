@@ -17,11 +17,11 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use corecruxctl::{
-    admin, audit_export, audit_pack, c2pa_x509, code_chain, code_health, config_bundle, cost, deploy_audit, evidence,
-    explain, export, extensions, fixture_digest, gaps, hooks, identity_cli, incident, ingest, inspect_receipt, learn,
-    login, machine, memory, memory_pack, observe_ingest, openclaw, output_verify, parity, projections, receipts,
-    reconcile, replay, repo, session_sync, shard, shardmap, smoke, snapshot, stage1_import, start, storage,
-    structured_log, tooling_env, verify_store,
+    admin, audit_export, audit_pack, c2pa_x509, code_chain, code_health, compaction_sync, config_bundle, cost,
+    deploy_audit, evidence, explain, export, extensions, fixture_digest, gaps, hooks, identity_cli, incident, ingest,
+    inspect_receipt, learn, login, machine, memory, memory_pack, observe_ingest, openclaw, output_verify, parity,
+    projections, receipts, reconcile, replay, repo, session_sync, shard, shardmap, smoke, snapshot, stage1_import,
+    start, storage, structured_log, tooling_env, verify_store,
 };
 
 #[derive(Debug, Parser)]
@@ -150,6 +150,13 @@ enum Command {
     Session {
         #[command(subcommand)]
         command: SessionCommand,
+    },
+
+    /// Hosted compaction-snapshot sync (Pro) — activate cross-device continuity.
+    #[command(name = "compaction-sync")]
+    CompactionSync {
+        #[command(subcommand)]
+        command: CompactionSyncCommand,
     },
 
     /// Observe audit-chain tools (transcript ingest).
@@ -902,6 +909,15 @@ enum ConfigCommand {
         #[arg(long)]
         url: Option<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum CompactionSyncCommand {
+    /// Verify prerequisites, set the opt-in, and run a live seal→push→pull→verify
+    /// self-test. A 402 (non-Pro) blocks activation with an upgrade message.
+    Enable,
+    /// Report the current opt-in / mirror / passport / gate state (offline).
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2571,6 +2587,11 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 force,
                 since_days,
             } => cost::run_cost_sweep(tenant, url, dry_run, force, since_days),
+        },
+
+        Command::CompactionSync { command } => match command {
+            CompactionSyncCommand::Enable => compaction_sync::run_enable(),
+            CompactionSyncCommand::Status => compaction_sync::run_status(),
         },
         Command::Observe { command } => match command {
             ObserveCommand::Ingest {
