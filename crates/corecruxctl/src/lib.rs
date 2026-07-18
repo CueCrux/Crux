@@ -25,6 +25,7 @@ pub mod benchmark;
 pub mod c2pa_x509;
 pub mod code_chain;
 pub mod code_health;
+pub mod compaction_sync;
 pub mod config_bundle;
 pub mod cost;
 pub mod deploy_audit;
