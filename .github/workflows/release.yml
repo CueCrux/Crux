@@ -318,3 +318,41 @@ jobs:
     with:
       base64-subjects: ${{ needs.combine-hashes.outputs.hashes }}
       upload-assets: true
+
+  # --- Update manifest (ExecPlan daemon-distribution-packaging-2026-06-11) ---
+  # After the release exists, generate update-manifest.json from the already
+  # published, cosign-verified RELEASE-MANIFEST files (the script verifies each
+  # before trusting its sha256 pins), sign it like every other artifact, and
+  # attach all three. This is what `crux self update` and the binary-install
+  # check path fetch from releases/latest/download/update-manifest.json.
+  update-manifest:
+    name: Update manifest
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # attach the manifest to the release
+      id-token: write # cosign keyless signing
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with:
+          cosign-release: 'v2.4.3'
+
+      - name: Generate + sign update manifest
+        run: |
+          set -euo pipefail
+          bash scripts/generate-update-manifest.sh "${GITHUB_REF_NAME}" > update-manifest.json
+          cosign sign-blob --yes \
+            --output-signature update-manifest.json.sig \
+            --output-certificate update-manifest.json.pem \
+            update-manifest.json
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            update-manifest.json
+            update-manifest.json.sig
+            update-manifest.json.pem
