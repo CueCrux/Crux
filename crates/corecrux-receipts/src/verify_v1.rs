@@ -1244,4 +1244,304 @@ mod tests {
         assert!(!tc.candidate_digest_present);
         assert!(tc.candidate_digest_matches_recompute.is_none());
     }
+
+    // ── helpers for the mutation-killing tests below ────────────────
+
+    fn keyring_with(key_id: &str, pub_key_base64: &str) -> Ed25519KeyRingV1 {
+        Ed25519KeyRingV1 {
+            v: 1,
+            keys: vec![Ed25519KeyEntryV1 {
+                key_id: key_id.to_string(),
+                pub_key_base64: pub_key_base64.to_string(),
+            }],
+        }
+    }
+
+    fn encode_sig(sig: &ReceiptSigV1) -> Vec<u8> {
+        let mut b = Vec::new();
+        ciborium::ser::into_writer(sig, &mut b).unwrap();
+        b
+    }
+
+    fn sig_over(receipt_id: &str, hash: [u8; 32], signature: Vec<u8>) -> ReceiptSigV1 {
+        ReceiptSigV1 {
+            schema: "cuecrux.receipt.sig.v1".to_string(),
+            receipt_id: receipt_id.to_string(),
+            alg: "ed25519".to_string(),
+            key_id: "k1".to_string(),
+            signed_at: "2026-01-01T00:00:00Z".to_string(),
+            signature,
+            signed_payload_hash: hash.to_vec(),
+        }
+    }
+
+    // Deterministically find a 32-byte value that is NOT a valid Ed25519
+    // compressed point, so `VerifyingKey::from_bytes` rejects it.
+    fn invalid_ed25519_point() -> [u8; 32] {
+        for seed in 0u32..=1_000_000 {
+            let mut b = [0u8; 32];
+            b[..4].copy_from_slice(&seed.to_le_bytes());
+            if VerifyingKey::from_bytes(&b).is_err() {
+                return b;
+            }
+        }
+        panic!("no invalid compressed point found in search range");
+    }
+
+    // ── error_message discipline (no spurious payload-mismatch text) ─
+
+    #[test]
+    fn verify_receipt_no_sig_matching_hash_has_no_error_message() {
+        // Sig missing but the body hash matches: there must be NO payload-hash
+        // error message. Pins the `if !payload_hash_matches` guard on the
+        // err_msg assignment in the no-sig branch.
+        let (body_bytes, hash) = make_body_and_hash();
+        let build = test_build_info();
+        let report = verify_receipt_v1(VerifyReceiptInput {
+            tenant_id: "t-1",
+            receipt_id: "r-1",
+            body_bytes: &body_bytes,
+            stored_body_payload_hash: hash,
+            sig_bytes: None,
+            keyring: None,
+            verified_at: "2026-01-01T00:00:00Z",
+            verifier_build: &build,
+            recompute_candidate_digest: false,
+        })
+        .unwrap();
+        assert_eq!(report.error_code, "SIG_MISSING");
+        assert!(report.error_message.is_none(), "unexpected: {:?}", report.error_message);
+    }
+
+    #[test]
+    fn verify_receipt_valid_signature_has_no_error_message() {
+        // On a fully-valid OK verification, error_message must be absent. Pins
+        // the `err == BodyCborParseError` check (mutating to `!=` would attach a
+        // spurious "not valid CBOR" message to OK results).
+        let (body_bytes, hash) = make_body_and_hash();
+        let sk = SigningKey::from_bytes(&[42u8; 32]);
+        let vk = sk.verifying_key();
+        let sig = sig_over("r-1", hash, sk.sign(&body_bytes).to_bytes().to_vec());
+        let sig_bytes = encode_sig(&sig);
+        let keyring = keyring_with("k1", &base64::engine::general_purpose::STANDARD.encode(vk.as_bytes()));
+        let build = test_build_info();
+        let report = verify_receipt_v1(VerifyReceiptInput {
+            tenant_id: "t-1",
+            receipt_id: "r-1",
+            body_bytes: &body_bytes,
+            stored_body_payload_hash: hash,
+            sig_bytes: Some(&sig_bytes),
+            keyring: Some(&keyring),
+            verified_at: "2026-01-01T00:00:00Z",
+            verifier_build: &build,
+            recompute_candidate_digest: false,
+        })
+        .unwrap();
+        assert_eq!(report.error_code, "OK");
+        assert!(report.signature_valid);
+        assert!(report.error_message.is_none(), "unexpected: {:?}", report.error_message);
+    }
+
+    #[test]
+    fn verify_receipt_bad_signature_matching_hash_reports_sig_error_not_payload_mismatch() {
+        // A 64-byte but bogus signature over a body whose hash matches: the
+        // failure is SIG_INVALID and the message is the signature error, never
+        // the payload-hash-mismatch text. Pins the `if !payload_hash_matches`
+        // guard in the verify-failed branch.
+        let (body_bytes, hash) = make_body_and_hash();
+        let sk = SigningKey::from_bytes(&[42u8; 32]);
+        let vk = sk.verifying_key();
+        let sig = sig_over("r-1", hash, vec![0u8; 64]); // wrong signature
+        let sig_bytes = encode_sig(&sig);
+        let keyring = keyring_with("k1", &base64::engine::general_purpose::STANDARD.encode(vk.as_bytes()));
+        let build = test_build_info();
+        let report = verify_receipt_v1(VerifyReceiptInput {
+            tenant_id: "t-1",
+            receipt_id: "r-1",
+            body_bytes: &body_bytes,
+            stored_body_payload_hash: hash,
+            sig_bytes: Some(&sig_bytes),
+            keyring: Some(&keyring),
+            verified_at: "2026-01-01T00:00:00Z",
+            verifier_build: &build,
+            recompute_candidate_digest: false,
+        })
+        .unwrap();
+        assert_eq!(report.error_code, "SIG_INVALID");
+        assert!(report.integrity.payload_hash_matches);
+        let msg = report.error_message.expect("sig-invalid carries a message");
+        assert!(!msg.contains("payload_hash mismatch"), "unexpected: {msg}");
+    }
+
+    // ── pubkey / signature validation (fail-closed, hash matching) ──
+
+    #[test]
+    fn verify_receipt_pubkey_invalid_when_keyring_undecodable() {
+        // Keyring pubkey is not valid base64 → to_index_map fails. With a
+        // matching body hash the code must be PUBKEY_INVALID, not
+        // BODY_HASH_MISMATCH. Pins the `if !payload_hash_matches` guard.
+        let (body_bytes, hash) = make_body_and_hash();
+        let sig = sig_over("r-1", hash, vec![0u8; 64]);
+        let sig_bytes = encode_sig(&sig);
+        let keyring = keyring_with("k1", "!!! not base64 !!!");
+        let build = test_build_info();
+        let report = verify_receipt_v1(VerifyReceiptInput {
+            tenant_id: "t-1",
+            receipt_id: "r-1",
+            body_bytes: &body_bytes,
+            stored_body_payload_hash: hash,
+            sig_bytes: Some(&sig_bytes),
+            keyring: Some(&keyring),
+            verified_at: "2026-01-01T00:00:00Z",
+            verifier_build: &build,
+            recompute_candidate_digest: false,
+        })
+        .unwrap();
+        assert_eq!(report.error_code, "PUBKEY_INVALID");
+        assert!(report.integrity.payload_hash_matches);
+    }
+
+    #[test]
+    fn verify_receipt_pubkey_invalid_when_point_off_curve() {
+        // Keyring pubkey decodes to 32 bytes but is not a valid curve point →
+        // VerifyingKey::from_bytes fails. Matching hash → PUBKEY_INVALID. Pins
+        // the `if !payload_hash_matches` guard at the from_bytes error branch.
+        let (body_bytes, hash) = make_body_and_hash();
+        let sig = sig_over("r-1", hash, vec![0u8; 64]);
+        let sig_bytes = encode_sig(&sig);
+        let bad = invalid_ed25519_point();
+        let keyring = keyring_with("k1", &base64::engine::general_purpose::STANDARD.encode(bad));
+        let build = test_build_info();
+        let report = verify_receipt_v1(VerifyReceiptInput {
+            tenant_id: "t-1",
+            receipt_id: "r-1",
+            body_bytes: &body_bytes,
+            stored_body_payload_hash: hash,
+            sig_bytes: Some(&sig_bytes),
+            keyring: Some(&keyring),
+            verified_at: "2026-01-01T00:00:00Z",
+            verifier_build: &build,
+            recompute_candidate_digest: false,
+        })
+        .unwrap();
+        assert_eq!(report.error_code, "PUBKEY_INVALID");
+        assert!(report.integrity.payload_hash_matches);
+    }
+
+    #[test]
+    fn verify_receipt_sig_invalid_when_signature_length_wrong() {
+        // Valid keyring + key + pubkey, but the signature is not 64 bytes.
+        // Matching hash → SIG_INVALID, not BODY_HASH_MISMATCH. Pins the
+        // `if !payload_hash_matches` guard at the length-check branch.
+        let (body_bytes, hash) = make_body_and_hash();
+        let sk = SigningKey::from_bytes(&[42u8; 32]);
+        let vk = sk.verifying_key();
+        let sig = sig_over("r-1", hash, vec![0u8; 10]); // length != 64
+        let sig_bytes = encode_sig(&sig);
+        let keyring = keyring_with("k1", &base64::engine::general_purpose::STANDARD.encode(vk.as_bytes()));
+        let build = test_build_info();
+        let report = verify_receipt_v1(VerifyReceiptInput {
+            tenant_id: "t-1",
+            receipt_id: "r-1",
+            body_bytes: &body_bytes,
+            stored_body_payload_hash: hash,
+            sig_bytes: Some(&sig_bytes),
+            keyring: Some(&keyring),
+            verified_at: "2026-01-01T00:00:00Z",
+            verifier_build: &build,
+            recompute_candidate_digest: false,
+        })
+        .unwrap();
+        assert_eq!(report.error_code, "SIG_INVALID");
+        assert!(report.integrity.payload_hash_matches);
+    }
+
+    // ── compute_trace_checks: recompute flag + anchors arm ──────────
+
+    fn recompute_matches_flag(body: &[u8]) -> Option<bool> {
+        let build = test_build_info();
+        let report = verify_receipt_v1(VerifyReceiptInput {
+            tenant_id: "t-1",
+            receipt_id: "r-1",
+            body_bytes: body,
+            stored_body_payload_hash: *blake3::hash(body).as_bytes(),
+            sig_bytes: None,
+            keyring: None,
+            verified_at: "2026-01-01T00:00:00Z",
+            verifier_build: &build,
+            recompute_candidate_digest: true,
+        })
+        .unwrap();
+        report.trace_checks.candidate_digest_matches_recompute
+    }
+
+    #[test]
+    fn recompute_flag_is_some_false_when_body_unparseable() {
+        // Genuinely invalid CBOR → the parsed_body None branch. With recompute
+        // requested the field must be Some(false), not defaulted to None.
+        // Gotcha: an ASCII string like b"not cbor at all" can accidentally be
+        // VALID CBOR (0x6e is a 14-byte text-string header), which decodes as
+        // Text and lands in the not-a-Map branch instead. A bare 0xff break
+        // byte is never valid at the top level.
+        assert_eq!(recompute_matches_flag(&[0xff]), Some(false));
+    }
+
+    #[test]
+    fn recompute_flag_is_some_false_when_body_not_a_map() {
+        // CBOR that parses but is not a Map → the not-a-map branch.
+        let mut body = Vec::new();
+        ciborium::ser::into_writer(&ciborium::value::Value::Integer(7.into()), &mut body).unwrap();
+        assert_eq!(recompute_matches_flag(&body), Some(false));
+    }
+
+    #[test]
+    fn recompute_flag_is_some_false_when_no_retrieval_trace() {
+        // A Map body with no retrieval_trace → the no-retrieval branch.
+        let (body_bytes, _hash) = make_body_and_hash();
+        assert_eq!(recompute_matches_flag(&body_bytes), Some(false));
+    }
+
+    #[test]
+    fn trace_checks_detect_anchors_map() {
+        use ciborium::value::Value;
+        // retrieval_trace.anchors is a Map with ids + derivation method: the
+        // `Some(Value::Map(am))` arm must report all three anchor flags true.
+        // Deleting that arm collapses to (false, false, false).
+        let anchors = Value::Map(vec![
+            (
+                Value::Text("anchor_set_ids".to_string()),
+                Value::Array(vec![Value::Text("a1".to_string())]),
+            ),
+            (
+                Value::Text("derivation_method".to_string()),
+                Value::Text("merkle".to_string()),
+            ),
+        ]);
+        let rt = Value::Map(vec![(Value::Text("anchors".to_string()), anchors)]);
+        let body_val = Value::Map(vec![
+            (
+                Value::Text("schema".to_string()),
+                Value::Text("cuecrux.receipt.body.v1".to_string()),
+            ),
+            (Value::Text("retrieval_trace".to_string()), rt),
+        ]);
+        let mut body = Vec::new();
+        ciborium::ser::into_writer(&body_val, &mut body).unwrap();
+        let build = test_build_info();
+        let report = verify_receipt_v1(VerifyReceiptInput {
+            tenant_id: "t-1",
+            receipt_id: "r-1",
+            body_bytes: &body,
+            stored_body_payload_hash: *blake3::hash(&body).as_bytes(),
+            sig_bytes: None,
+            keyring: None,
+            verified_at: "2026-01-01T00:00:00Z",
+            verifier_build: &build,
+            recompute_candidate_digest: false,
+        })
+        .unwrap();
+        assert!(report.trace_checks.anchors_present);
+        assert!(report.trace_checks.anchors_ids_present);
+        assert!(report.trace_checks.anchors_derivation_method_present);
+    }
 }
