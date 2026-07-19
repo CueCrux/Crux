@@ -1174,4 +1174,86 @@ mod tests {
             .verify_strict(&tampered, &ed25519_dalek::Signature::from_bytes(&sig_bytes))
             .is_err());
     }
+
+    // A fully-valid coverage-window entry set (arithmetic reconciles); used as
+    // the baseline for single-field tamper tests below.
+    fn valid_window_entries() -> Vec<(CborValue, CborValue)> {
+        let counts = window_counts();
+        vec![
+            text_entry("schema", AUDIT_GAP_BODY_SCHEMA_V1),
+            text_entry("kind", COVERAGE_WINDOW_KIND_V1),
+            text_entry("receipt_id", "cw_1"),
+            text_entry("tenant_id", "tenant-a"),
+            text_entry("attestation_id", "coverage-window-1"),
+            text_entry("actor_passport", "passport:operator"),
+            text_entry("from", "2026-06-14T00:00:00Z"),
+            text_entry("to", "2026-06-15T00:00:00Z"),
+            uint_entry("events", counts.events),
+            uint_entry("receipts", counts.receipts),
+            uint_entry("anchored", counts.anchored),
+            uint_entry("gaps", counts.gaps()),
+            uint_entry("events_without_receipt", counts.events_without_receipt),
+            uint_entry("receipts_without_anchor", counts.receipts_without_anchor),
+            text_entry("chain_head", "blake3:00"),
+            text_entry("report_hash", "blake3:report"),
+            text_entry("created_at", "2026-06-15T00:01:00Z"),
+        ]
+    }
+
+    fn set_text_field(entries: &mut [(CborValue, CborValue)], field: &str, value: &str) {
+        for (k, v) in entries.iter_mut() {
+            if let CborValue::Text(ks) = k {
+                if ks == field {
+                    *v = CborValue::Text(value.to_string());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn coverage_window_body_rejects_each_blank_required_string() {
+        // Sanity: the fully-populated entry set verifies.
+        assert!(verify_coverage_window_body_v1(&encode(valid_window_entries()).0));
+        // Blank exactly one required string field at a time (every other field
+        // valid) — the verifier's OR-chain guard must reject on the single bad
+        // field. This pins each `||` in the guard against `&&`: with `&&` an
+        // isolated bad field no longer forces rejection.
+        for field in [
+            "receipt_id",
+            "tenant_id",
+            "attestation_id",
+            "actor_passport",
+            "from",
+            "to",
+            "chain_head",
+            "report_hash",
+            "created_at",
+        ] {
+            let mut entries = valid_window_entries();
+            set_text_field(&mut entries, field, "   ");
+            let (body, _) = encode(entries);
+            assert!(
+                !verify_coverage_window_body_v1(&body),
+                "blank `{field}` must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn coverage_window_body_rejects_wrong_kind_with_all_else_valid() {
+        // Only `kind` is wrong; schema + every other field valid. Pins the
+        // schema/kind boundary of the OR-chain.
+        let mut entries = valid_window_entries();
+        set_text_field(&mut entries, "kind", COVERAGE_ATTESTATION_KIND_V1);
+        let (body, _) = encode(entries);
+        assert!(!verify_coverage_window_body_v1(&body));
+    }
+
+    #[test]
+    fn coverage_window_body_rejects_wrong_schema_with_all_else_valid() {
+        let mut entries = valid_window_entries();
+        set_text_field(&mut entries, "schema", "cuecrux.receipt.body.WRONG");
+        let (body, _) = encode(entries);
+        assert!(!verify_coverage_window_body_v1(&body));
+    }
 }

@@ -30,6 +30,7 @@ on:
     branches: [main]
     paths:
       - "fuzz/**"
+      - "crates/corecrux-frame/**"
       - "crates/corecrux-segment/**"
       - "crates/corecrux-storage/**"
       - "crates/corecrux-receipts/**"

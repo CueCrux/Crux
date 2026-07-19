@@ -86,3 +86,9 @@ jobs:
             coverage-summary.txt
             lcov.info
             coverage-attestation/
+
+      - name: Reclaim per-job CARGO_HOME
+        if: always()
+        # Same disk-leak mitigation as every other per-run CARGO_HOME job
+        # (incident 2026-06-15); this workflow was the one place missing it.
+        run: rm -rf "$CARGO_HOME"

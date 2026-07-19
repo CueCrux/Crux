@@ -558,6 +558,36 @@ pub fn seal_segment_v1_from_record_area_with_block_codec(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::decoder::decode_segment_v1;
+    use crate::trailer::decode_trailer_index_v1;
+    use crate::RECORD_BLOCK_CODEC_LZ4_V1;
+
+    /// A record-area frame whose `frame_len` bytes span `[record_off, record_off+frame_len)`.
+    /// `payload_len` and the digests are opaque to the sealer, so they carry marker values.
+    fn frame(stream_hash: u64, seq: u64, record_off: u32, frame_len: u32) -> FrameMetaV1 {
+        FrameMetaV1 {
+            stream_hash,
+            seq,
+            record_off,
+            frame_len,
+            payload_len: frame_len.saturating_sub(4),
+            event_id_hash16: [seq as u8; 16],
+            header_digest8: [stream_hash as u8; 8],
+            payload_digest8: [(seq + 1) as u8; 8],
+        }
+    }
+
+    /// Three contiguous 40-byte frames covering a 120-byte record area. Deliberately
+    /// stored out of `(stream_hash, seq)` order so the TOC sort and min/max bounds are
+    /// exercised: record order is (9,1),(1,2),(1,1); sorted order is (1,1),(1,2),(9,1).
+    fn sample_layout() -> (Vec<u8>, Vec<FrameMetaV1>) {
+        let record_area = vec![0xABu8; 120];
+        let frames = vec![frame(9, 1, 0, 40), frame(1, 2, 40, 40), frame(1, 1, 80, 40)];
+        (record_area, frames)
+    }
+
+    // Existing constants used across assertions.
+    const HDR: u64 = SEGMENT_HEADER_LEN as u64;
 
     #[test]
     fn seal_segment_from_record_area_validates_contiguity() {
@@ -582,5 +612,204 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, SegmentError::LengthOutOfRange { .. }));
+    }
+
+    /// Full sealed-segment round-trip for the uncompressed path. This pins every
+    /// structural invariant of `seal_segment_v1_from_record_area`: the segment must
+    /// decode, the TOC must be sorted, offsets/lengths must line up, the footer bounds
+    /// (min/max stream_hash + seq) must reflect the sorted TOC, per-entry file offsets
+    /// must equal `header_len + record_off`, the embedded `crc_tables_len` must match the
+    /// builder's own accounting, and the Phase-5 trailer index must decode from it.
+    ///
+    /// Any arithmetic/comparison mutation that shifts a length, offset, bound, or guard
+    /// produces a segment that fails one of these checks (or fails to decode at all).
+    #[test]
+    fn seal_uncompressed_roundtrip_preserves_invariants() {
+        let (record_area, frames) = sample_layout();
+        let out = seal_segment_v1_from_record_area(
+            7,
+            3,
+            11,
+            SegmentId([0xA5; 16]),
+            1_700_000_000_000_000_000,
+            1_700_000_000_000_000_999,
+            &record_area,
+            &frames,
+        )
+        .unwrap();
+
+        // Decodes cleanly and the decoded shape matches the builder output.
+        let (header, toc_h, entries, footer) = decode_segment_v1(&out.bytes).unwrap();
+        assert_eq!(header.segment_seq, 11);
+        assert_eq!(header.epoch, 3);
+        assert_eq!(header.shard_id, 7);
+        assert_eq!(footer.sealed_at_unix_ns, 1_700_000_000_000_000_999);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(toc_h.entry_count, 3);
+        assert!(is_sorted_toc(&entries));
+
+        // Offsets/lengths line up exactly: header | record | toc | footer.
+        assert_eq!(footer.record_area_offset, HDR);
+        assert_eq!(footer.record_area_len, 120);
+        assert_eq!(footer.toc_offset, HDR + 120);
+        assert_eq!(footer.toc_offset, footer.record_area_offset + footer.record_area_len);
+        assert_eq!(footer.file_len, out.bytes.len() as u64);
+        assert_eq!(
+            footer.file_len,
+            HDR + footer.record_area_len + footer.toc_len + SEGMENT_FOOTER_LEN as u64
+        );
+
+        // Footer bounds reflect the *sorted* TOC (min = first, max = last).
+        assert_eq!((footer.min_stream_hash, footer.min_seq), (1, 1));
+        assert_eq!((footer.max_stream_hash, footer.max_seq), (9, 1));
+
+        // Sorted TOC order and per-entry logical file offset (= header_len + record_off).
+        assert_eq!((entries[0].stream_hash, entries[0].seq), (1, 1));
+        assert_eq!((entries[1].stream_hash, entries[1].seq), (1, 2));
+        assert_eq!((entries[2].stream_hash, entries[2].seq), (9, 1));
+        assert_eq!(entries[0].file_offset as u64, HDR + 80); // (1,1) stored at record_off 80
+        assert_eq!(entries[1].file_offset as u64, HDR + 40); // (1,2) stored at record_off 40
+        assert_eq!(entries[2].file_offset as u64, HDR); //      (9,1) stored at record_off 0
+
+        // `crc_tables_len` embedded in the on-disk TOC header must equal the builder's
+        // own count (record CRC table + TOC CRC table, 4 bytes each).
+        assert_eq!(toc_h.crc_tables_len, out.toc_header.crc_tables_len);
+        assert_eq!(
+            toc_h.crc_tables_len,
+            (out.record_crc32c_table.len() + out.toc_crc32c_table.len()) as u64 * 4
+        );
+
+        // The Phase-5 trailer index must be locatable and decode consistently — this only
+        // works when `crc_tables_len` (and thus the extension offset) is correct.
+        let toc_area = &out.bytes[footer.toc_offset as usize..(footer.toc_offset + footer.toc_len) as usize];
+        let trailer = decode_trailer_index_v1(toc_area, &toc_h).unwrap().unwrap();
+        assert_eq!(trailer.toc_by_offset.len(), 3);
+        assert_eq!(trailer.toc_sorted_idx.len(), 3);
+        assert_eq!(trailer.blocks.len(), 1);
+    }
+
+    #[test]
+    fn seal_uncompressed_rejects_frame_past_record_area() {
+        // Single frame claims 50 bytes but the record area is only 40 — the frame end
+        // (50) exceeds the record area length.
+        let err =
+            seal_segment_v1_from_record_area(0, 1, 1, SegmentId([0u8; 16]), 1, 2, &[0u8; 40], &[frame(1, 1, 0, 50)])
+                .unwrap_err();
+        assert!(matches!(err, SegmentError::LengthOutOfRange { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn seal_uncompressed_rejects_non_covering_frames() {
+        // Frames cover only 80 of the 100 record-area bytes → not fully covered.
+        let err = seal_segment_v1_from_record_area(
+            0,
+            1,
+            1,
+            SegmentId([0u8; 16]),
+            1,
+            2,
+            &[0u8; 100],
+            &[frame(1, 1, 0, 40), frame(1, 2, 40, 40)],
+        )
+        .unwrap_err();
+        assert!(matches!(err, SegmentError::LengthOutOfRange { .. }), "got {err:?}");
+    }
+
+    /// With `record_block_codec == NONE`, the codec entry point must delegate byte-for-byte
+    /// to the uncompressed sealer. If the dispatch comparison is inverted the block path
+    /// runs instead and produces a differently-structured (4KiB-padded) segment.
+    #[test]
+    fn seal_block_codec_none_matches_uncompressed_seal() {
+        let (record_area, frames) = sample_layout();
+        let direct =
+            seal_segment_v1_from_record_area(2, 4, 6, SegmentId([0x11; 16]), 10, 20, &record_area, &frames).unwrap();
+        let via_codec = seal_segment_v1_from_record_area_with_block_codec(
+            2,
+            4,
+            6,
+            SegmentId([0x11; 16]),
+            10,
+            20,
+            RECORD_BLOCK_CODEC_NONE_V1,
+            &record_area,
+            &frames,
+        )
+        .unwrap();
+        assert_eq!(via_codec.bytes, direct.bytes);
+    }
+
+    /// Full round-trip for the LZ4 block-codec path. Beyond the shared structural
+    /// invariants, this pins the Phase-9 4KiB alignment (footer padding), that the
+    /// trailer records the LZ4 codec, and that logical TOC offsets survive block
+    /// compression.
+    #[test]
+    fn seal_block_codec_lz4_roundtrip_preserves_invariants() {
+        let (record_area, frames) = sample_layout();
+        let out = seal_segment_v1_from_record_area_with_block_codec(
+            7,
+            3,
+            11,
+            SegmentId([0x5A; 16]),
+            1_700_000_000_000_000_000,
+            1_700_000_000_000_000_999,
+            RECORD_BLOCK_CODEC_LZ4_V1,
+            &record_area,
+            &frames,
+        )
+        .unwrap();
+
+        // Phase-9: the whole file is 4KiB-aligned.
+        assert_eq!(out.bytes.len() % 4096, 0);
+
+        let (header, toc_h, entries, footer) = decode_segment_v1(&out.bytes).unwrap();
+        assert_eq!(header.segment_seq, 11);
+        assert_eq!(footer.sealed_at_unix_ns, 1_700_000_000_000_000_999);
+        assert_eq!(entries.len(), 3);
+        assert!(is_sorted_toc(&entries));
+
+        // Offsets/lengths line up (record area here is the *physical*, compressed area).
+        assert_eq!(footer.record_area_offset, HDR);
+        assert_eq!(footer.toc_offset, footer.record_area_offset + footer.record_area_len);
+        assert_eq!(footer.file_len, out.bytes.len() as u64);
+        assert_eq!(
+            footer.file_len,
+            HDR + footer.record_area_len + footer.toc_len + SEGMENT_FOOTER_LEN as u64
+        );
+
+        // Bounds reflect the sorted TOC.
+        assert_eq!((footer.min_stream_hash, footer.min_seq), (1, 1));
+        assert_eq!((footer.max_stream_hash, footer.max_seq), (9, 1));
+
+        // Logical TOC file offsets are header_len + uncompressed record_off, unchanged by
+        // block compression.
+        assert_eq!(entries[0].file_offset as u64, HDR + 80);
+        assert_eq!(entries[1].file_offset as u64, HDR + 40);
+        assert_eq!(entries[2].file_offset as u64, HDR);
+
+        assert_eq!(toc_h.crc_tables_len, out.toc_header.crc_tables_len);
+
+        // Trailer index decodes and records the LZ4 codec.
+        let toc_area = &out.bytes[footer.toc_offset as usize..(footer.toc_offset + footer.toc_len) as usize];
+        let trailer = decode_trailer_index_v1(toc_area, &toc_h).unwrap().unwrap();
+        assert_eq!(trailer.toc_by_offset.len(), 3);
+        assert_eq!(trailer.blocks.len(), 1);
+        assert_eq!(trailer.blocks[0].codec, RECORD_BLOCK_CODEC_LZ4_V1);
+    }
+
+    #[test]
+    fn seal_block_codec_lz4_rejects_non_covering_frames() {
+        let err = seal_segment_v1_from_record_area_with_block_codec(
+            0,
+            1,
+            1,
+            SegmentId([0u8; 16]),
+            1,
+            2,
+            RECORD_BLOCK_CODEC_LZ4_V1,
+            &[0u8; 100],
+            &[frame(1, 1, 0, 40), frame(1, 2, 40, 40)],
+        )
+        .unwrap_err();
+        assert!(matches!(err, SegmentError::LengthOutOfRange { .. }), "got {err:?}");
     }
 }

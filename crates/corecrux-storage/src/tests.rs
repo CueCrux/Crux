@@ -1465,6 +1465,60 @@ mod tests {
     }
 
     #[test]
+    fn seal_material_signing_bytes_commit_to_predecessor_link() {
+        // The predecessor link is what chains seal receipts (I2). Two materials
+        // identical except for the link MUST sign differently, and the link
+        // flag/seq/hash must occupy their fixed offsets. The append-path test
+        // above cannot pin this: its two receipts differ in seq/hash anyway, so
+        // an encoder that silently drops the (Some, Some) arm still passes it.
+        let base = SegmentSealMaterialV1 {
+            shard_id: 3,
+            epoch: 7,
+            segment_seq: 42,
+            segment_id: SegmentId([0xAB; 16]),
+            segment_hash: [0xCD; 32],
+            previous_segment_seq: None,
+            previous_segment_hash: None,
+            sealed_at_unix_ns: 1_700_000_000_000_000_000,
+            frame_count: 5,
+        };
+        let linked = SegmentSealMaterialV1 {
+            previous_segment_seq: Some(41),
+            previous_segment_hash: Some([0xEE; 32]),
+            ..base
+        };
+
+        let unlinked_bytes = base.signing_bytes();
+        let linked_bytes = linked.signing_bytes();
+        assert_eq!(unlinked_bytes.len(), linked_bytes.len(), "fixed-width encoding");
+        assert_ne!(linked.material_hash(), base.material_hash());
+
+        // Fixed layout: domain tag (34) + shard_id (4) + epoch (8) + seq (8)
+        // + segment_id (16) + segment_hash (32) puts the link flag at 102.
+        const LINK_FLAG_OFF: usize = 34 + 4 + 8 + 8 + 16 + 32;
+        assert_eq!(unlinked_bytes[LINK_FLAG_OFF], 0);
+        assert_eq!(linked_bytes[LINK_FLAG_OFF], 1);
+        assert_eq!(
+            &linked_bytes[LINK_FLAG_OFF + 1..LINK_FLAG_OFF + 9],
+            &41u64.to_be_bytes()
+        );
+        assert_eq!(&linked_bytes[LINK_FLAG_OFF + 9..LINK_FLAG_OFF + 41], &[0xEE; 32]);
+
+        // A different predecessor hash must change the signature material.
+        let relinked = SegmentSealMaterialV1 {
+            previous_segment_hash: Some([0xEF; 32]),
+            ..linked
+        };
+        assert_ne!(relinked.material_hash(), linked.material_hash());
+        // A half-set link (hash without seq) must encode exactly as unlinked.
+        let half = SegmentSealMaterialV1 {
+            previous_segment_seq: None,
+            ..linked
+        };
+        assert_eq!(half.signing_bytes(), unlinked_bytes);
+    }
+
+    #[test]
     fn load_manifest_segment_catalog_returns_sorted_segments() {
         let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 

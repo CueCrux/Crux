@@ -7812,6 +7812,7 @@ async fn m11_closure_suite_exercises_hybrid_workbench_replay_and_offboarding() {
         });
         store.store_synced(corecrux_memory::fact_store::Fact {
             fact_id: "f_m11_business_mirror".to_string(),
+            tenant_hash: "default".to_string(),
             entity: "business::acme::mirror::cloud".to_string(),
             key: "summary".to_string(),
             value: "mirrored business tenant state".to_string(),

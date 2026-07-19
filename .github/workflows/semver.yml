@@ -25,6 +25,25 @@ jobs:
         with:
           tool: cargo-semver-checks
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-      - name: Check semver
-        run: cargo semver-checks check-release --workspace || echo "::warning::Semver check failed (expected for first release or missing baseline)"
-        continue-on-error: true
+      - name: Check semver (advisory)
+        # ADVISORY, deliberately: "Semver Compatibility" is a required check on
+        # main, so a hard failure here would wedge every PR. But the previous
+        # form (`|| echo` AND continue-on-error) could never fail NOR surface
+        # what broke — a structurally always-green required check. Now:
+        # violations land in the job summary + a warning annotation; the job
+        # still passes. Promote to enforcing (fail in the else-branch) after a
+        # clean run history — see ExecPlan
+        # crux-mutation-testing-first-class-2026-07-19 (M5).
+        run: |
+          set -uo pipefail
+          if cargo semver-checks check-release --workspace 2>&1 | tee semver.log; then
+            echo "## Semver: clean" >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "## ⚠️ Semver violations (advisory — job stays green)"
+              echo '```'
+              tail -100 semver.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::cargo-semver-checks found violations — see the job summary. Advisory pending promotion to enforcing."
+          fi

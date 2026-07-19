@@ -181,3 +181,94 @@ fn subject_key_hex16(subject_id: &str) -> String {
     let h = blake3::hash(subject_id.as_bytes()).to_hex().to_string();
     h[0..16].to_string()
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn latest(receipt_id: &str, mode: &str, ingested_at: &str) -> ReceiptSubjectLatestV1 {
+        ReceiptSubjectLatestV1 {
+            receipt_id: receipt_id.to_string(),
+            mode: mode.to_string(),
+            ingested_at: ingested_at.to_string(),
+        }
+    }
+
+    /// Write a crafted subject-index file to the on-disk path derived for
+    /// `(tenant, path_kind, subject)`, but with an overridden stored `kind`.
+    /// This simulates a hash-collision / key-mismatch: the file at the requested
+    /// key claims a different logical identity than requested.
+    fn write_index_with_kind(root: &Path, tenant: &str, path_kind: &str, subject: &str, stored_kind: &str) {
+        let path = subject_index_path_v1(root, tenant, path_kind, subject);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let idx = ReceiptSubjectIndexV1 {
+            schema: "cuecrux.receipt.subject_index.v1".to_string(),
+            tenant_id: tenant.to_string(),
+            kind: stored_kind.to_string(),
+            subject_id: subject.to_string(),
+            latest: latest("r0", "light", "2026-01-01T00:00:00Z"),
+            latest_verified: None,
+            latest_audit: None,
+        };
+        std::fs::write(&path, serde_json::to_vec_pretty(&idx).unwrap()).unwrap();
+    }
+
+    // ── key-mismatch collision guards (fail-closed) ─────────────────
+
+    #[test]
+    fn update_rejects_key_mismatch_on_kind_only() {
+        // Stored kind differs from the requested kind, tenant + subject match:
+        // exactly one of the three OR'd conditions is true. The guard must still
+        // fail closed. Pins both `||` operators against `&&`.
+        let tmp = tempfile::tempdir().unwrap();
+        write_index_with_kind(tmp.path(), "t", "answer", "subj", "action");
+        let res = update_subject_index_v1(tmp.path(), "t", "answer", "subj", "r1", "light", "2026-02-01T00:00:00Z");
+        assert!(matches!(res, Err(ReceiptStoreError::Invalid { .. })));
+    }
+
+    #[test]
+    fn resolve_rejects_key_mismatch_on_kind_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_index_with_kind(tmp.path(), "t", "answer", "subj", "action");
+        let res = resolve_subject_receipt_id_v1(tmp.path(), "t", "answer", "subj", SubjectResolveModeV1::Latest);
+        assert!(matches!(res, Err(ReceiptStoreError::Invalid { .. })));
+    }
+
+    // ── strictly-newer timestamp guards (`>`, not `>=`/`==`/`<`) ────
+
+    #[test]
+    fn update_latest_requires_strictly_newer_timestamp() {
+        // Equal ingested_at must NOT overwrite `latest` (pins `>` vs `>=`).
+        let tmp = tempfile::tempdir().unwrap();
+        update_subject_index_v1(tmp.path(), "t", "answer", "s", "r1", "light", "2026-03-01T00:00:00Z").unwrap();
+        update_subject_index_v1(tmp.path(), "t", "answer", "s", "r2", "light", "2026-03-01T00:00:00Z").unwrap();
+        let got = resolve_subject_receipt_id_v1(tmp.path(), "t", "answer", "s", SubjectResolveModeV1::Latest).unwrap();
+        assert_eq!(got, Some("r1".to_string()));
+    }
+
+    #[test]
+    fn update_latest_verified_requires_strictly_newer_timestamp() {
+        // Pins the verified-branch `>` against `==`, `<`, and `>=`.
+        let tmp = tempfile::tempdir().unwrap();
+        update_subject_index_v1(tmp.path(), "t", "answer", "s", "v1", "verified", "2026-03-02T00:00:00Z").unwrap();
+        // Equal timestamp, different receipt: must not overwrite (kills == and >=).
+        update_subject_index_v1(tmp.path(), "t", "answer", "s", "v2", "verified", "2026-03-02T00:00:00Z").unwrap();
+        // Strictly older: must not overwrite (kills <).
+        update_subject_index_v1(tmp.path(), "t", "answer", "s", "v3", "verified", "2026-03-01T00:00:00Z").unwrap();
+        let got =
+            resolve_subject_receipt_id_v1(tmp.path(), "t", "answer", "s", SubjectResolveModeV1::Verified).unwrap();
+        assert_eq!(got, Some("v1".to_string()));
+    }
+
+    #[test]
+    fn update_latest_audit_requires_strictly_newer_timestamp() {
+        // Pins the audit-branch `>` against `==`, `<`, and `>=`.
+        let tmp = tempfile::tempdir().unwrap();
+        update_subject_index_v1(tmp.path(), "t", "answer", "s", "a1", "audit", "2026-03-02T00:00:00Z").unwrap();
+        update_subject_index_v1(tmp.path(), "t", "answer", "s", "a2", "audit", "2026-03-02T00:00:00Z").unwrap();
+        update_subject_index_v1(tmp.path(), "t", "answer", "s", "a3", "audit", "2026-03-01T00:00:00Z").unwrap();
+        let got = resolve_subject_receipt_id_v1(tmp.path(), "t", "answer", "s", SubjectResolveModeV1::Audit).unwrap();
+        assert_eq!(got, Some("a1".to_string()));
+    }
+}

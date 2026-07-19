@@ -62,7 +62,9 @@ jobs:
           fi
           echo "changed files:"; echo "$files" | sed 's/^/  /'
           # Empty diff (couldn't classify) is the safe default: run the gate.
-          if [ -z "$files" ] || echo "$files" | grep -qE '^shells/desktop/|^\.github/workflows/desktop-shell\.yml$'; then
+          # Herestring, not `echo | grep`: under pipefail a SIGPIPE'd echo
+          # would misclassify a desktop change as skippable (see ci.yml).
+          if [ -z "$files" ] || grep -qE '^shells/desktop/|^\.github/workflows/desktop-shell\.yml$' <<< "$files"; then
             echo "desktop=true" >> "$GITHUB_OUTPUT"
           else
             echo "desktop=false" >> "$GITHUB_OUTPUT"
