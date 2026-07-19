@@ -1,0 +1,99 @@
+# Mutation testing audit — 2026-07-19
+
+Trigger: operator report that "mutation testing in Crux Daemon could be better." Confirmed. Two distinct problems: the nightly job silently never completes, and the partial data we do have shows a ~33% survivor rate in the trust-core crates.
+
+## Current state
+
+- Workflow: `.github/workflows/mutants.yml` — nightly 04:00 UTC, `cargo-mutants` over
+  `corecrux-receipts`, `corecrux-segment`, `corecrux-storage` (3 of 28 crates),
+  report-only (`continue-on-error: true`, `|| true`), self-hosted runner,
+  `CARGO_BUILD_JOBS=4`, per-mutant timeout 120s. Added under ExecPlan
+  `crux-testing-system-hardening-2026-06-17` (M5).
+
+## Finding 1 — the job has effectively never delivered a report (P0)
+
+Sampled runs across 2026-06-18 → 2026-07-18 (~31 nightly runs):
+
+- Every sampled "success" run (29633470202, 29559766203, 29310787450, 28698243392)
+  shows the `Run cargo-mutants` step **cancelled** mid-run at ~2.5–4.2h, with
+  `Upload mutants report` **skipped** despite `if: always()` — consistent with the
+  runner process being killed outright (no grace period), not a GitHub-side cancel.
+- Cancellations cluster around **09:20–10:30 UTC**, suggesting a daily event on the
+  shared self-hosted runner fleet (restart/update/cleanup cron). Root cause not yet
+  pinned down.
+- Only **2 artifacts ever uploaded** (runs 29142589381, 29232035466) — and those are
+  the two runs that hit the 6h job timeout, where GitHub's cancel path did allow the
+  `always()` upload.
+- Net effect: ~3–6 h of runner time burned nightly for a month, green checkmark shown,
+  **no report produced, no triage possible**. This is exactly the green-on-cancel
+  silent-failure anti-pattern.
+
+## Finding 2 — the partial data shows a real assertion gap
+
+From the 2026-07-13 artifact (run truncated at 6h: 2,532 of 3,244 mutants tested):
+
+| outcome | count |
+|---|---|
+| caught | 1,090 |
+| **missed (survivors)** | **544** |
+| timeout | 19 |
+| unviable | 877 |
+| never tested (6h cut) | ~712 |
+
+Mutation score ≈ **67%** caught (1,090 / 1,634 viable tested) — weak for crates whose
+whole point is tamper-evidence. Survivors by file (top):
+
+| survivors | file |
+|---|---|
+| 141 | `crates/corecrux-storage/src/lib.rs` |
+| 104 | `crates/corecrux-segment/src/sealer.rs` |
+| 52 | `crates/corecrux-segment/src/builder.rs` |
+| 47 | `crates/corecrux-storage/src/append.rs` |
+| 44 | `crates/corecrux-receipts/src/witness_v1.rs` |
+| 41 | `crates/corecrux-segment/src/trailer.rs` |
+| 17 | `crates/corecrux-segment/src/footer.rs` |
+| 13 | `crates/corecrux-receipts/src/candidate_digest_v1.rs` |
+| 10 | `crates/corecrux-receipts/src/audit_gap_v1.rs` (incl. `||`→`&&` in `verify_coverage_window_body_v1`) |
+
+Survivors in `sealer.rs`, `witness_v1.rs`, and `audit_gap_v1.rs` verification logic are
+the alarming ones — those are the claims `docs/agent/CLAIMS.md` says tests prove.
+
+Also: 877/3,244 (27%) unviable mutants = pure wasted compile time.
+
+## Proposed first-class approach
+
+Phase 0 — make it deliver (small, do first):
+1. **Shard the run** so each job finishes inside the runner-disruption window:
+   `cargo mutants --shard k/8` as a matrix job (~25–45 min each), artifact per shard.
+   This alone fixes both the 6h overrun and the 09:20–10:30 kill window.
+2. **Upload mid-run state regardless**: keep `mutants.out/` under the workspace, add a
+   final step with `if: ${{ always() }}` per shard; short jobs make this moot anyway.
+3. **Surface the score**: merge shard outcomes, write caught/missed/unviable + per-crate
+   score to `$GITHUB_STEP_SUMMARY`; fail the workflow (it is non-gating anyway) when
+   the step is cancelled, so silent death is visible.
+4. Separately: find what kills long jobs on the runner fleet at ~09:20 UTC — this
+   likely affects other long workflows (fuzz, coverage-attestation).
+
+Phase 1 — make it incremental (the actual first-class pattern):
+5. **PR-time `--in-diff`**: run `cargo mutants --in-diff <(git diff origin/main...)` on
+   PRs touching trust-core crates. Minutes, not hours; gate *new* code at 100%
+   caught-or-annotated. Keeps the nightly sweep as the safety net.
+6. **Baseline ratchet**: check in `missed.txt` (or a digest of it) as a baseline;
+   nightly job diffs against it — new survivors fail, fixed survivors ratchet down.
+7. **Speed**: `--test-tool=nextest`; consider `--baseline=skip` once the workspace
+   baseline is known-green from ci.yml; keep `CARGO_BUILD_JOBS=4` for fleet safety.
+
+Phase 2 — burn down and expand:
+8. **Triage the 544-survivor backlog** starting with receipts verification + sealer.
+   Buckets: (a) write the missing assertion, (b) genuinely inert (log/metric lines) →
+   `#[mutants::skip]` or `exclude_globs` in `.cargo/mutants.toml` with a justification
+   comment — this also cuts the 27% unviable waste.
+9. **Expand scope** crate-by-crate (candidate next: `corecrux-memory`, retrieval
+   fusion) only after the trust-core score is ≥90% and gated.
+
+## Verification pointers
+
+- Run list: `gh run list --workflow=mutants.yml`
+- Step conclusions: `gh api repos/CueCrux/Crux/actions/runs/<id>/jobs --jq '.jobs[0].steps[]'`
+- Artifacts (only 2 exist): `gh api "repos/CueCrux/Crux/actions/artifacts?name=mutants-report"`
+- Analyzed artifact extracted at scratchpad `mutants-0713/` (session-ephemeral).
