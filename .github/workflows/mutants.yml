@@ -1,36 +1,68 @@
+# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
+# Licensed under the CueCrux Community Licence (CCL v1.0).
+#
 # Mutation testing for the tamper-evidence trust core.
 #
 # Region coverage proves a line executed; it does NOT prove a test would catch
 # a regression. `cargo-mutants` mutates the code and checks that some test
-# fails — surviving mutants are assertion gaps (the failure mode the 2026-06-17
-# testing-system audit flagged). Scoped to the trust-core crates and run
-# nightly / on-demand; NON-BLOCKING (report-only) so it never gates a PR until
-# the survivor backlog is triaged. See PlanCrux ExecPlan
-# crux-testing-system-hardening-2026-06-17 (M5).
+# fails — surviving mutants are assertion gaps.
+#
+# Design (ExecPlan crux-mutation-testing-first-class-2026-07-19; audit in
+# .agent/notes/mutation-testing-audit-2026-07-19.md):
+#
+# * SHARDED 8 ways so each job finishes in well under an hour. The previous
+#   single 3-6h job was OOM-killed mid-run on ~29 of 31 nights (confirmed
+#   `cargo-mutants invoked oom-killer` in runner-hel1's journal): the shared
+#   62G host hits daily memory pressure in the ~09:20-10:30 UTC window when
+#   the morning eval jobs land, and the long-running mutants job was the
+#   process with the highest OOM score. It uploaded no report and still
+#   showed green.
+# * HONEST STATUS: cargo-mutants exit 2 ("missed mutants found") is expected
+#   and reported; any other non-zero exit (baseline failure, internal error,
+#   cancellation) fails the shard. The merge job fails when any shard died.
+# * RATCHET, not gate: survivors are compared against the checked-in
+#   .github/mutants-baseline.txt (normalised "path: description", a count
+#   ratchet per normalised bucket). NEW survivors turn the nightly red;
+#   no-longer-missed ones are listed (with their disposition) so the baseline
+#   can be ratcheted down. Not a required check on main (and must not become one
+#   without a merge_group trigger — see merge-queue rule).
+# * Cron at 02:30 UTC and max-parallel: 3 so the whole run clears the fleet
+#   kill window with margin while bounding concurrent build load on the
+#   shared runner host (OOM incident 2026-06-22 — hence CARGO_BUILD_JOBS=4).
+#
+# PR-time incremental mutation testing lives in mutants-diff.yml.
 name: Mutation (trust core)
 
 on:
   schedule:
-    - cron: "0 4 * * *" # nightly 04:00 UTC
+    - cron: "30 2 * * *" # nightly 02:30 UTC; must clear the host's morning memory-pressure window (~09:20 UTC)
   workflow_dispatch: {}
 
+permissions:
+  contents: read
+
 concurrency:
-  group: mutants-${{ github.ref }}
+  # Namespaced by event so a manual dispatch does not cancel (and discard)
+  # an in-flight nightly's reports.
+  group: mutants-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
+
+env:
+  MUTANTS_SHARDS: "8"
 
 jobs:
   mutants:
-    name: cargo-mutants (receipts/segment/storage)
+    name: shard ${{ matrix.shard }}
     runs-on: [self-hosted, ci]
-    # Report-only: a surviving mutant must not fail the workflow yet.
-    continue-on-error: true
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      # Bound concurrent cargo builds on the shared runner host.
+      max-parallel: 3
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     env:
-      CARGO_HOME: /home/gha-runner/.cargo-${{ github.job }}-${{ github.run_id }}
-      # Cap build parallelism so the baseline workspace build doesn't spike host
-      # RAM and trip the OOM-killer that took down the shared self-hosted CI
-      # runners (incident 2026-06-22 — runner fleet down 1-2 days). cargo-mutants
-      # already runs mutants serially; this bounds the cargo build phase. Nightly
-      # + non-blocking, so a slower run is an acceptable trade for fleet safety.
+      CARGO_HOME: /home/gha-runner/.cargo-mutants-${{ matrix.shard }}-${{ github.run_id }}
       CARGO_BUILD_JOBS: "4"
     steps:
       - name: Seed per-job CARGO_HOME from shared toolchain
@@ -45,19 +77,73 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-mutants
-      - name: Run cargo-mutants on the trust-core crates
+          # Pinned: cargo-mutants documents that its mutants.out format may
+          # change between versions; scripts/mutants-report.py parses it.
+          tool: cargo-mutants@27.1.0
+      - name: Run cargo-mutants shard on the trust-core crates
         run: |
+          set -uo pipefail
           cargo mutants --no-shuffle --timeout 120 \
-            -p corecrux-receipts -p corecrux-segment -p corecrux-storage \
-            || true
-      - name: Upload mutants report
+            --shard "${{ matrix.shard }}/${MUTANTS_SHARDS}" \
+            -p corecrux-receipts -p corecrux-segment -p corecrux-storage
+          rc=$?
+          # 0 = all mutants caught; 2 = missed mutants (reported by the merge
+          # job, non-fatal here). Anything else is an infra/baseline failure
+          # and must fail the shard — silent death is the failure mode that
+          # hid this job's results for a month.
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then
+            echo "::error::cargo-mutants exited $rc (not a survivors result: 3=all-timeouts, 4=baseline failed, other=infra — see log)"
+            exit "$rc"
+          fi
+      - name: Upload shard report
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: mutants-report
+          name: mutants-shard-${{ matrix.shard }}
           path: mutants.out/
-          if-no-files-found: ignore
+          if-no-files-found: warn
+          retention-days: 30
       - name: Reclaim per-job CARGO_HOME
         if: always()
         run: rm -rf "$CARGO_HOME"
+
+  merge:
+    name: merge + ratchet
+    needs: mutants
+    if: always()
+    runs-on: [self-hosted, ci]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download shard reports
+        uses: actions/download-artifact@v7
+        with:
+          pattern: mutants-shard-*
+          path: shard-reports
+      - name: Merge, score, and ratchet against baseline
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          dirs=(shard-reports/mutants-shard-*)
+          if [ "${#dirs[@]}" -eq 0 ]; then
+            echo "::error::no shard reports downloaded — every shard died before upload"
+            exit 1
+          fi
+          python3 scripts/mutants-report.py \
+            --outs "${dirs[@]}" \
+            --baseline .github/mutants-baseline.txt \
+            --summary "$GITHUB_STEP_SUMMARY" \
+            --expect-min-viable 1200
+          rc=$?
+          if [ "$rc" -eq 2 ]; then
+            echo "::error::new mutation survivors vs .github/mutants-baseline.txt (see job summary)"
+          fi
+          if [ "${#dirs[@]}" -ne "${MUTANTS_SHARDS}" ]; then
+            echo "::error::only ${#dirs[@]}/${MUTANTS_SHARDS} shard reports present — results are partial"
+            rc=1
+          fi
+          if [ "${{ needs.mutants.result }}" != "success" ]; then
+            echo "::error::one or more mutant shards failed or was cancelled"
+            rc=1
+          fi
+          exit "$rc"
