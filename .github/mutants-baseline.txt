@@ -7,34 +7,14 @@ crates/corecrux-receipts/src/approval_decision_v1.rs: replace ApprovalRiskTierV1
 crates/corecrux-receipts/src/audit_bundle_v1.rs: replace * with +
 crates/corecrux-receipts/src/audit_bundle_v1.rs: replace * with +
 crates/corecrux-receipts/src/audit_bundle_v1.rs: replace > with >= in decode_all_bounded
-crates/corecrux-receipts/src/audit_gap_v1.rs: replace || with && in verify_coverage_window_body_v1
-crates/corecrux-receipts/src/audit_gap_v1.rs: replace || with && in verify_coverage_window_body_v1
-crates/corecrux-receipts/src/audit_gap_v1.rs: replace || with && in verify_coverage_window_body_v1
-crates/corecrux-receipts/src/audit_gap_v1.rs: replace || with && in verify_coverage_window_body_v1
-crates/corecrux-receipts/src/audit_gap_v1.rs: replace || with && in verify_coverage_window_body_v1
-crates/corecrux-receipts/src/audit_gap_v1.rs: replace || with && in verify_coverage_window_body_v1
-crates/corecrux-receipts/src/audit_gap_v1.rs: replace || with && in verify_coverage_window_body_v1
-crates/corecrux-receipts/src/audit_gap_v1.rs: replace || with && in verify_coverage_window_body_v1
-crates/corecrux-receipts/src/audit_gap_v1.rs: replace || with && in verify_coverage_window_body_v1
-crates/corecrux-receipts/src/audit_gap_v1.rs: replace || with && in verify_coverage_window_body_v1
 crates/corecrux-receipts/src/c2pa_manifest_v1.rs: delete ! in pem_cert_to_der
 crates/corecrux-receipts/src/c2pa_manifest_v1.rs: replace + with * in hex_to_bytes
 crates/corecrux-receipts/src/c2pa_manifest_v1.rs: replace + with * in pem_cert_to_der
 crates/corecrux-receipts/src/c2pa_manifest_v1.rs: replace += with *= in hex_to_bytes
 crates/corecrux-receipts/src/c2pa_manifest_v1.rs: replace < with <= in hex_to_bytes
 crates/corecrux-receipts/src/c2pa_manifest_v1.rs: replace | with ^ in hex_to_bytes
-crates/corecrux-receipts/src/candidate_digest_v1.rs: delete match arm Value::Bytes(b) in parse_digest_bytes
-crates/corecrux-receipts/src/candidate_digest_v1.rs: delete match arm Value::Integer(i) in val_to_f64_opt
 crates/corecrux-receipts/src/candidate_digest_v1.rs: delete match arm Value::Null in val_to_f64_opt
-crates/corecrux-receipts/src/candidate_digest_v1.rs: delete match arm Value::Text(s) in parse_lanes_used
-crates/corecrux-receipts/src/candidate_digest_v1.rs: delete match arm b'A'..= b'F' in from_hex
-crates/corecrux-receipts/src/candidate_digest_v1.rs: replace != with == in parse_digest_bytes
-crates/corecrux-receipts/src/candidate_digest_v1.rs: replace + with - in from_hex
-crates/corecrux-receipts/src/candidate_digest_v1.rs: replace - with + in from_hex
-crates/corecrux-receipts/src/candidate_digest_v1.rs: replace - with / in from_hex
 crates/corecrux-receipts/src/candidate_digest_v1.rs: replace << with >> in compute_candidate_digest_bytes_v1
-crates/corecrux-receipts/src/candidate_digest_v1.rs: replace > with == in compute_candidate_digest_bytes_v1
-crates/corecrux-receipts/src/candidate_digest_v1.rs: replace > with >= in compute_candidate_digest_bytes_v1
 crates/corecrux-receipts/src/candidate_digest_v1.rs: replace | with ^ in parse_digest_hex_string
 crates/corecrux-receipts/src/chain_reanchor_v1.rs: replace && with || in verify_chain_signature_reanchor_v1
 crates/corecrux-receipts/src/chain_reanchor_v1.rs: replace ReanchorSigningKeyV1<'_>::alg -> &'static str with ""
@@ -42,17 +22,6 @@ crates/corecrux-receipts/src/chain_reanchor_v1.rs: replace ReanchorSigningKeyV1<
 crates/corecrux-receipts/src/chain_reanchor_v1.rs: replace || with && in verify_chain_signature_reanchor_v1
 crates/corecrux-receipts/src/chain_reanchor_v1.rs: replace || with && in verify_reanchor_sig_under
 crates/corecrux-receipts/src/crypto_shred_v1.rs: replace || with && in open_crypto_shred_payload_v1
-crates/corecrux-receipts/src/subject_index_v1.rs: replace > with < in update_subject_index_v1
-crates/corecrux-receipts/src/subject_index_v1.rs: replace > with < in update_subject_index_v1
-crates/corecrux-receipts/src/subject_index_v1.rs: replace > with == in update_subject_index_v1
-crates/corecrux-receipts/src/subject_index_v1.rs: replace > with == in update_subject_index_v1
-crates/corecrux-receipts/src/subject_index_v1.rs: replace > with >= in update_subject_index_v1
-crates/corecrux-receipts/src/subject_index_v1.rs: replace > with >= in update_subject_index_v1
-crates/corecrux-receipts/src/subject_index_v1.rs: replace > with >= in update_subject_index_v1
-crates/corecrux-receipts/src/subject_index_v1.rs: replace || with && in resolve_subject_receipt_id_v1
-crates/corecrux-receipts/src/subject_index_v1.rs: replace || with && in resolve_subject_receipt_id_v1
-crates/corecrux-receipts/src/subject_index_v1.rs: replace || with && in update_subject_index_v1
-crates/corecrux-receipts/src/subject_index_v1.rs: replace || with && in update_subject_index_v1
 crates/corecrux-receipts/src/vault_pki_x509_signer.rs: delete ! in VaultPkiX509Signer::regenerate_leaf
 crates/corecrux-receipts/src/vault_pki_x509_signer.rs: delete ! in VaultPkiX509Signer::regenerate_leaf
 crates/corecrux-receipts/src/vault_pki_x509_signer.rs: delete ! in atomic_write_pem
@@ -62,59 +31,11 @@ crates/corecrux-receipts/src/vault_pki_x509_signer.rs: replace && with || in ato
 crates/corecrux-receipts/src/vault_pki_x509_signer.rs: replace < with <= in needs_rotation
 crates/corecrux-receipts/src/vault_pki_x509_signer.rs: replace VaultPkiX509Signer::current_leaf_not_after -> Option<SystemTime> with None
 crates/corecrux-receipts/src/vault_pki_x509_signer.rs: replace || with && in VaultPkiX509Signer::try_load_from_disk
-crates/corecrux-receipts/src/verify_v1.rs: delete ! in verify_receipt_v1
-crates/corecrux-receipts/src/verify_v1.rs: delete ! in verify_receipt_v1
-crates/corecrux-receipts/src/verify_v1.rs: delete ! in verify_receipt_v1
-crates/corecrux-receipts/src/verify_v1.rs: delete ! in verify_receipt_v1
-crates/corecrux-receipts/src/verify_v1.rs: delete ! in verify_receipt_v1
-crates/corecrux-receipts/src/verify_v1.rs: delete field candidate_digest_matches_recompute from struct VerificationTraceChecksV1 expression in compute_trace_checks
-crates/corecrux-receipts/src/verify_v1.rs: delete field candidate_digest_matches_recompute from struct VerificationTraceChecksV1 expression in compute_trace_checks
-crates/corecrux-receipts/src/verify_v1.rs: delete field candidate_digest_matches_recompute from struct VerificationTraceChecksV1 expression in compute_trace_checks
-crates/corecrux-receipts/src/verify_v1.rs: delete match arm Some(Value::Map(am)) in compute_trace_checks
-crates/corecrux-receipts/src/verify_v1.rs: replace == with != in verify_receipt_v1
-crates/corecrux-receipts/src/witness_v1.rs: delete match arm "2.16.840.1.101.3.4.2.2" in alg_name_for_digest_oid_str
-crates/corecrux-receipts/src/witness_v1.rs: delete match arm "2.16.840.1.101.3.4.2.3" in alg_name_for_digest_oid_str
-crates/corecrux-receipts/src/witness_v1.rs: delete match arm "sha384" in digest_len_for_alg
-crates/corecrux-receipts/src/witness_v1.rs: delete match arm "sha512" in digest_len_for_alg
-crates/corecrux-receipts/src/witness_v1.rs: replace != with == in verify_rfc6962_inclusion_proof_v1
-crates/corecrux-receipts/src/witness_v1.rs: replace % with + in verify_rfc6962_inclusion_proof_v1
-crates/corecrux-receipts/src/witness_v1.rs: replace % with + in verify_rfc6962_inclusion_proof_v1
-crates/corecrux-receipts/src/witness_v1.rs: replace % with / in verify_rfc6962_inclusion_proof_v1
-crates/corecrux-receipts/src/witness_v1.rs: replace % with / in verify_rfc6962_inclusion_proof_v1
-crates/corecrux-receipts/src/witness_v1.rs: replace && with || in generalized_time_to_rfc3339
-crates/corecrux-receipts/src/witness_v1.rs: replace && with || in trim_unsigned_integer
-crates/corecrux-receipts/src/witness_v1.rs: replace && with || in validate_tsa_chain_v1
 crates/corecrux-receipts/src/witness_v1.rs: replace && with || in verify_rfc6962_inclusion_proof_v1
-crates/corecrux-receipts/src/witness_v1.rs: replace && with || in verify_witness_binding_v1
-crates/corecrux-receipts/src/witness_v1.rs: replace + with - in checkpoint_text_if_root_matches
-crates/corecrux-receipts/src/witness_v1.rs: replace < with <= in parse_tst_info_v1
-crates/corecrux-receipts/src/witness_v1.rs: replace < with <= in wrap_generalized_time_der
-crates/corecrux-receipts/src/witness_v1.rs: replace < with == in parse_tst_info_v1
-crates/corecrux-receipts/src/witness_v1.rs: replace < with == in wrap_generalized_time_der
-crates/corecrux-receipts/src/witness_v1.rs: replace < with > in parse_tst_info_v1
-crates/corecrux-receipts/src/witness_v1.rs: replace < with > in wrap_generalized_time_der
-crates/corecrux-receipts/src/witness_v1.rs: replace <= with > in wrap_generalized_time_der
-crates/corecrux-receipts/src/witness_v1.rs: replace == with != in cert_matches_signer_v1
-crates/corecrux-receipts/src/witness_v1.rs: replace == with != in digest_for_oid
-crates/corecrux-receipts/src/witness_v1.rs: replace == with != in digest_for_oid
-crates/corecrux-receipts/src/witness_v1.rs: replace == with != in trim_unsigned_integer
-crates/corecrux-receipts/src/witness_v1.rs: replace == with != in verify_rfc6962_inclusion_proof_v1
-crates/corecrux-receipts/src/witness_v1.rs: replace > with < in ring_alg_for_signature_v1
-crates/corecrux-receipts/src/witness_v1.rs: replace > with < in trim_unsigned_integer
-crates/corecrux-receipts/src/witness_v1.rs: replace > with == in ring_alg_for_signature_v1
-crates/corecrux-receipts/src/witness_v1.rs: replace > with == in ring_alg_for_signature_v1
-crates/corecrux-receipts/src/witness_v1.rs: replace > with == in trim_unsigned_integer
-crates/corecrux-receipts/src/witness_v1.rs: replace > with >= in note_signature_payload
 crates/corecrux-receipts/src/witness_v1.rs: replace > with >= in ring_alg_for_signature_v1
 crates/corecrux-receipts/src/witness_v1.rs: replace > with >= in ring_alg_for_signature_v1
-crates/corecrux-receipts/src/witness_v1.rs: replace > with >= in trim_unsigned_integer
-crates/corecrux-receipts/src/witness_v1.rs: replace >>= with <<= in verify_rfc6962_inclusion_proof_v1
-crates/corecrux-receipts/src/witness_v1.rs: replace >>= with <<= in verify_rfc6962_inclusion_proof_v1
-crates/corecrux-receipts/src/witness_v1.rs: replace >>= with <<= in verify_rfc6962_inclusion_proof_v1
 crates/corecrux-receipts/src/witness_v1.rs: replace | with ^ in parse_digest_hex
 crates/corecrux-receipts/src/witness_v1.rs: replace | with ^ in parse_sha256_hex
-crates/corecrux-receipts/src/witness_v1.rs: replace || with && in verify_rfc6962_inclusion_proof_v1
-crates/corecrux-receipts/src/witness_v1.rs: replace || with && in verify_rfc6962_inclusion_proof_v1
 crates/corecrux-receipts/src/witness_v1.rs: replace || with && in verify_witness_binding_v1
 crates/corecrux-segment/src/builder.rs: replace * with + in build_segment_v1
 crates/corecrux-segment/src/builder.rs: replace * with + in build_segment_v1
@@ -208,83 +129,10 @@ crates/corecrux-segment/src/frame.rs: replace > with == in encode_frame_v1
 crates/corecrux-segment/src/frame.rs: replace > with >= in encode_frame_v1
 crates/corecrux-segment/src/frame.rs: replace > with >= in encode_frame_v1
 crates/corecrux-segment/src/header.rs: replace < with > in decode_segment_header_v1
-crates/corecrux-segment/src/sealer.rs: delete ! in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: delete ! in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace != with == in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace != with == in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace != with == in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace != with == in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace * with + in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace * with + in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace * with + in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace * with + in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace * with + in seal_segment_v1_from_record_area
 crates/corecrux-segment/src/sealer.rs: replace * with + in seal_segment_v1_from_record_area
 crates/corecrux-segment/src/sealer.rs: replace * with + in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace * with + in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace * with + in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace * with + in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace * with + in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace * with + in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace * with / in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace * with / in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace * with / in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace * with / in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace * with / in seal_segment_v1_from_record_area
 crates/corecrux-segment/src/sealer.rs: replace * with / in seal_segment_v1_from_record_area
 crates/corecrux-segment/src/sealer.rs: replace * with / in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace * with / in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace * with / in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace * with / in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace * with / in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace * with / in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace + with * in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace + with * in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace + with * in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace + with * in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace + with * in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace + with * in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace + with * in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace + with * in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace + with * in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace + with * in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace + with * in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace + with * in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace + with * in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace + with * in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace + with - in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace + with - in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace + with - in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace + with - in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace + with - in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace + with - in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace + with - in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace + with - in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace + with - in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace + with - in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace + with - in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace + with - in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace + with - in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace + with - in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace - with + in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace - with + in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace - with / in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace - with / in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace == with != in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace > with < in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace > with < in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace > with < in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace > with < in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace > with < in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace > with < in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace > with < in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace > with < in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace > with < in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace > with < in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace > with < in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace > with < in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace > with < in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace > with == in seal_segment_v1_from_record_area
 crates/corecrux-segment/src/sealer.rs: replace > with == in seal_segment_v1_from_record_area
 crates/corecrux-segment/src/sealer.rs: replace > with == in seal_segment_v1_from_record_area
 crates/corecrux-segment/src/sealer.rs: replace > with == in seal_segment_v1_from_record_area
@@ -295,15 +143,11 @@ crates/corecrux-segment/src/sealer.rs: replace > with == in seal_segment_v1_from
 crates/corecrux-segment/src/sealer.rs: replace > with == in seal_segment_v1_from_record_area_with_block_codec
 crates/corecrux-segment/src/sealer.rs: replace > with == in seal_segment_v1_from_record_area_with_block_codec
 crates/corecrux-segment/src/sealer.rs: replace > with == in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace > with == in seal_segment_v1_from_record_area_with_block_codec
-crates/corecrux-segment/src/sealer.rs: replace > with == in seal_segment_v1_from_record_area_with_block_codec
 crates/corecrux-segment/src/sealer.rs: replace > with >= in seal_segment_v1_from_record_area
 crates/corecrux-segment/src/sealer.rs: replace > with >= in seal_segment_v1_from_record_area
 crates/corecrux-segment/src/sealer.rs: replace > with >= in seal_segment_v1_from_record_area
 crates/corecrux-segment/src/sealer.rs: replace > with >= in seal_segment_v1_from_record_area
 crates/corecrux-segment/src/sealer.rs: replace > with >= in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace > with >= in seal_segment_v1_from_record_area
-crates/corecrux-segment/src/sealer.rs: replace > with >= in seal_segment_v1_from_record_area_with_block_codec
 crates/corecrux-segment/src/sealer.rs: replace > with >= in seal_segment_v1_from_record_area_with_block_codec
 crates/corecrux-segment/src/sealer.rs: replace > with >= in seal_segment_v1_from_record_area_with_block_codec
 crates/corecrux-segment/src/sealer.rs: replace > with >= in seal_segment_v1_from_record_area_with_block_codec
@@ -413,7 +257,6 @@ crates/corecrux-storage/src/lib.rs: delete ! in ShardStorage::open
 crates/corecrux-storage/src/lib.rs: delete ! in ShardStorage::open
 crates/corecrux-storage/src/lib.rs: delete ! in ShardStorage::open
 crates/corecrux-storage/src/lib.rs: delete ! in select_stream_tail_from_trailer_bloom
-crates/corecrux-storage/src/lib.rs: delete match arm (Some(seq), Some(hash)) in SegmentSealMaterialV1::signing_bytes
 crates/corecrux-storage/src/lib.rs: replace != with == in encode_dir_run_v1
 crates/corecrux-storage/src/lib.rs: replace != with == in toc_by_offset_ranges_by_block
 crates/corecrux-storage/src/lib.rs: replace % with / in encode_dir_run_v1

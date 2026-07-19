@@ -1498,7 +1498,10 @@ mod tests {
         const LINK_FLAG_OFF: usize = 34 + 4 + 8 + 8 + 16 + 32;
         assert_eq!(unlinked_bytes[LINK_FLAG_OFF], 0);
         assert_eq!(linked_bytes[LINK_FLAG_OFF], 1);
-        assert_eq!(&linked_bytes[LINK_FLAG_OFF + 1..LINK_FLAG_OFF + 9], &41u64.to_be_bytes());
+        assert_eq!(
+            &linked_bytes[LINK_FLAG_OFF + 1..LINK_FLAG_OFF + 9],
+            &41u64.to_be_bytes()
+        );
         assert_eq!(&linked_bytes[LINK_FLAG_OFF + 9..LINK_FLAG_OFF + 41], &[0xEE; 32]);
 
         // A different predecessor hash must change the signature material.
