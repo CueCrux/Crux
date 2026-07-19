@@ -74,7 +74,11 @@ jobs:
           # Docs set mirrors the old paths-ignore: *.md anywhere, docs/,
           # .agent/, LICENSE*/LICENCE*. Anything else (or an empty diff,
           # the safe default) counts as code.
-          if [ -n "$files" ] && ! echo "$files" | grep -qEv '\.md$|^docs/|^\.agent/|^LICENSE|^LICENCE'; then
+          # Herestring, not `echo | grep`: under pipefail, grep -q exiting at
+          # its first match can SIGPIPE the echo on a large change list, and
+          # the `!` would then misclassify a code PR as docs-only — skipping
+          # every heavy gate.
+          if [ -n "$files" ] && ! grep -qEv '\.md$|^docs/|^\.agent/|^LICENSE|^LICENCE' <<< "$files"; then
             echo "code=false" >> "$GITHUB_OUTPUT"
             echo "docs-only change set — heavy jobs will skip (and report skipped)"
           else
@@ -178,16 +182,12 @@ jobs:
         run: bash scripts/ci-cargo-with-fallback.sh test -p corecruxd route_auth
       - name: HTTP boundary smoke contracts
         run: bash scripts/ci-cargo-with-fallback.sh test -p corecruxd http_boundary_contracts
-      # ExecPlan crux-external-findings-remediation M4: the hosted-service HTTP
-      # surfaces (`/v1/gpu1/*`, `/v1/cloud/access-contract`) are compiled OUT of
-      # the default Community Edition build (the `hosted-surfaces` feature is
-      # OFF by default). `cargo test --workspace` above already exercises the
-      # full suite in that default OFF config; here we only need a cheap `check`
-      # that the ON config still compiles, so a route regression that skips the
-      # feature gate is caught. (A full `test --features hosted-surfaces` was
-      # run locally and passes; kept out of CI to hold the critical path down.)
-      - name: Hosted-surfaces feature compiles
-        run: bash scripts/ci-cargo-with-fallback.sh check -p corecruxd --features hosted-surfaces
+      # The hosted-surfaces ON-config (behaviour + authorization tests included)
+      # now RUNS in the parallel non-required `test-hosted` job below — the
+      # previous cheap `check` here only proved it compiled, so those
+      # feature-gated tests never executed anywhere in CI (codex review
+      # 2026-07-19). Removed from this required job to keep the critical path
+      # unchanged.
       # `cargo test --workspace` (next step) already covers
       # `crux-integrations::community_packs`; the explicit invocation here
       # was duplicating that target's execution. Drop it.
@@ -203,7 +203,15 @@ jobs:
         run: |
           set -euo pipefail
           DATA_DIR=/tmp/crux-smoke-${{ github.run_id }}
-          CORECRUXD_AUTH_MODE=dev_scopes CORECRUXD_DATA_DIR="$DATA_DIR" ./target/debug/corecruxd &
+          # Per-job ports: concurrent Test jobs share this runner host, and on
+          # the default 14800/14801 an AddrInUse daemon dies silently while the
+          # probes below happily test ANOTHER job's daemon (false green).
+          # Stride 2 so this job's MCP port can never equal a neighbour's HTTP.
+          HTTP_PORT=$((15000 + 2 * (${{ github.run_id }} % 4500)))
+          MCP_PORT=$((HTTP_PORT + 1))
+          CORECRUXD_AUTH_MODE=dev_scopes CORECRUXD_DATA_DIR="$DATA_DIR" \
+            CORECRUXD_HTTP_PORT="$HTTP_PORT" CORECRUXD_MCP_PORT="$MCP_PORT" \
+            ./target/debug/corecruxd &
           PID=$!
           cleanup() {
             kill "$PID" 2>/dev/null || true
@@ -212,41 +220,44 @@ jobs:
           }
           trap cleanup EXIT
           for _ in $(seq 1 30); do
-            if curl -sf http://localhost:14800/readyz >/dev/null && curl -sf http://localhost:14801/mcp >/dev/null; then
+            if curl -sf "http://localhost:$HTTP_PORT"/readyz >/dev/null && curl -sf "http://localhost:$MCP_PORT"/mcp >/dev/null; then
               break
             fi
             sleep 1
           done
-          curl -sf http://localhost:14800/healthz | jq .
-          curl -sf http://localhost:14800/readyz
+          # The PID must still be ours and alive; a dead daemon here means
+          # startup crash, and any port response would come from someone else.
+          kill -0 "$PID"
+          curl -sf "http://localhost:$HTTP_PORT/healthz" | jq .
+          curl -sf "http://localhost:$HTTP_PORT"/readyz
           # Stage to a variable then read via heredoc — `printf | head` has the
           # same SIGPIPE-race as `curl | head`: head closes the pipe after 5
           # lines, the upstream process exits with SIGPIPE/13 (write error),
           # and `set -o pipefail` propagates. Heredoc input has no pipe.
-          METRICS=$(curl -sf http://localhost:14800/metrics)
+          METRICS=$(curl -sf "http://localhost:$HTTP_PORT"/metrics)
           head -5 <<<"$METRICS"
-          curl -sf http://localhost:14800/v1/version | jq -e '.features.mcp == true' >/dev/null
-          curl -sf http://localhost:14800/v1/version | jq -e '.update.state | type == "string"' >/dev/null
+          curl -sf "http://localhost:$HTTP_PORT"/v1/version | jq -e '.features.mcp == true' >/dev/null
+          curl -sf "http://localhost:$HTTP_PORT"/v1/version | jq -e '.update.state | type == "string"' >/dev/null
           # The console HTML is now ~430 KB. Any `... | grep -q 'X'` pipeline
           # races: grep exits immediately on first match (the title is in the
           # first KB), the producing process gets SIGPIPE on its remaining
           # writes, and `set -euo pipefail` propagates that exit code.
           # Stage to a variable + use bash string matching — no pipe, no race.
-          HTML=$(curl -sf http://localhost:14800/console)
+          HTML=$(curl -sf "http://localhost:$HTTP_PORT"/console)
           [[ "$HTML" == *"Crux Console"* ]]
-          curl -sf http://localhost:14800/v1/console/summary \
+          curl -sf "http://localhost:$HTTP_PORT"/v1/console/summary \
             -H 'X-Corecrux-Scopes: admin:read' \
             | jq -e '.console.route == "/console"' >/dev/null
-          curl -sf http://localhost:14800/v1/console/integrations \
+          curl -sf "http://localhost:$HTTP_PORT"/v1/console/integrations \
             -H 'X-Corecrux-Scopes: admin:read' \
             | jq -e '.packs | type == "array"' >/dev/null
-          curl -sf http://localhost:14801/mcp | jq -e '.serverInfo.name == "crux"' >/dev/null
+          curl -sf "http://localhost:$MCP_PORT"/mcp | jq -e '.serverInfo.name == "crux"' >/dev/null
           # Sanity-check the MCP catalog responds with a non-empty tool list.
           # Exact count is pinned by crux_mcp::tools::tests::TOOL_COUNT and the
           # crux-integration-tests::mcp_tools_list lower-bound; the smoke test
           # just confirms the surface is reachable. Echo the count so changes
           # in catalog size are visible in CI logs without breaking the build.
-          TOOL_COUNT=$(curl -sf -X POST http://localhost:14801/mcp \
+          TOOL_COUNT=$(curl -sf -X POST "http://localhost:$MCP_PORT/mcp" \
             -H "Content-Type: application/json" \
             -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
             | jq -r '.result.tools | length')
@@ -267,6 +278,38 @@ jobs:
       # test — export a signed bundle, verify offline, reject a tamper.
       - name: Trust-surface gate (context custody exit test)
         run: CORECRUXCTL=./target/debug/corecruxctl bash scripts/assert-context-custody.sh
+      - name: Reclaim per-job CARGO_HOME
+        if: always()
+        run: rm -rf "$CARGO_HOME"  # see lint job — prevents data-disk leak
+
+  # ── Hosted-surfaces ON-config tests ──────────────────────────────────
+  # The `hosted-surfaces` feature is OFF in the default CE build, so the
+  # workspace test run above never executes its behaviour/authorization tests
+  # (e.g. corecruxd http hosted-surface suites). This job runs them with the
+  # feature ON. NOT a required check — do not promote it without a
+  # merge_group trigger (merge-queue rule).
+  test-hosted:
+    name: Test (hosted-surfaces)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: [self-hosted, ci]
+    env:
+      # See `lint` job above for the per-job CARGO_HOME rationale.
+      CARGO_HOME: /home/gha-runner/.cargo-${{ github.job }}-${{ github.run_id }}
+    steps:
+      - name: Seed per-job CARGO_HOME from shared toolchain
+        run: |
+          mkdir -p "$CARGO_HOME/bin"
+          for tool in /home/gha-runner/.cargo/bin/*; do
+            [ -e "$tool" ] || continue
+            ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
+          done
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+      - name: Test corecruxd with hosted-surfaces enabled
+        run: bash scripts/ci-cargo-with-fallback.sh test -p corecruxd --features hosted-surfaces
       - name: Reclaim per-job CARGO_HOME
         if: always()
         run: rm -rf "$CARGO_HOME"  # see lint job — prevents data-disk leak

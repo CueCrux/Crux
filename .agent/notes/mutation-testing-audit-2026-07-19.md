@@ -118,6 +118,61 @@ OOM-kills other jobs (`.NET` workers on 07-12/07-17, test binaries on
 crons, add per-slot systemd `MemoryHigh=` limits, or add swap. Left as an
 operator decision — it touches other teams' workflows.
 
+## Testing-architecture review (M5, 2026-07-19)
+
+Two independent reviews (Fable inline + codex/GPT read-only sweep, 20 findings)
+over `.github/workflows/*`, `scripts/ci-*`, and the trust-core test surfaces.
+Every finding below was verified against the code before acting.
+
+### Fixed on this branch
+
+| finding | fix |
+|---|---|
+| "Semver Compatibility" (a REQUIRED check) could never fail: `\|\| echo` AND `continue-on-error` | now surfaces violations in job summary + warning; kept advisory deliberately (hard-fail would wedge the merge queue if the baseline is broken) — promote after a clean history |
+| `buf.yml`: job-level `continue-on-error` (justified only for the lint layout rule) also hid `buf breaking` wire-format regressions | split into advisory `lint` + visible blocking-red `breaking` job |
+| `changes` classifier: `echo "$files" \| grep -q` under pipefail can SIGPIPE on big change lists; the `!` then flags a code PR docs-only and skips every heavy gate (same bug in desktop-shell.yml) | herestrings, no pipe |
+| Smoke test used fixed ports 14800/14801 — concurrent Test jobs on the shared runner can silently probe each other's daemon (false green) and never assert the spawned PID is alive | per-job `CORECRUXD_HTTP_PORT`/`MCP_PORT` (stride-2 from run_id) + `kill -0 $PID` after readiness |
+| hosted-surfaces feature tests never ran anywhere in CI (only `cargo check`) | new non-required `Test (hosted-surfaces)` job runs them with the feature ON |
+| mutants ratchet ignored timeouts (missed→timeout looked like progress) | survivors = missed + timeout; baseline regenerated (565 entries) |
+| `coverage-attestation.yml` missing the `if: always()` CARGO_HOME cleanup every other job has (disk-leak incident 2026-06-15 class) | cleanup step added |
+| fuzz.yml PR trigger omitted `crates/corecrux-frame/**` despite THREAT_MODEL promising fuzz on frame changes | path added |
+| **Fork-PR workflows ran with only first-time-contributor approval on a PUBLIC repo whose self-hosted runners have passwordless sudo** — any once-merged contributor could execute arbitrary code on the CI host | repo setting flipped to `all_external_contributors` (every fork PR now needs an operator "Approve and run"; revert: `gh api -X PUT repos/CueCrux/Crux/actions/permissions/fork-pr-contributor-approval -f approval_policy=first_time_contributors`) |
+
+### Documented, needs operator/product decision (in priority order)
+
+1. **Fork PRs still execute on the privileged runner pool after approval.** The
+   approval gate is a mitigation, not a fix. Options: ephemeral runners for
+   `pull_request` from forks, or a sudo-less runner class for untrusted code.
+2. **`verify-store --strict` doesn't verify seal receipts / predecessor links**
+   (`corecrux-storage/src/integrity.rs`); only chain *creation* is tested. Needs
+   a negative chain-verification suite (deletion / reorder / link tamper / bad
+   sig). Sizeable test work — good next burn-down slice.
+3. **Corruption matrix permits the unhashed CRC-table/trailer region** while
+   THREAT_MODEL.md claims "any modification" detection — either sweep that
+   region through the lazy reader path and reject, or narrow the documented claim.
+4. **`single_byte_mutation_fails_verification` (segment decoder proptest) is
+   tautological in its `Ok` branch** (asserts mutated bytes ≠ original bytes,
+   trivially true). A naive `Err`-required fix would be flaky for unhashed
+   bytes; the fix must constrain offsets to covered regions. Deliberate defer —
+   a wrong fix makes a required check flaky.
+5. **No non-canonical/malleable Ed25519 vectors** in the signature suites — a
+   swap of `verify_strict` for permissive verify would survive current tests
+   and most mutation operators.
+6. **Fuzzing gaps**: `receipt_verify_cbor` always passes `keyring: None`
+   (never reaches key parsing / verify_strict); no target for
+   `decode_canonical_header_bytes_v1`; nightly toolchain + unlocked fuzz
+   workspace = weak reproducibility (pin a dated nightly).
+7. **ci-fallback.yml can't actually satisfy the required checks** (check names
+   differ, no Coverage job) — its advertised purpose fails; fold fallback into
+   the primary jobs or rename to match.
+8. **Coverage floors have ≤1.4pt headroom** (integer floors vs decimal actuals)
+   — fine today; ratchet to decimals after the M4 tests raise
+   receipts/segment coverage.
+9. **Ratchet identity is a per-bucket count** (`path: description`, line-less):
+   a same-bucket swap (one old survivor fixed, one new identical-description
+   survivor) stays green. Documented in the script; accept or move to
+   function-scoped identity later.
+
 ## Verification pointers
 
 - Run list: `gh run list --workflow=mutants.yml`

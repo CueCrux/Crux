@@ -20,6 +20,7 @@ crates/corecrux-receipts/src/audit_gap_v1.rs: replace || with && in verify_cover
 crates/corecrux-receipts/src/c2pa_manifest_v1.rs: delete ! in pem_cert_to_der
 crates/corecrux-receipts/src/c2pa_manifest_v1.rs: replace + with * in hex_to_bytes
 crates/corecrux-receipts/src/c2pa_manifest_v1.rs: replace + with * in pem_cert_to_der
+crates/corecrux-receipts/src/c2pa_manifest_v1.rs: replace += with *= in hex_to_bytes
 crates/corecrux-receipts/src/c2pa_manifest_v1.rs: replace < with <= in hex_to_bytes
 crates/corecrux-receipts/src/c2pa_manifest_v1.rs: replace | with ^ in hex_to_bytes
 crates/corecrux-receipts/src/candidate_digest_v1.rs: delete match arm Value::Bytes(b) in parse_digest_bytes
@@ -354,6 +355,10 @@ crates/corecrux-segment/src/trailer.rs: replace > with >= in encode_trailer_inde
 crates/corecrux-segment/src/trailer.rs: replace > with >= in encode_trailer_index_v1
 crates/corecrux-segment/src/trailer.rs: replace > with >= in encode_trailer_index_v1
 crates/corecrux-segment/src/trailer.rs: replace || with && in decode_trailer_index_v1
+crates/corecrux-segment/src/util.rs: replace + with * in block_crc32c
+crates/corecrux-segment/src/util.rs: replace < with <= in block_crc32c
+crates/corecrux-segment/src/util.rs: replace < with == in block_crc32c
+crates/corecrux-segment/src/util.rs: replace == with != in block_crc32c
 crates/corecrux-segment/src/util.rs: replace > with >= in read_u16
 crates/corecrux-segment/src/util.rs: replace > with >= in read_u64
 crates/corecrux-storage/src/append.rs: delete ! in ShardStorage::append_batch_with_stats
@@ -367,6 +372,7 @@ crates/corecrux-storage/src/append.rs: replace + with - in ShardStorage::append_
 crates/corecrux-storage/src/append.rs: replace + with - in ShardStorage::load_head_segment_from_disk
 crates/corecrux-storage/src/append.rs: replace + with - in ShardStorage::load_head_segment_from_disk
 crates/corecrux-storage/src/append.rs: replace + with - in ShardStorage::seal_head_segment
+crates/corecrux-storage/src/append.rs: replace += with *= in ShardStorage::seal_head_segment
 crates/corecrux-storage/src/append.rs: replace += with *= in ShardStorage::seal_head_segment
 crates/corecrux-storage/src/append.rs: replace < with <= in ShardStorage::load_head_segment_from_disk
 crates/corecrux-storage/src/append.rs: replace < with <= in ShardStorage::load_head_segment_from_disk
@@ -411,6 +417,7 @@ crates/corecrux-storage/src/lib.rs: delete match arm (Some(seq), Some(hash)) in 
 crates/corecrux-storage/src/lib.rs: replace != with == in encode_dir_run_v1
 crates/corecrux-storage/src/lib.rs: replace != with == in toc_by_offset_ranges_by_block
 crates/corecrux-storage/src/lib.rs: replace % with / in encode_dir_run_v1
+crates/corecrux-storage/src/lib.rs: replace && with || in ShardStorage::open
 crates/corecrux-storage/src/lib.rs: replace && with || in append_head_record_to_blocks
 crates/corecrux-storage/src/lib.rs: replace && with || in merge_dir_extents_partition_sorted_unique_cpu
 crates/corecrux-storage/src/lib.rs: replace && with || in toc_lower_bound
@@ -435,10 +442,19 @@ crates/corecrux-storage/src/lib.rs: replace + with - in toc_stream_range
 crates/corecrux-storage/src/lib.rs: replace + with - in write_at_file
 crates/corecrux-storage/src/lib.rs: replace + with - in write_at_file
 crates/corecrux-storage/src/lib.rs: replace += with *= in ShardStorage::open
+crates/corecrux-storage/src/lib.rs: replace += with *= in ShardStorage::open
+crates/corecrux-storage/src/lib.rs: replace += with *= in ShardStorage::open
+crates/corecrux-storage/src/lib.rs: replace += with *= in build_trailer_stream_ranges
 crates/corecrux-storage/src/lib.rs: replace += with *= in merge_dir_extents_partition_sorted_unique_cpu
 crates/corecrux-storage/src/lib.rs: replace += with *= in merge_dir_extents_partition_sorted_unique_cpu
+crates/corecrux-storage/src/lib.rs: replace += with *= in merge_dir_extents_partition_sorted_unique_cpu
+crates/corecrux-storage/src/lib.rs: replace += with *= in merge_dir_extents_partition_sorted_unique_cpu
+crates/corecrux-storage/src/lib.rs: replace += with *= in merge_dir_extents_partition_sorted_unique_cpu
+crates/corecrux-storage/src/lib.rs: replace += with *= in select_stream_range_from_trailer_sorted
+crates/corecrux-storage/src/lib.rs: replace += with *= in write_at_file
 crates/corecrux-storage/src/lib.rs: replace - with + in encode_dir_run_v1
 crates/corecrux-storage/src/lib.rs: replace - with / in encode_dir_run_v1
+crates/corecrux-storage/src/lib.rs: replace -= with /= in find_last_valid_commit_frame
 crates/corecrux-storage/src/lib.rs: replace < with <= in ShardStorage::open
 crates/corecrux-storage/src/lib.rs: replace < with <= in decode_stored_event_from_frame_bytes
 crates/corecrux-storage/src/lib.rs: replace < with <= in find_last_valid_commit_frame
@@ -483,6 +499,7 @@ crates/corecrux-storage/src/lib.rs: replace < with > in toc_stream_range
 crates/corecrux-storage/src/lib.rs: replace < with > in toc_stream_range
 crates/corecrux-storage/src/lib.rs: replace <= with > in read_selected_frames_codec_none_from_entries
 crates/corecrux-storage/src/lib.rs: replace <= with > in toc_stream_range
+crates/corecrux-storage/src/lib.rs: replace == with != in IdemHotCache::evict_one
 crates/corecrux-storage/src/lib.rs: replace == with != in ShardStorage::open
 crates/corecrux-storage/src/lib.rs: replace == with != in add_selected_entries_stats
 crates/corecrux-storage/src/lib.rs: replace == with != in build_trailer_stream_ranges
@@ -499,6 +516,7 @@ crates/corecrux-storage/src/lib.rs: replace == with != in select_stream_tail_fro
 crates/corecrux-storage/src/lib.rs: replace == with != in select_stream_tail_from_trailer_sorted_from_seq_with_range
 crates/corecrux-storage/src/lib.rs: replace == with != in toc_by_offset_ranges_by_block
 crates/corecrux-storage/src/lib.rs: replace == with != in toc_lower_bound
+crates/corecrux-storage/src/lib.rs: replace > with < in IdemHotCache::insert
 crates/corecrux-storage/src/lib.rs: replace > with < in append_head_record_to_blocks
 crates/corecrux-storage/src/lib.rs: replace > with < in append_head_record_to_blocks
 crates/corecrux-storage/src/lib.rs: replace > with < in build_head_stream_tail_index
@@ -539,6 +557,7 @@ crates/corecrux-storage/src/lib.rs: replace >= with < in select_stream_tail_from
 crates/corecrux-storage/src/lib.rs: replace >= with < in select_stream_tail_from_trailer_sorted_from_seq_with_range
 crates/corecrux-storage/src/lib.rs: replace >= with < in toc_by_offset_ranges_by_block
 crates/corecrux-storage/src/lib.rs: replace >= with < in toc_by_offset_ranges_by_block
+crates/corecrux-storage/src/lib.rs: replace IdemHotCache::evict_one with ()
 crates/corecrux-storage/src/lib.rs: replace now_unix_ns -> u64 with 0
 crates/corecrux-storage/src/lib.rs: replace now_unix_ns -> u64 with 1
 crates/corecrux-storage/src/lib.rs: replace || with && in select_stream_tail_from_trailer_bloom

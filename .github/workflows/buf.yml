@@ -11,7 +11,7 @@ on:
 
 jobs:
   lint:
-    name: Lint & Breaking
+    name: Lint (advisory — flat proto layout)
     runs-on: [self-hosted, ci]
     # Proto files use flat directory layout (two packages in proto/).
     # buf lint enforces one-package-per-directory which we can't change
@@ -24,8 +24,21 @@ jobs:
         with:
           setup_only: true
       - run: buf lint proto/
+
+  # Split from lint (2026-07-19): breaking-change detection on the wire format
+  # was hidden under lint's continue-on-error, whose justification only covers
+  # the layout rule. A breaking proto change must be RED and visible (this
+  # workflow is not a required check, so red is informative, not merge-blocking).
+  breaking:
+    name: Breaking (wire format)
+    runs-on: [self-hosted, ci]
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
       - run: buf breaking proto/ --against 'https://github.com/CueCrux/Crux.git#branch=main,subdir=proto'
-        if: github.event_name == 'pull_request'
 
   push:
     name: Push to BSR

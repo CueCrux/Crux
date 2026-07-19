@@ -13,7 +13,9 @@ Each --outs directory is a cargo-mutants output dir containing caught.txt,
 missed.txt, timeout.txt, unviable.txt (one mutant per line, formatted
 "path:line:col: description").
 
-Mutant identity is normalised to "path: description" — line:col are stripped so
+Survivors are ratcheted as missed+timeout (a mutant drifting from missed to
+timeout must not look like progress). Mutant identity is normalised to
+"path: description" — line:col are stripped so
 unrelated edits do not churn the baseline. Identical mutations of the same kind
 inside one function (e.g. three `||`->`&&` in the same fn) collapse to one
 normalised string; we track multiplicity, and a survivor is "new" only when its
@@ -128,9 +130,11 @@ def main() -> int:
         return 1
 
     baseline = read_baseline(args.baseline)
-    missed = cats["missed"]
-    new = missed - baseline          # counts above baseline
-    fixed = baseline - missed        # baseline entries no longer missed
+    # A timeout is a survivor for ratchet purposes: a mutant that flips from
+    # missed to timing-out must not read as "greener" (codex review 2026-07-19).
+    survivors = cats["missed"] + cats["timeout"]
+    new = survivors - baseline       # counts above baseline
+    fixed = baseline - survivors     # baseline entries no longer surviving
 
     crates = sorted({crate_of(m) for c in cats.values() for m in c})
     lines = ["# Mutation report (trust core)", ""]
@@ -154,7 +158,7 @@ def main() -> int:
     lines.append("")
 
     if new:
-        lines.append(f"## ❌ {sum(new.values())} NEW survivor(s) vs baseline")
+        lines.append(f"## ❌ {sum(new.values())} NEW survivor(s) vs baseline (missed + timeout)")
         lines.append("")
         for m in sorted(new):
             lines.append(f"- `{m}` (x{new[m]})")
@@ -198,7 +202,7 @@ def main() -> int:
             fh.write("# cargo-mutants survivor baseline (normalised: path: description).\n")
             fh.write("# Regenerate: scripts/mutants-report.py --outs mutants.out "
                      "--baseline <this> --write-baseline <this>\n")
-            for m in sorted(missed.elements()):
+            for m in sorted(survivors.elements()):
                 fh.write(m + "\n")
 
     return 2 if new else 0
