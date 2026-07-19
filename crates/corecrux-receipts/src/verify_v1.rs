@@ -1476,7 +1476,7 @@ mod tests {
     }
 
     #[test]
-    fn recompute_flag_is_some_false_when_body_unparseable() {
+    fn recompute_flag_is_some_false_when_body_unparsable() {
         // Genuinely invalid CBOR → the parsed_body None branch. With recompute
         // requested the field must be Some(false), not defaulted to None.
         // Gotcha: an ASCII string like b"not cbor at all" can accidentally be

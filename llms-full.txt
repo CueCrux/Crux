@@ -3107,10 +3107,26 @@ This is the honest part. 86.97% is what an *accurate* gate over the
    its raw covered-region count.
 
 4. **Coverage measures execution, not assertion strength.** Region coverage
-   proves a line ran; it does not prove a test would catch a regression. The
-   non-blocking nightly [`mutants.yml`](../.github/workflows/mutants.yml) runs
-   `cargo-mutants` on the trust-core crates to surface assertion gaps that
-   coverage alone misses.
+   proves a line ran; it does not prove a test would catch a regression.
+   Mutation testing fills that gap on the trust-core crates
+   (`corecrux-receipts`, `corecrux-segment`, `corecrux-storage`):
+
+   - Nightly [`mutants.yml`](../.github/workflows/mutants.yml) runs
+     `cargo-mutants` sharded 8 ways, merges the shard reports into a
+     per-crate mutation-score table in the job summary, and **ratchets**
+     against [`mutants-baseline.txt`](../.github/mutants-baseline.txt):
+     a *new* survivor (a mutant no test kills that isn't in the baseline)
+     turns the nightly red; survivors that become caught are listed so the
+     baseline can be shrunk. Neither is a required PR check.
+   - PR-time [`mutants-diff.yml`](../.github/workflows/mutants-diff.yml)
+     runs `cargo mutants --in-diff` over the PR's changes to the trust-core
+     crates, so assertion-free new code is caught at review time in minutes
+     instead of overnight.
+   - To burn a survivor down: write a test that kills it, run
+     `cargo mutants --file <file> -p <crate> --timeout 120` to confirm, and
+     delete its line from the baseline. Only genuinely inert mutations
+     (logging, metrics) belong in the baseline long-term — prefer
+     `#[mutants::skip]` with a comment for those so the baseline shrinks.
 
 ## Maintaining the gate
 
