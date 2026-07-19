@@ -1,0 +1,103 @@
+# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
+# Licensed under the CueCrux Community Licence (CCL v1.0).
+#
+# PR-time incremental mutation testing for the trust-core crates.
+#
+# `cargo mutants --in-diff` mutates only code touched by the PR, so
+# assertion-free new code is caught at review time in minutes instead of by
+# the nightly sweep (mutants.yml). Survivors are ratcheted against
+# .github/mutants-baseline.txt via scripts/mutants-report.py, so pre-existing
+# baseline survivors whose lines merely moved do not fail a refactor PR —
+# only NEW survivors do.
+#
+# NOT a required check (path-filtered workflows cannot be required, and new
+# required checks need merge_group triggers — see the merge-queue rule).
+# ExecPlan: crux-mutation-testing-first-class-2026-07-19.
+name: Mutation (PR diff)
+
+on:
+  pull_request:
+    paths:
+      - "crates/corecrux-receipts/**"
+      - "crates/corecrux-segment/**"
+      - "crates/corecrux-storage/**"
+      - ".github/workflows/mutants-diff.yml"
+      - ".github/mutants-baseline.txt"
+      - "scripts/mutants-report.py"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutants-diff-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  in-diff:
+    name: cargo-mutants --in-diff
+    runs-on: [self-hosted, ci]
+    timeout-minutes: 60
+    env:
+      CARGO_HOME: /home/gha-runner/.cargo-mutants-diff-${{ github.run_id }}
+      CARGO_BUILD_JOBS: "4"
+    steps:
+      - name: Seed per-job CARGO_HOME from shared toolchain
+        run: |
+          mkdir -p "$CARGO_HOME/bin"
+          for tool in /home/gha-runner/.cargo/bin/*; do
+            [ -e "$tool" ] || continue
+            ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
+          done
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          # Pinned to match mutants.yml — mutants.out format may change between versions.
+          tool: cargo-mutants@27.1.0
+      - name: Mutate the PR diff
+        run: |
+          set -uo pipefail
+          git diff "origin/${{ github.base_ref }}...HEAD" > pr.diff
+          if [ ! -s pr.diff ]; then
+            echo "empty diff vs origin/${{ github.base_ref }} — nothing to mutate"
+            exit 0
+          fi
+          cargo mutants --in-diff pr.diff --timeout 120 \
+            -p corecrux-receipts -p corecrux-segment -p corecrux-storage
+          rc=$?
+          # 0 = clean, 2 = survivors (ratcheted below). Anything else is an
+          # infra/baseline failure and must be visible.
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then
+            echo "::error::cargo-mutants exited $rc (not a survivors result: 3=all-timeouts, 4=baseline failed, other=infra — see log)"
+            exit "$rc"
+          fi
+      - name: Ratchet survivors against baseline
+        run: |
+          set -uo pipefail
+          if [ ! -d mutants.out ]; then
+            echo "no mutants.out — diff produced no mutants in scope"
+            exit 0
+          fi
+          python3 scripts/mutants-report.py \
+            --outs mutants.out \
+            --baseline .github/mutants-baseline.txt \
+            --summary "$GITHUB_STEP_SUMMARY"
+          rc=$?
+          if [ "$rc" -eq 2 ]; then
+            echo "::error::this PR introduces mutation survivors — new code has assertion gaps (see job summary). Kill each survivor with a test; only genuinely inert mutations belong in .github/mutants-baseline.txt (prefer #[mutants::skip] with a comment)."
+          fi
+          exit "$rc"
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutants-diff-report
+          path: mutants.out/
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Reclaim per-job CARGO_HOME
+        if: always()
+        run: rm -rf "$CARGO_HOME"
