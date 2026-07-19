@@ -1344,7 +1344,12 @@ fn parse_body_fields(body_bytes: &[u8]) -> Option<BodyFields> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::format_collect,
+    clippy::borrow_as_ptr
+)]
 mod tests {
     use super::*;
     use ed25519_dalek::VerifyingKey;
@@ -1674,5 +1679,455 @@ mod tests {
             &vk,
             &root_hex
         ));
+    }
+
+    // --- Mutation-killing coverage for the tamper-evidence trust core. ---
+
+    fn witness_proof(head_hash: &str, entry_body_b64: &str, leaf_hash: &str) -> WitnessProofV1 {
+        WitnessProofV1 {
+            transparency_log: "rekor".to_string(),
+            log_url: "https://rekor.example".to_string(),
+            rekor_uuid: None,
+            leaf_hash: leaf_hash.to_string(),
+            log_index: 0,
+            tree_size: 1,
+            root_hash: String::new(),
+            inclusion_proof: Vec::new(),
+            checkpoint: None,
+            integrated_time: "0".to_string(),
+            head_hash: head_hash.to_string(),
+            entry_body_b64: entry_body_b64.to_string(),
+        }
+    }
+
+    #[test]
+    fn witness_binding_requires_both_head_and_entry_body() {
+        use base64::Engine as _;
+        let head = [0x11u8; 32];
+        let head_hex = hex_lower(&head);
+        // The hashedrekord artifact digest that a bound entry must commit to.
+        let artifact_digest = hex_lower(&Sha256::digest(head));
+        let entry_body = format!("{{\"spec\":{{\"data\":{{\"hash\":{{\"value\":\"sha256:{artifact_digest}\"}}}}}}}}");
+        let entry_b64 = base64::engine::general_purpose::STANDARD.encode(entry_body.as_bytes());
+        let leaf = {
+            let mut h = Sha256::new();
+            h.update([0x00]);
+            h.update(entry_body.as_bytes());
+            hex_lower(&h.finalize())
+        };
+
+        // A fully bound proof verifies.
+        assert!(verify_witness_binding_v1(&witness_proof(&head_hex, &entry_b64, &leaf)));
+        // Legacy/synthetic proof with no binding material at all is accepted.
+        assert!(verify_witness_binding_v1(&witness_proof("", "", "")));
+        // Exactly one side present is inconsistent and MUST be rejected: the
+        // both-empty early return uses `&&`, and a follow-up `||` guard rejects
+        // any half-populated proof. Weakening either connective wrongly accepts.
+        assert!(!verify_witness_binding_v1(&witness_proof(&head_hex, "", &leaf)));
+        assert!(!verify_witness_binding_v1(&witness_proof("", &entry_b64, &leaf)));
+        // Tampered head (artifact digest no longer commits to it) is rejected.
+        let wrong_head = hex_lower(&[0x22u8; 32]);
+        assert!(!verify_witness_binding_v1(&witness_proof(
+            &wrong_head,
+            &entry_b64,
+            &leaf
+        )));
+        // Tampered entry body (leaf no longer matches) is rejected.
+        let tampered_b64 = base64::engine::general_purpose::STANDARD.encode(b"not-the-entry-body");
+        assert!(!verify_witness_binding_v1(&witness_proof(
+            &head_hex,
+            &tampered_b64,
+            &leaf
+        )));
+    }
+
+    // RFC6962 reference Merkle tree (MTH / PATH), independent of the verifier
+    // under test, used to assert the verifier accepts genuine proofs and
+    // rejects tampered ones across tree shapes and leaf positions.
+    fn split_point(n: usize) -> usize {
+        let mut k = 1usize;
+        while k << 1 < n {
+            k <<= 1;
+        }
+        k
+    }
+
+    fn mth(leaves: &[[u8; 32]]) -> [u8; 32] {
+        if leaves.len() == 1 {
+            return leaves[0];
+        }
+        let k = split_point(leaves.len());
+        rfc6962_node_hash(&mth(&leaves[..k]), &mth(&leaves[k..]))
+    }
+
+    fn audit_path(m: usize, leaves: &[[u8; 32]]) -> Vec<[u8; 32]> {
+        if leaves.len() == 1 {
+            return Vec::new();
+        }
+        let k = split_point(leaves.len());
+        if m < k {
+            let mut path = audit_path(m, &leaves[..k]);
+            path.push(mth(&leaves[k..]));
+            path
+        } else {
+            let mut path = audit_path(m - k, &leaves[k..]);
+            path.push(mth(&leaves[..k]));
+            path
+        }
+    }
+
+    #[test]
+    fn rfc6962_inclusion_proof_matches_reference_for_all_positions() {
+        // Exercise every leaf position across power-of-two and ragged trees so
+        // the audit-path walk (index parity, rightmost-node handling, the
+        // `>>=` descent, and the final `sn == 0` root gate) is fully driven.
+        for size in 1usize..=9 {
+            let leaves: Vec<[u8; 32]> = (0..size)
+                .map(|i| rfc6962_leaf_hash(format!("leaf-{i}").as_bytes()))
+                .collect();
+            let root = mth(&leaves);
+            let root_hex = hex_lower(&root);
+            for idx in 0..size {
+                let path: Vec<String> = audit_path(idx, &leaves).iter().map(|h| hex_lower(h)).collect();
+                assert!(
+                    verify_rfc6962_inclusion_proof_v1(
+                        &hex_lower(&leaves[idx]),
+                        idx as u64,
+                        size as u64,
+                        &root_hex,
+                        &path
+                    ),
+                    "size={size} idx={idx}: genuine proof must verify"
+                );
+                // A tampered signed-tree-head root is rejected.
+                let mut bad_root = root;
+                bad_root[0] ^= 0xff;
+                assert!(
+                    !verify_rfc6962_inclusion_proof_v1(
+                        &hex_lower(&leaves[idx]),
+                        idx as u64,
+                        size as u64,
+                        &hex_lower(&bad_root),
+                        &path
+                    ),
+                    "size={size} idx={idx}: tampered root must be rejected"
+                );
+                // Corrupting any audit-path sibling is rejected.
+                let mut siblings = audit_path(idx, &leaves);
+                if !siblings.is_empty() {
+                    siblings[0][0] ^= 0xff;
+                    let bad_path: Vec<String> = siblings.iter().map(|h| hex_lower(h)).collect();
+                    assert!(
+                        !verify_rfc6962_inclusion_proof_v1(
+                            &hex_lower(&leaves[idx]),
+                            idx as u64,
+                            size as u64,
+                            &root_hex,
+                            &bad_path
+                        ),
+                        "size={size} idx={idx}: tampered sibling must be rejected"
+                    );
+                }
+            }
+        }
+
+        // Out-of-range index in a single-leaf tree: the bounds guard must
+        // reject even though leaf == root and the proof is empty (the size-1
+        // short-circuit would otherwise wrongly accept).
+        let solo = rfc6962_leaf_hash(b"solo");
+        let solo_hex = hex_lower(&solo);
+        assert!(verify_rfc6962_inclusion_proof_v1(&solo_hex, 0, 1, &solo_hex, &[]));
+        assert!(!verify_rfc6962_inclusion_proof_v1(&solo_hex, 1, 1, &solo_hex, &[]));
+        // Index equal to tree_size in a larger tree is also out of range.
+        let two = [rfc6962_leaf_hash(b"a"), rfc6962_leaf_hash(b"b")];
+        let two_root = hex_lower(&mth(&two));
+        assert!(!verify_rfc6962_inclusion_proof_v1(
+            &hex_lower(&two[0]),
+            2,
+            2,
+            &two_root,
+            &[hex_lower(&two[1])]
+        ));
+    }
+
+    #[test]
+    fn checkpoint_split_returns_signed_text_and_signature_block() {
+        use base64::Engine as _;
+        let root = [0xAB_u8; 32];
+        let root_b64 = base64::engine::general_purpose::STANDARD.encode(root);
+        let root_hex: String = root.iter().map(|b| format!("{b:02x}")).collect();
+        let text = format!("rekor.example\n42\n{root_b64}\n");
+        let sig_block = "\u{2014} rekor.example AAAABBBBCCCCDDDD\n";
+        let checkpoint = format!("{text}\n{sig_block}");
+
+        let (got_text, got_sig) =
+            checkpoint_text_if_root_matches(&checkpoint, &root_hex).expect("root commits, split succeeds");
+        // The signed text is exactly the note bytes the signature covers, and
+        // the signature block starts precisely after the "\n\n" separator.
+        assert_eq!(got_text, text);
+        assert_eq!(got_sig, sig_block);
+        // A mismatched expected root yields no split.
+        assert!(checkpoint_text_if_root_matches(&checkpoint, &"cd".repeat(32)).is_none());
+    }
+
+    #[test]
+    fn note_signature_payload_requires_bytes_beyond_key_hash() {
+        use base64::Engine as _;
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        // Exactly the 4-byte key-hash prefix with no signature bytes: rejected
+        // (a payload must have strictly more than 4 bytes).
+        let only_keyhash = format!("\u{2014} rekor.example {}", b64(&[0u8; 4]));
+        assert_eq!(note_signature_payload(&only_keyhash), None);
+        // Key hash plus one signature byte: the payload is the bytes after the
+        // 4-byte prefix.
+        let with_sig = format!("\u{2014} rekor.example {}", b64(&[1, 2, 3, 4, 42]));
+        assert_eq!(note_signature_payload(&with_sig), Some(vec![42]));
+    }
+
+    // Minimal DER TLV (short-form lengths only) for hand-building a TSTInfo.
+    fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+        assert!(content.len() < 128, "helper only encodes short-form DER lengths");
+        let mut v = vec![tag, content.len() as u8];
+        v.extend_from_slice(content);
+        v
+    }
+
+    fn minimal_tstinfo_der(full_message_imprint: bool) -> Vec<u8> {
+        // messageImprint hashAlgorithm ::= SEQUENCE { OID sha256 }
+        let sha256_oid = der_tlv(0x06, &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01]);
+        let alg_seq = der_tlv(0x30, &sha256_oid);
+        let mut imprint_content = alg_seq;
+        if full_message_imprint {
+            // hashedMessage ::= OCTET STRING (32 bytes for sha256)
+            imprint_content.extend(der_tlv(0x04, &[0u8; 32]));
+        }
+        let imprint = der_tlv(0x30, &imprint_content);
+        let version = der_tlv(0x02, &[0x01]);
+        let policy = der_tlv(0x06, &[0x2a, 0x03, 0x04]); // OID 1.2.3.4
+        let serial = der_tlv(0x02, &[0x01]);
+        let gen_time = der_tlv(0x18, b"20260614102328Z");
+        let mut body = Vec::new();
+        for part in [version, policy, imprint, serial, gen_time] {
+            body.extend(part);
+        }
+        der_tlv(0x30, &body)
+    }
+
+    #[test]
+    fn parse_tst_info_accepts_minimal_five_field_structure() {
+        // A valid TSTInfo with exactly the five required fields must parse; the
+        // arity guard is strictly `fields.len() < 5`, so a five-field structure
+        // has to be accepted (not rejected via `==`/`<=`).
+        let parsed = parse_tst_info_v1(&minimal_tstinfo_der(true)).expect("minimal 5-field TSTInfo parses");
+        assert_eq!(parsed.version, 1);
+        assert_eq!(parsed.policy_oid, "1.2.3.4");
+        assert_eq!(parsed.message_imprint_alg_oid, "2.16.840.1.101.3.4.2.1");
+        assert_eq!(parsed.message_imprint_hash, vec![0u8; 32]);
+        assert!(parsed.nonce.is_none());
+        // A messageImprint carrying only its hashAlgorithm (no hashedMessage)
+        // has fewer than two fields and must be rejected.
+        assert!(parse_tst_info_v1(&minimal_tstinfo_der(false)).is_err());
+    }
+
+    #[test]
+    fn wrap_generalized_time_der_uses_correct_length_encoding() {
+        // Short form (< 128 bytes): a single length byte.
+        let mut expected = vec![0x18u8, 0x0f];
+        expected.extend_from_slice(b"20260614102328Z");
+        assert_eq!(wrap_generalized_time_der(b"20260614102328Z").unwrap(), expected);
+        // Exactly 128 bytes crosses into the long form 0x81 <len>; the guard is
+        // `< 128` then `<= 255`, so 128 must NOT be short-form encoded.
+        let content = vec![b'0'; 128];
+        let wrapped = wrap_generalized_time_der(&content).unwrap();
+        assert_eq!(&wrapped[..3], &[0x18, 0x81, 0x80]);
+        assert_eq!(wrapped.len(), 3 + 128);
+        // Over 255 bytes is rejected outright.
+        assert!(wrap_generalized_time_der(&vec![b'0'; 256]).is_err());
+    }
+
+    #[test]
+    fn generalized_time_formats_zulu_and_passes_through_others() {
+        assert_eq!(generalized_time_to_rfc3339(b"20260614102328Z"), "2026-06-14T10:23:28Z");
+        // 15 bytes but not 'Z'-terminated: the `&&` guard must fall through to
+        // verbatim passthrough rather than reformatting non-Zulu input.
+        assert_eq!(generalized_time_to_rfc3339(b"20260614102328+"), "20260614102328+");
+        // A different length passes through untouched.
+        assert_eq!(generalized_time_to_rfc3339(b"2026"), "2026");
+    }
+
+    #[test]
+    fn cert_matches_signer_by_subject_key_identifier() {
+        use cms::cert::x509::der::asn1::OctetString;
+        // rcgen writes a SubjectKeyIdentifier extension for ExplicitNoCa leaves.
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["ski-signer".to_string()]).unwrap();
+        params.is_ca = rcgen::IsCa::ExplicitNoCa;
+        params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2040, 1, 1);
+        let cert = params.self_signed(&key).unwrap();
+        let der = cert.der().as_ref().to_vec();
+        let cms_cert = CmsCertificate::from_der(&der).unwrap();
+        let (_critical, cert_ski) = cms_cert
+            .tbs_certificate()
+            .get_extension::<SubjectKeyIdentifier>()
+            .unwrap()
+            .expect("rcgen leaf carries a SubjectKeyIdentifier");
+
+        // A SignerIdentifier built from the certificate's own SKI matches.
+        let sid_match = SignerIdentifier::SubjectKeyIdentifier(cert_ski.clone());
+        assert!(cert_matches_signer_v1(&cms_cert, &sid_match));
+        // A single flipped SKI byte must NOT match (fail-closed identity check).
+        let mut bad = cert_ski.0.as_bytes().to_vec();
+        bad[0] ^= 0xff;
+        let sid_bad = SignerIdentifier::SubjectKeyIdentifier(SubjectKeyIdentifier(OctetString::new(bad).unwrap()));
+        assert!(!cert_matches_signer_v1(&cms_cert, &sid_bad));
+    }
+
+    fn gen_self_signed_der(alg: &'static rcgen::SignatureAlgorithm) -> Vec<u8> {
+        let key = rcgen::KeyPair::generate_for(alg).unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["ring-alg".to_string()]).unwrap();
+        params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2040, 1, 1);
+        params.self_signed(&key).unwrap().der().as_ref().to_vec()
+    }
+
+    #[test]
+    fn ring_alg_selects_curve_by_pubkey_length() {
+        let p256_der = gen_self_signed_der(&rcgen::PKCS_ECDSA_P256_SHA256);
+        let p384_der = gen_self_signed_der(&rcgen::PKCS_ECDSA_P384_SHA384);
+        let (_, p256) = X509Certificate::from_der(&p256_der).unwrap();
+        let (_, p384) = X509Certificate::from_der(&p384_der).unwrap();
+        // Uncompressed EC points: P-256 = 65 bytes, P-384 = 97 bytes; both sit
+        // on the same side of the 80-byte curve-selection threshold as their
+        // curve demands.
+        assert_eq!(p256.public_key().subject_public_key.data.len(), 65);
+        assert_eq!(p384.public_key().subject_public_key.data.len(), 97);
+
+        let sha256_oid = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
+        let sha384_oid = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.3");
+        assert!(std::ptr::addr_eq(
+            ring_alg_for_signature_v1(sha256_oid, &p256).unwrap(),
+            &signature::ECDSA_P256_SHA256_ASN1,
+        ));
+        assert!(std::ptr::addr_eq(
+            ring_alg_for_signature_v1(sha256_oid, &p384).unwrap(),
+            &signature::ECDSA_P384_SHA256_ASN1,
+        ));
+        assert!(std::ptr::addr_eq(
+            ring_alg_for_signature_v1(sha384_oid, &p256).unwrap(),
+            &signature::ECDSA_P256_SHA384_ASN1,
+        ));
+        assert!(std::ptr::addr_eq(
+            ring_alg_for_signature_v1(sha384_oid, &p384).unwrap(),
+            &signature::ECDSA_P384_SHA384_ASN1,
+        ));
+    }
+
+    #[test]
+    fn tsa_chain_requires_name_and_signature_to_agree() {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, PKCS_ECDSA_P256_SHA256};
+        fn validity(p: &mut CertificateParams) {
+            p.not_before = rcgen::date_time_ymd(2020, 1, 1);
+            p.not_after = rcgen::date_time_ymd(2040, 1, 1);
+        }
+
+        // Trusted root CN=ChainRoot.
+        let root_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut root_params = CertificateParams::new(vec!["chain-root".to_string()]).unwrap();
+        root_params.distinguished_name.push(DnType::CommonName, "ChainRoot");
+        root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        validity(&mut root_params);
+        let root_cert = root_params.self_signed(&root_key).unwrap();
+        let root_der = root_cert.der().as_ref().to_vec();
+        let root_issuer = Issuer::new(root_params, root_key);
+
+        // Leaf genuinely signed by the trusted root.
+        let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut leaf_params = CertificateParams::new(vec!["chain-leaf".to_string()]).unwrap();
+        leaf_params.distinguished_name.push(DnType::CommonName, "ChainLeaf");
+        validity(&mut leaf_params);
+        let leaf_der = leaf_params
+            .signed_by(&leaf_key, &root_issuer)
+            .unwrap()
+            .der()
+            .as_ref()
+            .to_vec();
+
+        // A decoy-CA issuer that is never trusted and never a chain candidate.
+        let decoy_ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut decoy_ca_params = CertificateParams::new(vec!["decoy-ca".to_string()]).unwrap();
+        decoy_ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "DecoyIssuer");
+        decoy_ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        validity(&mut decoy_ca_params);
+        let decoy_ca_issuer = Issuer::new(decoy_ca_params, decoy_ca_key);
+
+        // The decoy shares the root's subject DN (CN=ChainRoot) so it collides
+        // on NAME with the leaf's issuer, but it is signed by the decoy CA, so
+        // the leaf's signature does NOT verify under the decoy's key — and the
+        // decoy dead-ends (its own issuer is absent). A validator that requires
+        // BOTH name match AND a valid signature skips the decoy and reaches the
+        // real root; one that accepts on name alone follows the decoy and fails.
+        let decoy_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut decoy_params = CertificateParams::new(vec!["decoy".to_string()]).unwrap();
+        decoy_params.distinguished_name.push(DnType::CommonName, "ChainRoot");
+        validity(&mut decoy_params);
+        let decoy_der = decoy_params
+            .signed_by(&decoy_key, &decoy_ca_issuer)
+            .unwrap()
+            .der()
+            .as_ref()
+            .to_vec();
+
+        let gen_time = x509_parser::time::ASN1Time::from_timestamp(1_750_000_000).unwrap();
+        // Candidate order places the name-colliding decoy before the real root.
+        let candidates = vec![leaf_der.clone(), decoy_der];
+        let roots = vec![root_der];
+        assert!(
+            validate_tsa_chain_v1(&leaf_der, &candidates, &roots, gen_time).is_ok(),
+            "leaf must chain to the trusted root despite the name-collision decoy"
+        );
+    }
+
+    #[test]
+    fn digest_for_oid_selects_by_algorithm() {
+        let msg = b"corecrux";
+        assert_eq!(
+            digest_for_oid(rfc5912::ID_SHA_256, msg),
+            Some(Sha256::digest(msg).to_vec())
+        );
+        assert_eq!(digest_for_oid(rfc5912::ID_SHA_256, msg).unwrap().len(), 32);
+        assert_eq!(digest_for_oid(rfc5912::ID_SHA_384, msg).unwrap().len(), 48);
+        assert_eq!(digest_for_oid(rfc5912::ID_SHA_512, msg).unwrap().len(), 64);
+        // Unsupported digest OID fails closed.
+        assert!(digest_for_oid(ObjectIdentifier::new_unwrap("1.2.3.4"), msg).is_none());
+    }
+
+    #[test]
+    fn alg_name_and_digest_len_cover_all_sha2_variants() {
+        assert_eq!(alg_name_for_digest_oid_str("2.16.840.1.101.3.4.2.1"), Some("sha256"));
+        assert_eq!(alg_name_for_digest_oid_str("2.16.840.1.101.3.4.2.2"), Some("sha384"));
+        assert_eq!(alg_name_for_digest_oid_str("2.16.840.1.101.3.4.2.3"), Some("sha512"));
+        assert_eq!(alg_name_for_digest_oid_str("1.2.3.4"), None);
+
+        assert_eq!(digest_len_for_alg("sha256"), Some(32));
+        assert_eq!(digest_len_for_alg("sha384"), Some(48));
+        assert_eq!(digest_len_for_alg("sha512"), Some(64));
+        assert_eq!(digest_len_for_alg("SHA512"), Some(64)); // case-insensitive
+        assert_eq!(digest_len_for_alg("md5"), None);
+    }
+
+    #[test]
+    fn trim_unsigned_integer_strips_only_leading_zeros_keeping_one_byte() {
+        assert_eq!(trim_unsigned_integer(&[0x00, 0x00, 0x05]), &[0x05u8][..]);
+        assert_eq!(trim_unsigned_integer(&[0x05]), &[0x05u8][..]);
+        // A lone zero stays a single zero and is never emptied.
+        assert_eq!(trim_unsigned_integer(&[0x00]), &[0x00u8][..]);
+        assert_eq!(trim_unsigned_integer(&[0x00, 0x00]), &[0x00u8][..]);
+        // A leading non-zero byte is preserved even with trailing zeros.
+        assert_eq!(trim_unsigned_integer(&[0x01, 0x00]), &[0x01u8, 0x00][..]);
+        // A leading non-zero never triggers stripping.
+        assert_eq!(trim_unsigned_integer(&[0x01, 0x02]), &[0x01u8, 0x02][..]);
     }
 }

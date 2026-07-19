@@ -313,3 +313,94 @@ fn get_val_one<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
     }
     None
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn one_candidate() -> CandidateV1 {
+        CandidateV1 {
+            chunk_id: "c1".to_string(),
+            sparse_score: Some(1.0),
+            lane_scores: std::collections::BTreeMap::new(),
+            fusion_score: None,
+            priors_score: None,
+            anchor_score: None,
+            rerank_score: None,
+        }
+    }
+
+    // ── parse_lanes_used ────────────────────────────────────────────
+
+    #[test]
+    fn parse_lanes_used_accepts_bare_text_entries() {
+        // The `Value::Text(s)` arm must collect bare-string lane keys; without
+        // it `lanes` stays empty and parsing fails closed.
+        let trace = vec![(
+            Value::Text("lanes_used".to_string()),
+            Value::Array(vec![
+                Value::Text("dense".to_string()),
+                Value::Text("sparse".to_string()),
+            ]),
+        )];
+        assert_eq!(
+            parse_lanes_used(&trace).unwrap(),
+            vec!["dense".to_string(), "sparse".to_string()]
+        );
+    }
+
+    // ── compute_candidate_digest_bytes_v1: lane-count guard ─────────
+
+    #[test]
+    fn lane_overflow_boundary_at_27_is_accepted() {
+        // Exactly 27 unique lanes is the widest accepted layout. Pins `> 27`
+        // against both `>= 27` and `== 27` (either would reject 27).
+        let lanes: Vec<String> = (0..27).map(|i| format!("lane{i}")).collect();
+        assert!(compute_candidate_digest_bytes_v1(&lanes, &[one_candidate()]).is_ok());
+    }
+
+    #[test]
+    fn lane_overflow_at_28_is_rejected() {
+        // 28 lanes must overflow; pins `> 27` against `== 27` (which accepts 28).
+        let lanes: Vec<String> = (0..28).map(|i| format!("lane{i}")).collect();
+        let err = compute_candidate_digest_bytes_v1(&lanes, &[one_candidate()]).unwrap_err();
+        assert!(err.starts_with("candidate_digest_lane_overflow:"), "got {err}");
+    }
+
+    // ── parse_digest_bytes ──────────────────────────────────────────
+
+    #[test]
+    fn parse_digest_bytes_accepts_32_raw_bytes() {
+        // Pins the `Value::Bytes(b)` arm and its `len != 32` length guard.
+        let v = Value::Bytes(vec![7u8; 32]);
+        assert_eq!(parse_digest_bytes(&v), Some([7u8; 32]));
+    }
+
+    #[test]
+    fn parse_digest_bytes_rejects_wrong_length() {
+        // `!= 32` (not `== 32`): a 31-byte blob is not a digest.
+        assert_eq!(parse_digest_bytes(&Value::Bytes(vec![7u8; 31])), None);
+    }
+
+    // ── from_hex / parse_digest_hex_string ──────────────────────────
+
+    #[test]
+    fn from_hex_decodes_uppercase_hex_to_exact_bytes() {
+        // Uppercase A-F arm plus its `b - b'A' + 10` arithmetic must decode to
+        // the exact byte. `AB` -> (0xA<<4)|0xB == 0xAB; `CD` -> 0xCD.
+        let hex: String = "AB".repeat(32); // 64 chars, uppercase
+        assert_eq!(parse_digest_hex_string(&hex), Some([0xABu8; 32]));
+        let prefixed = format!("blake3:hex:{}", "CD".repeat(32));
+        assert_eq!(parse_digest_hex_string(&prefixed), Some([0xCDu8; 32]));
+    }
+
+    // ── val_to_f64_opt ──────────────────────────────────────────────
+
+    #[test]
+    fn val_to_f64_opt_converts_integer() {
+        // Pins the `Value::Integer(i)` arm (deleting it would drop integer scores).
+        assert_eq!(val_to_f64_opt(&Value::Integer(5.into())), Some(5.0));
+        assert_eq!(val_to_f64_opt(&Value::Integer((-3).into())), Some(-3.0));
+    }
+}
