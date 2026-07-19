@@ -91,6 +91,33 @@ Phase 2 — burn down and expand:
 9. **Expand scope** crate-by-crate (candidate next: `corecrux-memory`, retrieval
    fusion) only after the trust-core score is ≥90% and gated.
 
+## Root cause of the kill window (resolved 2026-07-19, session 2)
+
+Diagnosed on runner-hel1 (62G RAM, 8G swap, 6 runner slots + caddy-hooks):
+
+- `journalctl`: `cargo-mutants invoked oom-killer` at 09:42:51Z on 2026-07-18;
+  the runner reported `Job cargo-mutants … completed with result: Canceled` 18s
+  later. One OOM event **every day** in the 09:20–10:30 UTC window since at
+  least 07-10 (victims vary: cargo-mutants, `.NET` runner workers, test
+  binaries) — the morning eval-job burst pushes the shared host into memory
+  pressure, and the long-running mutants job (highest OOM score) was the usual
+  casualty. Not a cron/timer: `gha-cargo-reaper` (hourly) only removes
+  `.cargo-*` dirs older than 180 min and never matched mutants dirs.
+- Because the job died without running its cleanup step, ~21 `.cargo-mutants-*`
+  CARGO_HOME dirs (~188M each) had leaked into /home/gha-runner.
+
+Host changes applied (reversible):
+- Deleted the 21 leaked `.cargo-mutants-*` dirs (age-guarded `-mmin +360`).
+- Extended `/usr/local/bin/gha-cargo-reaper.sh` to also reap
+  `.cargo-mutants-*` / `.cargo-mutants-diff-*` (backup:
+  `gha-cargo-reaper.sh.bak-2026-07-19`; revert = restore the backup).
+
+Still open for the operator: the *fleet-wide* morning memory crunch also
+OOM-kills other jobs (`.NET` workers on 07-12/07-17, test binaries on
+07-15/07-16) and mass-cancels eval jobs (~09:50Z). Options: stagger the eval
+crons, add per-slot systemd `MemoryHigh=` limits, or add swap. Left as an
+operator decision — it touches other teams' workflows.
+
 ## Verification pointers
 
 - Run list: `gh run list --workflow=mutants.yml`
