@@ -2417,9 +2417,14 @@
     if (!api || typeof api.get !== 'function') { return Promise.resolve({ ok: false, status: 0, data: null }); }
     return api.get(url)
       .then(function (r) {
+        // Session gate (oauth2-proxy) bounces an unauthenticated read with a 302
+        // to /oauth2/sign_in; the browser follows it, so we land on the login
+        // page as a "200" HTML body (r.redirected true, r.url the gate). Flag it
+        // so the shell surfaces a signed-out state instead of a null-data panel.
+        var authRequired = !!(r.redirected && /\/oauth2\//.test(r.url));
         return r.json().then(
-          function (data) { return { ok: r.ok, status: r.status, data: data }; },
-          function () { return { ok: r.ok, status: r.status, data: null }; }
+          function (data) { return { ok: r.ok, status: r.status, data: data, authRequired: authRequired }; },
+          function () { return { ok: r.ok, status: r.status, data: null, authRequired: authRequired }; }
         );
       })
       .catch(function () { return { ok: false, status: 0, data: null }; });
@@ -2471,6 +2476,24 @@
     document.getElementById('healthText').textContent = text;
   }
 
+  // Session expired: oauth2-proxy is bouncing every /v1 read to its sign-in page
+  // (see fetchJSON's authRequired). Rather than a silent "Degraded" pill over
+  // empty panels, show a fixed banner with a one-click return through the gate —
+  // rd brings the operator back to this exact view after signing in.
+  // ponytail: detected once at boot (the gate is origin-wide, so the summary read
+  // is a faithful oracle); a mid-session expiry isn't caught until the next load —
+  // add per-read detection only if that proves common in practice.
+  function showAuthBanner() {
+    if (document.getElementById('authBanner')) { return; }
+    var bar = el('div', { id: 'authBanner', role: 'alert' });
+    bar.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;display:flex;gap:12px;align-items:center;justify-content:center;padding:10px 16px;background:var(--crit);color:#fff;font:600 14px/1.4 system-ui,-apple-system,sans-serif';
+    bar.appendChild(el('span', { text: 'Your session has expired — the console is showing no live data.' }));
+    var a = el('a', { href: '/oauth2/sign_in?rd=' + encodeURIComponent(location.href), text: 'Sign in' });
+    a.style.cssText = 'color:#fff;font-weight:800;text-decoration:underline;white-space:nowrap';
+    bar.appendChild(a);
+    document.body.appendChild(bar);
+  }
+
   // ---- Status pill (top-right) -------------------------------------------
   // No address / node-id in the text — origin + node id now live on the System
   // destination. States: Connected · Local (auth 'off') / Connected · Platform
@@ -2479,7 +2502,8 @@
   function setStatusPill() {
     var authMode = get(BOOT.summary, ['daemon', 'auth_mode']);
     var kind, text;
-    if (BOOT.health === 'down') { kind = 'down'; text = 'Offline'; }
+    if (BOOT.health === 'auth') { kind = 'down'; text = 'Signed out'; }
+    else if (BOOT.health === 'down') { kind = 'down'; text = 'Offline'; }
     else if (BOOT.health === 'degraded') { kind = 'degraded'; text = 'Degraded'; }
     else { kind = 'ok'; text = 'Connected · ' + (authMode === 'off' ? 'Local' : 'Platform'); }
     if (POSTURE === 'customer') { text += ' · read-only'; }
@@ -2894,7 +2918,14 @@
         if (ver && ver.data) { BOOT.version = ver.data; }
         if (sum && sum.ok && sum.data) { BOOT.summary = sum.data; }
         var reachable = (ver && ver.status !== 0) || (sum && sum.status !== 0);
-        if (!reachable) {
+        // Origin-wide session gate: if the summary read was bounced to sign-in
+        // (or hard 401/403), the operator is signed out — every /v1 read is dead,
+        // so surface it as an actionable signed-out state, not a silent Degraded.
+        var signedOut = !!(sum && (sum.authRequired || sum.status === 401 || sum.status === 403));
+        if (signedOut) {
+          BOOT.health = 'auth';
+          showAuthBanner();
+        } else if (!reachable) {
           BOOT.health = 'down';
         } else if (BOOT.summary) {
           BOOT.health = 'ok';
@@ -2992,7 +3023,7 @@
 <script>
 (function () {
   'use strict';
-  var SW_REV = 'ushell-v2-r6';   // keep in lock-step with /console-v2/sw.js
+  var SW_REV = 'ushell-v2-r7';   // keep in lock-step with /console-v2/sw.js
   if (!('serviceWorker' in navigator)) { return; }
   // Dev bypass — when the daemon serves this shell from CORECRUXD_CONSOLE_DEV_PATH
   // it stamps window.__CRUX_CONSOLE_DEV__ (see console.rs inject_console_dev_flag).
