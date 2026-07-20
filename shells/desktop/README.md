@@ -1,159 +1,319 @@
 # Crux desktop shell
 
-A native desktop wrapper around the Crux console. It is a **thin webview over a
-bundled `corecruxd` sidecar** — the app spawns the daemon on a loopback port with
-auth off, waits for it to become healthy, then loads
-`http://127.0.0.1:<port>/console` in a native window. On quit it shuts the daemon
-down; no orphan daemon survives the shell.
+The Crux desktop shell is a Tauri v2 connection manager for the existing web
+console. A named profile either starts the bundled `corecruxd` sidecar or
+attaches to a daemon that is already running. The shell remains in-tree and is
+workspace-excluded per OD-31; it does not add a second console implementation.
 
-This is the **desktop shell (M6)** of the unified-shell console work,
-housed **in-tree, workspace-excluded** per decision **OD-31**.
+Milestone M1 implements both lifecycle modes and resolves OD-42 by reusing the
+daemon's existing static agent-token bearer authentication for attach profiles.
+It does not add a daemon authentication mechanism. The token is resolved by
+native Rust through the operating-system credential client and injected by a
+shell-owned loopback proxy. It is never placed in profile JSON, a URL, web
+storage, page JavaScript, a Tauri command, or an operator-facing error.
 
 ## Architecture
 
-```
-┌─────────────────────── Crux.app (Tauri v2) ───────────────────────┐
-│                                                                    │
-│  src/main.rs                                                       │
-│    ├─ resolve app-data dir + bundled corecruxd (externalBin)       │
-│    ├─ crux-shell-lifecycle::spawn_sidecar()                        │
-│    │      env: CORECRUXD_AUTH_MODE=off                             │
-│    │           CORECRUXD_HTTP_PORT=<free loopback port>            │
-│    │           CORECRUXD_DATA_DIR=<per-user app data>              │
-│    │           CORECRUXD_CONSOLE_V2=1                              │
-│    ├─ wait_for_health()  →  GET /healthz == 200                    │
-│    └─ WebviewWindow → http://127.0.0.1:<port>/console             │
-│                                   │                                │
-│                                   ▼                                │
-│                         ┌──────────────────┐                       │
-│                         │  corecruxd        │  (child process,     │
-│                         │  127.0.0.1:<port> │   loopback only)     │
-│                         └──────────────────┘                       │
-│  on close / exit → SidecarHandle::shutdown() (Drop = backstop)     │
-└────────────────────────────────────────────────────────────────────┘
+```text
+                                  attach profile
+                           +---------------------------+
+                           | existing corecruxd        |
+                           | HTTP loopback or HTTPS    |
+                           | static bearer auth        |
+                           +-------------^-------------+
+                                         | native HTTP; bearer injected here
++----------------------- Crux desktop shell ------------------------+
+| OS credential store --> native broker --> 127.0.0.1:<ephemeral>  |
+|                                            profile proxy          |
+|                                                  ^                |
+|                                                  | no Tauri IPC   |
+|                                      Tauri webview /console       |
+|                                                  |                |
+| bundled profile                                 v                |
+| lifecycle supervisor --> bundled corecruxd on loopback/auth off  |
++-------------------------------------------------------------------+
 ```
 
-Two crates, **each its own Cargo workspace** (so the root daemon workspace stays
-untouched and the app's webkit stack never blocks the daemon build):
+There are three crates, each with its own `[workspace]` so none joins the root
+daemon workspace:
 
-| Crate | Path | Builds on the dev box? | Role |
+| Crate | Path | Local role |
+|---|---|---|
+| `crux-shell-lifecycle` | `lifecycle/` | Dependency-free sidecar spawn, readiness, shutdown, and Drop backstop. |
+| `crux-shell-connection` | `connection/` | Dependency-free profile store, URL policy, health model, finite backoff, platform credential broker, secret wrapper, and loopback proxy. |
+| `crux-desktop-shell` | `app/` | Thin Tauri integration, tray/window policy, and pinned Rustls HTTP adapter. Requires the WebKit/GTK toolchain on Linux. |
+
+The app uses exact dependency pins. Its attach transport is `ureq =3.3.0` with
+Rustls and normal WebPKI certificate and hostname validation. Redirect following,
+environment proxy discovery, response decompression, and insecure TLS overrides
+are disabled. Probes have a five-second per-request deadline; forwarded requests
+have a 30-second deadline, so browser EventSource clients reconnect instead of
+letting a quiet hostile stream retain an old profile token. Credential lookup
+uses fixed platform clients, so no extra keychain crate or plaintext fallback
+is present.
+
+## Connection profiles
+
+Non-secret connection configuration is stored durably as
+`<Tauri app-data>/connection-profiles-v1.json`. The platform app-data root is
+resolved by Tauri for application identifier `com.cuecrux.crux`; do not assume
+a portable relative path. Replacement is atomic on Unix and uses a recoverable
+same-directory backup sequence on Windows. The document is schema version 1 and
+names exactly one active profile:
+
+```json
+{
+  "schema_version": 1,
+  "active_profile": "local",
+  "profiles": [
+    {
+      "name": "local",
+      "mode": "bundled",
+      "url": "",
+      "token-ref": null
+    },
+    {
+      "name": "operations",
+      "mode": "attach",
+      "url": "https://crux.example.com",
+      "token-ref": "operations-agent-token"
+    }
+  ]
+}
+```
+
+On first launch, an absent store is created with one active bundled profile
+named `Local`. An invalid or unreadable existing store is not overwritten: the
+window shows a native configuration error, profile actions are disabled, and
+the operator must correct the file and restart Crux.
+
+Profile names must be unique. A bundled profile has no token reference; its URL
+is normally empty because the shell allocates the sidecar port. An attach
+profile requires an origin-only URL and a `token-ref`. The reference is the
+credential-store lookup key, not the bearer, and uses only ASCII letters,
+digits, `.`, `_`, `~`, `-`, or `:` so it is safe at both fixed native-client
+boundaries. Missing or unknown JSON fields are
+rejected, which also prevents adding a plaintext `token` field. A missing,
+locked, malformed, or unavailable credential fails closed and produces an
+explicit native-owned status page.
+
+### Lifecycle ownership
+
+| Mode | Daemon ownership | Authentication | Exit and switch behaviour |
 |---|---|---|---|
-| `crux-shell-lifecycle` | `lifecycle/` | **Yes** — std-only, no deps | Spawn / health-poll / shutdown the sidecar. Fully unit-tested. |
-| `crux-desktop-shell` | `app/` | **No** — needs webkit2gtk | Tauri v2 window + sidecar wiring. CI-only build. |
+| `bundled` | The shell starts the packaged sidecar through `crux-shell-lifecycle`. | Auth off on an ephemeral loopback port, unchanged from the shipped shell. | The shell shuts down only the sidecar handle it owns; shutdown and Drop preserve the no-orphan invariant. |
+| `attach` | The operator or service manager owns an already-running daemon. | Existing static agent-token bearer, retrieved from the OS credential store. | The shell never starts, restarts, signals, or stops the daemon. Closing the app only stops the shell proxy. |
 
-### Auth posture
+Switching changes and safely persists the active profile without restarting
+the app. Every activation binds a new `127.0.0.1` ephemeral status-proxy port
+before the webview is repointed; attach mode continues through that proxy after
+it becomes ready, while bundled mode navigates directly to its live sidecar.
+As soon as a switch reserves a new generation, the old proxy is synchronously
+quiesced into a native status state: its shared forwarding credential is made
+inactive, tracked sockets are closed, and a newly admitted request cannot reach
+that upstream. A request already dispatched before quiescence retains only its
+bounded 30-second transport budget while the old proxy performs a bounded drain.
+The webview uses an in-memory/incognito browser profile, and the shell clears
+browsing data before every profile switch; failure to clear blocks the switch.
+Native status pages and the first forwarded response also carry a shell-owned `Clear-Site-Data` barrier.
+The different origin and clearing isolate web storage across profiles, while
+attach request and response cookie headers are removed.
+Switching away from bundled mode releases only the shell-owned sidecar.
+Switching away from attach mode cannot affect the external daemon.
 
-The sidecar binds `127.0.0.1` with `CORECRUXD_AUTH_MODE=off`. There is no
-network-exposed, unauthenticated endpoint — the daemon is reachable only from
-this machine, and the shell's webview **is** the trusted operator surface. This
-matches the v2 console posture derivation in the ExecPlan.
+## Credential provisioning
 
-## Build
+The daemon and credential store must contain the same static agent token. The
+profile stores only the lookup reference. Tokens must be 32–256 bytes using the
+daemon token alphabet: ASCII letters, digits, `.`, `_`, `~`, and `-`.
+Attach credential lookup is implemented for Linux and Windows; unsupported
+platforms fail closed. Bundled mode retains its existing platform support.
 
-### Lifecycle crate (any host, including the WSL dev box)
+### Linux Secret Service
+
+Runtime prerequisites are an active Secret Service provider in the user's
+D-Bus session and the client at the fixed path `/usr/bin/secret-tool` (commonly
+provided by the `libsecret-tools` package). Store the token under the exact
+attributes used by the broker; this command reads the secret from standard
+input rather than a command-line argument:
 
 ```bash
-cargo test --manifest-path shells/desktop/lifecycle/Cargo.toml
+/usr/bin/secret-tool store --label='Crux operations agent token' \
+  service com.cuecrux.crux token-ref operations-agent-token
 ```
 
-Green here because it is `std`-only (fake daemon = a canned-`200` `TcpListener`;
-`/bin/sleep` stands in for the child in the spawn/shutdown/Drop tests).
+Enter only the bearer when prompted. `operations-agent-token` must match the
+profile's `token-ref`. A missing helper, absent D-Bus session, denied unlock,
+locked collection, missing item, or lookup timeout is an unavailable
+credential; the app does not consult an environment variable or file instead.
 
-### Desktop app (CI or a VM with the webkit toolchain)
+### Windows PasswordVault
 
-The app **cannot** compile on a host without `pkg-config` + webkit2gtk/GTK
-(the CueCrux WSL dev box and self-hosted CI runners). Validate its manifests
-structurally instead:
+Runtime lookup uses Windows Credential Manager through WinRT
+`Windows.Security.Credentials.PasswordVault`, launched by the native host with
+the fixed Windows PowerShell path. The credential resource is
+`com.cuecrux.crux`; its user name is the profile's `token-ref`. Windows
+PowerShell 5.1 and an accessible user Credential Locker are therefore runtime
+prerequisites.
+
+The following provisioning session prompts without putting the token in the
+command history and clears the temporary unmanaged copy:
+
+```powershell
+$null = [Windows.Security.Credentials.PasswordVault,Windows.Security.Credentials,ContentType=WindowsRuntime]
+$secret = Read-Host 'Static agent token' -AsSecureString
+$pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secret)
+try {
+  $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer)
+  $vault = New-Object Windows.Security.Credentials.PasswordVault
+  $item = New-Object Windows.Security.Credentials.PasswordCredential(
+    'com.cuecrux.crux', 'operations-agent-token', $plain)
+  $vault.Add($item)
+} finally {
+  [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
+  Remove-Variable plain, secret -ErrorAction SilentlyContinue
+}
+```
+
+Replace `operations-agent-token` with the profile reference. Missing, locked,
+denied, or timed-out PasswordVault access fails closed; there is no plaintext or
+environment fallback.
+
+## Transport and browser boundary
+
+Attach URLs are origins only: no user information, base path, query, fragment,
+backslash, or zero port. Exact `localhost` is normalized to `127.0.0.1` so it
+does not depend on ambient DNS or hosts-file resolution.
+
+| Attach URL | Result | Reason |
+|---|---|---|
+| `http://localhost:14800` | Allowed, normalized to `http://127.0.0.1:14800` | Exact localhost. |
+| `http://127.0.0.1:14800` or `http://[::1]:14800` | Allowed | Literal loopback address. |
+| `https://127.0.0.1:14800` | Allowed if its certificate validates normally | HTTPS is accepted; no certificate bypass exists. |
+| `http://192.168.1.20:14800` or `http://crux.example.com` | Rejected | Plain HTTP is loopback-only. |
+| `https://crux.example.com` | Allowed if its chain and hostname validate | Non-loopback origins require HTTPS. |
+| `https://user@crux.example.com/base?x=1` | Rejected | Credentials, paths, queries, and fragments are outside the profile contract. |
+
+For attach mode, the webview loads the shell's loopback proxy, never the daemon
+origin. The proxy accepts same-origin browser requests, removes browser-supplied
+authorization, cookies, forwarding headers, and hop-by-hop headers, and injects
+exactly one `Authorization: Bearer ...` upstream. It disables upstream redirect
+following. Same-origin redirects are rewritten to proxy-relative locations;
+foreign-origin, scheme-relative, and non-HTTP redirects such as `file://` are
+blocked. `Set-Cookie`, refresh navigation, attachment responses, and unsafe
+response headers are stripped or blocked. A reflected token blocks a response
+header name or value and is replaced with `[REDACTED]` in a streamed response
+body.
+
+The default Tauri capability declares an empty permission list and no remote
+URL grant. Profile, keychain, lifecycle, tray, and navigation operations stay in
+native Rust; remote console content receives no Tauri IPC, filesystem, shell,
+dialog, keychain, or updater permission. The bundled fallback document uses a
+`default-src 'none'` CSP. Proxy responses replace daemon CSP headers with a
+shell-owned same-origin policy and deny framing, referrers, privileged browser
+features, and cross-origin resources. Navigation is limited to the active
+profile proxy plus the live bundled-sidecar origin. An external HTTP(S) target
+is denied in the webview and placed in a one-item native tray approval queue;
+only the operator's **Open external link** tray action launches the system
+browser. Scripted navigation cannot spawn a handler or replace a pending link,
+and a profile switch discards it. Other schemes, new windows, and downloads are
+denied. Linux browser handoff uses the fixed `/usr/bin/xdg-open` client; Windows
+uses the system `rundll32.exe` URL handler.
+
+## Health, status, and switching
+
+Every activation probes `/healthz`, followed by `/v1/version`. The latter is
+the forward-compatible hook for M2: schema-version-1 `runtime_capabilities` are
+summarized while unknown fields, an absent descriptor, and future schema
+versions are tolerated.
+
+| Status | Meaning and rendering |
+|---|---|
+| `ok` | `/healthz` and `/v1/version` returned usable 2xx responses and no reported degradation was found. The console loads and the tray marks the profile healthy. |
+| `degraded` | The daemon answered but reported `ok=false`, sync/capability degradation, a non-2xx response, or an unusable version descriptor. The reason is visible in the tray/status surface rather than discarded. |
+| `unreachable` | The daemon cannot be reached, or native credential, transport, or startup work failed. The proxy renders an escaped native-owned error page instead of a blank webview. |
+
+Before a probe completes, the status proxy serves a connecting page and the
+tray reason says that a connection check is in progress. Attach retries are
+finite and visible: the default exponential schedule permits five delays
+(`250ms`, `500ms`, `1s`, `2s`, `4s`) after the initial probe and then leaves the
+profile explicitly unreachable. Bundled startup retains the lifecycle crate's
+bounded readiness budget and likewise stops at a rendered error. There is no
+background infinite retry loop. The tray contains one status-bearing row per
+profile plus explicit Retry and Quit actions. Retry or a new profile selection
+starts a fresh bounded activation; bundled Retry restarts only the shell-owned
+daemon.
+
+## Local verification
+
+The two support crates are std-only and can be checked on a host without
+webkit2gtk:
 
 ```bash
-cargo metadata --no-deps --manifest-path shells/desktop/app/Cargo.toml   # parses
-python3 -m json.tool shells/desktop/app/tauri.conf.json                  # valid
-python3 -m json.tool shells/desktop/app/capabilities/default.json        # valid
+(cd shells/desktop/lifecycle && cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked)
+(cd shells/desktop/connection && cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked)
 ```
 
-Full build (GitHub-hosted `ubuntu-latest`, or a dev VM):
+The connection test suite contains checks for profile round-trip and
+secret-field rejection, URL policy, schema-v1 health parsing, degradation and
+unreachable states, bounded backoff, same-origin enforcement, bearer
+replacement, credential-output validation, token redaction, and a hostile
+upstream that returns cookies and foreign or `file://` redirects.
+
+On a machine without the WebKit/GTK development packages, limit app checks to
+formatting and structural validation:
 
 ```bash
-# 1. Linux prerequisites (Tauri v2)
-sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
-  libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev \
-  libjavascriptcoregtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev pkg-config
-
-# 2. Generate the icon set (not committed — source art in the console assets)
-cargo install tauri-cli --version '^2.0'
-cargo tauri icon crates/corecruxd/console/assets/CueCrux-Arc-Loop.png \
-  --output shells/desktop/app/icons
-
-# 3. Stage the sidecar into the externalBin slot
-cargo build --release --bin corecruxd
-triple="$(rustc -vV | sed -n 's/^host: //p')"
-mkdir -p shells/desktop/app/binaries
-cp target/release/corecruxd "shells/desktop/app/binaries/corecruxd-${triple}"
-
-# 4a. Compile gate
-cargo build --release --manifest-path shells/desktop/app/Cargo.toml
-# 4b. Bundle installers (macOS .dmg/.app, Windows .msi, Linux .deb/.AppImage)
-cd shells/desktop/app && cargo tauri build
+rustfmt --edition 2021 --check shells/desktop/app/src/main.rs shells/desktop/app/src/upstream.rs
+cargo metadata --locked --no-deps --manifest-path shells/desktop/app/Cargo.toml
+python3 -m json.tool shells/desktop/app/tauri.conf.json >/dev/null
+python3 -m json.tool shells/desktop/app/capabilities/default.json >/dev/null
+typos shells/desktop/
+git diff --check
 ```
 
-CI does 1–4a on every `shells/desktop/**` PR (`.github/workflows/desktop-shell.yml`);
-the bundle (4b) runs as a **non-blocking follow-up** job.
+The Linux job in `.github/workflows/desktop-shell.yml` is the compile gate for
+the Tauri crate and must build it with the checked-in lockfile and WebKit/GTK
+packages. Packaging still stages `corecruxd` into Tauri's `externalBin` slot;
+the existing icon generation and platform signing/notarisation process is
+unchanged.
 
-### Icons
+## Operator validation checklist
 
-Icons are **generated, not committed**. `cargo tauri icon <src.png>` fans a single
-source PNG out into `32x32.png`, `128x128.png`, `128x128@2x.png`, `icon.icns`
-(macOS) and `icon.ico` (Windows) — the set referenced in `tauri.conf.json`.
-Source art: `crates/corecruxd/console/assets/CueCrux-Arc-Loop.png`.
+Run the manual M1 security and lifecycle pass on packaged Linux and Windows
+builds. Record platform, app build, daemon build, and date with the result.
 
-### Per-platform notes
+- [ ] Configure one bundled profile and two attach profiles targeting different
+      live daemons; provision distinct static tokens under their `token-ref`
+      values.
+- [ ] Switch between all profiles from the tray. Each console re-renders without
+      restarting the app, browsing data from the prior origin is cleared, and
+      the connecting page remains visible until the tray settles on
+      `ok`/`degraded`/`unreachable`.
+- [ ] Make an attach daemon unreachable. Confirm a reasoned native error page,
+      the finite visible retry sequence, and no silent retry after exhaustion.
+- [ ] Lock or disable the platform credential store and remove a credential.
+      Confirm both cases fail closed with a sanitized state and do not read a
+      token from profile JSON, environment, URL, console storage, or a file.
+- [ ] Capture webview storage, HTTP traffic, and shell/daemon logs while using
+      attach mode. Confirm the bearer appears only on the native proxy-to-daemon
+      request and nowhere in browser-visible content or persisted shell data.
+- [ ] Exercise a hostile daemon response containing `Set-Cookie`, a foreign
+      redirect, a `file://` redirect, an attachment, and reflected token bytes.
+      Confirm navigation/download is denied and no token reaches a response.
+- [ ] Attempt Tauri IPC, a new window, a non-HTTP external scheme, and access
+      from the previous profile origin. Confirm each is denied; confirm a normal
+      external HTTP(S) link queues exactly one labelled tray approval and opens
+      in the system browser only after that native action is selected. Confirm
+      scripted repeats do not spawn handlers or replace the pending target.
+- [ ] Switch bundled to attach and quit. The attach daemon must survive; the
+      previously shell-owned sidecar and both profile proxies must not.
+- [ ] Switch attach to bundled and quit. The external daemon must survive; the
+      current bundled sidecar must shut down, with Drop/exit as the backstop.
+- [ ] Repeat the existing clean-VM install, bundled-sidecar SHA, startup failure,
+      and no-orphan checks before shipping an installer.
 
-- **macOS**: universal `.app`/`.dmg`; sign + notarise for distribution.
-- **Windows**: `.msi` (WiX) / `.exe` (NSIS); the release build hides the console
-  window (`windows_subsystem = "windows"`).
-- **Linux**: `.deb` + `.AppImage`; requires the webkit2gtk-4.1 runtime.
-- The sidecar is delivered via Tauri `externalBin`, laid down next to the app
-  executable; `resolve_sidecar_binary()` finds it there at runtime.
-
-## Clean-VM validation checklist (operator gate)
-
-The ExecPlan **M6 gate** is deferred to a manual pass on a **fresh VM** (no
-prior CueCrux install). This checklist also folds in the deferred **M5** manual
-items so a single operator pass covers both. Run it against the bundle from the
-`app-bundle` CI job (or a local `cargo tauri build`).
-
-### M6 — desktop shell
-
-- [ ] **Fresh VM, no prior install.** Clean OS image; confirm no `corecruxd` on
-      `PATH`, no `~/.local/share/Crux` (or platform app-data equivalent), no
-      existing process: `pgrep -a -l -f corecruxd` returns nothing.
-- [ ] **Install the artifact.** Install the `.dmg`/`.msi`/`.AppImage`/`.deb`.
-- [ ] **App boots the daemon + console with no prior setup.** Launch Crux; the
-      window loads the console (Overwatch landing). Confirm the sidecar came up:
-      `pgrep -a -l -f corecruxd` shows exactly one, bound to a loopback port.
-- [ ] **Sidecar sha matches its release tag.** Verify the bundled binary is the
-      attested release build, not a local rebuild:
-      ```bash
-      sha256sum "<install-dir>/corecruxd"           # or corecruxctl --version / build sha
-      # compare against the release artifact's published sha256 for the tag
-      ```
-- [ ] **Quit leaves no orphan daemon (the gate).** Close the window / Quit, then:
-      ```bash
-      sleep 2; pgrep -a -l -f corecruxd     # must return NOTHING
-      ```
-      Repeat for force-quit of the app window to confirm Drop/exit handlers fire.
-- [ ] **Failure dialog.** Simulate a daemon that never becomes healthy (e.g.
-      point at a corrupt data dir); confirm the native error dialog appears **and
-      names the log path**, and that quitting still leaves no orphan.
-
-### M5 — PWA / phone tier (deferred manual items, same pass)
-
-- [ ] **Offline reload serves the app shell.** In the console (any shell), go
-      offline and reload — the service-worker app shell renders (no `/v1/*`
-      served stale).
-- [ ] **Installability audit passes** (manifest + service worker + icons).
-- [ ] **Gate-approval flow at 390px.** The M3 work-gate approve/reject flow
-      completes end-to-end at 390px viewport width; touch targets ≥44px.
-
-Record the pass (approving passport + date) per the ExecPlan's medium-risk
-human-gate requirement before the desktop artifact ships.
+The runtime credential prompts, OS-store lock behaviour, system-browser handoff,
+real WebKit navigation hooks, packet/log inspection, cross-daemon switching, and
+process ownership assertions are intentionally operator-gated because the
+headless development host cannot prove them.

@@ -21,20 +21,19 @@
       }
       @keyframes pulse { 0%,100% { opacity: .35 } 50% { opacity: 1 } }
       .muted { color: #6e7e96; font-size: 13px; }
+      @media (prefers-reduced-motion: reduce) { .dot { animation: none; } }
     </style>
   </head>
   <body>
     <!--
-      Placeholder frontend. Tauri requires a `frontendDist` to exist for the
-      build, but the real UI is the corecruxd console served over the sidecar's
-      loopback port; the shell replaces this window's contents with that origin
-      once the daemon is healthy (see src/main.rs). This screen is only ever
-      seen briefly (or as a fallback if window replacement is deferred).
+      Trusted local fallback only. Runtime loading and error states are served
+      by the shell-owned loopback proxy so they can include the active profile's
+      sanitized reason without granting the webview any native IPC capability.
     -->
     <div class="wrap">
       <div class="dot"></div>
-      <div>Starting the Crux local daemon…</div>
-      <div class="muted">This window will open the console once the daemon is ready.</div>
+      <div role="status">Preparing the active Crux connection…</div>
+      <div class="muted">Connection details and recovery actions are available from the Crux tray menu.</div>
     </div>
   </body>
 </html>

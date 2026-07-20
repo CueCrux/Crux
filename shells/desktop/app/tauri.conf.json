@@ -9,7 +9,7 @@
   "app": {
     "windows": [],
     "security": {
-      "csp": null
+      "csp": "default-src 'none'; script-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
     }
   },
   "bundle": {
@@ -17,7 +17,7 @@
     "targets": "all",
     "category": "DeveloperTool",
     "shortDescription": "Crux desktop shell",
-    "longDescription": "Crux desktop shell — a native window hosting the corecruxd console, served by a bundled loopback sidecar.",
+    "longDescription": "Crux desktop shell — a native connection manager for a bundled loopback sidecar or an authenticated attached corecruxd daemon.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

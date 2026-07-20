@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Minimal capability set for the Crux desktop shell. The shell is a thin webview over the loopback sidecar console; it exposes no bespoke JS->core commands, so only the framework defaults plus the dialog plugin (used for the boot-failure dialog) are granted.",
+  "description": "Zero-IPC capability for the Crux console webview. There is deliberately no remote URL grant and no command permission; profile, credential, lifecycle, tray, and navigation work stays in native Rust.",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:default"]
+  "permissions": []
 }
