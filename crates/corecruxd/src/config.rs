@@ -387,6 +387,11 @@ pub struct Config {
     // `actor`. Default OFF — attribution only, no enforcement (M5).
     pub agent_passports_enabled: bool,
 
+    // Passport mint requests M1: expose the agent-facing request tool without
+    // enabling any passport minting. Default OFF; operator approval and mint
+    // wiring are deliberately deferred to M2.
+    pub passport_mint_requests_enabled: bool,
+
     // Phase 8 receipts: bytes-first fetch + signature verification projection.
     pub receipts_verify_enabled: bool,
     pub receipts_recompute_candidate_digest: bool,
@@ -948,6 +953,7 @@ pub fn load_config() -> Config {
     // agent-passport M1: default OFF. Only the env var enables it (no file
     // override needed — this is a deliberate, operator-set switch).
     let agent_passports_enabled = env_bool("CORECRUXD_AGENT_PASSPORTS").unwrap_or(false);
+    let passport_mint_requests_enabled = env_bool("CORECRUXD_FEATURE_PASSPORT_MINT_REQUESTS").unwrap_or(false);
 
     let projections_enabled = std::env::var("CORECRUXD_PROJECTIONS_ENABLED")
         .ok()
@@ -1153,6 +1159,7 @@ pub fn load_config() -> Config {
 
         build_ccxi,
         agent_passports_enabled,
+        passport_mint_requests_enabled,
 
         projections_enabled,
         projections_batch_frames,
@@ -1748,6 +1755,7 @@ mod tests {
         assert_eq!(cfg.llm_model, None);
         assert_eq!(cfg.io_backend, "cpu");
         assert!(!cfg.build_ccxi);
+        assert!(!cfg.passport_mint_requests_enabled);
         assert!(!cfg.projections_enabled);
         assert!(!cfg.compute_provider_enabled);
         assert!(cfg.embed_delegate_url.is_none());
@@ -1880,6 +1888,21 @@ mod tests {
         }
 
         std::env::remove_var(KEY);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn passport_mint_requests_are_opt_in() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_corecruxd_env();
+
+        assert!(!super::load_config().passport_mint_requests_enabled);
+
+        std::env::set_var("CORECRUXD_FEATURE_PASSPORT_MINT_REQUESTS", "true");
+        assert!(super::load_config().passport_mint_requests_enabled);
+
+        clear_corecruxd_env();
     }
 
     #[test]

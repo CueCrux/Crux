@@ -32,6 +32,7 @@
 //! - `__legal_hold_receipt__::` — daemon-owned legal-hold audit records
 //! - `__answer_replay_capsule__::` — deterministic answer replay capsules
 //! - `__passport__::`        — passport metadata (already shouldn't sync)
+//! - `__mint_request__::`     — operator-gated passport-mint requests
 //! - `__bootstrap__::`       — first-run setup state
 //! - `__project__::`         — project metadata
 //! - `__ax_session::`        — AX session-scoped state
@@ -117,6 +118,7 @@ pub const DEFAULT_PRIVATE_PREFIXES: &[&str] = &[
     "__workbench__::",
     "__answer_replay_capsule__::",
     "__passport__::",
+    "__mint_request__::",
     "__session_binding__::",
     "__coord__::",
     "__incident__::",
@@ -133,9 +135,14 @@ pub const DEFAULT_PRIVATE_PREFIXES: &[&str] = &[
 ///
 /// Client-facing fact-write handlers must reject these prefixes before they
 /// reach [`crate::fact_store::FactStore`]. The core store deliberately does
-/// not enforce this policy because legal-hold and incident implementations
-/// persist their own state through direct store calls.
-pub const DAEMON_OWNED_ENTITY_PREFIXES: &[&str] = &["__legal_hold__::", "__legal_hold_receipt__::", "__incident__::"];
+/// not enforce this policy because legal-hold, incident, and mint-request
+/// implementations persist their own state through direct store calls.
+pub const DAEMON_OWNED_ENTITY_PREFIXES: &[&str] = &[
+    "__legal_hold__::",
+    "__legal_hold_receipt__::",
+    "__incident__::",
+    "__mint_request__::",
+];
 
 /// Return the daemon-owned prefix covering `entity`, if any.
 ///

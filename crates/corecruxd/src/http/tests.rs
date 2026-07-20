@@ -10558,6 +10558,46 @@ async fn passports_list_after_seed_returns_three_defaults() {
 }
 
 #[tokio::test]
+async fn passport_mint_requests_pending_lists_filed_request_without_minting() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        let filed = crate::mint_requests::file_mint_request(
+            &mut store,
+            "codex-work".to_string(),
+            "codex-work".to_string(),
+            Some("work".to_string()),
+            Some("Stamp the caller identity".to_string()),
+            1_726_000_000_000,
+        );
+        assert!(filed.is_ok());
+        assert!(!store.all_facts().any(|fact| fact.entity.starts_with("__passport__::")));
+    }
+
+    let resp = super::passports::get_pending_mint_requests(
+        State(state.clone()),
+        Query(super::passports::ListPendingMintRequestsQuery {
+            by_passport: Some("codex-work".to_string()),
+        }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = json_body(resp).await;
+    assert_eq!(body["count"], 1);
+    assert_eq!(body["pending"][0]["requester_id"], "codex-work");
+    assert_eq!(body["pending"][0]["requested_by_passport"], "codex-work");
+    assert_eq!(body["pending"][0]["requested_category"], "work");
+    assert_eq!(body["pending"][0]["reason"], "Stamp the caller identity");
+    assert_eq!(body["pending"][0]["status"], "pending");
+
+    let store = state.fact_store.read().await;
+    assert!(!store.all_facts().any(|fact| fact.entity.starts_with("__passport__::")));
+}
+
+#[tokio::test]
 async fn passports_filter_by_category_returns_only_matching() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     {

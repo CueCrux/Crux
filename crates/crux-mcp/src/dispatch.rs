@@ -78,6 +78,11 @@ pub struct McpContext {
     /// `actor` (agent-passport M1). When false, behaviour is byte-for-byte
     /// the pre-M1 path (no actor written, no mapping applied).
     pub agent_passports_enabled: bool,
+    /// Feature flag (`CORECRUXD_FEATURE_PASSPORT_MINT_REQUESTS`, default OFF):
+    /// exposes the self-scoped `request_passport_mint` tool and permits it to
+    /// file a pending operator-approval request. Independent from
+    /// `agent_passports_enabled`; it never mints a passport itself.
+    pub passport_mint_requests_enabled: bool,
     /// Agent→passport mapping consulted only when `agent_passports_enabled`
     /// is true. Empty by default so a stray value cannot change behaviour
     /// while the flag is off.
@@ -126,6 +131,7 @@ impl McpContext {
             // pre-M1 behaviour (no actor stamped) unless it opts in via
             // `with_agent_passports`.
             agent_passports_enabled: false,
+            passport_mint_requests_enabled: false,
             agent_passport_map: crate::agent_passport::AgentPassportMap::empty(),
             revocation_enforced: false,
         }
@@ -159,6 +165,7 @@ impl McpContext {
             kind_registry: Arc::new(RwLock::new(KindRegistry::new())),
             artefact_store: Arc::new(RwLock::new(ArtefactStore::new())),
             agent_passports_enabled: false,
+            passport_mint_requests_enabled: false,
             agent_passport_map: crate::agent_passport::AgentPassportMap::empty(),
             revocation_enforced: false,
         }
@@ -206,6 +213,7 @@ impl McpContext {
             kind_registry: Arc::clone(&self.kind_registry),
             artefact_store: Arc::clone(&self.artefact_store),
             agent_passports_enabled: self.agent_passports_enabled,
+            passport_mint_requests_enabled: self.passport_mint_requests_enabled,
             agent_passport_map: self.agent_passport_map.clone(),
             revocation_enforced: self.revocation_enforced,
         }
@@ -219,6 +227,13 @@ impl McpContext {
     pub fn with_agent_passports(mut self, enabled: bool, map: crate::agent_passport::AgentPassportMap) -> Self {
         self.agent_passports_enabled = enabled;
         self.agent_passport_map = map;
+        self
+    }
+
+    /// Configure filing of self-scoped passport-mint approval requests.
+    /// The default is OFF; tests and daemon startup wire it explicitly.
+    pub fn with_passport_mint_requests(mut self, enabled: bool) -> Self {
+        self.passport_mint_requests_enabled = enabled;
         self
     }
 

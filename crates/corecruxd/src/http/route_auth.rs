@@ -326,6 +326,10 @@ pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContra
         return Some(RouteAuthContract::new(class, scopes));
     }
 
+    if method == "GET" && path == "/v1/passport/mint-requests/pending" {
+        return Some(RouteAuthContract::new(RouteAuthClass::AdminRead, &["admin:read"]));
+    }
+
     if path.starts_with("/v1/work")
         || path.starts_with("/v1/status-feed")
         || path.starts_with("/v1/projects")
@@ -825,6 +829,12 @@ mod tests {
             (
                 "GET",
                 "/v1/identity/candidates",
+                RouteAuthClass::AdminRead,
+                &["admin:read"][..],
+            ),
+            (
+                "GET",
+                "/v1/passport/mint-requests/pending",
                 RouteAuthClass::AdminRead,
                 &["admin:read"][..],
             ),
