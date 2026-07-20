@@ -6,7 +6,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
-//! Dependency-free connection primitives for the Crux desktop shell.
+//! Connection primitives for the Crux desktop shell.
 //!
 //! Secrets enter through [`SecretToken`] and are only exposed to the native
 //! upstream adapter. The loopback proxy overwrites browser credentials with

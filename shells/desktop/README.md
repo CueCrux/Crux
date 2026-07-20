@@ -40,7 +40,7 @@ daemon workspace:
 | Crate | Path | Local role |
 |---|---|---|
 | `crux-shell-lifecycle` | `lifecycle/` | Dependency-free sidecar spawn, readiness, shutdown, and Drop backstop. |
-| `crux-shell-connection` | `connection/` | Dependency-free profile store, URL policy, health model, finite backoff, platform credential broker, secret wrapper, and loopback proxy. |
+| `crux-shell-connection` | `connection/` | Lean profile store, URL policy, health model, finite backoff, platform credential broker, secret wrapper, and loopback proxy; its only direct dependency is exact-pinned `getrandom`. |
 | `crux-desktop-shell` | `app/` | Thin Tauri integration, tray/window policy, and pinned Rustls HTTP adapter. Requires the WebKit/GTK toolchain on Linux. |
 
 The app uses exact dependency pins. Its attach transport is `ureq =3.3.0` with
@@ -115,9 +115,11 @@ that upstream. A request already dispatched before quiescence retains only its
 bounded 30-second transport budget while the old proxy performs a bounded drain.
 The webview uses an in-memory/incognito browser profile, and the shell clears
 browsing data before every profile switch; failure to clear blocks the switch.
-Native status pages and the first forwarded response also carry a shell-owned `Clear-Site-Data` barrier.
+Native status pages clear cache, cookies, and storage. The attach handshake
+clears cache and storage before redirecting while preserving its newly minted
+session cookie.
 The different origin and clearing isolate web storage across profiles, while
-attach request and response cookie headers are removed.
+forwarded daemon request and response cookie headers are removed.
 Switching away from bundled mode releases only the shell-owned sidecar.
 Switching away from attach mode cannot affect the external daemon.
 
@@ -195,10 +197,12 @@ does not depend on ambient DNS or hosts-file resolution.
 | `https://user@crux.example.com/base?x=1` | Rejected | Credentials, paths, queries, and fragments are outside the profile contract. |
 
 For attach mode, the webview loads the shell's loopback proxy, never the daemon
-origin. The proxy accepts same-origin browser requests, removes browser-supplied
-authorization, cookies, forwarding headers, and hop-by-hop headers, and injects
-exactly one `Authorization: Bearer ...` upstream. It disables upstream redirect
-following. Same-origin redirects are rewritten to proxy-relative locations;
+origin. A one-time shell-minted URL secret establishes an HttpOnly,
+`SameSite=Strict` proxy-session cookie; every forwarded method must present that
+in-memory session ID before bearer injection. Browser origin/fetch evidence is
+an additional check, while all caller cookies (including the proxy cookie),
+authorization, forwarding, and hop-by-hop headers are removed upstream. It
+disables upstream redirect following. Same-origin redirects are rewritten to proxy-relative locations;
 foreign-origin, scheme-relative, and non-HTTP redirects such as `file://` are
 blocked. `Set-Cookie`, refresh navigation, attachment responses, and unsafe
 response headers are stripped or blocked. A reflected token blocks a response
@@ -246,8 +250,8 @@ daemon.
 
 ## Local verification
 
-The two support crates are std-only and can be checked on a host without
-webkit2gtk:
+Both support crates are WebKit-independent and can be checked on a host without
+webkit2gtk. Lifecycle is std-only; connection has one direct RNG dependency:
 
 ```bash
 (cd shells/desktop/lifecycle && cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked)
@@ -257,8 +261,9 @@ webkit2gtk:
 The connection test suite contains checks for profile round-trip and
 secret-field rejection, URL policy, schema-v1 health parsing, degradation and
 unreachable states, bounded backoff, same-origin enforcement, bearer
-replacement, credential-output validation, token redaction, and a hostile
-upstream that returns cookies and foreign or `file://` redirects.
+replacement, the one-time session handshake, cookie enforcement/stripping and
+rotation, credential-output validation, token redaction, and a hostile upstream
+that returns cookies and foreign or `file://` redirects.
 
 On a machine without the WebKit/GTK development packages, limit app checks to
 formatting and structural validation:

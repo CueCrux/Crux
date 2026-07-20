@@ -770,26 +770,22 @@ fn activate_attach(
                     return;
                 }
             };
-            if control.set_forward(&profile.url, Arc::clone(&upstream), token).is_err() {
-                publish_native_error(
-                    app,
-                    runtime,
-                    generation,
-                    control,
-                    profile,
-                    "Attach proxy could not start",
-                    "The native proxy rejected its upstream state.",
-                );
-                return;
-            }
-            publish_ready(
-                app,
-                runtime,
-                generation,
-                profile,
-                report,
-                &format!("{}/console", control.origin()),
-            );
+            let handshake_url = match control.set_forward(&profile.url, Arc::clone(&upstream), token) {
+                Ok(handshake_url) => handshake_url,
+                Err(_) => {
+                    publish_native_error(
+                        app,
+                        runtime,
+                        generation,
+                        control,
+                        profile,
+                        "Attach proxy could not start",
+                        "The native proxy rejected its upstream state.",
+                    );
+                    return;
+                }
+            };
+            publish_ready(app, runtime, generation, profile, report, &handshake_url);
             return;
         }
 
@@ -1095,7 +1091,7 @@ fn publish_page(
             &format!(
                 "{}/?generation={generation}&attempt={}",
                 control.origin(),
-                state_marker(state)
+                state_label(state)
             ),
         );
     }
@@ -1252,14 +1248,6 @@ fn menu_safe(value: &str) -> String {
 }
 
 const fn state_label(state: HealthState) -> &'static str {
-    match state {
-        HealthState::Ok => "ok",
-        HealthState::Degraded => "degraded",
-        HealthState::Unreachable => "unreachable",
-    }
-}
-
-const fn state_marker(state: HealthState) -> &'static str {
     match state {
         HealthState::Ok => "ok",
         HealthState::Degraded => "degraded",
