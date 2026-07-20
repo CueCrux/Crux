@@ -925,6 +925,7 @@ mod tests {
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
             plan_path: None,
+            plan_content_hash: None,
             current_milestone: None,
             next_ready_milestone: None,
             superseded_by: None,
