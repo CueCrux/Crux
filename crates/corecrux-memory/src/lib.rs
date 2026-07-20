@@ -51,6 +51,7 @@ pub mod fact_store;
 pub mod identity_link;
 pub mod kind_registry;
 pub mod legal_hold;
+pub mod mint_request;
 pub mod replay;
 pub mod result_envelope;
 pub mod semantic;
@@ -73,6 +74,10 @@ pub use kind_registry::{KindError, KindRegistration, KindRegistry};
 pub use legal_hold::{
     LegalHold, LegalHoldError, LegalHoldMutation, LegalHoldReceiptKind, LegalHoldReceiptV1, PlaceLegalHold,
     LEGAL_HOLD_ENTITY_PREFIX, LEGAL_HOLD_RECEIPT_ENTITY_PREFIX, LEGAL_HOLD_RECEIPT_SCHEMA_V1, LEGAL_HOLD_SCHEMA_V1,
+};
+pub use mint_request::{
+    file_mint_request, get_mint_request, list_pending_mint_requests, MintRequestError, PendingMintRequest,
+    MINT_REQUEST_ENTITY_PREFIX, MINT_REQUEST_RECORD_KEY, MINT_REQUEST_STATUS_PENDING,
 };
 pub use result_envelope::{
     result_envelope_content_hash, verify_result_envelope, CompanionArtifact, EnvelopeEdge, EnvelopeEntity,

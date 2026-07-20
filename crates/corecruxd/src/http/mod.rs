@@ -1166,6 +1166,10 @@ pub(crate) fn router_with_route_auth(
             axum::routing::post(self::planes::post_sync_layers),
         )
         // Multi-passport CRUD.
+        .route(
+            "/v1/passport/mint-requests/pending",
+            get(self::passports::get_pending_mint_requests),
+        )
         .route("/v1/passports/presence", get(self::passports::get_presence))
         .route("/v1/passports", get(self::passports::get_passports))
         .route(

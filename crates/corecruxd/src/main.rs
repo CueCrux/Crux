@@ -68,6 +68,7 @@ mod integrations_github_sync;
 mod integrations_openai;
 mod mcp_stdio;
 mod memory_extract;
+pub mod mint_requests;
 // metrics: Prometheus register!() macros use expect() at init — safe, panics
 // only on duplicate registration (programmer error caught in tests).
 mod console;
@@ -510,7 +511,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         rcx_passport_key.passport_fpr().to_string(),
         node_id.clone(),
         "local",
-        crux_mcp::tools::rcx_local_capabilities(),
+        // Preserve the pre-M1 passport-issuance capability set: this milestone
+        // adds only the independently gated request-filing capability.
+        crux_mcp::tools::rcx_local_capabilities_with_flags(false, config.passport_mint_requests_enabled),
         rcx_issued_at,
         rcx_issued_at.saturating_add(366 * 24 * 60 * 60),
         |hash| rcx_passport_key.sign_hash(hash),
@@ -1118,6 +1121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     crux_mcp::agent_passport::AgentPassportMap::empty()
                 },
             )
+            .with_passport_mint_requests(config.passport_mint_requests_enabled)
             // passport-revocation M3: refuse revoked passports' calls —
             // launch default ON; CRUX_PASSPORT_REVOCATION=0 disables it.
             .with_revocation_enforced(crux_mcp::dispatch::revocation_enforced_from_env())

@@ -17,6 +17,11 @@ pub(super) struct ListPassportsQuery {
 }
 
 #[derive(Debug, serde::Deserialize)]
+pub(super) struct ListPendingMintRequestsQuery {
+    pub by_passport: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
 pub(super) struct CreatePassportBody {
     pub id: String,
     pub category: String,
@@ -98,6 +103,33 @@ pub(super) async fn get_passports(
         Json(serde_json::json!({
             "passports": passports,
             "category_filter": cat_filter,
+        })),
+    )
+        .into_response()
+}
+
+pub(super) async fn get_pending_mint_requests(
+    State(state): State<AppState>,
+    Query(query): Query<ListPendingMintRequestsQuery>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+
+    let store = state.fact_store.read().await;
+    let mut pending = crate::mint_requests::list_pending_mint_requests(&store);
+    drop(store);
+
+    if let Some(by_passport) = query.by_passport.as_deref() {
+        pending.retain(|request| request.requested_by_passport == by_passport);
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "count": pending.len(),
+            "pending": pending,
         })),
     )
         .into_response()

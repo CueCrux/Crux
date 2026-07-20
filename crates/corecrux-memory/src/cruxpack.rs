@@ -86,6 +86,7 @@ pub const CRUXPACK_RESERVED_PREFIXES: &[&str] = &[
     "__workbench::",
     "__answer_replay_capsule__::",
     "__passport__::",
+    "__mint_request__::",
     "__session_binding__::",
     "__coord__::",
     "__incident__::",

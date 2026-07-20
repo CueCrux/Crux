@@ -109,6 +109,7 @@ fn is_prefix_grantable(prefix: &str) -> bool {
         "__work__::",
         "__work_transition__::",
         "__passport__::",
+        "__mint_request__::",
         "__bootstrap__::",
         "__project__::",
         "decisions::",

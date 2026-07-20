@@ -158,6 +158,11 @@ pub const TOOL_SURFACE: &[ToolSurfaceEntry] = &[
         marker: "[local]",
     },
     ToolSurfaceEntry {
+        name: "request_passport_mint",
+        tier: ToolTier::Local,
+        marker: "[local]",
+    },
+    ToolSurfaceEntry {
         name: "sync_status",
         tier: ToolTier::Local,
         marker: "[local]",
@@ -245,5 +250,11 @@ mod tests {
     fn unknown_tools_default_local_for_backward_compatibility() {
         assert_eq!(tool_tier("future_local_tool"), ToolTier::Local);
         assert_eq!(marker_for_tool("future_local_tool"), "[local]");
+    }
+
+    #[test]
+    fn passport_mint_request_is_explicitly_local() {
+        assert!(is_local_tool("request_passport_mint"));
+        assert_eq!(marker_for_tool("request_passport_mint"), "[local]");
     }
 }

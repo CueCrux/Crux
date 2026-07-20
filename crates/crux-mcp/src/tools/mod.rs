@@ -39,6 +39,7 @@ pub mod learn;
 pub mod loopback_auth;
 pub mod memory;
 pub mod memory_use;
+pub mod mint_request;
 pub mod observations;
 pub mod observe;
 pub mod orchestrators;
@@ -128,7 +129,7 @@ preferred routing, min-tier, and cost class. Call it once per session for the co
 /// each tool's description — cheap affordance for agents that skip the
 /// hint at the head of the list.
 pub fn list_tools() -> Vec<ToolDefinition> {
-    list_tools_local_surface(false)
+    list_tools_with_flags(false, false)
 }
 
 /// Like [`list_tools`], but flag-aware for the agent-passport feature
@@ -143,6 +144,19 @@ pub fn list_tools() -> Vec<ToolDefinition> {
 /// identical to the pre-M2 `list_tools()` (the two gating assertions in this
 /// module's tests still hold).
 pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefinition> {
+    list_tools_with_flags(agent_passports_enabled, false)
+}
+
+/// Build the catalogue for the two independently configured passport flags.
+///
+/// `passport_mint_requests_enabled` controls presence, not merely the surface
+/// marker: while it is false the request tool is indistinguishable from an
+/// unavailable method and cannot be advertised. The compatibility wrappers
+/// above keep their pre-feature, flag-off behaviour.
+pub fn list_tools_with_flags(
+    agent_passports_enabled: bool,
+    passport_mint_requests_enabled: bool,
+) -> Vec<ToolDefinition> {
     vec![
         // ── Session Handshake (master-plan §6) ────────────────────
         ToolDefinition {
@@ -1442,6 +1456,32 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
             }),
         },
         ToolDefinition {
+            name: "request_passport_mint".to_string(),
+            description: "File a self-scoped request for operator approval to mint a passport. \
+                          The request is for the authenticated caller's resolved identity; \
+                          this tool records a pending request and mints nothing. Available \
+                          only when CORECRUXD_FEATURE_PASSPORT_MINT_REQUESTS is enabled."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "requested_category": {
+                        "type": "string",
+                        "enum": ["personal", "work", "public"],
+                        "description": "Optional passport category. Defaults to the caller's mapped real category when available."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Optional reason shown to the approving operator"
+                    }
+                },
+                "examples": [
+                    {},
+                    { "requested_category": "work", "reason": "Need a work-scoped passport" }
+                ]
+            }),
+        },
+        ToolDefinition {
             name: "get_passport".to_string(),
             description: "Return the calling agent's passport with current reputation \
                           tier and receipt count. Automatically upgrades the tier if \
@@ -2376,6 +2416,7 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
         },
     ]
     .into_iter()
+    .filter(|tool| passport_mint_requests_enabled || tool.name != "request_passport_mint")
     .map(|mut t: ToolDefinition| {
         // agent-passport M2: when the flag is on, `issue_passport` is reachable
         // on a local-tier install, so it is marked `[local]` rather than the
@@ -2424,12 +2465,14 @@ pub(crate) async fn list_tools_json_for_context_with_mode(
         .rcx_router
         .as_ref()
         .map(|router| ToolAuthMetadata::from_token(router.token()));
-    let mut tools = ctx.rcx_router.as_ref().map_or_else(
+    let base_tools = list_tools_with_flags(ctx.agent_passports_enabled, ctx.passport_mint_requests_enabled);
+    let mut tools = match ctx.rcx_router.as_ref() {
         // Local-tier install (no RCX capability token): the agent-passport
-        // flag promotes `issue_passport` into the local surface (M2).
-        || list_tools_local_surface(ctx.agent_passports_enabled),
-        |router| list_tools_for_rcx_router(router, now_unix_seconds),
-    );
+        // flag promotes `issue_passport`, while the independent mint-request
+        // flag controls whether its filing tool exists at all.
+        None => base_tools,
+        Some(router) => filter_tools_for_rcx_router(base_tools, router, now_unix_seconds),
+    };
     let mut extension_tools = extensions::list_extension_tools(ctx).await;
     if let Some(router) = ctx.rcx_router.as_ref() {
         let capabilities: Vec<McpToolCapability> = extension_tools
@@ -2574,7 +2617,14 @@ pub fn list_tools_for_rcx_token(token: &RcxCapabilityToken, now_unix_seconds: u6
 }
 
 pub fn list_tools_for_rcx_router(router: &RcxRouter, now_unix_seconds: u64) -> Vec<ToolDefinition> {
-    let tools = list_tools();
+    filter_tools_for_rcx_router(list_tools(), router, now_unix_seconds)
+}
+
+fn filter_tools_for_rcx_router(
+    tools: Vec<ToolDefinition>,
+    router: &RcxRouter,
+    now_unix_seconds: u64,
+) -> Vec<ToolDefinition> {
     let capabilities: Vec<McpToolCapability> = tools.iter().map(|tool| rcx_mcp_tool_capability(&tool.name)).collect();
     let allowed: HashSet<String> = router
         .filter_mcp_tools(&capabilities, now_unix_seconds)
@@ -2597,7 +2647,7 @@ pub fn rcx_mcp_tool_capability(tool_name: &str) -> McpToolCapability {
 }
 
 pub fn rcx_local_capabilities() -> Vec<String> {
-    rcx_local_capabilities_with_flag(false)
+    rcx_local_capabilities_with_flags(false, false)
 }
 
 /// Flag-aware local capability surface for agent-passport M2.
@@ -2607,8 +2657,18 @@ pub fn rcx_local_capabilities() -> Vec<String> {
 /// (see [`list_tools_local_surface`]). Flag-off is identical to
 /// [`rcx_local_capabilities`] — the static `[hosted]` tier excludes it.
 pub fn rcx_local_capabilities_with_flag(agent_passports_enabled: bool) -> Vec<String> {
+    rcx_local_capabilities_with_flags(agent_passports_enabled, false)
+}
+
+/// Flag-aware free-local capability set. The mint-request capability is
+/// omitted entirely while its independent feature flag is off, matching the
+/// advertised catalogue and the handler's fail-closed dispatch guard.
+pub fn rcx_local_capabilities_with_flags(
+    agent_passports_enabled: bool,
+    passport_mint_requests_enabled: bool,
+) -> Vec<String> {
     let mut seen = HashSet::new();
-    let mut capabilities: Vec<String> = list_tools()
+    let mut capabilities: Vec<String> = list_tools_with_flags(agent_passports_enabled, passport_mint_requests_enabled)
         .into_iter()
         .filter_map(|tool| {
             let promoted_local = agent_passports_enabled && tool.name == "issue_passport";
@@ -2702,6 +2762,7 @@ pub fn tool_output_docs() -> Value {
         { "tool": "enrich_action",      "output": "EnrichedActionProposal { schema, tenant_id, enrichment_mode, tool_call, narrative, affected_principals, affected_resources, state_diff, consequences, relationship_hits, consequence_metadata, enrichment_receipt }" },
         { "tool": "audit_export_bundle", "output": "{ content: [...], bundle_id, bytes_path, manifest_signature_b64, fact_count, receipt_count, scope, since, until, events_jsonl_sha256, receipts_cbor_sha256 } — bundle persisted to CORECRUXD_AUDIT_EXPORT_DIR; verify offline via `corecruxctl audit-verify`. agent-ux-11 (EU AI Act Art. 12)." },
         { "tool": "issue_passport",     "output": "{ principal_id, reputation_tier, receipt_count, sponsor_id }" },
+        { "tool": "request_passport_mint", "output": "{ request_id, requester_id, requested_category, status: 'pending' } — files a self-scoped operator-approval request; mints nothing." },
         { "tool": "get_passport",       "output": "{ principal_id, reputation_tier, receipt_count, sponsor_id, issued_at, passport_hash }" },
         { "tool": "revoke_passport",    "output": "{ content: [...], revoked target_passport, revoker_passport, reason; isError on unauthorized / no-passport }" },
         { "tool": "passport_split",        "output": "{ content: [...], new_passport_id, split_receipt_id, receipt_body_cbor_hex, receipt_body_hash_hex, tenant_id }" },
@@ -2857,6 +2918,7 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "audit_export_bundle" => audit_export::handle_audit_export_bundle(args, ctx).await,
         "enrich_action" => action::handle_enrich_action(args, ctx).await,
         "issue_passport" => passport::handle_issue_passport(args, ctx).await,
+        "request_passport_mint" => mint_request::handle_request_passport_mint(args, ctx).await,
         "get_passport" => passport::handle_get_passport(args, ctx).await,
         "revoke_passport" => passport::handle_revoke_passport(args, ctx).await,
         // Identity continuity (agent-ux-08).
@@ -3271,6 +3333,48 @@ mod tests {
     }
 
     #[test]
+    fn passport_mint_request_flag_controls_catalogue_presence() {
+        let off = list_tools_with_flags(false, false);
+        assert!(!off.iter().any(|tool| tool.name == "request_passport_mint"));
+
+        let on = list_tools_with_flags(false, true);
+        assert_eq!(on.len(), TOOL_COUNT + 1);
+        let tool = on
+            .iter()
+            .find(|tool| tool.name == "request_passport_mint")
+            .expect("mint-request tool should be listed while enabled");
+        assert!(tool.description.starts_with("[local]"));
+        assert!(tool.input_schema["properties"].get("requester_id").is_none());
+        assert!(tool.input_schema["properties"].get("requested_category").is_some());
+        assert!(tool.input_schema["properties"].get("reason").is_some());
+    }
+
+    #[tokio::test]
+    async fn passport_mint_request_survives_rcx_context_filtering_when_enabled() {
+        let token = mint_free_local_token(
+            "p_0123456789abcdef0123456789abcdef",
+            "daemon_01HV0000000000000000000000",
+            "default",
+            vec!["crux-mcp.request_passport_mint".to_string()],
+            1_776_989_600,
+            1_780_143_200,
+            [0x11; RCX_CT_SIGNATURE_LEN],
+        );
+        let ctx = McpContext::new_default("test-node")
+            .with_rcx_router(RcxRouter::new(token))
+            .with_passport_mint_requests(true);
+
+        let listed = list_tools_json_for_context_with_mode(&ctx, 1_776_989_601, surface::ToolSurfaceMode::Full).await;
+        let names: Vec<&str> = listed["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["request_passport_mint"]);
+    }
+
+    #[test]
     fn list_tools_json_includes_consequence_metadata() {
         let listed = list_tools_json();
         let tools = listed["tools"].as_array().unwrap();
@@ -3335,6 +3439,15 @@ mod tests {
         assert!(capabilities.contains(&"crux-mcp.issue_passport".to_string()));
         assert!(!capabilities.contains(&"crux-mcp.sync_pull".to_string()));
         assert!(!capabilities.contains(&"crux-mcp.sync_push".to_string()));
+    }
+
+    #[test]
+    fn passport_mint_request_flag_controls_local_capability() {
+        let off = rcx_local_capabilities_with_flags(false, false);
+        assert!(!off.contains(&"crux-mcp.request_passport_mint".to_string()));
+
+        let on = rcx_local_capabilities_with_flags(false, true);
+        assert!(on.contains(&"crux-mcp.request_passport_mint".to_string()));
     }
 
     #[test]
@@ -3538,6 +3651,22 @@ mod tests {
         let ctx = test_ctx();
         let result = call_tool("issue_passport", &json!({}), &ctx).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn call_tool_request_passport_mint_flag_off_is_method_not_found() {
+        let ctx = test_ctx().with_agent(AgentIdentity {
+            name: "openai".to_string(),
+            token_hash: [0u8; 32],
+        });
+        let err = call_tool("request_passport_mint", &json!({}), &ctx).await.unwrap_err();
+        assert_eq!(err.code, crate::protocol::METHOD_NOT_FOUND);
+        assert!(!ctx
+            .fact_store
+            .read()
+            .await
+            .all_facts()
+            .any(|fact| fact.entity.starts_with("__mint_request__::")));
     }
 
     #[tokio::test]
