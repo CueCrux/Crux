@@ -2184,6 +2184,18 @@ function extractThemeVars(theme) {
 (function checkTwoProfileConformance() {
   const map = pages.CONTROL_CAPABILITY_MAP || {};
 
+  // (0) Schema-version lock-step: the console's accepted runtime-capability
+  // schema MUST equal the daemon's emitted RUNTIME_CAPABILITY_SCHEMA_VERSION.
+  // The M5b regression — daemon bumped 1→2 (additively) while render.js still
+  // rejected schema_version !== 1 — blanked the WHOLE descriptor
+  // (descriptor_unavailable) against every real daemon. This guard fails the
+  // smoke on any future one-sided bump.
+  const productSrcSchema = fs.readFileSync(path.join(DIR, '..', '..', 'src', 'product.rs'), 'utf8');
+  const daemonSchema = (productSrcSchema.match(/RUNTIME_CAPABILITY_SCHEMA_VERSION:\s*u32\s*=\s*(\d+)/) || [])[1];
+  const consoleSchema = (renderSrc.match(/descriptor\.schema_version\s*!==\s*(\d+)/) || [])[1];
+  check(!!daemonSchema && daemonSchema === consoleSchema,
+    '[m2b] console-accepted schema (' + consoleSchema + ') must equal daemon RUNTIME_CAPABILITY_SCHEMA_VERSION (' + daemonSchema + ') — a one-sided bump blanks the descriptor on every real daemon');
+
   // (1) Reverse coverage: collect every applyCapabilityGate call-site that names
   // a STRING-LITERAL control id and assert each is a map key. The one dynamic
   // call site — applyCapabilityGate(node, control && control.k) — routes keyed

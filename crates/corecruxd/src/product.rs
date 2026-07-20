@@ -222,7 +222,7 @@ impl ProductPosture {
     }
 }
 
-pub const RUNTIME_CAPABILITY_SCHEMA_VERSION: u32 = 2;
+pub const RUNTIME_CAPABILITY_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeCapabilityDescriptor {
@@ -1223,7 +1223,7 @@ mod tests {
             },
         );
 
-        assert_eq!(available.schema_version, 2);
+        assert_eq!(available.schema_version, 1);
         assert_eq!(available.capabilities.local_embedders.availability, "unavailable");
         assert_eq!(
             available.capabilities.local_embedders.reason_code,
