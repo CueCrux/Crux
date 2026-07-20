@@ -108,6 +108,27 @@ fn authorize_concrete_query_tenant(state: &AppState, headers: &HeaderMap, tenant
     }
 }
 
+fn delegated_stored_profile_problem(error: crate::local_ingest::DenseProfileCompatibilityError) -> Response {
+    let detail = match error {
+        crate::local_ingest::DenseProfileCompatibilityError::MissingProfile { .. } => {
+            "A stored dense segment has no semantic profile, so compatibility with the remote provider cannot be proven."
+        }
+        crate::local_ingest::DenseProfileCompatibilityError::FingerprintMismatch { .. } => {
+            "The remote provider semantic profile is incompatible with a stored dense segment; reindex with the configured model."
+        }
+        crate::local_ingest::DenseProfileCompatibilityError::InvalidProfile { .. } => {
+            "A stored dense segment has a non-canonical semantic profile, so its vector identity cannot be trusted."
+        }
+        crate::local_ingest::DenseProfileCompatibilityError::DimensionMismatch { .. } => {
+            "A stored dense segment's vector dimension disagrees with its semantic profile or the remote provider."
+        }
+        crate::local_ingest::DenseProfileCompatibilityError::InvalidVectorCompanion { .. } => {
+            "A stored dense segment has a malformed or non-finite vector companion, so delegated scoring cannot proceed safely."
+        }
+    };
+    embedding_semantic_profile_mismatch_response(detail)
+}
+
 // ── v4.2 query handlers ──────────────────────────────────────────────────
 
 #[utoipa::path(
@@ -432,9 +453,9 @@ pub(super) async fn post_query_text_search(
 
     let limit = body.limit.clamp(1, 100);
     let is_scan_mode = body.mode.as_deref() == Some("scan");
-    let semantic_profile = state.fact_store.read().await.semantic_profile();
-    let local_semantic_profile_id = semantic_profile.as_ref().map(|profile| profile.profile_id.clone());
-    let embedding_fingerprint = semantic_profile
+    let mut semantic_profile = state.fact_store.read().await.semantic_profile();
+    let mut local_semantic_profile_id = semantic_profile.as_ref().map(|profile| profile.profile_id.clone());
+    let mut embedding_fingerprint = semantic_profile
         .as_ref()
         .map(|profile| profile.embedding_fingerprint.clone());
 
@@ -488,18 +509,76 @@ pub(super) async fn post_query_text_search(
     // stays inert — bit-identical BM25. BM25 coverage reporting is preserved.
     const BM25_WEIGHT: f32 = 0.7;
     const DENSE_WEIGHT: f32 = 0.3;
-    let query_embedding = {
+    let (query_embedding, refreshed_semantic_profile, delegation_configured) = {
         let store = state.fact_store.read().await;
-        store.embed_text(&body.query)
+        let embedding = match store.try_embed_text(&body.query) {
+            Ok(embedding) => embedding,
+            Err(err) => {
+                tracing::warn!(error = %err, "query-embedding-failed");
+                if let Some(status) = store.delegation_status() {
+                    return embedding_delegation_degraded_response(&status);
+                }
+                // Preserve the established BM25-only degradation for local
+                // and generic external embedders. Crux delegation is
+                // different: its configured capability fails closed above.
+                None
+            }
+        };
+        (embedding, store.semantic_profile(), store.delegation_status().is_some())
     };
-    let dense_provider = query_embedding.as_ref().and_then(|qe| {
-        crate::local_ingest::build_dense_provider(
-            &index,
-            &state.data_dir,
-            qe,
-            embedding_fingerprint.as_ref().map(|f| f.hash.as_str()),
-        )
-    });
+    // A delegate pins the provider's complete profile on its first response.
+    // Refresh after the call so that first-call vectors are compared against
+    // the provider fingerprint, never the configured model/dimension placeholder.
+    semantic_profile = refreshed_semantic_profile;
+    local_semantic_profile_id = semantic_profile.as_ref().map(|profile| profile.profile_id.clone());
+    embedding_fingerprint = semantic_profile
+        .as_ref()
+        .map(|profile| profile.embedding_fingerprint.clone());
+    let dense_provider = if let Some(query_embedding) = query_embedding.as_ref() {
+        if delegation_configured {
+            let Some(expected_fingerprint) = embedding_fingerprint.as_ref() else {
+                return ProblemResponse(
+                    ProblemDetails::service_unavailable(
+                        "Remote embedding delegation did not publish a semantic fingerprint.",
+                    )
+                    .with_extensions(serde_json::json!({
+                        "code": "EMBEDDING_SEMANTIC_PROFILE_MISMATCH",
+                        "capability": "embedding_delegation",
+                        "availability": "degraded",
+                        "reason_code": "embedding_semantic_profile_mismatch",
+                    })),
+                )
+                .into_response();
+            };
+            match crate::local_ingest::build_dense_provider_strict(
+                &index,
+                &state.data_dir,
+                query_embedding,
+                &expected_fingerprint.hash,
+            ) {
+                Ok(provider) => {
+                    state.fact_store.read().await.clear_semantic_profile_mismatch();
+                    provider
+                }
+                Err(error) => {
+                    tracing::warn!(?error, "delegated-stored-semantic-profile-mismatch");
+                    state.fact_store.read().await.report_semantic_profile_mismatch();
+                    return delegated_stored_profile_problem(error);
+                }
+            }
+        } else {
+            crate::local_ingest::build_dense_provider(
+                &index,
+                &state.data_dir,
+                query_embedding,
+                embedding_fingerprint
+                    .as_ref()
+                    .map(|fingerprint| fingerprint.hash.as_str()),
+            )
+        }
+    } else {
+        None
+    };
     let dense_lane_active = dense_provider.is_some();
     if let Some(provider) = dense_provider.as_ref() {
         use corecrux_retrieval::dense::DenseProvider;
@@ -864,6 +943,37 @@ mod query_tests {
     use super::super::tests::{enabled_dataplane, test_app_state};
     use super::*;
 
+    #[derive(Debug)]
+    struct DegradedDelegation;
+
+    impl corecrux_memory::embeddings::Embedder for DegradedDelegation {
+        fn embed_batch(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>, corecrux_memory::embeddings::EmbeddingError> {
+            Err(corecrux_memory::embeddings::EmbeddingError::CircuitOpen { retry_after_ms: 30_000 })
+        }
+
+        fn dimensions(&self) -> usize {
+            2
+        }
+
+        fn model(&self) -> &str {
+            "mock-delegate"
+        }
+
+        fn semantic_profile(&self) -> corecrux_memory::embeddings::SemanticProfile {
+            corecrux_memory::embeddings::SemanticProfile::from_parts("mock-delegate", 2, "mock", "none", "l2")
+        }
+
+        fn delegation_status(&self) -> Option<corecrux_memory::embeddings::DelegationStatus> {
+            Some(corecrux_memory::embeddings::DelegationStatus {
+                availability: corecrux_memory::embeddings::DelegationAvailability::Degraded,
+                circuit_state: corecrux_memory::embeddings::DelegationCircuitState::Open,
+                reason_code: "embedding_delegate_circuit_open",
+                reason: "mock circuit open",
+                consecutive_failures: 3,
+            })
+        }
+    }
+
     fn enabled() -> AppState {
         let mut s = test_app_state(16);
         s.http_dataplane = enabled_dataplane(vec![], None);
@@ -984,5 +1094,64 @@ mod query_tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         std::env::remove_var("CORECRUXD_QUERY_TEXT_SEARCH");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn delegated_text_search_failure_returns_503_without_bm25_fallback() {
+        std::env::remove_var("CORECRUXD_QUERY_TEXT_SEARCH");
+        let state = enabled();
+        let documents = vec![crate::local_ingest::ProseDocument {
+            doc_id: "existing-doc".to_string(),
+            chunks: vec![crate::local_ingest::ProseChunk {
+                chunk_id: "existing-doc::0".to_string(),
+                text: "hello from stored prose".to_string(),
+                dense_vector: None,
+            }],
+        }];
+        crate::local_ingest::seal_prose_documents(
+            &state.data_dir,
+            0,
+            1,
+            "t1",
+            "corpus",
+            "2026-07-20T00:00:00Z",
+            &documents,
+            None,
+        )
+        .unwrap();
+        state
+            .retrieval_index
+            .write()
+            .await
+            .scan_and_load(&state.data_dir.join("shards").join("shard-0000").join("segments"))
+            .unwrap();
+        state
+            .fact_store
+            .write()
+            .await
+            .set_embedder(Box::new(DegradedDelegation));
+
+        let response = post_query_text_search(
+            State(state),
+            HeaderMap::new(),
+            Json(TextSearchBody {
+                tenant_id: "t1".to_string(),
+                query: "hello".to_string(),
+                limit: 10,
+                token_budget: None,
+                min_score: None,
+                mode: None,
+                include_receipt: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["code"], "EMBEDDING_DELEGATION_DEGRADED");
+        assert_eq!(body["reason_code"], "embedding_delegate_circuit_open");
     }
 }

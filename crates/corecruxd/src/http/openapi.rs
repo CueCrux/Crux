@@ -183,6 +183,7 @@ const ROUTES: &[RouteEntry] = &[
     // Hosted-service surface (ExecPlan crux-external-findings-remediation M4): compiled out of CE.
     #[cfg(feature = "hosted-surfaces")]
     RouteEntry { path: "/v1/cloud/access-contract", methods: &["GET"], tag: "Cloud", auth: "read", summary: "Cloud access contract" },
+    RouteEntry { path: "/v1/compute/embed", methods: &["POST"], tag: "Compute", auth: "feature-gated", summary: "Authenticated embedding compute provider" },
     RouteEntry { path: "/v1/console/chunks/{chunkDigest}", methods: &["GET"], tag: "Console", auth: "admin-read", summary: "Console chunks {chunkDigest}" },
     RouteEntry { path: "/v1/console/chunks/{chunkDigest}/preview", methods: &["GET"], tag: "Console", auth: "admin-read", summary: "Console chunks {chunkDigest} preview" },
     RouteEntry { path: "/v1/console/corecrux/lane-weights", methods: &["GET", "PUT", "DELETE"], tag: "Console", auth: "admin", summary: "Console corecrux lane weights" },

@@ -526,6 +526,28 @@ impl FactStore {
         self.embedder.as_ref().is_some_and(|embedder| embedder.runs_locally())
     }
 
+    /// Runtime state for authenticated CoreCrux embedding delegation. `None`
+    /// means the configured embedder, if any, is not a `DelegatingEmbedder`.
+    pub fn delegation_status(&self) -> Option<crate::embeddings::DelegationStatus> {
+        self.embedder.as_ref().and_then(|embedder| embedder.delegation_status())
+    }
+
+    /// Latch a persisted-vector/profile incompatibility into delegation
+    /// capability state without incrementing the transport circuit breaker.
+    pub fn report_semantic_profile_mismatch(&self) {
+        if let Some(embedder) = self.embedder.as_ref() {
+            embedder.report_semantic_profile_mismatch();
+        }
+    }
+
+    /// Clear the persisted-vector/profile mismatch latch after a strict
+    /// compatibility check succeeds or incompatible vectors are removed.
+    pub fn clear_semantic_profile_mismatch(&self) {
+        if let Some(embedder) = self.embedder.as_ref() {
+            embedder.clear_semantic_profile_mismatch();
+        }
+    }
+
     /// Enable store-time semantic near-duplicate detection at `threshold` cosine
     /// (buyer-fit M3.5). Only effective when an embedder is also configured.
     pub fn set_semantic_dedup(&mut self, threshold: f32) {
@@ -583,14 +605,32 @@ impl FactStore {
         self.embedder.as_ref().map(|embedder| embedder.semantic_profile())
     }
 
+    /// Fallible single-text embedding. `Ok(None)` means no embedder is
+    /// configured; a configured provider failure is preserved as `Err` so a
+    /// delegation-required caller can surface capability degradation.
+    pub fn try_embed_text(&self, text: &str) -> Result<Option<Vec<f32>>, crate::embeddings::EmbeddingError> {
+        let Some(embedder) = self.embedder.as_ref() else {
+            return Ok(None);
+        };
+        embedder.embed_one(text).map(Some)
+    }
+
+    /// Fallible batch embedding. The batch is all-or-nothing: a provider error
+    /// never becomes an empty or partially embedded result.
+    pub fn try_embed_texts(&self, texts: &[&str]) -> Result<Option<Vec<Vec<f32>>>, crate::embeddings::EmbeddingError> {
+        let Some(embedder) = self.embedder.as_ref() else {
+            return Ok(None);
+        };
+        embedder.embed_batch(texts).map(Some)
+    }
+
     /// Embed a single text with the node's embedder, or `None` when no embedder
     /// is configured or the embed fails. Used by the prose lane (buyer-fit M3.2)
     /// so document and query vectors come from the SAME embedder as the fact
     /// lane — a shared node-wide embedder keeps them fingerprint-compatible.
     pub fn embed_text(&self, text: &str) -> Option<Vec<f32>> {
-        let embedder = self.embedder.as_ref()?;
-        match embedder.embed_one(text) {
-            Ok(vec) => Some(vec),
+        match self.try_embed_text(text) {
+            Ok(vec) => vec,
             Err(err) => {
                 tracing::warn!(?err, "prose-embed-failed");
                 None
@@ -602,9 +642,8 @@ impl FactStore {
     /// configured; on a batch error, returns `None` (callers fall back to
     /// BM25-only rather than a partially-embedded corpus).
     pub fn embed_texts(&self, texts: &[&str]) -> Option<Vec<Vec<f32>>> {
-        let embedder = self.embedder.as_ref()?;
-        match embedder.embed_batch(texts) {
-            Ok(vecs) => Some(vecs),
+        match self.try_embed_texts(texts) {
+            Ok(vecs) => vecs,
             Err(err) => {
                 tracing::warn!(?err, count = texts.len(), "prose-embed-batch-failed");
                 None
@@ -948,38 +987,47 @@ impl FactStore {
 
     fn after_fact_stored(&mut self, fact: &Fact) {
         if let Some(embedder) = &self.embedder {
-            let text = format!("{} {} {}", fact.entity, fact.key, fact.value);
-            match embedder.embed_one(&text) {
-                Ok(vec) => {
-                    // Free, Bring-Your-Own-embedder dense lane. This store is
-                    // deliberately **uncapped** (ExecPlan
-                    // dense-lane-and-extraction-upsell-2026-06-26, constraint C1):
-                    // do NOT add a corpus cap or eviction here. Scale/quality is
-                    // the metered upsell, never a clip on local dense.
-                    self.embeddings.insert(fact.fact_id.clone(), vec);
+            // Daemon delegation is the prose/index compute lane. Fact writes
+            // are durability-first and occur while callers hold this store's
+            // write lock; waiting through remote retries here could make an
+            // already-committed mutation time out ambiguously. Keep delegated
+            // fact enrichment lexical until it can be queued out of band.
+            if embedder.delegation_status().is_some() {
+                tracing::debug!(fact_id = %fact.fact_id, "delegated-fact-enrichment-skipped");
+            } else {
+                let text = format!("{} {} {}", fact.entity, fact.key, fact.value);
+                match embedder.embed_one(&text) {
+                    Ok(vec) => {
+                        // Free, Bring-Your-Own-embedder dense lane. This store is
+                        // deliberately **uncapped** (ExecPlan
+                        // dense-lane-and-extraction-upsell-2026-06-26, constraint C1):
+                        // do NOT add a corpus cap or eviction here. Scale/quality is
+                        // the metered upsell, never a clip on local dense.
+                        self.embeddings.insert(fact.fact_id.clone(), vec);
 
-                    // M3.5: store-time semantic near-duplicate detection. Flags a
-                    // near-dup as a review candidate (log + queryable record); it
-                    // never mutates or drops the fact — dedup is advisory review,
-                    // not silent deletion.
-                    if let Some(threshold) = self.dedup_threshold {
-                        if let Some((similar_to, score)) = self.detect_near_duplicate(fact, threshold) {
-                            tracing::warn!(
-                                fact_id = %fact.fact_id,
-                                similar_to = %similar_to,
-                                score,
-                                "fact-near-duplicate-detected (M3.5 review candidate)"
-                            );
-                            self.near_duplicates.push(NearDuplicate {
-                                fact_id: fact.fact_id.clone(),
-                                similar_to,
-                                score,
-                            });
+                        // M3.5: store-time semantic near-duplicate detection. Flags a
+                        // near-dup as a review candidate (log + queryable record); it
+                        // never mutates or drops the fact — dedup is advisory review,
+                        // not silent deletion.
+                        if let Some(threshold) = self.dedup_threshold {
+                            if let Some((similar_to, score)) = self.detect_near_duplicate(fact, threshold) {
+                                tracing::warn!(
+                                    fact_id = %fact.fact_id,
+                                    similar_to = %similar_to,
+                                    score,
+                                    "fact-near-duplicate-detected (M3.5 review candidate)"
+                                );
+                                self.near_duplicates.push(NearDuplicate {
+                                    fact_id: fact.fact_id.clone(),
+                                    similar_to,
+                                    score,
+                                });
+                            }
                         }
                     }
-                }
-                Err(err) => {
-                    tracing::warn!(?err, fact_id = %fact.fact_id, "fact-embed-failed");
+                    Err(err) => {
+                        tracing::warn!(?err, fact_id = %fact.fact_id, "fact-embed-failed");
+                    }
                 }
             }
         }
@@ -1139,7 +1187,27 @@ impl FactStore {
     /// Query facts by keyword match (simple substring search).
     /// Returns facts sorted by relevance, limited by top_k or token_budget.
     pub fn query(&self, q: &FactQuery) -> FactQueryResult {
-        self.query_inner(q, None)
+        let query_embedding = match self.query_embedding(q) {
+            Ok(embedding) => embedding,
+            Err(err) => {
+                // Legacy in-process metadata lookups retain a lexical path.
+                // User-facing operations that require delegated semantics use
+                // `try_query` and surface the provider error instead.
+                tracing::warn!(?err, "query-embed-failed; using lexical query semantics");
+                None
+            }
+        };
+        self.query_inner(q, None, query_embedding.as_deref())
+    }
+
+    /// Fallible semantic recall for capability-aware callers. A fact-lane
+    /// embedder failure is returned to the caller; it never becomes an empty,
+    /// unrelated, or confidence-only result set. Daemon delegation is
+    /// deliberately a prose/index compute lane, so fact recall remains lexical
+    /// and never performs remote I/O under the store lock.
+    pub fn try_query(&self, q: &FactQuery) -> Result<FactQueryResult, crate::embeddings::EmbeddingError> {
+        let query_embedding = self.query_embedding(q)?;
+        Ok(self.query_inner(q, None, query_embedding.as_deref()))
     }
 
     /// Bi-temporal recall (Graphiti model): like [`Self::query`], but only
@@ -1150,10 +1218,41 @@ impl FactStore {
     /// bounds (the default) match any `as_of`, so this is a strict superset
     /// filter over [`Self::query`]. Ranking/budget logic is shared.
     pub fn query_as_of(&self, q: &FactQuery, as_of: DateTime<Utc>) -> FactQueryResult {
-        self.query_inner(q, Some(as_of))
+        let query_embedding = match self.query_embedding(q) {
+            Ok(embedding) => embedding,
+            Err(err) => {
+                tracing::warn!(?err, "as-of-query-embed-failed; using lexical query semantics");
+                None
+            }
+        };
+        self.query_inner(q, Some(as_of), query_embedding.as_deref())
     }
 
-    fn query_inner(&self, q: &FactQuery, as_of: Option<DateTime<Utc>>) -> FactQueryResult {
+    /// Fallible bi-temporal semantic recall. See [`Self::try_query`].
+    pub fn try_query_as_of(
+        &self,
+        q: &FactQuery,
+        as_of: DateTime<Utc>,
+    ) -> Result<FactQueryResult, crate::embeddings::EmbeddingError> {
+        let query_embedding = self.query_embedding(q)?;
+        Ok(self.query_inner(q, Some(as_of), query_embedding.as_deref()))
+    }
+
+    fn query_embedding(&self, q: &FactQuery) -> Result<Option<Vec<f32>>, crate::embeddings::EmbeddingError> {
+        match (&self.embedder, &q.query) {
+            (Some(embedder), Some(query_text)) if !query_text.is_empty() && embedder.delegation_status().is_none() => {
+                embedder.embed_one(query_text).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn query_inner(
+        &self,
+        q: &FactQuery,
+        as_of: Option<DateTime<Utc>>,
+        query_embedding: Option<&[f32]>,
+    ) -> FactQueryResult {
         let mut results: Vec<&Fact> = self
             .facts
             .values()
@@ -1179,7 +1278,7 @@ impl FactStore {
             .filter(|f| {
                 // When embeddings are enabled, skip keyword filtering — cosine
                 // similarity handles relevance ranking instead.
-                if self.embedder.is_some() {
+                if query_embedding.is_some() {
                     return true;
                 }
                 if let Some(query) = &q.query {
@@ -1197,21 +1296,10 @@ impl FactStore {
             })
             .collect();
 
-        // If embeddings are available and a query is provided, compute cosine
-        // similarity and blend it with confidence for ranking. Otherwise fall
-        // back to confidence + recency.
-        let query_embedding = match (&self.embedder, &q.query) {
-            (Some(embedder), Some(query_text)) if !query_text.is_empty() => match embedder.embed_one(query_text) {
-                Ok(vec) => Some(vec),
-                Err(err) => {
-                    tracing::warn!(?err, "query-embed-failed");
-                    None
-                }
-            },
-            _ => None,
-        };
-
-        if let Some(ref qe) = query_embedding {
+        // If embeddings are available and a query is provided, blend cosine
+        // similarity with confidence. Otherwise use the explicit lexical
+        // selection above and rank by confidence + recency.
+        if let Some(qe) = query_embedding {
             // Score = 0.6 * cosine_similarity + 0.4 * confidence.
             // Ranks the WHOLE filtered result set — the token_budget / top_k
             // selection below is a presentation limit, not a corpus cap. Keep it

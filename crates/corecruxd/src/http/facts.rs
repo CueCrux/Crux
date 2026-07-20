@@ -194,9 +194,9 @@ pub(super) fn query_visible_http_facts(
     store: &corecrux_memory::FactStore,
     q: &corecrux_memory::fact_store::FactQuery,
     ctx: &crate::auth::HttpScopeContext,
-) -> Vec<corecrux_memory::fact_store::Fact> {
+) -> Result<Vec<corecrux_memory::fact_store::Fact>, corecrux_memory::embeddings::EmbeddingError> {
     // Internal callers (context_surface) never set a confidence floor; drop the count.
-    query_visible_http_facts_as_of(store, q, ctx, None).0
+    Ok(query_visible_http_facts_as_of(store, q, ctx, None)?.0)
 }
 
 /// P2 confidence floor: drop facts whose recall-time EFFECTIVE confidence
@@ -261,7 +261,7 @@ pub(super) fn query_visible_http_facts_as_of(
     q: &corecrux_memory::fact_store::FactQuery,
     ctx: &crate::auth::HttpScopeContext,
     as_of: Option<chrono::DateTime<chrono::Utc>>,
-) -> (Vec<corecrux_memory::fact_store::Fact>, usize) {
+) -> Result<(Vec<corecrux_memory::fact_store::Fact>, usize), corecrux_memory::embeddings::EmbeddingError> {
     if raw_admin_read(ctx) {
         // Run the floor filter/count over the FULL matched+ranked set, THEN
         // apply budget/top_k — so a below-floor row never consumes the window
@@ -271,12 +271,14 @@ pub(super) fn query_visible_http_facts_as_of(
         unbounded.top_k = usize::MAX;
         unbounded.token_budget = None;
         unbounded.min_effective_confidence = None;
-        let mut facts = match as_of {
-            Some(instant) => store.query_as_of(&unbounded, instant).facts,
-            None => store.query(&unbounded).facts,
+        let mut facts = match (as_of, store.delegation_status().is_some()) {
+            (Some(instant), true) => store.try_query_as_of(&unbounded, instant)?.facts,
+            (None, true) => store.try_query(&unbounded)?.facts,
+            (Some(instant), false) => store.query_as_of(&unbounded, instant).facts,
+            (None, false) => store.query(&unbounded).facts,
         };
         let filtered = drop_below_confidence_floor(&mut facts, q.min_effective_confidence);
-        return (take_within_budget(facts, q.token_budget, q.top_k), filtered);
+        return Ok((take_within_budget(facts, q.token_budget, q.top_k), filtered));
     }
 
     let agent_name = ctx.passport_id.as_deref();
@@ -339,7 +341,7 @@ pub(super) fn query_visible_http_facts_as_of(
         .into_iter()
         .filter_map(|fact| render_fact_for_http(fact, ctx))
         .collect();
-    (rendered, filtered_below_threshold)
+    Ok((rendered, filtered_below_threshold))
 }
 
 pub(super) fn scoped_session_id_for_http(ctx: &crate::auth::HttpScopeContext, session_id: &str) -> String {
@@ -600,7 +602,19 @@ pub(super) async fn query_facts(
         None => None,
     };
     let store = state.fact_store.read().await;
-    let (facts, filtered_below_threshold) = query_visible_http_facts_as_of(&store, &q, &ctx, as_of);
+    let (facts, filtered_below_threshold) = match query_visible_http_facts_as_of(&store, &q, &ctx, as_of) {
+        Ok(result) => result,
+        Err(err) => {
+            tracing::warn!(error = %err, "fact-query-embedding-delegation-failed");
+            if let Some(status) = store.delegation_status() {
+                return super::embedding_delegation_degraded_response(&status);
+            }
+            return problem_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Fact query embedding failed; no fallback result was returned.",
+            );
+        }
+    };
     let total_tokens = facts.iter().map(|fact| fact.tokens).sum::<usize>();
     (
         StatusCode::OK,

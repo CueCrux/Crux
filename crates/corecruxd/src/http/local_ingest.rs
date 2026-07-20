@@ -20,7 +20,10 @@
 //! - M1: payload contract + flagged endpoint skeleton (validate + tenant-scope
 //!   auth + 202 stub; NO write yet).
 
-use super::{problem_response, AppState, HeaderMap, IntoResponse, Json, Response, State, StatusCode};
+use super::{
+    problem_response, AppState, HeaderMap, IntoResponse, Json, ProblemDetails, ProblemResponse, Response, State,
+    StatusCode,
+};
 use crate::local_ingest::{seal_prose_documents, ProseChunk, ProseDocument};
 use corecrux_memory::embeddings::SemanticProfile;
 
@@ -224,7 +227,10 @@ pub(super) async fn post_local_ingest(
         .iter()
         .flat_map(|d| &d.chunks)
         .any(|c| c.dense_vector.is_some());
-    let node_profile = state.fact_store.read().await.semantic_profile();
+    let (node_profile, delegate_selected) = {
+        let store = state.fact_store.read().await;
+        (store.semantic_profile(), store.delegation_status().is_some())
+    };
     let server_embed = !has_client_vectors && node_profile.is_some();
 
     // M3.3 fingerprint refusal: a caller-supplied vector batch that DECLARES a
@@ -234,6 +240,48 @@ pub(super) async fn post_local_ingest(
     // caller reindexes or configures a matching embedder, rather than storing
     // dead vectors.
     if has_client_vectors {
+        if delegate_selected {
+            return ProblemResponse(
+                ProblemDetails::new(
+                    StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
+                    "https://errors.cuecrux.com/delegated_client_vectors_unsupported",
+                    "Delegated Ingest Requires Provider Embeddings",
+                )
+                .with_detail(
+                    "Caller-supplied dense vectors are not accepted while daemon delegation is configured; omit dense_vector so the provider produces a verified semantic profile.",
+                )
+                .with_extensions(serde_json::json!({
+                    "code": "DELEGATED_CLIENT_VECTORS_UNSUPPORTED",
+                    "capability": "embedding_delegation",
+                })),
+            )
+            .into_response();
+        }
+        if let Some(declared) = body.semantic_profile.as_ref() {
+            let canonical = SemanticProfile::from_parts(
+                &declared.model,
+                declared.dimensions,
+                &declared.tokenizer,
+                &declared.prompt_template_version,
+                &declared.normalisation,
+            );
+            if declared != &canonical {
+                return ProblemResponse(
+                    ProblemDetails::new(
+                        StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
+                        "https://errors.cuecrux.com/invalid_semantic_profile",
+                        "Invalid Semantic Profile",
+                    )
+                    .with_detail(
+                        "semantic_profile identifiers and embedding fingerprint must be canonical for the declared model parameters.",
+                    )
+                    .with_extensions(serde_json::json!({
+                        "code": "INVALID_SEMANTIC_PROFILE",
+                    })),
+                )
+                .into_response();
+            }
+        }
         if let (Some(declared), Some(node)) = (body.semantic_profile.as_ref(), node_profile.as_ref()) {
             if declared.embedding_fingerprint.hash != node.embedding_fingerprint.hash {
                 return problem_response(
@@ -250,11 +298,45 @@ pub(super) async fn post_local_ingest(
         }
     }
 
+    if delegate_selected && server_embed {
+        let chunks = body.documents.iter().flat_map(|document| &document.chunks);
+        let chunk_count = chunks.clone().count();
+        let total_bytes = chunks
+            .clone()
+            .fold(0usize, |total, chunk| total.saturating_add(chunk.text.len()));
+        let item_too_large = chunks
+            .clone()
+            .any(|chunk| chunk.text.len() > corecrux_memory::embeddings::DELEGATION_MAX_TEXT_BYTES);
+        if chunk_count > corecrux_memory::embeddings::DELEGATION_MAX_TEXTS_PER_REQUEST
+            || total_bytes > corecrux_memory::embeddings::DELEGATION_MAX_TEXT_BYTES_PER_REQUEST
+            || item_too_large
+        {
+            return ProblemResponse(
+                ProblemDetails::new(
+                    StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+                    "https://errors.cuecrux.com/embedding_delegation_request_too_large",
+                    "Embedding Delegation Request Too Large",
+                )
+                .with_detail(
+                    "Delegated local ingest must fit one bounded provider call; split this ingest into smaller requests.",
+                )
+                .with_extensions(serde_json::json!({
+                    "code": "EMBEDDING_DELEGATION_REQUEST_TOO_LARGE",
+                    "capability": "embedding_delegation",
+                    "max_texts": corecrux_memory::embeddings::DELEGATION_MAX_TEXTS_PER_REQUEST,
+                    "max_text_bytes": corecrux_memory::embeddings::DELEGATION_MAX_TEXT_BYTES,
+                    "max_total_text_bytes": corecrux_memory::embeddings::DELEGATION_MAX_TEXT_BYTES_PER_REQUEST,
+                })),
+            )
+            .into_response();
+        }
+    }
+
     // The profile to persist alongside the `.ccxv` companion: the node embedder's
     // for server-embedded ingests; the caller's declared profile for supplied
     // vectors (or a dimension-only marker when undeclared, so a later query with a
     // different embedder can still tell the space apart).
-    let dense_profile: Option<SemanticProfile> = if server_embed {
+    let mut dense_profile: Option<SemanticProfile> = if server_embed {
         node_profile.clone()
     } else if has_client_vectors {
         body.semantic_profile.clone().or_else(|| {
@@ -268,9 +350,79 @@ pub(super) async fn post_local_ingest(
         None
     };
 
+    // A delegated batch is all-or-nothing and happens before sealing. If the
+    // remote capability is degraded, return an explicit 503 rather than
+    // silently persisting a BM25-only corpus under a dense semantic profile.
+    let (server_embeddings, refreshed_server_profile, delegation_configured) = if server_embed {
+        let texts = body
+            .documents
+            .iter()
+            .flat_map(|document| &document.chunks)
+            .map(|chunk| chunk.text.as_str())
+            .collect::<Vec<_>>();
+        let store = state.fact_store.read().await;
+        let embeddings = match store.try_embed_texts(&texts) {
+            Ok(embeddings) => embeddings,
+            Err(err) => {
+                tracing::warn!(error = %err, chunk_count = texts.len(), "local-ingest-embedding-failed");
+                if let Some(status) = store.delegation_status() {
+                    return super::embedding_delegation_degraded_response(&status);
+                }
+                // Retain the existing sparse-only behavior for local and
+                // generic external embedders; authenticated Crux delegation
+                // has an explicit no-fallback contract above.
+                None
+            }
+        };
+        (
+            embeddings,
+            store.semantic_profile(),
+            store.delegation_status().is_some(),
+        )
+    } else {
+        (None, None, false)
+    };
+    if server_embeddings.is_some() {
+        // Delegation pins the provider's complete semantic profile only after
+        // the first successful response. Persist that refreshed fingerprint
+        // beside the vectors, not the preflight model/dimension placeholder.
+        dense_profile = refreshed_server_profile;
+    }
+    if delegation_configured {
+        let (Some(embeddings), Some(profile)) = (server_embeddings.as_ref(), dense_profile.as_ref()) else {
+            return super::embedding_semantic_profile_mismatch_response(
+                "Remote embedding delegation did not produce a verifiable semantic profile.",
+            );
+        };
+        let Some(probe_embedding) = embeddings.first() else {
+            return super::embedding_semantic_profile_mismatch_response(
+                "Remote embedding delegation did not produce a verifiable embedding batch.",
+            );
+        };
+        let compatibility = {
+            let index = state.retrieval_index.read().await;
+            crate::local_ingest::build_dense_provider_strict(
+                &index,
+                &state.data_dir,
+                probe_embedding,
+                &profile.embedding_fingerprint.hash,
+            )
+        };
+        match compatibility {
+            Ok(_) => state.fact_store.read().await.clear_semantic_profile_mismatch(),
+            Err(error) => {
+                tracing::warn!(?error, "delegated-ingest-stored-semantic-profile-mismatch");
+                state.fact_store.read().await.report_semantic_profile_mismatch();
+                return super::embedding_semantic_profile_mismatch_response(
+                    "The remote provider semantic profile is incompatible with stored dense vectors; reindex with the configured model.",
+                );
+            }
+        }
+    }
+
     // Map the wire payload to the seal-core document model.
     let documents: Vec<ProseDocument> = if server_embed {
-        let store = state.fact_store.read().await;
+        let mut embeddings = server_embeddings.unwrap_or_default().into_iter();
         body.documents
             .iter()
             .map(|d| ProseDocument {
@@ -281,7 +433,7 @@ pub(super) async fn post_local_ingest(
                     .map(|c| ProseChunk {
                         chunk_id: c.chunk_id.clone(),
                         text: c.text.clone(),
-                        dense_vector: store.embed_text(&c.text),
+                        dense_vector: embeddings.next(),
                     })
                     .collect(),
             })
@@ -445,6 +597,70 @@ fn hex32(bytes: [u8; 32]) -> String {
 mod tests {
     use super::*;
 
+    #[derive(Debug)]
+    struct DegradedDelegation;
+
+    #[derive(Debug)]
+    struct SuccessfulDelegation;
+
+    impl corecrux_memory::embeddings::Embedder for DegradedDelegation {
+        fn embed_batch(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>, corecrux_memory::embeddings::EmbeddingError> {
+            Err(corecrux_memory::embeddings::EmbeddingError::Network(
+                "mock delegate unavailable".to_string(),
+            ))
+        }
+
+        fn dimensions(&self) -> usize {
+            2
+        }
+
+        fn model(&self) -> &str {
+            "mock-delegate"
+        }
+
+        fn semantic_profile(&self) -> SemanticProfile {
+            SemanticProfile::from_parts("mock-delegate", 2, "mock", "none", "l2")
+        }
+
+        fn delegation_status(&self) -> Option<corecrux_memory::embeddings::DelegationStatus> {
+            Some(corecrux_memory::embeddings::DelegationStatus {
+                availability: corecrux_memory::embeddings::DelegationAvailability::Degraded,
+                circuit_state: corecrux_memory::embeddings::DelegationCircuitState::Open,
+                reason_code: "embedding_delegate_circuit_open",
+                reason: "mock circuit open",
+                consecutive_failures: 3,
+            })
+        }
+    }
+
+    impl corecrux_memory::embeddings::Embedder for SuccessfulDelegation {
+        fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, corecrux_memory::embeddings::EmbeddingError> {
+            Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            2
+        }
+
+        fn model(&self) -> &str {
+            "new-delegate"
+        }
+
+        fn semantic_profile(&self) -> SemanticProfile {
+            SemanticProfile::from_parts("new-delegate", 2, "new-tokenizer", "none", "l2")
+        }
+
+        fn delegation_status(&self) -> Option<corecrux_memory::embeddings::DelegationStatus> {
+            Some(corecrux_memory::embeddings::DelegationStatus {
+                availability: corecrux_memory::embeddings::DelegationAvailability::Available,
+                circuit_state: corecrux_memory::embeddings::DelegationCircuitState::Closed,
+                reason_code: "available",
+                reason: "mock delegate available",
+                consecutive_failures: 0,
+            })
+        }
+    }
+
     fn chunk(id: &str, text: &str) -> LocalIngestChunk {
         LocalIngestChunk {
             chunk_id: id.to_string(),
@@ -562,6 +778,169 @@ mod tests {
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn delegated_embedding_failure_returns_explicit_503_without_sparse_fallback() {
+        let mut state = super::super::tests::test_app_state(16);
+        state.local_ingest_enabled = true;
+        state
+            .fact_store
+            .write()
+            .await
+            .set_embedder(Box::new(DegradedDelegation));
+        let index = state.retrieval_index.clone();
+
+        let resp = post_local_ingest(State(state), HeaderMap::new(), Json(valid_body()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("read problem response");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("decode problem response");
+        assert_eq!(body["code"], "EMBEDDING_DELEGATION_DEGRADED");
+        assert_eq!(body["reason_code"], "embedding_delegate_circuit_open");
+        assert_eq!(
+            index.read().await.total_docs(),
+            0,
+            "failed delegation must not seal sparse data"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_ingest_rejects_unverified_caller_vectors_without_sealing() {
+        let mut state = super::super::tests::test_app_state(16);
+        state.local_ingest_enabled = true;
+        state
+            .fact_store
+            .write()
+            .await
+            .set_embedder(Box::new(SuccessfulDelegation));
+        let index = state.retrieval_index.clone();
+        let mut body = valid_body();
+        for chunk in &mut body.documents[0].chunks {
+            chunk.dense_vector = Some(vec![1.0, 0.0]);
+        }
+
+        let resp = post_local_ingest(State(state), HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("read problem response");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("decode problem response");
+        assert_eq!(body["code"], "DELEGATED_CLIENT_VECTORS_UNSUPPORTED");
+        assert_eq!(index.read().await.total_docs(), 0);
+    }
+
+    #[tokio::test]
+    async fn delegated_ingest_rejects_oversized_logical_call_without_degrading_breaker() {
+        let mut state = super::super::tests::test_app_state(16);
+        state.local_ingest_enabled = true;
+        state
+            .fact_store
+            .write()
+            .await
+            .set_embedder(Box::new(SuccessfulDelegation));
+        let store = state.fact_store.clone();
+        let index = state.retrieval_index.clone();
+        let mut body = valid_body();
+        body.documents[0].chunks = (0..=corecrux_memory::embeddings::DELEGATION_MAX_TEXTS_PER_REQUEST)
+            .map(|index| chunk(&format!("doc-1::{index}"), "bounded text"))
+            .collect();
+
+        let resp = post_local_ingest(State(state), HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("read problem response");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("decode problem response");
+        assert_eq!(body["code"], "EMBEDDING_DELEGATION_REQUEST_TOO_LARGE");
+        assert_eq!(index.read().await.total_docs(), 0);
+        assert_eq!(
+            store.read().await.delegation_status().map(|status| status.availability),
+            Some(corecrux_memory::embeddings::DelegationAvailability::Available)
+        );
+    }
+
+    #[tokio::test]
+    async fn client_supplied_semantic_profile_must_be_canonical() {
+        let mut state = super::super::tests::test_app_state(16);
+        state.local_ingest_enabled = true;
+        let mut body = valid_body();
+        for chunk in &mut body.documents[0].chunks {
+            chunk.dense_vector = Some(vec![1.0, 0.0]);
+        }
+        let mut forged = SemanticProfile::from_parts("client-model", 2, "client-tokenizer", "none", "l2");
+        forged.profile_id = "sp_forged".to_string();
+        body.semantic_profile = Some(forged);
+
+        let resp = post_local_ingest(State(state), HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("read problem response");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("decode problem response");
+        assert_eq!(body["code"], "INVALID_SEMANTIC_PROFILE");
+    }
+
+    #[tokio::test]
+    async fn delegated_ingest_rejects_provider_profile_incompatible_with_stored_vectors() {
+        let mut state = super::super::tests::test_app_state(16);
+        state.local_ingest_enabled = true;
+        let existing_profile = SemanticProfile::from_parts("old-model", 2, "old-tokenizer", "none", "l2");
+        let existing_documents = vec![ProseDocument {
+            doc_id: "existing-doc".to_string(),
+            chunks: vec![ProseChunk {
+                chunk_id: "existing-doc::0".to_string(),
+                text: "existing dense content".to_string(),
+                dense_vector: Some(vec![0.0, 1.0]),
+            }],
+        }];
+        seal_prose_documents(
+            &state.data_dir,
+            LOCAL_INGEST_SHARD_ID,
+            LOCAL_INGEST_EPOCH,
+            "t1",
+            "mediacrux-archive",
+            "2026-07-20T00:00:00Z",
+            &existing_documents,
+            Some(&existing_profile),
+        )
+        .expect("seal existing profiled vectors");
+        state
+            .retrieval_index
+            .write()
+            .await
+            .scan_and_load(&state.data_dir.join("shards").join("shard-0000").join("segments"))
+            .expect("load existing profiled vectors");
+        state
+            .fact_store
+            .write()
+            .await
+            .set_embedder(Box::new(SuccessfulDelegation));
+        let index = state.retrieval_index.clone();
+
+        let resp = post_local_ingest(State(state), HeaderMap::new(), Json(valid_body()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("read problem response");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("decode problem response");
+        assert_eq!(body["code"], "EMBEDDING_SEMANTIC_PROFILE_MISMATCH");
+        assert_eq!(
+            index.read().await.total_docs(),
+            1,
+            "incompatible delegated vectors must not be sealed"
+        );
     }
 
     #[tokio::test]

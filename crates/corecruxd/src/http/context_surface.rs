@@ -110,7 +110,7 @@ async fn gather_facts(
     state: &AppState,
     ctx: &crate::auth::HttpScopeContext,
     req: &ContextRequest,
-) -> Vec<cb::FactInput> {
+) -> Result<Vec<cb::FactInput>, corecrux_memory::embeddings::EmbeddingError> {
     let store = state.fact_store.read().await;
 
     let mut out: Vec<cb::FactInput> = Vec::new();
@@ -127,7 +127,7 @@ async fn gather_facts(
             top_k: RECALL_TOP_K,
             token_budget: None,
         };
-        for fact in super::facts::query_visible_http_facts(&store, &q, ctx) {
+        for fact in super::facts::query_visible_http_facts(&store, &q, ctx)? {
             if fact.superseded_by.is_some() || !seen.insert(fact.fact_id.clone()) {
                 continue;
             }
@@ -152,14 +152,14 @@ async fn gather_facts(
             },
             token_budget: None,
         };
-        for fact in super::facts::query_visible_http_facts(&store, &q, ctx) {
+        for fact in super::facts::query_visible_http_facts(&store, &q, ctx)? {
             if fact.superseded_by.is_some() || !seen.insert(fact.fact_id.clone()) {
                 continue;
             }
             out.push(fact_input(fact, false));
         }
     }
-    out
+    Ok(out)
 }
 
 /// Saved session state for the requested session, scoped to the caller,
@@ -412,7 +412,20 @@ async fn handle_context(state: AppState, headers: HeaderMap, req: ContextRequest
     let bundle = if let Some(bundle) = cached {
         bundle
     } else {
-        let facts = gather_facts(&state, &ctx, &req).await;
+        let facts = match gather_facts(&state, &ctx, &req).await {
+            Ok(facts) => facts,
+            Err(err) => {
+                tracing::warn!(error = %err, "context-fact-embedding-delegation-failed");
+                let status = state.fact_store.read().await.delegation_status();
+                if let Some(status) = status {
+                    return super::embedding_delegation_degraded_response(&status);
+                }
+                return problem_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Context fact embedding failed; no fallback bundle was returned.",
+                );
+            }
+        };
         let aux: Vec<AuxSection> = gather_session_state(&state, &ctx, &req).await.into_iter().collect();
         let bundle = cb::assemble(&bundle_req, facts, aux);
         if let (Some(cache), Some(key)) = (&state.assembly_cache, cache_key) {

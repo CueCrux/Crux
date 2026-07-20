@@ -222,7 +222,7 @@ impl ProductPosture {
     }
 }
 
-pub const RUNTIME_CAPABILITY_SCHEMA_VERSION: u32 = 1;
+pub const RUNTIME_CAPABILITY_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeCapabilityDescriptor {
@@ -234,6 +234,7 @@ pub struct RuntimeCapabilityDescriptor {
 pub struct RuntimeCapabilities {
     pub append: RuntimeCapability,
     pub local_embedders: RuntimeCapability,
+    pub embedding_delegation: RuntimeCapability,
     pub rerank_gpu: RuntimeCapability,
     pub hosted_sync: RuntimeCapability,
     pub projection_queries: RuntimeCapability,
@@ -257,8 +258,21 @@ pub struct RuntimeCapabilityInputs {
     pub http_dataplane_enabled: bool,
     pub local_embedder_configured: bool,
     pub local_embedder_initialized: bool,
+    pub embedding_delegation: EmbeddingDelegationRuntimeState,
     pub rerank_endpoint_configured: bool,
     pub graph_expand_configured: bool,
+}
+
+/// Safe, public projection of the delegation client's live breaker state.
+/// Raw transport errors and endpoint details never enter `/v1/version`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingDelegationRuntimeState {
+    NotConfigured,
+    Available,
+    CircuitOpen,
+    HalfOpen,
+    SemanticProfileMismatch,
+    Degraded,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -294,6 +308,24 @@ impl RuntimeCapabilityDescriptor {
             initialized: inputs.local_embedder_initialized,
             entitled: true,
             degraded: false,
+        };
+        let embedding_delegation_configured = !matches!(
+            inputs.embedding_delegation,
+            EmbeddingDelegationRuntimeState::NotConfigured
+        );
+        let embedding_delegation_degraded = matches!(
+            inputs.embedding_delegation,
+            EmbeddingDelegationRuntimeState::CircuitOpen
+                | EmbeddingDelegationRuntimeState::HalfOpen
+                | EmbeddingDelegationRuntimeState::SemanticProfileMismatch
+                | EmbeddingDelegationRuntimeState::Degraded
+        );
+        let embedding_delegation_stages = RuntimeCapabilityStages {
+            compiled: true,
+            configured: embedding_delegation_configured,
+            initialized: embedding_delegation_configured,
+            entitled: true,
+            degraded: embedding_delegation_degraded,
         };
         let rerank_stages = RuntimeCapabilityStages {
             compiled: rerank_compiled,
@@ -337,12 +369,46 @@ impl RuntimeCapabilityDescriptor {
         };
         let local_embedders = if inputs.local_embedder_configured && inputs.local_embedder_initialized {
             RuntimeCapability::available(local_embedder_stages)
+        } else if embedding_delegation_configured {
+            RuntimeCapability::unavailable(
+                "delegated_to_remote",
+                "Embedding inference is delegated to a remote daemon; no in-process embedder is initialised.",
+                local_embedder_stages,
+            )
         } else {
             RuntimeCapability::unavailable(
                 "local_embedder_unavailable",
                 "No in-process embedder is initialised in this daemon's local fact store.",
                 local_embedder_stages,
             )
+        };
+        let embedding_delegation = match inputs.embedding_delegation {
+            EmbeddingDelegationRuntimeState::NotConfigured => RuntimeCapability::unavailable(
+                "embedding_delegation_not_configured",
+                "Authenticated daemon-to-daemon embedding delegation is not configured.",
+                embedding_delegation_stages,
+            ),
+            EmbeddingDelegationRuntimeState::Available => RuntimeCapability::available(embedding_delegation_stages),
+            EmbeddingDelegationRuntimeState::CircuitOpen => RuntimeCapability::degraded(
+                "embedding_delegation_circuit_open",
+                "Embedding delegation is degraded because its circuit breaker is open.",
+                embedding_delegation_stages,
+            ),
+            EmbeddingDelegationRuntimeState::HalfOpen => RuntimeCapability::degraded(
+                "embedding_delegation_half_open",
+                "Embedding delegation is degraded while its circuit breaker probes recovery.",
+                embedding_delegation_stages,
+            ),
+            EmbeddingDelegationRuntimeState::SemanticProfileMismatch => RuntimeCapability::degraded(
+                "embedding_semantic_profile_mismatch",
+                "The remote embedding provider is incompatible with the expected or persisted semantic profile.",
+                embedding_delegation_stages,
+            ),
+            EmbeddingDelegationRuntimeState::Degraded => RuntimeCapability::degraded(
+                "embedding_delegation_degraded",
+                "Embedding delegation is configured but remote compute is currently degraded.",
+                embedding_delegation_stages,
+            ),
         };
         let rerank_gpu = if !rerank_compiled {
             RuntimeCapability::unavailable(
@@ -425,6 +491,7 @@ impl RuntimeCapabilityDescriptor {
             capabilities: RuntimeCapabilities {
                 append,
                 local_embedders,
+                embedding_delegation,
                 rerank_gpu,
                 hosted_sync,
                 projection_queries,
@@ -1077,6 +1144,7 @@ mod tests {
                 http_dataplane_enabled: true,
                 local_embedder_configured: true,
                 local_embedder_initialized: true,
+                embedding_delegation: EmbeddingDelegationRuntimeState::NotConfigured,
                 rerank_endpoint_configured: true,
                 graph_expand_configured: true,
             },
@@ -1101,6 +1169,7 @@ mod tests {
                 http_dataplane_enabled: true,
                 local_embedder_configured: true,
                 local_embedder_initialized: true,
+                embedding_delegation: EmbeddingDelegationRuntimeState::NotConfigured,
                 rerank_endpoint_configured: false,
                 graph_expand_configured: true,
             },
@@ -1122,6 +1191,7 @@ mod tests {
                 http_dataplane_enabled: true,
                 local_embedder_configured: false,
                 local_embedder_initialized: false,
+                embedding_delegation: EmbeddingDelegationRuntimeState::NotConfigured,
                 rerank_endpoint_configured: false,
                 graph_expand_configured: true,
             },
@@ -1134,6 +1204,54 @@ mod tests {
         assert!(!hosted_sync.initialized);
         assert!(hosted_sync.entitled);
         assert!(!hosted_sync.degraded);
+    }
+
+    #[test]
+    fn embedding_delegation_is_distinct_from_local_embedding_and_tracks_breaker_state() {
+        let sync = SyncRuntimeStatus::from_settings(false, None, false);
+        let available = RuntimeCapabilityDescriptor::from_runtime(
+            OperatingMode::FreeLocal,
+            &[],
+            &sync,
+            RuntimeCapabilityInputs {
+                http_dataplane_enabled: true,
+                local_embedder_configured: false,
+                local_embedder_initialized: false,
+                embedding_delegation: EmbeddingDelegationRuntimeState::Available,
+                rerank_endpoint_configured: false,
+                graph_expand_configured: true,
+            },
+        );
+
+        assert_eq!(available.schema_version, 2);
+        assert_eq!(available.capabilities.local_embedders.availability, "unavailable");
+        assert_eq!(
+            available.capabilities.local_embedders.reason_code,
+            "delegated_to_remote"
+        );
+        assert_eq!(available.capabilities.embedding_delegation.availability, "available");
+        assert!(available.capabilities.embedding_delegation.configured);
+        assert!(!available.capabilities.embedding_delegation.degraded);
+
+        let circuit_open = RuntimeCapabilityDescriptor::from_runtime(
+            OperatingMode::FreeLocal,
+            &[],
+            &sync,
+            RuntimeCapabilityInputs {
+                http_dataplane_enabled: true,
+                local_embedder_configured: false,
+                local_embedder_initialized: false,
+                embedding_delegation: EmbeddingDelegationRuntimeState::CircuitOpen,
+                rerank_endpoint_configured: false,
+                graph_expand_configured: true,
+            },
+        );
+        assert_eq!(circuit_open.capabilities.embedding_delegation.availability, "degraded");
+        assert_eq!(
+            circuit_open.capabilities.embedding_delegation.reason_code,
+            "embedding_delegation_circuit_open"
+        );
+        assert!(circuit_open.capabilities.embedding_delegation.degraded);
     }
 
     #[test]
