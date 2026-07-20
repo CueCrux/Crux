@@ -40,7 +40,7 @@ daemon workspace:
 | Crate | Path | Local role |
 |---|---|---|
 | `crux-shell-lifecycle` | `lifecycle/` | Dependency-free sidecar spawn, readiness, shutdown, and Drop backstop. |
-| `crux-shell-connection` | `connection/` | Lean profile store, URL policy, health model, finite backoff, platform credential broker, secret wrapper, and loopback proxy; its only direct dependency is exact-pinned `getrandom`. |
+| `crux-shell-connection` | `connection/` | Lean profile store, URL policy, local-plan hashing and path authorisation, health model, finite backoff, platform credential broker, secret wrapper, and loopback proxy; its direct dependencies are exact-pinned `blake3` and `getrandom`. |
 | `crux-desktop-shell` | `app/` | Thin Tauri integration, tray/window policy, and pinned Rustls HTTP adapter. Requires the WebKit/GTK toolchain on Linux. |
 
 The app uses exact dependency pins. Its attach transport is `ureq =3.3.0` with
@@ -70,13 +70,15 @@ names exactly one active profile:
       "name": "local",
       "mode": "bundled",
       "url": "",
-      "token-ref": null
+      "token-ref": null,
+      "local-plan-root": "/home/operator/PlanCrux/.agent/execplans"
     },
     {
       "name": "operations",
       "mode": "attach",
       "url": "https://crux.example.com",
-      "token-ref": "operations-agent-token"
+      "token-ref": "operations-agent-token",
+      "local-plan-root": null
     }
   ]
 }
@@ -96,6 +98,14 @@ boundaries. Missing or unknown JSON fields are
 rejected, which also prevents adding a plaintext `token` field. A missing,
 locked, malformed, or unavailable credential fails closed and produces an
 explicit native-owned status page.
+
+`local-plan-root` is optional and defaults to `null` for schema-v1 profiles
+created before M5a. When configured on the active profile, the shell hashes the
+raw bytes of top-level `<slug>.md` files with BLAKE3 and exposes the immutable
+slug-to-hash map at document start as `window.CRUX_LOCAL_PLAN_HASHES`. Without a
+configured root, no hash map is injected. A profile switch builds a fresh
+isolated webview with that profile's own initialization script; hashes never
+transit through the outgoing page.
 
 ### Lifecycle ownership
 
@@ -217,12 +227,16 @@ dialog, keychain, or updater permission. The bundled fallback document uses a
 shell-owned same-origin policy and deny framing, referrers, privileged browser
 features, and cross-origin resources. Navigation is limited to the active
 profile proxy plus the live bundled-sidecar origin. An external HTTP(S) target
-is denied in the webview and placed in a one-item native tray approval queue;
-only the operator's **Open external link** tray action launches the system
-browser. Scripted navigation cannot spawn a handler or replace a pending link,
-and a profile switch discards it. Other schemes, new windows, and downloads are
-denied. Linux browser handoff uses the fixed `/usr/bin/xdg-open` client; Windows
-uses the system `rundll32.exe` URL handler.
+is denied in the webview and placed in a one-item native tray approval queue. A
+`file:` navigation is likewise denied and may only queue a decoded path that
+canonicalises to a real lowercase-`.md` file strictly inside the active
+profile's canonical `local-plan-root`. The operator's native tray action
+re-authorises a local path immediately before handoff. Scripted navigation
+cannot spawn a handler or replace a pending target, and a profile switch
+discards it. Traversal, symlink escape, outside absolute paths, other
+extensions, directories, and missing files fail closed. Other schemes, new
+windows, and downloads are denied. Linux handoff uses the fixed
+`/usr/bin/xdg-open` client; Windows uses the system `rundll32.exe` handler.
 
 ## Health, status, and switching
 
@@ -251,7 +265,8 @@ daemon.
 ## Local verification
 
 Both support crates are WebKit-independent and can be checked on a host without
-webkit2gtk. Lifecycle is std-only; connection has one direct RNG dependency:
+webkit2gtk. Lifecycle is std-only; connection has two exact-pinned direct
+dependencies:
 
 ```bash
 (cd shells/desktop/lifecycle && cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked)
@@ -263,7 +278,9 @@ secret-field rejection, URL policy, schema-v1 health parsing, degradation and
 unreachable states, bounded backoff, same-origin enforcement, bearer
 replacement, the one-time session handshake, cookie enforcement/stripping and
 rotation, credential-output validation, token redaction, and a hostile upstream
-that returns cookies and foreign or `file://` redirects.
+that returns cookies and foreign or `file://` redirects. M5a also covers raw-byte
+plan hashes, missing/ignored plan roots, canonical path escape attempts, exact
+origin matching, public-link classification, and stale generation rejection.
 
 On a machine without the WebKit/GTK development packages, limit app checks to
 formatting and structural validation:

@@ -3486,7 +3486,11 @@
       var tree = buildPlanTree({
         projects: (projRes.ok && projRes.data) || null,
         work: (workRes.ok && workRes.data) || null,
-        sessions: (coordRes.ok && coordRes.data) || null
+        sessions: (coordRes.ok && coordRes.data) || null,
+        // M5a: the desktop shell computes local BLAKE3 plan hashes and injects
+        // them as a read-only global before page load (not IPC). Browser-only
+        // users have it undefined → the badge stays provenance-only (M4c).
+        localPlanHashes: (typeof window !== 'undefined' && window.CRUX_LOCAL_PLAN_HASHES) || null
       });
       wrap.textContent = '';
       // Fail honest PER FEED — a degraded notice renders whenever a feed failed,
