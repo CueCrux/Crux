@@ -521,6 +521,11 @@ impl FactStore {
         self.embedder.is_some()
     }
 
+    /// Returns true only when the configured embedder executes in this daemon.
+    pub fn local_embeddings_enabled(&self) -> bool {
+        self.embedder.as_ref().is_some_and(|embedder| embedder.runs_locally())
+    }
+
     /// Enable store-time semantic near-duplicate detection at `threshold` cosine
     /// (buyer-fit M3.5). Only effective when an embedder is also configured.
     pub fn set_semantic_dedup(&mut self, threshold: f32) {
@@ -2217,6 +2222,7 @@ mod tests {
         let mut store = FactStore::new();
         store.set_embedder(Box::new(crate::embeddings::LocalHashEmbedder::default()));
         assert!(store.embeddings_enabled(), "local embedder ⇒ dense enabled");
+        assert!(store.local_embeddings_enabled());
         assert_eq!(
             store.semantic_profile().unwrap().model,
             crate::embeddings::LOCAL_HASH_EMBEDDER_MODEL,
@@ -2266,6 +2272,21 @@ mod tests {
             result.facts[0].key, "terraform",
             "highest-cosine fact ranks first via the local embedder"
         );
+    }
+
+    #[test]
+    fn external_embedding_client_is_not_reported_as_local() {
+        let mut store = FactStore::new();
+        store.set_embedding_client(crate::embeddings::EmbeddingClient::new(
+            crate::embeddings::EmbeddingConfig {
+                base_url: "http://embed.example.test".to_string(),
+                model: "external-test".to_string(),
+                dimensions: 8,
+            },
+        ));
+
+        assert!(store.embeddings_enabled());
+        assert!(!store.local_embeddings_enabled());
     }
 
     #[test]

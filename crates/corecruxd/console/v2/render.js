@@ -25,11 +25,28 @@
   // control type used anywhere in pages.js has a branch here.
   var CONTROL_TYPES = ['search', 'input', 'textarea', 'select', 'toggle', 'btn', 'info', 'exp', 'rpcout', 'bar', 'theme', 'chart', 'disclose', 'repogrid', 'wbread'];
   var GATE_TITLE = 'wired in M3+';
+  var RUNTIME_CAPABILITY_PRESENTATION = Object.freeze([
+    Object.freeze(['append', 'Dataplane append']),
+    Object.freeze(['local_embedders', 'Local embedders']),
+    Object.freeze(['rerank_gpu', 'GPU rerank']),
+    Object.freeze(['hosted_sync', 'Hosted sync']),
+    Object.freeze(['projection_queries', 'Projection queries']),
+    Object.freeze(['graph_expand', 'Graph expansion'])
+  ]);
 
   // ---- Environment shims (only used when rendering in a browser) ---------
   function doc() { return (typeof document !== 'undefined') ? document : null; }
   function posture() { return (typeof window !== 'undefined' && window.CRUX_POSTURE) || 'customer'; }
   function isOperator() { return posture() === 'operator'; }
+
+  function runtimeCapabilityDescriptor() {
+    return (typeof window !== 'undefined' && window.CRUX_RUNTIME_CAPABILITIES) || null;
+  }
+
+  function controlCapabilityMap() {
+    var pages = (typeof window !== 'undefined') ? window.CruxPages : null;
+    return (pages && pages.CONTROL_CAPABILITY_MAP) || {};
+  }
 
   // ---- Posture derivation (pure; the smoke unit-tests this) --------------
   // operator ⟺ the daemon reports auth_mode 'off' (an unauthenticated local
@@ -435,6 +452,108 @@
     return node;
   }
 
+  // A mapped control is usable only when /v1/version explicitly declares its
+  // capability available. Missing, newer, or incomplete descriptors fail
+  // closed. This layer only disables; posture and the gated mutation client
+  // remain the authority for whether an enabled write may run.
+  function runtimeCapabilityState(capabilityName, descriptor) {
+    var state = {
+      capability: capabilityName, availability: 'unknown', disabled: true,
+      reasonCode: '', reason: ''
+    };
+    if (!descriptor || descriptor.schema_version !== 1 || !descriptor.capabilities) {
+      state.reasonCode = 'descriptor_unavailable';
+      state.reason = 'Capability status is unavailable for this daemon.';
+      return state;
+    }
+    var capability = descriptor.capabilities[capabilityName];
+    if (!capability) {
+      state.reasonCode = 'capability_undeclared';
+      state.reason = 'This daemon did not declare the required capability.';
+      return state;
+    }
+    var availabilityValid = capability.availability === 'available' || capability.availability === 'unavailable' || capability.availability === 'degraded';
+    var reasonsValid = typeof capability.reason_code === 'string' && capability.reason_code.length > 0
+      && typeof capability.reason === 'string' && capability.reason.length > 0;
+    var stagesValid = ['compiled', 'configured', 'initialized', 'entitled', 'degraded'].every(function (stage) {
+      return typeof capability[stage] === 'boolean';
+    });
+    var availableStateValid = capability.availability !== 'available' || !capability.degraded;
+    var degradedStateValid = capability.availability !== 'degraded' || capability.degraded;
+    if (!availabilityValid || !reasonsValid || !stagesValid || !availableStateValid || !degradedStateValid) {
+      state.reasonCode = 'capability_descriptor_invalid';
+      state.reason = 'This daemon returned an incomplete capability status.';
+      return state;
+    }
+    state.availability = capability.availability;
+    state.reasonCode = capability.reason_code;
+    state.reason = capability.reason;
+    if (capability.availability === 'available') {
+      state.disabled = false;
+      return state;
+    }
+    return state;
+  }
+
+  function capabilityStateForControl(controlId, descriptor, map) {
+    var spec = (map || {})[controlId];
+    return spec ? runtimeCapabilityState(spec.capability, descriptor) : null;
+  }
+
+  function runtimeCapabilitySection(descriptor) {
+    return {
+      h: 'Runtime capabilities', wide: true,
+      controls: RUNTIME_CAPABILITY_PRESENTATION.map(function (entry) {
+        var state = runtimeCapabilityState(entry[0], descriptor);
+        return {
+          t: 'info', label: entry[1], capability: state.capability,
+          availability: state.availability, reasonCode: state.reasonCode,
+          reason: state.reason,
+          v: state.availability + ' — ' + state.reason
+        };
+      })
+    };
+  }
+
+  function withRuntimeCapabilitySection(page, sections) {
+    if (!page || page.id !== 'cx-settings') { return sections; }
+    return [runtimeCapabilitySection(runtimeCapabilityDescriptor())].concat(sections || []);
+  }
+
+  function applyCapabilityGate(node, controlId, descriptor, map) {
+    if (!node || !controlId) { return node; }
+    if (arguments.length < 3) { descriptor = runtimeCapabilityDescriptor(); }
+    if (arguments.length < 4) { map = controlCapabilityMap(); }
+    var state = capabilityStateForControl(controlId, descriptor, map);
+    if (!state) { return node; }
+    node.setAttribute('data-capability', state.capability);
+    node.setAttribute('data-capability-availability', state.availability);
+    if (!state.disabled) { return node; }
+
+    node.setAttribute('data-capability-reason', state.reasonCode);
+    node.setAttribute('aria-disabled', 'true');
+    node.setAttribute('title', state.reason);
+    node.classList.add('is-capability-disabled');
+    var reasonId = 'capability-reason-' + String(controlId).replace(/[^a-z0-9_-]+/gi, '-');
+    var targets = node.querySelectorAll('input, select, textarea, button');
+    for (var i = 0; i < targets.length; i++) {
+      targets[i].disabled = true;
+      targets[i].setAttribute('aria-disabled', 'true');
+      targets[i].setAttribute('title', state.reason);
+      var describedBy = targets[i].getAttribute('aria-describedby') || '';
+      if ((' ' + describedBy + ' ').indexOf(' ' + reasonId + ' ') < 0) {
+        targets[i].setAttribute('aria-describedby', (describedBy ? describedBy + ' ' : '') + reasonId);
+      }
+    }
+    var reason = node.querySelector('.capability-reason');
+    if (!reason) {
+      reason = el('p', { id: reasonId, 'class': 'ctl-desc capability-reason' });
+      node.appendChild(reason);
+    }
+    reason.textContent = (state.availability === 'degraded' ? 'Degraded' : 'Unavailable') + ' — ' + state.reason;
+    return node;
+  }
+
   // ---- M13b live-write harness -------------------------------------------
   // A control whose label is a key in WIRED_WRITES is rendered ENABLED for
   // operators (never disabled, no "wired in M3+" tag) and fires a REAL, guarded
@@ -642,6 +761,13 @@
           el('span', { 'class': 'ctl-info-k', text: control.label != null ? String(control.label) : '' }),
           el('span', { 'class': 'ctl-info-v', text: control.v != null ? String(control.v) : '—' })
         ]);
+        if (control.capability) {
+          node.classList.add('runtime-capability-status');
+          node.setAttribute('data-capability', control.capability);
+          node.setAttribute('data-capability-availability', control.availability || 'unknown');
+          node.setAttribute('data-capability-reason', control.reasonCode || 'availability_unknown');
+          node.setAttribute('title', control.reason || 'Capability status is unavailable.');
+        }
         break;
       }
       case 'input': {
@@ -887,7 +1013,7 @@
         node = el('div', { 'class': 'ctl-info' }, [el('span', { 'class': 'ctl-info-k', text: String(t || '?') }), el('span', { 'class': 'ctl-info-v', text: '(unrenderable control)' })]);
       }
     }
-    return node;
+    return applyCapabilityGate(node, control && control.k);
   }
 
   function renderSection(section) {
@@ -1844,7 +1970,8 @@
       return Promise.resolve();
     }
     // Immediate paint from static sections (skeleton / fallback).
-    renderSections(container, page.sections && page.sections.length ? page.sections : [{ h: page.title, wide: true, controls: [{ t: 'info', label: 'status', v: 'loading…' }] }]);
+    var initialSections = page.sections && page.sections.length ? page.sections : [{ h: page.title, wide: true, controls: [{ t: 'info', label: 'status', v: 'loading…' }] }];
+    renderSections(container, withRuntimeCapabilitySection(page, initialSections));
     if (!page.load || typeof page.load.build !== 'function') {
       return Promise.resolve();
     }
@@ -1854,7 +1981,7 @@
       var sections;
       try { sections = page.load.build(res); }
       catch (e) { sections = [{ h: page.title, wide: true, controls: [{ t: 'info', label: 'render error', v: String(e && e.message || e) }] }]; }
-      renderSections(container, sections);
+      renderSections(container, withRuntimeCapabilitySection(page, sections));
     });
   }
 
@@ -3440,6 +3567,7 @@
     var input = el('input', { 'class': 'ctl-input', type: 'text', placeholder: 'Artefact id (e.g. 42)…', style: 'flex:1;min-width:0;' });
     var loadBtn = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Load']);
     bar.appendChild(input); bar.appendChild(loadBtn);
+    applyCapabilityGate(bar, 'documents.living.load');
     main.appendChild(bar);
     main.appendChild(el('p', { 'class': 'ctl-desc', text: 'Hydrates state · relations · dependents · pressure from /v1/admin/projections/artifacts/{id}/* (a projections/dataplane capability).' }));
     var out = el('div', { 'class': 'doc-ev-host' });
@@ -3559,6 +3687,7 @@
     var input = el('input', { 'class': 'ctl-input', type: 'text', placeholder: 'Seed artefact id(s), e.g. 42, 108…', style: 'flex:1;min-width:0;' });
     var runBtn = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Expand']);
     bar.appendChild(input); bar.appendChild(runBtn);
+    applyCapabilityGate(bar, 'documents.dependencies.expand');
     main.appendChild(bar);
     main.appendChild(el('p', { 'class': 'ctl-desc', text: 'Traverses the relation graph from your seed(s) via /v1/query/graph-expand (edge types · hops · living state).' }));
     var out = el('div', { 'class': 'doc-ev-host' });
@@ -4725,6 +4854,9 @@
     // landing entry point + the gated-mutation helpers (all funnel through the
     // single operatorGatedCall choke point).
     derivePosture: derivePosture,
+    runtimeCapabilitySection: runtimeCapabilitySection,
+    capabilityStateForControl: capabilityStateForControl,
+    applyCapabilityGate: applyCapabilityGate,
     renderOverwatchLanding: renderOverwatchLanding,
     boundPassport: boundPassport,
     approveGate: approveGate,

@@ -41,6 +41,23 @@
     if (extra) { for (var k in extra) { c[k] = extra[k]; } }
     return c;
   }
+
+  // Runtime capability contract for rendered controls. Keys are stable control
+  // ids; values name the /v1/version capability and every route that control can
+  // reach. render.js consumes this as data through one generic gate, while the
+  // smoke checks the capability names against product.rs. Keep writes on the
+  // existing gated client: this map describes routes, it never dispatches them.
+  var CONTROL_CAPABILITY_MAP = Object.freeze({
+    'documents.living.load': Object.freeze({ capability: 'projection_queries', routes: Object.freeze([
+      Object.freeze(['GET', '/v1/admin/projections/artifacts/{artifactId}/state']),
+      Object.freeze(['GET', '/v1/admin/projections/artifacts/{artifactId}/relations']),
+      Object.freeze(['GET', '/v1/admin/projections/artifacts/{artifactId}/dependents']),
+      Object.freeze(['GET', '/v1/admin/projections/artifacts/{artifactId}/pressure-events'])
+    ]) }),
+    'documents.dependencies.expand': Object.freeze({ capability: 'graph_expand', routes: Object.freeze([
+      Object.freeze(['POST', '/v1/query/graph-expand'])
+    ]) })
+  });
   // Cross-feature launch point → the Canvas relation graph, focused on this
   // node's neighbourhood (M9). A read-only nav-family LINK (t:'btn' + href), so
   // it is visible in BOTH postures (never a mutation); render.js renders it small
@@ -1727,6 +1744,7 @@
     PRO_PORTED_IDS: PRO_PORTED_IDS,
     LEGACY_PORT: LEGACY_PORT,
     MUTATING_ACTIONS: MUTATING_ACTIONS,
+    CONTROL_CAPABILITY_MAP: CONTROL_CAPABILITY_MAP,
     CONTROL_DIFF: CONTROL_DIFF,
     JSX_PORT: JSX_PORT,
     CruxDemo: CruxDemo,

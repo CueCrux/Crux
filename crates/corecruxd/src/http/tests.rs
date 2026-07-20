@@ -6856,6 +6856,152 @@ async fn panic_handler_handles_string_panic() {
 
 // ── Production hardening: /v1/version endpoint ──────────────────
 
+fn runtime_capability_profile_env() -> [EnvVarGuard; 5] {
+    [
+        EnvVarGuard::set("CORECRUXD_SYNC_ENABLED", "true"),
+        EnvVarGuard::set("CORECRUXD_SYNC_REMOTE_URL", "http://sync.example.test:14800"),
+        EnvVarGuard::set("CORECRUXD_SYNC_API_KEY", "test-key"),
+        EnvVarGuard::set("CORECRUXD_QUERY_GRAPH_EXPAND", "1"),
+        EnvVarGuard::set("CORECRUXD_GPU1_BASE_URL", "http://gpu.example.test"),
+    ]
+}
+
+fn full_runtime_capability_state() -> AppState {
+    let mut state = test_app_state(16);
+    state.operating_mode = crate::product::OperatingMode::ProHybrid;
+    state.enabled_pro_services = vec!["gpu1:rerank".to_string(), "sync:mirror".to_string()];
+    state
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn version_runtime_capability_descriptor_full_profile() {
+    let _env = runtime_capability_profile_env();
+    let mut state = full_runtime_capability_state();
+    state.http_dataplane = enabled_dataplane(Vec::new(), None);
+    state
+        .fact_store
+        .write()
+        .await
+        .set_embedder(Box::<corecrux_memory::embeddings::LocalHashEmbedder>::default());
+
+    let body = json_body(get_version(State(state)).await.into_response()).await;
+    let descriptor = &body["product"]["runtime_capabilities"];
+    let capabilities = &descriptor["capabilities"];
+
+    assert_eq!(descriptor["schema_version"], 1);
+    let capability_values = capabilities.as_object().expect("capability map");
+    assert_eq!(capability_values.len(), 6);
+    for capability in capability_values.values() {
+        assert!(capability["availability"].is_string());
+        assert!(capability["reason_code"].is_string());
+        assert!(capability["reason"].as_str().is_some_and(|reason| !reason.is_empty()));
+        for stage in ["compiled", "configured", "initialized", "entitled", "degraded"] {
+            assert!(capability[stage].is_boolean(), "missing stage {stage}");
+        }
+    }
+    for capability in [
+        "append",
+        "local_embedders",
+        "hosted_sync",
+        "projection_queries",
+        "graph_expand",
+    ] {
+        assert_eq!(capabilities[capability]["availability"], "available", "{capability}");
+        assert_eq!(capabilities[capability]["reason_code"], "available", "{capability}");
+        assert_eq!(capabilities[capability]["compiled"], true, "{capability}");
+        assert_eq!(capabilities[capability]["configured"], true, "{capability}");
+        assert_eq!(capabilities[capability]["initialized"], true, "{capability}");
+        assert_eq!(capabilities[capability]["entitled"], true, "{capability}");
+        assert_eq!(capabilities[capability]["degraded"], false, "{capability}");
+    }
+    #[cfg(feature = "hosted-surfaces")]
+    {
+        assert_eq!(capabilities["rerank_gpu"]["availability"], "available");
+        assert_eq!(capabilities["rerank_gpu"]["compiled"], true);
+        assert_eq!(capabilities["rerank_gpu"]["configured"], true);
+        assert_eq!(capabilities["rerank_gpu"]["initialized"], true);
+        assert_eq!(capabilities["rerank_gpu"]["entitled"], true);
+        assert_eq!(capabilities["rerank_gpu"]["degraded"], false);
+    }
+    #[cfg(not(feature = "hosted-surfaces"))]
+    {
+        assert_eq!(capabilities["rerank_gpu"]["availability"], "unavailable");
+        assert_eq!(capabilities["rerank_gpu"]["reason_code"], "rerank_not_compiled");
+        assert_eq!(capabilities["rerank_gpu"]["compiled"], false);
+        assert_eq!(capabilities["rerank_gpu"]["configured"], true);
+        assert_eq!(capabilities["rerank_gpu"]["initialized"], false);
+        assert_eq!(capabilities["rerank_gpu"]["entitled"], true);
+        assert_eq!(capabilities["rerank_gpu"]["degraded"], false);
+    }
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn version_runtime_capability_descriptor_dataplane_off_profile() {
+    let _env = runtime_capability_profile_env();
+    let state = full_runtime_capability_state();
+    state
+        .fact_store
+        .write()
+        .await
+        .set_embedder(Box::<corecrux_memory::embeddings::LocalHashEmbedder>::default());
+
+    let body = json_body(get_version(State(state)).await.into_response()).await;
+    let capabilities = &body["product"]["runtime_capabilities"]["capabilities"];
+
+    for capability in ["append", "projection_queries", "graph_expand"] {
+        assert_eq!(capabilities[capability]["availability"], "unavailable", "{capability}");
+        assert_eq!(
+            capabilities[capability]["reason_code"], "http_dataplane_disabled",
+            "{capability}"
+        );
+        assert_eq!(capabilities[capability]["initialized"], false, "{capability}");
+    }
+    assert_eq!(capabilities["append"]["compiled"], true);
+    assert_eq!(capabilities["append"]["configured"], false);
+    assert_eq!(capabilities["append"]["entitled"], true);
+    assert_eq!(capabilities["local_embedders"]["availability"], "available");
+    assert_eq!(capabilities["hosted_sync"]["availability"], "available");
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn version_runtime_capability_descriptor_no_local_embedder_profile() {
+    let _env = runtime_capability_profile_env();
+    let mut state = full_runtime_capability_state();
+    state.http_dataplane = enabled_dataplane(Vec::new(), None);
+    state
+        .fact_store
+        .write()
+        .await
+        .set_embedding_client(corecrux_memory::embeddings::EmbeddingClient::new(
+            corecrux_memory::embeddings::EmbeddingConfig {
+                base_url: "http://embed.example.test".to_string(),
+                model: "remote-test".to_string(),
+                dimensions: 8,
+            },
+        ));
+
+    let body = json_body(get_version(State(state)).await.into_response()).await;
+    let capabilities = &body["product"]["runtime_capabilities"]["capabilities"];
+
+    assert_eq!(body["features"]["embeddings"], true);
+    assert_eq!(body["semantic_profile"]["model"], "remote-test");
+    assert_eq!(capabilities["append"]["availability"], "available");
+    assert_eq!(capabilities["projection_queries"]["availability"], "available");
+    assert_eq!(capabilities["local_embedders"]["availability"], "unavailable");
+    assert_eq!(
+        capabilities["local_embedders"]["reason_code"],
+        "local_embedder_unavailable"
+    );
+    assert_eq!(capabilities["local_embedders"]["compiled"], true);
+    assert_eq!(capabilities["local_embedders"]["configured"], false);
+    assert_eq!(capabilities["local_embedders"]["initialized"], false);
+    assert_eq!(capabilities["local_embedders"]["entitled"], true);
+    assert_eq!(capabilities["local_embedders"]["degraded"], false);
+}
+
 #[serial_test::serial]
 #[tokio::test]
 async fn version_public_view_is_redacted() {
@@ -7041,7 +7187,9 @@ async fn version_endpoint_reports_degraded_sync_when_remote_is_incomplete() {
     std::env::set_var("CORECRUXD_SYNC_REMOTE_URL", "http://example.test:14800");
     std::env::remove_var("CORECRUXD_SYNC_API_KEY");
 
-    let state = test_app_state(16);
+    let mut state = test_app_state(16);
+    state.operating_mode = crate::product::OperatingMode::ProHybrid;
+    state.enabled_pro_services = vec!["sync:mirror".to_string()];
     let resp = get_version(State(state)).await.into_response();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = json_body(resp).await;
@@ -7055,6 +7203,13 @@ async fn version_endpoint_reports_degraded_sync_when_remote_is_incomplete() {
         .as_str()
         .unwrap_or_default()
         .contains("CORECRUXD_SYNC_API_KEY"));
+    let hosted_sync = &body["product"]["runtime_capabilities"]["capabilities"]["hosted_sync"];
+    assert_eq!(hosted_sync["availability"], "degraded");
+    assert_eq!(hosted_sync["reason_code"], "hosted_sync_degraded");
+    assert_eq!(hosted_sync["configured"], false);
+    assert_eq!(hosted_sync["initialized"], true);
+    assert_eq!(hosted_sync["entitled"], true);
+    assert_eq!(hosted_sync["degraded"], true);
 
     std::env::remove_var("CORECRUXD_SYNC_ENABLED");
     std::env::remove_var("CORECRUXD_SYNC_REMOTE_URL");

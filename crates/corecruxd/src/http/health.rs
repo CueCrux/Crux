@@ -422,6 +422,39 @@ fn gpu1_compute_view(_state: &AppState) -> serde_json::Value {
     serde_json::Value::Null
 }
 
+#[cfg(feature = "hosted-surfaces")]
+fn rerank_endpoint_configured(state: &AppState) -> bool {
+    super::gpu1::compute_posture(state).endpoint_configured
+}
+
+#[cfg(not(feature = "hosted-surfaces"))]
+fn rerank_endpoint_configured(_state: &AppState) -> bool {
+    std::env::var("CORECRUXD_GPU1_BASE_URL")
+        .or_else(|_| std::env::var("CRUX_GPU1_BASE_URL"))
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn runtime_capability_descriptor(
+    state: &AppState,
+    sync_status: &corecrux_memory::sync::SyncRuntimeStatus,
+    local_embedder_configured: bool,
+    local_embedder_initialized: bool,
+) -> crate::product::RuntimeCapabilityDescriptor {
+    crate::product::RuntimeCapabilityDescriptor::from_runtime(
+        state.operating_mode,
+        &state.enabled_pro_services,
+        sync_status,
+        crate::product::RuntimeCapabilityInputs {
+            http_dataplane_enabled: state.http_dataplane.enabled(),
+            local_embedder_configured,
+            local_embedder_initialized,
+            rerank_endpoint_configured: rerank_endpoint_configured(state),
+            graph_expand_configured: is_query_feature_enabled("CORECRUXD_QUERY_GRAPH_EXPAND"),
+        },
+    )
+}
+
 #[utoipa::path(
     get,
     path = "/v1/version",
@@ -432,15 +465,25 @@ fn gpu1_compute_view(_state: &AppState) -> serde_json::Value {
 )]
 pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoResponse {
     let sync_status = sync_runtime_status();
-    let product = crate::product::ProductPosture::new(state.operating_mode, &state.enabled_pro_services);
     let cloud = crate::product::CloudPosture::from_sync(&sync_status);
     let cloud_access =
         crate::product::CloudAccessContract::new(state.operating_mode, &state.enabled_pro_services, &cloud);
     let agent_workbench = super::workbench::workbench_posture(&state);
-    let (embeddings_enabled, semantic_profile) = {
+    let (embeddings_enabled, local_embedder_configured, semantic_profile) = {
         let store = state.fact_store.read().await;
-        (store.embeddings_enabled(), store.semantic_profile())
+        (
+            store.embeddings_enabled(),
+            store.local_embeddings_enabled(),
+            store.semantic_profile(),
+        )
     };
+    let product = crate::product::ProductPosture::new(state.operating_mode, &state.enabled_pro_services)
+        .with_runtime_capabilities(runtime_capability_descriptor(
+            &state,
+            &sync_status,
+            local_embedder_configured,
+            local_embedder_configured && semantic_profile.is_some(),
+        ));
     let retrieval_segment_count = state.retrieval_index.read().await.segment_count();
     let protocol_contracts =
         crate::protocol_posture::ProtocolPosture::from_runtime(retrieval_segment_count, semantic_profile.as_ref());
@@ -523,16 +566,26 @@ pub(super) async fn get_admin_version(State(state): State<AppState>, headers: He
     }
     let sync_status = sync_runtime_status();
     let update_status = state.update_status.read().await.public_view();
-    let product = crate::product::ProductPosture::new(state.operating_mode, &state.enabled_pro_services);
     let cloud = crate::product::CloudPosture::from_sync(&sync_status);
     let cloud_access =
         crate::product::CloudAccessContract::new(state.operating_mode, &state.enabled_pro_services, &cloud);
     let action_enrichment = super::actions::action_enrichment_posture(&state);
     let agent_workbench = super::workbench::workbench_posture(&state);
-    let (embeddings_enabled, semantic_profile) = {
+    let (embeddings_enabled, local_embedder_configured, semantic_profile) = {
         let store = state.fact_store.read().await;
-        (store.embeddings_enabled(), store.semantic_profile())
+        (
+            store.embeddings_enabled(),
+            store.local_embeddings_enabled(),
+            store.semantic_profile(),
+        )
     };
+    let product = crate::product::ProductPosture::new(state.operating_mode, &state.enabled_pro_services)
+        .with_runtime_capabilities(runtime_capability_descriptor(
+            &state,
+            &sync_status,
+            local_embedder_configured,
+            local_embedder_configured && semantic_profile.is_some(),
+        ));
     let retrieval_segment_count = state.retrieval_index.read().await.segment_count();
     let protocol_contracts =
         crate::protocol_posture::ProtocolPosture::from_runtime(retrieval_segment_count, semantic_profile.as_ref());
