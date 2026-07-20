@@ -642,6 +642,7 @@ pub(crate) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         coord_presence_ttl_secs: crate::coord::DEFAULT_PRESENCE_TTL_SECS,
         consolidation_scheduler_enabled: false,
         context_surface_enabled: true,
+        compute_provider_enabled: false,
         auto_capture_enabled: true,
         local_ingest_enabled: false,
         stream_receipts_enabled: false,
@@ -6889,11 +6890,11 @@ async fn version_runtime_capability_descriptor_full_profile() {
     let descriptor = &body["product"]["runtime_capabilities"];
     let capabilities = &descriptor["capabilities"];
 
-    assert_eq!(descriptor["schema_version"], 1);
+    assert_eq!(descriptor["schema_version"], 2);
     let Some(capability_values) = capabilities.as_object() else {
         panic!("runtime_capabilities.capabilities must be a JSON object");
     };
-    assert_eq!(capability_values.len(), 6);
+    assert_eq!(capability_values.len(), 7);
     for capability in capability_values.values() {
         assert!(capability["availability"].is_string());
         assert!(capability["reason_code"].is_string());
@@ -6917,6 +6918,12 @@ async fn version_runtime_capability_descriptor_full_profile() {
         assert_eq!(capabilities[capability]["entitled"], true, "{capability}");
         assert_eq!(capabilities[capability]["degraded"], false, "{capability}");
     }
+    assert_eq!(capabilities["embedding_delegation"]["availability"], "unavailable");
+    assert_eq!(
+        capabilities["embedding_delegation"]["reason_code"],
+        "embedding_delegation_not_configured"
+    );
+    assert_eq!(capabilities["embedding_delegation"]["configured"], false);
     #[cfg(feature = "hosted-surfaces")]
     {
         assert_eq!(capabilities["rerank_gpu"]["availability"], "available");
@@ -7002,6 +7009,40 @@ async fn version_runtime_capability_descriptor_no_local_embedder_profile() {
     assert_eq!(capabilities["local_embedders"]["initialized"], false);
     assert_eq!(capabilities["local_embedders"]["entitled"], true);
     assert_eq!(capabilities["local_embedders"]["degraded"], false);
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn version_runtime_capability_descriptor_delegating_lite_profile(
+) -> Result<(), corecrux_memory::embeddings::EmbeddingError> {
+    let _env = runtime_capability_profile_env();
+    let mut state = full_runtime_capability_state();
+    state.http_dataplane = enabled_dataplane(Vec::new(), None);
+    let delegate = corecrux_memory::embeddings::DelegatingEmbedder::new(
+        corecrux_memory::embeddings::DelegatingEmbeddingConfig::new(
+            "http://compute.example.test".to_string(),
+            "test-delegate-token".to_string(),
+            "remote-test".to_string(),
+            8,
+        ),
+    )?;
+    state.fact_store.write().await.set_embedder(Box::new(delegate));
+
+    let body = json_body(get_version(State(state)).await.into_response()).await;
+    let capabilities = &body["product"]["runtime_capabilities"]["capabilities"];
+
+    assert_eq!(body["product"]["runtime_capabilities"]["schema_version"], 2);
+    assert_eq!(body["features"]["embeddings"], true);
+    assert_eq!(body["semantic_profile"]["model"], "remote-test");
+    assert_eq!(body["semantic_profile"]["dimensions"], 8);
+    assert_eq!(capabilities["local_embedders"]["availability"], "unavailable");
+    assert_eq!(capabilities["local_embedders"]["reason_code"], "delegated_to_remote");
+    assert_eq!(capabilities["embedding_delegation"]["availability"], "available");
+    assert_eq!(capabilities["embedding_delegation"]["reason_code"], "available");
+    assert_eq!(capabilities["embedding_delegation"]["configured"], true);
+    assert_eq!(capabilities["embedding_delegation"]["initialized"], true);
+    assert_eq!(capabilities["embedding_delegation"]["degraded"], false);
+    Ok(())
 }
 
 #[serial_test::serial]
@@ -15893,7 +15934,7 @@ async fn route_auth_ok_handler() -> StatusCode {
 /// (and the downstream handler's own scope check) so the "sufficient" leg is
 /// admitted by the middleware and not rejected by the handler for auth reasons.
 const ROUTE_AUTH_BROAD_SCOPES: &str = "admin:read admin:write query:read facts:read facts:write \
-sessions:read sessions:write replication:write integrations:install";
+sessions:read sessions:write replication:write integrations:install compute:embed";
 
 /// A scope no contract accepts — guarantees the middleware's insufficient-scope
 /// path regardless of which route it is applied to.

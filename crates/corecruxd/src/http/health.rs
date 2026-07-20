@@ -435,11 +435,34 @@ fn rerank_endpoint_configured(_state: &AppState) -> bool {
         .is_some_and(|value| !value.trim().is_empty())
 }
 
+fn embedding_delegation_runtime_state(
+    status: Option<&corecrux_memory::embeddings::DelegationStatus>,
+) -> crate::product::EmbeddingDelegationRuntimeState {
+    use crate::product::EmbeddingDelegationRuntimeState;
+    use corecrux_memory::embeddings::{DelegationAvailability, DelegationCircuitState};
+
+    let Some(status) = status else {
+        return EmbeddingDelegationRuntimeState::NotConfigured;
+    };
+    if status.reason_code == "embedding_semantic_profile_mismatch" {
+        return EmbeddingDelegationRuntimeState::SemanticProfileMismatch;
+    }
+    match status.circuit_state {
+        DelegationCircuitState::Open => EmbeddingDelegationRuntimeState::CircuitOpen,
+        DelegationCircuitState::HalfOpen => EmbeddingDelegationRuntimeState::HalfOpen,
+        DelegationCircuitState::Closed => match status.availability {
+            DelegationAvailability::Available => EmbeddingDelegationRuntimeState::Available,
+            DelegationAvailability::Degraded => EmbeddingDelegationRuntimeState::Degraded,
+        },
+    }
+}
+
 fn runtime_capability_descriptor(
     state: &AppState,
     sync_status: &corecrux_memory::sync::SyncRuntimeStatus,
     local_embedder_configured: bool,
     local_embedder_initialized: bool,
+    embedding_delegation: crate::product::EmbeddingDelegationRuntimeState,
 ) -> crate::product::RuntimeCapabilityDescriptor {
     crate::product::RuntimeCapabilityDescriptor::from_runtime(
         state.operating_mode,
@@ -449,6 +472,7 @@ fn runtime_capability_descriptor(
             http_dataplane_enabled: state.http_dataplane.enabled(),
             local_embedder_configured,
             local_embedder_initialized,
+            embedding_delegation,
             rerank_endpoint_configured: rerank_endpoint_configured(state),
             graph_expand_configured: is_query_feature_enabled("CORECRUXD_QUERY_GRAPH_EXPAND"),
         },
@@ -469,12 +493,14 @@ pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoRespo
     let cloud_access =
         crate::product::CloudAccessContract::new(state.operating_mode, &state.enabled_pro_services, &cloud);
     let agent_workbench = super::workbench::workbench_posture(&state);
-    let (embeddings_enabled, local_embedder_configured, semantic_profile) = {
+    let (embeddings_enabled, local_embedder_configured, semantic_profile, embedding_delegation) = {
         let store = state.fact_store.read().await;
+        let delegation_status = store.delegation_status();
         (
             store.embeddings_enabled(),
             store.local_embeddings_enabled(),
             store.semantic_profile(),
+            embedding_delegation_runtime_state(delegation_status.as_ref()),
         )
     };
     let product = crate::product::ProductPosture::new(state.operating_mode, &state.enabled_pro_services)
@@ -483,6 +509,7 @@ pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoRespo
             &sync_status,
             local_embedder_configured,
             local_embedder_configured && semantic_profile.is_some(),
+            embedding_delegation,
         ));
     let retrieval_segment_count = state.retrieval_index.read().await.segment_count();
     let protocol_contracts =
@@ -571,12 +598,14 @@ pub(super) async fn get_admin_version(State(state): State<AppState>, headers: He
         crate::product::CloudAccessContract::new(state.operating_mode, &state.enabled_pro_services, &cloud);
     let action_enrichment = super::actions::action_enrichment_posture(&state);
     let agent_workbench = super::workbench::workbench_posture(&state);
-    let (embeddings_enabled, local_embedder_configured, semantic_profile) = {
+    let (embeddings_enabled, local_embedder_configured, semantic_profile, embedding_delegation) = {
         let store = state.fact_store.read().await;
+        let delegation_status = store.delegation_status();
         (
             store.embeddings_enabled(),
             store.local_embeddings_enabled(),
             store.semantic_profile(),
+            embedding_delegation_runtime_state(delegation_status.as_ref()),
         )
     };
     let product = crate::product::ProductPosture::new(state.operating_mode, &state.enabled_pro_services)
@@ -585,6 +614,7 @@ pub(super) async fn get_admin_version(State(state): State<AppState>, headers: He
             &sync_status,
             local_embedder_configured,
             local_embedder_configured && semantic_profile.is_some(),
+            embedding_delegation,
         ));
     let retrieval_segment_count = state.retrieval_index.read().await.segment_count();
     let protocol_contracts =

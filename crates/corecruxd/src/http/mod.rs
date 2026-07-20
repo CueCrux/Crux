@@ -18,6 +18,7 @@ mod cases;
 // the default Community Edition binary; see the `hosted-surfaces` feature.
 #[cfg(feature = "hosted-surfaces")]
 mod cloud;
+mod compute;
 mod console;
 mod consolidation_receipt;
 mod context_surface;
@@ -232,6 +233,11 @@ pub struct AppState {
     /// Provider-agnostic injection-bundle surface (`/v1/context`). Default
     /// OFF (`CORECRUXD_CONTEXT_SURFACE=1`); when off, routes return 404.
     pub context_surface_enabled: bool,
+    /// Authenticated daemon-to-daemon embedding provider
+    /// (`POST /v1/compute/embed`). Default OFF
+    /// (`CORECRUXD_COMPUTE_PROVIDER=1`); the route remains mounted while off
+    /// so clients receive an explicit capability-disabled response.
+    pub compute_provider_enabled: bool,
     /// Local CPU prose-ingest door (`/v1/local/ingest`). Seals pre-formatted
     /// prose payloads into local segments served over BM25 — no GPU dataplane.
     /// Default ON; `CORECRUXD_LOCAL_INGEST=0` or `false` disables it and makes
@@ -463,6 +469,12 @@ pub(crate) fn router_with_route_auth(
             "/v1/audit/bundle/verify",
             axum::routing::post(self::audit_verify::post_audit_bundle_verify).layer(
                 axum::extract::DefaultBodyLimit::max(self::audit_verify::AUDIT_BUNDLE_MAX_UPLOAD_BYTES),
+            ),
+        )
+        .route(
+            "/v1/compute/embed",
+            axum::routing::post(self::compute::post_compute_embed).layer(
+                axum::extract::DefaultBodyLimit::max(self::compute::COMPUTE_EMBED_MAX_REQUEST_BYTES),
             ),
         )
         .route("/v1/legal-holds", axum::routing::post(self::legal_holds::post_legal_hold))
@@ -1690,6 +1702,38 @@ fn problem_for_status(status: StatusCode, detail: impl Into<String>) -> ProblemR
 
 fn problem_response(status: StatusCode, detail: impl Into<String>) -> Response {
     problem_for_status(status, detail).into_response()
+}
+
+/// Fail closed when a configured daemon-to-daemon embedder cannot provide the
+/// vector required by the current operation. The reason code mirrors the live
+/// `/v1/version` descriptor without exposing the delegate URL, token, or raw
+/// transport error.
+fn embedding_delegation_degraded_response(status: &corecrux_memory::embeddings::DelegationStatus) -> Response {
+    ProblemResponse(
+        ProblemDetails::service_unavailable(
+            "Remote embedding delegation is degraded; no local or empty-vector fallback was used.",
+        )
+        .with_extensions(serde_json::json!({
+            "code": "EMBEDDING_DELEGATION_DEGRADED",
+            "capability": "embedding_delegation",
+            "availability": "degraded",
+            "reason_code": status.reason_code,
+            "circuit_state": status.circuit_state,
+        })),
+    )
+    .into_response()
+}
+
+fn embedding_semantic_profile_mismatch_response(detail: &'static str) -> Response {
+    ProblemResponse(
+        ProblemDetails::service_unavailable(detail).with_extensions(serde_json::json!({
+            "code": "EMBEDDING_SEMANTIC_PROFILE_MISMATCH",
+            "capability": "embedding_delegation",
+            "availability": "degraded",
+            "reason_code": "embedding_semantic_profile_mismatch",
+        })),
+    )
+    .into_response()
 }
 
 /// Upgrade-aware `501 Not Implemented` for capabilities that exist on the

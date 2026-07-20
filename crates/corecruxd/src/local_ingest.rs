@@ -350,6 +350,7 @@ fn read_ccxv(path: &Path) -> Option<(u32, DenseEntries)> {
 /// so a per-`(shards_dir, segment_seq)` cache entry never goes stale; new
 /// segments only add entries.
 struct CachedDenseSegment {
+    dimension: usize,
     entries: DenseEntries,
     profile: Option<corecrux_memory::embeddings::SemanticProfile>,
 }
@@ -365,6 +366,22 @@ type DenseSegmentCache = std::collections::HashMap<(std::path::PathBuf, u64), st
 /// each build, so it stays bounded by the corpus and drops erased segments.
 static DENSE_SEGMENT_CACHE: std::sync::LazyLock<std::sync::Mutex<DenseSegmentCache>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Why a delegated query cannot safely score a persisted dense segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenseProfileCompatibilityError {
+    /// The segment predates semantic-profile sidecars, so its model identity
+    /// cannot be proven even if the vector dimension happens to match.
+    MissingProfile { segment_seq: u64 },
+    /// The persisted vectors were produced in a different semantic space.
+    FingerprintMismatch { segment_seq: u64 },
+    /// The profile sidecar's derived ids/hash do not match its declared fields.
+    InvalidProfile { segment_seq: u64 },
+    /// The vector companion, profile, and query do not share one dimension.
+    DimensionMismatch { segment_seq: u64 },
+    /// The vector companion is malformed or contains non-finite values.
+    InvalidVectorCompanion { segment_seq: u64 },
+}
 
 /// Build a [`corecrux_retrieval::CosineDenseProvider`] over all sealed `.ccxv` companions, keyed by
 /// `(doc_id, segment_index)` to match [`corecrux_retrieval::fused::fused_retrieve`]'s
@@ -386,6 +403,30 @@ pub fn build_dense_provider(
     query_embedding: &[f32],
     expected_fingerprint: Option<&str>,
 ) -> Option<corecrux_retrieval::CosineDenseProvider> {
+    build_dense_provider_inner(index_mgr, data_dir, query_embedding, expected_fingerprint, false)
+        .ok()
+        .flatten()
+}
+
+/// Delegation-specific dense provider construction. Unlike the legacy/local
+/// path, every stored vector segment must prove the same semantic fingerprint;
+/// an incompatible or unlabelled segment is an error, never a BM25-only 200.
+pub fn build_dense_provider_strict(
+    index_mgr: &corecrux_retrieval::IndexManager,
+    data_dir: &Path,
+    query_embedding: &[f32],
+    expected_fingerprint: &str,
+) -> Result<Option<corecrux_retrieval::CosineDenseProvider>, DenseProfileCompatibilityError> {
+    build_dense_provider_inner(index_mgr, data_dir, query_embedding, Some(expected_fingerprint), true)
+}
+
+fn build_dense_provider_inner(
+    index_mgr: &corecrux_retrieval::IndexManager,
+    data_dir: &Path,
+    query_embedding: &[f32],
+    expected_fingerprint: Option<&str>,
+    strict_profile: bool,
+) -> Result<Option<corecrux_retrieval::CosineDenseProvider>, DenseProfileCompatibilityError> {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
@@ -409,20 +450,62 @@ pub fn build_dense_provider(
             let Some(path) = find_ccxv_for_seq(&shards_dir, seq) else {
                 continue;
             };
-            let Some((_dim, entries)) = read_ccxv(&path) else {
+            let Some((dimension, entries)) = read_ccxv(&path) else {
+                if strict_profile {
+                    return Err(DenseProfileCompatibilityError::InvalidVectorCompanion { segment_seq: seq });
+                }
                 continue;
             };
             let profile = read_ccxp(&path.with_extension("ccxp"));
-            let c = Arc::new(CachedDenseSegment { entries, profile });
+            let c = Arc::new(CachedDenseSegment {
+                dimension: dimension as usize,
+                entries,
+                profile,
+            });
             cache.insert((shards_dir.clone(), seq), Arc::clone(&c));
             c
         };
-        // Skip segments whose recorded profile is incompatible with the query.
+        // Local/generic embedders retain the existing compatible-subset
+        // behavior. Authenticated daemon delegation is strict: silently
+        // dropping a mismatched segment would turn a semantic query into an
+        // apparently successful sparse-only result.
+        if strict_profile
+            && cached
+                .entries
+                .iter()
+                .any(|(_, vector)| vector.len() != cached.dimension || vector.iter().any(|value| !value.is_finite()))
+        {
+            return Err(DenseProfileCompatibilityError::InvalidVectorCompanion { segment_seq: seq });
+        }
         if let Some(expected) = expected_fingerprint {
-            if let Some(profile) = &cached.profile {
-                if profile.embedding_fingerprint.hash != expected {
-                    continue;
+            match &cached.profile {
+                Some(profile) => {
+                    if strict_profile {
+                        let canonical = corecrux_memory::embeddings::SemanticProfile::from_parts(
+                            &profile.model,
+                            profile.dimensions,
+                            &profile.tokenizer,
+                            &profile.prompt_template_version,
+                            &profile.normalisation,
+                        );
+                        if profile != &canonical {
+                            return Err(DenseProfileCompatibilityError::InvalidProfile { segment_seq: seq });
+                        }
+                        if cached.dimension != profile.dimensions || cached.dimension != query_embedding.len() {
+                            return Err(DenseProfileCompatibilityError::DimensionMismatch { segment_seq: seq });
+                        }
+                    }
+                    if profile.embedding_fingerprint.hash != expected {
+                        if strict_profile {
+                            return Err(DenseProfileCompatibilityError::FingerprintMismatch { segment_seq: seq });
+                        }
+                        continue;
+                    }
                 }
+                None if strict_profile => {
+                    return Err(DenseProfileCompatibilityError::MissingProfile { segment_seq: seq });
+                }
+                _ => {}
             }
         }
         for (doc_id, v) in &cached.entries {
@@ -431,9 +514,12 @@ pub fn build_dense_provider(
     }
 
     if vectors.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(corecrux_retrieval::CosineDenseProvider::new(query_embedding, vectors))
+    Ok(Some(corecrux_retrieval::CosineDenseProvider::new(
+        query_embedding,
+        vectors,
+    )))
 }
 
 /// Locate the `.ccxv` companion for a segment sequence across all shards.
@@ -691,6 +777,155 @@ mod tests {
         // doc-b is the 2nd appended frame → doc_id 1, and is query-aligned.
         assert_eq!(resp.results[0].doc_id, 1, "query-aligned doc must rank first");
         assert!(resp.results[0].score_breakdown.dense > 0.99, "top hit dense score ~1.0");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn delegated_dense_provider_rejects_mismatched_or_unlabelled_stored_vectors() {
+        let matching_profile =
+            corecrux_memory::embeddings::SemanticProfile::from_parts("delegate-model", 2, "tokenizer-a", "none", "l2");
+        let wrong_profile =
+            corecrux_memory::embeddings::SemanticProfile::from_parts("other-model", 2, "tokenizer-b", "none", "l2");
+        let docs = vec![ProseDocument {
+            doc_id: "profiled".to_string(),
+            chunks: vec![dense_chunk("profiled::0", "profiled vector", vec![1.0, 0.0])],
+        }];
+
+        let profiled = tempfile::tempdir().unwrap();
+        seal_prose_documents(
+            profiled.path(),
+            0,
+            1,
+            "tenant",
+            "corpus",
+            "2026-07-01T00:00:00Z",
+            &docs,
+            Some(&matching_profile),
+        )
+        .expect("seal profiled vectors");
+        let mut profiled_index = IndexManager::new();
+        profiled_index
+            .scan_and_load(&profiled.path().join("shards").join("shard-0000").join("segments"))
+            .expect("scan profiled vectors");
+        assert!(build_dense_provider_strict(
+            &profiled_index,
+            profiled.path(),
+            &[1.0, 0.0],
+            &matching_profile.embedding_fingerprint.hash,
+        )
+        .expect("matching profile")
+        .is_some());
+        assert!(matches!(
+            build_dense_provider_strict(
+                &profiled_index,
+                profiled.path(),
+                &[1.0, 0.0],
+                &wrong_profile.embedding_fingerprint.hash,
+            ),
+            Err(DenseProfileCompatibilityError::FingerprintMismatch { .. })
+        ));
+
+        let unlabelled = tempfile::tempdir().unwrap();
+        seal_prose_documents(
+            unlabelled.path(),
+            0,
+            1,
+            "tenant",
+            "corpus",
+            "2026-07-01T00:00:00Z",
+            &docs,
+            None,
+        )
+        .expect("seal legacy vectors");
+        let mut unlabelled_index = IndexManager::new();
+        unlabelled_index
+            .scan_and_load(&unlabelled.path().join("shards").join("shard-0000").join("segments"))
+            .expect("scan legacy vectors");
+        assert!(matches!(
+            build_dense_provider_strict(
+                &unlabelled_index,
+                unlabelled.path(),
+                &[1.0, 0.0],
+                &matching_profile.embedding_fingerprint.hash,
+            ),
+            Err(DenseProfileCompatibilityError::MissingProfile { .. })
+        ));
+
+        let forged = tempfile::tempdir().unwrap();
+        seal_prose_documents(
+            forged.path(),
+            0,
+            1,
+            "tenant",
+            "corpus",
+            "2026-07-01T00:00:00Z",
+            &docs,
+            Some(&matching_profile),
+        )
+        .expect("seal vectors with profile to forge");
+        let forged_segments = forged.path().join("shards").join("shard-0000").join("segments");
+        let profile_path = std::fs::read_dir(&forged_segments)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("ccxp"))
+            .expect("profile companion");
+        let mut forged_profile = matching_profile.clone();
+        forged_profile.profile_id = "sp_forged".to_string();
+        std::fs::write(&profile_path, serde_json::to_vec(&forged_profile).unwrap()).expect("forge profile sidecar");
+        let mut forged_index = IndexManager::new();
+        forged_index
+            .scan_and_load(&forged_segments)
+            .expect("scan forged profile vectors");
+        assert!(matches!(
+            build_dense_provider_strict(
+                &forged_index,
+                forged.path(),
+                &[1.0, 0.0],
+                &matching_profile.embedding_fingerprint.hash,
+            ),
+            Err(DenseProfileCompatibilityError::InvalidProfile { .. })
+        ));
+
+        let wrong_dimension = tempfile::tempdir().unwrap();
+        seal_prose_documents(
+            wrong_dimension.path(),
+            0,
+            1,
+            "tenant",
+            "corpus",
+            "2026-07-01T00:00:00Z",
+            &docs,
+            Some(&matching_profile),
+        )
+        .expect("seal vectors with dimension to forge");
+        let dimension_segments = wrong_dimension
+            .path()
+            .join("shards")
+            .join("shard-0000")
+            .join("segments");
+        let vector_path = std::fs::read_dir(&dimension_segments)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("ccxv"))
+            .expect("vector companion");
+        let mut vector_bytes = std::fs::read(&vector_path).expect("read vector companion");
+        vector_bytes[6..10].copy_from_slice(&1u32.to_le_bytes());
+        std::fs::write(&vector_path, vector_bytes).expect("forge vector dimension");
+        let mut dimension_index = IndexManager::new();
+        dimension_index
+            .scan_and_load(&dimension_segments)
+            .expect("scan wrong-dimension vectors");
+        assert!(matches!(
+            build_dense_provider_strict(
+                &dimension_index,
+                wrong_dimension.path(),
+                &[1.0, 0.0],
+                &matching_profile.embedding_fingerprint.hash,
+            ),
+            Err(DenseProfileCompatibilityError::DimensionMismatch { .. })
+        ));
     }
 
     /// FU3: `build_dense_provider` caches parsed companions per `(shards_dir,

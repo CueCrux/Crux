@@ -299,6 +299,29 @@ impl IngressConfig {
     }
 }
 
+/// An environment-sourced secret whose debug representation is always redacted.
+///
+/// Keep the bearer available only to the outbound client construction path;
+/// configuration diagnostics must never print the credential.
+#[derive(Clone)]
+pub struct RedactedSecret(String);
+
+impl RedactedSecret {
+    fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for RedactedSecret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub loaded_config_path: Option<PathBuf>,
@@ -429,9 +452,19 @@ pub struct Config {
     // JSONL persistence for FactStore and SessionStore.
     pub fact_persistence_enabled: bool,
 
+    // Full-daemon embedding compute provider. Default OFF: a daemon must opt in
+    // before `/v1/compute/embed` will execute local embedding work for peers.
+    pub compute_provider_enabled: bool,
+
     // Optional embedding endpoint for dense vector retrieval on facts.
     pub embedding_url: Option<String>,
     pub embedding_model: String,
+    // Authenticated daemon-to-daemon embedding delegation. The configured
+    // model is `embedding_model`; dimensions are mandatory so a lite daemon can
+    // fail closed before accepting vectors from an incompatible semantic space.
+    pub embed_delegate_url: Option<String>,
+    pub embed_delegate_token: Option<RedactedSecret>,
+    pub embed_delegate_dimensions: Option<usize>,
     // Pure-Rust offline dense embedder (buyer-fit M3.2). Default ON: when no
     // external `embedding_url` is set, facts are embedded with the zero-dep
     // `LocalHashEmbedder` so dense recall works with no external service. Set
@@ -555,6 +588,45 @@ pub struct Config {
     // daemon's operating contract; paid-gate enforcement is layered separately.
     pub operating_mode: OperatingMode,
     pub enabled_pro_services: Vec<String>,
+}
+
+impl Config {
+    /// Validate the mutually-exclusive embedding provider selection.
+    ///
+    /// Delegation is an explicit fail-closed profile: once any delegation
+    /// setting is present, an incomplete or ambiguous configuration aborts
+    /// startup instead of falling through to Ollama or an in-process model.
+    pub(crate) fn validate_embedding_selection(&self) -> Result<(), &'static str> {
+        let delegation_configured = self.embed_delegate_url.is_some()
+            || self.embed_delegate_token.is_some()
+            || self.embed_delegate_dimensions.is_some();
+        if !delegation_configured {
+            return Ok(());
+        }
+        if self.compute_provider_enabled {
+            return Err(
+                "CORECRUXD_COMPUTE_PROVIDER and CORECRUXD_EMBED_DELEGATE_URL are mutually exclusive to prevent delegation cycles",
+            );
+        }
+        if self.embed_delegate_url.is_none() {
+            return Err("CORECRUXD_EMBED_DELEGATE_URL is required when embedding delegation is configured");
+        }
+        if self.embedding_url.is_some() {
+            return Err("CORECRUXD_EMBED_DELEGATE_URL and CORECRUXD_EMBEDDING_URL are mutually exclusive");
+        }
+        if self.embed_delegate_token.is_none() {
+            return Err("CORECRUXD_EMBED_DELEGATE_TOKEN is required when embedding delegation is configured");
+        }
+        if self.embed_delegate_dimensions.is_none_or(|dimensions| dimensions == 0) {
+            return Err(
+                "CORECRUXD_EMBED_DELEGATE_DIMENSIONS must be a positive integer when embedding delegation is configured",
+            );
+        }
+        if self.embedding_model.trim().is_empty() {
+            return Err("CORECRUXD_EMBEDDING_MODEL must be non-empty when embedding delegation is configured");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1178,8 +1250,21 @@ pub fn load_config() -> Config {
             .ok()
             .is_none_or(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
 
+        compute_provider_enabled: env_bool("CORECRUXD_COMPUTE_PROVIDER").unwrap_or(false),
         embedding_url: std::env::var("CORECRUXD_EMBEDDING_URL").ok().filter(|s| !s.is_empty()),
         embedding_model: std::env::var("CORECRUXD_EMBEDDING_MODEL").unwrap_or_else(|_| "nomic-embed-text".to_string()),
+        embed_delegate_url: env_string("CORECRUXD_EMBED_DELEGATE_URL")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        embed_delegate_token: env_string("CORECRUXD_EMBED_DELEGATE_TOKEN")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(RedactedSecret::new),
+        embed_delegate_dimensions: env_string("CORECRUXD_EMBED_DELEGATE_DIMENSIONS")
+            // Preserve an invalid configured value as `Some(0)` so startup
+            // validation fails closed instead of treating a typo as "unset"
+            // and silently selecting the local embedder.
+            .map(|value| value.trim().parse::<usize>().unwrap_or_default()),
         local_embedder_enabled: env_default_on("CORECRUXD_LOCAL_EMBEDDER"),
         dense_model: std::env::var("CORECRUXD_DENSE_MODEL").ok().filter(|s| !s.is_empty()),
         semantic_dedup_threshold: {
@@ -1292,9 +1377,10 @@ pub fn load_config() -> Config {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppendLaneScope, CommitLevel, IngressConfig, StoreLockStrategy, DEFAULT_GRPC_KEEPALIVE_INTERVAL_SECS,
-        DEFAULT_GRPC_KEEPALIVE_TIMEOUT_SECS, DEFAULT_GRPC_MAX_CONCURRENT_STREAMS, DEFAULT_MAX_INFLIGHT,
-        DEFAULT_MAX_REQUEST_BODY_BYTES, DEFAULT_RATE_LIMIT_BURST, DEFAULT_RATE_LIMIT_RPS, DEFAULT_SHUTDOWN_DRAIN_SECS,
+        AppendLaneScope, CommitLevel, IngressConfig, RedactedSecret, StoreLockStrategy,
+        DEFAULT_GRPC_KEEPALIVE_INTERVAL_SECS, DEFAULT_GRPC_KEEPALIVE_TIMEOUT_SECS, DEFAULT_GRPC_MAX_CONCURRENT_STREAMS,
+        DEFAULT_MAX_INFLIGHT, DEFAULT_MAX_REQUEST_BODY_BYTES, DEFAULT_RATE_LIMIT_BURST, DEFAULT_RATE_LIMIT_RPS,
+        DEFAULT_SHUTDOWN_DRAIN_SECS,
     };
 
     #[test]
@@ -1663,6 +1749,11 @@ mod tests {
         assert_eq!(cfg.io_backend, "cpu");
         assert!(!cfg.build_ccxi);
         assert!(!cfg.projections_enabled);
+        assert!(!cfg.compute_provider_enabled);
+        assert!(cfg.embed_delegate_url.is_none());
+        assert!(cfg.embed_delegate_token.is_none());
+        assert!(cfg.embed_delegate_dimensions.is_none());
+        assert!(cfg.validate_embedding_selection().is_ok());
         assert_eq!(cfg.projections_batch_frames, 1024);
         assert_eq!(cfg.projections_tick_interval_ms, 1000);
         assert!(!cfg.admin_force_seal_enabled);
@@ -2337,6 +2428,104 @@ llm:
         std::env::set_var("CORECRUXD_HTTP_HOST", "not-an-ip");
         let cfg = super::load_config();
         assert_eq!(cfg.http_addr.ip().to_string(), "127.0.0.1");
+
+        clear_corecruxd_env();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_config_embedding_delegation_is_explicit_and_redacts_token() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_corecruxd_env();
+
+        std::env::set_var("CORECRUXD_EMBED_DELEGATE_URL", " https://compute.example.test/ ");
+        std::env::set_var("CORECRUXD_EMBED_DELEGATE_TOKEN", " delegate-secret-value ");
+        std::env::set_var("CORECRUXD_EMBED_DELEGATE_DIMENSIONS", "768");
+        std::env::set_var("CORECRUXD_EMBEDDING_MODEL", "nomic-embed-text");
+
+        let cfg = super::load_config();
+        assert!(!cfg.compute_provider_enabled);
+        assert_eq!(cfg.embed_delegate_url.as_deref(), Some("https://compute.example.test/"));
+        assert_eq!(
+            cfg.embed_delegate_token.as_ref().map(RedactedSecret::expose),
+            Some("delegate-secret-value")
+        );
+        assert_eq!(cfg.embed_delegate_dimensions, Some(768));
+        assert!(cfg.validate_embedding_selection().is_ok());
+        let debug = format!("{cfg:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("delegate-secret-value"));
+
+        clear_corecruxd_env();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_config_compute_provider_is_opt_in() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_corecruxd_env();
+
+        std::env::set_var("CORECRUXD_COMPUTE_PROVIDER", "true");
+        let cfg = super::load_config();
+        assert!(cfg.compute_provider_enabled);
+        assert!(cfg.validate_embedding_selection().is_ok());
+
+        clear_corecruxd_env();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn embedding_delegation_configuration_fails_closed() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_corecruxd_env();
+
+        std::env::set_var("CORECRUXD_EMBED_DELEGATE_URL", "https://compute.example.test");
+        std::env::set_var("CORECRUXD_EMBED_DELEGATE_DIMENSIONS", "768");
+        let missing_token = super::load_config();
+        assert_eq!(
+            missing_token.validate_embedding_selection(),
+            Err("CORECRUXD_EMBED_DELEGATE_TOKEN is required when embedding delegation is configured")
+        );
+
+        std::env::set_var("CORECRUXD_EMBED_DELEGATE_TOKEN", "secret");
+        std::env::set_var("CORECRUXD_COMPUTE_PROVIDER", "1");
+        let recursive_provider = super::load_config();
+        assert_eq!(
+            recursive_provider.validate_embedding_selection(),
+            Err(
+                "CORECRUXD_COMPUTE_PROVIDER and CORECRUXD_EMBED_DELEGATE_URL are mutually exclusive to prevent delegation cycles"
+            )
+        );
+
+        std::env::remove_var("CORECRUXD_COMPUTE_PROVIDER");
+        std::env::set_var("CORECRUXD_EMBEDDING_URL", "http://ollama.example.test");
+        let conflicting_sources = super::load_config();
+        assert_eq!(
+            conflicting_sources.validate_embedding_selection(),
+            Err("CORECRUXD_EMBED_DELEGATE_URL and CORECRUXD_EMBEDDING_URL are mutually exclusive")
+        );
+
+        std::env::remove_var("CORECRUXD_EMBEDDING_URL");
+        std::env::remove_var("CORECRUXD_EMBED_DELEGATE_DIMENSIONS");
+        let missing_dimensions = super::load_config();
+        assert_eq!(
+            missing_dimensions.validate_embedding_selection(),
+            Err(
+                "CORECRUXD_EMBED_DELEGATE_DIMENSIONS must be a positive integer when embedding delegation is configured"
+            )
+        );
+
+        std::env::remove_var("CORECRUXD_EMBED_DELEGATE_URL");
+        std::env::remove_var("CORECRUXD_EMBED_DELEGATE_TOKEN");
+        std::env::set_var("CORECRUXD_EMBED_DELEGATE_DIMENSIONS", "not-a-number");
+        let orphan_invalid_dimensions = super::load_config();
+        assert_eq!(
+            orphan_invalid_dimensions.validate_embedding_selection(),
+            Err("CORECRUXD_EMBED_DELEGATE_URL is required when embedding delegation is configured")
+        );
 
         clear_corecruxd_env();
     }

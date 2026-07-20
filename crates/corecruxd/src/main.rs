@@ -294,6 +294,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     let config = load_config();
+    if let Err(message) = config.validate_embedding_selection() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, message).into());
+    }
     if !config.auth_mode_explicitly_set {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -696,6 +699,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         context_surface_enabled: config.context_surface_enabled,
         auto_capture_enabled: config.auto_capture_enabled,
         local_ingest_enabled: config.local_ingest_enabled,
+        compute_provider_enabled: config.compute_provider_enabled,
         stream_receipts_enabled: config.stream_receipts_enabled,
         usage_receipts_enabled: config.usage_receipts_enabled,
         handoff_observations_enabled: config.handoff_observations_enabled,
@@ -868,11 +872,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         watcher.start_existing_repos().await;
     }
 
-    // Wire the dense embedder for fact retrieval. An external `embedding_url`
-    // selects the HTTP client (BYOE/paid, better vectors). Otherwise, unless
-    // explicitly disabled, wire the pure-Rust `LocalHashEmbedder` so dense
-    // recall works offline by default (buyer-fit M3.2 — dense ON by default).
-    if let Some(ref embedding_url) = config.embedding_url {
+    // Wire the dense embedder for fact retrieval. Explicit authenticated
+    // daemon delegation takes precedence, then an Ollama-compatible external
+    // service, then the default in-process CPU embedder. Startup validation
+    // rejects an ambiguous or incomplete delegation configuration, so this
+    // branch never silently falls through to a different semantic space.
+    if let Some(ref delegate_url) = config.embed_delegate_url {
+        let Some(delegate_token) = config.embed_delegate_token.as_ref() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "CORECRUXD_EMBED_DELEGATE_TOKEN is required when embedding delegation is configured",
+            )
+            .into());
+        };
+        let Some(expected_dimensions) = config.embed_delegate_dimensions else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "CORECRUXD_EMBED_DELEGATE_DIMENSIONS must be a positive integer when embedding delegation is configured",
+            )
+            .into());
+        };
+        let delegate_config = corecrux_memory::embeddings::DelegatingEmbeddingConfig::new(
+            delegate_url.clone(),
+            delegate_token.expose().to_string(),
+            config.embedding_model.clone(),
+            expected_dimensions,
+        );
+        let delegate = corecrux_memory::embeddings::DelegatingEmbedder::new(delegate_config).map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("embedding delegation configuration is invalid: {err}"),
+            )
+        })?;
+        info!(
+            model = %config.embedding_model,
+            dimensions = expected_dimensions,
+            "embedding-delegation-configured"
+        );
+        state.fact_store.write().await.set_embedder(Box::new(delegate));
+    } else if let Some(ref embedding_url) = config.embedding_url {
         let client = corecrux_memory::embeddings::EmbeddingClient::new(corecrux_memory::embeddings::EmbeddingConfig {
             base_url: embedding_url.clone(),
             model: config.embedding_model.clone(),
@@ -4397,6 +4435,7 @@ mod tests {
             context_surface_enabled: false,
             auto_capture_enabled: false,
             local_ingest_enabled: false,
+            compute_provider_enabled: false,
             stream_receipts_enabled: false,
             usage_receipts_enabled: false,
             handoff_observations_enabled: false,

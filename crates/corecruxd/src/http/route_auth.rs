@@ -369,6 +369,14 @@ pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContra
         ));
     }
 
+    if path == "/v1/compute/embed" {
+        return Some(RouteAuthContract::gated(
+            RouteAuthClass::FeatureGated,
+            &["compute:embed"],
+            "CORECRUXD_COMPUTE_PROVIDER",
+        ));
+    }
+
     if path.starts_with("/v1/context") {
         return Some(RouteAuthContract::gated(
             RouteAuthClass::FeatureGated,
@@ -801,6 +809,12 @@ mod tests {
                 "/v1/gpu1/answer",
                 RouteAuthClass::FeatureGated,
                 &["query:read", "admin:read"][..],
+            ),
+            (
+                "POST",
+                "/v1/compute/embed",
+                RouteAuthClass::FeatureGated,
+                &["compute:embed"][..],
             ),
             (
                 "POST",
