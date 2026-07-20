@@ -6890,7 +6890,9 @@ async fn version_runtime_capability_descriptor_full_profile() {
     let capabilities = &descriptor["capabilities"];
 
     assert_eq!(descriptor["schema_version"], 1);
-    let capability_values = capabilities.as_object().expect("capability map");
+    let Some(capability_values) = capabilities.as_object() else {
+        panic!("runtime_capabilities.capabilities must be a JSON object");
+    };
     assert_eq!(capability_values.len(), 6);
     for capability in capability_values.values() {
         assert!(capability["availability"].is_string());
