@@ -2842,6 +2842,35 @@
   function isExecPlanItem(w) {
     return !!(w && (w.plan_path || String(w.id).indexOf('execplan:') === 0 || w.project_id === 'execplans'));
   }
+
+  // ---- Stale-plan mismatch badge (M4c, console half) — pure -----------------
+  // PR #457 adds `plan_content_hash` (lowercase BLAKE3 hex of the plan file's raw
+  // bytes) to ExecPlan-projected /v1/work items. This derives the badge from the
+  // HASH, not two machines' paths/clocks. Be honest about what the BROWSER can
+  // know: it cannot read local files, so it never computes a local hash itself —
+  // the real comparison consumer is the desktop shell (M5a), which passes the
+  // local hash in. Driven purely by (daemon_hash, local_hash|null):
+  //   · daemon_hash falsy     → no badge (nothing projected to attest)
+  //   · local_hash null       → provenance chip only (daemon hash short-form)
+  //   · both present, equal    → in-sync chip
+  //   · both present, differ   → mismatch badge (T.2 guard)
+  // Case-insensitive compare: both sides are lowercase hex, but normalise anyway
+  // so a caller passing an upper-case digest never yields a false mismatch.
+  function planHashBadge(daemon_hash, local_hash) {
+    if (!daemon_hash) { return null; }
+    var dShort = String(daemon_hash).slice(0, 12);
+    if (local_hash == null) {
+      return { kind: 'provenance', code: 'daemon_only', short: dShort, label: 'plan ' + dShort,
+        title: 'daemon plan_content_hash (BLAKE3) — no local copy to compare; the browser cannot read local files, the desktop shell (M5a) supplies the local hash' };
+    }
+    if (String(daemon_hash).toLowerCase() === String(local_hash).toLowerCase()) {
+      return { kind: 'insync', code: 'in_sync', short: dShort, label: 'plan in sync',
+        title: 'local plan file matches the daemon-projected plan_content_hash (' + dShort + ')' };
+    }
+    return { kind: 'mismatch', code: 'stale_plan', short: dShort, localShort: String(local_hash).slice(0, 12),
+      label: 'plan drift', title: 'local plan file (' + String(local_hash).slice(0, 12) + ') differs from the daemon plan_content_hash (' + dShort + ') — the projected plan may be stale' };
+  }
+
   function buildPlanTree(data) {
     data = data || {};
     // null-proto lookup tables: ids like "__proto__"/"constructor" are data, not
@@ -2852,6 +2881,14 @@
     });
     var work = (data.work && (data.work.work || data.work.items)) || [];
     var sessions = (data.sessions && data.sessions.active_sessions) || [];
+    // M4c: optional client-side hash source keyed by work id AND bare slug. Empty
+    // in-browser today (no source yet → provenance chips); the desktop shell (M5a)
+    // fills it. null-proto so a slug like "__proto__" is data, not a chain key.
+    var localHashes = Object.create(null);
+    var haveLocalHashes = !!(data.localPlanHashes);
+    if (haveLocalHashes) {
+      Object.keys(data.localPlanHashes).forEach(function (k) { localHashes[k] = data.localPlanHashes[k]; });
+    }
 
     // Resolve a session's bare intent.execplan_slug to a work item. The ExecPlan
     // work id is "execplan:<slug>"; kanban ids are opaque. Match exact id or the
@@ -2934,11 +2971,17 @@
       }
 
       var slug = String(w.id).indexOf('execplan:') === 0 ? String(w.id).slice(9) : w.id;
+      // M4c: daemon hash read defensively — `plan_content_hash` is additive
+      // (PR #457), so this is undefined/absent until the daemon ships it, and the
+      // node simply carries no badge. Local hash resolves by id then bare slug.
+      var localHash = null;
+      if (haveLocalHashes) { localHash = localHashes[w.id]; if (localHash == null) { localHash = localHashes[slug]; } }
       var planNode = {
         key: 'work:' + w.id, type: 'execplan', id: w.id, label: w.title || slug,
         sub: (w.state || 'work') + (w.blocker_reason ? (' · blocked: ' + w.blocker_reason) : ''),
         state: w.state || null,
         progress: (w.milestones_total ? { done: w.milestones_done || 0, total: w.milestones_total, label: w.current_milestone || null } : null),
+        planBadge: planHashBadge(w.plan_content_hash || null, (localHash == null ? null : localHash)),
         focus: null, leases: [], children: []
       };
       proj.children.push(planNode);
@@ -2958,9 +3001,12 @@
       });
       // Attach sessions to their milestone node; a session that announced this
       // plan but no milestone (bucket key '') hangs directly off the plan.
+      // M4b: stamp the RESOLVED ExecPlan entity so the session-detail view fetches
+      // fact provenance only for sessions that actually resolved to an ExecPlan
+      // (kanban/unattached carry no execplanEntity → explicit no-plan absent state).
       Object.keys(bucket).forEach(function (m) {
         var target = (m !== '' && milestoneNodes[m]) ? milestoneNodes[m] : planNode;
-        bucket[m].forEach(function (sn) { target.children.push(sn); });
+        bucket[m].forEach(function (sn) { sn.execplanEntity = 'execplan:' + slug; target.children.push(sn); });
       });
     });
 
@@ -3377,6 +3423,14 @@
     if (node.progress) {
       frag.push(el('span', { 'class': 'plan-tree-prog', text: node.progress.done + '/' + node.progress.total + (node.progress.label ? (' · ' + node.progress.label) : '') }));
     }
+    // M4c: stale-plan hash chip. provenance = daemon hash short-form (no local
+    // copy to compare); mismatch = a visible drift badge (T.2 guard).
+    if (node.planBadge) {
+      var pb = node.planBadge;
+      var hashCls = pb.kind === 'mismatch' ? 'plan-tree-hash plan-tree-hash-mismatch'
+        : (pb.kind === 'insync' ? 'plan-tree-hash plan-tree-hash-insync' : 'plan-tree-hash plan-tree-hash-prov');
+      frag.push(el('span', { 'class': hashCls, 'data-hash-state': pb.code, title: pb.title, text: pb.label }));
+    }
     if (node.sub) { frag.push(el('span', { 'class': 'plan-tree-sub', text: node.sub })); }
     if (node.type === 'session' && node.focus) {
       // Unattached: show the slug that resolved to no plan (which plan failed).
@@ -3394,14 +3448,24 @@
     });
     return frag;
   }
-  function planTreeNode(node, depth) {
+  function planTreeNode(node, depth, onSelect) {
     var pad = (depth * 14 + 8) + 'px';
     var rowCls = 'plan-tree-row plan-tree-' + node.type;
     if (node.children && node.children.length) {
       var det = el('details', { 'class': 'plan-tree-node', open: 'open' });
       det.appendChild(el('summary', { 'class': rowCls, style: 'padding-left:' + pad }, planTreeRowInner(node)));
-      node.children.forEach(function (c) { det.appendChild(planTreeNode(c, depth + 1)); });
+      node.children.forEach(function (c) { det.appendChild(planTreeNode(c, depth + 1, onSelect)); });
       return det;
+    }
+    // M4b: a session leaf opens its evidence detail on click/Enter/Space. Kept
+    // behind the optional onSelect so the smoke can still paint a node with no
+    // handler (and non-session leaves stay inert).
+    if (node.type === 'session' && typeof onSelect === 'function') {
+      var srow = el('div', { 'class': rowCls + ' plan-tree-session-open', style: 'padding-left:' + pad,
+        role: 'button', tabindex: '0', 'aria-label': 'View session evidence: ' + (node.label || node.id || 'session') }, planTreeRowInner(node));
+      srow.addEventListener('click', function () { onSelect(node); });
+      srow.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelect(node); } });
+      return srow;
     }
     return el('div', { 'class': rowCls, style: 'padding-left:' + pad }, planTreeRowInner(node));
   }
@@ -3440,10 +3504,237 @@
         wrap.appendChild(el('p', { 'class': 'ctl-desc', text: 'Plan tree empty — ' + why + '.' }));
         return;
       }
-      tree.roots.forEach(function (root) { wrap.appendChild(planTreeNode(root, 0)); });
+      // M4b: split into the tree column + a session-detail column. Clicking a
+      // session paints its evidence (receipts, fact provenance, announced focus)
+      // through the generated client. Notices stay above the split (fail-honest).
+      var layout = el('div', { 'class': 'plan-tree-layout' });
+      var treeCol = el('div', { 'class': 'plan-tree-col' });
+      var detailCol = el('div', { 'class': 'session-detail-col' },
+        [el('p', { 'class': 'ctl-desc', text: 'Select a session to view its evidence — receipts, fact provenance, announced focus.' })]);
+      function onSelect(node) { renderSessionDetail(detailCol, node, api); }
+      tree.roots.forEach(function (root) { treeCol.appendChild(planTreeNode(root, 0, onSelect)); });
+      layout.appendChild(treeCol);
+      layout.appendChild(detailCol);
+      wrap.appendChild(layout);
     }).catch(function () {
       wrap.textContent = '';
       wrap.appendChild(el('p', { 'class': 'ctl-desc', text: 'Plan tree unavailable.' }));
+    });
+  }
+
+  // ---- Session-detail / evidence contract (M4b) ---------------------------
+  // Clicking a session opens an authorized/redacted evidence view over EXISTING
+  // daemon GET routes only — NO new routes, NO hand-rolled fetches, and reads that
+  // could carry content are NOT issued at all:
+  //   · announced focus ← coord/active (travels WITH the sessionNode from M4a; no re-fetch)
+  //   · receipts        ← GET /v1/sessions/{id}/observations (each record carries a
+  //                       CROWN receipt ENVELOPE + the daemon-reported chain status)
+  //   · fact provenance ← GET /v1/facts/entity/<resolved-execplan-entity> — ONLY when
+  //                       the session resolved to an ExecPlan item (M4a resolution; a
+  //                       kanban/unattached session carries no entity → no-plan absent)
+  //   · transcript      ← REFERENCE-ONLY: rendered ONLY from an id/path ALREADY loaded
+  //                       on the sessionNode (coord announcement field). We do NOT fetch
+  //                       session state — that blob could embed transcript CONTENT, and
+  //                       fetching-then-filtering still transits content to page JS. No
+  //                       transcript-content route/method exists and none is added. Any
+  //                       API-supplied path renders as inert text, never a link.
+  // Honesty rules: any non-ok feed → degraded notice (M4a idiom); reachable-but-empty
+  // (200 + empty) → absent-state (M2 disabled-with-reason idiom). No silent empties.
+  // Badges never claim a cryptographic property the client did not verify.
+  function shortHash(h) { return String(h || '').replace(/^blake3:/, '').slice(0, 12); }
+
+  // A non-ok read (unreachable / HTTP error) → degraded. Reachable-but-empty is
+  // NOT this — the caller renders that as an absent-state after confirming status.ok.
+  function evidenceDegraded(status, what) {
+    var s = status && status.status;
+    if (s === 0 || s == null) { return { code: 'unreachable', degraded: true, reason: what + ' — feed unreachable.' }; }
+    return { code: 'http_' + s, degraded: true, reason: what + ' — feed failed (HTTP ' + s + ').' };
+  }
+
+  function evidenceReceipts(observations, status) {
+    var chain = (observations && observations.chain) || null;
+    if (!status || !status.ok) {
+      return { present: false, items: [], chain: chain, absent: evidenceDegraded(status, 'Receipts') };
+    }
+    var list = (observations && observations.observations) || [];
+    if (!list.length) {
+      return { present: false, items: [], chain: chain,
+        absent: { code: 'empty', degraded: false, reason: 'No receipts recorded for this session.' } };
+    }
+    var items = list.slice(0, 50).map(function (o) {
+      var r = o.receipt || {};
+      // Structural fields ONLY — a receipt envelope is PRESENT. We do not verify the
+      // Ed25519 signature in the browser, so nothing here asserts "signed"/"valid".
+      return { observation_id: o.observation_id || null, provider: o.provider || null, kind: o.kind || null,
+        ts: o.ts || null, seq: (o.seq == null ? null : o.seq),
+        alg: r.alg || null, body_hash: r.body_hash || null };
+    });
+    return { present: true, items: items, chain: chain, absent: null };
+  }
+
+  // entity = the RESOLVED ExecPlan entity stamped by buildPlanTree (null for a
+  // kanban/unattached session — never guessed from the announced slug, which could
+  // point at a kanban item and fetch unrelated facts).
+  function evidenceProvenance(facts, status, entity) {
+    if (!entity) {
+      return { present: false, entity: null, items: [],
+        absent: { code: 'no_plan', degraded: false, reason: 'This session did not resolve to an ExecPlan — fact provenance is keyed by plan entity, so none can be resolved.' } };
+    }
+    if (!status || !status.ok) {
+      return { present: false, entity: entity, items: [], absent: evidenceDegraded(status, 'Fact provenance for ' + entity) };
+    }
+    var list = (facts && facts.facts) || [];
+    if (!list.length) {
+      return { present: false, entity: entity, items: [],
+        absent: { code: 'empty', degraded: false, reason: 'No facts recorded under ' + entity + '.' } };
+    }
+    var items = list.slice(0, 50).map(function (f) {
+      // ONLY a canonical [REDACTED:…] marker is a redaction (redact_writer.rs). A
+      // genuinely empty value is honest-empty — not a redaction claim.
+      var redacted = (typeof f.value === 'string' && f.value.indexOf('[REDACTED:') === 0);
+      return { key: f.key || null, stored_at: f.stored_at || null, actor: f.actor || null,
+        source_receipt: f.source_receipt || null, version: (f.version == null ? null : f.version),
+        superseded: !!f.superseded_by, private: !!f.private, redacted: redacted };
+    });
+    return { present: true, entity: entity, items: items, absent: null };
+  }
+
+  // Pure model builder — DOM-free so the smoke can assert the contract directly.
+  function buildSessionDetail(input) {
+    input = input || {};
+    var session = input.session || {};
+    var focus = session.focus || {};
+    var focusModel = {
+      execplan_slug: focus.execplan_slug || null, milestone: focus.milestone || null,
+      deploy_target: focus.deploy_target || null,
+      paths: Array.isArray(focus.paths) ? focus.paths : [],
+      leases: Array.isArray(session.leases) ? session.leases : [],
+      unresolvedSlug: session.unresolvedSlug || null
+    };
+    // Transcript reference — ONLY from data ALREADY loaded on the node (a coord
+    // announcement field). No session-state fetch: that blob can embed content, and
+    // content must never transit to page JS even to be filtered out.
+    var tref = (focus.transcript_ref || session.transcriptRef || null);
+    var transcript = tref ? { present: true, ref: String(tref) } : { present: false };
+
+    return {
+      sessionId: session.id || null, label: session.label || session.id || 'session',
+      focus: focusModel, transcript: transcript,
+      receipts: evidenceReceipts(input.observations, input.obsStatus),
+      provenance: evidenceProvenance(input.facts, input.factsStatus, input.entity || null)
+    };
+  }
+
+  function paintEvidenceSection(title, sec, itemFn, headBadge) {
+    var s = el('div', { 'class': 'session-detail-sec' });
+    var h = el('div', { 'class': 'session-detail-sec-h', text: title });
+    s.appendChild(h);
+    if (sec && sec.present) {
+      if (headBadge) { var b = headBadge(sec); if (b) { h.appendChild(b); } }
+      (sec.items || []).forEach(function (it) { s.appendChild(itemFn(it)); });
+    } else {
+      var a = (sec && sec.absent) || { code: 'unknown', degraded: false, reason: 'No data.' };
+      s.appendChild(el('p', {
+        'class': a.degraded ? 'session-detail-degraded' : 'session-detail-absent', role: 'status',
+        'data-feed-reason': a.code, 'data-capability-reason': a.code, text: a.reason
+      }));
+    }
+    return s;
+  }
+
+  function paintSessionDetail(model) {
+    var root = el('div', { 'class': 'session-detail' });
+    var head = el('div', { 'class': 'session-detail-head' });
+    head.appendChild(el('div', { 'class': 'session-detail-title', text: 'Session ' + (model.label || model.sessionId || '—') }));
+    var chips = el('div', { 'class': 'session-detail-chips' });
+    var f = model.focus || {};
+    if (f.execplan_slug) { chips.appendChild(el('span', { 'class': 'plan-tree-focus', text: f.execplan_slug })); }
+    if (f.milestone) { chips.appendChild(el('span', { 'class': 'plan-tree-focus', text: '@' + f.milestone })); }
+    if (f.deploy_target) { chips.appendChild(el('span', { 'class': 'plan-tree-focus', text: f.deploy_target })); }
+    if (f.unresolvedSlug) { chips.appendChild(el('span', { 'class': 'plan-tree-focus plan-tree-unresolved', text: 'unresolved: ' + f.unresolvedSlug })); }
+    // Declared paths + leases are API-supplied strings → TEXT only, never links.
+    (f.paths || []).slice(0, 8).forEach(function (p) { chips.appendChild(el('span', { 'class': 'plan-tree-path', text: p })); });
+    (f.leases || []).slice(0, 8).forEach(function (l) { chips.appendChild(el('span', { 'class': 'plan-tree-lease', title: 'lease · ' + (l.mode || 'modify'), text: 'lease: ' + (l.resource || l.punchcard_id || 'held') })); });
+    head.appendChild(chips);
+    root.appendChild(head);
+
+    // Transcript — reference-only inert chip (or an explicit absent-state).
+    var tsec = el('div', { 'class': 'session-detail-sec' });
+    tsec.appendChild(el('div', { 'class': 'session-detail-sec-h', text: 'Transcript' }));
+    if (model.transcript && model.transcript.present) {
+      tsec.appendChild(el('span', { 'class': 'session-detail-transcript-ref', 'data-inert': 'reference-only',
+        title: 'reference only — transcript content is never fetched or rendered', text: model.transcript.ref }));
+    } else {
+      tsec.appendChild(el('p', { 'class': 'session-detail-absent', 'data-capability-reason': 'no_transcript_ref',
+        role: 'status', text: 'No transcript reference on this session.' }));
+    }
+    root.appendChild(tsec);
+
+    root.appendChild(paintEvidenceSection('Receipts', model.receipts, function (r) {
+      // data-receipt-body-hash is a plain hook for the M9 registry verification
+      // link-out — NOT a client-side attestation. No "signed"/"valid" claim: the
+      // browser did not verify the Ed25519 signature.
+      var item = el('div', { 'class': 'session-detail-item', 'data-receipt-body-hash': (r.body_hash || null) });
+      item.appendChild(el('span', { 'class': 'session-detail-k', text: (r.provider || 'obs') + (r.kind ? (' · ' + r.kind) : '') }));
+      if (r.body_hash) { item.appendChild(el('span', { 'class': 'session-detail-hash', text: shortHash(r.body_hash) })); }
+      item.appendChild(el('span', { 'class': 'session-detail-badge', title: 'a signed receipt envelope is attached (signature not verified in the browser)', text: 'receipt envelope' }));
+      if (r.ts) { item.appendChild(el('span', { 'class': 'session-detail-k', text: r.ts })); }
+      return item;
+    }, function (sec) {
+      // The daemon-REPORTED chain status, VERBATIM. Neutral chip — this is data the
+      // daemon returned, not a verdict the client computed.
+      if (!sec.chain || !sec.chain.status) { return null; }
+      return el('span', { 'class': 'session-detail-badge', 'data-chain-status': sec.chain.status,
+        title: (sec.chain.reason ? (sec.chain.reason + ' — ') : '') + 'chain status as reported by the daemon (not verified in the browser)',
+        text: 'chain: ' + sec.chain.status });
+    }));
+
+    root.appendChild(paintEvidenceSection('Fact provenance' + (model.provenance.entity ? (' · ' + model.provenance.entity) : ''),
+      model.provenance, function (fct) {
+        var item = el('div', { 'class': 'session-detail-item' });
+        item.appendChild(el('span', { 'class': 'session-detail-k', text: fct.key || '(key)' }));
+        if (fct.version != null) { item.appendChild(el('span', { 'class': 'session-detail-badge', text: 'v' + fct.version })); }
+        if (fct.actor) { item.appendChild(el('span', { 'class': 'session-detail-k', text: 'by ' + fct.actor })); }
+        if (fct.source_receipt) { item.appendChild(el('span', { 'class': 'session-detail-hash', text: 'receipt ' + shortHash(fct.source_receipt) })); }
+        if (fct.stored_at) { item.appendChild(el('span', { 'class': 'session-detail-k', text: fct.stored_at })); }
+        if (fct.redacted) { item.appendChild(el('span', { 'class': 'session-detail-redacted', 'data-capability-reason': 'redacted', text: '[redacted]' })); }
+        if (fct.superseded) { item.appendChild(el('span', { 'class': 'session-detail-badge warn', text: 'superseded' })); }
+        return item;
+      }, null));
+
+    return root;
+  }
+
+  // Fetch the evidence through the generated client and paint it. Reads ONLY two
+  // content-free feeds: observations (receipt envelopes) and — only for an ExecPlan-
+  // resolved session — facts/entity (provenance). The transcript reference comes from
+  // data already on the node; the session-state blob is never read (it can embed content).
+  // A per-host selection token drops a stale paint when a newer session is clicked
+  // mid-flight (slow A must not overwrite the freshly-selected B).
+  function renderSessionDetail(host, sessionNode, api) {
+    var seq = (host._detailSeq = (host._detailSeq || 0) + 1);
+    host.textContent = '';
+    api = api || ((typeof window !== 'undefined') ? window.CruxApi : null);
+    sessionNode = sessionNode || {};
+    var sid = sessionNode.id;
+    var entity = sessionNode.execplanEntity || null;   // set by buildPlanTree only for ExecPlan-resolved sessions
+    host.appendChild(el('p', { 'class': 'ctl-desc', text: 'Loading session evidence…' }));
+    return Promise.all([
+      fetchVia(sid && api && typeof api.sessionsBySessionIdObservations === 'function' ? function () { return api.sessionsBySessionIdObservations(sid); } : null),
+      fetchVia(entity && api && typeof api.factsEntityByEntity === 'function' ? function () { return api.factsEntityByEntity(entity); } : null)
+    ]).then(function (r) {
+      if (host._detailSeq !== seq) { return; }   // superseded by a newer selection — drop this paint
+      var model = buildSessionDetail({
+        session: sessionNode, entity: entity,
+        observations: r[0].data, obsStatus: r[0],
+        facts: r[1].data, factsStatus: r[1]
+      });
+      host.textContent = '';
+      host.appendChild(paintSessionDetail(model));
+    }).catch(function () {
+      if (host._detailSeq !== seq) { return; }
+      host.textContent = '';
+      host.appendChild(el('p', { 'class': 'ctl-desc', text: 'Session evidence unavailable.' }));
     });
   }
 
@@ -5123,6 +5414,12 @@
     buildPlanTree: buildPlanTree,
     planTreeNode: planTreeNode,
     renderPlanTree: renderPlanTree,
+    // M4c (console half) — pure stale-plan mismatch badge (daemon_hash, local_hash|null).
+    planHashBadge: planHashBadge,
+    // M4b — session-detail / evidence contract (pure builder + its live renderer).
+    buildSessionDetail: buildSessionDetail,
+    paintSessionDetail: paintSessionDetail,
+    renderSessionDetail: renderSessionDetail,
     renderCanvas: renderCanvas,
     renderPage: renderPage,
     renderSections: renderSections,

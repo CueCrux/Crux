@@ -77,6 +77,35 @@ const notes = [];
 const asyncChecks = [];
 function check(ok, msg) { if (!ok) { failures.push(msg); } }
 
+// Shared jsdom-free mock DOM for the renderer-driving checks (plan tree, session
+// detail, plan-hash chip). `collect(node, out)` returns element descendants; seed
+// with `[node]` to include the root. `classesOf`/`findByClass` are thin wrappers.
+function newMockDom() {
+  function mkNode(tag) {
+    const node = {
+      tagName: String(tag || 'div').toUpperCase(), nodeType: 1, childNodes: [], _attrs: {}, className: '',
+      setAttribute: function (k, v) { this._attrs[k] = String(v); if (k === 'class') { this.className = String(v); } },
+      getAttribute: function (k) { return Object.prototype.hasOwnProperty.call(this._attrs, k) ? this._attrs[k] : null; },
+      appendChild: function (c) { this.childNodes.push(c); c.parentNode = this; return c; },
+      addEventListener: function () {}
+    };
+    Object.defineProperty(node, 'textContent', {
+      get: function () { let t = this._text || ''; (this.childNodes || []).forEach(function (c) { t += (c.textContent || ''); }); return t; },
+      set: function (v) { this._text = String(v); this.childNodes.length = 0; }
+    });
+    return node;
+  }
+  const doc = { createElement: mkNode, createTextNode: function (v) { return { nodeType: 3, textContent: String(v), childNodes: [] }; } };
+  function collect(node, out) {
+    out = out || [];
+    (node.childNodes || []).forEach(function (c) { if (c && c.nodeType === 1) { out.push(c); collect(c, out); } });
+    return out;
+  }
+  function classesOf(node) { return collect(node, [node]).map(function (n) { return n.className || ''; }); }
+  function findByClass(node, cls) { return collect(node, [node]).filter(function (n) { return new RegExp('\\b' + cls + '\\b').test(n.className || ''); }); }
+  return { mkNode: mkNode, doc: doc, collect: collect, classesOf: classesOf, findByClass: findByClass };
+}
+
 // Extract a brace-matched `function <name>(...) { ... }` span from `src`.
 // (operatorGatedCall contains no string-literal braces, so a plain depth
 // counter is sufficient for the containment audit in check 7.)
@@ -2273,29 +2302,11 @@ function extractThemeVars(theme) {
   check(/parts\[1\] === 'tree'/.test(shellHtml),
     '[plan-tree] shell.html parseCanvasHash must route #/canvas/tree to the Tree view');
 
-  // ---- The model paints + the live renderer fails honest. A tiny mock DOM lets
-  // the smoke both (a) paint the model directly and (b) drive renderPlanTree end
-  // to end with a mocked generated client where one feed FAILS.
-  function mkNode(tag) {
-    const node = {
-      tagName: String(tag || 'div').toUpperCase(), nodeType: 1, childNodes: [], _attrs: {}, className: '',
-      setAttribute: function (k, v) { this._attrs[k] = String(v); if (k === 'class') { this.className = String(v); } },
-      getAttribute: function (k) { return Object.prototype.hasOwnProperty.call(this._attrs, k) ? this._attrs[k] : null; },
-      appendChild: function (c) { this.childNodes.push(c); c.parentNode = this; return c; },
-      addEventListener: function () {}
-    };
-    Object.defineProperty(node, 'textContent', {
-      get: function () { let t = this._text || ''; (this.childNodes || []).forEach(function (c) { t += (c.textContent || ''); }); return t; },
-      set: function (v) { this._text = String(v); this.childNodes.length = 0; }
-    });
-    return node;
-  }
-  const mockDoc = { createElement: mkNode, createTextNode: function (v) { return { nodeType: 3, textContent: String(v), childNodes: [] }; } };
-  function collectNodes(node, out) {
-    (node.childNodes || []).forEach(function (c) { if (c && c.nodeType === 1) { out.push(c); collectNodes(c, out); } });
-    return out;
-  }
-  function classesOf(node) { return collectNodes(node, [node]).map(function (n) { return n.className || ''; }); }
+  // ---- The model paints + the live renderer fails honest. The shared mock DOM
+  // (newMockDom) lets the smoke both (a) paint the model directly and (b) drive
+  // renderPlanTree end to end with a mocked generated client where one feed FAILS.
+  const mock = newMockDom();
+  const mkNode = mock.mkNode, mockDoc = mock.doc, collectNodes = mock.collect, classesOf = mock.classesOf;
 
   if (typeof render.planTreeNode === 'function') {
     const savedDoc = global.document;
@@ -2394,6 +2405,267 @@ function extractThemeVars(theme) {
     }));
   }
   notes.push('query-string fix (isolated from M4a): fetchJSON splits path?query → CruxApi.get(base, query) at the single choke point, healing every query-bearing read (work?source=all + cx-facts/cost/review/memory) — verified by driving the real fetchJSON against the real generated client; the per-endpoint fetchWorkAll/fetchPageFeed wrappers are removed as redundant.');
+})();
+
+// =========================================================================
+//  Check 44 — (desktop mission control M4b) session-detail / evidence contract.
+//  Clicking a session opens an authorized/redacted evidence view over EXISTING
+//  daemon GET routes only: receipts (← /v1/sessions/{id}/observations, each record
+//  a signed CROWN receipt), fact provenance (← /v1/facts/entity/execplan:<slug>),
+//  and announced focus (← coord, already on the node). Decisions enforced here:
+//   · transcript = REFERENCE-ONLY — an inert text chip, never fetched/rendered;
+//     the smoke asserts NO transcript-content request path exists;
+//   · no arbitrary local-path read — API-supplied paths render as text, not links;
+//   · absence honesty — missing evidence renders an explicit absent-state (M2
+//     disabled-with-reason idiom); a feed error renders a degraded notice (M4a).
+//  All reads go through the generated client.
+// =========================================================================
+(function checkSessionDetail() {
+  check(typeof render.buildSessionDetail === 'function', '[session-detail] render.js must export buildSessionDetail()');
+  check(typeof render.paintSessionDetail === 'function', '[session-detail] render.js must export paintSessionDetail()');
+  check(typeof render.renderSessionDetail === 'function', '[session-detail] render.js must export renderSessionDetail()');
+  if (typeof render.buildSessionDetail !== 'function') { return; }
+
+  const sessionNode = {
+    key: 'session:aaaa', type: 'session', id: 'aaaa1111beef', label: 'aaaa1111',
+    execplanEntity: 'execplan:alpha',   // stamped by buildPlanTree only for ExecPlan-resolved sessions
+    // transcript_ref rides on the coord announcement (already-loaded node data) — never fetched.
+    focus: { execplan_slug: 'alpha', milestone: 'M2', paths: ['crates/x'], deploy_target: 'deploy:crux', transcript_ref: 'transcripts/aaaa1111.jsonl' },
+    leases: [{ resource: 'tree://crates/x', punchcard_id: 'pc1', mode: 'modify' }],
+    unresolvedSlug: null, children: []
+  };
+  const obsFixture = { observations: [
+    { observation_id: 'obs-1', provider: 'anthropic', kind: 'assistant', ts: '2026-07-20T10:00:00Z', seq: 0,
+      receipt: { alg: 'ed25519', signed_by: 'crux', body_hash: 'blake3:deadbeefcafe0000', signature: 'sig' } }
+  ], chain: { status: 'ok', chained_len: 1 } };
+  const factsFixture = { facts: [
+    { fact_id: 'f1', entity: 'execplan:alpha', key: 'gate:M2', value: '{...}', stored_at: '2026-07-20T09:00:00Z',
+      source_receipt: 'blake3:aaaabbbbcccc', actor: 'claude-opus-4-8', version: 2, private: false },
+    // canonical [REDACTED:…] marker (redact_writer.rs) → the redaction marker renders.
+    { fact_id: 'f2', entity: 'execplan:alpha', key: 'decision:x', value: '[REDACTED:fld.secret#abcd]', stored_at: '2026-07-20T09:30:00Z',
+      source_receipt: null, actor: null, version: 3 },
+    // genuinely EMPTY value → honest empty, NOT a redaction claim.
+    { fact_id: 'f3', entity: 'execplan:alpha', key: 'note:y', value: '', stored_at: '2026-07-20T09:45:00Z', version: 1 }
+  ] };
+  const okS = { ok: true, status: 200 };
+
+  // ---- Pure contract: focus + receipts + provenance + transcript all present.
+  const model = render.buildSessionDetail({ session: sessionNode, entity: 'execplan:alpha',
+    observations: obsFixture, obsStatus: okS, facts: factsFixture, factsStatus: okS });
+  check(model.focus && model.focus.milestone === 'M2' && model.focus.deploy_target === 'deploy:crux' &&
+    JSON.stringify(model.focus.paths) === JSON.stringify(['crates/x']) && (model.focus.leases || []).length === 1,
+    '[session-detail] model carries the announced focus (milestone, deploy target, paths, leases) from the node — not re-fetched');
+  check(model.receipts && model.receipts.present === true && model.receipts.items.length === 1 &&
+    model.receipts.items[0].body_hash === 'blake3:deadbeefcafe0000' && model.receipts.chain && model.receipts.chain.status === 'ok',
+    '[session-detail] receipts come from the observations feed (receipt envelope + daemon chain status)');
+  check(model.provenance && model.provenance.present === true && model.provenance.entity === 'execplan:alpha' &&
+    model.provenance.items.length === 3 && model.provenance.items[0].source_receipt === 'blake3:aaaabbbbcccc',
+    '[session-detail] fact provenance comes from /v1/facts/entity/<resolved-entity>');
+  // Redaction honesty: ONLY the canonical [REDACTED:…] value is a redaction; the
+  // empty value is honest-empty (no false redaction claim).
+  check(model.provenance.items[1].redacted === true && model.provenance.items[0].redacted === false && model.provenance.items[2].redacted === false,
+    '[session-detail] only a canonical [REDACTED:…] value renders the redaction marker; an empty value is honest-empty');
+  check(model.transcript && model.transcript.present === true && model.transcript.ref === 'transcripts/aaaa1111.jsonl',
+    '[session-detail] transcript reference comes from already-loaded node data (coord announcement) — no session-state fetch');
+
+  // ---- Fix 6: a session that did NOT resolve to an ExecPlan (no execplanEntity;
+  // it merely ANNOUNCED a slug that pointed at a kanban item) → no_plan absent.
+  // Provenance must NOT be keyed off the announced slug (would fetch unrelated facts).
+  const kanbanSess = { id: 'k1', focus: { execplan_slug: 'kanban-1' }, leases: [] };
+  const noPlan = render.buildSessionDetail({ session: kanbanSess, entity: null,
+    observations: obsFixture, obsStatus: okS, facts: factsFixture, factsStatus: okS });
+  check(noPlan.provenance.present === false && noPlan.provenance.absent && noPlan.provenance.absent.code === 'no_plan' && !noPlan.provenance.absent.degraded,
+    '[session-detail] a session that did not resolve to an ExecPlan renders no_plan absent (never guesses execplan:<announced-slug>)');
+  check(noPlan.transcript.present === false, '[session-detail] no transcript reference on the node → transcript absent-state');
+
+  // ---- Fix 4: any non-ok feed → degraded; reachable-but-empty (200+[]) → absent.
+  const emptyObs = render.buildSessionDetail({ session: sessionNode, entity: 'execplan:alpha', observations: { observations: [] }, obsStatus: okS,
+    facts: factsFixture, factsStatus: okS });
+  check(emptyObs.receipts.present === false && emptyObs.receipts.absent.code === 'empty' && emptyObs.receipts.absent.degraded === false,
+    '[session-detail] reachable-but-empty receipts render an absent-state (not degraded)');
+  [{ ok: false, status: 503 }, { ok: false, status: 404 }, { ok: false, status: 0 }].forEach(function (st) {
+    const errObs = render.buildSessionDetail({ session: sessionNode, entity: 'execplan:alpha', obsStatus: st, facts: factsFixture, factsStatus: okS });
+    check(errObs.receipts.present === false && errObs.receipts.absent.degraded === true,
+      '[session-detail] a non-ok receipts feed (status ' + st.status + ') → degraded notice, never an absent-state');
+  });
+
+  // ---- Source-level: renders through the generated client only; NO state fetch, NO transcript route.
+  const rsdBody = funcBody(renderSrc, 'renderSessionDetail') || '';
+  check(!/\bfetch\s*\(/.test(rsdBody), '[session-detail] renderSessionDetail must not raw-fetch — api.js is the sole network layer');
+  check(/api\.sessionsBySessionIdObservations\b/.test(rsdBody) && /api\.factsEntityByEntity\b/.test(rsdBody),
+    '[session-detail] receipts + provenance reads must go through the named generated-client methods');
+  check(!/sessionsBySessionIdState/.test(rsdBody),
+    '[session-detail] renderSessionDetail must NOT fetch session state (that blob can embed transcript content — content must never transit to page JS)');
+  // No transcript-content client method exists anywhere in the generated client —
+  // the strongest proof no transcript-content request path exists.
+  const apiSrc44 = fs.readFileSync(path.join(DIR, 'api.js'), 'utf8');
+  check(!/transcript/i.test(apiSrc44), '[session-detail] the generated client must expose NO transcript-content method (reference-only decision)');
+
+  // ---- Mock-DOM paint: honest badges, inert transcript, redacted/degraded/absent.
+  const mock = newMockDom();
+  const savedDoc = global.document;
+  global.document = mock.doc;
+  try {
+    const painted = render.paintSessionDetail(model);
+    const tref = mock.findByClass(painted, 'session-detail-transcript-ref');
+    check(tref.length === 1 && tref[0].tagName !== 'A' && tref[0].getAttribute('href') == null && tref[0].getAttribute('data-inert') === 'reference-only',
+      '[session-detail] the transcript chip is inert text — never an <a>/href, marked data-inert (reference-only, no fetch/open)');
+    // Honest badges: a neutral "receipt envelope" chip, NEVER a green "signed"/"valid" claim.
+    const paintedText = painted.textContent || '';
+    check(/receipt envelope/.test(paintedText) && !/\bsigned\b/.test(paintedText),
+      '[session-detail] receipts render a neutral "receipt envelope" chip, never a "signed" claim the browser did not verify');
+    check(/chain: ok/.test(paintedText) && !/intact/.test(paintedText),
+      '[session-detail] chain status renders VERBATIM from the daemon ("chain: ok"), never a client-computed "intact" verdict');
+    check(mock.findByClass(painted, 'session-detail-item').length >= 4,
+      '[session-detail] painted DOM renders receipt + provenance evidence items');
+    check(mock.findByClass(painted, 'session-detail-redacted').length === 1,
+      '[session-detail] exactly one redaction marker renders (the canonical [REDACTED:…] fact) — the empty fact is honest-empty');
+    const pathChips = mock.findByClass(painted, 'plan-tree-path');
+    check(pathChips.length === 1 && pathChips[0].tagName !== 'A' && pathChips[0].getAttribute('href') == null,
+      '[session-detail] an API-supplied path renders as inert text, never a link that fetches or opens');
+
+    const degradedModel = render.buildSessionDetail({ session: sessionNode, entity: 'execplan:alpha', observations: obsFixture, obsStatus: okS,
+      factsStatus: { ok: false, status: 500 } });
+    check(mock.findByClass(render.paintSessionDetail(degradedModel), 'session-detail-degraded').length >= 1,
+      '[session-detail] a provenance feed error paints a degraded notice');
+    const absentNodes = mock.findByClass(render.paintSessionDetail(emptyObs), 'session-detail-absent')
+      .filter(function (n) { return n.getAttribute('data-capability-reason') != null; });
+    check(absentNodes.length >= 1, '[session-detail] a reachable-but-empty section paints an absent-state carrying data-capability-reason (M2 idiom)');
+  } catch (e) {
+    check(false, '[session-detail] paintSessionDetail DOM render threw: ' + (e && e.stack || e));
+  } finally {
+    if (savedDoc === undefined) { delete global.document; } else { global.document = savedDoc; }
+  }
+
+  // ---- Drive renderSessionDetail through a MOCK client. Fix 7: assert the EXACT
+  // call multiset (count + names), not membership. Fix 6: a non-ExecPlan session
+  // fetches observations only. Fix 5: a stale in-flight paint is dropped.
+  if (typeof render.renderSessionDetail === 'function') {
+    function fakeRes(ok, status, data) { return Promise.resolve({ ok: ok, status: status, json: function () { return Promise.resolve(data); } }); }
+    function fakeResLater(ok, status, data) { return new Promise(function (res) { setTimeout(function () { res({ ok: ok, status: status, json: function () { return Promise.resolve(data); } }); }, 8); }); }
+    const savedDoc2 = global.document, savedWin = global.window;
+    global.document = mock.doc; global.window = {};
+
+    // Drive A — ExecPlan session, provenance feed FAILS.
+    const callsA = [];
+    const apiA = {
+      sessionsBySessionIdObservations: function (id) { callsA.push('observations:' + id); return fakeRes(true, 200, obsFixture); },
+      factsEntityByEntity: function (entity) { callsA.push('facts:' + entity); return fakeRes(false, 500, null); },
+      sessionsBySessionIdState: function (id) { callsA.push('state:' + id); return fakeRes(true, 200, {}); }
+    };
+    const hostA = mock.mkNode('div');
+    asyncChecks.push(Promise.resolve(render.renderSessionDetail(hostA, sessionNode, apiA)).then(function () {
+      check(JSON.stringify(callsA.slice().sort()) === JSON.stringify(['facts:execplan:alpha', 'observations:aaaa1111beef']),
+        '[session-detail] an ExecPlan session drives EXACTLY {observations, facts/entity} — no state fetch, no transcript (got ' + JSON.stringify(callsA.slice().sort()) + ')');
+      const painted = mock.collect(hostA, []);
+      check(painted.some(function (n) { return /\bsession-detail-transcript-ref\b/.test(n.className || ''); }),
+        '[session-detail] the inert transcript reference paints from node data (not a state fetch)');
+      check(painted.some(function (n) { return /\bsession-detail-degraded\b/.test(n.className || ''); }),
+        '[session-detail] a failed provenance feed paints a degraded notice (fail honest)');
+    }).catch(function (e) { check(false, '[session-detail] drive A threw: ' + (e && e.stack || e)); }));
+
+    // Drive B (fix 6) — kanban session (no execplanEntity): observations ONLY.
+    const callsB = [];
+    const apiB = {
+      sessionsBySessionIdObservations: function (id) { callsB.push('observations:' + id); return fakeRes(true, 200, obsFixture); },
+      factsEntityByEntity: function (entity) { callsB.push('facts:' + entity); return fakeRes(true, 200, factsFixture); }
+    };
+    const hostB = mock.mkNode('div');
+    asyncChecks.push(Promise.resolve(render.renderSessionDetail(hostB, { id: 'k1', focus: { execplan_slug: 'kanban-1' }, leases: [] }, apiB)).then(function () {
+      check(JSON.stringify(callsB) === JSON.stringify(['observations:k1']),
+        '[session-detail] a non-ExecPlan session fetches observations ONLY — never facts for execplan:<announced-slug> (got ' + JSON.stringify(callsB) + ')');
+    }).catch(function (e) { check(false, '[session-detail] drive B threw: ' + (e && e.stack || e)); }));
+
+    // Drive C (fix 5) — race: slow A then fast B into the SAME host; only B paints.
+    const nodeSlow = { id: 'slowA', label: 'SLOWA', execplanEntity: 'execplan:slowa', focus: { execplan_slug: 'slowa' }, leases: [] };
+    const nodeFast = { id: 'fastB', label: 'FASTB', execplanEntity: 'execplan:fastb', focus: { execplan_slug: 'fastb' }, leases: [] };
+    const apiRace = {
+      sessionsBySessionIdObservations: function (id) { return id === 'slowA' ? fakeResLater(true, 200, obsFixture) : fakeRes(true, 200, obsFixture); },
+      factsEntityByEntity: function () { return fakeRes(true, 200, factsFixture); }
+    };
+    const hostRace = mock.mkNode('div');
+    const pSlow = render.renderSessionDetail(hostRace, nodeSlow, apiRace);   // in-flight (slow)
+    const pFast = render.renderSessionDetail(hostRace, nodeFast, apiRace);   // supersedes
+    asyncChecks.push(Promise.all([pSlow, pFast]).then(function () {
+      const txt = hostRace.textContent || '';
+      check(/FASTB/.test(txt) && !/SLOWA/.test(txt),
+        '[session-detail] a stale in-flight paint (slow A) is dropped — only the latest selection (fast B) paints (got: ' + txt.slice(0, 60) + ')');
+    }).catch(function (e) { check(false, '[session-detail] race drive threw: ' + (e && e.stack || e)); }).then(function () {
+      if (savedDoc2 === undefined) { delete global.document; } else { global.document = savedDoc2; }
+      if (savedWin === undefined) { delete global.window; } else { global.window = savedWin; }
+    }));
+  }
+
+  notes.push('session-detail (M4b): buildSessionDetail joins receipts (observations feed — a neutral "receipt envelope" chip + the daemon-reported chain status VERBATIM, never a client-side "signed"/"intact" verification claim) + fact provenance (/v1/facts/entity/<RESOLVED ExecPlan entity> — only for sessions that resolved to an ExecPlan; kanban/unattached → no_plan absent, never guessing execplan:<announced-slug>) + announced focus (from the node — no re-fetch) over EXISTING GET routes only. Transcript is reference-only: rendered from an id/path ALREADY on the node (coord announcement), NEVER by fetching session state (that blob can embed content — no state read is issued). Only a canonical [REDACTED:…] value renders the redaction marker; empty is honest-empty. Any non-ok feed → degraded; reachable-empty → absent. renderSessionDetail drives EXACTLY {observations[, facts]} (asserted as an exact multiset), guards a per-host selection token so a stale slow paint cannot overwrite a newer selection, and adds no transcript route/method.');
+})();
+
+// =========================================================================
+//  Check 45 — (desktop mission control M4c, console half) stale-plan mismatch
+//  badge. PR #457 adds `plan_content_hash` (lowercase BLAKE3 hex) to ExecPlan
+//  /v1/work items. planHashBadge(daemon_hash, local_hash|null) is a pure function:
+//  the browser cannot read local files, so with no local hash it renders a
+//  provenance chip (daemon short-form); the desktop shell (M5a) supplies a local
+//  hash, and both-present-and-differing renders a visible mismatch badge (T.2
+//  guard). buildPlanTree wires it onto ExecPlan nodes; the row paints the chip.
+// =========================================================================
+(function checkPlanHashBadge() {
+  check(typeof render.planHashBadge === 'function', '[plan-hash] render.js must export planHashBadge()');
+  if (typeof render.planHashBadge !== 'function') { return; }
+
+  // Pure function — the four honest states.
+  check(render.planHashBadge(null, null) === null && render.planHashBadge('', 'x') === null,
+    '[plan-hash] no daemon hash → no badge (nothing projected to attest)');
+  const prov = render.planHashBadge('abcdef0123456789', null);
+  check(prov && prov.kind === 'provenance' && prov.code === 'daemon_only' && prov.short === 'abcdef012345',
+    '[plan-hash] local_hash null → provenance chip carrying the daemon hash short-form (browser cannot read local files)');
+  const sync = render.planHashBadge('ABCDEF', 'abcdef');
+  check(sync && sync.kind === 'insync' && sync.code === 'in_sync',
+    '[plan-hash] equal hashes (case-insensitive) → in-sync chip');
+  const drift = render.planHashBadge('aaaa1111', 'bbbb2222');
+  check(drift && drift.kind === 'mismatch' && drift.code === 'stale_plan' && drift.short === 'aaaa1111' && drift.localShort === 'bbbb2222',
+    '[plan-hash] differing hashes → mismatch badge (T.2 guard) carrying both short-forms');
+
+  // buildPlanTree wiring: daemon hash defensive; local hash from data.localPlanHashes
+  // (by id then bare slug). No hash on the item → no badge.
+  const fixture = {
+    work: { work: [
+      { id: 'execplan:alpha', project_id: 'execplans', title: 'Alpha', plan_content_hash: 'aaaaaaaaaaaa1111' },   // local matches
+      { id: 'execplan:beta', project_id: 'execplans', title: 'Beta', plan_content_hash: 'bbbbbbbbbbbb2222' },     // local differs
+      { id: 'execplan:gamma', project_id: 'execplans', title: 'Gamma', plan_content_hash: 'cccccccccccc3333' },   // no local entry
+      { id: 'execplan:delta', project_id: 'execplans', title: 'Delta' }                                            // no daemon hash
+    ] },
+    localPlanHashes: { 'alpha': 'aaaaaaaaaaaa1111', 'execplan:beta': 'ffffffffffff9999' }
+  };
+  const roots = (render.buildPlanTree(fixture).roots) || [];
+  const exec = roots.find(function (n) { return n.type === 'project' && n.id === 'execplans'; });
+  function planById(id) { return exec ? (exec.children || []).find(function (n) { return n.id === id; }) : null; }
+  const alpha = planById('execplan:alpha'), beta = planById('execplan:beta'), gamma = planById('execplan:gamma'), delta = planById('execplan:delta');
+  check(alpha && alpha.planBadge && alpha.planBadge.kind === 'insync', '[plan-hash] a plan whose local hash (resolved by bare slug) matches → in-sync badge');
+  check(beta && beta.planBadge && beta.planBadge.kind === 'mismatch', '[plan-hash] a plan whose local hash (resolved by full id) differs → mismatch badge');
+  check(gamma && gamma.planBadge && gamma.planBadge.kind === 'provenance', '[plan-hash] a plan with a daemon hash but no local entry → provenance chip');
+  check(delta && delta.planBadge == null, '[plan-hash] a plan with no daemon hash carries no badge (forward-compatible before PR #457 ships)');
+
+  // Row paints the chip with its state class AND a data-hash-state attribute.
+  const mock = newMockDom();
+  const savedDoc = global.document;
+  global.document = mock.doc;
+  try {
+    function hashChip(node, code) { return mock.collect(render.planTreeNode(node, 0), []).find(function (n) { return n.getAttribute('data-hash-state') === code; }) || null; }
+    const mmChip = hashChip(beta, 'stale_plan');
+    check(mmChip && /\bplan-tree-hash-mismatch\b/.test(mmChip.className || ''),
+      '[plan-hash] a mismatched ExecPlan row paints a chip with data-hash-state="stale_plan" + the mismatch class (T.2 guard)');
+    const provChip = hashChip(gamma, 'daemon_only');
+    check(provChip && /\bplan-tree-hash-prov\b/.test(provChip.className || ''),
+      '[plan-hash] a provenance-only ExecPlan row paints a chip with data-hash-state="daemon_only" + the provenance class');
+    check(mock.collect(render.planTreeNode(delta, 0), []).every(function (n) { return n.getAttribute('data-hash-state') == null; }),
+      '[plan-hash] a plan with no daemon hash paints no hash chip at all');
+  } catch (e) {
+    check(false, '[plan-hash] planTreeNode hash-chip render threw: ' + (e && e.stack || e));
+  } finally {
+    if (savedDoc === undefined) { delete global.document; } else { global.document = savedDoc; }
+  }
+
+  notes.push('plan-hash badge (M4c console half): planHashBadge(daemon_hash, local_hash|null) is pure — no daemon hash → no badge; no local hash → provenance chip (daemon short-form, since the browser cannot read local files); equal → in-sync; differing → mismatch badge (T.2 guard); buildPlanTree wires it onto ExecPlan nodes (daemon hash read defensively so it is forward-compatible before PR #457 ships; local hash from data.localPlanHashes by id then slug) and the row paints the state-classed chip carrying data-hash-state.');
 })();
 
 // ---- Report (awaits async renderer-driven checks) -----------------------

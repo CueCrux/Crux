@@ -1822,6 +1822,68 @@
     font-size: 11.5px; color: var(--ink2); padding: 7px 10px; border-radius: 7px;
     background: var(--surface2); border: 1px dashed var(--edge-strong); margin-bottom: 4px;
   }
+  /* Stale-plan hash chip (M4c console half). provenance = daemon hash only;
+     insync = local matches; mismatch = a loud drift badge (T.2 guard). */
+  .plan-tree-hash {
+    font-family: var(--font-mono); font-size: 10px; padding: 1px 6px; border-radius: 5px;
+    border: 1px solid var(--edge); color: var(--ink3); background: var(--surface2);
+  }
+  .plan-tree-hash-prov { color: var(--ink3); }
+  .plan-tree-hash-insync { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--edge)); }
+  .plan-tree-hash-mismatch {
+    color: var(--crit); border-color: color-mix(in srgb, var(--crit) 55%, var(--edge));
+    background: color-mix(in srgb, var(--crit) 12%, var(--surface2));
+  }
+
+  /* Session-detail / evidence view (M4b) — tree + detail split. */
+  .plan-tree-layout { display: flex; gap: 14px; align-items: flex-start; flex-wrap: wrap; }
+  .plan-tree-col { flex: 1 1 340px; min-width: 0; }
+  .session-detail-col { flex: 1 1 340px; min-width: 0; border-left: 1px solid var(--edge); padding-left: 14px; }
+  @media (max-width: 720px) {
+    .session-detail-col { border-left: none; padding-left: 0; border-top: 1px solid var(--edge); padding-top: 12px; }
+  }
+  .plan-tree-session-open { cursor: pointer; }
+  .plan-tree-session-open:hover { background: var(--surface2); }
+  .plan-tree-session-open:focus-visible { outline: 2px solid var(--acc); outline-offset: 1px; }
+  .session-detail { display: flex; flex-direction: column; gap: 12px; font-size: 12.5px; }
+  .session-detail-head { display: flex; flex-direction: column; gap: 6px; }
+  .session-detail-title { font-family: var(--font-mono); font-weight: 700; font-size: 13.5px; color: var(--ink); }
+  .session-detail-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+  .session-detail-sec { display: flex; flex-direction: column; gap: 6px; }
+  .session-detail-sec-h {
+    font-family: var(--font-mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--ink3); display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  }
+  .session-detail-item {
+    display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+    border: 1px solid var(--edge); border-radius: 7px; padding: 6px 9px;
+  }
+  .session-detail-k { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink2); }
+  .session-detail-hash { font-family: var(--font-mono); font-size: 10px; color: var(--ink3); }
+  /* Transcript reference — inert text, never a link (reference-only decision). */
+  .session-detail-transcript-ref {
+    font-family: var(--font-mono); font-size: 10.5px; padding: 2px 7px; border-radius: 5px;
+    background: var(--surface2); border: 1px dashed var(--edge-strong); color: var(--ink3);
+    word-break: break-all;
+  }
+  /* absent = reachable-but-empty (M2 disabled-with-reason idiom). */
+  .session-detail-absent {
+    font-size: 11.5px; color: var(--ink3); padding: 7px 10px; border-radius: 7px;
+    background: var(--surface2); border: 1px solid var(--edge);
+  }
+  /* degraded = feed error (M4a appendFeedNotices idiom). */
+  .session-detail-degraded {
+    font-size: 11.5px; color: var(--ink2); padding: 7px 10px; border-radius: 7px;
+    background: var(--surface2); border: 1px dashed var(--edge-strong);
+  }
+  .session-detail-badge {
+    font-family: var(--font-mono); font-size: 10px; padding: 2px 8px; border-radius: 999px;
+    border: 1px solid var(--edge); color: var(--ink3);
+  }
+  .session-detail-badge.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--edge)); }
+  .session-detail-badge.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--edge)); }
+  .session-detail-badge.err { color: var(--crit); border-color: color-mix(in srgb, var(--crit) 45%, var(--edge)); }
+  .session-detail-redacted { font-family: var(--font-mono); font-size: 10px; color: var(--warn); }
 
   /* ---- Activity log (Work › Activity) — v2-themed rolling activity surface --- */
   .act-log { display: flex; flex-direction: column; gap: 12px; }
@@ -3076,7 +3138,7 @@
 <script>
 (function () {
   'use strict';
-  var SW_REV = 'ushell-v2-r9';   // keep in lock-step with /console-v2/sw.js
+  var SW_REV = 'ushell-v2-r10';   // keep in lock-step with /console-v2/sw.js
   if (!('serviceWorker' in navigator)) { return; }
   // Dev bypass — when the daemon serves this shell from CORECRUXD_CONSOLE_DEV_PATH
   // it stamps window.__CRUX_CONSOLE_DEV__ (see console.rs inject_console_dev_flag).
