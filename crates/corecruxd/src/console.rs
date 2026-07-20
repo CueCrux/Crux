@@ -499,6 +499,60 @@ mod tests {
         assert_eq!(&*body, CONSOLE_V2_HTML, "/console must serve the v2 shell");
     }
 
+    // Locate `node` for the console-smoke runner: PATH first (CI + most dev
+    // machines), then a couple of common absolute locations.
+    fn find_node() -> Option<std::path::PathBuf> {
+        use std::process::Command;
+        let on_path = Command::new("node")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if on_path {
+            return Some(std::path::PathBuf::from("node"));
+        }
+        ["/usr/bin/node", "/usr/local/bin/node"]
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .find(|p| p.exists())
+    }
+
+    // Run the console v2 node/jsdom smoke (console/v2/smoke.cjs) as part of the
+    // ordinary `cargo test` gate. The smoke asserts runtime behaviour the
+    // include_str! structural tests cannot — the capability-descriptor
+    // conformance, two-profile anti-501 guard, plan-tree honesty, and the
+    // gated-mutation choke point. It was previously NOT enforced by CI (it is a
+    // standalone node script), which let two console regressions ship on
+    // additive daemon changes (the M5b Settings under-render and the
+    // runtime-capability schema over-bump). Wiring it here makes it mandatory
+    // wherever `node` is available (every dev machine and the node-capable CI
+    // runner). It graceful-skips when node is absent so a node-less runner never
+    // falsely blocks — the eprintln documents how to make it hard-mandatory.
+    #[test]
+    fn console_v2_smoke_cjs_passes() {
+        use std::process::Command;
+        let Some(node) = find_node() else {
+            eprintln!(
+                "SKIP console_v2_smoke_cjs_passes: `node` not found on PATH. The console \
+                 smoke is enforced on every machine with node; to make it mandatory in CI, \
+                 ensure the Rust test runner has node available (e.g. actions/setup-node)."
+            );
+            return;
+        };
+        let smoke = concat!(env!("CARGO_MANIFEST_DIR"), "/console/v2/smoke.cjs");
+        let output = match Command::new(node).arg(smoke).output() {
+            Ok(output) => output,
+            Err(err) => panic!("failed to spawn node for the console v2 smoke: {err}"),
+        };
+        assert!(
+            output.status.success(),
+            "console/v2/smoke.cjs failed (exit {:?}):\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
     #[test]
     fn console_v2_shell_has_licence_header_and_no_external_runtime_deps() {
         // CCL licence header carried in the leading HTML comment.
