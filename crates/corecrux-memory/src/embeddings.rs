@@ -149,6 +149,11 @@ pub trait Embedder: Send + Sync + std::fmt::Debug {
     fn model(&self) -> &str;
     /// This embedder's semantic profile (model/dim/fingerprint).
     fn semantic_profile(&self) -> SemanticProfile;
+    /// Whether inference executes inside this daemon process. External and
+    /// custom embedders default to remote so capability reporting fails closed.
+    fn runs_locally(&self) -> bool {
+        false
+    }
 }
 
 impl Embedder for EmbeddingClient {
@@ -246,6 +251,9 @@ impl Embedder for LocalHashEmbedder {
             "l2",
         )
     }
+    fn runs_locally(&self) -> bool {
+        true
+    }
 }
 
 /// Optional real CPU embedding model (buyer-fit M3.4), behind the
@@ -319,6 +327,9 @@ impl Embedder for FastEmbedEmbedder {
     }
     fn semantic_profile(&self) -> SemanticProfile {
         SemanticProfile::from_parts(&self.model_id, self.dimensions, "bert_wordpiece", "none", "l2")
+    }
+    fn runs_locally(&self) -> bool {
+        true
     }
 }
 

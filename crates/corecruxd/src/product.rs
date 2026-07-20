@@ -184,6 +184,8 @@ pub struct ProductPosture {
     pub daemon_implemented_pro_claims: Vec<&'static str>,
     pub hosted_control_plane_pro_claims: Vec<&'static str>,
     pub free_safety_baseline_active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_capabilities: Option<RuntimeCapabilityDescriptor>,
 }
 
 impl ProductPosture {
@@ -210,6 +212,269 @@ impl ProductPosture {
             daemon_implemented_pro_claims: DAEMON_IMPLEMENTED_PRO_CLAIMS.to_vec(),
             hosted_control_plane_pro_claims: HOSTED_CONTROL_PLANE_PRO_CLAIMS.to_vec(),
             free_safety_baseline_active: true,
+            runtime_capabilities: None,
+        }
+    }
+
+    pub fn with_runtime_capabilities(mut self, runtime_capabilities: RuntimeCapabilityDescriptor) -> Self {
+        self.runtime_capabilities = Some(runtime_capabilities);
+        self
+    }
+}
+
+pub const RUNTIME_CAPABILITY_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeCapabilityDescriptor {
+    pub schema_version: u32,
+    pub capabilities: RuntimeCapabilities,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeCapabilities {
+    pub append: RuntimeCapability,
+    pub local_embedders: RuntimeCapability,
+    pub rerank_gpu: RuntimeCapability,
+    pub hosted_sync: RuntimeCapability,
+    pub projection_queries: RuntimeCapability,
+    pub graph_expand: RuntimeCapability,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeCapability {
+    pub availability: &'static str,
+    pub reason_code: &'static str,
+    pub reason: &'static str,
+    pub compiled: bool,
+    pub configured: bool,
+    pub initialized: bool,
+    pub entitled: bool,
+    pub degraded: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeCapabilityInputs {
+    pub http_dataplane_enabled: bool,
+    pub local_embedder_configured: bool,
+    pub local_embedder_initialized: bool,
+    pub rerank_endpoint_configured: bool,
+    pub graph_expand_configured: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RuntimeCapabilityStages {
+    compiled: bool,
+    configured: bool,
+    initialized: bool,
+    entitled: bool,
+    degraded: bool,
+}
+
+impl RuntimeCapabilityDescriptor {
+    pub fn from_runtime(
+        mode: OperatingMode,
+        configured_pro_services: &[String],
+        sync: &SyncRuntimeStatus,
+        inputs: RuntimeCapabilityInputs,
+    ) -> Self {
+        let rerank_enabled = configured_pro_services.iter().any(|service| service == "gpu1:rerank");
+        let sync_enabled = configured_pro_services.iter().any(|service| service == "sync:mirror");
+        let pro_entitled = mode.includes_pro();
+        let rerank_compiled = cfg!(feature = "hosted-surfaces");
+        let append_stages = RuntimeCapabilityStages {
+            compiled: true,
+            configured: inputs.http_dataplane_enabled,
+            initialized: inputs.http_dataplane_enabled,
+            entitled: true,
+            degraded: false,
+        };
+        let local_embedder_stages = RuntimeCapabilityStages {
+            compiled: true,
+            configured: inputs.local_embedder_configured,
+            initialized: inputs.local_embedder_initialized,
+            entitled: true,
+            degraded: false,
+        };
+        let rerank_stages = RuntimeCapabilityStages {
+            compiled: rerank_compiled,
+            configured: inputs.rerank_endpoint_configured,
+            initialized: rerank_compiled && rerank_enabled && inputs.rerank_endpoint_configured,
+            entitled: pro_entitled,
+            degraded: rerank_enabled && !inputs.rerank_endpoint_configured,
+        };
+        let sync_stages = RuntimeCapabilityStages {
+            compiled: true,
+            configured: sync.configured,
+            initialized: sync.background_sync_enabled && !sync.remote_url.is_empty(),
+            entitled: pro_entitled,
+            degraded: sync.degraded,
+        };
+        let graph_stages = RuntimeCapabilityStages {
+            compiled: true,
+            configured: inputs.graph_expand_configured,
+            initialized: inputs.http_dataplane_enabled,
+            entitled: true,
+            degraded: false,
+        };
+
+        let append = if inputs.http_dataplane_enabled {
+            RuntimeCapability::available(append_stages)
+        } else {
+            RuntimeCapability::unavailable(
+                "http_dataplane_disabled",
+                "The HTTP dataplane is not initialised, so event append is unavailable.",
+                append_stages,
+            )
+        };
+        let projection_queries = if inputs.http_dataplane_enabled {
+            RuntimeCapability::available(append_stages)
+        } else {
+            RuntimeCapability::unavailable(
+                "http_dataplane_disabled",
+                "The HTTP dataplane is not initialised, so projection queries are unavailable.",
+                append_stages,
+            )
+        };
+        let local_embedders = if inputs.local_embedder_configured && inputs.local_embedder_initialized {
+            RuntimeCapability::available(local_embedder_stages)
+        } else {
+            RuntimeCapability::unavailable(
+                "local_embedder_unavailable",
+                "No in-process embedder is initialised in this daemon's local fact store.",
+                local_embedder_stages,
+            )
+        };
+        let rerank_gpu = if !rerank_compiled {
+            RuntimeCapability::unavailable(
+                "rerank_not_compiled",
+                "This daemon was built without the hosted GPU rerank bridge.",
+                rerank_stages,
+            )
+        } else if !pro_entitled {
+            RuntimeCapability::unavailable(
+                "rerank_not_entitled",
+                "GPU rerank is not enabled for this product posture.",
+                rerank_stages,
+            )
+        } else if !rerank_enabled {
+            RuntimeCapability::unavailable(
+                "rerank_not_enabled",
+                "GPU rerank is entitled but is not enabled in this daemon configuration.",
+                rerank_stages,
+            )
+        } else if !inputs.rerank_endpoint_configured {
+            RuntimeCapability::degraded(
+                "rerank_endpoint_not_configured",
+                "GPU rerank is entitled, but its remote compute endpoint is not configured.",
+                rerank_stages,
+            )
+        } else {
+            RuntimeCapability::available(rerank_stages)
+        };
+        let hosted_sync = if !pro_entitled {
+            RuntimeCapability::unavailable(
+                "hosted_sync_not_entitled",
+                "Hosted sync is not enabled for this product posture.",
+                sync_stages,
+            )
+        } else if !sync_enabled {
+            RuntimeCapability::unavailable(
+                "hosted_sync_not_enabled",
+                "Hosted sync is entitled but is not enabled in this daemon configuration.",
+                sync_stages,
+            )
+        } else if sync.degraded {
+            RuntimeCapability::degraded(
+                "hosted_sync_degraded",
+                "Hosted sync configuration is incomplete; the daemon is continuing local-only.",
+                sync_stages,
+            )
+        } else if !sync.configured {
+            RuntimeCapability::unavailable(
+                "hosted_sync_not_configured",
+                "Hosted sync is entitled but no complete remote target is configured.",
+                sync_stages,
+            )
+        } else if !sync.background_sync_enabled {
+            RuntimeCapability::available_with_reason(
+                "hosted_sync_manual",
+                "Hosted sync is configured for manual operation; its background loop is not initialised.",
+                sync_stages,
+            )
+        } else {
+            RuntimeCapability::available(sync_stages)
+        };
+        let graph_expand = if !inputs.graph_expand_configured {
+            RuntimeCapability::unavailable(
+                "graph_expand_not_configured",
+                "Graph expansion is disabled in this daemon configuration.",
+                graph_stages,
+            )
+        } else if !inputs.http_dataplane_enabled {
+            RuntimeCapability::unavailable(
+                "http_dataplane_disabled",
+                "The HTTP dataplane is not initialised, so graph expansion is unavailable.",
+                graph_stages,
+            )
+        } else {
+            RuntimeCapability::available(graph_stages)
+        };
+
+        Self {
+            schema_version: RUNTIME_CAPABILITY_SCHEMA_VERSION,
+            capabilities: RuntimeCapabilities {
+                append,
+                local_embedders,
+                rerank_gpu,
+                hosted_sync,
+                projection_queries,
+                graph_expand,
+            },
+        }
+    }
+}
+
+impl RuntimeCapability {
+    fn available(stages: RuntimeCapabilityStages) -> Self {
+        Self::available_with_reason("available", "Capability is available.", stages)
+    }
+
+    fn available_with_reason(reason_code: &'static str, reason: &'static str, stages: RuntimeCapabilityStages) -> Self {
+        Self {
+            availability: "available",
+            reason_code,
+            reason,
+            compiled: stages.compiled,
+            configured: stages.configured,
+            initialized: stages.initialized,
+            entitled: stages.entitled,
+            degraded: stages.degraded,
+        }
+    }
+
+    fn unavailable(reason_code: &'static str, reason: &'static str, stages: RuntimeCapabilityStages) -> Self {
+        Self {
+            availability: "unavailable",
+            reason_code,
+            reason,
+            compiled: stages.compiled,
+            configured: stages.configured,
+            initialized: stages.initialized,
+            entitled: stages.entitled,
+            degraded: stages.degraded,
+        }
+    }
+
+    fn degraded(reason_code: &'static str, reason: &'static str, stages: RuntimeCapabilityStages) -> Self {
+        Self {
+            availability: "degraded",
+            reason_code,
+            reason,
+            compiled: stages.compiled,
+            configured: stages.configured,
+            initialized: stages.initialized,
+            entitled: stages.entitled,
+            degraded: stages.degraded,
         }
     }
 }
@@ -798,6 +1063,77 @@ mod tests {
         assert!(posture.enabled_capability_claims.contains(&"gpu1:answer"));
         assert!(!posture.enabled_capability_claims.contains(&"gpu:onsite"));
         assert_eq!(posture.enabled_pro_services, vec!["gpu1:answer", "sync:mirror"]);
+    }
+
+    #[test]
+    fn runtime_capability_stages_remain_independent_of_entitlement() {
+        let configured = vec!["gpu1:rerank".to_string(), "sync:mirror".to_string()];
+        let sync = SyncRuntimeStatus::from_settings(true, Some("https://memory.example"), true);
+        let descriptor = RuntimeCapabilityDescriptor::from_runtime(
+            OperatingMode::FreeLocal,
+            &configured,
+            &sync,
+            RuntimeCapabilityInputs {
+                http_dataplane_enabled: true,
+                local_embedder_configured: true,
+                local_embedder_initialized: true,
+                rerank_endpoint_configured: true,
+                graph_expand_configured: true,
+            },
+        );
+
+        assert!(descriptor.capabilities.rerank_gpu.configured);
+        assert!(!descriptor.capabilities.rerank_gpu.entitled);
+        assert!(descriptor.capabilities.hosted_sync.configured);
+        assert!(descriptor.capabilities.hosted_sync.initialized);
+        assert!(!descriptor.capabilities.hosted_sync.entitled);
+        assert_eq!(descriptor.capabilities.hosted_sync.availability, "unavailable");
+        assert_eq!(
+            descriptor.capabilities.hosted_sync.reason_code,
+            "hosted_sync_not_entitled"
+        );
+
+        let missing_endpoint = RuntimeCapabilityDescriptor::from_runtime(
+            OperatingMode::FreeLocal,
+            &configured,
+            &sync,
+            RuntimeCapabilityInputs {
+                http_dataplane_enabled: true,
+                local_embedder_configured: true,
+                local_embedder_initialized: true,
+                rerank_endpoint_configured: false,
+                graph_expand_configured: true,
+            },
+        );
+        assert!(!missing_endpoint.capabilities.rerank_gpu.configured);
+        assert!(!missing_endpoint.capabilities.rerank_gpu.entitled);
+        assert!(missing_endpoint.capabilities.rerank_gpu.degraded);
+    }
+
+    #[test]
+    fn manual_hosted_sync_is_available_without_an_initialised_background_loop() {
+        let configured = vec!["sync:mirror".to_string()];
+        let sync = SyncRuntimeStatus::from_settings(false, Some("https://memory.example"), true);
+        let descriptor = RuntimeCapabilityDescriptor::from_runtime(
+            OperatingMode::ProHybrid,
+            &configured,
+            &sync,
+            RuntimeCapabilityInputs {
+                http_dataplane_enabled: true,
+                local_embedder_configured: false,
+                local_embedder_initialized: false,
+                rerank_endpoint_configured: false,
+                graph_expand_configured: true,
+            },
+        );
+        let hosted_sync = descriptor.capabilities.hosted_sync;
+
+        assert_eq!(hosted_sync.availability, "available");
+        assert_eq!(hosted_sync.reason_code, "hosted_sync_manual");
+        assert!(hosted_sync.configured);
+        assert!(!hosted_sync.initialized);
+        assert!(hosted_sync.entitled);
+        assert!(!hosted_sync.degraded);
     }
 
     #[test]

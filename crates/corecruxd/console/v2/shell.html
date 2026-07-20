@@ -605,6 +605,9 @@
   }
   .ctl-info-k { font-size: 12px; color: var(--ink3); font-weight: 500; flex: none; }
   .ctl-info-v { font-size: 12.5px; color: var(--ink); text-align: right; word-break: break-word; font-variant-numeric: tabular-nums; }
+  .runtime-capability-status[data-capability-availability="unavailable"],
+  .runtime-capability-status[data-capability-availability="degraded"] { border-color: var(--warn); }
+  .runtime-capability-status[data-capability-availability="unknown"] .ctl-info-v { color: var(--ink3); }
 
   /* ---- LED toggle — ported from the legacy console .active-toggle -----------
      (crates/corecruxd/console/index.html:388-392). A compact squarer chip with
@@ -666,6 +669,14 @@
     border: 1px solid color-mix(in srgb, var(--trust) 30%, transparent); padding: 1px 7px; border-radius: 999px;
   }
   .ctl-row.is-gated, .exp.is-gated { position: relative; }
+  .capability-reason {
+    margin: 8px 0 0; padding: 8px 10px;
+    color: var(--ink2); background: color-mix(in srgb, var(--warn) 8%, var(--surface));
+    border-left: 3px solid var(--warn); border-radius: var(--radius-sm);
+    font-size: 12px; line-height: 1.45;
+  }
+  .doc-card.is-capability-disabled { flex-wrap: wrap; }
+  .doc-card.is-capability-disabled > .capability-reason { flex-basis: 100%; }
 
   /* M13b live-write harness: result line + two-step confirm dialog. */
   .wired-out { margin-top: 6px; }
@@ -2362,6 +2373,7 @@
 
   // ---- Boot state --------------------------------------------------------
   var BOOT = { version: null, summary: null, health: 'loading', reason: '' };
+  window.CRUX_RUNTIME_CAPABILITIES = null;
   // Which content the left rail currently holds: 'dest' (the destination nav) or
   // 'docs' (the Documents-mode tree). renderDestination restores 'dest' when it
   // finds the rail swapped to the tree (leaving Documents mode).
@@ -2916,6 +2928,7 @@
       .then(function (res) {
         var ver = res[0], sum = res[1];
         if (ver && ver.data) { BOOT.version = ver.data; }
+        window.CRUX_RUNTIME_CAPABILITIES = get(BOOT.version, ['product', 'runtime_capabilities']) || null;
         if (sum && sum.ok && sum.data) { BOOT.summary = sum.data; }
         var reachable = (ver && ver.status !== 0) || (sum && sum.status !== 0);
         // Origin-wide session gate: if the summary read was bounced to sign-in
@@ -3023,7 +3036,7 @@
 <script>
 (function () {
   'use strict';
-  var SW_REV = 'ushell-v2-r7';   // keep in lock-step with /console-v2/sw.js
+  var SW_REV = 'ushell-v2-r8';   // keep in lock-step with /console-v2/sw.js
   if (!('serviceWorker' in navigator)) { return; }
   // Dev bypass — when the daemon serves this shell from CORECRUXD_CONSOLE_DEV_PATH
   // it stamps window.__CRUX_CONSOLE_DEV__ (see console.rs inject_console_dev_flag).

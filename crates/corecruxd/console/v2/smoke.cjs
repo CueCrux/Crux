@@ -54,6 +54,9 @@
 //  35. (M13a) native workbench port + CONTROL_DIFF coverage: the manifest covers
 //      every legacy CX page; cx-workbench loads /v1/workbench/contract and renders
 //      its GET read tools via a GET-only self-loader; every wired op is a GET.
+//  41. (desktop mission control M2) every mapped control names a declared runtime
+//      capability and route; unavailable controls render disabled with an
+//      accessible, machine-readable reason without bypassing the write choke.
 
 'use strict';
 
@@ -76,6 +79,22 @@ function check(ok, msg) { if (!ok) { failures.push(msg); } }
 // counter is sufficient for the containment audit in check 7.)
 function funcBody(src, name) {
   const at = src.indexOf('function ' + name);
+  if (at < 0) { return null; }
+  const open = src.indexOf('{', at);
+  if (open < 0) { return null; }
+  let depth = 0;
+  for (let i = open; i < src.length; i++) {
+    const ch = src[i];
+    if (ch === '{') { depth++; }
+    else if (ch === '}') { depth--; if (depth === 0) { return src.slice(at, i + 1); } }
+  }
+  return null;
+}
+
+// Extract an object-method body such as `queryGraphExpand(body) { ... }` from
+// the generated no-build client. Used only by the route-conformance audit.
+function objectMethodBody(src, name) {
+  const at = src.indexOf('\n  ' + name + '(');
   if (at < 0) { return null; }
   const open = src.indexOf('{', at);
   if (open < 0) { return null; }
@@ -1844,8 +1863,284 @@ function extractThemeVars(theme) {
   notes.push('tile canvas (M14): WebCrux grammar ported — 20px snap grid + SIZE_MAP + deterministic onion-layer auto-layout (pure, unit-tested), 4px-deadzone pan + {20,20} auto-pan, sibling dim blur(18px)/saturate(.2)/opacity(.15), entry .4s / exit .25s on cubic-bezier(.16,1,.3,1), hover −3px, form stack <640px; board = widget registry as tiles, documents landing = corpus canvas.');
 })();
 
+// =========================================================================
+//  Check 41 — (desktop mission control M2) capability-mapped controls. The
+//  central data map must reference fields declared by the daemon's versioned
+//  descriptor and list every route each control reaches. The renderer fails
+//  closed and paints an accessible reason; this DOM layer never dispatches a
+//  mutation and never enables a control disabled by another safety gate.
+// =========================================================================
+(function checkCapabilityMappedControls() {
+  const map = pages.CONTROL_CAPABILITY_MAP || {};
+  const expected = [
+    'documents.living.load', 'documents.dependencies.expand'
+  ];
+  check(Object.isFrozen(map), '[capabilities] CONTROL_CAPABILITY_MAP must be exported as frozen central data');
+  check(JSON.stringify(Object.keys(map).sort()) === JSON.stringify(expected.slice().sort()),
+    '[capabilities] CONTROL_CAPABILITY_MAP must contain the two stable consumer control ids');
+  check(/applyCapabilityGate\(bar, 'documents\.living\.load'\)/.test(renderSrc),
+    '[capabilities] Living Objects custom control bar must use the generic capability gate');
+  check(/applyCapabilityGate\(bar, 'documents\.dependencies\.expand'\)/.test(renderSrc),
+    '[capabilities] Dependencies custom control bar must use the generic capability gate');
+  check(/return applyCapabilityGate\(node, control && control\.k\)/.test(renderSrc),
+    '[capabilities] keyed DSL controls must pass once through the generic capability gate at renderControl return');
+
+  const productSrc = fs.readFileSync(path.join(DIR, '..', '..', 'src', 'product.rs'), 'utf8');
+  const openapiSrc = fs.readFileSync(path.join(DIR, '..', '..', 'src', 'http', 'openapi.rs'), 'utf8');
+  const apiSrc = fs.readFileSync(path.join(DIR, 'api.js'), 'utf8');
+  const structMatch = productSrc.match(/pub struct RuntimeCapabilities\s*\{([\s\S]*?)\n\}/);
+  check(!!structMatch, '[capabilities] product.rs must declare RuntimeCapabilities for route conformance');
+  const descriptorFields = new Set();
+  if (structMatch) {
+    let fieldMatch;
+    const fieldRe = /pub\s+([a-z][a-z0-9_]*):/g;
+    while ((fieldMatch = fieldRe.exec(structMatch[1])) !== null) { descriptorFields.add(fieldMatch[1]); }
+  }
+  Object.keys(map).forEach(function (controlId) {
+    const spec = map[controlId];
+    check(spec && descriptorFields.has(spec.capability),
+      '[capabilities] mapped control ' + controlId + ' names undeclared descriptor capability: ' + String(spec && spec.capability));
+    check(spec && Array.isArray(spec.routes) && spec.routes.length > 0,
+      '[capabilities] mapped control ' + controlId + ' must declare at least one route');
+    (spec && spec.routes || []).forEach(function (route) {
+      check(Array.isArray(route) && route.length === 2 && /^(GET|POST|PUT|PATCH|DELETE)$/.test(route[0]) && /^\/v1\//.test(route[1]),
+        '[capabilities] mapped control ' + controlId + ' has an invalid [method, /v1/path] route');
+    });
+  });
+
+  const daemonRoutes = new Set();
+  const routeEntryRe = /RouteEntry\s*\{\s*path:\s*"([^"]+)",\s*methods:\s*&\[([^\]]*)\]/g;
+  let routeEntry;
+  while ((routeEntry = routeEntryRe.exec(openapiSrc)) !== null) {
+    let method;
+    const methodRe = /"([A-Z]+)"/g;
+    while ((method = methodRe.exec(routeEntry[2])) !== null) {
+      daemonRoutes.add(method[1] + ' ' + routeEntry[1]);
+    }
+  }
+  Object.keys(map).forEach(function (controlId) {
+    map[controlId].routes.forEach(function (route) {
+      check(daemonRoutes.has(route[0] + ' ' + route[1]),
+        '[capabilities] mapped route is absent from the daemon route catalog: ' + route[0] + ' ' + route[1]);
+    });
+  });
+
+  function clientRoute(methodName) {
+    const body = objectMethodBody(apiSrc, methodName) || '';
+    const template = body.match(/`(\/v1\/[^`]*)`/);
+    const verb = body.match(/method:\s*'([A-Z]+)'/);
+    if (!template) { return null; }
+    return [verb ? verb[1] : 'GET', template[1].replace(/\$\{encodeURIComponent\(([^)]+)\)\}/g, '{$1}')];
+  }
+  function sortedRoutes(routes) {
+    return routes.filter(Boolean).map(function (route) { return route[0] + ' ' + route[1]; }).sort();
+  }
+  const livingBody = funcBody(renderSrc, 'renderDocSurface_living') || '';
+  const livingMethods = [];
+  let call;
+  const livingCallRe = /projCall\('([^']+)'/g;
+  while ((call = livingCallRe.exec(livingBody)) !== null) { livingMethods.push(call[1]); }
+  const dependencyBody = funcBody(renderSrc, 'renderDocSurface_deps') || '';
+  const dependencyCall = dependencyBody.match(/readPost\('([^']+)'/);
+  check(JSON.stringify(sortedRoutes(livingMethods.map(clientRoute))) === JSON.stringify(sortedRoutes(map['documents.living.load'].routes)),
+    '[capabilities] Living Objects map routes must exactly match its generated-client dispatches');
+  check(dependencyCall && JSON.stringify(sortedRoutes([clientRoute(dependencyCall[1])])) === JSON.stringify(sortedRoutes(map['documents.dependencies.expand'].routes)),
+    '[capabilities] Dependencies map routes must exactly match its generated-client dispatch');
+
+  const fullDescriptor = { schema_version: 1, capabilities: {} };
+  descriptorFields.forEach(function (name) {
+    fullDescriptor.capabilities[name] = {
+      availability: 'available', reason_code: 'available', reason: 'Available.',
+      compiled: true, configured: true, initialized: true, entitled: true, degraded: false
+    };
+  });
+  fullDescriptor.capabilities.rerank_gpu = {
+    availability: 'unavailable', reason_code: 'rerank_not_compiled',
+    reason: 'This daemon was built without the hosted GPU rerank bridge.',
+    compiled: false, configured: true, initialized: false, entitled: true, degraded: false
+  };
+  const dataplaneOffDescriptor = JSON.parse(JSON.stringify(fullDescriptor));
+  const descriptor = dataplaneOffDescriptor;
+  descriptor.capabilities.projection_queries = {
+    availability: 'unavailable', reason_code: 'http_dataplane_disabled',
+    reason: 'The HTTP dataplane is not initialised, so projection queries are unavailable.',
+    compiled: true, configured: false, initialized: false, entitled: true, degraded: false
+  };
+  descriptor.capabilities.graph_expand = {
+    availability: 'unavailable', reason_code: 'http_dataplane_disabled',
+    reason: 'The HTTP dataplane is not initialised, so graph expansion is unavailable.',
+    compiled: true, configured: true, initialized: false, entitled: true, degraded: false
+  };
+  descriptor.capabilities.append = {
+    availability: 'unavailable', reason_code: 'http_dataplane_disabled',
+    reason: 'The HTTP dataplane is not initialised, so event append is unavailable.',
+    compiled: true, configured: false, initialized: false, entitled: true, degraded: false
+  };
+  const noLocalEmbedderDescriptor = JSON.parse(JSON.stringify(fullDescriptor));
+  noLocalEmbedderDescriptor.capabilities.local_embedders = {
+    availability: 'unavailable', reason_code: 'local_embedder_unavailable',
+    reason: "No in-process embedder is initialised in this daemon's local fact store.",
+    compiled: true, configured: false, initialized: false, entitled: true, degraded: false
+  };
+
+  [
+    ['full', fullDescriptor, false],
+    ['dataplane-off', dataplaneOffDescriptor, true],
+    ['no-local-embedder', noLocalEmbedderDescriptor, false]
+  ].forEach(function (profile) {
+    Object.keys(map).forEach(function (controlId) {
+      const state = render.capabilityStateForControl(controlId, profile[1], map);
+      check(state && state.disabled === profile[2],
+        '[capabilities] ' + profile[0] + ' profile has the wrong gate for ' + controlId);
+    });
+  });
+
+  const missing = render.capabilityStateForControl('documents.living.load', null, map);
+  check(missing && missing.disabled && missing.reasonCode === 'descriptor_unavailable',
+    '[capabilities] a missing descriptor must fail closed with descriptor_unavailable');
+  const unknownSchema = render.capabilityStateForControl('documents.living.load', { schema_version: 2, capabilities: {} }, map);
+  check(unknownSchema && unknownSchema.disabled && unknownSchema.reasonCode === 'descriptor_unavailable',
+    '[capabilities] an unknown descriptor schema must fail closed');
+  const incomplete = render.capabilityStateForControl('documents.living.load', {
+    schema_version: 1, capabilities: { projection_queries: { availability: 'available' } }
+  }, map);
+  check(incomplete && incomplete.disabled && incomplete.reasonCode === 'capability_descriptor_invalid',
+    '[capabilities] an incomplete schema-v1 capability must fail closed');
+  const manualDescriptor = JSON.parse(JSON.stringify(descriptor));
+  manualDescriptor.capabilities.projection_queries = {
+    availability: 'available', reason_code: 'available_manual', reason: 'Manual operation is available.',
+    compiled: true, configured: true, initialized: false, entitled: true, degraded: false
+  };
+  const manual = render.capabilityStateForControl('documents.living.load', manualDescriptor, map);
+  check(manual && !manual.disabled,
+    '[capabilities] independently reported stages must not override an explicit available state');
+
+  const statusSection = render.runtimeCapabilitySection(descriptor);
+  const noLocalStatusSection = render.runtimeCapabilitySection(noLocalEmbedderDescriptor);
+  const statusControls = statusSection.controls || [];
+  check(JSON.stringify(statusControls.map(function (control) { return control.capability; }).sort()) === JSON.stringify(Array.from(descriptorFields).sort()),
+    '[capabilities] Settings status must render every descriptor-declared capability exactly once');
+  const appendStatus = statusControls.find(function (control) { return control.capability === 'append'; });
+  const embedderStatus = (noLocalStatusSection.controls || []).find(function (control) { return control.capability === 'local_embedders'; });
+  check(appendStatus && appendStatus.reasonCode === 'http_dataplane_disabled' && /event append is unavailable/.test(appendStatus.v),
+    '[capabilities] Settings must expose append availability and its daemon reason');
+  check(embedderStatus && embedderStatus.reasonCode === 'local_embedder_unavailable' && /local fact store/.test(embedderStatus.v),
+    '[capabilities] Settings must expose local-embedder availability and its daemon reason');
+
+  function matches(node, selector) {
+    return selector.split(',').some(function (part) {
+      const token = part.trim();
+      if (token.charAt(0) === '.') { return String(node.className || '').split(/\s+/).indexOf(token.slice(1)) >= 0; }
+      return node.tagName === token.toUpperCase();
+    });
+  }
+  function collect(node, selector, out) {
+    (node.childNodes || []).forEach(function (child) {
+      if (!child || child.nodeType !== 1) { return; }
+      if (matches(child, selector)) { out.push(child); }
+      collect(child, selector, out);
+    });
+  }
+  function mkEl(tag) {
+    const node = {
+      tagName: String(tag || 'div').toUpperCase(), nodeType: 1, childNodes: [],
+      _attrs: {}, className: '', disabled: false,
+      setAttribute: function (key, value) { this._attrs[key] = String(value); if (key === 'class') { this.className = String(value); } },
+      getAttribute: function (key) { return Object.prototype.hasOwnProperty.call(this._attrs, key) ? this._attrs[key] : null; },
+      appendChild: function (child) { this.childNodes.push(child); child.parentNode = this; return child; },
+      querySelector: function (selector) { const out = []; collect(this, selector, out); return out[0] || null; },
+      querySelectorAll: function (selector) { const out = []; collect(this, selector, out); return out; }
+    };
+    node.classList = {
+      add: function (name) { const names = node.className.split(/\s+/).filter(Boolean); if (names.indexOf(name) < 0) { names.push(name); } node.className = names.join(' '); node._attrs.class = node.className; },
+      contains: function (name) { return node.className.split(/\s+/).indexOf(name) >= 0; }
+    };
+    Object.defineProperty(node, 'textContent', {
+      get: function () { return this._text || ''; },
+      set: function (value) { this._text = String(value); this.childNodes.length = 0; }
+    });
+    return node;
+  }
+
+  const savedDoc = global.document;
+  const savedWindow = global.window;
+  global.document = {
+    createElement: mkEl,
+    createTextNode: function (value) { return { nodeType: 3, textContent: String(value), childNodes: [] }; }
+  };
+  global.window = { CRUX_RUNTIME_CAPABILITIES: descriptor, CruxPages: pages };
+  try {
+    const row = mkEl('div');
+    const input = mkEl('input');
+    row.appendChild(input);
+    render.applyCapabilityGate(row, 'documents.living.load', descriptor, map);
+    const reason = row.querySelector('.capability-reason');
+    check(input.disabled === true, '[capabilities] an unavailable mapped control must render disabled');
+    check(row.getAttribute('data-capability') === 'projection_queries',
+      '[capabilities] disabled control must expose data-capability');
+    check(row.getAttribute('data-capability-reason') === 'http_dataplane_disabled',
+      '[capabilities] disabled control must expose the machine-readable reason code');
+    check(!!reason && reason.textContent.indexOf('projection queries are unavailable') >= 0,
+      '[capabilities] disabled control must render the daemon reason inline');
+    check(input.getAttribute('aria-describedby') === (reason && reason.getAttribute('id')),
+      '[capabilities] disabled control must associate its inline reason with aria-describedby');
+
+    const graphRow = mkEl('div');
+    const graphButton = mkEl('button');
+    graphRow.appendChild(graphButton);
+    render.applyCapabilityGate(graphRow, 'documents.dependencies.expand', descriptor, map);
+    check(graphButton.disabled === true && graphRow.getAttribute('data-capability-reason') === 'http_dataplane_disabled',
+      '[capabilities] dataplane-off must disable graph expansion with the daemon reason');
+
+    const degradedDescriptor = JSON.parse(JSON.stringify(descriptor));
+    degradedDescriptor.capabilities.projection_queries = {
+      availability: 'degraded', reason_code: 'projection_degraded', reason: 'Projection reads are degraded.',
+      compiled: true, configured: true, initialized: true, entitled: true, degraded: true
+    };
+    const degradedRow = mkEl('div');
+    const degradedInput = mkEl('input');
+    degradedRow.appendChild(degradedInput);
+    render.applyCapabilityGate(degradedRow, 'documents.living.load', degradedDescriptor, map);
+    check(degradedInput.disabled === true && degradedRow.getAttribute('data-capability-availability') === 'degraded',
+      '[capabilities] a degraded mapped control must remain disabled and retain its availability state');
+    check(/^Degraded — /.test((degradedRow.querySelector('.capability-reason') || {}).textContent || ''),
+      '[capabilities] a degraded mapped control must render a distinct degraded reason');
+
+    const alreadyDisabled = mkEl('div');
+    const button = mkEl('button');
+    button.disabled = true;
+    alreadyDisabled.appendChild(button);
+    render.applyCapabilityGate(alreadyDisabled, 'documents.dependencies.expand', fullDescriptor, map);
+    check(button.disabled === true, '[capabilities] the capability layer must never enable a control disabled by another gate');
+    check(alreadyDisabled.querySelector('.capability-reason') === null,
+      '[capabilities] an available capability must not paint an unavailable reason');
+
+    const settings = mkEl('main');
+    render.renderPage({
+      id: 'cx-settings', title: 'Settings',
+      sections: [{ h: 'Settings', controls: [{ t: 'info', label: 'status', v: 'ready' }] }]
+    }, settings);
+    check(settings.querySelectorAll('.runtime-capability-status').length === descriptorFields.size,
+      '[capabilities] cx-settings must render the all-capability status section');
+  } catch (e) {
+    check(false, '[capabilities] disabled-with-reason DOM render threw: ' + (e && e.stack || e));
+  } finally {
+    if (savedDoc === undefined) { delete global.document; } else { global.document = savedDoc; }
+    if (savedWindow === undefined) { delete global.window; } else { global.window = savedWindow; }
+  }
+
+  const gateBody = funcBody(renderSrc, 'applyCapabilityGate') || '';
+  check(!/CruxApiGated|operatorGatedCall|\bfetch\s*\(/.test(gateBody),
+    '[capabilities] the capability renderer must not dispatch or bypass the gated mutation choke point');
+  const publish = "window.CRUX_RUNTIME_CAPABILITIES = get(BOOT.version, ['product', 'runtime_capabilities']) || null;";
+  const publishAt = shellHtml.indexOf(publish);
+  check(publishAt >= 0 && shellHtml.indexOf('route();', publishAt) > publishAt,
+    '[capabilities] shell boot must publish product.runtime_capabilities in memory before routing');
+  notes.push('runtime capabilities (M2): Settings reports all 6 descriptor capabilities; full/dataplane-off/no-local-embedder profiles gate 2 mapped consumers; map entries match descriptor fields, daemon routes, and generated-client dispatches; unavailable/missing/incomplete status fails closed with data-capability-reason and an aria-associated inline reason; available status never re-enables another gate.');
+})();
+
 // ---- Report -------------------------------------------------------------
-console.log('unified-shell-console v2 — M14 (WebCrux tile canvas) smoke');
+console.log('unified-shell-console v2 — M14 + desktop mission control M2 smoke');
 notes.forEach(function (n) { console.log('  · ' + n); });
 if (failures.length) {
   console.error('\nFAIL (' + failures.length + '):');
