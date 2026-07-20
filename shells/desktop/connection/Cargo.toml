@@ -1,0 +1,23 @@
+# Crux desktop shell — lean connection manager and loopback BFF.
+[package]
+name = "crux-shell-connection"
+version = "0.5.34"
+edition = "2021"
+rust-version = "1.88.0"
+license = "LicenseRef-CCL-1.0"
+publish = false
+description = "Profile, health, and loopback credential-broker primitives for Crux desktop."
+
+[dependencies]
+getrandom = "=0.3.4"
+
+# Keep the desktop support crate detached from the daemon workspace and its
+# WebKit-bearing app crate.
+[workspace]
+
+[lib]
+name = "crux_shell_connection"
+path = "src/lib.rs"
+
+[lints.rust]
+unsafe_code = "forbid"

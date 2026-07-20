@@ -12,7 +12,7 @@ edition = "2021"
 rust-version = "1.88.0"
 license = "LicenseRef-CCL-1.0"
 publish = false
-description = "Crux desktop shell — Tauri v2 webview over a bundled corecruxd sidecar."
+description = "Crux desktop shell — native manager for bundled and attached corecruxd profiles."
 
 [workspace]
 
@@ -21,12 +21,13 @@ name = "crux-desktop-shell"
 path = "src/main.rs"
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "=2.6.3", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
-tauri-plugin-dialog = "2"
+tauri = { version = "=2.11.5", features = ["tray-icon"] }
 crux-shell-lifecycle = { path = "../lifecycle" }
+crux-shell-connection = { path = "../connection" }
+ureq = { version = "=3.3.0", default-features = false, features = ["rustls"] }
 
 [features]
 # Enabled by the bundler (`cargo tauri build`) for production asset embedding.
