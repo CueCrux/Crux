@@ -6890,7 +6890,7 @@ async fn version_runtime_capability_descriptor_full_profile() {
     let descriptor = &body["product"]["runtime_capabilities"];
     let capabilities = &descriptor["capabilities"];
 
-    assert_eq!(descriptor["schema_version"], 2);
+    assert_eq!(descriptor["schema_version"], 1);
     let Some(capability_values) = capabilities.as_object() else {
         panic!("runtime_capabilities.capabilities must be a JSON object");
     };
@@ -7031,7 +7031,7 @@ async fn version_runtime_capability_descriptor_delegating_lite_profile(
     let body = json_body(get_version(State(state)).await.into_response()).await;
     let capabilities = &body["product"]["runtime_capabilities"]["capabilities"];
 
-    assert_eq!(body["product"]["runtime_capabilities"]["schema_version"], 2);
+    assert_eq!(body["product"]["runtime_capabilities"]["schema_version"], 1);
     assert_eq!(body["features"]["embeddings"], true);
     assert_eq!(body["semantic_profile"]["model"], "remote-test");
     assert_eq!(body["semantic_profile"]["dimensions"], 8);
