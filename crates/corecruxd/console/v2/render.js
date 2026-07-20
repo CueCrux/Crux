@@ -145,7 +145,17 @@
   function fetchJSON(url) {
     var api = (typeof window !== 'undefined') ? window.CruxApi : null;
     if (!api || typeof api.get !== 'function') { return Promise.resolve({ ok: false, status: 0, data: null }); }
-    return api.get(url)
+    // Split a query-bearing path into (base, query): CruxApi.get allowlists the
+    // BASE path and re-applies the query via withQuery. Passing the whole
+    // "path?query" string would miss the allowlist → reject → false-empty (the
+    // /v1/work?source=all + cx-facts/cost/review/memory bug). Base paths are all
+    // in the manifest allowlist, so this heals every query-bearing read at once.
+    var qi = url.indexOf('?'), base = url, query = null;
+    if (qi >= 0) {
+      base = url.slice(0, qi); query = {};
+      new URLSearchParams(url.slice(qi + 1)).forEach(function (v, k) { query[k] = v; });
+    }
+    return api.get(base, query)
       .then(function (r) {
         return r.json().then(
           function (data) { return { ok: r.ok, status: r.status, data: data }; },
@@ -2805,6 +2815,163 @@
     return { nodes: nodes, edges: edges };
   }
 
+  // ---- Plan tree (M4a) — Project → ExecPlan → Milestone → live session -----
+  // Pure join over the SAME real endpoint fields buildGraphModel consumes:
+  //   projects (GET /v1/projects → .projects[]: id,name)
+  //   work     (GET /v1/work?source=all → .work|.items[]: ExecPlan + kanban items;
+  //             ExecPlan items carry project_id="execplans", id "execplan:<slug>",
+  //             current_milestone, next_ready_milestone, milestones_done/total)
+  //   sessions (GET /v1/coord/active → .active_sessions[]: session_id_hex,
+  //             passport_id, intent{execplan_slug,milestone,paths,deploy_target},
+  //             leases[]) — 404/disabled tolerated (data.sessions == null)
+  // No fabricated edges: a session hangs off an ExecPlan ONLY when its announced
+  // execplan_slug resolves to a real work item, and off a milestone ONLY when that
+  // milestone id is one the data actually names. A session whose slug resolves to
+  // nothing (or that announced none) lands under an explicit "unattached" root —
+  // never guessed onto a plan. Milestone nodes are built solely from ids the data
+  // names (current_milestone, next_ready_milestone, announced session milestones)
+  // — never synthesised from milestones_total (ids are non-contiguous: M0, M3a,
+  // M4b …, so a 1..total range would invent milestones that do not exist).
+  // /v1/work?source=all merges TWO item kinds: aggregator-derived ExecPlans and
+  // plain kanban work. Only ExecPlan items own a milestone layer + session
+  // attachment; a kanban item rendered as an ExecPlan would fabricate a
+  // session→milestone→ExecPlan shape. The load-bearing discriminator is
+  // `plan_path` (set only by work_execplans::list_execplans; kanban items carry
+  // None) — corroborated by the "execplan:" id prefix + the virtual "execplans"
+  // project. See crates/corecruxd/src/work_execplans.rs:972.
+  function isExecPlanItem(w) {
+    return !!(w && (w.plan_path || String(w.id).indexOf('execplan:') === 0 || w.project_id === 'execplans'));
+  }
+  function buildPlanTree(data) {
+    data = data || {};
+    // null-proto lookup tables: ids like "__proto__"/"constructor" are data, not
+    // prototype keys, so a plain {} would mis-resolve or throw.
+    var projectsMeta = Object.create(null);
+    ((data.projects && data.projects.projects) || []).forEach(function (p) {
+      if (p && p.id != null) { projectsMeta[p.id] = p.name || p.id; }
+    });
+    var work = (data.work && (data.work.work || data.work.items)) || [];
+    var sessions = (data.sessions && data.sessions.active_sessions) || [];
+
+    // Resolve a session's bare intent.execplan_slug to a work item. The ExecPlan
+    // work id is "execplan:<slug>"; kanban ids are opaque. Match exact id or the
+    // "execplan:"-prefixed form — nothing fuzzier (fuzzy match = a fabricated edge).
+    var itemById = Object.create(null);
+    work.forEach(function (w) {
+      if (!w || w.id == null) { return; }
+      itemById[w.id] = w;
+      if (String(w.id).indexOf('execplan:') === 0) { itemById[String(w.id).slice(9)] = w; }
+    });
+    function resolveItem(slug) {
+      if (!slug) { return null; }
+      return itemById[slug] || itemById['execplan:' + slug] || null;
+    }
+    function sessionNode(s, unresolvedSlug) {
+      var i = s.intent || {};
+      var sid = s.session_id_hex || s.passport_id || 'session';
+      return {
+        key: 'session:' + sid, type: 'session', id: sid,
+        label: (s.session_id_hex ? String(s.session_id_hex).slice(0, 8) : (s.passport_id || 'session')),
+        sub: s.passport_id || null, state: null, progress: null,
+        // Announced focus + held leases travel WITH the node (M4a gate).
+        focus: {
+          execplan_slug: i.execplan_slug || null, milestone: i.milestone || null,
+          paths: Array.isArray(i.paths) ? i.paths : [], deploy_target: i.deploy_target || null
+        },
+        leases: Array.isArray(s.leases) ? s.leases : [],
+        // Non-null only for unattached sessions — the slug that resolved to no
+        // work item, painted so the row says which plan failed to resolve.
+        unresolvedSlug: unresolvedSlug || null,
+        children: []
+      };
+    }
+
+    // Bucket announced sessions by the item they resolve to (+ milestone). A
+    // session that resolves to an ExecPlan is attached by milestone; one that
+    // resolves to a kanban item attaches directly to it (no milestone level);
+    // an unresolved session goes to the unattached list — never a fabricated plan.
+    var byItemMilestone = Object.create(null);   // work.id -> { milestoneId|'' : [sessionNode] }
+    var unattached = [];
+    sessions.forEach(function (s) {
+      if (!s) { return; }
+      var i = s.intent || {};
+      var item = resolveItem(i.execplan_slug);
+      if (!item) { unattached.push(sessionNode(s, i.execplan_slug || null)); return; }
+      // Milestone only matters for ExecPlan items; kanban sessions collapse to ''.
+      var m = (isExecPlanItem(item) && i.milestone != null && i.milestone !== '') ? String(i.milestone) : '';
+      var bucket = byItemMilestone[item.id] || (byItemMilestone[item.id] = Object.create(null));
+      (bucket[m] || (bucket[m] = [])).push(sessionNode(s, null));
+    });
+
+    var projectNodes = Object.create(null), roots = [];
+    function projectNode(pid) {
+      if (projectNodes[pid]) { return projectNodes[pid]; }
+      var label = projectsMeta[pid] || (pid === 'execplans' ? 'ExecPlans' : pid);
+      var n = { key: 'project:' + pid, type: 'project', id: pid, label: label, sub: null,
+        state: null, progress: null, focus: null, leases: [], children: [] };
+      projectNodes[pid] = n; roots.push(n); return n;
+    }
+    function attachBucketFlat(target, bucket) {
+      Object.keys(bucket).forEach(function (m) { bucket[m].forEach(function (sn) { target.children.push(sn); }); });
+    }
+
+    work.forEach(function (w) {
+      if (!w || w.id == null) { return; }
+      var proj = projectNode(w.project_id || 'unknown');
+      var bucket = byItemMilestone[w.id] || Object.create(null);
+
+      if (!isExecPlanItem(w)) {
+        // Kanban item: a plain work node, NO milestone synthesis. Sessions that
+        // announced this id hang directly off it (never a fabricated ExecPlan).
+        var workNode = {
+          key: 'work:' + w.id, type: 'work', id: w.id, label: w.title || w.id,
+          sub: (w.state || 'work') + (w.blocker_reason ? (' · blocked: ' + w.blocker_reason) : ''),
+          state: w.state || null, progress: null, focus: null, leases: [], children: []
+        };
+        proj.children.push(workNode);
+        attachBucketFlat(workNode, bucket);
+        return;
+      }
+
+      var slug = String(w.id).indexOf('execplan:') === 0 ? String(w.id).slice(9) : w.id;
+      var planNode = {
+        key: 'work:' + w.id, type: 'execplan', id: w.id, label: w.title || slug,
+        sub: (w.state || 'work') + (w.blocker_reason ? (' · blocked: ' + w.blocker_reason) : ''),
+        state: w.state || null,
+        progress: (w.milestones_total ? { done: w.milestones_done || 0, total: w.milestones_total, label: w.current_milestone || null } : null),
+        focus: null, leases: [], children: []
+      };
+      proj.children.push(planNode);
+
+      // Milestone ids the data names for THIS plan: current + next-ready + any a
+      // live session announced. De-duped; empty ('' = no milestone) excluded.
+      var mids = [], milestoneNodes = Object.create(null);
+      function pushMid(m) { if (m != null && m !== '' && mids.indexOf(String(m)) < 0) { mids.push(String(m)); } }
+      pushMid(w.current_milestone);
+      pushMid(w.next_ready_milestone);
+      Object.keys(bucket).forEach(function (m) { pushMid(m); });
+      mids.forEach(function (mid) {
+        var mn = { key: 'work:' + w.id + '#' + mid, type: 'milestone', id: mid, label: mid,
+          sub: (mid === w.current_milestone ? 'current' : (mid === w.next_ready_milestone ? 'next ready' : null)),
+          state: null, progress: null, focus: null, leases: [], children: [] };
+        milestoneNodes[mid] = mn; planNode.children.push(mn);
+      });
+      // Attach sessions to their milestone node; a session that announced this
+      // plan but no milestone (bucket key '') hangs directly off the plan.
+      Object.keys(bucket).forEach(function (m) {
+        var target = (m !== '' && milestoneNodes[m]) ? milestoneNodes[m] : planNode;
+        bucket[m].forEach(function (sn) { target.children.push(sn); });
+      });
+    });
+
+    if (unattached.length) {
+      roots.push({ key: 'unattached', type: 'unattached', id: 'unattached',
+        label: 'Unattached sessions', sub: 'live sessions with no matching ExecPlan',
+        state: null, progress: null, focus: null, leases: [], children: unattached });
+    }
+    return { roots: roots };
+  }
+
   // Deterministic layered layout — columns by node type. No random seed: node
   // positions are a pure function of type + insertion order (replayable).
   // Card layout — columns by type (sessions lead, matching the concept). Each
@@ -3172,13 +3339,121 @@
 
   // ---- Canvas entry point (shell routes the canvas destination here) -----
   // No sub-pills: Canvas IS the page, with a nav-family Board | Graph switch.
+  // ---- Plan-tree view (M4a) — render buildPlanTree() live ----------------
+  // A session row carries its announced focus (@milestone, deploy target, up to
+  // 4 declared paths) + held leases inline — the M4a "nodes carry announced
+  // focus + leases" gate. Nodes with children use a native <details> for free
+  // expand/collapse (no JS). Fails honest: unreachable/501/empty each render a
+  // stated reason, never a blank pane.
+  // Per-feed degraded notice (M4a fail-honest, reusing the M2 disabled-with-
+  // reason idiom: an accessible node carrying a machine-readable reason). coord
+  // 404/disabled is "off, not error"; a non-zero status is an HTTP failure; 0 is
+  // unreachable. Only failed feeds emit a row.
+  function appendFeedNotices(wrap, feeds) {
+    feeds.forEach(function (f) {
+      var name = f[0], res = f[1], what = f[2];
+      if (res.ok) { return; }
+      var code, msg;
+      if (name === 'coord' && res.status === 404) {
+        code = 'coord_disabled';
+        msg = 'Coordination plane off (set CORECRUXD_COORD=1) — ' + what + ' not shown.';
+      } else if (res.status === 0) {
+        code = 'unreachable';
+        msg = 'The ' + name + ' feed is unreachable — ' + what + ' may be stale or missing.';
+      } else {
+        code = 'http_' + res.status;
+        msg = 'The ' + name + ' feed failed (HTTP ' + res.status + ') — ' + what + ' may be stale or missing.';
+      }
+      wrap.appendChild(el('p', {
+        'class': 'plan-tree-degraded', role: 'status',
+        'data-feed': name, 'data-feed-reason': code, text: msg
+      }));
+    });
+  }
+  function planTreeRowInner(node) {
+    var frag = [el('span', { 'class': 'plan-tree-type plan-tree-type-' + node.type, text: node.type })];
+    frag.push(el('span', { 'class': 'plan-tree-label', text: node.label }));
+    if (node.state) { frag.push(el('span', { 'class': 'plan-tree-state', text: node.state })); }
+    if (node.progress) {
+      frag.push(el('span', { 'class': 'plan-tree-prog', text: node.progress.done + '/' + node.progress.total + (node.progress.label ? (' · ' + node.progress.label) : '') }));
+    }
+    if (node.sub) { frag.push(el('span', { 'class': 'plan-tree-sub', text: node.sub })); }
+    if (node.type === 'session' && node.focus) {
+      // Unattached: show the slug that resolved to no plan (which plan failed).
+      if (node.unresolvedSlug) { frag.push(el('span', { 'class': 'plan-tree-focus plan-tree-unresolved', title: 'announced execplan_slug resolved to no work item', text: 'unresolved: ' + node.unresolvedSlug })); }
+      if (node.focus.milestone) { frag.push(el('span', { 'class': 'plan-tree-focus', text: '@' + node.focus.milestone })); }
+      if (node.focus.deploy_target) { frag.push(el('span', { 'class': 'plan-tree-focus', text: node.focus.deploy_target })); }
+      (node.focus.paths || []).slice(0, 4).forEach(function (p) { frag.push(el('span', { 'class': 'plan-tree-path', text: p })); });
+    }
+    (node.leases || []).slice(0, 4).forEach(function (l) {
+      frag.push(el('span', {
+        'class': 'plan-tree-lease',
+        title: 'lease · ' + (l.mode || 'modify') + (l.reason ? (' · ' + l.reason) : ''),
+        text: 'lease: ' + (l.resource || l.punchcard_id || 'held')
+      }));
+    });
+    return frag;
+  }
+  function planTreeNode(node, depth) {
+    var pad = (depth * 14 + 8) + 'px';
+    var rowCls = 'plan-tree-row plan-tree-' + node.type;
+    if (node.children && node.children.length) {
+      var det = el('details', { 'class': 'plan-tree-node', open: 'open' });
+      det.appendChild(el('summary', { 'class': rowCls, style: 'padding-left:' + pad }, planTreeRowInner(node)));
+      node.children.forEach(function (c) { det.appendChild(planTreeNode(c, depth + 1)); });
+      return det;
+    }
+    return el('div', { 'class': rowCls, style: 'padding-left:' + pad }, planTreeRowInner(node));
+  }
+  function renderPlanTree(host, ctx) {
+    host.textContent = '';
+    var wrap = el('div', { 'class': 'plan-tree' }, [el('p', { 'class': 'ctl-desc', text: 'Building plan tree…' })]);
+    host.appendChild(wrap);
+    var api = (typeof window !== 'undefined') ? window.CruxApi : null;
+    // /v1/work?source=all is a PARAMETERISED read → the named CruxApi.work({source})
+    // method (CruxApi.get's literal allowlist rejects a query string). /v1/coord/
+    // active is a literal read → fetchJSON. Both go through the generated client.
+    return Promise.all([
+      fetchJSON('/v1/projects'),
+      fetchVia(api && typeof api.work === 'function' ? function () { return api.work({ source: 'all' }); } : null),
+      fetchJSON('/v1/coord/active')
+    ]).then(function (r) {
+      var projRes = r[0], workRes = r[1], coordRes = r[2];
+      var tree = buildPlanTree({
+        projects: (projRes.ok && projRes.data) || null,
+        work: (workRes.ok && workRes.data) || null,
+        sessions: (coordRes.ok && coordRes.data) || null
+      });
+      wrap.textContent = '';
+      // Fail honest PER FEED — a degraded notice renders whenever a feed failed,
+      // even alongside a healthy tree. Without it, coord-off looks like "no
+      // sessions" and a work 500 falsely marks every session unattached.
+      appendFeedNotices(wrap, [
+        ['work', workRes, 'ExecPlan + work items'],
+        ['projects', projRes, 'project grouping'],
+        ['coord', coordRes, 'live sessions, announced focus + leases']
+      ]);
+      if (!tree.roots.length) {
+        var why = !workRes.ok
+          ? (workRes.status === 0 ? 'work feed unreachable' : ('work feed unavailable — HTTP ' + workRes.status))
+          : 'no plans or live sessions';
+        wrap.appendChild(el('p', { 'class': 'ctl-desc', text: 'Plan tree empty — ' + why + '.' }));
+        return;
+      }
+      tree.roots.forEach(function (root) { wrap.appendChild(planTreeNode(root, 0)); });
+    }).catch(function () {
+      wrap.textContent = '';
+      wrap.appendChild(el('p', { 'class': 'ctl-desc', text: 'Plan tree unavailable.' }));
+    });
+  }
+
   function renderCanvas(host, ctx) {
     ctx = ctx || {};
-    var view = ctx.view === 'graph' ? 'graph' : 'board';
+    var view = ctx.view === 'graph' ? 'graph' : (ctx.view === 'tree' ? 'tree' : 'board');
     host.textContent = '';
     var region = el('div', { 'class': 'canvas-region' });
     var seg = el('div', { 'class': 'modeseg canvas-seg', role: 'group', 'aria-label': 'Canvas view' });
-    [['board', 'Board'], ['graph', 'Graph']].forEach(function (v) {
+    [['board', 'Board'], ['graph', 'Graph'], ['tree', 'Tree']].forEach(function (v) {
       var b = el('button', { 'class': 'modeseg-btn', type: 'button', 'data-view': v[0], 'aria-pressed': v[0] === view ? 'true' : 'false' }, [v[1]]);
       (function (vid) { b.addEventListener('click', function () { location.hash = '#/canvas/' + vid; }); })(v[0]);
       seg.appendChild(b);
@@ -3188,6 +3463,7 @@
     region.appendChild(body);
     host.appendChild(region);
     if (view === 'graph') { return renderCanvasGraph(body, ctx, ctx.focus); }
+    if (view === 'tree') { return renderPlanTree(body, ctx); }
     renderCanvasBoard(body, ctx);
     return Promise.resolve();
   }
@@ -4842,6 +5118,11 @@
     tileExpandedDims: tileExpandedDims,
     renderTileCanvas: renderTileCanvas,
     buildGraphModel: buildGraphModel,
+    // M4a — plan-rooted tree join (pure; unit-tested by the smoke) + its view
+    // (planTreeNode exposed so the smoke can paint the model into a mock DOM).
+    buildPlanTree: buildPlanTree,
+    planTreeNode: planTreeNode,
+    renderPlanTree: renderPlanTree,
     renderCanvas: renderCanvas,
     renderPage: renderPage,
     renderSections: renderSections,

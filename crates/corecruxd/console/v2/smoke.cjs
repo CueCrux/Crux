@@ -72,6 +72,9 @@ const renderSrc = fs.readFileSync(path.join(DIR, 'render.js'), 'utf8');
 
 const failures = [];
 const notes = [];
+// Promises for checks that must drive an async renderer (M4a renderPlanTree);
+// the report awaits these so their assertions land before the exit code.
+const asyncChecks = [];
 function check(ok, msg) { if (!ok) { failures.push(msg); } }
 
 // Extract a brace-matched `function <name>(...) { ... }` span from `src`.
@@ -2139,13 +2142,269 @@ function extractThemeVars(theme) {
   notes.push('runtime capabilities (M2): Settings reports all 6 descriptor capabilities; full/dataplane-off/no-local-embedder profiles gate 2 mapped consumers; map entries match descriptor fields, daemon routes, and generated-client dispatches; unavailable/missing/incomplete status fails closed with data-capability-reason and an aria-associated inline reason; available status never re-enables another gate.');
 })();
 
-// ---- Report -------------------------------------------------------------
-console.log('unified-shell-console v2 — M14 + desktop mission control M2 smoke');
-notes.forEach(function (n) { console.log('  · ' + n); });
-if (failures.length) {
-  console.error('\nFAIL (' + failures.length + '):');
-  failures.forEach(function (f) { console.error('  ✗ ' + f); });
-  process.exit(1);
-}
-console.log('\nPASS — all gates green (26/26 ids incl. pill:false landing-render + 4 Pro-ported legacy pages, control coverage, theme contrast, posture gate, no external deps, through-client fetches, gated-mutations audit, posture derivation, engine mediation, PWA manifest, service worker, phone tier, demo-mode gating, unified buttons, collapsible rail, status pill + chips, charts, board strips, nav-family consolidation + rail-at-rest-borderless, projects disclosure + repo grid, topbar chip height, legacy LED toggle + squarer topbar chips + list-row language, M8 mode system + posture-independence, M8 legacy port-checklist integrity, M9 canvas board (canvasTier + widget registry), M9 canvas graph (real-edge-only model + focus parser + launch points), M10 documents mode (3-mode reader + ~72ch measure + evidence panel + real sources + demo Proof fixture + deep-link-out auto-switch), M10→M12 legacy retirement + removal (retired_at marker + removal copy, no live /console/legacy link, console.rs serve_console_legacy handler gone → route 404s), M12 11-surface JSX port (DOC_SURFACES + JSX_PORT + rail nav + #/documents/<id> routes + real-vs-demo honesty), M13a safe control parity + native workbench port (CONTROL_DIFF covers all 26 CX pages; cx-workbench loads /v1/workbench/contract + 5 GET read tools via a GET-only self-loader), M13b live mutation wiring (19 write controls live behind the guard harness — operatorGatedCall→CruxApiGated + bound-passport Art.14 refusal + confirm dialog on the destructive/spend subset + real receipt; 22 curated GATED_MUTATIONS; 8 controls stay operator-gated + disabled for documented ungroundable/invariant reasons; customer posture hides AND refuses every write), M14 WebCrux tile canvas (pure 20px-grid engine + onion-layer auto-layout + measured interaction grammar CSS + board-as-tiles + documents corpus canvas + <640px form stack)).');
-process.exit(0);
+// =========================================================================
+//  Check 42 — (desktop mission control M4a) plan-rooted tree join. The pure
+//  buildPlanTree() joins Project → ExecPlan → Milestone → live session from the
+//  real /v1/work?source=all + /v1/coord/active fields. The join must NOT
+//  fabricate edges: a session whose announced execplan_slug resolves to no work
+//  item lands under an explicit "unattached" root — never guessed onto a plan —
+//  and milestone nodes come only from ids the data names (current/next-ready/
+//  announced), never synthesised from milestones_total. Session nodes carry their
+//  announced focus + held leases. The view is wired into Canvas as a Tree switch,
+//  reachable via #/canvas/tree, and reads only through the generated client.
+// =========================================================================
+(function checkPlanTree() {
+  check(typeof render.buildPlanTree === 'function', '[plan-tree] render.js must export buildPlanTree()');
+  check(typeof render.renderPlanTree === 'function', '[plan-tree] render.js must export renderPlanTree()');
+  if (typeof render.buildPlanTree !== 'function') { return; }
+
+  // Empty input fabricates nothing.
+  const empty = render.buildPlanTree({});
+  check(empty && Array.isArray(empty.roots) && empty.roots.length === 0,
+    '[plan-tree] empty input must yield zero roots (no fabricated nodes)');
+
+  const fixture = {
+    projects: { projects: [
+      { id: 'execplans', name: 'ExecPlans' },
+      { id: 'proj-real', name: 'Real Project' }
+    ] },
+    work: { work: [
+      { id: 'execplan:alpha', project_id: 'execplans', title: 'Alpha plan', state: 'in_progress',
+        current_milestone: 'M2', next_ready_milestone: 'M3', milestones_done: 1, milestones_total: 5 },
+      { id: 'kanban-1', project_id: 'proj-real', title: 'Kanban task', state: 'planned' }
+    ] },
+    sessions: { active_sessions: [
+      // resolves to alpha + announces M2 → under the M2 milestone node; carries focus + a lease.
+      { session_id_hex: 'aaaa1111beef', passport_id: 'pp_a',
+        intent: { execplan_slug: 'alpha', milestone: 'M2', paths: ['crates/x'], deploy_target: 'deploy:crux' },
+        leases: [{ resource: 'tree://crates/x', punchcard_id: 'pc1', mode: 'modify', holder_passport: 'pp_a', expires_at_unix_ms: 9e15 }] },
+      // announces a slug that resolves to NO work item → must land under "unattached", not on a plan.
+      { session_id_hex: 'bbbb2222cafe', passport_id: 'pp_b',
+        intent: { execplan_slug: 'ghost-plan', milestone: 'M9' } },
+      // resolves to alpha but announces NO milestone → directly under the plan, not a milestone node.
+      { session_id_hex: 'cccc3333face', passport_id: 'pp_c',
+        intent: { execplan_slug: 'alpha' } },
+      // resolves to a KANBAN item (even with a milestone string) → must hang
+      // DIRECTLY off the kanban work node, never grow a milestone/ExecPlan shape.
+      { session_id_hex: 'dddd4444feed', passport_id: 'pp_d',
+        intent: { execplan_slug: 'kanban-1', milestone: 'M7' } }
+    ] }
+  };
+  const tree = render.buildPlanTree(fixture);
+  const roots = (tree && tree.roots) || [];
+  function byId(nodes, type, id) { return (nodes || []).find(function (n) { return n.type === type && n.id === id; }) || null; }
+  function walk(node, visit) { visit(node); (node.children || []).forEach(function (c) { walk(c, visit); }); }
+
+  const execRoot = byId(roots, 'project', 'execplans');
+  const realRoot = byId(roots, 'project', 'proj-real');
+  const unattachedRoot = byId(roots, 'unattached', 'unattached');
+  check(!!execRoot, '[plan-tree] the "execplans" virtual project must be a root');
+  check(!!realRoot, '[plan-tree] a real kanban project must be a root');
+  check(!!unattachedRoot, '[plan-tree] an explicit "unattached" root must exist when a session resolves to no plan');
+
+  const alpha = execRoot && byId(execRoot.children, 'execplan', 'execplan:alpha');
+  check(!!alpha, '[plan-tree] execplan:alpha must nest under its "execplans" project');
+  const alphaMilestones = alpha ? (alpha.children || []).filter(function (n) { return n.type === 'milestone'; }).map(function (n) { return n.id; }).sort() : [];
+  // Only current (M2) + next-ready (M3) — NOT M1/M4/M5 synthesised from total=5,
+  // and NOT M9 (announced only by the unattached ghost session).
+  check(JSON.stringify(alphaMilestones) === JSON.stringify(['M2', 'M3']),
+    '[plan-tree] milestone nodes must be exactly the ids the data names (current+next-ready), got ' + JSON.stringify(alphaMilestones));
+
+  const m2 = alpha && byId(alpha.children, 'milestone', 'M2');
+  const sessAAtM2 = m2 && byId(m2.children, 'session', 'aaaa1111beef');
+  check(!!sessAAtM2, '[plan-tree] a session announcing (alpha, M2) must attach under the M2 milestone node');
+  // Announced focus + leases travel WITH the node (M4a gate).
+  check(sessAAtM2 && sessAAtM2.focus && sessAAtM2.focus.milestone === 'M2' &&
+    JSON.stringify(sessAAtM2.focus.paths) === JSON.stringify(['crates/x']) && sessAAtM2.focus.deploy_target === 'deploy:crux',
+    '[plan-tree] session node must carry its announced focus (milestone, paths, deploy target)');
+  check(sessAAtM2 && Array.isArray(sessAAtM2.leases) && sessAAtM2.leases.length === 1 && sessAAtM2.leases[0].resource === 'tree://crates/x',
+    '[plan-tree] session node must carry its held leases');
+
+  // A session that announced the plan but no milestone hangs directly off the plan.
+  const sessCdirect = alpha && byId(alpha.children, 'session', 'cccc3333face');
+  check(!!sessCdirect, '[plan-tree] a session announcing a plan but no milestone must hang directly off the ExecPlan node');
+
+  // ---- Kanban vs ExecPlan (blocker #1): a kanban item is a plain "work" node
+  // with NO milestone synthesis; a session announcing its id (even with a
+  // milestone string) hangs directly off it — never a fabricated ExecPlan shape.
+  const kanban = realRoot && byId(realRoot.children, 'work', 'kanban-1');
+  check(!!kanban, '[plan-tree] a kanban item must render as a plain "work" node under its real project');
+  check(!execRoot || !byId(execRoot.children, 'execplan', 'kanban-1'),
+    '[plan-tree] a kanban item must NOT be rendered as an ExecPlan node');
+  check(kanban && !(kanban.children || []).some(function (n) { return n.type === 'milestone'; }),
+    '[plan-tree] a kanban item must NOT grow a milestone layer');
+  const kSess = kanban && byId(kanban.children, 'session', 'dddd4444feed');
+  check(!!kSess, '[plan-tree] a session announcing a kanban id must hang directly off the kanban work node (no milestone level)');
+  let kanbanSessCount = 0;
+  roots.forEach(function (root) { walk(root, function (n) { if (n.type === 'session' && n.id === 'dddd4444feed') { kanbanSessCount++; } }); });
+  check(kanbanSessCount === 1, '[plan-tree] a kanban session must appear exactly once (not duplicated onto a fabricated ExecPlan/milestone)');
+
+  // ---- No fabricated edges: the ghost session appears ONLY under "unattached".
+  const ghostUnderProjects = [];
+  const allMilestoneIds = {};
+  roots.forEach(function (root) {
+    if (root.type === 'unattached') { return; }
+    walk(root, function (n) {
+      if (n.type === 'session' && n.id === 'bbbb2222cafe') { ghostUnderProjects.push(n.id); }
+      if (n.type === 'milestone') { allMilestoneIds[n.id] = true; }
+    });
+  });
+  check(ghostUnderProjects.length === 0,
+    '[plan-tree] a session resolving to no work item must NOT appear under any project subtree (no fabricated edge)');
+  const ghostInUnattached = unattachedRoot && byId(unattachedRoot.children, 'session', 'bbbb2222cafe');
+  check(!!ghostInUnattached, '[plan-tree] the unresolved session must be present under the "unattached" root');
+  check(!allMilestoneIds['M9'],
+    '[plan-tree] no milestone node may be fabricated from an unresolved session\'s announced milestone (M9)');
+  check(!allMilestoneIds['M7'],
+    '[plan-tree] no milestone node may be fabricated from a kanban session\'s announced milestone (M7)');
+
+  // ---- Through-client + wiring: the Tree view reads via the generated client
+  // (the parameterised work?source=all through the named CruxApi.work({source})
+  // method — the query-string fetchJSON path rejects), and Canvas exposes it.
+  const renderPlanTreeBody = funcBody(renderSrc, 'renderPlanTree') || '';
+  check(/api\.work\(\s*\{\s*source:\s*'all'\s*\}\s*\)/.test(renderPlanTreeBody),
+    '[plan-tree] renderPlanTree must read /v1/work?source=all through the named CruxApi.work({source:"all"}) method');
+  check(/fetchJSON\('\/v1\/coord\/active'\)/.test(renderPlanTreeBody),
+    '[plan-tree] renderPlanTree must read /v1/coord/active for announced focus + leases');
+  check(!/\bfetch\s*\(/.test(renderPlanTreeBody),
+    '[plan-tree] renderPlanTree must not raw-fetch — api.js is the sole network layer');
+  check(/\['tree', 'Tree'\]/.test(renderSrc) && /renderPlanTree\(body, ctx\)/.test(renderSrc),
+    '[plan-tree] Canvas must carry a Tree view switch dispatching to renderPlanTree');
+  check(/parts\[1\] === 'tree'/.test(shellHtml),
+    '[plan-tree] shell.html parseCanvasHash must route #/canvas/tree to the Tree view');
+
+  // ---- The model paints + the live renderer fails honest. A tiny mock DOM lets
+  // the smoke both (a) paint the model directly and (b) drive renderPlanTree end
+  // to end with a mocked generated client where one feed FAILS.
+  function mkNode(tag) {
+    const node = {
+      tagName: String(tag || 'div').toUpperCase(), nodeType: 1, childNodes: [], _attrs: {}, className: '',
+      setAttribute: function (k, v) { this._attrs[k] = String(v); if (k === 'class') { this.className = String(v); } },
+      getAttribute: function (k) { return Object.prototype.hasOwnProperty.call(this._attrs, k) ? this._attrs[k] : null; },
+      appendChild: function (c) { this.childNodes.push(c); c.parentNode = this; return c; },
+      addEventListener: function () {}
+    };
+    Object.defineProperty(node, 'textContent', {
+      get: function () { let t = this._text || ''; (this.childNodes || []).forEach(function (c) { t += (c.textContent || ''); }); return t; },
+      set: function (v) { this._text = String(v); this.childNodes.length = 0; }
+    });
+    return node;
+  }
+  const mockDoc = { createElement: mkNode, createTextNode: function (v) { return { nodeType: 3, textContent: String(v), childNodes: [] }; } };
+  function collectNodes(node, out) {
+    (node.childNodes || []).forEach(function (c) { if (c && c.nodeType === 1) { out.push(c); collectNodes(c, out); } });
+    return out;
+  }
+  function classesOf(node) { return collectNodes(node, [node]).map(function (n) { return n.className || ''; }); }
+
+  if (typeof render.planTreeNode === 'function') {
+    const savedDoc = global.document;
+    global.document = mockDoc;
+    try {
+      const classes = classesOf(render.planTreeNode(execRoot, 0));
+      check(classes.some(function (c) { return /\bplan-tree-focus\b/.test(c); }), '[plan-tree] rendered DOM must paint the announced-focus chip');
+      check(classes.some(function (c) { return /\bplan-tree-lease\b/.test(c); }), '[plan-tree] rendered DOM must paint the held-lease chip');
+      check(classesOf(render.planTreeNode(unattachedRoot, 0)).some(function (c) { return /\bplan-tree-unattached\b/.test(c); }),
+        '[plan-tree] rendered DOM must paint the explicit unattached node');
+      // #5 — an unattached session paints the slug that failed to resolve.
+      check(classesOf(render.planTreeNode(unattachedRoot, 0)).some(function (c) { return /\bplan-tree-unresolved\b/.test(c); }),
+        '[plan-tree] an unattached session must paint its unresolved execplan_slug');
+    } catch (e) {
+      check(false, '[plan-tree] planTreeNode DOM render threw: ' + (e && e.stack || e));
+    } finally {
+      if (savedDoc === undefined) { delete global.document; } else { global.document = savedDoc; }
+    }
+  }
+
+  // ---- (fix #4b) Drive renderPlanTree end to end through a mocked generated
+  // client where COORD fails (503) while work + projects are healthy. The tree
+  // must still paint AND a per-feed degraded notice for coord must appear — the
+  // fail-honest hole the review caught (coord-off must not look like "no sessions").
+  if (typeof render.renderPlanTree === 'function') {
+    function fakeRes(ok, status, data) { return Promise.resolve({ ok: ok, status: status, json: function () { return Promise.resolve(data); } }); }
+    const mockApi = {
+      get: function (path) {
+        if (path === '/v1/projects') { return fakeRes(true, 200, fixture.projects); }
+        if (path === '/v1/coord/active') { return fakeRes(false, 503, null); }   // FAILED feed
+        return fakeRes(false, 404, null);
+      },
+      work: function () { return fakeRes(true, 200, fixture.work); }
+    };
+    const savedDoc = global.document, savedWin = global.window;
+    global.document = mockDoc;
+    global.window = { CruxApi: mockApi };
+    const host = mkNode('div');
+    asyncChecks.push(Promise.resolve(render.renderPlanTree(host, {})).then(function () {
+      const all = collectNodes(host, []);
+      const degraded = all.filter(function (n) { return /\bplan-tree-degraded\b/.test(n.className || ''); });
+      check(all.some(function (n) { return /\bplan-tree-row\b/.test(n.className || ''); }),
+        '[plan-tree] renderPlanTree must still paint the healthy tree when only one feed failed');
+      check(degraded.some(function (n) { return n.getAttribute('data-feed') === 'coord'; }),
+        '[plan-tree] renderPlanTree must render a per-feed degraded notice for the failed coord feed (fail honest, not silent "no sessions")');
+    }).catch(function (e) {
+      check(false, '[plan-tree] renderPlanTree drive threw: ' + (e && e.stack || e));
+    }).then(function () {
+      if (savedDoc === undefined) { delete global.document; } else { global.document = savedDoc; }
+      if (savedWin === undefined) { delete global.window; } else { global.window = savedWin; }
+    }));
+  }
+
+  notes.push('plan tree (M4a): buildPlanTree joins Project→ExecPlan→Milestone→live session from /v1/work?source=all + /v1/coord/active; kanban items render as plain work nodes (no milestone synthesis) and a kanban-announcing session hangs directly off them; unresolved sessions land under an explicit unattached root painting the failed slug (no fabricated edges); milestone nodes only from named ids (current/next-ready/announced), never from milestones_total; session nodes carry announced focus + held leases (model + mock-DOM paint); renderPlanTree fails honest per feed (coord-503 notice alongside a healthy tree); null-proto lookups; wired as Canvas #/canvas/tree through the generated client.');
+})();
+
+// =========================================================================
+//  Check 43 — (ISOLATED root-cause fix, NOT M4a) fetchJSON heals query-bearing
+//  reads at the single choke point: it splits "path?query" into (base, query) and
+//  calls CruxApi.get(base, query), whose allowlist matches the BASE path and
+//  re-applies the query. Before this, the whole query string was passed as the
+//  path → allowlist miss → reject → status 0 → the surface false-empties to demo.
+//  Functionally drives the REAL fetchJSON against the REAL generated client.
+// =========================================================================
+(function checkQueryStringSplit() {
+  const body = funcBody(renderSrc, 'fetchJSON') || '';
+  check(/URLSearchParams/.test(body) && /api\.get\(base, query\)/.test(body),
+    '[query-split] fetchJSON must split path?query and call CruxApi.get(base, query)');
+  check(typeof render.fetchJSON === 'function', '[query-split] render.js must export fetchJSON');
+
+  if (typeof render.fetchJSON === 'function') {
+    // Drive fetchJSON against the REAL client (require api.js onto a fresh window)
+    // with a stubbed fetch. fetchJSON reads window.CruxApi + global.fetch
+    // SYNCHRONOUSLY, so fire every probe then restore globals immediately — the
+    // promises resolve off already-captured refs (no async global juggling).
+    const savedWin = global.window, savedFetch = global.fetch;
+    const fetched = [];
+    global.window = {};
+    require('./api.js');   // populates global.window.CruxApi with the real client
+    global.fetch = function (u) { fetched.push(String(u)); return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve({ work: [] }); } }); };
+    // The five query-bearing surfaces the fix heals (work + the four cx-* loaders).
+    const urls = [
+      '/v1/work?source=all',
+      '/v1/console/facts?top_k=100',
+      '/v1/console/facts?top_k=50',
+      '/v1/console/review/queue?limit=50',
+      '/v1/cost/report?tenant_id=default&token_budget=4000'
+    ];
+    const probes = urls.map(function (u) { return render.fetchJSON(u); });
+    global.window = savedWin; global.fetch = savedFetch;
+    asyncChecks.push(Promise.all(probes).then(function (rs) {
+      check(rs.every(function (r) { return r.ok === true && r.status === 200; }),
+        '[query-split] every query-bearing read must resolve through the client (not false-empty status 0)');
+      check(urls.every(function (u) { return fetched.indexOf(u) >= 0; }),
+        '[query-split] the split must rebuild each exact query URL and reach the client');
+    }));
+  }
+  notes.push('query-string fix (isolated from M4a): fetchJSON splits path?query → CruxApi.get(base, query) at the single choke point, healing every query-bearing read (work?source=all + cx-facts/cost/review/memory) — verified by driving the real fetchJSON against the real generated client; the per-endpoint fetchWorkAll/fetchPageFeed wrappers are removed as redundant.');
+})();
+
+// ---- Report (awaits async renderer-driven checks) -----------------------
+Promise.all(asyncChecks).then(function () {
+  console.log('unified-shell-console v2 — M14 + desktop mission control M2 smoke');
+  notes.forEach(function (n) { console.log('  · ' + n); });
+  if (failures.length) {
+    console.error('\nFAIL (' + failures.length + '):');
+    failures.forEach(function (f) { console.error('  ✗ ' + f); });
+    process.exit(1);
+  }
+  console.log('\nPASS — all gates green (incl. M4a plan-rooted tree join: kanban/ExecPlan discrimination, no-fabricated-edges, named-ids-only milestones, focus+leases on nodes, fail-honest-per-feed).');
+  process.exit(0);
+});
