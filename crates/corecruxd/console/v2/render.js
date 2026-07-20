@@ -2845,7 +2845,7 @@
   function buildPlanTree(data) {
     data = data || {};
     // null-proto lookup tables: ids like "__proto__"/"constructor" are data, not
-    // prototype keys, so a plain {} would mis-resolve or throw.
+    // prototype keys, so a plain {} would resolve wrongly or throw.
     var projectsMeta = Object.create(null);
     ((data.projects && data.projects.projects) || []).forEach(function (p) {
       if (p && p.id != null) { projectsMeta[p.id] = p.name || p.id; }
