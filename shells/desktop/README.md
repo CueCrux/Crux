@@ -71,7 +71,7 @@ names exactly one active profile:
       "mode": "bundled",
       "url": "",
       "token-ref": null,
-      "local-plan-root": "/home/operator/PlanCrux/.agent/execplans"
+      "local-plan-root": "/home/operator/workspace/.agent/execplans"
     },
     {
       "name": "operations",
