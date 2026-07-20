@@ -64,6 +64,12 @@ pub enum WorkError {
     ProjectNotFound(String),
     #[error("gated action '{0}' not found")]
     GateNotFound(String),
+    #[error("gated action '{0}' is already resolved")]
+    GateAlreadyResolved(String),
+    #[error("gated action '{0}' tenant no longer matches its work item")]
+    GateTenantChanged(String),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }
@@ -232,6 +238,10 @@ pub struct WorkTransition {
     /// Additive + skip-if-`None` so pre-existing transition records load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocker_kind: Option<BlockerKind>,
+    /// CROWN receipt that proves an approved or rejected gated transition.
+    /// Legacy and ungated transitions omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -239,6 +249,10 @@ pub struct PendingGateAction {
     pub action_id: String,
     pub work_id: String,
     pub requested_by_passport: String,
+    /// Tenant at request time. Legacy gates omit this and authorize against
+    /// the current work tenant; new gates fail closed if that tenant drifts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
     /// Currently `update_state` is the only gated action; other patches go
     /// through directly. Carry the requested target state when applicable.
     pub requested_action: String,
@@ -250,6 +264,20 @@ pub struct PendingGateAction {
     pub resolved_at_unix_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_by_passport: Option<String>,
+    /// CROWN approval-decision receipt for the resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_id: Option<String>,
+}
+
+/// Immutable authorization material for a gate. HTTP authorization
+/// reads this while holding the same write guard later passed to
+/// [`resolve_gate`], preventing a tenant-check/resolution TOCTOU.
+#[derive(Debug, Clone)]
+pub struct GateResolutionTarget {
+    pub gate: PendingGateAction,
+    pub work: WorkItem,
+    pub tenant_id: String,
+    pub tenant_mismatch: bool,
 }
 
 pub fn validate_state(state: &str) -> Result<(), WorkError> {
@@ -322,6 +350,7 @@ pub fn create_work(store: &mut FactStore, input: CreateWorkInput, now_unix_ms: u
             gate_status: "allowed".to_string(),
             at_unix_ms: now_unix_ms,
             blocker_kind: None,
+            receipt_id: None,
         },
     )?;
     Ok(item)
@@ -393,10 +422,10 @@ pub struct UpdateWorkContext {
 
 #[derive(Debug)]
 pub enum UpdateOutcome {
-    // Boxed: WorkItem is much larger than PendingGateAction (clippy
-    // large_enum_variant); this enum is a transient return value.
+    // Both payloads are boxed to keep this transient result compact as their
+    // additive audit fields grow.
     Applied(Box<WorkItem>),
-    Queued(PendingGateAction),
+    Queued(Box<PendingGateAction>),
 }
 
 pub fn update_work(
@@ -429,19 +458,21 @@ pub fn update_work(
                 action_id: format!("ga_{}", Uuid::new_v4().simple()),
                 work_id: item.id.clone(),
                 requested_by_passport: ctx.by_passport.clone(),
+                tenant_id: Some(item.tenant_id.clone().unwrap_or_else(|| "default".to_string())),
                 requested_action: "update_state".to_string(),
                 target_state: Some(new_state.clone()),
                 status: "pending".to_string(),
                 requested_at_unix_ms: ctx.now_unix_ms,
                 resolved_at_unix_ms: None,
                 resolved_by_passport: None,
+                receipt_id: None,
             };
             write_gate(store, &pending)?;
             // Apply non-state fields, leave state untouched.
             apply_non_state_fields(&mut item, &input);
             item.updated_at_unix_ms = ctx.now_unix_ms;
             write_record(store, &item)?;
-            return Ok(UpdateOutcome::Queued(pending));
+            return Ok(UpdateOutcome::Queued(Box::new(pending)));
         }
     }
 
@@ -475,6 +506,7 @@ pub fn update_work(
                     gate_status: "allowed".to_string(),
                     at_unix_ms: ctx.now_unix_ms,
                     blocker_kind: item.blocker_kind,
+                    receipt_id: None,
                 },
             )?;
         }
@@ -628,14 +660,19 @@ pub fn resolve_gate(
     store: &mut FactStore,
     action_id: &str,
     approver_passport: &str,
+    receipt_id: &str,
     approve: bool,
     now_unix_ms: u64,
 ) -> Result<WorkItem, WorkError> {
-    let mut pending = get_gate(store, action_id).ok_or_else(|| WorkError::GateNotFound(action_id.to_string()))?;
-    if pending.status != "pending" {
-        return Err(WorkError::GateNotFound(action_id.to_string()));
+    let target = gate_resolution_target(store, action_id)?;
+    if target.tenant_mismatch {
+        return Err(WorkError::GateTenantChanged(action_id.to_string()));
     }
-    let item = get_work(store, &pending.work_id).ok_or_else(|| WorkError::NotFound(pending.work_id.clone()))?;
+    if target.gate.status != "pending" {
+        return Err(WorkError::GateAlreadyResolved(action_id.to_string()));
+    }
+    let mut pending = target.gate;
+    let item = target.work;
 
     pending.status = if approve {
         "approved".to_string()
@@ -644,9 +681,23 @@ pub fn resolve_gate(
     };
     pending.resolved_at_unix_ms = Some(now_unix_ms);
     pending.resolved_by_passport = Some(approver_passport.to_string());
-    write_gate(store, &pending)?;
+    pending.receipt_id = Some(receipt_id.to_string());
+    let gate_fact = gate_store_fact(&pending, Some(approver_passport), Some(receipt_id))?;
 
     if !approve {
+        let rejected = WorkTransition {
+            id: format!("tx_{}", Uuid::new_v4().simple()),
+            work_id: item.id.clone(),
+            from_state: item.state.clone(),
+            to_state: item.state.clone(),
+            by_passport: approver_passport.to_string(),
+            gate_status: "rejected".to_string(),
+            at_unix_ms: now_unix_ms,
+            blocker_kind: item.blocker_kind,
+            receipt_id: Some(receipt_id.to_string()),
+        };
+        let transition_fact = transition_store_fact(&rejected, Some(approver_passport), Some(receipt_id))?;
+        store.try_store_bulk(vec![gate_fact, transition_fact])?;
         return Ok(item);
     }
 
@@ -666,24 +717,39 @@ pub fn resolve_gate(
                 updated.blocker_kind = None;
             }
             updated.updated_at_unix_ms = now_unix_ms;
-            write_record(store, &updated)?;
-            write_transition(
-                store,
-                &WorkTransition {
-                    id: format!("tx_{}", Uuid::new_v4().simple()),
-                    work_id: updated.id.clone(),
-                    from_state,
-                    to_state: target.clone(),
-                    by_passport: approver_passport.to_string(),
-                    gate_status: "approved".to_string(),
-                    at_unix_ms: now_unix_ms,
-                    blocker_kind: updated.blocker_kind,
-                },
-            )?;
+            let transition = WorkTransition {
+                id: format!("tx_{}", Uuid::new_v4().simple()),
+                work_id: updated.id.clone(),
+                from_state,
+                to_state: target.clone(),
+                by_passport: approver_passport.to_string(),
+                gate_status: "approved".to_string(),
+                at_unix_ms: now_unix_ms,
+                blocker_kind: updated.blocker_kind,
+                receipt_id: Some(receipt_id.to_string()),
+            };
+            let work_fact = record_store_fact(&updated, Some(approver_passport), Some(receipt_id))?;
+            let transition_fact = transition_store_fact(&transition, Some(approver_passport), Some(receipt_id))?;
+            store.try_store_bulk(vec![gate_fact, work_fact, transition_fact])?;
             return Ok(updated);
         }
     }
+    store.try_store_bulk(vec![gate_fact])?;
     Ok(item)
+}
+
+pub fn gate_resolution_target(store: &FactStore, action_id: &str) -> Result<GateResolutionTarget, WorkError> {
+    let gate = get_gate(store, action_id).ok_or_else(|| WorkError::GateNotFound(action_id.to_string()))?;
+    let work = get_work(store, &gate.work_id).ok_or_else(|| WorkError::NotFound(gate.work_id.clone()))?;
+    let work_tenant_id = work.tenant_id.clone().unwrap_or_else(|| "default".to_string());
+    let tenant_id = gate.tenant_id.clone().unwrap_or_else(|| work_tenant_id.clone());
+    let tenant_mismatch = gate.tenant_id.is_some() && tenant_id != work_tenant_id;
+    Ok(GateResolutionTarget {
+        gate,
+        work,
+        tenant_id,
+        tenant_mismatch,
+    })
 }
 
 fn get_gate(store: &FactStore, action_id: &str) -> Option<PendingGateAction> {
@@ -716,26 +782,59 @@ pub fn write_work_record(store: &mut FactStore, item: &WorkItem) -> Result<(), W
 }
 
 fn write_record(store: &mut FactStore, item: &WorkItem) -> Result<(), WorkError> {
-    let value = serde_json::to_string(item)?;
-    let mut sf = StoreFact {
-        tenant_hash: "default".to_string(),
-        entity: format!("{WORK_ENTITY_PREFIX}::{}::{}", item.project_id, item.id),
-        key: RECORD_KEY.to_string(),
-        value,
-        source_receipt: None,
-        confidence: 1.0,
-        private: false,
-        horizon_class: None,
-        actor: None,
-    };
-    crate::fact_privacy::enforce_global(&mut sf);
+    write_record_with_attribution(store, item, None, None)
+}
+
+fn write_record_with_attribution(
+    store: &mut FactStore,
+    item: &WorkItem,
+    actor: Option<&str>,
+    receipt_id: Option<&str>,
+) -> Result<(), WorkError> {
+    let sf = record_store_fact(item, actor, receipt_id)?;
     store.store(sf);
     Ok(())
 }
 
+fn record_store_fact(item: &WorkItem, actor: Option<&str>, receipt_id: Option<&str>) -> Result<StoreFact, WorkError> {
+    let value = serde_json::to_string(item)?;
+    let mut fact = StoreFact {
+        tenant_hash: "default".to_string(),
+        entity: format!("{WORK_ENTITY_PREFIX}::{}::{}", item.project_id, item.id),
+        key: RECORD_KEY.to_string(),
+        value,
+        source_receipt: receipt_id.map(str::to_string),
+        confidence: 1.0,
+        private: false,
+        horizon_class: None,
+        actor: actor.map(str::to_string),
+    };
+    crate::fact_privacy::enforce_global(&mut fact);
+    Ok(fact)
+}
+
 fn write_transition(store: &mut FactStore, tx: &WorkTransition) -> Result<(), WorkError> {
+    write_transition_with_attribution(store, tx, None, None)
+}
+
+fn write_transition_with_attribution(
+    store: &mut FactStore,
+    tx: &WorkTransition,
+    actor: Option<&str>,
+    receipt_id: Option<&str>,
+) -> Result<(), WorkError> {
+    let sf = transition_store_fact(tx, actor, receipt_id)?;
+    store.store(sf);
+    Ok(())
+}
+
+fn transition_store_fact(
+    tx: &WorkTransition,
+    actor: Option<&str>,
+    receipt_id: Option<&str>,
+) -> Result<StoreFact, WorkError> {
     let value = serde_json::to_string(tx)?;
-    let mut sf = StoreFact {
+    let mut fact = StoreFact {
         tenant_hash: "default".to_string(),
         entity: format!(
             "{WORK_TRANSITION_ENTITY_PREFIX}::{}::{}-{}",
@@ -743,33 +842,50 @@ fn write_transition(store: &mut FactStore, tx: &WorkTransition) -> Result<(), Wo
         ),
         key: RECORD_KEY.to_string(),
         value,
-        source_receipt: None,
+        source_receipt: receipt_id.map(str::to_string),
         confidence: 1.0,
         private: false,
         horizon_class: None,
-        actor: None,
+        actor: actor.map(str::to_string),
     };
-    crate::fact_privacy::enforce_global(&mut sf);
+    crate::fact_privacy::enforce_global(&mut fact);
+    Ok(fact)
+}
+
+fn write_gate(store: &mut FactStore, gate: &PendingGateAction) -> Result<(), WorkError> {
+    write_gate_with_attribution(store, gate, None, None)
+}
+
+fn write_gate_with_attribution(
+    store: &mut FactStore,
+    gate: &PendingGateAction,
+    actor: Option<&str>,
+    receipt_id: Option<&str>,
+) -> Result<(), WorkError> {
+    let sf = gate_store_fact(gate, actor, receipt_id)?;
     store.store(sf);
     Ok(())
 }
 
-fn write_gate(store: &mut FactStore, gate: &PendingGateAction) -> Result<(), WorkError> {
+fn gate_store_fact(
+    gate: &PendingGateAction,
+    actor: Option<&str>,
+    receipt_id: Option<&str>,
+) -> Result<StoreFact, WorkError> {
     let value = serde_json::to_string(gate)?;
-    let mut sf = StoreFact {
+    let mut fact = StoreFact {
         tenant_hash: "default".to_string(),
         entity: format!("{WORK_GATE_ENTITY_PREFIX}::{}", gate.action_id),
         key: RECORD_KEY.to_string(),
         value,
-        source_receipt: None,
+        source_receipt: receipt_id.map(str::to_string),
         confidence: 1.0,
         private: false,
         horizon_class: None,
-        actor: None,
+        actor: actor.map(str::to_string),
     };
-    crate::fact_privacy::enforce_global(&mut sf);
-    store.store(sf);
-    Ok(())
+    crate::fact_privacy::enforce_global(&mut fact);
+    Ok(fact)
 }
 
 #[cfg(test)]
@@ -944,7 +1060,15 @@ mod tests {
         let still_planned = get_work(&store, &item.id).expect("item");
         assert_eq!(still_planned.state, "planned");
         assert_eq!(list_pending_gates(&store, None).len(), 1);
-        let approved = resolve_gate(&mut store, &pending.action_id, "operator-passport", true, 3_000).expect("resolve");
+        let approved = resolve_gate(
+            &mut store,
+            &pending.action_id,
+            "operator-passport",
+            "ad_test_approve",
+            true,
+            3_000,
+        )
+        .expect("resolve");
         assert_eq!(approved.state, "in_progress");
         assert!(list_pending_gates(&store, None).is_empty(), "no longer pending");
         let _ = std::fs::remove_dir_all(&dir);
@@ -979,7 +1103,15 @@ mod tests {
             UpdateOutcome::Queued(p) => p,
             UpdateOutcome::Applied(_) => panic!("expected queued"),
         };
-        let _ = resolve_gate(&mut store, &pending.action_id, "operator-passport", false, 3_000).expect("rejected");
+        let _ = resolve_gate(
+            &mut store,
+            &pending.action_id,
+            "operator-passport",
+            "ad_test_reject",
+            false,
+            3_000,
+        )
+        .expect("rejected");
         let still_planned = get_work(&store, &item.id).expect("item");
         assert_eq!(still_planned.state, "planned");
         let _ = std::fs::remove_dir_all(&dir);

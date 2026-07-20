@@ -951,6 +951,7 @@ dependencies = [
  "blake3",
  "chacha20poly1305",
  "chrono",
+ "ciborium",
  "corecrux-frame",
  "corecrux-index",
  "corecrux-memory",

@@ -902,6 +902,8 @@ fn http_ctx(auth: &Authz, headers: &HeaderMap) -> Result<AuthContext, ProblemRes
 pub struct HttpScopeContext {
     pub scopes: Vec<String>,
     pub passport_id: Option<String>,
+    auth_enforced: bool,
+    passport_override_used: bool,
     scope_bypass: bool,
     /// Tenant authority derived from the bearer token's `tenant_id`/`tenants`
     /// claim (same source the query path authorizes against). Drives the
@@ -1053,6 +1055,19 @@ impl HttpScopeContext {
         self.scope_bypass || self.scopes.iter().any(|s| s == scope)
     }
 
+    /// Whether JWT authentication accepted a passport header that differs
+    /// from the verified token identity. Most admin surfaces support this
+    /// explicit override; sensitive human-approval boundaries can deny it.
+    pub(crate) fn passport_override_used(&self) -> bool {
+        self.passport_override_used
+    }
+
+    /// Whether this context came from an auth mode that actually checks
+    /// caller credentials. Sensitive human-approval boundaries deny `off`.
+    pub(crate) fn auth_enforced(&self) -> bool {
+        self.auth_enforced
+    }
+
     /// Tenant to stamp on an HTTP write (OD-37). `Ok(None)` → default tenant.
     #[allow(clippy::result_large_err)]
     pub(crate) fn resolve_write_tenant(&self) -> Result<Option<String>, ProblemResponse> {
@@ -1090,11 +1105,16 @@ pub fn http_tenant_selector(headers: &HeaderMap) -> Option<String> {
 #[allow(clippy::result_large_err)]
 pub fn passport_bound_context(auth: &Authz, headers: &HeaderMap) -> Result<HttpScopeContext, ProblemResponse> {
     let ctx = http_ctx(auth, headers)?;
+    let verified_passport_id = ctx.passport_id.clone();
     let passport_id = bind_http_passport(auth.mode, &ctx, http_passport_id(headers))?;
+    let passport_override_used =
+        matches!(auth.mode, AuthMode::JwtHs256 | AuthMode::JwtJwks) && passport_id != verified_passport_id;
     let tenants = ctx.tenants.clone();
     Ok(HttpScopeContext {
         scopes: ctx.scopes.into_iter().collect(),
         passport_id,
+        auth_enforced: auth.mode != AuthMode::Off,
+        passport_override_used,
         scope_bypass: auth.mode == AuthMode::Off,
         tenants,
         write_tenant_selector: http_tenant_selector(headers),

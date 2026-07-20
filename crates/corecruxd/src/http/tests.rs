@@ -11655,6 +11655,884 @@ async fn status_feed_disabled_returns_notice_not_error() {
     assert!(body["events"].as_array().expect("events array").is_empty());
 }
 
+async fn gate_test_state(
+    auth_mode: AuthMode,
+    tenant_id: Option<&str>,
+) -> Result<(AppState, String, String), Box<dyn std::error::Error>> {
+    let mut state = test_app_state_with_auth(16, auth_mode);
+    bind_test_state_to_root_passport_key(&mut state);
+    let (work_id, action_id) = {
+        let mut store = state.fact_store.write().await;
+        seed_gate_test_store(&state.data_dir, &mut store, tenant_id)?
+    };
+    Ok((state, work_id, action_id))
+}
+
+fn seed_gate_test_store(
+    data_dir: &std::path::Path,
+    store: &mut corecrux_memory::FactStore,
+    tenant_id: Option<&str>,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    crate::passports::seed_defaults_if_missing(data_dir, store, 1)?;
+    crate::projects::seed_default_if_missing(store, 1)?;
+    let work = crate::work::create_work(
+        store,
+        crate::work::CreateWorkInput {
+            project_id: "default".to_string(),
+            title: "approval identity test".to_string(),
+            body: None,
+            state: None,
+            assignee_passport: None,
+            tenant_id: tenant_id.map(str::to_string),
+            linked_pr: None,
+            linked_issue: None,
+            created_by_passport: "requester-a".to_string(),
+        },
+        1_000,
+    )?;
+    let outcome = crate::work::update_work(
+        store,
+        &work.id,
+        crate::work::UpdateWorkInput {
+            title: None,
+            body: None,
+            state: Some("complete".to_string()),
+            assignee_passport: None,
+            tenant_id: None,
+            linked_pr: None,
+            linked_issue: None,
+            blocker_reason: None,
+            blocker_kind: None,
+        },
+        crate::work::UpdateWorkContext {
+            by_passport: "requester-a".to_string(),
+            passport_gated: true,
+            now_unix_ms: 2_000,
+        },
+    )?;
+    let crate::work::UpdateOutcome::Queued(pending) = outcome else {
+        return Err(std::io::Error::other("gate test update was not queued").into());
+    };
+    Ok((work.id, pending.action_id.clone()))
+}
+
+async fn gate_test_resolve(
+    state: &AppState,
+    action_id: &str,
+    headers: HeaderMap,
+    approver_hint: Option<&str>,
+    approve: bool,
+) -> Response {
+    let body = super::work::GateResolutionBody {
+        approver_passport: approver_hint.map(str::to_string),
+    };
+    if approve {
+        super::work::post_gate_approve(State(state.clone()), Path(action_id.to_string()), headers, Json(body))
+            .await
+            .into_response()
+    } else {
+        super::work::post_gate_reject(State(state.clone()), Path(action_id.to_string()), headers, Json(body))
+            .await
+            .into_response()
+    }
+}
+
+fn gate_test_latest_fact(
+    store: &corecrux_memory::FactStore,
+    entity: &str,
+) -> Option<corecrux_memory::fact_store::Fact> {
+    store
+        .all_facts()
+        .filter(|fact| fact.entity == entity && fact.key == crate::work::RECORD_KEY && !fact.deleted)
+        .max_by_key(|fact| fact.version)
+        .cloned()
+}
+
+fn gate_test_fact_count(store: &corecrux_memory::FactStore) -> usize {
+    store.all_facts().count()
+}
+
+fn gate_test_observation_count(state: &AppState) -> Result<usize, Box<dyn std::error::Error>> {
+    let path = super::observations::observation_file_path(&state.data_dir, super::work::WORK_GATE_RECEIPT_SESSION);
+    Ok(super::observations::read_observations_strict(&path)?.len())
+}
+
+#[tokio::test]
+async fn work_gate_spoofed_body_is_denied_and_bound_passport_is_stored() -> Result<(), Box<dyn std::error::Error>> {
+    for approve in [true, false] {
+        let (state, _work_id, action_id) = gate_test_state(AuthMode::DevScopes, Some("tenant-a")).await?;
+        let spoofed = gate_test_resolve(
+            &state,
+            &action_id,
+            dev_scope_passport_headers("facts:write", "approver-a"),
+            Some("approver-b"),
+            approve,
+        )
+        .await;
+        assert_eq!(spoofed.status(), StatusCode::FORBIDDEN);
+
+        {
+            let store = state.fact_store.read().await;
+            let entity = format!("{}::{action_id}", crate::work::WORK_GATE_ENTITY_PREFIX);
+            let Some(fact) = gate_test_latest_fact(&store, &entity) else {
+                return Err(std::io::Error::other("pending gate fact missing after spoof attempt").into());
+            };
+            let gate: crate::work::PendingGateAction = serde_json::from_str(&fact.value)?;
+            assert_eq!(gate.status, "pending");
+            assert_ne!(gate.resolved_by_passport.as_deref(), Some("approver-b"));
+        }
+
+        let accepted = gate_test_resolve(
+            &state,
+            &action_id,
+            dev_scope_passport_headers("facts:write", "approver-a"),
+            Some("approver-a"),
+            approve,
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let store = state.fact_store.read().await;
+        let entity = format!("{}::{action_id}", crate::work::WORK_GATE_ENTITY_PREFIX);
+        let Some(fact) = gate_test_latest_fact(&store, &entity) else {
+            return Err(std::io::Error::other("resolved gate fact missing").into());
+        };
+        let gate: crate::work::PendingGateAction = serde_json::from_str(&fact.value)?;
+        assert_eq!(gate.resolved_by_passport.as_deref(), Some("approver-a"));
+        assert_ne!(gate.resolved_by_passport.as_deref(), Some("approver-b"));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn work_gate_read_only_token_is_denied_in_route_auth_shadow() -> Result<(), Box<dyn std::error::Error>> {
+    for approve in [true, false] {
+        let (state, _work_id, action_id) = gate_test_state(AuthMode::DevScopes, Some("tenant-a")).await?;
+        let app = router_with_route_auth(state.clone(), test_case_store(), RouteAuthMode::Shadow);
+        let uri = if approve {
+            format!("/v1/work/gate/{action_id}/approve")
+        } else {
+            format!("/v1/work/gate/{action_id}/reject")
+        };
+        let payload = serde_json::to_vec(&serde_json::json!({"approver_passport": "approver-a"}))?;
+        let mut request = axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .body(axum::body::Body::from(payload))?;
+        *request.headers_mut() = dev_scope_passport_headers("admin:read", "approver-a");
+        request
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response = app.oneshot(request).await?;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let store = state.fact_store.read().await;
+        let entity = format!("{}::{action_id}", crate::work::WORK_GATE_ENTITY_PREFIX);
+        let Some(fact) = gate_test_latest_fact(&store, &entity) else {
+            return Err(std::io::Error::other("pending gate fact missing after read-only attempt").into());
+        };
+        let gate: crate::work::PendingGateAction = serde_json::from_str(&fact.value)?;
+        assert_eq!(gate.status, "pending");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn work_gate_missing_passport_is_denied_closed() -> Result<(), Box<dyn std::error::Error>> {
+    for approve in [true, false] {
+        let (state, _work_id, action_id) = gate_test_state(AuthMode::DevScopes, Some("tenant-a")).await?;
+        let response = gate_test_resolve(
+            &state,
+            &action_id,
+            dev_scope_headers("facts:write"),
+            Some("approver-a"),
+            approve,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let store = state.fact_store.read().await;
+        let entity = format!("{}::{action_id}", crate::work::WORK_GATE_ENTITY_PREFIX);
+        let Some(fact) = gate_test_latest_fact(&store, &entity) else {
+            return Err(std::io::Error::other("pending gate fact missing after anonymous attempt").into());
+        };
+        let gate: crate::work::PendingGateAction = serde_json::from_str(&fact.value)?;
+        assert_eq!(gate.status, "pending");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn work_gate_auth_off_rejects_forged_passport_header() -> Result<(), Box<dyn std::error::Error>> {
+    for approve in [true, false] {
+        let (state, _work_id, action_id) = gate_test_state(AuthMode::Off, Some("tenant-a")).await?;
+        let response = gate_test_resolve(
+            &state,
+            &action_id,
+            dev_scope_passport_headers("facts:write", "approver-a"),
+            Some("approver-a"),
+            approve,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(gate_test_observation_count(&state)?, 0);
+
+        let store = state.fact_store.read().await;
+        let entity = format!("{}::{action_id}", crate::work::WORK_GATE_ENTITY_PREFIX);
+        let Some(fact) = gate_test_latest_fact(&store, &entity) else {
+            return Err(std::io::Error::other("pending gate fact missing after auth-off attempt").into());
+        };
+        let gate: crate::work::PendingGateAction = serde_json::from_str(&fact.value)?;
+        assert_eq!(gate.status, "pending");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn work_gate_jwt_binding_and_cross_tenant_enforcement() -> Result<(), Box<dyn std::error::Error>> {
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+    const SECRET: &str = "0123456789abcdef0123456789abcdef";
+    let _secret = EnvVarGuard::set("CORECRUXD_JWT_HS256_SECRET", SECRET);
+    let _issuer = EnvVarGuard::set("CORECRUXD_JWT_ISS", "corecrux-test");
+    let _audience = EnvVarGuard::set("CORECRUXD_JWT_AUD", "corecrux");
+
+    #[derive(serde::Serialize)]
+    struct Claims<'a> {
+        exp: usize,
+        iss: &'a str,
+        aud: &'a str,
+        scope: &'a str,
+        tenant_id: &'a str,
+        passport_id: &'a str,
+    }
+
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let claims = Claims {
+        exp: now.as_secs().saturating_add(3_600) as usize,
+        iss: "corecrux-test",
+        aud: "corecrux",
+        scope: "facts:write",
+        tenant_id: "tenant-x",
+        passport_id: "approver-a",
+    };
+    let token = encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(SECRET.as_bytes()),
+    )?;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}"))?,
+    );
+
+    let wrong_tenant_claims = Claims {
+        exp: now.as_secs().saturating_add(3_600) as usize,
+        iss: "corecrux-test",
+        aud: "corecrux",
+        scope: "facts:write",
+        tenant_id: "tenant-y",
+        passport_id: "approver-a",
+    };
+    let wrong_tenant_token = encode(
+        &Header::new(Algorithm::HS256),
+        &wrong_tenant_claims,
+        &EncodingKey::from_secret(SECRET.as_bytes()),
+    )?;
+    let mut wrong_tenant_headers = HeaderMap::new();
+    wrong_tenant_headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {wrong_tenant_token}"))?,
+    );
+
+    let override_claims = Claims {
+        exp: now.as_secs().saturating_add(3_600) as usize,
+        iss: "corecrux-test",
+        aud: "corecrux",
+        scope: "facts:write admin:write",
+        tenant_id: "tenant-x",
+        passport_id: "approver-a",
+    };
+    let override_token = encode(
+        &Header::new(Algorithm::HS256),
+        &override_claims,
+        &EncodingKey::from_secret(SECRET.as_bytes()),
+    )?;
+    let mut override_headers = HeaderMap::new();
+    override_headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {override_token}"))?,
+    );
+    override_headers.insert("x-corecrux-passport-id", HeaderValue::from_static("approver-b"));
+
+    for approve in [true, false] {
+        let (bound_state, _work_id, bound_action_id) = gate_test_state(AuthMode::JwtHs256, Some("tenant-x")).await?;
+        let spoofed = gate_test_resolve(
+            &bound_state,
+            &bound_action_id,
+            headers.clone(),
+            Some("approver-b"),
+            approve,
+        )
+        .await;
+        assert_eq!(spoofed.status(), StatusCode::FORBIDDEN);
+        let impersonated = gate_test_resolve(
+            &bound_state,
+            &bound_action_id,
+            override_headers.clone(),
+            Some("approver-b"),
+            approve,
+        )
+        .await;
+        assert_eq!(impersonated.status(), StatusCode::FORBIDDEN);
+        let accepted = gate_test_resolve(
+            &bound_state,
+            &bound_action_id,
+            headers.clone(),
+            Some("approver-a"),
+            approve,
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        {
+            let store = bound_state.fact_store.read().await;
+            let entity = format!("{}::{bound_action_id}", crate::work::WORK_GATE_ENTITY_PREFIX);
+            let Some(fact) = gate_test_latest_fact(&store, &entity) else {
+                return Err(std::io::Error::other("JWT-bound resolved gate fact missing").into());
+            };
+            let gate: crate::work::PendingGateAction = serde_json::from_str(&fact.value)?;
+            assert_eq!(gate.resolved_by_passport.as_deref(), Some("approver-a"));
+            assert_ne!(gate.resolved_by_passport.as_deref(), Some("approver-b"));
+        }
+        let resolved_cross_tenant = gate_test_resolve(
+            &bound_state,
+            &bound_action_id,
+            wrong_tenant_headers.clone(),
+            Some("approver-a"),
+            !approve,
+        )
+        .await;
+        assert_eq!(resolved_cross_tenant.status(), StatusCode::FORBIDDEN);
+
+        let (state, _work_id, action_id) = gate_test_state(AuthMode::JwtHs256, Some("tenant-y")).await?;
+        let response = gate_test_resolve(&state, &action_id, headers.clone(), Some("approver-a"), approve).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        {
+            let store = state.fact_store.read().await;
+            let entity = format!("{}::{action_id}", crate::work::WORK_GATE_ENTITY_PREFIX);
+            let Some(fact) = gate_test_latest_fact(&store, &entity) else {
+                return Err(std::io::Error::other("pending cross-tenant gate fact missing").into());
+            };
+            let gate: crate::work::PendingGateAction = serde_json::from_str(&fact.value)?;
+            assert_eq!(gate.status, "pending");
+        }
+
+        let (drift_state, drift_work_id, drift_action_id) =
+            gate_test_state(AuthMode::JwtHs256, Some("tenant-y")).await?;
+        {
+            let mut store = drift_state.fact_store.write().await;
+            let _ = crate::work::update_work(
+                &mut store,
+                &drift_work_id,
+                crate::work::UpdateWorkInput {
+                    title: None,
+                    body: None,
+                    state: None,
+                    assignee_passport: None,
+                    tenant_id: Some(Some("tenant-x".to_string())),
+                    linked_pr: None,
+                    linked_issue: None,
+                    blocker_reason: None,
+                    blocker_kind: None,
+                },
+                crate::work::UpdateWorkContext {
+                    by_passport: "requester-a".to_string(),
+                    passport_gated: false,
+                    now_unix_ms: 2_500,
+                },
+            )?;
+        }
+        let current_tenant_attempt = gate_test_resolve(
+            &drift_state,
+            &drift_action_id,
+            headers.clone(),
+            Some("approver-a"),
+            approve,
+        )
+        .await;
+        assert_eq!(current_tenant_attempt.status(), StatusCode::FORBIDDEN);
+        let original_tenant_attempt = gate_test_resolve(
+            &drift_state,
+            &drift_action_id,
+            wrong_tenant_headers.clone(),
+            Some("approver-a"),
+            approve,
+        )
+        .await;
+        assert_eq!(original_tenant_attempt.status(), StatusCode::CONFLICT);
+        assert_eq!(gate_test_observation_count(&drift_state)?, 0);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn work_gate_receipt_resolves_and_resolution_facts_are_attributed() -> Result<(), Box<dyn std::error::Error>> {
+    for approve in [true, false] {
+        let (mut state, work_id, action_id) = gate_test_state(AuthMode::DevScopes, Some("tenant-a")).await?;
+        let response = gate_test_resolve(
+            &state,
+            &action_id,
+            dev_scope_passport_headers("facts:write", "approver-a"),
+            Some("approver-a"),
+            approve,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_body = json_body(response).await;
+        let Some(receipt_id) = response_body["receipt_id"].as_str() else {
+            return Err(std::io::Error::other("gate response receipt_id missing").into());
+        };
+        assert!(receipt_id.starts_with("ad_ga_"));
+
+        // A pre-seeded dataplane stream must not shadow the authoritative
+        // local gate receipt namespace.
+        state.http_dataplane = enabled_dataplane(
+            vec![
+                receipt_stored_event(EVT_RECEIPT_BODY_V1, 99, b"shadow body"),
+                receipt_stored_event(EVT_RECEIPT_SIG_V1, 100, b"shadow signature"),
+            ],
+            Some(sample_verification_report("shadow-receipt", "tenant-a")),
+        );
+
+        let receipt_headers = dev_scope_headers("receipts:read");
+        let body_response = super::receipts::get_receipt_body_v1(
+            State(state.clone()),
+            Path(receipt_id.to_string()),
+            Query(TenantQuery {
+                tenant_id: "tenant-a".to_string(),
+            }),
+            receipt_headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(body_response.status(), StatusCode::OK);
+        let body_envelope = json_body(body_response).await;
+        assert_eq!(body_envelope["receipt_id"], receipt_id);
+        assert_eq!(body_envelope["seq"], 0);
+        assert_eq!(
+            body_envelope["contentType"],
+            corecrux_receipts::CONTENT_TYPE_RECEIPT_BODY_V1
+        );
+        let Some(payload_base64) = body_envelope["payloadBase64"].as_str() else {
+            return Err(std::io::Error::other("receipt body payload missing").into());
+        };
+        let receipt_body = base64::engine::general_purpose::STANDARD.decode(payload_base64)?;
+        let Some(receipt_fields) = super::receipts::approval_receipt_text_fields(&receipt_body) else {
+            return Err(std::io::Error::other("receipt body is not text-keyed CBOR").into());
+        };
+        assert_eq!(
+            receipt_fields.get("reviewer_passport").map(String::as_str),
+            Some("approver-a")
+        );
+        assert_eq!(
+            receipt_fields.get("decision").map(String::as_str),
+            Some(if approve { "approve" } else { "reject" })
+        );
+
+        let signature_response = super::receipts::get_receipt_signature_v1(
+            State(state.clone()),
+            Path(receipt_id.to_string()),
+            Query(TenantQuery {
+                tenant_id: "tenant-a".to_string(),
+            }),
+            receipt_headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(signature_response.status(), StatusCode::OK);
+
+        let verification_response = super::receipts::get_receipt_verification_v1(
+            State(state.clone()),
+            Path(receipt_id.to_string()),
+            Query(TenantQuery {
+                tenant_id: "tenant-a".to_string(),
+            }),
+            receipt_headers,
+        )
+        .await
+        .into_response();
+        assert_eq!(verification_response.status(), StatusCode::OK);
+        let verification = json_body(verification_response).await;
+        assert_eq!(verification["receipt_id"], receipt_id);
+        assert_eq!(verification["signature_valid"], true);
+        assert_eq!(verification["error_code"], "OK");
+
+        let wrong_tenant_receipt = super::receipts::get_receipt_body_v1(
+            State(state.clone()),
+            Path(receipt_id.to_string()),
+            Query(TenantQuery {
+                tenant_id: "tenant-b".to_string(),
+            }),
+            dev_scope_headers("receipts:read"),
+        )
+        .await
+        .into_response();
+        assert_eq!(wrong_tenant_receipt.status(), StatusCode::NOT_FOUND);
+
+        let colliding_bundle_export = super::receipts::get_receipt_export_v1(
+            State(state.clone()),
+            Path(receipt_id.to_string()),
+            Query(super::receipts::ExportQueryV1 {
+                tenant_id: "tenant-a".to_string(),
+                include: None,
+                redaction: None,
+                format: None,
+            }),
+            dev_scope_headers("exports:read receipts:read"),
+        )
+        .await
+        .into_response();
+        assert_eq!(colliding_bundle_export.status(), StatusCode::NOT_IMPLEMENTED);
+
+        let store = state.fact_store.read().await;
+        let gate_entity = format!("{}::{action_id}", crate::work::WORK_GATE_ENTITY_PREFIX);
+        let Some(gate_fact) = gate_test_latest_fact(&store, &gate_entity) else {
+            return Err(std::io::Error::other("resolved gate fact missing").into());
+        };
+        assert_eq!(gate_fact.actor.as_deref(), Some("approver-a"));
+        assert_eq!(gate_fact.source_receipt.as_deref(), Some(receipt_id));
+        let gate: crate::work::PendingGateAction = serde_json::from_str(&gate_fact.value)?;
+        assert_eq!(gate.resolved_by_passport.as_deref(), Some("approver-a"));
+        assert_eq!(gate.receipt_id.as_deref(), Some(receipt_id));
+
+        let expected_gate_status = if approve { "approved" } else { "rejected" };
+        let transition = store.all_facts().find(|fact| {
+            if !fact
+                .entity
+                .starts_with(&format!("{}::{work_id}::", crate::work::WORK_TRANSITION_ENTITY_PREFIX))
+            {
+                return false;
+            }
+            serde_json::from_str::<crate::work::WorkTransition>(&fact.value)
+                .is_ok_and(|transition| transition.gate_status == expected_gate_status)
+        });
+        let Some(transition_fact) = transition else {
+            return Err(std::io::Error::other("gate resolution transition fact missing").into());
+        };
+        assert_eq!(transition_fact.actor.as_deref(), Some("approver-a"));
+        assert_eq!(transition_fact.source_receipt.as_deref(), Some(receipt_id));
+        let transition: crate::work::WorkTransition = serde_json::from_str(&transition_fact.value)?;
+        assert_eq!(transition.by_passport, "approver-a");
+        assert_eq!(transition.receipt_id.as_deref(), Some(receipt_id));
+
+        if approve {
+            let work_entity = format!("{}::default::{work_id}", crate::work::WORK_ENTITY_PREFIX);
+            let Some(work_fact) = gate_test_latest_fact(&store, &work_entity) else {
+                return Err(std::io::Error::other("approved work fact missing").into());
+            };
+            assert_eq!(work_fact.actor.as_deref(), Some("approver-a"));
+            assert_eq!(work_fact.source_receipt.as_deref(), Some(receipt_id));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn work_gate_replay_conflicts_without_duplicate_facts_or_receipts() -> Result<(), Box<dyn std::error::Error>> {
+    for approve in [true, false] {
+        let (state, _work_id, action_id) = gate_test_state(AuthMode::DevScopes, Some("tenant-a")).await?;
+        let headers = dev_scope_passport_headers("facts:write", "approver-a");
+        let first = gate_test_resolve(&state, &action_id, headers.clone(), Some("approver-a"), approve).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let facts_after_first = {
+            let store = state.fact_store.read().await;
+            gate_test_fact_count(&store)
+        };
+        let receipts_after_first = gate_test_observation_count(&state)?;
+
+        let replay = gate_test_resolve(&state, &action_id, headers, Some("approver-a"), !approve).await;
+        assert_eq!(replay.status(), StatusCode::CONFLICT);
+        let facts_after_replay = {
+            let store = state.fact_store.read().await;
+            gate_test_fact_count(&store)
+        };
+        assert_eq!(facts_after_replay, facts_after_first);
+        assert_eq!(gate_test_observation_count(&state)?, receipts_after_first);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn work_gate_receipt_is_reused_after_fact_journal_failure() -> Result<(), Box<dyn std::error::Error>> {
+    for approve in [true, false] {
+        let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+        bind_test_state_to_root_passport_key(&mut state);
+        let fact_dir = state.data_dir.join("gate-fact-journal");
+        let mut persistent_store = corecrux_memory::FactStore::with_persistence(&fact_dir)?;
+        let (_work_id, action_id) = seed_gate_test_store(&state.data_dir, &mut persistent_store, Some("tenant-a"))?;
+        state.fact_store = Arc::new(RwLock::new(persistent_store));
+
+        let journal_path = fact_dir.join("facts.jsonl");
+        let journal_backup = fact_dir.join("facts.before-failure.jsonl");
+        std::fs::rename(&journal_path, &journal_backup)?;
+        std::fs::create_dir(&journal_path)?;
+
+        let headers = dev_scope_passport_headers("facts:write", "approver-a");
+        let facts_before = {
+            let store = state.fact_store.read().await;
+            gate_test_fact_count(&store)
+        };
+        let failed = gate_test_resolve(&state, &action_id, headers.clone(), Some("approver-a"), approve).await;
+        assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(gate_test_observation_count(&state)?, 1);
+        {
+            let store = state.fact_store.read().await;
+            assert_eq!(gate_test_fact_count(&store), facts_before);
+            let entity = format!("{}::{action_id}", crate::work::WORK_GATE_ENTITY_PREFIX);
+            let Some(fact) = gate_test_latest_fact(&store, &entity) else {
+                return Err(std::io::Error::other("pending gate missing after journal failure").into());
+            };
+            let gate: crate::work::PendingGateAction = serde_json::from_str(&fact.value)?;
+            assert_eq!(gate.status, "pending");
+        }
+
+        let receipt_path =
+            super::observations::observation_file_path(&state.data_dir, super::work::WORK_GATE_RECEIPT_SESSION);
+        let receipt_records = super::observations::read_observations_strict(&receipt_path)?;
+        let Some(orphan_record) = receipt_records.first() else {
+            return Err(std::io::Error::other("orphan receipt record missing").into());
+        };
+        let orphan_observation_id = orphan_record.observation_id.clone();
+
+        std::fs::remove_dir(&journal_path)?;
+        std::fs::rename(&journal_backup, &journal_path)?;
+        let conflicting_retry =
+            gate_test_resolve(&state, &action_id, headers.clone(), Some("approver-a"), !approve).await;
+        assert_eq!(conflicting_retry.status(), StatusCode::CONFLICT);
+        assert_eq!(gate_test_observation_count(&state)?, 1);
+        {
+            let store = state.fact_store.read().await;
+            assert_eq!(gate_test_fact_count(&store), facts_before);
+        }
+
+        let retried = gate_test_resolve(&state, &action_id, headers, Some("approver-a"), approve).await;
+        assert_eq!(retried.status(), StatusCode::OK);
+        let retried_body = json_body(retried).await;
+        assert_eq!(retried_body["receipt_record_id"], orphan_observation_id);
+        assert_eq!(gate_test_observation_count(&state)?, 1);
+        let Some(retried_receipt_id) = retried_body["receipt_id"].as_str() else {
+            return Err(std::io::Error::other("retried receipt id missing").into());
+        };
+
+        let verification = super::receipts::get_receipt_verification_v1(
+            State(state),
+            Path(retried_receipt_id.to_string()),
+            Query(TenantQuery {
+                tenant_id: "tenant-a".to_string(),
+            }),
+            dev_scope_headers("receipts:read"),
+        )
+        .await
+        .into_response();
+        assert_eq!(verification.status(), StatusCode::OK);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn work_gate_concurrent_resolution_has_one_winner() -> Result<(), Box<dyn std::error::Error>> {
+    for approve in [true, false] {
+        let (state, _work_id, action_id) = gate_test_state(AuthMode::DevScopes, Some("tenant-a")).await?;
+        let headers = dev_scope_passport_headers("facts:write", "approver-a");
+        let first = gate_test_resolve(&state, &action_id, headers.clone(), Some("approver-a"), approve);
+        let second = gate_test_resolve(&state, &action_id, headers, Some("approver-a"), !approve);
+        let (first, second) = tokio::join!(first, second);
+        let mut statuses = [first.status(), second.status()];
+        statuses.sort();
+        assert_eq!(statuses, [StatusCode::OK, StatusCode::CONFLICT]);
+        assert_eq!(gate_test_observation_count(&state)?, 1);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn work_gate_requester_cannot_self_approve_or_self_reject() -> Result<(), Box<dyn std::error::Error>> {
+    for approve in [true, false] {
+        let (state, _work_id, action_id) = gate_test_state(AuthMode::DevScopes, Some("tenant-a")).await?;
+        let response = gate_test_resolve(
+            &state,
+            &action_id,
+            dev_scope_passport_headers("facts:write", "requester-a"),
+            Some("requester-a"),
+            approve,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(gate_test_observation_count(&state)?, 0);
+
+        let store = state.fact_store.read().await;
+        let entity = format!("{}::{action_id}", crate::work::WORK_GATE_ENTITY_PREFIX);
+        let Some(fact) = gate_test_latest_fact(&store, &entity) else {
+            return Err(std::io::Error::other("pending self-approval gate fact missing").into());
+        };
+        let gate: crate::work::PendingGateAction = serde_json::from_str(&fact.value)?;
+        assert_eq!(gate.status, "pending");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn work_gate_receipt_session_is_not_generic_observation_surface() -> Result<(), Box<dyn std::error::Error>> {
+    let (state, _work_id, action_id) = gate_test_state(AuthMode::DevScopes, Some("tenant-a")).await?;
+    let resolved = gate_test_resolve(
+        &state,
+        &action_id,
+        dev_scope_passport_headers("facts:write", "approver-a"),
+        Some("approver-a"),
+        true,
+    )
+    .await;
+    assert_eq!(resolved.status(), StatusCode::OK);
+    let resolved_body = json_body(resolved).await;
+    let Some(receipt_id) = resolved_body["receipt_id"].as_str() else {
+        return Err(std::io::Error::other("gate response receipt_id missing").into());
+    };
+
+    let generic_body = super::observations::PostObservationBody {
+        kind: "approval_decision".to_string(),
+        provider: "attacker".to_string(),
+        client_ts: None,
+        payload: serde_json::json!({"receipt_id": receipt_id}),
+    };
+    let singleton = super::observations::post_observation(
+        State(state.clone()),
+        dev_scope_headers("sessions:write"),
+        Path(super::work::WORK_GATE_RECEIPT_SESSION.to_string()),
+        Json(generic_body.clone()),
+    )
+    .await;
+    assert_eq!(singleton.status(), StatusCode::FORBIDDEN);
+    let bound_singleton = super::observations::post_observation(
+        State(state.clone()),
+        dev_scope_passport_headers("sessions:write", "approver-a"),
+        Path(super::work::WORK_GATE_RECEIPT_SESSION.to_string()),
+        Json(generic_body.clone()),
+    )
+    .await;
+    assert_eq!(bound_singleton.status(), StatusCode::FORBIDDEN);
+    let batch = super::observations::post_observations_batch(
+        State(state.clone()),
+        dev_scope_headers("sessions:write"),
+        Path(super::work::WORK_GATE_RECEIPT_SESSION.to_ascii_uppercase()),
+        Json(super::observations::PostObservationsBatchBody {
+            items: vec![generic_body],
+        }),
+    )
+    .await;
+    assert_eq!(batch.status(), StatusCode::FORBIDDEN);
+
+    let direct_read = super::observations::get_observations(
+        State(state.clone()),
+        dev_scope_headers("query:read"),
+        Path(super::work::WORK_GATE_RECEIPT_SESSION.to_string()),
+        Query(super::observations::ListObservationsQuery {
+            since: None,
+            limit: None,
+            provider: None,
+        }),
+    )
+    .await;
+    assert_eq!(direct_read.status(), StatusCode::FORBIDDEN);
+    let bound_direct_read = super::observations::get_observations(
+        State(state.clone()),
+        dev_scope_passport_headers("query:read", "approver-a"),
+        Path(super::work::WORK_GATE_RECEIPT_SESSION.to_string()),
+        Query(super::observations::ListObservationsQuery {
+            since: None,
+            limit: None,
+            provider: None,
+        }),
+    )
+    .await;
+    assert_eq!(bound_direct_read.status(), StatusCode::FORBIDDEN);
+    let aggregate = super::observations::get_observations_aggregate(
+        State(state.clone()),
+        dev_scope_headers("query:read"),
+        Query(super::observations::AggregateObservationsQuery {
+            since: None,
+            provider: None,
+            kind: None,
+            session_id: None,
+            limit: None,
+        }),
+    )
+    .await;
+    assert_eq!(aggregate.status(), StatusCode::OK);
+    let aggregate_body = json_body(aggregate).await;
+    assert_eq!(aggregate_body["matched"], 0);
+
+    let receipt_path =
+        super::observations::observation_file_path(&state.data_dir, super::work::WORK_GATE_RECEIPT_SESSION);
+    let (_archived, scanned) = super::observations::run_retention_pass(&state.data_dir, chrono::Duration::seconds(-1))?;
+    assert_eq!(scanned, 0);
+    assert!(receipt_path.exists());
+    assert_eq!(gate_test_observation_count(&state)?, 1);
+
+    let still_resolvable = super::receipts::get_receipt_verification_v1(
+        State(state),
+        Path(receipt_id.to_string()),
+        Query(TenantQuery {
+            tenant_id: "tenant-a".to_string(),
+        }),
+        dev_scope_headers("receipts:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(still_resolvable.status(), StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test]
+async fn work_gate_tampered_receipt_chain_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+    let (state, _work_id, action_id) = gate_test_state(AuthMode::DevScopes, Some("tenant-a")).await?;
+    let resolved = gate_test_resolve(
+        &state,
+        &action_id,
+        dev_scope_passport_headers("facts:write", "approver-a"),
+        Some("approver-a"),
+        false,
+    )
+    .await;
+    assert_eq!(resolved.status(), StatusCode::OK);
+    let resolved_body = json_body(resolved).await;
+    let Some(receipt_id) = resolved_body["receipt_id"].as_str() else {
+        return Err(std::io::Error::other("gate response receipt_id missing").into());
+    };
+    let receipt_path =
+        super::observations::observation_file_path(&state.data_dir, super::work::WORK_GATE_RECEIPT_SESSION);
+    let original = std::fs::read_to_string(&receipt_path)?;
+    let tampered = original.replacen("\"tenant_id\":\"tenant-a\"", "\"tenant_id\":\"tenant-b\"", 1);
+    if tampered == original {
+        return Err(std::io::Error::other("receipt tamper fixture did not find tenant field").into());
+    }
+    std::fs::write(&receipt_path, tampered)?;
+
+    let response = super::receipts::get_receipt_body_v1(
+        State(state),
+        Path(receipt_id.to_string()),
+        Query(TenantQuery {
+            tenant_id: "tenant-a".to_string(),
+        }),
+        dev_scope_headers("receipts:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    Ok(())
+}
+
 #[tokio::test]
 async fn work_patch_with_gated_passport_returns_202_queued() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
@@ -11736,7 +12614,8 @@ async fn work_patch_with_gated_passport_returns_202_queued() {
 
 #[tokio::test]
 async fn work_comments_get_item_and_gate_resolution_paths() {
-    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    bind_test_state_to_root_passport_key(&mut state);
     let work_id = {
         let mut store = state.fact_store.write().await;
         crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
@@ -11837,9 +12716,9 @@ async fn work_comments_get_item_and_gate_resolution_paths() {
     let rejected = super::work::post_gate_reject(
         State(state.clone()),
         Path(reject_action),
-        dev_scope_headers("admin:read"),
+        dev_scope_passport_headers("facts:write", "work-default"),
         Json(super::work::GateResolutionBody {
-            approver_passport: "work-default".to_string(),
+            approver_passport: Some("work-default".to_string()),
         }),
     )
     .await
@@ -11871,9 +12750,9 @@ async fn work_comments_get_item_and_gate_resolution_paths() {
     let approved = super::work::post_gate_approve(
         State(state),
         Path(approve_action),
-        dev_scope_headers("admin:read"),
+        dev_scope_passport_headers("facts:write", "work-default"),
         Json(super::work::GateResolutionBody {
-            approver_passport: "work-default".to_string(),
+            approver_passport: Some("work-default".to_string()),
         }),
     )
     .await

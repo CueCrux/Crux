@@ -155,7 +155,7 @@ pub(super) struct StreamReceiptDraft {
 /// hex seed — same on-disk format `crux_session::LocalPassportKey` owns) and
 /// assert the derived fingerprint matches the daemon identity, mirroring the
 /// guard in `observations::mint_receipt`.
-fn load_signing_key(state: &AppState) -> Result<SigningKey, String> {
+pub(super) fn load_signing_key(state: &AppState) -> Result<SigningKey, String> {
     let content =
         std::fs::read_to_string(&state.passport_key_path).map_err(|err| format!("passport key load failed: {err}"))?;
     let trimmed = content.trim();
