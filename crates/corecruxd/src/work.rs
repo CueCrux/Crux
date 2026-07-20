@@ -119,6 +119,10 @@ pub struct WorkItem {
     /// the kanban path stays byte-compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_path: Option<String>,
+    /// ExecPlan-only BLAKE3 digest of the canonical plan bytes, encoded as
+    /// lowercase hexadecimal without an algorithm prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_content_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_milestone: Option<String>,
     /// ExecPlan-aggregator only: the lowest-ordered milestone id whose `after`
@@ -291,6 +295,7 @@ pub fn create_work(store: &mut FactStore, input: CreateWorkInput, now_unix_ms: u
         created_at_unix_ms: now_unix_ms,
         updated_at_unix_ms: now_unix_ms,
         plan_path: None,
+        plan_content_hash: None,
         current_milestone: None,
         next_ready_milestone: None,
         superseded_by: None,
@@ -822,6 +827,17 @@ mod tests {
         assert_eq!(txns[0].from_state, "(none)");
         assert_eq!(txns[0].to_state, "planned");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kanban_item_serializes_without_plan_content_hash() -> Result<(), serde_json::Error> {
+        let (dir, mut store) = seeded_store();
+        let item = mk_work(&mut store);
+        let json = serde_json::to_value(item)?;
+
+        assert!(json.get("plan_content_hash").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     #[test]

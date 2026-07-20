@@ -969,6 +969,9 @@ fn mk_item(
     } else {
         None
     };
+    // Canonical bytes are the raw UTF-8 file bytes read once by the walker, with no normalization.
+    // BLAKE3 matches the daemon's existing file content-addressing convention.
+    let plan_content_hash = blake3::hash(file.content.as_bytes()).to_hex().to_string();
     WorkItem {
         id: format!("execplan:{}", file.slug),
         project_id: VIRTUAL_PROJECT_ID.to_string(),
@@ -985,6 +988,7 @@ fn mk_item(
         created_at_unix_ms: created,
         updated_at_unix_ms: updated,
         plan_path: Some(file.path.display().to_string()),
+        plan_content_hash: Some(plan_content_hash),
         current_milestone,
         next_ready_milestone,
         superseded_by,
@@ -1475,6 +1479,7 @@ mod tests {
             created_at_unix_ms: 0,
             updated_at_unix_ms: 0,
             plan_path: None,
+            plan_content_hash: None,
             current_milestone: None,
             next_ready_milestone: None,
             superseded_by: None,
@@ -2465,6 +2470,57 @@ mod tests {
         assert_eq!(gamma.state, "archive");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn execplan_item_plan_content_hash_matches_canonical_fixture() -> Result<(), Box<dyn std::error::Error>> {
+        const PLAN_BYTES: &[u8] = b"# Canonical plan\n\nStatus: Planned\n";
+        let dir = tempfile::tempdir()?;
+        let plan_path = dir.path().join("canonical.md");
+        std::fs::write(&plan_path, PLAN_BYTES)?;
+
+        let items = list_execplans(&FactStore::new(), dir.path(), 1_000)?;
+        let [item] = items.as_slice() else {
+            return Err(std::io::Error::other(format!("expected one projected plan, got {}", items.len())).into());
+        };
+        let fixture_bytes = std::fs::read(plan_path)?;
+        let expected = blake3::hash(&fixture_bytes).to_hex().to_string();
+
+        assert_eq!(item.plan_content_hash.as_deref(), Some(expected.as_str()));
+        Ok(())
+    }
+
+    #[test]
+    fn plan_content_hash_distinguishes_one_byte_and_matches_identical_copies() -> Result<(), Box<dyn std::error::Error>>
+    {
+        const SAME_BYTES: &[u8] = b"# Copy A\n\nStatus: Planned\n";
+        const DIFFERENT_BYTES: &[u8] = b"# Copy B\n\nStatus: Planned\n";
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("same-a.md"), SAME_BYTES)?;
+        std::fs::write(dir.path().join("same-b.md"), SAME_BYTES)?;
+        std::fs::write(dir.path().join("different.md"), DIFFERENT_BYTES)?;
+
+        let items = list_execplans(&FactStore::new(), dir.path(), 1_000)?;
+        let hash_for = |id: &str| {
+            items
+                .iter()
+                .find(|item| item.id == id)
+                .and_then(|item| item.plan_content_hash.as_deref())
+        };
+        let same_expected = blake3::hash(SAME_BYTES).to_hex().to_string();
+        let different_expected = blake3::hash(DIFFERENT_BYTES).to_hex().to_string();
+
+        assert_eq!(
+            SAME_BYTES.iter().zip(DIFFERENT_BYTES).filter(|(a, b)| a != b).count(),
+            1,
+            "the mismatch fixture must differ by exactly one byte"
+        );
+        assert_eq!(hash_for("execplan:same-a"), Some(same_expected.as_str()));
+        assert_eq!(hash_for("execplan:same-b"), Some(same_expected.as_str()));
+        assert_eq!(hash_for("execplan:different"), Some(different_expected.as_str()));
+        assert_eq!(hash_for("execplan:same-a"), hash_for("execplan:same-b"));
+        assert_ne!(hash_for("execplan:same-a"), hash_for("execplan:different"));
+        Ok(())
     }
 
     #[test]

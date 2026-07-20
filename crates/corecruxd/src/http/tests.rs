@@ -11469,6 +11469,7 @@ async fn projects_members_tenants_layers_repos_and_graph_round_trip() {
     assert_eq!(delete_member.status(), StatusCode::NO_CONTENT);
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn work_post_then_list_then_patch_state_round_trip() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
@@ -11548,6 +11549,47 @@ async fn work_post_then_list_then_patch_state_round_trip() {
     assert_eq!(txns.len(), 2, "create + transition");
     assert_eq!(txns[0]["from_state"], "(none)");
     assert_eq!(txns[1]["to_state"], "in_progress");
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn work_source_all_handler_round_trips_plan_content_hash() -> Result<(), Box<dyn std::error::Error>> {
+    const PLAN_BYTES: &[u8] = b"# Canonical handler fixture\n\nStatus: Planned\n";
+    let root = tempfile::tempdir()?;
+    std::fs::write(root.path().join("canonical.md"), PLAN_BYTES)?;
+    let root_display = root.path().display().to_string();
+    let _execplans_root = EnvVarGuard::set(crate::work_execplans::EXECPLANS_ROOT_ENV, &root_display);
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    let response = super::work::get_work(
+        State(state),
+        Query(super::work::ListWorkQuery {
+            project_id: None,
+            state: Some("planned".to_string()),
+            tenant_id: None,
+            assignee_passport: None,
+            source: super::work::WorkSource::All,
+            orchestrator: None,
+        }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = json_body(response).await;
+    let Some(work) = body["work"].as_array() else {
+        return Err(std::io::Error::other("work response must contain an array").into());
+    };
+    let Some(item) = work.iter().find(|item| item["id"] == "execplan:canonical") else {
+        return Err(std::io::Error::other("canonical ExecPlan missing from work response").into());
+    };
+    let expected = blake3::hash(PLAN_BYTES).to_hex().to_string();
+
+    assert_eq!(body["source"], "all");
+    assert_eq!(body["count"], 1);
+    assert_eq!(item["plan_content_hash"].as_str(), Some(expected.as_str()));
+    Ok(())
 }
 
 #[tokio::test]

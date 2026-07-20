@@ -635,6 +635,7 @@ mod tests {
             created_at_unix_ms: first_ms,
             updated_at_unix_ms: last_ms,
             plan_path: None,
+            plan_content_hash: None,
             current_milestone: None,
             next_ready_milestone: None,
             superseded_by: None,
