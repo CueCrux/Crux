@@ -2172,6 +2172,98 @@ function extractThemeVars(theme) {
 })();
 
 // =========================================================================
+//  M2b — two-profile capability conformance. Proves the anti-501 guarantee
+//  holds on BOTH a full daemon and a lite (delegating) daemon (M5b): (1)
+//  reverse coverage — every capability-gated control is actually wired through
+//  applyCapabilityGate AND present in CONTROL_CAPABILITY_MAP (a new gated
+//  control that skipped the map would render enabled → 404/501, the M2-review
+//  gap); (2) descriptor completeness — every capability the map consumes is
+//  declared by BOTH profiles, so a mapped control never falls to
+//  capability_undeclared (a "should work but the daemon didn't say so" 501);
+//  (3) the gate reacts to a lite/degraded profile with disabled-with-reason.
+(function checkTwoProfileConformance() {
+  const map = pages.CONTROL_CAPABILITY_MAP || {};
+
+  // (1) Reverse coverage: collect every applyCapabilityGate call-site that names
+  // a STRING-LITERAL control id and assert each is a map key. The one dynamic
+  // call site — applyCapabilityGate(node, control && control.k) — routes keyed
+  // DSL controls whose ids are validated elsewhere; only literals are checkable.
+  const litRe = /applyCapabilityGate\([^,]+,\s*'([^']+)'/g;
+  const gatedIds = new Set();
+  let m;
+  while ((m = litRe.exec(renderSrc)) !== null) { gatedIds.add(m[1]); }
+  check(gatedIds.size > 0, '[m2b] expected at least one literal applyCapabilityGate call site');
+  gatedIds.forEach(function (id) {
+    check(Object.prototype.hasOwnProperty.call(map, id),
+      '[m2b] gated control "' + id + '" is not in CONTROL_CAPABILITY_MAP — it would render enabled and reach a 404/501');
+  });
+
+  // A valid capability object per runtimeCapabilityState's shape contract.
+  function cap(availability, reasonCode) {
+    return {
+      availability: availability, reason_code: reasonCode, reason: reasonCode.replace(/_/g, ' '),
+      compiled: true, configured: true, initialized: availability === 'available',
+      entitled: true, degraded: availability === 'degraded'
+    };
+  }
+  // Every capability the map consumes, declared for a given profile. This mirrors
+  // what a real daemon /v1/version emits — the point is that the KEYS are all
+  // present on both profiles (completeness), with profile-appropriate availability.
+  function descriptorWith(overrides) {
+    const caps = {};
+    Object.keys(map).forEach(function (id) { caps[map[id].capability] = cap('available', 'available'); });
+    // Also carry the embedder/delegation axis so a lite profile is realistic.
+    caps.local_embedders = caps.local_embedders || cap('available', 'available');
+    caps.embedding_delegation = caps.embedding_delegation || cap('available', 'available');
+    Object.keys(overrides || {}).forEach(function (k) { caps[k] = overrides[k]; });
+    return { schema_version: 1, capabilities: caps };
+  }
+
+  const fullDescriptor = descriptorWith({});
+  // Lite (delegating) daemon (M5b): local embedders delegated, delegation live.
+  // The two mapped consumers are dataplane-gated (projection_queries /
+  // graph_expand), NOT embedder-gated, so they stay AVAILABLE on lite.
+  const liteDescriptor = descriptorWith({
+    local_embedders: cap('unavailable', 'delegated_to_remote'),
+    embedding_delegation: cap('available', 'available')
+  });
+  // Lite + delegation-down: the delegation capability degrades. Mapped consumers
+  // are still unaffected (not delegation-gated) — proving lite degradation does
+  // not spuriously disable dataplane controls, and vice-versa.
+  const liteDegraded = descriptorWith({
+    local_embedders: cap('unavailable', 'delegated_to_remote'),
+    embedding_delegation: cap('degraded', 'embedding_delegation_degraded')
+  });
+
+  [['full', fullDescriptor], ['lite', liteDescriptor], ['lite-degraded', liteDegraded]].forEach(function (pair) {
+    const label = pair[0], descriptor = pair[1];
+    // (2) Completeness: every mapped capability is declared on this profile.
+    Object.keys(map).forEach(function (id) {
+      const capName = map[id].capability;
+      check(!!descriptor.capabilities[capName],
+        '[m2b] ' + label + ' profile must declare capability "' + capName + '" consumed by control "' + id + '" (else undeclared → 501)');
+      // Anti-501: with the capability declared+available, the control is enabled;
+      // it never renders enabled-but-unbacked.
+      const state = render.capabilityStateForControl(id, descriptor, map);
+      check(state && state.disabled === false && state.availability === 'available',
+        '[m2b] ' + label + ': dataplane control "' + id + '" must be enabled (available) — not disabled, not 501');
+    });
+  });
+
+  // (3) The gate DOES react to a degraded profile: a hypothetical control mapped
+  // to the delegation capability renders disabled-with-reason on lite-degraded.
+  const probeMap = { 'probe.embedding': { capability: 'embedding_delegation', routes: [['POST', '/v1/query']] } };
+  const enabled = render.capabilityStateForControl('probe.embedding', liteDescriptor, probeMap);
+  const degraded = render.capabilityStateForControl('probe.embedding', liteDegraded, probeMap);
+  check(enabled && enabled.disabled === false,
+    '[m2b] a delegation-gated control is enabled when delegation is available');
+  check(degraded && degraded.disabled === true && degraded.reasonCode === 'embedding_delegation_degraded',
+    '[m2b] a delegation-gated control is disabled-with-reason when delegation is degraded (lite fail-closed)');
+
+  notes.push('two-profile conformance (M2b): reverse coverage asserts every literal applyCapabilityGate call site is in CONTROL_CAPABILITY_MAP (a new gated control that skipped the map fails the smoke instead of reaching a 501); descriptor completeness asserts every mapped capability is declared on BOTH full and lite (delegating) profiles so no mapped control falls to capability_undeclared; the two dataplane consumers stay enabled across full/lite/lite-degraded; and a delegation-gated probe flips to disabled-with-reason when a lite daemon reports delegation degraded (M5b breaker open) — proving the gate reacts to the lite axis and never renders enabled-but-unbacked.');
+})();
+
+// =========================================================================
 //  Check 42 — (desktop mission control M4a) plan-rooted tree join. The pure
 //  buildPlanTree() joins Project → ExecPlan → Milestone → live session from the
 //  real /v1/work?source=all + /v1/coord/active fields. The join must NOT

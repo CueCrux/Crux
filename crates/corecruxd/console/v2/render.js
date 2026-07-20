@@ -28,6 +28,7 @@
   var RUNTIME_CAPABILITY_PRESENTATION = Object.freeze([
     Object.freeze(['append', 'Dataplane append']),
     Object.freeze(['local_embedders', 'Local embedders']),
+    Object.freeze(['embedding_delegation', 'Embedding delegation']),
     Object.freeze(['rerank_gpu', 'GPU rerank']),
     Object.freeze(['hosted_sync', 'Hosted sync']),
     Object.freeze(['projection_queries', 'Projection queries']),
