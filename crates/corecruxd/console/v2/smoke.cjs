@@ -417,6 +417,8 @@ function extractThemeVars(theme) {
     ['POST', '/v1/work/gate/{actionId}/reject'],
     ['POST', '/v1/work/{id}/comments'],
     ['POST', '/v1/actions/enrich'],
+    ['POST', '/v1/passport/mint-requests/{request_id}/approve'],
+    ['POST', '/v1/passport/mint-requests/{request_id}/reject'],
     // M13b live-wired write controls (each behind the WIRED_WRITES harness):
     ['POST', '/v1/projects'],
     ['POST', '/v1/passports'],

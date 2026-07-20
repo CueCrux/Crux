@@ -10,7 +10,7 @@
 // Customer-safe posture: CruxApi (below) exposes only GET (read) routes; its
 // generic get(path) is allowlist-guarded to literal manifest GET paths. The ONLY
 // writes this console can perform live in the separate CruxApiGated object at the
-// bottom — exactly 22 curated, operator-posture-gated mutation(s), no more.
+// bottom — exactly 24 curated, operator-posture-gated mutation(s), no more.
 //
 // Every call is same-origin credentialed; the browser never holds a bearer
 // token (the daemon authenticates the session at its own origin).
@@ -668,6 +668,8 @@ const GATED_MUTATIONS = Object.freeze([
   Object.freeze(['POST', '/v1/work/gate/{actionId}/reject']),
   Object.freeze(['POST', '/v1/work/{id}/comments']),
   Object.freeze(['POST', '/v1/actions/enrich']),
+  Object.freeze(['POST', '/v1/passport/mint-requests/{request_id}/approve']),
+  Object.freeze(['POST', '/v1/passport/mint-requests/{request_id}/reject']),
   Object.freeze(['POST', '/v1/projects']),
   Object.freeze(['POST', '/v1/passports']),
   Object.freeze(['POST', '/v1/console/review/consolidations']),
@@ -700,6 +702,12 @@ const CruxApiGated = Object.freeze({
   },
   actionsEnrich(body) {
     return fetch(`/v1/actions/enrich`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  passportMintRequestApprove(request_id, body) {
+    return fetch(`/v1/passport/mint-requests/${encodeURIComponent(request_id)}/approve`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  passportMintRequestReject(request_id, body) {
+    return fetch(`/v1/passport/mint-requests/${encodeURIComponent(request_id)}/reject`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
   },
   createProject(body) {
     return fetch(`/v1/projects`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });

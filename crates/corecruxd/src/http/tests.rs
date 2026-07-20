@@ -638,6 +638,7 @@ pub(crate) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         cloud_witness_replay_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         mcp_enabled: true,
         console_enabled: true,
+        passport_mint_requests_enabled: false,
         coord_enabled: true,
         coord_presence_ttl_secs: crate::coord::DEFAULT_PRESENCE_TTL_SECS,
         consolidation_scheduler_enabled: false,
@@ -10598,6 +10599,290 @@ async fn passport_mint_requests_pending_lists_filed_request_without_minting() {
 }
 
 #[tokio::test]
+async fn passport_mint_request_approve_http_mints_and_attributes_operator() -> Result<(), Box<dyn std::error::Error>> {
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    state.passport_mint_requests_enabled = true;
+    let request_id = {
+        let mut store = state.fact_store.write().await;
+        crate::mint_requests::file_mint_request(
+            &mut store,
+            "codex-work".to_string(),
+            "codex-work".to_string(),
+            Some("personal".to_string()),
+            None,
+            100,
+        )?
+        .request_id
+    };
+
+    let resp = super::passports::post_mint_request_approve(
+        State(state.clone()),
+        Path(request_id.clone()),
+        dev_scope_headers("admin:write"),
+        Json(super::passports::ResolveMintRequestBody {
+            approver_passport: "operator-work".to_string(),
+            category: Some("work".to_string()),
+            name: Some("Codex work agent".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["request_id"], request_id);
+    assert_eq!(body["requester_id"], "codex-work");
+    assert_eq!(body["category"], "work");
+    assert_eq!(body["minted"], true);
+    assert_eq!(body["status"], "approved");
+
+    let store = state.fact_store.read().await;
+    let passport = crate::passports::get_passport(&store, "codex-work")
+        .ok_or_else(|| std::io::Error::other("minted passport missing"))?;
+    assert_eq!(passport.category, "work");
+    assert_eq!(passport.name.as_deref(), Some("Codex work agent"));
+    let resolved = crate::mint_requests::get_mint_request(&store, &request_id)
+        .ok_or_else(|| std::io::Error::other("resolved request missing"))?;
+    assert_eq!(resolved.status, crate::mint_requests::MINT_REQUEST_STATUS_APPROVED);
+    assert_eq!(resolved.resolved_by_passport.as_deref(), Some("operator-work"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn passport_mint_request_resolution_requires_admin_write_without_mutation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    state.passport_mint_requests_enabled = true;
+    let request_id = {
+        let mut store = state.fact_store.write().await;
+        crate::mint_requests::file_mint_request(
+            &mut store,
+            "codex-work".to_string(),
+            "codex-work".to_string(),
+            Some("work".to_string()),
+            None,
+            100,
+        )?
+        .request_id
+    };
+
+    let resp = super::passports::post_mint_request_approve(
+        State(state.clone()),
+        Path(request_id.clone()),
+        dev_scope_headers("admin:read"),
+        Json(super::passports::ResolveMintRequestBody {
+            approver_passport: "operator-work".to_string(),
+            category: Some("work".to_string()),
+            name: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let reject = super::passports::post_mint_request_reject(
+        State(state.clone()),
+        Path(request_id.clone()),
+        dev_scope_headers("admin:read"),
+        Json(super::passports::ResolveMintRequestBody {
+            approver_passport: "operator-work".to_string(),
+            category: None,
+            name: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(reject.status(), StatusCode::FORBIDDEN);
+
+    let store = state.fact_store.read().await;
+    assert!(crate::passports::get_passport(&store, "codex-work").is_none());
+    let request = crate::mint_requests::get_mint_request(&store, &request_id)
+        .ok_or_else(|| std::io::Error::other("pending request missing"))?;
+    assert_eq!(request.status, crate::mint_requests::MINT_REQUEST_STATUS_PENDING);
+    Ok(())
+}
+
+#[tokio::test]
+async fn passport_mint_request_flag_off_approve_and_reject_are_noops() -> Result<(), Box<dyn std::error::Error>> {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let request_id = {
+        let mut store = state.fact_store.write().await;
+        crate::mint_requests::file_mint_request(
+            &mut store,
+            "codex-work".to_string(),
+            "codex-work".to_string(),
+            Some("work".to_string()),
+            None,
+            100,
+        )?
+        .request_id
+    };
+    let body = || super::passports::ResolveMintRequestBody {
+        approver_passport: "operator-work".to_string(),
+        category: Some("work".to_string()),
+        name: None,
+    };
+
+    let approve = super::passports::post_mint_request_approve(
+        State(state.clone()),
+        Path(request_id.clone()),
+        dev_scope_headers("admin:write"),
+        Json(body()),
+    )
+    .await
+    .into_response();
+    assert_eq!(approve.status(), StatusCode::NOT_FOUND);
+
+    let reject = super::passports::post_mint_request_reject(
+        State(state.clone()),
+        Path(request_id.clone()),
+        dev_scope_headers("admin:write"),
+        Json(body()),
+    )
+    .await
+    .into_response();
+    assert_eq!(reject.status(), StatusCode::NOT_FOUND);
+
+    let store = state.fact_store.read().await;
+    assert!(crate::passports::get_passport(&store, "codex-work").is_none());
+    let request = crate::mint_requests::get_mint_request(&store, &request_id)
+        .ok_or_else(|| std::io::Error::other("pending request missing"))?;
+    assert_eq!(request.status, crate::mint_requests::MINT_REQUEST_STATUS_PENDING);
+    assert_eq!(request.resolved_at_unix_ms, None);
+    assert_eq!(request.resolved_by_passport, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn passport_mint_request_reject_http_mints_nothing_and_attributes_operator(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    state.passport_mint_requests_enabled = true;
+    let request_id = {
+        let mut store = state.fact_store.write().await;
+        crate::mint_requests::file_mint_request(
+            &mut store,
+            "rejected-agent".to_string(),
+            "rejected-agent".to_string(),
+            Some("work".to_string()),
+            None,
+            100,
+        )?
+        .request_id
+    };
+
+    let resp = super::passports::post_mint_request_reject(
+        State(state.clone()),
+        Path(request_id.clone()),
+        dev_scope_headers("admin:write"),
+        Json(super::passports::ResolveMintRequestBody {
+            approver_passport: "rejecting-operator".to_string(),
+            category: Some("public".to_string()),
+            name: Some("must be ignored".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["request_id"], request_id);
+    assert_eq!(body["requester_id"], "rejected-agent");
+    assert_eq!(body["minted"], false);
+    assert_eq!(body["status"], "rejected");
+
+    let store = state.fact_store.read().await;
+    assert!(crate::passports::get_passport(&store, "rejected-agent").is_none());
+    let request = crate::mint_requests::get_mint_request(&store, &request_id)
+        .ok_or_else(|| std::io::Error::other("rejected request missing"))?;
+    assert_eq!(request.status, crate::mint_requests::MINT_REQUEST_STATUS_REJECTED);
+    assert_eq!(request.resolved_by_passport.as_deref(), Some("rejecting-operator"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn passport_mint_request_approve_http_maps_category_and_terminal_errors_without_minting(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    state.passport_mint_requests_enabled = true;
+    let (missing_category_id, invalid_category_id, resolved_id) = {
+        let mut store = state.fact_store.write().await;
+        let missing = crate::mint_requests::file_mint_request(
+            &mut store,
+            "missing-category-agent".to_string(),
+            "missing-category-agent".to_string(),
+            None,
+            None,
+            100,
+        )?;
+        let invalid = crate::mint_requests::file_mint_request(
+            &mut store,
+            "invalid-category-agent".to_string(),
+            "invalid-category-agent".to_string(),
+            Some("work".to_string()),
+            None,
+            100,
+        )?;
+        let resolved = crate::mint_requests::file_mint_request(
+            &mut store,
+            "resolved-agent".to_string(),
+            "resolved-agent".to_string(),
+            Some("work".to_string()),
+            None,
+            100,
+        )?;
+        crate::mint_requests::reject_mint_request(&mut store, &resolved.request_id, "first-operator".to_string(), 200)?;
+        (missing.request_id, invalid.request_id, resolved.request_id)
+    };
+
+    let call = |request_id: String, category: Option<String>| {
+        super::passports::post_mint_request_approve(
+            State(state.clone()),
+            Path(request_id),
+            dev_scope_headers("admin:write"),
+            Json(super::passports::ResolveMintRequestBody {
+                approver_passport: "operator-work".to_string(),
+                category,
+                name: None,
+            }),
+        )
+    };
+
+    let missing = call(missing_category_id.clone(), None).await.into_response();
+    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+    let invalid = call(invalid_category_id.clone(), Some("private".to_string()))
+        .await
+        .into_response();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    let non_pending = call(resolved_id.clone(), Some("public".to_string()))
+        .await
+        .into_response();
+    assert_eq!(non_pending.status(), StatusCode::CONFLICT);
+
+    let store = state.fact_store.read().await;
+    for requester in ["missing-category-agent", "invalid-category-agent", "resolved-agent"] {
+        assert!(
+            crate::passports::get_passport(&store, requester).is_none(),
+            "{requester}"
+        );
+    }
+    let missing_category = crate::mint_requests::get_mint_request(&store, &missing_category_id)
+        .ok_or_else(|| std::io::Error::other("missing-category request missing"))?;
+    assert_eq!(
+        missing_category.status,
+        crate::mint_requests::MINT_REQUEST_STATUS_PENDING
+    );
+    let invalid_category = crate::mint_requests::get_mint_request(&store, &invalid_category_id)
+        .ok_or_else(|| std::io::Error::other("invalid-category request missing"))?;
+    assert_eq!(
+        invalid_category.status,
+        crate::mint_requests::MINT_REQUEST_STATUS_PENDING
+    );
+    let terminal = crate::mint_requests::get_mint_request(&store, &resolved_id)
+        .ok_or_else(|| std::io::Error::other("terminal request missing"))?;
+    assert_eq!(terminal.status, crate::mint_requests::MINT_REQUEST_STATUS_REJECTED);
+    Ok(())
+}
+
+#[tokio::test]
 async fn passports_filter_by_category_returns_only_matching() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     {
@@ -10639,7 +10924,7 @@ async fn passports_post_round_trip_to_get() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     let post_resp = super::passports::post_passport(
         State(state.clone()),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
         Json(super::passports::CreatePassportBody {
             id: "alice".to_string(),
             category: "personal".to_string(),
@@ -10683,12 +10968,12 @@ async fn passports_post_duplicate_id_returns_409() {
         company: None,
         notes: None,
     };
-    let first = super::passports::post_passport(State(state.clone()), dev_scope_headers("admin:read"), Json(mk()))
+    let first = super::passports::post_passport(State(state.clone()), dev_scope_headers("admin:write"), Json(mk()))
         .await
         .into_response();
     assert_eq!(first.status(), StatusCode::CREATED);
 
-    let second = super::passports::post_passport(State(state), dev_scope_headers("admin:read"), Json(mk()))
+    let second = super::passports::post_passport(State(state), dev_scope_headers("admin:write"), Json(mk()))
         .await
         .into_response();
     assert_eq!(second.status(), StatusCode::CONFLICT);
@@ -10699,7 +10984,7 @@ async fn passports_patch_updates_gate_and_default_flag() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     let _ = super::passports::post_passport(
         State(state.clone()),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
         Json(super::passports::CreatePassportBody {
             id: "alice".to_string(),
             category: "personal".to_string(),
@@ -10720,6 +11005,7 @@ async fn passports_patch_updates_gate_and_default_flag() {
         Path("alice".to_string()),
         dev_scope_headers("admin:read"),
         Json(super::passports::UpdatePassportBody {
+            category: Some("work".to_string()),
             agent_work_gate: Some(true),
             is_default_for_category: Some(true),
             sponsor_id: None,
@@ -10736,6 +11022,7 @@ async fn passports_patch_updates_gate_and_default_flag() {
     .into_response();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = json_body(resp).await;
+    assert_eq!(body["category"], "work");
     assert_eq!(body["agent_work_gate"], true);
     assert_eq!(body["is_default_for_category"], true);
 }
@@ -10745,7 +11032,7 @@ async fn passports_delete_removes_record() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     let _ = super::passports::post_passport(
         State(state.clone()),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
         Json(super::passports::CreatePassportBody {
             id: "alice".to_string(),
             category: "personal".to_string(),
@@ -11707,6 +11994,7 @@ async fn work_patch_with_gated_passport_returns_202_queued() {
             &mut store,
             "personal-default",
             crate::passports::UpdatePassportInput {
+                category: None,
                 agent_work_gate: Some(true),
                 is_default_for_category: None,
                 sponsor_id: None,
@@ -11837,6 +12125,7 @@ async fn work_comments_get_item_and_gate_resolution_paths() {
             &mut store,
             "personal-default",
             crate::passports::UpdatePassportInput {
+                category: None,
                 agent_work_gate: Some(true),
                 is_default_for_category: None,
                 sponsor_id: None,

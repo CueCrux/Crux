@@ -80,6 +80,16 @@ const GATED_MUTATIONS: &[(&str, &str, &str)] = &[
     ("POST", "/v1/work/gate/{actionId}/reject", "gateReject"),
     ("POST", "/v1/work/{id}/comments", "workComment"),
     ("POST", "/v1/actions/enrich", "actionsEnrich"),
+    (
+        "POST",
+        "/v1/passport/mint-requests/{request_id}/approve",
+        "passportMintRequestApprove",
+    ),
+    (
+        "POST",
+        "/v1/passport/mint-requests/{request_id}/reject",
+        "passportMintRequestReject",
+    ),
     // ── M13b: live-wired write controls (each behind the WIRED_WRITES harness) ──
     ("POST", "/v1/projects", "createProject"),
     ("POST", "/v1/passports", "createPassport"),

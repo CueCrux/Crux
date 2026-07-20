@@ -216,6 +216,7 @@ pub fn create_passport(
 }
 
 pub struct UpdatePassportInput {
+    pub category: Option<String>,
     pub agent_work_gate: Option<bool>,
     pub is_default_for_category: Option<bool>,
     pub sponsor_id: Option<Option<String>>, // outer Some = "user supplied"; inner None clears.
@@ -236,14 +237,23 @@ pub fn update_passport(
     input: UpdatePassportInput,
 ) -> Result<PassportRecord, PassportsError> {
     let mut record = get_passport(store, id).ok_or_else(|| PassportsError::NotFound(id.to_string()))?;
+    let category_changed = if let Some(category) = input.category.as_deref() {
+        validate_category(category)?;
+        record.category != category
+    } else {
+        false
+    };
+    if let Some(category) = input.category {
+        record.category = category;
+    }
     if let Some(g) = input.agent_work_gate {
         record.agent_work_gate = g;
     }
     if let Some(d) = input.is_default_for_category {
-        if d {
-            clear_default_for_category(store, &record.category, &record.id);
-        }
         record.is_default_for_category = d;
+    }
+    if record.is_default_for_category && (category_changed || input.is_default_for_category == Some(true)) {
+        clear_default_for_category(store, &record.category, &record.id);
     }
     if let Some(s) = input.sponsor_id {
         record.sponsor_id = s;
@@ -521,6 +531,7 @@ mod tests {
             &mut store,
             "personal-b",
             UpdatePassportInput {
+                category: None,
                 agent_work_gate: None,
                 is_default_for_category: Some(true),
                 sponsor_id: None,
@@ -540,6 +551,78 @@ mod tests {
         let b = listed.iter().find(|p| p.id == "personal-b").expect("b");
         assert!(!a.is_default_for_category);
         assert!(b.is_default_for_category);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_category_validates_and_preserves_default_uniqueness() {
+        let dir = temp_dir("update-category");
+        let mut store = FactStore::new();
+        let create_default = |id: &str, category: &str| CreatePassportInput {
+            id: id.to_string(),
+            category: category.to_string(),
+            sponsor_id: None,
+            agent_work_gate: false,
+            is_default_for_category: true,
+            name: None,
+            owner: None,
+            position: None,
+            company: None,
+            notes: None,
+        };
+        create_passport(&dir, &mut store, create_default("personal-a", "personal"), 1).expect("personal");
+        create_passport(&dir, &mut store, create_default("work-a", "work"), 2).expect("work");
+
+        let updated = update_passport(
+            &mut store,
+            "personal-a",
+            UpdatePassportInput {
+                category: Some("work".to_string()),
+                agent_work_gate: None,
+                is_default_for_category: None,
+                sponsor_id: None,
+                reputation_tier: None,
+                receipt_count: None,
+                name: None,
+                owner: None,
+                position: None,
+                company: None,
+                notes: None,
+            },
+        )
+        .expect("update category");
+
+        assert_eq!(updated.category, "work");
+        assert!(updated.is_default_for_category);
+        assert!(
+            !get_passport(&store, "work-a")
+                .expect("work passport")
+                .is_default_for_category
+        );
+
+        let error = update_passport(
+            &mut store,
+            "personal-a",
+            UpdatePassportInput {
+                category: Some("private".to_string()),
+                agent_work_gate: None,
+                is_default_for_category: None,
+                sponsor_id: None,
+                reputation_tier: None,
+                receipt_count: None,
+                name: None,
+                owner: None,
+                position: None,
+                company: None,
+                notes: None,
+            },
+        )
+        .expect_err("invalid category");
+        assert!(matches!(error, PassportsError::InvalidCategory(category) if category == "private"));
+        assert_eq!(
+            get_passport(&store, "personal-a").expect("unchanged passport").category,
+            "work"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -220,6 +220,10 @@ pub struct AppState {
     pub cloud_witness_replay_cache: Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>>,
     pub mcp_enabled: bool,
     pub console_enabled: bool,
+    /// Agent-requested passport mint approval surface. Default OFF
+    /// (`CORECRUXD_FEATURE_PASSPORT_MINT_REQUESTS`); approve/reject handlers
+    /// return 404 without touching state while disabled.
+    pub passport_mint_requests_enabled: bool,
     /// Multi-agent coordination plane (`/v1/coord/*`). Default ON; explicit
     /// `CORECRUXD_COORD=0` disables it and makes coord routes return 404.
     pub coord_enabled: bool,
@@ -1169,6 +1173,14 @@ pub(crate) fn router_with_route_auth(
         .route(
             "/v1/passport/mint-requests/pending",
             get(self::passports::get_pending_mint_requests),
+        )
+        .route(
+            "/v1/passport/mint-requests/{request_id}/approve",
+            axum::routing::post(self::passports::post_mint_request_approve),
+        )
+        .route(
+            "/v1/passport/mint-requests/{request_id}/reject",
+            axum::routing::post(self::passports::post_mint_request_reject),
         )
         .route("/v1/passports/presence", get(self::passports::get_presence))
         .route("/v1/passports", get(self::passports::get_passports))

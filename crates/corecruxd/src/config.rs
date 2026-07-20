@@ -387,9 +387,9 @@ pub struct Config {
     // `actor`. Default OFF — attribution only, no enforcement (M5).
     pub agent_passports_enabled: bool,
 
-    // Passport mint requests M1: expose the agent-facing request tool without
-    // enabling any passport minting. Default OFF; operator approval and mint
-    // wiring are deliberately deferred to M2.
+    // Passport mint requests: expose the agent-facing request tool and the
+    // operator approve/reject surface. Default OFF; no request or resolution
+    // path is available unless the operator explicitly enables it.
     pub passport_mint_requests_enabled: bool,
 
     // Phase 8 receipts: bytes-first fetch + signature verification projection.

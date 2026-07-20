@@ -22,6 +22,15 @@ pub(super) struct ListPendingMintRequestsQuery {
 }
 
 #[derive(Debug, serde::Deserialize)]
+pub(super) struct ResolveMintRequestBody {
+    pub approver_passport: String,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
 pub(super) struct CreatePassportBody {
     pub id: String,
     pub category: String,
@@ -45,6 +54,8 @@ pub(super) struct CreatePassportBody {
 
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct UpdatePassportBody {
+    #[serde(default)]
+    pub category: Option<String>,
     #[serde(default)]
     pub agent_work_gate: Option<bool>,
     #[serde(default)]
@@ -76,6 +87,49 @@ where
 {
     use serde::Deserialize;
     Option::<T>::deserialize(deserializer).map(Some)
+}
+
+fn mint_requests_disabled_response() -> axum::response::Response {
+    problem_response(
+        StatusCode::NOT_FOUND,
+        "passport mint requests disabled (set CORECRUXD_FEATURE_PASSPORT_MINT_REQUESTS=1)",
+    )
+}
+
+fn mint_request_error_response(err: crate::mint_requests::MintRequestResolutionError) -> axum::response::Response {
+    use crate::mint_requests::MintRequestResolutionError;
+
+    let status = match &err {
+        MintRequestResolutionError::MissingApprover | MintRequestResolutionError::MissingCategory => {
+            StatusCode::BAD_REQUEST
+        }
+        MintRequestResolutionError::Request(crate::mint_requests::MintRequestError::NotFound(_)) => {
+            StatusCode::NOT_FOUND
+        }
+        MintRequestResolutionError::Request(crate::mint_requests::MintRequestError::NotPending { .. }) => {
+            StatusCode::CONFLICT
+        }
+        MintRequestResolutionError::Request(
+            crate::mint_requests::MintRequestError::Json(_) | crate::mint_requests::MintRequestError::Store(_),
+        ) => StatusCode::INTERNAL_SERVER_ERROR,
+        MintRequestResolutionError::Passport(
+            crate::passports::PassportsError::InvalidId(_) | crate::passports::PassportsError::InvalidCategory(_),
+        ) => StatusCode::BAD_REQUEST,
+        MintRequestResolutionError::Passport(crate::passports::PassportsError::DuplicateId(_)) => StatusCode::CONFLICT,
+        MintRequestResolutionError::Passport(crate::passports::PassportsError::NotFound(_)) => StatusCode::NOT_FOUND,
+        MintRequestResolutionError::Passport(
+            crate::passports::PassportsError::Io(_)
+            | crate::passports::PassportsError::Json(_)
+            | crate::passports::PassportsError::Session(_),
+        ) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    problem_response(status, err.to_string())
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as u64)
 }
 
 pub(super) async fn get_passports(
@@ -135,6 +189,77 @@ pub(super) async fn get_pending_mint_requests(
         .into_response()
 }
 
+pub(super) async fn post_mint_request_approve(
+    State(state): State<AppState>,
+    Path(request_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<ResolveMintRequestBody>,
+) -> impl IntoResponse {
+    // Load-bearing: feature-off requests return before auth, locking, or any
+    // passport/request mutation.
+    if !state.passport_mint_requests_enabled {
+        return mint_requests_disabled_response();
+    }
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
+        return problem.into_response();
+    }
+
+    // One exclusive guard spans pending preflight, passport mint/update, and
+    // terminal transition. Approve and reject therefore cannot race between
+    // their status check and mutation.
+    let mut store = state.fact_store.write().await;
+    let result = crate::mint_requests::approve_mint_request(
+        &state.data_dir,
+        &mut store,
+        &request_id,
+        body.approver_passport,
+        body.category,
+        body.name,
+        now_unix_ms(),
+    );
+    drop(store);
+
+    match result {
+        Ok(approved) => (StatusCode::OK, Json(approved)).into_response(),
+        Err(err) => mint_request_error_response(err),
+    }
+}
+
+pub(super) async fn post_mint_request_reject(
+    State(state): State<AppState>,
+    Path(request_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<ResolveMintRequestBody>,
+) -> impl IntoResponse {
+    // Keep the same pre-lock no-op gate as approval. Category/name overrides
+    // are intentionally ignored because rejection must never touch a passport.
+    if !state.passport_mint_requests_enabled {
+        return mint_requests_disabled_response();
+    }
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
+        return problem.into_response();
+    }
+
+    let mut store = state.fact_store.write().await;
+    let result =
+        crate::mint_requests::reject_mint_request(&mut store, &request_id, body.approver_passport, now_unix_ms());
+    drop(store);
+
+    match result {
+        Ok(rejected) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "request_id": rejected.request_id,
+                "requester_id": rejected.requester_id,
+                "minted": false,
+                "status": rejected.status,
+            })),
+        )
+            .into_response(),
+        Err(err) => mint_request_error_response(err),
+    }
+}
+
 pub(super) async fn get_passport(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -157,12 +282,10 @@ pub(super) async fn post_passport(
     headers: HeaderMap,
     Json(body): Json<CreatePassportBody>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64);
+    let now_ms = now_unix_ms();
     let mut store = state.fact_store.write().await;
     let result = crate::passports::create_passport(
         &state.data_dir,
@@ -205,6 +328,7 @@ pub(super) async fn patch_passport(
         &mut store,
         &id,
         crate::passports::UpdatePassportInput {
+            category: body.category,
             agent_work_gate: body.agent_work_gate,
             is_default_for_category: body.is_default_for_category,
             sponsor_id: body.sponsor_id,

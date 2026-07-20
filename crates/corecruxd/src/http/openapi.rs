@@ -316,6 +316,8 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/orchestrators/{id}/members/{ref}", methods: &["DELETE"], tag: "Orchestrators", auth: "feature-gated", summary: "Orchestrators {id} members {ref}" },
     RouteEntry { path: "/v1/orchestrators/{id}/work", methods: &["GET"], tag: "Orchestrators", auth: "feature-gated", summary: "Orchestrators {id} work" },
     RouteEntry { path: "/v1/passport/mint-requests/pending", methods: &["GET"], tag: "Passports", auth: "admin-read", summary: "Pending passport mint requests" },
+    RouteEntry { path: "/v1/passport/mint-requests/{request_id}/approve", methods: &["POST"], tag: "Passports", auth: "feature-gated", summary: "Approve passport mint request" },
+    RouteEntry { path: "/v1/passport/mint-requests/{request_id}/reject", methods: &["POST"], tag: "Passports", auth: "feature-gated", summary: "Reject passport mint request" },
     RouteEntry { path: "/v1/passports", methods: &["GET", "POST"], tag: "Passports", auth: "read-write", summary: "Passports" },
     RouteEntry { path: "/v1/passports/presence", methods: &["GET"], tag: "Passports", auth: "read", summary: "Passports presence" },
     RouteEntry { path: "/v1/passports/{passportId}", methods: &["GET", "PATCH", "DELETE"], tag: "Passports", auth: "read-write", summary: "Passports {passportId}" },
