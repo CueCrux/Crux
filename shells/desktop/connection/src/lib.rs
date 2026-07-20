@@ -17,6 +17,9 @@ mod backoff;
 mod credential;
 mod health;
 mod json;
+mod local_file;
+mod local_plan;
+mod navigation;
 mod profile;
 mod proxy;
 mod secret;
@@ -25,6 +28,11 @@ mod transport;
 pub use backoff::Backoff;
 pub use credential::{NativeCredentialBroker, NativeCredentialError};
 pub use health::{probe_health, HealthReport, HealthState, RuntimeCapabilitiesSummary};
+pub use local_file::authorize_local_plan_path;
+pub use local_plan::{compute_local_plan_hashes, local_plan_hashes_initialization_script};
+pub use navigation::{
+    generation_is_current, is_public_http_link, next_generation, origin_is_allowed, OriginKey, OriginPolicy,
+};
 pub use profile::{Profile, ProfileMode, ProfileSet, ProfileStore, PROFILE_SCHEMA_VERSION};
 pub use proxy::{
     render_status_html, ForwardRequest, ProxyControl, ProxyHandle, ProxyServer, StatusPage, Upstream, UpstreamError,

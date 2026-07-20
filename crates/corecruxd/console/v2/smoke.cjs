@@ -2665,7 +2665,13 @@ function extractThemeVars(theme) {
     if (savedDoc === undefined) { delete global.document; } else { global.document = savedDoc; }
   }
 
-  notes.push('plan-hash badge (M4c console half): planHashBadge(daemon_hash, local_hash|null) is pure — no daemon hash → no badge; no local hash → provenance chip (daemon short-form, since the browser cannot read local files); equal → in-sync; differing → mismatch badge (T.2 guard); buildPlanTree wires it onto ExecPlan nodes (daemon hash read defensively so it is forward-compatible before PR #457 ships; local hash from data.localPlanHashes by id then slug) and the row paints the state-classed chip carrying data-hash-state.');
+  // M5a: renderPlanTree must source data.localPlanHashes from the desktop
+  // shell's injected read-only global (window.CRUX_LOCAL_PLAN_HASHES), not from
+  // a fetch — otherwise the injected hashes never reach the badge (dead wiring).
+  check(/localPlanHashes:\s*\(typeof window[^\n]*CRUX_LOCAL_PLAN_HASHES/.test(renderSrc),
+    '[plan-hash] renderPlanTree must wire window.CRUX_LOCAL_PLAN_HASHES into buildPlanTree data.localPlanHashes (M5a shell feed)');
+
+  notes.push('plan-hash badge (M4c console half): planHashBadge(daemon_hash, local_hash|null) is pure — no daemon hash → no badge; no local hash → provenance chip (daemon short-form, since the browser cannot read local files); equal → in-sync; differing → mismatch badge (T.2 guard); buildPlanTree wires it onto ExecPlan nodes (daemon hash read defensively so it is forward-compatible before PR #457 ships; local hash from data.localPlanHashes by id then slug) and the row paints the state-classed chip carrying data-hash-state. M5a: renderPlanTree feeds data.localPlanHashes from window.CRUX_LOCAL_PLAN_HASHES (shell-injected read-only global; undefined for browser-only users → provenance-only).');
 })();
 
 // ---- Report (awaits async renderer-driven checks) -----------------------

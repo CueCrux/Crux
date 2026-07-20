@@ -46,6 +46,7 @@ pub struct Profile {
     pub mode: ProfileMode,
     pub url: String,
     pub token_ref: Option<String>,
+    pub local_plan_root: Option<PathBuf>,
 }
 
 impl Profile {
@@ -55,6 +56,7 @@ impl Profile {
             mode: ProfileMode::Bundled,
             url: String::new(),
             token_ref: None,
+            local_plan_root: None,
         }
     }
 
@@ -68,6 +70,7 @@ impl Profile {
             mode: ProfileMode::Attach,
             url: url.into(),
             token_ref: Some(token_ref.into()),
+            local_plan_root: None,
         };
         profile.normalize_and_validate()?;
         Ok(profile)
@@ -75,6 +78,14 @@ impl Profile {
 
     fn normalize_and_validate(&mut self) -> Result<(), ConnectionError> {
         validate_label(&self.name, "profile name", 128)?;
+        if let Some(root) = &self.local_plan_root {
+            let root = root
+                .to_str()
+                .ok_or_else(|| ConnectionError::new("profile local-plan-root must be valid UTF-8"))?;
+            if root.is_empty() || root.chars().any(char::is_control) {
+                return Err(ConnectionError::new("profile local-plan-root is empty or invalid"));
+            }
+        }
         match self.mode {
             ProfileMode::Bundled => {
                 if self.token_ref.is_some() {
@@ -196,6 +207,16 @@ impl ProfileSet {
             output.push_str(",\"token-ref\":");
             match &profile.token_ref {
                 Some(value) => json::push_string(&mut output, value),
+                None => output.push_str("null"),
+            }
+            output.push_str(",\"local-plan-root\":");
+            match &profile.local_plan_root {
+                Some(value) => {
+                    let value = value
+                        .to_str()
+                        .ok_or_else(|| ConnectionError::new("profile local-plan-root must be valid UTF-8"))?;
+                    json::push_string(&mut output, value);
+                }
                 None => output.push_str("null"),
             }
             output.push('}');
@@ -376,22 +397,45 @@ fn parse_profile(value: &JsonValue) -> Result<Profile, ConnectionError> {
     let object = value
         .as_object()
         .ok_or_else(|| ConnectionError::new("each profile must be a JSON object"))?;
-    require_fields(object, &["name", "mode", "url", "token-ref"])?;
+    require_fields_with_optional(object, &["name", "mode", "url", "token-ref"], &["local-plan-root"])?;
     let token_ref = match object.get("token-ref") {
         Some(JsonValue::Null) => None,
         Some(JsonValue::String(value)) => Some(value.clone()),
         _ => return Err(ConnectionError::new("profile token-ref must be a string or null")),
+    };
+    let local_plan_root = match object.get("local-plan-root") {
+        None | Some(JsonValue::Null) => None,
+        Some(JsonValue::String(value)) => Some(PathBuf::from(value)),
+        _ => return Err(ConnectionError::new("profile local-plan-root must be a string or null")),
     };
     Ok(Profile {
         name: required_string(object, "name")?.to_string(),
         mode: ProfileMode::parse(required_string(object, "mode")?)?,
         url: required_string(object, "url")?.to_string(),
         token_ref,
+        local_plan_root,
     })
 }
 
 fn require_fields(object: &BTreeMap<String, JsonValue>, expected: &[&str]) -> Result<(), ConnectionError> {
     if object.len() != expected.len() || expected.iter().any(|field| !object.contains_key(*field)) {
+        return Err(ConnectionError::new(
+            "profile JSON contains missing or unknown fields; plaintext secret fields are forbidden",
+        ));
+    }
+    Ok(())
+}
+
+fn require_fields_with_optional(
+    object: &BTreeMap<String, JsonValue>,
+    required: &[&str],
+    optional: &[&str],
+) -> Result<(), ConnectionError> {
+    if required.iter().any(|field| !object.contains_key(*field))
+        || object
+            .keys()
+            .any(|field| !required.contains(&field.as_str()) && !optional.contains(&field.as_str()))
+    {
         return Err(ConnectionError::new(
             "profile JSON contains missing or unknown fields; plaintext secret fields are forbidden",
         ));
@@ -452,6 +496,7 @@ mod tests {
         .unwrap();
         let encoded = profiles.to_json().unwrap();
         assert!(encoded.contains("\"token-ref\""));
+        assert!(encoded.contains("\"local-plan-root\":null"));
         assert!(!encoded.contains("\"token_ref\""));
         assert!(!encoded.contains("actual-static-token"));
         assert_eq!(ProfileSet::from_json(&encoded).unwrap(), profiles);
@@ -468,6 +513,28 @@ mod tests {
             .count();
         assert_eq!(leftovers, 0);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn optional_local_plan_root_defaults_none_and_round_trips() {
+        let legacy = r#"{"schema_version":1,"active_profile":"x","profiles":[{"name":"x","mode":"bundled","url":"","token-ref":null}]}"#;
+        let legacy_profiles = ProfileSet::from_json(legacy).unwrap();
+        assert_eq!(legacy_profiles.active_profile().unwrap().local_plan_root, None);
+
+        let mut profile = Profile::bundled("x");
+        profile.local_plan_root = Some(PathBuf::from("/srv/crux/execplans"));
+        let profiles = ProfileSet::new("x", vec![profile]).unwrap();
+        let encoded = profiles.to_json().unwrap();
+        assert!(encoded.contains("\"local-plan-root\":\"/srv/crux/execplans\""));
+        assert_eq!(ProfileSet::from_json(&encoded).unwrap(), profiles);
+    }
+
+    #[test]
+    fn rejects_invalid_local_plan_root_fields() {
+        let wrong_type = r#"{"schema_version":1,"active_profile":"x","profiles":[{"name":"x","mode":"bundled","url":"","token-ref":null,"local-plan-root":[]}]}"#;
+        assert!(ProfileSet::from_json(wrong_type).is_err());
+        let empty = r#"{"schema_version":1,"active_profile":"x","profiles":[{"name":"x","mode":"bundled","url":"","token-ref":null,"local-plan-root":""}]}"#;
+        assert!(ProfileSet::from_json(empty).is_err());
     }
 
     #[test]

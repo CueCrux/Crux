@@ -19,21 +19,24 @@
 mod upstream;
 
 use std::collections::BTreeMap;
-use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 
 use crux_shell_connection::{
-    probe_health, Backoff, HealthReport, HealthState, NativeCredentialBroker, Profile, ProfileMode, ProfileSet,
-    ProfileStore, ProxyControl, ProxyHandle, ProxyServer, RuntimeCapabilitiesSummary, StatusPage, Upstream,
+    authorize_local_plan_path, compute_local_plan_hashes, generation_is_current as generation_matches,
+    is_public_http_link, local_plan_hashes_initialization_script, next_generation, origin_is_allowed, probe_health,
+    Backoff, HealthReport, HealthState, NativeCredentialBroker, OriginKey, OriginPolicy, Profile, ProfileMode,
+    ProfileSet, ProfileStore, ProxyControl, ProxyHandle, ProxyServer, RuntimeCapabilitiesSummary, StatusPage, Upstream,
 };
 use crux_shell_lifecycle::{spawn_sidecar, SidecarConfig, SidecarHandle};
 use tauri::menu::{CheckMenuItem, Menu, MenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::webview::NewWindowResponse;
-use tauri::{App, AppHandle, Manager, RunEvent, Url, WebviewUrl, WebviewWindowBuilder, WindowEvent, Wry};
+use tauri::{
+    App, AppHandle, Manager, RunEvent, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent, Wry,
+};
 
 use upstream::UreqUpstream;
 
@@ -50,6 +53,25 @@ type SharedSidecar = Arc<Mutex<SidecarHandle>>;
 struct StatusRecord {
     state: HealthState,
     reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingOpen {
+    PublicHttp(String),
+    LocalPlan(PathBuf),
+}
+
+struct WindowReplacement {
+    window_label: String,
+    initial_url: Url,
+    origins: Arc<RwLock<OriginPolicy>>,
+    local_plan_script: String,
+}
+
+struct ActivationTransition {
+    old_proxy: Option<ProxyHandle>,
+    old_sidecar: Option<SharedSidecar>,
+    window_replacement: Option<WindowReplacement>,
 }
 
 struct ProfileMenuEntry {
@@ -69,47 +91,6 @@ struct TrayParts {
     tray: TrayIcon<Wry>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct OriginKey {
-    scheme: String,
-    host: String,
-    port: u16,
-}
-
-impl OriginKey {
-    fn parse(value: &str) -> Option<Self> {
-        Url::parse(value).ok().and_then(|url| Self::from_url(&url))
-    }
-
-    fn from_url(url: &Url) -> Option<Self> {
-        if !url.username().is_empty() || url.password().is_some() {
-            return None;
-        }
-        Some(Self {
-            scheme: url.scheme().to_ascii_lowercase(),
-            host: url.host_str()?.to_ascii_lowercase(),
-            port: url.port_or_known_default()?,
-        })
-    }
-
-    fn matches(&self, url: &Url) -> bool {
-        Self::from_url(url).as_ref() == Some(self)
-    }
-}
-
-#[derive(Debug, Default)]
-struct OriginPolicy {
-    active_proxy: Option<OriginKey>,
-    bundled_sidecar: Option<OriginKey>,
-}
-
-impl OriginPolicy {
-    fn allows(&self, url: &Url) -> bool {
-        self.active_proxy.as_ref().is_some_and(|origin| origin.matches(url))
-            || self.bundled_sidecar.as_ref().is_some_and(|origin| origin.matches(url))
-    }
-}
-
 struct RuntimeState {
     profiles: ProfileSet,
     store: ProfileStore,
@@ -119,7 +100,8 @@ struct RuntimeState {
     runtime_capabilities: BTreeMap<String, Option<RuntimeCapabilitiesSummary>>,
     profile_menu: Vec<ProfileMenuEntry>,
     open_external_item: MenuItem<Wry>,
-    pending_external: Option<String>,
+    pending_open: Option<PendingOpen>,
+    window_label: String,
     proxy: Option<ProxyHandle>,
     sidecar: Option<SharedSidecar>,
     origins: Arc<RwLock<OriginPolicy>>,
@@ -171,6 +153,7 @@ fn setup_shell(app: &mut App) -> Result<(), String> {
         }
     };
 
+    let local_plan_script = active_local_plan_initialization_script(&profiles)?;
     let active_name = profiles.active_profile.clone();
     let mut statuses = BTreeMap::new();
     for profile in &profiles.profiles {
@@ -231,7 +214,8 @@ fn setup_shell(app: &mut App) -> Result<(), String> {
         runtime_capabilities: BTreeMap::new(),
         profile_menu,
         open_external_item,
-        pending_external: None,
+        pending_open: None,
+        window_label: MAIN_WINDOW.to_string(),
         proxy: Some(proxy),
         sidecar: None,
         origins: Arc::clone(&origins),
@@ -244,7 +228,15 @@ fn setup_shell(app: &mut App) -> Result<(), String> {
 
     let initial_url = Url::parse(&format!("{initial_origin}/?generation=1"))
         .map_err(|_| "the native connection status URL was invalid".to_string())?;
-    build_main_window(app, initial_url, Arc::clone(&origins))?;
+    build_main_window(
+        app,
+        MAIN_WINDOW,
+        1,
+        initial_url,
+        Arc::clone(&origins),
+        local_plan_script,
+        true,
+    )?;
 
     let profile = {
         let guard = runtime
@@ -261,7 +253,18 @@ fn setup_shell(app: &mut App) -> Result<(), String> {
         .ok()
         .is_some_and(|guard| guard.configuration_error.is_none())
     {
-        launch_activation(app.handle().clone(), runtime, 1, profile, control, None, None);
+        launch_activation(
+            app.handle().clone(),
+            runtime,
+            1,
+            profile,
+            control,
+            ActivationTransition {
+                old_proxy: None,
+                old_sidecar: None,
+                window_replacement: None,
+            },
+        );
     }
     Ok(())
 }
@@ -279,46 +282,127 @@ fn load_or_create_profiles(store: &ProfileStore) -> Result<ProfileSet, String> {
     }
 }
 
-fn build_main_window(app: &App, initial_url: Url, origins: Arc<RwLock<OriginPolicy>>) -> Result<(), String> {
+fn active_local_plan_initialization_script(profiles: &ProfileSet) -> Result<String, String> {
+    let profile = profiles.active_profile().map_err(|error| error.reason().to_string())?;
+    let hashes = local_plan_hashes_for_profile(profile)?;
+    Ok(local_plan_hashes_initialization_script(hashes.as_ref()))
+}
+
+fn local_plan_hashes_for_profile(profile: &Profile) -> Result<Option<BTreeMap<String, String>>, String> {
+    profile
+        .local_plan_root
+        .as_deref()
+        .map(compute_local_plan_hashes)
+        .transpose()
+        .map_err(|_| "could not read the profile's local ExecPlan root".to_string())
+}
+
+fn build_main_window<M: Manager<Wry>>(
+    app: &M,
+    window_label: &str,
+    window_generation: u64,
+    initial_url: Url,
+    origins: Arc<RwLock<OriginPolicy>>,
+    local_plan_script: String,
+    visible: bool,
+) -> Result<WebviewWindow<Wry>, String> {
     let navigation_origins = Arc::clone(&origins);
     let new_window_origins = origins;
-    let navigation_app = app.handle().clone();
-    let new_window_app = app.handle().clone();
-    WebviewWindowBuilder::new(app, MAIN_WINDOW, WebviewUrl::External(initial_url))
+    let navigation_app = app.app_handle().clone();
+    let new_window_app = app.app_handle().clone();
+    let navigation_window_label = window_label.to_string();
+    let new_window_label = navigation_window_label.clone();
+    WebviewWindowBuilder::new(app, window_label, WebviewUrl::External(initial_url))
         .title("Crux")
         // Rule 0: the console uses an in-memory browser profile so a reused
         // loopback port cannot recover storage from an earlier app session.
         .incognito(true)
+        .visible(visible)
         .inner_size(1280.0, 860.0)
         .min_inner_size(900.0, 600.0)
+        .initialization_script(local_plan_script)
         // Rule 1: in-webview navigation is limited to the current proxy and,
         // while bundled mode is live, that one shell-owned sidecar origin.
-        // A public HTTP(S) target only queues a native tray approval; remote
-        // content cannot directly launch a browser-handler process.
+        // An allowlisted local plan and a public HTTP(S) target can only queue
+        // a native tray approval; page script never launches a handler.
         .on_navigation(move |url| {
-            if origin_is_allowed(&navigation_origins, url) {
+            if handle_local_plan_navigation(
+                &navigation_app,
+                &navigation_window_label,
+                window_generation,
+                url,
+            ) {
+                false
+            } else if shared_origin_is_allowed(&navigation_origins, url) {
                 true
             } else {
-                if is_public_http_link(url) {
-                    queue_external_link(&navigation_app, url);
+                if is_public_http_link(url.as_str()) {
+                    queue_external_link(&navigation_app, window_generation, url);
                 }
                 false
             }
         })
-        // Rule 2: a new webview is never created; a public HTTP(S) target may
-        // only enter the same one-item approval queue. Loopback and all other
-        // schemes are denied.
+        // Rule 2: a requested new webview is never created; allowlisted local
+        // plans and public HTTP(S) targets enter the same one-item approval
+        // queue. Loopback and all other schemes are denied.
         .on_new_window(move |url, _features| {
-            if !origin_is_allowed(&new_window_origins, &url) && is_public_http_link(&url) {
-                queue_external_link(&new_window_app, &url);
+            if !handle_local_plan_navigation(&new_window_app, &new_window_label, window_generation, &url)
+                && !shared_origin_is_allowed(&new_window_origins, &url)
+                && is_public_http_link(url.as_str())
+            {
+                queue_external_link(&new_window_app, window_generation, &url);
             }
             NewWindowResponse::Deny
         })
         // Rule 3: downloads are denied regardless of daemon response headers.
         .on_download(|_webview, _event| false)
         .build()
-        .map(|_| ())
         .map_err(|_| "could not build the Crux console window".to_string())
+}
+
+fn replace_main_window(
+    app: &AppHandle,
+    runtime: &Arc<Mutex<RuntimeState>>,
+    generation: u64,
+    replacement: WindowReplacement,
+) -> Result<(), String> {
+    let new_label = replacement.window_label;
+    let new_window = build_main_window(
+        app,
+        &new_label,
+        generation,
+        replacement.initial_url,
+        replacement.origins,
+        replacement.local_plan_script,
+        false,
+    )?;
+    if !runtime_generation_is_current(runtime, generation) {
+        let _ = new_window.destroy();
+        return Ok(());
+    }
+    if new_window.show().is_err() {
+        let _ = new_window.destroy();
+        return Err("could not show the replacement Crux console window".to_string());
+    }
+    let old_label = match runtime.lock() {
+        Ok(mut guard) if generation_matches(guard.generation, generation) => {
+            std::mem::replace(&mut guard.window_label, new_label)
+        }
+        Ok(_) => {
+            let _ = new_window.destroy();
+            return Ok(());
+        }
+        Err(_) => {
+            let _ = new_window.destroy();
+            return Err("the native connection state is unavailable".to_string());
+        }
+    };
+    if let Some(old_window) = app.get_webview_window(&old_label) {
+        if old_window.destroy().is_err() {
+            let _ = old_window.hide();
+        }
+    }
+    Ok(())
 }
 
 fn build_tray(
@@ -353,7 +437,7 @@ fn build_tray(
     let open_external = MenuItem::with_id(
         app,
         OPEN_EXTERNAL_MENU_ID,
-        "Open external link — none pending",
+        "Open approved target — none pending",
         false,
         None::<&str>,
     )
@@ -402,14 +486,29 @@ fn handle_tray_event(app: &AppHandle, id: &str) {
     let runtime = Arc::clone(&managed.0);
     if id == OPEN_EXTERNAL_MENU_ID {
         let selected = runtime.lock().ok().map(|mut guard| {
-            let pending = guard.pending_external.take();
-            (pending, guard.open_external_item.clone())
+            let pending = guard.pending_open.take();
+            let local_root = guard
+                .profiles
+                .active_profile()
+                .ok()
+                .and_then(|profile| profile.local_plan_root.clone());
+            (pending, local_root, guard.open_external_item.clone())
         });
-        if let Some((pending, item)) = selected {
-            let _ = item.set_text("Open external link — none pending");
+        if let Some((pending, local_root, item)) = selected {
+            let _ = item.set_text("Open approved target — none pending");
             let _ = item.set_enabled(false);
-            if let Some(target) = pending.and_then(|value| Url::parse(&value).ok()) {
-                open_in_system_browser(&target);
+            match pending {
+                Some(PendingOpen::PublicHttp(value)) => {
+                    if let Ok(target) = Url::parse(&value) {
+                        open_in_system_browser(&target);
+                    }
+                }
+                Some(PendingOpen::LocalPlan(path)) => {
+                    if let Some(authorized) = local_root.and_then(|root| authorize_local_plan_path(root, path).ok()) {
+                        open_local_plan_in_system_handler(&authorized);
+                    }
+                }
+                None => {}
             }
         }
         return;
@@ -463,7 +562,7 @@ fn request_switch(app: &AppHandle, runtime: Arc<Mutex<RuntimeState>>, target: &s
         // Reserve the next generation before clearing browser state. Any
         // already-running worker or queued UI callback becomes stale before
         // it could repopulate host-scoped cookies during the switch.
-        guard.generation = guard.generation.saturating_add(1);
+        guard.generation = next_generation(guard.generation);
         // Quiesce the previous credential boundary in the same app-state
         // critical section as the generation change. New browser requests can
         // never observe a reserved switch with forwarding still enabled.
@@ -479,7 +578,7 @@ fn request_switch(app: &AppHandle, runtime: Arc<Mutex<RuntimeState>>, target: &s
                 control.stop();
             }
         }
-        guard.pending_external = None;
+        guard.pending_open = None;
         (
             guard.generation,
             profiles,
@@ -490,7 +589,19 @@ fn request_switch(app: &AppHandle, runtime: Arc<Mutex<RuntimeState>>, target: &s
     };
 
     let (snapshot_generation, mut profiles, store, profile, external_item) = snapshot;
-    let _ = external_item.set_text("Open external link — none pending");
+    let local_plan_script = match local_plan_hashes_for_profile(&profile) {
+        Ok(hashes) => local_plan_hashes_initialization_script(hashes.as_ref()),
+        Err(reason) => {
+            show_current_error(
+                app,
+                &runtime,
+                "Local ExecPlan root is unavailable",
+                &format!("{reason}. Correct the selected profile and retry."),
+            );
+            return;
+        }
+    };
+    let _ = external_item.set_text("Open approved target — none pending");
     let _ = external_item.set_enabled(false);
     if profiles.set_active(target).is_err() {
         show_current_error(
@@ -501,7 +612,7 @@ fn request_switch(app: &AppHandle, runtime: Arc<Mutex<RuntimeState>>, target: &s
         );
         return;
     }
-    if clear_profile_storage(app).is_err() {
+    if clear_profile_storage(app, &runtime, snapshot_generation).is_err() {
         show_current_error(
             app,
             &runtime,
@@ -554,7 +665,7 @@ fn request_switch(app: &AppHandle, runtime: Arc<Mutex<RuntimeState>>, target: &s
         let Ok(mut guard) = runtime.lock() else {
             return;
         };
-        if guard.generation != snapshot_generation {
+        if !generation_matches(guard.generation, snapshot_generation) {
             Ok(None)
         } else {
             let origins = Arc::clone(&guard.origins);
@@ -596,11 +707,17 @@ fn request_switch(app: &AppHandle, runtime: Arc<Mutex<RuntimeState>>, target: &s
                 // A concurrent quit can therefore always find and stop it.
                 let old_sidecar = guard.sidecar.clone();
                 let tray_updates = tray_updates(&guard);
-                Ok(Some((guard.generation, old_proxy, old_sidecar, tray_updates)))
+                Ok(Some((
+                    guard.generation,
+                    old_proxy,
+                    old_sidecar,
+                    tray_updates,
+                    Arc::clone(&guard.origins),
+                )))
             }
         }
     };
-    let (generation, old_proxy, old_sidecar, tray_updates) = match installed {
+    let (generation, old_proxy, old_sidecar, tray_updates, origins) = match installed {
         Ok(Some(installed)) => installed,
         Ok(None) => return,
         Err(()) => {
@@ -614,20 +731,26 @@ fn request_switch(app: &AppHandle, runtime: Arc<Mutex<RuntimeState>>, target: &s
         }
     };
     apply_tray_updates(app, Arc::clone(&runtime), generation, tray_updates);
-    navigate(
-        app,
-        Arc::clone(&runtime),
-        generation,
-        &format!("{proxy_origin}/?generation={generation}"),
-    );
+    let Ok(initial_url) = Url::parse(&format!("{proxy_origin}/?generation={generation}")) else {
+        navigation_failed(app, Arc::clone(&runtime), generation);
+        return;
+    };
     launch_activation(
         app.clone(),
         runtime,
         generation,
         profile,
         control,
-        old_proxy,
-        old_sidecar,
+        ActivationTransition {
+            old_proxy,
+            old_sidecar,
+            window_replacement: Some(WindowReplacement {
+                window_label: format!("{MAIN_WINDOW}-{generation}-{}", initial_url.port().unwrap_or_default()),
+                initial_url,
+                origins,
+                local_plan_script,
+            }),
+        },
     );
 }
 
@@ -637,10 +760,9 @@ fn launch_activation(
     generation: u64,
     profile: Profile,
     control: ProxyControl,
-    old_proxy: Option<ProxyHandle>,
-    old_sidecar: Option<SharedSidecar>,
+    transition: ActivationTransition,
 ) {
-    let failure_sidecar = old_sidecar.clone();
+    let failure_sidecar = transition.old_sidecar.clone();
     let failure_app = app.clone();
     let failure_runtime = Arc::clone(&runtime);
     let failure_control = control.clone();
@@ -648,9 +770,26 @@ fn launch_activation(
     let spawn = thread::Builder::new()
         .name(format!("crux-profile-{generation}"))
         .spawn(move || {
-            stop_previous(&runtime, old_proxy, old_sidecar);
-            if !generation_is_current(&runtime, generation) {
+            stop_previous(&runtime, transition.old_proxy, transition.old_sidecar);
+            if !runtime_generation_is_current(&runtime, generation) {
                 return;
+            }
+            if let Some(replacement) = transition.window_replacement {
+                if replace_main_window(&app, &runtime, generation, replacement).is_err() {
+                    let page = StatusPage {
+                        status: 503,
+                        title: "Profile window unavailable".to_string(),
+                        profile: profile.name.clone(),
+                        message: "Crux could not establish a fresh isolated webview for the selected profile."
+                            .to_string(),
+                        retry: Some("Choose Retry in the tray.".to_string()),
+                    };
+                    publish_page(&app, &runtime, generation, &control, page, HealthState::Unreachable);
+                    return;
+                }
+                if !runtime_generation_is_current(&runtime, generation) {
+                    return;
+                }
             }
             match profile.mode {
                 ProfileMode::Bundled => activate_bundled(&app, &runtime, generation, &profile, &control),
@@ -732,7 +871,7 @@ fn activate_attach(
 
     let mut backoff = Backoff::default();
     loop {
-        if !generation_is_current(runtime, generation) {
+        if !runtime_generation_is_current(runtime, generation) {
             return;
         }
         let report = probe_health(&probe_upstream, Some(&token));
@@ -752,7 +891,7 @@ fn activate_attach(
                 );
                 return;
             }
-            if !generation_is_current(runtime, generation) {
+            if !runtime_generation_is_current(runtime, generation) {
                 return;
             }
             let upstream: Arc<dyn Upstream> = match UreqUpstream::for_proxy(&profile.url) {
@@ -854,7 +993,7 @@ fn activate_bundled(
         let Ok(mut guard) = runtime.lock() else {
             return;
         };
-        if guard.generation != generation {
+        if !generation_matches(guard.generation, generation) {
             return;
         }
         match spawn_sidecar(&binary, SidecarConfig::new(&app_data_dir)) {
@@ -903,7 +1042,7 @@ fn activate_bundled(
         );
         return;
     }
-    if !generation_is_current(runtime, generation) {
+    if !runtime_generation_is_current(runtime, generation) {
         shutdown_shared_sidecar(&sidecar);
         clear_shared_sidecar(runtime, &sidecar);
         return;
@@ -948,7 +1087,7 @@ fn publish_ready_sidecar(
         return;
     };
     let updates = match runtime.lock() {
-        Ok(mut guard) if guard.generation == generation => {
+        Ok(mut guard) if generation_matches(guard.generation, generation) => {
             let origins = Arc::clone(&guard.origins);
             let Ok(mut policy) = origins.write() else {
                 return;
@@ -983,7 +1122,7 @@ fn publish_unreachable_sidecar(
     control: &ProxyControl,
     report: HealthReport,
 ) {
-    if !generation_is_current(runtime, generation) {
+    if !runtime_generation_is_current(runtime, generation) {
         return;
     }
     let page = StatusPage {
@@ -1010,7 +1149,7 @@ fn publish_ready(
         let Ok(mut guard) = runtime.lock() else {
             return;
         };
-        if guard.generation != generation {
+        if !generation_matches(guard.generation, generation) {
             None
         } else {
             guard.statuses.insert(
@@ -1060,14 +1199,14 @@ fn publish_page(
     page: StatusPage,
     state: HealthState,
 ) {
-    if !generation_is_current(runtime, generation) || control.show_status(page.clone()).is_err() {
+    if !runtime_generation_is_current(runtime, generation) || control.show_status(page.clone()).is_err() {
         return;
     }
     let updates = {
         let Ok(mut guard) = runtime.lock() else {
             return;
         };
-        if guard.generation != generation {
+        if !generation_matches(guard.generation, generation) {
             None
         } else {
             guard.statuses.insert(
@@ -1117,8 +1256,11 @@ fn show_current_error(app: &AppHandle, runtime: &Arc<Mutex<RuntimeState>>, title
     publish_page(app, runtime, generation, &control, page, HealthState::Unreachable);
 }
 
-fn generation_is_current(runtime: &Arc<Mutex<RuntimeState>>, generation: u64) -> bool {
-    runtime.lock().ok().is_some_and(|guard| guard.generation == generation)
+fn runtime_generation_is_current(runtime: &Arc<Mutex<RuntimeState>>, generation: u64) -> bool {
+    runtime
+        .lock()
+        .ok()
+        .is_some_and(|guard| generation_matches(guard.generation, generation))
 }
 
 fn connecting_page(profile: &str) -> StatusPage {
@@ -1174,12 +1316,12 @@ fn shutdown_owned_resources(app: &AppHandle) {
     };
     let (mut proxy, sidecar) = match managed.0.lock() {
         Ok(mut guard) => {
-            guard.generation = guard.generation.saturating_add(1);
+            guard.generation = next_generation(guard.generation);
             (guard.proxy.take(), guard.sidecar.take())
         }
         Err(poisoned) => {
             let mut guard = poisoned.into_inner();
-            guard.generation = guard.generation.saturating_add(1);
+            guard.generation = next_generation(guard.generation);
             (guard.proxy.take(), guard.sidecar.take())
         }
     };
@@ -1212,7 +1354,7 @@ fn tray_updates(state: &RuntimeState) -> Vec<TrayUpdate> {
 fn apply_tray_updates(app: &AppHandle, runtime: Arc<Mutex<RuntimeState>>, generation: u64, updates: Vec<TrayUpdate>) {
     let scheduler = app.clone();
     let _ = scheduler.run_on_main_thread(move || {
-        if !generation_is_current(&runtime, generation) {
+        if !runtime_generation_is_current(&runtime, generation) {
             return;
         }
         for update in updates {
@@ -1255,6 +1397,14 @@ const fn state_label(state: HealthState) -> &'static str {
     }
 }
 
+fn current_window(app: &AppHandle, runtime: &Arc<Mutex<RuntimeState>>, generation: u64) -> Option<WebviewWindow<Wry>> {
+    let label = runtime
+        .lock()
+        .ok()
+        .and_then(|guard| generation_matches(guard.generation, generation).then(|| guard.window_label.clone()))?;
+    app.get_webview_window(&label)
+}
+
 fn set_window_status(
     app: &AppHandle,
     runtime: Arc<Mutex<RuntimeState>>,
@@ -1270,17 +1420,17 @@ fn set_window_status(
     let scheduler = app.clone();
     let ui = app.clone();
     let _ = scheduler.run_on_main_thread(move || {
-        if !generation_is_current(&runtime, generation) {
+        if !runtime_generation_is_current(&runtime, generation) {
             return;
         }
-        if let Some(window) = ui.get_webview_window(MAIN_WINDOW) {
+        if let Some(window) = current_window(&ui, &runtime, generation) {
             let _ = window.set_title(&title);
         }
     });
 }
 
-fn clear_profile_storage(app: &AppHandle) -> Result<(), ()> {
-    let Some(window) = app.get_webview_window(MAIN_WINDOW) else {
+fn clear_profile_storage(app: &AppHandle, runtime: &Arc<Mutex<RuntimeState>>, generation: u64) -> Result<(), ()> {
+    let Some(window) = current_window(app, runtime, generation) else {
         return Err(());
     };
     window.clear_all_browsing_data().map_err(|_| ())
@@ -1295,10 +1445,10 @@ fn navigate(app: &AppHandle, runtime: Arc<Mutex<RuntimeState>>, generation: u64,
     let ui = app.clone();
     let callback_runtime = Arc::clone(&runtime);
     let scheduled = scheduler.run_on_main_thread(move || {
-        if !generation_is_current(&callback_runtime, generation) {
+        if !runtime_generation_is_current(&callback_runtime, generation) {
             return;
         }
-        if let Some(window) = ui.get_webview_window(MAIN_WINDOW) {
+        if let Some(window) = current_window(&ui, &callback_runtime, generation) {
             if window.navigate(url).is_err() {
                 navigation_failed(&ui, callback_runtime, generation);
             }
@@ -1316,7 +1466,7 @@ fn navigation_failed(app: &AppHandle, runtime: Arc<Mutex<RuntimeState>>, generat
         let Ok(mut guard) = runtime.lock() else {
             return;
         };
-        if guard.generation != generation {
+        if !generation_matches(guard.generation, generation) {
             return;
         }
         let Some(proxy) = guard.proxy.as_ref() else {
@@ -1355,43 +1505,64 @@ fn navigation_failed(app: &AppHandle, runtime: Arc<Mutex<RuntimeState>>, generat
     let scheduler = app.clone();
     let ui = app.clone();
     let _ = scheduler.run_on_main_thread(move || {
-        if !generation_is_current(&runtime, generation) {
+        if !runtime_generation_is_current(&runtime, generation) {
             return;
         }
-        if let Some(window) = ui.get_webview_window(MAIN_WINDOW) {
+        if let Some(window) = current_window(&ui, &runtime, generation) {
             let _ = window.set_title(&format!("Crux — {profile} — unreachable"));
             let _ = window.navigate(status_url);
         }
     });
 }
 
-fn origin_is_allowed(origins: &Arc<RwLock<OriginPolicy>>, url: &Url) -> bool {
-    origins.read().ok().is_some_and(|policy| policy.allows(url))
+fn shared_origin_is_allowed(origins: &Arc<RwLock<OriginPolicy>>, url: &Url) -> bool {
+    origins
+        .read()
+        .ok()
+        .is_some_and(|policy| origin_is_allowed(&policy, url.as_str()))
 }
 
-fn is_public_http_link(url: &Url) -> bool {
-    if !matches!(url.scheme(), "http" | "https") || !url.username().is_empty() || url.password().is_some() {
+fn handle_local_plan_navigation(app: &AppHandle, window_label: &str, window_generation: u64, url: &Url) -> bool {
+    if url.scheme() != "file" {
         return false;
     }
-    let Some(host) = url.host_str() else {
-        return false;
+    let requested_path = match url.to_file_path() {
+        Ok(path) => path,
+        Err(()) => return true,
     };
-    !host.eq_ignore_ascii_case("localhost") && host.parse::<IpAddr>().ok().is_none_or(|address| !address.is_loopback())
+    let authorized = app.try_state::<ManagedState>().and_then(|managed| {
+        let root = managed.0.lock().ok().and_then(|guard| {
+            if guard.window_label != window_label || !generation_matches(guard.generation, window_generation) {
+                return None;
+            }
+            guard
+                .profiles
+                .active_profile()
+                .ok()
+                .and_then(|profile| profile.local_plan_root.clone())
+        })?;
+        authorize_local_plan_path(root, requested_path).ok()
+    });
+    if let Some(path) = authorized {
+        queue_local_plan(app, window_generation, path);
+    }
+    true
 }
 
-fn queue_external_link(app: &AppHandle, url: &Url) {
-    if !is_public_http_link(url) {
+fn queue_external_link(app: &AppHandle, window_generation: u64, url: &Url) {
+    if !is_public_http_link(url.as_str()) {
         return;
     }
     let Some(managed) = app.try_state::<ManagedState>() else {
         return;
     };
     let target = url.as_str().to_string();
+    let pending = PendingOpen::PublicHttp(target.clone());
     let queued = managed.0.lock().ok().and_then(|mut guard| {
-        if guard.pending_external.is_some() {
+        if !generation_matches(guard.generation, window_generation) || guard.pending_open.is_some() {
             return None;
         }
-        guard.pending_external = Some(target.clone());
+        guard.pending_open = Some(pending.clone());
         let host = url.host_str().unwrap_or("external site");
         let authority = match url.port() {
             Some(port) => format!("{host}:{port}"),
@@ -1413,7 +1584,39 @@ fn queue_external_link(app: &AppHandle, url: &Url) {
     let scheduler = app.clone();
     let _ = scheduler.run_on_main_thread(move || {
         let still_pending = runtime.lock().ok().is_some_and(|guard| {
-            guard.generation == generation && guard.pending_external.as_deref() == Some(target.as_str())
+            generation_matches(guard.generation, generation) && guard.pending_open.as_ref() == Some(&pending)
+        });
+        if still_pending {
+            let _ = item.set_text(label);
+            let _ = item.set_enabled(true);
+        }
+    });
+}
+
+fn queue_local_plan(app: &AppHandle, window_generation: u64, path: PathBuf) {
+    let Some(managed) = app.try_state::<ManagedState>() else {
+        return;
+    };
+    let pending = PendingOpen::LocalPlan(path.clone());
+    let queued = managed.0.lock().ok().and_then(|mut guard| {
+        if !generation_matches(guard.generation, window_generation) || guard.pending_open.is_some() {
+            return None;
+        }
+        guard.pending_open = Some(pending.clone());
+        let label = path.file_name().and_then(|name| name.to_str()).map_or_else(
+            || "Open local plan".to_string(),
+            |name| format!("Open local plan — {}", menu_safe(name)),
+        );
+        Some((guard.generation, guard.open_external_item.clone(), label))
+    });
+    let Some((generation, item, label)) = queued else {
+        return;
+    };
+    let runtime = Arc::clone(&managed.0);
+    let scheduler = app.clone();
+    let _ = scheduler.run_on_main_thread(move || {
+        let still_pending = runtime.lock().ok().is_some_and(|guard| {
+            generation_matches(guard.generation, generation) && guard.pending_open.as_ref() == Some(&pending)
         });
         if still_pending {
             let _ = item.set_text(label);
@@ -1423,12 +1626,23 @@ fn queue_external_link(app: &AppHandle, url: &Url) {
 }
 
 fn open_in_system_browser(url: &Url) {
-    if !is_public_http_link(url) {
+    if !is_public_http_link(url.as_str()) {
         return;
     }
     let Some(mut command) = browser_command(url.as_str()) else {
         return;
     };
+    spawn_system_handler(&mut command);
+}
+
+fn open_local_plan_in_system_handler(path: &Path) {
+    let Some(mut command) = local_plan_command(path) else {
+        return;
+    };
+    spawn_system_handler(&mut command);
+}
+
+fn spawn_system_handler(command: &mut Command) {
     command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     let _ = command.spawn();
 }
@@ -1456,6 +1670,32 @@ fn browser_command(url: &str) -> Option<Command> {
 
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 fn browser_command(_url: &str) -> Option<Command> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn local_plan_command(path: &Path) -> Option<Command> {
+    let mut command = Command::new("/usr/bin/xdg-open");
+    command.arg(path);
+    Some(command)
+}
+
+#[cfg(target_os = "windows")]
+fn local_plan_command(path: &Path) -> Option<Command> {
+    let mut command = Command::new(r"C:\Windows\System32\rundll32.exe");
+    command.arg("url.dll,FileProtocolHandler").arg(path);
+    Some(command)
+}
+
+#[cfg(target_os = "macos")]
+fn local_plan_command(path: &Path) -> Option<Command> {
+    let mut command = Command::new("/usr/bin/open");
+    command.arg(path);
+    Some(command)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+fn local_plan_command(_path: &Path) -> Option<Command> {
     None
 }
 
