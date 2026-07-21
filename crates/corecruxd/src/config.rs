@@ -497,6 +497,11 @@ pub struct Config {
     /// VaultCrux/issuer Ed25519 trust-root public key, parsed from exactly
     /// 64 hexadecimal characters in `CORECRUXD_SYNC_PEER_TRUST_ROOT`.
     pub sync_peer_trust_root: Option<Vec<u8>>,
+    /// Enforce holder-appended narrowing caveats on attenuated peer tokens
+    /// (macaroon attenuation, R3). Default OFF (`CORECRUXD_SYNC_CAVEAT_ENFORCE=1`).
+    /// When OFF, a token carrying caveats is rejected at the sync boundary
+    /// (fail-closed) rather than accepted with its restrictions silently ignored.
+    pub sync_caveat_enforce: bool,
 
     // Background update checks against a tracked git ref.
     pub update_check_enabled: bool,
@@ -1302,6 +1307,9 @@ pub fn load_config() -> Config {
         sync_peer_trust_root: env_string("CORECRUXD_SYNC_PEER_TRUST_ROOT")
             .as_deref()
             .and_then(parse_sync_peer_trust_root),
+        sync_caveat_enforce: std::env::var("CORECRUXD_SYNC_CAVEAT_ENFORCE")
+            .ok()
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
         update_check_enabled: std::env::var("CORECRUXD_UPDATE_CHECK_ENABLED")
             .ok()
             .is_none_or(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),

@@ -680,6 +680,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         data_dir: config.data_dir.clone(),
         sync_mutual_auth: config.sync_mutual_auth,
         sync_peer_trust_root: config.sync_peer_trust_root.clone(),
+        sync_caveat_enforce: config.sync_caveat_enforce,
         sync_handshake_nonces: Arc::new(std::sync::Mutex::new(crux_sync::peer_handshake::NonceCache::new(
             SYNC_HANDSHAKE_NONCE_TTL_SECONDS,
         ))),
@@ -4424,6 +4425,7 @@ mod tests {
             data_dir: tmp.path().to_path_buf(),
             sync_mutual_auth: false,
             sync_peer_trust_root: None,
+            sync_caveat_enforce: false,
             sync_handshake_nonces: std::sync::Arc::new(std::sync::Mutex::new(
                 crux_sync::peer_handshake::NonceCache::new(crate::http::SYNC_HANDSHAKE_NONCE_TTL_SECONDS),
             )),
