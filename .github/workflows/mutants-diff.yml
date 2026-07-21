@@ -65,13 +65,15 @@ jobs:
             echo "empty diff vs origin/${{ github.base_ref }} — nothing to mutate"
             exit 0
           fi
+          # `|| rc=$?`: GitHub's default bash injects -e; a bare `cmd; rc=$?`
+          # dies at the cmd line on survivor exit codes (see mutants.yml).
+          rc=0
           cargo mutants --in-diff pr.diff --timeout 120 \
-            -p corecrux-receipts -p corecrux-segment -p corecrux-storage
-          rc=$?
-          # 0 = clean, 2 = survivors (ratcheted below). Anything else is an
-          # infra/baseline failure and must be visible.
-          if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then
-            echo "::error::cargo-mutants exited $rc (not a survivors result: 3=all-timeouts, 4=baseline failed, other=infra — see log)"
+            -p corecrux-receipts -p corecrux-segment -p corecrux-storage || rc=$?
+          # 0 = clean, 2 = survivors, 3 = timeouts (both ratcheted below).
+          # Anything else is an infra/baseline failure and must be visible.
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ] && [ "$rc" -ne 3 ]; then
+            echo "::error::cargo-mutants exited $rc (4=baseline failed, other=infra — see log)"
             exit "$rc"
           fi
       - name: Ratchet survivors against baseline
@@ -81,11 +83,11 @@ jobs:
             echo "no mutants.out — diff produced no mutants in scope"
             exit 0
           fi
+          rc=0
           python3 scripts/mutants-report.py \
             --outs mutants.out \
             --baseline .github/mutants-baseline.txt \
-            --summary "$GITHUB_STEP_SUMMARY"
-          rc=$?
+            --summary "$GITHUB_STEP_SUMMARY" || rc=$?  # -e-safe capture
           if [ "$rc" -eq 2 ]; then
             echo "::error::this PR introduces mutation survivors — new code has assertion gaps (see job summary). Kill each survivor with a test; only genuinely inert mutations belong in .github/mutants-baseline.txt (prefer #[mutants::skip] with a comment)."
           fi

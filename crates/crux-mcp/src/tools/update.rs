@@ -62,6 +62,11 @@ mod tests {
             checked_at: Some("2026-04-09T12:00:00Z".to_string()),
             error: None,
             comparison_stale: false,
+            basis: "binary".to_string(),
+            binary_commit: Some("abc123".to_string()),
+            checkout_commit: Some("0ff5e7".to_string()),
+            checkout_ahead_by: 0,
+            checkout_behind_by: 9,
             upgrade_hint: "upgrade available".to_string(),
         };
 
@@ -71,5 +76,10 @@ mod tests {
         assert!(text.contains("\"repo_dir\": \"/tmp/repo\""));
         assert!(text.contains("upgrade_playbook_query"));
         assert!(text.contains("backup_playbook_query"));
+        // New basis fields flow through the MCP JSON output via serde.
+        assert!(text.contains("\"basis\": \"binary\""));
+        assert!(text.contains("\"binary_commit\": \"abc123\""));
+        assert!(text.contains("\"checkout_commit\": \"0ff5e7\""));
+        assert!(text.contains("\"checkout_behind_by\": 9"));
     }
 }

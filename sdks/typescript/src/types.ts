@@ -139,6 +139,13 @@ export interface VersionResponse {
     behind_by: number;
     checked_at?: string | null;
     error?: string | null;
+    comparison_stale?: boolean;
+    /** Which ref the primary ahead_by/behind_by/current_commit describe: the running binary or the source checkout. Commit fields (binary_commit/checkout_commit) are admin-only. */
+    basis?: "binary" | "checkout" | string;
+    binary_commit?: string | null;
+    checkout_commit?: string | null;
+    checkout_ahead_by?: number;
+    checkout_behind_by?: number;
     upgrade_hint: string;
   };
 }
