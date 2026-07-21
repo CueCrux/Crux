@@ -2909,6 +2909,224 @@ function extractThemeVars(theme) {
   notes.push('plan-hash badge (M4c console half): planHashBadge(daemon_hash, local_hash|null) is pure — no daemon hash → no badge; no local hash → provenance chip (daemon short-form, since the browser cannot read local files); equal → in-sync; differing → mismatch badge (T.2 guard); buildPlanTree wires it onto ExecPlan nodes (daemon hash read defensively so it is forward-compatible before PR #457 ships; local hash from data.localPlanHashes by id then slug) and the row paints the state-classed chip carrying data-hash-state. M5a: renderPlanTree feeds data.localPlanHashes from window.CRUX_LOCAL_PLAN_HASHES (shell-injected read-only global; undefined for browser-only users → provenance-only).');
 })();
 
+// =========================================================================
+//  Check 47 — (M3b) attention-zone classifier truth table. deriveAttentionZone
+//  sorts ONE normalised work/session item into exactly one zone with an explicit
+//  precedence (needs_you > running > done_review) and an explicit staleness rule
+//  (a live session is "running" only while its heartbeat is within
+//  ATTENTION_LIVENESS_STALE_MS of now). The classifier is pure — no DOM, no fetch.
+// =========================================================================
+(function checkAttentionZoneClassifier() {
+  check(typeof render.deriveAttentionZone === 'function', '[attn] render.js must export the pure deriveAttentionZone classifier');
+  check(render.ATTENTION_LIVENESS_STALE_MS === 300000,
+    '[attn] ATTENTION_LIVENESS_STALE_MS must be 300000ms (5 min); got ' + render.ATTENTION_LIVENESS_STALE_MS);
+  if (typeof render.deriveAttentionZone !== 'function') { return; }
+  const dz = render.deriveAttentionZone;
+  const STALE = render.ATTENTION_LIVENESS_STALE_MS;
+  const now = 1000000000;
+  const fresh = now - Math.floor(STALE / 2);   // within the window → live
+  const stale = now - (STALE + 60000);          // older than the window → idle
+  const future = now + 60000;                    // clock skew → negative age
+
+  // Truth table: one representative input per zone (+ the "no attention" cases).
+  // States are the REAL WorkItem enum (work.rs WORK_STATES): 'complete' is done.
+  const cases = [
+    ['gate pending', { gatePending: true }, 'needs_you'],
+    ['blocked plan', { state: 'blocked', blockerReason: 'waiting on review' }, 'needs_you'],
+    ['waiting session', { liveSession: true, lastSeenUnixMs: fresh, waitingForInput: true }, 'needs_you'],
+    ['in_progress plan', { state: 'in_progress' }, 'running'],
+    ['fresh live session', { liveSession: true, lastSeenUnixMs: fresh }, 'running'],
+    ['complete plan', { state: 'complete' }, 'done_review'],
+    ['review pending', { reviewPending: true }, 'done_review'],
+    ['planned/idle', { state: 'planned' }, null],
+    ['deployed (shipped, not awaiting review)', { state: 'deployed' }, null],
+    ['empty item', {}, null],
+    ['non-object', null, null]
+  ];
+  cases.forEach(function (c) {
+    check(dz(c[1], now) === c[2], '[attn] deriveAttentionZone(' + c[0] + ') must be ' + String(c[2]) + ' (got ' + String(dz(c[1], now)) + ')');
+  });
+
+  // Precedence — needs_you > running > done_review.
+  check(dz({ state: 'blocked', liveSession: true, lastSeenUnixMs: fresh }, now) === 'needs_you',
+    '[attn] precedence: an item that is BOTH blocked AND a running session must resolve to needs_you');
+  check(dz({ gatePending: true, state: 'in_progress' }, now) === 'needs_you',
+    '[attn] precedence: a gate on an in_progress plan must resolve to needs_you');
+  check(dz({ state: 'in_progress', reviewPending: true }, now) === 'running',
+    '[attn] precedence: running must outrank done_review');
+
+  // Staleness rule — running requires a FINITE, non-negative heartbeat age in
+  // [0, threshold]. Stale, future (clock skew → negative age), and non-finite
+  // timestamps are all NOT running.
+  check(dz({ liveSession: true, lastSeenUnixMs: stale }, now) === null,
+    '[attn] staleness: a stale-heartbeat session must NOT be running (idle → null)');
+  check(dz({ liveSession: true, lastSeenUnixMs: future }, now) === null,
+    '[attn] staleness: a FUTURE heartbeat (clock skew → negative age) must NOT be running');
+  check(dz({ liveSession: true, lastSeenUnixMs: 'nope' }, now) === null,
+    '[attn] staleness: a non-finite heartbeat must NOT be running');
+  check(dz({ liveSession: true, lastSeenUnixMs: now - STALE }, now) === 'running',
+    '[attn] staleness: a heartbeat exactly at the threshold is still running (<=)');
+  check(dz({ liveSession: true, lastSeenUnixMs: now }, now) === 'running',
+    '[attn] staleness: a zero-age heartbeat is running');
+  check(dz({ liveSession: true, lastSeenUnixMs: now - STALE - 1 }, now) === null,
+    '[attn] staleness: a heartbeat one ms past the threshold is idle');
+
+  // Pure — no DOM / no fetch / no window in the classifier body.
+  const body = funcBody(renderSrc, 'deriveAttentionZone') || '';
+  check(!!body && !/document|\bwindow\b|fetch\s*\(|appendChild|CruxApi/.test(body),
+    '[attn] deriveAttentionZone must be pure (no DOM, no fetch, no window/CruxApi)');
+  notes.push('attention zones (M3b): deriveAttentionZone(item, now) sorts one normalised item into needs_you > running > done_review with an explicit staleness rule (a live session is running only while its heartbeat is within ATTENTION_LIVENESS_STALE_MS=' + STALE + 'ms of now); precedence + staleness truth table asserted; pure (no DOM/fetch).');
+})();
+
+// =========================================================================
+//  Check 48 — (M3b) attention surface renders zones from the classifier over a
+//  work + coord + gate fixture (mock DOM), grouping correctly; a failed feed
+//  shows a per-feed degraded notice (never a silently-empty zone).
+// =========================================================================
+(function checkAttentionSurfaceRender() {
+  if (typeof render.fillNeedsYou !== 'function') { check(false, '[attn-surface] render.js must export fillNeedsYou'); return; }
+  const mock = newMockDom();
+  const mkNode = mock.mkNode, mockDoc = mock.doc;
+  const STALE = render.ATTENTION_LIVENESS_STALE_MS;
+  const nowMs = 2000000000;
+  const coordData = { now_unix_ms: nowMs, presence_ttl_secs: 900, active_sessions: [
+    { session_id_hex: 'run11111', passport_id: 'pp_run', last_seen_at_unix_ms: nowMs - 60000, intent: { execplan_slug: 'alpha', milestone: 'M2' } },
+    { session_id_hex: 'idle2222', passport_id: 'pp_idle', last_seen_at_unix_ms: nowMs - (STALE + 300000), intent: { execplan_slug: 'alpha' } },
+    { session_id_hex: 'wait3333', passport_id: 'pp_wait', last_seen_at_unix_ms: nowMs - 60000, intent: { execplan_slug: 'beta', note: 'awaiting operator input before deploy' } }
+  ] };
+  // alpha is in_progress AND carries a pending gate → the gate join must classify
+  // it as needs_you ONCE (a gate card), NEVER also running (the double-count bug).
+  const workData = { work: [
+    { id: 'execplan:alpha', project_id: 'execplans', title: 'Alpha', state: 'in_progress' },
+    { id: 'execplan:beta', project_id: 'execplans', title: 'Beta', state: 'blocked', blocker_reason: 'needs a schema decision' },
+    { id: 'execplan:gamma', project_id: 'execplans', title: 'Gamma', state: 'complete' },
+    { id: 'execplan:delta', project_id: 'execplans', title: 'Delta', state: 'planned' }
+  ] };
+  const gateData = { pending: [{ action_id: 'act1', work_id: 'execplan:alpha', requested_by_passport: 'pp_req', status: 'pending' }] };
+  function fakeRes(ok, status, data) { return Promise.resolve({ ok: ok, status: status, json: function () { return Promise.resolve(data); } }); }
+  function mkWrap() { const w = mkNode('div'); w.__body = mkNode('div'); w.__ct = mkNode('span'); return w; }
+  function isCard(n) { return (n.className || '').split(/\s+/).indexOf('ow-gate') >= 0; }
+
+  const savedDoc = global.document, savedWin = global.window;
+  global.document = mockDoc;
+  // Drive A — every feed healthy → correct single-zone grouping (api captured
+  // synchronously so the later window swaps don't affect this drive).
+  global.window = { CruxApi: { get: function (p) {
+    if (p === '/v1/work/gate/pending') { return fakeRes(true, 200, gateData); }
+    if (p === '/v1/coord/active') { return fakeRes(true, 200, coordData); }
+    return fakeRes(false, 404, null);
+  }, work: function () { return fakeRes(true, 200, workData); } } };
+  const wrapA = mkWrap();
+  const pA = Promise.resolve(render.fillNeedsYou(wrapA));
+  // Drive B — coord fails (503) while gates+work stay healthy.
+  global.window = { CruxApi: { get: function (p) {
+    if (p === '/v1/work/gate/pending') { return fakeRes(true, 200, gateData); }
+    if (p === '/v1/coord/active') { return fakeRes(false, 503, null); }
+    return fakeRes(false, 404, null);
+  }, work: function () { return fakeRes(true, 200, workData); } } };
+  const wrapB = mkWrap();
+  const pB = Promise.resolve(render.fillNeedsYou(wrapB));
+  // Drive C — gate feed fails while work + coord are healthy-but-empty. The panel
+  // must show the gates degraded notice and MUST NOT show "All clear" (fail
+  // honest), and must NOT fall back to demo (which would erase the notice).
+  global.window = { CruxApi: { get: function (p) {
+    if (p === '/v1/work/gate/pending') { return fakeRes(false, 503, null); }
+    if (p === '/v1/coord/active') { return fakeRes(true, 200, { now_unix_ms: nowMs, active_sessions: [] }); }
+    return fakeRes(false, 404, null);
+  }, work: function () { return fakeRes(true, 200, { work: [] }); } } };
+  const wrapC = mkWrap();
+  const pC = Promise.resolve(render.fillNeedsYou(wrapC));
+
+  asyncChecks.push(Promise.all([pA, pB, pC]).then(function () {
+    // ---- Drive A: single-zone grouping (no double-count) ----
+    const nodesA = mock.collect(wrapA.__body, []);
+    const summary = nodesA.filter(function (n) { return /\bow-zone-summary\b/.test(n.className || ''); })[0];
+    check(!!summary, '[attn-surface] a zone summary must render the grouping readout');
+    if (summary) {
+      check(summary.getAttribute('data-needs-you') === '3', '[attn-surface] needs_you must group 3 (gated alpha + blocked beta + waiting session); got ' + summary.getAttribute('data-needs-you'));
+      check(summary.getAttribute('data-running') === '1', '[attn-surface] running must group 1 (fresh session ONLY — the gated in_progress alpha must NOT also count as running); got ' + summary.getAttribute('data-running'));
+      check(summary.getAttribute('data-done-review') === '1', '[attn-surface] done_review must group 1 (the complete plan); got ' + summary.getAttribute('data-done-review'));
+    }
+    const cardsA = nodesA.filter(isCard);
+    check(cardsA.length === 3, '[attn-surface] exactly 3 needs_you cards must render (got ' + cardsA.length + ')');
+    // The gated in_progress alpha appears exactly ONCE, as a gate card (data-action-id).
+    const alphaGate = nodesA.filter(function (n) { return n.getAttribute && n.getAttribute('data-action-id') === 'act1'; });
+    check(alphaGate.length === 1, '[attn-surface] a gated item must render exactly one gate card (not duplicated across zones); got ' + alphaGate.length);
+    check(nodesA.some(function (n) { return n.getAttribute && n.getAttribute('data-attn-kind') === 'blocked'; }), '[attn-surface] a blocked-plan card must render in the needs_you zone');
+    check(nodesA.some(function (n) { return n.getAttribute && n.getAttribute('data-attn-kind') === 'session'; }), '[attn-surface] a waiting-session card must render in the needs_you zone');
+    check(!nodesA.some(function (n) { return /idle2222/.test(n.textContent || ''); }), '[attn-surface] a stale-heartbeat session must NOT surface in the inbox (staleness rule)');
+    // ---- Drive B: fail honest per feed (partial failure keeps real cards) ----
+    const nodesB = mock.collect(wrapB.__body, []);
+    check(nodesB.filter(function (n) { return /\bplan-tree-degraded\b/.test(n.className || ''); }).some(function (n) { return n.getAttribute('data-feed') === 'coord'; }),
+      '[attn-surface] a failed coord feed must render a per-feed degraded notice (fail honest)');
+    check(nodesB.some(isCard), '[attn-surface] the needs_you zone must still paint its real cards when only one feed failed (never a silent empty)');
+    // ---- Drive C: failed feed + empty others → degraded, NEVER "All clear" ----
+    const nodesC = mock.collect(wrapC.__body, []);
+    check(nodesC.filter(function (n) { return /\bplan-tree-degraded\b/.test(n.className || ''); }).some(function (n) { return n.getAttribute('data-feed') === 'gates'; }),
+      '[attn-surface] a failed gates feed must render a per-feed degraded notice');
+    check(!nodesC.some(function (n) { return (n.className || '').split(/\s+/).indexOf('ow-allclear') >= 0; }),
+      '[attn-surface] must NOT render "All clear" when a feed failed (fail-honest contradiction)');
+    check(!nodesC.some(function (n) { return (n.className || '').split(/\s+/).indexOf('is-demo') >= 0 || (n.className || '').split(/\s+/).indexOf('demo-chip') >= 0; }),
+      '[attn-surface] must NOT fall back to demo when a feed failed (demo would erase the degraded notice)');
+  }).catch(function (e) {
+    check(false, '[attn-surface] fillNeedsYou drive threw: ' + (e && e.stack || e));
+  }).then(function () {
+    if (savedDoc === undefined) { delete global.document; } else { global.document = savedDoc; }
+    if (savedWin === undefined) { delete global.window; } else { global.window = savedWin; }
+  }));
+
+  notes.push('attention surface (M3b): fillNeedsYou renders the needs_you zone as cards (gate + blocked plan + waiting session) over a work+coord+gate fixture; a gated in_progress item is classified ONCE (gate card, not also running — the join fix); stale-heartbeat sessions excluded; a partial-failure feed keeps its real cards + a per-feed degraded notice; a failed feed with empty others shows the notice and NEVER "All clear" nor a notice-erasing demo (fail honest).');
+})();
+
+// =========================================================================
+//  Check 49 — (M3b) attention wiring + choke-point audit. The needs_you inbox is
+//  grouped by deriveAttentionZone over the three live feeds read THROUGH the
+//  generated client (M4a pattern); approve/return goes ONLY through the gated
+//  helpers → operatorGatedCall → CruxApiGated; no new mutation client, no raw
+//  fetch, no stray /v1/ literal for the query-bearing work path.
+// =========================================================================
+(function checkAttentionWiringAndChoke() {
+  const fn = funcBody(renderSrc, 'fillNeedsYou') || '';
+  check(!!fn, '[attn-wire] render.js must define fillNeedsYou');
+  check(/deriveAttentionZone\(/.test(fn), '[attn-wire] fillNeedsYou must group the inbox via deriveAttentionZone (not a raw list)');
+  check(/fetchJSON\('\/v1\/work\/gate\/pending'\)/.test(fn), '[attn-wire] fillNeedsYou must read pending gates via fetchJSON(/v1/work/gate/pending)');
+  check(/api\.work\(\s*\{\s*source:\s*'all'\s*\}\s*\)/.test(fn), '[attn-wire] fillNeedsYou must read /v1/work?source=all through CruxApi.work({source:"all"}) (parameterised — not a literal fetchJSON)');
+  check(/fetchJSON\('\/v1\/coord\/active'\)/.test(fn), '[attn-wire] fillNeedsYou must read /v1/coord/active via fetchJSON');
+  check(/appendFeedNotices\(/.test(fn), '[attn-wire] fillNeedsYou must fail honest per feed via appendFeedNotices');
+  check(!/fetchJSON\('\/v1\/work\?/.test(fn), '[attn-wire] fillNeedsYou must NOT read the query-bearing work path via literal fetchJSON (allowlist miss → false-empty)');
+  check(!/\bfetch\s*\(/.test(fn), '[attn-wire] fillNeedsYou must not raw-fetch — api.js is the sole network layer');
+  check(!/CruxApiGated/.test(fn), '[attn-wire] fillNeedsYou must not touch the gated write client directly');
+
+  // Approve/return route ONLY through the operator helpers (the sole choke point).
+  const gate = funcBody(renderSrc, 'gateCard') || '';
+  check(/approveGate\(/.test(gate) && /rejectGate\(/.test(gate), '[attn-wire] the gate card must approve/return through the approveGate/rejectGate operator helpers');
+  check(!/\bfetch\s*\(|CruxApiGated/.test(gate), '[attn-wire] the gate card must not raw-fetch or touch the gated client directly');
+  // Prove the routing chain by INSPECTING the helper bodies (not regex on the
+  // caller): approveGate/rejectGate → operatorGatedCall → CruxApiGated.gate*.
+  const ag = funcBody(renderSrc, 'approveGate') || '';
+  const rg = funcBody(renderSrc, 'rejectGate') || '';
+  const ogc = funcBody(renderSrc, 'operatorGatedCall') || '';
+  check(/operatorGatedCall\(/.test(ag) && /\bg\.gateApprove\(/.test(ag), '[attn-wire] approveGate must dispatch operatorGatedCall(g => g.gateApprove(...))');
+  check(/operatorGatedCall\(/.test(rg) && /\bg\.gateReject\(/.test(rg), '[attn-wire] rejectGate must dispatch operatorGatedCall(g => g.gateReject(...))');
+  check(/isOperator\(\)/.test(ogc) && /CruxApiGated/.test(ogc) && /return\s+invoke\(gated\)/.test(ogc),
+    '[attn-wire] operatorGatedCall must guard on isOperator() and invoke the CruxApiGated client (the sole gated choke point)');
+  // The blocked/waiting cards are read-only — no mutation surface at all.
+  ['blockedPlanCard', 'waitingSessionCard'].forEach(function (name) {
+    const b = funcBody(renderSrc, name) || '';
+    check(!!b, '[attn-wire] render.js must define ' + name);
+    check(!/CruxApiGated|operatorGatedCall|approveGate|rejectGate|\bfetch\s*\(/.test(b), '[attn-wire] ' + name + ' must be read-only (no mutation, no gated client)');
+  });
+  // M3b introduces NO new gated mutation — the curated set (check 7) is unchanged
+  // and the approve/reject path remains the sole gate write.
+  const apiSrc = fs.readFileSync(path.join(DIR, 'api.js'), 'utf8');
+  check(/'\/v1\/work\/gate\/\{actionId\}\/approve'/.test(apiSrc) && /'\/v1\/work\/gate\/\{actionId\}\/reject'/.test(apiSrc),
+    '[attn-wire] approve/reject must remain the curated gated path (M3b adds no new mutation client)');
+  // The receipt reference (M3a) is surfaced after a resolve.
+  const mr = funcBody(renderSrc, 'markResolved') || '';
+  check(/receipt_id/.test(mr) && /ow-hash/.test(mr), '[attn-wire] markResolved must surface the M3a receipt reference (receipt_id) on the card');
+  notes.push('attention wiring + choke-point (M3b): fillNeedsYou groups the needs_you inbox via deriveAttentionZone over /v1/work/gate/pending (fetchJSON) + /v1/work?source=all (CruxApi.work) + /v1/coord/active (fetchJSON), fail-honest per feed; approve/return route ONLY through approveGate/rejectGate→operatorGatedCall→CruxApiGated (no new mutation client, no raw fetch); blocked/waiting cards read-only; markResolved surfaces the M3a receipt_id.');
+})();
+
 // ---- Report (awaits async renderer-driven checks) -----------------------
 Promise.all(asyncChecks).then(function () { return passportMintInteraction(); }).then(function () {
   console.log('unified-shell-console v2 — M14 + desktop mission control M2 smoke');

@@ -1091,6 +1091,23 @@
   .ow-allclear b { display: block; font-size: 13.5px; color: var(--ink); }
   .ow-allclear span { font-size: 12px; color: var(--ink3); }
 
+  /* Attention-zone summary (M3b): needs_you rendered as cards below; running /
+     awaiting-review shown as a compact grouping readout. */
+  .ow-zone-summary {
+    font-family: var(--font-mono); font-size: 10.5px; letter-spacing: .04em;
+    color: var(--ink3); margin: 0 0 10px; padding: 6px 10px;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2);
+  }
+  /* Read-only attention cards reuse the .ow-gate chrome; the waiting card takes a
+     neutral (trust) stripe to distinguish it from a blocked (warn) plan. */
+  .ow-gate.ow-attn-waiting::before { background: var(--trust); }
+  /* Inferred marker: the waiting signal is derived (not daemon-backed), so the
+     chip reads muted/dashed — a visibly soft, honest signal. */
+  .ow-chip.ow-inferred {
+    color: var(--ink3); border: 1px dashed var(--edge);
+    background: transparent; font-style: italic;
+  }
+
   /* ---- Fleet rows (concept .sess) --------------------------------------- */
   .ow-fleet-row {
     display: flex; align-items: flex-start; gap: 12px; padding: 12px 14px; margin-bottom: 9px;
@@ -3138,7 +3155,7 @@
 <script>
 (function () {
   'use strict';
-  var SW_REV = 'ushell-v2-r12';   // keep in lock-step with /console-v2/sw.js
+  var SW_REV = 'ushell-v2-r13';   // keep in lock-step with /console-v2/sw.js
   if (!('serviceWorker' in navigator)) { return; }
   // Dev bypass — when the daemon serves this shell from CORECRUXD_CONSOLE_DEV_PATH
   // it stamps window.__CRUX_CONSOLE_DEV__ (see console.rs inject_console_dev_flag).
