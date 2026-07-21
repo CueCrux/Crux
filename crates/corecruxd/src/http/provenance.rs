@@ -54,6 +54,12 @@ const TLS_TERMINATED_ENV: &str = "CORECRUXD_PROVENANCE_TLS_TERMINATED";
 /// only for a currently-valid exact leaf whose envelope signature verifies.
 const TRUSTED_LEAF_SHA256_ENV: &str = "CORECRUXD_PROVENANCE_TRUSTED_LEAF_SHA256";
 const MAX_TRUSTED_LEAF_PINS: usize = 1_024;
+/// Optional verification-record retention window. Unset means no automatic
+/// deletion; an operator must choose an explicit 1..=3,650-day lifecycle.
+const RETENTION_DAYS_ENV: &str = "CORECRUXD_PROVENANCE_RETENTION_DAYS";
+const MAX_RETENTION_DAYS: u32 = 3_650;
+const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const RETENTION_SWEEP_MAX_TENANTS: usize = 10_000;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ProvenanceTrustPolicy {
@@ -97,6 +103,57 @@ impl ProvenanceTrustPolicy {
     fn trusts_leaf(&self, fingerprint: &str) -> bool {
         self.trusted_leaf_sha256.contains(fingerprint)
     }
+}
+
+fn provenance_retention_days_from_env() -> Result<Option<u32>, String> {
+    let Some(raw) = std::env::var(RETENTION_DAYS_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let days = raw
+        .parse::<u32>()
+        .map_err(|_| format!("{RETENTION_DAYS_ENV} must be an integer from 1 to {MAX_RETENTION_DAYS}"))?;
+    if !(1..=MAX_RETENTION_DAYS).contains(&days) {
+        return Err(format!(
+            "{RETENTION_DAYS_ENV} must be an integer from 1 to {MAX_RETENTION_DAYS}"
+        ));
+    }
+    Ok(Some(days))
+}
+
+fn retention_sweep_due(tenant: &str, now: Instant) -> bool {
+    static LAST_SWEEP: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    let sweeps = LAST_SWEEP.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut sweeps) = sweeps.lock() else {
+        tracing::error!("provenance retention cadence lock poisoned; preserving records");
+        return false;
+    };
+    let tenant_hash = tenant_records_hash(tenant);
+    if sweeps
+        .get(&tenant_hash)
+        .and_then(|last| now.checked_duration_since(*last))
+        .is_some_and(|elapsed| elapsed < RETENTION_SWEEP_INTERVAL)
+    {
+        return false;
+    }
+    if sweeps.len() >= RETENTION_SWEEP_MAX_TENANTS {
+        sweeps.retain(|_, last| {
+            now.checked_duration_since(*last)
+                .is_some_and(|elapsed| elapsed < RETENTION_SWEEP_INTERVAL)
+        });
+    }
+    if sweeps.len() >= RETENTION_SWEEP_MAX_TENANTS {
+        tracing::warn!(
+            max_tenants = RETENTION_SWEEP_MAX_TENANTS,
+            "provenance retention cadence table full; preserving unswept tenant records"
+        );
+        return false;
+    }
+    sweeps.insert(tenant_hash, now);
+    true
 }
 
 /// The M9 skeleton reads the flag from the environment directly rather than
@@ -152,6 +209,10 @@ pub(super) fn provenance_routes_enabled(state: &AppState) -> bool {
     if allowed {
         if let Err(error) = ProvenanceTrustPolicy::from_env() {
             tracing::error!(%error, "provenance API routes are not mounted: invalid exact-leaf trust list");
+            return false;
+        }
+        if let Err(error) = provenance_retention_days_from_env() {
+            tracing::error!(%error, "provenance API routes are not mounted: invalid record-retention policy");
             return false;
         }
     }
@@ -944,8 +1005,58 @@ enum RecordStoreError {
     LockPoisoned,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RecordRetentionSweepSummary {
+    retention_days: u32,
+    cutoff: String,
+    tenant_hash: String,
+    records_dropped: usize,
+    expired_records_held: usize,
+    files_rewritten: usize,
+    files_removed: usize,
+}
+
+#[derive(Debug)]
+struct RecordRetentionSweepRun {
+    summary: RecordRetentionSweepSummary,
+    error: Option<RecordStoreError>,
+}
+
+#[derive(Serialize)]
+struct RecordRetentionReceiptV1<'a> {
+    schema: &'a str,
+    op: &'a str,
+    reason_code: &'a str,
+    sweep_id: &'a str,
+    tenant_hash: &'a str,
+    retention_days: u32,
+    cutoff: &'a str,
+    records_dropped: usize,
+    expired_records_held: usize,
+    files_rewritten: usize,
+    files_removed: usize,
+    status: &'a str,
+    recorded_at: String,
+}
+
+struct RetentionAudit {
+    summary: RecordRetentionSweepSummary,
+    receipt_id: Option<String>,
+}
+
+struct RecordRewritePlan {
+    path: PathBuf,
+    retained_bytes: Vec<u8>,
+    records_dropped: usize,
+    expired_records_held: usize,
+}
+
+fn tenant_records_hash(tenant: &str) -> String {
+    blake3::hash(tenant.as_bytes()).to_hex().to_string()
+}
+
 fn tenant_records_dir(data_dir: &Path, tenant: &str) -> PathBuf {
-    let tenant_hash = blake3::hash(tenant.as_bytes()).to_hex();
+    let tenant_hash = tenant_records_hash(tenant);
     data_dir
         .join("provenance")
         .join("tenants")
@@ -959,6 +1070,36 @@ fn records_path(data_dir: &Path, tenant: &str) -> PathBuf {
 fn record_append_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn is_retention_temp_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(".verification-records-retention-"))
+        && path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("tmp"))
+}
+
+fn cleanup_retention_temp_files(tenant_dir: &Path) -> Result<(), RecordStoreError> {
+    let mut removed = false;
+    for entry in std::fs::read_dir(tenant_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !is_retention_temp_file(&path) {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() || !file_type.is_file() {
+            return Err(RecordStoreError::UnsafePath);
+        }
+        std::fs::remove_file(path)?;
+        removed = true;
+    }
+    if removed {
+        sync_directory(tenant_dir)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1032,6 +1173,7 @@ fn retain_record_with_limits(
     let lock_file = open_private_append_lock(&lock_path)?;
     validate_and_harden_open_file(&lock_file)?;
     lock_file.lock_exclusive()?;
+    cleanup_retention_temp_files(&tenant_dir)?;
 
     let active_path = records_path(data_dir, tenant);
     let mut total_bytes = 0_u64;
@@ -1103,6 +1245,198 @@ fn retain_record_with_limits(
         sync_directory_chain(&tenant_dir, data_dir)?;
     }
     Ok(RecordAppendOutcome::Appended)
+}
+
+fn sweep_expired_verification_records(
+    data_dir: &Path,
+    tenant: &str,
+    retention_days: u32,
+    now: chrono::DateTime<chrono::Utc>,
+    legal_holds: &[corecrux_memory::LegalHold],
+) -> RecordRetentionSweepRun {
+    let cutoff = now - chrono::Duration::days(i64::from(retention_days));
+    let mut summary = RecordRetentionSweepSummary {
+        retention_days,
+        cutoff: cutoff.to_rfc3339(),
+        tenant_hash: tenant_records_hash(tenant),
+        records_dropped: 0,
+        expired_records_held: 0,
+        files_rewritten: 0,
+        files_removed: 0,
+    };
+    let error = sweep_expired_verification_records_inner(
+        data_dir,
+        tenant,
+        cutoff,
+        legal_holds,
+        RecordStoreLimits::default(),
+        &mut summary,
+    )
+    .err();
+    RecordRetentionSweepRun { summary, error }
+}
+
+fn sweep_expired_verification_records_inner(
+    data_dir: &Path,
+    tenant: &str,
+    cutoff: chrono::DateTime<chrono::Utc>,
+    legal_holds: &[corecrux_memory::LegalHold],
+    limits: RecordStoreLimits,
+    summary: &mut RecordRetentionSweepSummary,
+) -> Result<(), RecordStoreError> {
+    use fs2::FileExt as _;
+    use std::io::BufRead as _;
+
+    let _process_guard = record_append_lock()
+        .lock()
+        .map_err(|_| RecordStoreError::LockPoisoned)?;
+    let tenant_dir = tenant_records_dir(data_dir, tenant);
+    let tenant_dir_metadata = match std::fs::symlink_metadata(&tenant_dir) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    if tenant_dir_metadata.file_type().is_symlink() || !tenant_dir_metadata.is_dir() {
+        return Err(RecordStoreError::UnsafePath);
+    }
+    set_private_directory_permissions(&tenant_dir)?;
+
+    let lock_path = tenant_dir.join(".append.lock");
+    reject_symlink_or_non_file(&lock_path)?;
+    let lock_file = open_private_append_lock(&lock_path)?;
+    validate_and_harden_open_file(&lock_file)?;
+    lock_file.lock_exclusive()?;
+    cleanup_retention_temp_files(&tenant_dir)?;
+
+    // Validate and plan the complete tenant rewrite before deleting anything.
+    // The store is already capped at 64 MiB per tenant, which bounds this
+    // retained-byte plan while allowing atomic per-file replacement.
+    let mut plans = Vec::new();
+    let mut directory_entries = 0usize;
+    let mut total_bytes = 0u64;
+    for entry in std::fs::read_dir(&tenant_dir)? {
+        let entry = entry?;
+        directory_entries = directory_entries.saturating_add(1);
+        if directory_entries > limits.max_directory_entries {
+            return Err(RecordStoreError::TooManyEntries);
+        }
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() || !file_type.is_file() {
+            return Err(RecordStoreError::UnsafePath);
+        }
+        let path = entry.path();
+        if entry.file_name() == ".append.lock" {
+            continue;
+        }
+        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+            return Err(RecordStoreError::UnsafePath);
+        }
+        total_bytes = total_bytes.saturating_add(entry.metadata()?.len());
+        if total_bytes > limits.tenant_max_bytes {
+            return Err(RecordStoreError::TenantQuotaExceeded {
+                needed: total_bytes,
+                max: limits.tenant_max_bytes,
+            });
+        }
+
+        reject_symlink_or_non_file(&path)?;
+        let file = open_private_read_file(&path)?;
+        validate_and_harden_open_file(&file)?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut retained_bytes = Vec::new();
+        let mut records_dropped = 0usize;
+        let mut expired_records_held = 0usize;
+        loop {
+            let mut encoded_line = Vec::new();
+            let bytes_read = reader.read_until(b'\n', &mut encoded_line)?;
+            if bytes_read == 0 {
+                break;
+            }
+            if !encoded_line.ends_with(b"\n")
+                || u64::try_from(encoded_line.len()).unwrap_or(u64::MAX) > limits.max_line_bytes
+            {
+                return Err(RecordStoreError::CorruptRecord);
+            }
+            let json_bytes = &encoded_line[..encoded_line.len() - 1];
+            if json_bytes.iter().all(u8::is_ascii_whitespace) {
+                retained_bytes.extend_from_slice(&encoded_line);
+                continue;
+            }
+            let stored: serde_json::Value =
+                serde_json::from_slice(json_bytes).map_err(|_| RecordStoreError::CorruptRecord)?;
+            if stored.get("schema").and_then(serde_json::Value::as_str)
+                != Some("cuecrux.provenance.verification_record.v1")
+                || stored.get("tenant_id").and_then(serde_json::Value::as_str) != Some(tenant)
+            {
+                return Err(RecordStoreError::CorruptRecord);
+            }
+            let record_id = stored
+                .get("record_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(RecordStoreError::CorruptRecord)?;
+            let recorded_at = stored
+                .get("recorded_at")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(RecordStoreError::CorruptRecord)?;
+            let recorded_at = chrono::DateTime::parse_from_rfc3339(recorded_at)
+                .map_err(|_| RecordStoreError::CorruptRecord)?
+                .with_timezone(&chrono::Utc);
+            if recorded_at >= cutoff {
+                retained_bytes.extend_from_slice(&encoded_line);
+                continue;
+            }
+
+            let entity = format!("provenance::verification_record::{record_id}");
+            if legal_holds.iter().any(|hold| hold.covers(tenant, &entity)) {
+                retained_bytes.extend_from_slice(&encoded_line);
+                expired_records_held = expired_records_held.saturating_add(1);
+            } else {
+                records_dropped = records_dropped.saturating_add(1);
+            }
+        }
+        if records_dropped > 0 {
+            plans.push(RecordRewritePlan {
+                path,
+                retained_bytes,
+                records_dropped,
+                expired_records_held,
+            });
+        } else {
+            summary.expired_records_held = summary.expired_records_held.saturating_add(expired_records_held);
+        }
+    }
+
+    for plan in plans {
+        if plan.retained_bytes.is_empty() {
+            std::fs::remove_file(&plan.path)?;
+            summary.records_dropped = summary.records_dropped.saturating_add(plan.records_dropped);
+            summary.expired_records_held = summary.expired_records_held.saturating_add(plan.expired_records_held);
+            summary.files_removed = summary.files_removed.saturating_add(1);
+            sync_directory(&tenant_dir)?;
+            continue;
+        }
+
+        let temp_path = tenant_dir.join(format!(".verification-records-retention-{}.tmp", uuid::Uuid::new_v4()));
+        let rewrite_result = (|| -> Result<(), RecordStoreError> {
+            use std::io::Write as _;
+
+            let mut temp_file = open_private_new_file(&temp_path)?;
+            validate_and_harden_open_file(&temp_file)?;
+            temp_file.write_all(&plan.retained_bytes)?;
+            temp_file.sync_all()?;
+            std::fs::rename(&temp_path, &plan.path)?;
+            summary.records_dropped = summary.records_dropped.saturating_add(plan.records_dropped);
+            summary.expired_records_held = summary.expired_records_held.saturating_add(plan.expired_records_held);
+            summary.files_rewritten = summary.files_rewritten.saturating_add(1);
+            sync_directory(&tenant_dir)?;
+            Ok(())
+        })();
+        if rewrite_result.is_err() {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+        rewrite_result?;
+    }
+    Ok(())
 }
 
 fn find_idempotent_record(
@@ -1179,6 +1513,13 @@ fn open_private_append_lock(path: &Path) -> std::io::Result<std::fs::File> {
 fn open_private_append_file(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true);
+    set_private_file_mode(&mut options);
+    options.open(path)
+}
+
+fn open_private_new_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
     set_private_file_mode(&mut options);
     options.open(path)
 }
@@ -1342,6 +1683,88 @@ fn blocking_task_failed(operation: &'static str, err: tokio::task::JoinError) ->
     problem_response(StatusCode::INTERNAL_SERVER_ERROR, "internal provenance worker failure")
 }
 
+#[allow(clippy::result_large_err)]
+fn retention_actor(state: &AppState, headers: &HeaderMap) -> Result<String, Response> {
+    let scope_context = crate::auth::http_scope_context(&state.auth, headers).map_err(IntoResponse::into_response)?;
+    if let Some(passport_id) = scope_context.passport_id {
+        return Ok(passport_id);
+    }
+    let evidence = crate::auth::describe_http_evidence(&state.auth, headers).map_err(IntoResponse::into_response)?;
+    Ok(evidence
+        .subject
+        .unwrap_or_else(|| format!("authenticated:{}", state.auth.mode().as_str())))
+}
+
+fn mint_record_retention_receipt(
+    state: &AppState,
+    actor: &str,
+    summary: RecordRetentionSweepSummary,
+    status: &'static str,
+) -> RetentionAudit {
+    let sweep_id = format!("prov_ret_{}", uuid::Uuid::new_v4());
+    let payload = build_record_retention_receipt(&summary, &sweep_id, status);
+    let receipt_id = super::observations::mint_governance_receipt(
+        state,
+        "__governance__::retention",
+        actor,
+        "retention.provenance_records",
+        &payload,
+    );
+    RetentionAudit { summary, receipt_id }
+}
+
+fn build_record_retention_receipt<'a>(
+    summary: &'a RecordRetentionSweepSummary,
+    sweep_id: &'a str,
+    status: &'a str,
+) -> RecordRetentionReceiptV1<'a> {
+    RecordRetentionReceiptV1 {
+        schema: "cuecrux.provenance.record_retention.v1",
+        op: "provenance_record_retention",
+        reason_code: "configured_retention_window",
+        sweep_id,
+        tenant_hash: &summary.tenant_hash,
+        retention_days: summary.retention_days,
+        cutoff: &summary.cutoff,
+        records_dropped: summary.records_dropped,
+        expired_records_held: summary.expired_records_held,
+        files_rewritten: summary.files_rewritten,
+        files_removed: summary.files_removed,
+        status,
+        recorded_at: chrono::Utc::now().to_rfc3339(),
+    }
+}
+
+fn attach_retention_audit_headers(mut response: Response, audit: Option<&RetentionAudit>) -> Response {
+    let Some(audit) = audit else {
+        return response;
+    };
+    let status = if audit.receipt_id.is_some() {
+        "recorded"
+    } else {
+        "pending"
+    };
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-cuecrux-retention-receipt-status"),
+        axum::http::HeaderValue::from_static(status),
+    );
+    if let Ok(value) = axum::http::HeaderValue::from_str(&audit.summary.records_dropped.to_string()) {
+        response.headers_mut().insert(
+            axum::http::HeaderName::from_static("x-cuecrux-retention-records-dropped"),
+            value,
+        );
+    }
+    if let Some(receipt_id) = audit.receipt_id.as_deref() {
+        if let Ok(value) = axum::http::HeaderValue::from_str(receipt_id) {
+            response.headers_mut().insert(
+                axum::http::HeaderName::from_static("x-cuecrux-retention-receipt-id"),
+                value,
+            );
+        }
+    }
+    response
+}
+
 /// Any-of scopes accepted across the whole provenance surface. Kept in sync
 /// with the `route_auth::classify_route` contract for `/v1/provenance`.
 const PROVENANCE_SCOPES: &[&str] = &["provenance:write", "admin:write"];
@@ -1443,10 +1866,89 @@ pub(super) async fn post_provenance_verify_record(
             );
         }
     };
+    let retention_days = match provenance_retention_days_from_env() {
+        Ok(days) => days,
+        Err(error) => {
+            tracing::error!(%error, "invalid provenance record-retention policy");
+            return problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid provenance retention configuration",
+            );
+        }
+    };
+    let mut retention_audit = None;
+    let retention_receipt_actor = match retention_days {
+        Some(_) => match retention_actor(&state, &headers) {
+            Ok(actor) => Some(actor),
+            Err(response) => return response,
+        },
+        None => None,
+    };
+    if let Some(retention_days) = retention_days.filter(|_| retention_sweep_due(&tenant, Instant::now())) {
+        // Resolve a durable actor before reserving the cadence slot or doing
+        // destructive lifecycle work. The legal-hold read lock remains held
+        // through the sweep so a hold cannot be placed concurrently between
+        // the check and file replacement.
+        let actor = match retention_receipt_actor {
+            Some(actor) => actor,
+            None => {
+                tracing::error!("provenance retention cadence reserved without a receipt actor");
+                return problem_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "verification-record retention sweep failed",
+                );
+            }
+        };
+        let fact_store = state.fact_store.clone();
+        let receipt_state = state.clone();
+        let sweep_data_dir = state.data_dir.clone();
+        let sweep_tenant = tenant.clone();
+        let sweep = tokio::task::spawn_blocking(move || {
+            let store = fact_store.blocking_read();
+            let legal_holds: Vec<_> = store
+                .active_legal_holds()
+                .into_iter()
+                .filter(|hold| hold.tenant_id == sweep_tenant)
+                .collect();
+            let run = sweep_expired_verification_records(
+                &sweep_data_dir,
+                &sweep_tenant,
+                retention_days,
+                chrono::Utc::now(),
+                &legal_holds,
+            );
+            drop(store);
+            let status = if run.error.is_some() { "failed" } else { "completed" };
+            let audit = (run.summary.records_dropped > 0)
+                .then(|| mint_record_retention_receipt(&receipt_state, &actor, run.summary.clone(), status));
+            (run, audit)
+        })
+        .await;
+        let (sweep, audit) = match sweep {
+            Ok(result) => result,
+            Err(error) => return blocking_task_failed("verify-record-retention", error),
+        };
+        retention_audit = audit;
+        if sweep.summary.expired_records_held > 0 {
+            tracing::info!(
+                tenant_hash = %sweep.summary.tenant_hash,
+                expired_records_held = sweep.summary.expired_records_held,
+                "provenance retention preserved records covered by active legal holds"
+            );
+        }
+        if let Some(error) = sweep.error {
+            tracing::error!(%error, "provenance record-retention sweep failed");
+            let response = problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "verification-record retention sweep failed",
+            );
+            return attach_retention_audit_headers(response, retention_audit.as_ref());
+        }
+    }
     let passport_key_path = state.passport_key_path.clone();
     let passport_fpr = state.passport_fpr.clone();
     let data_dir = state.data_dir.clone();
-    match tokio::task::spawn_blocking(move || {
+    let response = match tokio::task::spawn_blocking(move || {
         do_verify_record(
             &NoopMeter,
             &body,
@@ -1466,7 +1968,8 @@ pub(super) async fn post_provenance_verify_record(
         Ok(Ok(VerifyRecordOutcome::Replayed(resp))) => (StatusCode::OK, Json(resp)).into_response(),
         Ok(Err(err)) => err.into_response(),
         Err(err) => blocking_task_failed("verify-record", err),
-    }
+    };
+    attach_retention_audit_headers(response, retention_audit.as_ref())
 }
 
 #[cfg(test)]
@@ -2091,6 +2594,310 @@ mod tests {
         assert_eq!(after, before, "entry-cap rejection must precede rotation or append");
     }
 
+    fn retention_record_line(tenant: &str, record_id: &str, recorded_at: &str) -> serde_json::Value {
+        json!({
+            "schema": "cuecrux.provenance.verification_record.v1",
+            "tenant_id": tenant,
+            "record_id": record_id,
+            "recorded_at": recorded_at,
+        })
+    }
+
+    fn active_record_hold(tenant: &str, entity_prefixes: Vec<String>) -> corecrux_memory::LegalHold {
+        corecrux_memory::LegalHold {
+            schema: corecrux_memory::LEGAL_HOLD_SCHEMA_V1.to_string(),
+            hold_id: "hold-provenance-test".to_string(),
+            tenant_id: tenant.to_string(),
+            entity_prefixes,
+            reason: "fixture legal hold".to_string(),
+            placed_at: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            placed_by: "passport:test-reviewer".to_string(),
+            place_receipt_id: "receipt:test-hold".to_string(),
+            released_at: None,
+            released_by: None,
+            release_receipt_id: None,
+        }
+    }
+
+    #[test]
+    fn record_retention_drops_only_expired_unheld_records_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tenant = "tenant-retention";
+        append_record(
+            tmp.path(),
+            tenant,
+            &retention_record_line(tenant, "old-drop", "2026-01-01T00:00:00Z"),
+        )
+        .unwrap();
+        append_record(
+            tmp.path(),
+            tenant,
+            &retention_record_line(tenant, "old-held", "2026-01-02T00:00:00Z"),
+        )
+        .unwrap();
+        append_record(
+            tmp.path(),
+            tenant,
+            &retention_record_line(tenant, "fresh-keep", "2026-07-20T00:00:00Z"),
+        )
+        .unwrap();
+        let hold = active_record_hold(tenant, vec!["provenance::verification_record::old-held".to_string()]);
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let first = sweep_expired_verification_records(tmp.path(), tenant, 30, now, &[hold.clone()]);
+        assert!(first.error.is_none());
+        assert_eq!(first.summary.records_dropped, 1);
+        assert_eq!(first.summary.expired_records_held, 1);
+        assert_eq!(first.summary.files_rewritten, 1);
+        assert_eq!(first.summary.files_removed, 0);
+        assert_eq!(first.summary.tenant_hash, tenant_records_hash(tenant));
+        let stored = std::fs::read_to_string(records_path(tmp.path(), tenant)).unwrap();
+        assert!(!stored.contains("old-drop"));
+        assert!(stored.contains("old-held"));
+        assert!(stored.contains("fresh-keep"));
+
+        let second = sweep_expired_verification_records(tmp.path(), tenant, 30, now, &[hold]);
+        assert!(second.error.is_none());
+        assert_eq!(second.summary.records_dropped, 0);
+        assert_eq!(second.summary.expired_records_held, 1);
+        assert_eq!(second.summary.files_rewritten, 0);
+        assert_eq!(
+            std::fs::read_to_string(records_path(tmp.path(), tenant)).unwrap(),
+            stored
+        );
+    }
+
+    #[test]
+    fn record_retention_preserves_every_record_under_a_tenant_wide_hold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tenant = "tenant-retention-wide-hold";
+        append_record(
+            tmp.path(),
+            tenant,
+            &retention_record_line(tenant, "old-one", "2026-01-01T00:00:00Z"),
+        )
+        .unwrap();
+        append_record(
+            tmp.path(),
+            tenant,
+            &retention_record_line(tenant, "old-two", "2026-01-02T00:00:00Z"),
+        )
+        .unwrap();
+        let before = std::fs::read(records_path(tmp.path(), tenant)).unwrap();
+        let hold = active_record_hold(tenant, Vec::new());
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let sweep = sweep_expired_verification_records(tmp.path(), tenant, 30, now, &[hold]);
+
+        assert!(sweep.error.is_none());
+        assert_eq!(sweep.summary.records_dropped, 0);
+        assert_eq!(sweep.summary.expired_records_held, 2);
+        assert_eq!(sweep.summary.files_rewritten, 0);
+        assert_eq!(std::fs::read(records_path(tmp.path(), tenant)).unwrap(), before);
+    }
+
+    #[test]
+    fn record_store_cleans_a_crash_leftover_retention_temp_before_append() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tenant = "tenant-retention-temp-cleanup";
+        append_record(
+            tmp.path(),
+            tenant,
+            &retention_record_line(tenant, "first", "2026-07-20T00:00:00Z"),
+        )
+        .unwrap();
+        let temp_path =
+            tenant_records_dir(tmp.path(), tenant).join(".verification-records-retention-crash-fixture.tmp");
+        std::fs::write(&temp_path, b"incomplete rewrite").unwrap();
+
+        append_record(
+            tmp.path(),
+            tenant,
+            &retention_record_line(tenant, "second", "2026-07-21T00:00:00Z"),
+        )
+        .unwrap();
+
+        assert!(!temp_path.exists());
+        let retained = std::fs::read_to_string(records_path(tmp.path(), tenant)).unwrap();
+        assert!(retained.contains("\"record_id\":\"first\""));
+        assert!(retained.contains("\"record_id\":\"second\""));
+    }
+
+    #[test]
+    fn record_retention_fails_closed_before_deleting_when_any_line_is_corrupt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tenant = "tenant-retention-corrupt";
+        append_record(
+            tmp.path(),
+            tenant,
+            &retention_record_line(tenant, "old-valid", "2026-01-01T00:00:00Z"),
+        )
+        .unwrap();
+        append_record(
+            tmp.path(),
+            tenant,
+            &retention_record_line(tenant, "bad-time", "not-rfc3339"),
+        )
+        .unwrap();
+        let before = std::fs::read(records_path(tmp.path(), tenant)).unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let sweep = sweep_expired_verification_records(tmp.path(), tenant, 30, now, &[]);
+
+        assert!(matches!(sweep.error, Some(RecordStoreError::CorruptRecord)));
+        assert_eq!(sweep.summary.records_dropped, 0);
+        assert_eq!(std::fs::read(records_path(tmp.path(), tenant)).unwrap(), before);
+    }
+
+    #[test]
+    fn record_retention_removes_an_all_expired_segment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tenant = "tenant-retention-empty";
+        append_record(
+            tmp.path(),
+            tenant,
+            &retention_record_line(tenant, "old-only", "2026-01-01T00:00:00Z"),
+        )
+        .unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let sweep = sweep_expired_verification_records(tmp.path(), tenant, 30, now, &[]);
+
+        assert!(sweep.error.is_none());
+        assert_eq!(sweep.summary.records_dropped, 1);
+        assert_eq!(sweep.summary.files_removed, 1);
+        assert!(!records_path(tmp.path(), tenant).exists());
+        append_record(
+            tmp.path(),
+            tenant,
+            &retention_record_line(tenant, "new-after-sweep", "2026-07-21T00:00:00Z"),
+        )
+        .unwrap();
+        assert!(records_path(tmp.path(), tenant).exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn retention_policy_parser_is_explicit_bounded_and_fail_closed() {
+        std::env::remove_var(RETENTION_DAYS_ENV);
+        assert_eq!(provenance_retention_days_from_env().unwrap(), None);
+        std::env::set_var(RETENTION_DAYS_ENV, "90");
+        assert_eq!(provenance_retention_days_from_env().unwrap(), Some(90));
+        for invalid in ["0", "3651", "1.5", "forever"] {
+            std::env::set_var(RETENTION_DAYS_ENV, invalid);
+            assert!(provenance_retention_days_from_env().is_err());
+        }
+        std::env::remove_var(RETENTION_DAYS_ENV);
+    }
+
+    #[test]
+    fn record_retention_cadence_bounds_full_tenant_scans() {
+        let tenant = format!("tenant-retention-cadence-{}", uuid::Uuid::new_v4());
+        let start = Instant::now();
+        assert!(retention_sweep_due(&tenant, start));
+        assert!(!retention_sweep_due(&tenant, start + RETENTION_SWEEP_INTERVAL / 2));
+        assert!(retention_sweep_due(
+            &tenant,
+            start + RETENTION_SWEEP_INTERVAL + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn record_retention_receipt_is_count_only_and_excludes_raw_tenant_and_record_ids() {
+        let summary = RecordRetentionSweepSummary {
+            retention_days: 90,
+            cutoff: "2026-04-22T00:00:00+00:00".to_string(),
+            tenant_hash: tenant_records_hash("customer-tenant-secret"),
+            records_dropped: 3,
+            expired_records_held: 2,
+            files_rewritten: 1,
+            files_removed: 1,
+        };
+        let encoded = serde_json::to_string(&build_record_retention_receipt(
+            &summary,
+            "prov_ret_fixture",
+            "completed",
+        ))
+        .unwrap();
+
+        assert!(encoded.contains("configured_retention_window"));
+        assert!(encoded.contains("\"records_dropped\":3"));
+        assert!(encoded.contains(&summary.tenant_hash));
+        assert!(!encoded.contains("customer-tenant-secret"));
+        assert!(!encoded.contains("provenance::verification_record::"));
+        assert!(!encoded.contains("old-drop"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn verify_record_retention_mints_governance_receipt_and_surfaces_headers() {
+        use crate::auth::AuthMode;
+
+        std::env::set_var(FEATURE_ENV, "1");
+        std::env::set_var(RETENTION_DAYS_ENV, "30");
+        std::env::remove_var(TRUSTED_LEAF_SHA256_ENV);
+        let mut state = crate::http::tests::test_app_state_with_auth(1, AuthMode::DevScopes);
+        let passport_key = crux_session::LocalPassportKey::from_path(&state.passport_key_path).unwrap();
+        state.passport_fpr = passport_key.passport_fpr().to_string();
+        let tenant = format!("tenant-retention-http-{}", uuid::Uuid::new_v4());
+        append_record(
+            &state.data_dir,
+            &tenant,
+            &retention_record_line(&tenant, "expired-http-record", "2026-01-01T00:00:00Z"),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-corecrux-scopes", "provenance:write".parse().unwrap());
+        headers.insert("x-corecrux-tenant-id", tenant.parse().unwrap());
+        headers.insert("x-corecrux-passport-id", "passport:retention-test".parse().unwrap());
+
+        let response = post_provenance_verify_record(
+            State(state.clone()),
+            headers,
+            Json(VerifyRequest {
+                manifest_envelope_b64: None,
+                content_b64: None,
+                tenant_id: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            response.headers().get("x-cuecrux-retention-receipt-status").unwrap(),
+            "recorded"
+        );
+        assert_eq!(
+            response.headers().get("x-cuecrux-retention-records-dropped").unwrap(),
+            "1"
+        );
+        assert!(response.headers().get("x-cuecrux-retention-receipt-id").is_some());
+        let retained = std::fs::read_to_string(records_path(&state.data_dir, &tenant)).unwrap();
+        assert!(!retained.contains("expired-http-record"));
+        assert_eq!(retained.lines().count(), 1, "the new verification record remains");
+        let receipt_file =
+            super::super::observations::observation_file_path(&state.data_dir, "__governance__::retention");
+        let receipt_line = std::fs::read_to_string(receipt_file).unwrap();
+        assert!(receipt_line.contains("retention.provenance_records"));
+        assert!(
+            !receipt_line.contains(&tenant),
+            "governance payload must not expose raw tenant ids"
+        );
+
+        std::env::remove_var(RETENTION_DAYS_ENV);
+        std::env::remove_var(FEATURE_ENV);
+    }
+
     #[test]
     fn concurrent_record_appends_never_interleave_json_lines() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2225,6 +3032,35 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        std::env::remove_var(FEATURE_ENV);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn invalid_retention_policy_keeps_all_provenance_routes_unmounted() {
+        use crate::auth::AuthMode;
+        use tower::ServiceExt as _;
+
+        std::env::set_var(FEATURE_ENV, "1");
+        std::env::set_var(RETENTION_DAYS_ENV, "0");
+        let state = crate::http::tests::test_app_state_with_auth(1, AuthMode::DevScopes);
+        let app = crate::http::router(
+            state,
+            std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::CaseStore::new())),
+        );
+        for path in [
+            "/v1/provenance/sign",
+            "/v1/provenance/verify",
+            "/v1/provenance/verify-record",
+        ] {
+            let request = axum::http::Request::post(path)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from("{ malformed key-bearing request"))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+        std::env::remove_var(RETENTION_DAYS_ENV);
         std::env::remove_var(FEATURE_ENV);
     }
 

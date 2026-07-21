@@ -93,6 +93,13 @@ can establish a narrow operator-selected identity policy, but the beta does
 not perform CA-chain/root validation. Metering remains a no-op until the
 fractional-credit contract is ratified and implemented.
 
+`CORECRUXD_PROVENANCE_RETENTION_DAYS=1..3650` enables activity-driven
+retained-record expiry; unset means no automatic deletion. Sweeps preserve
+active tenant-wide or `provenance::verification_record::`-scoped legal holds
+and mint count-only governance receipts. A non-empty sweep reports its receipt
+status/id and deletion count in `X-Cuecrux-Retention-*` response headers. See
+the quickstart for the exact lifecycle and fail-closed behavior.
+
 ### Replay Exports
 
 | Method | Path | Description | Auth Scope |

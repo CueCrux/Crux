@@ -100,6 +100,44 @@ An exact leaf pin is a narrow operator policy, not a claim that a public CA
 validated the signer. Malformed pin configuration fails closed and leaves the
 routes unmounted.
 
+## Optional retained-record lifecycle
+
+Automatic deletion is off unless the operator selects a window before daemon
+startup:
+
+```bash
+export CORECRUXD_PROVENANCE_RETENTION_DAYS=90
+```
+
+The accepted range is 1–3,650 days; zero, malformed, and out-of-range values
+fail closed and keep the provenance routes unmounted. An authenticated
+`verify-record` call can sweep that tenant before retaining the new result.
+Full scans are limited to once per tenant per hour and the cadence table is
+bounded; saturation preserves records instead of opening an unbounded memory
+or I/O path. The sweep validates every segment before its first mutation, runs
+under the same process and cross-process locks as appends, and atomically
+replaces partially retained files.
+
+Active legal holds are checked while the legal-hold read lock is held through
+the sweep. A tenant-wide hold preserves every verification record. A scoped
+hold can target `provenance::verification_record::<record_id>` (or the broader
+`provenance::verification_record::` prefix). Malformed newest hold state is
+resolved by the legal-hold store's tenant-wide fail-closed fallback.
+
+Every non-empty sweep mints a count-only governance receipt under
+`__governance__::retention`; it contains the tenant hash and counts, never raw
+tenant ids, record ids, asset bytes, or caller text. The triggering response
+includes:
+
+- `X-Cuecrux-Retention-Receipt-Status: recorded|pending`;
+- `X-Cuecrux-Retention-Receipt-Id` when minting succeeds;
+- `X-Cuecrux-Retention-Records-Dropped`.
+
+`pending` is loud audit debt: the deletion is not rolled back, and the daemon
+increments/logs its governance-receipt failure signal. A configured sweep is
+activity-driven in this beta; inactive tenants are not swept until a later
+authenticated retained-record call.
+
 ## API shape
 
 All three routes require `provenance:write` or `admin:write`, plus an explicit
