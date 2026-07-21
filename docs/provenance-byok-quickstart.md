@@ -80,6 +80,9 @@ verify, and new retained-record creation. The record includes the corpus
 unique run id. It is a loopback baseline, not the hosted-beta P95 required by
 the M9 launch gate.
 
+The first reproducible release-profile run is retained at
+[`docs/bench/provenance-byok-local-2026-07-21.json`](bench/provenance-byok-local-2026-07-21.json).
+
 ## Reading the verification result
 
 For the disposable self-signed sample, `ok` is true while

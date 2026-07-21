@@ -1,0 +1,43 @@
+{
+  "schema": "cuecrux.provenance_latency.v1",
+  "run_id": "provenance-byok-local-20260721T174751Z-8e711150",
+  "corpus": "provenance-byok-sample-v1",
+  "commit_sha": "63ba08919ccae952004a985abe8b8c91e69b5be4",
+  "build_profile": "release",
+  "environment": {
+    "os": "Linux 5.15.167.4-microsoft-standard-WSL2",
+    "architecture": "x86_64",
+    "logical_cpus": 24,
+    "cpu_model": "Intel(R) Core(TM) Ultra 9 285K"
+  },
+  "lane_flags": {
+    "provenance_api": true,
+    "auth_mode": "dev_scopes",
+    "meter": "noop",
+    "trust_policy": "untrusted_presented_leaf",
+    "transport": "loopback_http"
+  },
+  "iterations_per_operation": 30,
+  "unit": "seconds",
+  "latency": {
+    "sign": {
+      "min": 0.000929,
+      "p50": 0.00104,
+      "p95": 0.001496,
+      "max": 0.001794
+    },
+    "verify": {
+      "min": 0.000815,
+      "p50": 0.00094,
+      "p95": 0.00194,
+      "max": 0.002145
+    },
+    "verify_record_create": {
+      "min": 0.005038,
+      "p50": 0.005651,
+      "p95": 0.007021,
+      "max": 0.007493
+    }
+  },
+  "scope": "local baseline only; not a hosted-beta SLO"
+}
