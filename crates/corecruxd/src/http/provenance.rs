@@ -364,7 +364,7 @@ pub(super) struct SignResponse {
     pub manifest_id: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub(super) struct VerifyRequest {
     /// Sidecar JUMBF envelope (base64). Absent ⇒ asset is unsigned.
     pub manifest_envelope_b64: Option<String>,
@@ -377,7 +377,7 @@ pub(super) struct VerifyRequest {
 /// caller's own (untrusted) key — they are UNVERIFIED claims, never facts the
 /// gateway attests to. Field names carry the `unverified_` prefix so a machine
 /// consumer can't mistake them for gateway-established identity.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct ManifestClaims {
     pub manifest_id: String,
     pub claim_generator: String,
@@ -387,7 +387,7 @@ pub(super) struct ManifestClaims {
     pub signer_key_id: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct VerifyResponse {
     /// Was a parseable manifest envelope supplied?
     pub present: bool,
@@ -423,7 +423,7 @@ pub(super) struct VerifyResponse {
     pub notes: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct ProvenanceReceiptV1 {
     pub alg: String,
     pub signed_by: String,
@@ -431,12 +431,58 @@ pub(super) struct ProvenanceReceiptV1 {
     pub signature: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct VerifyRecordResponse {
     pub verification: VerifyResponse,
     pub record_id: String,
     pub recorded_at: String,
     pub receipt: ProvenanceReceiptV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RecordIdempotency {
+    key_hash: String,
+    request_hash: String,
+}
+
+impl RecordIdempotency {
+    fn from_request(tenant: &str, key: &str, req: &VerifyRequest) -> Self {
+        let mut key_hasher = blake3::Hasher::new();
+        key_hasher.update(b"cuecrux.provenance.idempotency-key.v1\0");
+        key_hasher.update(tenant.as_bytes());
+        key_hasher.update(b"\0");
+        key_hasher.update(key.as_bytes());
+
+        let mut request_hasher = blake3::Hasher::new();
+        request_hasher.update(b"cuecrux.provenance.verify-record-request.v1\0");
+        request_hasher.update(tenant.as_bytes());
+        hash_optional_text(&mut request_hasher, req.manifest_envelope_b64.as_deref());
+        hash_optional_text(&mut request_hasher, req.content_b64.as_deref());
+
+        Self {
+            key_hash: format!("blake3:{}", key_hasher.finalize().to_hex()),
+            request_hash: format!("blake3:{}", request_hasher.finalize().to_hex()),
+        }
+    }
+}
+
+fn hash_optional_text(hasher: &mut blake3::Hasher, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hasher.update(b"\x01");
+            hasher.update(&(value.len() as u64).to_le_bytes());
+            hasher.update(value.as_bytes());
+        }
+        None => {
+            hasher.update(b"\x00");
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum VerifyRecordOutcome {
+    Created(VerifyRecordResponse),
+    Replayed(VerifyRecordResponse),
 }
 
 // ── Inner logic (pure enough to unit-test without axum/auth) ────────────────
@@ -610,10 +656,11 @@ fn do_verify_record(
     meter: &dyn ProvenanceMeter,
     tenant: &str,
     req: &VerifyRequest,
+    idempotency: Option<&RecordIdempotency>,
     passport_key_path: &Path,
     passport_fpr: &str,
     data_dir: &Path,
-) -> Result<VerifyRecordResponse, ProvErr> {
+) -> Result<VerifyRecordOutcome, ProvErr> {
     let verification = verify_inner(req)?;
 
     let record_id = format!("prov_vr_{}", uuid::Uuid::new_v4());
@@ -627,6 +674,17 @@ fn do_verify_record(
         "tenant_id": tenant,
         "verification": verification,
     });
+    let mut record_body = record_body;
+    if let (serde_json::Value::Object(obj), Some(idempotency)) = (&mut record_body, idempotency) {
+        obj.insert(
+            "idempotency_key_hash".to_string(),
+            serde_json::Value::String(idempotency.key_hash.clone()),
+        );
+        obj.insert(
+            "request_hash".to_string(),
+            serde_json::Value::String(idempotency.request_hash.clone()),
+        );
+    }
     let canonical = serde_json::to_vec(&record_body).map_err(|e| {
         tracing::error!(error = %e, "provenance record canonicalise failed");
         ProvErr::new(
@@ -667,33 +725,50 @@ fn do_verify_record(
             serde_json::to_value(&receipt).unwrap_or(serde_json::Value::Null),
         );
     }
-    // TODO(flag-enable, #9): reserve credits BEFORE persisting (idempotent,
-    // keyed by op-id + payload hash) and settle after returning success, so a
-    // retained record can never be minted unpaid. NoopMeter charges nothing,
-    // so append-then-meter is inert in the skeleton.
-    append_record(data_dir, tenant, &line).map_err(|e| {
+    // Idempotent retries are bound to the normalized request hash and replay
+    // the exact retained response. The remaining flag-enable money gate is to
+    // reserve credits BEFORE entering this persistence boundary and settle
+    // after a successful append/replay; NoopMeter still charges nothing.
+    let append_outcome = retain_verification_record(data_dir, tenant, &line, idempotency).map_err(|e| {
         tracing::error!(error = %e, "provenance record persist failed");
-        let status = match e {
-            RecordStoreError::LineTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
-            RecordStoreError::TenantQuotaExceeded { .. } | RecordStoreError::TooManyEntries => {
-                StatusCode::INSUFFICIENT_STORAGE
-            }
+        let (status, message) = match e {
+            RecordStoreError::LineTooLarge { .. } => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "verification record exceeds the retention size limit",
+            ),
+            RecordStoreError::TenantQuotaExceeded { .. } | RecordStoreError::TooManyEntries => (
+                StatusCode::INSUFFICIENT_STORAGE,
+                "verification-record tenant retention quota is full",
+            ),
+            RecordStoreError::IdempotencyConflict => (
+                StatusCode::CONFLICT,
+                "Idempotency-Key was already used for a different verification request",
+            ),
             RecordStoreError::Io(_)
             | RecordStoreError::Json(_)
+            | RecordStoreError::CorruptRecord
             | RecordStoreError::UnsafePath
-            | RecordStoreError::LockPoisoned => StatusCode::INTERNAL_SERVER_ERROR,
+            | RecordStoreError::LockPoisoned => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "verification record could not be retained",
+            ),
         };
-        ProvErr::new(status, "verification record could not be retained")
+        ProvErr::new(status, message)
     })?;
 
-    meter.on_op(ProvenanceOp::VerifyRecord, tenant);
-
-    Ok(VerifyRecordResponse {
+    let response = VerifyRecordResponse {
         verification,
         record_id,
         recorded_at,
         receipt,
-    })
+    };
+    match append_outcome {
+        RecordAppendOutcome::Appended => {
+            meter.on_op(ProvenanceOp::VerifyRecord, tenant);
+            Ok(VerifyRecordOutcome::Created(response))
+        }
+        RecordAppendOutcome::Existing(existing) => Ok(VerifyRecordOutcome::Replayed(*existing)),
+    }
 }
 
 const RECORD_MAX_LINE_BYTES: u64 = 128 * 1024;
@@ -732,6 +807,10 @@ enum RecordStoreError {
     TenantQuotaExceeded { needed: u64, max: u64 },
     #[error("tenant verification-record directory has too many entries")]
     TooManyEntries,
+    #[error("idempotency key was already used for a different verification request")]
+    IdempotencyConflict,
+    #[error("verification-record storage contains an unreadable or incomplete record")]
+    CorruptRecord,
     #[error("verification-record storage path is not a regular private file or directory")]
     UnsafePath,
     #[error("record append lock is poisoned")]
@@ -755,16 +834,46 @@ fn record_append_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum RecordAppendOutcome {
+    Appended,
+    Existing(Box<VerifyRecordResponse>),
+}
+
+#[cfg(test)]
 fn append_record(data_dir: &Path, tenant: &str, line: &serde_json::Value) -> Result<(), RecordStoreError> {
     append_record_with_limits(data_dir, tenant, line, RecordStoreLimits::default())
 }
 
+#[cfg(test)]
 fn append_record_with_limits(
     data_dir: &Path,
     tenant: &str,
     line: &serde_json::Value,
     limits: RecordStoreLimits,
 ) -> Result<(), RecordStoreError> {
+    match retain_record_with_limits(data_dir, tenant, line, limits, None)? {
+        RecordAppendOutcome::Appended => Ok(()),
+        RecordAppendOutcome::Existing(_) => Err(RecordStoreError::CorruptRecord),
+    }
+}
+
+fn retain_verification_record(
+    data_dir: &Path,
+    tenant: &str,
+    line: &serde_json::Value,
+    idempotency: Option<&RecordIdempotency>,
+) -> Result<RecordAppendOutcome, RecordStoreError> {
+    retain_record_with_limits(data_dir, tenant, line, RecordStoreLimits::default(), idempotency)
+}
+
+fn retain_record_with_limits(
+    data_dir: &Path,
+    tenant: &str,
+    line: &serde_json::Value,
+    limits: RecordStoreLimits,
+    idempotency: Option<&RecordIdempotency>,
+) -> Result<RecordAppendOutcome, RecordStoreError> {
     use fs2::FileExt as _;
     use std::io::Write as _;
 
@@ -801,6 +910,7 @@ fn append_record_with_limits(
     let mut total_bytes = 0_u64;
     let mut directory_entries = 0_usize;
     let mut active_bytes = None;
+    let mut jsonl_paths = Vec::new();
     for entry in std::fs::read_dir(&tenant_dir)? {
         let entry = entry?;
         directory_entries = directory_entries.saturating_add(1);
@@ -825,6 +935,12 @@ fn append_record_with_limits(
             if entry_path == active_path {
                 active_bytes = Some(bytes);
             }
+            jsonl_paths.push(entry_path);
+        }
+    }
+    if let Some(idempotency) = idempotency {
+        if let Some(existing) = find_idempotent_record(&jsonl_paths, idempotency)? {
+            return Ok(RecordAppendOutcome::Existing(Box::new(existing)));
         }
     }
     let needed = total_bytes.saturating_add(line_bytes);
@@ -859,7 +975,62 @@ fn append_record_with_limits(
     if !tenant_dir_preexisting {
         sync_directory_chain(&tenant_dir, data_dir)?;
     }
-    Ok(())
+    Ok(RecordAppendOutcome::Appended)
+}
+
+fn find_idempotent_record(
+    jsonl_paths: &[PathBuf],
+    idempotency: &RecordIdempotency,
+) -> Result<Option<VerifyRecordResponse>, RecordStoreError> {
+    use std::io::BufRead as _;
+
+    let mut matched = None;
+    for path in jsonl_paths {
+        reject_symlink_or_non_file(path)?;
+        let file = open_private_read_file(path)?;
+        validate_and_harden_open_file(&file)?;
+        for line in std::io::BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            if u64::try_from(line.len()).unwrap_or(u64::MAX) > RECORD_MAX_LINE_BYTES {
+                return Err(RecordStoreError::CorruptRecord);
+            }
+            let stored: serde_json::Value = serde_json::from_str(&line).map_err(|_| RecordStoreError::CorruptRecord)?;
+            let Some(stored_key_hash) = stored.get("idempotency_key_hash") else {
+                continue;
+            };
+            let Some(stored_key_hash) = stored_key_hash.as_str() else {
+                return Err(RecordStoreError::CorruptRecord);
+            };
+            if stored_key_hash != idempotency.key_hash {
+                continue;
+            }
+            if stored.get("request_hash").and_then(serde_json::Value::as_str) != Some(idempotency.request_hash.as_str())
+            {
+                return Err(RecordStoreError::IdempotencyConflict);
+            }
+            let response = verification_response_from_stored_line(&stored)?;
+            if matched.as_ref().is_some_and(|existing| existing != &response) {
+                return Err(RecordStoreError::CorruptRecord);
+            }
+            matched = Some(response);
+        }
+    }
+    Ok(matched)
+}
+
+fn verification_response_from_stored_line(
+    stored: &serde_json::Value,
+) -> Result<VerifyRecordResponse, RecordStoreError> {
+    serde_json::from_value(json!({
+        "verification": stored.get("verification"),
+        "record_id": stored.get("record_id"),
+        "recorded_at": stored.get("recorded_at"),
+        "receipt": stored.get("receipt"),
+    }))
+    .map_err(|_| RecordStoreError::CorruptRecord)
 }
 
 fn reject_symlink_or_non_file(path: &Path) -> Result<(), RecordStoreError> {
@@ -881,6 +1052,13 @@ fn open_private_append_lock(path: &Path) -> std::io::Result<std::fs::File> {
 fn open_private_append_file(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true);
+    set_private_file_mode(&mut options);
+    options.open(path)
+}
+
+fn open_private_read_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
     set_private_file_mode(&mut options);
     options.open(path)
 }
@@ -990,6 +1168,41 @@ fn credential_rate_key(headers: &HeaderMap, tenant: &str) -> String {
     format!("{tenant}:{credential_hash}")
 }
 
+fn record_idempotency(
+    headers: &HeaderMap,
+    tenant: &str,
+    req: &VerifyRequest,
+) -> Result<Option<RecordIdempotency>, ProvErr> {
+    let mut values = headers.get_all("idempotency-key").iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(ProvErr::new(
+            StatusCode::BAD_REQUEST,
+            "exactly one Idempotency-Key header is allowed",
+        ));
+    }
+    let key = value.to_str().map_err(|_| {
+        ProvErr::new(
+            StatusCode::BAD_REQUEST,
+            "Idempotency-Key must contain visible ASCII characters",
+        )
+    })?;
+    if key.is_empty()
+        || key.len() > 128
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err(ProvErr::new(
+            StatusCode::BAD_REQUEST,
+            "Idempotency-Key must be 1-128 characters from [A-Za-z0-9._:-]",
+        ));
+    }
+    Ok(Some(RecordIdempotency::from_request(tenant, key, req)))
+}
+
 fn not_enabled() -> Response {
     problem_response(
         StatusCode::NOT_FOUND,
@@ -1079,15 +1292,28 @@ pub(super) async fn post_provenance_verify_record(
         Ok(tenant) => tenant,
         Err(resp) => return resp,
     };
+    let idempotency = match record_idempotency(&headers, &tenant, &body) {
+        Ok(idempotency) => idempotency,
+        Err(err) => return err.into_response(),
+    };
     let passport_key_path = state.passport_key_path.clone();
     let passport_fpr = state.passport_fpr.clone();
     let data_dir = state.data_dir.clone();
     match tokio::task::spawn_blocking(move || {
-        do_verify_record(&NoopMeter, &tenant, &body, &passport_key_path, &passport_fpr, &data_dir)
+        do_verify_record(
+            &NoopMeter,
+            &tenant,
+            &body,
+            idempotency.as_ref(),
+            &passport_key_path,
+            &passport_fpr,
+            &data_dir,
+        )
     })
     .await
     {
-        Ok(Ok(resp)) => (StatusCode::CREATED, Json(resp)).into_response(),
+        Ok(Ok(VerifyRecordOutcome::Created(resp))) => (StatusCode::CREATED, Json(resp)).into_response(),
+        Ok(Ok(VerifyRecordOutcome::Replayed(resp))) => (StatusCode::OK, Json(resp)).into_response(),
         Ok(Err(err)) => err.into_response(),
         Err(err) => blocking_task_failed("verify-record", err),
     }
@@ -1339,11 +1565,15 @@ mod tests {
                 content_b64: Some(b64(content)),
                 tenant_id: None,
             },
+            None,
             &key_path,
             &fpr,
             data_dir,
         )
         .unwrap();
+        let VerifyRecordOutcome::Created(resp) = resp else {
+            panic!("first write must create a verification record");
+        };
 
         assert!(resp.verification.ok);
         assert!(resp.record_id.starts_with("prov_vr_"));
@@ -1387,16 +1617,132 @@ mod tests {
                 content_b64: None, // no asset supplied
                 tenant_id: None,
             },
+            None,
             &key_path,
             &fpr,
             data_dir,
         )
         .unwrap();
+        let VerifyRecordOutcome::Created(resp) = resp else {
+            panic!("first write must create a verification record");
+        };
         assert!(
             !resp.verification.ok,
             "record must not claim overall success without asset match"
         );
         assert!(!resp.verification.asset_binding_checked);
+    }
+
+    #[test]
+    fn verify_record_idempotency_replays_exact_record_and_conflicts_on_payload_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("passport.key");
+        let key = crux_session::LocalPassportKey::from_path(&key_path).unwrap();
+        let fpr = key.passport_fpr().to_string();
+        let meter = RecordingMeter::default();
+        let signed = do_sign(&meter, "tenant-idem", &sign_req(b"bound-asset", None)).unwrap();
+        let req = VerifyRequest {
+            manifest_envelope_b64: Some(signed.manifest_envelope_b64),
+            content_b64: Some(b64(b"bound-asset")),
+            tenant_id: None,
+        };
+        let idempotency = RecordIdempotency::from_request("tenant-idem", "request-123", &req);
+
+        let first = do_verify_record(
+            &meter,
+            "tenant-idem",
+            &req,
+            Some(&idempotency),
+            &key_path,
+            &fpr,
+            tmp.path(),
+        )
+        .unwrap();
+        let VerifyRecordOutcome::Created(first) = first else {
+            panic!("first idempotent request must create");
+        };
+        let retry = do_verify_record(
+            &meter,
+            "tenant-idem",
+            &req,
+            Some(&idempotency),
+            &key_path,
+            &fpr,
+            tmp.path(),
+        )
+        .unwrap();
+        let VerifyRecordOutcome::Replayed(retry) = retry else {
+            panic!("retry must replay the retained record");
+        };
+        assert_eq!(retry, first);
+
+        let stored = std::fs::read_to_string(records_path(tmp.path(), "tenant-idem")).unwrap();
+        assert_eq!(stored.lines().count(), 1);
+        assert!(
+            !stored.contains("request-123"),
+            "raw idempotency keys must not be persisted"
+        );
+        assert!(stored.contains(&idempotency.key_hash));
+        assert_eq!(
+            meter
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(op, _)| op == "provenance.verify_record")
+                .count(),
+            1,
+            "an idempotent replay must not meter a second operation"
+        );
+
+        let changed_req = VerifyRequest {
+            content_b64: Some(b64(b"different-asset")),
+            ..req
+        };
+        let changed_idempotency = RecordIdempotency::from_request("tenant-idem", "request-123", &changed_req);
+        let err = do_verify_record(
+            &meter,
+            "tenant-idem",
+            &changed_req,
+            Some(&changed_idempotency),
+            &key_path,
+            &fpr,
+            tmp.path(),
+        )
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        let after_conflict = std::fs::read_to_string(records_path(tmp.path(), "tenant-idem")).unwrap();
+        assert_eq!(after_conflict.lines().count(), 1);
+    }
+
+    #[test]
+    fn idempotency_header_is_strict_and_tenant_scoped() {
+        let req = VerifyRequest {
+            manifest_envelope_b64: None,
+            content_b64: None,
+            tenant_id: None,
+        };
+        let mut headers = HeaderMap::new();
+        assert_eq!(record_idempotency(&headers, "tenant-a", &req).unwrap(), None);
+
+        headers.insert("idempotency-key", "safe.key:123".parse().unwrap());
+        let tenant_a = record_idempotency(&headers, "tenant-a", &req).unwrap().unwrap();
+        let tenant_b = record_idempotency(&headers, "tenant-b", &req).unwrap().unwrap();
+        assert_ne!(tenant_a.key_hash, tenant_b.key_hash);
+
+        headers.insert("idempotency-key", "unsafe/key".parse().unwrap());
+        assert_eq!(
+            record_idempotency(&headers, "tenant-a", &req).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+
+        headers.clear();
+        headers.append("idempotency-key", "one".parse().unwrap());
+        headers.append("idempotency-key", "two".parse().unwrap());
+        assert_eq!(
+            record_idempotency(&headers, "tenant-a", &req).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[test]
