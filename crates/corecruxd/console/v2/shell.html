@@ -3090,6 +3090,12 @@
   }
   .session-detail-k { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink2); }
   .session-detail-hash { font-family: var(--font-mono); font-size: 10px; color: var(--ink3); }
+  .session-detail-verify {
+    font-family: var(--font-mono); font-size: 10px; color: var(--acc);
+    text-decoration: none; border-bottom: 1px solid color-mix(in srgb, var(--acc) 45%, transparent);
+  }
+  .session-detail-verify:hover { border-bottom-color: var(--acc); }
+  .session-detail-verify:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; border-radius: 2px; }
   /* Transcript reference — inert text, never a link (reference-only decision). */
   .session-detail-transcript-ref {
     font-family: var(--font-mono); font-size: 10.5px; padding: 2px 7px; border-radius: 5px;
@@ -5765,7 +5771,7 @@
 <script>
 (function () {
   'use strict';
-  var SW_REV = 'ushell-v2-r15';   // keep in lock-step with /console-v2/sw.js
+  var SW_REV = 'ushell-v2-r16';   // keep in lock-step with /console-v2/sw.js
   if (!('serviceWorker' in navigator)) { return; }
   // Dev bypass — when the daemon serves this shell from CORECRUXD_CONSOLE_DEV_PATH
   // it stamps window.__CRUX_CONSOLE_DEV__ (see console.rs inject_console_dev_flag).
