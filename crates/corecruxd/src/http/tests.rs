@@ -7067,6 +7067,11 @@ async fn version_public_view_is_redacted() {
         checked_at: Some("2026-04-09T12:00:00Z".to_string()),
         error: None,
         comparison_stale: false,
+        basis: "binary".to_string(),
+        binary_commit: Some("def4567".to_string()),
+        checkout_commit: Some("abc1234".to_string()),
+        checkout_ahead_by: 0,
+        checkout_behind_by: 5,
         upgrade_hint: "current".to_string(),
     };
     let resp = get_version(State(state)).await.into_response();
@@ -7088,6 +7093,13 @@ async fn version_public_view_is_redacted() {
     assert!(body["update"]["repo_dir"].is_null());
     assert!(body["update"]["remote"].is_null());
     assert!(body["update"]["tracking_ref"].is_null());
+    // basis + checkout drift counts are product-facing; the commit SHAs
+    // (binary_commit/checkout_commit) stay admin-only like current_commit.
+    assert_eq!(body["update"]["basis"], "binary");
+    assert_eq!(body["update"]["checkout_behind_by"], 5);
+    assert_eq!(body["update"]["checkout_ahead_by"], 0);
+    assert!(body["update"]["binary_commit"].is_null());
+    assert!(body["update"]["checkout_commit"].is_null());
     assert_eq!(body["product"]["mode"], "free_local");
     assert_eq!(body["product"]["tier"], "free");
     assert_eq!(body["product"]["free_safety_baseline_active"], true);
@@ -7193,6 +7205,11 @@ async fn version_admin_view_includes_operational_details() {
         checked_at: Some("2026-04-09T12:00:00Z".to_string()),
         error: None,
         comparison_stale: false,
+        basis: "binary".to_string(),
+        binary_commit: Some("def4567".to_string()),
+        checkout_commit: Some("abc1234".to_string()),
+        checkout_ahead_by: 0,
+        checkout_behind_by: 5,
         upgrade_hint: "current".to_string(),
     };
 
@@ -7222,6 +7239,11 @@ async fn version_admin_view_includes_operational_details() {
     assert_eq!(body["update"]["current_commit"], "abc123");
     assert!(body["update"]["repo_dir"].is_null());
     assert!(body["update"]["error"].is_null());
+    // Admin view (public_view) keeps the basis fields, including commit SHAs.
+    assert_eq!(body["update"]["basis"], "binary");
+    assert_eq!(body["update"]["binary_commit"], "def4567");
+    assert_eq!(body["update"]["checkout_commit"], "abc1234");
+    assert_eq!(body["update"]["checkout_behind_by"], 5);
 }
 
 #[serial_test::serial]

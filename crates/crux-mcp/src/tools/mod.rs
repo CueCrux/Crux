@@ -1711,9 +1711,13 @@ pub fn list_tools_with_flags(
         },
         ToolDefinition {
             name: "update_status".to_string(),
-            description: "Show whether this checkout is current, behind, ahead, \
+            description: "Show whether the running daemon is current, behind, ahead, \
                           diverged, disabled, or unavailable relative to the tracked \
-                          git branch. Includes an upgrade hint plus backup playbook pointers."
+                          git branch. `basis` says what the primary ahead/behind counts \
+                          describe: \"binary\" (the running binary's embedded commit, the \
+                          deploy-gating number) or \"checkout\" (the source-tree HEAD, the \
+                          fallback); the checkout_* fields expose a stale source clone. \
+                          Includes an upgrade hint plus backup playbook pointers."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -2771,7 +2775,7 @@ pub fn tool_output_docs() -> Value {
         { "tool": "sync_pull",          "output": "{ tenant_id?, facts_pulled, cursor, total_pull_count, collection_cursor_count }" },
         { "tool": "sync_push",          "output": "{ mode?='tenant_promotion_preview', tenant_id?, facts_pushed?|would_promote?, preview_hash?, skipped_private?, skipped_synced?, skipped_not_allowlisted?, total_push_count?, collection_cursor_count? }" },
         { "tool": "sync_status",        "output": "{ mode, configured, background_sync_enabled, remote_url, api_key_configured, platform_online, degraded, degraded_reason, onboarding_hint, last_pull_at, last_push_at, pull_count, push_count, collection_pull_cursor_count, collection_push_cursor_count, tenant_manifest_supported, local_fact_count }" },
-        { "tool": "update_status",      "output": "{ enabled, state, tracking_ref, current_commit, latest_commit, ahead_by, behind_by, checked_at, error, upgrade_hint, upgrade_playbook_query, backup_playbook_query }" },
+        { "tool": "update_status",      "output": "{ enabled, state, basis(binary|checkout), tracking_ref, current_commit, binary_commit, latest_commit, ahead_by, behind_by, checkout_commit, checkout_ahead_by, checkout_behind_by, checked_at, error, comparison_stale, upgrade_hint, upgrade_playbook_query, backup_playbook_query }" },
         { "tool": "list_projects",      "output": "{ projects: [{ id, name, planning_target?, default_passport_id, created_at_unix_ms }] }" },
         { "tool": "get_project_context","output": "{ id, name, planning_target?, default_passport_id, members: [{ passport_id, role }], tenants: [{ tenant_id, default_passport_id? }] }" },
         { "tool": "list_work",          "output": "{ count, work: [{ id, project_id, state, title, body, assignee_passport?, tenant_id?, linked_pr?, linked_issue?, blocker_reason?, created_by_passport, created_at_unix_ms, updated_at_unix_ms }] }" },

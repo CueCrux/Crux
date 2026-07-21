@@ -40,6 +40,11 @@ pub fn initial_status(config: &Config) -> UpdateStatus {
             checked_at: None,
             error: None,
             comparison_stale: false,
+            basis: "checkout".to_string(),
+            binary_commit: None,
+            checkout_commit: None,
+            checkout_ahead_by: 0,
+            checkout_behind_by: 0,
             upgrade_hint: "Update checks are disabled. Set CORECRUXD_UPDATE_CHECK_ENABLED=1 to compare this checkout against the tracked branch.".to_string(),
         };
     }
@@ -61,6 +66,11 @@ pub fn initial_status(config: &Config) -> UpdateStatus {
         checked_at: None,
         error: Some("update check pending".to_string()),
         comparison_stale: false,
+        basis: "checkout".to_string(),
+        binary_commit: None,
+        checkout_commit: None,
+        checkout_ahead_by: 0,
+        checkout_behind_by: 0,
         upgrade_hint: "Update check is starting. If this node runs from a git checkout, the current tracked-branch status will appear shortly.".to_string(),
     }
 }
@@ -96,6 +106,29 @@ async fn write_status(status: &std::sync::Arc<RwLock<UpdateStatus>>, next: Updat
 }
 
 pub async fn refresh_status(config: &Config) -> UpdateStatus {
+    refresh_status_with_binary_sha(config, binary_sha_from_env()).await
+}
+
+/// The running binary's embedded commit (`CORECRUX_GIT_SHA`, the same source
+/// `/v1/version`'s `commit` uses). `"unknown"`/empty are treated as absent so a
+/// container build without a resolvable sha falls back to checkout basis.
+fn binary_sha_from_env() -> Option<String> {
+    option_env!("CORECRUX_GIT_SHA")
+        .map(str::trim)
+        .filter(|sha| !sha.is_empty() && *sha != "unknown")
+        .map(str::to_string)
+}
+
+/// Core of [`refresh_status`], parameterised on the binary sha so tests can pin
+/// a known commit rather than the compile-time-baked `CORECRUX_GIT_SHA`.
+///
+/// Basis selection: when the binary's embedded commit resolves in the checkout,
+/// the primary `state/ahead_by/behind_by/current_commit` describe the *running
+/// binary* vs the tracking ref (basis = "binary"). Otherwise they describe the
+/// checkout HEAD (basis = "checkout") — the legacy behaviour. Either way the
+/// `checkout_*` fields carry the HEAD-vs-tracking-ref comparison so a stale
+/// source clone is always visible.
+async fn refresh_status_with_binary_sha(config: &Config, binary_sha: Option<String>) -> UpdateStatus {
     let tracking_ref = tracking_ref(config);
     let checked_at = Some(Utc::now().to_rfc3339());
 
@@ -121,7 +154,10 @@ pub async fn refresh_status(config: &Config) -> UpdateStatus {
     };
     let repo_dir_display = Some(repo_dir.display().to_string());
 
-    let current_commit = match run_git(&repo_dir, &["rev-parse", "--short", "HEAD"]).await {
+    // The source checkout's HEAD — the legacy "current" and the checkout-basis
+    // fallback. The primary `current_commit` now follows the chosen basis (the
+    // binary sha when it resolves), so it gets its own name here.
+    let checkout_commit = match run_git(&repo_dir, &["rev-parse", "--short", "HEAD"]).await {
         Ok(commit) => Some(commit),
         Err(err) => return error_status(config, repo_dir_display, None, checked_at, err),
     };
@@ -152,37 +188,111 @@ pub async fn refresh_status(config: &Config) -> UpdateStatus {
             } else {
                 format!("tracking ref {tracking_ref} is unavailable locally: {err}")
             };
-            return unavailable_status(config, repo_dir_display, current_commit, checked_at, message);
+            return unavailable_status(config, repo_dir_display, checkout_commit, checked_at, message);
         }
     };
 
-    let counts = match run_git(
-        &repo_dir,
-        &["rev-list", "--left-right", "--count", &format!("HEAD...{tracking_ref}")],
-    )
-    .await
-    {
+    // Always compute the checkout (HEAD vs tracking ref) comparison — operators
+    // still want to see a stale source clone even when the binary is the basis.
+    let (checkout_ahead_by, checkout_behind_by) = match left_right_counts(&repo_dir, "HEAD", &tracking_ref).await {
         Ok(counts) => counts,
         Err(err) => {
-            let message = if let Some(fetch_warning) = fetch_warning {
-                format!("{fetch_warning}; git rev-list comparison failed: {err}")
-            } else {
-                format!("git rev-list comparison failed: {err}")
+            let message = match fetch_warning {
+                Some(fetch_warning) => format!("{fetch_warning}; {err}"),
+                None => err,
             };
-            return error_status(config, repo_dir_display, current_commit, checked_at, message);
+            return error_status(config, repo_dir_display, checkout_commit, checked_at, message);
         }
     };
 
-    let (ahead_by, behind_by) = match parse_left_right_counts(&counts) {
-        Ok(counts) => counts,
-        Err(err) => return error_status(config, repo_dir_display, current_commit, checked_at, err),
+    // Prefer the running binary's embedded commit when it resolves in this
+    // checkout, so the primary count reflects what is actually running rather
+    // than the source tree's HEAD (prod: a bind-mounted clone can be far staler
+    // than the binary built from it). `binary_note` records the fallback reason
+    // when a sha existed but could not be used; it is surfaced via the hint.
+    let mut binary_note = None;
+    let (basis, current_commit, ahead_by, behind_by, binary_commit) = match binary_sha.as_deref() {
+        Some(sha) => match run_git(
+            &repo_dir,
+            &[
+                "rev-parse",
+                "--short",
+                "--verify",
+                "--quiet",
+                &format!("{sha}^{{commit}}"),
+            ],
+        )
+        .await
+        {
+            Ok(short_sha) => match left_right_counts(&repo_dir, &short_sha, &tracking_ref).await {
+                Ok((ahead, behind)) => (
+                    "binary".to_string(),
+                    Some(short_sha.clone()),
+                    ahead,
+                    behind,
+                    Some(short_sha),
+                ),
+                Err(_) => {
+                    // Keep the sha and git error (which can embed paths) out of
+                    // the hint — /v1/version serves it unauthenticated. The
+                    // structured admin-only `binary_commit` carries the sha.
+                    binary_note = Some(format!(
+                        "binary-commit comparison against {tracking_ref} failed; reporting source-checkout drift instead."
+                    ));
+                    (
+                        "checkout".to_string(),
+                        checkout_commit.clone(),
+                        checkout_ahead_by,
+                        checkout_behind_by,
+                        Some(short_sha),
+                    )
+                }
+            },
+            Err(_) => {
+                // No sha in the text (public hint); `binary_commit` carries it.
+                binary_note = Some(
+                    "the running binary's commit does not resolve in the source checkout; reporting source-checkout drift instead."
+                        .to_string(),
+                );
+                (
+                    "checkout".to_string(),
+                    checkout_commit.clone(),
+                    checkout_ahead_by,
+                    checkout_behind_by,
+                    Some(sha.to_string()),
+                )
+            }
+        },
+        None => (
+            "checkout".to_string(),
+            checkout_commit.clone(),
+            checkout_ahead_by,
+            checkout_behind_by,
+            None,
+        ),
     };
+
     let state = derive_state(ahead_by, behind_by);
-    let error = fetch_warning;
-    // Fetch failed → the ahead/behind counts came from a stale cached tracking
-    // ref. Flag it so the banner / /v1/version present "drift unverified"
-    // rather than a confident (and possibly wrong) number.
-    let comparison_stale = error.is_some();
+    // Fetch failed → the counts came from a stale cached tracking ref. Flag it
+    // so the banner / /v1/version present "drift unverified" rather than a
+    // confident (and possibly wrong) number. Independent of `binary_note`.
+    let comparison_stale = fetch_warning.is_some();
+
+    // On binary basis, if the source checkout is at a different distance than
+    // the binary, tell the operator to refresh the src clone on deploy (the
+    // prod scenario: binary 90 behind, src clone 663 behind).
+    // No repo path in the text — /v1/version serves the hint unauthenticated
+    // and the path stays admin-only (`repo_dir` on /v1/admin/version).
+    let checkout_note = (basis == "binary" && (checkout_behind_by != behind_by || checkout_ahead_by != ahead_by))
+        .then(|| format!("note: the source checkout is {checkout_behind_by} behind — refresh it on deploy."));
+
+    // Both notes are operator-facing → append to the hint. The error channel is
+    // reserved for the fetch-staleness warning (drives `comparison_stale`).
+    let mut notes: Vec<String> = Vec::new();
+    notes.extend(checkout_note);
+    notes.extend(binary_note);
+    let extra_note = (!notes.is_empty()).then(|| notes.join(" "));
+    let hint = upgrade_hint(state, &basis, comparison_stale, extra_note.as_deref());
 
     UpdateStatus {
         enabled: true,
@@ -196,10 +306,26 @@ pub async fn refresh_status(config: &Config) -> UpdateStatus {
         ahead_by,
         behind_by,
         checked_at,
-        error: error.clone(),
+        error: fetch_warning,
         comparison_stale,
-        upgrade_hint: upgrade_hint(state, comparison_stale),
+        basis,
+        binary_commit,
+        checkout_commit,
+        checkout_ahead_by,
+        checkout_behind_by,
+        upgrade_hint: hint,
     }
+}
+
+/// Run `git rev-list --left-right --count <left>...<right>` in `repo_dir` and
+/// parse it into `(ahead, behind)`. Shared by the checkout and binary bases.
+async fn left_right_counts(repo_dir: &Path, left: &str, right: &str) -> Result<(u64, u64), String> {
+    let raw = run_git(
+        repo_dir,
+        &["rev-list", "--left-right", "--count", &format!("{left}...{right}")],
+    )
+    .await?;
+    parse_left_right_counts(&raw)
 }
 
 fn tracking_ref(config: &Config) -> String {
@@ -224,13 +350,18 @@ fn unavailable_status(
         ref_name: config.update_check_ref.clone(),
         tracking_ref: tracking_ref(config),
         repo_dir,
-        current_commit,
+        current_commit: current_commit.clone(),
         latest_commit: None,
         ahead_by: 0,
         behind_by: 0,
         checked_at,
         error: Some(error),
         comparison_stale: false,
+        basis: "checkout".to_string(),
+        binary_commit: None,
+        checkout_commit: current_commit,
+        checkout_ahead_by: 0,
+        checkout_behind_by: 0,
         upgrade_hint: "Update checks require a readable git checkout and a tracked branch. Continue serving traffic locally and configure CORECRUXD_UPDATE_CHECK_REPO_DIR if the service starts outside the repo.".to_string(),
     }
 }
@@ -249,13 +380,18 @@ fn error_status(
         ref_name: config.update_check_ref.clone(),
         tracking_ref: tracking_ref(config),
         repo_dir,
-        current_commit,
+        current_commit: current_commit.clone(),
         latest_commit: None,
         ahead_by: 0,
         behind_by: 0,
         checked_at,
         error: Some(error),
         comparison_stale: false,
+        basis: "checkout".to_string(),
+        binary_commit: None,
+        checkout_commit: current_commit,
+        checkout_ahead_by: 0,
+        checkout_behind_by: 0,
         upgrade_hint: "Update comparison failed. Keep the node running locally, inspect git connectivity, and use the upgrade playbooks before attempting maintenance.".to_string(),
     }
 }
@@ -269,13 +405,18 @@ fn derive_state(ahead_by: u64, behind_by: u64) -> UpdateCheckState {
     }
 }
 
-fn upgrade_hint(state: UpdateCheckState, using_cached_tracking_ref: bool) -> String {
+fn upgrade_hint(
+    state: UpdateCheckState,
+    basis: &str,
+    using_cached_tracking_ref: bool,
+    extra_note: Option<&str>,
+) -> String {
     let suffix = if using_cached_tracking_ref {
         " The comparison used the last locally cached tracking ref because fetch failed."
     } else {
         ""
     };
-    match state {
+    let base = match state {
         UpdateCheckState::Disabled => {
             "Update checks are disabled. Enable them before asking an agent to decide whether an upgrade is needed."
                 .to_string()
@@ -283,9 +424,17 @@ fn upgrade_hint(state: UpdateCheckState, using_cached_tracking_ref: bool) -> Str
         UpdateCheckState::Current => format!(
             "This checkout matches the tracked branch. No upgrade is needed right now.{suffix}"
         ),
-        UpdateCheckState::Behind => format!(
-            "A newer tracked commit is available. Take a filesystem snapshot of CORECRUXD_DATA_DIR or export receipts first, then pull, rebuild, and restart.{suffix}"
-        ),
+        UpdateCheckState::Behind => {
+            if basis == "binary" {
+                format!(
+                    "A newer tracked commit is available than the running binary. Take a filesystem snapshot of CORECRUXD_DATA_DIR or export receipts first, then rebuild/redeploy.{suffix}"
+                )
+            } else {
+                format!(
+                    "A newer tracked commit is available. Take a filesystem snapshot of CORECRUXD_DATA_DIR or export receipts first, then pull, rebuild, and restart.{suffix}"
+                )
+            }
+        }
         UpdateCheckState::Ahead => format!(
             "This checkout is ahead of the tracked branch. Avoid automated downgrades; review local commits before changing versions.{suffix}"
         ),
@@ -300,6 +449,10 @@ fn upgrade_hint(state: UpdateCheckState, using_cached_tracking_ref: bool) -> Str
             "Update status could not be refreshed because git comparison failed. Keep the node online locally and investigate before attempting an upgrade."
                 .to_string()
         }
+    };
+    match extra_note {
+        Some(note) if !note.is_empty() => format!("{base} {note}"),
+        _ => base,
     }
 }
 
@@ -522,6 +675,11 @@ mod tests {
             checked_at: Some("2026-04-10T00:00:00Z".to_string()),
             error: Some("git fetch failed".to_string()),
             comparison_stale: true,
+            basis: "checkout".to_string(),
+            binary_commit: None,
+            checkout_commit: Some("abc123".to_string()),
+            checkout_ahead_by: 0,
+            checkout_behind_by: 0,
             upgrade_hint: "investigate".to_string(),
         };
 
@@ -704,5 +862,107 @@ mod tests {
             .as_deref()
             .is_some_and(|error| error.contains("git fetch") && error.contains("failed")));
         assert!(status.upgrade_hint.contains("cached tracking ref"));
+    }
+
+    #[tokio::test]
+    async fn left_right_counts_reports_ahead_and_behind() {
+        // Exercises the shared parse-reuse helper directly: one local-only
+        // commit (ahead) against two remote-only commits (behind).
+        let fixture = setup_tracked_repo();
+        write_commit(&fixture.local, "local.txt", "local\n", "local");
+        for i in 0..2 {
+            write_commit(&fixture.seed, "r.txt", &format!("r{i}\n"), &format!("r{i}"));
+        }
+        git(&fixture.seed, &["push"]);
+        git(&fixture.local, &["fetch", "origin", "main"]);
+
+        let counts = left_right_counts(&fixture.local, "HEAD", "origin/main").await.unwrap();
+        assert_eq!(counts, (1, 2));
+    }
+
+    #[tokio::test]
+    async fn refresh_status_binary_basis_reports_binary_drift_not_checkout() {
+        // Remote advances 3 commits past the local clone; the checkout HEAD stays
+        // at the seed commit (3 behind). The "binary" is the second-to-last
+        // remote commit — 1 behind the tracking ref. Primary counts must follow
+        // the binary; the checkout_* fields must carry the staler HEAD drift.
+        let fixture = setup_tracked_repo();
+        for i in 0..3 {
+            write_commit(
+                &fixture.seed,
+                "remote.txt",
+                &format!("remote {i}\n"),
+                &format!("remote {i}"),
+            );
+        }
+        git(&fixture.seed, &["push"]);
+        let binary_sha = git(&fixture.seed, &["rev-parse", "HEAD~1"]);
+        let config = test_config(Some(fixture.local.clone()));
+
+        let status = refresh_status_with_binary_sha(&config, Some(binary_sha.clone())).await;
+
+        // Primary comparison follows the running binary.
+        assert_eq!(status.basis, "binary");
+        assert_eq!(status.state, UpdateCheckState::Behind);
+        assert_eq!(status.ahead_by, 0);
+        assert_eq!(status.behind_by, 1);
+        let short = status.current_commit.as_deref().expect("current_commit set");
+        assert!(binary_sha.starts_with(short), "current_commit is the binary sha prefix");
+        assert_eq!(status.binary_commit.as_deref(), Some(short));
+        // The staler source checkout is still visible in the secondary fields.
+        assert_eq!(status.checkout_ahead_by, 0);
+        assert_eq!(status.checkout_behind_by, 3);
+        assert!(status.checkout_commit.is_some());
+        assert_ne!(status.current_commit, status.checkout_commit);
+        // Binary basis + materially staler checkout → hint nudges a src refresh.
+        assert!(status.upgrade_hint.contains("running binary"));
+        assert!(status.upgrade_hint.contains("source checkout"));
+        // The hint is served unauthenticated via /v1/version — it must not leak
+        // the repo path (which stays admin-only in `repo_dir`).
+        assert!(!status.upgrade_hint.contains(fixture.local.to_str().unwrap()));
+        // Binary note is operator-facing (hint), not an error/staleness signal.
+        assert!(status.error.is_none());
+        assert!(!status.comparison_stale);
+    }
+
+    #[tokio::test]
+    async fn refresh_status_checkout_basis_when_binary_sha_absent() {
+        let fixture = setup_tracked_repo();
+        write_commit(&fixture.seed, "remote.txt", "remote\n", "remote");
+        git(&fixture.seed, &["push"]);
+        let config = test_config(Some(fixture.local.clone()));
+
+        let status = refresh_status_with_binary_sha(&config, None).await;
+
+        assert_eq!(status.basis, "checkout");
+        assert_eq!(status.state, UpdateCheckState::Behind);
+        assert_eq!(status.behind_by, 1);
+        assert_eq!(status.checkout_behind_by, 1);
+        assert!(status.binary_commit.is_none());
+        // Under checkout basis the primary commit is the checkout HEAD.
+        assert_eq!(status.current_commit, status.checkout_commit);
+        assert!(status.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_status_checkout_basis_with_note_when_binary_sha_unresolvable() {
+        let fixture = setup_tracked_repo();
+        let config = test_config(Some(fixture.local.clone()));
+        // Syntactically valid but absent from the checkout.
+        let bogus = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string();
+
+        let status = refresh_status_with_binary_sha(&config, Some(bogus.clone())).await;
+
+        assert_eq!(status.basis, "checkout");
+        // The unresolved binary sha is still surfaced so operators can see it.
+        assert_eq!(status.binary_commit.as_deref(), Some(bogus.as_str()));
+        // The fallback reason lands in the hint, not the error/staleness channel.
+        assert!(status.upgrade_hint.contains("does not resolve"));
+        // The unauthenticated /v1/version hint must not leak the binary sha.
+        assert!(!status.upgrade_hint.contains(&bogus));
+        assert!(status.error.is_none());
+        assert!(!status.comparison_stale);
+        // Synced checkout → Current under the checkout basis.
+        assert_eq!(status.state, UpdateCheckState::Current);
     }
 }
