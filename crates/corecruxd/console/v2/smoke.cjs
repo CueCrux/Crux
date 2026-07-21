@@ -75,6 +75,7 @@ const notes = [];
 // Promises for checks that must drive an async renderer (M4a renderPlanTree);
 // the report awaits these so their assertions land before the exit code.
 const asyncChecks = [];
+let passportMintInteraction = function () { return Promise.resolve(); };
 function check(ok, msg) { if (!ok) { failures.push(msg); } }
 
 // Shared jsdom-free mock DOM for the renderer-driving checks (plan tree, session
@@ -195,7 +196,7 @@ function walkPage(page, fn) {
   // Declared native v2 pages beyond the legacy 26 (not pro-gated). cx-activity-log
   // is the Work › Activity log — folded into this console (the standalone
   // /console/activity page was removed), custom-rendered.
-  const nativeExtra = new Set(['cx-activity-log']);
+  const nativeExtra = new Set(['cx-activity-log', 'cx-mints']);
   Object.keys(pages.PAGES).forEach(function (id) {
     if (LEGACY_26.indexOf(id) >= 0) { return; }
     if (nativeExtra.has(id)) {
@@ -513,6 +514,134 @@ function extractThemeVars(theme) {
     check(derive({}) === 'customer', '[posture] derivePosture(empty) must be customer');
     notes.push('posture derivation truth table verified (auth-off→operator, probe200→operator, else→customer; local_only rejected).');
   }
+})();
+
+// =========================================================================
+//  Check 8b — Passport mint M3 console gate. A pending request renders with
+//  its requested category pre-filled; edited category/name + the bound operator
+//  passport reach the generated approve client; reject is attributed; both
+//  decisions refresh the queue. Feature-off and scope failures stay inline.
+// =========================================================================
+(function checkPassportMintGate() {
+  const page = pages.PAGES['cx-mints'];
+  check(!!page, '[mint-m3] cx-mints must be registered');
+  check(page && page.operatorOnly === true, '[mint-m3] cx-mints must be operator-only');
+  check(page && page.load && page.load.endpoint === '/v1/passport/mint-requests/pending',
+    '[mint-m3] cx-mints must load GET /v1/passport/mint-requests/pending');
+  if (!page || !page.load || typeof page.load.build !== 'function') { return; }
+
+  const fixture = {
+    request_id: 'pmr_123', requester_id: 'agent-work', requested_category: 'work',
+    requested_by_passport: 'agent-work', reason: 'Needs an attributed work identity',
+    status: 'pending', requested_at_unix_ms: Date.now() - 5 * 60000
+  };
+  const sections = page.load.build({ ok: true, status: 200, data: { count: 1, pending: [fixture] } });
+  const mint = sections[0].controls.find(function (c) { return c.t === 'mintcard'; });
+  check(!!mint, '[mint-m3] a pending request must build one mintcard');
+  check(mint && mint.category === 'work', '[mint-m3] mintcard category must default to requested_category');
+  check(mint && /ago|just now/.test(mint.age), '[mint-m3] mintcard must carry a human-readable request age');
+
+  const disabled = page.load.build({ ok: false, status: 404, data: null });
+  const disabledControls = (disabled[0] && disabled[0].controls) || [];
+  check(!disabledControls.some(function (c) { return c.t === 'mintcard'; }),
+    '[mint-m3] feature-off 404 must render no mint cards');
+  check(disabledControls.some(function (c) { return /feature disabled/i.test(String(c.v || '')); }),
+    '[mint-m3] feature-off 404 must degrade to an inline feature-disabled state');
+
+  function mockDom() {
+    function node(tag) {
+      const listeners = {};
+      const n = {
+        tagName: String(tag || 'div').toUpperCase(), nodeType: 1, childNodes: [], _attrs: {}, value: '', disabled: false,
+        setAttribute: function (k, v) {
+          this._attrs[k] = String(v);
+          if (k === 'class') { this.className = String(v); }
+          if (k === 'value') { this.value = String(v); }
+          if (k === 'disabled') { this.disabled = true; }
+        },
+        getAttribute: function (k) { return Object.prototype.hasOwnProperty.call(this._attrs, k) ? this._attrs[k] : null; },
+        appendChild: function (c) { this.childNodes.push(c); c.parentNode = this; return c; },
+        addEventListener: function (type, fn) { listeners[type] = fn; },
+        fire: function (type) { return listeners[type] ? listeners[type]({ type: type, target: this }) : undefined; },
+        focus: function () { this.focused = true; }
+      };
+      Object.defineProperty(n, 'textContent', {
+        get: function () { let t = this._text || ''; this.childNodes.forEach(function (c) { t += c.textContent || ''; }); return t; },
+        set: function (v) { this._text = String(v); this.childNodes.length = 0; }
+      });
+      return n;
+    }
+    const doc = { createElement: node, createTextNode: function (v) { return { nodeType: 3, textContent: String(v), childNodes: [] }; } };
+    function all(root, out) {
+      out = out || [root];
+      (root.childNodes || []).forEach(function (c) { if (c && c.nodeType === 1) { out.push(c); all(c, out); } });
+      return out;
+    }
+    function byAttr(root, key, value) { return all(root).find(function (n) { return n.getAttribute && n.getAttribute(key) === value; }); }
+    return { doc: doc, node: node, byAttr: byAttr };
+  }
+
+  passportMintInteraction = async function () {
+    const dom = mockDom();
+    const calls = [];
+    let approveResponse = { ok: true, status: 200, data: { minted: true, status: 'approved', category: 'public' } };
+    function response(spec) { return { ok: spec.ok, status: spec.status, json: function () { return Promise.resolve(spec.data); } }; }
+    const savedDoc = global.document, savedWin = global.window, savedStorage = global.localStorage;
+    global.document = dom.doc;
+    global.localStorage = { getItem: function (key) { return key === 'crux-console-bound-passport' ? 'operator-work' : null; } };
+    global.window = {
+      CRUX_POSTURE: 'operator', CruxPages: pages,
+      CruxApi: { get: function (url) { calls.push({ kind: 'refresh', url: url }); return Promise.resolve(response({ ok: true, status: 200, data: { count: 0, pending: [] } })); } },
+      CruxApiGated: {
+        passportMintRequestApprove: function (id, body) { calls.push({ kind: 'approve', id: id, body: body }); return Promise.resolve(response(approveResponse)); },
+        passportMintRequestReject: function (id, body) { calls.push({ kind: 'reject', id: id, body: body }); return Promise.resolve(response({ ok: true, status: 200, data: { minted: false, status: 'rejected' } })); }
+      }
+    };
+    try {
+      const card = render.renderMintRequestCard(mint, dom.node('section'));
+      const category = dom.byAttr(card, 'data-mint-field', 'category');
+      const name = dom.byAttr(card, 'data-mint-field', 'name');
+      const accept = dom.byAttr(card, 'data-mint-action', 'accept');
+      const reject = dom.byAttr(card, 'data-mint-action', 'reject');
+      const status = dom.byAttr(card, 'data-mint-status', fixture.request_id);
+      check(category && category.value === 'work', '[mint-m3] rendered category select must be pre-filled to work');
+      check(!!name && !!accept && !!reject, '[mint-m3] rendered card must carry name, Accept, and Reject controls');
+
+      category.value = 'public'; name.value = 'Agent Public';
+      await accept.fire('click');
+      const approve = calls.find(function (c) { return c.kind === 'approve'; });
+      check(approve && approve.id === fixture.request_id, '[mint-m3] Accept must target the request approve endpoint client');
+      check(approve && approve.body.approver_passport === 'operator-work', '[mint-m3] Accept must carry the bound operator passport');
+      check(approve && approve.body.category === 'public' && approve.body.name === 'Agent Public',
+        '[mint-m3] Accept must carry the edited category and name');
+      check(calls.some(function (c) { return c.kind === 'refresh' && c.url === '/v1/passport/mint-requests/pending'; }),
+        '[mint-m3] successful Accept must refresh the pending mint queue');
+      check(status && /minted as public/.test(status.textContent), '[mint-m3] successful Accept must surface the minted category');
+
+      accept.disabled = false; reject.disabled = false;
+      await reject.fire('click');
+      const rejected = calls.find(function (c) { return c.kind === 'reject'; });
+      check(rejected && rejected.id === fixture.request_id, '[mint-m3] Reject must target the request reject endpoint client');
+      check(rejected && JSON.stringify(rejected.body) === JSON.stringify({ approver_passport: 'operator-work' }),
+        '[mint-m3] Reject must carry only the bound operator passport');
+      check(calls.filter(function (c) { return c.kind === 'refresh'; }).length >= 2,
+        '[mint-m3] successful Reject must refresh the pending mint queue');
+
+      approveResponse = { ok: false, status: 403, data: { detail: 'admin:write scope required' } };
+      const errorCard = render.renderMintRequestCard(mint, dom.node('section'));
+      await dom.byAttr(errorCard, 'data-mint-action', 'accept').fire('click');
+      const errorStatus = dom.byAttr(errorCard, 'data-mint-status', fixture.request_id);
+      check(errorStatus && /HTTP 403.*admin:write scope required/.test(errorStatus.textContent),
+        '[mint-m3] API errors must render inline with status and detail');
+    } catch (e) {
+      check(false, '[mint-m3] interaction smoke threw: ' + (e && e.stack || e));
+    } finally {
+      if (savedDoc === undefined) { delete global.document; } else { global.document = savedDoc; }
+      if (savedWin === undefined) { delete global.window; } else { global.window = savedWin; }
+      if (savedStorage === undefined) { delete global.localStorage; } else { global.localStorage = savedStorage; }
+    }
+    notes.push('passport mint M3: pending card prefill + edited approve attribution/body + reject attribution + refresh + feature-off/error degradation exercised.');
+  };
 })();
 
 // =========================================================================
@@ -2781,7 +2910,7 @@ function extractThemeVars(theme) {
 })();
 
 // ---- Report (awaits async renderer-driven checks) -----------------------
-Promise.all(asyncChecks).then(function () {
+Promise.all(asyncChecks).then(function () { return passportMintInteraction(); }).then(function () {
   console.log('unified-shell-console v2 — M14 + desktop mission control M2 smoke');
   notes.forEach(function (n) { console.log('  · ' + n); });
   if (failures.length) {
