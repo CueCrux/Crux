@@ -63,6 +63,23 @@ The private key, certificate, and request bodies live only in a
 permission-controlled temporary directory and are removed on exit. The script
 never prints the key.
 
+### Optional local P95 baseline
+
+Run up to 30 create-path samples per operation without exceeding the local
+per-credential window used by the quickstart:
+
+```bash
+CORECRUXD_BUILD_PROFILE=release \
+PROVENANCE_BENCH_ITERATIONS=30 \
+  ./examples/provenance-byok/quickstart.sh
+```
+
+This adds `benchmark.json`, with min/P50/P95/max latency for sign, stateless
+verify, and new retained-record creation. The record includes the corpus
+(`provenance-byok-sample-v1`), source commit, build profile, lane flags, and a
+unique run id. It is a loopback baseline, not the hosted-beta P95 required by
+the M9 launch gate.
+
 ## Reading the verification result
 
 For the disposable self-signed sample, `ok` is true while
