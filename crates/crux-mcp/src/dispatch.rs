@@ -678,6 +678,7 @@ fn current_unix_seconds() -> u64 {
 mod tests {
     use super::*;
     use crux_router::{mint_free_local_token, RcxRouter};
+    use ed25519_dalek::{Signer, SigningKey};
     use rcx_capability_token::RCX_CT_SIGNATURE_LEN;
     use serde_json::json;
 
@@ -687,7 +688,8 @@ mod tests {
 
     fn rcx_ctx_with_capabilities(capabilities: Vec<&str>) -> McpContext {
         let now = current_unix_seconds();
-        McpContext::new_default("test-node").with_rcx_router(RcxRouter::new(mint_free_local_token(
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let mut token = mint_free_local_token(
             "p_0123456789abcdef0123456789abcdef",
             "daemon_01HV0000000000000000000000",
             "default",
@@ -695,7 +697,12 @@ mod tests {
             now.saturating_sub(60),
             now.saturating_add(3600),
             [0x22; RCX_CT_SIGNATURE_LEN],
-        )))
+        );
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
+        McpContext::new_default("test-node").with_rcx_router(RcxRouter::new_with_trusted_issuer_pubkey(
+            token,
+            signing.verifying_key().to_bytes(),
+        ))
     }
 
     fn rpc(method: &str, params: serde_json::Value) -> JsonRpcRequest {

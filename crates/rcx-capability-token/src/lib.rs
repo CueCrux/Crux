@@ -5,20 +5,27 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
-//! RCX Capability Token v1.0 schema-lock crate.
+//! RCX Capability Token schema-lock and strict verification crate.
 //!
-//! Phase 1 intentionally keeps this crate pure: it defines the token model,
-//! deterministic CBOR/JSON mirror, token hash input, structural validation, and
-//! strict Ed25519 verification helpers used by the daemon router and hosted
-//! issuer.
+//! Legacy v1.0 tokens remain byte-stable. Delegation-capable v1.1 tokens opt in
+//! through an issuer-signed policy and require recipient proof of possession,
+//! a verifier-issued nonce, and an exact request context.
 
 use crux_session::canonical::{to_canonical_json, CborValue};
 use ed25519_dalek::{Signature as Ed25519Signature, Signer as _, SigningKey, VerifyingKey};
 use serde::Deserialize;
 
 pub const RCX_CT_SPEC_VERSION: &str = "rcx-ct/1.0";
+pub const RCX_CT_DELEGATION_SPEC_VERSION: &str = "rcx-ct/1.1";
 pub const RCX_CT_SIGNATURE_LEN: usize = 64;
 pub const RCX_CT_HASH_LEN: usize = 32;
+pub const RCX_CT_PUBLIC_KEY_LEN: usize = 32;
+pub const RCX_DELEGATION_ENVELOPE_VERSION: u8 = 1;
+pub const RCX_SYNC_DELEGATION_AUDIENCE: &str = "crux-sync";
+pub const RCX_MAX_DELEGATION_CAVEATS: usize = 16;
+pub const RCX_MAX_DELEGATION_SCOPES: usize = 64;
+pub const RCX_MAX_DELEGATION_PRINCIPALS: usize = 64;
+pub const RCX_MAX_DELEGATION_VALUE_LEN: usize = 128;
 pub const RCX_HOSTED_BACKEND_ID: &str = "hosted.vaultcrux.com";
 pub const RCX_HOSTED_RETRIEVE_CAPABILITY: &str = "vaultcrux.retrieve";
 pub const RCX_TEAM_CONSTRAINTS_SYNC_CAPABILITY: &str = "vaultcrux.team.constraints.sync";
@@ -371,12 +378,21 @@ where
         .map_err(|_| serde::de::Error::custom("signature.sig must be exactly 64 bytes of hex"))
 }
 
-/// A first-party caveat: a restriction a holder appends to *narrow* its token,
-/// bound by the holder's own possession-key signature (audit-v2 R3 / macaroon
-/// attenuation). Closed v1 set — each is a pure predicate the verifier evaluates
-/// locally. Unknown caveat types must fail closed (deny), never be ignored.
+fn deserialize_public_key_hex<'de, D>(deserializer: D) -> Result<[u8; RCX_CT_PUBLIC_KEY_LEN], D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let encoded = String::deserialize(deserializer)?;
+    let decoded = hex::decode(encoded).map_err(serde::de::Error::custom)?;
+    decoded
+        .try_into()
+        .map_err(|_| serde::de::Error::custom("delegation public keys must be exactly 32 bytes of hex"))
+}
+
+/// A first-party caveat: a restriction an issuer-named subject uses to narrow a
+/// recipient-bound token. Unknown variants or fields fail deserialization.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Caveat {
     /// The effective expiry must be ≤ this instant (shrink lifetime only).
     ExpiresAtLe { expires_at: u64 },
@@ -386,86 +402,381 @@ pub enum Caveat {
     ScopeSubset { scopes: Vec<String> },
 }
 
-/// Domain separator for the holder's caveat-binding signature. The holder signs
-/// `CAVEAT_BINDING_DOMAIN || token_hash(base) || canonical_cbor(caveats)` with its
-/// subject key; the verifier re-derives it and checks the signature.
-pub const CAVEAT_BINDING_DOMAIN: &[u8] = b"rcx-capability-token/caveat-binding/v1\0";
+/// Issuer-signed opt-in policy for PoP-only, one-hop delegation.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationPolicy {
+    pub presentation: DelegationPresentation,
+    pub max_depth: u8,
+    pub audience: DelegationAudience,
+    pub allowed_delegate_fprs: Vec<String>,
+}
 
-/// The exact bytes a holder signs to bind `caveats` to a base token. Pinning the
-/// base `token_hash` means the caveats cannot be lifted onto a different token,
-/// and any add/remove/reorder/mutate of a caveat changes these bytes (so the
-/// holder signature stops verifying).
-pub fn caveat_binding_message(base_token_hash: &[u8; RCX_CT_HASH_LEN], caveats: &[Caveat]) -> Vec<u8> {
-    let mut message = CAVEAT_BINDING_DOMAIN.to_vec();
-    message.extend_from_slice(base_token_hash);
-    let caveats_cbor = CborValue::Array(caveats.iter().map(caveat_to_cbor).collect()).encode();
-    message.extend_from_slice(&caveats_cbor);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationPresentation {
+    ProofOfPossession,
+}
+
+impl DelegationPresentation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ProofOfPossession => "proof_of_possession",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DelegationAudience {
+    CruxSync,
+}
+
+impl DelegationAudience {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CruxSync => RCX_SYNC_DELEGATION_AUDIENCE,
+        }
+    }
+}
+
+/// Atomic one-hop envelope signed by the issuer-named subject.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationEnvelope {
+    pub version: u8,
+    pub delegation_id: String,
+    pub audience: DelegationAudience,
+    #[serde(deserialize_with = "deserialize_public_key_hex")]
+    pub delegator_public_key: [u8; RCX_CT_PUBLIC_KEY_LEN],
+    #[serde(deserialize_with = "deserialize_public_key_hex")]
+    pub delegate_public_key: [u8; RCX_CT_PUBLIC_KEY_LEN],
+    pub caveats: Vec<Caveat>,
+    #[serde(deserialize_with = "deserialize_signature_hex")]
+    pub signature: [u8; RCX_CT_SIGNATURE_LEN],
+}
+
+pub const DELEGATION_BINDING_DOMAIN: &[u8] = b"rcx-capability-token/delegation-envelope/v1\0";
+pub const PRESENTATION_PROOF_DOMAIN: &[u8] = b"rcx-capability-token/presentation-proof/v1\0";
+
+/// Canonical bytes signed by the subject. Every envelope field and the exact
+/// issuer-signed base token are bound.
+pub fn delegation_binding_message(
+    base_token_hash: &[u8; RCX_CT_HASH_LEN],
+    version: u8,
+    delegation_id: &str,
+    audience: DelegationAudience,
+    delegator_public_key: &[u8; RCX_CT_PUBLIC_KEY_LEN],
+    delegate_public_key: &[u8; RCX_CT_PUBLIC_KEY_LEN],
+    caveats: &[Caveat],
+) -> Vec<u8> {
+    let mut message = DELEGATION_BINDING_DOMAIN.to_vec();
+    message.extend_from_slice(
+        &CborValue::Map(vec![
+            (
+                "base_token_hash".to_string(),
+                CborValue::Bytes(base_token_hash.to_vec()),
+            ),
+            ("version".to_string(), CborValue::Uint(u64::from(version))),
+            ("delegation_id".to_string(), CborValue::Text(delegation_id.to_string())),
+            ("audience".to_string(), CborValue::Text(audience.as_str().to_string())),
+            (
+                "delegator_public_key".to_string(),
+                CborValue::Bytes(delegator_public_key.to_vec()),
+            ),
+            (
+                "delegate_public_key".to_string(),
+                CborValue::Bytes(delegate_public_key.to_vec()),
+            ),
+            (
+                "caveats".to_string(),
+                CborValue::Array(caveats.iter().map(caveat_to_cbor).collect()),
+            ),
+        ])
+        .encode(),
+    );
     message
 }
 
-/// The holder's Ed25519 signature over [`caveat_binding_message`], carried on an
-/// attenuated token. Absent on an un-attenuated token, and — like `caveats` —
-/// excluded from `to_signing_cbor()` so the issuer signature is unaffected.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CaveatSignature {
-    #[serde(deserialize_with = "deserialize_signature_hex")]
-    pub sig: [u8; RCX_CT_SIGNATURE_LEN],
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttenuationContext<'a> {
+    pub audience: DelegationAudience,
+    pub tenant_id: &'a str,
+    pub backend_id: &'a str,
+    pub capability: &'a str,
+    pub data_egress_classes: &'a [DataEgressClass],
+    pub present_attestations: &'a [&'a str],
 }
 
-/// Outcome of verifying an attenuated token. `Verified` means the base issuer
-/// signature AND the holder's caveat binding are valid; the caller then evaluates
-/// the caveats against the concrete request via the `caveats_permit_*` /
-/// [`RcxCapabilityToken::attenuated_expires_at`] helpers (which can only narrow).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresentationProof<'a> {
+    pub public_key: [u8; RCX_CT_PUBLIC_KEY_LEN],
+    pub nonce: &'a [u8],
+    pub signature: [u8; RCX_CT_SIGNATURE_LEN],
+}
+
+/// Challenge signed by the presenter. It binds the full wire token, exact
+/// request context, and a verifier-issued nonce.
+pub fn presentation_proof_message(
+    token: &RcxCapabilityToken,
+    context: AttenuationContext<'_>,
+    nonce: &[u8],
+) -> Vec<u8> {
+    let token_digest = blake3::hash(&token.to_canonical_cbor());
+    let mut egress: Vec<&str> = context
+        .data_egress_classes
+        .iter()
+        .map(DataEgressClass::as_str)
+        .collect();
+    egress.sort_unstable();
+    egress.dedup();
+    let mut attestations = context.present_attestations.to_vec();
+    attestations.sort_unstable();
+    attestations.dedup();
+
+    let mut message = PRESENTATION_PROOF_DOMAIN.to_vec();
+    message.extend_from_slice(
+        &CborValue::Map(vec![
+            (
+                "token_digest".to_string(),
+                CborValue::Bytes(token_digest.as_bytes().to_vec()),
+            ),
+            (
+                "audience".to_string(),
+                CborValue::Text(context.audience.as_str().to_string()),
+            ),
+            ("tenant_id".to_string(), CborValue::Text(context.tenant_id.to_string())),
+            (
+                "backend_id".to_string(),
+                CborValue::Text(context.backend_id.to_string()),
+            ),
+            (
+                "capability".to_string(),
+                CborValue::Text(context.capability.to_string()),
+            ),
+            (
+                "data_egress_classes".to_string(),
+                CborValue::Array(
+                    egress
+                        .into_iter()
+                        .map(|value| CborValue::Text(value.to_string()))
+                        .collect(),
+                ),
+            ),
+            (
+                "present_attestations".to_string(),
+                CborValue::Array(
+                    attestations
+                        .into_iter()
+                        .map(|value| CborValue::Text(value.to_string()))
+                        .collect(),
+                ),
+            ),
+            ("nonce".to_string(), CborValue::Bytes(nonce.to_vec())),
+        ])
+        .encode(),
+    );
+    message
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttenuateError {
+    DelegationNotPermitted,
+    AlreadyDelegated,
+    DelegatorMismatch,
+    DelegateNotPermitted,
+    SelfDelegation,
+    InvalidDelegationId,
+    EmptyCaveats,
+    InvalidCaveatEncoding,
+    CaveatDoesNotNarrow,
+    CaveatOutsideBaseGrant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedAttenuation {
+    pub actor_fpr: String,
+    pub delegated_by: Option<String>,
+    pub delegation_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttenuatedOutcome {
-    Verified,
-    /// The base (issuer) verification failed.
+    Verified(VerifiedAttenuation),
     Base(VerifyOutcome),
-    /// The presented holder pubkey does not match `subject.passport_fpr`.
-    HolderMismatch,
-    /// Caveats are present but no holder caveat-signature accompanies them.
-    MissingCaveatSignature,
-    /// The holder caveat-signature does not verify over the caveats.
-    BadCaveatSignature,
-    /// A caveat-signature is present with no caveats (malformed).
-    UnexpectedCaveatSignature,
+    ContextDenied,
+    DelegationNotPermitted,
+    DelegatorMismatch,
+    DelegateMismatch,
+    SelfDelegation,
+    PrincipalRevoked,
+    BadPossessionProof,
+    MalformedEnvelope,
+    BadDelegationSignature,
+    CaveatDenied,
 }
 
-/// Verify an attenuated token: issuer signature on the base (unchanged) + the
-/// holder controls `subject.passport_fpr` + the holder's signature binds exactly
-/// these caveats. Unknown caveat types cannot occur (the `Caveat` enum is closed,
-/// so an unknown `type` fails deserialization upstream — fail-closed by construction).
-pub fn verify_token_attenuated(
+/// Verify a subject-PoP base or recipient-bound one-hop delegation. The caller
+/// owns nonce issuance and must consume the outstanding nonce atomically after a
+/// successful result; the independently supplied `expected_nonce` prevents a
+/// captured proof from satisfying a fresh challenge.
+pub fn verify_token_attenuated<F>(
     token: &RcxCapabilityToken,
     trust_root_pubkey: &[u8],
     now_unix_seconds: u64,
-    holder_pubkey: &[u8; 32],
-) -> AttenuatedOutcome {
-    match verify_token(token, trust_root_pubkey, now_unix_seconds) {
+    proof: &PresentationProof<'_>,
+    expected_nonce: &[u8],
+    context: AttenuationContext<'_>,
+    is_principal_revoked: F,
+) -> AttenuatedOutcome
+where
+    F: Fn(&str) -> bool,
+{
+    match verify_issuer_signed_token(token, trust_root_pubkey, now_unix_seconds) {
         VerifyOutcome::Verified => {}
         other => return AttenuatedOutcome::Base(other),
     }
-    if crux_session::passport::passport_fpr_from_public_key(holder_pubkey) != token.subject.passport_fpr {
-        return AttenuatedOutcome::HolderMismatch;
+
+    if token.delegation_envelope.as_ref().is_some_and(|envelope| {
+        envelope.version != RCX_DELEGATION_ENVELOPE_VERSION
+            || !valid_delegation_id(&envelope.delegation_id)
+            || envelope.caveats.is_empty()
+            || !caveats_are_canonical(&envelope.caveats)
+    }) {
+        return AttenuatedOutcome::MalformedEnvelope;
     }
-    match (token.caveats.is_empty(), token.caveat_signature.as_ref()) {
-        (true, None) => AttenuatedOutcome::Verified,
-        (true, Some(_)) => AttenuatedOutcome::UnexpectedCaveatSignature,
-        (false, None) => AttenuatedOutcome::MissingCaveatSignature,
-        (false, Some(caveat_sig)) => {
-            let verifying_key = match VerifyingKey::from_bytes(holder_pubkey) {
-                Ok(key) => key,
-                Err(_) => return AttenuatedOutcome::HolderMismatch,
-            };
-            let message = caveat_binding_message(&token.token_hash(), &token.caveats);
-            let signature = Ed25519Signature::from_bytes(&caveat_sig.sig);
-            match verifying_key.verify_strict(&message, &signature) {
-                Ok(()) => AttenuatedOutcome::Verified,
-                Err(_) => AttenuatedOutcome::BadCaveatSignature,
-            }
+
+    if token.tenant_scope.tenant_id != context.tenant_id
+        || !token.backends.iter().any(|backend| {
+            backend.backend_id == context.backend_id
+                && backend.permitted_capabilities.iter().any(|permitted| {
+                    permitted.capability == context.capability
+                        && context
+                            .data_egress_classes
+                            .iter()
+                            .all(|required| permitted.data_egress_classes.iter().any(|allowed| allowed == required))
+                        && permitted
+                            .required_attestations
+                            .iter()
+                            .all(|required| context.present_attestations.iter().any(|present| present == required))
+                })
+        })
+    {
+        return AttenuatedOutcome::ContextDenied;
+    }
+
+    if expected_nonce.is_empty() || proof.nonce != expected_nonce {
+        return AttenuatedOutcome::BadPossessionProof;
+    }
+    let presenter_key = match VerifyingKey::from_bytes(&proof.public_key) {
+        Ok(key) => key,
+        Err(_) => return AttenuatedOutcome::BadPossessionProof,
+    };
+    let message = presentation_proof_message(token, context, proof.nonce);
+    if presenter_key
+        .verify_strict(&message, &Ed25519Signature::from_bytes(&proof.signature))
+        .is_err()
+    {
+        return AttenuatedOutcome::BadPossessionProof;
+    }
+
+    let subject_fpr = token.subject.passport_fpr.as_str();
+    if is_principal_revoked(subject_fpr) {
+        return AttenuatedOutcome::PrincipalRevoked;
+    }
+
+    let Some(envelope) = token.delegation_envelope.as_ref() else {
+        if token
+            .delegation_policy
+            .as_ref()
+            .is_some_and(|policy| policy.audience != context.audience)
+        {
+            return AttenuatedOutcome::ContextDenied;
         }
+        return if crux_session::passport::passport_fpr_from_public_key(&proof.public_key) == subject_fpr {
+            AttenuatedOutcome::Verified(VerifiedAttenuation {
+                actor_fpr: subject_fpr.to_string(),
+                delegated_by: None,
+                delegation_id: None,
+            })
+        } else {
+            AttenuatedOutcome::DelegateMismatch
+        };
+    };
+
+    let Some(policy) = token.delegation_policy.as_ref() else {
+        return AttenuatedOutcome::DelegationNotPermitted;
+    };
+    if token.spec_version != RCX_CT_DELEGATION_SPEC_VERSION
+        || policy.presentation != DelegationPresentation::ProofOfPossession
+        || policy.max_depth != 1
+    {
+        return AttenuatedOutcome::DelegationNotPermitted;
     }
+    if policy.audience != context.audience || envelope.audience != policy.audience {
+        return AttenuatedOutcome::ContextDenied;
+    }
+    if crux_session::passport::passport_fpr_from_public_key(&envelope.delegator_public_key) != subject_fpr {
+        return AttenuatedOutcome::DelegatorMismatch;
+    }
+    let delegate_fpr = crux_session::passport::passport_fpr_from_public_key(&envelope.delegate_public_key);
+    if delegate_fpr == subject_fpr {
+        return AttenuatedOutcome::SelfDelegation;
+    }
+    if envelope.delegate_public_key != proof.public_key {
+        return AttenuatedOutcome::DelegateMismatch;
+    }
+    if !policy
+        .allowed_delegate_fprs
+        .iter()
+        .any(|allowed| allowed == &delegate_fpr)
+        || token.team_scope.as_ref().is_some_and(|team| {
+            !team
+                .principal_passport_fprs
+                .iter()
+                .any(|allowed| allowed == &delegate_fpr)
+        })
+    {
+        return AttenuatedOutcome::DelegationNotPermitted;
+    }
+    if is_principal_revoked(&delegate_fpr) {
+        return AttenuatedOutcome::PrincipalRevoked;
+    }
+
+    let delegator_key = match VerifyingKey::from_bytes(&envelope.delegator_public_key) {
+        Ok(key) => key,
+        Err(_) => return AttenuatedOutcome::DelegatorMismatch,
+    };
+    let message = delegation_binding_message(
+        &token.token_hash(),
+        envelope.version,
+        &envelope.delegation_id,
+        envelope.audience,
+        &envelope.delegator_public_key,
+        &envelope.delegate_public_key,
+        &envelope.caveats,
+    );
+    if delegator_key
+        .verify_strict(&message, &Ed25519Signature::from_bytes(&envelope.signature))
+        .is_err()
+    {
+        return AttenuatedOutcome::BadDelegationSignature;
+    }
+    if validate_caveats_against_base(token, &envelope.caveats).is_err() {
+        return AttenuatedOutcome::CaveatDenied;
+    }
+    if now_unix_seconds >= token.attenuated_expires_at()
+        || !token.caveats_permit_tenant(context.tenant_id)
+        || !token.caveats_permit_capability(context.capability)
+    {
+        return AttenuatedOutcome::CaveatDenied;
+    }
+
+    AttenuatedOutcome::Verified(VerifiedAttenuation {
+        actor_fpr: delegate_fpr,
+        delegated_by: Some(subject_fpr.to_string()),
+        delegation_id: Some(envelope.delegation_id.clone()),
+    })
 }
 
 fn caveat_to_cbor(caveat: &Caveat) -> CborValue {
@@ -488,6 +799,165 @@ fn caveat_to_cbor(caveat: &Caveat) -> CborValue {
     }
 }
 
+fn caveats_are_canonical(caveats: &[Caveat]) -> bool {
+    if caveats.is_empty() || caveats.len() > RCX_MAX_DELEGATION_CAVEATS {
+        return false;
+    }
+
+    let mut previous: Option<Vec<u8>> = None;
+    for caveat in caveats {
+        let valid = match caveat {
+            Caveat::ExpiresAtLe { .. } => true,
+            Caveat::TenantIdEq { tenant_id } => valid_delegation_value(tenant_id),
+            Caveat::ScopeSubset { scopes } => {
+                !scopes.is_empty()
+                    && scopes.len() <= RCX_MAX_DELEGATION_SCOPES
+                    && scopes.iter().all(|scope| valid_delegation_value(scope))
+                    && scopes.windows(2).all(|pair| pair[0] < pair[1])
+            }
+        };
+        if !valid {
+            return false;
+        }
+
+        let encoded = caveat_to_cbor(caveat).encode();
+        if previous.as_ref().is_some_and(|prior| prior >= &encoded) {
+            return false;
+        }
+        previous = Some(encoded);
+    }
+    true
+}
+
+fn normalize_scope_caveats(caveats: &mut [Caveat]) {
+    for caveat in caveats.iter_mut() {
+        if let Caveat::ScopeSubset { scopes } = caveat {
+            scopes.sort();
+            scopes.dedup();
+        }
+    }
+    caveats.sort_by_key(|caveat| caveat_to_cbor(caveat).encode());
+}
+
+fn validate_caveats_against_base(token: &RcxCapabilityToken, caveats: &[Caveat]) -> Result<(), AttenuateError> {
+    if caveats.is_empty() {
+        return Err(AttenuateError::EmptyCaveats);
+    }
+    if !caveats_are_canonical(caveats) {
+        return Err(AttenuateError::InvalidCaveatEncoding);
+    }
+
+    let base_capabilities: std::collections::BTreeSet<&str> = token
+        .backends
+        .iter()
+        .flat_map(|backend| {
+            backend
+                .permitted_capabilities
+                .iter()
+                .map(|permitted| permitted.capability.as_str())
+        })
+        .collect();
+    let mut strictly_narrows = false;
+
+    for caveat in caveats {
+        match caveat {
+            Caveat::ExpiresAtLe { expires_at } => {
+                if *expires_at > token.expires_at {
+                    return Err(AttenuateError::CaveatOutsideBaseGrant);
+                }
+                strictly_narrows |= *expires_at < token.expires_at;
+            }
+            Caveat::TenantIdEq { tenant_id } => {
+                if tenant_id != &token.tenant_scope.tenant_id {
+                    return Err(AttenuateError::CaveatOutsideBaseGrant);
+                }
+            }
+            Caveat::ScopeSubset { scopes } => {
+                if scopes.iter().any(|scope| !base_capabilities.contains(scope.as_str())) {
+                    return Err(AttenuateError::CaveatOutsideBaseGrant);
+                }
+                strictly_narrows |= scopes.len() < base_capabilities.len();
+            }
+        }
+    }
+
+    if strictly_narrows {
+        Ok(())
+    } else {
+        Err(AttenuateError::CaveatDoesNotNarrow)
+    }
+}
+
+fn valid_delegation_id(value: &str) -> bool {
+    valid_delegation_value(value)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn valid_delegation_value(value: &str) -> bool {
+    !value.is_empty() && value.len() <= RCX_MAX_DELEGATION_VALUE_LEN && !value.chars().any(char::is_control)
+}
+
+fn valid_passport_fpr(value: &str) -> bool {
+    value.len() == 34
+        && value.starts_with("p_")
+        && value.as_bytes()[2..]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn delegation_policy_to_cbor(policy: &DelegationPolicy) -> CborValue {
+    CborValue::Map(vec![
+        (
+            "presentation".to_string(),
+            CborValue::Text(policy.presentation.as_str().to_string()),
+        ),
+        ("max_depth".to_string(), CborValue::Uint(u64::from(policy.max_depth))),
+        (
+            "audience".to_string(),
+            CborValue::Text(policy.audience.as_str().to_string()),
+        ),
+        (
+            "allowed_delegate_fprs".to_string(),
+            CborValue::Array(
+                policy
+                    .allowed_delegate_fprs
+                    .iter()
+                    .map(|fpr| CborValue::Text(fpr.clone()))
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+fn delegation_envelope_to_cbor(envelope: &DelegationEnvelope) -> CborValue {
+    CborValue::Map(vec![
+        ("version".to_string(), CborValue::Uint(u64::from(envelope.version))),
+        (
+            "delegation_id".to_string(),
+            CborValue::Text(envelope.delegation_id.clone()),
+        ),
+        (
+            "audience".to_string(),
+            CborValue::Text(envelope.audience.as_str().to_string()),
+        ),
+        (
+            "delegator_public_key".to_string(),
+            CborValue::Bytes(envelope.delegator_public_key.to_vec()),
+        ),
+        (
+            "delegate_public_key".to_string(),
+            CborValue::Bytes(envelope.delegate_public_key.to_vec()),
+        ),
+        (
+            "caveats".to_string(),
+            CborValue::Array(envelope.caveats.iter().map(caveat_to_cbor).collect()),
+        ),
+        ("signature".to_string(), CborValue::Bytes(envelope.signature.to_vec())),
+    ])
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RcxCapabilityToken {
@@ -507,17 +977,13 @@ pub struct RcxCapabilityToken {
     pub credits: Credits,
     pub fallback: FallbackPolicy,
     pub revocation: Revocation,
-    /// Holder-appended narrowing caveats (audit-v2 R3). Empty on an un-attenuated
-    /// token — then it is excluded from the canonical form entirely, so existing
-    /// tokens are byte-identical. Bound by the holder signature, NOT the issuer's:
-    /// caveats are excluded from `to_signing_cbor()` so `token_hash()` (and the
-    /// issuer signature over it) is caveat-independent.
+    /// Issuer-signed opt-in. Its absence preserves the exact v1.0 signing bytes.
     #[serde(default)]
-    pub caveats: Vec<Caveat>,
-    /// The holder's signature binding `caveats` (audit-v2 R3). `None` on an
-    /// un-attenuated token; excluded from `to_signing_cbor()` like `caveats`.
+    pub delegation_policy: Option<DelegationPolicy>,
+    /// Subject-signed one-hop delegation. It is a presentation envelope, so it is
+    /// carried on the wire but excluded from the issuer's signing bytes.
     #[serde(default)]
-    pub caveat_signature: Option<CaveatSignature>,
+    pub delegation_envelope: Option<DelegationEnvelope>,
     pub signature: Signature,
 }
 
@@ -556,22 +1022,12 @@ impl RcxCapabilityToken {
             ("fallback".to_string(), fallback_to_cbor(&self.fallback)),
             ("revocation".to_string(), revocation_to_cbor(&self.revocation)),
         ]);
-        // Caveats are bound by the HOLDER signature, not the issuer's, so they are
-        // excluded from the signing hash (`zero_signature`) entirely — `token_hash`
-        // stays caveat-independent. In the wire/canonical form they appear only when
-        // present, so an un-attenuated token is byte-identical to a pre-R3 token.
-        if !zero_signature && !self.caveats.is_empty() {
-            pairs.push((
-                "caveats".to_string(),
-                CborValue::Array(self.caveats.iter().map(caveat_to_cbor).collect()),
-            ));
+        if let Some(policy) = &self.delegation_policy {
+            pairs.push(("delegation_policy".to_string(), delegation_policy_to_cbor(policy)));
         }
         if !zero_signature {
-            if let Some(caveat_sig) = &self.caveat_signature {
-                pairs.push((
-                    "caveat_signature".to_string(),
-                    CborValue::Map(vec![("sig".to_string(), CborValue::Bytes(caveat_sig.sig.to_vec()))]),
-                ));
+            if let Some(envelope) = &self.delegation_envelope {
+                pairs.push(("delegation_envelope".to_string(), delegation_envelope_to_cbor(envelope)));
             }
         }
         pairs.push((
@@ -601,45 +1057,109 @@ impl RcxCapabilityToken {
         hex::encode(self.token_hash())
     }
 
-    /// Append a narrowing caveat and bind the whole caveat list with the holder's
-    /// possession key (audit-v2 R3). Requires **no issuer key** — offline
-    /// attenuation. The issuer signature and `token_hash()` are untouched (caveats
-    /// are excluded from the signing hash).
-    pub fn attenuate(&self, caveat: Caveat, holder_key: &SigningKey) -> RcxCapabilityToken {
-        let mut token = self.clone();
-        token.caveats.push(caveat);
-        let signature = holder_key
-            .sign(&caveat_binding_message(&token.token_hash(), &token.caveats))
-            .to_bytes();
-        token.caveat_signature = Some(CaveatSignature { sig: signature });
-        token
+    pub fn requires_contextual_verification(&self) -> bool {
+        self.spec_version == RCX_CT_DELEGATION_SPEC_VERSION
+            || self.delegation_policy.is_some()
+            || self.delegation_envelope.is_some()
     }
 
-    /// Effective expiry after caveats — never later than the base `expires_at` or
-    /// any `ExpiresAtLe` caveat. A caveat can only SHRINK the lifetime.
-    pub fn attenuated_expires_at(&self) -> u64 {
-        self.caveats.iter().fold(self.expires_at, |acc, caveat| match caveat {
+    /// Create a canonical, recipient-bound one-hop envelope without the issuer key.
+    pub fn attenuate_for(
+        &self,
+        mut caveats: Vec<Caveat>,
+        delegate_public_key: [u8; RCX_CT_PUBLIC_KEY_LEN],
+        delegation_id: impl Into<String>,
+        subject_key: &SigningKey,
+    ) -> Result<RcxCapabilityToken, AttenuateError> {
+        if self.delegation_envelope.is_some() {
+            return Err(AttenuateError::AlreadyDelegated);
+        }
+        let Some(policy) = self.delegation_policy.as_ref() else {
+            return Err(AttenuateError::DelegationNotPermitted);
+        };
+        if self.spec_version != RCX_CT_DELEGATION_SPEC_VERSION
+            || policy.presentation != DelegationPresentation::ProofOfPossession
+            || policy.max_depth != 1
+        {
+            return Err(AttenuateError::DelegationNotPermitted);
+        }
+
+        let delegator_public_key = subject_key.verifying_key().to_bytes();
+        let delegator_fpr = crux_session::passport::passport_fpr_from_public_key(&delegator_public_key);
+        if delegator_fpr != self.subject.passport_fpr {
+            return Err(AttenuateError::DelegatorMismatch);
+        }
+        let delegate_fpr = crux_session::passport::passport_fpr_from_public_key(&delegate_public_key);
+        if delegate_fpr == delegator_fpr {
+            return Err(AttenuateError::SelfDelegation);
+        }
+        if !policy
+            .allowed_delegate_fprs
+            .iter()
+            .any(|allowed| allowed == &delegate_fpr)
+            || self.team_scope.as_ref().is_some_and(|team| {
+                !team
+                    .principal_passport_fprs
+                    .iter()
+                    .any(|allowed| allowed == &delegate_fpr)
+            })
+        {
+            return Err(AttenuateError::DelegateNotPermitted);
+        }
+
+        let delegation_id = delegation_id.into();
+        if !valid_delegation_id(&delegation_id) {
+            return Err(AttenuateError::InvalidDelegationId);
+        }
+        normalize_scope_caveats(&mut caveats);
+        validate_caveats_against_base(self, &caveats)?;
+
+        let signature = subject_key
+            .sign(&delegation_binding_message(
+                &self.token_hash(),
+                RCX_DELEGATION_ENVELOPE_VERSION,
+                &delegation_id,
+                policy.audience,
+                &delegator_public_key,
+                &delegate_public_key,
+                &caveats,
+            ))
+            .to_bytes();
+        let mut token = self.clone();
+        token.delegation_envelope = Some(DelegationEnvelope {
+            version: RCX_DELEGATION_ENVELOPE_VERSION,
+            delegation_id,
+            audience: policy.audience,
+            delegator_public_key,
+            delegate_public_key,
+            caveats,
+            signature,
+        });
+        Ok(token)
+    }
+
+    fn caveats(&self) -> &[Caveat] {
+        self.delegation_envelope
+            .as_ref()
+            .map_or(&[], |envelope| envelope.caveats.as_slice())
+    }
+
+    fn attenuated_expires_at(&self) -> u64 {
+        self.caveats().iter().fold(self.expires_at, |acc, caveat| match caveat {
             Caveat::ExpiresAtLe { expires_at } => acc.min(*expires_at),
             _ => acc,
         })
     }
 
-    /// Whether the caveats permit `tenant_id`. Every `TenantIdEq` caveat must name
-    /// exactly this tenant — a caveat can only restrict to one tenant, never add.
-    /// (The caller separately checks the tenant is within the base grant.)
-    pub fn caveats_permit_tenant(&self, tenant_id: &str) -> bool {
-        self.caveats.iter().all(|caveat| match caveat {
+    fn caveats_permit_tenant(&self, tenant_id: &str) -> bool {
+        self.caveats().iter().all(|caveat| match caveat {
             Caveat::TenantIdEq { tenant_id: allowed } => allowed == tenant_id,
             _ => true,
         })
     }
 
-    /// Whether the caveats permit `capability`. Every `ScopeSubset` caveat must
-    /// include it — a caveat can only remove capabilities, never add. (The caller
-    /// separately checks the capability is in the base grant, so a superset caveat
-    /// cannot widen: effective = base ∩ caveats.)
-    pub fn caveats_permit_capability(&self, capability: &str) -> bool {
-        self.caveats.iter().all(|caveat| match caveat {
+    fn caveats_permit_capability(&self, capability: &str) -> bool {
+        self.caveats().iter().all(|caveat| match caveat {
             Caveat::ScopeSubset { scopes } => scopes.iter().any(|s| s == capability),
             _ => true,
         })
@@ -664,12 +1184,41 @@ impl RcxCapabilityToken {
     /// (seconds) applied symmetrically to the not-yet-valid and expired
     /// comparisons. Pass `0` for exact-boundary semantics.
     pub fn validate_basic_with_leeway(&self, now_unix_seconds: u64, leeway_seconds: u64) -> TokenValidationResult {
-        let mut issues = Vec::new();
-        if self.spec_version != RCX_CT_SPEC_VERSION {
-            issues.push(TokenValidationIssue::new(
-                "invalid_spec_version",
-                "spec_version must be rcx-ct/1.0",
+        let mut result = self.validate_issuer_base_with_leeway(now_unix_seconds, leeway_seconds);
+        if self.requires_contextual_verification() {
+            result.issues.push(TokenValidationIssue::new(
+                "proof_of_possession_context_required",
+                "delegation-capable tokens require contextual proof-of-possession verification",
             ));
+            result.valid = false;
+        }
+        result
+    }
+
+    fn validate_issuer_base_with_leeway(&self, now_unix_seconds: u64, leeway_seconds: u64) -> TokenValidationResult {
+        let mut issues = Vec::new();
+        match (&*self.spec_version, &self.delegation_policy) {
+            (RCX_CT_SPEC_VERSION, None) if self.delegation_envelope.is_none() => {}
+            (RCX_CT_DELEGATION_SPEC_VERSION, Some(policy)) => {
+                let delegates_valid = !policy.allowed_delegate_fprs.is_empty()
+                    && policy.allowed_delegate_fprs.len() <= RCX_MAX_DELEGATION_PRINCIPALS
+                    && policy.allowed_delegate_fprs.iter().all(|fpr| valid_passport_fpr(fpr))
+                    && policy.allowed_delegate_fprs.windows(2).all(|pair| pair[0] < pair[1]);
+                if policy.presentation != DelegationPresentation::ProofOfPossession
+                    || policy.max_depth != 1
+                    || policy.audience != DelegationAudience::CruxSync
+                    || !delegates_valid
+                {
+                    issues.push(TokenValidationIssue::new(
+                        "invalid_delegation_policy",
+                        "delegation policy must be canonical PoP-only, one-hop, crux-sync policy",
+                    ));
+                }
+            }
+            _ => issues.push(TokenValidationIssue::new(
+                "invalid_spec_version",
+                "delegation fields require issuer-signed rcx-ct/1.1 policy",
+            )),
         }
         if self.token_id.trim().is_empty() {
             issues.push(TokenValidationIssue::new("missing_token_id", "token_id is required"));
@@ -795,7 +1344,19 @@ impl RcxCapabilityToken {
         }
     }
 
-    pub fn permits_egress(&self, backend_id: &str, capability: &str, egress_class: DataEgressClass) -> bool {
+    pub fn permits_egress(
+        &self,
+        trust_root_pubkey: &[u8],
+        now_unix_seconds: u64,
+        backend_id: &str,
+        capability: &str,
+        egress_class: DataEgressClass,
+    ) -> bool {
+        verify_token(self, trust_root_pubkey, now_unix_seconds) == VerifyOutcome::Verified
+            && self.base_permits_egress(backend_id, capability, &egress_class)
+    }
+
+    fn base_permits_egress(&self, backend_id: &str, capability: &str, egress_class: &DataEgressClass) -> bool {
         self.backends.iter().any(|backend| {
             backend.backend_id == backend_id
                 && backend.permitted_capabilities.iter().any(|permitted| {
@@ -803,7 +1364,7 @@ impl RcxCapabilityToken {
                         && permitted
                             .data_egress_classes
                             .iter()
-                            .any(|candidate| candidate == &egress_class)
+                            .any(|candidate| candidate == egress_class)
                 })
         })
     }
@@ -840,7 +1401,21 @@ pub enum VerifyOutcome {
 }
 
 pub fn verify_token(token: &RcxCapabilityToken, trust_root_pubkey: &[u8], now_unix_seconds: u64) -> VerifyOutcome {
-    let basic = token.validate_basic(now_unix_seconds);
+    match verify_issuer_signed_token(token, trust_root_pubkey, now_unix_seconds) {
+        VerifyOutcome::Verified if token.requires_contextual_verification() => {
+            VerifyOutcome::StructuralFailure(vec!["proof_of_possession_context_required".to_string()])
+        }
+        outcome => outcome,
+    }
+}
+
+fn verify_issuer_signed_token(
+    token: &RcxCapabilityToken,
+    trust_root_pubkey: &[u8],
+    now_unix_seconds: u64,
+) -> VerifyOutcome {
+    let basic =
+        token.validate_issuer_base_with_leeway(now_unix_seconds, RcxCapabilityToken::DEFAULT_CLOCK_SKEW_LEEWAY_SECS);
     if !basic.valid {
         return VerifyOutcome::StructuralFailure(basic.issues.into_iter().map(|issue| issue.code).collect());
     }
@@ -916,8 +1491,8 @@ pub fn free_local_verified_fixture() -> RcxCapabilityToken {
             crl_url: None,
             push_channel: None,
         },
-        caveats: Vec::new(),
-        caveat_signature: None,
+        delegation_policy: None,
+        delegation_envelope: None,
         signature: Signature {
             alg: "ed25519".to_string(),
             kid: passport_fpr.to_string(),
@@ -1189,345 +1764,777 @@ mod tests {
         assert_eq!(token.token_hash_hex(), FREE_LOCAL_VERIFIED_TOKEN_HASH);
     }
 
-    // ── R3 macaroon M1: caveats + holder-signed binding ───────────────────
+    const M2_REPAIR_NOW: u64 = 1_776_989_601;
+    const M2_NONCE: &[u8] = b"verifier-issued-single-use-nonce";
 
-    #[test]
-    fn caveats_do_not_affect_token_hash_and_empty_is_invisible() {
-        // The issuer signs token_hash, which MUST be caveat-independent (caveats
-        // are holder-bound, not issuer-bound). An un-attenuated token also carries
-        // no `caveats` field at all (byte-identical — also pinned by the golden test).
-        let base = free_local_verified_fixture();
-        let mut attenuated = base.clone();
-        attenuated.caveats = vec![
-            Caveat::TenantIdEq {
-                tenant_id: "acme".to_string(),
-            },
-            Caveat::ExpiresAtLe { expires_at: 123 },
-        ];
-        assert_eq!(
-            base.token_hash(),
-            attenuated.token_hash(),
-            "caveats must not change token_hash"
-        );
-        assert!(
-            !base.to_canonical_json().contains("caveats"),
-            "un-attenuated token has no caveats field"
-        );
-        assert!(
-            attenuated.to_canonical_json().contains("caveats"),
-            "attenuated token carries caveats"
-        );
-    }
-
-    #[test]
-    fn holder_signature_binds_caveats_and_resists_un_narrowing() {
-        use ed25519_dalek::Verifier as _;
-        let holder = SigningKey::from_bytes(&[7u8; 32]);
-        let base_hash = free_local_verified_fixture().token_hash();
-        let caveats = vec![
-            Caveat::TenantIdEq {
-                tenant_id: "acme".to_string(),
-            },
-            Caveat::ExpiresAtLe { expires_at: 999 },
-        ];
-        let msg = caveat_binding_message(&base_hash, &caveats);
-        let sig = holder.sign(&msg);
-        holder
-            .verifying_key()
-            .verify(&msg, &sig)
-            .expect("holder signature verifies");
-
-        // Strip a caveat → message changes → the holder sig no longer verifies.
-        // A holder cannot un-narrow: it would have to re-sign as a different subject.
-        let stripped = caveat_binding_message(&base_hash, &caveats[..1]);
-        assert!(
-            holder.verifying_key().verify(&stripped, &sig).is_err(),
-            "stripping a caveat breaks the binding"
-        );
-
-        // Reorder → different message (caveat order binds).
-        let reordered = caveat_binding_message(&base_hash, &[caveats[1].clone(), caveats[0].clone()]);
-        assert_ne!(msg, reordered, "caveat order is part of the binding");
-
-        // Caveats cannot be lifted onto a different base token.
-        assert_ne!(
-            msg,
-            caveat_binding_message(&[0u8; RCX_CT_HASH_LEN], &caveats),
-            "base token_hash binds"
-        );
-    }
-
-    #[test]
-    fn caveat_binding_message_is_deterministic() {
-        let base_hash = free_local_verified_fixture().token_hash();
-        let caveats = vec![Caveat::ScopeSubset {
-            scopes: vec!["a".to_string(), "b".to_string()],
-        }];
-        assert_eq!(
-            caveat_binding_message(&base_hash, &caveats),
-            caveat_binding_message(&base_hash, &caveats),
-        );
-    }
-
-    // ── R3 macaroon M2: attenuate + verify (intersection, fail-closed) ────
-
-    const M2_NOW: u64 = 1_776_989_601;
-
-    /// A fixture whose `subject.passport_fpr` is the fingerprint of `holder`, and
-    /// whose base is issuer-signed by `issuer` — the shape `verify_token_attenuated`
-    /// expects (base issuer sig + holder possession of the subject key).
-    fn holder_bound_fixture(issuer: &SigningKey, holder: &SigningKey) -> RcxCapabilityToken {
+    fn delegation_enabled_fixture(
+        issuer: &SigningKey,
+        subject: &SigningKey,
+        delegate: &SigningKey,
+    ) -> RcxCapabilityToken {
         let mut token = free_local_verified_fixture();
+        token.spec_version = RCX_CT_DELEGATION_SPEC_VERSION.to_string();
         token.subject.passport_fpr =
-            crux_session::passport::passport_fpr_from_public_key(&holder.verifying_key().to_bytes());
+            crux_session::passport::passport_fpr_from_public_key(&subject.verifying_key().to_bytes());
+        token.backends[0].permitted_capabilities.push(PermittedCapability {
+            capability: "corecrux.query.explain".to_string(),
+            data_egress_classes: vec![DataEgressClass::None],
+            required_attestations: vec!["passport_bound".to_string()],
+            credit_cost: None,
+        });
+        token.delegation_policy = Some(DelegationPolicy {
+            presentation: DelegationPresentation::ProofOfPossession,
+            max_depth: 1,
+            audience: DelegationAudience::CruxSync,
+            allowed_delegate_fprs: vec![crux_session::passport::passport_fpr_from_public_key(
+                &delegate.verifying_key().to_bytes(),
+            )],
+        });
         token.signature.sig = issuer.sign(&token.token_hash()).to_bytes();
         token
     }
 
-    #[test]
-    fn attenuate_then_verify_ok_and_narrows() {
-        let issuer = SigningKey::from_bytes(&[5u8; 32]);
-        let holder = SigningKey::from_bytes(&[7u8; 32]);
-        let base = holder_bound_fixture(&issuer, &holder);
-        let att = base
-            .attenuate(
-                Caveat::TenantIdEq {
-                    tenant_id: "default".to_string(),
-                },
-                &holder,
+    fn query_context<'a>(
+        capability: &'a str,
+        tenant_id: &'a str,
+        attestations: &'a [&'a str],
+    ) -> AttenuationContext<'a> {
+        AttenuationContext {
+            audience: DelegationAudience::CruxSync,
+            tenant_id,
+            backend_id: "local",
+            capability,
+            data_egress_classes: &[DataEgressClass::None],
+            present_attestations: attestations,
+        }
+    }
+
+    fn presentation_proof<'a>(
+        token: &RcxCapabilityToken,
+        context: AttenuationContext<'_>,
+        nonce: &'a [u8],
+        presenter: &SigningKey,
+    ) -> PresentationProof<'a> {
+        PresentationProof {
+            public_key: presenter.verifying_key().to_bytes(),
+            nonce,
+            signature: presenter
+                .sign(&presentation_proof_message(token, context, nonce))
+                .to_bytes(),
+        }
+    }
+
+    fn verify_as(
+        token: &RcxCapabilityToken,
+        issuer: &SigningKey,
+        presenter: &SigningKey,
+        context: AttenuationContext<'_>,
+        nonce: &[u8],
+        expected_nonce: &[u8],
+    ) -> AttenuatedOutcome {
+        let proof = presentation_proof(token, context, nonce, presenter);
+        verify_token_attenuated(
+            token,
+            &issuer.verifying_key().to_bytes(),
+            M2_REPAIR_NOW,
+            &proof,
+            expected_nonce,
+            context,
+            |_| false,
+        )
+    }
+
+    fn valid_delegation(issuer: &SigningKey, subject: &SigningKey, delegate: &SigningKey) -> RcxCapabilityToken {
+        delegation_enabled_fixture(issuer, subject, delegate)
+            .attenuate_for(
+                vec![
+                    Caveat::TenantIdEq {
+                        tenant_id: "default".to_string(),
+                    },
+                    Caveat::ExpiresAtLe {
+                        expires_at: 1_780_143_100,
+                    },
+                ],
+                delegate.verifying_key().to_bytes(),
+                "delegation-1",
+                subject,
             )
-            .attenuate(
-                Caveat::ExpiresAtLe {
-                    expires_at: base.expires_at - 10,
-                },
-                &holder,
+            .unwrap_or_else(|error| panic!("valid delegation fixture failed: {error:?}"))
+    }
+
+    fn resign_envelope(token: &mut RcxCapabilityToken, subject: &SigningKey) {
+        let base_hash = token.token_hash();
+        let envelope = token
+            .delegation_envelope
+            .as_mut()
+            .unwrap_or_else(|| panic!("delegation envelope required"));
+        envelope.signature = subject
+            .sign(&delegation_binding_message(
+                &base_hash,
+                envelope.version,
+                &envelope.delegation_id,
+                envelope.audience,
+                &envelope.delegator_public_key,
+                &envelope.delegate_public_key,
+                &envelope.caveats,
+            ))
+            .to_bytes();
+    }
+
+    #[test]
+    fn v11_policy_is_issuer_signed_and_envelope_is_subject_signed() {
+        let issuer = SigningKey::from_bytes(&[1; 32]);
+        let subject = SigningKey::from_bytes(&[2; 32]);
+        let delegate = SigningKey::from_bytes(&[3; 32]);
+        let base = delegation_enabled_fixture(&issuer, &subject, &delegate);
+        let delegated = valid_delegation(&issuer, &subject, &delegate);
+
+        assert_eq!(base.token_hash(), delegated.token_hash());
+        assert_ne!(base.to_canonical_cbor(), delegated.to_canonical_cbor());
+        let mut changed_policy = base;
+        changed_policy
+            .delegation_policy
+            .as_mut()
+            .unwrap_or_else(|| panic!("policy required"))
+            .allowed_delegate_fprs = vec![crux_session::passport::passport_fpr_from_public_key(
+            &SigningKey::from_bytes(&[4; 32]).verifying_key().to_bytes(),
+        )];
+        assert_eq!(
+            verify_token(&changed_policy, &issuer.verifying_key().to_bytes(), M2_REPAIR_NOW),
+            VerifyOutcome::BadSignature
+        );
+    }
+
+    #[test]
+    fn v11_canonical_json_round_trips_without_losing_binding_fields() {
+        let issuer = SigningKey::from_bytes(&[1; 32]);
+        let subject = SigningKey::from_bytes(&[2; 32]);
+        let delegate = SigningKey::from_bytes(&[3; 32]);
+        let token = valid_delegation(&issuer, &subject, &delegate);
+        let decoded: RcxCapabilityToken = serde_json::from_str(&token.to_canonical_json())
+            .unwrap_or_else(|error| panic!("v1.1 canonical JSON must decode: {error}"));
+
+        assert_eq!(decoded, token);
+        assert_eq!(decoded.to_canonical_cbor(), token.to_canonical_cbor());
+        assert_eq!(decoded.token_hash(), token.token_hash());
+    }
+
+    #[test]
+    fn valid_one_hop_verifies_with_attributed_actor() {
+        let issuer = SigningKey::from_bytes(&[1; 32]);
+        let subject = SigningKey::from_bytes(&[2; 32]);
+        let delegate = SigningKey::from_bytes(&[3; 32]);
+        let token = valid_delegation(&issuer, &subject, &delegate);
+        let context = query_context("corecrux.query.local", "default", &[]);
+
+        assert_eq!(
+            verify_as(&token, &issuer, &delegate, context, M2_NONCE, M2_NONCE),
+            AttenuatedOutcome::Verified(VerifiedAttenuation {
+                actor_fpr: crux_session::passport::passport_fpr_from_public_key(&delegate.verifying_key().to_bytes()),
+                delegated_by: Some(crux_session::passport::passport_fpr_from_public_key(
+                    &subject.verifying_key().to_bytes()
+                )),
+                delegation_id: Some("delegation-1".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn subject_pop_base_verifies_only_for_subject() {
+        let issuer = SigningKey::from_bytes(&[1; 32]);
+        let subject = SigningKey::from_bytes(&[2; 32]);
+        let delegate = SigningKey::from_bytes(&[3; 32]);
+        let token = delegation_enabled_fixture(&issuer, &subject, &delegate);
+        let context = query_context("corecrux.query.local", "default", &[]);
+
+        assert!(matches!(
+            verify_as(&token, &issuer, &subject, context, M2_NONCE, M2_NONCE),
+            AttenuatedOutcome::Verified(_)
+        ));
+        assert_eq!(
+            verify_as(&token, &issuer, &delegate, context, M2_NONCE, M2_NONCE),
+            AttenuatedOutcome::DelegateMismatch
+        );
+    }
+
+    #[test]
+    fn generic_paths_reject_every_v11_token() {
+        let issuer = SigningKey::from_bytes(&[1; 32]);
+        let subject = SigningKey::from_bytes(&[2; 32]);
+        let delegate = SigningKey::from_bytes(&[3; 32]);
+        for token in [
+            delegation_enabled_fixture(&issuer, &subject, &delegate),
+            valid_delegation(&issuer, &subject, &delegate),
+        ] {
+            assert!(token
+                .validate_basic(M2_REPAIR_NOW)
+                .issues
+                .iter()
+                .any(|issue| issue.code == "proof_of_possession_context_required"));
+            assert_eq!(
+                verify_token(&token, &issuer.verifying_key().to_bytes(), M2_REPAIR_NOW),
+                VerifyOutcome::StructuralFailure(vec!["proof_of_possession_context_required".to_string()])
             );
-
-        assert_eq!(
-            verify_token_attenuated(
-                &att,
+            assert!(!token.permits_egress(
                 &issuer.verifying_key().to_bytes(),
-                M2_NOW,
-                &holder.verifying_key().to_bytes()
-            ),
-            AttenuatedOutcome::Verified,
-        );
-        assert_eq!(att.attenuated_expires_at(), base.expires_at - 10);
-        assert!(att.caveats_permit_tenant("default"));
-        assert!(!att.caveats_permit_tenant("other"));
+                M2_REPAIR_NOW,
+                "local",
+                "corecrux.query.local",
+                DataEgressClass::None
+            ));
+        }
     }
 
     #[test]
-    fn un_attenuated_token_passes_the_attenuated_path() {
-        let issuer = SigningKey::from_bytes(&[5u8; 32]);
-        let holder = SigningKey::from_bytes(&[7u8; 32]);
-        let base = holder_bound_fixture(&issuer, &holder);
+    fn stripping_envelope_does_not_let_delegate_use_subject_base() {
+        let issuer = SigningKey::from_bytes(&[1; 32]);
+        let subject = SigningKey::from_bytes(&[2; 32]);
+        let delegate = SigningKey::from_bytes(&[3; 32]);
+        let mut token = valid_delegation(&issuer, &subject, &delegate);
+        token.delegation_envelope = None;
+        let context = query_context("corecrux.query.local", "default", &[]);
         assert_eq!(
-            verify_token_attenuated(
-                &base,
-                &issuer.verifying_key().to_bytes(),
-                M2_NOW,
-                &holder.verifying_key().to_bytes()
-            ),
-            AttenuatedOutcome::Verified,
+            verify_as(&token, &issuer, &delegate, context, M2_NONCE, M2_NONCE),
+            AttenuatedOutcome::DelegateMismatch
         );
     }
 
-    // ── Adversarial: caveats can only narrow ──────────────────────────────
-
     #[test]
-    fn widen_expiry_caveat_cannot_extend() {
-        let issuer = SigningKey::from_bytes(&[5u8; 32]);
-        let holder = SigningKey::from_bytes(&[7u8; 32]);
-        let base = holder_bound_fixture(&issuer, &holder);
-        let att = base.attenuate(
-            Caveat::ExpiresAtLe {
-                expires_at: base.expires_at + 100_000,
-            },
-            &holder,
-        );
+    fn stripping_all_v11_markers_breaks_issuer_signature() {
+        let issuer = SigningKey::from_bytes(&[1; 32]);
+        let subject = SigningKey::from_bytes(&[2; 32]);
+        let delegate = SigningKey::from_bytes(&[3; 32]);
+        let mut token = valid_delegation(&issuer, &subject, &delegate);
+        token.delegation_policy = None;
+        token.delegation_envelope = None;
+        token.spec_version = RCX_CT_SPEC_VERSION.to_string();
         assert_eq!(
-            att.attenuated_expires_at(),
-            base.expires_at,
-            "a later expiry caveat cannot extend the lifetime"
+            verify_token(&token, &issuer.verifying_key().to_bytes(), M2_REPAIR_NOW),
+            VerifyOutcome::BadSignature
         );
     }
 
     #[test]
-    fn scope_subset_removes_and_superset_cannot_widen() {
-        let issuer = SigningKey::from_bytes(&[5u8; 32]);
-        let holder = SigningKey::from_bytes(&[7u8; 32]);
-        let base = holder_bound_fixture(&issuer, &holder);
-        // The fixture grants exactly `corecrux.query.local`.
-        let granted = "corecrux.query.local";
-        // A subset caveat removes everything not listed.
-        let subset = base.attenuate(
-            Caveat::ScopeSubset {
-                scopes: vec!["something.else".to_string()],
-            },
-            &holder,
-        );
-        assert!(
-            !subset.caveats_permit_capability(granted),
-            "scope-subset removes a capability not in the list"
-        );
-        // A superset caveat "permits" an ungranted cap, but the base never granted it,
-        // so the effective set (base ∩ caveats) still cannot include it.
-        let superset = base.attenuate(
-            Caveat::ScopeSubset {
-                scopes: vec![granted.to_string(), "ungranted.extra".to_string()],
-            },
-            &holder,
-        );
-        assert!(
-            superset.caveats_permit_capability("ungranted.extra"),
-            "caveat alone permits it..."
-        );
-        let base_caps: Vec<&str> = superset
-            .backends
-            .iter()
-            .flat_map(|b| b.permitted_capabilities.iter().map(|c| c.capability.as_str()))
-            .collect();
-        assert!(
-            !base_caps.contains(&"ungranted.extra"),
-            "...but the issuer never granted it, so it stays denied"
-        );
-    }
+    fn envelope_mutation_removal_and_reordering_fail_closed() {
+        let issuer = SigningKey::from_bytes(&[1; 32]);
+        let subject = SigningKey::from_bytes(&[2; 32]);
+        let delegate = SigningKey::from_bytes(&[3; 32]);
+        let context = query_context("corecrux.query.local", "default", &[]);
+        let base = valid_delegation(&issuer, &subject, &delegate);
 
-    #[test]
-    fn cross_tenant_caveat_only_restricts() {
-        let issuer = SigningKey::from_bytes(&[5u8; 32]);
-        let holder = SigningKey::from_bytes(&[7u8; 32]);
-        let base = holder_bound_fixture(&issuer, &holder);
-        let att = base.attenuate(
-            Caveat::TenantIdEq {
-                tenant_id: "acme".to_string(),
-            },
-            &holder,
-        );
-        assert!(att.caveats_permit_tenant("acme"));
-        assert!(
-            !att.caveats_permit_tenant("default"),
-            "a tenant caveat restricts to one tenant, never adds another"
-        );
-    }
-
-    // ── Adversarial: the holder binding resists tampering ─────────────────
-
-    #[test]
-    fn edited_caveat_breaks_holder_signature() {
-        let issuer = SigningKey::from_bytes(&[5u8; 32]);
-        let holder = SigningKey::from_bytes(&[7u8; 32]);
-        let mut att = holder_bound_fixture(&issuer, &holder).attenuate(
-            Caveat::TenantIdEq {
-                tenant_id: "default".to_string(),
-            },
-            &holder,
-        );
-        att.caveats[0] = Caveat::TenantIdEq {
-            tenant_id: "attacker".to_string(),
-        };
+        let mut mutated = base.clone();
+        mutated
+            .delegation_envelope
+            .as_mut()
+            .unwrap_or_else(|| panic!("envelope required"))
+            .delegation_id = "changed".to_string();
         assert_eq!(
-            verify_token_attenuated(
-                &att,
-                &issuer.verifying_key().to_bytes(),
-                M2_NOW,
-                &holder.verifying_key().to_bytes()
-            ),
-            AttenuatedOutcome::BadCaveatSignature,
+            verify_as(&mutated, &issuer, &delegate, context, M2_NONCE, M2_NONCE),
+            AttenuatedOutcome::BadDelegationSignature
+        );
+
+        let mut removed = base.clone();
+        removed
+            .delegation_envelope
+            .as_mut()
+            .unwrap_or_else(|| panic!("envelope required"))
+            .caveats
+            .pop();
+        assert_eq!(
+            verify_as(&removed, &issuer, &delegate, context, M2_NONCE, M2_NONCE),
+            AttenuatedOutcome::BadDelegationSignature
+        );
+
+        let mut reordered = base;
+        reordered
+            .delegation_envelope
+            .as_mut()
+            .unwrap_or_else(|| panic!("envelope required"))
+            .caveats
+            .reverse();
+        assert_eq!(
+            verify_as(&reordered, &issuer, &delegate, context, M2_NONCE, M2_NONCE),
+            AttenuatedOutcome::MalformedEnvelope
         );
     }
 
     #[test]
-    fn stripping_a_caveat_breaks_holder_signature() {
-        let issuer = SigningKey::from_bytes(&[5u8; 32]);
-        let holder = SigningKey::from_bytes(&[7u8; 32]);
-        let mut att = holder_bound_fixture(&issuer, &holder)
-            .attenuate(
-                Caveat::TenantIdEq {
-                    tenant_id: "a".to_string(),
-                },
-                &holder,
+    fn envelope_cannot_be_lifted_to_another_base_or_recipient() {
+        let issuer = SigningKey::from_bytes(&[1; 32]);
+        let subject = SigningKey::from_bytes(&[2; 32]);
+        let delegate = SigningKey::from_bytes(&[3; 32]);
+        let other = SigningKey::from_bytes(&[4; 32]);
+        let context = query_context("corecrux.query.local", "default", &[]);
+
+        let delegated = valid_delegation(&issuer, &subject, &delegate);
+        let mut lifted = delegated.clone();
+        lifted.token_id.push_str("-other-base");
+        lifted.signature.sig = issuer.sign(&lifted.token_hash()).to_bytes();
+        assert_eq!(
+            verify_as(&lifted, &issuer, &delegate, context, M2_NONCE, M2_NONCE),
+            AttenuatedOutcome::BadDelegationSignature
+        );
+
+        let mut base = delegation_enabled_fixture(&issuer, &subject, &delegate);
+        let mut allowed = vec![
+            crux_session::passport::passport_fpr_from_public_key(&delegate.verifying_key().to_bytes()),
+            crux_session::passport::passport_fpr_from_public_key(&other.verifying_key().to_bytes()),
+        ];
+        allowed.sort();
+        base.delegation_policy
+            .as_mut()
+            .unwrap_or_else(|| panic!("policy required"))
+            .allowed_delegate_fprs = allowed;
+        base.signature.sig = issuer.sign(&base.token_hash()).to_bytes();
+        let mut substituted = base
+            .attenuate_for(
+                vec![Caveat::ExpiresAtLe {
+                    expires_at: base.expires_at - 1,
+                }],
+                delegate.verifying_key().to_bytes(),
+                "recipient-binding",
+                &subject,
             )
-            .attenuate(
-                Caveat::TenantIdEq {
-                    tenant_id: "b".to_string(),
-                },
-                &holder,
-            );
-        att.caveats.pop(); // drop a caveat but keep the 2-caveat signature (un-attenuation attempt)
+            .unwrap_or_else(|error| panic!("valid delegation: {error:?}"));
+        substituted
+            .delegation_envelope
+            .as_mut()
+            .unwrap_or_else(|| panic!("envelope required"))
+            .delegate_public_key = other.verifying_key().to_bytes();
         assert_eq!(
-            verify_token_attenuated(
-                &att,
-                &issuer.verifying_key().to_bytes(),
-                M2_NOW,
-                &holder.verifying_key().to_bytes()
-            ),
-            AttenuatedOutcome::BadCaveatSignature,
+            verify_as(&substituted, &issuer, &other, context, M2_NONCE, M2_NONCE),
+            AttenuatedOutcome::BadDelegationSignature
         );
     }
 
     #[test]
-    fn caveats_without_holder_signature_are_rejected() {
-        let issuer = SigningKey::from_bytes(&[5u8; 32]);
-        let holder = SigningKey::from_bytes(&[7u8; 32]);
-        let mut token = holder_bound_fixture(&issuer, &holder);
-        token.caveats.push(Caveat::TenantIdEq {
-            tenant_id: "sneaky".to_string(),
-        }); // no signature
+    fn subject_signed_noop_or_widening_caveats_are_denied() {
+        let issuer = SigningKey::from_bytes(&[1; 32]);
+        let subject = SigningKey::from_bytes(&[2; 32]);
+        let delegate = SigningKey::from_bytes(&[3; 32]);
+        let context = query_context("corecrux.query.local", "default", &[]);
+
+        for hostile in [
+            vec![Caveat::ExpiresAtLe {
+                expires_at: 1_780_143_200,
+            }],
+            vec![Caveat::ExpiresAtLe {
+                expires_at: 1_780_143_201,
+            }],
+            vec![Caveat::TenantIdEq {
+                tenant_id: "attacker".to_string(),
+            }],
+            vec![Caveat::ScopeSubset {
+                scopes: vec!["ungranted".to_string()],
+            }],
+        ] {
+            let mut token = valid_delegation(&issuer, &subject, &delegate);
+            let envelope = token
+                .delegation_envelope
+                .as_mut()
+                .unwrap_or_else(|| panic!("envelope required"));
+            envelope.caveats = hostile;
+            normalize_scope_caveats(&mut envelope.caveats);
+            resign_envelope(&mut token, &subject);
+            assert_eq!(
+                verify_as(&token, &issuer, &delegate, context, M2_NONCE, M2_NONCE),
+                AttenuatedOutcome::CaveatDenied
+            );
+        }
+    }
+
+    #[test]
+    fn proof_binds_full_token_context_and_expected_nonce() {
+        let issuer = SigningKey::from_bytes(&[1; 32]);
+        let subject = SigningKey::from_bytes(&[2; 32]);
+        let delegate = SigningKey::from_bytes(&[3; 32]);
+        let token = valid_delegation(&issuer, &subject, &delegate);
+        let context = query_context("corecrux.query.local", "default", &[]);
+        let proof = presentation_proof(&token, context, M2_NONCE, &delegate);
+
         assert_eq!(
             verify_token_attenuated(
                 &token,
                 &issuer.verifying_key().to_bytes(),
-                M2_NOW,
-                &holder.verifying_key().to_bytes()
+                M2_REPAIR_NOW,
+                &proof,
+                b"different-live-challenge",
+                context,
+                |_| false
             ),
-            AttenuatedOutcome::MissingCaveatSignature,
-        );
-    }
-
-    #[test]
-    fn wrong_holder_key_is_rejected() {
-        let issuer = SigningKey::from_bytes(&[5u8; 32]);
-        let holder = SigningKey::from_bytes(&[7u8; 32]);
-        let attacker = SigningKey::from_bytes(&[9u8; 32]);
-        let att = holder_bound_fixture(&issuer, &holder).attenuate(
-            Caveat::TenantIdEq {
-                tenant_id: "default".to_string(),
-            },
-            &holder,
+            AttenuatedOutcome::BadPossessionProof
         );
         assert_eq!(
             verify_token_attenuated(
-                &att,
+                &token,
                 &issuer.verifying_key().to_bytes(),
-                M2_NOW,
-                &attacker.verifying_key().to_bytes()
+                M2_REPAIR_NOW,
+                &proof,
+                b"",
+                context,
+                |_| false
             ),
-            AttenuatedOutcome::HolderMismatch,
+            AttenuatedOutcome::BadPossessionProof
+        );
+
+        let changed_context = query_context("corecrux.query.explain", "default", &["passport_bound"]);
+        assert_eq!(
+            verify_token_attenuated(
+                &token,
+                &issuer.verifying_key().to_bytes(),
+                M2_REPAIR_NOW,
+                &proof,
+                M2_NONCE,
+                changed_context,
+                |_| false
+            ),
+            AttenuatedOutcome::BadPossessionProof
+        );
+
+        let mut different_token = token.clone();
+        different_token
+            .delegation_envelope
+            .as_mut()
+            .unwrap_or_else(|| panic!("envelope required"))
+            .delegation_id = "different-delegation".to_string();
+        resign_envelope(&mut different_token, &subject);
+        assert_eq!(
+            verify_token_attenuated(
+                &different_token,
+                &issuer.verifying_key().to_bytes(),
+                M2_REPAIR_NOW,
+                &proof,
+                M2_NONCE,
+                context,
+                |_| false
+            ),
+            AttenuatedOutcome::BadPossessionProof
         );
     }
 
     #[test]
-    fn bad_issuer_signature_surfaces_as_base_failure() {
-        let issuer = SigningKey::from_bytes(&[5u8; 32]);
-        let wrong_issuer = SigningKey::from_bytes(&[6u8; 32]);
-        let holder = SigningKey::from_bytes(&[7u8; 32]);
-        let att = holder_bound_fixture(&issuer, &holder).attenuate(
-            Caveat::TenantIdEq {
-                tenant_id: "default".to_string(),
-            },
-            &holder,
+    fn proof_from_wrong_key_is_rejected() {
+        let issuer = SigningKey::from_bytes(&[1; 32]);
+        let subject = SigningKey::from_bytes(&[2; 32]);
+        let delegate = SigningKey::from_bytes(&[3; 32]);
+        let attacker = SigningKey::from_bytes(&[4; 32]);
+        let token = valid_delegation(&issuer, &subject, &delegate);
+        let context = query_context("corecrux.query.local", "default", &[]);
+        assert_eq!(
+            verify_as(&token, &issuer, &attacker, context, M2_NONCE, M2_NONCE),
+            AttenuatedOutcome::DelegateMismatch
+        );
+    }
+
+    #[test]
+    fn constructor_rejects_legacy_self_unlisted_second_hop_and_invalid_caveats() {
+        let issuer = SigningKey::from_bytes(&[1; 32]);
+        let subject = SigningKey::from_bytes(&[2; 32]);
+        let delegate = SigningKey::from_bytes(&[3; 32]);
+        let outsider = SigningKey::from_bytes(&[4; 32]);
+        let base = delegation_enabled_fixture(&issuer, &subject, &delegate);
+        let expiry = vec![Caveat::ExpiresAtLe {
+            expires_at: base.expires_at - 1,
+        }];
+
+        assert_eq!(
+            base.attenuate_for(Vec::new(), delegate.verifying_key().to_bytes(), "d", &subject),
+            Err(AttenuateError::EmptyCaveats)
+        );
+        assert_eq!(
+            base.attenuate_for(
+                (0..=RCX_MAX_DELEGATION_CAVEATS)
+                    .map(|offset| Caveat::ExpiresAtLe {
+                        expires_at: base.expires_at - 1 - offset as u64,
+                    })
+                    .collect(),
+                delegate.verifying_key().to_bytes(),
+                "d",
+                &subject
+            ),
+            Err(AttenuateError::InvalidCaveatEncoding)
+        );
+        assert_eq!(
+            base.attenuate_for(
+                expiry.clone(),
+                delegate.verifying_key().to_bytes(),
+                "not valid",
+                &subject
+            ),
+            Err(AttenuateError::InvalidDelegationId)
+        );
+
+        let mut legacy = base.clone();
+        legacy.spec_version = RCX_CT_SPEC_VERSION.to_string();
+        legacy.delegation_policy = None;
+        assert_eq!(
+            legacy.attenuate_for(expiry.clone(), delegate.verifying_key().to_bytes(), "d", &subject),
+            Err(AttenuateError::DelegationNotPermitted)
+        );
+        assert_eq!(
+            base.attenuate_for(expiry.clone(), subject.verifying_key().to_bytes(), "d", &subject),
+            Err(AttenuateError::SelfDelegation)
+        );
+        assert_eq!(
+            base.attenuate_for(expiry.clone(), outsider.verifying_key().to_bytes(), "d", &subject),
+            Err(AttenuateError::DelegateNotPermitted)
+        );
+        assert_eq!(
+            base.attenuate_for(
+                vec![Caveat::ExpiresAtLe {
+                    expires_at: base.expires_at,
+                }],
+                delegate.verifying_key().to_bytes(),
+                "d",
+                &subject
+            ),
+            Err(AttenuateError::CaveatDoesNotNarrow)
+        );
+        assert_eq!(
+            base.attenuate_for(
+                vec![Caveat::ExpiresAtLe {
+                    expires_at: base.expires_at + 1,
+                }],
+                delegate.verifying_key().to_bytes(),
+                "d",
+                &subject
+            ),
+            Err(AttenuateError::CaveatOutsideBaseGrant)
+        );
+
+        let once = valid_delegation(&issuer, &subject, &delegate);
+        assert_eq!(
+            once.attenuate_for(expiry, outsider.verifying_key().to_bytes(), "d2", &delegate),
+            Err(AttenuateError::AlreadyDelegated)
+        );
+    }
+
+    #[test]
+    fn forged_delegate_to_third_party_second_hop_is_rejected() {
+        let issuer = SigningKey::from_bytes(&[1; 32]);
+        let subject = SigningKey::from_bytes(&[2; 32]);
+        let delegate = SigningKey::from_bytes(&[3; 32]);
+        let third_party = SigningKey::from_bytes(&[4; 32]);
+        let mut token = delegation_enabled_fixture(&issuer, &subject, &delegate);
+        let mut allowed = vec![
+            crux_session::passport::passport_fpr_from_public_key(&delegate.verifying_key().to_bytes()),
+            crux_session::passport::passport_fpr_from_public_key(&third_party.verifying_key().to_bytes()),
+        ];
+        allowed.sort();
+        token
+            .delegation_policy
+            .as_mut()
+            .unwrap_or_else(|| panic!("policy required"))
+            .allowed_delegate_fprs = allowed;
+        token.signature.sig = issuer.sign(&token.token_hash()).to_bytes();
+        let caveats = vec![Caveat::ExpiresAtLe {
+            expires_at: token.expires_at - 1,
+        }];
+        let delegator_public_key = delegate.verifying_key().to_bytes();
+        let delegate_public_key = third_party.verifying_key().to_bytes();
+        let signature = delegate
+            .sign(&delegation_binding_message(
+                &token.token_hash(),
+                RCX_DELEGATION_ENVELOPE_VERSION,
+                "forged-second-hop",
+                DelegationAudience::CruxSync,
+                &delegator_public_key,
+                &delegate_public_key,
+                &caveats,
+            ))
+            .to_bytes();
+        token.delegation_envelope = Some(DelegationEnvelope {
+            version: RCX_DELEGATION_ENVELOPE_VERSION,
+            delegation_id: "forged-second-hop".to_string(),
+            audience: DelegationAudience::CruxSync,
+            delegator_public_key,
+            delegate_public_key,
+            caveats,
+            signature,
+        });
+        let context = query_context("corecrux.query.local", "default", &[]);
+
+        assert_eq!(
+            verify_as(&token, &issuer, &third_party, context, M2_NONCE, M2_NONCE),
+            AttenuatedOutcome::DelegatorMismatch
+        );
+    }
+
+    #[test]
+    fn team_membership_is_enforced_by_constructor_and_verifier() {
+        let issuer = SigningKey::from_bytes(&[1; 32]);
+        let subject = SigningKey::from_bytes(&[2; 32]);
+        let delegate = SigningKey::from_bytes(&[3; 32]);
+        let outsider = SigningKey::from_bytes(&[4; 32]);
+        let mut base = delegation_enabled_fixture(&issuer, &subject, &delegate);
+        base.tier = RcxTier::Team;
+        base.team_scope = Some(TeamScope {
+            team_id: "team-1".to_string(),
+            seat_id: None,
+            seat_role: Some(TeamSeatRole::Member),
+            pooled_credit_agent_id: "pool-1".to_string(),
+            principal_passport_fprs: vec![
+                crux_session::passport::passport_fpr_from_public_key(&subject.verifying_key().to_bytes()),
+                crux_session::passport::passport_fpr_from_public_key(&delegate.verifying_key().to_bytes()),
+            ],
+        });
+        base.signature.sig = issuer.sign(&base.token_hash()).to_bytes();
+        assert!(base
+            .attenuate_for(
+                vec![Caveat::ExpiresAtLe {
+                    expires_at: base.expires_at - 1,
+                }],
+                delegate.verifying_key().to_bytes(),
+                "team-d",
+                &subject
+            )
+            .is_ok());
+
+        base.delegation_policy
+            .as_mut()
+            .unwrap_or_else(|| panic!("policy required"))
+            .allowed_delegate_fprs = vec![crux_session::passport::passport_fpr_from_public_key(
+            &outsider.verifying_key().to_bytes(),
+        )];
+        base.signature.sig = issuer.sign(&base.token_hash()).to_bytes();
+        assert_eq!(
+            base.attenuate_for(
+                vec![Caveat::ExpiresAtLe {
+                    expires_at: base.expires_at - 1,
+                }],
+                outsider.verifying_key().to_bytes(),
+                "team-outsider",
+                &subject
+            ),
+            Err(AttenuateError::DelegateNotPermitted)
+        );
+
+        let caveats = vec![Caveat::ExpiresAtLe {
+            expires_at: base.expires_at - 1,
+        }];
+        let delegator_public_key = subject.verifying_key().to_bytes();
+        let delegate_public_key = outsider.verifying_key().to_bytes();
+        let signature = subject
+            .sign(&delegation_binding_message(
+                &base.token_hash(),
+                RCX_DELEGATION_ENVELOPE_VERSION,
+                "team-outsider-forged",
+                DelegationAudience::CruxSync,
+                &delegator_public_key,
+                &delegate_public_key,
+                &caveats,
+            ))
+            .to_bytes();
+        base.delegation_envelope = Some(DelegationEnvelope {
+            version: RCX_DELEGATION_ENVELOPE_VERSION,
+            delegation_id: "team-outsider-forged".to_string(),
+            audience: DelegationAudience::CruxSync,
+            delegator_public_key,
+            delegate_public_key,
+            caveats,
+            signature,
+        });
+        let context = query_context("corecrux.query.local", "default", &[]);
+        assert_eq!(
+            verify_as(&base, &issuer, &outsider, context, M2_NONCE, M2_NONCE),
+            AttenuatedOutcome::DelegationNotPermitted
+        );
+    }
+
+    #[test]
+    fn context_intersects_base_grant_caveats_and_attestations() {
+        let issuer = SigningKey::from_bytes(&[1; 32]);
+        let subject = SigningKey::from_bytes(&[2; 32]);
+        let delegate = SigningKey::from_bytes(&[3; 32]);
+        let base = delegation_enabled_fixture(&issuer, &subject, &delegate);
+        let token = base
+            .attenuate_for(
+                vec![Caveat::ScopeSubset {
+                    scopes: vec!["corecrux.query.explain".to_string()],
+                }],
+                delegate.verifying_key().to_bytes(),
+                "scope-only",
+                &subject,
+            )
+            .unwrap_or_else(|error| panic!("valid scope delegation: {error:?}"));
+
+        let permitted = query_context("corecrux.query.explain", "default", &["passport_bound"]);
+        assert!(matches!(
+            verify_as(&token, &issuer, &delegate, permitted, M2_NONCE, M2_NONCE),
+            AttenuatedOutcome::Verified(_)
+        ));
+        for denied in [
+            query_context("corecrux.query.local", "default", &[]),
+            query_context("corecrux.query.explain", "other", &["passport_bound"]),
+            query_context("corecrux.query.explain", "default", &[]),
+        ] {
+            assert!(matches!(
+                verify_as(&token, &issuer, &delegate, denied, M2_NONCE, M2_NONCE),
+                AttenuatedOutcome::ContextDenied | AttenuatedOutcome::CaveatDenied
+            ));
+        }
+    }
+
+    #[test]
+    fn subject_and_delegate_revocation_both_deny() {
+        let issuer = SigningKey::from_bytes(&[1; 32]);
+        let subject = SigningKey::from_bytes(&[2; 32]);
+        let delegate = SigningKey::from_bytes(&[3; 32]);
+        let token = valid_delegation(&issuer, &subject, &delegate);
+        let context = query_context("corecrux.query.local", "default", &[]);
+        let proof = presentation_proof(&token, context, M2_NONCE, &delegate);
+        let subject_fpr = token.subject.passport_fpr.clone();
+        let delegate_fpr = crux_session::passport::passport_fpr_from_public_key(&delegate.verifying_key().to_bytes());
+        for revoked in [subject_fpr, delegate_fpr] {
+            assert_eq!(
+                verify_token_attenuated(
+                    &token,
+                    &issuer.verifying_key().to_bytes(),
+                    M2_REPAIR_NOW,
+                    &proof,
+                    M2_NONCE,
+                    context,
+                    |candidate| candidate == revoked
+                ),
+                AttenuatedOutcome::PrincipalRevoked
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_envelope_and_bad_issuer_fail_closed() {
+        let issuer = SigningKey::from_bytes(&[1; 32]);
+        let wrong_issuer = SigningKey::from_bytes(&[9; 32]);
+        let subject = SigningKey::from_bytes(&[2; 32]);
+        let delegate = SigningKey::from_bytes(&[3; 32]);
+        let context = query_context("corecrux.query.local", "default", &[]);
+        let mut malformed = valid_delegation(&issuer, &subject, &delegate);
+        malformed
+            .delegation_envelope
+            .as_mut()
+            .unwrap_or_else(|| panic!("envelope required"))
+            .version = 2;
+        assert_eq!(
+            verify_as(&malformed, &issuer, &delegate, context, M2_NONCE, M2_NONCE),
+            AttenuatedOutcome::MalformedEnvelope
         );
         assert!(matches!(
-            verify_token_attenuated(
-                &att,
-                &wrong_issuer.verifying_key().to_bytes(),
-                M2_NOW,
-                &holder.verifying_key().to_bytes()
+            verify_as(
+                &valid_delegation(&issuer, &subject, &delegate),
+                &wrong_issuer,
+                &delegate,
+                context,
+                M2_NONCE,
+                M2_NONCE
             ),
-            AttenuatedOutcome::Base(_),
+            AttenuatedOutcome::Base(VerifyOutcome::BadSignature)
         ));
+    }
+
+    #[test]
+    fn unknown_caveat_type_or_member_is_rejected_by_serde() {
+        assert!(serde_json::from_str::<Caveat>(r#"{"type":"future_caveat","value":1}"#).is_err());
+        assert!(serde_json::from_str::<Caveat>(r#"{"type":"expires_at_le","expires_at":1,"ignored":true}"#).is_err());
     }
 
     #[test]
@@ -1665,13 +2672,28 @@ mod tests {
 
     #[test]
     fn egress_matrix_defaults_to_no_text() {
-        let token = free_local_verified_fixture();
-        assert!(token.permits_egress("local", "corecrux.query.local", DataEgressClass::None));
-        assert!(!token.permits_egress("local", "corecrux.query.local", DataEgressClass::Text));
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let token = sign_fixture(&signing);
+        let pubkey = signing.verifying_key().to_bytes();
+        assert!(token.permits_egress(
+            &pubkey,
+            1_776_989_601,
+            "local",
+            "corecrux.query.local",
+            DataEgressClass::None
+        ));
+        assert!(!token.permits_egress(
+            &pubkey,
+            1_776_989_601,
+            "local",
+            "corecrux.query.local",
+            DataEgressClass::Text
+        ));
     }
 
     #[test]
     fn team_scope_supports_constraint_egress_without_changing_free_fixture() {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
         let mut token = free_local_verified_fixture();
         token.token_id = "rcxct_team_0123456789abcdef".to_string();
         token.tier = RcxTier::Team;
@@ -1695,10 +2717,13 @@ mod tests {
             unit: CreditCostUnit::Call,
             cost: 1,
         });
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
 
         let validation = token.validate_basic(1_776_989_601);
         assert!(validation.valid);
         assert!(token.permits_egress(
+            &signing.verifying_key().to_bytes(),
+            1_776_989_601,
             RCX_HOSTED_BACKEND_ID,
             RCX_TEAM_CONSTRAINTS_SYNC_CAPABILITY,
             DataEgressClass::ConstraintRecords
@@ -1710,6 +2735,7 @@ mod tests {
 
     #[test]
     fn enterprise_scope_supports_customer_hosted_encrypted_blob_egress() {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
         let mut token = free_local_verified_fixture();
         token.token_id = "rcxct_enterprise_0123456789abcdef".to_string();
         token.tier = RcxTier::Enterprise;
@@ -1738,10 +2764,13 @@ mod tests {
             unit: CreditCostUnit::Call,
             cost: 0,
         });
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
 
         let validation = token.validate_basic(1_776_989_601);
         assert!(validation.valid);
         assert!(token.permits_egress(
+            &signing.verifying_key().to_bytes(),
+            1_776_989_601,
             "customer:cluster-a",
             RCX_ENTERPRISE_ENCRYPTED_BLOB_MIRROR_CAPABILITY,
             DataEgressClass::EncryptedBlob
@@ -1755,6 +2784,7 @@ mod tests {
 #[cfg(test)]
 mod proptests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
     use proptest::prelude::*;
 
     proptest! {
@@ -1778,8 +2808,156 @@ mod proptests {
         ) {
             let token = free_local_verified_fixture();
             let _ = token.validate_basic(now);
-            let _ = token.permits_egress("local", "corecrux.query.local", DataEgressClass::None);
+            let _ = token.permits_egress(
+                &key,
+                now,
+                "local",
+                "corecrux.query.local",
+                DataEgressClass::None,
+            );
             let _ = verify_token(&token, &key, now);
+        }
+
+        #[test]
+        fn arbitrary_attenuation_never_widens_issuer_authority(
+            base_caps in proptest::collection::btree_set(0u8..6, 1..6),
+            text_caps in proptest::collection::btree_set(0u8..6, 0..7),
+            attestation_caps in proptest::collection::btree_set(0u8..6, 0..7),
+            caveat_scopes in proptest::collection::btree_set(0u8..8, 1..9),
+            requested_cap in 0u8..8,
+            request_text in any::<bool>(),
+            present_attestation in any::<bool>(),
+            context_tenant_matches in any::<bool>(),
+            caveat_tenant_matches in any::<bool>(),
+            expiry_mode in 0u8..3,
+        ) {
+            const NOW: u64 = 1_776_989_601;
+            let issuer = SigningKey::from_bytes(&[0x51; 32]);
+            let subject = SigningKey::from_bytes(&[0x52; 32]);
+            let delegate = SigningKey::from_bytes(&[0x53; 32]);
+            let mut token = free_local_verified_fixture();
+            token.spec_version = RCX_CT_DELEGATION_SPEC_VERSION.to_string();
+            token.subject.passport_fpr = crux_session::passport::passport_fpr_from_public_key(
+                &subject.verifying_key().to_bytes(),
+            );
+            token.backends[0].permitted_capabilities = base_caps
+                .iter()
+                .map(|id| {
+                    let mut egress = vec![DataEgressClass::None];
+                    if text_caps.contains(id) {
+                        egress.push(DataEgressClass::Text);
+                    }
+                    PermittedCapability {
+                        capability: format!("cap-{id}"),
+                        data_egress_classes: egress,
+                        required_attestations: if attestation_caps.contains(id) {
+                            vec!["passport_bound".to_string()]
+                        } else {
+                            Vec::new()
+                        },
+                        credit_cost: None,
+                    }
+                })
+                .collect();
+            token.delegation_policy = Some(DelegationPolicy {
+                presentation: DelegationPresentation::ProofOfPossession,
+                max_depth: 1,
+                audience: DelegationAudience::CruxSync,
+                allowed_delegate_fprs: vec![crux_session::passport::passport_fpr_from_public_key(
+                    &delegate.verifying_key().to_bytes(),
+                )],
+            });
+            token.signature.sig = issuer.sign(&token.token_hash()).to_bytes();
+
+            let expires_at = match expiry_mode {
+                0 => token.expires_at - 1,
+                1 => token.expires_at,
+                _ => token.expires_at + 1,
+            };
+            let mut caveats = vec![
+                Caveat::ExpiresAtLe { expires_at },
+                Caveat::ScopeSubset {
+                    scopes: caveat_scopes.iter().map(|id| format!("cap-{id}")).collect(),
+                },
+                Caveat::TenantIdEq {
+                    tenant_id: if caveat_tenant_matches {
+                        "default".to_string()
+                    } else {
+                        "other".to_string()
+                    },
+                },
+            ];
+            normalize_scope_caveats(&mut caveats);
+            let delegator_public_key = subject.verifying_key().to_bytes();
+            let delegate_public_key = delegate.verifying_key().to_bytes();
+            let envelope_signature = subject
+                .sign(&delegation_binding_message(
+                    &token.token_hash(),
+                    RCX_DELEGATION_ENVELOPE_VERSION,
+                    "property-delegation",
+                    DelegationAudience::CruxSync,
+                    &delegator_public_key,
+                    &delegate_public_key,
+                    &caveats,
+                ))
+                .to_bytes();
+            token.delegation_envelope = Some(DelegationEnvelope {
+                version: RCX_DELEGATION_ENVELOPE_VERSION,
+                delegation_id: "property-delegation".to_string(),
+                audience: DelegationAudience::CruxSync,
+                delegator_public_key,
+                delegate_public_key,
+                caveats,
+                signature: envelope_signature,
+            });
+
+            let requested_capability = format!("cap-{requested_cap}");
+            let requested_egress = if request_text {
+                vec![DataEgressClass::Text]
+            } else {
+                vec![DataEgressClass::None]
+            };
+            let present_attestations = if present_attestation {
+                vec!["passport_bound"]
+            } else {
+                Vec::new()
+            };
+            let context = AttenuationContext {
+                audience: DelegationAudience::CruxSync,
+                tenant_id: if context_tenant_matches { "default" } else { "other" },
+                backend_id: "local",
+                capability: &requested_capability,
+                data_egress_classes: &requested_egress,
+                present_attestations: &present_attestations,
+            };
+            let nonce = b"property-verifier-nonce";
+            let proof = PresentationProof {
+                public_key: delegate_public_key,
+                nonce,
+                signature: delegate
+                    .sign(&presentation_proof_message(&token, context, nonce))
+                    .to_bytes(),
+            };
+            let outcome = verify_token_attenuated(
+                &token,
+                &issuer.verifying_key().to_bytes(),
+                NOW,
+                &proof,
+                nonce,
+                context,
+                |_| false,
+            );
+
+            if matches!(outcome, AttenuatedOutcome::Verified(_)) {
+                prop_assert!(base_caps.contains(&requested_cap));
+                prop_assert!(!request_text || text_caps.contains(&requested_cap));
+                prop_assert!(!attestation_caps.contains(&requested_cap) || present_attestation);
+                prop_assert!(context_tenant_matches);
+                prop_assert!(caveat_tenant_matches);
+                prop_assert!(caveat_scopes.contains(&requested_cap));
+                prop_assert!(expires_at <= token.expires_at);
+                prop_assert!(NOW < expires_at);
+            }
         }
     }
 }

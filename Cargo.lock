@@ -1356,6 +1356,7 @@ dependencies = [
 name = "crux-enterprise-shim"
 version = "0.5.47"
 dependencies = [
+ "ed25519-dalek",
  "rcx-capability-token",
 ]
 
@@ -4072,6 +4073,7 @@ dependencies = [
  "hex",
  "proptest",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
