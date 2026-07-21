@@ -64,15 +64,62 @@ pub trait Witness: Send + Sync {
     fn submit(&self, head_hash: &[u8; 32]) -> Result<WitnessProofV1, WitnessError>;
 }
 
+/// The witness signing seam (audit-v2 R2 / witness-key-custody). Abstracts *where*
+/// the ECDSA P-256 private key lives: `EnvKeySigner` holds it in-process (today's
+/// behaviour); a Vault Transit signer keeps it in Vault and never sees the bytes.
+///
+/// Both `hashedrekord` inputs come from here — the SPKI public-key PEM and a
+/// DER-encoded ECDSA-P256/SHA-256 signature over the message.
+pub trait WitnessSigner: Send + Sync {
+    /// SPKI public-key PEM (LF line endings), resolved once at construction.
+    fn public_key_pem(&self) -> String;
+    /// ECDSA-P256/SHA-256 signature over `message`, ASN.1 DER-encoded.
+    fn sign_der(&self, message: &[u8]) -> Result<Vec<u8>, WitnessError>;
+}
+
+/// In-process signer: the P-256 private key lives in the daemon (loaded from
+/// `CORECRUXD_WITNESS_SIGNING_KEY`). This is the pre-R2 behaviour, preserved as
+/// the default so single-node/dev installs are unaffected.
+pub struct EnvKeySigner {
+    signing_key: P256SigningKey,
+    public_key_pem: String,
+}
+
+impl EnvKeySigner {
+    pub fn new(signing_key: P256SigningKey) -> Self {
+        let public_key_pem = signing_key
+            .verifying_key()
+            .to_public_key_pem(p256::pkcs8::LineEnding::LF)
+            .unwrap_or_default();
+        Self {
+            signing_key,
+            public_key_pem,
+        }
+    }
+}
+
+impl WitnessSigner for EnvKeySigner {
+    fn public_key_pem(&self) -> String {
+        self.public_key_pem.clone()
+    }
+
+    fn sign_der(&self, message: &[u8]) -> Result<Vec<u8>, WitnessError> {
+        // ECDSA signing over a valid key is infallible; matches the prior
+        // `self.signing_key.sign(head_hash).to_der()` path exactly.
+        let signature: P256Signature = self.signing_key.sign(message);
+        Ok(signature.to_der().as_bytes().to_vec())
+    }
+}
+
 /// Anchors seal-chain heads into a Sigstore Rekor transparency log.
 ///
-/// Each submission signs the head hash with the witness ECDSA P-256 key and writes
-/// a `hashedrekord` entry, then maps Rekor's response into a [`WitnessProofV1`]
-/// and self-verifies the returned Merkle proof before handing it back.
+/// Each submission signs the head hash via its [`WitnessSigner`] and writes a
+/// `hashedrekord` entry, then maps Rekor's response into a [`WitnessProofV1`] and
+/// self-verifies the returned Merkle proof before handing it back.
 pub struct RekorWitness {
     agent: ureq::Agent,
     rekor_url: String,
-    signing_key: P256SigningKey,
+    signer: Box<dyn WitnessSigner>,
     public_key_pem_b64: String,
 }
 
@@ -83,22 +130,26 @@ impl RekorWitness {
     /// P-256 (not the daemon's Ed25519 seal key) because Sigstore Rekor's
     /// `hashedrekord` verification rejects plain-Ed25519 signatures and accepts
     /// ECDSA-P256/SHA-256 (verified against live Rekor staging; see ExecPlan M4).
+    ///
+    /// Thin wrapper over [`Self::with_signer`] that keeps the in-process key path
+    /// (and this exact call signature) unchanged for existing callers.
     pub fn new(rekor_url: impl Into<String>, signing_key: P256SigningKey, timeout: Duration) -> Self {
+        Self::with_signer(rekor_url, Box::new(EnvKeySigner::new(signing_key)), timeout)
+    }
+
+    /// Build a witness around any [`WitnessSigner`] (in-process key, Vault Transit, …).
+    pub fn with_signer(rekor_url: impl Into<String>, signer: Box<dyn WitnessSigner>, timeout: Duration) -> Self {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_connect(Some(timeout))
             .timeout_recv_response(Some(timeout))
             .timeout_recv_body(Some(timeout))
             .build()
             .into();
-        let public_key_pem = signing_key
-            .verifying_key()
-            .to_public_key_pem(p256::pkcs8::LineEnding::LF)
-            .unwrap_or_default();
-        let public_key_pem_b64 = base64::engine::general_purpose::STANDARD.encode(public_key_pem.as_bytes());
+        let public_key_pem_b64 = base64::engine::general_purpose::STANDARD.encode(signer.public_key_pem().as_bytes());
         Self {
             agent,
             rekor_url: rekor_url.into().trim_end_matches('/').to_string(),
-            signing_key,
+            signer,
             public_key_pem_b64,
         }
     }
@@ -110,11 +161,11 @@ impl RekorWitness {
     /// Build the `hashedrekord` create payload for `head_hash`: the SHA-256 of
     /// the head as the artifact digest, an ECDSA-P256/SHA-256 (DER) signature
     /// over the head, and the witness's SPKI public key.
-    fn build_request(&self, head_hash: &[u8; 32]) -> HashedRekordCreate {
+    fn build_request(&self, head_hash: &[u8; 32]) -> Result<HashedRekordCreate, WitnessError> {
         let digest_hex = hex::encode(Sha256::digest(head_hash));
-        let signature: P256Signature = self.signing_key.sign(head_hash);
-        let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature.to_der().as_bytes());
-        HashedRekordCreate {
+        let signature_der = self.signer.sign_der(head_hash)?;
+        let signature_b64 = base64::engine::general_purpose::STANDARD.encode(&signature_der);
+        Ok(HashedRekordCreate {
             api_version: "0.0.1",
             kind: "hashedrekord",
             spec: HashedRekordSpec {
@@ -131,13 +182,13 @@ impl RekorWitness {
                     },
                 },
             },
-        }
+        })
     }
 }
 
 impl Witness for RekorWitness {
     fn submit(&self, head_hash: &[u8; 32]) -> Result<WitnessProofV1, WitnessError> {
-        let request = self.build_request(head_hash);
+        let request = self.build_request(head_hash)?;
         let request_value = serde_json::to_value(&request).map_err(|e| WitnessError::Decode(e.to_string()))?;
 
         let mut response = self
@@ -311,6 +362,35 @@ mod tests {
         P256SigningKey::from_slice(&[0x42; 32]).expect("valid p256 scalar")
     }
 
+    #[test]
+    fn env_key_signer_matches_direct_key_path() {
+        // M1 gate: the seam is a pure refactor — EnvKeySigner must produce exactly
+        // what the old `signing_key.sign(head).to_der()` path produced, and a public
+        // key PEM identical to the direct `to_public_key_pem` path.
+        let key = test_key();
+        let head = [0x7u8; 32];
+
+        let expected_sig: P256Signature = key.sign(&head);
+        let signer = EnvKeySigner::new(key.clone());
+        assert_eq!(
+            signer.sign_der(&head).expect("sign"),
+            expected_sig.to_der().as_bytes().to_vec(),
+            "EnvKeySigner DER signature must match the direct-key path"
+        );
+        assert_eq!(
+            signer.public_key_pem(),
+            key.verifying_key()
+                .to_public_key_pem(p256::pkcs8::LineEnding::LF)
+                .unwrap(),
+            "EnvKeySigner public key PEM must match the direct-key path"
+        );
+
+        // And the produced signature verifies over the head under the key.
+        use p256::ecdsa::signature::Verifier as _;
+        let sig = P256Signature::from_der(&signer.sign_der(&head).unwrap()).expect("der");
+        key.verifying_key().verify(&head, &sig).expect("must verify");
+    }
+
     /// RFC6962 leaf hash for an entry body — mirrors `into_proof`.
     fn rfc6962_leaf(body: &[u8]) -> [u8; 32] {
         let mut hasher = Sha256::new();
@@ -422,7 +502,7 @@ mod tests {
     fn build_request_has_hashedrekord_shape() {
         let witness = RekorWitness::new("https://rekor.example", test_key(), Duration::from_secs(5));
         let head = [0x11u8; 32];
-        let req = witness.build_request(&head);
+        let req = witness.build_request(&head).expect("build_request");
         assert_eq!(req.kind, "hashedrekord");
         assert_eq!(req.api_version, "0.0.1");
         assert_eq!(req.spec.data.hash.algorithm, "sha256");
