@@ -30,6 +30,10 @@
 #   (serde_json response-body assertions). tests.rs is #[cfg(test)] via an
 #   out-of-file #[path] mod decl so the ratchet counts its unwraps; zero
 #   production-path additions (the recall floor uses Option, no unwrap).
+# 2026-07-21 +2 corecruxd: macaroon M3 caveat-enforcement HTTP tests in
+#   http/tests.rs (unix_now_secs + sync_peer_manifest helpers) — #[cfg(test)]
+#   only, counted because tests.rs is an out-of-file #[path] mod; zero
+#   production-path additions (require_sync_peer uses no unwrap/expect).
 corecrux-frame 0
 corecrux-index 3
 corecrux-memory 0
@@ -41,7 +45,7 @@ corecrux-segment 32
 corecrux-storage 48
 corecrux-types 1
 corecruxctl 9
-corecruxd 774
+corecruxd 776
 crux-claude-hooks 1
 crux-config-wizard 8
 crux-contrib 0
