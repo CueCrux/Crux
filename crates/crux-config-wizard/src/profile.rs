@@ -109,6 +109,7 @@ fn bundled_raw() -> Vec<(&'static str, &'static str)> {
             "scratchpad-survival.md",
             include_str!("../profiles/scratchpad-survival.md"),
         ),
+        ("boot-banner.md", include_str!("../profiles/boot-banner.md")),
         ("pre-deploy-gate.md", include_str!("../profiles/pre-deploy-gate.md")),
         ("eu-ai-act.md", include_str!("../profiles/eu-ai-act.md")),
         ("audit-soc2.md", include_str!("../profiles/audit-soc2.md")),
@@ -175,13 +176,27 @@ This is the body.
     #[test]
     fn bundled_load_returns_all_in_order() {
         let bundled = load_bundled_profiles().unwrap();
-        assert_eq!(bundled.len(), 10);
+        assert_eq!(bundled.len(), 11);
         for win in bundled.windows(2) {
             assert!(
                 win[0].frontmatter.order <= win[1].frontmatter.order,
                 "bundled profiles must be sorted by order"
             );
         }
+    }
+
+    #[test]
+    fn boot_banner_fragment_loads() {
+        let bundled = load_bundled_profiles().unwrap();
+        let bb = bundled
+            .iter()
+            .find(|f| f.frontmatter.name == "boot-banner")
+            .expect("boot-banner fragment must be bundled");
+        assert_eq!(bb.frontmatter.order, 47);
+        assert_eq!(bb.frontmatter.targets, vec![Target::ClaudeMd, Target::AgentsMd]);
+        assert!(bb.body.contains("crux-statusline"), "documents the statusline");
+        assert!(bb.body.contains("crux-claude-banner"), "documents the agent brief");
+        assert!(bb.body.contains("CRUX_BANNER_CARD"), "documents the switches");
     }
 
     #[test]
