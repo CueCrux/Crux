@@ -671,12 +671,19 @@ fn do_verify_record(
     // keyed by op-id + payload hash) and settle after returning success, so a
     // retained record can never be minted unpaid. NoopMeter charges nothing,
     // so append-then-meter is inert in the skeleton.
-    append_record(data_dir, &line).map_err(|e| {
+    append_record(data_dir, tenant, &line).map_err(|e| {
         tracing::error!(error = %e, "provenance record persist failed");
-        ProvErr::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal error persisting verification record",
-        )
+        let status = match e {
+            RecordStoreError::LineTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            RecordStoreError::TenantQuotaExceeded { .. } | RecordStoreError::TooManyEntries => {
+                StatusCode::INSUFFICIENT_STORAGE
+            }
+            RecordStoreError::Io(_)
+            | RecordStoreError::Json(_)
+            | RecordStoreError::UnsafePath
+            | RecordStoreError::LockPoisoned => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        ProvErr::new(status, "verification record could not be retained")
     })?;
 
     meter.on_op(ProvenanceOp::VerifyRecord, tenant);
@@ -689,24 +696,253 @@ fn do_verify_record(
     })
 }
 
-fn records_path(data_dir: &Path) -> PathBuf {
-    data_dir.join("provenance").join("verification-records.jsonl")
+const RECORD_MAX_LINE_BYTES: u64 = 128 * 1024;
+const RECORD_SEGMENT_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const RECORD_TENANT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const RECORD_MAX_DIRECTORY_ENTRIES: usize = 1_024;
+
+#[derive(Clone, Copy)]
+struct RecordStoreLimits {
+    max_line_bytes: u64,
+    segment_max_bytes: u64,
+    tenant_max_bytes: u64,
+    max_directory_entries: usize,
 }
 
-// TODO(flag-enable, #10): this is an unbounded, un-rotated, un-quota'd global
-// JSONL with a non-exclusive append. Before flag-enable add per-tenant quota,
-// rotation, an exclusive/durable append (lock + fsync) or reuse the signed
-// append-only substrate, and run the CPU/file work under spawn_blocking.
-fn append_record(data_dir: &Path, line: &serde_json::Value) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let path = records_path(data_dir);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+impl Default for RecordStoreLimits {
+    fn default() -> Self {
+        Self {
+            max_line_bytes: RECORD_MAX_LINE_BYTES,
+            segment_max_bytes: RECORD_SEGMENT_MAX_BYTES,
+            tenant_max_bytes: RECORD_TENANT_MAX_BYTES,
+            max_directory_entries: RECORD_MAX_DIRECTORY_ENTRIES,
+        }
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum RecordStoreError {
+    #[error("record store io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("record serialization failed: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("verification record is {actual} bytes, above the {max} byte line cap")]
+    LineTooLarge { actual: u64, max: u64 },
+    #[error("tenant verification-record quota exceeded: need {needed} bytes, cap is {max}")]
+    TenantQuotaExceeded { needed: u64, max: u64 },
+    #[error("tenant verification-record directory has too many entries")]
+    TooManyEntries,
+    #[error("verification-record storage path is not a regular private file or directory")]
+    UnsafePath,
+    #[error("record append lock is poisoned")]
+    LockPoisoned,
+}
+
+fn tenant_records_dir(data_dir: &Path, tenant: &str) -> PathBuf {
+    let tenant_hash = blake3::hash(tenant.as_bytes()).to_hex();
+    data_dir
+        .join("provenance")
+        .join("tenants")
+        .join(format!("t_{tenant_hash}"))
+}
+
+fn records_path(data_dir: &Path, tenant: &str) -> PathBuf {
+    tenant_records_dir(data_dir, tenant).join("verification-records.jsonl")
+}
+
+fn record_append_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn append_record(data_dir: &Path, tenant: &str, line: &serde_json::Value) -> Result<(), RecordStoreError> {
+    append_record_with_limits(data_dir, tenant, line, RecordStoreLimits::default())
+}
+
+fn append_record_with_limits(
+    data_dir: &Path,
+    tenant: &str,
+    line: &serde_json::Value,
+    limits: RecordStoreLimits,
+) -> Result<(), RecordStoreError> {
+    use fs2::FileExt as _;
+    use std::io::Write as _;
+
     let mut serialized = serde_json::to_vec(line)?;
     serialized.push(b'\n');
-    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+    let line_bytes = u64::try_from(serialized.len()).unwrap_or(u64::MAX);
+    let effective_line_cap = limits.max_line_bytes.min(limits.segment_max_bytes);
+    if line_bytes > effective_line_cap {
+        return Err(RecordStoreError::LineTooLarge {
+            actual: line_bytes,
+            max: effective_line_cap,
+        });
+    }
+
+    let _process_guard = record_append_lock()
+        .lock()
+        .map_err(|_| RecordStoreError::LockPoisoned)?;
+    let tenant_dir = tenant_records_dir(data_dir, tenant);
+    let tenant_dir_preexisting = tenant_dir.exists();
+    std::fs::create_dir_all(&tenant_dir)?;
+    let tenant_dir_metadata = std::fs::symlink_metadata(&tenant_dir)?;
+    if tenant_dir_metadata.file_type().is_symlink() || !tenant_dir_metadata.is_dir() {
+        return Err(RecordStoreError::UnsafePath);
+    }
+    set_private_directory_permissions(&tenant_dir)?;
+
+    let lock_path = tenant_dir.join(".append.lock");
+    reject_symlink_or_non_file(&lock_path)?;
+    let lock_file = open_private_append_lock(&lock_path)?;
+    validate_and_harden_open_file(&lock_file)?;
+    lock_file.lock_exclusive()?;
+
+    let active_path = records_path(data_dir, tenant);
+    let mut total_bytes = 0_u64;
+    let mut directory_entries = 0_usize;
+    let mut active_bytes = None;
+    for entry in std::fs::read_dir(&tenant_dir)? {
+        let entry = entry?;
+        directory_entries = directory_entries.saturating_add(1);
+        if directory_entries > limits.max_directory_entries {
+            return Err(RecordStoreError::TooManyEntries);
+        }
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(RecordStoreError::UnsafePath);
+        }
+        if !file_type.is_file() {
+            return Err(RecordStoreError::UnsafePath);
+        }
+        let entry_path = entry.path();
+        let is_jsonl = entry_path.extension().and_then(|ext| ext.to_str()) == Some("jsonl");
+        if entry.file_name() != ".append.lock" && !is_jsonl {
+            return Err(RecordStoreError::UnsafePath);
+        }
+        if is_jsonl {
+            let bytes = entry.metadata()?.len();
+            total_bytes = total_bytes.saturating_add(bytes);
+            if entry_path == active_path {
+                active_bytes = Some(bytes);
+            }
+        }
+    }
+    let needed = total_bytes.saturating_add(line_bytes);
+    if needed > limits.tenant_max_bytes {
+        return Err(RecordStoreError::TenantQuotaExceeded {
+            needed,
+            max: limits.tenant_max_bytes,
+        });
+    }
+
+    reject_symlink_or_non_file(&active_path)?;
+    let rotate =
+        active_bytes.is_some_and(|bytes| bytes > 0 && bytes.saturating_add(line_bytes) > limits.segment_max_bytes);
+    if (active_bytes.is_none() || rotate) && directory_entries >= limits.max_directory_entries {
+        return Err(RecordStoreError::TooManyEntries);
+    }
+    if rotate {
+        let archive_path = tenant_dir.join(format!(
+            "verification-records-{}-{}.jsonl",
+            chrono::Utc::now().timestamp_millis(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::rename(&active_path, archive_path)?;
+        sync_directory(&tenant_dir)?;
+    }
+
+    let mut file = open_private_append_file(&active_path)?;
+    validate_and_harden_open_file(&file)?;
     file.write_all(&serialized)?;
+    file.sync_all()?;
+    sync_directory(&tenant_dir)?;
+    if !tenant_dir_preexisting {
+        sync_directory_chain(&tenant_dir, data_dir)?;
+    }
+    Ok(())
+}
+
+fn reject_symlink_or_non_file(path: &Path) -> Result<(), RecordStoreError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(RecordStoreError::UnsafePath),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn open_private_append_lock(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).write(true);
+    set_private_file_mode(&mut options);
+    options.open(path)
+}
+
+fn open_private_append_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    set_private_file_mode(&mut options);
+    options.open(path)
+}
+
+fn validate_and_harden_open_file(file: &std::fs::File) -> Result<(), RecordStoreError> {
+    if !file.metadata()?.is_file() {
+        return Err(RecordStoreError::UnsafePath);
+    }
+    set_open_file_private(file)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_file_mode(options: &mut std::fs::OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+}
+
+#[cfg(not(unix))]
+fn set_private_file_mode(_options: &mut std::fs::OpenOptions) {}
+
+#[cfg(unix)]
+fn set_open_file_private(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn set_open_file_private(_file: &std::fs::File) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_directory_permissions(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn set_private_directory_permissions(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn sync_directory_chain(start: &Path, stop: &Path) -> std::io::Result<()> {
+    let mut current = Some(start);
+    while let Some(path) = current {
+        sync_directory(path)?;
+        if path == stop {
+            break;
+        }
+        current = path.parent();
+    }
     Ok(())
 }
 
@@ -761,6 +997,11 @@ fn not_enabled() -> Response {
     )
 }
 
+fn blocking_task_failed(operation: &'static str, err: tokio::task::JoinError) -> Response {
+    tracing::error!(operation, error = %err, "provenance blocking task failed");
+    problem_response(StatusCode::INTERNAL_SERVER_ERROR, "internal provenance worker failure")
+}
+
 /// Any-of scopes accepted across the whole provenance surface. Kept in sync
 /// with the `route_auth::classify_route` contract for `/v1/provenance`.
 const PROVENANCE_SCOPES: &[&str] = &["provenance:write", "admin:write"];
@@ -806,9 +1047,10 @@ pub(super) async fn post_provenance_sign(
         Ok(tenant) => tenant,
         Err(resp) => return resp,
     };
-    match do_sign(&NoopMeter, &tenant, &body) {
-        Ok(resp) => (StatusCode::CREATED, Json(resp)).into_response(),
-        Err(e) => e.into_response(),
+    match tokio::task::spawn_blocking(move || do_sign(&NoopMeter, &tenant, &body)).await {
+        Ok(Ok(resp)) => (StatusCode::CREATED, Json(resp)).into_response(),
+        Ok(Err(err)) => err.into_response(),
+        Err(err) => blocking_task_failed("sign", err),
     }
 }
 
@@ -821,9 +1063,10 @@ pub(super) async fn post_provenance_verify(
         Ok(tenant) => tenant,
         Err(resp) => return resp,
     };
-    match do_verify(&NoopMeter, &tenant, &body) {
-        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
-        Err(e) => e.into_response(),
+    match tokio::task::spawn_blocking(move || do_verify(&NoopMeter, &tenant, &body)).await {
+        Ok(Ok(resp)) => (StatusCode::OK, Json(resp)).into_response(),
+        Ok(Err(err)) => err.into_response(),
+        Err(err) => blocking_task_failed("verify", err),
     }
 }
 
@@ -836,16 +1079,17 @@ pub(super) async fn post_provenance_verify_record(
         Ok(tenant) => tenant,
         Err(resp) => return resp,
     };
-    match do_verify_record(
-        &NoopMeter,
-        &tenant,
-        &body,
-        &state.passport_key_path,
-        &state.passport_fpr,
-        &state.data_dir,
-    ) {
-        Ok(resp) => (StatusCode::CREATED, Json(resp)).into_response(),
-        Err(e) => e.into_response(),
+    let passport_key_path = state.passport_key_path.clone();
+    let passport_fpr = state.passport_fpr.clone();
+    let data_dir = state.data_dir.clone();
+    match tokio::task::spawn_blocking(move || {
+        do_verify_record(&NoopMeter, &tenant, &body, &passport_key_path, &passport_fpr, &data_dir)
+    })
+    .await
+    {
+        Ok(Ok(resp)) => (StatusCode::CREATED, Json(resp)).into_response(),
+        Ok(Err(err)) => err.into_response(),
+        Err(err) => blocking_task_failed("verify-record", err),
     }
 }
 
@@ -1110,7 +1354,7 @@ mod tests {
 
         // The JSONL line is retained on disk.
         let mut buf = String::new();
-        std::fs::File::open(records_path(data_dir))
+        std::fs::File::open(records_path(data_dir, "tenant-r"))
             .unwrap()
             .read_to_string(&mut buf)
             .unwrap();
@@ -1153,6 +1397,156 @@ mod tests {
             "record must not claim overall success without asset match"
         );
         assert!(!resp.verification.asset_binding_checked);
+    }
+
+    #[test]
+    fn record_store_is_tenant_partitioned_private_and_durable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let line_a = json!({"tenant_id": "tenant-a", "record_id": "a"});
+        let line_b = json!({"tenant_id": "tenant-b", "record_id": "b"});
+        append_record(tmp.path(), "tenant-a", &line_a).unwrap();
+        append_record(tmp.path(), "tenant-b", &line_b).unwrap();
+
+        let path_a = records_path(tmp.path(), "tenant-a");
+        let path_b = records_path(tmp.path(), "tenant-b");
+        assert_ne!(path_a, path_b);
+        let stored_a = std::fs::read_to_string(&path_a).unwrap();
+        let stored_b = std::fs::read_to_string(&path_b).unwrap();
+        assert!(stored_a.contains("tenant-a"));
+        assert!(!stored_a.contains("tenant-b"));
+        assert!(stored_b.contains("tenant-b"));
+        assert!(!stored_b.contains("tenant-a"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(std::fs::metadata(&path_a).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::metadata(tenant_records_dir(tmp.path(), "tenant-a"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[test]
+    fn record_store_rotates_segments_and_enforces_total_quota() {
+        let tmp = tempfile::tempdir().unwrap();
+        let line = json!({"payload": "x".repeat(40)});
+        let encoded_len = u64::try_from(serde_json::to_vec(&line).unwrap().len() + 1).unwrap();
+        let rotating = RecordStoreLimits {
+            max_line_bytes: 512,
+            segment_max_bytes: encoded_len + 1,
+            tenant_max_bytes: 1_024,
+            max_directory_entries: 16,
+        };
+        append_record_with_limits(tmp.path(), "tenant-rotate", &line, rotating).unwrap();
+        append_record_with_limits(tmp.path(), "tenant-rotate", &line, rotating).unwrap();
+        let jsonl_files: Vec<PathBuf> = std::fs::read_dir(tenant_records_dir(tmp.path(), "tenant-rotate"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+            .collect();
+        assert_eq!(jsonl_files.len(), 2, "one archive plus one active segment");
+
+        let quota = RecordStoreLimits {
+            tenant_max_bytes: encoded_len + 1,
+            segment_max_bytes: 512,
+            ..rotating
+        };
+        append_record_with_limits(tmp.path(), "tenant-quota", &line, quota).unwrap();
+        let before = std::fs::read(records_path(tmp.path(), "tenant-quota")).unwrap();
+        let err = append_record_with_limits(tmp.path(), "tenant-quota", &line, quota).unwrap_err();
+        assert!(matches!(err, RecordStoreError::TenantQuotaExceeded { .. }));
+        let after = std::fs::read(records_path(tmp.path(), "tenant-quota")).unwrap();
+        assert_eq!(after, before, "quota rejection must not partially append");
+
+        let entry_limited = RecordStoreLimits {
+            max_directory_entries: 2, // lock file plus active segment
+            tenant_max_bytes: 1_024,
+            ..rotating
+        };
+        append_record_with_limits(tmp.path(), "tenant-entry-cap", &line, entry_limited).unwrap();
+        let before = std::fs::read(records_path(tmp.path(), "tenant-entry-cap")).unwrap();
+        let err = append_record_with_limits(tmp.path(), "tenant-entry-cap", &line, entry_limited).unwrap_err();
+        assert!(matches!(err, RecordStoreError::TooManyEntries));
+        let after = std::fs::read(records_path(tmp.path(), "tenant-entry-cap")).unwrap();
+        assert_eq!(after, before, "entry-cap rejection must precede rotation or append");
+    }
+
+    #[test]
+    fn concurrent_record_appends_never_interleave_json_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::sync::Arc::new(tmp.path().to_path_buf());
+        let mut workers = Vec::new();
+        for index in 0..8_u32 {
+            let root = std::sync::Arc::clone(&root);
+            workers.push(std::thread::spawn(move || {
+                append_record(&root, "tenant-concurrent", &json!({"record": index}))
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+        let stored = std::fs::read_to_string(records_path(&root, "tenant-concurrent")).unwrap();
+        let lines: Vec<&str> = stored.lines().collect();
+        assert_eq!(lines.len(), 8);
+        for line in lines {
+            let _: serde_json::Value = serde_json::from_str(line).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn record_store_rejects_symlinked_active_file() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tenant_dir = tenant_records_dir(tmp.path(), "tenant-symlink");
+        std::fs::create_dir_all(&tenant_dir).unwrap();
+        let victim = tmp.path().join("victim.txt");
+        std::fs::write(&victim, b"unchanged").unwrap();
+        symlink(&victim, records_path(tmp.path(), "tenant-symlink")).unwrap();
+
+        let err = append_record(tmp.path(), "tenant-symlink", &json!({"record": "attack"})).unwrap_err();
+        assert!(matches!(err, RecordStoreError::UnsafePath));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"unchanged");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn record_store_hardens_preexisting_file_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tenant_dir = tenant_records_dir(tmp.path(), "tenant-permissions");
+        std::fs::create_dir_all(&tenant_dir).unwrap();
+        let active_path = records_path(tmp.path(), "tenant-permissions");
+        let lock_path = tenant_dir.join(".append.lock");
+        std::fs::write(&active_path, b"").unwrap();
+        std::fs::write(&lock_path, b"").unwrap();
+        std::fs::set_permissions(&tenant_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&active_path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        append_record(tmp.path(), "tenant-permissions", &json!({"record": "private"})).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&tenant_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&active_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     // ── flag-off returns 404 at the axum handler ───────────────────────────
