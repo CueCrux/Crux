@@ -100,6 +100,23 @@ An exact leaf pin is a narrow operator policy, not a claim that a public CA
 validated the signer. Malformed pin configuration fails closed and leaves the
 routes unmounted.
 
+## Abuse-control layers
+
+The three provenance operations share one tenant-scoped budget of 120 calls
+per minute for each verified stable JWT `sub` or `passport_id`. Refreshing a
+token or switching from `verify` to `sign` does not reset that allowance.
+Hosted JWTs without either stable identity claim fail closed; loopback-only
+`dev_scopes` retains a hashed development-credential fallback. A rejected call
+returns `429` and `Retry-After: 60`.
+
+This principal budget complements the daemon-wide effective-client-IP token
+bucket, request-body caps, and global in-flight/load-shed guard. A reverse
+proxy's forwarded address is trusted only when its peer CIDR is explicitly in
+`CORECRUXD_TRUSTED_PROXY_CIDRS`; loopback is otherwise exempt by default. Both
+rate tables are process-local, so a horizontally scaled hosted deployment must
+also enforce a shared edge/gateway limit and verify it during the external beta
+drill.
+
 ## Optional retained-record lifecycle
 
 Automatic deletion is off unless the operator selects a window before daemon

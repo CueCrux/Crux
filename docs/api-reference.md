@@ -100,6 +100,15 @@ and mint count-only governance receipts. A non-empty sweep reports its receipt
 status/id and deletion count in `X-Cuecrux-Retention-*` response headers. See
 the quickstart for the exact lifecycle and fail-closed behavior.
 
+All three routes share a tenant-scoped 120-request/minute budget keyed by the
+verified stable JWT `sub` or `passport_id`, so token rotation and switching
+operations do not create fresh allowance. A rejection is `429` with
+`Retry-After: 60`. This sits behind the daemon-wide effective-client-IP token
+bucket, body limits, and concurrency/load-shed layer. The principal table is
+process-local: a multi-replica hosted deployment must additionally enforce a
+shared limit at its edge or gateway. Configure `CORECRUXD_TRUSTED_PROXY_CIDRS`
+before relying on forwarded client addresses; loopback is exempt by default.
+
 ### Replay Exports
 
 | Method | Path | Description | Auth Scope |

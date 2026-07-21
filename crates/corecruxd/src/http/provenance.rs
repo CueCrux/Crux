@@ -243,10 +243,12 @@ fn content_type_allowed(ct: &str) -> bool {
             .any(|f| base.starts_with(f) && base.len() > f.len())
 }
 
-/// Per-credential fixed-window rate limiter. The credential itself is hashed
-/// before it becomes a key, and the table has a hard cardinality bound so
-/// attacker-controlled tenant/token churn cannot grow process memory without
-/// limit. A later hosted pass can add a trusted-proxy-aware client-IP bucket.
+/// Per-principal fixed-window rate limiter. The verified stable subject or
+/// passport identity is tenant-domain-separated and hashed before it becomes
+/// a key, so refreshing a JWT cannot reset the budget. The table has a hard
+/// cardinality bound so attacker-controlled principal churn cannot grow
+/// process memory without limit. The daemon-wide ingress limiter independently
+/// supplies the trusted-proxy-aware effective-client-IP bucket.
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 const RATE_MAX_PER_WINDOW: u32 = 120;
 const RATE_MAX_KEYS: usize = 10_000;
@@ -1622,7 +1624,29 @@ fn requested_tenant(headers: &HeaderMap, body_tenant: Option<&str>) -> Result<St
         .ok_or_else(|| ProvErr::new(StatusCode::BAD_REQUEST, "tenant_id or x-corecrux-tenant-id is required"))
 }
 
-fn credential_rate_key(headers: &HeaderMap, tenant: &str) -> String {
+#[allow(clippy::result_large_err)]
+fn stable_rate_principal(state: &AppState, headers: &HeaderMap) -> Result<String, Response> {
+    let evidence = crate::auth::describe_http_evidence(&state.auth, headers).map_err(IntoResponse::into_response)?;
+    if let Some(subject) = evidence.subject.filter(|subject| !subject.trim().is_empty()) {
+        return Ok(format!("subject:{subject}"));
+    }
+    let scope_context = crate::auth::http_scope_context(&state.auth, headers).map_err(IntoResponse::into_response)?;
+    if let Some(passport_id) = scope_context.passport_id.filter(|passport| !passport.trim().is_empty()) {
+        return Ok(format!("passport:{passport_id}"));
+    }
+    if matches!(
+        state.auth.mode(),
+        crate::auth::AuthMode::JwtHs256 | crate::auth::AuthMode::JwtJwks
+    ) {
+        return Err(problem_response(
+            StatusCode::UNAUTHORIZED,
+            "provenance access token must include a stable sub or passport_id claim",
+        ));
+    }
+
+    // Loopback-only dev scopes do not carry verified identity claims. Preserve
+    // their existing per-credential isolation without weakening hosted JWT
+    // posture; the digest never exposes the development credential itself.
     let credential = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -1633,7 +1657,30 @@ fn credential_rate_key(headers: &HeaderMap, tenant: &str) -> String {
         })
         .unwrap_or("authenticated-no-credential-id");
     let credential_hash = blake3::hash(credential.as_bytes()).to_hex();
-    format!("{tenant}:{credential_hash}")
+    Ok(format!("dev-credential:{credential_hash}"))
+}
+
+#[allow(clippy::result_large_err)]
+fn credential_rate_key(state: &AppState, headers: &HeaderMap, tenant: &str) -> Result<String, Response> {
+    let principal = stable_rate_principal(state, headers)?;
+    let mut material = Vec::with_capacity(tenant.len() + principal.len() + 32);
+    material.extend_from_slice(b"cuecrux.provenance.rate-key.v1\0");
+    material.extend_from_slice(tenant.as_bytes());
+    material.push(0);
+    material.extend_from_slice(principal.as_bytes());
+    Ok(blake3::hash(&material).to_hex().to_string())
+}
+
+fn rate_limited_response() -> Response {
+    let mut response = problem_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        "per-principal provenance rate limit exceeded; retry after the current window",
+    );
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from_static("60"),
+    );
+    response
 }
 
 fn record_idempotency(
@@ -1792,11 +1839,9 @@ fn guard(state: &AppState, headers: &HeaderMap, body_tenant: Option<&str>) -> Re
     if let Err(problem) = require_http_any_scope_for_tenant(&state.auth, headers, PROVENANCE_SCOPES, &tenant) {
         return Err(problem.into_response());
     }
-    if !rate_limit_ok(&credential_rate_key(headers, &tenant)) {
-        return Err(problem_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            "per-key rate limit exceeded; retry after the current window",
-        ));
+    let rate_key = credential_rate_key(state, headers, &tenant)?;
+    if !rate_limit_ok(&rate_key) {
+        return Err(rate_limited_response());
     }
     Ok(tenant)
 }
@@ -3135,6 +3180,7 @@ mod tests {
             exp: usize,
             iss: &'a str,
             aud: &'a str,
+            sub: &'a str,
             scope: &'a str,
             tenant_id: &'a str,
         }
@@ -3146,6 +3192,7 @@ mod tests {
                 + 3_600) as usize,
             iss: "corecrux-test",
             aud: "corecrux",
+            sub: "customer-user-a",
             scope: "provenance:write",
             tenant_id: "tenant-a",
         };
@@ -3196,6 +3243,79 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn jwt_rate_keys_survive_token_rotation_and_require_a_stable_principal() {
+        use crate::auth::AuthMode;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+        const SECRET: &str = "0123456789abcdef0123456789abcdef";
+        std::env::set_var("CORECRUXD_JWT_HS256_SECRET", SECRET);
+        std::env::set_var("CORECRUXD_JWT_ISS", "corecrux-rate-test");
+        std::env::set_var("CORECRUXD_JWT_AUD", "corecrux");
+        let state = crate::http::tests::test_app_state_with_auth(1, AuthMode::JwtHs256);
+
+        #[derive(serde::Serialize)]
+        struct Claims<'a> {
+            exp: usize,
+            iss: &'a str,
+            aud: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            sub: Option<&'a str>,
+            scope: &'a str,
+            tenant_id: &'a str,
+            jti: &'a str,
+        }
+        let expiry = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3_600) as usize;
+        let token = |sub, jti| {
+            encode(
+                &Header::new(Algorithm::HS256),
+                &Claims {
+                    exp: expiry,
+                    iss: "corecrux-rate-test",
+                    aud: "corecrux",
+                    sub,
+                    scope: "provenance:write",
+                    tenant_id: "tenant-rate",
+                    jti,
+                },
+                &EncodingKey::from_secret(SECRET.as_bytes()),
+            )
+            .unwrap()
+        };
+        let headers = |token: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {token}").parse().unwrap(),
+            );
+            headers
+        };
+
+        let first =
+            credential_rate_key(&state, &headers(&token(Some("stable-user"), "token-a")), "tenant-rate").unwrap();
+        let rotated =
+            credential_rate_key(&state, &headers(&token(Some("stable-user"), "token-b")), "tenant-rate").unwrap();
+        assert_eq!(first, rotated, "rotating a JWT must not reset the principal budget");
+        assert_ne!(
+            first,
+            credential_rate_key(&state, &headers(&token(Some("stable-user"), "token-c")), "other-tenant").unwrap(),
+            "rate budgets remain tenant-scoped"
+        );
+        assert!(
+            credential_rate_key(&state, &headers(&token(None, "token-without-principal")), "tenant-rate").is_err(),
+            "hosted JWTs without sub/passport_id must fail closed"
+        );
+
+        for name in ["CORECRUXD_JWT_HS256_SECRET", "CORECRUXD_JWT_ISS", "CORECRUXD_JWT_AUD"] {
+            std::env::remove_var(name);
+        }
+    }
+
+    #[test]
     fn content_type_allowlist_matches_expected() {
         assert!(content_type_allowed("image/png"));
         assert!(content_type_allowed("video/mp4"));
@@ -3215,6 +3335,9 @@ mod tests {
             assert!(rate_limit_ok(&key));
         }
         assert!(!rate_limit_ok(&key), "budget exhausted within the window");
+        let response = rate_limited_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers().get(axum::http::header::RETRY_AFTER).unwrap(), "60");
     }
 
     #[test]
