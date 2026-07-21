@@ -1062,8 +1062,8 @@ impl HttpScopeContext {
         self.passport_override_used
     }
 
-    /// Whether this context came from an auth mode that actually checks
-    /// caller credentials. Sensitive human-approval boundaries deny `off`.
+    /// Whether the daemon enforces its configured request-auth contract rather
+    /// than taking the auth-off bypass. Auth-off identities are unverified.
     pub(crate) fn auth_enforced(&self) -> bool {
         self.auth_enforced
     }

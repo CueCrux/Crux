@@ -11862,27 +11862,78 @@ async fn work_gate_missing_passport_is_denied_closed() -> Result<(), Box<dyn std
 }
 
 #[tokio::test]
-async fn work_gate_auth_off_rejects_forged_passport_header() -> Result<(), Box<dyn std::error::Error>> {
+async fn work_gate_auth_off_succeeds_with_operator_unverified_attribution() -> Result<(), Box<dyn std::error::Error>> {
     for approve in [true, false] {
-        let (state, _work_id, action_id) = gate_test_state(AuthMode::Off, Some("tenant-a")).await?;
-        let response = gate_test_resolve(
-            &state,
-            &action_id,
-            dev_scope_passport_headers("facts:write", "approver-a"),
-            Some("approver-a"),
-            approve,
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let (state, work_id, action_id) = gate_test_state(AuthMode::Off, Some("tenant-a")).await?;
+
+        let missing_identity = gate_test_resolve(&state, &action_id, HeaderMap::new(), None, approve).await;
+        assert_eq!(missing_identity.status(), StatusCode::BAD_REQUEST);
         assert_eq!(gate_test_observation_count(&state)?, 0);
+
+        // The durable actor is tagged, but the four-eyes comparison must use
+        // the raw assertion so tagging cannot disguise requester self-review.
+        let self_review = gate_test_resolve(&state, &action_id, HeaderMap::new(), Some("requester-a"), approve).await;
+        assert_eq!(self_review.status(), StatusCode::FORBIDDEN);
+        assert_eq!(gate_test_observation_count(&state)?, 0);
+
+        let response = gate_test_resolve(&state, &action_id, HeaderMap::new(), Some("approver-a"), approve).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_body = json_body(response).await;
+        let Some(receipt_id) = response_body["receipt_id"].as_str() else {
+            return Err(std::io::Error::other("auth-off gate response receipt_id missing").into());
+        };
+        let receipt_id = receipt_id.to_string();
+        let expected_actor = format!("{}approver-a", super::work::AUTH_OFF_APPROVER_PREFIX);
+        assert_eq!(gate_test_observation_count(&state)?, 1);
+
+        let Some(receipt) = super::receipts::local_approval_receipt(&state, "tenant-a", &receipt_id)? else {
+            return Err(std::io::Error::other("auth-off gate receipt missing").into());
+        };
+        assert_eq!(receipt.reviewer_passport, expected_actor);
+        assert_ne!(receipt.reviewer_passport, "approver-a");
+        assert_eq!(receipt.decision, if approve { "approve" } else { "reject" });
 
         let store = state.fact_store.read().await;
         let entity = format!("{}::{action_id}", crate::work::WORK_GATE_ENTITY_PREFIX);
         let Some(fact) = gate_test_latest_fact(&store, &entity) else {
-            return Err(std::io::Error::other("pending gate fact missing after auth-off attempt").into());
+            return Err(std::io::Error::other("resolved auth-off gate fact missing").into());
         };
+        assert_eq!(fact.actor.as_deref(), Some(expected_actor.as_str()));
+        assert_ne!(fact.actor.as_deref(), Some("approver-a"));
+        assert_eq!(fact.source_receipt.as_deref(), Some(receipt_id.as_str()));
         let gate: crate::work::PendingGateAction = serde_json::from_str(&fact.value)?;
-        assert_eq!(gate.status, "pending");
+        assert_eq!(gate.status, if approve { "approved" } else { "rejected" });
+        assert_eq!(gate.resolved_by_passport.as_deref(), Some(expected_actor.as_str()));
+        assert_ne!(gate.resolved_by_passport.as_deref(), Some("approver-a"));
+        assert_eq!(gate.receipt_id.as_deref(), Some(receipt_id.as_str()));
+
+        let expected_gate_status = if approve { "approved" } else { "rejected" };
+        let transition_fact = store.all_facts().find(|fact| {
+            fact.entity
+                .starts_with(&format!("{}::{work_id}::", crate::work::WORK_TRANSITION_ENTITY_PREFIX))
+                && serde_json::from_str::<crate::work::WorkTransition>(&fact.value)
+                    .is_ok_and(|transition| transition.gate_status == expected_gate_status)
+        });
+        let Some(transition_fact) = transition_fact else {
+            return Err(std::io::Error::other("auth-off gate resolution transition missing").into());
+        };
+        assert_eq!(transition_fact.actor.as_deref(), Some(expected_actor.as_str()));
+        assert_ne!(transition_fact.actor.as_deref(), Some("approver-a"));
+        assert_eq!(transition_fact.source_receipt.as_deref(), Some(receipt_id.as_str()));
+        let transition: crate::work::WorkTransition = serde_json::from_str(&transition_fact.value)?;
+        assert_eq!(transition.by_passport, expected_actor);
+        assert_ne!(transition.by_passport, "approver-a");
+        assert_eq!(transition.receipt_id.as_deref(), Some(receipt_id.as_str()));
+
+        if approve {
+            let work_entity = format!("{}::default::{work_id}", crate::work::WORK_ENTITY_PREFIX);
+            let Some(work_fact) = gate_test_latest_fact(&store, &work_entity) else {
+                return Err(std::io::Error::other("auth-off approved work fact missing").into());
+            };
+            assert_eq!(work_fact.actor.as_deref(), Some(expected_actor.as_str()));
+            assert_ne!(work_fact.actor.as_deref(), Some("approver-a"));
+            assert_eq!(work_fact.source_receipt.as_deref(), Some(receipt_id.as_str()));
+        }
     }
     Ok(())
 }

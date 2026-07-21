@@ -111,8 +111,9 @@ pub(super) struct CommentBody {
 
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct GateResolutionBody {
-    /// Deprecated attribution hint retained for wire compatibility. The
-    /// authenticated passport is authoritative; a mismatched hint is denied.
+    /// In an enforcing auth mode this is a legacy hint that must match the
+    /// authenticated passport. In auth-off mode it is the operator's
+    /// self-asserted identity and is persisted with an unverified actor tag.
     #[serde(default)]
     pub approver_passport: Option<String>,
 }
@@ -136,6 +137,7 @@ struct MintedGateReceipt {
 /// signed, fsynced observation chain; `http::receipts` exposes its inner CROWN
 /// body/signature through the normal `/v1/receipts/{id}` API.
 pub(super) const WORK_GATE_RECEIPT_SESSION: &str = ".work_gate_receipts_v1";
+pub(super) const AUTH_OFF_APPROVER_PREFIX: &str = "operator:unverified:";
 
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct GateListQuery {
@@ -518,42 +520,56 @@ async fn resolve_gate_http(
     approve: bool,
 ) -> axum::response::Response {
     // This is intentionally independent of route_auth: its default posture is
-    // shadow, while an approval boundary must fail closed in every posture.
+    // shadow. Enforcing modes retain the hard boundary; auth-off uses an
+    // explicitly unverified operator attribution instead.
     let context = match crate::auth::passport_bound_context(&state.auth, headers) {
         Ok(context) => context,
         Err(problem) => return problem.into_response(),
     };
-    if !context.auth_enforced() {
-        return problem_response(
-            StatusCode::FORBIDDEN,
-            "gate resolution requires an enforcing authentication mode",
-        );
-    }
-    if context.passport_override_used() {
-        return problem_response(
-            StatusCode::FORBIDDEN,
-            "passport impersonation is not permitted for gate resolution",
-        );
-    }
-    if !context.has_scope("facts:write") {
-        return problem_response(StatusCode::FORBIDDEN, "facts:write scope required for gate resolution");
-    }
-    let Some(approver_passport) = context.passport_id.as_deref() else {
-        return problem_response(
-            StatusCode::FORBIDDEN,
-            "an authenticated passport is required for gate resolution",
-        );
+    let (asserted_approver, approver_actor) = if context.auth_enforced() {
+        if context.passport_override_used() {
+            return problem_response(
+                StatusCode::FORBIDDEN,
+                "passport impersonation is not permitted for gate resolution",
+            );
+        }
+        if !context.has_scope("facts:write") {
+            return problem_response(StatusCode::FORBIDDEN, "facts:write scope required for gate resolution");
+        }
+        let Some(approver_passport) = context.passport_id.as_deref() else {
+            return problem_response(
+                StatusCode::FORBIDDEN,
+                "an authenticated passport is required for gate resolution",
+            );
+        };
+        if body
+            .approver_passport
+            .as_deref()
+            .is_some_and(|claimed| claimed != approver_passport)
+        {
+            return problem_response(
+                StatusCode::FORBIDDEN,
+                "approver_passport does not match the authenticated passport",
+            );
+        }
+        (approver_passport.to_string(), approver_passport.to_string())
+    } else {
+        let Some(approver_passport) = body
+            .approver_passport
+            .as_deref()
+            .map(str::trim)
+            .filter(|claimed| !claimed.is_empty())
+        else {
+            return problem_response(
+                StatusCode::BAD_REQUEST,
+                "approver_passport is required in auth-off mode",
+            );
+        };
+        (
+            approver_passport.to_string(),
+            format!("{AUTH_OFF_APPROVER_PREFIX}{approver_passport}"),
+        )
     };
-    if body
-        .approver_passport
-        .as_deref()
-        .is_some_and(|claimed| claimed != approver_passport)
-    {
-        return problem_response(
-            StatusCode::FORBIDDEN,
-            "approver_passport does not match the authenticated passport",
-        );
-    }
 
     // Keep target inspection, tenant authorization, receipt persistence, and
     // resolution under one write guard. That serializes concurrent decisions
@@ -574,21 +590,21 @@ async fn resolve_gate_http(
     if target.gate.status != "pending" {
         return gate_error_response(crate::work::WorkError::GateAlreadyResolved(action_id.to_string()));
     }
-    if target.gate.requested_by_passport == approver_passport {
+    if target.gate.requested_by_passport == asserted_approver {
         return problem_response(
             StatusCode::FORBIDDEN,
             "the requesting passport cannot resolve its own gate",
         );
     }
 
-    let receipt = match mint_gate_receipt(state, &target, approver_passport, approve) {
+    let receipt = match mint_gate_receipt(state, &target, &approver_actor, approve) {
         Ok(receipt) => receipt,
         Err((status, detail)) => return problem_response(status, detail),
     };
     let result = crate::work::resolve_gate(
         &mut store,
         action_id,
-        approver_passport,
+        &approver_actor,
         &receipt.receipt_id,
         approve,
         now_unix_ms(),
