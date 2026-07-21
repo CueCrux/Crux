@@ -10,9 +10,10 @@ Pick one install path, then continue at [First boot](#2-first-boot).
 
 ## 1. Install (~5 minutes)
 
-All release artifacts are signed (cosign keyless) with SLSA provenance.
-Whatever path you choose, the signature is checked **before** anything runs —
-copy-paste verification commands live in [verify-release.md](verify-release.md).
+Release binaries are cosign-signed; native installer targets also carry SLSA
+provenance. Whatever path you choose, verify the artifact **before** anything
+runs — copy-paste commands and the cross-build provenance boundary live in
+[verify-release.md](verify-release.md).
 
 ### Option A — installer script (macOS, Linux, WSL2)
 
@@ -26,9 +27,13 @@ less install.sh        # read what you're about to run
 bash install.sh        # add --with-service for a systemd/launchd unit
 ```
 
-Installs `crux`, `corecruxd` (same binary, service-manager name) and
-`corecruxctl` into `~/.local/bin`, and creates a private data dir
-(`~/.local/share/crux`, mode 0700). Nothing is auto-started.
+Installs `crux`, `corecruxd` (same binary, service-manager name),
+`corecruxctl`, and `crux-hook` into `~/.local/bin`, and creates a private data
+dir (`~/.local/share/crux`, mode 0700). Nothing is auto-started.
+
+Re-run the verified installer to upgrade the complete set together. Packaged
+installs refuse daemon-only `crux self update` so the CLI and hook cannot be
+left on an older version.
 
 ### Option B — Docker / Podman
 
@@ -208,7 +213,7 @@ boundary is machine-readable: `curl -s localhost:14800/v1/version | jq
 
 ## Upgrade
 
-Upgrades are always explicit — the daemon never self-updates:
+Upgrades are always explicit — the daemon never updates automatically:
 
 ```bash
 bash install.sh --version vX.Y.Z   # re-verifies signatures; data is kept

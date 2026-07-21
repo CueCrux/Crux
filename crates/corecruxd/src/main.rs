@@ -258,7 +258,8 @@ The only recognised flags are:\n\
   mcp-stdio        run the bundled stdio\u{21c4}HTTP MCP bridge (not the daemon);\n\
                    env: CRUX_MCP_URL (default http://127.0.0.1:14801/mcp),\n\
                    CRUX_AGENT_TOKEN (optional bearer)\n\
-  self update      download, verify (sha256) and install the latest release;\n\
+  self update      update a standalone daemon binary; packaged installs use\n\
+                   their installer/package manager to keep companions aligned;\n\
                    append --check to only report whether a newer one exists\n",
         line = version_line()
     )

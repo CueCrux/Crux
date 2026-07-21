@@ -5,8 +5,8 @@ phoning home by default.
 
 ## Posture (non-negotiable)
 
-- **Notification, never action.** Nothing self-updates. The upgrade is always
-  an explicit operator command that re-verifies signatures
+- **Notification, never automatic action.** Nothing updates in the background.
+  The upgrade is always an explicit operator command that re-verifies artifacts
   (`install.sh --version vX.Y.Z`, `brew upgrade crux`, `dpkg -i`, image tag
   bump).
 - **Opt-in check.** The daemon makes no outbound connections by default
@@ -27,27 +27,32 @@ The stable URL always points at the newest release:
 https://github.com/CueCrux/Crux/releases/latest/download/update-manifest.json
 ```
 
-Shape (`crux.update_manifest.v1`):
+Shape (`crux.update_manifest.v2`):
 
 ```json
 {
-  "schema": "crux.update_manifest.v1",
+  "schema": "crux.update_manifest.v2",
   "tag": "v0.5.0",
   "version": "0.5.0",
   "published_at": "2026-06-20T00:00:00Z",
   "notes_url": "https://github.com/CueCrux/Crux/releases/tag/v0.5.0",
   "verify_doc": "https://github.com/CueCrux/Crux/blob/v0.5.0/docs/verify-release.md",
   "artifacts": [
-    {"name": "crux-linux-amd64", "sha256": "…"},
-    {"name": "crux-darwin-arm64", "sha256": "…"},
-    {"name": "crux-darwin-amd64", "sha256": "…"}
+    {"name": "standalone-crux-linux-amd64", "asset_name": "crux-linux-amd64", "sha256": "…"},
+    {"name": "standalone-crux-darwin-arm64", "asset_name": "crux-darwin-arm64", "sha256": "…"},
+    {"name": "standalone-crux-darwin-amd64", "asset_name": "crux-darwin-amd64", "sha256": "…"}
   ]
 }
 ```
 
 Consumers compare `version` against their own `crux --version` and print the
-upgrade hint. The sha256 list lets a consumer pre-pin what it expects before
-downloading; full verification remains the cosign/SLSA flow.
+upgrade hint. `name` is the standalone-updater selector; `asset_name` is the
+actual GitHub Release file. The distinct logical name is a compatibility fence:
+pre-M5 updaters search only for `crux-<target>`, find no match, and fail before
+mutation. That prevents packaged installs from crossing without the new
+hook/CLI; an old standalone install also takes the verified installer for this
+one transition. The sha256 list lets a current standalone consumer pre-pin what
+it expects before downloading; full verification remains the cosign/SLSA flow.
 
 ## Today's checking surfaces
 
@@ -58,14 +63,29 @@ downloading; full verification remains the cosign/SLSA flow.
   checkout you deployed from. This probe is inert for binary installs (no
   repo to compare) and installers pin it `=0`.
 - **Binary installs**: check manually against the manifest URL above, or
-  re-run the installer with a pinned `--version` when you decide to move.
+  run `crux self update --check`. Re-run the installer with a pinned
+  `--version` when you decide to move.
 
-## Planned: `crux self update` (gated)
+## `crux self update` (implemented, explicit-only)
 
-`crux self update --check` (manifest GET + version compare + print hint) and
-`crux self update [--version vX.Y.Z]` (download → cosign verify → atomic
-swap with `.bak` retention) are speced against `crux.update_manifest.v1` but
-**not implemented in this plan** — the subcommand lands in `corecruxd`'s CLI
-surface, which has concurrent in-flight work; see ExecPlan
-`daemon-distribution-packaging-2026-06-11` decision log (M7) for the gate.
-Until then, `install.sh --version` *is* the one-command upgrade.
+`crux self update --check` performs the manifest GET, compares versions, and
+prints the result without writing. `crux self update` can download, sha256-pin,
+and atomically replace a **standalone daemon binary**. It is never invoked by
+the daemon in the background.
+
+Packaged installs deliberately refuse that daemon-only replacement when
+`crux-hook` or `corecruxctl` is installed beside the daemon. A partial update
+would create version skew, and replacing several executables cannot be one
+filesystem-atomic operation. Upgrade the complete verified set instead:
+
+- installer: re-run `install.sh --version vX.Y.Z`
+- Homebrew: `brew upgrade crux`
+- Debian: install the new signed `.deb`
+
+This complete-bundle route is also required for the first upgrade into an M5
+release: the v2 logical artifact name deliberately fences pre-M5 self-updaters
+before they can perform a partial transition.
+
+The in-process standalone path verifies the downloaded daemon against the hash
+in the HTTPS-fetched manifest. The signed installer remains the stronger
+cosign/SLSA path and the required route for managed bundles.

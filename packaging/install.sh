@@ -17,8 +17,8 @@
 #   └─────────────────────────────────────────────────────────────────┘
 #
 # What it does (and nothing else):
-#   - downloads the crux + corecruxctl binaries for your platform from the
-#     pinned GitHub Release,
+#   - downloads the crux, corecruxctl, and crux-hook binaries for your platform
+#     from the pinned GitHub Release,
 #   - VERIFIES their cosign keyless signatures before installing (hard
 #     requirement — there is no skip flag),
 #   - installs them into PREFIX/bin (default: ~/.local),
@@ -91,7 +91,11 @@ esac
 # ── uninstall ───────────────────────────────────────────────────────────────
 if [ "$UNINSTALL" -eq 1 ]; then
   echo "Removing binaries from ${BIN_DIR} ..."
-  rm -f "${BIN_DIR}/crux" "${BIN_DIR}/corecruxd" "${BIN_DIR}/corecruxctl"
+  rm -f \
+    "${BIN_DIR}/crux" \
+    "${BIN_DIR}/corecruxd" \
+    "${BIN_DIR}/corecruxctl" \
+    "${BIN_DIR}/crux-hook"
   if [ "$OS" = "Linux" ]; then
     UNIT="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/crux.service"
     if [ -f "$UNIT" ]; then
@@ -168,7 +172,7 @@ verify() {
          exit 1; }
 }
 
-for artifact in "crux-${SUFFIX}" "corecruxctl-${SUFFIX}"; do
+for artifact in "crux-${SUFFIX}" "corecruxctl-${SUFFIX}" "crux-hook-${SUFFIX}"; do
   fetch "${artifact}"
   fetch "${artifact}.sig"
   fetch "${artifact}.pem"
@@ -179,6 +183,7 @@ done
 mkdir -p "${BIN_DIR}"
 install -m 0755 "${WORK}/crux-${SUFFIX}" "${BIN_DIR}/crux"
 install -m 0755 "${WORK}/corecruxctl-${SUFFIX}" "${BIN_DIR}/corecruxctl"
+install -m 0755 "${WORK}/crux-hook-${SUFFIX}" "${BIN_DIR}/crux-hook"
 # Same binary, service-manager-friendly name (matches release artifact set).
 ln -sf "${BIN_DIR}/crux" "${BIN_DIR}/corecruxd"
 
@@ -243,6 +248,7 @@ echo "Installed:"
 echo "  ${BIN_DIR}/crux          (the daemon)"
 echo "  ${BIN_DIR}/corecruxd     (same binary, service-manager name)"
 echo "  ${BIN_DIR}/corecruxctl   (admin CLI)"
+echo "  ${BIN_DIR}/crux-hook     (agent lifecycle hooks)"
 echo "  ${DATA_DIR}              (data dir, 0700)"
 case ":${PATH}:" in
   *":${BIN_DIR}:"*) : ;;
