@@ -83,16 +83,20 @@ jobs:
       - name: Run cargo-mutants shard on the trust-core crates
         run: |
           set -uo pipefail
+          # GitHub's default bash shell injects -e, so the exit code MUST be
+          # captured with `|| rc=$?` — a bare `cmd; rc=$?` dies at the cmd
+          # line before rc is read (first nightly, run 29720177941: all 8
+          # shards "failed" with normal survivor exit codes).
+          rc=0
           cargo mutants --no-shuffle --timeout 120 \
             --shard "${{ matrix.shard }}/${MUTANTS_SHARDS}" \
-            -p corecrux-receipts -p corecrux-segment -p corecrux-storage
-          rc=$?
-          # 0 = all mutants caught; 2 = missed mutants (reported by the merge
-          # job, non-fatal here). Anything else is an infra/baseline failure
-          # and must fail the shard — silent death is the failure mode that
-          # hid this job's results for a month.
-          if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then
-            echo "::error::cargo-mutants exited $rc (not a survivors result: 3=all-timeouts, 4=baseline failed, other=infra — see log)"
+            -p corecrux-receipts -p corecrux-segment -p corecrux-storage || rc=$?
+          # 0 = all caught; 2 = missed mutants; 3 = some mutants timed out.
+          # All three are RESULTS — the merge job ratchets missed+timeout.
+          # Anything else is an infra/baseline failure and must fail the
+          # shard — silent death hid this job's results for a month.
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ] && [ "$rc" -ne 3 ]; then
+            echo "::error::cargo-mutants exited $rc (4=baseline failed, other=infra — see log)"
             exit "$rc"
           fi
       - name: Upload shard report
@@ -129,12 +133,12 @@ jobs:
             echo "::error::no shard reports downloaded — every shard died before upload"
             exit 1
           fi
+          rc=0
           python3 scripts/mutants-report.py \
             --outs "${dirs[@]}" \
             --baseline .github/mutants-baseline.txt \
             --summary "$GITHUB_STEP_SUMMARY" \
-            --expect-min-viable 1200
-          rc=$?
+            --expect-min-viable 1200 || rc=$?  # -e-safe capture (see shard step)
           if [ "$rc" -eq 2 ]; then
             echo "::error::new mutation survivors vs .github/mutants-baseline.txt (see job summary)"
           fi
