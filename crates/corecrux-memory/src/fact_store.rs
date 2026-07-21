@@ -10,8 +10,11 @@
 //! keyword search over fact values and soft-delete via tombstone events.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt as _;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -487,6 +490,75 @@ pub struct NearDuplicate {
     pub score: f32,
 }
 
+/// Quarantine an unterminated JSONL tail, the signature of a crash during one
+/// append. Even parseable JSON is not treated as committed: the append never
+/// completed its record delimiter and therefore may not have returned success
+/// to the caller. Newline-terminated corruption remains fail-visible.
+fn repair_torn_journal_tail(path: &Path) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)?;
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last_byte = [0_u8; 1];
+    file.read_exact(&mut last_byte)?;
+    if last_byte[0] == b'\n' {
+        return Ok(());
+    }
+
+    let mut cursor = len;
+    let mut tail_start = 0_u64;
+    let mut block = vec![0_u8; 8 * 1024];
+    while cursor > 0 {
+        let start = cursor.saturating_sub(block.len() as u64);
+        let width = (cursor - start) as usize;
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut block[..width])?;
+        if let Some(index) = block[..width].iter().rposition(|byte| *byte == b'\n') {
+            tail_start = start + index as u64 + 1;
+            break;
+        }
+        cursor = start;
+    }
+    let tail_len = len.saturating_sub(tail_start);
+    const MAX_RECOVERY_TAIL_BYTES: u64 = 64 * 1024 * 1024;
+    if tail_len > MAX_RECOVERY_TAIL_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unterminated fact journal tail is {tail_len} bytes"),
+        ));
+    }
+    let mut tail = vec![0_u8; tail_len as usize];
+    file.seek(SeekFrom::Start(tail_start))?;
+    file.read_exact(&mut tail)?;
+    let quarantine = path.with_extension(format!("jsonl.torn.{}", uuid::Uuid::new_v4().simple()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut torn = options.open(&quarantine)?;
+    torn.write_all(&tail)?;
+    torn.sync_all()?;
+    file.set_len(tail_start)?;
+    file.sync_all()?;
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    tracing::error!(
+        journal = %path.display(),
+        quarantine = %quarantine.display(),
+        bytes = tail.len(),
+        "quarantined torn fact-journal tail before durable append"
+    );
+    Ok(())
+}
+
 impl FactStore {
     pub fn new() -> Self {
         Self::default()
@@ -678,9 +750,29 @@ impl FactStore {
     /// Append a journal event to the JSONL file.
     fn append_journal(&self, event: &JournalEvent) -> std::io::Result<()> {
         if let Some(path) = &self.journal_path {
+            repair_torn_journal_tail(path)?;
             let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
             let line = serde_json::to_string(event).map_err(std::io::Error::other)?;
             writeln!(file, "{}", line)?;
+        }
+        Ok(())
+    }
+
+    /// Append one journal event and synchronize both the file and its parent
+    /// directory before returning. Reserved for authority-changing batches
+    /// whose caller must not observe an in-memory commit ahead of durable
+    /// storage.
+    fn append_journal_durable(&self, event: &JournalEvent) -> std::io::Result<()> {
+        let Some(path) = &self.journal_path else {
+            return Ok(());
+        };
+        repair_torn_journal_tail(path)?;
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        let line = serde_json::to_string(event).map_err(std::io::Error::other)?;
+        writeln!(file, "{}", line)?;
+        file.sync_all()?;
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
         }
         Ok(())
     }
@@ -1102,6 +1194,26 @@ impl FactStore {
             })
             .collect();
         self.append_journal(&JournalEvent::StoreBatch { facts: facts.clone() })?;
+        for fact in &facts {
+            self.insert_fact_indexes(fact);
+            self.supersede_prior_version(fact);
+            self.after_fact_stored(fact);
+        }
+        Ok(facts)
+    }
+
+    /// Store multiple facts as one journal event, fsyncing that event before
+    /// mutating in-memory state. This is the high-risk counterpart to
+    /// [`Self::try_store_bulk`].
+    pub fn try_store_bulk_durable(&mut self, reqs: Vec<StoreFact>) -> std::io::Result<Vec<Fact>> {
+        let facts: Vec<Fact> = reqs
+            .into_iter()
+            .map(|mut req| {
+                crate::fact_privacy::enforce_global(&mut req);
+                self.build_fact(req)
+            })
+            .collect();
+        self.append_journal_durable(&JournalEvent::StoreBatch { facts: facts.clone() })?;
         for fact in &facts {
             self.insert_fact_indexes(fact);
             self.supersede_prior_version(fact);
@@ -3769,6 +3881,98 @@ mod tests {
             assert_eq!(store.get_by_entity("a").len(), 1);
             assert_eq!(store.get_by_entity("b").len(), 1);
         }
+    }
+
+    #[test]
+    fn try_store_bulk_durable_persists_as_one_replayable_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = FactStore::with_persistence(dir.path()).unwrap();
+            let facts = store
+                .try_store_bulk_durable(vec![
+                    StoreFact {
+                        tenant_hash: "default".to_string(),
+                        entity: "authority::passport".into(),
+                        key: "record".into(),
+                        value: "passport".into(),
+                        source_receipt: Some("ad_mr_test".into()),
+                        confidence: 1.0,
+                        private: true,
+                        horizon_class: Some(HorizonClass::None),
+                        actor: Some("reviewer".into()),
+                    },
+                    StoreFact {
+                        tenant_hash: "default".to_string(),
+                        entity: "authority::request".into(),
+                        key: "record".into(),
+                        value: "approved".into(),
+                        source_receipt: Some("ad_mr_test".into()),
+                        confidence: 1.0,
+                        private: true,
+                        horizon_class: Some(HorizonClass::None),
+                        actor: Some("reviewer".into()),
+                    },
+                ])
+                .unwrap();
+            assert_eq!(facts.len(), 2);
+            assert_eq!(store.count(), 2);
+        }
+
+        let journal = std::fs::read_to_string(dir.path().join("facts.jsonl")).unwrap();
+        assert_eq!(journal.lines().count(), 1);
+        assert!(journal.contains("store_batch"));
+        let replayed = FactStore::with_persistence(dir.path()).unwrap();
+        assert_eq!(replayed.count(), 2);
+    }
+
+    #[test]
+    fn durable_batch_quarantines_torn_unterminated_tail_before_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("facts.jsonl");
+        let mut store = FactStore::with_persistence(dir.path()).unwrap();
+        store
+            .try_store(StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: "before".into(),
+                key: "record".into(),
+                value: "before".into(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: true,
+                horizon_class: Some(HorizonClass::None),
+                actor: None,
+            })
+            .unwrap();
+        {
+            let mut journal = std::fs::OpenOptions::new().append(true).open(&journal_path).unwrap();
+            journal.write_all(br#"{"event":"store_batch""#).unwrap();
+            journal.sync_all().unwrap();
+        }
+
+        store
+            .try_store_bulk_durable(vec![StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: "after".into(),
+                key: "record".into(),
+                value: "after".into(),
+                source_receipt: Some("ad_mr_tail".into()),
+                confidence: 1.0,
+                private: true,
+                horizon_class: Some(HorizonClass::None),
+                actor: Some("reviewer".into()),
+            }])
+            .unwrap();
+
+        let replayed = FactStore::with_persistence(dir.path()).unwrap();
+        assert_eq!(replayed.count(), 2);
+        assert_eq!(replayed.get_by_entity("before").len(), 1);
+        assert_eq!(replayed.get_by_entity("after").len(), 1);
+        let quarantines = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains("jsonl.torn."))
+            .count();
+        assert_eq!(quarantines, 1);
     }
 
     #[test]

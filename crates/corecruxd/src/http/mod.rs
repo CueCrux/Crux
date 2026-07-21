@@ -10,6 +10,7 @@ mod activity;
 mod admin;
 mod agent_usage;
 mod append;
+mod approval_receipts;
 mod auth_device;
 mod auth_rails;
 mod cases;

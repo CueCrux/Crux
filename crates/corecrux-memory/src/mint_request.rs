@@ -62,6 +62,34 @@ pub struct PendingMintRequest {
     pub resolved_at_unix_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_by_passport: Option<String>,
+    /// Typed approval-decision receipt that authorized the terminal state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_receipt_id: Option<String>,
+    /// Exact category applied by an approved decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_category: Option<String>,
+    /// Whether approval created or updated the requester passport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passport_operation: Option<String>,
+    /// BLAKE3 digest of the normalized passport record authorized by the
+    /// receipt. This binds editable metadata without copying it into the
+    /// approval receipt's action summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passport_record_hash: Option<String>,
+    /// BLAKE3 digest of the complete normalized passport mutation set,
+    /// including any default-passport records changed as a side effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passport_mutation_hash: Option<String>,
+}
+
+/// Optional audit bindings attached to a terminal mint-request record.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MintRequestResolutionMetadata {
+    pub receipt_id: Option<String>,
+    pub approved_category: Option<String>,
+    pub passport_operation: Option<String>,
+    pub passport_record_hash: Option<String>,
+    pub passport_mutation_hash: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -96,6 +124,11 @@ pub fn file_mint_request(
         requested_at_unix_ms: now_unix_ms,
         resolved_at_unix_ms: None,
         resolved_by_passport: None,
+        resolution_receipt_id: None,
+        approved_category: None,
+        passport_operation: None,
+        passport_record_hash: None,
+        passport_mutation_hash: None,
     };
     let value = serde_json::to_string(&request)?;
     let fact = StoreFact {
@@ -172,6 +205,29 @@ pub fn resolve_mint_request(
     decision: MintRequestDecision,
     resolved_at_unix_ms: u64,
 ) -> Result<PendingMintRequest, MintRequestError> {
+    let (request, fact) = prepare_mint_request_resolution(
+        store,
+        request_id,
+        approver_passport,
+        decision,
+        resolved_at_unix_ms,
+        MintRequestResolutionMetadata::default(),
+    )?;
+    store.try_store(fact)?;
+    Ok(request)
+}
+
+/// Build, but do not persist, a terminal mint-request fact. Approval uses this
+/// to commit the authority-changing passport fact and its request decision in
+/// one [`FactStore::try_store_bulk`] journal event.
+pub fn prepare_mint_request_resolution(
+    store: &FactStore,
+    request_id: &str,
+    approver_passport: String,
+    decision: MintRequestDecision,
+    resolved_at_unix_ms: u64,
+    metadata: MintRequestResolutionMetadata,
+) -> Result<(PendingMintRequest, StoreFact), MintRequestError> {
     let mut request =
         get_mint_request(store, request_id).ok_or_else(|| MintRequestError::NotFound(request_id.to_string()))?;
     if request.status != MINT_REQUEST_STATUS_PENDING {
@@ -184,20 +240,25 @@ pub fn resolve_mint_request(
     request.status = decision.status().to_string();
     request.resolved_at_unix_ms = Some(resolved_at_unix_ms);
     request.resolved_by_passport = Some(approver_passport.clone());
+    request.resolution_receipt_id.clone_from(&metadata.receipt_id);
+    request.approved_category = metadata.approved_category;
+    request.passport_operation = metadata.passport_operation;
+    request.passport_record_hash = metadata.passport_record_hash;
+    request.passport_mutation_hash = metadata.passport_mutation_hash;
 
     let value = serde_json::to_string(&request)?;
-    store.try_store(StoreFact {
+    let fact = StoreFact {
         tenant_hash: default_tenant_hash(),
         entity: format!("{MINT_REQUEST_ENTITY_PREFIX}::{request_id}"),
         key: MINT_REQUEST_RECORD_KEY.to_string(),
         value,
-        source_receipt: None,
+        source_receipt: metadata.receipt_id,
         confidence: 1.0,
         private: true,
         horizon_class: Some(HorizonClass::None),
         actor: Some(approver_passport),
-    })?;
-    Ok(request)
+    };
+    Ok((request, fact))
 }
 
 #[cfg(test)]
@@ -258,6 +319,40 @@ mod tests {
         assert_eq!(resolved.reason, pending.reason);
         assert_eq!(resolved.resolved_by_passport.as_deref(), Some("rejecting-operator"));
         assert!(list_pending_mint_requests(&store).is_empty());
+    }
+
+    #[test]
+    fn prepared_resolution_binds_receipt_actor_and_approval_metadata() {
+        let mut store = FactStore::new();
+        let pending = pending_request(&mut store);
+        let receipt_id = format!("ad_{}", pending.request_id);
+
+        let (resolved, fact) = prepare_mint_request_resolution(
+            &store,
+            &pending.request_id,
+            "operator-passport".to_string(),
+            MintRequestDecision::Approved,
+            250,
+            MintRequestResolutionMetadata {
+                receipt_id: Some(receipt_id.clone()),
+                approved_category: Some("work".to_string()),
+                passport_operation: Some("create".to_string()),
+                passport_record_hash: Some("blake3:record".to_string()),
+                passport_mutation_hash: Some("blake3:mutation".to_string()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved.resolution_receipt_id.as_deref(), Some(receipt_id.as_str()));
+        assert_eq!(resolved.approved_category.as_deref(), Some("work"));
+        assert_eq!(resolved.passport_operation.as_deref(), Some("create"));
+        assert_eq!(resolved.passport_record_hash.as_deref(), Some("blake3:record"));
+        assert_eq!(resolved.passport_mutation_hash.as_deref(), Some("blake3:mutation"));
+        assert_eq!(fact.source_receipt.as_deref(), Some(receipt_id.as_str()));
+        assert_eq!(fact.actor.as_deref(), Some("operator-passport"));
+        assert!(fact.private);
+        assert_eq!(fact.horizon_class, Some(HorizonClass::None));
+        assert_eq!(get_mint_request(&store, &pending.request_id), Some(pending));
     }
 
     #[test]

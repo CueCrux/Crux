@@ -526,7 +526,92 @@ fn append_observation(file_path: &Path, line: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-fn sync_observation(file_path: &Path) -> std::io::Result<()> {
+/// Quarantine an unterminated observation tail before the next append. A
+/// missing JSONL delimiter means the previous append did not complete, even
+/// when the bytes happen to parse as JSON; treating it as committed could
+/// produce a receipt the prior caller observed as failed.
+fn repair_torn_observation_tail_unlocked(file_path: &Path) -> std::io::Result<()> {
+    use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+
+    let mut file = match std::fs::OpenOptions::new().read(true).write(true).open(file_path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last_byte = [0_u8; 1];
+    file.read_exact(&mut last_byte)?;
+    if last_byte[0] == b'\n' {
+        return Ok(());
+    }
+
+    let mut cursor = len;
+    let mut tail_start = 0_u64;
+    let mut block = vec![0_u8; 8 * 1024];
+    while cursor > 0 {
+        let start = cursor.saturating_sub(block.len() as u64);
+        let width = (cursor - start) as usize;
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut block[..width])?;
+        if let Some(index) = block[..width].iter().rposition(|byte| *byte == b'\n') {
+            tail_start = start + index as u64 + 1;
+            break;
+        }
+        cursor = start;
+    }
+    let tail_len = len.saturating_sub(tail_start);
+    const MAX_RECOVERY_TAIL_BYTES: u64 = 4 * 1024 * 1024;
+    if tail_len > MAX_RECOVERY_TAIL_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unterminated observation tail is {tail_len} bytes"),
+        ));
+    }
+    let mut tail = vec![0_u8; tail_len as usize];
+    file.seek(SeekFrom::Start(tail_start))?;
+    file.read_exact(&mut tail)?;
+
+    let quarantine = file_path.with_extension(format!("jsonl.torn.{}", uuid::Uuid::new_v4().simple()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut torn = options.open(&quarantine)?;
+    torn.write_all(&tail)?;
+    torn.sync_all()?;
+    file.set_len(tail_start)?;
+    file.sync_all()?;
+    if let Some(parent) = file_path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    tracing::error!(
+        observation = %file_path.display(),
+        quarantine = %quarantine.display(),
+        bytes = tail.len(),
+        "quarantined torn observation tail before append"
+    );
+    Ok(())
+}
+
+pub(super) fn repair_observation_tail(file_path: &Path) -> std::io::Result<()> {
+    let _guard = OBSERVATION_APPEND_LOCK
+        .lock()
+        .map_err(|_| std::io::Error::other("observation append lock poisoned"))?;
+    repair_torn_observation_tail_unlocked(file_path)
+}
+
+pub(super) fn sync_observation(file_path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if file_path.with_extension("sync-fail").exists() {
+        return Err(std::io::Error::other("injected post-append observation sync failure"));
+    }
     std::fs::OpenOptions::new().write(true).open(file_path)?.sync_all()?;
 
     // On Unix, fsync the directory entries as well as the file contents. The
@@ -700,6 +785,13 @@ pub(super) fn append_one(
             "observation append lock poisoned".to_string(),
         )
     })?;
+    let file_path = observation_file_path(&state.data_dir, scoped_session_id);
+    repair_torn_observation_tail_unlocked(&file_path).map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("repair torn observation tail: {err}"),
+        )
+    })?;
     append_one_unlocked(state, scoped_session_id, principal, body, chain_tip)
 }
 
@@ -782,16 +874,45 @@ pub(super) fn append_one_durable(
     body: PostObservationBody,
     chain_tip: Option<ChainTip>,
 ) -> Result<(PostObservationResponse, ChainTip), (StatusCode, String)> {
-    let _guard = OBSERVATION_APPEND_LOCK.lock().map_err(|_| {
-        (
+    append_one_durable_tracked(state, scoped_session_id, principal, body, chain_tip).map_err(|failure| failure.error)
+}
+
+/// Failure from a durable append with the ambiguity boundary made explicit.
+/// `appended=true` means the signed line was written but a later fsync failed;
+/// callers must retain any receipt-bound preparation and retry durability.
+pub(super) struct DurableAppendFailure {
+    pub appended: bool,
+    pub error: (StatusCode, String),
+}
+
+pub(super) fn append_one_durable_tracked(
+    state: &AppState,
+    scoped_session_id: &str,
+    principal: &str,
+    body: PostObservationBody,
+    chain_tip: Option<ChainTip>,
+) -> Result<(PostObservationResponse, ChainTip), DurableAppendFailure> {
+    let _guard = OBSERVATION_APPEND_LOCK.lock().map_err(|_| DurableAppendFailure {
+        appended: false,
+        error: (
             StatusCode::INTERNAL_SERVER_ERROR,
             "observation append lock poisoned".to_string(),
-        )
+        ),
     })?;
-    let appended = append_one_unlocked(state, scoped_session_id, principal, body, chain_tip)?;
     let file_path = observation_file_path(&state.data_dir, scoped_session_id);
-    sync_observation(&file_path)
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("sync observation: {err}")))?;
+    repair_torn_observation_tail_unlocked(&file_path).map_err(|err| DurableAppendFailure {
+        appended: false,
+        error: (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("repair torn observation tail: {err}"),
+        ),
+    })?;
+    let appended = append_one_unlocked(state, scoped_session_id, principal, body, chain_tip)
+        .map_err(|error| DurableAppendFailure { appended: false, error })?;
+    sync_observation(&file_path).map_err(|err| DurableAppendFailure {
+        appended: true,
+        error: (StatusCode::INTERNAL_SERVER_ERROR, format!("sync observation: {err}")),
+    })?;
     Ok(appended)
 }
 

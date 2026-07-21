@@ -127,17 +127,9 @@ struct GateResolutionResponse {
     receipt_session_id: String,
 }
 
-#[derive(Debug)]
-struct MintedGateReceipt {
-    receipt_id: String,
-    observation_id: String,
-}
-
-/// CPU-local source of truth for typed gate receipts. The fixed session is a
-/// signed, fsynced observation chain; `http::receipts` exposes its inner CROWN
-/// body/signature through the normal `/v1/receipts/{id}` API.
-pub(super) const WORK_GATE_RECEIPT_SESSION: &str = ".work_gate_receipts_v1";
-pub(super) const AUTH_OFF_APPROVER_PREFIX: &str = "operator:unverified:";
+pub(super) use super::approval_receipts::{
+    APPROVAL_RECEIPT_SESSION as WORK_GATE_RECEIPT_SESSION, UNVERIFIED_APPROVER_PREFIX as AUTH_OFF_APPROVER_PREFIX,
+};
 
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct GateListQuery {
@@ -649,115 +641,35 @@ fn mint_gate_receipt(
     target: &crate::work::GateResolutionTarget,
     approver_passport: &str,
     approve: bool,
-) -> Result<MintedGateReceipt, (StatusCode, String)> {
-    use corecrux_receipts::{
-        build_approval_decision_body_v1, sign_approval_decision_v1, ApprovalDecisionBodyInputV1, ApprovalDecisionV1,
-        ApprovalRiskTierV1, APPROVAL_DECISION_BODY_SCHEMA_V1, APPROVAL_DECISION_KIND_V1,
-    };
+) -> Result<super::approval_receipts::MintedApprovalReceipt, (StatusCode, String)> {
+    use corecrux_receipts::ApprovalDecisionV1;
 
     let receipt_id = format!("ad_{}", target.gate.action_id);
-    let decided_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let decision = if approve {
         ApprovalDecisionV1::Approve
     } else {
         ApprovalDecisionV1::Reject
     };
-    match super::receipts::local_approval_receipt(state, &target.tenant_id, &receipt_id) {
-        Ok(Some(existing))
-            if existing.request_id == target.gate.action_id
-                && existing.reviewer_passport == approver_passport
-                && existing.decision == decision.as_str() =>
-        {
-            return Ok(MintedGateReceipt {
-                receipt_id,
-                observation_id: existing.observation_id,
-            });
-        }
-        Ok(Some(_)) => {
-            return Err((
-                StatusCode::CONFLICT,
-                "a conflicting approval receipt already exists for this gate".to_string(),
-            ));
-        }
-        Ok(None) => {}
-        Err(detail) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("existing approval receipt validation failed: {detail}"),
-            ));
-        }
-    }
     let target_state = target.gate.target_state.as_deref().unwrap_or("unchanged");
     let action_summary = format!(
         "work:{}:{}:{}",
         target.work.id, target.gate.requested_action, target_state
     );
-    let (body_bytes, body_hash) = build_approval_decision_body_v1(&ApprovalDecisionBodyInputV1 {
-        tenant_id: &target.tenant_id,
-        receipt_id: &receipt_id,
-        request_id: &target.gate.action_id,
-        reviewer_passport: approver_passport,
+    let mut envelope_fields = serde_json::Map::new();
+    envelope_fields.insert("work_id".to_string(), serde_json::Value::String(target.work.id.clone()));
+    super::approval_receipts::mint_or_load_approval_receipt(
+        state,
+        &super::approval_receipts::ApprovalReceiptSpec {
+            receipt_id: &receipt_id,
+            tenant_id: &target.tenant_id,
+            request_id: &target.gate.action_id,
+            action_summary: &action_summary,
+            envelope_fields,
+        },
+        approver_passport,
         decision,
-        risk_tier: ApprovalRiskTierV1::High,
-        action_summary: &action_summary,
-        reviewer_notes: None,
-        decided_at: &decided_at,
-    });
-    if body_bytes.is_empty() {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "approval receipt body encoding failed".to_string(),
-        ));
-    }
-    let signing_key = super::stream_receipts::load_signing_key(state)
-        .map_err(|detail| (StatusCode::INTERNAL_SERVER_ERROR, detail))?;
-    let signature = sign_approval_decision_v1(
-        &receipt_id,
-        &body_bytes,
-        body_hash,
-        &signing_key,
-        &state.passport_fpr,
-        &decided_at,
-    );
-    let mut signature_bytes = Vec::new();
-    ciborium::ser::into_writer(&signature, &mut signature_bytes).map_err(|err| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("approval receipt signature encoding failed: {err}"),
-        )
-    })?;
-
-    let observation = super::observations::PostObservationBody {
-        kind: APPROVAL_DECISION_KIND_V1.to_string(),
-        provider: "corecruxd".to_string(),
-        client_ts: None,
-        payload: serde_json::json!({
-            "receipt_id": receipt_id,
-            "tenant_id": target.tenant_id,
-            "request_id": target.gate.action_id,
-            "work_id": target.work.id,
-            "decision": if approve { "approve" } else { "reject" },
-            "reviewer_passport": approver_passport,
-            "body_schema": APPROVAL_DECISION_BODY_SCHEMA_V1,
-            "body_cbor_hex": hex::encode(&body_bytes),
-            "body_hash": format!("blake3:{}", hex::encode(body_hash)),
-            "signature_cbor_hex": hex::encode(&signature_bytes),
-            "signer_key_id": state.passport_fpr,
-            "signer_public_key_hex": state.passport_public_key_hex,
-        }),
-    };
-    let (persisted, _) =
-        super::observations::append_one_durable(state, WORK_GATE_RECEIPT_SESSION, approver_passport, observation, None)
-            .map_err(|(status, detail)| {
-                (
-                    status,
-                    format!("approval receipt signing or persistence failed: {detail}"),
-                )
-            })?;
-    Ok(MintedGateReceipt {
-        receipt_id,
-        observation_id: persisted.observation_id,
-    })
+    )
+    .map_err(|failure| (failure.status, failure.detail))
 }
 
 #[derive(Debug, serde::Deserialize)]

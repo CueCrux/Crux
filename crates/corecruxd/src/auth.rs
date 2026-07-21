@@ -211,6 +211,8 @@ impl AgentTokenHttpConfig {
             passport_id: Some(format!("agent:{}", agent.name)),
             scopes: self.scopes.clone(),
             tenants: self.tenants.clone(),
+            passport_identity_verified: false,
+            credential_is_agent_token: true,
         })
     }
 }
@@ -386,6 +388,13 @@ struct AuthContext {
     passport_id: Option<String>,
     scopes: BTreeSet<String>,
     tenants: TenantAllow,
+    /// True only when the passport id came from a cryptographically verified
+    /// JWT claim. Dev-scope headers and MCP agent-token aliases are not human
+    /// approval identities.
+    passport_identity_verified: bool,
+    /// MCP agent tokens authenticate automation, not a human reviewer. High-
+    /// risk four-eyes boundaries use this provenance to deny machine approval.
+    credential_is_agent_token: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -508,6 +517,8 @@ fn verify_jwt_hs256(cfg: &JwtHs256Config, token: &str) -> Result<AuthContext, St
         passport_id,
         scopes,
         tenants,
+        passport_identity_verified: true,
+        credential_is_agent_token: false,
     })
 }
 
@@ -696,6 +707,8 @@ fn verify_jwt_jwks(cfg: &JwtJwksConfig, token: &str) -> Result<AuthContext, Stri
         passport_id,
         scopes,
         tenants,
+        passport_identity_verified: true,
+        credential_is_agent_token: false,
     })
 }
 
@@ -816,6 +829,8 @@ fn http_ctx(auth: &Authz, headers: &HeaderMap) -> Result<AuthContext, ProblemRes
             passport_id: None,
             scopes: BTreeSet::new(),
             tenants: TenantAllow::Any,
+            passport_identity_verified: false,
+            credential_is_agent_token: false,
         }),
         AuthMode::DevScopes => {
             let scopes = extract_scopes_http_dev(headers).ok_or_else(|| {
@@ -831,6 +846,8 @@ fn http_ctx(auth: &Authz, headers: &HeaderMap) -> Result<AuthContext, ProblemRes
                 passport_id: None,
                 scopes,
                 tenants: TenantAllow::Any,
+                passport_identity_verified: false,
+                credential_is_agent_token: false,
             })
         }
         AuthMode::JwtHs256 => {
@@ -904,6 +921,8 @@ pub struct HttpScopeContext {
     pub passport_id: Option<String>,
     auth_enforced: bool,
     passport_override_used: bool,
+    passport_identity_verified: bool,
+    credential_is_agent_token: bool,
     scope_bypass: bool,
     /// Tenant authority derived from the bearer token's `tenant_id`/`tenants`
     /// claim (same source the query path authorizes against). Drives the
@@ -1068,6 +1087,19 @@ impl HttpScopeContext {
         self.auth_enforced
     }
 
+    /// Whether the passport identity is backed by a verified JWT claim rather
+    /// than a development header or an automation token alias.
+    pub(crate) fn passport_identity_verified(&self) -> bool {
+        self.passport_identity_verified
+    }
+
+    /// Whether HTTP authentication fell back to a registered MCP agent token.
+    /// These credentials may call automation APIs but cannot satisfy a human
+    /// four-eyes decision.
+    pub(crate) fn credential_is_agent_token(&self) -> bool {
+        self.credential_is_agent_token
+    }
+
     /// Tenant to stamp on an HTTP write (OD-37). `Ok(None)` → default tenant.
     #[allow(clippy::result_large_err)]
     pub(crate) fn resolve_write_tenant(&self) -> Result<Option<String>, ProblemResponse> {
@@ -1115,6 +1147,8 @@ pub fn passport_bound_context(auth: &Authz, headers: &HeaderMap) -> Result<HttpS
         passport_id,
         auth_enforced: auth.mode != AuthMode::Off,
         passport_override_used,
+        passport_identity_verified: ctx.passport_identity_verified,
+        credential_is_agent_token: ctx.credential_is_agent_token,
         scope_bypass: auth.mode == AuthMode::Off,
         tenants,
         write_tenant_selector: http_tenant_selector(headers),
@@ -1169,6 +1203,8 @@ fn grpc_ctx(auth: &Authz, meta: &MetadataMap) -> Result<AuthContext, Status> {
             passport_id: None,
             scopes: BTreeSet::new(),
             tenants: TenantAllow::Any,
+            passport_identity_verified: false,
+            credential_is_agent_token: false,
         }),
         AuthMode::DevScopes => {
             let scopes = extract_scopes_grpc_dev(meta).ok_or_else(|| {
@@ -1186,6 +1222,8 @@ fn grpc_ctx(auth: &Authz, meta: &MetadataMap) -> Result<AuthContext, Status> {
                 passport_id: None,
                 scopes,
                 tenants: TenantAllow::Any,
+                passport_identity_verified: false,
+                credential_is_agent_token: false,
             })
         }
         AuthMode::JwtHs256 => {
