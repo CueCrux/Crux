@@ -11,6 +11,33 @@
 //! deterministic CBOR/JSON mirror, token hash input, structural validation, and
 //! strict Ed25519 verification helpers used by the daemon router and hosted
 //! issuer.
+//!
+//! # Macaroon-style attenuation (audit-v2 R3)
+//!
+//! A holder can derive a strictly *narrower* token offline — without the
+//! issuer's key — by appending [`Caveat`]s and binding them with its own
+//! possession key ([`RcxCapabilityToken::attenuate`]). The closed v1 caveat set
+//! only ever *removes* authority: `ExpiresAtLe` (shrink lifetime), `TenantIdEq`
+//! (narrow to one already-granted tenant), and `ScopeSubset` (a subset of the
+//! granted capabilities). Effective authority is `issuer_grant ∩ caveat₁ ∩ … ∩
+//! caveatₙ` — evaluated as intersection, never union — so a caveat can never
+//! widen a grant.
+//!
+//! Caveats are **excluded from `to_signing_cbor()`**, so the issuer signature
+//! and `token_hash()` stay caveat-independent and an un-attenuated token is
+//! byte-identical to a pre-R3 token. They are instead bound by the holder's
+//! signature over [`caveat_binding_message`], checked by
+//! [`verify_token_attenuated`] against the possession-proven holder key.
+//!
+//! **Fail-closed, not versioned.** `spec_version` stays `rcx-ct/1.0` for
+//! attenuated tokens: it is issuer-signed, and a holder attenuating offline
+//! cannot change it (nor would a bumped value survive `validate_basic`, which
+//! pins `rcx-ct/1.0`). The guarantee that an old verifier never silently accepts
+//! an attenuated token as un-attenuated comes instead from
+//! `#[serde(deny_unknown_fields)]` (a pre-R3 verifier rejects the unknown
+//! `caveats` field) and the closed [`Caveat`] enum (an unknown caveat type fails
+//! deserialization). Consumers that enforce caveats must be deployed **before**
+//! any issuer mints attenuated tokens (mint-before-verify).
 
 use crux_session::canonical::{to_canonical_json, CborValue};
 use ed25519_dalek::{Signature as Ed25519Signature, Signer as _, SigningKey, VerifyingKey};
@@ -1322,6 +1349,43 @@ mod tests {
         let issuer = SigningKey::from_bytes(&[5u8; 32]);
         let holder = SigningKey::from_bytes(&[7u8; 32]);
         let base = holder_bound_fixture(&issuer, &holder);
+        assert_eq!(
+            verify_token_attenuated(
+                &base,
+                &issuer.verifying_key().to_bytes(),
+                M2_NOW,
+                &holder.verifying_key().to_bytes()
+            ),
+            AttenuatedOutcome::Verified,
+        );
+    }
+
+    #[test]
+    fn old_spec_no_caveat_token_still_verifies_and_is_wire_invisible() {
+        // Backward-compat guarantee (macaroon M4): an un-attenuated rcx-ct/1.0
+        // token — no caveats, no caveat_signature — verifies exactly as it did
+        // before caveats existed, via both the base and attenuated paths, and
+        // carries no caveat keys on the wire. spec_version is NOT bumped for
+        // attenuation (it is issuer-signed and holders attenuate offline); the
+        // fail-closed boundary is `deny_unknown_fields`, not the version.
+        let issuer = SigningKey::from_bytes(&[5u8; 32]);
+        let holder = SigningKey::from_bytes(&[7u8; 32]);
+        let base = holder_bound_fixture(&issuer, &holder);
+
+        assert_eq!(base.spec_version, RCX_CT_SPEC_VERSION);
+        assert!(base.caveats.is_empty());
+        assert!(base.caveat_signature.is_none());
+
+        let wire = base.to_canonical_json();
+        assert!(
+            !wire.contains("caveat"),
+            "an un-attenuated token must be caveat-invisible on the wire: {wire}"
+        );
+
+        assert_eq!(
+            verify_token(&base, &issuer.verifying_key().to_bytes(), M2_NOW),
+            VerifyOutcome::Verified,
+        );
         assert_eq!(
             verify_token_attenuated(
                 &base,
