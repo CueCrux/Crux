@@ -1327,13 +1327,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             tracing::warn!("witness: CORECRUXD_REKOR_URL unset; heads remain pending");
                             continue;
                         };
-                        let Some(signing_key) = crate::witness_submit::load_witness_signing_key() else {
+                        let Some(signer) = crate::witness_submit::select_witness_signer(timeout) else {
                             tracing::warn!(
-                                "witness: no witness signing key (CORECRUXD_WITNESS_SIGNING_KEY); heads remain pending"
+                                "witness: no signer configured (Vault Transit or CORECRUXD_WITNESS_SIGNING_KEY); heads remain pending"
                             );
                             continue;
                         };
-                        let witness = crate::witness_submit::RekorWitness::new(url, signing_key, timeout);
+                        let witness = crate::witness_submit::RekorWitness::with_signer(url, signer, timeout);
                         let n_pending = pending.len();
                         tracing::debug!(provider = %provider, pending = n_pending, "witness: draining heads");
                         // Network I/O off the async runtime and without the store lock.

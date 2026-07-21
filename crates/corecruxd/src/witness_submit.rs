@@ -50,6 +50,10 @@ pub enum WitnessError {
     EmptyResponse,
     #[error("witness returned an inclusion proof that does not verify: {0}")]
     Inconsistent(String),
+    #[error("witness signing error: {0}")]
+    Sign(String),
+    #[error("witness signer configuration error: {0}")]
+    Config(String),
 }
 
 /// A transparency-log witness.
@@ -111,6 +115,178 @@ impl WitnessSigner for EnvKeySigner {
     }
 }
 
+/// Env: Vault base address (e.g. `https://vault.internal:8200`).
+pub const ENV_VAULT_ADDR: &str = "VAULT_ADDR";
+/// Env: Vault token used to authenticate the sign/keys calls.
+pub const ENV_VAULT_TOKEN: &str = "VAULT_TOKEN";
+/// Env: Transit secrets-engine mount (default `transit`).
+pub const ENV_WITNESS_VAULT_MOUNT: &str = "CORECRUXD_WITNESS_VAULT_MOUNT";
+/// Env: Transit key name to sign with. Presence of this var selects the Vault signer.
+pub const ENV_WITNESS_VAULT_KEY: &str = "CORECRUXD_WITNESS_VAULT_KEY";
+
+/// Off-host signer: the ECDSA P-256 private key lives in Vault's Transit engine
+/// and is never loaded into the daemon. Signing is a `POST /v1/{mount}/sign/{key}`
+/// with a prehashed=false input (Vault SHA-256s and signs); the daemon only ever
+/// sends the head bytes and receives a signature (audit-v2 R2).
+pub struct VaultTransitSigner {
+    agent: ureq::Agent,
+    addr: String,
+    token: String,
+    mount: String,
+    key_name: String,
+    public_key_pem: String,
+}
+
+impl VaultTransitSigner {
+    fn sign_url(&self) -> String {
+        format!("{}/v1/{}/sign/{}", self.addr, self.mount, self.key_name)
+    }
+
+    fn keys_url(addr: &str, mount: &str, key_name: &str) -> String {
+        format!("{addr}/v1/{mount}/keys/{key_name}")
+    }
+
+    fn build_agent(timeout: Duration) -> ureq::Agent {
+        ureq::Agent::config_builder()
+            .timeout_connect(Some(timeout))
+            .timeout_recv_response(Some(timeout))
+            .timeout_recv_body(Some(timeout))
+            .build()
+            .into()
+    }
+
+    /// Connect to Vault, fetch the Transit key's SPKI public-key PEM (the latest
+    /// version), and build the signer. The private key stays in Vault.
+    pub fn connect(
+        addr: impl Into<String>,
+        token: impl Into<String>,
+        mount: impl Into<String>,
+        key_name: impl Into<String>,
+        timeout: Duration,
+    ) -> Result<Self, WitnessError> {
+        let addr = addr.into().trim_end_matches('/').to_string();
+        let token = token.into();
+        let mount = mount.into();
+        let key_name = key_name.into();
+        let agent = Self::build_agent(timeout);
+
+        let mut resp = agent
+            .get(&Self::keys_url(&addr, &mount, &key_name))
+            .header("X-Vault-Token", &token)
+            .call()
+            .map_err(|e| WitnessError::Config(format!("vault keys read failed: {e}")))?;
+        let body: serde_json::Value = resp
+            .body_mut()
+            .read_json()
+            .map_err(|e| WitnessError::Config(format!("vault keys decode failed: {e}")))?;
+        let public_key_pem = Self::extract_public_key_pem(&body)?;
+
+        Ok(Self {
+            agent,
+            addr,
+            token,
+            mount,
+            key_name,
+            public_key_pem,
+        })
+    }
+
+    /// Build from env (`VAULT_ADDR`, `VAULT_TOKEN`, `CORECRUXD_WITNESS_VAULT_MOUNT`
+    /// default `transit`, `CORECRUXD_WITNESS_VAULT_KEY`). Absent addr/token/key →
+    /// `Config` error so selection can fall back to the env key.
+    pub fn from_env(timeout: Duration) -> Result<Self, WitnessError> {
+        let addr = env_nonempty(ENV_VAULT_ADDR)?;
+        let token = env_nonempty(ENV_VAULT_TOKEN)?;
+        let key_name = env_nonempty(ENV_WITNESS_VAULT_KEY)?;
+        let mount = std::env::var(ENV_WITNESS_VAULT_MOUNT)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "transit".to_string());
+        Self::connect(addr, token, mount, key_name, timeout)
+    }
+
+    /// Pull the latest version's SPKI public-key PEM out of a Transit key read.
+    fn extract_public_key_pem(body: &serde_json::Value) -> Result<String, WitnessError> {
+        let data = body
+            .get("data")
+            .ok_or_else(|| WitnessError::Config("vault keys: no data".into()))?;
+        let keys = data
+            .get("keys")
+            .and_then(|k| k.as_object())
+            .ok_or_else(|| WitnessError::Config("vault keys: no keys map".into()))?;
+        // Prefer latest_version; else the highest numeric key.
+        let version = data
+            .get("latest_version")
+            .and_then(|v| v.as_u64())
+            .map(|v| v.to_string())
+            .filter(|v| keys.contains_key(v))
+            .or_else(|| {
+                keys.keys()
+                    .filter_map(|k| k.parse::<u64>().ok())
+                    .max()
+                    .map(|v| v.to_string())
+            })
+            .ok_or_else(|| WitnessError::Config("vault keys: no key version".into()))?;
+        keys.get(&version)
+            .and_then(|v| v.get("public_key"))
+            .and_then(|v| v.as_str())
+            .filter(|s| s.contains("PUBLIC KEY"))
+            .map(str::to_string)
+            .ok_or_else(|| WitnessError::Config("vault keys: no SPKI public_key (is the key ecdsa-p256?)".into()))
+    }
+}
+
+impl WitnessSigner for VaultTransitSigner {
+    fn public_key_pem(&self) -> String {
+        self.public_key_pem.clone()
+    }
+
+    fn sign_der(&self, message: &[u8]) -> Result<Vec<u8>, WitnessError> {
+        // prehashed=false: Vault SHA-256s `input` then signs, matching the
+        // EnvKeySigner path (ECDSA over the raw message). asn1 marshaling → DER,
+        // the exact wire shape Rekor's hashedrekord expects.
+        let body = serde_json::json!({
+            "input": base64::engine::general_purpose::STANDARD.encode(message),
+            "hash_algorithm": "sha2-256",
+            "prehashed": false,
+            "marshaling_algorithm": "asn1",
+        });
+        let mut resp = self
+            .agent
+            .post(&self.sign_url())
+            .header("X-Vault-Token", &self.token)
+            .send_json(body)
+            .map_err(|e| WitnessError::Sign(format!("vault sign request failed: {e}")))?;
+        let value: serde_json::Value = resp
+            .body_mut()
+            .read_json()
+            .map_err(|e| WitnessError::Sign(format!("vault sign decode failed: {e}")))?;
+        let signature = value
+            .get("data")
+            .and_then(|d| d.get("signature"))
+            .and_then(|s| s.as_str())
+            .ok_or_else(|| WitnessError::Sign("vault sign response missing data.signature".into()))?;
+        // Format: `vault:v<N>:<base64-der>`. The base64 alphabet has no ':'.
+        let b64 = signature
+            .rsplit(':')
+            .next()
+            .ok_or_else(|| WitnessError::Sign("malformed vault signature".into()))?;
+        base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| WitnessError::Sign(format!("vault signature base64 decode failed: {e}")))
+    }
+}
+
+/// Read a required non-empty env var, mapping absence/blank to a `Config` error.
+fn env_nonempty(name: &str) -> Result<String, WitnessError> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| WitnessError::Config(format!("{name} is unset")))
+}
+
 /// Anchors seal-chain heads into a Sigstore Rekor transparency log.
 ///
 /// Each submission signs the head hash via its [`WitnessSigner`] and writes a
@@ -131,12 +307,6 @@ impl RekorWitness {
     /// `hashedrekord` verification rejects plain-Ed25519 signatures and accepts
     /// ECDSA-P256/SHA-256 (verified against live Rekor staging; see ExecPlan M4).
     ///
-    /// Thin wrapper over [`Self::with_signer`] that keeps the in-process key path
-    /// (and this exact call signature) unchanged for existing callers.
-    pub fn new(rekor_url: impl Into<String>, signing_key: P256SigningKey, timeout: Duration) -> Self {
-        Self::with_signer(rekor_url, Box::new(EnvKeySigner::new(signing_key)), timeout)
-    }
-
     /// Build a witness around any [`WitnessSigner`] (in-process key, Vault Transit, …).
     pub fn with_signer(rekor_url: impl Into<String>, signer: Box<dyn WitnessSigner>, timeout: Duration) -> Self {
         let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -243,6 +413,14 @@ pub const WITNESS_SIGNING_KEY_ENV: &str = "CORECRUXD_WITNESS_SIGNING_KEY";
 /// the daemon's Ed25519 seal key because Rekor's `hashedrekord` verification
 /// requires ECDSA P-256. Returns `None` when unset/empty/invalid (the witness
 /// task then logs and idles — heads stay pending).
+///
+/// **Custody note (audit-v2 R2):** this path holds the raw private key **in the
+/// daemon's process environment** — readable via a core dump, `docker inspect`,
+/// or host access. For off-host custody, provision the key in Vault Transit and
+/// set `CORECRUXD_WITNESS_VAULT_KEY` (+ `VAULT_ADDR`/`VAULT_TOKEN`) — see
+/// [`VaultTransitSigner`] / [`select_witness_signer`]. Migration: import the key
+/// into Transit **or** issue a fresh witness key there and re-anchor from the new
+/// identity; the env-key path stays the default so nothing breaks unattended.
 pub fn load_witness_signing_key() -> Option<P256SigningKey> {
     let encoded = std::env::var(WITNESS_SIGNING_KEY_ENV).ok()?;
     let encoded = encoded.trim();
@@ -254,6 +432,37 @@ pub fn load_witness_signing_key() -> Option<P256SigningKey> {
         .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(encoded))
         .ok()?;
     P256SigningKey::from_slice(&decoded).ok()
+}
+
+/// Select the witness signer by config precedence (witness-custody M3):
+///
+/// 1. **Vault Transit** when `CORECRUXD_WITNESS_VAULT_KEY` is set (with
+///    `VAULT_ADDR`/`VAULT_TOKEN`) — the private key never enters the process. A
+///    misconfigured or unreachable Vault **logs and falls through** to the env
+///    key rather than silently dropping the witness.
+/// 2. else the **in-process env key** (`CORECRUXD_WITNESS_SIGNING_KEY`) — the
+///    pre-R2 default, unchanged.
+/// 3. else `None` — no key, heads stay pending (unchanged).
+pub fn select_witness_signer(timeout: Duration) -> Option<Box<dyn WitnessSigner>> {
+    if std::env::var(ENV_WITNESS_VAULT_KEY)
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty())
+    {
+        match VaultTransitSigner::from_env(timeout) {
+            Ok(signer) => {
+                tracing::info!("witness: signing via Vault Transit (private key stays off-host)");
+                return Some(Box::new(signer));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "witness: Vault Transit signer unavailable; falling back to env key");
+            }
+        }
+    }
+    if let Some(key) = load_witness_signing_key() {
+        tracing::info!("witness: signing via in-process env key (CORECRUXD_WITNESS_SIGNING_KEY)");
+        return Some(Box::new(EnvKeySigner::new(key)));
+    }
+    None
 }
 
 // ---- Rekor wire types ------------------------------------------------------
@@ -362,6 +571,10 @@ mod tests {
         P256SigningKey::from_slice(&[0x42; 32]).expect("valid p256 scalar")
     }
 
+    fn rekor_with_key(url: impl Into<String>, key: P256SigningKey, timeout: Duration) -> RekorWitness {
+        RekorWitness::with_signer(url, Box::new(EnvKeySigner::new(key)), timeout)
+    }
+
     #[test]
     fn env_key_signer_matches_direct_key_path() {
         // M1 gate: the seam is a pure refactor — EnvKeySigner must produce exactly
@@ -389,6 +602,97 @@ mod tests {
         use p256::ecdsa::signature::Verifier as _;
         let sig = P256Signature::from_der(&signer.sign_der(&head).unwrap()).expect("der");
         key.verifying_key().verify(&head, &sig).expect("must verify");
+    }
+
+    fn vault_signer_at(url: String, key: &P256SigningKey) -> VaultTransitSigner {
+        VaultTransitSigner {
+            agent: VaultTransitSigner::build_agent(Duration::from_secs(2)),
+            addr: url,
+            token: "test-token".into(),
+            mount: "transit".into(),
+            key_name: "witness".into(),
+            public_key_pem: key
+                .verifying_key()
+                .to_public_key_pem(p256::pkcs8::LineEnding::LF)
+                .unwrap(),
+        }
+    }
+
+    #[test]
+    fn vault_transit_signer_returns_verifiable_der_and_never_sends_the_key() {
+        // M2 gate: the signer sends only the message input, gets back a signature
+        // that verifies under the Transit public key, and NEVER transmits the key.
+        use p256::ecdsa::signature::Verifier as _;
+        let key = test_key();
+        let message = [0x9u8; 32];
+        let signature: P256Signature = key.sign(&message);
+        let der = signature.to_der().as_bytes().to_vec();
+        let vault_sig = format!("vault:v1:{}", base64::engine::general_purpose::STANDARD.encode(&der));
+        let body = serde_json::json!({ "data": { "signature": vault_sig } }).to_string();
+        let (url, rx, handle) = start_mock("200 OK", body);
+
+        let signer = vault_signer_at(url, &key);
+        let got = signer.sign_der(&message).expect("sign");
+        assert_eq!(got, der, "returned DER must be the Vault signature");
+        let sig = P256Signature::from_der(&got).expect("der");
+        key.verifying_key()
+            .verify(&message, &sig)
+            .expect("must verify under the transit pubkey");
+
+        let request = String::from_utf8_lossy(&rx.recv_timeout(Duration::from_secs(2)).expect("request")).to_string();
+        handle.join().ok();
+        assert!(
+            request.contains(&base64::engine::general_purpose::STANDARD.encode(message)),
+            "request must carry the base64 message input"
+        );
+        assert!(
+            !request.contains(&hex::encode(key.to_bytes())),
+            "the private key scalar must NEVER appear in the request"
+        );
+    }
+
+    #[test]
+    fn vault_transit_signer_error_degrades_not_panics() {
+        let key = test_key();
+        let (url, _rx, handle) = start_mock("500 Internal Server Error", "{\"errors\":[\"boom\"]}".into());
+        let err = vault_signer_at(url, &key).sign_der(&[0x1u8; 32]).unwrap_err();
+        assert!(
+            matches!(err, WitnessError::Sign(_)),
+            "vault failure must map to Sign, not panic"
+        );
+        handle.join().ok();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn select_witness_signer_precedence() {
+        // M3: no config -> None (heads pending, unchanged).
+        std::env::remove_var(ENV_WITNESS_VAULT_KEY);
+        std::env::remove_var(WITNESS_SIGNING_KEY_ENV);
+        assert!(select_witness_signer(Duration::from_secs(1)).is_none());
+
+        // env key present, no Vault -> Some (in-process EnvKeySigner).
+        std::env::set_var(
+            WITNESS_SIGNING_KEY_ENV,
+            base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]),
+        );
+        assert!(select_witness_signer(Duration::from_secs(1)).is_some());
+        std::env::remove_var(WITNESS_SIGNING_KEY_ENV);
+    }
+
+    #[test]
+    fn extract_public_key_pem_reads_latest_version() {
+        let pem = "-----BEGIN PUBLIC KEY-----\nMFkw...\n-----END PUBLIC KEY-----\n";
+        let body = serde_json::json!({
+            "data": { "latest_version": 2, "keys": { "1": { "public_key": "stale" }, "2": { "public_key": pem } } }
+        });
+        assert_eq!(VaultTransitSigner::extract_public_key_pem(&body).unwrap(), pem);
+        // A non-ecdsa key read (no SPKI) must be a Config error, not a silent empty.
+        let bad = serde_json::json!({ "data": { "latest_version": 1, "keys": { "1": { "name": "aes256" } } } });
+        assert!(matches!(
+            VaultTransitSigner::extract_public_key_pem(&bad),
+            Err(WitnessError::Config(_))
+        ));
     }
 
     /// RFC6962 leaf hash for an entry body — mirrors `into_proof`.
@@ -500,7 +804,7 @@ mod tests {
 
     #[test]
     fn build_request_has_hashedrekord_shape() {
-        let witness = RekorWitness::new("https://rekor.example", test_key(), Duration::from_secs(5));
+        let witness = rekor_with_key("https://rekor.example", test_key(), Duration::from_secs(5));
         let head = [0x11u8; 32];
         let req = witness.build_request(&head).expect("build_request");
         assert_eq!(req.kind, "hashedrekord");
@@ -538,7 +842,7 @@ mod tests {
         let response = rekor_response(&body_b64, 0, 1, &root_hex, vec![]);
 
         let (url, rx, handle) = start_mock("201 Created", response);
-        let witness = RekorWitness::new(url, test_key(), Duration::from_secs(5));
+        let witness = rekor_with_key(url, test_key(), Duration::from_secs(5));
         let proof = witness.submit(&head).expect("submit ok");
         handle.join().expect("join");
 
@@ -575,7 +879,7 @@ mod tests {
         let response = rekor_response(&body_b64, 0, 2, &hex::encode(root), vec![hex::encode(leaf1)]);
 
         let (url, rx, handle) = start_mock("201 Created", response);
-        let witness = RekorWitness::new(url, test_key(), Duration::from_secs(5));
+        let witness = rekor_with_key(url, test_key(), Duration::from_secs(5));
         let proof = witness.submit(&head).expect("submit ok");
         handle.join().expect("join");
         let _ = rx.recv();
@@ -605,7 +909,7 @@ mod tests {
         let response = rekor_response(&body_b64, 0, 1, &bogus_root, vec![]);
 
         let (url, _rx, handle) = start_mock("201 Created", response);
-        let witness = RekorWitness::new(url, test_key(), Duration::from_secs(5));
+        let witness = rekor_with_key(url, test_key(), Duration::from_secs(5));
         let err = witness.submit(&[0x44u8; 32]).expect_err("must reject");
         handle.join().expect("join");
         assert!(matches!(err, WitnessError::Inconsistent(_)), "got {err:?}");
@@ -614,7 +918,7 @@ mod tests {
     #[test]
     fn submit_surfaces_http_errors() {
         let (url, _rx, handle) = start_mock("500 Internal Server Error", "boom".to_string());
-        let witness = RekorWitness::new(url, test_key(), Duration::from_secs(5));
+        let witness = rekor_with_key(url, test_key(), Duration::from_secs(5));
         let err = witness.submit(&[0x55u8; 32]).expect_err("must error");
         handle.join().expect("join");
         assert!(matches!(err, WitnessError::Http(_)), "got {err:?}");
@@ -625,7 +929,7 @@ mod tests {
     fn live_submit_to_rekor_staging_p256() {
         // Real end-to-end: the reworked P-256 adapter submits to Sigstore Rekor
         // staging and the returned inclusion proof self-verifies (RFC6962).
-        let witness = RekorWitness::new(
+        let witness = rekor_with_key(
             "https://rekor.sigstage.dev",
             P256SigningKey::from_slice(&[0x3c; 32]).expect("scalar"),
             Duration::from_secs(30),
