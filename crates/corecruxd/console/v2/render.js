@@ -1633,33 +1633,210 @@
     return work;
   }
 
-  // Needs-you: pending gates from GET /v1/work/gate/pending. Operator posture
-  // gets approve / return-with-note (+ foresight); customer gets a read-only
-  // queue.
+  // ---- Attention-zone classifier (M3b) — PURE (smoke truth-table) ---------
+  // Sort ONE normalised work/session item into exactly one attention zone, with
+  // an explicit precedence and an explicit staleness rule. No DOM, no fetch — the
+  // wiring below normalises the live feeds into items and calls this per item.
+  //
+  // Item signals (all optional; absent ⇒ that signal is not present):
+  //   gatePending      a gated transition referencing this item awaits approval
+  //                    (the wiring JOINS the gate feed to work items by work_id,
+  //                    so each item is classified exactly once — no double-count)
+  //   state            work state — the real WorkItem enum: 'planned' |
+  //                    'in_progress' | 'blocked' | 'complete' | 'deployed' |
+  //                    'archive' | 'pending_approval' | 'drafting'
+  //                    (crates/corecruxd/src/work.rs WORK_STATES)
+  //   blockerReason    stated reason a plan is blocked (context only)
+  //   waitingForInput  a session is waiting for operator input. NOTE: coord has
+  //                    no structured field for this today, so the wiring passes
+  //                    an INFERRED value (see sessionWaitingForInput); this signal
+  //                    is exact only when a real structured field feeds it.
+  //   liveSession      this item is a live coord session (carries a heartbeat)
+  //   lastSeenUnixMs   coord liveness heartbeat. It is PASSPORT-level, not
+  //                    session-level (coord.rs:292) — sibling sessions of one
+  //                    passport share it — so "fresh" means "this identity is
+  //                    around", not per-session activity. We don't claim more.
+  //   reviewPending    finished, awaiting review
+  //
+  // Precedence (high → low): needs_you > running > done_review. Anything in none
+  // of the three (a planned/idle plan, a stale-heartbeat session) returns null.
+  // Staleness rule: a live session is "running" only while its heartbeat age is
+  // in [0, ATTENTION_LIVENESS_STALE_MS] — a non-finite or FUTURE timestamp (clock
+  // skew → negative age) is NOT running, and an older heartbeat is idle (so a
+  // walked-away session never masquerades as active work). Kept well under the
+  // coord presence TTL (900s) so the inbox reflects live work, not mere presence.
+  var ATTENTION_LIVENESS_STALE_MS = 5 * 60 * 1000;   // 5 minutes
+  function deriveAttentionZone(item, now) {
+    if (!item || typeof item !== 'object') { return null; }
+    // needs_you — a human must act: an approval is pending, a plan is blocked,
+    // or a session is waiting for input.
+    if (item.gatePending) { return 'needs_you'; }
+    if (item.state === 'blocked') { return 'needs_you'; }
+    if (item.waitingForInput) { return 'needs_you'; }
+    // running — work actively in flight: an in_progress plan, or a live session
+    // whose heartbeat is fresh (the staleness rule: finite + non-negative age).
+    var nowMs = Number(now);
+    var last = Number(item.lastSeenUnixMs);
+    var age = nowMs - last;
+    var fresh = item.lastSeenUnixMs != null && isFinite(nowMs) && isFinite(last) &&
+      age >= 0 && age <= ATTENTION_LIVENESS_STALE_MS;
+    if (item.state === 'in_progress') { return 'running'; }
+    if (item.liveSession && fresh) { return 'running'; }
+    // done_review — finished, awaiting review. No 'reviewed' flag exists on a
+    // WorkItem, so a 'complete' plan is, by default, awaiting review.
+    if (item.reviewPending || item.state === 'complete') { return 'done_review'; }
+    return null;
+  }
+
+  // ponytail: heuristic — coord carries no structured waiting-for-input field, so
+  // the only signal is the session's OWN announced intent note, and NL intent is
+  // unreliable ("awaiting CI; no input needed" can match). So this stays a soft
+  // INFERRED signal (the card labels it "may need input · inferred"), never a
+  // definite claim. Upgrade path: a coord `waiting_for_input` intent flag → exact.
+  // Requires BOTH a waiting verb and a person/decision object to cut the loudest
+  // false positives, but the honesty lever is the card label, not the regex.
+  var WAIT_VERB_RE = /\b(await\w*|waiting|needs?|need)\b/i;
+  var WAIT_OBJECT_RE = /\b(input|operator|human|reviewer?|approval|sign-?off|decision|go-?ahead|your\s+\w+|you)\b/i;
+  function sessionWaitingForInput(note) {
+    return typeof note === 'string' && WAIT_VERB_RE.test(note) && WAIT_OBJECT_RE.test(note);
+  }
+
+  // Read-only needs_you cards for the two non-gate signals (blocked plan / waiting
+  // session). They carry NO mutation — a blocked plan is unblocked by editing the
+  // plan or resolving its gate, not from the inbox — so they never touch the gated
+  // choke point. data-zone lets the smoke assert grouping.
+  function blockedPlanCard(w) {
+    var card = el('div', { 'class': 'ow-gate ow-attn-blocked', 'data-zone': 'needs_you', 'data-attn-kind': 'blocked', 'data-work-id': w.id || '' });
+    card.appendChild(el('div', { 'class': 'ow-gate-top' }, [
+      el('span', { 'class': 'ow-badge risk', text: 'BLOCKED' }),
+      el('span', { 'class': 'ow-slug', text: w.id || '' })
+    ]));
+    card.appendChild(el('h3', { text: w.title || w.id || 'blocked plan' }));
+    if (w.blocker_reason) { card.appendChild(el('p', { 'class': 'ow-await', text: w.blocker_reason })); }
+    card.appendChild(el('a', { 'class': 'btn-quiet', href: '#/canvas/tree?focus=work:' + (w.id || ''), title: 'Open in the plan tree' }, ['View plan']));
+    return card;
+  }
+  // The waiting signal is INFERRED from the intent note (coord has no structured
+  // field), so the card says "may need input" + an "inferred from intent" chip —
+  // never a definite "waiting for input" claim the daemon cannot back.
+  function waitingSessionCard(s) {
+    var i = s.intent || {};
+    var pid = s.passport_id || '?';
+    var card = el('div', { 'class': 'ow-gate ow-attn-waiting', 'data-zone': 'needs_you', 'data-attn-kind': 'session', 'data-inferred': 'intent-note' });
+    card.appendChild(el('div', { 'class': 'ow-gate-top' }, [
+      el('span', { 'class': 'ow-badge', text: 'MAY NEED INPUT' }),
+      el('span', { 'class': 'ow-slug', text: (s.session_id_hex ? String(s.session_id_hex).slice(0, 8) : pid) })
+    ]));
+    card.appendChild(el('div', { 'class': 'ow-attr' }, [
+      el('span', { 'class': 'ow-avatar', text: initials(pid) }),
+      el('span', { text: pid + (i.execplan_slug ? ' · ' + i.execplan_slug + (i.milestone ? ' @ ' + i.milestone : '') : '') })
+    ]));
+    if (i.note) { card.appendChild(el('p', { 'class': 'ow-await', text: i.note })); }
+    card.appendChild(el('span', { 'class': 'ow-chip ow-inferred', title: 'inferred from the session’s announced intent note — coord has no structured waiting-for-input signal', text: 'inferred from intent' }));
+    card.appendChild(el('a', { 'class': 'btn-quiet cx-graphlink', href: '#/canvas/graph?focus=session:' + (s.session_id_hex || pid), title: 'Open in the Canvas relation graph' }, ['View graph']));
+    return card;
+  }
+
+  // Needs-you: the attention INBOX (M3b) — the needs_you zone from
+  // deriveAttentionZone over three live feeds, each read THROUGH the generated
+  // client (M4a pattern):
+  //   · pending gates   ← /v1/work/gate/pending  (literal → fetchJSON)
+  //   · blocked plans   ← /v1/work?source=all    (parameterised → CruxApi.work)
+  //   · waiting/live sessions ← /v1/coord/active (literal → fetchJSON)
+  // Fail-honest PER FEED (M4a appendFeedNotices): a failed feed shows a degraded
+  // notice and never silently empties the zone, and "All clear" renders only when
+  // EVERY feed is healthy. Operators get approve / return on gate cards (through
+  // the gated choke point); the other cards are read-only. Demo fills ONLY a
+  // genuinely-empty healthy panel (every feed ok but nothing pending) — never a
+  // failure, so it can never erase the per-feed degraded notices.
   function fillNeedsYou(wrap) {
     var body = wrap.__body;
-    return fetchJSON('/v1/work/gate/pending').then(function (res) {
+    var api = (typeof window !== 'undefined') ? window.CruxApi : null;
+    return Promise.all([
+      fetchJSON('/v1/work/gate/pending'),
+      fetchVia(api && typeof api.work === 'function' ? function () { return api.work({ source: 'all' }); } : null),
+      fetchJSON('/v1/coord/active')
+    ]).then(function (r) {
+      var gateRes = r[0], workRes = r[1], coordRes = r[2];
       body.textContent = '';
-      if (!res.ok || !res.data) {
-        if (demoNeedsYou(wrap)) { return; }   // demo fills only a degraded panel
-        setCt(wrap, 'gate queue unavailable');
-        body.appendChild(kv(res.status === 0 ? 'unreachable' : ('HTTP ' + res.status), 'GET /v1/work/gate/pending'));
-        return;
-      }
-      var pending = (res.data.pending || []).filter(function (p) { return (p.status || 'pending') === 'pending'; });
-      if (!pending.length && demoNeedsYou(wrap)) { return; }   // demo fills only an empty panel
-      setCt(wrap, pending.length + ' pending · /v1/work/gate/pending' + (isOperator() ? '' : ' · awaiting operator'));
-      if (!pending.length) {
+      // Fail honest per feed (coord 404 = "off, not error"; the coord clock also
+      // anchors session-liveness so a wall-clock skew never mislabels freshness).
+      appendFeedNotices(body, [
+        ['gates', gateRes, 'pending gated transitions'],
+        ['work', workRes, 'blocked plans'],
+        ['coord', coordRes, 'waiting / live sessions']
+      ]);
+      // Session liveness is PASSPORT-level (coord.rs:292): sibling sessions of one
+      // passport share a heartbeat, so "fresh" reads as "identity is around".
+      var now = (coordRes.ok && coordRes.data && coordRes.data.now_unix_ms) || Date.now();
+      var pending = ((gateRes.ok && gateRes.data && gateRes.data.pending) || []).filter(function (p) { return (p.status || 'pending') === 'pending'; });
+      var workItems = (workRes.ok && workRes.data && (workRes.data.work || workRes.data.items)) || [];
+      var sessions = (coordRes.ok && coordRes.data && coordRes.data.active_sessions) || [];
+      // JOIN the gate feed to work items by work_id so a gated in_progress/blocked
+      // item is classified EXACTLY ONCE (gatePending → needs_you, never also
+      // running/done_review). Without the join the item double-counts.
+      var gateByWork = Object.create(null);
+      pending.forEach(function (p) { if (p && p.work_id != null) { gateByWork[p.work_id] = p; } });
+      var needs = [], running = 0, review = 0;
+      var usedGate = Object.create(null);   // action_ids consumed by a joined work item
+      workItems.forEach(function (w) {
+        if (!w || w.id == null || w.superseded_by) { return; }   // a superseded plan is not live attention
+        var gate = gateByWork[w.id] || null;
+        var z = deriveAttentionZone({ gatePending: !!gate, state: w.state, blockerReason: w.blocker_reason }, now);
+        if (z === 'needs_you') {
+          // Gate wins the render (it is the actionable card); else it is blocked.
+          if (gate) { needs.push({ kind: 'gate', v: gate }); if (gate.action_id) { usedGate[gate.action_id] = 1; } }
+          else { needs.push({ kind: 'blocked', v: w }); }
+        } else if (z === 'running') { running++; }
+        else if (z === 'done_review') { review++; }
+      });
+      // Pending gates whose work_id is not in the work feed still need showing —
+      // render each once (skip the ones already joined above; no drop, no dupe).
+      pending.forEach(function (p) {
+        if (p && p.action_id && usedGate[p.action_id]) { return; }
+        needs.push({ kind: 'gate', v: p });
+      });
+      // Sessions are a separate axis from work items, so no double-count risk.
+      sessions.forEach(function (s) {
+        var z = deriveAttentionZone({ liveSession: true, lastSeenUnixMs: s.last_seen_at_unix_ms, waitingForInput: sessionWaitingForInput((s.intent || {}).note) }, now);
+        if (z === 'needs_you') { needs.push({ kind: 'session', v: s }); }
+        else if (z === 'running') { running++; }
+      });
+      var anyFail = !gateRes.ok || !workRes.ok || !coordRes.ok;
+      var nothing = !needs.length && !running && !review;
+      // Demo fills ONLY a genuinely-empty HEALTHY panel — never when a feed
+      // failed (that must keep its per-feed degraded notice; demoNeedsYou clears
+      // the body, so gating it on !anyFail preserves the notices).
+      if (nothing && !anyFail && demoNeedsYou(wrap)) { return; }
+      setCt(wrap, needs.length + ' need you · ' + running + ' running · ' + review + ' awaiting review' + (isOperator() ? '' : ' · awaiting operator'));
+      // Grouping readout (the running / done_review zones are counts; the
+      // needs_you zone is rendered as actionable cards below).
+      body.appendChild(el('div', {
+        'class': 'ow-zone-summary', role: 'status',
+        'data-needs-you': String(needs.length), 'data-running': String(running), 'data-done-review': String(review),
+        text: needs.length + ' need you · ' + running + ' running · ' + review + ' awaiting review'
+      }));
+      if (!needs.length) {
+        // Never "All clear" when a feed failed — the per-feed notices above say
+        // what is degraded, and the inbox may be incomplete (fail honest).
+        if (anyFail) {
+          body.appendChild(el('p', { 'class': 'ow-await', text: 'Some feeds are degraded (see above) — the attention inbox may be incomplete.' }));
+          return;
+        }
         var ok = el('div', { 'class': 'ow-allclear' });
         ok.innerHTML = SVG_CHECK;
         ok.appendChild(el('div', {}, [
-          el('b', { text: 'All clear — agents unblocked' }),
-          el('span', { text: 'no gated transitions are waiting' })
+          el('b', { text: 'All clear — nothing needs you' }),
+          el('span', { text: running + ' running · ' + review + ' awaiting review' })
         ]));
         body.appendChild(ok);
         return;
       }
-      pending.forEach(function (p) { body.appendChild(gateCard(p)); });
+      needs.forEach(function (n) {
+        if (n.kind === 'gate') { body.appendChild(gateCard(n.v)); }
+        else if (n.kind === 'blocked') { body.appendChild(blockedPlanCard(n.v)); }
+        else { body.appendChild(waitingSessionCard(n.v)); }
+      });
     });
   }
 
@@ -1725,19 +1902,21 @@
     return wrap;
   }
 
-  // Optimistic resolve. The backend returns the updated WorkItem (not a
-  // receipt), so surface only REAL fields; a receipt id renders here only if
-  // the response carries one, else "recorded" — never a fabricated hash.
+  // Optimistic resolve. The M3a-hardened approve/reject returns the updated
+  // WorkItem flattened WITH a resolvable `receipt_id` (the bound-actor CROWN
+  // receipt) — surface that reference. Only a real value renders; a response
+  // lacking one shows "recorded", never a fabricated hash.
   function markResolved(wrap, kind, data, who) {
     wrap.classList.add('is-resolved');   // stripe flips --warn → --ok
     var op = wrap.querySelector('.ow-gate-op');
     if (op) { op.textContent = ''; } else { op = el('div', { 'class': 'ow-gate-op' }); wrap.appendChild(op); }
     var receipt = data && (data.receipt_id || (data.receipt && data.receipt.receipt_id) || data.receipt);
+    var haveReceipt = receipt && typeof receipt === 'string';
     var line = el('div', { 'class': 'ow-done' + (kind === 'returned' ? ' returned' : '') });
     line.innerHTML = (kind === 'returned' ? SVG_RETURN : SVG_CHECK);
     line.appendChild(el('span', { text: (kind === 'approved' ? 'Approved' : 'Returned') + ' by ' + who + (data && data.state ? ' · ' + data.state : '') }));
-    // A receipt id only if the backend returned one; otherwise "recorded" — never a fabricated hash.
-    line.appendChild(el('span', { 'class': 'ow-hash', text: (receipt && typeof receipt === 'string') ? receipt : 'recorded' }));
+    // The resolvable receipt reference (M3a) — resolvable via /v1/receipts/{id}.
+    line.appendChild(el('span', { 'class': 'ow-hash', title: haveReceipt ? 'CROWN receipt · resolvable at /v1/receipts/' + receipt : 'receipt not returned', text: haveReceipt ? 'receipt ' + receipt : 'recorded' }));
     op.appendChild(line);
   }
 
@@ -5562,6 +5741,11 @@
     capabilityStateForControl: capabilityStateForControl,
     applyCapabilityGate: applyCapabilityGate,
     renderOverwatchLanding: renderOverwatchLanding,
+    // M3b — pure attention-zone classifier + its staleness threshold (smoke
+    // truth-table); the needs_you zone is wired into the Overwatch inbox.
+    deriveAttentionZone: deriveAttentionZone,
+    ATTENTION_LIVENESS_STALE_MS: ATTENTION_LIVENESS_STALE_MS,
+    fillNeedsYou: fillNeedsYou,
     boundPassport: boundPassport,
     approveGate: approveGate,
     rejectGate: rejectGate,
