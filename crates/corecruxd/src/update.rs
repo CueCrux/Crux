@@ -232,9 +232,12 @@ async fn refresh_status_with_binary_sha(config: &Config, binary_sha: Option<Stri
                     behind,
                     Some(short_sha),
                 ),
-                Err(err) => {
+                Err(_) => {
+                    // Keep the sha and git error (which can embed paths) out of
+                    // the hint — /v1/version serves it unauthenticated. The
+                    // structured admin-only `binary_commit` carries the sha.
                     binary_note = Some(format!(
-                        "binary commit {short_sha} vs {tracking_ref} comparison failed ({err}); reporting source-checkout drift instead."
+                        "binary-commit comparison against {tracking_ref} failed; reporting source-checkout drift instead."
                     ));
                     (
                         "checkout".to_string(),
@@ -246,9 +249,11 @@ async fn refresh_status_with_binary_sha(config: &Config, binary_sha: Option<Stri
                 }
             },
             Err(_) => {
-                binary_note = Some(format!(
-                    "binary commit {sha} does not resolve in the source checkout; reporting source-checkout drift instead."
-                ));
+                // No sha in the text (public hint); `binary_commit` carries it.
+                binary_note = Some(
+                    "the running binary's commit does not resolve in the source checkout; reporting source-checkout drift instead."
+                        .to_string(),
+                );
                 (
                     "checkout".to_string(),
                     checkout_commit.clone(),
@@ -276,14 +281,10 @@ async fn refresh_status_with_binary_sha(config: &Config, binary_sha: Option<Stri
     // On binary basis, if the source checkout is at a different distance than
     // the binary, tell the operator to refresh the src clone on deploy (the
     // prod scenario: binary 90 behind, src clone 663 behind).
-    let checkout_note =
-        (basis == "binary" && (checkout_behind_by != behind_by || checkout_ahead_by != ahead_by)).then(|| {
-            format!(
-                "note: the source checkout at {} is {} behind — refresh it on deploy.",
-                repo_dir_display.as_deref().unwrap_or("(unknown)"),
-                checkout_behind_by
-            )
-        });
+    // No repo path in the text — /v1/version serves the hint unauthenticated
+    // and the path stays admin-only (`repo_dir` on /v1/admin/version).
+    let checkout_note = (basis == "binary" && (checkout_behind_by != behind_by || checkout_ahead_by != ahead_by))
+        .then(|| format!("note: the source checkout is {checkout_behind_by} behind — refresh it on deploy."));
 
     // Both notes are operator-facing → append to the hint. The error channel is
     // reserved for the fetch-staleness warning (drives `comparison_stale`).
@@ -916,6 +917,9 @@ mod tests {
         // Binary basis + materially staler checkout → hint nudges a src refresh.
         assert!(status.upgrade_hint.contains("running binary"));
         assert!(status.upgrade_hint.contains("source checkout"));
+        // The hint is served unauthenticated via /v1/version — it must not leak
+        // the repo path (which stays admin-only in `repo_dir`).
+        assert!(!status.upgrade_hint.contains(fixture.local.to_str().unwrap()));
         // Binary note is operator-facing (hint), not an error/staleness signal.
         assert!(status.error.is_none());
         assert!(!status.comparison_stale);
@@ -954,6 +958,8 @@ mod tests {
         assert_eq!(status.binary_commit.as_deref(), Some(bogus.as_str()));
         // The fallback reason lands in the hint, not the error/staleness channel.
         assert!(status.upgrade_hint.contains("does not resolve"));
+        // The unauthenticated /v1/version hint must not leak the binary sha.
+        assert!(!status.upgrade_hint.contains(&bogus));
         assert!(status.error.is_none());
         assert!(!status.comparison_stale);
         // Synced checkout → Current under the checkout basis.
