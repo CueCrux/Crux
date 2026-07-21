@@ -68,6 +68,7 @@
 use base64::Engine as _;
 use ciborium::value::Value as CborValue;
 use ed25519_dalek::{Signer as _, SigningKey, VerifyingKey};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Schema string written into the canonical body.
@@ -733,6 +734,22 @@ pub struct C2paVerificationReportV1 {
     pub ok: bool,
 }
 
+/// Stable identity metadata for the leaf certificate embedded in an ES256
+/// C2PA envelope. This is inspection data only: a caller must still verify the
+/// envelope signature and apply its own trust policy to the fingerprint.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct C2paLeafCertificateV1 {
+    pub sha256_hex: String,
+    pub not_before_unix: u64,
+    pub not_after_unix: u64,
+}
+
+impl C2paLeafCertificateV1 {
+    pub fn valid_at(&self, unix_seconds: u64) -> bool {
+        unix_seconds >= self.not_before_unix && unix_seconds <= self.not_after_unix
+    }
+}
+
 /// Verify a parsed manifest:
 /// 1. Recompute the canonical body BLAKE3 and compare against the
 ///    `signed_payload_hash_b64` field (corrupt-envelope detection).
@@ -912,21 +929,46 @@ impl C2paSigner for ByokP256Signer {
     }
 }
 
+/// Inspect the presented ES256 leaf without assigning trust. The SHA-256
+/// fingerprint is over the exact DER certificate bytes embedded in `x5chain`.
+pub fn inspect_c2pa_leaf_certificate_v1(
+    parsed: &C2paSignedManifestV1,
+) -> Result<C2paLeafCertificateV1, C2paManifestError> {
+    use sha2::{Digest as _, Sha256};
+    use x509_cert::der::Decode as _;
+
+    if parsed.signature_alg != "es256" {
+        return Err(C2paManifestError::Decode(format!(
+            "expected an es256 envelope, got alg {:?}",
+            parsed.signature_alg
+        )));
+    }
+    let chain_pem = parsed
+        .x5chain_pem
+        .as_deref()
+        .ok_or_else(|| C2paManifestError::Decode("es256 envelope is missing the x5chain".into()))?;
+    let chain = split_pem_certs(chain_pem);
+    let leaf_pem = chain
+        .first()
+        .ok_or_else(|| C2paManifestError::Decode("x5chain contains no certificates".into()))?;
+    let leaf_der = pem_cert_to_der(leaf_pem)?;
+    let leaf = x509_cert::Certificate::from_der(&leaf_der)
+        .map_err(|e| C2paManifestError::Decode(format!("leaf cert DER parse: {e}")))?;
+    let validity = leaf.tbs_certificate().validity();
+
+    Ok(C2paLeafCertificateV1 {
+        sha256_hex: bytes_to_hex(&Sha256::digest(&leaf_der)),
+        not_before_unix: validity.not_before.to_unix_duration().as_secs(),
+        not_after_unix: validity.not_after.to_unix_duration().as_secs(),
+    })
+}
+
 /// Verify a **true ES256** (ECDSA-P256-SHA256) signed manifest statelessly:
 /// the leaf verifying key is taken from the envelope's own `x5chain`, so this
 /// needs no external key. Rejects any non-`es256` envelope up front (no
-/// algorithm confusion), then checks:
-/// 1. the transmitted BLAKE3 payload hash matches a recomputation
-///    (`canonical_hash_match` — envelope integrity), and
-/// 2. the ECDSA-SHA256 signature over the canonical body verifies against the
-///    leaf key (`signature_valid`).
-///
-/// These are reported as INDEPENDENT fields — neither implies trust.
-///
-/// This only establishes internal consistency against the PRESENTED leaf.
-/// Chain-to-root / trust-list / identity validation is out of scope; the
-/// caller must treat the leaf as untrusted until it applies its own trust
-/// policy (see `corecruxctl c2pa-verify` for the chain walk).
+/// algorithm confusion), then independently checks the transmitted BLAKE3
+/// payload hash, the ECDSA-SHA256 signature, and the optional asset binding.
+/// This establishes consistency only; callers apply their own trust policy.
 pub fn verify_c2pa_signed_manifest_es256_v1(
     parsed: &C2paSignedManifestV1,
     content_bytes: &[u8],
@@ -1221,6 +1263,14 @@ mod tests {
         assert!(signed.x5chain_pem.is_some());
         // Round-trip through the JUMBF envelope like the HTTP surface does.
         let parsed = parse_jumbf_base64(&signed.to_jumbf_base64()).unwrap();
+        let leaf = inspect_c2pa_leaf_certificate_v1(&parsed).unwrap();
+        assert_eq!(leaf.sha256_hex.len(), 64);
+        assert!(leaf.sha256_hex.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(leaf.valid_at(now));
         let report = verify_c2pa_signed_manifest_es256_v1(&parsed, content).unwrap();
         assert!(report.canonical_hash_match);
         assert!(
@@ -1229,6 +1279,24 @@ mod tests {
         );
         assert!(report.content_hash_match);
         assert!(report.ok);
+    }
+
+    #[test]
+    fn leaf_inspection_reports_expired_certificate_without_assigning_trust() {
+        use rcgen::{date_time_ymd, CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
+
+        let mut params = CertificateParams::new(vec!["expired.test".to_string()]).unwrap();
+        params.not_before = date_time_ymd(2019, 1, 1);
+        params.not_after = date_time_ymd(2020, 1, 1);
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let signer = ByokP256Signer::from_pem(&key.serialize_pem(), &cert.pem(), "expired-leaf").unwrap();
+        let manifest = build_c2pa_manifest_v1(&byok_input(b"expired"));
+        let signed = sign_c2pa_manifest_via_signer(manifest, &signer, "2026-07-21T00:00:00Z").unwrap();
+        let leaf = inspect_c2pa_leaf_certificate_v1(&signed).unwrap();
+
+        assert!(!leaf.valid_at(1_788_825_600)); // 2026-09-08 UTC
+        assert!(leaf.not_after_unix < leaf.not_before_unix + 366 * 86_400);
     }
 
     #[test]

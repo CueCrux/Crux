@@ -23,7 +23,7 @@
 //! until the wedge passes its skeleton gate. Wiring the no-op to the real
 //! `credit_meter` reserve/spend rail remains a follow-up.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -35,8 +35,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use corecrux_receipts::{
-    build_c2pa_manifest_v1, parse_jumbf_base64, sign_c2pa_manifest_via_signer, verify_c2pa_signed_manifest_es256_v1,
-    ByokP256Signer, C2paManifestInputV1,
+    build_c2pa_manifest_v1, inspect_c2pa_leaf_certificate_v1, parse_jumbf_base64, sign_c2pa_manifest_via_signer,
+    verify_c2pa_signed_manifest_es256_v1, ByokP256Signer, C2paManifestInputV1,
 };
 
 use super::{problem_response, require_http_any_scope_for_tenant, AppState, HeaderMap, State, StatusCode};
@@ -49,6 +49,55 @@ const FEATURE_ENV: &str = "CORECRUXD_FEATURE_PROVENANCE_API";
 /// daemon does not terminate TLS itself, so a public BYOK surface must sit
 /// behind an authenticated TLS proxy before request bodies can be accepted.
 const TLS_TERMINATED_ENV: &str = "CORECRUXD_PROVENANCE_TLS_TERMINATED";
+/// Optional comma-separated exact leaf-certificate SHA-256 pins. This beta
+/// trust list does not claim CA-chain validation; it upgrades identity trust
+/// only for a currently-valid exact leaf whose envelope signature verifies.
+const TRUSTED_LEAF_SHA256_ENV: &str = "CORECRUXD_PROVENANCE_TRUSTED_LEAF_SHA256";
+const MAX_TRUSTED_LEAF_PINS: usize = 1_024;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ProvenanceTrustPolicy {
+    trusted_leaf_sha256: HashSet<String>,
+}
+
+impl ProvenanceTrustPolicy {
+    fn from_env() -> Result<Self, String> {
+        Self::parse(std::env::var(TRUSTED_LEAF_SHA256_ENV).ok().as_deref())
+    }
+
+    fn parse(raw: Option<&str>) -> Result<Self, String> {
+        let mut trusted_leaf_sha256 = HashSet::new();
+        let mut pin_count = 0usize;
+        for raw_pin in raw.unwrap_or_default().split(',') {
+            let raw_pin = raw_pin.trim();
+            if raw_pin.is_empty() {
+                continue;
+            }
+            pin_count += 1;
+            if pin_count > MAX_TRUSTED_LEAF_PINS {
+                return Err(format!(
+                    "{TRUSTED_LEAF_SHA256_ENV} exceeds the {MAX_TRUSTED_LEAF_PINS}-pin limit"
+                ));
+            }
+            let without_prefix = raw_pin
+                .strip_prefix("sha256:")
+                .or_else(|| raw_pin.strip_prefix("SHA256:"))
+                .unwrap_or(raw_pin);
+            let normalized = without_prefix.replace(':', "").to_ascii_lowercase();
+            if normalized.len() != 64 || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(format!(
+                    "{TRUSTED_LEAF_SHA256_ENV} entries must be 64-hex SHA-256 fingerprints"
+                ));
+            }
+            trusted_leaf_sha256.insert(normalized);
+        }
+        Ok(Self { trusted_leaf_sha256 })
+    }
+
+    fn trusts_leaf(&self, fingerprint: &str) -> bool {
+        self.trusted_leaf_sha256.contains(fingerprint)
+    }
+}
 
 /// The M9 skeleton reads the flag from the environment directly rather than
 /// threading a bool through `AppState`/`Config`: both structs have dozens of
@@ -99,6 +148,12 @@ pub(super) fn provenance_routes_enabled(state: &AppState) -> bool {
             tls_terminated_asserted = env_truthy(TLS_TERMINATED_ENV),
             "provenance API flag is on but routes are not mounted: require non-off auth and either loopback binding or JWT plus TLS termination"
         );
+    }
+    if allowed {
+        if let Err(error) = ProvenanceTrustPolicy::from_env() {
+            tracing::error!(%error, "provenance API routes are not mounted: invalid exact-leaf trust list");
+            return false;
+        }
     }
     allowed
 }
@@ -406,13 +461,19 @@ pub(super) struct VerifyResponse {
     /// `None` when no content was supplied.
     pub content_hash_match: Option<bool>,
     // ── Trust: NOT established by this BYOK skeleton ──
-    /// Machine-readable trust posture. The skeleton never validates the cert
-    /// chain to a root/trust-list, so this is `"untrusted_presented_leaf"`
-    /// (or `"unsigned"` / `"external_key_required"`).
+    /// Machine-readable trust posture. An operator-pinned, currently-valid
+    /// exact leaf can be `"trusted_leaf_allowlist"`; CA-chain validation is
+    /// still absent. Otherwise `"untrusted_presented_leaf"`, `"unsigned"`,
+    /// or `"external_key_required"`.
     pub trust_status: String,
+    /// SHA-256 of the exact DER leaf embedded in `x5chain`, when present.
+    /// Safe to compare with an operator trust list; not a trust claim alone.
+    #[serde(default)]
+    pub signer_leaf_sha256: Option<String>,
     /// Always false here — no chain-to-root validation.
     pub chain_validated: bool,
-    /// Always false here — no identity/trust-list validation.
+    /// True only for a valid exact leaf pinned by the operator and a valid
+    /// signature over the canonical envelope body.
     pub identity_trusted: bool,
     // ── Overall ──
     /// True ONLY when the envelope is internally consistent AND asset bytes
@@ -477,6 +538,13 @@ fn hash_optional_text(hasher: &mut blake3::Hasher, value: Option<&str>) {
             hasher.update(b"\x00");
         }
     }
+}
+
+fn current_unix_seconds() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -550,7 +618,7 @@ fn do_sign(meter: &dyn ProvenanceMeter, tenant: &str, req: &SignRequest) -> Resu
     })
 }
 
-fn verify_inner(req: &VerifyRequest) -> Result<VerifyResponse, ProvErr> {
+fn verify_inner(req: &VerifyRequest, trust_policy: &ProvenanceTrustPolicy) -> Result<VerifyResponse, ProvErr> {
     let Some(envelope_b64) = req.manifest_envelope_b64.as_deref() else {
         return Ok(VerifyResponse {
             present: false,
@@ -561,6 +629,7 @@ fn verify_inner(req: &VerifyRequest) -> Result<VerifyResponse, ProvErr> {
             asset_binding_checked: false,
             content_hash_match: None,
             trust_status: "unsigned".to_string(),
+            signer_leaf_sha256: None,
             chain_validated: false,
             identity_trusted: false,
             ok: false,
@@ -592,15 +661,45 @@ fn verify_inner(req: &VerifyRequest) -> Result<VerifyResponse, ProvErr> {
         // x5chain. This establishes CONSISTENCY only — never trust.
         let report = verify_c2pa_signed_manifest_es256_v1(&parsed, content.as_deref().unwrap_or(&[]))
             .map_err(|_| ProvErr::new(StatusCode::BAD_REQUEST, "es256 verification failed"))?;
+        let leaf = inspect_c2pa_leaf_certificate_v1(&parsed)
+            .map_err(|_| ProvErr::new(StatusCode::BAD_REQUEST, "es256 leaf certificate did not parse"))?;
         let integrity_valid = report.canonical_hash_match && report.signature_valid;
         let content_hash_match = content_supplied.then_some(report.content_hash_match);
         // Overall ok requires integrity AND a checked+matching asset binding.
         let ok = integrity_valid && content_hash_match == Some(true);
-        let mut notes = vec![
-            "integrity_valid checks the envelope against the PRESENTED leaf only; the leaf, its chain, \
-             and all manifest_claims are UNTRUSTED — no chain-to-root/identity validation is performed"
-                .to_string(),
-        ];
+        let now = current_unix_seconds();
+        let leaf_current = now.is_some_and(|unix_seconds| leaf.valid_at(unix_seconds));
+        let leaf_pinned = trust_policy.trusts_leaf(&leaf.sha256_hex);
+        let identity_trusted = leaf_pinned && leaf_current && integrity_valid;
+        let trust_status = if identity_trusted {
+            "trusted_leaf_allowlist"
+        } else if now.is_none() && leaf_pinned {
+            "system_clock_invalid"
+        } else if leaf_pinned && !leaf_current {
+            "expired_pinned_leaf"
+        } else if leaf_pinned {
+            "pinned_leaf_integrity_invalid"
+        } else {
+            "untrusted_presented_leaf"
+        };
+        let mut notes = if identity_trusted {
+            vec![
+                "the exact currently-valid leaf certificate is operator-pinned and the envelope signature verifies; \
+                 CA-chain validation is not performed"
+                    .to_string(),
+            ]
+        } else {
+            vec![
+                "integrity_valid checks the envelope against the PRESENTED leaf only; the leaf, its chain, \
+                 and all manifest_claims are UNTRUSTED unless trust_status says trusted_leaf_allowlist"
+                    .to_string(),
+            ]
+        };
+        if now.is_none() {
+            notes.push("the system clock is before the Unix epoch; exact-leaf trust failed closed".to_string());
+        } else if !leaf_current {
+            notes.push("the presented leaf certificate is outside its validity interval".to_string());
+        }
         if !content_supplied {
             notes.push(
                 "asset bytes not supplied — content binding NOT checked, so overall ok is false; \
@@ -616,9 +715,10 @@ fn verify_inner(req: &VerifyRequest) -> Result<VerifyResponse, ProvErr> {
             integrity_valid,
             asset_binding_checked: content_supplied,
             content_hash_match,
-            trust_status: "untrusted_presented_leaf".to_string(),
+            trust_status: trust_status.to_string(),
+            signer_leaf_sha256: Some(leaf.sha256_hex),
             chain_validated: false,
-            identity_trusted: false,
+            identity_trusted,
             ok,
             manifest_claims: Some(claims),
             notes,
@@ -635,6 +735,7 @@ fn verify_inner(req: &VerifyRequest) -> Result<VerifyResponse, ProvErr> {
             asset_binding_checked: false,
             content_hash_match: None,
             trust_status: "external_key_required".to_string(),
+            signer_leaf_sha256: None,
             chain_validated: false,
             identity_trusted: false,
             ok: false,
@@ -646,22 +747,48 @@ fn verify_inner(req: &VerifyRequest) -> Result<VerifyResponse, ProvErr> {
     }
 }
 
+#[cfg(test)]
 fn do_verify(meter: &dyn ProvenanceMeter, tenant: &str, req: &VerifyRequest) -> Result<VerifyResponse, ProvErr> {
-    let resp = verify_inner(req)?;
+    let resp = verify_inner(req, &ProvenanceTrustPolicy::default())?;
     meter.on_op(ProvenanceOp::Verify, tenant);
     Ok(resp)
 }
 
-fn do_verify_record(
+fn do_verify_with_trust(
     meter: &dyn ProvenanceMeter,
     tenant: &str,
     req: &VerifyRequest,
-    idempotency: Option<&RecordIdempotency>,
-    passport_key_path: &Path,
-    passport_fpr: &str,
-    data_dir: &Path,
+    trust_policy: &ProvenanceTrustPolicy,
+) -> Result<VerifyResponse, ProvErr> {
+    let resp = verify_inner(req, trust_policy)?;
+    meter.on_op(ProvenanceOp::Verify, tenant);
+    Ok(resp)
+}
+
+#[derive(Clone, Copy)]
+struct VerifyRecordContext<'a> {
+    tenant: &'a str,
+    idempotency: Option<&'a RecordIdempotency>,
+    trust_policy: &'a ProvenanceTrustPolicy,
+    passport_key_path: &'a Path,
+    passport_fpr: &'a str,
+    data_dir: &'a Path,
+}
+
+fn do_verify_record(
+    meter: &dyn ProvenanceMeter,
+    req: &VerifyRequest,
+    context: VerifyRecordContext<'_>,
 ) -> Result<VerifyRecordOutcome, ProvErr> {
-    let verification = verify_inner(req)?;
+    let VerifyRecordContext {
+        tenant,
+        idempotency,
+        trust_policy,
+        passport_key_path,
+        passport_fpr,
+        data_dir,
+    } = context;
+    let verification = verify_inner(req, trust_policy)?;
 
     let record_id = format!("prov_vr_{}", uuid::Uuid::new_v4());
     let recorded_at = chrono::Utc::now().to_rfc3339();
@@ -1276,7 +1403,17 @@ pub(super) async fn post_provenance_verify(
         Ok(tenant) => tenant,
         Err(resp) => return resp,
     };
-    match tokio::task::spawn_blocking(move || do_verify(&NoopMeter, &tenant, &body)).await {
+    let trust_policy = match ProvenanceTrustPolicy::from_env() {
+        Ok(policy) => policy,
+        Err(error) => {
+            tracing::error!(%error, "invalid provenance exact-leaf trust list");
+            return problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid provenance trust configuration",
+            );
+        }
+    };
+    match tokio::task::spawn_blocking(move || do_verify_with_trust(&NoopMeter, &tenant, &body, &trust_policy)).await {
         Ok(Ok(resp)) => (StatusCode::OK, Json(resp)).into_response(),
         Ok(Err(err)) => err.into_response(),
         Err(err) => blocking_task_failed("verify", err),
@@ -1296,18 +1433,31 @@ pub(super) async fn post_provenance_verify_record(
         Ok(idempotency) => idempotency,
         Err(err) => return err.into_response(),
     };
+    let trust_policy = match ProvenanceTrustPolicy::from_env() {
+        Ok(policy) => policy,
+        Err(error) => {
+            tracing::error!(%error, "invalid provenance exact-leaf trust list");
+            return problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid provenance trust configuration",
+            );
+        }
+    };
     let passport_key_path = state.passport_key_path.clone();
     let passport_fpr = state.passport_fpr.clone();
     let data_dir = state.data_dir.clone();
     match tokio::task::spawn_blocking(move || {
         do_verify_record(
             &NoopMeter,
-            &tenant,
             &body,
-            idempotency.as_ref(),
-            &passport_key_path,
-            &passport_fpr,
-            &data_dir,
+            VerifyRecordContext {
+                tenant: &tenant,
+                idempotency: idempotency.as_ref(),
+                trust_policy: &trust_policy,
+                passport_key_path: &passport_key_path,
+                passport_fpr: &passport_fpr,
+                data_dir: &data_dir,
+            },
         )
     })
     .await
@@ -1333,6 +1483,16 @@ mod tests {
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "provenance byok TEST");
+        let kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let cert = params.self_signed(&kp).unwrap();
+        (kp.serialize_pem(), cert.pem())
+    }
+
+    fn expired_byok_material() -> (String, String) {
+        use rcgen::{date_time_ymd, CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
+        let mut params = CertificateParams::new(vec!["expired-byok.test".to_string()]).unwrap();
+        params.not_before = date_time_ymd(2019, 1, 1);
+        params.not_after = date_time_ymd(2020, 1, 1);
         let kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
         let cert = params.self_signed(&kp).unwrap();
         (kp.serialize_pem(), cert.pem())
@@ -1439,6 +1599,7 @@ mod tests {
         assert!(verify.ok);
         // Honesty: internal consistency is NOT trust.
         assert_eq!(verify.trust_status, "untrusted_presented_leaf");
+        assert!(verify.signer_leaf_sha256.is_some());
         assert!(!verify.chain_validated);
         assert!(!verify.identity_trusted);
         // Manifest values are surfaced as UNVERIFIED claims.
@@ -1447,6 +1608,94 @@ mod tests {
         let calls = meter.calls.lock().unwrap();
         assert_eq!(calls[0], ("provenance.sign".to_string(), "tenant-a".to_string()));
         assert_eq!(calls[1], ("provenance.verify".to_string(), "tenant-a".to_string()));
+    }
+
+    #[test]
+    fn exact_leaf_allowlist_requires_current_cert_and_valid_envelope_integrity() {
+        let content = b"trusted-leaf-content";
+        let meter = RecordingMeter::default();
+        let signed = do_sign(&meter, "tenant-trust", &sign_req(content, Some("image/png"))).unwrap();
+        let parsed = parse_jumbf_base64(&signed.manifest_envelope_b64).unwrap();
+        let leaf = inspect_c2pa_leaf_certificate_v1(&parsed).unwrap();
+        let colon_fingerprint = leaf
+            .sha256_hex
+            .as_bytes()
+            .chunks(2)
+            .map(|chunk| std::str::from_utf8(chunk).unwrap())
+            .collect::<Vec<_>>()
+            .join(":");
+        let policy = ProvenanceTrustPolicy::parse(Some(&format!("SHA256:{colon_fingerprint}"))).unwrap();
+        let request = VerifyRequest {
+            manifest_envelope_b64: Some(signed.manifest_envelope_b64),
+            content_b64: Some(b64(content)),
+            tenant_id: None,
+        };
+
+        let verified = do_verify_with_trust(&meter, "tenant-trust", &request, &policy).unwrap();
+
+        assert!(verified.ok);
+        assert!(verified.identity_trusted);
+        assert!(!verified.chain_validated);
+        assert_eq!(verified.trust_status, "trusted_leaf_allowlist");
+        assert_eq!(verified.signer_leaf_sha256.as_deref(), Some(leaf.sha256_hex.as_str()));
+
+        let (key_pem, cert_pem) = expired_byok_material();
+        let expired_request = SignRequest {
+            content_b64: b64(content),
+            content_type: Some("image/png".to_string()),
+            signing_key_pem: key_pem.into(),
+            cert_chain_pem: cert_pem,
+            manifest: ManifestParams::default(),
+            tenant_id: None,
+            key_id: Some("expired-leaf".to_string()),
+        };
+        let expired_signed = do_sign(&meter, "tenant-trust", &expired_request).unwrap();
+        let expired_parsed = parse_jumbf_base64(&expired_signed.manifest_envelope_b64).unwrap();
+        let expired_leaf = inspect_c2pa_leaf_certificate_v1(&expired_parsed).unwrap();
+        let expired_policy = ProvenanceTrustPolicy {
+            trusted_leaf_sha256: HashSet::from([expired_leaf.sha256_hex]),
+        };
+        let expired_verified = do_verify_with_trust(
+            &meter,
+            "tenant-trust",
+            &VerifyRequest {
+                manifest_envelope_b64: Some(expired_signed.manifest_envelope_b64),
+                content_b64: Some(b64(content)),
+                tenant_id: None,
+            },
+            &expired_policy,
+        )
+        .unwrap();
+        assert!(expired_verified.integrity_valid);
+        assert!(!expired_verified.identity_trusted);
+        assert_eq!(expired_verified.trust_status, "expired_pinned_leaf");
+    }
+
+    #[test]
+    fn exact_leaf_allowlist_parser_is_bounded_and_fail_closed() {
+        assert_eq!(
+            ProvenanceTrustPolicy::parse(None).unwrap(),
+            ProvenanceTrustPolicy::default()
+        );
+        assert_eq!(
+            ProvenanceTrustPolicy::parse(Some("not-a-fingerprint")).unwrap_err(),
+            format!("{TRUSTED_LEAF_SHA256_ENV} entries must be 64-hex SHA-256 fingerprints")
+        );
+        let too_many = (0..=MAX_TRUSTED_LEAF_PINS)
+            .map(|index| format!("{index:064x}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            ProvenanceTrustPolicy::parse(Some(&too_many)).unwrap_err(),
+            format!("{TRUSTED_LEAF_SHA256_ENV} exceeds the {MAX_TRUSTED_LEAF_PINS}-pin limit")
+        );
+        let duplicate_overflow = std::iter::repeat_n("0".repeat(64), MAX_TRUSTED_LEAF_PINS + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            ProvenanceTrustPolicy::parse(Some(&duplicate_overflow)).unwrap_err(),
+            format!("{TRUSTED_LEAF_SHA256_ENV} exceeds the {MAX_TRUSTED_LEAF_PINS}-pin limit")
+        );
     }
 
     #[test]
@@ -1556,19 +1805,23 @@ mod tests {
         let content = b"record-me";
         let meter = RecordingMeter::default();
         let signed = do_sign(&meter, "tenant-r", &sign_req(content, None)).unwrap();
+        let trust_policy = ProvenanceTrustPolicy::default();
 
         let resp = do_verify_record(
             &meter,
-            "tenant-r",
             &VerifyRequest {
                 manifest_envelope_b64: Some(signed.manifest_envelope_b64),
                 content_b64: Some(b64(content)),
                 tenant_id: None,
             },
-            None,
-            &key_path,
-            &fpr,
-            data_dir,
+            VerifyRecordContext {
+                tenant: "tenant-r",
+                idempotency: None,
+                trust_policy: &trust_policy,
+                passport_key_path: &key_path,
+                passport_fpr: &fpr,
+                data_dir,
+            },
         )
         .unwrap();
         let VerifyRecordOutcome::Created(resp) = resp else {
@@ -1609,18 +1862,22 @@ mod tests {
 
         let meter = RecordingMeter::default();
         let signed = do_sign(&meter, "t", &sign_req(b"asset", None)).unwrap();
+        let trust_policy = ProvenanceTrustPolicy::default();
         let resp = do_verify_record(
             &meter,
-            "t",
             &VerifyRequest {
                 manifest_envelope_b64: Some(signed.manifest_envelope_b64),
                 content_b64: None, // no asset supplied
                 tenant_id: None,
             },
-            None,
-            &key_path,
-            &fpr,
-            data_dir,
+            VerifyRecordContext {
+                tenant: "t",
+                idempotency: None,
+                trust_policy: &trust_policy,
+                passport_key_path: &key_path,
+                passport_fpr: &fpr,
+                data_dir,
+            },
         )
         .unwrap();
         let VerifyRecordOutcome::Created(resp) = resp else {
@@ -1647,15 +1904,19 @@ mod tests {
             tenant_id: None,
         };
         let idempotency = RecordIdempotency::from_request("tenant-idem", "request-123", &req);
+        let trust_policy = ProvenanceTrustPolicy::default();
 
         let first = do_verify_record(
             &meter,
-            "tenant-idem",
             &req,
-            Some(&idempotency),
-            &key_path,
-            &fpr,
-            tmp.path(),
+            VerifyRecordContext {
+                tenant: "tenant-idem",
+                idempotency: Some(&idempotency),
+                trust_policy: &trust_policy,
+                passport_key_path: &key_path,
+                passport_fpr: &fpr,
+                data_dir: tmp.path(),
+            },
         )
         .unwrap();
         let VerifyRecordOutcome::Created(first) = first else {
@@ -1663,12 +1924,15 @@ mod tests {
         };
         let retry = do_verify_record(
             &meter,
-            "tenant-idem",
             &req,
-            Some(&idempotency),
-            &key_path,
-            &fpr,
-            tmp.path(),
+            VerifyRecordContext {
+                tenant: "tenant-idem",
+                idempotency: Some(&idempotency),
+                trust_policy: &trust_policy,
+                passport_key_path: &key_path,
+                passport_fpr: &fpr,
+                data_dir: tmp.path(),
+            },
         )
         .unwrap();
         let VerifyRecordOutcome::Replayed(retry) = retry else {
@@ -1702,12 +1966,15 @@ mod tests {
         let changed_idempotency = RecordIdempotency::from_request("tenant-idem", "request-123", &changed_req);
         let err = do_verify_record(
             &meter,
-            "tenant-idem",
             &changed_req,
-            Some(&changed_idempotency),
-            &key_path,
-            &fpr,
-            tmp.path(),
+            VerifyRecordContext {
+                tenant: "tenant-idem",
+                idempotency: Some(&changed_idempotency),
+                trust_policy: &trust_policy,
+                passport_key_path: &key_path,
+                passport_fpr: &fpr,
+                data_dir: tmp.path(),
+            },
         )
         .unwrap_err();
         assert_eq!(err.status, StatusCode::CONFLICT);
