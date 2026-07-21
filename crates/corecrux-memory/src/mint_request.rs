@@ -19,8 +19,28 @@ use crate::fact_store::{dedup_latest, default_tenant_hash, FactQuery, FactStore,
 pub const MINT_REQUEST_ENTITY_PREFIX: &str = "__mint_request__";
 /// Fixed key for the current request record under each request entity.
 pub const MINT_REQUEST_RECORD_KEY: &str = "record";
-/// Initial request status. Resolution transitions are implemented in M2.
+/// Initial request status.
 pub const MINT_REQUEST_STATUS_PENDING: &str = "pending";
+/// Terminal status for an operator-approved request.
+pub const MINT_REQUEST_STATUS_APPROVED: &str = "approved";
+/// Terminal status for an operator-rejected request.
+pub const MINT_REQUEST_STATUS_REJECTED: &str = "rejected";
+
+/// Operator decision for a pending passport-mint request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MintRequestDecision {
+    Approved,
+    Rejected,
+}
+
+impl MintRequestDecision {
+    fn status(self) -> &'static str {
+        match self {
+            Self::Approved => MINT_REQUEST_STATUS_APPROVED,
+            Self::Rejected => MINT_REQUEST_STATUS_REJECTED,
+        }
+    }
+}
 
 /// A request for an operator to mint a passport for the requesting identity.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -35,7 +55,7 @@ pub struct PendingMintRequest {
     pub requested_by_passport: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// `pending` in M1; `approved` and `rejected` are reserved for M2.
+    /// `pending` until an operator resolves it as `approved` or `rejected`.
     pub status: String,
     pub requested_at_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -46,6 +66,10 @@ pub struct PendingMintRequest {
 
 #[derive(Debug, Error)]
 pub enum MintRequestError {
+    #[error("mint request not found: {0}")]
+    NotFound(String),
+    #[error("mint request is not pending: {request_id} (status: {status})")]
+    NotPending { request_id: String, status: String },
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error("mint-request fact-store write failed: {0}")]
@@ -133,4 +157,176 @@ pub fn get_mint_request(store: &FactStore, request_id: &str) -> Option<PendingMi
         .into_iter()
         .find(|fact| fact.key == MINT_REQUEST_RECORD_KEY)
         .and_then(|fact| serde_json::from_str::<PendingMintRequest>(&fact.value).ok())
+}
+
+/// Resolve a pending request without minting or updating a passport.
+///
+/// The mutable store borrow serializes the read/validate/write transition for
+/// in-process callers. [`FactStore::try_store`] durably appends the terminal
+/// record before mutating an on-disk-backed store, so a failed write leaves the
+/// request pending.
+pub fn resolve_mint_request(
+    store: &mut FactStore,
+    request_id: &str,
+    approver_passport: String,
+    decision: MintRequestDecision,
+    resolved_at_unix_ms: u64,
+) -> Result<PendingMintRequest, MintRequestError> {
+    let mut request =
+        get_mint_request(store, request_id).ok_or_else(|| MintRequestError::NotFound(request_id.to_string()))?;
+    if request.status != MINT_REQUEST_STATUS_PENDING {
+        return Err(MintRequestError::NotPending {
+            request_id: request_id.to_string(),
+            status: request.status,
+        });
+    }
+
+    request.status = decision.status().to_string();
+    request.resolved_at_unix_ms = Some(resolved_at_unix_ms);
+    request.resolved_by_passport = Some(approver_passport.clone());
+
+    let value = serde_json::to_string(&request)?;
+    store.try_store(StoreFact {
+        tenant_hash: default_tenant_hash(),
+        entity: format!("{MINT_REQUEST_ENTITY_PREFIX}::{request_id}"),
+        key: MINT_REQUEST_RECORD_KEY.to_string(),
+        value,
+        source_receipt: None,
+        confidence: 1.0,
+        private: true,
+        horizon_class: Some(HorizonClass::None),
+        actor: Some(approver_passport),
+    })?;
+    Ok(request)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn pending_request(store: &mut FactStore) -> PendingMintRequest {
+        file_mint_request(
+            store,
+            "requester-passport".to_string(),
+            "requester-passport".to_string(),
+            Some("work".to_string()),
+            Some("needs work memory".to_string()),
+            100,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn resolve_approved_records_terminal_status_and_operator_attribution() {
+        let mut store = FactStore::new();
+        let pending = pending_request(&mut store);
+
+        let resolved = resolve_mint_request(
+            &mut store,
+            &pending.request_id,
+            "operator-passport".to_string(),
+            MintRequestDecision::Approved,
+            200,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.status, MINT_REQUEST_STATUS_APPROVED);
+        assert_eq!(resolved.resolved_at_unix_ms, Some(200));
+        assert_eq!(resolved.resolved_by_passport.as_deref(), Some("operator-passport"));
+        assert!(list_pending_mint_requests(&store).is_empty());
+        assert_eq!(get_mint_request(&store, &pending.request_id), Some(resolved));
+    }
+
+    #[test]
+    fn resolve_rejected_records_terminal_status_without_changing_request_fields() {
+        let mut store = FactStore::new();
+        let pending = pending_request(&mut store);
+
+        let resolved = resolve_mint_request(
+            &mut store,
+            &pending.request_id,
+            "rejecting-operator".to_string(),
+            MintRequestDecision::Rejected,
+            300,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.status, MINT_REQUEST_STATUS_REJECTED);
+        assert_eq!(resolved.requester_id, pending.requester_id);
+        assert_eq!(resolved.requested_category, pending.requested_category);
+        assert_eq!(resolved.reason, pending.reason);
+        assert_eq!(resolved.resolved_by_passport.as_deref(), Some("rejecting-operator"));
+        assert!(list_pending_mint_requests(&store).is_empty());
+    }
+
+    #[test]
+    fn resolving_missing_or_non_pending_request_does_not_write() {
+        let mut store = FactStore::new();
+        let missing = resolve_mint_request(
+            &mut store,
+            "mr_missing",
+            "operator-passport".to_string(),
+            MintRequestDecision::Approved,
+            200,
+        );
+        assert!(matches!(missing, Err(MintRequestError::NotFound(id)) if id == "mr_missing"));
+        assert_eq!(store.count(), 0);
+
+        let pending = pending_request(&mut store);
+        resolve_mint_request(
+            &mut store,
+            &pending.request_id,
+            "first-operator".to_string(),
+            MintRequestDecision::Rejected,
+            300,
+        )
+        .unwrap();
+        let count_after_resolution = store.count();
+
+        let repeated = resolve_mint_request(
+            &mut store,
+            &pending.request_id,
+            "second-operator".to_string(),
+            MintRequestDecision::Approved,
+            400,
+        );
+        assert!(matches!(
+            repeated,
+            Err(MintRequestError::NotPending { request_id, status })
+                if request_id == pending.request_id && status == MINT_REQUEST_STATUS_REJECTED
+        ));
+        assert_eq!(store.count(), count_after_resolution);
+
+        let stored = get_mint_request(&store, &pending.request_id).unwrap();
+        assert_eq!(stored.status, MINT_REQUEST_STATUS_REJECTED);
+        assert_eq!(stored.resolved_at_unix_ms, Some(300));
+        assert_eq!(stored.resolved_by_passport.as_deref(), Some("first-operator"));
+    }
+
+    #[test]
+    fn resolved_request_survives_fact_store_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let request_id;
+        {
+            let mut store = FactStore::with_persistence(dir.path()).unwrap();
+            let pending = pending_request(&mut store);
+            request_id = pending.request_id;
+            resolve_mint_request(
+                &mut store,
+                &request_id,
+                "operator-passport".to_string(),
+                MintRequestDecision::Approved,
+                500,
+            )
+            .unwrap();
+        }
+
+        let replayed = FactStore::with_persistence(dir.path()).unwrap();
+        let resolved = get_mint_request(&replayed, &request_id).unwrap();
+        assert_eq!(resolved.status, MINT_REQUEST_STATUS_APPROVED);
+        assert_eq!(resolved.resolved_at_unix_ms, Some(500));
+        assert_eq!(resolved.resolved_by_passport.as_deref(), Some("operator-passport"));
+        assert!(list_pending_mint_requests(&replayed).is_empty());
+    }
 }

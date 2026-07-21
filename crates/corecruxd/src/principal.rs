@@ -269,6 +269,7 @@ mod tests {
             &mut store,
             "veteran",
             passports::UpdatePassportInput {
+                category: None,
                 agent_work_gate: None,
                 is_default_for_category: None,
                 sponsor_id: None,
@@ -309,6 +310,7 @@ mod tests {
             store,
             "personal-default",
             passports::UpdatePassportInput {
+                category: None,
                 agent_work_gate: None,
                 is_default_for_category: None,
                 sponsor_id: None,

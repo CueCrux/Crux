@@ -76,8 +76,9 @@ pub use legal_hold::{
     LEGAL_HOLD_ENTITY_PREFIX, LEGAL_HOLD_RECEIPT_ENTITY_PREFIX, LEGAL_HOLD_RECEIPT_SCHEMA_V1, LEGAL_HOLD_SCHEMA_V1,
 };
 pub use mint_request::{
-    file_mint_request, get_mint_request, list_pending_mint_requests, MintRequestError, PendingMintRequest,
-    MINT_REQUEST_ENTITY_PREFIX, MINT_REQUEST_RECORD_KEY, MINT_REQUEST_STATUS_PENDING,
+    file_mint_request, get_mint_request, list_pending_mint_requests, resolve_mint_request, MintRequestDecision,
+    MintRequestError, PendingMintRequest, MINT_REQUEST_ENTITY_PREFIX, MINT_REQUEST_RECORD_KEY,
+    MINT_REQUEST_STATUS_APPROVED, MINT_REQUEST_STATUS_PENDING, MINT_REQUEST_STATUS_REJECTED,
 };
 pub use result_envelope::{
     result_envelope_content_hash, verify_result_envelope, CompanionArtifact, EnvelopeEdge, EnvelopeEntity,

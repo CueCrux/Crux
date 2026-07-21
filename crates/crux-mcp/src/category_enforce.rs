@@ -108,7 +108,7 @@ struct PassportCategorySlice {
 /// record's `tenant_group`, mapped through [`TenantCategory::parse_user_input`].
 /// A `tenant_group` that isn't a valid category (e.g. a custom group name)
 /// yields `None`, so enforcement still fails closed rather than guessing.
-fn passport_category_for(store: &FactStore, passport_id: &str) -> Option<String> {
+pub fn passport_category_for(store: &FactStore, passport_id: &str) -> Option<String> {
     let entity = format!("{PASSPORT_PREFIX}::{passport_id}");
     let facts: Vec<&corecrux_memory::fact_store::Fact> = store.get_by_entity(&entity);
 

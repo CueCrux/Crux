@@ -330,6 +330,23 @@ pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContra
         return Some(RouteAuthContract::new(RouteAuthClass::AdminRead, &["admin:read"]));
     }
 
+    if method == "POST"
+        && matches!(
+            path,
+            "/v1/passport/mint-requests/{request_id}/approve" | "/v1/passport/mint-requests/{request_id}/reject"
+        )
+    {
+        return Some(RouteAuthContract::gated(
+            RouteAuthClass::FeatureGated,
+            &["admin:write"],
+            "CORECRUXD_FEATURE_PASSPORT_MINT_REQUESTS",
+        ));
+    }
+
+    if method == "POST" && path == "/v1/passports" {
+        return Some(RouteAuthContract::new(RouteAuthClass::AdminWrite, &["admin:write"]));
+    }
+
     if path.starts_with("/v1/work")
         || path.starts_with("/v1/status-feed")
         || path.starts_with("/v1/projects")
@@ -840,6 +857,24 @@ mod tests {
             ),
             (
                 "POST",
+                "/v1/passport/mint-requests/{request_id}/approve",
+                RouteAuthClass::FeatureGated,
+                &["admin:write"][..],
+            ),
+            (
+                "POST",
+                "/v1/passport/mint-requests/{request_id}/reject",
+                RouteAuthClass::FeatureGated,
+                &["admin:write"][..],
+            ),
+            (
+                "POST",
+                "/v1/passports",
+                RouteAuthClass::AdminWrite,
+                &["admin:write"][..],
+            ),
+            (
+                "POST",
                 "/v1/identity/candidates/{candidateId}/confirm",
                 RouteAuthClass::AdminWrite,
                 &["admin:write"][..],
@@ -862,6 +897,23 @@ mod tests {
                     contract.scopes
                 );
             }
+        }
+    }
+
+    #[test]
+    fn passport_mint_resolution_routes_record_the_feature_gate() {
+        for path in [
+            "/v1/passport/mint-requests/{request_id}/approve",
+            "/v1/passport/mint-requests/{request_id}/reject",
+        ] {
+            let contract = classify_route("POST", path).expect("passport mint resolution route contract");
+            assert_eq!(contract.class, RouteAuthClass::FeatureGated, "{path}");
+            assert_eq!(contract.scopes, &["admin:write"], "{path}");
+            assert_eq!(
+                contract.feature_gate,
+                Some("CORECRUXD_FEATURE_PASSPORT_MINT_REQUESTS"),
+                "{path}"
+            );
         }
     }
 
