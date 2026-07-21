@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# Local BYOK provenance round-trip. The generated private key stays in a
+# disposable directory and is removed on exit; response artifacts contain no
+# asset bytes or private-key material.
+
+set -euo pipefail
+
+for required_command in curl jq openssl; do
+  if ! command -v "$required_command" >/dev/null 2>&1; then
+    echo "ERROR: $required_command is required" >&2
+    exit 1
+  fi
+done
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+asset_path="$script_dir/asset.txt"
+base_url=${CORECRUXD_HTTP_URL:-http://127.0.0.1:14800}
+tenant_id=${CORECRUXD_PROVENANCE_TENANT:-quickstart}
+output_dir=${1:-"$PWD/provenance-byok-output"}
+secret_dir=$(mktemp -d "${TMPDIR:-/tmp}/cuecrux-provenance-byok.XXXXXXXX")
+
+cleanup() {
+  if [[ -n "${secret_dir:-}" && -d "$secret_dir" && "$secret_dir" == *cuecrux-provenance-byok.* ]]; then
+    rm -f -- \
+      "$secret_dir/key.pem" \
+      "$secret_dir/cert.pem" \
+      "$secret_dir/sign-request.json" \
+      "$secret_dir/verify-request.json"
+    rmdir -- "$secret_dir"
+  fi
+}
+trap cleanup EXIT
+
+mkdir -p -- "$output_dir"
+
+openssl genpkey \
+  -algorithm EC \
+  -pkeyopt ec_paramgen_curve:P-256 \
+  -out "$secret_dir/key.pem" 2>/dev/null
+openssl req \
+  -new \
+  -x509 \
+  -sha256 \
+  -key "$secret_dir/key.pem" \
+  -out "$secret_dir/cert.pem" \
+  -days 1 \
+  -subj '/CN=cuecrux-byok-quickstart.invalid' 2>/dev/null
+
+content_b64=$(openssl base64 -A -in "$asset_path")
+signing_key_pem=$(<"$secret_dir/key.pem")
+cert_chain_pem=$(<"$secret_dir/cert.pem")
+
+jq -n \
+  --arg content_b64 "$content_b64" \
+  --arg signing_key_pem "$signing_key_pem" \
+  --arg cert_chain_pem "$cert_chain_pem" \
+  --arg tenant_id "$tenant_id" \
+  '{
+    content_b64: $content_b64,
+    content_type: "text/plain",
+    signing_key_pem: $signing_key_pem,
+    cert_chain_pem: $cert_chain_pem,
+    tenant_id: $tenant_id,
+    key_id: "quickstart-disposable",
+    manifest: {claim_generator: "cuecrux/provenance-byok-quickstart"}
+  }' >"$secret_dir/sign-request.json"
+
+curl -sS --fail-with-body \
+  -X POST "$base_url/v1/provenance/sign" \
+  -H 'Content-Type: application/json' \
+  -H 'X-Corecrux-Scopes: provenance:write' \
+  -H "X-Corecrux-Tenant-Id: $tenant_id" \
+  --data-binary "@$secret_dir/sign-request.json" \
+  >"$output_dir/sign-response.json"
+
+jq -e '
+  .signature_alg == "es256" and
+  (.manifest_envelope_b64 | type == "string" and length > 0) and
+  (.content_hash_blake3_hex | type == "string" and length == 64)
+' "$output_dir/sign-response.json" >/dev/null
+
+envelope_b64=$(jq -er '.manifest_envelope_b64' "$output_dir/sign-response.json")
+jq -n \
+  --arg manifest_envelope_b64 "$envelope_b64" \
+  --arg content_b64 "$content_b64" \
+  --arg tenant_id "$tenant_id" \
+  '{
+    manifest_envelope_b64: $manifest_envelope_b64,
+    content_b64: $content_b64,
+    tenant_id: $tenant_id
+  }' >"$secret_dir/verify-request.json"
+
+curl -sS --fail-with-body \
+  -X POST "$base_url/v1/provenance/verify" \
+  -H 'Content-Type: application/json' \
+  -H 'X-Corecrux-Scopes: provenance:write' \
+  -H "X-Corecrux-Tenant-Id: $tenant_id" \
+  --data-binary "@$secret_dir/verify-request.json" \
+  >"$output_dir/verify-response.json"
+
+jq -e '
+  .ok == true and
+  .integrity_valid == true and
+  .asset_binding_checked == true and
+  .content_hash_match == true and
+  .identity_trusted == false and
+  .chain_validated == false and
+  .trust_status == "untrusted_presented_leaf" and
+  (.signer_leaf_sha256 | type == "string" and length == 64)
+' "$output_dir/verify-response.json" >/dev/null
+
+idempotency_key="quickstart-$(openssl rand -hex 12)"
+record_status=$(curl -sS \
+  -o "$output_dir/verify-record-response.json" \
+  -w '%{http_code}' \
+  -X POST "$base_url/v1/provenance/verify-record" \
+  -H 'Content-Type: application/json' \
+  -H 'X-Corecrux-Scopes: provenance:write' \
+  -H "X-Corecrux-Tenant-Id: $tenant_id" \
+  -H "Idempotency-Key: $idempotency_key" \
+  --data-binary "@$secret_dir/verify-request.json")
+[[ "$record_status" == 201 ]]
+
+replay_status=$(curl -sS \
+  -o "$output_dir/verify-record-replay.json" \
+  -w '%{http_code}' \
+  -X POST "$base_url/v1/provenance/verify-record" \
+  -H 'Content-Type: application/json' \
+  -H 'X-Corecrux-Scopes: provenance:write' \
+  -H "X-Corecrux-Tenant-Id: $tenant_id" \
+  -H "Idempotency-Key: $idempotency_key" \
+  --data-binary "@$secret_dir/verify-request.json")
+[[ "$replay_status" == 200 ]]
+
+record_id=$(jq -er '.record_id' "$output_dir/verify-record-response.json")
+replay_record_id=$(jq -er '.record_id' "$output_dir/verify-record-replay.json")
+[[ "$record_id" == "$replay_record_id" ]]
+jq -e '.verification.ok == true and (.receipt.signature | length > 0)' \
+  "$output_dir/verify-record-response.json" >/dev/null
+
+leaf_fingerprint=$(openssl x509 -in "$secret_dir/cert.pem" -outform DER \
+  | openssl dgst -sha256 -hex \
+  | awk '{print $NF}')
+
+printf 'BYOK provenance quickstart passed.\n'
+printf 'Artifacts: %s\n' "$output_dir"
+printf 'Record: %s (replay returned the same record)\n' "$record_id"
+printf 'Disposable leaf SHA-256: %s\n' "$leaf_fingerprint"
+printf 'Trust stayed false, as expected: an exact leaf pin is an operator policy, not a chain claim.\n'

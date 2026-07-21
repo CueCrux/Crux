@@ -78,6 +78,21 @@ calls also reserve and spend 3 comped-wallet credits. The pinned
 `credits_spent`, and `wallet_balance`. Failed/degraded compute releases the
 reservation and emits no spend stamp.
 
+### BYOK Provenance (default off)
+
+| Method | Path | Description | Auth Scope |
+|--------|------|-------------|------------|
+| POST | `/v1/provenance/sign` | Sign an asset with a request-scoped caller P-256 key and leaf-first certificate chain | `provenance:write` or `admin:write` |
+| POST | `/v1/provenance/verify` | Verify envelope integrity and optional asset binding without retaining a record | `provenance:write` or `admin:write` |
+| POST | `/v1/provenance/verify-record` | Verify and retain a passport-signed record; supports `Idempotency-Key` | `provenance:write` or `admin:write` |
+
+Set `CORECRUXD_FEATURE_PROVENANCE_API=1` to mount the routes. They require an
+explicit authorized tenant and a safe transport posture; see the
+[BYOK provenance quickstart](provenance-byok-quickstart.md). Exact leaf pins
+can establish a narrow operator-selected identity policy, but the beta does
+not perform CA-chain/root validation. Metering remains a no-op until the
+fractional-credit contract is ratified and implemented.
+
 ### Replay Exports
 
 | Method | Path | Description | Auth Scope |

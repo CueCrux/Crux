@@ -31,6 +31,8 @@ server run on your machine without a hosted account.
 - [Developer portal](developer-portal.md) - OpenAPI, RFC 7807 errors,
   receipt verification, SDKs, and contracts.
 - [API reference](api-reference.md) - HTTP, gRPC, and MCP surfaces.
+- [BYOK provenance quickstart](provenance-byok-quickstart.md) - locally sign,
+  verify, and retain a sample provenance record without persisting the key.
 - [Agent guide](agent-guide.md) - using Crux as an agent memory and retrieval
   backend.
 - [Session handshake](session-handshake.md) - identity, install UUIDs, and
