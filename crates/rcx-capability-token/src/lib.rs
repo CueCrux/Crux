@@ -13,7 +13,7 @@
 //! issuer.
 
 use crux_session::canonical::{to_canonical_json, CborValue};
-use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey};
+use ed25519_dalek::{Signature as Ed25519Signature, Signer as _, SigningKey, VerifyingKey};
 use serde::Deserialize;
 
 pub const RCX_CT_SPEC_VERSION: &str = "rcx-ct/1.0";
@@ -403,6 +403,71 @@ pub fn caveat_binding_message(base_token_hash: &[u8; RCX_CT_HASH_LEN], caveats: 
     message
 }
 
+/// The holder's Ed25519 signature over [`caveat_binding_message`], carried on an
+/// attenuated token. Absent on an un-attenuated token, and — like `caveats` —
+/// excluded from `to_signing_cbor()` so the issuer signature is unaffected.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaveatSignature {
+    #[serde(deserialize_with = "deserialize_signature_hex")]
+    pub sig: [u8; RCX_CT_SIGNATURE_LEN],
+}
+
+/// Outcome of verifying an attenuated token. `Verified` means the base issuer
+/// signature AND the holder's caveat binding are valid; the caller then evaluates
+/// the caveats against the concrete request via the `caveats_permit_*` /
+/// [`RcxCapabilityToken::attenuated_expires_at`] helpers (which can only narrow).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttenuatedOutcome {
+    Verified,
+    /// The base (issuer) verification failed.
+    Base(VerifyOutcome),
+    /// The presented holder pubkey does not match `subject.passport_fpr`.
+    HolderMismatch,
+    /// Caveats are present but no holder caveat-signature accompanies them.
+    MissingCaveatSignature,
+    /// The holder caveat-signature does not verify over the caveats.
+    BadCaveatSignature,
+    /// A caveat-signature is present with no caveats (malformed).
+    UnexpectedCaveatSignature,
+}
+
+/// Verify an attenuated token: issuer signature on the base (unchanged) + the
+/// holder controls `subject.passport_fpr` + the holder's signature binds exactly
+/// these caveats. Unknown caveat types cannot occur (the `Caveat` enum is closed,
+/// so an unknown `type` fails deserialization upstream — fail-closed by construction).
+pub fn verify_token_attenuated(
+    token: &RcxCapabilityToken,
+    trust_root_pubkey: &[u8],
+    now_unix_seconds: u64,
+    holder_pubkey: &[u8; 32],
+) -> AttenuatedOutcome {
+    match verify_token(token, trust_root_pubkey, now_unix_seconds) {
+        VerifyOutcome::Verified => {}
+        other => return AttenuatedOutcome::Base(other),
+    }
+    if crux_session::passport::passport_fpr_from_public_key(holder_pubkey) != token.subject.passport_fpr {
+        return AttenuatedOutcome::HolderMismatch;
+    }
+    match (token.caveats.is_empty(), token.caveat_signature.as_ref()) {
+        (true, None) => AttenuatedOutcome::Verified,
+        (true, Some(_)) => AttenuatedOutcome::UnexpectedCaveatSignature,
+        (false, None) => AttenuatedOutcome::MissingCaveatSignature,
+        (false, Some(caveat_sig)) => {
+            let verifying_key = match VerifyingKey::from_bytes(holder_pubkey) {
+                Ok(key) => key,
+                Err(_) => return AttenuatedOutcome::HolderMismatch,
+            };
+            let message = caveat_binding_message(&token.token_hash(), &token.caveats);
+            let signature = Ed25519Signature::from_bytes(&caveat_sig.sig);
+            match verifying_key.verify_strict(&message, &signature) {
+                Ok(()) => AttenuatedOutcome::Verified,
+                Err(_) => AttenuatedOutcome::BadCaveatSignature,
+            }
+        }
+    }
+}
+
 fn caveat_to_cbor(caveat: &Caveat) -> CborValue {
     match caveat {
         Caveat::ExpiresAtLe { expires_at } => CborValue::Map(vec![
@@ -449,6 +514,10 @@ pub struct RcxCapabilityToken {
     /// issuer signature over it) is caveat-independent.
     #[serde(default)]
     pub caveats: Vec<Caveat>,
+    /// The holder's signature binding `caveats` (audit-v2 R3). `None` on an
+    /// un-attenuated token; excluded from `to_signing_cbor()` like `caveats`.
+    #[serde(default)]
+    pub caveat_signature: Option<CaveatSignature>,
     pub signature: Signature,
 }
 
@@ -497,6 +566,14 @@ impl RcxCapabilityToken {
                 CborValue::Array(self.caveats.iter().map(caveat_to_cbor).collect()),
             ));
         }
+        if !zero_signature {
+            if let Some(caveat_sig) = &self.caveat_signature {
+                pairs.push((
+                    "caveat_signature".to_string(),
+                    CborValue::Map(vec![("sig".to_string(), CborValue::Bytes(caveat_sig.sig.to_vec()))]),
+                ));
+            }
+        }
         pairs.push((
             "signature".to_string(),
             signature_to_cbor(&self.signature, zero_signature),
@@ -522,6 +599,50 @@ impl RcxCapabilityToken {
 
     pub fn token_hash_hex(&self) -> String {
         hex::encode(self.token_hash())
+    }
+
+    /// Append a narrowing caveat and bind the whole caveat list with the holder's
+    /// possession key (audit-v2 R3). Requires **no issuer key** — offline
+    /// attenuation. The issuer signature and `token_hash()` are untouched (caveats
+    /// are excluded from the signing hash).
+    pub fn attenuate(&self, caveat: Caveat, holder_key: &SigningKey) -> RcxCapabilityToken {
+        let mut token = self.clone();
+        token.caveats.push(caveat);
+        let signature = holder_key
+            .sign(&caveat_binding_message(&token.token_hash(), &token.caveats))
+            .to_bytes();
+        token.caveat_signature = Some(CaveatSignature { sig: signature });
+        token
+    }
+
+    /// Effective expiry after caveats — never later than the base `expires_at` or
+    /// any `ExpiresAtLe` caveat. A caveat can only SHRINK the lifetime.
+    pub fn attenuated_expires_at(&self) -> u64 {
+        self.caveats.iter().fold(self.expires_at, |acc, caveat| match caveat {
+            Caveat::ExpiresAtLe { expires_at } => acc.min(*expires_at),
+            _ => acc,
+        })
+    }
+
+    /// Whether the caveats permit `tenant_id`. Every `TenantIdEq` caveat must name
+    /// exactly this tenant — a caveat can only restrict to one tenant, never add.
+    /// (The caller separately checks the tenant is within the base grant.)
+    pub fn caveats_permit_tenant(&self, tenant_id: &str) -> bool {
+        self.caveats.iter().all(|caveat| match caveat {
+            Caveat::TenantIdEq { tenant_id: allowed } => allowed == tenant_id,
+            _ => true,
+        })
+    }
+
+    /// Whether the caveats permit `capability`. Every `ScopeSubset` caveat must
+    /// include it — a caveat can only remove capabilities, never add. (The caller
+    /// separately checks the capability is in the base grant, so a superset caveat
+    /// cannot widen: effective = base ∩ caveats.)
+    pub fn caveats_permit_capability(&self, capability: &str) -> bool {
+        self.caveats.iter().all(|caveat| match caveat {
+            Caveat::ScopeSubset { scopes } => scopes.iter().any(|s| s == capability),
+            _ => true,
+        })
     }
 
     /// Default clock-skew tolerance (seconds) applied to the `issued_at` and
@@ -796,6 +917,7 @@ pub fn free_local_verified_fixture() -> RcxCapabilityToken {
             push_channel: None,
         },
         caveats: Vec::new(),
+        caveat_signature: None,
         signature: Signature {
             alg: "ed25519".to_string(),
             kid: passport_fpr.to_string(),
@@ -1145,6 +1267,267 @@ mod tests {
             caveat_binding_message(&base_hash, &caveats),
             caveat_binding_message(&base_hash, &caveats),
         );
+    }
+
+    // ── R3 macaroon M2: attenuate + verify (intersection, fail-closed) ────
+
+    const M2_NOW: u64 = 1_776_989_601;
+
+    /// A fixture whose `subject.passport_fpr` is the fingerprint of `holder`, and
+    /// whose base is issuer-signed by `issuer` — the shape `verify_token_attenuated`
+    /// expects (base issuer sig + holder possession of the subject key).
+    fn holder_bound_fixture(issuer: &SigningKey, holder: &SigningKey) -> RcxCapabilityToken {
+        let mut token = free_local_verified_fixture();
+        token.subject.passport_fpr =
+            crux_session::passport::passport_fpr_from_public_key(&holder.verifying_key().to_bytes());
+        token.signature.sig = issuer.sign(&token.token_hash()).to_bytes();
+        token
+    }
+
+    #[test]
+    fn attenuate_then_verify_ok_and_narrows() {
+        let issuer = SigningKey::from_bytes(&[5u8; 32]);
+        let holder = SigningKey::from_bytes(&[7u8; 32]);
+        let base = holder_bound_fixture(&issuer, &holder);
+        let att = base
+            .attenuate(
+                Caveat::TenantIdEq {
+                    tenant_id: "default".to_string(),
+                },
+                &holder,
+            )
+            .attenuate(
+                Caveat::ExpiresAtLe {
+                    expires_at: base.expires_at - 10,
+                },
+                &holder,
+            );
+
+        assert_eq!(
+            verify_token_attenuated(
+                &att,
+                &issuer.verifying_key().to_bytes(),
+                M2_NOW,
+                &holder.verifying_key().to_bytes()
+            ),
+            AttenuatedOutcome::Verified,
+        );
+        assert_eq!(att.attenuated_expires_at(), base.expires_at - 10);
+        assert!(att.caveats_permit_tenant("default"));
+        assert!(!att.caveats_permit_tenant("other"));
+    }
+
+    #[test]
+    fn un_attenuated_token_passes_the_attenuated_path() {
+        let issuer = SigningKey::from_bytes(&[5u8; 32]);
+        let holder = SigningKey::from_bytes(&[7u8; 32]);
+        let base = holder_bound_fixture(&issuer, &holder);
+        assert_eq!(
+            verify_token_attenuated(
+                &base,
+                &issuer.verifying_key().to_bytes(),
+                M2_NOW,
+                &holder.verifying_key().to_bytes()
+            ),
+            AttenuatedOutcome::Verified,
+        );
+    }
+
+    // ── Adversarial: caveats can only narrow ──────────────────────────────
+
+    #[test]
+    fn widen_expiry_caveat_cannot_extend() {
+        let issuer = SigningKey::from_bytes(&[5u8; 32]);
+        let holder = SigningKey::from_bytes(&[7u8; 32]);
+        let base = holder_bound_fixture(&issuer, &holder);
+        let att = base.attenuate(
+            Caveat::ExpiresAtLe {
+                expires_at: base.expires_at + 100_000,
+            },
+            &holder,
+        );
+        assert_eq!(
+            att.attenuated_expires_at(),
+            base.expires_at,
+            "a later expiry caveat cannot extend the lifetime"
+        );
+    }
+
+    #[test]
+    fn scope_subset_removes_and_superset_cannot_widen() {
+        let issuer = SigningKey::from_bytes(&[5u8; 32]);
+        let holder = SigningKey::from_bytes(&[7u8; 32]);
+        let base = holder_bound_fixture(&issuer, &holder);
+        // The fixture grants exactly `corecrux.query.local`.
+        let granted = "corecrux.query.local";
+        // A subset caveat removes everything not listed.
+        let subset = base.attenuate(
+            Caveat::ScopeSubset {
+                scopes: vec!["something.else".to_string()],
+            },
+            &holder,
+        );
+        assert!(
+            !subset.caveats_permit_capability(granted),
+            "scope-subset removes a capability not in the list"
+        );
+        // A superset caveat "permits" an ungranted cap, but the base never granted it,
+        // so the effective set (base ∩ caveats) still cannot include it.
+        let superset = base.attenuate(
+            Caveat::ScopeSubset {
+                scopes: vec![granted.to_string(), "ungranted.extra".to_string()],
+            },
+            &holder,
+        );
+        assert!(
+            superset.caveats_permit_capability("ungranted.extra"),
+            "caveat alone permits it..."
+        );
+        let base_caps: Vec<&str> = superset
+            .backends
+            .iter()
+            .flat_map(|b| b.permitted_capabilities.iter().map(|c| c.capability.as_str()))
+            .collect();
+        assert!(
+            !base_caps.contains(&"ungranted.extra"),
+            "...but the issuer never granted it, so it stays denied"
+        );
+    }
+
+    #[test]
+    fn cross_tenant_caveat_only_restricts() {
+        let issuer = SigningKey::from_bytes(&[5u8; 32]);
+        let holder = SigningKey::from_bytes(&[7u8; 32]);
+        let base = holder_bound_fixture(&issuer, &holder);
+        let att = base.attenuate(
+            Caveat::TenantIdEq {
+                tenant_id: "acme".to_string(),
+            },
+            &holder,
+        );
+        assert!(att.caveats_permit_tenant("acme"));
+        assert!(
+            !att.caveats_permit_tenant("default"),
+            "a tenant caveat restricts to one tenant, never adds another"
+        );
+    }
+
+    // ── Adversarial: the holder binding resists tampering ─────────────────
+
+    #[test]
+    fn edited_caveat_breaks_holder_signature() {
+        let issuer = SigningKey::from_bytes(&[5u8; 32]);
+        let holder = SigningKey::from_bytes(&[7u8; 32]);
+        let mut att = holder_bound_fixture(&issuer, &holder).attenuate(
+            Caveat::TenantIdEq {
+                tenant_id: "default".to_string(),
+            },
+            &holder,
+        );
+        att.caveats[0] = Caveat::TenantIdEq {
+            tenant_id: "attacker".to_string(),
+        };
+        assert_eq!(
+            verify_token_attenuated(
+                &att,
+                &issuer.verifying_key().to_bytes(),
+                M2_NOW,
+                &holder.verifying_key().to_bytes()
+            ),
+            AttenuatedOutcome::BadCaveatSignature,
+        );
+    }
+
+    #[test]
+    fn stripping_a_caveat_breaks_holder_signature() {
+        let issuer = SigningKey::from_bytes(&[5u8; 32]);
+        let holder = SigningKey::from_bytes(&[7u8; 32]);
+        let mut att = holder_bound_fixture(&issuer, &holder)
+            .attenuate(
+                Caveat::TenantIdEq {
+                    tenant_id: "a".to_string(),
+                },
+                &holder,
+            )
+            .attenuate(
+                Caveat::TenantIdEq {
+                    tenant_id: "b".to_string(),
+                },
+                &holder,
+            );
+        att.caveats.pop(); // drop a caveat but keep the 2-caveat signature (un-attenuation attempt)
+        assert_eq!(
+            verify_token_attenuated(
+                &att,
+                &issuer.verifying_key().to_bytes(),
+                M2_NOW,
+                &holder.verifying_key().to_bytes()
+            ),
+            AttenuatedOutcome::BadCaveatSignature,
+        );
+    }
+
+    #[test]
+    fn caveats_without_holder_signature_are_rejected() {
+        let issuer = SigningKey::from_bytes(&[5u8; 32]);
+        let holder = SigningKey::from_bytes(&[7u8; 32]);
+        let mut token = holder_bound_fixture(&issuer, &holder);
+        token.caveats.push(Caveat::TenantIdEq {
+            tenant_id: "sneaky".to_string(),
+        }); // no signature
+        assert_eq!(
+            verify_token_attenuated(
+                &token,
+                &issuer.verifying_key().to_bytes(),
+                M2_NOW,
+                &holder.verifying_key().to_bytes()
+            ),
+            AttenuatedOutcome::MissingCaveatSignature,
+        );
+    }
+
+    #[test]
+    fn wrong_holder_key_is_rejected() {
+        let issuer = SigningKey::from_bytes(&[5u8; 32]);
+        let holder = SigningKey::from_bytes(&[7u8; 32]);
+        let attacker = SigningKey::from_bytes(&[9u8; 32]);
+        let att = holder_bound_fixture(&issuer, &holder).attenuate(
+            Caveat::TenantIdEq {
+                tenant_id: "default".to_string(),
+            },
+            &holder,
+        );
+        assert_eq!(
+            verify_token_attenuated(
+                &att,
+                &issuer.verifying_key().to_bytes(),
+                M2_NOW,
+                &attacker.verifying_key().to_bytes()
+            ),
+            AttenuatedOutcome::HolderMismatch,
+        );
+    }
+
+    #[test]
+    fn bad_issuer_signature_surfaces_as_base_failure() {
+        let issuer = SigningKey::from_bytes(&[5u8; 32]);
+        let wrong_issuer = SigningKey::from_bytes(&[6u8; 32]);
+        let holder = SigningKey::from_bytes(&[7u8; 32]);
+        let att = holder_bound_fixture(&issuer, &holder).attenuate(
+            Caveat::TenantIdEq {
+                tenant_id: "default".to_string(),
+            },
+            &holder,
+        );
+        assert!(matches!(
+            verify_token_attenuated(
+                &att,
+                &wrong_issuer.verifying_key().to_bytes(),
+                M2_NOW,
+                &holder.verifying_key().to_bytes()
+            ),
+            AttenuatedOutcome::Base(_),
+        ));
     }
 
     #[test]
