@@ -273,7 +273,7 @@ fn write_new_passport_seed(path: &Path) -> Result<[u8; 32], SessionError> {
 }
 
 /// Canonical passport fingerprint of an Ed25519 public key: `p_` + hex of the
-/// first [`PASSPORT_FPR_BYTES`] of `blake3(pubkey)`. This is the fingerprint
+/// first 16 bytes (`PASSPORT_FPR_BYTES`) of `blake3(pubkey)`. This is the fingerprint
 /// minters write into `subject.passport_fpr`, so verifiers (e.g. RCX token caveat
 /// attenuation) resolve a holder pubkey to its fingerprint through this one fn.
 pub fn passport_fpr_from_public_key(public_key: &[u8; 32]) -> String {
