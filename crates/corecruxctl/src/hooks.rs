@@ -56,6 +56,15 @@ export CRUX_MCP_URL="${CRUX_MCP_URL:-http://127.0.0.1:14801/mcp}"
 export CRUX_HTTP_URL="${CRUX_HTTP_URL:-http://127.0.0.1:14800}"
 export CORECRUXD_URL="${CRUX_HTTP_URL}"
 export CORECRUXD_AUTH_TOKEN="${CRUX_AGENT_TOKEN:-}"
+# Since the 2026-07-18 daemon redeploy the MCP endpoint accepts only registered
+# agent tokens (crux-mcp authenticate_agent: registry/OAuth, no JWT). The JWT
+# stays in CORECRUXD_AUTH_TOKEN above for the HTTP API (:14800); crux-hook's
+# MCP client reads CRUX_AGENT_TOKEN, so swap it to the registered token.
+mcp_tok="$HOME/.config/cuecrux/crux-tokens/anthropic.mcp-token"
+if [ -f "$mcp_tok" ]; then
+  CRUX_AGENT_TOKEN="$(tr -d ' \r\n' < "$mcp_tok")"
+  export CRUX_AGENT_TOKEN
+fi
 mode="${1:-}"; shift || true
 OBSERVE="$HOME/.local/share/crux/hooks/crux-observe.sh"
 case "$mode" in
@@ -101,6 +110,16 @@ const FILEMOD_SH: &str = include_str!("../../../integrations/claude-code/hooks/c
 /// backstop); the agent calls it directly with `--execplan <slug>` for a
 /// deliberate, fact-emitting handoff. Installed to `~/.local/bin` (on PATH).
 const SCRATCHPAD_SH: &str = include_str!("../../../integrations/claude-code/hooks/crux-scratchpad-persist");
+
+/// The Python SessionStart banner (Channels 2+3 of crux-banner-redesign): the
+/// token-lean agent brief + conditional first-reply card. Registered-token auth
+/// (reads `crux-tokens/anthropic.mcp-token`) so it works post-2026-07-18 daemon
+/// redeploy. Installed to `~/.local/bin/crux-claude-banner` (no `.py` suffix).
+const CLAUDE_BANNER_PY: &str = include_str!("../assets/hooks/crux-claude-banner.py");
+
+/// The Python statusline (Channel 1): a persistent, zero-model-token human
+/// surface rendered from a 60s cache. Installed to `~/.local/bin/crux-statusline`.
+const STATUSLINE_PY: &str = include_str!("../assets/hooks/crux-statusline.py");
 
 /// Resolve the `crux-hook` binary (banner/context/pre-compact). `None` ⇒ install
 /// observe-only and note the banner needs the binary.
@@ -148,22 +167,75 @@ fn write_exec(path: &Path, body: &str) -> Result<(), DynErr> {
     Ok(())
 }
 
-/// Install the helper scripts to `~/.local/share/crux/hooks`. Returns the
-/// launcher path + whether the `crux-hook` binary was found.
-fn install_assets() -> Result<(PathBuf, bool), DynErr> {
+/// Write-on-change: skip if the destination already holds `body` (idempotence);
+/// otherwise back the current contents up to `<path>.bak` before overwriting.
+/// A non-existent (or non-UTF-8) destination is written without a backup.
+fn write_exec_on_change(path: &Path, body: &str) -> Result<(), DynErr> {
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        if existing == body {
+            return Ok(());
+        }
+        std::fs::write(format!("{}.bak", path.display()), existing.as_bytes())?;
+    }
+    write_exec(path, body)
+}
+
+/// Is `python3` findable (PATH or `~/.local/bin`)? Gates the Python banner stack;
+/// absent ⇒ fall back to the legacy wrapper `banner` mode.
+fn python3_present() -> bool {
+    std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join("python3").is_file()))
+        || std::env::var_os("HOME").is_some_and(|h| Path::new(&h).join(".local/bin/python3").is_file())
+}
+
+/// Command substrings that mark a settings.json hook group as Crux-managed. A
+/// group is ours (safe to drop + re-add) if any of its commands contains one of
+/// these; everything else is a foreign/operator hook we must preserve.
+const CRUX_HOOK_MARKERS: &[&str] = &[
+    "crux-hook-env.sh",
+    "crux-claude-banner",
+    "crux-hook ",
+    "crux-filemod.sh",
+    "crux-observe.sh",
+    "crux-scratchpad-persist",
+];
+
+/// True if `group` (a `{matcher, hooks:[…]}` entry) is Crux-managed.
+fn is_crux_managed(group: &serde_json::Value) -> bool {
+    let s = group.to_string();
+    CRUX_HOOK_MARKERS.iter().any(|m| s.contains(m))
+}
+
+/// statusLine outcome for the install summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatuslineOutcome {
+    /// We set our statusLine (the key was absent).
+    Set,
+    /// An existing statusLine was left untouched.
+    KeptExisting,
+}
+
+/// Install the helper scripts to `~/.local/share/crux/hooks` and the banner
+/// stack to `~/.local/bin`. Returns the launcher path, the `~/.local/bin` dir,
+/// and whether the `crux-hook` binary was found. The wrapper + banner-stack
+/// scripts are written on-change (backup-then-write) so a re-run that already
+/// holds the canonical bytes is a true no-op (no spurious `.bak`).
+fn install_assets() -> Result<(PathBuf, PathBuf, bool), DynErr> {
     let dir = hooks_dir()?;
     std::fs::create_dir_all(&dir)?;
     let wrapper = dir.join("crux-hook-env.sh");
-    write_exec(&wrapper, WRAPPER_SH)?;
+    write_exec_on_change(&wrapper, WRAPPER_SH)?;
     write_exec(&dir.join("crux-observe.sh"), OBSERVE_SH)?;
     write_exec(&dir.join("crux-filemod.sh"), FILEMOD_SH)?;
-    // The scratchpad-survival helper goes on PATH (~/.local/bin) so the agent can
-    // call `crux-scratchpad-persist --execplan <slug>` directly, and the SessionEnd
-    // `scratchpad` launcher mode execs it by absolute path.
+    // The scratchpad-survival helper + banner stack go on PATH (~/.local/bin) so
+    // the agent can call `crux-scratchpad-persist --execplan <slug>` directly, the
+    // SessionEnd `scratchpad` launcher mode execs it by absolute path, and the
+    // SessionStart banner / statusLine entries point at the two Python scripts.
     let bin = local_bin_dir()?;
     std::fs::create_dir_all(&bin)?;
     write_exec(&bin.join("crux-scratchpad-persist"), SCRATCHPAD_SH)?;
-    Ok((wrapper, locate_crux_hook().is_some()))
+    write_exec_on_change(&bin.join("crux-claude-banner"), CLAUDE_BANNER_PY)?;
+    write_exec_on_change(&bin.join("crux-statusline"), STATUSLINE_PY)?;
+    Ok((wrapper, bin, locate_crux_hook().is_some()))
 }
 
 /// Resolve the target `settings.json`: user (`~/.claude/settings.json`) or a
@@ -198,14 +270,26 @@ fn event_matched(matcher: &str, hooks: Vec<serde_json::Value>) -> serde_json::Va
 /// own `case "$TOOL"` allowlist).
 const FILEMOD_MATCHER: &str = "Edit|Write|MultiEdit|NotebookEdit";
 
-/// Build the `hooks` block. Observe runs on all five lifecycle events; the
-/// banner/context/pre-compact entries are added only when `crux-hook` exists.
-fn build_hooks_block(wrapper: &Path, have_binary: bool) -> serde_json::Value {
+/// Build the `hooks` block. Observe runs on all five lifecycle events. The
+/// SessionStart banner prefers the Python banner stack (`crux-claude-banner`,
+/// gated on `python3`); absent python3, it falls back to the legacy wrapper
+/// `banner` mode (gated on the `crux-hook` binary). context-monitor + pre-compact
+/// remain `crux-hook` features.
+fn build_hooks_block(wrapper: &Path, local_bin: &Path, have_binary: bool, have_python: bool) -> serde_json::Value {
     let mut session_start = vec![cmd(wrapper, "observe session_start")];
     let mut post_tool = vec![cmd(wrapper, "observe tool_use")];
     let mut map = serde_json::Map::new();
-    if have_binary {
+    // Banner first in SessionStart so its brief/card lands before observe.
+    if have_python {
+        let banner = local_bin.join("crux-claude-banner");
+        session_start.insert(
+            0,
+            serde_json::json!({ "type": "command", "command": banner.display().to_string(), "timeout": 10 }),
+        );
+    } else if have_binary {
         session_start.insert(0, cmd(wrapper, "banner"));
+    }
+    if have_binary {
         post_tool.push(cmd(wrapper, "context"));
         map.insert("PreCompact".to_string(), event(vec![cmd(wrapper, "precompact")]));
     }
@@ -250,40 +334,96 @@ fn build_hooks_block(wrapper: &Path, have_binary: bool) -> serde_json::Value {
     serde_json::Value::Object(map)
 }
 
-/// Merge the Crux hooks block into `path`, preserving other keys. Backs up the
-/// existing file to `<path>.bak`.
-fn merge_into_settings(path: &Path, hooks: serde_json::Value) -> Result<(), DynErr> {
+/// Merge the Crux hooks block into `path`, converging (not clobbering) the
+/// operator's config:
+///
+/// - **Per-event, not wholesale.** For each event WE manage, drop the existing
+///   Crux-managed groups (old + our own prior run) and prepend our fresh groups,
+///   preserving every foreign group in its original relative order. Events we
+///   don't manage are left untouched — the old `root["hooks"] = block` dropped
+///   them, silently regressing operator hooks.
+/// - **statusLine only-if-absent.** We never overwrite an existing statusLine.
+/// - **Write-on-change.** If the composed file equals what's on disk, skip the
+///   write entirely (no `.bak`, idempotent); otherwise back up then write.
+fn merge_into_settings(
+    path: &Path,
+    hooks: serde_json::Value,
+    statusline_cmd: &str,
+) -> Result<StatuslineOutcome, DynErr> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut root: serde_json::Value = match std::fs::read_to_string(path) {
-        Ok(s) if !s.trim().is_empty() => {
-            std::fs::write(format!("{}.bak", path.display()), &s)?;
-            serde_json::from_str(&s)?
-        }
-        _ => serde_json::json!({}),
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let mut root: serde_json::Value = if existing.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str(&existing)?
     };
     if !root.is_object() {
         return Err(format!("{} is not a JSON object", path.display()).into());
     }
-    root["hooks"] = hooks;
-    std::fs::write(path, serde_json::to_string_pretty(&root)? + "\n")?;
-    Ok(())
+
+    // Ensure `hooks` is an object we can merge into (existing non-object → reset).
+    if !root.get("hooks").is_some_and(|h| h.is_object()) {
+        root["hooks"] = serde_json::json!({});
+    }
+    let our = hooks
+        .as_object()
+        .ok_or("internal: built hooks block is not a JSON object")?;
+    for (event, our_groups) in our {
+        let our_arr = our_groups.as_array().cloned().unwrap_or_default();
+        let existing_arr = root["hooks"]
+            .get(event)
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let foreign = existing_arr.into_iter().filter(|g| !is_crux_managed(g));
+        let mut merged = our_arr;
+        merged.extend(foreign);
+        root["hooks"][event] = serde_json::Value::Array(merged);
+    }
+
+    // statusLine: set only when the key is absent; never overwrite an operator's.
+    let sl_outcome = if root.get("statusLine").is_some() {
+        StatuslineOutcome::KeptExisting
+    } else {
+        root["statusLine"] = serde_json::json!({ "type": "command", "command": statusline_cmd });
+        StatuslineOutcome::Set
+    };
+
+    let new_text = serde_json::to_string_pretty(&root)? + "\n";
+    if new_text != existing {
+        if !existing.trim().is_empty() {
+            std::fs::write(format!("{}.bak", path.display()), existing.as_bytes())?;
+        }
+        std::fs::write(path, &new_text)?;
+    }
+    Ok(sl_outcome)
 }
 
 /// Core install used by both the `hooks install` subcommand and `login`.
 /// Returns a human-readable summary.
 pub fn install(user: bool, project: Option<PathBuf>) -> Result<String, DynErr> {
-    let (wrapper, have_binary) = install_assets()?;
+    let (wrapper, local_bin, have_binary) = install_assets()?;
+    let have_python = python3_present();
     let target = settings_path(user, project)?;
-    let hooks = build_hooks_block(&wrapper, have_binary);
-    merge_into_settings(&target, hooks)?;
+    let hooks = build_hooks_block(&wrapper, &local_bin, have_binary, have_python);
+    let statusline_cmd = local_bin.join("crux-statusline").display().to_string();
+    let sl = merge_into_settings(&target, hooks, &statusline_cmd)?;
 
     let mut summary = format!("hooks installed → {}", target.display());
-    summary.push_str(if have_binary {
-        " (banner + observe)"
+    if have_python {
+        summary.push_str(" (banner: crux-claude-banner + observe)");
+    } else if have_binary {
+        summary.push_str(
+            " (banner: legacy crux-hook — python3 not found on PATH/~/.local/bin, banner-stack skipped; + observe)",
+        );
     } else {
-        " (observe only — `crux-hook` binary not found on PATH/~/.local/bin; banner skipped)"
+        summary.push_str(" (observe only — no python3 and no `crux-hook` binary; banner skipped)");
+    }
+    summary.push_str(match sl {
+        StatuslineOutcome::Set => "\n  statusLine → crux-statusline (key was absent)",
+        StatuslineOutcome::KeptExisting => "\n  statusLine left as-is (existing entry preserved)",
     });
     if !jq_present() {
         summary.push_str("\n  note: `jq` not found — the observe hooks need it (install jq, e.g. to ~/.local/bin)");
@@ -368,7 +508,7 @@ pub fn run_status(user: bool, project: Option<PathBuf>) -> Result<(), DynErr> {
     match hooks {
         Some(map) if !map.is_empty() => {
             for (event, _) in map {
-                let crux = root["hooks"][event].to_string().contains("crux-hook-env.sh");
+                let crux = is_crux_managed(&root["hooks"][event]);
                 println!("  {event:<16} {}", if crux { "crux ✓" } else { "(other)" });
             }
         }
@@ -394,10 +534,14 @@ pub fn run_status(user: bool, project: Option<PathBuf>) -> Result<(), DynErr> {
 mod tests {
     use super::*;
 
+    const LB: &str = "/x/.local/bin";
+
     #[test]
     fn hooks_block_observe_only_when_no_binary() {
         let w = Path::new("/x/crux-hook-env.sh");
-        let h = build_hooks_block(w, false);
+        let lb = Path::new(LB);
+        // No python3, no crux-hook binary → observe-only, no banner at all.
+        let h = build_hooks_block(w, lb, false, false);
         let map = h.as_object().unwrap();
         for ev in ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd"] {
             assert!(map.contains_key(ev), "missing {ev}");
@@ -414,7 +558,7 @@ mod tests {
     #[test]
     fn session_end_wires_observe_then_cost() {
         let w = Path::new("/x/crux-hook-env.sh");
-        let h = build_hooks_block(w, true);
+        let h = build_hooks_block(w, Path::new(LB), true, true);
         let hooks = h["SessionEnd"][0]["hooks"].as_array().unwrap();
         let cmds: Vec<String> = hooks
             .iter()
@@ -439,7 +583,7 @@ mod tests {
         // Wiring is present regardless of the crux-hook binary (filemod is
         // independent of it, like the cost leg).
         for have_binary in [false, true] {
-            let h = build_hooks_block(w, have_binary);
+            let h = build_hooks_block(w, Path::new(LB), have_binary, true);
             let map = h.as_object().unwrap();
 
             // PreToolUse: a single matcher group scoped to the edit tools, running
@@ -477,14 +621,37 @@ mod tests {
     }
 
     #[test]
-    fn hooks_block_adds_banner_when_binary_present() {
+    fn hooks_block_adds_context_and_precompact_when_binary_present() {
+        // have_binary=true, no python3 → legacy wrapper banner + context/precompact.
         let w = Path::new("/x/crux-hook-env.sh");
-        let h = build_hooks_block(w, true);
+        let h = build_hooks_block(w, Path::new(LB), true, false);
         assert!(h.as_object().unwrap().contains_key("PreCompact"));
         let s = h.to_string();
-        assert!(s.contains("banner"));
+        assert!(s.contains("banner")); // legacy `crux-hook-env.sh banner`
+        assert!(!s.contains("crux-claude-banner"), "no python banner without python3");
         assert!(s.contains("precompact"));
         assert!(s.contains("context"));
+    }
+
+    #[test]
+    fn session_start_prefers_python_banner_first() {
+        // python3 present → SessionStart leads with crux-claude-banner (timeout 10),
+        // then observe. Independent of the crux-hook binary.
+        let w = Path::new("/x/crux-hook-env.sh");
+        let h = build_hooks_block(w, Path::new(LB), false, true);
+        let hooks = h["SessionStart"][0]["hooks"].as_array().unwrap();
+        assert!(
+            hooks[0]["command"].as_str().unwrap().ends_with("/crux-claude-banner"),
+            "banner must be first: {hooks:?}"
+        );
+        assert_eq!(hooks[0]["timeout"], 10);
+        assert!(hooks[1]["command"].as_str().unwrap().ends_with("observe session_start"));
+        // The legacy wrapper `banner` mode must NOT be wired when python3 is present.
+        assert!(!h.to_string().contains("crux-hook-env.sh banner"));
+    }
+
+    fn block(w: &Path) -> serde_json::Value {
+        build_hooks_block(w, Path::new(LB), true, true)
     }
 
     #[test]
@@ -493,16 +660,198 @@ mod tests {
         let path = dir.path().join("settings.json");
         std::fs::write(&path, r#"{"permissions":{"allow":["x"]}}"#).unwrap();
         let w = Path::new("/x/crux-hook-env.sh");
+        let sl = "/x/.local/bin/crux-statusline";
 
-        merge_into_settings(&path, build_hooks_block(w, true)).unwrap();
+        let bak = path.with_file_name("settings.json.bak");
+        let o1 = merge_into_settings(&path, block(w), sl).unwrap();
+        assert_eq!(o1, StatuslineOutcome::Set, "first run sets the absent statusLine");
         let after1 = std::fs::read_to_string(&path).unwrap();
-        merge_into_settings(&path, build_hooks_block(w, true)).unwrap();
+        // Run 1 converged a non-empty file, so it legitimately backed the original up.
+        let bak1 = std::fs::read_to_string(&bak).unwrap();
+        let o2 = merge_into_settings(&path, block(w), sl).unwrap();
+        assert_eq!(o2, StatuslineOutcome::KeptExisting, "second run keeps our statusLine");
         let after2 = std::fs::read_to_string(&path).unwrap();
 
         assert_eq!(after1, after2, "merge must be idempotent");
+        // The no-op re-run must not touch the backup (write-on-change skipped the write).
+        assert_eq!(
+            bak1,
+            std::fs::read_to_string(&bak).unwrap(),
+            ".bak untouched on no-op re-run"
+        );
         let v: serde_json::Value = serde_json::from_str(&after2).unwrap();
         assert_eq!(v["permissions"]["allow"][0], "x", "preserves existing keys");
         assert!(v["hooks"]["SessionStart"].is_array());
+        assert_eq!(v["statusLine"]["command"], sl);
+    }
+
+    #[test]
+    fn merge_preserves_foreign_hooks_and_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // A foreign SessionStart group, a foreign PostToolUse group, and an event
+        // we don't manage at all (Notification).
+        std::fs::write(
+            &path,
+            r#"{
+              "hooks": {
+                "SessionStart": [{"matcher":".*","hooks":[{"type":"command","command":"/opt/foo/my-start.sh"}]}],
+                "PostToolUse":  [{"matcher":".*","hooks":[{"type":"command","command":"/opt/foo/my-post.sh"}]}],
+                "Notification": [{"matcher":".*","hooks":[{"type":"command","command":"/opt/foo/notify.sh"}]}]
+              }
+            }"#,
+        )
+        .unwrap();
+        let w = Path::new("/x/crux-hook-env.sh");
+        merge_into_settings(&path, block(w), "/x/.local/bin/crux-statusline").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let flat = v["hooks"].to_string();
+
+        // Foreign entries survive.
+        assert!(flat.contains("/opt/foo/my-start.sh"), "foreign SessionStart preserved");
+        assert!(flat.contains("/opt/foo/my-post.sh"), "foreign PostToolUse preserved");
+        // The unmanaged event is untouched.
+        assert!(
+            flat.contains("/opt/foo/notify.sh"),
+            "unmanaged Notification event preserved"
+        );
+        // Our banner is present and leads SessionStart.
+        let ss = v["hooks"]["SessionStart"].as_array().unwrap();
+        assert!(ss[0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with("/crux-claude-banner"));
+    }
+
+    #[test]
+    fn merge_converges_from_old_crux_wiring() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // The OLD wiring: SessionStart wholesale-managed group with the wrapper
+        // `banner` mode + observe, plus a foreign group the operator added.
+        std::fs::write(
+            &path,
+            r#"{
+              "hooks": {
+                "SessionStart": [
+                  {"matcher":".*","hooks":[
+                    {"type":"command","command":"/home/me/.local/share/crux/hooks/crux-hook-env.sh banner"},
+                    {"type":"command","command":"/home/me/.local/share/crux/hooks/crux-hook-env.sh observe session_start"}
+                  ]},
+                  {"matcher":".*","hooks":[{"type":"command","command":"/opt/foo/my-start.sh"}]}
+                ]
+              }
+            }"#,
+        )
+        .unwrap();
+        let w = Path::new("/x/crux-hook-env.sh");
+        merge_into_settings(&path, block(w), "/x/.local/bin/crux-statusline").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let ss = v["hooks"]["SessionStart"].as_array().unwrap();
+
+        // Banner-first, and the stale `crux-hook-env.sh banner` group is gone.
+        assert!(ss[0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with("/crux-claude-banner"));
+        let flat = v["hooks"]["SessionStart"].to_string();
+        assert!(
+            !flat.contains("crux-hook-env.sh banner"),
+            "old wrapper banner entry removed: {flat}"
+        );
+        // Foreign group intact.
+        assert!(flat.contains("/opt/foo/my-start.sh"), "foreign group preserved");
+    }
+
+    #[test]
+    fn statusline_only_set_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = Path::new("/x/crux-hook-env.sh");
+
+        // Absent → we set ours.
+        let a = dir.path().join("a.json");
+        std::fs::write(&a, "{}").unwrap();
+        let out = merge_into_settings(&a, block(w), "/x/.local/bin/crux-statusline").unwrap();
+        assert_eq!(out, StatuslineOutcome::Set);
+        let va: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&a).unwrap()).unwrap();
+        assert_eq!(va["statusLine"]["command"], "/x/.local/bin/crux-statusline");
+
+        // Present → left untouched.
+        let b = dir.path().join("b.json");
+        std::fs::write(
+            &b,
+            r#"{"statusLine":{"type":"command","command":"/my/own/statusline"}}"#,
+        )
+        .unwrap();
+        let out = merge_into_settings(&b, block(w), "/x/.local/bin/crux-statusline").unwrap();
+        assert_eq!(out, StatuslineOutcome::KeptExisting);
+        let vb: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&b).unwrap()).unwrap();
+        assert_eq!(
+            vb["statusLine"]["command"], "/my/own/statusline",
+            "existing statusLine untouched"
+        );
+    }
+
+    #[test]
+    fn wrapper_template_carries_mcp_token_swap() {
+        // The MCP registered-token swap (post-2026-07-18) must ship in the template.
+        assert!(
+            WRAPPER_SH.contains("anthropic.mcp-token"),
+            "wrapper must swap CRUX_AGENT_TOKEN"
+        );
+        assert!(WRAPPER_SH.contains("CRUX_AGENT_TOKEN=\"$(tr -d"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn install_is_idempotent_no_new_bak() {
+        let home = tmp();
+        std::env::set_var("HOME", &home);
+        // A PATH with a fake python3 so the banner-stack (crux-claude-banner) path
+        // is exercised deterministically; no crux-hook binary → observe-only extras.
+        let fakebin = home.join("fakebin");
+        std::fs::create_dir_all(&fakebin).unwrap();
+        std::fs::write(fakebin.join("python3"), "#!/bin/sh\n").unwrap();
+        std::env::set_var("PATH", &fakebin);
+
+        install(true, None).unwrap();
+        let settings = home.join(".claude/settings.json");
+        let s1 = std::fs::read_to_string(&settings).unwrap();
+        let banner1 = std::fs::read_to_string(home.join(".local/bin/crux-claude-banner")).unwrap();
+        let sl1 = std::fs::read_to_string(home.join(".local/bin/crux-statusline")).unwrap();
+
+        install(true, None).unwrap();
+        let s2 = std::fs::read_to_string(&settings).unwrap();
+        let banner2 = std::fs::read_to_string(home.join(".local/bin/crux-claude-banner")).unwrap();
+        let sl2 = std::fs::read_to_string(home.join(".local/bin/crux-statusline")).unwrap();
+
+        assert_eq!(s1, s2, "settings must be byte-identical across installs");
+        assert_eq!(banner1, banner2, "banner asset stable");
+        assert_eq!(sl1, sl2, "statusline asset stable");
+        // No `.bak` files anywhere the write-on-change helper touches.
+        assert!(!home.join(".claude/settings.json.bak").exists(), "no settings .bak");
+        assert!(
+            !home.join(".local/bin/crux-claude-banner.bak").exists(),
+            "no banner .bak"
+        );
+        assert!(
+            !home.join(".local/bin/crux-statusline.bak").exists(),
+            "no statusline .bak"
+        );
+        assert!(
+            !home.join(".local/share/crux/hooks/crux-hook-env.sh.bak").exists(),
+            "no wrapper .bak"
+        );
+        // The banner is wired first in SessionStart, statusLine set.
+        let v: serde_json::Value = serde_json::from_str(&s2).unwrap();
+        assert!(v["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with("/crux-claude-banner"));
+        assert!(v["statusLine"]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with("/crux-statusline"));
     }
 
     fn tmp() -> PathBuf {
@@ -593,12 +942,13 @@ mod tests {
         run_install(true, None, None).unwrap();
         run_status(true, None).unwrap();
 
-        // Now add the binary → banner + PreCompact appear.
+        // Now add the crux-hook binary. PATH is still "" (no python3), so the
+        // banner falls back to the legacy wrapper mode; PreCompact/context appear.
         let bin = home.join(".local/bin");
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::write(bin.join("crux-hook"), "#!/bin/sh\n").unwrap();
         let summary = install(true, None).unwrap();
-        assert!(summary.contains("banner + observe"));
+        assert!(summary.contains("legacy crux-hook"), "legacy fallback noted: {summary}");
         let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert!(v["hooks"].as_object().unwrap().contains_key("PreCompact"));
     }
