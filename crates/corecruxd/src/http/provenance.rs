@@ -18,10 +18,10 @@
 //! chain per request. We never persist, log, or echo key material or asset
 //! bytes. Hosted key custody is a later milestone gated on the M11 trust test.
 //!
-//! **Metering.** Op codes + rates are defined here behind a
-//! [`ProvenanceMeter`] trait with a no-op default; rates are NOT public
-//! pending OD-38 ratification. Wiring the no-op to the real `credit_meter`
-//! reserve/spend rail is the follow-up (see `TODO(OD-38)`).
+//! **Metering.** Op codes + OD-38-ratified rates are defined here behind a
+//! [`ProvenanceMeter`] trait with a no-op default; rates stay unpublished
+//! until the wedge passes its skeleton gate. Wiring the no-op to the real
+//! `credit_meter` reserve/spend rail remains a follow-up.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -39,12 +39,16 @@ use corecrux_receipts::{
     ByokP256Signer, C2paManifestInputV1,
 };
 
-use super::{problem_response, require_http_any_scope, AppState, HeaderMap, State, StatusCode};
+use super::{problem_response, require_http_any_scope_for_tenant, AppState, HeaderMap, State, StatusCode};
 
 // ── Feature flag ───────────────────────────────────────────────────────────
 
 /// Env flag gating the whole surface. Default OFF.
 const FEATURE_ENV: &str = "CORECRUXD_FEATURE_PROVENANCE_API";
+/// Required operator assertion when the daemon listener is non-loopback. The
+/// daemon does not terminate TLS itself, so a public BYOK surface must sit
+/// behind an authenticated TLS proxy before request bodies can be accepted.
+const TLS_TERMINATED_ENV: &str = "CORECRUXD_PROVENANCE_TLS_TERMINATED";
 
 /// The M9 skeleton reads the flag from the environment directly rather than
 /// threading a bool through `AppState`/`Config`: both structs have dozens of
@@ -53,10 +57,50 @@ const FEATURE_ENV: &str = "CORECRUXD_FEATURE_PROVENANCE_API";
 /// this change purely additive. Fold into `Config` at M9-full once the
 /// surrounding structs settle.
 pub(super) fn provenance_api_enabled() -> bool {
+    env_truthy(FEATURE_ENV)
+}
+
+fn env_truthy(name: &str) -> bool {
     matches!(
-        std::env::var(FEATURE_ENV).ok().as_deref(),
+        std::env::var(name).ok().as_deref(),
         Some("1") | Some("true") | Some("TRUE") | Some("on")
     )
+}
+
+fn transport_posture_allowed(auth_mode: crate::auth::AuthMode, http_bind_loopback: bool, tls_terminated: bool) -> bool {
+    if auth_mode == crate::auth::AuthMode::Off {
+        return false;
+    }
+    if http_bind_loopback {
+        return true;
+    }
+    matches!(
+        auth_mode,
+        crate::auth::AuthMode::JwtHs256 | crate::auth::AuthMode::JwtJwks
+    ) && tls_terminated
+}
+
+/// Router-level posture gate. This runs before routes are mounted, so an
+/// unsafe flag/auth/transport combination cannot deserialize a BYOK private
+/// key body and then reject it later in the handler.
+pub(super) fn provenance_routes_enabled(state: &AppState) -> bool {
+    if !provenance_api_enabled() {
+        return false;
+    }
+    let allowed = transport_posture_allowed(
+        state.auth.mode(),
+        state.http_bind_loopback,
+        env_truthy(TLS_TERMINATED_ENV),
+    );
+    if !allowed {
+        tracing::error!(
+            auth_mode = state.auth.mode().as_str(),
+            http_bind_loopback = state.http_bind_loopback,
+            tls_terminated_asserted = env_truthy(TLS_TERMINATED_ENV),
+            "provenance API flag is on but routes are not mounted: require non-off auth and either loopback binding or JWT plus TLS termination"
+        );
+    }
+    allowed
 }
 
 // ── Hardening knobs ────────────────────────────────────────────────────────
@@ -83,45 +127,97 @@ fn content_type_allowed(ct: &str) -> bool {
             .any(|f| base.starts_with(f) && base.len() > f.len())
 }
 
-/// Naive per-key fixed-window rate limiter.
-///
-// ponytail: global-lock fixed-window counter; swap for the shared
-// `crux_router::quota::QuotaLedger` (already in `AppState`) if throughput or
-// fairness matters. Adequate for a BYOK beta gate.
+/// Per-credential fixed-window rate limiter. The credential itself is hashed
+/// before it becomes a key, and the table has a hard cardinality bound so
+/// attacker-controlled tenant/token churn cannot grow process memory without
+/// limit. A later hosted pass can add a trusted-proxy-aware client-IP bucket.
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 const RATE_MAX_PER_WINDOW: u32 = 120;
+const RATE_MAX_KEYS: usize = 10_000;
 
-fn rate_limiter() -> &'static Mutex<HashMap<String, (Instant, u32)>> {
-    static LIMITER: OnceLock<Mutex<HashMap<String, (Instant, u32)>>> = OnceLock::new();
-    LIMITER.get_or_init(|| Mutex::new(HashMap::new()))
+struct FixedWindowRateLimiter {
+    entries: HashMap<String, (Instant, u32)>,
+    window: Duration,
+    max_per_window: u32,
+    max_keys: usize,
+    last_sweep: Option<Instant>,
+}
+
+impl FixedWindowRateLimiter {
+    fn new(window: Duration, max_per_window: u32, max_keys: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            window,
+            max_per_window,
+            max_keys,
+            last_sweep: None,
+        }
+    }
+
+    fn allow(&mut self, key: &str, now: Instant) -> bool {
+        if let Some((started, count)) = self.entries.get_mut(key) {
+            if now
+                .checked_duration_since(*started)
+                .is_some_and(|age| age > self.window)
+            {
+                *started = now;
+                *count = 1;
+                return true;
+            }
+            if *count >= self.max_per_window {
+                return false;
+            }
+            *count += 1;
+            return true;
+        }
+
+        let sweep_due = self.entries.len() >= self.max_keys
+            || self
+                .last_sweep
+                .is_none_or(|last| now.checked_duration_since(last).is_some_and(|age| age > self.window));
+        if sweep_due {
+            self.entries.retain(|_, (started, _)| {
+                now.checked_duration_since(*started)
+                    .is_none_or(|age| age <= self.window)
+            });
+            self.last_sweep = Some(now);
+        }
+        if self.entries.len() >= self.max_keys {
+            return false;
+        }
+        self.entries.insert(key.to_string(), (now, 1));
+        true
+    }
+}
+
+fn rate_limiter() -> &'static Mutex<FixedWindowRateLimiter> {
+    static LIMITER: OnceLock<Mutex<FixedWindowRateLimiter>> = OnceLock::new();
+    LIMITER.get_or_init(|| {
+        Mutex::new(FixedWindowRateLimiter::new(
+            RATE_WINDOW,
+            RATE_MAX_PER_WINDOW,
+            RATE_MAX_KEYS,
+        ))
+    })
 }
 
 /// Returns `true` if the call is within budget for `key`, `false` if the
 /// per-key window is exhausted.
 fn rate_limit_ok(key: &str) -> bool {
-    let now = Instant::now();
-    let mut map = match rate_limiter().lock() {
+    let mut limiter = match rate_limiter().lock() {
         Ok(g) => g,
         // A poisoned limiter must fail closed on the counter, not panic.
         Err(_) => return false,
     };
-    let entry = map.entry(key.to_string()).or_insert((now, 0));
-    if now.duration_since(entry.0) > RATE_WINDOW {
-        *entry = (now, 0);
-    }
-    if entry.1 >= RATE_MAX_PER_WINDOW {
-        return false;
-    }
-    entry.1 += 1;
-    true
+    limiter.allow(key, Instant::now())
 }
 
-// ── Metering (OD-38 pending; rates NOT public) ─────────────────────────────
+// ── Metering (OD-38 ratified; rates not yet published) ────────────────────
 
 /// Metered provenance operations. Rates are in **milli-credits** (1000 =
 /// 1 Cr) to represent the sub-credit verify rate faithfully.
 ///
-/// Rates (NOT public — pending OD-38 ratification, no pricing-page use):
+/// Ratified rates (NOT public until the wedge exits skeleton):
 /// sign 20 Cr · verify 0.25 Cr · verify-record 1 Cr.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ProvenanceOp {
@@ -139,7 +235,7 @@ impl ProvenanceOp {
         }
     }
 
-    /// Milli-credits (1000 = 1 Cr). NOT a public price (OD-38).
+    /// Milli-credits (1000 = 1 Cr). Not yet a public price.
     pub(super) fn milli_credits(self) -> u64 {
         match self {
             ProvenanceOp::Sign => 20_000,
@@ -158,10 +254,10 @@ pub(super) trait ProvenanceMeter: Send + Sync {
 
 /// Default meter: records the op (structured log), charges nothing.
 ///
-/// TODO(OD-38): replace with a `credit_meter`-backed impl that reserves +
-/// spends `op.milli_credits()` against `state.credit_meter` for `tenant`
-/// (rounding sub-credit ops per the ratified rounding rule), once OD-38 sets
-/// the public rates. The trait boundary means the handlers do not change.
+/// TODO(M9-metering): replace with a `credit_meter`-backed impl that reserves
+/// before work and settles/voids after the result. The existing meter is
+/// whole-credit-denominated, while `verify` is ratified at 0.25 Cr; the
+/// fractional denomination must be made explicit rather than silently rounded.
 pub(super) struct NoopMeter;
 
 impl ProvenanceMeter for NoopMeter {
@@ -172,7 +268,7 @@ impl ProvenanceMeter for NoopMeter {
             milli_credits = op.milli_credits(),
             tenant = tenant,
             pricing_public = false,
-            "provenance op metered (OD-38 pending — rate not public, no charge in skeleton)"
+            "provenance op observed (ratified rate not public; no charge in skeleton)"
         );
     }
 }
@@ -219,13 +315,29 @@ pub(super) struct ManifestParams {
     pub model: Option<String>,
 }
 
+/// Parsed secret text whose owned allocation is zeroized on drop. Axum/serde's
+/// transient request buffer remains framework-owned, which is why route
+/// mounting separately requires loopback or an asserted TLS-terminating proxy.
+#[derive(Deserialize)]
+#[serde(transparent)]
+pub(super) struct SecretPem(zeroize::Zeroizing<String>);
+
+impl SecretPem {
+    fn expose(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+#[cfg(test)]
+impl From<String> for SecretPem {
+    fn from(value: String) -> Self {
+        Self(zeroize::Zeroizing::new(value))
+    }
+}
+
 // NB: deliberately NOT `Debug`/`Serialize` — this struct holds the caller's
 // private key PEM, and a derived Debug/echo is the classic way key material
-// leaks into a log line or error body.
-// TODO(flag-enable, key-hardening): deserialize `signing_key_pem` into a
-// zeroizing secret wrapper and require loopback or authenticated-TLS
-// termination (startup validation) before the flag may enable, so the raw PEM
-// never rests un-wiped in the Axum JSON buffer. See PR body §remaining.
+// leaks into a log line or error body. The parsed field zeroizes on drop.
 #[derive(Deserialize)]
 pub(super) struct SignRequest {
     /// Base64 asset bytes to attest.
@@ -233,7 +345,7 @@ pub(super) struct SignRequest {
     /// Asset MIME type (validated against the allowlist).
     pub content_type: Option<String>,
     /// BYOK P-256 private key PEM (PKCS#8 or SEC1). Never stored or echoed.
-    pub signing_key_pem: String,
+    pub signing_key_pem: SecretPem,
     /// BYOK cert chain PEM (leaf first, then intermediates).
     pub cert_chain_pem: String,
     #[serde(default)]
@@ -342,7 +454,7 @@ fn do_sign(meter: &dyn ProvenanceMeter, tenant: &str, req: &SignRequest) -> Resu
     let content = decode_b64("content_b64", &req.content_b64)?;
 
     let signer = ByokP256Signer::from_pem(
-        &req.signing_key_pem,
+        req.signing_key_pem.expose(),
         &req.cert_chain_pem,
         req.key_id.clone().unwrap_or_else(|| "byok-leaf".to_string()),
     )
@@ -598,16 +710,48 @@ fn append_record(data_dir: &Path, line: &serde_json::Value) -> std::io::Result<(
     Ok(())
 }
 
-// ── Axum handlers (flag → auth → rate-limit → inner) ───────────────────────
+// ── Axum handlers (flag → transport → auth/tenant → rate-limit → inner) ───
 
-fn tenant_from(headers: &HeaderMap, body_tenant: Option<&str>) -> String {
-    headers
-        .get("x-corecrux-tenant-id")
-        .and_then(|v| v.to_str().ok())
+fn requested_tenant(headers: &HeaderMap, body_tenant: Option<&str>) -> Result<String, ProvErr> {
+    let header_tenant = match headers.get("x-corecrux-tenant-id") {
+        Some(value) => Some(
+            value
+                .to_str()
+                .map_err(|_| ProvErr::new(StatusCode::BAD_REQUEST, "x-corecrux-tenant-id is not valid text"))?
+                .trim(),
+        )
+        .filter(|value| !value.is_empty()),
+        None => None,
+    };
+    let body_tenant = body_tenant.map(str::trim).filter(|value| !value.is_empty());
+
+    if let (Some(header), Some(body)) = (header_tenant, body_tenant) {
+        if header != body {
+            return Err(ProvErr::new(
+                StatusCode::BAD_REQUEST,
+                "tenant_id does not match x-corecrux-tenant-id",
+            ));
+        }
+    }
+
+    header_tenant
+        .or(body_tenant)
         .map(str::to_string)
-        .or_else(|| body_tenant.map(str::to_string))
-        .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| "byok-anonymous".to_string())
+        .ok_or_else(|| ProvErr::new(StatusCode::BAD_REQUEST, "tenant_id or x-corecrux-tenant-id is required"))
+}
+
+fn credential_rate_key(headers: &HeaderMap, tenant: &str) -> String {
+    let credential = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| {
+            headers
+                .get("x-corecrux-passport-id")
+                .and_then(|value| value.to_str().ok())
+        })
+        .unwrap_or("authenticated-no-credential-id");
+    let credential_hash = blake3::hash(credential.as_bytes()).to_hex();
+    format!("{tenant}:{credential_hash}")
 }
 
 fn not_enabled() -> Response {
@@ -621,40 +765,36 @@ fn not_enabled() -> Response {
 /// with the `route_auth::classify_route` contract for `/v1/provenance`.
 const PROVENANCE_SCOPES: &[&str] = &["provenance:write", "admin:write"];
 
-/// Common pre-handler gate: flag → refuse spoofable auth → scope → rate limit.
-/// Returns `Some(response)` to short-circuit, `None` to proceed. (`Option`
-/// rather than `Result<(), Response>` — the axum `Response` error variant is
-/// large enough to trip `clippy::result_large_err`.)
-///
-/// The global `route_auth` middleware also enforces the classify_route
-/// contract before body extraction in `enforce` mode; this in-handler guard is
-/// defence-in-depth (and the sole gate when route_auth is not in enforce mode).
-// TODO(flag-enable, #7): resolve `tenant` from authenticated token claims
-// (require_http_any_scope_for_tenant) rather than trusting the header/body,
-// and key the rate limiter on the authenticated subject + client IP with a
-// bounded/evicting map — the current global map trusts a caller-controlled
-// string and never evicts.
-fn guard(state: &AppState, headers: &HeaderMap, tenant: &str) -> Option<Response> {
+/// Common pre-handler gate. The selected tenant is accepted only when the
+/// verified token's `tenant_id`/`tenants` claim authorizes it (admin scope is
+/// the explicit bypass). The returned tenant is therefore safe to use for
+/// persistence and metering; the body/header value alone never grants access.
+#[allow(clippy::result_large_err)]
+fn guard(state: &AppState, headers: &HeaderMap, body_tenant: Option<&str>) -> Result<String, Response> {
     if !provenance_api_enabled() {
-        return Some(not_enabled());
+        return Err(not_enabled());
     }
-    // A metered, key-custody-adjacent surface must not run without real auth.
-    if state.auth.mode() == crate::auth::AuthMode::Off {
-        return Some(problem_response(
+    if !transport_posture_allowed(
+        state.auth.mode(),
+        state.http_bind_loopback,
+        env_truthy(TLS_TERMINATED_ENV),
+    ) {
+        return Err(problem_response(
             StatusCode::FORBIDDEN,
-            "provenance API requires an authenticated auth mode (refusing AuthMode::Off)",
+            "provenance API requires non-off auth and a safe transport posture",
         ));
     }
-    if let Err(problem) = require_http_any_scope(&state.auth, headers, PROVENANCE_SCOPES) {
-        return Some(problem.into_response());
+    let tenant = requested_tenant(headers, body_tenant).map_err(IntoResponse::into_response)?;
+    if let Err(problem) = require_http_any_scope_for_tenant(&state.auth, headers, PROVENANCE_SCOPES, &tenant) {
+        return Err(problem.into_response());
     }
-    if !rate_limit_ok(tenant) {
-        return Some(problem_response(
+    if !rate_limit_ok(&credential_rate_key(headers, &tenant)) {
+        return Err(problem_response(
             StatusCode::TOO_MANY_REQUESTS,
             "per-key rate limit exceeded; retry after the current window",
         ));
     }
-    None
+    Ok(tenant)
 }
 
 pub(super) async fn post_provenance_sign(
@@ -662,10 +802,10 @@ pub(super) async fn post_provenance_sign(
     headers: HeaderMap,
     Json(body): Json<SignRequest>,
 ) -> Response {
-    let tenant = tenant_from(&headers, body.tenant_id.as_deref());
-    if let Some(resp) = guard(&state, &headers, &tenant) {
-        return resp;
-    }
+    let tenant = match guard(&state, &headers, body.tenant_id.as_deref()) {
+        Ok(tenant) => tenant,
+        Err(resp) => return resp,
+    };
     match do_sign(&NoopMeter, &tenant, &body) {
         Ok(resp) => (StatusCode::CREATED, Json(resp)).into_response(),
         Err(e) => e.into_response(),
@@ -677,10 +817,10 @@ pub(super) async fn post_provenance_verify(
     headers: HeaderMap,
     Json(body): Json<VerifyRequest>,
 ) -> Response {
-    let tenant = tenant_from(&headers, body.tenant_id.as_deref());
-    if let Some(resp) = guard(&state, &headers, &tenant) {
-        return resp;
-    }
+    let tenant = match guard(&state, &headers, body.tenant_id.as_deref()) {
+        Ok(tenant) => tenant,
+        Err(resp) => return resp,
+    };
     match do_verify(&NoopMeter, &tenant, &body) {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
         Err(e) => e.into_response(),
@@ -692,10 +832,10 @@ pub(super) async fn post_provenance_verify_record(
     headers: HeaderMap,
     Json(body): Json<VerifyRequest>,
 ) -> Response {
-    let tenant = tenant_from(&headers, body.tenant_id.as_deref());
-    if let Some(resp) = guard(&state, &headers, &tenant) {
-        return resp;
-    }
+    let tenant = match guard(&state, &headers, body.tenant_id.as_deref()) {
+        Ok(tenant) => tenant,
+        Err(resp) => return resp,
+    };
     match do_verify_record(
         &NoopMeter,
         &tenant,
@@ -751,7 +891,7 @@ mod tests {
         SignRequest {
             content_b64: b64(content),
             content_type: content_type.map(str::to_string),
-            signing_key_pem: key_pem,
+            signing_key_pem: key_pem.into(),
             cert_chain_pem: cert_pem,
             manifest: ManifestParams::default(),
             tenant_id: Some("tenant-a".to_string()),
@@ -772,9 +912,33 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn flag_defaults_off() {
         std::env::remove_var(FEATURE_ENV);
         assert!(!provenance_api_enabled());
+    }
+
+    #[test]
+    fn transport_posture_requires_real_auth_and_tls_off_loopback() {
+        use crate::auth::AuthMode;
+
+        assert!(!transport_posture_allowed(AuthMode::Off, true, false));
+        assert!(transport_posture_allowed(AuthMode::DevScopes, true, false));
+        assert!(!transport_posture_allowed(AuthMode::DevScopes, false, true));
+        assert!(!transport_posture_allowed(AuthMode::JwtHs256, false, false));
+        assert!(transport_posture_allowed(AuthMode::JwtHs256, false, true));
+        assert!(transport_posture_allowed(AuthMode::JwtJwks, false, true));
+    }
+
+    #[test]
+    fn private_key_field_deserializes_into_zeroizing_wrapper() {
+        let req: SignRequest = serde_json::from_value(json!({
+            "content_b64": b64(b"asset"),
+            "signing_key_pem": "test-secret-key",
+            "cert_chain_pem": "test-cert"
+        }))
+        .unwrap();
+        assert_eq!(req.signing_key_pem.expose(), "test-secret-key");
     }
 
     // ── sign → verify round trip (HTTP glue level) ─────────────────────────
@@ -885,7 +1049,7 @@ mod tests {
         let req = SignRequest {
             content_b64: b64(b"x"),
             content_type: Some("application/x-evil".to_string()),
-            signing_key_pem: "garbage".to_string(),
+            signing_key_pem: "garbage".to_string().into(),
             cert_chain_pem: "garbage".to_string(),
             manifest: ManifestParams::default(),
             tenant_id: None,
@@ -1037,6 +1201,157 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn router_flag_on_with_auth_off_still_never_mounts_or_reads_body() {
+        use tower::ServiceExt as _;
+
+        std::env::set_var(FEATURE_ENV, "1");
+        let state = crate::http::tests::test_app_state(1);
+        let app = crate::http::router(
+            state,
+            std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::CaseStore::new())),
+        );
+        let req = axum::http::Request::post("/v1/provenance/sign")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from("{ this contains key material but is not json"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        std::env::remove_var(FEATURE_ENV);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn handler_rejects_missing_or_conflicting_tenant_selector() {
+        use crate::auth::AuthMode;
+
+        std::env::set_var(FEATURE_ENV, "1");
+        let state = crate::http::tests::test_app_state_with_auth(1, AuthMode::DevScopes);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-corecrux-scopes", "provenance:write".parse().unwrap());
+
+        let missing = post_provenance_verify(
+            State(state.clone()),
+            headers.clone(),
+            Json(VerifyRequest {
+                manifest_envelope_b64: None,
+                content_b64: None,
+                tenant_id: None,
+            }),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+
+        headers.insert("x-corecrux-tenant-id", "tenant-a".parse().unwrap());
+        let conflicting = post_provenance_verify(
+            State(state.clone()),
+            headers.clone(),
+            Json(VerifyRequest {
+                manifest_envelope_b64: None,
+                content_b64: None,
+                tenant_id: Some("tenant-b".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(conflicting.status(), StatusCode::BAD_REQUEST);
+
+        headers.insert(
+            "x-corecrux-tenant-id",
+            axum::http::HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        let invalid_header = post_provenance_verify(
+            State(state),
+            headers,
+            Json(VerifyRequest {
+                manifest_envelope_b64: None,
+                content_b64: None,
+                tenant_id: Some("tenant-a".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(invalid_header.status(), StatusCode::BAD_REQUEST);
+        std::env::remove_var(FEATURE_ENV);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn handler_binds_selected_tenant_to_verified_jwt_claim() {
+        use crate::auth::AuthMode;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+        const SECRET: &str = "0123456789abcdef0123456789abcdef";
+        std::env::set_var(FEATURE_ENV, "1");
+        std::env::set_var("CORECRUXD_JWT_HS256_SECRET", SECRET);
+        std::env::set_var("CORECRUXD_JWT_ISS", "corecrux-test");
+        std::env::set_var("CORECRUXD_JWT_AUD", "corecrux");
+        let state = crate::http::tests::test_app_state_with_auth(1, AuthMode::JwtHs256);
+
+        #[derive(serde::Serialize)]
+        struct Claims<'a> {
+            exp: usize,
+            iss: &'a str,
+            aud: &'a str,
+            scope: &'a str,
+            tenant_id: &'a str,
+        }
+        let claims = Claims {
+            exp: (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3_600) as usize,
+            iss: "corecrux-test",
+            aud: "corecrux",
+            scope: "provenance:write",
+            tenant_id: "tenant-a",
+        };
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(SECRET.as_bytes()),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+
+        let denied = post_provenance_verify(
+            State(state.clone()),
+            headers.clone(),
+            Json(VerifyRequest {
+                manifest_envelope_b64: None,
+                content_b64: None,
+                tenant_id: Some("tenant-b".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let allowed = post_provenance_verify(
+            State(state),
+            headers,
+            Json(VerifyRequest {
+                manifest_envelope_b64: None,
+                content_b64: None,
+                tenant_id: Some("tenant-a".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(allowed.status(), StatusCode::OK);
+
+        for name in [
+            FEATURE_ENV,
+            "CORECRUXD_JWT_HS256_SECRET",
+            "CORECRUXD_JWT_ISS",
+            "CORECRUXD_JWT_AUD",
+        ] {
+            std::env::remove_var(name);
+        }
+    }
+
     #[test]
     fn content_type_allowlist_matches_expected() {
         assert!(content_type_allowed("image/png"));
@@ -1057,5 +1372,24 @@ mod tests {
             assert!(rate_limit_ok(&key));
         }
         assert!(!rate_limit_ok(&key), "budget exhausted within the window");
+    }
+
+    #[test]
+    fn rate_limiter_bounds_key_cardinality_and_reclaims_expired_entries() {
+        let start = Instant::now();
+        let mut limiter = FixedWindowRateLimiter::new(Duration::from_secs(10), 2, 2);
+        assert!(limiter.allow("credential-a", start));
+        assert!(limiter.allow("credential-a", start));
+        assert!(!limiter.allow("credential-a", start), "per-key budget must fail closed");
+        assert!(limiter.allow("credential-b", start));
+        assert!(
+            !limiter.allow("credential-c", start),
+            "new keys must fail closed at the cap"
+        );
+        assert!(
+            limiter.allow("credential-c", start + Duration::from_secs(11)),
+            "expired entries must be reclaimed"
+        );
+        assert_eq!(limiter.entries.len(), 1);
     }
 }

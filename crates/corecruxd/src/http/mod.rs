@@ -1424,7 +1424,7 @@ pub(crate) fn router_with_route_auth(
     // Kept as a separate runtime-conditional block (like the hosted-surfaces
     // block below) so the `.route(...)` templates still appear verbatim in
     // source for the route-auth matrix + route-spec drift tests.
-    let router = if self::provenance::provenance_api_enabled() {
+    let router = if self::provenance::provenance_routes_enabled(&state) {
         router
             .route(
                 "/v1/provenance/sign",
