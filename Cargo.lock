@@ -937,6 +937,7 @@ dependencies = [
  "urlencoding",
  "uuid",
  "x509-cert",
+ "x509-parser",
  "xxhash-rust",
  "zip",
 ]

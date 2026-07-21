@@ -40,6 +40,7 @@ sha2 = { workspace = true }
 # c2pa-rotate-leaf — agent-ux-07 M6). Matches the versions in corecrux-receipts.
 p256 = { workspace = true, default-features = false, features = ["std", "ecdsa", "pem"] }
 x509-cert = { workspace = true, default-features = false, features = ["std", "pem"] }
+x509-parser = { version = "0.18.1", features = ["verify"] }
 
 corecrux-frame = { path = "../corecrux-frame" }
 corecrux-index = { path = "../corecrux-index" }

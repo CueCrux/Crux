@@ -133,6 +133,15 @@ Whatever channel: **the fingerprint must be displayed alongside the PEM**.
 Verifiers MUST refuse to trust a PEM whose fingerprint doesn't match the
 published value.
 
+`corecruxctl c2pa-verify` reports overall `ok=true` for an X.509 envelope
+only when the envelope signature/content checks pass and the presented chain
+cryptographically reaches the exact operator-selected anchor. The offline
+private-anchor validator checks current certificate validity, signatures,
+BasicConstraints, key usages, the CueCrux C2PA leaf EKU, path length, and
+unsupported critical extensions. A missing anchor is untrusted, not a soft
+success. Revocation and membership in a public C2PA trust list remain separate
+checks and are reported as such.
+
 ---
 
 ## 4. Rotation playbook
