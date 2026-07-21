@@ -8,11 +8,11 @@
 //! `hosted-compaction-sync-productization-2026-07-17` M3).
 //!
 //! `enable` turns on hosted continuity in one command: it verifies the CruxEngine
-//! credential + passport prerequisite, sets the durable opt-in in
-//! `~/.config/cuecrux/env`, and runs a live seal→push→pull→verify round-trip on a
-//! scratch snapshot — which doubles as the Pro-entitlement probe (a `402` blocks
-//! activation with a clear "upgrade to Pro" message). `status` reports the current
-//! state without touching the network.
+//! credential + passport prerequisite, runs a live seal→push→pull→verify round-trip
+//! on a scratch snapshot, then sets the durable opt-in in `~/.config/cuecrux/env`.
+//! The round-trip doubles as the Pro-entitlement probe, so a `402` or transport
+//! failure cannot enable the feature. `status` reports the current state without
+//! touching the network.
 //!
 //! The hosted transport + credential model live in
 //! [`corecrux_memory::snapshot_sync`]; this module is only the operator on-ramp.
@@ -65,7 +65,13 @@ pub fn run_enable() -> Result<(), DynErr> {
     }
     println!("  [ok] passport seed present     (same-passport cross-device prerequisite)");
 
-    // 3) Set the durable opt-in (read by the hook + daemon on the next session).
+    // 3) Live self-test: seal→push→pull→verify. Doubles as the Pro probe. Do not
+    //    mutate durable or process-local activation unless this succeeds.
+    println!("\n  Running self-test (push → pull → verify)…");
+    self_test(&config)?;
+
+    // 4) Persist the opt-in only after the entitlement and transport path pass.
+    //    The hook + daemon read this on the next session.
     let env_path = set_opt_in()?;
     std::env::set_var(snapshot_sync::COMPACTION_SYNC_ENV, "1");
     println!(
@@ -73,10 +79,6 @@ pub fn run_enable() -> Result<(), DynErr> {
         snapshot_sync::COMPACTION_SYNC_ENV,
         env_path.display()
     );
-
-    // 4) Live self-test: seal→push→pull→verify. Doubles as the Pro probe.
-    println!("\n  Running self-test (push → pull → verify)…");
-    self_test(&config)?;
 
     println!(
         "\n[ok] Activated. Hosted continuity is on for tenant {}.\n\
@@ -344,6 +346,27 @@ mod tests {
         base
     }
 
+    fn spawn_disconnect_stub() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = read_request(&mut stream);
+            }
+        });
+        base
+    }
+
+    fn assert_activation_stayed_off(dir: &std::path::Path, original_env: &str) {
+        let env_path = dir.join(".config/cuecrux/env");
+        let env = std::fs::read_to_string(&env_path).expect("existing env remains readable");
+        assert_eq!(env, original_env, "failed activation must not rewrite env");
+        assert!(
+            !snapshot_sync::opt_in_enabled(),
+            "failed activation must not set the process opt-in"
+        );
+    }
+
     fn read_request(stream: &mut std::net::TcpStream) -> (String, Vec<u8>) {
         let mut bytes = Vec::new();
         let mut buf = [0u8; 4096];
@@ -396,7 +419,11 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn enable_blocks_on_402_pro_required() {
-        let _dir = scratch_env();
+        let dir = scratch_env();
+        let original_env = "CRUX_AGENT_TOKEN=fixture-token\n";
+        let env_path = dir.join(".config/cuecrux/env");
+        std::fs::create_dir_all(env_path.parent().unwrap()).unwrap();
+        std::fs::write(&env_path, original_env).unwrap();
         std::env::set_var(
             snapshot_sync::ENGINE_BASE_URL_ENV,
             spawn_status_stub("402 Payment Required"),
@@ -407,6 +434,22 @@ mod tests {
             err.to_string().contains("Pro entitlement"),
             "clear upgrade message: {err}"
         );
+        assert_activation_stayed_off(&dir, original_env);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn enable_transport_failure_does_not_activate() {
+        let dir = scratch_env();
+        let original_env = "CRUX_AGENT_TOKEN=fixture-token\n";
+        let env_path = dir.join(".config/cuecrux/env");
+        std::fs::create_dir_all(env_path.parent().unwrap()).unwrap();
+        std::fs::write(&env_path, original_env).unwrap();
+        std::env::set_var(snapshot_sync::ENGINE_BASE_URL_ENV, spawn_disconnect_stub());
+
+        let err = run_enable().expect_err("transport failure must block activation");
+        assert!(err.to_string().contains("self-test push failed"), "{err}");
+        assert_activation_stayed_off(&dir, original_env);
     }
 
     #[test]
