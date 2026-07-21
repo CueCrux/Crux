@@ -7,6 +7,276 @@
 
 use super::*;
 
+#[derive(Debug)]
+pub(super) struct LocalApprovalReceipt {
+    pub(super) observation_id: String,
+    pub(super) request_id: String,
+    pub(super) reviewer_passport: String,
+    pub(super) decision: String,
+    body_bytes: Vec<u8>,
+    signature_bytes: Vec<u8>,
+    occurred_at: String,
+    verification: corecrux_receipts::VerificationReportV1,
+}
+
+/// Resolve the typed receipt nested inside the CPU-local, signed gate
+/// observation chain. `corecruxd` intentionally has no dataplane pool, so
+/// approval receipts need this narrow fallback to remain dereferenceable via
+/// the canonical receipt API.
+pub(super) fn local_approval_receipt(
+    state: &AppState,
+    tenant_id: &str,
+    receipt_id: &str,
+) -> Result<Option<LocalApprovalReceipt>, String> {
+    use corecrux_receipts::{
+        assert_approval_decision_kind_v1, verify_receipt_v1, Ed25519KeyEntryV1, Ed25519KeyRingV1, VerifyReceiptInput,
+        APPROVAL_DECISION_BODY_SCHEMA_V1, APPROVAL_DECISION_KIND_V1,
+    };
+
+    let path = super::observations::observation_file_path(&state.data_dir, super::work::WORK_GATE_RECEIPT_SESSION);
+    let records = super::observations::read_observations_strict(&path)
+        .map_err(|err| format!("read local approval receipts: {err}"))?;
+    if records.is_empty() {
+        return Ok(None);
+    }
+    if !matches!(
+        super::observations::validate_chain(&records),
+        super::observations::ChainStatus::Ok { .. }
+    ) {
+        return Err("local approval receipt observation chain is invalid".to_string());
+    }
+
+    // The hash chain alone only binds the declared body hashes. Verify every
+    // record's daemon signature before selecting the requested receipt, so an
+    // unrelated tampered entry cannot be hidden in an otherwise linked chain.
+    for record in &records {
+        if record.session_id != super::work::WORK_GATE_RECEIPT_SESSION
+            || record.provider != "corecruxd"
+            || record.kind != APPROVAL_DECISION_KIND_V1
+            || record.payload.get("body_schema").and_then(serde_json::Value::as_str)
+                != Some(APPROVAL_DECISION_BODY_SCHEMA_V1)
+            || record
+                .payload
+                .get("reviewer_passport")
+                .and_then(serde_json::Value::as_str)
+                != Some(record.principal.as_str())
+        {
+            return Err("unexpected record in local approval receipt chain".to_string());
+        }
+        verify_local_approval_observation(state, record)?;
+    }
+
+    let mut found = None;
+    for record in records {
+        if record.session_id != super::work::WORK_GATE_RECEIPT_SESSION
+            || record.provider != "corecruxd"
+            || record.kind != APPROVAL_DECISION_KIND_V1
+            || record.payload.get("receipt_id").and_then(serde_json::Value::as_str) != Some(receipt_id)
+            || record.payload.get("tenant_id").and_then(serde_json::Value::as_str) != Some(tenant_id)
+        {
+            continue;
+        }
+        let Some(body_hex) = record.payload.get("body_cbor_hex").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(signature_hex) = record
+            .payload
+            .get("signature_cbor_hex")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        if body_hex.len() > 2_097_152 || signature_hex.len() > 16_384 {
+            return Err("local approval receipt material exceeds size limits".to_string());
+        }
+        let Ok(body_bytes) = hex::decode(body_hex) else {
+            return Err("local approval receipt body is not valid hex".to_string());
+        };
+        let Ok(signature_bytes) = hex::decode(signature_hex) else {
+            return Err("local approval receipt signature is not valid hex".to_string());
+        };
+        if !assert_approval_decision_kind_v1(&body_bytes) {
+            return Err("local approval receipt body has the wrong kind".to_string());
+        }
+        let fields = approval_receipt_text_fields(&body_bytes)
+            .ok_or_else(|| "local approval receipt body is not a text-keyed CBOR map".to_string())?;
+        for field in ["receipt_id", "tenant_id", "request_id", "reviewer_passport", "decision"] {
+            let Some(inner) = fields.get(field).map(String::as_str) else {
+                return Err(format!("local approval receipt {field} is missing from the body"));
+            };
+            let Some(outer) = record.payload.get(field).and_then(serde_json::Value::as_str) else {
+                return Err(format!("local approval receipt {field} is missing from the envelope"));
+            };
+            if inner != outer {
+                return Err(format!("local approval receipt {field} binding mismatch"));
+            }
+        }
+        if fields.get("receipt_id").map(String::as_str) != Some(receipt_id)
+            || fields.get("tenant_id").map(String::as_str) != Some(tenant_id)
+        {
+            return Err("local approval receipt URL binding mismatch".to_string());
+        }
+        let body_hash = corecrux_frame::compute_payload_hash(&body_bytes);
+        let expected_body_hash = format!("blake3:{}", hex::encode(body_hash));
+        if record.payload.get("body_hash").and_then(serde_json::Value::as_str) != Some(expected_body_hash.as_str()) {
+            return Err("local approval receipt body hash binding mismatch".to_string());
+        }
+        let public_key = verify_local_approval_observation(state, &record)?;
+        let signer_key_id = record
+            .payload
+            .get("signer_key_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "local approval receipt signer key id is missing".to_string())?;
+        let keyring = Ed25519KeyRingV1 {
+            v: 1,
+            keys: vec![Ed25519KeyEntryV1 {
+                key_id: signer_key_id.to_string(),
+                pub_key_base64: base64::engine::general_purpose::STANDARD.encode(public_key),
+            }],
+        };
+        let verified_at = record.ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let verification = match verify_receipt_v1(VerifyReceiptInput {
+            tenant_id,
+            receipt_id,
+            body_bytes: &body_bytes,
+            stored_body_payload_hash: body_hash,
+            sig_bytes: Some(&signature_bytes),
+            keyring: Some(&keyring),
+            verified_at: &verified_at,
+            verifier_build: &state.build,
+            recompute_candidate_digest: false,
+        }) {
+            Ok(report) if report.signature_valid && report.error_code == "OK" => report,
+            Ok(_) | Err(_) => return Err("local approval receipt signature verification failed".to_string()),
+        };
+        let request_id = fields
+            .get("request_id")
+            .cloned()
+            .ok_or_else(|| "local approval receipt request_id is missing".to_string())?;
+        let reviewer_passport = fields
+            .get("reviewer_passport")
+            .cloned()
+            .ok_or_else(|| "local approval receipt reviewer_passport is missing".to_string())?;
+        let decision = fields
+            .get("decision")
+            .cloned()
+            .ok_or_else(|| "local approval receipt decision is missing".to_string())?;
+        let candidate = LocalApprovalReceipt {
+            observation_id: record.observation_id.clone(),
+            request_id,
+            reviewer_passport,
+            decision,
+            body_bytes,
+            signature_bytes,
+            occurred_at: verified_at,
+            verification,
+        };
+        if found.replace(candidate).is_some() {
+            return Err("duplicate local approval receipt id".to_string());
+        }
+    }
+    Ok(found)
+}
+
+pub(super) fn approval_receipt_text_fields(body_bytes: &[u8]) -> Option<std::collections::BTreeMap<String, String>> {
+    let value = ciborium::de::from_reader::<ciborium::value::Value, _>(std::io::Cursor::new(body_bytes)).ok()?;
+    let ciborium::value::Value::Map(entries) = value else {
+        return None;
+    };
+    let mut fields = std::collections::BTreeMap::new();
+    for (key, value) in entries {
+        if let (ciborium::value::Value::Text(key), ciborium::value::Value::Text(value)) = (key, value) {
+            fields.insert(key, value);
+        }
+    }
+    Some(fields)
+}
+
+fn verify_local_approval_observation(
+    state: &AppState,
+    record: &super::observations::ObservationRecordV1,
+) -> Result<[u8; 32], String> {
+    use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
+
+    let signer_key_id = record
+        .payload
+        .get("signer_key_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "local approval receipt signer key id is missing".to_string())?;
+    let public_key_hex = record
+        .payload
+        .get("signer_public_key_hex")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "local approval receipt signer public key is missing".to_string())?;
+    let public_key: [u8; 32] = hex::decode(public_key_hex)
+        .map_err(|err| format!("decode local approval receipt public key: {err}"))?
+        .try_into()
+        .map_err(|bytes: Vec<u8>| format!("local approval receipt public key is {} bytes", bytes.len()))?;
+    let derived_key_id = format!("p_{}", hex::encode(&blake3::hash(&public_key).as_bytes()[..16]));
+    if signer_key_id != derived_key_id
+        || signer_key_id != record.receipt.signed_by
+        || signer_key_id != state.passport_fpr
+        || public_key_hex != state.passport_public_key_hex
+        || record.receipt.alg != "ed25519"
+    {
+        return Err("local approval receipt signer binding mismatch".to_string());
+    }
+    let body_bytes = super::observations::canonical_body_bytes(record)?;
+    let body_hash = blake3::hash(&body_bytes);
+    if record.receipt.body_hash != format!("blake3:{}", hex::encode(body_hash.as_bytes())) {
+        return Err("local approval observation body hash mismatch".to_string());
+    }
+    let signature = Signature::from_slice(
+        &hex::decode(&record.receipt.signature)
+            .map_err(|err| format!("decode local approval observation signature: {err}"))?,
+    )
+    .map_err(|err| format!("parse local approval observation signature: {err}"))?;
+    let verifying_key =
+        VerifyingKey::from_bytes(&public_key).map_err(|err| format!("parse local approval public key: {err}"))?;
+    verifying_key
+        .verify(body_hash.as_bytes(), &signature)
+        .map_err(|err| format!("verify local approval observation signature: {err}"))?;
+    Ok(public_key)
+}
+
+fn local_receipt_payload_response(
+    tenant_id: &str,
+    receipt_id: &str,
+    seq: u64,
+    content_type: &'static str,
+    payload: Vec<u8>,
+    occurred_at: &str,
+    headers: &HeaderMap,
+) -> axum::response::Response {
+    if wants_cbor(headers) {
+        let mut response = axum::response::Response::new(axum::body::Body::from(payload));
+        *response.status_mut() = StatusCode::OK;
+        response
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+        return response;
+    }
+    let payload_hash = corecrux_frame::compute_payload_hash(&payload);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "tenant_id": tenant_id,
+            "receipt_id": receipt_id,
+            "seq": seq,
+            "occurredAt": occurred_at,
+            "ingestedAt": occurred_at,
+            "contentType": content_type,
+            "payloadBase64": base64::engine::general_purpose::STANDARD.encode(payload),
+            "payloadHash": hex32(&payload_hash),
+        })),
+    )
+        .into_response()
+}
+
+fn is_local_approval_receipt_id(receipt_id: &str) -> bool {
+    receipt_id.starts_with("ad_ga_")
+}
+
 #[utoipa::path(
     get,
     path = "/v1/receipts/{receiptId}",
@@ -34,6 +304,21 @@ pub(super) async fn get_receipt_body_v1(
         return problem.into_response();
     }
 
+    if is_local_approval_receipt_id(&receipt_id) {
+        return match local_approval_receipt(&state, &q.tenant_id, &receipt_id) {
+            Ok(Some(local)) => local_receipt_payload_response(
+                &q.tenant_id,
+                &receipt_id,
+                0,
+                corecrux_receipts::CONTENT_TYPE_RECEIPT_BODY_V1,
+                local.body_bytes,
+                &local.occurred_at,
+                &headers,
+            ),
+            Ok(None) => problem_response(StatusCode::NOT_FOUND, "receipt body not found"),
+            Err(detail) => problem_response(StatusCode::INTERNAL_SERVER_ERROR, detail),
+        };
+    }
     if !state.http_dataplane.enabled() {
         return problem_response(StatusCode::NOT_IMPLEMENTED, "dataplane disabled");
     }
@@ -132,6 +417,21 @@ pub(super) async fn get_receipt_signature_v1(
         return problem.into_response();
     }
 
+    if is_local_approval_receipt_id(&receipt_id) {
+        return match local_approval_receipt(&state, &q.tenant_id, &receipt_id) {
+            Ok(Some(local)) => local_receipt_payload_response(
+                &q.tenant_id,
+                &receipt_id,
+                1,
+                corecrux_receipts::CONTENT_TYPE_RECEIPT_SIG_V1,
+                local.signature_bytes,
+                &local.occurred_at,
+                &headers,
+            ),
+            Ok(None) => problem_response(StatusCode::NOT_FOUND, "receipt signature not found"),
+            Err(detail) => problem_response(StatusCode::INTERNAL_SERVER_ERROR, detail),
+        };
+    }
     if !state.http_dataplane.enabled() {
         return problem_response(StatusCode::NOT_IMPLEMENTED, "dataplane disabled");
     }
@@ -230,6 +530,13 @@ pub(super) async fn get_receipt_verification_v1(
         return problem.into_response();
     }
 
+    if is_local_approval_receipt_id(&receipt_id) {
+        return match local_approval_receipt(&state, &q.tenant_id, &receipt_id) {
+            Ok(Some(local)) => (StatusCode::OK, Json(local.verification)).into_response(),
+            Ok(None) => problem_response(StatusCode::NOT_FOUND, "receipt body not found"),
+            Err(detail) => problem_response(StatusCode::INTERNAL_SERVER_ERROR, detail),
+        };
+    }
     if !state.http_dataplane.enabled() {
         return problem_response(StatusCode::NOT_IMPLEMENTED, "dataplane disabled");
     }
@@ -294,6 +601,16 @@ pub(super) async fn get_receipt_export_v1(
         Ok(v) => v,
         Err(msg) => return problem_response(StatusCode::BAD_REQUEST, msg),
     };
+    if is_local_approval_receipt_id(&receipt_id) {
+        return match local_approval_receipt(&state, &q.tenant_id, &receipt_id) {
+            Ok(Some(_)) => problem_response(
+                StatusCode::NOT_IMPLEMENTED,
+                "local approval receipt bundle export is not implemented",
+            ),
+            Ok(None) => problem_response(StatusCode::NOT_FOUND, "receipt body not found"),
+            Err(detail) => problem_response(StatusCode::INTERNAL_SERVER_ERROR, detail),
+        };
+    }
     export_receipt_bundle_v1(&state, &q.tenant_id, &receipt_id, opts).await
 }
 

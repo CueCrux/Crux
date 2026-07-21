@@ -385,6 +385,23 @@ fn projects_work_and_coordination_tools_flow() {
         .unwrap();
     assert_eq!(approved["state"], "complete");
 
+    let transitions: serde_json::Value = d
+        .get(&format!("/v1/work/{work_id}/transitions"))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    let approved_transition = transitions["transitions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|transition| transition["gate_status"] == "approved")
+        .unwrap();
+    let expected_approver = format!("operator:unverified:{actor_passport}");
+    assert_eq!(approved_transition["by_passport"], expected_approver);
+    assert_ne!(approved_transition["by_passport"], actor_passport);
+    assert_eq!(approved_transition["receipt_id"], approved["receipt_id"]);
+
     let mcp_projects = mcp_text_json(&mcp_tool_call("list_projects", json!({})));
     assert!(mcp_projects["projects"]
         .as_array()

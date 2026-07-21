@@ -111,8 +111,33 @@ pub(super) struct CommentBody {
 
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct GateResolutionBody {
-    pub approver_passport: String,
+    /// In an enforcing auth mode this is a legacy hint that must match the
+    /// authenticated passport. In auth-off mode it is the operator's
+    /// self-asserted identity and is persisted with an unverified actor tag.
+    #[serde(default)]
+    pub approver_passport: Option<String>,
 }
+
+#[derive(Debug, serde::Serialize)]
+struct GateResolutionResponse {
+    #[serde(flatten)]
+    work: crate::work::WorkItem,
+    receipt_id: String,
+    receipt_record_id: String,
+    receipt_session_id: String,
+}
+
+#[derive(Debug)]
+struct MintedGateReceipt {
+    receipt_id: String,
+    observation_id: String,
+}
+
+/// CPU-local source of truth for typed gate receipts. The fixed session is a
+/// signed, fsynced observation chain; `http::receipts` exposes its inner CROWN
+/// body/signature through the normal `/v1/receipts/{id}` API.
+pub(super) const WORK_GATE_RECEIPT_SESSION: &str = ".work_gate_receipts_v1";
+pub(super) const AUTH_OFF_APPROVER_PREFIX: &str = "operator:unverified:";
 
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct GateListQuery {
@@ -475,19 +500,7 @@ pub(super) async fn post_gate_approve(
     headers: HeaderMap,
     Json(body): Json<GateResolutionBody>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-        return problem.into_response();
-    }
-    let mut store = state.fact_store.write().await;
-    let result = crate::work::resolve_gate(&mut store, &action_id, &body.approver_passport, true, now_unix_ms());
-    drop(store);
-    match result {
-        Ok(w) => (StatusCode::OK, Json(w)).into_response(),
-        Err(crate::work::WorkError::GateNotFound(_)) => {
-            problem_response(StatusCode::NOT_FOUND, "gated action not found")
-        }
-        Err(err) => problem_response(StatusCode::BAD_REQUEST, err.to_string()),
-    }
+    resolve_gate_http(&state, &action_id, &headers, &body, true).await
 }
 
 pub(super) async fn post_gate_reject(
@@ -496,19 +509,255 @@ pub(super) async fn post_gate_reject(
     headers: HeaderMap,
     Json(body): Json<GateResolutionBody>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    resolve_gate_http(&state, &action_id, &headers, &body, false).await
+}
+
+async fn resolve_gate_http(
+    state: &AppState,
+    action_id: &str,
+    headers: &HeaderMap,
+    body: &GateResolutionBody,
+    approve: bool,
+) -> axum::response::Response {
+    // This is intentionally independent of route_auth: its default posture is
+    // shadow. Enforcing modes retain the hard boundary; auth-off uses an
+    // explicitly unverified operator attribution instead.
+    let context = match crate::auth::passport_bound_context(&state.auth, headers) {
+        Ok(context) => context,
+        Err(problem) => return problem.into_response(),
+    };
+    let (asserted_approver, approver_actor) = if context.auth_enforced() {
+        if context.passport_override_used() {
+            return problem_response(
+                StatusCode::FORBIDDEN,
+                "passport impersonation is not permitted for gate resolution",
+            );
+        }
+        if !context.has_scope("facts:write") {
+            return problem_response(StatusCode::FORBIDDEN, "facts:write scope required for gate resolution");
+        }
+        let Some(approver_passport) = context.passport_id.as_deref() else {
+            return problem_response(
+                StatusCode::FORBIDDEN,
+                "an authenticated passport is required for gate resolution",
+            );
+        };
+        if body
+            .approver_passport
+            .as_deref()
+            .is_some_and(|claimed| claimed != approver_passport)
+        {
+            return problem_response(
+                StatusCode::FORBIDDEN,
+                "approver_passport does not match the authenticated passport",
+            );
+        }
+        (approver_passport.to_string(), approver_passport.to_string())
+    } else {
+        let Some(approver_passport) = body
+            .approver_passport
+            .as_deref()
+            .map(str::trim)
+            .filter(|claimed| !claimed.is_empty())
+        else {
+            return problem_response(
+                StatusCode::BAD_REQUEST,
+                "approver_passport is required in auth-off mode",
+            );
+        };
+        (
+            approver_passport.to_string(),
+            format!("{AUTH_OFF_APPROVER_PREFIX}{approver_passport}"),
+        )
+    };
+
+    // Keep target inspection, tenant authorization, receipt persistence, and
+    // resolution under one write guard. That serializes concurrent decisions
+    // and prevents a work tenant change between authorization and commit.
+    let mut store = state.fact_store.write().await;
+    let target = match crate::work::gate_resolution_target(&store, action_id) {
+        Ok(target) => target,
+        Err(err) => return gate_error_response(err),
+    };
+    if let Err(problem) =
+        crate::auth::require_http_scopes_for_tenant(&state.auth, headers, &["facts:write"], &target.tenant_id)
+    {
         return problem.into_response();
     }
-    let mut store = state.fact_store.write().await;
-    let result = crate::work::resolve_gate(&mut store, &action_id, &body.approver_passport, false, now_unix_ms());
-    drop(store);
-    match result {
-        Ok(w) => (StatusCode::OK, Json(w)).into_response(),
-        Err(crate::work::WorkError::GateNotFound(_)) => {
-            problem_response(StatusCode::NOT_FOUND, "gated action not found")
-        }
-        Err(err) => problem_response(StatusCode::BAD_REQUEST, err.to_string()),
+    if target.tenant_mismatch {
+        return gate_error_response(crate::work::WorkError::GateTenantChanged(action_id.to_string()));
     }
+    if target.gate.status != "pending" {
+        return gate_error_response(crate::work::WorkError::GateAlreadyResolved(action_id.to_string()));
+    }
+    if target.gate.requested_by_passport == asserted_approver {
+        return problem_response(
+            StatusCode::FORBIDDEN,
+            "the requesting passport cannot resolve its own gate",
+        );
+    }
+
+    let receipt = match mint_gate_receipt(state, &target, &approver_actor, approve) {
+        Ok(receipt) => receipt,
+        Err((status, detail)) => return problem_response(status, detail),
+    };
+    let result = crate::work::resolve_gate(
+        &mut store,
+        action_id,
+        &approver_actor,
+        &receipt.receipt_id,
+        approve,
+        now_unix_ms(),
+    );
+    drop(store);
+
+    match result {
+        Ok(work) => (
+            StatusCode::OK,
+            Json(GateResolutionResponse {
+                work,
+                receipt_id: receipt.receipt_id,
+                receipt_record_id: receipt.observation_id,
+                receipt_session_id: WORK_GATE_RECEIPT_SESSION.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(err) => gate_error_response(err),
+    }
+}
+
+fn gate_error_response(err: crate::work::WorkError) -> axum::response::Response {
+    match err {
+        crate::work::WorkError::GateNotFound(_) => problem_response(StatusCode::NOT_FOUND, "gated action not found"),
+        crate::work::WorkError::GateAlreadyResolved(_) => {
+            problem_response(StatusCode::CONFLICT, "gated action is already resolved")
+        }
+        crate::work::WorkError::GateTenantChanged(_) => problem_response(
+            StatusCode::CONFLICT,
+            "gated action tenant no longer matches its work item",
+        ),
+        crate::work::WorkError::NotFound(_) => problem_response(StatusCode::NOT_FOUND, "work item not found"),
+        crate::work::WorkError::Io(_) | crate::work::WorkError::Json(_) => {
+            problem_response(StatusCode::INTERNAL_SERVER_ERROR, "gate resolution persistence failed")
+        }
+        err => problem_response(StatusCode::BAD_REQUEST, err.to_string()),
+    }
+}
+
+fn mint_gate_receipt(
+    state: &AppState,
+    target: &crate::work::GateResolutionTarget,
+    approver_passport: &str,
+    approve: bool,
+) -> Result<MintedGateReceipt, (StatusCode, String)> {
+    use corecrux_receipts::{
+        build_approval_decision_body_v1, sign_approval_decision_v1, ApprovalDecisionBodyInputV1, ApprovalDecisionV1,
+        ApprovalRiskTierV1, APPROVAL_DECISION_BODY_SCHEMA_V1, APPROVAL_DECISION_KIND_V1,
+    };
+
+    let receipt_id = format!("ad_{}", target.gate.action_id);
+    let decided_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let decision = if approve {
+        ApprovalDecisionV1::Approve
+    } else {
+        ApprovalDecisionV1::Reject
+    };
+    match super::receipts::local_approval_receipt(state, &target.tenant_id, &receipt_id) {
+        Ok(Some(existing))
+            if existing.request_id == target.gate.action_id
+                && existing.reviewer_passport == approver_passport
+                && existing.decision == decision.as_str() =>
+        {
+            return Ok(MintedGateReceipt {
+                receipt_id,
+                observation_id: existing.observation_id,
+            });
+        }
+        Ok(Some(_)) => {
+            return Err((
+                StatusCode::CONFLICT,
+                "a conflicting approval receipt already exists for this gate".to_string(),
+            ));
+        }
+        Ok(None) => {}
+        Err(detail) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("existing approval receipt validation failed: {detail}"),
+            ));
+        }
+    }
+    let target_state = target.gate.target_state.as_deref().unwrap_or("unchanged");
+    let action_summary = format!(
+        "work:{}:{}:{}",
+        target.work.id, target.gate.requested_action, target_state
+    );
+    let (body_bytes, body_hash) = build_approval_decision_body_v1(&ApprovalDecisionBodyInputV1 {
+        tenant_id: &target.tenant_id,
+        receipt_id: &receipt_id,
+        request_id: &target.gate.action_id,
+        reviewer_passport: approver_passport,
+        decision,
+        risk_tier: ApprovalRiskTierV1::High,
+        action_summary: &action_summary,
+        reviewer_notes: None,
+        decided_at: &decided_at,
+    });
+    if body_bytes.is_empty() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "approval receipt body encoding failed".to_string(),
+        ));
+    }
+    let signing_key = super::stream_receipts::load_signing_key(state)
+        .map_err(|detail| (StatusCode::INTERNAL_SERVER_ERROR, detail))?;
+    let signature = sign_approval_decision_v1(
+        &receipt_id,
+        &body_bytes,
+        body_hash,
+        &signing_key,
+        &state.passport_fpr,
+        &decided_at,
+    );
+    let mut signature_bytes = Vec::new();
+    ciborium::ser::into_writer(&signature, &mut signature_bytes).map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("approval receipt signature encoding failed: {err}"),
+        )
+    })?;
+
+    let observation = super::observations::PostObservationBody {
+        kind: APPROVAL_DECISION_KIND_V1.to_string(),
+        provider: "corecruxd".to_string(),
+        client_ts: None,
+        payload: serde_json::json!({
+            "receipt_id": receipt_id,
+            "tenant_id": target.tenant_id,
+            "request_id": target.gate.action_id,
+            "work_id": target.work.id,
+            "decision": if approve { "approve" } else { "reject" },
+            "reviewer_passport": approver_passport,
+            "body_schema": APPROVAL_DECISION_BODY_SCHEMA_V1,
+            "body_cbor_hex": hex::encode(&body_bytes),
+            "body_hash": format!("blake3:{}", hex::encode(body_hash)),
+            "signature_cbor_hex": hex::encode(&signature_bytes),
+            "signer_key_id": state.passport_fpr,
+            "signer_public_key_hex": state.passport_public_key_hex,
+        }),
+    };
+    let (persisted, _) =
+        super::observations::append_one_durable(state, WORK_GATE_RECEIPT_SESSION, approver_passport, observation, None)
+            .map_err(|(status, detail)| {
+                (
+                    status,
+                    format!("approval receipt signing or persistence failed: {detail}"),
+                )
+            })?;
+    Ok(MintedGateReceipt {
+        receipt_id,
+        observation_id: persisted.observation_id,
+    })
 }
 
 #[derive(Debug, serde::Deserialize)]

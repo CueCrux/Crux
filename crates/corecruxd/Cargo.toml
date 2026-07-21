@@ -36,6 +36,7 @@ utoipa = { workspace = true, features = ["axum_extras"] }
 base64 = { workspace = true }
 blake3 = { workspace = true }
 chrono = { workspace = true, default-features = false, features = ["clock"] }
+ciborium = { workspace = true }
 crc32fast = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["std", "pkcs8"] }
 fs2 = { workspace = true }

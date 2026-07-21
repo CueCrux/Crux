@@ -400,7 +400,16 @@ fn list_observation_files(data_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
             Some(name) => name,
             None => continue,
         };
-        if file_name.starts_with('.') {
+        // Gate approval receipts are tenant-authorized through `/v1/receipts`,
+        // never through aggregate/incident reads or generic retention. The
+        // leading dot hides the current filename; the explicit check keeps the
+        // boundary intact if that implementation detail changes.
+        if file_name.starts_with('.')
+            || path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(is_reserved_work_gate_receipt_session)
+        {
             continue;
         }
         if !std::path::Path::new(file_name)
@@ -443,6 +452,16 @@ fn sanitize_session_id_for_filename(session_id: &str) -> String {
 pub(crate) fn observation_file_path(data_dir: &Path, scoped_session_id: &str) -> PathBuf {
     let filename = format!("{}.jsonl", sanitize_session_id_for_filename(scoped_session_id));
     observations_dir(data_dir).join(filename)
+}
+
+fn is_reserved_work_gate_receipt_session(scoped_session_id: &str) -> bool {
+    sanitize_session_id_for_filename(scoped_session_id).eq_ignore_ascii_case(&sanitize_session_id_for_filename(
+        super::work::WORK_GATE_RECEIPT_SESSION,
+    ))
+}
+
+fn should_stream_observation_to_dataplane(scoped_session_id: &str) -> bool {
+    !is_reserved_work_gate_receipt_session(scoped_session_id)
 }
 
 // ── Canonicalisation + signing ────────────────────────────────────────────
@@ -586,7 +605,7 @@ fn read_chain_tip(file_path: &Path) -> std::io::Result<Option<ChainTip>> {
     }))
 }
 
-fn read_observations(file_path: &Path) -> std::io::Result<Vec<ObservationRecordV1>> {
+pub(super) fn read_observations(file_path: &Path) -> std::io::Result<Vec<ObservationRecordV1>> {
     use std::fs::File;
     use std::io::{BufRead, BufReader};
     let file = match File::open(file_path) {
@@ -612,6 +631,36 @@ fn read_observations(file_path: &Path) -> std::io::Result<Vec<ObservationRecordV
                 );
             }
         }
+    }
+    Ok(out)
+}
+
+/// Strict reader for security-sensitive receipt chains. Unlike the general
+/// observation query path, one malformed non-empty line invalidates the whole
+/// chain instead of being skipped.
+pub(super) fn read_observations_strict(file_path: &Path) -> std::io::Result<Vec<ObservationRecordV1>> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let file = match File::open(file_path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    let reader = BufReader::new(file);
+    let mut out = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record = serde_json::from_str::<ObservationRecordV1>(&line).map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("malformed receipt observation: {err}"),
+            )
+        })?;
+        out.push(record);
     }
     Ok(out)
 }
@@ -827,7 +876,9 @@ fn append_one_unlocked(
     // M5f.3: also stream the (body, sig) pair via the dataplane pool if one
     // is wired. No-op in the Tier 1 local-only build. The JSONL append
     // above is the source of truth; streaming is best-effort.
-    spawn_stream_observation_write(state, &observation_id, body_bytes, &receipt.signature, ts);
+    if should_stream_observation_to_dataplane(scoped_session_id) {
+        spawn_stream_observation_write(state, &observation_id, body_bytes, &receipt.signature, ts);
+    }
 
     Ok((
         PostObservationResponse {
@@ -930,6 +981,9 @@ pub(super) async fn post_observation(
         Err(response) => return response,
     };
     let scoped = scoped_session_id_for_http(&ctx, &session_id);
+    if is_reserved_work_gate_receipt_session(&session_id) || is_reserved_work_gate_receipt_session(&scoped) {
+        return problem_response(StatusCode::FORBIDDEN, "reserved receipt session");
+    }
     let principal = ctx.passport_id.clone().unwrap_or_else(|| state.passport_fpr.clone());
     match append_one(&state, &scoped, &principal, body, None) {
         Ok((resp, _tip)) => (StatusCode::CREATED, Json(resp)).into_response(),
@@ -948,6 +1002,9 @@ pub(super) async fn post_observations_batch(
         Err(response) => return response,
     };
     let scoped = scoped_session_id_for_http(&ctx, &session_id);
+    if is_reserved_work_gate_receipt_session(&session_id) || is_reserved_work_gate_receipt_session(&scoped) {
+        return problem_response(StatusCode::FORBIDDEN, "reserved receipt session");
+    }
     let principal = ctx.passport_id.clone().unwrap_or_else(|| state.passport_fpr.clone());
 
     let mut items = Vec::with_capacity(body.items.len());
@@ -1515,6 +1572,9 @@ pub(super) async fn get_observations(
         Err(response) => return response,
     };
     let scoped = scoped_session_id_for_http(&ctx, &session_id);
+    if is_reserved_work_gate_receipt_session(&session_id) || is_reserved_work_gate_receipt_session(&scoped) {
+        return problem_response(StatusCode::FORBIDDEN, "reserved receipt session");
+    }
     let file_path = observation_file_path(&state.data_dir, &scoped);
     let all_records = match read_observations(&file_path) {
         Ok(records) => records,
@@ -1921,6 +1981,17 @@ mod tests {
         // under `<data_dir>/observations/`, never escapes it.
         assert_eq!(sanitize_session_id_for_filename("../escape"), ".._escape");
         assert!(!sanitize_session_id_for_filename("../etc/passwd").contains('/'));
+    }
+
+    #[test]
+    fn work_gate_receipt_session_never_streams_to_shared_dataplane() {
+        assert!(!should_stream_observation_to_dataplane(
+            crate::http::work::WORK_GATE_RECEIPT_SESSION
+        ));
+        assert!(!should_stream_observation_to_dataplane(
+            &crate::http::work::WORK_GATE_RECEIPT_SESSION.to_ascii_uppercase()
+        ));
+        assert!(should_stream_observation_to_dataplane("ordinary-session"));
     }
 
     #[test]
