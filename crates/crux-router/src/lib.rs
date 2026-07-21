@@ -545,6 +545,7 @@ pub fn mint_free_local_token(
             crl_url: None,
             push_channel: None,
         },
+        caveats: Vec::new(),
         signature: Signature {
             alg: "ed25519".to_string(),
             kid: passport_fpr,
