@@ -371,6 +371,58 @@ where
         .map_err(|_| serde::de::Error::custom("signature.sig must be exactly 64 bytes of hex"))
 }
 
+/// A first-party caveat: a restriction a holder appends to *narrow* its token,
+/// bound by the holder's own possession-key signature (audit-v2 R3 / macaroon
+/// attenuation). Closed v1 set — each is a pure predicate the verifier evaluates
+/// locally. Unknown caveat types must fail closed (deny), never be ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Caveat {
+    /// The effective expiry must be ≤ this instant (shrink lifetime only).
+    ExpiresAtLe { expires_at: u64 },
+    /// The tenant scope must be exactly this tenant (already permitted by the grant).
+    TenantIdEq { tenant_id: String },
+    /// The usable scope must be a subset of these entries.
+    ScopeSubset { scopes: Vec<String> },
+}
+
+/// Domain separator for the holder's caveat-binding signature. The holder signs
+/// `CAVEAT_BINDING_DOMAIN || token_hash(base) || canonical_cbor(caveats)` with its
+/// subject key; the verifier re-derives it and checks the signature.
+pub const CAVEAT_BINDING_DOMAIN: &[u8] = b"rcx-capability-token/caveat-binding/v1\0";
+
+/// The exact bytes a holder signs to bind `caveats` to a base token. Pinning the
+/// base `token_hash` means the caveats cannot be lifted onto a different token,
+/// and any add/remove/reorder/mutate of a caveat changes these bytes (so the
+/// holder signature stops verifying).
+pub fn caveat_binding_message(base_token_hash: &[u8; RCX_CT_HASH_LEN], caveats: &[Caveat]) -> Vec<u8> {
+    let mut message = CAVEAT_BINDING_DOMAIN.to_vec();
+    message.extend_from_slice(base_token_hash);
+    let caveats_cbor = CborValue::Array(caveats.iter().map(caveat_to_cbor).collect()).encode();
+    message.extend_from_slice(&caveats_cbor);
+    message
+}
+
+fn caveat_to_cbor(caveat: &Caveat) -> CborValue {
+    match caveat {
+        Caveat::ExpiresAtLe { expires_at } => CborValue::Map(vec![
+            ("type".to_string(), CborValue::Text("expires_at_le".to_string())),
+            ("expires_at".to_string(), CborValue::Uint(*expires_at)),
+        ]),
+        Caveat::TenantIdEq { tenant_id } => CborValue::Map(vec![
+            ("type".to_string(), CborValue::Text("tenant_id_eq".to_string())),
+            ("tenant_id".to_string(), CborValue::Text(tenant_id.clone())),
+        ]),
+        Caveat::ScopeSubset { scopes } => CborValue::Map(vec![
+            ("type".to_string(), CborValue::Text("scope_subset".to_string())),
+            (
+                "scopes".to_string(),
+                CborValue::Array(scopes.iter().map(|s| CborValue::Text(s.clone())).collect()),
+            ),
+        ]),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RcxCapabilityToken {
@@ -390,6 +442,13 @@ pub struct RcxCapabilityToken {
     pub credits: Credits,
     pub fallback: FallbackPolicy,
     pub revocation: Revocation,
+    /// Holder-appended narrowing caveats (audit-v2 R3). Empty on an un-attenuated
+    /// token — then it is excluded from the canonical form entirely, so existing
+    /// tokens are byte-identical. Bound by the holder signature, NOT the issuer's:
+    /// caveats are excluded from `to_signing_cbor()` so `token_hash()` (and the
+    /// issuer signature over it) is caveat-independent.
+    #[serde(default)]
+    pub caveats: Vec<Caveat>,
     pub signature: Signature,
 }
 
@@ -427,11 +486,21 @@ impl RcxCapabilityToken {
             ("credits".to_string(), credits_to_cbor(&self.credits)),
             ("fallback".to_string(), fallback_to_cbor(&self.fallback)),
             ("revocation".to_string(), revocation_to_cbor(&self.revocation)),
-            (
-                "signature".to_string(),
-                signature_to_cbor(&self.signature, zero_signature),
-            ),
         ]);
+        // Caveats are bound by the HOLDER signature, not the issuer's, so they are
+        // excluded from the signing hash (`zero_signature`) entirely — `token_hash`
+        // stays caveat-independent. In the wire/canonical form they appear only when
+        // present, so an un-attenuated token is byte-identical to a pre-R3 token.
+        if !zero_signature && !self.caveats.is_empty() {
+            pairs.push((
+                "caveats".to_string(),
+                CborValue::Array(self.caveats.iter().map(caveat_to_cbor).collect()),
+            ));
+        }
+        pairs.push((
+            "signature".to_string(),
+            signature_to_cbor(&self.signature, zero_signature),
+        ));
         CborValue::Map(pairs)
     }
 
@@ -726,6 +795,7 @@ pub fn free_local_verified_fixture() -> RcxCapabilityToken {
             crl_url: None,
             push_channel: None,
         },
+        caveats: Vec::new(),
         signature: Signature {
             alg: "ed25519".to_string(),
             kid: passport_fpr.to_string(),
@@ -995,6 +1065,86 @@ mod tests {
         let token = free_local_verified_fixture();
         assert_eq!(hex::encode(token.to_canonical_cbor()), FREE_LOCAL_VERIFIED_CBOR_HEX);
         assert_eq!(token.token_hash_hex(), FREE_LOCAL_VERIFIED_TOKEN_HASH);
+    }
+
+    // ── R3 macaroon M1: caveats + holder-signed binding ───────────────────
+
+    #[test]
+    fn caveats_do_not_affect_token_hash_and_empty_is_invisible() {
+        // The issuer signs token_hash, which MUST be caveat-independent (caveats
+        // are holder-bound, not issuer-bound). An un-attenuated token also carries
+        // no `caveats` field at all (byte-identical — also pinned by the golden test).
+        let base = free_local_verified_fixture();
+        let mut attenuated = base.clone();
+        attenuated.caveats = vec![
+            Caveat::TenantIdEq {
+                tenant_id: "acme".to_string(),
+            },
+            Caveat::ExpiresAtLe { expires_at: 123 },
+        ];
+        assert_eq!(
+            base.token_hash(),
+            attenuated.token_hash(),
+            "caveats must not change token_hash"
+        );
+        assert!(
+            !base.to_canonical_json().contains("caveats"),
+            "un-attenuated token has no caveats field"
+        );
+        assert!(
+            attenuated.to_canonical_json().contains("caveats"),
+            "attenuated token carries caveats"
+        );
+    }
+
+    #[test]
+    fn holder_signature_binds_caveats_and_resists_un_narrowing() {
+        use ed25519_dalek::Verifier as _;
+        let holder = SigningKey::from_bytes(&[7u8; 32]);
+        let base_hash = free_local_verified_fixture().token_hash();
+        let caveats = vec![
+            Caveat::TenantIdEq {
+                tenant_id: "acme".to_string(),
+            },
+            Caveat::ExpiresAtLe { expires_at: 999 },
+        ];
+        let msg = caveat_binding_message(&base_hash, &caveats);
+        let sig = holder.sign(&msg);
+        holder
+            .verifying_key()
+            .verify(&msg, &sig)
+            .expect("holder signature verifies");
+
+        // Strip a caveat → message changes → the holder sig no longer verifies.
+        // A holder cannot un-narrow: it would have to re-sign as a different subject.
+        let stripped = caveat_binding_message(&base_hash, &caveats[..1]);
+        assert!(
+            holder.verifying_key().verify(&stripped, &sig).is_err(),
+            "stripping a caveat breaks the binding"
+        );
+
+        // Reorder → different message (caveat order binds).
+        let reordered = caveat_binding_message(&base_hash, &[caveats[1].clone(), caveats[0].clone()]);
+        assert_ne!(msg, reordered, "caveat order is part of the binding");
+
+        // Caveats cannot be lifted onto a different base token.
+        assert_ne!(
+            msg,
+            caveat_binding_message(&[0u8; RCX_CT_HASH_LEN], &caveats),
+            "base token_hash binds"
+        );
+    }
+
+    #[test]
+    fn caveat_binding_message_is_deterministic() {
+        let base_hash = free_local_verified_fixture().token_hash();
+        let caveats = vec![Caveat::ScopeSubset {
+            scopes: vec!["a".to_string(), "b".to_string()],
+        }];
+        assert_eq!(
+            caveat_binding_message(&base_hash, &caveats),
+            caveat_binding_message(&base_hash, &caveats),
+        );
     }
 
     #[test]
