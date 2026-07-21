@@ -469,20 +469,20 @@ impl VaultPkiX509Signer {
 /// Implement [`crate::c2pa_manifest_v1::C2paSigner`] so the
 /// VaultPkiX509Signer can be passed to [`crate::c2pa_manifest_v1::sign_c2pa_manifest_via_signer`]
 /// without the c2pa module learning anything about Vault. The C2PA
-/// path hashes the canonical body with BLAKE3-32 and we sign the
-/// digest as a prehash (ECDSA accepts any 32-byte prehash; the
-/// algorithm identifier `es256` advertises SHA-256, but the prehash
-/// payload is opaque to the cryptographic layer — verifiers MUST
-/// rehash the same canonical bytes before comparing).
+/// path hashes the canonical body with SHA-256 and signs that digest as a
+/// prehash. This is genuine ES256 (ECDSA P-256 with SHA-256); BLAKE3 remains
+/// the separate envelope-integrity/content-hash mechanism.
 impl crate::c2pa_manifest_v1::C2paSigner for VaultPkiX509Signer {
     fn sign_body(
         &self,
         canonical_body_bytes: &[u8],
     ) -> std::result::Result<crate::c2pa_manifest_v1::SignedManifestParts, crate::c2pa_manifest_v1::C2paManifestError>
     {
-        let hash = blake3::hash(canonical_body_bytes);
+        use sha2::{Digest as _, Sha256};
+
+        let hash = Sha256::digest(canonical_body_bytes);
         let x509_sig = self
-            .sign(hash.as_bytes())
+            .sign(&hash)
             .map_err(|e| crate::c2pa_manifest_v1::C2paManifestError::Encode(format!("vault pki sign: {e}")))?;
         // Key id for X.509 envelopes = SHA-256 hex of the leaf DER.
         // Stable across reloads, doesn't collide with Ed25519 key ids,
@@ -961,6 +961,32 @@ mod tests {
         assert_eq!(parsed.signature_alg, "es256");
         assert_eq!(parsed.signature, signed.signature);
         assert!(parsed.x5chain_pem.is_some());
+
+        // Independent algorithm check: the legacy implementation signed a
+        // BLAKE3 prehash while advertising ES256. Prove new Vault envelopes
+        // verify under SHA-256 and specifically fail under the old digest.
+        use p256::ecdsa::signature::hazmat::PrehashVerifier as _;
+        use sha2::{Digest as _, Sha256};
+        let chain = split_pem_certs(parsed.x5chain_pem.as_ref().unwrap());
+        let leaf_der = pem_to_der(&chain[0]).unwrap();
+        let leaf = Certificate::from_der(&leaf_der).unwrap();
+        let spki = leaf
+            .tbs_certificate()
+            .subject_public_key_info()
+            .subject_public_key
+            .as_bytes()
+            .unwrap();
+        let verifying_key = p256::ecdsa::VerifyingKey::from_sec1_bytes(spki).unwrap();
+        let signature = p256::ecdsa::Signature::from_der(&parsed.signature).unwrap();
+        let sha256 = Sha256::digest(&parsed.canonical_body_bytes);
+        assert!(verifying_key.verify_prehash(&sha256, &signature).is_ok());
+        let legacy_blake3 = blake3::hash(&parsed.canonical_body_bytes);
+        assert!(
+            verifying_key
+                .verify_prehash(legacy_blake3.as_bytes(), &signature)
+                .is_err(),
+            "Vault C2PA signatures must not use the legacy BLAKE3 prehash"
+        );
     }
 
     #[test]

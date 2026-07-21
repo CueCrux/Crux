@@ -142,6 +142,13 @@ unsupported critical extensions. A missing anchor is untrusted, not a soft
 success. Revocation and membership in a public C2PA trust list remain separate
 checks and are reported as such.
 
+Vault-backed manifests now use genuine ES256: ECDSA P-256 over SHA-256 of
+the canonical body. Earlier development builds mislabeled a BLAKE3-prehashed
+signature as `es256`; strict verification intentionally rejects those
+non-standard envelopes. Do not relabel or silently grandfather them as ES256.
+Before enabling the still-default-off X.509 signer, inventory any retained
+development artifacts and classify them explicitly as legacy/non-standard.
+
 ---
 
 ## 4. Rotation playbook

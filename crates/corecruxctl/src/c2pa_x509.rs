@@ -276,7 +276,7 @@ fn verify_x509_envelope(
     ),
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    use p256::ecdsa::signature::hazmat::PrehashVerifier;
+    use p256::ecdsa::signature::Verifier as _;
     use p256::ecdsa::{Signature as P256Sig, VerifyingKey as P256VerifyingKey};
 
     let mut notes: Vec<String> = Vec::new();
@@ -303,8 +303,7 @@ fn verify_x509_envelope(
     let verifying_key =
         P256VerifyingKey::from_sec1_bytes(&leaf_spki).map_err(|e| format!("leaf SPKI is not a P-256 point: {e}"))?;
     let sig = P256Sig::from_der(&parsed.signature).map_err(|e| format!("signature is not DER ECDSA: {e}"))?;
-    let body_hash = blake3::hash(&parsed.canonical_body_bytes);
-    let signature_valid = verifying_key.verify_prehash(body_hash.as_bytes(), &sig).is_ok();
+    let signature_valid = verifying_key.verify(&parsed.canonical_body_bytes, &sig).is_ok();
 
     let anchor_path_buf = anchor_path.map_or_else(|| PathBuf::from(DEFAULT_ROOT_ANCHOR_PATH), Path::to_path_buf);
     let (chain_valid, anchor_sha256) = match std::fs::read_to_string(&anchor_path_buf) {
