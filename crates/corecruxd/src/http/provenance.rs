@@ -25,7 +25,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex, OnceLock,
+};
 use std::time::{Duration, Instant};
 
 use axum::response::{IntoResponse, Response};
@@ -57,9 +60,17 @@ const MAX_TRUSTED_LEAF_PINS: usize = 1_024;
 /// Optional verification-record retention window. Unset means no automatic
 /// deletion; an operator must choose an explicit 1..=3,650-day lifecycle.
 const RETENTION_DAYS_ENV: &str = "CORECRUXD_PROVENANCE_RETENTION_DAYS";
+const RETENTION_SIGNER_KEYRING_ENV: &str = "CORECRUXD_PROVENANCE_RECORD_SIGNER_KEYRING_JSON";
+const MAX_RETENTION_SIGNER_KEYS: usize = 64;
 const MAX_RETENTION_DAYS: u32 = 3_650;
 const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const RETENTION_SWEEP_MAX_TENANTS: usize = 10_000;
+const RETENTION_DISCOVERY_MAX_ENTRIES: usize = 10_000;
+const RETENTION_SCHEDULER_ACTOR: &str = "provenance-retention-scheduler";
+const RETENTION_SCHEDULER_MAX_BYTES_PER_PASS: u64 = 512 * 1024 * 1024;
+const RETENTION_SCHEDULER_MAX_PASS_DURATION: Duration = Duration::from_secs(30);
+const RETENTION_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const RECORD_TENANT_LOCK_SHARDS: usize = 64;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ProvenanceTrustPolicy {
@@ -938,7 +949,11 @@ fn do_verify_record(
             | RecordStoreError::Json(_)
             | RecordStoreError::CorruptRecord
             | RecordStoreError::UnsafePath
-            | RecordStoreError::LockPoisoned => (
+            | RecordStoreError::LockPoisoned
+            | RecordStoreError::InvalidSignerKeyring
+            | RecordStoreError::RetentionAuditUnavailable
+            | RecordStoreError::RetentionCancelled
+            | RecordStoreError::RetentionBudgetExhausted => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "verification record could not be retained",
             ),
@@ -1005,6 +1020,14 @@ enum RecordStoreError {
     UnsafePath,
     #[error("record append lock is poisoned")]
     LockPoisoned,
+    #[error("verification-record retention signer keyring is invalid")]
+    InvalidSignerKeyring,
+    #[error("verification-record retention audit intent could not be durably recorded")]
+    RetentionAuditUnavailable,
+    #[error("verification-record retention pass was cancelled before mutation")]
+    RetentionCancelled,
+    #[error("verification-record retention pass exhausted its configured resource budget")]
+    RetentionBudgetExhausted,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1022,6 +1045,139 @@ struct RecordRetentionSweepSummary {
 struct RecordRetentionSweepRun {
     summary: RecordRetentionSweepSummary,
     error: Option<RecordStoreError>,
+    audit_intent_recorded: bool,
+    bytes_examined: u64,
+}
+
+#[derive(Clone)]
+struct RetentionSweepControls {
+    cancellation: Arc<AtomicBool>,
+    deadline: Option<Instant>,
+    max_store_bytes: u64,
+}
+
+impl RetentionSweepControls {
+    fn unbounded() -> Self {
+        Self {
+            cancellation: Arc::new(AtomicBool::new(false)),
+            deadline: None,
+            max_store_bytes: u64::MAX,
+        }
+    }
+
+    fn check(&self) -> Result<(), RecordStoreError> {
+        if self.cancellation.load(Ordering::Acquire) {
+            return Err(RecordStoreError::RetentionCancelled);
+        }
+        if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(RecordStoreError::RetentionBudgetExhausted);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct RecordReceiptVerifier {
+    verifying_keys: HashMap<String, ed25519_dalek::VerifyingKey>,
+}
+
+impl RecordReceiptVerifier {
+    fn from_parts(expected_signer: &str, public_key_hex: &str) -> Result<Self, RecordStoreError> {
+        let public_key: [u8; 32] = hex::decode(public_key_hex)
+            .map_err(|_| RecordStoreError::InvalidSignerKeyring)?
+            .try_into()
+            .map_err(|_: Vec<u8>| RecordStoreError::InvalidSignerKeyring)?;
+        if corecrux_memory::cruxpack::passport_fpr_from_public_key(&public_key) != expected_signer {
+            return Err(RecordStoreError::InvalidSignerKeyring);
+        }
+        let verifying_key =
+            ed25519_dalek::VerifyingKey::from_bytes(&public_key).map_err(|_| RecordStoreError::InvalidSignerKeyring)?;
+        Ok(Self {
+            verifying_keys: HashMap::from([(expected_signer.to_string(), verifying_key)]),
+        })
+    }
+
+    fn from_state(state: &AppState) -> Result<Self, RecordStoreError> {
+        let mut verifier = Self::from_parts(&state.passport_fpr, &state.passport_public_key_hex)?;
+        let Some(raw_keyring) = std::env::var(RETENTION_SIGNER_KEYRING_ENV)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(verifier);
+        };
+        let historical: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&raw_keyring).map_err(|_| RecordStoreError::InvalidSignerKeyring)?;
+        if historical.len() > MAX_RETENTION_SIGNER_KEYS {
+            return Err(RecordStoreError::InvalidSignerKeyring);
+        }
+        for (signer, value) in historical {
+            let public_key_hex = value.as_str().ok_or(RecordStoreError::InvalidSignerKeyring)?;
+            let historical_verifier = Self::from_parts(&signer, public_key_hex)?;
+            let historical_key = historical_verifier
+                .verifying_keys
+                .get(&signer)
+                .ok_or(RecordStoreError::InvalidSignerKeyring)?;
+            if let Some(existing) = verifier.verifying_keys.get(&signer) {
+                if existing.to_bytes() != historical_key.to_bytes() {
+                    return Err(RecordStoreError::InvalidSignerKeyring);
+                }
+            } else {
+                verifier.verifying_keys.insert(signer, *historical_key);
+            }
+        }
+        Ok(verifier)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ScheduledRetentionReport {
+    tenants_discovered: usize,
+    tenants_selected: usize,
+    tenants_swept: usize,
+    tenants_failed: usize,
+    records_dropped: usize,
+    expired_records_held: usize,
+    receipts_pending: usize,
+    cancelled: bool,
+    budget_exhausted: bool,
+    bytes_examined: u64,
+    empty_directories_removed: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ScheduledRetentionLimits {
+    max_bytes: u64,
+    max_duration: Duration,
+}
+
+impl Default for ScheduledRetentionLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: RETENTION_SCHEDULER_MAX_BYTES_PER_PASS,
+            max_duration: RETENTION_SCHEDULER_MAX_PASS_DURATION,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RetainedTenantCandidate {
+    tenant: String,
+    tenant_hash: String,
+    store_bytes: u64,
+    next_cursor: usize,
+}
+
+struct ScheduledRetentionDiscovery {
+    tenants_discovered: usize,
+    tenants_selected: usize,
+    candidates: Vec<RetainedTenantCandidate>,
+    failures: Vec<(String, RecordStoreError)>,
+    next_cursor: usize,
+    empty_directories_removed: usize,
+    bytes_examined: u64,
+    cancelled: bool,
+    budget_exhausted: bool,
 }
 
 #[derive(Serialize)]
@@ -1038,6 +1194,7 @@ struct RecordRetentionReceiptV1<'a> {
     files_rewritten: usize,
     files_removed: usize,
     status: &'a str,
+    trigger: &'a str,
     recorded_at: String,
 }
 
@@ -1048,9 +1205,56 @@ struct RetentionAudit {
 
 struct RecordRewritePlan {
     path: PathBuf,
+    identity: RecordFileIdentity,
     retained_bytes: Vec<u8>,
     records_dropped: usize,
     expired_records_held: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RecordFileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
+    len: u64,
+    #[cfg(not(unix))]
+    modified: Option<std::time::SystemTime>,
+}
+
+impl RecordFileIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Result<Self, RecordStoreError> {
+        if !metadata.is_file() {
+            return Err(RecordStoreError::UnsafePath);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if metadata.nlink() != 1 {
+                return Err(RecordStoreError::UnsafePath);
+            }
+            Ok(Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+            })
+        }
+    }
+
+    fn matches_path(&self, path: &Path) -> Result<bool, RecordStoreError> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Ok(false);
+        }
+        Ok(*self == Self::from_metadata(&metadata)?)
+    }
 }
 
 fn tenant_records_hash(tenant: &str) -> String {
@@ -1065,13 +1269,259 @@ fn tenant_records_dir(data_dir: &Path, tenant: &str) -> PathBuf {
         .join(format!("t_{tenant_hash}"))
 }
 
+struct AnchoredDirectory {
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+impl AnchoredDirectory {
+    #[cfg(target_os = "linux")]
+    fn open_path(path: &Path) -> Result<Self, RecordStoreError> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let file = options.open(path)?;
+        if !file.metadata()?.is_dir() {
+            return Err(RecordStoreError::UnsafePath);
+        }
+        let anchor = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        let file_metadata = file.metadata()?;
+        let anchor_metadata = std::fs::metadata(&anchor)?;
+        if file_metadata.dev() != anchor_metadata.dev() || file_metadata.ino() != anchor_metadata.ino() {
+            return Err(RecordStoreError::UnsafePath);
+        }
+        Ok(Self { file, path: anchor })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn open_path(path: &Path) -> Result<Self, RecordStoreError> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(RecordStoreError::UnsafePath);
+        }
+        let file = std::fs::File::open(path)?;
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_child(&self, name: &str) -> Result<Self, RecordStoreError> {
+        if name.is_empty() || name.contains('/') {
+            return Err(RecordStoreError::UnsafePath);
+        }
+        let descriptor = rustix::fs::openat(
+            &self.file,
+            name,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?;
+        let file = std::fs::File::from(descriptor);
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        let file_metadata = file.metadata()?;
+        let anchor_metadata = std::fs::metadata(&path)?;
+        if !file_metadata.is_dir()
+            || file_metadata.dev() != anchor_metadata.dev()
+            || file_metadata.ino() != anchor_metadata.ino()
+        {
+            return Err(RecordStoreError::UnsafePath);
+        }
+        Ok(Self { file, path })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn open_child(&self, name: &str) -> Result<Self, RecordStoreError> {
+        Self::open_path(&self.path.join(name))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn sync_all(&self) -> Result<(), RecordStoreError> {
+        self.file.sync_all().map_err(Into::into)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn same_directory(&self, other: &Self) -> Result<bool, RecordStoreError> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let left = self.file.metadata()?;
+        let right = other.file.metadata()?;
+        Ok(left.dev() == right.dev() && left.ino() == right.ino())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn unlink_child(&self, name: &str, remove_directory: bool) -> Result<(), RecordStoreError> {
+        if name.is_empty() || name.contains('/') {
+            return Err(RecordStoreError::UnsafePath);
+        }
+        let flags = if remove_directory {
+            rustix::fs::AtFlags::REMOVEDIR
+        } else {
+            rustix::fs::AtFlags::empty()
+        };
+        rustix::fs::unlinkat(&self.file, name, flags)
+            .map_err(std::io::Error::from)
+            .map_err(Into::into)
+    }
+}
+
+fn open_existing_tenants_root(data_dir: &Path) -> Result<Option<AnchoredDirectory>, RecordStoreError> {
+    let data_root = match AnchoredDirectory::open_path(data_dir) {
+        Ok(root) => root,
+        Err(RecordStoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let provenance_root = match data_root.open_child("provenance") {
+        Ok(root) => root,
+        Err(RecordStoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    match provenance_root.open_child("tenants") {
+        Ok(root) => Ok(Some(root)),
+        Err(RecordStoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn open_existing_tenant_directory(
+    data_dir: &Path,
+    tenant_hash: &str,
+) -> Result<Option<AnchoredDirectory>, RecordStoreError> {
+    let Some(tenants_root) = open_existing_tenants_root(data_dir)? else {
+        return Ok(None);
+    };
+    match tenants_root.open_child(&format!("t_{tenant_hash}")) {
+        Ok(directory) => Ok(Some(directory)),
+        Err(RecordStoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_empty_tenant_directory(data_dir: &Path, tenant_hash: &str) -> Result<bool, RecordStoreError> {
+    cleanup_empty_tenant_directory_with_controls(data_dir, tenant_hash, &RetentionSweepControls::unbounded())
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_empty_tenant_directory_with_controls(
+    data_dir: &Path,
+    tenant_hash: &str,
+    controls: &RetentionSweepControls,
+) -> Result<bool, RecordStoreError> {
+    let _process_guard = lock_tenant_for_retention(tenant_hash, controls)?;
+    let Some(tenant_anchor) = open_existing_tenant_directory(data_dir, tenant_hash)? else {
+        return Ok(false);
+    };
+    let lock_path = tenant_anchor.path().join(".append.lock");
+    let lock_file = match open_private_existing_lock(&lock_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    validate_and_harden_open_file(&lock_file)?;
+    lock_file_for_retention(&lock_file, controls)?;
+    controls.check()?;
+    cleanup_retention_temp_files(tenant_anchor.path())?;
+    for entry in std::fs::read_dir(tenant_anchor.path())? {
+        controls.check()?;
+        let entry = entry?;
+        if entry.file_name() != ".append.lock" {
+            return Ok(false);
+        }
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() || !file_type.is_file() {
+            return Err(RecordStoreError::UnsafePath);
+        }
+    }
+
+    let Some(tenants_root) = open_existing_tenants_root(data_dir)? else {
+        return Err(RecordStoreError::UnsafePath);
+    };
+    let directory_name = format!("t_{tenant_hash}");
+    let current = tenants_root.open_child(&directory_name)?;
+    if !tenant_anchor.same_directory(&current)? {
+        return Err(RecordStoreError::UnsafePath);
+    }
+    tenant_anchor.unlink_child(".append.lock", false)?;
+    tenant_anchor.sync_all()?;
+    tenants_root.unlink_child(&directory_name, true)?;
+    tenants_root.sync_all()?;
+    Ok(true)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cleanup_empty_tenant_directory(_data_dir: &Path, _tenant_hash: &str) -> Result<bool, RecordStoreError> {
+    Err(RecordStoreError::UnsafePath)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cleanup_empty_tenant_directory_with_controls(
+    _data_dir: &Path,
+    _tenant_hash: &str,
+    _controls: &RetentionSweepControls,
+) -> Result<bool, RecordStoreError> {
+    Err(RecordStoreError::UnsafePath)
+}
+
+#[cfg(test)]
 fn records_path(data_dir: &Path, tenant: &str) -> PathBuf {
     tenant_records_dir(data_dir, tenant).join("verification-records.jsonl")
 }
 
-fn record_append_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+fn record_tenant_lock(tenant_hash: &str) -> &'static Mutex<()> {
+    static LOCKS: OnceLock<Box<[Mutex<()>]>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| {
+        (0..RECORD_TENANT_LOCK_SHARDS)
+            .map(|_| Mutex::new(()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    });
+    let digest = blake3::hash(tenant_hash.as_bytes());
+    let shard = usize::from(digest.as_bytes()[0]) % locks.len();
+    &locks[shard]
+}
+
+fn lock_tenant_for_retention<'a>(
+    tenant_hash: &str,
+    controls: &RetentionSweepControls,
+) -> Result<std::sync::MutexGuard<'a, ()>, RecordStoreError> {
+    let lock: &'a Mutex<()> = record_tenant_lock(tenant_hash);
+    loop {
+        controls.check()?;
+        match lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(RETENTION_LOCK_POLL_INTERVAL),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(RecordStoreError::LockPoisoned),
+        }
+    }
+}
+
+fn lock_file_for_retention(file: &std::fs::File, controls: &RetentionSweepControls) -> Result<(), RecordStoreError> {
+    use fs2::FileExt as _;
+
+    loop {
+        controls.check()?;
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(RETENTION_LOCK_POLL_INTERVAL);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 fn is_retention_temp_file(path: &Path) -> bool {
@@ -1081,6 +1531,25 @@ fn is_retention_temp_file(path: &Path) -> bool {
         && path
             .extension()
             .is_some_and(|extension| extension.eq_ignore_ascii_case("tmp"))
+}
+
+fn is_verification_record_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if name == "verification-records.jsonl" {
+        return true;
+    }
+    let Some(archive) = name
+        .strip_prefix("verification-records-")
+        .and_then(|name| name.strip_suffix(".jsonl"))
+    else {
+        return false;
+    };
+    let Some((timestamp, uuid)) = archive.split_once('-') else {
+        return false;
+    };
+    timestamp.parse::<i64>().is_ok() && uuid::Uuid::parse_str(uuid).is_ok()
 }
 
 fn cleanup_retention_temp_files(tenant_dir: &Path) -> Result<(), RecordStoreError> {
@@ -1093,6 +1562,10 @@ fn cleanup_retention_temp_files(tenant_dir: &Path) -> Result<(), RecordStoreErro
         }
         let file_type = entry.file_type()?;
         if file_type.is_symlink() || !file_type.is_file() {
+            return Err(RecordStoreError::UnsafePath);
+        }
+        let identity = RecordFileIdentity::from_metadata(&entry.metadata()?)?;
+        if !identity.matches_path(&path)? {
             return Err(RecordStoreError::UnsafePath);
         }
         std::fs::remove_file(path)?;
@@ -1158,31 +1631,30 @@ fn retain_record_with_limits(
         });
     }
 
-    let _process_guard = record_append_lock()
+    let tenant_hash = tenant_records_hash(tenant);
+    let _process_guard = record_tenant_lock(&tenant_hash)
         .lock()
         .map_err(|_| RecordStoreError::LockPoisoned)?;
-    let tenant_dir = tenant_records_dir(data_dir, tenant);
-    let tenant_dir_preexisting = tenant_dir.exists();
-    std::fs::create_dir_all(&tenant_dir)?;
-    let tenant_dir_metadata = std::fs::symlink_metadata(&tenant_dir)?;
-    if tenant_dir_metadata.file_type().is_symlink() || !tenant_dir_metadata.is_dir() {
-        return Err(RecordStoreError::UnsafePath);
-    }
-    set_private_directory_permissions(&tenant_dir)?;
+    let tenant_dir_path = tenant_records_dir(data_dir, tenant);
+    let tenant_dir_preexisting = tenant_dir_path.exists();
+    std::fs::create_dir_all(&tenant_dir_path)?;
+    let tenant_anchor = open_existing_tenant_directory(data_dir, &tenant_hash)?.ok_or(RecordStoreError::UnsafePath)?;
+    let tenant_dir = tenant_anchor.path();
+    set_private_directory_permissions(tenant_dir)?;
 
     let lock_path = tenant_dir.join(".append.lock");
     reject_symlink_or_non_file(&lock_path)?;
     let lock_file = open_private_append_lock(&lock_path)?;
     validate_and_harden_open_file(&lock_file)?;
     lock_file.lock_exclusive()?;
-    cleanup_retention_temp_files(&tenant_dir)?;
+    cleanup_retention_temp_files(tenant_dir)?;
 
-    let active_path = records_path(data_dir, tenant);
+    let active_path = tenant_dir.join("verification-records.jsonl");
     let mut total_bytes = 0_u64;
     let mut directory_entries = 0_usize;
     let mut active_bytes = None;
     let mut jsonl_paths = Vec::new();
-    for entry in std::fs::read_dir(&tenant_dir)? {
+    for entry in std::fs::read_dir(tenant_dir)? {
         let entry = entry?;
         directory_entries = directory_entries.saturating_add(1);
         if directory_entries > limits.max_directory_entries {
@@ -1196,7 +1668,7 @@ fn retain_record_with_limits(
             return Err(RecordStoreError::UnsafePath);
         }
         let entry_path = entry.path();
-        let is_jsonl = entry_path.extension().and_then(|ext| ext.to_str()) == Some("jsonl");
+        let is_jsonl = is_verification_record_file(&entry_path);
         if entry.file_name() != ".append.lock" && !is_jsonl {
             return Err(RecordStoreError::UnsafePath);
         }
@@ -1235,80 +1707,242 @@ fn retain_record_with_limits(
             uuid::Uuid::new_v4()
         ));
         std::fs::rename(&active_path, archive_path)?;
-        sync_directory(&tenant_dir)?;
+        tenant_anchor.sync_all()?;
     }
 
     let mut file = open_private_append_file(&active_path)?;
     validate_and_harden_open_file(&file)?;
     file.write_all(&serialized)?;
     file.sync_all()?;
-    sync_directory(&tenant_dir)?;
+    tenant_anchor.sync_all()?;
     if !tenant_dir_preexisting {
-        sync_directory_chain(&tenant_dir, data_dir)?;
+        sync_directory_chain(&tenant_dir_path, data_dir)?;
     }
     Ok(RecordAppendOutcome::Appended)
 }
 
+struct ValidatedStoredRecord<'a> {
+    record_id: &'a str,
+    recorded_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn read_bounded_retention_line(
+    reader: &mut impl std::io::BufRead,
+    max_line_bytes: u64,
+    remaining_budget: u64,
+) -> Result<Option<Vec<u8>>, RecordStoreError> {
+    use std::io::{BufRead as _, Read as _};
+
+    if remaining_budget == 0 {
+        return Err(RecordStoreError::RetentionBudgetExhausted);
+    }
+    let read_cap = remaining_budget.min(max_line_bytes.saturating_add(1));
+    let mut encoded_line = Vec::new();
+    let line_bytes = reader.take(read_cap).read_until(b'\n', &mut encoded_line)?;
+    if line_bytes == 0 {
+        return Ok(None);
+    }
+    let line_bytes = u64::try_from(line_bytes).unwrap_or(u64::MAX);
+    if line_bytes > max_line_bytes {
+        return Err(RecordStoreError::CorruptRecord);
+    }
+    if !encoded_line.ends_with(b"\n") {
+        if line_bytes >= remaining_budget && remaining_budget <= max_line_bytes {
+            return Err(RecordStoreError::RetentionBudgetExhausted);
+        }
+        return Err(RecordStoreError::CorruptRecord);
+    }
+    Ok(Some(encoded_line))
+}
+
+fn validate_retained_record_for_retention<'a>(
+    stored: &'a serde_json::Value,
+    tenant: &str,
+    verifier: &RecordReceiptVerifier,
+) -> Result<ValidatedStoredRecord<'a>, RecordStoreError> {
+    use ed25519_dalek::Verifier as _;
+
+    let mut body = stored.as_object().cloned().ok_or(RecordStoreError::CorruptRecord)?;
+    let receipt: ProvenanceReceiptV1 =
+        serde_json::from_value(body.remove("receipt").ok_or(RecordStoreError::CorruptRecord)?)
+            .map_err(|_| RecordStoreError::CorruptRecord)?;
+    if body.get("schema").and_then(serde_json::Value::as_str) != Some("cuecrux.provenance.verification_record.v1")
+        || body.get("tenant_id").and_then(serde_json::Value::as_str) != Some(tenant)
+        || receipt.alg != "ed25519"
+    {
+        return Err(RecordStoreError::CorruptRecord);
+    }
+    let verifying_key = verifier
+        .verifying_keys
+        .get(&receipt.signed_by)
+        .ok_or(RecordStoreError::CorruptRecord)?;
+    let canonical = serde_json::to_vec(&serde_json::Value::Object(body)).map_err(RecordStoreError::Json)?;
+    let hash = blake3::hash(&canonical);
+    if receipt.body_hash != format!("blake3:{}", hex::encode(hash.as_bytes())) {
+        return Err(RecordStoreError::CorruptRecord);
+    }
+    let signature = ed25519_dalek::Signature::from_slice(
+        &hex::decode(&receipt.signature).map_err(|_| RecordStoreError::CorruptRecord)?,
+    )
+    .map_err(|_| RecordStoreError::CorruptRecord)?;
+    verifying_key
+        .verify(hash.as_bytes(), &signature)
+        .map_err(|_| RecordStoreError::CorruptRecord)?;
+
+    let record_id = stored
+        .get("record_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(RecordStoreError::CorruptRecord)?;
+    let recorded_at = stored
+        .get("recorded_at")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(RecordStoreError::CorruptRecord)?;
+    let recorded_at = chrono::DateTime::parse_from_rfc3339(recorded_at)
+        .map_err(|_| RecordStoreError::CorruptRecord)?
+        .with_timezone(&chrono::Utc);
+    Ok(ValidatedStoredRecord { record_id, recorded_at })
+}
+
+#[cfg(test)]
 fn sweep_expired_verification_records(
     data_dir: &Path,
     tenant: &str,
     retention_days: u32,
     now: chrono::DateTime<chrono::Utc>,
     legal_holds: &[corecrux_memory::LegalHold],
+    verifier: &RecordReceiptVerifier,
 ) -> RecordRetentionSweepRun {
-    let cutoff = now - chrono::Duration::days(i64::from(retention_days));
-    let mut summary = RecordRetentionSweepSummary {
+    sweep_expired_verification_records_with_audit_intent(
+        data_dir,
+        tenant,
         retention_days,
+        now,
+        legal_holds,
+        verifier,
+        |_| Ok(()),
+    )
+}
+
+fn sweep_expired_verification_records_with_audit_intent(
+    data_dir: &Path,
+    tenant: &str,
+    retention_days: u32,
+    now: chrono::DateTime<chrono::Utc>,
+    legal_holds: &[corecrux_memory::LegalHold],
+    verifier: &RecordReceiptVerifier,
+    record_audit_intent: impl FnMut(&RecordRetentionSweepSummary) -> Result<(), RecordStoreError>,
+) -> RecordRetentionSweepRun {
+    sweep_expired_verification_records_with_controls(
+        data_dir,
+        RetentionSweepRequest {
+            tenant,
+            retention_days,
+            now,
+            legal_holds,
+            verifier,
+            controls: &RetentionSweepControls::unbounded(),
+        },
+        record_audit_intent,
+    )
+}
+
+struct RetentionSweepRequest<'a> {
+    tenant: &'a str,
+    retention_days: u32,
+    now: chrono::DateTime<chrono::Utc>,
+    legal_holds: &'a [corecrux_memory::LegalHold],
+    verifier: &'a RecordReceiptVerifier,
+    controls: &'a RetentionSweepControls,
+}
+
+struct RetentionSweepContext<'a> {
+    tenant: &'a str,
+    cutoff: chrono::DateTime<chrono::Utc>,
+    legal_holds: &'a [corecrux_memory::LegalHold],
+    verifier: &'a RecordReceiptVerifier,
+    controls: &'a RetentionSweepControls,
+}
+
+fn sweep_expired_verification_records_with_controls(
+    data_dir: &Path,
+    request: RetentionSweepRequest<'_>,
+    mut record_audit_intent: impl FnMut(&RecordRetentionSweepSummary) -> Result<(), RecordStoreError>,
+) -> RecordRetentionSweepRun {
+    let cutoff = request.now - chrono::Duration::days(i64::from(request.retention_days));
+    let mut summary = RecordRetentionSweepSummary {
+        retention_days: request.retention_days,
         cutoff: cutoff.to_rfc3339(),
-        tenant_hash: tenant_records_hash(tenant),
+        tenant_hash: tenant_records_hash(request.tenant),
         records_dropped: 0,
         expired_records_held: 0,
         files_rewritten: 0,
         files_removed: 0,
     };
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = &mut record_audit_intent;
+        return RecordRetentionSweepRun {
+            summary,
+            error: Some(RecordStoreError::UnsafePath),
+            audit_intent_recorded: false,
+            bytes_examined: 0,
+        };
+    }
+
+    let context = RetentionSweepContext {
+        tenant: request.tenant,
+        cutoff,
+        legal_holds: request.legal_holds,
+        verifier: request.verifier,
+        controls: request.controls,
+    };
+    let mut audit_intent_recorded = false;
+    let mut tracked_audit_intent = |planned: &RecordRetentionSweepSummary| {
+        record_audit_intent(planned)?;
+        audit_intent_recorded = true;
+        Ok(())
+    };
+    let mut bytes_examined = 0;
     let error = sweep_expired_verification_records_inner(
         data_dir,
-        tenant,
-        cutoff,
-        legal_holds,
-        RecordStoreLimits::default(),
+        &context,
         &mut summary,
+        &mut bytes_examined,
+        &mut tracked_audit_intent,
     )
     .err();
-    RecordRetentionSweepRun { summary, error }
+    RecordRetentionSweepRun {
+        summary,
+        error,
+        audit_intent_recorded,
+        bytes_examined,
+    }
 }
 
 fn sweep_expired_verification_records_inner(
     data_dir: &Path,
-    tenant: &str,
-    cutoff: chrono::DateTime<chrono::Utc>,
-    legal_holds: &[corecrux_memory::LegalHold],
-    limits: RecordStoreLimits,
+    context: &RetentionSweepContext<'_>,
     summary: &mut RecordRetentionSweepSummary,
+    bytes_examined: &mut u64,
+    record_audit_intent: &mut impl FnMut(&RecordRetentionSweepSummary) -> Result<(), RecordStoreError>,
 ) -> Result<(), RecordStoreError> {
-    use fs2::FileExt as _;
-    use std::io::BufRead as _;
-
-    let _process_guard = record_append_lock()
-        .lock()
-        .map_err(|_| RecordStoreError::LockPoisoned)?;
-    let tenant_dir = tenant_records_dir(data_dir, tenant);
-    let tenant_dir_metadata = match std::fs::symlink_metadata(&tenant_dir) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err.into()),
+    let limits = RecordStoreLimits::default();
+    context.controls.check()?;
+    let tenant_hash = tenant_records_hash(context.tenant);
+    let _process_guard = lock_tenant_for_retention(&tenant_hash, context.controls)?;
+    let Some(tenant_anchor) = open_existing_tenant_directory(data_dir, &tenant_hash)? else {
+        return Ok(());
     };
-    if tenant_dir_metadata.file_type().is_symlink() || !tenant_dir_metadata.is_dir() {
-        return Err(RecordStoreError::UnsafePath);
-    }
-    set_private_directory_permissions(&tenant_dir)?;
+    let tenant_dir = tenant_anchor.path();
+    set_private_directory_permissions(tenant_dir)?;
 
     let lock_path = tenant_dir.join(".append.lock");
     reject_symlink_or_non_file(&lock_path)?;
     let lock_file = open_private_append_lock(&lock_path)?;
     validate_and_harden_open_file(&lock_file)?;
-    lock_file.lock_exclusive()?;
-    cleanup_retention_temp_files(&tenant_dir)?;
+    lock_file_for_retention(&lock_file, context.controls)?;
+    context.controls.check()?;
+    cleanup_retention_temp_files(tenant_dir)?;
 
     // Validate and plan the complete tenant rewrite before deleting anything.
     // The store is already capped at 64 MiB per tenant, which bounds this
@@ -1316,7 +1950,8 @@ fn sweep_expired_verification_records_inner(
     let mut plans = Vec::new();
     let mut directory_entries = 0usize;
     let mut total_bytes = 0u64;
-    for entry in std::fs::read_dir(&tenant_dir)? {
+    for entry in std::fs::read_dir(tenant_dir)? {
+        context.controls.check()?;
         let entry = entry?;
         directory_entries = directory_entries.saturating_add(1);
         if directory_entries > limits.max_directory_entries {
@@ -1330,10 +1965,15 @@ fn sweep_expired_verification_records_inner(
         if entry.file_name() == ".append.lock" {
             continue;
         }
-        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+        if !is_verification_record_file(&path) {
             return Err(RecordStoreError::UnsafePath);
         }
-        total_bytes = total_bytes.saturating_add(entry.metadata()?.len());
+        let next_total = total_bytes.saturating_add(entry.metadata()?.len());
+        if next_total > context.controls.max_store_bytes {
+            return Err(RecordStoreError::RetentionBudgetExhausted);
+        }
+        total_bytes = next_total;
+        *bytes_examined = total_bytes;
         if total_bytes > limits.tenant_max_bytes {
             return Err(RecordStoreError::TenantQuotaExceeded {
                 needed: total_bytes,
@@ -1344,21 +1984,21 @@ fn sweep_expired_verification_records_inner(
         reject_symlink_or_non_file(&path)?;
         let file = open_private_read_file(&path)?;
         validate_and_harden_open_file(&file)?;
+        let identity = RecordFileIdentity::from_metadata(&file.metadata()?)?;
         let mut reader = std::io::BufReader::new(file);
         let mut retained_bytes = Vec::new();
         let mut records_dropped = 0usize;
         let mut expired_records_held = 0usize;
         loop {
-            let mut encoded_line = Vec::new();
-            let bytes_read = reader.read_until(b'\n', &mut encoded_line)?;
-            if bytes_read == 0 {
+            context.controls.check()?;
+            let Some(encoded_line) = read_bounded_retention_line(
+                &mut reader,
+                limits.max_line_bytes,
+                limits.max_line_bytes.saturating_add(1),
+            )?
+            else {
                 break;
-            }
-            if !encoded_line.ends_with(b"\n")
-                || u64::try_from(encoded_line.len()).unwrap_or(u64::MAX) > limits.max_line_bytes
-            {
-                return Err(RecordStoreError::CorruptRecord);
-            }
+            };
             let json_bytes = &encoded_line[..encoded_line.len() - 1];
             if json_bytes.iter().all(u8::is_ascii_whitespace) {
                 retained_bytes.extend_from_slice(&encoded_line);
@@ -1366,30 +2006,18 @@ fn sweep_expired_verification_records_inner(
             }
             let stored: serde_json::Value =
                 serde_json::from_slice(json_bytes).map_err(|_| RecordStoreError::CorruptRecord)?;
-            if stored.get("schema").and_then(serde_json::Value::as_str)
-                != Some("cuecrux.provenance.verification_record.v1")
-                || stored.get("tenant_id").and_then(serde_json::Value::as_str) != Some(tenant)
-            {
-                return Err(RecordStoreError::CorruptRecord);
-            }
-            let record_id = stored
-                .get("record_id")
-                .and_then(serde_json::Value::as_str)
-                .ok_or(RecordStoreError::CorruptRecord)?;
-            let recorded_at = stored
-                .get("recorded_at")
-                .and_then(serde_json::Value::as_str)
-                .ok_or(RecordStoreError::CorruptRecord)?;
-            let recorded_at = chrono::DateTime::parse_from_rfc3339(recorded_at)
-                .map_err(|_| RecordStoreError::CorruptRecord)?
-                .with_timezone(&chrono::Utc);
-            if recorded_at >= cutoff {
+            let validated = validate_retained_record_for_retention(&stored, context.tenant, context.verifier)?;
+            if validated.recorded_at >= context.cutoff {
                 retained_bytes.extend_from_slice(&encoded_line);
                 continue;
             }
 
-            let entity = format!("provenance::verification_record::{record_id}");
-            if legal_holds.iter().any(|hold| hold.covers(tenant, &entity)) {
+            let entity = format!("provenance::verification_record::{}", validated.record_id);
+            if context
+                .legal_holds
+                .iter()
+                .any(|hold| hold.covers(context.tenant, &entity))
+            {
                 retained_bytes.extend_from_slice(&encoded_line);
                 expired_records_held = expired_records_held.saturating_add(1);
             } else {
@@ -1399,6 +2027,7 @@ fn sweep_expired_verification_records_inner(
         if records_dropped > 0 {
             plans.push(RecordRewritePlan {
                 path,
+                identity,
                 retained_bytes,
                 records_dropped,
                 expired_records_held,
@@ -1408,13 +2037,33 @@ fn sweep_expired_verification_records_inner(
         }
     }
 
+    let mut planned_summary = summary.clone();
+    for plan in &plans {
+        planned_summary.records_dropped = planned_summary.records_dropped.saturating_add(plan.records_dropped);
+        planned_summary.expired_records_held = planned_summary
+            .expired_records_held
+            .saturating_add(plan.expired_records_held);
+        if plan.retained_bytes.is_empty() {
+            planned_summary.files_removed = planned_summary.files_removed.saturating_add(1);
+        } else {
+            planned_summary.files_rewritten = planned_summary.files_rewritten.saturating_add(1);
+        }
+    }
+    if planned_summary.records_dropped > 0 {
+        context.controls.check()?;
+        record_audit_intent(&planned_summary)?;
+    }
+
     for plan in plans {
+        if !plan.identity.matches_path(&plan.path)? {
+            return Err(RecordStoreError::UnsafePath);
+        }
         if plan.retained_bytes.is_empty() {
             std::fs::remove_file(&plan.path)?;
             summary.records_dropped = summary.records_dropped.saturating_add(plan.records_dropped);
             summary.expired_records_held = summary.expired_records_held.saturating_add(plan.expired_records_held);
             summary.files_removed = summary.files_removed.saturating_add(1);
-            sync_directory(&tenant_dir)?;
+            tenant_anchor.sync_all()?;
             continue;
         }
 
@@ -1426,11 +2075,14 @@ fn sweep_expired_verification_records_inner(
             validate_and_harden_open_file(&temp_file)?;
             temp_file.write_all(&plan.retained_bytes)?;
             temp_file.sync_all()?;
+            if !plan.identity.matches_path(&plan.path)? {
+                return Err(RecordStoreError::UnsafePath);
+            }
             std::fs::rename(&temp_path, &plan.path)?;
             summary.records_dropped = summary.records_dropped.saturating_add(plan.records_dropped);
             summary.expired_records_held = summary.expired_records_held.saturating_add(plan.expired_records_held);
             summary.files_rewritten = summary.files_rewritten.saturating_add(1);
-            sync_directory(&tenant_dir)?;
+            tenant_anchor.sync_all()?;
             Ok(())
         })();
         if rewrite_result.is_err() {
@@ -1439,6 +2091,695 @@ fn sweep_expired_verification_records_inner(
         rewrite_result?;
     }
     Ok(())
+}
+
+fn retention_terminal_status(run: &RecordRetentionSweepRun) -> Option<&'static str> {
+    run.audit_intent_recorded
+        .then_some(if run.error.is_some() { "failed" } else { "completed" })
+}
+
+#[cfg(test)]
+fn provenance_tenants_root(data_dir: &Path) -> PathBuf {
+    data_dir.join("provenance").join("tenants")
+}
+
+fn tenant_hash_from_directory_name(name: &str) -> Result<String, RecordStoreError> {
+    let hash = name.strip_prefix("t_").ok_or(RecordStoreError::UnsafePath)?;
+    if hash.len() != 64
+        || !hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(RecordStoreError::UnsafePath);
+    }
+    Ok(hash.to_string())
+}
+
+#[cfg(test)]
+fn list_retained_tenant_directories_with_limit(
+    data_dir: &Path,
+    max_entries: usize,
+) -> Result<Vec<String>, RecordStoreError> {
+    list_retained_tenant_directories_with_controls(data_dir, max_entries, &RetentionSweepControls::unbounded())
+}
+
+fn list_retained_tenant_directories_with_controls(
+    data_dir: &Path,
+    max_entries: usize,
+    controls: &RetentionSweepControls,
+) -> Result<Vec<String>, RecordStoreError> {
+    controls.check()?;
+    let Some(tenants_root) = open_existing_tenants_root(data_dir)? else {
+        return Ok(Vec::new());
+    };
+
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(tenants_root.path())? {
+        controls.check()?;
+        let entry = entry?;
+        if paths.len() >= max_entries {
+            return Err(RecordStoreError::TooManyEntries);
+        }
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() || !file_type.is_dir() {
+            return Err(RecordStoreError::UnsafePath);
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| RecordStoreError::UnsafePath)?;
+        tenant_hash_from_directory_name(&name)?;
+        paths.push(name);
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn selected_tenant_directories(paths: &[String], cursor: &mut usize, limit: usize) -> Vec<String> {
+    if paths.is_empty() || limit == 0 {
+        *cursor = 0;
+        return Vec::new();
+    }
+    let start = *cursor % paths.len();
+    let count = limit.min(paths.len());
+    let selected = (0..count)
+        .map(|offset| paths[(start + offset) % paths.len()].clone())
+        .collect();
+    *cursor = (start + count) % paths.len();
+    selected
+}
+
+fn recover_retained_tenant(
+    data_dir: &Path,
+    tenant_hash: &str,
+    verifier: &RecordReceiptVerifier,
+    controls: &RetentionSweepControls,
+    bytes_examined: &mut u64,
+) -> Result<Option<RetainedTenantCandidate>, RecordStoreError> {
+    controls.check()?;
+    let _process_guard = lock_tenant_for_retention(tenant_hash, controls)?;
+    let Some(tenant_anchor) = open_existing_tenant_directory(data_dir, tenant_hash)? else {
+        return Ok(None);
+    };
+    let tenant_dir = tenant_anchor.path();
+    let lock_path = tenant_dir.join(".append.lock");
+    let lock_metadata = std::fs::symlink_metadata(&lock_path)?;
+    if lock_metadata.file_type().is_symlink() || !lock_metadata.is_file() {
+        return Err(RecordStoreError::UnsafePath);
+    }
+    let lock_file = open_private_existing_lock(&lock_path)?;
+    validate_and_harden_open_file(&lock_file)?;
+    lock_file_for_retention(&lock_file, controls)?;
+
+    let mut jsonl_paths = Vec::new();
+    let mut directory_entries = 0usize;
+    let mut total_bytes = 0u64;
+    for entry in std::fs::read_dir(tenant_dir)? {
+        controls.check()?;
+        let entry = entry?;
+        directory_entries = directory_entries.saturating_add(1);
+        if directory_entries > RECORD_MAX_DIRECTORY_ENTRIES {
+            return Err(RecordStoreError::TooManyEntries);
+        }
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() || !file_type.is_file() {
+            return Err(RecordStoreError::UnsafePath);
+        }
+        let path = entry.path();
+        if entry.file_name() == ".append.lock" || is_retention_temp_file(&path) {
+            continue;
+        }
+        if !is_verification_record_file(&path) {
+            return Err(RecordStoreError::UnsafePath);
+        }
+        let file_bytes = entry.metadata()?.len();
+        let next_examined = (*bytes_examined).saturating_add(file_bytes);
+        if next_examined > controls.max_store_bytes {
+            return Err(RecordStoreError::RetentionBudgetExhausted);
+        }
+        *bytes_examined = next_examined;
+        total_bytes = total_bytes.saturating_add(file_bytes);
+        if total_bytes > RECORD_TENANT_MAX_BYTES {
+            return Err(RecordStoreError::TenantQuotaExceeded {
+                needed: total_bytes,
+                max: RECORD_TENANT_MAX_BYTES,
+            });
+        }
+        jsonl_paths.push(path);
+    }
+    jsonl_paths.sort();
+
+    let had_jsonl = !jsonl_paths.is_empty();
+    for path in jsonl_paths {
+        controls.check()?;
+        reject_symlink_or_non_file(&path)?;
+        let file = open_private_read_file(&path)?;
+        validate_and_harden_open_file(&file)?;
+        let mut reader = std::io::BufReader::new(file);
+        loop {
+            controls.check()?;
+            let Some(encoded_line) = read_bounded_retention_line(
+                &mut reader,
+                RECORD_MAX_LINE_BYTES,
+                RECORD_MAX_LINE_BYTES.saturating_add(1),
+            )?
+            else {
+                break;
+            };
+            let json_bytes = &encoded_line[..encoded_line.len() - 1];
+            if json_bytes.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let stored: serde_json::Value =
+                serde_json::from_slice(json_bytes).map_err(|_| RecordStoreError::CorruptRecord)?;
+            let tenant = stored
+                .get("tenant_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(RecordStoreError::CorruptRecord)?;
+            if tenant_records_hash(tenant) != tenant_hash {
+                return Err(RecordStoreError::CorruptRecord);
+            }
+            validate_retained_record_for_retention(&stored, tenant, verifier)?;
+            return Ok(Some(RetainedTenantCandidate {
+                tenant: tenant.to_string(),
+                tenant_hash: tenant_hash.to_string(),
+                store_bytes: total_bytes,
+                next_cursor: 0,
+            }));
+        }
+    }
+    if had_jsonl {
+        Err(RecordStoreError::CorruptRecord)
+    } else {
+        Ok(None)
+    }
+}
+
+fn with_active_tenant_legal_holds<R>(
+    fact_store: &tokio::sync::RwLock<corecrux_memory::FactStore>,
+    tenant: &str,
+    apply: impl FnOnce(&[corecrux_memory::LegalHold]) -> R,
+) -> R {
+    let store = fact_store.blocking_read();
+    let legal_holds: Vec<_> = store
+        .active_legal_holds()
+        .into_iter()
+        .filter(|hold| hold.tenant_id == tenant)
+        .collect();
+    let result = apply(&legal_holds);
+    drop(store);
+    result
+}
+
+fn with_active_tenant_legal_holds_controlled<R>(
+    fact_store: &tokio::sync::RwLock<corecrux_memory::FactStore>,
+    tenant: &str,
+    controls: &RetentionSweepControls,
+    apply: impl FnOnce(&[corecrux_memory::LegalHold]) -> R,
+) -> Result<R, RecordStoreError> {
+    let store = loop {
+        controls.check()?;
+        if let Ok(store) = fact_store.try_read() {
+            break store;
+        }
+        std::thread::sleep(RETENTION_LOCK_POLL_INTERVAL);
+    };
+    let legal_holds: Vec<_> = store
+        .active_legal_holds()
+        .into_iter()
+        .filter(|hold| hold.tenant_id == tenant)
+        .collect();
+    let result = apply(&legal_holds);
+    drop(store);
+    Ok(result)
+}
+
+#[cfg(test)]
+async fn run_scheduled_retention_once(
+    state: &AppState,
+    retention_days: u32,
+    max_tenants: usize,
+    now: chrono::DateTime<chrono::Utc>,
+    cursor: &mut usize,
+) -> Result<ScheduledRetentionReport, RecordStoreError> {
+    run_scheduled_retention_once_with_limits(
+        state,
+        retention_days,
+        max_tenants,
+        now,
+        cursor,
+        Arc::new(AtomicBool::new(false)),
+        ScheduledRetentionLimits::default(),
+    )
+    .await
+}
+
+async fn run_scheduled_retention_once_with_cancel(
+    state: &AppState,
+    retention_days: u32,
+    max_tenants: usize,
+    now: chrono::DateTime<chrono::Utc>,
+    cursor: &mut usize,
+    cancellation: Arc<AtomicBool>,
+) -> Result<ScheduledRetentionReport, RecordStoreError> {
+    run_scheduled_retention_once_with_limits(
+        state,
+        retention_days,
+        max_tenants,
+        now,
+        cursor,
+        cancellation,
+        ScheduledRetentionLimits::default(),
+    )
+    .await
+}
+
+async fn run_scheduled_retention_once_with_limits(
+    state: &AppState,
+    retention_days: u32,
+    max_tenants: usize,
+    now: chrono::DateTime<chrono::Utc>,
+    cursor: &mut usize,
+    cancellation: Arc<AtomicBool>,
+    limits: ScheduledRetentionLimits,
+) -> Result<ScheduledRetentionReport, RecordStoreError> {
+    let pass_started = Instant::now();
+    let pass_controls = RetentionSweepControls {
+        cancellation: cancellation.clone(),
+        deadline: pass_started.checked_add(limits.max_duration),
+        max_store_bytes: limits.max_bytes,
+    };
+    let verifier = RecordReceiptVerifier::from_state(state)?;
+    let data_dir = state.data_dir.clone();
+    let discovery_verifier = verifier.clone();
+    let discovery_controls = pass_controls.clone();
+    let mut discovery_cursor = *cursor;
+    let discovery_result = tokio::task::spawn_blocking(move || {
+        let paths = match list_retained_tenant_directories_with_controls(
+            &data_dir,
+            RETENTION_DISCOVERY_MAX_ENTRIES,
+            &discovery_controls,
+        ) {
+            Ok(paths) => paths,
+            Err(RecordStoreError::RetentionCancelled) => {
+                return Ok(ScheduledRetentionDiscovery {
+                    tenants_discovered: 0,
+                    tenants_selected: 0,
+                    candidates: Vec::new(),
+                    failures: Vec::new(),
+                    next_cursor: discovery_cursor,
+                    empty_directories_removed: 0,
+                    bytes_examined: 0,
+                    cancelled: true,
+                    budget_exhausted: false,
+                });
+            }
+            Err(RecordStoreError::RetentionBudgetExhausted) => {
+                return Ok(ScheduledRetentionDiscovery {
+                    tenants_discovered: 0,
+                    tenants_selected: 0,
+                    candidates: Vec::new(),
+                    failures: Vec::new(),
+                    next_cursor: discovery_cursor.saturating_add(max_tenants),
+                    empty_directories_removed: 0,
+                    bytes_examined: 0,
+                    cancelled: false,
+                    budget_exhausted: true,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let discovered = paths.len();
+        let selection_start = if paths.is_empty() {
+            0
+        } else {
+            discovery_cursor % paths.len()
+        };
+        let selected = selected_tenant_directories(&paths, &mut discovery_cursor, max_tenants);
+        let selected_count = selected.len();
+        let mut candidates = Vec::new();
+        let mut failures = Vec::new();
+        let mut empty_directories_removed = 0usize;
+        let mut bytes_examined = 0u64;
+        let mut cancelled = false;
+        let mut budget_exhausted = false;
+        let mut next_cursor = selection_start;
+        for (offset, directory_name) in selected.into_iter().enumerate() {
+            match discovery_controls.check() {
+                Ok(()) => {}
+                Err(RecordStoreError::RetentionCancelled) => {
+                    cancelled = true;
+                    break;
+                }
+                Err(RecordStoreError::RetentionBudgetExhausted) => {
+                    budget_exhausted = true;
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+            let directory_next_cursor = (selection_start + offset + 1) % paths.len();
+            next_cursor = directory_next_cursor;
+            let tenant_hash = tenant_hash_from_directory_name(&directory_name)?;
+            match recover_retained_tenant(
+                &data_dir,
+                &tenant_hash,
+                &discovery_verifier,
+                &discovery_controls,
+                &mut bytes_examined,
+            ) {
+                Ok(Some(mut candidate)) => {
+                    candidate.next_cursor = directory_next_cursor;
+                    candidates.push(candidate);
+                }
+                Ok(None) => {
+                    match cleanup_empty_tenant_directory_with_controls(&data_dir, &tenant_hash, &discovery_controls) {
+                        Ok(true) => empty_directories_removed = empty_directories_removed.saturating_add(1),
+                        Ok(false) => {}
+                        Err(RecordStoreError::RetentionCancelled) => {
+                            cancelled = true;
+                            break;
+                        }
+                        Err(RecordStoreError::RetentionBudgetExhausted) => {
+                            budget_exhausted = true;
+                            break;
+                        }
+                        Err(error) => failures.push((tenant_hash, error)),
+                    }
+                }
+                Err(RecordStoreError::RetentionCancelled) => {
+                    cancelled = true;
+                    break;
+                }
+                Err(RecordStoreError::RetentionBudgetExhausted) => {
+                    budget_exhausted = true;
+                    break;
+                }
+                Err(error) => failures.push((tenant_hash, error)),
+            }
+        }
+        Ok::<_, RecordStoreError>(ScheduledRetentionDiscovery {
+            tenants_discovered: discovered,
+            tenants_selected: selected_count,
+            candidates,
+            failures,
+            next_cursor,
+            empty_directories_removed,
+            bytes_examined,
+            cancelled,
+            budget_exhausted,
+        })
+    })
+    .await
+    .map_err(|error| RecordStoreError::Io(std::io::Error::other(format!("retention discovery task: {error}"))))?;
+    let discovery = discovery_result?;
+    *cursor = discovery.next_cursor;
+    let mut report = ScheduledRetentionReport {
+        tenants_discovered: discovery.tenants_discovered,
+        tenants_selected: discovery.tenants_selected,
+        tenants_failed: discovery.failures.len(),
+        empty_directories_removed: discovery.empty_directories_removed,
+        bytes_examined: discovery.bytes_examined,
+        cancelled: discovery.cancelled,
+        budget_exhausted: discovery.budget_exhausted,
+        ..ScheduledRetentionReport::default()
+    };
+    for (tenant_hash, error) in discovery.failures {
+        tracing::error!(%tenant_hash, %error, "provenance retention tenant discovery failed closed");
+    }
+    if report.cancelled || report.budget_exhausted {
+        return Ok(report);
+    }
+
+    for candidate in discovery.candidates {
+        *cursor = candidate.next_cursor;
+        match pass_controls.check() {
+            Ok(()) => {}
+            Err(RecordStoreError::RetentionCancelled) => {
+                report.cancelled = true;
+                break;
+            }
+            Err(RecordStoreError::RetentionBudgetExhausted) => {
+                report.budget_exhausted = true;
+                break;
+            }
+            Err(error) => return Err(error),
+        }
+        let remaining_bytes = limits.max_bytes.saturating_sub(report.bytes_examined);
+        if remaining_bytes == 0 || candidate.store_bytes > remaining_bytes {
+            report.budget_exhausted = true;
+            break;
+        }
+        if !retention_sweep_due(&candidate.tenant, Instant::now()) {
+            continue;
+        }
+        let sweep_controls = RetentionSweepControls {
+            max_store_bytes: remaining_bytes,
+            ..pass_controls.clone()
+        };
+        let fact_store = state.fact_store.clone();
+        let receipt_state = state.clone();
+        let sweep_data_dir = state.data_dir.clone();
+        let sweep_tenant = candidate.tenant;
+        let tenant_hash = candidate.tenant_hash;
+        let sweep_verifier = verifier.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<_, RecordStoreError> {
+            let sweep_id = new_retention_sweep_id();
+            let mut run = with_active_tenant_legal_holds_controlled(
+                &fact_store,
+                &sweep_tenant,
+                &sweep_controls,
+                |legal_holds| {
+                    sweep_expired_verification_records_with_controls(
+                        &sweep_data_dir,
+                        RetentionSweepRequest {
+                            tenant: &sweep_tenant,
+                            retention_days,
+                            now,
+                            legal_holds,
+                            verifier: &sweep_verifier,
+                            controls: &sweep_controls,
+                        },
+                        |planned| {
+                            let intent = mint_record_retention_intent_controlled(
+                                &receipt_state,
+                                RETENTION_SCHEDULER_ACTOR,
+                                planned.clone(),
+                                &sweep_id,
+                                "scheduled",
+                                &sweep_controls,
+                            )?;
+                            intent
+                                .receipt_id
+                                .map(|_| ())
+                                .ok_or(RecordStoreError::RetentionAuditUnavailable)
+                        },
+                    )
+                },
+            )?;
+            let empty_directory_removed = if run.error.is_none() {
+                match cleanup_empty_tenant_directory_with_controls(
+                    &sweep_data_dir,
+                    &tenant_records_hash(&sweep_tenant),
+                    &sweep_controls,
+                ) {
+                    Ok(removed) => removed,
+                    Err(error) => {
+                        run.error = Some(error);
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            let audit = retention_terminal_status(&run).map(|status| {
+                mint_record_retention_receipt(
+                    &receipt_state,
+                    RETENTION_SCHEDULER_ACTOR,
+                    run.summary.clone(),
+                    &sweep_id,
+                    status,
+                    "scheduled",
+                )
+            });
+            Ok((run, audit, empty_directory_removed))
+        })
+        .await;
+        let (run, audit, empty_directory_removed) = match result {
+            Ok(Ok(result)) => result,
+            Ok(Err(RecordStoreError::RetentionCancelled)) => {
+                report.cancelled = true;
+                break;
+            }
+            Ok(Err(RecordStoreError::RetentionBudgetExhausted)) => {
+                report.budget_exhausted = true;
+                break;
+            }
+            Ok(Err(error)) => {
+                report.tenants_failed = report.tenants_failed.saturating_add(1);
+                tracing::error!(%tenant_hash, %error, "provenance retention tenant task failed closed");
+                continue;
+            }
+            Err(error) => {
+                report.tenants_failed = report.tenants_failed.saturating_add(1);
+                tracing::error!(%tenant_hash, %error, "provenance retention tenant task failed");
+                continue;
+            }
+        };
+        report.bytes_examined = report.bytes_examined.saturating_add(run.bytes_examined);
+        report.records_dropped = report.records_dropped.saturating_add(run.summary.records_dropped);
+        if empty_directory_removed {
+            report.empty_directories_removed = report.empty_directories_removed.saturating_add(1);
+        }
+        report.expired_records_held = report
+            .expired_records_held
+            .saturating_add(run.summary.expired_records_held);
+        if audit.as_ref().is_some_and(|audit| audit.receipt_id.is_none()) {
+            report.receipts_pending = report.receipts_pending.saturating_add(1);
+        }
+        match run.error {
+            Some(RecordStoreError::RetentionCancelled) => {
+                report.cancelled = true;
+                break;
+            }
+            Some(RecordStoreError::RetentionBudgetExhausted) => {
+                report.budget_exhausted = true;
+                break;
+            }
+            Some(error) => {
+                report.tenants_failed = report.tenants_failed.saturating_add(1);
+                tracing::error!(%tenant_hash, %error, "provenance scheduled retention sweep failed closed");
+            }
+            None => report.tenants_swept = report.tenants_swept.saturating_add(1),
+        }
+    }
+    report.cancelled |= cancellation.load(Ordering::Acquire);
+    Ok(report)
+}
+
+pub(crate) fn spawn_provenance_retention_scheduler(
+    enabled: bool,
+    interval_secs: u64,
+    max_tenants: usize,
+    state: AppState,
+    shutdown: tokio::sync::broadcast::Receiver<()>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !(60..=86_400).contains(&interval_secs) || !(1..=1_000).contains(&max_tenants) {
+        if enabled {
+            tracing::error!(
+                interval_secs,
+                max_tenants,
+                "invalid provenance retention scheduler bounds; scheduler disabled"
+            );
+        }
+        return None;
+    }
+    spawn_provenance_retention_scheduler_with_interval(
+        enabled,
+        Duration::from_secs(interval_secs),
+        max_tenants,
+        state,
+        shutdown,
+    )
+}
+
+fn spawn_provenance_retention_scheduler_with_interval(
+    enabled: bool,
+    interval: Duration,
+    max_tenants: usize,
+    state: AppState,
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !enabled {
+        return None;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (interval, max_tenants, state, shutdown);
+        tracing::error!(
+            "provenance retention scheduler requires descriptor-anchored Linux filesystem operations; scheduler disabled"
+        );
+        return None;
+    }
+    let retention_days = match provenance_retention_days_from_env() {
+        Ok(Some(days)) => days,
+        Ok(None) => {
+            tracing::error!(
+                "provenance retention scheduler enabled without an explicit retention-days policy; scheduler disabled"
+            );
+            return None;
+        }
+        Err(error) => {
+            tracing::error!(%error, "invalid provenance retention scheduler policy; scheduler disabled");
+            return None;
+        }
+    };
+    if max_tenants == 0 || RecordReceiptVerifier::from_state(&state).is_err() {
+        tracing::error!("invalid provenance retention scheduler bounds or passport verifier; scheduler disabled");
+        return None;
+    }
+    tracing::info!(
+        retention_days,
+        interval_secs = interval.as_secs(),
+        max_tenants,
+        max_bytes_per_pass = RETENTION_SCHEDULER_MAX_BYTES_PER_PASS,
+        max_pass_seconds = RETENTION_SCHEDULER_MAX_PASS_DURATION.as_secs(),
+        "provenance retention scheduler armed; first pass deferred until the configured interval"
+    );
+
+    Some(tokio::spawn(async move {
+        let mut interval = tokio::time::interval(interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        let mut cursor = 0usize;
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.recv() => break,
+                _ = interval.tick() => {
+                    let cancellation = Arc::new(AtomicBool::new(false));
+                    let pass = run_scheduled_retention_once_with_cancel(
+                        &state,
+                        retention_days,
+                        max_tenants,
+                        chrono::Utc::now(),
+                        &mut cursor,
+                        cancellation.clone(),
+                    );
+                    tokio::pin!(pass);
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.recv() => {
+                            cancellation.store(true, Ordering::Release);
+                            log_scheduled_retention_result(pass.await);
+                            break;
+                        }
+                        result = &mut pass => log_scheduled_retention_result(result),
+                    }
+                }
+            }
+        }
+    }))
+}
+
+fn log_scheduled_retention_result(result: Result<ScheduledRetentionReport, RecordStoreError>) {
+    match result {
+        Ok(report) => {
+            tracing::info!(
+                tenants_discovered = report.tenants_discovered,
+                tenants_selected = report.tenants_selected,
+                tenants_swept = report.tenants_swept,
+                tenants_failed = report.tenants_failed,
+                records_dropped = report.records_dropped,
+                expired_records_held = report.expired_records_held,
+                receipts_pending = report.receipts_pending,
+                cancelled = report.cancelled,
+                budget_exhausted = report.budget_exhausted,
+                bytes_examined = report.bytes_examined,
+                "provenance scheduled retention pass completed"
+            );
+        }
+        Err(error) => tracing::error!(%error, "provenance scheduled retention pass failed closed"),
+    }
 }
 
 fn find_idempotent_record(
@@ -1512,6 +2853,13 @@ fn open_private_append_lock(path: &Path) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
+fn open_private_existing_lock(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true);
+    set_private_file_mode(&mut options);
+    options.open(path)
+}
+
 fn open_private_append_file(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true);
@@ -1534,9 +2882,7 @@ fn open_private_read_file(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 fn validate_and_harden_open_file(file: &std::fs::File) -> Result<(), RecordStoreError> {
-    if !file.metadata()?.is_file() {
-        return Err(RecordStoreError::UnsafePath);
-    }
+    RecordFileIdentity::from_metadata(&file.metadata()?)?;
     set_open_file_private(file)?;
     Ok(())
 }
@@ -1746,10 +3092,11 @@ fn mint_record_retention_receipt(
     state: &AppState,
     actor: &str,
     summary: RecordRetentionSweepSummary,
+    sweep_id: &str,
     status: &'static str,
+    trigger: &'static str,
 ) -> RetentionAudit {
-    let sweep_id = format!("prov_ret_{}", uuid::Uuid::new_v4());
-    let payload = build_record_retention_receipt(&summary, &sweep_id, status);
+    let payload = build_record_retention_receipt(&summary, sweep_id, status, trigger);
     let receipt_id = super::observations::mint_governance_receipt(
         state,
         "__governance__::retention",
@@ -1760,10 +3107,47 @@ fn mint_record_retention_receipt(
     RetentionAudit { summary, receipt_id }
 }
 
+fn mint_record_retention_intent_controlled(
+    state: &AppState,
+    actor: &str,
+    summary: RecordRetentionSweepSummary,
+    sweep_id: &str,
+    trigger: &'static str,
+    controls: &RetentionSweepControls,
+) -> Result<RetentionAudit, RecordStoreError> {
+    let payload = build_record_retention_receipt(&summary, sweep_id, "planned", trigger);
+    match super::observations::mint_governance_receipt_controlled(
+        state,
+        "__governance__::retention",
+        actor,
+        "retention.provenance_records",
+        &payload,
+        || controls.check().is_ok(),
+    ) {
+        super::observations::ControlledGovernanceReceiptMint::Recorded(receipt_id) => Ok(RetentionAudit {
+            summary,
+            receipt_id: Some(receipt_id),
+        }),
+        super::observations::ControlledGovernanceReceiptMint::Pending => Ok(RetentionAudit {
+            summary,
+            receipt_id: None,
+        }),
+        super::observations::ControlledGovernanceReceiptMint::Interrupted => match controls.check() {
+            Err(error) => Err(error),
+            Ok(()) => Err(RecordStoreError::RetentionCancelled),
+        },
+    }
+}
+
+fn new_retention_sweep_id() -> String {
+    format!("prov_ret_{}", uuid::Uuid::new_v4())
+}
+
 fn build_record_retention_receipt<'a>(
     summary: &'a RecordRetentionSweepSummary,
     sweep_id: &'a str,
     status: &'a str,
+    trigger: &'a str,
 ) -> RecordRetentionReceiptV1<'a> {
     RecordRetentionReceiptV1 {
         schema: "cuecrux.provenance.record_retention.v1",
@@ -1778,6 +3162,7 @@ fn build_record_retention_receipt<'a>(
         files_rewritten: summary.files_rewritten,
         files_removed: summary.files_removed,
         status,
+        trigger,
         recorded_at: chrono::Utc::now().to_rfc3339(),
     }
 }
@@ -1929,6 +3314,19 @@ pub(super) async fn post_provenance_verify_record(
         },
         None => None,
     };
+    let retention_verifier = match retention_days {
+        Some(_) => match RecordReceiptVerifier::from_state(&state) {
+            Ok(verifier) => Some(verifier),
+            Err(error) => {
+                tracing::error!(%error, "invalid provenance record-retention verifier");
+                return problem_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "invalid provenance retention verifier",
+                );
+            }
+        },
+        None => None,
+    };
     if let Some(retention_days) = retention_days.filter(|_| retention_sweep_due(&tenant, Instant::now())) {
         // Resolve a durable actor before reserving the cadence slot or doing
         // destructive lifecycle work. The legal-hold read lock remains held
@@ -1948,24 +3346,58 @@ pub(super) async fn post_provenance_verify_record(
         let receipt_state = state.clone();
         let sweep_data_dir = state.data_dir.clone();
         let sweep_tenant = tenant.clone();
+        let sweep_verifier = match retention_verifier {
+            Some(verifier) => verifier,
+            None => {
+                tracing::error!("provenance retention cadence reserved without a record verifier");
+                return problem_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "verification-record retention sweep failed",
+                );
+            }
+        };
         let sweep = tokio::task::spawn_blocking(move || {
-            let store = fact_store.blocking_read();
-            let legal_holds: Vec<_> = store
-                .active_legal_holds()
-                .into_iter()
-                .filter(|hold| hold.tenant_id == sweep_tenant)
-                .collect();
-            let run = sweep_expired_verification_records(
-                &sweep_data_dir,
-                &sweep_tenant,
-                retention_days,
-                chrono::Utc::now(),
-                &legal_holds,
-            );
-            drop(store);
-            let status = if run.error.is_some() { "failed" } else { "completed" };
-            let audit = (run.summary.records_dropped > 0)
-                .then(|| mint_record_retention_receipt(&receipt_state, &actor, run.summary.clone(), status));
+            let sweep_id = new_retention_sweep_id();
+            let mut run = with_active_tenant_legal_holds(&fact_store, &sweep_tenant, |legal_holds| {
+                sweep_expired_verification_records_with_audit_intent(
+                    &sweep_data_dir,
+                    &sweep_tenant,
+                    retention_days,
+                    chrono::Utc::now(),
+                    legal_holds,
+                    &sweep_verifier,
+                    |planned| {
+                        let intent = mint_record_retention_receipt(
+                            &receipt_state,
+                            &actor,
+                            planned.clone(),
+                            &sweep_id,
+                            "planned",
+                            "request",
+                        );
+                        intent
+                            .receipt_id
+                            .map(|_| ())
+                            .ok_or(RecordStoreError::RetentionAuditUnavailable)
+                    },
+                )
+            });
+            if run.error.is_none() {
+                if let Err(error) = cleanup_empty_tenant_directory(&sweep_data_dir, &tenant_records_hash(&sweep_tenant))
+                {
+                    run.error = Some(error);
+                }
+            }
+            let audit = retention_terminal_status(&run).map(|status| {
+                mint_record_retention_receipt(
+                    &receipt_state,
+                    &actor,
+                    run.summary.clone(),
+                    &sweep_id,
+                    status,
+                    "request",
+                )
+            });
             (run, audit)
         })
         .await;
@@ -2639,13 +4071,51 @@ mod tests {
         assert_eq!(after, before, "entry-cap rejection must precede rotation or append");
     }
 
-    fn retention_record_line(tenant: &str, record_id: &str, recorded_at: &str) -> serde_json::Value {
-        json!({
+    fn retention_test_key() -> crux_session::LocalPassportKey {
+        crux_session::LocalPassportKey::from_seed([0x5a; 32]).unwrap()
+    }
+
+    fn retention_test_verifier() -> RecordReceiptVerifier {
+        let key = retention_test_key();
+        RecordReceiptVerifier::from_parts(key.passport_fpr(), key.public_key_hex()).unwrap()
+    }
+
+    fn retention_test_state() -> (AppState, crux_session::LocalPassportKey) {
+        let mut state = crate::http::tests::test_app_state_with_auth(1, crate::auth::AuthMode::Off);
+        let key = crux_session::LocalPassportKey::from_path(&state.passport_key_path).unwrap();
+        state.passport_fpr = key.passport_fpr().to_string();
+        state.passport_public_key_hex = key.public_key_hex().to_string();
+        (state, key)
+    }
+
+    fn signed_retention_record_line(
+        key: &crux_session::LocalPassportKey,
+        tenant: &str,
+        record_id: &str,
+        recorded_at: &str,
+    ) -> serde_json::Value {
+        let mut body = json!({
             "schema": "cuecrux.provenance.verification_record.v1",
             "tenant_id": tenant,
             "record_id": record_id,
             "recorded_at": recorded_at,
-        })
+        });
+        let canonical = serde_json::to_vec(&body).unwrap();
+        let hash = blake3::hash(&canonical);
+        let receipt = ProvenanceReceiptV1 {
+            alg: "ed25519".to_string(),
+            signed_by: key.passport_fpr().to_string(),
+            body_hash: format!("blake3:{}", hex::encode(hash.as_bytes())),
+            signature: hex::encode(key.sign_hash(hash.as_bytes())),
+        };
+        body.as_object_mut()
+            .unwrap()
+            .insert("receipt".to_string(), serde_json::to_value(receipt).unwrap());
+        body
+    }
+
+    fn retention_record_line(tenant: &str, record_id: &str, recorded_at: &str) -> serde_json::Value {
+        signed_retention_record_line(&retention_test_key(), tenant, record_id, recorded_at)
     }
 
     fn active_record_hold(tenant: &str, entity_prefixes: Vec<String>) -> corecrux_memory::LegalHold {
@@ -2667,6 +4137,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn record_retention_drops_only_expired_unheld_records_and_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
         let tenant = "tenant-retention";
@@ -2693,7 +4164,8 @@ mod tests {
             .unwrap()
             .with_timezone(&chrono::Utc);
 
-        let first = sweep_expired_verification_records(tmp.path(), tenant, 30, now, &[hold.clone()]);
+        let verifier = retention_test_verifier();
+        let first = sweep_expired_verification_records(tmp.path(), tenant, 30, now, &[hold.clone()], &verifier);
         assert!(first.error.is_none());
         assert_eq!(first.summary.records_dropped, 1);
         assert_eq!(first.summary.expired_records_held, 1);
@@ -2705,7 +4177,7 @@ mod tests {
         assert!(stored.contains("old-held"));
         assert!(stored.contains("fresh-keep"));
 
-        let second = sweep_expired_verification_records(tmp.path(), tenant, 30, now, &[hold]);
+        let second = sweep_expired_verification_records(tmp.path(), tenant, 30, now, &[hold], &verifier);
         assert!(second.error.is_none());
         assert_eq!(second.summary.records_dropped, 0);
         assert_eq!(second.summary.expired_records_held, 1);
@@ -2717,6 +4189,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn record_retention_preserves_every_record_under_a_tenant_wide_hold() {
         let tmp = tempfile::tempdir().unwrap();
         let tenant = "tenant-retention-wide-hold";
@@ -2738,7 +4211,8 @@ mod tests {
             .unwrap()
             .with_timezone(&chrono::Utc);
 
-        let sweep = sweep_expired_verification_records(tmp.path(), tenant, 30, now, &[hold]);
+        let sweep =
+            sweep_expired_verification_records(tmp.path(), tenant, 30, now, &[hold], &retention_test_verifier());
 
         assert!(sweep.error.is_none());
         assert_eq!(sweep.summary.records_dropped, 0);
@@ -2775,6 +4249,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn record_retention_fails_closed_before_deleting_when_any_line_is_corrupt() {
         let tmp = tempfile::tempdir().unwrap();
         let tenant = "tenant-retention-corrupt";
@@ -2795,7 +4270,7 @@ mod tests {
             .unwrap()
             .with_timezone(&chrono::Utc);
 
-        let sweep = sweep_expired_verification_records(tmp.path(), tenant, 30, now, &[]);
+        let sweep = sweep_expired_verification_records(tmp.path(), tenant, 30, now, &[], &retention_test_verifier());
 
         assert!(matches!(sweep.error, Some(RecordStoreError::CorruptRecord)));
         assert_eq!(sweep.summary.records_dropped, 0);
@@ -2803,6 +4278,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn record_retention_removes_an_all_expired_segment() {
         let tmp = tempfile::tempdir().unwrap();
         let tenant = "tenant-retention-empty";
@@ -2816,7 +4292,7 @@ mod tests {
             .unwrap()
             .with_timezone(&chrono::Utc);
 
-        let sweep = sweep_expired_verification_records(tmp.path(), tenant, 30, now, &[]);
+        let sweep = sweep_expired_verification_records(tmp.path(), tenant, 30, now, &[], &retention_test_verifier());
 
         assert!(sweep.error.is_none());
         assert_eq!(sweep.summary.records_dropped, 1);
@@ -2872,10 +4348,12 @@ mod tests {
             &summary,
             "prov_ret_fixture",
             "completed",
+            "scheduled",
         ))
         .unwrap();
 
         assert!(encoded.contains("configured_retention_window"));
+        assert!(encoded.contains("\"trigger\":\"scheduled\""));
         assert!(encoded.contains("\"records_dropped\":3"));
         assert!(encoded.contains(&summary.tenant_hash));
         assert!(!encoded.contains("customer-tenant-secret"));
@@ -2885,6 +4363,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    #[cfg(target_os = "linux")]
     async fn verify_record_retention_mints_governance_receipt_and_surfaces_headers() {
         use crate::auth::AuthMode;
 
@@ -2894,11 +4373,12 @@ mod tests {
         let mut state = crate::http::tests::test_app_state_with_auth(1, AuthMode::DevScopes);
         let passport_key = crux_session::LocalPassportKey::from_path(&state.passport_key_path).unwrap();
         state.passport_fpr = passport_key.passport_fpr().to_string();
+        state.passport_public_key_hex = passport_key.public_key_hex().to_string();
         let tenant = format!("tenant-retention-http-{}", uuid::Uuid::new_v4());
         append_record(
             &state.data_dir,
             &tenant,
-            &retention_record_line(&tenant, "expired-http-record", "2026-01-01T00:00:00Z"),
+            &signed_retention_record_line(&passport_key, &tenant, "expired-http-record", "2026-01-01T00:00:00Z"),
         )
         .unwrap();
         let mut headers = HeaderMap::new();
@@ -2941,6 +4421,787 @@ mod tests {
 
         std::env::remove_var(RETENTION_DAYS_ENV);
         std::env::remove_var(FEATURE_ENV);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn record_retention_rejects_a_tampered_signed_timestamp_before_deletion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = retention_test_key();
+        let tenant = "tenant-retention-signed-time";
+        let mut tampered = signed_retention_record_line(&key, tenant, "fresh-record", "2026-07-20T00:00:00Z");
+        tampered["recorded_at"] = serde_json::Value::String("2026-01-01T00:00:00Z".to_string());
+        append_record(tmp.path(), tenant, &tampered).unwrap();
+        let before = std::fs::read(records_path(tmp.path(), tenant)).unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let verifier = RecordReceiptVerifier::from_parts(key.passport_fpr(), key.public_key_hex()).unwrap();
+
+        let sweep = sweep_expired_verification_records(tmp.path(), tenant, 30, now, &[], &verifier);
+
+        assert!(matches!(sweep.error, Some(RecordStoreError::CorruptRecord)));
+        assert_eq!(sweep.summary.records_dropped, 0);
+        assert_eq!(std::fs::read(records_path(tmp.path(), tenant)).unwrap(), before);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[cfg(target_os = "linux")]
+    fn record_retention_requires_a_trusted_current_or_historical_signer() {
+        std::env::remove_var(RETENTION_SIGNER_KEYRING_ENV);
+        let (state, _) = retention_test_state();
+        let historical_key = crux_session::LocalPassportKey::from_seed([0x6b; 32]).unwrap();
+        let tenant = "tenant-historical-retention-signer";
+        append_record(
+            &state.data_dir,
+            tenant,
+            &signed_retention_record_line(&historical_key, tenant, "historical-record", "2026-01-01T00:00:00Z"),
+        )
+        .unwrap();
+        let before = std::fs::read(records_path(&state.data_dir, tenant)).unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let current_only = RecordReceiptVerifier::from_state(&state).unwrap();
+        let rejected = sweep_expired_verification_records(&state.data_dir, tenant, 30, now, &[], &current_only);
+        assert!(matches!(rejected.error, Some(RecordStoreError::CorruptRecord)));
+        assert_eq!(std::fs::read(records_path(&state.data_dir, tenant)).unwrap(), before);
+
+        std::env::set_var(
+            RETENTION_SIGNER_KEYRING_ENV,
+            serde_json::json!({ (historical_key.passport_fpr()): historical_key.public_key_hex() }).to_string(),
+        );
+        let with_history = RecordReceiptVerifier::from_state(&state).unwrap();
+        let accepted = sweep_expired_verification_records(&state.data_dir, tenant, 30, now, &[], &with_history);
+        assert!(accepted.error.is_none());
+        assert_eq!(accepted.summary.records_dropped, 1);
+        assert!(!records_path(&state.data_dir, tenant).exists());
+        std::env::remove_var(RETENTION_SIGNER_KEYRING_ENV);
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn scheduled_retention_expires_an_inactive_tenant_and_mints_redacted_intent_and_result() {
+        let (state, key) = retention_test_state();
+        let tenant = format!("inactive-tenant-secret-{}", uuid::Uuid::new_v4());
+        append_record(
+            &state.data_dir,
+            &tenant,
+            &signed_retention_record_line(&key, &tenant, "inactive-expired-secret", "2026-01-01T00:00:00Z"),
+        )
+        .unwrap();
+        append_record(
+            &state.data_dir,
+            &tenant,
+            &signed_retention_record_line(&key, &tenant, "inactive-fresh-secret", "2026-07-20T00:00:00Z"),
+        )
+        .unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut cursor = 0usize;
+
+        let first = run_scheduled_retention_once(&state, 30, 10, now, &mut cursor)
+            .await
+            .unwrap();
+
+        assert_eq!(first.tenants_discovered, 1);
+        assert_eq!(first.tenants_selected, 1);
+        assert_eq!(first.tenants_swept, 1);
+        assert_eq!(first.tenants_failed, 0);
+        assert_eq!(first.records_dropped, 1);
+        assert_eq!(first.receipts_pending, 0);
+        let retained = std::fs::read_to_string(records_path(&state.data_dir, &tenant)).unwrap();
+        assert!(!retained.contains("inactive-expired-secret"));
+        assert!(retained.contains("inactive-fresh-secret"));
+
+        let receipt_path =
+            super::super::observations::observation_file_path(&state.data_dir, "__governance__::retention");
+        let receipt_before = std::fs::read_to_string(&receipt_path).unwrap();
+        assert!(receipt_before.contains(RETENTION_SCHEDULER_ACTOR));
+        assert!(receipt_before.contains("scheduled"));
+        assert!(receipt_before.contains("planned"));
+        assert!(receipt_before.contains("completed"));
+        assert_eq!(receipt_before.lines().count(), 2);
+        assert!(!receipt_before.contains(&tenant));
+        assert!(!receipt_before.contains("inactive-expired-secret"));
+        assert!(!receipt_before.contains("inactive-fresh-secret"));
+
+        let second = run_scheduled_retention_once(&state, 30, 10, now, &mut cursor)
+            .await
+            .unwrap();
+        assert_eq!(second.records_dropped, 0);
+        assert_eq!(std::fs::read_to_string(receipt_path).unwrap(), receipt_before);
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn scheduled_retention_aborts_before_deletion_when_audit_intent_cannot_be_minted() {
+        let (mut state, key) = retention_test_state();
+        let tenant = format!("tenant-audit-intent-failure-{}", uuid::Uuid::new_v4());
+        append_record(
+            &state.data_dir,
+            &tenant,
+            &signed_retention_record_line(&key, &tenant, "must-remain", "2026-01-01T00:00:00Z"),
+        )
+        .unwrap();
+        let before = std::fs::read(records_path(&state.data_dir, &tenant)).unwrap();
+        state.passport_key_path = state.data_dir.clone();
+        let debt_before = super::super::observations::receipt_mint_failures();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut cursor = 0usize;
+
+        let report = run_scheduled_retention_once(&state, 30, 10, now, &mut cursor)
+            .await
+            .unwrap();
+
+        assert_eq!(report.records_dropped, 0);
+        assert_eq!(report.tenants_failed, 1);
+        assert!(super::super::observations::receipt_mint_failures() > debt_before);
+        assert_eq!(std::fs::read(records_path(&state.data_dir, &tenant)).unwrap(), before);
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn scheduled_retention_validates_later_lines_before_deleting_earlier_records() {
+        let (state, key) = retention_test_state();
+        let tenant = format!("tenant-later-corrupt-{}", uuid::Uuid::new_v4());
+        append_record(
+            &state.data_dir,
+            &tenant,
+            &signed_retention_record_line(&key, &tenant, "old-valid", "2026-01-01T00:00:00Z"),
+        )
+        .unwrap();
+        append_record(
+            &state.data_dir,
+            &tenant,
+            &signed_retention_record_line(&key, &tenant, "bad-time", "not-rfc3339"),
+        )
+        .unwrap();
+        let before = std::fs::read(records_path(&state.data_dir, &tenant)).unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut cursor = 0usize;
+
+        let report = run_scheduled_retention_once(&state, 30, 10, now, &mut cursor)
+            .await
+            .unwrap();
+
+        assert_eq!(report.records_dropped, 0);
+        assert_eq!(report.tenants_failed, 1);
+        assert_eq!(std::fs::read(records_path(&state.data_dir, &tenant)).unwrap(), before);
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn scheduled_retention_honours_scoped_and_malformed_fail_closed_legal_holds() {
+        use corecrux_memory::fact_store::StoreFact;
+        use corecrux_memory::HorizonClass;
+
+        let (state, key) = retention_test_state();
+        let scoped_tenant = format!("tenant-scheduled-scoped-{}", uuid::Uuid::new_v4());
+        append_record(
+            &state.data_dir,
+            &scoped_tenant,
+            &signed_retention_record_line(&key, &scoped_tenant, "drop-me", "2026-01-01T00:00:00Z"),
+        )
+        .unwrap();
+        append_record(
+            &state.data_dir,
+            &scoped_tenant,
+            &signed_retention_record_line(&key, &scoped_tenant, "held-record", "2026-01-02T00:00:00Z"),
+        )
+        .unwrap();
+        let malformed_tenant = format!("tenant-scheduled-malformed-{}", uuid::Uuid::new_v4());
+        append_record(
+            &state.data_dir,
+            &malformed_tenant,
+            &signed_retention_record_line(&key, &malformed_tenant, "must-survive", "2026-01-01T00:00:00Z"),
+        )
+        .unwrap();
+        {
+            let mut store = state.fact_store.write().await;
+            store
+                .place_legal_hold(corecrux_memory::PlaceLegalHold {
+                    tenant_id: scoped_tenant.clone(),
+                    entity_prefixes: vec!["provenance::verification_record::held-record".to_string()],
+                    reason: "fixture scoped hold".to_string(),
+                    actor: Some("passport:test-reviewer".to_string()),
+                })
+                .unwrap();
+            store
+                .try_store(StoreFact {
+                    tenant_hash: malformed_tenant.clone(),
+                    entity: "__legal_hold__::malformed-scheduler-fixture".to_string(),
+                    key: "state".to_string(),
+                    value: "{malformed-json".to_string(),
+                    source_receipt: None,
+                    confidence: 1.0,
+                    private: true,
+                    horizon_class: Some(HorizonClass::None),
+                    actor: Some("fixture-bypass".to_string()),
+                })
+                .unwrap();
+        }
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut cursor = 0usize;
+
+        let report = run_scheduled_retention_once(&state, 30, 10, now, &mut cursor)
+            .await
+            .unwrap();
+
+        assert_eq!(report.records_dropped, 1);
+        assert_eq!(report.expired_records_held, 2);
+        let scoped = std::fs::read_to_string(records_path(&state.data_dir, &scoped_tenant)).unwrap();
+        assert!(!scoped.contains("drop-me"));
+        assert!(scoped.contains("held-record"));
+        let malformed = std::fs::read_to_string(records_path(&state.data_dir, &malformed_tenant)).unwrap();
+        assert!(malformed.contains("must-survive"));
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn scheduled_retention_rejects_hash_mismatches_without_touching_the_record() {
+        let (state, key) = retention_test_state();
+        let stored_tenant = "tenant-signed-inside-mismatched-directory";
+        let directory_tenant = "different-directory-tenant";
+        let tenant_dir = tenant_records_dir(&state.data_dir, directory_tenant);
+        std::fs::create_dir_all(&tenant_dir).unwrap();
+        std::fs::write(tenant_dir.join(".append.lock"), b"").unwrap();
+        let line = signed_retention_record_line(&key, stored_tenant, "preserve-me", "2026-01-01T00:00:00Z");
+        let mut encoded = serde_json::to_vec(&line).unwrap();
+        encoded.push(b'\n');
+        let path = tenant_dir.join("verification-records.jsonl");
+        std::fs::write(&path, &encoded).unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut cursor = 0usize;
+
+        let report = run_scheduled_retention_once(&state, 30, 10, now, &mut cursor)
+            .await
+            .unwrap();
+
+        assert_eq!(report.tenants_failed, 1);
+        assert_eq!(report.tenants_swept, 0);
+        assert_eq!(report.records_dropped, 0);
+        assert_eq!(std::fs::read(path).unwrap(), encoded);
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn scheduled_retention_batches_rotate_fairly_across_tenants() {
+        let (state, key) = retention_test_state();
+        let mut tenants = Vec::new();
+        for index in 0..3 {
+            let tenant = format!("tenant-fair-batch-{index}");
+            append_record(
+                &state.data_dir,
+                &tenant,
+                &signed_retention_record_line(&key, &tenant, &format!("expired-{index}"), "2026-01-01T00:00:00Z"),
+            )
+            .unwrap();
+            tenants.push(tenant);
+        }
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut cursor = 0usize;
+        let mut dropped = 0usize;
+        for _ in 0..3 {
+            let report = run_scheduled_retention_once(&state, 30, 1, now, &mut cursor)
+                .await
+                .unwrap();
+            assert_eq!(report.tenants_selected, 1);
+            dropped = dropped.saturating_add(report.records_dropped);
+        }
+        assert_eq!(dropped, 3);
+        for tenant in tenants {
+            assert!(!records_path(&state.data_dir, &tenant).exists());
+            assert!(!tenant_records_dir(&state.data_dir, &tenant).exists());
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(target_os = "linux")]
+    async fn retention_scheduler_is_default_off_and_shutdown_preempts_the_first_pass() {
+        std::env::remove_var(RETENTION_DAYS_ENV);
+        let (state, key) = retention_test_state();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        assert!(spawn_provenance_retention_scheduler_with_interval(
+            false,
+            Duration::from_millis(10),
+            1,
+            state.clone(),
+            shutdown_rx,
+        )
+        .is_none());
+        let (_, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        assert!(spawn_provenance_retention_scheduler_with_interval(
+            true,
+            Duration::from_millis(10),
+            1,
+            state.clone(),
+            shutdown_rx,
+        )
+        .is_none());
+
+        let tenant = "tenant-shutdown-before-first-retention-pass";
+        append_record(
+            &state.data_dir,
+            tenant,
+            &signed_retention_record_line(&key, tenant, "must-remain", "2026-01-01T00:00:00Z"),
+        )
+        .unwrap();
+        std::env::set_var(RETENTION_DAYS_ENV, "30");
+        let handle = spawn_provenance_retention_scheduler_with_interval(
+            true,
+            Duration::from_millis(50),
+            1,
+            state.clone(),
+            shutdown_tx.subscribe(),
+        )
+        .unwrap();
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("scheduler exits promptly")
+            .unwrap();
+        assert!(std::fs::read_to_string(records_path(&state.data_dir, tenant))
+            .unwrap()
+            .contains("must-remain"));
+        std::env::remove_var(RETENTION_DAYS_ENV);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(target_os = "linux")]
+    async fn retention_scheduler_waits_for_its_interval_then_runs() {
+        let (state, key) = retention_test_state();
+        let tenant = format!("tenant-live-scheduler-{}", uuid::Uuid::new_v4());
+        append_record(
+            &state.data_dir,
+            &tenant,
+            &signed_retention_record_line(&key, &tenant, "expired-live", "2026-01-01T00:00:00Z"),
+        )
+        .unwrap();
+        std::env::set_var(RETENTION_DAYS_ENV, "30");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let handle = spawn_provenance_retention_scheduler_with_interval(
+            true,
+            Duration::from_millis(80),
+            1,
+            state.clone(),
+            shutdown_rx,
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            records_path(&state.data_dir, &tenant).exists(),
+            "boot tick must be skipped"
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while tenant_records_dir(&state.data_dir, &tenant).exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("scheduled pass runs after its interval");
+        shutdown_tx.send(()).unwrap();
+        handle.await.unwrap();
+        std::env::remove_var(RETENTION_DAYS_ENV);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(target_os = "linux")]
+    async fn retention_scheduler_shutdown_before_audit_intent_preserves_all_tenants() {
+        let (state, key) = retention_test_state();
+        let tenants = [
+            format!("tenant-shutdown-inflight-a-{}", uuid::Uuid::new_v4()),
+            format!("tenant-shutdown-inflight-b-{}", uuid::Uuid::new_v4()),
+        ];
+        for tenant in &tenants {
+            append_record(
+                &state.data_dir,
+                tenant,
+                &signed_retention_record_line(&key, tenant, "expired", "2026-01-01T00:00:00Z"),
+            )
+            .unwrap();
+        }
+        std::env::set_var(RETENTION_DAYS_ENV, "30");
+        let fact_store_guard = state.fact_store.write().await;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let handle = spawn_provenance_retention_scheduler_with_interval(
+            true,
+            Duration::from_millis(20),
+            2,
+            state.clone(),
+            shutdown_rx,
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("scheduler cancels while legal-hold authority is unavailable")
+            .unwrap();
+        drop(fact_store_guard);
+
+        assert!(tenants
+            .iter()
+            .all(|tenant| records_path(&state.data_dir, tenant).exists()));
+        std::env::remove_var(RETENTION_DAYS_ENV);
+    }
+
+    #[test]
+    fn retention_discovery_entry_bound_fails_closed_before_any_sweep() {
+        let tmp = tempfile::tempdir().unwrap();
+        for tenant in ["tenant-bound-a", "tenant-bound-b"] {
+            append_record(
+                tmp.path(),
+                tenant,
+                &retention_record_line(tenant, "must-remain", "2026-01-01T00:00:00Z"),
+            )
+            .unwrap();
+        }
+
+        assert!(matches!(
+            list_retained_tenant_directories_with_limit(tmp.path(), 1),
+            Err(RecordStoreError::TooManyEntries)
+        ));
+        for tenant in ["tenant-bound-a", "tenant-bound-b"] {
+            assert!(records_path(tmp.path(), tenant).exists());
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn scheduled_retention_byte_and_time_budgets_preserve_unswept_tenants() {
+        let (state, key) = retention_test_state();
+        let tenants = [
+            format!("tenant-byte-budget-a-{}", uuid::Uuid::new_v4()),
+            format!("tenant-byte-budget-b-{}", uuid::Uuid::new_v4()),
+        ];
+        for tenant in &tenants {
+            append_record(
+                &state.data_dir,
+                tenant,
+                &signed_retention_record_line(&key, tenant, "must-remain", "2026-01-01T00:00:00Z"),
+            )
+            .unwrap();
+        }
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut cursor = 0usize;
+        let report = run_scheduled_retention_once_with_limits(
+            &state,
+            30,
+            2,
+            now,
+            &mut cursor,
+            Arc::new(AtomicBool::new(false)),
+            ScheduledRetentionLimits {
+                max_bytes: 1,
+                max_duration: Duration::from_secs(5),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(report.budget_exhausted);
+        assert_eq!(report.records_dropped, 0);
+        assert_eq!(cursor, 1, "a budget-hit tenant must not starve the next directory");
+        for tenant in &tenants {
+            assert!(records_path(&state.data_dir, tenant).exists());
+        }
+
+        let mut cursor = 0usize;
+        let report = run_scheduled_retention_once_with_limits(
+            &state,
+            30,
+            2,
+            now,
+            &mut cursor,
+            Arc::new(AtomicBool::new(false)),
+            ScheduledRetentionLimits {
+                max_bytes: RETENTION_SCHEDULER_MAX_BYTES_PER_PASS,
+                max_duration: Duration::ZERO,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(report.budget_exhausted);
+        assert_eq!(report.records_dropped, 0);
+        for tenant in &tenants {
+            assert!(records_path(&state.data_dir, tenant).exists());
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sweep_rechecks_the_byte_budget_under_the_tenant_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tenant = "tenant-locked-byte-budget";
+        append_record(
+            tmp.path(),
+            tenant,
+            &retention_record_line(tenant, "must-remain", "2026-01-01T00:00:00Z"),
+        )
+        .unwrap();
+        let before = std::fs::read(records_path(tmp.path(), tenant)).unwrap();
+        let controls = RetentionSweepControls {
+            cancellation: Arc::new(AtomicBool::new(false)),
+            deadline: None,
+            max_store_bytes: before.len().saturating_sub(1) as u64,
+        };
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let sweep = sweep_expired_verification_records_with_controls(
+            tmp.path(),
+            RetentionSweepRequest {
+                tenant,
+                retention_days: 30,
+                now,
+                legal_holds: &[],
+                verifier: &retention_test_verifier(),
+                controls: &controls,
+            },
+            |_| Ok(()),
+        );
+
+        assert!(matches!(sweep.error, Some(RecordStoreError::RetentionBudgetExhausted)));
+        assert!(!sweep.audit_intent_recorded);
+        assert_eq!(std::fs::read(records_path(tmp.path(), tenant)).unwrap(), before);
+    }
+
+    #[test]
+    fn retention_line_reader_rejects_a_no_newline_blob_without_scanning_the_file() {
+        let blob_len = usize::try_from(RECORD_MAX_LINE_BYTES).unwrap() * 8;
+        let cursor = std::io::Cursor::new(vec![b'x'; blob_len]);
+        let mut reader = std::io::BufReader::new(cursor);
+
+        let result = read_bounded_retention_line(
+            &mut reader,
+            RECORD_MAX_LINE_BYTES,
+            RECORD_MAX_LINE_BYTES.saturating_add(1),
+        );
+
+        assert!(matches!(result, Err(RecordStoreError::CorruptRecord)));
+        assert!(reader.get_ref().position() <= RECORD_MAX_LINE_BYTES.saturating_add(8 * 1024));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn empty_directory_cleanup_observes_cancellation_while_the_tenant_lock_is_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tenant = "tenant-cancelled-empty-cleanup";
+        append_record(
+            tmp.path(),
+            tenant,
+            &retention_record_line(tenant, "fixture", "2026-07-20T00:00:00Z"),
+        )
+        .unwrap();
+        std::fs::remove_file(records_path(tmp.path(), tenant)).unwrap();
+        let tenant_hash = tenant_records_hash(tenant);
+        let _guard = record_tenant_lock(&tenant_hash).lock().unwrap();
+        let cancellation = Arc::new(AtomicBool::new(true));
+        let controls = RetentionSweepControls {
+            cancellation,
+            deadline: None,
+            max_store_bytes: RETENTION_SCHEDULER_MAX_BYTES_PER_PASS,
+        };
+
+        assert!(matches!(
+            cleanup_empty_tenant_directory_with_controls(tmp.path(), &tenant_hash, &controls),
+            Err(RecordStoreError::RetentionCancelled)
+        ));
+        assert!(tenant_records_dir(tmp.path(), tenant).exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legal_hold_read_authority_spans_the_retention_mutation_callback() {
+        let fact_store = Arc::new(tokio::sync::RwLock::new(corecrux_memory::FactStore::new()));
+        let worker_store = fact_store.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = tokio::task::spawn_blocking(move || {
+            with_active_tenant_legal_holds(&worker_store, "tenant-lock-span", |_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            });
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        assert!(
+            fact_store.try_write().is_err(),
+            "a concurrent hold writer must not interleave with the mutation callback"
+        );
+        release_tx.send(()).unwrap();
+        worker.await.unwrap();
+        assert!(fact_store.try_write().is_ok());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn anchored_tenant_directory_cannot_be_redirected_by_a_parent_swap() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tenant = "tenant-parent-swap";
+        append_record(
+            tmp.path(),
+            tenant,
+            &retention_record_line(tenant, "anchored-record", "2026-01-01T00:00:00Z"),
+        )
+        .unwrap();
+        let original = tenant_records_dir(tmp.path(), tenant);
+        let moved = tmp.path().join("moved-original-tenant");
+        let victim = tmp.path().join("outside-victim-directory");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("verification-records.jsonl"), b"victim-must-remain").unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let sweep = sweep_expired_verification_records_with_audit_intent(
+            tmp.path(),
+            tenant,
+            30,
+            now,
+            &[],
+            &retention_test_verifier(),
+            |_| {
+                std::fs::rename(&original, &moved)?;
+                symlink(&victim, &original)?;
+                Ok(())
+            },
+        );
+
+        assert!(sweep.error.is_none());
+        assert!(sweep.audit_intent_recorded);
+        assert_eq!(sweep.summary.records_dropped, 1);
+        assert_eq!(
+            std::fs::read(victim.join("verification-records.jsonl")).unwrap(),
+            b"victim-must-remain"
+        );
+        assert!(!moved.join("verification-records.jsonl").exists());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn automatic_retention_preserves_records_on_platforms_without_descriptor_anchoring() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tenant = "tenant-non-linux-preservation";
+        let path = records_path(tmp.path(), tenant);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"preserve-without-parsing\n").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let sweep = sweep_expired_verification_records(tmp.path(), tenant, 30, now, &[], &retention_test_verifier());
+
+        assert!(matches!(sweep.error, Some(RecordStoreError::UnsafePath)));
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn retention_scheduler_stays_disabled_without_descriptor_anchoring() {
+        let (state, _) = retention_test_state();
+        let (_, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        assert!(spawn_provenance_retention_scheduler_with_interval(
+            true,
+            Duration::from_secs(60),
+            1,
+            state,
+            shutdown_rx,
+        )
+        .is_none());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn post_intent_identity_failure_requires_a_terminal_failed_receipt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tenant = "tenant-post-intent-identity-failure";
+        append_record(
+            tmp.path(),
+            tenant,
+            &retention_record_line(tenant, "expired-original", "2026-01-01T00:00:00Z"),
+        )
+        .unwrap();
+        let active = records_path(tmp.path(), tenant);
+        let displaced = active.with_extension("displaced");
+        let replacement = serde_json::to_vec(&retention_record_line(
+            tenant,
+            "replacement-must-remain",
+            "2026-07-20T00:00:00Z",
+        ))
+        .unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let sweep = sweep_expired_verification_records_with_audit_intent(
+            tmp.path(),
+            tenant,
+            30,
+            now,
+            &[],
+            &retention_test_verifier(),
+            |_| {
+                std::fs::rename(&active, &displaced)?;
+                let mut encoded = replacement.clone();
+                encoded.push(b'\n');
+                std::fs::write(&active, encoded)?;
+                Ok(())
+            },
+        );
+
+        assert!(matches!(sweep.error, Some(RecordStoreError::UnsafePath)));
+        assert!(sweep.audit_intent_recorded);
+        assert_eq!(retention_terminal_status(&sweep), Some("failed"));
+        assert_eq!(sweep.summary.records_dropped, 0);
+        assert!(std::fs::read_to_string(&active)
+            .unwrap()
+            .contains("replacement-must-remain"));
+        assert!(std::fs::read_to_string(displaced).unwrap().contains("expired-original"));
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn scheduled_retention_rejects_symlinked_tenant_entries_without_touching_the_target() {
+        use std::os::unix::fs::symlink;
+
+        let (state, _) = retention_test_state();
+        let tenants_root = provenance_tenants_root(&state.data_dir);
+        std::fs::create_dir_all(&tenants_root).unwrap();
+        let victim = state.data_dir.join("outside-retention-victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("marker"), b"unchanged").unwrap();
+        symlink(&victim, tenants_root.join(format!("t_{}", "a".repeat(64)))).unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut cursor = 0usize;
+
+        let result = run_scheduled_retention_once(&state, 30, 10, now, &mut cursor).await;
+
+        assert!(matches!(result, Err(RecordStoreError::UnsafePath)));
+        assert_eq!(std::fs::read(victim.join("marker")).unwrap(), b"unchanged");
     }
 
     #[test]

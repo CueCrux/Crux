@@ -1045,6 +1045,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // `__reverify_receipts__::*` facts past retain, via the journaled
     // delete path. See `crate::ephemeral_gc`.
     ephemeral_gc::spawn_ephemeral_gc(config.ephemeral_gc_enabled, state.clone(), shutdown_tx.subscribe());
+    // Inactive-tenant verification-record retention. This is independently
+    // default OFF and additionally requires a valid explicit retention-days
+    // policy. It never runs on the immediate boot tick.
+    let _provenance_retention_scheduler = crate::http::spawn_provenance_retention_scheduler(
+        config.provenance_retention_scheduler_enabled,
+        config.provenance_retention_scheduler_interval_secs,
+        config.provenance_retention_scheduler_max_tenants,
+        state.clone(),
+        shutdown_tx.subscribe(),
+    );
     // Consolidation review scheduler (Audit II M4). Gated at spawn by
     // CORECRUXD_CONSOLIDATION_SCHEDULER (default OFF); interval config-driven.
     // Detect+surface only: each tick runs the read-only contradiction pass and

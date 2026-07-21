@@ -992,6 +992,7 @@ dependencies = [
  "rcx-capability-token",
  "regex",
  "roxmltree",
+ "rustix",
  "serde",
  "serde_json",
  "serde_yaml",

@@ -510,6 +510,14 @@ pub struct Config {
     // via the journaled delete path. Default OFF.
     pub ephemeral_gc_enabled: bool,
 
+    // Inactive-tenant provenance verification-record retention. Separately
+    // default OFF even when a retention window is configured: an operator
+    // must explicitly opt into autonomous background deletion. Deletion is
+    // Linux-only until equivalent descriptor-relative primitives are wired.
+    pub provenance_retention_scheduler_enabled: bool,
+    pub provenance_retention_scheduler_interval_secs: u64,
+    pub provenance_retention_scheduler_max_tenants: usize,
+
     // Consolidation scheduler (Audit II M4): periodically runs the read-only
     // contradiction-candidate pass and SURFACES the result as a receipt fact
     // under `__consolidation_review__::*`. Detect+surface only — resolution
@@ -732,6 +740,30 @@ fn env_string(key: &str) -> Option<String> {
 
 fn env_bool(key: &str) -> Option<bool> {
     std::env::var(key).ok().map(|value| bool_value(&value))
+}
+
+fn env_bounded_u64_or_zero(key: &str, default: u64, min: u64, max: u64) -> u64 {
+    match std::env::var(key) {
+        Err(_) => default,
+        Ok(value) => value
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|parsed| (min..=max).contains(parsed))
+            .unwrap_or(0),
+    }
+}
+
+fn env_bounded_usize_or_zero(key: &str, default: usize, min: usize, max: usize) -> usize {
+    match std::env::var(key) {
+        Err(_) => default,
+        Ok(value) => value
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|parsed| (min..=max).contains(parsed))
+            .unwrap_or(0),
+    }
 }
 
 /// Read a default-on environment flag. Only an explicit `0` or `false`
@@ -1317,6 +1349,19 @@ pub fn load_config() -> Config {
             .map(PathBuf::from)
             .filter(|path| !path.as_os_str().is_empty()),
         ephemeral_gc_enabled: env_bool("CORECRUXD_EPHEMERAL_GC").unwrap_or(false),
+        provenance_retention_scheduler_enabled: env_bool("CORECRUXD_PROVENANCE_RETENTION_SCHEDULER").unwrap_or(false),
+        provenance_retention_scheduler_interval_secs: env_bounded_u64_or_zero(
+            "CORECRUXD_PROVENANCE_RETENTION_INTERVAL_SECS",
+            3_600,
+            60,
+            86_400,
+        ),
+        provenance_retention_scheduler_max_tenants: env_bounded_usize_or_zero(
+            "CORECRUXD_PROVENANCE_RETENTION_MAX_TENANTS_PER_PASS",
+            100,
+            1,
+            1_000,
+        ),
         consolidation_scheduler_enabled: env_bool("CORECRUXD_CONSOLIDATION_SCHEDULER").unwrap_or(false),
         consolidation_scheduler_interval_secs: std::env::var("CORECRUXD_CONSOLIDATION_SCHEDULER_INTERVAL_SECS")
             .ok()
@@ -1817,6 +1862,10 @@ mod tests {
         assert_eq!(cfg.dir_l0_max_runs, 8);
         // Ephemeral GC is default OFF.
         assert!(!cfg.ephemeral_gc_enabled);
+        // Inactive-tenant provenance retention is independently default OFF.
+        assert!(!cfg.provenance_retention_scheduler_enabled);
+        assert_eq!(cfg.provenance_retention_scheduler_interval_secs, 3_600);
+        assert_eq!(cfg.provenance_retention_scheduler_max_tenants, 100);
         // Coordination plane is default ON for launch; presence TTL defaults
         // to 15 min. Explicit `CORECRUXD_COORD=0` disables it.
         assert!(cfg.coord_enabled);
@@ -1848,6 +1897,29 @@ mod tests {
         std::env::set_var("CORECRUXD_SYNC_PEER_TRUST_ROOT", "ab".repeat(31));
         let cfg = super::load_config();
         assert!(cfg.sync_peer_trust_root.is_none());
+        clear_corecruxd_env();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_config_provenance_retention_scheduler_is_explicit_and_bounded() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+        clear_corecruxd_env();
+        std::env::set_var("CORECRUXD_PROVENANCE_RETENTION_SCHEDULER", "true");
+        std::env::set_var("CORECRUXD_PROVENANCE_RETENTION_INTERVAL_SECS", "1");
+        std::env::set_var("CORECRUXD_PROVENANCE_RETENTION_MAX_TENANTS_PER_PASS", "5000");
+
+        let cfg = super::load_config();
+
+        assert!(cfg.provenance_retention_scheduler_enabled);
+        assert_eq!(cfg.provenance_retention_scheduler_interval_secs, 0);
+        assert_eq!(cfg.provenance_retention_scheduler_max_tenants, 0);
+        std::env::set_var("CORECRUXD_PROVENANCE_RETENTION_INTERVAL_SECS", "300");
+        std::env::set_var("CORECRUXD_PROVENANCE_RETENTION_MAX_TENANTS_PER_PASS", "25");
+        let cfg = super::load_config();
+        assert_eq!(cfg.provenance_retention_scheduler_interval_secs, 300);
+        assert_eq!(cfg.provenance_retention_scheduler_max_tenants, 25);
         clear_corecruxd_env();
     }
 

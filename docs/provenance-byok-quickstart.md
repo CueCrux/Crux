@@ -133,7 +133,14 @@ Full scans are limited to once per tenant per hour and the cadence table is
 bounded; saturation preserves records instead of opening an unbounded memory
 or I/O path. The sweep validates every segment before its first mutation, runs
 under the same process and cross-process locks as appends, and atomically
-replaces partially retained files.
+replaces partially retained files. Every record whose timestamp can drive a
+deletion must also pass its daemon-passport signature and body-hash check;
+unknown signers or tampered timestamps preserve the tenant and fail closed.
+After an intentional daemon passport rotation, provide a bounded
+`CORECRUXD_PROVENANCE_RECORD_SIGNER_KEYRING_JSON` object mapping each retained
+historical `p_…` fingerprint to its Ed25519 public-key hex. The fingerprint is
+re-derived from every configured key; malformed, mismatched, or unknown keys
+never authorize deletion.
 
 Active legal holds are checked while the legal-hold read lock is held through
 the sweep. A tenant-wide hold preserves every verification record. A scoped
@@ -141,19 +148,54 @@ hold can target `provenance::verification_record::<record_id>` (or the broader
 `provenance::verification_record::` prefix). Malformed newest hold state is
 resolved by the legal-hold store's tenant-wide fail-closed fallback.
 
-Every non-empty sweep mints a count-only governance receipt under
-`__governance__::retention`; it contains the tenant hash and counts, never raw
-tenant ids, record ids, asset bytes, or caller text. The triggering response
-includes:
+Every deletion-producing sweep first durably mints a count-only `planned` governance
+receipt under `__governance__::retention`; deletion does not begin if that
+intent cannot be recorded. A second `completed` or `failed` receipt uses the
+same sweep id after the attempt, including failures before the first file
+mutation. These contain the tenant hash and counts, never
+raw tenant ids, record ids, asset bytes, or caller text. The triggering
+response reports the final receipt:
 
 - `X-Cuecrux-Retention-Receipt-Status: recorded|pending`;
 - `X-Cuecrux-Retention-Receipt-Id` when minting succeeds;
 - `X-Cuecrux-Retention-Records-Dropped`.
 
 `pending` is loud audit debt: the deletion is not rolled back, and the daemon
-increments/logs its governance-receipt failure signal. A configured sweep is
-activity-driven in this beta; inactive tenants are not swept until a later
-authenticated retained-record call.
+increments/logs its governance-receipt failure signal.
+
+Inactive-tenant scheduling is a separate, default-off operator choice:
+
+```bash
+export CORECRUXD_PROVENANCE_RETENTION_SCHEDULER=true
+export CORECRUXD_PROVENANCE_RETENTION_INTERVAL_SECS=3600
+export CORECRUXD_PROVENANCE_RETENTION_MAX_TENANTS_PER_PASS=100
+```
+
+It requires the retention-days policy above, skips the immediate boot tick,
+discovers only exact hash-bound tenant directories, and rotates through a
+bounded batch (interval 60–86,400 seconds; batch 1–1,000). Explicit malformed
+or out-of-range scheduler bounds disable the task rather than being clamped.
+Each pass starts its 30-second deadline before discovery, checks it and
+shutdown during discovery, lock acquisition, and record validation, and
+conservatively debits discovered store bytes from the 512-MiB cap before
+rechecking the remaining budget under each tenant lock. Malformed no-newline
+records are cut off at the line bound rather than scanned to EOF. A budget-hit directory advances the
+round-robin cursor so it cannot starve later tenants. Once a
+durable `planned` receipt exists, that tenant's bounded atomic mutation and
+terminal receipt finish before shutdown; while waiting to mint that intent,
+shutdown/deadline cancellation is still observed. Later tenants are skipped. The
+scheduler shares the request-path hourly tenant cadence. Scheduled receipts use the fixed actor
+`provenance-retention-scheduler` and trigger `scheduled`; they contain the same
+counts and hashed tenant identity as request-triggered receipts.
+
+Automatic verification-record deletion (request-triggered or scheduled) is
+currently enabled only on Linux, where every existing directory component is
+opened descriptor-relative with no symlink traversal and mutations remain
+anchored to the opened tenant directory. Other platforms preserve records and
+fail the configured deletion attempt closed. The scheduler is
+independent of `CORECRUXD_FEATURE_PROVENANCE_API`: routes may stay off while a
+separately approved lifecycle task runs. A hosted activation and deletion
+drill remain operator gates.
 
 ## API shape
 
