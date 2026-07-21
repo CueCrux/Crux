@@ -407,6 +407,40 @@
     return [{ h: 'Awaiting approval', sub: '/v1/work/gate/pending · ' + pend.length + ' pending', wide: true, controls: rows }];
   }
 
+  function requestAge(unixMs) {
+    var at = Number(unixMs);
+    if (!isFinite(at) || at <= 0) { return 'age unknown'; }
+    var elapsed = Math.max(0, Date.now() - at);
+    var minutes = Math.floor(elapsed / 60000);
+    if (minutes < 1) { return 'just now'; }
+    if (minutes < 60) { return minutes + 'm ago'; }
+    var hours = Math.floor(minutes / 60);
+    if (hours < 24) { return hours + 'h ago'; }
+    var days = Math.floor(hours / 24);
+    return days + 'd ago';
+  }
+
+  // Passport mint requests are operator decisions, directly analogous to
+  // cx-gates. The renderer owns the editable, attributed approve/reject form;
+  // this transform stays pure data + formatting and degrades feature-off 404s
+  // to an honest empty state.
+  function buildMints(res) {
+    if (!res.ok || !res.data) {
+      var message = res.status === 404
+        ? 'Feature disabled — passport mint requests are not enabled on this daemon.'
+        : 'Mint requests unavailable — GET /v1/passport/mint-requests/pending';
+      return [{ h: 'Awaiting approval', wide: true, controls: degraded(res.status, message) }];
+    }
+    var pending = arr(res.data.pending).filter(function (p) { return (p.status || 'pending') === 'pending'; });
+    var controls = [{ t: 'search', ph: 'Filter pending mint requests…' }];
+    pending.slice(0, 50).forEach(function (p) {
+      var requested = ['personal', 'work', 'public'].indexOf(p.requested_category) >= 0 ? p.requested_category : '';
+      controls.push({ t: 'mintcard', request: p, category: requested, age: requestAge(p.requested_at_unix_ms) });
+    });
+    if (!pending.length) { controls.push(info('none pending', 'agent-requested passport mints appear here for operator approval')); }
+    return [{ h: 'Awaiting approval', sub: '/v1/passport/mint-requests/pending · ' + pending.length + ' pending', wide: true, controls: controls }];
+  }
+
   // Review-queue view (P1 widen): the surfaced `__consolidation_review__::`
   // runs written by the (default-OFF) consolidation scheduler, each carrying
   // its contradiction candidates AND expiry proposals (stale / low-confidence).
@@ -1146,6 +1180,7 @@
     // ---- Trust -----------------------------------------------------------
     'cx-receipts': page('cx-receipts', 'trust', 'Receipts', 'CROWN · verify Ed25519 proofs offline with the key'),
     'cx-gates': page('cx-gates', 'trust', 'Gates', 'human approvals — destructive / high-risk transitions wait here (Art. 14)', { load: { endpoint: '/v1/work/gate/pending', build: buildGates } }),
+    'cx-mints': page('cx-mints', 'trust', 'Pending mints', 'agent-requested passports — review details, then accept or reject', { operatorOnly: true, load: { endpoint: '/v1/passport/mint-requests/pending', build: buildMints } }),
     'cx-passport': page('cx-passport', 'trust', 'Passport', 'agent + people identities · create and view passports', { load: { endpoint: '/v1/passports', build: buildPassports } }),
     'cx-identity': page('cx-identity', 'trust', 'Identity', 'candidate links — inference proposes, consent disposes', { load: { endpoint: '/v1/identity/candidates', build: buildIdentity } }),
     'cx-mediation': page('cx-mediation', 'trust', 'Mediation', 'the gateway plane — identity, capability ladder, foresight', { load: { endpoint: '/v1/console/engine/summary', build: buildMediationEngine } }),

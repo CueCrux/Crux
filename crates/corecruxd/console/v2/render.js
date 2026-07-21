@@ -23,7 +23,7 @@
 
   // The control types this renderer knows how to draw. The smoke asserts every
   // control type used anywhere in pages.js has a branch here.
-  var CONTROL_TYPES = ['search', 'input', 'textarea', 'select', 'toggle', 'btn', 'info', 'exp', 'rpcout', 'bar', 'theme', 'chart', 'disclose', 'repogrid', 'wbread'];
+  var CONTROL_TYPES = ['search', 'input', 'textarea', 'select', 'toggle', 'btn', 'info', 'exp', 'mintcard', 'rpcout', 'bar', 'theme', 'chart', 'disclose', 'repogrid', 'wbread'];
   var GATE_TITLE = 'wired in M3+';
   var RUNTIME_CAPABILITY_PRESENTATION = Object.freeze([
     Object.freeze(['append', 'Dataplane append']),
@@ -96,6 +96,20 @@
   }
   function rejectGate(actionId, approverPassport) {
     return operatorGatedCall(function (g) { return g.gateReject(actionId, { approver_passport: approverPassport }); });
+  }
+  function approveMintRequest(requestId, approverPassport, category, name) {
+    return operatorGatedCall(function (g) {
+      return g.passportMintRequestApprove(requestId, {
+        approver_passport: approverPassport,
+        category: category,
+        name: name
+      });
+    });
+  }
+  function rejectMintRequest(requestId, approverPassport) {
+    return operatorGatedCall(function (g) {
+      return g.passportMintRequestReject(requestId, { approver_passport: approverPassport });
+    });
   }
   function commentWork(workId, authorPassport, body) {
     return operatorGatedCall(function (g) { return g.workComment(workId, { author_passport: authorPassport, body: body }); });
@@ -749,6 +763,109 @@
     return row;
   }
 
+  function mintProblem(action, r) {
+    var data = (r && r.data) || {};
+    var detail = data.detail || data.error || data.message;
+    return action + ' failed · HTTP ' + (r ? r.status : 0) + (detail ? ' · ' + detail : '');
+  }
+
+  function refreshMintPanel(sectionCard, flash) {
+    return fetchJSON('/v1/passport/mint-requests/pending').then(function (res) {
+      var pages = (typeof window !== 'undefined') ? window.CruxPages : null;
+      var page = pages && pages.PAGES && pages.PAGES['cx-mints'];
+      var sections = page && page.load && typeof page.load.build === 'function' ? page.load.build(res) : [];
+      if (flash && sections[0]) {
+        sections[0].controls = [{ t: 'info', label: 'last decision', v: flash }].concat(sections[0].controls || []);
+      }
+      var grid = sectionCard && sectionCard.parentNode;
+      var container = grid && grid.parentNode;
+      if (container && sections.length) { renderSections(container, withRuntimeCapabilitySection(page, sections)); }
+      return res;
+    });
+  }
+
+  function renderMintRequestCard(control, sectionCard) {
+    var request = control.request || {};
+    var requestId = String(request.request_id || '');
+    var domId = requestId.replace(/[^a-zA-Z0-9_-]/g, '-') || 'unknown';
+    var requestedCategory = control.category || '';
+    var details = el('details', { 'class': 'exp', open: 'open', 'data-mint-request-id': requestId });
+    details.appendChild(el('summary', { 'class': 'exp-sum' }, [
+      el('span', { 'class': 'exp-label', text: request.requester_id || 'unknown requester' }),
+      el('span', { 'class': 'exp-sub', text: (control.age || 'age unknown') + ' · requested by ' + (request.requested_by_passport || '?') }),
+      el('span', { 'class': 'exp-badge', text: requestedCategory || 'category required' })
+    ]));
+    var body = el('div', { 'class': 'exp-body' });
+    body.appendChild(el('div', { 'class': 'ctl-info' }, [
+      el('span', { 'class': 'ctl-info-k', text: 'reason' }),
+      el('span', { 'class': 'ctl-info-v', text: request.reason || '—' })
+    ]));
+    body.appendChild(el('div', { 'class': 'ctl-info' }, [
+      el('span', { 'class': 'ctl-info-k', text: 'requested category' }),
+      el('span', { 'class': 'ctl-info-v', text: request.requested_category || 'not supplied' })
+    ]));
+
+    var categoryId = 'mint-category-' + domId;
+    var category = el('select', { 'class': 'ctl-input ctl-select', id: categoryId, 'data-mint-field': 'category' });
+    [
+      { value: '', label: 'Choose category…' },
+      { value: 'personal', label: 'personal' },
+      { value: 'work', label: 'work' },
+      { value: 'public', label: 'public' }
+    ].forEach(function (entry) {
+      var option = el('option', { value: entry.value, text: entry.label });
+      if (entry.value === requestedCategory) { option.setAttribute('selected', 'selected'); }
+      category.appendChild(option);
+    });
+    category.value = requestedCategory;
+    body.appendChild(el('div', { 'class': 'ctl-row' }, [
+      el('label', { 'class': 'ctl-label', 'for': categoryId, text: 'Category' }), category,
+      el('p', { 'class': 'ctl-desc', text: requestedCategory ? 'Pre-filled from the agent request; change it before accepting if needed.' : 'Required — choose the passport category before accepting.' })
+    ]));
+
+    var nameId = 'mint-name-' + domId;
+    var name = el('input', { 'class': 'ctl-input', id: nameId, type: 'text', value: '', placeholder: 'Optional display name', autocomplete: 'off', 'data-mint-field': 'name' });
+    name.value = '';
+    body.appendChild(el('div', { 'class': 'ctl-row' }, [
+      el('label', { 'class': 'ctl-label', 'for': nameId, text: 'Name (optional)' }), name
+    ]));
+
+    var accept = el('button', { 'class': 'btn-primary', type: 'button', 'data-mint-action': 'accept' }, ['Accept']);
+    var reject = el('button', { 'class': 'btn-quiet danger', type: 'button', 'data-mint-action': 'reject' }, ['Reject']);
+    var status = el('p', { 'class': 'ow-status', role: 'status', 'aria-live': 'polite', 'data-mint-status': requestId });
+    body.appendChild(el('div', { 'class': 'ow-actions' }, [accept, reject]));
+    body.appendChild(status);
+    details.appendChild(body);
+    stampOperatorOnly(details);
+
+    function lock(message) { accept.disabled = true; reject.disabled = true; status.textContent = message; }
+    function unlock() { accept.disabled = false; reject.disabled = false; }
+    accept.addEventListener('click', function () {
+      var approver = boundPassport();
+      var selected = (category.value || '').trim();
+      if (!approver) { status.textContent = 'Bind a passport to accept — mint decisions must be attributed (Art. 14).'; return Promise.resolve(); }
+      if (!selected) { status.textContent = 'Choose a category before accepting.'; category.focus(); return Promise.resolve(); }
+      lock('Accepting…');
+      return approveMintRequest(requestId, approver, selected, (name.value || '').trim()).then(readJson).then(function (r) {
+        if (!r.ok) { status.textContent = mintProblem('Accept', r); unlock(); return r; }
+        var mintedCategory = (r.data && r.data.category) || selected;
+        status.textContent = 'Accepted · minted as ' + mintedCategory + ' · refreshing…';
+        return refreshMintPanel(sectionCard, 'Accepted ' + request.requester_id + ' · minted as ' + mintedCategory);
+      }).catch(function (e) { status.textContent = 'Accept failed · ' + (e && e.message || e); unlock(); });
+    });
+    reject.addEventListener('click', function () {
+      var approver = boundPassport();
+      if (!approver) { status.textContent = 'Bind a passport to reject — mint decisions must be attributed (Art. 14).'; return Promise.resolve(); }
+      lock('Rejecting…');
+      return rejectMintRequest(requestId, approver).then(readJson).then(function (r) {
+        if (!r.ok) { status.textContent = mintProblem('Reject', r); unlock(); return r; }
+        status.textContent = 'Rejected · refreshing…';
+        return refreshMintPanel(sectionCard, 'Rejected ' + request.requester_id);
+      }).catch(function (e) { status.textContent = 'Reject failed · ' + (e && e.message || e); unlock(); });
+    });
+    return details;
+  }
+
   function renderControl(control, sectionCard) {
     var t = control.t;
     var node;
@@ -970,6 +1087,10 @@
         }
         det.appendChild(body);
         node = det;
+        break;
+      }
+      case 'mintcard': {
+        node = renderMintRequestCard(control, sectionCard);
         break;
       }
       case 'disclose': {
@@ -5444,6 +5565,9 @@
     boundPassport: boundPassport,
     approveGate: approveGate,
     rejectGate: rejectGate,
+    approveMintRequest: approveMintRequest,
+    rejectMintRequest: rejectMintRequest,
+    renderMintRequestCard: renderMintRequestCard,
     commentWork: commentWork,
     enrichAction: enrichAction,
     // M13b — the live-write registry (exposed so the smoke can audit the harness:
