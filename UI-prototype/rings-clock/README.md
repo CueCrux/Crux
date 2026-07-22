@@ -53,3 +53,10 @@ Related: `UI-prototype/console-3d/` (clay-substrate concept, 2026-06-11).
   ledger (stacked bar per event: tokens + kind + version cap) with the plan's
   own min/mid/max date ticks and min→max range on the 12 o'clock seam;
   sector click now enters solo.
+- `versions/v4.7-solo-radial-ledger.html` — solo ledger as radial bars in the
+  9→12 quadrant (superseded layout).
+- v4.8 (current `index.html`) — solo ledger reworked as a polar gantt: one
+  ring per event (earliest outermost, same-day events on adjacent rings by
+  exact time), each ring tracks to 9 o'clock then stands up as a vertical
+  stacked bar (tokens + kind + version) on the horizontal baseline, with
+  per-event date labels and the plan's min→max range on the seam.
