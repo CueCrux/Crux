@@ -458,18 +458,12 @@ function toDisc(g, sx, sy) {
   return { x: ux * c - uy * s, y: ux * s + uy * c };
 }
 
-const soloRingR = (g, c) => {
-  /* solo: one ring per event — earliest outermost, latest innermost */
-  const unit = g.R - g.r0;
-  const rMax = g.r0 + unit * 0.92, rMin = g.r0 + unit * 0.18;
-  return c.n > 1 ? rMax - (rMax - rMin) * (c.rank / (c.n - 1)) : (rMax + rMin) / 2;
-};
 function cellPos(g, c) {
   if (!c.p.lay) return null;
   /* clockwise by day order: earliest at the sector's leading edge */
   const frac = c.n > 1 ? (c.rank + 0.5) / c.n : 0.5;
   const a = c.p.lay.a0 + (c.p.lay.a1 - c.p.lay.a0) * (0.06 + 0.88 * frac);
-  const r = solo === c.p ? soloRingR(g, c) : dayR(g, c.day) * (0.995 + c.jr * 0.01);
+  const r = dayR(g, c.day) * (0.995 + c.jr * 0.01);
   return { a, r, x: Math.cos(a) * r, y: Math.sin(a) * r };
 }
 function dotR(c) {
@@ -502,14 +496,12 @@ function draw(now) {
   ctx.scale(Z, Z);
   ctx.rotate(rot);
 
-  /* epoch rings (suppressed in solo — there, rings ARE events) */
-  if (!solo) {
-    for (let i = 1; i <= EPOCH_RINGS; i++) {
-      const r = g.r0 + (g.R - g.r0) * (i / EPOCH_RINGS);
-      ctx.strokeStyle = 'rgba(255,255,255,.09)';
-      ctx.lineWidth = 1 / Z;
-      ctx.beginPath(); ctx.arc(0, 0, r, 0, 7); ctx.stroke();
-    }
+  /* epoch rings */
+  for (let i = 1; i <= EPOCH_RINGS; i++) {
+    const r = g.r0 + (g.R - g.r0) * (i / EPOCH_RINGS);
+    ctx.strokeStyle = 'rgba(255,255,255,.09)';
+    ctx.lineWidth = 1 / Z;
+    ctx.beginPath(); ctx.arc(0, 0, r, 0, 7); ctx.stroke();
   }
 
   /* seam at 12: the "now" notch */
@@ -624,62 +616,62 @@ function draw(now) {
     }
   }
 
-  /* ── solo event ledger: one ring per event (earliest outermost). Each
-     event's ring tracks around to 9 o'clock, then stands straight up as a
-     vertical stacked bar — tokens (indigo) + fact kind + version cap.
-     Same-day events keep their exact time order: adjacent rings. ── */
+  /* ── solo event ledger: the 9→12 quadrant charts what each event used.
+     One stacked bar per event: tokens (indigo) + fact kind + version cap. ── */
   let soloLabels = null;
   if (solo && solo.lay && solo.lay.alpha > 0.5) {
     soloLabels = [];
+    const q0 = Math.PI + 0.10, q1 = Math.PI * 1.5 - 0.10;
+    const minD = solo.b, maxD = Math.max(solo.e, minD + 0.5);
+    const span = maxD - minD;
+    const Rb = g.r0 + (g.R - g.r0) * 0.12;
     const unit = g.R - g.r0;
-    const L = solo.lay;
+    /* base arc + date tick guides (min / mid / max of THIS plan) */
+    ctx.strokeStyle = 'rgba(255,255,255,.12)';
+    ctx.lineWidth = 1 / Z;
+    ctx.beginPath(); ctx.arc(0, 0, Rb, q0, q1); ctx.stroke();
+    for (let tI = 0; tI <= 2; tI++) {
+      const f = tI / 2;
+      const a = q0 + (q1 - q0) * f;
+      ctx.strokeStyle = 'rgba(255,255,255,.05)';
+      ctx.beginPath();
+      ctx.moveTo(Math.cos(a) * Rb, Math.sin(a) * Rb);
+      ctx.lineTo(Math.cos(a) * (Rb + unit * 0.52), Math.sin(a) * (Rb + unit * 0.52));
+      ctx.stroke();
+      soloLabels.push({ x: Math.cos(a) * (Rb + unit * 0.60), y: Math.sin(a) * (Rb + unit * 0.60),
+                        t: dayDate(minD + span * f) });
+    }
+    /* stacked bars, chronological 9 → 12 */
     const evs = [...solo.cells].sort((a, b) => a.day - b.day)
       .filter(c => c.day <= T && c.day >= S && c.day <= E && passFilter(c));
-    /* 9 o'clock baseline the bars stand on */
-    ctx.strokeStyle = 'rgba(255,255,255,.16)';
-    ctx.lineWidth = 1 / Z;
-    ctx.beginPath(); ctx.moveTo(-(g.R + 10), 0); ctx.lineTo(-g.r0 * 0.72, 0); ctx.stroke();
+    let lastAng = -99, crowd = 0;
     for (const c of evs) {
-      const r = soloRingR(g, c);
-      const frac = c.n > 1 ? (c.rank + 0.5) / c.n : 0.5;
-      const aNode = L.a0 + (L.a1 - L.a0) * (0.06 + 0.88 * frac);
-      const chue = KIND_HUE[c.kind] || '#8b96f2';
-      const isSelBar = pinned === c;
-      /* faint full ring across the sector, brighter track node → 9 o'clock */
-      ctx.strokeStyle = hex2rgba(chue, 0.07);
-      ctx.lineWidth = 1 / Z;
-      ctx.beginPath(); ctx.arc(0, 0, r, L.a0, aNode); ctx.stroke();
-      ctx.strokeStyle = hex2rgba(chue, isSelBar ? 0.75 : 0.30);
-      ctx.lineWidth = (isSelBar ? 2 : 1.3) / Z;
-      ctx.beginPath(); ctx.arc(0, 0, r, aNode, Math.PI); ctx.stroke();
-      /* elbow at (−r, 0): the bar goes straight up */
-      let y1 = 0;
+      let a = q0 + (q1 - q0) * ((c.day - minD) / span);
+      if (a - lastAng < 0.022) { crowd++; a = lastAng + 0.022; } else crowd = 0;
+      lastAng = a;
+      let r1 = Rb;
       const segs = [
-        { h: unit * (0.06 + Math.min(0.30, ((c.tokens || 160) / 550) * 0.34)), col: hex2rgba('#8b96f2', 0.55) },
-        { h: unit * 0.055, col: hex2rgba(chue, 0.95) },
+        { h: unit * (0.05 + Math.min(0.28, ((c.tokens || 160) / 550) * 0.30)), col: hex2rgba('#8b96f2', 0.5) },
+        { h: unit * 0.07, col: hex2rgba(KIND_HUE[c.kind] || '#8b96f2', 0.95) },
       ];
-      if (c.version > 1) segs.push({ h: unit * 0.022, col: 'rgba(238,240,246,.85)' });
+      if (c.version > 1) segs.push({ h: unit * 0.028, col: 'rgba(238,240,246,.85)' });
+      const isSelBar = pinned === c;
       for (const sg of segs) {
         ctx.strokeStyle = sg.col;
         ctx.lineWidth = (5 / Z) * (isSelBar ? 1.5 : 1);
         ctx.beginPath();
-        ctx.moveTo(-r, -y1);
-        y1 += sg.h;
-        ctx.lineTo(-r, -y1);
+        ctx.moveTo(Math.cos(a) * r1, Math.sin(a) * r1);
+        r1 += sg.h;
+        ctx.lineTo(Math.cos(a) * r1, Math.sin(a) * r1);
         ctx.stroke();
       }
-      c._bx = -r; c._bh = y1;
+      c._barAng = a; c._barR1 = r1;
     }
     ctx.lineWidth = 1 / Z;
-    /* date labels under the axis: first / mid / last visible event */
-    const picks = evs.length ? [evs[0], evs[Math.floor((evs.length - 1) / 2)], evs[evs.length - 1]] : [];
-    const seen = new Set();
-    for (const c of picks) {
-      if (seen.has(c.rank)) continue;
-      seen.add(c.rank);
-      soloLabels.push({ x: -soloRingR(g, c), y: 16, t: dayDate(c.day) });
-    }
-    soloLabels.push({ x: -(g.r0 + unit * 0.55), y: -(unit * 0.62), t: 'event ledger · outer ring = first event', cap: true });
+    /* quadrant caption */
+    const capA = (q0 + q1) / 2;
+    soloLabels.push({ x: Math.cos(capA) * (g.R + 26), y: Math.sin(capA) * (g.R + 26),
+                      t: 'event ledger · bar = tokens + kind', cap: true });
   }
 
   /* live edge: outward mode sweeps with T; inward mode IS the rim */
@@ -937,11 +929,14 @@ function hitTest(e) {
   const p = toDisc(g, e.clientX - r.left, e.clientY - r.top);
   const pr = Math.hypot(p.x, p.y);
   const pa = Math.atan2(p.y, p.x);
-  /* solo: event-ledger vertical bars take priority */
+  /* solo: event-ledger bars take priority */
   if (solo) {
+    let pa2 = pa;
+    if (pa2 < 0) pa2 += TAU;
     for (const c of solo.cells) {
-      if (c._bx === undefined || c.day > T) continue;
-      if (Math.abs(p.x - c._bx) < 6 / Z && p.y < 5 / Z && p.y > -(c._bh + 9 / Z)) return c;
+      if (c._barAng === undefined || c.day > T) continue;
+      const da2 = Math.abs(pa2 - c._barAng);
+      if (da2 * Math.max(pr, 1) < 6 / Z && pr > g.r0 && pr < c._barR1 + 8 / Z) return c;
     }
   }
   let best = null, bd = 10 / Z;
