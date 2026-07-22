@@ -160,3 +160,20 @@ fs.writeFileSync(f, src.replace(/var RINGS_HTML_B64 = '\''[^'\'']*'\''/,
 
 The mirror mounts the console dir (`CORECRUXD_CONSOLE_DEV_PATH=/console-dev`),
 so a browser refresh picks the change up — no container restart needed.
+
+## Auth workaround (local browser access)
+
+Prod fronts the console with an oauth2 proxy (`/oauth2/sign_in`) that does not
+exist locally, so the replicated `jwt_hs256` mode left the browser session-less
+("Your session has expired") with a dead sign-in link. The mirror now runs with
+(in `mirror.env`, which is the LAST `--env-file` and therefore wins):
+
+```
+CORECRUXD_AUTH_MODE=off
+CORECRUXD_ALLOW_INSECURE_DEV_AUTH_BIND=1   # container binds 0.0.0.0 internally;
+                                           # published on host loopback only
+```
+
+This is acceptable ONLY because the container is published on `127.0.0.1` and
+runs against a throwaway copy. Never carry these two lines to any non-loopback
+deployment. API calls need no Authorization header against the mirror.
