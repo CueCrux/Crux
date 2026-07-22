@@ -38,36 +38,26 @@ code { font-family: var(--font-mono); font-size: .9em; background: var(--panel-s
 #topbar .pill .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--teal); }
 #topbar .sp { margin-left: auto; }
 
-/* ── lens tiles: compact stack, top-right over the stage ── */
+/* ── lens tiles (console card vocabulary: surface, 1px edge, hover border) ── */
 #tiles {
-  position: absolute; top: 14px; right: 16px; z-index: 15;
-  display: flex; flex-direction: column; gap: 6px; width: 200px;
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px;
+  max-width: 1240px; margin: 18px auto 0; padding: 0 clamp(16px, 3vw, 32px);
 }
 .tile {
   text-align: left; cursor: pointer;
-  display: flex; align-items: baseline; gap: 8px;
-  background: rgba(14,16,24,.88); border: 1px solid var(--hairline);
-  border-radius: 10px; padding: 7px 12px;
+  background: var(--panel); border: 1px solid var(--hairline);
+  border-radius: 12px; padding: 13px 16px 11px;
   color: var(--ink2); font-family: var(--font-sans);
   transition: border-color .15s, background .15s;
 }
-.tile:hover { border-color: var(--hairline-strong); background: rgba(20,23,33,.95); }
+.tile:hover { border-color: var(--hairline-strong); background: var(--panel-strong); }
 .tile:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.tile[aria-pressed="true"] { border-color: rgba(139,150,242,.6); background: rgba(139,150,242,.14); }
-.tile .t { font: 600 12px var(--font-sans); color: var(--ink2); display: flex; align-items: center; gap: 7px; flex: 1; }
-.tile .t i { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
-.tile .n { font: 700 14px var(--font-sans); color: var(--ink); letter-spacing: -.01em; font-variant-numeric: tabular-nums; }
-.tile .s { display: none; }
+.tile[aria-pressed="true"] { border-color: rgba(139,150,242,.6); background: rgba(139,150,242,.10); }
+.tile .t { font: 600 12.5px var(--font-sans); color: var(--ink2); display: flex; align-items: center; gap: 8px; }
+.tile .t i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.tile .n { font: 700 22px var(--font-sans); color: var(--ink); letter-spacing: -.02em; margin-top: 3px; font-variant-numeric: tabular-nums; }
+.tile .s { font: 11px var(--font-mono); color: var(--ink3); margin-top: 2px; }
 .tile[aria-pressed="true"] .t { color: var(--accent); }
-@media (max-width: 760px) { #tiles { position: static; flex-direction: row; flex-wrap: wrap; width: auto; margin: 10px 16px 0; } }
-
-/* icon buttons + date pickers */
-.stagebar button.ic { font-size: 13px; padding: 4px 9px; min-width: 30px; text-align: center; }
-.stagebar input[type=date] {
-  font: 600 11px var(--font-mono); color: var(--ink2);
-  background: rgba(255,255,255,.07); border: 1px solid var(--hairline-strong);
-  border-radius: 7px; padding: 3px 6px; color-scheme: dark;
-}
 
 section.concept { max-width: 1560px; margin: 26px auto 0; padding: 0 clamp(12px, 3vw, 36px); }
 /* de-carded: the rings sit directly on the page */
@@ -170,37 +160,41 @@ footer { max-width: 1100px; margin: 48px auto 0; padding: 20px clamp(16px, 4vw, 
   <span class="pill">snapshot · 2026-07-22</span>
 </header>
 
+<div id="tiles" role="group" aria-label="Ring lenses">
+  <button class="tile" data-lens="work" aria-pressed="true">
+    <span class="t"><i style="background:#a78bfa"></i>ExecPlans</span>
+    <span class="n">1,040</span>
+    <span class="s">58 in progress · 4 blocked · clock of work</span>
+  </button>
+  <button class="tile" data-lens="memory" aria-pressed="false">
+    <span class="t"><i style="background:#2dd4bf"></i>Memory</span>
+    <span class="n">21</span>
+    <span class="s">traced facts · by kind · decay-aware</span>
+  </button>
+  <button class="tile" data-lens="sessions" aria-pressed="false">
+    <span class="t"><i style="background:#22d3ee"></i>Sessions</span>
+    <span class="n">32</span>
+    <span class="s">live bindings · writes by agent passport</span>
+  </button>
+  <button class="tile" data-lens="receipts" aria-pressed="false">
+    <span class="t"><i style="background:#34d399"></i>Receipts</span>
+    <span class="n">seq</span>
+    <span class="s">CROWN chain · forward only</span>
+  </button>
+</div>
 
 <section class="concept" id="rings">
   <div class="stagewrap">
-    <canvas id="cv" aria-label="Rings: real execplan portfolio replayed as an animated clock; tiles switch the lens"></canvas>
-    <div id="tiles" role="group" aria-label="Ring lenses">
-      <button class="tile" data-lens="work" aria-pressed="true">
-        <span class="t"><i style="background:#a78bfa"></i>ExecPlans</span><span class="n">1,040</span>
-      </button>
-      <button class="tile" data-lens="data" aria-pressed="false">
-        <span class="t"><i style="background:#8b96f2"></i>Data graph</span><span class="n">66</span>
-      </button>
-      <button class="tile" data-lens="memory" aria-pressed="false">
-        <span class="t"><i style="background:#2dd4bf"></i>Memory</span><span class="n">21</span>
-      </button>
-      <button class="tile" data-lens="sessions" aria-pressed="false">
-        <span class="t"><i style="background:#22d3ee"></i>Sessions</span><span class="n">32</span>
-      </button>
-      <button class="tile" data-lens="receipts" aria-pressed="false">
-        <span class="t"><i style="background:#34d399"></i>Receipts</span><span class="n">seq</span>
-      </button>
-    </div>
+    <canvas id="cv" aria-label="Rings v4: real execplan portfolio replayed as an animated clock; zoom for card detail"></canvas>
     <div class="stagebar">
       <span class="grp">
-        <button id="b-spin" class="ic" aria-pressed="true" title="Ambient spin">⟳</button>
-        <button id="b-clock" class="ic" title="Reset clock to 12 (also stops spin)">◷</button>
-        <button id="b-mode" class="ic" aria-pressed="true" title="Bars: spoke from centre to each node">▥</button>
-        <button id="b-dir" class="ic" aria-pressed="false" title="Time edge: outward (rings grow) / inward (nodes sink from rim)">⇅</button>
-        <button id="b-all" class="ic" aria-pressed="false" title="Census: every plan stays on the clock; hover names sectors">◌</button>
-        <button id="b-done" class="ic" aria-pressed="false" title="Show completed plans on the clock (auto-on during playback)">✓</button>
-        <button id="b-state" class="ic" aria-pressed="false" title="State colours: complete green · in progress purple · blocked red">◑</button>
-        <button id="b-lin" class="ic" aria-pressed="false" title="Lineage chords (depends_on)">⌇</button>
+        <button id="b-spin" aria-pressed="true">spin</button>
+        <button id="b-clock">reset clock</button>
+        <button id="b-mode" aria-pressed="false">bars</button>
+        <button id="b-dir" aria-pressed="false" title="Where new nodes appear: centre-out (rings grow) or rim-in (nodes sink)">edge: outward</button>
+        <button id="b-all" aria-pressed="false" title="Every plan in the window stays on the clock — completed and parked included. Labels hide; hover a sector to name it.">all plans</button>
+        <button id="b-state" aria-pressed="false" title="Colour nodes by their plan's state: complete green, in progress purple, blocked red">state colours</button>
+        <button id="b-lin" aria-pressed="false" title="Show all plan-lineage chords (depends_on); hovering a sector always lights its own">lineage</button>
       </span>
       <span class="grp">
         <select id="s-kind" aria-label="Filter by node kind">
@@ -217,13 +211,11 @@ footer { max-width: 1100px; margin: 48px auto 0; padding: 20px clamp(16px, 4vw, 
         </select>
       </span>
       <span class="grp">
-        <input id="d-start" type="date" min="2026-05-18" max="2026-07-22" value="2026-05-18" aria-label="Window start date">
-        <input id="r-start" type="range" min="0" max="1000" value="0" style="width:70px" aria-label="Window start">
-        <input id="r-end" type="range" min="0" max="1000" value="1000" style="width:70px" aria-label="Window end">
-        <input id="d-end" type="date" min="2026-05-18" max="2026-07-22" value="2026-07-22" aria-label="Window end date">
+        <label for="r-start">start</label><input id="r-start" type="range" min="0" max="1000" value="0">
+        <label for="r-end">end</label><input id="r-end" type="range" min="0" max="1000" value="1000">
       </span>
       <span class="grp">
-        <button id="b-play" class="ic" aria-pressed="false" title="Replay the window">▶</button>
+        <button id="b-play" aria-pressed="false">play</button>
         <input id="r-time" type="range" min="0" max="1000" value="1000" aria-label="Time">
         <span id="c-date" class="chip">2026-07-22</span>
       </span>
@@ -377,8 +369,7 @@ const cells = [];
 
 /* ── view state ── */
 let rot = 0, spinning = !REDUCED, resetTween = false;
-let mode = 'bars';                                 /* dots | bars — bars by default */
-let showCompleted = false;                         /* completed plans on the clock; auto-on while playing */
+let mode = 'dots';                                 /* dots | bars */
 let dir = 'out';                                   /* out: rings grow from centre · in: nodes sink from rim */
 let showAll = false;                               /* census mode: nothing retires off the clock */
 let hoverSec = null;                               /* plan whose sector is under the pointer */
@@ -416,11 +407,8 @@ const SEAM = 0.10;                                 /* gap at 12 o'clock */
 const BASE = -Math.PI / 2 + SEAM / 2;              /* 12:01 */
 function activePlans(t) {
   if (solo) return [solo];
-  let out;
-  if (showAll) out = PLANS.filter(p => p.b <= t && p.e >= S - 0.001 && p.b <= E);
-  else out = PLANS.filter(p => p.b <= t && t < p.exit && p.e >= S - 0.001 && p.b <= E);
-  if (!showCompleted) out = out.filter(p => p.st !== 0);
-  return out;
+  if (showAll) return PLANS.filter(p => p.b <= t && p.e >= S - 0.001 && p.b <= E);
+  return PLANS.filter(p => p.b <= t && t < p.exit && p.e >= S - 0.001 && p.b <= E);
 }
 function layoutTargets(t) {
   if (solo) {
@@ -909,116 +897,9 @@ function draw(now) {
   if (visible && !document.hidden) rafId = requestAnimationFrame(draw);
 }
 
-/* ── data graph lens: 66 real facts pulled live from the daemon.
-   Angle = source date on the clock · radius = effective confidence
-   (high near the heartwood, decayed/low further out) · edges = facts
-   sharing an entity, in time order · click = 2-hop neighbourhood. ── */
-const GRAPH_RAW = [{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"gate:M1-R-code","d":75.59696759259168,"a":"claude-work","h":"medium","c":1.0,"t":127},{"e":"execplan:verifiable-record-products-2026-07-17","k":"gate:M3-core-pointer-producer-code-2026-07-22","d":76.75865740740846,"a":"claude-work","h":"stable","c":1.0,"t":158},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"gate:M3","d":68.95072916666686,"a":"codex-work","h":"stable","c":1.0,"t":316},{"e":"incident:2026-07-22","k":"gpu1-cargo-deploy-help-side-effect","d":76.43028935185066,"a":"claude-work","h":"stable","c":1.0,"t":291},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"decision:vault-target-regression-repair","d":75.59696759259168,"a":"claude-work","h":"stable","c":1.0,"t":155},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"progress:M3","d":68.90971064814948,"a":"codex-work","h":"volatile","c":1.0,"t":274},{"e":"execplan:production-ethos-audit-harness-2026-07-17","k":"gate:M5","d":74.60589120370423,"a":"codex-work","h":"volatile","c":1.0,"t":323},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"gate:M1","d":68.38157407407562,"a":"codex-work","h":"medium","c":1.0,"t":296},{"e":"execplan:wikicrux-public-readiness-hardening-2026-07-21","k":"gate:M3b-blocked","d":75.82773148148044,"a":"drivew-host","h":"stable","c":1.0,"t":221},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"decision:m5b-installer-transaction","d":76.36789351851985,"a":"claude-work","h":"stable","c":1.0,"t":232},{"e":"incident:2026-07-22","k":"crc-v1-resident-ordinal-handle-alias","d":76.47960648148,"a":"claude-work","h":"stable","c":1.0,"t":185},{"e":"execplan:verifiable-record-products-2026-07-17","k":"gate:M9-evidence-publication","d":76.67115740740701,"a":"claude-work","h":"stable","c":1.0,"t":125},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"brief","d":67.92068287037182,"a":"codex-work","h":"medium","c":1.0,"t":205},{"e":"execplan:wikicrux-m5-pricing-enforcement-2026-07-17","k":"decision:m3b-refund-contract-parity","d":76.02534722222117,"a":"claude-work","h":"stable","c":1.0,"t":153},{"e":"execplan:verifiable-record-products-2026-07-17","k":"gate:M3-engine-consumer-deploy-2026-07-22","d":76.73957175925898,"a":"claude-work","h":"stable","c":1.0,"t":223},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"gate:M0","d":67.93586805555606,"a":"codex-work","h":"medium","c":1.0,"t":205},{"e":"execplan:crux-macaroon-token-attenuation-2026-07-16","k":"design:sync-delegation-convention","d":76.4979745370365,"a":"codex-work","h":"stable","c":1.0,"t":408},{"e":"execplan:crux-macaroon-token-attenuation-2026-07-16","k":"gate:M2prime-hotfix-reviewed-and-reconciliation-plan","d":76.41813657407329,"a":"codex-work","h":"stable","c":1.0,"t":743},{"e":"execplan:wikicrux-market-wedge-offers-2026-07-16","k":"decision:canonical-pricing","d":75.82225694444423,"a":"claude-work","h":"stable","c":1.0,"t":146},{"e":"execplan:wikicrux-m5-pricing-enforcement-2026-07-17","k":"gate:M3b","d":76.02534722222117,"a":"claude-work","h":"stable","c":1.0,"t":223},{"e":"execplan:verifiable-record-products-2026-07-17","k":"gate:M3","d":76.7468518518508,"a":"claude-work","h":"stable","c":1.0,"t":150},{"e":"execplan:cuecrux-selfserve-launch-readiness-2026-07-16","k":"gate:M8-edge-repair","d":76.54800925925883,"a":"claude-work","h":"none","c":1.0,"t":254},{"e":"bench:provenance-byok-local-20260721T174751Z-8e711150","k":"result","d":75.74369212962847,"a":"claude-work","h":"stable","c":1.0,"t":145},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"gate:M3-M4","d":68.8297453703708,"a":"codex-work","h":"medium","c":1.0,"t":328},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"console-v1-removed-followup-done","d":69.89159722222394,"a":"codex-work","h":"medium","c":1.0,"t":329},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"gate:M2","d":68.64881944444278,"a":"codex-work","h":"medium","c":1.0,"t":236},{"e":"execplan:crux-macaroon-token-attenuation-2026-07-16","k":"design:M3prime-sync-enforcement-on-v11","d":76.43527777777854,"a":"codex-work","h":"stable","c":1.0,"t":870},{"e":"incident:2026-07-22","k":"release-v0.5.48-macos-socket-fixture","d":76.56612268518438,"a":"claude-work","h":"stable","c":1.0,"t":147},{"e":"execplan:wikicrux-public-readiness-hardening-2026-07-21","k":"gate:M3b","d":75.84260416666802,"a":"drivew-host","h":"stable","c":1.0,"t":287},{"e":"execplan:wikicrux-market-wedge-offers-2026-07-16","k":"gate:M0","d":75.82225694444423,"a":"claude-work","h":"stable","c":1.0,"t":74},{"e":"execplan:corecrux-object-storage-tier-2026-07-07","k":"gate:G3-code-merge","d":76.63100694444438,"a":"claude-work","h":"stable","c":1.0,"t":125},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"gate:M1","d":68.6698958333327,"a":"codex-work","h":"stable","c":1.0,"t":536},{"e":"execplan:wikicrux-m5-pricing-enforcement-2026-07-17","k":"gate:M5a","d":75.79510416666744,"a":"claude-work","h":"stable","c":1.0,"t":230},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"decision:topology-corrected-cruxengine-14343","d":67.94807870370278,"a":"codex-work","h":"medium","c":1.0,"t":207},{"e":"incident:2026-07-22","k":"passport-mint-pre-m2-approval-live","d":76.75064814814687,"a":"claude-work","h":"stable","c":1.0,"t":203},{"e":"incident:2026-07-22","k":"core-sidecar-snapshot-path","d":76.8100694444438,"a":"claude-work","h":"stable","c":1.0,"t":172},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"gate:M5b","d":76.36789351851985,"a":"claude-work","h":"stable","c":1.0,"t":184},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"handoff:2026-07-14","d":68.88217592592628,"a":"codex-work","h":"stable","c":1.0,"t":409},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"milestone:M1-partial","d":67.99072916666773,"a":"codex-work","h":"medium","c":1.0,"t":275},{"e":"execplan:crux-macaroon-token-attenuation-2026-07-16","k":"gate:M2-rustdoc-fix-and-M3-grounding","d":75.82988425925942,"a":"codex-work","h":"stable","c":1.0,"t":732},{"e":"execplan:sdkcrux-dependency-vuln-remediation-2026-07-20","k":"audit-snapshot","d":74.56193287036876,"a":"codex-work","h":"volatile","c":1.0,"t":415},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"gate:M0","d":68.35657407407416,"a":"codex-work","h":"stable","c":1.0,"t":412},{"e":"execplan:crux-passport-mint-request-gate-2026-07-17","k":"gate:M2.1-integration","d":76.65032407407489,"a":"claude-work","h":"stable","c":1.0,"t":207},{"e":"execplan:cuecrux-selfserve-launch-readiness-2026-07-16","k":"decision:edge-cutover-gate","d":76.54349537036978,"a":"claude-work","h":"none","c":1.0,"t":167},{"e":"incident:2026-07-20","k":"sdkcrux-ci-runner-move-and-stacked-failures","d":74.54767361111226,"a":"codex-work","h":"volatile","c":1.0,"t":564},{"e":"execplan:production-ethos-audit-harness-2026-07-17","k":"gate:M7","d":75.6126157407416,"a":"claude-work","h":"stable","c":1.0,"t":116},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"gate:M2","d":68.84675925926058,"a":"codex-work","h":"stable","c":1.0,"t":463},{"e":"execplan:crux-banner-redesign-2026-07-21","k":"gate:deploy-v0.5.47","d":76.39510416666599,"a":"codex-work","h":"volatile","c":1.0,"t":216},{"e":"execplan:wikicrux-market-wedge-offers-2026-07-16","k":"gate:M1","d":75.82225694444423,"a":"claude-work","h":"medium","c":1.0,"t":162},{"e":"execplan:verifiable-record-products-2026-07-17","k":"gate:M3-deploy-automation-2026-07-22","d":76.7569560185184,"a":"claude-work","h":"stable","c":1.0,"t":175},{"e":"execplan:crux-macaroon-token-attenuation-2026-07-16","k":"incident:M3-M4-collision-with-concurrent-security-hotfix","d":75.92763888889021,"a":"codex-work","h":"stable","c":1.0,"t":822},{"e":"execplan:crux-macaroon-token-attenuation-2026-07-16","k":"gate:M3prime-sync-delegation","d":76.61583333333328,"a":"codex-work","h":"stable","c":1.0,"t":638},{"e":"__work_comment__::w_51752647ca6e4bdbbe4c3b45d30241c9::c_9a7285cbf6604152be964e81d7de0367","k":"record","d":76.73920138888934,"a":null,"h":"none","c":1.0,"t":173},{"e":"execplan:crux-passport-mint-request-gate-2026-07-17","k":"gate:M2-live-containment-2026-07-22","d":76.75064814814687,"a":"claude-work","h":"stable","c":1.0,"t":159},{"e":"execplan:sdkcrux-dependency-vuln-remediation-2026-07-20","k":"gate:M4","d":74.58318287037036,"a":"codex-work","h":"volatile","c":1.0,"t":220},{"e":"execplan:corecrux-object-storage-tier-2026-07-07","k":"gate:G3-prod-safety-recheck","d":76.6583912037022,"a":"claude-work","h":"volatile","c":1.0,"t":131},{"e":"execplan:wikicrux-m5-pricing-enforcement-2026-07-17","k":"gate:M3a-harness","d":75.91656249999869,"a":"claude-work","h":"stable","c":1.0,"t":244},{"e":"execplan:production-ethos-audit-harness-2026-07-17","k":"gate:M4","d":74.578125,"a":"codex-work","h":"volatile","c":1.0,"t":344},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"gate:M4","d":68.85881944444554,"a":"codex-work","h":"stable","c":1.0,"t":409},{"e":"execplan:crux-passport-mint-request-gate-2026-07-17","k":"gate:M2.1-integration","d":76.64783564814934,"a":"claude-work","h":"stable","c":1.0,"t":185},{"e":"execplan:wikicrux-public-readiness-hardening-2026-07-21","k":"gate:M3b","d":75.9136111111111,"a":"drivew-host","h":"stable","c":1.0,"t":293},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"console-v1-removed","d":68.89186342592438,"a":"codex-work","h":"medium","c":1.0,"t":288},{"e":"incident:2026-07-22","k":"vaultcrux-public-edge-loopback-regression","d":76.54800925925883,"a":"claude-work","h":"stable","c":1.0,"t":157},{"e":"incident:2026-07-22","k":"legal-hold-canary-mcp-auth-mismatch","d":76.43935185185182,"a":"codex-work","h":"stable","c":1.0,"t":214},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"gate:M3","d":69.03211805555475,"a":"codex-work","h":"stable","c":1.0,"t":215},{"e":"incident:2026-07-22","k":"legal-hold-canary-mcp-auth-mismatch","d":76.43893518518598,"a":"codex-work","h":"stable","c":1.0,"t":214}];
-const GNODES = GRAPH_RAW.map((n, i) => ({ ...n, i }));
-const GEDGES = [];
-(function buildGraph() {
-  const byE = {};
-  for (const n of GNODES) (byE[n.e] = byE[n.e] || []).push(n);
-  for (const e in byE) {
-    const arr = byE[e].sort((a, b) => a.d - b.d);
-    for (let i = 1; i < arr.length; i++) GEDGES.push({ a: arr[i - 1], b: arr[i] });
-  }
-})();
-const GADJ = {};
-for (const ed of GEDGES) {
-  (GADJ[ed.a.i] = GADJ[ed.a.i] || []).push(ed.b.i);
-  (GADJ[ed.b.i] = GADJ[ed.b.i] || []).push(ed.a.i);
-}
-let gSel = null;                                   /* selected node index → 2-hop highlight */
-function gHops(i0) {
-  const l1 = new Set(GADJ[i0] || []);
-  const l2 = new Set();
-  for (const j of l1) for (const k2 of (GADJ[j] || [])) if (k2 !== i0 && !l1.has(k2)) l2.add(k2);
-  return { l1, l2 };
-}
-const G_FAM_HUE = e =>
-  e.startsWith('execplan:') ? '#a78bfa' :
-  e.startsWith('bench:') ? '#f5a623' :
-  e.startsWith('incident:') ? '#ef4444' :
-  e.startsWith('design:') ? '#22d3ee' :
-  e.startsWith('__work_comment__') ? '#34d399' : '#7e8595';
-const G_THR = { volatile: 1, medium: 35, stable: 365, none: Infinity };
-function gEffConf(n) {
-  const age = Math.max(0, T - n.d);
-  const thr = G_THR[n.h] || Infinity;
-  if (thr === Infinity) return n.c;
-  return age > thr ? n.c * 0.5 : n.c * (1 - 0.35 * (age / thr));
-}
-function drawDataLens(ctx2, g) {
-  for (const n of GNODES) { n._x = undefined; n._on = false; }
-  const span = Math.max(0.5, E - S);
-  const rIn = g.r0 * 1.25, rOut = g.R * 0.96;
-  /* radius = confidence RANK within the visible set (real confidences are
-     uniformly ~1.0 today; normalising keeps "higher = nearer the centre"
-     meaningful instead of clumping everything at the heartwood) */
-  const vis = GNODES.filter(n => n.d <= T && n.d >= S && n.d <= E);
-  let cMin = 1, cMax = 0;
-  for (const n of vis) { const ec = gEffConf(n); if (ec < cMin) cMin = ec; if (ec > cMax) cMax = ec; }
-  const cSpan = Math.max(0.02, cMax - cMin);
-  const posOf = n => {
-    const a = BASE + (TAU - SEAM) * Math.max(0, Math.min(1, (n.d - S) / span));
-    const norm = (gEffConf(n) - cMin) / cSpan;
-    const r = rIn + (rOut - rIn) * (1 - (0.08 + 0.84 * norm));
-    return { a, x: Math.cos(a) * r, y: Math.sin(a) * r };
-  };
-  const hops = gSel !== null ? gHops(gSel) : null;
-  const inFocus = i2 => gSel === null ? null : (i2 === gSel ? 0 : hops.l1.has(i2) ? 1 : hops.l2.has(i2) ? 2 : -1);
-  /* confidence guide rings */
-  for (const cf of [0.25, 0.5, 0.75]) {
-    ctx2.strokeStyle = 'rgba(255,255,255,.04)';
-    ctx2.lineWidth = 1 / Z;
-    ctx2.beginPath(); ctx2.arc(0, 0, rIn + (rOut - rIn) * cf, 0, 7); ctx2.stroke();
-  }
-  lensLabels.push({ x: 0, y: -(rIn + (rOut - rIn) * 0.02) + 10, t: '' });
-  /* edges */
-  for (const ed of GEDGES) {
-    if (ed.a.d > T || ed.b.d > T || ed.a.d < S || ed.b.d < S) continue;
-    const pa2 = posOf(ed.a), pb2 = posOf(ed.b);
-    let alpha = 0.16;
-    if (hops) {
-      const fa = inFocus(ed.a.i), fb = inFocus(ed.b.i);
-      alpha = (fa >= 0 && fb >= 0) ? 0.6 : 0.03;
-    }
-    ctx2.strokeStyle = hex2rgba(G_FAM_HUE(ed.a.e), alpha);
-    ctx2.lineWidth = 1.1 / Z;
-    ctx2.beginPath();
-    ctx2.moveTo(pa2.x, pa2.y);
-    ctx2.quadraticCurveTo((pa2.x + pb2.x) / 2 * 0.55, (pa2.y + pb2.y) / 2 * 0.55, pb2.x, pb2.y);
-    ctx2.stroke();
-  }
-  /* nodes */
-  for (const n of GNODES) {
-    if (n.d > T || n.d < S || n.d > E) continue;
-    const p2 = posOf(n);
-    const hue2 = G_FAM_HUE(n.e);
-    const f2 = inFocus(n.i);
-    const isH = hover === n;
-    let alpha = 0.85;
-    if (f2 !== null) alpha = f2 === -1 ? 0.10 : f2 === 0 ? 1 : f2 === 1 ? 0.95 : 0.6;
-    const rr = (2.2 + Math.min(3, (n.t || 150) / 180)) * (isH || f2 === 0 ? 1.7 : 1);
-    ctx2.fillStyle = hex2rgba(hue2, alpha);
-    ctx2.beginPath(); ctx2.arc(p2.x, p2.y, rr, 0, 7); ctx2.fill();
-    if (f2 === 0) {
-      ctx2.strokeStyle = hex2rgba(hue2, 0.95);
-      ctx2.lineWidth = 1.5 / Z;
-      ctx2.beginPath(); ctx2.arc(p2.x, p2.y, rr + 5 / Z, 0, 7); ctx2.stroke();
-    }
-    if (isH) { ctx2.strokeStyle = hex2rgba(hue2, 0.9); ctx2.beginPath(); ctx2.arc(p2.x, p2.y, rr + 4 / Z, 0, 7); ctx2.stroke(); }
-    n._x = p2.x; n._y = p2.y; n._dr = rr; n._on = true;
-  }
-  lensLabels.push({ x: 0, y: g.R + 42, cap: true,
-                    t: 'data graph · 66 live facts · angle = source date · centre = higher confidence (decay-adjusted, rank-scaled ' + cMin.toFixed(2) + '–' + cMax.toFixed(2) + ') · edge = shared entity · click = 2-hop' });
-}
-
 /* ── alternative lenses: same disc, different substrate cut ── */
 function drawLensInFrame(ctx2, g, time) {
   for (const c of cells) { c._x = undefined; c._on = false; c._bx = undefined; }
-  if (lens === 'data') { drawDataLens(ctx2, g); return; }
   if (lens === 'receipts') { drawReceiptsLens(ctx2, g, time); return; }
   const groups = lens === 'memory'
     ? [['gate', '#2dd4bf'], ['decision', '#a78bfa'], ['memory', '#8b96f2'], ['handoff', '#f5a623'], ['incident', '#ef4444']]
@@ -1107,13 +988,8 @@ kick();
 /* ── controls ── */
 function setPlaying(v) {
   playing = v;
-  bPlay.textContent = v ? '⏸' : '▶';
+  bPlay.textContent = v ? 'pause' : 'play';
   bPlay.setAttribute('aria-pressed', String(v));
-  if (v && !showCompleted) setCompleted(true);     /* playback needs the add/remove story */
-}
-function setCompleted(v) {
-  showCompleted = v;
-  document.getElementById('b-done').setAttribute('aria-pressed', String(v));
 }
 bPlay.addEventListener('click', () => {
   if (!playing && T >= E - 0.01) T = S;            /* replay from window start */
@@ -1123,7 +999,6 @@ bSpin.addEventListener('click', () => {
   spinning = !spinning;
   bSpin.setAttribute('aria-pressed', String(spinning));
 });
-document.getElementById('b-done').addEventListener('click', () => setCompleted(!showCompleted));
 bClock.addEventListener('click', () => {
   resetTween = true;
   spinning = false;                                /* reset also stops the spin */
@@ -1156,8 +1031,6 @@ bLin.addEventListener('click', () => {
 });
 document.getElementById('s-kind').addEventListener('change', e => { fKind = e.target.value; });
 document.getElementById('s-agent').addEventListener('change', e => { fAgent = e.target.value; });
-const dStart = document.getElementById('d-start');
-const dEnd = document.getElementById('d-end');
 function syncWindow() {
   const s = Math.min(rStart.value / 1000, rEnd.value / 1000 - 0.03);
   const e = Math.max(rEnd.value / 1000, rStart.value / 1000 + 0.03);
@@ -1166,23 +1039,9 @@ function syncWindow() {
   T = Math.max(S, Math.min(E, T));
   rTime.value = Math.round((T - S) / Math.max(0.5, E - S) * 1000);
   cDate.textContent = dayDate(T);
-  dStart.value = dayDate(S);
-  dEnd.value = dayDate(E);
 }
 rStart.addEventListener('input', syncWindow);
 rEnd.addEventListener('input', syncWindow);
-/* date pickers drive the same window */
-function dateToDay(v) { return Date.parse(v + 'T00:00:00Z') / 86400000 - 20580; }
-dStart.addEventListener('change', () => {
-  const d = Math.max(11, Math.min(NOW - 1, dateToDay(dStart.value)));
-  rStart.value = Math.round((d - 11) / (NOW - 11) * 1000);
-  syncWindow();
-});
-dEnd.addEventListener('change', () => {
-  const d = Math.max(12, Math.min(NOW, dateToDay(dEnd.value)));
-  rEnd.value = Math.round((d - 11) / (NOW - 11) * 1000);
-  syncWindow();
-});
 rTime.addEventListener('input', () => {
   T = S + (rTime.value / 1000) * (E - S);
   setPlaying(false);
@@ -1225,17 +1084,7 @@ cv.addEventListener('pointermove', e => {
     return;
   }
   hover = hitTest(e);
-  hoverSec = hover && hover.p ? hover.p : sectorAt(e);
-  if (hover && lens === 'data') {
-    const n = hover;
-    showTip(mxAbs, myAbs,
-      '<b>' + n.k + '</b><br>' +
-      '<span class="k">entity</span> ' + (n.e.length > 40 ? n.e.slice(0, 39) + '…' : n.e) + '<br>' +
-      '<span class="k">source</span> ' + dayDate(n.d) + (n.a ? ' <span class="k">by</span> ' + n.a : '') + '<br>' +
-      '<span class="k">confidence</span> ' + gEffConf(n).toFixed(2) + ' <span class="k">(' + (n.h || 'none') + ')</span>' +
-      ' · <span class="k">links</span> ' + ((GADJ[n.i] || []).length));
-    return;
-  }
+  hoverSec = hover ? hover.p : sectorAt(e);
   if (hover) {
     const c = hover;
     showTip(mxAbs, myAbs, c.real
@@ -1286,16 +1135,6 @@ function hitTest(e) {
   const p = toDisc(g, e.clientX - r.left, e.clientY - r.top);
   const pr = Math.hypot(p.x, p.y);
   const pa = Math.atan2(p.y, p.x);
-  /* data lens: graph nodes */
-  if (lens === 'data') {
-    let best2 = null, bd2 = 9 / Z;
-    for (const n of GNODES) {
-      if (!n._on || n._x === undefined) continue;
-      const d2 = Math.hypot(n._x - p.x, n._y - p.y);
-      if (d2 < bd2 + n._dr) { bd2 = d2; best2 = n; }
-    }
-    return best2;
-  }
   /* solo: event-ledger vertical bars take priority */
   if (solo) {
     for (const c of solo.cells) {
@@ -1319,12 +1158,7 @@ function hitTest(e) {
   return best;
 }
 function handleClick(e) {
-  if (lens === 'data') {                           /* graph: toggle 2-hop neighbourhood */
-    const hit = hitTest(e);
-    gSel = (hit && hit.i !== undefined) ? (gSel === hit.i ? null : hit.i) : null;
-    return;
-  }
-  if (lens !== 'work') return;                     /* other lens views: hover only in this mock */
+  if (lens !== 'work') return;                     /* lens views: hover only in this mock */
   const r = cv.getBoundingClientRect();
   const cxp = e.clientX - r.left, cyp = e.clientY - r.top;
   /* 1 — ledger rows: filter the ring to that plan */
@@ -1447,12 +1281,7 @@ document.querySelectorAll('#tiles .tile').forEach(t2 => {
   t2.addEventListener('click', () => {
     lens = t2.dataset.lens;
     document.querySelectorAll('#tiles .tile').forEach(x => x.setAttribute('aria-pressed', String(x === t2)));
-    setSel(null); solo = null; hover = null; hoverSec = null; gSel = null; hideTip();
-    if (lens === 'data') {
-      /* auto-fit the window to the data extent so source dates spread the clock */
-      const minD = Math.min(...GNODES.map(n => n.d)) - 0.5;
-      if (S < minD - 1) { rStart.value = Math.round((minD - 11) / (NOW - 11) * 1000); syncWindow(); }
-    }
+    setSel(null); solo = null; hover = null; hoverSec = null; hideTip();
   });
 });
 
