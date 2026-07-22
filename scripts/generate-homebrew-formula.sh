@@ -41,7 +41,8 @@ sha_for() {
       --certificate-oidc-issuer "${OIDC_ISSUER}" \
       "${WORK}/${manifest}" >/dev/null
   fi
-  # RELEASE-MANIFEST paths are ./-prefixed (sha256sum run in the package dir).
+  # Current manifests use public flat basenames. Keep the ./ match for releases
+  # produced before the basename collision hardening.
   awk -v f="$2" '$2 == f || $2 == "*"f || $2 == "./"f {print $1; found=1} END {exit !found}' \
     "${WORK}/${manifest}" \
     || { echo "ERROR: $2 not in ${manifest}" >&2; exit 1; }
