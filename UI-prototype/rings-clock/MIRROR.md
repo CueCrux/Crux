@@ -137,3 +137,26 @@ docker run --rm --network=host -e CRUX_TOKEN="$CRUX_AGENT_TOKEN" -v "$PWD:/work"
 - Prod is **read-only**: only `ssh root@crux` read commands + `:ro` throwaway containers.
 - Secrets live ONLY in `/home/myles/crux-prod-mirror/*.env` (staging). Never commit them; never `cat` them into a repo file.
 - The mirror does not submit usage receipts, run update checks, or reach the external engine.
+
+## Updating the Rings console page after editing the mock
+
+The console serves the mock from `RINGS_HTML_B64` inside
+`crates/corecruxd/console/v2/pages.js` (base64 `data:` URL in an iframe —
+escaping-proof against the mock's inline `</script>`). After editing
+`UI-prototype/rings-clock/console-mock.html`, regenerate and splice:
+
+```bash
+B64=$(printf '<!doctype html>\n<meta charset="utf-8">\n' \
+  | cat - UI-prototype/rings-clock/console-mock.html | base64 -w0)
+# replace the value of RINGS_HTML_B64 in crates/corecruxd/console/v2/pages.js
+node -e '
+const fs = require("fs");
+const f = "crates/corecruxd/console/v2/pages.js";
+const src = fs.readFileSync(f, "utf8");
+fs.writeFileSync(f, src.replace(/var RINGS_HTML_B64 = '\''[^'\'']*'\''/,
+  "var RINGS_HTML_B64 = '\''" + process.env.B64 + "'\''"));
+' 
+```
+
+The mirror mounts the console dir (`CORECRUXD_CONSOLE_DEV_PATH=/console-dev`),
+so a browser refresh picks the change up — no container restart needed.
