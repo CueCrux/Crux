@@ -68,3 +68,9 @@ Related: `UI-prototype/console-3d/` (clay-substrate concept, 2026-06-11).
 - `versions/v4.9-sessions-overlay.html` — sessions-overlay experiment
   (episode stitches; retired as unclear).
 - v4.10 (current `index.html`) — sessions overlay removed.
+- `versions/v4.10-pre-lineage.html` — the return point before lineage/OD.
+- v4.11 (current `index.html`) — lineage chords (real depends_on edges, 27
+  resolvable in the embedded set; 'lineage' toggle shows all faintly, hover
+  always lights a sector's own; dot = the plan being stood on) and amber
+  open-decision ticks on sector rims; tooltips and pane list ODs, depends-on
+  and extended-by.
