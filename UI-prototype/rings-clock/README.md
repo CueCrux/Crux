@@ -103,3 +103,6 @@ in this mock; the ExecPlans lens keeps full interactivity.
   estimated savings from fact recalls (12-token recall vs ~3k replay, the
   daemon's own pattern math). ▥ toggles cumulative/daily; per-day hover
   tooltips. Prior: versions/console-mock-v3.html.
+- console-mock v5 — Tokens lens gains explicit sub-view buttons
+  (cumulative | per day) shown only while the lens is active; per-day
+  caption reports avg/peak spend and avg estimated savings.
