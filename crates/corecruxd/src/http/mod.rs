@@ -213,6 +213,10 @@ pub struct AppState {
     pub sync_mutual_auth: bool,
     /// Issuer Ed25519 public key used to validate peer capability tokens.
     pub sync_peer_trust_root: Option<Vec<u8>>,
+    /// Accept recipient-bound v1.1 delegation tokens at the sync boundary
+    /// (macaroon M3′). Default OFF (`CORECRUXD_SYNC_DELEGATION_ENFORCE=1`); OFF
+    /// rejects contextual tokens fail-closed. v1.0 tokens are unaffected.
+    pub sync_delegation_enforce: bool,
     /// Shared single-use challenge state across cloned Axum application state.
     pub sync_handshake_nonces: Arc<std::sync::Mutex<crux_sync::peer_handshake::NonceCache>>,
     pub witness: crate::witness::WitnessRuntimeConfigV1,

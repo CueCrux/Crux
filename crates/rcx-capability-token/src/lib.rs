@@ -22,6 +22,18 @@ pub const RCX_CT_HASH_LEN: usize = 32;
 pub const RCX_CT_PUBLIC_KEY_LEN: usize = 32;
 pub const RCX_DELEGATION_ENVELOPE_VERSION: u8 = 1;
 pub const RCX_SYNC_DELEGATION_AUDIENCE: &str = "crux-sync";
+/// Backend id a CruxEngine-issued sync-delegation token carries, and the
+/// `AttenuationContext.backend_id` the sync boundary presents (macaroon M3′).
+/// Distinct from `"local"` (the router's signature short-circuit) and from the
+/// legacy hosted backend id.
+pub const RCX_SYNC_BACKEND_ID: &str = "crux-sync";
+/// Capability for a delegated sync **read** (tenant manifest/collection pull).
+pub const RCX_SYNC_PULL_CAPABILITY: &str = "corecrux.sync.pull";
+/// Capability for a delegated sync **write** (tenant promote/offboard push).
+pub const RCX_SYNC_PUSH_CAPABILITY: &str = "corecrux.sync.push";
+/// Attestation the sync boundary presents once the peer handshake has proven
+/// possession of the delegate key; sync-delegation capabilities require it.
+pub const RCX_SYNC_PASSPORT_ATTESTATION: &str = "passport_bound";
 pub const RCX_MAX_DELEGATION_CAVEATS: usize = 16;
 pub const RCX_MAX_DELEGATION_SCOPES: usize = 64;
 pub const RCX_MAX_DELEGATION_PRINCIPALS: usize = 64;
