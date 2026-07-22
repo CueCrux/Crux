@@ -82,6 +82,29 @@ impl NonceCache {
     pub fn sweep_expired(&mut self, now_unix_seconds: u64) {
         self.entries.retain(|_, entry| now_unix_seconds <= entry.expires_at);
     }
+
+    /// Whether `nonce` is a currently-issued challenge that is unconsumed and
+    /// unexpired. Used by the v1.1 delegation path, which verifies the
+    /// presentation proof before [`Self::consume`]-ing the nonce; the caller
+    /// holds the cache lock across both so the check-then-consume is atomic.
+    pub fn is_fresh(&self, nonce: &[u8], now_unix_seconds: u64) -> bool {
+        self.entries
+            .get(nonce)
+            .is_some_and(|entry| !entry.consumed && now_unix_seconds <= entry.expires_at)
+    }
+
+    /// Mark `nonce` consumed (single-use). Returns `false` if the nonce is
+    /// unknown or was already consumed — a second presentation of the same
+    /// nonce therefore fails closed.
+    pub fn consume(&mut self, nonce: &[u8]) -> bool {
+        match self.entries.get_mut(nonce) {
+            Some(entry) if !entry.consumed => {
+                entry.consumed = true;
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 fn passport_fpr_from_public_key(public_key: &[u8; 32]) -> String {
