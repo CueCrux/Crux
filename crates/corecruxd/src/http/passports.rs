@@ -173,10 +173,10 @@ fn mint_request_approver(
             "automation credentials cannot satisfy a human passport-mint decision",
         ));
     }
-    if !context.passport_identity_verified() {
+    if !context.canonical_passport_claim_verified() {
         return Err(problem_response(
             StatusCode::FORBIDDEN,
-            "a cryptographically verified human passport is required for passport-mint decisions",
+            "a cryptographically verified canonical passport_id claim is required for passport-mint decisions",
         ));
     }
     let Some(asserted) = context.passport_id.as_deref() else {

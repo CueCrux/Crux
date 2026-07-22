@@ -211,7 +211,7 @@ impl AgentTokenHttpConfig {
             passport_id: Some(format!("agent:{}", agent.name)),
             scopes: self.scopes.clone(),
             tenants: self.tenants.clone(),
-            passport_identity_verified: false,
+            canonical_passport_claim_verified: false,
             credential_is_agent_token: true,
         })
     }
@@ -402,10 +402,11 @@ struct AuthContext {
     passport_id: Option<String>,
     scopes: BTreeSet<String>,
     tenants: TenantAllow,
-    /// True only when the passport id came from a cryptographically verified
-    /// JWT claim. Dev-scope headers and MCP agent-token aliases are not human
-    /// approval identities.
-    passport_identity_verified: bool,
+    /// True only when a cryptographically verified JWT carried a canonical,
+    /// non-empty `passport_id` claim. Legacy aliases and `sub` remain valid
+    /// identity fallbacks for ordinary routes, but cannot authorize sensitive
+    /// human-approval boundaries.
+    canonical_passport_claim_verified: bool,
     /// MCP agent tokens authenticate automation, not a human reviewer. High-
     /// risk four-eyes boundaries use this provenance to deny machine approval.
     credential_is_agent_token: bool,
@@ -486,15 +487,20 @@ fn subject_from_claims(claims: &serde_json::Value) -> Option<String> {
     None
 }
 
+fn canonical_passport_from_claims(claims: &serde_json::Value) -> Option<String> {
+    claims
+        .get("passport_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|passport| !passport.is_empty())
+        .map(str::to_string)
+}
+
 fn passport_from_claims(claims: &serde_json::Value) -> Option<String> {
-    for key in [
-        "passport_id",
-        "passportId",
-        "passport",
-        "passport_fpr",
-        "passportFpr",
-        "pid",
-    ] {
+    if let Some(passport) = canonical_passport_from_claims(claims) {
+        return Some(passport);
+    }
+    for key in ["passportId", "passport", "passport_fpr", "passportFpr", "pid"] {
         if let Some(passport) = claims.get(key).and_then(|v| v.as_str()) {
             let trimmed = passport.trim();
             if !trimmed.is_empty() {
@@ -525,13 +531,14 @@ fn verify_jwt_hs256(cfg: &JwtHs256Config, token: &str) -> Result<AuthContext, St
     let scopes = scopes_from_claims(&data.claims);
     let tenants = tenants_from_claims(&data.claims);
     let subject = subject_from_claims(&data.claims);
+    let canonical_passport_claim_verified = canonical_passport_from_claims(&data.claims).is_some();
     let passport_id = passport_from_claims(&data.claims);
     Ok(AuthContext {
         subject,
         passport_id,
         scopes,
         tenants,
-        passport_identity_verified: true,
+        canonical_passport_claim_verified,
         credential_is_agent_token: false,
     })
 }
@@ -715,13 +722,14 @@ fn verify_jwt_jwks(cfg: &JwtJwksConfig, token: &str) -> Result<AuthContext, Stri
     let scopes = scopes_from_claims(&data.claims);
     let tenants = tenants_from_claims(&data.claims);
     let subject = subject_from_claims(&data.claims);
+    let canonical_passport_claim_verified = canonical_passport_from_claims(&data.claims).is_some();
     let passport_id = passport_from_claims(&data.claims);
     Ok(AuthContext {
         subject,
         passport_id,
         scopes,
         tenants,
-        passport_identity_verified: true,
+        canonical_passport_claim_verified,
         credential_is_agent_token: false,
     })
 }
@@ -843,7 +851,7 @@ fn http_ctx(auth: &Authz, headers: &HeaderMap) -> Result<AuthContext, ProblemRes
             passport_id: None,
             scopes: BTreeSet::new(),
             tenants: TenantAllow::Any,
-            passport_identity_verified: false,
+            canonical_passport_claim_verified: false,
             credential_is_agent_token: false,
         }),
         AuthMode::DevScopes => {
@@ -860,7 +868,7 @@ fn http_ctx(auth: &Authz, headers: &HeaderMap) -> Result<AuthContext, ProblemRes
                 passport_id: None,
                 scopes,
                 tenants: TenantAllow::Any,
-                passport_identity_verified: false,
+                canonical_passport_claim_verified: false,
                 credential_is_agent_token: false,
             })
         }
@@ -935,7 +943,7 @@ pub struct HttpScopeContext {
     pub passport_id: Option<String>,
     auth_enforced: bool,
     passport_override_used: bool,
-    passport_identity_verified: bool,
+    canonical_passport_claim_verified: bool,
     credential_is_agent_token: bool,
     scope_bypass: bool,
     /// Tenant authority derived from the bearer token's `tenant_id`/`tenants`
@@ -1101,10 +1109,10 @@ impl HttpScopeContext {
         self.auth_enforced
     }
 
-    /// Whether the passport identity is backed by a verified JWT claim rather
-    /// than a development header or an automation token alias.
-    pub(crate) fn passport_identity_verified(&self) -> bool {
-        self.passport_identity_verified
+    /// Whether the verified JWT carried a canonical, non-empty `passport_id`
+    /// claim. This is stricter than the ordinary identity fallback to `sub`.
+    pub(crate) fn canonical_passport_claim_verified(&self) -> bool {
+        self.canonical_passport_claim_verified
     }
 
     /// Whether HTTP authentication fell back to a registered MCP agent token.
@@ -1161,7 +1169,7 @@ pub fn passport_bound_context(auth: &Authz, headers: &HeaderMap) -> Result<HttpS
         passport_id,
         auth_enforced: auth.mode != AuthMode::Off,
         passport_override_used,
-        passport_identity_verified: ctx.passport_identity_verified,
+        canonical_passport_claim_verified: ctx.canonical_passport_claim_verified,
         credential_is_agent_token: ctx.credential_is_agent_token,
         scope_bypass: auth.mode == AuthMode::Off,
         tenants,
@@ -1217,7 +1225,7 @@ fn grpc_ctx(auth: &Authz, meta: &MetadataMap) -> Result<AuthContext, Status> {
             passport_id: None,
             scopes: BTreeSet::new(),
             tenants: TenantAllow::Any,
-            passport_identity_verified: false,
+            canonical_passport_claim_verified: false,
             credential_is_agent_token: false,
         }),
         AuthMode::DevScopes => {
@@ -1236,7 +1244,7 @@ fn grpc_ctx(auth: &Authz, meta: &MetadataMap) -> Result<AuthContext, Status> {
                 passport_id: None,
                 scopes,
                 tenants: TenantAllow::Any,
-                passport_identity_verified: false,
+                canonical_passport_claim_verified: false,
                 credential_is_agent_token: false,
             })
         }
@@ -1754,6 +1762,60 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
 
         let err = require_http_scopes_for_tenant(&auth, &headers, &["admin:read"], "t1").unwrap_err();
         assert_eq!(err.0.status, 403);
+
+        let exp = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600) as usize;
+        let signed_context = |claims: serde_json::Value| {
+            let token = encode(
+                &header,
+                &claims,
+                &EncodingKey::from_rsa_pem(PRIVATE_KEY_PEM.as_bytes()).expect("rsa key"),
+            )
+            .expect("jwt");
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {token}").parse().unwrap(),
+            );
+            passport_bound_context(&auth, &headers).expect("passport context")
+        };
+
+        let canonical = signed_context(serde_json::json!({
+            "exp": exp,
+            "iss": "corecrux-test",
+            "aud": "corecrux",
+            "scope": "admin:write",
+            "tenant_id": "default",
+            "sub": "automation-subject",
+            "passport_id": "operator-passport",
+        }));
+        assert_eq!(canonical.passport_id.as_deref(), Some("operator-passport"));
+        assert!(canonical.canonical_passport_claim_verified());
+
+        let sub_only = signed_context(serde_json::json!({
+            "exp": exp,
+            "iss": "corecrux-test",
+            "aud": "corecrux",
+            "scope": "admin:write",
+            "tenant_id": "default",
+            "sub": "automation-subject",
+        }));
+        assert_eq!(sub_only.passport_id.as_deref(), Some("automation-subject"));
+        assert!(!sub_only.canonical_passport_claim_verified());
+
+        let legacy_alias = signed_context(serde_json::json!({
+            "exp": exp,
+            "iss": "corecrux-test",
+            "aud": "corecrux",
+            "scope": "admin:write",
+            "tenant_id": "default",
+            "passportId": "legacy-passport",
+        }));
+        assert_eq!(legacy_alias.passport_id.as_deref(), Some("legacy-passport"));
+        assert!(!legacy_alias.canonical_passport_claim_verified());
     }
 
     fn env_lock() -> &'static std::sync::Mutex<()> {
@@ -2159,6 +2221,25 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
     fn passport_from_claims_falls_back_to_subject() {
         let claims = serde_json::json!({ "sub": "subject-id" });
         assert_eq!(passport_from_claims(&claims), Some("subject-id".to_string()));
+    }
+
+    #[test]
+    fn canonical_passport_from_claims_requires_exact_non_empty_claim() {
+        assert_eq!(
+            canonical_passport_from_claims(&serde_json::json!({ "passport_id": " passport-id " })),
+            Some("passport-id".to_string())
+        );
+        assert_eq!(
+            canonical_passport_from_claims(&serde_json::json!({
+                "sub": "subject-id",
+                "passportId": "legacy-alias",
+            })),
+            None
+        );
+        assert_eq!(
+            canonical_passport_from_claims(&serde_json::json!({ "passport_id": "   " })),
+            None
+        );
     }
 
     // ── missing_scopes ────────────────────────────────────────────────────

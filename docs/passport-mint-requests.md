@@ -2,8 +2,9 @@
 
 Agent-requested, operator-approved passport minting. When an agent hits a category-enforcement 403
 ("passport '…' pre-dates the category field, or is unknown"), it can **request** a passport mint; an operator
-**approves it in the console** with a category (defaults pre-filled), and the daemon mints a category-scoped
-passport for that agent — attributed to the approving operator's passport.
+**approves it through the authenticated HTTP surface** with a category, and the daemon mints a category-scoped
+passport for that agent — attributed to the approving operator's passport. The console panel can drive that
+surface only when a same-origin BFF or proxy supplies the operator bearer JWT.
 
 Feature: `CORECRUXD_FEATURE_PASSPORT_MINT_REQUESTS` (default **OFF**). ExecPlan
 `crux-passport-mint-request-gate-2026-07-17`. Landed M1–M3 (PRs #467/#470/#471), with the
@@ -14,13 +15,13 @@ production approval boundary hardened in PR #497.
 ```
 agent (category-403) ──request_passport_mint──▶ pending record (__mint_request__::<id>, born-private)
                                                         │
-                                          console "Pending mints" panel (#/, cx-mints)
+                              operator review client / BFF-backed console panel
                                                         │  operator: pick category + name, Accept
 POST /v1/passport/mint-requests/<id>/approve ◀──────────┘
    → mints for the REQUESTER with EXACTLY the approved category
      (create_passport if no daemon record, else update_passport(category))
    → records resolved_by_passport = verified operator; request → approved
-   → returns a signed approval receipt that binds the exact passport mutation
+   → persists a signed approval receipt and returns its identifiers
                                                         │
 requester's next write in that category ──────────────▶ 200 (was 403)
 ```
@@ -33,7 +34,7 @@ requester's next write in that category ─────────────�
 | `GET /v1/passport/mint-requests/pending` | `corecruxd` HTTP, scope `admin:read` |
 | `POST /v1/passport/mint-requests/{id}/approve` | verified human JWT, `admin:write`, tenant `default`; body `{category, name?, approver_passport?}`. `category` is mandatory; an approver hint, if supplied, must equal the JWT `passport_id` |
 | `POST /v1/passport/mint-requests/{id}/reject` | verified human JWT, `admin:write`, tenant `default`; body `{approver_passport?}` with the same exact-match rule |
-| Console "Pending mints" panel | `console/v2` `cx-mints` (operator-only) |
+| Console "Pending mints" panel | `console/v2` `cx-mints`; requires an auth-injecting same-origin BFF/proxy in JWT modes |
 
 ## Security invariants (do not weaken)
 
@@ -42,6 +43,10 @@ requester's next write in that category ─────────────�
   cryptographically verified JWT carrying `passport_id` and `admin:write`. Auth-off, `dev_scopes`, agent tokens,
   passport overrides, and body-only approver claims cannot decide a mint. There is no auto-mint or timeout
   auto-approve (eu-ai-act Art.14).
+- **Issuer trust contract**: `passport_id` proves signed passport attribution, not humanity by itself. The configured
+  issuer must reserve `admin:write` plus canonical `passport_id` for interactively authenticated human operators;
+  service, device, loopback, and agent tokens must remain sub-only. Pin both `CORECRUXD_JWT_ISS` and
+  `CORECRUXD_JWT_AUD`; if that issuer policy is not evidenced, keep the production feature flag off.
 - **No self-review**: the authenticated operator passport must differ from both `requester_id` and
   `requested_by_passport`.
 - **Least privilege**: the minted passport's category equals **exactly** the operator-approved category —
@@ -54,7 +59,7 @@ requester's next write in that category ─────────────�
   verified operator. The receipt also binds the request, decision, category, operation, record hash, and mutation
   hash; receipt failure aborts the passport mutation.
 
-## M4 — canary end-to-end verification
+## M4 — backend/JWT canary verification
 
 Run against a **non-prod** daemon built from `main`, flag ON, isolated data dir + ports, and signed JWT auth.
 `off` and `dev_scopes` are deliberately invalid for mint decisions.
@@ -81,8 +86,8 @@ CRUX_AGENT_TOKENS="requester:$CANARY_AGENT_TOKEN" \
 curl -s -H "Authorization: Bearer $OPERATOR_JWT" \
   http://127.0.0.1:<ALT_HTTP>/v1/passport/mint-requests/pending | jq
 
-# 4. Operator approves — in the CONSOLE "Pending mints" panel (the human-in-the-loop step),
-#    or equivalently. The body hint is optional, but when present must equal the JWT passport_id.
+# 4. Operator approves through the HTTP API with a human operator JWT. The body hint is
+#    optional, but when present must equal the JWT passport_id.
 curl -s -X POST -H "Authorization: Bearer $OPERATOR_WRITE_JWT" -H 'content-type: application/json' \
   -d '{"approver_passport":"operator-canary","category":"work","name":"EthosClaw agent"}' \
   http://127.0.0.1:<ALT_HTTP>/v1/passport/mint-requests/<id>/approve | jq
@@ -92,9 +97,11 @@ curl -s -X POST -H "Authorization: Bearer $OPERATOR_WRITE_JWT" -H 'content-type:
 ```
 
 **Gate:** request → non-self verified-JWT approve with an explicit category → the requester's `work` write
-succeeds and a `personal` write 403s. The response's receipt verifies; `resolved_by_passport` is the JWT
+succeeds and a `personal` write 403s. Fetch the persisted signed receipt by the returned identifiers and verify
+its signature; `resolved_by_passport` is the JWT
 `passport_id`; body/JWT mismatch, self-review, agent-token approval, missing category, reject, and flag-off all
-mint nothing. (The backend path is covered by integration tests; this canary proves the live daemon + console.)
+mint nothing. This canary proves the live HTTP/MCP backend and JWT boundary only. Console acceptance is a
+separate gate and requires a cookie-to-bearer bridge in a BFF/proxy; raw console v2 sends cookie-only requests.
 
 ## EthosClaw ingest unblock (motivating case)
 
@@ -112,8 +119,8 @@ with category `work` (stamps the existing identity — keeps its `CRUX_AGENT_TOK
 2. Keep `CORECRUXD_FEATURE_PASSPORT_MINT_REQUESTS=0` for the image cutover and complete health/auth smoke first.
    Then change only that key in `/opt/crux/docker-compose.override.yml` **under a human gate** and force-recreate
    only the `crux` service. Retain an exact pre-change backup and never run `docker compose down -v`.
-3. Post-enable smoke: a filed request appears in the prod console "Pending mints"; approve works; the
-   passport write is receipted + verifiable.
+3. Post-enable smoke: a filed request appears through the authenticated operator API; approve works; the
+   passport write is receipted + verifiable. Claim console acceptance only after its BFF/proxy JWT bridge is live.
 
 **Rollback:** disable the flag (the MCP tool disappears, the approve path is inert). Already-minted passports
 are unaffected and revocable via existing passport-revocation tooling. No schema-destructive change.
