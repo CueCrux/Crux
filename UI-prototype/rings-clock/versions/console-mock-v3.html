@@ -190,9 +190,6 @@ footer { max-width: 1100px; margin: 48px auto 0; padding: 20px clamp(16px, 4vw, 
       <button class="tile" data-lens="receipts" aria-pressed="false">
         <span class="t"><i style="background:#34d399"></i>Receipts</span><span class="n">seq</span>
       </button>
-      <button class="tile" data-lens="tokens" aria-pressed="false">
-        <span class="t"><i style="background:#f5a623"></i>Tokens</span><span class="n" id="tile-tok">—</span>
-      </button>
     </div>
     <div class="stagebar">
       <span class="grp">
@@ -1036,82 +1033,10 @@ function drawDataLens(ctx2, g) {
                     t: 'data graph · 66 live facts · angle = source date · centre = higher confidence (decay-adjusted, rank-scaled ' + cMin.toFixed(2) + '–' + cMax.toFixed(2) + ') · edge = shared entity · click = 2-hop' });
 }
 
-/* ── tokens lens: workspace-total spend + estimated savings over time.
-   Spend: each plan's real output-token total distributed across its own
-   event days. Savings: the daemon's published pattern math — a recalled
-   fact ≈ 12 tokens vs ~3k replaying the conversation it came from — applied
-   to the facts written each day. Bars: spent grows OUTWARD (purple), saved
-   grows INWARD toward the heartwood (green). ▥ toggles cumulative/daily. ── */
-const TOK = (function buildTok() {
-  const spent = {}, saved = {};
-  for (const p of PLANS) {
-    if (!p.cells.length || !p.o) continue;
-    const per = (p.o / 10) / p.cells.length;       /* M tokens per event */
-    for (const c of p.cells) {
-      const d2 = Math.floor(c.day);
-      spent[d2] = (spent[d2] || 0) + per;
-    }
-  }
-  for (const c of cells) {
-    const d2 = Math.floor(c.day);
-    saved[d2] = (saved[d2] || 0) + 0.003;          /* ≈3k tokens replay avoided per fact */
-  }
-  let totS = 0, totV = 0;
-  for (const d2 in spent) totS += spent[d2];
-  for (const d2 in saved) totV += saved[d2];
-  return { spent, saved, totS, totV };
-})();
-document.getElementById('tile-tok').textContent = Math.round(TOK.totS) + 'M';
-let tokBins = [];                                  /* per-frame bin geometry for hover */
-function drawTokensLens(ctx2, g) {
-  tokBins = [];
-  const cum = mode === 'bars';                     /* ▥ = cumulative (default) */
-  const rB = g.r0 * 1.7;
-  const spanOut = g.R * 0.94 - rB, spanIn = rB - g.r0 * 0.8;
-  const d0 = Math.ceil(S), d1 = Math.floor(Math.min(T, E));
-  /* series + normalisation */
-  let cs = 0, cv = 0, maxS = 0.001, maxV = 0.001;
-  const rows = [];
-  for (let d2 = d0; d2 <= d1; d2++) {
-    const sp = TOK.spent[d2] || 0, sv = TOK.saved[d2] || 0;
-    cs += sp; cv += sv;
-    rows.push({ d: d2, sp, sv, cs, cv });
-  }
-  for (const r2 of rows) { maxS = Math.max(maxS, cum ? r2.cs : r2.sp); maxV = Math.max(maxV, cum ? r2.cv : r2.sv); }
-  const wA = (TAU - SEAM) / Math.max(1, (Math.floor(E) - Math.ceil(S) + 1));
-  ctx2.strokeStyle = 'rgba(255,255,255,.12)';
-  ctx2.lineWidth = 1 / Z;
-  ctx2.beginPath(); ctx2.arc(0, 0, rB, BASE, BASE + TAU - SEAM); ctx2.stroke();
-  for (const r2 of rows) {
-    const a = BASE + (TAU - SEAM) * ((r2.d + 0.5 - S) / Math.max(0.5, E - S));
-    const hS = ((cum ? r2.cs : r2.sp) / maxS) * spanOut;
-    const hV = ((cum ? r2.cv : r2.sv) / maxV) * spanIn;
-    const wBar = Math.max(1.5, wA * rB * 0.55) / Math.max(1, Math.sqrt(Z));
-    ctx2.lineWidth = wBar;
-    ctx2.strokeStyle = hex2rgba('#a78bfa', 0.55);  /* spent → outward */
-    ctx2.beginPath();
-    ctx2.moveTo(Math.cos(a) * rB, Math.sin(a) * rB);
-    ctx2.lineTo(Math.cos(a) * (rB + hS), Math.sin(a) * (rB + hS));
-    ctx2.stroke();
-    ctx2.strokeStyle = hex2rgba('#34d399', 0.6);   /* saved → inward */
-    ctx2.beginPath();
-    ctx2.moveTo(Math.cos(a) * rB, Math.sin(a) * rB);
-    ctx2.lineTo(Math.cos(a) * (rB - hV), Math.sin(a) * (rB - hV));
-    ctx2.stroke();
-    tokBins.push({ ...r2, a, rTip: rB + hS });
-  }
-  ctx2.lineWidth = 1 / Z;
-  const pct = TOK.totS > 0 ? Math.round(100 * TOK.totV / TOK.totS) : 0;
-  lensLabels.push({ x: 0, y: g.R + 42, cap: true,
-    t: 'tokens · ' + (cum ? 'cumulative' : 'daily') + ' (▥ toggles) · outward = spent ' + Math.round(TOK.totS) +
-       'M · inward = est. saved ' + TOK.totV.toFixed(1) + 'M (~' + pct + '%, from 12-token fact recalls vs ~3k replays)' });
-}
-
 /* ── alternative lenses: same disc, different substrate cut ── */
 function drawLensInFrame(ctx2, g, time) {
   for (const c of cells) { c._x = undefined; c._on = false; c._bx = undefined; }
   if (lens === 'data') { drawDataLens(ctx2, g); return; }
-  if (lens === 'tokens') { drawTokensLens(ctx2, g); return; }
   if (lens === 'receipts') { drawReceiptsLens(ctx2, g, time); return; }
   const groups = lens === 'memory'
     ? [['gate', '#2dd4bf'], ['decision', '#a78bfa'], ['memory', '#8b96f2'], ['handoff', '#f5a623'], ['incident', '#ef4444']]
@@ -1315,27 +1240,6 @@ cv.addEventListener('pointermove', e => {
     dragMoved += Math.abs(dx) + Math.abs(dy);
     if (dragMoved > 5) { panX += dx; panY += dy; }
     lastPX = e.clientX; lastPY = e.clientY;
-    return;
-  }
-  if (lens === 'tokens') {
-    const g2 = geom();
-    const pd = toDisc(g2, e.clientX - cv.getBoundingClientRect().left, e.clientY - cv.getBoundingClientRect().top);
-    const pr2 = Math.hypot(pd.x, pd.y);
-    let pa2 = Math.atan2(pd.y, pd.x);
-    while (pa2 < BASE) pa2 += TAU;
-    let bin = null, bd2 = 0.05;
-    for (const b2 of tokBins) {
-      let ba = b2.a; while (ba < BASE) ba += TAU;
-      const da2 = Math.abs(pa2 - ba);
-      if (da2 < bd2 && pr2 > g2.r0 * 0.7 && pr2 < g2.R) { bd2 = da2; bin = b2; }
-    }
-    if (bin) {
-      showTip(e.clientX, e.clientY,
-        '<b>' + dayDate(bin.d) + '</b><br>' +
-        '<span class="k">spent</span> ' + bin.sp.toFixed(1) + 'M <span class="k">day</span> · ' + bin.cs.toFixed(1) + 'M <span class="k">cum</span><br>' +
-        '<span class="k">saved</span> ' + bin.sv.toFixed(2) + 'M <span class="k">day</span> · ' + bin.cv.toFixed(2) + 'M <span class="k">cum (est.)</span>');
-    } else hideTip();
-    hover = null; hoverSec = null;
     return;
   }
   hover = hitTest(e);

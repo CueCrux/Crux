@@ -97,3 +97,9 @@ in this mock; the ExecPlans lens keeps full interactivity.
   shows "rings from <date>"), so years of history never crowd live work
   onto the outer rim. Census, solo, and non-work lenses keep the absolute
   window. Priors: versions/v4.11-lineage-od.html, versions/console-mock-v2.html.
+- console-mock v4 — Tokens lens: workspace-total spend over the window
+  (each plan's real output-token total distributed across its event days),
+  bars around the dial — outward purple = spent (255M), inward green =
+  estimated savings from fact recalls (12-token recall vs ~3k replay, the
+  daemon's own pattern math). ▥ toggles cumulative/daily; per-day hover
+  tooltips. Prior: versions/console-mock-v3.html.
