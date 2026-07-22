@@ -2,21 +2,24 @@ name: TypeScript SDK
 
 on:
   push:
-    tags: ['v*']
+    tags:
+      - 'v*'
+      - 'sdk-typescript-v*'
+  pull_request:
+    paths:
+      - 'sdks/typescript/**'
+      - '.github/workflows/sdk-typescript.yml'
   workflow_dispatch:
 
+# Build/test runs never receive registry-write OIDC permission. Only an
+# explicit sdk-typescript-vX.Y.Z tag can start the publish job below.
+permissions:
+  contents: read
+
 jobs:
-  build-and-publish:
-    name: Build & Publish
+  build:
+    name: Build package
     runs-on: [self-hosted, ci]
-    # npm Trusted Publishing (OIDC) — no NPM_TOKEN secret. Requires a
-    # (pending) trusted publisher on npmjs.org for the @cuecrux scope:
-    # owner CueCrux, repository Crux, workflow sdk-typescript.yml. Until that
-    # is registered the publish step fails closed — there is no token fallback.
-    # Mirrors sdk-python.yml's move to PyPI trusted publishing.
-    permissions:
-      contents: read
-      id-token: write # OIDC token for tokenless auth + provenance attestation
     defaults:
       run:
         working-directory: sdks/typescript
@@ -25,13 +28,52 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
-      # Trusted publishing (tokenless OIDC auth) needs npm >= 11.5.1; node 22
-      # ships npm 10. Upgrade before publishing so `npm publish` exchanges the
-      # OIDC token itself instead of looking for NODE_AUTH_TOKEN.
-      - run: npm install -g npm@latest
-      - run: npm install
+      - name: Require SDK tag to match package version
+        if: startsWith(github.ref, 'refs/tags/sdk-typescript-v')
+        run: |
+          set -euo pipefail
+          package_version="$(node -p 'require("./package.json").version')"
+          tag_version="${GITHUB_REF_NAME#sdk-typescript-v}"
+          if [[ "$tag_version" != "$package_version" ]]; then
+            echo "::error::SDK tag version $tag_version does not match package.json version $package_version"
+            exit 1
+          fi
+      - run: npm ci
       - run: npm run build
-      # --provenance attaches the signed SLSA provenance statement (uses the
-      # same id-token); trusted publishing supplies auth with no secret.
-      - run: npm publish --access public --provenance
+      - name: Pack exact publish artifact
+        run: |
+          rm -rf package
+          mkdir package
+          npm pack --pack-destination package
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: typescript-sdk-${{ github.sha }}
+          path: sdks/typescript/package/*.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish to npm
+    if: startsWith(github.ref, 'refs/tags/sdk-typescript-v')
+    needs: build
+    runs-on: [self-hosted, ci]
+    # npm Trusted Publishing (OIDC) — no NPM_TOKEN secret. The package version
+    # remains immutable: duplicate uploads fail closed.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Install OIDC-capable npm
+        run: npm install -g npm@11.6.2
+      - name: Download verified package
+        uses: actions/download-artifact@v8
+        with:
+          name: typescript-sdk-${{ github.sha }}
+          path: package
+      - name: Publish exact package with provenance
+        run: npm publish package/*.tgz --access public --provenance
