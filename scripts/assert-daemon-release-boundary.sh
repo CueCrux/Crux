@@ -15,6 +15,7 @@ required=(
   "content/MANIFEST.json"
   "content/README.md"
   "packaging/install.sh"
+  "scripts/assert-release-asset-basenames.sh"
   "scripts/package-daemon-release.sh"
 )
 
@@ -26,7 +27,18 @@ for path in "${required[@]}"; do
 done
 
 scan_output="$(mktemp)"
-trap 'rm -f "$scan_output"' EXIT
+basename_fixture=""
+dist=""
+cleanup() {
+  rm -f "$scan_output"
+  if [[ -n "$basename_fixture" ]]; then
+    rm -rf "$basename_fixture"
+  fi
+  if [[ -n "$dist" ]]; then
+    rm -rf "$dist"
+  fi
+}
+trap cleanup EXIT
 
 if command -v rg >/dev/null 2>&1; then
   scan_cmd=(rg -in '(cuda|cudart|nvcc|libcuda|corecrux-gpu)' "$root/Cargo.toml" "$root/crates" --glob 'Cargo.toml')
@@ -54,6 +66,7 @@ for needle in \
   "docs/release-packaging.md" \
   "content/MANIFEST.json" \
   "CONTENT-README.md" \
+  "assert-release-asset-basenames.sh" \
   'cp "$root/packaging/install.sh" "$dist/install.sh"' \
   "RELEASE-MANIFEST"; do
   if ! grep -Fq -- "$needle" "$package_script"; then
@@ -102,13 +115,24 @@ require_marker "packaging/tests/install-smoke.sh" \
 require_marker ".github/workflows/release.yml" \
   'package-daemon-release.sh has already staged install.sh before generating'
 require_marker ".github/workflows/release.yml" \
-  'Assert unique release asset basenames'
+  'bash scripts/assert-release-asset-basenames.sh dist'
+
+basename_fixture="$(mktemp -d)"
+mkdir -p "$basename_fixture/a" "$basename_fixture/b"
+touch "$basename_fixture/a/alpha" "$basename_fixture/b/bravo"
+bash "$root/scripts/assert-release-asset-basenames.sh" "$basename_fixture" >/dev/null
+touch "$basename_fixture/a/collision" "$basename_fixture/b/collision"
+if bash "$root/scripts/assert-release-asset-basenames.sh" "$basename_fixture" >/dev/null 2>&1; then
+  echo "release basename guard accepted a duplicate fixture" >&2
+  exit 1
+fi
+rm -rf "$basename_fixture"
+basename_fixture=""
 
 if [[ -x "$root/target/release/corecruxd" \
   && -x "$root/target/release/corecruxctl" \
   && -x "$root/target/release/crux-hook" ]]; then
   dist="$(mktemp -d)"
-  trap 'rm -f "$scan_output"; rm -rf "$dist"' EXIT
   # Use the linux-amd64 release suffix so the single-copy installer path is
   # exercised even when this structural smoke runs on another native runner.
   bash "$package_script" linux-amd64 "$dist" >/dev/null
@@ -132,7 +156,7 @@ if [[ -x "$root/target/release/corecruxd" \
       exit 1
     fi
   done
-  if ! grep -Eq '[[:space:]]+\./install\.sh$' \
+  if ! grep -Eq '[[:space:]]+install\.sh$' \
     "$dist/RELEASE-MANIFEST-linux-amd64.txt"; then
     echo "daemon release manifest does not cover install.sh" >&2
     exit 1
@@ -145,12 +169,7 @@ if [[ -x "$root/target/release/corecruxd" \
     echo "staged CONTENT-README.md does not match the content guide" >&2
     exit 1
   fi
-  duplicate_basenames="$(find "$dist" -type f -exec basename {} \; | sort | uniq -d)"
-  if [[ -n "$duplicate_basenames" ]]; then
-    echo "daemon release package contains duplicate asset basenames:" >&2
-    printf '%s\n' "$duplicate_basenames" >&2
-    exit 1
-  fi
+  bash "$root/scripts/assert-release-asset-basenames.sh" "$dist" >/dev/null
 fi
 
 echo "daemon release boundary OK"

@@ -64,6 +64,12 @@ cosign verify-blob \
 sha256sum --check --ignore-missing RELEASE-MANIFEST-linux-amd64.txt
 ```
 
+Manifest entries use the flat public release-asset filenames. Download the
+assets you want to verify into the same directory as the manifest; nested
+repository staging paths do not need to be recreated. The release workflow
+rejects duplicate basenames before publishing, so every checksum maps to one
+unambiguous public asset.
+
 The linux-amd64 manifest includes `install.sh`; the checksum command therefore
 provides a second, manifest-rooted check when both files are present.
 

@@ -18,11 +18,14 @@ Each target bundle includes:
   `content/LICENCE-CONTENT.md` (the content guide is renamed while staging so
   its basename remains distinct in GitHub's flat release-asset namespace; the
   content licence is shipped with the assets it governs).
-- `RELEASE-MANIFEST-<target>.txt` with SHA-256 checksums for staged files.
+- `RELEASE-MANIFEST-<target>.txt` with SHA-256 checksums keyed by the flat
+  public release-asset basenames. Packaging and release creation both fail if
+  two staged files would share a basename.
 
 `scripts/assert-daemon-release-boundary.sh` verifies the required files, CUDA/GPU
-exclusion boundary, package-script artifact markers, and a package smoke test
-whenever release binaries already exist under `target/release`.
+exclusion boundary, package-script artifact markers, positive and negative
+basename-guard fixtures, and a package smoke test whenever release binaries
+already exist under `target/release`.
 
 The boundary script proves only the local daemon distribution shape:
 

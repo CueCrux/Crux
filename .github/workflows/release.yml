@@ -253,6 +253,8 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
@@ -260,14 +262,7 @@ jobs:
           merge-multiple: true
 
       - name: Assert unique release asset basenames
-        run: |
-          set -euo pipefail
-          duplicates="$(find dist -type f -exec basename {} \; | sort | uniq -d)"
-          if [[ -n "$duplicates" ]]; then
-            echo "::error::Duplicate release asset basenames detected"
-            printf '%s\n' "$duplicates"
-            exit 1
-          fi
+        run: bash scripts/assert-release-asset-basenames.sh dist
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3

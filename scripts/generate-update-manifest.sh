@@ -46,8 +46,8 @@ for suffix in "${SUFFIXES[@]}"; do
   # clients would otherwise replace only the daemon and omit the newly bundled
   # hook/CLI; failing lookup forces the complete installer transition.
   name="standalone-${asset_name}"
-  # RELEASE-MANIFEST paths are ./-prefixed (sha256sum run in the package dir);
-  # v0.5.45's manifest job failed on the bare-name-only match.
+  # Current manifests use public flat basenames. Keep the ./ match for releases
+  # produced before the basename collision hardening.
   sha="$(awk -v f="$asset_name" '$2 == f || $2 == "*"f || $2 == "./"f {print $1}' "${WORK}/${manifest}")"
   [ -n "$sha" ] || { echo "ERROR: ${asset_name} not found in ${manifest}" >&2; exit 1; }
   artifacts="$(jq -c --arg n "$name" --arg a "$asset_name" --arg s "$sha" '. + [{name:$n, asset_name:$a, sha256:$s}]' <<<"$artifacts")"
