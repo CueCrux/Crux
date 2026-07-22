@@ -10588,7 +10588,8 @@ async fn passports_list_after_seed_returns_three_defaults() {
 
 #[tokio::test]
 async fn passport_mint_requests_pending_lists_filed_request_without_minting() {
-    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    state.passport_mint_requests_enabled = true;
     {
         let mut store = state.fact_store.write().await;
         let filed = crate::mint_requests::file_mint_request(
@@ -10624,6 +10625,37 @@ async fn passport_mint_requests_pending_lists_filed_request_without_minting() {
 
     let store = state.fact_store.read().await;
     assert!(!store.all_facts().any(|fact| fact.entity.starts_with("__passport__::")));
+}
+
+#[tokio::test]
+async fn passport_mint_request_flag_off_hides_pending_list() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        let filed = crate::mint_requests::file_mint_request(
+            &mut store,
+            "codex-work".to_string(),
+            "codex-work".to_string(),
+            Some("work".to_string()),
+            Some("operator review".to_string()),
+            1_726_000_000_000,
+        );
+        assert!(filed.is_ok(), "seed pending request: {filed:?}");
+    }
+
+    let resp = super::passports::get_pending_mint_requests(
+        State(state),
+        Query(super::passports::ListPendingMintRequestsQuery { by_passport: None }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = json_body(resp).await;
+    assert!(body["detail"]
+        .as_str()
+        .is_some_and(|detail| detail.contains("passport mint requests disabled")));
 }
 
 #[tokio::test]

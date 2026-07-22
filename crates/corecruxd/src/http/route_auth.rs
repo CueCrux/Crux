@@ -327,7 +327,11 @@ pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContra
     }
 
     if method == "GET" && path == "/v1/passport/mint-requests/pending" {
-        return Some(RouteAuthContract::new(RouteAuthClass::AdminRead, &["admin:read"]));
+        return Some(RouteAuthContract::gated(
+            RouteAuthClass::FeatureGated,
+            &["admin:read"],
+            "CORECRUXD_FEATURE_PASSPORT_MINT_REQUESTS",
+        ));
     }
 
     if method == "POST"
@@ -852,7 +856,7 @@ mod tests {
             (
                 "GET",
                 "/v1/passport/mint-requests/pending",
-                RouteAuthClass::AdminRead,
+                RouteAuthClass::FeatureGated,
                 &["admin:read"][..],
             ),
             (
@@ -901,14 +905,25 @@ mod tests {
     }
 
     #[test]
-    fn passport_mint_resolution_routes_record_the_feature_gate() {
-        for path in [
-            "/v1/passport/mint-requests/{request_id}/approve",
-            "/v1/passport/mint-requests/{request_id}/reject",
+    fn passport_mint_routes_record_the_feature_gate() {
+        for (method, path, scopes) in [
+            ("GET", "/v1/passport/mint-requests/pending", &["admin:read"][..]),
+            (
+                "POST",
+                "/v1/passport/mint-requests/{request_id}/approve",
+                &["admin:write"][..],
+            ),
+            (
+                "POST",
+                "/v1/passport/mint-requests/{request_id}/reject",
+                &["admin:write"][..],
+            ),
         ] {
-            let contract = classify_route("POST", path).expect("passport mint resolution route contract");
+            let Some(contract) = classify_route(method, path) else {
+                panic!("missing passport mint route contract for {method} {path}");
+            };
             assert_eq!(contract.class, RouteAuthClass::FeatureGated, "{path}");
-            assert_eq!(contract.scopes, &["admin:write"], "{path}");
+            assert_eq!(contract.scopes, scopes, "{path}");
             assert_eq!(
                 contract.feature_gate,
                 Some("CORECRUXD_FEATURE_PASSPORT_MINT_REQUESTS"),
