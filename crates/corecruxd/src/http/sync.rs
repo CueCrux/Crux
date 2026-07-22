@@ -13,6 +13,20 @@
 //! `x-crux-peer-pubkey` (32-byte hex), `x-crux-peer-nonce` (32-byte hex), and
 //! `x-crux-peer-sig` (64-byte hex). The authenticated token tenant must exactly
 //! equal the tenant path parameter.
+//!
+//! ## Caveat enforcement (`CORECRUXD_SYNC_CAVEAT_ENFORCE=1`, macaroon R3)
+//!
+//! A peer token may carry holder-appended narrowing caveats (see the
+//! `rcx_capability_token` crate). With enforcement **ON**, after the handshake
+//! authenticates the base grant and key possession, `require_sync_peer` verifies
+//! the holder caveat-signature with the possession-proven peer key and evaluates
+//! every caveat against the request — tenant, effective expiry, and the
+//! `facts:read` / `facts:write` capability; any narrowing that excludes the
+//! request denies it. With enforcement **OFF** (the default), a token carrying
+//! caveats is **rejected outright** (fail-closed) so its restrictions are never
+//! silently dropped to grant the broader base authority. Un-attenuated tokens
+//! behave identically with the flag ON or OFF. Deploy verifiers with the flag
+//! enabled **before** minting attenuated tokens (mint-before-verify).
 
 use super::*;
 use base64::Engine as _;
