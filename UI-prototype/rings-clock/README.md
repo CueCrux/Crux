@@ -106,3 +106,7 @@ in this mock; the ExecPlans lens keeps full interactivity.
 - console-mock v5 — Tokens lens gains explicit sub-view buttons
   (cumulative | per day) shown only while the lens is active; per-day
   caption reports avg/peak spend and avg estimated savings.
+- console-mock v6 — per-day token bars both face outward (paired: spent
+  purple left, saved green right, nodes at tips); clicking a day bar opens
+  the pane with that day's figures and the active execplans ranked by
+  attributed spend + events; selected day highlighted on the dial.
