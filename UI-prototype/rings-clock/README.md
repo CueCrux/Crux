@@ -84,3 +84,11 @@ lineage/filters), **Memory** (sector = fact kind, ring = day, age-fade),
 **Sessions** (sector = agent passport), **Receipts** (chain escapement,
 illustrative until /v1/receipts/export is wired). Lens views are hover-only
 in this mock; the ExecPlans lens keeps full interactivity.
+- `versions/console-mock-v1.html` — first console mock (full-width tile row,
+  text buttons, no data-graph lens).
+- console-mock v2 (current `console-mock.html`) — Data-graph lens (66 live
+  facts from the daemon: angle = source date, radius = decay-adjusted
+  confidence rank toward the centre, edges = shared entity, click = 2-hop
+  neighbourhood); compact icon controls; start/end date pickers; bars on by
+  default; tiles compacted to the top-right; completed-plans toggle (off by
+  default, auto-on during playback).
