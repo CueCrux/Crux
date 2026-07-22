@@ -1759,7 +1759,10 @@ mod credit_meter_tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let body = body_json(response).await;
         assert_eq!(body["type"], "https://errors.cuecrux.com/rcx-lane-denied");
-        assert_eq!(body["reason_code"], "denied:capability_not_permitted");
+        // The free/local token is unsigned, so under the trusted-issuer router it
+        // fails issuer verification (not rcx-verified) before the lane-capability
+        // check — the metered lane is refused without reserving credits either way.
+        assert_eq!(body["reason_code"], "denied:token_invalid");
         let meter = shared
             .credit_meter
             .as_ref()
