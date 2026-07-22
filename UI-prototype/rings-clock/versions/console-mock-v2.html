@@ -1,4 +1,4 @@
-<title>Crux — The Rings v4 (clock of work)</title>
+<title>Crux Console — Rings landing mock</title>
 <style>
 :root, :root[data-theme="light"], :root[data-theme="dark"] {
   --bg0: #0b0d13; --bg1: #12151d;
@@ -22,17 +22,59 @@ a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; text-underline-offset: 3px; }
 code { font-family: var(--font-mono); font-size: .9em; background: var(--panel-strong); padding: .1em .35em; border-radius: 5px; }
 
-header.lead { max-width: 1100px; margin: 0 auto; padding: clamp(28px, 5vh, 54px) clamp(16px, 4vw, 40px) 6px; }
-header.lead h1 { font-size: clamp(26px, 3.6vw, 42px); font-weight: 800; letter-spacing: -.025em; line-height: 1.08; margin: 0 0 14px; text-wrap: balance; }
-header.lead h1 em { font-style: normal; color: var(--accent); }
-header.lead p.thesis { font-size: clamp(15px, 1.5vw, 17px); color: var(--ink2); max-width: 74ch; margin: 0 0 10px; }
-header.lead p.thesis b { color: var(--ink); font-weight: 650; }
+/* ── console topbar ── */
+#topbar {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px clamp(16px, 3vw, 32px);
+  border-bottom: 1px solid var(--hairline);
+  font-family: var(--font-mono); font-size: 12px; color: var(--ink3);
+}
+#topbar .brand { font: 800 15px var(--font-sans); color: var(--ink); letter-spacing: -.01em; }
+#topbar .brand span { color: var(--ink3); font-weight: 500; }
+#topbar .pill {
+  display: inline-flex; align-items: center; gap: 7px;
+  border: 1px solid var(--hairline-strong); border-radius: 999px; padding: 3px 12px;
+}
+#topbar .pill .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--teal); }
+#topbar .sp { margin-left: auto; }
+
+/* ── lens tiles: compact stack, top-right over the stage ── */
+#tiles {
+  position: absolute; top: 14px; right: 16px; z-index: 15;
+  display: flex; flex-direction: column; gap: 6px; width: 200px;
+}
+.tile {
+  text-align: left; cursor: pointer;
+  display: flex; align-items: baseline; gap: 8px;
+  background: rgba(14,16,24,.88); border: 1px solid var(--hairline);
+  border-radius: 10px; padding: 7px 12px;
+  color: var(--ink2); font-family: var(--font-sans);
+  transition: border-color .15s, background .15s;
+}
+.tile:hover { border-color: var(--hairline-strong); background: rgba(20,23,33,.95); }
+.tile:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.tile[aria-pressed="true"] { border-color: rgba(139,150,242,.6); background: rgba(139,150,242,.14); }
+.tile .t { font: 600 12px var(--font-sans); color: var(--ink2); display: flex; align-items: center; gap: 7px; flex: 1; }
+.tile .t i { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+.tile .n { font: 700 14px var(--font-sans); color: var(--ink); letter-spacing: -.01em; font-variant-numeric: tabular-nums; }
+.tile .s { display: none; }
+.tile[aria-pressed="true"] .t { color: var(--accent); }
+@media (max-width: 760px) { #tiles { position: static; flex-direction: row; flex-wrap: wrap; width: auto; margin: 10px 16px 0; } }
+
+/* icon buttons + date pickers */
+.stagebar button.ic { font-size: 13px; padding: 4px 9px; min-width: 30px; text-align: center; }
+.stagebar input[type=date] {
+  font: 600 11px var(--font-mono); color: var(--ink2);
+  background: rgba(255,255,255,.07); border: 1px solid var(--hairline-strong);
+  border-radius: 7px; padding: 3px 6px; color-scheme: dark;
+}
 
 section.concept { max-width: 1560px; margin: 26px auto 0; padding: 0 clamp(12px, 3vw, 36px); }
+/* de-carded: the rings sit directly on the page */
 .stagewrap {
-  position: relative; border: 1px solid var(--hairline); border-radius: 18px;
-  background: radial-gradient(900px 500px at 50% 0%, rgba(94,106,210,.06), transparent 65%), var(--bg1);
-  overflow: hidden; box-shadow: 0 24px 70px rgba(0,0,0,.45);
+  position: relative; border: 0; border-radius: 0;
+  background: transparent;
+  overflow: hidden; box-shadow: none;
 }
 .stagewrap canvas { display: block; width: 100%; height: clamp(520px, 74vh, 820px); cursor: crosshair; touch-action: none; }
 .stagebar {
@@ -120,23 +162,45 @@ footer { max-width: 1100px; margin: 48px auto 0; padding: 20px clamp(16px, 4vw, 
 @media (prefers-reduced-motion: reduce) { #tip { transition: none; } }
 </style>
 
-<header class="lead">
-  <h1>The Rings v4 — a <em>clock of work</em>, replaying 223 real plans</h1>
-  <p class="thesis">New work enters just after midnight; plans age clockwise around the dial; finished work retires just before twelve. This is the real portfolio — <b>223 ExecPlans with provenance</b> (163 complete · 57 in progress · 3 blocked) pulled from the daemon's work board — replayed over <b>May → July 2026</b>. Press <b>play</b> and watch the workspace breathe: sectors bloom in when a plan is born, seal and collapse when it completes, and park in grey when it goes quiet for 18 days (the board's own <code>stale</code> rule). Scroll to zoom and pan; click any dot or bar for its card. Completed plans retire off the clock into the ledger on the left.</p>
+<header id="topbar">
+  <span class="brand">crux <span>· console</span></span>
+  <span class="pill"><span class="dot"></span>daemon · local</span>
+  <span class="pill">http :14800 · mcp :14801</span>
+  <span class="sp"></span>
+  <span class="pill">snapshot · 2026-07-22</span>
 </header>
+
 
 <section class="concept" id="rings">
   <div class="stagewrap">
-    <canvas id="cv" aria-label="Rings v4: real execplan portfolio replayed as an animated clock; zoom for card detail"></canvas>
+    <canvas id="cv" aria-label="Rings: real execplan portfolio replayed as an animated clock; tiles switch the lens"></canvas>
+    <div id="tiles" role="group" aria-label="Ring lenses">
+      <button class="tile" data-lens="work" aria-pressed="true">
+        <span class="t"><i style="background:#a78bfa"></i>ExecPlans</span><span class="n">1,040</span>
+      </button>
+      <button class="tile" data-lens="data" aria-pressed="false">
+        <span class="t"><i style="background:#8b96f2"></i>Data graph</span><span class="n">66</span>
+      </button>
+      <button class="tile" data-lens="memory" aria-pressed="false">
+        <span class="t"><i style="background:#2dd4bf"></i>Memory</span><span class="n">21</span>
+      </button>
+      <button class="tile" data-lens="sessions" aria-pressed="false">
+        <span class="t"><i style="background:#22d3ee"></i>Sessions</span><span class="n">32</span>
+      </button>
+      <button class="tile" data-lens="receipts" aria-pressed="false">
+        <span class="t"><i style="background:#34d399"></i>Receipts</span><span class="n">seq</span>
+      </button>
+    </div>
     <div class="stagebar">
       <span class="grp">
-        <button id="b-spin" aria-pressed="true">spin</button>
-        <button id="b-clock">reset clock</button>
-        <button id="b-mode" aria-pressed="false">bars</button>
-        <button id="b-dir" aria-pressed="false" title="Where new nodes appear: centre-out (rings grow) or rim-in (nodes sink)">edge: outward</button>
-        <button id="b-all" aria-pressed="false" title="Every plan in the window stays on the clock — completed and parked included. Labels hide; hover a sector to name it.">all plans</button>
-        <button id="b-state" aria-pressed="false" title="Colour nodes by their plan's state: complete green, in progress purple, blocked red">state colours</button>
-        <button id="b-lin" aria-pressed="false" title="Show all plan-lineage chords (depends_on); hovering a sector always lights its own">lineage</button>
+        <button id="b-spin" class="ic" aria-pressed="true" title="Ambient spin">⟳</button>
+        <button id="b-clock" class="ic" title="Reset clock to 12 (also stops spin)">◷</button>
+        <button id="b-mode" class="ic" aria-pressed="true" title="Bars: spoke from centre to each node">▥</button>
+        <button id="b-dir" class="ic" aria-pressed="false" title="Time edge: outward (rings grow) / inward (nodes sink from rim)">⇅</button>
+        <button id="b-all" class="ic" aria-pressed="false" title="Census: every plan stays on the clock; hover names sectors">◌</button>
+        <button id="b-done" class="ic" aria-pressed="false" title="Show completed plans on the clock (auto-on during playback)">✓</button>
+        <button id="b-state" class="ic" aria-pressed="false" title="State colours: complete green · in progress purple · blocked red">◑</button>
+        <button id="b-lin" class="ic" aria-pressed="false" title="Lineage chords (depends_on)">⌇</button>
       </span>
       <span class="grp">
         <select id="s-kind" aria-label="Filter by node kind">
@@ -153,11 +217,13 @@ footer { max-width: 1100px; margin: 48px auto 0; padding: 20px clamp(16px, 4vw, 
         </select>
       </span>
       <span class="grp">
-        <label for="r-start">start</label><input id="r-start" type="range" min="0" max="1000" value="0">
-        <label for="r-end">end</label><input id="r-end" type="range" min="0" max="1000" value="1000">
+        <input id="d-start" type="date" min="2026-05-18" max="2026-07-22" value="2026-05-18" aria-label="Window start date">
+        <input id="r-start" type="range" min="0" max="1000" value="0" style="width:70px" aria-label="Window start">
+        <input id="r-end" type="range" min="0" max="1000" value="1000" style="width:70px" aria-label="Window end">
+        <input id="d-end" type="date" min="2026-05-18" max="2026-07-22" value="2026-07-22" aria-label="Window end date">
       </span>
       <span class="grp">
-        <button id="b-play" aria-pressed="false">play</button>
+        <button id="b-play" class="ic" aria-pressed="false" title="Replay the window">▶</button>
         <input id="r-time" type="range" min="0" max="1000" value="1000" aria-label="Time">
         <span id="c-date" class="chip">2026-07-22</span>
       </span>
@@ -170,37 +236,9 @@ footer { max-width: 1100px; margin: 48px auto 0; padding: 20px clamp(16px, 4vw, 
     </div>
     <aside id="pane" aria-label="Detail pane"></aside>
   </div>
-  <div class="cnotes">
-    <div class="why">
-      <h3>What you're watching</h3>
-      <p><b>The seam at 12 o'clock is "now".</b> Sectors are ordered by age: the newest plan sits at 12:01, the oldest at 11:59 — position on the dial <i>is</i> seniority. When a new plan is born mid-playback it enters at the top and pushes the dial round; everything on the clock re-flows live.</p>
-      <p><b>Three exits, three flashes:</b> teal seal = completed (its gates passed), grey = parked after 18 quiet days (the board's <code>stale</code> semantics — most of the 57 "in progress" plans are honestly this), red pulse = blocked.</p>
-      <p><b>Bars mode</b> turns every node into a spoke from the heartwood to its ring — older spokes layer over newer, nodes spread clockwise in day order, so a plan reads as a fan of its own history. Click any bar or dot for its card. <b>edge: inward</b> flips the time metaphor: new work appears at the rim and sinks toward the heartwood as it ages.</p>
-    </div>
-    <div>
-      <h3>Controls & mapping</h3>
-      <table class="map">
-        <tr><td>spin / reset clock</td><td>ambient rotation; reset tweens the seam back to 12</td></tr>
-        <tr><td>start · end</td><td>the window the rings span (radius = birth time within it)</td></tr>
-        <tr><td>play / time</td><td>replays the portfolio; live edge sweeps outward</td></tr>
-        <tr><td>sector order</td><td>newest at 12:01 → oldest at 11:59, always</td></tr>
-        <tr><td>dot size</td><td>tokens (traced facts) · milestone weight (untraced)</td></tr>
-        <tr><td>bars</td><td>spoke = centre → node ring; older over newer; both clickable</td></tr>
-        <tr><td>edge toggle</td><td>outward: rings grow from the centre · inward: nodes sink from the rim</td></tr>
-        <tr><td>rim track</td><td>thin arc = the segment's full extent (gapped from neighbours); thick arc = progress. Complete plan = one solid thick bar</td></tr>
-        <tr><td>state colours</td><td>toggle: nodes take their plan's state — <b style="color:#34d399">complete</b> · <b style="color:#a78bfa">in progress</b> · <b style="color:#ef4444">blocked</b></td></tr>
-        <tr><td>filters</td><td>node kind (gates / decisions-OD / memory / handoffs) × agent passport</td></tr>
-        <tr><td>token chart</td><td>in the detail pane: cumulative spend over the plan's life, gradient-filled, event dots by kind</td></tr>
-        <tr><td>ledger</td><td>completed plans stack on the left edge as they retire</td></tr>
-        <tr><td>traced plans</td><td><code>buyer-fit-buildout</code> + <code>cross-site-auth-sso</code> carry their real facts; others show milestone-derived density</td></tr>
-      </table>
-    </div>
-  </div>
+  <p style="max-width:1240px;margin:10px auto 0;padding:0 clamp(16px,3vw,32px);font:11px var(--font-mono);color:var(--ink3)">mock · tiles switch the lens · ExecPlans lens keeps solo / ledger / lineage / filters · snapshot data, live-wire: /v1/work · /v1/facts · receipts by seq</p>
 </section>
 
-<footer>
-  rings v4 · 223 real execplans (provenance-dated) from crux:14800 · day window 2026-05-18 → 2026-07-22 · exits: sealed = complete, parked = 18d quiet (stale rule), blocked pulses red
-</footer>
 
 <div id="tip" role="status"></div>
 
@@ -339,12 +377,15 @@ const cells = [];
 
 /* ── view state ── */
 let rot = 0, spinning = !REDUCED, resetTween = false;
-let mode = 'dots';                                 /* dots | bars */
+let mode = 'bars';                                 /* dots | bars — bars by default */
+let showCompleted = false;                         /* completed plans on the clock; auto-on while playing */
 let dir = 'out';                                   /* out: rings grow from centre · in: nodes sink from rim */
 let showAll = false;                               /* census mode: nothing retires off the clock */
 let hoverSec = null;                               /* plan whose sector is under the pointer */
 let colorByState = false;                          /* nodes coloured by plan state instead of kind */
 let showLineage = false;                           /* all depends_on chords faintly visible */
+let lens = 'work';                                 /* work | memory | sessions | receipts */
+let lensLabels = [];                               /* screen-space labels set by lens renderers */
 let fKind = 'all', fAgent = 'all';                 /* node filters */
 const passFilter = c =>
   (fKind === 'all' || c.kind === fKind) &&
@@ -375,8 +416,11 @@ const SEAM = 0.10;                                 /* gap at 12 o'clock */
 const BASE = -Math.PI / 2 + SEAM / 2;              /* 12:01 */
 function activePlans(t) {
   if (solo) return [solo];
-  if (showAll) return PLANS.filter(p => p.b <= t && p.e >= S - 0.001 && p.b <= E);
-  return PLANS.filter(p => p.b <= t && t < p.exit && p.e >= S - 0.001 && p.b <= E);
+  let out;
+  if (showAll) out = PLANS.filter(p => p.b <= t && p.e >= S - 0.001 && p.b <= E);
+  else out = PLANS.filter(p => p.b <= t && t < p.exit && p.e >= S - 0.001 && p.b <= E);
+  if (!showCompleted) out = out.filter(p => p.st !== 0);
+  return out;
 }
 function layoutTargets(t) {
   if (solo) {
@@ -445,31 +489,16 @@ function geom() {
   const r0 = R * 0.13;
   return { cx, cy, R, r0 };
 }
-/* radius for a day.
+/* radius for a day within [S, E].
    out: radius fixed by birth time — early inner, late outer, edge sweeps out.
-   in : radius by AGE at T — born at the rim, sinks toward the heartwood.
-   RAD_LO is the radial time floor: in the active-plans view it snaps to the
-   oldest VISIBLE node so ring 1 is always occupied — otherwise, years in,
-   every live node would crowd the outer rim. Census keeps the full window. */
-let RAD_LO = 11;
+   in : radius by AGE at T — born at the rim, sinks toward the heartwood.   */
 function dayR(g, day) {
   if (dir === 'in') {
-    const age = Math.max(0, Math.min(1, (T - day) / Math.max(0.5, T - RAD_LO)));
+    const age = Math.max(0, Math.min(1, (T - day) / Math.max(0.5, E - S)));
     return g.r0 + (g.R - g.r0) * (0.96 - 0.88 * age);
   }
-  const f = Math.max(0, Math.min(1, (day - RAD_LO) / Math.max(0.5, E - RAD_LO)));
+  const f = Math.max(0, Math.min(1, (day - S) / Math.max(0.5, E - S)));
   return g.r0 + (g.R - g.r0) * (0.08 + 0.88 * f);
-}
-function updateRadLo() {
-  RAD_LO = S;
-  if (showAll || solo) return;                     /* census + solo keep the full window */
-  let lo = Infinity;
-  for (const p of activePlans(T)) {
-    for (const c of p.cells) {
-      if (c.day <= T && c.day >= S && c.day <= E && c.day < lo) lo = c.day;
-    }
-  }
-  if (lo < Infinity) RAD_LO = Math.max(S, Math.min(lo, E - 1));
 }
 /* disc → screen */
 function toScreen(g, x, y) {
@@ -517,8 +546,7 @@ function draw(now) {
     rTime.value = Math.round((T - S) / Math.max(0.5, E - S) * 1000);
     cDate.textContent = dayDate(T);
   }
-  stepLayout(dt);
-  updateRadLo();
+  if (lens === 'work') stepLayout(dt);
   const g = geom();
   ctx.clearRect(0, 0, W, H);
 
@@ -547,6 +575,11 @@ function draw(now) {
   ctx.stroke();
 
   /* sectors */
+  lensLabels = [];
+  let soloLabels = null;
+  if (lens !== 'work') {
+    drawLensInFrame(ctx, g, time);
+  } else {
   ctx.lineWidth = 1 / Z;
   for (const p of PLANS) {
     if (!p.lay || p.lay.alpha < 0.02) continue;
@@ -693,7 +726,6 @@ function draw(now) {
      event's ring tracks around to 9 o'clock, then stands straight up as a
      vertical stacked bar — tokens (indigo) + fact kind + version cap.
      Same-day events keep their exact time order: adjacent rings. ── */
-  let soloLabels = null;
   if (solo && solo.lay && solo.lay.alpha > 0.5) {
     soloLabels = [];
     const unit = g.R - g.r0;
@@ -747,6 +779,8 @@ function draw(now) {
     soloLabels.push({ x: -(g.r0 + unit * 0.55), y: -(unit * 0.62), t: 'event ledger · outer ring = first event', cap: true });
   }
 
+  }  /* end work-lens in-frame */
+
   /* live edge: outward mode sweeps with T; inward mode IS the rim */
   {
     const er = dir === 'in' ? g.r0 + (g.R - g.r0) * 0.96 : dayR(g, T);
@@ -795,14 +829,13 @@ function draw(now) {
   ctx.fillText('crux', core.x, core.y - 6);
   ctx.fillStyle = 'rgba(126,133,149,.9)';
   ctx.font = '8.5px ' + MONO;
-  ctx.fillText(nAct + (showAll ? ' plans' : ' live'), core.x, core.y + 7);
+  ctx.fillText(lens === 'work' ? nAct + (showAll ? ' plans' : ' live') : lens, core.x, core.y + 7);
   ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
 
   /* corner status */
   ctx.fillStyle = 'rgba(126,133,149,.8)';
   ctx.font = '9.5px ' + MONO;
-  ctx.fillText(dayDate(S) + ' → ' + dayDate(E) + ' · T = ' + dayDate(T) + ' · ' + nAct + ' live · zoom ' + Z.toFixed(1) + '×'
-    + (RAD_LO > S + 0.5 ? ' · rings from ' + dayDate(RAD_LO) : ''), 18, 24);
+  ctx.fillText(dayDate(S) + ' → ' + dayDate(E) + ' · T = ' + dayDate(T) + ' · ' + nAct + ' live · zoom ' + Z.toFixed(1) + '×', 18, 24);
 
   /* solo: ledger labels + the seam's min→max range for THIS plan */
   if (soloLabels) {
@@ -820,10 +853,27 @@ function draw(now) {
     ctx.textAlign = 'left';
   }
 
+  /* lens captions (screen space) */
+  if (lensLabels.length) {
+    ctx.font = '9.5px ' + MONO;
+    ctx.textAlign = 'center';
+    for (const L2 of lensLabels) {
+      const sp = toScreen(g, L2.x, L2.y);
+      ctx.save();
+      if (L2.rot !== undefined) { ctx.translate(sp.x, sp.y); ctx.rotate(L2.rot + rot); ctx.translate(-sp.x, -sp.y); }
+      ctx.fillStyle = L2.cap ? 'rgba(182,188,201,.9)' : 'rgba(200,206,219,.95)';
+      if (!L2.cap) ctx.font = '700 11px ' + MONO;
+      ctx.fillText(L2.t, sp.x, sp.y);
+      ctx.restore();
+      ctx.font = '9.5px ' + MONO;
+    }
+    ctx.textAlign = 'left';
+  }
+
   /* completed ledger — plans retire off the clock into the left edge.
      Rows are clickable: filter the ring down to that one plan. */
   ledgerRows = [];
-  {
+  if (lens === 'work') {
     const doneList = PLANS
       .filter(p => p.st === 0 && p.exit <= T && p.b <= E && p.e >= S - 0.001)
       .sort((a, b) => b.exit - a.exit);
@@ -859,6 +909,196 @@ function draw(now) {
   if (visible && !document.hidden) rafId = requestAnimationFrame(draw);
 }
 
+/* ── data graph lens: 66 real facts pulled live from the daemon.
+   Angle = source date on the clock · radius = effective confidence
+   (high near the heartwood, decayed/low further out) · edges = facts
+   sharing an entity, in time order · click = 2-hop neighbourhood. ── */
+const GRAPH_RAW = [{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"gate:M1-R-code","d":75.59696759259168,"a":"claude-work","h":"medium","c":1.0,"t":127},{"e":"execplan:verifiable-record-products-2026-07-17","k":"gate:M3-core-pointer-producer-code-2026-07-22","d":76.75865740740846,"a":"claude-work","h":"stable","c":1.0,"t":158},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"gate:M3","d":68.95072916666686,"a":"codex-work","h":"stable","c":1.0,"t":316},{"e":"incident:2026-07-22","k":"gpu1-cargo-deploy-help-side-effect","d":76.43028935185066,"a":"claude-work","h":"stable","c":1.0,"t":291},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"decision:vault-target-regression-repair","d":75.59696759259168,"a":"claude-work","h":"stable","c":1.0,"t":155},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"progress:M3","d":68.90971064814948,"a":"codex-work","h":"volatile","c":1.0,"t":274},{"e":"execplan:production-ethos-audit-harness-2026-07-17","k":"gate:M5","d":74.60589120370423,"a":"codex-work","h":"volatile","c":1.0,"t":323},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"gate:M1","d":68.38157407407562,"a":"codex-work","h":"medium","c":1.0,"t":296},{"e":"execplan:wikicrux-public-readiness-hardening-2026-07-21","k":"gate:M3b-blocked","d":75.82773148148044,"a":"drivew-host","h":"stable","c":1.0,"t":221},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"decision:m5b-installer-transaction","d":76.36789351851985,"a":"claude-work","h":"stable","c":1.0,"t":232},{"e":"incident:2026-07-22","k":"crc-v1-resident-ordinal-handle-alias","d":76.47960648148,"a":"claude-work","h":"stable","c":1.0,"t":185},{"e":"execplan:verifiable-record-products-2026-07-17","k":"gate:M9-evidence-publication","d":76.67115740740701,"a":"claude-work","h":"stable","c":1.0,"t":125},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"brief","d":67.92068287037182,"a":"codex-work","h":"medium","c":1.0,"t":205},{"e":"execplan:wikicrux-m5-pricing-enforcement-2026-07-17","k":"decision:m3b-refund-contract-parity","d":76.02534722222117,"a":"claude-work","h":"stable","c":1.0,"t":153},{"e":"execplan:verifiable-record-products-2026-07-17","k":"gate:M3-engine-consumer-deploy-2026-07-22","d":76.73957175925898,"a":"claude-work","h":"stable","c":1.0,"t":223},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"gate:M0","d":67.93586805555606,"a":"codex-work","h":"medium","c":1.0,"t":205},{"e":"execplan:crux-macaroon-token-attenuation-2026-07-16","k":"design:sync-delegation-convention","d":76.4979745370365,"a":"codex-work","h":"stable","c":1.0,"t":408},{"e":"execplan:crux-macaroon-token-attenuation-2026-07-16","k":"gate:M2prime-hotfix-reviewed-and-reconciliation-plan","d":76.41813657407329,"a":"codex-work","h":"stable","c":1.0,"t":743},{"e":"execplan:wikicrux-market-wedge-offers-2026-07-16","k":"decision:canonical-pricing","d":75.82225694444423,"a":"claude-work","h":"stable","c":1.0,"t":146},{"e":"execplan:wikicrux-m5-pricing-enforcement-2026-07-17","k":"gate:M3b","d":76.02534722222117,"a":"claude-work","h":"stable","c":1.0,"t":223},{"e":"execplan:verifiable-record-products-2026-07-17","k":"gate:M3","d":76.7468518518508,"a":"claude-work","h":"stable","c":1.0,"t":150},{"e":"execplan:cuecrux-selfserve-launch-readiness-2026-07-16","k":"gate:M8-edge-repair","d":76.54800925925883,"a":"claude-work","h":"none","c":1.0,"t":254},{"e":"bench:provenance-byok-local-20260721T174751Z-8e711150","k":"result","d":75.74369212962847,"a":"claude-work","h":"stable","c":1.0,"t":145},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"gate:M3-M4","d":68.8297453703708,"a":"codex-work","h":"medium","c":1.0,"t":328},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"console-v1-removed-followup-done","d":69.89159722222394,"a":"codex-work","h":"medium","c":1.0,"t":329},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"gate:M2","d":68.64881944444278,"a":"codex-work","h":"medium","c":1.0,"t":236},{"e":"execplan:crux-macaroon-token-attenuation-2026-07-16","k":"design:M3prime-sync-enforcement-on-v11","d":76.43527777777854,"a":"codex-work","h":"stable","c":1.0,"t":870},{"e":"incident:2026-07-22","k":"release-v0.5.48-macos-socket-fixture","d":76.56612268518438,"a":"claude-work","h":"stable","c":1.0,"t":147},{"e":"execplan:wikicrux-public-readiness-hardening-2026-07-21","k":"gate:M3b","d":75.84260416666802,"a":"drivew-host","h":"stable","c":1.0,"t":287},{"e":"execplan:wikicrux-market-wedge-offers-2026-07-16","k":"gate:M0","d":75.82225694444423,"a":"claude-work","h":"stable","c":1.0,"t":74},{"e":"execplan:corecrux-object-storage-tier-2026-07-07","k":"gate:G3-code-merge","d":76.63100694444438,"a":"claude-work","h":"stable","c":1.0,"t":125},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"gate:M1","d":68.6698958333327,"a":"codex-work","h":"stable","c":1.0,"t":536},{"e":"execplan:wikicrux-m5-pricing-enforcement-2026-07-17","k":"gate:M5a","d":75.79510416666744,"a":"claude-work","h":"stable","c":1.0,"t":230},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"decision:topology-corrected-cruxengine-14343","d":67.94807870370278,"a":"codex-work","h":"medium","c":1.0,"t":207},{"e":"incident:2026-07-22","k":"passport-mint-pre-m2-approval-live","d":76.75064814814687,"a":"claude-work","h":"stable","c":1.0,"t":203},{"e":"incident:2026-07-22","k":"core-sidecar-snapshot-path","d":76.8100694444438,"a":"claude-work","h":"stable","c":1.0,"t":172},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"gate:M5b","d":76.36789351851985,"a":"claude-work","h":"stable","c":1.0,"t":184},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"handoff:2026-07-14","d":68.88217592592628,"a":"codex-work","h":"stable","c":1.0,"t":409},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"milestone:M1-partial","d":67.99072916666773,"a":"codex-work","h":"medium","c":1.0,"t":275},{"e":"execplan:crux-macaroon-token-attenuation-2026-07-16","k":"gate:M2-rustdoc-fix-and-M3-grounding","d":75.82988425925942,"a":"codex-work","h":"stable","c":1.0,"t":732},{"e":"execplan:sdkcrux-dependency-vuln-remediation-2026-07-20","k":"audit-snapshot","d":74.56193287036876,"a":"codex-work","h":"volatile","c":1.0,"t":415},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"gate:M0","d":68.35657407407416,"a":"codex-work","h":"stable","c":1.0,"t":412},{"e":"execplan:crux-passport-mint-request-gate-2026-07-17","k":"gate:M2.1-integration","d":76.65032407407489,"a":"claude-work","h":"stable","c":1.0,"t":207},{"e":"execplan:cuecrux-selfserve-launch-readiness-2026-07-16","k":"decision:edge-cutover-gate","d":76.54349537036978,"a":"claude-work","h":"none","c":1.0,"t":167},{"e":"incident:2026-07-20","k":"sdkcrux-ci-runner-move-and-stacked-failures","d":74.54767361111226,"a":"codex-work","h":"volatile","c":1.0,"t":564},{"e":"execplan:production-ethos-audit-harness-2026-07-17","k":"gate:M7","d":75.6126157407416,"a":"claude-work","h":"stable","c":1.0,"t":116},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"gate:M2","d":68.84675925926058,"a":"codex-work","h":"stable","c":1.0,"t":463},{"e":"execplan:crux-banner-redesign-2026-07-21","k":"gate:deploy-v0.5.47","d":76.39510416666599,"a":"codex-work","h":"volatile","c":1.0,"t":216},{"e":"execplan:wikicrux-market-wedge-offers-2026-07-16","k":"gate:M1","d":75.82225694444423,"a":"claude-work","h":"medium","c":1.0,"t":162},{"e":"execplan:verifiable-record-products-2026-07-17","k":"gate:M3-deploy-automation-2026-07-22","d":76.7569560185184,"a":"claude-work","h":"stable","c":1.0,"t":175},{"e":"execplan:crux-macaroon-token-attenuation-2026-07-16","k":"incident:M3-M4-collision-with-concurrent-security-hotfix","d":75.92763888889021,"a":"codex-work","h":"stable","c":1.0,"t":822},{"e":"execplan:crux-macaroon-token-attenuation-2026-07-16","k":"gate:M3prime-sync-delegation","d":76.61583333333328,"a":"codex-work","h":"stable","c":1.0,"t":638},{"e":"__work_comment__::w_51752647ca6e4bdbbe4c3b45d30241c9::c_9a7285cbf6604152be964e81d7de0367","k":"record","d":76.73920138888934,"a":null,"h":"none","c":1.0,"t":173},{"e":"execplan:crux-passport-mint-request-gate-2026-07-17","k":"gate:M2-live-containment-2026-07-22","d":76.75064814814687,"a":"claude-work","h":"stable","c":1.0,"t":159},{"e":"execplan:sdkcrux-dependency-vuln-remediation-2026-07-20","k":"gate:M4","d":74.58318287037036,"a":"codex-work","h":"volatile","c":1.0,"t":220},{"e":"execplan:corecrux-object-storage-tier-2026-07-07","k":"gate:G3-prod-safety-recheck","d":76.6583912037022,"a":"claude-work","h":"volatile","c":1.0,"t":131},{"e":"execplan:wikicrux-m5-pricing-enforcement-2026-07-17","k":"gate:M3a-harness","d":75.91656249999869,"a":"claude-work","h":"stable","c":1.0,"t":244},{"e":"execplan:production-ethos-audit-harness-2026-07-17","k":"gate:M4","d":74.578125,"a":"codex-work","h":"volatile","c":1.0,"t":344},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"gate:M4","d":68.85881944444554,"a":"codex-work","h":"stable","c":1.0,"t":409},{"e":"execplan:crux-passport-mint-request-gate-2026-07-17","k":"gate:M2.1-integration","d":76.64783564814934,"a":"claude-work","h":"stable","c":1.0,"t":185},{"e":"execplan:wikicrux-public-readiness-hardening-2026-07-21","k":"gate:M3b","d":75.9136111111111,"a":"drivew-host","h":"stable","c":1.0,"t":293},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"console-v1-removed","d":68.89186342592438,"a":"codex-work","h":"medium","c":1.0,"t":288},{"e":"incident:2026-07-22","k":"vaultcrux-public-edge-loopback-regression","d":76.54800925925883,"a":"claude-work","h":"stable","c":1.0,"t":157},{"e":"incident:2026-07-22","k":"legal-hold-canary-mcp-auth-mismatch","d":76.43935185185182,"a":"codex-work","h":"stable","c":1.0,"t":214},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"gate:M3","d":69.03211805555475,"a":"codex-work","h":"stable","c":1.0,"t":215},{"e":"incident:2026-07-22","k":"legal-hold-canary-mcp-auth-mismatch","d":76.43893518518598,"a":"codex-work","h":"stable","c":1.0,"t":214}];
+const GNODES = GRAPH_RAW.map((n, i) => ({ ...n, i }));
+const GEDGES = [];
+(function buildGraph() {
+  const byE = {};
+  for (const n of GNODES) (byE[n.e] = byE[n.e] || []).push(n);
+  for (const e in byE) {
+    const arr = byE[e].sort((a, b) => a.d - b.d);
+    for (let i = 1; i < arr.length; i++) GEDGES.push({ a: arr[i - 1], b: arr[i] });
+  }
+})();
+const GADJ = {};
+for (const ed of GEDGES) {
+  (GADJ[ed.a.i] = GADJ[ed.a.i] || []).push(ed.b.i);
+  (GADJ[ed.b.i] = GADJ[ed.b.i] || []).push(ed.a.i);
+}
+let gSel = null;                                   /* selected node index → 2-hop highlight */
+function gHops(i0) {
+  const l1 = new Set(GADJ[i0] || []);
+  const l2 = new Set();
+  for (const j of l1) for (const k2 of (GADJ[j] || [])) if (k2 !== i0 && !l1.has(k2)) l2.add(k2);
+  return { l1, l2 };
+}
+const G_FAM_HUE = e =>
+  e.startsWith('execplan:') ? '#a78bfa' :
+  e.startsWith('bench:') ? '#f5a623' :
+  e.startsWith('incident:') ? '#ef4444' :
+  e.startsWith('design:') ? '#22d3ee' :
+  e.startsWith('__work_comment__') ? '#34d399' : '#7e8595';
+const G_THR = { volatile: 1, medium: 35, stable: 365, none: Infinity };
+function gEffConf(n) {
+  const age = Math.max(0, T - n.d);
+  const thr = G_THR[n.h] || Infinity;
+  if (thr === Infinity) return n.c;
+  return age > thr ? n.c * 0.5 : n.c * (1 - 0.35 * (age / thr));
+}
+function drawDataLens(ctx2, g) {
+  for (const n of GNODES) { n._x = undefined; n._on = false; }
+  const span = Math.max(0.5, E - S);
+  const rIn = g.r0 * 1.25, rOut = g.R * 0.96;
+  /* radius = confidence RANK within the visible set (real confidences are
+     uniformly ~1.0 today; normalising keeps "higher = nearer the centre"
+     meaningful instead of clumping everything at the heartwood) */
+  const vis = GNODES.filter(n => n.d <= T && n.d >= S && n.d <= E);
+  let cMin = 1, cMax = 0;
+  for (const n of vis) { const ec = gEffConf(n); if (ec < cMin) cMin = ec; if (ec > cMax) cMax = ec; }
+  const cSpan = Math.max(0.02, cMax - cMin);
+  const posOf = n => {
+    const a = BASE + (TAU - SEAM) * Math.max(0, Math.min(1, (n.d - S) / span));
+    const norm = (gEffConf(n) - cMin) / cSpan;
+    const r = rIn + (rOut - rIn) * (1 - (0.08 + 0.84 * norm));
+    return { a, x: Math.cos(a) * r, y: Math.sin(a) * r };
+  };
+  const hops = gSel !== null ? gHops(gSel) : null;
+  const inFocus = i2 => gSel === null ? null : (i2 === gSel ? 0 : hops.l1.has(i2) ? 1 : hops.l2.has(i2) ? 2 : -1);
+  /* confidence guide rings */
+  for (const cf of [0.25, 0.5, 0.75]) {
+    ctx2.strokeStyle = 'rgba(255,255,255,.04)';
+    ctx2.lineWidth = 1 / Z;
+    ctx2.beginPath(); ctx2.arc(0, 0, rIn + (rOut - rIn) * cf, 0, 7); ctx2.stroke();
+  }
+  lensLabels.push({ x: 0, y: -(rIn + (rOut - rIn) * 0.02) + 10, t: '' });
+  /* edges */
+  for (const ed of GEDGES) {
+    if (ed.a.d > T || ed.b.d > T || ed.a.d < S || ed.b.d < S) continue;
+    const pa2 = posOf(ed.a), pb2 = posOf(ed.b);
+    let alpha = 0.16;
+    if (hops) {
+      const fa = inFocus(ed.a.i), fb = inFocus(ed.b.i);
+      alpha = (fa >= 0 && fb >= 0) ? 0.6 : 0.03;
+    }
+    ctx2.strokeStyle = hex2rgba(G_FAM_HUE(ed.a.e), alpha);
+    ctx2.lineWidth = 1.1 / Z;
+    ctx2.beginPath();
+    ctx2.moveTo(pa2.x, pa2.y);
+    ctx2.quadraticCurveTo((pa2.x + pb2.x) / 2 * 0.55, (pa2.y + pb2.y) / 2 * 0.55, pb2.x, pb2.y);
+    ctx2.stroke();
+  }
+  /* nodes */
+  for (const n of GNODES) {
+    if (n.d > T || n.d < S || n.d > E) continue;
+    const p2 = posOf(n);
+    const hue2 = G_FAM_HUE(n.e);
+    const f2 = inFocus(n.i);
+    const isH = hover === n;
+    let alpha = 0.85;
+    if (f2 !== null) alpha = f2 === -1 ? 0.10 : f2 === 0 ? 1 : f2 === 1 ? 0.95 : 0.6;
+    const rr = (2.2 + Math.min(3, (n.t || 150) / 180)) * (isH || f2 === 0 ? 1.7 : 1);
+    ctx2.fillStyle = hex2rgba(hue2, alpha);
+    ctx2.beginPath(); ctx2.arc(p2.x, p2.y, rr, 0, 7); ctx2.fill();
+    if (f2 === 0) {
+      ctx2.strokeStyle = hex2rgba(hue2, 0.95);
+      ctx2.lineWidth = 1.5 / Z;
+      ctx2.beginPath(); ctx2.arc(p2.x, p2.y, rr + 5 / Z, 0, 7); ctx2.stroke();
+    }
+    if (isH) { ctx2.strokeStyle = hex2rgba(hue2, 0.9); ctx2.beginPath(); ctx2.arc(p2.x, p2.y, rr + 4 / Z, 0, 7); ctx2.stroke(); }
+    n._x = p2.x; n._y = p2.y; n._dr = rr; n._on = true;
+  }
+  lensLabels.push({ x: 0, y: g.R + 42, cap: true,
+                    t: 'data graph · 66 live facts · angle = source date · centre = higher confidence (decay-adjusted, rank-scaled ' + cMin.toFixed(2) + '–' + cMax.toFixed(2) + ') · edge = shared entity · click = 2-hop' });
+}
+
+/* ── alternative lenses: same disc, different substrate cut ── */
+function drawLensInFrame(ctx2, g, time) {
+  for (const c of cells) { c._x = undefined; c._on = false; c._bx = undefined; }
+  if (lens === 'data') { drawDataLens(ctx2, g); return; }
+  if (lens === 'receipts') { drawReceiptsLens(ctx2, g, time); return; }
+  const groups = lens === 'memory'
+    ? [['gate', '#2dd4bf'], ['decision', '#a78bfa'], ['memory', '#8b96f2'], ['handoff', '#f5a623'], ['incident', '#ef4444']]
+    : [['claude-work', '#8b96f2'], ['codex-work', '#22d3ee'], ['untraced', '#7e8595']];
+  const keyOf = c => lens === 'memory' ? c.kind : (c.actor || 'untraced');
+  const N2 = groups.length;
+  groups.forEach((grp, gi) => {
+    const k2 = grp[0], hue2 = grp[1];
+    const a0 = BASE + (gi / N2) * (TAU - SEAM), a1 = BASE + ((gi + 1) / N2) * (TAU - SEAM);
+    /* divider + rim arc */
+    ctx2.strokeStyle = 'rgba(255,255,255,.06)';
+    ctx2.lineWidth = 1 / Z;
+    ctx2.beginPath();
+    ctx2.moveTo(Math.cos(a0) * g.r0, Math.sin(a0) * g.r0);
+    ctx2.lineTo(Math.cos(a0) * g.R, Math.sin(a0) * g.R);
+    ctx2.stroke();
+    const members = cells.filter(c => keyOf(c) === k2 && c.day <= T && c.day >= S && c.day <= E && passFilter(c));
+    ctx2.strokeStyle = hex2rgba(hue2, 0.5);
+    ctx2.lineWidth = 3 / Z;
+    ctx2.beginPath(); ctx2.arc(0, 0, g.R + 3, a0 + 0.02, a1 - 0.02); ctx2.stroke();
+    ctx2.lineWidth = 1 / Z;
+    /* label */
+    const mid = (a0 + a1) / 2;
+    lensLabels.push({ x: Math.cos(mid) * (g.R + 20), y: Math.sin(mid) * (g.R + 20),
+                      t: k2 + ' · ' + members.length });
+    /* cells: ring = day epoch, fade = age (memory lens) */
+    for (const c of members) {
+      const a = a0 + (a1 - a0) * (0.08 + c.ja * 0.84);
+      const r = dayR(g, c.day) * (0.995 + c.jr * 0.01);
+      const x = Math.cos(a) * r, y = Math.sin(a) * r;
+      const isH = hover === c;
+      let alpha = c.real ? 0.9 : 0.45;
+      if (lens === 'memory') {
+        const ageFrac = Math.max(0, Math.min(1, (T - c.day) / Math.max(0.5, E - S)));
+        alpha *= 1 - 0.5 * ageFrac;                 /* older memory dims — decay, illustratively */
+      }
+      const rr = (c.real ? 3.2 : 2.4) * (isH ? 1.8 : 1);
+      ctx2.fillStyle = hex2rgba(hue2, alpha * (hover && !isH ? 0.5 : 1));
+      if (c.kind === 'gate' && c.real) {
+        ctx2.beginPath();
+        ctx2.moveTo(x, y - rr - 1); ctx2.lineTo(x + rr, y); ctx2.lineTo(x, y + rr + 1); ctx2.lineTo(x - rr, y);
+        ctx2.closePath(); ctx2.fill();
+      } else {
+        ctx2.beginPath(); ctx2.arc(x, y, rr, 0, 7); ctx2.fill();
+      }
+      if (isH) { ctx2.strokeStyle = hex2rgba(hue2, 0.95); ctx2.beginPath(); ctx2.arc(x, y, rr + 4 / Z, 0, 7); ctx2.stroke(); }
+      c._x = x; c._y = y; c._dr = rr; c._on = true;
+    }
+  });
+  lensLabels.push({ x: 0, y: g.R + 42, cap: true,
+                    t: lens === 'memory'
+                      ? 'memory lens · sector = fact kind · ring = day · fade = age (decay illustrative)'
+                      : 'sessions lens · sector = agent passport · ring = day · untraced plans have no actor' });
+}
+function drawReceiptsLens(ctx2, g, time) {
+  const teeth = 120;
+  const sealedFrac = Math.max(0, Math.min(1, (T - S) / Math.max(0.5, E - S)));
+  for (let i = 0; i < teeth; i++) {
+    const a = BASE + (i / teeth) * (TAU - SEAM);
+    const sealed = i / teeth <= sealedFrac;
+    ctx2.strokeStyle = sealed ? 'rgba(52,211,153,.8)' : 'rgba(255,255,255,.10)';
+    ctx2.lineWidth = (sealed ? 1.8 : 1) / Z;
+    ctx2.beginPath();
+    ctx2.moveTo(Math.cos(a) * g.R, Math.sin(a) * g.R);
+    ctx2.lineTo(Math.cos(a) * (g.R + (sealed ? 9 : 6)), Math.sin(a) * (g.R + (sealed ? 9 : 6)));
+    ctx2.stroke();
+  }
+  ctx2.lineWidth = 1 / Z;
+  /* rivet spiral: receipts accumulating inward-out (golden angle) */
+  const n = Math.floor(90 * sealedFrac) + 8;
+  for (let i = 0; i < n; i++) {
+    const a = i * 2.399963;
+    const r = g.r0 + (g.R - g.r0) * (0.12 + (i / 98) * 0.78);
+    ctx2.fillStyle = hex2rgba('#34d399', 0.25 + (i / n) * 0.5);
+    ctx2.beginPath(); ctx2.arc(Math.cos(a) * r, Math.sin(a) * r, 1.8, 0, 7); ctx2.fill();
+  }
+  lensLabels.push({ x: 0, y: g.R + 42, cap: true,
+                    t: 'receipts lens · chain ticks forward only · illustrative until /v1/receipts/export is wired' });
+}
+
 /* kick */
 function kick() { if (rafId === null) rafId = requestAnimationFrame(draw); }
 document.addEventListener('visibilitychange', kick);
@@ -867,8 +1107,13 @@ kick();
 /* ── controls ── */
 function setPlaying(v) {
   playing = v;
-  bPlay.textContent = v ? 'pause' : 'play';
+  bPlay.textContent = v ? '⏸' : '▶';
   bPlay.setAttribute('aria-pressed', String(v));
+  if (v && !showCompleted) setCompleted(true);     /* playback needs the add/remove story */
+}
+function setCompleted(v) {
+  showCompleted = v;
+  document.getElementById('b-done').setAttribute('aria-pressed', String(v));
 }
 bPlay.addEventListener('click', () => {
   if (!playing && T >= E - 0.01) T = S;            /* replay from window start */
@@ -878,6 +1123,7 @@ bSpin.addEventListener('click', () => {
   spinning = !spinning;
   bSpin.setAttribute('aria-pressed', String(spinning));
 });
+document.getElementById('b-done').addEventListener('click', () => setCompleted(!showCompleted));
 bClock.addEventListener('click', () => {
   resetTween = true;
   spinning = false;                                /* reset also stops the spin */
@@ -910,6 +1156,8 @@ bLin.addEventListener('click', () => {
 });
 document.getElementById('s-kind').addEventListener('change', e => { fKind = e.target.value; });
 document.getElementById('s-agent').addEventListener('change', e => { fAgent = e.target.value; });
+const dStart = document.getElementById('d-start');
+const dEnd = document.getElementById('d-end');
 function syncWindow() {
   const s = Math.min(rStart.value / 1000, rEnd.value / 1000 - 0.03);
   const e = Math.max(rEnd.value / 1000, rStart.value / 1000 + 0.03);
@@ -918,9 +1166,23 @@ function syncWindow() {
   T = Math.max(S, Math.min(E, T));
   rTime.value = Math.round((T - S) / Math.max(0.5, E - S) * 1000);
   cDate.textContent = dayDate(T);
+  dStart.value = dayDate(S);
+  dEnd.value = dayDate(E);
 }
 rStart.addEventListener('input', syncWindow);
 rEnd.addEventListener('input', syncWindow);
+/* date pickers drive the same window */
+function dateToDay(v) { return Date.parse(v + 'T00:00:00Z') / 86400000 - 20580; }
+dStart.addEventListener('change', () => {
+  const d = Math.max(11, Math.min(NOW - 1, dateToDay(dStart.value)));
+  rStart.value = Math.round((d - 11) / (NOW - 11) * 1000);
+  syncWindow();
+});
+dEnd.addEventListener('change', () => {
+  const d = Math.max(12, Math.min(NOW, dateToDay(dEnd.value)));
+  rEnd.value = Math.round((d - 11) / (NOW - 11) * 1000);
+  syncWindow();
+});
 rTime.addEventListener('input', () => {
   T = S + (rTime.value / 1000) * (E - S);
   setPlaying(false);
@@ -963,7 +1225,17 @@ cv.addEventListener('pointermove', e => {
     return;
   }
   hover = hitTest(e);
-  hoverSec = hover ? hover.p : sectorAt(e);
+  hoverSec = hover && hover.p ? hover.p : sectorAt(e);
+  if (hover && lens === 'data') {
+    const n = hover;
+    showTip(mxAbs, myAbs,
+      '<b>' + n.k + '</b><br>' +
+      '<span class="k">entity</span> ' + (n.e.length > 40 ? n.e.slice(0, 39) + '…' : n.e) + '<br>' +
+      '<span class="k">source</span> ' + dayDate(n.d) + (n.a ? ' <span class="k">by</span> ' + n.a : '') + '<br>' +
+      '<span class="k">confidence</span> ' + gEffConf(n).toFixed(2) + ' <span class="k">(' + (n.h || 'none') + ')</span>' +
+      ' · <span class="k">links</span> ' + ((GADJ[n.i] || []).length));
+    return;
+  }
   if (hover) {
     const c = hover;
     showTip(mxAbs, myAbs, c.real
@@ -990,6 +1262,7 @@ cv.addEventListener('pointermove', e => {
 });
 /* which plan's sector is under the pointer (annulus only) */
 function sectorAt(e) {
+  if (lens !== 'work') return null;
   const r = cv.getBoundingClientRect();
   const g = geom();
   const p = toDisc(g, e.clientX - r.left, e.clientY - r.top);
@@ -1013,6 +1286,16 @@ function hitTest(e) {
   const p = toDisc(g, e.clientX - r.left, e.clientY - r.top);
   const pr = Math.hypot(p.x, p.y);
   const pa = Math.atan2(p.y, p.x);
+  /* data lens: graph nodes */
+  if (lens === 'data') {
+    let best2 = null, bd2 = 9 / Z;
+    for (const n of GNODES) {
+      if (!n._on || n._x === undefined) continue;
+      const d2 = Math.hypot(n._x - p.x, n._y - p.y);
+      if (d2 < bd2 + n._dr) { bd2 = d2; best2 = n; }
+    }
+    return best2;
+  }
   /* solo: event-ledger vertical bars take priority */
   if (solo) {
     for (const c of solo.cells) {
@@ -1036,6 +1319,12 @@ function hitTest(e) {
   return best;
 }
 function handleClick(e) {
+  if (lens === 'data') {                           /* graph: toggle 2-hop neighbourhood */
+    const hit = hitTest(e);
+    gSel = (hit && hit.i !== undefined) ? (gSel === hit.i ? null : hit.i) : null;
+    return;
+  }
+  if (lens !== 'work') return;                     /* other lens views: hover only in this mock */
   const r = cv.getBoundingClientRect();
   const cxp = e.clientX - r.left, cyp = e.clientY - r.top;
   /* 1 — ledger rows: filter the ring to that plan */
@@ -1152,6 +1441,20 @@ function renderPane() {
   pane.classList.add('open');
 }
 addEventListener('keydown', e => { if (e.key === 'Escape') { setSel(null); solo = null; } });
+
+/* tiles: press to switch the lens */
+document.querySelectorAll('#tiles .tile').forEach(t2 => {
+  t2.addEventListener('click', () => {
+    lens = t2.dataset.lens;
+    document.querySelectorAll('#tiles .tile').forEach(x => x.setAttribute('aria-pressed', String(x === t2)));
+    setSel(null); solo = null; hover = null; hoverSec = null; gSel = null; hideTip();
+    if (lens === 'data') {
+      /* auto-fit the window to the data extent so source dates spread the clock */
+      const minD = Math.min(...GNODES.map(n => n.d)) - 0.5;
+      if (S < minD - 1) { rStart.value = Math.round((minD - 11) / (NOW - 11) * 1000); syncWindow(); }
+    }
+  });
+});
 
 /* init */
 syncWindow();
