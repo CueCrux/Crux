@@ -685,6 +685,7 @@ pub(crate) fn router_with_route_auth(
         .route("/v1/facts/{factId}", axum::routing::delete(self::facts::delete_fact))
         .route("/v1/facts/entity/{entity}", get(self::facts::get_facts_by_entity))
         .route("/v1/facts/export", get(self::facts::export_facts))
+        .route("/v1/facts/list", get(self::facts::list_facts))
         // Substrate (M1: Crux as domain substrate).
         .route("/v1/entities", get(self::entities::list_entities))
         .route("/v1/entities/{kind}/{id}", get(self::entities::get_entity))
