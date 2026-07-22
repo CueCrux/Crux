@@ -110,3 +110,7 @@ in this mock; the ExecPlans lens keeps full interactivity.
   purple left, saved green right, nodes at tips); clicking a day bar opens
   the pane with that day's figures and the active execplans ranked by
   attributed spend + events; selected day highlighted on the dial.
+- console-mock v7 — per-day bars joined into one spoke (green savings core
+  overlaid inside the purple spend bar, tip nodes for both); day pane gains
+  a gradient line chart of the whole window (spend area + savings line)
+  with the selected day marked on both series.
