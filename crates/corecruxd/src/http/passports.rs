@@ -155,49 +155,43 @@ fn mint_request_approver(
     }
     let claimed_approver = claimed_approver.map(str::trim).filter(|claimed| !claimed.is_empty());
 
-    if context.auth_enforced() {
-        if context.passport_override_used() {
-            return Err(problem_response(
-                StatusCode::FORBIDDEN,
-                "passport impersonation is not permitted for passport-mint decisions",
-            ));
-        }
-        if context.credential_is_agent_token() {
-            return Err(problem_response(
-                StatusCode::FORBIDDEN,
-                "automation credentials cannot satisfy a human passport-mint decision",
-            ));
-        }
-        let Some(asserted) = context.passport_id.as_deref() else {
-            return Err(problem_response(
-                StatusCode::FORBIDDEN,
-                "an authenticated passport is required for passport-mint decisions",
-            ));
-        };
-        if claimed_approver.is_some_and(|claimed| claimed != asserted) {
-            return Err(problem_response(
-                StatusCode::FORBIDDEN,
-                "approver_passport does not match the authenticated passport",
-            ));
-        }
-        let actor = if context.passport_identity_verified() {
-            asserted.to_string()
-        } else {
-            format!("{}{}", super::approval_receipts::UNVERIFIED_APPROVER_PREFIX, asserted)
-        };
-        return Ok((asserted.to_string(), actor));
-    }
-
-    let Some(asserted) = claimed_approver else {
+    if !context.auth_enforced() {
         return Err(problem_response(
-            StatusCode::BAD_REQUEST,
-            "approver_passport is required in auth-off mode",
+            StatusCode::FORBIDDEN,
+            "a cryptographically verified human passport is required for passport-mint decisions",
+        ));
+    }
+    if context.passport_override_used() {
+        return Err(problem_response(
+            StatusCode::FORBIDDEN,
+            "passport impersonation is not permitted for passport-mint decisions",
+        ));
+    }
+    if context.credential_is_agent_token() {
+        return Err(problem_response(
+            StatusCode::FORBIDDEN,
+            "automation credentials cannot satisfy a human passport-mint decision",
+        ));
+    }
+    if !context.passport_identity_verified() {
+        return Err(problem_response(
+            StatusCode::FORBIDDEN,
+            "a cryptographically verified human passport is required for passport-mint decisions",
+        ));
+    }
+    let Some(asserted) = context.passport_id.as_deref() else {
+        return Err(problem_response(
+            StatusCode::FORBIDDEN,
+            "an authenticated passport is required for passport-mint decisions",
         ));
     };
-    Ok((
-        asserted.to_string(),
-        format!("{}{}", super::approval_receipts::UNVERIFIED_APPROVER_PREFIX, asserted),
-    ))
+    if claimed_approver.is_some_and(|claimed| claimed != asserted) {
+        return Err(problem_response(
+            StatusCode::FORBIDDEN,
+            "approver_passport does not match the authenticated passport",
+        ));
+    }
+    Ok((asserted.to_string(), asserted.to_string()))
 }
 
 #[allow(clippy::result_large_err)] // Axum responses preserve the exact HTTP denial at this boundary.

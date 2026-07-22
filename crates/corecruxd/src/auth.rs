@@ -311,6 +311,20 @@ impl Authz {
     pub fn mode(&self) -> AuthMode {
         self.mode
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_hs256(secret: &[u8], issuer: &str, audience: &str) -> Self {
+        Self {
+            mode: AuthMode::JwtHs256,
+            jwt_hs256: Some(JwtHs256Config {
+                secret: secret.to_vec(),
+                issuer: Some(issuer.to_string()),
+                audience: Some(audience.to_string()),
+            }),
+            jwt_jwks: None,
+            agent_http: None,
+        }
+    }
 }
 
 fn parse_secret(raw: &str) -> Result<Vec<u8>, String> {

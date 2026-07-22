@@ -81,9 +81,10 @@ fn validated_approver(approver_passport: String) -> Result<String, MintRequestRe
 
 /// Prepare an explicit operator approval without mutating fact-store state.
 ///
-/// The operator override wins exactly when present; otherwise the requested
-/// category is used. The returned action summary binds the exact normalized
-/// passport record and is intended to be signed in an approval receipt before
+/// The operator must submit the category explicitly. The requester's suggested
+/// category is display-only and is never silently accepted by the approval
+/// backend. The returned action summary binds the exact normalized passport
+/// record and is intended to be signed in an approval receipt before
 /// [`PreparedMintApproval::commit`] is called.
 #[allow(clippy::too_many_arguments)] // Each value is independently bound into the signed approval transaction.
 pub fn prepare_mint_request_approval(
@@ -99,7 +100,8 @@ pub fn prepare_mint_request_approval(
     let approver_passport = validated_approver(approver_passport)?;
     let request = pending_request(store, request_id)?;
     let final_category = category_override
-        .or_else(|| request.requested_category.clone())
+        .map(|category| category.trim().to_string())
+        .filter(|category| !category.is_empty())
         .ok_or(MintRequestResolutionError::MissingCategory)?;
     crate::passports::validate_category(&final_category)?;
 
@@ -583,7 +585,9 @@ mod tests {
         let data_dir = tempfile::tempdir().unwrap();
         let mut store = FactStore::new();
 
-        let missing_category = file_request(&mut store, "missing-category", None);
+        // The requester's category is only a UI suggestion. Approval must
+        // still carry an explicit operator-confirmed category.
+        let missing_category = file_request(&mut store, "missing-category", Some("work"));
         let facts_before_missing_category = store.count();
         let missing_category_result = approve_mint_request(
             data_dir.path(),
