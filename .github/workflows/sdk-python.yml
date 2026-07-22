@@ -28,3 +28,7 @@ jobs:
         uses: pypa/gh-action-pypi-publish@v1.14.1 # immutable version tag (Docker action: image is published per version tag, NOT per commit SHA → SHA-pin gives manifest-unknown)
         with:
           packages-dir: sdks/python/dist
+          # The Python SDK has an independent version from daemon tags. Most
+          # daemon releases therefore rebuild the same immutable distribution;
+          # treat an already-published filename as an idempotent no-op.
+          skip-existing: true
