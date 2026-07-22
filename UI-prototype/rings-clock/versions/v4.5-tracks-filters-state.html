@@ -390,31 +390,21 @@ function stepLayout(dt) {
       p.lay.a0 = mix(p.lay.a0, tg.a0, k);
       p.lay.a1 = mix(p.lay.a1, tg.a1, k);
       p.lay.alpha = mix(p.lay.alpha, 1, k);
-    } else if (p.lay) {                            /* exit: farewell wave (play mode), then collapse */
-      const nowS = performance.now() / 1000;
+    } else if (p.lay) {                            /* exit: collapse + flash once */
       if (!p.lay.exiting) {
         p.lay.exiting = true;
-        /* during playback the plan waves goodbye for ~0.5s before leaving;
-           scrubbed jumps skip straight to the collapse */
-        p.lay.exitAt = (playing && !REDUCED) ? nowS : 0;
         const mid = (p.lay.a0 + p.lay.a1) / 2;
         const hue = p.st === 0 ? '#34d399' : p.st === 2 ? '#ef4444' : '#7e8595';
-        flashes.push({ kind: 'exit', ang: mid, t0: nowS, hue });
+        flashes.push({ kind: 'exit', ang: mid, t0: performance.now() / 1000, hue });
       }
-      if (p.lay.exitAt && nowS < p.lay.exitAt + 0.55) {
-        const kw = (nowS - p.lay.exitAt) / 0.55;
-        /* fade out → in → out: two dips over the wave window */
-        p.lay.alpha = 0.25 + 0.75 * Math.abs(Math.cos(kw * Math.PI * 2));
-      } else {
-        const mid = (p.lay.a0 + p.lay.a1) / 2;
-        p.lay.a0 = mix(p.lay.a0, mid, k);
-        p.lay.a1 = mix(p.lay.a1, mid, k);
-        p.lay.alpha = mix(p.lay.alpha, 0, k);
-        if (p.lay.alpha < 0.02) p.lay = null;
-      }
+      const mid = (p.lay.a0 + p.lay.a1) / 2;
+      p.lay.a0 = mix(p.lay.a0, mid, k);
+      p.lay.a1 = mix(p.lay.a1, mid, k);
+      p.lay.alpha = mix(p.lay.alpha, 0, k);
+      if (p.lay.alpha < 0.02) p.lay = null;
     }
     if (p.lay && !targets.get(p.i)) { /* keep exiting */ }
-    else if (p.lay) { p.lay.exiting = false; p.lay.exitAt = 0; }
+    else if (p.lay) p.lay.exiting = false;
   }
 }
 
@@ -484,7 +474,7 @@ function draw(now) {
     if (Math.abs(rot - target) < 0.002) { rot = 0; resetTween = false; }
   }
   if (playing) {
-    T += dt * (E - S) / 24;                        /* full window in ~24s (slowed 25%) */
+    T += dt * (E - S) / 18;                        /* full window in ~18s */
     if (T >= E) { T = E; setPlaying(false); }
     rTime.value = Math.round((T - S) / Math.max(0.5, E - S) * 1000);
     cDate.textContent = dayDate(T);
