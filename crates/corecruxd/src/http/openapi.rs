@@ -45,6 +45,7 @@ use utoipa::OpenApi;
         super::facts::get_facts_by_entity,
         super::facts::query_facts,
         super::facts::export_facts,
+        super::facts::list_facts,
         // Sessions
         super::facts::put_session_state,
         super::facts::get_session_state,
@@ -248,6 +249,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/facts/aggregate", methods: &["POST"], tag: "Facts", auth: "read", summary: "Deterministic 0-LLM aggregate lane" },
     RouteEntry { path: "/v1/facts/entity/{entity}", methods: &["GET"], tag: "Facts", auth: "read", summary: "Facts entity {entity}" },
     RouteEntry { path: "/v1/facts/export", methods: &["GET"], tag: "Facts", auth: "read", summary: "Facts export" },
+    RouteEntry { path: "/v1/facts/list", methods: &["GET"], tag: "Facts", auth: "read", summary: "Facts list (console paged listing)" },
     RouteEntry { path: "/v1/facts/{factId}", methods: &["GET", "DELETE"], tag: "Facts", auth: "read-write", summary: "Facts {factId}" },
     RouteEntry { path: "/v1/features/capabilities", methods: &["GET"], tag: "Features", auth: "read", summary: "Features capabilities" },
     RouteEntry { path: "/v1/features/capabilities/analysis/coverage", methods: &["GET"], tag: "Features", auth: "read", summary: "Features capabilities analysis coverage" },

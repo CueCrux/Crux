@@ -3193,6 +3193,306 @@ async fn export_facts_honors_cursor_and_reports_next_cursor() {
     assert_eq!(body["next_cursor"], facts[0]["fact_id"]);
 }
 
+// ── GET /v1/facts/list (console paged listing, M1) ──────────────────
+
+fn list_facts_params() -> ListFactsParams {
+    ListFactsParams {
+        cursor: None,
+        limit: None,
+        include_reserved: None,
+        include_superseded: None,
+        entity_prefix: None,
+        q: None,
+    }
+}
+
+async fn store_plain_fact(state: &AppState, entity: &str, key: &str, value: &str) -> String {
+    let mut store = state.fact_store.write().await;
+    store
+        .store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: entity.to_string(),
+            key: key.to_string(),
+            value: value.to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        })
+        .fact_id
+}
+
+/// The ordering key each row is sorted by: `(stored_at_unix_ms, fact_id)` DESC.
+fn list_row_key(row: &serde_json::Value) -> (i64, String) {
+    (
+        row["stored_at_unix_ms"].as_i64().expect("stored_at_unix_ms"),
+        row["fact_id"].as_str().expect("fact_id").to_string(),
+    )
+}
+
+#[tokio::test]
+async fn list_facts_paginates_full_store_exactly_once_descending() {
+    let state = test_app_state(16);
+    for i in 0..25 {
+        store_plain_fact(&state, "note", &format!("k{i}"), &format!("v{i}")).await;
+    }
+
+    let mut collected: Vec<serde_json::Value> = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let params = ListFactsParams {
+            cursor: cursor.clone(),
+            limit: Some(10),
+            ..list_facts_params()
+        };
+        let resp = facts::list_facts(State(state.clone()), HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["total_visible"], 25);
+        assert_eq!(body["limit"], 10);
+        let rows = body["facts"].as_array().unwrap().clone();
+        pages += 1;
+        let next = body["next_cursor"].as_str().map(str::to_string);
+        if next.is_some() {
+            assert_eq!(body["has_more"], true);
+            assert_eq!(rows.len(), 10);
+        } else {
+            assert_eq!(body["has_more"], false);
+        }
+        collected.extend(rows);
+        match next {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+
+    assert_eq!(pages, 3, "25 / 10 = 3 pages");
+    assert_eq!(collected.len(), 25);
+    // Every fact exactly once.
+    let ids: std::collections::BTreeSet<String> = collected
+        .iter()
+        .map(|r| r["fact_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids.len(), 25, "no dupes / no gaps across cursor pages");
+    // Strictly descending by (stored_at_unix_ms, fact_id).
+    for pair in collected.windows(2) {
+        assert!(
+            list_row_key(&pair[0]) > list_row_key(&pair[1]),
+            "rows must be strictly descending"
+        );
+    }
+}
+
+#[tokio::test]
+async fn list_facts_excludes_reserved_unless_requested() {
+    let state = test_app_state(16);
+    store_plain_fact(&state, "note", "k", "public-one").await;
+    // `__memory_pin::` is a RESERVED_ENTITY_PREFIXES entry that is NOT in the
+    // force-private DEFAULT_PRIVATE_PREFIXES, so it stays non-private and is
+    // visible once `include_reserved` is set (unlike `__work__::` etc., which
+    // are born private and never surface here).
+    store_plain_fact(&state, "__memory_pin::plan", "k", "reserved-one").await;
+
+    // Default: reserved hidden.
+    let resp = facts::list_facts(State(state.clone()), HeaderMap::new(), Query(list_facts_params()))
+        .await
+        .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["total_visible"], 1);
+    let text = serde_json::to_string(&body["facts"]).unwrap();
+    assert!(text.contains("public-one"));
+    assert!(!text.contains("reserved-one"));
+
+    // include_reserved=1 → both.
+    let params = ListFactsParams {
+        include_reserved: Some("1".to_string()),
+        ..list_facts_params()
+    };
+    let resp = facts::list_facts(State(state.clone()), HeaderMap::new(), Query(params))
+        .await
+        .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["total_visible"], 2);
+    let text = serde_json::to_string(&body["facts"]).unwrap();
+    assert!(text.contains("reserved-one"));
+}
+
+#[tokio::test]
+async fn list_facts_always_excludes_private_and_deleted() {
+    let state = test_app_state(16);
+    store_plain_fact(&state, "note", "shared", "public-value").await;
+    let deleted_id = store_plain_fact(&state, "note", "gone", "deleted-value").await;
+    {
+        let mut store = state.fact_store.write().await;
+        store.delete(&deleted_id);
+        store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: crux_mcp::scope::private_entity_for_agent("alice", "notes"),
+            key: "secret".to_string(),
+            value: "private-value".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: true,
+            horizon_class: None,
+            actor: None,
+        });
+    }
+
+    let resp = facts::list_facts(State(state.clone()), HeaderMap::new(), Query(list_facts_params()))
+        .await
+        .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["total_visible"], 1);
+    // total_nondeleted counts the universe (incl. private) minus tombstones: the
+    // public + the private fact = 2, the deleted one excluded.
+    assert_eq!(body["total_nondeleted"], 2);
+    let text = serde_json::to_string(&body["facts"]).unwrap();
+    assert!(text.contains("public-value"));
+    assert!(!text.contains("deleted-value"));
+    assert!(!text.contains("private-value"));
+}
+
+#[tokio::test]
+async fn list_facts_applies_entity_prefix_and_q_filters() {
+    let state = test_app_state(16);
+    store_plain_fact(&state, "deploy:gpu", "method", "canary rollout").await;
+    store_plain_fact(&state, "deploy:cpu", "method", "blue green").await;
+    store_plain_fact(&state, "testing:e2e", "approach", "canary smoke").await;
+
+    // entity_prefix confines to `deploy:` (2 of 3).
+    let params = ListFactsParams {
+        entity_prefix: Some("deploy:".to_string()),
+        ..list_facts_params()
+    };
+    let resp = facts::list_facts(State(state.clone()), HeaderMap::new(), Query(params))
+        .await
+        .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["total_visible"], 2);
+
+    // q="canary" hits value on deploy:gpu and testing:e2e (2 of 3),
+    // case-insensitively.
+    let params = ListFactsParams {
+        q: Some("CANARY".to_string()),
+        ..list_facts_params()
+    };
+    let resp = facts::list_facts(State(state.clone()), HeaderMap::new(), Query(params))
+        .await
+        .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["total_visible"], 2);
+    let text = serde_json::to_string(&body["facts"]).unwrap();
+    assert!(text.contains("canary rollout"));
+    assert!(text.contains("canary smoke"));
+    assert!(!text.contains("blue green"));
+
+    // entity_prefix + q combined: only deploy:gpu.
+    let params = ListFactsParams {
+        entity_prefix: Some("deploy:".to_string()),
+        q: Some("canary".to_string()),
+        ..list_facts_params()
+    };
+    let resp = facts::list_facts(State(state.clone()), HeaderMap::new(), Query(params))
+        .await
+        .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["total_visible"], 1);
+}
+
+#[tokio::test]
+async fn list_facts_scopes_by_tenant_for_non_admin_context() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        for (tenant, value) in [("default", "default-fact"), ("other", "other-fact")] {
+            store.store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: tenant.to_string(),
+                entity: "note".to_string(),
+                key: "k".to_string(),
+                value: value.to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            });
+        }
+    }
+
+    // Scoped (no passport, query:read) ⇒ read-tenant "default": sees only its own.
+    let resp = facts::list_facts(
+        State(state.clone()),
+        dev_scope_headers("query:read"),
+        Query(list_facts_params()),
+    )
+    .await
+    .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["total_visible"], 1);
+    assert_eq!(body["total_nondeleted"], 1);
+    let text = serde_json::to_string(&body["facts"]).unwrap();
+    assert!(text.contains("default-fact"));
+    assert!(!text.contains("other-fact"));
+
+    // Raw-admin (admin:read, no passport) sees both tenants.
+    let resp = facts::list_facts(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Query(list_facts_params()),
+    )
+    .await
+    .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["total_visible"], 2);
+}
+
+#[tokio::test]
+async fn list_facts_clamps_limit_and_rejects_bad_cursor() {
+    let state = test_app_state(16);
+    for i in 0..3 {
+        store_plain_fact(&state, "note", &format!("k{i}"), &format!("v{i}")).await;
+    }
+
+    // limit above the cap is clamped to 500 (reported), not echoed raw.
+    let params = ListFactsParams {
+        limit: Some(100_000),
+        ..list_facts_params()
+    };
+    let resp = facts::list_facts(State(state.clone()), HeaderMap::new(), Query(params))
+        .await
+        .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["limit"], 500);
+    assert_eq!(body["facts"].as_array().unwrap().len(), 3);
+
+    // limit=0 clamps up to 1.
+    let params = ListFactsParams {
+        limit: Some(0),
+        ..list_facts_params()
+    };
+    let resp = facts::list_facts(State(state.clone()), HeaderMap::new(), Query(params))
+        .await
+        .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["limit"], 1);
+    assert_eq!(body["facts"].as_array().unwrap().len(), 1);
+    assert_eq!(body["has_more"], true);
+
+    // Malformed cursor ⇒ 400 problem response, never a panic.
+    let params = ListFactsParams {
+        cursor: Some("not-a-valid-cursor".to_string()),
+        ..list_facts_params()
+    };
+    let resp = facts::list_facts(State(state.clone()), HeaderMap::new(), Query(params))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
 // ── Session Store (PUT /v1/sessions/{sessionId}/state) ──────────
 
 #[tokio::test]
