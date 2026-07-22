@@ -30,6 +30,10 @@
 #   (serde_json response-body assertions). tests.rs is #[cfg(test)] via an
 #   out-of-file #[path] mod decl so the ratchet counts its unwraps; zero
 #   production-path additions (the recall floor uses Option, no unwrap).
+# 2026-07-22 +3 corecruxd: passport-mint approval HTTP fixture setup in
+#   http/tests.rs (system-time, JWT encoding, and Authorization header
+#   construction). tests.rs is #[cfg(test)] via the out-of-file module above;
+#   zero production-path additions (verified by diff).
 corecrux-frame 0
 corecrux-index 3
 corecrux-memory 0
@@ -41,7 +45,7 @@ corecrux-segment 32
 corecrux-storage 48
 corecrux-types 1
 corecruxctl 9
-corecruxd 774
+corecruxd 777
 crux-claude-hooks 1
 crux-config-wizard 8
 crux-contrib 0

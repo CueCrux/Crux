@@ -1027,6 +1027,7 @@ dependencies = [
  "wasmtime",
  "wat",
  "xxhash-rust",
+ "zeroize",
  "zip",
  "zstd",
 ]

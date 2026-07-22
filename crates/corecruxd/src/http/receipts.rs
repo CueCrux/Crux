@@ -13,6 +13,9 @@ pub(super) struct LocalApprovalReceipt {
     pub(super) request_id: String,
     pub(super) reviewer_passport: String,
     pub(super) decision: String,
+    pub(super) risk_tier: String,
+    pub(super) action_summary: String,
+    pub(super) passport_issued_at_unix_ms: Option<u64>,
     body_bytes: Vec<u8>,
     signature_bytes: Vec<u8>,
     occurred_at: String,
@@ -161,11 +164,32 @@ pub(super) fn local_approval_receipt(
             .get("decision")
             .cloned()
             .ok_or_else(|| "local approval receipt decision is missing".to_string())?;
+        let risk_tier = fields
+            .get("risk_tier")
+            .cloned()
+            .ok_or_else(|| "local approval receipt risk_tier is missing".to_string())?;
+        let action_summary = fields
+            .get("action_summary")
+            .cloned()
+            .ok_or_else(|| "local approval receipt action_summary is missing".to_string())?;
+        for (field, inner) in [("risk_tier", &risk_tier), ("action_summary", &action_summary)] {
+            if let Some(outer) = record.payload.get(field).and_then(serde_json::Value::as_str) {
+                if outer != inner {
+                    return Err(format!("local approval receipt {field} binding mismatch"));
+                }
+            }
+        }
         let candidate = LocalApprovalReceipt {
             observation_id: record.observation_id.clone(),
             request_id,
             reviewer_passport,
             decision,
+            risk_tier,
+            action_summary,
+            passport_issued_at_unix_ms: record
+                .payload
+                .get("passport_issued_at_unix_ms")
+                .and_then(serde_json::Value::as_u64),
             body_bytes,
             signature_bytes,
             occurred_at: verified_at,
@@ -274,7 +298,7 @@ fn local_receipt_payload_response(
 }
 
 fn is_local_approval_receipt_id(receipt_id: &str) -> bool {
-    receipt_id.starts_with("ad_ga_")
+    receipt_id.starts_with("ad_ga_") || receipt_id.starts_with("ad_mr_")
 }
 
 #[utoipa::path(

@@ -10627,6 +10627,131 @@ async fn passport_mint_requests_pending_lists_filed_request_without_minting() {
     assert!(!store.all_facts().any(|fact| fact.entity.starts_with("__passport__::")));
 }
 
+async fn mint_test_state(
+    auth_mode: AuthMode,
+    requester_id: &str,
+    requested_by_passport: &str,
+    requested_category: Option<&str>,
+) -> Result<(AppState, String), Box<dyn std::error::Error>> {
+    let mut state = test_app_state_with_auth(16, auth_mode);
+    bind_test_state_to_root_passport_key(&mut state);
+    state.passport_mint_requests_enabled = true;
+    let request_id = {
+        let mut store = state.fact_store.write().await;
+        crate::mint_requests::file_mint_request(
+            &mut store,
+            requester_id.to_string(),
+            requested_by_passport.to_string(),
+            requested_category.map(str::to_string),
+            None,
+            100,
+        )?
+        .request_id
+    };
+    Ok((state, request_id))
+}
+
+const MINT_TEST_HS256_SECRET: &str = "mint-approval-test-secret-32-bytes-minimum";
+const MINT_TEST_ISSUER: &str = "corecrux-mint-test";
+const MINT_TEST_AUDIENCE: &str = "corecrux";
+
+fn mint_test_verified_app_state(action_max_pending: usize) -> AppState {
+    let mut state = test_app_state_with_auth(action_max_pending, AuthMode::Off);
+    state.auth =
+        crate::auth::Authz::test_hs256(MINT_TEST_HS256_SECRET.as_bytes(), MINT_TEST_ISSUER, MINT_TEST_AUDIENCE);
+    state
+}
+
+fn mint_test_verified_headers(scopes: &str, passport_id: &str) -> HeaderMap {
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_secs()
+        .saturating_add(3_600) as usize;
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &serde_json::json!({
+            "exp": exp,
+            "iss": MINT_TEST_ISSUER,
+            "aud": MINT_TEST_AUDIENCE,
+            "scope": scopes,
+            "tenant_id": "default",
+            "passport_id": passport_id,
+        }),
+        &jsonwebtoken::EncodingKey::from_secret(MINT_TEST_HS256_SECRET.as_bytes()),
+    )
+    .expect("mint approval test JWT");
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}")).expect("bearer header"),
+    );
+    headers
+}
+
+async fn mint_test_verified_state(
+    requester_id: &str,
+    requested_by_passport: &str,
+    requested_category: Option<&str>,
+) -> Result<(AppState, String), Box<dyn std::error::Error>> {
+    let mut state = mint_test_verified_app_state(16);
+    bind_test_state_to_root_passport_key(&mut state);
+    state.passport_mint_requests_enabled = true;
+    let request_id = {
+        let mut store = state.fact_store.write().await;
+        crate::mint_requests::file_mint_request(
+            &mut store,
+            requester_id.to_string(),
+            requested_by_passport.to_string(),
+            requested_category.map(str::to_string),
+            None,
+            100,
+        )?
+        .request_id
+    };
+    Ok((state, request_id))
+}
+
+async fn mint_test_resolve(
+    state: &AppState,
+    request_id: &str,
+    headers: HeaderMap,
+    approver_hint: Option<&str>,
+    category: Option<&str>,
+    approve: bool,
+) -> Response {
+    let body = super::passports::ResolveMintRequestBody {
+        approver_passport: approver_hint.map(str::to_string),
+        category: category.map(str::to_string),
+        name: None,
+    };
+    if approve {
+        super::passports::post_mint_request_approve(
+            State(state.clone()),
+            Path(request_id.to_string()),
+            headers,
+            Json(body),
+        )
+        .await
+        .into_response()
+    } else {
+        super::passports::post_mint_request_reject(
+            State(state.clone()),
+            Path(request_id.to_string()),
+            headers,
+            Json(body),
+        )
+        .await
+        .into_response()
+    }
+}
+
+fn mint_test_observation_count(state: &AppState) -> Result<usize, Box<dyn std::error::Error>> {
+    let path =
+        super::observations::observation_file_path(&state.data_dir, super::approval_receipts::APPROVAL_RECEIPT_SESSION);
+    Ok(super::observations::read_observations_strict(&path)?.len())
+}
+
 #[tokio::test]
 async fn passport_mint_request_flag_off_hides_pending_list() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
@@ -10660,7 +10785,8 @@ async fn passport_mint_request_flag_off_hides_pending_list() {
 
 #[tokio::test]
 async fn passport_mint_request_approve_http_mints_and_attributes_operator() -> Result<(), Box<dyn std::error::Error>> {
-    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let mut state = mint_test_verified_app_state(16);
+    bind_test_state_to_root_passport_key(&mut state);
     state.passport_mint_requests_enabled = true;
     let request_id = {
         let mut store = state.fact_store.write().await;
@@ -10678,9 +10804,9 @@ async fn passport_mint_request_approve_http_mints_and_attributes_operator() -> R
     let resp = super::passports::post_mint_request_approve(
         State(state.clone()),
         Path(request_id.clone()),
-        dev_scope_headers("admin:write"),
+        mint_test_verified_headers("admin:write", "operator-work"),
         Json(super::passports::ResolveMintRequestBody {
-            approver_passport: "operator-work".to_string(),
+            approver_passport: Some("operator-work".to_string()),
             category: Some("work".to_string()),
             name: Some("Codex work agent".to_string()),
         }),
@@ -10694,6 +10820,16 @@ async fn passport_mint_request_approve_http_mints_and_attributes_operator() -> R
     assert_eq!(body["category"], "work");
     assert_eq!(body["minted"], true);
     assert_eq!(body["status"], "approved");
+    assert_eq!(
+        body["receipt_session_id"],
+        super::approval_receipts::APPROVAL_RECEIPT_SESSION
+    );
+    let receipt_id = body["receipt_id"]
+        .as_str()
+        .ok_or_else(|| std::io::Error::other("mint approval receipt_id missing"))?
+        .to_string();
+    assert_eq!(receipt_id, format!("ad_{request_id}"));
+    assert!(body["receipt_record_id"].is_string());
 
     let store = state.fact_store.read().await;
     let passport = crate::passports::get_passport(&store, "codex-work")
@@ -10704,6 +10840,103 @@ async fn passport_mint_request_approve_http_mints_and_attributes_operator() -> R
         .ok_or_else(|| std::io::Error::other("resolved request missing"))?;
     assert_eq!(resolved.status, crate::mint_requests::MINT_REQUEST_STATUS_APPROVED);
     assert_eq!(resolved.resolved_by_passport.as_deref(), Some("operator-work"));
+    assert_eq!(resolved.resolution_receipt_id.as_deref(), Some(receipt_id.as_str()));
+    assert_eq!(resolved.approved_category.as_deref(), Some("work"));
+    assert_eq!(resolved.passport_operation.as_deref(), Some("create"));
+    assert_eq!(
+        resolved.passport_record_hash.as_deref(),
+        body["passport_record_hash"].as_str()
+    );
+    assert_eq!(
+        resolved.passport_mutation_hash.as_deref(),
+        body["passport_mutation_hash"].as_str()
+    );
+    let passport_entity = format!("{}::codex-work", crate::passports::PASSPORT_ENTITY_PREFIX);
+    let passport_fact = store
+        .all_facts()
+        .filter(|fact| fact.entity == passport_entity && fact.key == crate::passports::PASSPORT_RECORD_KEY)
+        .max_by_key(|fact| fact.version)
+        .ok_or_else(|| std::io::Error::other("minted passport fact missing"))?;
+    let request_entity = format!("{}::{request_id}", crate::mint_requests::MINT_REQUEST_ENTITY_PREFIX);
+    let request_fact = store
+        .all_facts()
+        .filter(|fact| fact.entity == request_entity && fact.key == crate::mint_requests::MINT_REQUEST_RECORD_KEY)
+        .max_by_key(|fact| fact.version)
+        .ok_or_else(|| std::io::Error::other("resolved mint request fact missing"))?;
+    for fact in [passport_fact, request_fact] {
+        assert_eq!(fact.actor.as_deref(), Some("operator-work"));
+        assert_eq!(fact.source_receipt.as_deref(), Some(receipt_id.as_str()));
+    }
+    drop(store);
+
+    let follow_up_request_id = {
+        let mut store = state.fact_store.write().await;
+        crate::mint_requests::file_mint_request(
+            &mut store,
+            "codex-work".to_string(),
+            "codex-work".to_string(),
+            Some("work".to_string()),
+            Some("request after receipt-backed resolution".to_string()),
+            101,
+        )?
+        .request_id
+    };
+    assert_ne!(follow_up_request_id, request_id);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(state.data_dir.join("passports/codex-work.key"))?
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    let local = super::receipts::local_approval_receipt(&state, "default", &receipt_id)?
+        .ok_or_else(|| std::io::Error::other("local mint approval receipt missing"))?;
+    assert_eq!(local.reviewer_passport, "operator-work");
+    assert_eq!(local.decision, "approve");
+    assert_eq!(local.risk_tier, "high");
+    assert!(local.action_summary.contains("category=work"));
+    assert!(local.passport_issued_at_unix_ms.is_some());
+
+    let body_response = super::receipts::get_receipt_body_v1(
+        State(state.clone()),
+        Path(receipt_id.clone()),
+        Query(TenantQuery {
+            tenant_id: "default".to_string(),
+        }),
+        mint_test_verified_headers("receipts:read", "operator-work"),
+    )
+    .await
+    .into_response();
+    assert_eq!(body_response.status(), StatusCode::OK);
+    let signature_response = super::receipts::get_receipt_signature_v1(
+        State(state.clone()),
+        Path(receipt_id.clone()),
+        Query(TenantQuery {
+            tenant_id: "default".to_string(),
+        }),
+        mint_test_verified_headers("receipts:read", "operator-work"),
+    )
+    .await
+    .into_response();
+    assert_eq!(signature_response.status(), StatusCode::OK);
+    let verification_response = super::receipts::get_receipt_verification_v1(
+        State(state),
+        Path(receipt_id),
+        Query(TenantQuery {
+            tenant_id: "default".to_string(),
+        }),
+        mint_test_verified_headers("receipts:read", "operator-work"),
+    )
+    .await
+    .into_response();
+    assert_eq!(verification_response.status(), StatusCode::OK);
+    let verification = json_body(verification_response).await;
+    assert_eq!(verification["signature_valid"], true);
+    assert_eq!(verification["error_code"], "OK");
     Ok(())
 }
 
@@ -10711,6 +10944,7 @@ async fn passport_mint_request_approve_http_mints_and_attributes_operator() -> R
 async fn passport_mint_request_resolution_requires_admin_write_without_mutation(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    bind_test_state_to_root_passport_key(&mut state);
     state.passport_mint_requests_enabled = true;
     let request_id = {
         let mut store = state.fact_store.write().await;
@@ -10730,7 +10964,7 @@ async fn passport_mint_request_resolution_requires_admin_write_without_mutation(
         Path(request_id.clone()),
         dev_scope_headers("admin:read"),
         Json(super::passports::ResolveMintRequestBody {
-            approver_passport: "operator-work".to_string(),
+            approver_passport: Some("operator-work".to_string()),
             category: Some("work".to_string()),
             name: None,
         }),
@@ -10744,7 +10978,7 @@ async fn passport_mint_request_resolution_requires_admin_write_without_mutation(
         Path(request_id.clone()),
         dev_scope_headers("admin:read"),
         Json(super::passports::ResolveMintRequestBody {
-            approver_passport: "operator-work".to_string(),
+            approver_passport: Some("operator-work".to_string()),
             category: None,
             name: None,
         }),
@@ -10777,7 +11011,7 @@ async fn passport_mint_request_flag_off_approve_and_reject_are_noops() -> Result
         .request_id
     };
     let body = || super::passports::ResolveMintRequestBody {
-        approver_passport: "operator-work".to_string(),
+        approver_passport: Some("operator-work".to_string()),
         category: Some("work".to_string()),
         name: None,
     };
@@ -10785,7 +11019,7 @@ async fn passport_mint_request_flag_off_approve_and_reject_are_noops() -> Result
     let approve = super::passports::post_mint_request_approve(
         State(state.clone()),
         Path(request_id.clone()),
-        dev_scope_headers("admin:write"),
+        dev_scope_passport_headers("admin:write", "rejecting-operator"),
         Json(body()),
     )
     .await
@@ -10815,7 +11049,8 @@ async fn passport_mint_request_flag_off_approve_and_reject_are_noops() -> Result
 #[tokio::test]
 async fn passport_mint_request_reject_http_mints_nothing_and_attributes_operator(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let mut state = mint_test_verified_app_state(16);
+    bind_test_state_to_root_passport_key(&mut state);
     state.passport_mint_requests_enabled = true;
     let request_id = {
         let mut store = state.fact_store.write().await;
@@ -10833,9 +11068,9 @@ async fn passport_mint_request_reject_http_mints_nothing_and_attributes_operator
     let resp = super::passports::post_mint_request_reject(
         State(state.clone()),
         Path(request_id.clone()),
-        dev_scope_headers("admin:write"),
+        mint_test_verified_headers("admin:write", "rejecting-operator"),
         Json(super::passports::ResolveMintRequestBody {
-            approver_passport: "rejecting-operator".to_string(),
+            approver_passport: Some("rejecting-operator".to_string()),
             category: Some("public".to_string()),
             name: Some("must be ignored".to_string()),
         }),
@@ -10848,6 +11083,15 @@ async fn passport_mint_request_reject_http_mints_nothing_and_attributes_operator
     assert_eq!(body["requester_id"], "rejected-agent");
     assert_eq!(body["minted"], false);
     assert_eq!(body["status"], "rejected");
+    let receipt_id = body["receipt_id"]
+        .as_str()
+        .ok_or_else(|| std::io::Error::other("mint rejection receipt_id missing"))?
+        .to_string();
+    assert_eq!(receipt_id, format!("ad_{request_id}"));
+    assert_eq!(
+        body["receipt_session_id"],
+        super::approval_receipts::APPROVAL_RECEIPT_SESSION
+    );
 
     let store = state.fact_store.read().await;
     assert!(crate::passports::get_passport(&store, "rejected-agent").is_none());
@@ -10855,13 +11099,47 @@ async fn passport_mint_request_reject_http_mints_nothing_and_attributes_operator
         .ok_or_else(|| std::io::Error::other("rejected request missing"))?;
     assert_eq!(request.status, crate::mint_requests::MINT_REQUEST_STATUS_REJECTED);
     assert_eq!(request.resolved_by_passport.as_deref(), Some("rejecting-operator"));
+    assert_eq!(request.resolution_receipt_id.as_deref(), Some(receipt_id.as_str()));
+    assert_eq!(request.approved_category, None);
+    assert_eq!(request.passport_operation, None);
+    assert_eq!(request.passport_record_hash, None);
+    assert_eq!(request.passport_mutation_hash, None);
+    let request_entity = format!("{}::{request_id}", crate::mint_requests::MINT_REQUEST_ENTITY_PREFIX);
+    let request_fact = store
+        .all_facts()
+        .filter(|fact| fact.entity == request_entity && fact.key == crate::mint_requests::MINT_REQUEST_RECORD_KEY)
+        .max_by_key(|fact| fact.version)
+        .ok_or_else(|| std::io::Error::other("rejected mint request fact missing"))?;
+    assert_eq!(request_fact.actor.as_deref(), Some("rejecting-operator"));
+    assert_eq!(request_fact.source_receipt.as_deref(), Some(receipt_id.as_str()));
+    drop(store);
+
+    let local = super::receipts::local_approval_receipt(&state, "default", &receipt_id)?
+        .ok_or_else(|| std::io::Error::other("local mint rejection receipt missing"))?;
+    assert_eq!(local.reviewer_passport, "rejecting-operator");
+    assert_eq!(local.decision, "reject");
+    assert_eq!(local.passport_issued_at_unix_ms, None);
+    let verification_response = super::receipts::get_receipt_verification_v1(
+        State(state),
+        Path(receipt_id),
+        Query(TenantQuery {
+            tenant_id: "default".to_string(),
+        }),
+        mint_test_verified_headers("receipts:read", "rejecting-operator"),
+    )
+    .await
+    .into_response();
+    assert_eq!(verification_response.status(), StatusCode::OK);
+    let verification = json_body(verification_response).await;
+    assert_eq!(verification["signature_valid"], true);
+    assert_eq!(verification["error_code"], "OK");
     Ok(())
 }
 
 #[tokio::test]
 async fn passport_mint_request_approve_http_maps_category_and_terminal_errors_without_minting(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let mut state = mint_test_verified_app_state(16);
     state.passport_mint_requests_enabled = true;
     let (missing_category_id, invalid_category_id, resolved_id) = {
         let mut store = state.fact_store.write().await;
@@ -10869,7 +11147,7 @@ async fn passport_mint_request_approve_http_maps_category_and_terminal_errors_wi
             &mut store,
             "missing-category-agent".to_string(),
             "missing-category-agent".to_string(),
-            None,
+            Some("work".to_string()),
             None,
             100,
         )?;
@@ -10889,7 +11167,13 @@ async fn passport_mint_request_approve_http_maps_category_and_terminal_errors_wi
             None,
             100,
         )?;
-        crate::mint_requests::reject_mint_request(&mut store, &resolved.request_id, "first-operator".to_string(), 200)?;
+        crate::mint_requests::reject_mint_request(
+            &mut store,
+            &resolved.request_id,
+            "first-operator".to_string(),
+            &format!("ad_{}", resolved.request_id),
+            200,
+        )?;
         (missing.request_id, invalid.request_id, resolved.request_id)
     };
 
@@ -10897,9 +11181,9 @@ async fn passport_mint_request_approve_http_maps_category_and_terminal_errors_wi
         super::passports::post_mint_request_approve(
             State(state.clone()),
             Path(request_id),
-            dev_scope_headers("admin:write"),
+            mint_test_verified_headers("admin:write", "operator-work"),
             Json(super::passports::ResolveMintRequestBody {
-                approver_passport: "operator-work".to_string(),
+                approver_passport: Some("operator-work".to_string()),
                 category,
                 name: None,
             }),
@@ -10939,6 +11223,545 @@ async fn passport_mint_request_approve_http_maps_category_and_terminal_errors_wi
     let terminal = crate::mint_requests::get_mint_request(&store, &resolved_id)
         .ok_or_else(|| std::io::Error::other("terminal request missing"))?;
     assert_eq!(terminal.status, crate::mint_requests::MINT_REQUEST_STATUS_REJECTED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn passport_mint_request_denies_missing_spoofed_and_self_reviewer_without_mutation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    for approve in [true, false] {
+        let (state, request_id) =
+            mint_test_state(AuthMode::DevScopes, "requester-a", "requester-a", Some("work")).await?;
+
+        let missing = mint_test_resolve(
+            &state,
+            &request_id,
+            dev_scope_headers("admin:write"),
+            Some("approver-a"),
+            Some("work"),
+            approve,
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+
+        let spoofed = mint_test_resolve(
+            &state,
+            &request_id,
+            dev_scope_passport_headers("admin:write", "approver-a"),
+            Some("approver-b"),
+            Some("work"),
+            approve,
+        )
+        .await;
+        assert_eq!(spoofed.status(), StatusCode::FORBIDDEN);
+
+        let unverified = mint_test_resolve(
+            &state,
+            &request_id,
+            dev_scope_passport_headers("admin:write", "approver-a"),
+            Some("approver-a"),
+            Some("work"),
+            approve,
+        )
+        .await;
+        assert_eq!(unverified.status(), StatusCode::FORBIDDEN);
+
+        let self_review = mint_test_resolve(
+            &state,
+            &request_id,
+            dev_scope_passport_headers("admin:write", "requester-a"),
+            Some("requester-a"),
+            Some("work"),
+            approve,
+        )
+        .await;
+        assert_eq!(self_review.status(), StatusCode::FORBIDDEN);
+        assert_eq!(mint_test_observation_count(&state)?, 0);
+
+        let store = state.fact_store.read().await;
+        let pending = crate::mint_requests::get_mint_request(&store, &request_id)
+            .ok_or_else(|| std::io::Error::other("pending mint request missing"))?;
+        assert_eq!(pending.status, crate::mint_requests::MINT_REQUEST_STATUS_PENDING);
+        assert!(crate::passports::get_passport(&store, "requester-a").is_none());
+        assert!(!state.data_dir.join("passports/requester-a.key").exists());
+
+        let (verified_state, verified_request_id) =
+            mint_test_verified_state("requester-a", "requester-a", Some("work")).await?;
+        let verified_self_review = mint_test_resolve(
+            &verified_state,
+            &verified_request_id,
+            mint_test_verified_headers("admin:write", "requester-a"),
+            Some("requester-a"),
+            Some("work"),
+            approve,
+        )
+        .await;
+        assert_eq!(verified_self_review.status(), StatusCode::FORBIDDEN);
+        assert_eq!(mint_test_observation_count(&verified_state)?, 0);
+        let verified_store = verified_state.fact_store.read().await;
+        let verified_pending = crate::mint_requests::get_mint_request(&verified_store, &verified_request_id)
+            .ok_or_else(|| std::io::Error::other("verified self-review request missing"))?;
+        assert_eq!(
+            verified_pending.status,
+            crate::mint_requests::MINT_REQUEST_STATUS_PENDING
+        );
+        assert!(crate::passports::get_passport(&verified_store, "requester-a").is_none());
+        assert!(!verified_state.data_dir.join("passports/requester-a.key").exists());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn passport_mint_request_auth_off_is_rejected_without_mutation() -> Result<(), Box<dyn std::error::Error>> {
+    for approve in [true, false] {
+        let (state, request_id) = mint_test_state(AuthMode::Off, "requester-a", "requester-a", Some("work")).await?;
+
+        for claimed in [None, Some("requester-a"), Some("approver-a")] {
+            let denied = mint_test_resolve(&state, &request_id, HeaderMap::new(), claimed, Some("work"), approve).await;
+            assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        }
+        assert_eq!(mint_test_observation_count(&state)?, 0);
+
+        let store = state.fact_store.read().await;
+        let pending = crate::mint_requests::get_mint_request(&store, &request_id)
+            .ok_or_else(|| std::io::Error::other("auth-off pending mint request missing"))?;
+        assert_eq!(pending.status, crate::mint_requests::MINT_REQUEST_STATUS_PENDING);
+        assert_eq!(pending.resolved_by_passport, None);
+        assert_eq!(pending.resolution_receipt_id, None);
+        assert!(crate::passports::get_passport(&store, "requester-a").is_none());
+        assert!(!state.data_dir.join("passports/requester-a.key").exists());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn passport_mint_request_jwt_reviewer_binding_denies_body_and_header_impersonation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+    const SECRET: &str = "0123456789abcdef0123456789abcdef";
+    let _secret = EnvVarGuard::set("CORECRUXD_JWT_HS256_SECRET", SECRET);
+    let _issuer = EnvVarGuard::set("CORECRUXD_JWT_ISS", "corecrux-test");
+    let _audience = EnvVarGuard::set("CORECRUXD_JWT_AUD", "corecrux");
+
+    #[derive(serde::Serialize)]
+    struct Claims<'a> {
+        exp: usize,
+        iss: &'a str,
+        aud: &'a str,
+        scope: &'a str,
+        tenant_id: &'a str,
+        passport_id: &'a str,
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let token = encode(
+        &Header::new(Algorithm::HS256),
+        &Claims {
+            exp: now.as_secs().saturating_add(3_600) as usize,
+            iss: "corecrux-test",
+            aud: "corecrux",
+            scope: "admin:write",
+            tenant_id: "default",
+            passport_id: "approver-a",
+        },
+        &EncodingKey::from_secret(SECRET.as_bytes()),
+    )?;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}"))?,
+    );
+
+    let (state, request_id) = mint_test_state(AuthMode::JwtHs256, "requester-a", "requester-a", Some("work")).await?;
+    let spoofed = mint_test_resolve(
+        &state,
+        &request_id,
+        headers.clone(),
+        Some("approver-b"),
+        Some("work"),
+        true,
+    )
+    .await;
+    assert_eq!(spoofed.status(), StatusCode::FORBIDDEN);
+
+    let mut override_headers = headers.clone();
+    override_headers.insert("x-corecrux-passport-id", HeaderValue::from_static("approver-b"));
+    let impersonated = mint_test_resolve(
+        &state,
+        &request_id,
+        override_headers,
+        Some("approver-b"),
+        Some("work"),
+        true,
+    )
+    .await;
+    assert_eq!(impersonated.status(), StatusCode::FORBIDDEN);
+    assert_eq!(mint_test_observation_count(&state)?, 0);
+
+    let accepted = mint_test_resolve(&state, &request_id, headers, None, Some("work"), true).await;
+    assert_eq!(accepted.status(), StatusCode::OK);
+    let body = json_body(accepted).await;
+    let receipt_id = body["receipt_id"]
+        .as_str()
+        .ok_or_else(|| std::io::Error::other("JWT mint receipt id missing"))?;
+    let receipt = super::receipts::local_approval_receipt(&state, "default", receipt_id)?
+        .ok_or_else(|| std::io::Error::other("JWT mint receipt missing"))?;
+    assert_eq!(receipt.reviewer_passport, "approver-a");
+    let store = state.fact_store.read().await;
+    let resolved = crate::mint_requests::get_mint_request(&store, &request_id)
+        .ok_or_else(|| std::io::Error::other("JWT resolved mint request missing"))?;
+    assert_eq!(resolved.resolved_by_passport.as_deref(), Some("approver-a"));
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn passport_mint_request_rejects_agent_token_as_human_approval() -> Result<(), Box<dyn std::error::Error>> {
+    const SECRET: &str = "0123456789abcdef0123456789abcdef";
+    const AGENT_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
+    let _secret = EnvVarGuard::set("CORECRUXD_JWT_HS256_SECRET", SECRET);
+    let _accept = EnvVarGuard::set("CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS", "1");
+    let _tokens = EnvVarGuard::set("CRUX_AGENT_TOKENS", &format!("drivew:{AGENT_TOKEN}"));
+    let _scopes = EnvVarGuard::set("CORECRUXD_AGENT_TOKEN_HTTP_SCOPES", "admin:write");
+    let _tenant = EnvVarGuard::set("CORECRUXD_AGENT_TOKEN_HTTP_TENANT", "default");
+
+    let (state, request_id) = mint_test_state(AuthMode::JwtHs256, "requester-a", "requester-a", Some("work")).await?;
+    for approve in [true, false] {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {AGENT_TOKEN}"))?,
+        );
+        let denied = mint_test_resolve(&state, &request_id, headers, None, Some("work"), approve).await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    }
+    assert_eq!(mint_test_observation_count(&state)?, 0);
+    let store = state.fact_store.read().await;
+    let pending = crate::mint_requests::get_mint_request(&store, &request_id)
+        .ok_or_else(|| std::io::Error::other("agent-token pending mint request missing"))?;
+    assert_eq!(pending.status, crate::mint_requests::MINT_REQUEST_STATUS_PENDING);
+    assert!(crate::passports::get_passport(&store, "requester-a").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn passport_mint_request_receipt_failure_cleans_new_key_and_leaves_request_pending(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (state, request_id) = mint_test_verified_state("requester-a", "requester-a", Some("work")).await?;
+    let receipt_path =
+        super::observations::observation_file_path(&state.data_dir, super::approval_receipts::APPROVAL_RECEIPT_SESSION);
+    std::fs::create_dir_all(&receipt_path)?;
+
+    let failed = mint_test_resolve(
+        &state,
+        &request_id,
+        mint_test_verified_headers("admin:write", "approver-a"),
+        Some("approver-a"),
+        Some("work"),
+        true,
+    )
+    .await;
+    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(!state.data_dir.join("passports/requester-a.key").exists());
+
+    let store = state.fact_store.read().await;
+    let pending = crate::mint_requests::get_mint_request(&store, &request_id)
+        .ok_or_else(|| std::io::Error::other("pending request missing after receipt failure"))?;
+    assert_eq!(pending.status, crate::mint_requests::MINT_REQUEST_STATUS_PENDING);
+    assert!(crate::passports::get_passport(&store, "requester-a").is_none());
+    drop(store);
+
+    let duplicate = {
+        let mut store = state.fact_store.write().await;
+        crate::mint_requests::file_mint_request(
+            &mut store,
+            "requester-a".to_string(),
+            "requester-a".to_string(),
+            Some("work".to_string()),
+            None,
+            101,
+        )
+    };
+    assert!(matches!(
+        duplicate,
+        Err(crate::mint_requests::MintRequestError::AlreadyPending {
+            request_id: duplicate_request_id,
+            ..
+        }) if duplicate_request_id == request_id
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn passport_mint_request_post_append_sync_failure_retains_key_for_exact_retry(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (state, request_id) = mint_test_verified_state("requester-a", "requester-a", Some("work")).await?;
+    let receipt_path =
+        super::observations::observation_file_path(&state.data_dir, super::approval_receipts::APPROVAL_RECEIPT_SESSION);
+    let sync_failure_marker = receipt_path.with_extension("sync-fail");
+    if let Some(parent) = sync_failure_marker.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&sync_failure_marker, b"fail after append")?;
+    let headers = mint_test_verified_headers("admin:write", "approver-a");
+
+    let failed = mint_test_resolve(
+        &state,
+        &request_id,
+        headers.clone(),
+        Some("approver-a"),
+        Some("work"),
+        true,
+    )
+    .await;
+    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(mint_test_observation_count(&state)?, 1);
+    let key_path = state.data_dir.join("passports/requester-a.key");
+    let receipt_bound_key = std::fs::read(&key_path)?;
+    {
+        let store = state.fact_store.read().await;
+        let pending = crate::mint_requests::get_mint_request(&store, &request_id)
+            .ok_or_else(|| std::io::Error::other("pending request missing after receipt sync failure"))?;
+        assert_eq!(pending.status, crate::mint_requests::MINT_REQUEST_STATUS_PENDING);
+        assert!(crate::passports::get_passport(&store, "requester-a").is_none());
+    }
+
+    std::fs::remove_file(&sync_failure_marker)?;
+    let retried = mint_test_resolve(&state, &request_id, headers, Some("approver-a"), Some("work"), true).await;
+    assert_eq!(retried.status(), StatusCode::OK);
+    assert_eq!(mint_test_observation_count(&state)?, 1);
+    assert_eq!(std::fs::read(&key_path)?, receipt_bound_key);
+    let store = state.fact_store.read().await;
+    assert!(crate::passports::get_passport(&store, "requester-a").is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn passport_mint_request_quarantines_torn_receipt_tail_before_approval() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (state, request_id) = mint_test_verified_state("requester-a", "requester-a", Some("work")).await?;
+    let receipt_path =
+        super::observations::observation_file_path(&state.data_dir, super::approval_receipts::APPROVAL_RECEIPT_SESSION);
+    if let Some(parent) = receipt_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&receipt_path, br#"{"observation_id":"torn""#)?;
+
+    let approved = mint_test_resolve(
+        &state,
+        &request_id,
+        mint_test_verified_headers("admin:write", "approver-a"),
+        Some("approver-a"),
+        Some("work"),
+        true,
+    )
+    .await;
+    assert_eq!(approved.status(), StatusCode::OK);
+    assert_eq!(mint_test_observation_count(&state)?, 1);
+    let quarantine_count = std::fs::read_dir(
+        receipt_path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("receipt path parent missing"))?,
+    )?
+    .filter_map(Result::ok)
+    .filter(|entry| entry.file_name().to_string_lossy().contains("jsonl.torn."))
+    .count();
+    assert_eq!(quarantine_count, 1);
+    let store = state.fact_store.read().await;
+    assert!(crate::passports::get_passport(&store, "requester-a").is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn passport_mint_request_reuses_receipt_bound_key_after_fact_journal_failure(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut state = mint_test_verified_app_state(16);
+    bind_test_state_to_root_passport_key(&mut state);
+    state.passport_mint_requests_enabled = true;
+    let fact_dir = state.data_dir.join("mint-fact-journal");
+    let mut persistent_store = corecrux_memory::FactStore::with_persistence(&fact_dir)?;
+    let request_id = crate::mint_requests::file_mint_request(
+        &mut persistent_store,
+        "requester-a".to_string(),
+        "requester-a".to_string(),
+        Some("work".to_string()),
+        None,
+        100,
+    )?
+    .request_id;
+    state.fact_store = Arc::new(RwLock::new(persistent_store));
+
+    let journal_path = fact_dir.join("facts.jsonl");
+    let journal_backup = fact_dir.join("facts.before-failure.jsonl");
+    std::fs::rename(&journal_path, &journal_backup)?;
+    std::fs::create_dir(&journal_path)?;
+    let headers = mint_test_verified_headers("admin:write", "approver-a");
+
+    let failed = mint_test_resolve(
+        &state,
+        &request_id,
+        headers.clone(),
+        Some("approver-a"),
+        Some("work"),
+        true,
+    )
+    .await;
+    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(mint_test_observation_count(&state)?, 1);
+    let key_path = state.data_dir.join("passports/requester-a.key");
+    let receipt_bound_key = std::fs::read(&key_path)?;
+    {
+        let store = state.fact_store.read().await;
+        let pending = crate::mint_requests::get_mint_request(&store, &request_id)
+            .ok_or_else(|| std::io::Error::other("pending request missing after fact failure"))?;
+        assert_eq!(pending.status, crate::mint_requests::MINT_REQUEST_STATUS_PENDING);
+        assert!(crate::passports::get_passport(&store, "requester-a").is_none());
+    }
+    let duplicate = {
+        let mut store = state.fact_store.write().await;
+        crate::mint_requests::file_mint_request(
+            &mut store,
+            "requester-a".to_string(),
+            "requester-a".to_string(),
+            Some("work".to_string()),
+            None,
+            101,
+        )
+    };
+    assert!(matches!(
+        duplicate,
+        Err(crate::mint_requests::MintRequestError::AlreadyPending {
+            request_id: duplicate_request_id,
+            ..
+        }) if duplicate_request_id == request_id
+    ));
+    let receipt_records = super::observations::read_observations_strict(&super::observations::observation_file_path(
+        &state.data_dir,
+        super::approval_receipts::APPROVAL_RECEIPT_SESSION,
+    ))?;
+    let receipt_record_id = receipt_records
+        .first()
+        .ok_or_else(|| std::io::Error::other("orphan mint receipt missing"))?
+        .observation_id
+        .clone();
+
+    std::fs::remove_dir(&journal_path)?;
+    std::fs::rename(&journal_backup, &journal_path)?;
+
+    let changed_category = mint_test_resolve(
+        &state,
+        &request_id,
+        headers.clone(),
+        Some("approver-a"),
+        Some("public"),
+        true,
+    )
+    .await;
+    assert_eq!(changed_category.status(), StatusCode::CONFLICT);
+    let opposite_decision =
+        mint_test_resolve(&state, &request_id, headers.clone(), Some("approver-a"), None, false).await;
+    assert_eq!(opposite_decision.status(), StatusCode::CONFLICT);
+    assert_eq!(mint_test_observation_count(&state)?, 1);
+
+    let retried = mint_test_resolve(&state, &request_id, headers, Some("approver-a"), Some("work"), true).await;
+    assert_eq!(retried.status(), StatusCode::OK);
+    let retried_body = json_body(retried).await;
+    assert_eq!(retried_body["receipt_record_id"], receipt_record_id);
+    assert_eq!(mint_test_observation_count(&state)?, 1);
+    assert_eq!(std::fs::read(&key_path)?, receipt_bound_key);
+
+    let store = state.fact_store.read().await;
+    let resolved = crate::mint_requests::get_mint_request(&store, &request_id)
+        .ok_or_else(|| std::io::Error::other("retried mint request missing"))?;
+    assert_eq!(resolved.status, crate::mint_requests::MINT_REQUEST_STATUS_APPROVED);
+    assert!(crate::passports::get_passport(&store, "requester-a").is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn passport_mint_request_conflicting_approve_cleans_key_after_reject_receipt_failure(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut state = mint_test_verified_app_state(16);
+    bind_test_state_to_root_passport_key(&mut state);
+    state.passport_mint_requests_enabled = true;
+    let fact_dir = state.data_dir.join("reject-fact-journal");
+    let mut persistent_store = corecrux_memory::FactStore::with_persistence(&fact_dir)?;
+    let request_id = crate::mint_requests::file_mint_request(
+        &mut persistent_store,
+        "requester-a".to_string(),
+        "requester-a".to_string(),
+        Some("work".to_string()),
+        None,
+        100,
+    )?
+    .request_id;
+    state.fact_store = Arc::new(RwLock::new(persistent_store));
+    let journal_path = fact_dir.join("facts.jsonl");
+    let journal_backup = fact_dir.join("facts.before-failure.jsonl");
+    std::fs::rename(&journal_path, &journal_backup)?;
+    std::fs::create_dir(&journal_path)?;
+    let headers = mint_test_verified_headers("admin:write", "approver-a");
+
+    let failed_reject = mint_test_resolve(&state, &request_id, headers.clone(), Some("approver-a"), None, false).await;
+    assert_eq!(failed_reject.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(mint_test_observation_count(&state)?, 1);
+    assert!(!state.data_dir.join("passports/requester-a.key").exists());
+    std::fs::remove_dir(&journal_path)?;
+    std::fs::rename(&journal_backup, &journal_path)?;
+
+    let conflicting_approve = mint_test_resolve(
+        &state,
+        &request_id,
+        headers.clone(),
+        Some("approver-a"),
+        Some("work"),
+        true,
+    )
+    .await;
+    assert_eq!(conflicting_approve.status(), StatusCode::CONFLICT);
+    let facts = state.fact_store.read().await;
+    assert!(crate::passports::get_passport(&facts, "requester-a").is_none());
+    drop(facts);
+    assert!(!state.data_dir.join("passports/requester-a.key").exists());
+
+    let retried_reject = mint_test_resolve(&state, &request_id, headers, Some("approver-a"), None, false).await;
+    assert_eq!(retried_reject.status(), StatusCode::OK);
+    assert_eq!(mint_test_observation_count(&state)?, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn passport_mint_request_concurrent_opposite_decisions_have_one_winner() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (state, request_id) = mint_test_verified_state("requester-a", "requester-a", Some("work")).await?;
+    let headers = mint_test_verified_headers("admin:write", "approver-a");
+    let approve = mint_test_resolve(
+        &state,
+        &request_id,
+        headers.clone(),
+        Some("approver-a"),
+        Some("work"),
+        true,
+    );
+    let reject = mint_test_resolve(&state, &request_id, headers, Some("approver-a"), None, false);
+    let (approve, reject) = tokio::join!(approve, reject);
+    let mut statuses = [approve.status(), reject.status()];
+    statuses.sort();
+    assert_eq!(statuses, [StatusCode::OK, StatusCode::CONFLICT]);
+    assert_eq!(mint_test_observation_count(&state)?, 1);
+
+    let store = state.fact_store.read().await;
+    let resolved = crate::mint_requests::get_mint_request(&store, &request_id)
+        .ok_or_else(|| std::io::Error::other("concurrently resolved mint request missing"))?;
+    assert!(matches!(
+        resolved.status.as_str(),
+        crate::mint_requests::MINT_REQUEST_STATUS_APPROVED | crate::mint_requests::MINT_REQUEST_STATUS_REJECTED
+    ));
+    assert_eq!(
+        crate::passports::get_passport(&store, "requester-a").is_some(),
+        resolved.status == crate::mint_requests::MINT_REQUEST_STATUS_APPROVED
+    );
     Ok(())
 }
 

@@ -19,15 +19,17 @@
 #![allow(clippy::option_option)] // PATCH tri-state semantics: outer Some=present, inner None=clear, inner Some=set
 
 use std::fs;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 
 use corecrux_memory::fact_store::{FactQuery, FactStore, StoreFact};
 use crux_session::LocalPassportKey;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 pub const PASSPORT_ENTITY_PREFIX: &str = "__passport__";
 pub const PASSPORT_RECORD_KEY: &str = "record";
@@ -143,11 +145,229 @@ pub struct CreatePassportInput {
     pub notes: Option<String>,
 }
 
+/// A normalized passport mutation prepared for the mint-request approval
+/// transaction. No fact-store state has changed yet. A newly generated key is
+/// tracked so callers can remove it if the approval receipt is not persisted.
+pub(crate) struct PreparedPassportWrite {
+    pub store_facts: Vec<StoreFact>,
+    pub operation: &'static str,
+    pub record_hash: String,
+    pub mutation_hash: String,
+    created_key_path: Option<PathBuf>,
+}
+
+impl PreparedPassportWrite {
+    pub(crate) fn cleanup_uncommitted_key(&self) -> std::io::Result<()> {
+        let Some(path) = self.created_key_path.as_deref() else {
+            return Ok(());
+        };
+        cleanup_created_key_path(path)
+    }
+}
+
+fn cleanup_created_key_path(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {
+            if let Some(parent) = path.parent() {
+                fs::File::open(parent)?.sync_all()?;
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+/// Load an existing seed through an opened file handle, then verify that the
+/// path still names that same regular file. On Unix the inode/device check
+/// closes the symlink-swap window without relying on a path-based second read.
+fn load_existing_passport_key(path: &Path) -> Result<LocalPassportKey, PassportsError> {
+    let mut file = fs::OpenOptions::new().read(true).open(path)?;
+    let opened = file.metadata()?;
+    if !opened.file_type().is_file() {
+        return Err(PassportsError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("passport key path is not a regular file: {}", path.display()),
+        )));
+    }
+    #[cfg(unix)]
+    {
+        let current = fs::symlink_metadata(path)?;
+        if current.file_type().is_symlink()
+            || !current.file_type().is_file()
+            || current.dev() != opened.dev()
+            || current.ino() != opened.ino()
+        {
+            return Err(PassportsError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("passport key path changed during secure open: {}", path.display()),
+            )));
+        }
+        if opened.permissions().mode() & 0o077 != 0 {
+            return Err(PassportsError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("passport key permissions are broader than 0600: {}", path.display()),
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let current = fs::symlink_metadata(path)?;
+        if current.file_type().is_symlink() || !current.file_type().is_file() {
+            return Err(PassportsError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("passport key path changed during secure open: {}", path.display()),
+            )));
+        }
+    }
+    if opened.len() > 128 {
+        return Err(PassportsError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("passport key file is oversized: {}", path.display()),
+        )));
+    }
+
+    let mut encoded = Zeroizing::new(Vec::with_capacity(opened.len() as usize));
+    file.read_to_end(&mut encoded)?;
+    let Some(first) = encoded.iter().position(|byte| !byte.is_ascii_whitespace()) else {
+        return Err(PassportsError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("passport key file is empty: {}", path.display()),
+        )));
+    };
+    let Some(last) = encoded.iter().rposition(|byte| !byte.is_ascii_whitespace()) else {
+        return Err(PassportsError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("passport key file is empty: {}", path.display()),
+        )));
+    };
+    let encoded_seed = &encoded[first..=last];
+    if encoded_seed.len() != 64 {
+        return Err(PassportsError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("passport key seed has invalid length: {}", path.display()),
+        )));
+    }
+    let mut seed = Zeroizing::new([0_u8; 32]);
+    hex::decode_to_slice(encoded_seed, seed.as_mut()).map_err(|err| {
+        PassportsError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("passport key seed is not valid hex: {err}"),
+        ))
+    })?;
+    LocalPassportKey::from_seed(*seed).map_err(|err| PassportsError::Session(err.to_string()))
+}
+
+fn load_existing_passport_key_after_create_race(path: &Path) -> Result<LocalPassportKey, PassportsError> {
+    for attempt in 0..50 {
+        match load_existing_passport_key(path) {
+            Ok(key) => return Ok(key),
+            Err(PassportsError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof && attempt < 49 => {
+                std::thread::yield_now();
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    unreachable!("bounded key-load loop returns on its final attempt")
+}
+
 /// Normalise an optional free-text metadata field: trim, drop if empty, cap at
 /// `MAX_PASSPORT_META_CHARS` so notes can't bloat the record.
 fn clean_meta(v: Option<String>) -> Option<String> {
     v.map(|s| s.trim().chars().take(MAX_PASSPORT_META_CHARS).collect::<String>())
         .filter(|s| !s.is_empty())
+}
+
+/// Prepare the exact passport record authorized by a mint-request approval.
+/// The returned facts carry identical reviewer/receipt attribution and can be
+/// appended alongside the terminal request fact as one `StoreBatch`.
+#[allow(clippy::too_many_arguments)] // The receipt-bound mutation fields remain explicit for auditability.
+pub(crate) fn prepare_mint_passport_write(
+    data_dir: &Path,
+    store: &FactStore,
+    requester_id: &str,
+    category: &str,
+    name: Option<String>,
+    actor: &str,
+    source_receipt: &str,
+    now_unix_ms: u64,
+) -> Result<PreparedPassportWrite, PassportsError> {
+    validate_id(requester_id)?;
+    validate_category(category)?;
+
+    let (record, operation, created_key_path, mut related_records) =
+        if let Some(mut record) = get_passport(store, requester_id) {
+            let category_changed = record.category != category;
+            record.category = category.to_string();
+            if let Some(name) = name {
+                record.name = clean_meta(Some(name));
+            }
+            let related_records = if record.is_default_for_category && category_changed {
+                list_passports(store, Some(category))
+                    .into_iter()
+                    .filter(|candidate| candidate.is_default_for_category && candidate.id != record.id)
+                    .map(|mut candidate| {
+                        candidate.is_default_for_category = false;
+                        candidate
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (record, "update", None, related_records)
+        } else {
+            let (key, created_key_path) = generate_keypair_for_passport_tracked(data_dir, requester_id)?;
+            let record = PassportRecord {
+                id: requester_id.to_string(),
+                principal_id: key.passport_fpr().to_string(),
+                public_key_hex: key.public_key_hex().to_string(),
+                category: category.to_string(),
+                sponsor_id: None,
+                reputation_tier: default_tier(),
+                receipt_count: 0,
+                agent_work_gate: false,
+                is_default_for_category: false,
+                name: clean_meta(name),
+                owner: None,
+                position: None,
+                company: None,
+                notes: None,
+                issued_at_unix_ms: now_unix_ms,
+            };
+            (record, "create", created_key_path, Vec::new())
+        };
+
+    let mut build = || -> Result<(Vec<StoreFact>, String, String), PassportsError> {
+        let mut mutation_records = related_records.clone();
+        mutation_records.push(record.clone());
+        mutation_records.sort_by(|a, b| a.id.cmp(&b.id));
+        let mutation_bytes = serde_json::to_vec(&mutation_records)?;
+        let mutation_hash = format!("blake3:{}", hex::encode(blake3::hash(&mutation_bytes).as_bytes()));
+        let mut store_facts = Vec::with_capacity(related_records.len().saturating_add(1));
+        for related in related_records.drain(..) {
+            store_facts.push(record_store_fact(&related, Some(actor), Some(source_receipt))?);
+        }
+        store_facts.push(record_store_fact(&record, Some(actor), Some(source_receipt))?);
+        let record_bytes = serde_json::to_vec(&record)?;
+        let record_hash = format!("blake3:{}", hex::encode(blake3::hash(&record_bytes).as_bytes()));
+        Ok((store_facts, record_hash, mutation_hash))
+    };
+
+    match build() {
+        Ok((store_facts, record_hash, mutation_hash)) => Ok(PreparedPassportWrite {
+            store_facts,
+            operation,
+            record_hash,
+            mutation_hash,
+            created_key_path,
+        }),
+        Err(err) => {
+            if let Some(path) = created_key_path.as_deref() {
+                let _ = fs::remove_file(path);
+            }
+            Err(err)
+        }
+    }
 }
 
 pub fn list_passports(store: &FactStore, category_filter: Option<&str>) -> Vec<PassportRecord> {
@@ -190,7 +410,7 @@ pub fn create_passport(
     if get_passport(store, &input.id).is_some() {
         return Err(PassportsError::DuplicateId(input.id));
     }
-    let key = generate_keypair_for_passport(data_dir, &input.id)?;
+    let (key, created_key_path) = generate_keypair_for_passport_tracked(data_dir, &input.id)?;
     let record = PassportRecord {
         id: input.id.clone(),
         principal_id: key.passport_fpr().to_string(),
@@ -211,7 +431,16 @@ pub fn create_passport(
     if record.is_default_for_category {
         clear_default_for_category(store, &record.category, &record.id);
     }
-    write_record(store, &record)?;
+    if let Err(store_err) = write_record(store, &record) {
+        if let Some(path) = created_key_path.as_deref() {
+            cleanup_created_key_path(path).map_err(|cleanup_err| {
+                PassportsError::Io(std::io::Error::other(format!(
+                    "passport fact write failed ({store_err}); key cleanup failed ({cleanup_err})"
+                )))
+            })?;
+        }
+        return Err(store_err);
+    }
     Ok(record)
 }
 
@@ -360,41 +589,99 @@ fn clear_default_for_category(store: &mut FactStore, category: &str, except_id: 
 }
 
 fn write_record(store: &mut FactStore, record: &PassportRecord) -> Result<(), PassportsError> {
+    let fact = record_store_fact(record, None, None)?;
+    store.try_store(fact)?;
+    Ok(())
+}
+
+fn record_store_fact(
+    record: &PassportRecord,
+    actor: Option<&str>,
+    source_receipt: Option<&str>,
+) -> Result<StoreFact, PassportsError> {
     let value = serde_json::to_string(record)?;
     let mut sf = StoreFact {
         tenant_hash: "default".to_string(),
         entity: format!("{PASSPORT_ENTITY_PREFIX}::{}", record.id),
         key: PASSPORT_RECORD_KEY.to_string(),
         value,
-        source_receipt: None,
+        source_receipt: source_receipt.map(str::to_string),
         confidence: 1.0,
         private: false,
         horizon_class: None,
-        actor: None,
+        actor: actor.map(str::to_string),
     };
     crate::fact_privacy::enforce_global(&mut sf);
-    store.store(sf);
-    Ok(())
+    Ok(sf)
 }
 
-fn generate_keypair_for_passport(data_dir: &Path, id: &str) -> Result<LocalPassportKey, PassportsError> {
+/// Create a passport seed without clobbering an existing file. Newly-created
+/// key material is written mode-0600, fsynced, and followed by a directory
+/// sync before its public identity is used in a fact.
+fn generate_keypair_for_passport_tracked(
+    data_dir: &Path,
+    id: &str,
+) -> Result<(LocalPassportKey, Option<PathBuf>), PassportsError> {
     let path = passport_seed_path(data_dir, id);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    if !path.exists() {
-        let mut seed = [0u8; 32];
-        rand::rng().fill_bytes(&mut seed);
-        let hex_seed = hex::encode(seed);
-        fs::write(&path, hex_seed)?;
-        #[cfg(unix)]
-        {
-            let mut perms = fs::metadata(&path)?.permissions();
-            perms.set_mode(0o600);
-            fs::set_permissions(&path, perms)?;
+
+    if let Ok(metadata) = fs::symlink_metadata(&path) {
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return Err(PassportsError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("passport key path is not a regular file: {}", path.display()),
+            )));
         }
+        let key = load_existing_passport_key_after_create_race(&path)?;
+        return Ok((key, None));
     }
-    LocalPassportKey::from_path(&path).map_err(|e| PassportsError::Session(e.to_string()))
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    match options.open(&path) {
+        Ok(mut file) => {
+            let result = (|| -> Result<LocalPassportKey, PassportsError> {
+                let mut seed = Zeroizing::new([0_u8; 32]);
+                rand::rng().fill_bytes(seed.as_mut());
+                let mut encoded = Zeroizing::new([0_u8; 64]);
+                hex::encode_to_slice(seed.as_ref(), encoded.as_mut()).map_err(|err| {
+                    PassportsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("encode passport seed: {err}"),
+                    ))
+                })?;
+                file.write_all(encoded.as_ref())?;
+                file.sync_all()?;
+                if let Some(parent) = path.parent() {
+                    fs::File::open(parent)?.sync_all()?;
+                }
+                LocalPassportKey::from_seed(*seed).map_err(|err| PassportsError::Session(err.to_string()))
+            })();
+            match result {
+                Ok(key) => Ok((key, Some(path))),
+                Err(err) => {
+                    let _ = fs::remove_file(&path);
+                    Err(err)
+                }
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                return Err(PassportsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("passport key path is not a regular file: {}", path.display()),
+                )));
+            }
+            let key = load_existing_passport_key_after_create_race(&path)?;
+            Ok((key, None))
+        }
+        Err(err) => Err(PassportsError::Io(err)),
+    }
 }
 
 fn passport_seed_path(data_dir: &Path, id: &str) -> PathBuf {
@@ -459,6 +746,30 @@ mod tests {
         let listed = list_passports(&store, None);
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, "alice");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracked_key_creation_rejects_symlinks_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir("key-symlink");
+        let passports_dir = dir.join("passports");
+        fs::create_dir_all(&passports_dir).expect("passports dir");
+        let target = dir.join("outside.key");
+        fs::write(&target, "do-not-touch").expect("target fixture");
+        symlink(&target, passports_dir.join("alice.key")).expect("key symlink fixture");
+
+        let err = match generate_keypair_for_passport_tracked(&dir, "alice") {
+            Ok(_) => panic!("symlink must fail closed"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, PassportsError::Io(_)));
+        assert_eq!(
+            fs::read_to_string(&target).expect("target remains readable"),
+            "do-not-touch"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -71,6 +71,7 @@ opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"], optional = true
 opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"], optional = true }
 uuid = { workspace = true, features = ["v4"] }
 url = { workspace = true }
+zeroize = "1.8"
 zstd = { workspace = true }
 zip = { workspace = true, features = ["default"] }
 
