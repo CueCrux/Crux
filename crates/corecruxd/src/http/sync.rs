@@ -39,7 +39,7 @@
 //! enabled **before** the issuer (CruxEngine) mints any `rcx-ct/1.1`
 //! sync-delegation token (mint-before-verify): an old verifier rejecting a
 //! delegation token is the safe direction, a new mint against an old verifier is
-//! not. See `PlanCrux/.agent/artifacts/sync-delegation-convention-2026-07-22.md`.
+//! not.
 
 use super::*;
 use base64::Engine as _;
