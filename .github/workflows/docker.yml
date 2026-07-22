@@ -15,6 +15,11 @@ on:
       - "Dockerfile"
       - ".dockerignore"
       - ".github/workflows/docker.yml"
+  # Floating aliases move only after the complete Release workflow succeeds.
+  # The promotion job never checks out or executes code from the release ref.
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       skip_trivy_gate:
@@ -51,6 +56,7 @@ env:
 jobs:
   build-and-push:
     name: Build and Push Docker Image
+    if: github.event_name != 'workflow_run'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -70,8 +76,9 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           # Tag policy:
-          #   - Releases (git tag v*) publish semver tags (`X.Y.Z`, `X.Y`) and
-          #     `latest`. `latest` therefore means "last released version".
+          #   - Release tag builds publish only the immutable `X.Y.Z` tag.
+          #     The promotion job below moves `X.Y` and `latest` only after the
+          #     complete Release workflow and its acceptance assets succeed.
           #   - Merges to main publish `edge` (main-tip), NOT `latest`, so
           #     deployers can opt into bleeding-edge without disturbing `latest`.
           # `enable={{is_default_branch}}` is true for both default-branch
@@ -79,8 +86,6 @@ jobs:
           # semver/raw `type` filters keep each tag scoped to the right event.
           tags: |
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
 
       # --- Supply-chain scan gate (ExecPlan crux-supply-chain-attestation-2026-06-11, M2) ---
@@ -237,3 +242,187 @@ jobs:
             --type cyclonedx \
             --predicate crux-daemon-image.cdx.json \
             "$IMAGE_DIGEST_REF"
+
+  # `vX.Y` and `latest` are release acceptance aliases, not build aliases.
+  # workflow_run carries a privileged token, so this job treats its payload as
+  # untrusted metadata: it never checks out the release ref, requires an exact
+  # stable-semver tag, binds the tag and image to the completed run SHA, and
+  # verifies the signed immutable image before promoting its digest.
+  promote-release-aliases:
+    name: Promote accepted release aliases
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.path == '.github/workflows/release.yml' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      startsWith(github.event.workflow_run.head_branch, 'v')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: docker-release-alias-promotion
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    env:
+      RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+      RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+      REPOSITORY: ${{ github.repository }}
+      IMAGE_REPO: ghcr.io/cuecrux/crux-daemon
+    steps:
+      - name: Validate completed release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Only stable vX.Y.Z releases may move floating aliases: $RELEASE_TAG"
+            exit 1
+          fi
+
+          tag_sha="$(gh api "repos/$REPOSITORY/commits/$RELEASE_TAG" --jq '.sha')"
+          if [ "$tag_sha" != "$RELEASE_SHA" ]; then
+            echo "::error::Release tag resolves to $tag_sha, expected completed run SHA $RELEASE_SHA"
+            exit 1
+          fi
+
+          release="$(gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG")"
+          jq -e --arg tag "$RELEASE_TAG" \
+            '.tag_name == $tag and (.draft == false) and (.prerelease == false)' \
+            <<<"$release" >/dev/null || {
+              echo "::error::$RELEASE_TAG is not an accepted stable release"
+              exit 1
+            }
+
+          for asset in multiple.intoto.jsonl update-manifest.json; do
+            jq -e --arg asset "$asset" \
+              'any(.assets[]; .name == $asset)' <<<"$release" >/dev/null || {
+                echo "::error::Accepted release is missing required asset: $asset"
+                exit 1
+              }
+          done
+
+          accepted_tags="$(gh api --paginate \
+            "repos/$REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.draft == false and .prerelease == false) | select(any(.assets[]; .name == "multiple.intoto.jsonl")) | select(any(.assets[]; .name == "update-manifest.json")) | .tag_name')"
+          highest_accepted="$(
+            while IFS= read -r tag; do
+              if [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+                printf '%s\n' "$tag"
+              fi
+            done <<<"$accepted_tags" | sort -V | tail -n 1
+          )"
+          if [ "$highest_accepted" != "$RELEASE_TAG" ]; then
+            echo "::error::$RELEASE_TAG is not the highest accepted stable release ($highest_accepted)"
+            exit 1
+          fi
+
+      - name: Log in to GHCR
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Verify immutable image and promote exact digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          version="${RELEASE_TAG#v}"
+          minor="${version%.*}"
+          image_tag="$IMAGE_REPO:$version"
+          digest="$(docker buildx imagetools inspect "$image_tag" \
+            --format '{{json .Manifest.Digest}}' | jq -er '.')"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Immutable image returned an invalid digest: $digest"
+            exit 1
+          fi
+
+          digest_ref="$IMAGE_REPO@$digest"
+          revision="$(docker buildx imagetools inspect "$digest_ref" \
+            --format '{{json .Image.Config.Labels}}' \
+            | jq -er '."org.opencontainers.image.revision"')"
+          if [ "$revision" != "$RELEASE_SHA" ]; then
+            echo "::error::Image revision $revision does not match release SHA $RELEASE_SHA"
+            exit 1
+          fi
+
+          identity="https://github.com/$REPOSITORY/.github/workflows/docker.yml@refs/tags/$RELEASE_TAG"
+          issuer="https://token.actions.githubusercontent.com"
+          cosign verify \
+            --certificate-identity "$identity" \
+            --certificate-oidc-issuer "$issuer" \
+            "$digest_ref" >/dev/null
+          cosign verify-attestation \
+            --type cyclonedx \
+            --certificate-identity "$identity" \
+            --certificate-oidc-issuer "$issuer" \
+            "$digest_ref" >/dev/null
+
+          # Re-evaluate accepted-release monotonicity immediately before the
+          # registry mutation. The job-level concurrency group serializes all
+          # promoters; this second check also catches a newer Release workflow
+          # completing while signature verification was in progress.
+          accepted_tags="$(gh api --paginate \
+            "repos/$REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.draft == false and .prerelease == false) | select(any(.assets[]; .name == "multiple.intoto.jsonl")) | select(any(.assets[]; .name == "update-manifest.json")) | .tag_name')"
+          highest_accepted="$(
+            while IFS= read -r tag; do
+              if [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+                printf '%s\n' "$tag"
+              fi
+            done <<<"$accepted_tags" | sort -V | tail -n 1
+          )"
+          if [ "$highest_accepted" != "$RELEASE_TAG" ]; then
+            echo "::error::Refusing stale promotion: highest accepted release is $highest_accepted"
+            exit 1
+          fi
+
+          # GitHub release metadata is not the only monotonic anchor. `latest`
+          # exists for this established package and is the global registry
+          # watermark. Any inspection/auth/network error is fatal; treating it
+          # as an absent alias would turn an outage into a downgrade bypass.
+          if ! current_labels="$(docker buildx imagetools inspect \
+            "$IMAGE_REPO:latest" \
+            --format '{{json .Image.Config.Labels}}')"; then
+            echo "::error::Cannot inspect the existing latest alias; refusing promotion"
+            exit 1
+          fi
+          if ! current_version="$(jq -er '."org.opencontainers.image.version"' \
+            <<<"$current_labels")"; then
+            echo "::error::Existing latest alias has no verifiable OCI version label"
+            exit 1
+          fi
+          current_version="${current_version#v}"
+          if [[ ! "$current_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Existing latest alias has invalid stable version: $current_version"
+            exit 1
+          fi
+          newest="$(printf '%s\n%s\n' "$current_version" "$version" | sort -V | tail -n 1)"
+          if [ "$newest" != "$version" ]; then
+            echo "::error::Refusing to downgrade latest from $current_version to $version"
+            exit 1
+          fi
+
+          docker buildx imagetools create --prefer-index=false \
+            --tag "$IMAGE_REPO:$minor" \
+            --tag "$IMAGE_REPO:latest" \
+            "$digest_ref"
+
+          for alias in "$minor" latest; do
+            alias_digest="$(docker buildx imagetools inspect "$IMAGE_REPO:$alias" \
+              --format '{{json .Manifest.Digest}}' | jq -er '.')"
+            if [ "$alias_digest" != "$digest" ]; then
+              echo "::error::$alias resolved to $alias_digest after promotion, expected $digest"
+              exit 1
+            fi
+          done
