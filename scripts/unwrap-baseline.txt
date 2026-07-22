@@ -34,6 +34,11 @@
 #   http/tests.rs (system-time, JWT encoding, and Authorization header
 #   construction). tests.rs is #[cfg(test)] via the out-of-file module above;
 #   zero production-path additions (verified by diff).
+# 2026-07-22 +17 corecruxd: macaroon M3′ recipient-bound delegation HTTP tests in
+#   http/tests.rs (sync-delegation base/token/header builders + 8 adversarial
+#   gate tests) — #[cfg(test)] only, counted because tests.rs is an out-of-file
+#   #[path] mod; zero production-path additions (require_sync_peer /
+#   verify_sync_delegation use Result/Option, no unwrap/expect).
 corecrux-frame 0
 corecrux-index 3
 corecrux-memory 0
@@ -45,7 +50,7 @@ corecrux-segment 32
 corecrux-storage 48
 corecrux-types 1
 corecruxctl 9
-corecruxd 777
+corecruxd 794
 crux-claude-hooks 1
 crux-config-wizard 8
 crux-contrib 0

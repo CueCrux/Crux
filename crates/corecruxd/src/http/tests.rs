@@ -342,6 +342,389 @@ async fn sync_mutual_auth_flag_off_preserves_scope_auth_and_hides_nonce() {
     assert_eq!(manifest_response.status(), StatusCode::OK);
 }
 
+// --- M3′: recipient-bound v1.1 delegation at the sync boundary --------------
+
+/// A CruxEngine-issued sync-delegation base token per the 2026-07-22 convention:
+/// `rcx-ct/1.1`, `crux-sync` backend granting `corecrux.sync.pull|push`
+/// (attestation `passport_bound`), CruxSync PoP policy allowing `delegate`.
+/// Returns `(issuer, subject, delegate, base_token)`.
+fn sync_delegation_base_token(
+    tenant_id: &str,
+) -> (
+    SigningKey,
+    SigningKey,
+    SigningKey,
+    rcx_capability_token::RcxCapabilityToken,
+) {
+    use rcx_capability_token::{
+        DataEgressClass, DelegationAudience, DelegationPolicy, DelegationPresentation, PermittedCapability,
+        RCX_CT_DELEGATION_SPEC_VERSION, RCX_SYNC_BACKEND_ID, RCX_SYNC_PASSPORT_ATTESTATION, RCX_SYNC_PULL_CAPABILITY,
+        RCX_SYNC_PUSH_CAPABILITY,
+    };
+    let issuer = SigningKey::from_bytes(&[0x41; 32]);
+    let subject = SigningKey::from_bytes(&[0x42; 32]);
+    let delegate = SigningKey::from_bytes(&[0x43; 32]);
+    let issuer_fpr = sync_test_passport_fpr(&issuer.verifying_key().to_bytes());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock")
+        .as_secs();
+    let mut token = rcx_capability_token::free_local_verified_fixture();
+    token.spec_version = RCX_CT_DELEGATION_SPEC_VERSION.to_string();
+    token.token_id = "rcxct_sync_delegation_http_test".to_string();
+    token.issued_at = now.saturating_sub(60);
+    token.refresh_hint_at = now.saturating_add(1_800);
+    token.expires_at = now.saturating_add(3_600);
+    token.subject.passport_fpr = sync_test_passport_fpr(&subject.verifying_key().to_bytes());
+    token.tenant_scope.tenant_id = tenant_id.to_string();
+    token.issuer.passport_kid.clone_from(&issuer_fpr);
+    token.signature.kid.clone_from(&issuer_fpr);
+    token.backends[0].backend_id = RCX_SYNC_BACKEND_ID.to_string();
+    token.backends[0].trust_root_kid.clone_from(&issuer_fpr);
+    token.backends[0].permitted_capabilities = vec![
+        PermittedCapability {
+            capability: RCX_SYNC_PULL_CAPABILITY.to_string(),
+            data_egress_classes: vec![DataEgressClass::None],
+            required_attestations: vec![RCX_SYNC_PASSPORT_ATTESTATION.to_string()],
+            credit_cost: None,
+        },
+        PermittedCapability {
+            capability: RCX_SYNC_PUSH_CAPABILITY.to_string(),
+            data_egress_classes: vec![DataEgressClass::None],
+            required_attestations: vec![RCX_SYNC_PASSPORT_ATTESTATION.to_string()],
+            credit_cost: None,
+        },
+    ];
+    token.delegation_policy = Some(DelegationPolicy {
+        presentation: DelegationPresentation::ProofOfPossession,
+        max_depth: 1,
+        audience: DelegationAudience::CruxSync,
+        allowed_delegate_fprs: vec![sync_test_passport_fpr(&delegate.verifying_key().to_bytes())],
+    });
+    token.signature.sig = issuer.sign(&token.token_hash()).to_bytes();
+    (issuer, subject, delegate, token)
+}
+
+fn sync_delegated_token(
+    base: &rcx_capability_token::RcxCapabilityToken,
+    subject: &SigningKey,
+    delegate: &SigningKey,
+    caveats: Vec<rcx_capability_token::Caveat>,
+) -> rcx_capability_token::RcxCapabilityToken {
+    base.attenuate_for(caveats, delegate.verifying_key().to_bytes(), "delegation-1", subject)
+        .expect("attenuate_for")
+}
+
+/// Recipient (`delegate`) presentation headers: the proof is signed over the
+/// exact `AttenuationContext` the sync boundary builds for `(tenant, capability)`.
+fn sync_delegation_headers(
+    token: &rcx_capability_token::RcxCapabilityToken,
+    delegate: &SigningKey,
+    nonce: &[u8],
+    tenant_id: &str,
+    capability: &str,
+) -> HeaderMap {
+    use rcx_capability_token::{
+        presentation_proof_message, AttenuationContext, DelegationAudience, RCX_SYNC_BACKEND_ID,
+        RCX_SYNC_PASSPORT_ATTESTATION,
+    };
+    let attestations = [RCX_SYNC_PASSPORT_ATTESTATION];
+    let context = AttenuationContext {
+        audience: DelegationAudience::CruxSync,
+        tenant_id,
+        backend_id: RCX_SYNC_BACKEND_ID,
+        capability,
+        data_egress_classes: &[],
+        present_attestations: &attestations,
+    };
+    let signature = delegate
+        .sign(&presentation_proof_message(token, context, nonce))
+        .to_bytes();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-crux-peer-token",
+        HeaderValue::from_str(&base64::engine::general_purpose::STANDARD.encode(token.to_canonical_json().as_bytes()))
+            .expect("peer token header"),
+    );
+    headers.insert(
+        "x-crux-peer-pubkey",
+        HeaderValue::from_str(&hex::encode(delegate.verifying_key().to_bytes())).expect("peer public key header"),
+    );
+    headers.insert(
+        "x-crux-peer-nonce",
+        HeaderValue::from_str(&hex::encode(nonce)).expect("peer nonce header"),
+    );
+    headers.insert(
+        "x-crux-peer-sig",
+        HeaderValue::from_str(&hex::encode(signature)).expect("peer signature header"),
+    );
+    headers
+}
+
+fn sync_delegation_app(trust_root: &SigningKey) -> Router {
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    state.sync_mutual_auth = true;
+    state.sync_peer_trust_root = Some(trust_root.verifying_key().to_bytes().to_vec());
+    state.sync_delegation_enforce = true;
+    router_with_route_auth(state, test_case_store(), RouteAuthMode::Enforce)
+}
+
+fn sync_far_future_expiry() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock")
+        .as_secs()
+        .saturating_add(1_800)
+}
+
+#[tokio::test]
+async fn sync_delegation_accepts_valid_recipient_for_bound_tenant() {
+    use rcx_capability_token::Caveat;
+    let (issuer, subject, delegate, base) = sync_delegation_base_token("tenant-acme");
+    let token = sync_delegated_token(
+        &base,
+        &subject,
+        &delegate,
+        vec![
+            Caveat::TenantIdEq {
+                tenant_id: "tenant-acme".to_string(),
+            },
+            Caveat::ExpiresAtLe {
+                expires_at: sync_far_future_expiry(),
+            },
+        ],
+    );
+    let app = sync_delegation_app(&issuer);
+    let nonce = issue_sync_handshake_nonce(&app).await;
+    let response = app
+        .oneshot(sync_http_request(
+            "GET",
+            "/v1/sync/tenants/tenant-acme/manifest",
+            sync_delegation_headers(&token, &delegate, &nonce, "tenant-acme", "corecrux.sync.pull"),
+        ))
+        .await
+        .expect("manifest response");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn sync_delegation_flag_off_rejects_contextual_token_fail_closed() {
+    use rcx_capability_token::Caveat;
+    let (issuer, subject, delegate, base) = sync_delegation_base_token("tenant-acme");
+    let token = sync_delegated_token(
+        &base,
+        &subject,
+        &delegate,
+        vec![
+            Caveat::TenantIdEq {
+                tenant_id: "tenant-acme".to_string(),
+            },
+            Caveat::ExpiresAtLe {
+                expires_at: sync_far_future_expiry(),
+            },
+        ],
+    );
+    // sync_mutual_auth_app leaves sync_delegation_enforce OFF.
+    let app = sync_mutual_auth_app(&issuer);
+    let nonce = issue_sync_handshake_nonce(&app).await;
+    let response = app
+        .oneshot(sync_http_request(
+            "GET",
+            "/v1/sync/tenants/tenant-acme/manifest",
+            sync_delegation_headers(&token, &delegate, &nonce, "tenant-acme", "corecrux.sync.pull"),
+        ))
+        .await
+        .expect("manifest response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_body(response).await["reason_class"], "peer_delegation_disabled");
+}
+
+#[tokio::test]
+async fn sync_delegation_rejects_request_for_other_tenant() {
+    use rcx_capability_token::Caveat;
+    let (issuer, subject, delegate, base) = sync_delegation_base_token("tenant-acme");
+    let token = sync_delegated_token(
+        &base,
+        &subject,
+        &delegate,
+        vec![
+            Caveat::TenantIdEq {
+                tenant_id: "tenant-acme".to_string(),
+            },
+            Caveat::ExpiresAtLe {
+                expires_at: sync_far_future_expiry(),
+            },
+        ],
+    );
+    let app = sync_delegation_app(&issuer);
+    let nonce = issue_sync_handshake_nonce(&app).await;
+    let response = app
+        .oneshot(sync_http_request(
+            "GET",
+            "/v1/sync/tenants/tenant-other/manifest",
+            sync_delegation_headers(&token, &delegate, &nonce, "tenant-other", "corecrux.sync.pull"),
+        ))
+        .await
+        .expect("manifest response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_body(response).await["reason_class"], "peer_context_denied");
+}
+
+#[tokio::test]
+async fn sync_delegation_rejects_expired_caveat() {
+    use rcx_capability_token::Caveat;
+    let (issuer, subject, delegate, base) = sync_delegation_base_token("tenant-acme");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock")
+        .as_secs();
+    let token = sync_delegated_token(
+        &base,
+        &subject,
+        &delegate,
+        vec![Caveat::ExpiresAtLe {
+            expires_at: now.saturating_sub(1),
+        }],
+    );
+    let app = sync_delegation_app(&issuer);
+    let nonce = issue_sync_handshake_nonce(&app).await;
+    let response = app
+        .oneshot(sync_http_request(
+            "GET",
+            "/v1/sync/tenants/tenant-acme/manifest",
+            sync_delegation_headers(&token, &delegate, &nonce, "tenant-acme", "corecrux.sync.pull"),
+        ))
+        .await
+        .expect("manifest response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_body(response).await["reason_class"], "peer_caveat_denied");
+}
+
+#[tokio::test]
+async fn sync_delegation_rejects_scope_subset_excluding_the_request() {
+    use rcx_capability_token::Caveat;
+    let (issuer, subject, delegate, base) = sync_delegation_base_token("tenant-acme");
+    // Narrow to push only, then request a pull (manifest read).
+    let token = sync_delegated_token(
+        &base,
+        &subject,
+        &delegate,
+        vec![Caveat::ScopeSubset {
+            scopes: vec!["corecrux.sync.push".to_string()],
+        }],
+    );
+    let app = sync_delegation_app(&issuer);
+    let nonce = issue_sync_handshake_nonce(&app).await;
+    let response = app
+        .oneshot(sync_http_request(
+            "GET",
+            "/v1/sync/tenants/tenant-acme/manifest",
+            sync_delegation_headers(&token, &delegate, &nonce, "tenant-acme", "corecrux.sync.pull"),
+        ))
+        .await
+        .expect("manifest response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_body(response).await["reason_class"], "peer_caveat_denied");
+}
+
+#[tokio::test]
+async fn sync_delegation_rejects_unissued_nonce() {
+    use rcx_capability_token::Caveat;
+    let (issuer, subject, delegate, base) = sync_delegation_base_token("tenant-acme");
+    let token = sync_delegated_token(
+        &base,
+        &subject,
+        &delegate,
+        vec![
+            Caveat::TenantIdEq {
+                tenant_id: "tenant-acme".to_string(),
+            },
+            Caveat::ExpiresAtLe {
+                expires_at: sync_far_future_expiry(),
+            },
+        ],
+    );
+    let app = sync_delegation_app(&issuer);
+    // Never issued by the server.
+    let nonce = [0x5a_u8; 32].to_vec();
+    let response = app
+        .oneshot(sync_http_request(
+            "GET",
+            "/v1/sync/tenants/tenant-acme/manifest",
+            sync_delegation_headers(&token, &delegate, &nonce, "tenant-acme", "corecrux.sync.pull"),
+        ))
+        .await
+        .expect("manifest response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_body(response).await["reason_class"], "peer_nonce_rejected");
+}
+
+#[tokio::test]
+async fn sync_delegation_denies_replayed_nonce() {
+    use rcx_capability_token::Caveat;
+    let (issuer, subject, delegate, base) = sync_delegation_base_token("tenant-acme");
+    let token = sync_delegated_token(
+        &base,
+        &subject,
+        &delegate,
+        vec![
+            Caveat::TenantIdEq {
+                tenant_id: "tenant-acme".to_string(),
+            },
+            Caveat::ExpiresAtLe {
+                expires_at: sync_far_future_expiry(),
+            },
+        ],
+    );
+    let app = sync_delegation_app(&issuer);
+    let nonce = issue_sync_handshake_nonce(&app).await;
+
+    let first = app
+        .clone()
+        .oneshot(sync_http_request(
+            "GET",
+            "/v1/sync/tenants/tenant-acme/manifest",
+            sync_delegation_headers(&token, &delegate, &nonce, "tenant-acme", "corecrux.sync.pull"),
+        ))
+        .await
+        .expect("first manifest response");
+    assert_eq!(first.status(), StatusCode::OK);
+
+    // Second presentation of the same (now consumed) nonce fails closed.
+    let second = app
+        .oneshot(sync_http_request(
+            "GET",
+            "/v1/sync/tenants/tenant-acme/manifest",
+            sync_delegation_headers(&token, &delegate, &nonce, "tenant-acme", "corecrux.sync.pull"),
+        ))
+        .await
+        .expect("second manifest response");
+    assert_eq!(second.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_body(second).await["reason_class"], "peer_nonce_rejected");
+}
+
+#[tokio::test]
+async fn sync_delegation_enforce_on_leaves_v1_peer_unchanged() {
+    // A plain v1.0 (non-contextual) peer token keeps working through the
+    // existing path, with delegation enforcement ON.
+    let (trust_root, subject, token) = sync_test_peer("tenant-acme");
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    state.sync_mutual_auth = true;
+    state.sync_peer_trust_root = Some(trust_root.verifying_key().to_bytes().to_vec());
+    state.sync_delegation_enforce = true;
+    let app = router_with_route_auth(state, test_case_store(), RouteAuthMode::Enforce);
+    let nonce = issue_sync_handshake_nonce(&app).await;
+    let response = app
+        .oneshot(sync_http_request(
+            "GET",
+            "/v1/sync/tenants/tenant-acme/manifest",
+            sync_peer_headers(&token, &subject, &subject, &nonce),
+        ))
+        .await
+        .expect("manifest response");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
 #[tokio::test]
 async fn sync_manifest_and_collection_page_are_tenant_scoped() {
     let state = test_app_state(1);
@@ -628,6 +1011,7 @@ pub(crate) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         data_dir: root.clone(),
         sync_mutual_auth: false,
         sync_peer_trust_root: None,
+        sync_delegation_enforce: false,
         sync_handshake_nonces: Arc::new(std::sync::Mutex::new(crux_sync::peer_handshake::NonceCache::new(
             SYNC_HANDSHAKE_NONCE_TTL_SECONDS,
         ))),

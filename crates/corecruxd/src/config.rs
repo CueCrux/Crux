@@ -494,9 +494,14 @@ pub struct Config {
     /// Require issuer-signed Ed25519 peer handshakes on sync server routes.
     /// Default OFF (`CORECRUXD_SYNC_MUTUAL_AUTH=1`).
     pub sync_mutual_auth: bool,
-    /// VaultCrux/issuer Ed25519 trust-root public key, parsed from exactly
+    /// CruxEngine/issuer Ed25519 trust-root public key, parsed from exactly
     /// 64 hexadecimal characters in `CORECRUXD_SYNC_PEER_TRUST_ROOT`.
     pub sync_peer_trust_root: Option<Vec<u8>>,
+    /// Accept recipient-bound v1.1 delegation tokens at the sync boundary
+    /// (macaroon M3′). Default OFF (`CORECRUXD_SYNC_DELEGATION_ENFORCE=1`). When
+    /// OFF, a contextual (v1.1) token is rejected fail-closed; v1.0 tokens are
+    /// unaffected either way.
+    pub sync_delegation_enforce: bool,
 
     // Background update checks against a tracked git ref.
     pub update_check_enabled: bool,
@@ -1302,6 +1307,9 @@ pub fn load_config() -> Config {
         sync_peer_trust_root: env_string("CORECRUXD_SYNC_PEER_TRUST_ROOT")
             .as_deref()
             .and_then(parse_sync_peer_trust_root),
+        sync_delegation_enforce: std::env::var("CORECRUXD_SYNC_DELEGATION_ENFORCE")
+            .ok()
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
         update_check_enabled: std::env::var("CORECRUXD_UPDATE_CHECK_ENABLED")
             .ok()
             .is_none_or(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
