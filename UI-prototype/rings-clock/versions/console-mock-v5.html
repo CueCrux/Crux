@@ -1068,7 +1068,6 @@ const TOK = (function buildTok() {
 document.getElementById('tile-tok').textContent = Math.round(TOK.totS) + 'M';
 let tokBins = [];                                  /* per-frame bin geometry for hover */
 let tokView = 'cum';                               /* cum | day — explicit sub-view */
-let tokSel = null;                                 /* selected day → pane lists active plans */
 function drawTokensLens(ctx2, g) {
   tokBins = [];
   const cum = tokView === 'cum';
@@ -1091,46 +1090,19 @@ function drawTokensLens(ctx2, g) {
   for (const r2 of rows) {
     const a = BASE + (TAU - SEAM) * ((r2.d + 0.5 - S) / Math.max(0.5, E - S));
     const hS = ((cum ? r2.cs : r2.sp) / maxS) * spanOut;
+    const hV = ((cum ? r2.cv : r2.sv) / maxV) * spanIn;
     const wBar = Math.max(1.5, wA * rB * 0.55) / Math.max(1, Math.sqrt(Z));
-    const isSelDay = tokSel === r2.d;
-    if (cum) {
-      const hV = ((r2.cv) / maxV) * spanIn;
-      ctx2.lineWidth = wBar;
-      ctx2.strokeStyle = hex2rgba('#a78bfa', 0.55);  /* spent → outward */
-      ctx2.beginPath();
-      ctx2.moveTo(Math.cos(a) * rB, Math.sin(a) * rB);
-      ctx2.lineTo(Math.cos(a) * (rB + hS), Math.sin(a) * (rB + hS));
-      ctx2.stroke();
-      ctx2.strokeStyle = hex2rgba('#34d399', 0.6);   /* saved → inward */
-      ctx2.beginPath();
-      ctx2.moveTo(Math.cos(a) * rB, Math.sin(a) * rB);
-      ctx2.lineTo(Math.cos(a) * (rB - hV), Math.sin(a) * (rB - hV));
-      ctx2.stroke();
-    } else {
-      /* per day: BOTH outward, paired — spent left, saved right; node at each tip */
-      const hV = ((r2.sv) / maxV) * spanOut * 0.85;
-      const off = Math.max(0.006, wA * 0.20);
-      ctx2.lineWidth = wBar * 0.7;
-      ctx2.strokeStyle = hex2rgba('#a78bfa', isSelDay ? 0.95 : 0.55);
-      ctx2.beginPath();
-      ctx2.moveTo(Math.cos(a - off) * rB, Math.sin(a - off) * rB);
-      ctx2.lineTo(Math.cos(a - off) * (rB + hS), Math.sin(a - off) * (rB + hS));
-      ctx2.stroke();
-      ctx2.strokeStyle = hex2rgba('#34d399', isSelDay ? 0.95 : 0.6);
-      ctx2.beginPath();
-      ctx2.moveTo(Math.cos(a + off) * rB, Math.sin(a + off) * rB);
-      ctx2.lineTo(Math.cos(a + off) * (rB + hV), Math.sin(a + off) * (rB + hV));
-      ctx2.stroke();
-      ctx2.lineWidth = 1 / Z;
-      ctx2.fillStyle = hex2rgba('#a78bfa', isSelDay ? 1 : 0.85);
-      ctx2.beginPath(); ctx2.arc(Math.cos(a - off) * (rB + hS), Math.sin(a - off) * (rB + hS), (isSelDay ? 3.4 : 2.4) / Math.sqrt(Z), 0, 7); ctx2.fill();
-      ctx2.fillStyle = hex2rgba('#34d399', isSelDay ? 1 : 0.85);
-      ctx2.beginPath(); ctx2.arc(Math.cos(a + off) * (rB + hV), Math.sin(a + off) * (rB + hV), (isSelDay ? 3 : 2.2) / Math.sqrt(Z), 0, 7); ctx2.fill();
-      if (isSelDay) {
-        ctx2.strokeStyle = 'rgba(238,240,246,.5)';
-        ctx2.beginPath(); ctx2.arc(0, 0, rB, a - off * 2.2, a + off * 2.2); ctx2.stroke();
-      }
-    }
+    ctx2.lineWidth = wBar;
+    ctx2.strokeStyle = hex2rgba('#a78bfa', 0.55);  /* spent → outward */
+    ctx2.beginPath();
+    ctx2.moveTo(Math.cos(a) * rB, Math.sin(a) * rB);
+    ctx2.lineTo(Math.cos(a) * (rB + hS), Math.sin(a) * (rB + hS));
+    ctx2.stroke();
+    ctx2.strokeStyle = hex2rgba('#34d399', 0.6);   /* saved → inward */
+    ctx2.beginPath();
+    ctx2.moveTo(Math.cos(a) * rB, Math.sin(a) * rB);
+    ctx2.lineTo(Math.cos(a) * (rB - hV), Math.sin(a) * (rB - hV));
+    ctx2.stroke();
     tokBins.push({ ...r2, a, rTip: rB + hS });
   }
   ctx2.lineWidth = 1 / Z;
@@ -1473,23 +1445,6 @@ function handleClick(e) {
     gSel = (hit && hit.i !== undefined) ? (gSel === hit.i ? null : hit.i) : null;
     return;
   }
-  if (lens === 'tokens') {                         /* day bar → which plans were active */
-    const r2 = cv.getBoundingClientRect();
-    const g2 = geom();
-    const pd = toDisc(g2, e.clientX - r2.left, e.clientY - r2.top);
-    const pr2 = Math.hypot(pd.x, pd.y);
-    let pa2 = Math.atan2(pd.y, pd.x);
-    while (pa2 < BASE) pa2 += TAU;
-    let bin = null, bd2 = 0.05;
-    for (const b2 of tokBins) {
-      let ba = b2.a; while (ba < BASE) ba += TAU;
-      const da2 = Math.abs(pa2 - ba);
-      if (da2 < bd2 && pr2 > g2.r0 * 0.7 && pr2 < g2.R + 14) { bd2 = da2; bin = b2; }
-    }
-    if (bin && tokSel !== bin.d) { tokSel = bin.d; renderTokenDayPane(bin); }
-    else { tokSel = null; pane.classList.remove('open'); }
-    return;
-  }
   if (lens !== 'work') return;                     /* other lens views: hover only in this mock */
   const r = cv.getBoundingClientRect();
   const cxp = e.clientX - r.left, cyp = e.clientY - r.top;
@@ -1606,14 +1561,14 @@ function renderPane() {
   }
   pane.classList.add('open');
 }
-addEventListener('keydown', e => { if (e.key === 'Escape') { setSel(null); solo = null; tokSel = null; } });
+addEventListener('keydown', e => { if (e.key === 'Escape') { setSel(null); solo = null; } });
 
 /* tiles: press to switch the lens */
 document.querySelectorAll('#tiles .tile').forEach(t2 => {
   t2.addEventListener('click', () => {
     lens = t2.dataset.lens;
     document.querySelectorAll('#tiles .tile').forEach(x => x.setAttribute('aria-pressed', String(x === t2)));
-    setSel(null); solo = null; hover = null; hoverSec = null; gSel = null; tokSel = null; hideTip();
+    setSel(null); solo = null; hover = null; hoverSec = null; gSel = null; hideTip();
     if (lens === 'data') {
       /* auto-fit the window to the data extent so source dates spread the clock */
       const minD = Math.min(...GNODES.map(n => n.d)) - 0.5;
@@ -1622,36 +1577,6 @@ document.querySelectorAll('#tiles .tile').forEach(t2 => {
     document.getElementById('tok-views').style.display = lens === 'tokens' ? 'flex' : 'none';
   });
 });
-
-/* tokens: day pane — which execplans were active on the clicked day */
-function renderTokenDayPane(bin) {
-  const esc = t2 => String(t2).replace(/&/g, '&amp;').replace(/</g, '&lt;');
-  const d2 = bin.d;
-  const act = PLANS
-    .filter(p => p.b <= d2 && d2 <= p.e)
-    .map(p => {
-      const dayCells = p.cells.filter(c => Math.floor(c.day) === d2).length;
-      const sp = (p.o && p.cells.length) ? (p.o / 10) / p.cells.length * dayCells : 0;
-      return { p, dayCells, sp };
-    })
-    .sort((x, y) => y.sp - x.sp || y.dayCells - x.dayCells);
-  pane.innerHTML =
-    '<h4>' + dayDate(d2) + '</h4>' +
-    '<span class="kindchip"><i style="background:#f5a623"></i>token day</span>' +
-    '<div class="row"><span>spent</span><span>' + bin.sp.toFixed(1) + 'M day · ' + bin.cs.toFixed(1) + 'M cum</span></div>' +
-    '<div class="row"><span>saved (est.)</span><span>' + (bin.sv * 1000).toFixed(0) + 'k day · ' + bin.cv.toFixed(2) + 'M cum</span></div>' +
-    '<div class="sect">ACTIVE EXECPLANS · ' + act.length + '</div>' +
-    (act.length
-      ? '<ul class="facts">' + act.slice(0, 22).map(x2 =>
-          '<li><b style="color:' + stateHue(x2.p) + '">●</b> <b>' + esc(x2.p.short.slice(0, 30)) + '</b> · ' +
-          STATE[x2.p.st] + ' ' + x2.p.done + '/' + x2.p.total +
-          (x2.sp ? ' · ~' + x2.sp.toFixed(1) + 'M' : '') +
-          (x2.dayCells ? ' · ' + x2.dayCells + ' events' : '') + '</li>').join('') +
-        (act.length > 22 ? '<li>… +' + (act.length - 22) + ' more</li>' : '') + '</ul>'
-      : '<p class="note">no plans with activity spans covering this day</p>') +
-    '<p class="note">spend attribution: plan output-token totals distributed across their event days (estimate until per-day token_burn is wired)</p>';
-  pane.classList.add('open');
-}
 
 /* tokens sub-views */
 function setTokView(v) {
