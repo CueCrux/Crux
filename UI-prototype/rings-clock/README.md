@@ -74,3 +74,13 @@ Related: `UI-prototype/console-3d/` (clay-substrate concept, 2026-06-11).
   always lights a sector's own; dot = the plan being stood on) and amber
   open-decision ticks on sector rims; tooltips and pane list ODs, depends-on
   and extended-by.
+
+## Console integration mock
+
+`console-mock.html` — the rings de-carded onto a console index page:
+console-style topbar + pressable lens tiles. Tiles switch the disc between
+four lenses: **ExecPlans** (the full clock-of-work incl. solo/ledger/
+lineage/filters), **Memory** (sector = fact kind, ring = day, age-fade),
+**Sessions** (sector = agent passport), **Receipts** (chain escapement,
+illustrative until /v1/receipts/export is wired). Lens views are hover-only
+in this mock; the ExecPlans lens keeps full interactivity.
