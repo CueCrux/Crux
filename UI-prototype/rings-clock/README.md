@@ -65,3 +65,6 @@ Related: `UI-prototype/console-3d/` (clay-substrate concept, 2026-06-11).
   connect into work episodes (same agent, <2.5h gaps — the round-3 rule);
   stitch colour = agent passport, open ring = episode start; untraced plans
   fall back to time-gap inference (grey) and say so.
+- `versions/v4.9-sessions-overlay.html` — sessions-overlay experiment
+  (episode stitches; retired as unclear).
+- v4.10 (current `index.html`) — sessions overlay removed.
