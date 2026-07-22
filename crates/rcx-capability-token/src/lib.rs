@@ -1783,6 +1783,163 @@ mod tests {
         assert_eq!(token.token_hash_hex(), FREE_LOCAL_VERIFIED_TOKEN_HASH);
     }
 
+    // --- rcx-ct/1.1 sync-delegation cross-language byte-parity vector ---------
+    // Deterministic base token that CruxEngine will mint (spec 1.1, one crux-sync
+    // backend with corecrux.sync.pull/push, an issuer-signed PoP/one-hop/crux-sync
+    // delegation_policy). The CruxEngine TS fixture `syncDelegationVectorFixture`
+    // (packages/shared/packages/contracts/src/rcx-capability-token.ts) mirrors this
+    // byte-for-byte; the shared hex constants below lock the two encoders together.
+    // ExecPlan cruxengine-sync-delegation-minting-2026-07-22 M1.
+    const SYNC_DELEGATION_ISSUER_SEED: [u8; 32] = [7u8; 32];
+    const SYNC_DELEGATION_VECTOR_CBOR_HEX: &str = "b06474696572646672656566697373756572a26a6973737565725f6f7267656c6f63616c6c70617373706f72745f6b69647822705f30313233343536373839616263646566303132333435363738396162636465666763726564697473a466726566696c6ca266616d6f756e74f666706572696f64646e6f6e656762616c616e6365f6696f766572647261667466666f726269646f6f76657264726166745f6c696d6974f6677375626a656374a26c70617373706f72745f6670727822705f3031323334353637383961626364656630313233343536373839616263646566726461656d6f6e5f696e7374616e63655f696478216461656d6f6e5f3031485630303030303030303030303030303030303030303030686261636b656e647381a46a6261636b656e645f696469637275782d73796e636c656e64706f696e745f75726cf66e74727573745f726f6f745f6b69647822705f3031323334353637383961626364656630313233343536373839616263646566767065726d69747465645f6361706162696c697469657382a46a6361706162696c69747972636f7265637275782e73796e632e70756c6c6b6372656469745f636f7374f673646174615f6567726573735f636c617373657381646e6f6e657572657175697265645f6174746573746174696f6e73816e70617373706f72745f626f756e64a46a6361706162696c69747972636f7265637275782e73796e632e707573686b6372656469745f636f7374f673646174615f6567726573735f636c617373657381646e6f6e657572657175697265645f6174746573746174696f6e73816e70617373706f72745f626f756e646866616c6c6261636ba4696f6e5f657870697279667265667573657171756575655f74746c5f7365636f6e6473f6746f6e5f637265646974735f65786861757374656466726566757365766f6e5f6261636b656e645f756e726561636861626c656672656675736568746f6b656e5f6964782672637863745f73796e6364656c5f303132333435363738396162636465665f64656661756c74696973737565645f61741a69eab5a0697369676e6174757265a363616c676765643235353139636b69647822705f3031323334353637383961626364656630313233343536373839616263646566637369675840111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111116a657870697265735f61741a6a1ad4606a7265766f636174696f6ea26763726c5f75726cf66c707573685f6368616e6e656cf66c737065635f76657273696f6e6a7263782d63742f312e316c74656e616e745f73636f7065a26974656e616e745f69646764656661756c746c646973706c61795f6e616d65654c6f63616c6d726563656970745f636c6173736876657269666965646f726566726573685f68696e745f61741a6a1ac6507164656c65676174696f6e5f706f6c696379a46861756469656e636569637275782d73796e63696d61785f6465707468016c70726573656e746174696f6e7370726f6f665f6f665f706f7373657373696f6e75616c6c6f7765645f64656c65676174655f66707273827822705f30303030303030303030303030303030303030303030303030303030303030317822705f3030303030303030303030303030303030303030303030303030303030303032";
+    const SYNC_DELEGATION_VECTOR_TOKEN_HASH: &str = "1ca9e0d2f4e74af7314a80d6f376b73a52e30df04a10d8cb435d11766a73b0c7";
+    const SYNC_DELEGATION_VECTOR_ISSUER_SIG: &str = "6441eb1f1678566b7d0e81b52b331c77e3a500ae210cdbdeda67dbbe71ed1dc78ee1be37434735b19ac61362afb64c3f962fb3a3b5659cd96b4012f344ee3801";
+
+    fn sync_delegation_vector_fixture() -> RcxCapabilityToken {
+        let mut token = free_local_verified_fixture();
+        token.spec_version = RCX_CT_DELEGATION_SPEC_VERSION.to_string();
+        token.token_id = "rcxct_syncdel_0123456789abcdef_default".to_string();
+        token.backends = vec![Backend {
+            backend_id: RCX_SYNC_BACKEND_ID.to_string(),
+            trust_root_kid: token.issuer.passport_kid.clone(),
+            endpoint_url: None,
+            permitted_capabilities: vec![
+                PermittedCapability {
+                    capability: RCX_SYNC_PULL_CAPABILITY.to_string(),
+                    data_egress_classes: vec![DataEgressClass::None],
+                    required_attestations: vec![RCX_SYNC_PASSPORT_ATTESTATION.to_string()],
+                    credit_cost: None,
+                },
+                PermittedCapability {
+                    capability: RCX_SYNC_PUSH_CAPABILITY.to_string(),
+                    data_egress_classes: vec![DataEgressClass::None],
+                    required_attestations: vec![RCX_SYNC_PASSPORT_ATTESTATION.to_string()],
+                    credit_cost: None,
+                },
+            ],
+        }];
+        token.delegation_policy = Some(DelegationPolicy {
+            presentation: DelegationPresentation::ProofOfPossession,
+            max_depth: 1,
+            audience: DelegationAudience::CruxSync,
+            allowed_delegate_fprs: vec![
+                "p_00000000000000000000000000000001".to_string(),
+                "p_00000000000000000000000000000002".to_string(),
+            ],
+        });
+        token
+    }
+
+    #[test]
+    fn sync_delegation_vector_has_stable_bytes_and_verifies() {
+        let unsigned = sync_delegation_vector_fixture();
+        let issuer = SigningKey::from_bytes(&SYNC_DELEGATION_ISSUER_SEED);
+        let mut signed = sync_delegation_vector_fixture();
+        // token_hash zeroes the signature, so signing over it is stable.
+        signed.signature.sig = issuer.sign(&signed.token_hash()).to_bytes();
+
+        assert_eq!(
+            hex::encode(unsigned.to_canonical_cbor()),
+            SYNC_DELEGATION_VECTOR_CBOR_HEX
+        );
+        assert_eq!(unsigned.token_hash_hex(), SYNC_DELEGATION_VECTOR_TOKEN_HASH);
+        assert_eq!(hex::encode(signed.signature.sig), SYNC_DELEGATION_VECTOR_ISSUER_SIG);
+        // Signing must not perturb the signing bytes.
+        assert_eq!(signed.token_hash_hex(), SYNC_DELEGATION_VECTOR_TOKEN_HASH);
+
+        // The base delegation token is a valid, issuer-signed, contextual token:
+        // verify_token confirms the issuer signature + canonical policy, then reports
+        // that presentation-time proof-of-possession is still required.
+        let now = unsigned.issued_at;
+        assert_eq!(
+            verify_token(&signed, &issuer.verifying_key().to_bytes(), now),
+            VerifyOutcome::StructuralFailure(vec!["proof_of_possession_context_required".to_string()]),
+        );
+        // A wrong trust root must fail the signature, not fall through to contextual.
+        let wrong = SigningKey::from_bytes(&[9u8; 32]);
+        assert_eq!(
+            verify_token(&signed, &wrong.verifying_key().to_bytes(), now),
+            VerifyOutcome::BadSignature,
+        );
+    }
+
+    #[test]
+    fn cruxengine_shaped_sync_delegation_verifies_end_to_end() {
+        // The exact base-token shape CruxEngine mints (crux-sync backend,
+        // corecrux.sync.pull/push, PoP/one-hop/crux-sync policy) flows through
+        // the M3′ mint→attenuate→present→accept path. ExecPlan
+        // cruxengine-sync-delegation-minting-2026-07-22 M4.
+        let issuer = SigningKey::from_bytes(&[1; 32]);
+        let subject = SigningKey::from_bytes(&[2; 32]);
+        let delegate = SigningKey::from_bytes(&[3; 32]);
+
+        // Mint: the CruxEngine shape, bound to the real subject + delegate fprs
+        // and issuer-signed (matches issueSyncDelegationToken's output shape).
+        let mut base = sync_delegation_vector_fixture();
+        base.subject.passport_fpr =
+            crux_session::passport::passport_fpr_from_public_key(&subject.verifying_key().to_bytes());
+        base.delegation_policy
+            .as_mut()
+            .unwrap_or_else(|| panic!("policy required"))
+            .allowed_delegate_fprs = vec![crux_session::passport::passport_fpr_from_public_key(
+            &delegate.verifying_key().to_bytes(),
+        )];
+        base.signature.sig = issuer.sign(&base.token_hash()).to_bytes();
+
+        // The issuer-signed base token is a valid contextual token.
+        assert_eq!(
+            verify_token(&base, &issuer.verifying_key().to_bytes(), M2_REPAIR_NOW),
+            VerifyOutcome::StructuralFailure(vec!["proof_of_possession_context_required".to_string()]),
+        );
+
+        // Attenuate: the subject narrows and binds the delegate offline.
+        let delegated = base
+            .attenuate_for(
+                vec![
+                    Caveat::TenantIdEq {
+                        tenant_id: "default".to_string(),
+                    },
+                    Caveat::ExpiresAtLe {
+                        expires_at: 1_780_143_100,
+                    },
+                ],
+                delegate.verifying_key().to_bytes(),
+                "sync-delegation-1",
+                &subject,
+            )
+            .unwrap_or_else(|error| panic!("sync-delegation attenuation failed: {error:?}"));
+
+        // Present + accept: the delegate proves possession at the crux-sync boundary.
+        let context = AttenuationContext {
+            audience: DelegationAudience::CruxSync,
+            tenant_id: "default",
+            backend_id: RCX_SYNC_BACKEND_ID,
+            capability: RCX_SYNC_PULL_CAPABILITY,
+            data_egress_classes: &[DataEgressClass::None],
+            present_attestations: &[RCX_SYNC_PASSPORT_ATTESTATION],
+        };
+        let nonce = b"sync-boundary-nonce";
+        let proof = presentation_proof(&delegated, context, nonce, &delegate);
+        assert_eq!(
+            verify_token_attenuated(
+                &delegated,
+                &issuer.verifying_key().to_bytes(),
+                M2_REPAIR_NOW,
+                &proof,
+                nonce,
+                context,
+                |_| false,
+            ),
+            AttenuatedOutcome::Verified(VerifiedAttenuation {
+                actor_fpr: crux_session::passport::passport_fpr_from_public_key(&delegate.verifying_key().to_bytes()),
+                delegated_by: Some(crux_session::passport::passport_fpr_from_public_key(
+                    &subject.verifying_key().to_bytes()
+                )),
+                delegation_id: Some("sync-delegation-1".to_string()),
+            })
+        );
+    }
+
     const M2_REPAIR_NOW: u64 = 1_776_989_601;
     const M2_NONCE: &[u8] = b"verifier-issued-single-use-nonce";
 
