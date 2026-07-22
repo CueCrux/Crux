@@ -1472,7 +1472,7 @@ pub fn list_tools_with_flags(
                     },
                     "reason": {
                         "type": "string",
-                        "description": "Optional reason shown to the approving operator"
+                        "description": "Optional reason shown to the approving operator (maximum 2048 UTF-8 bytes)"
                     }
                 },
                 "examples": [
