@@ -10632,15 +10632,15 @@ async fn passport_mint_request_flag_off_hides_pending_list() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     {
         let mut store = state.fact_store.write().await;
-        crate::mint_requests::file_mint_request(
+        let filed = crate::mint_requests::file_mint_request(
             &mut store,
             "codex-work".to_string(),
             "codex-work".to_string(),
             Some("work".to_string()),
             Some("operator review".to_string()),
             1_726_000_000_000,
-        )
-        .expect("seed pending request");
+        );
+        assert!(filed.is_ok(), "seed pending request: {filed:?}");
     }
 
     let resp = super::passports::get_pending_mint_requests(

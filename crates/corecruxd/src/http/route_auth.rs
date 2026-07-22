@@ -919,7 +919,9 @@ mod tests {
                 &["admin:write"][..],
             ),
         ] {
-            let contract = classify_route(method, path).expect("passport mint route contract");
+            let Some(contract) = classify_route(method, path) else {
+                panic!("missing passport mint route contract for {method} {path}");
+            };
             assert_eq!(contract.class, RouteAuthClass::FeatureGated, "{path}");
             assert_eq!(contract.scopes, scopes, "{path}");
             assert_eq!(
