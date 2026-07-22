@@ -10,25 +10,44 @@ Pick one install path, then continue at [First boot](#2-first-boot).
 
 ## 1. Install (~5 minutes)
 
-All release artifacts are signed (cosign keyless) with SLSA provenance.
-Whatever path you choose, the signature is checked **before** anything runs —
-copy-paste verification commands live in [verify-release.md](verify-release.md).
+Release binaries are cosign-signed; native installer targets also carry SLSA
+provenance. Whatever path you choose, verify the artifact **before** anything
+runs — copy-paste commands and the cross-build provenance boundary live in
+[verify-release.md](verify-release.md).
 
 ### Option A — installer script (macOS, Linux, WSL2)
 
-Three steps, deliberately not one. We never ask you to pipe a URL into a
-shell, and the installer refuses to install binaries that fail signature
-verification (it needs [cosign](https://docs.sigstore.dev/cosign/system_config/installation/)).
+Resolve the exact release, download the installer and its signature, verify it,
+then read and run it. We never ask you to pipe a URL into a shell, and the
+installer refuses to install binaries that fail signature verification (it
+needs [cosign](https://docs.sigstore.dev/cosign/system_config/installation/)).
 
 ```bash
-curl -fsSLO https://github.com/CueCrux/Crux/releases/latest/download/install.sh
-less install.sh        # read what you're about to run
-bash install.sh        # add --with-service for a systemd/launchd unit
+REPO=CueCrux/Crux
+TAG="$(curl -fsSL -o /dev/null -w '%{url_effective}' \
+  "https://github.com/${REPO}/releases/latest" | sed 's|.*/tag/||')"
+BASE="https://github.com/${REPO}/releases/download/${TAG}"
+curl -fsSLO "${BASE}/install.sh" \
+  -O "${BASE}/install.sh.sig" \
+  -O "${BASE}/install.sh.pem"
+cosign verify-blob \
+  --certificate install.sh.pem \
+  --signature install.sh.sig \
+  --certificate-identity \
+    "https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/${TAG}" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  install.sh
+less install.sh
+bash install.sh --version "${TAG}"  # add --with-service for a service unit
 ```
 
-Installs `crux`, `corecruxd` (same binary, service-manager name) and
-`corecruxctl` into `~/.local/bin`, and creates a private data dir
-(`~/.local/share/crux`, mode 0700). Nothing is auto-started.
+Installs `crux`, `corecruxd` (same binary, service-manager name),
+`corecruxctl`, and `crux-hook` into `~/.local/bin`, and creates a private data
+dir (`~/.local/share/crux`, mode 0700). Nothing is auto-started.
+
+Re-run the verified installer to upgrade the complete set together. Packaged
+installs refuse daemon-only `crux self update` so the CLI and hook cannot be
+left on an older version.
 
 ### Option B — Docker / Podman
 
@@ -208,7 +227,7 @@ boundary is machine-readable: `curl -s localhost:14800/v1/version | jq
 
 ## Upgrade
 
-Upgrades are always explicit — the daemon never self-updates:
+Upgrades are always explicit — the daemon never updates automatically:
 
 ```bash
 bash install.sh --version vX.Y.Z   # re-verifies signatures; data is kept

@@ -56,6 +56,9 @@ sha_crux_linux_amd64="$(sha_for linux-amd64 "crux-linux-amd64")"
 sha_ctl_darwin_arm64="$(sha_for darwin-arm64 "corecruxctl-darwin-arm64")"
 sha_ctl_darwin_amd64="$(sha_for darwin-amd64 "corecruxctl-darwin-amd64")"
 sha_ctl_linux_amd64="$(sha_for linux-amd64 "corecruxctl-linux-amd64")"
+sha_hook_darwin_arm64="$(sha_for darwin-arm64 "crux-hook-darwin-arm64")"
+sha_hook_darwin_amd64="$(sha_for darwin-amd64 "crux-hook-darwin-amd64")"
+sha_hook_linux_amd64="$(sha_for linux-amd64 "crux-hook-linux-amd64")"
 
 sed \
   -e "s|{{VERSION}}|${VERSION}|g" \
@@ -65,4 +68,7 @@ sed \
   -e "s|{{SHA256_CTL_DARWIN_ARM64}}|${sha_ctl_darwin_arm64}|" \
   -e "s|{{SHA256_CTL_DARWIN_AMD64}}|${sha_ctl_darwin_amd64}|" \
   -e "s|{{SHA256_CTL_LINUX_AMD64}}|${sha_ctl_linux_amd64}|" \
+  -e "s|{{SHA256_HOOK_DARWIN_ARM64}}|${sha_hook_darwin_arm64}|" \
+  -e "s|{{SHA256_HOOK_DARWIN_AMD64}}|${sha_hook_darwin_amd64}|" \
+  -e "s|{{SHA256_HOOK_LINUX_AMD64}}|${sha_hook_linux_amd64}|" \
   "$TEMPLATE"

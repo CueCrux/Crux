@@ -2,9 +2,11 @@
 
 Claude Code lifecycle hook binaries for the Crux Daemon.
 
-Three subcommands under a single `crux-hook` binary, each fired by the Claude
-Code harness at a specific lifecycle event. Best-effort and non-blocking: a
-missing or unreachable daemon never blocks tool execution.
+The compaction/context subcommands below ship under a single `crux-hook`
+binary, each fired by the Claude Code harness at a specific lifecycle event.
+Best-effort and non-blocking: a missing or unreachable daemon never blocks
+tool execution. Run `crux-hook --help` for the additional observation and
+code-context subcommands.
 
 ## Subcommands
 
@@ -14,7 +16,12 @@ missing or unreachable daemon never blocks tool execution.
 | `pre-compact` | `PreCompact` | Snapshots session state to the Crux daemon via MCP `save_session` before harness compaction. On a hosted (Pro) node it *also* stores a client-side-encrypted `session_snapshot` fact (see [Hosted encrypted snapshot sync](#hosted-encrypted-snapshot-sync-pro)). |
 | `session-start` | `SessionStart` | Automates the §11.1 session-boot ritual: `sync_status` + `get_bootstrap("patterns")` with `token_budget=500`. Injects result as `additionalContext`. On a `compact`/`resume` boot it also restores the hosted encrypted snapshot from another device. |
 
-## Build
+## Install or build
+
+The signed release installer, Debian package, and Homebrew formula install
+`crux-hook` alongside the daemon and CLI. Verify a release per
+[`docs/verify-release.md`](../../docs/verify-release.md), then use `crux-hook`
+from `PATH` in the configuration below. To build from source instead:
 
 ```bash
 cd /home/myles/CueCrux/Crux
@@ -35,7 +42,7 @@ Add to `.claude/settings.local.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "/path/to/Crux/target/release/crux-hook context-monitor",
+            "command": "crux-hook context-monitor",
             "timeout": 5
           }
         ]
@@ -47,7 +54,7 @@ Add to `.claude/settings.local.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "/path/to/Crux/target/release/crux-hook pre-compact",
+            "command": "crux-hook pre-compact",
             "timeout": 5
           }
         ]
@@ -59,7 +66,7 @@ Add to `.claude/settings.local.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "/path/to/Crux/target/release/crux-hook session-start",
+            "command": "crux-hook session-start",
             "timeout": 5
           }
         ]

@@ -6,10 +6,12 @@
 # already-signed) artifacts. Run from the repo root:
 #
 #   1. Stage binaries:
-#        cargo build --locked --release --bin corecruxd --bin corecruxctl
+#        cargo build --locked --release \
+#          --bin corecruxd --bin corecruxctl --bin crux-hook
 #        mkdir -p dist
 #        cp target/release/corecruxd dist/crux-linux-amd64
 #        cp target/release/corecruxctl dist/corecruxctl-linux-amd64
+#        cp target/release/crux-hook dist/crux-hook-linux-amd64
 #      (In the release flow these come from the signed release artifacts
 #       instead — verify per docs/verify-release.md before packaging.)
 #   2. Build:
@@ -27,7 +29,10 @@ if ! command -v nfpm >/dev/null 2>&1; then
   exit 2
 fi
 
-for f in dist/crux-linux-amd64 dist/corecruxctl-linux-amd64; do
+for f in \
+  dist/crux-linux-amd64 \
+  dist/corecruxctl-linux-amd64 \
+  dist/crux-hook-linux-amd64; do
   [ -f "$f" ] || { echo "ERROR: missing $f — stage binaries first (see header)" >&2; exit 2; }
 done
 

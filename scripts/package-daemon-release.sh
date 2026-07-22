@@ -20,10 +20,18 @@ mkdir -p "$dist/content" "$dist/docs"
 cp "$root/target/release/corecruxd" "$dist/corecruxd-$suffix"
 cp "$root/target/release/corecruxd" "$dist/crux-$suffix"
 cp "$root/target/release/corecruxctl" "$dist/corecruxctl-$suffix"
+cp "$root/target/release/crux-hook" "$dist/crux-hook-$suffix"
 cp "$root/LICENCE.md" "$root/TRUST-CONTRACT.md" "$dist/"
 cp "$root/README.md" "$root/config.example.env" "$root/config.example.yaml" "$dist/"
 cp "$root/docs/release-packaging.md" "$dist/docs/"
 cp "$root/content/MANIFEST.json" "$root/content/README.md" "$root/content/LICENCE-CONTENT.md" "$dist/content/"
+
+# The installer is platform-agnostic and uploaded once from the linux-amd64
+# release leg. Stage it before hashing so its signed-manifest coverage matches
+# the public verification claim; the workflow also signs it directly.
+if [[ "$suffix" == "linux-amd64" ]]; then
+  cp "$root/packaging/install.sh" "$dist/install.sh"
+fi
 
 manifest="$dist/RELEASE-MANIFEST-$suffix.txt"
 (
