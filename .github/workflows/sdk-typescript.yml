@@ -19,7 +19,7 @@ permissions:
 jobs:
   build:
     name: Build package
-    runs-on: [self-hosted, ci]
+    runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: sdks/typescript
@@ -29,7 +29,7 @@ jobs:
         with:
           node-version: '22'
       - name: Require SDK tag to match package version
-        if: startsWith(github.ref, 'refs/tags/sdk-typescript-v')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/sdk-typescript-v')
         run: |
           set -euo pipefail
           package_version="$(node -p 'require("./package.json").version')"
@@ -55,9 +55,9 @@ jobs:
 
   publish:
     name: Publish to npm
-    if: startsWith(github.ref, 'refs/tags/sdk-typescript-v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/sdk-typescript-v')
     needs: build
-    runs-on: [self-hosted, ci]
+    runs-on: ubuntu-latest
     # npm Trusted Publishing (OIDC) — no NPM_TOKEN secret. The package version
     # remains immutable: duplicate uploads fail closed.
     permissions:
