@@ -187,3 +187,14 @@ attribution isn't being materialised from the copied events (root cause not
 yet chased; likely an aggregation/warm path that keys off something outside
 the data volume). The Rings page detects the all-zero board and falls back to
 its snapshot token profile, labelling the tile "255M (snap)".
+
+## Known daemon gap: no paged facts listing
+
+The store holds 5,026 visible facts but no HTTP surface can enumerate them:
+`/v1/console/facts` returns only the ~55 visible facts inside its recent-200
+window (`as_of_unix_ms` filters that same window — page 2 is empty, it is not
+a pager), and `/v1/facts` is recall/budget-shaped (query-driven). The Rings
+data-graph therefore draws recall-surfaced facts merged with its curated
+snapshot and captions the true coverage ("N of 5,026"). Daemon follow-up: a
+paged facts listing route (offset/cursor by stored_at) unlocks the full-store
+graph.
