@@ -10,6 +10,13 @@
 //! Legacy v1.0 tokens remain byte-stable. Delegation-capable v1.1 tokens opt in
 //! through an issuer-signed policy and require recipient proof of possession,
 //! a verifier-issued nonce, and an exact request context.
+//!
+//! A v1.1 token is *contextual*: the generic `verify_token` path fails it closed,
+//! so a delegation-aware verifier (`verify_token_attenuated`) must be deployed
+//! before any v1.1 token is minted — mint-before-verify. The spec version is not
+//! bumped per token beyond `rcx-ct/1.1`; the fail-closed guarantee for older
+//! verifiers comes from `#[serde(deny_unknown_fields)]` and the contextual gate,
+//! not a version field.
 
 use crux_session::canonical::{to_canonical_json, CborValue};
 use ed25519_dalek::{Signature as Ed25519Signature, Signer as _, SigningKey, VerifyingKey};
