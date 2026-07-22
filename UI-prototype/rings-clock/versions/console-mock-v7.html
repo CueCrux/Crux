@@ -187,6 +187,9 @@ footer { max-width: 1100px; margin: 48px auto 0; padding: 20px clamp(16px, 4vw, 
       <button class="tile" data-lens="sessions" aria-pressed="false">
         <span class="t"><i style="background:#22d3ee"></i>Sessions</span><span class="n">32</span>
       </button>
+      <button class="tile" data-lens="receipts" aria-pressed="false">
+        <span class="t"><i style="background:#34d399"></i>Receipts</span><span class="n">seq</span>
+      </button>
       <button class="tile" data-lens="tokens" aria-pressed="false">
         <span class="t"><i style="background:#f5a623"></i>Tokens</span><span class="n" id="tile-tok">—</span>
       </button>
@@ -199,7 +202,6 @@ footer { max-width: 1100px; margin: 48px auto 0; padding: 20px clamp(16px, 4vw, 
         <button id="b-dir" class="ic" aria-pressed="false" title="Time edge: outward (rings grow) / inward (nodes sink from rim)">⇅</button>
         <button id="b-all" class="ic" aria-pressed="false" title="Census: every plan stays on the clock; hover names sectors">◌</button>
         <button id="b-done" class="ic" aria-pressed="false" title="Show completed plans on the clock (auto-on during playback)">✓</button>
-        <button id="b-ledger" class="ic" aria-pressed="false" title="Completed-plans list (left). Auto-shows during playback; hides on lens swap.">≡</button>
         <button id="b-state" class="ic" aria-pressed="false" title="State colours: complete green · in progress purple · blocked red">◑</button>
         <button id="b-lin" class="ic" aria-pressed="false" title="Lineage chords (depends_on)">⌇</button>
       </span>
@@ -384,7 +386,6 @@ const cells = [];
 let rot = 0, spinning = !REDUCED, resetTween = false;
 let mode = 'bars';                                 /* dots | bars — bars by default */
 let showCompleted = false;                         /* completed plans on the clock; auto-on while playing */
-let showLedger = false;                            /* completed list (left); auto-on during play, off on lens swap */
 let dir = 'out';                                   /* out: rings grow from centre · in: nodes sink from rim */
 let showAll = false;                               /* census mode: nothing retires off the clock */
 let hoverSec = null;                               /* plan whose sector is under the pointer */
@@ -895,10 +896,9 @@ function draw(now) {
   }
 
   /* completed ledger — plans retire off the clock into the left edge.
-     Rows are clickable: filter the ring down to that one plan.
-     Hidden by default; ≡ toggles, playback auto-shows, lens swap hides. */
+     Rows are clickable: filter the ring down to that one plan. */
   ledgerRows = [];
-  if (lens === 'work' && showLedger) {
+  if (lens === 'work') {
     const doneList = PLANS
       .filter(p => p.st === 0 && p.exit <= T && p.b <= E && p.e >= S - 0.001)
       .sort((a, b) => b.exit - a.exit);
@@ -1239,11 +1239,6 @@ function setPlaying(v) {
   bPlay.textContent = v ? '⏸' : '▶';
   bPlay.setAttribute('aria-pressed', String(v));
   if (v && !showCompleted) setCompleted(true);     /* playback needs the add/remove story */
-  if (v && !showLedger) setLedger(true);           /* …and the retire list alongside it */
-}
-function setLedger(v) {
-  showLedger = v;
-  document.getElementById('b-ledger').setAttribute('aria-pressed', String(v));
 }
 function setCompleted(v) {
   showCompleted = v;
@@ -1258,7 +1253,6 @@ bSpin.addEventListener('click', () => {
   bSpin.setAttribute('aria-pressed', String(spinning));
 });
 document.getElementById('b-done').addEventListener('click', () => setCompleted(!showCompleted));
-document.getElementById('b-ledger').addEventListener('click', () => setLedger(!showLedger));
 bClock.addEventListener('click', () => {
   resetTween = true;
   spinning = false;                                /* reset also stops the spin */
@@ -1621,7 +1615,6 @@ document.querySelectorAll('#tiles .tile').forEach(t2 => {
     lens = t2.dataset.lens;
     document.querySelectorAll('#tiles .tile').forEach(x => x.setAttribute('aria-pressed', String(x === t2)));
     setSel(null); solo = null; hover = null; hoverSec = null; gSel = null; tokSel = null; hideTip();
-    setLedger(false);                              /* lens swap hides the completed list */
     if (lens === 'data') {
       /* auto-fit the window to the data extent so source dates spread the clock */
       const minD = Math.min(...GNODES.map(n => n.d)) - 0.5;
