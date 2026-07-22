@@ -38,11 +38,30 @@ code { font-family: var(--font-mono); font-size: .9em; background: var(--panel-s
 #topbar .pill .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--teal); }
 #topbar .sp { margin-left: auto; }
 
-/* ── lens tiles: compact stack, top-right over the stage ── */
+/* framed inside the console: its chrome already provides the top bar */
+.framed #topbar { display: none; }
+
+/* ── lens tiles: compact row docked at the bottom (above the control bar) ── */
 #tiles {
-  position: absolute; top: 14px; right: 16px; z-index: 15;
-  display: flex; flex-direction: column; gap: 6px; width: 200px;
+  position: absolute; bottom: 108px; right: 16px; z-index: 15;
+  display: flex; flex-direction: row; flex-wrap: wrap; justify-content: flex-end;
+  gap: 6px; max-width: 60vw;
 }
+
+/* ── daemon at a glance: top-right, live from /v1/console/summary ── */
+#glance {
+  position: absolute; top: 14px; right: 16px; z-index: 14;
+  display: grid; grid-template-columns: 1fr 1fr; gap: 6px; width: 230px;
+}
+.gl {
+  text-align: left; cursor: default;
+  background: rgba(14,16,24,.88); border: 1px solid var(--hairline);
+  border-radius: 10px; padding: 7px 11px 6px;
+  color: var(--ink2); font-family: var(--font-sans);
+}
+.gl .t { display: block; font: 600 9.5px var(--font-mono); letter-spacing: .04em; color: var(--ink3); text-transform: uppercase; }
+.gl .n { display: block; font: 700 15px var(--font-sans); color: var(--ink); letter-spacing: -.01em; font-variant-numeric: tabular-nums; margin-top: 1px; }
+#glance .src { grid-column: 1 / -1; font: 10px var(--font-mono); color: var(--ink3); text-align: right; padding-right: 2px; }
 .tile {
   text-align: left; cursor: pointer;
   display: flex; align-items: baseline; gap: 8px;
@@ -162,6 +181,7 @@ footer { max-width: 1100px; margin: 48px auto 0; padding: 20px clamp(16px, 4vw, 
 @media (prefers-reduced-motion: reduce) { #tip { transition: none; } }
 </style>
 
+<script>if (window.self !== window.top) document.documentElement.classList.add('framed');</script>
 <header id="topbar">
   <span class="brand">crux <span>· console</span></span>
   <span class="pill"><span class="dot"></span>daemon · local</span>
@@ -190,6 +210,15 @@ footer { max-width: 1100px; margin: 48px auto 0; padding: 20px clamp(16px, 4vw, 
       <button class="tile" data-lens="tokens" aria-pressed="false">
         <span class="t"><i style="background:#f5a623"></i>Tokens</span><span class="n" id="tile-tok">—</span>
       </button>
+    </div>
+    <div id="glance" role="group" aria-label="Daemon at a glance">
+      <button class="gl"><span class="t">facts</span><span class="n" id="gl-facts">5,026</span></button>
+      <button class="gl"><span class="t">sessions</span><span class="n" id="gl-sessions">76</span></button>
+      <button class="gl"><span class="t">execplans</span><span class="n" id="gl-execplans">1,081</span></button>
+      <button class="gl"><span class="t">mcp agents</span><span class="n" id="gl-mcp">5</span></button>
+      <button class="gl"><span class="t">integrations</span><span class="n" id="gl-int">3</span></button>
+      <button class="gl"><span class="t">engine</span><span class="n" id="gl-engine">off</span></button>
+      <span class="src" id="gl-src">snapshot · 2026-07-22</span>
     </div>
     <div class="stagebar">
       <span class="grp">
@@ -281,7 +310,8 @@ function showTip(x, y, html) {
 function hideTip() { tip.style.opacity = 0; }
 
 /* ── time base: day 0 = 2026-05-07 ── */
-const NOW = 76;                                    /* 2026-07-22 */
+let NOW = 76;                                      /* 2026-07-22 snapshot; extends when live data loads */
+let dataSrc = 'snapshot';                          /* snapshot | live · prod-mirror */
 function dayDate(d) {
   return new Date(Date.UTC(2026, 4, 7) + d * 86400000).toISOString().slice(0, 10);
 }
@@ -294,21 +324,33 @@ const STATE_HUE = { 0: '#34d399', 1: '#a78bfa', 2: '#ef4444' };
 const stateHue = p => STATE_HUE[p.st];
 const PARK_DAYS = 18;                              /* WorkItem.stale semantics */
 
-const PLANS = PLANS_RAW.map((p, i) => {
+/* PLANS is rebuildable: boots from the embedded snapshot, then swaps to the
+   daemon's live work board when served same-origin (the console mirror). */
+const PLANS = [];
+function mapRaw(p, i) {
   const short = p.s.replace(/-2026-\d\d-\d\d$/, '').replace(/-2026$/, '');
   /* exit day: complete → e + 1.5; in_progress/blocked → park at e + PARK_DAYS (never if recent) */
   const exit = p.st === 0 ? p.e + 1.5 : (NOW - p.e > PARK_DAYS ? p.e + PARK_DAYS : Infinity);
   return { i, slug: p.s, short, st: p.st, done: p.d, total: p.t || 1, b: Math.max(0, p.b), e: p.e, o: p.o, exit,
            dep: p.dep || [], ext: p.ext || [], od: p.od || [],
            traced: p.s.startsWith('crux-daemon-buyer-fit') || p.s.startsWith('cross-site-auth-sso') };
-});
-/* lineage edges resolvable within the embedded set: a depends_on b */
-const bySlug = Object.fromEntries(PLANS.map(p => [p.slug, p]));
-const DEP_EDGES = [];
-for (const p of PLANS) for (const d of p.dep) {
-  const t2 = bySlug[d];
-  if (t2) DEP_EDGES.push({ a: p, b: t2 });
 }
+function loadPlans(raws) {
+  PLANS.length = 0;
+  raws.forEach((p, i) => PLANS.push(mapRaw(p, i)));
+}
+/* lineage edges resolvable within the current set: a depends_on b */
+const DEP_EDGES = [];
+function rebuildLineage() {
+  DEP_EDGES.length = 0;
+  const bySlug = Object.fromEntries(PLANS.map(p => [p.slug, p]));
+  for (const p of PLANS) for (const d of p.dep) {
+    const t2 = bySlug[d];
+    if (t2) DEP_EDGES.push({ a: p, b: t2 });
+  }
+}
+loadPlans(PLANS_RAW);
+rebuildLineage();
 
 /* real facts for the two traced plans (day = 67 + offset from Jul 13) */
 const J13 = 67;                                    /* 2026-07-13 as day index */
@@ -336,9 +378,10 @@ const RFACTS = [
   ['bf', 'decision:m5b-installer-transaction', 'decision', 9.367, 'claude-work', 'stable', 232, 1],
 ];
 
-/* cells: real for traced plans, milestone-derived for the rest */
+/* cells: real for traced plans, milestone-derived for the rest (rebuildable) */
 const cells = [];
-(function makeCells() {
+function buildCells() {
+  cells.length = 0;
   const rr = mulberry32(0xC4C4);
   for (const p of PLANS) {
     if (p.traced) {
@@ -378,7 +421,8 @@ const cells = [];
     /* height scale: heavier plans (output tokens) get taller rim charts */
     p.tokScale = 0.35 + 0.65 * Math.min(1, Math.log(1 + p.o) / Math.log(81));
   }
-})();
+}
+buildCells();
 
 /* ── view state ── */
 let rot = 0, spinning = !REDUCED, resetTween = false;
@@ -859,7 +903,7 @@ function draw(now) {
   ctx.fillStyle = 'rgba(126,133,149,.8)';
   ctx.font = '9.5px ' + MONO;
   ctx.fillText(dayDate(S) + ' → ' + dayDate(E) + ' · T = ' + dayDate(T) + ' · ' + nAct + ' live · zoom ' + Z.toFixed(1) + '×'
-    + (RAD_LO > S + 0.5 ? ' · rings from ' + dayDate(RAD_LO) : ''), 18, 24);
+    + (RAD_LO > S + 0.5 ? ' · rings from ' + dayDate(RAD_LO) : '') + ' · ' + dataSrc, 18, 24);
 
   /* solo: ledger labels + the seam's min→max range for THIS plan */
   if (soloLabels) {
@@ -1046,7 +1090,8 @@ function drawDataLens(ctx2, g) {
    fact ≈ 12 tokens vs ~3k replaying the conversation it came from — applied
    to the facts written each day. Bars: spent grows OUTWARD (purple), saved
    grows INWARD toward the heartwood (green). ▥ toggles cumulative/daily. ── */
-const TOK = (function buildTok() {
+let TOK = null;
+function buildTok() {
   const spent = {}, saved = {};
   for (const p of PLANS) {
     if (!p.cells.length || !p.o) continue;
@@ -1064,8 +1109,13 @@ const TOK = (function buildTok() {
   for (const d2 in spent) totS += spent[d2];
   for (const d2 in saved) totV += saved[d2];
   return { spent, saved, totS, totV };
-})();
-document.getElementById('tile-tok').textContent = Math.round(TOK.totS) + 'M';
+}
+function refreshTok() {
+  TOK = buildTok();
+  document.getElementById('tile-tok').textContent = Math.round(TOK.totS) + 'M';
+}
+refreshTok();
+const SNAP_TOK = TOK;   /* snapshot token profile — fallback when a live board carries no token_burn */
 let tokBins = [];                                  /* per-frame bin geometry for hover */
 let tokView = 'cum';                               /* cum | day — explicit sub-view */
 let tokSel = null;                                 /* selected day → pane lists active plans */
@@ -1708,5 +1758,73 @@ document.getElementById('b-tok-day').addEventListener('click', () => setTokView(
 
 /* init */
 syncWindow();
+
+/* ── live wire: when served same-origin by the daemon (console mirror), swap
+   the embedded snapshot for the real work board + glance metrics. Fails
+   silently back to the snapshot anywhere else (artifact, file://). ── */
+(async function liveInit() {
+  const num = v => (v === null || v === undefined) ? '—' : Number(v).toLocaleString();
+  try {
+    const r = await fetch('/v1/work?source=all', { headers: { accept: 'application/json' } });
+    if (r.ok && (r.headers.get('content-type') || '').includes('json')) {
+      const j = await r.json();
+      const items = (j.work || []).filter(w =>
+        w.id && w.id.startsWith('execplan:') &&
+        w.provenance && w.provenance.first_activity_unix_ms &&
+        ['in_progress', 'complete', 'blocked'].includes(w.state));
+      if (items.length >= 50) {
+        NOW = Math.max(76, Math.floor(Date.now() / 86400000) - 20580);
+        const raws = items.map(w => ({
+          s: w.id.slice(9),
+          st: w.state === 'in_progress' ? 1 : w.state === 'blocked' ? 2 : 0,
+          d: w.milestones_done || 0, t: w.milestones_total || 1,
+          b: Math.floor(w.provenance.first_activity_unix_ms / 86400000) - 20580,
+          e: Math.floor(w.provenance.last_activity_unix_ms / 86400000) - 20580,
+          o: Math.floor(((w.token_burn && w.token_burn.output_tokens) || 0) / 1e5),
+          dep: w.depends_on || [], ext: w.extended_by || [], od: w.open_decisions || [],
+        }));
+        setSel(null); solo = null; hover = null; hoverSec = null; gSel = null; tokSel = null;
+        loadPlans(raws);
+        rebuildLineage();
+        buildCells();
+        refreshTok();
+        /* this mirror serves token_burn: null on work items (attribution not
+           materialised from the copied session-events) — keep the snapshot
+           token profile rather than showing an all-zero lens */
+        if (TOK.totS < 1 && SNAP_TOK.totS >= 1) {
+          TOK = SNAP_TOK;
+          document.getElementById('tile-tok').textContent = Math.round(TOK.totS) + 'M (snap)';
+        }
+        dStart.max = dEnd.max = dayDate(NOW);
+        syncWindow();
+        dataSrc = 'live · prod-mirror';
+        document.getElementById('gl-execplans').textContent = num(j.count);
+        document.querySelector('[data-lens="work"] .n').textContent = num(j.count);
+        document.getElementById('gl-src').textContent = 'live · ' + dayDate(NOW);
+      }
+    }
+  } catch (e) { /* not same-origin with a daemon — snapshot stands */ }
+  try {
+    const r2 = await fetch('/v1/console/summary', { headers: { accept: 'application/json' } });
+    if (r2.ok && (r2.headers.get('content-type') || '').includes('json')) {
+      const s2 = await r2.json();
+      if (s2.stores) {
+        document.getElementById('gl-facts').textContent = num(s2.stores.facts);
+        document.getElementById('gl-sessions').textContent = num(s2.stores.sessions);
+      }
+      if (s2.daemon && s2.daemon.mcp_agent_count !== undefined)
+        document.getElementById('gl-mcp').textContent = num(s2.daemon.mcp_agent_count);
+      if (s2.integrations !== undefined) {
+        const gi = s2.integrations;
+        document.getElementById('gl-int').textContent =
+          Array.isArray(gi) ? String(gi.length)
+          : (gi && typeof gi === 'object') ? num(gi.builtin_pack_count !== undefined ? gi.builtin_pack_count : Object.keys(gi).length)
+          : num(gi);
+      }
+      if (s2.daemon)
+        document.getElementById('gl-engine').textContent = s2.daemon.dataplane_enabled ? 'on' : 'off';
+    }
+  } catch (e) { /* snapshot glance stands */ }
+})();
 })();
 </script>
