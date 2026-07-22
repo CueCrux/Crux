@@ -97,6 +97,7 @@ footer { max-width: 1100px; margin: 48px auto 0; padding: 20px clamp(16px, 4vw, 
         <button id="b-clock">reset clock</button>
         <button id="b-mode" aria-pressed="false">bars</button>
         <button id="b-dir" aria-pressed="false" title="Where new nodes appear: centre-out (rings grow) or rim-in (nodes sink)">edge: outward</button>
+        <button id="b-all" aria-pressed="false" title="Every plan in the window stays on the clock — completed and parked included. Labels hide; hover a sector to name it.">all plans</button>
       </span>
       <span class="grp">
         <label for="r-start">start</label><input id="r-start" type="range" min="0" max="1000" value="0">
@@ -279,6 +280,8 @@ const cells = [];
 let rot = 0, spinning = !REDUCED, resetTween = false;
 let mode = 'dots';                                 /* dots | bars */
 let dir = 'out';                                   /* out: rings grow from centre · in: nodes sink from rim */
+let showAll = false;                               /* census mode: nothing retires off the clock */
+let hoverSec = null;                               /* plan whose sector is under the pointer */
 let S = 11, E = NOW, T = NOW;                      /* window + playhead (days) */
 let playing = false;
 let Z = 1, panX = 0, panY = 0;
@@ -301,6 +304,7 @@ const cDate = document.getElementById('c-date');
 const SEAM = 0.10;                                 /* gap at 12 o'clock */
 const BASE = -Math.PI / 2 + SEAM / 2;              /* 12:01 */
 function activePlans(t) {
+  if (showAll) return PLANS.filter(p => p.b <= t && p.e >= S - 0.001 && p.b <= E);
   return PLANS.filter(p => p.b <= t && t < p.exit && p.e >= S - 0.001 && p.b <= E);
 }
 function layoutTargets(t) {
@@ -319,7 +323,8 @@ function stepLayout(dt) {
       if (!p.lay) {                                /* enter: bloom from target mid */
         const mid = (tg.a0 + tg.a1) / 2;
         p.lay = { a0: mid, a1: mid, alpha: 0 };
-        flashes.push({ kind: 'enter', ang: mid, t0: performance.now() / 1000, hue: '#8b96f2' });
+        if (flashes.length < 40)                   /* cap: toggling census mode births 160+ at once */
+          flashes.push({ kind: 'enter', ang: mid, t0: performance.now() / 1000, hue: '#8b96f2' });
       }
       p.lay.a0 = mix(p.lay.a0, tg.a0, k);
       p.lay.a1 = mix(p.lay.a1, tg.a1, k);
@@ -445,14 +450,23 @@ function draw(now) {
     if (!p.lay || p.lay.alpha < 0.02) continue;
     const L = p.lay, al = L.alpha;
     const wSec = L.a1 - L.a0;
-    /* divider */
-    ctx.strokeStyle = 'rgba(255,255,255,' + 0.06 * al + ')';
-    ctx.beginPath();
-    ctx.moveTo(Math.cos(L.a0) * g.r0, Math.sin(L.a0) * g.r0);
-    ctx.lineTo(Math.cos(L.a0) * g.R, Math.sin(L.a0) * g.R);
-    ctx.stroke();
+    /* divider — skipped when sectors are too thin to separate */
+    if (wSec * g.R * Z > 8) {
+      ctx.strokeStyle = 'rgba(255,255,255,' + 0.06 * al + ')';
+      ctx.beginPath();
+      ctx.moveTo(Math.cos(L.a0) * g.r0, Math.sin(L.a0) * g.r0);
+      ctx.lineTo(Math.cos(L.a0) * g.R, Math.sin(L.a0) * g.R);
+      ctx.stroke();
+    }
     /* rim progress arc */
     const hue = p.st === 2 ? '#ef4444' : p.st === 0 ? '#2dd4bf' : '#f5a623';
+    /* hovered sector: full-arc highlight */
+    if (p === hoverSec) {
+      ctx.strokeStyle = hex2rgba(hue, 0.28 * al);
+      ctx.lineWidth = 10 / Z;
+      ctx.beginPath(); ctx.arc(0, 0, g.R - 5 / Z, L.a0, L.a1); ctx.stroke();
+      ctx.lineWidth = 1 / Z;
+    }
     ctx.strokeStyle = hex2rgba(hue, 0.6 * al);
     ctx.lineWidth = 2 / Z;
     ctx.beginPath(); ctx.arc(0, 0, g.R + 4, L.a0 + 0.01, L.a0 + Math.max(0.02, (wSec - 0.02) * (p.done / p.total))); ctx.stroke();
@@ -465,7 +479,7 @@ function draw(now) {
     }
     /* rim token chart: sector start = tracking start, sector end = current.
        radial ticks on [R+7, R+7+h] — a circular barcode of spend */
-    {
+    if (wSec * g.R * Z > 30) {
       const NB = p.tok.length;
       const eEff = Math.min(T, p.e + 0.001);
       const life = Math.max(0.5, p.e - p.b);
@@ -484,17 +498,19 @@ function draw(now) {
       }
       ctx.lineWidth = 1 / Z;
     }
-    /* label if wide enough on screen — the plan heading */
-    if (wSec * g.R * Z > 46) {
+    /* label if wide enough on screen — or hovered (census mode names on hover) */
+    const isHovSec = p === hoverSec;
+    if (wSec * g.R * Z > 46 || isHovSec) {
       const midA = (L.a0 + L.a1) / 2, lr = g.R + 26;
       ctx.save();
       ctx.translate(Math.cos(midA) * lr, Math.sin(midA) * lr);
       ctx.rotate(midA + (Math.cos(midA + rot) < 0 ? Math.PI : 0));
-      ctx.fillStyle = 'rgba(200,206,219,' + 0.95 * al + ')';
+      ctx.fillStyle = isHovSec ? 'rgba(238,240,246,1)' : 'rgba(200,206,219,' + 0.95 * al + ')';
       ctx.font = '700 ' + (12 / Z) + 'px ' + MONO;
       ctx.textAlign = Math.cos(midA + rot) < 0 ? 'right' : 'left';
       ctx.textBaseline = 'middle';
-      const lbl = p.short.length > 16 ? p.short.slice(0, 15) + '…' : p.short;
+      const lbl = isHovSec ? (p.short.length > 34 ? p.short.slice(0, 33) + '…' : p.short)
+                           : (p.short.length > 16 ? p.short.slice(0, 15) + '…' : p.short);
       ctx.fillText(lbl + ' ' + p.done + '/' + p.total, 0, 0);
       ctx.restore();
     }
@@ -591,7 +607,7 @@ function draw(now) {
   ctx.fillText('crux', core.x, core.y - 6);
   ctx.fillStyle = 'rgba(126,133,149,.9)';
   ctx.font = '8.5px ' + MONO;
-  ctx.fillText(nAct + ' live', core.x, core.y + 7);
+  ctx.fillText(nAct + (showAll ? ' plans' : ' live'), core.x, core.y + 7);
   ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
 
   /* corner status */
@@ -709,6 +725,11 @@ bDir.addEventListener('click', () => {
   bDir.textContent = dir === 'out' ? 'edge: outward' : 'edge: inward';
   bDir.setAttribute('aria-pressed', String(dir === 'in'));
 });
+const bAll = document.getElementById('b-all');
+bAll.addEventListener('click', () => {
+  showAll = !showAll;
+  bAll.setAttribute('aria-pressed', String(showAll));
+});
 function syncWindow() {
   const s = Math.min(rStart.value / 1000, rEnd.value / 1000 - 0.03);
   const e = Math.max(rEnd.value / 1000, rStart.value / 1000 + 0.03);
@@ -762,6 +783,7 @@ cv.addEventListener('pointermove', e => {
     return;
   }
   hover = hitTest(e);
+  hoverSec = hover ? hover.p : sectorAt(e);
   if (hover) {
     const c = hover;
     showTip(mxAbs, myAbs, c.real
@@ -772,9 +794,33 @@ cv.addEventListener('pointermove', e => {
       : '<b>' + c.p.short + '</b><br>' +
         '<span class="k">' + STATE[c.p.st] + ' · ' + c.p.done + '/' + c.p.total + ' · born ' + dayDate(c.p.b) + '</span><br>' +
         '<span class="k">' + (c.kind === 'gate' ? c.key : 'untraced density — one query_facts call away') + '</span>');
+  } else if (hoverSec) {
+    const p = hoverSec;
+    showTip(mxAbs, myAbs,
+      '<b>' + p.short + '</b><br>' +
+      '<span class="k">' + STATE[p.st] + ' · ' + p.done + '/' + p.total + '</span><br>' +
+      '<span class="k">born</span> ' + dayDate(p.b) + ' <span class="k">· last</span> ' + dayDate(p.e) +
+      (p.o ? '<br><span class="k">output</span> ' + (p.o / 10).toFixed(1) + 'M tok' : ''));
   } else hideTip();
 });
-cv.addEventListener('pointerleave', () => { hover = null; hideTip(); });
+/* which plan's sector is under the pointer (annulus only) */
+function sectorAt(e) {
+  const r = cv.getBoundingClientRect();
+  const g = geom();
+  const p = toDisc(g, e.clientX - r.left, e.clientY - r.top);
+  const pr = Math.hypot(p.x, p.y);
+  if (pr < g.r0 * 0.85 || pr > g.R + 30) return null;
+  const pa = Math.atan2(p.y, p.x);
+  for (const pl of PLANS) {
+    if (!pl.lay || pl.lay.alpha < 0.4) continue;
+    let da = pa - pl.lay.a0;
+    while (da < 0) da += TAU;
+    while (da >= TAU) da -= TAU;
+    if (da <= pl.lay.a1 - pl.lay.a0) return pl;
+  }
+  return null;
+}
+cv.addEventListener('pointerleave', () => { hover = null; hoverSec = null; hideTip(); });
 
 function hitTest(e) {
   const r = cv.getBoundingClientRect();
