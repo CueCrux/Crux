@@ -219,10 +219,6 @@ footer { max-width: 1100px; margin: 48px auto 0; padding: 20px clamp(16px, 4vw, 
           <option value="codex-work">codex-work</option>
         </select>
       </span>
-      <span class="grp" id="tok-views" style="display:none">
-        <button id="b-tok-cum" aria-pressed="true" title="Running total across the window">cumulative</button>
-        <button id="b-tok-day" aria-pressed="false" title="Tokens per day">per day</button>
-      </span>
       <span class="grp">
         <input id="d-start" type="date" min="2026-05-18" max="2026-07-22" value="2026-05-18" aria-label="Window start date">
         <input id="r-start" type="range" min="0" max="1000" value="0" style="width:70px" aria-label="Window start">
@@ -1067,10 +1063,9 @@ const TOK = (function buildTok() {
 })();
 document.getElementById('tile-tok').textContent = Math.round(TOK.totS) + 'M';
 let tokBins = [];                                  /* per-frame bin geometry for hover */
-let tokView = 'cum';                               /* cum | day — explicit sub-view */
 function drawTokensLens(ctx2, g) {
   tokBins = [];
-  const cum = tokView === 'cum';
+  const cum = mode === 'bars';                     /* ▥ = cumulative (default) */
   const rB = g.r0 * 1.7;
   const spanOut = g.R * 0.94 - rB, spanIn = rB - g.r0 * 0.8;
   const d0 = Math.ceil(S), d1 = Math.floor(Math.min(T, E));
@@ -1107,11 +1102,9 @@ function drawTokensLens(ctx2, g) {
   }
   ctx2.lineWidth = 1 / Z;
   const pct = TOK.totS > 0 ? Math.round(100 * TOK.totV / TOK.totS) : 0;
-  const nDays = Math.max(1, rows.length);
   lensLabels.push({ x: 0, y: g.R + 42, cap: true,
-    t: cum
-      ? 'tokens · cumulative · outward = spent ' + Math.round(TOK.totS) + 'M · inward = est. saved ' + TOK.totV.toFixed(1) + 'M (~' + pct + '%, from 12-token fact recalls vs ~3k replays)'
-      : 'tokens · per day · avg ' + (cs / nDays).toFixed(1) + 'M/day spent · peak ' + maxS.toFixed(1) + 'M · est. saved avg ' + (cv / nDays * 1000).toFixed(0) + 'k/day' });
+    t: 'tokens · ' + (cum ? 'cumulative' : 'daily') + ' (▥ toggles) · outward = spent ' + Math.round(TOK.totS) +
+       'M · inward = est. saved ' + TOK.totV.toFixed(1) + 'M (~' + pct + '%, from 12-token fact recalls vs ~3k replays)' });
 }
 
 /* ── alternative lenses: same disc, different substrate cut ── */
@@ -1574,18 +1567,8 @@ document.querySelectorAll('#tiles .tile').forEach(t2 => {
       const minD = Math.min(...GNODES.map(n => n.d)) - 0.5;
       if (S < minD - 1) { rStart.value = Math.round((minD - 11) / (NOW - 11) * 1000); syncWindow(); }
     }
-    document.getElementById('tok-views').style.display = lens === 'tokens' ? 'flex' : 'none';
   });
 });
-
-/* tokens sub-views */
-function setTokView(v) {
-  tokView = v;
-  document.getElementById('b-tok-cum').setAttribute('aria-pressed', String(v === 'cum'));
-  document.getElementById('b-tok-day').setAttribute('aria-pressed', String(v === 'day'));
-}
-document.getElementById('b-tok-cum').addEventListener('click', () => setTokView('cum'));
-document.getElementById('b-tok-day').addEventListener('click', () => setTokView('day'));
 
 /* init */
 syncWindow();
