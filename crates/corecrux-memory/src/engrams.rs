@@ -151,7 +151,7 @@ pub fn builtin_engrams() -> Vec<LocalEngram> {
             ),
             content: "Before writing code, take the highest rung that holds: (1) does this need to exist at all — speculative need is skipped, said in one line; (2) does it already exist in this codebase — search first, reuse the existing helper/type/pattern; (3) stdlib covers it — use it; (4) a native platform feature covers it — prefer it over hand-rolled code; (5) an already-installed dependency covers it — use it, never add a new one for a few lines; (6) it fits in one line — one line; (7) only then write the minimum code that works. Understand the problem before climbing: trace every file the change touches. Never minimise away trust-boundary validation, data-loss error handling, security, accessibility, or anything explicitly requested. Non-trivial logic leaves one runnable check behind. Mark deliberate ceilings with a `crux-min:` comment naming the upgrade trigger.".to_string(),
             applicable_why: Some(
-                "Measured on frontier models (AuditCrux benchmarks/ponytail, corpus ponytail-fastapi-cd83fc1): -48% to -70% code volume with no correctness regression; effect grows with model capability.".to_string(),
+                "The historical v1-profile replay (AuditCrux benchmarks/ponytail, corpus ponytail-fastapi-cd83fc1) observed lower pooled code volume and recorded total-token aggregates on Fable and Opus. All 96 cells left a non-empty diff, but the harness executed no generated patch or task test and one Opus baseline timed out, so it supports no functional-correctness or causal scaling claim.".to_string(),
             ),
             capability_class_min: None,
             capability_class_max: None,
@@ -188,6 +188,7 @@ pub fn build_engram_manifest(engrams: &[LocalEngram], tenant_id: &str, capabilit
                 "version": e.version,
                 "intent_bucket": e.intent_bucket,
                 "prompt_hash": prompt_hash(&e.content),
+                "applicable_why_hash": e.applicable_why.as_deref().map(prompt_hash),
                 "generated_class": &e.generated_class,
                 "source_chunk_hashes": &e.source_chunk_hashes,
                 "source_chunk_set_hash": &e.source_chunk_set_hash,
@@ -214,7 +215,14 @@ pub fn build_engram_manifest(engrams: &[LocalEngram], tenant_id: &str, capabilit
 pub fn compute_engram_set_hash(engrams: &[LocalEngram]) -> serde_json::Value {
     let rows: Vec<_> = engrams
         .iter()
-        .map(|e| json!({"name": e.name, "version": e.version, "prompt_hash": prompt_hash(&e.content)}))
+        .map(|e| {
+            json!({
+                "name": e.name,
+                "version": e.version,
+                "prompt_hash": prompt_hash(&e.content),
+                "applicable_why_hash": e.applicable_why.as_deref().map(prompt_hash),
+            })
+        })
         .collect();
     let row_value = serde_json::Value::Array(rows);
     let count = row_value.as_array().map_or(0, Vec::len);
@@ -333,6 +341,24 @@ mod tests {
     }
 
     #[test]
+    fn manifest_and_set_hashes_bind_applicable_why() {
+        let one = builtin_engrams();
+        let mut two = one.clone();
+        two[0].applicable_why = Some("corrected rationale".to_string());
+
+        let manifest_a = build_engram_manifest(&one, "t", "capable");
+        let manifest_b = build_engram_manifest(&two, "t", "capable");
+        assert_ne!(manifest_a["manifest_hash"], manifest_b["manifest_hash"]);
+        assert_ne!(
+            compute_engram_set_hash(&one)["hash"],
+            compute_engram_set_hash(&two)["hash"]
+        );
+        assert!(manifest_a["engrams"][0]["applicable_why_hash"]
+            .as_str()
+            .is_some_and(|hash| hash.starts_with("blake3:")));
+    }
+
+    #[test]
     fn manifest_round_trips_generated_metadata() {
         let engrams = vec![LocalEngram {
             id: "generated-1".to_string(),
@@ -366,10 +392,15 @@ mod tests {
         let cm = builtins
             .iter()
             .find(|e| e.name == "code-minimalism" && e.version == "v1")
-            .expect("code-minimalism v1 must ship as a builtin");
+            .expect("the backwards-compatible code-minimalism v1 must ship as a builtin");
         assert_eq!(cm.intent_bucket, "developer_surface");
         assert!(cm.enabled);
         assert!(cm.content.contains("crux-min:"));
+        let why = cm.applicable_why.as_deref().expect("bounded rationale");
+        assert!(why.contains("All 96 cells"));
+        assert!(why.contains("timed out"));
+        assert!(why.contains("no functional-correctness or causal scaling claim"));
+        assert!(!why.contains("no correctness regression"));
     }
 
     #[test]

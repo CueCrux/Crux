@@ -186,6 +186,44 @@ This is the body.
     }
 
     #[test]
+    fn code_minimalism_v2_bounds_benchmark_claims() {
+        let bundled = load_bundled_profiles().unwrap();
+        let profile = bundled
+            .iter()
+            .find(|f| f.frontmatter.name == "code-minimalism")
+            .expect("code-minimalism fragment must be bundled");
+        assert_eq!(profile.frontmatter.version, 2);
+
+        let claims = format!("{}\n{}", profile.frontmatter.description, profile.body)
+            .to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(claims.contains("did not execute"));
+        assert!(claims.contains("non-empty code diff"));
+        assert!(claims.contains("95 returned cli result json"));
+        assert!(claims.contains("timed out"));
+        assert!(claims.contains("censored/provisional"));
+        assert!(claims.contains("functional correctness"));
+        assert!(claims.contains("causal"));
+        for unsupported in [
+            "no correctness regression",
+            "zero correctness",
+            "correctness 1.0",
+            "correctness 1.00",
+            "both arms correct",
+            "48/48 correct",
+            "all cells correct",
+            "effect scales with model",
+            "effect grows with model",
+            "stronger models over-build",
+            "matters most on the strongest",
+        ] {
+            assert!(!claims.contains(unsupported), "unsupported claim: {unsupported}");
+        }
+    }
+
+    #[test]
     fn boot_banner_fragment_loads() {
         let bundled = load_bundled_profiles().unwrap();
         let bb = bundled
