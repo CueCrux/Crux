@@ -69,37 +69,6 @@ table.map td:first-child { font-family: var(--font-mono); font-size: 11.5px; col
 table.map td:last-child { color: var(--ink2); }
 table.map td:last-child b { color: var(--ink); font-weight: 600; }
 
-/* ── slide-out detail pane ── */
-#pane {
-  position: absolute; top: 0; right: 0; bottom: 0; z-index: 20;
-  width: min(330px, 86vw);
-  background: rgba(14,16,24,.97);
-  border-left: 1px solid var(--hairline-strong);
-  transform: translateX(105%);
-  transition: transform .30s cubic-bezier(.16,1,.3,1);
-  padding: 18px 18px 60px;
-  overflow-y: auto;
-  font-family: var(--font-mono); font-size: 11.5px; line-height: 1.6; color: var(--ink2);
-}
-#pane.open { transform: translateX(0); }
-#pane h4 { font: 700 13px var(--font-mono); color: var(--ink); margin: 0 0 2px; overflow-wrap: anywhere; }
-#pane .kindchip { display: inline-flex; align-items: center; gap: 6px; font-size: 10.5px; color: var(--ink3);
-  border: 1px solid var(--hairline-strong); border-radius: 999px; padding: 2px 10px; margin: 6px 0 12px; }
-#pane .kindchip i { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
-#pane .row { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; border-bottom: 1px solid var(--hairline); }
-#pane .row span:first-child { color: var(--ink3); white-space: nowrap; }
-#pane .row span:last-child { color: var(--ink2); text-align: right; overflow-wrap: anywhere; }
-#pane .sect { margin-top: 16px; font: 700 10.5px var(--font-mono); letter-spacing: .04em; color: var(--ink3); }
-#pane .bar { height: 5px; border-radius: 3px; background: rgba(255,255,255,.08); margin: 8px 0 4px; overflow: hidden; }
-#pane .bar i { display: block; height: 100%; border-radius: 3px; }
-#pane ul.facts { list-style: none; margin: 8px 0 0; padding: 0; }
-#pane ul.facts li { padding: 4px 0 4px 14px; position: relative; font-size: 10.5px; color: var(--ink3); }
-#pane ul.facts li::before { content: ''; position: absolute; left: 2px; top: 9px; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); opacity: .6; }
-#pane ul.facts li.sel { color: var(--ink); }
-#pane ul.facts li b { color: var(--ink2); font-weight: 600; }
-#pane .note { margin-top: 12px; font-size: 10.5px; color: var(--ink3); }
-@media (prefers-reduced-motion: reduce) { #pane { transition: none; } }
-
 #tip {
   position: fixed; z-index: 90; pointer-events: none;
   background: rgba(18,20,29,.97); border: 1px solid var(--hairline-strong);
@@ -144,9 +113,8 @@ footer { max-width: 1100px; margin: 48px auto 0; padding: 20px clamp(16px, 4vw, 
         <button id="b-zout" aria-label="Zoom out">−</button>
         <button id="b-zfit">fit</button>
       </span>
-      <span class="hint" id="hint">wheel = zoom · drag = pan · click node / sector / ledger · background clears</span>
+      <span class="hint" id="hint">wheel = zoom · drag = pan · click a dot or bar for its card</span>
     </div>
-    <aside id="pane" aria-label="Detail pane"></aside>
   </div>
   <div class="cnotes">
     <div class="why">
@@ -291,11 +259,18 @@ const cells = [];
     p.cells = cells.filter(c => c.p === p).sort((a, b) => b.day - a.day);
     const asc = [...p.cells].sort((a, b) => a.day - b.day);
     asc.forEach((c, k) => { c.rank = k; c.n = asc.length; });
-    /* rim token weight per EVENT — the chart is anchored to the event lines */
+    /* rim token profile: 18 bins across the plan's life, spend mass from cells */
+    const rr2 = mulberry32(0xB0B0 + p.i);
+    const NB = 18;
+    p.tok = new Array(NB).fill(0);
+    const span = Math.max(0.5, p.e - p.b);
     for (const c of asc) {
-      c.tokW = (c.kind === 'gate' ? 3 : c.kind === 'decision' ? 2 : 1) + (c.tokens ? c.tokens / 250 : 0);
+      const bin = Math.min(NB - 1, Math.floor(((c.day - p.b) / span) * NB));
+      p.tok[bin] += (c.kind === 'gate' ? 3 : c.kind === 'decision' ? 2 : 1) + (c.tokens ? c.tokens / 250 : 0);
     }
-    p.tokMax = Math.max(0.001, ...asc.map(c => c.tokW));
+    for (let i = 0; i < NB; i++) p.tok[i] += rr2() * 0.6;
+    const mx2 = Math.max(...p.tok, 0.001);
+    for (let i = 0; i < NB; i++) p.tok[i] /= mx2;
     /* height scale: heavier plans (output tokens) get taller rim charts */
     p.tokScale = 0.35 + 0.65 * Math.min(1, Math.log(1 + p.o) / Math.log(81));
   }
@@ -310,10 +285,7 @@ let hoverSec = null;                               /* plan whose sector is under
 let S = 11, E = NOW, T = NOW;                      /* window + playhead (days) */
 let playing = false;
 let Z = 1, panX = 0, panY = 0;
-let hover = null, pinned = null;                   /* pinned = selected cell (highlight ring) */
-let sel = null;                                    /* {type:'cell', c} | {type:'plan', p} → pane */
-let solo = null;                                   /* ledger filter: show only this plan */
-let ledgerRows = [];                               /* screen rects for ledger hit-testing */
+let hover = null, pinned = null;
 let mxAbs = 0, myAbs = 0;
 let dragging = false, dragMoved = 0, lastPX = 0, lastPY = 0;
 const flashes = [];                                /* {ang0, ang1, r, hue, t0} exit/enter flashes */
@@ -332,7 +304,6 @@ const cDate = document.getElementById('c-date');
 const SEAM = 0.10;                                 /* gap at 12 o'clock */
 const BASE = -Math.PI / 2 + SEAM / 2;              /* 12:01 */
 function activePlans(t) {
-  if (solo) return [solo];
   if (showAll) return PLANS.filter(p => p.b <= t && p.e >= S - 0.001 && p.b <= E);
   return PLANS.filter(p => p.b <= t && t < p.exit && p.e >= S - 0.001 && p.b <= E);
 }
@@ -487,7 +458,7 @@ function draw(now) {
       ctx.lineTo(Math.cos(L.a0) * g.R, Math.sin(L.a0) * g.R);
       ctx.stroke();
     }
-    /* rim progress arc (under the token chart) — thicker */
+    /* rim progress arc */
     const hue = p.st === 2 ? '#ef4444' : p.st === 0 ? '#2dd4bf' : '#f5a623';
     /* hovered sector: full-arc highlight */
     if (p === hoverSec) {
@@ -496,9 +467,9 @@ function draw(now) {
       ctx.beginPath(); ctx.arc(0, 0, g.R - 5 / Z, L.a0, L.a1); ctx.stroke();
       ctx.lineWidth = 1 / Z;
     }
-    ctx.strokeStyle = hex2rgba(hue, 0.65 * al);
-    ctx.lineWidth = 4.5 / Z;
-    ctx.beginPath(); ctx.arc(0, 0, g.R + 3, L.a0 + 0.01, L.a0 + Math.max(0.02, (wSec - 0.02) * (p.done / p.total))); ctx.stroke();
+    ctx.strokeStyle = hex2rgba(hue, 0.6 * al);
+    ctx.lineWidth = 2 / Z;
+    ctx.beginPath(); ctx.arc(0, 0, g.R + 4, L.a0 + 0.01, L.a0 + Math.max(0.02, (wSec - 0.02) * (p.done / p.total))); ctx.stroke();
     ctx.lineWidth = 1 / Z;
     /* blocked pulse on rim */
     if (p.st === 2) {
@@ -506,64 +477,24 @@ function draw(now) {
       ctx.strokeStyle = hex2rgba('#ef4444', pulse * al);
       ctx.beginPath(); ctx.arc(0, 0, g.R + 8, L.a0 + 0.01, L.a1 - 0.01); ctx.stroke();
     }
-    /* rim token chart: gradient area anchored to the EVENT lines.
-       Each visible event contributes a point at its own angle; the curve
-       spans sector start → current position, filled hue → transparent. */
+    /* rim token chart: sector start = tracking start, sector end = current.
+       radial ticks on [R+7, R+7+h] — a circular barcode of spend */
     if (wSec * g.R * Z > 30) {
-      const Rb = g.R + 7;
-      const hMax = 13 / Math.max(1, Math.sqrt(Z));
-      const evs = [];
-      for (let k2 = p.cells.length - 1; k2 >= 0; k2--) {   /* p.cells is desc; walk asc */
-        const c = p.cells[k2];
-        if (c.day > T || c.day < S || c.day > E) continue;
-        const frac = c.n > 1 ? (c.rank + 0.5) / c.n : 0.5;
-        const a = L.a0 + wSec * (0.06 + 0.88 * frac);
-        evs.push({ a, h: (2 + (c.tokW / p.tokMax) * (hMax - 2) * p.tokScale) });
-      }
-      if (evs.length) {
-        /* crest sampled ALONG the arc (height lerped between events) so wide
-           sectors don't cut straight chords through the disc */
-        const crest = [];
-        const step = 0.035;
-        crest.push({ a: evs[0].a, h: evs[0].h });
-        for (let k3 = 0; k3 < evs.length - 1; k3++) {
-          const a1 = evs[k3], b1 = evs[k3 + 1];
-          const nSub = Math.max(1, Math.ceil((b1.a - a1.a) / step));
-          for (let s2 = 1; s2 <= nSub; s2++) {
-            const f2 = s2 / nSub;
-            crest.push({ a: mix(a1.a, b1.a, f2), h: mix(a1.h, b1.h, ss(f2)) });
-          }
-        }
-        const grad = ctx.createRadialGradient(0, 0, Rb, 0, 0, Rb + hMax + 2);
-        grad.addColorStop(0, hex2rgba(hue, 0.34 * al));
-        grad.addColorStop(1, hex2rgba(hue, 0));
+      const NB = p.tok.length;
+      const eEff = Math.min(T, p.e + 0.001);
+      const life = Math.max(0.5, p.e - p.b);
+      const aPad = Math.min(0.02, wSec * 0.08);
+      for (let bIdx = 0; bIdx < NB; bIdx++) {
+        const binT = p.b + life * ((bIdx + 1) / NB);
+        if (binT > eEff) break;
+        const ba = L.a0 + aPad + (wSec - 2 * aPad) * ((bIdx + 0.5) / NB);
+        const hTok = (2 + p.tok[bIdx] * 12 * p.tokScale) / Math.max(1, Math.sqrt(Z));
+        ctx.strokeStyle = hex2rgba(hue, 0.42 * al);
+        ctx.lineWidth = Math.max(1, (wSec - 2 * aPad) / NB * g.R * 0.5) ;
         ctx.beginPath();
-        ctx.moveTo(Math.cos(crest[0].a) * Rb, Math.sin(crest[0].a) * Rb);
-        for (const cp of crest) ctx.lineTo(Math.cos(cp.a) * (Rb + cp.h), Math.sin(cp.a) * (Rb + cp.h));
-        const last = crest[crest.length - 1];
-        ctx.lineTo(Math.cos(last.a) * Rb, Math.sin(last.a) * Rb);
-        ctx.arc(0, 0, Rb, last.a, crest[0].a, true);
-        ctx.closePath();
-        ctx.fillStyle = grad;
-        ctx.fill();
-        /* crest line */
-        ctx.strokeStyle = hex2rgba(hue, 0.6 * al);
-        ctx.lineWidth = 1.2 / Z;
-        ctx.beginPath();
-        crest.forEach((cp, k3) => {
-          const x2 = Math.cos(cp.a) * (Rb + cp.h), y2 = Math.sin(cp.a) * (Rb + cp.h);
-          if (k3 === 0) ctx.moveTo(x2, y2); else ctx.lineTo(x2, y2);
-        });
+        ctx.moveTo(Math.cos(ba) * (g.R + 7), Math.sin(ba) * (g.R + 7));
+        ctx.lineTo(Math.cos(ba) * (g.R + 7 + hTok), Math.sin(ba) * (g.R + 7 + hTok));
         ctx.stroke();
-        /* the line drawn out from each event */
-        ctx.lineWidth = 1 / Z;
-        for (const ev of evs) {
-          ctx.strokeStyle = hex2rgba(hue, 0.5 * al);
-          ctx.beginPath();
-          ctx.moveTo(Math.cos(ev.a) * Rb, Math.sin(ev.a) * Rb);
-          ctx.lineTo(Math.cos(ev.a) * (Rb + ev.h), Math.sin(ev.a) * (Rb + ev.h));
-          ctx.stroke();
-        }
       }
       ctx.lineWidth = 1 / Z;
     }
@@ -684,34 +615,26 @@ function draw(now) {
   ctx.font = '9.5px ' + MONO;
   ctx.fillText(dayDate(S) + ' → ' + dayDate(E) + ' · T = ' + dayDate(T) + ' · ' + nAct + ' live · zoom ' + Z.toFixed(1) + '×', 18, 24);
 
-  /* completed ledger — plans retire off the clock into the left edge.
-     Rows are clickable: filter the ring down to that one plan. */
-  ledgerRows = [];
+  /* completed ledger — plans retire off the clock into the left edge */
   {
     const doneList = PLANS
       .filter(p => p.st === 0 && p.exit <= T && p.b <= E && p.e >= S - 0.001)
       .sort((a, b) => b.exit - a.exit);
     ctx.font = '700 11px ' + MONO;
     ctx.fillStyle = 'rgba(45,212,191,.9)';
-    ctx.fillText('completed · ' + doneList.length + (solo ? '  (filtering — click row again or background to clear)' : ''), 18, 52);
+    ctx.fillText('completed · ' + doneList.length, 18, 52);
     ctx.font = '9.5px ' + MONO;
     const maxRows = Math.floor((H - 140) / 16);
     doneList.slice(0, maxRows).forEach((p, k) => {
       const fresh = T - p.exit < 2.0;
-      const isSolo = solo === p;
       const y = 70 + k * 16;
-      if (isSolo) {
-        ctx.fillStyle = 'rgba(139,150,242,.16)';
-        ctx.fillRect(12, y - 11, 218, 15);
-      }
-      ctx.fillStyle = fresh || isSolo ? 'rgba(45,212,191,.95)' : 'rgba(126,133,149,.75)';
+      ctx.fillStyle = fresh ? 'rgba(45,212,191,.95)' : 'rgba(126,133,149,.75)';
       ctx.fillText('✓', 18, y);
-      ctx.fillStyle = isSolo ? 'rgba(238,240,246,1)' : fresh ? 'rgba(238,240,246,.95)' : 'rgba(126,133,149,.8)';
+      ctx.fillStyle = fresh ? 'rgba(238,240,246,.95)' : 'rgba(126,133,149,.8)';
       const lbl = p.short.length > 26 ? p.short.slice(0, 25) + '…' : p.short;
       ctx.fillText(lbl, 32, y);
       ctx.fillStyle = 'rgba(126,133,149,.55)';
       ctx.fillText(dayDate(p.exit).slice(5), 32 + 27 * 6.0, y);
-      ledgerRows.push({ x: 12, y: y - 11, w: 218, h: 15, p });
     });
     if (doneList.length > maxRows) {
       ctx.fillStyle = 'rgba(126,133,149,.6)';
@@ -719,8 +642,57 @@ function draw(now) {
     }
   }
 
+  /* cards: pinned only (zoom LOD cards disabled for now) */
+  const cardTargets = [];
+  if (pinned && pinned._x !== undefined && pinned.p.lay) {
+    const sp = toScreen(g, pinned._x, pinned._y);
+    if (!cardTargets.some(t => t.c === pinned)) cardTargets.push({ c: pinned, sp, pin: true });
+  }
+  /* de-overlap: sort by y, push a card below any placed card it intersects */
+  cardTargets.sort((a, b) => a.sp.y - b.sp.y);
+  const placed = [];
+  for (const t of cardTargets) {
+    const wC = 172, hC = t.c.real ? 58 : 44;
+    let x = t.sp.x + 12;
+    if (x + wC > W - 8) x = t.sp.x - wC - 12;
+    let y = Math.max(8, Math.min(H - hC - 8, t.sp.y - hC / 2));
+    for (const r of placed) {
+      if (x < r.x + r.w + 6 && x + wC > r.x - 6 && y < r.y + r.h + 4 && y + hC > r.y - 4) {
+        y = r.y + r.h + 5;
+      }
+    }
+    if (y + hC > H - 8) continue;               /* no room — skip rather than pile up */
+    placed.push({ x, y, w: wC, h: hC });
+    drawCard(t.c, t.sp, t.pin, x, y, wC, hC);
+  }
+
   rafId = null;
   if (visible && !document.hidden) rafId = requestAnimationFrame(draw);
+}
+function drawCard(c, sp, pin, x, y, wC, hC) {
+  const hue = KIND_HUE[c.kind] || '#8b96f2';
+  /* leader */
+  ctx.strokeStyle = hex2rgba(hue, 0.5);
+  ctx.beginPath(); ctx.moveTo(sp.x, sp.y); ctx.lineTo(x < sp.x ? x + wC : x, y + hC / 2); ctx.stroke();
+  /* card: console surface/edge/radius vocabulary */
+  ctx.fillStyle = 'rgba(18,20,29,.96)';
+  ctx.strokeStyle = pin ? hex2rgba(hue, 0.8) : 'rgba(255,255,255,.14)';
+  ctx.beginPath();
+  ctx.roundRect(x, y, wC, hC, 10);
+  ctx.fill(); ctx.stroke();
+  ctx.fillStyle = hue;
+  ctx.beginPath(); ctx.arc(x + 12, y + 14, 3, 0, 7); ctx.fill();
+  ctx.fillStyle = 'rgba(238,240,246,.95)';
+  ctx.font = '600 10px ' + MONO;
+  const key = c.key.length > 22 ? c.key.slice(0, 21) + '…' : c.key;
+  ctx.fillText(key + (c.version > 1 ? ' v' + c.version : ''), x + 22, y + 17);
+  ctx.fillStyle = 'rgba(126,133,149,.9)';
+  ctx.font = '9px ' + MONO;
+  const slug = c.p.short.length > 26 ? c.p.short.slice(0, 25) + '…' : c.p.short;
+  ctx.fillText(slug, x + 22, y + 30);
+  if (c.real) {
+    ctx.fillText(c.actor + ' · ' + dayDate(c.day) + ' · ' + c.horizon, x + 22, y + 43);
+  }
 }
 
 /* kick */
@@ -872,74 +844,10 @@ function hitTest(e) {
   return best;
 }
 function handleClick(e) {
-  const r = cv.getBoundingClientRect();
-  const cxp = e.clientX - r.left, cyp = e.clientY - r.top;
-  /* 1 — ledger rows: filter the ring to that plan */
-  for (const row of ledgerRows) {
-    if (cxp >= row.x && cxp <= row.x + row.w && cyp >= row.y && cyp <= row.y + row.h) {
-      if (solo === row.p) { setSel(null); solo = null; }
-      else { solo = row.p; setSel({ type: 'plan', p: row.p }); }
-      return;
-    }
-  }
-  /* 2 — node */
   const hit = hitTest(e);
-  if (hit) { setSel(sel && sel.c === hit ? null : { type: 'cell', c: hit }); return; }
-  /* 3 — sector */
-  const sec = sectorAt(e);
-  if (sec) { setSel(sel && sel.p === sec && sel.type === 'plan' ? null : { type: 'plan', p: sec }); return; }
-  /* 4 — background: hide pane, clear filter */
-  setSel(null);
-  solo = null;
+  pinned = (hit === pinned) ? null : hit;
 }
-function setSel(s) {
-  sel = s;
-  pinned = s && s.type === 'cell' ? s.c : null;
-  renderPane();
-}
-const pane = document.getElementById('pane');
-function renderPane() {
-  if (!sel) { pane.classList.remove('open'); return; }
-  const esc = t => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;');
-  const planBlock = p => {
-    const hue = p.st === 2 ? '#ef4444' : p.st === 0 ? '#2dd4bf' : '#f5a623';
-    const nCells = p.cells.length;
-    const gates = p.cells.filter(c => c.kind === 'gate').length;
-    return '<div class="sect">EXECPLAN</div>' +
-      '<h4>' + esc(p.slug) + '</h4>' +
-      '<div class="bar"><i style="width:' + Math.round(100 * p.done / p.total) + '%;background:' + hue + '"></i></div>' +
-      '<div class="row"><span>state</span><span>' + STATE[p.st] + ' · ' + p.done + '/' + p.total + '</span></div>' +
-      '<div class="row"><span>born</span><span>' + dayDate(p.b) + '</span></div>' +
-      '<div class="row"><span>last activity</span><span>' + dayDate(p.e) + '</span></div>' +
-      (p.o ? '<div class="row"><span>output tokens</span><span>' + (p.o / 10).toFixed(1) + 'M</span></div>' : '') +
-      '<div class="row"><span>nodes</span><span>' + nCells + ' (' + gates + ' gates)</span></div>' +
-      (p.traced
-        ? '<div class="sect">FACTS (real)</div><ul class="facts">' +
-          [...p.cells].sort((a, b) => a.day - b.day).map(c =>
-            '<li' + (sel.c === c ? ' class="sel"' : '') + '><b>' + esc(c.key) + '</b> · ' + dayDate(c.day) +
-            (c.actor ? ' · ' + esc(c.actor) : '') + '</li>').join('') + '</ul>'
-        : '<p class="note">Untraced plan — node density is milestone-derived. One call makes it real:<br><code>query_facts(entity="execplan:' + esc(p.slug) + '", token_budget=4000)</code></p>');
-  };
-  if (sel.type === 'cell') {
-    const c = sel.c, hue = KIND_HUE[c.kind] || '#8b96f2';
-    pane.innerHTML =
-      '<h4>' + esc(c.key) + (c.version > 1 ? ' <span style="color:var(--ink3)">v' + c.version + '</span>' : '') + '</h4>' +
-      '<span class="kindchip"><i style="background:' + hue + '"></i>' + c.kind + (c.real ? ' · real fact' : ' · illustrative') + '</span>' +
-      (c.real
-        ? '<div class="row"><span>stored</span><span>' + dayDate(c.day) + '</span></div>' +
-          '<div class="row"><span>actor</span><span>' + esc(c.actor) + '</span></div>' +
-          '<div class="row"><span>horizon</span><span>' + c.horizon + '</span></div>' +
-          '<div class="row"><span>tokens</span><span>' + c.tokens + '</span></div>' +
-          (c.version > 1 ? '<div class="row"><span>supersedes</span><span>v' + (c.version - 1) + ' of same key</span></div>' : '')
-        : '<div class="row"><span>day</span><span>' + dayDate(c.day) + '</span></div>') +
-      planBlock(c.p);
-  } else {
-    pane.innerHTML = planBlock(sel.p) +
-      (solo === sel.p ? '<p class="note">Ring filtered to this plan — click the background to clear.</p>' : '');
-  }
-  pane.classList.add('open');
-}
-addEventListener('keydown', e => { if (e.key === 'Escape') { setSel(null); solo = null; } });
+addEventListener('keydown', e => { if (e.key === 'Escape') pinned = null; });
 
 /* init */
 syncWindow();
