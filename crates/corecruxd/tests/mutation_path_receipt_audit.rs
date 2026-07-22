@@ -62,7 +62,7 @@ const PATHS: &[MutationPath] = &[
     },
     MutationPath {
         id: 2,
-        name: "FactStore::try_store_bulk (StoreBatch)",
+        name: "FactStore::try_store_bulk/try_store_bulk_durable (StoreBatch)",
         class: Class::Receipted,
         backing_test: "",
         followup_ref: "",
@@ -223,6 +223,7 @@ const AUDITED_MUTATORS: &[&str] = &[
     "try_store",
     "store_bulk",
     "try_store_bulk",
+    "try_store_bulk_durable",
     "store_synced",
     "delete",
     "try_delete",
