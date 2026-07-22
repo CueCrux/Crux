@@ -13,6 +13,33 @@
 //! `x-crux-peer-pubkey` (32-byte hex), `x-crux-peer-nonce` (32-byte hex), and
 //! `x-crux-peer-sig` (64-byte hex). The authenticated token tenant must exactly
 //! equal the tenant path parameter.
+//!
+//! ## Recipient-bound delegation (`CORECRUXD_SYNC_DELEGATION_ENFORCE=1`, macaroon M3′)
+//!
+//! A peer may instead present a **delegated v1.1 token** (`rcx-ct/1.1`): a subject
+//! that holds a CruxEngine-issued `crux-sync` grant bound a strictly narrower
+//! one-hop delegation to a recipient key **offline** (`attenuate_for`). Such
+//! tokens are *contextual* — the base `verify_token` fails them closed
+//! everywhere — so they are honoured only here, and only with enforcement on.
+//!
+//! `require_sync_peer` routes any token whose `requires_contextual_verification()`
+//! is true through `verify_sync_delegation`. It reuses the same `x-crux-peer-*`
+//! headers, but now `pubkey` is the recipient key and `sig` is the recipient's
+//! `PresentationProof` over the full canonical wire token, the request context,
+//! and the nonce. The daemon builds the sync `AttenuationContext` (audience
+//! `crux-sync`, backend `crux-sync`, capability `corecrux.sync.pull` for reads /
+//! `corecrux.sync.push` for writes, attestation `passport_bound`), requires a
+//! fresh server nonce, calls `verify_token_attenuated`, and consumes the nonce
+//! only on success — so a replayed nonce fails closed. A plain v1.0 token keeps
+//! the existing subject-possession path unchanged, with the flag ON or OFF.
+//!
+//! **Fail-closed & rollout.** With `CORECRUXD_SYNC_DELEGATION_ENFORCE` OFF (the
+//! default) a contextual token is rejected outright — its caveats are never
+//! dropped to grant the broader base authority. Deploy verifiers with the flag
+//! enabled **before** the issuer (CruxEngine) mints any `rcx-ct/1.1`
+//! sync-delegation token (mint-before-verify): an old verifier rejecting a
+//! delegation token is the safe direction, a new mint against an old verifier is
+//! not. See `PlanCrux/.agent/artifacts/sync-delegation-convention-2026-07-22.md`.
 
 use super::*;
 use base64::Engine as _;
