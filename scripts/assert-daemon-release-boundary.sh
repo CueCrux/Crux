@@ -92,6 +92,12 @@ require_marker "scripts/generate-update-manifest.sh" 'name="standalone-${asset_n
 require_marker "scripts/generate-update-manifest.sh" 'asset_name:$a'
 require_marker "packaging/tests/install-smoke.sh" \
   '"${PREFIX}/bin/crux-hook" --version'
+require_marker "packaging/tests/install-smoke.sh" \
+  'cosign verify-blob'
+require_marker "packaging/tests/install-smoke.sh" \
+  'RELEASE-MANIFEST-linux-amd64.txt'
+require_marker "packaging/tests/install-smoke.sh" \
+  'install.sh does not match signed release manifest'
 require_marker ".github/workflows/release.yml" \
   'package-daemon-release.sh has already staged install.sh before generating'
 
