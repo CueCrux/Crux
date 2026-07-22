@@ -2415,6 +2415,7 @@
     }
     // Custom-rendered pages (no section model).
     if (page.id === 'cx-activity-log') { container.textContent = ''; renderActivityLog(container); return Promise.resolve(); }
+    if (page.id === 'cx-facts') { container.textContent = ''; renderFactsBrowser(container); return Promise.resolve(); }
     if (page.operatorOnly && !isOperator()) {
       renderSections(container, [{ h: page.title, wide: true, controls: [
         { t: 'info', label: 'operator only', v: 'This surface is only available in operator posture.' },
@@ -5582,6 +5583,321 @@
       return r.json().then(function (d) { return { ok: r.ok, status: r.status, data: d }; }, function () { return { ok: r.ok, status: r.status, data: null }; });
     }).catch(function () { return { ok: false, status: 0, data: null }; });
   }
+  // =======================================================================
+  //  Facts browser (console-surfaces-remediation M2) — the durable record,
+  //  paged over GET /v1/facts/list. Custom-rendered (like the activity log)
+  //  because the section model is a pure data→DOM transform: this surface needs
+  //  server-side pagination + search (q=), an ingest-time as_of time-machine
+  //  (as_of_unix_ms), and per-row detail that dereferences the FULL (untruncated)
+  //  value by id. Every read routes through the generated client (fetchJSON +
+  //  CruxApi.factsByFactId via fetchVia) — no raw network here. Degrades honestly
+  //  on an older daemon (list route 404) to the recent-window console feed,
+  //  banner-labelled.
+  // =======================================================================
+  var FACTS_PAGE_LIMIT = 100;      // rows per server page
+  var FACTS_DOM_CAP = 2000;        // hard ceiling on rendered rows (never all-in)
+
+  // Entity-prefix → the console's status/kind hue token (border-left tint).
+  function factKindTone(prefix) {
+    switch (prefix) {
+      case 'execplan': return 'acc';
+      case 'bench': return 'ok';
+      case 'incident': return 'crit';
+      case 'design': return 'trust';
+      case 'session': return 'warn';
+      default: return 'ink3';
+    }
+  }
+  // Group key: the entity prefix up to the first ':' (execplan, bench, …);
+  // reserved '__x::' entities group under their '__x::' stem; else 'other'.
+  function factGroupKey(entity) {
+    var e = String(entity || '');
+    var m = e.match(/^([a-z0-9_]+):/i);
+    if (m) { return m[1]; }
+    var r = e.match(/^(__[a-z0-9_]+::)/i);
+    if (r) { return r[1]; }
+    return 'other';
+  }
+  function factGroupLabel(k) { return (/::$/.test(k)) ? k : (k === 'other' ? 'other' : k + ':*'); }
+
+  function renderFactsBrowser(host) {
+    host.textContent = '';
+    function nfmt(n) {
+      if (typeof n !== 'number' || !isFinite(n)) { return (n == null) ? '—' : String(n); }
+      try { return n.toLocaleString('en-US'); } catch (e) { return String(n); }
+    }
+    function shortTime(iso) { var s = String(iso || ''); return s.length >= 16 ? s.slice(0, 16).replace('T', ' ') : (s || '—'); }
+    function fmtConf(c) { return (typeof c === 'number' && isFinite(c)) ? c.toFixed(2) : '—'; }
+    function prettyValue(v) {
+      if (typeof v !== 'string') { try { return JSON.stringify(v, null, 2); } catch (e) { return String(v); } }
+      var t = v.trim();
+      if (t && (t.charAt(0) === '{' || t.charAt(0) === '[')) { try { return JSON.stringify(JSON.parse(v), null, 2); } catch (e) { return v; } }
+      return v;
+    }
+    function qs(obj) {
+      var parts = [];
+      Object.keys(obj).forEach(function (k) { parts.push(encodeURIComponent(k) + '=' + encodeURIComponent(obj[k])); });
+      return parts.join('&');
+    }
+
+    var state = {
+      rows: [], seen: {}, groupBodies: {}, groupsExpanded: {},
+      nextCursor: null, hasMore: false, totalVisible: null, totalNondeleted: null,
+      census: null, q: '', entityPrefix: '',
+      includeReserved: false, includeSuperseded: true, asOfMs: null,
+      loading: false, fallback: false, deb: null, token: 0
+    };
+
+    // ---- toolbar ----
+    var searchInput = el('input', { 'class': 'facts-input', type: 'search', placeholder: 'search entity / key / value…', 'aria-label': 'search facts' });
+    var asOfInput = el('input', { 'class': 'facts-input facts-asof', type: 'datetime-local', 'aria-label': 'as of (ingest-time machine)' });
+    var supToggle = el('button', { 'class': 'facts-toggle on', type: 'button', 'aria-pressed': 'true', title: 'include cross-entity-retired (superseded) facts' }, ['superseded']);
+    var resToggle = el('button', { 'class': 'facts-toggle', type: 'button', 'aria-pressed': 'false', title: 'include daemon-reserved (__*) entities' }, ['reserved __*']);
+    function field(label, node) { return el('label', { 'class': 'facts-field' }, [el('span', { text: label }), node]); }
+    var toolbar = el('div', { 'class': 'facts-toolbar' }, [
+      field('search', searchInput),
+      field('as of', asOfInput),
+      el('div', { 'class': 'facts-toggles' }, [supToggle, resToggle])
+    ]);
+    var countLine = el('p', { 'class': 'facts-count' });
+    var chipsWrap = el('div', { 'class': 'facts-chips' });
+    var banner = el('div', { 'class': 'facts-banner' }); banner.style.display = 'none';
+    var groupsWrap = el('div', { 'class': 'facts-groups' });
+    var moreWrap = el('div', { 'class': 'facts-more' });
+    var sentinel = el('div', { 'class': 'facts-sentinel' });
+    host.appendChild(el('div', { 'class': 'facts-browser' }, [toolbar, countLine, chipsWrap, banner, groupsWrap, moreWrap, sentinel]));
+
+    function syncToggles() {
+      supToggle.classList.toggle('on', state.includeSuperseded); supToggle.setAttribute('aria-pressed', state.includeSuperseded ? 'true' : 'false');
+      resToggle.classList.toggle('on', state.includeReserved); resToggle.setAttribute('aria-pressed', state.includeReserved ? 'true' : 'false');
+    }
+    function baseQuery(extra) {
+      var q = { limit: FACTS_PAGE_LIMIT };
+      if (state.q) { q.q = state.q; }
+      if (state.entityPrefix) { q.entity_prefix = state.entityPrefix; }
+      if (state.includeReserved) { q.include_reserved = 1; }
+      if (!state.includeSuperseded) { q.include_superseded = 0; }
+      if (state.asOfMs != null) { q.as_of_unix_ms = state.asOfMs; }
+      if (extra) { for (var k in extra) { q[k] = extra[k]; } }
+      return q;
+    }
+
+    function paintCount() {
+      var shown = state.rows.length, vis = state.totalVisible;
+      var filtered = !!(state.q || state.entityPrefix);
+      var label = filtered ? (vis === 1 ? 'match' : 'matches') : 'visible';
+      var kids = [el('b', { text: nfmt(shown) }), ' shown of ', el('b', { text: (vis == null ? '—' : nfmt(vis)) }), ' ' + label];
+      var c = state.census;
+      if (c && c.stored != null) {
+        kids.push(' · '); kids.push(el('b', { text: nfmt(c.stored) })); kids.push(' stored');
+        if (c.priv != null && c.reserved != null) {
+          kids.push(' (' + nfmt(c.priv) + ' private + ' + nfmt(c.reserved) + ' reserved ' + (state.includeReserved ? 'shown' : 'hidden') + ')');
+        }
+      } else if (state.totalNondeleted != null) {
+        kids.push(' · '); kids.push(el('b', { text: nfmt(state.totalNondeleted) })); kids.push(' stored');
+      }
+      if (state.asOfMs != null) { kids.push(el('span', { 'class': 'facts-asof-tag', text: '⏱ as of ' + shortTime(new Date(state.asOfMs).toISOString()) })); }
+      countLine.textContent = '';
+      kids.forEach(function (k) { countLine.appendChild(typeof k === 'string' ? doc().createTextNode(k) : k); });
+    }
+
+    // Census: two limit=1 probes (reserved off / on, superseded included, current
+    // as_of) yield the exact private + reserved split from the SAME response
+    // fields — derived, never hardcoded.
+    function loadCensus() {
+      var probe = { limit: 1 };
+      if (state.asOfMs != null) { probe.as_of_unix_ms = state.asOfMs; }
+      var onQ = {}; for (var k in probe) { onQ[k] = probe[k]; } onQ.include_reserved = 1;
+      var myToken = state.token;
+      Promise.all([fetchJSON('/v1/facts/list?' + qs(probe)), fetchJSON('/v1/facts/list?' + qs(onQ))]).then(function (rr) {
+        if (myToken !== state.token) { return; }
+        var a = rr[0], b = rr[1];
+        if (!a.ok || !a.data) { return; }
+        var visible = a.data.total_visible, stored = a.data.total_nondeleted;
+        var withReserved = (b.ok && b.data && b.data.total_visible != null) ? b.data.total_visible : visible;
+        state.census = {
+          stored: stored,
+          reserved: (withReserved != null && visible != null) ? Math.max(0, withReserved - visible) : null,
+          priv: (stored != null && withReserved != null) ? Math.max(0, stored - withReserved) : null
+        };
+        paintCount();
+      });
+    }
+
+    function rowEl(f) {
+      var badges = el('div', { 'class': 'facts-rbadges' });
+      if (f.superseded_by) { badges.appendChild(el('span', { 'class': 'facts-badge sup', title: 'superseded by ' + f.superseded_by, text: 'superseded' })); }
+      if (f.value_truncated) { badges.appendChild(el('span', { 'class': 'facts-badge', title: f.value_len + ' chars — open the row for the full value', text: nfmt(f.value_len) + ' ch' })); }
+      var head = el('div', { 'class': 'facts-rhead' }, [
+        el('span', { 'class': 'facts-key', text: f.key || '(no key)' }),
+        el('span', { 'class': 'facts-entity', text: f.entity || '' }),
+        badges,
+        el('span', { 'class': 'facts-time', text: shortTime(f.stored_at) })
+      ]);
+      var val = el('div', { 'class': 'facts-val', text: (f.value || '') + (f.value_truncated ? ' …' : '') });
+      var detail = el('div', { 'class': 'facts-detail' });
+      var row = el('div', { 'class': 'facts-row tone-' + factKindTone(factGroupKey(f.entity)), role: 'button', tabindex: '0' }, [head, val, detail]);
+      var opened = false;
+      function toggle() { var o = row.classList.toggle('open'); if (o && !opened) { opened = true; expandRow(detail, f); } }
+      row.addEventListener('click', toggle);
+      row.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+      return row;
+    }
+    function expandRow(detail, f) {
+      detail.textContent = '';
+      detail.appendChild(el('div', { 'class': 'facts-loading', text: 'loading full fact…' }));
+      fetchVia(function () { return window.CruxApi.factsByFactId(f.fact_id); }).then(function (res) {
+        detail.textContent = '';
+        var full = (res.ok && res.data) ? res.data : null;
+        var value = full ? full.value : (f.value || '');
+        var meta = el('div', { 'class': 'facts-kv' });
+        function kv(k, v) { meta.appendChild(el('span', { 'class': 'facts-kv-k', text: k })); meta.appendChild(el('span', { 'class': 'facts-kv-v', text: (v == null || v === '') ? '—' : String(v) })); }
+        kv('fact_id', f.fact_id);
+        kv('entity', f.entity);
+        kv('key', f.key);
+        kv('actor', (full && full.actor != null) ? full.actor : f.actor);
+        kv('confidence', fmtConf(full ? full.confidence : f.confidence));
+        kv('horizon_class', (full && full.horizon_class) || f.horizon_class);
+        kv('tokens', (full && full.tokens != null) ? full.tokens : f.tokens);
+        kv('version', (full && full.version != null) ? full.version : f.version);
+        kv('stored_at', (full && full.stored_at) || f.stored_at);
+        if (f.superseded_by || (full && full.superseded_by)) { kv('superseded_by', f.superseded_by || (full && full.superseded_by)); }
+        detail.appendChild(meta);
+        if (!full) { detail.appendChild(el('p', { 'class': 'ctl-desc', text: 'Full value unavailable (HTTP ' + (res.status || '?') + ') — showing the row value.' })); }
+        detail.appendChild(el('div', { 'class': 'facts-vlabel', text: (full && f.value_truncated) ? 'value (full)' : 'value' }));
+        detail.appendChild(el('pre', { 'class': 'facts-vfull', text: prettyValue(value) }));
+      });
+    }
+
+    function ensureGroup(k) {
+      if (state.groupBodies[k]) { return state.groupBodies[k]; }
+      if (!(k in state.groupsExpanded)) { state.groupsExpanded[k] = false; }
+      var det = el('details', { 'class': 'facts-group tone-' + factKindTone(k) });
+      if (state.groupsExpanded[k]) { det.setAttribute('open', 'open'); }
+      var count = el('span', { 'class': 'facts-gcount' });
+      var sum = el('summary', { 'class': 'facts-gsum' }, [el('span', { 'class': 'facts-gdot' }), el('span', { 'class': 'facts-gname', text: factGroupLabel(k) }), count]);
+      det.appendChild(sum);
+      det.addEventListener('toggle', function () { state.groupsExpanded[k] = det.open; });
+      var body = el('div', { 'class': 'facts-glist' });
+      det.appendChild(body);
+      groupsWrap.appendChild(det);
+      state.groupBodies[k] = { body: body, count: count, n: 0 };
+      return state.groupBodies[k];
+    }
+    function appendRows(facts) {
+      facts.forEach(function (f) { var g = ensureGroup(factGroupKey(f.entity)); g.body.appendChild(rowEl(f)); g.n++; g.count.textContent = g.n + ' loaded'; });
+    }
+    function firstPaint(facts) {
+      groupsWrap.textContent = ''; state.groupBodies = {};
+      if (!facts.length) { groupsWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'No facts match.' })); return; }
+      var counts = {};
+      facts.forEach(function (f) { var k = factGroupKey(f.entity); counts[k] = (counts[k] || 0) + 1; });
+      Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a]; }).forEach(function (k, idx) { state.groupsExpanded[k] = idx < 4; });
+      appendRows(facts);
+    }
+
+    function paintChips() {
+      if (state.fallback) { chipsWrap.textContent = ''; return; }
+      var counts = {};
+      state.rows.forEach(function (f) { var k = factGroupKey(f.entity); counts[k] = (counts[k] || 0) + 1; });
+      var keys = Object.keys(counts).filter(function (k) { return k !== 'other'; }).sort(function (a, b) { return counts[b] - counts[a]; }).slice(0, 12);
+      chipsWrap.textContent = '';
+      var allChip = el('button', { 'class': 'facts-chip' + (state.entityPrefix ? '' : ' on'), type: 'button', title: 'clear the entity-prefix filter' }, ['all']);
+      allChip.addEventListener('click', function () { if (!state.entityPrefix) { return; } state.entityPrefix = ''; resetAndLoad(); });
+      chipsWrap.appendChild(allChip);
+      keys.forEach(function (k) {
+        var pref = (/::$/.test(k)) ? k : k + ':';
+        var active = state.entityPrefix === pref;
+        var chip = el('button', { 'class': 'facts-chip' + (active ? ' on' : ''), type: 'button', title: 'filter to ' + pref + '* server-side' }, [el('span', { text: factGroupLabel(k) }), el('span', { 'class': 'c', text: String(counts[k]) })]);
+        chip.addEventListener('click', function () {
+          if (active) { state.entityPrefix = ''; }
+          else { state.entityPrefix = pref; if (/^__/.test(pref) && !state.includeReserved) { state.includeReserved = true; syncToggles(); } }
+          resetAndLoad();
+        });
+        chipsWrap.appendChild(chip);
+      });
+    }
+
+    function paintMore() {
+      moreWrap.textContent = '';
+      if (state.fallback) { return; }
+      if (state.rows.length >= FACTS_DOM_CAP) { moreWrap.appendChild(el('p', { 'class': 'facts-cap', text: 'Rendered ' + nfmt(FACTS_DOM_CAP) + '+ rows — narrow with search or a prefix chip to load the rest.' })); return; }
+      if (state.hasMore) {
+        var remaining = (state.totalVisible != null) ? Math.max(0, state.totalVisible - state.rows.length) : null;
+        var btn = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Load more' + (remaining != null ? ' (' + nfmt(remaining) + ' remaining)' : '')]);
+        btn.addEventListener('click', loadNext);
+        moreWrap.appendChild(btn);
+      } else if (state.rows.length) {
+        moreWrap.appendChild(el('p', { 'class': 'ctl-desc', text: 'End of ' + ((state.q || state.entityPrefix) ? 'matches' : 'the visible store') + '.' }));
+      }
+    }
+
+    function loadPage(cursor, isFirst) {
+      if (state.loading) { return; }
+      state.loading = true;
+      if (isFirst) { groupsWrap.textContent = ''; groupsWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'loading…' })); }
+      var myToken = state.token;
+      fetchJSON('/v1/facts/list?' + qs(baseQuery(cursor ? { cursor: cursor } : null))).then(function (res) {
+        if (myToken !== state.token) { return; }
+        state.loading = false;
+        if (isFirst && res.status === 404) { state.fallback = true; fallbackLoad(); return; }
+        if (!res.ok || !res.data) {
+          if (isFirst) { banner.style.display = ''; banner.className = 'facts-banner err'; banner.textContent = 'Facts listing unavailable — ' + (res.status === 0 ? 'daemon unreachable' : 'HTTP ' + res.status) + '.'; groupsWrap.textContent = ''; }
+          return;
+        }
+        var d = res.data;
+        state.totalVisible = d.total_visible; state.totalNondeleted = d.total_nondeleted;
+        state.nextCursor = d.next_cursor || null; state.hasMore = !!d.has_more;
+        var fresh = [];
+        (d.facts || []).forEach(function (f) { if (f.fact_id && state.seen[f.fact_id]) { return; } if (f.fact_id) { state.seen[f.fact_id] = true; } state.rows.push(f); fresh.push(f); });
+        if (isFirst) { firstPaint(state.rows); } else { appendRows(fresh); }
+        paintCount(); paintChips(); paintMore();
+      });
+    }
+    function loadNext() {
+      if (state.fallback || state.loading || !state.hasMore) { return; }
+      if (state.rows.length >= FACTS_DOM_CAP) { paintMore(); return; }
+      loadPage(state.nextCursor, false);
+    }
+    function resetAndLoad() {
+      state.token++;
+      state.rows = []; state.seen = {}; state.groupBodies = {}; state.groupsExpanded = {};
+      state.nextCursor = null; state.hasMore = false; state.loading = false; state.fallback = false;
+      banner.style.display = 'none'; moreWrap.textContent = '';
+      loadCensus();
+      loadPage(null, true);
+    }
+    // Older daemon (no /v1/facts/list): fall back to the recent-window console
+    // feed, honestly labelled — read-only, no server paging or search.
+    function fallbackLoad() {
+      banner.style.display = ''; banner.className = 'facts-banner warn';
+      banner.textContent = 'Listing route unavailable on this daemon (needs the console-surfaces-remediation branch). Showing the recent window from /v1/console/facts only.';
+      chipsWrap.textContent = ''; moreWrap.textContent = '';
+      fetchJSON('/v1/console/facts?top_k=100').then(function (res) {
+        groupsWrap.textContent = '';
+        if (!res.ok || !res.data) { groupsWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'Recent-window feed also unavailable (HTTP ' + (res.status || '?') + ').' })); return; }
+        var facts = res.data.facts || [];
+        state.rows = facts;
+        state.totalVisible = (res.data.visible_count != null) ? res.data.visible_count : facts.length;
+        state.totalNondeleted = (res.data.count != null) ? res.data.count : null;
+        state.census = null;
+        firstPaint(facts); paintCount();
+        moreWrap.appendChild(el('p', { 'class': 'ctl-desc', text: 'Recent window: ' + nfmt(facts.length) + (state.totalNondeleted != null ? ' of ' + nfmt(state.totalNondeleted) + ' stored' : '') + ' (no server-side paging on this daemon).' }));
+      });
+    }
+
+    // ---- wiring ----
+    searchInput.addEventListener('input', function () { clearTimeout(state.deb); state.deb = setTimeout(function () { state.q = (searchInput.value || '').trim(); resetAndLoad(); }, 250); });
+    asOfInput.addEventListener('change', function () { var v = asOfInput.value; if (!v) { state.asOfMs = null; } else { var t = new Date(v).getTime(); state.asOfMs = isFinite(t) ? t : null; } resetAndLoad(); });
+    supToggle.addEventListener('click', function () { state.includeSuperseded = !state.includeSuperseded; syncToggles(); resetAndLoad(); });
+    resToggle.addEventListener('click', function () { state.includeReserved = !state.includeReserved; syncToggles(); resetAndLoad(); });
+    if (typeof IntersectionObserver !== 'undefined') {
+      var io = new IntersectionObserver(function (entries) { if (entries[0] && entries[0].isIntersecting) { loadNext(); } }, { rootMargin: '500px' });
+      io.observe(sentinel);
+    }
+    resetAndLoad();
+  }
+
   function renderActivityLog(host) {
     host.textContent = '';
     if (__actLogES) { try { __actLogES.close(); } catch (e) { /* noop */ } __actLogES = null; }
@@ -5999,6 +6315,8 @@
     capabilityAvailable: capabilityAvailable,
     // Site map — static reference destination (rail → destinations map).
     renderSiteMap: renderSiteMap,
+    // M2 (console-surfaces-remediation) — the paged, searchable facts browser.
+    renderFactsBrowser: renderFactsBrowser,
     // M10 — Documents mode (the console-as-reader).
     renderDocuments: renderDocuments,
     DOC_REFERENCE: DOC_REFERENCE,

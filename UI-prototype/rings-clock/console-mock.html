@@ -270,7 +270,7 @@ footer { max-width: 1100px; margin: 48px auto 0; padding: 20px clamp(16px, 4vw, 
     </div>
     <aside id="pane" aria-label="Detail pane"></aside>
   </div>
-  <p style="max-width:1240px;margin:10px auto 0;padding:0 clamp(16px,3vw,32px);font:11px var(--font-mono);color:var(--ink3)">mock · tiles switch the lens · ExecPlans lens keeps solo / ledger / lineage / filters · snapshot data, live-wire: /v1/work · /v1/facts · receipts by seq</p>
+  <p style="max-width:1240px;margin:10px auto 0;padding:0 clamp(16px,3vw,32px);font:11px var(--font-mono);color:var(--ink3)">mock · tiles switch the lens · ExecPlans lens keeps solo / ledger / lineage / filters · snapshot data, live-wire: /v1/work · /v1/facts/list · receipts by seq</p>
 </section>
 
 
@@ -986,7 +986,8 @@ const GRAPH_RAW = [{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"g
 const GNODES = [];
 const GEDGES = [];
 const GADJ = {};
-let gTotal = null;                                 /* store-wide fact count when live */
+let gTotal = null;                                 /* store-wide visible fact count when live */
+let gCap = false;                                  /* true when the node walk hit its cap */
 function loadGraph(raws) {
   GNODES.length = 0; GEDGES.length = 0;
   for (const k2 in GADJ) delete GADJ[k2];
@@ -1086,7 +1087,7 @@ function drawDataLens(ctx2, g) {
     n._x = p2.x; n._y = p2.y; n._dr = rr; n._on = true;
   }
   lensLabels.push({ x: 0, y: g.R + 42, cap: true,
-                    t: 'data graph · ' + GNODES.length + (gTotal ? ' of ' + gTotal.toLocaleString() + ' facts — the daemon has no paged facts listing yet; only recall-surfaced facts can be drawn' : ' live facts') +
+                    t: 'data graph · ' + GNODES.length + (gTotal ? ' of ' + gTotal.toLocaleString() + ' visible facts' + (gCap ? ' (node cap)' : '') : ' live facts') +
                        ' · angle = source date · centre = higher confidence (rank-scaled ' + cMin.toFixed(2) + '–' + cMax.toFixed(2) + ') · edge = shared entity · click = 2-hop' });
 }
 
@@ -1832,52 +1833,44 @@ syncWindow();
         document.getElementById('gl-engine').textContent = s2.daemon.dataplane_enabled ? 'on' : 'off';
     }
   } catch (e) { /* snapshot glance stands */ }
-  /* data graph: the console facts feed returns ~55 visible facts per call
-     (reserved __-prefixed facts eat most of the top_k=200 recency window),
-     so page BACKWARD through the store with as_of_unix_ms — each page's
-     oldest stored_at becomes the next page's cutoff. */
+  /* data graph: page the WHOLE visible store through the M2 listing route
+     (/v1/facts/list — cursor pagination, newest-first, reserved included so the
+     graph mirrors the store), up to a sane node cap. Falls back to the embedded
+     snapshot when the route is absent (404 on an older daemon). */
   try {
+    const NODE_CAP = 2000;
     const seen = new Map();
-    let total = null;
-    let asOf = null;
-    for (let page2 = 0; page2 < 16; page2++) {
-      const u = '/v1/console/facts?top_k=200' + (asOf ? '&as_of_unix_ms=' + asOf : '');
+    let total = null, cursor = null, capped = false, ok = false;
+    for (let page2 = 0; page2 < 40; page2++) {
+      const u = '/v1/facts/list?limit=200&include_reserved=1' + (cursor ? '&cursor=' + encodeURIComponent(cursor) : '');
       const r3 = await fetch(u, { headers: { accept: 'application/json' } });
+      if (r3.status === 404) break;                /* older daemon — snapshot stands */
       if (!r3.ok || !(r3.headers.get('content-type') || '').includes('json')) break;
       const j3 = await r3.json();
-      if (total === null && j3.count) total = j3.count;
-      let oldest = null, fresh = 0;
+      ok = true;
+      if (total === null && j3.total_visible != null) total = j3.total_visible;
       for (const f of (j3.facts || [])) {
-        if (!f.fact_id || !f.stored_at) continue;
+        if (!f.fact_id || !f.stored_at || seen.has(f.fact_id)) continue;
         const ms = Date.parse(f.stored_at);
-        if (oldest === null || ms < oldest) oldest = ms;
-        if (seen.has(f.fact_id)) continue;
-        fresh++;
+        if (!isFinite(ms)) continue;
         seen.set(f.fact_id, {
           e: f.entity || '?', k: f.key || '?',
           d: ms / 86400000 - 20580,
           a: f.actor || null, h: f.horizon_class || 'none',
           c: f.confidence === undefined ? 1 : f.confidence, t: f.tokens || 100,
         });
+        if (seen.size >= NODE_CAP) { capped = true; break; }
       }
-      if (!fresh || oldest === null) break;        /* window exhausted — the feed
-        is "recent 200, filtered", not a pager: page 2 comes back empty. There
-        is currently NO paged facts-listing route on the daemon (every /v1
-        facts surface is recall/budget-shaped) — a listing endpoint is the
-        daemon-side follow-up this lens is waiting on. */
-      asOf = oldest - 1;
+      cursor = j3.next_cursor || null;
+      if (capped || !cursor || !j3.has_more) break;
     }
     const live = [...seen.values()].filter(n => isFinite(n.d) && n.d > 0);
-    /* merge live recents with the curated snapshot (dedupe on entity+key) */
-    const byEK = new Map();
-    for (const n of GRAPH_RAW) byEK.set(n.e + '|' + n.k, n);
-    for (const n of live) byEK.set(n.e + '|' + n.k, n);
-    const merged = [...byEK.values()];
-    if (live.length && merged.length > GRAPH_RAW.length) {
+    if (ok && live.length) {
       gSel = null;
-      loadGraph(merged);
+      loadGraph(live);
       gTotal = total;
-      document.getElementById('tile-data').textContent = num(merged.length);
+      gCap = capped;
+      document.getElementById('tile-data').textContent = num(live.length);
     } else if (total) {
       gTotal = total;                              /* at least report true store size */
     }

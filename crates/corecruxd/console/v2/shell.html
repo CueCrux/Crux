@@ -1991,6 +1991,73 @@
   .act-row.k-error { border-left-color: var(--crit); }
   .act-row.k-reasoning { border-left-color: var(--ink3); }
 
+  /* ---- Facts browser (console-surfaces-remediation M2) — paged /v1/facts/list
+     with entity-prefix groups, server-side search, ingest-time as_of machine,
+     superseded/reserved toggles, and per-row full-value detail. All colour is
+     var(--…) tokens (theme-safe across glass/dark/light). ------------------- */
+  .facts-browser { display: flex; flex-direction: column; gap: 12px; }
+  .facts-toolbar { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
+  .facts-field { display: flex; flex-direction: column; gap: 3px; font-family: var(--font-mono); font-size: 10px; color: var(--ink3); }
+  .facts-input { min-height: 34px; min-width: 220px; padding: 0 10px; border: 1px solid var(--edge); border-radius: 8px; background: var(--surface2); color: var(--ink); font: inherit; font-size: 13px; }
+  .facts-input.facts-asof { min-width: 190px; }
+  .facts-input:focus { border-color: var(--edge-strong); outline: none; }
+  .facts-toggles { display: flex; gap: 8px; align-items: center; }
+  .facts-toggle { font-family: var(--font-mono); font-size: 10.5px; padding: 7px 12px; border-radius: 999px; border: 1px solid var(--edge); background: none; color: var(--ink3); cursor: pointer; }
+  .facts-toggle.on { color: var(--ink); border-color: currentColor; }
+  .facts-count { margin: 0; font-family: var(--font-mono); font-size: 12px; color: var(--ink2); line-height: 1.5; }
+  .facts-count b { color: var(--ink); font-weight: 600; }
+  .facts-asof-tag { margin-left: 8px; font-size: 10px; padding: 2px 8px; border-radius: 999px; border: 1px solid color-mix(in srgb, var(--acc) 45%, var(--edge)); color: var(--acc); }
+  .facts-chips { display: flex; gap: 7px; flex-wrap: wrap; }
+  .facts-chip { font-family: var(--font-mono); font-size: 10.5px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--edge); background: none; color: var(--ink3); cursor: pointer; }
+  .facts-chip.on { color: var(--ink); border-color: currentColor; }
+  .facts-chip .c { color: var(--ink3); margin-left: 5px; }
+  .facts-banner { border: 1px solid var(--edge); border-radius: 10px; padding: 10px 13px; font-size: 12.5px; color: var(--ink2); background: var(--surface2); }
+  .facts-banner.warn { border-color: color-mix(in srgb, var(--warn) 45%, var(--edge)); color: var(--warn); }
+  .facts-banner.err { border-color: color-mix(in srgb, var(--crit) 45%, var(--edge)); color: var(--crit); }
+  .facts-groups { display: flex; flex-direction: column; gap: 8px; }
+  .facts-group { border: 1px solid var(--edge); border-radius: 10px; background: var(--surface); overflow: hidden; }
+  .facts-gsum { display: flex; align-items: center; gap: 9px; padding: 9px 13px; cursor: pointer; font-family: var(--font-mono); font-size: 12px; color: var(--ink); list-style: none; }
+  .facts-gsum::-webkit-details-marker { display: none; }
+  .facts-gdot { width: 8px; height: 8px; border-radius: 999px; background: var(--ink3); flex: none; }
+  .facts-gname { font-weight: 600; }
+  .facts-gcount { margin-left: auto; color: var(--ink3); font-size: 10.5px; }
+  .facts-glist { display: flex; flex-direction: column; gap: 6px; padding: 0 10px 10px; }
+  .facts-row { border: 1px solid var(--edge); border-left: 3px solid var(--ink3); border-radius: 8px; padding: 8px 12px; background: var(--surface2); cursor: pointer; }
+  .facts-row:hover { border-color: var(--edge-strong); }
+  .facts-rhead { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .facts-key { font-family: var(--font-mono); font-size: 12.5px; color: var(--ink); font-weight: 600; }
+  .facts-entity { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink3); }
+  .facts-rbadges { display: flex; gap: 6px; }
+  .facts-time { margin-left: auto; font-family: var(--font-mono); font-size: 10px; color: var(--ink3); }
+  .facts-val { margin-top: 4px; font-size: 12px; color: var(--ink2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .facts-badge { font-family: var(--font-mono); font-size: 9.5px; padding: 2px 7px; border-radius: 999px; border: 1px solid var(--edge); color: var(--ink3); }
+  .facts-badge.sup { border-style: dashed; opacity: .85; }
+  .facts-detail { display: none; margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--edge); }
+  .facts-row.open .facts-detail { display: block; }
+  .facts-row.open .facts-val { white-space: normal; }
+  .facts-kv { display: grid; grid-template-columns: max-content 1fr; gap: 3px 14px; font-family: var(--font-mono); font-size: 11px; }
+  .facts-kv-k { color: var(--ink3); }
+  .facts-kv-v { color: var(--ink2); word-break: break-word; }
+  .facts-vlabel { margin: 9px 0 4px; font-family: var(--font-mono); font-size: 10px; color: var(--ink3); }
+  .facts-vfull { margin: 0; padding: 10px; border-radius: 8px; background: var(--bg); border: 1px solid var(--edge); font-family: var(--font-mono); font-size: 11.5px; color: var(--ink); white-space: pre-wrap; word-break: break-word; max-height: 360px; overflow: auto; }
+  .facts-loading { font-family: var(--font-mono); font-size: 11px; color: var(--ink3); }
+  .facts-more { display: flex; justify-content: center; padding: 4px 0; }
+  .facts-cap { margin: 0; font-family: var(--font-mono); font-size: 11px; color: var(--warn); }
+  .facts-empty { padding: 8px 0; }
+  .facts-sentinel { height: 1px; }
+  .facts-row.tone-acc { border-left-color: var(--acc); }
+  .facts-row.tone-ok { border-left-color: var(--ok); }
+  .facts-row.tone-crit { border-left-color: var(--crit); }
+  .facts-row.tone-trust { border-left-color: var(--trust); }
+  .facts-row.tone-warn { border-left-color: var(--warn); }
+  .facts-row.tone-ink3 { border-left-color: var(--ink3); }
+  .facts-group.tone-acc .facts-gdot { background: var(--acc); }
+  .facts-group.tone-ok .facts-gdot { background: var(--ok); }
+  .facts-group.tone-crit .facts-gdot { background: var(--crit); }
+  .facts-group.tone-trust .facts-gdot { background: var(--trust); }
+  .facts-group.tone-warn .facts-gdot { background: var(--warn); }
+  .facts-group.tone-ink3 .facts-gdot { background: var(--ink3); }
+
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { animation: none !important; transition: none !important; }
     .aurora { animation: none !important; }

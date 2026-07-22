@@ -3203,6 +3203,7 @@ fn list_facts_params() -> ListFactsParams {
         include_superseded: None,
         entity_prefix: None,
         q: None,
+        as_of_unix_ms: None,
     }
 }
 
@@ -3285,6 +3286,120 @@ async fn list_facts_paginates_full_store_exactly_once_descending() {
             "rows must be strictly descending"
         );
     }
+}
+
+/// Store one fact with an explicit `stored_at` (ingest time) via the sync path —
+/// `store()` stamps `Utc::now()`, which a tight loop cannot spread across
+/// distinct milliseconds. Deterministic timestamps are what the `as_of` filter
+/// needs to be exercised meaningfully.
+async fn store_fact_at(state: &AppState, entity: &str, key: &str, value: &str, stored_at_ms: i64) {
+    let mut store = state.fact_store.write().await;
+    store.store_synced(corecrux_memory::fact_store::Fact {
+        fact_id: format!("f_{entity}_{key}"),
+        tenant_hash: "default".to_string(),
+        entity: entity.to_string(),
+        key: key.to_string(),
+        value: value.to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        stored_at: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(stored_at_ms).unwrap(),
+        tokens: 1,
+        deleted: false,
+        version: 1,
+        supersedes: None,
+        private: false,
+        horizon_class: corecrux_memory::HorizonClass::None,
+        reverified_at: None,
+        superseded_by: None,
+        actor: None,
+        valid_from: None,
+        valid_to: None,
+        access_count: 0,
+        last_accessed_at: None,
+    });
+}
+
+#[tokio::test]
+async fn list_facts_as_of_excludes_newer_facts_and_paginates_exactly() {
+    let state = test_app_state(16);
+    // 20 facts with strictly increasing stored_at (1_000ms ..= 20_000ms).
+    for i in 1..=20i64 {
+        store_fact_at(&state, "note", &format!("k{i:02}"), &format!("v{i}"), i * 1000).await;
+    }
+
+    // Time-machine cutoff between the 12th and 13th fact: only facts stored at
+    // or before 12_500ms (i = 1..=12) may appear.
+    let cutoff = 12_500i64;
+    let mut collected: Vec<serde_json::Value> = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let params = ListFactsParams {
+            cursor: cursor.clone(),
+            limit: Some(5),
+            as_of_unix_ms: Some(cutoff),
+            ..list_facts_params()
+        };
+        let resp = facts::list_facts(State(state.clone()), HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        // total_visible is the as-of universe (12), not the whole store …
+        assert_eq!(
+            body["total_visible"], 12,
+            "only facts at/under the as_of cutoff are visible"
+        );
+        // … while total_nondeleted still reports the true store size (20).
+        assert_eq!(
+            body["total_nondeleted"], 20,
+            "as_of never shrinks the store-size denominator"
+        );
+        let rows = body["facts"].as_array().unwrap().clone();
+        pages += 1;
+        let next = body["next_cursor"].as_str().map(str::to_string);
+        if next.is_some() {
+            assert_eq!(body["has_more"], true);
+            assert_eq!(rows.len(), 5);
+        } else {
+            assert_eq!(body["has_more"], false);
+        }
+        collected.extend(rows);
+        match next {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+
+    assert_eq!(pages, 3, "12 visible / limit 5 = 3 pages (5 + 5 + 2)");
+    assert_eq!(collected.len(), 12);
+    // No fact newer than the cutoff leaked, and every fact appears exactly once.
+    let ids: std::collections::BTreeSet<String> = collected
+        .iter()
+        .map(|r| r["fact_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids.len(), 12, "no dupes / no gaps across cursor pages under as_of");
+    for r in &collected {
+        assert!(
+            r["stored_at_unix_ms"].as_i64().unwrap() <= cutoff,
+            "no fact newer than as_of may appear"
+        );
+    }
+    // Strictly descending by (stored_at_unix_ms, fact_id) — the as_of filter
+    // must not disturb ordering.
+    for pair in collected.windows(2) {
+        assert!(
+            list_row_key(&pair[0]) > list_row_key(&pair[1]),
+            "rows stay strictly descending"
+        );
+    }
+
+    // Sanity: omitting as_of returns the whole store.
+    let resp = facts::list_facts(State(state.clone()), HeaderMap::new(), Query(list_facts_params()))
+        .await
+        .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["total_visible"], 20, "as_of omitted ⇒ whole visible store");
 }
 
 #[tokio::test]
