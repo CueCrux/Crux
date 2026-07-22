@@ -2935,9 +2935,12 @@
     }
 
     // Rings (prototype) — no sub-pills: it IS the page. The self-contained
-    // rings-clock landing mock is rendered in an isolated iframe via a base64
-    // data: URL (CruxPages.RINGS_HTML_B64), so its styles/scripts can't collide
-    // with the SPA. Reads nothing itself (embedded snapshot), so every posture.
+    // rings-clock landing mock is rendered in an isolated iframe. The payload
+    // ships base64 (CruxPages.RINGS_HTML_B64, escaping-proof) but is injected
+    // via `srcdoc` rather than a data: URL: srcdoc documents INHERIT the
+    // console's origin, so the mock's same-origin fetches (/v1/work,
+    // /v1/console/summary) reach the daemon and swap its embedded snapshot
+    // for live data. A data: URL is an opaque origin and cannot do that.
     if (destId === 'rings') {
       document.getElementById('destTitle').textContent = dest.label;
       document.getElementById('destSub').textContent = dest.sub || '';
@@ -2946,8 +2949,14 @@
       if (ringsB64) {
         var frame = el('iframe', {
           'class': 'rings-frame', id: 'ringsFrame', title: 'Rings-clock landing prototype',
-          loading: 'lazy', src: 'data:text/html;charset=utf-8;base64,' + ringsB64
+          loading: 'lazy'
         });
+        try {
+          frame.srcdoc = new TextDecoder().decode(
+            Uint8Array.from(atob(ringsB64), function (c) { return c.charCodeAt(0); }));
+        } catch (e) {
+          frame.src = 'data:text/html;charset=utf-8;base64,' + ringsB64; // fallback: snapshot-only
+        }
         ringsHost.appendChild(frame);
       } else {
         ringsHost.appendChild(el('p', { 'class': 'v2card-sub', text: 'Rings prototype asset unavailable.' }));

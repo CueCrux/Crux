@@ -177,3 +177,13 @@ CORECRUXD_ALLOW_INSECURE_DEV_AUTH_BIND=1   # container binds 0.0.0.0 internally;
 This is acceptable ONLY because the container is published on `127.0.0.1` and
 runs against a throwaway copy. Never carry these two lines to any non-loopback
 deployment. API calls need no Authorization header against the mirror.
+
+## Known mirror gap: token_burn is null
+
+Prod's `/v1/work` items carry `token_burn` (cost attribution over session
+events); the mirror returns `token_burn: null` for the same items despite
+`CORECRUXD_FEATURE_COST_LENS=1` and the copied `session-events.jsonl` —
+attribution isn't being materialised from the copied events (root cause not
+yet chased; likely an aggregation/warm path that keys off something outside
+the data volume). The Rings page detects the all-zero board and falls back to
+its snapshot token profile, labelling the tile "255M (snap)".
