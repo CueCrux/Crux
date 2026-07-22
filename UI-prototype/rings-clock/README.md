@@ -30,3 +30,8 @@ Related: `UI-prototype/console-3d/` (clay-substrate concept, 2026-06-11).
   token bars, drawn click-cards (pre-pane).
 - v4.3 (current `index.html`) — event-aligned gradient rim charts, slide-out
   detail pane, ledger-click plan filter, thicker progress arcs.
+- `versions/v4.3-pane-eventcharts.html` — rim-mounted event-aligned token
+  charts (pre-move-to-pane).
+- v4.4 (current `index.html`) — token chart relocated into the detail pane as
+  a horizontal gradient area (cumulative spend, event dots by kind); rim
+  carries only the thick progress arcs.

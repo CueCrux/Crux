@@ -165,7 +165,7 @@ footer { max-width: 1100px; margin: 48px auto 0; padding: 20px clamp(16px, 4vw, 
         <tr><td>dot size</td><td>tokens (traced facts) · milestone weight (untraced)</td></tr>
         <tr><td>bars</td><td>spoke = centre → node ring; older over newer; both clickable</td></tr>
         <tr><td>edge toggle</td><td>outward: rings grow from the centre · inward: nodes sink from the rim</td></tr>
-        <tr><td>token chart</td><td>in the detail pane: cumulative spend over the plan's life, gradient-filled, event dots by kind</td></tr>
+        <tr><td>rim chart</td><td>token spend across each sector's arc: sector start = tracking start, sector end = now</td></tr>
         <tr><td>ledger</td><td>completed plans stack on the left edge as they retire</td></tr>
         <tr><td>traced plans</td><td><code>buyer-fit-buildout</code> + <code>cross-site-auth-sso</code> carry their real facts; others show milestone-derived density</td></tr>
       </table>
@@ -506,11 +506,71 @@ function draw(now) {
       ctx.strokeStyle = hex2rgba('#ef4444', pulse * al);
       ctx.beginPath(); ctx.arc(0, 0, g.R + 8, L.a0 + 0.01, L.a1 - 0.01); ctx.stroke();
     }
-    /* (token usage chart moved into the detail pane — rim stays clean) */
+    /* rim token chart: gradient area anchored to the EVENT lines.
+       Each visible event contributes a point at its own angle; the curve
+       spans sector start → current position, filled hue → transparent. */
+    if (wSec * g.R * Z > 30) {
+      const Rb = g.R + 7;
+      const hMax = 13 / Math.max(1, Math.sqrt(Z));
+      const evs = [];
+      for (let k2 = p.cells.length - 1; k2 >= 0; k2--) {   /* p.cells is desc; walk asc */
+        const c = p.cells[k2];
+        if (c.day > T || c.day < S || c.day > E) continue;
+        const frac = c.n > 1 ? (c.rank + 0.5) / c.n : 0.5;
+        const a = L.a0 + wSec * (0.06 + 0.88 * frac);
+        evs.push({ a, h: (2 + (c.tokW / p.tokMax) * (hMax - 2) * p.tokScale) });
+      }
+      if (evs.length) {
+        /* crest sampled ALONG the arc (height lerped between events) so wide
+           sectors don't cut straight chords through the disc */
+        const crest = [];
+        const step = 0.035;
+        crest.push({ a: evs[0].a, h: evs[0].h });
+        for (let k3 = 0; k3 < evs.length - 1; k3++) {
+          const a1 = evs[k3], b1 = evs[k3 + 1];
+          const nSub = Math.max(1, Math.ceil((b1.a - a1.a) / step));
+          for (let s2 = 1; s2 <= nSub; s2++) {
+            const f2 = s2 / nSub;
+            crest.push({ a: mix(a1.a, b1.a, f2), h: mix(a1.h, b1.h, ss(f2)) });
+          }
+        }
+        const grad = ctx.createRadialGradient(0, 0, Rb, 0, 0, Rb + hMax + 2);
+        grad.addColorStop(0, hex2rgba(hue, 0.34 * al));
+        grad.addColorStop(1, hex2rgba(hue, 0));
+        ctx.beginPath();
+        ctx.moveTo(Math.cos(crest[0].a) * Rb, Math.sin(crest[0].a) * Rb);
+        for (const cp of crest) ctx.lineTo(Math.cos(cp.a) * (Rb + cp.h), Math.sin(cp.a) * (Rb + cp.h));
+        const last = crest[crest.length - 1];
+        ctx.lineTo(Math.cos(last.a) * Rb, Math.sin(last.a) * Rb);
+        ctx.arc(0, 0, Rb, last.a, crest[0].a, true);
+        ctx.closePath();
+        ctx.fillStyle = grad;
+        ctx.fill();
+        /* crest line */
+        ctx.strokeStyle = hex2rgba(hue, 0.6 * al);
+        ctx.lineWidth = 1.2 / Z;
+        ctx.beginPath();
+        crest.forEach((cp, k3) => {
+          const x2 = Math.cos(cp.a) * (Rb + cp.h), y2 = Math.sin(cp.a) * (Rb + cp.h);
+          if (k3 === 0) ctx.moveTo(x2, y2); else ctx.lineTo(x2, y2);
+        });
+        ctx.stroke();
+        /* the line drawn out from each event */
+        ctx.lineWidth = 1 / Z;
+        for (const ev of evs) {
+          ctx.strokeStyle = hex2rgba(hue, 0.5 * al);
+          ctx.beginPath();
+          ctx.moveTo(Math.cos(ev.a) * Rb, Math.sin(ev.a) * Rb);
+          ctx.lineTo(Math.cos(ev.a) * (Rb + ev.h), Math.sin(ev.a) * (Rb + ev.h));
+          ctx.stroke();
+        }
+      }
+      ctx.lineWidth = 1 / Z;
+    }
     /* label if wide enough on screen — or hovered (census mode names on hover) */
     const isHovSec = p === hoverSec;
     if (wSec * g.R * Z > 46 || isHovSec) {
-      const midA = (L.a0 + L.a1) / 2, lr = g.R + 14;
+      const midA = (L.a0 + L.a1) / 2, lr = g.R + 26;
       ctx.save();
       ctx.translate(Math.cos(midA) * lr, Math.sin(midA) * lr);
       ctx.rotate(midA + (Math.cos(midA + rot) < 0 ? Math.PI : 0));
@@ -841,37 +901,6 @@ const pane = document.getElementById('pane');
 function renderPane() {
   if (!sel) { pane.classList.remove('open'); return; }
   const esc = t => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;');
-  /* token usage as a horizontal gradient area chart: cumulative event weight
-     over the plan's life, event dots coloured by kind */
-  const tokChart = p => {
-    const evs = [...p.cells].sort((a, b) => a.day - b.day);
-    if (!evs.length) return '';
-    const W2 = 288, H2 = 92, padT = 10, padB = 20, padX = 2;
-    const b = p.b, e = Math.max(p.e, b + 0.5);
-    const tot = evs.reduce((a, c) => a + c.tokW, 0) || 1;
-    const hue = p.st === 2 ? '#ef4444' : p.st === 0 ? '#2dd4bf' : '#f5a623';
-    const X2 = d => padX + Math.max(0, Math.min(1, (d - b) / (e - b))) * (W2 - 2 * padX);
-    const Y2 = f => (H2 - padB) - f * (H2 - padB - padT);
-    let cum = 0;
-    const pts = evs.map(c => { cum += c.tokW; return { x: X2(c.day), y: Y2(cum / tot), c }; });
-    const line = 'M' + padX + ',' + Y2(0) + pts.map(pt => 'L' + pt.x.toFixed(1) + ',' + pt.y.toFixed(1)).join('') +
-                 'L' + (W2 - padX) + ',' + pts[pts.length - 1].y.toFixed(1);
-    const area = line + 'L' + (W2 - padX) + ',' + Y2(0) + 'Z';
-    const gid = 'tg' + p.i;
-    const dots = pts.map(pt =>
-      '<circle cx="' + pt.x.toFixed(1) + '" cy="' + pt.y.toFixed(1) + '" r="' + (pt.c.kind === 'gate' ? 3 : 2.2) + '" fill="' + (KIND_HUE[pt.c.kind] || '#8b96f2') + '"/>').join('');
-    return '<div class="sect">TOKEN USAGE' + (p.o ? ' · ' + (p.o / 10).toFixed(1) + 'M out' : '') + '</div>' +
-      '<svg width="100%" viewBox="0 0 ' + W2 + ' ' + H2 + '" style="display:block;margin-top:6px" role="img" aria-label="Cumulative token usage over the plan’s life">' +
-      '<defs><linearGradient id="' + gid + '" x1="0" y1="0" x2="0" y2="1">' +
-      '<stop offset="0" stop-color="' + hue + '" stop-opacity=".38"/>' +
-      '<stop offset="1" stop-color="' + hue + '" stop-opacity="0"/></linearGradient></defs>' +
-      '<path d="' + area + '" fill="url(#' + gid + ')"/>' +
-      '<path d="' + line + '" fill="none" stroke="' + hue + '" stroke-opacity=".85" stroke-width="1.4"/>' +
-      dots +
-      '<text x="' + padX + '" y="' + (H2 - 5) + '" fill="rgba(126,133,149,.8)" font-size="9" font-family="' + MONO.replace(/"/g, "'") + '">' + dayDate(b) + '</text>' +
-      '<text x="' + (W2 - padX) + '" y="' + (H2 - 5) + '" text-anchor="end" fill="rgba(126,133,149,.8)" font-size="9" font-family="' + MONO.replace(/"/g, "'") + '">' + dayDate(p.e) + '</text>' +
-      '</svg>';
-  };
   const planBlock = p => {
     const hue = p.st === 2 ? '#ef4444' : p.st === 0 ? '#2dd4bf' : '#f5a623';
     const nCells = p.cells.length;
@@ -884,7 +913,6 @@ function renderPane() {
       '<div class="row"><span>last activity</span><span>' + dayDate(p.e) + '</span></div>' +
       (p.o ? '<div class="row"><span>output tokens</span><span>' + (p.o / 10).toFixed(1) + 'M</span></div>' : '') +
       '<div class="row"><span>nodes</span><span>' + nCells + ' (' + gates + ' gates)</span></div>' +
-      tokChart(p) +
       (p.traced
         ? '<div class="sect">FACTS (real)</div><ul class="facts">' +
           [...p.cells].sort((a, b) => a.day - b.day).map(c =>
