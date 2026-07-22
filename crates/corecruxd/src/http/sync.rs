@@ -23,7 +23,7 @@ use corecrux_memory::sync::{
 };
 use crux_sync::peer_handshake::{verify_peer_handshake, AuthenticatedPeer, PeerAuthError, PeerHandshake};
 use rand::TryRng as _;
-use rcx_capability_token::{verify_token_attenuated, AttenuatedOutcome, RcxCapabilityToken};
+use rcx_capability_token::RcxCapabilityToken;
 use serde_json::json;
 
 const PEER_TOKEN_HEADER: &str = "x-crux-peer-token";
@@ -121,12 +121,7 @@ fn peer_rejection_class(error: &PeerAuthError) -> &'static str {
 }
 
 #[allow(clippy::result_large_err)]
-async fn require_sync_peer(
-    state: &AppState,
-    headers: &HeaderMap,
-    tenant_id: &str,
-    required_capability: &str,
-) -> Result<(), Response> {
+async fn require_sync_peer(state: &AppState, headers: &HeaderMap, tenant_id: &str) -> Result<(), Response> {
     let handshake = parse_peer_handshake(headers).map_err(|error| match error {
         PeerHandshakeParseError::Missing => peer_auth_problem("missing_peer_handshake"),
         PeerHandshakeParseError::Malformed => peer_auth_problem("malformed_peer_handshake"),
@@ -171,34 +166,6 @@ async fn require_sync_peer(
     if authenticated_tenant != tenant_id {
         return Err(peer_tenant_problem());
     }
-
-    // Macaroon attenuation (R3): a peer token MAY carry holder-appended narrowing
-    // caveats. They can only *remove* authority (tenant / time / scope); the base
-    // grant was already verified above. Evaluate them against this request.
-    let token = &handshake.capability_token;
-    if !token.caveats.is_empty() {
-        // Fail-closed: a verifier that is not enforcing caveats MUST NOT accept an
-        // attenuated token — accepting it would silently drop the restrictions and
-        // grant the broader base authority. Reject until enforcement is deployed
-        // everywhere (mint-before-verify ordering; see the M4 rollout note).
-        if !state.sync_caveat_enforce {
-            return Err(peer_auth_problem("peer_caveat_enforcement_disabled"));
-        }
-        // Authenticate the caveat binding with the possession-proven holder key
-        // (the same peer public key the handshake above verified).
-        if verify_token_attenuated(token, trust_root, now, &handshake.peer_public_key) != AttenuatedOutcome::Verified {
-            return Err(peer_auth_problem("peer_caveat_signature_rejected"));
-        }
-        // Each caveat kind must permit the concrete request; effective authority is
-        // base ∩ caveats, so any narrowing that excludes this request denies it.
-        if !token.caveats_permit_tenant(tenant_id)
-            || token.attenuated_expires_at() < now
-            || !token.caveats_permit_capability(required_capability)
-        {
-            return Err(peer_auth_problem("peer_caveat_denied"));
-        }
-    }
-
     Ok(())
 }
 
@@ -294,7 +261,7 @@ fn validate_tenant_id(tenant_id: &str) -> Result<(), Response> {
 #[allow(clippy::result_large_err)]
 async fn require_sync_read(state: &AppState, headers: &HeaderMap, tenant_id: &str) -> Result<(), Response> {
     if state.sync_mutual_auth {
-        return require_sync_peer(state, headers, tenant_id, "facts:read").await;
+        return require_sync_peer(state, headers, tenant_id).await;
     }
 
     let ctx = crate::auth::http_scope_context(&state.auth, headers).map_err(IntoResponse::into_response)?;
@@ -308,7 +275,7 @@ async fn require_sync_read(state: &AppState, headers: &HeaderMap, tenant_id: &st
 #[allow(clippy::result_large_err)]
 async fn require_sync_write(state: &AppState, headers: &HeaderMap, tenant_id: &str) -> Result<(), Response> {
     if state.sync_mutual_auth {
-        return require_sync_peer(state, headers, tenant_id, "facts:write").await;
+        return require_sync_peer(state, headers, tenant_id).await;
     }
 
     let ctx = crate::auth::http_scope_context(&state.auth, headers).map_err(IntoResponse::into_response)?;
