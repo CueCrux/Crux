@@ -10662,22 +10662,23 @@ fn mint_test_verified_app_state(action_max_pending: usize) -> AppState {
     state
 }
 
-fn mint_test_verified_headers(scopes: &str, passport_id: &str) -> HeaderMap {
+fn mint_test_jwt_headers(scopes: &str, identity_claim: (&str, &str)) -> HeaderMap {
     let exp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system time after epoch")
         .as_secs()
         .saturating_add(3_600) as usize;
+    let mut claims = serde_json::json!({
+        "exp": exp,
+        "iss": MINT_TEST_ISSUER,
+        "aud": MINT_TEST_AUDIENCE,
+        "scope": scopes,
+        "tenant_id": "default",
+    });
+    claims[identity_claim.0] = serde_json::json!(identity_claim.1);
     let token = jsonwebtoken::encode(
         &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
-        &serde_json::json!({
-            "exp": exp,
-            "iss": MINT_TEST_ISSUER,
-            "aud": MINT_TEST_AUDIENCE,
-            "scope": scopes,
-            "tenant_id": "default",
-            "passport_id": passport_id,
-        }),
+        &claims,
         &jsonwebtoken::EncodingKey::from_secret(MINT_TEST_HS256_SECRET.as_bytes()),
     )
     .expect("mint approval test JWT");
@@ -10689,31 +10690,12 @@ fn mint_test_verified_headers(scopes: &str, passport_id: &str) -> HeaderMap {
     headers
 }
 
+fn mint_test_verified_headers(scopes: &str, passport_id: &str) -> HeaderMap {
+    mint_test_jwt_headers(scopes, ("passport_id", passport_id))
+}
+
 fn mint_test_sub_only_headers(scopes: &str, subject: &str) -> HeaderMap {
-    let exp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time after epoch")
-        .as_secs()
-        .saturating_add(3_600) as usize;
-    let token = jsonwebtoken::encode(
-        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
-        &serde_json::json!({
-            "exp": exp,
-            "iss": MINT_TEST_ISSUER,
-            "aud": MINT_TEST_AUDIENCE,
-            "scope": scopes,
-            "tenant_id": "default",
-            "sub": subject,
-        }),
-        &jsonwebtoken::EncodingKey::from_secret(MINT_TEST_HS256_SECRET.as_bytes()),
-    )
-    .expect("sub-only mint approval test JWT");
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        header::AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {token}")).expect("bearer header"),
-    );
-    headers
+    mint_test_jwt_headers(scopes, ("sub", subject))
 }
 
 async fn mint_test_verified_state(
