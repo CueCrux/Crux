@@ -485,6 +485,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use crux_router::{mint_free_local_token, RcxRouter};
+    use ed25519_dalek::{Signer, SigningKey};
     use http_body_util::BodyExt;
     use rcx_capability_token::RCX_CT_SIGNATURE_LEN;
     use tower::ServiceExt;
@@ -846,7 +847,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let token = mint_free_local_token(
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let mut token = mint_free_local_token(
             "p_0123456789abcdef0123456789abcdef",
             "daemon_01HV0000000000000000000000",
             "default",
@@ -855,7 +857,11 @@ mod tests {
             now.saturating_add(3600),
             [0x22; RCX_CT_SIGNATURE_LEN],
         );
-        let ctx = McpContext::new_default("test-node").with_rcx_router(RcxRouter::new(token));
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
+        let ctx = McpContext::new_default("test-node").with_rcx_router(RcxRouter::new_with_trusted_issuer_pubkey(
+            token,
+            signing.verifying_key().to_bytes(),
+        ));
         let app = test_app_with_ctx(ctx);
         let body = serde_json::to_string(&json!({
             "jsonrpc": "2.0",

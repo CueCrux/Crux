@@ -10,6 +10,12 @@ fuzz_target!(|data: &[u8]| {
 
     let token = free_local_verified_fixture();
     let _ = token.validate_basic(1_776_989_601);
-    let _ = token.permits_egress("local", "corecrux.query.local", DataEgressClass::None);
+    let _ = token.permits_egress(
+        data,
+        1_776_989_601,
+        "local",
+        "corecrux.query.local",
+        DataEgressClass::None,
+    );
     let _ = verify_token(&token, data, 1_776_989_601);
 });

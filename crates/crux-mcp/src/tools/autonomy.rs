@@ -347,7 +347,8 @@ mod tests {
     }
 
     fn local_only_router(passport: &str) -> RcxRouter {
-        RcxRouter::new(mint_free_local_token(
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let mut token = mint_free_local_token(
             passport,
             "daemon_01HV0000000000000000000000",
             "default",
@@ -355,7 +356,9 @@ mod tests {
             1_776_989_600,
             1_780_143_200,
             [0x11; RCX_CT_SIGNATURE_LEN],
-        ))
+        );
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
+        RcxRouter::new_with_trusted_issuer_pubkey(token, signing.verifying_key().to_bytes())
     }
 
     fn pro_hosted_router(passport: &str) -> RcxRouter {

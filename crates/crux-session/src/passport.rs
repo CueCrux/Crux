@@ -171,6 +171,11 @@ impl LocalPassportKey {
         &self.public_key_hex
     }
 
+    /// Public Ed25519 verifier bytes for locally issued RCX tokens.
+    pub fn verifying_key_bytes(&self) -> [u8; 32] {
+        self.signing_key.verifying_key().to_bytes()
+    }
+
     pub fn sign_hash(&self, hash: &[u8; HASH_LEN]) -> [u8; SIGNATURE_LEN] {
         let sig = self.signing_key.sign(hash);
         let mut out = [0_u8; SIGNATURE_LEN];

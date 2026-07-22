@@ -14,10 +14,11 @@
 pub mod hosted;
 pub mod quota;
 
+use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey};
 use rcx_capability_token::{
-    verify_token, Backend, CreditRefill, Credits, DataEgressClass, FallbackAction, FallbackPolicy, Issuer,
-    OverdraftPolicy, PermittedCapability, RcxCapabilityToken, RcxTier, ReceiptClass, Revocation, Signature, Subject,
-    TenantScope, TokenValidationIssue, VerifyOutcome, RCX_CT_SIGNATURE_LEN, RCX_CT_SPEC_VERSION,
+    Backend, CreditRefill, Credits, DataEgressClass, FallbackAction, FallbackPolicy, Issuer, OverdraftPolicy,
+    PermittedCapability, RcxCapabilityToken, RcxTier, ReceiptClass, Revocation, Signature, Subject, TenantScope,
+    RCX_CT_SIGNATURE_LEN, RCX_CT_SPEC_VERSION,
 };
 
 pub const RCX_MODE_HEADER: &str = "X-Crux-Mode";
@@ -161,7 +162,7 @@ impl McpToolCapability {
 #[derive(Debug, Clone)]
 pub struct RcxRouter {
     token: RcxCapabilityToken,
-    trusted_issuer_pubkey: Option<[u8; 32]>,
+    issuer_signature_valid: bool,
     runtime_credit_balance: RuntimeCreditBalance,
 }
 
@@ -172,18 +173,14 @@ enum RuntimeCreditBalance {
 }
 
 impl RcxRouter {
-    pub fn new(token: RcxCapabilityToken) -> Self {
-        Self {
-            token,
-            trusted_issuer_pubkey: None,
-            runtime_credit_balance: RuntimeCreditBalance::FromToken,
-        }
-    }
-
     pub fn new_with_trusted_issuer_pubkey(token: RcxCapabilityToken, trusted_issuer_pubkey: [u8; 32]) -> Self {
+        let issuer_signature_valid = VerifyingKey::from_bytes(&trusted_issuer_pubkey).is_ok_and(|key| {
+            key.verify_strict(&token.token_hash(), &Ed25519Signature::from_bytes(&token.signature.sig))
+                .is_ok()
+        });
         Self {
             token,
-            trusted_issuer_pubkey: Some(trusted_issuer_pubkey),
+            issuer_signature_valid,
             runtime_credit_balance: RuntimeCreditBalance::FromToken,
         }
     }
@@ -198,33 +195,24 @@ impl RcxRouter {
     }
 
     pub fn decide(&self, call: &CallContext, now_unix_seconds: u64) -> RouterDecision {
+        if self.token.requires_contextual_verification() {
+            return self.refuse(call, DenialReason::TokenInvalid);
+        }
+        if !self.issuer_signature_valid {
+            return self.refuse(call, DenialReason::TokenInvalid);
+        }
         let validation = self.token.validate_basic(now_unix_seconds);
-        if !validation.valid {
-            let reason = first_validation_reason(&validation.issues);
-            if reason == DenialReason::TokenExpired
-                && validation.issues.iter().all(|issue| issue.code == "token_expired")
-            {
-                return self.apply_expiry_fallback(call, reason);
-            }
-            return self.refuse(call, reason);
+        let expired = !validation.valid
+            && !validation.issues.is_empty()
+            && validation.issues.iter().all(|issue| issue.code == "token_expired");
+        if !validation.valid && !expired {
+            return self.refuse(call, DenialReason::TokenInvalid);
         }
 
         let backend = self.select_backend(call);
         let Some(backend) = backend else {
             return self.refuse(call, DenialReason::CapabilityNotPermitted);
         };
-
-        if !self.token_signature_permits_backend(backend, now_unix_seconds) {
-            return self.refuse(call, DenialReason::TokenInvalid);
-        }
-
-        if !call.backend_reachable && backend.backend_id != "local" {
-            return self.apply_fallback_action(
-                call,
-                &self.token.fallback.on_backend_unreachable,
-                DenialReason::BackendUnavailable,
-            );
-        }
 
         let Some(capability) = backend
             .permitted_capabilities
@@ -248,6 +236,18 @@ impl RcxRouter {
             .any(|required| !call.present_attestations.iter().any(|present| present == required))
         {
             return self.refuse(call, DenialReason::AttestationMissing);
+        }
+
+        if expired {
+            return self.apply_expiry_fallback(call, DenialReason::TokenExpired);
+        }
+
+        if !call.backend_reachable && backend.backend_id != "local" {
+            return self.apply_fallback_action(
+                call,
+                &self.token.fallback.on_backend_unreachable,
+                DenialReason::BackendUnavailable,
+            );
         }
 
         let credit_cost = capability
@@ -317,31 +317,6 @@ impl RcxRouter {
                     .iter()
                     .any(|capability| capability.capability == call.capability)
         })
-    }
-
-    /// Whether the token's signature authorises routing to `backend`.
-    ///
-    /// INVARIANT: the `local` backend skips signature verification. This is sound
-    /// only because the token reaching `decide()` is always daemon-minted (see
-    /// `RcxRouter::new`, fed a self-minted local token in `corecruxd::main`) and
-    /// never a client-injected `RcxCapabilityToken`. The local token never crosses
-    /// a trust boundary, so there is no signer to verify against.
-    ///
-    /// Any future wiring that routes a client-supplied token through `decide()`
-    /// MUST construct the router via `new_with_trusted_issuer_pubkey` so non-local
-    /// backends are signature-checked; the local short-circuit must not be relied
-    /// on to authorise a hosted backend. The negative test
-    /// `local_signature_bypass_does_not_extend_to_hosted_backend` pins this: a
-    /// router built with `new()` (no trusted issuer) authorises a local capability
-    /// but refuses any hosted backend with `TokenInvalid`.
-    fn token_signature_permits_backend(&self, backend: &Backend, now_unix_seconds: u64) -> bool {
-        if backend.backend_id == "local" {
-            return true;
-        }
-        let Some(trusted_issuer_pubkey) = self.trusted_issuer_pubkey.as_ref() else {
-            return false;
-        };
-        verify_token(&self.token, trusted_issuer_pubkey, now_unix_seconds) == VerifyOutcome::Verified
     }
 
     fn has_credit(&self, estimated_credit_cost: u64) -> bool {
@@ -545,8 +520,8 @@ pub fn mint_free_local_token(
             crl_url: None,
             push_channel: None,
         },
-        caveats: Vec::new(),
-        caveat_signature: None,
+        delegation_policy: None,
+        delegation_envelope: None,
         signature: Signature {
             alg: "ed25519".to_string(),
             kid: passport_fpr,
@@ -732,14 +707,6 @@ pub fn ingest_usage_report(
     }
 }
 
-fn first_validation_reason(issues: &[TokenValidationIssue]) -> DenialReason {
-    if issues.iter().any(|issue| issue.code == "token_expired") {
-        DenialReason::TokenExpired
-    } else {
-        DenialReason::TokenInvalid
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,7 +714,8 @@ mod tests {
     use std::time::Instant;
 
     fn router() -> RcxRouter {
-        RcxRouter::new(mint_free_local_token(
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let mut token = mint_free_local_token(
             "p_0123456789abcdef0123456789abcdef",
             "daemon_01HV0000000000000000000000",
             "default",
@@ -759,7 +727,9 @@ mod tests {
             1_776_989_600,
             1_780_143_200,
             [0x11; RCX_CT_SIGNATURE_LEN],
-        ))
+        );
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
+        RcxRouter::new_with_trusted_issuer_pubkey(token, signing.verifying_key().to_bytes())
     }
 
     fn hosted_token(
@@ -834,7 +804,8 @@ mod tests {
     }
 
     #[test]
-    fn refuses_hosted_without_trusted_issuer_key() {
+    fn refuses_hosted_with_bad_signature() {
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
         let token = hosted_token(
             FallbackAction::Refuse,
             FallbackAction::Refuse,
@@ -842,7 +813,8 @@ mod tests {
             None,
             Some(10),
         );
-        let decision = RcxRouter::new(token).decide(&hosted_retrieve_call(1, true), 1_776_989_601);
+        let decision = RcxRouter::new_with_trusted_issuer_pubkey(token, signing.verifying_key().to_bytes())
+            .decide(&hosted_retrieve_call(1, true), 1_776_989_601);
         assert!(!decision.authorised);
         assert_eq!(decision.reason_code.as_deref(), Some("denied:token_invalid"));
     }
@@ -860,46 +832,53 @@ mod tests {
     }
 
     #[test]
-    fn local_signature_bypass_does_not_extend_to_hosted_backend() {
-        // A router built via new() (no trusted issuer pubkey) models the
-        // daemon-minted-local-token case. The local signature bypass authorises a
-        // local capability, but the SAME router must refuse a hosted backend with
-        // TokenInvalid — the bypass cannot be leveraged to reach a hosted lane.
-        let token = hosted_token(
-            FallbackAction::Refuse,
-            FallbackAction::Refuse,
-            FallbackAction::Refuse,
-            None,
-            Some(10),
+    fn local_tokens_are_signature_checked() {
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let mut token = mint_free_local_token(
+            "p_0123456789abcdef0123456789abcdef",
+            "daemon_01HV0000000000000000000000",
+            "default",
+            vec!["corecrux.query.local".to_string()],
+            1_776_989_600,
+            1_780_143_200,
+            [0; RCX_CT_SIGNATURE_LEN],
         );
-        // Grant the same token a local capability so we can prove local is allowed.
-        let mut token = token;
-        token.backends.push(Backend {
-            backend_id: "local".to_string(),
-            trust_root_kid: "p_0123456789abcdef0123456789abcdef".to_string(),
-            endpoint_url: None,
-            permitted_capabilities: vec![PermittedCapability {
-                capability: "corecrux.query.local".to_string(),
-                data_egress_classes: vec![DataEgressClass::None],
-                required_attestations: vec![],
-                credit_cost: None,
-            }],
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
+        token.token_id.push_str("-tampered");
+        let router = RcxRouter::new_with_trusted_issuer_pubkey(token, signing.verifying_key().to_bytes());
+        let decision = router.decide(&CallContext::local("corecrux.query.local"), 1_776_989_601);
+        assert!(!decision.authorised);
+        assert_eq!(decision.reason_code.as_deref(), Some("denied:token_invalid"));
+    }
+
+    #[test]
+    fn stripped_v11_policy_cannot_downgrade_through_router() {
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let mut token = mint_free_local_token(
+            "p_0123456789abcdef0123456789abcdef",
+            "daemon_01HV0000000000000000000000",
+            "default",
+            vec!["corecrux.query.local".to_string()],
+            1_776_989_600,
+            1_780_143_200,
+            [0; RCX_CT_SIGNATURE_LEN],
+        );
+        token.spec_version = rcx_capability_token::RCX_CT_DELEGATION_SPEC_VERSION.to_string();
+        token.delegation_policy = Some(rcx_capability_token::DelegationPolicy {
+            presentation: rcx_capability_token::DelegationPresentation::ProofOfPossession,
+            max_depth: 1,
+            audience: rcx_capability_token::DelegationAudience::CruxSync,
+            allowed_delegate_fprs: vec!["p_0123456789abcdef0123456789abcdef".to_string()],
         });
-        let router = RcxRouter::new(token);
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
+        token.spec_version = RCX_CT_SPEC_VERSION.to_string();
+        token.delegation_policy = None;
+        token.delegation_envelope = None;
 
-        let local = router.decide(&CallContext::local("corecrux.query.local"), 1_776_989_601);
-        assert!(
-            local.authorised,
-            "local capability must be authorised via the local bypass"
-        );
-        assert_eq!(local.backend_id.as_deref(), Some("local"));
-
-        let hosted = router.decide(&hosted_retrieve_call(1, true), 1_776_989_601);
-        assert!(
-            !hosted.authorised,
-            "hosted backend must not ride the local signature bypass"
-        );
-        assert_eq!(hosted.reason_code.as_deref(), Some("denied:token_invalid"));
+        let decision = RcxRouter::new_with_trusted_issuer_pubkey(token, signing.verifying_key().to_bytes())
+            .decide(&CallContext::local("corecrux.query.local"), 1_776_989_601);
+        assert!(!decision.authorised);
+        assert_eq!(decision.reason_code.as_deref(), Some("denied:token_invalid"));
     }
 
     #[test]
@@ -1085,6 +1064,66 @@ mod tests {
         assert!(decision.authorised);
         assert_eq!(decision.mode, RouterMode::DegradedLocal);
         assert_eq!(decision.reason_code.as_deref(), Some("denied:token_expired"));
+    }
+
+    #[test]
+    fn expiry_fallback_cannot_authorise_an_ungranted_capability() {
+        let decision = hosted_router(
+            FallbackAction::Refuse,
+            FallbackAction::Refuse,
+            FallbackAction::DegradeToLocal,
+            None,
+            Some(10),
+        )
+        .decide(&CallContext::local("attacker.ungranted"), 1_780_143_301);
+
+        assert!(!decision.authorised);
+        assert_eq!(decision.reason_code.as_deref(), Some("denied:capability_not_permitted"));
+    }
+
+    #[test]
+    fn unreachable_fallback_cannot_bypass_egress_or_attestations() {
+        let router = hosted_router(
+            FallbackAction::Queue,
+            FallbackAction::Refuse,
+            FallbackAction::Refuse,
+            Some(120),
+            Some(10),
+        );
+        let mut egress = hosted_retrieve_call(1, false);
+        egress.data_egress_classes.push(DataEgressClass::Text);
+        let egress_decision = router.decide(&egress, 1_776_989_601);
+        assert!(!egress_decision.authorised);
+        assert_eq!(
+            egress_decision.reason_code.as_deref(),
+            Some("denied:egress_not_permitted")
+        );
+
+        let mut attestations = hosted_retrieve_call(1, false);
+        attestations.present_attestations.clear();
+        let attestation_decision = router.decide(&attestations, 1_776_989_601);
+        assert!(!attestation_decision.authorised);
+        assert_eq!(
+            attestation_decision.reason_code.as_deref(),
+            Some("denied:attestation_missing")
+        );
+    }
+
+    #[test]
+    fn forged_expired_token_cannot_invoke_fallback_policy() {
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let token = hosted_token(
+            FallbackAction::Refuse,
+            FallbackAction::Refuse,
+            FallbackAction::DegradeToLocal,
+            None,
+            Some(10),
+        );
+        let decision = RcxRouter::new_with_trusted_issuer_pubkey(token, signing.verifying_key().to_bytes())
+            .decide(&hosted_retrieve_call(1, true), 1_780_143_301);
+
+        assert!(!decision.authorised);
+        assert_eq!(decision.reason_code.as_deref(), Some("denied:token_invalid"));
     }
 
     #[test]

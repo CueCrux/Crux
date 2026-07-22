@@ -757,7 +757,8 @@ fn test_rcx_router(capabilities: Vec<&str>) -> std::sync::Arc<crux_router::RcxRo
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock")
         .as_secs();
-    std::sync::Arc::new(crux_router::RcxRouter::new(crux_router::mint_free_local_token(
+    let signing = SigningKey::from_bytes(&[0x44; 32]);
+    let mut token = crux_router::mint_free_local_token(
         "p_0123456789abcdef0123456789abcdef",
         "daemon_01HV0000000000000000000000",
         "default",
@@ -765,7 +766,12 @@ fn test_rcx_router(capabilities: Vec<&str>) -> std::sync::Arc<crux_router::RcxRo
         now.saturating_sub(60),
         now.saturating_add(3600),
         [0x22; 64],
-    )))
+    );
+    token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
+    std::sync::Arc::new(crux_router::RcxRouter::new_with_trusted_issuer_pubkey(
+        token,
+        signing.verifying_key().to_bytes(),
+    ))
 }
 
 fn dev_scope_headers(scopes: &str) -> HeaderMap {

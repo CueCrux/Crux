@@ -519,7 +519,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         |hash| rcx_passport_key.sign_hash(hash),
     );
     let rcx_token_hash = rcx_token.token_hash_hex();
-    let rcx_router = Arc::new(crux_router::RcxRouter::new(rcx_token));
+    let rcx_router = Arc::new(crux_router::RcxRouter::new_with_trusted_issuer_pubkey(
+        rcx_token,
+        rcx_passport_key.verifying_key_bytes(),
+    ));
     info!(
         passport_fpr = %rcx_passport_key.passport_fpr(),
         public_key_hex = %rcx_passport_key.public_key_hex(),
