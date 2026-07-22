@@ -41,3 +41,8 @@ Related: `UI-prototype/console-3d/` (clay-substrate concept, 2026-06-11).
   complete = one thick bar), in-progress recoloured purple, state-colours
   toggle (green/purple/red), kind filter (gates / decisions-OD / memory /
   handoffs) and agent-passport filter.
+- `versions/v4.5-tracks-filters-state.html` — instant sector exits, 18s
+  playback.
+- v4.6 (current `index.html`) — play-mode farewell wave: an exiting plan
+  fades out-in-out for ~0.5s before collapsing (scrubbing skips it);
+  playback slowed 25% (window in ~24s).
