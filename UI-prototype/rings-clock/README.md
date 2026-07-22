@@ -46,3 +46,10 @@ Related: `UI-prototype/console-3d/` (clay-substrate concept, 2026-06-11).
 - v4.6 (current `index.html`) — play-mode farewell wave: an exiting plan
   fades out-in-out for ~0.5s before collapsing (scrubbing skips it);
   playback slowed 25% (window in ~24s).
+- `versions/v4.6-farewell-wave.html` — play-mode farewell wave (retired),
+  full-circle solo layout.
+- v4.7 (current `index.html`) — farewell wave removed; reset clock also stops
+  spin; solo redesigned: plan spans 12→9, the 9→12 quadrant is the event
+  ledger (stacked bar per event: tokens + kind + version cap) with the plan's
+  own min/mid/max date ticks and min→max range on the 12 o'clock seam;
+  sector click now enters solo.
