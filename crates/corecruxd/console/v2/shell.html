@@ -33,10 +33,12 @@
     // Apply the persisted rail state before first paint too (icon-only vs full
     // rail) so the grid width doesn't jump on load. Mirrors crux.console.rail.
     try {
+      // Collapsed by default on a fresh load; only an explicit user-expanded
+      // preference (persisted as 'open') keeps the rail open.
       document.documentElement.setAttribute(
-        'data-rail', localStorage.getItem('crux.console.rail') === 'collapsed' ? 'collapsed' : 'open');
+        'data-rail', localStorage.getItem('crux.console.rail') === 'open' ? 'open' : 'collapsed');
     } catch (e) {
-      document.documentElement.setAttribute('data-rail', 'open');
+      document.documentElement.setAttribute('data-rail', 'collapsed');
     }
     // Apply the persisted presentation mode (Standard | Professional | Documents)
     // before first paint so Pro density / the reader layout don't flash. Mirrors
@@ -488,6 +490,13 @@
   .health.down .dot { background: var(--crit); }
 
   .content { padding: 26px 28px 48px; }
+
+  /* ---- Rings prototype embed --------------------------------------------
+     The rings-clock landing mock renders in an isolated iframe (base64 data:
+     URL). Cancel the .content padding so the full-bleed prototype fills the
+     surface below the topbar; the mock owns its own internal scroll. */
+  .rings-region-host { margin: -26px -28px -48px; height: calc(100vh - 72px); min-height: 520px; }
+  .rings-frame { display: block; width: 100%; height: 100%; border: 0; background: #0b0d13; }
 
   /* ---- Stat tiles (Overwatch boot readout) ------------------------------ */
   .stats {
@@ -2032,7 +2041,7 @@
       <div class="brand">
         <span class="mark" aria-hidden="true"></span>
         <span class="name">Crux Console<small>Unified shell · v2</small></span>
-        <button class="rail-toggle" id="railToggle" type="button" aria-expanded="true" aria-label="Collapse navigation" title="Collapse navigation"></button>
+        <button class="rail-toggle" id="railToggle" type="button" aria-expanded="false" aria-label="Expand navigation" title="Expand navigation"></button>
       </div>
       <!-- Compact meta cluster (condensed from the old top bar): the Command |
            Explore surface toggle + the status chips + the connection pill. -->
@@ -2119,6 +2128,7 @@
     canvas: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>',
     search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>',
     map: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="5" rx="1.4"/><rect x="3" y="16" width="6" height="5" rx="1.4"/><rect x="15" y="16" width="6" height="5" rx="1.4"/><path d="M12 8v4M6 16v-2.5h12V16"/></svg>',
+    rings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5.5"/><circle cx="12" cy="12" r="2"/><path d="M12 3v3"/></svg>',
     lock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>',
     palette: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 1 0 0 18c1 0 1.6-.8 1.6-1.7 0-.5-.2-.9-.5-1.2-.3-.3-.5-.7-.5-1.1 0-.9.8-1.7 1.7-1.7H16a5 5 0 0 0 5-5c0-4.1-4-7.3-9-7.3z"/><circle cx="7.5" cy="11.5" r="1"/><circle cx="12" cy="8" r="1"/><circle cx="16.5" cy="11.5" r="1"/></svg>',
     globe: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.6 2.5 4 5.6 4 9s-1.4 6.5-4 9c-2.6-2.5-4-5.6-4-9s1.4-6.5 4-9z"/></svg>',
@@ -2682,8 +2692,9 @@
   // rail entirely, so this is desktop-only (CSS guards to min-width:721px).
   var LS_RAIL = 'crux.console.rail';
   function readRail() {
-    try { return localStorage.getItem(LS_RAIL) === 'collapsed' ? 'collapsed' : 'open'; }
-    catch (e) { return 'open'; }
+    // Default collapsed; only an explicit persisted 'open' keeps the rail open.
+    try { return localStorage.getItem(LS_RAIL) === 'open' ? 'open' : 'collapsed'; }
+    catch (e) { return 'collapsed'; }
   }
   function applyRail(state) {
     var collapsed = state === 'collapsed';
@@ -2918,6 +2929,30 @@
       } else {
         mapHost.appendChild(el('p', { 'class': 'v2card-sub', text: 'Renderer module unavailable.' }));
       }
+      applyPosture(content);
+      if (typeof content.scrollTo === 'function') { content.scrollTo(0, 0); }
+      return;
+    }
+
+    // Rings (prototype) — no sub-pills: it IS the page. The self-contained
+    // rings-clock landing mock is rendered in an isolated iframe via a base64
+    // data: URL (CruxPages.RINGS_HTML_B64), so its styles/scripts can't collide
+    // with the SPA. Reads nothing itself (embedded snapshot), so every posture.
+    if (destId === 'rings') {
+      document.getElementById('destTitle').textContent = dest.label;
+      document.getElementById('destSub').textContent = dest.sub || '';
+      var ringsHost = el('div', { 'class': 'rings-region-host', id: 'ringsHost' });
+      var ringsB64 = CP.RINGS_HTML_B64 || '';
+      if (ringsB64) {
+        var frame = el('iframe', {
+          'class': 'rings-frame', id: 'ringsFrame', title: 'Rings-clock landing prototype',
+          loading: 'lazy', src: 'data:text/html;charset=utf-8;base64,' + ringsB64
+        });
+        ringsHost.appendChild(frame);
+      } else {
+        ringsHost.appendChild(el('p', { 'class': 'v2card-sub', text: 'Rings prototype asset unavailable.' }));
+      }
+      content.appendChild(ringsHost);
       applyPosture(content);
       if (typeof content.scrollTo === 'function') { content.scrollTo(0, 0); }
       return;
