@@ -7,7 +7,7 @@
 // module.exports under node for the static-analysis smoke). It carries all 26
 // legacy CX pages ported into the v2 IA — each page keeps the legacy control DSL
 // (t:'search'|'input'|'textarea'|'select'|'toggle'|'btn'|'info'|'exp'|'rpcout'|
-// 'bar'|'theme'). Rendering lives in render.js; this file is pure data + pure
+// 'bar'|'theme'|'approver'). Rendering lives in render.js; this file is pure data + pure
 // build() transforms (no DOM, no fetch) so it can be required and audited.
 //
 // Customer-safe posture: any control that WRITES carries `mut:true`; render.js
@@ -425,14 +425,15 @@
   // this transform stays pure data + formatting and degrades feature-off 404s
   // to an honest empty state.
   function buildMints(res) {
+    var approver = { t: 'approver' };
     if (!res.ok || !res.data) {
       var message = res.status === 404
         ? 'Feature disabled — passport mint requests are not enabled on this daemon.'
         : 'Mint requests unavailable — GET /v1/passport/mint-requests/pending';
-      return [{ h: 'Awaiting approval', wide: true, controls: degraded(res.status, message) }];
+      return [{ h: 'Awaiting approval', wide: true, controls: [approver].concat(degraded(res.status, message)) }];
     }
     var pending = arr(res.data.pending).filter(function (p) { return (p.status || 'pending') === 'pending'; });
-    var controls = [{ t: 'search', ph: 'Filter pending mint requests…' }];
+    var controls = [approver, { t: 'search', ph: 'Filter pending mint requests…' }];
     pending.slice(0, 50).forEach(function (p) {
       var requested = ['personal', 'work', 'public'].indexOf(p.requested_category) >= 0 ? p.requested_category : '';
       controls.push({ t: 'mintcard', request: p, category: requested, age: requestAge(p.requested_at_unix_ms) });

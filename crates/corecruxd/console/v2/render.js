@@ -23,7 +23,7 @@
 
   // The control types this renderer knows how to draw. The smoke asserts every
   // control type used anywhere in pages.js has a branch here.
-  var CONTROL_TYPES = ['search', 'input', 'textarea', 'select', 'toggle', 'btn', 'info', 'exp', 'mintcard', 'rpcout', 'bar', 'theme', 'chart', 'disclose', 'repogrid', 'wbread'];
+  var CONTROL_TYPES = ['search', 'input', 'textarea', 'select', 'toggle', 'btn', 'info', 'exp', 'approver', 'mintcard', 'rpcout', 'bar', 'theme', 'chart', 'disclose', 'repogrid', 'wbread'];
   var GATE_TITLE = 'wired in M3+';
   var RUNTIME_CAPABILITY_PRESENTATION = Object.freeze([
     Object.freeze(['append', 'Dataplane append']),
@@ -87,6 +87,18 @@
   function boundPassport() {
     try { return (localStorage.getItem('crux-console-bound-passport') || '').trim(); }
     catch (e) { return ''; }
+  }
+
+  function storeBoundPassport(passportId) {
+    var id = String(passportId || '').trim();
+    if (!id) { return false; }
+    try { localStorage.setItem('crux-console-bound-passport', id); return true; }
+    catch (e) { return false; }
+  }
+
+  function removeBoundPassport() {
+    try { localStorage.removeItem('crux-console-bound-passport'); return true; }
+    catch (e) { return false; }
   }
 
   // Public gated helpers. Each resolves to the raw fetch Response so callers
@@ -775,13 +787,129 @@
       var page = pages && pages.PAGES && pages.PAGES['cx-mints'];
       var sections = page && page.load && typeof page.load.build === 'function' ? page.load.build(res) : [];
       if (flash && sections[0]) {
-        sections[0].controls = [{ t: 'info', label: 'last decision', v: flash }].concat(sections[0].controls || []);
+        var controls = sections[0].controls || [];
+        var insertAt = controls[0] && controls[0].t === 'approver' ? 1 : 0;
+        controls.splice(insertAt, 0, { t: 'info', label: 'last decision', v: flash });
+        sections[0].controls = controls;
       }
       var grid = sectionCard && sectionCard.parentNode;
       var container = grid && grid.parentNode;
       if (container && sections.length) { renderSections(container, withRuntimeCapabilitySection(page, sections)); }
       return res;
     });
+  }
+
+  function passportPickerLabel(passport) {
+    var bits = [String(passport.id)];
+    if (passport.category) { bits.push(String(passport.category)); }
+    if (passport.reputation_tier) { bits.push(String(passport.reputation_tier)); }
+    return bits.join(' · ');
+  }
+
+  function renderBoundApproverControl(sectionCard) {
+    var current = boundPassport();
+    var details = el('details', { 'class': 'exp', open: 'open', 'data-bound-approver-control': 'true' });
+    details.appendChild(el('summary', { 'class': 'exp-sum' }, [
+      el('span', { 'class': 'exp-label', text: 'Bound approver' }),
+      el('span', { 'class': 'exp-sub', text: 'Shared attribution identity for operator approvals' }),
+      el('span', { 'class': 'exp-badge', text: current ? 'bound' : 'unbound' })
+    ]));
+
+    var body = el('div', { 'class': 'exp-body' });
+    body.appendChild(el('div', { 'class': 'ctl-info' }, [
+      el('span', { 'class': 'ctl-info-k', text: 'current approver' }),
+      el('span', {
+        'class': 'ctl-info-v',
+        'data-bound-approver-current': 'true',
+        text: current || 'No approver bound — bind one to accept/reject (Art.14)'
+      })
+    ]));
+
+    var pickerId = 'bound-approver-passport';
+    var pickerRow = el('div', { 'class': 'ctl-row' });
+    pickerRow.appendChild(el('label', { 'class': 'ctl-label', 'for': pickerId, text: 'Approver passport' }));
+    var pickerHost = el('div', { 'data-bound-approver-picker-host': 'true' }, [
+      el('p', { 'class': 'ctl-desc', text: 'Loading passports…' })
+    ]);
+    pickerRow.appendChild(pickerHost);
+    pickerRow.appendChild(el('p', {
+      'class': 'ctl-desc',
+      text: 'This shared binding is used by mint and work-gate approve/reject actions.'
+    }));
+    body.appendChild(pickerRow);
+
+    var bind = el('button', { 'class': 'btn-primary', type: 'button', disabled: 'disabled', 'data-bound-approver-action': 'bind' }, ['Bind']);
+    var clear = el('button', { 'class': 'btn-quiet danger', type: 'button', 'data-bound-approver-action': 'clear' }, ['Clear']);
+    clear.disabled = !current;
+    var status = el('p', { 'class': 'ow-status', role: 'status', 'aria-live': 'polite', 'data-bound-approver-status': 'true' });
+    body.appendChild(el('div', { 'class': 'ow-actions' }, [bind, clear]));
+    body.appendChild(status);
+    details.appendChild(body);
+    stampOperatorOnly(details);
+
+    var picker = null;
+    function installPicker(res) {
+      var passports = res && res.ok && res.data && Array.isArray(res.data.passports)
+        ? res.data.passports.filter(function (p) { return p && String(p.id || '').trim(); })
+        : [];
+      pickerHost.textContent = '';
+      if (passports.length) {
+        picker = el('select', {
+          'class': 'ctl-input ctl-select', id: pickerId, 'data-bound-approver-picker': 'select',
+          'aria-label': 'Approver passport'
+        });
+        var choose = el('option', { value: '', text: 'Choose approver passport…' });
+        if (!passports.some(function (p) { return String(p.id).trim() === current; })) {
+          choose.setAttribute('selected', 'selected');
+        }
+        picker.appendChild(choose);
+        passports.forEach(function (passport) {
+          var id = String(passport.id).trim();
+          var option = el('option', { value: id, text: passportPickerLabel(passport) });
+          if (id === current) { option.setAttribute('selected', 'selected'); }
+          picker.appendChild(option);
+        });
+        picker.value = passports.some(function (p) { return String(p.id).trim() === current; }) ? current : '';
+      } else {
+        picker = el('input', {
+          'class': 'ctl-input mono', id: pickerId, type: 'text', value: current,
+          placeholder: 'Enter passport id', autocomplete: 'off',
+          'data-bound-approver-picker': 'text', 'aria-label': 'Approver passport id'
+        });
+        picker.value = current;
+        status.textContent = res && res.ok
+          ? 'No passports returned — enter an approver passport id manually.'
+          : 'Passport list unavailable — enter an approver passport id manually.';
+      }
+      pickerHost.appendChild(picker);
+      bind.disabled = false;
+      return picker;
+    }
+
+    details.cruxReady = fetchJSON('/v1/passports').then(installPicker);
+
+    bind.addEventListener('click', function () {
+      var chosen = picker && String(picker.value || '').trim();
+      if (!chosen) { status.textContent = 'Choose or enter an approver passport id before binding.'; if (picker) { picker.focus(); } return Promise.resolve(); }
+      if (!storeBoundPassport(chosen)) { status.textContent = 'Could not save the approver binding in local storage.'; return Promise.resolve(); }
+      bind.disabled = true; clear.disabled = true;
+      status.textContent = 'Bound ' + chosen + ' · refreshing…';
+      return refreshMintPanel(sectionCard).then(function (res) {
+        if (!res.ok) { status.textContent = 'Bound ' + chosen + ' · panel refresh unavailable (HTTP ' + res.status + ').'; bind.disabled = false; clear.disabled = false; }
+        return res;
+      });
+    });
+
+    clear.addEventListener('click', function () {
+      if (!removeBoundPassport()) { status.textContent = 'Could not clear the approver binding from local storage.'; return Promise.resolve(); }
+      bind.disabled = true; clear.disabled = true;
+      status.textContent = 'Approver cleared · refreshing…';
+      return refreshMintPanel(sectionCard).then(function (res) {
+        if (!res.ok) { status.textContent = 'Approver cleared · panel refresh unavailable (HTTP ' + res.status + ').'; bind.disabled = false; }
+        return res;
+      });
+    });
+    return details;
   }
 
   function renderMintRequestCard(control, sectionCard) {
@@ -1091,6 +1219,10 @@
       }
       case 'mintcard': {
         node = renderMintRequestCard(control, sectionCard);
+        break;
+      }
+      case 'approver': {
+        node = renderBoundApproverControl(sectionCard);
         break;
       }
       case 'disclose': {
@@ -5751,6 +5883,7 @@
     rejectGate: rejectGate,
     approveMintRequest: approveMintRequest,
     rejectMintRequest: rejectMintRequest,
+    renderBoundApproverControl: renderBoundApproverControl,
     renderMintRequestCard: renderMintRequestCard,
     commentWork: commentWork,
     enrichAction: enrichAction,
