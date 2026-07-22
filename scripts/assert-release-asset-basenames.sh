@@ -14,7 +14,7 @@ if [[ ! -d "$assets_dir" ]]; then
   exit 1
 fi
 
-duplicates="$(find "$assets_dir" -type f -exec basename -- {} \; | LC_ALL=C sort | uniq -d)"
+duplicates="$(find "$assets_dir" -type f -exec basename {} \; | LC_ALL=C sort | uniq -d)"
 if [[ -n "$duplicates" ]]; then
   echo "duplicate release asset basenames detected:" >&2
   printf '%s\n' "$duplicates" >&2
