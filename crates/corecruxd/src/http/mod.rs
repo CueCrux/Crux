@@ -212,11 +212,6 @@ pub struct AppState {
     pub sync_mutual_auth: bool,
     /// Issuer Ed25519 public key used to validate peer capability tokens.
     pub sync_peer_trust_root: Option<Vec<u8>>,
-    /// Enforce holder caveats on attenuated peer tokens at the sync boundary
-    /// (macaroon attenuation, R3). Default OFF (`CORECRUXD_SYNC_CAVEAT_ENFORCE=1`).
-    /// OFF rejects any caveat-bearing token (fail-closed); un-attenuated tokens
-    /// are unaffected either way.
-    pub sync_caveat_enforce: bool,
     /// Shared single-use challenge state across cloned Axum application state.
     pub sync_handshake_nonces: Arc<std::sync::Mutex<crux_sync::peer_handshake::NonceCache>>,
     pub witness: crate::witness::WitnessRuntimeConfigV1,
