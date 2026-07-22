@@ -151,15 +151,13 @@ jobs:
       - name: Package binaries
         run: bash scripts/package-daemon-release.sh ${{ matrix.suffix }} dist
 
-      # --- Debian package + installer (daemon-distribution-packaging-2026-06-11,
+      # --- Debian package (daemon-distribution-packaging-2026-06-11,
       #     GATE-PACKAGE: installers built but never attached to releases) ---
-      # Both live only on the linux-amd64 leg: the .deb bundles the amd64 binaries
-      # that package-daemon-release.sh just staged (dist/crux-linux-amd64,
-      # dist/corecruxctl-linux-amd64, dist/crux-hook-linux-amd64), and install.sh
-      # is platform-agnostic so one copy suffices. Staged into dist/ so the leg's
-      # upload + the release job's dist/* glob carry them to the release with no
-      # upload-list change.
-      - name: Build Debian package + stage installer
+      # The linux-amd64 leg builds the .deb from the binaries staged above.
+      # package-daemon-release.sh has already staged install.sh before generating
+      # RELEASE-MANIFEST-linux-amd64.txt, so the installer is both manifest-covered
+      # and directly signed below.
+      - name: Build Debian package
         if: matrix.suffix == 'linux-amd64'
         run: |
           set -euo pipefail
@@ -167,7 +165,6 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
           export PATH="$(go env GOPATH)/bin:$PATH"
           CRUX_VERSION="${GITHUB_REF_NAME#v}" bash packaging/deb/build-deb.sh
-          cp packaging/install.sh dist/install.sh
 
       - name: Install cosign
         # sigstore/cosign-installer v4.1.2 (pinned SHA — floating tags are a T.5 vector)

@@ -17,14 +17,28 @@ runs — copy-paste commands and the cross-build provenance boundary live in
 
 ### Option A — installer script (macOS, Linux, WSL2)
 
-Three steps, deliberately not one. We never ask you to pipe a URL into a
-shell, and the installer refuses to install binaries that fail signature
-verification (it needs [cosign](https://docs.sigstore.dev/cosign/system_config/installation/)).
+Resolve the exact release, download the installer and its signature, verify it,
+then read and run it. We never ask you to pipe a URL into a shell, and the
+installer refuses to install binaries that fail signature verification (it
+needs [cosign](https://docs.sigstore.dev/cosign/system_config/installation/)).
 
 ```bash
-curl -fsSLO https://github.com/CueCrux/Crux/releases/latest/download/install.sh
-less install.sh        # read what you're about to run
-bash install.sh        # add --with-service for a systemd/launchd unit
+REPO=CueCrux/Crux
+TAG="$(curl -fsSL -o /dev/null -w '%{url_effective}' \
+  "https://github.com/${REPO}/releases/latest" | sed 's|.*/tag/||')"
+BASE="https://github.com/${REPO}/releases/download/${TAG}"
+curl -fsSLO "${BASE}/install.sh" \
+  -O "${BASE}/install.sh.sig" \
+  -O "${BASE}/install.sh.pem"
+cosign verify-blob \
+  --certificate install.sh.pem \
+  --signature install.sh.sig \
+  --certificate-identity \
+    "https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/${TAG}" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  install.sh
+less install.sh
+bash install.sh --version "${TAG}"  # add --with-service for a service unit
 ```
 
 Installs `crux`, `corecruxd` (same binary, service-manager name),

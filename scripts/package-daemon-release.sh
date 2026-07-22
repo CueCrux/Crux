@@ -26,6 +26,13 @@ cp "$root/README.md" "$root/config.example.env" "$root/config.example.yaml" "$di
 cp "$root/docs/release-packaging.md" "$dist/docs/"
 cp "$root/content/MANIFEST.json" "$root/content/README.md" "$root/content/LICENCE-CONTENT.md" "$dist/content/"
 
+# The installer is platform-agnostic and uploaded once from the linux-amd64
+# release leg. Stage it before hashing so its signed-manifest coverage matches
+# the public verification claim; the workflow also signs it directly.
+if [[ "$suffix" == "linux-amd64" ]]; then
+  cp "$root/packaging/install.sh" "$dist/install.sh"
+fi
+
 manifest="$dist/RELEASE-MANIFEST-$suffix.txt"
 (
   cd "$dist"

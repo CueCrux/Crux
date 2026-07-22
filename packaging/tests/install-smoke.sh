@@ -18,6 +18,8 @@ set -euo pipefail
 
 TAG="${1:?usage: install-smoke.sh vX.Y.Z}"
 PREFIX="$(mktemp -d "${HOME}/crux-smoke.XXXXXX")"
+SMOKE_DATA_HOME="${PREFIX}/xdg-data"
+DATA_DIR="${SMOKE_DATA_HOME}/crux"
 FAILED=0
 
 step() { echo; echo "== $* =="; }
@@ -28,7 +30,8 @@ curl -fsSL --proto '=https' --tlsv1.2 \
   "https://github.com/CueCrux/Crux/releases/download/${TAG}/install.sh"
 
 step "2/8 install with signature verification"
-bash "${PREFIX}/install.sh" --version "${TAG}" --prefix "${PREFIX}"
+XDG_DATA_HOME="${SMOKE_DATA_HOME}" \
+  bash "${PREFIX}/install.sh" --version "${TAG}" --prefix "${PREFIX}"
 
 step "3/8 verify hook binary"
 HOOK_VERSION="$("${PREFIX}/bin/crux-hook" --version)"
@@ -37,7 +40,6 @@ EXPECTED_HOOK_VERSION="crux-hook ${TAG#v}"
   || { echo "FAIL: hook version '$HOOK_VERSION' != '$EXPECTED_HOOK_VERSION'"; exit 1; }
 
 step "4/8 boot daemon"
-DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/crux"
 CORECRUXD_AUTH_MODE=dev_scopes \
   CORECRUXD_DATA_DIR="${DATA_DIR}" \
   CORECRUXD_HTTP_PORT=14800 \
@@ -81,7 +83,8 @@ kill "$DPID" && wait "$DPID" 2>/dev/null || true
 trap - EXIT
 
 step "8/8 uninstall (data must survive)"
-bash "${PREFIX}/install.sh" --uninstall --prefix "${PREFIX}"
+XDG_DATA_HOME="${SMOKE_DATA_HOME}" \
+  bash "${PREFIX}/install.sh" --uninstall --prefix "${PREFIX}"
 [ ! -e "${PREFIX}/bin/crux" ] || { echo "FAIL: binary still present"; FAILED=1; }
 [ ! -e "${PREFIX}/bin/crux-hook" ] || { echo "FAIL: hook binary still present"; FAILED=1; }
 [ -d "${DATA_DIR}" ] || { echo "FAIL: data dir was deleted by uninstall"; FAILED=1; }
