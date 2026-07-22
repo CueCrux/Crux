@@ -136,6 +136,7 @@ footer { max-width: 1100px; margin: 48px auto 0; padding: 20px clamp(16px, 4vw, 
         <button id="b-dir" aria-pressed="false" title="Where new nodes appear: centre-out (rings grow) or rim-in (nodes sink)">edge: outward</button>
         <button id="b-all" aria-pressed="false" title="Every plan in the window stays on the clock — completed and parked included. Labels hide; hover a sector to name it.">all plans</button>
         <button id="b-state" aria-pressed="false" title="Colour nodes by their plan's state: complete green, in progress purple, blocked red">state colours</button>
+        <button id="b-sess" aria-pressed="false" title="Solo view: connect events into work episodes — same agent, gaps under ~2.5h. Colour = agent passport.">sessions</button>
       </span>
       <span class="grp">
         <select id="s-kind" aria-label="Filter by node kind">
@@ -335,6 +336,8 @@ let dir = 'out';                                   /* out: rings grow from centr
 let showAll = false;                               /* census mode: nothing retires off the clock */
 let hoverSec = null;                               /* plan whose sector is under the pointer */
 let colorByState = false;                          /* nodes coloured by plan state instead of kind */
+let showSess = false;                              /* solo: overlay session episodes connecting the dots */
+const SESS_HUE = { 'claude-work': '#8b96f2', 'codex-work': '#22d3ee' };
 let fKind = 'all', fAgent = 'all';                 /* node filters */
 const passFilter = c =>
   (fKind === 'all' || c.kind === fKind) &&
@@ -639,6 +642,47 @@ function draw(now) {
     ctx.strokeStyle = 'rgba(255,255,255,.16)';
     ctx.lineWidth = 1 / Z;
     ctx.beginPath(); ctx.moveTo(-(g.R + 10), 0); ctx.lineTo(-g.r0 * 0.72, 0); ctx.stroke();
+
+    /* ── session overlay: connect the dots into work episodes ──
+       Episode = same agent, consecutive events < ~2.5h apart (0.105 d) —
+       the round-3 derivation rule. Untraced plans have no actor, so their
+       episodes are inferred from time gaps alone (drawn grey). */
+    if (showSess && evs.length > 1) {
+      const nodeXY = c => {
+        const r = soloRingR(g, c);
+        const frac = c.n > 1 ? (c.rank + 0.5) / c.n : 0.5;
+        const a = L.a0 + (L.a1 - L.a0) * (0.06 + 0.88 * frac);
+        return { x: Math.cos(a) * r, y: Math.sin(a) * r };
+      };
+      const eps = [];
+      let cur = [evs[0]];
+      for (let i2 = 1; i2 < evs.length; i2++) {
+        const prev = cur[cur.length - 1], c2 = evs[i2];
+        if ((c2.actor || '?') === (prev.actor || '?') && c2.day - prev.day < 0.105) cur.push(c2);
+        else { eps.push(cur); cur = [c2]; }
+      }
+      eps.push(cur);
+      for (const ep of eps) {
+        if (ep.length < 2) continue;
+        const hueS = SESS_HUE[ep[0].actor] || '#7e8595';
+        const pts = ep.map(nodeXY);
+        ctx.strokeStyle = hex2rgba(hueS, 0.6);
+        ctx.lineWidth = 1.8 / Z;
+        ctx.lineJoin = 'round';
+        ctx.beginPath();
+        ctx.moveTo(pts[0].x, pts[0].y);
+        for (let i3 = 1; i3 < pts.length; i3++) {
+          const a2 = pts[i3 - 1], b2 = pts[i3];
+          ctx.quadraticCurveTo(a2.x, a2.y, (a2.x + b2.x) / 2, (a2.y + b2.y) / 2);
+        }
+        const lastP = pts[pts.length - 1];
+        ctx.lineTo(lastP.x, lastP.y);
+        ctx.stroke();
+        /* episode start: small open ring marks where the session began */
+        ctx.beginPath(); ctx.arc(pts[0].x, pts[0].y, 6 / Z, 0, 7); ctx.stroke();
+      }
+      ctx.lineWidth = 1 / Z;
+    }
     for (const c of evs) {
       const r = soloRingR(g, c);
       const frac = c.n > 1 ? (c.rank + 0.5) / c.n : 0.5;
@@ -680,6 +724,11 @@ function draw(now) {
       soloLabels.push({ x: -soloRingR(g, c), y: 16, t: dayDate(c.day) });
     }
     soloLabels.push({ x: -(g.r0 + unit * 0.55), y: -(unit * 0.62), t: 'event ledger · outer ring = first event', cap: true });
+    if (showSess) soloLabels.push({
+      x: -(g.r0 + unit * 0.55), y: -(unit * 0.55),
+      t: solo.traced ? 'sessions · line = one episode · colour = agent' : 'sessions · episodes inferred from time gaps (no actor data)',
+      cap: true,
+    });
   }
 
   /* live edge: outward mode sweeps with T; inward mode IS the rim */
@@ -836,6 +885,11 @@ const bState = document.getElementById('b-state');
 bState.addEventListener('click', () => {
   colorByState = !colorByState;
   bState.setAttribute('aria-pressed', String(colorByState));
+});
+const bSess = document.getElementById('b-sess');
+bSess.addEventListener('click', () => {
+  showSess = !showSess;
+  bSess.setAttribute('aria-pressed', String(showSess));
 });
 document.getElementById('s-kind').addEventListener('change', e => { fKind = e.target.value; });
 document.getElementById('s-agent').addEventListener('change', e => { fAgent = e.target.value; });
