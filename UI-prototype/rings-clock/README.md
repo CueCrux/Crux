@@ -60,3 +60,8 @@ Related: `UI-prototype/console-3d/` (clay-substrate concept, 2026-06-11).
   exact time), each ring tracks to 9 o'clock then stands up as a vertical
   stacked bar (tokens + kind + version) on the horizontal baseline, with
   per-event date labels and the plan's min→max range on the seam.
+- `versions/v4.8-polar-gantt.html` — polar-gantt solo, pre-sessions overlay.
+- v4.9 (current `index.html`) — 'sessions' toggle: in solo view, events
+  connect into work episodes (same agent, <2.5h gaps — the round-3 rule);
+  stitch colour = agent passport, open ring = episode start; untraced plans
+  fall back to time-gap inference (grey) and say so.
