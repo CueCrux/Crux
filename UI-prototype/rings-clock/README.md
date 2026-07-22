@@ -35,3 +35,9 @@ Related: `UI-prototype/console-3d/` (clay-substrate concept, 2026-06-11).
 - v4.4 (current `index.html`) — token chart relocated into the detail pane as
   a horizontal gradient area (cumulative spend, event dots by kind); rim
   carries only the thick progress arcs.
+- `versions/v4.4-pane-token-chart.html` — token chart in pane, orange
+  in-progress palette, no rim track arcs, no kind/agent filters.
+- v4.5 (current `index.html`) — rim track arcs (segment extent, gapped;
+  complete = one thick bar), in-progress recoloured purple, state-colours
+  toggle (green/purple/red), kind filter (gates / decisions-OD / memory /
+  handoffs) and agent-passport filter.

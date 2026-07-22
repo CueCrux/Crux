@@ -53,13 +53,7 @@ section.concept { max-width: 1560px; margin: 26px auto 0; padding: 0 clamp(12px,
 }
 .stagebar button:hover { color: var(--ink); background: rgba(255,255,255,.12); }
 .stagebar button[aria-pressed="true"] { color: var(--accent); border-color: rgba(139,150,242,.55); background: rgba(139,150,242,.12); }
-.stagebar button:focus-visible, .stagebar input:focus-visible, .stagebar select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.stagebar select {
-  font: 600 11.5px var(--font-mono); color: var(--ink2);
-  background: rgba(255,255,255,.07); border: 1px solid var(--hairline-strong);
-  border-radius: 7px; padding: 4px 8px; cursor: pointer;
-}
-.stagebar select:hover { color: var(--ink); background: rgba(255,255,255,.12); }
+.stagebar button:focus-visible, .stagebar input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .stagebar input[type=range] { accent-color: var(--accent-deep); width: min(150px, 17vw); }
 .stagebar label { color: var(--ink3); }
 .stagebar .chip { background: rgba(139,150,242,.14); border: 1px solid rgba(139,150,242,.4); color: var(--accent); border-radius: 999px; padding: 3px 11px; font-weight: 600; white-space: nowrap; }
@@ -135,21 +129,6 @@ footer { max-width: 1100px; margin: 48px auto 0; padding: 20px clamp(16px, 4vw, 
         <button id="b-mode" aria-pressed="false">bars</button>
         <button id="b-dir" aria-pressed="false" title="Where new nodes appear: centre-out (rings grow) or rim-in (nodes sink)">edge: outward</button>
         <button id="b-all" aria-pressed="false" title="Every plan in the window stays on the clock — completed and parked included. Labels hide; hover a sector to name it.">all plans</button>
-        <button id="b-state" aria-pressed="false" title="Colour nodes by their plan's state: complete green, in progress purple, blocked red">state colours</button>
-      </span>
-      <span class="grp">
-        <select id="s-kind" aria-label="Filter by node kind">
-          <option value="all">all kinds</option>
-          <option value="gate">gates only</option>
-          <option value="decision">decisions (OD) only</option>
-          <option value="memory">memory only</option>
-          <option value="handoff">handoffs only</option>
-        </select>
-        <select id="s-agent" aria-label="Filter by agent passport">
-          <option value="all">all agents</option>
-          <option value="claude-work">claude-work</option>
-          <option value="codex-work">codex-work</option>
-        </select>
       </span>
       <span class="grp">
         <label for="r-start">start</label><input id="r-start" type="range" min="0" max="1000" value="0">
@@ -186,9 +165,6 @@ footer { max-width: 1100px; margin: 48px auto 0; padding: 20px clamp(16px, 4vw, 
         <tr><td>dot size</td><td>tokens (traced facts) · milestone weight (untraced)</td></tr>
         <tr><td>bars</td><td>spoke = centre → node ring; older over newer; both clickable</td></tr>
         <tr><td>edge toggle</td><td>outward: rings grow from the centre · inward: nodes sink from the rim</td></tr>
-        <tr><td>rim track</td><td>thin arc = the segment's full extent (gapped from neighbours); thick arc = progress. Complete plan = one solid thick bar</td></tr>
-        <tr><td>state colours</td><td>toggle: nodes take their plan's state — <b style="color:#34d399">complete</b> · <b style="color:#a78bfa">in progress</b> · <b style="color:#ef4444">blocked</b></td></tr>
-        <tr><td>filters</td><td>node kind (gates / decisions-OD / memory / handoffs) × agent passport</td></tr>
         <tr><td>token chart</td><td>in the detail pane: cumulative spend over the plan's life, gradient-filled, event dots by kind</td></tr>
         <tr><td>ledger</td><td>completed plans stack on the left edge as they retire</td></tr>
         <tr><td>traced plans</td><td><code>buyer-fit-buildout</code> + <code>cross-site-auth-sso</code> carry their real facts; others show milestone-derived density</td></tr>
@@ -245,9 +221,6 @@ function dayDate(d) {
 /* ── dataset ── */
 const KIND_HUE = { gate: '#2dd4bf', decision: '#a78bfa', memory: '#8b96f2', handoff: '#f5a623', incident: '#ef4444' };
 const STATE = { 0: 'complete', 1: 'in_progress', 2: 'blocked' };
-/* state palette: complete green · in progress purple · blocked red */
-const STATE_HUE = { 0: '#34d399', 1: '#a78bfa', 2: '#ef4444' };
-const stateHue = p => STATE_HUE[p.st];
 const PARK_DAYS = 18;                              /* WorkItem.stale semantics */
 
 const PLANS = PLANS_RAW.map((p, i) => {
@@ -334,11 +307,6 @@ let mode = 'dots';                                 /* dots | bars */
 let dir = 'out';                                   /* out: rings grow from centre · in: nodes sink from rim */
 let showAll = false;                               /* census mode: nothing retires off the clock */
 let hoverSec = null;                               /* plan whose sector is under the pointer */
-let colorByState = false;                          /* nodes coloured by plan state instead of kind */
-let fKind = 'all', fAgent = 'all';                 /* node filters */
-const passFilter = c =>
-  (fKind === 'all' || c.kind === fKind) &&
-  (fAgent === 'all' || c.actor === fAgent);
 let S = 11, E = NOW, T = NOW;                      /* window + playhead (days) */
 let playing = false;
 let Z = 1, panX = 0, panY = 0;
@@ -394,7 +362,7 @@ function stepLayout(dt) {
       if (!p.lay.exiting) {
         p.lay.exiting = true;
         const mid = (p.lay.a0 + p.lay.a1) / 2;
-        const hue = p.st === 0 ? '#34d399' : p.st === 2 ? '#ef4444' : '#7e8595';
+        const hue = p.st === 0 ? '#2dd4bf' : p.st === 2 ? '#ef4444' : '#7e8595';
         flashes.push({ kind: 'exit', ang: mid, t0: performance.now() / 1000, hue });
       }
       const mid = (p.lay.a0 + p.lay.a1) / 2;
@@ -519,10 +487,8 @@ function draw(now) {
       ctx.lineTo(Math.cos(L.a0) * g.R, Math.sin(L.a0) * g.R);
       ctx.stroke();
     }
-    /* rim: full-extent track arc (segment start → finish, gapped from the
-       neighbour) with the thick progress arc on top. A complete plan's
-       progress covers the whole track — one solid thick bar. */
-    const hue = stateHue(p);
+    /* rim progress arc (under the token chart) — thicker */
+    const hue = p.st === 2 ? '#ef4444' : p.st === 0 ? '#2dd4bf' : '#f5a623';
     /* hovered sector: full-arc highlight */
     if (p === hoverSec) {
       ctx.strokeStyle = hex2rgba(hue, 0.28 * al);
@@ -530,15 +496,9 @@ function draw(now) {
       ctx.beginPath(); ctx.arc(0, 0, g.R - 5 / Z, L.a0, L.a1); ctx.stroke();
       ctx.lineWidth = 1 / Z;
     }
-    const aPad = Math.min(0.02, wSec * 0.10);
-    ctx.strokeStyle = hex2rgba(hue, 0.28 * al);
-    ctx.lineWidth = 1.6 / Z;
-    ctx.beginPath(); ctx.arc(0, 0, g.R + 3, L.a0 + aPad, L.a1 - aPad); ctx.stroke();
-    ctx.strokeStyle = hex2rgba(hue, 0.8 * al);
+    ctx.strokeStyle = hex2rgba(hue, 0.65 * al);
     ctx.lineWidth = 4.5 / Z;
-    ctx.beginPath();
-    ctx.arc(0, 0, g.R + 3, L.a0 + aPad, L.a0 + aPad + Math.max(0.008, (wSec - 2 * aPad) * (p.done / p.total)));
-    ctx.stroke();
+    ctx.beginPath(); ctx.arc(0, 0, g.R + 3, L.a0 + 0.01, L.a0 + Math.max(0.02, (wSec - 0.02) * (p.done / p.total))); ctx.stroke();
     ctx.lineWidth = 1 / Z;
     /* blocked pulse on rim */
     if (p.st === 2) {
@@ -566,10 +526,9 @@ function draw(now) {
     /* bars + dots (older bars painted last = on top) */
     for (const c of p.cells) {
       if (c.day > T || c.day < S || c.day > E) continue;
-      if (!passFilter(c)) { c._x = undefined; continue; }
       const pos = cellPos(g, c);
       if (!pos) continue;
-      const chue = colorByState ? stateHue(c.p) : (KIND_HUE[c.kind] || '#8b96f2');
+      const chue = KIND_HUE[c.kind] || '#8b96f2';
       const isSel = (hover === c || pinned === c);
       const age = T - c.day;
       const pop = REDUCED ? 1 : Math.min(1, age / 0.8);           /* birth pop */
@@ -739,13 +698,6 @@ bAll.addEventListener('click', () => {
   showAll = !showAll;
   bAll.setAttribute('aria-pressed', String(showAll));
 });
-const bState = document.getElementById('b-state');
-bState.addEventListener('click', () => {
-  colorByState = !colorByState;
-  bState.setAttribute('aria-pressed', String(colorByState));
-});
-document.getElementById('s-kind').addEventListener('change', e => { fKind = e.target.value; });
-document.getElementById('s-agent').addEventListener('change', e => { fAgent = e.target.value; });
 function syncWindow() {
   const s = Math.min(rStart.value / 1000, rEnd.value / 1000 - 0.03);
   const e = Math.max(rEnd.value / 1000, rStart.value / 1000 + 0.03);
@@ -846,7 +798,7 @@ function hitTest(e) {
   const pa = Math.atan2(p.y, p.x);
   let best = null, bd = 10 / Z;
   for (const c of cells) {
-    if (c._x === undefined || c.day > T || !c.p.lay || c.p.lay.alpha < 0.3 || !passFilter(c)) continue;
+    if (c._x === undefined || c.day > T || !c.p.lay || c.p.lay.alpha < 0.3) continue;
     const d = Math.hypot(c._x - p.x, c._y - p.y);
     if (d < bd + c._dr) { bd = d; best = c; }
     if (mode === 'bars' && !best) {
@@ -897,7 +849,7 @@ function renderPane() {
     const W2 = 288, H2 = 92, padT = 10, padB = 20, padX = 2;
     const b = p.b, e = Math.max(p.e, b + 0.5);
     const tot = evs.reduce((a, c) => a + c.tokW, 0) || 1;
-    const hue = stateHue(p);
+    const hue = p.st === 2 ? '#ef4444' : p.st === 0 ? '#2dd4bf' : '#f5a623';
     const X2 = d => padX + Math.max(0, Math.min(1, (d - b) / (e - b))) * (W2 - 2 * padX);
     const Y2 = f => (H2 - padB) - f * (H2 - padB - padT);
     let cum = 0;
@@ -921,7 +873,7 @@ function renderPane() {
       '</svg>';
   };
   const planBlock = p => {
-    const hue = stateHue(p);
+    const hue = p.st === 2 ? '#ef4444' : p.st === 0 ? '#2dd4bf' : '#f5a623';
     const nCells = p.cells.length;
     const gates = p.cells.filter(c => c.kind === 'gate').length;
     return '<div class="sect">EXECPLAN</div>' +
