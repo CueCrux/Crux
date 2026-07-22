@@ -92,3 +92,8 @@ in this mock; the ExecPlans lens keeps full interactivity.
   neighbourhood); compact icon controls; start/end date pickers; bars on by
   default; tiles compacted to the top-right; completed-plans toggle (off by
   default, auto-on during playback).
+- v4.12 / console-mock v3 — adaptive radial time floor: in the active-plans
+  view the ring-1 radius snaps to the oldest visible node (corner status
+  shows "rings from <date>"), so years of history never crowd live work
+  onto the outer rim. Census, solo, and non-work lenses keep the absolute
+  window. Priors: versions/v4.11-lineage-od.html, versions/console-mock-v2.html.
