@@ -10,7 +10,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use corecrux_memory::mint_request::file_mint_request;
+use corecrux_memory::mint_request::{file_mint_request, MintRequestError};
 use serde_json::{json, Value};
 
 use crate::dispatch::McpContext;
@@ -27,6 +27,49 @@ fn feature_disabled_error() -> JsonRpcError {
             "feature_flag": "CORECRUXD_FEATURE_PASSPORT_MINT_REQUESTS",
             "enabled": false,
         })),
+    }
+}
+
+fn filing_error(err: MintRequestError) -> JsonRpcError {
+    match err {
+        MintRequestError::ReasonTooLong {
+            max_bytes,
+            actual_bytes,
+        } => JsonRpcError {
+            code: INVALID_PARAMS,
+            message: format!("request_passport_mint: 'reason' exceeds {max_bytes} UTF-8 bytes"),
+            data: Some(json!({
+                "param": "reason",
+                "max_bytes": max_bytes,
+                "actual_bytes": actual_bytes,
+            })),
+        },
+        MintRequestError::AlreadyPending {
+            requester_id,
+            request_id,
+        } => JsonRpcError {
+            code: INVALID_PARAMS,
+            message: "request_passport_mint: caller already has a pending request".to_string(),
+            data: Some(json!({
+                "requester_id": requester_id,
+                "existing_request_id": request_id,
+                "status": "pending",
+            })),
+        },
+        MintRequestError::QueueFull { max_pending } => JsonRpcError {
+            code: INTERNAL_ERROR,
+            message: "request_passport_mint: pending request queue is full".to_string(),
+            data: Some(json!({
+                "queue_full": true,
+                "max_pending": max_pending,
+                "retry_after_operator_review": true,
+            })),
+        },
+        err => JsonRpcError {
+            code: INTERNAL_ERROR,
+            message: format!("request_passport_mint: failed to file request: {err}"),
+            data: None,
+        },
     }
 }
 
@@ -97,11 +140,7 @@ pub async fn handle_request_passport_mint(args: &Value, ctx: &McpContext) -> Res
             reason,
             now_unix_ms(),
         )
-        .map_err(|err| JsonRpcError {
-            code: INTERNAL_ERROR,
-            message: format!("request_passport_mint: failed to file request: {err}"),
-            data: None,
-        })?
+        .map_err(filing_error)?
     };
 
     Ok(json!({
@@ -220,5 +259,85 @@ mod tests {
 
         let store = ctx.fact_store.read().await;
         assert!(list_pending_mint_requests(&store).is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_reason_without_filing() {
+        let ctx = openai_ctx(true);
+        let err = handle_request_passport_mint(
+            &json!({
+                "reason": "x".repeat(
+                    corecrux_memory::mint_request::MAX_MINT_REQUEST_REASON_BYTES + 1
+                )
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert_eq!(
+            err.data.as_ref().and_then(|data| data["param"].as_str()),
+            Some("reason")
+        );
+        let store = ctx.fact_store.read().await;
+        assert!(list_pending_mint_requests(&store).is_empty());
+    }
+
+    #[tokio::test]
+    async fn returns_existing_pending_request_without_duplicate_write() {
+        let ctx = openai_ctx(true);
+        let first = handle_request_passport_mint(&json!({"reason": "first"}), &ctx)
+            .await
+            .unwrap();
+        let err = handle_request_passport_mint(&json!({"reason": "second"}), &ctx)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert_eq!(
+            err.data.as_ref().and_then(|data| data["existing_request_id"].as_str()),
+            first["request_id"].as_str()
+        );
+        let store = ctx.fact_store.read().await;
+        assert_eq!(list_pending_mint_requests(&store).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_filings_serialize_to_one_pending_request() {
+        let ctx = openai_ctx(true);
+        let first_args = json!({"reason": "first"});
+        let second_args = json!({"reason": "second"});
+        let (first, second) = tokio::join!(
+            handle_request_passport_mint(&first_args, &ctx),
+            handle_request_passport_mint(&second_args, &ctx),
+        );
+
+        assert_ne!(first.is_ok(), second.is_ok());
+        let duplicate = first.err().or_else(|| second.err()).unwrap();
+        assert_eq!(duplicate.code, INVALID_PARAMS);
+        assert_eq!(
+            duplicate.data.as_ref().and_then(|data| data["status"].as_str()),
+            Some("pending")
+        );
+        let store = ctx.fact_store.read().await;
+        assert_eq!(list_pending_mint_requests(&store).len(), 1);
+    }
+
+    #[test]
+    fn queue_full_error_is_structured_and_retryable_after_review() {
+        let err = filing_error(MintRequestError::QueueFull { max_pending: 1_000 });
+
+        assert_eq!(err.code, INTERNAL_ERROR);
+        assert_eq!(
+            err.data.as_ref().and_then(|data| data["queue_full"].as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            err.data
+                .as_ref()
+                .and_then(|data| data["retry_after_operator_review"].as_bool()),
+            Some(true)
+        );
     }
 }

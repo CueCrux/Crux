@@ -533,6 +533,12 @@ pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoRespo
         "state": update.state,
         "ahead_by": update.ahead_by,
         "behind_by": update.behind_by,
+        // `basis` says whether ahead/behind describe the running binary or the
+        // source checkout; the checkout_* counts expose a stale src clone. Commit
+        // SHAs stay admin-only (see /v1/admin/version), consistent with `commit`.
+        "basis": update.basis,
+        "checkout_ahead_by": update.checkout_ahead_by,
+        "checkout_behind_by": update.checkout_behind_by,
         "comparison_stale": update.comparison_stale,
         "upgrade_hint": update.upgrade_hint,
         "latest_release": latest_release,

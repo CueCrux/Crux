@@ -11,9 +11,9 @@
 //! egress refusal reasons.
 
 use rcx_capability_token::{
-    Backend, CreditCost, CreditCostUnit, DataEgressClass, EnterpriseScope, PermittedCapability, RcxCapabilityToken,
-    RcxTier, TokenValidationIssue, RCX_CUSTOMER_BACKEND_PREFIX, RCX_ENTERPRISE_ENCRYPTED_BLOB_MIRROR_CAPABILITY,
-    RCX_HOSTED_BACKEND_ID, RCX_HOSTED_RETRIEVE_CAPABILITY,
+    verify_token, Backend, CreditCost, CreditCostUnit, DataEgressClass, EnterpriseScope, PermittedCapability,
+    RcxCapabilityToken, RcxTier, TokenValidationIssue, VerifyOutcome, RCX_CUSTOMER_BACKEND_PREFIX,
+    RCX_ENTERPRISE_ENCRYPTED_BLOB_MIRROR_CAPABILITY, RCX_HOSTED_BACKEND_ID, RCX_HOSTED_RETRIEVE_CAPABILITY,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,14 +51,16 @@ pub struct EnterpriseShimCall {
     pub backend_id: String,
     pub capability: String,
     pub data_egress_classes: Vec<DataEgressClass>,
+    pub present_attestations: Vec<String>,
 }
 
 impl EnterpriseShimCall {
-    pub fn encrypted_blob_mirror(backend_id: impl Into<String>) -> Self {
+    pub fn encrypted_blob_mirror(backend_id: impl Into<String>, present_attestations: Vec<String>) -> Self {
         Self {
             backend_id: backend_id.into(),
             capability: RCX_ENTERPRISE_ENCRYPTED_BLOB_MIRROR_CAPABILITY.to_string(),
             data_egress_classes: vec![DataEgressClass::EncryptedBlob, DataEgressClass::ReceiptHashes],
+            present_attestations,
         }
     }
 }
@@ -98,17 +100,27 @@ impl EnterpriseShim {
         Self { trust_root }
     }
 
-    pub fn validate(
+    pub fn validate_with_trusted_issuer_pubkey(
         &self,
         token: &RcxCapabilityToken,
+        trusted_issuer_pubkey: [u8; 32],
         call: &EnterpriseShimCall,
         now_unix_seconds: u64,
     ) -> EnterpriseShimDecision {
-        let validation = token.validate_basic(now_unix_seconds);
-        if !validation.valid {
-            return Self::refuse(token, call, "token_invalid", validation.issues);
+        match verify_token(token, &trusted_issuer_pubkey, now_unix_seconds) {
+            VerifyOutcome::Verified => self.validate_policy(token, call),
+            VerifyOutcome::StructuralFailure(codes) => Self::refuse(
+                token,
+                call,
+                "token_invalid",
+                codes.into_iter().map(|code| issue(&code)).collect(),
+            ),
+            VerifyOutcome::BadSignature => Self::refuse(token, call, "token_invalid", vec![issue("bad_signature")]),
+            VerifyOutcome::BadTrustRoot => Self::refuse(token, call, "token_invalid", vec![issue("bad_trust_root")]),
         }
+    }
 
+    fn validate_policy(&self, token: &RcxCapabilityToken, call: &EnterpriseShimCall) -> EnterpriseShimDecision {
         if token.tier != RcxTier::Enterprise {
             return Self::refuse(
                 token,
@@ -166,15 +178,40 @@ impl EnterpriseShim {
             return Some(scoped("issuer_not_trusted", "enterprise_issuer_not_trusted"));
         }
 
-        let backend = token
+        let Some(backend) = token
             .backends
             .iter()
-            .find(|backend| backend.backend_id == call.backend_id)?;
+            .find(|backend| backend.backend_id == call.backend_id)
+        else {
+            return Some(scoped("backend_not_permitted", "enterprise_backend_missing"));
+        };
         if backend.trust_root_kid != self.trust_root.trust_root_kid {
             return Some(scoped("trust_root_mismatch", "backend_trust_root_mismatch"));
         }
-        if !backend_permits_call(backend, call) {
+        let Some(capability) = backend
+            .permitted_capabilities
+            .iter()
+            .find(|capability| capability.capability == call.capability)
+        else {
+            return Some(scoped(
+                "capability_not_permitted",
+                "enterprise_capability_not_permitted",
+            ));
+        };
+        if call.data_egress_classes.iter().any(|egress| {
+            !capability
+                .data_egress_classes
+                .iter()
+                .any(|permitted| permitted == egress)
+        }) {
             return Some(scoped("egress_not_permitted", "enterprise_egress_not_permitted"));
+        }
+        if capability
+            .required_attestations
+            .iter()
+            .any(|required| !call.present_attestations.iter().any(|present| present == required))
+        {
+            return Some(scoped("attestation_missing", "enterprise_attestation_missing"));
         }
         None
     }
@@ -222,18 +259,6 @@ fn issue(code: &str) -> TokenValidationIssue {
     TokenValidationIssue::new(code, code)
 }
 
-fn backend_permits_call(backend: &Backend, call: &EnterpriseShimCall) -> bool {
-    backend.permitted_capabilities.iter().any(|capability| {
-        capability.capability == call.capability
-            && call.data_egress_classes.iter().all(|egress| {
-                capability
-                    .data_egress_classes
-                    .iter()
-                    .any(|permitted| permitted == egress)
-            })
-    })
-}
-
 pub fn enterprise_encrypted_blob_backend(
     backend_id: impl Into<String>,
     endpoint_url: impl Into<String>,
@@ -278,9 +303,13 @@ pub fn enterprise_encrypted_blob_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rcx_capability_token::{free_local_verified_fixture, RcxTier};
+    use ed25519_dalek::{Signer, SigningKey};
+    use rcx_capability_token::{
+        free_local_verified_fixture, DelegationAudience, DelegationPolicy, DelegationPresentation, RcxTier,
+        RCX_CT_DELEGATION_SPEC_VERSION,
+    };
 
-    fn enterprise_token() -> RcxCapabilityToken {
+    fn enterprise_token(signing: &SigningKey) -> RcxCapabilityToken {
         let mut token = free_local_verified_fixture();
         token.token_id = "rcxct_enterprise_0123456789abcdef".to_string();
         token.issuer.passport_kid = "rcx-test-kid".to_string();
@@ -301,6 +330,7 @@ mod tests {
             "https://cluster-a.customer.example/rcx",
             "customer-root-a",
         )];
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
         token
     }
 
@@ -315,17 +345,50 @@ mod tests {
         })
     }
 
+    fn enterprise_call() -> EnterpriseShimCall {
+        EnterpriseShimCall::encrypted_blob_mirror(
+            "customer:cluster-a",
+            vec![
+                "passport_bound".to_string(),
+                "customer_trust_root".to_string(),
+                "enterprise_contract_active".to_string(),
+            ],
+        )
+    }
+
     #[test]
     fn allows_customer_hosted_encrypted_blob_calls() {
-        let decision = shim().validate(
-            &enterprise_token(),
-            &EnterpriseShimCall::encrypted_blob_mirror("customer:cluster-a"),
+        let signing = SigningKey::from_bytes(&[7; 32]);
+        let decision = shim().validate_with_trusted_issuer_pubkey(
+            &enterprise_token(&signing),
+            signing.verifying_key().to_bytes(),
+            &enterprise_call(),
             1_776_989_601,
         );
 
         assert!(decision.allowed);
         assert_eq!(decision.mode, EnterpriseShimMode::CustomerHosted);
         assert_eq!(decision.backend_id.as_deref(), Some("customer:cluster-a"));
+    }
+
+    #[test]
+    fn refuses_customer_call_with_missing_attestation() {
+        let signing = SigningKey::from_bytes(&[7; 32]);
+        let mut call = enterprise_call();
+        call.present_attestations.pop();
+        let decision = shim().validate_with_trusted_issuer_pubkey(
+            &enterprise_token(&signing),
+            signing.verifying_key().to_bytes(),
+            &call,
+            1_776_989_601,
+        );
+
+        assert!(!decision.allowed);
+        assert_eq!(decision.refusal_code.as_deref(), Some("attestation_missing"));
+        assert!(decision
+            .issues
+            .iter()
+            .any(|issue| issue.code == "enterprise_attestation_missing"));
     }
 
     #[test]
@@ -373,17 +436,20 @@ mod tests {
 
     #[test]
     fn refuses_airgap_tokens_that_include_hosted_backend() {
-        let mut token = enterprise_token();
+        let signing = SigningKey::from_bytes(&[7; 32]);
+        let mut token = enterprise_token(&signing);
         token.backends.push(Backend {
             backend_id: RCX_HOSTED_BACKEND_ID.to_string(),
             trust_root_kid: "rcx-test-kid".to_string(),
             endpoint_url: Some("https://hosted.vaultcrux.com".to_string()),
             permitted_capabilities: Vec::new(),
         });
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
 
-        let decision = shim().validate(
+        let decision = shim().validate_with_trusted_issuer_pubkey(
             &token,
-            &EnterpriseShimCall::encrypted_blob_mirror("customer:cluster-a"),
+            signing.verifying_key().to_bytes(),
+            &enterprise_call(),
             1_776_989_601,
         );
 
@@ -397,7 +463,8 @@ mod tests {
 
     #[test]
     fn refuses_untrusted_customer_issuer_without_vaultcrux_cross_sign() {
-        let mut token = enterprise_token();
+        let signing = SigningKey::from_bytes(&[7; 32]);
+        let mut token = enterprise_token(&signing);
         token.issuer.issuer_org = "customer-a".to_string();
         token.issuer.passport_kid = "unknown-customer-issuer".to_string();
         token.signature.kid = "unknown-customer-issuer".to_string();
@@ -406,14 +473,84 @@ mod tests {
             .as_mut()
             .expect("enterprise scope")
             .cross_signed_by_vaultcrux = false;
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
 
-        let decision = shim().validate(
+        let decision = shim().validate_with_trusted_issuer_pubkey(
             &token,
-            &EnterpriseShimCall::encrypted_blob_mirror("customer:cluster-a"),
+            signing.verifying_key().to_bytes(),
+            &enterprise_call(),
             1_776_989_601,
         );
 
         assert!(!decision.allowed);
         assert_eq!(decision.refusal_code.as_deref(), Some("issuer_not_trusted"));
+    }
+
+    #[test]
+    fn refuses_bad_signature_before_enterprise_policy() {
+        let signing = SigningKey::from_bytes(&[7; 32]);
+        let mut token = enterprise_token(&signing);
+        token.token_id.push_str("-tampered");
+        let decision = shim().validate_with_trusted_issuer_pubkey(
+            &token,
+            signing.verifying_key().to_bytes(),
+            &enterprise_call(),
+            1_776_989_601,
+        );
+
+        assert!(!decision.allowed);
+        assert!(decision.issues.iter().any(|issue| issue.code == "bad_signature"));
+    }
+
+    #[test]
+    fn refuses_contextual_delegation_tokens_on_generic_enterprise_path() {
+        let signing = SigningKey::from_bytes(&[7; 32]);
+        let mut token = enterprise_token(&signing);
+        token.spec_version = RCX_CT_DELEGATION_SPEC_VERSION.to_string();
+        token.delegation_policy = Some(DelegationPolicy {
+            presentation: DelegationPresentation::ProofOfPossession,
+            max_depth: 1,
+            audience: DelegationAudience::CruxSync,
+            allowed_delegate_fprs: vec!["p_0123456789abcdef0123456789abcdef".to_string()],
+        });
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
+        let decision = shim().validate_with_trusted_issuer_pubkey(
+            &token,
+            signing.verifying_key().to_bytes(),
+            &enterprise_call(),
+            1_776_989_601,
+        );
+
+        assert!(!decision.allowed);
+        assert!(decision
+            .issues
+            .iter()
+            .any(|issue| issue.code == "proof_of_possession_context_required"));
+    }
+
+    #[test]
+    fn refuses_missing_customer_backend() {
+        let signing = SigningKey::from_bytes(&[7; 32]);
+        let mut token = enterprise_token(&signing);
+        token.backends.clear();
+        token.backends.push(enterprise_encrypted_blob_backend(
+            "customer:different",
+            "https://different.customer.example/rcx",
+            "customer-root-a",
+        ));
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
+        let decision = shim().validate_with_trusted_issuer_pubkey(
+            &token,
+            signing.verifying_key().to_bytes(),
+            &enterprise_call(),
+            1_776_989_601,
+        );
+
+        assert!(!decision.allowed);
+        assert_eq!(decision.refusal_code.as_deref(), Some("token_invalid"));
+        assert!(decision
+            .issues
+            .iter()
+            .any(|issue| issue.code == "enterprise_backend_missing"));
     }
 }

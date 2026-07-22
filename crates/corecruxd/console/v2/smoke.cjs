@@ -517,10 +517,10 @@ function extractThemeVars(theme) {
 })();
 
 // =========================================================================
-//  Check 8b — Passport mint M3 console gate. A pending request renders with
-//  its requested category pre-filled; edited category/name + the bound operator
-//  passport reach the generated approve client; reject is attributed; both
-//  decisions refresh the queue. Feature-off and scope failures stay inline.
+//  Check 8b — Passport mint M3 console gate + bound-approver picker. The picker
+//  loads real passport ids through the read client, persists the shared Art.14
+//  identity, clears it, and falls back to typed ids when the read fails. A
+//  pending request still preserves prefill/edit/approve/reject/error behaviour.
 // =========================================================================
 (function checkPassportMintGate() {
   const page = pages.PAGES['cx-mints'];
@@ -536,13 +536,21 @@ function extractThemeVars(theme) {
     status: 'pending', requested_at_unix_ms: Date.now() - 5 * 60000
   };
   const sections = page.load.build({ ok: true, status: 200, data: { count: 1, pending: [fixture] } });
+  check(sections[0].controls[0] && sections[0].controls[0].t === 'approver',
+    '[mint-picker] bound approver must be the first control in the pending-mints panel');
   const mint = sections[0].controls.find(function (c) { return c.t === 'mintcard'; });
   check(!!mint, '[mint-m3] a pending request must build one mintcard');
   check(mint && mint.category === 'work', '[mint-m3] mintcard category must default to requested_category');
   check(mint && /ago|just now/.test(mint.age), '[mint-m3] mintcard must carry a human-readable request age');
 
+  const empty = page.load.build({ ok: true, status: 200, data: { count: 0, pending: [] } });
+  check(empty[0].controls[0] && empty[0].controls[0].t === 'approver',
+    '[mint-picker] bound approver must render when there are zero pending requests');
+
   const disabled = page.load.build({ ok: false, status: 404, data: null });
   const disabledControls = (disabled[0] && disabled[0].controls) || [];
+  check(disabledControls[0] && disabledControls[0].t === 'approver',
+    '[mint-picker] bound approver must survive a pending-mints feature-off response');
   check(!disabledControls.some(function (c) { return c.t === 'mintcard'; }),
     '[mint-m3] feature-off 404 must render no mint cards');
   check(disabledControls.some(function (c) { return /feature disabled/i.test(String(c.v || '')); }),
@@ -552,7 +560,7 @@ function extractThemeVars(theme) {
     function node(tag) {
       const listeners = {};
       const n = {
-        tagName: String(tag || 'div').toUpperCase(), nodeType: 1, childNodes: [], _attrs: {}, value: '', disabled: false,
+        tagName: String(tag || 'div').toUpperCase(), nodeType: 1, childNodes: [], _attrs: {}, value: '', disabled: false, hidden: false,
         setAttribute: function (k, v) {
           this._attrs[k] = String(v);
           if (k === 'class') { this.className = String(v); }
@@ -584,20 +592,65 @@ function extractThemeVars(theme) {
   passportMintInteraction = async function () {
     const dom = mockDom();
     const calls = [];
+    const storageValues = {};
+    let passportsFail = false;
+    let passportsEmpty = false;
     let approveResponse = { ok: true, status: 200, data: { minted: true, status: 'approved', category: 'public' } };
     function response(spec) { return { ok: spec.ok, status: spec.status, json: function () { return Promise.resolve(spec.data); } }; }
     const savedDoc = global.document, savedWin = global.window, savedStorage = global.localStorage;
     global.document = dom.doc;
-    global.localStorage = { getItem: function (key) { return key === 'crux-console-bound-passport' ? 'operator-work' : null; } };
+    global.localStorage = {
+      getItem: function (key) { return Object.prototype.hasOwnProperty.call(storageValues, key) ? storageValues[key] : null; },
+      setItem: function (key, value) { storageValues[key] = String(value); },
+      removeItem: function (key) { delete storageValues[key]; }
+    };
     global.window = {
       CRUX_POSTURE: 'operator', CruxPages: pages,
-      CruxApi: { get: function (url) { calls.push({ kind: 'refresh', url: url }); return Promise.resolve(response({ ok: true, status: 200, data: { count: 0, pending: [] } })); } },
+      CruxApi: { get: function (url) {
+        if (url === '/v1/passports') {
+          calls.push({ kind: 'passports', url: url });
+          if (passportsFail) { return Promise.reject(new Error('passport list unavailable')); }
+          return Promise.resolve(response({ ok: true, status: 200, data: { passports: passportsEmpty ? [] : [
+            { id: 'operator-personal', category: 'personal', reputation_tier: 'trusted' },
+            { id: 'operator-work', category: 'work', reputation_tier: 'verified' }
+          ] } }));
+        }
+        calls.push({ kind: 'refresh', url: url });
+        return Promise.resolve(response({ ok: true, status: 200, data: { count: 0, pending: [] } }));
+      } },
       CruxApiGated: {
         passportMintRequestApprove: function (id, body) { calls.push({ kind: 'approve', id: id, body: body }); return Promise.resolve(response(approveResponse)); },
         passportMintRequestReject: function (id, body) { calls.push({ kind: 'reject', id: id, body: body }); return Promise.resolve(response({ ok: true, status: 200, data: { minted: false, status: 'rejected' } })); }
       }
     };
     try {
+      const approverControl = render.renderBoundApproverControl(dom.node('section'));
+      const initialCurrent = dom.byAttr(approverControl, 'data-bound-approver-current', 'true');
+      check(initialCurrent && /No approver bound.*Art\.14/.test(initialCurrent.textContent),
+        '[mint-picker] empty localStorage must render the explicit unbound Art.14 state');
+      await approverControl.cruxReady;
+      const picker = dom.byAttr(approverControl, 'data-bound-approver-picker', 'select');
+      check(!!picker, '[mint-picker] successful GET /v1/passports must render a select');
+      check(picker && /operator-personal.*personal.*trusted/.test(picker.textContent)
+        && /operator-work.*work.*verified/.test(picker.textContent),
+      '[mint-picker] select options must come from passport ids with category/tier context');
+      if (picker) { picker.value = 'operator-work'; }
+      await dom.byAttr(approverControl, 'data-bound-approver-action', 'bind').fire('click');
+      check(storageValues['crux-console-bound-passport'] === 'operator-work',
+        '[mint-picker] Bind must write the shared crux-console-bound-passport localStorage key');
+      check(render.boundPassport() === 'operator-work',
+        '[mint-picker] boundPassport() must re-read the id written by Bind');
+      check(calls.some(function (c) { return c.kind === 'refresh' && c.url === '/v1/passport/mint-requests/pending'; }),
+        '[mint-picker] Bind must refresh the pending-mints panel through its existing read path');
+
+      const reboundControl = render.renderBoundApproverControl(dom.node('section'));
+      const reboundCurrent = dom.byAttr(reboundControl, 'data-bound-approver-current', 'true');
+      check(reboundCurrent && reboundCurrent.textContent === 'operator-work',
+        '[mint-picker] a refreshed bound-approver control must show the current bound id');
+      await reboundControl.cruxReady;
+      check(dom.byAttr(reboundControl, 'data-bound-approver-picker', 'select').value === 'operator-work',
+        '[mint-picker] passport select must default to the current bound id when it is present');
+
       const card = render.renderMintRequestCard(mint, dom.node('section'));
       const category = dom.byAttr(card, 'data-mint-field', 'category');
       const name = dom.byAttr(card, 'data-mint-field', 'name');
@@ -614,6 +667,8 @@ function extractThemeVars(theme) {
       check(approve && approve.body.approver_passport === 'operator-work', '[mint-m3] Accept must carry the bound operator passport');
       check(approve && approve.body.category === 'public' && approve.body.name === 'Agent Public',
         '[mint-m3] Accept must carry the edited category and name');
+      check(status && !/Bind a passport/.test(status.textContent),
+        '[mint-picker] Accept must no longer hit the bind-first Art.14 gate after binding');
       check(calls.some(function (c) { return c.kind === 'refresh' && c.url === '/v1/passport/mint-requests/pending'; }),
         '[mint-m3] successful Accept must refresh the pending mint queue');
       check(status && /minted as public/.test(status.textContent), '[mint-m3] successful Accept must surface the minted category');
@@ -626,6 +681,27 @@ function extractThemeVars(theme) {
         '[mint-m3] Reject must carry only the bound operator passport');
       check(calls.filter(function (c) { return c.kind === 'refresh'; }).length >= 2,
         '[mint-m3] successful Reject must refresh the pending mint queue');
+
+      await dom.byAttr(reboundControl, 'data-bound-approver-action', 'clear').fire('click');
+      check(!Object.prototype.hasOwnProperty.call(storageValues, 'crux-console-bound-passport') && render.boundPassport() === '',
+        '[mint-picker] Clear must remove the shared approver key');
+
+      passportsEmpty = true;
+      const emptyPassportControl = render.renderBoundApproverControl(dom.node('section'));
+      await emptyPassportControl.cruxReady;
+      check(!!dom.byAttr(emptyPassportControl, 'data-bound-approver-picker', 'text'),
+        '[mint-picker] an empty passport list must degrade to a text input');
+
+      passportsEmpty = false;
+      passportsFail = true;
+      const fallbackControl = render.renderBoundApproverControl(dom.node('section'));
+      await fallbackControl.cruxReady;
+      const fallback = dom.byAttr(fallbackControl, 'data-bound-approver-picker', 'text');
+      check(!!fallback, '[mint-picker] passport-fetch failure must degrade to a text input without throwing');
+      if (fallback) { fallback.value = 'manual-approver'; }
+      await dom.byAttr(fallbackControl, 'data-bound-approver-action', 'bind').fire('click');
+      check(render.boundPassport() === 'manual-approver',
+        '[mint-picker] text-input fallback Bind must persist the typed passport id');
 
       approveResponse = { ok: false, status: 403, data: { detail: 'admin:write scope required' } };
       const errorCard = render.renderMintRequestCard(mint, dom.node('section'));
@@ -640,7 +716,7 @@ function extractThemeVars(theme) {
       if (savedWin === undefined) { delete global.window; } else { global.window = savedWin; }
       if (savedStorage === undefined) { delete global.localStorage; } else { global.localStorage = savedStorage; }
     }
-    notes.push('passport mint M3: pending card prefill + edited approve attribution/body + reject attribution + refresh + feature-off/error degradation exercised.');
+    notes.push('passport mint picker + M3: first/empty/feature-off control presence; read-client options; shared-key bind + panel refresh + ungated Accept; Clear; failed-read text fallback; pending-card prefill/edit/approve/reject/error degradation exercised.');
   };
 })();
 

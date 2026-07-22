@@ -10,7 +10,7 @@ verification *before* install, no phone-home, nothing auto-starts.
 | `systemd/crux.service` | System-wide unit (shipped in the .deb; `DynamicUser` + `StateDirectory=crux`). `install.sh --with-service` writes a per-user unit instead. |
 | `homebrew/crux.rb` | Formula **template** for `CueCrux/homebrew-tap`; rendered per release by `scripts/generate-homebrew-formula.sh` from the *verified* signed manifests. |
 | `deb/` | nfpm config + maintainer scripts + `build-deb.sh` for the `.deb` attached to releases (no apt repo in v1 — see header comment in `deb/nfpm.yaml`). |
-| `tests/install-smoke.sh` | Clean-VM gate: install → ready → MCP handshake → fact round-trip → uninstall (data preserved). Operator-run against a published release. |
+| `tests/install-smoke.sh` | Clean-VM gate: install → `crux-hook --version` → ready → MCP handshake → fact round-trip → uninstall (data preserved). Operator-run against a published release. |
 
 Posture rules every installer here follows:
 
@@ -21,5 +21,8 @@ Posture rules every installer here follows:
 3. **No phone-home.** Installed services set
    `CORECRUXD_UPDATE_CHECK_ENABLED=0`; upgrades are explicit
    (`install.sh --version vX.Y.Z`, `brew upgrade crux`, `dpkg -i`).
-4. **Uninstall never deletes data.** Export first (console → Settings →
+4. **Upgrade the bundle together.** Packaged installs refuse daemon-only
+   `crux self update`; use the installer/package manager so `crux`,
+   `corecruxctl`, and `crux-hook` stay on the same release.
+5. **Uninstall never deletes data.** Export first (console → Settings →
    Export); deleting `CORECRUXD_DATA_DIR` is the user's explicit command.

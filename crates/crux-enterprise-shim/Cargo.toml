@@ -9,5 +9,8 @@ description = "Enterprise customer-hosted RCX Capability Token validation shim c
 [dependencies]
 rcx-capability-token = { path = "../rcx-capability-token" }
 
+[dev-dependencies]
+ed25519-dalek = { workspace = true, features = ["std"] }
+
 [lints]
 workspace = true

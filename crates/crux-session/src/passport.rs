@@ -171,6 +171,11 @@ impl LocalPassportKey {
         &self.public_key_hex
     }
 
+    /// Public Ed25519 verifier bytes for locally issued RCX tokens.
+    pub fn verifying_key_bytes(&self) -> [u8; 32] {
+        self.signing_key.verifying_key().to_bytes()
+    }
+
     pub fn sign_hash(&self, hash: &[u8; HASH_LEN]) -> [u8; SIGNATURE_LEN] {
         let sig = self.signing_key.sign(hash);
         let mut out = [0_u8; SIGNATURE_LEN];
@@ -272,7 +277,11 @@ fn write_new_passport_seed(path: &Path) -> Result<[u8; 32], SessionError> {
     }
 }
 
-fn passport_fpr_from_public_key(public_key: &[u8; 32]) -> String {
+/// Canonical passport fingerprint of an Ed25519 public key: `p_` + hex of the
+/// first 16 bytes (`PASSPORT_FPR_BYTES`) of `blake3(pubkey)`. This is the fingerprint
+/// minters write into `subject.passport_fpr`, so verifiers (e.g. RCX token caveat
+/// attenuation) resolve a holder pubkey to its fingerprint through this one fn.
+pub fn passport_fpr_from_public_key(public_key: &[u8; 32]) -> String {
     let digest = blake3::hash(public_key);
     format!("p_{}", hex::encode(&digest.as_bytes()[..PASSPORT_FPR_BYTES]))
 }

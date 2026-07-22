@@ -395,7 +395,8 @@ mod tests {
 
     #[test]
     fn hosted_bridge_refuses_without_authorized_token_and_does_not_call_client() {
-        let router = RcxRouter::new(mint_free_local_token(
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let mut token = mint_free_local_token(
             "p_0123456789abcdef0123456789abcdef",
             "daemon_01HV0000000000000000000000",
             "default",
@@ -403,7 +404,9 @@ mod tests {
             1_776_989_600,
             1_780_143_200,
             [0x11; RCX_CT_SIGNATURE_LEN],
-        ));
+        );
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
+        let router = RcxRouter::new_with_trusted_issuer_pubkey(token, signing.verifying_key().to_bytes());
         let ledger = CreditLedger::from_token(router.token(), 1_776_989_600);
         let client = MockHostedClient {
             reachable: true,

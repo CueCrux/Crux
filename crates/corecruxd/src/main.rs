@@ -258,7 +258,8 @@ The only recognised flags are:\n\
   mcp-stdio        run the bundled stdio\u{21c4}HTTP MCP bridge (not the daemon);\n\
                    env: CRUX_MCP_URL (default http://127.0.0.1:14801/mcp),\n\
                    CRUX_AGENT_TOKEN (optional bearer)\n\
-  self update      download, verify (sha256) and install the latest release;\n\
+  self update      update a standalone daemon binary; packaged installs use\n\
+                   their installer/package manager to keep companions aligned;\n\
                    append --check to only report whether a newer one exists\n",
         line = version_line()
     )
@@ -519,7 +520,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         |hash| rcx_passport_key.sign_hash(hash),
     );
     let rcx_token_hash = rcx_token.token_hash_hex();
-    let rcx_router = Arc::new(crux_router::RcxRouter::new(rcx_token));
+    let rcx_router = Arc::new(crux_router::RcxRouter::new_with_trusted_issuer_pubkey(
+        rcx_token,
+        rcx_passport_key.verifying_key_bytes(),
+    ));
     info!(
         passport_fpr = %rcx_passport_key.passport_fpr(),
         public_key_hex = %rcx_passport_key.public_key_hex(),
@@ -1327,13 +1331,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             tracing::warn!("witness: CORECRUXD_REKOR_URL unset; heads remain pending");
                             continue;
                         };
-                        let Some(signing_key) = crate::witness_submit::load_witness_signing_key() else {
+                        let Some(signer) = crate::witness_submit::select_witness_signer(timeout) else {
                             tracing::warn!(
-                                "witness: no witness signing key (CORECRUXD_WITNESS_SIGNING_KEY); heads remain pending"
+                                "witness: no signer configured (Vault Transit or CORECRUXD_WITNESS_SIGNING_KEY); heads remain pending"
                             );
                             continue;
                         };
-                        let witness = crate::witness_submit::RekorWitness::new(url, signing_key, timeout);
+                        let witness = crate::witness_submit::RekorWitness::with_signer(url, signer, timeout);
                         let n_pending = pending.len();
                         tracing::debug!(provider = %provider, pending = n_pending, "witness: draining heads");
                         // Network I/O off the async runtime and without the store lock.

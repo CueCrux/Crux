@@ -757,7 +757,8 @@ fn test_rcx_router(capabilities: Vec<&str>) -> std::sync::Arc<crux_router::RcxRo
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock")
         .as_secs();
-    std::sync::Arc::new(crux_router::RcxRouter::new(crux_router::mint_free_local_token(
+    let signing = SigningKey::from_bytes(&[0x44; 32]);
+    let mut token = crux_router::mint_free_local_token(
         "p_0123456789abcdef0123456789abcdef",
         "daemon_01HV0000000000000000000000",
         "default",
@@ -765,7 +766,12 @@ fn test_rcx_router(capabilities: Vec<&str>) -> std::sync::Arc<crux_router::RcxRo
         now.saturating_sub(60),
         now.saturating_add(3600),
         [0x22; 64],
-    )))
+    );
+    token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
+    std::sync::Arc::new(crux_router::RcxRouter::new_with_trusted_issuer_pubkey(
+        token,
+        signing.verifying_key().to_bytes(),
+    ))
 }
 
 fn dev_scope_headers(scopes: &str) -> HeaderMap {
@@ -7067,6 +7073,11 @@ async fn version_public_view_is_redacted() {
         checked_at: Some("2026-04-09T12:00:00Z".to_string()),
         error: None,
         comparison_stale: false,
+        basis: "binary".to_string(),
+        binary_commit: Some("def4567".to_string()),
+        checkout_commit: Some("abc1234".to_string()),
+        checkout_ahead_by: 0,
+        checkout_behind_by: 5,
         upgrade_hint: "current".to_string(),
     };
     let resp = get_version(State(state)).await.into_response();
@@ -7088,6 +7099,13 @@ async fn version_public_view_is_redacted() {
     assert!(body["update"]["repo_dir"].is_null());
     assert!(body["update"]["remote"].is_null());
     assert!(body["update"]["tracking_ref"].is_null());
+    // basis + checkout drift counts are product-facing; the commit SHAs
+    // (binary_commit/checkout_commit) stay admin-only like current_commit.
+    assert_eq!(body["update"]["basis"], "binary");
+    assert_eq!(body["update"]["checkout_behind_by"], 5);
+    assert_eq!(body["update"]["checkout_ahead_by"], 0);
+    assert!(body["update"]["binary_commit"].is_null());
+    assert!(body["update"]["checkout_commit"].is_null());
     assert_eq!(body["product"]["mode"], "free_local");
     assert_eq!(body["product"]["tier"], "free");
     assert_eq!(body["product"]["free_safety_baseline_active"], true);
@@ -7193,6 +7211,11 @@ async fn version_admin_view_includes_operational_details() {
         checked_at: Some("2026-04-09T12:00:00Z".to_string()),
         error: None,
         comparison_stale: false,
+        basis: "binary".to_string(),
+        binary_commit: Some("def4567".to_string()),
+        checkout_commit: Some("abc1234".to_string()),
+        checkout_ahead_by: 0,
+        checkout_behind_by: 5,
         upgrade_hint: "current".to_string(),
     };
 
@@ -7222,6 +7245,11 @@ async fn version_admin_view_includes_operational_details() {
     assert_eq!(body["update"]["current_commit"], "abc123");
     assert!(body["update"]["repo_dir"].is_null());
     assert!(body["update"]["error"].is_null());
+    // Admin view (public_view) keeps the basis fields, including commit SHAs.
+    assert_eq!(body["update"]["basis"], "binary");
+    assert_eq!(body["update"]["binary_commit"], "def4567");
+    assert_eq!(body["update"]["checkout_commit"], "abc1234");
+    assert_eq!(body["update"]["checkout_behind_by"], 5);
 }
 
 #[serial_test::serial]
@@ -10560,7 +10588,8 @@ async fn passports_list_after_seed_returns_three_defaults() {
 
 #[tokio::test]
 async fn passport_mint_requests_pending_lists_filed_request_without_minting() {
-    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    state.passport_mint_requests_enabled = true;
     {
         let mut store = state.fact_store.write().await;
         let filed = crate::mint_requests::file_mint_request(
@@ -10663,6 +10692,37 @@ fn mint_test_observation_count(state: &AppState) -> Result<usize, Box<dyn std::e
 }
 
 #[tokio::test]
+async fn passport_mint_request_flag_off_hides_pending_list() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        let filed = crate::mint_requests::file_mint_request(
+            &mut store,
+            "codex-work".to_string(),
+            "codex-work".to_string(),
+            Some("work".to_string()),
+            Some("operator review".to_string()),
+            1_726_000_000_000,
+        );
+        assert!(filed.is_ok(), "seed pending request: {filed:?}");
+    }
+
+    let resp = super::passports::get_pending_mint_requests(
+        State(state),
+        Query(super::passports::ListPendingMintRequestsQuery { by_passport: None }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = json_body(resp).await;
+    assert!(body["detail"]
+        .as_str()
+        .is_some_and(|detail| detail.contains("passport mint requests disabled")));
+}
+
+#[tokio::test]
 async fn passport_mint_request_approve_http_mints_and_attributes_operator() -> Result<(), Box<dyn std::error::Error>> {
     let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
     bind_test_state_to_root_passport_key(&mut state);
@@ -10750,6 +10810,20 @@ async fn passport_mint_request_approve_http_mints_and_attributes_operator() -> R
         assert_eq!(fact.source_receipt.as_deref(), Some(receipt_id.as_str()));
     }
     drop(store);
+
+    let follow_up_request_id = {
+        let mut store = state.fact_store.write().await;
+        crate::mint_requests::file_mint_request(
+            &mut store,
+            "codex-work".to_string(),
+            "codex-work".to_string(),
+            Some("work".to_string()),
+            Some("request after receipt-backed resolution".to_string()),
+            101,
+        )?
+        .request_id
+    };
+    assert_ne!(follow_up_request_id, request_id);
 
     #[cfg(unix)]
     {
@@ -11333,6 +11407,26 @@ async fn passport_mint_request_receipt_failure_cleans_new_key_and_leaves_request
         .ok_or_else(|| std::io::Error::other("pending request missing after receipt failure"))?;
     assert_eq!(pending.status, crate::mint_requests::MINT_REQUEST_STATUS_PENDING);
     assert!(crate::passports::get_passport(&store, "requester-a").is_none());
+    drop(store);
+
+    let duplicate = {
+        let mut store = state.fact_store.write().await;
+        crate::mint_requests::file_mint_request(
+            &mut store,
+            "requester-a".to_string(),
+            "requester-a".to_string(),
+            Some("work".to_string()),
+            None,
+            101,
+        )
+    };
+    assert!(matches!(
+        duplicate,
+        Err(crate::mint_requests::MintRequestError::AlreadyPending {
+            request_id: duplicate_request_id,
+            ..
+        }) if duplicate_request_id == request_id
+    ));
     Ok(())
 }
 
@@ -11461,6 +11555,24 @@ async fn passport_mint_request_reuses_receipt_bound_key_after_fact_journal_failu
         assert_eq!(pending.status, crate::mint_requests::MINT_REQUEST_STATUS_PENDING);
         assert!(crate::passports::get_passport(&store, "requester-a").is_none());
     }
+    let duplicate = {
+        let mut store = state.fact_store.write().await;
+        crate::mint_requests::file_mint_request(
+            &mut store,
+            "requester-a".to_string(),
+            "requester-a".to_string(),
+            Some("work".to_string()),
+            None,
+            101,
+        )
+    };
+    assert!(matches!(
+        duplicate,
+        Err(crate::mint_requests::MintRequestError::AlreadyPending {
+            request_id: duplicate_request_id,
+            ..
+        }) if duplicate_request_id == request_id
+    ));
     let receipt_records = super::observations::read_observations_strict(&super::observations::observation_file_path(
         &state.data_dir,
         super::approval_receipts::APPROVAL_RECEIPT_SESSION,

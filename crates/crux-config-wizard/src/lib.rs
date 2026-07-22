@@ -36,6 +36,7 @@ pub const DEFAULT_PROFILES: &[&str] = &[
     "execplan-discipline",
     "code-grounding",
     "scratchpad-survival",
+    "boot-banner",
     "pre-deploy-gate",
     "eu-ai-act",
     "audit-soc2",
@@ -71,11 +72,27 @@ mod tests {
 
     #[test]
     fn default_profiles_present_and_unique() {
-        assert_eq!(DEFAULT_PROFILES.len(), 9);
+        assert_eq!(DEFAULT_PROFILES.len(), 10);
         let mut seen = std::collections::HashSet::new();
         for p in DEFAULT_PROFILES {
             assert!(seen.insert(*p), "duplicate default profile '{p}'");
         }
+        assert!(DEFAULT_PROFILES.contains(&"boot-banner"), "boot-banner in default set");
+    }
+
+    #[test]
+    fn default_set_composes_boot_banner_section() {
+        // The default set, composed, must land the boot-banner managed section.
+        let bundled = load_bundled_profiles().unwrap();
+        let selected: Vec<_> = bundled
+            .into_iter()
+            .filter(|f| DEFAULT_PROFILES.contains(&f.frontmatter.name.as_str()))
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        compose_file(dir.path(), Target::ClaudeMd, &selected, false, false).unwrap();
+        let txt = std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
+        assert!(txt.contains("BEGIN-CRUX-MANAGED:boot-banner v1"));
+        assert!(txt.contains("## Crux Boot Banner"));
     }
 
     #[test]

@@ -515,6 +515,7 @@ More: [`docs/troubleshooting.md`](docs/troubleshooting.md) ·
 | `corecruxd` | Canonical daemon binary built by Cargo. |
 | `crux` | User-facing release alias for `corecruxd`. |
 | `corecruxctl` | CLI for verification, replay, receipts, and operations. |
+| `crux-hook` | Agent lifecycle hooks, including encrypted compaction snapshot sync. |
 | `CORECRUXD_*` | Environment-variable prefix for daemon config. |
 
 **This repo contains** the local-first daemon, CLI, MCP server, append-only storage, BM25

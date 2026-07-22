@@ -7,6 +7,8 @@ Each target bundle includes:
 - `corecruxd-<target>` as the canonical daemon binary.
 - `crux-<target>` as the user-facing alias for the same daemon binary.
 - `corecruxctl-<target>` for administrative checks and store verification.
+- `crux-hook-<target>` for agent lifecycle hooks, including encrypted
+  compaction snapshot sync.
 - `LICENCE.md` (code licence) and `TRUST-CONTRACT.md`. The code licence is
   published to scanners as SPDX `LicenseRef-CCL-1.0` (crate manifests + `.rs`
   headers); see [docs/LICENCE-FAQ.md](LICENCE-FAQ.md) → "machine-readable
@@ -22,8 +24,8 @@ whenever release binaries already exist under `target/release`.
 
 The boundary script proves only the local daemon distribution shape:
 
-- required daemon, alias, CLI, licence, trust-contract, README, config, content,
-  and release-manifest files are present in the staged package
+- required daemon, alias, CLI, hook, licence, trust-contract, README, config,
+  content, and release-manifest files are present in the staged package
 - hosted GPU/CUDA surfaces are excluded from the daemon package
 - package-script smoke markers are produced for the staged binaries
 

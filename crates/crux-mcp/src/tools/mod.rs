@@ -1472,7 +1472,7 @@ pub fn list_tools_with_flags(
                     },
                     "reason": {
                         "type": "string",
-                        "description": "Optional reason shown to the approving operator"
+                        "description": "Optional reason shown to the approving operator (maximum 2048 UTF-8 bytes)"
                     }
                 },
                 "examples": [
@@ -1711,9 +1711,13 @@ pub fn list_tools_with_flags(
         },
         ToolDefinition {
             name: "update_status".to_string(),
-            description: "Show whether this checkout is current, behind, ahead, \
+            description: "Show whether the running daemon is current, behind, ahead, \
                           diverged, disabled, or unavailable relative to the tracked \
-                          git branch. Includes an upgrade hint plus backup playbook pointers."
+                          git branch. `basis` says what the primary ahead/behind counts \
+                          describe: \"binary\" (the running binary's embedded commit, the \
+                          deploy-gating number) or \"checkout\" (the source-tree HEAD, the \
+                          fallback); the checkout_* fields expose a stale source clone. \
+                          Includes an upgrade hint plus backup playbook pointers."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -2610,9 +2614,13 @@ fn tools_to_json(tools: Vec<ToolDefinition>, auth: Option<ToolAuthMetadata>) -> 
     response
 }
 
-/// Return the MCP catalogue after applying an RCX Capability Token matrix.
-pub fn list_tools_for_rcx_token(token: &RcxCapabilityToken, now_unix_seconds: u64) -> Vec<ToolDefinition> {
-    let router = RcxRouter::new(token.clone());
+/// Return the MCP catalogue after signature-checking an RCX Capability Token.
+pub fn list_tools_for_verified_rcx_token(
+    token: &RcxCapabilityToken,
+    trusted_issuer_pubkey: [u8; 32],
+    now_unix_seconds: u64,
+) -> Vec<ToolDefinition> {
+    let router = RcxRouter::new_with_trusted_issuer_pubkey(token.clone(), trusted_issuer_pubkey);
     list_tools_for_rcx_router(&router, now_unix_seconds)
 }
 
@@ -2771,7 +2779,7 @@ pub fn tool_output_docs() -> Value {
         { "tool": "sync_pull",          "output": "{ tenant_id?, facts_pulled, cursor, total_pull_count, collection_cursor_count }" },
         { "tool": "sync_push",          "output": "{ mode?='tenant_promotion_preview', tenant_id?, facts_pushed?|would_promote?, preview_hash?, skipped_private?, skipped_synced?, skipped_not_allowlisted?, total_push_count?, collection_cursor_count? }" },
         { "tool": "sync_status",        "output": "{ mode, configured, background_sync_enabled, remote_url, api_key_configured, platform_online, degraded, degraded_reason, onboarding_hint, last_pull_at, last_push_at, pull_count, push_count, collection_pull_cursor_count, collection_push_cursor_count, tenant_manifest_supported, local_fact_count }" },
-        { "tool": "update_status",      "output": "{ enabled, state, tracking_ref, current_commit, latest_commit, ahead_by, behind_by, checked_at, error, upgrade_hint, upgrade_playbook_query, backup_playbook_query }" },
+        { "tool": "update_status",      "output": "{ enabled, state, basis(binary|checkout), tracking_ref, current_commit, binary_commit, latest_commit, ahead_by, behind_by, checkout_commit, checkout_ahead_by, checkout_behind_by, checked_at, error, comparison_stale, upgrade_hint, upgrade_playbook_query, backup_playbook_query }" },
         { "tool": "list_projects",      "output": "{ projects: [{ id, name, planning_target?, default_passport_id, created_at_unix_ms }] }" },
         { "tool": "get_project_context","output": "{ id, name, planning_target?, default_passport_id, members: [{ passport_id, role }], tenants: [{ tenant_id, default_passport_id? }] }" },
         { "tool": "list_work",          "output": "{ count, work: [{ id, project_id, state, title, body, assignee_passport?, tenant_id?, linked_pr?, linked_issue?, blocker_reason?, created_by_passport, created_at_unix_ms, updated_at_unix_ms }] }" },
@@ -3351,7 +3359,8 @@ mod tests {
 
     #[tokio::test]
     async fn passport_mint_request_survives_rcx_context_filtering_when_enabled() {
-        let token = mint_free_local_token(
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let mut token = mint_free_local_token(
             "p_0123456789abcdef0123456789abcdef",
             "daemon_01HV0000000000000000000000",
             "default",
@@ -3360,8 +3369,12 @@ mod tests {
             1_780_143_200,
             [0x11; RCX_CT_SIGNATURE_LEN],
         );
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
         let ctx = McpContext::new_default("test-node")
-            .with_rcx_router(RcxRouter::new(token))
+            .with_rcx_router(RcxRouter::new_with_trusted_issuer_pubkey(
+                token,
+                signing.verifying_key().to_bytes(),
+            ))
             .with_passport_mint_requests(true);
 
         let listed = list_tools_json_for_context_with_mode(&ctx, 1_776_989_601, surface::ToolSurfaceMode::Full).await;
@@ -3521,8 +3534,9 @@ mod tests {
     }
 
     #[test]
-    fn list_tools_for_rcx_token_filters_unpermitted_tools() {
-        let token = mint_free_local_token(
+    fn list_tools_for_verified_rcx_token_filters_unpermitted_tools() {
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let mut token = mint_free_local_token(
             "p_0123456789abcdef0123456789abcdef",
             "daemon_01HV0000000000000000000000",
             "default",
@@ -3531,21 +3545,41 @@ mod tests {
             1_780_143_200,
             [0x11; RCX_CT_SIGNATURE_LEN],
         );
-        let names: Vec<String> = list_tools_for_rcx_token(&token, 1_776_989_601)
-            .into_iter()
-            .map(|tool| tool.name)
-            .collect();
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
+        let names: Vec<String> =
+            list_tools_for_verified_rcx_token(&token, signing.verifying_key().to_bytes(), 1_776_989_601)
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect();
 
         assert!(names.contains(&"query".to_string()));
         assert!(names.contains(&"query_scan".to_string()));
         assert!(names.contains(&"query_expand".to_string()));
         assert!(names.contains(&"store_fact".to_string()));
         assert!(!names.contains(&"sync_pull".to_string()));
+
+        let mut contextual = token;
+        contextual.spec_version = rcx_capability_token::RCX_CT_DELEGATION_SPEC_VERSION.to_string();
+        contextual.delegation_policy = Some(rcx_capability_token::DelegationPolicy {
+            presentation: rcx_capability_token::DelegationPresentation::ProofOfPossession,
+            max_depth: 1,
+            audience: rcx_capability_token::DelegationAudience::CruxSync,
+            allowed_delegate_fprs: vec!["p_0123456789abcdef0123456789abcdef".to_string()],
+        });
+        contextual.signature.sig = signing.sign(&contextual.token_hash()).to_bytes();
+        let mut stripped = contextual;
+        stripped.spec_version = rcx_capability_token::RCX_CT_SPEC_VERSION.to_string();
+        stripped.delegation_policy = None;
+        stripped.delegation_envelope = None;
+        assert!(
+            list_tools_for_verified_rcx_token(&stripped, signing.verifying_key().to_bytes(), 1_776_989_601,).is_empty()
+        );
     }
 
     #[test]
     fn list_tools_json_for_rcx_router_includes_token_metadata() {
-        let token = mint_free_local_token(
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let mut token = mint_free_local_token(
             "p_0123456789abcdef0123456789abcdef",
             "daemon_01HV0000000000000000000000",
             "default",
@@ -3554,9 +3588,10 @@ mod tests {
             1_780_143_200,
             [0x11; RCX_CT_SIGNATURE_LEN],
         );
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
         let token_id = token.token_id.clone();
         let token_hash = token.token_hash_hex();
-        let router = RcxRouter::new(token);
+        let router = RcxRouter::new_with_trusted_issuer_pubkey(token, signing.verifying_key().to_bytes());
 
         let listed = list_tools_json_for_rcx_router(&router, 1_776_989_601);
         assert_eq!(listed["_meta"]["crux"]["token_ref"]["token_id"], token_id);

@@ -157,6 +157,30 @@ pub struct UpdateStatus {
     /// redaction, unlike `error`.
     #[serde(default)]
     pub comparison_stale: bool,
+    /// Which reference the primary `state/ahead_by/behind_by/current_commit`
+    /// describe: `"binary"` (the running binary's embedded commit, when it
+    /// resolves in the checkout) or `"checkout"` (the working-tree HEAD — the
+    /// legacy behaviour, and the fallback when the binary sha is unknown or
+    /// unresolvable). Operators deploy-gate on the primary count, so it must
+    /// track the running binary, not a stale source clone. `#[serde(default)]`
+    /// → payloads written before this field deserialize as `""`.
+    #[serde(default)]
+    pub basis: String,
+    /// Short sha embedded in the running binary (`CORECRUX_GIT_SHA`), when
+    /// known. Set regardless of basis so operators can see the binary's commit
+    /// even when the source checkout has drifted away from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_commit: Option<String>,
+    /// Short sha of the source checkout's HEAD (`repo_dir`), set whenever the
+    /// checkout is readable. Under binary basis this surfaces a stale src clone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout_commit: Option<String>,
+    /// Ahead/behind of the source checkout HEAD vs the tracking ref, always
+    /// computed so a stale src clone is still visible under binary basis.
+    #[serde(default)]
+    pub checkout_ahead_by: u64,
+    #[serde(default)]
+    pub checkout_behind_by: u64,
     pub upgrade_hint: String,
 }
 
@@ -185,6 +209,11 @@ impl Default for UpdateStatus {
             checked_at: None,
             error: None,
             comparison_stale: false,
+            basis: "checkout".to_string(),
+            binary_commit: None,
+            checkout_commit: None,
+            checkout_ahead_by: 0,
+            checkout_behind_by: 0,
             upgrade_hint: "Update checks are disabled.".to_string(),
         }
     }

@@ -110,6 +110,15 @@ fn mint_request_error_response(err: crate::mint_requests::MintRequestResolutionE
         MintRequestResolutionError::Request(crate::mint_requests::MintRequestError::NotPending { .. }) => {
             StatusCode::CONFLICT
         }
+        MintRequestResolutionError::Request(crate::mint_requests::MintRequestError::ReasonTooLong { .. }) => {
+            StatusCode::BAD_REQUEST
+        }
+        MintRequestResolutionError::Request(crate::mint_requests::MintRequestError::AlreadyPending { .. }) => {
+            StatusCode::CONFLICT
+        }
+        MintRequestResolutionError::Request(crate::mint_requests::MintRequestError::QueueFull { .. }) => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         MintRequestResolutionError::Request(
             crate::mint_requests::MintRequestError::Json(_) | crate::mint_requests::MintRequestError::Store(_),
         ) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -240,6 +249,9 @@ pub(super) async fn get_pending_mint_requests(
     Query(query): Query<ListPendingMintRequestsQuery>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    if !state.passport_mint_requests_enabled {
+        return mint_requests_disabled_response();
+    }
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
     }

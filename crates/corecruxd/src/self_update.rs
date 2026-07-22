@@ -8,13 +8,16 @@
 //! Fetches the signed release update-manifest.json, compares its version
 //! against the running binary, prints the result, and (without `--check`)
 //! downloads the matching platform asset, verifies its sha256 against the
-//! manifest, and atomically replaces the running executable.
+//! manifest, and atomically replaces the running executable. Packaged installs
+//! that also carry `crux-hook` or `corecruxctl` fail closed and route to the
+//! complete installer/package-manager upgrade so companion versions cannot
+//! silently skew.
 //!
 //! Posture (`docs/update-channel.md`): this is NEVER automatic and NEVER a
 //! background default. It runs only when an operator types the command, makes
 //! its outbound GETs only then, and re-verifies the artifact before swapping it
 //! in — consistent with "the upgrade is always an explicit operator command
-//! that re-verifies signatures".
+//! that re-verifies artifact integrity".
 //!
 //! Trust model: the artifact's sha256 is checked against the HTTPS-fetched
 //! manifest. Full cosign keyless / SLSA verification remains the `install.sh`
@@ -37,8 +40,10 @@ const MANIFEST_URL: &str = "https://github.com/CueCrux/Crux/releases/latest/down
 /// Version of the running binary, stamped at compile time.
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// `crux.update_manifest.v1` — only the fields this command consumes; serde
-/// ignores the rest (schema, published_at, verify_doc).
+/// `crux.update_manifest.v1/v2` — only the fields this command consumes; serde
+/// ignores the rest (schema, published_at, verify_doc). V2 adds a logical
+/// standalone name plus the actual release asset name so legacy packaged
+/// updaters cannot partially cross the hook-distribution boundary.
 #[derive(serde::Deserialize)]
 struct Manifest {
     version: String,
@@ -51,7 +56,15 @@ struct Manifest {
 #[derive(serde::Deserialize)]
 struct Artifact {
     name: String,
+    #[serde(default)]
+    asset_name: Option<String>,
     sha256: String,
+}
+
+impl Artifact {
+    fn release_asset_name(&self) -> &str {
+        self.asset_name.as_deref().unwrap_or(&self.name)
+    }
 }
 
 /// Entry point for the `self` CLI action. `args` is the full argv (after
@@ -91,7 +104,7 @@ fn parse_self_args(args: &[String]) -> Result<bool, String> {
 fn self_usage() -> String {
     "usage: crux self update [--check]\n\
      \n\
-     \x20 self update          download, verify (sha256) and install the latest release\n\
+     \x20 self update          update a standalone daemon binary; packaged installs use their installer\n\
      \x20 self update --check  report whether a newer release exists; make no changes"
         .to_string()
 }
@@ -132,17 +145,31 @@ fn run_inner(check_only: bool) -> Result<(), String> {
             std::env::consts::ARCH
         )
     })?;
-    let name = format!("crux-{suffix}");
-    let artifact = manifest
-        .artifacts
-        .iter()
-        .find(|a| a.name == name)
-        .ok_or_else(|| format!("release {} carries no artifact named {name}", manifest.tag))?;
+    let artifact = select_standalone_artifact(&manifest, suffix).ok_or_else(|| {
+        format!(
+            "release {} carries no standalone daemon artifact for {suffix}; use the complete signed installer",
+            manifest.tag
+        )
+    })?;
 
     let exe = download_and_replace(artifact, &manifest.tag)?;
     println!("replaced {} with crux {}", exe.display(), manifest.version);
     println!("restart the daemon (or your service manager) to run the new version.");
     Ok(())
+}
+
+/// Select the fenced v2 logical name first, with a v1 fallback for manifests
+/// published before companion binaries joined the distribution.
+fn select_standalone_artifact<'a>(manifest: &'a Manifest, suffix: &str) -> Option<&'a Artifact> {
+    let fenced_name = format!("standalone-crux-{suffix}");
+    manifest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.name == fenced_name)
+        .or_else(|| {
+            let legacy_name = format!("crux-{suffix}");
+            manifest.artifacts.iter().find(|artifact| artifact.name == legacy_name)
+        })
 }
 
 /// Map the compile target to the release artifact suffix used in the manifest
@@ -168,19 +195,19 @@ fn fetch_manifest() -> Result<Manifest, String> {
         .map_err(|e| format!("parsing update manifest failed: {e}"))
 }
 
-/// Download `crux-<suffix>` for `tag`, verify its sha256 against the manifest,
-/// and atomically replace the running executable. Returns the replaced path.
+/// Download the selected release asset for `tag`, verify its sha256 against the
+/// manifest, and atomically replace the running executable. Returns the
+/// replaced path.
 fn download_and_replace(artifact: &Artifact, tag: &str) -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate the running executable: {e}"))?;
+    guard_packaged_companions(&exe, tag)?;
     let dir = exe
         .parent()
         .ok_or_else(|| "the running executable has no parent directory".to_string())?;
 
-    let url = format!(
-        "https://github.com/CueCrux/Crux/releases/download/{tag}/{}",
-        artifact.name
-    );
-    println!("downloading {} ...", artifact.name);
+    let asset_name = artifact.release_asset_name();
+    let url = format!("https://github.com/CueCrux/Crux/releases/download/{tag}/{asset_name}");
+    println!("downloading {asset_name} ...");
     let mut resp = ureq::get(&url).call().map_err(|e| format!("download failed: {e}"))?;
     // as_reader() (not read_to_vec) so the multi-MB binary is not truncated by a
     // convenience-method size limit — mirrors the audit-pack export download.
@@ -194,7 +221,7 @@ fn download_and_replace(artifact: &Artifact, tag: &str) -> Result<PathBuf, Strin
     if !got.eq_ignore_ascii_case(artifact.sha256.trim()) {
         return Err(format!(
             "sha256 mismatch for {} — manifest {}, downloaded {got}; refusing to install",
-            artifact.name, artifact.sha256
+            asset_name, artifact.sha256
         ));
     }
     println!("verified sha256 {got}");
@@ -221,6 +248,32 @@ fn download_and_replace(artifact: &Artifact, tag: &str) -> Result<PathBuf, Strin
         return Err(format!("failed to replace {}: {e}", exe.display()));
     }
     Ok(exe)
+}
+
+/// Refuse a daemon-only replacement when this is visibly a managed bundle.
+///
+/// The signed installer, Debian package, and Homebrew formula place both
+/// companions beside the daemon. Updating only `crux` would strand an older
+/// hook/CLI while reporting the daemon as current. A multi-file replacement is
+/// not atomic, so the safe boundary is to use the existing complete-bundle
+/// upgrade path.
+fn guard_packaged_companions(exe: &Path, tag: &str) -> Result<(), String> {
+    let Some(dir) = exe.parent() else {
+        return Ok(());
+    };
+    let companion = ["crux-hook", "corecruxctl"]
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|path| path.exists());
+    let Some(companion) = companion else {
+        return Ok(());
+    };
+
+    Err(format!(
+        "refusing a daemon-only update because {} is installed beside {}; replacing only crux would leave companion versions stale. Upgrade the complete signed bundle with install.sh --version {tag}, brew upgrade crux, or a new .deb",
+        companion.display(),
+        exe.display()
+    ))
 }
 
 fn write_executable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -313,8 +366,31 @@ mod tests {
         assert_eq!(m.version, "0.5.45");
         assert_eq!(m.tag, "v0.5.45");
         assert_eq!(m.notes_url.as_deref(), Some("https://example.invalid/notes"));
-        let selected = m.artifacts.iter().find(|a| a.name == "crux-linux-amd64").unwrap();
+        let selected = select_standalone_artifact(&m, "linux-amd64").unwrap();
         assert_eq!(selected.sha256, "aa");
+        assert_eq!(selected.release_asset_name(), "crux-linux-amd64");
+    }
+
+    #[test]
+    fn v2_manifest_fences_legacy_lookup_but_resolves_release_asset() -> Result<(), Box<dyn std::error::Error>> {
+        let json = r#"{
+          "schema":"crux.update_manifest.v2","tag":"v0.5.45","version":"0.5.45",
+          "artifacts":[
+            {"name":"standalone-crux-linux-amd64","asset_name":"crux-linux-amd64","sha256":"aa"},
+            {"name":"standalone-crux-darwin-arm64","asset_name":"crux-darwin-arm64","sha256":"bb"}
+          ]
+        }"#;
+        let m: Manifest = serde_json::from_str(json)?;
+
+        // A pre-M5 updater searches only the old logical name and therefore
+        // fails before downloading/replacing the daemon.
+        assert!(m.artifacts.iter().all(|a| a.name != "crux-linux-amd64"));
+
+        let selected = select_standalone_artifact(&m, "linux-amd64")
+            .ok_or_else(|| std::io::Error::other("v2 standalone artifact not selected"))?;
+        assert_eq!(selected.name, "standalone-crux-linux-amd64");
+        assert_eq!(selected.release_asset_name(), "crux-linux-amd64");
+        Ok(())
     }
 
     #[test]
@@ -328,5 +404,28 @@ mod tests {
             ("macos", "x86_64") => assert_eq!(platform_suffix(), Some("darwin-amd64")),
             _ => assert!(platform_suffix().is_none()),
         }
+    }
+
+    #[test]
+    fn packaged_companions_refuse_daemon_only_update() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let standalone = temp.path().join("standalone");
+        std::fs::create_dir(&standalone)?;
+        let standalone_exe = standalone.join("crux");
+        assert_eq!(guard_packaged_companions(&standalone_exe, "v0.5.45"), Ok(()));
+
+        for companion_name in ["crux-hook", "corecruxctl"] {
+            let case_dir = temp.path().join(companion_name);
+            std::fs::create_dir(&case_dir)?;
+            let exe = case_dir.join("crux");
+            std::fs::write(case_dir.join(companion_name), b"fixture")?;
+            let message = guard_packaged_companions(&exe, "v0.5.45")
+                .err()
+                .ok_or_else(|| std::io::Error::other("packaged update was not refused"))?;
+            assert!(message.contains(companion_name));
+            assert!(message.contains("install.sh --version v0.5.45"));
+            assert!(message.contains("companion versions stale"));
+        }
+        Ok(())
     }
 }
