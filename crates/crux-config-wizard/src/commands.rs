@@ -136,7 +136,9 @@ pub fn run_regenerate(workspace: &Path, force: bool) -> std::io::Result<CommandR
     }
     if pins_updated > 0 {
         cfg.save(workspace).map_err(std::io::Error::other)?;
-        writeln!(stdout, ".crux/agent-profile.toml: updated={pins_updated}").expect("write to String cannot fail");
+        stdout.push_str(".crux/agent-profile.toml: updated=");
+        stdout.push_str(&pins_updated.to_string());
+        stdout.push('\n');
     }
     Ok(CommandReport::ok(stdout))
 }
