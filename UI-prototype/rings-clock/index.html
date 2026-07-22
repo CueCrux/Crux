@@ -1,0 +1,809 @@
+<title>Crux — The Rings v4 (clock of work)</title>
+<style>
+:root, :root[data-theme="light"], :root[data-theme="dark"] {
+  --bg0: #0b0d13; --bg1: #12151d;
+  --panel: rgba(255,255,255,.035); --panel-strong: rgba(255,255,255,.06);
+  --hairline: rgba(255,255,255,.09); --hairline-strong: rgba(255,255,255,.18);
+  --ink: #eef0f6; --ink2: #b6bcc9; --ink3: #7e8595;
+  --accent: #8b96f2; --accent-deep: #5e6ad2;
+  --teal: #2dd4bf; --amber: #f5a623; --violet: #a78bfa; --err: #ef4444;
+  --font-sans: 'Public Sans', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Arial, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: radial-gradient(1200px 700px at 70% -10%, rgba(94,106,210,.10), transparent 60%), var(--bg0);
+  color: var(--ink); font-family: var(--font-sans); line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; text-underline-offset: 3px; }
+code { font-family: var(--font-mono); font-size: .9em; background: var(--panel-strong); padding: .1em .35em; border-radius: 5px; }
+
+header.lead { max-width: 1100px; margin: 0 auto; padding: clamp(28px, 5vh, 54px) clamp(16px, 4vw, 40px) 6px; }
+header.lead h1 { font-size: clamp(26px, 3.6vw, 42px); font-weight: 800; letter-spacing: -.025em; line-height: 1.08; margin: 0 0 14px; text-wrap: balance; }
+header.lead h1 em { font-style: normal; color: var(--accent); }
+header.lead p.thesis { font-size: clamp(15px, 1.5vw, 17px); color: var(--ink2); max-width: 74ch; margin: 0 0 10px; }
+header.lead p.thesis b { color: var(--ink); font-weight: 650; }
+
+section.concept { max-width: 1560px; margin: 26px auto 0; padding: 0 clamp(12px, 3vw, 36px); }
+.stagewrap {
+  position: relative; border: 1px solid var(--hairline); border-radius: 18px;
+  background: radial-gradient(900px 500px at 50% 0%, rgba(94,106,210,.06), transparent 65%), var(--bg1);
+  overflow: hidden; box-shadow: 0 24px 70px rgba(0,0,0,.45);
+}
+.stagewrap canvas { display: block; width: 100%; height: clamp(520px, 74vh, 820px); cursor: crosshair; touch-action: none; }
+.stagebar {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  display: flex; align-items: center; gap: 9px; flex-wrap: wrap;
+  padding: 10px 16px;
+  font-family: var(--font-mono); font-size: 11.5px; color: var(--ink3);
+  background: linear-gradient(transparent, rgba(11,13,19,.85) 45%);
+  pointer-events: none;
+}
+.stagebar > * { pointer-events: auto; }
+.stagebar .grp { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.stagebar .hint { margin-left: auto; text-align: right; }
+.stagebar button {
+  font: 600 11.5px var(--font-mono); color: var(--ink2);
+  background: rgba(255,255,255,.07); border: 1px solid var(--hairline-strong);
+  border-radius: 7px; padding: 4px 11px; cursor: pointer;
+}
+.stagebar button:hover { color: var(--ink); background: rgba(255,255,255,.12); }
+.stagebar button[aria-pressed="true"] { color: var(--accent); border-color: rgba(139,150,242,.55); background: rgba(139,150,242,.12); }
+.stagebar button:focus-visible, .stagebar input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.stagebar input[type=range] { accent-color: var(--accent-deep); width: min(150px, 17vw); }
+.stagebar label { color: var(--ink3); }
+.stagebar .chip { background: rgba(139,150,242,.14); border: 1px solid rgba(139,150,242,.4); color: var(--accent); border-radius: 999px; padding: 3px 11px; font-weight: 600; white-space: nowrap; }
+
+.cnotes { max-width: 1100px; margin: 20px auto 0; padding: 0 4px; display: grid; grid-template-columns: minmax(300px, 3fr) minmax(280px, 2fr); gap: 20px 44px; }
+@media (max-width: 860px) { .cnotes { grid-template-columns: 1fr; } }
+.cnotes h3 { font-size: 13px; font-weight: 700; letter-spacing: .02em; color: var(--ink2); margin: 0 0 10px; }
+.cnotes .why p { color: var(--ink2); font-size: 14.5px; margin: 0 0 10px; max-width: 64ch; }
+.cnotes .why p b { color: var(--ink); font-weight: 650; }
+table.map { border-collapse: collapse; width: 100%; font-size: 13px; }
+table.map td { padding: 6px 10px 6px 0; vertical-align: top; border-bottom: 1px solid var(--hairline); }
+table.map td:first-child { font-family: var(--font-mono); font-size: 11.5px; color: var(--ink3); white-space: nowrap; width: 1%; padding-right: 16px; }
+table.map td:last-child { color: var(--ink2); }
+table.map td:last-child b { color: var(--ink); font-weight: 600; }
+
+#tip {
+  position: fixed; z-index: 90; pointer-events: none;
+  background: rgba(18,20,29,.97); border: 1px solid var(--hairline-strong);
+  border-radius: 10px; padding: 8px 12px;
+  font-family: var(--font-mono); font-size: 11.5px; line-height: 1.55;
+  color: var(--ink2); box-shadow: 0 10px 30px rgba(0,0,0,.5);
+  max-width: 320px; opacity: 0; transition: opacity .12s;
+}
+#tip b { color: var(--ink); font-weight: 600; }
+#tip .k { color: var(--ink3); }
+footer { max-width: 1100px; margin: 48px auto 0; padding: 20px clamp(16px, 4vw, 40px) 50px; border-top: 1px solid var(--hairline); font-family: var(--font-mono); font-size: 11.5px; color: var(--ink3); }
+@media (prefers-reduced-motion: reduce) { #tip { transition: none; } }
+</style>
+
+<header class="lead">
+  <h1>The Rings v4 — a <em>clock of work</em>, replaying 223 real plans</h1>
+  <p class="thesis">New work enters just after midnight; plans age clockwise around the dial; finished work retires just before twelve. This is the real portfolio — <b>223 ExecPlans with provenance</b> (163 complete · 57 in progress · 3 blocked) pulled from the daemon's work board — replayed over <b>May → July 2026</b>. Press <b>play</b> and watch the workspace breathe: sectors bloom in when a plan is born, seal and collapse when it completes, and park in grey when it goes quiet for 18 days (the board's own <code>stale</code> rule). Scroll to zoom and pan; click any dot or bar for its card. Completed plans retire off the clock into the ledger on the left.</p>
+</header>
+
+<section class="concept" id="rings">
+  <div class="stagewrap">
+    <canvas id="cv" aria-label="Rings v4: real execplan portfolio replayed as an animated clock; zoom for card detail"></canvas>
+    <div class="stagebar">
+      <span class="grp">
+        <button id="b-spin" aria-pressed="true">spin</button>
+        <button id="b-clock">reset clock</button>
+        <button id="b-mode" aria-pressed="false">bars</button>
+        <button id="b-dir" aria-pressed="false" title="Where new nodes appear: centre-out (rings grow) or rim-in (nodes sink)">edge: outward</button>
+      </span>
+      <span class="grp">
+        <label for="r-start">start</label><input id="r-start" type="range" min="0" max="1000" value="0">
+        <label for="r-end">end</label><input id="r-end" type="range" min="0" max="1000" value="1000">
+      </span>
+      <span class="grp">
+        <button id="b-play" aria-pressed="false">play</button>
+        <input id="r-time" type="range" min="0" max="1000" value="1000" aria-label="Time">
+        <span id="c-date" class="chip">2026-07-22</span>
+      </span>
+      <span class="grp">
+        <button id="b-zin" aria-label="Zoom in">+</button>
+        <button id="b-zout" aria-label="Zoom out">−</button>
+        <button id="b-zfit">fit</button>
+      </span>
+      <span class="hint" id="hint">wheel = zoom · drag = pan · click a dot or bar for its card</span>
+    </div>
+  </div>
+  <div class="cnotes">
+    <div class="why">
+      <h3>What you're watching</h3>
+      <p><b>The seam at 12 o'clock is "now".</b> Sectors are ordered by age: the newest plan sits at 12:01, the oldest at 11:59 — position on the dial <i>is</i> seniority. When a new plan is born mid-playback it enters at the top and pushes the dial round; everything on the clock re-flows live.</p>
+      <p><b>Three exits, three flashes:</b> teal seal = completed (its gates passed), grey = parked after 18 quiet days (the board's <code>stale</code> semantics — most of the 57 "in progress" plans are honestly this), red pulse = blocked.</p>
+      <p><b>Bars mode</b> turns every node into a spoke from the heartwood to its ring — older spokes layer over newer, nodes spread clockwise in day order, so a plan reads as a fan of its own history. Click any bar or dot for its card. <b>edge: inward</b> flips the time metaphor: new work appears at the rim and sinks toward the heartwood as it ages.</p>
+    </div>
+    <div>
+      <h3>Controls & mapping</h3>
+      <table class="map">
+        <tr><td>spin / reset clock</td><td>ambient rotation; reset tweens the seam back to 12</td></tr>
+        <tr><td>start · end</td><td>the window the rings span (radius = birth time within it)</td></tr>
+        <tr><td>play / time</td><td>replays the portfolio; live edge sweeps outward</td></tr>
+        <tr><td>sector order</td><td>newest at 12:01 → oldest at 11:59, always</td></tr>
+        <tr><td>dot size</td><td>tokens (traced facts) · milestone weight (untraced)</td></tr>
+        <tr><td>bars</td><td>spoke = centre → node ring; older over newer; both clickable</td></tr>
+        <tr><td>edge toggle</td><td>outward: rings grow from the centre · inward: nodes sink from the rim</td></tr>
+        <tr><td>rim chart</td><td>token spend across each sector's arc: sector start = tracking start, sector end = now</td></tr>
+        <tr><td>ledger</td><td>completed plans stack on the left edge as they retire</td></tr>
+        <tr><td>traced plans</td><td><code>buyer-fit-buildout</code> + <code>cross-site-auth-sso</code> carry their real facts; others show milestone-derived density</td></tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+<footer>
+  rings v4 · 223 real execplans (provenance-dated) from crux:14800 · day window 2026-05-18 → 2026-07-22 · exits: sealed = complete, parked = 18d quiet (stale rule), blocked pulses red
+</footer>
+
+<div id="tip" role="status"></div>
+
+<script>
+(function () {
+'use strict';
+const PLANS_RAW = [{"s":"corecrux-object-storage-tier-2026-07-07","st":0,"d":6,"t":6,"b":61,"e":76,"o":59},{"s":"tier-packaging-p1-remediation-2026-07-13","st":1,"d":0,"t":1,"b":67,"e":76,"o":55},{"s":"crux-daemon-buyer-fit-buildout-2026-07-13","st":1,"d":1,"t":8,"b":67,"e":76,"o":64},{"s":"crux-audit-v2-closeout-2026-07-15","st":0,"d":7,"t":7,"b":69,"e":75,"o":56},{"s":"vault-consolidation-2026-04-07","st":1,"d":0,"t":8,"b":54,"e":75,"o":80},{"s":"cross-site-auth-sso-cuecrux-2026-07-13","st":1,"d":3,"t":6,"b":67,"e":75,"o":67},{"s":"wikicrux-agent-publish-plane-shared-tenant-2026-07-09","st":1,"d":1,"t":6,"b":73,"e":74,"o":5},{"s":"portfolio-burn-down-orchestration-2026-07-10","st":2,"d":2,"t":8,"b":64,"e":74,"o":54},{"s":"commerce-paddle-billing-2026-06-11","st":1,"d":0,"t":8,"b":58,"e":72,"o":51},{"s":"daemon-distribution-packaging-2026-06-11","st":0,"d":7,"t":7,"b":36,"e":72,"o":137},{"s":"esi-v2-no-blindspot-live-write-2026-06-03","st":2,"d":3,"t":6,"b":27,"e":72,"o":137},{"s":"unified-shell-console-2026-07-03","st":1,"d":12,"t":13,"b":57,"e":58,"o":17},{"s":"wikicrux-prose-dense-reembed-float16-pool-2026-06-27","st":0,"d":3,"t":5,"b":51,"e":51,"o":7},{"s":"wikicrux-public-codemaps-2026-07-10","st":1,"d":4,"t":4,"b":64,"e":64,"o":0},{"s":"wikicrux-retrieval-quality-hardening-2026-06-28","st":0,"d":6,"t":7,"b":52,"e":52,"o":11},{"s":"wiki-prose-residual-extraction-2026-06-30","st":0,"d":3,"t":4,"b":54,"e":55,"o":15},{"s":"vernacular-retrieval-lift-check-2026-05-21","st":0,"d":0,"t":7,"b":14,"e":14,"o":0},{"s":"wiki-cuecrux-com-prod-deploy-2026-07-08","st":0,"d":0,"t":5,"b":62,"e":62,"o":4},{"s":"wikicrux-agent-language-encode-2026-06-28","st":1,"d":5,"t":10,"b":52,"e":53,"o":30},{"s":"wikicrux-grounding-poisoning-defense-2026-07-08","st":0,"d":5,"t":6,"b":62,"e":62,"o":4},{"s":"vaultcrux-search-outcome-corpus-pollution-2026-05-31","st":0,"d":2,"t":3,"b":24,"e":24,"o":0},{"s":"wikicrux-idempotent-ingestion-2026-06-14","st":1,"d":4,"t":10,"b":38,"e":52,"o":48},{"s":"wikicrux-agent-first-wiki-service-2026-06-11","st":1,"d":3,"t":8,"b":35,"e":37,"o":1},{"s":"wikicrux-full-enwiki-ingest-2026-06-28","st":1,"d":2,"t":9,"b":52,"e":54,"o":33},{"s":"wikicrux-adoption-telemetry-and-corpus-flywheel-2026-07-09","st":1,"d":5,"t":10,"b":63,"e":67,"o":8},{"s":"vaultcrux-companion-lane-transforms-and-ccxev-2026-05-20","st":0,"d":0,"t":10,"b":15,"e":15,"o":0},{"s":"vaultcrux-multi-predicate-enumerate-2026-04-29","st":0,"d":0,"t":3,"b":20,"e":20,"o":0},{"s":"vaultcrux-multi-predicate-m3-verify-build-2026-06-09","st":0,"d":1,"t":5,"b":34,"e":34,"o":0},{"s":"tenant-isolation-policy-and-silo-2026-06-24","st":0,"d":7,"t":7,"b":48,"e":50,"o":25},{"s":"release-readiness-master-2026-06-11","st":1,"d":0,"t":6,"b":35,"e":49,"o":52},{"s":"tier0-deterministic-levers-2026-06-30","st":0,"d":5,"t":5,"b":54,"e":54,"o":6},{"s":"scorecrux-coding-intelligence-refresh-2026-06-25","st":1,"d":0,"t":5,"b":49,"e":50,"o":5},{"s":"tier-packaging-and-site-reframe-2026-07-13","st":1,"d":7,"t":8,"b":66,"e":67,"o":5},{"s":"unified-retrieval-hardening-2026-07-02","st":2,"d":7,"t":10,"b":55,"e":56,"o":1},{"s":"proof-carrying-adaptive-packs-2026-07-13","st":1,"d":0,"t":7,"b":67,"e":67,"o":5},{"s":"security-critical-7-tenant-isolation-2026-06-11","st":0,"d":4,"t":7,"b":65,"e":65,"o":0},{"s":"topology-ccxn-entity-coverage-backfill-lme-s-2026-06-06","st":0,"d":3,"t":5,"b":31,"e":31,"o":0},{"s":"token-burn-precise-attribution-2026-06-26","st":0,"d":3,"t":3,"b":50,"e":50,"o":7},{"s":"unified-reasoner-encode-evidence-2026-06-29","st":1,"d":0,"t":1,"b":53,"e":54,"o":25},{"s":"unified-production-claims-source-2026-06-30","st":1,"d":3,"t":4,"b":54,"e":54,"o":6},{"s":"rcx-registry-deployment-readiness-2026-06-14","st":0,"d":5,"t":5,"b":38,"e":38,"o":0},{"s":"production-cutover-orchestration-2026-07-07","st":1,"d":39,"t":40,"b":61,"e":65,"o":2},{"s":"provider-integration-surfaces-2026-06-11","st":1,"d":5,"t":6,"b":36,"e":36,"o":1},{"s":"scratchpad-survival-wizard-standard-2026-06-30","st":1,"d":4,"t":4,"b":54,"e":55,"o":8},{"s":"topology-ccxn-weight-and-noise-tune-lme-s-2026-06-07","st":0,"d":4,"t":4,"b":31,"e":31,"o":0},{"s":"tokenburn-ab-harness-2026-06-10","st":0,"d":1,"t":7,"b":34,"e":34,"o":0},{"s":"prod-engine-reconcile-deploy-2026-06-26","st":0,"d":0,"t":1,"b":50,"e":50,"o":4},{"s":"phase-t-usage-receipts-2026-07-03","st":0,"d":3,"t":3,"b":64,"e":64,"o":3},{"s":"lme-s-gated-accuracy-push-2026-05-29","st":0,"d":0,"t":5,"b":22,"e":28,"o":0},{"s":"phase-t-cross-vendor-instrumentation-2026-07-03","st":1,"d":1,"t":3,"b":61,"e":64,"o":5},{"s":"passport-revocation-and-agent-card-discovery-2026-06-29","st":0,"d":7,"t":7,"b":53,"e":53,"o":26},{"s":"phase-0-hygiene-debt-2026-07-02","st":1,"d":3,"t":10,"b":56,"e":60,"o":27},{"s":"phase-t-usage-receipts-autoemit-version-notify-2026-07-03","st":0,"d":3,"t":3,"b":57,"e":57,"o":3},{"s":"master-plan-canonical-consolidation-2026-06-14","st":0,"d":4,"t":4,"b":38,"e":38,"o":0},{"s":"portfolio-status-decisions-registry-2026-06-11","st":0,"d":0,"t":4,"b":36,"e":36,"o":0},{"s":"open-engine-coordination-surfaces-2026-06-30","st":0,"d":0,"t":5,"b":54,"e":55,"o":9},{"s":"plancrux-retirement-master-2026-05-19","st":1,"d":0,"t":9,"b":12,"e":34,"o":0},{"s":"mh-ab-v2-harness-build-2026-06-12","st":0,"d":1,"t":5,"b":36,"e":36,"o":0},{"s":"lme-s-multi-lane-retrieval-gemma-2026-05-23","st":0,"d":0,"t":7,"b":16,"e":16,"o":0},{"s":"lme-knowledge-reingest-and-legacy-segment-retire-2026-05-29","st":0,"d":0,"t":1,"b":22,"e":22,"o":0},{"s":"lane-coverage-backfill-2026-05-22","st":0,"d":2,"t":5,"b":15,"e":15,"o":0},{"s":"lme-ordering-day-precision-extraction-2026-06-12","st":1,"d":3,"t":6,"b":36,"e":37,"o":0},{"s":"lme-s-8-lever-deepdive-2026-06-04","st":0,"d":0,"t":1,"b":28,"e":29,"o":0},{"s":"lme-s-aggregation-projection-lane-wikicrux-bridge-2026-06-28","st":1,"d":0,"t":6,"b":52,"e":53,"o":26},{"s":"lme-agent-native-retrieval-harness-2026-05-30","st":0,"d":2,"t":5,"b":23,"e":32,"o":0},{"s":"lme-s-aggregation-count-extraction-2026-06-18","st":0,"d":5,"t":5,"b":42,"e":47,"o":59},{"s":"knowledge-state-production-hooks-2026-06-13","st":0,"d":6,"t":6,"b":37,"e":39,"o":9},{"s":"extraction-lane-observability-2026-05-21","st":0,"d":7,"t":7,"b":14,"e":35,"o":0},{"s":"execplan-lineage-provenance-open-questions-2026-06-25","st":0,"d":4,"t":5,"b":49,"e":49,"o":5},{"s":"generative-execplans-and-deploy-coordination-2026-06-26","st":0,"d":0,"t":1,"b":50,"e":53,"o":27},{"s":"identity-memory-portability-2026-06-11","st":0,"d":6,"t":6,"b":36,"e":36,"o":1},{"s":"fable5-d1-redteam-kill-risk-register-2026-07-02","st":0,"d":6,"t":6,"b":56,"e":56,"o":6},{"s":"gated-tiered-aggregation-prompt-fixes-2026-05-24","st":0,"d":0,"t":8,"b":17,"e":33,"o":0},{"s":"execplan-token-burn-per-execplan-2026-06-26","st":0,"d":2,"t":3,"b":50,"e":50,"o":12},{"s":"event-lane-semantic-recall-2026-06-05","st":0,"d":6,"t":7,"b":29,"e":30,"o":0},{"s":"glassbox-eu-ai-act-soc2-compliance-bench-2026-06-26","st":0,"d":11,"t":11,"b":50,"e":51,"o":22},{"s":"event-counter-noise-reduction-2026-06-06","st":0,"d":6,"t":7,"b":30,"e":30,"o":0},{"s":"frontdoor-agent-ux-nuxt-feature-flag-wiring-2026-05-29","st":1,"d":0,"t":8,"b":21,"e":22,"o":0},{"s":"gold-free-extraction-automation-2026-05-31","st":1,"d":2,"t":11,"b":24,"e":28,"o":0},{"s":"execplan-board-fidelity-states-console-cost-2026-06-26","st":0,"d":3,"t":4,"b":50,"e":50,"o":5},{"s":"embedder-pool-distribution-manager-2026-07-01","st":1,"d":2,"t":6,"b":55,"e":55,"o":11},{"s":"enwiki-prose-dedicated-serving-data-1-2026-07-03","st":0,"d":1,"t":6,"b":64,"e":64,"o":0},{"s":"embedder-pool-per-tenant-bundle-2026-06-16","st":0,"d":5,"t":5,"b":40,"e":40,"o":12},{"s":"enwiki-claims-coverage-expansion-2026-07-04","st":1,"d":2,"t":6,"b":64,"e":64,"o":0},{"s":"esi-v2-live-fact-write-path-2026-06-03","st":0,"d":0,"t":4,"b":27,"e":27,"o":0},{"s":"engine-ci-layer-7-remaining-highs-2026-05-21","st":0,"d":0,"t":4,"b":14,"e":14,"o":0},{"s":"enwiki-prose-ranking-quality-2026-07-03","st":0,"d":3,"t":5,"b":64,"e":64,"o":0},{"s":"cuecrux-feature-registry-and-router-2026-05-26","st":0,"d":0,"t":17,"b":19,"e":19,"o":0},{"s":"crux-http-ingress-hardening-2026-06-11","st":1,"d":4,"t":5,"b":35,"e":36,"o":0},{"s":"crux-self-hosting-hygiene-2026-06-05","st":0,"d":4,"t":5,"b":29,"e":29,"o":0},{"s":"crux-prod-deploy-2026-06-05","st":0,"d":3,"t":4,"b":29,"e":29,"o":0},{"s":"crux-gateway-production-2026-06-10","st":0,"d":0,"t":1,"b":34,"e":35,"o":0},{"s":"crux-mcp-oauth-for-hosted-clients-2026-06-23","st":1,"d":5,"t":8,"b":47,"e":49,"o":44},{"s":"crux-session-capability-graph-completion-2026-06-08","st":1,"d":1,"t":5,"b":32,"e":32,"o":0},{"s":"cruxengine-companion-installer-deploy-hardening-2026-07-12","st":0,"d":4,"t":4,"b":66,"e":66,"o":0},{"s":"crux-repo-audit-fixing-2026-06-15","st":0,"d":8,"t":8,"b":39,"e":39,"o":0},{"s":"crux-moat-m4-memory-hook-m8-buyer-package-2026-06-11","st":0,"d":0,"t":2,"b":35,"e":35,"o":0},{"s":"crux-repo-audit-hardening-followup-2026-06-15","st":0,"d":0,"t":1,"b":39,"e":39,"o":0},{"s":"crux-signed-session-recorder-2026-06-21","st":0,"d":3,"t":3,"b":46,"e":46,"o":40},{"s":"crux-hook-client-wire-activity-2026-06-22","st":0,"d":5,"t":5,"b":46,"e":46,"o":38},{"s":"crux-headroom-token-efficiency-learnings-2026-06-24","st":0,"d":3,"t":6,"b":48,"e":49,"o":17},{"s":"crux-orchestrator-orcplan-2026-05-29","st":0,"d":0,"t":7,"b":22,"e":22,"o":0},{"s":"crux-punchcard-resource-leases-2026-05-29","st":0,"d":0,"t":7,"b":22,"e":22,"o":0},{"s":"crux-session-archive-and-friendly-titles-2026-06-13","st":0,"d":2,"t":7,"b":37,"e":37,"o":0},{"s":"crux-growth-upsell-master-2026-06-11","st":1,"d":0,"t":4,"b":35,"e":36,"o":0},{"s":"crux-mcp-notification-202-native-http-2026-07-06","st":0,"d":1,"t":3,"b":60,"e":61,"o":4},{"s":"crux-work-panel-execplans-as-truenorth-2026-05-26","st":0,"d":8,"t":8,"b":19,"e":20,"o":0},{"s":"crux-tenant-category-model-2026-05-22","st":0,"d":7,"t":7,"b":15,"e":15,"o":0},{"s":"crux-new-tool-probe-fixes-2026-06-05","st":0,"d":3,"t":8,"b":29,"e":29,"o":0},{"s":"crux-response-contract-v1-default-schema-2026-06-08","st":0,"d":6,"t":7,"b":32,"e":34,"o":0},{"s":"crux-supply-chain-attestation-2026-06-11","st":0,"d":5,"t":5,"b":35,"e":48,"o":47},{"s":"cruxengine-companion-lane-port-2026-06-09","st":0,"d":7,"t":7,"b":33,"e":34,"o":0},{"s":"crux-mcp-dynamic-tool-surface-2026-06-08","st":0,"d":1,"t":6,"b":32,"e":34,"o":0},{"s":"crux-log-redaction-2026-06-11","st":1,"d":3,"t":5,"b":35,"e":36,"o":0},{"s":"crux-integration-platform-surfaces","st":0,"d":0,"t":7,"b":31,"e":31,"o":0},{"s":"crux-session-capability-catalog-refresh-2026-05-29","st":0,"d":0,"t":6,"b":21,"e":21,"o":0},{"s":"crux-segment-integrity-audit-remediation-2026-06-13","st":0,"d":7,"t":7,"b":37,"e":37,"o":2},{"s":"crux-moat-track-master-2026-06-05","st":1,"d":0,"t":9,"b":35,"e":66,"o":90},{"s":"crux-agent-presence-coordination-2026-06-11","st":0,"d":0,"t":7,"b":35,"e":35,"o":1},{"s":"crux-config-wizard-dedup-lint-2026-06-23","st":0,"d":5,"t":5,"b":47,"e":47,"o":37},{"s":"crux-audit-ii-gap-closure-codebase-audit-2026-06-13","st":0,"d":4,"t":4,"b":37,"e":37,"o":2},{"s":"crux-agent-passport-grouped-collaboration-2026-06-05","st":0,"d":5,"t":5,"b":29,"e":29,"o":0},{"s":"crux-console-graph-cutover-2026-05-30","st":0,"d":0,"t":1,"b":23,"e":23,"o":0},{"s":"crux-console-public-exposure-2026-05-17","st":1,"d":0,"t":6,"b":11,"e":11,"o":0},{"s":"crux-daemon-full-audit-2026-06-05","st":0,"d":6,"t":6,"b":29,"e":29,"o":0},{"s":"crux-dual-surface-activity-log-2026-06-18","st":0,"d":5,"t":5,"b":42,"e":46,"o":51},{"s":"cross-model-agreement-router-2026-06-04","st":0,"d":2,"t":3,"b":28,"e":28,"o":0},{"s":"crux-audit-ii-gap-closure-implementation-2026-06-14","st":0,"d":14,"t":14,"b":38,"e":38,"o":0},{"s":"crux-console-3d-substrate-concept-2026-06-11","st":0,"d":1,"t":4,"b":35,"e":35,"o":0},{"s":"crux-daemon-security-gap-scan-2026-06-12","st":0,"d":3,"t":4,"b":36,"e":36,"o":0},{"s":"crucible-gateway-supersede-clawd-2026-06-26","st":0,"d":0,"t":1,"b":50,"e":50,"o":5},{"s":"crux-freshness-dogfood-2026-06-04","st":0,"d":4,"t":8,"b":28,"e":29,"o":0},{"s":"crux-daemon-console-lane-weights-2026-06-13","st":0,"d":7,"t":7,"b":37,"e":37,"o":2},{"s":"crux-credit-burn-rail-2026-06-22","st":1,"d":1,"t":7,"b":61,"e":62,"o":2},{"s":"crux-daemon-v8-coverage-scan-2026-06-13","st":0,"d":3,"t":3,"b":37,"e":37,"o":0},{"s":"crux-domain-substrate-and-features-lens-2026-05-18","st":0,"d":6,"t":7,"b":11,"e":11,"o":0},{"s":"crucible-control-plane-and-deep-retrieval-2026-06-18","st":1,"d":0,"t":1,"b":48,"e":50,"o":53},{"s":"crux-console-data-plane-wiring-2026-05-21","st":0,"d":3,"t":6,"b":14,"e":14,"o":0},{"s":"crux-external-findings-remediation-2026-07-10","st":0,"d":7,"t":7,"b":64,"e":65,"o":3},{"s":"crux-daemon-hardening-audit-findings-2026-06-07","st":0,"d":6,"t":6,"b":31,"e":31,"o":0},{"s":"cross-session-identity-resolution-2026-06-15","st":0,"d":7,"t":7,"b":39,"e":39,"o":0},{"s":"crux-console-lane-weight-polish-2026-06-14","st":0,"d":6,"t":6,"b":38,"e":38,"o":0},{"s":"crux-ci-merge-queue-wiring-2026-06-26","st":0,"d":3,"t":4,"b":50,"e":53,"o":20},{"s":"crux-agent-action-ledger-token-accounting-2026-06-11","st":0,"d":6,"t":6,"b":35,"e":48,"o":47},{"s":"crux-activity-log-completion-2026-06-23","st":0,"d":4,"t":5,"b":47,"e":48,"o":38},{"s":"crux-codex-authentication-2026-06-12","st":0,"d":4,"t":4,"b":36,"e":57,"o":76},{"s":"crux-audit-chain-data-contract-2026-05-29","st":0,"d":1,"t":7,"b":22,"e":22,"o":0},{"s":"crux-agent-passport-mcp-binding-2026-06-10","st":0,"d":0,"t":1,"b":34,"e":34,"o":0},{"s":"corecrux-skip-companions-projection-control-2026-05-29","st":0,"d":0,"t":1,"b":21,"e":22,"o":0},{"s":"corecruxd-c2pa-vault-pki-runtime-enablement-2026-05-29","st":1,"d":0,"t":7,"b":21,"e":21,"o":0},{"s":"corecruxd-boost-overlay-persistence-2026-05-21","st":0,"d":1,"t":6,"b":14,"e":15,"o":0},{"s":"corecrux-turboquant-ccxe-quant-mode","st":1,"d":0,"t":6,"b":36,"e":36,"o":11},{"s":"corecrux-trait-expansion-lme-s-structural-losses-2026-05-21","st":0,"d":3,"t":6,"b":14,"e":15,"o":0},{"s":"corecrux-vernacular-v4-schema-and-prefilter-2026-05-20","st":0,"d":0,"t":8,"b":13,"e":13,"o":0},{"s":"corecrux-text-search-tenant-isolation-2026-06-30","st":0,"d":5,"t":6,"b":54,"e":54,"o":2},{"s":"corpus-segregation-bulk-repartition-2026-06-26","st":0,"d":4,"t":6,"b":50,"e":52,"o":33},{"s":"corecrux-transition-doc-content-plane-contamination-2026-06-12","st":0,"d":2,"t":6,"b":36,"e":37,"o":0},{"s":"corecrux-topology-no-link-prune-2026-05-27","st":0,"d":3,"t":6,"b":20,"e":21,"o":0},{"s":"corecrux-trait-expansion-global-default-on-2026-05-21","st":1,"d":0,"t":6,"b":14,"e":33,"o":0},{"s":"corecrux-trait-expansion-substrate-density-auto-tune-2026-05-21","st":0,"d":4,"t":6,"b":14,"e":15,"o":0},{"s":"corecruxd-companion-hot-reload-2026-05-18","st":0,"d":0,"t":6,"b":11,"e":35,"o":0},{"s":"corecrux-offline-serving-companions-2026-06-30","st":0,"d":6,"t":6,"b":54,"e":54,"o":34},{"s":"corecrux-recstyle-keyword-extension-2026-05-21","st":0,"d":3,"t":5,"b":14,"e":14,"o":0},{"s":"corecrux-prometheus-indexmanager-double-count-2026-05-28","st":0,"d":0,"t":3,"b":21,"e":21,"o":0},{"s":"corecrux-seal-shard-vs-tick-shard-mismatch-2026-06-01","st":0,"d":0,"t":1,"b":25,"e":25,"o":0},{"s":"corecrux-query-expansion-via-trait-embeddings-2026-05-20","st":0,"d":4,"t":6,"b":14,"e":14,"o":0},{"s":"corecrux-ingest-extraction-followups-2026-06-11","st":1,"d":6,"t":9,"b":35,"e":36,"o":0},{"s":"corecrux-retrieve-agent-shaped-payload-2026-05-15","st":1,"d":2,"t":9,"b":23,"e":24,"o":0},{"s":"corecrux-loadedsegment-memstats-2026-05-23","st":0,"d":3,"t":6,"b":15,"e":15,"o":0},{"s":"corecrux-gpu1-memory-stabilization-2026-05-28","st":0,"d":2,"t":6,"b":21,"e":24,"o":0},{"s":"corecrux-ingest-extraction-top10-2026-06-11","st":0,"d":0,"t":1,"b":35,"e":35,"o":0},{"s":"corecrux-query-expansion-rollout-completion-2026-05-21","st":0,"d":3,"t":5,"b":14,"e":35,"o":0},{"s":"corecrux-no-link-prune-substrate-rebuild-2026-05-29","st":0,"d":0,"t":1,"b":21,"e":21,"o":0},{"s":"corecrux-daemon-fast-startup-2026-06-16","st":0,"d":4,"t":6,"b":40,"e":40,"o":17},{"s":"corecrux-evictor-convergence-2026-05-31","st":0,"d":3,"t":4,"b":24,"e":24,"o":0},{"s":"codex-crux-session-banner-2026-06-01","st":0,"d":8,"t":8,"b":25,"e":29,"o":0},{"s":"chaincrux-phase1-5-event-edges-and-temporal-filter-2026-05-22","st":0,"d":0,"t":8,"b":17,"e":17,"o":0},{"s":"context-mediation-injection-2026-06-11","st":1,"d":6,"t":7,"b":36,"e":36,"o":0},{"s":"corecrux-bm25-64bit-tenant-filter-2026-06-13","st":1,"d":0,"t":1,"b":37,"e":37,"o":0},{"s":"corecrux-cascade-engagement-lme-s-2026-05-22","st":0,"d":2,"t":6,"b":15,"e":15,"o":0},{"s":"claudeclaw-subscription-sonnet-backend-2026-06-03","st":0,"d":6,"t":6,"b":27,"e":28,"o":0},{"s":"context-bench-v2-100point-thirdparty-board-2026-07-03","st":1,"d":6,"t":7,"b":57,"e":65,"o":22},{"s":"corecrux-document-index-lane-2026-05-15","st":0,"d":0,"t":11,"b":11,"e":11,"o":0},{"s":"chaincrux-phase1-prove-earned-edge-2026-05-22","st":0,"d":0,"t":7,"b":15,"e":15,"o":0},{"s":"corecrux-bulk-ingest-at-scale-2026-06-14","st":0,"d":0,"t":1,"b":38,"e":48,"o":61},{"s":"corecrux-bulk-ingest-polish-2026-05-03","st":1,"d":0,"t":1,"b":64,"e":64,"o":0},{"s":"codemap-endpoint-and-agent-docs-hardening-2026-07-10","st":0,"d":4,"t":4,"b":63,"e":63,"o":0},{"s":"clawd-unified-daemon-relocation-data1-2026-06-13","st":0,"d":7,"t":7,"b":36,"e":37,"o":0},{"s":"corecrux-evidence-hash-replay-dedup-2026-06-23","st":0,"d":5,"t":5,"b":47,"e":48,"o":44},{"s":"companion-build-429-hardening-2026-06-16","st":0,"d":6,"t":6,"b":40,"e":40,"o":7},{"s":"chaincrux-zero-events-substrate-investigation-2026-05-28","st":1,"d":0,"t":5,"b":21,"e":21,"o":0},{"s":"codemaps-facet-coverage-completion-2026-07-12","st":1,"d":0,"t":6,"b":66,"e":66,"o":0},{"s":"corecrux-curator-clustering-spike-2026-07-07","st":0,"d":2,"t":3,"b":61,"e":61,"o":0},{"s":"corecrux-event-lane-rrf-wiring-2026-05-24","st":0,"d":0,"t":8,"b":17,"e":17,"o":0},{"s":"context-custody-surface-2026-06-30","st":0,"d":0,"t":1,"b":54,"e":54,"o":6},{"s":"context-dependence-benchmark-scorecrux-2026-07-03","st":0,"d":1,"t":7,"b":56,"e":57,"o":15},{"s":"corecrux-fleet-control-plane-2026-07-03","st":1,"d":1,"t":7,"b":64,"e":64,"o":2},{"s":"codexclaw-deterministic-gate-orchestration-2026-05-26","st":0,"d":1,"t":8,"b":19,"e":35,"o":0},{"s":"chaincrux-cascade-route-integration-2026-05-25","st":0,"d":4,"t":8,"b":18,"e":21,"o":0},{"s":"ccxi-query-shape-routing-2026-06-30","st":1,"d":4,"t":6,"b":54,"e":54,"o":3},{"s":"audit-ii-gap-closure-hardening-2026-06-14","st":0,"d":0,"t":10,"b":47,"e":47,"o":33},{"s":"ast-polyglot-code-graph-and-repo-watch-2026-07-08","st":0,"d":10,"t":10,"b":62,"e":63,"o":2},{"s":"audit-ii-operational-hardening-rollout-2026-06-14","st":0,"d":10,"t":10,"b":38,"e":38,"o":0},{"s":"atlas-manifest-routing-production-2026-06-05","st":0,"d":11,"t":11,"b":29,"e":64,"o":90},{"s":"agent-ux-02-acknowledged-memory-use-2026-05-27","st":0,"d":4,"t":4,"b":20,"e":20,"o":0},{"s":"agent-native-noise-reduction-2026-06-08","st":1,"d":0,"t":8,"b":32,"e":65,"o":90},{"s":"agent-ux-03-freshness-decay-2026-05-27","st":0,"d":5,"t":6,"b":20,"e":20,"o":0},{"s":"agent-query-eval-corpus-2026-06-07","st":0,"d":0,"t":6,"b":31,"e":31,"o":0},{"s":"agent-ux-best-in-class-master-2026-05-27","st":0,"d":1,"t":9,"b":20,"e":21,"o":0},{"s":"agent-ux-08-identity-continuity-2026-05-27","st":0,"d":3,"t":5,"b":21,"e":21,"o":0},{"s":"agent-ux-05-risk-tiered-hitl-2026-05-27","st":0,"d":3,"t":6,"b":21,"e":21,"o":0},{"s":"agent-ux-07-verifiable-output-receipts-2026-05-27","st":0,"d":5,"t":6,"b":21,"e":21,"o":0},{"s":"agent-ux-04-source-linked-traceability-2026-05-27","st":0,"d":3,"t":5,"b":20,"e":21,"o":0},{"s":"agent-ux-06-typed-action-traces-2026-05-27","st":0,"d":5,"t":8,"b":20,"e":20,"o":0},{"s":"agent-ux-11-byo-audit-trail-2026-05-27","st":1,"d":4,"t":6,"b":20,"e":20,"o":0},{"s":"agent-query-eval-lanes-on-retest-2026-06-08","st":0,"d":0,"t":5,"b":32,"e":33,"o":0},{"s":"agent-ux-10-visible-autonomy-contract-2026-05-27","st":0,"d":2,"t":6,"b":20,"e":20,"o":0},{"s":"amr-lane-authority-credit-gating-2026-06-07","st":1,"d":2,"t":7,"b":31,"e":32,"o":0},{"s":"agent-config-wizard-2026-05-19","st":0,"d":3,"t":8,"b":12,"e":12,"o":5},{"s":"agent-ux-01-readable-editable-memory-2026-05-27","st":0,"d":4,"t":4,"b":20,"e":20,"o":0},{"s":"agent-harness-testbench-messyworld-2026-06-18","st":1,"d":0,"t":7,"b":41,"e":65,"o":94},{"s":"agent-ux-12-calm-deferred-output-2026-05-27","st":0,"d":0,"t":6,"b":21,"e":21,"o":0},{"s":"agent-ux-09-scoped-forget-2026-05-27","st":0,"d":2,"t":5,"b":20,"e":20,"o":0}];
+
+/* ── plumbing ── */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+const REDUCED = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const MONO = "'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace";
+const ss = t => t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t);
+const mix = (a, b, k) => a + (b - a) * k;
+const TAU = Math.PI * 2;
+function hex2rgba(hex, a) {
+  const n = parseInt(hex.slice(1), 16);
+  return 'rgba(' + (n >> 16 & 255) + ',' + (n >> 8 & 255) + ',' + (n & 255) + ',' + Math.max(0, Math.min(1, a)) + ')';
+}
+const tip = document.getElementById('tip');
+function showTip(x, y, html) {
+  tip.innerHTML = html;
+  const pad = 14, w = tip.offsetWidth || 220;
+  tip.style.left = Math.min(x + pad, innerWidth - w - 10) + 'px';
+  tip.style.top = (y + pad + tip.offsetHeight > innerHeight ? y - tip.offsetHeight - 8 : y + pad) + 'px';
+  tip.style.opacity = 1;
+}
+function hideTip() { tip.style.opacity = 0; }
+
+/* ── time base: day 0 = 2026-05-07 ── */
+const NOW = 76;                                    /* 2026-07-22 */
+function dayDate(d) {
+  return new Date(Date.UTC(2026, 4, 7) + d * 86400000).toISOString().slice(0, 10);
+}
+
+/* ── dataset ── */
+const KIND_HUE = { gate: '#2dd4bf', decision: '#a78bfa', memory: '#8b96f2', handoff: '#f5a623', incident: '#ef4444' };
+const STATE = { 0: 'complete', 1: 'in_progress', 2: 'blocked' };
+const PARK_DAYS = 18;                              /* WorkItem.stale semantics */
+
+const PLANS = PLANS_RAW.map((p, i) => {
+  const short = p.s.replace(/-2026-\d\d-\d\d$/, '').replace(/-2026$/, '');
+  /* exit day: complete → e + 1.5; in_progress/blocked → park at e + PARK_DAYS (never if recent) */
+  const exit = p.st === 0 ? p.e + 1.5 : (NOW - p.e > PARK_DAYS ? p.e + PARK_DAYS : Infinity);
+  return { i, slug: p.s, short, st: p.st, done: p.d, total: p.t || 1, b: Math.max(0, p.b), e: p.e, o: p.o, exit,
+           traced: p.s.startsWith('crux-daemon-buyer-fit') || p.s.startsWith('cross-site-auth-sso') };
+});
+
+/* real facts for the two traced plans (day = 67 + offset from Jul 13) */
+const J13 = 67;                                    /* 2026-07-13 as day index */
+const RFACTS = [
+  ['sso', 'brief', 'memory', 0.920, 'codex-work', 'medium', 205, 1],
+  ['sso', 'gate:M0', 'gate', 0.936, 'codex-work', 'medium', 205, 1],
+  ['sso', 'decision:topology-corrected-cruxengine', 'decision', 0.948, 'codex-work', 'medium', 207, 1],
+  ['sso', 'milestone:M1-partial', 'memory', 0.990, 'codex-work', 'medium', 275, 1],
+  ['bf', 'gate:M0', 'gate', 1.356, 'codex-work', 'stable', 412, 1],
+  ['sso', 'gate:M1', 'gate', 1.381, 'codex-work', 'medium', 296, 1],
+  ['sso', 'gate:M2', 'gate', 1.649, 'codex-work', 'medium', 236, 1],
+  ['bf', 'gate:M1', 'gate', 1.669, 'codex-work', 'stable', 536, 1],
+  ['sso', 'gate:M3-M4', 'gate', 1.829, 'codex-work', 'medium', 328, 1],
+  ['bf', 'gate:M2', 'gate', 1.847, 'codex-work', 'stable', 463, 1],
+  ['bf', 'gate:M4', 'gate', 1.858, 'codex-work', 'stable', 409, 1],
+  ['bf', 'handoff:2026-07-14', 'handoff', 1.882, 'codex-work', 'stable', 409, 1],
+  ['sso', 'console-v1-removed', 'memory', 1.892, 'codex-work', 'medium', 288, 1],
+  ['bf', 'progress:M3', 'memory', 1.909, 'codex-work', 'volatile', 274, 1],
+  ['bf', 'gate:M3', 'gate', 1.951, 'codex-work', 'stable', 316, 1],
+  ['bf', 'gate:M3', 'gate', 2.032, 'codex-work', 'stable', 215, 2],
+  ['sso', 'console-v1-removed-followup-done', 'memory', 2.891, 'codex-work', 'medium', 329, 1],
+  ['sso', 'gate:M1-R-code', 'gate', 8.597, 'claude-work', 'medium', 127, 1],
+  ['sso', 'decision:vault-target-regression-repair', 'decision', 8.597, 'claude-work', 'stable', 155, 1],
+  ['bf', 'gate:M5b', 'gate', 9.367, 'claude-work', 'stable', 184, 1],
+  ['bf', 'decision:m5b-installer-transaction', 'decision', 9.367, 'claude-work', 'stable', 232, 1],
+];
+
+/* cells: real for traced plans, milestone-derived for the rest */
+const cells = [];
+(function makeCells() {
+  const rr = mulberry32(0xC4C4);
+  for (const p of PLANS) {
+    if (p.traced) {
+      const tag = p.slug.startsWith('crux-daemon-buyer-fit') ? 'bf' : 'sso';
+      for (const r of RFACTS) {
+        if (r[0] !== tag) continue;
+        cells.push({ p, key: r[1], kind: r[2], day: J13 + r[3], actor: r[4], horizon: r[5],
+                     tokens: r[6], version: r[7], real: true, ja: rr(), jr: rr() });
+      }
+      continue;
+    }
+    const span = Math.max(0.5, p.e - p.b);
+    const nGates = Math.min(p.done, 12);
+    for (let m = 0; m < nGates; m++) {
+      cells.push({ p, key: 'gate:M' + m, kind: 'gate', day: p.b + span * ((m + 1) / (nGates + 1)),
+                   real: false, ja: rr(), jr: rr() });
+    }
+    const nMem = Math.max(1, Math.min(6, Math.round(span / 6) + (p.o > 0 ? 2 : 0)));
+    for (let m = 0; m < nMem; m++) {
+      const kinds = ['memory', 'memory', 'decision'];
+      const kk = kinds[Math.floor(rr() * 3)];
+      cells.push({ p, key: kk, kind: kk, day: p.b + span * rr(),
+                   real: false, ja: rr(), jr: rr() });
+    }
+  }
+  /* per-plan draw list, oldest LAST (so older bars paint on top);
+     day-rank drives the clockwise in-sector spread */
+  for (const p of PLANS) {
+    p.cells = cells.filter(c => c.p === p).sort((a, b) => b.day - a.day);
+    const asc = [...p.cells].sort((a, b) => a.day - b.day);
+    asc.forEach((c, k) => { c.rank = k; c.n = asc.length; });
+    /* rim token profile: 18 bins across the plan's life, spend mass from cells */
+    const rr2 = mulberry32(0xB0B0 + p.i);
+    const NB = 18;
+    p.tok = new Array(NB).fill(0);
+    const span = Math.max(0.5, p.e - p.b);
+    for (const c of asc) {
+      const bin = Math.min(NB - 1, Math.floor(((c.day - p.b) / span) * NB));
+      p.tok[bin] += (c.kind === 'gate' ? 3 : c.kind === 'decision' ? 2 : 1) + (c.tokens ? c.tokens / 250 : 0);
+    }
+    for (let i = 0; i < NB; i++) p.tok[i] += rr2() * 0.6;
+    const mx2 = Math.max(...p.tok, 0.001);
+    for (let i = 0; i < NB; i++) p.tok[i] /= mx2;
+    /* height scale: heavier plans (output tokens) get taller rim charts */
+    p.tokScale = 0.35 + 0.65 * Math.min(1, Math.log(1 + p.o) / Math.log(81));
+  }
+})();
+
+/* ── view state ── */
+let rot = 0, spinning = !REDUCED, resetTween = false;
+let mode = 'dots';                                 /* dots | bars */
+let dir = 'out';                                   /* out: rings grow from centre · in: nodes sink from rim */
+let S = 11, E = NOW, T = NOW;                      /* window + playhead (days) */
+let playing = false;
+let Z = 1, panX = 0, panY = 0;
+let hover = null, pinned = null;
+let mxAbs = 0, myAbs = 0;
+let dragging = false, dragMoved = 0, lastPX = 0, lastPY = 0;
+const flashes = [];                                /* {ang0, ang1, r, hue, t0} exit/enter flashes */
+
+const bSpin = document.getElementById('b-spin');
+const bClock = document.getElementById('b-clock');
+const bMode = document.getElementById('b-mode');
+const bPlay = document.getElementById('b-play');
+const rStart = document.getElementById('r-start');
+const rEnd = document.getElementById('r-end');
+const rTime = document.getElementById('r-time');
+const cDate = document.getElementById('c-date');
+
+/* ── active set + animated sector layout ── */
+/* each plan: lay = {a0, a1, alpha} lerped toward targets */
+const SEAM = 0.10;                                 /* gap at 12 o'clock */
+const BASE = -Math.PI / 2 + SEAM / 2;              /* 12:01 */
+function activePlans(t) {
+  return PLANS.filter(p => p.b <= t && t < p.exit && p.e >= S - 0.001 && p.b <= E);
+}
+function layoutTargets(t) {
+  const act = activePlans(t).sort((a, b) => b.b - a.b || a.i - b.i);  /* newest first */
+  const width = (TAU - SEAM) / Math.max(1, act.length);
+  const out = new Map();
+  act.forEach((p, k) => out.set(p.i, { a0: BASE + k * width, a1: BASE + (k + 1) * width }));
+  return out;
+}
+function stepLayout(dt) {
+  const targets = layoutTargets(T);
+  const k = REDUCED ? 1 : Math.min(1, dt * 7);
+  for (const p of PLANS) {
+    const tg = targets.get(p.i);
+    if (tg) {
+      if (!p.lay) {                                /* enter: bloom from target mid */
+        const mid = (tg.a0 + tg.a1) / 2;
+        p.lay = { a0: mid, a1: mid, alpha: 0 };
+        flashes.push({ kind: 'enter', ang: mid, t0: performance.now() / 1000, hue: '#8b96f2' });
+      }
+      p.lay.a0 = mix(p.lay.a0, tg.a0, k);
+      p.lay.a1 = mix(p.lay.a1, tg.a1, k);
+      p.lay.alpha = mix(p.lay.alpha, 1, k);
+    } else if (p.lay) {                            /* exit: collapse + flash once */
+      if (!p.lay.exiting) {
+        p.lay.exiting = true;
+        const mid = (p.lay.a0 + p.lay.a1) / 2;
+        const hue = p.st === 0 ? '#2dd4bf' : p.st === 2 ? '#ef4444' : '#7e8595';
+        flashes.push({ kind: 'exit', ang: mid, t0: performance.now() / 1000, hue });
+      }
+      const mid = (p.lay.a0 + p.lay.a1) / 2;
+      p.lay.a0 = mix(p.lay.a0, mid, k);
+      p.lay.a1 = mix(p.lay.a1, mid, k);
+      p.lay.alpha = mix(p.lay.alpha, 0, k);
+      if (p.lay.alpha < 0.02) p.lay = null;
+    }
+    if (p.lay && !targets.get(p.i)) { /* keep exiting */ }
+    else if (p.lay) p.lay.exiting = false;
+  }
+}
+
+/* ── stage ── */
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+let W = 0, H = 0, visible = true, rafId = null, lastT = performance.now();
+function resize() {
+  const r = cv.getBoundingClientRect(), dpr = Math.min(devicePixelRatio || 1, 2);
+  W = r.width; H = r.height;
+  cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+new ResizeObserver(resize).observe(cv);
+new IntersectionObserver(es => { visible = es[0].isIntersecting; }, { rootMargin: '60px' }).observe(cv);
+
+const EPOCH_RINGS = 10;
+function geom() {
+  const cx = W / 2, cy = H / 2;
+  const R = Math.min(W * 0.9, H * 0.78) * 0.44;
+  const r0 = R * 0.13;
+  return { cx, cy, R, r0 };
+}
+/* radius for a day within [S, E].
+   out: radius fixed by birth time — early inner, late outer, edge sweeps out.
+   in : radius by AGE at T — born at the rim, sinks toward the heartwood.   */
+function dayR(g, day) {
+  if (dir === 'in') {
+    const age = Math.max(0, Math.min(1, (T - day) / Math.max(0.5, E - S)));
+    return g.r0 + (g.R - g.r0) * (0.96 - 0.88 * age);
+  }
+  const f = Math.max(0, Math.min(1, (day - S) / Math.max(0.5, E - S)));
+  return g.r0 + (g.R - g.r0) * (0.08 + 0.88 * f);
+}
+/* disc → screen */
+function toScreen(g, x, y) {
+  const c = Math.cos(rot), s = Math.sin(rot);
+  return { x: g.cx + panX + (x * c - y * s) * Z, y: g.cy + panY + (x * s + y * c) * Z };
+}
+/* screen → disc */
+function toDisc(g, sx, sy) {
+  const ux = (sx - g.cx - panX) / Z, uy = (sy - g.cy - panY) / Z;
+  const c = Math.cos(-rot), s = Math.sin(-rot);
+  return { x: ux * c - uy * s, y: ux * s + uy * c };
+}
+
+function cellPos(g, c) {
+  if (!c.p.lay) return null;
+  /* clockwise by day order: earliest at the sector's leading edge */
+  const frac = c.n > 1 ? (c.rank + 0.5) / c.n : 0.5;
+  const a = c.p.lay.a0 + (c.p.lay.a1 - c.p.lay.a0) * (0.06 + 0.88 * frac);
+  const r = dayR(g, c.day) * (0.995 + c.jr * 0.01);
+  return { a, r, x: Math.cos(a) * r, y: Math.sin(a) * r };
+}
+function dotR(c) {
+  return (c.real ? 3.4 + (c.tokens || 200) / 260 : c.kind === 'gate' ? 3.2 : 2.6);
+}
+
+function draw(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000); lastT = now;
+  const time = now / 1000;
+  if (spinning && !REDUCED && !resetTween) rot += dt * 0.02;
+  if (resetTween) {
+    let target = rot - (((rot % TAU) + TAU) % TAU);           /* nearest full turn below */
+    if (((rot % TAU) + TAU) % TAU > Math.PI) target += TAU;   /* go the short way */
+    rot = mix(rot, target, REDUCED ? 1 : 0.12);
+    if (Math.abs(rot - target) < 0.002) { rot = 0; resetTween = false; }
+  }
+  if (playing) {
+    T += dt * (E - S) / 18;                        /* full window in ~18s */
+    if (T >= E) { T = E; setPlaying(false); }
+    rTime.value = Math.round((T - S) / Math.max(0.5, E - S) * 1000);
+    cDate.textContent = dayDate(T);
+  }
+  stepLayout(dt);
+  const g = geom();
+  ctx.clearRect(0, 0, W, H);
+
+  /* ══ disc frame ══ */
+  ctx.save();
+  ctx.translate(g.cx + panX, g.cy + panY);
+  ctx.scale(Z, Z);
+  ctx.rotate(rot);
+
+  /* epoch rings */
+  for (let i = 1; i <= EPOCH_RINGS; i++) {
+    const r = g.r0 + (g.R - g.r0) * (i / EPOCH_RINGS);
+    ctx.strokeStyle = 'rgba(255,255,255,.09)';
+    ctx.lineWidth = 1 / Z;
+    ctx.beginPath(); ctx.arc(0, 0, r, 0, 7); ctx.stroke();
+  }
+
+  /* seam at 12: the "now" notch */
+  ctx.strokeStyle = 'rgba(139,150,242,.6)';
+  ctx.lineWidth = 1.5 / Z;
+  ctx.beginPath();
+  ctx.moveTo(Math.cos(-Math.PI / 2) * g.r0 * 0.9, Math.sin(-Math.PI / 2) * g.r0 * 0.9);
+  ctx.lineTo(Math.cos(-Math.PI / 2) * (g.R + 10), Math.sin(-Math.PI / 2) * (g.R + 10));
+  ctx.stroke();
+
+  /* sectors */
+  ctx.lineWidth = 1 / Z;
+  for (const p of PLANS) {
+    if (!p.lay || p.lay.alpha < 0.02) continue;
+    const L = p.lay, al = L.alpha;
+    const wSec = L.a1 - L.a0;
+    /* divider */
+    ctx.strokeStyle = 'rgba(255,255,255,' + 0.06 * al + ')';
+    ctx.beginPath();
+    ctx.moveTo(Math.cos(L.a0) * g.r0, Math.sin(L.a0) * g.r0);
+    ctx.lineTo(Math.cos(L.a0) * g.R, Math.sin(L.a0) * g.R);
+    ctx.stroke();
+    /* rim progress arc */
+    const hue = p.st === 2 ? '#ef4444' : p.st === 0 ? '#2dd4bf' : '#f5a623';
+    ctx.strokeStyle = hex2rgba(hue, 0.6 * al);
+    ctx.lineWidth = 2 / Z;
+    ctx.beginPath(); ctx.arc(0, 0, g.R + 4, L.a0 + 0.01, L.a0 + Math.max(0.02, (wSec - 0.02) * (p.done / p.total))); ctx.stroke();
+    ctx.lineWidth = 1 / Z;
+    /* blocked pulse on rim */
+    if (p.st === 2) {
+      const pulse = REDUCED ? 0.5 : 0.35 + 0.3 * Math.sin(time * 4);
+      ctx.strokeStyle = hex2rgba('#ef4444', pulse * al);
+      ctx.beginPath(); ctx.arc(0, 0, g.R + 8, L.a0 + 0.01, L.a1 - 0.01); ctx.stroke();
+    }
+    /* rim token chart: sector start = tracking start, sector end = current.
+       radial ticks on [R+7, R+7+h] — a circular barcode of spend */
+    {
+      const NB = p.tok.length;
+      const eEff = Math.min(T, p.e + 0.001);
+      const life = Math.max(0.5, p.e - p.b);
+      const aPad = Math.min(0.02, wSec * 0.08);
+      for (let bIdx = 0; bIdx < NB; bIdx++) {
+        const binT = p.b + life * ((bIdx + 1) / NB);
+        if (binT > eEff) break;
+        const ba = L.a0 + aPad + (wSec - 2 * aPad) * ((bIdx + 0.5) / NB);
+        const hTok = (2 + p.tok[bIdx] * 12 * p.tokScale) / Math.max(1, Math.sqrt(Z));
+        ctx.strokeStyle = hex2rgba(hue, 0.42 * al);
+        ctx.lineWidth = Math.max(1, (wSec - 2 * aPad) / NB * g.R * 0.5) ;
+        ctx.beginPath();
+        ctx.moveTo(Math.cos(ba) * (g.R + 7), Math.sin(ba) * (g.R + 7));
+        ctx.lineTo(Math.cos(ba) * (g.R + 7 + hTok), Math.sin(ba) * (g.R + 7 + hTok));
+        ctx.stroke();
+      }
+      ctx.lineWidth = 1 / Z;
+    }
+    /* label if wide enough on screen — the plan heading */
+    if (wSec * g.R * Z > 46) {
+      const midA = (L.a0 + L.a1) / 2, lr = g.R + 26;
+      ctx.save();
+      ctx.translate(Math.cos(midA) * lr, Math.sin(midA) * lr);
+      ctx.rotate(midA + (Math.cos(midA + rot) < 0 ? Math.PI : 0));
+      ctx.fillStyle = 'rgba(200,206,219,' + 0.95 * al + ')';
+      ctx.font = '700 ' + (12 / Z) + 'px ' + MONO;
+      ctx.textAlign = Math.cos(midA + rot) < 0 ? 'right' : 'left';
+      ctx.textBaseline = 'middle';
+      const lbl = p.short.length > 16 ? p.short.slice(0, 15) + '…' : p.short;
+      ctx.fillText(lbl + ' ' + p.done + '/' + p.total, 0, 0);
+      ctx.restore();
+    }
+    /* bars + dots (older bars painted last = on top) */
+    for (const c of p.cells) {
+      if (c.day > T || c.day < S || c.day > E) continue;
+      const pos = cellPos(g, c);
+      if (!pos) continue;
+      const chue = KIND_HUE[c.kind] || '#8b96f2';
+      const isSel = (hover === c || pinned === c);
+      const age = T - c.day;
+      const pop = REDUCED ? 1 : Math.min(1, age / 0.8);           /* birth pop */
+      const rr = dotR(c) * (isSel ? 1.7 : 1) * (0.4 + 0.6 * pop);
+      if (mode === 'bars') {
+        ctx.strokeStyle = hex2rgba(chue, (0.34 + (c.real ? 0.3 : 0)) * al * pop);
+        ctx.lineWidth = (isSel ? 3.6 : 2.6) / Math.sqrt(Z);
+        ctx.beginPath();
+        ctx.moveTo(Math.cos(pos.a) * g.r0, Math.sin(pos.a) * g.r0);
+        ctx.lineTo(pos.x, pos.y);
+        ctx.stroke();
+      }
+      ctx.fillStyle = hex2rgba(chue, (c.real ? 0.92 : 0.55) * al * pop);
+      if (c.kind === 'gate' && c.real) {
+        ctx.beginPath();
+        ctx.moveTo(pos.x, pos.y - rr - 1); ctx.lineTo(pos.x + rr, pos.y); ctx.lineTo(pos.x, pos.y + rr + 1); ctx.lineTo(pos.x - rr, pos.y);
+        ctx.closePath(); ctx.fill();
+      } else {
+        ctx.beginPath(); ctx.arc(pos.x, pos.y, rr, 0, 7); ctx.fill();
+      }
+      if (c.version > 1) {
+        ctx.strokeStyle = hex2rgba(chue, 0.8 * al);
+        ctx.lineWidth = 1 / Z;
+        ctx.beginPath(); ctx.arc(pos.x, pos.y, rr + 2.5 / Z, 0, 7); ctx.stroke();
+      }
+      if (!REDUCED && age < 0.8) {                 /* birth halo */
+        ctx.strokeStyle = hex2rgba(chue, (1 - age / 0.8) * 0.8);
+        ctx.lineWidth = 1.5 / Z;
+        ctx.beginPath(); ctx.arc(pos.x, pos.y, rr + (age / 0.8) * 14, 0, 7); ctx.stroke();
+      }
+      if (isSel) {
+        ctx.strokeStyle = hex2rgba(chue, 0.95);
+        ctx.lineWidth = 1.5 / Z;
+        ctx.beginPath(); ctx.arc(pos.x, pos.y, rr + 4 / Z, 0, 7); ctx.stroke();
+      }
+      c._x = pos.x; c._y = pos.y; c._a = pos.a; c._r = pos.r; c._dr = rr;
+    }
+  }
+
+  /* live edge: outward mode sweeps with T; inward mode IS the rim */
+  {
+    const er = dir === 'in' ? g.r0 + (g.R - g.r0) * 0.96 : dayR(g, T);
+    if (dir === 'in' || T < E - 0.01) {
+      const grow = REDUCED ? 0.86 : (0.55 + 0.45 * ((time * 0.06) % 1));
+      ctx.strokeStyle = 'rgba(139,150,242,.7)';
+      ctx.lineWidth = 1.6 / Z;
+      ctx.setLineDash([5 / Z, 7 / Z]);
+      ctx.beginPath(); ctx.arc(0, 0, er, -Math.PI / 2, -Math.PI / 2 + TAU * grow); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+
+  /* enter/exit flashes */
+  for (let i = flashes.length - 1; i >= 0; i--) {
+    const f = flashes[i];
+    const k = (time - f.t0) / 1.1;
+    if (k > 1) { flashes.splice(i, 1); continue; }
+    if (REDUCED) continue;
+    const rr = f.kind === 'exit' ? g.R * (1 + k * 0.14) : g.R * (1.14 - k * 0.14);
+    ctx.strokeStyle = hex2rgba(f.hue, (1 - k) * 0.9);
+    ctx.lineWidth = (2.5 * (1 - k) + 0.5) / Z;
+    ctx.beginPath(); ctx.arc(0, 0, rr, f.ang - 0.3 * (1 - k * 0.5), f.ang + 0.3 * (1 - k * 0.5)); ctx.stroke();
+  }
+  ctx.lineWidth = 1;
+
+  /* heartwood */
+  const glow = ctx.createRadialGradient(0, 0, 0, 0, 0, g.r0 * 1.5);
+  glow.addColorStop(0, 'rgba(139,150,242,.5)');
+  glow.addColorStop(1, 'transparent');
+  ctx.fillStyle = glow;
+  ctx.beginPath(); ctx.arc(0, 0, g.r0 * 1.5, 0, 7); ctx.fill();
+  ctx.fillStyle = '#12151d';
+  ctx.beginPath(); ctx.arc(0, 0, g.r0 * 0.7, 0, 7); ctx.fill();
+  ctx.strokeStyle = 'rgba(139,150,242,.85)';
+  ctx.lineWidth = 1 / Z;
+  ctx.beginPath(); ctx.arc(0, 0, g.r0 * 0.7, 0, 7); ctx.stroke();
+  ctx.restore();
+
+  /* ══ screen space ══ */
+  const nAct = activePlans(T).length;
+  ctx.fillStyle = 'rgba(238,240,246,.95)';
+  ctx.font = '600 10.5px ' + MONO;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const core = toScreen(g, 0, 0);
+  ctx.fillText('crux', core.x, core.y - 6);
+  ctx.fillStyle = 'rgba(126,133,149,.9)';
+  ctx.font = '8.5px ' + MONO;
+  ctx.fillText(nAct + ' live', core.x, core.y + 7);
+  ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+
+  /* corner status */
+  ctx.fillStyle = 'rgba(126,133,149,.8)';
+  ctx.font = '9.5px ' + MONO;
+  ctx.fillText(dayDate(S) + ' → ' + dayDate(E) + ' · T = ' + dayDate(T) + ' · ' + nAct + ' live · zoom ' + Z.toFixed(1) + '×', 18, 24);
+
+  /* completed ledger — plans retire off the clock into the left edge */
+  {
+    const doneList = PLANS
+      .filter(p => p.st === 0 && p.exit <= T && p.b <= E && p.e >= S - 0.001)
+      .sort((a, b) => b.exit - a.exit);
+    ctx.font = '700 11px ' + MONO;
+    ctx.fillStyle = 'rgba(45,212,191,.9)';
+    ctx.fillText('completed · ' + doneList.length, 18, 52);
+    ctx.font = '9.5px ' + MONO;
+    const maxRows = Math.floor((H - 140) / 16);
+    doneList.slice(0, maxRows).forEach((p, k) => {
+      const fresh = T - p.exit < 2.0;
+      const y = 70 + k * 16;
+      ctx.fillStyle = fresh ? 'rgba(45,212,191,.95)' : 'rgba(126,133,149,.75)';
+      ctx.fillText('✓', 18, y);
+      ctx.fillStyle = fresh ? 'rgba(238,240,246,.95)' : 'rgba(126,133,149,.8)';
+      const lbl = p.short.length > 26 ? p.short.slice(0, 25) + '…' : p.short;
+      ctx.fillText(lbl, 32, y);
+      ctx.fillStyle = 'rgba(126,133,149,.55)';
+      ctx.fillText(dayDate(p.exit).slice(5), 32 + 27 * 6.0, y);
+    });
+    if (doneList.length > maxRows) {
+      ctx.fillStyle = 'rgba(126,133,149,.6)';
+      ctx.fillText('… +' + (doneList.length - maxRows) + ' more', 18, 70 + maxRows * 16);
+    }
+  }
+
+  /* cards: pinned only (zoom LOD cards disabled for now) */
+  const cardTargets = [];
+  if (pinned && pinned._x !== undefined && pinned.p.lay) {
+    const sp = toScreen(g, pinned._x, pinned._y);
+    if (!cardTargets.some(t => t.c === pinned)) cardTargets.push({ c: pinned, sp, pin: true });
+  }
+  /* de-overlap: sort by y, push a card below any placed card it intersects */
+  cardTargets.sort((a, b) => a.sp.y - b.sp.y);
+  const placed = [];
+  for (const t of cardTargets) {
+    const wC = 172, hC = t.c.real ? 58 : 44;
+    let x = t.sp.x + 12;
+    if (x + wC > W - 8) x = t.sp.x - wC - 12;
+    let y = Math.max(8, Math.min(H - hC - 8, t.sp.y - hC / 2));
+    for (const r of placed) {
+      if (x < r.x + r.w + 6 && x + wC > r.x - 6 && y < r.y + r.h + 4 && y + hC > r.y - 4) {
+        y = r.y + r.h + 5;
+      }
+    }
+    if (y + hC > H - 8) continue;               /* no room — skip rather than pile up */
+    placed.push({ x, y, w: wC, h: hC });
+    drawCard(t.c, t.sp, t.pin, x, y, wC, hC);
+  }
+
+  rafId = null;
+  if (visible && !document.hidden) rafId = requestAnimationFrame(draw);
+}
+function drawCard(c, sp, pin, x, y, wC, hC) {
+  const hue = KIND_HUE[c.kind] || '#8b96f2';
+  /* leader */
+  ctx.strokeStyle = hex2rgba(hue, 0.5);
+  ctx.beginPath(); ctx.moveTo(sp.x, sp.y); ctx.lineTo(x < sp.x ? x + wC : x, y + hC / 2); ctx.stroke();
+  /* card: console surface/edge/radius vocabulary */
+  ctx.fillStyle = 'rgba(18,20,29,.96)';
+  ctx.strokeStyle = pin ? hex2rgba(hue, 0.8) : 'rgba(255,255,255,.14)';
+  ctx.beginPath();
+  ctx.roundRect(x, y, wC, hC, 10);
+  ctx.fill(); ctx.stroke();
+  ctx.fillStyle = hue;
+  ctx.beginPath(); ctx.arc(x + 12, y + 14, 3, 0, 7); ctx.fill();
+  ctx.fillStyle = 'rgba(238,240,246,.95)';
+  ctx.font = '600 10px ' + MONO;
+  const key = c.key.length > 22 ? c.key.slice(0, 21) + '…' : c.key;
+  ctx.fillText(key + (c.version > 1 ? ' v' + c.version : ''), x + 22, y + 17);
+  ctx.fillStyle = 'rgba(126,133,149,.9)';
+  ctx.font = '9px ' + MONO;
+  const slug = c.p.short.length > 26 ? c.p.short.slice(0, 25) + '…' : c.p.short;
+  ctx.fillText(slug, x + 22, y + 30);
+  if (c.real) {
+    ctx.fillText(c.actor + ' · ' + dayDate(c.day) + ' · ' + c.horizon, x + 22, y + 43);
+  }
+}
+
+/* kick */
+function kick() { if (rafId === null) rafId = requestAnimationFrame(draw); }
+document.addEventListener('visibilitychange', kick);
+kick();
+
+/* ── controls ── */
+function setPlaying(v) {
+  playing = v;
+  bPlay.textContent = v ? 'pause' : 'play';
+  bPlay.setAttribute('aria-pressed', String(v));
+}
+bPlay.addEventListener('click', () => {
+  if (!playing && T >= E - 0.01) T = S;            /* replay from window start */
+  setPlaying(!playing);
+});
+bSpin.addEventListener('click', () => {
+  spinning = !spinning;
+  bSpin.setAttribute('aria-pressed', String(spinning));
+});
+bClock.addEventListener('click', () => { resetTween = true; });
+bMode.addEventListener('click', () => {
+  mode = mode === 'dots' ? 'bars' : 'dots';
+  bMode.setAttribute('aria-pressed', String(mode === 'bars'));
+});
+const bDir = document.getElementById('b-dir');
+bDir.addEventListener('click', () => {
+  dir = dir === 'out' ? 'in' : 'out';
+  bDir.textContent = dir === 'out' ? 'edge: outward' : 'edge: inward';
+  bDir.setAttribute('aria-pressed', String(dir === 'in'));
+});
+function syncWindow() {
+  const s = Math.min(rStart.value / 1000, rEnd.value / 1000 - 0.03);
+  const e = Math.max(rEnd.value / 1000, rStart.value / 1000 + 0.03);
+  S = 11 + s * (NOW - 11);
+  E = 11 + e * (NOW - 11);
+  T = Math.max(S, Math.min(E, T));
+  rTime.value = Math.round((T - S) / Math.max(0.5, E - S) * 1000);
+  cDate.textContent = dayDate(T);
+}
+rStart.addEventListener('input', syncWindow);
+rEnd.addEventListener('input', syncWindow);
+rTime.addEventListener('input', () => {
+  T = S + (rTime.value / 1000) * (E - S);
+  setPlaying(false);
+  cDate.textContent = dayDate(T);
+});
+
+/* zoom + pan */
+function zoomAt(sx, sy, factor) {
+  const g = geom();
+  const before = toDisc(g, sx, sy);
+  Z = Math.max(0.6, Math.min(7, Z * factor));
+  const after = toScreen(g, before.x, before.y);
+  panX += sx - after.x; panY += sy - after.y;
+}
+cv.addEventListener('wheel', e => {
+  e.preventDefault();
+  const r = cv.getBoundingClientRect();
+  zoomAt(e.clientX - r.left, e.clientY - r.top, e.deltaY < 0 ? 1.15 : 1 / 1.15);
+}, { passive: false });
+document.getElementById('b-zin').addEventListener('click', () => zoomAt(W / 2, H / 2, 1.35));
+document.getElementById('b-zout').addEventListener('click', () => zoomAt(W / 2, H / 2, 1 / 1.35));
+document.getElementById('b-zfit').addEventListener('click', () => { Z = 1; panX = panY = 0; });
+
+cv.addEventListener('pointerdown', e => {
+  dragging = true; dragMoved = 0;
+  lastPX = e.clientX; lastPY = e.clientY;
+  cv.setPointerCapture(e.pointerId);
+});
+cv.addEventListener('pointerup', e => {
+  dragging = false;
+  if (dragMoved < 5) handleClick(e);
+});
+cv.addEventListener('pointermove', e => {
+  mxAbs = e.clientX; myAbs = e.clientY;
+  if (dragging) {
+    const dx = e.clientX - lastPX, dy = e.clientY - lastPY;
+    dragMoved += Math.abs(dx) + Math.abs(dy);
+    if (dragMoved > 5) { panX += dx; panY += dy; }
+    lastPX = e.clientX; lastPY = e.clientY;
+    return;
+  }
+  hover = hitTest(e);
+  if (hover) {
+    const c = hover;
+    showTip(mxAbs, myAbs, c.real
+      ? '<b>' + c.key + '</b>' + (c.version > 1 ? ' <span class="k">v' + c.version + '</span>' : '') + '<br>' +
+        '<span class="k">plan</span> ' + c.p.short + '<br>' +
+        '<span class="k">stored</span> ' + dayDate(c.day) + ' <span class="k">by</span> ' + c.actor + '<br>' +
+        '<span class="k">kind</span> ' + c.kind + ' · <span class="k">horizon</span> ' + c.horizon
+      : '<b>' + c.p.short + '</b><br>' +
+        '<span class="k">' + STATE[c.p.st] + ' · ' + c.p.done + '/' + c.p.total + ' · born ' + dayDate(c.p.b) + '</span><br>' +
+        '<span class="k">' + (c.kind === 'gate' ? c.key : 'untraced density — one query_facts call away') + '</span>');
+  } else hideTip();
+});
+cv.addEventListener('pointerleave', () => { hover = null; hideTip(); });
+
+function hitTest(e) {
+  const r = cv.getBoundingClientRect();
+  const g = geom();
+  const p = toDisc(g, e.clientX - r.left, e.clientY - r.top);
+  const pr = Math.hypot(p.x, p.y);
+  const pa = Math.atan2(p.y, p.x);
+  let best = null, bd = 10 / Z;
+  for (const c of cells) {
+    if (c._x === undefined || c.day > T || !c.p.lay || c.p.lay.alpha < 0.3) continue;
+    const d = Math.hypot(c._x - p.x, c._y - p.y);
+    if (d < bd + c._dr) { bd = d; best = c; }
+    if (mode === 'bars' && !best) {
+      /* radial bar hit: same angle (within ~3px arc), radius within [r0, cellR] */
+      let da = pa - c._a;
+      while (da > Math.PI) da -= TAU;
+      while (da < -Math.PI) da += TAU;
+      if (Math.abs(da) * pr < 4 / Z && pr > g.r0 - 2 && pr < c._r + c._dr) best = c;
+    }
+  }
+  return best;
+}
+function handleClick(e) {
+  const hit = hitTest(e);
+  pinned = (hit === pinned) ? null : hit;
+}
+addEventListener('keydown', e => { if (e.key === 'Escape') pinned = null; });
+
+/* init */
+syncWindow();
+})();
+</script>
