@@ -2,29 +2,83 @@ name: Python SDK
 
 on:
   push:
-    tags: ['v*']
+    tags:
+      - 'v*'
+      - 'sdk-python-v*'
+  pull_request:
+    paths:
+      - 'sdks/python/**'
+      - '.github/workflows/sdk-python.yml'
   workflow_dispatch:
 
+# Build/test runs never receive registry-write OIDC permission. Only an
+# explicit sdk-python-vX.Y.Z tag can start the publish job below.
+permissions:
+  contents: read
+
 jobs:
-  build-and-publish:
-    name: Build & Publish
-    runs-on: [self-hosted, ci]
-    # PyPI Trusted Publishing (OIDC) — no PYPI_TOKEN secret. Requires a
-    # (pending) trusted publisher on pypi.org for project `corecrux-client`:
-    # owner CueCrux, repository Crux, workflow sdk-python.yml.
-    permissions:
-      contents: read
-      id-token: write
+  build:
+    name: Build reproducibly
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdks/python
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - run: pip install build
-        working-directory: sdks/python
-      - run: python -m build
-        working-directory: sdks/python
+      - name: Require SDK tag to match package version
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/sdk-python-v')
+        run: |
+          set -euo pipefail
+          package_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          tag_version="${GITHUB_REF_NAME#sdk-python-v}"
+          if [[ "$tag_version" != "$package_version" ]]; then
+            echo "::error::SDK tag version $tag_version does not match pyproject.toml version $package_version"
+            exit 1
+          fi
+      - name: Install pinned build toolchain
+        run: python -m pip install 'build==1.5.0' 'hatchling==1.31.0'
+      - name: Build twice and verify reproducibility
+        run: |
+          set -euo pipefail
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          first="${RUNNER_TEMP}/python-sdk-build-first"
+          second="${RUNNER_TEMP}/python-sdk-build-second"
+          rm -rf "$first" "$second" dist
+          mkdir -p "$first" "$second" dist
+          python -m build --no-isolation --outdir "$first"
+          python -m build --no-isolation --outdir "$second"
+          (cd "$first" && sha256sum *) >"${RUNNER_TEMP}/python-sdk-first.sha256"
+          (cd "$second" && sha256sum *) >"${RUNNER_TEMP}/python-sdk-second.sha256"
+          diff -u "${RUNNER_TEMP}/python-sdk-first.sha256" "${RUNNER_TEMP}/python-sdk-second.sha256"
+          cp "$first"/* dist/
+      - name: Upload built distributions
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-sdk-${{ github.sha }}
+          path: sdks/python/dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish to PyPI
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/sdk-python-v')
+    needs: build
+    runs-on: ubuntu-latest
+    # PyPI Trusted Publishing (OIDC) — no PYPI_TOKEN secret. The package
+    # version remains immutable: duplicate uploads fail closed.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download verified build
+        uses: actions/download-artifact@v8
+        with:
+          name: python-sdk-${{ github.sha }}
+          path: sdks/python/dist
       - name: Publish to PyPI (OIDC)
-        uses: pypa/gh-action-pypi-publish@v1.14.1 # immutable version tag (Docker action: image is published per version tag, NOT per commit SHA → SHA-pin gives manifest-unknown)
+        uses: pypa/gh-action-pypi-publish@v1.14.1 # Docker action version tag; SHA pins are not published manifests
         with:
           packages-dir: sdks/python/dist

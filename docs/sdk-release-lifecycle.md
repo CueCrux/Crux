@@ -14,11 +14,11 @@ it never publishes anything, and adopting it is gated (see "Adoption gates").
 
 - **Semver, strictly.** Breaking change to a public type, function signature,
   default, or wire expectation → major. Additive → minor. Fix → patch.
-- SDK versions are **decoupled from the daemon version**. Today both SDKs
-  publish on the daemon's `v*` tag (`sdk-typescript.yml`, `sdk-python.yml`);
-  that trigger is convenient but the *package* version in
-  `package.json`/`pyproject.toml` is the source of truth — a daemon release
-  with no SDK changes must not bump or republish the SDKs.
+- SDK versions are **decoupled from the daemon version**. Daemon `v*` tags
+  build and package both SDKs but never receive registry-write permission.
+  Publishing requires an explicit `sdk-python-vX.Y.Z` or
+  `sdk-typescript-vX.Y.Z` tag, and the tag must exactly match the package
+  version in `pyproject.toml`/`package.json`.
 - Each SDK declares the **API version it was generated/tested against** in
   its README and in package metadata, pinned to the daemon's
   `/v1/openapi.json` at the release commit. Generated clients are regenerated
@@ -64,13 +64,18 @@ tag-triggered and self-hosted); do not add new token-secret publish jobs.
 1. Bump version + changelog entry in the SDK directory (PR, normal review).
 2. Regenerate from `/v1/openapi.json` if the daemon API moved; commit the
    regenerated client in the same PR with the API version pin updated.
-3. Tests green in CI (`sdk-*.yml` build steps run on every tag; PR CI must
-   cover them too).
-4. Tag push (daemon release) or `workflow_dispatch` for an SDK-only release.
+3. Tests and reproducible packaging green in PR CI. Daemon tags repeat the
+   build/package job but skip the publish job.
+4. Push `sdk-python-vX.Y.Z` or `sdk-typescript-vX.Y.Z`. A manual dispatch
+   is build-only and cannot publish.
 5. Post-publish: `npm audit signatures` / check the PyPI attestation badge;
    yank only for malware/credential incidents — broken releases are
    superseded by a patch, never unpublished (matches the binary-release
    supersede-never-delete rule).
+
+Registry immutability is fail-closed. Do not use `skip-existing`: a matching
+filename/version does not prove artifact identity and could hide an SDK source
+change that was not accompanied by a version bump.
 
 ## Adoption gates (operator actions — nothing here is done by docs alone)
 
