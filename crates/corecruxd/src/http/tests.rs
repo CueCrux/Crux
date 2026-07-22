@@ -11046,22 +11046,23 @@ fn mint_test_verified_app_state(action_max_pending: usize) -> AppState {
     state
 }
 
-fn mint_test_verified_headers(scopes: &str, passport_id: &str) -> HeaderMap {
+fn mint_test_jwt_headers(scopes: &str, identity_claim: (&str, &str)) -> HeaderMap {
     let exp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system time after epoch")
         .as_secs()
         .saturating_add(3_600) as usize;
+    let mut claims = serde_json::json!({
+        "exp": exp,
+        "iss": MINT_TEST_ISSUER,
+        "aud": MINT_TEST_AUDIENCE,
+        "scope": scopes,
+        "tenant_id": "default",
+    });
+    claims[identity_claim.0] = serde_json::json!(identity_claim.1);
     let token = jsonwebtoken::encode(
         &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
-        &serde_json::json!({
-            "exp": exp,
-            "iss": MINT_TEST_ISSUER,
-            "aud": MINT_TEST_AUDIENCE,
-            "scope": scopes,
-            "tenant_id": "default",
-            "passport_id": passport_id,
-        }),
+        &claims,
         &jsonwebtoken::EncodingKey::from_secret(MINT_TEST_HS256_SECRET.as_bytes()),
     )
     .expect("mint approval test JWT");
@@ -11071,6 +11072,14 @@ fn mint_test_verified_headers(scopes: &str, passport_id: &str) -> HeaderMap {
         HeaderValue::from_str(&format!("Bearer {token}")).expect("bearer header"),
     );
     headers
+}
+
+fn mint_test_verified_headers(scopes: &str, passport_id: &str) -> HeaderMap {
+    mint_test_jwt_headers(scopes, ("passport_id", passport_id))
+}
+
+fn mint_test_sub_only_headers(scopes: &str, subject: &str) -> HeaderMap {
+    mint_test_jwt_headers(scopes, ("sub", subject))
 }
 
 async fn mint_test_verified_state(
@@ -11826,6 +11835,35 @@ async fn passport_mint_request_rejects_agent_token_as_human_approval() -> Result
         .ok_or_else(|| std::io::Error::other("agent-token pending mint request missing"))?;
     assert_eq!(pending.status, crate::mint_requests::MINT_REQUEST_STATUS_PENDING);
     assert!(crate::passports::get_passport(&store, "requester-a").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn passport_mint_request_rejects_sub_only_jwt_as_human_approval() -> Result<(), Box<dyn std::error::Error>> {
+    let (state, request_id) = mint_test_verified_state("requester-a", "requester-a", Some("work")).await?;
+
+    for approve in [true, false] {
+        let denied = mint_test_resolve(
+            &state,
+            &request_id,
+            mint_test_sub_only_headers("admin:write", "automation-subject"),
+            None,
+            Some("work"),
+            approve,
+        )
+        .await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    }
+
+    assert_eq!(mint_test_observation_count(&state)?, 0);
+    let store = state.fact_store.read().await;
+    let pending = crate::mint_requests::get_mint_request(&store, &request_id)
+        .ok_or_else(|| std::io::Error::other("sub-only JWT pending mint request missing"))?;
+    assert_eq!(pending.status, crate::mint_requests::MINT_REQUEST_STATUS_PENDING);
+    assert_eq!(pending.resolved_by_passport, None);
+    assert_eq!(pending.resolution_receipt_id, None);
+    assert!(crate::passports::get_passport(&store, "requester-a").is_none());
+    assert!(!state.data_dir.join("passports/requester-a.key").exists());
     Ok(())
 }
 
