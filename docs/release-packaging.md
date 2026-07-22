@@ -14,8 +14,10 @@ Each target bundle includes:
   headers); see [docs/LICENCE-FAQ.md](LICENCE-FAQ.md) → "machine-readable
   metadata".
 - `README.md` and `config.example.yaml`.
-- `content/MANIFEST.json`, `content/README.md`, and `content/LICENCE-CONTENT.md`
-  (the content licence, shipped with the assets it governs).
+- `content/MANIFEST.json`, `content/CONTENT-README.md`, and
+  `content/LICENCE-CONTENT.md` (the content guide is renamed while staging so
+  its basename remains distinct in GitHub's flat release-asset namespace; the
+  content licence is shipped with the assets it governs).
 - `RELEASE-MANIFEST-<target>.txt` with SHA-256 checksums for staged files.
 
 `scripts/assert-daemon-release-boundary.sh` verifies the required files, CUDA/GPU

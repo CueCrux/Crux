@@ -259,6 +259,16 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Assert unique release asset basenames
+        run: |
+          set -euo pipefail
+          duplicates="$(find dist -type f -exec basename {} \; | sort | uniq -d)"
+          if [[ -n "$duplicates" ]]; then
+            echo "::error::Duplicate release asset basenames detected"
+            printf '%s\n' "$duplicates"
+            exit 1
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:

@@ -24,7 +24,10 @@ cp "$root/target/release/crux-hook" "$dist/crux-hook-$suffix"
 cp "$root/LICENCE.md" "$root/TRUST-CONTRACT.md" "$dist/"
 cp "$root/README.md" "$root/config.example.env" "$root/config.example.yaml" "$dist/"
 cp "$root/docs/release-packaging.md" "$dist/docs/"
-cp "$root/content/MANIFEST.json" "$root/content/README.md" "$root/content/LICENCE-CONTENT.md" "$dist/content/"
+cp "$root/content/MANIFEST.json" "$root/content/LICENCE-CONTENT.md" "$dist/content/"
+# GitHub release assets are a flat namespace. Keep the content guide distinct
+# from the repository README so both can be uploaded without a basename race.
+cp "$root/content/README.md" "$dist/content/CONTENT-README.md"
 
 # The installer is platform-agnostic and uploaded once from the linux-amd64
 # release leg. Stage it before hashing so its signed-manifest coverage matches

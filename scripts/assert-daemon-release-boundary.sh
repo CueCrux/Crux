@@ -53,6 +53,7 @@ for needle in \
   "config.example.yaml" \
   "docs/release-packaging.md" \
   "content/MANIFEST.json" \
+  "CONTENT-README.md" \
   'cp "$root/packaging/install.sh" "$dist/install.sh"' \
   "RELEASE-MANIFEST"; do
   if ! grep -Fq -- "$needle" "$package_script"; then
@@ -100,6 +101,8 @@ require_marker "packaging/tests/install-smoke.sh" \
   'install.sh does not match signed release manifest'
 require_marker ".github/workflows/release.yml" \
   'package-daemon-release.sh has already staged install.sh before generating'
+require_marker ".github/workflows/release.yml" \
+  'Assert unique release asset basenames'
 
 if [[ -x "$root/target/release/corecruxd" \
   && -x "$root/target/release/corecruxctl" \
@@ -122,7 +125,7 @@ if [[ -x "$root/target/release/corecruxd" \
     "config.example.yaml" \
     "docs/release-packaging.md" \
     "content/MANIFEST.json" \
-    "content/README.md" \
+    "content/CONTENT-README.md" \
     "RELEASE-MANIFEST-linux-amd64.txt"; do
     if [[ ! -f "$dist/$artifact" ]]; then
       echo "daemon release package smoke missing artifact: $artifact" >&2
@@ -132,6 +135,20 @@ if [[ -x "$root/target/release/corecruxd" \
   if ! grep -Eq '[[:space:]]+\./install\.sh$' \
     "$dist/RELEASE-MANIFEST-linux-amd64.txt"; then
     echo "daemon release manifest does not cover install.sh" >&2
+    exit 1
+  fi
+  if ! cmp -s "$root/README.md" "$dist/README.md"; then
+    echo "staged README.md does not match the repository README" >&2
+    exit 1
+  fi
+  if ! cmp -s "$root/content/README.md" "$dist/content/CONTENT-README.md"; then
+    echo "staged CONTENT-README.md does not match the content guide" >&2
+    exit 1
+  fi
+  duplicate_basenames="$(find "$dist" -type f -exec basename {} \; | sort | uniq -d)"
+  if [[ -n "$duplicate_basenames" ]]; then
+    echo "daemon release package contains duplicate asset basenames:" >&2
+    printf '%s\n' "$duplicate_basenames" >&2
     exit 1
   fi
 fi
