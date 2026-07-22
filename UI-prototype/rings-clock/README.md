@@ -20,3 +20,13 @@ the completed ledger. Rings are time; sectors are plans; dots/bars are facts.
 Lineage: rounds 1–3 of the signature-visual exploration (Loom + Rings) live as
 claude.ai artifacts; this folder is the first in-repo landing of the Rings.
 Related: `UI-prototype/console-3d/` (clay-substrate concept, 2026-06-11).
+
+## Versions
+
+`index.html` is always the latest. Prior builds are kept verbatim in `versions/`
+(besides git history) so older iterations can be opened side-by-side:
+
+- `versions/v4.2-census.html` — census mode, hover-named sectors, binned rim
+  token bars, drawn click-cards (pre-pane).
+- v4.3 (current `index.html`) — event-aligned gradient rim charts, slide-out
+  detail pane, ledger-click plan filter, thicker progress arcs.
