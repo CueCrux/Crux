@@ -71,6 +71,14 @@ pub(super) struct ListFactsParams {
     pub entity_prefix: Option<String>,
     /// Case-insensitive substring over entity / key / value (server-side search).
     pub q: Option<String>,
+    /// Server-side time-machine: when set, exclude facts stored AFTER this
+    /// instant (Unix epoch **milliseconds**) — the page keeps only facts whose
+    /// `stored_at.timestamp_millis() <= as_of_unix_ms`. Distinct from
+    /// `/v1/facts`' bi-temporal `as_of` (which filters *valid-time*): this
+    /// filters INGEST time (`stored_at`), so the console can ask "what did the
+    /// store hold as of `<t>`" and page the whole matching set — not just a
+    /// recent window. Omitted ⇒ live (whole visible store).
+    pub as_of_unix_ms: Option<i64>,
 }
 
 /// Parse a query-string boolean flag that may arrive as `1`/`0`/`true`/`false`/
@@ -788,7 +796,8 @@ pub(super) async fn export_facts(
 /// M1). Distinct from `/v1/facts` (recall-ranked recent window) and
 /// `/v1/facts/export` (ascending sync-push path): this walks the *whole* visible
 /// store in stable `(stored_at, fact_id)` DESC order with server-side reserved /
-/// prefix / substring filtering, so the console can page + search the full set.
+/// prefix / substring filtering (and an optional `as_of_unix_ms` ingest-time
+/// time-machine), so the console can page + search the full set.
 ///
 /// Always excludes private and deleted facts. Tenant scoping mirrors
 /// `query_facts`: a raw-admin (auth-off) caller sees the store; a scoped caller
@@ -825,6 +834,10 @@ pub(super) async fn list_facts(
     let include_superseded = parse_query_flag(params.include_superseded.as_deref(), true);
     let entity_prefix = params.entity_prefix.clone();
     let q_lower = params.q.as_ref().map(|q| q.to_lowercase());
+    // Server-side time-machine (M2): exclude facts stored after this instant.
+    // Applied inside the page predicate so `total_visible` reflects the as-of
+    // universe (not the whole store) and pagination stays exact over it.
+    let as_of_unix_ms = params.as_of_unix_ms;
 
     // Raw-admin (auth-off console) sees the whole store; a scoped caller is
     // confined to its read-tenant — same authority the query path uses.
@@ -838,6 +851,11 @@ pub(super) async fn list_facts(
 
     let store = state.fact_store.read().await;
     let page = store.list_page(cursor.as_ref(), limit, include_superseded, |fact| {
+        if let Some(cutoff) = as_of_unix_ms {
+            if fact.stored_at.timestamp_millis() > cutoff {
+                return false;
+            }
+        }
         if !is_admin && fact.tenant_hash != tenant_hash {
             return false;
         }
