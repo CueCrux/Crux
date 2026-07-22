@@ -369,13 +369,6 @@ function activePlans(t) {
   return PLANS.filter(p => p.b <= t && t < p.exit && p.e >= S - 0.001 && p.b <= E);
 }
 function layoutTargets(t) {
-  if (solo) {
-    /* solo: the plan spans 12 → 9 o'clock; the 9→12 quadrant becomes the
-       event ledger */
-    const out = new Map();
-    out.set(solo.i, { a0: -Math.PI / 2 + 0.02, a1: Math.PI - 0.02 });
-    return out;
-  }
   const act = activePlans(t).sort((a, b) => b.b - a.b || a.i - b.i);  /* newest first */
   const width = (TAU - SEAM) / Math.max(1, act.length);
   const out = new Map();
@@ -397,21 +390,31 @@ function stepLayout(dt) {
       p.lay.a0 = mix(p.lay.a0, tg.a0, k);
       p.lay.a1 = mix(p.lay.a1, tg.a1, k);
       p.lay.alpha = mix(p.lay.alpha, 1, k);
-    } else if (p.lay) {                            /* exit: collapse + flash once */
+    } else if (p.lay) {                            /* exit: farewell wave (play mode), then collapse */
+      const nowS = performance.now() / 1000;
       if (!p.lay.exiting) {
         p.lay.exiting = true;
+        /* during playback the plan waves goodbye for ~0.5s before leaving;
+           scrubbed jumps skip straight to the collapse */
+        p.lay.exitAt = (playing && !REDUCED) ? nowS : 0;
         const mid = (p.lay.a0 + p.lay.a1) / 2;
         const hue = p.st === 0 ? '#34d399' : p.st === 2 ? '#ef4444' : '#7e8595';
-        flashes.push({ kind: 'exit', ang: mid, t0: performance.now() / 1000, hue });
+        flashes.push({ kind: 'exit', ang: mid, t0: nowS, hue });
       }
-      const mid = (p.lay.a0 + p.lay.a1) / 2;
-      p.lay.a0 = mix(p.lay.a0, mid, k);
-      p.lay.a1 = mix(p.lay.a1, mid, k);
-      p.lay.alpha = mix(p.lay.alpha, 0, k);
-      if (p.lay.alpha < 0.02) p.lay = null;
+      if (p.lay.exitAt && nowS < p.lay.exitAt + 0.55) {
+        const kw = (nowS - p.lay.exitAt) / 0.55;
+        /* fade out → in → out: two dips over the wave window */
+        p.lay.alpha = 0.25 + 0.75 * Math.abs(Math.cos(kw * Math.PI * 2));
+      } else {
+        const mid = (p.lay.a0 + p.lay.a1) / 2;
+        p.lay.a0 = mix(p.lay.a0, mid, k);
+        p.lay.a1 = mix(p.lay.a1, mid, k);
+        p.lay.alpha = mix(p.lay.alpha, 0, k);
+        if (p.lay.alpha < 0.02) p.lay = null;
+      }
     }
     if (p.lay && !targets.get(p.i)) { /* keep exiting */ }
-    else if (p.lay) p.lay.exiting = false;
+    else if (p.lay) { p.lay.exiting = false; p.lay.exitAt = 0; }
   }
 }
 
@@ -556,7 +559,7 @@ function draw(now) {
     /* (token usage chart moved into the detail pane — rim stays clean) */
     /* label if wide enough on screen — or hovered (census mode names on hover) */
     const isHovSec = p === hoverSec;
-    if ((wSec * g.R * Z > 46 || isHovSec) && solo !== p) {  /* solo names itself at the seam */
+    if (wSec * g.R * Z > 46 || isHovSec) {
       const midA = (L.a0 + L.a1) / 2, lr = g.R + 14;
       ctx.save();
       ctx.translate(Math.cos(midA) * lr, Math.sin(midA) * lr);
@@ -616,64 +619,6 @@ function draw(now) {
     }
   }
 
-  /* ── solo event ledger: the 9→12 quadrant charts what each event used.
-     One stacked bar per event: tokens (indigo) + fact kind + version cap. ── */
-  let soloLabels = null;
-  if (solo && solo.lay && solo.lay.alpha > 0.5) {
-    soloLabels = [];
-    const q0 = Math.PI + 0.10, q1 = Math.PI * 1.5 - 0.10;
-    const minD = solo.b, maxD = Math.max(solo.e, minD + 0.5);
-    const span = maxD - minD;
-    const Rb = g.r0 + (g.R - g.r0) * 0.12;
-    const unit = g.R - g.r0;
-    /* base arc + date tick guides (min / mid / max of THIS plan) */
-    ctx.strokeStyle = 'rgba(255,255,255,.12)';
-    ctx.lineWidth = 1 / Z;
-    ctx.beginPath(); ctx.arc(0, 0, Rb, q0, q1); ctx.stroke();
-    for (let tI = 0; tI <= 2; tI++) {
-      const f = tI / 2;
-      const a = q0 + (q1 - q0) * f;
-      ctx.strokeStyle = 'rgba(255,255,255,.05)';
-      ctx.beginPath();
-      ctx.moveTo(Math.cos(a) * Rb, Math.sin(a) * Rb);
-      ctx.lineTo(Math.cos(a) * (Rb + unit * 0.52), Math.sin(a) * (Rb + unit * 0.52));
-      ctx.stroke();
-      soloLabels.push({ x: Math.cos(a) * (Rb + unit * 0.60), y: Math.sin(a) * (Rb + unit * 0.60),
-                        t: dayDate(minD + span * f) });
-    }
-    /* stacked bars, chronological 9 → 12 */
-    const evs = [...solo.cells].sort((a, b) => a.day - b.day)
-      .filter(c => c.day <= T && c.day >= S && c.day <= E && passFilter(c));
-    let lastAng = -99, crowd = 0;
-    for (const c of evs) {
-      let a = q0 + (q1 - q0) * ((c.day - minD) / span);
-      if (a - lastAng < 0.022) { crowd++; a = lastAng + 0.022; } else crowd = 0;
-      lastAng = a;
-      let r1 = Rb;
-      const segs = [
-        { h: unit * (0.05 + Math.min(0.28, ((c.tokens || 160) / 550) * 0.30)), col: hex2rgba('#8b96f2', 0.5) },
-        { h: unit * 0.07, col: hex2rgba(KIND_HUE[c.kind] || '#8b96f2', 0.95) },
-      ];
-      if (c.version > 1) segs.push({ h: unit * 0.028, col: 'rgba(238,240,246,.85)' });
-      const isSelBar = pinned === c;
-      for (const sg of segs) {
-        ctx.strokeStyle = sg.col;
-        ctx.lineWidth = (5 / Z) * (isSelBar ? 1.5 : 1);
-        ctx.beginPath();
-        ctx.moveTo(Math.cos(a) * r1, Math.sin(a) * r1);
-        r1 += sg.h;
-        ctx.lineTo(Math.cos(a) * r1, Math.sin(a) * r1);
-        ctx.stroke();
-      }
-      c._barAng = a; c._barR1 = r1;
-    }
-    ctx.lineWidth = 1 / Z;
-    /* quadrant caption */
-    const capA = (q0 + q1) / 2;
-    soloLabels.push({ x: Math.cos(capA) * (g.R + 26), y: Math.sin(capA) * (g.R + 26),
-                      t: 'event ledger · bar = tokens + kind', cap: true });
-  }
-
   /* live edge: outward mode sweeps with T; inward mode IS the rim */
   {
     const er = dir === 'in' ? g.r0 + (g.R - g.r0) * 0.96 : dayR(g, T);
@@ -729,22 +674,6 @@ function draw(now) {
   ctx.fillStyle = 'rgba(126,133,149,.8)';
   ctx.font = '9.5px ' + MONO;
   ctx.fillText(dayDate(S) + ' → ' + dayDate(E) + ' · T = ' + dayDate(T) + ' · ' + nAct + ' live · zoom ' + Z.toFixed(1) + '×', 18, 24);
-
-  /* solo: ledger labels + the seam's min→max range for THIS plan */
-  if (soloLabels) {
-    ctx.font = '9px ' + MONO;
-    ctx.textAlign = 'center';
-    for (const L2 of soloLabels) {
-      const sp = toScreen(g, L2.x, L2.y);
-      ctx.fillStyle = L2.cap ? 'rgba(182,188,201,.9)' : 'rgba(126,133,149,.85)';
-      ctx.fillText(L2.t, sp.x, sp.y);
-    }
-    const tip2 = toScreen(g, 0, -(g.R + 24));
-    ctx.fillStyle = 'rgba(238,240,246,.92)';
-    ctx.font = '700 10px ' + MONO;
-    ctx.fillText(dayDate(solo.b) + ' → ' + dayDate(solo.e), tip2.x, tip2.y);
-    ctx.textAlign = 'left';
-  }
 
   /* completed ledger — plans retire off the clock into the left edge.
      Rows are clickable: filter the ring down to that one plan. */
@@ -804,11 +733,7 @@ bSpin.addEventListener('click', () => {
   spinning = !spinning;
   bSpin.setAttribute('aria-pressed', String(spinning));
 });
-bClock.addEventListener('click', () => {
-  resetTween = true;
-  spinning = false;                                /* reset also stops the spin */
-  bSpin.setAttribute('aria-pressed', 'false');
-});
+bClock.addEventListener('click', () => { resetTween = true; });
 bMode.addEventListener('click', () => {
   mode = mode === 'dots' ? 'bars' : 'dots';
   bMode.setAttribute('aria-pressed', String(mode === 'bars'));
@@ -929,16 +854,6 @@ function hitTest(e) {
   const p = toDisc(g, e.clientX - r.left, e.clientY - r.top);
   const pr = Math.hypot(p.x, p.y);
   const pa = Math.atan2(p.y, p.x);
-  /* solo: event-ledger bars take priority */
-  if (solo) {
-    let pa2 = pa;
-    if (pa2 < 0) pa2 += TAU;
-    for (const c of solo.cells) {
-      if (c._barAng === undefined || c.day > T) continue;
-      const da2 = Math.abs(pa2 - c._barAng);
-      if (da2 * Math.max(pr, 1) < 6 / Z && pr > g.r0 && pr < c._barR1 + 8 / Z) return c;
-    }
-  }
   let best = null, bd = 10 / Z;
   for (const c of cells) {
     if (c._x === undefined || c.day > T || !c.p.lay || c.p.lay.alpha < 0.3 || !passFilter(c)) continue;
@@ -968,22 +883,9 @@ function handleClick(e) {
   /* 2 — node */
   const hit = hitTest(e);
   if (hit) { setSel(sel && sel.c === hit ? null : { type: 'cell', c: hit }); return; }
-  /* 3 — sector: focus the plan on its own (12→9 + event ledger) */
+  /* 3 — sector */
   const sec = sectorAt(e);
-  if (sec) {
-    if (solo === sec) { setSel(null); solo = null; }
-    else { solo = sec; setSel({ type: 'plan', p: sec }); }
-    return;
-  }
-  /* 3.5 — clicks inside the solo event-ledger quadrant are not "background" */
-  if (solo) {
-    const g2 = geom();
-    const pd = toDisc(g2, cxp, cyp);
-    const pr2 = Math.hypot(pd.x, pd.y);
-    let pa2 = Math.atan2(pd.y, pd.x);
-    if (pa2 < 0) pa2 += TAU;
-    if (pr2 > g2.r0 && pr2 < g2.R + 12 && pa2 > Math.PI && pa2 < Math.PI * 1.5) return;
-  }
+  if (sec) { setSel(sel && sel.p === sec && sel.type === 'plan' ? null : { type: 'plan', p: sec }); return; }
   /* 4 — background: hide pane, clear filter */
   setSel(null);
   solo = null;
