@@ -17500,6 +17500,108 @@ async fn identity_candidates_list_requires_admin_read_and_filters() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+// ── Candidate seed route (console-surfaces-remediation M6) ─────────────────
+
+/// Seed two session→passport bindings sharing a tenant + project inside the
+/// temporal window but with DISTINCT passports — the shape `propose_from_session_
+/// bindings` turns into exactly one candidate.
+async fn seed_two_distinct_bindings(state: &AppState) {
+    seed_default_passports(state).await;
+    let mut store = state.fact_store.write().await;
+    for (hex, passport, at) in [
+        ("seed-sess-a", "personal-default", 1_000_u64),
+        ("seed-sess-b", "work-default", 2_000),
+    ] {
+        let binding = crate::session_bindings::resolve(
+            &store,
+            crate::session_bindings::ResolveInput {
+                session_id_hex: hex,
+                project_id: Some("alpha".to_string()),
+                tenant_id: Some("work::team".to_string()),
+                passport_id: Some(passport.to_string()),
+                now_unix_ms: at,
+            },
+        )
+        .expect("resolve binding");
+        crate::session_bindings::write_binding(&mut store, &binding).expect("write binding");
+    }
+}
+
+#[tokio::test]
+async fn identity_candidates_propose_disabled_returns_404() {
+    let mut state = test_app_state(16);
+    state.identity_links_enabled = false;
+    let resp = identity_links::post_identity_candidates_propose(State(state), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn identity_candidates_propose_requires_admin_write() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    // No credentials → 401.
+    let resp = identity_links::post_identity_candidates_propose(State(state.clone()), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    // facts:write is not enough — seeding is an operator (admin:write) action.
+    let resp = identity_links::post_identity_candidates_propose(State(state), dev_scope_headers("facts:write"))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn identity_candidates_propose_from_bindings_is_idempotent() {
+    let state = test_app_state(16); // AuthMode::Off — guard passes, actor = operator:admin
+    seed_two_distinct_bindings(&state).await;
+
+    // First run: the binding pair yields a candidate.
+    let resp = identity_links::post_identity_candidates_propose(State(state.clone()), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert!(
+        body["created"].as_u64().unwrap() >= 1,
+        "bindings source seeds at least one candidate"
+    );
+    assert_eq!(body["by_source"]["bindings"]["created"].as_u64().unwrap(), 1);
+    assert_eq!(body["by_source"]["bindings"]["examined"].as_u64().unwrap(), 2);
+    // No observation journals in this fixture → observations source is empty.
+    assert_eq!(body["by_source"]["observations"]["created"].as_u64().unwrap(), 0);
+    let first_created = body["created"].as_u64().unwrap();
+
+    // The candidate is now listable.
+    let resp = identity_links::get_identity_candidates(
+        State(state.clone()),
+        HeaderMap::new(),
+        Query(identity_links::ListIdentityCandidatesQuery { status: None }),
+    )
+    .await
+    .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["candidates"].as_array().unwrap().len() as u64, first_created);
+
+    // Re-propose over the same evidence: proposers dedup by content-derived id.
+    let resp = identity_links::post_identity_candidates_propose(State(state), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["created"].as_u64().unwrap(),
+        0,
+        "re-propose is idempotent (creates nothing)"
+    );
+    assert_eq!(
+        body["examined"].as_u64().unwrap(),
+        2,
+        "still examines the same evidence"
+    );
+}
+
 #[tokio::test]
 async fn resolve_principal_include_candidates_surfaces_suggestions_without_resolving() {
     let state = test_app_state(16);

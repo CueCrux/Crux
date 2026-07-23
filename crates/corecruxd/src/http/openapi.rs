@@ -59,6 +59,7 @@ use utoipa::OpenApi;
         super::query::post_query_graph_expand,
         super::query::post_query_time_range,
         // Receipts
+        super::observations::get_receipts_list,
         super::receipts::get_receipt_body_v1,
         super::receipts::get_receipt_signature_v1,
         super::receipts::get_receipt_verification_v1,
@@ -270,6 +271,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/gpu1/rerank", methods: &["POST"], tag: "GPU1", auth: "feature-gated", summary: "Gpu1 rerank" },
     RouteEntry { path: "/v1/gpus", methods: &["GET"], tag: "Routing", auth: "admin-read", summary: "Gpus" },
     RouteEntry { path: "/v1/identity/candidates", methods: &["GET"], tag: "Identity", auth: "admin-read", summary: "Identity candidates" },
+    RouteEntry { path: "/v1/identity/candidates/propose", methods: &["POST"], tag: "Identity", auth: "admin-write", summary: "Identity candidates propose" },
     RouteEntry { path: "/v1/identity/candidates/{candidateId}/confirm", methods: &["POST"], tag: "Identity", auth: "admin-write", summary: "Identity candidates {candidateId} confirm" },
     RouteEntry { path: "/v1/identity/candidates/{candidateId}/reject", methods: &["POST"], tag: "Identity", auth: "admin-write", summary: "Identity candidates {candidateId} reject" },
     RouteEntry { path: "/v1/identity/links", methods: &["GET", "POST"], tag: "Identity", auth: "read-write", summary: "Identity links" },
@@ -378,6 +380,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/rcx/publish/passports/{passportId}/preview", methods: &["POST"], tag: "RCX", auth: "write", summary: "Rcx publish passports {passportId} preview" },
     RouteEntry { path: "/v1/rcx/publish/projects/{projectId}/emit", methods: &["POST"], tag: "RCX", auth: "write", summary: "Rcx publish projects {projectId} emit" },
     RouteEntry { path: "/v1/rcx/publish/projects/{projectId}/preview", methods: &["POST"], tag: "RCX", auth: "write", summary: "Rcx publish projects {projectId} preview" },
+    RouteEntry { path: "/v1/receipts/list", methods: &["GET"], tag: "Receipts", auth: "read", summary: "Receipts list" },
     RouteEntry { path: "/v1/receipts/{receiptId}", methods: &["GET"], tag: "Receipts", auth: "read", summary: "Receipts {receiptId}" },
     RouteEntry { path: "/v1/receipts/{receiptId}/signature", methods: &["GET"], tag: "Receipts", auth: "read", summary: "Receipts {receiptId} signature" },
     RouteEntry { path: "/v1/receipts/{receiptId}/verification", methods: &["GET"], tag: "Receipts", auth: "read", summary: "Receipts {receiptId} verification" },

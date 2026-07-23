@@ -2064,6 +2064,36 @@
   .sess-state-details > summary { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink3); cursor: pointer; padding: 3px 0; }
   .sess-state-details[open] > summary { color: var(--ink2); }
 
+  /* cx trust cluster (console-surfaces-remediation M6): receipts / gates /
+     identity / mediation. Reuses the facts-* chrome; these add the help panels,
+     kind chips, the verbatim verification verdict, and the honest posture cards.
+     All colour is var(--) tokens — no hard-coded hues. */
+  .m6-help { background: var(--surface2); border-color: var(--edge); color: var(--ink2); }
+  .m6-help-h { font-family: var(--font-mono); font-size: 12px; color: var(--ink); font-weight: 600; margin-bottom: 5px; }
+  .m6-help .facts-kv { margin-top: 6px; }
+  .m6-help .facts-vlabel:first-child { margin-top: 4px; }
+  .facts-banner.ok-empty { border-color: color-mix(in srgb, var(--ok) 40%, var(--edge)); }
+  .facts-banner.ok-empty .m6-help-h { color: var(--ok); }
+  /* Receipt kind chip: same pill as .sess-chip, tinted by kind tone. */
+  .rcpt-kind { font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: .04em; padding: 2px 8px; border-radius: 999px; border: 1px solid currentColor; }
+  .rcpt-kind.tone-acc { color: var(--acc); }
+  .rcpt-kind.tone-ok { color: var(--ok); }
+  .rcpt-kind.tone-crit { color: var(--crit); }
+  .rcpt-kind.tone-trust { color: var(--trust); }
+  .rcpt-kind.tone-warn { color: var(--warn); }
+  .rcpt-kind.tone-ink3 { color: var(--ink3); }
+  .rcpt-fetchable { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); background: color-mix(in srgb, var(--ok) 11%, transparent); }
+  .rcpt-envonly { color: var(--ink3); border-style: dashed; }
+  /* Verification verdict — rendered VERBATIM from the daemon report. */
+  .rcpt-verdict { display: grid; grid-template-columns: max-content 1fr; gap: 3px 12px; font-family: var(--font-mono); font-size: 11.5px; padding: 8px 10px; border-radius: 8px; margin: 4px 0; border: 1px solid var(--edge); }
+  .rcpt-verdict.ok { border-color: color-mix(in srgb, var(--ok) 45%, var(--edge)); }
+  .rcpt-verdict.bad { border-color: color-mix(in srgb, var(--crit) 45%, var(--edge)); }
+  .rcpt-verdict-k { color: var(--ink3); }
+  .rcpt-verdict b { color: var(--ink); font-weight: 600; }
+  .rcpt-verdict.ok b { color: var(--ok); }
+  .rcpt-verdict.bad b { color: var(--crit); }
+  .gate-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { animation: none !important; transition: none !important; }
     .aurora { animation: none !important; }
