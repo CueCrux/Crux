@@ -2339,6 +2339,39 @@
     return wrap;
   }
 
+  // Shared Overwatch tab-content renderer (M13). One source of truth for what a
+  // view tab paints, reused by BOTH the Overwatch landing (renderTab) AND the
+  // Rings tab hub (renderRings) — the Rings hub does NOT fork the view renderers,
+  // it calls this. The Activity tab reuses the exact Needs-you + Fleet + Activity
+  // arrangement; every other tab renders its page (renderPage) full-width. All
+  // reads stay on the generated client (renderPage → fetchJSON). Returns the
+  // renderPage promise so a caller can time a post-render animation (the Rings
+  // cascade) against the async data swap.
+  function owRenderTab(id, content, ctx) {
+    content.textContent = '';
+    var CP = (typeof window !== 'undefined') ? window.CruxPages : null;
+    var PAGES = (CP && CP.PAGES) || {};
+    var page = PAGES[id];
+    if (id === 'cx-activity') {
+      var cols = el('div', { 'class': 'ow-cols' });
+      var left = el('div', { 'class': 'ow-col' });
+      var right = el('div', { 'class': 'ow-col' });
+      cols.appendChild(left); cols.appendChild(right);
+      content.appendChild(cols);
+      var needs = panel('Needs you', 'loading gate queue…', true);
+      var fleet = panel('Fleet', 'loading live sessions…', false);
+      left.appendChild(needs); left.appendChild(fleet);   // Needs-you then Fleet (left 50%)
+      var actHost = el('div', { 'class': 'page-host' });
+      right.appendChild(actHost);
+      var pr = page ? renderPage(page, actHost) : null;    // Activity (cx-activity) on the right 50%
+      fillNeedsYou(needs); fillFleet(fleet);
+      return pr || Promise.resolve();
+    }
+    var host = el('div', { 'class': 'page-host' });
+    content.appendChild(host);
+    return (page ? renderPage(page, host) : null) || Promise.resolve();
+  }
+
   // The Overwatch landing entry point (shell.html calls this for the overwatch
   // destination, above the — now suppressed — page-pill row). Nodes are appended
   // in order first, then filled async, so ordering is stable regardless of fetch
@@ -2386,28 +2419,11 @@
       });
       tabBar.appendChild(b); tabBtns[t.id] = b;
     });
-    function renderTab(id) {
-      content.textContent = '';
-      var page = PAGES[id];
-      if (id === 'cx-activity') {
-        var cols = el('div', { 'class': 'ow-cols' });
-        var left = el('div', { 'class': 'ow-col' });
-        var right = el('div', { 'class': 'ow-col' });
-        cols.appendChild(left); cols.appendChild(right);
-        content.appendChild(cols);
-        var needs = panel('Needs you', 'loading gate queue…', true);
-        var fleet = panel('Fleet', 'loading live sessions…', false);
-        left.appendChild(needs); left.appendChild(fleet);   // Needs-you then Fleet (left 50%)
-        var actHost = el('div', { 'class': 'page-host' });
-        right.appendChild(actHost);
-        if (page) { renderPage(page, actHost); }             // Activity (cx-activity) on the right 50%
-        fillNeedsYou(needs); fillFleet(fleet);
-        return;
-      }
-      var host = el('div', { 'class': 'page-host' });
-      content.appendChild(host);
-      if (page) { renderPage(page, host); }
-    }
+    // Tab content is painted by the shared module-level owRenderTab so the Rings
+    // tab hub reuses the EXACT same view renderers + arrangement (M13). The
+    // activity-layout static-source assertions moved with it (smoke check 39 →
+    // owRenderTab). ow-tabs / ow-tabcontent / renderTab identity stays here.
+    function renderTab(id) { owRenderTab(id, content, ctx); }
     if (active) { renderTab(active); }
     return fillTiles(tileCard, ctx);
   }
@@ -3546,6 +3562,39 @@
     });
     return { width: (maxX - minX) + pad * 2, height: (maxY - minY) + pad * 2 };
   }
+  // Organic (mesh) layout — the zoom-agnostic placement (M13). Nodes sit on a
+  // golden-angle phyllotaxis so there is NO row/column alignment at ANY zoom
+  // level; the same positions serve the zoomed-out overview and the zoomed-in
+  // card view (LOD only swaps DETAIL — dot vs full card — never the geometry).
+  // Deterministic: the spiral index is the node's (type,id)-sorted rank, so the
+  // mesh is stable across renders. Spacing is chosen so full 300×128 cards never
+  // overlap (nearest-neighbour distance ≈ 1.77·SP ≥ 340 ⇒ if dy<128 then dx>300).
+  function layoutGraphOrganic(nodes, edges) {
+    var CARD_W = 300, CARD_H = 128, SP = 212, pad = 80;
+    var list = nodes.slice().sort(function (a, b) {
+      if (a.type !== b.type) { return a.type < b.type ? -1 : 1; }
+      var ai = String(a.id), bi = String(b.id); return ai < bi ? -1 : (ai > bi ? 1 : 0);
+    });
+    var GA = Math.PI * (3 - Math.sqrt(5));
+    var pos = {};
+    list.forEach(function (n, i) {
+      var r = SP * Math.sqrt(i + 0.5), a = i * GA;
+      pos[n.key] = { x: Math.cos(a) * r, y: Math.sin(a) * r };
+    });
+    var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    nodes.forEach(function (n) {
+      var p = pos[n.key], x = p.x - CARD_W / 2, y = p.y - CARD_H / 2;
+      if (x < minX) { minX = x; } if (y < minY) { minY = y; }
+      if (x + CARD_W > maxX) { maxX = x + CARD_W; } if (y + CARD_H > maxY) { maxY = y + CARD_H; }
+    });
+    if (!isFinite(minX)) { minX = 0; minY = 0; maxX = CARD_W; maxY = CARD_H; }
+    nodes.forEach(function (n) {
+      var p = pos[n.key];
+      n.orgX = p.x - CARD_W / 2 - minX + pad;
+      n.orgY = p.y - CARD_H / 2 - minY + pad;
+    });
+    return { width: (maxX - minX) + pad * 2, height: (maxY - minY) + pad * 2 };
+  }
   // Graph legibility cap: /v1/work?source=all can carry >1,000 items (mostly
   // complete/archived) — a relation graph of the whole set is an unreadable
   // hairball. Keep an active-first, deterministic slice (in-progress/blocked/
@@ -3656,9 +3705,16 @@
         focus = { type: fnode.type, id: fnode.id };   // normalise for the select() below
       }
     }
-    var cardDims = layoutGraph(model.nodes);   // columns-by-type — the zoomed-IN detail arrangement
-    model.nodes.forEach(function (n) { n.cardX = n.x; n.cardY = n.y; });
-    var ringDims = layoutGraphRing(model.nodes);   // concentric type-shells — the zoomed-OUT overview
+    // M13 — ONE organic (mesh) layout used at ALL zoom levels: no snap-to-columns
+    // on zoom-in. cardX/cardY and ringX/ringY reference the SAME positions, so the
+    // LOD switch changes card DETAIL only (see switchMode), never the geometry.
+    // baseX/baseY snapshot these positions so focus mode can tween back to them.
+    var orgDims = layoutGraphOrganic(model.nodes, model.edges);
+    model.nodes.forEach(function (n) {
+      n.cardX = n.orgX; n.cardY = n.orgY; n.ringX = n.orgX; n.ringY = n.orgY;
+      n.baseX = n.orgX; n.baseY = n.orgY;
+    });
+    var cardDims = orgDims, ringDims = orgDims;
     var reduceMotion = (typeof window !== 'undefined' && window.matchMedia) ? window.matchMedia('(prefers-reduced-motion: reduce)').matches : false;
     // LOD threshold on the layer scale (view.scale): below it the nodes ride the
     // ring overview, above it the card view. Open in whichever the CARD layout's
@@ -3781,7 +3837,7 @@
       }
       var idline = (n.extra && n.extra.session_id) || (n.type === 'work' ? n.id : null);
       if (idline) { card.appendChild(el('div', { 'class': 'cv-card-id', text: idline })); }
-      function open() { select(n.key); onSelect(n); }
+      function open() { select(n.key); onSelect(n); if (focusMode) { applyFocus(n.key); } }   // M13 — re-cluster on select in focus mode
       // Drag to move: delta ÷ view.scale → layer space; wires reflow every frame.
       // A ≤3px press is a click (select + inspect); a real drag just repositions.
       card.addEventListener('mousedown', function (ev) {
@@ -3843,7 +3899,9 @@
       model.nodes.forEach(function (n) {
         var w = n.w || 300, h = n.h || 128;
         from[n.key] = { x: (sc[n.key].x - view.tx) / view.scale - w / 2, y: (sc[n.key].y - view.ty) / view.scale - h / 2 };
-        to[n.key] = (mode === 'ring') ? { x: n.ringX, y: n.ringY } : { x: n.cardX, y: n.cardY };
+        // M13 — organic positions are identical across LOD; while focus mode holds
+        // a cluster, keep nodes where they are (don't snap back to the base mesh).
+        to[n.key] = focusMode ? { x: n.x, y: n.y } : ((mode === 'ring') ? { x: n.ringX, y: n.ringY } : { x: n.cardX, y: n.cardY });
       });
       if (lodRaf != null && typeof window !== 'undefined' && window.cancelAnimationFrame) { window.cancelAnimationFrame(lodRaf); lodRaf = null; }
       var canAnim = !reduceMotion && model.nodes.length <= TWEEN_MAX && typeof window !== 'undefined' && window.requestAnimationFrame;
@@ -3881,10 +3939,18 @@
     var zoomIn = el('button', { 'class': 'cv-zoom-btn', type: 'button', 'aria-label': 'Zoom in', title: 'Zoom in' }, ['+']);
     zoomOut.addEventListener('click', function (e) { e.stopPropagation(); zoomBy(0.8); });
     zoomIn.addEventListener('click', function (e) { e.stopPropagation(); zoomBy(1.25); });
-    stage.appendChild(el('div', { 'class': 'cv-zoom' }, [zoomOut, modeLbl, zoomIn]));
+    // M13 — connected-focus toggle (unified icon idiom, svgIcon): ON + a selected
+    // node → isolate its connections into a compact cluster (see setFocusMode).
+    var focusBtn = el('button', { 'class': 'cv-zoom-btn cv-focus-btn', type: 'button', 'aria-pressed': 'false',
+      'aria-label': 'Focus mode: isolate the selected node and its connections', title: 'Focus: isolate selected + connections' });
+    focusBtn.innerHTML = svgIcon('<circle cx="12" cy="12" r="3.4"/><path d="M12 2.5v3.4M12 18.1v3.4M2.5 12h3.4M18.1 12h3.4"/>', 1.8);
+    focusBtn.addEventListener('click', function (e) { e.stopPropagation(); setFocusMode(!focusMode); });
+    stage.appendChild(el('div', { 'class': 'cv-zoom' }, [zoomOut, modeLbl, zoomIn, el('span', { 'class': 'cv-zoom-div', 'aria-hidden': 'true' }), focusBtn]));
+    var currentSel = null;   // M13 — the selected node key (drives focus mode)
     function select(key) {
+      currentSel = key;
       if (key == null) {
-        Object.keys(cardEls).forEach(function (k) { cardEls[k].classList.remove('is-sel'); cardEls[k].classList.remove('is-dim'); });
+        Object.keys(cardEls).forEach(function (k) { cardEls[k].classList.remove('is-sel'); cardEls[k].classList.remove('is-dim'); cardEls[k].classList.remove('is-linked'); });
         edgeEls.forEach(function (ln) {
           ln.classList.remove('is-dim'); ln.classList.remove('is-hot'); ln.setAttribute('marker-end', 'url(#cvArrow)');
           if (ln.__eo && ln.__eo.pulse) { ln.__eo.pulse.classList.remove('is-dim'); ln.__eo.pulse.classList.remove('is-hot'); }
@@ -3895,6 +3961,7 @@
       var hasLinks = Object.keys(nbr).length > 1;   // don't grey the world for an isolated node
       Object.keys(cardEls).forEach(function (k) {
         cardEls[k].classList.toggle('is-sel', k === key);
+        cardEls[k].classList.toggle('is-linked', !!(hasLinks && nbr[k] && k !== key));   // M13 — obvious connection highlight (coerce: toggle(undefined) would FLIP)
         cardEls[k].classList.toggle('is-dim', hasLinks && !nbr[k]);
       });
       edgeEls.forEach(function (ln) {
@@ -3907,12 +3974,87 @@
       });
     }
 
+    // ---- M13: connected-focus mode ---------------------------------------
+    // Toggle ON with a node selected → hide every non-connected node + its edges,
+    // then zoom + REARRANGE the connected set into a compact organic cluster with
+    // an eased tween (the "wow", ~420ms ease-out; reduced-motion → instant).
+    // Toggle OFF / deselect → the full graph tweens back to the base mesh. Drag /
+    // select / hover stay live throughout (the tween only writes x/y + the view).
+    var focusMode = false, focusKey = null, focusRaf = null, CW = 300, CH = 128;
+    function setFocusBtn() { if (focusBtn) { focusBtn.setAttribute('aria-pressed', focusMode ? 'true' : 'false'); focusBtn.classList.toggle('is-on', focusMode); } }
+    function focusSetVisible(keys) {
+      Object.keys(cardEls).forEach(function (k) { cardEls[k].classList.toggle('cv-hidden', !!keys && !keys[k]); });
+      edgeEls.forEach(function (ln) {
+        var vis = !keys || (keys[ln.__from] && keys[ln.__to]);
+        ln.classList.toggle('cv-hidden', !vis);
+        if (ln.__eo && ln.__eo.pulse) { ln.__eo.pulse.classList.toggle('cv-hidden', !vis); }
+      });
+    }
+    function clusterTargets(keyList) {
+      // compact golden-angle cluster centred in the layer; selected node at centre.
+      var GA = Math.PI * (3 - Math.sqrt(5)), SP = 208;
+      var cx = activeDims.width / 2, cy = activeDims.height / 2, out = {};
+      keyList.forEach(function (k, i) {
+        var r = i === 0 ? 0 : SP * Math.sqrt(i + 0.15), a = i * GA;
+        out[k] = { x: cx + Math.cos(a) * r - CW / 2, y: cy + Math.sin(a) * r - CH / 2 };
+      });
+      return out;
+    }
+    function fitTransformFor(posMap, keys) {
+      var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      keys.forEach(function (k) { var p = posMap[k]; if (!p) { return; } if (p.x < minX) { minX = p.x; } if (p.y < minY) { minY = p.y; } if (p.x + CW > maxX) { maxX = p.x + CW; } if (p.y + CH > maxY) { maxY = p.y + CH; } });
+      if (!isFinite(minX)) { return { scale: view.scale, tx: view.tx, ty: view.ty }; }
+      var sw = stage.clientWidth || 960, sh = stage.clientHeight || 640, pad = 44;
+      var bw = maxX - minX, bh = maxY - minY;
+      var availW = Math.max(240, sw - focusReserve - pad * 2), availH = Math.max(200, sh - pad * 2);
+      var s = Math.max(0.2, Math.min(availW / bw, availH / bh, 1.15));
+      return { scale: s, tx: pad + Math.max(0, (availW - bw * s) / 2) - minX * s, ty: pad + Math.max(0, (availH - bh * s) / 2) - minY * s };
+    }
+    function focusTween(nodePosTargets, viewTarget, dur) {
+      if (focusRaf != null && typeof window !== 'undefined' && window.cancelAnimationFrame) { window.cancelAnimationFrame(focusRaf); focusRaf = null; }
+      var fromPos = {}, keys = Object.keys(nodePosTargets);
+      keys.forEach(function (k) { var n = index[k]; if (n) { fromPos[k] = { x: n.x, y: n.y }; } });
+      var v0 = { scale: view.scale, tx: view.tx, ty: view.ty };
+      function setAll(e) {
+        keys.forEach(function (k) { var n = index[k]; if (!n) { return; } n.x = fromPos[k].x + (nodePosTargets[k].x - fromPos[k].x) * e; n.y = fromPos[k].y + (nodePosTargets[k].y - fromPos[k].y) * e; placeCard(n); });
+        view.scale = v0.scale + (viewTarget.scale - v0.scale) * e;
+        view.tx = v0.tx + (viewTarget.tx - v0.tx) * e;
+        view.ty = v0.ty + (viewTarget.ty - v0.ty) * e;
+        apply(); layoutEdges();
+      }
+      if (reduceMotion || typeof window === 'undefined' || !window.requestAnimationFrame) { setAll(1); return; }
+      var t0 = null, DUR = dur || 420;
+      function step(ts) { if (t0 == null) { t0 = ts; } var p = Math.min(1, (ts - t0) / DUR); var e = 1 - Math.pow(1 - p, 3); setAll(e); if (p < 1) { focusRaf = window.requestAnimationFrame(step); } else { focusRaf = null; } }
+      focusRaf = window.requestAnimationFrame(step);
+    }
+    function applyFocus(key) {
+      if (key == null || !index[key]) { return; }
+      var nbr = graphNeighbourhood(model.edges, key); nbr[key] = true;
+      var setKeys = {}; Object.keys(nbr).forEach(function (k) { if (index[k]) { setKeys[k] = true; } });
+      var ordered = [key].concat(Object.keys(setKeys).filter(function (k) { return k !== key; }).sort());
+      focusSetVisible(setKeys);
+      var targets = clusterTargets(ordered);
+      focusTween(targets, fitTransformFor(targets, ordered), 420);
+      focusKey = key;
+    }
+    function clearFocus() {
+      focusSetVisible(null);   // show all
+      var targets = {}; model.nodes.forEach(function (n) { targets[n.key] = { x: n.baseX, y: n.baseY }; });
+      focusTween(targets, frame(activeDims), 420);
+      focusKey = null;
+    }
+    function setFocusMode(v) {
+      focusMode = v; setFocusBtn();
+      if (v) { if (currentSel) { applyFocus(currentSel); } }
+      else { clearFocus(); }
+    }
+
     // Pan (drag on empty stage) + wheel zoom. A click on empty space (no drag)
     // deselects — the inspector then slides away unless it's pinned.
     var drag = null, moved = false;
     function onEmpty(ev) { return !(ev.target.closest && (ev.target.closest('.cv-card') || ev.target.closest('.cv-zoom'))); }
     stage.addEventListener('mousedown', function (ev) { if (!onEmpty(ev)) { return; } drag = { x: ev.clientX, y: ev.clientY, tx: view.tx, ty: view.ty }; moved = false; });
-    stage.addEventListener('click', function (ev) { if (!onEmpty(ev)) { return; } if (!moved) { select(null); onSelect(null); } });
+    stage.addEventListener('click', function (ev) { if (!onEmpty(ev)) { return; } if (!moved) { select(null); onSelect(null); if (focusMode) { clearFocus(); } } });   // M13 — deselect restores the full graph
     function onMove(ev) { if (!drag) { return; } moved = true; view.tx = drag.tx + (ev.clientX - drag.x); view.ty = drag.ty + (ev.clientY - drag.y); apply(); }
     function onUp() { drag = null; }
     stage.addEventListener('wheel', function (ev) { ev.preventDefault(); zoomBy(ev.deltaY < 0 ? 1.1 : 0.9); });
@@ -3920,6 +4062,7 @@
     __canvasGraphCleanup = function () {
       if (rafId != null && typeof window !== 'undefined' && window.cancelAnimationFrame) { window.cancelAnimationFrame(rafId); rafId = null; }
       if (lodRaf != null && typeof window !== 'undefined' && window.cancelAnimationFrame) { window.cancelAnimationFrame(lodRaf); lodRaf = null; }
+      if (focusRaf != null && typeof window !== 'undefined' && window.cancelAnimationFrame) { window.cancelAnimationFrame(focusRaf); focusRaf = null; }
       if (typeof window !== 'undefined') { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); }
     };
 
@@ -3927,6 +4070,17 @@
     if (focus && focus.type && focus.id != null) {
       var fn = index[focus.type + ':' + focus.id] || graphMatchNode(model.nodes, focus);
       if (fn) { select(fn.key); onSelect(fn); }
+    }
+    // Dev-only hook (mirror verification): select the highest-degree node so the
+    // connection highlight + focus cluster can be exercised deterministically
+    // (same code path as a card click: select + onSelect). Flag-gated, never prod.
+    if (typeof window !== 'undefined' && window.__CRUX_CONSOLE_DEV__) {
+      window.__cvSelectConnected = function () {
+        var deg = {}; model.edges.forEach(function (e) { deg[e.from] = (deg[e.from] || 0) + 1; deg[e.to] = (deg[e.to] || 0) + 1; });
+        var bk = null, bd = -1; Object.keys(deg).forEach(function (k) { if (deg[k] > bd) { bd = deg[k]; bk = k; } });
+        if (bk != null && index[bk]) { select(bk); onSelect(index[bk]); if (focusMode) { applyFocus(bk); } }
+        return { key: bk, deg: bd };
+      };
     }
   }
 
@@ -7971,7 +8125,9 @@
       state: ricon('<circle cx="12" cy="12" r="8.5"/><path d="M12 3.5a8.5 8.5 0 0 1 0 17z" fill="currentColor" stroke="none"/>'),
       lineage: ricon('<circle cx="7" cy="7" r="2"/><circle cx="17" cy="17" r="2"/><path d="M9 7h4a2 2 0 0 1 2 2v6"/>'),
       play: ricon('<path d="M8 5.5v13l11-6.5z" fill="currentColor"/>'),
-      pause: ricon('<path d="M9 5v14M15 5v14"/>')
+      pause: ricon('<path d="M9 5v14M15 5v14"/>'),
+      // M13 — data-lens connected-focus toggle (same idiom as the canvas focus btn)
+      focus: ricon('<circle cx="12" cy="12" r="3.4"/><path d="M12 2.5v3.4M12 18.1v3.4M2.5 12h3.4M18.1 12h3.4"/>')
     };
     function svgIconBtn(cls, svg, aria, extra) {
       var b = el('button', { 'class': cls, type: 'button', 'aria-label': aria, title: aria });
@@ -8001,6 +8157,11 @@
     var bTokCum = el('button', { type: 'button', 'aria-pressed': 'true', title: 'Running total across the window' }, ['cumulative']);
     var bTokDay = el('button', { type: 'button', 'aria-pressed': 'false', title: 'Tokens per day' }, ['per day']);
     var grpTokViews = el('span', { 'class': 'grp toktoggle' }, [bTokCum, bTokDay]); grpTokViews.style.display = 'none';
+
+    // ---- M13: data-lens connected-focus toggle (only meaningful in the data
+    //      graph lens; shown just for that lens, like the token toggle). ----
+    var bDataFocus = svgTool('focus', 'Focus: isolate the selected fact node and its connections', false);
+    var grpDataFocus = el('span', { 'class': 'grp' }, [bDataFocus]); grpDataFocus.style.display = 'none';
 
     // ---- kinds / agents filters → icon buttons that expand a popover menu ----
     // Single-select (matches the fKind / fAgent state); active state stays visible
@@ -8041,7 +8202,7 @@
       [['all', 'all agents', ''], ['claude-work', 'claude-work', '#8b96f2'], ['codex-work', 'codex-work', '#22d3ee']],
       function () { return fAgent; }, function (v) { fAgent = v; });
     var helpBtn = svgIconBtn('rings-iconbtn rings-helpbtn', RIC.help, 'How the rings page works', { 'aria-haspopup': 'dialog' });
-    var tools = el('div', { 'class': 'rings-tools' }, [grpTools, kindMenu.wrap, agentMenu.wrap, helpBtn, grpTokViews]);
+    var tools = el('div', { 'class': 'rings-tools' }, [grpTools, kindMenu.wrap, agentMenu.wrap, helpBtn, grpTokViews, grpDataFocus]);
     stage.appendChild(tools);
 
     // ---- top play/timeline bar (M12): SAME measure as the bottom bar, centred.
@@ -8228,6 +8389,9 @@
     var passFilter = function (c) { return (fKind === 'all' || c.kind === fKind) && (fAgent === 'all' || c.actor === fAgent); };
     var S = 11, E = NOW, T = NOW, playing = false, Z = 1, panX = 0, panY = 0;
     var hover = null, pinned = null, sel = null, solo = null, ledgerRows = [];
+    // M13 — tab hub state: the draw loop pauses while a non-Ring view is shown
+    // (canvas faded out) so it never burns frames behind the swapped-in content.
+    var activeTab = 'ring', paused = false;
     var mxAbs = 0, myAbs = 0, dragging = false, dragMoved = 0, lastPX = 0, lastPY = 0;
     var flashes = [];
 
@@ -8341,6 +8505,7 @@
         cDate.textContent = dayDate(T);
       }
       if (lens === 'work') { stepLayout(dt); }
+      if (lens === 'data') { stepDataFocus(dt); }
       updateRadLo();
       var g = geom();
       ctx.clearRect(0, 0, W, H);
@@ -8536,9 +8701,10 @@
       ctx.fillStyle = ink3c(.9); ctx.font = '8.5px ' + MONO;
       ctx.fillText(lens === 'work' ? nAct + (showAll ? ' plans' : ' live') : lens, core.x, core.y + 7);
       ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
-      ctx.fillStyle = ink3c(.8); ctx.font = '9.5px ' + MONO;
-      ctx.fillText(dayDate(S) + ' → ' + dayDate(E) + ' · T = ' + dayDate(T) + ' · ' + nAct + ' live · zoom ' + Z.toFixed(1) + '×'
-        + (RAD_LO > S + 0.5 ? ' · rings from ' + dayDate(RAD_LO) : '') + ' · ' + dataSrc, 18, 24);
+      // M13 — the single top-left status line (window range · zoom · dataSrc) was
+      // removed: that corner now hosts the fixed tab hub (Ring · Activity · …).
+      // The same facts remain reachable — window dates in the play/bottom bars,
+      // dataSrc via the root's data-src liveness attribute, zoom on the bottom bar.
       if (soloLabels) {
         ctx.font = '9px ' + MONO; ctx.textAlign = 'center';
         soloLabels.forEach(function (L3) {
@@ -8597,9 +8763,13 @@
         window.__ringsDrawMs = drawMsEMA; window.__ringsLastDrawMs = __ms;
         var __g = geom(); window.__ringsCenter = { x: __g.cx + panX, y: __g.cy + panY, R: __g.R * Z };
         window.__ringsSolo = solo ? (solo.slug || solo.s || true) : null;
+        window.__ringsActiveTab = activeTab; window.__ringsPaused = paused;
+        window.__ringsFrame = (window.__ringsFrame || 0) + 1;   // stops advancing when the loop pauses
+        window.__ringsLens = lens; window.__ringsDataFocus = gFocus; window.__ringsDataFocusK = gFocusK;
+        window.__ringsDataSel = gSel; window.__ringsDataConn = gConn ? Object.keys(gConn).length : 0;
       }
       rafId = null;
-      if (visible && !doc().hidden && cv.isConnected) { rafId = requestAnimationFrame(draw); }
+      if (visible && !paused && !doc().hidden && cv.isConnected) { rafId = requestAnimationFrame(draw); }
     }
 
     // ---- data graph lens ----
@@ -8623,6 +8793,42 @@
       (GADJ[i0] || []).forEach(function (j) { l1[j] = 1; });
       (GADJ[i0] || []).forEach(function (j) { (GADJ[j] || []).forEach(function (k2) { if (k2 !== i0 && !l1[k2]) { l2[k2] = 1; } }); });
       return { l1: l1, l2: l2 };
+    }
+    // ---- M13: data-lens connected-focus (the canvas focus mode, on the ring
+    //      fact graph). ON + a selected node → hide unconnected nodes/edges +
+    //      rearrange the connected set into a compact organic cluster + zoom, all
+    //      via an eased tween advanced in the RAF loop (stepDataFocus). The draw
+    //      stays hue-batched (no per-node ops added to the hot path beyond one
+    //      lerp), so the 60fps budget holds. Reduced motion → instant.
+    var gFocus = false, gFocusK = 0, gConn = null, gClusterTargets = null;
+    var gViewTarget = null, gViewTweening = false, gPrevView = null;
+    function gConnSet(i0) { var s = {}; s[i0] = true; (GADJ[i0] || []).forEach(function (j) { s[j] = true; }); return s; }
+    function applyDataFocus() {
+      if (gSel === null) { gConn = null; gClusterTargets = null; return; }
+      gConn = gConnSet(gSel);
+      var ids = Object.keys(gConn).map(Number);
+      ids.sort(function (a, b) { return a === gSel ? -1 : (b === gSel ? 1 : a - b); });
+      var g = geom();
+      var GA = Math.PI * (3 - Math.sqrt(5));
+      var SP = Math.max(24, (g.R * 0.6) / Math.sqrt(Math.max(1, ids.length)));
+      gClusterTargets = {};
+      ids.forEach(function (i, k) { var r = k === 0 ? 0 : SP * Math.sqrt(k + 0.2), a = k * GA; gClusterTargets[i] = { x: Math.cos(a) * r, y: Math.sin(a) * r }; });
+      gViewTarget = { Z: Math.min(3, Math.max(Z, 1.7)), panX: 0, panY: 0 };
+      gViewTweening = true;
+      spinning = false; bSpin.setAttribute('aria-pressed', 'false');
+    }
+    function releaseDataFocus() { gConn = null; gClusterTargets = null; gViewTarget = gPrevView || { Z: 1, panX: 0, panY: 0 }; gViewTweening = true; }
+    function stepDataFocus(dt) {
+      var kf = REDUCED ? 1 : Math.min(1, dt * 6);
+      var wantK = (gFocus && gSel !== null && gClusterTargets) ? 1 : 0;
+      gFocusK += (wantK - gFocusK) * kf;
+      if (Math.abs(wantK - gFocusK) < 0.002) { gFocusK = wantK; }
+      if (gViewTweening && gViewTarget) {
+        Z += (gViewTarget.Z - Z) * kf; panX += (gViewTarget.panX - panX) * kf; panY += (gViewTarget.panY - panY) * kf;
+        if (Math.abs(gViewTarget.Z - Z) < 0.01 && Math.abs(gViewTarget.panX - panX) < 0.5 && Math.abs(gViewTarget.panY - panY) < 0.5) {
+          Z = gViewTarget.Z; panX = gViewTarget.panX; panY = gViewTarget.panY; gViewTweening = false;
+        }
+      }
     }
     var G_FAM_HUE = function (e) {
       return e.indexOf('execplan:') === 0 ? PAL.decision : e.indexOf('bench:') === 0 ? PAL.handoff : e.indexOf('incident:') === 0 ? PAL.incident : e.indexOf('design:') === 0 ? PAL.codex : e.indexOf('__work_comment__') === 0 ? PAL.done : PAL.untraced;
@@ -8656,7 +8862,14 @@
         var r = rIn + (rOut - rIn) * (1 - (0.08 + 0.84 * norm));
         n._px = Math.cos(a) * r; n._py = Math.sin(a) * r;
       });
+      // M13 focus mode — lerp the connected set's positions toward the compact
+      // cluster by gFocusK (0 = natural angle/radius, 1 = clustered). Unconnected
+      // nodes keep their natural spot and fade out (see the node/edge alpha below).
+      if (gFocusK > 0.001 && gClusterTargets) {
+        vis.forEach(function (n) { var t2 = gClusterTargets[n.i]; if (t2) { n._px += (t2.x - n._px) * gFocusK; n._py += (t2.y - n._py) * gFocusK; } });
+      }
       var hops = gSel !== null ? gHops(gSel) : null;
+      var gFoc = gFocusK > 0.001 && gConn;
       var inFocus = function (i2) { return gSel === null ? null : (i2 === gSel ? 0 : hops.l1[i2] ? 1 : hops.l2[i2] ? 2 : -1); };
       ctx2.strokeStyle = hair(.04); ctx2.lineWidth = 1 / Z;
       [0.25, 0.5, 0.75].forEach(function (cf) { ctx2.beginPath(); ctx2.arc(0, 0, rIn + (rOut - rIn) * cf, 0, 7); ctx2.stroke(); });
@@ -8667,6 +8880,7 @@
         if (na._px === undefined || nb._px === undefined) { return; }
         var alpha = 0.16;
         if (hops) { var fa = inFocus(na.i), fb = inFocus(nb.i); alpha = (fa >= 0 && fb >= 0) ? 0.6 : 0.03; }
+        if (gFoc) { var ec = gConn[na.i] && gConn[nb.i]; if (ec) { alpha = Math.max(alpha, 0.5); } else { alpha *= (1 - gFocusK); if (gFocusK > 0.98) { return; } } }
         var hue2 = G_FAM_HUE(na.e), key = hue2 + '|' + alpha;
         (edgeBuckets[key] = edgeBuckets[key] || { hue: hue2, alpha: alpha, segs: [] }).segs.push(na, nb);
       });
@@ -8688,6 +8902,7 @@
         var hue2 = G_FAM_HUE(n.e), f2 = inFocus(n.i), isH = hover === n;
         var alpha = 0.85;
         if (f2 !== null) { alpha = f2 === -1 ? 0.10 : f2 === 0 ? 1 : f2 === 1 ? 0.95 : 0.6; }
+        if (gFoc && !gConn[n.i]) { if (gFocusK > 0.98) { n._on = false; n._x = undefined; return; } alpha *= (1 - gFocusK); }
         var rr = (2.2 + Math.min(3, (n.t || 150) / 180)) * (isH || f2 === 0 ? 1.7 : 1);
         n._x = n._px; n._y = n._py; n._dr = rr; n._on = true;
         if (isH || f2 === 0) { special.push({ n: n, hue: hue2, rr: rr, f0: f2 === 0 }); }
@@ -8838,7 +9053,7 @@
       lensLabels.push({ x: 0, y: g.R + 42, cap: true, t: 'receipts lens · chain ticks forward only · illustrative until /v1/receipts/export is wired' });
     }
 
-    function kick() { if (rafId === null && cv.isConnected) { rafId = requestAnimationFrame(draw); } }
+    function kick() { if (rafId === null && !paused && cv.isConnected) { rafId = requestAnimationFrame(draw); } }
 
     // ---- controls ----
     function setPlaying(v) {
@@ -8993,7 +9208,11 @@
       return best;
     }
     function handleClick(e) {
-      if (lens === 'data') { var hit0 = hitTest(e); gSel = (hit0 && hit0.i !== undefined) ? (gSel === hit0.i ? null : hit0.i) : null; return; }
+      if (lens === 'data') {
+        var hit0 = hitTest(e); gSel = (hit0 && hit0.i !== undefined) ? (gSel === hit0.i ? null : hit0.i) : null;
+        if (gFocus) { if (gSel === null) { releaseDataFocus(); } else { applyDataFocus(); } }   // M13 — re-cluster / restore
+        return;
+      }
       if (lens === 'tokens') {
         var r2 = cv.getBoundingClientRect(), g2 = geom();
         var pd = toDisc(g2, e.clientX - r2.left, e.clientY - r2.top);
@@ -9208,14 +9427,34 @@
         Object.keys(tileByLens).forEach(function (x) { tileByLens[x].b.setAttribute('aria-pressed', String(x === ln)); });
         setSel(null); solo = null; hover = null; hoverSec = null; gSel = null; tokSel = null; hideTip();
         setLedger(false);
+        // M13 — leaving the data lens clears any focus isolation.
+        gFocus = false; gConn = null; gClusterTargets = null; gFocusK = 0; gViewTweening = false; bDataFocus.setAttribute('aria-pressed', 'false');
         if (lens === 'data') { var minD = Math.min.apply(null, GNODES.map(function (n) { return n.d; })) - 0.5; if (S < minD - 1) { rStart.value = Math.round((minD - 11) / (NOW - 11) * 1000); syncWindow(); } }
         grpTokViews.style.display = lens === 'tokens' ? 'flex' : 'none';
+        grpDataFocus.style.display = lens === 'data' ? 'flex' : 'none';
         fitView();   // reframe the ring for the new lens (clear of the bars)
       });
     });
     function setTokView(v) { tokView = v; bTokCum.setAttribute('aria-pressed', String(v === 'cum')); bTokDay.setAttribute('aria-pressed', String(v === 'day')); }
     bTokCum.addEventListener('click', function () { setTokView('cum'); });
     bTokDay.addEventListener('click', function () { setTokView('day'); });
+    bDataFocus.addEventListener('click', function () {
+      gFocus = !gFocus; bDataFocus.setAttribute('aria-pressed', String(gFocus));
+      if (gFocus) { gPrevView = { Z: Z, panX: panX, panY: panY }; applyDataFocus(); }
+      else { releaseDataFocus(); }
+      kick();
+    });
+    // Dev-only hook (mirror verification): deterministically select the highest-
+    // degree fact node so the data-lens focus mode can be exercised without a
+    // pixel-precise canvas click. Never present in prod (flag-gated).
+    if (typeof window !== 'undefined' && window.__CRUX_CONSOLE_DEV__) {
+      window.__ringsSelectDataNode = function () {
+        var best = -1, bi = null;
+        GNODES.forEach(function (n) { var d = (GADJ[n.i] || []).length; if (d > best) { best = d; bi = n.i; } });
+        gSel = bi; if (gFocus) { applyDataFocus(); } kick();
+        return { i: bi, deg: best };
+      };
+    }
 
     // ---- teardown + boot ----
     function onVis() { kick(); }
@@ -9223,6 +9462,8 @@
     function teardown() {
       if (rafId != null && typeof cancelAnimationFrame === 'function') { cancelAnimationFrame(rafId); }
       rafId = null;
+      if (fadeTimer) { clearTimeout(fadeTimer); fadeTimer = null; }       // M13 tab-hub timers
+      if (pauseWatch) { clearInterval(pauseWatch); pauseWatch = null; }
       if (ro) { try { ro.disconnect(); } catch (e) { /* noop */ } }
       if (io) { try { io.disconnect(); } catch (e) { /* noop */ } }
       if (themeObs) { try { themeObs.disconnect(); } catch (e) { /* noop */ } }
@@ -9261,6 +9502,96 @@
         var days = Object.keys(TOK.spent).map(Number).filter(isFinite).sort(function (a, b) { return a - b; });
         if (days.length >= 2) { daySpark(tTok.sp, days.map(function (dd) { return TOK.spent[dd]; }), tTok.hue); }
       }
+    }
+
+    // ---- M13: fixed tab hub (top-left) + swap-in host for the Overwatch views ----
+    //   Ring (default) shows the canvas; the other five tabs FADE the ring out,
+    //   hide the rings-only chrome (toolbar · play bar · bottom bar · tiles ·
+    //   detail pane — none of it applies to a list/board view), and swap in the
+    //   corresponding Overwatch view via the SHARED owRenderTab (same renderers,
+    //   same data paths — through the generated client only). The tab buttons
+    //   never move (fixed top-left, independent of the active tab). Reduced motion
+    //   → instant swap (no fade, no cascade). The draw loop is paused while hidden.
+    var fadeTimer = null, pauseWatch = null;
+    var RINGS_TABS = [
+      { id: 'ring', title: 'Ring' },
+      { id: 'cx-activity', title: 'Activity' },
+      { id: 'cx-coord', title: 'Live board' },
+      { id: 'cx-orchestrators', title: 'Orchestrators' },
+      { id: 'cx-punchcards', title: 'Punchcards' },
+      { id: 'ax-agent', title: 'Agent' }
+    ];
+    var ringTabBtns = {};
+    var ringTabBar = el('div', { 'class': 'rings-tabs', role: 'tablist', 'aria-label': 'Rings views' });
+    RINGS_TABS.forEach(function (t) {
+      var b = el('button', { 'class': 'rings-tab', type: 'button', role: 'tab', 'data-tab': t.id, 'aria-selected': t.id === 'ring' ? 'true' : 'false' }, [t.title]);
+      b.addEventListener('click', function () { setTab(t.id); });
+      ringTabBar.appendChild(b); ringTabBtns[t.id] = b;
+    });
+    stage.appendChild(ringTabBar);
+    var tabHost = el('div', { 'class': 'rings-tabhost', role: 'region', 'aria-label': 'Overwatch view' });
+    tabHost.hidden = true;
+    stage.appendChild(tabHost);
+
+    var ringChrome = [tools, cards, topbar, bottombar, pane];
+    function setChromeHidden(hide) {
+      ringChrome.forEach(function (elm) { if (elm) { elm.classList.toggle('rings-chrome-hidden', hide); } });
+    }
+    // "wow" cascade: staggered, lightly-scattered entrance of the view's real
+    // cards/panels (the honest read of the operator's "mesh, no alignment" — the
+    // list/board views have no fabricated entity mesh, so the cascade IS the mesh-
+    // assembling entrance of the REAL cards). Each item flies in from a seeded
+    // offset; final layout + data are untouched. Reduced-motion → no-op.
+    function jr(n) { var x = Math.sin(n * 99.71) * 43758.5453; return x - Math.floor(x); }
+    function ringsCascade(host) {
+      if (REDUCED) { return; }
+      var items = host.querySelectorAll('.v2card, .ow-panel');
+      for (var i = 0; i < items.length; i++) {
+        var it = items[i];
+        if (it.getAttribute('data-casc') === '1') { continue; }   // animate each card once
+        it.setAttribute('data-casc', '1');
+        it.style.setProperty('--casc-i', String(i));
+        it.style.setProperty('--casc-dx', ((jr(i) * 2 - 1) * 34).toFixed(1) + 'px');
+        it.style.setProperty('--casc-dy', (10 + jr(i + 7) * 20).toFixed(1) + 'px');
+        it.classList.add('rings-casc-item');
+      }
+    }
+    function paintTab(id) {
+      var p = owRenderTab(id, tabHost, ctxIn);
+      ringsCascade(tabHost);                                   // synchronous skeleton content
+      if (p && typeof p.then === 'function') { p.then(function () { ringsCascade(tabHost); }); }   // + the async data swap
+    }
+    function setTab(id) {
+      if (id === activeTab) { return; }
+      activeTab = id;
+      Object.keys(ringTabBtns).forEach(function (k) { ringTabBtns[k].setAttribute('aria-selected', k === id ? 'true' : 'false'); });
+      closePop(); closeModal();
+      if (fadeTimer) { clearTimeout(fadeTimer); fadeTimer = null; }
+      if (pauseWatch) { clearInterval(pauseWatch); pauseWatch = null; }
+      if (id === 'ring') {
+        tabHost.hidden = true; tabHost.textContent = '';
+        setChromeHidden(false);
+        root.classList.remove('rings-tab-active');            // fade the canvas back in
+        paused = false;
+        resize(); fitView(); kick();                          // resume the draw loop
+        return;
+      }
+      // Non-Ring: fade the ring out, hide the ring-only chrome, swap in the view.
+      setChromeHidden(true);
+      root.classList.add('rings-tab-active');                 // .rings-canvas opacity → 0 (CSS)
+      tabHost.hidden = false; tabHost.scrollTop = 0;
+      paintTab(id);
+      // Pause the RAF once the fade has finished (don't burn frames while hidden).
+      // A cheap watchdog still tears down cleanly if the route changes while paused
+      // (the paused RAF can't detect the canvas leaving the DOM on its own).
+      var stop = function () {
+        paused = true;
+        if (rafId != null && typeof cancelAnimationFrame === 'function') { cancelAnimationFrame(rafId); rafId = null; }
+        if (!pauseWatch && typeof setInterval === 'function') {
+          pauseWatch = setInterval(function () { if (!cv.isConnected) { clearInterval(pauseWatch); pauseWatch = null; teardown(); } }, 600);
+        }
+      };
+      if (REDUCED) { stop(); } else { fadeTimer = setTimeout(stop, 360); }
     }
 
     readPalette();   // M12 — seed the canvas palette from the theme tokens

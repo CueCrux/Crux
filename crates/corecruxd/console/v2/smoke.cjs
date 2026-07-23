@@ -1949,13 +1949,21 @@ function extractThemeVars(theme) {
     check(!/fillActivity/.test(landing), '[overwatch] landing must NOT render the Activity ticker panel (fillActivity removed — duplicates the Activity page)');
     check(!/activityTicker/.test(landing), '[overwatch] landing must NOT build an activity ticker');
     check(!/fillEngine\b/.test(landing), '[overwatch] landing must NOT render the standalone Engine panel (folded into the tiles)');
-    check(/fillNeedsYou/.test(landing) && /fillFleet/.test(landing), '[overwatch] landing must still fill Needs-you + Fleet');
-    check(/left\.appendChild\(needs\)/.test(landing) && /left\.appendChild\(fleet\)/.test(landing),
-      '[overwatch] the Activity tab must stack Needs-you then Fleet in the LEFT column');
-    check(/right\.appendChild\(actHost\)/.test(landing) && /renderPage\(page, actHost\)/.test(landing),
-      '[overwatch] the Activity tab must render the Activity page (cx-activity) in the RIGHT column (50%)');
     check(/ow-tabs/.test(landing) && /renderTab/.test(landing) && /ow-tabcontent/.test(landing),
       '[overwatch] the landing must render the view tab bar (ow-tabs) + swappable ow-tabcontent (renderTab)');
+  }
+  // M13 — the tab CONTENT renderer was extracted to the shared module-level
+  // owRenderTab so the Rings tab hub (renderRings) reuses the EXACT same view
+  // renderers + arrangement instead of forking them. The activity-layout
+  // assertions moved here with it; renderOverwatchLanding.renderTab delegates.
+  const owtab = funcBody(renderSrc, 'owRenderTab');
+  check(!!owtab, '[overwatch] render.js must define the shared owRenderTab (reused by the landing + the Rings tab hub)');
+  if (owtab) {
+    check(/fillNeedsYou/.test(owtab) && /fillFleet/.test(owtab), '[overwatch] owRenderTab must still fill Needs-you + Fleet');
+    check(/left\.appendChild\(needs\)/.test(owtab) && /left\.appendChild\(fleet\)/.test(owtab),
+      '[overwatch] the Activity tab must stack Needs-you then Fleet in the LEFT column');
+    check(/right\.appendChild\(actHost\)/.test(owtab) && /renderPage\(page, actHost\)/.test(owtab),
+      '[overwatch] the Activity tab must render the Activity page (cx-activity) in the RIGHT column (50%)');
   }
   // owPageNav reuses the page list from pages.js (dest==='overwatch'), never hardcoded.
   const nav = funcBody(renderSrc, 'owPageNav');
