@@ -425,6 +425,8 @@ function extractThemeVars(theme) {
     ['POST', '/v1/passports'],
     ['POST', '/v1/console/review/consolidations'],
     ['POST', '/v1/identity/candidates/{candidateId}/confirm'],
+    // console-surfaces-remediation M6: operator-gated "Seed candidates".
+    ['POST', '/v1/identity/candidates/propose'],
     ['PUT', '/v1/console/corecrux/lane-weights'],
     ['DELETE', '/v1/console/corecrux/lane-weights'],
     ['POST', '/v1/admin/restart'],

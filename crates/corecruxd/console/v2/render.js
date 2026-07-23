@@ -130,6 +130,16 @@
   function enrichAction(input) {
     return operatorGatedCall(function (g) { return g.actionsEnrich(input); });
   }
+  // M6 cx-identity: run the candidate proposers (the ONLY shipped producer of
+  // /v1/identity/candidates). Operator-gated, server admin:write-gated.
+  function seedIdentityCandidates() {
+    return operatorGatedCall(function (g) { return g.identityCandidatePropose({}); });
+  }
+  // M6 cx-identity: confirm a candidate by supplying the cross-signature proof —
+  // mints the resolving identity_link only after both signatures verify (daemon).
+  function confirmIdentityCandidate(candidateId, proof) {
+    return operatorGatedCall(function (g) { return g.identityCandidateConfirm(candidateId, proof); });
+  }
 
   // Parse a fetch Response without ever throwing — the read counterpart of the
   // gated helpers above.
@@ -2418,6 +2428,11 @@
     if (page.id === 'cx-facts') { container.textContent = ''; renderFactsBrowser(container); return Promise.resolve(); }
     if (page.id === 'cx-sessions') { container.textContent = ''; renderSessionsBrowser(container); return Promise.resolve(); }
     if (page.id === 'cx-cost') { container.textContent = ''; renderCostBrowser(container); return Promise.resolve(); }
+    // M6 trust cluster — custom-rendered (live listing / honest posture panels).
+    if (page.id === 'cx-receipts') { container.textContent = ''; renderReceiptsBrowser(container); return Promise.resolve(); }
+    if (page.id === 'cx-gates') { container.textContent = ''; renderGatesBoard(container); return Promise.resolve(); }
+    if (page.id === 'cx-identity') { container.textContent = ''; renderIdentityBrowser(container); return Promise.resolve(); }
+    if (page.id === 'cx-mediation') { container.textContent = ''; renderMediationPosture(container); return Promise.resolve(); }
     if (page.operatorOnly && !isOperator()) {
       renderSections(container, [{ h: page.title, wide: true, controls: [
         { t: 'info', label: 'operator only', v: 'This surface is only available in operator posture.' },
@@ -6724,6 +6739,553 @@
     }
     // DEFAULT-ON: pull the all-sessions lane immediately (no session id required).
     loadFresh();
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  M6 trust cluster — shared helpers for the four custom-rendered pages below.
+  // ─────────────────────────────────────────────────────────────────────────
+  function m6ShortTime(iso) { var s = String(iso || ''); return s.length >= 19 ? s.slice(0, 19).replace('T', ' ') : (s || '—'); }
+  function m6Short(v, n) { var s = String(v == null ? '' : v); return s.length > n ? s.slice(0, n) + '…' : s; }
+  function m6PrettyJson(v) { try { return JSON.stringify(v, null, 2); } catch (e) { return String(v); } }
+  function m6Kv(pairs) {
+    var meta = el('div', { 'class': 'facts-kv' });
+    pairs.forEach(function (kv) {
+      if (kv[1] == null || kv[1] === '') { return; }
+      meta.appendChild(el('span', { 'class': 'facts-kv-k', text: kv[0] }));
+      meta.appendChild(el('span', { 'class': 'facts-kv-v', text: String(kv[1]) }));
+    });
+    return meta;
+  }
+  function m6Label(t) { return el('div', { 'class': 'facts-vlabel', text: t }); }
+  function m6Empty(t) { return el('p', { 'class': 'ctl-desc sess-empty', text: t }); }
+  function m6Chip(cls, text, title) { return el('span', { 'class': cls, title: title || '' }, [String(text)]); }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  cx-receipts (M6): live CROWN receipt listing over GET /v1/receipts/list
+  //  (the new CE-local route). Newest-first rows (ts · kind chip · principal ·
+  //  session pill · signer short + alg · body-hash short), Load-older cursor
+  //  pagination, client-side search + kind chips. Row click → detail drawer:
+  //  envelope fields, and for the fetchable ad_ga_* class the drawer pulls
+  //  /v1/receipts/{id} + /signature + /verification THROUGH THE CLIENT and renders
+  //  the daemon verification verdict VERBATIM (never a client-side "valid" claim).
+  //  Envelope-only rows say why the body is unavailable on a CPU-only daemon.
+  //  Through-client only (fetchJSON + CruxApi named methods), el()/textContent.
+  // ─────────────────────────────────────────────────────────────────────────
+  function renderReceiptsBrowser(host) {
+    host.textContent = '';
+    var TENANT = 'default';
+    function kindTone(kind) {
+      var k = String(kind || '');
+      if (k.indexOf('approval') >= 0 || k.indexOf('gate') >= 0) { return 'trust'; }
+      if (k.indexOf('mediation') >= 0 || k.indexOf('witness') >= 0) { return 'acc'; }
+      if (k.indexOf('error') >= 0 || k.indexOf('deny') >= 0 || k.indexOf('reject') >= 0) { return 'crit'; }
+      if (k.indexOf('model') >= 0 || k.indexOf('response') >= 0 || k.indexOf('stop') >= 0) { return 'ok'; }
+      return 'ink3';
+    }
+    function qs(obj) { var p = []; Object.keys(obj).forEach(function (k) { if (obj[k] != null && obj[k] !== '') { p.push(encodeURIComponent(k) + '=' + encodeURIComponent(obj[k])); } }); return p.join('&'); }
+
+    var state = { rows: [], seen: {}, q: '', kind: '', nextCursor: null, hasMore: false, matched: null, kindCounts: {}, loading: false, token: 0, deb: null };
+
+    var searchInput = el('input', { 'class': 'facts-input', type: 'search', placeholder: 'search id / principal / kind / signer…', 'aria-label': 'search receipts' });
+    function field(label, node) { return el('label', { 'class': 'facts-field' }, [el('span', { text: label }), node]); }
+    var toolbar = el('div', { 'class': 'facts-toolbar' }, [field('search', searchInput)]);
+    var countLine = el('p', { 'class': 'facts-count' });
+    var chipsWrap = el('div', { 'class': 'facts-chips' });
+    var banner = el('div', { 'class': 'facts-banner' }); banner.style.display = 'none';
+    var listWrap = el('div', { 'class': 'facts-groups' });
+    var moreWrap = el('div', { 'class': 'facts-more' });
+    var help = el('div', { 'class': 'facts-banner m6-help' }, [
+      el('div', { 'class': 'm6-help-h', text: 'Verify a receipt offline' }),
+      el('p', { 'class': 'ctl-desc', text: 'The signed envelope (signer · alg · body hash · chain seq) is listed here for every observation. A CPU-only Crux daemon holds no dataplane, so the full CROWN body / signature / verification is dereferenceable only for the local ad_ga_* gate-approval receipts (open one to pull the daemon verdict verbatim). Dataplane receipts live in the hosted tier.' }),
+      el('p', { 'class': 'ctl-desc', text: 'Offline: corecruxctl inspect-receipt <id> (or corecruxctl evidence <id> --keyring <path>) checks the Ed25519 signature without the daemon. Bundle export: GET /v1/replay/exports/receipts/{id}.' })
+    ]);
+    host.appendChild(el('div', { 'class': 'facts-browser' }, [toolbar, countLine, chipsWrap, banner, listWrap, moreWrap, help]));
+
+    function matches(r, q) {
+      if (!q) { return true; }
+      var rc = r.receipt || {};
+      return ((r.observation_id || '') + ' ' + (r.principal || '') + ' ' + (r.kind || '') + ' ' + (r.session_id || '') + ' ' + (rc.signed_by || '') + ' ' + (r.receipt_id || '')).toLowerCase().indexOf(q) >= 0;
+    }
+    function visibleRows() {
+      var q = state.q;
+      return state.rows.filter(function (r) { return (!state.kind || r.kind === state.kind) && matches(r, q); });
+    }
+    function paintCount() {
+      countLine.textContent = '';
+      var vis = visibleRows().length;
+      var kids = [el('b', { text: String(vis) }), ' shown'];
+      if (state.q || state.kind) { kids.push(' (filtered)'); }
+      kids.push(' · '); kids.push(el('b', { text: String(state.rows.length) })); kids.push(' loaded');
+      if (state.matched != null) { kids.push(' · '); kids.push(el('b', { text: String(state.matched) })); kids.push(' on this daemon'); }
+      kids.forEach(function (k) { countLine.appendChild(typeof k === 'string' ? doc().createTextNode(k) : k); });
+    }
+    function paintChips() {
+      chipsWrap.textContent = '';
+      var counts = state.kindCounts || {};
+      var keys = Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a]; }).slice(0, 12);
+      if (!keys.length) { return; }
+      var allChip = el('button', { 'class': 'facts-chip' + (state.kind ? '' : ' on'), type: 'button', title: 'all kinds' }, ['all']);
+      allChip.addEventListener('click', function () { state.kind = ''; paint(); });
+      chipsWrap.appendChild(allChip);
+      keys.forEach(function (k) {
+        var active = state.kind === k;
+        var chip = el('button', { 'class': 'facts-chip' + (active ? ' on' : ''), type: 'button', title: 'filter to kind ' + k }, [el('span', { text: k }), el('span', { 'class': 'c', text: String(counts[k]) })]);
+        chip.addEventListener('click', function () { state.kind = active ? '' : k; paint(); });
+        chipsWrap.appendChild(chip);
+      });
+    }
+    function rowEl(r) {
+      var rc = r.receipt || {};
+      var head = el('div', { 'class': 'facts-rhead' }, [
+        m6Chip('rcpt-kind tone-' + kindTone(r.kind), r.kind || 'observation', 'observation kind'),
+        el('span', { 'class': 'facts-entity', text: r.principal || '(no principal)' }),
+        r.session_short ? m6Chip('sess-chip', r.session_short, 'session ' + (r.session_id || '')) : null,
+        el('span', { 'class': 'facts-time', text: m6ShortTime(r.ts) })
+      ]);
+      var metaChips = el('div', { 'class': 'sess-rmeta' }, [
+        m6Chip('sess-chip', (rc.alg || '?') + ' · ' + (rc.signed_by_short || '—'), 'signer ' + (rc.signed_by || '')),
+        m6Chip('sess-chip', 'hash ' + (rc.body_hash_short || '—'), rc.body_hash || ''),
+        (r.seq != null) ? m6Chip('sess-chip', 'seq ' + r.seq, 'per-session chain sequence') : null,
+        r.fetchable ? m6Chip('sess-chip rcpt-fetchable', 'CROWN body ✓', 'full body/signature/verification fetchable (ad_ga_*)') : m6Chip('sess-chip rcpt-envonly', 'envelope only', 'body lives in the hosted-tier dataplane')
+      ]);
+      var detail = el('div', { 'class': 'facts-detail' });
+      var row = el('div', { 'class': 'facts-row tone-' + kindTone(r.kind), role: 'button', tabindex: '0' }, [head, metaChips, detail]);
+      var opened = false;
+      function toggle() { if (row.classList.contains('open')) { row.classList.remove('open'); return; } row.classList.add('open'); if (!opened) { opened = true; expandDetail(detail, r); } }
+      row.addEventListener('click', function (e) { if (e.target && e.target.closest && e.target.closest('.facts-detail')) { return; } toggle(); });
+      row.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+      return row;
+    }
+    function expandDetail(detail, r) {
+      var rc = r.receipt || {};
+      detail.textContent = '';
+      detail.appendChild(m6Label('receipt envelope'));
+      detail.appendChild(m6Kv([
+        ['observation_id', r.observation_id], ['session_id', r.session_id], ['ts', r.ts],
+        ['principal', r.principal], ['kind', r.kind], ['chain seq', r.seq],
+        ['alg', rc.alg], ['signed_by', rc.signed_by], ['body_hash', rc.body_hash]
+      ]));
+      if (!r.fetchable) {
+        detail.appendChild(m6Empty('Envelope only. This CPU-only daemon holds no dataplane pool, so the full CROWN body, signature, and verification are not dereferenceable here — dataplane receipts live in the hosted tier. The signed envelope above is the daemon record for this observation.'));
+        return;
+      }
+      detail.appendChild(m6Label('CROWN body / signature / verification'));
+      var slot = el('div', { 'class': 'facts-loading', text: 'fetching receipt ' + m6Short(r.receipt_id, 20) + '…' });
+      detail.appendChild(slot);
+      var id = r.receipt_id;
+      Promise.all([
+        fetchVia(function () { return window.CruxApi.receiptsByReceiptId(id, { tenant_id: TENANT }); }),
+        fetchVia(function () { return window.CruxApi.receiptsByReceiptIdSignature(id, { tenant_id: TENANT }); }),
+        fetchVia(function () { return window.CruxApi.receiptsByReceiptIdVerification(id, { tenant_id: TENANT }); })
+      ]).then(function (rr) {
+        var body = rr[0], sig = rr[1], ver = rr[2];
+        slot.textContent = '';
+        var wrap = el('div', {});
+        wrap.appendChild(m6Kv([
+          ['receipt_id', id],
+          ['body', body.ok ? ('seq ' + (body.data && body.data.seq) + ' · ' + (body.data && body.data.contentType || 'body')) : ('unavailable (HTTP ' + (body.status || '?') + ')')],
+          ['signature', sig.ok ? ('seq ' + (sig.data && sig.data.seq) + ' · ' + (sig.data && sig.data.contentType || 'sig')) : ('unavailable (HTTP ' + (sig.status || '?') + ')')]
+        ]));
+        // Verification verdict — rendered VERBATIM from the daemon report; the
+        // console NEVER computes or claims "valid" itself.
+        wrap.appendChild(m6Label('verification verdict (daemon, verbatim)'));
+        if (!ver.ok || !ver.data) {
+          wrap.appendChild(m6Empty('Verification unavailable (HTTP ' + (ver.status || '?') + ') — GET /v1/receipts/' + id + '/verification.'));
+        } else {
+          var v = ver.data;
+          var verdictClass = (v.signature_valid === true && v.error_code === 'OK') ? 'rcpt-verdict ok' : 'rcpt-verdict bad';
+          wrap.appendChild(el('div', { 'class': verdictClass }, [
+            el('span', { 'class': 'rcpt-verdict-k', text: 'signature_valid' }), el('b', { text: String(v.signature_valid) }),
+            el('span', { 'class': 'rcpt-verdict-k', text: 'error_code' }), el('b', { text: String(v.error_code) })
+          ]));
+          wrap.appendChild(el('pre', { 'class': 'facts-vfull', text: m6PrettyJson(v) }));
+        }
+        detail.appendChild(wrap);
+      });
+    }
+    function paint() {
+      var q = (searchInput.value || '').trim().toLowerCase();
+      state.q = q;
+      listWrap.textContent = '';
+      var vis = visibleRows();
+      if (!state.rows.length) { listWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: state.loading ? 'loading receipts…' : 'No receipts. Receipts are minted on every signed observation (POST /v1/sessions/{id}/observations) and on gate approvals.' })); }
+      else if (!vis.length) { listWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'No receipts match the filter.' })); }
+      else { vis.forEach(function (r) { listWrap.appendChild(rowEl(r)); }); }
+      paintCount(); paintChips();
+    }
+    function paintMore() {
+      moreWrap.textContent = '';
+      if (state.hasMore) {
+        var btn = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Load older']);
+        btn.addEventListener('click', loadNext);
+        moreWrap.appendChild(btn);
+      } else if (state.rows.length) {
+        moreWrap.appendChild(el('p', { 'class': 'ctl-desc', text: 'End of the receipt journal.' }));
+      }
+    }
+    function loadPage(cursor, isFirst) {
+      if (state.loading) { return; }
+      state.loading = true;
+      if (isFirst) { paint(); }
+      var myToken = state.token;
+      var query = { limit: 50 };
+      if (cursor) { query.before = cursor; }
+      fetchJSON('/v1/receipts/list?' + qs(query)).then(function (res) {
+        if (myToken !== state.token) { return; }
+        state.loading = false;
+        if (!res.ok || !res.data) {
+          banner.style.display = ''; banner.className = 'facts-banner err';
+          banner.textContent = 'Receipts listing unavailable — ' + (res.status === 0 ? 'daemon unreachable' : 'HTTP ' + res.status) + ' (needs the console-surfaces-remediation branch: GET /v1/receipts/list).';
+          return;
+        }
+        banner.style.display = 'none';
+        var d = res.data;
+        state.matched = d.matched; state.nextCursor = d.next_cursor || null; state.hasMore = !!d.has_more;
+        if (isFirst && d.kind_counts) { state.kindCounts = d.kind_counts; }
+        (d.rows || []).forEach(function (r) { var k = r.observation_id; if (k && state.seen[k]) { return; } if (k) { state.seen[k] = true; } state.rows.push(r); });
+        paint(); paintMore();
+      });
+    }
+    function loadNext() { if (!state.loading && state.hasMore) { loadPage(state.nextCursor, false); } }
+    searchInput.addEventListener('input', function () { clearTimeout(state.deb); state.deb = setTimeout(paint, 200); });
+    loadPage(null, true);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  cx-gates (M6): the canonical Art.14 approval queue. Live pending list over
+  //  GET /v1/work/gate/pending (unchanged endpoint); when empty, a RICH,
+  //  code-grounded empty state — what a gate is (PendingGateAction), the
+  //  BlockerKind taxonomy (needs_info | needs_approval), how one is created, and
+  //  a client-side join over /v1/work linking blocked items owed an approval.
+  //  Approvals stay operator-gated (approveGate/rejectGate → operatorGatedCall).
+  // ─────────────────────────────────────────────────────────────────────────
+  function renderGatesBoard(host) {
+    host.textContent = '';
+    function ageOf(unixMs) {
+      var at = Number(unixMs); if (!isFinite(at) || at <= 0) { return 'age unknown'; }
+      var m = Math.floor(Math.max(0, Date.now() - at) / 60000);
+      if (m < 1) { return 'just now'; } if (m < 60) { return m + 'm ago'; }
+      var h = Math.floor(m / 60); if (h < 24) { return h + 'h ago'; } return Math.floor(h / 24) + 'd ago';
+    }
+    var state = { pending: [], work: [], loading: false, token: 0 };
+    var head = el('p', { 'class': 'facts-count' });
+    var banner = el('div', { 'class': 'facts-banner' }); banner.style.display = 'none';
+    var listWrap = el('div', { 'class': 'facts-groups' });
+    host.appendChild(el('div', { 'class': 'facts-browser' }, [head, banner, listWrap]));
+
+    function workLink(id) {
+      return el('a', { 'class': 'btn-quiet cx-graphlink', href: '#/canvas/graph?focus=work:' + id, title: 'open ' + id + ' in the relation graph' }, ['View work item']);
+    }
+    function pendingRow(p) {
+      var rows = m6Kv([
+        ['action id', p.action_id], ['work id', p.work_id],
+        ['requested', (p.requested_action || 'update_state') + (p.target_state ? ' → ' + p.target_state : '')],
+        ['by passport', p.requested_by_passport], ['status', p.status || 'pending'], ['requested', ageOf(p.requested_at_unix_ms)]
+      ]);
+      var links = el('div', { 'class': 'sess-rmeta' }, [workLink(p.work_id)]);
+      var actions = el('div', { 'class': 'gate-actions' });
+      if (isOperator()) {
+        var msg = el('span', { 'class': 'ctl-desc' });
+        var approve = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Approve']);
+        var reject = el('button', { 'class': 'btn-quiet danger', type: 'button' }, ['Reject']);
+        function run(fn, verb) {
+          var pp = boundPassport();
+          if (!pp) { msg.textContent = 'Bind a passport first (Art.14 — approvals are passport-attributed).'; return; }
+          approve.disabled = reject.disabled = true; msg.textContent = verb + '…';
+          fn(p.action_id, pp).then(readJson).then(function (r) {
+            msg.textContent = (r && r.ok) ? (verb + ' recorded · receipt ' + m6Short((r.data && (r.data.receipt_id || (r.data.gate && r.data.gate.receipt_id))) || '—', 18)) : (verb + ' failed (HTTP ' + (r && r.status) + ')');
+            load();
+          }, function () { msg.textContent = verb + ' failed.'; approve.disabled = reject.disabled = false; });
+        }
+        approve.addEventListener('click', function () { run(approveGate, 'Approve'); });
+        reject.addEventListener('click', function () { run(rejectGate, 'Reject'); });
+        actions.appendChild(approve); actions.appendChild(reject); actions.appendChild(msg);
+      } else {
+        actions.appendChild(el('p', { 'class': 'ctl-desc', text: 'Approvals are operator-gated (Art.14) — grant an operator scope to approve or reject from the Overwatch “needs you” lane.' }));
+      }
+      var detail = el('div', { 'class': 'facts-detail' }, [rows, links, actions]);
+      var badge = m6Chip('sess-chip sess-chip-plan', 'GATED', 'Art.14 human approval');
+      var body = el('div', {}, [
+        el('div', { 'class': 'facts-rhead' }, [el('span', { 'class': 'facts-key', text: p.work_id || '(work)' }), badge, el('span', { 'class': 'facts-time', text: ageOf(p.requested_at_unix_ms) })]),
+        el('div', { 'class': 'facts-val', text: (p.requested_action || 'update_state') + (p.target_state ? ' → ' + p.target_state : '') + ' · by ' + (p.requested_by_passport || '?') }),
+        detail
+      ]);
+      var row = el('div', { 'class': 'facts-row open tone-warn' }, [body]);
+      return row;
+    }
+    function richEmpty() {
+      var wrap = el('div', {});
+      wrap.appendChild(el('div', { 'class': 'facts-banner ok-empty' }, [
+        el('div', { 'class': 'm6-help-h', text: 'No gates pending — the queue is clear.' }),
+        el('p', { 'class': 'ctl-desc', text: 'This is the canonical Art.14 approval queue. A gate is a PendingGateAction: it is created when an agent requests a work-item state transition that the work-gate policy holds for a human go/no-go (e.g. a destructive or high-risk update_state). It waits here with status “pending” until an operator approves or rejects — that decision mints a CROWN approval receipt (ad_ga_*), visible on the Receipts page.' })
+      ]));
+      wrap.appendChild(m6Label('how a gate is created'));
+      wrap.appendChild(m6Kv([
+        ['producer', 'work-gate policy on a state transition (WorkTransition → PendingGateAction)'],
+        ['endpoint', 'GET /v1/work/gate/pending (this page) · POST /v1/work/gate/{actionId}/approve|reject'],
+        ['requested_action', 'update_state (the only gated action today) + target_state'],
+        ['resolution', 'approve/reject → CROWN ad_ga_* receipt, attributed to the approving passport']
+      ]));
+      wrap.appendChild(m6Label('blocker taxonomy (work.rs BlockerKind)'));
+      wrap.appendChild(m6Kv([
+        ['needs_info', 'blocked, waiting on an answer about the task'],
+        ['needs_approval', 'blocked, waiting on an owner’s go/no-go — a HINT an approval is owed (not the gate itself; the gate stays keyed on passport/risk)']
+      ]));
+      // Client-side join: blocked work items owed an approval → the producers a
+      // gate would come from. Cheap single read of /v1/work.
+      var owed = state.work.filter(function (w) { return w && w.state === 'blocked' && (w.blocker_kind === 'needs_approval'); });
+      wrap.appendChild(m6Label('work items owed an approval (blocked · needs_approval)'));
+      if (!owed.length) {
+        wrap.appendChild(m6Empty('None — no blocked work item currently carries blocker_kind = needs_approval on /v1/work.'));
+      } else {
+        owed.slice(0, 25).forEach(function (w) {
+          var r = el('div', { 'class': 'facts-row tone-warn' }, [
+            el('div', { 'class': 'facts-rhead' }, [el('span', { 'class': 'facts-key', text: w.id }), m6Chip('sess-chip', 'needs_approval', 'blocker kind'), el('span', { 'class': 'facts-time', text: w.state })]),
+            w.title ? el('div', { 'class': 'facts-val', text: w.title }) : null,
+            el('div', { 'class': 'sess-rmeta' }, [workLink(w.id)])
+          ]);
+          wrap.appendChild(r);
+        });
+      }
+      return wrap;
+    }
+    function paint() {
+      listWrap.textContent = '';
+      var pend = (state.pending || []).filter(function (p) { return (p.status || 'pending') === 'pending'; });
+      head.textContent = '';
+      head.appendChild(el('b', { text: String(pend.length) }));
+      head.appendChild(doc().createTextNode(' pending · /v1/work/gate/pending'));
+      if (pend.length) { pend.forEach(function (p) { listWrap.appendChild(pendingRow(p)); }); }
+      else { listWrap.appendChild(richEmpty()); }
+    }
+    function load() {
+      if (state.loading) { return; } state.loading = true; state.token++;
+      var myToken = state.token;
+      Promise.all([fetchJSON('/v1/work/gate/pending'), fetchJSON('/v1/work?source=all')]).then(function (rr) {
+        if (myToken !== state.token) { return; }
+        state.loading = false;
+        var g = rr[0], w = rr[1];
+        if (!g.ok || !g.data) { banner.style.display = ''; banner.className = 'facts-banner err'; banner.textContent = 'Gates unavailable — ' + (g.status === 0 ? 'daemon unreachable' : 'HTTP ' + g.status) + '.'; listWrap.textContent = ''; return; }
+        banner.style.display = 'none';
+        state.pending = g.data.pending || [];
+        state.work = (w.ok && w.data) ? (w.data.work || w.data.items || w.data.work_items || []) : [];
+        paint();
+      });
+    }
+    load();
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  cx-identity (M6): the candidate-links surface. (a) an in-page help panel
+  //  grounded in the code (what a candidate is, the NEW propose route + its two
+  //  inputs, how consent disposes, the flag); (b) live candidates from
+  //  /v1/identity/candidates (honest 404 naming the flag when off); (c) an
+  //  operator-gated "Seed candidates" action wired to POST /v1/identity/candidates/
+  //  propose through operatorGatedCall (disabled + reason in customer posture);
+  //  confirm kept under the operator-gating idiom.
+  // ─────────────────────────────────────────────────────────────────────────
+  function renderIdentityBrowser(host) {
+    host.textContent = '';
+    var state = { candidates: [], status: 0, loading: false, token: 0 };
+
+    var help = el('div', { 'class': 'facts-banner m6-help' }, [
+      el('div', { 'class': 'm6-help-h', text: 'Candidate links — inference proposes, consent disposes' }),
+      el('p', { 'class': 'ctl-desc', text: 'A candidate is a PROPOSAL that two identities (a local passport and an observed subject) may be the same principal. Candidates never resolve on their own — the principal resolver ignores them until an operator confirms.' })
+    ]);
+    var pipeline = el('div', {});
+    pipeline.appendChild(m6Label('what writes candidates'));
+    pipeline.appendChild(m6Kv([
+      ['producer', 'POST /v1/identity/candidates/propose (the NEW M6 seed route — the only shipped producer)'],
+      ['input · bindings', 'session→passport bindings: two distinct passports co-occurring in one tenant+project within the temporal window'],
+      ['input · observations', 'observation-journal principals: distinct signing identities co-occurring in one session'],
+      ['confirm', 'POST …/{id}/confirm with the cross-signature proof → mints a resolving, cross-signed identity_link'],
+      ['reject', 'POST …/{id}/reject → keeps the audit trail, never resolves'],
+      ['revoke', 'POST /v1/identity/links/{id}/revoke → retires a confirmed link'],
+      ['flag', 'CORECRUXD_IDENTITY_LINKS=1 (all /v1/identity/* 404 when off)']
+    ]));
+    help.appendChild(pipeline);
+
+    var seedWrap = el('div', { 'class': 'facts-toolbar', 'style': 'margin-top:10px' });
+    var seedMsg = el('span', { 'class': 'ctl-desc' });
+    var seedBtn = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Seed candidates']);
+    if (!isOperator()) {
+      seedBtn.disabled = true;
+      seedBtn.setAttribute('data-requires', 'operator');
+      seedBtn.setAttribute('title', 'operator posture required — the seed route is admin:write');
+      seedMsg.textContent = 'Operator posture required to run the proposers (admin:write).';
+    } else {
+      seedBtn.addEventListener('click', function () {
+        seedBtn.disabled = true; seedMsg.textContent = 'running proposers…';
+        seedIdentityCandidates().then(readJson).then(function (r) {
+          seedBtn.disabled = false;
+          if (r && r.ok && r.data) {
+            var by = r.data.by_source || {};
+            seedMsg.textContent = 'created ' + r.data.created + ' (examined ' + r.data.examined + ') · bindings ' + ((by.bindings && by.bindings.created) || 0) + '/' + ((by.bindings && by.bindings.examined) || 0) + ' · observations ' + ((by.observations && by.observations.created) || 0) + '/' + ((by.observations && by.observations.examined) || 0);
+            load();
+          } else { seedMsg.textContent = 'seed failed (HTTP ' + (r && r.status) + ')'; }
+        }, function () { seedBtn.disabled = false; seedMsg.textContent = 'seed failed.'; });
+      });
+    }
+    seedWrap.appendChild(seedBtn); seedWrap.appendChild(seedMsg);
+    help.appendChild(seedWrap);
+
+    var countLine = el('p', { 'class': 'facts-count' });
+    var banner = el('div', { 'class': 'facts-banner' }); banner.style.display = 'none';
+    var listWrap = el('div', { 'class': 'facts-groups' });
+    host.appendChild(el('div', { 'class': 'facts-browser' }, [help, countLine, banner, listWrap]));
+
+    function candidateRow(c) {
+      var cand = c.candidate || c;
+      var id = c.candidate_id || cand.candidate_id || c.id;
+      var status = String(cand.status || 'proposed');
+      var signals = (cand.signals || []).map(function (s) { return s.kind; }).join(' · ');
+      var detail = el('div', { 'class': 'facts-detail' }, [
+        m6Kv([
+          ['candidate_id', id], ['status', status],
+          ['local passport', cand.local_passport_fpr], ['observed subject', cand.observed_subject],
+          ['confidence', cand.confidence], ['signals', signals || '—'],
+          ['evidence', (cand.evidence_refs || []).join(', ')], ['proposed at', cand.proposed_at],
+          ['resolved link', cand.resolved_link_id]
+        ])
+      ]);
+      if (status === 'proposed' && isOperator()) {
+        detail.appendChild(m6Label('confirm (operator — needs the cross-signature proof)'));
+        var f = {};
+        function inp(k, ph, v) { var i = el('input', { 'class': 'facts-input', type: 'text', placeholder: ph }); if (v) { i.value = v; } f[k] = i; return el('label', { 'class': 'facts-field' }, [el('span', { text: k }), i]); }
+        var form = el('div', { 'class': 'facts-toolbar' }, [
+          inp('local_passport_id', 'personal-default', 'personal-default'),
+          inp('remote_fpr', 'p_… (= observed subject)', cand.observed_subject || ''),
+          inp('remote_public_key_hex', '64 hex chars'),
+          inp('created_at', '2026-06-15T00:00:00Z'),
+          inp('sig_local', '128 hex chars'),
+          inp('sig_remote', '128 hex chars')
+        ]);
+        var cmsg = el('span', { 'class': 'ctl-desc' });
+        var confirmBtn = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Confirm candidate']);
+        confirmBtn.addEventListener('click', function () {
+          confirmBtn.disabled = true; cmsg.textContent = 'verifying signatures…';
+          confirmIdentityCandidate(id, {
+            local_passport_id: f.local_passport_id.value, remote_fpr: f.remote_fpr.value,
+            remote_public_key_hex: f.remote_public_key_hex.value, created_at: f.created_at.value,
+            sig_local: f.sig_local.value, sig_remote: f.sig_remote.value
+          }).then(readJson).then(function (r) {
+            confirmBtn.disabled = false;
+            cmsg.textContent = (r && r.ok) ? 'confirmed → identity_link minted' : 'rejected by daemon (HTTP ' + (r && r.status) + ') — ' + m6Short((r.data && (r.data.detail || r.data.title)) || 'signatures must verify', 80);
+            if (r && r.ok) { load(); }
+          }, function () { confirmBtn.disabled = false; cmsg.textContent = 'confirm failed.'; });
+        });
+        detail.appendChild(form); detail.appendChild(confirmBtn); detail.appendChild(cmsg);
+        detail.appendChild(el('p', { 'class': 'ctl-desc', text: 'Reject is an API/CLI action: POST /v1/identity/candidates/' + id + '/reject (keeps the audit trail).' }));
+      }
+      var tone = status === 'confirmed' ? 'ok' : (status === 'rejected' ? 'crit' : 'trust');
+      var row = el('div', { 'class': 'facts-row tone-' + tone, role: 'button', tabindex: '0' }, [
+        el('div', { 'class': 'facts-rhead' }, [el('span', { 'class': 'facts-key', text: id }), m6Chip('sess-chip', status, 'candidate status'), el('span', { 'class': 'facts-time', text: (cand.confidence != null ? 'conf ' + cand.confidence : '') })]),
+        el('div', { 'class': 'facts-val', text: (cand.observed_subject || '') + (signals ? ' · ' + signals : '') }),
+        detail
+      ]);
+      var opened = false;
+      function toggle() { var o = row.classList.toggle('open'); if (o && !opened) { opened = true; } }
+      row.addEventListener('click', function (e) { if (e.target && e.target.closest && e.target.closest('.facts-detail')) { return; } toggle(); });
+      row.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+      return row;
+    }
+    function paint() {
+      listWrap.textContent = ''; countLine.textContent = '';
+      if (state.status === 404) {
+        banner.style.display = ''; banner.className = 'facts-banner warn';
+        banner.textContent = 'Identity links are disabled on this daemon (all /v1/identity/* return 404). Set CORECRUXD_IDENTITY_LINKS=1 to enable candidates, the seed route, and confirmation.';
+        return;
+      }
+      banner.style.display = 'none';
+      countLine.appendChild(el('b', { text: String(state.candidates.length) }));
+      countLine.appendChild(doc().createTextNode(' candidate' + (state.candidates.length === 1 ? '' : 's') + ' · /v1/identity/candidates'));
+      if (!state.candidates.length) { listWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'No candidates yet. Run “Seed candidates” above (operator) to propose from session bindings + observation principals — a fresh workspace has no other producer.' })); return; }
+      state.candidates.forEach(function (c) { listWrap.appendChild(candidateRow(c)); });
+    }
+    function load() {
+      if (state.loading) { return; } state.loading = true; state.token++;
+      var myToken = state.token;
+      fetchJSON('/v1/identity/candidates').then(function (res) {
+        if (myToken !== state.token) { return; }
+        state.loading = false; state.status = res.status;
+        if (res.status === 404) { paint(); return; }
+        if (!res.ok || !res.data) { banner.style.display = ''; banner.className = 'facts-banner err'; banner.textContent = 'Candidates unavailable — HTTP ' + res.status + '.'; return; }
+        state.candidates = res.data.candidates || [];
+        paint();
+      });
+    }
+    load();
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  cx-mediation (M6): honest CE posture over GET /v1/console/engine/summary,
+  //  branching on the THREE real states — 404 "engine mediation not configured"
+  //  → CE posture card; 502 "engine upstream unavailable" → configured-but-
+  //  unreachable card; 200 → the proxied summary with its mediated/reachable/
+  //  latency stamps. No dead controls are rendered (customer-safe by omission).
+  // ─────────────────────────────────────────────────────────────────────────
+  function renderMediationPosture(host) {
+    host.textContent = '';
+    var banner = el('div', { 'class': 'facts-banner' }); banner.style.display = 'none';
+    var body = el('div', {});
+    host.appendChild(el('div', { 'class': 'facts-browser' }, [banner, body]));
+
+    function ceCard() {
+      var wrap = el('div', {});
+      wrap.appendChild(el('div', { 'class': 'facts-banner m6-help' }, [
+        el('div', { 'class': 'm6-help-h', text: 'CE posture — engine mediation not configured' }),
+        el('p', { 'class': 'ctl-desc', text: 'The gateway (mediation) plane is where a hosted CruxEngine mediates identity, the capability ladder, and Art.15 foresight on the browser’s behalf. This CPU-only Crux daemon holds NO engine state — it only proxies a small, curated set of read summaries when an engine base URL is configured. Right now none is, so the read side is honestly empty rather than a dead pane.' })
+      ]));
+      wrap.appendChild(m6Label('what exists on this daemon'));
+      wrap.appendChild(m6Kv([
+        ['engine state held here', 'none — the daemon proxies, it does not run the engine'],
+        ['configured by', 'CORECRUXD_ENGINE_BASE_URL (+ optional CORECRUXD_ENGINE_API_KEY)'],
+        ['read routes (when configured)', 'GET /v1/console/engine/summary · /bench · /spend (proxied, read-only)'],
+        ['status now', '404 “engine mediation not configured” — base URL unset']
+      ]));
+      wrap.appendChild(m6Label('what a configured engine (M3+) unlocks'));
+      wrap.appendChild(m6Kv([
+        ['summary', 'engine liveness + reachability + latency stamps'],
+        ['bench / spend', 'benchmark manifest + committed escrow spend, proxied'],
+        ['search', 'mediated WikiCrux retrieval (POST /v1/console/engine/search)']
+      ]));
+      return wrap;
+    }
+    function unreachableCard() {
+      var wrap = el('div', {});
+      wrap.appendChild(el('div', { 'class': 'facts-banner warn' }, [
+        el('div', { 'class': 'm6-help-h', text: 'Engine configured — upstream unavailable (502)' }),
+        el('p', { 'class': 'ctl-desc', text: 'CORECRUXD_ENGINE_BASE_URL is set, but the daemon’s proxied read to the engine failed (transport error or non-2xx). The upstream body, headers, and API key are never forwarded — this is the terse 502 posture. Check the engine base URL, the API key, and engine health, then reload.' })
+      ]));
+      return wrap;
+    }
+    function summaryCard(d) {
+      var wrap = el('div', {});
+      wrap.appendChild(el('div', { 'class': 'facts-banner ok-empty' }, [
+        el('div', { 'class': 'm6-help-h', text: 'Engine reachable — mediated summary' })
+      ]));
+      wrap.appendChild(m6Kv([
+        ['mediated', d.mediated === true ? 'yes · daemon-proxied' : String(d.mediated)],
+        ['engine_reachable', String(d.engine_reachable)],
+        ['engine_latency_ms', d.engine_latency_ms],
+        ['fetched_at_unix_ms', d.fetched_at_unix_ms]
+      ]));
+      wrap.appendChild(m6Label('proxied engine summary (verbatim)'));
+      wrap.appendChild(el('pre', { 'class': 'facts-vfull', text: m6PrettyJson(d) }));
+      return wrap;
+    }
+    function load() {
+      body.textContent = ''; body.appendChild(el('p', { 'class': 'facts-loading', text: 'probing engine mediation…' }));
+      fetchJSON('/v1/console/engine/summary').then(function (res) {
+        body.textContent = '';
+        if (res.status === 404) { body.appendChild(ceCard()); return; }
+        if (res.status === 502) { body.appendChild(unreachableCard()); return; }
+        if (res.ok && res.data) { body.appendChild(summaryCard(res.data)); return; }
+        banner.style.display = ''; banner.className = 'facts-banner err';
+        banner.textContent = 'Engine summary unavailable — ' + (res.status === 0 ? 'daemon unreachable' : 'HTTP ' + res.status) + '.';
+      });
+    }
+    load();
   }
 
   function renderExplorer(host, ctx) {
