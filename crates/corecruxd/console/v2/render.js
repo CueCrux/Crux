@@ -3355,6 +3355,89 @@
     });
     return { width: marginX * 2 + Math.max(1, used.length) * colGap, height: marginY * 2 + Math.max(1, maxRows) * rowGap };
   }
+  // Concentric type-shell (radial) layout — the zoomed-OUT overview. Nodes are
+  // arranged on rings by node type: projects innermost (the anchors), work/gates
+  // next, then sessions, then passports/repos outermost. Deterministic: nodes are
+  // sorted by (type, id) and placed at evenly-spaced angles (no randomness —
+  // stability across renders is the point). A shell that can't hold its band on
+  // one ring wraps to further concentric sub-rings; ring radius always clears the
+  // previous band by at least a card's span, so cards never stack/overlap. Sets
+  // n.ringX / n.ringY (card top-left, layer coords) and returns the box dims.
+  function layoutGraphRing(nodes) {
+    var CARD_W = 300, CARD_H = 128, SEP = 340, RING_GAP = 210;
+    var BANDS = [['project'], ['work', 'gate'], ['session'], ['passport', 'repo']];
+    var bandOf = {}; BANDS.forEach(function (ts, i) { ts.forEach(function (t) { bandOf[t] = i; }); });
+    var byBand = {};
+    nodes.forEach(function (n) { var b = bandOf[n.type]; if (b == null) { b = BANDS.length; } (byBand[b] || (byBand[b] = [])).push(n); });
+    var bandKeys = Object.keys(byBand).map(Number).sort(function (a, b) { return a - b; });
+    var minR = 0, maxR = 0;
+    bandKeys.forEach(function (bk) {
+      var list = byBand[bk].slice().sort(function (a, b) {
+        if (a.type !== b.type) { return a.type < b.type ? -1 : 1; }
+        var ai = String(a.id), bi = String(b.id); return ai < bi ? -1 : (ai > bi ? 1 : 0);
+      });
+      var r = Math.max(minR + RING_GAP, SEP * 0.9), idx = 0, sub = 0;
+      while (idx < list.length) {
+        var cap = Math.max(1, Math.floor((2 * Math.PI * r) / SEP));
+        var take = Math.min(cap, list.length - idx);
+        var phase = bk * 0.7 + sub * 0.35;   // deterministic per-ring stagger
+        for (var k = 0; k < take; k++) {
+          var n = list[idx + k], a = phase + (k / take) * 2 * Math.PI;
+          n.__rx = r * Math.cos(a); n.__ry = r * Math.sin(a);
+        }
+        idx += take; maxR = Math.max(maxR, r); r += RING_GAP; sub++;
+      }
+      minR = maxR;
+    });
+    var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    nodes.forEach(function (n) {
+      var x = (n.__rx || 0) - CARD_W / 2, y = (n.__ry || 0) - CARD_H / 2;
+      if (x < minX) { minX = x; } if (y < minY) { minY = y; }
+      if (x + CARD_W > maxX) { maxX = x + CARD_W; } if (y + CARD_H > maxY) { maxY = y + CARD_H; }
+    });
+    if (!isFinite(minX)) { minX = 0; minY = 0; maxX = CARD_W; maxY = CARD_H; }
+    var pad = 80;
+    nodes.forEach(function (n) {
+      n.ringX = (n.__rx || 0) - CARD_W / 2 - minX + pad;
+      n.ringY = (n.__ry || 0) - CARD_H / 2 - minY + pad;
+      delete n.__rx; delete n.__ry;
+    });
+    return { width: (maxX - minX) + pad * 2, height: (maxY - minY) + pad * 2 };
+  }
+  // Graph legibility cap: /v1/work?source=all can carry >1,000 items (mostly
+  // complete/archived) — a relation graph of the whole set is an unreadable
+  // hairball. Keep an active-first, deterministic slice (in-progress/blocked/
+  // review/drafting first, then deployed, planned, finally complete/archive;
+  // ties broken by recency then id) and ALWAYS keep the focused node so a
+  // ?focus=work:… deep-link still resolves. Honest: the caller shows "N of M".
+  function graphWorkPriority(w) {
+    var s = String((w && w.state) || '').toLowerCase();
+    if (s === 'in_progress' || s === 'blocked' || s === 'review' || s === 'drafting') { return 0; }
+    if (s === 'deployed') { return 1; }
+    if (s === 'planned') { return 2; }
+    return 3;   // complete / archive / done / unknown
+  }
+  function capGraphWork(list, focus, cap) {
+    cap = cap || 80;
+    if (!Array.isArray(list) || list.length <= cap) { return list; }
+    var focusId = (focus && focus.type === 'work' && focus.id != null) ? String(focus.id) : null;
+    var sorted = list.slice().sort(function (a, b) {
+      var pa = graphWorkPriority(a), pb = graphWorkPriority(b);
+      if (pa !== pb) { return pa - pb; }
+      var ua = Number(a.updated_at_unix_ms || a.created_at_unix_ms || 0), ub = Number(b.updated_at_unix_ms || b.created_at_unix_ms || 0);
+      if (ua !== ub) { return ub - ua; }
+      var ai = String(a.id), bi = String(b.id); return ai < bi ? -1 : (ai > bi ? 1 : 0);
+    });
+    var kept = sorted.slice(0, cap);
+    if (focusId) {
+      var has = kept.some(function (w) { return String(w.id) === focusId || String(w.id) === 'execplan:' + focusId || 'execplan:' + String(w.id) === focusId; });
+      if (!has) {
+        var f = list.filter(function (w) { return String(w.id) === focusId || 'execplan:' + String(w.id) === focusId; })[0];
+        if (f) { kept = kept.slice(0, cap - 1); kept.push(f); }
+      }
+    }
+    return kept;
+  }
   function graphNodeRadius(type) { return type === 'project' ? 9 : (type === 'work' ? 8 : 6); }
   function graphNeighbourhood(edges, key) {
     var out = {};
@@ -3431,13 +3514,31 @@
         focus = { type: fnode.type, id: fnode.id };   // normalise for the select() below
       }
     }
-    var dims = layoutGraph(model.nodes);
+    var cardDims = layoutGraph(model.nodes);   // columns-by-type — the zoomed-IN detail arrangement
+    model.nodes.forEach(function (n) { n.cardX = n.x; n.cardY = n.y; });
+    var ringDims = layoutGraphRing(model.nodes);   // concentric type-shells — the zoomed-OUT overview
+    var reduceMotion = (typeof window !== 'undefined' && window.matchMedia) ? window.matchMedia('(prefers-reduced-motion: reduce)').matches : false;
+    // LOD threshold on the layer scale (view.scale): below it the nodes ride the
+    // ring overview, above it the card view. Open in whichever the CARD layout's
+    // natural fit lands in — a huge graph opens as the constellation, a small one
+    // straight into cards.
+    var LOD_THRESHOLD = 0.62;
+    var focusReserve = (focus && focus.type && focus.id != null) ? 380 : 0;
+    function fitScaleFor(d, reserveR) {
+      var sw = stage.clientWidth || 960, sh = stage.clientHeight || 640, pad = 30;
+      var availW = Math.max(260, sw - (reserveR || 0) - pad * 2), availH = Math.max(200, sh - pad * 2);
+      return Math.min(availW / d.width, availH / d.height);
+    }
+    var mode = fitScaleFor(cardDims, focusReserve) < LOD_THRESHOLD ? 'ring' : 'card';
+    model.nodes.forEach(function (n) { n.x = (mode === 'ring') ? n.ringX : n.cardX; n.y = (mode === 'ring') ? n.ringY : n.cardY; });
+    var activeDims = (mode === 'ring') ? ringDims : cardDims;
     var index = {}; model.nodes.forEach(function (n) { index[n.key] = n; });
     // One transformed layer holds the SVG edge canvas + the HTML node cards, so
     // pan/zoom moves cards and edges together.
     var layer = el('div', { 'class': 'cv-graph-layer' });
-    layer.style.width = dims.width + 'px'; layer.style.height = dims.height + 'px';
-    var svg = svgEl('svg', { 'class': 'cv-graph-edges', width: dims.width, height: dims.height, 'aria-hidden': 'true' });
+    layer.setAttribute('data-lod', mode);
+    layer.style.width = activeDims.width + 'px'; layer.style.height = activeDims.height + 'px';
+    var svg = svgEl('svg', { 'class': 'cv-graph-edges', width: activeDims.width, height: activeDims.height, 'aria-hidden': 'true' });
     // Two solid arrowhead markers (idle + hot) — userSpaceOnUse keeps them a
     // constant size regardless of stroke width; fill is set per class in CSS.
     var defs = svgEl('defs');
@@ -3448,7 +3549,6 @@
     });
     svg.appendChild(defs);
     layer.appendChild(svg);
-    var reduceMotion = (typeof window !== 'undefined' && window.matchMedia) ? window.matchMedia('(prefers-reduced-motion: reduce)').matches : false;
     // --- Edge routing with attachment "ports" -----------------------------
     // Each edge attaches to the SIDE of a node that faces the other node, at a
     // point distributed along that side — so multiple wires sharing one side fan
@@ -3568,20 +3668,78 @@
 
     var view = { tx: 16, ty: 16, scale: 1 };
     function apply() { layer.style.transform = 'translate(' + view.tx + 'px,' + view.ty + 'px) scale(' + view.scale + ')'; }
-    // Fit-to-viewport: scale + centre the whole graph into the stage so it lands
-    // on-screen without panning. When a node is focused the inspector slides in
-    // over the right edge, so reserve that width and centre in the space left.
-    function fitView() {
+    function placeCard(n) { var c = cardEls[n.key]; if (c) { c.style.left = n.x + 'px'; c.style.top = n.y + 'px'; } }
+    // Frame a layout into the stage (centre + scale). Floor is mode-aware: the
+    // ring overview may shrink far (the whole constellation on-screen), the card
+    // view stays legible. Reserves the inspector width when a node is focused.
+    function frame(d) {
       var sw = stage.clientWidth || 960, sh = stage.clientHeight || 640, pad = 30;
-      var reserveR = (focus && focus.type && focus.id != null) ? 380 : 0;
-      var availW = Math.max(260, sw - reserveR - pad * 2), availH = Math.max(200, sh - pad * 2);
-      var s = Math.max(0.42, Math.min(availW / dims.width, availH / dims.height, 1.15));
-      view.scale = s;
-      view.tx = pad + Math.max(0, (availW - dims.width * s) / 2);
-      view.ty = pad + Math.max(0, (availH - dims.height * s) / 2);
-      apply();
+      var availW = Math.max(260, sw - focusReserve - pad * 2), availH = Math.max(200, sh - pad * 2);
+      var floor = (mode === 'ring') ? 0.03 : 0.42, cap = (mode === 'ring') ? 1.0 : 1.15;
+      var s = Math.max(floor, Math.min(availW / d.width, availH / d.height, cap));
+      return { scale: s, tx: pad + Math.max(0, (availW - d.width * s) / 2), ty: pad + Math.max(0, (availH - d.height * s) / 2) };
     }
+    function fitView() { var f = frame(activeDims); view.scale = f.scale; view.tx = f.tx; view.ty = f.ty; apply(); }
     fitView();
+    // Zoom-aware LOD: crossing the threshold morphs the nodes between the ring
+    // overview and the card detail arrangement over ~300ms (snap under reduced
+    // motion or on very large graphs). Each node's tween START is its exact
+    // current on-screen position re-expressed under the NEW framing, so nodes
+    // never jump at the cut — they glide from where they were into the new layout.
+    var lodRaf = null, TWEEN_MAX = 160;
+    function screenCentre(n) { var w = n.w || 300, h = n.h || 128; return { x: view.tx + (n.x + w / 2) * view.scale, y: view.ty + (n.y + h / 2) * view.scale }; }
+    function switchMode(next) {
+      if (next === mode) { return; }
+      var sc = {}; model.nodes.forEach(function (n) { sc[n.key] = screenCentre(n); });
+      mode = next; activeDims = (mode === 'ring') ? ringDims : cardDims;
+      layer.style.width = activeDims.width + 'px'; layer.style.height = activeDims.height + 'px';
+      svg.setAttribute('width', activeDims.width); svg.setAttribute('height', activeDims.height);
+      layer.setAttribute('data-lod', mode);
+      if (modeLbl) { modeLbl.textContent = (mode === 'ring') ? 'overview' : 'detail'; }
+      var f = frame(activeDims); view.scale = f.scale; view.tx = f.tx; view.ty = f.ty; apply();
+      var from = {}, to = {};
+      model.nodes.forEach(function (n) {
+        var w = n.w || 300, h = n.h || 128;
+        from[n.key] = { x: (sc[n.key].x - view.tx) / view.scale - w / 2, y: (sc[n.key].y - view.ty) / view.scale - h / 2 };
+        to[n.key] = (mode === 'ring') ? { x: n.ringX, y: n.ringY } : { x: n.cardX, y: n.cardY };
+      });
+      if (lodRaf != null && typeof window !== 'undefined' && window.cancelAnimationFrame) { window.cancelAnimationFrame(lodRaf); lodRaf = null; }
+      var canAnim = !reduceMotion && model.nodes.length <= TWEEN_MAX && typeof window !== 'undefined' && window.requestAnimationFrame;
+      if (!canAnim) {
+        model.nodes.forEach(function (n) { n.x = to[n.key].x; n.y = to[n.key].y; placeCard(n); });
+        layoutEdges(); return;
+      }
+      var t0 = null, DUR = 300;
+      model.nodes.forEach(function (n) { n.x = from[n.key].x; n.y = from[n.key].y; placeCard(n); });
+      layoutEdges();
+      function stepFn(ts) {
+        if (t0 == null) { t0 = ts; }
+        var p = Math.min(1, (ts - t0) / DUR);
+        var e = p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;   // easeInOutQuad
+        model.nodes.forEach(function (n) {
+          n.x = from[n.key].x + (to[n.key].x - from[n.key].x) * e;
+          n.y = from[n.key].y + (to[n.key].y - from[n.key].y) * e;
+          placeCard(n);
+        });
+        layoutEdges();
+        if (p < 1) { lodRaf = window.requestAnimationFrame(stepFn); } else { lodRaf = null; }
+      }
+      lodRaf = window.requestAnimationFrame(stepFn);
+    }
+    function zoomBy(factor) {
+      var b = (mode === 'ring') ? { min: 0.03, max: 1.3 } : { min: 0.42, max: 2.4 };
+      var ns = Math.max(b.min, Math.min(b.max, view.scale * factor));
+      view.scale = ns; apply();
+      if (mode === 'card' && factor < 1 && ns <= LOD_THRESHOLD) { switchMode('ring'); }
+      else if (mode === 'ring' && factor > 1 && ns >= LOD_THRESHOLD) { switchMode('card'); }
+    }
+    // Unobtrusive +/- zoom cluster (wheel/pinch still work) carrying a live LOD label.
+    var modeLbl = el('span', { 'class': 'cv-zoom-mode', text: (mode === 'ring') ? 'overview' : 'detail' });
+    var zoomOut = el('button', { 'class': 'cv-zoom-btn', type: 'button', 'aria-label': 'Zoom out', title: 'Zoom out' }, ['−']);
+    var zoomIn = el('button', { 'class': 'cv-zoom-btn', type: 'button', 'aria-label': 'Zoom in', title: 'Zoom in' }, ['+']);
+    zoomOut.addEventListener('click', function (e) { e.stopPropagation(); zoomBy(0.8); });
+    zoomIn.addEventListener('click', function (e) { e.stopPropagation(); zoomBy(1.25); });
+    stage.appendChild(el('div', { 'class': 'cv-zoom' }, [zoomOut, modeLbl, zoomIn]));
     function select(key) {
       if (key == null) {
         Object.keys(cardEls).forEach(function (k) { cardEls[k].classList.remove('is-sel'); cardEls[k].classList.remove('is-dim'); });
@@ -3610,14 +3768,16 @@
     // Pan (drag on empty stage) + wheel zoom. A click on empty space (no drag)
     // deselects — the inspector then slides away unless it's pinned.
     var drag = null, moved = false;
-    stage.addEventListener('mousedown', function (ev) { if (ev.target.closest && ev.target.closest('.cv-card')) { return; } drag = { x: ev.clientX, y: ev.clientY, tx: view.tx, ty: view.ty }; moved = false; });
-    stage.addEventListener('click', function (ev) { if (ev.target.closest && ev.target.closest('.cv-card')) { return; } if (!moved) { select(null); onSelect(null); } });
+    function onEmpty(ev) { return !(ev.target.closest && (ev.target.closest('.cv-card') || ev.target.closest('.cv-zoom'))); }
+    stage.addEventListener('mousedown', function (ev) { if (!onEmpty(ev)) { return; } drag = { x: ev.clientX, y: ev.clientY, tx: view.tx, ty: view.ty }; moved = false; });
+    stage.addEventListener('click', function (ev) { if (!onEmpty(ev)) { return; } if (!moved) { select(null); onSelect(null); } });
     function onMove(ev) { if (!drag) { return; } moved = true; view.tx = drag.tx + (ev.clientX - drag.x); view.ty = drag.ty + (ev.clientY - drag.y); apply(); }
     function onUp() { drag = null; }
-    stage.addEventListener('wheel', function (ev) { ev.preventDefault(); var f = ev.deltaY < 0 ? 1.1 : 0.9; view.scale = Math.max(0.4, Math.min(2.2, view.scale * f)); apply(); });
+    stage.addEventListener('wheel', function (ev) { ev.preventDefault(); zoomBy(ev.deltaY < 0 ? 1.1 : 0.9); });
     if (typeof window !== 'undefined') { window.addEventListener('mousemove', onMove); window.addEventListener('mouseup', onUp); }
     __canvasGraphCleanup = function () {
       if (rafId != null && typeof window !== 'undefined' && window.cancelAnimationFrame) { window.cancelAnimationFrame(rafId); rafId = null; }
+      if (lodRaf != null && typeof window !== 'undefined' && window.cancelAnimationFrame) { window.cancelAnimationFrame(lodRaf); lodRaf = null; }
       if (typeof window !== 'undefined') { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); }
     };
 
@@ -3666,9 +3826,23 @@
         fetchJSON('/v1/console/sessions')
       ]);
     }).then(function (r) {
+      // Cap the work feed to an active-first, deterministic slice so the relation
+      // graph stays legible (the full source=all set can be >1,000 items). Keeps
+      // the focused node so a ?focus=work:… deep-link still resolves; honest count
+      // shown below. buildGraphModel + the card/focus paths are otherwise untouched.
+      var workData = (r[1].ok && r[1].data) || null, totalWork = 0, shownWork = 0;
+      if (workData) {
+        var wlist = workData.work || workData.items || [];
+        totalWork = wlist.length;
+        var capped = capGraphWork(wlist, focus, 80);
+        shownWork = capped.length;
+        var wd = {}; for (var wk in workData) { wd[wk] = workData[wk]; }
+        if (workData.work) { wd.work = capped; } else { wd.items = capped; }
+        workData = wd;
+      }
       var data = {
         projects: (r[0].ok && r[0].data) || null,
-        work: (r[1].ok && r[1].data) || null,
+        work: workData,
         gates: (r[2].ok && r[2].data) || null,
         passports: (r[3].ok && r[3].data) || null,
         sessions: (r[4].ok && r[4].data) || null,   // /v1/coord/active 404 → null (tolerated)
@@ -3699,6 +3873,9 @@
         }
       }
       drawGraph(stage, onSelect, model, focus);
+      if (!demoOn() && totalWork > shownWork) {
+        stage.appendChild(el('div', { 'class': 'cv-graph-note', text: 'showing ' + shownWork + ' of ' + totalWork + ' work items — active first (zoom in or open a node to explore)' }));
+      }
     }).catch(function () { stage.textContent = ''; stage.appendChild(el('p', { 'class': 'ctl-desc', text: 'Graph unavailable.' })); });
   }
 
@@ -3770,9 +3947,14 @@
   function planTreeNode(node, depth, onSelect) {
     var pad = (depth * 14 + 8) + 'px';
     var rowCls = 'plan-tree-row plan-tree-' + node.type;
+    // M7: kind (data-kind) and state (data-state) travel on every row so the CSS
+    // can colour by the console's existing status/kind hue vocabulary. Nulls are
+    // dropped by el(), so stateless kinds (project/milestone/session) carry no
+    // data-state. Additive — the existing classes + chips are untouched.
+    var kindAttr = node.type, stateAttr = (node.state != null && node.state !== '') ? node.state : null;
     if (node.children && node.children.length) {
       var det = el('details', { 'class': 'plan-tree-node', open: 'open' });
-      det.appendChild(el('summary', { 'class': rowCls, style: 'padding-left:' + pad }, planTreeRowInner(node)));
+      det.appendChild(el('summary', { 'class': rowCls, style: 'padding-left:' + pad, 'data-kind': kindAttr, 'data-state': stateAttr }, planTreeRowInner(node)));
       node.children.forEach(function (c) { det.appendChild(planTreeNode(c, depth + 1, onSelect)); });
       return det;
     }
@@ -3781,12 +3963,13 @@
     // handler (and non-session leaves stay inert).
     if (node.type === 'session' && typeof onSelect === 'function') {
       var srow = el('div', { 'class': rowCls + ' plan-tree-session-open', style: 'padding-left:' + pad,
+        'data-kind': kindAttr, 'data-state': stateAttr,
         role: 'button', tabindex: '0', 'aria-label': 'View session evidence: ' + (node.label || node.id || 'session') }, planTreeRowInner(node));
       srow.addEventListener('click', function () { onSelect(node); });
       srow.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelect(node); } });
       return srow;
     }
-    return el('div', { 'class': rowCls, style: 'padding-left:' + pad }, planTreeRowInner(node));
+    return el('div', { 'class': rowCls, style: 'padding-left:' + pad, 'data-kind': kindAttr, 'data-state': stateAttr }, planTreeRowInner(node));
   }
   function renderPlanTree(host, ctx) {
     host.textContent = '';
@@ -3827,18 +4010,107 @@
         wrap.appendChild(el('p', { 'class': 'ctl-desc', text: 'Plan tree empty — ' + why + '.' }));
         return;
       }
+      // ---- M7: colour legend + kind/state/text filters -------------------
+      // Colour is added in CSS keyed on the row's data-kind / data-state (planTreeNode);
+      // here we build the legend + the live filter controls. Filtering keeps
+      // ancestors of matches visible (a node shows if it matches OR any descendant
+      // does) so the tree stays navigable, and reports an honest "N of M" count.
+      var KIND_LABELS = [['project', 'Project'], ['execplan', 'ExecPlan'], ['milestone', 'Milestone'], ['session', 'Session'], ['work', 'Kanban'], ['unattached', 'Unattached']];
+      var STATE_ORDER = ['planned', 'in_progress', 'drafting', 'blocked', 'review', 'deployed', 'done', 'complete', 'archive'];
+      var kindsPresent = {}, statesPresent = {}, totalNodes = 0;
+      tree.roots.forEach(function (root) { (function w(n) { totalNodes++; kindsPresent[n.type] = true; if (n.state != null && n.state !== '') { statesPresent[n.state] = true; } (n.children || []).forEach(w); })(root); });
+      var kindOn = {}, stateOn = {}, textq = '';
+      Object.keys(kindsPresent).forEach(function (k) { kindOn[k] = true; });
+      Object.keys(statesPresent).forEach(function (s) { stateOn[s] = true; });
+
+      var controls = el('div', { 'class': 'plan-tree-controls' });
+      var legend = el('div', { 'class': 'plan-tree-legend' });
+      legend.appendChild(el('span', { 'class': 'plan-tree-legend-h', text: 'Kind' }));
+      KIND_LABELS.forEach(function (kl) {
+        if (!kindsPresent[kl[0]]) { return; }
+        legend.appendChild(el('span', { 'class': 'plan-tree-legend-item' }, [
+          el('span', { 'class': 'plan-tree-legend-swatch', 'data-kind': kl[0] }),
+          el('span', { 'class': 'plan-tree-legend-lab', text: kl[1] })
+        ]));
+      });
+      legend.appendChild(el('span', { 'class': 'plan-tree-legend-h', text: 'State' }));
+      STATE_ORDER.forEach(function (s) {
+        if (!statesPresent[s]) { return; }
+        legend.appendChild(el('span', { 'class': 'plan-tree-legend-item' }, [
+          el('span', { 'class': 'plan-tree-legend-swatch', 'data-state': s }),
+          el('span', { 'class': 'plan-tree-legend-lab', text: s })
+        ]));
+      });
+
+      var toolbar = el('div', { 'class': 'plan-tree-filters' });
+      var kindRow = el('div', { 'class': 'plan-tree-filter-row' }, [el('span', { 'class': 'plan-tree-filter-lab', text: 'Kinds' })]);
+      KIND_LABELS.forEach(function (kl) {
+        if (!kindsPresent[kl[0]]) { return; }
+        var chip = el('button', { 'class': 'plan-tree-toggle is-on', type: 'button', 'data-kind': kl[0], 'aria-pressed': 'true' }, [kl[1]]);
+        chip.addEventListener('click', function () { kindOn[kl[0]] = !kindOn[kl[0]]; chip.classList.toggle('is-on', kindOn[kl[0]]); chip.setAttribute('aria-pressed', kindOn[kl[0]] ? 'true' : 'false'); repaint(); });
+        kindRow.appendChild(chip);
+      });
+      var stateRow = el('div', { 'class': 'plan-tree-filter-row' }, [el('span', { 'class': 'plan-tree-filter-lab', text: 'States' })]);
+      STATE_ORDER.forEach(function (s) {
+        if (!statesPresent[s]) { return; }
+        var chip = el('button', { 'class': 'plan-tree-toggle is-on', type: 'button', 'data-state': s, 'aria-pressed': 'true' }, [s]);
+        chip.addEventListener('click', function () { stateOn[s] = !stateOn[s]; chip.classList.toggle('is-on', stateOn[s]); chip.setAttribute('aria-pressed', stateOn[s] ? 'true' : 'false'); repaint(); });
+        stateRow.appendChild(chip);
+      });
+      var textInput = el('input', { 'class': 'plan-tree-search', type: 'search', placeholder: 'Filter by label, id or slug…', 'aria-label': 'Filter tree by text' });
+      textInput.addEventListener('input', function () { textq = String(textInput.value || '').trim().toLowerCase(); repaint(); });
+      var searchRow = el('div', { 'class': 'plan-tree-filter-row' }, [el('span', { 'class': 'plan-tree-filter-lab', text: 'Find' }), textInput]);
+      toolbar.appendChild(kindRow); toolbar.appendChild(stateRow); toolbar.appendChild(searchRow);
+      var countLine = el('p', { 'class': 'plan-tree-count', role: 'status' });
+      controls.appendChild(legend); controls.appendChild(toolbar); controls.appendChild(countLine);
+      wrap.appendChild(controls);
+
       // M4b: split into the tree column + a session-detail column. Clicking a
       // session paints its evidence (receipts, fact provenance, announced focus)
-      // through the generated client. Notices stay above the split (fail-honest).
+      // through the generated client. Notices + filters stay above the split.
       var layout = el('div', { 'class': 'plan-tree-layout' });
       var treeCol = el('div', { 'class': 'plan-tree-col' });
       var detailCol = el('div', { 'class': 'session-detail-col' },
         [el('p', { 'class': 'ctl-desc', text: 'Select a session to view its evidence — receipts, fact provenance, announced focus.' })]);
       function onSelect(node) { renderSessionDetail(detailCol, node, api); }
-      tree.roots.forEach(function (root) { treeCol.appendChild(planTreeNode(root, 0, onSelect)); });
       layout.appendChild(treeCol);
       layout.appendChild(detailCol);
       wrap.appendChild(layout);
+
+      function nodeMatches(n) {
+        if (!kindOn[n.type]) { return false; }
+        if (n.state != null && n.state !== '' && !stateOn[n.state]) { return false; }
+        if (textq) {
+          var hay = String(n.label || '') + ' ' + String(n.id || '');
+          if (String(n.id || '').indexOf('execplan:') === 0) { hay += ' ' + String(n.id).slice(9); }
+          if (n.unresolvedSlug) { hay += ' ' + n.unresolvedSlug; }
+          if (hay.toLowerCase().indexOf(textq) < 0) { return false; }
+        }
+        return true;
+      }
+      // Keep ancestors of matches: a node survives if it matches OR any descendant
+      // survives; its whole subtree is dropped only when nothing under it matches.
+      function filterNode(n) {
+        var kids = (n.children || []).map(filterNode).filter(Boolean);
+        var self = nodeMatches(n);
+        if (!self && kids.length === 0) { return null; }
+        var copy = {}; for (var k in n) { copy[k] = n[k]; }
+        copy.children = kids;
+        return copy;
+      }
+      function repaint() {
+        var froots = tree.roots.map(filterNode).filter(Boolean);
+        treeCol.textContent = '';
+        if (!froots.length) {
+          treeCol.appendChild(el('p', { 'class': 'ctl-desc', text: 'No nodes match the current filters.' }));
+        } else {
+          froots.forEach(function (root) { treeCol.appendChild(planTreeNode(root, 0, onSelect)); });
+        }
+        var shown = 0;
+        froots.forEach(function (root) { (function w(n) { shown++; (n.children || []).forEach(w); })(root); });
+        countLine.textContent = 'showing ' + shown + ' of ' + totalNodes + ' nodes';
+      }
+      repaint();
     }).catch(function () {
       wrap.textContent = '';
       wrap.appendChild(el('p', { 'class': 'ctl-desc', text: 'Plan tree unavailable.' }));
