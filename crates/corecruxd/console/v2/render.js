@@ -32,7 +32,8 @@
     Object.freeze(['rerank_gpu', 'GPU rerank']),
     Object.freeze(['hosted_sync', 'Hosted sync']),
     Object.freeze(['projection_queries', 'Projection queries']),
-    Object.freeze(['graph_expand', 'Graph expansion'])
+    Object.freeze(['graph_expand', 'Graph expansion']),
+    Object.freeze(['console_link_graph', 'Link graph (CoreCrux proxy)'])
   ]);
 
   // ---- Environment shims (only used when rendering in a browser) ---------
@@ -535,6 +536,15 @@
   function capabilityStateForControl(controlId, descriptor, map) {
     var spec = (map || {})[controlId];
     return spec ? runtimeCapabilityState(spec.capability, descriptor) : null;
+  }
+
+  // Does the daemon's runtime capability PLAN grant a capability by name? The
+  // unified shell gates capability-scoped DESTINATIONS on this (render from the
+  // plan, never the route registry) — e.g. the Link graph pane only appears when
+  // the daemon reports console_link_graph 'available' (its mediation proxy is
+  // configured). Fails closed: an absent/invalid descriptor ⇒ not available.
+  function capabilityAvailable(name) {
+    return runtimeCapabilityState(name, runtimeCapabilityDescriptor()).availability === 'available';
   }
 
   function runtimeCapabilitySection(descriptor) {
@@ -5820,11 +5830,173 @@
     return { search: doSearch, state: state };
   }
 
+  // ── Link graph pane (ExecPlan wikicrux-link-graph-explorer M4) ────────────
+  // A special full-viewport destination: a WebGL six-degrees explorer over the
+  // enwiki-prose link graph, served through the Crux daemon's read-only CoreCrux
+  // mediation proxy (/v1/console/corecrux/graph/*). All reads go through the
+  // generated CruxApi.get (fetchJSON) — no bearer in the browser (T.3). The
+  // renderer is a client-only ESM module (custom three.js r165) dynamically
+  // imported so the no-build shell never evaluates WebGL until this pane opens.
+  function linkGraphTheme() {
+    var t = (typeof document !== 'undefined') ? document.documentElement.getAttribute('data-theme') : null;
+    return (t === 'dark' || t === 'glass') ? t : 'light';
+  }
+  function lgFmtNum(n) {
+    if (typeof n !== 'number' || !isFinite(n)) { return String(n); }
+    return n.toLocaleString ? n.toLocaleString() : String(n);
+  }
+  function lgError(res, what) {
+    if (res.status === 503) { return 'Link graph unavailable — the CoreCrux graph is not built/enabled upstream.'; }
+    if (res.status === 0) { return 'Graph backend unreachable.'; }
+    var detail = res.data && res.data.detail;
+    return 'Graph ' + what + ' failed (' + (res.status || '?') + ')' + (detail ? ': ' + detail : '') + '.';
+  }
+
+  function renderLinkGraph(host, ctx) {
+    ctx = ctx || {};
+    host.textContent = '';
+    var region = el('div', { 'class': 'lg-region' });
+    host.appendChild(region);
+
+    // Safety net: the DEST is capability-gated, but a deep-link (#/linkgraph) can
+    // still land here on a daemon without the proxy — fail to an honest empty state.
+    if (!capabilityAvailable('console_link_graph')) {
+      region.appendChild(el('div', { 'class': 'lg-empty' }, [
+        el('h2', { text: 'Link graph is not configured' }),
+        el('p', { 'class': 'ctl-desc', text: 'This daemon has no CoreCrux graph mediation proxy. Set CORECRUXD_CORECRUX_GRAPH_BASE_URL on the Crux daemon to enable the six-degrees explorer.' })
+      ]));
+      return;
+    }
+
+    var header = el('div', { 'class': 'lg-header' });
+    var statLine = el('div', { 'class': 'lg-stats', role: 'status', 'aria-live': 'polite' }, [el('span', { 'class': 'ctl-desc', text: 'Loading graph stats…' })]);
+    header.appendChild(statLine);
+    region.appendChild(header);
+
+    var controls = el('div', { 'class': 'lg-controls' });
+    var fromIn = el('input', { 'class': 'lg-input', type: 'text', placeholder: 'From article… (e.g. Dog)', 'aria-label': 'Path start article' });
+    var toIn = el('input', { 'class': 'lg-input', type: 'text', placeholder: 'To article… (e.g. Barack Obama)', 'aria-label': 'Path end article' });
+    var findBtn = el('button', { 'class': 'btn-primary lg-btn', type: 'button' }, ['Find path']);
+    controls.appendChild(fromIn); controls.appendChild(toIn); controls.appendChild(findBtn);
+    region.appendChild(controls);
+
+    var status = el('div', { 'class': 'lg-status ctl-desc', role: 'status', 'aria-live': 'polite', text: 'Enter two article titles to trace a shortest path, then click any node to expand its neighbourhood.' });
+    region.appendChild(status);
+
+    var stage = el('div', { 'class': 'lg-stage' });
+    region.appendChild(stage);
+
+    var rendererHandle = null;
+    var rendererPromise = null;
+    var themeObs = null;
+    var reduced = (typeof window !== 'undefined' && window.matchMedia) ? window.matchMedia('(prefers-reduced-motion: reduce)').matches : false;
+
+    function ensureRenderer() {
+      if (rendererPromise) { return rendererPromise; }
+      // Dynamic import so SSR/no-build never evaluates WebGL; `three` resolves via
+      // the shell import map to the vendored r165 (zero new trust-kernel surface).
+      rendererPromise = import('/console-v2/linkgraph-renderer.mjs').then(function (mod) {
+        var make = mod.createLinkGraphRenderer || mod.default;
+        rendererHandle = make();
+        rendererHandle.mount(stage, { theme: linkGraphTheme(), reducedMotion: reduced, onNodeClick: onNodeClick });
+        if (typeof MutationObserver !== 'undefined') {
+          themeObs = new MutationObserver(function () { if (rendererHandle) { rendererHandle.setTheme(linkGraphTheme()); } });
+          themeObs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+        }
+        return rendererHandle;
+      }).catch(function (err) {
+        status.textContent = 'Renderer unavailable: ' + (err && err.message ? err.message : 'failed to load the graph module') + '.';
+        return null;
+      });
+      return rendererPromise;
+    }
+
+    function loadStats() {
+      fetchJSON('/v1/console/corecrux/graph/stats').then(function (res) {
+        statLine.textContent = '';
+        if (res.status === 503) { statLine.appendChild(el('span', { 'class': 'ctl-desc', text: 'Graph not built/enabled upstream — set CORECRUXD_LINK_GRAPH + build a .ccxg on the CoreCrux daemon.' })); return; }
+        if (!res.ok || !res.data) { statLine.appendChild(el('span', { 'class': 'ctl-desc', text: lgError(res, 'stats') })); return; }
+        var d = res.data;
+        var snap = d.snapshot_id || (d.build && d.build.snapshot_id) || '—';
+        var digest = (d.build && d.build.digest) ? String(d.build.digest).slice(0, 12) : '';
+        statLine.appendChild(el('span', { 'class': 'lg-stat', text: 'snapshot ' + snap }));
+        if (d.nodes && d.nodes.total != null) { statLine.appendChild(el('span', { 'class': 'lg-stat', text: lgFmtNum(d.nodes.total) + ' nodes' })); }
+        if (d.edges && d.edges.total != null) { statLine.appendChild(el('span', { 'class': 'lg-stat', text: lgFmtNum(d.edges.total) + ' edges' })); }
+        if (d.community_count != null) { statLine.appendChild(el('span', { 'class': 'lg-stat', text: lgFmtNum(d.community_count) + ' communities' })); }
+        if (digest) { statLine.appendChild(el('span', { 'class': 'lg-stat lg-digest', title: 'CoreCrux .ccxg build digest (artifact provenance)', text: 'digest ' + digest + '…' })); }
+      });
+    }
+
+    function doPath() {
+      var a = fromIn.value.trim(), b = toIn.value.trim();
+      if (!a || !b) { status.textContent = 'Enter two article titles.'; return; }
+      status.textContent = 'Resolving titles…';
+      fetchJSON('/v1/console/corecrux/graph/resolve?titles=' + encodeURIComponent(a + '|' + b)).then(function (res) {
+        if (!res.ok || !res.data || !res.data.results) { status.textContent = lgError(res, 'resolve'); return; }
+        var r = res.data.results;
+        var src = r[0] && r[0].node_id, dst = r[1] && r[1].node_id;
+        if (src === null || src === undefined) { status.textContent = 'Unresolved article: “' + a + '”.'; return; }
+        if (dst === null || dst === undefined) { status.textContent = 'Unresolved article: “' + b + '”.'; return; }
+        var srcT = (r[0] && r[0].canonical_title) || a, dstT = (r[1] && r[1].canonical_title) || b;
+        status.textContent = 'Finding path ' + srcT + ' → ' + dstT + '…';
+        fetchJSON('/v1/console/corecrux/graph/path?src=' + src + '&dst=' + dst + '&max_hops=6').then(function (pres) {
+          if (!pres.ok || !pres.data) { status.textContent = lgError(pres, 'path'); return; }
+          var d = pres.data;
+          if (d.length === null || d.length === undefined) {
+            status.textContent = 'No path within 6 hops between “' + srcT + '” and “' + dstT + '”.';
+          } else {
+            status.textContent = srcT + ' → ' + dstT + ': ' + d.length + ' hop' + (d.length === 1 ? '' : 's') + ' · ' + (d.paths ? d.paths.length : 0) + ' equal-length path(s)' + (d.truncated ? ' (truncated)' : '') + '.';
+          }
+          var cg = d.context || { nodes: [], edges: [], edge_kinds: [] };
+          ensureRenderer().then(function (h) {
+            if (!h) { return; }
+            h.setData({ nodes: cg.nodes || [], edges: cg.edges || [], edgeKinds: cg.edge_kinds || [], paths: d.paths || [], seeds: [src, dst] });
+          });
+        });
+      });
+    }
+
+    function onNodeClick(node) {
+      if (!node) { return; }
+      var label = node.title || String(node.id);
+      status.textContent = 'Expanding “' + label + '”…';
+      fetchJSON('/v1/console/corecrux/graph/ego?seeds=' + node.id + '&hops=1&budget_nodes=400&budget_edges=1500&degree_cap=40').then(function (res) {
+        if (!res.ok || !res.data) { status.textContent = lgError(res, 'ego'); return; }
+        var d = res.data;
+        if (rendererHandle) { rendererHandle.expandData({ nodes: d.nodes || [], edges: d.edges || [], edgeKinds: d.edge_kinds || [] }); }
+        var trunc = (d.truncated_nodes || d.truncated_edges || d.truncated_degree) ? ' (budget-truncated)' : '';
+        status.textContent = 'Expanded “' + label + '” · +' + ((d.nodes || []).length) + ' node(s)' + trunc + '.';
+      });
+    }
+
+    findBtn.addEventListener('click', doPath);
+    [fromIn, toIn].forEach(function (inp) { inp.addEventListener('keydown', function (ev) { if (ev.key === 'Enter') { doPath(); } }); });
+
+    // Teardown on navigation away — dispose the WebGL context + observers so the
+    // pane never leaks a live renderer or a perpetual observer (a11y/battery).
+    var onHash = function () {
+      if ((location.hash || '').indexOf('/linkgraph') < 0) {
+        window.removeEventListener('hashchange', onHash);
+        if (themeObs) { themeObs.disconnect(); themeObs = null; }
+        if (rendererHandle) { rendererHandle.destroy(); rendererHandle = null; }
+      }
+    };
+    if (typeof window !== 'undefined') { window.addEventListener('hashchange', onHash); }
+
+    loadStats();
+    return { search: doPath, expand: onNodeClick };
+  }
+
   return {
     CONTROL_TYPES: CONTROL_TYPES,
     GATE_TITLE: GATE_TITLE,
     // M11 — Explorer (corpus search; reads only, posture-independent).
     renderExplorer: renderExplorer,
+    // Link graph (ExecPlan wikicrux-link-graph-explorer M4) — WebGL six-degrees
+    // explorer over the CoreCrux link graph via the read-only mediation proxy;
+    // capabilityAvailable gates the DEST on the daemon's runtime capability plan.
+    renderLinkGraph: renderLinkGraph,
+    capabilityAvailable: capabilityAvailable,
     // Site map — static reference destination (rail → destinations map).
     renderSiteMap: renderSiteMap,
     // M10 — Documents mode (the console-as-reader).

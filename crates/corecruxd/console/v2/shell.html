@@ -50,6 +50,20 @@
     }
   })();
 </script>
+<!-- Import map for the Link graph pane's WebGL renderer (ExecPlan
+     wikicrux-link-graph-explorer M4). Maps the bare `three` specifier to the
+     already-vendored three.js r165 the console-3d substrate loads — ZERO new
+     vendored files, all same-origin (T.5: no CDN, no external requests). The
+     renderer module (/console-v2/linkgraph-renderer.mjs) is dynamically imported
+     only when the pane opens; no existing pane loads a module, so this is inert
+     until then. Must precede any module load, hence its place in <head>. -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "/console-3d/vendor/three.module.min.js"
+  }
+}
+</script>
 <style>
   /* ---- Base reset -------------------------------------------------------- */
   * { box-sizing: border-box; }
@@ -481,6 +495,31 @@
   .explorer-detail-head { display: flex; align-items: baseline; gap: 12px; }
   .explorer-detail-head h2 { margin: 0; font-size: 20px; font-weight: 650; }
   .explorer-detail-body { margin: 12px 0; font-size: 14px; line-height: 1.6; color: var(--ink); }
+
+  /* ---- Link graph pane (M4) --------------------------------------------- */
+  /* Every colour is a theme token, so Light/Dark/Glass restyle wholesale; the
+     WebGL renderer reads data-theme itself for the canvas clear + node/edge/label
+     colours. Render-on-demand only (no CSS animation, no perpetual rAF) so the
+     pane satisfies the prefers-reduced-motion "no perpetual animation" floor. */
+  .linkgraph-region-host { display: block; }
+  .lg-region { display: flex; flex-direction: column; gap: 12px; height: calc(100vh - 210px); min-height: 520px; }
+  .lg-empty { max-width: 640px; margin: 8vh auto 0; text-align: center; }
+  .lg-empty h2 { margin: 0 0 8px; font-size: 20px; font-weight: 650; color: var(--ink); }
+  .lg-header { display: flex; align-items: center; min-height: 24px; }
+  .lg-stats { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; }
+  .lg-stat { font-size: 12.5px; color: var(--ink2); font-variant-numeric: tabular-nums; padding: 3px 9px; border: 1px solid var(--edge); border-radius: 999px; background: var(--surface2); }
+  .lg-digest { font-family: var(--font-mono); }
+  .lg-controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  .lg-input { flex: 1 1 220px; min-width: 170px; min-height: 44px; padding: 10px 12px; font: inherit; color: var(--ink); background: var(--surface2); border: 1px solid var(--edge); border-radius: var(--radius-sm); }
+  .lg-input::placeholder { color: var(--ink3); }
+  .lg-input:focus-visible { border-color: var(--acc); }
+  .lg-btn { min-height: 44px; padding: 10px 18px; flex: none; cursor: pointer; }
+  .lg-status { min-height: 20px; }
+  .lg-stage { position: relative; flex: 1 1 auto; min-height: 340px; border: 1px solid var(--edge); border-radius: var(--radius); overflow: hidden; background: var(--bg); }
+  .lg-stage canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; }
+  .lg-stage canvas:focus-visible { outline: 2px solid var(--acc); outline-offset: -2px; }
+  .lg-label { position: absolute; }
+  @supports (height: 100dvh) { .lg-region { height: calc(100dvh - 210px); } }
   .health { gap: 8px; }
   .health .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ink3); flex: none; }
   .health.ok .dot { background: var(--ok); }
@@ -2119,6 +2158,7 @@
     canvas: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>',
     search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>',
     map: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="5" rx="1.4"/><rect x="3" y="16" width="6" height="5" rx="1.4"/><rect x="15" y="16" width="6" height="5" rx="1.4"/><path d="M12 8v4M6 16v-2.5h12V16"/></svg>',
+    linkgraph: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="6" r="2.4"/><circle cx="19" cy="6" r="2.4"/><circle cx="12" cy="18" r="2.4"/><path d="M7 7l3 9M17 7l-3 9M7 6h10"/></svg>',
     lock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>',
     palette: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 1 0 0 18c1 0 1.6-.8 1.6-1.7 0-.5-.2-.9-.5-1.2-.3-.3-.5-.7-.5-1.1 0-.9.8-1.7 1.7-1.7H16a5 5 0 0 0 5-5c0-4.1-4-7.3-9-7.3z"/><circle cx="7.5" cy="11.5" r="1"/><circle cx="12" cy="8" r="1"/><circle cx="16.5" cy="11.5" r="1"/></svg>',
     globe: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.6 2.5 4 5.6 4 9s-1.4 6.5-4 9c-2.6-2.5-4-5.6-4-9s1.4-6.5 4-9z"/></svg>',
@@ -2470,6 +2510,17 @@
   var PAGES = CP.PAGES;
   var DEST_INDEX = {};
   for (var _di = 0; _di < DESTS.length; _di++) { DEST_INDEX[DESTS[_di].id] = DESTS[_di]; }
+  // A destination that declares a `capability` is gated on the daemon's runtime
+  // capability PLAN (render from the plan, never the route registry — unified-shell
+  // rule). Hidden everywhere until the plan reports it available (e.g. the Link
+  // graph pane appears only when the CoreCrux graph mediation proxy is configured);
+  // the pane's own renderer also fails closed on a deep-link. No capability ⇒ always
+  // visible. Re-evaluated after boot() loads the plan (the nav is rebuilt there).
+  function destVisible(dest) {
+    if (!dest || !dest.capability) { return true; }
+    var cr = (typeof window !== 'undefined') ? window.CruxRender : null;
+    return !!(cr && cr.capabilityAvailable && cr.capabilityAvailable(dest.capability));
+  }
   var PAGES_BY_DEST = {};
   (function indexPages() {
     for (var id in PAGES) {
@@ -2569,6 +2620,7 @@
     for (var i = 0; i < DESTS.length; i++) {
       var item = DESTS[i];
       if (item.railHidden) { continue; }   // reachable via search / Explore menu, not the Command rail
+      if (!destVisible(item)) { continue; }   // capability-gated dest not granted by the runtime plan
       var btn = el('button', {
         'class': 'nav-item', type: 'button', 'data-dest': item.id, 'aria-current': 'false',
         title: item.label   // tooltip — the only label shown when the rail is collapsed
@@ -2764,6 +2816,7 @@
     for (var i = 0; i < DESTS.length; i++) {
       var d = DESTS[i];
       if (!isMoreDest(d.id) || d.railHidden) { continue; }   // only non-tab, non-rail-hidden destinations
+      if (!destVisible(d)) { continue; }   // capability-gated dest not granted by the runtime plan
       var btn = el('button', { 'class': 'sheet-item', type: 'button', 'data-dest': d.id, 'aria-current': 'false' });
       btn.innerHTML = ICONS[d.icon] || '';
       btn.appendChild(el('span', { 'class': 'label', text: d.label }));
@@ -2923,6 +2976,26 @@
       return;
     }
 
+    // Link graph (M4) — no sub-pills: it IS a WebGL six-degrees explorer over the
+    // CoreCrux link graph via the read-only mediation proxy. Delegates to render.js
+    // renderLinkGraph (custom three.js r165, dynamically imported). Capability-gated
+    // (console_link_graph): render.renderLinkGraph itself fails to an honest empty
+    // state when the proxy is unconfigured, so a deep-link here is always safe.
+    if (destId === 'linkgraph') {
+      document.getElementById('destTitle').textContent = dest.label;
+      document.getElementById('destSub').textContent = dest.sub || '';
+      var lgHost = el('div', { 'class': 'linkgraph-region-host', id: 'linkgraphHost' });
+      content.appendChild(lgHost);
+      if (window.CruxRender && window.CruxRender.renderLinkGraph) {
+        window.CruxRender.renderLinkGraph(lgHost, { summary: BOOT.summary });
+      } else {
+        lgHost.appendChild(el('p', { 'class': 'v2card-sub', text: 'Renderer module unavailable.' }));
+      }
+      applyPosture(content);
+      if (typeof content.scrollTo === 'function') { content.scrollTo(0, 0); }
+      return;
+    }
+
     document.getElementById('destTitle').textContent = page ? page.title : dest.label;
     document.getElementById('destSub').textContent = page ? (page.sub || '') : (dest.sub || '');
     // Overwatch is the real landing: Daemon-at-a-glance tiles → Needs-you + Fleet
@@ -3048,6 +3121,11 @@
         var ver = res[0], sum = res[1];
         if (ver && ver.data) { BOOT.version = ver.data; }
         window.CRUX_RUNTIME_CAPABILITIES = get(BOOT.version, ['product', 'runtime_capabilities']) || null;
+        // Capability plan is now loaded — rebuild the capability-gated nav surfaces
+        // so plan-granted destinations (e.g. Link graph) appear. Idempotent; the
+        // rail/sheet were first built pre-boot (plan absent ⇒ gated dests hidden).
+        buildRail();
+        buildSheetNav();
         if (sum && sum.ok && sum.data) { BOOT.summary = sum.data; }
         var reachable = (ver && ver.status !== 0) || (sum && sum.status !== 0);
         // Origin-wide session gate: if the summary read was bounced to sign-in

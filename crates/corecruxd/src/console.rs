@@ -30,6 +30,12 @@ const CONSOLE_V2_RENDER_JS: &str = include_str!("../console/v2/render.js");
 // `cargo test -p corecruxd --test route_spec_drift -- --ignored regen_api_js`.
 // GET routes only — the customer-safe posture holds at the client layer too.
 const CONSOLE_V2_API_JS: &str = include_str!("../console/v2/api.js");
+// Link-graph pane WebGL renderer (ExecPlan wikicrux-link-graph-explorer M4). A
+// client-only ESM module (custom three.js r165) served at
+// `/console-v2/linkgraph-renderer.mjs`; render.js dynamically imports it when the
+// Link graph pane opens. `three` resolves via the shell import map to the vendored
+// r165 — zero new vendored files (T.5). Same embedded, dev-overridable posture.
+const CONSOLE_V2_LINKGRAPH_MJS: &str = include_str!("../console/v2/linkgraph-renderer.mjs");
 // PWA app-shell assets (M5). Served same-origin at `/console-v2/{name}` alongside
 // the JS modules. `sw.js` is the app-shell service worker (never caches `/v1/*`);
 // `manifest.webmanifest` is the install manifest; `icon.svg` is the app icon.
@@ -91,6 +97,7 @@ async fn serve_console_v2_asset(AxumPath(name): AxumPath<String>) -> Response {
         "pages.js" => (CONSOLE_V2_PAGES_JS, "text/javascript; charset=utf-8"),
         "render.js" => (CONSOLE_V2_RENDER_JS, "text/javascript; charset=utf-8"),
         "api.js" => (CONSOLE_V2_API_JS, "text/javascript; charset=utf-8"),
+        "linkgraph-renderer.mjs" => (CONSOLE_V2_LINKGRAPH_MJS, "text/javascript; charset=utf-8"),
         "sw.js" => (CONSOLE_V2_SW_JS, "application/javascript; charset=utf-8"),
         "manifest.webmanifest" => (CONSOLE_V2_MANIFEST, "application/manifest+json; charset=utf-8"),
         "icon.svg" => (CONSOLE_V2_ICON_SVG, "image/svg+xml; charset=utf-8"),
@@ -477,7 +484,7 @@ fn resolve_dev_html_path(base: &Path) -> PathBuf {
 mod tests {
     use super::{
         resolve_console_body, CONSOLE_DEV_PATH_ENV, CONSOLE_V2_API_JS, CONSOLE_V2_HTML, CONSOLE_V2_ICON_SVG,
-        CONSOLE_V2_MANIFEST, CONSOLE_V2_PAGES_JS, CONSOLE_V2_RENDER_JS, CONSOLE_V2_SW_JS,
+        CONSOLE_V2_LINKGRAPH_MJS, CONSOLE_V2_MANIFEST, CONSOLE_V2_PAGES_JS, CONSOLE_V2_RENDER_JS, CONSOLE_V2_SW_JS,
     };
     use std::sync::Mutex;
 
@@ -692,6 +699,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn console_v2_linkgraph_renderer_module_is_self_contained() {
+        // ExecPlan wikicrux-link-graph-explorer M4: the renderer is a client-only
+        // ESM module (custom three.js r165). CCL header + public API + the vendored
+        // three specifier + zero external runtime deps (T.5).
+        assert!(
+            CONSOLE_V2_LINKGRAPH_MJS.contains("CueCrux Community Licence (CCL v1.0)"),
+            "linkgraph-renderer.mjs must carry the CCL licence header"
+        );
+        assert!(
+            CONSOLE_V2_LINKGRAPH_MJS.contains("import * as THREE from 'three'"),
+            "renderer must import the bare `three` specifier (resolved by the shell import map to the vendored r165)"
+        );
+        for api in ["mount", "setData", "expandData", "setTheme", "onNodeClick", "destroy"] {
+            assert!(
+                CONSOLE_V2_LINKGRAPH_MJS.contains(api),
+                "renderer must expose the shared public API method: {api}"
+            );
+        }
+        // No external runtime deps: no remote loader / CDN host / http(s) import.
+        for blocked in [
+            "from \"http",
+            "from 'http",
+            "import(\"http",
+            "import('http",
+            "unpkg.com",
+            "jsdelivr.net",
+            "cdnjs.cloudflare",
+            "cdn.jsdelivr",
+            "fonts.googleapis",
+        ] {
+            assert!(
+                !CONSOLE_V2_LINKGRAPH_MJS.contains(blocked),
+                "linkgraph-renderer.mjs has an external runtime dependency marker: {blocked}"
+            );
+        }
+    }
+
+    #[test]
+    fn console_v2_shell_wires_the_link_graph_import_map() {
+        // The import map maps `three` to the already-vendored r165 (same-origin,
+        // no CDN) and must precede any module load (it lives in <head>).
+        assert!(
+            CONSOLE_V2_HTML.contains(r#"<script type="importmap">"#),
+            "shell must carry an import map for the link-graph renderer"
+        );
+        assert!(
+            CONSOLE_V2_HTML.contains("/console-3d/vendor/three.module.min.js"),
+            "shell import map must point `three` at the vendored r165"
+        );
+        assert!(
+            CONSOLE_V2_HTML.contains("destId === 'linkgraph'") && CONSOLE_V2_HTML.contains("renderLinkGraph"),
+            "shell must route the linkgraph destination to render.renderLinkGraph"
+        );
+    }
+
     #[tokio::test]
     async fn console_v2_asset_route_serves_the_modules() {
         use tower::ServiceExt;
@@ -700,6 +763,7 @@ mod tests {
         for (uri, needle) in [
             ("/console-v2/pages.js", "MUTATING_ACTIONS"),
             ("/console-v2/render.js", "CONTROL_TYPES"),
+            ("/console-v2/linkgraph-renderer.mjs", "createLinkGraphRenderer"),
         ] {
             let resp = super::routes(true)
                 .oneshot(
