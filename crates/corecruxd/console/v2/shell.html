@@ -1848,6 +1848,37 @@
   .cx-graphlink { min-height: 30px; padding: 0 11px; font-size: 12px; align-self: flex-start; }
   @media (max-width: 720px) { .canvas-graph-inspector { width: 100%; max-width: 100%; } }
 
+  /* ---- Canvas graph — zoom-aware LOD (M7) --------------------------------
+     Zoomed OUT the nodes ride concentric type-shells (the ring overview); zoomed
+     IN they snap to the card/force columns. A +/- cluster carries a live label
+     ("overview" / "detail"); wheel + pinch still zoom. */
+  .cv-zoom {
+    position: absolute; left: 14px; bottom: 14px; z-index: 5;
+    display: flex; align-items: center; gap: 2px; padding: 3px;
+    border: 1px solid var(--edge); border-radius: 9px;
+    background: color-mix(in srgb, var(--surface) 92%, var(--bg));
+    backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+    box-shadow: 0 6px 18px rgba(0,0,0,.35);
+  }
+  .cv-zoom-btn {
+    width: 28px; height: 28px; display: inline-flex; align-items: center; justify-content: center;
+    border: none; border-radius: 6px; background: none; color: var(--ink2);
+    font-size: 16px; line-height: 1; cursor: pointer; transition: color .12s ease, background .12s ease;
+  }
+  .cv-zoom-btn:hover { color: var(--ink); background: var(--surface2); }
+  .cv-zoom-mode {
+    font-family: var(--font-mono); font-size: 9px; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--ink3); padding: 0 8px; min-width: 58px; text-align: center;
+  }
+  .cv-graph-note {
+    position: absolute; left: 14px; top: 14px; z-index: 5; max-width: 62%;
+    font-family: var(--font-mono); font-size: 10px; color: var(--ink3);
+    background: color-mix(in srgb, var(--surface) 90%, var(--bg));
+    border: 1px solid var(--edge); border-radius: 7px; padding: 4px 9px;
+  }
+  /* Overview (ring) declutter — drop the id line so the shells read cleanly. */
+  .cv-graph-layer[data-lod="ring"] .cv-card-id { display: none; }
+
   /* ---- Plan tree (M4a) — Project → ExecPlan → Milestone → live session ----
      Indented rows over native <details>; nesting shown by indent + a rotating
      ▸ disclosure caret (CSS-only), not a coloured side-tab. */
@@ -1899,6 +1930,88 @@
     color: var(--crit); border-color: color-mix(in srgb, var(--crit) 55%, var(--edge));
     background: color-mix(in srgb, var(--crit) 12%, var(--surface2));
   }
+
+  /* ---- Plan tree colour + filters (M7) ----------------------------------
+     KIND → the row's left-border STYLE + colour and its type-chip hue (reusing
+     the graph's kind vocabulary: project=acc, execplan=trust, session=ok,
+     kanban(work)=warn, milestone=ink3, unattached=crit). STATE → a subtle row
+     fill + the state-chip hue (reusing the console's status vocabulary:
+     planned=ink3, in_progress/drafting=acc, blocked/review=warn,
+     done/complete/deployed=ok, archive=muted). Additive: existing chips + hash
+     badges + focus/lease chips are untouched. */
+  .plan-tree-row[data-kind] { border-left: 3px solid transparent; }
+  .plan-tree-row[data-kind="project"] { border-left-color: var(--acc); }
+  .plan-tree-row[data-kind="execplan"] { border-left-color: var(--trust); }
+  .plan-tree-row[data-kind="milestone"] { border-left-style: dotted; border-left-color: var(--ink3); }
+  .plan-tree-row[data-kind="session"] { border-left-color: var(--ok); }
+  .plan-tree-row[data-kind="work"] { border-left-style: dashed; border-left-color: var(--warn); }
+  .plan-tree-row[data-kind="unattached"] { border-left-style: dashed; border-left-color: var(--crit); }
+  /* Type chip hue by kind. */
+  .plan-tree-row[data-kind="project"] .plan-tree-type { color: var(--acc); border-color: color-mix(in srgb, var(--acc) 42%, var(--edge)); }
+  .plan-tree-row[data-kind="execplan"] .plan-tree-type { color: var(--trust); border-color: color-mix(in srgb, var(--trust) 42%, var(--edge)); }
+  .plan-tree-row[data-kind="milestone"] .plan-tree-type { color: var(--ink2); }
+  .plan-tree-row[data-kind="session"] .plan-tree-type { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 42%, var(--edge)); }
+  .plan-tree-row[data-kind="work"] .plan-tree-type { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 42%, var(--edge)); }
+  .plan-tree-row[data-kind="unattached"] .plan-tree-type { color: var(--crit); border-color: color-mix(in srgb, var(--crit) 42%, var(--edge)); }
+  /* State fill (subtle). */
+  .plan-tree-row[data-state="planned"] { background: color-mix(in srgb, var(--ink3) 7%, transparent); }
+  .plan-tree-row[data-state="in_progress"], .plan-tree-row[data-state="drafting"] { background: color-mix(in srgb, var(--acc) 10%, transparent); }
+  .plan-tree-row[data-state="blocked"], .plan-tree-row[data-state="review"] { background: color-mix(in srgb, var(--warn) 12%, transparent); }
+  .plan-tree-row[data-state="done"], .plan-tree-row[data-state="complete"], .plan-tree-row[data-state="deployed"] { background: color-mix(in srgb, var(--ok) 9%, transparent); }
+  .plan-tree-row[data-state="archive"] { background: color-mix(in srgb, var(--ink3) 5%, transparent); }
+  /* State chip hue. */
+  .plan-tree-row[data-state="in_progress"] .plan-tree-state, .plan-tree-row[data-state="drafting"] .plan-tree-state { color: var(--acc); }
+  .plan-tree-row[data-state="blocked"] .plan-tree-state, .plan-tree-row[data-state="review"] .plan-tree-state { color: var(--warn); }
+  .plan-tree-row[data-state="done"] .plan-tree-state, .plan-tree-row[data-state="complete"] .plan-tree-state, .plan-tree-row[data-state="deployed"] .plan-tree-state { color: var(--ok); }
+  .plan-tree-row[data-state="planned"] .plan-tree-state, .plan-tree-row[data-state="archive"] .plan-tree-state { color: var(--ink3); }
+
+  .plan-tree-controls { display: flex; flex-direction: column; gap: 10px; margin-bottom: 12px; }
+  .plan-tree-legend {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 7px 13px;
+    padding: 8px 11px; border: 1px solid var(--edge); border-radius: 8px; background: var(--surface);
+  }
+  .plan-tree-legend-h { font-family: var(--font-mono); font-size: 9px; letter-spacing: .14em; text-transform: uppercase; color: var(--ink3); font-weight: 600; }
+  .plan-tree-legend-item { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; color: var(--ink2); }
+  .plan-tree-legend-lab { font-family: var(--font-mono); }
+  .plan-tree-legend-swatch { width: 13px; height: 13px; border-radius: 3px; border: 1.5px solid var(--edge-strong); background: transparent; flex: none; }
+  .plan-tree-legend-swatch[data-kind="project"] { background: var(--acc); border-color: var(--acc); }
+  .plan-tree-legend-swatch[data-kind="execplan"] { background: var(--trust); border-color: var(--trust); }
+  .plan-tree-legend-swatch[data-kind="milestone"] { border-style: dotted; border-color: var(--ink3); }
+  .plan-tree-legend-swatch[data-kind="session"] { background: var(--ok); border-color: var(--ok); }
+  .plan-tree-legend-swatch[data-kind="work"] { border-style: dashed; border-color: var(--warn); }
+  .plan-tree-legend-swatch[data-kind="unattached"] { border-style: dashed; border-color: var(--crit); }
+  .plan-tree-legend-swatch[data-state="planned"] { background: var(--ink3); border-color: var(--ink3); }
+  .plan-tree-legend-swatch[data-state="in_progress"], .plan-tree-legend-swatch[data-state="drafting"] { background: var(--acc); border-color: var(--acc); }
+  .plan-tree-legend-swatch[data-state="blocked"], .plan-tree-legend-swatch[data-state="review"] { background: var(--warn); border-color: var(--warn); }
+  .plan-tree-legend-swatch[data-state="done"], .plan-tree-legend-swatch[data-state="complete"], .plan-tree-legend-swatch[data-state="deployed"] { background: var(--ok); border-color: var(--ok); }
+  .plan-tree-legend-swatch[data-state="archive"] { background: color-mix(in srgb, var(--ink3) 55%, transparent); border-color: var(--ink3); }
+
+  .plan-tree-filters { display: flex; flex-direction: column; gap: 7px; }
+  .plan-tree-filter-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+  .plan-tree-filter-lab { font-family: var(--font-mono); font-size: 9px; letter-spacing: .12em; text-transform: uppercase; color: var(--ink3); min-width: 46px; }
+  .plan-tree-toggle {
+    font-family: var(--font-mono); font-size: 10.5px; padding: 3px 9px; border-radius: 999px;
+    border: 1px solid var(--edge); background: var(--surface2); color: var(--ink3); cursor: pointer;
+    transition: color .12s ease, border-color .12s ease, opacity .12s ease;
+  }
+  .plan-tree-toggle:hover { color: var(--ink); border-color: var(--edge-strong); }
+  .plan-tree-toggle:not(.is-on) { opacity: .42; text-decoration: line-through; }
+  .plan-tree-toggle.is-on[data-kind="project"] { color: var(--acc); border-color: color-mix(in srgb, var(--acc) 45%, var(--edge)); }
+  .plan-tree-toggle.is-on[data-kind="execplan"] { color: var(--trust); border-color: color-mix(in srgb, var(--trust) 45%, var(--edge)); }
+  .plan-tree-toggle.is-on[data-kind="session"] { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--edge)); }
+  .plan-tree-toggle.is-on[data-kind="work"] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--edge)); }
+  .plan-tree-toggle.is-on[data-kind="unattached"] { color: var(--crit); border-color: color-mix(in srgb, var(--crit) 45%, var(--edge)); }
+  .plan-tree-toggle.is-on[data-kind="milestone"] { color: var(--ink); }
+  .plan-tree-toggle.is-on[data-state="in_progress"], .plan-tree-toggle.is-on[data-state="drafting"] { color: var(--acc); border-color: color-mix(in srgb, var(--acc) 45%, var(--edge)); }
+  .plan-tree-toggle.is-on[data-state="blocked"], .plan-tree-toggle.is-on[data-state="review"] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--edge)); }
+  .plan-tree-toggle.is-on[data-state="done"], .plan-tree-toggle.is-on[data-state="complete"], .plan-tree-toggle.is-on[data-state="deployed"] { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--edge)); }
+  .plan-tree-toggle.is-on[data-state="planned"], .plan-tree-toggle.is-on[data-state="archive"] { color: var(--ink2); }
+  .plan-tree-search {
+    flex: 1; min-width: 160px; font-family: inherit; font-size: 12px; padding: 5px 10px;
+    border-radius: 7px; border: 1px solid var(--edge); background: var(--surface2); color: var(--ink);
+  }
+  .plan-tree-search:focus { outline: none; border-color: var(--acc); }
+  .plan-tree-count { font-family: var(--font-mono); font-size: 11px; color: var(--ink3); margin: 0; }
 
   /* Session-detail / evidence view (M4b) — tree + detail split. */
   .plan-tree-layout { display: flex; gap: 14px; align-items: flex-start; flex-wrap: wrap; }
