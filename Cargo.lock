@@ -1385,12 +1385,14 @@ dependencies = [
  "corecrux-receipts",
  "ed25519-dalek",
  "hex",
+ "p256",
  "serde",
  "serde_json",
  "serial_test",
  "tempfile",
  "thiserror 2.0.19",
  "tracing",
+ "x509-cert",
 ]
 
 [[package]]
