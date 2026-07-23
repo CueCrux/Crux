@@ -1951,6 +1951,16 @@
   .act-row.k-execplan, .act-row.k-handoff { border-left-color: #5EC2E7; }
   .act-row.k-error { border-left-color: var(--crit); }
   .act-row.k-reasoning { border-left-color: var(--ink3); }
+  /* M4 default-on all-sessions lane: derived kind-chip counts, clickable session
+     pill, relative-time-with-absolute-on-hover, receipt/fact ref chips. */
+  .act-kc { color: var(--ink3); margin-left: 5px; }
+  .act-sess { font-family: var(--font-mono); font-size: 10px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--edge); background: none; color: var(--acc); cursor: pointer; }
+  .act-sess:hover { border-color: currentColor; }
+  .act-time { cursor: help; }
+  .act-refs { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 5px; }
+  .act-ref { font-family: var(--font-mono); font-size: 9.5px; padding: 2px 7px; border-radius: 999px; border: 1px solid var(--edge); color: var(--ink3); }
+  .act-ref.rc { color: var(--trust); border-color: color-mix(in srgb, var(--trust) 40%, var(--edge)); }
+  .act-ref.fr { color: var(--acc); border-color: color-mix(in srgb, var(--acc) 40%, var(--edge)); }
 
   /* ---- Facts browser (console-surfaces-remediation M2) — paged /v1/facts/list
      with entity-prefix groups, server-side search, ingest-time as_of machine,

@@ -6003,71 +6003,175 @@
     load();
   }
 
+  // console-surfaces-remediation M4: the activity log is DEFAULT-ON. On open it
+  // pulls the all-sessions lane (GET /v1/activity with `session` OMITTED —
+  // recent_all across every session for the tenant, cursor-paged by `before` =
+  // last row's `cursor`) so the operator sees the live rolling record without
+  // typing a session id. Entering a session id switches to that single session
+  // (server `recent`, newest `limit`, no older paging); clearing it returns to
+  // all-sessions. Search + kind chips are CLIENT-SIDE over the LOADED rows
+  // (labelled so — the daemon has no activity full-text search). Live tail: the
+  // `activity.appended` SSE carries ids-only, so the honest-cheap merge refetches
+  // page 1 for the current mode and prepends genuinely-new rows. Through-client
+  // only (activityBackfill → CruxApi.activity), el()/textContent, no innerHTML.
+  var ACT_DOM_CAP = 1500;               // hard ceiling on rendered rows (never all-in)
+  // Page-size budget for the default-on first pull: sized so the all-sessions
+  // lane opens ALREADY populated (a rolling-log surface, not an empty prompt) —
+  // ~80 rows on production-shaped data (200-char previews); `limit` caps at 100
+  // and the budget binds first. Older pages reuse the same budget via `before`.
+  var ACT_DEFAULT_BUDGET = 8000;
+  var ACT_PAGE_LIMIT = 100;
   function renderActivityLog(host) {
     host.textContent = '';
     if (__actLogES) { try { __actLogES.close(); } catch (e) { /* noop */ } __actLogES = null; }
-    var state = { tenant: 'default', session: '', budget: 2000, kinds: {}, rows: [], deb: null };
-    ACT_KINDS.forEach(function (k) { state.kinds[k] = true; });
-    var sessionInput = el('input', { 'class': 'act-input', type: 'text', placeholder: 'session id…', 'aria-label': 'session id' });
-    var budgetInput = el('input', { 'class': 'act-input act-budget', type: 'number', min: '1', value: '2000', 'aria-label': 'token budget' });
-    var searchInput = el('input', { 'class': 'act-input', type: 'search', placeholder: 'filter text…', 'aria-label': 'search' });
+
+    function nfmt(n) { if (typeof n !== 'number' || !isFinite(n)) { return (n == null) ? '—' : String(n); } try { return n.toLocaleString('en-US'); } catch (e) { return String(n); } }
+    function shortId(id) { var s = String(id || ''); return s.length > 8 ? s.slice(0, 8) : (s || '—'); }
+    function relTime(iso) {
+      var t = Date.parse(iso || ''); if (!isFinite(t)) { return String(iso || '—'); }
+      var s = Math.max(0, Math.round((Date.now() - t) / 1000));
+      if (s < 60) { return s + 's ago'; }
+      var m = Math.round(s / 60); if (m < 60) { return m + 'm ago'; }
+      var h = Math.round(m / 60); if (h < 48) { return h + 'h ago'; }
+      return Math.round(h / 24) + 'd ago';
+    }
+
+    var state = {
+      tenant: 'default', session: '', budget: ACT_DEFAULT_BUDGET, limit: ACT_PAGE_LIMIT,
+      rows: [], seen: {}, kindsPresent: {}, kindsOff: {},
+      nextCursor: null, hasMore: false, truncated: false,
+      loading: false, token: 0, deb: null, liveDeb: null
+    };
+    function rowKey(r) { return (r.session_id || '') + ':' + r.seq; }
+    function anyKindOff() { return Object.keys(state.kindsOff).some(function (k) { return state.kindsOff[k]; }); }
+    function isFiltered() { return !!((searchInput.value || '').trim()) || anyKindOff(); }
+
+    // ---- controls ----
+    var sessionInput = el('input', { 'class': 'act-input', type: 'text', placeholder: 'session id — blank = all sessions', 'aria-label': 'session id filter' });
+    var budgetInput = el('input', { 'class': 'act-input act-budget', type: 'number', min: '1', value: String(ACT_DEFAULT_BUDGET), 'aria-label': 'token budget per page' });
+    var searchInput = el('input', { 'class': 'act-input', type: 'search', placeholder: 'filter loaded rows (client-side)…', 'aria-label': 'search loaded activity' });
     function field(label, node) { return el('label', { 'class': 'act-field' }, [el('span', { text: label }), node]); }
     var kindsWrap = el('div', { 'class': 'act-kinds' });
-    var loadBtn = el('button', { 'class': 'btn-primary', type: 'button' }, ['Load']);
+    var reloadBtn = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Reload']);
     var liveBtn = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Go live']);
-    var controls = el('div', { 'class': 'act-controls' }, [field('session', sessionInput), field('token budget', budgetInput), field('search', searchInput), kindsWrap, loadBtn, liveBtn]);
+    var controls = el('div', { 'class': 'act-controls' }, [field('session', sessionInput), field('token budget', budgetInput), field('search (client-side)', searchInput), kindsWrap, reloadBtn, liveBtn]);
     var liveDot = el('span', { 'class': 'act-livedot' });
-    var statusText = el('span', { 'class': 'act-statustext', text: 'Enter a session id and Load. The activity log is gated by CORECRUXD_FEATURE_ACTIVITY_LOG.' });
-    var list = el('div', { 'class': 'act-list' }, [el('p', { 'class': 'ctl-desc', text: 'No activity loaded yet.' })]);
-    host.appendChild(el('div', { 'class': 'act-log' }, [controls, el('div', { 'class': 'act-status' }, [liveDot, statusText]), list]));
+    var statusText = el('span', { 'class': 'act-statustext', text: 'loading the all-sessions activity lane…' });
+    var countLine = el('p', { 'class': 'facts-count' });
+    var banner = el('div', { 'class': 'facts-banner' }); banner.style.display = 'none';
+    var list = el('div', { 'class': 'act-list' }, [el('p', { 'class': 'ctl-desc', text: 'loading…' })]);
+    var moreWrap = el('div', { 'class': 'facts-more' });
+    var sentinel = el('div', { 'class': 'facts-sentinel' });
+    host.appendChild(el('div', { 'class': 'act-log' }, [controls, el('div', { 'class': 'act-status' }, [liveDot, statusText]), countLine, banner, list, moreWrap, sentinel]));
 
     function setStatus(t) { statusText.textContent = t; }
-    function activeKinds() { return ACT_KINDS.filter(function (k) { return state.kinds[k]; }); }
+    function modeLabel() { return state.session ? ('session ' + shortId(state.session)) : 'all sessions'; }
+
+    // Kind chips are derived from the LOADED rows (kind → count) and filter
+    // client-side (toggle off to hide). Stable ACT_KINDS order first, then any
+    // unknown kinds. A chip carries its loaded count; toggling never re-queries.
+    function updateKindsPresent() {
+      var c = {};
+      state.rows.forEach(function (r) { var k = r.kind || 'idle'; c[k] = (c[k] || 0) + 1; });
+      state.kindsPresent = c;
+    }
     function renderKinds() {
       kindsWrap.textContent = '';
-      ACT_KINDS.forEach(function (k) {
-        var chip = el('button', { 'class': 'act-kchip k-' + k + (state.kinds[k] ? ' on' : ''), type: 'button', 'aria-pressed': state.kinds[k] ? 'true' : 'false', text: k });
-        chip.addEventListener('click', function () { state.kinds[k] = !state.kinds[k]; renderKinds(); paint(); });
+      var order = ACT_KINDS.filter(function (k) { return state.kindsPresent[k]; });
+      Object.keys(state.kindsPresent).forEach(function (k) { if (order.indexOf(k) < 0) { order.push(k); } });
+      if (!order.length) { return; }
+      order.forEach(function (k) {
+        var on = !state.kindsOff[k];
+        var chip = el('button', { 'class': 'act-kchip k-' + k + (on ? ' on' : ''), type: 'button', 'aria-pressed': on ? 'true' : 'false', title: 'client-side filter — toggle ' + k + ' rows' },
+          [el('span', { text: k }), el('span', { 'class': 'act-kc', text: String(state.kindsPresent[k]) })]);
+        chip.addEventListener('click', function () { state.kindsOff[k] = on; renderKinds(); paint(); });
         kindsWrap.appendChild(chip);
       });
     }
-    function load() {
-      state.session = (sessionInput.value || '').trim();
-      state.budget = parseInt(budgetInput.value, 10) || 2000;
-      if (!state.session) { setStatus('Enter a session id first.'); return; }
-      var ak = activeKinds();
-      var query = { tenant_id: state.tenant, session: state.session, token_budget: state.budget };
-      if (ak.length < ACT_KINDS.length) { query.kinds = ak.join(','); }
-      activityBackfill(query).then(function (res) {
-        if (res.status === 404) { state.rows = []; setStatus('Activity log disabled on this daemon (set CORECRUXD_FEATURE_ACTIVITY_LOG=1).'); paint(); return; }
-        if (!res.ok || !res.data) { state.rows = []; setStatus('Load failed (HTTP ' + (res.status || '?') + ').'); paint(); return; }
-        state.rows = res.data.rows || [];
-        setStatus((res.data.returned != null ? res.data.returned : state.rows.length) + ' row(s)' + (res.data.truncated ? ' (budget-truncated — raise token_budget)' : '') + ' · session ' + state.session);
-        paint();
-      });
-    }
+
     function matches(r, q) {
       if (!q) { return true; }
-      return ((r.kind || '') + ' ' + (r.preview || '') + ' ' + (r.tool || '') + ' ' + (r.intent || '') + ' ' + (r.turn_id || '')).toLowerCase().indexOf(q) >= 0;
+      return ((r.session_id || '') + ' ' + (r.kind || '') + ' ' + (r.preview || '') + ' ' + (r.tool || '') + ' ' + (r.intent || '') + ' ' + (r.turn_id || '')).toLowerCase().indexOf(q) >= 0;
+    }
+    function visibleRows() {
+      var q = (searchInput.value || '').trim().toLowerCase();
+      return state.rows.filter(function (r) { return !state.kindsOff[r.kind || 'idle'] && matches(r, q); });
+    }
+    function emptyMsg() {
+      return state.session
+        ? ('No activity for session ' + shortId(state.session) + ' yet.')
+        : 'The activity journal is empty. It fills as agents work — every question, answer, reasoning step, tool command, fact write, ExecPlan update, and handoff is appended to the activity journal (GET /v1/activity, gated by CORECRUXD_FEATURE_ACTIVITY_LOG).';
+    }
+
+    function paintCount(shown) {
+      countLine.textContent = '';
+      var loaded = state.rows.length;
+      var kids = [el('b', { text: nfmt(shown) }), ' shown'];
+      if (isFiltered()) { kids.push(' (filtered client-side)'); }
+      kids.push(' of '); kids.push(el('b', { text: nfmt(loaded) })); kids.push(' loaded · ' + modeLabel());
+      if (!state.session && state.hasMore) { kids.push(' · journal holds more — Load older'); }
+      kids.forEach(function (k) { countLine.appendChild(typeof k === 'string' ? doc().createTextNode(k) : k); });
+    }
+    function paintMore() {
+      moreWrap.textContent = '';
+      if (state.session) {
+        // Single-session view: the daemon's per-session read returns the newest
+        // `limit` with no `before` older-paging. Say so honestly when it's full.
+        if (state.hasMore && state.rows.length >= state.limit) {
+          moreWrap.appendChild(el('p', { 'class': 'ctl-desc', text: 'Showing the most recent ' + nfmt(state.rows.length) + ' for this session — the single-session view is not paginated. Raise the token budget, or clear the session for the paged all-sessions timeline.' }));
+        }
+        return;
+      }
+      if (state.rows.length >= ACT_DOM_CAP) { moreWrap.appendChild(el('p', { 'class': 'facts-cap', text: 'Rendered ' + nfmt(ACT_DOM_CAP) + '+ rows — narrow with search or kind chips to keep paging.' })); return; }
+      if (state.hasMore) {
+        var btn = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Load older']);
+        btn.addEventListener('click', loadOlder);
+        moreWrap.appendChild(btn);
+      } else if (state.rows.length) {
+        moreWrap.appendChild(el('p', { 'class': 'ctl-desc', text: 'End of the activity journal.' }));
+      }
     }
     function paint() {
-      var q = (searchInput.value || '').trim().toLowerCase();
+      var vis = visibleRows();
       list.textContent = '';
-      var visible = state.rows.filter(function (r) { return state.kinds[r.kind] && matches(r, q); });
-      if (!visible.length) { list.appendChild(el('p', { 'class': 'ctl-desc', text: state.rows.length ? 'No matching activity.' : 'No activity loaded yet.' })); return; }
-      visible.forEach(function (r) { list.appendChild(rowEl(r)); });
+      if (!vis.length) {
+        list.appendChild(el('p', { 'class': 'ctl-desc', text: state.rows.length ? 'No loaded rows match the current search / kind filter.' : emptyMsg() }));
+      } else {
+        vis.forEach(function (r) { list.appendChild(rowEl(r)); });
+      }
+      paintCount(vis.length);
+      paintMore();
+    }
+
+    function refChip(cls, glyph, id, kind) {
+      return el('span', { 'class': 'act-ref ' + cls, title: kind + ' ' + id, text: glyph + ' ' + String(id).slice(0, 14) });
     }
     function rowEl(r) {
-      var meta = el('div', { 'class': 'act-meta' }, [
-        el('span', { 'class': 'act-kind', text: r.kind || '' }),
-        el('span', { text: 'seq ' + r.seq }),
-        el('span', { text: r.ts || '' }),
-        el('span', { text: r.turn_id ? ('turn ' + r.turn_id) : '—' })
-      ]);
+      var meta = el('div', { 'class': 'act-meta' });
+      meta.appendChild(el('span', { 'class': 'act-kind', text: r.kind || '' }));
+      // Session short-id pill — click prefills the session filter (single-session).
+      var sess = el('button', { 'class': 'act-sess', type: 'button', title: 'filter to session ' + (r.session_id || ''), text: shortId(r.session_id) });
+      sess.addEventListener('click', function (e) { e.stopPropagation(); focusSession(r.session_id); });
+      meta.appendChild(sess);
+      // Relative time; absolute ISO on hover (title).
+      meta.appendChild(el('span', { 'class': 'act-time', title: r.ts || '', text: relTime(r.ts) }));
+      meta.appendChild(el('span', { text: 'seq ' + r.seq }));
       var extra = [r.tool, r.intent, (r.confidence != null ? ('conf ' + r.confidence) : null)].filter(Boolean).join(' · ');
       if (extra) { meta.appendChild(el('span', { text: extra })); }
+      var kids = [meta, el('div', { 'class': 'act-preview', text: r.preview || '' })];
+      // Receipt / fact-ref chips where present.
+      var receipts = r.receipt_ids || [], facts = r.fact_refs || [];
+      if (receipts.length || facts.length) {
+        var refs = el('div', { 'class': 'act-refs' });
+        receipts.slice(0, 3).forEach(function (rid) { refs.appendChild(refChip('rc', '✎', rid, 'receipt')); });
+        if (receipts.length > 3) { refs.appendChild(el('span', { 'class': 'act-ref', text: '+' + (receipts.length - 3) + ' receipts' })); }
+        facts.slice(0, 2).forEach(function (fid) { refs.appendChild(refChip('fr', '◆', fid, 'fact')); });
+        if (facts.length > 2) { refs.appendChild(el('span', { 'class': 'act-ref', text: '+' + (facts.length - 2) + ' facts' })); }
+        kids.push(refs);
+      }
       var expand = el('div', { 'class': 'act-expand' }, [el('div', { 'class': 'act-verbatim', text: 'loading verbatim…' }), el('div', { 'class': 'act-receipts' })]);
-      var row = el('div', { 'class': 'act-row k-' + (r.kind || 'idle'), role: 'button', tabindex: '0' }, [meta, el('div', { 'class': 'act-preview', text: r.preview || '' }), expand]);
+      kids.push(expand);
+      var row = el('div', { 'class': 'act-row k-' + (r.kind || 'idle'), role: 'button', tabindex: '0' }, kids);
       var opened = false;
       function toggle() { var o = row.classList.toggle('open'); if (o && !opened) { opened = true; expandRow(row, r); } }
       row.addEventListener('click', toggle);
@@ -6076,8 +6180,10 @@
     }
     function expandRow(row, r) {
       var vb = row.querySelector('.act-verbatim'), rc = row.querySelector('.act-receipts');
-      if (!r.turn_id) { vb.textContent = r.preview || '(no turn id — preview only)'; return; }
-      var query = { tenant_id: state.tenant, session: state.session };
+      // Deref uses the ROW's own session (all-sessions rows each carry one).
+      var sess = r.session_id || state.session;
+      if (!r.turn_id || !sess) { vb.textContent = r.preview || '(no turn id — preview only)'; return; }
+      var query = { tenant_id: state.tenant, session: sess };
       activityTurnCall('activityTurnByTurnId', r.turn_id, query).then(function (res) {
         if (!res.ok || !res.data) { vb.textContent = 'deref failed (HTTP ' + (res.status || '?') + ')'; return; }
         var entries = res.data.entries || [];
@@ -6098,32 +6204,127 @@
         });
       });
     }
+
+    // ---- loaders ----
+    function buildQuery(before) {
+      var q = { tenant_id: state.tenant, token_budget: state.budget, limit: state.limit };
+      if (state.session) { q.session = state.session; }           // omit ⇒ all-sessions lane
+      if (before != null) { q.before = before; }                  // older-page cursor (all-sessions only)
+      return q;
+    }
+    function ingest(rows) {
+      var fresh = [];
+      (rows || []).forEach(function (r) { var k = rowKey(r); if (state.seen[k]) { return; } state.seen[k] = true; state.rows.push(r); fresh.push(r); });
+      return fresh;
+    }
+    function loadFresh() {
+      state.session = (sessionInput.value || '').trim();
+      state.budget = parseInt(budgetInput.value, 10) || ACT_DEFAULT_BUDGET;
+      state.token++;
+      state.rows = []; state.seen = {}; state.kindsPresent = {}; state.kindsOff = {};
+      state.nextCursor = null; state.hasMore = false; state.truncated = false; state.loading = false;
+      banner.style.display = 'none'; moreWrap.textContent = ''; kindsWrap.textContent = '';
+      list.textContent = ''; list.appendChild(el('p', { 'class': 'ctl-desc', text: 'loading…' }));
+      setStatus('loading the ' + modeLabel() + ' lane…');
+      loadPage(null, true);
+    }
+    function loadPage(before, isFirst) {
+      if (state.loading) { return; }
+      state.loading = true;
+      var myToken = state.token;
+      activityBackfill(buildQuery(before)).then(function (res) {
+        if (myToken !== state.token) { return; }
+        state.loading = false;
+        if (res.status === 404) { handle404(); return; }
+        if (!res.ok || !res.data) {
+          if (isFirst) { banner.style.display = ''; banner.className = 'facts-banner err'; banner.textContent = 'Activity load failed — ' + (res.status === 0 ? 'daemon unreachable' : 'HTTP ' + res.status) + '.'; list.textContent = ''; countLine.textContent = ''; }
+          setStatus('load failed (HTTP ' + (res.status || '?') + ')');
+          return;
+        }
+        var d = res.data;
+        state.hasMore = !!d.has_more;
+        state.nextCursor = (d.next_cursor != null) ? d.next_cursor : null;
+        state.truncated = !!d.truncated;
+        ingest(d.rows);
+        updateKindsPresent(); renderKinds();
+        setStatus(nfmt(state.rows.length) + ' row(s) loaded' + (state.truncated ? ' · page budget-truncated (raise token budget)' : '') + ' · ' + modeLabel());
+        paint();
+      });
+    }
+    function loadOlder() {
+      if (state.loading || state.session || !state.hasMore) { return; }   // older-paging is all-sessions only
+      if (state.rows.length >= ACT_DOM_CAP) { paintMore(); return; }
+      if (state.nextCursor == null) { return; }
+      loadPage(state.nextCursor, false);
+    }
+
+    // Honest flag-off state — keep the CORECRUXD_FEATURE_ACTIVITY_LOG copy. Under
+    // ?demo=1 a labelled fixture stands in (a real, enabled daemon never 404s).
+    function handle404() {
+      var demoAct = demoOn() ? demoData('activityLog') : null;
+      if (demoAct && demoAct.length) {
+        state.rows = demoAct.map(function (r) { var c = {}; for (var k in r) { c[k] = r[k]; } if (!c.session_id) { c.session_id = 'sess_demo01'; } return c; });
+        state.seen = {}; state.rows.forEach(function (r) { state.seen[rowKey(r)] = true; });
+        state.hasMore = false; state.nextCursor = null;
+        updateKindsPresent(); renderKinds();
+        banner.style.display = ''; banner.className = 'facts-banner';
+        banner.textContent = 'Activity log route is off (CORECRUXD_FEATURE_ACTIVITY_LOG) — showing a labelled demo fixture. Enable the flag for live data.';
+        setStatus(nfmt(state.rows.length) + ' row(s) · demo');
+        paint();
+        return;
+      }
+      state.rows = []; state.hasMore = false; state.nextCursor = null;
+      banner.style.display = ''; banner.className = 'facts-banner warn';
+      banner.textContent = 'Activity log disabled on this daemon — set CORECRUXD_FEATURE_ACTIVITY_LOG=1 to enable GET /v1/activity and the live stream.';
+      setStatus('route unavailable (404)');
+      list.textContent = ''; list.appendChild(el('p', { 'class': 'ctl-desc', text: 'The activity journal route is off on this daemon.' }));
+      countLine.textContent = ''; moreWrap.textContent = '';
+    }
+
+    // ---- live tail: the SSE event is ids-only, so refetch page 1 for the
+    //      current mode (budgeted) and prepend genuinely-new rows (dedup on
+    //      session:seq). Cheap + honest — no fabricated rows from the event. ----
+    function focusSession(id) { sessionInput.value = id || ''; loadFresh(); }
+    function scheduleLiveMerge() { clearTimeout(state.liveDeb); state.liveDeb = setTimeout(mergeNewest, 500); }
+    function mergeNewest() {
+      var myToken = state.token;
+      activityBackfill(buildQuery(null)).then(function (res) {
+        if (myToken !== state.token) { return; }
+        if (!res.ok || !res.data) { return; }
+        var incoming = res.data.rows || [], added = 0;
+        for (var i = incoming.length - 1; i >= 0; i--) {              // oldest→newest so newest ends at index 0
+          var r = incoming[i], k = rowKey(r);
+          if (state.seen[k]) { continue; }
+          state.seen[k] = true; state.rows.unshift(r); added++;
+        }
+        if (added) {
+          updateKindsPresent(); renderKinds(); paint();
+          setStatus('+' + added + ' new · ' + nfmt(state.rows.length) + ' loaded · live · ' + modeLabel());
+        }
+      });
+    }
     function toggleLive() {
       if (__actLogES) { try { __actLogES.close(); } catch (e) { /* noop */ } __actLogES = null; liveDot.classList.remove('on'); liveBtn.textContent = 'Go live'; return; }
       if (typeof EventSource === 'undefined') { setStatus('Live streaming unsupported in this browser.'); return; }
       try { __actLogES = new EventSource('/v1/events/stream?types=activity.appended'); }
       catch (e) { setStatus('Live stream unavailable.'); return; }
-      __actLogES.addEventListener('activity.appended', function () { clearTimeout(state.deb); state.deb = setTimeout(load, 400); });
+      __actLogES.addEventListener('activity.appended', function () { scheduleLiveMerge(); });
       __actLogES.onerror = function () { liveBtn.textContent = 'Live (reconnecting)'; };
       liveDot.classList.add('on'); liveBtn.textContent = 'Stop live';
     }
-    loadBtn.addEventListener('click', load);
+
+    // ---- wiring ----
+    reloadBtn.addEventListener('click', loadFresh);
     liveBtn.addEventListener('click', toggleLive);
-    searchInput.addEventListener('input', paint);
-    sessionInput.addEventListener('keydown', function (e) { if (e.key === 'Enter') { load(); } });
-    renderKinds();
-    // Demo mode: a fresh daemon gates the activity log (CORECRUXD_FEATURE_ACTIVITY_LOG),
-    // so the surface is blank until Loaded. Under ?demo=1 paint a labelled fixture
-    // of a session's rolling turns (via the demoData() choke point) — a real
-    // session id + Load still overrides it.
-    var demoAct = demoData('activityLog');
-    if (demoAct && demoAct.length) {
-      state.session = 'sess_7f3a1c2b';
-      sessionInput.value = state.session;
-      state.rows = demoAct;
-      setStatus(state.rows.length + ' row(s) · session ' + state.session + ' · demo');
-      paint();
+    searchInput.addEventListener('input', function () { clearTimeout(state.deb); state.deb = setTimeout(paint, 200); });
+    sessionInput.addEventListener('keydown', function (e) { if (e.key === 'Enter') { loadFresh(); } });
+    budgetInput.addEventListener('keydown', function (e) { if (e.key === 'Enter') { loadFresh(); } });
+    if (typeof IntersectionObserver !== 'undefined') {
+      var io = new IntersectionObserver(function (entries) { if (entries[0] && entries[0].isIntersecting) { loadOlder(); } }, { rootMargin: '500px' });
+      io.observe(sentinel);
     }
+    // DEFAULT-ON: pull the all-sessions lane immediately (no session id required).
+    loadFresh();
   }
 
   function renderExplorer(host, ctx) {
