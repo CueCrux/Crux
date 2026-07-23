@@ -5835,7 +5835,7 @@
     'canvas:tree':     'Plan tree — colour-coded by kind and state, filterable',
     'explorer':        'Search the corpus — local retrieval or mediated WikiCrux',
     'sitemap':         "You're here — the whole console, one guided map",
-    'rings':           'Rings-clock landing prototype — live against this daemon'
+    'rings':           'The clock of work — the live work board, facts and glance as an animated ring'
   };
   // Honest per-node badges — access posture + feature-gating, stated on the card.
   var SITEMAP_BADGE = {
@@ -5843,8 +5843,9 @@
     'cx-mints':        { t: 'OPERATOR', cls: 'op' },
     'cx-raw':          { t: 'OPERATOR', cls: 'op' },
     'cx-identity':     { t: 'FEATURE-GATED', cls: 'gate' },
-    'cx-mediation':    { t: 'ENGINE OFF', cls: 'gate' },
-    'rings':           { t: 'PROTOTYPE', cls: 'proto' }
+    'cx-mediation':    { t: 'ENGINE OFF', cls: 'gate' }
+    // rings: no badge — it is now a native, live-wired page like every other
+    // content surface (was PROTOTYPE while it shipped as an embedded iframe mock).
   };
   // Recommended first-run path (node keys, in order). Rendered as small numerals
   // on the matching cards + a legend; steps whose node is absent in this posture
@@ -6862,6 +6863,21 @@
       loading: false, token: 0, deb: null, liveDeb: null
     };
     function rowKey(r) { return (r.session_id || '') + ':' + r.seq; }
+    // Newest-first invariant. Rows carry a monotonic per-row `cursor` (µs since
+    // epoch) — the authoritative recency key; ts+seq is the honest fallback when
+    // an older daemon omits it. state.rows is kept sorted DESC by this key after
+    // every load/merge so the FIRST rendered row is ALWAYS the newest, regardless
+    // of which path (initial page, Load-older append, or SSE merge) added it or
+    // what order the server returned them in. (Previously order was implicit —
+    // trusting the server's DESC feed + the correct insertion side — with no
+    // enforced invariant, so any out-of-order page or merge inverted the DOM.)
+    function actSortKey(r) {
+      var c = Number(r && r.cursor);
+      if (isFinite(c)) { return c; }
+      var t = Date.parse((r && r.ts) || '');
+      return (isFinite(t) ? t * 1000 : 0) + (parseInt(r && r.seq, 10) || 0);
+    }
+    function sortRowsNewestFirst() { state.rows.sort(function (a, b) { return actSortKey(b) - actSortKey(a); }); }
     function anyKindOff() { return Object.keys(state.kindsOff).some(function (k) { return state.kindsOff[k]; }); }
     function isFiltered() { return !!((searchInput.value || '').trim()) || anyKindOff(); }
 
@@ -7034,6 +7050,7 @@
     function ingest(rows) {
       var fresh = [];
       (rows || []).forEach(function (r) { var k = rowKey(r); if (state.seen[k]) { return; } state.seen[k] = true; state.rows.push(r); fresh.push(r); });
+      sortRowsNewestFirst();   // enforce newest-first regardless of page/server order
       return fresh;
     }
     function loadFresh() {
@@ -7084,6 +7101,7 @@
       if (demoAct && demoAct.length) {
         state.rows = demoAct.map(function (r) { var c = {}; for (var k in r) { c[k] = r[k]; } if (!c.session_id) { c.session_id = 'sess_demo01'; } return c; });
         state.seen = {}; state.rows.forEach(function (r) { state.seen[rowKey(r)] = true; });
+        sortRowsNewestFirst();
         state.hasMore = false; state.nextCursor = null;
         updateKindsPresent(); renderKinds();
         banner.style.display = ''; banner.className = 'facts-banner';
@@ -7111,12 +7129,13 @@
         if (myToken !== state.token) { return; }
         if (!res.ok || !res.data) { return; }
         var incoming = res.data.rows || [], added = 0;
-        for (var i = incoming.length - 1; i >= 0; i--) {              // oldest→newest so newest ends at index 0
+        for (var i = 0; i < incoming.length; i++) {                   // dedup-append; sort restores newest-first
           var r = incoming[i], k = rowKey(r);
           if (state.seen[k]) { continue; }
-          state.seen[k] = true; state.rows.unshift(r); added++;
+          state.seen[k] = true; state.rows.push(r); added++;
         }
         if (added) {
+          sortRowsNewestFirst();                                      // genuinely-new rows float to the top by cursor
           updateKindsPresent(); renderKinds(); paint();
           setStatus('+' + added + ' new · ' + nfmt(state.rows.length) + ' loaded · live · ' + modeLabel());
         }
@@ -7818,161 +7837,1251 @@
     return { search: doSearch, state: state };
   }
 
-  // ── Link graph pane (ExecPlan wikicrux-link-graph-explorer M4) ────────────
-  // A special full-viewport destination: a WebGL six-degrees explorer over the
-  // enwiki-prose link graph, served through the Crux daemon's read-only CoreCrux
-  // mediation proxy (/v1/console/corecrux/graph/*). All reads go through the
-  // generated CruxApi.get (fetchJSON) — no bearer in the browser (T.3). The
-  // renderer is a client-only ESM module (custom three.js r165) dynamically
-  // imported so the no-build shell never evaluates WebGL until this pane opens.
-  function linkGraphTheme() {
-    var t = (typeof document !== 'undefined') ? document.documentElement.getAttribute('data-theme') : null;
-    return (t === 'dark' || t === 'glass') ? t : 'light';
-  }
-  function lgFmtNum(n) {
-    if (typeof n !== 'number' || !isFinite(n)) { return String(n); }
-    return n.toLocaleString ? n.toLocaleString() : String(n);
-  }
-  function lgError(res, what) {
-    if (res.status === 503) { return 'Link graph unavailable — the CoreCrux graph is not built/enabled upstream.'; }
-    if (res.status === 0) { return 'Graph backend unreachable.'; }
-    var detail = res.data && res.data.detail;
-    return 'Graph ' + what + ' failed (' + (res.status || '?') + ')' + (detail ? ': ' + detail : '') + '.';
-  }
+  // =========================================================================
+  //  Rings snapshot data — the honest degradation for the native Rings page
+  //  (renderRings below). Ported verbatim from UI-prototype/rings-clock/
+  //  console-mock.html; live feeds (/v1/work, /v1/console/summary,
+  //  /v1/facts/list) supersede these at runtime when reachable.
+  // =========================================================================
+  var RINGS_PLANS_RAW = [{"s":"corecrux-object-storage-tier-2026-07-07","st":0,"d":6,"t":6,"b":61,"e":76,"o":59,"dep":["corecrux-memory-manager-2026-07-05"],"ext":[],"od":[]},{"s":"tier-packaging-p1-remediation-2026-07-13","st":1,"d":0,"t":1,"b":67,"e":76,"o":55,"dep":[],"ext":[],"od":[]},{"s":"crux-daemon-buyer-fit-buildout-2026-07-13","st":1,"d":1,"t":8,"b":67,"e":76,"o":64,"dep":[],"ext":[],"od":[]},{"s":"crux-audit-v2-closeout-2026-07-15","st":0,"d":7,"t":7,"b":69,"e":75,"o":56,"dep":["crux-audit-v2-remediation-2026-07-13"],"ext":[],"od":[]},{"s":"vault-consolidation-2026-04-07","st":1,"d":0,"t":8,"b":54,"e":75,"o":80,"dep":[],"ext":[],"od":[]},{"s":"cross-site-auth-sso-cuecrux-2026-07-13","st":1,"d":3,"t":6,"b":67,"e":75,"o":67,"dep":["paddle-billing-state-2026-07-13","unified-shell-console-2026-07-03"],"ext":["cuecrux-selfserve-launch-readiness-2026-07-16"],"od":[]},{"s":"wikicrux-agent-publish-plane-shared-tenant-2026-07-09","st":1,"d":1,"t":6,"b":73,"e":74,"o":5,"dep":["wikicrux-agent-adoption-sequence-2026-07-08","wikicrux-agent-first-wiki-service-2026-06-11"],"ext":["wikicrux-adoption-telemetry-and-corpus-flywheel-2026-07-09"],"od":[]},{"s":"portfolio-burn-down-orchestration-2026-07-10","st":2,"d":2,"t":8,"b":64,"e":74,"o":54,"dep":["commerce-paddle-billing-2026-06-11","crux-credit-burn-rail-2026-06-22","production-cutover-orchestration-2026-07-07"],"ext":[],"od":["OD-1"]},{"s":"commerce-paddle-billing-2026-06-11","st":1,"d":0,"t":8,"b":58,"e":72,"o":51,"dep":[],"ext":["portfolio-burn-down-orchestration-2026-07-10"],"od":[]},{"s":"daemon-distribution-packaging-2026-06-11","st":0,"d":7,"t":7,"b":36,"e":72,"o":137,"dep":[],"ext":[],"od":[]},{"s":"esi-v2-no-blindspot-live-write-2026-06-03","st":2,"d":3,"t":6,"b":27,"e":72,"o":137,"dep":[],"ext":[],"od":[]},{"s":"unified-shell-console-2026-07-03","st":1,"d":12,"t":13,"b":57,"e":58,"o":17,"dep":["open-engine-coordination-surfaces-2026-06-30"],"ext":["cross-site-auth-sso-cuecrux-2026-07-13"],"od":[]},{"s":"wikicrux-prose-dense-reembed-float16-pool-2026-06-27","st":0,"d":3,"t":5,"b":51,"e":51,"o":7,"dep":[],"ext":["wikicrux-retrieval-quality-hardening-2026-06-28"],"od":[]},{"s":"wikicrux-public-codemaps-2026-07-10","st":1,"d":4,"t":4,"b":64,"e":64,"o":0,"dep":[],"ext":["codemaps-cross-repo-graph-and-value-expansion-2026-07-10"],"od":[]},{"s":"wikicrux-retrieval-quality-hardening-2026-06-28","st":0,"d":6,"t":7,"b":52,"e":52,"o":11,"dep":["wikicrux-prose-dense-reembed-float16-pool-2026-06-27"],"ext":[],"od":[]},{"s":"wiki-prose-residual-extraction-2026-06-30","st":0,"d":3,"t":4,"b":54,"e":55,"o":15,"dep":[],"ext":["unified-retrieval-hardening-2026-07-02"],"od":[]},{"s":"vernacular-retrieval-lift-check-2026-05-21","st":0,"d":0,"t":7,"b":14,"e":14,"o":0,"dep":[],"ext":[],"od":[]},{"s":"wiki-cuecrux-com-prod-deploy-2026-07-08","st":0,"d":0,"t":5,"b":62,"e":62,"o":4,"dep":["wikicrux-agent-first-wiki-service-2026-06-11","wikicrux-grounding-poisoning-defense-2026-07-08"],"ext":["wikicrux-adoption-telemetry-and-corpus-flywheel-2026-07-09"],"od":[]},{"s":"wikicrux-agent-language-encode-2026-06-28","st":1,"d":5,"t":10,"b":52,"e":53,"o":30,"dep":["classical-ner-at-ingest-2026-05-05","wikicrux-agent-first-wiki-service-2026-06-11","wikicrux-full-enwiki-ingest-2026-06-28"],"ext":["unified-reasoner-encode-evidence-2026-06-29"],"od":[]},{"s":"wikicrux-grounding-poisoning-defense-2026-07-08","st":0,"d":5,"t":6,"b":62,"e":62,"o":4,"dep":["wikicrux-agent-first-wiki-service-2026-06-11"],"ext":["wiki-cuecrux-com-prod-deploy-2026-07-08","wikicrux-adoption-telemetry-and-corpus-flywheel-2026-07-09"],"od":[]},{"s":"vaultcrux-search-outcome-corpus-pollution-2026-05-31","st":0,"d":2,"t":3,"b":24,"e":24,"o":0,"dep":[],"ext":[],"od":[]},{"s":"wikicrux-idempotent-ingestion-2026-06-14","st":1,"d":4,"t":10,"b":38,"e":52,"o":48,"dep":[],"ext":["wikicrux-adoption-telemetry-and-corpus-flywheel-2026-07-09"],"od":[]},{"s":"wikicrux-agent-first-wiki-service-2026-06-11","st":1,"d":3,"t":8,"b":35,"e":37,"o":1,"dep":[],"ext":["wiki-cuecrux-com-prod-deploy-2026-07-08","wikicrux-adoption-telemetry-and-corpus-flywheel-2026-07-09","wikicrux-agent-adoption-sequence-2026-07-08","wikicrux-agent-language-encode-2026-06-28","wikicrux-agent-publish-plane-shared-tenant-2026-07-09","wikicrux-grounding-poisoning-defense-2026-07-08"],"od":[]},{"s":"wikicrux-full-enwiki-ingest-2026-06-28","st":1,"d":2,"t":9,"b":52,"e":54,"o":33,"dep":[],"ext":["enwiki-prose-dedicated-serving-data-1-2026-07-03","wikicrux-adoption-telemetry-and-corpus-flywheel-2026-07-09","wikicrux-agent-language-encode-2026-06-28"],"od":[]},{"s":"wikicrux-adoption-telemetry-and-corpus-flywheel-2026-07-09","st":1,"d":5,"t":10,"b":63,"e":67,"o":8,"dep":["enwiki-prose-dedicated-serving-data-1-2026-07-03","wiki-cuecrux-com-prod-deploy-2026-07-08","wikicrux-agent-adoption-sequence-2026-07-08","wikicrux-agent-first-wiki-service-2026-06-11","wikicrux-agent-publish-plane-shared-tenant-2026-07-09","wikicrux-full-enwiki-ingest-2026-06-28","wikicrux-grounding-poisoning-defense-2026-07-08","wikicrux-idempotent-ingestion-2026-06-14"],"ext":[],"od":[]},{"s":"vaultcrux-companion-lane-transforms-and-ccxev-2026-05-20","st":0,"d":0,"t":10,"b":15,"e":15,"o":0,"dep":[],"ext":[],"od":[]},{"s":"vaultcrux-multi-predicate-enumerate-2026-04-29","st":0,"d":0,"t":3,"b":20,"e":20,"o":0,"dep":[],"ext":[],"od":[]},{"s":"vaultcrux-multi-predicate-m3-verify-build-2026-06-09","st":0,"d":1,"t":5,"b":34,"e":34,"o":0,"dep":[],"ext":[],"od":[]},{"s":"tenant-isolation-policy-and-silo-2026-06-24","st":0,"d":7,"t":7,"b":48,"e":50,"o":25,"dep":[],"ext":[],"od":[]},{"s":"release-readiness-master-2026-06-11","st":1,"d":0,"t":6,"b":35,"e":49,"o":52,"dep":[],"ext":[],"od":[]},{"s":"tier0-deterministic-levers-2026-06-30","st":0,"d":5,"t":5,"b":54,"e":54,"o":6,"dep":[],"ext":[],"od":[]},{"s":"scorecrux-coding-intelligence-refresh-2026-06-25","st":1,"d":0,"t":5,"b":49,"e":50,"o":5,"dep":[],"ext":[],"od":[]},{"s":"tier-packaging-and-site-reframe-2026-07-13","st":1,"d":7,"t":8,"b":66,"e":67,"o":5,"dep":[],"ext":[],"od":[]},{"s":"unified-retrieval-hardening-2026-07-02","st":2,"d":7,"t":10,"b":55,"e":56,"o":1,"dep":["ccxi-query-shape-routing-2026-06-30","corecrux-offline-attach-candidate-selection-2026-07-01","embedder-pool-distribution-manager-2026-07-01","unified-production-claims-source-2026-06-30","unified-reasoner-encode-evidence-2026-06-29","wiki-prose-residual-extraction-2026-06-30"],"ext":[],"od":["OD-1","OD-2","OD-3"]},{"s":"proof-carrying-adaptive-packs-2026-07-13","st":1,"d":0,"t":7,"b":67,"e":67,"o":5,"dep":[],"ext":[],"od":[]},{"s":"security-critical-7-tenant-isolation-2026-06-11","st":0,"d":4,"t":7,"b":65,"e":65,"o":0,"dep":[],"ext":[],"od":[]},{"s":"topology-ccxn-entity-coverage-backfill-lme-s-2026-06-06","st":0,"d":3,"t":5,"b":31,"e":31,"o":0,"dep":[],"ext":[],"od":[]},{"s":"token-burn-precise-attribution-2026-06-26","st":0,"d":3,"t":3,"b":50,"e":50,"o":7,"dep":["execplan-token-burn-per-execplan-2026-06-26"],"ext":[],"od":["OD-28"]},{"s":"unified-reasoner-encode-evidence-2026-06-29","st":1,"d":0,"t":1,"b":53,"e":54,"o":25,"dep":["lme-s-aggregation-projection-lane-wikicrux-bridge-2026-06-28","wikicrux-agent-language-encode-2026-06-28"],"ext":["ccxi-query-shape-routing-2026-06-30","unified-retrieval-hardening-2026-07-02"],"od":[]},{"s":"unified-production-claims-source-2026-06-30","st":1,"d":3,"t":4,"b":54,"e":54,"o":6,"dep":[],"ext":["ccxi-query-shape-routing-2026-06-30","enwiki-prose-dedicated-serving-data-1-2026-07-03","unified-retrieval-hardening-2026-07-02"],"od":[]},{"s":"rcx-registry-deployment-readiness-2026-06-14","st":0,"d":5,"t":5,"b":38,"e":38,"o":0,"dep":[],"ext":[],"od":[]},{"s":"production-cutover-orchestration-2026-07-07","st":1,"d":39,"t":40,"b":61,"e":65,"o":2,"dep":[],"ext":["portfolio-burn-down-orchestration-2026-07-10"],"od":[]},{"s":"provider-integration-surfaces-2026-06-11","st":1,"d":5,"t":6,"b":36,"e":36,"o":1,"dep":[],"ext":[],"od":[]},{"s":"scratchpad-survival-wizard-standard-2026-06-30","st":1,"d":4,"t":4,"b":54,"e":55,"o":8,"dep":[],"ext":[],"od":[]},{"s":"topology-ccxn-weight-and-noise-tune-lme-s-2026-06-07","st":0,"d":4,"t":4,"b":31,"e":31,"o":0,"dep":[],"ext":[],"od":[]},{"s":"tokenburn-ab-harness-2026-06-10","st":0,"d":1,"t":7,"b":34,"e":34,"o":0,"dep":[],"ext":[],"od":[]},{"s":"prod-engine-reconcile-deploy-2026-06-26","st":0,"d":0,"t":1,"b":50,"e":50,"o":4,"dep":[],"ext":[],"od":[]},{"s":"phase-t-usage-receipts-2026-07-03","st":0,"d":3,"t":3,"b":64,"e":64,"o":3,"dep":[],"ext":[],"od":[]},{"s":"lme-s-gated-accuracy-push-2026-05-29","st":0,"d":0,"t":5,"b":22,"e":28,"o":0,"dep":[],"ext":[],"od":[]},{"s":"phase-t-cross-vendor-instrumentation-2026-07-03","st":1,"d":1,"t":3,"b":61,"e":64,"o":5,"dep":[],"ext":[],"od":[]},{"s":"passport-revocation-and-agent-card-discovery-2026-06-29","st":0,"d":7,"t":7,"b":53,"e":53,"o":26,"dep":[],"ext":[],"od":[]},{"s":"phase-0-hygiene-debt-2026-07-02","st":1,"d":3,"t":10,"b":56,"e":60,"o":27,"dep":["master-plan-refresh-and-docs-unification-2026-07-02"],"ext":[],"od":[]},{"s":"phase-t-usage-receipts-autoemit-version-notify-2026-07-03","st":0,"d":3,"t":3,"b":57,"e":57,"o":3,"dep":[],"ext":[],"od":[]},{"s":"master-plan-canonical-consolidation-2026-06-14","st":0,"d":4,"t":4,"b":38,"e":38,"o":0,"dep":[],"ext":[],"od":[]},{"s":"portfolio-status-decisions-registry-2026-06-11","st":0,"d":0,"t":4,"b":36,"e":36,"o":0,"dep":[],"ext":[],"od":[]},{"s":"open-engine-coordination-surfaces-2026-06-30","st":0,"d":0,"t":5,"b":54,"e":55,"o":9,"dep":[],"ext":["unified-shell-console-2026-07-03"],"od":[]},{"s":"plancrux-retirement-master-2026-05-19","st":1,"d":0,"t":9,"b":12,"e":34,"o":0,"dep":[],"ext":[],"od":[]},{"s":"mh-ab-v2-harness-build-2026-06-12","st":0,"d":1,"t":5,"b":36,"e":36,"o":0,"dep":[],"ext":["context-dependence-benchmark-scorecrux-2026-07-03"],"od":[]},{"s":"lme-s-multi-lane-retrieval-gemma-2026-05-23","st":0,"d":0,"t":7,"b":16,"e":16,"o":0,"dep":[],"ext":[],"od":[]},{"s":"lme-knowledge-reingest-and-legacy-segment-retire-2026-05-29","st":0,"d":0,"t":1,"b":22,"e":22,"o":0,"dep":[],"ext":[],"od":[]},{"s":"lane-coverage-backfill-2026-05-22","st":0,"d":2,"t":5,"b":15,"e":15,"o":0,"dep":[],"ext":[],"od":[]},{"s":"lme-ordering-day-precision-extraction-2026-06-12","st":1,"d":3,"t":6,"b":36,"e":37,"o":0,"dep":[],"ext":[],"od":[]},{"s":"lme-s-8-lever-deepdive-2026-06-04","st":0,"d":0,"t":1,"b":28,"e":29,"o":0,"dep":[],"ext":[],"od":[]},{"s":"lme-s-aggregation-projection-lane-wikicrux-bridge-2026-06-28","st":1,"d":0,"t":6,"b":52,"e":53,"o":26,"dep":["lme-s-aggregation-count-extraction-2026-06-18"],"ext":["unified-reasoner-encode-evidence-2026-06-29"],"od":[]},{"s":"lme-agent-native-retrieval-harness-2026-05-30","st":0,"d":2,"t":5,"b":23,"e":32,"o":0,"dep":[],"ext":[],"od":[]},{"s":"lme-s-aggregation-count-extraction-2026-06-18","st":0,"d":5,"t":5,"b":42,"e":47,"o":59,"dep":[],"ext":["lme-s-aggregation-projection-lane-wikicrux-bridge-2026-06-28"],"od":[]},{"s":"knowledge-state-production-hooks-2026-06-13","st":0,"d":6,"t":6,"b":37,"e":39,"o":9,"dep":[],"ext":[],"od":[]},{"s":"extraction-lane-observability-2026-05-21","st":0,"d":7,"t":7,"b":14,"e":35,"o":0,"dep":[],"ext":[],"od":[]},{"s":"execplan-lineage-provenance-open-questions-2026-06-25","st":0,"d":4,"t":5,"b":49,"e":49,"o":5,"dep":["coord-plane-p1-execplan-board-2026-06-23","crux-work-panel-execplans-as-truenorth-2026-05-26"],"ext":["execplan-board-fidelity-states-console-cost-2026-06-26"],"od":["OD-3","OD-24"]},{"s":"generative-execplans-and-deploy-coordination-2026-06-26","st":0,"d":0,"t":1,"b":50,"e":53,"o":27,"dep":["crux-work-panel-execplans-as-truenorth-2026-05-26","execplan-board-fidelity-states-console-cost-2026-06-26"],"ext":[],"od":[]},{"s":"identity-memory-portability-2026-06-11","st":0,"d":6,"t":6,"b":36,"e":36,"o":1,"dep":[],"ext":[],"od":[]},{"s":"fable5-d1-redteam-kill-risk-register-2026-07-02","st":0,"d":6,"t":6,"b":56,"e":56,"o":6,"dep":[],"ext":[],"od":[]},{"s":"gated-tiered-aggregation-prompt-fixes-2026-05-24","st":0,"d":0,"t":8,"b":17,"e":33,"o":0,"dep":[],"ext":[],"od":[]},{"s":"execplan-token-burn-per-execplan-2026-06-26","st":0,"d":2,"t":3,"b":50,"e":50,"o":12,"dep":["execplan-board-fidelity-states-console-cost-2026-06-26"],"ext":["token-burn-precise-attribution-2026-06-26"],"od":["OD-28"]},{"s":"event-lane-semantic-recall-2026-06-05","st":0,"d":6,"t":7,"b":29,"e":30,"o":0,"dep":[],"ext":[],"od":[]},{"s":"glassbox-eu-ai-act-soc2-compliance-bench-2026-06-26","st":0,"d":11,"t":11,"b":50,"e":51,"o":22,"dep":[],"ext":[],"od":[]},{"s":"event-counter-noise-reduction-2026-06-06","st":0,"d":6,"t":7,"b":30,"e":30,"o":0,"dep":[],"ext":[],"od":[]},{"s":"frontdoor-agent-ux-nuxt-feature-flag-wiring-2026-05-29","st":1,"d":0,"t":8,"b":21,"e":22,"o":0,"dep":[],"ext":[],"od":[]},{"s":"gold-free-extraction-automation-2026-05-31","st":1,"d":2,"t":11,"b":24,"e":28,"o":0,"dep":[],"ext":[],"od":[]},{"s":"execplan-board-fidelity-states-console-cost-2026-06-26","st":0,"d":3,"t":4,"b":50,"e":50,"o":5,"dep":["execplan-lineage-provenance-open-questions-2026-06-25"],"ext":["execplan-token-burn-per-execplan-2026-06-26","generative-execplans-and-deploy-coordination-2026-06-26"],"od":[]},{"s":"embedder-pool-distribution-manager-2026-07-01","st":1,"d":2,"t":6,"b":55,"e":55,"o":11,"dep":[],"ext":["unified-retrieval-hardening-2026-07-02"],"od":[]},{"s":"enwiki-prose-dedicated-serving-data-1-2026-07-03","st":0,"d":1,"t":6,"b":64,"e":64,"o":0,"dep":["claims-resident-bm25-and-next-steps-2026-06-30","unified-production-claims-source-2026-06-30","wikicrux-full-enwiki-ingest-2026-06-28"],"ext":["wikicrux-adoption-telemetry-and-corpus-flywheel-2026-07-09"],"od":[]},{"s":"embedder-pool-per-tenant-bundle-2026-06-16","st":0,"d":5,"t":5,"b":40,"e":40,"o":12,"dep":[],"ext":[],"od":[]},{"s":"enwiki-claims-coverage-expansion-2026-07-04","st":1,"d":2,"t":6,"b":64,"e":64,"o":0,"dep":[],"ext":[],"od":[]},{"s":"esi-v2-live-fact-write-path-2026-06-03","st":0,"d":0,"t":4,"b":27,"e":27,"o":0,"dep":[],"ext":[],"od":[]},{"s":"engine-ci-layer-7-remaining-highs-2026-05-21","st":0,"d":0,"t":4,"b":14,"e":14,"o":0,"dep":[],"ext":[],"od":[]},{"s":"enwiki-prose-ranking-quality-2026-07-03","st":0,"d":3,"t":5,"b":64,"e":64,"o":0,"dep":[],"ext":[],"od":["OD-1","OD-2"]},{"s":"cuecrux-feature-registry-and-router-2026-05-26","st":0,"d":0,"t":17,"b":19,"e":19,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-http-ingress-hardening-2026-06-11","st":1,"d":4,"t":5,"b":35,"e":36,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-self-hosting-hygiene-2026-06-05","st":0,"d":4,"t":5,"b":29,"e":29,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-prod-deploy-2026-06-05","st":0,"d":3,"t":4,"b":29,"e":29,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-gateway-production-2026-06-10","st":0,"d":0,"t":1,"b":34,"e":35,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-mcp-oauth-for-hosted-clients-2026-06-23","st":1,"d":5,"t":8,"b":47,"e":49,"o":44,"dep":[],"ext":[],"od":["OD-3","OD-24"]},{"s":"crux-session-capability-graph-completion-2026-06-08","st":1,"d":1,"t":5,"b":32,"e":32,"o":0,"dep":[],"ext":[],"od":[]},{"s":"cruxengine-companion-installer-deploy-hardening-2026-07-12","st":0,"d":4,"t":4,"b":66,"e":66,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-repo-audit-fixing-2026-06-15","st":0,"d":8,"t":8,"b":39,"e":39,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-moat-m4-memory-hook-m8-buyer-package-2026-06-11","st":0,"d":0,"t":2,"b":35,"e":35,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-repo-audit-hardening-followup-2026-06-15","st":0,"d":0,"t":1,"b":39,"e":39,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-signed-session-recorder-2026-06-21","st":0,"d":3,"t":3,"b":46,"e":46,"o":40,"dep":[],"ext":[],"od":[]},{"s":"crux-hook-client-wire-activity-2026-06-22","st":0,"d":5,"t":5,"b":46,"e":46,"o":38,"dep":[],"ext":[],"od":[]},{"s":"crux-headroom-token-efficiency-learnings-2026-06-24","st":0,"d":3,"t":6,"b":48,"e":49,"o":17,"dep":[],"ext":[],"od":[]},{"s":"crux-orchestrator-orcplan-2026-05-29","st":0,"d":0,"t":7,"b":22,"e":22,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-punchcard-resource-leases-2026-05-29","st":0,"d":0,"t":7,"b":22,"e":22,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-session-archive-and-friendly-titles-2026-06-13","st":0,"d":2,"t":7,"b":37,"e":37,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-growth-upsell-master-2026-06-11","st":1,"d":0,"t":4,"b":35,"e":36,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-mcp-notification-202-native-http-2026-07-06","st":0,"d":1,"t":3,"b":60,"e":61,"o":4,"dep":[],"ext":[],"od":[]},{"s":"crux-work-panel-execplans-as-truenorth-2026-05-26","st":0,"d":8,"t":8,"b":19,"e":20,"o":0,"dep":[],"ext":["execplan-lineage-provenance-open-questions-2026-06-25","generative-execplans-and-deploy-coordination-2026-06-26"],"od":[]},{"s":"crux-tenant-category-model-2026-05-22","st":0,"d":7,"t":7,"b":15,"e":15,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-new-tool-probe-fixes-2026-06-05","st":0,"d":3,"t":8,"b":29,"e":29,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-response-contract-v1-default-schema-2026-06-08","st":0,"d":6,"t":7,"b":32,"e":34,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-supply-chain-attestation-2026-06-11","st":0,"d":5,"t":5,"b":35,"e":48,"o":47,"dep":[],"ext":[],"od":[]},{"s":"cruxengine-companion-lane-port-2026-06-09","st":0,"d":7,"t":7,"b":33,"e":34,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-mcp-dynamic-tool-surface-2026-06-08","st":0,"d":1,"t":6,"b":32,"e":34,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-log-redaction-2026-06-11","st":1,"d":3,"t":5,"b":35,"e":36,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-integration-platform-surfaces","st":0,"d":0,"t":7,"b":31,"e":31,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-session-capability-catalog-refresh-2026-05-29","st":0,"d":0,"t":6,"b":21,"e":21,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-segment-integrity-audit-remediation-2026-06-13","st":0,"d":7,"t":7,"b":37,"e":37,"o":2,"dep":[],"ext":[],"od":[]},{"s":"crux-moat-track-master-2026-06-05","st":1,"d":0,"t":9,"b":35,"e":66,"o":90,"dep":[],"ext":[],"od":[]},{"s":"crux-agent-presence-coordination-2026-06-11","st":0,"d":0,"t":7,"b":35,"e":35,"o":1,"dep":[],"ext":[],"od":[]},{"s":"crux-config-wizard-dedup-lint-2026-06-23","st":0,"d":5,"t":5,"b":47,"e":47,"o":37,"dep":[],"ext":[],"od":["OD-18"]},{"s":"crux-audit-ii-gap-closure-codebase-audit-2026-06-13","st":0,"d":4,"t":4,"b":37,"e":37,"o":2,"dep":[],"ext":[],"od":[]},{"s":"crux-agent-passport-grouped-collaboration-2026-06-05","st":0,"d":5,"t":5,"b":29,"e":29,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-console-graph-cutover-2026-05-30","st":0,"d":0,"t":1,"b":23,"e":23,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-console-public-exposure-2026-05-17","st":1,"d":0,"t":6,"b":11,"e":11,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-daemon-full-audit-2026-06-05","st":0,"d":6,"t":6,"b":29,"e":29,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-dual-surface-activity-log-2026-06-18","st":0,"d":5,"t":5,"b":42,"e":46,"o":51,"dep":[],"ext":[],"od":[]},{"s":"cross-model-agreement-router-2026-06-04","st":0,"d":2,"t":3,"b":28,"e":28,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-audit-ii-gap-closure-implementation-2026-06-14","st":0,"d":14,"t":14,"b":38,"e":38,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-console-3d-substrate-concept-2026-06-11","st":0,"d":1,"t":4,"b":35,"e":35,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-daemon-security-gap-scan-2026-06-12","st":0,"d":3,"t":4,"b":36,"e":36,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crucible-gateway-supersede-clawd-2026-06-26","st":0,"d":0,"t":1,"b":50,"e":50,"o":5,"dep":[],"ext":[],"od":[]},{"s":"crux-freshness-dogfood-2026-06-04","st":0,"d":4,"t":8,"b":28,"e":29,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-daemon-console-lane-weights-2026-06-13","st":0,"d":7,"t":7,"b":37,"e":37,"o":2,"dep":[],"ext":[],"od":[]},{"s":"crux-credit-burn-rail-2026-06-22","st":1,"d":1,"t":7,"b":61,"e":62,"o":2,"dep":[],"ext":["portfolio-burn-down-orchestration-2026-07-10"],"od":[]},{"s":"crux-daemon-v8-coverage-scan-2026-06-13","st":0,"d":3,"t":3,"b":37,"e":37,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-domain-substrate-and-features-lens-2026-05-18","st":0,"d":6,"t":7,"b":11,"e":11,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crucible-control-plane-and-deep-retrieval-2026-06-18","st":1,"d":0,"t":1,"b":48,"e":50,"o":53,"dep":[],"ext":[],"od":[]},{"s":"crux-console-data-plane-wiring-2026-05-21","st":0,"d":3,"t":6,"b":14,"e":14,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-external-findings-remediation-2026-07-10","st":0,"d":7,"t":7,"b":64,"e":65,"o":3,"dep":[],"ext":[],"od":[]},{"s":"crux-daemon-hardening-audit-findings-2026-06-07","st":0,"d":6,"t":6,"b":31,"e":31,"o":0,"dep":[],"ext":[],"od":[]},{"s":"cross-session-identity-resolution-2026-06-15","st":0,"d":7,"t":7,"b":39,"e":39,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-console-lane-weight-polish-2026-06-14","st":0,"d":6,"t":6,"b":38,"e":38,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-ci-merge-queue-wiring-2026-06-26","st":0,"d":3,"t":4,"b":50,"e":53,"o":20,"dep":[],"ext":[],"od":[]},{"s":"crux-agent-action-ledger-token-accounting-2026-06-11","st":0,"d":6,"t":6,"b":35,"e":48,"o":47,"dep":[],"ext":[],"od":[]},{"s":"crux-activity-log-completion-2026-06-23","st":0,"d":4,"t":5,"b":47,"e":48,"o":38,"dep":[],"ext":[],"od":[]},{"s":"crux-codex-authentication-2026-06-12","st":0,"d":4,"t":4,"b":36,"e":57,"o":76,"dep":[],"ext":[],"od":[]},{"s":"crux-audit-chain-data-contract-2026-05-29","st":0,"d":1,"t":7,"b":22,"e":22,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-agent-passport-mcp-binding-2026-06-10","st":0,"d":0,"t":1,"b":34,"e":34,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-skip-companions-projection-control-2026-05-29","st":0,"d":0,"t":1,"b":21,"e":22,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecruxd-c2pa-vault-pki-runtime-enablement-2026-05-29","st":1,"d":0,"t":7,"b":21,"e":21,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecruxd-boost-overlay-persistence-2026-05-21","st":0,"d":1,"t":6,"b":14,"e":15,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-turboquant-ccxe-quant-mode","st":1,"d":0,"t":6,"b":36,"e":36,"o":11,"dep":[],"ext":[],"od":[]},{"s":"corecrux-trait-expansion-lme-s-structural-losses-2026-05-21","st":0,"d":3,"t":6,"b":14,"e":15,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-vernacular-v4-schema-and-prefilter-2026-05-20","st":0,"d":0,"t":8,"b":13,"e":13,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-text-search-tenant-isolation-2026-06-30","st":0,"d":5,"t":6,"b":54,"e":54,"o":2,"dep":["corecrux-offline-serving-companions-2026-06-30"],"ext":["ccxi-query-shape-routing-2026-06-30"],"od":[]},{"s":"corpus-segregation-bulk-repartition-2026-06-26","st":0,"d":4,"t":6,"b":50,"e":52,"o":33,"dep":[],"ext":[],"od":[]},{"s":"corecrux-transition-doc-content-plane-contamination-2026-06-12","st":0,"d":2,"t":6,"b":36,"e":37,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-topology-no-link-prune-2026-05-27","st":0,"d":3,"t":6,"b":20,"e":21,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-trait-expansion-global-default-on-2026-05-21","st":1,"d":0,"t":6,"b":14,"e":33,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-trait-expansion-substrate-density-auto-tune-2026-05-21","st":0,"d":4,"t":6,"b":14,"e":15,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecruxd-companion-hot-reload-2026-05-18","st":0,"d":0,"t":6,"b":11,"e":35,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-offline-serving-companions-2026-06-30","st":0,"d":6,"t":6,"b":54,"e":54,"o":34,"dep":[],"ext":["ccxi-query-shape-routing-2026-06-30","corecrux-text-search-tenant-isolation-2026-06-30"],"od":[]},{"s":"corecrux-recstyle-keyword-extension-2026-05-21","st":0,"d":3,"t":5,"b":14,"e":14,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-prometheus-indexmanager-double-count-2026-05-28","st":0,"d":0,"t":3,"b":21,"e":21,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-seal-shard-vs-tick-shard-mismatch-2026-06-01","st":0,"d":0,"t":1,"b":25,"e":25,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-query-expansion-via-trait-embeddings-2026-05-20","st":0,"d":4,"t":6,"b":14,"e":14,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-ingest-extraction-followups-2026-06-11","st":1,"d":6,"t":9,"b":35,"e":36,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-retrieve-agent-shaped-payload-2026-05-15","st":1,"d":2,"t":9,"b":23,"e":24,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-loadedsegment-memstats-2026-05-23","st":0,"d":3,"t":6,"b":15,"e":15,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-gpu1-memory-stabilization-2026-05-28","st":0,"d":2,"t":6,"b":21,"e":24,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-ingest-extraction-top10-2026-06-11","st":0,"d":0,"t":1,"b":35,"e":35,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-query-expansion-rollout-completion-2026-05-21","st":0,"d":3,"t":5,"b":14,"e":35,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-no-link-prune-substrate-rebuild-2026-05-29","st":0,"d":0,"t":1,"b":21,"e":21,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-daemon-fast-startup-2026-06-16","st":0,"d":4,"t":6,"b":40,"e":40,"o":17,"dep":[],"ext":[],"od":[]},{"s":"corecrux-evictor-convergence-2026-05-31","st":0,"d":3,"t":4,"b":24,"e":24,"o":0,"dep":[],"ext":[],"od":[]},{"s":"codex-crux-session-banner-2026-06-01","st":0,"d":8,"t":8,"b":25,"e":29,"o":0,"dep":[],"ext":[],"od":[]},{"s":"chaincrux-phase1-5-event-edges-and-temporal-filter-2026-05-22","st":0,"d":0,"t":8,"b":17,"e":17,"o":0,"dep":[],"ext":[],"od":[]},{"s":"context-mediation-injection-2026-06-11","st":1,"d":6,"t":7,"b":36,"e":36,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-bm25-64bit-tenant-filter-2026-06-13","st":1,"d":0,"t":1,"b":37,"e":37,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-cascade-engagement-lme-s-2026-05-22","st":0,"d":2,"t":6,"b":15,"e":15,"o":0,"dep":[],"ext":[],"od":[]},{"s":"claudeclaw-subscription-sonnet-backend-2026-06-03","st":0,"d":6,"t":6,"b":27,"e":28,"o":0,"dep":[],"ext":[],"od":[]},{"s":"context-bench-v2-100point-thirdparty-board-2026-07-03","st":1,"d":6,"t":7,"b":57,"e":65,"o":22,"dep":["context-dependence-benchmark-scorecrux-2026-07-03"],"ext":[],"od":[]},{"s":"corecrux-document-index-lane-2026-05-15","st":0,"d":0,"t":11,"b":11,"e":11,"o":0,"dep":[],"ext":[],"od":[]},{"s":"chaincrux-phase1-prove-earned-edge-2026-05-22","st":0,"d":0,"t":7,"b":15,"e":15,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-bulk-ingest-at-scale-2026-06-14","st":0,"d":0,"t":1,"b":38,"e":48,"o":61,"dep":[],"ext":[],"od":[]},{"s":"corecrux-bulk-ingest-polish-2026-05-03","st":1,"d":0,"t":1,"b":64,"e":64,"o":0,"dep":[],"ext":[],"od":[]},{"s":"codemap-endpoint-and-agent-docs-hardening-2026-07-10","st":0,"d":4,"t":4,"b":63,"e":63,"o":0,"dep":[],"ext":["codemaps-cross-repo-graph-and-value-expansion-2026-07-10"],"od":[]},{"s":"clawd-unified-daemon-relocation-data1-2026-06-13","st":0,"d":7,"t":7,"b":36,"e":37,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-evidence-hash-replay-dedup-2026-06-23","st":0,"d":5,"t":5,"b":47,"e":48,"o":44,"dep":[],"ext":[],"od":[]},{"s":"companion-build-429-hardening-2026-06-16","st":0,"d":6,"t":6,"b":40,"e":40,"o":7,"dep":[],"ext":[],"od":[]},{"s":"chaincrux-zero-events-substrate-investigation-2026-05-28","st":1,"d":0,"t":5,"b":21,"e":21,"o":0,"dep":[],"ext":[],"od":[]},{"s":"codemaps-facet-coverage-completion-2026-07-12","st":1,"d":0,"t":6,"b":66,"e":66,"o":0,"dep":["codemaps-cross-repo-graph-and-value-expansion-2026-07-10"],"ext":[],"od":[]},{"s":"corecrux-curator-clustering-spike-2026-07-07","st":0,"d":2,"t":3,"b":61,"e":61,"o":0,"dep":["corecrux-memory-manager-2026-07-05"],"ext":[],"od":[]},{"s":"corecrux-event-lane-rrf-wiring-2026-05-24","st":0,"d":0,"t":8,"b":17,"e":17,"o":0,"dep":[],"ext":[],"od":[]},{"s":"context-custody-surface-2026-06-30","st":0,"d":0,"t":1,"b":54,"e":54,"o":6,"dep":[],"ext":[],"od":[]},{"s":"context-dependence-benchmark-scorecrux-2026-07-03","st":0,"d":1,"t":7,"b":56,"e":57,"o":15,"dep":["mh-ab-v2-harness-build-2026-06-12"],"ext":["context-bench-v2-100point-thirdparty-board-2026-07-03"],"od":[]},{"s":"corecrux-fleet-control-plane-2026-07-03","st":1,"d":1,"t":7,"b":64,"e":64,"o":2,"dep":[],"ext":[],"od":[]},{"s":"codexclaw-deterministic-gate-orchestration-2026-05-26","st":0,"d":1,"t":8,"b":19,"e":35,"o":0,"dep":[],"ext":[],"od":[]},{"s":"chaincrux-cascade-route-integration-2026-05-25","st":0,"d":4,"t":8,"b":18,"e":21,"o":0,"dep":[],"ext":[],"od":[]},{"s":"ccxi-query-shape-routing-2026-06-30","st":1,"d":4,"t":6,"b":54,"e":54,"o":3,"dep":["corecrux-offline-serving-companions-2026-06-30","corecrux-text-search-tenant-isolation-2026-06-30","unified-production-claims-source-2026-06-30","unified-reasoner-encode-evidence-2026-06-29"],"ext":["unified-retrieval-hardening-2026-07-02"],"od":[]},{"s":"audit-ii-gap-closure-hardening-2026-06-14","st":0,"d":0,"t":10,"b":47,"e":47,"o":33,"dep":[],"ext":["domain-index-source-authority-signal-2026-07-08"],"od":[]},{"s":"ast-polyglot-code-graph-and-repo-watch-2026-07-08","st":0,"d":10,"t":10,"b":62,"e":63,"o":2,"dep":[],"ext":[],"od":[]},{"s":"audit-ii-operational-hardening-rollout-2026-06-14","st":0,"d":10,"t":10,"b":38,"e":38,"o":0,"dep":[],"ext":[],"od":[]},{"s":"atlas-manifest-routing-production-2026-06-05","st":0,"d":11,"t":11,"b":29,"e":64,"o":90,"dep":[],"ext":[],"od":["OD-10"]},{"s":"agent-ux-02-acknowledged-memory-use-2026-05-27","st":0,"d":4,"t":4,"b":20,"e":20,"o":0,"dep":[],"ext":[],"od":[]},{"s":"agent-native-noise-reduction-2026-06-08","st":1,"d":0,"t":8,"b":32,"e":65,"o":90,"dep":[],"ext":[],"od":[]},{"s":"agent-ux-03-freshness-decay-2026-05-27","st":0,"d":5,"t":6,"b":20,"e":20,"o":0,"dep":[],"ext":["dense-lane-and-extraction-upsell-2026-06-26"],"od":[]},{"s":"agent-query-eval-corpus-2026-06-07","st":0,"d":0,"t":6,"b":31,"e":31,"o":0,"dep":[],"ext":[],"od":[]},{"s":"agent-ux-best-in-class-master-2026-05-27","st":0,"d":1,"t":9,"b":20,"e":21,"o":0,"dep":[],"ext":[],"od":[]},{"s":"agent-ux-08-identity-continuity-2026-05-27","st":0,"d":3,"t":5,"b":21,"e":21,"o":0,"dep":[],"ext":[],"od":[]},{"s":"agent-ux-05-risk-tiered-hitl-2026-05-27","st":0,"d":3,"t":6,"b":21,"e":21,"o":0,"dep":[],"ext":[],"od":[]},{"s":"agent-ux-07-verifiable-output-receipts-2026-05-27","st":0,"d":5,"t":6,"b":21,"e":21,"o":0,"dep":[],"ext":[],"od":[]},{"s":"agent-ux-04-source-linked-traceability-2026-05-27","st":0,"d":3,"t":5,"b":20,"e":21,"o":0,"dep":[],"ext":["domain-index-source-authority-signal-2026-07-08"],"od":[]},{"s":"agent-ux-06-typed-action-traces-2026-05-27","st":0,"d":5,"t":8,"b":20,"e":20,"o":0,"dep":[],"ext":[],"od":[]},{"s":"agent-ux-11-byo-audit-trail-2026-05-27","st":1,"d":4,"t":6,"b":20,"e":20,"o":0,"dep":[],"ext":[],"od":[]},{"s":"agent-query-eval-lanes-on-retest-2026-06-08","st":0,"d":0,"t":5,"b":32,"e":33,"o":0,"dep":[],"ext":[],"od":[]},{"s":"agent-ux-10-visible-autonomy-contract-2026-05-27","st":0,"d":2,"t":6,"b":20,"e":20,"o":0,"dep":[],"ext":[],"od":[]},{"s":"amr-lane-authority-credit-gating-2026-06-07","st":1,"d":2,"t":7,"b":31,"e":32,"o":0,"dep":[],"ext":["domain-index-source-authority-signal-2026-07-08"],"od":[]},{"s":"agent-config-wizard-2026-05-19","st":0,"d":3,"t":8,"b":12,"e":12,"o":5,"dep":[],"ext":[],"od":[]},{"s":"agent-ux-01-readable-editable-memory-2026-05-27","st":0,"d":4,"t":4,"b":20,"e":20,"o":0,"dep":[],"ext":[],"od":[]},{"s":"agent-harness-testbench-messyworld-2026-06-18","st":1,"d":0,"t":7,"b":41,"e":65,"o":94,"dep":[],"ext":[],"od":[]},{"s":"agent-ux-12-calm-deferred-output-2026-05-27","st":0,"d":0,"t":6,"b":21,"e":21,"o":0,"dep":[],"ext":[],"od":[]},{"s":"agent-ux-09-scoped-forget-2026-05-27","st":0,"d":2,"t":5,"b":20,"e":20,"o":0,"dep":[],"ext":[],"od":[]}];
 
-  function renderLinkGraph(host, ctx) {
-    ctx = ctx || {};
-    host.textContent = '';
-    var region = el('div', { 'class': 'lg-region' });
-    host.appendChild(region);
+  var RINGS_RFACTS = [
+  ['sso', 'brief', 'memory', 0.920, 'codex-work', 'medium', 205, 1],
+  ['sso', 'gate:M0', 'gate', 0.936, 'codex-work', 'medium', 205, 1],
+  ['sso', 'decision:topology-corrected-cruxengine', 'decision', 0.948, 'codex-work', 'medium', 207, 1],
+  ['sso', 'milestone:M1-partial', 'memory', 0.990, 'codex-work', 'medium', 275, 1],
+  ['bf', 'gate:M0', 'gate', 1.356, 'codex-work', 'stable', 412, 1],
+  ['sso', 'gate:M1', 'gate', 1.381, 'codex-work', 'medium', 296, 1],
+  ['sso', 'gate:M2', 'gate', 1.649, 'codex-work', 'medium', 236, 1],
+  ['bf', 'gate:M1', 'gate', 1.669, 'codex-work', 'stable', 536, 1],
+  ['sso', 'gate:M3-M4', 'gate', 1.829, 'codex-work', 'medium', 328, 1],
+  ['bf', 'gate:M2', 'gate', 1.847, 'codex-work', 'stable', 463, 1],
+  ['bf', 'gate:M4', 'gate', 1.858, 'codex-work', 'stable', 409, 1],
+  ['bf', 'handoff:2026-07-14', 'handoff', 1.882, 'codex-work', 'stable', 409, 1],
+  ['sso', 'console-v1-removed', 'memory', 1.892, 'codex-work', 'medium', 288, 1],
+  ['bf', 'progress:M3', 'memory', 1.909, 'codex-work', 'volatile', 274, 1],
+  ['bf', 'gate:M3', 'gate', 1.951, 'codex-work', 'stable', 316, 1],
+  ['bf', 'gate:M3', 'gate', 2.032, 'codex-work', 'stable', 215, 2],
+  ['sso', 'console-v1-removed-followup-done', 'memory', 2.891, 'codex-work', 'medium', 329, 1],
+  ['sso', 'gate:M1-R-code', 'gate', 8.597, 'claude-work', 'medium', 127, 1],
+  ['sso', 'decision:vault-target-regression-repair', 'decision', 8.597, 'claude-work', 'stable', 155, 1],
+  ['bf', 'gate:M5b', 'gate', 9.367, 'claude-work', 'stable', 184, 1],
+  ['bf', 'decision:m5b-installer-transaction', 'decision', 9.367, 'claude-work', 'stable', 232, 1],
+];
 
-    // Safety net: the DEST is capability-gated, but a deep-link (#/linkgraph) can
-    // still land here on a daemon without the proxy — fail to an honest empty state.
-    if (!capabilityAvailable('console_link_graph')) {
-      region.appendChild(el('div', { 'class': 'lg-empty' }, [
-        el('h2', { text: 'Link graph is not configured' }),
-        el('p', { 'class': 'ctl-desc', text: 'This daemon has no CoreCrux graph mediation proxy. Set CORECRUXD_CORECRUX_GRAPH_BASE_URL on the Crux daemon to enable the six-degrees explorer.' })
-      ]));
-      return;
+  var RINGS_GRAPH_RAW = [{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"gate:M1-R-code","d":75.59696759259168,"a":"claude-work","h":"medium","c":1.0,"t":127},{"e":"execplan:verifiable-record-products-2026-07-17","k":"gate:M3-core-pointer-producer-code-2026-07-22","d":76.75865740740846,"a":"claude-work","h":"stable","c":1.0,"t":158},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"gate:M3","d":68.95072916666686,"a":"codex-work","h":"stable","c":1.0,"t":316},{"e":"incident:2026-07-22","k":"gpu1-cargo-deploy-help-side-effect","d":76.43028935185066,"a":"claude-work","h":"stable","c":1.0,"t":291},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"decision:vault-target-regression-repair","d":75.59696759259168,"a":"claude-work","h":"stable","c":1.0,"t":155},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"progress:M3","d":68.90971064814948,"a":"codex-work","h":"volatile","c":1.0,"t":274},{"e":"execplan:production-ethos-audit-harness-2026-07-17","k":"gate:M5","d":74.60589120370423,"a":"codex-work","h":"volatile","c":1.0,"t":323},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"gate:M1","d":68.38157407407562,"a":"codex-work","h":"medium","c":1.0,"t":296},{"e":"execplan:wikicrux-public-readiness-hardening-2026-07-21","k":"gate:M3b-blocked","d":75.82773148148044,"a":"drivew-host","h":"stable","c":1.0,"t":221},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"decision:m5b-installer-transaction","d":76.36789351851985,"a":"claude-work","h":"stable","c":1.0,"t":232},{"e":"incident:2026-07-22","k":"crc-v1-resident-ordinal-handle-alias","d":76.47960648148,"a":"claude-work","h":"stable","c":1.0,"t":185},{"e":"execplan:verifiable-record-products-2026-07-17","k":"gate:M9-evidence-publication","d":76.67115740740701,"a":"claude-work","h":"stable","c":1.0,"t":125},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"brief","d":67.92068287037182,"a":"codex-work","h":"medium","c":1.0,"t":205},{"e":"execplan:wikicrux-m5-pricing-enforcement-2026-07-17","k":"decision:m3b-refund-contract-parity","d":76.02534722222117,"a":"claude-work","h":"stable","c":1.0,"t":153},{"e":"execplan:verifiable-record-products-2026-07-17","k":"gate:M3-engine-consumer-deploy-2026-07-22","d":76.73957175925898,"a":"claude-work","h":"stable","c":1.0,"t":223},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"gate:M0","d":67.93586805555606,"a":"codex-work","h":"medium","c":1.0,"t":205},{"e":"execplan:crux-macaroon-token-attenuation-2026-07-16","k":"design:sync-delegation-convention","d":76.4979745370365,"a":"codex-work","h":"stable","c":1.0,"t":408},{"e":"execplan:crux-macaroon-token-attenuation-2026-07-16","k":"gate:M2prime-hotfix-reviewed-and-reconciliation-plan","d":76.41813657407329,"a":"codex-work","h":"stable","c":1.0,"t":743},{"e":"execplan:wikicrux-market-wedge-offers-2026-07-16","k":"decision:canonical-pricing","d":75.82225694444423,"a":"claude-work","h":"stable","c":1.0,"t":146},{"e":"execplan:wikicrux-m5-pricing-enforcement-2026-07-17","k":"gate:M3b","d":76.02534722222117,"a":"claude-work","h":"stable","c":1.0,"t":223},{"e":"execplan:verifiable-record-products-2026-07-17","k":"gate:M3","d":76.7468518518508,"a":"claude-work","h":"stable","c":1.0,"t":150},{"e":"execplan:cuecrux-selfserve-launch-readiness-2026-07-16","k":"gate:M8-edge-repair","d":76.54800925925883,"a":"claude-work","h":"none","c":1.0,"t":254},{"e":"bench:provenance-byok-local-20260721T174751Z-8e711150","k":"result","d":75.74369212962847,"a":"claude-work","h":"stable","c":1.0,"t":145},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"gate:M3-M4","d":68.8297453703708,"a":"codex-work","h":"medium","c":1.0,"t":328},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"console-v1-removed-followup-done","d":69.89159722222394,"a":"codex-work","h":"medium","c":1.0,"t":329},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"gate:M2","d":68.64881944444278,"a":"codex-work","h":"medium","c":1.0,"t":236},{"e":"execplan:crux-macaroon-token-attenuation-2026-07-16","k":"design:M3prime-sync-enforcement-on-v11","d":76.43527777777854,"a":"codex-work","h":"stable","c":1.0,"t":870},{"e":"incident:2026-07-22","k":"release-v0.5.48-macos-socket-fixture","d":76.56612268518438,"a":"claude-work","h":"stable","c":1.0,"t":147},{"e":"execplan:wikicrux-public-readiness-hardening-2026-07-21","k":"gate:M3b","d":75.84260416666802,"a":"drivew-host","h":"stable","c":1.0,"t":287},{"e":"execplan:wikicrux-market-wedge-offers-2026-07-16","k":"gate:M0","d":75.82225694444423,"a":"claude-work","h":"stable","c":1.0,"t":74},{"e":"execplan:corecrux-object-storage-tier-2026-07-07","k":"gate:G3-code-merge","d":76.63100694444438,"a":"claude-work","h":"stable","c":1.0,"t":125},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"gate:M1","d":68.6698958333327,"a":"codex-work","h":"stable","c":1.0,"t":536},{"e":"execplan:wikicrux-m5-pricing-enforcement-2026-07-17","k":"gate:M5a","d":75.79510416666744,"a":"claude-work","h":"stable","c":1.0,"t":230},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"decision:topology-corrected-cruxengine-14343","d":67.94807870370278,"a":"codex-work","h":"medium","c":1.0,"t":207},{"e":"incident:2026-07-22","k":"passport-mint-pre-m2-approval-live","d":76.75064814814687,"a":"claude-work","h":"stable","c":1.0,"t":203},{"e":"incident:2026-07-22","k":"core-sidecar-snapshot-path","d":76.8100694444438,"a":"claude-work","h":"stable","c":1.0,"t":172},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"gate:M5b","d":76.36789351851985,"a":"claude-work","h":"stable","c":1.0,"t":184},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"handoff:2026-07-14","d":68.88217592592628,"a":"codex-work","h":"stable","c":1.0,"t":409},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"milestone:M1-partial","d":67.99072916666773,"a":"codex-work","h":"medium","c":1.0,"t":275},{"e":"execplan:crux-macaroon-token-attenuation-2026-07-16","k":"gate:M2-rustdoc-fix-and-M3-grounding","d":75.82988425925942,"a":"codex-work","h":"stable","c":1.0,"t":732},{"e":"execplan:sdkcrux-dependency-vuln-remediation-2026-07-20","k":"audit-snapshot","d":74.56193287036876,"a":"codex-work","h":"volatile","c":1.0,"t":415},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"gate:M0","d":68.35657407407416,"a":"codex-work","h":"stable","c":1.0,"t":412},{"e":"execplan:crux-passport-mint-request-gate-2026-07-17","k":"gate:M2.1-integration","d":76.65032407407489,"a":"claude-work","h":"stable","c":1.0,"t":207},{"e":"execplan:cuecrux-selfserve-launch-readiness-2026-07-16","k":"decision:edge-cutover-gate","d":76.54349537036978,"a":"claude-work","h":"none","c":1.0,"t":167},{"e":"incident:2026-07-20","k":"sdkcrux-ci-runner-move-and-stacked-failures","d":74.54767361111226,"a":"codex-work","h":"volatile","c":1.0,"t":564},{"e":"execplan:production-ethos-audit-harness-2026-07-17","k":"gate:M7","d":75.6126157407416,"a":"claude-work","h":"stable","c":1.0,"t":116},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"gate:M2","d":68.84675925926058,"a":"codex-work","h":"stable","c":1.0,"t":463},{"e":"execplan:crux-banner-redesign-2026-07-21","k":"gate:deploy-v0.5.47","d":76.39510416666599,"a":"codex-work","h":"volatile","c":1.0,"t":216},{"e":"execplan:wikicrux-market-wedge-offers-2026-07-16","k":"gate:M1","d":75.82225694444423,"a":"claude-work","h":"medium","c":1.0,"t":162},{"e":"execplan:verifiable-record-products-2026-07-17","k":"gate:M3-deploy-automation-2026-07-22","d":76.7569560185184,"a":"claude-work","h":"stable","c":1.0,"t":175},{"e":"execplan:crux-macaroon-token-attenuation-2026-07-16","k":"incident:M3-M4-collision-with-concurrent-security-hotfix","d":75.92763888889021,"a":"codex-work","h":"stable","c":1.0,"t":822},{"e":"execplan:crux-macaroon-token-attenuation-2026-07-16","k":"gate:M3prime-sync-delegation","d":76.61583333333328,"a":"codex-work","h":"stable","c":1.0,"t":638},{"e":"__work_comment__::w_51752647ca6e4bdbbe4c3b45d30241c9::c_9a7285cbf6604152be964e81d7de0367","k":"record","d":76.73920138888934,"a":null,"h":"none","c":1.0,"t":173},{"e":"execplan:crux-passport-mint-request-gate-2026-07-17","k":"gate:M2-live-containment-2026-07-22","d":76.75064814814687,"a":"claude-work","h":"stable","c":1.0,"t":159},{"e":"execplan:sdkcrux-dependency-vuln-remediation-2026-07-20","k":"gate:M4","d":74.58318287037036,"a":"codex-work","h":"volatile","c":1.0,"t":220},{"e":"execplan:corecrux-object-storage-tier-2026-07-07","k":"gate:G3-prod-safety-recheck","d":76.6583912037022,"a":"claude-work","h":"volatile","c":1.0,"t":131},{"e":"execplan:wikicrux-m5-pricing-enforcement-2026-07-17","k":"gate:M3a-harness","d":75.91656249999869,"a":"claude-work","h":"stable","c":1.0,"t":244},{"e":"execplan:production-ethos-audit-harness-2026-07-17","k":"gate:M4","d":74.578125,"a":"codex-work","h":"volatile","c":1.0,"t":344},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"gate:M4","d":68.85881944444554,"a":"codex-work","h":"stable","c":1.0,"t":409},{"e":"execplan:crux-passport-mint-request-gate-2026-07-17","k":"gate:M2.1-integration","d":76.64783564814934,"a":"claude-work","h":"stable","c":1.0,"t":185},{"e":"execplan:wikicrux-public-readiness-hardening-2026-07-21","k":"gate:M3b","d":75.9136111111111,"a":"drivew-host","h":"stable","c":1.0,"t":293},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"console-v1-removed","d":68.89186342592438,"a":"codex-work","h":"medium","c":1.0,"t":288},{"e":"incident:2026-07-22","k":"vaultcrux-public-edge-loopback-regression","d":76.54800925925883,"a":"claude-work","h":"stable","c":1.0,"t":157},{"e":"incident:2026-07-22","k":"legal-hold-canary-mcp-auth-mismatch","d":76.43935185185182,"a":"codex-work","h":"stable","c":1.0,"t":214},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"gate:M3","d":69.03211805555475,"a":"codex-work","h":"stable","c":1.0,"t":215},{"e":"incident:2026-07-22","k":"legal-hold-canary-mcp-auth-mismatch","d":76.43893518518598,"a":"codex-work","h":"stable","c":1.0,"t":214}];
+
+  // =========================================================================
+  //  Rings — the "clock of work" (console-surfaces-remediation M10). NATIVE
+  //  port of UI-prototype/rings-clock/console-mock.html: a canvas 2D engine
+  //  that replays the real ExecPlan portfolio as an animated ring, with lens
+  //  tiles, a control bar, and a slide-out detail pane. Ported from the mock's
+  //  string-built DOM to el()/svgEl() safe construction (no raw HTML strings);
+  //  every raw network read rewired to the console's CruxApi client (fetchJSON); an
+  //  explicit teardown cancels the RAF + observers + document/window listeners
+  //  once the canvas leaves the DOM (route change clears #content). Snapshot
+  //  data (RINGS_PLANS_RAW / RINGS_GRAPH_RAW / RINGS_RFACTS) is the honest
+  //  degradation when a live feed is absent.
+  // =========================================================================
+  var __ringsCleanupFn = null;   // module-scope teardown handle (see renderRings)
+
+  function renderRings(container, ctxIn) {
+    ctxIn = ctxIn || {};
+    // Tear down any previous instance (re-entry / rings→rings) before building.
+    if (typeof __ringsCleanupFn === 'function') { try { __ringsCleanupFn(); } catch (e) { /* noop */ } __ringsCleanupFn = null; }
+    container.textContent = '';
+
+    var REDUCED = (typeof matchMedia === 'function') && matchMedia('(prefers-reduced-motion: reduce)').matches;
+    var MONO = 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+    var TAU = Math.PI * 2;
+    var mix = function (a, b, k) { return a + (b - a) * k; };
+    function mulberry32(a) {
+      return function () {
+        a |= 0; a = a + 0x6D2B79F5 | 0;
+        var t = Math.imul(a ^ a >>> 15, 1 | a);
+        t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+        return ((t ^ t >>> 14) >>> 0) / 4294967296;
+      };
+    }
+    function hex2rgba(hex, a) {
+      var n = parseInt(hex.slice(1), 16);
+      return 'rgba(' + (n >> 16 & 255) + ',' + (n >> 8 & 255) + ',' + (n & 255) + ',' + Math.max(0, Math.min(1, a)) + ')';
     }
 
-    var header = el('div', { 'class': 'lg-header' });
-    var statLine = el('div', { 'class': 'lg-stats', role: 'status', 'aria-live': 'polite' }, [el('span', { 'class': 'ctl-desc', text: 'Loading graph stats…' })]);
-    header.appendChild(statLine);
-    region.appendChild(header);
+    // ---- DOM scaffold (replaces the mock's markup; refs kept, no getElementById) ----
+    var root = el('div', { 'class': 'rings-root' });
+    var stage = el('div', { 'class': 'rings-stage' });
+    var cv = el('canvas', { 'class': 'rings-canvas', 'aria-label': 'Rings: the ExecPlan portfolio replayed as an animated clock; tiles switch the lens' });
+    stage.appendChild(cv);
 
-    var controls = el('div', { 'class': 'lg-controls' });
-    var fromIn = el('input', { 'class': 'lg-input', type: 'text', placeholder: 'From article… (e.g. Dog)', 'aria-label': 'Path start article' });
-    var toIn = el('input', { 'class': 'lg-input', type: 'text', placeholder: 'To article… (e.g. Barack Obama)', 'aria-label': 'Path end article' });
-    var findBtn = el('button', { 'class': 'btn-primary lg-btn', type: 'button' }, ['Find path']);
-    controls.appendChild(fromIn); controls.appendChild(toIn); controls.appendChild(findBtn);
-    region.appendChild(controls);
+    function tileEl(lens, hue, label, n) {
+      var nEl = el('span', { 'class': 'n', text: n });
+      var b = el('button', { 'class': 'rings-tile', type: 'button', 'data-lens': lens, 'aria-pressed': lens === 'work' ? 'true' : 'false' },
+        [el('span', { 'class': 't' }, [el('i', { style: 'background:' + hue }), label]), nEl]);
+      return { b: b, n: nEl };
+    }
+    var tWork = tileEl('work', '#a78bfa', 'ExecPlans', '1,040');
+    var tData = tileEl('data', '#8b96f2', 'Data graph', '66');
+    var tMem = tileEl('memory', '#2dd4bf', 'Memory', '21');
+    var tSess = tileEl('sessions', '#22d3ee', 'Sessions', '32');
+    var tTok = tileEl('tokens', '#f5a623', 'Tokens', '—');
+    var tiles = el('div', { 'class': 'rings-tiles', role: 'group', 'aria-label': 'Ring lenses' }, [tWork.b, tData.b, tMem.b, tSess.b, tTok.b]);
+    var tileByLens = { work: tWork, data: tData, memory: tMem, sessions: tSess, tokens: tTok };
+    stage.appendChild(tiles);
 
-    var status = el('div', { 'class': 'lg-status ctl-desc', role: 'status', 'aria-live': 'polite', text: 'Enter two article titles to trace a shortest path, then click any node to expand its neighbourhood.' });
-    region.appendChild(status);
+    function glEl(label, n) {
+      var nEl = el('span', { 'class': 'n', text: n });
+      return { el: el('button', { 'class': 'rings-gl', type: 'button' }, [el('span', { 'class': 't', text: label }), nEl]), n: nEl };
+    }
+    var glFacts = glEl('facts', '5,026'), glSessions = glEl('sessions', '76'), glExecplans = glEl('execplans', '1,081');
+    var glMcp = glEl('mcp agents', '5'), glInt = glEl('integrations', '3'), glEngine = glEl('engine', 'off');
+    var glSrc = el('span', { 'class': 'src', text: 'snapshot · 2026-07-22' });
+    var glance = el('div', { 'class': 'rings-glance', role: 'group', 'aria-label': 'Daemon at a glance' },
+      [glFacts.el, glSessions.el, glExecplans.el, glMcp.el, glInt.el, glEngine.el, glSrc]);
+    stage.appendChild(glance);
 
-    var stage = el('div', { 'class': 'lg-stage' });
-    region.appendChild(stage);
+    // ---- control bar ----
+    function icBtn(txt, title, pressed) { return el('button', { 'class': 'ic', type: 'button', title: title, 'aria-pressed': pressed ? 'true' : 'false' }, [txt]); }
+    var bSpin = icBtn('⟳', 'Ambient spin', !REDUCED);
+    var bClock = icBtn('◷', 'Reset clock to 12 (also stops spin)', false); bClock.removeAttribute('aria-pressed');
+    var bMode = icBtn('▥', 'Bars: spoke from centre to each node', true);
+    var bDir = icBtn('⇅', 'Time edge: outward (rings grow) / inward (nodes sink from rim)', false);
+    var bAll = icBtn('◌', 'Census: every plan stays on the clock; hover names sectors', false);
+    var bDone = icBtn('✓', 'Show completed plans on the clock (auto-on during playback)', false);
+    var bLedger = icBtn('≡', 'Completed-plans list (left). Auto-shows during playback; hides on lens swap.', false);
+    var bState = icBtn('◑', 'State colours: complete green · in progress purple · blocked red', false);
+    var bLin = icBtn('⌇', 'Lineage chords (depends_on)', false);
+    var grpTools = el('span', { 'class': 'grp' }, [bSpin, bClock, bMode, bDir, bAll, bDone, bLedger, bState, bLin]);
 
-    var rendererHandle = null;
-    var rendererPromise = null;
-    var themeObs = null;
-    var reduced = (typeof window !== 'undefined' && window.matchMedia) ? window.matchMedia('(prefers-reduced-motion: reduce)').matches : false;
+    function opt(v, t) { return el('option', { value: v }, [t]); }
+    var sKind = el('select', { 'aria-label': 'Filter by node kind' }, [opt('all', 'all kinds'), opt('gate', 'gates only'), opt('decision', 'decisions (OD) only'), opt('memory', 'memory only'), opt('handoff', 'handoffs only')]);
+    var sAgent = el('select', { 'aria-label': 'Filter by agent passport' }, [opt('all', 'all agents'), opt('claude-work', 'claude-work'), opt('codex-work', 'codex-work')]);
+    var grpFilters = el('span', { 'class': 'grp' }, [sKind, sAgent]);
 
-    function ensureRenderer() {
-      if (rendererPromise) { return rendererPromise; }
-      // Dynamic import so SSR/no-build never evaluates WebGL; `three` resolves via
-      // the shell import map to the vendored r165 (zero new trust-kernel surface).
-      rendererPromise = import('/console-v2/linkgraph-renderer.mjs').then(function (mod) {
-        var make = mod.createLinkGraphRenderer || mod.default;
-        rendererHandle = make();
-        rendererHandle.mount(stage, { theme: linkGraphTheme(), reducedMotion: reduced, onNodeClick: onNodeClick });
-        if (typeof MutationObserver !== 'undefined') {
-          themeObs = new MutationObserver(function () { if (rendererHandle) { rendererHandle.setTheme(linkGraphTheme()); } });
-          themeObs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    var bTokCum = el('button', { type: 'button', 'aria-pressed': 'true', title: 'Running total across the window' }, ['cumulative']);
+    var bTokDay = el('button', { type: 'button', 'aria-pressed': 'false', title: 'Tokens per day' }, ['per day']);
+    var grpTokViews = el('span', { 'class': 'grp' }, [bTokCum, bTokDay]); grpTokViews.style.display = 'none';
+
+    var dStart = el('input', { type: 'date', min: '2026-05-18', max: '2026-07-22', value: '2026-05-18', 'aria-label': 'Window start date' });
+    var rStart = el('input', { type: 'range', min: '0', max: '1000', value: '0', style: 'width:70px', 'aria-label': 'Window start' });
+    var rEnd = el('input', { type: 'range', min: '0', max: '1000', value: '1000', style: 'width:70px', 'aria-label': 'Window end' });
+    var dEnd = el('input', { type: 'date', min: '2026-05-18', max: '2026-07-22', value: '2026-07-22', 'aria-label': 'Window end date' });
+    var grpWindow = el('span', { 'class': 'grp' }, [dStart, rStart, rEnd, dEnd]);
+
+    var bPlay = icBtn('▶', 'Replay the window', false);
+    var rTime = el('input', { type: 'range', min: '0', max: '1000', value: '1000', 'aria-label': 'Time' });
+    var cDate = el('span', { 'class': 'chip', text: '2026-07-22' });
+    var grpPlay = el('span', { 'class': 'grp' }, [bPlay, rTime, cDate]);
+
+    var bZin = el('button', { type: 'button', 'aria-label': 'Zoom in' }, ['+']);
+    var bZout = el('button', { type: 'button', 'aria-label': 'Zoom out' }, ['−']);
+    var bZfit = el('button', { type: 'button' }, ['fit']);
+    var grpZoom = el('span', { 'class': 'grp' }, [bZin, bZout, bZfit]);
+
+    var hint = el('span', { 'class': 'hint', text: 'wheel = zoom · drag = pan · click node / sector / ledger · background clears' });
+    var stagebar = el('div', { 'class': 'rings-stagebar' }, [grpTools, grpFilters, grpTokViews, grpWindow, grpPlay, grpZoom, hint]);
+    stage.appendChild(stagebar);
+
+    var pane = el('aside', { 'class': 'rings-pane', 'aria-label': 'Detail pane' });
+    stage.appendChild(pane);
+    root.appendChild(stage);
+
+    var note = el('p', { 'class': 'rings-note', text: 'tiles switch the lens · ExecPlans lens keeps solo / ledger / lineage / filters · live: /v1/work · /v1/console/summary · /v1/facts/list — snapshot fallback when a feed is absent' });
+    root.appendChild(note);
+
+    var tip = el('div', { 'class': 'rings-tip', role: 'status' });
+    root.appendChild(tip);
+    container.appendChild(root);
+
+    // ---- tooltip: DOM builder (safe DOM, no raw HTML) ----
+    function tb(t) { return el('b', { text: t }); }
+    function tk(t) { return el('span', { 'class': 'k', text: t }); }
+    function br() { return el('br'); }
+    function showTip(x, y, nodes) {
+      tip.textContent = '';
+      nodes.forEach(function (n2) { if (n2 == null) { return; } tip.appendChild(typeof n2 === 'string' ? doc().createTextNode(n2) : n2); });
+      var pad = 14, w = tip.offsetWidth || 220;
+      tip.style.left = Math.min(x + pad, (typeof innerWidth !== 'undefined' ? innerWidth : 1440) - w - 10) + 'px';
+      tip.style.top = (y + pad + tip.offsetHeight > (typeof innerHeight !== 'undefined' ? innerHeight : 900) ? y - tip.offsetHeight - 8 : y + pad) + 'px';
+      tip.style.opacity = 1;
+    }
+    function hideTip() { tip.style.opacity = 0; }
+
+    // ---- time base: day 0 = 2026-05-07 ----
+    var NOW = 76, dataSrc = 'snapshot';
+    function dayDate(d) { return new Date(Date.UTC(2026, 4, 7) + d * 86400000).toISOString().slice(0, 10); }
+
+    // ---- dataset ----
+    var KIND_HUE = { gate: '#2dd4bf', decision: '#a78bfa', memory: '#8b96f2', handoff: '#f5a623', incident: '#ef4444' };
+    var STATE = { 0: 'complete', 1: 'in_progress', 2: 'blocked' };
+    var STATE_HUE = { 0: '#34d399', 1: '#a78bfa', 2: '#ef4444' };
+    var stateHue = function (p) { return STATE_HUE[p.st]; };
+    var PARK_DAYS = 18;
+
+    var PLANS = [], DEP_EDGES = [], cells = [];
+    function mapRaw(p, i) {
+      var short = p.s.replace(/-2026-\d\d-\d\d$/, '').replace(/-2026$/, '');
+      var exit = p.st === 0 ? p.e + 1.5 : (NOW - p.e > PARK_DAYS ? p.e + PARK_DAYS : Infinity);
+      return { i: i, slug: p.s, short: short, st: p.st, done: p.d, total: p.t || 1, b: Math.max(0, p.b), e: p.e, o: p.o, exit: exit,
+        dep: p.dep || [], ext: p.ext || [], od: p.od || [],
+        traced: p.s.indexOf('crux-daemon-buyer-fit') === 0 || p.s.indexOf('cross-site-auth-sso') === 0 };
+    }
+    function loadPlans(raws) { PLANS.length = 0; raws.forEach(function (p, i) { PLANS.push(mapRaw(p, i)); }); }
+    function rebuildLineage() {
+      DEP_EDGES.length = 0;
+      var bySlug = {}; PLANS.forEach(function (p) { bySlug[p.slug] = p; });
+      PLANS.forEach(function (p) { p.dep.forEach(function (d) { var t2 = bySlug[d]; if (t2) { DEP_EDGES.push({ a: p, b: t2 }); } }); });
+    }
+    var J13 = 67;
+    var RFACTS = RINGS_RFACTS;
+    function buildCells() {
+      cells.length = 0;
+      var rr = mulberry32(0xC4C4);
+      PLANS.forEach(function (p) {
+        if (p.traced) {
+          var tag = p.slug.indexOf('crux-daemon-buyer-fit') === 0 ? 'bf' : 'sso';
+          RFACTS.forEach(function (r) {
+            if (r[0] !== tag) { return; }
+            cells.push({ p: p, key: r[1], kind: r[2], day: J13 + r[3], actor: r[4], horizon: r[5], tokens: r[6], version: r[7], real: true, ja: rr(), jr: rr() });
+          });
+          return;
         }
-        return rendererHandle;
-      }).catch(function (err) {
-        status.textContent = 'Renderer unavailable: ' + (err && err.message ? err.message : 'failed to load the graph module') + '.';
-        return null;
+        var span = Math.max(0.5, p.e - p.b);
+        var nGates = Math.min(p.done, 12);
+        for (var m = 0; m < nGates; m++) {
+          cells.push({ p: p, key: 'gate:M' + m, kind: 'gate', day: p.b + span * ((m + 1) / (nGates + 1)), real: false, ja: rr(), jr: rr() });
+        }
+        var nMem = Math.max(1, Math.min(6, Math.round(span / 6) + (p.o > 0 ? 2 : 0)));
+        for (var mm = 0; mm < nMem; mm++) {
+          var kinds = ['memory', 'memory', 'decision'];
+          var kk = kinds[Math.floor(rr() * 3)];
+          cells.push({ p: p, key: kk, kind: kk, day: p.b + span * rr(), real: false, ja: rr(), jr: rr() });
+        }
       });
-      return rendererPromise;
-    }
-
-    function loadStats() {
-      fetchJSON('/v1/console/corecrux/graph/stats').then(function (res) {
-        statLine.textContent = '';
-        if (res.status === 503) { statLine.appendChild(el('span', { 'class': 'ctl-desc', text: 'Graph not built/enabled upstream — set CORECRUXD_LINK_GRAPH + build a .ccxg on the CoreCrux daemon.' })); return; }
-        if (!res.ok || !res.data) { statLine.appendChild(el('span', { 'class': 'ctl-desc', text: lgError(res, 'stats') })); return; }
-        var d = res.data;
-        var snap = d.snapshot_id || (d.build && d.build.snapshot_id) || '—';
-        var digest = (d.build && d.build.digest) ? String(d.build.digest).slice(0, 12) : '';
-        statLine.appendChild(el('span', { 'class': 'lg-stat', text: 'snapshot ' + snap }));
-        if (d.nodes && d.nodes.total != null) { statLine.appendChild(el('span', { 'class': 'lg-stat', text: lgFmtNum(d.nodes.total) + ' nodes' })); }
-        if (d.edges && d.edges.total != null) { statLine.appendChild(el('span', { 'class': 'lg-stat', text: lgFmtNum(d.edges.total) + ' edges' })); }
-        if (d.community_count != null) { statLine.appendChild(el('span', { 'class': 'lg-stat', text: lgFmtNum(d.community_count) + ' communities' })); }
-        if (digest) { statLine.appendChild(el('span', { 'class': 'lg-stat lg-digest', title: 'CoreCrux .ccxg build digest (artifact provenance)', text: 'digest ' + digest + '…' })); }
+      PLANS.forEach(function (p) {
+        p.cells = cells.filter(function (c) { return c.p === p; }).sort(function (a, b) { return b.day - a.day; });
+        var asc = p.cells.slice().sort(function (a, b) { return a.day - b.day; });
+        asc.forEach(function (c, k) { c.rank = k; c.n = asc.length; });
+        asc.forEach(function (c) { c.tokW = (c.kind === 'gate' ? 3 : c.kind === 'decision' ? 2 : 1) + (c.tokens ? c.tokens / 250 : 0); });
+        p.tokMax = Math.max.apply(null, [0.001].concat(asc.map(function (c) { return c.tokW; })));
+        p.tokScale = 0.35 + 0.65 * Math.min(1, Math.log(1 + p.o) / Math.log(81));
       });
     }
+    loadPlans(RINGS_PLANS_RAW); rebuildLineage(); buildCells();
 
-    function doPath() {
-      var a = fromIn.value.trim(), b = toIn.value.trim();
-      if (!a || !b) { status.textContent = 'Enter two article titles.'; return; }
-      status.textContent = 'Resolving titles…';
-      fetchJSON('/v1/console/corecrux/graph/resolve?titles=' + encodeURIComponent(a + '|' + b)).then(function (res) {
-        if (!res.ok || !res.data || !res.data.results) { status.textContent = lgError(res, 'resolve'); return; }
-        var r = res.data.results;
-        var src = r[0] && r[0].node_id, dst = r[1] && r[1].node_id;
-        if (src === null || src === undefined) { status.textContent = 'Unresolved article: “' + a + '”.'; return; }
-        if (dst === null || dst === undefined) { status.textContent = 'Unresolved article: “' + b + '”.'; return; }
-        var srcT = (r[0] && r[0].canonical_title) || a, dstT = (r[1] && r[1].canonical_title) || b;
-        status.textContent = 'Finding path ' + srcT + ' → ' + dstT + '…';
-        fetchJSON('/v1/console/corecrux/graph/path?src=' + src + '&dst=' + dst + '&max_hops=6').then(function (pres) {
-          if (!pres.ok || !pres.data) { status.textContent = lgError(pres, 'path'); return; }
-          var d = pres.data;
-          if (d.length === null || d.length === undefined) {
-            status.textContent = 'No path within 6 hops between “' + srcT + '” and “' + dstT + '”.';
-          } else {
-            status.textContent = srcT + ' → ' + dstT + ': ' + d.length + ' hop' + (d.length === 1 ? '' : 's') + ' · ' + (d.paths ? d.paths.length : 0) + ' equal-length path(s)' + (d.truncated ? ' (truncated)' : '') + '.';
+    // ---- view state ----
+    var rot = 0, spinning = !REDUCED, resetTween = false;
+    var mode = 'bars', showCompleted = false, showLedger = false, dir = 'out', showAll = false;
+    var hoverSec = null, colorByState = false, showLineage = false, lens = 'work', lensLabels = [];
+    var fKind = 'all', fAgent = 'all';
+    var passFilter = function (c) { return (fKind === 'all' || c.kind === fKind) && (fAgent === 'all' || c.actor === fAgent); };
+    var S = 11, E = NOW, T = NOW, playing = false, Z = 1, panX = 0, panY = 0;
+    var hover = null, pinned = null, sel = null, solo = null, ledgerRows = [];
+    var mxAbs = 0, myAbs = 0, dragging = false, dragMoved = 0, lastPX = 0, lastPY = 0;
+    var flashes = [];
+
+    var SEAM = 0.10, BASE = -Math.PI / 2 + SEAM / 2, EPOCH_RINGS = 10;
+    function activePlans(t) {
+      if (solo) { return [solo]; }
+      var out;
+      if (showAll) { out = PLANS.filter(function (p) { return p.b <= t && p.e >= S - 0.001 && p.b <= E; }); }
+      else { out = PLANS.filter(function (p) { return p.b <= t && t < p.exit && p.e >= S - 0.001 && p.b <= E; }); }
+      if (!showCompleted) { out = out.filter(function (p) { return p.st !== 0; }); }
+      return out;
+    }
+    function layoutTargets(t) {
+      if (solo) { var o1 = new Map(); o1.set(solo.i, { a0: -Math.PI / 2 + 0.02, a1: Math.PI - 0.02 }); return o1; }
+      var act = activePlans(t).sort(function (a, b) { return b.b - a.b || a.i - b.i; });
+      var width = (TAU - SEAM) / Math.max(1, act.length);
+      var out = new Map();
+      act.forEach(function (p, k) { out.set(p.i, { a0: BASE + k * width, a1: BASE + (k + 1) * width }); });
+      return out;
+    }
+    function stepLayout(dt) {
+      var targets = layoutTargets(T);
+      var k = REDUCED ? 1 : Math.min(1, dt * 7);
+      PLANS.forEach(function (p) {
+        var tg = targets.get(p.i);
+        if (tg) {
+          if (!p.lay) {
+            var mid0 = (tg.a0 + tg.a1) / 2;
+            p.lay = { a0: mid0, a1: mid0, alpha: 0 };
+            if (flashes.length < 40) { flashes.push({ kind: 'enter', ang: mid0, t0: performance.now() / 1000, hue: '#8b96f2' }); }
           }
-          var cg = d.context || { nodes: [], edges: [], edge_kinds: [] };
-          ensureRenderer().then(function (h) {
-            if (!h) { return; }
-            h.setData({ nodes: cg.nodes || [], edges: cg.edges || [], edgeKinds: cg.edge_kinds || [], paths: d.paths || [], seeds: [src, dst] });
+          p.lay.a0 = mix(p.lay.a0, tg.a0, k); p.lay.a1 = mix(p.lay.a1, tg.a1, k); p.lay.alpha = mix(p.lay.alpha, 1, k);
+        } else if (p.lay) {
+          if (!p.lay.exiting) {
+            p.lay.exiting = true;
+            var mid1 = (p.lay.a0 + p.lay.a1) / 2;
+            var hue = p.st === 0 ? '#34d399' : p.st === 2 ? '#ef4444' : '#7e8595';
+            flashes.push({ kind: 'exit', ang: mid1, t0: performance.now() / 1000, hue: hue });
+          }
+          var mid = (p.lay.a0 + p.lay.a1) / 2;
+          p.lay.a0 = mix(p.lay.a0, mid, k); p.lay.a1 = mix(p.lay.a1, mid, k); p.lay.alpha = mix(p.lay.alpha, 0, k);
+          if (p.lay.alpha < 0.02) { p.lay = null; }
+        }
+        if (p.lay && !targets.get(p.i)) { /* keep exiting */ } else if (p.lay) { p.lay.exiting = false; }
+      });
+    }
+
+    // ---- stage geometry ----
+    var ctx = cv.getContext('2d');
+    var W = 0, H = 0, visible = true, rafId = null, lastT = performance.now();
+    function resize() {
+      var r = cv.getBoundingClientRect(), dpr = Math.min((typeof devicePixelRatio !== 'undefined' ? devicePixelRatio : 1) || 1, 2);
+      W = r.width; H = r.height;
+      cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    var ro = (typeof ResizeObserver !== 'undefined') ? new ResizeObserver(resize) : null;
+    if (ro) { ro.observe(cv); }
+    var io = (typeof IntersectionObserver !== 'undefined') ? new IntersectionObserver(function (es) { visible = es[0].isIntersecting; }, { rootMargin: '60px' }) : null;
+    if (io) { io.observe(cv); }
+
+    function geom() {
+      var cx = W / 2, cy = H / 2;
+      var R = Math.min(W * 0.9, H * 0.78) * 0.44;
+      var r0 = R * 0.13;
+      return { cx: cx, cy: cy, R: R, r0: r0 };
+    }
+    var RAD_LO = 11;
+    function dayR(g, day) {
+      if (dir === 'in') { var age = Math.max(0, Math.min(1, (T - day) / Math.max(0.5, T - RAD_LO))); return g.r0 + (g.R - g.r0) * (0.96 - 0.88 * age); }
+      var f = Math.max(0, Math.min(1, (day - RAD_LO) / Math.max(0.5, E - RAD_LO)));
+      return g.r0 + (g.R - g.r0) * (0.08 + 0.88 * f);
+    }
+    function updateRadLo() {
+      RAD_LO = S;
+      if (lens !== 'work' || showAll || solo) { return; }
+      var lo = Infinity;
+      activePlans(T).forEach(function (p) { p.cells.forEach(function (c) { if (c.day <= T && c.day >= S && c.day <= E && c.day < lo) { lo = c.day; } }); });
+      if (lo < Infinity) { RAD_LO = Math.max(S, Math.min(lo, E - 1)); }
+    }
+    function toScreen(g, x, y) { var c = Math.cos(rot), s = Math.sin(rot); return { x: g.cx + panX + (x * c - y * s) * Z, y: g.cy + panY + (x * s + y * c) * Z }; }
+    function toDisc(g, sx, sy) { var ux = (sx - g.cx - panX) / Z, uy = (sy - g.cy - panY) / Z; var c = Math.cos(-rot), s = Math.sin(-rot); return { x: ux * c - uy * s, y: ux * s + uy * c }; }
+    var soloRingR = function (g, c) { var unit = g.R - g.r0; var rMax = g.r0 + unit * 0.92, rMin = g.r0 + unit * 0.18; return c.n > 1 ? rMax - (rMax - rMin) * (c.rank / (c.n - 1)) : (rMax + rMin) / 2; };
+    function cellPos(g, c) {
+      if (!c.p.lay) { return null; }
+      var frac = c.n > 1 ? (c.rank + 0.5) / c.n : 0.5;
+      var a = c.p.lay.a0 + (c.p.lay.a1 - c.p.lay.a0) * (0.06 + 0.88 * frac);
+      var r = solo === c.p ? soloRingR(g, c) : dayR(g, c.day) * (0.995 + c.jr * 0.01);
+      return { a: a, r: r, x: Math.cos(a) * r, y: Math.sin(a) * r };
+    }
+    function dotR(c) { return (c.real ? 3.4 + (c.tokens || 200) / 260 : c.kind === 'gate' ? 3.2 : 2.6); }
+
+    // ---- main draw loop ----
+    function draw(now) {
+      if (!cv.isConnected) { teardown(); return; }   // route change cleared #content
+      var dt = Math.min(0.05, (now - lastT) / 1000); lastT = now;
+      var time = now / 1000;
+      if (spinning && !REDUCED && !resetTween) { rot += dt * 0.02; }
+      if (resetTween) {
+        var target = rot - (((rot % TAU) + TAU) % TAU);
+        if (((rot % TAU) + TAU) % TAU > Math.PI) { target += TAU; }
+        rot = mix(rot, target, REDUCED ? 1 : 0.12);
+        if (Math.abs(rot - target) < 0.002) { rot = 0; resetTween = false; }
+      }
+      if (playing) {
+        T += dt * (E - S) / 24;
+        if (T >= E) { T = E; setPlaying(false); }
+        rTime.value = Math.round((T - S) / Math.max(0.5, E - S) * 1000);
+        cDate.textContent = dayDate(T);
+      }
+      if (lens === 'work') { stepLayout(dt); }
+      updateRadLo();
+      var g = geom();
+      ctx.clearRect(0, 0, W, H);
+      ctx.save();
+      ctx.translate(g.cx + panX, g.cy + panY);
+      ctx.scale(Z, Z);
+      ctx.rotate(rot);
+      if (!solo) {
+        for (var i = 1; i <= EPOCH_RINGS; i++) {
+          var rr0 = g.r0 + (g.R - g.r0) * (i / EPOCH_RINGS);
+          ctx.strokeStyle = 'rgba(255,255,255,.09)'; ctx.lineWidth = 1 / Z;
+          ctx.beginPath(); ctx.arc(0, 0, rr0, 0, 7); ctx.stroke();
+        }
+      }
+      ctx.strokeStyle = 'rgba(139,150,242,.6)'; ctx.lineWidth = 1.5 / Z;
+      ctx.beginPath();
+      ctx.moveTo(Math.cos(-Math.PI / 2) * g.r0 * 0.9, Math.sin(-Math.PI / 2) * g.r0 * 0.9);
+      ctx.lineTo(Math.cos(-Math.PI / 2) * (g.R + 10), Math.sin(-Math.PI / 2) * (g.R + 10));
+      ctx.stroke();
+      lensLabels = [];
+      var soloLabels = null;
+      if (lens !== 'work') {
+        drawLensInFrame(ctx, g, time);
+      } else {
+        ctx.lineWidth = 1 / Z;
+        PLANS.forEach(function (p) {
+          if (!p.lay || p.lay.alpha < 0.02) { return; }
+          var L = p.lay, al = L.alpha, wSec = L.a1 - L.a0;
+          if (wSec * g.R * Z > 8) {
+            ctx.strokeStyle = 'rgba(255,255,255,' + 0.06 * al + ')';
+            ctx.beginPath(); ctx.moveTo(Math.cos(L.a0) * g.r0, Math.sin(L.a0) * g.r0); ctx.lineTo(Math.cos(L.a0) * g.R, Math.sin(L.a0) * g.R); ctx.stroke();
+          }
+          var hue = stateHue(p);
+          if (p === hoverSec) {
+            ctx.strokeStyle = hex2rgba(hue, 0.28 * al); ctx.lineWidth = 10 / Z;
+            ctx.beginPath(); ctx.arc(0, 0, g.R - 5 / Z, L.a0, L.a1); ctx.stroke(); ctx.lineWidth = 1 / Z;
+          }
+          var aPad = Math.min(0.02, wSec * 0.10);
+          ctx.strokeStyle = hex2rgba(hue, 0.28 * al); ctx.lineWidth = 1.6 / Z;
+          ctx.beginPath(); ctx.arc(0, 0, g.R + 3, L.a0 + aPad, L.a1 - aPad); ctx.stroke();
+          ctx.strokeStyle = hex2rgba(hue, 0.8 * al); ctx.lineWidth = 4.5 / Z;
+          ctx.beginPath(); ctx.arc(0, 0, g.R + 3, L.a0 + aPad, L.a0 + aPad + Math.max(0.008, (wSec - 2 * aPad) * (p.done / p.total))); ctx.stroke();
+          ctx.lineWidth = 1 / Z;
+          if (p.od.length) {
+            var nT = Math.min(p.od.length, Math.max(1, Math.floor((wSec - 2 * aPad) / 0.02)));
+            ctx.strokeStyle = hex2rgba('#f5a623', 0.95 * al); ctx.lineWidth = 1.8 / Z;
+            for (var oi = 0; oi < nT; oi++) {
+              var oa = L.a0 + aPad + (oi + 0.5) * 0.019;
+              ctx.beginPath(); ctx.moveTo(Math.cos(oa) * (g.R + 8), Math.sin(oa) * (g.R + 8)); ctx.lineTo(Math.cos(oa) * (g.R + 13), Math.sin(oa) * (g.R + 13)); ctx.stroke();
+            }
+            ctx.lineWidth = 1 / Z;
+          }
+          if (p.st === 2) {
+            var pulse = REDUCED ? 0.5 : 0.35 + 0.3 * Math.sin(time * 4);
+            ctx.strokeStyle = hex2rgba('#ef4444', pulse * al);
+            ctx.beginPath(); ctx.arc(0, 0, g.R + 8, L.a0 + 0.01, L.a1 - 0.01); ctx.stroke();
+          }
+          var isHovSec = p === hoverSec;
+          if ((wSec * g.R * Z > 46 || isHovSec) && solo !== p) {
+            var midA = (L.a0 + L.a1) / 2, lr = g.R + 14;
+            ctx.save();
+            ctx.translate(Math.cos(midA) * lr, Math.sin(midA) * lr);
+            ctx.rotate(midA + (Math.cos(midA + rot) < 0 ? Math.PI : 0));
+            ctx.fillStyle = isHovSec ? 'rgba(238,240,246,1)' : 'rgba(200,206,219,' + 0.95 * al + ')';
+            ctx.font = '700 ' + (12 / Z) + 'px ' + MONO;
+            ctx.textAlign = Math.cos(midA + rot) < 0 ? 'right' : 'left'; ctx.textBaseline = 'middle';
+            var lbl = isHovSec ? (p.short.length > 34 ? p.short.slice(0, 33) + '…' : p.short) : (p.short.length > 16 ? p.short.slice(0, 15) + '…' : p.short);
+            ctx.fillText(lbl + ' ' + p.done + '/' + p.total, 0, 0);
+            ctx.restore();
+          }
+          p.cells.forEach(function (c) {
+            if (c.day > T || c.day < S || c.day > E) { return; }
+            if (!passFilter(c)) { c._x = undefined; return; }
+            var pos = cellPos(g, c);
+            if (!pos) { return; }
+            var chue = colorByState ? stateHue(c.p) : (KIND_HUE[c.kind] || '#8b96f2');
+            var isSel = (hover === c || pinned === c);
+            var age = T - c.day;
+            var pop = REDUCED ? 1 : Math.min(1, age / 0.8);
+            var rr = dotR(c) * (isSel ? 1.7 : 1) * (0.4 + 0.6 * pop);
+            if (mode === 'bars') {
+              ctx.strokeStyle = hex2rgba(chue, (0.34 + (c.real ? 0.3 : 0)) * al * pop);
+              ctx.lineWidth = (isSel ? 3.6 : 2.6) / Math.sqrt(Z);
+              ctx.beginPath(); ctx.moveTo(Math.cos(pos.a) * g.r0, Math.sin(pos.a) * g.r0); ctx.lineTo(pos.x, pos.y); ctx.stroke();
+            }
+            ctx.fillStyle = hex2rgba(chue, (c.real ? 0.92 : 0.55) * al * pop);
+            if (c.kind === 'gate' && c.real) {
+              ctx.beginPath();
+              ctx.moveTo(pos.x, pos.y - rr - 1); ctx.lineTo(pos.x + rr, pos.y); ctx.lineTo(pos.x, pos.y + rr + 1); ctx.lineTo(pos.x - rr, pos.y);
+              ctx.closePath(); ctx.fill();
+            } else {
+              ctx.beginPath(); ctx.arc(pos.x, pos.y, rr, 0, 7); ctx.fill();
+            }
+            if (c.version > 1) {
+              ctx.strokeStyle = hex2rgba(chue, 0.8 * al); ctx.lineWidth = 1 / Z;
+              ctx.beginPath(); ctx.arc(pos.x, pos.y, rr + 2.5 / Z, 0, 7); ctx.stroke();
+            }
+            if (!REDUCED && age < 0.8) {
+              ctx.strokeStyle = hex2rgba(chue, (1 - age / 0.8) * 0.8); ctx.lineWidth = 1.5 / Z;
+              ctx.beginPath(); ctx.arc(pos.x, pos.y, rr + (age / 0.8) * 14, 0, 7); ctx.stroke();
+            }
+            if (isSel) {
+              ctx.strokeStyle = hex2rgba(chue, 0.95); ctx.lineWidth = 1.5 / Z;
+              ctx.beginPath(); ctx.arc(pos.x, pos.y, rr + 4 / Z, 0, 7); ctx.stroke();
+            }
+            c._x = pos.x; c._y = pos.y; c._a = pos.a; c._r = pos.r; c._dr = rr;
           });
         });
-      });
-    }
-
-    function onNodeClick(node) {
-      if (!node) { return; }
-      var label = node.title || String(node.id);
-      status.textContent = 'Expanding “' + label + '”…';
-      fetchJSON('/v1/console/corecrux/graph/ego?seeds=' + node.id + '&hops=1&budget_nodes=400&budget_edges=1500&degree_cap=40').then(function (res) {
-        if (!res.ok || !res.data) { status.textContent = lgError(res, 'ego'); return; }
-        var d = res.data;
-        if (rendererHandle) { rendererHandle.expandData({ nodes: d.nodes || [], edges: d.edges || [], edgeKinds: d.edge_kinds || [] }); }
-        var trunc = (d.truncated_nodes || d.truncated_edges || d.truncated_degree) ? ' (budget-truncated)' : '';
-        status.textContent = 'Expanded “' + label + '” · +' + ((d.nodes || []).length) + ' node(s)' + trunc + '.';
-      });
-    }
-
-    findBtn.addEventListener('click', doPath);
-    [fromIn, toIn].forEach(function (inp) { inp.addEventListener('keydown', function (ev) { if (ev.key === 'Enter') { doPath(); } }); });
-
-    // Teardown on navigation away — dispose the WebGL context + observers so the
-    // pane never leaks a live renderer or a perpetual observer (a11y/battery).
-    var onHash = function () {
-      if ((location.hash || '').indexOf('/linkgraph') < 0) {
-        window.removeEventListener('hashchange', onHash);
-        if (themeObs) { themeObs.disconnect(); themeObs = null; }
-        if (rendererHandle) { rendererHandle.destroy(); rendererHandle = null; }
       }
-    };
-    if (typeof window !== 'undefined') { window.addEventListener('hashchange', onHash); }
+      if (!solo) {
+        DEP_EDGES.forEach(function (ed) {
+          var lit = hoverSec === ed.a || hoverSec === ed.b;
+          if (!showLineage && !lit) { return; }
+          if (!ed.a.lay || !ed.b.lay || ed.a.lay.alpha < 0.3 || ed.b.lay.alpha < 0.3) { return; }
+          var am = (ed.a.lay.a0 + ed.a.lay.a1) / 2, bm = (ed.b.lay.a0 + ed.b.lay.a1) / 2;
+          var r1 = g.R * 0.97;
+          var ax = Math.cos(am) * r1, ay = Math.sin(am) * r1, bx = Math.cos(bm) * r1, by = Math.sin(bm) * r1;
+          var alpha2 = lit ? 0.65 : 0.10;
+          ctx.strokeStyle = hex2rgba('#8b96f2', alpha2); ctx.lineWidth = (lit ? 1.6 : 1.1) / Z;
+          ctx.beginPath(); ctx.moveTo(ax, ay); ctx.quadraticCurveTo((ax + bx) / 2 * 0.2, (ay + by) / 2 * 0.2, bx, by); ctx.stroke();
+          ctx.fillStyle = hex2rgba('#8b96f2', Math.min(1, alpha2 * 1.6));
+          ctx.beginPath(); ctx.arc(bx, by, (lit ? 3 : 2.2) / Z, 0, 7); ctx.fill();
+        });
+        ctx.lineWidth = 1 / Z;
+      }
+      if (solo && solo.lay && solo.lay.alpha > 0.5) {
+        soloLabels = [];
+        var unit = g.R - g.r0, L2 = solo.lay;
+        var evs = solo.cells.slice().sort(function (a, b) { return a.day - b.day; }).filter(function (c) { return c.day <= T && c.day >= S && c.day <= E && passFilter(c); });
+        ctx.strokeStyle = 'rgba(255,255,255,.16)'; ctx.lineWidth = 1 / Z;
+        ctx.beginPath(); ctx.moveTo(-(g.R + 10), 0); ctx.lineTo(-g.r0 * 0.72, 0); ctx.stroke();
+        evs.forEach(function (c) {
+          var r = soloRingR(g, c);
+          var frac = c.n > 1 ? (c.rank + 0.5) / c.n : 0.5;
+          var aNode = L2.a0 + (L2.a1 - L2.a0) * (0.06 + 0.88 * frac);
+          var chue = KIND_HUE[c.kind] || '#8b96f2';
+          var isSelBar = pinned === c;
+          ctx.strokeStyle = hex2rgba(chue, 0.07); ctx.lineWidth = 1 / Z;
+          ctx.beginPath(); ctx.arc(0, 0, r, L2.a0, aNode); ctx.stroke();
+          ctx.strokeStyle = hex2rgba(chue, isSelBar ? 0.75 : 0.30); ctx.lineWidth = (isSelBar ? 2 : 1.3) / Z;
+          ctx.beginPath(); ctx.arc(0, 0, r, aNode, Math.PI); ctx.stroke();
+          var y1 = 0;
+          var segs = [
+            { h: unit * (0.06 + Math.min(0.30, ((c.tokens || 160) / 550) * 0.34)), col: hex2rgba('#8b96f2', 0.55) },
+            { h: unit * 0.055, col: hex2rgba(chue, 0.95) }
+          ];
+          if (c.version > 1) { segs.push({ h: unit * 0.022, col: 'rgba(238,240,246,.85)' }); }
+          segs.forEach(function (sg) {
+            ctx.strokeStyle = sg.col; ctx.lineWidth = (5 / Z) * (isSelBar ? 1.5 : 1);
+            ctx.beginPath(); ctx.moveTo(-r, -y1); y1 += sg.h; ctx.lineTo(-r, -y1); ctx.stroke();
+          });
+          c._bx = -r; c._bh = y1;
+        });
+        ctx.lineWidth = 1 / Z;
+        var picks = evs.length ? [evs[0], evs[Math.floor((evs.length - 1) / 2)], evs[evs.length - 1]] : [];
+        var seen = {};
+        picks.forEach(function (c) { if (seen[c.rank]) { return; } seen[c.rank] = 1; soloLabels.push({ x: -soloRingR(g, c), y: 16, t: dayDate(c.day) }); });
+        soloLabels.push({ x: -(g.r0 + unit * 0.55), y: -(unit * 0.62), t: 'event ledger · outer ring = first event', cap: true });
+      }
+      {
+        var er = dir === 'in' ? g.r0 + (g.R - g.r0) * 0.96 : dayR(g, T);
+        if (dir === 'in' || T < E - 0.01) {
+          var grow = REDUCED ? 0.86 : (0.55 + 0.45 * ((time * 0.06) % 1));
+          ctx.strokeStyle = 'rgba(139,150,242,.7)'; ctx.lineWidth = 1.6 / Z;
+          ctx.setLineDash([5 / Z, 7 / Z]);
+          ctx.beginPath(); ctx.arc(0, 0, er, -Math.PI / 2, -Math.PI / 2 + TAU * grow); ctx.stroke();
+          ctx.setLineDash([]);
+        }
+      }
+      for (var fi = flashes.length - 1; fi >= 0; fi--) {
+        var f = flashes[fi];
+        var kf = (time - f.t0) / 1.1;
+        if (kf > 1) { flashes.splice(fi, 1); continue; }
+        if (REDUCED) { continue; }
+        var rrf = f.kind === 'exit' ? g.R * (1 + kf * 0.14) : g.R * (1.14 - kf * 0.14);
+        ctx.strokeStyle = hex2rgba(f.hue, (1 - kf) * 0.9); ctx.lineWidth = (2.5 * (1 - kf) + 0.5) / Z;
+        ctx.beginPath(); ctx.arc(0, 0, rrf, f.ang - 0.3 * (1 - kf * 0.5), f.ang + 0.3 * (1 - kf * 0.5)); ctx.stroke();
+      }
+      ctx.lineWidth = 1;
+      var glow = ctx.createRadialGradient(0, 0, 0, 0, 0, g.r0 * 1.5);
+      glow.addColorStop(0, 'rgba(139,150,242,.5)'); glow.addColorStop(1, 'transparent');
+      ctx.fillStyle = glow; ctx.beginPath(); ctx.arc(0, 0, g.r0 * 1.5, 0, 7); ctx.fill();
+      ctx.fillStyle = '#12151d'; ctx.beginPath(); ctx.arc(0, 0, g.r0 * 0.7, 0, 7); ctx.fill();
+      ctx.strokeStyle = 'rgba(139,150,242,.85)'; ctx.lineWidth = 1 / Z;
+      ctx.beginPath(); ctx.arc(0, 0, g.r0 * 0.7, 0, 7); ctx.stroke();
+      ctx.restore();
 
-    loadStats();
-    return { search: doPath, expand: onNodeClick };
+      var nAct = activePlans(T).length;
+      ctx.fillStyle = 'rgba(238,240,246,.95)'; ctx.font = '600 10.5px ' + MONO;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      var core = toScreen(g, 0, 0);
+      ctx.fillText('crux', core.x, core.y - 6);
+      ctx.fillStyle = 'rgba(126,133,149,.9)'; ctx.font = '8.5px ' + MONO;
+      ctx.fillText(lens === 'work' ? nAct + (showAll ? ' plans' : ' live') : lens, core.x, core.y + 7);
+      ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = 'rgba(126,133,149,.8)'; ctx.font = '9.5px ' + MONO;
+      ctx.fillText(dayDate(S) + ' → ' + dayDate(E) + ' · T = ' + dayDate(T) + ' · ' + nAct + ' live · zoom ' + Z.toFixed(1) + '×'
+        + (RAD_LO > S + 0.5 ? ' · rings from ' + dayDate(RAD_LO) : '') + ' · ' + dataSrc, 18, 24);
+      if (soloLabels) {
+        ctx.font = '9px ' + MONO; ctx.textAlign = 'center';
+        soloLabels.forEach(function (L3) {
+          var sp = toScreen(g, L3.x, L3.y);
+          ctx.fillStyle = L3.cap ? 'rgba(182,188,201,.9)' : 'rgba(126,133,149,.85)';
+          ctx.fillText(L3.t, sp.x, sp.y);
+        });
+        var tip2 = toScreen(g, 0, -(g.R + 24));
+        ctx.fillStyle = 'rgba(238,240,246,.92)'; ctx.font = '700 10px ' + MONO;
+        ctx.fillText(dayDate(solo.b) + ' → ' + dayDate(solo.e), tip2.x, tip2.y);
+        ctx.textAlign = 'left';
+      }
+      if (lensLabels.length) {
+        ctx.font = '9.5px ' + MONO; ctx.textAlign = 'center';
+        lensLabels.forEach(function (L4) {
+          var sp = toScreen(g, L4.x, L4.y);
+          ctx.save();
+          if (L4.rot !== undefined) { ctx.translate(sp.x, sp.y); ctx.rotate(L4.rot + rot); ctx.translate(-sp.x, -sp.y); }
+          ctx.fillStyle = L4.cap ? 'rgba(182,188,201,.9)' : 'rgba(200,206,219,.95)';
+          if (!L4.cap) { ctx.font = '700 11px ' + MONO; }
+          ctx.fillText(L4.t, sp.x, sp.y);
+          ctx.restore();
+          ctx.font = '9.5px ' + MONO;
+        });
+        ctx.textAlign = 'left';
+      }
+      ledgerRows = [];
+      if (lens === 'work' && showLedger) {
+        var doneList = PLANS.filter(function (p) { return p.st === 0 && p.exit <= T && p.b <= E && p.e >= S - 0.001; }).sort(function (a, b) { return b.exit - a.exit; });
+        ctx.font = '700 11px ' + MONO; ctx.fillStyle = 'rgba(45,212,191,.9)';
+        ctx.fillText('completed · ' + doneList.length + (solo ? '  (filtering — click row again or background to clear)' : ''), 18, 52);
+        ctx.font = '9.5px ' + MONO;
+        var maxRows = Math.floor((H - 140) / 16);
+        doneList.slice(0, maxRows).forEach(function (p, k) {
+          var fresh = T - p.exit < 2.0, isSolo = solo === p, y = 70 + k * 16;
+          if (isSolo) { ctx.fillStyle = 'rgba(139,150,242,.16)'; ctx.fillRect(12, y - 11, 218, 15); }
+          ctx.fillStyle = fresh || isSolo ? 'rgba(45,212,191,.95)' : 'rgba(126,133,149,.75)';
+          ctx.fillText('✓', 18, y);
+          ctx.fillStyle = isSolo ? 'rgba(238,240,246,1)' : fresh ? 'rgba(238,240,246,.95)' : 'rgba(126,133,149,.8)';
+          var lbl = p.short.length > 26 ? p.short.slice(0, 25) + '…' : p.short;
+          ctx.fillText(lbl, 32, y);
+          ctx.fillStyle = 'rgba(126,133,149,.55)';
+          ctx.fillText(dayDate(p.exit).slice(5), 32 + 27 * 6.0, y);
+          ledgerRows.push({ x: 12, y: y - 11, w: 218, h: 15, p: p });
+        });
+        if (doneList.length > maxRows) {
+          ctx.fillStyle = 'rgba(126,133,149,.6)';
+          ctx.fillText('… +' + (doneList.length - maxRows) + ' more', 18, 70 + maxRows * 16);
+        }
+      }
+      rafId = null;
+      if (visible && !doc().hidden && cv.isConnected) { rafId = requestAnimationFrame(draw); }
+    }
+
+    // ---- data graph lens ----
+    var GNODES = [], GEDGES = [], GADJ = {}, gTotal = null, gCap = false;
+    function loadGraph(raws) {
+      GNODES.length = 0; GEDGES.length = 0;
+      for (var k2 in GADJ) { delete GADJ[k2]; }
+      raws.forEach(function (n, i) { var o = {}; for (var kk in n) { o[kk] = n[kk]; } o.i = i; GNODES.push(o); });
+      var byE = {};
+      GNODES.forEach(function (n) { (byE[n.e] = byE[n.e] || []).push(n); });
+      for (var e in byE) {
+        var arr = byE[e].sort(function (a, b) { return a.d - b.d; });
+        for (var i = 1; i < arr.length; i++) { GEDGES.push({ a: arr[i - 1], b: arr[i] }); }
+      }
+      GEDGES.forEach(function (ed) { (GADJ[ed.a.i] = GADJ[ed.a.i] || []).push(ed.b.i); (GADJ[ed.b.i] = GADJ[ed.b.i] || []).push(ed.a.i); });
+    }
+    loadGraph(RINGS_GRAPH_RAW);
+    var gSel = null;
+    function gHops(i0) {
+      var l1 = {}, l2 = {};
+      (GADJ[i0] || []).forEach(function (j) { l1[j] = 1; });
+      (GADJ[i0] || []).forEach(function (j) { (GADJ[j] || []).forEach(function (k2) { if (k2 !== i0 && !l1[k2]) { l2[k2] = 1; } }); });
+      return { l1: l1, l2: l2 };
+    }
+    var G_FAM_HUE = function (e) {
+      return e.indexOf('execplan:') === 0 ? '#a78bfa' : e.indexOf('bench:') === 0 ? '#f5a623' : e.indexOf('incident:') === 0 ? '#ef4444' : e.indexOf('design:') === 0 ? '#22d3ee' : e.indexOf('__work_comment__') === 0 ? '#34d399' : '#7e8595';
+    };
+    var G_THR = { volatile: 1, medium: 35, stable: 365, none: Infinity };
+    function gEffConf(n) {
+      var age = Math.max(0, T - n.d), thr = G_THR[n.h] || Infinity;
+      if (thr === Infinity) { return n.c; }
+      return age > thr ? n.c * 0.5 : n.c * (1 - 0.35 * (age / thr));
+    }
+    function drawDataLens(ctx2, g) {
+      GNODES.forEach(function (n) { n._x = undefined; n._on = false; });
+      var span = Math.max(0.5, E - S);
+      var rIn = g.r0 * 1.25, rOut = g.R * 0.96;
+      var vis = GNODES.filter(function (n) { return n.d <= T && n.d >= S && n.d <= E; });
+      var cMin = 1, cMax = 0;
+      vis.forEach(function (n) { var ec = gEffConf(n); if (ec < cMin) { cMin = ec; } if (ec > cMax) { cMax = ec; } });
+      var cSpan = Math.max(0.02, cMax - cMin);
+      var posOf = function (n) {
+        var a = BASE + (TAU - SEAM) * Math.max(0, Math.min(1, (n.d - S) / span));
+        var norm = (gEffConf(n) - cMin) / cSpan;
+        var r = rIn + (rOut - rIn) * (1 - (0.08 + 0.84 * norm));
+        return { a: a, x: Math.cos(a) * r, y: Math.sin(a) * r };
+      };
+      var hops = gSel !== null ? gHops(gSel) : null;
+      var inFocus = function (i2) { return gSel === null ? null : (i2 === gSel ? 0 : hops.l1[i2] ? 1 : hops.l2[i2] ? 2 : -1); };
+      [0.25, 0.5, 0.75].forEach(function (cf) { ctx2.strokeStyle = 'rgba(255,255,255,.04)'; ctx2.lineWidth = 1 / Z; ctx2.beginPath(); ctx2.arc(0, 0, rIn + (rOut - rIn) * cf, 0, 7); ctx2.stroke(); });
+      GEDGES.forEach(function (ed) {
+        if (ed.a.d > T || ed.b.d > T || ed.a.d < S || ed.b.d < S) { return; }
+        var pa2 = posOf(ed.a), pb2 = posOf(ed.b);
+        var alpha = 0.16;
+        if (hops) { var fa = inFocus(ed.a.i), fb = inFocus(ed.b.i); alpha = (fa >= 0 && fb >= 0) ? 0.6 : 0.03; }
+        ctx2.strokeStyle = hex2rgba(G_FAM_HUE(ed.a.e), alpha); ctx2.lineWidth = 1.1 / Z;
+        ctx2.beginPath(); ctx2.moveTo(pa2.x, pa2.y); ctx2.quadraticCurveTo((pa2.x + pb2.x) / 2 * 0.55, (pa2.y + pb2.y) / 2 * 0.55, pb2.x, pb2.y); ctx2.stroke();
+      });
+      GNODES.forEach(function (n) {
+        if (n.d > T || n.d < S || n.d > E) { return; }
+        var p2 = posOf(n), hue2 = G_FAM_HUE(n.e), f2 = inFocus(n.i), isH = hover === n;
+        var alpha = 0.85;
+        if (f2 !== null) { alpha = f2 === -1 ? 0.10 : f2 === 0 ? 1 : f2 === 1 ? 0.95 : 0.6; }
+        var rr = (2.2 + Math.min(3, (n.t || 150) / 180)) * (isH || f2 === 0 ? 1.7 : 1);
+        ctx2.fillStyle = hex2rgba(hue2, alpha);
+        ctx2.beginPath(); ctx2.arc(p2.x, p2.y, rr, 0, 7); ctx2.fill();
+        if (f2 === 0) { ctx2.strokeStyle = hex2rgba(hue2, 0.95); ctx2.lineWidth = 1.5 / Z; ctx2.beginPath(); ctx2.arc(p2.x, p2.y, rr + 5 / Z, 0, 7); ctx2.stroke(); }
+        if (isH) { ctx2.strokeStyle = hex2rgba(hue2, 0.9); ctx2.beginPath(); ctx2.arc(p2.x, p2.y, rr + 4 / Z, 0, 7); ctx2.stroke(); }
+        n._x = p2.x; n._y = p2.y; n._dr = rr; n._on = true;
+      });
+      lensLabels.push({ x: 0, y: g.R + 42, cap: true,
+        t: 'data graph · ' + GNODES.length + (gTotal ? ' of ' + gTotal.toLocaleString() + ' visible facts' + (gCap ? ' (node cap)' : '') : ' live facts') +
+          ' · angle = source date · centre = higher confidence (rank-scaled ' + cMin.toFixed(2) + '–' + cMax.toFixed(2) + ') · edge = shared entity · click = 2-hop' });
+    }
+
+    // ---- tokens lens ----
+    var TOK = null;
+    function buildTok() {
+      var spent = {}, saved = {};
+      PLANS.forEach(function (p) {
+        if (!p.cells.length || !p.o) { return; }
+        var per = (p.o / 10) / p.cells.length;
+        p.cells.forEach(function (c) { var d2 = Math.floor(c.day); spent[d2] = (spent[d2] || 0) + per; });
+      });
+      cells.forEach(function (c) { var d2 = Math.floor(c.day); saved[d2] = (saved[d2] || 0) + 0.003; });
+      var totS = 0, totV = 0;
+      for (var d2 in spent) { totS += spent[d2]; }
+      for (var d3 in saved) { totV += saved[d3]; }
+      return { spent: spent, saved: saved, totS: totS, totV: totV };
+    }
+    function refreshTok() { TOK = buildTok(); tTok.n.textContent = Math.round(TOK.totS) + 'M'; }
+    refreshTok();
+    var SNAP_TOK = TOK;
+    var tokBins = [], tokView = 'cum', tokSel = null;
+    function drawTokensLens(ctx2, g) {
+      tokBins = [];
+      var cum = tokView === 'cum';
+      var rB = g.r0 * 1.7;
+      var spanOut = g.R * 0.94 - rB, spanIn = rB - g.r0 * 0.8;
+      var d0 = Math.ceil(S), d1 = Math.floor(Math.min(T, E));
+      var cs = 0, cv2 = 0, maxS = 0.001, maxV = 0.001, rows = [];
+      for (var d2 = d0; d2 <= d1; d2++) { var sp = TOK.spent[d2] || 0, sv = TOK.saved[d2] || 0; cs += sp; cv2 += sv; rows.push({ d: d2, sp: sp, sv: sv, cs: cs, cv: cv2 }); }
+      rows.forEach(function (r2) { maxS = Math.max(maxS, cum ? r2.cs : r2.sp); maxV = Math.max(maxV, cum ? r2.cv : r2.sv); });
+      ctx2.strokeStyle = 'rgba(255,255,255,.12)'; ctx2.lineWidth = 1 / Z;
+      ctx2.beginPath(); ctx2.arc(0, 0, rB, BASE, BASE + TAU - SEAM); ctx2.stroke();
+      var wA = (TAU - SEAM) / Math.max(1, (Math.floor(E) - Math.ceil(S) + 1));
+      rows.forEach(function (r2) {
+        var a = BASE + (TAU - SEAM) * ((r2.d + 0.5 - S) / Math.max(0.5, E - S));
+        var hS = ((cum ? r2.cs : r2.sp) / maxS) * spanOut;
+        var wBar = Math.max(1.5, wA * rB * 0.55) / Math.max(1, Math.sqrt(Z));
+        var isSelDay = tokSel === r2.d;
+        if (cum) {
+          var hV = ((r2.cv) / maxV) * spanIn;
+          ctx2.lineWidth = wBar;
+          ctx2.strokeStyle = hex2rgba('#a78bfa', 0.55);
+          ctx2.beginPath(); ctx2.moveTo(Math.cos(a) * rB, Math.sin(a) * rB); ctx2.lineTo(Math.cos(a) * (rB + hS), Math.sin(a) * (rB + hS)); ctx2.stroke();
+          ctx2.strokeStyle = hex2rgba('#34d399', 0.6);
+          ctx2.beginPath(); ctx2.moveTo(Math.cos(a) * rB, Math.sin(a) * rB); ctx2.lineTo(Math.cos(a) * (rB - hV), Math.sin(a) * (rB - hV)); ctx2.stroke();
+        } else {
+          var hV2 = ((r2.sv) / maxV) * spanOut * 0.85;
+          ctx2.lineWidth = wBar;
+          ctx2.strokeStyle = hex2rgba('#a78bfa', isSelDay ? 0.9 : 0.5);
+          ctx2.beginPath(); ctx2.moveTo(Math.cos(a) * rB, Math.sin(a) * rB); ctx2.lineTo(Math.cos(a) * (rB + hS), Math.sin(a) * (rB + hS)); ctx2.stroke();
+          ctx2.lineWidth = Math.max(1.2, wBar * 0.38);
+          ctx2.strokeStyle = hex2rgba('#34d399', isSelDay ? 1 : 0.8);
+          ctx2.beginPath(); ctx2.moveTo(Math.cos(a) * rB, Math.sin(a) * rB); ctx2.lineTo(Math.cos(a) * (rB + hV2), Math.sin(a) * (rB + hV2)); ctx2.stroke();
+          ctx2.lineWidth = 1 / Z;
+          ctx2.fillStyle = hex2rgba('#a78bfa', isSelDay ? 1 : 0.85);
+          ctx2.beginPath(); ctx2.arc(Math.cos(a) * (rB + hS), Math.sin(a) * (rB + hS), (isSelDay ? 3.4 : 2.4) / Math.sqrt(Z), 0, 7); ctx2.fill();
+          ctx2.fillStyle = hex2rgba('#34d399', isSelDay ? 1 : 0.85);
+          ctx2.beginPath(); ctx2.arc(Math.cos(a) * (rB + hV2), Math.sin(a) * (rB + hV2), (isSelDay ? 2.8 : 2) / Math.sqrt(Z), 0, 7); ctx2.fill();
+          if (isSelDay) { ctx2.strokeStyle = 'rgba(238,240,246,.5)'; ctx2.beginPath(); ctx2.arc(0, 0, rB, a - 0.02, a + 0.02); ctx2.stroke(); }
+        }
+        tokBins.push({ d: r2.d, sp: r2.sp, sv: r2.sv, cs: r2.cs, cv: r2.cv, a: a, rTip: rB + hS });
+      });
+      ctx2.lineWidth = 1 / Z;
+      var pct = TOK.totS > 0 ? Math.round(100 * TOK.totV / TOK.totS) : 0;
+      var nDays = Math.max(1, rows.length);
+      lensLabels.push({ x: 0, y: g.R + 42, cap: true,
+        t: cum
+          ? 'tokens · cumulative · outward = spent ' + Math.round(TOK.totS) + 'M · inward = est. saved ' + TOK.totV.toFixed(1) + 'M (~' + pct + '%, from 12-token fact recalls vs ~3k replays)'
+          : 'tokens · per day · avg ' + (cs / nDays).toFixed(1) + 'M/day spent · peak ' + maxS.toFixed(1) + 'M · est. saved avg ' + (cv2 / nDays * 1000).toFixed(0) + 'k/day' });
+    }
+
+    function drawLensInFrame(ctx2, g, time) {
+      cells.forEach(function (c) { c._x = undefined; c._on = false; c._bx = undefined; });
+      if (lens === 'data') { drawDataLens(ctx2, g); return; }
+      if (lens === 'tokens') { drawTokensLens(ctx2, g); return; }
+      if (lens === 'receipts') { drawReceiptsLens(ctx2, g, time); return; }
+      var groups = lens === 'memory'
+        ? [['gate', '#2dd4bf'], ['decision', '#a78bfa'], ['memory', '#8b96f2'], ['handoff', '#f5a623'], ['incident', '#ef4444']]
+        : [['claude-work', '#8b96f2'], ['codex-work', '#22d3ee'], ['untraced', '#7e8595']];
+      var keyOf = function (c) { return lens === 'memory' ? c.kind : (c.actor || 'untraced'); };
+      var N2 = groups.length;
+      groups.forEach(function (grp, gi) {
+        var k2 = grp[0], hue2 = grp[1];
+        var a0 = BASE + (gi / N2) * (TAU - SEAM), a1 = BASE + ((gi + 1) / N2) * (TAU - SEAM);
+        ctx2.strokeStyle = 'rgba(255,255,255,.06)'; ctx2.lineWidth = 1 / Z;
+        ctx2.beginPath(); ctx2.moveTo(Math.cos(a0) * g.r0, Math.sin(a0) * g.r0); ctx2.lineTo(Math.cos(a0) * g.R, Math.sin(a0) * g.R); ctx2.stroke();
+        var members = cells.filter(function (c) { return keyOf(c) === k2 && c.day <= T && c.day >= S && c.day <= E && passFilter(c); });
+        ctx2.strokeStyle = hex2rgba(hue2, 0.5); ctx2.lineWidth = 3 / Z;
+        ctx2.beginPath(); ctx2.arc(0, 0, g.R + 3, a0 + 0.02, a1 - 0.02); ctx2.stroke();
+        ctx2.lineWidth = 1 / Z;
+        var mid = (a0 + a1) / 2;
+        lensLabels.push({ x: Math.cos(mid) * (g.R + 20), y: Math.sin(mid) * (g.R + 20), t: k2 + ' · ' + members.length });
+        members.forEach(function (c) {
+          var a = a0 + (a1 - a0) * (0.08 + c.ja * 0.84);
+          var r = dayR(g, c.day) * (0.995 + c.jr * 0.01);
+          var x = Math.cos(a) * r, y = Math.sin(a) * r, isH = hover === c;
+          var alpha = c.real ? 0.9 : 0.45;
+          if (lens === 'memory') { var ageFrac = Math.max(0, Math.min(1, (T - c.day) / Math.max(0.5, E - S))); alpha *= 1 - 0.5 * ageFrac; }
+          var rr = (c.real ? 3.2 : 2.4) * (isH ? 1.8 : 1);
+          ctx2.fillStyle = hex2rgba(hue2, alpha * (hover && !isH ? 0.5 : 1));
+          if (c.kind === 'gate' && c.real) {
+            ctx2.beginPath(); ctx2.moveTo(x, y - rr - 1); ctx2.lineTo(x + rr, y); ctx2.lineTo(x, y + rr + 1); ctx2.lineTo(x - rr, y); ctx2.closePath(); ctx2.fill();
+          } else { ctx2.beginPath(); ctx2.arc(x, y, rr, 0, 7); ctx2.fill(); }
+          if (isH) { ctx2.strokeStyle = hex2rgba(hue2, 0.95); ctx2.beginPath(); ctx2.arc(x, y, rr + 4 / Z, 0, 7); ctx2.stroke(); }
+          c._x = x; c._y = y; c._dr = rr; c._on = true;
+        });
+      });
+      lensLabels.push({ x: 0, y: g.R + 42, cap: true,
+        t: lens === 'memory' ? 'memory lens · sector = fact kind · ring = day · fade = age (decay illustrative)' : 'sessions lens · sector = agent passport · ring = day · untraced plans have no actor' });
+    }
+    function drawReceiptsLens(ctx2, g, time) {
+      var teeth = 120;
+      var sealedFrac = Math.max(0, Math.min(1, (T - S) / Math.max(0.5, E - S)));
+      for (var i = 0; i < teeth; i++) {
+        var a = BASE + (i / teeth) * (TAU - SEAM);
+        var sealed = i / teeth <= sealedFrac;
+        ctx2.strokeStyle = sealed ? 'rgba(52,211,153,.8)' : 'rgba(255,255,255,.10)'; ctx2.lineWidth = (sealed ? 1.8 : 1) / Z;
+        ctx2.beginPath(); ctx2.moveTo(Math.cos(a) * g.R, Math.sin(a) * g.R); ctx2.lineTo(Math.cos(a) * (g.R + (sealed ? 9 : 6)), Math.sin(a) * (g.R + (sealed ? 9 : 6))); ctx2.stroke();
+      }
+      ctx2.lineWidth = 1 / Z;
+      var n = Math.floor(90 * sealedFrac) + 8;
+      for (var j = 0; j < n; j++) {
+        var a2 = j * 2.399963;
+        var r = g.r0 + (g.R - g.r0) * (0.12 + (j / 98) * 0.78);
+        ctx2.fillStyle = hex2rgba('#34d399', 0.25 + (j / n) * 0.5);
+        ctx2.beginPath(); ctx2.arc(Math.cos(a2) * r, Math.sin(a2) * r, 1.8, 0, 7); ctx2.fill();
+      }
+      lensLabels.push({ x: 0, y: g.R + 42, cap: true, t: 'receipts lens · chain ticks forward only · illustrative until /v1/receipts/export is wired' });
+    }
+
+    function kick() { if (rafId === null && cv.isConnected) { rafId = requestAnimationFrame(draw); } }
+
+    // ---- controls ----
+    function setPlaying(v) {
+      playing = v;
+      bPlay.textContent = v ? '⏸' : '▶';
+      bPlay.setAttribute('aria-pressed', String(v));
+      if (v && !showCompleted) { setCompleted(true); }
+      if (v && !showLedger) { setLedger(true); }
+    }
+    function setLedger(v) { showLedger = v; bLedger.setAttribute('aria-pressed', String(v)); }
+    function setCompleted(v) { showCompleted = v; bDone.setAttribute('aria-pressed', String(v)); }
+    bPlay.addEventListener('click', function () { if (!playing && T >= E - 0.01) { T = S; } setPlaying(!playing); });
+    bSpin.addEventListener('click', function () { spinning = !spinning; bSpin.setAttribute('aria-pressed', String(spinning)); });
+    bDone.addEventListener('click', function () { setCompleted(!showCompleted); });
+    bLedger.addEventListener('click', function () { setLedger(!showLedger); });
+    bClock.addEventListener('click', function () { resetTween = true; spinning = false; bSpin.setAttribute('aria-pressed', 'false'); });
+    bMode.addEventListener('click', function () { mode = mode === 'dots' ? 'bars' : 'dots'; bMode.setAttribute('aria-pressed', String(mode === 'bars')); });
+    bDir.addEventListener('click', function () { dir = dir === 'out' ? 'in' : 'out'; bDir.textContent = dir === 'out' ? 'edge: outward' : 'edge: inward'; bDir.setAttribute('aria-pressed', String(dir === 'in')); });
+    bAll.addEventListener('click', function () { showAll = !showAll; bAll.setAttribute('aria-pressed', String(showAll)); });
+    bState.addEventListener('click', function () { colorByState = !colorByState; bState.setAttribute('aria-pressed', String(colorByState)); });
+    bLin.addEventListener('click', function () { showLineage = !showLineage; bLin.setAttribute('aria-pressed', String(showLineage)); });
+    sKind.addEventListener('change', function (e) { fKind = e.target.value; });
+    sAgent.addEventListener('change', function (e) { fAgent = e.target.value; });
+    function syncWindow() {
+      var s = Math.min(rStart.value / 1000, rEnd.value / 1000 - 0.03);
+      var e = Math.max(rEnd.value / 1000, rStart.value / 1000 + 0.03);
+      S = 11 + s * (NOW - 11); E = 11 + e * (NOW - 11); T = Math.max(S, Math.min(E, T));
+      rTime.value = Math.round((T - S) / Math.max(0.5, E - S) * 1000);
+      cDate.textContent = dayDate(T); dStart.value = dayDate(S); dEnd.value = dayDate(E);
+    }
+    rStart.addEventListener('input', syncWindow);
+    rEnd.addEventListener('input', syncWindow);
+    function dateToDay(v) { return Date.parse(v + 'T00:00:00Z') / 86400000 - 20580; }
+    dStart.addEventListener('change', function () { var d = Math.max(11, Math.min(NOW - 1, dateToDay(dStart.value))); rStart.value = Math.round((d - 11) / (NOW - 11) * 1000); syncWindow(); });
+    dEnd.addEventListener('change', function () { var d = Math.max(12, Math.min(NOW, dateToDay(dEnd.value))); rEnd.value = Math.round((d - 11) / (NOW - 11) * 1000); syncWindow(); });
+    rTime.addEventListener('input', function () { T = S + (rTime.value / 1000) * (E - S); setPlaying(false); cDate.textContent = dayDate(T); });
+    function zoomAt(sx, sy, factor) { var g = geom(); var before = toDisc(g, sx, sy); Z = Math.max(0.6, Math.min(7, Z * factor)); var after = toScreen(g, before.x, before.y); panX += sx - after.x; panY += sy - after.y; }
+    cv.addEventListener('wheel', function (e) { e.preventDefault(); var r = cv.getBoundingClientRect(); zoomAt(e.clientX - r.left, e.clientY - r.top, e.deltaY < 0 ? 1.15 : 1 / 1.15); }, { passive: false });
+    bZin.addEventListener('click', function () { zoomAt(W / 2, H / 2, 1.35); });
+    bZout.addEventListener('click', function () { zoomAt(W / 2, H / 2, 1 / 1.35); });
+    bZfit.addEventListener('click', function () { Z = 1; panX = panY = 0; });
+    cv.addEventListener('pointerdown', function (e) { dragging = true; dragMoved = 0; lastPX = e.clientX; lastPY = e.clientY; cv.setPointerCapture(e.pointerId); });
+    cv.addEventListener('pointerup', function (e) { dragging = false; if (dragMoved < 5) { handleClick(e); } });
+    cv.addEventListener('pointermove', function (e) {
+      mxAbs = e.clientX; myAbs = e.clientY;
+      if (dragging) {
+        var dx = e.clientX - lastPX, dy = e.clientY - lastPY;
+        dragMoved += Math.abs(dx) + Math.abs(dy);
+        if (dragMoved > 5) { panX += dx; panY += dy; }
+        lastPX = e.clientX; lastPY = e.clientY; return;
+      }
+      if (lens === 'tokens') {
+        var g2 = geom();
+        var pd = toDisc(g2, e.clientX - cv.getBoundingClientRect().left, e.clientY - cv.getBoundingClientRect().top);
+        var pr2 = Math.hypot(pd.x, pd.y);
+        var pa2 = Math.atan2(pd.y, pd.x); while (pa2 < BASE) { pa2 += TAU; }
+        var bin = null, bd2 = 0.05;
+        tokBins.forEach(function (b2) { var ba = b2.a; while (ba < BASE) { ba += TAU; } var da2 = Math.abs(pa2 - ba); if (da2 < bd2 && pr2 > g2.r0 * 0.7 && pr2 < g2.R) { bd2 = da2; bin = b2; } });
+        if (bin) {
+          showTip(e.clientX, e.clientY, [tb(dayDate(bin.d)), br(), tk('spent'), ' ' + bin.sp.toFixed(1) + 'M ', tk('day'), ' · ' + bin.cs.toFixed(1) + 'M ', tk('cum'), br(), tk('saved'), ' ' + bin.sv.toFixed(2) + 'M ', tk('day'), ' · ' + bin.cv.toFixed(2) + 'M ', tk('cum (est.)')]);
+        } else { hideTip(); }
+        hover = null; hoverSec = null; return;
+      }
+      hover = hitTest(e);
+      hoverSec = hover && hover.p ? hover.p : sectorAt(e);
+      if (hover && lens === 'data') {
+        var n = hover;
+        showTip(mxAbs, myAbs, [tb(n.k), br(), tk('entity'), ' ' + (n.e.length > 40 ? n.e.slice(0, 39) + '…' : n.e), br(), tk('source'), ' ' + dayDate(n.d) + (n.a ? '' : ''), (n.a ? tk('by') : null), (n.a ? ' ' + n.a : null), br(), tk('confidence'), ' ' + gEffConf(n).toFixed(2) + ' ', tk('(' + (n.h || 'none') + ')'), ' · ', tk('links'), ' ' + ((GADJ[n.i] || []).length)]);
+        return;
+      }
+      if (hover) {
+        var c = hover;
+        if (c.real) {
+          showTip(mxAbs, myAbs, [tb(c.key), (c.version > 1 ? ' ' : null), (c.version > 1 ? tk('v' + c.version) : null), br(), tk('plan'), ' ' + c.p.short, br(), tk('stored'), ' ' + dayDate(c.day) + ' ', tk('by'), ' ' + c.actor, br(), tk('kind'), ' ' + c.kind + ' · ', tk('horizon'), ' ' + c.horizon]);
+        } else {
+          showTip(mxAbs, myAbs, [tb(c.p.short), br(), tk(STATE[c.p.st] + ' · ' + c.p.done + '/' + c.p.total + ' · born ' + dayDate(c.p.b)), br(), tk(c.kind === 'gate' ? c.key : 'untraced density — one query_facts call away')]);
+        }
+      } else if (hoverSec) {
+        var p = hoverSec;
+        var nDepIn = DEP_EDGES.filter(function (ed) { return ed.b === p; }).length;
+        var parts = [tb(p.short), br(), tk(STATE[p.st] + ' · ' + p.done + '/' + p.total), br(), tk('born'), ' ' + dayDate(p.b) + ' ', tk('· last'), ' ' + dayDate(p.e)];
+        if (p.o) { parts.push(br(), tk('output'), ' ' + (p.o / 10).toFixed(1) + 'M tok'); }
+        if (p.od.length) { parts.push(br(), tk('open decisions'), ' ' + p.od.join(' ')); }
+        if (p.dep.length || nDepIn) { parts.push(br(), tk('lineage'), ' depends on ' + p.dep.length + ' · depended on by ' + nDepIn); }
+        showTip(mxAbs, myAbs, parts);
+      } else { hideTip(); }
+    });
+    function sectorAt(e) {
+      if (lens !== 'work') { return null; }
+      var r = cv.getBoundingClientRect(), g = geom();
+      var p = toDisc(g, e.clientX - r.left, e.clientY - r.top);
+      var pr = Math.hypot(p.x, p.y);
+      if (pr < g.r0 * 0.85 || pr > g.R + 30) { return null; }
+      var pa = Math.atan2(p.y, p.x);
+      for (var i = 0; i < PLANS.length; i++) {
+        var pl = PLANS[i];
+        if (!pl.lay || pl.lay.alpha < 0.4) { continue; }
+        var da = pa - pl.lay.a0; while (da < 0) { da += TAU; } while (da >= TAU) { da -= TAU; }
+        if (da <= pl.lay.a1 - pl.lay.a0) { return pl; }
+      }
+      return null;
+    }
+    cv.addEventListener('pointerleave', function () { hover = null; hoverSec = null; hideTip(); });
+    function hitTest(e) {
+      var r = cv.getBoundingClientRect(), g = geom();
+      var p = toDisc(g, e.clientX - r.left, e.clientY - r.top);
+      var pr = Math.hypot(p.x, p.y), pa = Math.atan2(p.y, p.x);
+      if (lens === 'data') {
+        var best2 = null, bd2 = 9 / Z;
+        GNODES.forEach(function (n) { if (!n._on || n._x === undefined) { return; } var d2 = Math.hypot(n._x - p.x, n._y - p.y); if (d2 < bd2 + n._dr) { bd2 = d2; best2 = n; } });
+        return best2;
+      }
+      if (solo) {
+        for (var si = 0; si < solo.cells.length; si++) {
+          var c0 = solo.cells[si];
+          if (c0._bx === undefined || c0.day > T) { continue; }
+          if (Math.abs(p.x - c0._bx) < 6 / Z && p.y < 5 / Z && p.y > -(c0._bh + 9 / Z)) { return c0; }
+        }
+      }
+      var best = null, bd = 10 / Z;
+      for (var ci = 0; ci < cells.length; ci++) {
+        var c = cells[ci];
+        if (c._x === undefined || c.day > T || !c.p.lay || c.p.lay.alpha < 0.3 || !passFilter(c)) { continue; }
+        var d = Math.hypot(c._x - p.x, c._y - p.y);
+        if (d < bd + c._dr) { bd = d; best = c; }
+        if (mode === 'bars' && !best) {
+          var da = pa - c._a; while (da > Math.PI) { da -= TAU; } while (da < -Math.PI) { da += TAU; }
+          if (Math.abs(da) * pr < 4 / Z && pr > g.r0 - 2 && pr < c._r + c._dr) { best = c; }
+        }
+      }
+      return best;
+    }
+    function handleClick(e) {
+      if (lens === 'data') { var hit0 = hitTest(e); gSel = (hit0 && hit0.i !== undefined) ? (gSel === hit0.i ? null : hit0.i) : null; return; }
+      if (lens === 'tokens') {
+        var r2 = cv.getBoundingClientRect(), g2 = geom();
+        var pd = toDisc(g2, e.clientX - r2.left, e.clientY - r2.top);
+        var pr2 = Math.hypot(pd.x, pd.y);
+        var pa2 = Math.atan2(pd.y, pd.x); while (pa2 < BASE) { pa2 += TAU; }
+        var bin = null, bd2 = 0.05;
+        tokBins.forEach(function (b2) { var ba = b2.a; while (ba < BASE) { ba += TAU; } var da2 = Math.abs(pa2 - ba); if (da2 < bd2 && pr2 > g2.r0 * 0.7 && pr2 < g2.R + 14) { bd2 = da2; bin = b2; } });
+        if (bin && tokSel !== bin.d) { tokSel = bin.d; renderTokenDayPane(bin); } else { tokSel = null; pane.classList.remove('open'); }
+        return;
+      }
+      if (lens !== 'work') { return; }
+      var r = cv.getBoundingClientRect();
+      var cxp = e.clientX - r.left, cyp = e.clientY - r.top;
+      for (var li = 0; li < ledgerRows.length; li++) {
+        var row = ledgerRows[li];
+        if (cxp >= row.x && cxp <= row.x + row.w && cyp >= row.y && cyp <= row.y + row.h) {
+          if (solo === row.p) { setSel(null); solo = null; } else { solo = row.p; setSel({ type: 'plan', p: row.p }); }
+          return;
+        }
+      }
+      var hit = hitTest(e);
+      if (hit) { setSel(sel && sel.c === hit ? null : { type: 'cell', c: hit }); return; }
+      var sec = sectorAt(e);
+      if (sec) { if (solo === sec) { setSel(null); solo = null; } else { solo = sec; setSel({ type: 'plan', p: sec }); } return; }
+      if (solo) {
+        var g3 = geom();
+        var pd2 = toDisc(g3, cxp, cyp);
+        var pr3 = Math.hypot(pd2.x, pd2.y);
+        var pa3 = Math.atan2(pd2.y, pd2.x); if (pa3 < 0) { pa3 += TAU; }
+        if (pr3 > g3.r0 && pr3 < g3.R + 12 && pa3 > Math.PI && pa3 < Math.PI * 1.5) { return; }
+      }
+      setSel(null); solo = null;
+    }
+    function setSel(s) { sel = s; pinned = s && s.type === 'cell' ? s.c : null; renderPane(); }
+
+    // ---- detail pane (DOM builders; no innerHTML) ----
+    function pRow(k, v) {
+      var val = el('span', {});
+      if (Array.isArray(v)) { v.forEach(function (x) { val.appendChild(typeof x === 'string' ? doc().createTextNode(x) : x); }); }
+      else { val.textContent = String(v); }
+      return el('div', { 'class': 'row' }, [el('span', { text: k }), val]);
+    }
+    function pSect(t) { return el('div', { 'class': 'sect', text: t }); }
+    function joinBr(arr) { var out = []; arr.forEach(function (s, i) { if (i) { out.push(el('br')); } out.push(s); }); return out; }
+    function tokChart(p) {
+      var evs = p.cells.slice().sort(function (a, b) { return a.day - b.day; });
+      if (!evs.length) { return null; }
+      var W2 = 288, H2 = 92, padT = 10, padB = 20, padX = 2;
+      var b = p.b, e = Math.max(p.e, b + 0.5);
+      var tot = evs.reduce(function (a, c) { return a + c.tokW; }, 0) || 1;
+      var hue = stateHue(p);
+      var X2 = function (d) { return padX + Math.max(0, Math.min(1, (d - b) / (e - b))) * (W2 - 2 * padX); };
+      var Y2 = function (f) { return (H2 - padB) - f * (H2 - padB - padT); };
+      var cum = 0, pts = evs.map(function (c) { cum += c.tokW; return { x: X2(c.day), y: Y2(cum / tot), c: c }; });
+      var line = 'M' + padX + ',' + Y2(0) + pts.map(function (pt) { return 'L' + pt.x.toFixed(1) + ',' + pt.y.toFixed(1); }).join('') + 'L' + (W2 - padX) + ',' + pts[pts.length - 1].y.toFixed(1);
+      var area = line + 'L' + (W2 - padX) + ',' + Y2(0) + 'Z';
+      var gid = 'rtg' + p.i;
+      var wrap = el('div', {});
+      wrap.appendChild(pSect('TOKEN USAGE' + (p.o ? ' · ' + (p.o / 10).toFixed(1) + 'M out' : '')));
+      var svg = svgEl('svg', { width: '100%', viewBox: '0 0 ' + W2 + ' ' + H2, style: 'display:block;margin-top:6px', role: 'img', 'aria-label': "Cumulative token usage over the plan's life" });
+      var defs = svgEl('defs');
+      var grad = svgEl('linearGradient', { id: gid, x1: '0', y1: '0', x2: '0', y2: '1' });
+      grad.appendChild(svgEl('stop', { offset: '0', 'stop-color': hue, 'stop-opacity': '.38' }));
+      grad.appendChild(svgEl('stop', { offset: '1', 'stop-color': hue, 'stop-opacity': '0' }));
+      defs.appendChild(grad); svg.appendChild(defs);
+      svg.appendChild(svgEl('path', { d: area, fill: 'url(#' + gid + ')' }));
+      svg.appendChild(svgEl('path', { d: line, fill: 'none', stroke: hue, 'stroke-opacity': '.85', 'stroke-width': '1.4' }));
+      pts.forEach(function (pt) { svg.appendChild(svgEl('circle', { cx: pt.x.toFixed(1), cy: pt.y.toFixed(1), r: (pt.c.kind === 'gate' ? 3 : 2.2), fill: (KIND_HUE[pt.c.kind] || '#8b96f2') })); });
+      svg.appendChild(svgEl('text', { x: padX, y: (H2 - 5), fill: 'rgba(126,133,149,.8)', 'font-size': '9', 'font-family': 'monospace' }));
+      svg.lastChild.textContent = dayDate(b);
+      svg.appendChild(svgEl('text', { x: (W2 - padX), y: (H2 - 5), 'text-anchor': 'end', fill: 'rgba(126,133,149,.8)', 'font-size': '9', 'font-family': 'monospace' }));
+      svg.lastChild.textContent = dayDate(p.e);
+      wrap.appendChild(svg);
+      return wrap;
+    }
+    function planBlock(p) {
+      var hue = stateHue(p);
+      var nCells = p.cells.length, gates = p.cells.filter(function (c) { return c.kind === 'gate'; }).length;
+      var frag = doc().createDocumentFragment();
+      frag.appendChild(pSect('EXECPLAN'));
+      frag.appendChild(el('h4', { text: p.slug }));
+      var bar = el('div', { 'class': 'bar' }); var bi = el('i'); bi.style.width = Math.round(100 * p.done / p.total) + '%'; bi.style.background = hue; bar.appendChild(bi); frag.appendChild(bar);
+      frag.appendChild(pRow('state', STATE[p.st] + ' · ' + p.done + '/' + p.total));
+      frag.appendChild(pRow('born', dayDate(p.b)));
+      frag.appendChild(pRow('last activity', dayDate(p.e)));
+      if (p.o) { frag.appendChild(pRow('output tokens', (p.o / 10).toFixed(1) + 'M')); }
+      frag.appendChild(pRow('nodes', nCells + ' (' + gates + ' gates)'));
+      if (p.od.length) { frag.appendChild(pRow('open decisions', p.od.join(' · '))); }
+      if (p.dep.length) { frag.appendChild(pRow('depends on', joinBr(p.dep.map(function (d) { return doc().createTextNode(d.replace(/-2026-\d\d-\d\d$/, '')); })))); }
+      if (p.ext.length) { frag.appendChild(pRow('extended by', joinBr(p.ext.map(function (d) { return doc().createTextNode(d.replace(/-2026-\d\d-\d\d$/, '')); })))); }
+      var tc = tokChart(p); if (tc) { frag.appendChild(tc); }
+      if (p.traced) {
+        frag.appendChild(pSect('FACTS (real)'));
+        var ul = el('ul', { 'class': 'facts' });
+        p.cells.slice().sort(function (a, b) { return a.day - b.day; }).forEach(function (c) {
+          var li = el('li', (sel && sel.c === c) ? { 'class': 'sel' } : {}, [el('b', { text: c.key }), ' · ' + dayDate(c.day) + (c.actor ? ' · ' + c.actor : '')]);
+          ul.appendChild(li);
+        });
+        frag.appendChild(ul);
+      } else {
+        var note2 = el('p', { 'class': 'note' }, ['Untraced plan — node density is milestone-derived. One call makes it real:', el('br'), el('code', { text: 'query_facts(entity="execplan:' + p.slug + '", token_budget=4000)' })]);
+        frag.appendChild(note2);
+      }
+      return frag;
+    }
+    function renderPane() {
+      if (!sel) { pane.classList.remove('open'); return; }
+      pane.textContent = '';
+      if (sel.type === 'cell') {
+        var c = sel.c, hue = KIND_HUE[c.kind] || '#8b96f2';
+        var h4 = el('h4', { text: c.key });
+        if (c.version > 1) { var vspan = el('span', { text: ' v' + c.version }); vspan.style.color = 'var(--rings-ink3)'; h4.appendChild(vspan); }
+        pane.appendChild(h4);
+        pane.appendChild(el('span', { 'class': 'kindchip' }, [el('i', { style: 'background:' + hue }), c.kind + (c.real ? ' · real fact' : ' · illustrative')]));
+        if (c.real) {
+          pane.appendChild(pRow('stored', dayDate(c.day)));
+          pane.appendChild(pRow('actor', c.actor));
+          pane.appendChild(pRow('horizon', c.horizon));
+          pane.appendChild(pRow('tokens', c.tokens));
+          if (c.version > 1) { pane.appendChild(pRow('supersedes', 'v' + (c.version - 1) + ' of same key')); }
+        } else {
+          pane.appendChild(pRow('day', dayDate(c.day)));
+        }
+        pane.appendChild(planBlock(c.p));
+      } else {
+        pane.appendChild(planBlock(sel.p));
+        if (solo === sel.p) { pane.appendChild(el('p', { 'class': 'note', text: 'Ring filtered to this plan — click the background to clear.' })); }
+      }
+      pane.classList.add('open');
+    }
+    function tokPaneChart(selDay) {
+      var W2 = 288, H2 = 92, padT = 10, padB = 20, padX = 2;
+      var d0 = Math.ceil(S), d1 = Math.floor(E);
+      var days = [], mS = 0.001, mV = 0.001;
+      for (var d3 = d0; d3 <= d1; d3++) { var sp = TOK.spent[d3] || 0, sv = TOK.saved[d3] || 0; days.push({ d: d3, sp: sp, sv: sv }); mS = Math.max(mS, sp); mV = Math.max(mV, sv); }
+      if (!days.length) { return null; }
+      var X2 = function (d3) { return padX + ((d3 - d0) / Math.max(1, d1 - d0)) * (W2 - 2 * padX); };
+      var YS = function (v) { return (H2 - padB) - (v / mS) * (H2 - padB - padT); };
+      var YV = function (v) { return (H2 - padB) - (v / mV) * (H2 - padB - padT); };
+      var lineS = days.map(function (r2, i2) { return (i2 ? 'L' : 'M') + X2(r2.d).toFixed(1) + ',' + YS(r2.sp).toFixed(1); }).join('');
+      var areaS = lineS + 'L' + X2(d1).toFixed(1) + ',' + (H2 - padB) + 'L' + X2(d0).toFixed(1) + ',' + (H2 - padB) + 'Z';
+      var lineV = days.map(function (r2, i2) { return (i2 ? 'L' : 'M') + X2(r2.d).toFixed(1) + ',' + YV(r2.sv).toFixed(1); }).join('');
+      var selX = X2(selDay).toFixed(1);
+      var selRow = days.filter(function (r2) { return r2.d === selDay; })[0];
+      var wrap = doc().createDocumentFragment();
+      var svg = svgEl('svg', { width: '100%', viewBox: '0 0 ' + W2 + ' ' + H2, style: 'display:block;margin:10px 0 2px', role: 'img', 'aria-label': 'Daily token spend with the selected day marked' });
+      var defs = svgEl('defs');
+      var grad = svgEl('linearGradient', { id: 'rtp', x1: '0', y1: '0', x2: '0', y2: '1' });
+      grad.appendChild(svgEl('stop', { offset: '0', 'stop-color': '#a78bfa', 'stop-opacity': '.4' }));
+      grad.appendChild(svgEl('stop', { offset: '1', 'stop-color': '#a78bfa', 'stop-opacity': '0' }));
+      defs.appendChild(grad); svg.appendChild(defs);
+      svg.appendChild(svgEl('path', { d: areaS, fill: 'url(#rtp)' }));
+      svg.appendChild(svgEl('path', { d: lineS, fill: 'none', stroke: '#a78bfa', 'stroke-opacity': '.9', 'stroke-width': '1.4' }));
+      svg.appendChild(svgEl('path', { d: lineV, fill: 'none', stroke: '#34d399', 'stroke-opacity': '.8', 'stroke-width': '1.1' }));
+      svg.appendChild(svgEl('line', { x1: selX, y1: padT, x2: selX, y2: (H2 - padB), stroke: 'rgba(238,240,246,.5)', 'stroke-dasharray': '2 3' }));
+      if (selRow) {
+        svg.appendChild(svgEl('circle', { cx: selX, cy: YS(selRow.sp).toFixed(1), r: '3.2', fill: '#a78bfa' }));
+        svg.appendChild(svgEl('circle', { cx: selX, cy: YV(selRow.sv).toFixed(1), r: '2.4', fill: '#34d399' }));
+      }
+      var tx0 = svgEl('text', { x: padX, y: (H2 - 5), fill: 'rgba(126,133,149,.8)', 'font-size': '9', 'font-family': 'monospace' }); tx0.textContent = dayDate(d0); svg.appendChild(tx0);
+      var tx1 = svgEl('text', { x: (W2 - padX), y: (H2 - 5), 'text-anchor': 'end', fill: 'rgba(126,133,149,.8)', 'font-size': '9', 'font-family': 'monospace' }); tx1.textContent = dayDate(d1); svg.appendChild(tx1);
+      wrap.appendChild(svg);
+      wrap.appendChild(el('p', { 'class': 'note', style: 'margin-top:0', text: 'purple = spent/day (max ' + mS.toFixed(1) + 'M) · green = est. saved/day (own scale, max ' + (mV * 1000).toFixed(0) + 'k)' }));
+      return wrap;
+    }
+    function renderTokenDayPane(bin) {
+      var d2 = bin.d;
+      var act = PLANS.filter(function (p) { return p.b <= d2 && d2 <= p.e; }).map(function (p) {
+        var dayCells = p.cells.filter(function (c) { return Math.floor(c.day) === d2; }).length;
+        var sp = (p.o && p.cells.length) ? (p.o / 10) / p.cells.length * dayCells : 0;
+        return { p: p, dayCells: dayCells, sp: sp };
+      }).sort(function (x, y) { return y.sp - x.sp || y.dayCells - x.dayCells; });
+      pane.textContent = '';
+      pane.appendChild(el('h4', { text: dayDate(d2) }));
+      pane.appendChild(el('span', { 'class': 'kindchip' }, [el('i', { style: 'background:#f5a623' }), 'token day']));
+      pane.appendChild(pRow('spent', bin.sp.toFixed(1) + 'M day · ' + bin.cs.toFixed(1) + 'M cum'));
+      pane.appendChild(pRow('saved (est.)', (bin.sv * 1000).toFixed(0) + 'k day · ' + bin.cv.toFixed(2) + 'M cum'));
+      var tpc = tokPaneChart(d2); if (tpc) { pane.appendChild(tpc); }
+      pane.appendChild(pSect('ACTIVE EXECPLANS · ' + act.length));
+      if (act.length) {
+        var ul = el('ul', { 'class': 'facts' });
+        act.slice(0, 22).forEach(function (x2) {
+          var dot = el('b', { text: '●' }); dot.style.color = stateHue(x2.p);
+          ul.appendChild(el('li', {}, [dot, ' ', el('b', { text: x2.p.short.slice(0, 30) }), ' · ' + STATE[x2.p.st] + ' ' + x2.p.done + '/' + x2.p.total + (x2.sp ? ' · ~' + x2.sp.toFixed(1) + 'M' : '') + (x2.dayCells ? ' · ' + x2.dayCells + ' events' : '')]));
+        });
+        if (act.length > 22) { ul.appendChild(el('li', { text: '… +' + (act.length - 22) + ' more' })); }
+        pane.appendChild(ul);
+      } else {
+        pane.appendChild(el('p', { 'class': 'note', text: 'no plans with activity spans covering this day' }));
+      }
+      pane.appendChild(el('p', { 'class': 'note', text: 'spend attribution: plan output-token totals distributed across their event days (estimate until per-day token_burn is wired)' }));
+      pane.classList.add('open');
+    }
+
+    function onKey(e) { if (e.key === 'Escape') { setSel(null); solo = null; tokSel = null; } }
+    if (typeof window !== 'undefined') { window.addEventListener('keydown', onKey); }
+
+    // tiles: press to switch the lens
+    Object.keys(tileByLens).forEach(function (ln) {
+      tileByLens[ln].b.addEventListener('click', function () {
+        lens = ln;
+        Object.keys(tileByLens).forEach(function (x) { tileByLens[x].b.setAttribute('aria-pressed', String(x === ln)); });
+        setSel(null); solo = null; hover = null; hoverSec = null; gSel = null; tokSel = null; hideTip();
+        setLedger(false);
+        if (lens === 'data') { var minD = Math.min.apply(null, GNODES.map(function (n) { return n.d; })) - 0.5; if (S < minD - 1) { rStart.value = Math.round((minD - 11) / (NOW - 11) * 1000); syncWindow(); } }
+        grpTokViews.style.display = lens === 'tokens' ? 'flex' : 'none';
+      });
+    });
+    function setTokView(v) { tokView = v; bTokCum.setAttribute('aria-pressed', String(v === 'cum')); bTokDay.setAttribute('aria-pressed', String(v === 'day')); }
+    bTokCum.addEventListener('click', function () { setTokView('cum'); });
+    bTokDay.addEventListener('click', function () { setTokView('day'); });
+
+    // ---- teardown + boot ----
+    function onVis() { kick(); }
+    if (typeof document !== 'undefined') { document.addEventListener('visibilitychange', onVis); }
+    function teardown() {
+      if (rafId != null && typeof cancelAnimationFrame === 'function') { cancelAnimationFrame(rafId); }
+      rafId = null;
+      if (ro) { try { ro.disconnect(); } catch (e) { /* noop */ } }
+      if (io) { try { io.disconnect(); } catch (e) { /* noop */ } }
+      if (typeof document !== 'undefined') { document.removeEventListener('visibilitychange', onVis); }
+      if (typeof window !== 'undefined') { window.removeEventListener('keydown', onKey); }
+      if (__ringsCleanupFn === teardown) { __ringsCleanupFn = null; }
+    }
+    __ringsCleanupFn = teardown;
+
+    syncWindow();
+    resize();
+    kick();
+
+    // ---- live wire: swap the embedded snapshot for the real board when the
+    //      daemon feeds are reachable (through the console's CruxApi client).
+    //      Fails silently back to the snapshot on any absent/failed feed. ----
+    (function liveInit() {
+      var num = function (v) { return (v === null || v === undefined) ? '—' : Number(v).toLocaleString(); };
+      fetchJSON('/v1/work?source=all').then(function (res) {
+        if (res.ok && res.data) {
+          var j = res.data;
+          var items = (j.work || []).filter(function (w) {
+            return w.id && w.id.indexOf('execplan:') === 0 && w.provenance && w.provenance.first_activity_unix_ms && ['in_progress', 'complete', 'blocked'].indexOf(w.state) >= 0;
+          });
+          if (items.length >= 50) {
+            NOW = Math.max(76, Math.floor(Date.now() / 86400000) - 20580);
+            var raws = items.map(function (w) {
+              return { s: w.id.slice(9), st: w.state === 'in_progress' ? 1 : w.state === 'blocked' ? 2 : 0,
+                d: w.milestones_done || 0, t: w.milestones_total || 1,
+                b: Math.floor(w.provenance.first_activity_unix_ms / 86400000) - 20580,
+                e: Math.floor(w.provenance.last_activity_unix_ms / 86400000) - 20580,
+                o: Math.floor(((w.token_burn && w.token_burn.output_tokens) || 0) / 1e5),
+                dep: w.depends_on || [], ext: w.extended_by || [], od: w.open_decisions || [] };
+            });
+            setSel(null); solo = null; hover = null; hoverSec = null; gSel = null; tokSel = null;
+            loadPlans(raws); rebuildLineage(); buildCells(); refreshTok();
+            if (TOK.totS < 1 && SNAP_TOK.totS >= 1) { TOK = SNAP_TOK; tTok.n.textContent = Math.round(TOK.totS) + 'M (snap)'; }
+            dStart.max = dEnd.max = dayDate(NOW);
+            syncWindow();
+            dataSrc = 'live · prod-mirror';
+            glExecplans.n.textContent = num(j.count);
+            tWork.n.textContent = num(j.count);
+            glSrc.textContent = 'live · ' + dayDate(NOW);
+          }
+        }
+      });
+      fetchJSON('/v1/console/summary').then(function (res) {
+        if (res.ok && res.data) {
+          var s2 = res.data;
+          if (s2.stores) { glFacts.n.textContent = num(s2.stores.facts); glSessions.n.textContent = num(s2.stores.sessions); tSess.n.textContent = num(s2.stores.sessions); }
+          if (s2.daemon && s2.daemon.mcp_agent_count !== undefined) { glMcp.n.textContent = num(s2.daemon.mcp_agent_count); }
+          if (s2.integrations !== undefined) {
+            var gi = s2.integrations;
+            glInt.n.textContent = Array.isArray(gi) ? String(gi.length) : (gi && typeof gi === 'object') ? num(gi.builtin_pack_count !== undefined ? gi.builtin_pack_count : Object.keys(gi).length) : num(gi);
+          }
+          if (s2.daemon) { glEngine.n.textContent = s2.daemon.dataplane_enabled ? 'on' : 'off'; }
+        }
+      });
+      // data graph: page the WHOLE visible store through /v1/facts/list (cursor
+      // pagination, reserved included), up to a sane node cap. Snapshot stands on 404.
+      (function walkFacts() {
+        var NODE_CAP = 2000, seen = {}, seenCount = 0, total = null, cursor = null, capped = false, ok = false;
+        function page2(count) {
+          if (count > 40) { finish(); return; }
+          var u = '/v1/facts/list?limit=200&include_reserved=1' + (cursor ? '&cursor=' + encodeURIComponent(cursor) : '');
+          fetchJSON(u).then(function (res) {
+            if (res.status === 404 || !res.ok || !res.data) { finish(); return; }
+            var j3 = res.data; ok = true;
+            if (total === null && j3.total_visible != null) { total = j3.total_visible; }
+            (j3.facts || []).forEach(function (f) {
+              if (capped || !f.fact_id || !f.stored_at || seen[f.fact_id]) { return; }
+              var ms = Date.parse(f.stored_at); if (!isFinite(ms)) { return; }
+              seen[f.fact_id] = { e: f.entity || '?', k: f.key || '?', d: ms / 86400000 - 20580, a: f.actor || null, h: f.horizon_class || 'none', c: f.confidence === undefined ? 1 : f.confidence, t: f.tokens || 100 };
+              seenCount++; if (seenCount >= NODE_CAP) { capped = true; }
+            });
+            cursor = j3.next_cursor || null;
+            if (capped || !cursor || !j3.has_more) { finish(); return; }
+            page2(count + 1);
+          });
+        }
+        function finish() {
+          var live = [];
+          for (var id in seen) { var n = seen[id]; if (isFinite(n.d) && n.d > 0) { live.push(n); } }
+          if (ok && live.length) { gSel = null; loadGraph(live); gTotal = total; gCap = capped; tData.n.textContent = num(live.length); }
+          else if (total) { gTotal = total; }
+        }
+        page2(0);
+      })();
+    })();
   }
 
   return {
@@ -8024,6 +9133,9 @@
     paintSessionDetail: paintSessionDetail,
     renderSessionDetail: renderSessionDetail,
     renderCanvas: renderCanvas,
+    // M10 (console-surfaces-remediation, review round 1) — the native Rings page
+    // (canvas "clock of work"; replaced the embedded iframe mock).
+    renderRings: renderRings,
     renderPage: renderPage,
     renderSections: renderSections,
     fetchJSON: fetchJSON,

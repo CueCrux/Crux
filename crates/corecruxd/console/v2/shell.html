@@ -530,12 +530,106 @@
 
   .content { padding: 26px 28px 48px; }
 
-  /* ---- Rings prototype embed --------------------------------------------
-     The rings-clock landing mock renders in an isolated iframe (base64 data:
-     URL). Cancel the .content padding so the full-bleed prototype fills the
-     surface below the topbar; the mock owns its own internal scroll. */
-  .rings-region-host { margin: -26px -28px -48px; height: calc(100vh - 72px); min-height: 520px; }
-  .rings-frame { display: block; width: 100%; height: 100%; border: 0; background: #0b0d13; }
+  /* ---- Rings page — NATIVE (no iframe) -----------------------------------
+     The rings-clock "clock of work" is rendered natively into #content by
+     render.js renderRings (canvas 2D + a control bar + a detail pane). No
+     iframe, no base64 blob. The region cancels the .content padding and
+     flex-fills the viewport below the topbar so the canvas scales to the
+     available area (single window scroll; the canvas itself never scrolls).
+
+     THEME STANCE — dark-fixed by design. The rings canvas is a cinematic
+     dark surface (its committed identity: deep #0b0d13 field, glowing indigo
+     heartwood, kind/state hues drawn straight to the 2D context). Rather than
+     re-theme ~1600 lines of hard-coded canvas colours per console theme — which
+     would read as accidental, not intentional — the whole region is a
+     self-contained dark panel in all three console themes (glass/dark/light).
+     The mock's palette lives as --rings-* custom properties ON .rings-root
+     (fonts map to the theme-stable console --font-* tokens); every text token
+     is a light ink on the dark field, so copy stays legible in light theme
+     too. Nothing here leaks: all selectors are scoped under .rings-root. */
+  .rings-region-host { margin: -26px -28px -48px; min-height: calc(100vh - 72px); display: flex; flex-direction: column; }
+  .rings-root {
+    --rings-bg0: #0b0d13; --rings-bg1: #12151d;
+    --rings-panel: rgba(255,255,255,.035); --rings-panel-strong: rgba(255,255,255,.06);
+    --rings-hairline: rgba(255,255,255,.09); --rings-hairline-strong: rgba(255,255,255,.18);
+    --rings-ink: #eef0f6; --rings-ink2: #b6bcc9; --rings-ink3: #7e8595;
+    --rings-accent: #8b96f2; --rings-accent-deep: #5e6ad2;
+    --rings-teal: #2dd4bf; --rings-amber: #f5a623; --rings-violet: #a78bfa; --rings-err: #ef4444;
+    flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0;
+    background: radial-gradient(1200px 700px at 70% -10%, rgba(94,106,210,.10), transparent 60%), var(--rings-bg0);
+    color: var(--rings-ink); font-family: var(--font-sans); line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  .rings-root code { font-family: var(--font-mono); font-size: .9em; background: var(--rings-panel-strong); padding: .1em .35em; border-radius: 5px; }
+
+  /* stage — the canvas fills the flex-grown area */
+  .rings-stage { position: relative; flex: 1 1 auto; min-height: 460px; overflow: hidden; }
+  .rings-canvas { display: block; position: absolute; inset: 0; width: 100%; height: 100%; cursor: crosshair; touch-action: none; }
+
+  /* lens tiles — compact row docked bottom-right, above the control bar */
+  .rings-tiles { position: absolute; bottom: 108px; right: 16px; z-index: 15; display: flex; flex-flow: row wrap; justify-content: flex-end; gap: 6px; max-width: 60%; }
+  .rings-tile { text-align: left; cursor: pointer; display: flex; align-items: baseline; gap: 8px; background: rgba(14,16,24,.88); border: 1px solid var(--rings-hairline); border-radius: 10px; padding: 7px 12px; color: var(--rings-ink2); font-family: var(--font-sans); transition: border-color .15s, background .15s; }
+  .rings-tile:hover { border-color: var(--rings-hairline-strong); background: rgba(20,23,33,.95); }
+  .rings-tile:focus-visible { outline: 2px solid var(--rings-accent); outline-offset: 2px; }
+  .rings-tile[aria-pressed="true"] { border-color: rgba(139,150,242,.6); background: rgba(139,150,242,.14); }
+  .rings-tile .t { font: 600 12px var(--font-sans); color: var(--rings-ink2); display: flex; align-items: center; gap: 7px; flex: 1; }
+  .rings-tile .t i { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+  .rings-tile .n { font: 700 14px var(--font-sans); color: var(--rings-ink); letter-spacing: -.01em; font-variant-numeric: tabular-nums; }
+  .rings-tile[aria-pressed="true"] .t { color: var(--rings-accent); }
+
+  /* daemon at a glance — top-right */
+  .rings-glance { position: absolute; top: 14px; right: 16px; z-index: 14; display: grid; grid-template-columns: 1fr 1fr; gap: 6px; width: 230px; }
+  .rings-gl { text-align: left; cursor: default; background: rgba(14,16,24,.88); border: 1px solid var(--rings-hairline); border-radius: 10px; padding: 7px 11px 6px; color: var(--rings-ink2); font-family: var(--font-sans); }
+  .rings-gl .t { display: block; font: 600 9.5px var(--font-mono); letter-spacing: .04em; color: var(--rings-ink3); text-transform: uppercase; }
+  .rings-gl .n { display: block; font: 700 15px var(--font-sans); color: var(--rings-ink); letter-spacing: -.01em; font-variant-numeric: tabular-nums; margin-top: 1px; }
+  .rings-glance .src { grid-column: 1 / -1; font: 10px var(--font-mono); color: var(--rings-ink3); text-align: right; padding-right: 2px; }
+
+  /* control bar */
+  .rings-stagebar { position: absolute; left: 0; right: 0; bottom: 0; display: flex; align-items: center; gap: 9px; flex-wrap: wrap; padding: 10px 16px; font-family: var(--font-mono); font-size: 11.5px; color: var(--rings-ink3); background: linear-gradient(transparent, rgba(11,13,19,.85) 45%); pointer-events: none; }
+  .rings-stagebar > * { pointer-events: auto; }
+  .rings-stagebar .grp { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+  .rings-stagebar .hint { margin-left: auto; text-align: right; }
+  .rings-stagebar button { font: 600 11.5px var(--font-mono); color: var(--rings-ink2); background: rgba(255,255,255,.07); border: 1px solid var(--rings-hairline-strong); border-radius: 7px; padding: 4px 11px; cursor: pointer; }
+  .rings-stagebar button:hover { color: var(--rings-ink); background: rgba(255,255,255,.12); }
+  .rings-stagebar button[aria-pressed="true"] { color: var(--rings-accent); border-color: rgba(139,150,242,.55); background: rgba(139,150,242,.12); }
+  .rings-stagebar button.ic { font-size: 13px; padding: 4px 9px; min-width: 30px; text-align: center; }
+  .rings-stagebar button:focus-visible, .rings-stagebar input:focus-visible, .rings-stagebar select:focus-visible { outline: 2px solid var(--rings-accent); outline-offset: 2px; }
+  .rings-stagebar select { font: 600 11.5px var(--font-mono); color: var(--rings-ink2); background: rgba(255,255,255,.07); border: 1px solid var(--rings-hairline-strong); border-radius: 7px; padding: 4px 8px; cursor: pointer; }
+  .rings-stagebar select:hover { color: var(--rings-ink); background: rgba(255,255,255,.12); }
+  .rings-stagebar input[type=range] { accent-color: var(--rings-accent-deep); width: min(150px, 17vw); }
+  .rings-stagebar input[type=date] { font: 600 11px var(--font-mono); color: var(--rings-ink2); background: rgba(255,255,255,.07); border: 1px solid var(--rings-hairline-strong); border-radius: 7px; padding: 3px 6px; color-scheme: dark; }
+  .rings-stagebar label { color: var(--rings-ink3); }
+  .rings-stagebar .chip { background: rgba(139,150,242,.14); border: 1px solid rgba(139,150,242,.4); color: var(--rings-accent); border-radius: 999px; padding: 3px 11px; font-weight: 600; white-space: nowrap; }
+
+  /* slide-out detail pane */
+  .rings-pane { position: absolute; top: 0; right: 0; bottom: 0; z-index: 20; width: min(330px, 86%); background: rgba(14,16,24,.97); border-left: 1px solid var(--rings-hairline-strong); transform: translateX(105%); transition: transform .30s cubic-bezier(.16,1,.3,1); padding: 18px 18px 60px; overflow-y: auto; font-family: var(--font-mono); font-size: 11.5px; line-height: 1.6; color: var(--rings-ink2); }
+  .rings-pane.open { transform: translateX(0); }
+  .rings-pane h4 { font: 700 13px var(--font-mono); color: var(--rings-ink); margin: 0 0 2px; overflow-wrap: anywhere; }
+  .rings-pane .kindchip { display: inline-flex; align-items: center; gap: 6px; font-size: 10.5px; color: var(--rings-ink3); border: 1px solid var(--rings-hairline-strong); border-radius: 999px; padding: 2px 10px; margin: 6px 0 12px; }
+  .rings-pane .kindchip i { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+  .rings-pane .row { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; border-bottom: 1px solid var(--rings-hairline); }
+  .rings-pane .row span:first-child { color: var(--rings-ink3); white-space: nowrap; }
+  .rings-pane .row span:last-child { color: var(--rings-ink2); text-align: right; overflow-wrap: anywhere; }
+  .rings-pane .sect { margin-top: 16px; font: 700 10.5px var(--font-mono); letter-spacing: .04em; color: var(--rings-ink3); }
+  .rings-pane .bar { height: 5px; border-radius: 3px; background: rgba(255,255,255,.08); margin: 8px 0 4px; overflow: hidden; }
+  .rings-pane .bar i { display: block; height: 100%; border-radius: 3px; }
+  .rings-pane ul.facts { list-style: none; margin: 8px 0 0; padding: 0; }
+  .rings-pane ul.facts li { padding: 4px 0 4px 14px; position: relative; font-size: 10.5px; color: var(--rings-ink3); }
+  .rings-pane ul.facts li::before { content: ''; position: absolute; left: 2px; top: 9px; width: 6px; height: 6px; border-radius: 50%; background: var(--rings-accent); opacity: .6; }
+  .rings-pane ul.facts li.sel { color: var(--rings-ink); }
+  .rings-pane ul.facts li b { color: var(--rings-ink2); font-weight: 600; }
+  .rings-pane .note { margin-top: 12px; font-size: 10.5px; color: var(--rings-ink3); }
+
+  /* hover tooltip (fixed to viewport) */
+  .rings-tip { position: fixed; z-index: 90; pointer-events: none; background: rgba(18,20,29,.97); border: 1px solid var(--rings-hairline-strong); border-radius: 10px; padding: 8px 12px; font-family: var(--font-mono); font-size: 11.5px; line-height: 1.55; color: var(--rings-ink2); box-shadow: 0 10px 30px rgba(0,0,0,.5); max-width: 320px; opacity: 0; transition: opacity .12s; }
+  .rings-tip b { color: var(--rings-ink); font-weight: 600; }
+  .rings-tip .k { color: var(--rings-ink3); }
+
+  /* footer note under the stage */
+  .rings-note { padding: 10px clamp(16px, 3vw, 32px) 22px; font: 11px var(--font-mono); color: var(--rings-ink3); }
+
+  @media (prefers-reduced-motion: reduce) { .rings-pane, .rings-tip { transition: none; } }
+  @media (max-width: 760px) { .rings-tiles { position: static; margin: 10px 16px 0; max-width: none; } }
 
   /* ---- Stat tiles (Overwatch boot readout) ------------------------------ */
   .stats {
@@ -3285,34 +3379,24 @@
       return;
     }
 
-    // Rings (prototype) — no sub-pills: it IS the page. The self-contained
-    // rings-clock landing mock is rendered in an isolated iframe. The payload
-    // ships base64 (CruxPages.RINGS_HTML_B64, escaping-proof) but is injected
-    // via `srcdoc` rather than a data: URL: srcdoc documents INHERIT the
-    // console's origin, so the mock's same-origin fetches (/v1/work,
-    // /v1/console/summary) reach the daemon and swap its embedded snapshot
-    // for live data. A data: URL is an opaque origin and cannot do that.
+    // Rings — no sub-pills: it IS the page. Rendered NATIVELY (no iframe, no
+    // base64 blob) by render.js renderRings: a canvas "clock of work" that
+    // live-wires the real work board (/v1/work?source=all), the daemon glance
+    // (/v1/console/summary) and the visible fact store (/v1/facts/list) through
+    // the console's own CruxApi client, with snapshot fallbacks when a feed is
+    // absent. The renderer registers a teardown that this route triggers by
+    // clearing #content (renderRings' RAF/observers/listeners self-cancel once
+    // the canvas leaves the DOM). Reads only, so it shows in every posture.
     if (destId === 'rings') {
       document.getElementById('destTitle').textContent = dest.label;
       document.getElementById('destSub').textContent = dest.sub || '';
       var ringsHost = el('div', { 'class': 'rings-region-host', id: 'ringsHost' });
-      var ringsB64 = CP.RINGS_HTML_B64 || '';
-      if (ringsB64) {
-        var frame = el('iframe', {
-          'class': 'rings-frame', id: 'ringsFrame', title: 'Rings-clock landing prototype',
-          loading: 'lazy'
-        });
-        try {
-          frame.srcdoc = new TextDecoder().decode(
-            Uint8Array.from(atob(ringsB64), function (c) { return c.charCodeAt(0); }));
-        } catch (e) {
-          frame.src = 'data:text/html;charset=utf-8;base64,' + ringsB64; // fallback: snapshot-only
-        }
-        ringsHost.appendChild(frame);
-      } else {
-        ringsHost.appendChild(el('p', { 'class': 'v2card-sub', text: 'Rings prototype asset unavailable.' }));
-      }
       content.appendChild(ringsHost);
+      if (window.CruxRender && window.CruxRender.renderRings) {
+        window.CruxRender.renderRings(ringsHost, { summary: BOOT.summary });
+      } else {
+        ringsHost.appendChild(el('p', { 'class': 'v2card-sub', text: 'Renderer module unavailable.' }));
+      }
       applyPosture(content);
       if (typeof content.scrollTo === 'function') { content.scrollTo(0, 0); }
       return;
@@ -3563,7 +3647,7 @@
 <script>
 (function () {
   'use strict';
-  var SW_REV = 'ushell-v2-r14';   // keep in lock-step with /console-v2/sw.js
+  var SW_REV = 'ushell-v2-r15';   // keep in lock-step with /console-v2/sw.js
   if (!('serviceWorker' in navigator)) { return; }
   // Dev bypass — when the daemon serves this shell from CORECRUXD_CONSOLE_DEV_PATH
   // it stamps window.__CRUX_CONSOLE_DEV__ (see console.rs inject_console_dev_flag).

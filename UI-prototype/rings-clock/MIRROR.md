@@ -211,7 +211,7 @@ curl -s "http://127.0.0.1:14802/v1/work?source=all" \
   -H "Authorization: Bearer $CRUX_AGENT_TOKEN" \
   | python3 -c 'import sys,json;print(json.load(sys.stdin)["count"])'   # -> ~1000+
 # Console: http://127.0.0.1:14802/console  (default = Overwatch, rail collapsed,
-# new "Rings" entry -> #/rings renders the mock in an iframe).
+# "Rings" entry -> #/rings renders the native clock-of-work canvas, no iframe).
 ```
 
 Screenshot proof (Playwright-in-Docker). **`--network=host` is broken on this host**
@@ -248,28 +248,37 @@ so the same script runs directly on the host or through the proxy from a contain
 - Secrets live ONLY in `/home/myles/crux-prod-mirror/*.env` (staging). Never commit them; never `cat` them into a repo file.
 - The mirror does not submit usage receipts, run update checks, or reach the external engine.
 
-## Updating the Rings console page after editing the mock
+## Rings console page — NATIVE (no longer embeds the mock)
 
-The console serves the mock from `RINGS_HTML_B64` inside
-`crates/corecruxd/console/v2/pages.js` (base64 `data:` URL in an iframe —
-escaping-proof against the mock's inline `</script>`). After editing
-`UI-prototype/rings-clock/console-mock.html`, regenerate and splice:
+**As of console-surfaces-remediation M10 the Rings page is native — the console
+no longer embeds `console-mock.html`.** There is no `RINGS_HTML_B64` blob and no
+iframe anymore. The `#/rings` page is rendered directly into `#content` by:
 
-```bash
-B64=$(printf '<!doctype html>\n<meta charset="utf-8">\n' \
-  | cat - UI-prototype/rings-clock/console-mock.html | base64 -w0)
-# replace the value of RINGS_HTML_B64 in crates/corecruxd/console/v2/pages.js
-node -e '
-const fs = require("fs");
-const f = "crates/corecruxd/console/v2/pages.js";
-const src = fs.readFileSync(f, "utf8");
-fs.writeFileSync(f, src.replace(/var RINGS_HTML_B64 = '\''[^'\'']*'\''/,
-  "var RINGS_HTML_B64 = '\''" + process.env.B64 + "'\''"));
-' 
-```
+- **`crates/corecruxd/console/v2/render.js`** — `renderRings(container, ctx)`:
+  the canvas "clock of work" engine (ported from the mock), the lens tiles /
+  glance / control bar / detail pane built with `el()`/`svgEl()` safe
+  construction (no raw HTML strings), all data loaded through the console's
+  `CruxApi` client via `fetchJSON` (`/v1/work?source=all`,
+  `/v1/console/summary`, and a `/v1/facts/list` cursor walk), with the embedded
+  snapshots (`RINGS_PLANS_RAW` / `RINGS_GRAPH_RAW` / `RINGS_RFACTS`) as honest
+  degradation when a feed is absent. The RAF loop, resize/intersection
+  observers and document/window listeners are torn down when the canvas leaves
+  the DOM (route change) — self-cancelled via an `isConnected` check plus a
+  module-scope cleanup handle re-run on re-entry.
+- **`crates/corecruxd/console/v2/shell.html`** — the `.rings-root`-scoped CSS
+  (dark-fixed canvas identity mapped onto `--rings-*` custom properties; fonts
+  alias the theme-stable console `--font-*` tokens) and the `renderDestination`
+  `rings` branch that flex-fills the viewport below the topbar and calls
+  `window.CruxRender.renderRings`.
 
-The mirror mounts the console dir (`CORECRUXD_CONSOLE_DEV_PATH=/console-dev`),
-so a browser refresh picks the change up — no container restart needed.
+**`UI-prototype/rings-clock/console-mock.html` remains a standalone prototype /
+artifact source** — it is the design reference the native port was ported from,
+and it still works on its own (open the file, or publish it as an artifact). It
+is **no longer wired into the console**, so editing it does **not** change the
+console: to change the live Rings page, edit `renderRings` in `render.js` (JS)
+and the `.rings-root` CSS in `shell.html`. The mirror mounts the console dir
+(`CORECRUXD_CONSOLE_DEV_PATH=/console-dev`), so a browser refresh picks those
+edits up — no container restart needed.
 
 ## Auth workaround (local browser access)
 
