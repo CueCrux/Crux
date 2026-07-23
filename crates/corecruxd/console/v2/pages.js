@@ -1244,10 +1244,11 @@
     // railHidden — Explorer is NOT in the Command rail; it's reached via the
     // top-right search field and from the top of the Explore (documents) menu.
     { id: 'explorer', label: 'Explorer', icon: 'search', railHidden: true, sub: 'Search the corpus — local retrieval or mediated WikiCrux.' },
-    // Site map — a destination with no sub-pills: it IS a static reference page
-    // (the flat rail rearranged into 5 destinations + System). Delegates to
-    // render.js renderSiteMap; reads nothing, so it shows in every posture.
-    { id: 'sitemap', label: 'Site map', icon: 'map', key: '7', sub: "the 26-item rail, rearranged into 5 destinations + System" },
+    // Site map — a destination with no sub-pills: it IS the page. A real,
+    // click-through map of every destination + surface, each node an <a href="#/…">
+    // to a registered route derived from this registry (render.js renderSiteMap,
+    // M8) — so it cannot drift from the nav. Reads nothing; shows in every posture.
+    { id: 'sitemap', label: 'Site map', icon: 'map', key: '7', sub: 'Every surface, one click away — with what each is for' },
     // Rings (prototype) — a destination with no sub-pills: it IS the page. Renders
     // the self-contained rings-clock landing mock (UI-prototype/rings-clock/
     // console-mock.html) in an isolated iframe via a base64 data: URL held in

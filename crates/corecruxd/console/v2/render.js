@@ -5622,85 +5622,218 @@
   }
 
   // =======================================================================
-  //  Site map — a static reference destination: the console's flat rail
-  //  rearranged into 5 destinations + System. Bespoke card grid (no sections
-  //  model). Reads nothing; renders in every posture. Ported from the unified-
-  //  shell concept (rev 1 · 2026-07-03).
+  //  Site map (console-surfaces-remediation M8) — a real, click-through map of
+  //  the console. Every node is an <a href="#/…"> to a REAL registered route,
+  //  DERIVED at render time from the page registry (window.CruxPages.DESTS +
+  //  PAGES) so it can never drift from the nav. The registry lacks two things a
+  //  map needs — operator-voiced "what you'll find / when to use" copy, and the
+  //  destination-IS-the-page routes (canvas views, explorer, sitemap, rings) —
+  //  so those live in the small SITEMAP_META / synthetic-node maps below and are
+  //  the ONLY hand-authored surface. Reads nothing; renders in every posture.
+  //  Highlights where the operator just came from ("you are here", from
+  //  window.CRUX_PREV_HASH) and numbers a recommended first-run path.
   // =======================================================================
+  // Section glyphs, keyed by DEST *icon* id (copied from the shell's ICONS so the
+  // map header art matches the Command rail 1:1).
   var SITEMAP_ICONS = {
-    radar: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/><path d="M12 12l6-6"/></svg>',
-    board: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="5" height="16" rx="1"/><rect x="10" y="4" width="5" height="10" rx="1"/><rect x="17" y="4" width="4" height="13" rx="1"/></svg>',
-    brain: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="5" width="16" height="4.5" rx="2"/><rect x="4" y="12" width="16" height="4.5" rx="2"/><path d="M11 19.5h6"/></svg>',
-    shield: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"/><path d="M9 12l2 2 4-4"/></svg>',
-    gauge: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14a8 8 0 1 1 16 0"/><path d="M12 14l3.5-3.5"/><path d="M4 19h16"/></svg>',
-    server: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="4" width="17" height="6.5" rx="1.8"/><rect x="3.5" y="13.5" width="17" height="6.5" rx="1.8"/><path d="M7 7.2h.01M7 16.7h.01"/></svg>'
+    overwatch: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/></svg>',
+    work: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="5" height="16" rx="1"/><rect x="10" y="4" width="5" height="10" rx="1"/><rect x="17" y="4" width="4" height="13" rx="1"/></svg>',
+    memory: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>',
+    trust: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"/><path d="M9 12l2 2 4-4"/></svg>',
+    meters: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19a8 8 0 0 1 16 0"/><path d="M12 19l4-5"/><circle cx="12" cy="19" r="1.4"/></svg>',
+    settings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.6 1.6 0 0 0-1-1.5 1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.6 1.6 0 0 0 1.5-1 1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H9a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V9a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z"/></svg>',
+    canvas: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>',
+    search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>',
+    map: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="5" rx="1.4"/><rect x="3" y="16" width="6" height="5" rx="1.4"/><rect x="15" y="16" width="6" height="5" rx="1.4"/><path d="M12 8v4M6 16v-2.5h12V16"/></svg>',
+    rings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5.5"/><circle cx="12" cy="12" r="2"/><path d="M12 3v3"/></svg>'
   };
-  var SITEMAP = [
-    { icon: 'radar', color: 'var(--acc)', title: 'Overwatch', tag: "the arm's-length home — glance, decide, get out", items: [
-      { name: 'Home · Needs you', anno: { t: 'PROMOTED', cls: 'promote' }, why: 'Gates rise from rail item #8 to the first thing you see. Review counts and blocked-plan questions surface here too.', provs: [{ t: 'cx-overview' }, { t: 'cx-gates (actionable)' }, { t: 'cx-review (count)' }] },
-      { name: 'Fleet', anno: { t: '4 → 1', cls: 'merge' }, why: "Live board, sessions, orchestrators and punchcards are four rail items describing one question — \"who is working and on what?\" Leases and intents become facets of a session row.", provs: [{ t: 'cx-coord' }, { t: 'cx-sessions (live)' }, { t: 'cx-orchestrators' }, { t: 'cx-punchcards' }] },
-      { name: 'Activity', why: 'The rolling all-sessions log, unchanged — plus the human-lane page folds in as a filter, not a separate URL.', provs: [{ t: 'cx-activity' }, { t: '/console/activity' }] }
-    ] },
-    { icon: 'board', color: '#5EC2E7', title: 'Work', tag: "plans are true north — resume, don't respawn", items: [
-      { name: 'Board', anno: { t: 'VIEW SWITCH', cls: 'vsw' }, why: 'Kanban graduates from a rail pull-out to the primary view; list and graph become a segmented switch on the page — the DUAL_VIEW pattern, made explicit.', provs: [{ t: 'cx-work' }, { t: 'kanban pull-out' }, { t: 'console-3d (work graph)' }] },
-      { name: 'Projects', why: 'Repo pairing, planning repo, working tenants — unchanged, but now feeds Board filters instead of standing alone.', provs: [{ t: 'cx-projects' }] },
-      { name: 'Runs', why: 'Session history splits from the live fleet: archived sessions with their per-run token usage attached, searchable by plan.', provs: [{ t: 'cx-sessions (archive)' }, { t: 'cx-usage (per-run)' }] }
-    ] },
-    { icon: 'brain', color: 'var(--trust)', title: 'Memory', tag: 'the substrate — what the node knows and how fresh it is', items: [
-      { name: 'Facts', anno: { t: '2 → 1', cls: 'merge' }, why: 'cx-facts (by entity prefix) and cx-memory (recent per tenant) are the same data with different lenses — one page, three lenses: by entity · recent · by tenant.', provs: [{ t: 'cx-facts' }, { t: 'cx-memory' }] },
-      { name: 'Tenants & lanes', why: 'Store list with AMR lane policy per tenant; system tenants stay hidden by default.', provs: [{ t: 'cx-tenants' }] },
-      { name: 'Documents · ingest', why: 'What the daemon has read, per tenant — and how to feed it more. Unchanged.', provs: [{ t: 'cx-documents' }] },
-      { name: 'Review', anno: { t: 'COUNT → HOME', cls: 'promote' }, why: 'Contradictions + guarded consolidation live here; the pending count is an Overwatch card because it needs human judgment.', provs: [{ t: 'cx-review' }] },
-      { name: 'Tuning', anno: { t: 'ADVANCED', cls: 'adv' }, why: 'RRF lane weights are expert controls — kept, but behind a disclosure so they stop competing with daily pages.', provs: [{ t: 'cx-lane-weights' }] }
-    ] },
-    { icon: 'shield', color: 'var(--ok)', title: 'Trust', tag: 'regulation is a destination, not a settings page', items: [
-      { name: 'Receipts', anno: { t: 'VIEW SWITCH', cls: 'vsw' }, why: 'CROWN receipt list with the graph pull-out as a view switch; the receipts-vs-console demo becomes the "why receipts" explainer here.', provs: [{ t: 'cx-receipts' }, { t: '/console/receipts-vs-console' }] },
-      { name: 'Gates', why: 'The full Art.14 queue + history + timeout policy. Overwatch shows the actionable slice; this is the canonical record.', provs: [{ t: 'cx-gates' }] },
-      { name: 'Identity', anno: { t: '2 → 1', cls: 'merge' }, why: 'Passports and identity-link ceremonies are one story: who exists, who signs, what links. Device grants (/activate) approve from here too.', provs: [{ t: 'cx-passport' }, { t: 'cx-identity' }, { t: '/activate' }] },
-      { name: 'Policy & posture', anno: { t: 'NEW', cls: 'new' }, why: 'Mediation (capability ladder, foresight) joins a compliance posture panel — the Art.10–15 cards from this concept. Today that story is implicit; regulated buyers need it on one page.', provs: [{ t: 'cx-mediation' }, { t: 'posture panel (new)', 'new': true }] }
-    ] },
-    { icon: 'gauge', color: 'var(--warn)', title: 'Meters', tag: 'cost, capacity, evidence — replaces "Benchmarks" as the 5th section', items: [
-      { name: 'Token burn', why: 'The ground-truth cost lens, unchanged — headline number surfaces as an Overwatch tile.', provs: [{ t: 'cx-cost' }] },
-      { name: 'Usage', why: 'Observation-derived usage aggregates; per-run slices move to Work → Runs.', provs: [{ t: 'cx-usage' }] },
-      { name: 'Storage & node', anno: { t: 'UNBURIED', cls: 'promote' }, why: "Storage breakdown, infra summary, ops health and update/bootstrap status escape the Settings page — they're monitoring, not configuration.", provs: [{ t: 'storage-breakdown' }, { t: 'infra/summary' }, { t: 'ops health' }] },
-      { name: 'Benchmarks', anno: { t: 'NEW', cls: 'new' }, why: 'bench:* facts get a real page — corpus identity, commit, lane flags — with deep links to scorecrux.com for published suites.', provs: [{ t: 'bench:* facts' }, { t: 'ScoreCrux links', 'new': true }] }
-    ] },
-    { icon: 'server', color: 'var(--ink3)', title: 'System', note: 'bottom of rail', tag: 'configure rarely, then leave', items: [
-      { name: 'Settings', why: 'Access posture, embedding endpoint, sync, freshness horizons, retention, appearance, coordination toggles — minus the monitoring sections that moved to Meters.', provs: [{ t: 'cx-settings' }] },
-      { name: 'Integrations', anno: { t: '2 → 1', cls: 'merge' }, why: 'Packs and signed extensions are one catalog with two provenance badges; install stays inert until a passport grant exists.', provs: [{ t: 'cx-integrations' }, { t: 'cx-extensions' }] },
-      { name: 'Developer', why: 'Raw JSON-RPC console and the DX docs scope live under Developer; the GX global-search scope becomes ⌘K everywhere.', provs: [{ t: 'cx-raw' }, { t: 'DX scope' }, { t: 'GX scope → ⌘K' }] }
-    ] }
-  ];
+  // Section accent, keyed by DEST *id* (var(--) tokens only).
+  var SITEMAP_ACCENT = {
+    overwatch: 'var(--acc)', work: 'var(--acc)', memory: 'var(--trust)', trust: 'var(--ok)',
+    meters: 'var(--warn)', system: 'var(--ink3)', canvas: 'var(--acc)', explorer: 'var(--trust)',
+    sitemap: 'var(--acc)', rings: 'var(--trust)'
+  };
+  // One-line operator copy per node — "what you'll find / when to use", grounded
+  // in what each page does TODAY (post M2–M7), honest where feature-gated. Keyed
+  // by page id, plus synthetic keys for the destination-IS-the-page surfaces and
+  // the Overwatch landing root (`#/overwatch`). Missing key → the registry `sub`
+  // (endpoint noise stripped) is the honest fallback.
+  var SITEMAP_META = {
+    '#/overwatch':     'Start here — needs-you, fleet and live pulse at a glance',
+    'cx-overview':     'Daemon posture, readiness and capacity, one screen',
+    'cx-activity':     'Live session stream beside the needs-you and fleet panels',
+    'cx-coord':        'Who is working right now — live sessions and leases',
+    'cx-orchestrators':'Group plans running under one session',
+    'cx-punchcards':   'Advisory path leases, grouped by session',
+    'cx-work':         "ExecPlans as true north — resume, don't respawn",
+    'cx-activity-log': 'The all-sessions live journal — searchable, streaming',
+    'cx-projects':     'Repos, planning target, passports and working tenants',
+    'cx-sessions':     'Who worked, on what plan, with what tokens',
+    'cx-facts':        'Browse and search the whole visible fact store — time-machine included',
+    'cx-memory':       'Recent facts per tenant — system tenants hidden by default',
+    'cx-tenants':      'Memory stores and their AMR lane routing',
+    'cx-documents':    'What the daemon has read — and how to feed it more',
+    'cx-review':       'Contradictions and guarded consolidation, waiting for judgment',
+    'cx-lane-weights': 'Expert RRF lane weights — operator controls',
+    'cx-receipts':     'The signed evidence trail — verify Ed25519 proofs verbatim',
+    'cx-gates':        'Approvals waiting on you — high-risk transitions pause here',
+    'cx-mints':        'Agent-requested passports — review, then accept or reject',
+    'cx-passport':     'Agent and people identities — create and view passports',
+    'cx-identity':     'Cross-daemon identity links — inference proposes, consent disposes',
+    'cx-mediation':    'Engine gateway posture — off on this CPU-only node',
+    'cx-cost':         'Sessions × token burn, with plan attribution',
+    'cx-usage':        'Aggregate call volume and average spend',
+    'cx-settings':     'Access, sync, freshness, retention, appearance — configure rarely',
+    'cx-integrations': 'Installed packs and their passport grants',
+    'cx-extensions':   'Signed third-party manifests — per-passport grants',
+    'cx-workbench':    'Operator tooling — read tools live, writes gated',
+    'cx-raw':          'Raw JSON-RPC console — scopes attach automatically',
+    'canvas:board':    'Size-adaptive tile dashboard — drag, pan, expand in place',
+    'canvas:graph':    'Relation graph — real edges, ring layout when zoomed out',
+    'canvas:tree':     'Plan tree — colour-coded by kind and state, filterable',
+    'explorer':        'Search the corpus — local retrieval or mediated WikiCrux',
+    'sitemap':         "You're here — the whole console, one guided map",
+    'rings':           'Rings-clock landing prototype — live against this daemon'
+  };
+  // Honest per-node badges — access posture + feature-gating, stated on the card.
+  var SITEMAP_BADGE = {
+    'cx-lane-weights': { t: 'OPERATOR', cls: 'op' },
+    'cx-mints':        { t: 'OPERATOR', cls: 'op' },
+    'cx-raw':          { t: 'OPERATOR', cls: 'op' },
+    'cx-identity':     { t: 'FEATURE-GATED', cls: 'gate' },
+    'cx-mediation':    { t: 'ENGINE OFF', cls: 'gate' },
+    'rings':           { t: 'PROTOTYPE', cls: 'proto' }
+  };
+  // Recommended first-run path (node keys, in order). Rendered as small numerals
+  // on the matching cards + a legend; steps whose node is absent in this posture
+  // are skipped so the numbering stays honest.
+  var SITEMAP_START = ['#/overwatch', 'cx-sessions', 'cx-facts', 'cx-receipts'];
+  var SITEMAP_START_LABEL = { '#/overwatch': 'Overwatch', 'cx-sessions': 'Sessions', 'cx-facts': 'Facts', 'cx-receipts': 'Receipts' };
+
+  // Strip trailing "· /v1/…" endpoint noise from a registry sub for map display.
+  function siteMapCleanSub(sub) {
+    if (!sub) { return ''; }
+    return String(sub).replace(/\s*·\s*\/v1\/\S*/g, '').trim();
+  }
+
+  // Build the map sections from the live registry. Returns [{ dest, nodes:[{ key,
+  // name, href, sub }] }]. Pro-only pages are omitted (Pro mode owns them);
+  // operator-only pages are omitted for a customer view so every rendered node
+  // resolves to a live route in the current posture (no dead nodes).
+  function siteMapSections(isOp) {
+    var pages = (typeof window !== 'undefined') ? window.CruxPages : null;
+    if (!pages || !pages.DESTS) { return []; }
+    var byDest = {};
+    Object.keys(pages.PAGES).forEach(function (id) {
+      var p = pages.PAGES[id];
+      (byDest[p.dest] = byDest[p.dest] || []).push(p);
+    });
+    return pages.DESTS.map(function (d) {
+      var nodes = [];
+      var list = byDest[d.id] || [];
+      if (list.length) {
+        if (d.id === 'overwatch') {
+          nodes.push({ key: '#/overwatch', name: 'Home · at a glance', href: '#/overwatch' });
+        }
+        list.forEach(function (p) {
+          if (p.pro === true) { return; }               // Pro-mode-only → not on this map
+          if (p.operatorOnly && !isOp) { return; }      // customer can't reach it → skip
+          nodes.push({ key: p.id, name: p.title, href: '#/' + d.id + '/' + p.id, sub: p.sub });
+        });
+      } else if (d.id === 'canvas') {
+        nodes.push({ key: 'canvas:board', name: 'Board', href: '#/canvas/board' });
+        nodes.push({ key: 'canvas:graph', name: 'Graph', href: '#/canvas/graph' });
+        nodes.push({ key: 'canvas:tree', name: 'Tree', href: '#/canvas/tree' });
+      } else {
+        // explorer / sitemap / rings — the destination IS the page.
+        nodes.push({ key: d.id, name: d.label, href: '#/' + d.id });
+      }
+      return { dest: d, nodes: nodes };
+    }).filter(function (s) { return s.nodes.length; });
+  }
+
+  // Resolve which node the operator came FROM (window.CRUX_PREV_HASH) → node key,
+  // for the "you are here" marker. Falls back to the Site map's own node when the
+  // origin is unknown or was the map itself.
+  function siteMapHereKey(prevHash, sections) {
+    var h = String(prevHash || '').replace(/^#\/?/, '');
+    var qi = h.indexOf('?'); if (qi >= 0) { h = h.slice(0, qi); }
+    var parts = h.split('/').filter(Boolean);
+    var dest = parts[0], leaf = parts[1];
+    if (!dest || dest === 'sitemap') { return 'sitemap'; }
+    if (dest === 'canvas') { return 'canvas:' + (leaf === 'graph' || leaf === 'tree' ? leaf : 'board'); }
+    if (dest === 'explorer' || dest === 'rings') { return dest; }
+    if (dest === 'overwatch' && !leaf) { return '#/overwatch'; }
+    var present = {};
+    sections.forEach(function (s) { s.nodes.forEach(function (n) { present[n.key] = s.dest.id; }); });
+    if (leaf && present[leaf]) { return leaf; }         // explicit page node
+    // Dest root with no explicit (or a hidden) page → that section's first node.
+    var hit = null;
+    sections.forEach(function (s) { if (!hit && s.dest.id === dest) { hit = s.nodes[0] && s.nodes[0].key; } });
+    return hit || 'sitemap';
+  }
+
   function renderSiteMap(host) {
     host.textContent = '';
+    var isOp = (typeof window !== 'undefined' && window.CRUX_POSTURE === 'operator');
+    var sections = siteMapSections(isOp);
+    var prev = (typeof window !== 'undefined' && window.CRUX_PREV_HASH) || '';
+    var hereKey = siteMapHereKey(prev, sections);
+
+    // Start-here numerals — number only the steps whose node is present.
+    var present = {};
+    sections.forEach(function (s) { s.nodes.forEach(function (n) { present[n.key] = true; }); });
+    var stepOf = {}; var step = 0;
+    SITEMAP_START.forEach(function (k) { if (present[k]) { step++; stepOf[k] = step; } });
+
     var grid = el('div', { 'class': 'map-grid' });
-    SITEMAP.forEach(function (s) {
+    var nodeCount = 0;
+    sections.forEach(function (s) {
+      var d = s.dest;
       var sec = el('div', { 'class': 'map-sec' });
-      sec.style.setProperty('--sec-c', s.color);
-      var ico = el('span', { 'class': 'map-ico' }); ico.innerHTML = SITEMAP_ICONS[s.icon] || '';
-      var icoSvg = ico.querySelector('svg'); if (icoSvg) { icoSvg.setAttribute('width', '16'); icoSvg.setAttribute('height', '16'); }
-      var h = el('h3', null, [ico, doc().createTextNode(s.title)]);
-      if (s.note) { h.appendChild(el('span', { 'class': 'map-h-note', text: ' · ' + s.note })); }
-      sec.appendChild(h);
-      sec.appendChild(el('div', { 'class': 'tag', text: s.tag }));
-      s.items.forEach(function (it) {
-        var b = el('b', null, [doc().createTextNode(it.name)]);
-        if (it.anno) { b.appendChild(el('span', { 'class': 'anno ' + it.anno.cls, text: it.anno.t })); }
-        var pg = el('div', { 'class': 'map-page' }, [b, el('div', { 'class': 'why', text: it.why })]);
-        if (it.provs && it.provs.length) {
-          var provs = el('div', { 'class': 'provs' });
-          it.provs.forEach(function (pv) { provs.appendChild(el('span', { 'class': 'prov' + (pv['new'] ? ' new' : ''), text: pv.t })); });
-          pg.appendChild(provs);
-        }
-        sec.appendChild(pg);
+      if (sec.style && sec.style.setProperty) { sec.style.setProperty('--sec-c', SITEMAP_ACCENT[d.id] || 'var(--acc)'); }
+      var ico = el('span', { 'class': 'map-ico' }); ico.innerHTML = SITEMAP_ICONS[d.icon] || '';
+      if (ico.querySelector) { var icoSvg = ico.querySelector('svg'); if (icoSvg) { icoSvg.setAttribute('width', '16'); icoSvg.setAttribute('height', '16'); } }
+      // Header links to the destination root.
+      var head = el('a', { 'class': 'map-head', href: '#/' + d.id },
+        [el('h3', null, [ico, doc().createTextNode(d.label)])]);
+      sec.appendChild(head);
+      sec.appendChild(el('div', { 'class': 'tag', text: d.sub || '' }));
+      s.nodes.forEach(function (n) {
+        nodeCount++;
+        var isHere = (n.key === hereKey);
+        var a = el('a', { 'class': 'map-page' + (isHere ? ' is-here' : ''), href: n.href });
+        if (isHere) { a.setAttribute('aria-current', 'page'); }
+        var b = el('b');
+        if (stepOf[n.key]) { b.appendChild(el('span', { 'class': 'map-step', 'aria-hidden': 'true', text: String(stepOf[n.key]) })); }
+        b.appendChild(doc().createTextNode(n.name));
+        var badge = SITEMAP_BADGE[n.key];
+        if (badge) { b.appendChild(el('span', { 'class': 'anno ' + badge.cls, text: badge.t })); }
+        if (isHere) { b.appendChild(el('span', { 'class': 'map-here', text: 'YOU ARE HERE' })); }
+        a.appendChild(b);
+        a.appendChild(el('div', { 'class': 'why', text: SITEMAP_META[n.key] || siteMapCleanSub(n.sub) }));
+        a.appendChild(el('div', { 'class': 'map-route', text: n.href }));
+        sec.appendChild(a);
       });
       grid.appendChild(sec);
     });
     host.appendChild(grid);
+
+    // Footer: recommended first-run path + honest counts.
     var note = el('div', { 'class': 'map-note' });
-    note.innerHTML =
-      '<b>The count:</b> today\'s console is 26 flat rail items in the CX scope plus 4 sibling scopes (DX · GX · AX · IX). This arrangement lands the same surface in <b>5 destinations + System</b> — 9 pages merge into 4, three buried things get promoted (gates, review, node health), two get built new (posture, benchmarks), and nothing is dropped. The 2D|3D substrate switch and the kanban/graph pull-outs survive as per-page view switches. Phone gets Overwatch · Work · Trust + More; Memory, Meters and System sit behind More because approving a gate at a bus stop is real and re-tuning lane weights is not.'
-      + '<br><br><b>The function census behind this map:</b> Crux Daemon exposes 118 HTTP routes (~40 groups), 114 registered MCP tools (14 live at free tier — the console renders from the capability plan, not the registry), 98 corecruxctl subcommands; CruxEngine adds 295 paths on port 14343 + 164 on 14344. ≈789 functions total, each assigned a destination in <span class="mono">PlanCrux/docs/architecture/function-map-daemon-engine-2026-07-03.md</span>. Engine functions reach this UI only through daemon-mediated proxy routes (the lane-weights / gpu1 precedent) — one origin, one passport, receipts on every cross-system mutation.';
+    var legend = el('div', { 'class': 'map-legend' });
+    legend.appendChild(el('span', { 'class': 'map-legend-h', text: 'New here? Follow the path:' }));
+    SITEMAP_START.forEach(function (k) {
+      if (!stepOf[k]) { return; }
+      legend.appendChild(el('span', { 'class': 'map-legend-step' },
+        [el('span', { 'class': 'map-step', text: String(stepOf[k]) }), doc().createTextNode(' ' + (SITEMAP_START_LABEL[k] || k))]));
+    });
+    note.appendChild(legend);
+    var count = el('p', { 'class': 'map-count' }, [
+      el('b', { text: sections.length + ' destinations · ' + nodeCount + ' surfaces.' }),
+      doc().createTextNode(' Every card is a live link to its route — derived from the page registry, so this map cannot drift from the nav. Operator-only and feature-gated surfaces are labelled; the highlighted card is where you came from.')
+    ]);
+    note.appendChild(count);
     host.appendChild(note);
   }
 

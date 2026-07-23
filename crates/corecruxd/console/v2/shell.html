@@ -999,6 +999,47 @@
   .map-note .mono { font-family: var(--font-mono); font-size: 10px; color: var(--ink2); }
   @media (max-width: 900px) { .map-grid { grid-template-columns: 1fr; } }
 
+  /* ---- Site map M8: nodes are real links; you-are-here + start-here markers -
+     Every .map-page is an <a href="#/…"> to a registered route. The header links
+     to the destination root. Markers use var(--) tokens only. */
+  a.map-head { display: block; text-decoration: none; color: inherit; }
+  a.map-head:hover h3 { color: var(--sec-c, var(--acc)); }
+  a.map-page {
+    display: block; text-decoration: none; color: inherit;
+    padding: 9px 8px; margin: 0 -8px; border-radius: 8px;
+    transition: background .14s ease, box-shadow .14s ease;
+  }
+  a.map-page:hover { background: var(--surface2); }
+  a.map-page:focus-visible { outline: 2px solid var(--acc); outline-offset: 1px; }
+  a.map-page.is-here {
+    background: color-mix(in srgb, var(--acc) 10%, transparent);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--acc) 55%, transparent);
+  }
+  .map-route {
+    font-family: var(--font-mono); font-size: 9px; color: var(--ink3);
+    margin-top: 4px; opacity: 0; transition: opacity .14s ease;
+  }
+  a.map-page:hover .map-route, a.map-page.is-here .map-route { opacity: 1; }
+  .map-here {
+    font-family: var(--font-mono); font-size: 8px; font-weight: 700; letter-spacing: .1em;
+    padding: 2px 6px; border-radius: 6px; color: var(--acc);
+    background: color-mix(in srgb, var(--acc) 16%, transparent);
+  }
+  .map-step {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 16px; height: 16px; flex: none; border-radius: 50%;
+    font-family: var(--font-mono); font-size: 9.5px; font-weight: 700;
+    color: var(--acc); border: 1.5px solid var(--acc); background: transparent;
+  }
+  .anno.op    { background: var(--surface2); color: var(--ink2); }
+  .anno.gate  { background: color-mix(in srgb, var(--warn) 14%, transparent); color: var(--warn); }
+  .anno.proto { background: color-mix(in srgb, var(--trust) 14%, transparent); color: var(--trust); }
+  .map-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 11px; }
+  .map-legend-h { font-size: 12.5px; font-weight: 650; color: var(--ink); }
+  .map-legend-step { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--ink2); }
+  .map-count { font-size: 12px; color: var(--ink2); line-height: 1.6; margin: 0; }
+  .map-count b { color: var(--ink); }
+
   /* Overwatch page nav (right column) — the nav-family section that replaces the
      suppressed sub-nav pill row. Pills stack; active state via the shared .pill
      rule. 44px targets for the primary nav. */
@@ -2758,6 +2799,9 @@
   // ---- Boot state --------------------------------------------------------
   var BOOT = { version: null, summary: null, health: 'loading', reason: '' };
   window.CRUX_RUNTIME_CAPABILITIES = null;
+  // The hash the operator navigated FROM — read by the Site map's "you are here"
+  // marker (M8). Updated on every hashchange from the event's oldURL.
+  window.CRUX_PREV_HASH = window.CRUX_PREV_HASH || '';
   // Which content the left rail currently holds: 'dest' (the destination nav) or
   // 'docs' (the Documents-mode tree). renderDestination restores 'dest' when it
   // finds the rail swapped to the tree (leaving Documents mode).
@@ -3431,7 +3475,15 @@
     }
     var scrim = document.getElementById('sheetScrim');
     if (scrim) { scrim.addEventListener('click', closeSheet); }
-    window.addEventListener('hashchange', route);
+    window.addEventListener('hashchange', function (ev) {
+      // Track where the operator came from so the Site map can mark "you are
+      // here" against their previous location (M8). hashchange carries oldURL.
+      if (ev && ev.oldURL) {
+        var oi = ev.oldURL.indexOf('#');
+        window.CRUX_PREV_HASH = (oi >= 0) ? ev.oldURL.slice(oi) : '';
+      }
+      route();
+    });
     document.addEventListener('keydown', onKey);
     document.addEventListener('keydown', function (ev) { if (ev.key === 'Escape') { closeSheet(); } });
     route();   // paint the shell immediately; boot() fills in live data
