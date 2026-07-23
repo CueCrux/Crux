@@ -15,9 +15,27 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default per-attempt boot budget. A cold corecruxd boot builds/loads the
+/// `.ccxi` index and passes the `/readyz` gates (routing_loaded, capacity,
+/// control_evidence, …); under a loaded self-hosted CI runner — or `cargo
+/// llvm-cov` instrumentation — that regularly exceeds the old fixed 10s and
+/// flaked PR CI even on near-solo reruns. 30s comfortably covers a cold boot
+/// while still failing fast on a genuinely wedged daemon. Override without a
+/// rebuild via `CORECRUXD_STARTUP_TIMEOUT_SECS` so CI can tune per runner.
+const STARTUP_TIMEOUT_SECS_DEFAULT: u64 = 30;
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(750);
 const START_ATTEMPTS: usize = 3;
+
+/// Per-attempt daemon boot timeout, honouring `CORECRUXD_STARTUP_TIMEOUT_SECS`
+/// (falling back to [`STARTUP_TIMEOUT_SECS_DEFAULT`] when unset or unparseable).
+fn startup_timeout() -> Duration {
+    let secs = std::env::var("CORECRUXD_STARTUP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(STARTUP_TIMEOUT_SECS_DEFAULT);
+    Duration::from_secs(secs)
+}
 
 fn repo_root() -> PathBuf {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -157,7 +175,7 @@ impl TestDaemon {
         let mut failures = Vec::new();
         for attempt in 1..=START_ATTEMPTS {
             match Self::spawn_once(agent_token) {
-                Ok(mut daemon) => match daemon.wait_healthy(STARTUP_TIMEOUT) {
+                Ok(mut daemon) => match daemon.wait_healthy(startup_timeout()) {
                     Ok(()) => return daemon,
                     Err(err) => {
                         failures.push(format!("attempt {attempt}: {err}"));
