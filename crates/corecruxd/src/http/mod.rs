@@ -1377,6 +1377,10 @@ pub(crate) fn router_with_route_auth(
         )
         .route("/v1/console/passports", get(self::console::get_console_passports))
         .route("/v1/console/sessions", get(self::console::get_console_sessions))
+        .route(
+            "/v1/console/sessions/detail",
+            get(self::console::get_console_session_detail),
+        )
         .route("/v1/console/facts", get(self::console::get_console_facts))
         .route(
             "/v1/console/facts/add",
