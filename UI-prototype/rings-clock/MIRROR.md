@@ -178,15 +178,52 @@ This is acceptable ONLY because the container is published on `127.0.0.1` and
 runs against a throwaway copy. Never carry these two lines to any non-loopback
 deployment. API calls need no Authorization header against the mirror.
 
-## Known mirror gap: token_burn is null
+## token_burn is null — ROOT CAUSE + FIX (console-surfaces-remediation M5)
 
-Prod's `/v1/work` items carry `token_burn` (cost attribution over session
-events); the mirror returns `token_burn: null` for the same items despite
-`CORECRUXD_FEATURE_COST_LENS=1` and the copied `session-events.jsonl` —
-attribution isn't being materialised from the copied events (root cause not
-yet chased; likely an aggregation/warm path that keys off something outside
-the data volume). The Rings page detects the all-zero board and falls back to
-its snapshot token profile, labelling the tile "255M (snap)".
+**Root cause (definitive).** `/v1/work` `token_burn` and `/v1/cost/report` both
+read a **process-global, in-memory** cost store (`corecruxd/src/cost.rs`,
+`OnceLock<Mutex<CostStore>>` — "pure in-memory, no disk"). That store is
+populated **only** by `POST /v1/cost/report`, which `corecruxctl session cost
+--post` sends after parsing the operator's **local** Claude Code transcripts
+(the daemon never sees a transcript). So a fresh daemon process has an **empty**
+store and returns `token_burn: null` / `has_report: false` until reports are
+(re-)posted. It was never about the copied data volume — the mirror nulled
+because it was a fresh process with nothing posted. **This empties prod too on
+any restart**, until the SessionEnd hook / `cost-sweep` re-posts.
+
+**Fix (this branch).** `cost.rs` now journals every accepted POST to an
+append-only `<data_dir>/cost/reports.jsonl` and **replays it into the store at
+startup** (latest line per `(tenant, session)` wins — same semantics the store
+already had). Enabled only when `CORECRUXD_FEATURE_COST_LENS` is on; no config,
+no compaction (tiny file), malformed lines are warn+skipped. So cost attribution
+now **survives a restart** — posted once, it persists. `GET /v1/cost/report`'s
+`sessions[]` picker was also extended (additive) with the window
+(`started_at`/`ended_at`), `context_tokens`, `output_tokens`, `actor_passport`,
+and `execplan_slugs` the `cx-cost` sessions×burn page renders.
+
+**Populate the mirror** (`/home/myles/crux-prod-mirror/populate-cost.sh`):
+
+```bash
+MIRROR_BASE=http://127.0.0.1:14802 ./populate-cost.sh
+```
+
+It runs `corecruxctl session cost --file <t> --json` over every transcript under
+`~/.claude/projects`, **strips the only content-bearing field** before posting,
+and POSTs the numeric/metadata skeleton. **Privacy:** the `CostReport` is mostly
+token counts / windows / plan metadata, but `top_blocks[].preview` carries
+≤80-char excerpts of tool results / user prompts / assistant prose (thinking is
+redacted). The M5 privacy gate forbids posting conversation content **anywhere**,
+so the script sets `top_blocks = []` (jq) — retaining headline / measured /
+window / `execplan_slugs` / buckets (coarse tags) / levers (advice + tool names),
+which is everything the page and `token_burn` attribution need — and a
+content-guard refuses to post if any preview survives the strip. Verified: the
+on-disk journal has **0** non-empty `top_blocks` / **0** `preview` keys — zero
+conversation content at rest.
+
+After M5's persistence lands, the script only needs to run **once** — a mirror
+(or prod) restart replays the journal instead of re-posting. On this data it
+posts 828 transcripts → 83 distinct sessions (latest-wins) and stamps
+`token_burn` on **390 / 1082** work items (link 22 · mixed 27 · window 341).
 
 ## Known daemon gap: no paged facts listing
 

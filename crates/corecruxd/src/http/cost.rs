@@ -90,6 +90,9 @@ pub(super) async fn post_cost_report(
         let mut store = cost::global().lock().await;
         store.put(body.tenant_id, session_id, actor, body.report)
     };
+    // Restart-durability: journal the accepted report (append-only, latest-wins
+    // on replay). Non-fatal — the in-memory store above is already authoritative.
+    cost::append_report_to_journal(&stored);
 
     (
         StatusCode::CREATED,

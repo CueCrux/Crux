@@ -2417,6 +2417,7 @@
     if (page.id === 'cx-activity-log') { container.textContent = ''; renderActivityLog(container); return Promise.resolve(); }
     if (page.id === 'cx-facts') { container.textContent = ''; renderFactsBrowser(container); return Promise.resolve(); }
     if (page.id === 'cx-sessions') { container.textContent = ''; renderSessionsBrowser(container); return Promise.resolve(); }
+    if (page.id === 'cx-cost') { container.textContent = ''; renderCostBrowser(container); return Promise.resolve(); }
     if (page.operatorOnly && !isOperator()) {
       renderSections(container, [{ h: page.title, wide: true, controls: [
         { t: 'info', label: 'operator only', v: 'This surface is only available in operator posture.' },
@@ -6145,6 +6146,262 @@
     load();
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  //  cx-cost — sessions × token burn (console-surfaces-remediation M5)
+  //
+  //  Custom-rendered like renderSessionsBrowser: a table of one row per posted
+  //  session cost report, filters (passport / date range / plan / min-burn), a
+  //  totals row, and a top-burn horizontal bar chart. Data comes from the
+  //  in-memory cost store via GET /v1/cost/report (sessions[] carries the window,
+  //  burn totals, poster passport, and producer-derived execplan_slugs — the
+  //  additive M5 fields); the ExecPlan join is client-side over /v1/work.
+  //
+  //  Honesty: the store is POST-fed by `corecruxctl session cost --post` and gated
+  //  by CORECRUXD_FEATURE_COST_LENS — the empty state names both. A session that
+  //  carries execplan_slugs links PRECISELY to those plans (method "link"); one
+  //  without falls back to window-overlap on the board (method "window-inferred"),
+  //  labelled so it never reads as falsely precise.
+  //  Through-client only (fetchJSON → CruxApi.get), el()/textContent, no innerHTML.
+  // ─────────────────────────────────────────────────────────────────────────
+  function renderCostBrowser(host) {
+    host.textContent = '';
+    function arr(v) { return Array.isArray(v) ? v : []; }
+    function compactN(n) {
+      if (typeof n !== 'number' || !isFinite(n)) { return '—'; }
+      if (n >= 1e6) { return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + 'M'; }
+      if (n >= 1000) { var k = n / 1000; return (k >= 100 ? Math.round(k) : k.toFixed(1)) + 'k'; }
+      return String(n);
+    }
+    function shortId(id) { var s = String(id || ''); return s.length > 10 ? s.slice(0, 8) + '…' : (s || '(no id)'); }
+    function tsOf(s) { var t = Date.parse(s.started_at || s.received_at || s.generated_at || ''); return isFinite(t) ? t : null; }
+    function fmtDay(iso) { var t = Date.parse(iso || ''); if (!isFinite(t)) { return '—'; } try { return new Date(t).toISOString().slice(0, 16).replace('T', ' '); } catch (e) { return '—'; } }
+    function windowLabel(s) {
+      if (s.started_at && s.ended_at) {
+        var a = fmtDay(s.started_at), b = Date.parse(s.ended_at); var bt = isFinite(b) ? new Date(b).toISOString().slice(11, 16) : '';
+        return a + (bt ? ('→' + bt) : '');
+      }
+      return 'rcvd ' + fmtDay(s.received_at);
+    }
+    function isLinked(s) { return arr(s.execplan_slugs).length > 0; }
+    function planIdsFor(s) { return arr(s.execplan_slugs).map(function (sl) { return 'execplan:' + sl; }); }
+
+    var state = { all: [], plans: {}, q: '', passport: '', plan: '', minBurn: 0, from: '', to: '', loading: false, token: 0 };
+
+    // ---- toolbar (filters) ----
+    var searchInput = el('input', { 'class': 'facts-input', type: 'search', placeholder: 'filter id / source / passport / plan…', 'aria-label': 'filter sessions' });
+    var passportSel = el('select', { 'class': 'facts-input', 'aria-label': 'passport filter' });
+    var planSel = el('select', { 'class': 'facts-input', 'aria-label': 'plan filter' });
+    var minBurnInput = el('input', { 'class': 'facts-input facts-asof', type: 'number', min: '0', step: '1000', placeholder: 'min output tok', 'aria-label': 'minimum output-token burn' });
+    var fromInput = el('input', { 'class': 'facts-input facts-asof', type: 'date', 'aria-label': 'from date' });
+    var toInput = el('input', { 'class': 'facts-input facts-asof', type: 'date', 'aria-label': 'to date' });
+    function field(label, node) { return el('label', { 'class': 'facts-field' }, [el('span', { text: label }), node]); }
+    var toolbar = el('div', { 'class': 'facts-toolbar' }, [
+      field('filter', searchInput), field('passport', passportSel), field('plan', planSel),
+      field('min burn (out)', minBurnInput), field('from', fromInput), field('to', toInput)
+    ]);
+    var countLine = el('p', { 'class': 'facts-count' });
+    var banner = el('div', { 'class': 'facts-banner' }); banner.style.display = 'none';
+    var chartWrap = el('div', { 'class': 'cost-chart' });
+    var totalsRow = el('div', { 'class': 'cost-totals' });
+    var listWrap = el('div', { 'class': 'facts-groups' });
+    host.appendChild(el('div', { 'class': 'facts-browser' }, [toolbar, countLine, banner, chartWrap, totalsRow, listWrap]));
+
+    function opt(sel, value, label) { sel.appendChild(el('option', { value: value }, [label])); }
+    function fillSelects() {
+      passportSel.textContent = ''; planSel.textContent = '';
+      opt(passportSel, '', 'all passports'); opt(planSel, '', 'all plans');
+      var pps = {}, pls = {};
+      state.all.forEach(function (s) {
+        var pp = s.actor_passport || ''; if (pp && pp !== '__anon__') { pps[pp] = 1; }
+        arr(s.execplan_slugs).forEach(function (sl) { pls[sl] = 1; });
+      });
+      Object.keys(pps).sort().forEach(function (p) { opt(passportSel, p, p); });
+      Object.keys(pls).sort().forEach(function (p) { opt(planSel, p, p); });
+      passportSel.value = state.passport; planSel.value = state.plan;
+    }
+
+    function matches(s) {
+      if (state.q) {
+        var hay = ((s.session_id || '') + ' ' + (s.source || '') + ' ' + (s.actor_passport || '') + ' ' + arr(s.execplan_slugs).join(' ')).toLowerCase();
+        if (hay.indexOf(state.q) < 0) { return false; }
+      }
+      if (state.passport && s.actor_passport !== state.passport) { return false; }
+      if (state.plan && arr(s.execplan_slugs).indexOf(state.plan) < 0) { return false; }
+      if (state.minBurn > 0 && !((s.output_tokens || 0) >= state.minBurn)) { return false; }
+      if (state.from || state.to) {
+        var t = tsOf(s); if (t == null) { return false; }
+        if (state.from) { var f = Date.parse(state.from + 'T00:00:00Z'); if (isFinite(f) && t < f) { return false; } }
+        if (state.to) { var e = Date.parse(state.to + 'T23:59:59Z'); if (isFinite(e) && t > e) { return false; } }
+      }
+      return true;
+    }
+
+    function chip(cls, text, title) { return el('span', { 'class': cls, title: title || '' }, [text]); }
+    function planChips(s) {
+      if (!isLinked(s)) { return [chip('sess-chip', 'window-inferred', 'no producer link — burn attributes to plans by window-overlap on the board')]; }
+      return planIdsFor(s).map(function (id) {
+        var p = state.plans[id];
+        var txt = id.replace(/^execplan:/, '') + (p && p.state ? (' · ' + p.state) : '');
+        return chip('sess-chip sess-chip-plan', txt, p ? ('ExecPlan (producer link) — ' + (p.title || id)) : (id + ' — not yet on the work board'));
+      });
+    }
+    function methodChip(s) {
+      return isLinked(s)
+        ? chip('sess-chip cost-method link', 'link', 'precise: this session named the plan(s) it worked')
+        : chip('sess-chip cost-method window', 'window', 'coarse: attributed to overlapping plan windows');
+    }
+
+    function rowEl(s) {
+      var head = el('div', { 'class': 'facts-rhead' }, [
+        el('span', { 'class': 'facts-key', text: shortId(s.session_id) }),
+        methodChip(s),
+        el('span', { 'class': 'facts-time', text: windowLabel(s) })
+      ]);
+      var metaChips = el('div', { 'class': 'sess-rmeta' }, [
+        chip('sess-chip', compactN(s.context_tokens || 0) + ' ctx', 'measured context tokens (Σ)'),
+        chip('sess-chip cost-out', compactN(s.output_tokens || 0) + ' out', 'output tokens generated (Σ)'),
+        (s.assistant_turns ? chip('sess-chip', s.assistant_turns + ' turns', 'assistant turns') : null),
+        (s.actor_passport && s.actor_passport !== '__anon__') ? chip('sess-chip sess-chip-pass', s.actor_passport, 'poster passport') : null
+      ].concat(planChips(s)));
+      var sub = el('div', { 'class': 'facts-val', text: s.source || '(no source)' });
+      var detail = el('div', { 'class': 'facts-detail' });
+      var row = el('div', { 'class': 'facts-row', role: 'button', tabindex: '0' }, [head, sub, metaChips, detail]);
+      var opened = false;
+      function toggle() { var o = row.classList.toggle('open'); if (o && !opened) { opened = true; expandDetail(detail, s); } }
+      row.addEventListener('click', function (e) { if (e.target && e.target.closest && (e.target.closest('a') || e.target.closest('.facts-detail'))) { return; } toggle(); });
+      row.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+      return row;
+    }
+    function kvGrid(pairs) {
+      var meta = el('div', { 'class': 'facts-kv' });
+      pairs.forEach(function (kv) { if (kv[1] == null || kv[1] === '') { return; } meta.appendChild(el('span', { 'class': 'facts-kv-k', text: kv[0] })); meta.appendChild(el('span', { 'class': 'facts-kv-v', text: String(kv[1]) })); });
+      return meta;
+    }
+    function sectionLabel(t) { return el('div', { 'class': 'facts-vlabel', text: t }); }
+    function expandDetail(detail, s) {
+      detail.textContent = '';
+      detail.appendChild(sectionLabel('session'));
+      detail.appendChild(kvGrid([
+        ['session id', s.session_id], ['source', s.source],
+        ['window', (s.started_at && s.ended_at) ? (s.started_at + '  →  ' + s.ended_at) : '(no transcript window — placed at ' + (s.received_at || '?') + ')'],
+        ['received', s.received_at], ['generated', s.generated_at]
+      ]));
+      detail.appendChild(sectionLabel('burn'));
+      detail.appendChild(kvGrid([
+        ['context tokens (Σ)', compactN(s.context_tokens || 0) + '  (' + (s.context_tokens || 0) + ')'],
+        ['output tokens (Σ)', compactN(s.output_tokens || 0) + '  (' + (s.output_tokens || 0) + ')'],
+        ['context / turn', compactN(s.context_tokens_per_turn || 0)], ['assistant turns', s.assistant_turns]
+      ]));
+      detail.appendChild(sectionLabel('linked ExecPlan'));
+      if (isLinked(s)) {
+        var list = el('div', { 'class': 'facts-kv' });
+        planIdsFor(s).forEach(function (id) {
+          var p = state.plans[id];
+          list.appendChild(el('span', { 'class': 'facts-kv-k', text: id }));
+          list.appendChild(el('span', { 'class': 'facts-kv-v', text: p ? ((p.title || '—') + (p.state ? (' · ' + p.state) : '') + (p.current_milestone ? (' · ' + p.current_milestone) : '')) : 'not yet on the work board (rsync lag)' }));
+        });
+        detail.appendChild(list);
+        detail.appendChild(el('p', { 'class': 'ctl-desc', text: 'producer link (method "link"): this session named these plans in its transcript — the burn credits them precisely (even-split across N).' }));
+      } else {
+        detail.appendChild(el('p', { 'class': 'ctl-desc sess-empty', text: 'no producer link — this session had no execplan_slugs. Its burn attributes to plans whose fact-window overlaps the session window (method "window", coarse). See the plan board /v1/work for the per-plan token_burn rollup.' }));
+      }
+      detail.appendChild(el('p', { 'class': 'ctl-desc', text: 'attribution recomputed read-time in cost_attribution.rs; passport = poster identity (' + (s.actor_passport || '__anon__') + ').' }));
+    }
+
+    function renderChart(visible) {
+      chartWrap.textContent = '';
+      var top = visible.slice().sort(function (a, b) { return (b.output_tokens || 0) - (a.output_tokens || 0); }).slice(0, 10);
+      if (!top.length || (top[0].output_tokens || 0) <= 0) { return; }
+      chartWrap.appendChild(el('div', { 'class': 'cost-chart-title', text: 'Top sessions by output tokens' }));
+      var max = top[0].output_tokens || 1;
+      top.forEach(function (s) {
+        var pct = Math.max(2, Math.round(100 * (s.output_tokens || 0) / max));
+        var fill = el('div', { 'class': 'cost-bar-fill' }); fill.style.width = pct + '%';
+        chartWrap.appendChild(el('div', { 'class': 'cost-bar' }, [
+          el('div', { 'class': 'cost-bar-label', title: s.session_id || '', text: shortId(s.session_id) }),
+          el('div', { 'class': 'cost-bar-track' }, [fill]),
+          el('div', { 'class': 'cost-bar-val', text: compactN(s.output_tokens || 0) })
+        ]));
+      });
+    }
+    function renderTotals(visible) {
+      totalsRow.textContent = '';
+      if (!visible.length) { return; }
+      var ctx = 0, out = 0;
+      visible.forEach(function (s) { ctx += (s.context_tokens || 0); out += (s.output_tokens || 0); });
+      totalsRow.appendChild(el('span', { 'class': 'cost-totals-k', text: 'TOTALS' }));
+      totalsRow.appendChild(el('span', { 'class': 'cost-totals-v' }, [el('b', { text: compactN(ctx) }), ' context']));
+      totalsRow.appendChild(el('span', { 'class': 'cost-totals-v' }, [el('b', { text: compactN(out) }), ' output']));
+      totalsRow.appendChild(el('span', { 'class': 'cost-totals-v' }, [el('b', { text: String(visible.length) }), ' session' + (visible.length === 1 ? '' : 's')]));
+    }
+    function paintCount(shown) {
+      countLine.textContent = '';
+      var kids = [el('b', { text: String(shown) }), ' shown'];
+      if (state.q || state.passport || state.plan || state.minBurn || state.from || state.to) { kids.push(' (filtered)'); }
+      kids.push(' · '); kids.push(el('b', { text: String(state.all.length) })); kids.push(' session report' + (state.all.length === 1 ? '' : 's') + ' posted');
+      kids.forEach(function (k) { countLine.appendChild(typeof k === 'string' ? doc().createTextNode(k) : k); });
+    }
+    function emptyState() {
+      listWrap.textContent = '';
+      chartWrap.textContent = ''; totalsRow.textContent = '';
+      var box = el('div', { 'class': 'facts-empty ctl-desc' }, [
+        el('p', { text: 'No session cost reports posted for this tenant.' }),
+        el('p', { text: 'The token-burn lens is POST-fed: it renders reports produced by  corecruxctl session cost --post  (which parses your local Claude Code transcript). Nothing is computed until a report is posted.' }),
+        el('p', { text: 'Feature gate: CORECRUXD_FEATURE_COST_LENS must be enabled on the daemon.' })
+      ]);
+      listWrap.appendChild(box);
+      paintCount(0);
+    }
+    function paint() {
+      state.q = (searchInput.value || '').trim().toLowerCase();
+      state.passport = passportSel.value || '';
+      state.plan = planSel.value || '';
+      state.minBurn = Math.max(0, parseInt(minBurnInput.value, 10) || 0);
+      state.from = fromInput.value || ''; state.to = toInput.value || '';
+      if (!state.all.length) { emptyState(); return; }
+      var visible = state.all.filter(matches);
+      renderChart(visible); renderTotals(visible);
+      listWrap.textContent = '';
+      if (!visible.length) { listWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'No sessions match the filters.' })); paintCount(0); return; }
+      visible.forEach(function (s) { listWrap.appendChild(rowEl(s)); });
+      paintCount(visible.length);
+    }
+    function loadPlans() {
+      return fetchJSON('/v1/work?source=all').then(function (res) {
+        var map = {};
+        if (res.ok && res.data) {
+          var items = res.data.work || res.data.items || res.data.work_items || [];
+          items.forEach(function (w) { if (w && typeof w.id === 'string' && w.id.indexOf('execplan:') === 0) { map[w.id] = { state: w.state || null, current_milestone: w.current_milestone || null, title: w.title || null }; } });
+        }
+        state.plans = map;
+      });
+    }
+    function load() {
+      if (state.loading) { return; }
+      state.loading = true; state.token++; var myToken = state.token;
+      listWrap.textContent = ''; listWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'loading…' }));
+      Promise.all([fetchJSON('/v1/cost/report?tenant_id=default&token_budget=4000'), loadPlans()]).then(function (rr) {
+        var res = rr[0];
+        if (myToken !== state.token) { return; }
+        state.loading = false;
+        if (!res.ok || !res.data) {
+          banner.style.display = ''; banner.className = 'facts-banner err';
+          banner.textContent = (res.status === 404)
+            ? 'Cost lens off — set CORECRUXD_FEATURE_COST_LENS=1 on the daemon (GET /v1/cost/report → 404).'
+            : 'Cost report unavailable — ' + (res.status === 0 ? 'daemon unreachable' : 'HTTP ' + res.status) + '.';
+          listWrap.textContent = ''; chartWrap.textContent = ''; totalsRow.textContent = ''; return;
+        }
+        banner.style.display = 'none';
+        state.all = arr(res.data.sessions);
+        fillSelects();
+        paint();
+      });
+    }
+    [searchInput, minBurnInput].forEach(function (n) { n.addEventListener('input', paint); });
+    [passportSel, planSel, fromInput, toInput].forEach(function (n) { n.addEventListener('change', paint); });
+    load();
+  }
+
   // console-surfaces-remediation M4: the activity log is DEFAULT-ON. On open it
   // pulls the all-sessions lane (GET /v1/activity with `session` OMITTED —
   // recent_all across every session for the tenant, cursor-paged by `before` =
@@ -6767,6 +7024,8 @@
     renderFactsBrowser: renderFactsBrowser,
     // M3 (console-surfaces-remediation) — sessions browser + detail drawer.
     renderSessionsBrowser: renderSessionsBrowser,
+    // M5 (console-surfaces-remediation) — sessions × token-burn browser.
+    renderCostBrowser: renderCostBrowser,
     // M10 — Documents mode (the console-as-reader).
     renderDocuments: renderDocuments,
     DOC_REFERENCE: DOC_REFERENCE,
