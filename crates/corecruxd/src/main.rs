@@ -648,6 +648,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         corecrux_memory::FactStore::new()
     }));
+
+    // Cost-report persistence (console-surfaces-remediation M5): replay any
+    // journalled `/v1/cost/report` posts into the in-memory cost store so cost
+    // attribution (cx-cost page + per-ExecPlan token_burn) survives a restart.
+    // No-op unless CORECRUXD_FEATURE_COST_LENS is enabled.
+    crate::cost::init_persistence(&config.data_dir).await;
     let projection_state = {
         let mut ps = corecrux_projections::ProjectionState::default();
         match crate::relations::load_into_state(&config.data_dir, &mut ps) {
