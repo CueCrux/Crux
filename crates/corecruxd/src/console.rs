@@ -51,8 +51,7 @@ const CONSOLE_ALLOWED_ORIGINS_ENV: &str = "CORECRUXD_CONSOLE_ALLOWED_ORIGINS";
 // Default allowlist when `CORECRUXD_CONSOLE_ALLOWED_ORIGINS` is unset: the
 // public console origin plus the two Tailnet-facing origins the daemon is
 // reachable on (host `crux` / its Tailscale IP). Matches the M5 plan intent.
-const DEFAULT_CONSOLE_ALLOWED_ORIGINS: &[&str] =
-    &["https://crux.cuecrux.com", "http://100.70.12.73", "http://crux"];
+const DEFAULT_CONSOLE_ALLOWED_ORIGINS: &[&str] = &["https://crux.cuecrux.com", "http://100.70.12.73", "http://crux"];
 
 // Bundled PNG assets — embedded so the binary can serve them with no on-disk
 // dependency. Dev override (CORECRUXD_CONSOLE_DEV_PATH) falls back to reading
@@ -1017,7 +1016,14 @@ mod tests {
         // dropped — a configured `null` would otherwise match `Origin: null`
         // from sandboxed iframes / local-file contexts. A well-formed http(s)
         // neighbour in the same list survives.
-        for bad in ["null", "file://x", "data:text/html", "example.com", "https://", "ftp://x.example.com"] {
+        for bad in [
+            "null",
+            "file://x",
+            "data:text/html",
+            "example.com",
+            "https://",
+            "ftp://x.example.com",
+        ] {
             let origins = origin_strings(&super::resolve_allowed_origins(bad));
             // Sole bad entry => empty parse => defaults; assert the bad token
             // itself never appears.
