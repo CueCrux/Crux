@@ -23,6 +23,13 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 ed25519-dalek = { workspace = true, features = ["std", "rand_core"] }
+# The M4 Vault integration test (tests/vault_c2pa_m4_integration.rs,
+# #[ignore]-gated) re-verifies the emitted signature against the leaf
+# certificate's own public key (parsed from the envelope x5chain via
+# x509-cert) to isolate the signer's ECDSA-over-BLAKE3 prehash from the
+# SHA-256 es256 verifier — without trusting the on-disk private key.
+p256 = { workspace = true, features = ["std", "ecdsa", "pem"] }
+x509-cert = { workspace = true, features = ["std", "pem"] }
 # Env-mutation tests in c2pa_signer_selector are serialised so they
 # don't race the dual-flag tests in crux-mcp::tools::output_attest.
 serial_test = { workspace = true }
