@@ -500,6 +500,10 @@ pub(crate) fn router_with_route_auth(
             "/v1/incidents/{id}/export",
             axum::routing::post(self::incidents::export_incident),
         )
+        // Static `/list` MUST be registered before the `/{receiptId}` param route
+        // so matchit's static-beats-param precedence routes it to the listing
+        // handler, not the by-id 501/404 path (proven by a router test).
+        .route("/v1/receipts/list", get(self::observations::get_receipts_list))
         .route("/v1/receipts/{receiptId}", get(self::receipts::get_receipt_body_v1))
         .route(
             "/v1/receipts/{receiptId}/signature",
@@ -670,6 +674,10 @@ pub(crate) fn router_with_route_auth(
             axum::routing::post(self::identity_links::post_identity_link_revoke),
         )
         .route(
+            "/v1/identity/candidates/propose",
+            axum::routing::post(self::identity_links::post_identity_candidates_propose),
+        )
+        .route(
             "/v1/identity/candidates/{candidateId}/confirm",
             axum::routing::post(self::identity_links::post_identity_candidate_confirm),
         )
@@ -685,6 +693,7 @@ pub(crate) fn router_with_route_auth(
         .route("/v1/facts/{factId}", axum::routing::delete(self::facts::delete_fact))
         .route("/v1/facts/entity/{entity}", get(self::facts::get_facts_by_entity))
         .route("/v1/facts/export", get(self::facts::export_facts))
+        .route("/v1/facts/list", get(self::facts::list_facts))
         // Substrate (M1: Crux as domain substrate).
         .route("/v1/entities", get(self::entities::list_entities))
         .route("/v1/entities/{kind}/{id}", get(self::entities::get_entity))
@@ -1376,6 +1385,10 @@ pub(crate) fn router_with_route_auth(
         )
         .route("/v1/console/passports", get(self::console::get_console_passports))
         .route("/v1/console/sessions", get(self::console::get_console_sessions))
+        .route(
+            "/v1/console/sessions/detail",
+            get(self::console::get_console_session_detail),
+        )
         .route("/v1/console/facts", get(self::console::get_console_facts))
         .route(
             "/v1/console/facts/add",

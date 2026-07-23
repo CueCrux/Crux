@@ -10,12 +10,12 @@
 // Customer-safe posture: CruxApi (below) exposes only GET (read) routes; its
 // generic get(path) is allowlist-guarded to literal manifest GET paths. The ONLY
 // writes this console can perform live in the separate CruxApiGated object at the
-// bottom — exactly 24 curated, operator-posture-gated mutation(s), no more.
+// bottom — exactly 25 curated, operator-posture-gated mutation(s), no more.
 //
 // Every call is same-origin credentialed; the browser never holds a bearer
 // token (the daemon authenticates the session at its own origin).
 //
-// 163 read endpoints, generated from the route manifest.
+// 166 read endpoints, generated from the route manifest.
 
 /**
  * Append a plain query object to a path as a URL search string.
@@ -65,6 +65,7 @@ const LITERAL_GET_PATHS = Object.freeze({
   '/v1/console/review/contradictions': true,
   '/v1/console/review/queue': true,
   '/v1/console/sessions': true,
+  '/v1/console/sessions/detail': true,
   '/v1/console/settings': true,
   '/v1/console/storage-breakdown': true,
   '/v1/console/summary': true,
@@ -80,6 +81,7 @@ const LITERAL_GET_PATHS = Object.freeze({
   '/v1/extensions/keys': true,
   '/v1/facts': true,
   '/v1/facts/export': true,
+  '/v1/facts/list': true,
   '/v1/features/capabilities': true,
   '/v1/features/capabilities/analysis/coverage': true,
   '/v1/features/capabilities/analysis/gaps': true,
@@ -114,6 +116,7 @@ const LITERAL_GET_PATHS = Object.freeze({
   '/v1/projects': true,
   '/v1/punchcards': true,
   '/v1/quota': true,
+  '/v1/receipts/list': true,
   '/v1/relations': true,
   '/v1/relations/incoming': true,
   '/v1/repos': true,
@@ -269,6 +272,9 @@ const CruxApi = Object.freeze({
   consoleSessions(query) {
     return fetch(withQuery(`/v1/console/sessions`, query), { credentials: 'same-origin' });
   },
+  consoleSessionsDetail(query) {
+    return fetch(withQuery(`/v1/console/sessions/detail`, query), { credentials: 'same-origin' });
+  },
   consoleSettings(query) {
     return fetch(withQuery(`/v1/console/settings`, query), { credentials: 'same-origin' });
   },
@@ -334,6 +340,9 @@ const CruxApi = Object.freeze({
   },
   factsExport(query) {
     return fetch(withQuery(`/v1/facts/export`, query), { credentials: 'same-origin' });
+  },
+  factsList(query) {
+    return fetch(withQuery(`/v1/facts/list`, query), { credentials: 'same-origin' });
   },
   factsByFactId(factId, query) {
     return fetch(withQuery(`/v1/facts/${encodeURIComponent(factId)}`, query), { credentials: 'same-origin' });
@@ -518,6 +527,9 @@ const CruxApi = Object.freeze({
   quota(query) {
     return fetch(withQuery(`/v1/quota`, query), { credentials: 'same-origin' });
   },
+  receiptsList(query) {
+    return fetch(withQuery(`/v1/receipts/list`, query), { credentials: 'same-origin' });
+  },
   receiptsByReceiptId(receiptId, query) {
     return fetch(withQuery(`/v1/receipts/${encodeURIComponent(receiptId)}`, query), { credentials: 'same-origin' });
   },
@@ -674,6 +686,7 @@ const GATED_MUTATIONS = Object.freeze([
   Object.freeze(['POST', '/v1/passports']),
   Object.freeze(['POST', '/v1/console/review/consolidations']),
   Object.freeze(['POST', '/v1/identity/candidates/{candidateId}/confirm']),
+  Object.freeze(['POST', '/v1/identity/candidates/propose']),
   Object.freeze(['PUT', '/v1/console/corecrux/lane-weights']),
   Object.freeze(['DELETE', '/v1/console/corecrux/lane-weights']),
   Object.freeze(['POST', '/v1/admin/restart']),
@@ -720,6 +733,9 @@ const CruxApiGated = Object.freeze({
   },
   identityCandidateConfirm(candidateId, body) {
     return fetch(`/v1/identity/candidates/${encodeURIComponent(candidateId)}/confirm`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  identityCandidatePropose(body) {
+    return fetch(`/v1/identity/candidates/propose`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
   },
   laneWeightsApply(body) {
     return fetch(`/v1/console/corecrux/lane-weights`, { method: 'PUT', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });

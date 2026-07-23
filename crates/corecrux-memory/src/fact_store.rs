@@ -1555,6 +1555,100 @@ impl FactStore {
         }
     }
 
+    /// Paginated, newest-first listing of facts for console / operator surfaces.
+    ///
+    /// Unlike [`Self::export`] (which is the sync-push path: ascending order,
+    /// `since`-anchored), this is the human-browsing path: **descending**
+    /// `(stored_at_millis, fact_id)` order — newest fact first — with an opaque
+    /// cursor that resumes the walk *exactly* even if the cursor fact is later
+    /// filtered out or deleted (the cursor carries the ordering key, not a
+    /// position). Millisecond truncation of the sort key makes the cursor and
+    /// the sort agree to the same resolution, so there is no sub-millisecond
+    /// skew between "where the cursor points" and "how the page is ordered".
+    ///
+    /// Always-excluded, matching `export`: `private` facts (never leave the
+    /// node) and `deleted` (tombstoned) facts. `include_superseded = false`
+    /// additionally drops cross-entity-retired facts (`superseded_by.is_some()`);
+    /// the default of `true` keeps them so the caller can badge them (parity
+    /// with `/v1/facts` + `/v1/console/facts`, which show retired facts today).
+    ///
+    /// All *other* filtering — reserved-prefix exclusion, `entity_prefix`, `q`
+    /// substring, tenant scoping, passport visibility — is the caller's, passed
+    /// as `filter`. The store deliberately does not know the consumer-surface
+    /// reserved list (that lives in `crux-mcp`) or the auth context.
+    ///
+    /// `total_visible` counts everything passing `filter` (+ the built-in
+    /// exclusions and superseded gate) BEFORE pagination — computed once, cheap
+    /// at the ~5k scale this serves.
+    pub fn list_page<F>(
+        &self,
+        cursor: Option<&FactListCursor>,
+        limit: usize,
+        include_superseded: bool,
+        filter: F,
+    ) -> FactListPage
+    where
+        F: Fn(&Fact) -> bool,
+    {
+        // 1. Collect the visible set: never private, never deleted; drop
+        //    cross-entity-retired facts unless the caller opted them in; then
+        //    the caller's own predicate (reserved / prefix / q / tenant).
+        let mut all: Vec<&Fact> = self
+            .facts
+            .values()
+            .filter(|f| !f.private && !f.deleted)
+            .filter(|f| include_superseded || f.superseded_by.is_none())
+            .filter(|f| filter(f))
+            .collect();
+        let total_visible = all.len();
+
+        // 2. Sort DESCENDING by (stored_at_millis, fact_id) — newest first, with
+        //    the unique fact_id as a total-order tiebreak inside a millisecond.
+        all.sort_by(|a, b| {
+            b.stored_at
+                .timestamp_millis()
+                .cmp(&a.stored_at.timestamp_millis())
+                .then_with(|| b.fact_id.cmp(&a.fact_id))
+        });
+
+        // 3. Resume past the cursor: skip every fact whose ordering key is >=
+        //    the cursor's key. Because the slice is DESC-sorted by exactly this
+        //    key, that prefix is contiguous, so `partition_point` finds the
+        //    resume index in O(log n). The cursor fact itself (key == cursor)
+        //    was the last row of the previous page, so `>=` correctly excludes
+        //    it; a cursor pointing at a now-deleted/filtered fact still lands on
+        //    the right boundary because we compare keys, not identities.
+        let start = match cursor {
+            Some(c) => all.partition_point(|f| {
+                (f.stored_at.timestamp_millis(), f.fact_id.as_str()) >= (c.stored_at_ms, c.fact_id.as_str())
+            }),
+            None => 0,
+        };
+        let remaining = &all[start..];
+
+        // 4. Take `limit`; the next cursor is the last taken row's key.
+        let has_more = remaining.len() > limit;
+        let taken: Vec<Fact> = remaining.iter().take(limit).map(|f| (*f).clone()).collect();
+        let next_cursor = if has_more {
+            taken.last().map(|f| {
+                FactListCursor {
+                    stored_at_ms: f.stored_at.timestamp_millis(),
+                    fact_id: f.fact_id.clone(),
+                }
+                .encode()
+            })
+        } else {
+            None
+        };
+
+        FactListPage {
+            facts: taken,
+            next_cursor,
+            has_more,
+            total_visible,
+        }
+    }
+
     /// Hard-delete the content of soft-deleted facts from the on-disk journal
     /// (launch-gate 5.1 — GDPR erasure).
     ///
@@ -2158,6 +2252,53 @@ pub struct FactExportResult {
     pub facts: Vec<Fact>,
     pub next_cursor: Option<String>,
     pub has_more: bool,
+}
+
+/// Opaque descending-listing cursor for [`FactStore::list_page`].
+///
+/// Encodes the ordering key of the last row returned — `(stored_at_millis,
+/// fact_id)` — so the next page resumes exactly. The wire form is
+/// `"<stored_at_ms>:<fact_id>"`: the millisecond field is all digits, so
+/// splitting on the FIRST `:` recovers both halves even though `fact_id`
+/// (`f_<hex>`) never itself contains a colon. Clients MUST treat it as opaque:
+/// only hand back a `next_cursor` from a prior response, never construct one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FactListCursor {
+    pub stored_at_ms: i64,
+    pub fact_id: String,
+}
+
+impl FactListCursor {
+    /// Serialize to the opaque wire form (`"<ms>:<fact_id>"`).
+    pub fn encode(&self) -> String {
+        format!("{}:{}", self.stored_at_ms, self.fact_id)
+    }
+
+    /// Parse the opaque wire form. Returns `None` for anything malformed
+    /// (missing separator, non-numeric millisecond field, empty fact_id) so the
+    /// HTTP layer can answer 400 rather than silently restarting the walk.
+    pub fn decode(raw: &str) -> Option<Self> {
+        let (ms, fact_id) = raw.split_once(':')?;
+        let stored_at_ms: i64 = ms.parse().ok()?;
+        if fact_id.is_empty() {
+            return None;
+        }
+        Some(Self {
+            stored_at_ms,
+            fact_id: fact_id.to_string(),
+        })
+    }
+}
+
+/// One page of [`FactStore::list_page`]: the descending (newest-first) slice
+/// plus the opaque `next_cursor` (present iff `has_more`) and `total_visible`
+/// (the full count matching the caller's filters, before pagination).
+#[derive(Debug)]
+pub struct FactListPage {
+    pub facts: Vec<Fact>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+    pub total_visible: usize,
 }
 
 /// Estimate token count from text (bytes / 4 approximation).
@@ -4487,5 +4628,158 @@ mod tests {
         assert_eq!(f.access_count, 0);
         assert!(f.last_accessed_at.is_none());
         assert_eq!(f.value, "v");
+    }
+
+    // ── FactStore::list_page (console paged listing route, M1) ──────────────
+
+    /// Store a fact and stamp a deterministic `stored_at` so listing order is
+    /// exercised against *distinct* timestamps (not the coarse `Utc::now()` a
+    /// tight loop yields). Returns the new fact_id.
+    fn store_at(store: &mut FactStore, entity: &str, key: &str, value: &str, stored_at_ms: i64) -> String {
+        let fact = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: entity.into(),
+            key: key.into(),
+            value: value.into(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        let id = fact.fact_id.clone();
+        store.facts.get_mut(&id).unwrap().stored_at = DateTime::<Utc>::from_timestamp_millis(stored_at_ms).unwrap();
+        id
+    }
+
+    #[test]
+    fn list_page_walks_full_store_descending_exactly_once() {
+        let mut store = FactStore::new();
+        // 25 facts with strictly increasing stored_at (1000ms..=25000ms).
+        let mut expected_ids = Vec::new();
+        for i in 1..=25i64 {
+            expected_ids.push(store_at(
+                &mut store,
+                "note",
+                &format!("k{i}"),
+                &format!("v{i}"),
+                i * 1000,
+            ));
+        }
+        // Newest-first: expected walk order is the reverse of insertion order.
+        expected_ids.reverse();
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<FactListCursor> = None;
+        let mut pages = 0;
+        loop {
+            let page = store.list_page(cursor.as_ref(), 10, true, |_| true);
+            pages += 1;
+            assert_eq!(page.total_visible, 25);
+            for f in &page.facts {
+                seen.push(f.fact_id.clone());
+            }
+            match page.next_cursor {
+                Some(ref c) => {
+                    assert!(page.has_more);
+                    cursor = Some(FactListCursor::decode(c).expect("round-trip cursor"));
+                }
+                None => {
+                    assert!(!page.has_more);
+                    break;
+                }
+            }
+        }
+        assert_eq!(pages, 3, "25 facts / limit 10 = 3 pages (10 + 10 + 5)");
+        assert_eq!(seen.len(), 25);
+        assert_eq!(seen, expected_ids, "exact newest-first order, no dupes/gaps");
+        let unique: std::collections::BTreeSet<&String> = seen.iter().collect();
+        assert_eq!(unique.len(), 25, "every fact exactly once");
+    }
+
+    #[test]
+    fn list_page_cursor_resumes_even_when_cursor_fact_deleted() {
+        let mut store = FactStore::new();
+        for i in 1..=5i64 {
+            store_at(&mut store, "note", &format!("k{i}"), &format!("v{i}"), i * 1000);
+        }
+        // Page 1 of 2 (newest first: 5000,4000).
+        let page1 = store.list_page(None, 2, true, |_| true);
+        assert_eq!(page1.facts.len(), 2);
+        assert_eq!(page1.facts[0].value, "v5");
+        assert_eq!(page1.facts[1].value, "v4");
+        let cursor = FactListCursor::decode(page1.next_cursor.as_ref().unwrap()).unwrap();
+        // Delete the cursor fact (v4). The cursor carries the ordering key, not
+        // a position, so the next page must still resume at v3 with no dupe.
+        let v4_id = page1.facts[1].fact_id.clone();
+        store.delete(&v4_id);
+        let page2 = store.list_page(Some(&cursor), 2, true, |_| true);
+        assert_eq!(page2.facts[0].value, "v3");
+        assert_eq!(page2.facts[1].value, "v2");
+        assert_eq!(page2.total_visible, 4, "v4 now deleted");
+    }
+
+    #[test]
+    fn list_page_excludes_private_deleted_and_gates_superseded() {
+        let mut store = FactStore::new();
+        store_at(&mut store, "note", "shared", "public", 1000);
+        // Private fact — never listed.
+        let mut priv_req = StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "secret".into(),
+            key: "k".into(),
+            value: "hidden".into(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: true,
+            horizon_class: None,
+            actor: None,
+        };
+        priv_req.private = true;
+        store.store(priv_req);
+        // Deleted fact — never listed.
+        let del_id = store_at(&mut store, "note", "gone", "deleted-value", 2000);
+        store.delete(&del_id);
+        // Superseded fact.
+        let old_id = store_at(&mut store, "note", "retired", "old", 3000);
+        let new_id = store_at(&mut store, "note", "current", "new", 4000);
+        store.mark_superseded(&old_id, &new_id);
+
+        // Default (include_superseded=true): public + current + old(retired) = 3.
+        let page = store.list_page(None, 100, true, |_| true);
+        assert_eq!(page.total_visible, 3);
+        assert!(page
+            .facts
+            .iter()
+            .all(|f| f.value != "hidden" && f.value != "deleted-value"));
+        assert!(page.facts.iter().any(|f| f.value == "old"));
+
+        // include_superseded=false: the retired `old` drops out → 2.
+        let page = store.list_page(None, 100, false, |_| true);
+        assert_eq!(page.total_visible, 2);
+        assert!(page.facts.iter().all(|f| f.value != "old"));
+    }
+
+    #[test]
+    fn list_page_applies_caller_filter_to_visible_count() {
+        let mut store = FactStore::new();
+        store_at(&mut store, "alpha", "k", "one", 1000);
+        store_at(&mut store, "alpha", "k", "two", 2000);
+        store_at(&mut store, "beta", "k", "three", 3000);
+        let page = store.list_page(None, 100, true, |f| f.entity == "alpha");
+        assert_eq!(page.total_visible, 2);
+        assert!(page.facts.iter().all(|f| f.entity == "alpha"));
+    }
+
+    #[test]
+    fn fact_list_cursor_round_trips_and_rejects_garbage() {
+        let c = FactListCursor {
+            stored_at_ms: 1_726_000_000_000,
+            fact_id: "f_deadbeef".into(),
+        };
+        assert_eq!(FactListCursor::decode(&c.encode()), Some(c));
+        assert_eq!(FactListCursor::decode("not-a-cursor"), None);
+        assert_eq!(FactListCursor::decode("notanumber:f_x"), None);
+        assert_eq!(FactListCursor::decode("123:"), None);
     }
 }

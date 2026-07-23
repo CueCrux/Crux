@@ -99,6 +99,9 @@ const GATED_MUTATIONS: &[(&str, &str, &str)] = &[
         "/v1/identity/candidates/{candidateId}/confirm",
         "identityCandidateConfirm",
     ),
+    // console-surfaces-remediation M6: operator-gated "Seed candidates" — runs the
+    // candidate proposers so a fresh workspace can populate /v1/identity/candidates.
+    ("POST", "/v1/identity/candidates/propose", "identityCandidatePropose"),
     ("PUT", "/v1/console/corecrux/lane-weights", "laneWeightsApply"),
     ("DELETE", "/v1/console/corecrux/lane-weights", "laneWeightsReset"),
     ("POST", "/v1/admin/restart", "adminRestart"),

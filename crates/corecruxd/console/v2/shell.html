@@ -999,6 +999,47 @@
   .map-note .mono { font-family: var(--font-mono); font-size: 10px; color: var(--ink2); }
   @media (max-width: 900px) { .map-grid { grid-template-columns: 1fr; } }
 
+  /* ---- Site map M8: nodes are real links; you-are-here + start-here markers -
+     Every .map-page is an <a href="#/…"> to a registered route. The header links
+     to the destination root. Markers use var(--) tokens only. */
+  a.map-head { display: block; text-decoration: none; color: inherit; }
+  a.map-head:hover h3 { color: var(--sec-c, var(--acc)); }
+  a.map-page {
+    display: block; text-decoration: none; color: inherit;
+    padding: 9px 8px; margin: 0 -8px; border-radius: 8px;
+    transition: background .14s ease, box-shadow .14s ease;
+  }
+  a.map-page:hover { background: var(--surface2); }
+  a.map-page:focus-visible { outline: 2px solid var(--acc); outline-offset: 1px; }
+  a.map-page.is-here {
+    background: color-mix(in srgb, var(--acc) 10%, transparent);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--acc) 55%, transparent);
+  }
+  .map-route {
+    font-family: var(--font-mono); font-size: 9px; color: var(--ink3);
+    margin-top: 4px; opacity: 0; transition: opacity .14s ease;
+  }
+  a.map-page:hover .map-route, a.map-page.is-here .map-route { opacity: 1; }
+  .map-here {
+    font-family: var(--font-mono); font-size: 8px; font-weight: 700; letter-spacing: .1em;
+    padding: 2px 6px; border-radius: 6px; color: var(--acc);
+    background: color-mix(in srgb, var(--acc) 16%, transparent);
+  }
+  .map-step {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 16px; height: 16px; flex: none; border-radius: 50%;
+    font-family: var(--font-mono); font-size: 9.5px; font-weight: 700;
+    color: var(--acc); border: 1.5px solid var(--acc); background: transparent;
+  }
+  .anno.op    { background: var(--surface2); color: var(--ink2); }
+  .anno.gate  { background: color-mix(in srgb, var(--warn) 14%, transparent); color: var(--warn); }
+  .anno.proto { background: color-mix(in srgb, var(--trust) 14%, transparent); color: var(--trust); }
+  .map-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 11px; }
+  .map-legend-h { font-size: 12.5px; font-weight: 650; color: var(--ink); }
+  .map-legend-step { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--ink2); }
+  .map-count { font-size: 12px; color: var(--ink2); line-height: 1.6; margin: 0; }
+  .map-count b { color: var(--ink); }
+
   /* Overwatch page nav (right column) — the nav-family section that replaces the
      suppressed sub-nav pill row. Pills stack; active state via the shared .pill
      rule. 44px targets for the primary nav. */
@@ -1809,6 +1850,37 @@
   .cx-graphlink { min-height: 30px; padding: 0 11px; font-size: 12px; align-self: flex-start; }
   @media (max-width: 720px) { .canvas-graph-inspector { width: 100%; max-width: 100%; } }
 
+  /* ---- Canvas graph — zoom-aware LOD (M7) --------------------------------
+     Zoomed OUT the nodes ride concentric type-shells (the ring overview); zoomed
+     IN they snap to the card/force columns. A +/- cluster carries a live label
+     ("overview" / "detail"); wheel + pinch still zoom. */
+  .cv-zoom {
+    position: absolute; left: 14px; bottom: 14px; z-index: 5;
+    display: flex; align-items: center; gap: 2px; padding: 3px;
+    border: 1px solid var(--edge); border-radius: 9px;
+    background: color-mix(in srgb, var(--surface) 92%, var(--bg));
+    backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+    box-shadow: 0 6px 18px rgba(0,0,0,.35);
+  }
+  .cv-zoom-btn {
+    width: 28px; height: 28px; display: inline-flex; align-items: center; justify-content: center;
+    border: none; border-radius: 6px; background: none; color: var(--ink2);
+    font-size: 16px; line-height: 1; cursor: pointer; transition: color .12s ease, background .12s ease;
+  }
+  .cv-zoom-btn:hover { color: var(--ink); background: var(--surface2); }
+  .cv-zoom-mode {
+    font-family: var(--font-mono); font-size: 9px; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--ink3); padding: 0 8px; min-width: 58px; text-align: center;
+  }
+  .cv-graph-note {
+    position: absolute; left: 14px; top: 14px; z-index: 5; max-width: 62%;
+    font-family: var(--font-mono); font-size: 10px; color: var(--ink3);
+    background: color-mix(in srgb, var(--surface) 90%, var(--bg));
+    border: 1px solid var(--edge); border-radius: 7px; padding: 4px 9px;
+  }
+  /* Overview (ring) declutter — drop the id line so the shells read cleanly. */
+  .cv-graph-layer[data-lod="ring"] .cv-card-id { display: none; }
+
   /* ---- Plan tree (M4a) — Project → ExecPlan → Milestone → live session ----
      Indented rows over native <details>; nesting shown by indent + a rotating
      ▸ disclosure caret (CSS-only), not a coloured side-tab. */
@@ -1860,6 +1932,88 @@
     color: var(--crit); border-color: color-mix(in srgb, var(--crit) 55%, var(--edge));
     background: color-mix(in srgb, var(--crit) 12%, var(--surface2));
   }
+
+  /* ---- Plan tree colour + filters (M7) ----------------------------------
+     KIND → the row's left-border STYLE + colour and its type-chip hue (reusing
+     the graph's kind vocabulary: project=acc, execplan=trust, session=ok,
+     kanban(work)=warn, milestone=ink3, unattached=crit). STATE → a subtle row
+     fill + the state-chip hue (reusing the console's status vocabulary:
+     planned=ink3, in_progress/drafting=acc, blocked/review=warn,
+     done/complete/deployed=ok, archive=muted). Additive: existing chips + hash
+     badges + focus/lease chips are untouched. */
+  .plan-tree-row[data-kind] { border-left: 3px solid transparent; }
+  .plan-tree-row[data-kind="project"] { border-left-color: var(--acc); }
+  .plan-tree-row[data-kind="execplan"] { border-left-color: var(--trust); }
+  .plan-tree-row[data-kind="milestone"] { border-left-style: dotted; border-left-color: var(--ink3); }
+  .plan-tree-row[data-kind="session"] { border-left-color: var(--ok); }
+  .plan-tree-row[data-kind="work"] { border-left-style: dashed; border-left-color: var(--warn); }
+  .plan-tree-row[data-kind="unattached"] { border-left-style: dashed; border-left-color: var(--crit); }
+  /* Type chip hue by kind. */
+  .plan-tree-row[data-kind="project"] .plan-tree-type { color: var(--acc); border-color: color-mix(in srgb, var(--acc) 42%, var(--edge)); }
+  .plan-tree-row[data-kind="execplan"] .plan-tree-type { color: var(--trust); border-color: color-mix(in srgb, var(--trust) 42%, var(--edge)); }
+  .plan-tree-row[data-kind="milestone"] .plan-tree-type { color: var(--ink2); }
+  .plan-tree-row[data-kind="session"] .plan-tree-type { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 42%, var(--edge)); }
+  .plan-tree-row[data-kind="work"] .plan-tree-type { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 42%, var(--edge)); }
+  .plan-tree-row[data-kind="unattached"] .plan-tree-type { color: var(--crit); border-color: color-mix(in srgb, var(--crit) 42%, var(--edge)); }
+  /* State fill (subtle). */
+  .plan-tree-row[data-state="planned"] { background: color-mix(in srgb, var(--ink3) 7%, transparent); }
+  .plan-tree-row[data-state="in_progress"], .plan-tree-row[data-state="drafting"] { background: color-mix(in srgb, var(--acc) 10%, transparent); }
+  .plan-tree-row[data-state="blocked"], .plan-tree-row[data-state="review"] { background: color-mix(in srgb, var(--warn) 12%, transparent); }
+  .plan-tree-row[data-state="done"], .plan-tree-row[data-state="complete"], .plan-tree-row[data-state="deployed"] { background: color-mix(in srgb, var(--ok) 9%, transparent); }
+  .plan-tree-row[data-state="archive"] { background: color-mix(in srgb, var(--ink3) 5%, transparent); }
+  /* State chip hue. */
+  .plan-tree-row[data-state="in_progress"] .plan-tree-state, .plan-tree-row[data-state="drafting"] .plan-tree-state { color: var(--acc); }
+  .plan-tree-row[data-state="blocked"] .plan-tree-state, .plan-tree-row[data-state="review"] .plan-tree-state { color: var(--warn); }
+  .plan-tree-row[data-state="done"] .plan-tree-state, .plan-tree-row[data-state="complete"] .plan-tree-state, .plan-tree-row[data-state="deployed"] .plan-tree-state { color: var(--ok); }
+  .plan-tree-row[data-state="planned"] .plan-tree-state, .plan-tree-row[data-state="archive"] .plan-tree-state { color: var(--ink3); }
+
+  .plan-tree-controls { display: flex; flex-direction: column; gap: 10px; margin-bottom: 12px; }
+  .plan-tree-legend {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 7px 13px;
+    padding: 8px 11px; border: 1px solid var(--edge); border-radius: 8px; background: var(--surface);
+  }
+  .plan-tree-legend-h { font-family: var(--font-mono); font-size: 9px; letter-spacing: .14em; text-transform: uppercase; color: var(--ink3); font-weight: 600; }
+  .plan-tree-legend-item { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; color: var(--ink2); }
+  .plan-tree-legend-lab { font-family: var(--font-mono); }
+  .plan-tree-legend-swatch { width: 13px; height: 13px; border-radius: 3px; border: 1.5px solid var(--edge-strong); background: transparent; flex: none; }
+  .plan-tree-legend-swatch[data-kind="project"] { background: var(--acc); border-color: var(--acc); }
+  .plan-tree-legend-swatch[data-kind="execplan"] { background: var(--trust); border-color: var(--trust); }
+  .plan-tree-legend-swatch[data-kind="milestone"] { border-style: dotted; border-color: var(--ink3); }
+  .plan-tree-legend-swatch[data-kind="session"] { background: var(--ok); border-color: var(--ok); }
+  .plan-tree-legend-swatch[data-kind="work"] { border-style: dashed; border-color: var(--warn); }
+  .plan-tree-legend-swatch[data-kind="unattached"] { border-style: dashed; border-color: var(--crit); }
+  .plan-tree-legend-swatch[data-state="planned"] { background: var(--ink3); border-color: var(--ink3); }
+  .plan-tree-legend-swatch[data-state="in_progress"], .plan-tree-legend-swatch[data-state="drafting"] { background: var(--acc); border-color: var(--acc); }
+  .plan-tree-legend-swatch[data-state="blocked"], .plan-tree-legend-swatch[data-state="review"] { background: var(--warn); border-color: var(--warn); }
+  .plan-tree-legend-swatch[data-state="done"], .plan-tree-legend-swatch[data-state="complete"], .plan-tree-legend-swatch[data-state="deployed"] { background: var(--ok); border-color: var(--ok); }
+  .plan-tree-legend-swatch[data-state="archive"] { background: color-mix(in srgb, var(--ink3) 55%, transparent); border-color: var(--ink3); }
+
+  .plan-tree-filters { display: flex; flex-direction: column; gap: 7px; }
+  .plan-tree-filter-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+  .plan-tree-filter-lab { font-family: var(--font-mono); font-size: 9px; letter-spacing: .12em; text-transform: uppercase; color: var(--ink3); min-width: 46px; }
+  .plan-tree-toggle {
+    font-family: var(--font-mono); font-size: 10.5px; padding: 3px 9px; border-radius: 999px;
+    border: 1px solid var(--edge); background: var(--surface2); color: var(--ink3); cursor: pointer;
+    transition: color .12s ease, border-color .12s ease, opacity .12s ease;
+  }
+  .plan-tree-toggle:hover { color: var(--ink); border-color: var(--edge-strong); }
+  .plan-tree-toggle:not(.is-on) { opacity: .42; text-decoration: line-through; }
+  .plan-tree-toggle.is-on[data-kind="project"] { color: var(--acc); border-color: color-mix(in srgb, var(--acc) 45%, var(--edge)); }
+  .plan-tree-toggle.is-on[data-kind="execplan"] { color: var(--trust); border-color: color-mix(in srgb, var(--trust) 45%, var(--edge)); }
+  .plan-tree-toggle.is-on[data-kind="session"] { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--edge)); }
+  .plan-tree-toggle.is-on[data-kind="work"] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--edge)); }
+  .plan-tree-toggle.is-on[data-kind="unattached"] { color: var(--crit); border-color: color-mix(in srgb, var(--crit) 45%, var(--edge)); }
+  .plan-tree-toggle.is-on[data-kind="milestone"] { color: var(--ink); }
+  .plan-tree-toggle.is-on[data-state="in_progress"], .plan-tree-toggle.is-on[data-state="drafting"] { color: var(--acc); border-color: color-mix(in srgb, var(--acc) 45%, var(--edge)); }
+  .plan-tree-toggle.is-on[data-state="blocked"], .plan-tree-toggle.is-on[data-state="review"] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--edge)); }
+  .plan-tree-toggle.is-on[data-state="done"], .plan-tree-toggle.is-on[data-state="complete"], .plan-tree-toggle.is-on[data-state="deployed"] { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--edge)); }
+  .plan-tree-toggle.is-on[data-state="planned"], .plan-tree-toggle.is-on[data-state="archive"] { color: var(--ink2); }
+  .plan-tree-search {
+    flex: 1; min-width: 160px; font-family: inherit; font-size: 12px; padding: 5px 10px;
+    border-radius: 7px; border: 1px solid var(--edge); background: var(--surface2); color: var(--ink);
+  }
+  .plan-tree-search:focus { outline: none; border-color: var(--acc); }
+  .plan-tree-count { font-family: var(--font-mono); font-size: 11px; color: var(--ink3); margin: 0; }
 
   /* Session-detail / evidence view (M4b) — tree + detail split. */
   .plan-tree-layout { display: flex; gap: 14px; align-items: flex-start; flex-wrap: wrap; }
@@ -1951,6 +2105,148 @@
   .act-row.k-execplan, .act-row.k-handoff { border-left-color: #5EC2E7; }
   .act-row.k-error { border-left-color: var(--crit); }
   .act-row.k-reasoning { border-left-color: var(--ink3); }
+  /* M4 default-on all-sessions lane: derived kind-chip counts, clickable session
+     pill, relative-time-with-absolute-on-hover, receipt/fact ref chips. */
+  .act-kc { color: var(--ink3); margin-left: 5px; }
+  .act-sess { font-family: var(--font-mono); font-size: 10px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--edge); background: none; color: var(--acc); cursor: pointer; }
+  .act-sess:hover { border-color: currentColor; }
+  .act-time { cursor: help; }
+  .act-refs { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 5px; }
+  .act-ref { font-family: var(--font-mono); font-size: 9.5px; padding: 2px 7px; border-radius: 999px; border: 1px solid var(--edge); color: var(--ink3); }
+  .act-ref.rc { color: var(--trust); border-color: color-mix(in srgb, var(--trust) 40%, var(--edge)); }
+  .act-ref.fr { color: var(--acc); border-color: color-mix(in srgb, var(--acc) 40%, var(--edge)); }
+
+  /* ---- Facts browser (console-surfaces-remediation M2) — paged /v1/facts/list
+     with entity-prefix groups, server-side search, ingest-time as_of machine,
+     superseded/reserved toggles, and per-row full-value detail. All colour is
+     var(--…) tokens (theme-safe across glass/dark/light). ------------------- */
+  .facts-browser { display: flex; flex-direction: column; gap: 12px; }
+  .facts-toolbar { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
+  .facts-field { display: flex; flex-direction: column; gap: 3px; font-family: var(--font-mono); font-size: 10px; color: var(--ink3); }
+  .facts-input { min-height: 34px; min-width: 220px; padding: 0 10px; border: 1px solid var(--edge); border-radius: 8px; background: var(--surface2); color: var(--ink); font: inherit; font-size: 13px; }
+  .facts-input.facts-asof { min-width: 190px; }
+  .facts-input:focus { border-color: var(--edge-strong); outline: none; }
+  .facts-toggles { display: flex; gap: 8px; align-items: center; }
+  .facts-toggle { font-family: var(--font-mono); font-size: 10.5px; padding: 7px 12px; border-radius: 999px; border: 1px solid var(--edge); background: none; color: var(--ink3); cursor: pointer; }
+  .facts-toggle.on { color: var(--ink); border-color: currentColor; }
+  .facts-count { margin: 0; font-family: var(--font-mono); font-size: 12px; color: var(--ink2); line-height: 1.5; }
+  .facts-count b { color: var(--ink); font-weight: 600; }
+  .facts-asof-tag { margin-left: 8px; font-size: 10px; padding: 2px 8px; border-radius: 999px; border: 1px solid color-mix(in srgb, var(--acc) 45%, var(--edge)); color: var(--acc); }
+  .facts-chips { display: flex; gap: 7px; flex-wrap: wrap; }
+  .facts-chip { font-family: var(--font-mono); font-size: 10.5px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--edge); background: none; color: var(--ink3); cursor: pointer; }
+  .facts-chip.on { color: var(--ink); border-color: currentColor; }
+  .facts-chip .c { color: var(--ink3); margin-left: 5px; }
+  .facts-banner { border: 1px solid var(--edge); border-radius: 10px; padding: 10px 13px; font-size: 12.5px; color: var(--ink2); background: var(--surface2); }
+  .facts-banner.warn { border-color: color-mix(in srgb, var(--warn) 45%, var(--edge)); color: var(--warn); }
+  .facts-banner.err { border-color: color-mix(in srgb, var(--crit) 45%, var(--edge)); color: var(--crit); }
+  .facts-groups { display: flex; flex-direction: column; gap: 8px; }
+  .facts-group { border: 1px solid var(--edge); border-radius: 10px; background: var(--surface); overflow: hidden; }
+  .facts-gsum { display: flex; align-items: center; gap: 9px; padding: 9px 13px; cursor: pointer; font-family: var(--font-mono); font-size: 12px; color: var(--ink); list-style: none; }
+  .facts-gsum::-webkit-details-marker { display: none; }
+  .facts-gdot { width: 8px; height: 8px; border-radius: 999px; background: var(--ink3); flex: none; }
+  .facts-gname { font-weight: 600; }
+  .facts-gcount { margin-left: auto; color: var(--ink3); font-size: 10.5px; }
+  .facts-glist { display: flex; flex-direction: column; gap: 6px; padding: 0 10px 10px; }
+  .facts-row { border: 1px solid var(--edge); border-left: 3px solid var(--ink3); border-radius: 8px; padding: 8px 12px; background: var(--surface2); cursor: pointer; }
+  .facts-row:hover { border-color: var(--edge-strong); }
+  .facts-rhead { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .facts-key { font-family: var(--font-mono); font-size: 12.5px; color: var(--ink); font-weight: 600; }
+  .facts-entity { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink3); }
+  .facts-rbadges { display: flex; gap: 6px; }
+  .facts-time { margin-left: auto; font-family: var(--font-mono); font-size: 10px; color: var(--ink3); }
+  .facts-val { margin-top: 4px; font-size: 12px; color: var(--ink2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .facts-badge { font-family: var(--font-mono); font-size: 9.5px; padding: 2px 7px; border-radius: 999px; border: 1px solid var(--edge); color: var(--ink3); }
+  .facts-badge.sup { border-style: dashed; opacity: .85; }
+  .facts-detail { display: none; margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--edge); }
+  .facts-row.open .facts-detail { display: block; }
+  .facts-row.open .facts-val { white-space: normal; }
+  .facts-kv { display: grid; grid-template-columns: max-content 1fr; gap: 3px 14px; font-family: var(--font-mono); font-size: 11px; }
+  .facts-kv-k { color: var(--ink3); }
+  .facts-kv-v { color: var(--ink2); word-break: break-word; }
+  .facts-vlabel { margin: 9px 0 4px; font-family: var(--font-mono); font-size: 10px; color: var(--ink3); }
+  .facts-vfull { margin: 0; padding: 10px; border-radius: 8px; background: var(--bg); border: 1px solid var(--edge); font-family: var(--font-mono); font-size: 11.5px; color: var(--ink); white-space: pre-wrap; word-break: break-word; max-height: 360px; overflow: auto; }
+  .facts-loading { font-family: var(--font-mono); font-size: 11px; color: var(--ink3); }
+  .facts-more { display: flex; justify-content: center; padding: 4px 0; }
+  .facts-cap { margin: 0; font-family: var(--font-mono); font-size: 11px; color: var(--warn); }
+  .facts-empty { padding: 8px 0; }
+  .facts-sentinel { height: 1px; }
+  .facts-row.tone-acc { border-left-color: var(--acc); }
+  .facts-row.tone-ok { border-left-color: var(--ok); }
+  .facts-row.tone-crit { border-left-color: var(--crit); }
+  .facts-row.tone-trust { border-left-color: var(--trust); }
+  .facts-row.tone-warn { border-left-color: var(--warn); }
+  .facts-row.tone-ink3 { border-left-color: var(--ink3); }
+  .facts-group.tone-acc .facts-gdot { background: var(--acc); }
+  .facts-group.tone-ok .facts-gdot { background: var(--ok); }
+  .facts-group.tone-crit .facts-gdot { background: var(--crit); }
+  .facts-group.tone-trust .facts-gdot { background: var(--trust); }
+  .facts-group.tone-warn .facts-gdot { background: var(--warn); }
+  .facts-group.tone-ink3 .facts-gdot { background: var(--ink3); }
+
+  /* cx-sessions browser (M3) — reuses the facts-* chrome; these add the state
+     chip, the per-row meta chip row, honest-empty notes, and the state details. */
+  .sess-sc { font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: .04em; padding: 2px 8px; border-radius: 999px; border: 1px solid currentColor; }
+  .sess-sc.active { color: var(--ok); }
+  .sess-sc.idle { color: var(--ink3); }
+  .sess-sc.archived { color: var(--warn); }
+  /* same-id ExecPlan chip: an EXACT link — emphasised over the lighter coord
+     live-announce plan chip (both classes apply; this one wins by source order). */
+  .sess-chip-idmatch { color: var(--acc); border-color: var(--acc); background: color-mix(in srgb, var(--acc) 18%, transparent); font-weight: 600; }
+  .sess-rmeta { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 7px; }
+  .facts-row.open .sess-rmeta { margin-bottom: 4px; }
+  .sess-note-empty { font-family: var(--font-mono); font-size: 11.5px; color: var(--ink3); font-style: italic; }
+  /* cx-cost (console-surfaces-remediation M5): method chip, output chip, top-burn
+     bar chart, and the totals row — all var(--) tokens, no libraries. */
+  .cost-method.link { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); background: color-mix(in srgb, var(--ok) 11%, transparent); }
+  .cost-method.window { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); background: color-mix(in srgb, var(--warn) 11%, transparent); }
+  .cost-out { color: var(--acc); border-color: color-mix(in srgb, var(--acc) 32%, transparent); }
+  .cost-chart { display: flex; flex-direction: column; gap: 4px; }
+  .cost-chart:empty { display: none; }
+  .cost-chart-title { font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--ink3); margin-bottom: 2px; }
+  .cost-bar { display: grid; grid-template-columns: 96px 1fr 52px; align-items: center; gap: 8px; }
+  .cost-bar-label { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cost-bar-track { height: 12px; background: var(--surface2); border: 1px solid var(--edge); border-radius: 6px; overflow: hidden; }
+  .cost-bar-fill { height: 100%; background: var(--acc); border-radius: 6px 0 0 6px; min-width: 2px; }
+  .cost-bar-val { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink2); text-align: right; }
+  .cost-totals { display: flex; gap: 14px; align-items: baseline; flex-wrap: wrap; padding: 8px 12px; border: 1px solid var(--edge); border-left: 3px solid var(--acc); border-radius: 8px; background: var(--surface2); }
+  .cost-totals:empty { display: none; }
+  .cost-totals-k { font-family: var(--font-mono); font-size: 10px; letter-spacing: .06em; color: var(--ink3); }
+  .cost-totals-v { font-family: var(--font-mono); font-size: 12px; color: var(--ink2); }
+  .cost-totals-v b { color: var(--ink); font-weight: 600; }
+  .sess-empty { margin: 3px 0 6px; }
+  .sess-state-details { margin-top: 9px; }
+  .sess-state-details > summary { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink3); cursor: pointer; padding: 3px 0; }
+  .sess-state-details[open] > summary { color: var(--ink2); }
+
+  /* cx trust cluster (console-surfaces-remediation M6): receipts / gates /
+     identity / mediation. Reuses the facts-* chrome; these add the help panels,
+     kind chips, the verbatim verification verdict, and the honest posture cards.
+     All colour is var(--) tokens — no hard-coded hues. */
+  .m6-help { background: var(--surface2); border-color: var(--edge); color: var(--ink2); }
+  .m6-help-h { font-family: var(--font-mono); font-size: 12px; color: var(--ink); font-weight: 600; margin-bottom: 5px; }
+  .m6-help .facts-kv { margin-top: 6px; }
+  .m6-help .facts-vlabel:first-child { margin-top: 4px; }
+  .facts-banner.ok-empty { border-color: color-mix(in srgb, var(--ok) 40%, var(--edge)); }
+  .facts-banner.ok-empty .m6-help-h { color: var(--ok); }
+  /* Receipt kind chip: same pill as .sess-chip, tinted by kind tone. */
+  .rcpt-kind { font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: .04em; padding: 2px 8px; border-radius: 999px; border: 1px solid currentColor; }
+  .rcpt-kind.tone-acc { color: var(--acc); }
+  .rcpt-kind.tone-ok { color: var(--ok); }
+  .rcpt-kind.tone-crit { color: var(--crit); }
+  .rcpt-kind.tone-trust { color: var(--trust); }
+  .rcpt-kind.tone-warn { color: var(--warn); }
+  .rcpt-kind.tone-ink3 { color: var(--ink3); }
+  .rcpt-fetchable { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); background: color-mix(in srgb, var(--ok) 11%, transparent); }
+  .rcpt-envonly { color: var(--ink3); border-style: dashed; }
+  /* Verification verdict — rendered VERBATIM from the daemon report. */
+  .rcpt-verdict { display: grid; grid-template-columns: max-content 1fr; gap: 3px 12px; font-family: var(--font-mono); font-size: 11.5px; padding: 8px 10px; border-radius: 8px; margin: 4px 0; border: 1px solid var(--edge); }
+  .rcpt-verdict.ok { border-color: color-mix(in srgb, var(--ok) 45%, var(--edge)); }
+  .rcpt-verdict.bad { border-color: color-mix(in srgb, var(--crit) 45%, var(--edge)); }
+  .rcpt-verdict-k { color: var(--ink3); }
+  .rcpt-verdict b { color: var(--ink); font-weight: 600; }
+  .rcpt-verdict.ok b { color: var(--ok); }
+  .rcpt-verdict.bad b { color: var(--crit); }
+  .gate-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
 
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { animation: none !important; transition: none !important; }
@@ -2503,6 +2799,9 @@
   // ---- Boot state --------------------------------------------------------
   var BOOT = { version: null, summary: null, health: 'loading', reason: '' };
   window.CRUX_RUNTIME_CAPABILITIES = null;
+  // The hash the operator navigated FROM — read by the Site map's "you are here"
+  // marker (M8). Updated on every hashchange from the event's oldURL.
+  window.CRUX_PREV_HASH = window.CRUX_PREV_HASH || '';
   // Which content the left rail currently holds: 'dest' (the destination nav) or
   // 'docs' (the Documents-mode tree). renderDestination restores 'dest' when it
   // finds the rail swapped to the tree (leaving Documents mode).
@@ -3176,7 +3475,15 @@
     }
     var scrim = document.getElementById('sheetScrim');
     if (scrim) { scrim.addEventListener('click', closeSheet); }
-    window.addEventListener('hashchange', route);
+    window.addEventListener('hashchange', function (ev) {
+      // Track where the operator came from so the Site map can mark "you are
+      // here" against their previous location (M8). hashchange carries oldURL.
+      if (ev && ev.oldURL) {
+        var oi = ev.oldURL.indexOf('#');
+        window.CRUX_PREV_HASH = (oi >= 0) ? ev.oldURL.slice(oi) : '';
+      }
+      route();
+    });
     document.addEventListener('keydown', onKey);
     document.addEventListener('keydown', function (ev) { if (ev.key === 'Escape') { closeSheet(); } });
     route();   // paint the shell immediately; boot() fills in live data
@@ -3199,7 +3506,7 @@
 <script>
 (function () {
   'use strict';
-  var SW_REV = 'ushell-v2-r13';   // keep in lock-step with /console-v2/sw.js
+  var SW_REV = 'ushell-v2-r14';   // keep in lock-step with /console-v2/sw.js
   if (!('serviceWorker' in navigator)) { return; }
   // Dev bypass — when the daemon serves this shell from CORECRUXD_CONSOLE_DEV_PATH
   // it stamps window.__CRUX_CONSOLE_DEV__ (see console.rs inject_console_dev_flag).

@@ -1897,8 +1897,6 @@ pub(super) async fn get_console_sessions(
         return problem.into_response();
     }
 
-    let store = state.session_store.read().await;
-
     // A session is "active" if it was written within this window, "idle" beyond
     // it, "archived" if soft-archived. `updated_at` is refreshed on every
     // `put()`, so it is the authoritative last-activity signal — the console
@@ -1906,37 +1904,98 @@ pub(super) async fn get_console_sessions(
     const LIVE_WINDOW_MS: i64 = 15 * 60 * 1000; // 15 min (matches coord presence TTL)
     let now_ms = chrono::Utc::now().timestamp_millis();
 
-    // Build structured rows: friendly title (scoped prefix stripped), owning
-    // agent, the raw key (needed by the console to issue archive calls), the
-    // archive flag, plus last-active time + derived live state (the console
-    // sorts by recency, splits archived out, and time-filters on these).
-    // Archived rows are hidden unless `include_archived=true`.
-    let mut rows: Vec<serde_json::Value> = store
-        .list_filtered(query.include_archived)
+    // Snapshot the base rows from the session store, then release its lock
+    // before joining the fact store (bindings + coord) so we never hold two
+    // stores at once. `title` (the logical id, scoped prefix stripped) is the
+    // candidate key we join on — see `session_link_maps`.
+    let (base, total_count, archived_count): (Vec<SessionRowBase>, usize, usize) = {
+        let store = state.session_store.read().await;
+        let total_count = store.count();
+        let archived_count = store
+            .list_filtered(true)
+            .len()
+            .saturating_sub(store.list_filtered(false).len());
+        let rows = store
+            .list_filtered(query.include_archived)
+            .into_iter()
+            .filter_map(|raw_key| store.get(raw_key).map(|session| (raw_key.to_string(), session)))
+            .map(|(raw_key, session)| {
+                let (agent, title) = match crux_mcp::scope::split_scoped_session_id(&raw_key) {
+                    Some((owner, logical)) => (Some(owner.to_string()), logical.to_string()),
+                    None => (None, raw_key.clone()),
+                };
+                let last_active_ms = session.updated_at.timestamp_millis();
+                let live_state = if session.archived {
+                    "archived"
+                } else if now_ms.saturating_sub(last_active_ms) <= LIVE_WINDOW_MS {
+                    "active"
+                } else {
+                    "idle"
+                };
+                SessionRowBase {
+                    raw_key,
+                    title,
+                    agent,
+                    archived: session.archived,
+                    archived_at: session.archived_at.map(|t| t.to_rfc3339()),
+                    archive_reason: session.archive_reason.clone(),
+                    last_active_ms,
+                    updated_at: session.updated_at.to_rfc3339(),
+                    live_state,
+                    total_tokens: session.total_tokens,
+                    expires_at: session.expires_at.map(|t| t.to_rfc3339()),
+                    state_first_line: session_state_first_line(&session.state),
+                }
+            })
+            .collect();
+        (rows, total_count, archived_count)
+    };
+
+    // Passport (session binding) + live ExecPlan (coord intent) joins. The
+    // session store is keyed by the raw scoped id; bindings/coord are keyed by
+    // `session_id_hex` (a sealed-plan ULID). We join on the logical `title` the
+    // same way `principal::resolve_by_session` does — passing the id straight to
+    // `session_bindings::get_binding` / matching `coord::CoordIntent.session_id_hex`,
+    // with NO client-side hashing. Sessions whose id is not a sealed-plan hex
+    // (agent `save_session` ids) resolve to null — honest, not fabricated.
+    let (binding_by_hex, intent_by_hex) = {
+        let store = state.fact_store.read().await;
+        let bindings: HashMap<String, crate::session_bindings::SessionBinding> =
+            crate::session_bindings::list_bindings(&store)
+                .into_iter()
+                .map(|b| (b.session_id_hex.clone(), b))
+                .collect();
+        let now_u64 = now_ms.max(0) as u64;
+        let intents: HashMap<String, crate::coord::CoordIntent> = crate::coord::list_intents(&store, None)
+            .into_iter()
+            .filter(|i| i.is_live(now_u64))
+            .map(|i| (i.session_id_hex.clone(), i))
+            .collect();
+        (bindings, intents)
+    };
+
+    let mut rows: Vec<serde_json::Value> = base
         .into_iter()
-        .filter_map(|raw_key| store.get(raw_key).map(|session| (raw_key.to_string(), session)))
-        .map(|(raw_key, session)| {
-            let (agent, title) = match crux_mcp::scope::split_scoped_session_id(&raw_key) {
-                Some((owner, logical)) => (Some(owner.to_string()), logical.to_string()),
-                None => (None, raw_key.clone()),
-            };
-            let last_active_ms = session.updated_at.timestamp_millis();
-            let live_state = if session.archived {
-                "archived"
-            } else if now_ms.saturating_sub(last_active_ms) <= LIVE_WINDOW_MS {
-                "active"
-            } else {
-                "idle"
-            };
+        .map(|b| {
+            let binding = binding_by_hex.get(&b.title);
+            let intent = intent_by_hex.get(&b.title);
             serde_json::json!({
-                "session_id": title,
-                "agent": agent,
-                "raw_key": raw_key,
-                "archived": session.archived,
-                "archived_at": session.archived_at,
-                "last_active_unix_ms": last_active_ms,
-                "updated_at": session.updated_at.to_rfc3339(),
-                "state": live_state,
+                "session_id": b.title,
+                "agent": b.agent,
+                "raw_key": b.raw_key,
+                "archived": b.archived,
+                "archived_at": b.archived_at,
+                "archive_reason": b.archive_reason,
+                "last_active_unix_ms": b.last_active_ms,
+                "updated_at": b.updated_at,
+                "state": b.live_state,
+                "total_tokens": b.total_tokens,
+                "expires_at": b.expires_at,
+                "state_first_line": b.state_first_line,
+                "passport_id": binding.map(|x| x.passport_id.clone()),
+                "passport_category": binding.map(|x| x.passport_category.clone()),
+                "execplan_slug": intent.and_then(|x| x.execplan_slug.clone()),
+                "milestone": intent.and_then(|x| x.milestone.clone()),
             })
         })
         .collect();
@@ -1954,25 +2013,283 @@ pub(super) async fn get_console_sessions(
     // Backward-compatible flat list of friendly ids (consumed by the classic
     // console and any older caller). Mirrors `session_rows` post-filter/sort.
     let session_ids: Vec<&str> = rows.iter().filter_map(|r| r["session_id"].as_str()).collect();
-    let archived_count = store
-        .list_filtered(true)
-        .len()
-        .saturating_sub(store.list_filtered(false).len());
 
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "count": rows.len(),
-            "total_count": store.count(),
+            "total_count": total_count,
             "archived_count": archived_count,
             "include_archived": query.include_archived,
             "sessions": session_ids,
             "session_rows": rows,
-            "state_preview": "ids_only",
+            "state_preview": "first_line",
             "raw_state_exposed": false
         })),
     )
         .into_response()
+}
+
+/// Owned snapshot of one session row taken while the session-store lock is held,
+/// so the lock is released before the fact-store (binding + coord) join.
+struct SessionRowBase {
+    raw_key: String,
+    /// Logical session id (scoped prefix stripped) — also the candidate key we
+    /// join to bindings / coord intents on.
+    title: String,
+    agent: Option<String>,
+    archived: bool,
+    archived_at: Option<String>,
+    archive_reason: Option<String>,
+    last_active_ms: i64,
+    updated_at: String,
+    live_state: &'static str,
+    total_tokens: usize,
+    expires_at: Option<String>,
+    state_first_line: Option<String>,
+}
+
+/// Server-derived short (≤140 char) preview of a session `state` blob. Picks the
+/// first meaningful string among the CONVENTIONAL summary fields only
+/// (`decisions`/`decisions_made` first element, `note`, `context_summary`,
+/// `summary`). Returns `None` for a blob that carries none of those.
+///
+/// This is deliberately NOT a "first string leaf anywhere" walk: the sessions
+/// LIST is guarded by `console_redacts_private_facts_and_session_state` (state
+/// content must not transit the list), and an arbitrary-leaf preview would leak
+/// whatever an agent happened to stash (e.g. a `{"token": …}` blob). The
+/// convention fields are the human-authored session summary — the intended,
+/// safe preview. The full blob is exposed only by the admin-read detail route.
+fn session_state_first_line(state: &serde_json::Value) -> Option<String> {
+    fn clip140(s: &str) -> Option<String> {
+        let t = s.trim();
+        if t.is_empty() {
+            return None;
+        }
+        let one_line: String = t.split_whitespace().collect::<Vec<_>>().join(" ");
+        Some(if one_line.chars().count() > 140 {
+            let mut out: String = one_line.chars().take(139).collect();
+            out.push('…');
+            out
+        } else {
+            one_line
+        })
+    }
+    // Convention-only: the fields agents write by habit (see session_store tests
+    // + CLAUDE.md fact conventions). No arbitrary-leaf fallback — see the doc note.
+    let obj = state.as_object()?;
+    for field in ["decisions", "decisions_made"] {
+        if let Some(first) = obj.get(field).and_then(|v| v.as_array()).and_then(|a| a.first()) {
+            if let Some(s) = first.as_str().and_then(clip140) {
+                return Some(s);
+            }
+        }
+    }
+    for field in ["note", "context_summary", "summary"] {
+        if let Some(s) = obj.get(field).and_then(|v| v.as_str()).and_then(clip140) {
+            return Some(s);
+        }
+    }
+    None
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct ConsoleSessionDetailQuery {
+    /// The raw scoped session-store key (e.g. `__agent_session::openai::slug`).
+    /// A query param, not a path segment, because raw keys contain `/` and `::`.
+    pub key: String,
+}
+
+/// `GET /v1/console/sessions/detail?key=<raw_key>` — the full operator drawer for
+/// one session (console-surfaces-remediation M3). Same auth as the list
+/// (admin-read). DELIBERATELY exposes the full `state` blob — a plan decision for
+/// the operator console — which is why it does NOT flow through the canvas
+/// `renderSessionDetail` path (whose smoke gate forbids reading session state).
+///
+/// Joins (all honest-null when absent):
+///   * `binding` — passport via `session_bindings::get_binding` on the logical id.
+///   * `coord_intent` — live ExecPlan focus via `coord::list_intents` (TTL).
+///   * `gates` — cross-work `__work_transition__::` scan where `by_passport`
+///     matches the bound passport and the gate was decided (approved / rejected /
+///     auto_approved), newest first, capped at 50.
+///   * `linked_plans_heuristic` — `execplan:*` facts authored by the bound
+///     passport, grouped by entity, top 5 by latest write. Fact-authorship is a
+///     heuristic — journaled session↔plan linkage is a daemon follow-up.
+pub(super) async fn get_console_session_detail(
+    State(state): State<AppState>,
+    Query(query): Query<ConsoleSessionDetailQuery>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(problem) = require_console_read(&state, &headers) {
+        return problem.into_response();
+    }
+
+    // Resolve the session from the store by its raw key.
+    const LIVE_WINDOW_MS: i64 = 15 * 60 * 1000;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let session = {
+        let store = state.session_store.read().await;
+        store.get(&query.key).cloned()
+    };
+    let Some(session) = session else {
+        return problem_response(
+            StatusCode::NOT_FOUND,
+            format!("no session stored under key '{}'", query.key),
+        );
+    };
+
+    let (agent, title) = match crux_mcp::scope::split_scoped_session_id(&query.key) {
+        Some((owner, logical)) => (Some(owner.to_string()), logical.to_string()),
+        None => (None, query.key.clone()),
+    };
+    let last_active_ms = session.updated_at.timestamp_millis();
+    let live_state = if session.archived {
+        "archived"
+    } else if now_ms.saturating_sub(last_active_ms) <= LIVE_WINDOW_MS {
+        "active"
+    } else {
+        "idle"
+    };
+
+    // Fact-store joins under a single read lock.
+    let store = state.fact_store.read().await;
+    let binding = crate::session_bindings::get_binding(&store, &title);
+    let now_u64 = now_ms.max(0) as u64;
+    let coord_intent = crate::coord::list_intents(&store, None)
+        .into_iter()
+        .find(|i| i.session_id_hex == title && i.is_live(now_u64));
+
+    // Gates + linked plans require the bound passport as the actor key.
+    let (gates, linked_plans) = match binding.as_ref() {
+        Some(b) => (
+            gates_for_passport(&store, &b.passport_id),
+            linked_plans_for_passport(&store, &b.passport_id),
+        ),
+        None => (Vec::new(), Vec::new()),
+    };
+    drop(store);
+
+    let binding_json = binding.as_ref().map(|b| {
+        serde_json::json!({
+            "passport_id": b.passport_id,
+            "passport_category": b.passport_category,
+            "project_id": b.project_id,
+        })
+    });
+    let coord_json = coord_intent.as_ref().map(|i| {
+        serde_json::json!({
+            "execplan_slug": i.execplan_slug,
+            "milestone": i.milestone,
+            "paths": i.paths,
+            "note": i.note,
+        })
+    });
+
+    let session_meta = serde_json::json!({
+        "session_id": title,
+        "agent": agent,
+        "raw_key": query.key,
+        "archived": session.archived,
+        "archived_at": session.archived_at.map(|t| t.to_rfc3339()),
+        "archive_reason": session.archive_reason,
+        "last_active_unix_ms": last_active_ms,
+        "updated_at": session.updated_at.to_rfc3339(),
+        "state": live_state,
+        "total_tokens": session.total_tokens,
+        "expires_at": session.expires_at.map(|t| t.to_rfc3339()),
+        "state_first_line": session_state_first_line(&session.state),
+        "passport_id": binding.as_ref().map(|b| b.passport_id.clone()),
+        "passport_category": binding.as_ref().map(|b| b.passport_category.clone()),
+        "execplan_slug": coord_intent.as_ref().and_then(|i| i.execplan_slug.clone()),
+        "milestone": coord_intent.as_ref().and_then(|i| i.milestone.clone()),
+    });
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "session": session_meta,
+            "state": session.state,
+            "binding": binding_json,
+            "coord_intent": coord_json,
+            "gates": gates,
+            "linked_plans_heuristic": linked_plans,
+        })),
+    )
+        .into_response()
+}
+
+/// Cross-work scan of `__work_transition__::` facts for the gates a passport
+/// decided (approved / rejected / auto_approved), newest first, capped at 50.
+/// Each row carries the work title when the work item is still readable.
+fn gates_for_passport(store: &corecrux_memory::fact_store::FactStore, passport_id: &str) -> Vec<serde_json::Value> {
+    let prefix = format!("{}::", crate::work::WORK_TRANSITION_ENTITY_PREFIX);
+    let mut transitions: Vec<crate::work::WorkTransition> = store
+        .all_facts()
+        .filter(|f| !f.deleted && f.key == crate::work::RECORD_KEY && f.entity.starts_with(&prefix))
+        .filter_map(|f| serde_json::from_str::<crate::work::WorkTransition>(&f.value).ok())
+        .filter(|t| {
+            t.by_passport == passport_id && matches!(t.gate_status.as_str(), "approved" | "rejected" | "auto_approved")
+        })
+        .collect();
+    transitions.sort_by(|a, b| b.at_unix_ms.cmp(&a.at_unix_ms));
+    transitions.truncate(50);
+
+    // Resolve work titles once per distinct work id (bounded by the 50 cap).
+    let mut titles: HashMap<String, Option<String>> = HashMap::new();
+    transitions
+        .into_iter()
+        .map(|t| {
+            let work_title = titles
+                .entry(t.work_id.clone())
+                .or_insert_with(|| crate::work::get_work(store, &t.work_id).map(|w| w.title))
+                .clone();
+            serde_json::json!({
+                "work_id": t.work_id,
+                "work_title": work_title,
+                "from_state": t.from_state,
+                "to_state": t.to_state,
+                "gate_status": t.gate_status,
+                "at_unix_ms": t.at_unix_ms,
+                "receipt_id": t.receipt_id,
+            })
+        })
+        .collect()
+}
+
+/// `execplan:*` facts authored by a passport, grouped by entity, top 5 by latest
+/// write. Heuristic linkage — fact authorship, not a journaled session↔plan edge.
+fn linked_plans_for_passport(
+    store: &corecrux_memory::fact_store::FactStore,
+    passport_id: &str,
+) -> Vec<serde_json::Value> {
+    // (matches, latest stored_at ms) per execplan entity.
+    let mut by_entity: BTreeMap<String, (u64, i64)> = BTreeMap::new();
+    for f in store.all_facts() {
+        if f.deleted || !f.entity.starts_with("execplan:") {
+            continue;
+        }
+        if f.actor.as_deref() != Some(passport_id) {
+            continue;
+        }
+        let at = f.stored_at.timestamp_millis();
+        let e = by_entity.entry(f.entity.clone()).or_insert((0, at));
+        e.0 += 1;
+        if at > e.1 {
+            e.1 = at;
+        }
+    }
+    let mut rows: Vec<(String, u64, i64)> = by_entity.into_iter().map(|(k, (n, at))| (k, n, at)).collect();
+    rows.sort_by(|a, b| b.2.cmp(&a.2));
+    rows.truncate(5);
+    rows.into_iter()
+        .map(|(entity, matches, latest_at)| {
+            serde_json::json!({
+                "entity": entity,
+                "matches": matches,
+                "latest_at": latest_at,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -2672,5 +2989,249 @@ mod lane_weight_tests {
             StatusCode::BAD_REQUEST,
             "empty target set is rejected, not laundered into 200"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod session_detail_tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::response::Response;
+    use corecrux_memory::fact_store::StoreFact;
+    use serde_json::{json, Value};
+
+    fn st() -> AppState {
+        super::super::tests::test_app_state(16)
+    }
+
+    async fn body_json(resp: Response) -> Value {
+        let bytes = to_bytes(resp.into_body(), 1 << 20).await.expect("read body");
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    }
+
+    /// Store a work-transition fact the way `work::transition_store_fact` does,
+    /// so `gates_for_passport`'s prefix scan finds it.
+    fn store_transition(store: &mut corecrux_memory::fact_store::FactStore, tx: &crate::work::WorkTransition) {
+        let sf = StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: format!(
+                "{}::{}::{}-{}",
+                crate::work::WORK_TRANSITION_ENTITY_PREFIX,
+                tx.work_id,
+                tx.at_unix_ms,
+                tx.id
+            ),
+            key: crate::work::RECORD_KEY.to_string(),
+            value: serde_json::to_string(tx).unwrap(),
+            source_receipt: tx.receipt_id.clone(),
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: Some(tx.by_passport.clone()),
+        };
+        store.store(sf);
+    }
+
+    fn mk_transition(
+        work_id: &str,
+        passport: &str,
+        gate: &str,
+        at: u64,
+        receipt: Option<&str>,
+    ) -> crate::work::WorkTransition {
+        crate::work::WorkTransition {
+            id: format!("t_{at}"),
+            work_id: work_id.to_string(),
+            from_state: "in_progress".to_string(),
+            to_state: "done".to_string(),
+            by_passport: passport.to_string(),
+            gate_status: gate.to_string(),
+            at_unix_ms: at,
+            blocker_kind: None,
+            receipt_id: receipt.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn state_first_line_prefers_conventional_fields_then_leaf() {
+        assert_eq!(
+            session_state_first_line(&json!({ "decisions_made": ["chose canary"], "x": 1 })).as_deref(),
+            Some("chose canary")
+        );
+        assert_eq!(
+            session_state_first_line(&json!({ "note": "  wired M3  " })).as_deref(),
+            Some("wired M3")
+        );
+        assert_eq!(
+            session_state_first_line(&json!({ "context_summary": "building Crux" })).as_deref(),
+            Some("building Crux")
+        );
+        // NO arbitrary-leaf fallback: a non-conventional blob yields no preview,
+        // so the list can't leak an agent's stashed content (redaction invariant).
+        assert_eq!(
+            session_state_first_line(&json!({ "misc": { "deep": ["", "hello"] } })),
+            None
+        );
+        assert_eq!(
+            session_state_first_line(&json!({ "token": "secret-session-token" })),
+            None
+        );
+        // Empty / string-less blobs → None (honest).
+        assert_eq!(session_state_first_line(&json!({ "n": 42 })), None);
+        assert_eq!(session_state_first_line(&json!({})), None);
+        // Long lines are clipped to <=140 chars with an ellipsis.
+        let long = "x".repeat(300);
+        let clipped = session_state_first_line(&json!({ "note": long })).unwrap();
+        assert!(clipped.chars().count() <= 140, "got {}", clipped.chars().count());
+        assert!(clipped.ends_with('…'));
+    }
+
+    #[tokio::test]
+    async fn list_rows_carry_new_fields() {
+        let state = st();
+        {
+            let mut store = state.session_store.write().await;
+            store.put(
+                "__agent_session::anthropic::plan-slug",
+                json!({ "decisions": ["shipped M3"] }),
+                Some(3600),
+            );
+        }
+        let resp = get_console_sessions(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(ConsoleSessionsQuery {
+                include_archived: false,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["state_preview"], "first_line");
+        let row = &body["session_rows"][0];
+        assert_eq!(row["session_id"], "plan-slug");
+        assert_eq!(row["agent"], "anthropic");
+        assert!(row["total_tokens"].as_u64().unwrap() > 0);
+        assert!(row["expires_at"].is_string());
+        assert_eq!(row["state_first_line"], "shipped M3");
+        // No binding / coord intent for this session → honest null.
+        assert!(row["passport_id"].is_null());
+        assert!(row["execplan_slug"].is_null());
+    }
+
+    #[tokio::test]
+    async fn detail_joins_binding_gates_and_plans() {
+        let state = st();
+        let hex = "abcdef0123456789abcdef0123456789";
+        let raw_key = format!("__agent_session::anthropic::{hex}");
+        {
+            let mut sstore = state.session_store.write().await;
+            sstore.put(&raw_key, json!({ "note": "resume here" }), None);
+        }
+        {
+            let mut fstore = state.fact_store.write().await;
+            // Binding keyed by the session's logical id (== hex here) → join works.
+            let binding = crate::session_bindings::SessionBinding {
+                session_id_hex: hex.to_string(),
+                project_id: Some("plancrux".to_string()),
+                tenant_id: "work::team".to_string(),
+                passport_id: "claude-work".to_string(),
+                passport_category: "work".to_string(),
+                agent_work_gate: true,
+                bound_at_unix_ms: 1000,
+            };
+            crate::session_bindings::write_binding(&mut fstore, &binding).unwrap();
+            // A decided gate by this passport (newest first) + an undecided one (filtered out).
+            store_transition(
+                &mut fstore,
+                &mk_transition("w_1", "claude-work", "approved", 2000, Some("ad_ga_1")),
+            );
+            store_transition(&mut fstore, &mk_transition("w_2", "claude-work", "queued", 3000, None));
+            store_transition(
+                &mut fstore,
+                &mk_transition("w_3", "someone-else", "approved", 4000, None),
+            );
+            // execplan authorship by this passport (heuristic plan linkage).
+            let mut ef = StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: "execplan:my-plan".to_string(),
+                key: "gate:M3".to_string(),
+                value: "{\"status\":\"pass\"}".to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: Some("claude-work".to_string()),
+            };
+            crate::fact_privacy::enforce_global(&mut ef);
+            fstore.store(ef);
+        }
+        let resp = get_console_session_detail(
+            State(state.clone()),
+            Query(ConsoleSessionDetailQuery { key: raw_key.clone() }),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        // Full state blob is exposed (deliberate admin-read decision).
+        assert_eq!(body["state"], json!({ "note": "resume here" }));
+        assert_eq!(body["binding"]["passport_id"], "claude-work");
+        assert_eq!(body["binding"]["project_id"], "plancrux");
+        // Only the decided gate by this passport survives.
+        let gates = body["gates"].as_array().unwrap();
+        assert_eq!(gates.len(), 1);
+        assert_eq!(gates[0]["work_id"], "w_1");
+        assert_eq!(gates[0]["gate_status"], "approved");
+        assert_eq!(gates[0]["receipt_id"], "ad_ga_1");
+        // Heuristic plan linkage grouped by entity.
+        let plans = body["linked_plans_heuristic"].as_array().unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0]["entity"], "execplan:my-plan");
+        assert_eq!(plans[0]["matches"], 1);
+    }
+
+    #[tokio::test]
+    async fn detail_missing_session_is_404() {
+        let state = st();
+        let resp = get_console_session_detail(
+            State(state.clone()),
+            Query(ConsoleSessionDetailQuery {
+                key: "nope".to_string(),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn detail_without_binding_is_honest_empty() {
+        let state = st();
+        {
+            let mut sstore = state.session_store.write().await;
+            sstore.put("__agent_session::openai::unbound", json!({ "k": "v" }), None);
+        }
+        let resp = get_console_session_detail(
+            State(state.clone()),
+            Query(ConsoleSessionDetailQuery {
+                key: "__agent_session::openai::unbound".to_string(),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert!(body["binding"].is_null());
+        assert!(body["coord_intent"].is_null());
+        assert_eq!(body["gates"].as_array().unwrap().len(), 0);
+        assert_eq!(body["linked_plans_heuristic"].as_array().unwrap().len(), 0);
+        // State is still exposed even with no linkage.
+        assert_eq!(body["state"], json!({ "k": "v" }));
     }
 }

@@ -117,6 +117,16 @@
   function enrichAction(input) {
     return operatorGatedCall(function (g) { return g.actionsEnrich(input); });
   }
+  // M6 cx-identity: run the candidate proposers (the ONLY shipped producer of
+  // /v1/identity/candidates). Operator-gated, server admin:write-gated.
+  function seedIdentityCandidates() {
+    return operatorGatedCall(function (g) { return g.identityCandidatePropose({}); });
+  }
+  // M6 cx-identity: confirm a candidate by supplying the cross-signature proof —
+  // mints the resolving identity_link only after both signatures verify (daemon).
+  function confirmIdentityCandidate(candidateId, proof) {
+    return operatorGatedCall(function (g) { return g.identityCandidateConfirm(candidateId, proof); });
+  }
 
   // Parse a fetch Response without ever throwing — the read counterpart of the
   // gated helpers above.
@@ -2273,6 +2283,14 @@
     }
     // Custom-rendered pages (no section model).
     if (page.id === 'cx-activity-log') { container.textContent = ''; renderActivityLog(container); return Promise.resolve(); }
+    if (page.id === 'cx-facts') { container.textContent = ''; renderFactsBrowser(container); return Promise.resolve(); }
+    if (page.id === 'cx-sessions') { container.textContent = ''; renderSessionsBrowser(container); return Promise.resolve(); }
+    if (page.id === 'cx-cost') { container.textContent = ''; renderCostBrowser(container); return Promise.resolve(); }
+    // M6 trust cluster — custom-rendered (live listing / honest posture panels).
+    if (page.id === 'cx-receipts') { container.textContent = ''; renderReceiptsBrowser(container); return Promise.resolve(); }
+    if (page.id === 'cx-gates') { container.textContent = ''; renderGatesBoard(container); return Promise.resolve(); }
+    if (page.id === 'cx-identity') { container.textContent = ''; renderIdentityBrowser(container); return Promise.resolve(); }
+    if (page.id === 'cx-mediation') { container.textContent = ''; renderMediationPosture(container); return Promise.resolve(); }
     if (page.operatorOnly && !isOperator()) {
       renderSections(container, [{ h: page.title, wide: true, controls: [
         { t: 'info', label: 'operator only', v: 'This surface is only available in operator posture.' },
@@ -3337,6 +3355,89 @@
     });
     return { width: marginX * 2 + Math.max(1, used.length) * colGap, height: marginY * 2 + Math.max(1, maxRows) * rowGap };
   }
+  // Concentric type-shell (radial) layout — the zoomed-OUT overview. Nodes are
+  // arranged on rings by node type: projects innermost (the anchors), work/gates
+  // next, then sessions, then passports/repos outermost. Deterministic: nodes are
+  // sorted by (type, id) and placed at evenly-spaced angles (no randomness —
+  // stability across renders is the point). A shell that can't hold its band on
+  // one ring wraps to further concentric sub-rings; ring radius always clears the
+  // previous band by at least a card's span, so cards never stack/overlap. Sets
+  // n.ringX / n.ringY (card top-left, layer coords) and returns the box dims.
+  function layoutGraphRing(nodes) {
+    var CARD_W = 300, CARD_H = 128, SEP = 340, RING_GAP = 210;
+    var BANDS = [['project'], ['work', 'gate'], ['session'], ['passport', 'repo']];
+    var bandOf = {}; BANDS.forEach(function (ts, i) { ts.forEach(function (t) { bandOf[t] = i; }); });
+    var byBand = {};
+    nodes.forEach(function (n) { var b = bandOf[n.type]; if (b == null) { b = BANDS.length; } (byBand[b] || (byBand[b] = [])).push(n); });
+    var bandKeys = Object.keys(byBand).map(Number).sort(function (a, b) { return a - b; });
+    var minR = 0, maxR = 0;
+    bandKeys.forEach(function (bk) {
+      var list = byBand[bk].slice().sort(function (a, b) {
+        if (a.type !== b.type) { return a.type < b.type ? -1 : 1; }
+        var ai = String(a.id), bi = String(b.id); return ai < bi ? -1 : (ai > bi ? 1 : 0);
+      });
+      var r = Math.max(minR + RING_GAP, SEP * 0.9), idx = 0, sub = 0;
+      while (idx < list.length) {
+        var cap = Math.max(1, Math.floor((2 * Math.PI * r) / SEP));
+        var take = Math.min(cap, list.length - idx);
+        var phase = bk * 0.7 + sub * 0.35;   // deterministic per-ring stagger
+        for (var k = 0; k < take; k++) {
+          var n = list[idx + k], a = phase + (k / take) * 2 * Math.PI;
+          n.__rx = r * Math.cos(a); n.__ry = r * Math.sin(a);
+        }
+        idx += take; maxR = Math.max(maxR, r); r += RING_GAP; sub++;
+      }
+      minR = maxR;
+    });
+    var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    nodes.forEach(function (n) {
+      var x = (n.__rx || 0) - CARD_W / 2, y = (n.__ry || 0) - CARD_H / 2;
+      if (x < minX) { minX = x; } if (y < minY) { minY = y; }
+      if (x + CARD_W > maxX) { maxX = x + CARD_W; } if (y + CARD_H > maxY) { maxY = y + CARD_H; }
+    });
+    if (!isFinite(minX)) { minX = 0; minY = 0; maxX = CARD_W; maxY = CARD_H; }
+    var pad = 80;
+    nodes.forEach(function (n) {
+      n.ringX = (n.__rx || 0) - CARD_W / 2 - minX + pad;
+      n.ringY = (n.__ry || 0) - CARD_H / 2 - minY + pad;
+      delete n.__rx; delete n.__ry;
+    });
+    return { width: (maxX - minX) + pad * 2, height: (maxY - minY) + pad * 2 };
+  }
+  // Graph legibility cap: /v1/work?source=all can carry >1,000 items (mostly
+  // complete/archived) — a relation graph of the whole set is an unreadable
+  // hairball. Keep an active-first, deterministic slice (in-progress/blocked/
+  // review/drafting first, then deployed, planned, finally complete/archive;
+  // ties broken by recency then id) and ALWAYS keep the focused node so a
+  // ?focus=work:… deep-link still resolves. Honest: the caller shows "N of M".
+  function graphWorkPriority(w) {
+    var s = String((w && w.state) || '').toLowerCase();
+    if (s === 'in_progress' || s === 'blocked' || s === 'review' || s === 'drafting') { return 0; }
+    if (s === 'deployed') { return 1; }
+    if (s === 'planned') { return 2; }
+    return 3;   // complete / archive / done / unknown
+  }
+  function capGraphWork(list, focus, cap) {
+    cap = cap || 80;
+    if (!Array.isArray(list) || list.length <= cap) { return list; }
+    var focusId = (focus && focus.type === 'work' && focus.id != null) ? String(focus.id) : null;
+    var sorted = list.slice().sort(function (a, b) {
+      var pa = graphWorkPriority(a), pb = graphWorkPriority(b);
+      if (pa !== pb) { return pa - pb; }
+      var ua = Number(a.updated_at_unix_ms || a.created_at_unix_ms || 0), ub = Number(b.updated_at_unix_ms || b.created_at_unix_ms || 0);
+      if (ua !== ub) { return ub - ua; }
+      var ai = String(a.id), bi = String(b.id); return ai < bi ? -1 : (ai > bi ? 1 : 0);
+    });
+    var kept = sorted.slice(0, cap);
+    if (focusId) {
+      var has = kept.some(function (w) { return String(w.id) === focusId || String(w.id) === 'execplan:' + focusId || 'execplan:' + String(w.id) === focusId; });
+      if (!has) {
+        var f = list.filter(function (w) { return String(w.id) === focusId || 'execplan:' + String(w.id) === focusId; })[0];
+        if (f) { kept = kept.slice(0, cap - 1); kept.push(f); }
+      }
+    }
+    return kept;
+  }
   function graphNodeRadius(type) { return type === 'project' ? 9 : (type === 'work' ? 8 : 6); }
   function graphNeighbourhood(edges, key) {
     var out = {};
@@ -3413,13 +3514,31 @@
         focus = { type: fnode.type, id: fnode.id };   // normalise for the select() below
       }
     }
-    var dims = layoutGraph(model.nodes);
+    var cardDims = layoutGraph(model.nodes);   // columns-by-type — the zoomed-IN detail arrangement
+    model.nodes.forEach(function (n) { n.cardX = n.x; n.cardY = n.y; });
+    var ringDims = layoutGraphRing(model.nodes);   // concentric type-shells — the zoomed-OUT overview
+    var reduceMotion = (typeof window !== 'undefined' && window.matchMedia) ? window.matchMedia('(prefers-reduced-motion: reduce)').matches : false;
+    // LOD threshold on the layer scale (view.scale): below it the nodes ride the
+    // ring overview, above it the card view. Open in whichever the CARD layout's
+    // natural fit lands in — a huge graph opens as the constellation, a small one
+    // straight into cards.
+    var LOD_THRESHOLD = 0.62;
+    var focusReserve = (focus && focus.type && focus.id != null) ? 380 : 0;
+    function fitScaleFor(d, reserveR) {
+      var sw = stage.clientWidth || 960, sh = stage.clientHeight || 640, pad = 30;
+      var availW = Math.max(260, sw - (reserveR || 0) - pad * 2), availH = Math.max(200, sh - pad * 2);
+      return Math.min(availW / d.width, availH / d.height);
+    }
+    var mode = fitScaleFor(cardDims, focusReserve) < LOD_THRESHOLD ? 'ring' : 'card';
+    model.nodes.forEach(function (n) { n.x = (mode === 'ring') ? n.ringX : n.cardX; n.y = (mode === 'ring') ? n.ringY : n.cardY; });
+    var activeDims = (mode === 'ring') ? ringDims : cardDims;
     var index = {}; model.nodes.forEach(function (n) { index[n.key] = n; });
     // One transformed layer holds the SVG edge canvas + the HTML node cards, so
     // pan/zoom moves cards and edges together.
     var layer = el('div', { 'class': 'cv-graph-layer' });
-    layer.style.width = dims.width + 'px'; layer.style.height = dims.height + 'px';
-    var svg = svgEl('svg', { 'class': 'cv-graph-edges', width: dims.width, height: dims.height, 'aria-hidden': 'true' });
+    layer.setAttribute('data-lod', mode);
+    layer.style.width = activeDims.width + 'px'; layer.style.height = activeDims.height + 'px';
+    var svg = svgEl('svg', { 'class': 'cv-graph-edges', width: activeDims.width, height: activeDims.height, 'aria-hidden': 'true' });
     // Two solid arrowhead markers (idle + hot) — userSpaceOnUse keeps them a
     // constant size regardless of stroke width; fill is set per class in CSS.
     var defs = svgEl('defs');
@@ -3430,7 +3549,6 @@
     });
     svg.appendChild(defs);
     layer.appendChild(svg);
-    var reduceMotion = (typeof window !== 'undefined' && window.matchMedia) ? window.matchMedia('(prefers-reduced-motion: reduce)').matches : false;
     // --- Edge routing with attachment "ports" -----------------------------
     // Each edge attaches to the SIDE of a node that faces the other node, at a
     // point distributed along that side — so multiple wires sharing one side fan
@@ -3550,20 +3668,78 @@
 
     var view = { tx: 16, ty: 16, scale: 1 };
     function apply() { layer.style.transform = 'translate(' + view.tx + 'px,' + view.ty + 'px) scale(' + view.scale + ')'; }
-    // Fit-to-viewport: scale + centre the whole graph into the stage so it lands
-    // on-screen without panning. When a node is focused the inspector slides in
-    // over the right edge, so reserve that width and centre in the space left.
-    function fitView() {
+    function placeCard(n) { var c = cardEls[n.key]; if (c) { c.style.left = n.x + 'px'; c.style.top = n.y + 'px'; } }
+    // Frame a layout into the stage (centre + scale). Floor is mode-aware: the
+    // ring overview may shrink far (the whole constellation on-screen), the card
+    // view stays legible. Reserves the inspector width when a node is focused.
+    function frame(d) {
       var sw = stage.clientWidth || 960, sh = stage.clientHeight || 640, pad = 30;
-      var reserveR = (focus && focus.type && focus.id != null) ? 380 : 0;
-      var availW = Math.max(260, sw - reserveR - pad * 2), availH = Math.max(200, sh - pad * 2);
-      var s = Math.max(0.42, Math.min(availW / dims.width, availH / dims.height, 1.15));
-      view.scale = s;
-      view.tx = pad + Math.max(0, (availW - dims.width * s) / 2);
-      view.ty = pad + Math.max(0, (availH - dims.height * s) / 2);
-      apply();
+      var availW = Math.max(260, sw - focusReserve - pad * 2), availH = Math.max(200, sh - pad * 2);
+      var floor = (mode === 'ring') ? 0.03 : 0.42, cap = (mode === 'ring') ? 1.0 : 1.15;
+      var s = Math.max(floor, Math.min(availW / d.width, availH / d.height, cap));
+      return { scale: s, tx: pad + Math.max(0, (availW - d.width * s) / 2), ty: pad + Math.max(0, (availH - d.height * s) / 2) };
     }
+    function fitView() { var f = frame(activeDims); view.scale = f.scale; view.tx = f.tx; view.ty = f.ty; apply(); }
     fitView();
+    // Zoom-aware LOD: crossing the threshold morphs the nodes between the ring
+    // overview and the card detail arrangement over ~300ms (snap under reduced
+    // motion or on very large graphs). Each node's tween START is its exact
+    // current on-screen position re-expressed under the NEW framing, so nodes
+    // never jump at the cut — they glide from where they were into the new layout.
+    var lodRaf = null, TWEEN_MAX = 160;
+    function screenCentre(n) { var w = n.w || 300, h = n.h || 128; return { x: view.tx + (n.x + w / 2) * view.scale, y: view.ty + (n.y + h / 2) * view.scale }; }
+    function switchMode(next) {
+      if (next === mode) { return; }
+      var sc = {}; model.nodes.forEach(function (n) { sc[n.key] = screenCentre(n); });
+      mode = next; activeDims = (mode === 'ring') ? ringDims : cardDims;
+      layer.style.width = activeDims.width + 'px'; layer.style.height = activeDims.height + 'px';
+      svg.setAttribute('width', activeDims.width); svg.setAttribute('height', activeDims.height);
+      layer.setAttribute('data-lod', mode);
+      if (modeLbl) { modeLbl.textContent = (mode === 'ring') ? 'overview' : 'detail'; }
+      var f = frame(activeDims); view.scale = f.scale; view.tx = f.tx; view.ty = f.ty; apply();
+      var from = {}, to = {};
+      model.nodes.forEach(function (n) {
+        var w = n.w || 300, h = n.h || 128;
+        from[n.key] = { x: (sc[n.key].x - view.tx) / view.scale - w / 2, y: (sc[n.key].y - view.ty) / view.scale - h / 2 };
+        to[n.key] = (mode === 'ring') ? { x: n.ringX, y: n.ringY } : { x: n.cardX, y: n.cardY };
+      });
+      if (lodRaf != null && typeof window !== 'undefined' && window.cancelAnimationFrame) { window.cancelAnimationFrame(lodRaf); lodRaf = null; }
+      var canAnim = !reduceMotion && model.nodes.length <= TWEEN_MAX && typeof window !== 'undefined' && window.requestAnimationFrame;
+      if (!canAnim) {
+        model.nodes.forEach(function (n) { n.x = to[n.key].x; n.y = to[n.key].y; placeCard(n); });
+        layoutEdges(); return;
+      }
+      var t0 = null, DUR = 300;
+      model.nodes.forEach(function (n) { n.x = from[n.key].x; n.y = from[n.key].y; placeCard(n); });
+      layoutEdges();
+      function stepFn(ts) {
+        if (t0 == null) { t0 = ts; }
+        var p = Math.min(1, (ts - t0) / DUR);
+        var e = p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;   // easeInOutQuad
+        model.nodes.forEach(function (n) {
+          n.x = from[n.key].x + (to[n.key].x - from[n.key].x) * e;
+          n.y = from[n.key].y + (to[n.key].y - from[n.key].y) * e;
+          placeCard(n);
+        });
+        layoutEdges();
+        if (p < 1) { lodRaf = window.requestAnimationFrame(stepFn); } else { lodRaf = null; }
+      }
+      lodRaf = window.requestAnimationFrame(stepFn);
+    }
+    function zoomBy(factor) {
+      var b = (mode === 'ring') ? { min: 0.03, max: 1.3 } : { min: 0.42, max: 2.4 };
+      var ns = Math.max(b.min, Math.min(b.max, view.scale * factor));
+      view.scale = ns; apply();
+      if (mode === 'card' && factor < 1 && ns <= LOD_THRESHOLD) { switchMode('ring'); }
+      else if (mode === 'ring' && factor > 1 && ns >= LOD_THRESHOLD) { switchMode('card'); }
+    }
+    // Unobtrusive +/- zoom cluster (wheel/pinch still work) carrying a live LOD label.
+    var modeLbl = el('span', { 'class': 'cv-zoom-mode', text: (mode === 'ring') ? 'overview' : 'detail' });
+    var zoomOut = el('button', { 'class': 'cv-zoom-btn', type: 'button', 'aria-label': 'Zoom out', title: 'Zoom out' }, ['−']);
+    var zoomIn = el('button', { 'class': 'cv-zoom-btn', type: 'button', 'aria-label': 'Zoom in', title: 'Zoom in' }, ['+']);
+    zoomOut.addEventListener('click', function (e) { e.stopPropagation(); zoomBy(0.8); });
+    zoomIn.addEventListener('click', function (e) { e.stopPropagation(); zoomBy(1.25); });
+    stage.appendChild(el('div', { 'class': 'cv-zoom' }, [zoomOut, modeLbl, zoomIn]));
     function select(key) {
       if (key == null) {
         Object.keys(cardEls).forEach(function (k) { cardEls[k].classList.remove('is-sel'); cardEls[k].classList.remove('is-dim'); });
@@ -3592,14 +3768,16 @@
     // Pan (drag on empty stage) + wheel zoom. A click on empty space (no drag)
     // deselects — the inspector then slides away unless it's pinned.
     var drag = null, moved = false;
-    stage.addEventListener('mousedown', function (ev) { if (ev.target.closest && ev.target.closest('.cv-card')) { return; } drag = { x: ev.clientX, y: ev.clientY, tx: view.tx, ty: view.ty }; moved = false; });
-    stage.addEventListener('click', function (ev) { if (ev.target.closest && ev.target.closest('.cv-card')) { return; } if (!moved) { select(null); onSelect(null); } });
+    function onEmpty(ev) { return !(ev.target.closest && (ev.target.closest('.cv-card') || ev.target.closest('.cv-zoom'))); }
+    stage.addEventListener('mousedown', function (ev) { if (!onEmpty(ev)) { return; } drag = { x: ev.clientX, y: ev.clientY, tx: view.tx, ty: view.ty }; moved = false; });
+    stage.addEventListener('click', function (ev) { if (!onEmpty(ev)) { return; } if (!moved) { select(null); onSelect(null); } });
     function onMove(ev) { if (!drag) { return; } moved = true; view.tx = drag.tx + (ev.clientX - drag.x); view.ty = drag.ty + (ev.clientY - drag.y); apply(); }
     function onUp() { drag = null; }
-    stage.addEventListener('wheel', function (ev) { ev.preventDefault(); var f = ev.deltaY < 0 ? 1.1 : 0.9; view.scale = Math.max(0.4, Math.min(2.2, view.scale * f)); apply(); });
+    stage.addEventListener('wheel', function (ev) { ev.preventDefault(); zoomBy(ev.deltaY < 0 ? 1.1 : 0.9); });
     if (typeof window !== 'undefined') { window.addEventListener('mousemove', onMove); window.addEventListener('mouseup', onUp); }
     __canvasGraphCleanup = function () {
       if (rafId != null && typeof window !== 'undefined' && window.cancelAnimationFrame) { window.cancelAnimationFrame(rafId); rafId = null; }
+      if (lodRaf != null && typeof window !== 'undefined' && window.cancelAnimationFrame) { window.cancelAnimationFrame(lodRaf); lodRaf = null; }
       if (typeof window !== 'undefined') { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); }
     };
 
@@ -3648,9 +3826,23 @@
         fetchJSON('/v1/console/sessions')
       ]);
     }).then(function (r) {
+      // Cap the work feed to an active-first, deterministic slice so the relation
+      // graph stays legible (the full source=all set can be >1,000 items). Keeps
+      // the focused node so a ?focus=work:… deep-link still resolves; honest count
+      // shown below. buildGraphModel + the card/focus paths are otherwise untouched.
+      var workData = (r[1].ok && r[1].data) || null, totalWork = 0, shownWork = 0;
+      if (workData) {
+        var wlist = workData.work || workData.items || [];
+        totalWork = wlist.length;
+        var capped = capGraphWork(wlist, focus, 80);
+        shownWork = capped.length;
+        var wd = {}; for (var wk in workData) { wd[wk] = workData[wk]; }
+        if (workData.work) { wd.work = capped; } else { wd.items = capped; }
+        workData = wd;
+      }
       var data = {
         projects: (r[0].ok && r[0].data) || null,
-        work: (r[1].ok && r[1].data) || null,
+        work: workData,
         gates: (r[2].ok && r[2].data) || null,
         passports: (r[3].ok && r[3].data) || null,
         sessions: (r[4].ok && r[4].data) || null,   // /v1/coord/active 404 → null (tolerated)
@@ -3681,6 +3873,9 @@
         }
       }
       drawGraph(stage, onSelect, model, focus);
+      if (!demoOn() && totalWork > shownWork) {
+        stage.appendChild(el('div', { 'class': 'cv-graph-note', text: 'showing ' + shownWork + ' of ' + totalWork + ' work items — active first (zoom in or open a node to explore)' }));
+      }
     }).catch(function () { stage.textContent = ''; stage.appendChild(el('p', { 'class': 'ctl-desc', text: 'Graph unavailable.' })); });
   }
 
@@ -3752,9 +3947,14 @@
   function planTreeNode(node, depth, onSelect) {
     var pad = (depth * 14 + 8) + 'px';
     var rowCls = 'plan-tree-row plan-tree-' + node.type;
+    // M7: kind (data-kind) and state (data-state) travel on every row so the CSS
+    // can colour by the console's existing status/kind hue vocabulary. Nulls are
+    // dropped by el(), so stateless kinds (project/milestone/session) carry no
+    // data-state. Additive — the existing classes + chips are untouched.
+    var kindAttr = node.type, stateAttr = (node.state != null && node.state !== '') ? node.state : null;
     if (node.children && node.children.length) {
       var det = el('details', { 'class': 'plan-tree-node', open: 'open' });
-      det.appendChild(el('summary', { 'class': rowCls, style: 'padding-left:' + pad }, planTreeRowInner(node)));
+      det.appendChild(el('summary', { 'class': rowCls, style: 'padding-left:' + pad, 'data-kind': kindAttr, 'data-state': stateAttr }, planTreeRowInner(node)));
       node.children.forEach(function (c) { det.appendChild(planTreeNode(c, depth + 1, onSelect)); });
       return det;
     }
@@ -3763,12 +3963,13 @@
     // handler (and non-session leaves stay inert).
     if (node.type === 'session' && typeof onSelect === 'function') {
       var srow = el('div', { 'class': rowCls + ' plan-tree-session-open', style: 'padding-left:' + pad,
+        'data-kind': kindAttr, 'data-state': stateAttr,
         role: 'button', tabindex: '0', 'aria-label': 'View session evidence: ' + (node.label || node.id || 'session') }, planTreeRowInner(node));
       srow.addEventListener('click', function () { onSelect(node); });
       srow.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelect(node); } });
       return srow;
     }
-    return el('div', { 'class': rowCls, style: 'padding-left:' + pad }, planTreeRowInner(node));
+    return el('div', { 'class': rowCls, style: 'padding-left:' + pad, 'data-kind': kindAttr, 'data-state': stateAttr }, planTreeRowInner(node));
   }
   function renderPlanTree(host, ctx) {
     host.textContent = '';
@@ -3809,18 +4010,107 @@
         wrap.appendChild(el('p', { 'class': 'ctl-desc', text: 'Plan tree empty — ' + why + '.' }));
         return;
       }
+      // ---- M7: colour legend + kind/state/text filters -------------------
+      // Colour is added in CSS keyed on the row's data-kind / data-state (planTreeNode);
+      // here we build the legend + the live filter controls. Filtering keeps
+      // ancestors of matches visible (a node shows if it matches OR any descendant
+      // does) so the tree stays navigable, and reports an honest "N of M" count.
+      var KIND_LABELS = [['project', 'Project'], ['execplan', 'ExecPlan'], ['milestone', 'Milestone'], ['session', 'Session'], ['work', 'Kanban'], ['unattached', 'Unattached']];
+      var STATE_ORDER = ['planned', 'in_progress', 'drafting', 'blocked', 'review', 'deployed', 'done', 'complete', 'archive'];
+      var kindsPresent = {}, statesPresent = {}, totalNodes = 0;
+      tree.roots.forEach(function (root) { (function w(n) { totalNodes++; kindsPresent[n.type] = true; if (n.state != null && n.state !== '') { statesPresent[n.state] = true; } (n.children || []).forEach(w); })(root); });
+      var kindOn = {}, stateOn = {}, textq = '';
+      Object.keys(kindsPresent).forEach(function (k) { kindOn[k] = true; });
+      Object.keys(statesPresent).forEach(function (s) { stateOn[s] = true; });
+
+      var controls = el('div', { 'class': 'plan-tree-controls' });
+      var legend = el('div', { 'class': 'plan-tree-legend' });
+      legend.appendChild(el('span', { 'class': 'plan-tree-legend-h', text: 'Kind' }));
+      KIND_LABELS.forEach(function (kl) {
+        if (!kindsPresent[kl[0]]) { return; }
+        legend.appendChild(el('span', { 'class': 'plan-tree-legend-item' }, [
+          el('span', { 'class': 'plan-tree-legend-swatch', 'data-kind': kl[0] }),
+          el('span', { 'class': 'plan-tree-legend-lab', text: kl[1] })
+        ]));
+      });
+      legend.appendChild(el('span', { 'class': 'plan-tree-legend-h', text: 'State' }));
+      STATE_ORDER.forEach(function (s) {
+        if (!statesPresent[s]) { return; }
+        legend.appendChild(el('span', { 'class': 'plan-tree-legend-item' }, [
+          el('span', { 'class': 'plan-tree-legend-swatch', 'data-state': s }),
+          el('span', { 'class': 'plan-tree-legend-lab', text: s })
+        ]));
+      });
+
+      var toolbar = el('div', { 'class': 'plan-tree-filters' });
+      var kindRow = el('div', { 'class': 'plan-tree-filter-row' }, [el('span', { 'class': 'plan-tree-filter-lab', text: 'Kinds' })]);
+      KIND_LABELS.forEach(function (kl) {
+        if (!kindsPresent[kl[0]]) { return; }
+        var chip = el('button', { 'class': 'plan-tree-toggle is-on', type: 'button', 'data-kind': kl[0], 'aria-pressed': 'true' }, [kl[1]]);
+        chip.addEventListener('click', function () { kindOn[kl[0]] = !kindOn[kl[0]]; chip.classList.toggle('is-on', kindOn[kl[0]]); chip.setAttribute('aria-pressed', kindOn[kl[0]] ? 'true' : 'false'); repaint(); });
+        kindRow.appendChild(chip);
+      });
+      var stateRow = el('div', { 'class': 'plan-tree-filter-row' }, [el('span', { 'class': 'plan-tree-filter-lab', text: 'States' })]);
+      STATE_ORDER.forEach(function (s) {
+        if (!statesPresent[s]) { return; }
+        var chip = el('button', { 'class': 'plan-tree-toggle is-on', type: 'button', 'data-state': s, 'aria-pressed': 'true' }, [s]);
+        chip.addEventListener('click', function () { stateOn[s] = !stateOn[s]; chip.classList.toggle('is-on', stateOn[s]); chip.setAttribute('aria-pressed', stateOn[s] ? 'true' : 'false'); repaint(); });
+        stateRow.appendChild(chip);
+      });
+      var textInput = el('input', { 'class': 'plan-tree-search', type: 'search', placeholder: 'Filter by label, id or slug…', 'aria-label': 'Filter tree by text' });
+      textInput.addEventListener('input', function () { textq = String(textInput.value || '').trim().toLowerCase(); repaint(); });
+      var searchRow = el('div', { 'class': 'plan-tree-filter-row' }, [el('span', { 'class': 'plan-tree-filter-lab', text: 'Find' }), textInput]);
+      toolbar.appendChild(kindRow); toolbar.appendChild(stateRow); toolbar.appendChild(searchRow);
+      var countLine = el('p', { 'class': 'plan-tree-count', role: 'status' });
+      controls.appendChild(legend); controls.appendChild(toolbar); controls.appendChild(countLine);
+      wrap.appendChild(controls);
+
       // M4b: split into the tree column + a session-detail column. Clicking a
       // session paints its evidence (receipts, fact provenance, announced focus)
-      // through the generated client. Notices stay above the split (fail-honest).
+      // through the generated client. Notices + filters stay above the split.
       var layout = el('div', { 'class': 'plan-tree-layout' });
       var treeCol = el('div', { 'class': 'plan-tree-col' });
       var detailCol = el('div', { 'class': 'session-detail-col' },
         [el('p', { 'class': 'ctl-desc', text: 'Select a session to view its evidence — receipts, fact provenance, announced focus.' })]);
       function onSelect(node) { renderSessionDetail(detailCol, node, api); }
-      tree.roots.forEach(function (root) { treeCol.appendChild(planTreeNode(root, 0, onSelect)); });
       layout.appendChild(treeCol);
       layout.appendChild(detailCol);
       wrap.appendChild(layout);
+
+      function nodeMatches(n) {
+        if (!kindOn[n.type]) { return false; }
+        if (n.state != null && n.state !== '' && !stateOn[n.state]) { return false; }
+        if (textq) {
+          var hay = String(n.label || '') + ' ' + String(n.id || '');
+          if (String(n.id || '').indexOf('execplan:') === 0) { hay += ' ' + String(n.id).slice(9); }
+          if (n.unresolvedSlug) { hay += ' ' + n.unresolvedSlug; }
+          if (hay.toLowerCase().indexOf(textq) < 0) { return false; }
+        }
+        return true;
+      }
+      // Keep ancestors of matches: a node survives if it matches OR any descendant
+      // survives; its whole subtree is dropped only when nothing under it matches.
+      function filterNode(n) {
+        var kids = (n.children || []).map(filterNode).filter(Boolean);
+        var self = nodeMatches(n);
+        if (!self && kids.length === 0) { return null; }
+        var copy = {}; for (var k in n) { copy[k] = n[k]; }
+        copy.children = kids;
+        return copy;
+      }
+      function repaint() {
+        var froots = tree.roots.map(filterNode).filter(Boolean);
+        treeCol.textContent = '';
+        if (!froots.length) {
+          treeCol.appendChild(el('p', { 'class': 'ctl-desc', text: 'No nodes match the current filters.' }));
+        } else {
+          froots.forEach(function (root) { treeCol.appendChild(planTreeNode(root, 0, onSelect)); });
+        }
+        var shown = 0;
+        froots.forEach(function (root) { (function w(n) { shown++; (n.children || []).forEach(w); })(root); });
+        countLine.textContent = 'showing ' + shown + ' of ' + totalNodes + ' nodes';
+      }
+      repaint();
     }).catch(function () {
       wrap.textContent = '';
       wrap.appendChild(el('p', { 'class': 'ctl-desc', text: 'Plan tree unavailable.' }));
@@ -5332,85 +5622,218 @@
   }
 
   // =======================================================================
-  //  Site map — a static reference destination: the console's flat rail
-  //  rearranged into 5 destinations + System. Bespoke card grid (no sections
-  //  model). Reads nothing; renders in every posture. Ported from the unified-
-  //  shell concept (rev 1 · 2026-07-03).
+  //  Site map (console-surfaces-remediation M8) — a real, click-through map of
+  //  the console. Every node is an <a href="#/…"> to a REAL registered route,
+  //  DERIVED at render time from the page registry (window.CruxPages.DESTS +
+  //  PAGES) so it can never drift from the nav. The registry lacks two things a
+  //  map needs — operator-voiced "what you'll find / when to use" copy, and the
+  //  destination-IS-the-page routes (canvas views, explorer, sitemap, rings) —
+  //  so those live in the small SITEMAP_META / synthetic-node maps below and are
+  //  the ONLY hand-authored surface. Reads nothing; renders in every posture.
+  //  Highlights where the operator just came from ("you are here", from
+  //  window.CRUX_PREV_HASH) and numbers a recommended first-run path.
   // =======================================================================
+  // Section glyphs, keyed by DEST *icon* id (copied from the shell's ICONS so the
+  // map header art matches the Command rail 1:1).
   var SITEMAP_ICONS = {
-    radar: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/><path d="M12 12l6-6"/></svg>',
-    board: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="5" height="16" rx="1"/><rect x="10" y="4" width="5" height="10" rx="1"/><rect x="17" y="4" width="4" height="13" rx="1"/></svg>',
-    brain: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="5" width="16" height="4.5" rx="2"/><rect x="4" y="12" width="16" height="4.5" rx="2"/><path d="M11 19.5h6"/></svg>',
-    shield: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"/><path d="M9 12l2 2 4-4"/></svg>',
-    gauge: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14a8 8 0 1 1 16 0"/><path d="M12 14l3.5-3.5"/><path d="M4 19h16"/></svg>',
-    server: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="4" width="17" height="6.5" rx="1.8"/><rect x="3.5" y="13.5" width="17" height="6.5" rx="1.8"/><path d="M7 7.2h.01M7 16.7h.01"/></svg>'
+    overwatch: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/></svg>',
+    work: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="5" height="16" rx="1"/><rect x="10" y="4" width="5" height="10" rx="1"/><rect x="17" y="4" width="4" height="13" rx="1"/></svg>',
+    memory: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>',
+    trust: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"/><path d="M9 12l2 2 4-4"/></svg>',
+    meters: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19a8 8 0 0 1 16 0"/><path d="M12 19l4-5"/><circle cx="12" cy="19" r="1.4"/></svg>',
+    settings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.6 1.6 0 0 0-1-1.5 1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.6 1.6 0 0 0 1.5-1 1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H9a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V9a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z"/></svg>',
+    canvas: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>',
+    search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>',
+    map: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="5" rx="1.4"/><rect x="3" y="16" width="6" height="5" rx="1.4"/><rect x="15" y="16" width="6" height="5" rx="1.4"/><path d="M12 8v4M6 16v-2.5h12V16"/></svg>',
+    rings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5.5"/><circle cx="12" cy="12" r="2"/><path d="M12 3v3"/></svg>'
   };
-  var SITEMAP = [
-    { icon: 'radar', color: 'var(--acc)', title: 'Overwatch', tag: "the arm's-length home — glance, decide, get out", items: [
-      { name: 'Home · Needs you', anno: { t: 'PROMOTED', cls: 'promote' }, why: 'Gates rise from rail item #8 to the first thing you see. Review counts and blocked-plan questions surface here too.', provs: [{ t: 'cx-overview' }, { t: 'cx-gates (actionable)' }, { t: 'cx-review (count)' }] },
-      { name: 'Fleet', anno: { t: '4 → 1', cls: 'merge' }, why: "Live board, sessions, orchestrators and punchcards are four rail items describing one question — \"who is working and on what?\" Leases and intents become facets of a session row.", provs: [{ t: 'cx-coord' }, { t: 'cx-sessions (live)' }, { t: 'cx-orchestrators' }, { t: 'cx-punchcards' }] },
-      { name: 'Activity', why: 'The rolling all-sessions log, unchanged — plus the human-lane page folds in as a filter, not a separate URL.', provs: [{ t: 'cx-activity' }, { t: '/console/activity' }] }
-    ] },
-    { icon: 'board', color: '#5EC2E7', title: 'Work', tag: "plans are true north — resume, don't respawn", items: [
-      { name: 'Board', anno: { t: 'VIEW SWITCH', cls: 'vsw' }, why: 'Kanban graduates from a rail pull-out to the primary view; list and graph become a segmented switch on the page — the DUAL_VIEW pattern, made explicit.', provs: [{ t: 'cx-work' }, { t: 'kanban pull-out' }, { t: 'console-3d (work graph)' }] },
-      { name: 'Projects', why: 'Repo pairing, planning repo, working tenants — unchanged, but now feeds Board filters instead of standing alone.', provs: [{ t: 'cx-projects' }] },
-      { name: 'Runs', why: 'Session history splits from the live fleet: archived sessions with their per-run token usage attached, searchable by plan.', provs: [{ t: 'cx-sessions (archive)' }, { t: 'cx-usage (per-run)' }] }
-    ] },
-    { icon: 'brain', color: 'var(--trust)', title: 'Memory', tag: 'the substrate — what the node knows and how fresh it is', items: [
-      { name: 'Facts', anno: { t: '2 → 1', cls: 'merge' }, why: 'cx-facts (by entity prefix) and cx-memory (recent per tenant) are the same data with different lenses — one page, three lenses: by entity · recent · by tenant.', provs: [{ t: 'cx-facts' }, { t: 'cx-memory' }] },
-      { name: 'Tenants & lanes', why: 'Store list with AMR lane policy per tenant; system tenants stay hidden by default.', provs: [{ t: 'cx-tenants' }] },
-      { name: 'Documents · ingest', why: 'What the daemon has read, per tenant — and how to feed it more. Unchanged.', provs: [{ t: 'cx-documents' }] },
-      { name: 'Review', anno: { t: 'COUNT → HOME', cls: 'promote' }, why: 'Contradictions + guarded consolidation live here; the pending count is an Overwatch card because it needs human judgment.', provs: [{ t: 'cx-review' }] },
-      { name: 'Tuning', anno: { t: 'ADVANCED', cls: 'adv' }, why: 'RRF lane weights are expert controls — kept, but behind a disclosure so they stop competing with daily pages.', provs: [{ t: 'cx-lane-weights' }] }
-    ] },
-    { icon: 'shield', color: 'var(--ok)', title: 'Trust', tag: 'regulation is a destination, not a settings page', items: [
-      { name: 'Receipts', anno: { t: 'VIEW SWITCH', cls: 'vsw' }, why: 'CROWN receipt list with the graph pull-out as a view switch; the receipts-vs-console demo becomes the "why receipts" explainer here.', provs: [{ t: 'cx-receipts' }, { t: '/console/receipts-vs-console' }] },
-      { name: 'Gates', why: 'The full Art.14 queue + history + timeout policy. Overwatch shows the actionable slice; this is the canonical record.', provs: [{ t: 'cx-gates' }] },
-      { name: 'Identity', anno: { t: '2 → 1', cls: 'merge' }, why: 'Passports and identity-link ceremonies are one story: who exists, who signs, what links. Device grants (/activate) approve from here too.', provs: [{ t: 'cx-passport' }, { t: 'cx-identity' }, { t: '/activate' }] },
-      { name: 'Policy & posture', anno: { t: 'NEW', cls: 'new' }, why: 'Mediation (capability ladder, foresight) joins a compliance posture panel — the Art.10–15 cards from this concept. Today that story is implicit; regulated buyers need it on one page.', provs: [{ t: 'cx-mediation' }, { t: 'posture panel (new)', 'new': true }] }
-    ] },
-    { icon: 'gauge', color: 'var(--warn)', title: 'Meters', tag: 'cost, capacity, evidence — replaces "Benchmarks" as the 5th section', items: [
-      { name: 'Token burn', why: 'The ground-truth cost lens, unchanged — headline number surfaces as an Overwatch tile.', provs: [{ t: 'cx-cost' }] },
-      { name: 'Usage', why: 'Observation-derived usage aggregates; per-run slices move to Work → Runs.', provs: [{ t: 'cx-usage' }] },
-      { name: 'Storage & node', anno: { t: 'UNBURIED', cls: 'promote' }, why: "Storage breakdown, infra summary, ops health and update/bootstrap status escape the Settings page — they're monitoring, not configuration.", provs: [{ t: 'storage-breakdown' }, { t: 'infra/summary' }, { t: 'ops health' }] },
-      { name: 'Benchmarks', anno: { t: 'NEW', cls: 'new' }, why: 'bench:* facts get a real page — corpus identity, commit, lane flags — with deep links to scorecrux.com for published suites.', provs: [{ t: 'bench:* facts' }, { t: 'ScoreCrux links', 'new': true }] }
-    ] },
-    { icon: 'server', color: 'var(--ink3)', title: 'System', note: 'bottom of rail', tag: 'configure rarely, then leave', items: [
-      { name: 'Settings', why: 'Access posture, embedding endpoint, sync, freshness horizons, retention, appearance, coordination toggles — minus the monitoring sections that moved to Meters.', provs: [{ t: 'cx-settings' }] },
-      { name: 'Integrations', anno: { t: '2 → 1', cls: 'merge' }, why: 'Packs and signed extensions are one catalog with two provenance badges; install stays inert until a passport grant exists.', provs: [{ t: 'cx-integrations' }, { t: 'cx-extensions' }] },
-      { name: 'Developer', why: 'Raw JSON-RPC console and the DX docs scope live under Developer; the GX global-search scope becomes ⌘K everywhere.', provs: [{ t: 'cx-raw' }, { t: 'DX scope' }, { t: 'GX scope → ⌘K' }] }
-    ] }
-  ];
+  // Section accent, keyed by DEST *id* (var(--) tokens only).
+  var SITEMAP_ACCENT = {
+    overwatch: 'var(--acc)', work: 'var(--acc)', memory: 'var(--trust)', trust: 'var(--ok)',
+    meters: 'var(--warn)', system: 'var(--ink3)', canvas: 'var(--acc)', explorer: 'var(--trust)',
+    sitemap: 'var(--acc)', rings: 'var(--trust)'
+  };
+  // One-line operator copy per node — "what you'll find / when to use", grounded
+  // in what each page does TODAY (post M2–M7), honest where feature-gated. Keyed
+  // by page id, plus synthetic keys for the destination-IS-the-page surfaces and
+  // the Overwatch landing root (`#/overwatch`). Missing key → the registry `sub`
+  // (endpoint noise stripped) is the honest fallback.
+  var SITEMAP_META = {
+    '#/overwatch':     'Start here — needs-you, fleet and live pulse at a glance',
+    'cx-overview':     'Daemon posture, readiness and capacity, one screen',
+    'cx-activity':     'Live session stream beside the needs-you and fleet panels',
+    'cx-coord':        'Who is working right now — live sessions and leases',
+    'cx-orchestrators':'Group plans running under one session',
+    'cx-punchcards':   'Advisory path leases, grouped by session',
+    'cx-work':         "ExecPlans as true north — resume, don't respawn",
+    'cx-activity-log': 'The all-sessions live journal — searchable, streaming',
+    'cx-projects':     'Repos, planning target, passports and working tenants',
+    'cx-sessions':     'Who worked, on what plan, with what tokens',
+    'cx-facts':        'Browse and search the whole visible fact store — time-machine included',
+    'cx-memory':       'Recent facts per tenant — system tenants hidden by default',
+    'cx-tenants':      'Memory stores and their AMR lane routing',
+    'cx-documents':    'What the daemon has read — and how to feed it more',
+    'cx-review':       'Contradictions and guarded consolidation, waiting for judgment',
+    'cx-lane-weights': 'Expert RRF lane weights — operator controls',
+    'cx-receipts':     'The signed evidence trail — verify Ed25519 proofs verbatim',
+    'cx-gates':        'Approvals waiting on you — high-risk transitions pause here',
+    'cx-mints':        'Agent-requested passports — review, then accept or reject',
+    'cx-passport':     'Agent and people identities — create and view passports',
+    'cx-identity':     'Cross-daemon identity links — inference proposes, consent disposes',
+    'cx-mediation':    'Engine gateway posture — off on this CPU-only node',
+    'cx-cost':         'Sessions × token burn, with plan attribution',
+    'cx-usage':        'Aggregate call volume and average spend',
+    'cx-settings':     'Access, sync, freshness, retention, appearance — configure rarely',
+    'cx-integrations': 'Installed packs and their passport grants',
+    'cx-extensions':   'Signed third-party manifests — per-passport grants',
+    'cx-workbench':    'Operator tooling — read tools live, writes gated',
+    'cx-raw':          'Raw JSON-RPC console — scopes attach automatically',
+    'canvas:board':    'Size-adaptive tile dashboard — drag, pan, expand in place',
+    'canvas:graph':    'Relation graph — real edges, ring layout when zoomed out',
+    'canvas:tree':     'Plan tree — colour-coded by kind and state, filterable',
+    'explorer':        'Search the corpus — local retrieval or mediated WikiCrux',
+    'sitemap':         "You're here — the whole console, one guided map",
+    'rings':           'Rings-clock landing prototype — live against this daemon'
+  };
+  // Honest per-node badges — access posture + feature-gating, stated on the card.
+  var SITEMAP_BADGE = {
+    'cx-lane-weights': { t: 'OPERATOR', cls: 'op' },
+    'cx-mints':        { t: 'OPERATOR', cls: 'op' },
+    'cx-raw':          { t: 'OPERATOR', cls: 'op' },
+    'cx-identity':     { t: 'FEATURE-GATED', cls: 'gate' },
+    'cx-mediation':    { t: 'ENGINE OFF', cls: 'gate' },
+    'rings':           { t: 'PROTOTYPE', cls: 'proto' }
+  };
+  // Recommended first-run path (node keys, in order). Rendered as small numerals
+  // on the matching cards + a legend; steps whose node is absent in this posture
+  // are skipped so the numbering stays honest.
+  var SITEMAP_START = ['#/overwatch', 'cx-sessions', 'cx-facts', 'cx-receipts'];
+  var SITEMAP_START_LABEL = { '#/overwatch': 'Overwatch', 'cx-sessions': 'Sessions', 'cx-facts': 'Facts', 'cx-receipts': 'Receipts' };
+
+  // Strip trailing "· /v1/…" endpoint noise from a registry sub for map display.
+  function siteMapCleanSub(sub) {
+    if (!sub) { return ''; }
+    return String(sub).replace(/\s*·\s*\/v1\/\S*/g, '').trim();
+  }
+
+  // Build the map sections from the live registry. Returns [{ dest, nodes:[{ key,
+  // name, href, sub }] }]. Pro-only pages are omitted (Pro mode owns them);
+  // operator-only pages are omitted for a customer view so every rendered node
+  // resolves to a live route in the current posture (no dead nodes).
+  function siteMapSections(isOp) {
+    var pages = (typeof window !== 'undefined') ? window.CruxPages : null;
+    if (!pages || !pages.DESTS) { return []; }
+    var byDest = {};
+    Object.keys(pages.PAGES).forEach(function (id) {
+      var p = pages.PAGES[id];
+      (byDest[p.dest] = byDest[p.dest] || []).push(p);
+    });
+    return pages.DESTS.map(function (d) {
+      var nodes = [];
+      var list = byDest[d.id] || [];
+      if (list.length) {
+        if (d.id === 'overwatch') {
+          nodes.push({ key: '#/overwatch', name: 'Home · at a glance', href: '#/overwatch' });
+        }
+        list.forEach(function (p) {
+          if (p.pro === true) { return; }               // Pro-mode-only → not on this map
+          if (p.operatorOnly && !isOp) { return; }      // customer can't reach it → skip
+          nodes.push({ key: p.id, name: p.title, href: '#/' + d.id + '/' + p.id, sub: p.sub });
+        });
+      } else if (d.id === 'canvas') {
+        nodes.push({ key: 'canvas:board', name: 'Board', href: '#/canvas/board' });
+        nodes.push({ key: 'canvas:graph', name: 'Graph', href: '#/canvas/graph' });
+        nodes.push({ key: 'canvas:tree', name: 'Tree', href: '#/canvas/tree' });
+      } else {
+        // explorer / sitemap / rings — the destination IS the page.
+        nodes.push({ key: d.id, name: d.label, href: '#/' + d.id });
+      }
+      return { dest: d, nodes: nodes };
+    }).filter(function (s) { return s.nodes.length; });
+  }
+
+  // Resolve which node the operator came FROM (window.CRUX_PREV_HASH) → node key,
+  // for the "you are here" marker. Falls back to the Site map's own node when the
+  // origin is unknown or was the map itself.
+  function siteMapHereKey(prevHash, sections) {
+    var h = String(prevHash || '').replace(/^#\/?/, '');
+    var qi = h.indexOf('?'); if (qi >= 0) { h = h.slice(0, qi); }
+    var parts = h.split('/').filter(Boolean);
+    var dest = parts[0], leaf = parts[1];
+    if (!dest || dest === 'sitemap') { return 'sitemap'; }
+    if (dest === 'canvas') { return 'canvas:' + (leaf === 'graph' || leaf === 'tree' ? leaf : 'board'); }
+    if (dest === 'explorer' || dest === 'rings') { return dest; }
+    if (dest === 'overwatch' && !leaf) { return '#/overwatch'; }
+    var present = {};
+    sections.forEach(function (s) { s.nodes.forEach(function (n) { present[n.key] = s.dest.id; }); });
+    if (leaf && present[leaf]) { return leaf; }         // explicit page node
+    // Dest root with no explicit (or a hidden) page → that section's first node.
+    var hit = null;
+    sections.forEach(function (s) { if (!hit && s.dest.id === dest) { hit = s.nodes[0] && s.nodes[0].key; } });
+    return hit || 'sitemap';
+  }
+
   function renderSiteMap(host) {
     host.textContent = '';
+    var isOp = (typeof window !== 'undefined' && window.CRUX_POSTURE === 'operator');
+    var sections = siteMapSections(isOp);
+    var prev = (typeof window !== 'undefined' && window.CRUX_PREV_HASH) || '';
+    var hereKey = siteMapHereKey(prev, sections);
+
+    // Start-here numerals — number only the steps whose node is present.
+    var present = {};
+    sections.forEach(function (s) { s.nodes.forEach(function (n) { present[n.key] = true; }); });
+    var stepOf = {}; var step = 0;
+    SITEMAP_START.forEach(function (k) { if (present[k]) { step++; stepOf[k] = step; } });
+
     var grid = el('div', { 'class': 'map-grid' });
-    SITEMAP.forEach(function (s) {
+    var nodeCount = 0;
+    sections.forEach(function (s) {
+      var d = s.dest;
       var sec = el('div', { 'class': 'map-sec' });
-      sec.style.setProperty('--sec-c', s.color);
-      var ico = el('span', { 'class': 'map-ico' }); ico.innerHTML = SITEMAP_ICONS[s.icon] || '';
-      var icoSvg = ico.querySelector('svg'); if (icoSvg) { icoSvg.setAttribute('width', '16'); icoSvg.setAttribute('height', '16'); }
-      var h = el('h3', null, [ico, doc().createTextNode(s.title)]);
-      if (s.note) { h.appendChild(el('span', { 'class': 'map-h-note', text: ' · ' + s.note })); }
-      sec.appendChild(h);
-      sec.appendChild(el('div', { 'class': 'tag', text: s.tag }));
-      s.items.forEach(function (it) {
-        var b = el('b', null, [doc().createTextNode(it.name)]);
-        if (it.anno) { b.appendChild(el('span', { 'class': 'anno ' + it.anno.cls, text: it.anno.t })); }
-        var pg = el('div', { 'class': 'map-page' }, [b, el('div', { 'class': 'why', text: it.why })]);
-        if (it.provs && it.provs.length) {
-          var provs = el('div', { 'class': 'provs' });
-          it.provs.forEach(function (pv) { provs.appendChild(el('span', { 'class': 'prov' + (pv['new'] ? ' new' : ''), text: pv.t })); });
-          pg.appendChild(provs);
-        }
-        sec.appendChild(pg);
+      if (sec.style && sec.style.setProperty) { sec.style.setProperty('--sec-c', SITEMAP_ACCENT[d.id] || 'var(--acc)'); }
+      var ico = el('span', { 'class': 'map-ico' }); ico.innerHTML = SITEMAP_ICONS[d.icon] || '';
+      if (ico.querySelector) { var icoSvg = ico.querySelector('svg'); if (icoSvg) { icoSvg.setAttribute('width', '16'); icoSvg.setAttribute('height', '16'); } }
+      // Header links to the destination root.
+      var head = el('a', { 'class': 'map-head', href: '#/' + d.id },
+        [el('h3', null, [ico, doc().createTextNode(d.label)])]);
+      sec.appendChild(head);
+      sec.appendChild(el('div', { 'class': 'tag', text: d.sub || '' }));
+      s.nodes.forEach(function (n) {
+        nodeCount++;
+        var isHere = (n.key === hereKey);
+        var a = el('a', { 'class': 'map-page' + (isHere ? ' is-here' : ''), href: n.href });
+        if (isHere) { a.setAttribute('aria-current', 'page'); }
+        var b = el('b');
+        if (stepOf[n.key]) { b.appendChild(el('span', { 'class': 'map-step', 'aria-hidden': 'true', text: String(stepOf[n.key]) })); }
+        b.appendChild(doc().createTextNode(n.name));
+        var badge = SITEMAP_BADGE[n.key];
+        if (badge) { b.appendChild(el('span', { 'class': 'anno ' + badge.cls, text: badge.t })); }
+        if (isHere) { b.appendChild(el('span', { 'class': 'map-here', text: 'YOU ARE HERE' })); }
+        a.appendChild(b);
+        a.appendChild(el('div', { 'class': 'why', text: SITEMAP_META[n.key] || siteMapCleanSub(n.sub) }));
+        a.appendChild(el('div', { 'class': 'map-route', text: n.href }));
+        sec.appendChild(a);
       });
       grid.appendChild(sec);
     });
     host.appendChild(grid);
+
+    // Footer: recommended first-run path + honest counts.
     var note = el('div', { 'class': 'map-note' });
-    note.innerHTML =
-      '<b>The count:</b> today\'s console is 26 flat rail items in the CX scope plus 4 sibling scopes (DX · GX · AX · IX). This arrangement lands the same surface in <b>5 destinations + System</b> — 9 pages merge into 4, three buried things get promoted (gates, review, node health), two get built new (posture, benchmarks), and nothing is dropped. The 2D|3D substrate switch and the kanban/graph pull-outs survive as per-page view switches. Phone gets Overwatch · Work · Trust + More; Memory, Meters and System sit behind More because approving a gate at a bus stop is real and re-tuning lane weights is not.'
-      + '<br><br><b>The function census behind this map:</b> Crux Daemon exposes 118 HTTP routes (~40 groups), 114 registered MCP tools (14 live at free tier — the console renders from the capability plan, not the registry), 98 corecruxctl subcommands; CruxEngine adds 295 paths on port 14343 + 164 on 14344. ≈789 functions total, each assigned a destination in <span class="mono">PlanCrux/docs/architecture/function-map-daemon-engine-2026-07-03.md</span>. Engine functions reach this UI only through daemon-mediated proxy routes (the lane-weights / gpu1 precedent) — one origin, one passport, receipts on every cross-system mutation.';
+    var legend = el('div', { 'class': 'map-legend' });
+    legend.appendChild(el('span', { 'class': 'map-legend-h', text: 'New here? Follow the path:' }));
+    SITEMAP_START.forEach(function (k) {
+      if (!stepOf[k]) { return; }
+      legend.appendChild(el('span', { 'class': 'map-legend-step' },
+        [el('span', { 'class': 'map-step', text: String(stepOf[k]) }), doc().createTextNode(' ' + (SITEMAP_START_LABEL[k] || k))]));
+    });
+    note.appendChild(legend);
+    var count = el('p', { 'class': 'map-count' }, [
+      el('b', { text: sections.length + ' destinations · ' + nodeCount + ' surfaces.' }),
+      doc().createTextNode(' Every card is a live link to its route — derived from the page registry, so this map cannot drift from the nav. Operator-only and feature-gated surfaces are labelled; the highlighted card is where you came from.')
+    ]);
+    note.appendChild(count);
     host.appendChild(note);
   }
 
@@ -5440,71 +5863,992 @@
       return r.json().then(function (d) { return { ok: r.ok, status: r.status, data: d }; }, function () { return { ok: r.ok, status: r.status, data: null }; });
     }).catch(function () { return { ok: false, status: 0, data: null }; });
   }
-  function renderActivityLog(host) {
-    host.textContent = '';
-    if (__actLogES) { try { __actLogES.close(); } catch (e) { /* noop */ } __actLogES = null; }
-    var state = { tenant: 'default', session: '', budget: 2000, kinds: {}, rows: [], deb: null };
-    ACT_KINDS.forEach(function (k) { state.kinds[k] = true; });
-    var sessionInput = el('input', { 'class': 'act-input', type: 'text', placeholder: 'session id…', 'aria-label': 'session id' });
-    var budgetInput = el('input', { 'class': 'act-input act-budget', type: 'number', min: '1', value: '2000', 'aria-label': 'token budget' });
-    var searchInput = el('input', { 'class': 'act-input', type: 'search', placeholder: 'filter text…', 'aria-label': 'search' });
-    function field(label, node) { return el('label', { 'class': 'act-field' }, [el('span', { text: label }), node]); }
-    var kindsWrap = el('div', { 'class': 'act-kinds' });
-    var loadBtn = el('button', { 'class': 'btn-primary', type: 'button' }, ['Load']);
-    var liveBtn = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Go live']);
-    var controls = el('div', { 'class': 'act-controls' }, [field('session', sessionInput), field('token budget', budgetInput), field('search', searchInput), kindsWrap, loadBtn, liveBtn]);
-    var liveDot = el('span', { 'class': 'act-livedot' });
-    var statusText = el('span', { 'class': 'act-statustext', text: 'Enter a session id and Load. The activity log is gated by CORECRUXD_FEATURE_ACTIVITY_LOG.' });
-    var list = el('div', { 'class': 'act-list' }, [el('p', { 'class': 'ctl-desc', text: 'No activity loaded yet.' })]);
-    host.appendChild(el('div', { 'class': 'act-log' }, [controls, el('div', { 'class': 'act-status' }, [liveDot, statusText]), list]));
+  // =======================================================================
+  //  Facts browser (console-surfaces-remediation M2) — the durable record,
+  //  paged over GET /v1/facts/list. Custom-rendered (like the activity log)
+  //  because the section model is a pure data→DOM transform: this surface needs
+  //  server-side pagination + search (q=), an ingest-time as_of time-machine
+  //  (as_of_unix_ms), and per-row detail that dereferences the FULL (untruncated)
+  //  value by id. Every read routes through the generated client (fetchJSON +
+  //  CruxApi.factsByFactId via fetchVia) — no raw network here. Degrades honestly
+  //  on an older daemon (list route 404) to the recent-window console feed,
+  //  banner-labelled.
+  // =======================================================================
+  var FACTS_PAGE_LIMIT = 100;      // rows per server page
+  var FACTS_DOM_CAP = 2000;        // hard ceiling on rendered rows (never all-in)
 
-    function setStatus(t) { statusText.textContent = t; }
-    function activeKinds() { return ACT_KINDS.filter(function (k) { return state.kinds[k]; }); }
-    function renderKinds() {
-      kindsWrap.textContent = '';
-      ACT_KINDS.forEach(function (k) {
-        var chip = el('button', { 'class': 'act-kchip k-' + k + (state.kinds[k] ? ' on' : ''), type: 'button', 'aria-pressed': state.kinds[k] ? 'true' : 'false', text: k });
-        chip.addEventListener('click', function () { state.kinds[k] = !state.kinds[k]; renderKinds(); paint(); });
-        kindsWrap.appendChild(chip);
+  // Entity-prefix → the console's status/kind hue token (border-left tint).
+  function factKindTone(prefix) {
+    switch (prefix) {
+      case 'execplan': return 'acc';
+      case 'bench': return 'ok';
+      case 'incident': return 'crit';
+      case 'design': return 'trust';
+      case 'session': return 'warn';
+      default: return 'ink3';
+    }
+  }
+  // Group key: the entity prefix up to the first ':' (execplan, bench, …);
+  // reserved '__x::' entities group under their '__x::' stem; else 'other'.
+  function factGroupKey(entity) {
+    var e = String(entity || '');
+    var m = e.match(/^([a-z0-9_]+):/i);
+    if (m) { return m[1]; }
+    var r = e.match(/^(__[a-z0-9_]+::)/i);
+    if (r) { return r[1]; }
+    return 'other';
+  }
+  function factGroupLabel(k) { return (/::$/.test(k)) ? k : (k === 'other' ? 'other' : k + ':*'); }
+
+  function renderFactsBrowser(host) {
+    host.textContent = '';
+    function nfmt(n) {
+      if (typeof n !== 'number' || !isFinite(n)) { return (n == null) ? '—' : String(n); }
+      try { return n.toLocaleString('en-US'); } catch (e) { return String(n); }
+    }
+    function shortTime(iso) { var s = String(iso || ''); return s.length >= 16 ? s.slice(0, 16).replace('T', ' ') : (s || '—'); }
+    function fmtConf(c) { return (typeof c === 'number' && isFinite(c)) ? c.toFixed(2) : '—'; }
+    function prettyValue(v) {
+      if (typeof v !== 'string') { try { return JSON.stringify(v, null, 2); } catch (e) { return String(v); } }
+      var t = v.trim();
+      if (t && (t.charAt(0) === '{' || t.charAt(0) === '[')) { try { return JSON.stringify(JSON.parse(v), null, 2); } catch (e) { return v; } }
+      return v;
+    }
+    function qs(obj) {
+      var parts = [];
+      Object.keys(obj).forEach(function (k) { parts.push(encodeURIComponent(k) + '=' + encodeURIComponent(obj[k])); });
+      return parts.join('&');
+    }
+
+    var state = {
+      rows: [], seen: {}, groupBodies: {}, groupsExpanded: {},
+      nextCursor: null, hasMore: false, totalVisible: null, totalNondeleted: null,
+      census: null, q: '', entityPrefix: '',
+      includeReserved: false, includeSuperseded: true, asOfMs: null,
+      loading: false, fallback: false, deb: null, token: 0
+    };
+
+    // ---- toolbar ----
+    var searchInput = el('input', { 'class': 'facts-input', type: 'search', placeholder: 'search entity / key / value…', 'aria-label': 'search facts' });
+    var asOfInput = el('input', { 'class': 'facts-input facts-asof', type: 'datetime-local', 'aria-label': 'as of (ingest-time machine)' });
+    var supToggle = el('button', { 'class': 'facts-toggle on', type: 'button', 'aria-pressed': 'true', title: 'include cross-entity-retired (superseded) facts' }, ['superseded']);
+    var resToggle = el('button', { 'class': 'facts-toggle', type: 'button', 'aria-pressed': 'false', title: 'include daemon-reserved (__*) entities' }, ['reserved __*']);
+    function field(label, node) { return el('label', { 'class': 'facts-field' }, [el('span', { text: label }), node]); }
+    var toolbar = el('div', { 'class': 'facts-toolbar' }, [
+      field('search', searchInput),
+      field('as of', asOfInput),
+      el('div', { 'class': 'facts-toggles' }, [supToggle, resToggle])
+    ]);
+    var countLine = el('p', { 'class': 'facts-count' });
+    var chipsWrap = el('div', { 'class': 'facts-chips' });
+    var banner = el('div', { 'class': 'facts-banner' }); banner.style.display = 'none';
+    var groupsWrap = el('div', { 'class': 'facts-groups' });
+    var moreWrap = el('div', { 'class': 'facts-more' });
+    var sentinel = el('div', { 'class': 'facts-sentinel' });
+    host.appendChild(el('div', { 'class': 'facts-browser' }, [toolbar, countLine, chipsWrap, banner, groupsWrap, moreWrap, sentinel]));
+
+    function syncToggles() {
+      supToggle.classList.toggle('on', state.includeSuperseded); supToggle.setAttribute('aria-pressed', state.includeSuperseded ? 'true' : 'false');
+      resToggle.classList.toggle('on', state.includeReserved); resToggle.setAttribute('aria-pressed', state.includeReserved ? 'true' : 'false');
+    }
+    function baseQuery(extra) {
+      var q = { limit: FACTS_PAGE_LIMIT };
+      if (state.q) { q.q = state.q; }
+      if (state.entityPrefix) { q.entity_prefix = state.entityPrefix; }
+      if (state.includeReserved) { q.include_reserved = 1; }
+      if (!state.includeSuperseded) { q.include_superseded = 0; }
+      if (state.asOfMs != null) { q.as_of_unix_ms = state.asOfMs; }
+      if (extra) { for (var k in extra) { q[k] = extra[k]; } }
+      return q;
+    }
+
+    function paintCount() {
+      var shown = state.rows.length, vis = state.totalVisible;
+      var filtered = !!(state.q || state.entityPrefix);
+      var label = filtered ? (vis === 1 ? 'match' : 'matches') : 'visible';
+      var kids = [el('b', { text: nfmt(shown) }), ' shown of ', el('b', { text: (vis == null ? '—' : nfmt(vis)) }), ' ' + label];
+      var c = state.census;
+      if (c && c.stored != null) {
+        kids.push(' · '); kids.push(el('b', { text: nfmt(c.stored) })); kids.push(' stored');
+        if (c.priv != null && c.reserved != null) {
+          kids.push(' (' + nfmt(c.priv) + ' private + ' + nfmt(c.reserved) + ' reserved ' + (state.includeReserved ? 'shown' : 'hidden') + ')');
+        }
+      } else if (state.totalNondeleted != null) {
+        kids.push(' · '); kids.push(el('b', { text: nfmt(state.totalNondeleted) })); kids.push(' stored');
+      }
+      if (state.asOfMs != null) { kids.push(el('span', { 'class': 'facts-asof-tag', text: '⏱ as of ' + shortTime(new Date(state.asOfMs).toISOString()) })); }
+      countLine.textContent = '';
+      kids.forEach(function (k) { countLine.appendChild(typeof k === 'string' ? doc().createTextNode(k) : k); });
+    }
+
+    // Census: two limit=1 probes (reserved off / on, superseded included, current
+    // as_of) yield the exact private + reserved split from the SAME response
+    // fields — derived, never hardcoded.
+    function loadCensus() {
+      var probe = { limit: 1 };
+      if (state.asOfMs != null) { probe.as_of_unix_ms = state.asOfMs; }
+      var onQ = {}; for (var k in probe) { onQ[k] = probe[k]; } onQ.include_reserved = 1;
+      var myToken = state.token;
+      Promise.all([fetchJSON('/v1/facts/list?' + qs(probe)), fetchJSON('/v1/facts/list?' + qs(onQ))]).then(function (rr) {
+        if (myToken !== state.token) { return; }
+        var a = rr[0], b = rr[1];
+        if (!a.ok || !a.data) { return; }
+        var visible = a.data.total_visible, stored = a.data.total_nondeleted;
+        var withReserved = (b.ok && b.data && b.data.total_visible != null) ? b.data.total_visible : visible;
+        state.census = {
+          stored: stored,
+          reserved: (withReserved != null && visible != null) ? Math.max(0, withReserved - visible) : null,
+          priv: (stored != null && withReserved != null) ? Math.max(0, stored - withReserved) : null
+        };
+        paintCount();
       });
     }
-    function load() {
-      state.session = (sessionInput.value || '').trim();
-      state.budget = parseInt(budgetInput.value, 10) || 2000;
-      if (!state.session) { setStatus('Enter a session id first.'); return; }
-      var ak = activeKinds();
-      var query = { tenant_id: state.tenant, session: state.session, token_budget: state.budget };
-      if (ak.length < ACT_KINDS.length) { query.kinds = ak.join(','); }
-      activityBackfill(query).then(function (res) {
-        if (res.status === 404) { state.rows = []; setStatus('Activity log disabled on this daemon (set CORECRUXD_FEATURE_ACTIVITY_LOG=1).'); paint(); return; }
-        if (!res.ok || !res.data) { state.rows = []; setStatus('Load failed (HTTP ' + (res.status || '?') + ').'); paint(); return; }
-        state.rows = res.data.rows || [];
-        setStatus((res.data.returned != null ? res.data.returned : state.rows.length) + ' row(s)' + (res.data.truncated ? ' (budget-truncated — raise token_budget)' : '') + ' · session ' + state.session);
-        paint();
+
+    function rowEl(f) {
+      var badges = el('div', { 'class': 'facts-rbadges' });
+      if (f.superseded_by) { badges.appendChild(el('span', { 'class': 'facts-badge sup', title: 'superseded by ' + f.superseded_by, text: 'superseded' })); }
+      if (f.value_truncated) { badges.appendChild(el('span', { 'class': 'facts-badge', title: f.value_len + ' chars — open the row for the full value', text: nfmt(f.value_len) + ' ch' })); }
+      var head = el('div', { 'class': 'facts-rhead' }, [
+        el('span', { 'class': 'facts-key', text: f.key || '(no key)' }),
+        el('span', { 'class': 'facts-entity', text: f.entity || '' }),
+        badges,
+        el('span', { 'class': 'facts-time', text: shortTime(f.stored_at) })
+      ]);
+      var val = el('div', { 'class': 'facts-val', text: (f.value || '') + (f.value_truncated ? ' …' : '') });
+      var detail = el('div', { 'class': 'facts-detail' });
+      var row = el('div', { 'class': 'facts-row tone-' + factKindTone(factGroupKey(f.entity)), role: 'button', tabindex: '0' }, [head, val, detail]);
+      var opened = false;
+      function toggle() { var o = row.classList.toggle('open'); if (o && !opened) { opened = true; expandRow(detail, f); } }
+      row.addEventListener('click', toggle);
+      row.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+      return row;
+    }
+    function expandRow(detail, f) {
+      detail.textContent = '';
+      detail.appendChild(el('div', { 'class': 'facts-loading', text: 'loading full fact…' }));
+      fetchVia(function () { return window.CruxApi.factsByFactId(f.fact_id); }).then(function (res) {
+        detail.textContent = '';
+        var full = (res.ok && res.data) ? res.data : null;
+        var value = full ? full.value : (f.value || '');
+        var meta = el('div', { 'class': 'facts-kv' });
+        function kv(k, v) { meta.appendChild(el('span', { 'class': 'facts-kv-k', text: k })); meta.appendChild(el('span', { 'class': 'facts-kv-v', text: (v == null || v === '') ? '—' : String(v) })); }
+        kv('fact_id', f.fact_id);
+        kv('entity', f.entity);
+        kv('key', f.key);
+        kv('actor', (full && full.actor != null) ? full.actor : f.actor);
+        kv('confidence', fmtConf(full ? full.confidence : f.confidence));
+        kv('horizon_class', (full && full.horizon_class) || f.horizon_class);
+        kv('tokens', (full && full.tokens != null) ? full.tokens : f.tokens);
+        kv('version', (full && full.version != null) ? full.version : f.version);
+        kv('stored_at', (full && full.stored_at) || f.stored_at);
+        if (f.superseded_by || (full && full.superseded_by)) { kv('superseded_by', f.superseded_by || (full && full.superseded_by)); }
+        detail.appendChild(meta);
+        if (!full) { detail.appendChild(el('p', { 'class': 'ctl-desc', text: 'Full value unavailable (HTTP ' + (res.status || '?') + ') — showing the row value.' })); }
+        detail.appendChild(el('div', { 'class': 'facts-vlabel', text: (full && f.value_truncated) ? 'value (full)' : 'value' }));
+        detail.appendChild(el('pre', { 'class': 'facts-vfull', text: prettyValue(value) }));
       });
     }
-    function matches(r, q) {
+
+    function ensureGroup(k) {
+      if (state.groupBodies[k]) { return state.groupBodies[k]; }
+      if (!(k in state.groupsExpanded)) { state.groupsExpanded[k] = false; }
+      var det = el('details', { 'class': 'facts-group tone-' + factKindTone(k) });
+      if (state.groupsExpanded[k]) { det.setAttribute('open', 'open'); }
+      var count = el('span', { 'class': 'facts-gcount' });
+      var sum = el('summary', { 'class': 'facts-gsum' }, [el('span', { 'class': 'facts-gdot' }), el('span', { 'class': 'facts-gname', text: factGroupLabel(k) }), count]);
+      det.appendChild(sum);
+      det.addEventListener('toggle', function () { state.groupsExpanded[k] = det.open; });
+      var body = el('div', { 'class': 'facts-glist' });
+      det.appendChild(body);
+      groupsWrap.appendChild(det);
+      state.groupBodies[k] = { body: body, count: count, n: 0 };
+      return state.groupBodies[k];
+    }
+    function appendRows(facts) {
+      facts.forEach(function (f) { var g = ensureGroup(factGroupKey(f.entity)); g.body.appendChild(rowEl(f)); g.n++; g.count.textContent = g.n + ' loaded'; });
+    }
+    function firstPaint(facts) {
+      groupsWrap.textContent = ''; state.groupBodies = {};
+      if (!facts.length) { groupsWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'No facts match.' })); return; }
+      var counts = {};
+      facts.forEach(function (f) { var k = factGroupKey(f.entity); counts[k] = (counts[k] || 0) + 1; });
+      Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a]; }).forEach(function (k, idx) { state.groupsExpanded[k] = idx < 4; });
+      appendRows(facts);
+    }
+
+    function paintChips() {
+      if (state.fallback) { chipsWrap.textContent = ''; return; }
+      var counts = {};
+      state.rows.forEach(function (f) { var k = factGroupKey(f.entity); counts[k] = (counts[k] || 0) + 1; });
+      var keys = Object.keys(counts).filter(function (k) { return k !== 'other'; }).sort(function (a, b) { return counts[b] - counts[a]; }).slice(0, 12);
+      chipsWrap.textContent = '';
+      var allChip = el('button', { 'class': 'facts-chip' + (state.entityPrefix ? '' : ' on'), type: 'button', title: 'clear the entity-prefix filter' }, ['all']);
+      allChip.addEventListener('click', function () { if (!state.entityPrefix) { return; } state.entityPrefix = ''; resetAndLoad(); });
+      chipsWrap.appendChild(allChip);
+      keys.forEach(function (k) {
+        var pref = (/::$/.test(k)) ? k : k + ':';
+        var active = state.entityPrefix === pref;
+        var chip = el('button', { 'class': 'facts-chip' + (active ? ' on' : ''), type: 'button', title: 'filter to ' + pref + '* server-side' }, [el('span', { text: factGroupLabel(k) }), el('span', { 'class': 'c', text: String(counts[k]) })]);
+        chip.addEventListener('click', function () {
+          if (active) { state.entityPrefix = ''; }
+          else { state.entityPrefix = pref; if (/^__/.test(pref) && !state.includeReserved) { state.includeReserved = true; syncToggles(); } }
+          resetAndLoad();
+        });
+        chipsWrap.appendChild(chip);
+      });
+    }
+
+    function paintMore() {
+      moreWrap.textContent = '';
+      if (state.fallback) { return; }
+      if (state.rows.length >= FACTS_DOM_CAP) { moreWrap.appendChild(el('p', { 'class': 'facts-cap', text: 'Rendered ' + nfmt(FACTS_DOM_CAP) + '+ rows — narrow with search or a prefix chip to load the rest.' })); return; }
+      if (state.hasMore) {
+        var remaining = (state.totalVisible != null) ? Math.max(0, state.totalVisible - state.rows.length) : null;
+        var btn = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Load more' + (remaining != null ? ' (' + nfmt(remaining) + ' remaining)' : '')]);
+        btn.addEventListener('click', loadNext);
+        moreWrap.appendChild(btn);
+      } else if (state.rows.length) {
+        moreWrap.appendChild(el('p', { 'class': 'ctl-desc', text: 'End of ' + ((state.q || state.entityPrefix) ? 'matches' : 'the visible store') + '.' }));
+      }
+    }
+
+    function loadPage(cursor, isFirst) {
+      if (state.loading) { return; }
+      state.loading = true;
+      if (isFirst) { groupsWrap.textContent = ''; groupsWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'loading…' })); }
+      var myToken = state.token;
+      fetchJSON('/v1/facts/list?' + qs(baseQuery(cursor ? { cursor: cursor } : null))).then(function (res) {
+        if (myToken !== state.token) { return; }
+        state.loading = false;
+        if (isFirst && res.status === 404) { state.fallback = true; fallbackLoad(); return; }
+        if (!res.ok || !res.data) {
+          if (isFirst) { banner.style.display = ''; banner.className = 'facts-banner err'; banner.textContent = 'Facts listing unavailable — ' + (res.status === 0 ? 'daemon unreachable' : 'HTTP ' + res.status) + '.'; groupsWrap.textContent = ''; }
+          return;
+        }
+        var d = res.data;
+        state.totalVisible = d.total_visible; state.totalNondeleted = d.total_nondeleted;
+        state.nextCursor = d.next_cursor || null; state.hasMore = !!d.has_more;
+        var fresh = [];
+        (d.facts || []).forEach(function (f) { if (f.fact_id && state.seen[f.fact_id]) { return; } if (f.fact_id) { state.seen[f.fact_id] = true; } state.rows.push(f); fresh.push(f); });
+        if (isFirst) { firstPaint(state.rows); } else { appendRows(fresh); }
+        paintCount(); paintChips(); paintMore();
+      });
+    }
+    function loadNext() {
+      if (state.fallback || state.loading || !state.hasMore) { return; }
+      if (state.rows.length >= FACTS_DOM_CAP) { paintMore(); return; }
+      loadPage(state.nextCursor, false);
+    }
+    function resetAndLoad() {
+      state.token++;
+      state.rows = []; state.seen = {}; state.groupBodies = {}; state.groupsExpanded = {};
+      state.nextCursor = null; state.hasMore = false; state.loading = false; state.fallback = false;
+      banner.style.display = 'none'; moreWrap.textContent = '';
+      loadCensus();
+      loadPage(null, true);
+    }
+    // Older daemon (no /v1/facts/list): fall back to the recent-window console
+    // feed, honestly labelled — read-only, no server paging or search.
+    function fallbackLoad() {
+      banner.style.display = ''; banner.className = 'facts-banner warn';
+      banner.textContent = 'Listing route unavailable on this daemon (needs the console-surfaces-remediation branch). Showing the recent window from /v1/console/facts only.';
+      chipsWrap.textContent = ''; moreWrap.textContent = '';
+      fetchJSON('/v1/console/facts?top_k=100').then(function (res) {
+        groupsWrap.textContent = '';
+        if (!res.ok || !res.data) { groupsWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'Recent-window feed also unavailable (HTTP ' + (res.status || '?') + ').' })); return; }
+        var facts = res.data.facts || [];
+        state.rows = facts;
+        state.totalVisible = (res.data.visible_count != null) ? res.data.visible_count : facts.length;
+        state.totalNondeleted = (res.data.count != null) ? res.data.count : null;
+        state.census = null;
+        firstPaint(facts); paintCount();
+        moreWrap.appendChild(el('p', { 'class': 'ctl-desc', text: 'Recent window: ' + nfmt(facts.length) + (state.totalNondeleted != null ? ' of ' + nfmt(state.totalNondeleted) + ' stored' : '') + ' (no server-side paging on this daemon).' }));
+      });
+    }
+
+    // ---- wiring ----
+    searchInput.addEventListener('input', function () { clearTimeout(state.deb); state.deb = setTimeout(function () { state.q = (searchInput.value || '').trim(); resetAndLoad(); }, 250); });
+    asOfInput.addEventListener('change', function () { var v = asOfInput.value; if (!v) { state.asOfMs = null; } else { var t = new Date(v).getTime(); state.asOfMs = isFinite(t) ? t : null; } resetAndLoad(); });
+    supToggle.addEventListener('click', function () { state.includeSuperseded = !state.includeSuperseded; syncToggles(); resetAndLoad(); });
+    resToggle.addEventListener('click', function () { state.includeReserved = !state.includeReserved; syncToggles(); resetAndLoad(); });
+    if (typeof IntersectionObserver !== 'undefined') {
+      var io = new IntersectionObserver(function (entries) { if (entries[0] && entries[0].isIntersecting) { loadNext(); } }, { rootMargin: '500px' });
+      io.observe(sentinel);
+    }
+    resetAndLoad();
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  cx-sessions (console-surfaces-remediation M3): a searchable session list
+  //  over /v1/console/sessions (session_rows — NOT the bare id strings the old
+  //  builder read), with a row-click detail drawer over the new
+  //  /v1/console/sessions/detail route. Custom-rendered like renderFactsBrowser;
+  //  through-client only (fetchJSON → CruxApi.get), el()/textContent, no innerHTML.
+  //  Deliberately SEPARATE from the canvas renderSessionDetail path (whose smoke
+  //  gate forbids reading session state) — this drawer shows the full state blob
+  //  the daemon exposes under admin-read.
+  // ─────────────────────────────────────────────────────────────────────────
+  function renderSessionsBrowser(host) {
+    host.textContent = '';
+    function nfmt(n) { if (typeof n !== 'number' || !isFinite(n)) { return (n == null) ? '—' : String(n); } try { return n.toLocaleString('en-US'); } catch (e) { return String(n); } }
+    function compactTokens(n) {
+      if (typeof n !== 'number' || !isFinite(n)) { return '—'; }
+      if (n >= 1000) { var k = n / 1000; return (k >= 100 ? Math.round(k) : k.toFixed(1)) + 'k'; }
+      return String(n);
+    }
+    function relTime(iso) {
+      var t = Date.parse(iso || ''); if (!isFinite(t)) { return '—'; }
+      var s = Math.max(0, Math.round((Date.now() - t) / 1000));
+      if (s < 60) { return s + 's ago'; }
+      var m = Math.round(s / 60); if (m < 60) { return m + 'm ago'; }
+      var h = Math.round(m / 60); if (h < 48) { return h + 'h ago'; }
+      return Math.round(h / 24) + 'd ago';
+    }
+    function prettyValue(v) {
+      if (typeof v !== 'string') { try { return JSON.stringify(v, null, 2); } catch (e) { return String(v); } }
+      var t = v.trim();
+      if (t && (t.charAt(0) === '{' || t.charAt(0) === '[')) { try { return JSON.stringify(JSON.parse(v), null, 2); } catch (e) { return v; } }
+      return v;
+    }
+    function shortId(id) { var s = String(id || ''); return s.length > 8 ? s.slice(0, 8) : s; }
+
+    // Same-id ExecPlan lane (M3 follow-up): EXACT linkage — a session whose
+    // logical id names an ExecPlan work-board item (`execplan:<slug>`, or a bare
+    // `<slug>` that resolves to one). `state.plans` maps that id → the work item
+    // {state, current_milestone, title}, fetched once alongside the session list.
+    // Distinct from the coord live-announce lane (TTL) and the fact-authorship
+    // heuristic lane — this is identity, not inference.
+    var state = { all: [], q: '', includeArchived: false, totalCount: 0, archivedCount: 0, loading: false, token: 0, plans: {} };
+    function planIdFor(s) {
+      var lid = String((s && s.session_id) || '');
+      if (!lid) { return null; }
+      var id = lid.indexOf('execplan:') === 0 ? lid : 'execplan:' + lid;
+      return state.plans[id] ? id : null;
+    }
+
+    var searchInput = el('input', { 'class': 'facts-input', type: 'search', placeholder: 'filter id / agent / passport / plan…', 'aria-label': 'filter sessions' });
+    var archToggle = el('button', { 'class': 'facts-toggle', type: 'button', 'aria-pressed': 'false', title: 'include archived sessions' }, ['archived']);
+    function field(label, node) { return el('label', { 'class': 'facts-field' }, [el('span', { text: label }), node]); }
+    var toolbar = el('div', { 'class': 'facts-toolbar' }, [field('filter', searchInput), el('div', { 'class': 'facts-toggles' }, [archToggle])]);
+    var countLine = el('p', { 'class': 'facts-count' });
+    var banner = el('div', { 'class': 'facts-banner' }); banner.style.display = 'none';
+    var listWrap = el('div', { 'class': 'facts-groups' });
+    host.appendChild(el('div', { 'class': 'facts-browser' }, [toolbar, countLine, banner, listWrap]));
+
+    function matches(s, q) {
       if (!q) { return true; }
-      return ((r.kind || '') + ' ' + (r.preview || '') + ' ' + (r.tool || '') + ' ' + (r.intent || '') + ' ' + (r.turn_id || '')).toLowerCase().indexOf(q) >= 0;
+      return ((s.session_id || '') + ' ' + (s.agent || '') + ' ' + (s.passport_id || '') + ' ' + (s.execplan_slug || '') + ' ' + (planIdFor(s) || '')).toLowerCase().indexOf(q) >= 0;
+    }
+    function paintCount(shown) {
+      countLine.textContent = '';
+      var loaded = state.all.length;
+      // Rows the server would return for this view (archived are excluded unless
+      // the toggle is on) — distinct from the 100-row cap below.
+      var expected = state.includeArchived ? state.totalCount : Math.max(0, state.totalCount - state.archivedCount);
+      var scope = state.includeArchived ? 'all' : 'active';
+      var kids = [el('b', { text: nfmt(shown) }), ' shown'];
+      if (state.q) { kids.push(' (filtered)'); }
+      kids.push(' · '); kids.push(el('b', { text: nfmt(loaded) })); kids.push(' ' + scope + ' session' + (loaded === 1 ? '' : 's') + ' loaded');
+      kids.push(' · '); kids.push(el('b', { text: nfmt(state.totalCount) })); kids.push(' total');
+      if (state.archivedCount) { kids.push(' · ' + nfmt(state.archivedCount) + ' archived'); }
+      // The server caps the row set at 100 — the ONLY real truncation signal
+      // (archived exclusion is not truncation). Say so honestly when it bites.
+      if (loaded >= 100 && expected > loaded) { kids.push(' · '); kids.push(el('span', { 'class': 'facts-asof-tag', text: 'showing first ' + nfmt(loaded) + ' of ' + nfmt(expected) })); }
+      kids.forEach(function (k) { countLine.appendChild(typeof k === 'string' ? doc().createTextNode(k) : k); });
+    }
+    function chip(cls, text, title) { return el('span', { 'class': cls, title: title || '' }, [text]); }
+    function rowEl(s) {
+      var head = el('div', { 'class': 'facts-rhead' }, [
+        el('span', { 'class': 'facts-key', text: s.session_id || '(no id)' }),
+        el('span', { 'class': 'sess-sc ' + (s.state || 'idle'), text: s.state || 'idle' }),
+        s.agent ? chip('sess-chip', s.agent, 'owning agent') : null,
+        el('span', { 'class': 'facts-time', text: relTime(s.updated_at) })
+      ]);
+      var planId = planIdFor(s);
+      var plan = planId ? state.plans[planId] : null;
+      var planChipText = planId ? (planId.replace(/^execplan:/, '') + (plan && plan.state ? (' · ' + plan.state) : '')) : null;
+      var metaChips = el('div', { 'class': 'sess-rmeta' }, [
+        chip('sess-chip', compactTokens(s.total_tokens) + ' tok', 'total tokens (bytes/4 estimate)'),
+        s.passport_id ? chip('sess-chip sess-chip-pass', s.passport_id, 'bound passport') : null,
+        planId ? chip('sess-chip sess-chip-plan sess-chip-idmatch', planChipText, 'ExecPlan — matched by session id (exact)') : null,
+        s.execplan_slug ? chip('sess-chip sess-chip-plan', s.execplan_slug + (s.milestone ? (' · ' + s.milestone) : ''), 'live coord announce') : null,
+        s.archived ? chip('sess-chip', 'archived' + (s.archive_reason ? (': ' + s.archive_reason) : ''), 'archived session') : null
+      ]);
+      var sub = s.state_first_line ? el('div', { 'class': 'facts-val', text: s.state_first_line }) : el('div', { 'class': 'sess-note-empty', text: 'no state summary' });
+      var detail = el('div', { 'class': 'facts-detail' });
+      var row = el('div', { 'class': 'facts-row', role: 'button', tabindex: '0' }, [head, sub, metaChips, detail]);
+      var opened = false;
+      function toggle() { var o = row.classList.toggle('open'); if (o && !opened) { opened = true; expandDetail(detail, s); } }
+      // A click inside the open drawer (the state-JSON <details> summary, text
+      // selection) must NOT bubble up and collapse the row — only head/meta toggle.
+      row.addEventListener('click', function (e) { if (e.target && e.target.closest && (e.target.closest('a') || e.target.closest('.facts-detail'))) { return; } toggle(); });
+      row.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+      return row;
+    }
+    function kvGrid(pairs) {
+      var meta = el('div', { 'class': 'facts-kv' });
+      pairs.forEach(function (kv) {
+        if (kv[1] == null || kv[1] === '') { return; }
+        meta.appendChild(el('span', { 'class': 'facts-kv-k', text: kv[0] }));
+        meta.appendChild(el('span', { 'class': 'facts-kv-v', text: String(kv[1]) }));
+      });
+      return meta;
+    }
+    function sectionLabel(t) { return el('div', { 'class': 'facts-vlabel', text: t }); }
+    function emptyNote(t) { return el('p', { 'class': 'ctl-desc sess-empty', text: t }); }
+    function expandDetail(detail, s) {
+      detail.textContent = '';
+      detail.appendChild(el('div', { 'class': 'facts-loading', text: 'loading session detail…' }));
+      fetchJSON('/v1/console/sessions/detail?key=' + encodeURIComponent(s.raw_key || s.session_id || '')).then(function (res) {
+        detail.textContent = '';
+        if (!res.ok || !res.data) { detail.appendChild(emptyNote('Detail unavailable (HTTP ' + (res.status || '?') + ') — GET /v1/console/sessions/detail.')); return; }
+        var d = res.data;
+        var meta = d.session || {};
+        // 1) session meta
+        detail.appendChild(sectionLabel('session'));
+        detail.appendChild(kvGrid([
+          ['raw key', meta.raw_key], ['agent', meta.agent], ['state', meta.state],
+          ['updated', meta.updated_at], ['expires', meta.expires_at],
+          ['archived', meta.archived ? ('yes' + (meta.archive_reason ? (' · ' + meta.archive_reason) : '')) : 'no']
+        ]));
+        // 2) passport binding
+        detail.appendChild(sectionLabel('passport'));
+        if (d.binding) { detail.appendChild(kvGrid([['passport', d.binding.passport_id], ['category', d.binding.passport_category], ['project', d.binding.project_id]])); }
+        else { detail.appendChild(emptyNote('No passport binding for this session. Bindings are minted on POST /session (sealed-plan sessions); agent save_session ids resolve to none.')); }
+        // 3) linked ExecPlan — three lanes, most-authoritative first.
+        detail.appendChild(sectionLabel('linked ExecPlan'));
+        // 3a) same-id match (EXACT — the session id names a work-board ExecPlan).
+        var planId = planIdFor(s);
+        if (planId) {
+          var plan = state.plans[planId] || {};
+          detail.appendChild(kvGrid([
+            ['same-id match', planId],
+            ['title', plan.title],
+            ['state', plan.state],
+            ['current milestone', plan.current_milestone]
+          ]));
+          detail.appendChild(el('p', { 'class': 'ctl-desc', text: 'exact: this session’s id equals ExecPlan work item ' + planId + ' — identity, not inference.' }));
+        } else {
+          detail.appendChild(emptyNote('same-id match: none — this session’s id does not name an ExecPlan on the work board (/v1/work).'));
+        }
+        // 3b) live announce (coord intent, TTL-scoped).
+        if (d.coord_intent) {
+          detail.appendChild(kvGrid([
+            ['live announce', (d.coord_intent.execplan_slug || '—') + (d.coord_intent.milestone ? (' · ' + d.coord_intent.milestone) : '')],
+            ['paths', (d.coord_intent.paths || []).join(', ')], ['note', d.coord_intent.note]
+          ]));
+        } else { detail.appendChild(emptyNote('live announce: none — populated by coord_announce (TTL-scoped presence).')); }
+        var plans = d.linked_plans_heuristic || [];
+        if (plans.length) {
+          var plist = el('div', { 'class': 'facts-kv' });
+          plans.forEach(function (p) {
+            plist.appendChild(el('span', { 'class': 'facts-kv-k', text: p.entity }));
+            plist.appendChild(el('span', { 'class': 'facts-kv-v', text: p.matches + ' fact' + (p.matches === 1 ? '' : 's') }));
+          });
+          detail.appendChild(plist);
+          detail.appendChild(el('p', { 'class': 'ctl-desc', text: 'derived from fact authorship — journaled session-plan linkage is a daemon follow-up.' }));
+        } else { detail.appendChild(emptyNote('heuristic plan linkage: none — execplan:* facts authored by this session’s passport would appear here.')); }
+        // 4) gates approved
+        detail.appendChild(sectionLabel('gates decided'));
+        var gates = d.gates || [];
+        if (gates.length) {
+          var glist = el('div', { 'class': 'facts-kv' });
+          gates.forEach(function (g) {
+            var left = g.gate_status + ' · ' + (g.work_title || g.work_id);
+            var right = (g.receipt_id ? (shortId(g.receipt_id) + '…') : 'no receipt');
+            glist.appendChild(el('span', { 'class': 'facts-kv-k', text: left }));
+            glist.appendChild(el('span', { 'class': 'facts-kv-v', text: right }));
+          });
+          detail.appendChild(glist);
+        } else { detail.appendChild(emptyNote('No gate decisions by this passport. Populated by gate approvals (WorkTransition receipts).')); }
+        // 5) token usage
+        detail.appendChild(sectionLabel('token usage'));
+        detail.appendChild(kvGrid([['total tokens', nfmt(meta.total_tokens)], ['estimate', 'serialized-state bytes / 4']]));
+        // 6) full state blob — collapsible, textContent only (admin-read decision).
+        var pre = el('pre', { 'class': 'facts-vfull', text: prettyValue(d.state) });
+        var det = el('details', { 'class': 'sess-state-details' }, [el('summary', {}, ['state JSON (full blob)']), pre]);
+        detail.appendChild(det);
+      });
     }
     function paint() {
       var q = (searchInput.value || '').trim().toLowerCase();
+      state.q = q;
+      var visible = state.all.filter(function (s) { return matches(s, q); });
+      listWrap.textContent = '';
+      if (!state.all.length) { listWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: state.loading ? 'loading…' : 'No sessions. Sessions are written by save_session / cuecrux_session.' })); paintCount(0); return; }
+      if (!visible.length) { listWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'No sessions match the filter.' })); paintCount(0); return; }
+      visible.forEach(function (s) { listWrap.appendChild(rowEl(s)); });
+      paintCount(visible.length);
+    }
+    // Build the same-id ExecPlan map from the work board. Cheap, best-effort:
+    // a failed/absent work feed just leaves state.plans empty (no plan chips /
+    // "same-id: none" in the drawer) — honest degradation, never blocking.
+    function loadPlans() {
+      return fetchJSON('/v1/work?source=all').then(function (res) {
+        var map = {};
+        if (res.ok && res.data) {
+          var items = res.data.work || res.data.items || res.data.work_items || [];
+          items.forEach(function (w) {
+            var id = w && w.id;
+            if (typeof id === 'string' && id.indexOf('execplan:') === 0) {
+              map[id] = { state: w.state || null, current_milestone: w.current_milestone || null, title: w.title || null };
+            }
+          });
+        }
+        state.plans = map;
+      });
+    }
+    function load() {
+      if (state.loading) { return; }
+      state.loading = true; state.token++;
+      var myToken = state.token;
+      listWrap.textContent = ''; listWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'loading…' }));
+      Promise.all([
+        fetchJSON('/v1/console/sessions?include_archived=' + (state.includeArchived ? 'true' : 'false')),
+        loadPlans()
+      ]).then(function (rr) {
+        var res = rr[0];
+        if (myToken !== state.token) { return; }
+        state.loading = false;
+        if (!res.ok || !res.data) { banner.style.display = ''; banner.className = 'facts-banner err'; banner.textContent = 'Sessions unavailable — ' + (res.status === 0 ? 'daemon unreachable' : 'HTTP ' + res.status) + '.'; listWrap.textContent = ''; return; }
+        banner.style.display = 'none';
+        state.all = res.data.session_rows || [];
+        state.totalCount = (res.data.total_count != null) ? res.data.total_count : state.all.length;
+        state.archivedCount = res.data.archived_count || 0;
+        paint();
+      });
+    }
+
+    searchInput.addEventListener('input', paint);
+    archToggle.addEventListener('click', function () { state.includeArchived = !state.includeArchived; archToggle.classList.toggle('on', state.includeArchived); archToggle.setAttribute('aria-pressed', state.includeArchived ? 'true' : 'false'); load(); });
+    load();
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  cx-cost — sessions × token burn (console-surfaces-remediation M5)
+  //
+  //  Custom-rendered like renderSessionsBrowser: a table of one row per posted
+  //  session cost report, filters (passport / date range / plan / min-burn), a
+  //  totals row, and a top-burn horizontal bar chart. Data comes from the
+  //  in-memory cost store via GET /v1/cost/report (sessions[] carries the window,
+  //  burn totals, poster passport, and producer-derived execplan_slugs — the
+  //  additive M5 fields); the ExecPlan join is client-side over /v1/work.
+  //
+  //  Honesty: the store is POST-fed by `corecruxctl session cost --post` and gated
+  //  by CORECRUXD_FEATURE_COST_LENS — the empty state names both. A session that
+  //  carries execplan_slugs links PRECISELY to those plans (method "link"); one
+  //  without falls back to window-overlap on the board (method "window-inferred"),
+  //  labelled so it never reads as falsely precise.
+  //  Through-client only (fetchJSON → CruxApi.get), el()/textContent, no innerHTML.
+  // ─────────────────────────────────────────────────────────────────────────
+  function renderCostBrowser(host) {
+    host.textContent = '';
+    function arr(v) { return Array.isArray(v) ? v : []; }
+    function compactN(n) {
+      if (typeof n !== 'number' || !isFinite(n)) { return '—'; }
+      if (n >= 1e6) { return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + 'M'; }
+      if (n >= 1000) { var k = n / 1000; return (k >= 100 ? Math.round(k) : k.toFixed(1)) + 'k'; }
+      return String(n);
+    }
+    function shortId(id) { var s = String(id || ''); return s.length > 10 ? s.slice(0, 8) + '…' : (s || '(no id)'); }
+    function tsOf(s) { var t = Date.parse(s.started_at || s.received_at || s.generated_at || ''); return isFinite(t) ? t : null; }
+    function fmtDay(iso) { var t = Date.parse(iso || ''); if (!isFinite(t)) { return '—'; } try { return new Date(t).toISOString().slice(0, 16).replace('T', ' '); } catch (e) { return '—'; } }
+    function windowLabel(s) {
+      if (s.started_at && s.ended_at) {
+        var a = fmtDay(s.started_at), b = Date.parse(s.ended_at); var bt = isFinite(b) ? new Date(b).toISOString().slice(11, 16) : '';
+        return a + (bt ? ('→' + bt) : '');
+      }
+      return 'rcvd ' + fmtDay(s.received_at);
+    }
+    function isLinked(s) { return arr(s.execplan_slugs).length > 0; }
+    function planIdsFor(s) { return arr(s.execplan_slugs).map(function (sl) { return 'execplan:' + sl; }); }
+
+    var state = { all: [], plans: {}, q: '', passport: '', plan: '', minBurn: 0, from: '', to: '', loading: false, token: 0 };
+
+    // ---- toolbar (filters) ----
+    var searchInput = el('input', { 'class': 'facts-input', type: 'search', placeholder: 'filter id / source / passport / plan…', 'aria-label': 'filter sessions' });
+    var passportSel = el('select', { 'class': 'facts-input', 'aria-label': 'passport filter' });
+    var planSel = el('select', { 'class': 'facts-input', 'aria-label': 'plan filter' });
+    var minBurnInput = el('input', { 'class': 'facts-input facts-asof', type: 'number', min: '0', step: '1000', placeholder: 'min output tok', 'aria-label': 'minimum output-token burn' });
+    var fromInput = el('input', { 'class': 'facts-input facts-asof', type: 'date', 'aria-label': 'from date' });
+    var toInput = el('input', { 'class': 'facts-input facts-asof', type: 'date', 'aria-label': 'to date' });
+    function field(label, node) { return el('label', { 'class': 'facts-field' }, [el('span', { text: label }), node]); }
+    var toolbar = el('div', { 'class': 'facts-toolbar' }, [
+      field('filter', searchInput), field('passport', passportSel), field('plan', planSel),
+      field('min burn (out)', minBurnInput), field('from', fromInput), field('to', toInput)
+    ]);
+    var countLine = el('p', { 'class': 'facts-count' });
+    var banner = el('div', { 'class': 'facts-banner' }); banner.style.display = 'none';
+    var chartWrap = el('div', { 'class': 'cost-chart' });
+    var totalsRow = el('div', { 'class': 'cost-totals' });
+    var listWrap = el('div', { 'class': 'facts-groups' });
+    host.appendChild(el('div', { 'class': 'facts-browser' }, [toolbar, countLine, banner, chartWrap, totalsRow, listWrap]));
+
+    function opt(sel, value, label) { sel.appendChild(el('option', { value: value }, [label])); }
+    function fillSelects() {
+      passportSel.textContent = ''; planSel.textContent = '';
+      opt(passportSel, '', 'all passports'); opt(planSel, '', 'all plans');
+      var pps = {}, pls = {};
+      state.all.forEach(function (s) {
+        var pp = s.actor_passport || ''; if (pp && pp !== '__anon__') { pps[pp] = 1; }
+        arr(s.execplan_slugs).forEach(function (sl) { pls[sl] = 1; });
+      });
+      Object.keys(pps).sort().forEach(function (p) { opt(passportSel, p, p); });
+      Object.keys(pls).sort().forEach(function (p) { opt(planSel, p, p); });
+      passportSel.value = state.passport; planSel.value = state.plan;
+    }
+
+    function matches(s) {
+      if (state.q) {
+        var hay = ((s.session_id || '') + ' ' + (s.source || '') + ' ' + (s.actor_passport || '') + ' ' + arr(s.execplan_slugs).join(' ')).toLowerCase();
+        if (hay.indexOf(state.q) < 0) { return false; }
+      }
+      if (state.passport && s.actor_passport !== state.passport) { return false; }
+      if (state.plan && arr(s.execplan_slugs).indexOf(state.plan) < 0) { return false; }
+      if (state.minBurn > 0 && !((s.output_tokens || 0) >= state.minBurn)) { return false; }
+      if (state.from || state.to) {
+        var t = tsOf(s); if (t == null) { return false; }
+        if (state.from) { var f = Date.parse(state.from + 'T00:00:00Z'); if (isFinite(f) && t < f) { return false; } }
+        if (state.to) { var e = Date.parse(state.to + 'T23:59:59Z'); if (isFinite(e) && t > e) { return false; } }
+      }
+      return true;
+    }
+
+    function chip(cls, text, title) { return el('span', { 'class': cls, title: title || '' }, [text]); }
+    function planChips(s) {
+      if (!isLinked(s)) { return [chip('sess-chip', 'window-inferred', 'no producer link — burn attributes to plans by window-overlap on the board')]; }
+      return planIdsFor(s).map(function (id) {
+        var p = state.plans[id];
+        var txt = id.replace(/^execplan:/, '') + (p && p.state ? (' · ' + p.state) : '');
+        return chip('sess-chip sess-chip-plan', txt, p ? ('ExecPlan (producer link) — ' + (p.title || id)) : (id + ' — not yet on the work board'));
+      });
+    }
+    function methodChip(s) {
+      return isLinked(s)
+        ? chip('sess-chip cost-method link', 'link', 'precise: this session named the plan(s) it worked')
+        : chip('sess-chip cost-method window', 'window', 'coarse: attributed to overlapping plan windows');
+    }
+
+    function rowEl(s) {
+      var head = el('div', { 'class': 'facts-rhead' }, [
+        el('span', { 'class': 'facts-key', text: shortId(s.session_id) }),
+        methodChip(s),
+        el('span', { 'class': 'facts-time', text: windowLabel(s) })
+      ]);
+      var metaChips = el('div', { 'class': 'sess-rmeta' }, [
+        chip('sess-chip', compactN(s.context_tokens || 0) + ' ctx', 'measured context tokens (Σ)'),
+        chip('sess-chip cost-out', compactN(s.output_tokens || 0) + ' out', 'output tokens generated (Σ)'),
+        (s.assistant_turns ? chip('sess-chip', s.assistant_turns + ' turns', 'assistant turns') : null),
+        (s.actor_passport && s.actor_passport !== '__anon__') ? chip('sess-chip sess-chip-pass', s.actor_passport, 'poster passport') : null
+      ].concat(planChips(s)));
+      var sub = el('div', { 'class': 'facts-val', text: s.source || '(no source)' });
+      var detail = el('div', { 'class': 'facts-detail' });
+      var row = el('div', { 'class': 'facts-row', role: 'button', tabindex: '0' }, [head, sub, metaChips, detail]);
+      var opened = false;
+      function toggle() { var o = row.classList.toggle('open'); if (o && !opened) { opened = true; expandDetail(detail, s); } }
+      row.addEventListener('click', function (e) { if (e.target && e.target.closest && (e.target.closest('a') || e.target.closest('.facts-detail'))) { return; } toggle(); });
+      row.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+      return row;
+    }
+    function kvGrid(pairs) {
+      var meta = el('div', { 'class': 'facts-kv' });
+      pairs.forEach(function (kv) { if (kv[1] == null || kv[1] === '') { return; } meta.appendChild(el('span', { 'class': 'facts-kv-k', text: kv[0] })); meta.appendChild(el('span', { 'class': 'facts-kv-v', text: String(kv[1]) })); });
+      return meta;
+    }
+    function sectionLabel(t) { return el('div', { 'class': 'facts-vlabel', text: t }); }
+    function expandDetail(detail, s) {
+      detail.textContent = '';
+      detail.appendChild(sectionLabel('session'));
+      detail.appendChild(kvGrid([
+        ['session id', s.session_id], ['source', s.source],
+        ['window', (s.started_at && s.ended_at) ? (s.started_at + '  →  ' + s.ended_at) : '(no transcript window — placed at ' + (s.received_at || '?') + ')'],
+        ['received', s.received_at], ['generated', s.generated_at]
+      ]));
+      detail.appendChild(sectionLabel('burn'));
+      detail.appendChild(kvGrid([
+        ['context tokens (Σ)', compactN(s.context_tokens || 0) + '  (' + (s.context_tokens || 0) + ')'],
+        ['output tokens (Σ)', compactN(s.output_tokens || 0) + '  (' + (s.output_tokens || 0) + ')'],
+        ['context / turn', compactN(s.context_tokens_per_turn || 0)], ['assistant turns', s.assistant_turns]
+      ]));
+      detail.appendChild(sectionLabel('linked ExecPlan'));
+      if (isLinked(s)) {
+        var list = el('div', { 'class': 'facts-kv' });
+        planIdsFor(s).forEach(function (id) {
+          var p = state.plans[id];
+          list.appendChild(el('span', { 'class': 'facts-kv-k', text: id }));
+          list.appendChild(el('span', { 'class': 'facts-kv-v', text: p ? ((p.title || '—') + (p.state ? (' · ' + p.state) : '') + (p.current_milestone ? (' · ' + p.current_milestone) : '')) : 'not yet on the work board (rsync lag)' }));
+        });
+        detail.appendChild(list);
+        detail.appendChild(el('p', { 'class': 'ctl-desc', text: 'producer link (method "link"): this session named these plans in its transcript — the burn credits them precisely (even-split across N).' }));
+      } else {
+        detail.appendChild(el('p', { 'class': 'ctl-desc sess-empty', text: 'no producer link — this session had no execplan_slugs. Its burn attributes to plans whose fact-window overlaps the session window (method "window", coarse). See the plan board /v1/work for the per-plan token_burn rollup.' }));
+      }
+      detail.appendChild(el('p', { 'class': 'ctl-desc', text: 'attribution recomputed read-time in cost_attribution.rs; passport = poster identity (' + (s.actor_passport || '__anon__') + ').' }));
+    }
+
+    function renderChart(visible) {
+      chartWrap.textContent = '';
+      var top = visible.slice().sort(function (a, b) { return (b.output_tokens || 0) - (a.output_tokens || 0); }).slice(0, 10);
+      if (!top.length || (top[0].output_tokens || 0) <= 0) { return; }
+      chartWrap.appendChild(el('div', { 'class': 'cost-chart-title', text: 'Top sessions by output tokens' }));
+      var max = top[0].output_tokens || 1;
+      top.forEach(function (s) {
+        var pct = Math.max(2, Math.round(100 * (s.output_tokens || 0) / max));
+        var fill = el('div', { 'class': 'cost-bar-fill' }); fill.style.width = pct + '%';
+        chartWrap.appendChild(el('div', { 'class': 'cost-bar' }, [
+          el('div', { 'class': 'cost-bar-label', title: s.session_id || '', text: shortId(s.session_id) }),
+          el('div', { 'class': 'cost-bar-track' }, [fill]),
+          el('div', { 'class': 'cost-bar-val', text: compactN(s.output_tokens || 0) })
+        ]));
+      });
+    }
+    function renderTotals(visible) {
+      totalsRow.textContent = '';
+      if (!visible.length) { return; }
+      var ctx = 0, out = 0;
+      visible.forEach(function (s) { ctx += (s.context_tokens || 0); out += (s.output_tokens || 0); });
+      totalsRow.appendChild(el('span', { 'class': 'cost-totals-k', text: 'TOTALS' }));
+      totalsRow.appendChild(el('span', { 'class': 'cost-totals-v' }, [el('b', { text: compactN(ctx) }), ' context']));
+      totalsRow.appendChild(el('span', { 'class': 'cost-totals-v' }, [el('b', { text: compactN(out) }), ' output']));
+      totalsRow.appendChild(el('span', { 'class': 'cost-totals-v' }, [el('b', { text: String(visible.length) }), ' session' + (visible.length === 1 ? '' : 's')]));
+    }
+    function paintCount(shown) {
+      countLine.textContent = '';
+      var kids = [el('b', { text: String(shown) }), ' shown'];
+      if (state.q || state.passport || state.plan || state.minBurn || state.from || state.to) { kids.push(' (filtered)'); }
+      kids.push(' · '); kids.push(el('b', { text: String(state.all.length) })); kids.push(' session report' + (state.all.length === 1 ? '' : 's') + ' posted');
+      kids.forEach(function (k) { countLine.appendChild(typeof k === 'string' ? doc().createTextNode(k) : k); });
+    }
+    function emptyState() {
+      listWrap.textContent = '';
+      chartWrap.textContent = ''; totalsRow.textContent = '';
+      var box = el('div', { 'class': 'facts-empty ctl-desc' }, [
+        el('p', { text: 'No session cost reports posted for this tenant.' }),
+        el('p', { text: 'The token-burn lens is POST-fed: it renders reports produced by  corecruxctl session cost --post  (which parses your local Claude Code transcript). Nothing is computed until a report is posted.' }),
+        el('p', { text: 'Feature gate: CORECRUXD_FEATURE_COST_LENS must be enabled on the daemon.' })
+      ]);
+      listWrap.appendChild(box);
+      paintCount(0);
+    }
+    function paint() {
+      state.q = (searchInput.value || '').trim().toLowerCase();
+      state.passport = passportSel.value || '';
+      state.plan = planSel.value || '';
+      state.minBurn = Math.max(0, parseInt(minBurnInput.value, 10) || 0);
+      state.from = fromInput.value || ''; state.to = toInput.value || '';
+      if (!state.all.length) { emptyState(); return; }
+      var visible = state.all.filter(matches);
+      renderChart(visible); renderTotals(visible);
+      listWrap.textContent = '';
+      if (!visible.length) { listWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'No sessions match the filters.' })); paintCount(0); return; }
+      visible.forEach(function (s) { listWrap.appendChild(rowEl(s)); });
+      paintCount(visible.length);
+    }
+    function loadPlans() {
+      return fetchJSON('/v1/work?source=all').then(function (res) {
+        var map = {};
+        if (res.ok && res.data) {
+          var items = res.data.work || res.data.items || res.data.work_items || [];
+          items.forEach(function (w) { if (w && typeof w.id === 'string' && w.id.indexOf('execplan:') === 0) { map[w.id] = { state: w.state || null, current_milestone: w.current_milestone || null, title: w.title || null }; } });
+        }
+        state.plans = map;
+      });
+    }
+    function load() {
+      if (state.loading) { return; }
+      state.loading = true; state.token++; var myToken = state.token;
+      listWrap.textContent = ''; listWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'loading…' }));
+      Promise.all([fetchJSON('/v1/cost/report?tenant_id=default&token_budget=4000'), loadPlans()]).then(function (rr) {
+        var res = rr[0];
+        if (myToken !== state.token) { return; }
+        state.loading = false;
+        if (!res.ok || !res.data) {
+          banner.style.display = ''; banner.className = 'facts-banner err';
+          banner.textContent = (res.status === 404)
+            ? 'Cost lens off — set CORECRUXD_FEATURE_COST_LENS=1 on the daemon (GET /v1/cost/report → 404).'
+            : 'Cost report unavailable — ' + (res.status === 0 ? 'daemon unreachable' : 'HTTP ' + res.status) + '.';
+          listWrap.textContent = ''; chartWrap.textContent = ''; totalsRow.textContent = ''; return;
+        }
+        banner.style.display = 'none';
+        state.all = arr(res.data.sessions);
+        fillSelects();
+        paint();
+      });
+    }
+    [searchInput, minBurnInput].forEach(function (n) { n.addEventListener('input', paint); });
+    [passportSel, planSel, fromInput, toInput].forEach(function (n) { n.addEventListener('change', paint); });
+    load();
+  }
+
+  // console-surfaces-remediation M4: the activity log is DEFAULT-ON. On open it
+  // pulls the all-sessions lane (GET /v1/activity with `session` OMITTED —
+  // recent_all across every session for the tenant, cursor-paged by `before` =
+  // last row's `cursor`) so the operator sees the live rolling record without
+  // typing a session id. Entering a session id switches to that single session
+  // (server `recent`, newest `limit`, no older paging); clearing it returns to
+  // all-sessions. Search + kind chips are CLIENT-SIDE over the LOADED rows
+  // (labelled so — the daemon has no activity full-text search). Live tail: the
+  // `activity.appended` SSE carries ids-only, so the honest-cheap merge refetches
+  // page 1 for the current mode and prepends genuinely-new rows. Through-client
+  // only (activityBackfill → CruxApi.activity), el()/textContent, no innerHTML.
+  var ACT_DOM_CAP = 1500;               // hard ceiling on rendered rows (never all-in)
+  // Page-size budget for the default-on first pull: sized so the all-sessions
+  // lane opens ALREADY populated (a rolling-log surface, not an empty prompt) —
+  // ~80 rows on production-shaped data (200-char previews); `limit` caps at 100
+  // and the budget binds first. Older pages reuse the same budget via `before`.
+  var ACT_DEFAULT_BUDGET = 8000;
+  var ACT_PAGE_LIMIT = 100;
+  function renderActivityLog(host) {
+    host.textContent = '';
+    if (__actLogES) { try { __actLogES.close(); } catch (e) { /* noop */ } __actLogES = null; }
+
+    function nfmt(n) { if (typeof n !== 'number' || !isFinite(n)) { return (n == null) ? '—' : String(n); } try { return n.toLocaleString('en-US'); } catch (e) { return String(n); } }
+    function shortId(id) { var s = String(id || ''); return s.length > 8 ? s.slice(0, 8) : (s || '—'); }
+    function relTime(iso) {
+      var t = Date.parse(iso || ''); if (!isFinite(t)) { return String(iso || '—'); }
+      var s = Math.max(0, Math.round((Date.now() - t) / 1000));
+      if (s < 60) { return s + 's ago'; }
+      var m = Math.round(s / 60); if (m < 60) { return m + 'm ago'; }
+      var h = Math.round(m / 60); if (h < 48) { return h + 'h ago'; }
+      return Math.round(h / 24) + 'd ago';
+    }
+
+    var state = {
+      tenant: 'default', session: '', budget: ACT_DEFAULT_BUDGET, limit: ACT_PAGE_LIMIT,
+      rows: [], seen: {}, kindsPresent: {}, kindsOff: {},
+      nextCursor: null, hasMore: false, truncated: false,
+      loading: false, token: 0, deb: null, liveDeb: null
+    };
+    function rowKey(r) { return (r.session_id || '') + ':' + r.seq; }
+    function anyKindOff() { return Object.keys(state.kindsOff).some(function (k) { return state.kindsOff[k]; }); }
+    function isFiltered() { return !!((searchInput.value || '').trim()) || anyKindOff(); }
+
+    // ---- controls ----
+    var sessionInput = el('input', { 'class': 'act-input', type: 'text', placeholder: 'session id — blank = all sessions', 'aria-label': 'session id filter' });
+    var budgetInput = el('input', { 'class': 'act-input act-budget', type: 'number', min: '1', value: String(ACT_DEFAULT_BUDGET), 'aria-label': 'token budget per page' });
+    var searchInput = el('input', { 'class': 'act-input', type: 'search', placeholder: 'filter loaded rows (client-side)…', 'aria-label': 'search loaded activity' });
+    function field(label, node) { return el('label', { 'class': 'act-field' }, [el('span', { text: label }), node]); }
+    var kindsWrap = el('div', { 'class': 'act-kinds' });
+    var reloadBtn = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Reload']);
+    var liveBtn = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Go live']);
+    var controls = el('div', { 'class': 'act-controls' }, [field('session', sessionInput), field('token budget', budgetInput), field('search (client-side)', searchInput), kindsWrap, reloadBtn, liveBtn]);
+    var liveDot = el('span', { 'class': 'act-livedot' });
+    var statusText = el('span', { 'class': 'act-statustext', text: 'loading the all-sessions activity lane…' });
+    var countLine = el('p', { 'class': 'facts-count' });
+    var banner = el('div', { 'class': 'facts-banner' }); banner.style.display = 'none';
+    var list = el('div', { 'class': 'act-list' }, [el('p', { 'class': 'ctl-desc', text: 'loading…' })]);
+    var moreWrap = el('div', { 'class': 'facts-more' });
+    var sentinel = el('div', { 'class': 'facts-sentinel' });
+    host.appendChild(el('div', { 'class': 'act-log' }, [controls, el('div', { 'class': 'act-status' }, [liveDot, statusText]), countLine, banner, list, moreWrap, sentinel]));
+
+    function setStatus(t) { statusText.textContent = t; }
+    function modeLabel() { return state.session ? ('session ' + shortId(state.session)) : 'all sessions'; }
+
+    // Kind chips are derived from the LOADED rows (kind → count) and filter
+    // client-side (toggle off to hide). Stable ACT_KINDS order first, then any
+    // unknown kinds. A chip carries its loaded count; toggling never re-queries.
+    function updateKindsPresent() {
+      var c = {};
+      state.rows.forEach(function (r) { var k = r.kind || 'idle'; c[k] = (c[k] || 0) + 1; });
+      state.kindsPresent = c;
+    }
+    function renderKinds() {
+      kindsWrap.textContent = '';
+      var order = ACT_KINDS.filter(function (k) { return state.kindsPresent[k]; });
+      Object.keys(state.kindsPresent).forEach(function (k) { if (order.indexOf(k) < 0) { order.push(k); } });
+      if (!order.length) { return; }
+      order.forEach(function (k) {
+        var on = !state.kindsOff[k];
+        var chip = el('button', { 'class': 'act-kchip k-' + k + (on ? ' on' : ''), type: 'button', 'aria-pressed': on ? 'true' : 'false', title: 'client-side filter — toggle ' + k + ' rows' },
+          [el('span', { text: k }), el('span', { 'class': 'act-kc', text: String(state.kindsPresent[k]) })]);
+        chip.addEventListener('click', function () { state.kindsOff[k] = on; renderKinds(); paint(); });
+        kindsWrap.appendChild(chip);
+      });
+    }
+
+    function matches(r, q) {
+      if (!q) { return true; }
+      return ((r.session_id || '') + ' ' + (r.kind || '') + ' ' + (r.preview || '') + ' ' + (r.tool || '') + ' ' + (r.intent || '') + ' ' + (r.turn_id || '')).toLowerCase().indexOf(q) >= 0;
+    }
+    function visibleRows() {
+      var q = (searchInput.value || '').trim().toLowerCase();
+      return state.rows.filter(function (r) { return !state.kindsOff[r.kind || 'idle'] && matches(r, q); });
+    }
+    function emptyMsg() {
+      return state.session
+        ? ('No activity for session ' + shortId(state.session) + ' yet.')
+        : 'The activity journal is empty. It fills as agents work — every question, answer, reasoning step, tool command, fact write, ExecPlan update, and handoff is appended to the activity journal (GET /v1/activity, gated by CORECRUXD_FEATURE_ACTIVITY_LOG).';
+    }
+
+    function paintCount(shown) {
+      countLine.textContent = '';
+      var loaded = state.rows.length;
+      var kids = [el('b', { text: nfmt(shown) }), ' shown'];
+      if (isFiltered()) { kids.push(' (filtered client-side)'); }
+      kids.push(' of '); kids.push(el('b', { text: nfmt(loaded) })); kids.push(' loaded · ' + modeLabel());
+      if (!state.session && state.hasMore) { kids.push(' · journal holds more — Load older'); }
+      kids.forEach(function (k) { countLine.appendChild(typeof k === 'string' ? doc().createTextNode(k) : k); });
+    }
+    function paintMore() {
+      moreWrap.textContent = '';
+      if (state.session) {
+        // Single-session view: the daemon's per-session read returns the newest
+        // `limit` with no `before` older-paging. Say so honestly when it's full.
+        if (state.hasMore && state.rows.length >= state.limit) {
+          moreWrap.appendChild(el('p', { 'class': 'ctl-desc', text: 'Showing the most recent ' + nfmt(state.rows.length) + ' for this session — the single-session view is not paginated. Raise the token budget, or clear the session for the paged all-sessions timeline.' }));
+        }
+        return;
+      }
+      if (state.rows.length >= ACT_DOM_CAP) { moreWrap.appendChild(el('p', { 'class': 'facts-cap', text: 'Rendered ' + nfmt(ACT_DOM_CAP) + '+ rows — narrow with search or kind chips to keep paging.' })); return; }
+      if (state.hasMore) {
+        var btn = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Load older']);
+        btn.addEventListener('click', loadOlder);
+        moreWrap.appendChild(btn);
+      } else if (state.rows.length) {
+        moreWrap.appendChild(el('p', { 'class': 'ctl-desc', text: 'End of the activity journal.' }));
+      }
+    }
+    function paint() {
+      var vis = visibleRows();
       list.textContent = '';
-      var visible = state.rows.filter(function (r) { return state.kinds[r.kind] && matches(r, q); });
-      if (!visible.length) { list.appendChild(el('p', { 'class': 'ctl-desc', text: state.rows.length ? 'No matching activity.' : 'No activity loaded yet.' })); return; }
-      visible.forEach(function (r) { list.appendChild(rowEl(r)); });
+      if (!vis.length) {
+        list.appendChild(el('p', { 'class': 'ctl-desc', text: state.rows.length ? 'No loaded rows match the current search / kind filter.' : emptyMsg() }));
+      } else {
+        vis.forEach(function (r) { list.appendChild(rowEl(r)); });
+      }
+      paintCount(vis.length);
+      paintMore();
+    }
+
+    function refChip(cls, glyph, id, kind) {
+      return el('span', { 'class': 'act-ref ' + cls, title: kind + ' ' + id, text: glyph + ' ' + String(id).slice(0, 14) });
     }
     function rowEl(r) {
-      var meta = el('div', { 'class': 'act-meta' }, [
-        el('span', { 'class': 'act-kind', text: r.kind || '' }),
-        el('span', { text: 'seq ' + r.seq }),
-        el('span', { text: r.ts || '' }),
-        el('span', { text: r.turn_id ? ('turn ' + r.turn_id) : '—' })
-      ]);
+      var meta = el('div', { 'class': 'act-meta' });
+      meta.appendChild(el('span', { 'class': 'act-kind', text: r.kind || '' }));
+      // Session short-id pill — click prefills the session filter (single-session).
+      var sess = el('button', { 'class': 'act-sess', type: 'button', title: 'filter to session ' + (r.session_id || ''), text: shortId(r.session_id) });
+      sess.addEventListener('click', function (e) { e.stopPropagation(); focusSession(r.session_id); });
+      meta.appendChild(sess);
+      // Relative time; absolute ISO on hover (title).
+      meta.appendChild(el('span', { 'class': 'act-time', title: r.ts || '', text: relTime(r.ts) }));
+      meta.appendChild(el('span', { text: 'seq ' + r.seq }));
       var extra = [r.tool, r.intent, (r.confidence != null ? ('conf ' + r.confidence) : null)].filter(Boolean).join(' · ');
       if (extra) { meta.appendChild(el('span', { text: extra })); }
+      var kids = [meta, el('div', { 'class': 'act-preview', text: r.preview || '' })];
+      // Receipt / fact-ref chips where present.
+      var receipts = r.receipt_ids || [], facts = r.fact_refs || [];
+      if (receipts.length || facts.length) {
+        var refs = el('div', { 'class': 'act-refs' });
+        receipts.slice(0, 3).forEach(function (rid) { refs.appendChild(refChip('rc', '✎', rid, 'receipt')); });
+        if (receipts.length > 3) { refs.appendChild(el('span', { 'class': 'act-ref', text: '+' + (receipts.length - 3) + ' receipts' })); }
+        facts.slice(0, 2).forEach(function (fid) { refs.appendChild(refChip('fr', '◆', fid, 'fact')); });
+        if (facts.length > 2) { refs.appendChild(el('span', { 'class': 'act-ref', text: '+' + (facts.length - 2) + ' facts' })); }
+        kids.push(refs);
+      }
       var expand = el('div', { 'class': 'act-expand' }, [el('div', { 'class': 'act-verbatim', text: 'loading verbatim…' }), el('div', { 'class': 'act-receipts' })]);
-      var row = el('div', { 'class': 'act-row k-' + (r.kind || 'idle'), role: 'button', tabindex: '0' }, [meta, el('div', { 'class': 'act-preview', text: r.preview || '' }), expand]);
+      kids.push(expand);
+      var row = el('div', { 'class': 'act-row k-' + (r.kind || 'idle'), role: 'button', tabindex: '0' }, kids);
       var opened = false;
       function toggle() { var o = row.classList.toggle('open'); if (o && !opened) { opened = true; expandRow(row, r); } }
       row.addEventListener('click', toggle);
@@ -5513,8 +6857,10 @@
     }
     function expandRow(row, r) {
       var vb = row.querySelector('.act-verbatim'), rc = row.querySelector('.act-receipts');
-      if (!r.turn_id) { vb.textContent = r.preview || '(no turn id — preview only)'; return; }
-      var query = { tenant_id: state.tenant, session: state.session };
+      // Deref uses the ROW's own session (all-sessions rows each carry one).
+      var sess = r.session_id || state.session;
+      if (!r.turn_id || !sess) { vb.textContent = r.preview || '(no turn id — preview only)'; return; }
+      var query = { tenant_id: state.tenant, session: sess };
       activityTurnCall('activityTurnByTurnId', r.turn_id, query).then(function (res) {
         if (!res.ok || !res.data) { vb.textContent = 'deref failed (HTTP ' + (res.status || '?') + ')'; return; }
         var entries = res.data.entries || [];
@@ -5535,32 +6881,674 @@
         });
       });
     }
+
+    // ---- loaders ----
+    function buildQuery(before) {
+      var q = { tenant_id: state.tenant, token_budget: state.budget, limit: state.limit };
+      if (state.session) { q.session = state.session; }           // omit ⇒ all-sessions lane
+      if (before != null) { q.before = before; }                  // older-page cursor (all-sessions only)
+      return q;
+    }
+    function ingest(rows) {
+      var fresh = [];
+      (rows || []).forEach(function (r) { var k = rowKey(r); if (state.seen[k]) { return; } state.seen[k] = true; state.rows.push(r); fresh.push(r); });
+      return fresh;
+    }
+    function loadFresh() {
+      state.session = (sessionInput.value || '').trim();
+      state.budget = parseInt(budgetInput.value, 10) || ACT_DEFAULT_BUDGET;
+      state.token++;
+      state.rows = []; state.seen = {}; state.kindsPresent = {}; state.kindsOff = {};
+      state.nextCursor = null; state.hasMore = false; state.truncated = false; state.loading = false;
+      banner.style.display = 'none'; moreWrap.textContent = ''; kindsWrap.textContent = '';
+      list.textContent = ''; list.appendChild(el('p', { 'class': 'ctl-desc', text: 'loading…' }));
+      setStatus('loading the ' + modeLabel() + ' lane…');
+      loadPage(null, true);
+    }
+    function loadPage(before, isFirst) {
+      if (state.loading) { return; }
+      state.loading = true;
+      var myToken = state.token;
+      activityBackfill(buildQuery(before)).then(function (res) {
+        if (myToken !== state.token) { return; }
+        state.loading = false;
+        if (res.status === 404) { handle404(); return; }
+        if (!res.ok || !res.data) {
+          if (isFirst) { banner.style.display = ''; banner.className = 'facts-banner err'; banner.textContent = 'Activity load failed — ' + (res.status === 0 ? 'daemon unreachable' : 'HTTP ' + res.status) + '.'; list.textContent = ''; countLine.textContent = ''; }
+          setStatus('load failed (HTTP ' + (res.status || '?') + ')');
+          return;
+        }
+        var d = res.data;
+        state.hasMore = !!d.has_more;
+        state.nextCursor = (d.next_cursor != null) ? d.next_cursor : null;
+        state.truncated = !!d.truncated;
+        ingest(d.rows);
+        updateKindsPresent(); renderKinds();
+        setStatus(nfmt(state.rows.length) + ' row(s) loaded' + (state.truncated ? ' · page budget-truncated (raise token budget)' : '') + ' · ' + modeLabel());
+        paint();
+      });
+    }
+    function loadOlder() {
+      if (state.loading || state.session || !state.hasMore) { return; }   // older-paging is all-sessions only
+      if (state.rows.length >= ACT_DOM_CAP) { paintMore(); return; }
+      if (state.nextCursor == null) { return; }
+      loadPage(state.nextCursor, false);
+    }
+
+    // Honest flag-off state — keep the CORECRUXD_FEATURE_ACTIVITY_LOG copy. Under
+    // ?demo=1 a labelled fixture stands in (a real, enabled daemon never 404s).
+    function handle404() {
+      var demoAct = demoOn() ? demoData('activityLog') : null;
+      if (demoAct && demoAct.length) {
+        state.rows = demoAct.map(function (r) { var c = {}; for (var k in r) { c[k] = r[k]; } if (!c.session_id) { c.session_id = 'sess_demo01'; } return c; });
+        state.seen = {}; state.rows.forEach(function (r) { state.seen[rowKey(r)] = true; });
+        state.hasMore = false; state.nextCursor = null;
+        updateKindsPresent(); renderKinds();
+        banner.style.display = ''; banner.className = 'facts-banner';
+        banner.textContent = 'Activity log route is off (CORECRUXD_FEATURE_ACTIVITY_LOG) — showing a labelled demo fixture. Enable the flag for live data.';
+        setStatus(nfmt(state.rows.length) + ' row(s) · demo');
+        paint();
+        return;
+      }
+      state.rows = []; state.hasMore = false; state.nextCursor = null;
+      banner.style.display = ''; banner.className = 'facts-banner warn';
+      banner.textContent = 'Activity log disabled on this daemon — set CORECRUXD_FEATURE_ACTIVITY_LOG=1 to enable GET /v1/activity and the live stream.';
+      setStatus('route unavailable (404)');
+      list.textContent = ''; list.appendChild(el('p', { 'class': 'ctl-desc', text: 'The activity journal route is off on this daemon.' }));
+      countLine.textContent = ''; moreWrap.textContent = '';
+    }
+
+    // ---- live tail: the SSE event is ids-only, so refetch page 1 for the
+    //      current mode (budgeted) and prepend genuinely-new rows (dedup on
+    //      session:seq). Cheap + honest — no fabricated rows from the event. ----
+    function focusSession(id) { sessionInput.value = id || ''; loadFresh(); }
+    function scheduleLiveMerge() { clearTimeout(state.liveDeb); state.liveDeb = setTimeout(mergeNewest, 500); }
+    function mergeNewest() {
+      var myToken = state.token;
+      activityBackfill(buildQuery(null)).then(function (res) {
+        if (myToken !== state.token) { return; }
+        if (!res.ok || !res.data) { return; }
+        var incoming = res.data.rows || [], added = 0;
+        for (var i = incoming.length - 1; i >= 0; i--) {              // oldest→newest so newest ends at index 0
+          var r = incoming[i], k = rowKey(r);
+          if (state.seen[k]) { continue; }
+          state.seen[k] = true; state.rows.unshift(r); added++;
+        }
+        if (added) {
+          updateKindsPresent(); renderKinds(); paint();
+          setStatus('+' + added + ' new · ' + nfmt(state.rows.length) + ' loaded · live · ' + modeLabel());
+        }
+      });
+    }
     function toggleLive() {
       if (__actLogES) { try { __actLogES.close(); } catch (e) { /* noop */ } __actLogES = null; liveDot.classList.remove('on'); liveBtn.textContent = 'Go live'; return; }
       if (typeof EventSource === 'undefined') { setStatus('Live streaming unsupported in this browser.'); return; }
       try { __actLogES = new EventSource('/v1/events/stream?types=activity.appended'); }
       catch (e) { setStatus('Live stream unavailable.'); return; }
-      __actLogES.addEventListener('activity.appended', function () { clearTimeout(state.deb); state.deb = setTimeout(load, 400); });
+      __actLogES.addEventListener('activity.appended', function () { scheduleLiveMerge(); });
       __actLogES.onerror = function () { liveBtn.textContent = 'Live (reconnecting)'; };
       liveDot.classList.add('on'); liveBtn.textContent = 'Stop live';
     }
-    loadBtn.addEventListener('click', load);
+
+    // ---- wiring ----
+    reloadBtn.addEventListener('click', loadFresh);
     liveBtn.addEventListener('click', toggleLive);
-    searchInput.addEventListener('input', paint);
-    sessionInput.addEventListener('keydown', function (e) { if (e.key === 'Enter') { load(); } });
-    renderKinds();
-    // Demo mode: a fresh daemon gates the activity log (CORECRUXD_FEATURE_ACTIVITY_LOG),
-    // so the surface is blank until Loaded. Under ?demo=1 paint a labelled fixture
-    // of a session's rolling turns (via the demoData() choke point) — a real
-    // session id + Load still overrides it.
-    var demoAct = demoData('activityLog');
-    if (demoAct && demoAct.length) {
-      state.session = 'sess_7f3a1c2b';
-      sessionInput.value = state.session;
-      state.rows = demoAct;
-      setStatus(state.rows.length + ' row(s) · session ' + state.session + ' · demo');
-      paint();
+    searchInput.addEventListener('input', function () { clearTimeout(state.deb); state.deb = setTimeout(paint, 200); });
+    sessionInput.addEventListener('keydown', function (e) { if (e.key === 'Enter') { loadFresh(); } });
+    budgetInput.addEventListener('keydown', function (e) { if (e.key === 'Enter') { loadFresh(); } });
+    if (typeof IntersectionObserver !== 'undefined') {
+      var io = new IntersectionObserver(function (entries) { if (entries[0] && entries[0].isIntersecting) { loadOlder(); } }, { rootMargin: '500px' });
+      io.observe(sentinel);
     }
+    // DEFAULT-ON: pull the all-sessions lane immediately (no session id required).
+    loadFresh();
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  M6 trust cluster — shared helpers for the four custom-rendered pages below.
+  // ─────────────────────────────────────────────────────────────────────────
+  function m6ShortTime(iso) { var s = String(iso || ''); return s.length >= 19 ? s.slice(0, 19).replace('T', ' ') : (s || '—'); }
+  function m6Short(v, n) { var s = String(v == null ? '' : v); return s.length > n ? s.slice(0, n) + '…' : s; }
+  function m6PrettyJson(v) { try { return JSON.stringify(v, null, 2); } catch (e) { return String(v); } }
+  function m6Kv(pairs) {
+    var meta = el('div', { 'class': 'facts-kv' });
+    pairs.forEach(function (kv) {
+      if (kv[1] == null || kv[1] === '') { return; }
+      meta.appendChild(el('span', { 'class': 'facts-kv-k', text: kv[0] }));
+      meta.appendChild(el('span', { 'class': 'facts-kv-v', text: String(kv[1]) }));
+    });
+    return meta;
+  }
+  function m6Label(t) { return el('div', { 'class': 'facts-vlabel', text: t }); }
+  function m6Empty(t) { return el('p', { 'class': 'ctl-desc sess-empty', text: t }); }
+  function m6Chip(cls, text, title) { return el('span', { 'class': cls, title: title || '' }, [String(text)]); }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  cx-receipts (M6): live CROWN receipt listing over GET /v1/receipts/list
+  //  (the new CE-local route). Newest-first rows (ts · kind chip · principal ·
+  //  session pill · signer short + alg · body-hash short), Load-older cursor
+  //  pagination, client-side search + kind chips. Row click → detail drawer:
+  //  envelope fields, and for the fetchable ad_ga_* class the drawer pulls
+  //  /v1/receipts/{id} + /signature + /verification THROUGH THE CLIENT and renders
+  //  the daemon verification verdict VERBATIM (never a client-side "valid" claim).
+  //  Envelope-only rows say why the body is unavailable on a CPU-only daemon.
+  //  Through-client only (fetchJSON + CruxApi named methods), el()/textContent.
+  // ─────────────────────────────────────────────────────────────────────────
+  function renderReceiptsBrowser(host) {
+    host.textContent = '';
+    var TENANT = 'default';
+    function kindTone(kind) {
+      var k = String(kind || '');
+      if (k.indexOf('approval') >= 0 || k.indexOf('gate') >= 0) { return 'trust'; }
+      if (k.indexOf('mediation') >= 0 || k.indexOf('witness') >= 0) { return 'acc'; }
+      if (k.indexOf('error') >= 0 || k.indexOf('deny') >= 0 || k.indexOf('reject') >= 0) { return 'crit'; }
+      if (k.indexOf('model') >= 0 || k.indexOf('response') >= 0 || k.indexOf('stop') >= 0) { return 'ok'; }
+      return 'ink3';
+    }
+    function qs(obj) { var p = []; Object.keys(obj).forEach(function (k) { if (obj[k] != null && obj[k] !== '') { p.push(encodeURIComponent(k) + '=' + encodeURIComponent(obj[k])); } }); return p.join('&'); }
+
+    var state = { rows: [], seen: {}, q: '', kind: '', nextCursor: null, hasMore: false, matched: null, kindCounts: {}, loading: false, token: 0, deb: null };
+
+    var searchInput = el('input', { 'class': 'facts-input', type: 'search', placeholder: 'search id / principal / kind / signer…', 'aria-label': 'search receipts' });
+    function field(label, node) { return el('label', { 'class': 'facts-field' }, [el('span', { text: label }), node]); }
+    var toolbar = el('div', { 'class': 'facts-toolbar' }, [field('search', searchInput)]);
+    var countLine = el('p', { 'class': 'facts-count' });
+    var chipsWrap = el('div', { 'class': 'facts-chips' });
+    var banner = el('div', { 'class': 'facts-banner' }); banner.style.display = 'none';
+    var listWrap = el('div', { 'class': 'facts-groups' });
+    var moreWrap = el('div', { 'class': 'facts-more' });
+    var help = el('div', { 'class': 'facts-banner m6-help' }, [
+      el('div', { 'class': 'm6-help-h', text: 'Verify a receipt offline' }),
+      el('p', { 'class': 'ctl-desc', text: 'The signed envelope (signer · alg · body hash · chain seq) is listed here for every observation. A CPU-only Crux daemon holds no dataplane, so the full CROWN body / signature / verification is dereferenceable only for the local ad_ga_* gate-approval receipts (open one to pull the daemon verdict verbatim). Dataplane receipts live in the hosted tier.' }),
+      el('p', { 'class': 'ctl-desc', text: 'Offline: corecruxctl inspect-receipt <id> (or corecruxctl evidence <id> --keyring <path>) checks the Ed25519 signature without the daemon. Bundle export: GET /v1/replay/exports/receipts/{id}.' })
+    ]);
+    host.appendChild(el('div', { 'class': 'facts-browser' }, [toolbar, countLine, chipsWrap, banner, listWrap, moreWrap, help]));
+
+    function matches(r, q) {
+      if (!q) { return true; }
+      var rc = r.receipt || {};
+      return ((r.observation_id || '') + ' ' + (r.principal || '') + ' ' + (r.kind || '') + ' ' + (r.session_id || '') + ' ' + (rc.signed_by || '') + ' ' + (r.receipt_id || '')).toLowerCase().indexOf(q) >= 0;
+    }
+    function visibleRows() {
+      var q = state.q;
+      return state.rows.filter(function (r) { return (!state.kind || r.kind === state.kind) && matches(r, q); });
+    }
+    function paintCount() {
+      countLine.textContent = '';
+      var vis = visibleRows().length;
+      var kids = [el('b', { text: String(vis) }), ' shown'];
+      if (state.q || state.kind) { kids.push(' (filtered)'); }
+      kids.push(' · '); kids.push(el('b', { text: String(state.rows.length) })); kids.push(' loaded');
+      if (state.matched != null) { kids.push(' · '); kids.push(el('b', { text: String(state.matched) })); kids.push(' on this daemon'); }
+      kids.forEach(function (k) { countLine.appendChild(typeof k === 'string' ? doc().createTextNode(k) : k); });
+    }
+    function paintChips() {
+      chipsWrap.textContent = '';
+      var counts = state.kindCounts || {};
+      var keys = Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a]; }).slice(0, 12);
+      if (!keys.length) { return; }
+      var allChip = el('button', { 'class': 'facts-chip' + (state.kind ? '' : ' on'), type: 'button', title: 'all kinds' }, ['all']);
+      allChip.addEventListener('click', function () { state.kind = ''; paint(); });
+      chipsWrap.appendChild(allChip);
+      keys.forEach(function (k) {
+        var active = state.kind === k;
+        var chip = el('button', { 'class': 'facts-chip' + (active ? ' on' : ''), type: 'button', title: 'filter to kind ' + k }, [el('span', { text: k }), el('span', { 'class': 'c', text: String(counts[k]) })]);
+        chip.addEventListener('click', function () { state.kind = active ? '' : k; paint(); });
+        chipsWrap.appendChild(chip);
+      });
+    }
+    function rowEl(r) {
+      var rc = r.receipt || {};
+      var head = el('div', { 'class': 'facts-rhead' }, [
+        m6Chip('rcpt-kind tone-' + kindTone(r.kind), r.kind || 'observation', 'observation kind'),
+        el('span', { 'class': 'facts-entity', text: r.principal || '(no principal)' }),
+        r.session_short ? m6Chip('sess-chip', r.session_short, 'session ' + (r.session_id || '')) : null,
+        el('span', { 'class': 'facts-time', text: m6ShortTime(r.ts) })
+      ]);
+      var metaChips = el('div', { 'class': 'sess-rmeta' }, [
+        m6Chip('sess-chip', (rc.alg || '?') + ' · ' + (rc.signed_by_short || '—'), 'signer ' + (rc.signed_by || '')),
+        m6Chip('sess-chip', 'hash ' + (rc.body_hash_short || '—'), rc.body_hash || ''),
+        (r.seq != null) ? m6Chip('sess-chip', 'seq ' + r.seq, 'per-session chain sequence') : null,
+        r.fetchable ? m6Chip('sess-chip rcpt-fetchable', 'CROWN body ✓', 'full body/signature/verification fetchable (ad_ga_*)') : m6Chip('sess-chip rcpt-envonly', 'envelope only', 'body lives in the hosted-tier dataplane')
+      ]);
+      var detail = el('div', { 'class': 'facts-detail' });
+      var row = el('div', { 'class': 'facts-row tone-' + kindTone(r.kind), role: 'button', tabindex: '0' }, [head, metaChips, detail]);
+      var opened = false;
+      function toggle() { if (row.classList.contains('open')) { row.classList.remove('open'); return; } row.classList.add('open'); if (!opened) { opened = true; expandDetail(detail, r); } }
+      row.addEventListener('click', function (e) { if (e.target && e.target.closest && e.target.closest('.facts-detail')) { return; } toggle(); });
+      row.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+      return row;
+    }
+    function expandDetail(detail, r) {
+      var rc = r.receipt || {};
+      detail.textContent = '';
+      detail.appendChild(m6Label('receipt envelope'));
+      detail.appendChild(m6Kv([
+        ['observation_id', r.observation_id], ['session_id', r.session_id], ['ts', r.ts],
+        ['principal', r.principal], ['kind', r.kind], ['chain seq', r.seq],
+        ['alg', rc.alg], ['signed_by', rc.signed_by], ['body_hash', rc.body_hash]
+      ]));
+      if (!r.fetchable) {
+        detail.appendChild(m6Empty('Envelope only. This CPU-only daemon holds no dataplane pool, so the full CROWN body, signature, and verification are not dereferenceable here — dataplane receipts live in the hosted tier. The signed envelope above is the daemon record for this observation.'));
+        return;
+      }
+      detail.appendChild(m6Label('CROWN body / signature / verification'));
+      var slot = el('div', { 'class': 'facts-loading', text: 'fetching receipt ' + m6Short(r.receipt_id, 20) + '…' });
+      detail.appendChild(slot);
+      var id = r.receipt_id;
+      Promise.all([
+        fetchVia(function () { return window.CruxApi.receiptsByReceiptId(id, { tenant_id: TENANT }); }),
+        fetchVia(function () { return window.CruxApi.receiptsByReceiptIdSignature(id, { tenant_id: TENANT }); }),
+        fetchVia(function () { return window.CruxApi.receiptsByReceiptIdVerification(id, { tenant_id: TENANT }); })
+      ]).then(function (rr) {
+        var body = rr[0], sig = rr[1], ver = rr[2];
+        slot.textContent = '';
+        var wrap = el('div', {});
+        wrap.appendChild(m6Kv([
+          ['receipt_id', id],
+          ['body', body.ok ? ('seq ' + (body.data && body.data.seq) + ' · ' + (body.data && body.data.contentType || 'body')) : ('unavailable (HTTP ' + (body.status || '?') + ')')],
+          ['signature', sig.ok ? ('seq ' + (sig.data && sig.data.seq) + ' · ' + (sig.data && sig.data.contentType || 'sig')) : ('unavailable (HTTP ' + (sig.status || '?') + ')')]
+        ]));
+        // Verification verdict — rendered VERBATIM from the daemon report; the
+        // console NEVER computes or claims "valid" itself.
+        wrap.appendChild(m6Label('verification verdict (daemon, verbatim)'));
+        if (!ver.ok || !ver.data) {
+          wrap.appendChild(m6Empty('Verification unavailable (HTTP ' + (ver.status || '?') + ') — GET /v1/receipts/' + id + '/verification.'));
+        } else {
+          var v = ver.data;
+          var verdictClass = (v.signature_valid === true && v.error_code === 'OK') ? 'rcpt-verdict ok' : 'rcpt-verdict bad';
+          wrap.appendChild(el('div', { 'class': verdictClass }, [
+            el('span', { 'class': 'rcpt-verdict-k', text: 'signature_valid' }), el('b', { text: String(v.signature_valid) }),
+            el('span', { 'class': 'rcpt-verdict-k', text: 'error_code' }), el('b', { text: String(v.error_code) })
+          ]));
+          wrap.appendChild(el('pre', { 'class': 'facts-vfull', text: m6PrettyJson(v) }));
+        }
+        detail.appendChild(wrap);
+      });
+    }
+    function paint() {
+      var q = (searchInput.value || '').trim().toLowerCase();
+      state.q = q;
+      listWrap.textContent = '';
+      var vis = visibleRows();
+      if (!state.rows.length) { listWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: state.loading ? 'loading receipts…' : 'No receipts. Receipts are minted on every signed observation (POST /v1/sessions/{id}/observations) and on gate approvals.' })); }
+      else if (!vis.length) { listWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'No receipts match the filter.' })); }
+      else { vis.forEach(function (r) { listWrap.appendChild(rowEl(r)); }); }
+      paintCount(); paintChips();
+    }
+    function paintMore() {
+      moreWrap.textContent = '';
+      if (state.hasMore) {
+        var btn = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Load older']);
+        btn.addEventListener('click', loadNext);
+        moreWrap.appendChild(btn);
+      } else if (state.rows.length) {
+        moreWrap.appendChild(el('p', { 'class': 'ctl-desc', text: 'End of the receipt journal.' }));
+      }
+    }
+    function loadPage(cursor, isFirst) {
+      if (state.loading) { return; }
+      state.loading = true;
+      if (isFirst) { paint(); }
+      var myToken = state.token;
+      var query = { limit: 50 };
+      if (cursor) { query.before = cursor; }
+      fetchJSON('/v1/receipts/list?' + qs(query)).then(function (res) {
+        if (myToken !== state.token) { return; }
+        state.loading = false;
+        if (!res.ok || !res.data) {
+          banner.style.display = ''; banner.className = 'facts-banner err';
+          banner.textContent = 'Receipts listing unavailable — ' + (res.status === 0 ? 'daemon unreachable' : 'HTTP ' + res.status) + ' (needs the console-surfaces-remediation branch: GET /v1/receipts/list).';
+          return;
+        }
+        banner.style.display = 'none';
+        var d = res.data;
+        state.matched = d.matched; state.nextCursor = d.next_cursor || null; state.hasMore = !!d.has_more;
+        if (isFirst && d.kind_counts) { state.kindCounts = d.kind_counts; }
+        (d.rows || []).forEach(function (r) { var k = r.observation_id; if (k && state.seen[k]) { return; } if (k) { state.seen[k] = true; } state.rows.push(r); });
+        paint(); paintMore();
+      });
+    }
+    function loadNext() { if (!state.loading && state.hasMore) { loadPage(state.nextCursor, false); } }
+    searchInput.addEventListener('input', function () { clearTimeout(state.deb); state.deb = setTimeout(paint, 200); });
+    loadPage(null, true);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  cx-gates (M6): the canonical Art.14 approval queue. Live pending list over
+  //  GET /v1/work/gate/pending (unchanged endpoint); when empty, a RICH,
+  //  code-grounded empty state — what a gate is (PendingGateAction), the
+  //  BlockerKind taxonomy (needs_info | needs_approval), how one is created, and
+  //  a client-side join over /v1/work linking blocked items owed an approval.
+  //  Approvals stay operator-gated (approveGate/rejectGate → operatorGatedCall).
+  // ─────────────────────────────────────────────────────────────────────────
+  function renderGatesBoard(host) {
+    host.textContent = '';
+    function ageOf(unixMs) {
+      var at = Number(unixMs); if (!isFinite(at) || at <= 0) { return 'age unknown'; }
+      var m = Math.floor(Math.max(0, Date.now() - at) / 60000);
+      if (m < 1) { return 'just now'; } if (m < 60) { return m + 'm ago'; }
+      var h = Math.floor(m / 60); if (h < 24) { return h + 'h ago'; } return Math.floor(h / 24) + 'd ago';
+    }
+    var state = { pending: [], work: [], loading: false, token: 0 };
+    var head = el('p', { 'class': 'facts-count' });
+    var banner = el('div', { 'class': 'facts-banner' }); banner.style.display = 'none';
+    var listWrap = el('div', { 'class': 'facts-groups' });
+    host.appendChild(el('div', { 'class': 'facts-browser' }, [head, banner, listWrap]));
+
+    function workLink(id) {
+      return el('a', { 'class': 'btn-quiet cx-graphlink', href: '#/canvas/graph?focus=work:' + id, title: 'open ' + id + ' in the relation graph' }, ['View work item']);
+    }
+    function pendingRow(p) {
+      var rows = m6Kv([
+        ['action id', p.action_id], ['work id', p.work_id],
+        ['requested', (p.requested_action || 'update_state') + (p.target_state ? ' → ' + p.target_state : '')],
+        ['by passport', p.requested_by_passport], ['status', p.status || 'pending'], ['requested', ageOf(p.requested_at_unix_ms)]
+      ]);
+      var links = el('div', { 'class': 'sess-rmeta' }, [workLink(p.work_id)]);
+      var actions = el('div', { 'class': 'gate-actions' });
+      if (isOperator()) {
+        var msg = el('span', { 'class': 'ctl-desc' });
+        var approve = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Approve']);
+        var reject = el('button', { 'class': 'btn-quiet danger', type: 'button' }, ['Reject']);
+        function run(fn, verb) {
+          var pp = boundPassport();
+          if (!pp) { msg.textContent = 'Bind a passport first (Art.14 — approvals are passport-attributed).'; return; }
+          approve.disabled = reject.disabled = true; msg.textContent = verb + '…';
+          fn(p.action_id, pp).then(readJson).then(function (r) {
+            msg.textContent = (r && r.ok) ? (verb + ' recorded · receipt ' + m6Short((r.data && (r.data.receipt_id || (r.data.gate && r.data.gate.receipt_id))) || '—', 18)) : (verb + ' failed (HTTP ' + (r && r.status) + ')');
+            load();
+          }, function () { msg.textContent = verb + ' failed.'; approve.disabled = reject.disabled = false; });
+        }
+        approve.addEventListener('click', function () { run(approveGate, 'Approve'); });
+        reject.addEventListener('click', function () { run(rejectGate, 'Reject'); });
+        actions.appendChild(approve); actions.appendChild(reject); actions.appendChild(msg);
+      } else {
+        actions.appendChild(el('p', { 'class': 'ctl-desc', text: 'Approvals are operator-gated (Art.14) — grant an operator scope to approve or reject from the Overwatch “needs you” lane.' }));
+      }
+      var detail = el('div', { 'class': 'facts-detail' }, [rows, links, actions]);
+      var badge = m6Chip('sess-chip sess-chip-plan', 'GATED', 'Art.14 human approval');
+      var body = el('div', {}, [
+        el('div', { 'class': 'facts-rhead' }, [el('span', { 'class': 'facts-key', text: p.work_id || '(work)' }), badge, el('span', { 'class': 'facts-time', text: ageOf(p.requested_at_unix_ms) })]),
+        el('div', { 'class': 'facts-val', text: (p.requested_action || 'update_state') + (p.target_state ? ' → ' + p.target_state : '') + ' · by ' + (p.requested_by_passport || '?') }),
+        detail
+      ]);
+      var row = el('div', { 'class': 'facts-row open tone-warn' }, [body]);
+      return row;
+    }
+    function richEmpty() {
+      var wrap = el('div', {});
+      wrap.appendChild(el('div', { 'class': 'facts-banner ok-empty' }, [
+        el('div', { 'class': 'm6-help-h', text: 'No gates pending — the queue is clear.' }),
+        el('p', { 'class': 'ctl-desc', text: 'This is the canonical Art.14 approval queue. A gate is a PendingGateAction: it is created when an agent requests a work-item state transition that the work-gate policy holds for a human go/no-go (e.g. a destructive or high-risk update_state). It waits here with status “pending” until an operator approves or rejects — that decision mints a CROWN approval receipt (ad_ga_*), visible on the Receipts page.' })
+      ]));
+      wrap.appendChild(m6Label('how a gate is created'));
+      wrap.appendChild(m6Kv([
+        ['producer', 'work-gate policy on a state transition (WorkTransition → PendingGateAction)'],
+        ['endpoint', 'GET /v1/work/gate/pending (this page) · POST /v1/work/gate/{actionId}/approve|reject'],
+        ['requested_action', 'update_state (the only gated action today) + target_state'],
+        ['resolution', 'approve/reject → CROWN ad_ga_* receipt, attributed to the approving passport']
+      ]));
+      wrap.appendChild(m6Label('blocker taxonomy (work.rs BlockerKind)'));
+      wrap.appendChild(m6Kv([
+        ['needs_info', 'blocked, waiting on an answer about the task'],
+        ['needs_approval', 'blocked, waiting on an owner’s go/no-go — a HINT an approval is owed (not the gate itself; the gate stays keyed on passport/risk)']
+      ]));
+      // Client-side join: blocked work items owed an approval → the producers a
+      // gate would come from. Cheap single read of /v1/work.
+      var owed = state.work.filter(function (w) { return w && w.state === 'blocked' && (w.blocker_kind === 'needs_approval'); });
+      wrap.appendChild(m6Label('work items owed an approval (blocked · needs_approval)'));
+      if (!owed.length) {
+        wrap.appendChild(m6Empty('None — no blocked work item currently carries blocker_kind = needs_approval on /v1/work.'));
+      } else {
+        owed.slice(0, 25).forEach(function (w) {
+          var r = el('div', { 'class': 'facts-row tone-warn' }, [
+            el('div', { 'class': 'facts-rhead' }, [el('span', { 'class': 'facts-key', text: w.id }), m6Chip('sess-chip', 'needs_approval', 'blocker kind'), el('span', { 'class': 'facts-time', text: w.state })]),
+            w.title ? el('div', { 'class': 'facts-val', text: w.title }) : null,
+            el('div', { 'class': 'sess-rmeta' }, [workLink(w.id)])
+          ]);
+          wrap.appendChild(r);
+        });
+      }
+      return wrap;
+    }
+    function paint() {
+      listWrap.textContent = '';
+      var pend = (state.pending || []).filter(function (p) { return (p.status || 'pending') === 'pending'; });
+      head.textContent = '';
+      head.appendChild(el('b', { text: String(pend.length) }));
+      head.appendChild(doc().createTextNode(' pending · /v1/work/gate/pending'));
+      if (pend.length) { pend.forEach(function (p) { listWrap.appendChild(pendingRow(p)); }); }
+      else { listWrap.appendChild(richEmpty()); }
+    }
+    function load() {
+      if (state.loading) { return; } state.loading = true; state.token++;
+      var myToken = state.token;
+      Promise.all([fetchJSON('/v1/work/gate/pending'), fetchJSON('/v1/work?source=all')]).then(function (rr) {
+        if (myToken !== state.token) { return; }
+        state.loading = false;
+        var g = rr[0], w = rr[1];
+        if (!g.ok || !g.data) { banner.style.display = ''; banner.className = 'facts-banner err'; banner.textContent = 'Gates unavailable — ' + (g.status === 0 ? 'daemon unreachable' : 'HTTP ' + g.status) + '.'; listWrap.textContent = ''; return; }
+        banner.style.display = 'none';
+        state.pending = g.data.pending || [];
+        state.work = (w.ok && w.data) ? (w.data.work || w.data.items || w.data.work_items || []) : [];
+        paint();
+      });
+    }
+    load();
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  cx-identity (M6): the candidate-links surface. (a) an in-page help panel
+  //  grounded in the code (what a candidate is, the NEW propose route + its two
+  //  inputs, how consent disposes, the flag); (b) live candidates from
+  //  /v1/identity/candidates (honest 404 naming the flag when off); (c) an
+  //  operator-gated "Seed candidates" action wired to POST /v1/identity/candidates/
+  //  propose through operatorGatedCall (disabled + reason in customer posture);
+  //  confirm kept under the operator-gating idiom.
+  // ─────────────────────────────────────────────────────────────────────────
+  function renderIdentityBrowser(host) {
+    host.textContent = '';
+    var state = { candidates: [], status: 0, loading: false, token: 0 };
+
+    var help = el('div', { 'class': 'facts-banner m6-help' }, [
+      el('div', { 'class': 'm6-help-h', text: 'Candidate links — inference proposes, consent disposes' }),
+      el('p', { 'class': 'ctl-desc', text: 'A candidate is a PROPOSAL that two identities (a local passport and an observed subject) may be the same principal. Candidates never resolve on their own — the principal resolver ignores them until an operator confirms.' })
+    ]);
+    var pipeline = el('div', {});
+    pipeline.appendChild(m6Label('what writes candidates'));
+    pipeline.appendChild(m6Kv([
+      ['producer', 'POST /v1/identity/candidates/propose (the NEW M6 seed route — the only shipped producer)'],
+      ['input · bindings', 'session→passport bindings: two distinct passports co-occurring in one tenant+project within the temporal window'],
+      ['input · observations', 'observation-journal principals: distinct signing identities co-occurring in one session'],
+      ['confirm', 'POST …/{id}/confirm with the cross-signature proof → mints a resolving, cross-signed identity_link'],
+      ['reject', 'POST …/{id}/reject → keeps the audit trail, never resolves'],
+      ['revoke', 'POST /v1/identity/links/{id}/revoke → retires a confirmed link'],
+      ['flag', 'CORECRUXD_IDENTITY_LINKS=1 (all /v1/identity/* 404 when off)']
+    ]));
+    help.appendChild(pipeline);
+
+    var seedWrap = el('div', { 'class': 'facts-toolbar', 'style': 'margin-top:10px' });
+    var seedMsg = el('span', { 'class': 'ctl-desc' });
+    var seedBtn = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Seed candidates']);
+    if (!isOperator()) {
+      seedBtn.disabled = true;
+      seedBtn.setAttribute('data-requires', 'operator');
+      seedBtn.setAttribute('title', 'operator posture required — the seed route is admin:write');
+      seedMsg.textContent = 'Operator posture required to run the proposers (admin:write).';
+    } else {
+      seedBtn.addEventListener('click', function () {
+        seedBtn.disabled = true; seedMsg.textContent = 'running proposers…';
+        seedIdentityCandidates().then(readJson).then(function (r) {
+          seedBtn.disabled = false;
+          if (r && r.ok && r.data) {
+            var by = r.data.by_source || {};
+            seedMsg.textContent = 'created ' + r.data.created + ' (examined ' + r.data.examined + ') · bindings ' + ((by.bindings && by.bindings.created) || 0) + '/' + ((by.bindings && by.bindings.examined) || 0) + ' · observations ' + ((by.observations && by.observations.created) || 0) + '/' + ((by.observations && by.observations.examined) || 0);
+            load();
+          } else { seedMsg.textContent = 'seed failed (HTTP ' + (r && r.status) + ')'; }
+        }, function () { seedBtn.disabled = false; seedMsg.textContent = 'seed failed.'; });
+      });
+    }
+    seedWrap.appendChild(seedBtn); seedWrap.appendChild(seedMsg);
+    help.appendChild(seedWrap);
+
+    var countLine = el('p', { 'class': 'facts-count' });
+    var banner = el('div', { 'class': 'facts-banner' }); banner.style.display = 'none';
+    var listWrap = el('div', { 'class': 'facts-groups' });
+    host.appendChild(el('div', { 'class': 'facts-browser' }, [help, countLine, banner, listWrap]));
+
+    function candidateRow(c) {
+      var cand = c.candidate || c;
+      var id = c.candidate_id || cand.candidate_id || c.id;
+      var status = String(cand.status || 'proposed');
+      var signals = (cand.signals || []).map(function (s) { return s.kind; }).join(' · ');
+      var detail = el('div', { 'class': 'facts-detail' }, [
+        m6Kv([
+          ['candidate_id', id], ['status', status],
+          ['local passport', cand.local_passport_fpr], ['observed subject', cand.observed_subject],
+          ['confidence', cand.confidence], ['signals', signals || '—'],
+          ['evidence', (cand.evidence_refs || []).join(', ')], ['proposed at', cand.proposed_at],
+          ['resolved link', cand.resolved_link_id]
+        ])
+      ]);
+      if (status === 'proposed' && isOperator()) {
+        detail.appendChild(m6Label('confirm (operator — needs the cross-signature proof)'));
+        var f = {};
+        function inp(k, ph, v) { var i = el('input', { 'class': 'facts-input', type: 'text', placeholder: ph }); if (v) { i.value = v; } f[k] = i; return el('label', { 'class': 'facts-field' }, [el('span', { text: k }), i]); }
+        var form = el('div', { 'class': 'facts-toolbar' }, [
+          inp('local_passport_id', 'personal-default', 'personal-default'),
+          inp('remote_fpr', 'p_… (= observed subject)', cand.observed_subject || ''),
+          inp('remote_public_key_hex', '64 hex chars'),
+          inp('created_at', '2026-06-15T00:00:00Z'),
+          inp('sig_local', '128 hex chars'),
+          inp('sig_remote', '128 hex chars')
+        ]);
+        var cmsg = el('span', { 'class': 'ctl-desc' });
+        var confirmBtn = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Confirm candidate']);
+        confirmBtn.addEventListener('click', function () {
+          confirmBtn.disabled = true; cmsg.textContent = 'verifying signatures…';
+          confirmIdentityCandidate(id, {
+            local_passport_id: f.local_passport_id.value, remote_fpr: f.remote_fpr.value,
+            remote_public_key_hex: f.remote_public_key_hex.value, created_at: f.created_at.value,
+            sig_local: f.sig_local.value, sig_remote: f.sig_remote.value
+          }).then(readJson).then(function (r) {
+            confirmBtn.disabled = false;
+            cmsg.textContent = (r && r.ok) ? 'confirmed → identity_link minted' : 'rejected by daemon (HTTP ' + (r && r.status) + ') — ' + m6Short((r.data && (r.data.detail || r.data.title)) || 'signatures must verify', 80);
+            if (r && r.ok) { load(); }
+          }, function () { confirmBtn.disabled = false; cmsg.textContent = 'confirm failed.'; });
+        });
+        detail.appendChild(form); detail.appendChild(confirmBtn); detail.appendChild(cmsg);
+        detail.appendChild(el('p', { 'class': 'ctl-desc', text: 'Reject is an API/CLI action: POST /v1/identity/candidates/' + id + '/reject (keeps the audit trail).' }));
+      }
+      var tone = status === 'confirmed' ? 'ok' : (status === 'rejected' ? 'crit' : 'trust');
+      var row = el('div', { 'class': 'facts-row tone-' + tone, role: 'button', tabindex: '0' }, [
+        el('div', { 'class': 'facts-rhead' }, [el('span', { 'class': 'facts-key', text: id }), m6Chip('sess-chip', status, 'candidate status'), el('span', { 'class': 'facts-time', text: (cand.confidence != null ? 'conf ' + cand.confidence : '') })]),
+        el('div', { 'class': 'facts-val', text: (cand.observed_subject || '') + (signals ? ' · ' + signals : '') }),
+        detail
+      ]);
+      var opened = false;
+      function toggle() { var o = row.classList.toggle('open'); if (o && !opened) { opened = true; } }
+      row.addEventListener('click', function (e) { if (e.target && e.target.closest && e.target.closest('.facts-detail')) { return; } toggle(); });
+      row.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+      return row;
+    }
+    function paint() {
+      listWrap.textContent = ''; countLine.textContent = '';
+      if (state.status === 404) {
+        banner.style.display = ''; banner.className = 'facts-banner warn';
+        banner.textContent = 'Identity links are disabled on this daemon (all /v1/identity/* return 404). Set CORECRUXD_IDENTITY_LINKS=1 to enable candidates, the seed route, and confirmation.';
+        return;
+      }
+      banner.style.display = 'none';
+      countLine.appendChild(el('b', { text: String(state.candidates.length) }));
+      countLine.appendChild(doc().createTextNode(' candidate' + (state.candidates.length === 1 ? '' : 's') + ' · /v1/identity/candidates'));
+      if (!state.candidates.length) { listWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'No candidates yet. Run “Seed candidates” above (operator) to propose from session bindings + observation principals — a fresh workspace has no other producer.' })); return; }
+      state.candidates.forEach(function (c) { listWrap.appendChild(candidateRow(c)); });
+    }
+    function load() {
+      if (state.loading) { return; } state.loading = true; state.token++;
+      var myToken = state.token;
+      fetchJSON('/v1/identity/candidates').then(function (res) {
+        if (myToken !== state.token) { return; }
+        state.loading = false; state.status = res.status;
+        if (res.status === 404) { paint(); return; }
+        if (!res.ok || !res.data) { banner.style.display = ''; banner.className = 'facts-banner err'; banner.textContent = 'Candidates unavailable — HTTP ' + res.status + '.'; return; }
+        state.candidates = res.data.candidates || [];
+        paint();
+      });
+    }
+    load();
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  cx-mediation (M6): honest CE posture over GET /v1/console/engine/summary,
+  //  branching on the THREE real states — 404 "engine mediation not configured"
+  //  → CE posture card; 502 "engine upstream unavailable" → configured-but-
+  //  unreachable card; 200 → the proxied summary with its mediated/reachable/
+  //  latency stamps. No dead controls are rendered (customer-safe by omission).
+  // ─────────────────────────────────────────────────────────────────────────
+  function renderMediationPosture(host) {
+    host.textContent = '';
+    var banner = el('div', { 'class': 'facts-banner' }); banner.style.display = 'none';
+    var body = el('div', {});
+    host.appendChild(el('div', { 'class': 'facts-browser' }, [banner, body]));
+
+    function ceCard() {
+      var wrap = el('div', {});
+      wrap.appendChild(el('div', { 'class': 'facts-banner m6-help' }, [
+        el('div', { 'class': 'm6-help-h', text: 'CE posture — engine mediation not configured' }),
+        el('p', { 'class': 'ctl-desc', text: 'The gateway (mediation) plane is where a hosted CruxEngine mediates identity, the capability ladder, and Art.15 foresight on the browser’s behalf. This CPU-only Crux daemon holds NO engine state — it only proxies a small, curated set of read summaries when an engine base URL is configured. Right now none is, so the read side is honestly empty rather than a dead pane.' })
+      ]));
+      wrap.appendChild(m6Label('what exists on this daemon'));
+      wrap.appendChild(m6Kv([
+        ['engine state held here', 'none — the daemon proxies, it does not run the engine'],
+        ['configured by', 'CORECRUXD_ENGINE_BASE_URL (+ optional CORECRUXD_ENGINE_API_KEY)'],
+        ['read routes (when configured)', 'GET /v1/console/engine/summary · /bench · /spend (proxied, read-only)'],
+        ['status now', '404 “engine mediation not configured” — base URL unset']
+      ]));
+      wrap.appendChild(m6Label('what a configured engine (M3+) unlocks'));
+      wrap.appendChild(m6Kv([
+        ['summary', 'engine liveness + reachability + latency stamps'],
+        ['bench / spend', 'benchmark manifest + committed escrow spend, proxied'],
+        ['search', 'mediated WikiCrux retrieval (POST /v1/console/engine/search)']
+      ]));
+      return wrap;
+    }
+    function unreachableCard() {
+      var wrap = el('div', {});
+      wrap.appendChild(el('div', { 'class': 'facts-banner warn' }, [
+        el('div', { 'class': 'm6-help-h', text: 'Engine configured — upstream unavailable (502)' }),
+        el('p', { 'class': 'ctl-desc', text: 'CORECRUXD_ENGINE_BASE_URL is set, but the daemon’s proxied read to the engine failed (transport error or non-2xx). The upstream body, headers, and API key are never forwarded — this is the terse 502 posture. Check the engine base URL, the API key, and engine health, then reload.' })
+      ]));
+      return wrap;
+    }
+    function summaryCard(d) {
+      var wrap = el('div', {});
+      wrap.appendChild(el('div', { 'class': 'facts-banner ok-empty' }, [
+        el('div', { 'class': 'm6-help-h', text: 'Engine reachable — mediated summary' })
+      ]));
+      wrap.appendChild(m6Kv([
+        ['mediated', d.mediated === true ? 'yes · daemon-proxied' : String(d.mediated)],
+        ['engine_reachable', String(d.engine_reachable)],
+        ['engine_latency_ms', d.engine_latency_ms],
+        ['fetched_at_unix_ms', d.fetched_at_unix_ms]
+      ]));
+      wrap.appendChild(m6Label('proxied engine summary (verbatim)'));
+      wrap.appendChild(el('pre', { 'class': 'facts-vfull', text: m6PrettyJson(d) }));
+      return wrap;
+    }
+    function load() {
+      body.textContent = ''; body.appendChild(el('p', { 'class': 'facts-loading', text: 'probing engine mediation…' }));
+      fetchJSON('/v1/console/engine/summary').then(function (res) {
+        body.textContent = '';
+        if (res.status === 404) { body.appendChild(ceCard()); return; }
+        if (res.status === 502) { body.appendChild(unreachableCard()); return; }
+        if (res.ok && res.data) { body.appendChild(summaryCard(res.data)); return; }
+        banner.style.display = ''; banner.className = 'facts-banner err';
+        banner.textContent = 'Engine summary unavailable — ' + (res.status === 0 ? 'daemon unreachable' : 'HTTP ' + res.status) + '.';
+      });
+    }
+    load();
   }
 
   function renderExplorer(host, ctx) {
@@ -5695,6 +7683,12 @@
     renderExplorer: renderExplorer,
     // Site map — static reference destination (rail → destinations map).
     renderSiteMap: renderSiteMap,
+    // M2 (console-surfaces-remediation) — the paged, searchable facts browser.
+    renderFactsBrowser: renderFactsBrowser,
+    // M3 (console-surfaces-remediation) — sessions browser + detail drawer.
+    renderSessionsBrowser: renderSessionsBrowser,
+    // M5 (console-surfaces-remediation) — sessions × token-burn browser.
+    renderCostBrowser: renderCostBrowser,
     // M10 — Documents mode (the console-as-reader).
     renderDocuments: renderDocuments,
     DOC_REFERENCE: DOC_REFERENCE,

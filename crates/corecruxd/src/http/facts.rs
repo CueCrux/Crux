@@ -45,6 +45,84 @@ pub(super) struct ExportFactsParams {
     pub limit: Option<u32>,
 }
 
+/// Default page size for the `GET /v1/facts/list` console listing route.
+const FACT_LIST_DEFAULT_LIMIT: usize = 100;
+/// Hard cap on the page size (a single response never returns more).
+const FACT_LIST_MAX_LIMIT: usize = 500;
+/// Values longer than this (in `char`s) are truncated in the row; `value_len`
+/// carries the true length and `value_truncated` flags it.
+const FACT_LIST_VALUE_MAX_CHARS: usize = 500;
+
+/// Query parameters for the GET /v1/facts/list endpoint (console paged listing).
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+pub(super) struct ListFactsParams {
+    /// Opaque cursor from a prior response's `next_cursor`. Do not construct.
+    pub cursor: Option<String>,
+    /// Page size, clamped to 1..=500. Defaults to 100.
+    pub limit: Option<usize>,
+    /// Include daemon-reserved-prefix entities (`__work__::` etc.). Accepts
+    /// `1`/`true`/`yes`/`on`. Defaults to false (reserved hidden, console parity).
+    pub include_reserved: Option<String>,
+    /// Include cross-entity-retired (superseded) facts. Accepts
+    /// `0`/`false`/`no`/`off` to exclude. Defaults to true (parity with
+    /// `/v1/facts` + `/v1/console/facts`, which show retired facts today).
+    pub include_superseded: Option<String>,
+    /// Server-side entity-prefix filter (exact `starts_with`).
+    pub entity_prefix: Option<String>,
+    /// Case-insensitive substring over entity / key / value (server-side search).
+    pub q: Option<String>,
+    /// Server-side time-machine: when set, exclude facts stored AFTER this
+    /// instant (Unix epoch **milliseconds**) — the page keeps only facts whose
+    /// `stored_at.timestamp_millis() <= as_of_unix_ms`. Distinct from
+    /// `/v1/facts`' bi-temporal `as_of` (which filters *valid-time*): this
+    /// filters INGEST time (`stored_at`), so the console can ask "what did the
+    /// store hold as of `<t>`" and page the whole matching set — not just a
+    /// recent window. Omitted ⇒ live (whole visible store).
+    pub as_of_unix_ms: Option<i64>,
+}
+
+/// Parse a query-string boolean flag that may arrive as `1`/`0`/`true`/`false`/
+/// `yes`/`no`/`on`/`off` (axum's default bool decoder rejects `1`/`0`). Absent ⇒
+/// `default`.
+fn parse_query_flag(raw: Option<&str>, default: bool) -> bool {
+    match raw {
+        None => default,
+        Some(s) => matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+    }
+}
+
+/// Render one fact into the console-listing row shape: value truncated to
+/// [`FACT_LIST_VALUE_MAX_CHARS`] with `value_len` (full length) + a
+/// `value_truncated` flag, timestamps in both RFC 3339 and unix-ms form, and
+/// the retirement marker so the UI can badge superseded rows. `private` is
+/// always `false` — private facts never reach this surface.
+fn fact_list_row(fact: &corecrux_memory::fact_store::Fact) -> serde_json::Value {
+    let value_len = fact.value.chars().count();
+    let value_truncated = value_len > FACT_LIST_VALUE_MAX_CHARS;
+    let value = if value_truncated {
+        fact.value.chars().take(FACT_LIST_VALUE_MAX_CHARS).collect::<String>()
+    } else {
+        fact.value.clone()
+    };
+    serde_json::json!({
+        "fact_id": fact.fact_id,
+        "entity": fact.entity,
+        "key": fact.key,
+        "value": value,
+        "value_len": value_len,
+        "value_truncated": value_truncated,
+        "confidence": fact.confidence,
+        "horizon_class": fact.horizon_class,
+        "actor": fact.actor,
+        "stored_at": fact.stored_at.to_rfc3339(),
+        "stored_at_unix_ms": fact.stored_at.timestamp_millis(),
+        "tokens": fact.tokens,
+        "version": fact.version,
+        "superseded_by": fact.superseded_by,
+        "private": false,
+    })
+}
+
 // `axum::response::Response` is large by clippy's reckoning, but
 // returning it as the Err arm is the idiomatic axum pattern; suppress
 // the lint at the helper boundary.
@@ -696,6 +774,129 @@ pub(super) async fn export_facts(
             "next_cursor": result.next_cursor,
             "has_more": result.has_more,
             "exported_at": chrono::Utc::now().to_rfc3339(),
+        })),
+    )
+        .into_response()
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/facts/list",
+    tag = "Facts",
+    params(ListFactsParams),
+    responses(
+        (status = 200, description = "Paged, newest-first fact listing"),
+        (status = 400, description = "Malformed cursor"),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = []))
+)]
+/// `GET /v1/facts/list` — descending (newest-first), cursor-paginated listing of
+/// the fact store for console / operator browsing (console-surfaces-remediation
+/// M1). Distinct from `/v1/facts` (recall-ranked recent window) and
+/// `/v1/facts/export` (ascending sync-push path): this walks the *whole* visible
+/// store in stable `(stored_at, fact_id)` DESC order with server-side reserved /
+/// prefix / substring filtering (and an optional `as_of_unix_ms` ingest-time
+/// time-machine), so the console can page + search the full set.
+///
+/// Always excludes private and deleted facts. Tenant scoping mirrors
+/// `query_facts`: a raw-admin (auth-off) caller sees the store; a scoped caller
+/// is filtered to its read-tenant.
+pub(super) async fn list_facts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ListFactsParams>,
+) -> impl IntoResponse {
+    let ctx = match require_fact_read_ctx(&state, &headers) {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+
+    // Malformed cursor ⇒ 400 (never silently restart the walk).
+    let cursor = match params.cursor.as_deref() {
+        Some(raw) => match corecrux_memory::fact_store::FactListCursor::decode(raw) {
+            Some(c) => Some(c),
+            None => {
+                return problem_response(
+                    StatusCode::BAD_REQUEST,
+                    "cursor is malformed; pass back only a next_cursor from a prior response",
+                );
+            }
+        },
+        None => None,
+    };
+
+    let limit = params
+        .limit
+        .unwrap_or(FACT_LIST_DEFAULT_LIMIT)
+        .clamp(1, FACT_LIST_MAX_LIMIT);
+    let include_reserved = parse_query_flag(params.include_reserved.as_deref(), false);
+    let include_superseded = parse_query_flag(params.include_superseded.as_deref(), true);
+    let entity_prefix = params.entity_prefix.clone();
+    let q_lower = params.q.as_ref().map(|q| q.to_lowercase());
+    // Server-side time-machine (M2): exclude facts stored after this instant.
+    // Applied inside the page predicate so `total_visible` reflects the as-of
+    // universe (not the whole store) and pagination stays exact over it.
+    let as_of_unix_ms = params.as_of_unix_ms;
+
+    // Raw-admin (auth-off console) sees the whole store; a scoped caller is
+    // confined to its read-tenant — same authority the query path uses.
+    let is_admin = raw_admin_read(&ctx);
+    let tenant_hash = tenant_hash_for_read_context(&ctx);
+
+    // The consumer-surface reserved list is the single source of truth in
+    // crux-mcp (`crux_mcp::tools::memory::RESERVED_ENTITY_PREFIXES`); the store
+    // stays ignorant of it, so we apply it here in the caller's predicate.
+    let reserved = crux_mcp::tools::memory::RESERVED_ENTITY_PREFIXES;
+
+    let store = state.fact_store.read().await;
+    let page = store.list_page(cursor.as_ref(), limit, include_superseded, |fact| {
+        if let Some(cutoff) = as_of_unix_ms {
+            if fact.stored_at.timestamp_millis() > cutoff {
+                return false;
+            }
+        }
+        if !is_admin && fact.tenant_hash != tenant_hash {
+            return false;
+        }
+        if !include_reserved && reserved.iter().any(|p| fact.entity.starts_with(p)) {
+            return false;
+        }
+        if let Some(prefix) = entity_prefix.as_deref() {
+            if !fact.entity.starts_with(prefix) {
+                return false;
+            }
+        }
+        if let Some(needle) = q_lower.as_deref() {
+            let hit = fact.entity.to_lowercase().contains(needle)
+                || fact.key.to_lowercase().contains(needle)
+                || fact.value.to_lowercase().contains(needle);
+            if !hit {
+                return false;
+            }
+        }
+        true
+    });
+
+    // `total_nondeleted` is the universe count in scope (non-deleted, INCLUDING
+    // private + reserved) so a client can render "N of TOTAL" and reconcile the
+    // delta (private / reserved / superseded) against `total_visible`.
+    let total_nondeleted = if is_admin {
+        store.all_facts().filter(|f| !f.deleted).count()
+    } else {
+        store.all_facts_for_tenant(&tenant_hash).filter(|f| !f.deleted).count()
+    };
+
+    let rows: Vec<serde_json::Value> = page.facts.iter().map(fact_list_row).collect();
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "facts": rows,
+            "next_cursor": page.next_cursor,
+            "has_more": page.has_more,
+            "total_visible": page.total_visible,
+            "total_nondeleted": total_nondeleted,
+            "limit": limit,
         })),
     )
         .into_response()
