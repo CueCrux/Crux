@@ -1,14 +1,31 @@
 # Crux prod-mirror — local daemon against a copy of production data
 
 A throwaway, read-write **copy** of the production Crux daemon (`corecruxd`) running
-locally in Docker, backed by a **duplicate** of the prod data volume. Used to preview
-console changes (e.g. the `Rings` prototype page) against real prod-shaped data
-without touching production.
+locally, backed by a **duplicate** of the prod data volume. Used to preview console
++ daemon changes against real prod-shaped data without touching production.
+
+> **Two runtimes, one data copy, one review URL (`127.0.0.1:14802`):**
+>
+> 1. **Primary (current): the branch-built binary as a host process** —
+>    `run-branch-mirror.sh` / `stop-branch-mirror.sh`. Runs
+>    `target/release/corecruxd` from this checkout against the data copy, so the
+>    branch's new **daemon** routes (M1 `/v1/facts/list`, M5 cost persistence, M6
+>    `/v1/receipts/list` + identity propose) are live at the same review URL. This
+>    is what the `console-surfaces-remediation` milestones were verified against.
+> 2. **Rollback: the prod-image container** (`crux-mirror`, `docker run …`). The
+>    exact prod binary (`docker save | docker load`), for A/B against prod
+>    behaviour. Currently **stopped** — `stop-branch-mirror.sh` frees the port,
+>    then `docker start crux-mirror` restores the prod-binary runtime.
+>
+> Only ONE may own `127.0.0.1:14802` at a time. Both share the same
+> `/home/myles/crux-prod-mirror/data` copy (additive schema — the branch binary
+> boots clean on 0.5.48-written data).
 
 > **Production is read-only.** Nothing here mutates prod. The data is a one-shot
 > `tar` stream from a `:ro` throwaway container off the prod volume; the image is a
 > `docker save | docker load` of the exact prod image. No prod container/file/volume
-> is ever stopped, restarted, or written.
+> is ever stopped, restarted, or written. The branch binary is built locally from
+> source — it never reaches prod.
 
 ## What it is
 
@@ -59,7 +76,77 @@ the env there serves this branch's console edits with **no image rebuild**. The 
 path also injects `window.__CRUX_CONSOLE_DEV__=1`, which disables the PWA service
 worker so edits show on a plain refresh.
 
-## Recreate from scratch
+## Primary runtime: the branch-built binary (host process)
+
+`console-surfaces-remediation` adds **daemon** routes (M1/M5/M6), and the console
+dev-path override only hot-serves JS — a new Rust route needs the branch binary
+running. Rather than rebuild the container image every milestone, the mirror runs
+the locally-built `corecruxd` directly as a host process on the same review URL:
+
+```bash
+cd /home/myles/CueCrux/Crux
+cargo build --release -p corecruxd            # produce target/release/corecruxd
+/home/myles/crux-prod-mirror/run-branch-mirror.sh   # launch on 127.0.0.1:14802
+# ... review at http://127.0.0.1:14802/console ...
+/home/myles/crux-prod-mirror/stop-branch-mirror.sh  # graceful SIGTERM (SIGKILL after 10s)
+```
+
+- **`run-branch-mirror.sh`** launches `target/release/corecruxd` with the WSL-tested
+  detach triad (`setsid + nohup + </dev/null + disown`), waits on `/readyz`, and
+  writes the authoritative pid to `branch-mirror.pid`; log at `branch-mirror.log`.
+  Ports: HTTP `14802`, gRPC `14807`, MCP `14811`. `CORECRUXD_DATA_DIR` points at the
+  same `data/` copy.
+- **`stop-branch-mirror.sh`** SIGTERMs the pid, waits up to 10s, only then SIGKILL
+  (never `-9` a partially-flushed writer without a clean-shutdown chance first).
+- **Env**: the script sources `override.env` + `mirror.env` (non-secret) and then
+  applies host overrides. It deliberately **never sources `crux.env`** — the branch
+  mirror runs `CORECRUXD_AUTH_MODE=off` on loopback only, so no secret is read.
+- **Rollback to the prod binary**: `stop-branch-mirror.sh` (frees `14802`), then
+  `docker start crux-mirror`. See "Run / refresh / stop" (container) below.
+
+### `CORECRUXD_IDENTITY_LINKS=1` (mirror only)
+
+`run-branch-mirror.sh` sets `CORECRUXD_IDENTITY_LINKS=1` so `cx-identity` is
+reviewable — it un-404s `GET /v1/identity/candidates` and enables the M6 seed path
+`POST /v1/identity/candidates/propose`. **This is a MIRROR-ONLY review toggle.** The
+prod flag state is a deliberate **M9 operator decision** and is NOT set by anything
+that reaches production. (On this data the honest candidate yield is 0 — the page
+renders its help panel + seed action, not fabricated candidates.)
+
+### M6 demo artifacts on the data copy (throwaway — ignore for prod parity)
+
+To exercise the M6 verbatim gate-receipt verification + pending-gates paths, the
+data copy carries a small set of **minted throwaway artifacts**:
+
+- project **`m6-demo`** ("M6 demo project") with 2 work items
+  (`M6 pending-gate demo`, `M6 receipt-verification demo`),
+- passport **`m6-gate-approver`**,
+- **1 approved + 1 pending** gate (the pending one is what `cx-gates` lists as
+  `1 pending`, and the approved one backs a fetchable `ad_ga_*` gate receipt).
+
+These live ONLY in the local data copy — **purge/ignore them before any
+prod-parity comparison**; they are not on prod. They are the reason `cx-gates`
+shows `1 pending` and the receipts list carries fetchable `ad_ga_*` rows on the
+mirror.
+
+### `populate-cost.sh` — one-shot cost attribution seed
+
+`GET /v1/cost/report` + work-item `token_burn` read a store fed only by
+`POST /v1/cost/report` (see the token_burn section below). `populate-cost.sh`
+runs `corecruxctl session cost` over the local Claude Code transcripts, strips the
+only content-bearing field (`top_blocks=[]`) with a content-guard, and POSTs the
+numeric/metadata skeleton:
+
+```bash
+MIRROR_BASE=http://127.0.0.1:14802 /home/myles/crux-prod-mirror/populate-cost.sh
+```
+
+On this data it posts 828 transcripts → 83 distinct sessions and stamps
+`token_burn` on 390 / 1082 work items. **Since M5 made the store restart-durable
+(journal + boot replay), this only needs to run ONCE** — the branch binary replays
+`<data_dir>/cost/reports.jsonl` on boot instead of re-posting.
+
+## Recreate from scratch (prod-image container — rollback path)
 
 ```bash
 # 0. Prereqs: `ssh root@crux` works; local docker; ~/.config/cuecrux/env has the token.
@@ -81,7 +168,12 @@ chmod 600 /home/myles/crux-prod-mirror/crux.env
 # 4. Run the mirror (see below).
 ```
 
-## Run / refresh / stop
+## Run / refresh / stop (prod-image container — rollback path)
+
+> The container is the **rollback** runtime (exact prod binary). For day-to-day
+> review of this branch use `run-branch-mirror.sh` (above). The container is
+> currently stopped; only start it when you need to A/B against prod behaviour, and
+> stop the branch binary first so the port is free.
 
 ```bash
 # RUN (or refresh after console edits — just recreate; the console is bind-mounted).
@@ -122,15 +214,33 @@ curl -s "http://127.0.0.1:14802/v1/work?source=all" \
 # new "Rings" entry -> #/rings renders the mock in an iframe).
 ```
 
-Screenshot proof (Playwright-in-Docker, `--network=host` for loopback):
+Screenshot proof (Playwright-in-Docker). **`--network=host` is broken on this host**
+— a host-network container cannot reach the daemon's `127.0.0.1:14802` loopback
+bind. Use the **TCP-proxy pattern** instead: a tiny host forwarder republishes the
+loopback port on `0.0.0.0:14899`, and the container reaches it via
+`host.docker.internal`.
 
 ```bash
+# 1. Start the forwarder on the host (0.0.0.0:14899 -> 127.0.0.1:14802).
+#    scratchpad/tcp_proxy.py is a ~40-line asyncio forwarder; background it:
+setsid nohup python3 tcp_proxy.py >proxy.log 2>&1 </dev/null &
+
+# 2. Run Playwright, pointing MIRROR_BASE at the proxy via the docker gateway.
 cd /home/myles/crux-prod-mirror
-docker run --rm --network=host -e CRUX_TOKEN="$CRUX_AGENT_TOKEN" -v "$PWD:/work" -w /work \
+docker run --rm \
+  --add-host=host.docker.internal:host-gateway \
+  -e MIRROR_BASE="http://host.docker.internal:14899" \
+  -v "$PWD:/work" -w /work \
   mcr.microsoft.com/playwright:v1.49.0-noble \
-  bash -c "npm i -s playwright@1.49.0 >/dev/null 2>&1 && node rings-verify.mjs"
-# -> shots/01-default-overwatch-collapsed.png, 02-rings-page.png, 03-rings-rail-expanded.png
+  bash -c "npm i -s playwright@1.49.0 >/dev/null 2>&1 && node m9-sweep.mjs"
+# -> shots/m9-after/00..12-*.png (13 surfaces; every mN-verify.mjs uses this pattern)
+
+# 3. STOP the proxy when done (leaving 0.0.0.0:14899 open is a needless exposure).
+pkill -f tcp_proxy.py
 ```
+
+The verify scripts read `MIRROR_BASE` (default `http://127.0.0.1:14802`) precisely
+so the same script runs directly on the host or through the proxy from a container.
 
 ## Safety rules (recap)
 
@@ -225,13 +335,25 @@ After M5's persistence lands, the script only needs to run **once** — a mirror
 posts 828 transcripts → 83 distinct sessions (latest-wins) and stamps
 `token_burn` on **390 / 1082** work items (link 22 · mixed 27 · window 341).
 
-## Known daemon gap: no paged facts listing
+## Paged facts listing — RESOLVED on `console-surfaces-remediation` (M1)
 
-The store holds 5,026 visible facts but no HTTP surface can enumerate them:
-`/v1/console/facts` returns only the ~55 visible facts inside its recent-200
-window (`as_of_unix_ms` filters that same window — page 2 is empty, it is not
-a pager), and `/v1/facts` is recall/budget-shaped (query-driven). The Rings
-data-graph therefore draws recall-surfaced facts merged with its curated
-snapshot and captions the true coverage ("N of 5,026"). Daemon follow-up: a
-paged facts listing route (offset/cursor by stored_at) unlocks the full-store
-graph.
+> **Was a known gap; now fixed on this branch.** Previously the store held
+> thousands of visible facts but no HTTP surface could enumerate them:
+> `/v1/console/facts` returned only the ~26–55 visible facts inside a filtered
+> recent-200 window (`as_of_unix_ms` filtered that same window — page 2 was empty,
+> not a pager) and `/v1/facts` is recall/budget-shaped (query-driven).
+
+M1 adds **`GET /v1/facts/list`** (`crates/corecruxd/src/http/facts.rs`): a stable
+`(stored_at_ms, fact_id)` DESC listing over the fact-store journal with opaque
+cursor pagination (`cursor="<stored_at_ms>:<fact_id>"`), server-side
+private/reserved filtering (reserved prefixes reused from
+`crux_mcp::tools::memory::RESERVED_ENTITY_PREFIXES`), and per-fact fields the
+console needs (fact_id, entity, key, value + full-length, confidence,
+horizon_class, actor, stored_at, tokens, version, `superseded_by`). On the mirror
+it enumerates the full store — **3,611 visible / 5,063 stored** — across cursor
+pages with 0 dupes/omissions.
+
+Consumers rewired to it (M2): `cx-facts` (`#/memory/cx-facts`) now pages the whole
+store with a search box + `as_of` field and a `N of TOTAL` header; the Rings
+data-graph lens uses the same route (its old "N of 5,026" cap is gone). Verified on
+the branch binary at `127.0.0.1:14802`.
