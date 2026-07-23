@@ -29,7 +29,7 @@
 //! CORECRUXD_VAULT_PKI_MOUNT=pki-c2pa \
 //! VAULT_C2PA_ROOT_PEM=/path/to/vault-root.pem \
 //! C2PATOOL_BIN=/abs/path/to/c2patool \
-//! cargo test -p crux-integrations --test vault_c2pa_m4_integration -- --ignored --nocapture
+//! cargo test -p crux-integrations --test vault_c2pa_m4_evidence -- --ignored --nocapture
 //! ```
 //!
 //! ## Environment contract (all REQUIRED — the leg is not optional)

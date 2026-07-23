@@ -23,7 +23,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 ed25519-dalek = { workspace = true, features = ["std", "rand_core"] }
-# The M4 Vault integration test (tests/vault_c2pa_m4_integration.rs,
+# The M4 Vault integration test (tests/vault_c2pa_m4_evidence.rs,
 # #[ignore]-gated) re-verifies the emitted signature against the leaf
 # certificate's own public key (parsed from the envelope x5chain via
 # x509-cert) as true ES256 (ECDSA-P256 over SHA-256) — without trusting
