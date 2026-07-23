@@ -3258,6 +3258,83 @@ function extractThemeVars(theme) {
   notes.push('attention wiring + choke-point (M3b): fillNeedsYou groups the needs_you inbox via deriveAttentionZone over /v1/work/gate/pending (fetchJSON) + /v1/work?source=all (CruxApi.work) + /v1/coord/active (fetchJSON), fail-honest per feed; approve/return route ONLY through approveGate/rejectGate→operatorGatedCall→CruxApiGated (no new mutation client, no raw fetch); blocked/waiting cards read-only; markResolved surfaces the M3a receipt_id.');
 })();
 
+// =========================================================================
+//  Check 50 — (console-surfaces-remediation M8) Site map is a REAL, registry-
+//  derived, click-through map — no dead nodes. Driving render.renderSiteMap
+//  against a mock DOM (operator posture, a known previous route) proves: (a)
+//  every non-Pro registered page has exactly one <a href="#/<dest>/<id>"> node;
+//  (b) the destination-IS-the-page surfaces (overwatch home, canvas board/graph/
+//  tree, explorer, sitemap, rings) each get their real route; (c) EVERY node
+//  href resolves to a registered destination (no dead nodes / no drift); (d) the
+//  "you are here" marker lands on the route the operator came from; (e) the
+//  recommended first-run path is numbered on its cards.
+// =========================================================================
+(function checkSiteMap() {
+  check(typeof render.renderSiteMap === 'function', '[sitemap] render.js must export renderSiteMap');
+  if (typeof render.renderSiteMap !== 'function') { return; }
+  const dom = newMockDom();
+  const savedDoc = global.document, savedWin = global.window;
+  global.document = dom.doc;
+  global.window = { CruxPages: pages, CRUX_POSTURE: 'operator', CRUX_PREV_HASH: '#/work/cx-sessions' };
+  try {
+    const host = dom.mkNode('div');
+    render.renderSiteMap(host);
+
+    const destIds = new Set(pages.DESTS.map(function (d) { return d.id; }));
+    const nodeAnchors = dom.findByClass(host, 'map-page');
+    check(nodeAnchors.length > 0, '[sitemap] must render at least one clickable node (a.map-page)');
+
+    // Every node anchor: an in-app hash link whose destination is registered.
+    const hrefs = new Set();
+    nodeAnchors.forEach(function (a) {
+      const href = a.getAttribute('href') || '';
+      check(/^#\//.test(href), '[sitemap] node anchor href must be an in-app hash route (got ' + JSON.stringify(href) + ')');
+      hrefs.add(href);
+      const dest = href.replace(/^#\//, '').split(/[/?]/)[0];
+      check(destIds.has(dest), '[sitemap] DEAD NODE: href ' + href + ' points at an unregistered destination "' + dest + '"');
+    });
+
+    // Every non-Pro registered page has exactly one live node at its real route.
+    // (Operator posture, so operator-only pages are included.)
+    let expectedPages = 0;
+    Object.keys(pages.PAGES).forEach(function (id) {
+      const p = pages.PAGES[id];
+      if (p.pro === true) { return; }
+      expectedPages++;
+      const want = '#/' + p.dest + '/' + id;
+      check(hrefs.has(want), '[sitemap] registered page ' + id + ' has no click-through node (' + want + ')');
+    });
+
+    // The destination-IS-the-page surfaces get their real routes.
+    ['#/overwatch', '#/canvas/board', '#/canvas/graph', '#/canvas/tree', '#/explorer', '#/sitemap', '#/rings'].forEach(function (route) {
+      check(hrefs.has(route), '[sitemap] missing destination-is-page node for ' + route);
+    });
+
+    // (d) "you are here" lands on the origin route (#/work/cx-sessions), exactly once.
+    const hereNodes = nodeAnchors.filter(function (a) { return /\bis-here\b/.test(a.className || ''); });
+    check(hereNodes.length === 1, '[sitemap] exactly one node must carry the you-are-here marker (got ' + hereNodes.length + ')');
+    check(hereNodes[0] && hereNodes[0].getAttribute('href') === '#/work/cx-sessions',
+      '[sitemap] you-are-here must mark the route navigated from (#/work/cx-sessions)');
+    check(hereNodes[0] && hereNodes[0].getAttribute('aria-current') === 'page',
+      '[sitemap] the you-are-here node must set aria-current="page"');
+
+    // (e) the recommended first-run path is numbered on its cards.
+    const startRoutes = ['#/overwatch', '#/work/cx-sessions', '#/memory/cx-facts', '#/trust/cx-receipts'];
+    startRoutes.forEach(function (route) {
+      const node = nodeAnchors.find(function (a) { return a.getAttribute('href') === route; });
+      check(!!node, '[sitemap] start-path node missing: ' + route);
+      check(node && dom.findByClass(node, 'map-step').length >= 1, '[sitemap] start-path node ' + route + ' must carry a step numeral');
+    });
+
+    notes.push('site map (M8): ' + nodeAnchors.length + ' click-through nodes over ' + destIds.size + ' destinations (' + expectedPages + ' registered pages + destination-is-page surfaces), all hrefs resolve to a registered dest (no dead nodes), you-are-here marks the origin route, first-run path numbered.');
+  } catch (e) {
+    check(false, '[sitemap] renderSiteMap smoke threw: ' + (e && e.stack || e));
+  } finally {
+    if (savedDoc === undefined) { delete global.document; } else { global.document = savedDoc; }
+    if (savedWin === undefined) { delete global.window; } else { global.window = savedWin; }
+  }
+})();
+
 // ---- Report (awaits async renderer-driven checks) -----------------------
 Promise.all(asyncChecks).then(function () { return passportMintInteraction(); }).then(function () {
   console.log('unified-shell-console v2 — M14 + desktop mission control M2 smoke');
