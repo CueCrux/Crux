@@ -9,11 +9,11 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use axum::extract::Path as AxumPath;
-use axum::http::header;
+use axum::http::{header, HeaderValue, Method};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::Router;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 // Unified Shell Console v2 (ExecPlan unified-shell-console-2026-07-03). The
 // self-contained, no-build shell served unconditionally at `/console` — the
@@ -39,6 +39,19 @@ const CONSOLE_V2_SW_JS: &str = include_str!("../console/v2/sw.js");
 const CONSOLE_V2_MANIFEST: &str = include_str!("../console/v2/manifest.webmanifest");
 const CONSOLE_V2_ICON_SVG: &str = include_str!("../console/v2/icon.svg");
 const CONSOLE_DEV_PATH_ENV: &str = "CORECRUXD_CONSOLE_DEV_PATH";
+
+// CORS allowlist for the console asset routes (ExecPlan
+// crux-console-public-exposure-2026-05-17, M5). The console is publicly exposed
+// behind oauth2-proxy, so the daemon must not answer cross-origin requests with
+// a wildcard `Access-Control-Allow-Origin`. Origins are configured via
+// `CORECRUXD_CONSOLE_ALLOWED_ORIGINS` (comma-separated); when unset (or empty
+// after trimming) the production defaults below apply.
+const CONSOLE_ALLOWED_ORIGINS_ENV: &str = "CORECRUXD_CONSOLE_ALLOWED_ORIGINS";
+
+// Default allowlist when `CORECRUXD_CONSOLE_ALLOWED_ORIGINS` is unset: the
+// public console origin plus the two Tailnet-facing origins the daemon is
+// reachable on (host `crux` / its Tailscale IP). Matches the M5 plan intent.
+const DEFAULT_CONSOLE_ALLOWED_ORIGINS: &[&str] = &["https://crux.cuecrux.com", "http://100.70.12.73", "http://crux"];
 
 // Bundled PNG assets — embedded so the binary can serve them with no on-disk
 // dependency. Dev override (CORECRUXD_CONSOLE_DEV_PATH) falls back to reading
@@ -206,6 +219,71 @@ async fn serve_console3d(AxumPath(path): AxumPath<String>) -> Response {
         .into_response()
 }
 
+/// An allowlist entry is only accepted if it looks like a browser Origin: an
+/// `http`/`https` scheme (case-insensitive) followed by a non-empty host. This
+/// is deliberately strict — it drops `*`, `null`, and non-web schemes so a
+/// misconfigured env var cannot re-introduce a permissive or opaque-origin match.
+fn is_allowlistable_origin(entry: &str) -> bool {
+    let lower = entry.to_ascii_lowercase();
+    ["https://", "http://"]
+        .into_iter()
+        .find_map(|scheme| lower.strip_prefix(scheme))
+        .is_some_and(|host| !host.is_empty())
+}
+
+/// Parse the comma-separated `CORECRUXD_CONSOLE_ALLOWED_ORIGINS` value into a
+/// validated list of allowed origins. Entries are trimmed; empty entries (so a
+/// trailing comma or `"a, ,b"`) are dropped; entries that are not a valid HTTP
+/// header value (control chars, etc.) are skipped rather than aborting startup.
+/// When the input yields no usable origins, the production defaults apply — the
+/// console is never left with an empty allowlist by accident, and never falls
+/// back to a permissive wildcard.
+fn resolve_allowed_origins(raw: &str) -> Vec<HeaderValue> {
+    let parsed: Vec<HeaderValue> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        // Only accept real `http(s)://<host>` origins. This rejects a literal
+        // wildcard (`*` would defeat the allowlist and panics `AllowOrigin::list`)
+        // AND opaque-origin values like `null`, `file:` or `data:` — a configured
+        // `null` would otherwise match the `Origin: null` that sandboxed iframes
+        // and local-file contexts send, silently re-opening the hole M5 closes.
+        .filter(|entry| is_allowlistable_origin(entry))
+        .filter_map(|entry| HeaderValue::from_str(entry).ok())
+        .collect();
+    if parsed.is_empty() {
+        DEFAULT_CONSOLE_ALLOWED_ORIGINS
+            .iter()
+            .filter_map(|origin| HeaderValue::from_str(origin).ok())
+            .collect()
+    } else {
+        parsed
+    }
+}
+
+/// Resolve the console CORS allowlist from the environment (or the defaults).
+fn console_allowed_origins() -> Vec<HeaderValue> {
+    let raw = std::env::var(CONSOLE_ALLOWED_ORIGINS_ENV).unwrap_or_default();
+    resolve_allowed_origins(&raw)
+}
+
+/// Build the explicit-allowlist CORS layer for the console asset routes. Replaces
+/// the previous `CorsLayer::permissive()` (which reflected any origin with a
+/// wildcard `Access-Control-Allow-Origin`) now that the console is publicly
+/// exposed. Origins come from `console_allowed_origins`; methods are restricted
+/// to the read-only verbs these static-asset routes actually serve. Request
+/// headers are named explicitly rather than `Any`: the CORS spec's `*` header
+/// wildcard does NOT cover `Authorization`, so it must be listed by name for the
+/// console's localStorage-JWT (`Authorization` header) flow to survive preflight.
+/// Credentials are intentionally NOT allowed — the JWT rides an `Authorization`
+/// header, never a cookie, so cookie/credential mode stays off.
+fn console_cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(console_allowed_origins()))
+        .allow_methods([Method::GET, Method::HEAD, Method::OPTIONS])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT])
+}
+
 pub fn routes(enabled: bool) -> Router {
     if !enabled {
         return Router::new();
@@ -219,7 +297,7 @@ pub fn routes(enabled: bool) -> Router {
         .route("/console-3d/{*path}", get(serve_console3d))
         // Device-grant approval page (ExecPlan crux-unified-login-rails, M3).
         .route("/activate", get(serve_activate))
-        .layer(CorsLayer::permissive())
+        .layer(console_cors_layer())
 }
 
 /// `/activate` — operator approval page for the device-authorization grant.
@@ -862,5 +940,201 @@ mod tests {
                 "{uri} body should contain {needle}"
             );
         }
+    }
+
+    // ---- CORS allowlist (ExecPlan crux-console-public-exposure, M5) --------
+
+    // Render a `Vec<HeaderValue>` origin list back to comparable strings.
+    fn origin_strings(origins: &[axum::http::HeaderValue]) -> Vec<String> {
+        origins
+            .iter()
+            .map(|v| v.to_str().expect("origin is ascii").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn allowed_origins_empty_input_falls_back_to_defaults() {
+        // Unset / blank / comma-and-whitespace-only all resolve to the
+        // production defaults — never an empty (deny-all) or wildcard list.
+        for raw in ["", "   ", ",", " , , ", "\t,\n"] {
+            let origins = origin_strings(&super::resolve_allowed_origins(raw));
+            assert_eq!(
+                origins,
+                vec![
+                    "https://crux.cuecrux.com".to_string(),
+                    "http://100.70.12.73".to_string(),
+                    "http://crux".to_string(),
+                ],
+                "input {raw:?} should fall back to the default allowlist"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_origins_parses_and_trims_a_custom_list() {
+        // Trimming, dropped empty entries (leading/trailing/interior commas),
+        // and order preservation.
+        let origins = origin_strings(&super::resolve_allowed_origins(
+            "  https://a.example.com ,http://localhost:5173, ,https://b.example.com,",
+        ));
+        assert_eq!(
+            origins,
+            vec![
+                "https://a.example.com".to_string(),
+                "http://localhost:5173".to_string(),
+                "https://b.example.com".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn allowed_origins_skips_invalid_entries_but_keeps_valid_ones() {
+        // A control char makes an invalid HeaderValue; it is dropped, the valid
+        // neighbour survives, and the list does not collapse to the defaults.
+        let origins = origin_strings(&super::resolve_allowed_origins(
+            "https://ok.example.com,bad\u{7f}origin",
+        ));
+        assert_eq!(origins, vec!["https://ok.example.com".to_string()]);
+    }
+
+    #[test]
+    fn allowed_origins_never_contains_wildcard() {
+        // The whole point of M5: the resolver must never emit a `*` origin,
+        // whatever the input.
+        for raw in ["", "*", "https://x.example.com,*", "  *  "] {
+            let origins = origin_strings(&super::resolve_allowed_origins(raw));
+            assert!(
+                !origins.iter().any(|o| o == "*"),
+                "input {raw:?} must not yield a wildcard origin (got {origins:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_origins_rejects_opaque_and_non_web_schemes() {
+        // `null`, `file:`, `data:`, bare hosts, and scheme-only strings are all
+        // dropped — a configured `null` would otherwise match `Origin: null`
+        // from sandboxed iframes / local-file contexts. A well-formed http(s)
+        // neighbour in the same list survives.
+        for bad in [
+            "null",
+            "file://x",
+            "data:text/html",
+            "example.com",
+            "https://",
+            "ftp://x.example.com",
+        ] {
+            let origins = origin_strings(&super::resolve_allowed_origins(bad));
+            // Sole bad entry => empty parse => defaults; assert the bad token
+            // itself never appears.
+            assert!(
+                !origins.iter().any(|o| o == bad),
+                "input {bad:?} must not appear in the resolved allowlist (got {origins:?})"
+            );
+        }
+        // Bad entry dropped, good neighbour kept (no collapse to defaults).
+        let mixed = origin_strings(&super::resolve_allowed_origins("null, https://ok.example.com"));
+        assert_eq!(mixed, vec!["https://ok.example.com".to_string()]);
+    }
+
+    #[test]
+    fn allowed_origins_reads_the_env_var() {
+        let _guard = env_lock();
+        std::env::set_var(
+            super::CONSOLE_ALLOWED_ORIGINS_ENV,
+            "https://console.example.test, http://localhost:3000",
+        );
+        let origins = origin_strings(&super::console_allowed_origins());
+        std::env::remove_var(super::CONSOLE_ALLOWED_ORIGINS_ENV);
+        assert_eq!(
+            origins,
+            vec![
+                "https://console.example.test".to_string(),
+                "http://localhost:3000".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_reflects_allowlisted_origin_and_rejects_others() {
+        use tower::ServiceExt;
+        let _guard = env_lock();
+        // Use the built-in defaults for a deterministic allowlist.
+        std::env::remove_var(super::CONSOLE_ALLOWED_ORIGINS_ENV);
+
+        // An allowlisted origin is reflected in Access-Control-Allow-Origin...
+        let resp = super::routes(true)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/console")
+                    .header(axum::http::header::ORIGIN, "https://crux.cuecrux.com")
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router response");
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("https://crux.cuecrux.com"),
+            "an allowlisted origin must be reflected exactly (never a wildcard)"
+        );
+
+        // ...and a non-allowlisted origin gets NO allow-origin header at all,
+        // and certainly not a wildcard.
+        let resp = super::routes(true)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/console")
+                    .header(axum::http::header::ORIGIN, "https://evil.example.com")
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router response");
+        let allow_origin = resp
+            .headers()
+            .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|v| v.to_str().ok());
+        assert!(
+            allow_origin.is_none(),
+            "a non-allowlisted origin must not receive an Access-Control-Allow-Origin header (got {allow_origin:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_names_authorization_header() {
+        use tower::ServiceExt;
+        let _guard = env_lock();
+        std::env::remove_var(super::CONSOLE_ALLOWED_ORIGINS_ENV);
+        // Preflight from an allowlisted origin requesting an Authorization header:
+        // the `*` header wildcard would NOT satisfy the browser here, so assert
+        // `Authorization` is named explicitly in Access-Control-Allow-Headers.
+        let resp = super::routes(true)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("OPTIONS")
+                    .uri("/console")
+                    .header(axum::http::header::ORIGIN, "https://crux.cuecrux.com")
+                    .header(axum::http::header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                    .header(axum::http::header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization")
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router response");
+        let allow_headers = resp
+            .headers()
+            .get(axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        assert!(
+            allow_headers.contains("authorization"),
+            "preflight must name `authorization` explicitly (got {allow_headers:?})"
+        );
     }
 }
