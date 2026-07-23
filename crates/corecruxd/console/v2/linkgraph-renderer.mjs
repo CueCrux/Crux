@@ -439,7 +439,7 @@ export function createLinkGraphRenderer() {
   }
   function edgeKey(a, b) { return a < b ? a + ':' + b : b + ':' + a; }
 
-  // ── Labels (path + seeds + hovered/selected only — LOD at 10k) ─────────────
+  // ── Labels (path + seeds + hovered/selected only — level-of-detail at 10k) ──
   let hoverId = null;
   function renderLabels() {
     if (!labelLayer) { return; }

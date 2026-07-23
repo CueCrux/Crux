@@ -639,7 +639,7 @@ fn parse_graph_u32(raw: &str, name: &str) -> Result<u32, String> {
 }
 
 /// Validate + translate the `ego` query params into the upstream POST body,
-/// mirroring the m2 contract's caps (seeds ≤ 256, hops clamp [0,3], mandatory
+/// mirroring the m2 contract's caps (seeds ≤ 256, hops clamp \[0,3\], mandatory
 /// budgets ≤ 50 000 nodes / 200 000 edges, kind/direction enums).
 fn build_graph_ego_body(params: &HashMap<String, String>) -> Result<serde_json::Value, String> {
     let seeds_raw = params.get("seeds").map_or("", String::as_str).trim();
@@ -717,8 +717,8 @@ fn build_graph_ego_body(params: &HashMap<String, String>) -> Result<serde_json::
 }
 
 /// Validate + translate the `path` query params into the upstream POST body,
-/// mirroring the m2 contract (max_hops 1..=8, k clamp [1,64], context edge budget
-/// clamp [0,20000]).
+/// mirroring the m2 contract (max_hops 1..=8, k clamp \[1,64\], context edge budget
+/// clamp \[0,20000\]).
 fn build_graph_path_body(params: &HashMap<String, String>) -> Result<serde_json::Value, String> {
     let src = parse_graph_u32(params.get("src").ok_or_else(|| "src is required".to_string())?, "src")?;
     let dst = parse_graph_u32(params.get("dst").ok_or_else(|| "dst is required".to_string())?, "dst")?;
