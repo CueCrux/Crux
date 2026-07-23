@@ -145,6 +145,9 @@ pub struct HandshakeHintsWire {
     pub prefer_bulk: Option<bool>,
     pub max_capabilities: Option<u32>,
     pub want_parent_chain: Option<bool>,
+    /// §5.7 privacy: suppress the capability-graph `excluded` list entirely.
+    /// Absent = false (the generator's tier/affinity guard still applies).
+    pub hide_exclusions: Option<bool>,
 }
 
 #[allow(dead_code)]
@@ -412,7 +415,8 @@ pub async fn post_session(State(state): State<AppState>, headers: HeaderMap, bod
     let handshake_request = HandshakeRequest {
         passport,
         channels,
-        hints: GraphHints::from_request(request.hints.prefer_bulk),
+        hints: GraphHints::from_request(request.hints.prefer_bulk)
+            .with_hide_exclusions(request.hints.hide_exclusions.unwrap_or(false)),
         session_ttl_s: services.default_ttl_s,
         budget,
         origin: "ce".into(),

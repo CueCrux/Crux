@@ -115,6 +115,7 @@ fn ce_full_parity_open_session_10_invocations_restart_verify() {
                 prefer_bulk: true,
                 intent: None,
                 max_capabilities: None,
+                hide_exclusions: false,
             },
             session_ttl_s: 3600,
             budget: Budget {
@@ -258,6 +259,7 @@ fn ce_golden_handshake_mode_is_local_across_restart() {
                 prefer_bulk: true,
                 intent: None,
                 max_capabilities: None,
+                hide_exclusions: false,
             },
             session_ttl_s: 3600,
             budget: Budget {
