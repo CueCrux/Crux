@@ -445,6 +445,458 @@ pub(super) async fn delete_console_corecrux_lane_weights(
     }
 }
 
+// ── CoreCrux link-graph mediation proxy ──────────────────────────────────────
+//
+// ExecPlan `wikicrux-link-graph-explorer-2026-07-23` (M4, D-D / D2 / R5). GET-only,
+// read-only console → CoreCrux translation for the six-degrees link-graph pane.
+// The console is same-origin cookie/scope auth by design (generated `CruxApi`, no
+// bearer in the browser, T.3); it never talks to CoreCrux directly. These four
+// GET routes translate allowlisted query params into the upstream CoreCrux
+// `/v1/graph/*` JSON POST bodies (`stats` is GET-passthrough), exactly mirroring
+// the lane-weights / gpu1 shim env + timeout + error-mapping family.
+//
+// Upstream base URL + bearer token live in the daemon env ONLY. Client request
+// headers are NEVER forwarded upstream; the daemon injects its own graph scope +
+// token. When the graph base URL is unset the routes 503 with a build hint so the
+// console hides the pane (the capability plan gates visibility first; this is the
+// same-origin safety net). This is Crux CE (CPU-only) — no CoreCrux engine code
+// is compiled here; all graph work happens over the wire on the CoreCrux daemon.
+
+/// The console proxy caps `resolve` well under the upstream 10 000; the pane only
+/// resolves a handful of titles (two-article path search + a few ego seeds).
+const GRAPH_RESOLVE_MAX_TITLES: usize = 256;
+/// Mirror of the upstream `ego` seed cap (m2 contract: at most 256 seeds).
+const GRAPH_EGO_MAX_SEEDS: usize = 256;
+/// Mirror of the upstream `ego` budget maxima (m2 contract).
+const GRAPH_EGO_MAX_BUDGET_NODES: u64 = 50_000;
+const GRAPH_EGO_MAX_BUDGET_EDGES: u64 = 200_000;
+
+const GRAPH_RESOLVE_PARAMS: &[&str] = &["titles"];
+const GRAPH_EGO_PARAMS: &[&str] = &[
+    "seeds",
+    "hops",
+    "budget_nodes",
+    "budget_edges",
+    "kind",
+    "direction",
+    "degree_cap",
+];
+const GRAPH_PATH_PARAMS: &[&str] = &["src", "dst", "max_hops", "k", "context_edge_budget"];
+
+/// `GET /v1/console/corecrux/graph/stats` — GET-passthrough to upstream
+/// `GET /v1/graph/stats` (corpus counts, snapshot id, build digest, degree histogram).
+pub(super) async fn get_console_corecrux_graph_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(problem) = require_console_read(&state, &headers) {
+        return problem.into_response();
+    }
+    let base_url = match corecrux_graph_base_url_from_env() {
+        Ok(url) => url,
+        Err(err) => return problem_response(StatusCode::SERVICE_UNAVAILABLE, err),
+    };
+    let result = tokio::task::spawn_blocking(move || fetch_graph_stats(&base_url))
+        .await
+        .map_err(graph_join_error);
+    finish_graph_proxy(result)
+}
+
+/// `GET /v1/console/corecrux/graph/resolve?titles=A|B|C` — translated to upstream
+/// `POST /v1/graph/resolve {titles:[...]}`. `|` is the delimiter (invalid in ns0
+/// titles, so it can never appear inside one).
+pub(super) async fn get_console_corecrux_graph_resolve(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_console_read(&state, &headers) {
+        return problem.into_response();
+    }
+    if let Err(err) = reject_unknown_graph_params(&params, GRAPH_RESOLVE_PARAMS) {
+        return problem_response(StatusCode::BAD_REQUEST, err);
+    }
+    let titles: Vec<String> = params
+        .get("titles")
+        .map_or("", String::as_str)
+        .split('|')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if titles.is_empty() {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "titles is required: a '|'-separated list of article titles",
+        );
+    }
+    if titles.len() > GRAPH_RESOLVE_MAX_TITLES {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            format!("at most {GRAPH_RESOLVE_MAX_TITLES} titles per request"),
+        );
+    }
+    let base_url = match corecrux_graph_base_url_from_env() {
+        Ok(url) => url,
+        Err(err) => return problem_response(StatusCode::SERVICE_UNAVAILABLE, err),
+    };
+    let result = tokio::task::spawn_blocking(move || fetch_graph_resolve(&base_url, titles))
+        .await
+        .map_err(graph_join_error);
+    finish_graph_proxy(result)
+}
+
+/// `GET /v1/console/corecrux/graph/ego?seeds=1,2&hops=2&budget_nodes=5000&…` →
+/// upstream `POST /v1/graph/ego`. Budgets are mandatory (mirroring the upstream
+/// contract, R3); all params validated + capped server-side before any network
+/// call.
+pub(super) async fn get_console_corecrux_graph_ego(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_console_read(&state, &headers) {
+        return problem.into_response();
+    }
+    if let Err(err) = reject_unknown_graph_params(&params, GRAPH_EGO_PARAMS) {
+        return problem_response(StatusCode::BAD_REQUEST, err);
+    }
+    let body = match build_graph_ego_body(&params) {
+        Ok(body) => body,
+        Err(err) => return problem_response(StatusCode::BAD_REQUEST, err),
+    };
+    let base_url = match corecrux_graph_base_url_from_env() {
+        Ok(url) => url,
+        Err(err) => return problem_response(StatusCode::SERVICE_UNAVAILABLE, err),
+    };
+    let result = tokio::task::spawn_blocking(move || fetch_graph_ego(&base_url, body))
+        .await
+        .map_err(graph_join_error);
+    finish_graph_proxy(result)
+}
+
+/// `GET /v1/console/corecrux/graph/path?src=1&dst=2&max_hops=6&…` → upstream
+/// `POST /v1/graph/path` (k-shortest bidirectional BFS + 1-hop context subgraph).
+pub(super) async fn get_console_corecrux_graph_path(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_console_read(&state, &headers) {
+        return problem.into_response();
+    }
+    if let Err(err) = reject_unknown_graph_params(&params, GRAPH_PATH_PARAMS) {
+        return problem_response(StatusCode::BAD_REQUEST, err);
+    }
+    let body = match build_graph_path_body(&params) {
+        Ok(body) => body,
+        Err(err) => return problem_response(StatusCode::BAD_REQUEST, err),
+    };
+    let base_url = match corecrux_graph_base_url_from_env() {
+        Ok(url) => url,
+        Err(err) => return problem_response(StatusCode::SERVICE_UNAVAILABLE, err),
+    };
+    let result = tokio::task::spawn_blocking(move || fetch_graph_path(&base_url, body))
+        .await
+        .map_err(graph_join_error);
+    finish_graph_proxy(result)
+}
+
+fn graph_join_error(err: tokio::task::JoinError) -> CoreCruxProxyError {
+    CoreCruxProxyError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("CoreCrux graph proxy join failed: {err}"),
+    )
+}
+
+fn finish_graph_proxy(
+    result: Result<Result<serde_json::Value, CoreCruxProxyError>, CoreCruxProxyError>,
+) -> axum::response::Response {
+    match result {
+        Ok(Ok(body)) => (StatusCode::OK, Json(body)).into_response(),
+        Ok(Err(err)) | Err(err) => problem_response(err.status, err.detail),
+    }
+}
+
+/// Reject any query key not in the per-endpoint allowlist (T.5 posture: the
+/// console proxy forwards a fixed, audited param surface — never an arbitrary
+/// passthrough).
+fn reject_unknown_graph_params(params: &HashMap<String, String>, allowed: &[&str]) -> Result<(), String> {
+    for key in params.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(format!(
+                "unknown query parameter '{key}' (allowed: {})",
+                allowed.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_graph_u32(raw: &str, name: &str) -> Result<u32, String> {
+    raw.trim()
+        .parse::<u32>()
+        .map_err(|_| format!("{name} must be a non-negative integer node id"))
+}
+
+/// Validate + translate the `ego` query params into the upstream POST body,
+/// mirroring the m2 contract's caps (seeds ≤ 256, hops clamp \[0,3\], mandatory
+/// budgets ≤ 50 000 nodes / 200 000 edges, kind/direction enums).
+fn build_graph_ego_body(params: &HashMap<String, String>) -> Result<serde_json::Value, String> {
+    let seeds_raw = params.get("seeds").map_or("", String::as_str).trim();
+    if seeds_raw.is_empty() {
+        return Err("seeds is required: a comma-separated list of node ids".to_string());
+    }
+    let mut seeds: Vec<u32> = Vec::new();
+    for tok in seeds_raw.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        seeds.push(parse_graph_u32(tok, "seeds")?);
+    }
+    if seeds.is_empty() {
+        return Err("seeds must not be empty".to_string());
+    }
+    if seeds.len() > GRAPH_EGO_MAX_SEEDS {
+        return Err(format!("at most {GRAPH_EGO_MAX_SEEDS} seeds per request"));
+    }
+
+    let hops = match params.get("hops") {
+        Some(raw) => parse_graph_u32(raw, "hops")?.min(3),
+        None => 1,
+    };
+
+    let budget_nodes = params
+        .get("budget_nodes")
+        .ok_or_else(|| "budget_nodes is required (> 0)".to_string())?
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| "budget_nodes must be a positive integer".to_string())?;
+    let budget_edges = params
+        .get("budget_edges")
+        .ok_or_else(|| "budget_edges is required (> 0)".to_string())?
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| "budget_edges must be a positive integer".to_string())?;
+    if budget_nodes == 0 || budget_edges == 0 {
+        return Err("budget_nodes and budget_edges must both be > 0".to_string());
+    }
+    if budget_nodes > GRAPH_EGO_MAX_BUDGET_NODES || budget_edges > GRAPH_EGO_MAX_BUDGET_EDGES {
+        return Err(format!(
+            "budget too large (max nodes {GRAPH_EGO_MAX_BUDGET_NODES}, max edges {GRAPH_EGO_MAX_BUDGET_EDGES})"
+        ));
+    }
+
+    let kind = match params.get("kind").map(String::as_str) {
+        None => "link",
+        Some(k @ ("link" | "category" | "both")) => k,
+        Some(other) => return Err(format!("kind must be 'link' | 'category' | 'both', got '{other}'")),
+    };
+    let direction = match params.get("direction").map(String::as_str) {
+        None => "both",
+        Some(d @ ("forward" | "reverse" | "both")) => d,
+        Some(other) => {
+            return Err(format!(
+                "direction must be 'forward' | 'reverse' | 'both', got '{other}'"
+            ))
+        }
+    };
+    let degree_cap = match params.get("degree_cap") {
+        Some(raw) => parse_graph_u32(raw, "degree_cap")?,
+        None => 0,
+    };
+
+    Ok(serde_json::json!({
+        "seeds": seeds,
+        "hops": hops,
+        "budget": { "nodes": budget_nodes, "edges": budget_edges },
+        "kind": kind,
+        "direction": direction,
+        "degree_cap": degree_cap,
+    }))
+}
+
+/// Validate + translate the `path` query params into the upstream POST body,
+/// mirroring the m2 contract (max_hops 1..=8, k clamp \[1,64\], context edge budget
+/// clamp \[0,20000\]).
+fn build_graph_path_body(params: &HashMap<String, String>) -> Result<serde_json::Value, String> {
+    let src = parse_graph_u32(params.get("src").ok_or_else(|| "src is required".to_string())?, "src")?;
+    let dst = parse_graph_u32(params.get("dst").ok_or_else(|| "dst is required".to_string())?, "dst")?;
+    let max_hops = match params.get("max_hops") {
+        Some(raw) => {
+            let mh = parse_graph_u32(raw, "max_hops")?;
+            if mh == 0 {
+                return Err("max_hops must be >= 1".to_string());
+            }
+            if mh > 8 {
+                return Err("max_hops must be <= 8".to_string());
+            }
+            mh
+        }
+        None => 6,
+    };
+    let k = match params.get("k") {
+        Some(raw) => parse_graph_u32(raw, "k")?.clamp(1, 64),
+        None => 4,
+    };
+    let context_edge_budget = match params.get("context_edge_budget") {
+        Some(raw) => parse_graph_u32(raw, "context_edge_budget")?.min(20_000),
+        None => 500,
+    };
+
+    Ok(serde_json::json!({
+        "src": src,
+        "dst": dst,
+        "max_hops": max_hops,
+        "k": k,
+        "context_edge_budget": context_edge_budget,
+    }))
+}
+
+/// Read the CoreCrux graph base URL from the daemon env (graph-specific first,
+/// then the un-prefixed fallback — same lookup family as `corecrux_base_url_from_env`).
+/// `pub(super)` so `/v1/version` (health.rs) can surface the `console_link_graph`
+/// runtime capability from the same source of truth.
+pub(super) fn corecrux_graph_base_url_from_env() -> Result<String, String> {
+    for key in ["CORECRUXD_CORECRUX_GRAPH_BASE_URL", "CORECRUX_GRAPH_BASE_URL"] {
+        if let Ok(raw) = std::env::var(key) {
+            let trimmed = raw.trim().trim_end_matches('/').to_string();
+            if !trimmed.is_empty() {
+                return Ok(trimmed);
+            }
+        }
+    }
+    Err(
+        "CoreCrux graph base URL is not configured; set CORECRUXD_CORECRUX_GRAPH_BASE_URL on the Crux daemon"
+            .to_string(),
+    )
+}
+
+/// Whether the CoreCrux graph mediation proxy is configured on this daemon — the
+/// `console_link_graph` runtime-capability signal the console gates its pane on.
+pub(super) fn corecrux_graph_base_url_configured() -> bool {
+    corecrux_graph_base_url_from_env().is_ok()
+}
+
+fn corecrux_graph_token_from_env() -> Option<String> {
+    std::env::var("CORECRUXD_CORECRUX_GRAPH_TOKEN")
+        .or_else(|_| std::env::var("CORECRUX_GRAPH_TOKEN"))
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn corecrux_graph_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(std::time::Duration::from_secs(15)))
+        .build()
+        .into()
+}
+
+/// Attach only the daemon-injected scope + bearer. Client request headers are
+/// never forwarded upstream (T.3); the graph endpoints are scope-only auth
+/// (`query:read`), tenant-agnostic (whole-corpus `.ccxg`, no tenant binding).
+fn apply_corecrux_graph_headers<S>(mut req: ureq::RequestBuilder<S>) -> ureq::RequestBuilder<S> {
+    req = req
+        .header("Accept", "application/json")
+        .header("X-Corecrux-Scopes", "query:read");
+    if let Some(token) = corecrux_graph_token_from_env() {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+    req
+}
+
+/// Map an upstream CoreCrux graph HTTP status onto the status the console sees.
+/// Upstream auth failures (401/403 — a daemon-token misconfig, never the browser
+/// user's fault) and any 5xx collapse to 502 so no upstream auth signal leaks to
+/// the same-origin console. Upstream `404` (link-graph flag off) and `503` (no
+/// `.ccxg` loaded) both surface as `503` so the pane shows the enable/build hint.
+fn map_graph_upstream_status(upstream: u16) -> StatusCode {
+    match upstream {
+        400 => StatusCode::BAD_REQUEST,
+        404 | 503 => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::BAD_GATEWAY,
+    }
+}
+
+fn read_corecrux_graph_json(
+    mut response: ureq::http::Response<ureq::Body>,
+) -> Result<serde_json::Value, CoreCruxProxyError> {
+    let status = response.status().as_u16();
+    let text = response.body_mut().read_to_string().map_err(|err| {
+        CoreCruxProxyError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("CoreCrux graph response read failed: {err}"),
+        )
+    })?;
+    let body = if text.trim().is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str::<serde_json::Value>(&text).map_err(|err| {
+            CoreCruxProxyError::new(
+                StatusCode::BAD_GATEWAY,
+                format!("CoreCrux graph returned non-JSON response ({status}): {err}"),
+            )
+        })?
+    };
+    if (200..300).contains(&status) {
+        return Ok(body);
+    }
+    // Surface the upstream problem+json `detail` when present (e.g. the build
+    // hint), otherwise a generic mapped message. Never echo upstream auth detail.
+    let mapped = map_graph_upstream_status(status);
+    let detail = if mapped == StatusCode::BAD_GATEWAY {
+        format!("CoreCrux graph endpoint returned {status}")
+    } else {
+        body.get("detail")
+            .and_then(|v| v.as_str())
+            .map_or_else(|| format!("CoreCrux graph endpoint returned {status}"), str::to_string)
+    };
+    Err(CoreCruxProxyError::new(mapped, detail))
+}
+
+fn corecrux_graph_get(agent: &ureq::Agent, url: &str) -> Result<serde_json::Value, CoreCruxProxyError> {
+    let response = apply_corecrux_graph_headers(agent.get(url)).call().map_err(|err| {
+        CoreCruxProxyError::new(StatusCode::BAD_GATEWAY, format!("CoreCrux graph request failed: {err}"))
+    })?;
+    read_corecrux_graph_json(response)
+}
+
+fn corecrux_graph_post(
+    agent: &ureq::Agent,
+    url: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, CoreCruxProxyError> {
+    let response = apply_corecrux_graph_headers(agent.post(url))
+        .send_json(body)
+        .map_err(|err| {
+            CoreCruxProxyError::new(StatusCode::BAD_GATEWAY, format!("CoreCrux graph request failed: {err}"))
+        })?;
+    read_corecrux_graph_json(response)
+}
+
+fn fetch_graph_stats(base_url: &str) -> Result<serde_json::Value, CoreCruxProxyError> {
+    let agent = corecrux_graph_agent();
+    corecrux_graph_get(&agent, &format!("{base_url}/v1/graph/stats"))
+}
+
+fn fetch_graph_resolve(base_url: &str, titles: Vec<String>) -> Result<serde_json::Value, CoreCruxProxyError> {
+    let agent = corecrux_graph_agent();
+    let body = serde_json::json!({ "titles": titles });
+    corecrux_graph_post(&agent, &format!("{base_url}/v1/graph/resolve"), &body)
+}
+
+fn fetch_graph_ego(base_url: &str, body: serde_json::Value) -> Result<serde_json::Value, CoreCruxProxyError> {
+    let agent = corecrux_graph_agent();
+    corecrux_graph_post(&agent, &format!("{base_url}/v1/graph/ego"), &body)
+}
+
+fn fetch_graph_path(base_url: &str, body: serde_json::Value) -> Result<serde_json::Value, CoreCruxProxyError> {
+    let agent = corecrux_graph_agent();
+    corecrux_graph_post(&agent, &format!("{base_url}/v1/graph/path"), &body)
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct ConsoleReviewQuery {
     pub limit: Option<usize>,
@@ -2672,5 +3124,199 @@ mod lane_weight_tests {
             StatusCode::BAD_REQUEST,
             "empty target set is rejected, not laundered into 200"
         );
+    }
+
+    // ── CoreCrux link-graph mediation proxy (ExecPlan wikicrux-link-graph M4) ──
+
+    fn qmap(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn reject_unknown_graph_params_allows_known_rejects_extras() {
+        assert!(reject_unknown_graph_params(&qmap(&[("titles", "Dog|Cat")]), GRAPH_RESOLVE_PARAMS).is_ok());
+        // A cache-buster / arbitrary param is rejected (T.5: fixed audited surface).
+        assert!(reject_unknown_graph_params(&qmap(&[("titles", "Dog"), ("_", "9")]), GRAPH_RESOLVE_PARAMS).is_err());
+        assert!(reject_unknown_graph_params(&qmap(&[("tenant_id", "x")]), GRAPH_EGO_PARAMS).is_err());
+    }
+
+    #[test]
+    fn build_graph_ego_body_valid_and_caps() {
+        let body = build_graph_ego_body(&qmap(&[
+            ("seeds", "1,2,3"),
+            ("hops", "9"),
+            ("budget_nodes", "5000"),
+            ("budget_edges", "20000"),
+        ]))
+        .expect("valid ego body");
+        assert_eq!(body["seeds"], serde_json::json!([1, 2, 3]));
+        assert_eq!(
+            body["hops"],
+            serde_json::json!(3),
+            "hops clamps to the upstream max of 3"
+        );
+        assert_eq!(body["budget"]["nodes"], serde_json::json!(5000));
+        assert_eq!(body["kind"], serde_json::json!("link"), "kind defaults to link");
+        assert_eq!(body["direction"], serde_json::json!("both"));
+    }
+
+    #[test]
+    fn build_graph_ego_body_error_paths() {
+        assert!(
+            build_graph_ego_body(&qmap(&[("budget_nodes", "1"), ("budget_edges", "1")])).is_err(),
+            "seeds required"
+        );
+        assert!(
+            build_graph_ego_body(&qmap(&[("seeds", "1")])).is_err(),
+            "budgets required"
+        );
+        assert!(
+            build_graph_ego_body(&qmap(&[("seeds", "1"), ("budget_nodes", "0"), ("budget_edges", "1")])).is_err(),
+            "budget must be > 0"
+        );
+        assert!(
+            build_graph_ego_body(&qmap(&[
+                ("seeds", "1"),
+                ("budget_nodes", "999999"),
+                ("budget_edges", "1")
+            ]))
+            .is_err(),
+            "budget over the upstream max is rejected"
+        );
+        assert!(
+            build_graph_ego_body(&qmap(&[
+                ("seeds", "1"),
+                ("budget_nodes", "1"),
+                ("budget_edges", "1"),
+                ("kind", "nope")
+            ]))
+            .is_err(),
+            "bad kind rejected"
+        );
+        assert!(
+            build_graph_ego_body(&qmap(&[
+                ("seeds", "1"),
+                ("budget_nodes", "1"),
+                ("budget_edges", "1"),
+                ("direction", "sideways")
+            ]))
+            .is_err(),
+            "bad direction rejected"
+        );
+        assert!(build_graph_ego_body(&qmap(&[
+            ("seeds", "notanint"),
+            ("budget_nodes", "1"),
+            ("budget_edges", "1")
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn build_graph_path_body_valid_and_caps() {
+        let body = build_graph_path_body(&qmap(&[
+            ("src", "1"),
+            ("dst", "2"),
+            ("k", "999"),
+            ("context_edge_budget", "999999"),
+        ]))
+        .expect("valid path body");
+        assert_eq!(body["src"], serde_json::json!(1));
+        assert_eq!(body["dst"], serde_json::json!(2));
+        assert_eq!(body["max_hops"], serde_json::json!(6), "max_hops defaults to 6");
+        assert_eq!(body["k"], serde_json::json!(64), "k clamps to 64");
+        assert_eq!(
+            body["context_edge_budget"],
+            serde_json::json!(20000),
+            "context edge budget clamps to 20000"
+        );
+    }
+
+    #[test]
+    fn build_graph_path_body_error_paths() {
+        assert!(build_graph_path_body(&qmap(&[("dst", "2")])).is_err(), "src required");
+        assert!(build_graph_path_body(&qmap(&[("src", "1")])).is_err(), "dst required");
+        assert!(
+            build_graph_path_body(&qmap(&[("src", "1"), ("dst", "2"), ("max_hops", "0")])).is_err(),
+            "max_hops must be >= 1"
+        );
+        assert!(
+            build_graph_path_body(&qmap(&[("src", "1"), ("dst", "2"), ("max_hops", "9")])).is_err(),
+            "max_hops must be <= 8"
+        );
+    }
+
+    #[test]
+    fn map_graph_upstream_status_hides_auth_and_surfaces_availability() {
+        // Upstream flag-off (404) and graph-absent (503) both surface as 503 so the
+        // pane shows the enable/build hint.
+        assert_eq!(map_graph_upstream_status(404), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(map_graph_upstream_status(503), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(map_graph_upstream_status(400), StatusCode::BAD_REQUEST);
+        // Upstream auth failure (daemon-token misconfig) never leaks — collapses to 502.
+        assert_eq!(map_graph_upstream_status(401), StatusCode::BAD_GATEWAY);
+        assert_eq!(map_graph_upstream_status(403), StatusCode::BAD_GATEWAY);
+        assert_eq!(map_graph_upstream_status(500), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn corecrux_graph_base_url_env_unset_and_set() {
+        for k in ["CORECRUXD_CORECRUX_GRAPH_BASE_URL", "CORECRUX_GRAPH_BASE_URL"] {
+            std::env::remove_var(k);
+        }
+        assert!(corecrux_graph_base_url_from_env().is_err());
+        assert!(!corecrux_graph_base_url_configured());
+        std::env::set_var("CORECRUX_GRAPH_BASE_URL", "http://data-1:14800/");
+        assert_eq!(corecrux_graph_base_url_from_env().unwrap(), "http://data-1:14800");
+        assert!(corecrux_graph_base_url_configured());
+        std::env::remove_var("CORECRUX_GRAPH_BASE_URL");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn graph_handlers_503_without_upstream_and_400_on_bad_params() {
+        for k in ["CORECRUXD_CORECRUX_GRAPH_BASE_URL", "CORECRUX_GRAPH_BASE_URL"] {
+            std::env::remove_var(k);
+        }
+        let state = st();
+        // stats → 503 (graph upstream unconfigured; console hides / dims the pane).
+        let resp = get_console_corecrux_graph_stats(State(state.clone()), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(status_of(resp).await, StatusCode::SERVICE_UNAVAILABLE);
+
+        // resolve with no titles → 400 (validated before the env lookup).
+        let resp =
+            get_console_corecrux_graph_resolve(State(state.clone()), HeaderMap::new(), Query(qmap(&[("titles", "")])))
+                .await
+                .into_response();
+        assert_eq!(status_of(resp).await, StatusCode::BAD_REQUEST);
+
+        // ego with an unknown param → 400.
+        let resp = get_console_corecrux_graph_ego(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(qmap(&[("seeds", "1"), ("nope", "1")])),
+        )
+        .await
+        .into_response();
+        assert_eq!(status_of(resp).await, StatusCode::BAD_REQUEST);
+
+        // path with max_hops out of range → 400.
+        let resp = get_console_corecrux_graph_path(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(qmap(&[("src", "1"), ("dst", "2"), ("max_hops", "9")])),
+        )
+        .await
+        .into_response();
+        assert_eq!(status_of(resp).await, StatusCode::BAD_REQUEST);
+
+        // resolve with a real title but upstream unset → 503.
+        let resp =
+            get_console_corecrux_graph_resolve(State(state), HeaderMap::new(), Query(qmap(&[("titles", "Dog")])))
+                .await
+                .into_response();
+        assert_eq!(status_of(resp).await, StatusCode::SERVICE_UNAVAILABLE);
     }
 }

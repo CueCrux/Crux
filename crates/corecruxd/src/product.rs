@@ -239,6 +239,12 @@ pub struct RuntimeCapabilities {
     pub hosted_sync: RuntimeCapability,
     pub projection_queries: RuntimeCapability,
     pub graph_expand: RuntimeCapability,
+    /// The CoreCrux link-graph console mediation proxy (`/v1/console/corecrux/graph/*`).
+    /// `configured` ⇔ the graph upstream base URL env is set on this daemon; the
+    /// unified-shell console gates its six-degrees link-graph pane on this signal
+    /// (render from the capability plan, never the route registry). See ExecPlan
+    /// `wikicrux-link-graph-explorer-2026-07-23` (M4).
+    pub console_link_graph: RuntimeCapability,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -261,6 +267,9 @@ pub struct RuntimeCapabilityInputs {
     pub embedding_delegation: EmbeddingDelegationRuntimeState,
     pub rerank_endpoint_configured: bool,
     pub graph_expand_configured: bool,
+    /// The CoreCrux link-graph console mediation proxy is configured (graph
+    /// upstream base URL env set). Sourced from `http::console` at `/v1/version`.
+    pub console_link_graph_configured: bool,
 }
 
 /// Safe, public projection of the delegation client's live breaker state.
@@ -485,6 +494,25 @@ impl RuntimeCapabilityDescriptor {
         } else {
             RuntimeCapability::available(graph_stages)
         };
+        // The link-graph console proxy is a stateless GET-only mediation surface:
+        // once the graph upstream base URL env is set it is both configured and
+        // ready (no in-process init). Available ⇔ configured.
+        let console_link_graph_stages = RuntimeCapabilityStages {
+            compiled: true,
+            configured: inputs.console_link_graph_configured,
+            initialized: inputs.console_link_graph_configured,
+            entitled: true,
+            degraded: false,
+        };
+        let console_link_graph = if inputs.console_link_graph_configured {
+            RuntimeCapability::available(console_link_graph_stages)
+        } else {
+            RuntimeCapability::unavailable(
+                "console_link_graph_not_configured",
+                "The CoreCrux link-graph mediation proxy is not configured; set CORECRUXD_CORECRUX_GRAPH_BASE_URL on the Crux daemon.",
+                console_link_graph_stages,
+            )
+        };
 
         Self {
             schema_version: RUNTIME_CAPABILITY_SCHEMA_VERSION,
@@ -496,6 +524,7 @@ impl RuntimeCapabilityDescriptor {
                 hosted_sync,
                 projection_queries,
                 graph_expand,
+                console_link_graph,
             },
         }
     }
@@ -1147,6 +1176,7 @@ mod tests {
                 embedding_delegation: EmbeddingDelegationRuntimeState::NotConfigured,
                 rerank_endpoint_configured: true,
                 graph_expand_configured: true,
+                console_link_graph_configured: false,
             },
         );
 
@@ -1172,6 +1202,7 @@ mod tests {
                 embedding_delegation: EmbeddingDelegationRuntimeState::NotConfigured,
                 rerank_endpoint_configured: false,
                 graph_expand_configured: true,
+                console_link_graph_configured: false,
             },
         );
         assert!(!missing_endpoint.capabilities.rerank_gpu.configured);
@@ -1194,6 +1225,7 @@ mod tests {
                 embedding_delegation: EmbeddingDelegationRuntimeState::NotConfigured,
                 rerank_endpoint_configured: false,
                 graph_expand_configured: true,
+                console_link_graph_configured: false,
             },
         );
         let hosted_sync = descriptor.capabilities.hosted_sync;
@@ -1220,6 +1252,7 @@ mod tests {
                 embedding_delegation: EmbeddingDelegationRuntimeState::Available,
                 rerank_endpoint_configured: false,
                 graph_expand_configured: true,
+                console_link_graph_configured: false,
             },
         );
 
@@ -1244,6 +1277,7 @@ mod tests {
                 embedding_delegation: EmbeddingDelegationRuntimeState::CircuitOpen,
                 rerank_endpoint_configured: false,
                 graph_expand_configured: true,
+                console_link_graph_configured: false,
             },
         );
         assert_eq!(circuit_open.capabilities.embedding_delegation.availability, "degraded");

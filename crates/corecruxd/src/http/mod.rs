@@ -1318,6 +1318,26 @@ pub(crate) fn router_with_route_auth(
                 .put(self::console::put_console_corecrux_lane_weights)
                 .delete(self::console::delete_console_corecrux_lane_weights),
         )
+        // CoreCrux link-graph mediation proxy (ExecPlan
+        // wikicrux-link-graph-explorer-2026-07-23, M4). GET-only, read-only
+        // translation to the upstream CoreCrux `/v1/graph/*` endpoints; base URL +
+        // token in daemon env, no bearer in the browser (lane-weights/gpu1 precedent).
+        .route(
+            "/v1/console/corecrux/graph/stats",
+            get(self::console::get_console_corecrux_graph_stats),
+        )
+        .route(
+            "/v1/console/corecrux/graph/resolve",
+            get(self::console::get_console_corecrux_graph_resolve),
+        )
+        .route(
+            "/v1/console/corecrux/graph/ego",
+            get(self::console::get_console_corecrux_graph_ego),
+        )
+        .route(
+            "/v1/console/corecrux/graph/path",
+            get(self::console::get_console_corecrux_graph_path),
+        )
         .route(
             "/v1/console/review/contradictions",
             get(self::console::get_console_review_contradictions),

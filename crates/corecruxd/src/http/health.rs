@@ -475,6 +475,7 @@ fn runtime_capability_descriptor(
             embedding_delegation,
             rerank_endpoint_configured: rerank_endpoint_configured(state),
             graph_expand_configured: is_query_feature_enabled("CORECRUXD_QUERY_GRAPH_EXPAND"),
+            console_link_graph_configured: super::console::corecrux_graph_base_url_configured(),
         },
     )
 }

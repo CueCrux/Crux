@@ -1572,6 +1572,59 @@ function extractThemeVars(theme) {
 })();
 
 // =========================================================================
+//  Check — (M4) Link graph destination. A special full-viewport destination
+//  (like Canvas/Explorer/Sitemap) that IS a WebGL six-degrees explorer over the
+//  CoreCrux link graph, reached ONLY through the Crux daemon's read-only
+//  mediation proxy (/v1/console/corecrux/graph/*). VISIBILITY is gated on the
+//  daemon's runtime capability PLAN (console_link_graph), not the route registry
+//  (unified-shell rule). Renderer = custom three.js r165 on the already-vendored
+//  module (zero new vendored files, T.5). Reduced-motion: render-on-demand only.
+// =========================================================================
+(function checkLinkGraphDestination() {
+  const lg = (pages.DESTS || []).filter(function (d) { return d.id === 'linkgraph'; })[0];
+  check(!!lg, '[linkgraph] pages.DESTS must register the linkgraph destination');
+  if (lg) {
+    check(lg.capability === 'console_link_graph', '[linkgraph] the linkgraph destination must declare capability "console_link_graph" (gate visibility on the runtime plan, not the registry)');
+    check(lg.icon === 'linkgraph', '[linkgraph] the linkgraph destination must use the linkgraph icon');
+    check(!lg.key, '[linkgraph] the linkgraph destination must not claim a keyboard shortcut (it is capability-gated + not always present)');
+  }
+  // Shell wiring: icon glyph, import map → vendored r165, special-cased render,
+  // and the capability-gated nav (destVisible + a post-boot nav rebuild).
+  check(/linkgraph:\s*'<svg/.test(shellHtml), '[linkgraph] shell.html must define the "linkgraph" icon glyph');
+  check(/<script type="importmap">/.test(shellHtml) && shellHtml.indexOf('/console-3d/vendor/three.module.min.js') >= 0,
+    '[linkgraph] shell.html must map bare `three` to the already-vendored r165 (no new vendored files, no CDN)');
+  check(/destId === 'linkgraph'/.test(shellHtml) && /renderLinkGraph/.test(shellHtml),
+    '[linkgraph] shell.html must route the linkgraph destination to render.renderLinkGraph');
+  check(/function destVisible/.test(shellHtml) && /destVisible\(item\)/.test(shellHtml),
+    '[linkgraph] shell.html must gate rail destinations on the runtime capability plan (destVisible)');
+  check(/capabilityAvailable/.test(shellHtml) || /CruxRender\.capabilityAvailable/.test(shellHtml),
+    '[linkgraph] the capability gate must read the daemon capability plan via CruxRender.capabilityAvailable');
+  // render.js entry points.
+  check(typeof render.renderLinkGraph === 'function', '[linkgraph] render.js must export renderLinkGraph');
+  check(typeof render.capabilityAvailable === 'function', '[linkgraph] render.js must export capabilityAvailable (plan-driven gate)');
+  // The pane reaches the graph ONLY through the four read-only proxy routes.
+  const apiSrc = fs.readFileSync(path.join(DIR, 'api.js'), 'utf8');
+  ['/v1/console/corecrux/graph/stats', '/v1/console/corecrux/graph/resolve', '/v1/console/corecrux/graph/ego', '/v1/console/corecrux/graph/path'].forEach(function (route) {
+    check(renderSrc.indexOf(route) >= 0, '[linkgraph] render.renderLinkGraph must reach the proxy route ' + route);
+    check(apiSrc.indexOf("'" + route + "': true") >= 0, '[linkgraph] api.js LITERAL_GET_PATHS must allowlist ' + route);
+  });
+  // The renderer is a client-only ESM module: CCL header, bare `three`, the shared
+  // public API, and zero external runtime deps (T.5). It also must not run a
+  // perpetual rAF loop (reduced-motion floor) — render-on-demand only.
+  const rendererSrc = fs.readFileSync(path.join(DIR, 'linkgraph-renderer.mjs'), 'utf8');
+  check(/CueCrux Community Licence \(CCL v1\.0\)/.test(rendererSrc), '[linkgraph] linkgraph-renderer.mjs must carry the CCL licence header');
+  check(/import \* as THREE from 'three'/.test(rendererSrc), '[linkgraph] renderer must import the bare `three` specifier (resolved to the vendored r165 by the shell import map)');
+  ['mount', 'setData', 'expandData', 'setTheme', 'onNodeClick', 'destroy'].forEach(function (m) {
+    check(rendererSrc.indexOf(m) >= 0, '[linkgraph] renderer must expose the shared public API method: ' + m);
+  });
+  ['unpkg.com', 'jsdelivr.net', 'cdnjs.cloudflare', 'cdn.jsdelivr', 'fonts.googleapis', "from 'http", 'from "http', "import('http", 'import("http'].forEach(function (bad) {
+    check(rendererSrc.indexOf(bad) < 0, '[linkgraph] renderer must have no external runtime dependency: ' + bad);
+  });
+  check(/reduced-motion/i.test(rendererSrc) || /reducedMotion/.test(rendererSrc), '[linkgraph] renderer must honour prefers-reduced-motion (render-on-demand, no perpetual animation)');
+  notes.push('linkgraph destination (M4): capability-gated (console_link_graph) WebGL six-degrees pane over /v1/console/corecrux/graph/* (stats/resolve/ego/path); custom three.js r165 via the vendored module (zero new files); render-on-demand (reduced-motion safe); 44px targets + focus-visible.');
+})();
+
+// =========================================================================
 //  Check 32 — (M12) JSX surface port. All 11 WebCrux Proof surfaces
 //  (webcrux-surfaces-demo-v3.jsx NAV, line 3028) are the Documents-mode surface
 //  list: render.DOC_SURFACES carries the 11 ids; each has a render function

@@ -1238,7 +1238,16 @@
     // Site map — a destination with no sub-pills: it IS a static reference page
     // (the flat rail rearranged into 5 destinations + System). Delegates to
     // render.js renderSiteMap; reads nothing, so it shows in every posture.
-    { id: 'sitemap', label: 'Site map', icon: 'map', key: '7', sub: "the 26-item rail, rearranged into 5 destinations + System" }
+    { id: 'sitemap', label: 'Site map', icon: 'map', key: '7', sub: "the 26-item rail, rearranged into 5 destinations + System" },
+    // Link graph (ExecPlan wikicrux-link-graph-explorer M4) — a destination with
+    // no sub-pills: it IS a WebGL six-degrees explorer over the enwiki-prose link
+    // graph, served through the Crux daemon's read-only CoreCrux mediation proxy
+    // (/v1/console/corecrux/graph/*). `capability` gates VISIBILITY on the daemon's
+    // runtime capability plan (render from the plan, never the route registry —
+    // unified-shell rule): the pane is dark until the proxy env is configured. No
+    // key + capability-gated, so it never appears in the rail on a daemon without
+    // the proxy. Delegates to render.js renderLinkGraph (custom three.js r165).
+    { id: 'linkgraph', label: 'Link graph', icon: 'linkgraph', capability: 'console_link_graph', sub: 'Six-degrees explorer over the enwiki-prose link graph (CoreCrux mediation proxy).' }
   ];
 
   // ---- Legacy id inventory (the 26 CX pages this plan must keep reachable)

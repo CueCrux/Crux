@@ -15,7 +15,7 @@
 // Every call is same-origin credentialed; the browser never holds a bearer
 // token (the daemon authenticates the session at its own origin).
 //
-// 163 read endpoints, generated from the route manifest.
+// 167 read endpoints, generated from the route manifest.
 
 /**
  * Append a plain query object to a path as a URL search string.
@@ -53,6 +53,10 @@ const LITERAL_GET_PATHS = Object.freeze({
   '/v1/auth/whoami': true,
   '/v1/bootstrap/status': true,
   '/v1/cloud/access-contract': true,
+  '/v1/console/corecrux/graph/ego': true,
+  '/v1/console/corecrux/graph/path': true,
+  '/v1/console/corecrux/graph/resolve': true,
+  '/v1/console/corecrux/graph/stats': true,
   '/v1/console/corecrux/lane-weights': true,
   '/v1/console/engine/bench': true,
   '/v1/console/engine/spend': true,
@@ -232,6 +236,18 @@ const CruxApi = Object.freeze({
   },
   consoleChunksByChunkDigestPreview(chunkDigest, query) {
     return fetch(withQuery(`/v1/console/chunks/${encodeURIComponent(chunkDigest)}/preview`, query), { credentials: 'same-origin' });
+  },
+  consoleCorecruxGraphEgo(query) {
+    return fetch(withQuery(`/v1/console/corecrux/graph/ego`, query), { credentials: 'same-origin' });
+  },
+  consoleCorecruxGraphPath(query) {
+    return fetch(withQuery(`/v1/console/corecrux/graph/path`, query), { credentials: 'same-origin' });
+  },
+  consoleCorecruxGraphResolve(query) {
+    return fetch(withQuery(`/v1/console/corecrux/graph/resolve`, query), { credentials: 'same-origin' });
+  },
+  consoleCorecruxGraphStats(query) {
+    return fetch(withQuery(`/v1/console/corecrux/graph/stats`, query), { credentials: 'same-origin' });
   },
   consoleCorecruxLaneWeights(query) {
     return fetch(withQuery(`/v1/console/corecrux/lane-weights`, query), { credentials: 'same-origin' });

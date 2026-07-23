@@ -7248,13 +7248,14 @@ async fn panic_handler_handles_string_panic() {
 
 // ── Production hardening: /v1/version endpoint ──────────────────
 
-fn runtime_capability_profile_env() -> [EnvVarGuard; 5] {
+fn runtime_capability_profile_env() -> [EnvVarGuard; 6] {
     [
         EnvVarGuard::set("CORECRUXD_SYNC_ENABLED", "true"),
         EnvVarGuard::set("CORECRUXD_SYNC_REMOTE_URL", "http://sync.example.test:14800"),
         EnvVarGuard::set("CORECRUXD_SYNC_API_KEY", "test-key"),
         EnvVarGuard::set("CORECRUXD_QUERY_GRAPH_EXPAND", "1"),
         EnvVarGuard::set("CORECRUXD_GPU1_BASE_URL", "http://gpu.example.test"),
+        EnvVarGuard::set("CORECRUXD_CORECRUX_GRAPH_BASE_URL", "http://graph.example.test"),
     ]
 }
 
@@ -7285,7 +7286,7 @@ async fn version_runtime_capability_descriptor_full_profile() {
     let Some(capability_values) = capabilities.as_object() else {
         panic!("runtime_capabilities.capabilities must be a JSON object");
     };
-    assert_eq!(capability_values.len(), 7);
+    assert_eq!(capability_values.len(), 8);
     for capability in capability_values.values() {
         assert!(capability["availability"].is_string());
         assert!(capability["reason_code"].is_string());
@@ -7300,6 +7301,7 @@ async fn version_runtime_capability_descriptor_full_profile() {
         "hosted_sync",
         "projection_queries",
         "graph_expand",
+        "console_link_graph",
     ] {
         assert_eq!(capabilities[capability]["availability"], "available", "{capability}");
         assert_eq!(capabilities[capability]["reason_code"], "available", "{capability}");
