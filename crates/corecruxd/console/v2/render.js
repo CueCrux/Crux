@@ -7958,7 +7958,20 @@
       zin: ricon('<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3M11 8.2v5.6M8.2 11h5.6"/>'),
       zout: ricon('<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3M8.2 11h5.6"/>'),
       fit: ricon('<path d="M9 4H5a1 1 0 0 0-1 1v4M15 4h4a1 1 0 0 1 1 1v4M9 20H5a1 1 0 0 1-1-1v-4M15 20h4a1 1 0 0 1 1-1v-4"/>'),
-      close: ricon('<path d="M6 6l12 12M18 6L6 18"/>')
+      close: ricon('<path d="M6 6l12 12M18 6L6 18"/>'),
+      // M12 — the top-left tool toggles, unified into the same SVG family
+      // (24 viewBox · 1.8 stroke) — completes the icon unification A2 skipped.
+      spin: ricon('<path d="M20.5 12a8.5 8.5 0 1 1-2.4-5.9"/><path d="M20.5 4.5v3.6h-3.6"/>'),
+      clock: ricon('<circle cx="12" cy="12" r="8.5"/><path d="M12 7v5l3.2 2"/>'),
+      mode: ricon('<circle cx="12" cy="12" r="1.7"/><path d="M12 4v4.6M12 15.4V20M4 12h4.6M15.4 12H20M6.4 6.4l3.2 3.2M14.4 14.4l3.2 3.2M17.6 6.4l-3.2 3.2M9.6 14.4l-3.2 3.2"/>'),
+      dir: ricon('<path d="M12 3v8M12 3l-3 3M12 3l3 3M12 21v-8M12 21l-3-3M12 21l3-3"/>'),
+      census: ricon('<circle cx="12" cy="12" r="8" stroke-dasharray="2 2.6"/><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/>'),
+      done: ricon('<path d="M20 6.5L9.5 17 4 11.5"/>'),
+      ledger: ricon('<path d="M4 6.5h16M4 12h16M4 17.5h10"/>'),
+      state: ricon('<circle cx="12" cy="12" r="8.5"/><path d="M12 3.5a8.5 8.5 0 0 1 0 17z" fill="currentColor" stroke="none"/>'),
+      lineage: ricon('<circle cx="7" cy="7" r="2"/><circle cx="17" cy="17" r="2"/><path d="M9 7h4a2 2 0 0 1 2 2v6"/>'),
+      play: ricon('<path d="M8 5.5v13l11-6.5z" fill="currentColor"/>'),
+      pause: ricon('<path d="M9 5v14M15 5v14"/>')
     };
     function svgIconBtn(cls, svg, aria, extra) {
       var b = el('button', { 'class': cls, type: 'button', 'aria-label': aria, title: aria });
@@ -7966,22 +7979,28 @@
       b.innerHTML = svg; return b;
     }
 
-    // ---- tool toggles (unicode glyphs — a distinct affordance from the SVG set) --
-    function icBtn(txt, title, pressed) { return el('button', { 'class': 'ic', type: 'button', title: title, 'aria-pressed': pressed ? 'true' : 'false' }, [txt]); }
-    var bSpin = icBtn('⟳', 'Ambient spin', !REDUCED);
-    var bClock = icBtn('◷', 'Reset clock to 12 (also stops spin)', false); bClock.removeAttribute('aria-pressed');
-    var bMode = icBtn('▥', 'Bars: spoke from centre to each node', true);
-    var bDir = icBtn('⇅', 'Time edge: outward (rings grow) / inward (nodes sink from rim)', false);
-    var bAll = icBtn('◌', 'Census: every plan stays on the clock; hover names sectors', false);
-    var bDone = icBtn('✓', 'Show completed plans on the clock (auto-on during playback)', false);
-    var bLedger = icBtn('≡', 'Completed-plans list (left). Auto-shows during playback; hides on lens swap.', false);
-    var bState = icBtn('◑', 'State colours: complete green · in progress purple · blocked red', false);
-    var bLin = icBtn('⌇', 'Lineage chords (depends_on)', false);
+    // ---- tool toggles (M12: unified SVG icon buttons in the vertical left toolbar;
+    //      svgTool renders an RIC icon toggle — pressed=null → momentary action) --
+    function svgTool(key, title, pressed) {
+      var b = el('button', { 'class': 'ic', type: 'button', title: title, 'aria-label': title });
+      if (pressed !== null) { b.setAttribute('aria-pressed', pressed ? 'true' : 'false'); }
+      b.innerHTML = RIC[key];
+      return b;
+    }
+    var bSpin = svgTool('spin', 'Ambient spin', !REDUCED);
+    var bClock = svgTool('clock', 'Reset clock to 12 (also stops spin)', null);
+    var bMode = svgTool('mode', 'Bars: spoke from centre to each node', true);
+    var bDir = svgTool('dir', 'Time edge: outward (rings grow) / inward (nodes sink from rim)', false);
+    var bAll = svgTool('census', 'Census: every plan stays on the clock; hover names sectors', false);
+    var bDone = svgTool('done', 'Show completed plans on the clock (auto-on during playback)', false);
+    var bLedger = svgTool('ledger', 'Completed-plans list (left). Auto-shows during playback; hides on lens swap.', false);
+    var bState = svgTool('state', 'State colours: complete green · in progress purple · blocked red', false);
+    var bLin = svgTool('lineage', 'Lineage chords (depends_on)', false);
     var grpTools = el('span', { 'class': 'grp' }, [bSpin, bClock, bMode, bDir, bAll, bDone, bLedger, bState, bLin]);
 
     var bTokCum = el('button', { type: 'button', 'aria-pressed': 'true', title: 'Running total across the window' }, ['cumulative']);
     var bTokDay = el('button', { type: 'button', 'aria-pressed': 'false', title: 'Tokens per day' }, ['per day']);
-    var grpTokViews = el('span', { 'class': 'grp' }, [bTokCum, bTokDay]); grpTokViews.style.display = 'none';
+    var grpTokViews = el('span', { 'class': 'grp toktoggle' }, [bTokCum, bTokDay]); grpTokViews.style.display = 'none';
 
     // ---- kinds / agents filters → icon buttons that expand a popover menu ----
     // Single-select (matches the fKind / fAgent state); active state stays visible
@@ -8025,22 +8044,23 @@
     var tools = el('div', { 'class': 'rings-tools' }, [grpTools, kindMenu.wrap, agentMenu.wrap, helpBtn, grpTokViews]);
     stage.appendChild(tools);
 
-    // ---- top timeline (M11): the replay scrubber, enlarged + moved to the top ----
-    var bPlay = icBtn('▶', 'Replay the window', false);
+    // ---- top play/timeline bar (M12): SAME measure as the bottom bar, centred.
+    //      Layout left→right: start-date · play · slider · finish-date. The date
+    //      pickers moved UP from the bottom bar; cDate is the live scrub-date,
+    //      floated just below the bar centre. ----
+    var dStart = el('input', { type: 'date', min: '2026-05-18', max: '2026-07-22', value: '2026-05-18', 'aria-label': 'Window start date', 'class': 'rings-bdate' });
+    var dEnd = el('input', { type: 'date', min: '2026-05-18', max: '2026-07-22', value: '2026-07-22', 'aria-label': 'Window end date', 'class': 'rings-bdate' });
+    var bPlay = svgTool('play', 'Replay the window', false);
     var rTime = el('input', { type: 'range', min: '0', max: '1000', value: '1000', 'aria-label': 'Time', 'class': 'rings-timeline' });
     var cDate = el('span', { 'class': 'chip', text: '2026-07-22' });
-    var topbar = el('div', { 'class': 'rings-topbar' }, [bPlay, rTime, cDate]);
+    var topbar = el('div', { 'class': 'rings-topbar' }, [dStart, bPlay, rTime, dEnd, cDate]);
     stage.appendChild(topbar);
 
-    // ---- bottom control bar (M11): date pickers + window sliders + canvas zoom,
-    //      centred over an opaque background so it reads over the canvas. There is
-    //      ONE zoom concept (canvas zoom), so per the operator's reconciliation it
-    //      lives here (the timeline above carries its own scrub range). ----
-    var dStart = el('input', { type: 'date', min: '2026-05-18', max: '2026-07-22', value: '2026-05-18', 'aria-label': 'Window start date' });
+    // ---- bottom control bar (M12): window sliders + canvas zoom, centred + opaque,
+    //      the SAME measure as the play bar above (date pickers now live up top). ----
     var rStart = el('input', { type: 'range', min: '0', max: '1000', value: '0', 'aria-label': 'Window start' });
     var rEnd = el('input', { type: 'range', min: '0', max: '1000', value: '1000', 'aria-label': 'Window end' });
-    var dEnd = el('input', { type: 'date', min: '2026-05-18', max: '2026-07-22', value: '2026-07-22', 'aria-label': 'Window end date' });
-    var grpWindow = el('span', { 'class': 'grp bb-window' }, [el('label', { text: 'from' }), dStart, rStart, rEnd, dEnd, el('label', { text: 'to' })]);
+    var grpWindow = el('span', { 'class': 'grp bb-window' }, [el('label', { text: 'window' }), rStart, rEnd]);
     var bZin = svgIconBtn('rings-iconbtn', RIC.zin, 'Zoom in');
     var bZout = svgIconBtn('rings-iconbtn', RIC.zout, 'Zoom out');
     var bZfit = svgIconBtn('rings-iconbtn', RIC.fit, 'Fit to view');
@@ -8116,6 +8136,37 @@
     var STATE = { 0: 'complete', 1: 'in_progress', 2: 'blocked' };
     var STATE_HUE = { 0: '#34d399', 1: '#a78bfa', 2: '#ef4444' };
     var stateHue = function (p) { return STATE_HUE[p.st]; };
+    // ---- theme-responsive canvas palette (M12): the draw code reads its ink /
+    //      hairline / accent / hub / kind+state hues from CSS custom properties on
+    //      .rings-root, so the light theme gets a legible variant with no reload.
+    //      Semantic hues keep their hue family (deepened for contrast on light).
+    //      readPalette() is called once after the root is attached + on every live
+    //      theme toggle; the KIND_HUE/STATE_HUE objects are mutated in place so the
+    //      closures that captured them (G_FAM_HUE, draw) see the new values. ----
+    var PAL = {
+      ink: '#eef0f6', ink2: '#c8cedb', ink3: '#7e8595', hair: '#ffffff',
+      accent: '#8b96f2', hub: '#12151d', gate: '#2dd4bf', decision: '#a78bfa',
+      memory: '#8b96f2', handoff: '#f5a623', incident: '#ef4444',
+      done: '#34d399', prog: '#a78bfa', block: '#ef4444', codex: '#22d3ee', untraced: '#7e8595'
+    };
+    function readPalette() {
+      var cs = (typeof getComputedStyle === 'function') ? getComputedStyle(root) : null;
+      if (!cs) { return; }
+      var v = function (name, dflt) { var x = (cs.getPropertyValue(name) || '').trim(); return /^#[0-9a-fA-F]{6}$/.test(x) ? x : dflt; };
+      PAL.ink = v('--rings-cv-ink', PAL.ink); PAL.ink2 = v('--rings-cv-ink2', PAL.ink2); PAL.ink3 = v('--rings-cv-ink3', PAL.ink3);
+      PAL.hair = v('--rings-cv-hair', PAL.hair); PAL.accent = v('--rings-cv-accent', PAL.accent); PAL.hub = v('--rings-cv-hub', PAL.hub);
+      PAL.gate = v('--rings-cv-gate', PAL.gate); PAL.decision = v('--rings-cv-decision', PAL.decision); PAL.memory = v('--rings-cv-memory', PAL.memory);
+      PAL.handoff = v('--rings-cv-handoff', PAL.handoff); PAL.incident = v('--rings-cv-incident', PAL.incident);
+      PAL.done = v('--rings-cv-state-done', PAL.done); PAL.prog = v('--rings-cv-state-prog', PAL.prog); PAL.block = v('--rings-cv-state-block', PAL.block);
+      PAL.codex = v('--rings-cv-sess-codex', PAL.codex); PAL.untraced = v('--rings-cv-untraced', PAL.untraced);
+      KIND_HUE.gate = PAL.gate; KIND_HUE.decision = PAL.decision; KIND_HUE.memory = PAL.memory; KIND_HUE.handoff = PAL.handoff; KIND_HUE.incident = PAL.incident;
+      STATE_HUE[0] = PAL.done; STATE_HUE[1] = PAL.prog; STATE_HUE[2] = PAL.block;
+    }
+    function ink(a) { return hex2rgba(PAL.ink, a); }
+    function ink2c(a) { return hex2rgba(PAL.ink2, a); }
+    function ink3c(a) { return hex2rgba(PAL.ink3, a); }
+    function hair(a) { return hex2rgba(PAL.hair, a); }
+    function acc(a) { return hex2rgba(PAL.accent, a); }
     var PARK_DAYS = 18;
 
     var PLANS = [], DEP_EDGES = [], cells = [];
@@ -8300,11 +8351,11 @@
       if (!solo) {
         for (var i = 1; i <= EPOCH_RINGS; i++) {
           var rr0 = g.r0 + (g.R - g.r0) * (i / EPOCH_RINGS);
-          ctx.strokeStyle = 'rgba(255,255,255,.09)'; ctx.lineWidth = 1 / Z;
+          ctx.strokeStyle = hair(.09); ctx.lineWidth = 1 / Z;
           ctx.beginPath(); ctx.arc(0, 0, rr0, 0, 7); ctx.stroke();
         }
       }
-      ctx.strokeStyle = 'rgba(139,150,242,.6)'; ctx.lineWidth = 1.5 / Z;
+      ctx.strokeStyle = acc(.6); ctx.lineWidth = 1.5 / Z;
       ctx.beginPath();
       ctx.moveTo(Math.cos(-Math.PI / 2) * g.r0 * 0.9, Math.sin(-Math.PI / 2) * g.r0 * 0.9);
       ctx.lineTo(Math.cos(-Math.PI / 2) * (g.R + 10), Math.sin(-Math.PI / 2) * (g.R + 10));
@@ -8319,7 +8370,7 @@
           if (!p.lay || p.lay.alpha < 0.02) { return; }
           var L = p.lay, al = L.alpha, wSec = L.a1 - L.a0;
           if (wSec * g.R * Z > 8) {
-            ctx.strokeStyle = 'rgba(255,255,255,' + 0.06 * al + ')';
+            ctx.strokeStyle = hair(0.06 * al);
             ctx.beginPath(); ctx.moveTo(Math.cos(L.a0) * g.r0, Math.sin(L.a0) * g.r0); ctx.lineTo(Math.cos(L.a0) * g.R, Math.sin(L.a0) * g.R); ctx.stroke();
           }
           var hue = stateHue(p);
@@ -8335,7 +8386,7 @@
           ctx.lineWidth = 1 / Z;
           if (p.od.length) {
             var nT = Math.min(p.od.length, Math.max(1, Math.floor((wSec - 2 * aPad) / 0.02)));
-            ctx.strokeStyle = hex2rgba('#f5a623', 0.95 * al); ctx.lineWidth = 1.8 / Z;
+            ctx.strokeStyle = hex2rgba(PAL.handoff, 0.95 * al); ctx.lineWidth = 1.8 / Z;
             for (var oi = 0; oi < nT; oi++) {
               var oa = L.a0 + aPad + (oi + 0.5) * 0.019;
               ctx.beginPath(); ctx.moveTo(Math.cos(oa) * (g.R + 8), Math.sin(oa) * (g.R + 8)); ctx.lineTo(Math.cos(oa) * (g.R + 13), Math.sin(oa) * (g.R + 13)); ctx.stroke();
@@ -8344,7 +8395,7 @@
           }
           if (p.st === 2) {
             var pulse = REDUCED ? 0.5 : 0.35 + 0.3 * Math.sin(time * 4);
-            ctx.strokeStyle = hex2rgba('#ef4444', pulse * al);
+            ctx.strokeStyle = hex2rgba(PAL.block, pulse * al);
             ctx.beginPath(); ctx.arc(0, 0, g.R + 8, L.a0 + 0.01, L.a1 - 0.01); ctx.stroke();
           }
           var isHovSec = p === hoverSec;
@@ -8353,7 +8404,7 @@
             ctx.save();
             ctx.translate(Math.cos(midA) * lr, Math.sin(midA) * lr);
             ctx.rotate(midA + (Math.cos(midA + rot) < 0 ? Math.PI : 0));
-            ctx.fillStyle = isHovSec ? 'rgba(238,240,246,1)' : 'rgba(200,206,219,' + 0.95 * al + ')';
+            ctx.fillStyle = isHovSec ? ink(1) : ink2c(0.95 * al);
             ctx.font = '700 ' + (12 / Z) + 'px ' + MONO;
             ctx.textAlign = Math.cos(midA + rot) < 0 ? 'right' : 'left'; ctx.textBaseline = 'middle';
             var lbl = isHovSec ? (p.short.length > 34 ? p.short.slice(0, 33) + '…' : p.short) : (p.short.length > 16 ? p.short.slice(0, 15) + '…' : p.short);
@@ -8365,7 +8416,7 @@
             if (!passFilter(c)) { c._x = undefined; return; }
             var pos = cellPos(g, c);
             if (!pos) { return; }
-            var chue = colorByState ? stateHue(c.p) : (KIND_HUE[c.kind] || '#8b96f2');
+            var chue = colorByState ? stateHue(c.p) : (KIND_HUE[c.kind] || PAL.memory);
             var isSel = (hover === c || pinned === c);
             var age = T - c.day;
             var pop = REDUCED ? 1 : Math.min(1, age / 0.8);
@@ -8408,9 +8459,9 @@
           var r1 = g.R * 0.97;
           var ax = Math.cos(am) * r1, ay = Math.sin(am) * r1, bx = Math.cos(bm) * r1, by = Math.sin(bm) * r1;
           var alpha2 = lit ? 0.65 : 0.10;
-          ctx.strokeStyle = hex2rgba('#8b96f2', alpha2); ctx.lineWidth = (lit ? 1.6 : 1.1) / Z;
+          ctx.strokeStyle = acc(alpha2); ctx.lineWidth = (lit ? 1.6 : 1.1) / Z;
           ctx.beginPath(); ctx.moveTo(ax, ay); ctx.quadraticCurveTo((ax + bx) / 2 * 0.2, (ay + by) / 2 * 0.2, bx, by); ctx.stroke();
-          ctx.fillStyle = hex2rgba('#8b96f2', Math.min(1, alpha2 * 1.6));
+          ctx.fillStyle = acc(Math.min(1, alpha2 * 1.6));
           ctx.beginPath(); ctx.arc(bx, by, (lit ? 3 : 2.2) / Z, 0, 7); ctx.fill();
         });
         ctx.lineWidth = 1 / Z;
@@ -8419,13 +8470,13 @@
         soloLabels = [];
         var unit = g.R - g.r0, L2 = solo.lay;
         var evs = solo.cells.slice().sort(function (a, b) { return a.day - b.day; }).filter(function (c) { return c.day <= T && c.day >= S && c.day <= E && passFilter(c); });
-        ctx.strokeStyle = 'rgba(255,255,255,.16)'; ctx.lineWidth = 1 / Z;
+        ctx.strokeStyle = hair(.16); ctx.lineWidth = 1 / Z;
         ctx.beginPath(); ctx.moveTo(-(g.R + 10), 0); ctx.lineTo(-g.r0 * 0.72, 0); ctx.stroke();
         evs.forEach(function (c) {
           var r = soloRingR(g, c);
           var frac = c.n > 1 ? (c.rank + 0.5) / c.n : 0.5;
           var aNode = L2.a0 + (L2.a1 - L2.a0) * (0.06 + 0.88 * frac);
-          var chue = KIND_HUE[c.kind] || '#8b96f2';
+          var chue = KIND_HUE[c.kind] || PAL.memory;
           var isSelBar = pinned === c;
           ctx.strokeStyle = hex2rgba(chue, 0.07); ctx.lineWidth = 1 / Z;
           ctx.beginPath(); ctx.arc(0, 0, r, L2.a0, aNode); ctx.stroke();
@@ -8433,10 +8484,10 @@
           ctx.beginPath(); ctx.arc(0, 0, r, aNode, Math.PI); ctx.stroke();
           var y1 = 0;
           var segs = [
-            { h: unit * (0.06 + Math.min(0.30, ((c.tokens || 160) / 550) * 0.34)), col: hex2rgba('#8b96f2', 0.55) },
+            { h: unit * (0.06 + Math.min(0.30, ((c.tokens || 160) / 550) * 0.34)), col: acc(0.55) },
             { h: unit * 0.055, col: hex2rgba(chue, 0.95) }
           ];
-          if (c.version > 1) { segs.push({ h: unit * 0.022, col: 'rgba(238,240,246,.85)' }); }
+          if (c.version > 1) { segs.push({ h: unit * 0.022, col: ink(.85) }); }
           segs.forEach(function (sg) {
             ctx.strokeStyle = sg.col; ctx.lineWidth = (5 / Z) * (isSelBar ? 1.5 : 1);
             ctx.beginPath(); ctx.moveTo(-r, -y1); y1 += sg.h; ctx.lineTo(-r, -y1); ctx.stroke();
@@ -8453,7 +8504,7 @@
         var er = dir === 'in' ? g.r0 + (g.R - g.r0) * 0.96 : dayR(g, T);
         if (dir === 'in' || T < E - 0.01) {
           var grow = REDUCED ? 0.86 : (0.55 + 0.45 * ((time * 0.06) % 1));
-          ctx.strokeStyle = 'rgba(139,150,242,.7)'; ctx.lineWidth = 1.6 / Z;
+          ctx.strokeStyle = acc(.7); ctx.lineWidth = 1.6 / Z;
           ctx.setLineDash([5 / Z, 7 / Z]);
           ctx.beginPath(); ctx.arc(0, 0, er, -Math.PI / 2, -Math.PI / 2 + TAU * grow); ctx.stroke();
           ctx.setLineDash([]);
@@ -8470,33 +8521,33 @@
       }
       ctx.lineWidth = 1;
       var glow = ctx.createRadialGradient(0, 0, 0, 0, 0, g.r0 * 1.5);
-      glow.addColorStop(0, 'rgba(139,150,242,.5)'); glow.addColorStop(1, 'transparent');
+      glow.addColorStop(0, acc(.5)); glow.addColorStop(1, 'transparent');
       ctx.fillStyle = glow; ctx.beginPath(); ctx.arc(0, 0, g.r0 * 1.5, 0, 7); ctx.fill();
-      ctx.fillStyle = '#12151d'; ctx.beginPath(); ctx.arc(0, 0, g.r0 * 0.7, 0, 7); ctx.fill();
-      ctx.strokeStyle = 'rgba(139,150,242,.85)'; ctx.lineWidth = 1 / Z;
+      ctx.fillStyle = PAL.hub; ctx.beginPath(); ctx.arc(0, 0, g.r0 * 0.7, 0, 7); ctx.fill();
+      ctx.strokeStyle = acc(.85); ctx.lineWidth = 1 / Z;
       ctx.beginPath(); ctx.arc(0, 0, g.r0 * 0.7, 0, 7); ctx.stroke();
       ctx.restore();
 
       var nAct = activePlans(T).length;
-      ctx.fillStyle = 'rgba(238,240,246,.95)'; ctx.font = '600 10.5px ' + MONO;
+      ctx.fillStyle = ink(.95); ctx.font = '600 10.5px ' + MONO;
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
       var core = toScreen(g, 0, 0);
       ctx.fillText('crux', core.x, core.y - 6);
-      ctx.fillStyle = 'rgba(126,133,149,.9)'; ctx.font = '8.5px ' + MONO;
+      ctx.fillStyle = ink3c(.9); ctx.font = '8.5px ' + MONO;
       ctx.fillText(lens === 'work' ? nAct + (showAll ? ' plans' : ' live') : lens, core.x, core.y + 7);
       ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
-      ctx.fillStyle = 'rgba(126,133,149,.8)'; ctx.font = '9.5px ' + MONO;
+      ctx.fillStyle = ink3c(.8); ctx.font = '9.5px ' + MONO;
       ctx.fillText(dayDate(S) + ' → ' + dayDate(E) + ' · T = ' + dayDate(T) + ' · ' + nAct + ' live · zoom ' + Z.toFixed(1) + '×'
         + (RAD_LO > S + 0.5 ? ' · rings from ' + dayDate(RAD_LO) : '') + ' · ' + dataSrc, 18, 24);
       if (soloLabels) {
         ctx.font = '9px ' + MONO; ctx.textAlign = 'center';
         soloLabels.forEach(function (L3) {
           var sp = toScreen(g, L3.x, L3.y);
-          ctx.fillStyle = L3.cap ? 'rgba(182,188,201,.9)' : 'rgba(126,133,149,.85)';
+          ctx.fillStyle = L3.cap ? ink2c(.9) : ink3c(.85);
           ctx.fillText(L3.t, sp.x, sp.y);
         });
         var tip2 = toScreen(g, 0, -(g.R + 24));
-        ctx.fillStyle = 'rgba(238,240,246,.92)'; ctx.font = '700 10px ' + MONO;
+        ctx.fillStyle = ink(.92); ctx.font = '700 10px ' + MONO;
         ctx.fillText(dayDate(solo.b) + ' → ' + dayDate(solo.e), tip2.x, tip2.y);
         ctx.textAlign = 'left';
       }
@@ -8506,7 +8557,7 @@
           var sp = toScreen(g, L4.x, L4.y);
           ctx.save();
           if (L4.rot !== undefined) { ctx.translate(sp.x, sp.y); ctx.rotate(L4.rot + rot); ctx.translate(-sp.x, -sp.y); }
-          ctx.fillStyle = L4.cap ? 'rgba(182,188,201,.9)' : 'rgba(200,206,219,.95)';
+          ctx.fillStyle = L4.cap ? ink2c(.9) : ink2c(.95);
           if (!L4.cap) { ctx.font = '700 11px ' + MONO; }
           ctx.fillText(L4.t, sp.x, sp.y);
           ctx.restore();
@@ -8517,24 +8568,24 @@
       ledgerRows = [];
       if (lens === 'work' && showLedger) {
         var doneList = PLANS.filter(function (p) { return p.st === 0 && p.exit <= T && p.b <= E && p.e >= S - 0.001; }).sort(function (a, b) { return b.exit - a.exit; });
-        ctx.font = '700 11px ' + MONO; ctx.fillStyle = 'rgba(45,212,191,.9)';
+        ctx.font = '700 11px ' + MONO; ctx.fillStyle = hex2rgba(PAL.gate, .9);
         ctx.fillText('completed · ' + doneList.length + (solo ? '  (filtering — click row again or background to clear)' : ''), 18, 52);
         ctx.font = '9.5px ' + MONO;
         var maxRows = Math.floor((H - 140) / 16);
         doneList.slice(0, maxRows).forEach(function (p, k) {
           var fresh = T - p.exit < 2.0, isSolo = solo === p, y = 70 + k * 16;
-          if (isSolo) { ctx.fillStyle = 'rgba(139,150,242,.16)'; ctx.fillRect(12, y - 11, 218, 15); }
-          ctx.fillStyle = fresh || isSolo ? 'rgba(45,212,191,.95)' : 'rgba(126,133,149,.75)';
+          if (isSolo) { ctx.fillStyle = acc(.16); ctx.fillRect(12, y - 11, 218, 15); }
+          ctx.fillStyle = fresh || isSolo ? hex2rgba(PAL.gate, .95) : ink3c(.75);
           ctx.fillText('✓', 18, y);
-          ctx.fillStyle = isSolo ? 'rgba(238,240,246,1)' : fresh ? 'rgba(238,240,246,.95)' : 'rgba(126,133,149,.8)';
+          ctx.fillStyle = isSolo ? ink(1) : fresh ? ink(.95) : ink3c(.8);
           var lbl = p.short.length > 26 ? p.short.slice(0, 25) + '…' : p.short;
           ctx.fillText(lbl, 32, y);
-          ctx.fillStyle = 'rgba(126,133,149,.55)';
+          ctx.fillStyle = ink3c(.55);
           ctx.fillText(dayDate(p.exit).slice(5), 32 + 27 * 6.0, y);
           ledgerRows.push({ x: 12, y: y - 11, w: 218, h: 15, p: p });
         });
         if (doneList.length > maxRows) {
-          ctx.fillStyle = 'rgba(126,133,149,.6)';
+          ctx.fillStyle = ink3c(.6);
           ctx.fillText('… +' + (doneList.length - maxRows) + ' more', 18, 70 + maxRows * 16);
         }
       }
@@ -8574,7 +8625,7 @@
       return { l1: l1, l2: l2 };
     }
     var G_FAM_HUE = function (e) {
-      return e.indexOf('execplan:') === 0 ? '#a78bfa' : e.indexOf('bench:') === 0 ? '#f5a623' : e.indexOf('incident:') === 0 ? '#ef4444' : e.indexOf('design:') === 0 ? '#22d3ee' : e.indexOf('__work_comment__') === 0 ? '#34d399' : '#7e8595';
+      return e.indexOf('execplan:') === 0 ? PAL.decision : e.indexOf('bench:') === 0 ? PAL.handoff : e.indexOf('incident:') === 0 ? PAL.incident : e.indexOf('design:') === 0 ? PAL.codex : e.indexOf('__work_comment__') === 0 ? PAL.done : PAL.untraced;
     };
     var G_THR = { volatile: 1, medium: 35, stable: 365, none: Infinity };
     function gEffConf(n) {
@@ -8607,7 +8658,7 @@
       });
       var hops = gSel !== null ? gHops(gSel) : null;
       var inFocus = function (i2) { return gSel === null ? null : (i2 === gSel ? 0 : hops.l1[i2] ? 1 : hops.l2[i2] ? 2 : -1); };
-      ctx2.strokeStyle = 'rgba(255,255,255,.04)'; ctx2.lineWidth = 1 / Z;
+      ctx2.strokeStyle = hair(.04); ctx2.lineWidth = 1 / Z;
       [0.25, 0.5, 0.75].forEach(function (cf) { ctx2.beginPath(); ctx2.arc(0, 0, rIn + (rOut - rIn) * cf, 0, 7); ctx2.stroke(); });
       // edges — bucket by (hue, alpha), one stroked path per bucket
       var edgeBuckets = {};
@@ -8687,7 +8738,7 @@
       var cs = 0, cv2 = 0, maxS = 0.001, maxV = 0.001, rows = [];
       for (var d2 = d0; d2 <= d1; d2++) { var sp = TOK.spent[d2] || 0, sv = TOK.saved[d2] || 0; cs += sp; cv2 += sv; rows.push({ d: d2, sp: sp, sv: sv, cs: cs, cv: cv2 }); }
       rows.forEach(function (r2) { maxS = Math.max(maxS, cum ? r2.cs : r2.sp); maxV = Math.max(maxV, cum ? r2.cv : r2.sv); });
-      ctx2.strokeStyle = 'rgba(255,255,255,.12)'; ctx2.lineWidth = 1 / Z;
+      ctx2.strokeStyle = hair(.12); ctx2.lineWidth = 1 / Z;
       ctx2.beginPath(); ctx2.arc(0, 0, rB, BASE, BASE + TAU - SEAM); ctx2.stroke();
       var wA = (TAU - SEAM) / Math.max(1, (Math.floor(E) - Math.ceil(S) + 1));
       rows.forEach(function (r2) {
@@ -8698,24 +8749,24 @@
         if (cum) {
           var hV = ((r2.cv) / maxV) * spanIn;
           ctx2.lineWidth = wBar;
-          ctx2.strokeStyle = hex2rgba('#a78bfa', 0.55);
+          ctx2.strokeStyle = hex2rgba(PAL.decision, 0.55);
           ctx2.beginPath(); ctx2.moveTo(Math.cos(a) * rB, Math.sin(a) * rB); ctx2.lineTo(Math.cos(a) * (rB + hS), Math.sin(a) * (rB + hS)); ctx2.stroke();
-          ctx2.strokeStyle = hex2rgba('#34d399', 0.6);
+          ctx2.strokeStyle = hex2rgba(PAL.done, 0.6);
           ctx2.beginPath(); ctx2.moveTo(Math.cos(a) * rB, Math.sin(a) * rB); ctx2.lineTo(Math.cos(a) * (rB - hV), Math.sin(a) * (rB - hV)); ctx2.stroke();
         } else {
           var hV2 = ((r2.sv) / maxV) * spanOut * 0.85;
           ctx2.lineWidth = wBar;
-          ctx2.strokeStyle = hex2rgba('#a78bfa', isSelDay ? 0.9 : 0.5);
+          ctx2.strokeStyle = hex2rgba(PAL.decision, isSelDay ? 0.9 : 0.5);
           ctx2.beginPath(); ctx2.moveTo(Math.cos(a) * rB, Math.sin(a) * rB); ctx2.lineTo(Math.cos(a) * (rB + hS), Math.sin(a) * (rB + hS)); ctx2.stroke();
           ctx2.lineWidth = Math.max(1.2, wBar * 0.38);
-          ctx2.strokeStyle = hex2rgba('#34d399', isSelDay ? 1 : 0.8);
+          ctx2.strokeStyle = hex2rgba(PAL.done, isSelDay ? 1 : 0.8);
           ctx2.beginPath(); ctx2.moveTo(Math.cos(a) * rB, Math.sin(a) * rB); ctx2.lineTo(Math.cos(a) * (rB + hV2), Math.sin(a) * (rB + hV2)); ctx2.stroke();
           ctx2.lineWidth = 1 / Z;
-          ctx2.fillStyle = hex2rgba('#a78bfa', isSelDay ? 1 : 0.85);
+          ctx2.fillStyle = hex2rgba(PAL.decision, isSelDay ? 1 : 0.85);
           ctx2.beginPath(); ctx2.arc(Math.cos(a) * (rB + hS), Math.sin(a) * (rB + hS), (isSelDay ? 3.4 : 2.4) / Math.sqrt(Z), 0, 7); ctx2.fill();
-          ctx2.fillStyle = hex2rgba('#34d399', isSelDay ? 1 : 0.85);
+          ctx2.fillStyle = hex2rgba(PAL.done, isSelDay ? 1 : 0.85);
           ctx2.beginPath(); ctx2.arc(Math.cos(a) * (rB + hV2), Math.sin(a) * (rB + hV2), (isSelDay ? 2.8 : 2) / Math.sqrt(Z), 0, 7); ctx2.fill();
-          if (isSelDay) { ctx2.strokeStyle = 'rgba(238,240,246,.5)'; ctx2.beginPath(); ctx2.arc(0, 0, rB, a - 0.02, a + 0.02); ctx2.stroke(); }
+          if (isSelDay) { ctx2.strokeStyle = ink(.5); ctx2.beginPath(); ctx2.arc(0, 0, rB, a - 0.02, a + 0.02); ctx2.stroke(); }
         }
         tokBins.push({ d: r2.d, sp: r2.sp, sv: r2.sv, cs: r2.cs, cv: r2.cv, a: a, rTip: rB + hS });
       });
@@ -8734,14 +8785,14 @@
       if (lens === 'tokens') { drawTokensLens(ctx2, g); return; }
       if (lens === 'receipts') { drawReceiptsLens(ctx2, g, time); return; }
       var groups = lens === 'memory'
-        ? [['gate', '#2dd4bf'], ['decision', '#a78bfa'], ['memory', '#8b96f2'], ['handoff', '#f5a623'], ['incident', '#ef4444']]
-        : [['claude-work', '#8b96f2'], ['codex-work', '#22d3ee'], ['untraced', '#7e8595']];
+        ? [['gate', PAL.gate], ['decision', PAL.decision], ['memory', PAL.memory], ['handoff', PAL.handoff], ['incident', PAL.incident]]
+        : [['claude-work', PAL.memory], ['codex-work', PAL.codex], ['untraced', PAL.untraced]];
       var keyOf = function (c) { return lens === 'memory' ? c.kind : (c.actor || 'untraced'); };
       var N2 = groups.length;
       groups.forEach(function (grp, gi) {
         var k2 = grp[0], hue2 = grp[1];
         var a0 = BASE + (gi / N2) * (TAU - SEAM), a1 = BASE + ((gi + 1) / N2) * (TAU - SEAM);
-        ctx2.strokeStyle = 'rgba(255,255,255,.06)'; ctx2.lineWidth = 1 / Z;
+        ctx2.strokeStyle = hair(.06); ctx2.lineWidth = 1 / Z;
         ctx2.beginPath(); ctx2.moveTo(Math.cos(a0) * g.r0, Math.sin(a0) * g.r0); ctx2.lineTo(Math.cos(a0) * g.R, Math.sin(a0) * g.R); ctx2.stroke();
         var members = cells.filter(function (c) { return keyOf(c) === k2 && c.day <= T && c.day >= S && c.day <= E && passFilter(c); });
         ctx2.strokeStyle = hex2rgba(hue2, 0.5); ctx2.lineWidth = 3 / Z;
@@ -8773,7 +8824,7 @@
       for (var i = 0; i < teeth; i++) {
         var a = BASE + (i / teeth) * (TAU - SEAM);
         var sealed = i / teeth <= sealedFrac;
-        ctx2.strokeStyle = sealed ? 'rgba(52,211,153,.8)' : 'rgba(255,255,255,.10)'; ctx2.lineWidth = (sealed ? 1.8 : 1) / Z;
+        ctx2.strokeStyle = sealed ? hex2rgba(PAL.done, .8) : hair(.10); ctx2.lineWidth = (sealed ? 1.8 : 1) / Z;
         ctx2.beginPath(); ctx2.moveTo(Math.cos(a) * g.R, Math.sin(a) * g.R); ctx2.lineTo(Math.cos(a) * (g.R + (sealed ? 9 : 6)), Math.sin(a) * (g.R + (sealed ? 9 : 6))); ctx2.stroke();
       }
       ctx2.lineWidth = 1 / Z;
@@ -8781,7 +8832,7 @@
       for (var j = 0; j < n; j++) {
         var a2 = j * 2.399963;
         var r = g.r0 + (g.R - g.r0) * (0.12 + (j / 98) * 0.78);
-        ctx2.fillStyle = hex2rgba('#34d399', 0.25 + (j / n) * 0.5);
+        ctx2.fillStyle = hex2rgba(PAL.done, 0.25 + (j / n) * 0.5);
         ctx2.beginPath(); ctx2.arc(Math.cos(a2) * r, Math.sin(a2) * r, 1.8, 0, 7); ctx2.fill();
       }
       lensLabels.push({ x: 0, y: g.R + 42, cap: true, t: 'receipts lens · chain ticks forward only · illustrative until /v1/receipts/export is wired' });
@@ -8792,7 +8843,7 @@
     // ---- controls ----
     function setPlaying(v) {
       playing = v;
-      bPlay.textContent = v ? '⏸' : '▶';
+      bPlay.innerHTML = v ? RIC.pause : RIC.play;
       bPlay.setAttribute('aria-pressed', String(v));
       if (v && !showCompleted) { setCompleted(true); }
       if (v && !showLedger) { setLedger(true); }
@@ -8805,7 +8856,7 @@
     bLedger.addEventListener('click', function () { setLedger(!showLedger); });
     bClock.addEventListener('click', function () { resetTween = true; spinning = false; bSpin.setAttribute('aria-pressed', 'false'); });
     bMode.addEventListener('click', function () { mode = mode === 'dots' ? 'bars' : 'dots'; bMode.setAttribute('aria-pressed', String(mode === 'bars')); });
-    bDir.addEventListener('click', function () { dir = dir === 'out' ? 'in' : 'out'; bDir.textContent = dir === 'out' ? 'edge: outward' : 'edge: inward'; bDir.setAttribute('aria-pressed', String(dir === 'in')); });
+    bDir.addEventListener('click', function () { dir = dir === 'out' ? 'in' : 'out'; bDir.setAttribute('aria-pressed', String(dir === 'in')); });
     bAll.addEventListener('click', function () { showAll = !showAll; bAll.setAttribute('aria-pressed', String(showAll)); });
     bState.addEventListener('click', function () { colorByState = !colorByState; bState.setAttribute('aria-pressed', String(colorByState)); });
     bLin.addEventListener('click', function () { showLineage = !showLineage; bLin.setAttribute('aria-pressed', String(showLineage)); });
@@ -8836,8 +8887,12 @@
       var topH = barPx(topbar) + 12, botH = barPx(bottombar) + 12;
       var availH = Math.max(60, H - topH - botH);
       var availW = Math.max(60, W - 24);
-      var contentR = g.R + 48;   // ring radius + the outer lens-label ring (g.R + 42)
-      Z = Math.max(0.6, Math.min(7, (Math.min(availW, availH) * 0.5 * 0.94) / contentR));
+      // M12 — contentR reserves the full drawn extent past the ring (lens-label
+      // ring g.R+42, sector labels g.R+20, OD ticks g.R+13, flash rings ~g.R*1.14)
+      // and the 0.86 fill factor leaves a clear radius margin top+bottom so the
+      // ring stops clipping into the play/control bars at the default fit.
+      var contentR = g.R + 56;
+      Z = Math.max(0.6, Math.min(7, (Math.min(availW, availH) * 0.5 * 0.86) / contentR));
       panX = 0;
       var bandCenterY = topH + availH / 2;
       panY = bandCenterY - g.cy;
@@ -9010,9 +9065,9 @@
       svg.appendChild(svgEl('path', { d: area, fill: 'url(#' + gid + ')' }));
       svg.appendChild(svgEl('path', { d: line, fill: 'none', stroke: hue, 'stroke-opacity': '.85', 'stroke-width': '1.4' }));
       pts.forEach(function (pt) { svg.appendChild(svgEl('circle', { cx: pt.x.toFixed(1), cy: pt.y.toFixed(1), r: (pt.c.kind === 'gate' ? 3 : 2.2), fill: (KIND_HUE[pt.c.kind] || '#8b96f2') })); });
-      svg.appendChild(svgEl('text', { x: padX, y: (H2 - 5), fill: 'rgba(126,133,149,.8)', 'font-size': '9', 'font-family': 'monospace' }));
+      svg.appendChild(svgEl('text', { x: padX, y: (H2 - 5), fill: ink3c(.8), 'font-size': '9', 'font-family': 'monospace' }));
       svg.lastChild.textContent = dayDate(b);
-      svg.appendChild(svgEl('text', { x: (W2 - padX), y: (H2 - 5), 'text-anchor': 'end', fill: 'rgba(126,133,149,.8)', 'font-size': '9', 'font-family': 'monospace' }));
+      svg.appendChild(svgEl('text', { x: (W2 - padX), y: (H2 - 5), 'text-anchor': 'end', fill: ink3c(.8), 'font-size': '9', 'font-family': 'monospace' }));
       svg.lastChild.textContent = dayDate(p.e);
       wrap.appendChild(svg);
       return wrap;
@@ -9051,7 +9106,7 @@
       if (!sel) { pane.classList.remove('open'); return; }
       pane.textContent = '';
       if (sel.type === 'cell') {
-        var c = sel.c, hue = KIND_HUE[c.kind] || '#8b96f2';
+        var c = sel.c, hue = KIND_HUE[c.kind] || PAL.memory;
         var h4 = el('h4', { text: c.key });
         if (c.version > 1) { var vspan = el('span', { text: ' v' + c.version }); vspan.style.color = 'var(--rings-ink3)'; h4.appendChild(vspan); }
         pane.appendChild(h4);
@@ -9096,13 +9151,13 @@
       svg.appendChild(svgEl('path', { d: areaS, fill: 'url(#rtp)' }));
       svg.appendChild(svgEl('path', { d: lineS, fill: 'none', stroke: '#a78bfa', 'stroke-opacity': '.9', 'stroke-width': '1.4' }));
       svg.appendChild(svgEl('path', { d: lineV, fill: 'none', stroke: '#34d399', 'stroke-opacity': '.8', 'stroke-width': '1.1' }));
-      svg.appendChild(svgEl('line', { x1: selX, y1: padT, x2: selX, y2: (H2 - padB), stroke: 'rgba(238,240,246,.5)', 'stroke-dasharray': '2 3' }));
+      svg.appendChild(svgEl('line', { x1: selX, y1: padT, x2: selX, y2: (H2 - padB), stroke: ink(.5), 'stroke-dasharray': '2 3' }));
       if (selRow) {
         svg.appendChild(svgEl('circle', { cx: selX, cy: YS(selRow.sp).toFixed(1), r: '3.2', fill: '#a78bfa' }));
         svg.appendChild(svgEl('circle', { cx: selX, cy: YV(selRow.sv).toFixed(1), r: '2.4', fill: '#34d399' }));
       }
-      var tx0 = svgEl('text', { x: padX, y: (H2 - 5), fill: 'rgba(126,133,149,.8)', 'font-size': '9', 'font-family': 'monospace' }); tx0.textContent = dayDate(d0); svg.appendChild(tx0);
-      var tx1 = svgEl('text', { x: (W2 - padX), y: (H2 - 5), 'text-anchor': 'end', fill: 'rgba(126,133,149,.8)', 'font-size': '9', 'font-family': 'monospace' }); tx1.textContent = dayDate(d1); svg.appendChild(tx1);
+      var tx0 = svgEl('text', { x: padX, y: (H2 - 5), fill: ink3c(.8), 'font-size': '9', 'font-family': 'monospace' }); tx0.textContent = dayDate(d0); svg.appendChild(tx0);
+      var tx1 = svgEl('text', { x: (W2 - padX), y: (H2 - 5), 'text-anchor': 'end', fill: ink3c(.8), 'font-size': '9', 'font-family': 'monospace' }); tx1.textContent = dayDate(d1); svg.appendChild(tx1);
       wrap.appendChild(svg);
       wrap.appendChild(el('p', { 'class': 'note', style: 'margin-top:0', text: 'purple = spent/day (max ' + mS.toFixed(1) + 'M) · green = est. saved/day (own scale, max ' + (mV * 1000).toFixed(0) + 'k)' }));
       return wrap;
@@ -9170,6 +9225,7 @@
       rafId = null;
       if (ro) { try { ro.disconnect(); } catch (e) { /* noop */ } }
       if (io) { try { io.disconnect(); } catch (e) { /* noop */ } }
+      if (themeObs) { try { themeObs.disconnect(); } catch (e) { /* noop */ } }
       if (typeof document !== 'undefined') { document.removeEventListener('visibilitychange', onVis); document.removeEventListener('click', onDocClick, true); }
       if (typeof window !== 'undefined') { window.removeEventListener('keydown', onKey); }
       if (__ringsCleanupFn === teardown) { __ringsCleanupFn = null; }
@@ -9207,6 +9263,14 @@
       }
     }
 
+    readPalette();   // M12 — seed the canvas palette from the theme tokens
+    // React to live theme toggles: the console stamps data-theme on <html> — re-read
+    // the palette + repaint without a reload (layout is unchanged, so no re-fit).
+    var themeObs = null;
+    if (typeof MutationObserver === 'function' && typeof document !== 'undefined') {
+      themeObs = new MutationObserver(function () { readPalette(); kick(); });
+      themeObs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    }
     syncWindow();
     resize();
     fitView();   // default fit accounts for the top timeline + bottom control bar

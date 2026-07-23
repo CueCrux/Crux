@@ -215,13 +215,18 @@
   .rail-toggle:hover { background: var(--surface2); color: var(--ink); border-color: var(--edge-strong); }
 
   .brand { display: flex; align-items: center; gap: 10px; padding: 4px 8px 12px; }
+  /* Site logo (M12) — the CueCrux Arc-Loop mark, theme-switched: white mark on
+     the dark/glass grounds, the navy mark on light. Served from the embedded
+     /console-assets/ PNGs (no gradient tile — the mark stands on its own). */
   .brand .mark {
-    width: 30px; height: 30px; flex: none; border-radius: 9px;
+    width: 30px; height: 30px; flex: none;
     display: grid; place-items: center;
-    background: linear-gradient(140deg, var(--acc), var(--trust));
-    color: #fff;
   }
   .brand .mark svg { width: 18px; height: 18px; }
+  .brand .mark img { width: 100%; height: 100%; object-fit: contain; display: none; }
+  .brand .mark .brand-logo-dark { display: block; }
+  :root[data-theme="light"] .brand .mark .brand-logo-dark { display: none; }
+  :root[data-theme="light"] .brand .mark .brand-logo-light { display: block; }
   .brand .name { font-weight: 700; letter-spacing: -.01em; font-size: 15px; }
   .brand .name small { display: block; font-weight: 500; font-size: 11px; color: var(--ink3); letter-spacing: .02em; }
 
@@ -566,28 +571,60 @@
      flex-fills the viewport below the topbar so the canvas scales to the
      available area (single window scroll; the canvas itself never scrolls).
 
-     THEME STANCE — dark-fixed by design. The rings canvas is a cinematic
-     dark surface (its committed identity: deep #0b0d13 field, glowing indigo
-     heartwood, kind/state hues drawn straight to the 2D context). Rather than
-     re-theme ~1600 lines of hard-coded canvas colours per console theme — which
-     would read as accidental, not intentional — the whole region is a
-     self-contained dark panel in all three console themes (glass/dark/light).
-     The mock's palette lives as --rings-* custom properties ON .rings-root
-     (fonts map to the theme-stable console --font-* tokens); every text token
-     is a light ink on the dark field, so copy stays legible in light theme
-     too. Nothing here leaks: all selectors are scoped under .rings-root. */
+     THEME STANCE (M12 — supersedes the M10 dark-fixed stance). The page ground
+     now MATCHES the console (transparent → body --bg + aurora, task 2), and the
+     whole region is THEME-RESPONSIVE: the --rings-* chrome tokens + the
+     --rings-cv-* canvas-draw tokens are redefined under
+     :root[data-theme="light"] .rings-root (light block below), and render.js
+     readPalette() reads the --rings-cv-* hex tokens at draw-setup + on every live
+     theme toggle (MutationObserver) so the canvas repaints for light without a
+     reload. Glass maps to the dark defaults. Semantic state/kind hues keep their
+     hue family, deepened for contrast on the light ground. Nothing leaks: all
+     selectors are scoped under .rings-root. */
   .rings-region-host { margin: -26px -28px -48px; min-height: calc(100vh - 72px); display: flex; flex-direction: column; }
   .rings-root {
-    --rings-bg0: #0b0d13; --rings-bg1: #12151d;
+    --rings-bg1: #12151d;
     --rings-panel: rgba(255,255,255,.035); --rings-panel-strong: rgba(255,255,255,.06);
     --rings-hairline: rgba(255,255,255,.09); --rings-hairline-strong: rgba(255,255,255,.18);
     --rings-ink: #eef0f6; --rings-ink2: #b6bcc9; --rings-ink3: #7e8595;
     --rings-accent: #8b96f2; --rings-accent-deep: #5e6ad2;
     --rings-teal: #2dd4bf; --rings-amber: #f5a623; --rings-violet: #a78bfa; --rings-err: #ef4444;
+    /* chrome surfaces (tiles · bars · buttons · popovers) — theme-responsive */
+    --rings-tile-bg: rgba(14,16,24,.9); --rings-tile-bg-hover: rgba(20,23,33,.96);
+    --rings-btn-bg: rgba(20,23,33,.9); --rings-btn-bg-hover: rgba(255,255,255,.12);
+    --rings-bar-bg: rgba(12,14,20,.95); --rings-topbar-bg: rgba(14,16,24,.72);
+    --rings-pop-bg: rgba(18,20,29,.98); --rings-pane-bg: rgba(14,16,24,.97);
+    --rings-scheme: dark;
+    /* canvas-draw palette — read by render.js readPalette() (6-digit hex only) */
+    --rings-cv-ink: #eef0f6; --rings-cv-ink2: #c8cedb; --rings-cv-ink3: #7e8595;
+    --rings-cv-hair: #ffffff; --rings-cv-accent: #8b96f2; --rings-cv-hub: #12151d;
+    --rings-cv-gate: #2dd4bf; --rings-cv-decision: #a78bfa; --rings-cv-memory: #8b96f2;
+    --rings-cv-handoff: #f5a623; --rings-cv-incident: #ef4444;
+    --rings-cv-state-done: #34d399; --rings-cv-state-prog: #a78bfa; --rings-cv-state-block: #ef4444;
+    --rings-cv-sess-codex: #22d3ee; --rings-cv-untraced: #7e8595;
     flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0;
-    background: radial-gradient(1200px 700px at 70% -10%, rgba(94,106,210,.10), transparent 60%), var(--rings-bg0);
+    background: transparent;   /* M12 task 2 — inherit the console page ground (+ aurora) */
     color: var(--rings-ink); font-family: var(--font-sans); line-height: 1.55;
     -webkit-font-smoothing: antialiased;
+  }
+  /* M12 task 2/7 — LIGHT theme variant (glass + dark keep the defaults above) */
+  :root[data-theme="light"] .rings-root {
+    --rings-bg1: #ffffff;
+    --rings-panel: rgba(20,28,45,.05); --rings-panel-strong: rgba(20,28,45,.09);
+    --rings-hairline: rgba(20,28,45,.12); --rings-hairline-strong: rgba(20,28,45,.22);
+    --rings-ink: #1b2733; --rings-ink2: #46536a; --rings-ink3: #5b6b7d;
+    --rings-accent: #5e6ad2; --rings-accent-deep: #4650b8;
+    --rings-tile-bg: rgba(255,255,255,.94); --rings-tile-bg-hover: rgba(255,255,255,.99);
+    --rings-btn-bg: rgba(255,255,255,.92); --rings-btn-bg-hover: rgba(20,28,45,.08);
+    --rings-bar-bg: rgba(255,255,255,.95); --rings-topbar-bg: rgba(255,255,255,.82);
+    --rings-pop-bg: #ffffff; --rings-pane-bg: rgba(255,255,255,.98);
+    --rings-scheme: light;
+    --rings-cv-ink: #1b2733; --rings-cv-ink2: #46536a; --rings-cv-ink3: #5b6b7d;
+    --rings-cv-hair: #1b2536; --rings-cv-accent: #5e6ad2; --rings-cv-hub: #ffffff;
+    --rings-cv-gate: #0d9488; --rings-cv-decision: #7c3aed; --rings-cv-memory: #4f46e5;
+    --rings-cv-handoff: #b45309; --rings-cv-incident: #dc2626;
+    --rings-cv-state-done: #059669; --rings-cv-state-prog: #7c3aed; --rings-cv-state-block: #dc2626;
+    --rings-cv-sess-codex: #0891b2; --rings-cv-untraced: #5b6472;
   }
   .rings-root code { font-family: var(--font-mono); font-size: .9em; background: var(--rings-panel-strong); padding: .1em .35em; border-radius: 5px; }
 
@@ -600,52 +637,66 @@
      cluster (left) and the unified colour-coded card group (right) beneath it.
      Bottom: one centred, opaque control bar (date window + sliders + zoom). --- */
 
-  /* top timeline — the replay scrubber, enlarged + moved to the top */
-  .rings-topbar { position: absolute; top: 10px; left: 12px; right: 12px; z-index: 14; display: flex; align-items: center; gap: 14px; background: rgba(14,16,24,.72); border: 1px solid var(--rings-hairline); border-radius: 12px; padding: 9px 18px; -webkit-backdrop-filter: blur(4px); backdrop-filter: blur(4px); }
-  .rings-topbar .ic { font: 600 14px var(--font-mono); color: var(--rings-ink2); background: rgba(255,255,255,.07); border: 1px solid var(--rings-hairline-strong); border-radius: 7px; padding: 5px 12px; cursor: pointer; }
-  .rings-topbar .ic:hover { color: var(--rings-ink); background: rgba(255,255,255,.12); }
-  .rings-topbar .ic[aria-pressed="true"] { color: var(--rings-accent); border-color: rgba(139,150,242,.55); background: rgba(139,150,242,.12); }
+  /* top play/timeline bar (M12) — centred, SAME measure as the bottom bar.
+     Layout: start-date · play · slider · finish-date; cDate floats below centre. */
+  .rings-topbar { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); width: min(680px, calc(100% - 24px)); z-index: 14; display: flex; align-items: center; gap: 11px; background: var(--rings-topbar-bg); border: 1px solid var(--rings-hairline); border-radius: 12px; padding: 8px 14px; -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
+  .rings-topbar .ic { display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; flex: none; color: var(--rings-ink2); background: var(--rings-panel-strong); border: 1px solid var(--rings-hairline-strong); border-radius: 8px; cursor: pointer; }
+  .rings-topbar .ic svg { width: 17px; height: 17px; }
+  .rings-topbar .ic:hover { color: var(--rings-ink); background: var(--rings-btn-bg-hover); }
+  .rings-topbar .ic[aria-pressed="true"] { color: var(--rings-accent); border-color: color-mix(in srgb, var(--rings-accent) 55%, transparent); background: color-mix(in srgb, var(--rings-accent) 14%, transparent); }
   .rings-topbar .ic:focus-visible, .rings-topbar input:focus-visible { outline: 2px solid var(--rings-accent); outline-offset: 2px; }
+  .rings-topbar .rings-bdate { flex: none; font: 600 11px var(--font-mono); color: var(--rings-ink2); background: var(--rings-panel-strong); border: 1px solid var(--rings-hairline-strong); border-radius: 7px; padding: 5px 7px; color-scheme: var(--rings-scheme); }
   input.rings-timeline { flex: 1 1 auto; min-width: 0; height: 26px; accent-color: var(--rings-accent); cursor: pointer; }
-  .rings-topbar .chip { background: rgba(139,150,242,.14); border: 1px solid rgba(139,150,242,.4); color: var(--rings-accent); border-radius: 999px; padding: 5px 14px; font: 700 13px var(--font-mono); white-space: nowrap; }
+  .rings-topbar .chip { position: absolute; left: 50%; top: calc(100% + 5px); transform: translateX(-50%); background: var(--rings-panel-strong); border: 1px solid var(--rings-hairline); color: var(--rings-ink2); border-radius: 999px; padding: 2px 12px; font: 700 11px var(--font-mono); white-space: nowrap; -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
 
-  /* tool + filter + help cluster — top-left, below the timeline */
-  .rings-tools { position: absolute; top: 64px; left: 12px; z-index: 16; display: flex; align-items: flex-start; flex-wrap: wrap; gap: 6px; max-width: 44%; }
-  .rings-tools .grp { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
-  .rings-tools .ic, .rings-tools .grp button { font: 600 12px var(--font-mono); color: var(--rings-ink2); background: rgba(20,23,33,.9); border: 1px solid var(--rings-hairline-strong); border-radius: 7px; padding: 4px 8px; min-width: 28px; text-align: center; cursor: pointer; }
-  .rings-tools .grp button:hover { color: var(--rings-ink); background: rgba(255,255,255,.12); }
-  .rings-tools .grp button[aria-pressed="true"] { color: var(--rings-accent); border-color: rgba(139,150,242,.55); background: rgba(139,150,242,.14); }
+  /* tool + filter + help cluster (M12) — VERTICAL toolbar down the top-left
+     corner; rail-size tier (40px square, 18px icon); popovers open to the right. */
+  .rings-tools { position: absolute; top: 88px; left: 12px; z-index: 16; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; max-width: none; max-height: calc(100% - 172px); }
+  .rings-tools .grp { display: flex; flex-direction: column; align-items: stretch; gap: 6px; }
+  .rings-tools .ic, .rings-tools .grp button, .rings-tools .rings-iconbtn { width: 40px; min-width: 40px; height: 40px; padding: 0; display: inline-flex; align-items: center; justify-content: center; font: 600 12px var(--font-mono); color: var(--rings-ink2); background: var(--rings-btn-bg); border: 1px solid var(--rings-hairline-strong); border-radius: 9px; cursor: pointer; }
+  .rings-tools .ic svg, .rings-tools .grp button svg, .rings-tools .rings-iconbtn svg { width: 18px; height: 18px; flex: none; }
+  .rings-tools .ic:hover, .rings-tools .grp button:hover, .rings-tools .rings-iconbtn:hover { color: var(--rings-ink); background: var(--rings-btn-bg-hover); }
+  .rings-tools .ic[aria-pressed="true"], .rings-tools .grp button[aria-pressed="true"], .rings-tools .rings-iconbtn[aria-expanded="true"] { color: var(--rings-accent); border-color: color-mix(in srgb, var(--rings-accent) 55%, transparent); background: color-mix(in srgb, var(--rings-accent) 14%, var(--rings-btn-bg)); }
   .rings-tools button:focus-visible { outline: 2px solid var(--rings-accent); outline-offset: 2px; }
+  /* token cumulative/per-day text toggles keep an auto-width horizontal pair */
+  .rings-tools .grp.toktoggle { flex-direction: row; }
+  .rings-tools .grp.toktoggle button { width: auto; min-width: 0; height: 30px; padding: 0 9px; }
+  /* filter popovers open to the RIGHT of the vertical toolbar; the value badge
+     is hidden in the square icon (the active dot + popover check carry state) */
+  .rings-tools .rings-pop { top: 0; left: calc(100% + 6px); }
+  .rings-tools .rings-filterbtn .fbadge { display: none; }
 
-  /* unified SVG icon buttons (filters · help · zoom) */
-  .rings-iconbtn { position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-width: 30px; height: 28px; padding: 0 6px; color: var(--rings-ink2); background: rgba(20,23,33,.9); border: 1px solid var(--rings-hairline-strong); border-radius: 7px; cursor: pointer; }
+  /* unified SVG icon buttons (filters · help · zoom) — bottom-bar zoom keeps the
+     compact 28px tier; the toolbar copies inherit the 40px rail tier above. */
+  .rings-iconbtn { position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-width: 30px; height: 28px; padding: 0 6px; color: var(--rings-ink2); background: var(--rings-btn-bg); border: 1px solid var(--rings-hairline-strong); border-radius: 7px; cursor: pointer; }
   .rings-iconbtn svg { width: 16px; height: 16px; flex: none; }
-  .rings-iconbtn:hover { color: var(--rings-ink); background: rgba(255,255,255,.12); }
+  .rings-iconbtn:hover { color: var(--rings-ink); background: var(--rings-btn-bg-hover); }
   .rings-iconbtn:focus-visible { outline: 2px solid var(--rings-accent); outline-offset: 2px; }
-  .rings-iconbtn[aria-expanded="true"] { color: var(--rings-accent); border-color: rgba(139,150,242,.55); }
-  .rings-filterbtn[data-active="1"] { color: var(--rings-accent); border-color: rgba(139,150,242,.6); background: rgba(139,150,242,.12); }
+  .rings-iconbtn[aria-expanded="true"] { color: var(--rings-accent); border-color: color-mix(in srgb, var(--rings-accent) 55%, transparent); }
+  .rings-filterbtn[data-active="1"] { color: var(--rings-accent); border-color: color-mix(in srgb, var(--rings-accent) 60%, transparent); background: color-mix(in srgb, var(--rings-accent) 12%, transparent); }
   .rings-filterbtn[data-active="1"]::before { content: ''; position: absolute; top: 3px; right: 3px; width: 5px; height: 5px; border-radius: 50%; background: var(--rings-accent); }
-  .rings-filterbtn .fbadge { font: 600 10px var(--font-mono); color: var(--rings-accent); max-width: 70px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rings-filterbtn .fbadge { font: 600 10px var(--font-mono); color: var(--rings-accent); max-width: 34px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .rings-filterbtn[data-active="0"] .fbadge { display: none; }
 
   /* filter popover menu (same flyout idiom as the rail flyout) */
   .rings-menuwrap { position: relative; display: inline-flex; }
-  .rings-pop { position: absolute; top: calc(100% + 6px); left: 0; z-index: 40; min-width: 172px; background: rgba(18,20,29,.98); border: 1px solid var(--rings-hairline-strong); border-radius: 10px; padding: 6px; box-shadow: 0 14px 40px rgba(0,0,0,.55); display: flex; flex-direction: column; gap: 2px; }
+  .rings-pop { position: absolute; top: calc(100% + 6px); left: 0; z-index: 40; min-width: 172px; background: var(--rings-pop-bg); border: 1px solid var(--rings-hairline-strong); border-radius: 10px; padding: 6px; box-shadow: 0 14px 40px rgba(0,0,0,.35); display: flex; flex-direction: column; gap: 2px; }
   .rings-pop[hidden] { display: none; }
   .rings-pop-h { font: 700 9.5px var(--font-mono); letter-spacing: .05em; text-transform: uppercase; color: var(--rings-ink3); padding: 3px 8px 5px; }
   .rings-pop-row { display: flex; align-items: center; gap: 9px; text-align: left; font: 600 12px var(--font-sans); color: var(--rings-ink2); background: transparent; border: 1px solid transparent; border-radius: 7px; padding: 6px 9px; cursor: pointer; }
-  .rings-pop-row:hover { background: rgba(255,255,255,.06); color: var(--rings-ink); }
+  .rings-pop-row:hover { background: var(--rings-panel-strong); color: var(--rings-ink); }
   .rings-pop-row:focus-visible { outline: 2px solid var(--rings-accent); outline-offset: -2px; }
   .rings-pop-row .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
-  .rings-pop-row[aria-checked="true"] { background: rgba(139,150,242,.14); color: var(--rings-accent); border-color: rgba(139,150,242,.4); }
+  .rings-pop-row[aria-checked="true"] { background: color-mix(in srgb, var(--rings-accent) 14%, transparent); color: var(--rings-accent); border-color: color-mix(in srgb, var(--rings-accent) 40%, transparent); }
 
-  /* unified top-right card group — lens switchers + daemon glance, colour-coded */
-  .rings-cards { position: absolute; top: 64px; right: 12px; z-index: 15; display: grid; grid-template-columns: repeat(2, minmax(112px, 1fr)); gap: 6px; width: 300px; max-width: 46%; }
-  .rings-card { text-align: left; display: flex; flex-direction: column; gap: 1px; background: rgba(14,16,24,.9); border: 1px solid var(--rings-hairline); border-top: 2px solid var(--h, var(--rings-accent)); border-radius: 10px; padding: 6px 10px 7px; color: var(--rings-ink2); font-family: var(--font-sans); }
+  /* top-right lens/glance tile group (M12) — ONE vertical column, colour-coded.
+     Responsive: ≤1180px drop the sparklines + compact to single rows; ≤980px shrink. */
+  .rings-cards { position: absolute; top: 88px; right: 12px; z-index: 15; display: flex; flex-direction: column; gap: 6px; width: 186px; max-width: 42%; max-height: calc(100% - 172px); overflow-y: auto; overflow-x: hidden; }
+  .rings-card { text-align: left; display: flex; flex-direction: column; gap: 1px; background: var(--rings-tile-bg); border: 1px solid var(--rings-hairline); border-top: 2px solid var(--h, var(--rings-accent)); border-radius: 10px; padding: 6px 10px 7px; color: var(--rings-ink2); font-family: var(--font-sans); }
   button.rings-card { cursor: pointer; transition: border-color .15s, background .15s; }
-  button.rings-card:hover { border-color: var(--rings-hairline-strong); background: rgba(20,23,33,.96); }
+  button.rings-card:hover { border-color: var(--rings-hairline-strong); background: var(--rings-tile-bg-hover); }
   button.rings-card:focus-visible { outline: 2px solid var(--rings-accent); outline-offset: 2px; }
-  .rings-card[aria-pressed="true"] { background: color-mix(in srgb, var(--h) 15%, rgba(20,23,33,.96)); border-color: color-mix(in srgb, var(--h) 55%, var(--rings-hairline)); }
+  .rings-card[aria-pressed="true"] { background: color-mix(in srgb, var(--h) 15%, var(--rings-tile-bg-hover)); border-color: color-mix(in srgb, var(--h) 55%, var(--rings-hairline)); }
   .rings-card .t { font: 600 10px var(--font-sans); color: var(--rings-ink3); display: flex; align-items: center; gap: 6px; }
   .rings-card .t i { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex: none; }
   .rings-card[aria-pressed="true"] .t { color: var(--h); }
@@ -653,15 +704,31 @@
   .rings-card .sp { display: block; height: 16px; margin-top: 2px; --acc: var(--h); }
   .rings-card .sp:empty { display: none; }
   .rings-card .sp .spark, .rings-card .sp svg { width: 100%; height: 16px; margin: 0; display: block; }
+  /* ≤1180px — drop the sparkline charts + compact each tile to a single row */
+  @media (max-width: 1180px) {
+    .rings-cards { width: 168px; }
+    .rings-card { flex-direction: row; align-items: baseline; justify-content: space-between; gap: 8px; padding: 5px 9px 5px; }
+    .rings-card .sp { display: none; }
+    .rings-card .n { font-size: 13.5px; }
+  }
+  /* ≤980px — shrink the compact tiles further out of the canvas's way */
+  @media (max-width: 980px) {
+    .rings-cards { width: 138px; gap: 4px; }
+    .rings-card { padding: 4px 8px; border-top-width: 2px; }
+    .rings-card .t { font-size: 9px; gap: 5px; }
+    .rings-card .t i { width: 6px; height: 6px; }
+    .rings-card .n { font-size: 12px; }
+  }
 
-  /* bottom control bar — centred, opaque: date window + sliders + canvas zoom */
-  .rings-bottombar { position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%); z-index: 15; display: flex; align-items: center; gap: 14px; flex-wrap: wrap; justify-content: center; max-width: calc(100% - 24px); background: rgba(12,14,20,.95); border: 1px solid var(--rings-hairline-strong); border-radius: 12px; padding: 8px 16px; box-shadow: 0 10px 30px rgba(0,0,0,.45); }
+  /* bottom control bar (M12) — centred + opaque, SAME measure as the play bar:
+     window sliders + canvas zoom (the date pickers moved up into the play bar) */
+  .rings-bottombar { position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%); width: min(680px, calc(100% - 24px)); z-index: 15; display: flex; align-items: center; gap: 14px; flex-wrap: wrap; justify-content: center; background: var(--rings-bar-bg); border: 1px solid var(--rings-hairline-strong); border-radius: 12px; padding: 8px 16px; box-shadow: 0 10px 30px rgba(0,0,0,.35); }
   .rings-bottombar .grp { display: flex; align-items: center; gap: 8px; }
+  .rings-bottombar .bb-window { flex: 1 1 auto; }
   .rings-bottombar label { font: 600 10.5px var(--font-mono); color: var(--rings-ink3); text-transform: uppercase; letter-spacing: .04em; }
-  .rings-bottombar input[type=date] { font: 600 11px var(--font-mono); color: var(--rings-ink2); background: rgba(255,255,255,.07); border: 1px solid var(--rings-hairline-strong); border-radius: 7px; padding: 4px 7px; color-scheme: dark; }
-  .rings-bottombar input[type=range] { accent-color: var(--rings-accent-deep); width: 84px; }
+  .rings-bottombar input[type=range] { accent-color: var(--rings-accent-deep); flex: 1 1 auto; min-width: 60px; }
   .rings-bottombar input:focus-visible { outline: 2px solid var(--rings-accent); outline-offset: 2px; }
-  .bb-zoom { padding-left: 12px; border-left: 1px solid var(--rings-hairline); gap: 5px; }
+  .bb-zoom { padding-left: 12px; border-left: 1px solid var(--rings-hairline); gap: 5px; flex: none; }
 
   /* help modal — structured explainer (ports the removed description bars) */
   .rings-modal { position: absolute; inset: 0; z-index: 60; display: flex; align-items: center; justify-content: center; background: rgba(6,8,13,.72); -webkit-backdrop-filter: blur(3px); backdrop-filter: blur(3px); padding: 24px; }
@@ -670,7 +737,7 @@
   .rings-modal-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
   .rings-modal-head h3 { font: 700 17px var(--font-sans); color: var(--rings-ink); margin: 0; }
   .rings-modal-x { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; flex: none; color: var(--rings-ink3); background: transparent; border: 1px solid var(--rings-hairline); border-radius: 8px; cursor: pointer; }
-  .rings-modal-x:hover { color: var(--rings-ink); background: rgba(255,255,255,.06); }
+  .rings-modal-x:hover { color: var(--rings-ink); background: var(--rings-panel-strong); }
   .rings-modal-x svg { width: 16px; height: 16px; }
   .rings-modal-x:focus-visible { outline: 2px solid var(--rings-accent); outline-offset: 2px; }
   .rings-modal-body h4 { font: 700 11.5px var(--font-mono); letter-spacing: .03em; text-transform: uppercase; color: var(--rings-accent); margin: 16px 0 5px; }
@@ -679,7 +746,7 @@
   .rings-modal-body code { font-family: var(--font-mono); font-size: .88em; background: var(--rings-panel-strong); padding: .1em .35em; border-radius: 5px; color: var(--rings-ink); }
 
   /* slide-out detail pane */
-  .rings-pane { position: absolute; top: 0; right: 0; bottom: 0; z-index: 20; width: min(330px, 86%); background: rgba(14,16,24,.97); border-left: 1px solid var(--rings-hairline-strong); transform: translateX(105%); transition: transform .30s cubic-bezier(.16,1,.3,1); padding: 18px 18px 60px; overflow-y: auto; font-family: var(--font-mono); font-size: 11.5px; line-height: 1.6; color: var(--rings-ink2); }
+  .rings-pane { position: absolute; top: 0; right: 0; bottom: 0; z-index: 20; width: min(330px, 86%); background: var(--rings-pane-bg); border-left: 1px solid var(--rings-hairline-strong); transform: translateX(105%); transition: transform .30s cubic-bezier(.16,1,.3,1); padding: 18px 18px 60px; overflow-y: auto; font-family: var(--font-mono); font-size: 11.5px; line-height: 1.6; color: var(--rings-ink2); }
   .rings-pane.open { transform: translateX(0); }
   .rings-pane h4 { font: 700 13px var(--font-mono); color: var(--rings-ink); margin: 0 0 2px; overflow-wrap: anywhere; }
   .rings-pane .kindchip { display: inline-flex; align-items: center; gap: 6px; font-size: 10.5px; color: var(--rings-ink3); border: 1px solid var(--rings-hairline-strong); border-radius: 999px; padding: 2px 10px; margin: 6px 0 12px; }
@@ -688,7 +755,7 @@
   .rings-pane .row span:first-child { color: var(--rings-ink3); white-space: nowrap; }
   .rings-pane .row span:last-child { color: var(--rings-ink2); text-align: right; overflow-wrap: anywhere; }
   .rings-pane .sect { margin-top: 16px; font: 700 10.5px var(--font-mono); letter-spacing: .04em; color: var(--rings-ink3); }
-  .rings-pane .bar { height: 5px; border-radius: 3px; background: rgba(255,255,255,.08); margin: 8px 0 4px; overflow: hidden; }
+  .rings-pane .bar { height: 5px; border-radius: 3px; background: var(--rings-hairline-strong); margin: 8px 0 4px; overflow: hidden; }
   .rings-pane .bar i { display: block; height: 100%; border-radius: 3px; }
   .rings-pane ul.facts { list-style: none; margin: 8px 0 0; padding: 0; }
   .rings-pane ul.facts li { padding: 4px 0 4px 14px; position: relative; font-size: 10.5px; color: var(--rings-ink3); }
@@ -698,15 +765,11 @@
   .rings-pane .note { margin-top: 12px; font-size: 10.5px; color: var(--rings-ink3); }
 
   /* hover tooltip (fixed to viewport) */
-  .rings-tip { position: fixed; z-index: 90; pointer-events: none; background: rgba(18,20,29,.97); border: 1px solid var(--rings-hairline-strong); border-radius: 10px; padding: 8px 12px; font-family: var(--font-mono); font-size: 11.5px; line-height: 1.55; color: var(--rings-ink2); box-shadow: 0 10px 30px rgba(0,0,0,.5); max-width: 320px; opacity: 0; transition: opacity .12s; }
+  .rings-tip { position: fixed; z-index: 90; pointer-events: none; background: var(--rings-pop-bg); border: 1px solid var(--rings-hairline-strong); border-radius: 10px; padding: 8px 12px; font-family: var(--font-mono); font-size: 11.5px; line-height: 1.55; color: var(--rings-ink2); box-shadow: 0 10px 30px rgba(0,0,0,.35); max-width: 320px; opacity: 0; transition: opacity .12s; }
   .rings-tip b { color: var(--rings-ink); font-weight: 600; }
   .rings-tip .k { color: var(--rings-ink3); }
 
   @media (prefers-reduced-motion: reduce) { .rings-pane, .rings-tip { transition: none; } }
-  @media (max-width: 900px) {
-    .rings-cards { grid-template-columns: 1fr; width: 168px; }
-    .rings-tools { max-width: 40%; }
-  }
 
   /* ---- Stat tiles (Overwatch boot readout) ------------------------------ */
   .stats {
@@ -3745,7 +3808,7 @@
   function init() {
     initDemo();   // set window.CRUX_DEMO before any module render reads it
     initMode();   // set window.CRUX_MODE + build the mode segmented control before first render
-    document.querySelector('.brand .mark').innerHTML = ICONS.logo;
+    document.querySelector('.brand .mark').innerHTML = '<img class="brand-logo-dark" src="/console-assets/CueCrux-Arc-Loop-White.png" alt="CueCrux"><img class="brand-logo-light" src="/console-assets/CueCrux-Arc-Loop.png" alt="CueCrux">';
     document.querySelector('.passport-chip .avatar').innerHTML = ICONS.passport;
     initSearchStub();   // wire the top-right search stub → Explorer
     wireTopbarScroll(); // transparent top bar → glass on scroll
