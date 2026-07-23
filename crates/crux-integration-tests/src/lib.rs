@@ -18,6 +18,61 @@ use std::time::{Duration, Instant};
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(750);
 const START_ATTEMPTS: usize = 3;
+/// Cap on the `/readyz` body echoed into a startup-failure message — enough for
+/// the failing-check breakdown, short of dumping an unbounded payload into the
+/// panic text of every test in the binary.
+const READYZ_BODY_LIMIT: usize = 800;
+
+/// The last poll of the startup probes, retained so a `wait_healthy` timeout can
+/// report *which* probe was still failing instead of a bare "not healthy in 10s".
+///
+/// This matters because the interesting failure mode is silent: a daemon that
+/// binds all three ports but never passes a `/readyz` gate (`capacity`,
+/// `lock_held`, `routing_loaded`, `control_evidence`, …) logs nothing at
+/// `warn`, so `failure_message` finds an empty stderr log and the only signal
+/// left is the timeout itself. A full CI disk trips the `capacity` gate exactly
+/// this way, and without the probe detail it presents as every integration test
+/// in the workspace failing identically for no stated reason.
+#[derive(Default)]
+struct ProbeSnapshot {
+    healthz: String,
+    mcp: String,
+    grpc: String,
+    readyz: String,
+}
+
+impl ProbeSnapshot {
+    fn describe(&self) -> String {
+        let unknown = |s: &String| if s.is_empty() { "unknown".to_string() } else { s.clone() };
+        format!(
+            "healthz={}, mcp={}, grpc={}, readyz={}",
+            unknown(&self.healthz),
+            unknown(&self.mcp),
+            unknown(&self.grpc),
+            unknown(&self.readyz)
+        )
+    }
+}
+
+/// Reduce an HTTP probe to (is_200, short description) for the snapshot.
+fn describe_probe(result: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> (bool, String) {
+    match result {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            (status == 200, status.to_string())
+        }
+        Err(err) => (false, format!("error({err})")),
+    }
+}
+
+/// Truncate on a char boundary so a multi-byte body can never panic the harness.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(max).collect();
+    format!("{kept}… (truncated)")
+}
 
 fn repo_root() -> PathBuf {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -243,9 +298,13 @@ impl TestDaemon {
 
     fn wait_healthy(&mut self, timeout: Duration) -> Result<(), String> {
         let start = Instant::now();
+        let mut probes = ProbeSnapshot::default();
         loop {
             if start.elapsed() > timeout {
-                return Err(self.failure_message(format!("not healthy in {timeout:?}")));
+                return Err(self.failure_message(format!(
+                    "not healthy in {timeout:?} (last probe: {})",
+                    probes.describe()
+                )));
             }
             match self.process.try_wait() {
                 Ok(Some(status)) => {
@@ -262,16 +321,51 @@ impl TestDaemon {
             // instrumentation the daemon's boot path is slower, so tests
             // racing `/readyz` against `start()` flake. Wait here until the
             // daemon is *actually* serve-ready, not just port-bound.
-            let healthy = self.get("/healthz").is_ok() && self.mcp_get().is_ok() && self.grpc_listening();
-            let ready = healthy
-                && self
-                    .get("/readyz")
-                    .map(|resp| resp.status().as_u16() == 200)
-                    .unwrap_or(false);
-            if ready {
-                return Ok(());
+            let (healthz_ok, healthz) = describe_probe(self.get("/healthz"));
+            let (mcp_ok, mcp) = describe_probe(self.mcp_get());
+            let grpc_ok = self.grpc_listening();
+            probes.healthz = healthz;
+            probes.mcp = mcp;
+            probes.grpc = if grpc_ok { "listening" } else { "not-listening" }.to_string();
+
+            if healthz_ok && mcp_ok && grpc_ok {
+                let (ready, readyz) = self.probe_readyz();
+                probes.readyz = readyz;
+                if ready {
+                    return Ok(());
+                }
+            } else {
+                probes.readyz = "not-probed (transport not up)".to_string();
             }
             std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// `/readyz` probe that also captures the response body. A 503 body is the
+    /// `{"ok":false,"checks":[…]}` breakdown naming the gate that is failing,
+    /// which is the single most useful thing a startup timeout can report.
+    ///
+    /// Uses its own agent with `http_status_as_error(false)`: the default agent
+    /// turns a 503 into `Err`, which would discard the very body we are here to
+    /// read and leave only "http status: 503".
+    fn probe_readyz(&self) -> (bool, String) {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_connect(Some(REQUEST_TIMEOUT))
+            .timeout_recv_response(Some(REQUEST_TIMEOUT))
+            .timeout_recv_body(Some(REQUEST_TIMEOUT))
+            .http_status_as_error(false)
+            .build()
+            .into();
+        match agent.get(&format!("{}/readyz", self.base_url)).call() {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                if status == 200 {
+                    return (true, "200".to_string());
+                }
+                let body = resp.into_body().read_to_string().unwrap_or_default();
+                (false, format!("{status} {}", truncate(body.trim(), READYZ_BODY_LIMIT)))
+            }
+            Err(err) => (false, format!("error({err})")),
         }
     }
 
@@ -360,5 +454,63 @@ impl TestDaemon {
 impl Drop for TestDaemon {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{truncate, ProbeSnapshot, READYZ_BODY_LIMIT};
+
+    #[test]
+    fn probe_snapshot_reports_unfilled_probes_as_unknown() {
+        // A timeout before the first poll completes must still produce a
+        // readable line rather than empty `foo=, bar=` fields.
+        assert_eq!(
+            ProbeSnapshot::default().describe(),
+            "healthz=unknown, mcp=unknown, grpc=unknown, readyz=unknown"
+        );
+    }
+
+    #[test]
+    fn probe_snapshot_surfaces_the_failing_readyz_gate() {
+        // The capacity-gate case: transport is fully up and only `/readyz`
+        // fails, so the description must carry the check breakdown — that is
+        // the whole point of retaining the body.
+        // Verbatim shape of a real 503 from the daemon's readiness handler,
+        // captured by forcing CORECRUXD_CAPACITY_EMERGENCY_FREE_RATIO high.
+        let snapshot = ProbeSnapshot {
+            healthz: "200".to_string(),
+            mcp: "200".to_string(),
+            grpc: "listening".to_string(),
+            readyz: r#"503 {"ok":false,"checks":[{"name":"data_dir_capacity","ok":false,"error":"data dir free ratio below emergency threshold (free_ratio=0.060 threshold=0.100 free_bytes=50000000000 total_bytes=861000000000)"}]}"#
+                .to_string(),
+        };
+        let described = snapshot.describe();
+        assert!(described.contains("healthz=200"), "{described}");
+        assert!(described.contains("grpc=listening"), "{described}");
+        assert!(described.contains("\"name\":\"data_dir_capacity\""), "{described}");
+        assert!(described.contains("free_ratio=0.060"), "{described}");
+    }
+
+    #[test]
+    fn truncate_keeps_short_input_verbatim() {
+        assert_eq!(truncate("short body", READYZ_BODY_LIMIT), "short body");
+        assert_eq!(truncate("", READYZ_BODY_LIMIT), "");
+    }
+
+    #[test]
+    fn truncate_caps_long_input_and_marks_it() {
+        let long = "x".repeat(READYZ_BODY_LIMIT + 50);
+        let out = truncate(&long, READYZ_BODY_LIMIT);
+        assert!(out.ends_with("… (truncated)"), "{out}");
+        assert_eq!(out.chars().count(), READYZ_BODY_LIMIT + "… (truncated)".chars().count());
+    }
+
+    #[test]
+    fn truncate_splits_on_a_char_boundary() {
+        // Multi-byte input must not panic: a naive byte slice would split the
+        // 3-byte '€' and abort the whole test binary.
+        let multibyte = "€".repeat(10);
+        assert_eq!(truncate(&multibyte, 4), "€€€€… (truncated)");
     }
 }
