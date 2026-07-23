@@ -3942,7 +3942,7 @@
     var pinBtn = el('button', { 'class': 'cv-insp-btn cv-insp-pin', type: 'button', title: 'Pin inspector', 'aria-pressed': 'false' });
     pinBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4h6l-1 6 3 3v2H7v-2l3-3z"/><path d="M12 15v5"/></svg>';
     var closeBtn = el('button', { 'class': 'cv-insp-btn cv-insp-close', type: 'button', title: 'Close', 'aria-label': 'Close inspector' });
-    closeBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>';
+    closeBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 6l12 12M18 6L6 18"/></svg>';
     var inspBody = el('div', { 'class': 'cv-insp-body' });
     inspector.appendChild(el('div', { 'class': 'cv-insp-topbar' }, [el('span', { 'class': 'canvas-insp-type', text: 'Node inspector' }), pinBtn, closeBtn]));
     inspector.appendChild(inspBody);
@@ -7892,6 +7892,10 @@
     container.textContent = '';
 
     var REDUCED = (typeof matchMedia === 'function') && matchMedia('(prefers-reduced-motion: reduce)').matches;
+    // M11 — data-graph node cap raised 2,000 → 10,000 (feasibility-verified: the
+    // batched drawDataLens renders the mirror's full ~3.7K visible facts at 60fps,
+    // ~1.5ms/frame, so 10K stays well inside the frame budget).
+    var RINGS_NODE_CAP = 10000;
     var MONO = 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
     var TAU = Math.PI * 2;
     var mix = function (a, b, k) { return a + (b - a) * k; };
@@ -7914,33 +7918,55 @@
     var cv = el('canvas', { 'class': 'rings-canvas', 'aria-label': 'Rings: the ExecPlan portfolio replayed as an animated clock; tiles switch the lens' });
     stage.appendChild(cv);
 
+    // ---- top-right unified card group (M11): the lens switchers and the daemon
+    //      glance merged into ONE colour-coded tile group, each with a sparkline.
+    //      Lens tiles stay clickable (switch the ring lens); glance tiles are
+    //      read-outs. Colour-coding + mini-charts follow the Overwatch tile idiom;
+    //      hues are the ring's own kind/state palette (this region is dark-fixed).
     function tileEl(lens, hue, label, n) {
       var nEl = el('span', { 'class': 'n', text: n });
-      var b = el('button', { 'class': 'rings-tile', type: 'button', 'data-lens': lens, 'aria-pressed': lens === 'work' ? 'true' : 'false' },
-        [el('span', { 'class': 't' }, [el('i', { style: 'background:' + hue }), label]), nEl]);
-      return { b: b, n: nEl };
+      var sp = el('span', { 'class': 'sp', 'aria-hidden': 'true' });
+      var b = el('button', { 'class': 'rings-tile rings-card', type: 'button', 'data-lens': lens, 'aria-pressed': lens === 'work' ? 'true' : 'false', style: '--h:' + hue },
+        [el('span', { 'class': 't' }, [el('i', { style: 'background:' + hue }), label]), nEl, sp]);
+      return { b: b, n: nEl, sp: sp, hue: hue };
     }
     var tWork = tileEl('work', '#a78bfa', 'ExecPlans', '1,040');
     var tData = tileEl('data', '#8b96f2', 'Data graph', '66');
     var tMem = tileEl('memory', '#2dd4bf', 'Memory', '21');
     var tSess = tileEl('sessions', '#22d3ee', 'Sessions', '32');
     var tTok = tileEl('tokens', '#f5a623', 'Tokens', '—');
-    var tiles = el('div', { 'class': 'rings-tiles', role: 'group', 'aria-label': 'Ring lenses' }, [tWork.b, tData.b, tMem.b, tSess.b, tTok.b]);
     var tileByLens = { work: tWork, data: tData, memory: tMem, sessions: tSess, tokens: tTok };
-    stage.appendChild(tiles);
 
-    function glEl(label, n) {
+    function glEl(label, n, hue) {
       var nEl = el('span', { 'class': 'n', text: n });
-      return { el: el('button', { 'class': 'rings-gl', type: 'button' }, [el('span', { 'class': 't', text: label }), nEl]), n: nEl };
+      var sp = el('span', { 'class': 'sp', 'aria-hidden': 'true' });
+      return { el: el('div', { 'class': 'rings-gl rings-card rings-stat', style: '--h:' + hue }, [el('span', { 'class': 't' }, [el('i', { style: 'background:' + hue }), label]), nEl, sp]), n: nEl, sp: sp, hue: hue };
     }
-    var glFacts = glEl('facts', '5,026'), glSessions = glEl('sessions', '76'), glExecplans = glEl('execplans', '1,081');
-    var glMcp = glEl('mcp agents', '5'), glInt = glEl('integrations', '3'), glEngine = glEl('engine', 'off');
-    var glSrc = el('span', { 'class': 'src', text: 'snapshot · 2026-07-22' });
-    var glance = el('div', { 'class': 'rings-glance', role: 'group', 'aria-label': 'Daemon at a glance' },
-      [glFacts.el, glSessions.el, glExecplans.el, glMcp.el, glInt.el, glEngine.el, glSrc]);
-    stage.appendChild(glance);
+    var glFacts = glEl('facts', '5,026', '#8b96f2'), glSessions = glEl('sessions', '76', '#22d3ee'), glExecplans = glEl('execplans', '1,081', '#a78bfa');
+    var glMcp = glEl('mcp agents', '5', '#34d399'), glInt = glEl('integrations', '3', '#f5a623'), glEngine = glEl('engine', 'off', '#7e8595');
+    var cards = el('div', { 'class': 'rings-cards', role: 'group', 'aria-label': 'Ring lenses and daemon glance' },
+      [tWork.b, tData.b, tMem.b, tSess.b, tTok.b, glFacts.el, glSessions.el, glExecplans.el, glMcp.el, glInt.el, glEngine.el]);
+    stage.appendChild(cards);
 
-    // ---- control bar ----
+    // ---- unified SVG icon set (M11) — one viewBox / one stroke-width / one
+    //      family, matching the Command rail + Explore rail glyphs. ----
+    function ricon(inner) { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' + inner + '</svg>'; }
+    var RIC = {
+      kinds: ricon('<path d="M3 5.5h18l-7 8v5l-4 2v-7z"/>'),
+      agents: ricon('<circle cx="12" cy="9" r="3"/><path d="M6 20a6 6 0 0 1 12 0"/>'),
+      help: ricon('<circle cx="12" cy="12" r="9"/><path d="M9.7 9.3a2.3 2.3 0 0 1 4.5.7c0 1.5-2.2 1.8-2.2 3"/><circle cx="12" cy="16" r=".7" fill="currentColor" stroke="none"/>'),
+      zin: ricon('<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3M11 8.2v5.6M8.2 11h5.6"/>'),
+      zout: ricon('<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3M8.2 11h5.6"/>'),
+      fit: ricon('<path d="M9 4H5a1 1 0 0 0-1 1v4M15 4h4a1 1 0 0 1 1 1v4M9 20H5a1 1 0 0 1-1-1v-4M15 20h4a1 1 0 0 1 1-1v-4"/>'),
+      close: ricon('<path d="M6 6l12 12M18 6L6 18"/>')
+    };
+    function svgIconBtn(cls, svg, aria, extra) {
+      var b = el('button', { 'class': cls, type: 'button', 'aria-label': aria, title: aria });
+      if (extra) { for (var a in extra) { b.setAttribute(a, extra[a]); } }
+      b.innerHTML = svg; return b;
+    }
+
+    // ---- tool toggles (unicode glyphs — a distinct affordance from the SVG set) --
     function icBtn(txt, title, pressed) { return el('button', { 'class': 'ic', type: 'button', title: title, 'aria-pressed': pressed ? 'true' : 'false' }, [txt]); }
     var bSpin = icBtn('⟳', 'Ambient spin', !REDUCED);
     var bClock = icBtn('◷', 'Reset clock to 12 (also stops spin)', false); bClock.removeAttribute('aria-pressed');
@@ -7953,41 +7979,115 @@
     var bLin = icBtn('⌇', 'Lineage chords (depends_on)', false);
     var grpTools = el('span', { 'class': 'grp' }, [bSpin, bClock, bMode, bDir, bAll, bDone, bLedger, bState, bLin]);
 
-    function opt(v, t) { return el('option', { value: v }, [t]); }
-    var sKind = el('select', { 'aria-label': 'Filter by node kind' }, [opt('all', 'all kinds'), opt('gate', 'gates only'), opt('decision', 'decisions (OD) only'), opt('memory', 'memory only'), opt('handoff', 'handoffs only')]);
-    var sAgent = el('select', { 'aria-label': 'Filter by agent passport' }, [opt('all', 'all agents'), opt('claude-work', 'claude-work'), opt('codex-work', 'codex-work')]);
-    var grpFilters = el('span', { 'class': 'grp' }, [sKind, sAgent]);
-
     var bTokCum = el('button', { type: 'button', 'aria-pressed': 'true', title: 'Running total across the window' }, ['cumulative']);
     var bTokDay = el('button', { type: 'button', 'aria-pressed': 'false', title: 'Tokens per day' }, ['per day']);
     var grpTokViews = el('span', { 'class': 'grp' }, [bTokCum, bTokDay]); grpTokViews.style.display = 'none';
 
-    var dStart = el('input', { type: 'date', min: '2026-05-18', max: '2026-07-22', value: '2026-05-18', 'aria-label': 'Window start date' });
-    var rStart = el('input', { type: 'range', min: '0', max: '1000', value: '0', style: 'width:70px', 'aria-label': 'Window start' });
-    var rEnd = el('input', { type: 'range', min: '0', max: '1000', value: '1000', style: 'width:70px', 'aria-label': 'Window end' });
-    var dEnd = el('input', { type: 'date', min: '2026-05-18', max: '2026-07-22', value: '2026-07-22', 'aria-label': 'Window end date' });
-    var grpWindow = el('span', { 'class': 'grp' }, [dStart, rStart, rEnd, dEnd]);
+    // ---- kinds / agents filters → icon buttons that expand a popover menu ----
+    // Single-select (matches the fKind / fAgent state); active state stays visible
+    // when collapsed via a dot + the selected value on the icon.
+    var openPop = null, openPopBtn = null;
+    function closePop() { if (openPop) { openPop.hidden = true; if (openPopBtn) { openPopBtn.setAttribute('aria-expanded', 'false'); } openPop = null; openPopBtn = null; } }
+    function togglePop(panel, btn) { if (openPop === panel) { closePop(); return; } closePop(); panel.hidden = false; btn.setAttribute('aria-expanded', 'true'); openPop = panel; openPopBtn = btn; var f = panel.querySelector('[aria-checked="true"]') || panel.querySelector('.rings-pop-row'); if (f) { f.focus(); } }
+    function filterMenu(svg, aria, items, getVal, setVal) {
+      var badge = el('span', { 'class': 'fbadge', 'aria-hidden': 'true' });
+      var btn = svgIconBtn('rings-iconbtn rings-filterbtn', svg, aria, { 'aria-haspopup': 'true', 'aria-expanded': 'false' });
+      btn.appendChild(badge);
+      var panel = el('div', { 'class': 'rings-pop', role: 'menu', 'aria-label': aria });
+      panel.hidden = true;
+      panel.appendChild(el('div', { 'class': 'rings-pop-h', text: aria }));
+      var rows = {};
+      items.forEach(function (it) {
+        var row = el('button', { 'class': 'rings-pop-row', type: 'button', role: 'menuitemradio', 'aria-checked': 'false', 'data-val': it[0] },
+          [el('i', { 'class': 'dot', style: it[2] ? 'background:' + it[2] : 'opacity:0' }), el('span', { text: it[1] })]);
+        row.addEventListener('click', function () { setVal(it[0]); sync(); closePop(); btn.focus(); });
+        rows[it[0]] = row; panel.appendChild(row);
+      });
+      function sync() {
+        var v = getVal();
+        Object.keys(rows).forEach(function (k) { rows[k].setAttribute('aria-checked', String(k === v)); });
+        var active = v && v !== 'all';
+        btn.setAttribute('data-active', active ? '1' : '0');
+        badge.textContent = active ? v : '';
+      }
+      btn.addEventListener('click', function () { togglePop(panel, btn); });
+      var wrap = el('span', { 'class': 'rings-menuwrap' }, [btn, panel]);
+      sync();
+      return { wrap: wrap, sync: sync };
+    }
+    var kindMenu = filterMenu(RIC.kinds, 'Filter by node kind',
+      [['all', 'all kinds', ''], ['gate', 'gates', '#2dd4bf'], ['decision', 'decisions (OD)', '#a78bfa'], ['memory', 'memory', '#8b96f2'], ['handoff', 'handoffs', '#f5a623']],
+      function () { return fKind; }, function (v) { fKind = v; });
+    var agentMenu = filterMenu(RIC.agents, 'Filter by agent passport',
+      [['all', 'all agents', ''], ['claude-work', 'claude-work', '#8b96f2'], ['codex-work', 'codex-work', '#22d3ee']],
+      function () { return fAgent; }, function (v) { fAgent = v; });
+    var helpBtn = svgIconBtn('rings-iconbtn rings-helpbtn', RIC.help, 'How the rings page works', { 'aria-haspopup': 'dialog' });
+    var tools = el('div', { 'class': 'rings-tools' }, [grpTools, kindMenu.wrap, agentMenu.wrap, helpBtn, grpTokViews]);
+    stage.appendChild(tools);
 
+    // ---- top timeline (M11): the replay scrubber, enlarged + moved to the top ----
     var bPlay = icBtn('▶', 'Replay the window', false);
-    var rTime = el('input', { type: 'range', min: '0', max: '1000', value: '1000', 'aria-label': 'Time' });
+    var rTime = el('input', { type: 'range', min: '0', max: '1000', value: '1000', 'aria-label': 'Time', 'class': 'rings-timeline' });
     var cDate = el('span', { 'class': 'chip', text: '2026-07-22' });
-    var grpPlay = el('span', { 'class': 'grp' }, [bPlay, rTime, cDate]);
+    var topbar = el('div', { 'class': 'rings-topbar' }, [bPlay, rTime, cDate]);
+    stage.appendChild(topbar);
 
-    var bZin = el('button', { type: 'button', 'aria-label': 'Zoom in' }, ['+']);
-    var bZout = el('button', { type: 'button', 'aria-label': 'Zoom out' }, ['−']);
-    var bZfit = el('button', { type: 'button' }, ['fit']);
-    var grpZoom = el('span', { 'class': 'grp' }, [bZin, bZout, bZfit]);
-
-    var hint = el('span', { 'class': 'hint', text: 'wheel = zoom · drag = pan · click node / sector / ledger · background clears' });
-    var stagebar = el('div', { 'class': 'rings-stagebar' }, [grpTools, grpFilters, grpTokViews, grpWindow, grpPlay, grpZoom, hint]);
-    stage.appendChild(stagebar);
+    // ---- bottom control bar (M11): date pickers + window sliders + canvas zoom,
+    //      centred over an opaque background so it reads over the canvas. There is
+    //      ONE zoom concept (canvas zoom), so per the operator's reconciliation it
+    //      lives here (the timeline above carries its own scrub range). ----
+    var dStart = el('input', { type: 'date', min: '2026-05-18', max: '2026-07-22', value: '2026-05-18', 'aria-label': 'Window start date' });
+    var rStart = el('input', { type: 'range', min: '0', max: '1000', value: '0', 'aria-label': 'Window start' });
+    var rEnd = el('input', { type: 'range', min: '0', max: '1000', value: '1000', 'aria-label': 'Window end' });
+    var dEnd = el('input', { type: 'date', min: '2026-05-18', max: '2026-07-22', value: '2026-07-22', 'aria-label': 'Window end date' });
+    var grpWindow = el('span', { 'class': 'grp bb-window' }, [el('label', { text: 'from' }), dStart, rStart, rEnd, dEnd, el('label', { text: 'to' })]);
+    var bZin = svgIconBtn('rings-iconbtn', RIC.zin, 'Zoom in');
+    var bZout = svgIconBtn('rings-iconbtn', RIC.zout, 'Zoom out');
+    var bZfit = svgIconBtn('rings-iconbtn', RIC.fit, 'Fit to view');
+    var grpZoom = el('span', { 'class': 'grp bb-zoom' }, [bZout, bZfit, bZin]);
+    var bottombar = el('div', { 'class': 'rings-bottombar' }, [grpWindow, grpZoom]);
+    stage.appendChild(bottombar);
 
     var pane = el('aside', { 'class': 'rings-pane', 'aria-label': 'Detail pane' });
     stage.appendChild(pane);
-    root.appendChild(stage);
 
-    var note = el('p', { 'class': 'rings-note', text: 'tiles switch the lens · ExecPlans lens keeps solo / ledger / lineage / filters · live: /v1/work · /v1/console/summary · /v1/facts/list — snapshot fallback when a feed is absent' });
-    root.appendChild(note);
+    // ---- help modal (M11): ports the removed description bars into a structured,
+    //      focus-trapped explainer (what the rings are · lenses · filters/zoom/solo) --
+    var modalClose = svgIconBtn('rings-modal-x', RIC.close, 'Close');
+    function mH(t) { return el('h4', { text: t }); }
+    function mP(children) { return el('p', {}, children); }
+    var modalCard = el('div', { 'class': 'rings-modal-card', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'How the rings page works' }, [
+      el('div', { 'class': 'rings-modal-head' }, [el('h3', { text: 'How the rings page works' }), modalClose]),
+      el('div', { 'class': 'rings-modal-body' }, [
+        mH('The rings'),
+        mP(['The clock of work: the live ExecPlan portfolio (', el('code', { text: '/v1/work?source=all' }), '), the daemon glance (', el('code', { text: '/v1/console/summary' }), ') and the visible fact store (', el('code', { text: '/v1/facts/list' }), ') replayed as an animated ring. Angle is time; the rim is the latest day. A snapshot stands in when a feed is absent.']),
+        mH('Lenses'),
+        mP(['The top-right tiles switch the lens: ', el('b', { text: 'ExecPlans' }), ' (the work board — keeps solo / ledger / lineage / filters), ', el('b', { text: 'Data graph' }), ' (facts, angle = source date, centre = higher confidence, edges join shared entities), ', el('b', { text: 'Memory' }), ', ', el('b', { text: 'Sessions' }), ' and ', el('b', { text: 'Tokens' }), '. Each tile shows its headline count and a sparkline.']),
+        mH('Filters, zoom & solo'),
+        mP(['The ', el('b', { text: 'kinds' }), ' and ', el('b', { text: 'agents' }), ' icons (top-left) open menus to filter which nodes show; an active filter keeps a dot + its value on the icon. ', el('b', { text: 'Wheel' }), ' zooms and ', el('b', { text: 'drag' }), ' pans; the bottom bar carries the date window, sliders and the ', el('b', { text: '+ / − / fit' }), ' zoom. Click a plan sector (or a ledger row) to ', el('b', { text: 'solo' }), ' it — the ring reframes to that plan; click the background to clear and reframe the whole set.'])
+      ])
+    ]);
+    var modal = el('div', { 'class': 'rings-modal' }, [modalCard]);
+    modal.hidden = true;
+    function openModal() { closePop(); modal.hidden = false; modalClose.focus(); }
+    function closeModal() { if (!modal.hidden) { modal.hidden = true; helpBtn.focus(); } }
+    helpBtn.addEventListener('click', openModal);
+    modalClose.addEventListener('click', closeModal);
+    modal.addEventListener('click', function (e) { if (e.target === modal) { closeModal(); } });
+    modalCard.addEventListener('keydown', function (e) {
+      if (e.key !== 'Tab') { return; }
+      var f = modalCard.querySelectorAll('button, a, [tabindex]');
+      if (!f.length) { return; }
+      var first = f[0], last = f[f.length - 1];
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    });
+    root.appendChild(stage);
+    root.appendChild(modal);
+
+    // click-away closes an open popover (not clicks inside a menu wrap)
+    function onDocClick(e) { if (openPop && !e.target.closest('.rings-menuwrap')) { closePop(); } }
+    if (typeof document !== 'undefined') { document.addEventListener('click', onDocClick, true); }
 
     var tip = el('div', { 'class': 'rings-tip', role: 'status' });
     root.appendChild(tip);
@@ -8170,8 +8270,10 @@
     function dotR(c) { return (c.real ? 3.4 + (c.tokens || 200) / 260 : c.kind === 'gate' ? 3.2 : 2.6); }
 
     // ---- main draw loop ----
+    var drawMsEMA = 0;   // exponential moving average of draw-loop cost (ms)
     function draw(now) {
       if (!cv.isConnected) { teardown(); return; }   // route change cleared #content
+      var __t0 = performance.now();
       var dt = Math.min(0.05, (now - lastT) / 1000); lastT = now;
       var time = now / 1000;
       if (spinning && !REDUCED && !resetTween) { rot += dt * 0.02; }
@@ -8436,6 +8538,15 @@
           ctx.fillText('… +' + (doneList.length - maxRows) + ' more', 18, 70 + maxRows * 16);
         }
       }
+      var __ms = performance.now() - __t0;
+      drawMsEMA = drawMsEMA ? drawMsEMA * 0.9 + __ms * 0.1 : __ms;
+      // Dev-only perf probe (the dev console override sets __CRUX_CONSOLE_DEV__).
+      // Never leaks a global in prod; lets the mirror measure draw-loop cost.
+      if (typeof window !== 'undefined' && window.__CRUX_CONSOLE_DEV__) {
+        window.__ringsDrawMs = drawMsEMA; window.__ringsLastDrawMs = __ms;
+        var __g = geom(); window.__ringsCenter = { x: __g.cx + panX, y: __g.cy + panY, R: __g.R * Z };
+        window.__ringsSolo = solo ? (solo.slug || solo.s || true) : null;
+      }
       rafId = null;
       if (visible && !doc().hidden && cv.isConnected) { rafId = requestAnimationFrame(draw); }
     }
@@ -8472,45 +8583,80 @@
       return age > thr ? n.c * 0.5 : n.c * (1 - 0.35 * (age / thr));
     }
     function drawDataLens(ctx2, g) {
-      GNODES.forEach(function (n) { n._x = undefined; n._on = false; });
+      // M11 — batched render: fills/strokes are grouped by (hue, alpha) into one
+      // path per bucket, so a full-store graph (thousands of fact nodes + edges)
+      // costs ~a dozen canvas ops per frame instead of one per node/edge. Node
+      // positions are computed once and cached on the node (_px/_py) so edges
+      // reuse them. This is what makes the raised node cap interactive.
       var span = Math.max(0.5, E - S);
       var rIn = g.r0 * 1.25, rOut = g.R * 0.96;
-      var vis = GNODES.filter(function (n) { return n.d <= T && n.d >= S && n.d <= E; });
-      var cMin = 1, cMax = 0;
-      vis.forEach(function (n) { var ec = gEffConf(n); if (ec < cMin) { cMin = ec; } if (ec > cMax) { cMax = ec; } });
+      var vis = [], cMin = 1, cMax = 0;
+      GNODES.forEach(function (n) {
+        n._x = undefined; n._on = false; n._px = undefined;
+        if (n.d > T || n.d < S || n.d > E) { return; }
+        var ec = gEffConf(n); n._ec = ec;
+        if (ec < cMin) { cMin = ec; } if (ec > cMax) { cMax = ec; }
+        vis.push(n);
+      });
       var cSpan = Math.max(0.02, cMax - cMin);
-      var posOf = function (n) {
+      vis.forEach(function (n) {
         var a = BASE + (TAU - SEAM) * Math.max(0, Math.min(1, (n.d - S) / span));
-        var norm = (gEffConf(n) - cMin) / cSpan;
+        var norm = (n._ec - cMin) / cSpan;
         var r = rIn + (rOut - rIn) * (1 - (0.08 + 0.84 * norm));
-        return { a: a, x: Math.cos(a) * r, y: Math.sin(a) * r };
-      };
+        n._px = Math.cos(a) * r; n._py = Math.sin(a) * r;
+      });
       var hops = gSel !== null ? gHops(gSel) : null;
       var inFocus = function (i2) { return gSel === null ? null : (i2 === gSel ? 0 : hops.l1[i2] ? 1 : hops.l2[i2] ? 2 : -1); };
-      [0.25, 0.5, 0.75].forEach(function (cf) { ctx2.strokeStyle = 'rgba(255,255,255,.04)'; ctx2.lineWidth = 1 / Z; ctx2.beginPath(); ctx2.arc(0, 0, rIn + (rOut - rIn) * cf, 0, 7); ctx2.stroke(); });
+      ctx2.strokeStyle = 'rgba(255,255,255,.04)'; ctx2.lineWidth = 1 / Z;
+      [0.25, 0.5, 0.75].forEach(function (cf) { ctx2.beginPath(); ctx2.arc(0, 0, rIn + (rOut - rIn) * cf, 0, 7); ctx2.stroke(); });
+      // edges — bucket by (hue, alpha), one stroked path per bucket
+      var edgeBuckets = {};
       GEDGES.forEach(function (ed) {
-        if (ed.a.d > T || ed.b.d > T || ed.a.d < S || ed.b.d < S) { return; }
-        var pa2 = posOf(ed.a), pb2 = posOf(ed.b);
+        var na = ed.a, nb = ed.b;
+        if (na._px === undefined || nb._px === undefined) { return; }
         var alpha = 0.16;
-        if (hops) { var fa = inFocus(ed.a.i), fb = inFocus(ed.b.i); alpha = (fa >= 0 && fb >= 0) ? 0.6 : 0.03; }
-        ctx2.strokeStyle = hex2rgba(G_FAM_HUE(ed.a.e), alpha); ctx2.lineWidth = 1.1 / Z;
-        ctx2.beginPath(); ctx2.moveTo(pa2.x, pa2.y); ctx2.quadraticCurveTo((pa2.x + pb2.x) / 2 * 0.55, (pa2.y + pb2.y) / 2 * 0.55, pb2.x, pb2.y); ctx2.stroke();
+        if (hops) { var fa = inFocus(na.i), fb = inFocus(nb.i); alpha = (fa >= 0 && fb >= 0) ? 0.6 : 0.03; }
+        var hue2 = G_FAM_HUE(na.e), key = hue2 + '|' + alpha;
+        (edgeBuckets[key] = edgeBuckets[key] || { hue: hue2, alpha: alpha, segs: [] }).segs.push(na, nb);
       });
-      GNODES.forEach(function (n) {
-        if (n.d > T || n.d < S || n.d > E) { return; }
-        var p2 = posOf(n), hue2 = G_FAM_HUE(n.e), f2 = inFocus(n.i), isH = hover === n;
+      ctx2.lineWidth = 1.1 / Z;
+      Object.keys(edgeBuckets).forEach(function (key) {
+        var bk = edgeBuckets[key];
+        ctx2.strokeStyle = hex2rgba(bk.hue, bk.alpha); ctx2.beginPath();
+        for (var i = 0; i < bk.segs.length; i += 2) {
+          var pa2 = bk.segs[i], pb2 = bk.segs[i + 1];
+          ctx2.moveTo(pa2._px, pa2._py);
+          ctx2.quadraticCurveTo((pa2._px + pb2._px) / 2 * 0.55, (pa2._py + pb2._py) / 2 * 0.55, pb2._px, pb2._py);
+        }
+        ctx2.stroke();
+      });
+      // nodes — bucket by (hue, alpha), one filled path per bucket; hover / focus
+      // centre nodes get an extra ring, drawn last (there are only a handful)
+      var nodeBuckets = {}, special = [];
+      vis.forEach(function (n) {
+        var hue2 = G_FAM_HUE(n.e), f2 = inFocus(n.i), isH = hover === n;
         var alpha = 0.85;
         if (f2 !== null) { alpha = f2 === -1 ? 0.10 : f2 === 0 ? 1 : f2 === 1 ? 0.95 : 0.6; }
         var rr = (2.2 + Math.min(3, (n.t || 150) / 180)) * (isH || f2 === 0 ? 1.7 : 1);
-        ctx2.fillStyle = hex2rgba(hue2, alpha);
-        ctx2.beginPath(); ctx2.arc(p2.x, p2.y, rr, 0, 7); ctx2.fill();
-        if (f2 === 0) { ctx2.strokeStyle = hex2rgba(hue2, 0.95); ctx2.lineWidth = 1.5 / Z; ctx2.beginPath(); ctx2.arc(p2.x, p2.y, rr + 5 / Z, 0, 7); ctx2.stroke(); }
-        if (isH) { ctx2.strokeStyle = hex2rgba(hue2, 0.9); ctx2.beginPath(); ctx2.arc(p2.x, p2.y, rr + 4 / Z, 0, 7); ctx2.stroke(); }
-        n._x = p2.x; n._y = p2.y; n._dr = rr; n._on = true;
+        n._x = n._px; n._y = n._py; n._dr = rr; n._on = true;
+        if (isH || f2 === 0) { special.push({ n: n, hue: hue2, rr: rr, f0: f2 === 0 }); }
+        var key = hue2 + '|' + alpha.toFixed(2);
+        (nodeBuckets[key] = nodeBuckets[key] || { hue: hue2, alpha: alpha, nodes: [] }).nodes.push(n);
       });
-      lensLabels.push({ x: 0, y: g.R + 42, cap: true,
-        t: 'data graph · ' + GNODES.length + (gTotal ? ' of ' + gTotal.toLocaleString() + ' visible facts' + (gCap ? ' (node cap)' : '') : ' live facts') +
-          ' · angle = source date · centre = higher confidence (rank-scaled ' + cMin.toFixed(2) + '–' + cMax.toFixed(2) + ') · edge = shared entity · click = 2-hop' });
+      Object.keys(nodeBuckets).forEach(function (key) {
+        var bk = nodeBuckets[key];
+        ctx2.fillStyle = hex2rgba(bk.hue, bk.alpha); ctx2.beginPath();
+        bk.nodes.forEach(function (n) { ctx2.moveTo(n._x + n._dr, n._y); ctx2.arc(n._x, n._y, n._dr, 0, 7); });
+        ctx2.fill();
+      });
+      special.forEach(function (s) {
+        ctx2.strokeStyle = hex2rgba(s.hue, s.f0 ? 0.95 : 0.9); ctx2.lineWidth = (s.f0 ? 1.5 : 1) / Z;
+        ctx2.beginPath(); ctx2.arc(s.n._x, s.n._y, s.rr + (s.f0 ? 5 : 4) / Z, 0, 7); ctx2.stroke();
+      });
+      var capTxt = 'data graph · ' + GNODES.length + (gTotal ? ' of ' + gTotal.toLocaleString() + ' visible facts' + (gCap ? ' (node cap ' + RINGS_NODE_CAP.toLocaleString() + ')' : '') : ' live facts') +
+        ' · angle = source date · centre = higher confidence (rank-scaled ' + cMin.toFixed(2) + '–' + cMax.toFixed(2) + ') · edge = shared entity · click = 2-hop';
+      lensLabels.push({ x: 0, y: g.R + 42, cap: true, t: capTxt });
+      if (typeof window !== 'undefined' && window.__CRUX_CONSOLE_DEV__) { window.__ringsDataCaption = capTxt; window.__ringsNodeCap = RINGS_NODE_CAP; window.__ringsNodes = GNODES.length; window.__ringsCapped = gCap; }
     }
 
     // ---- tokens lens ----
@@ -8663,8 +8809,6 @@
     bAll.addEventListener('click', function () { showAll = !showAll; bAll.setAttribute('aria-pressed', String(showAll)); });
     bState.addEventListener('click', function () { colorByState = !colorByState; bState.setAttribute('aria-pressed', String(colorByState)); });
     bLin.addEventListener('click', function () { showLineage = !showLineage; bLin.setAttribute('aria-pressed', String(showLineage)); });
-    sKind.addEventListener('change', function (e) { fKind = e.target.value; });
-    sAgent.addEventListener('change', function (e) { fAgent = e.target.value; });
     function syncWindow() {
       var s = Math.min(rStart.value / 1000, rEnd.value / 1000 - 0.03);
       var e = Math.max(rEnd.value / 1000, rStart.value / 1000 + 0.03);
@@ -8682,7 +8826,26 @@
     cv.addEventListener('wheel', function (e) { e.preventDefault(); var r = cv.getBoundingClientRect(); zoomAt(e.clientX - r.left, e.clientY - r.top, e.deltaY < 0 ? 1.15 : 1 / 1.15); }, { passive: false });
     bZin.addEventListener('click', function () { zoomAt(W / 2, H / 2, 1.35); });
     bZout.addEventListener('click', function () { zoomAt(W / 2, H / 2, 1 / 1.35); });
-    bZfit.addEventListener('click', function () { Z = 1; panX = panY = 0; });
+    // ---- fit-to-view (M11): frame the ring inside the band left clear by the top
+    //      timeline + the bottom control bar (no overlap), and centre it there. Used
+    //      for the default fit, the fit button, and on solo / return-to-all. ----
+    function barPx(elm) { if (!elm) { return 0; } var r = elm.getBoundingClientRect(); return isFinite(r.height) ? r.height : 0; }
+    function fitView() {
+      if (!W || !H) { return; }
+      var g = geom();
+      var topH = barPx(topbar) + 12, botH = barPx(bottombar) + 12;
+      var availH = Math.max(60, H - topH - botH);
+      var availW = Math.max(60, W - 24);
+      var contentR = g.R + 48;   // ring radius + the outer lens-label ring (g.R + 42)
+      Z = Math.max(0.6, Math.min(7, (Math.min(availW, availH) * 0.5 * 0.94) / contentR));
+      panX = 0;
+      var bandCenterY = topH + availH / 2;
+      panY = bandCenterY - g.cy;
+      if (typeof window !== 'undefined' && window.__CRUX_CONSOLE_DEV__) {
+        window.__ringsFit = { contentBottom: bandCenterY + contentR * Z, barTop: H - botH, topH: topH, botH: botH, Z: Z };
+      }
+    }
+    bZfit.addEventListener('click', fitView);
     cv.addEventListener('pointerdown', function (e) { dragging = true; dragMoved = 0; lastPX = e.clientX; lastPY = e.clientY; cv.setPointerCapture(e.pointerId); });
     cv.addEventListener('pointerup', function (e) { dragging = false; if (dragMoved < 5) { handleClick(e); } });
     cv.addEventListener('pointermove', function (e) {
@@ -8793,13 +8956,14 @@
         var row = ledgerRows[li];
         if (cxp >= row.x && cxp <= row.x + row.w && cyp >= row.y && cyp <= row.y + row.h) {
           if (solo === row.p) { setSel(null); solo = null; } else { solo = row.p; setSel({ type: 'plan', p: row.p }); }
+          fitView();   // zoom-to-fit the solo'd plan / the whole set on toggle-off
           return;
         }
       }
       var hit = hitTest(e);
       if (hit) { setSel(sel && sel.c === hit ? null : { type: 'cell', c: hit }); return; }
       var sec = sectorAt(e);
-      if (sec) { if (solo === sec) { setSel(null); solo = null; } else { solo = sec; setSel({ type: 'plan', p: sec }); } return; }
+      if (sec) { if (solo === sec) { setSel(null); solo = null; } else { solo = sec; setSel({ type: 'plan', p: sec }); } fitView(); return; }
       if (solo) {
         var g3 = geom();
         var pd2 = toDisc(g3, cxp, cyp);
@@ -8807,7 +8971,9 @@
         var pa3 = Math.atan2(pd2.y, pd2.x); if (pa3 < 0) { pa3 += TAU; }
         if (pr3 > g3.r0 && pr3 < g3.R + 12 && pa3 > Math.PI && pa3 < Math.PI * 1.5) { return; }
       }
+      var hadSolo = !!solo;
       setSel(null); solo = null;
+      if (hadSolo) { fitView(); }   // returning to all-execplans → zoom-to-fit the set
     }
     function setSel(s) { sel = s; pinned = s && s.type === 'cell' ? s.c : null; renderPane(); }
 
@@ -8970,7 +9136,14 @@
       pane.classList.add('open');
     }
 
-    function onKey(e) { if (e.key === 'Escape') { setSel(null); solo = null; tokSel = null; } }
+    function onKey(e) {
+      if (e.key !== 'Escape') { return; }
+      if (!modal.hidden) { closeModal(); return; }
+      if (openPop) { closePop(); return; }
+      var hadSolo = !!solo;
+      setSel(null); solo = null; tokSel = null;
+      if (hadSolo) { fitView(); }
+    }
     if (typeof window !== 'undefined') { window.addEventListener('keydown', onKey); }
 
     // tiles: press to switch the lens
@@ -8982,6 +9155,7 @@
         setLedger(false);
         if (lens === 'data') { var minD = Math.min.apply(null, GNODES.map(function (n) { return n.d; })) - 0.5; if (S < minD - 1) { rStart.value = Math.round((minD - 11) / (NOW - 11) * 1000); syncWindow(); } }
         grpTokViews.style.display = lens === 'tokens' ? 'flex' : 'none';
+        fitView();   // reframe the ring for the new lens (clear of the bars)
       });
     });
     function setTokView(v) { tokView = v; bTokCum.setAttribute('aria-pressed', String(v === 'cum')); bTokDay.setAttribute('aria-pressed', String(v === 'day')); }
@@ -8996,14 +9170,47 @@
       rafId = null;
       if (ro) { try { ro.disconnect(); } catch (e) { /* noop */ } }
       if (io) { try { io.disconnect(); } catch (e) { /* noop */ } }
-      if (typeof document !== 'undefined') { document.removeEventListener('visibilitychange', onVis); }
+      if (typeof document !== 'undefined') { document.removeEventListener('visibilitychange', onVis); document.removeEventListener('click', onDocClick, true); }
       if (typeof window !== 'undefined') { window.removeEventListener('keydown', onKey); }
       if (__ringsCleanupFn === teardown) { __ringsCleanupFn = null; }
     }
     __ringsCleanupFn = teardown;
 
+    // ---- sparklines (M11): colour-coded mini-charts in the lens tiles, from the
+    //      ring's OWN per-day series (real data — no fabricated trend; tiles with
+    //      no natural series stay chart-less). Each spark inherits its tile hue. --
+    function daySpark(host, series, hue) {
+      if (!host) { return; }
+      host.textContent = '';
+      var svg = areaChart(series, { spark: true });
+      if (svg) { host.style.setProperty('--acc', hue); host.appendChild(svg); }
+    }
+    function binByDay(getDay, keep) {
+      var bins = {}, lo = Infinity, hi = -Infinity;
+      keep.forEach(function (o) { if (!getDay(o).ok) { return; } var d = Math.floor(getDay(o).d); bins[d] = (bins[d] || 0) + 1; if (d < lo) { lo = d; } if (d > hi) { hi = d; } });
+      if (!isFinite(lo)) { return null; }
+      var out = []; for (var d = lo; d <= hi; d++) { out.push(bins[d] || 0); }
+      return out.length >= 2 ? out : null;
+    }
+    function updateSparks() {
+      var hi = Math.max(12, Math.round(NOW)), step = Math.max(1, Math.round((hi - 11) / 40));
+      var workS = [];
+      for (var d = 11; d <= hi; d += step) { var c = 0; PLANS.forEach(function (p) { if (p.b <= d && p.exit > d) { c++; } }); workS.push(c); }
+      daySpark(tWork.sp, workS, tWork.hue);
+      var dataS = binByDay(function (n) { return { ok: isFinite(n.d), d: n.d }; }, GNODES);
+      if (dataS) { daySpark(tData.sp, dataS, tData.hue); }
+      var memS = binByDay(function (c2) { return { ok: c2.kind === 'memory' && isFinite(c2.day), d: c2.day }; }, cells);
+      if (memS) { daySpark(tMem.sp, memS, tMem.hue); }
+      if (TOK && TOK.spent) {
+        var days = Object.keys(TOK.spent).map(Number).filter(isFinite).sort(function (a, b) { return a - b; });
+        if (days.length >= 2) { daySpark(tTok.sp, days.map(function (dd) { return TOK.spent[dd]; }), tTok.hue); }
+      }
+    }
+
     syncWindow();
     resize();
+    fitView();   // default fit accounts for the top timeline + bottom control bar
+    updateSparks();
     kick();
 
     // ---- live wire: swap the embedded snapshot for the real board when the
@@ -9035,7 +9242,8 @@
             dataSrc = 'live · prod-mirror';
             glExecplans.n.textContent = num(j.count);
             tWork.n.textContent = num(j.count);
-            glSrc.textContent = 'live · ' + dayDate(NOW);
+            root.setAttribute('data-src', 'live');   // liveness signal (the visible "live · date" stamp was removed in M11)
+            fitView(); updateSparks();
           }
         }
       });
@@ -9054,9 +9262,9 @@
       // data graph: page the WHOLE visible store through /v1/facts/list (cursor
       // pagination, reserved included), up to a sane node cap. Snapshot stands on 404.
       (function walkFacts() {
-        var NODE_CAP = 2000, seen = {}, seenCount = 0, total = null, cursor = null, capped = false, ok = false;
+        var NODE_CAP = RINGS_NODE_CAP, seen = {}, seenCount = 0, total = null, cursor = null, capped = false, ok = false;
         function page2(count) {
-          if (count > 40) { finish(); return; }
+          if (count > 55) { finish(); return; }
           var u = '/v1/facts/list?limit=200&include_reserved=1' + (cursor ? '&cursor=' + encodeURIComponent(cursor) : '');
           fetchJSON(u).then(function (res) {
             if (res.status === 404 || !res.ok || !res.data) { finish(); return; }
@@ -9076,7 +9284,7 @@
         function finish() {
           var live = [];
           for (var id in seen) { var n = seen[id]; if (isFinite(n.d) && n.d > 0) { live.push(n); } }
-          if (ok && live.length) { gSel = null; loadGraph(live); gTotal = total; gCap = capped; tData.n.textContent = num(live.length); }
+          if (ok && live.length) { gSel = null; loadGraph(live); gTotal = total; gCap = capped; tData.n.textContent = num(live.length); updateSparks(); }
           else if (total) { gTotal = total; }
         }
         page2(0);

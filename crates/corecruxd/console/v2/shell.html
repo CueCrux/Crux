@@ -528,6 +528,35 @@
   .health.degraded .dot { background: var(--warn); }
   .health.down .dot { background: var(--crit); }
 
+  /* ---- Rail secondary flyout (M11) --------------------------------------
+     Hover/focus a rail destination → a panel pulls out flush to the rail,
+     listing that destination's pages, in the rail's own glass idiom. An
+     advisory overlay (click still navigates to the default page). */
+  .rail-flyout {
+    position: fixed; z-index: 200; min-width: 208px; max-width: 264px;
+    background: var(--surface); border: 1px solid var(--edge-strong); border-radius: var(--radius);
+    box-shadow: var(--card-shadow), 0 18px 50px rgba(0,0,0,.42);
+    backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
+    padding: 8px; display: flex; flex-direction: column; gap: 3px;
+  }
+  .rail-flyout[hidden] { display: none; }
+  .rail-flyout-h {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--ink3); font-weight: 600; padding: 4px 10px 6px;
+  }
+  .rail-flyout-item {
+    display: flex; align-items: center; min-height: 36px; padding: 0 10px; width: 100%;
+    text-align: left; border: 1px solid transparent; border-radius: var(--radius-sm);
+    background: none; color: var(--ink2); cursor: pointer; font: inherit;
+    transition: background .16s ease, color .16s ease, border-color .16s ease;
+  }
+  .rail-flyout-item .label { flex: 1; font-weight: 500; font-size: 13px; }
+  .rail-flyout-item:hover, .rail-flyout-item:focus-visible {
+    background: var(--surface2); color: var(--ink); border-color: var(--edge-strong); outline: none;
+  }
+  .rail-flyout-item[aria-current="page"] { background: var(--surface2); color: var(--ink); border-color: var(--edge-strong); }
+  @media (prefers-reduced-motion: reduce) { .rail-flyout-item { transition: none; } }
+
   .content { padding: 26px 28px 48px; }
 
   /* ---- Rings page — NATIVE (no iframe) -----------------------------------
@@ -566,40 +595,88 @@
   .rings-stage { position: relative; flex: 1 1 auto; min-height: 460px; overflow: hidden; }
   .rings-canvas { display: block; position: absolute; inset: 0; width: 100%; height: 100%; cursor: crosshair; touch-action: none; }
 
-  /* lens tiles — compact row docked bottom-right, above the control bar */
-  .rings-tiles { position: absolute; bottom: 108px; right: 16px; z-index: 15; display: flex; flex-flow: row wrap; justify-content: flex-end; gap: 6px; max-width: 60%; }
-  .rings-tile { text-align: left; cursor: pointer; display: flex; align-items: baseline; gap: 8px; background: rgba(14,16,24,.88); border: 1px solid var(--rings-hairline); border-radius: 10px; padding: 7px 12px; color: var(--rings-ink2); font-family: var(--font-sans); transition: border-color .15s, background .15s; }
-  .rings-tile:hover { border-color: var(--rings-hairline-strong); background: rgba(20,23,33,.95); }
-  .rings-tile:focus-visible { outline: 2px solid var(--rings-accent); outline-offset: 2px; }
-  .rings-tile[aria-pressed="true"] { border-color: rgba(139,150,242,.6); background: rgba(139,150,242,.14); }
-  .rings-tile .t { font: 600 12px var(--font-sans); color: var(--rings-ink2); display: flex; align-items: center; gap: 7px; flex: 1; }
-  .rings-tile .t i { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
-  .rings-tile .n { font: 700 14px var(--font-sans); color: var(--rings-ink); letter-spacing: -.01em; font-variant-numeric: tabular-nums; }
-  .rings-tile[aria-pressed="true"] .t { color: var(--rings-accent); }
+  /* ---- M11 rings chrome ---------------------------------------------------
+     Top row: a full-width replay TIMELINE (top) with the tool + filter + help
+     cluster (left) and the unified colour-coded card group (right) beneath it.
+     Bottom: one centred, opaque control bar (date window + sliders + zoom). --- */
 
-  /* daemon at a glance — top-right */
-  .rings-glance { position: absolute; top: 14px; right: 16px; z-index: 14; display: grid; grid-template-columns: 1fr 1fr; gap: 6px; width: 230px; }
-  .rings-gl { text-align: left; cursor: default; background: rgba(14,16,24,.88); border: 1px solid var(--rings-hairline); border-radius: 10px; padding: 7px 11px 6px; color: var(--rings-ink2); font-family: var(--font-sans); }
-  .rings-gl .t { display: block; font: 600 9.5px var(--font-mono); letter-spacing: .04em; color: var(--rings-ink3); text-transform: uppercase; }
-  .rings-gl .n { display: block; font: 700 15px var(--font-sans); color: var(--rings-ink); letter-spacing: -.01em; font-variant-numeric: tabular-nums; margin-top: 1px; }
-  .rings-glance .src { grid-column: 1 / -1; font: 10px var(--font-mono); color: var(--rings-ink3); text-align: right; padding-right: 2px; }
+  /* top timeline — the replay scrubber, enlarged + moved to the top */
+  .rings-topbar { position: absolute; top: 10px; left: 12px; right: 12px; z-index: 14; display: flex; align-items: center; gap: 14px; background: rgba(14,16,24,.72); border: 1px solid var(--rings-hairline); border-radius: 12px; padding: 9px 18px; -webkit-backdrop-filter: blur(4px); backdrop-filter: blur(4px); }
+  .rings-topbar .ic { font: 600 14px var(--font-mono); color: var(--rings-ink2); background: rgba(255,255,255,.07); border: 1px solid var(--rings-hairline-strong); border-radius: 7px; padding: 5px 12px; cursor: pointer; }
+  .rings-topbar .ic:hover { color: var(--rings-ink); background: rgba(255,255,255,.12); }
+  .rings-topbar .ic[aria-pressed="true"] { color: var(--rings-accent); border-color: rgba(139,150,242,.55); background: rgba(139,150,242,.12); }
+  .rings-topbar .ic:focus-visible, .rings-topbar input:focus-visible { outline: 2px solid var(--rings-accent); outline-offset: 2px; }
+  input.rings-timeline { flex: 1 1 auto; min-width: 0; height: 26px; accent-color: var(--rings-accent); cursor: pointer; }
+  .rings-topbar .chip { background: rgba(139,150,242,.14); border: 1px solid rgba(139,150,242,.4); color: var(--rings-accent); border-radius: 999px; padding: 5px 14px; font: 700 13px var(--font-mono); white-space: nowrap; }
 
-  /* control bar */
-  .rings-stagebar { position: absolute; left: 0; right: 0; bottom: 0; display: flex; align-items: center; gap: 9px; flex-wrap: wrap; padding: 10px 16px; font-family: var(--font-mono); font-size: 11.5px; color: var(--rings-ink3); background: linear-gradient(transparent, rgba(11,13,19,.85) 45%); pointer-events: none; }
-  .rings-stagebar > * { pointer-events: auto; }
-  .rings-stagebar .grp { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
-  .rings-stagebar .hint { margin-left: auto; text-align: right; }
-  .rings-stagebar button { font: 600 11.5px var(--font-mono); color: var(--rings-ink2); background: rgba(255,255,255,.07); border: 1px solid var(--rings-hairline-strong); border-radius: 7px; padding: 4px 11px; cursor: pointer; }
-  .rings-stagebar button:hover { color: var(--rings-ink); background: rgba(255,255,255,.12); }
-  .rings-stagebar button[aria-pressed="true"] { color: var(--rings-accent); border-color: rgba(139,150,242,.55); background: rgba(139,150,242,.12); }
-  .rings-stagebar button.ic { font-size: 13px; padding: 4px 9px; min-width: 30px; text-align: center; }
-  .rings-stagebar button:focus-visible, .rings-stagebar input:focus-visible, .rings-stagebar select:focus-visible { outline: 2px solid var(--rings-accent); outline-offset: 2px; }
-  .rings-stagebar select { font: 600 11.5px var(--font-mono); color: var(--rings-ink2); background: rgba(255,255,255,.07); border: 1px solid var(--rings-hairline-strong); border-radius: 7px; padding: 4px 8px; cursor: pointer; }
-  .rings-stagebar select:hover { color: var(--rings-ink); background: rgba(255,255,255,.12); }
-  .rings-stagebar input[type=range] { accent-color: var(--rings-accent-deep); width: min(150px, 17vw); }
-  .rings-stagebar input[type=date] { font: 600 11px var(--font-mono); color: var(--rings-ink2); background: rgba(255,255,255,.07); border: 1px solid var(--rings-hairline-strong); border-radius: 7px; padding: 3px 6px; color-scheme: dark; }
-  .rings-stagebar label { color: var(--rings-ink3); }
-  .rings-stagebar .chip { background: rgba(139,150,242,.14); border: 1px solid rgba(139,150,242,.4); color: var(--rings-accent); border-radius: 999px; padding: 3px 11px; font-weight: 600; white-space: nowrap; }
+  /* tool + filter + help cluster — top-left, below the timeline */
+  .rings-tools { position: absolute; top: 64px; left: 12px; z-index: 16; display: flex; align-items: flex-start; flex-wrap: wrap; gap: 6px; max-width: 44%; }
+  .rings-tools .grp { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+  .rings-tools .ic, .rings-tools .grp button { font: 600 12px var(--font-mono); color: var(--rings-ink2); background: rgba(20,23,33,.9); border: 1px solid var(--rings-hairline-strong); border-radius: 7px; padding: 4px 8px; min-width: 28px; text-align: center; cursor: pointer; }
+  .rings-tools .grp button:hover { color: var(--rings-ink); background: rgba(255,255,255,.12); }
+  .rings-tools .grp button[aria-pressed="true"] { color: var(--rings-accent); border-color: rgba(139,150,242,.55); background: rgba(139,150,242,.14); }
+  .rings-tools button:focus-visible { outline: 2px solid var(--rings-accent); outline-offset: 2px; }
+
+  /* unified SVG icon buttons (filters · help · zoom) */
+  .rings-iconbtn { position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-width: 30px; height: 28px; padding: 0 6px; color: var(--rings-ink2); background: rgba(20,23,33,.9); border: 1px solid var(--rings-hairline-strong); border-radius: 7px; cursor: pointer; }
+  .rings-iconbtn svg { width: 16px; height: 16px; flex: none; }
+  .rings-iconbtn:hover { color: var(--rings-ink); background: rgba(255,255,255,.12); }
+  .rings-iconbtn:focus-visible { outline: 2px solid var(--rings-accent); outline-offset: 2px; }
+  .rings-iconbtn[aria-expanded="true"] { color: var(--rings-accent); border-color: rgba(139,150,242,.55); }
+  .rings-filterbtn[data-active="1"] { color: var(--rings-accent); border-color: rgba(139,150,242,.6); background: rgba(139,150,242,.12); }
+  .rings-filterbtn[data-active="1"]::before { content: ''; position: absolute; top: 3px; right: 3px; width: 5px; height: 5px; border-radius: 50%; background: var(--rings-accent); }
+  .rings-filterbtn .fbadge { font: 600 10px var(--font-mono); color: var(--rings-accent); max-width: 70px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rings-filterbtn[data-active="0"] .fbadge { display: none; }
+
+  /* filter popover menu (same flyout idiom as the rail flyout) */
+  .rings-menuwrap { position: relative; display: inline-flex; }
+  .rings-pop { position: absolute; top: calc(100% + 6px); left: 0; z-index: 40; min-width: 172px; background: rgba(18,20,29,.98); border: 1px solid var(--rings-hairline-strong); border-radius: 10px; padding: 6px; box-shadow: 0 14px 40px rgba(0,0,0,.55); display: flex; flex-direction: column; gap: 2px; }
+  .rings-pop[hidden] { display: none; }
+  .rings-pop-h { font: 700 9.5px var(--font-mono); letter-spacing: .05em; text-transform: uppercase; color: var(--rings-ink3); padding: 3px 8px 5px; }
+  .rings-pop-row { display: flex; align-items: center; gap: 9px; text-align: left; font: 600 12px var(--font-sans); color: var(--rings-ink2); background: transparent; border: 1px solid transparent; border-radius: 7px; padding: 6px 9px; cursor: pointer; }
+  .rings-pop-row:hover { background: rgba(255,255,255,.06); color: var(--rings-ink); }
+  .rings-pop-row:focus-visible { outline: 2px solid var(--rings-accent); outline-offset: -2px; }
+  .rings-pop-row .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .rings-pop-row[aria-checked="true"] { background: rgba(139,150,242,.14); color: var(--rings-accent); border-color: rgba(139,150,242,.4); }
+
+  /* unified top-right card group — lens switchers + daemon glance, colour-coded */
+  .rings-cards { position: absolute; top: 64px; right: 12px; z-index: 15; display: grid; grid-template-columns: repeat(2, minmax(112px, 1fr)); gap: 6px; width: 300px; max-width: 46%; }
+  .rings-card { text-align: left; display: flex; flex-direction: column; gap: 1px; background: rgba(14,16,24,.9); border: 1px solid var(--rings-hairline); border-top: 2px solid var(--h, var(--rings-accent)); border-radius: 10px; padding: 6px 10px 7px; color: var(--rings-ink2); font-family: var(--font-sans); }
+  button.rings-card { cursor: pointer; transition: border-color .15s, background .15s; }
+  button.rings-card:hover { border-color: var(--rings-hairline-strong); background: rgba(20,23,33,.96); }
+  button.rings-card:focus-visible { outline: 2px solid var(--rings-accent); outline-offset: 2px; }
+  .rings-card[aria-pressed="true"] { background: color-mix(in srgb, var(--h) 15%, rgba(20,23,33,.96)); border-color: color-mix(in srgb, var(--h) 55%, var(--rings-hairline)); }
+  .rings-card .t { font: 600 10px var(--font-sans); color: var(--rings-ink3); display: flex; align-items: center; gap: 6px; }
+  .rings-card .t i { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex: none; }
+  .rings-card[aria-pressed="true"] .t { color: var(--h); }
+  .rings-card .n { font: 700 15px var(--font-sans); color: var(--rings-ink); letter-spacing: -.01em; font-variant-numeric: tabular-nums; }
+  .rings-card .sp { display: block; height: 16px; margin-top: 2px; --acc: var(--h); }
+  .rings-card .sp:empty { display: none; }
+  .rings-card .sp .spark, .rings-card .sp svg { width: 100%; height: 16px; margin: 0; display: block; }
+
+  /* bottom control bar — centred, opaque: date window + sliders + canvas zoom */
+  .rings-bottombar { position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%); z-index: 15; display: flex; align-items: center; gap: 14px; flex-wrap: wrap; justify-content: center; max-width: calc(100% - 24px); background: rgba(12,14,20,.95); border: 1px solid var(--rings-hairline-strong); border-radius: 12px; padding: 8px 16px; box-shadow: 0 10px 30px rgba(0,0,0,.45); }
+  .rings-bottombar .grp { display: flex; align-items: center; gap: 8px; }
+  .rings-bottombar label { font: 600 10.5px var(--font-mono); color: var(--rings-ink3); text-transform: uppercase; letter-spacing: .04em; }
+  .rings-bottombar input[type=date] { font: 600 11px var(--font-mono); color: var(--rings-ink2); background: rgba(255,255,255,.07); border: 1px solid var(--rings-hairline-strong); border-radius: 7px; padding: 4px 7px; color-scheme: dark; }
+  .rings-bottombar input[type=range] { accent-color: var(--rings-accent-deep); width: 84px; }
+  .rings-bottombar input:focus-visible { outline: 2px solid var(--rings-accent); outline-offset: 2px; }
+  .bb-zoom { padding-left: 12px; border-left: 1px solid var(--rings-hairline); gap: 5px; }
+
+  /* help modal — structured explainer (ports the removed description bars) */
+  .rings-modal { position: absolute; inset: 0; z-index: 60; display: flex; align-items: center; justify-content: center; background: rgba(6,8,13,.72); -webkit-backdrop-filter: blur(3px); backdrop-filter: blur(3px); padding: 24px; }
+  .rings-modal[hidden] { display: none; }
+  .rings-modal-card { width: min(560px, 100%); max-height: 84%; overflow-y: auto; background: var(--rings-bg1); border: 1px solid var(--rings-hairline-strong); border-radius: 16px; box-shadow: 0 24px 70px rgba(0,0,0,.6); padding: 22px 24px 26px; color: var(--rings-ink2); }
+  .rings-modal-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+  .rings-modal-head h3 { font: 700 17px var(--font-sans); color: var(--rings-ink); margin: 0; }
+  .rings-modal-x { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; flex: none; color: var(--rings-ink3); background: transparent; border: 1px solid var(--rings-hairline); border-radius: 8px; cursor: pointer; }
+  .rings-modal-x:hover { color: var(--rings-ink); background: rgba(255,255,255,.06); }
+  .rings-modal-x svg { width: 16px; height: 16px; }
+  .rings-modal-x:focus-visible { outline: 2px solid var(--rings-accent); outline-offset: 2px; }
+  .rings-modal-body h4 { font: 700 11.5px var(--font-mono); letter-spacing: .03em; text-transform: uppercase; color: var(--rings-accent); margin: 16px 0 5px; }
+  .rings-modal-body p { font: 13px/1.62 var(--font-sans); color: var(--rings-ink2); margin: 0; }
+  .rings-modal-body b { color: var(--rings-ink); font-weight: 600; }
+  .rings-modal-body code { font-family: var(--font-mono); font-size: .88em; background: var(--rings-panel-strong); padding: .1em .35em; border-radius: 5px; color: var(--rings-ink); }
 
   /* slide-out detail pane */
   .rings-pane { position: absolute; top: 0; right: 0; bottom: 0; z-index: 20; width: min(330px, 86%); background: rgba(14,16,24,.97); border-left: 1px solid var(--rings-hairline-strong); transform: translateX(105%); transition: transform .30s cubic-bezier(.16,1,.3,1); padding: 18px 18px 60px; overflow-y: auto; font-family: var(--font-mono); font-size: 11.5px; line-height: 1.6; color: var(--rings-ink2); }
@@ -625,11 +702,11 @@
   .rings-tip b { color: var(--rings-ink); font-weight: 600; }
   .rings-tip .k { color: var(--rings-ink3); }
 
-  /* footer note under the stage */
-  .rings-note { padding: 10px clamp(16px, 3vw, 32px) 22px; font: 11px var(--font-mono); color: var(--rings-ink3); }
-
   @media (prefers-reduced-motion: reduce) { .rings-pane, .rings-tip { transition: none; } }
-  @media (max-width: 760px) { .rings-tiles { position: static; margin: 10px 16px 0; max-width: none; } }
+  @media (max-width: 900px) {
+    .rings-cards { grid-template-columns: 1fr; width: 168px; }
+    .rings-tools { max-width: 40%; }
+  }
 
   /* ---- Stat tiles (Overwatch boot readout) ------------------------------ */
   .stats {
@@ -2548,7 +2625,7 @@
 (function () {
   // ---- Inline SVG icon set (no emoji, no external assets) ----------------
   var ICONS = {
-    logo: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 1 0 9 9"/><path d="M12 3v9l6 3"/></svg>',
+    logo: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 1 0 9 9"/><path d="M12 3v9l6 3"/></svg>',
     overwatch: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/></svg>',
     work: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="5" height="16" rx="1"/><rect x="10" y="4" width="5" height="10" rx="1"/><rect x="17" y="4" width="4" height="13" rx="1"/></svg>',
     memory: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>',
@@ -2568,7 +2645,7 @@
     developer: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 9l-4 3 4 3"/><path d="M16 9l4 3-4 3"/><path d="M13 6l-2 12"/></svg>',
     passport: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="9" r="3"/><path d="M6 20a6 6 0 0 1 12 0"/></svg>',
     more: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="19" cy="12" r="1.4"/></svg>',
-    chevron: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"/></svg>',
+    chevron: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"/></svg>',
     glass: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l2.2 4.8L19 9l-3.5 3.4.9 4.9L12 15l-4.4 2.3.9-4.9L5 9l4.8-1.2z"/></svg>',
     dark: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a7 7 0 1 0 10.5 10.5z"/></svg>',
     light: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4.2"/><path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M19.1 4.9l-1.8 1.8M6.7 17.3l-1.8 1.8"/></svg>'
@@ -3015,10 +3092,77 @@
   }
 
   // ---- Renderers ---------------------------------------------------------
+  // ---- Rail secondary flyout (M11) — hovering or focusing a rail destination
+  //      pulls out a panel, flush to the rail, listing that destination's pages
+  //      (the same set the sub-nav pills show). Advisory overlay: click still
+  //      navigates to the default page. Closes on route change / Escape / away. --
+  var railFlyout = null, railFlyoutTimer = null, railFlyoutAnchor = null;
+  function ensureRailFlyout() {
+    if (railFlyout) { return railFlyout; }
+    railFlyout = el('div', { id: 'railFlyout', 'class': 'rail-flyout', role: 'menu', 'aria-label': 'Destination pages' });
+    railFlyout.hidden = true;
+    railFlyout.addEventListener('mouseenter', function () { clearTimeout(railFlyoutTimer); });
+    railFlyout.addEventListener('mouseleave', scheduleRailFlyoutClose);
+    document.body.appendChild(railFlyout);
+    return railFlyout;
+  }
+  function railFlyoutPages(destId) {
+    var pro = (typeof window !== 'undefined' && window.CRUX_MODE === 'professional');
+    return pagesForDest(destId).filter(function (p) {
+      if (!pro) { if (p.pill === false) { return false; } if (p.pro === true) { return false; } }
+      if (p.operatorOnly && POSTURE !== 'operator') { return false; }
+      return true;
+    });
+  }
+  function closeRailFlyout() {
+    clearTimeout(railFlyoutTimer);
+    if (!railFlyout || railFlyout.hidden) { return; }
+    railFlyout.hidden = true;
+    if (railFlyoutAnchor) { railFlyoutAnchor.setAttribute('aria-expanded', 'false'); }
+    railFlyoutAnchor = null;
+  }
+  function scheduleRailFlyoutClose() { clearTimeout(railFlyoutTimer); railFlyoutTimer = setTimeout(closeRailFlyout, 220); }
+  function openRailFlyout(destId, anchorBtn) {
+    var pages = railFlyoutPages(destId);
+    if (!pages.length) { closeRailFlyout(); return; }   // single-page destinations (canvas / rings / sitemap): no flyout
+    var dest = DEST_INDEX[destId], fo = ensureRailFlyout();
+    clearTimeout(railFlyoutTimer);
+    fo.textContent = '';
+    fo.appendChild(el('div', { 'class': 'rail-flyout-h', text: dest ? dest.label : destId }));
+    var h = (location.hash || '').replace(/^#\/?/, '').split('?')[0].split('/');
+    var activePage = h[0] === destId ? h[1] : null;
+    pages.forEach(function (p) {
+      var row = el('button', { 'class': 'rail-flyout-item', type: 'button', role: 'menuitem', 'data-page': p.id, 'aria-current': p.id === activePage ? 'page' : 'false' }, [el('span', { 'class': 'label', text: p.title })]);
+      (function (pid) { row.addEventListener('click', function () { location.hash = '#/' + destId + '/' + pid; closeRailFlyout(); }); })(p.id);
+      fo.appendChild(row);
+    });
+    applyPosture(fo);
+    var railEl = document.querySelector('.rail'), aRect = anchorBtn.getBoundingClientRect(), rRect = railEl.getBoundingClientRect();
+    fo.hidden = false;
+    fo.style.left = Math.round(rRect.right - 1) + 'px';
+    var maxTop = window.innerHeight - fo.offsetHeight - 8;
+    fo.style.top = Math.max(8, Math.min(Math.round(aRect.top), maxTop)) + 'px';
+    if (railFlyoutAnchor && railFlyoutAnchor !== anchorBtn) { railFlyoutAnchor.setAttribute('aria-expanded', 'false'); }
+    railFlyoutAnchor = anchorBtn;
+    anchorBtn.setAttribute('aria-expanded', 'true');
+  }
+  function railFlyoutFocusFirst() {
+    if (railFlyout && !railFlyout.hidden) { var r = railFlyout.querySelector('.rail-flyout-item'); if (r) { r.focus(); return true; } }
+    return false;
+  }
+  if (typeof document !== 'undefined') {
+    document.addEventListener('click', function (e) { if (railFlyout && !railFlyout.hidden && !e.target.closest('#railFlyout') && !e.target.closest('#nav .nav-item')) { closeRailFlyout(); } }, true);
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' && railFlyout && !railFlyout.hidden) { var a = railFlyoutAnchor; closeRailFlyout(); if (a) { a.focus(); } }
+      else if (e.key === 'ArrowDown' && railFlyoutAnchor && document.activeElement === railFlyoutAnchor && railFlyout && !railFlyout.hidden) { e.preventDefault(); railFlyoutFocusFirst(); }
+    });
+  }
+
   function buildRail() {
     var nav = document.getElementById('nav');
     nav.textContent = '';
     RAIL_MODE = 'dest';   // restored to the destination nav
+    closeRailFlyout();
     for (var i = 0; i < DESTS.length; i++) {
       var item = DESTS[i];
       if (item.railHidden) { continue; }   // reachable via search / Explore menu, not the Command rail
@@ -3030,9 +3174,17 @@
       btn.innerHTML = ICONS[item.icon] || '';   // inline SVG glyph
       btn.appendChild(el('span', { 'class': 'label', text: item.label }));
       if (item.key) { btn.appendChild(el('span', { 'class': 'kbd', text: item.key })); }
-      (function (id) {
-        btn.addEventListener('click', function () { location.hash = '#/' + id; });
-      })(item.id);
+      (function (id, b) {
+        b.addEventListener('click', function () { location.hash = '#/' + id; });
+        // Flyout only for destinations that carry pages (the sub-pill set).
+        if (railFlyoutPages(id).length) {
+          b.setAttribute('aria-haspopup', 'true');
+          b.setAttribute('aria-expanded', 'false');
+          b.addEventListener('mouseenter', function () { openRailFlyout(id, b); });
+          b.addEventListener('focus', function () { openRailFlyout(id, b); });
+          b.addEventListener('mouseleave', scheduleRailFlyoutClose);
+        }
+      })(item.id, btn);
       nav.appendChild(btn);
     }
     applyPosture(nav);
@@ -3623,6 +3775,7 @@
         var oi = ev.oldURL.indexOf('#');
         window.CRUX_PREV_HASH = (oi >= 0) ? ev.oldURL.slice(oi) : '';
       }
+      closeRailFlyout();   // route change closes the rail flyout
       route();
     });
     document.addEventListener('keydown', onKey);
