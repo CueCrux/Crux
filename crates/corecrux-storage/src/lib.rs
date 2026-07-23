@@ -1350,13 +1350,13 @@ mod tests;
 // crux-storage-mutation-burndown-2026-07-22) — separate files so parallel
 // authors don't contend on the shared tests.rs.
 #[cfg(test)]
-mod mutants_tests_read;
-#[cfg(test)]
-mod mutants_tests_lib;
-#[cfg(test)]
 mod mutants_tests_append;
 #[cfg(test)]
 mod mutants_tests_integrity;
+#[cfg(test)]
+mod mutants_tests_lib;
+#[cfg(test)]
+mod mutants_tests_read;
 
 // Re-export manifest items that were previously pub at crate root.
 pub use manifest::{
