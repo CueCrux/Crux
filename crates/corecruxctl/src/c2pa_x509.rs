@@ -225,8 +225,29 @@ pub fn c2pa_verify(opts: &X509VerifyOptions) -> Result<X509VerifyReport, Box<dyn
                     .to_string(),
             );
             ("ed25519".to_string(), 0, None, None, false, notes)
-        } else {
+        } else if parsed.signature_alg == "es256" {
             verify_x509_envelope(&parsed, opts.root_anchor_path.as_deref())?
+        } else {
+            // Algorithm-confusion guard. `signature_alg` lives OUTSIDE the
+            // signed body, so an attacker can relabel a genuine ES256 envelope
+            // with any other identifier. The X.509 verifier only implements
+            // ES256 (ECDSA-P256-SHA256); refuse to route an unknown label to it
+            // rather than verifying the P-256 signature anyway and reporting
+            // ok=true under a bogus alg. Mirrors the daemon's
+            // `verify_c2pa_signed_manifest_es256_v1`, which rejects non-es256
+            // envelopes up front.
+            let notes = vec![format!(
+                "unsupported signature algorithm {:?}: the X.509 verifier only implements es256 (ECDSA-P256-SHA256)",
+                parsed.signature_alg
+            )];
+            (
+                format!("unsupported:{}", parsed.signature_alg),
+                0,
+                None,
+                None,
+                false,
+                notes,
+            )
         };
 
     let canonical_hash_match = canonical_hash_matches(&parsed);
@@ -273,7 +294,7 @@ fn verify_x509_envelope(
     ),
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    use p256::ecdsa::signature::hazmat::PrehashVerifier;
+    use p256::ecdsa::signature::Verifier as _;
     use p256::ecdsa::{Signature as P256Sig, VerifyingKey as P256VerifyingKey};
 
     let mut notes: Vec<String> = Vec::new();
@@ -300,8 +321,11 @@ fn verify_x509_envelope(
     let verifying_key =
         P256VerifyingKey::from_sec1_bytes(&leaf_spki).map_err(|e| format!("leaf SPKI is not a P-256 point: {e}"))?;
     let sig = P256Sig::from_der(&parsed.signature).map_err(|e| format!("signature is not DER ECDSA: {e}"))?;
-    let body_hash = blake3::hash(&parsed.canonical_body_bytes);
-    let signature_valid = verifying_key.verify_prehash(body_hash.as_bytes(), &sig).is_ok();
+    // True ES256: verify the ECDSA-P256 signature as ECDSA-over-SHA-256 of
+    // the canonical body bytes — the `es256` algorithm identifier's real
+    // meaning. Mirrors `verify_c2pa_signed_manifest_es256_v1` (the daemon
+    // provenance path), so a manifest that verifies here verifies there.
+    let signature_valid = verifying_key.verify(&parsed.canonical_body_bytes, &sig).is_ok();
 
     let anchor_path_buf = anchor_path.map_or_else(|| PathBuf::from(DEFAULT_ROOT_ANCHOR_PATH), Path::to_path_buf);
     let (chain_valid, anchor_sha256) = match std::fs::read_to_string(&anchor_path_buf) {
@@ -714,5 +738,47 @@ mod tests {
         .unwrap();
         assert_eq!(report.envelope_kind, "ed25519");
         assert!(report.notes.iter().any(|n| n.contains("legacy Ed25519")));
+    }
+
+    #[test]
+    fn c2pa_verify_rejects_relabelled_es256_algorithm() {
+        // Algorithm-confusion guard: take a genuine ES256 envelope, relabel its
+        // `signature_alg` (which is OUTSIDE the signed body) to an unknown
+        // identifier, and confirm the verifier refuses it instead of routing
+        // the P-256 signature to the ES256 path and reporting ok=true.
+        let tmp = TempDir::new().unwrap();
+        let signer = make_signer(&tmp, TestPki::new());
+        signer.regenerate_leaf().unwrap();
+        let content = b"relabel-me";
+        let manifest = build_c2pa_manifest_v1(&C2paManifestInputV1 {
+            content_bytes: content,
+            content_type: None,
+            crown_receipt_id: "r_relabel",
+            signer_passport: "p",
+            claim_generator: "g",
+            manifest_id: "u",
+            when: "t",
+            model: None,
+        });
+        let mut signed = sign_c2pa_manifest_via_signer(manifest, &signer, "t").unwrap();
+        // Tamper: swap the honest "es256" label for a bogus one.
+        signed.signature_alg = "es999".to_string();
+        let manifest_file = tmp.path().join("relabelled.jumbf");
+        std::fs::write(&manifest_file, signed.to_jumbf_base64()).unwrap();
+        let content_file = tmp.path().join("content.bin");
+        std::fs::write(&content_file, content).unwrap();
+        let report = c2pa_verify(&X509VerifyOptions {
+            manifest_path: manifest_file,
+            content: Some(content_file),
+            root_anchor_path: Some(tmp.path().join("root.cert.pem")),
+        })
+        .unwrap();
+        assert!(report.envelope_kind.starts_with("unsupported:"));
+        assert!(!report.signature_valid, "must NOT verify a relabelled envelope");
+        assert!(!report.ok);
+        assert!(report
+            .notes
+            .iter()
+            .any(|n| n.contains("unsupported signature algorithm")));
     }
 }
