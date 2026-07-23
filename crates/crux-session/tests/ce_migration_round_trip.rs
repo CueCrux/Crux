@@ -126,6 +126,7 @@ fn ce_install_exports_verifiable_bundle() {
                 prefer_bulk: true,
                 intent: None,
                 max_capabilities: None,
+                hide_exclusions: false,
             },
             session_ttl_s: 3600,
             budget: Budget {
@@ -274,6 +275,7 @@ fn bundle_mixing_two_principals_is_rejected_by_verifier() {
             prefer_bulk: true,
             intent: None,
             max_capabilities: None,
+            hide_exclusions: false,
         },
         session_ttl_s: 3600,
         budget: Budget {

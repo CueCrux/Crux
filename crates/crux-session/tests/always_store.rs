@@ -52,6 +52,7 @@ fn handshake_once(
             prefer_bulk: true,
             intent: None,
             max_capabilities: None,
+            hide_exclusions: false,
         },
         session_ttl_s: 1800,
         budget: Budget {
