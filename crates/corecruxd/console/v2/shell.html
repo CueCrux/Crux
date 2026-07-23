@@ -2058,6 +2058,23 @@
   .facts-group.tone-warn .facts-gdot { background: var(--warn); }
   .facts-group.tone-ink3 .facts-gdot { background: var(--ink3); }
 
+  /* cx-sessions browser (M3) — reuses the facts-* chrome; these add the state
+     chip, the per-row meta chip row, honest-empty notes, and the state details. */
+  .sess-sc { font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: .04em; padding: 2px 8px; border-radius: 999px; border: 1px solid currentColor; }
+  .sess-sc.active { color: var(--ok); }
+  .sess-sc.idle { color: var(--ink3); }
+  .sess-sc.archived { color: var(--warn); }
+  /* same-id ExecPlan chip: an EXACT link — emphasised over the lighter coord
+     live-announce plan chip (both classes apply; this one wins by source order). */
+  .sess-chip-idmatch { color: var(--acc); border-color: var(--acc); background: color-mix(in srgb, var(--acc) 18%, transparent); font-weight: 600; }
+  .sess-rmeta { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 7px; }
+  .facts-row.open .sess-rmeta { margin-bottom: 4px; }
+  .sess-note-empty { font-family: var(--font-mono); font-size: 11.5px; color: var(--ink3); font-style: italic; }
+  .sess-empty { margin: 3px 0 6px; }
+  .sess-state-details { margin-top: 9px; }
+  .sess-state-details > summary { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink3); cursor: pointer; padding: 3px 0; }
+  .sess-state-details[open] > summary { color: var(--ink2); }
+
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { animation: none !important; transition: none !important; }
     .aurora { animation: none !important; }

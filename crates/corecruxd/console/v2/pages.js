@@ -279,15 +279,19 @@
     return String(n);
   }
   function buildSessions(res) {
+    // NOTE: cx-sessions is custom-rendered by render.js renderSessionsBrowser
+    // (M3) — this builder is the graceful section-model fallback. It reads
+    // `session_rows` (rich objects), NOT `.sessions` (bare id strings) — the
+    // M0-diagnosed bug that painted 49 blank "session" cards.
     // Demo mode: real saved sessions are bare id rows locally, so a demoOn()-guarded
     // fixture paints richer resume/audit detail (execplan · passport · turns · token/progress bars).
-    if (typeof window !== 'undefined' && window.CRUX_DEMO && CruxDemo.sessions) { res = { ok: true, data: { sessions: CruxDemo.sessions } }; }
+    if (typeof window !== 'undefined' && window.CRUX_DEMO && CruxDemo.sessions) { res = { ok: true, data: { session_rows: CruxDemo.sessions } }; }
     if (!res.ok || !res.data) { return [{ h: 'Sessions', wide: true, controls: [{ t: 'search', ph: 'Filter sessions…' }].concat(degraded(res.status, 'Sessions unavailable — GET /v1/console/sessions')) }]; }
-    var list = arr(res.data.sessions || res.data.items || res.data);
+    var list = arr(res.data.session_rows || res.data.sessions || res.data.items || res.data);
     var live = list.filter(function (s) { return !s.archived; });
     var arch = list.filter(function (s) { return s.archived; });
     // A session renders as a rich card: id + status, the execplan + passport it
-    // carries, and two horizontal gradient bars — token usage and progress.
+    // carries, its total-token estimate, and (when present) a live-milestone tag.
     var row = function (s) {
       var used = (typeof s.token_used === 'number') ? s.token_used : null;
       var lim = (typeof s.token_limit === 'number') ? s.token_limit : null;
@@ -295,12 +299,13 @@
       var mDone = s.milestones_done, mTot = s.milestones_total;
       var progPct = (typeof s.progress === 'number') ? Math.round(s.progress * 100)
         : (mTot ? Math.round(((mDone || 0) / mTot) * 100) : null);
-      var progLabel = progPct != null ? (progPct + '%' + (mTot ? (' · M' + (mDone || 0) + '/' + mTot) : '')) : null;
+      var progLabel = progPct != null ? (progPct + '%' + (mTot ? (' · M' + (mDone || 0) + '/' + mTot) : null))
+        : (s.milestone || null);
       return { t: 'sesscard', id: s.session_id || s.id || s.label || 'session',
-        status: s.archived ? 'archived' : (s.status || 'session'),
+        status: s.archived ? ('archived' + (s.archive_reason ? (': ' + s.archive_reason) : '')) : (s.state || s.status || 'session'),
         execplan: s.execplan_slug || null, passport: s.passport_id || null, tenant: s.tenant_id || null,
         turns: (s.turn_count != null) ? s.turn_count : null, updated: s.updated_at || s.last_active || null,
-        tokPct: tokPct, tokLabel: (used != null && lim) ? (fmtK(used) + ' / ' + fmtK(lim)) : null,
+        tokPct: tokPct, tokLabel: (used != null && lim) ? (fmtK(used) + ' / ' + fmtK(lim)) : (typeof s.total_tokens === 'number' ? (fmtK(s.total_tokens) + ' tok') : null),
         progPct: progPct, progLabel: progLabel,
         focusId: s.session_id || s.id || null };
     };

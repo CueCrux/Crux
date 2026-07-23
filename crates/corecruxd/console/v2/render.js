@@ -2416,6 +2416,7 @@
     // Custom-rendered pages (no section model).
     if (page.id === 'cx-activity-log') { container.textContent = ''; renderActivityLog(container); return Promise.resolve(); }
     if (page.id === 'cx-facts') { container.textContent = ''; renderFactsBrowser(container); return Promise.resolve(); }
+    if (page.id === 'cx-sessions') { container.textContent = ''; renderSessionsBrowser(container); return Promise.resolve(); }
     if (page.operatorOnly && !isOperator()) {
       renderSections(container, [{ h: page.title, wide: true, controls: [
         { t: 'info', label: 'operator only', v: 'This surface is only available in operator posture.' },
@@ -5898,6 +5899,252 @@
     resetAndLoad();
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  //  cx-sessions (console-surfaces-remediation M3): a searchable session list
+  //  over /v1/console/sessions (session_rows — NOT the bare id strings the old
+  //  builder read), with a row-click detail drawer over the new
+  //  /v1/console/sessions/detail route. Custom-rendered like renderFactsBrowser;
+  //  through-client only (fetchJSON → CruxApi.get), el()/textContent, no innerHTML.
+  //  Deliberately SEPARATE from the canvas renderSessionDetail path (whose smoke
+  //  gate forbids reading session state) — this drawer shows the full state blob
+  //  the daemon exposes under admin-read.
+  // ─────────────────────────────────────────────────────────────────────────
+  function renderSessionsBrowser(host) {
+    host.textContent = '';
+    function nfmt(n) { if (typeof n !== 'number' || !isFinite(n)) { return (n == null) ? '—' : String(n); } try { return n.toLocaleString('en-US'); } catch (e) { return String(n); } }
+    function compactTokens(n) {
+      if (typeof n !== 'number' || !isFinite(n)) { return '—'; }
+      if (n >= 1000) { var k = n / 1000; return (k >= 100 ? Math.round(k) : k.toFixed(1)) + 'k'; }
+      return String(n);
+    }
+    function relTime(iso) {
+      var t = Date.parse(iso || ''); if (!isFinite(t)) { return '—'; }
+      var s = Math.max(0, Math.round((Date.now() - t) / 1000));
+      if (s < 60) { return s + 's ago'; }
+      var m = Math.round(s / 60); if (m < 60) { return m + 'm ago'; }
+      var h = Math.round(m / 60); if (h < 48) { return h + 'h ago'; }
+      return Math.round(h / 24) + 'd ago';
+    }
+    function prettyValue(v) {
+      if (typeof v !== 'string') { try { return JSON.stringify(v, null, 2); } catch (e) { return String(v); } }
+      var t = v.trim();
+      if (t && (t.charAt(0) === '{' || t.charAt(0) === '[')) { try { return JSON.stringify(JSON.parse(v), null, 2); } catch (e) { return v; } }
+      return v;
+    }
+    function shortId(id) { var s = String(id || ''); return s.length > 8 ? s.slice(0, 8) : s; }
+
+    // Same-id ExecPlan lane (M3 follow-up): EXACT linkage — a session whose
+    // logical id names an ExecPlan work-board item (`execplan:<slug>`, or a bare
+    // `<slug>` that resolves to one). `state.plans` maps that id → the work item
+    // {state, current_milestone, title}, fetched once alongside the session list.
+    // Distinct from the coord live-announce lane (TTL) and the fact-authorship
+    // heuristic lane — this is identity, not inference.
+    var state = { all: [], q: '', includeArchived: false, totalCount: 0, archivedCount: 0, loading: false, token: 0, plans: {} };
+    function planIdFor(s) {
+      var lid = String((s && s.session_id) || '');
+      if (!lid) { return null; }
+      var id = lid.indexOf('execplan:') === 0 ? lid : 'execplan:' + lid;
+      return state.plans[id] ? id : null;
+    }
+
+    var searchInput = el('input', { 'class': 'facts-input', type: 'search', placeholder: 'filter id / agent / passport / plan…', 'aria-label': 'filter sessions' });
+    var archToggle = el('button', { 'class': 'facts-toggle', type: 'button', 'aria-pressed': 'false', title: 'include archived sessions' }, ['archived']);
+    function field(label, node) { return el('label', { 'class': 'facts-field' }, [el('span', { text: label }), node]); }
+    var toolbar = el('div', { 'class': 'facts-toolbar' }, [field('filter', searchInput), el('div', { 'class': 'facts-toggles' }, [archToggle])]);
+    var countLine = el('p', { 'class': 'facts-count' });
+    var banner = el('div', { 'class': 'facts-banner' }); banner.style.display = 'none';
+    var listWrap = el('div', { 'class': 'facts-groups' });
+    host.appendChild(el('div', { 'class': 'facts-browser' }, [toolbar, countLine, banner, listWrap]));
+
+    function matches(s, q) {
+      if (!q) { return true; }
+      return ((s.session_id || '') + ' ' + (s.agent || '') + ' ' + (s.passport_id || '') + ' ' + (s.execplan_slug || '') + ' ' + (planIdFor(s) || '')).toLowerCase().indexOf(q) >= 0;
+    }
+    function paintCount(shown) {
+      countLine.textContent = '';
+      var loaded = state.all.length;
+      // Rows the server would return for this view (archived are excluded unless
+      // the toggle is on) — distinct from the 100-row cap below.
+      var expected = state.includeArchived ? state.totalCount : Math.max(0, state.totalCount - state.archivedCount);
+      var scope = state.includeArchived ? 'all' : 'active';
+      var kids = [el('b', { text: nfmt(shown) }), ' shown'];
+      if (state.q) { kids.push(' (filtered)'); }
+      kids.push(' · '); kids.push(el('b', { text: nfmt(loaded) })); kids.push(' ' + scope + ' session' + (loaded === 1 ? '' : 's') + ' loaded');
+      kids.push(' · '); kids.push(el('b', { text: nfmt(state.totalCount) })); kids.push(' total');
+      if (state.archivedCount) { kids.push(' · ' + nfmt(state.archivedCount) + ' archived'); }
+      // The server caps the row set at 100 — the ONLY real truncation signal
+      // (archived exclusion is not truncation). Say so honestly when it bites.
+      if (loaded >= 100 && expected > loaded) { kids.push(' · '); kids.push(el('span', { 'class': 'facts-asof-tag', text: 'showing first ' + nfmt(loaded) + ' of ' + nfmt(expected) })); }
+      kids.forEach(function (k) { countLine.appendChild(typeof k === 'string' ? doc().createTextNode(k) : k); });
+    }
+    function chip(cls, text, title) { return el('span', { 'class': cls, title: title || '' }, [text]); }
+    function rowEl(s) {
+      var head = el('div', { 'class': 'facts-rhead' }, [
+        el('span', { 'class': 'facts-key', text: s.session_id || '(no id)' }),
+        el('span', { 'class': 'sess-sc ' + (s.state || 'idle'), text: s.state || 'idle' }),
+        s.agent ? chip('sess-chip', s.agent, 'owning agent') : null,
+        el('span', { 'class': 'facts-time', text: relTime(s.updated_at) })
+      ]);
+      var planId = planIdFor(s);
+      var plan = planId ? state.plans[planId] : null;
+      var planChipText = planId ? (planId.replace(/^execplan:/, '') + (plan && plan.state ? (' · ' + plan.state) : '')) : null;
+      var metaChips = el('div', { 'class': 'sess-rmeta' }, [
+        chip('sess-chip', compactTokens(s.total_tokens) + ' tok', 'total tokens (bytes/4 estimate)'),
+        s.passport_id ? chip('sess-chip sess-chip-pass', s.passport_id, 'bound passport') : null,
+        planId ? chip('sess-chip sess-chip-plan sess-chip-idmatch', planChipText, 'ExecPlan — matched by session id (exact)') : null,
+        s.execplan_slug ? chip('sess-chip sess-chip-plan', s.execplan_slug + (s.milestone ? (' · ' + s.milestone) : ''), 'live coord announce') : null,
+        s.archived ? chip('sess-chip', 'archived' + (s.archive_reason ? (': ' + s.archive_reason) : ''), 'archived session') : null
+      ]);
+      var sub = s.state_first_line ? el('div', { 'class': 'facts-val', text: s.state_first_line }) : el('div', { 'class': 'sess-note-empty', text: 'no state summary' });
+      var detail = el('div', { 'class': 'facts-detail' });
+      var row = el('div', { 'class': 'facts-row', role: 'button', tabindex: '0' }, [head, sub, metaChips, detail]);
+      var opened = false;
+      function toggle() { var o = row.classList.toggle('open'); if (o && !opened) { opened = true; expandDetail(detail, s); } }
+      // A click inside the open drawer (the state-JSON <details> summary, text
+      // selection) must NOT bubble up and collapse the row — only head/meta toggle.
+      row.addEventListener('click', function (e) { if (e.target && e.target.closest && (e.target.closest('a') || e.target.closest('.facts-detail'))) { return; } toggle(); });
+      row.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+      return row;
+    }
+    function kvGrid(pairs) {
+      var meta = el('div', { 'class': 'facts-kv' });
+      pairs.forEach(function (kv) {
+        if (kv[1] == null || kv[1] === '') { return; }
+        meta.appendChild(el('span', { 'class': 'facts-kv-k', text: kv[0] }));
+        meta.appendChild(el('span', { 'class': 'facts-kv-v', text: String(kv[1]) }));
+      });
+      return meta;
+    }
+    function sectionLabel(t) { return el('div', { 'class': 'facts-vlabel', text: t }); }
+    function emptyNote(t) { return el('p', { 'class': 'ctl-desc sess-empty', text: t }); }
+    function expandDetail(detail, s) {
+      detail.textContent = '';
+      detail.appendChild(el('div', { 'class': 'facts-loading', text: 'loading session detail…' }));
+      fetchJSON('/v1/console/sessions/detail?key=' + encodeURIComponent(s.raw_key || s.session_id || '')).then(function (res) {
+        detail.textContent = '';
+        if (!res.ok || !res.data) { detail.appendChild(emptyNote('Detail unavailable (HTTP ' + (res.status || '?') + ') — GET /v1/console/sessions/detail.')); return; }
+        var d = res.data;
+        var meta = d.session || {};
+        // 1) session meta
+        detail.appendChild(sectionLabel('session'));
+        detail.appendChild(kvGrid([
+          ['raw key', meta.raw_key], ['agent', meta.agent], ['state', meta.state],
+          ['updated', meta.updated_at], ['expires', meta.expires_at],
+          ['archived', meta.archived ? ('yes' + (meta.archive_reason ? (' · ' + meta.archive_reason) : '')) : 'no']
+        ]));
+        // 2) passport binding
+        detail.appendChild(sectionLabel('passport'));
+        if (d.binding) { detail.appendChild(kvGrid([['passport', d.binding.passport_id], ['category', d.binding.passport_category], ['project', d.binding.project_id]])); }
+        else { detail.appendChild(emptyNote('No passport binding for this session. Bindings are minted on POST /session (sealed-plan sessions); agent save_session ids resolve to none.')); }
+        // 3) linked ExecPlan — three lanes, most-authoritative first.
+        detail.appendChild(sectionLabel('linked ExecPlan'));
+        // 3a) same-id match (EXACT — the session id names a work-board ExecPlan).
+        var planId = planIdFor(s);
+        if (planId) {
+          var plan = state.plans[planId] || {};
+          detail.appendChild(kvGrid([
+            ['same-id match', planId],
+            ['title', plan.title],
+            ['state', plan.state],
+            ['current milestone', plan.current_milestone]
+          ]));
+          detail.appendChild(el('p', { 'class': 'ctl-desc', text: 'exact: this session’s id equals ExecPlan work item ' + planId + ' — identity, not inference.' }));
+        } else {
+          detail.appendChild(emptyNote('same-id match: none — this session’s id does not name an ExecPlan on the work board (/v1/work).'));
+        }
+        // 3b) live announce (coord intent, TTL-scoped).
+        if (d.coord_intent) {
+          detail.appendChild(kvGrid([
+            ['live announce', (d.coord_intent.execplan_slug || '—') + (d.coord_intent.milestone ? (' · ' + d.coord_intent.milestone) : '')],
+            ['paths', (d.coord_intent.paths || []).join(', ')], ['note', d.coord_intent.note]
+          ]));
+        } else { detail.appendChild(emptyNote('live announce: none — populated by coord_announce (TTL-scoped presence).')); }
+        var plans = d.linked_plans_heuristic || [];
+        if (plans.length) {
+          var plist = el('div', { 'class': 'facts-kv' });
+          plans.forEach(function (p) {
+            plist.appendChild(el('span', { 'class': 'facts-kv-k', text: p.entity }));
+            plist.appendChild(el('span', { 'class': 'facts-kv-v', text: p.matches + ' fact' + (p.matches === 1 ? '' : 's') }));
+          });
+          detail.appendChild(plist);
+          detail.appendChild(el('p', { 'class': 'ctl-desc', text: 'derived from fact authorship — journaled session-plan linkage is a daemon follow-up.' }));
+        } else { detail.appendChild(emptyNote('heuristic plan linkage: none — execplan:* facts authored by this session’s passport would appear here.')); }
+        // 4) gates approved
+        detail.appendChild(sectionLabel('gates decided'));
+        var gates = d.gates || [];
+        if (gates.length) {
+          var glist = el('div', { 'class': 'facts-kv' });
+          gates.forEach(function (g) {
+            var left = g.gate_status + ' · ' + (g.work_title || g.work_id);
+            var right = (g.receipt_id ? (shortId(g.receipt_id) + '…') : 'no receipt');
+            glist.appendChild(el('span', { 'class': 'facts-kv-k', text: left }));
+            glist.appendChild(el('span', { 'class': 'facts-kv-v', text: right }));
+          });
+          detail.appendChild(glist);
+        } else { detail.appendChild(emptyNote('No gate decisions by this passport. Populated by gate approvals (WorkTransition receipts).')); }
+        // 5) token usage
+        detail.appendChild(sectionLabel('token usage'));
+        detail.appendChild(kvGrid([['total tokens', nfmt(meta.total_tokens)], ['estimate', 'serialized-state bytes / 4']]));
+        // 6) full state blob — collapsible, textContent only (admin-read decision).
+        var pre = el('pre', { 'class': 'facts-vfull', text: prettyValue(d.state) });
+        var det = el('details', { 'class': 'sess-state-details' }, [el('summary', {}, ['state JSON (full blob)']), pre]);
+        detail.appendChild(det);
+      });
+    }
+    function paint() {
+      var q = (searchInput.value || '').trim().toLowerCase();
+      state.q = q;
+      var visible = state.all.filter(function (s) { return matches(s, q); });
+      listWrap.textContent = '';
+      if (!state.all.length) { listWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: state.loading ? 'loading…' : 'No sessions. Sessions are written by save_session / cuecrux_session.' })); paintCount(0); return; }
+      if (!visible.length) { listWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'No sessions match the filter.' })); paintCount(0); return; }
+      visible.forEach(function (s) { listWrap.appendChild(rowEl(s)); });
+      paintCount(visible.length);
+    }
+    // Build the same-id ExecPlan map from the work board. Cheap, best-effort:
+    // a failed/absent work feed just leaves state.plans empty (no plan chips /
+    // "same-id: none" in the drawer) — honest degradation, never blocking.
+    function loadPlans() {
+      return fetchJSON('/v1/work?source=all').then(function (res) {
+        var map = {};
+        if (res.ok && res.data) {
+          var items = res.data.work || res.data.items || res.data.work_items || [];
+          items.forEach(function (w) {
+            var id = w && w.id;
+            if (typeof id === 'string' && id.indexOf('execplan:') === 0) {
+              map[id] = { state: w.state || null, current_milestone: w.current_milestone || null, title: w.title || null };
+            }
+          });
+        }
+        state.plans = map;
+      });
+    }
+    function load() {
+      if (state.loading) { return; }
+      state.loading = true; state.token++;
+      var myToken = state.token;
+      listWrap.textContent = ''; listWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'loading…' }));
+      Promise.all([
+        fetchJSON('/v1/console/sessions?include_archived=' + (state.includeArchived ? 'true' : 'false')),
+        loadPlans()
+      ]).then(function (rr) {
+        var res = rr[0];
+        if (myToken !== state.token) { return; }
+        state.loading = false;
+        if (!res.ok || !res.data) { banner.style.display = ''; banner.className = 'facts-banner err'; banner.textContent = 'Sessions unavailable — ' + (res.status === 0 ? 'daemon unreachable' : 'HTTP ' + res.status) + '.'; listWrap.textContent = ''; return; }
+        banner.style.display = 'none';
+        state.all = res.data.session_rows || [];
+        state.totalCount = (res.data.total_count != null) ? res.data.total_count : state.all.length;
+        state.archivedCount = res.data.archived_count || 0;
+        paint();
+      });
+    }
+
+    searchInput.addEventListener('input', paint);
+    archToggle.addEventListener('click', function () { state.includeArchived = !state.includeArchived; archToggle.classList.toggle('on', state.includeArchived); archToggle.setAttribute('aria-pressed', state.includeArchived ? 'true' : 'false'); load(); });
+    load();
+  }
+
   function renderActivityLog(host) {
     host.textContent = '';
     if (__actLogES) { try { __actLogES.close(); } catch (e) { /* noop */ } __actLogES = null; }
@@ -6317,6 +6564,8 @@
     renderSiteMap: renderSiteMap,
     // M2 (console-surfaces-remediation) — the paged, searchable facts browser.
     renderFactsBrowser: renderFactsBrowser,
+    // M3 (console-surfaces-remediation) — sessions browser + detail drawer.
+    renderSessionsBrowser: renderSessionsBrowser,
     // M10 — Documents mode (the console-as-reader).
     renderDocuments: renderDocuments,
     DOC_REFERENCE: DOC_REFERENCE,
