@@ -53,23 +53,27 @@
 //! - the flag resolves to the Vault backend,
 //! - `build_manifest_signer(Vault)` mints a leaf against real Vault,
 //! - the emitted envelope is `es256` and carries an `x5chain`,
-//! - the emitted signature is a valid ECDSA-P256 signature over
-//!   `BLAKE3(canonical_body)` **verified against the leaf certificate's
-//!   own public key parsed from the envelope x5chain** (not the on-disk
-//!   private key — so a signer that never talked to Vault cannot pass),
+//! - the emitted signature is a valid **true ES256** signature —
+//!   ECDSA-P256 over `SHA-256(canonical_body)` — **verified against the
+//!   leaf certificate's own public key parsed from the envelope x5chain**
+//!   (not the on-disk private key — so a signer that never talked to
+//!   Vault cannot pass),
 //! - the x5chain leaf is **issued by** the Vault root (issuer == root
 //!   subject), and `c2patool` resolves `signingCredential.trusted` for
 //!   it against the Vault root anchor **with no allow-list shortcut**
-//!   (so trust must cryptographically chain to the Vault root).
+//!   (so trust must cryptographically chain to the Vault root),
+//! - the daemon's own stateless ES256 verifier
+//!   `verify_c2pa_signed_manifest_es256_v1` (ECDSA-**SHA-256**, used by
+//!   `corecruxd/src/http/provenance.rs`) **accepts** the Vault envelope.
+//!   This was the M5-gate blocker: `VaultPkiX509Signer::sign_body` used
+//!   to sign a **BLAKE3** prehash while advertising `es256`, so the
+//!   verifier reported `signature_valid=false`. Once the signer moved to
+//!   a true SHA-256 prehash this became a hard assertion and is the
+//!   end-to-end regression guard against that algorithm confusion.
 //!
 //! Recorded (evidence, not assertions) — surfaced to stderr + summary:
 //! - p50/p95/max per-sign latency over 50 calls + one-time Vault CSR
-//!   init cost,
-//! - **M4 FINDING**: whether the daemon's own stateless ES256 verifier
-//!   `verify_c2pa_signed_manifest_es256_v1` (ECDSA-**SHA-256**, used by
-//!   `corecruxd/src/http/provenance.rs`) accepts the Vault envelope. It
-//!   does **not**, because `VaultPkiX509Signer::sign_body` signs a
-//!   **BLAKE3** prehash while advertising `es256`. See the PR body.
+//!   init cost.
 
 // Integration test: panicking on a failed external service and printing
 // evidence to stderr is the intended behaviour, so opt out of the
@@ -94,7 +98,7 @@ use corecrux_receipts::{
 };
 
 use ed25519_dalek::SigningKey;
-use p256::ecdsa::signature::hazmat::PrehashVerifier as _;
+use p256::ecdsa::signature::Verifier as _;
 use x509_cert::der::Decode as _;
 
 /// A 64x64 RGB PNG fixture — large enough for `c2patool` to embed a
@@ -207,22 +211,22 @@ fn vault_signer_end_to_end_against_local_vault() {
 
     // ── 4. Signer soundness against the LEAF CERT public key ───────────
     // Parse the leaf certificate FROM the envelope x5chain, derive its
-    // public key, and verify the emitted DER signature as a BLAKE3
-    // *prehash* — exactly what corecruxctl's `c2pa-verify` does
-    // (corecruxctl/src/c2pa_x509.rs verify_prehash(blake3(body))). Using
-    // the cert's own key (not the on-disk private key) means a signer
-    // that skipped Vault and wrote an unrelated cert cannot pass.
+    // public key, and verify the emitted DER signature as **true ES256**
+    // (ECDSA-P256 over the SHA-256 hash of the canonical body) — exactly
+    // what corecruxctl's `c2pa-verify` does (corecruxctl/src/c2pa_x509.rs)
+    // and what the `es256` algorithm identifier actually means. Using the
+    // cert's own key (not the on-disk private key) means a signer that
+    // skipped Vault and wrote an unrelated cert cannot pass.
     let leaf_der = first_cert_der(&x5chain_pem).expect("x5chain has a leaf certificate");
     let leaf_cert = x509_cert::Certificate::from_der(&leaf_der).expect("leaf cert DER parses");
     let leaf_vk = p256_verifying_key_from_cert(&leaf_cert).expect("leaf SPKI is a P-256 point");
     let der_sig = p256::ecdsa::Signature::from_der(&signed.signature).expect("es256 signature is DER ECDSA");
-    let blake3_prehash = blake3::hash(&signed.canonical_body_bytes);
-    let blake3_prehash_valid = leaf_vk.verify_prehash(blake3_prehash.as_bytes(), &der_sig).is_ok();
+    let es256_signature_valid = leaf_vk.verify(&signed.canonical_body_bytes, &der_sig).is_ok();
     assert!(
-        blake3_prehash_valid,
-        "the emitted signature must verify as ECDSA-P256 over BLAKE3(canonical_body) under the x5chain leaf key"
+        es256_signature_valid,
+        "the emitted signature must verify as true ES256 (ECDSA-P256 over SHA-256(canonical_body)) under the x5chain leaf key"
     );
-    eprintln!("[soundness] ECDSA-P256 over BLAKE3(body) under the x5chain LEAF cert key: VALID");
+    eprintln!("[soundness] true ES256 (ECDSA-P256 over SHA-256(body)) under the x5chain LEAF cert key: VALID");
 
     // ── 5. Leaf issuance: the x5chain leaf is issued by the Vault root ─
     let root_pem = std::fs::read_to_string(&root_pem_path).expect("read VAULT_C2PA_ROOT_PEM");
@@ -235,23 +239,26 @@ fn vault_signer_end_to_end_against_local_vault() {
     );
     eprintln!("[issuance] x5chain leaf issuer == Vault root subject: OK");
 
-    // ── 6. M4 FINDING: off-the-shelf / daemon ES256 (SHA-256) verifier ─
+    // ── 6. Daemon / off-the-shelf ES256 (SHA-256) verifier MUST accept ─
     // The daemon's own stateless verifier and any off-the-shelf ES256
-    // verifier hash the body with SHA-256. Record (do not assert) whether
-    // it accepts the Vault envelope — it does not, exposing the
-    // BLAKE3-vs-SHA-256 prehash mismatch. This is the M5-gate blocker.
+    // verifier hash the body with SHA-256. Before the true-ES256 fix this
+    // reported signature_valid=false (the BLAKE3-vs-SHA-256 prehash
+    // mismatch that blocked the M5 gate); it is now a hard assertion and
+    // the end-to-end regression guard against that algorithm confusion.
     let envelope = signed.to_jumbf_base64();
     let parsed = parse_jumbf_base64(&envelope).expect("round-trip parse");
     let es256_report = verify_c2pa_signed_manifest_es256_v1(&parsed, content).expect("es256 verify runs");
     assert!(
         es256_report.canonical_hash_match && es256_report.content_hash_match,
-        "envelope integrity (BLAKE3 + content hash) must hold regardless of the signature alg mismatch"
+        "envelope integrity (BLAKE3 canonical-body hash + content hash) must hold"
     );
     let es256_sha256_valid = es256_report.signature_valid;
-    eprintln!(
-        "[FINDING] verify_c2pa_signed_manifest_es256_v1 (ECDSA-SHA256) signature_valid = {es256_sha256_valid} \
-         (expected false: VaultPkiX509Signer signs a BLAKE3 prehash but labels it es256)"
+    assert!(
+        es256_sha256_valid,
+        "verify_c2pa_signed_manifest_es256_v1 (ECDSA-SHA256) must ACCEPT the Vault-signed envelope \
+         (was false before VaultPkiX509Signer moved to a true SHA-256 prehash)"
     );
+    eprintln!("[es256] verify_c2pa_signed_manifest_es256_v1 (ECDSA-SHA256) signature_valid = true");
 
     // ── 7. Latency: p50/p95/max over 50 per-manifest sign calls ────────
     let mut micros: Vec<u128> = Vec::with_capacity(50);
@@ -299,7 +306,7 @@ fn vault_signer_end_to_end_against_local_vault() {
             "{{\"vault_pki_mode\":\"pki-csr-sign-p256-emailProtection\",\
 \"init_ms\":{init_ms:.1},\
 \"p50_us\":{p50},\"p95_us\":{p95},\"max_us\":{max},\
-\"blake3_prehash_signature_valid\":{blake3_prehash_valid},\
+\"es256_leaf_key_signature_valid\":{es256_signature_valid},\
 \"es256_sha256_signature_valid\":{es256_sha256_valid},\
 \"c2patool_signingCredential_trusted\":{trusted},\
 \"c2patool_claimSignature_mismatch\":{mismatch}}}\n"
