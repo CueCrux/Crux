@@ -468,21 +468,27 @@ impl VaultPkiX509Signer {
 
 /// Implement [`crate::c2pa_manifest_v1::C2paSigner`] so the
 /// VaultPkiX509Signer can be passed to [`crate::c2pa_manifest_v1::sign_c2pa_manifest_via_signer`]
-/// without the c2pa module learning anything about Vault. The C2PA
-/// path hashes the canonical body with BLAKE3-32 and we sign the
-/// digest as a prehash (ECDSA accepts any 32-byte prehash; the
-/// algorithm identifier `es256` advertises SHA-256, but the prehash
-/// payload is opaque to the cryptographic layer — verifiers MUST
-/// rehash the same canonical bytes before comparing).
+/// without the c2pa module learning anything about Vault. This is
+/// **true ES256** (ECDSA-P256-SHA256): we prehash the canonical body
+/// with SHA-256 and sign that digest with the leaf key — identical in
+/// scheme to [`crate::c2pa_manifest_v1::ByokP256Signer`], so the `es256`
+/// algorithm identifier is honest and any off-the-shelf ES256 verifier
+/// (including the daemon's `verify_c2pa_signed_manifest_es256_v1`) accepts
+/// the envelope given the canonical bytes + leaf cert. BLAKE3 remains the
+/// SEPARATE envelope-integrity hash carried in `canonical_body_hash`.
 impl crate::c2pa_manifest_v1::C2paSigner for VaultPkiX509Signer {
     fn sign_body(
         &self,
         canonical_body_bytes: &[u8],
     ) -> std::result::Result<crate::c2pa_manifest_v1::SignedManifestParts, crate::c2pa_manifest_v1::C2paManifestError>
     {
-        let hash = blake3::hash(canonical_body_bytes);
+        // True ES256: ECDSA-P256 over the SHA-256 prehash of the canonical
+        // body. `sign` is a prehash signer, and sign_prehash(SHA-256(body))
+        // is exactly what a high-level ES256 signer computes, so the result
+        // verifies under `verify(body, sig)` with no BLAKE3 special-casing.
+        let digest = sha256_digest(canonical_body_bytes);
         let x509_sig = self
-            .sign(hash.as_bytes())
+            .sign(&digest)
             .map_err(|e| crate::c2pa_manifest_v1::C2paManifestError::Encode(format!("vault pki sign: {e}")))?;
         // Key id for X.509 envelopes = SHA-256 hex of the leaf DER.
         // Stable across reloads, doesn't collide with Ed25519 key ids,
@@ -961,6 +967,65 @@ mod tests {
         assert_eq!(parsed.signature_alg, "es256");
         assert_eq!(parsed.signature, signed.signature);
         assert!(parsed.x5chain_pem.is_some());
+    }
+
+    #[test]
+    fn test_vault_signed_envelope_verifies_as_true_es256() {
+        // Regression guard for the algorithm-confusion bug: the Vault signer
+        // labelled envelopes `es256` while signing a BLAKE3 prehash, so the
+        // daemon provenance verifier `verify_c2pa_signed_manifest_es256_v1`
+        // (which does ECDSA-over-SHA-256) reported signature_valid=false.
+        // After the fix the SAME verifier must ACCEPT the manifest.
+        use crate::c2pa_manifest_v1::{
+            build_c2pa_manifest_v1, parse_jumbf_base64, sign_c2pa_manifest_via_signer,
+            verify_c2pa_signed_manifest_es256_v1, C2paManifestInputV1,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let signer = VaultPkiX509Signer::with_post_fn(test_config(&tmp), mock_post_fn(TestPki::new()));
+        signer.regenerate_leaf().unwrap();
+        let content = b"true-es256-vault-content";
+        let manifest = build_c2pa_manifest_v1(&C2paManifestInputV1 {
+            content_bytes: content,
+            content_type: Some("image/png"),
+            crown_receipt_id: "r_es256",
+            signer_passport: "passport:test",
+            claim_generator: "cuecrux/test",
+            manifest_id: "urn:cuecrux:c2pa:es256",
+            when: "2026-05-28T00:00:00Z",
+            model: None,
+        });
+        let signed = sign_c2pa_manifest_via_signer(manifest, &signer, "2026-05-28T00:00:00Z").unwrap();
+        let parsed = parse_jumbf_base64(&signed.to_jumbf_base64()).unwrap();
+
+        // The off-the-shelf ES256 daemon-path verifier must now accept it.
+        let report = verify_c2pa_signed_manifest_es256_v1(&parsed, content).unwrap();
+        assert!(
+            report.signature_valid,
+            "Vault-signed es256 envelope must verify under the daemon ES256 verifier"
+        );
+        assert!(report.canonical_hash_match);
+        assert!(report.content_hash_match);
+        assert!(report.ok);
+
+        // Crypto-level: the signature is ECDSA-P256 over SHA-256 (true ES256)
+        // and specifically is NOT a BLAKE3-prehash signature.
+        use p256::ecdsa::signature::hazmat::PrehashVerifier as _;
+        use sha2::{Digest as _, Sha256};
+        let guard = signer.state.read();
+        let state = guard.as_ref().unwrap();
+        let signing_key: P256SigningKey = state.signing_key.clone().into();
+        let vk = p256::ecdsa::VerifyingKey::from(&signing_key);
+        let sig = p256::ecdsa::Signature::from_der(&parsed.signature).unwrap();
+        let sha = Sha256::digest(&parsed.canonical_body_bytes);
+        assert!(
+            vk.verify_prehash(&sha, &sig).is_ok(),
+            "signature must verify as ECDSA over SHA-256 (true ES256)"
+        );
+        let blake = blake3::hash(&parsed.canonical_body_bytes);
+        assert!(
+            vk.verify_prehash(blake.as_bytes(), &sig).is_err(),
+            "must NOT verify as a BLAKE3-prehash signature"
+        );
     }
 
     #[test]
