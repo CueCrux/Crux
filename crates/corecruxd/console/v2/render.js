@@ -1019,6 +1019,106 @@
     return details;
   }
 
+  // ---- M21: kanban board controls (state chips + sort) ---------------------
+  // The ExecPlan list is a kanban board, so "which states show" is column
+  // visibility and "sort" orders the cards INSIDE each column. Both live in
+  // localStorage keyed by the board id, so the operator's view of the plan list
+  // is the same on the next reload.
+  //
+  // Sort metrics, stated honestly:
+  //   updated / created — /v1/work's updated_at_unix_ms / created_at_unix_ms,
+  //                       newest first. Present on every item.
+  //   az               — title, locale-compared.
+  //   completion       — milestones_done / milestones_total. NOT every plan
+  //                      reports milestone counts; those sort last and the
+  //                      control says how many do (no invented progress).
+  var KANBAN_SORTS = [
+    ['updated', 'Updated · newest'],
+    ['created', 'Created · newest'],
+    ['az', 'Title · A→Z'],
+    ['completion', 'Completion · most done']
+  ];
+  var KANBAN_LS = 'crux.console.board.';
+  function kanbanReadHidden(boardId, cols) {
+    var out = {};
+    try {
+      var raw = localStorage.getItem(KANBAN_LS + boardId + '.hidden');
+      var list = raw ? JSON.parse(raw) : [];
+      if (Object.prototype.toString.call(list) === '[object Array]') {
+        list.forEach(function (k) { out[String(k)] = true; });
+      }
+    } catch (e) { /* quota / private mode — fall back to "everything shown" */ }
+    // Never restore a state that hides every column (an unusable board).
+    var shown = (cols || []).filter(function (c) { return !out[c.key]; });
+    return shown.length ? out : {};
+  }
+  function kanbanWriteHidden(boardId, hidden) {
+    try {
+      var list = Object.keys(hidden).filter(function (k) { return hidden[k]; });
+      localStorage.setItem(KANBAN_LS + boardId + '.hidden', JSON.stringify(list));
+    } catch (e) { /* non-fatal — the session keeps the choice in memory */ }
+  }
+  function kanbanReadSort(boardId) {
+    var v = null;
+    try { v = localStorage.getItem(KANBAN_LS + boardId + '.sort'); } catch (e) { v = null; }
+    for (var i = 0; i < KANBAN_SORTS.length; i++) { if (KANBAN_SORTS[i][0] === v) { return v; } }
+    return 'updated';
+  }
+  function kanbanWriteSort(boardId, sort) {
+    try { localStorage.setItem(KANBAN_LS + boardId + '.sort', sort); } catch (e) { /* non-fatal */ }
+  }
+  // Pure: order a card list by the chosen metric. Cards without the metric keep
+  // their feed order at the end rather than being dropped or faked.
+  function kanbanSortCards(cards, sort) {
+    var list = (cards || []).slice();
+    if (!sort || sort === 'feed') { return list; }
+    if (sort === 'az') {
+      return list.sort(function (a, b) { return String(a.title || '').localeCompare(String(b.title || '')); });
+    }
+    if (sort === 'completion') {
+      return list.sort(function (a, b) {
+        if (!!a.hasProg !== !!b.hasProg) { return a.hasProg ? -1 : 1; }   // unmeasured plans last
+        return (Number(b.pctSort) || 0) - (Number(a.pctSort) || 0);
+      });
+    }
+    var key = (sort === 'created') ? 'created' : 'updated';
+    return list.sort(function (a, b) { return (Number(b[key]) || 0) - (Number(a[key]) || 0); });
+  }
+  // Paint one column into a board host.
+  function kanbanColumn(board, col, sort) {
+    var cards = kanbanSortCards(col.cards, sort);
+    var colEl = el('div', { 'class': 'cvx-kcol', 'data-col': col.key });
+    colEl.appendChild(el('div', { 'class': 'cvx-kcol-head' }, [
+      el('span', { 'class': 'cvx-kcol-title', text: col.title }),
+      el('span', { 'class': 'cvx-kcol-count', text: String(cards.length) })
+    ]));
+    var colBody = el('div', { 'class': 'cvx-kcol-body' });
+    if (!cards.length) { colBody.appendChild(el('p', { 'class': 'cvx-kempty', text: 'none' })); }
+    cards.forEach(function (c) {
+      var kc = el('div', { 'class': 'cvx-kcard', 'data-strip': c.strip });
+      var top = el('div', { 'class': 'cvx-kcard-top' });
+      if (c.risk) { top.appendChild(el('span', { 'class': 'cvx-krisk risk-' + c.risk, text: c.risk })); }
+      if (c.milestone) { top.appendChild(el('span', { 'class': 'cvx-kms', text: c.milestone })); }
+      kc.appendChild(top);
+      if (c.slug) { kc.appendChild(el('div', { 'class': 'cvx-kslug', text: c.slug })); }
+      kc.appendChild(el('div', { 'class': 'cvx-ktitle', text: c.title }));
+      if (c.prog != null) {
+        var ktrack = el('div', { 'class': 'cvx-ktrack' }, [el('div', { 'class': 'cvx-kfill' })]);
+        ktrack.firstChild.style.width = Math.max(0, Math.min(100, Number(c.pct) || 0)) + '%';
+        kc.appendChild(el('div', { 'class': 'cvx-kprog' }, [ktrack, el('span', { 'class': 'cvx-kprogv', text: String(c.prog) })]));
+      }
+      var foot = el('div', { 'class': 'cvx-kcard-foot' });
+      if (c.passport) { foot.appendChild(el('span', { 'class': 'cvx-kpass', text: c.passport })); }
+      if (c.note) { foot.appendChild(el('span', { 'class': 'cvx-knote', text: c.note })); }
+      if (c.graph && c.graph.href) { foot.appendChild(el('a', { 'class': 'btn-quiet cx-graphlink cvx-kgraph', href: c.graph.href, title: 'View in relation graph' }, ['graph'])); }
+      if (foot.childNodes.length) { kc.appendChild(foot); }
+      colBody.appendChild(kc);
+    });
+    colEl.appendChild(colBody);
+    board.appendChild(colEl);
+    return colEl;
+  }
+
   function renderControl(control, sectionCard) {
     var t = control.t;
     var node;
@@ -1148,40 +1248,79 @@
         // ExecPlans as a clean board: columns keyed by work state; each card
         // carries a risk badge, execplan slug, bold title, a gradient progress
         // bar with its milestone count, the owner passport + a graph link.
+        //
+        // M21 — when the section opts in with `board: '<id>'` the board grows a
+        // toolbar: state chips (which columns show) and a sort control. Both are
+        // remembered in localStorage per board id, so the operator's view of the
+        // ExecPlan list survives a reload and a session.
         var board = el('div', { 'class': 'cvx-kanban' });
-        (control.columns || []).forEach(function (col) {
-          var cards = col.cards || [];
-          var colEl = el('div', { 'class': 'cvx-kcol' });
-          colEl.appendChild(el('div', { 'class': 'cvx-kcol-head' }, [
-            el('span', { 'class': 'cvx-kcol-title', text: col.title }),
-            el('span', { 'class': 'cvx-kcol-count', text: String(cards.length) })
-          ]));
-          var colBody = el('div', { 'class': 'cvx-kcol-body' });
-          if (!cards.length) { colBody.appendChild(el('p', { 'class': 'cvx-kempty', text: 'none' })); }
-          cards.forEach(function (c) {
-            var kc = el('div', { 'class': 'cvx-kcard', 'data-strip': c.strip });
-            var top = el('div', { 'class': 'cvx-kcard-top' });
-            if (c.risk) { top.appendChild(el('span', { 'class': 'cvx-krisk risk-' + c.risk, text: c.risk })); }
-            if (c.milestone) { top.appendChild(el('span', { 'class': 'cvx-kms', text: c.milestone })); }
-            kc.appendChild(top);
-            if (c.slug) { kc.appendChild(el('div', { 'class': 'cvx-kslug', text: c.slug })); }
-            kc.appendChild(el('div', { 'class': 'cvx-ktitle', text: c.title }));
-            if (c.prog != null) {
-              var ktrack = el('div', { 'class': 'cvx-ktrack' }, [el('div', { 'class': 'cvx-kfill' })]);
-              ktrack.firstChild.style.width = Math.max(0, Math.min(100, Number(c.pct) || 0)) + '%';
-              kc.appendChild(el('div', { 'class': 'cvx-kprog' }, [ktrack, el('span', { 'class': 'cvx-kprogv', text: String(c.prog) })]));
-            }
-            var foot = el('div', { 'class': 'cvx-kcard-foot' });
-            if (c.passport) { foot.appendChild(el('span', { 'class': 'cvx-kpass', text: c.passport })); }
-            if (c.note) { foot.appendChild(el('span', { 'class': 'cvx-knote', text: c.note })); }
-            if (c.graph && c.graph.href) { foot.appendChild(el('a', { 'class': 'btn-quiet cx-graphlink cvx-kgraph', href: c.graph.href, title: 'View in relation graph' }, ['graph'])); }
-            if (foot.childNodes.length) { kc.appendChild(foot); }
-            colBody.appendChild(kc);
+        var kbId = control.board || null;
+        var kbCols = control.columns || [];
+        var kbHidden = kbId ? kanbanReadHidden(kbId, kbCols) : {};
+        var kbSort = kbId ? kanbanReadSort(kbId) : 'updated';
+        function kanbanPaint() {
+          board.textContent = '';
+          kbCols.filter(function (col) { return !kbHidden[col.key]; }).forEach(function (col) {
+            kanbanColumn(board, col, kbSort);
           });
-          colEl.appendChild(colBody);
-          board.appendChild(colEl);
+        }
+        if (!kbId) {
+          kbCols.forEach(function (col) { kanbanColumn(board, col, null); });
+          node = board;
+          break;
+        }
+        // ---- toolbar: state chips + sort ----------------------------------
+        var bar = el('div', { 'class': 'cvx-kbar' });
+        var chipWrap = el('div', { 'class': 'cvx-kchips', role: 'group', 'aria-label': 'Show states' });
+        chipWrap.appendChild(el('span', { 'class': 'cvx-kbar-lbl', text: 'States' }));
+        kbCols.forEach(function (col) {
+          var chip = el('button', {
+            'class': 'cvx-kchip', type: 'button', 'data-state': col.key,
+            'aria-pressed': kbHidden[col.key] ? 'false' : 'true',
+            title: 'Show / hide the ' + col.title + ' column'
+          }, [
+            el('span', { 'class': 'cvx-kchip-dot', 'data-strip': col.key, 'aria-hidden': 'true' }),
+            el('span', { 'class': 'cvx-kchip-t', text: col.title }),
+            el('span', { 'class': 'cvx-kchip-n', text: String((col.cards || []).length) })
+          ]);
+          chip.addEventListener('click', function () {
+            var shown = kbCols.filter(function (c) { return !kbHidden[c.key]; });
+            if (!kbHidden[col.key] && shown.length <= 1) { return; }   // never hide the last column
+            kbHidden[col.key] = !kbHidden[col.key];
+            chip.setAttribute('aria-pressed', kbHidden[col.key] ? 'false' : 'true');
+            kanbanWriteHidden(kbId, kbHidden);
+            kanbanPaint();
+          });
+          chipWrap.appendChild(chip);
         });
-        node = board;
+        bar.appendChild(chipWrap);
+        var sortWrap = el('div', { 'class': 'cvx-ksort' });
+        var sortSel = el('select', { 'class': 'ctl-select cvx-ksort-sel', 'aria-label': 'Sort plans' });
+        KANBAN_SORTS.forEach(function (s) {
+          var o = el('option', { value: s[0], text: s[1] });
+          if (s[0] === kbSort) { o.selected = true; }
+          sortSel.appendChild(o);
+        });
+        // Honest metric note: completion orders by milestones_done/milestones_total,
+        // which only exists on plans that report milestones. Say how many do.
+        var sortNote = el('span', { 'class': 'cvx-ksort-note' });
+        function syncSortNote() {
+          if (kbSort !== 'completion') { sortNote.textContent = ''; return; }
+          var t = Number(control.total) || 0, wp = Number(control.withProgress) || 0;
+          sortNote.textContent = wp + ' of ' + t + ' plans report milestone counts — the rest sort last';
+        }
+        sortSel.addEventListener('change', function () {
+          kbSort = sortSel.value;
+          kanbanWriteSort(kbId, kbSort);
+          syncSortNote(); kanbanPaint();
+        });
+        sortWrap.appendChild(el('span', { 'class': 'cvx-kbar-lbl', text: 'Sort' }));
+        sortWrap.appendChild(sortSel);
+        sortWrap.appendChild(sortNote);
+        bar.appendChild(sortWrap);
+        syncSortNote();
+        kanbanPaint();
+        node = el('div', { 'class': 'cvx-kwrap' }, [bar, board]);
         break;
       }
       case 'sesscard': {
@@ -2812,11 +2951,49 @@
     var hostW = host.clientWidth || (typeof window !== 'undefined' && window.innerWidth) || 1280;
     if (hostW < TILE_FORM_BREAK) { return renderTileStack(host, cards, opts); }
 
-    var surface = el('div', { 'class': 'cvx-surface' });
+    // M21 — EXPLICIT EDIT MODE. Until now every board tile was draggable the
+    // moment it rendered, so an operator reading the board moved it by accident.
+    // The board is now LOCKED by default: no drag, no resize, no move cursor.
+    // Engaging the toolbar's Edit toggle arms move + resize; disengaging re-locks
+    // and drops the affordances. Deliberately NOT persisted — a board should
+    // always open read-only, whatever the last session did to it.
+    //
+    // This lives in renderTileCanvas so every host gets it from one place: the
+    // Rings Board tab (renderCanvasBoard) and the Documents corpus canvas
+    // (renderDocCanvas). The Studio has its own editor chrome and does not route
+    // through here — its editing behaviour is untouched.
+    var editMode = false;
+    var wrap = el('div', { 'class': 'cvx-boardwrap' });
+    var toolbar = el('div', { 'class': 'cvx-tb', role: 'toolbar', 'aria-label': 'Board controls' });
+    var editBtn = el('button', {
+      'class': 'cvx-tb-btn', type: 'button', 'data-tb': 'edit', 'aria-pressed': 'false',
+      'aria-label': 'Edit layout', title: 'Edit layout — move and resize tiles'
+    });
+    editBtn.innerHTML = svgIcon('<path d="M4 20h4.2L19 9.2a2.1 2.1 0 0 0-3-3L5.2 17z"/><path d="M14.6 6.8l2.6 2.6"/><path d="M4 20l.9-3.4"/>', 1.8);
+    var editLbl = el('span', { 'class': 'cvx-tb-state', text: 'Locked' });
+    toolbar.appendChild(editBtn);
+    toolbar.appendChild(editLbl);
+    wrap.appendChild(toolbar);
+    var surface = el('div', { 'class': 'cvx-surface is-locked' });
     surface.appendChild(el('div', { 'class': 'cvx-grid', 'aria-hidden': 'true' }));
     var layer = el('div', { 'class': 'cvx-layer' });
     surface.appendChild(layer);
-    host.appendChild(surface);
+    wrap.appendChild(surface);
+    host.appendChild(wrap);
+    function setEditMode(on) {
+      editMode = !!on;
+      editBtn.setAttribute('aria-pressed', editMode ? 'true' : 'false');
+      editBtn.setAttribute('title', editMode ? 'Editing — click to lock the layout' : 'Edit layout — move and resize tiles');
+      editLbl.textContent = editMode ? 'Editing' : 'Locked';
+      surface.classList.toggle('is-locked', !editMode);
+      surface.classList.toggle('is-editing', editMode);
+      Object.keys(nodes).forEach(function (k) { syncNodeEdit(nodes[k]); });
+    }
+    editBtn.addEventListener('click', function (ev) {
+      if (ev.stopPropagation) { ev.stopPropagation(); }
+      if (expandedId) { collapse(); }   // editing and a drilled-in card are different jobs
+      setEditMode(!editMode);
+    });
     function vp() {
       return {
         w: surface.clientWidth || hostW,
@@ -2880,14 +3057,50 @@
       applyLayerPan(TILE_PAN_TARGET.x - card.x, TILE_PAN_TARGET.y - card.y);
     }
 
+    // Show/hide a node's edit affordances for the current mode. A chromeless or
+    // pinned tile is never movable, so it never grows a handle.
+    function syncNodeEdit(node) {
+      if (!node) { return; }
+      var movable = editMode && node.getAttribute('data-fixed') !== '1';
+      setClass(node, 'cvx-editable', movable);
+      var rz = node.querySelector ? node.querySelector('.cvx-rz') : null;
+      if (rz) { rz.hidden = !movable; }
+    }
+
     function mountCard(card, idx) {
       var node = tileNode(card, idx);
       placeNode(card, node);
       nodes[card.id] = node;
+      if (card.chromeless || card.pinned) { node.setAttribute('data-fixed', '1'); }
       layer.appendChild(node);
+      // Close control for the EXPANDED state (M21). Present on every openable
+      // tile, CSS-hidden until .cvx-exp — a second, obvious way out alongside the
+      // existing Escape / click-away / click-again releases.
+      if (!card.chromeless) {
+        var xb = el('button', { 'class': 'cvx-expclose', type: 'button', 'aria-label': 'Close ' + (card.title || 'card'), title: 'Close' });
+        xb.innerHTML = svgIcon('<path d="M6 6l12 12M18 6L6 18"/>', 1.9);
+        xb.addEventListener('click', function (ev) { if (ev.stopPropagation) { ev.stopPropagation(); } collapse(); });
+        node.appendChild(xb);
+      }
+      // Resize handle — armed only in edit mode (syncNodeEdit toggles `hidden`).
+      // Writes through the SAME overrideW/overrideH + tileSavePositions path the
+      // grid-derived dims already use, so a resized tile survives a reload.
+      if (!card.chromeless && !card.pinned) {
+        var rz = el('div', { 'class': 'cvx-rz', 'aria-hidden': 'true', title: 'Drag to resize' });
+        rz.hidden = true;
+        rz.addEventListener('pointerdown', function (ev) {
+          if (!editMode || expandedId) { return; }
+          if (ev.stopPropagation) { ev.stopPropagation(); }
+          var dim = tileRenderedDims(card);
+          resize = { x: ev.clientX, y: ev.clientY, w: dim.w, h: dim.h, card: card, node: node, moved: false };
+          setClass(node, 'cvx-resizing', true);
+        });
+        node.appendChild(rz);
+      }
       node.addEventListener('pointerdown', function (ev) {
+        if (!editMode) { return; }   // M21 — locked board: reading never moves a tile
         if (expandedId || card.chromeless || card.pinned) { return; }
-        if (ev.target && ev.target.closest && ev.target.closest('button, a, input, select, textarea, details')) { return; }
+        if (ev.target && ev.target.closest && ev.target.closest('button, a, input, select, textarea, details, .cvx-rz')) { return; }
         drag = { x: ev.clientX, y: ev.clientY, cx: card.x, cy: card.y, card: card, node: node, moved: false };
         setClass(node, 'cvx-dragging', true);
       });
@@ -2912,6 +3125,7 @@
         if (pos.h != null) { card.overrideH = pos.h; }
         if (nodes[card.id]) { placeNode(card, nodes[card.id]); }
         else { mountCard(card, i); }
+        syncNodeEdit(nodes[card.id]);
       });
     }
     layoutAndMount();
@@ -2919,7 +3133,7 @@
     // Manual pan — pointer-drag on empty surface, 4px deadzone, translate
     // clamped ≤ 0 (pan right/down only); the layer transition is CSS-disabled
     // while .cvx-panning so the drag tracks 1:1.
-    var pan = null, drag = null;
+    var pan = null, drag = null, resize = null;
     surface.addEventListener('pointerdown', function (ev) {
       if (ev.target && ev.target.closest && ev.target.closest('.cvx-node')) { return; }
       if (expandedId) { return; }   // manual pan is a base-level gesture
@@ -2932,6 +3146,17 @@
       if (expandedId) { collapse(); }   // click on empty canvas releases
     });
     function onPointerMove(ev) {
+      if (resize) {
+        var rdx = ev.clientX - resize.x, rdy = ev.clientY - resize.y;
+        if (!resize.moved && Math.abs(rdx) < TILE_PAN_DEAD_ZONE && Math.abs(rdy) < TILE_PAN_DEAD_ZONE) { return; }
+        resize.moved = true;
+        // Snap to the same 20px grid the move gesture uses; floor at one cell.
+        resize.card.overrideW = Math.max(TILE_GRID * 6, tileSnap(resize.w + rdx));
+        resize.card.overrideH = Math.max(TILE_GRID * 4, tileSnap(resize.h + rdy));
+        resize.node.style.width = resize.card.overrideW + 'px';
+        resize.node.style.height = resize.card.overrideH + 'px';
+        return;
+      }
       if (pan) {
         var dx = ev.clientX - pan.x, dy = ev.clientY - pan.y;
         if (!pan.moved && Math.abs(dx) < TILE_PAN_DEAD_ZONE && Math.abs(dy) < TILE_PAN_DEAD_ZONE) { return; }
@@ -2951,6 +3176,21 @@
       }
     }
     function onPointerUp() {
+      if (resize) {
+        var r = resize;
+        resize = null;
+        setClass(r.node, 'cvx-resizing', false);
+        squelchClick = squelchClick || r.moved;
+        if (r.moved && opts.storeKey) {
+          var rsaved = tileLoadPositions(opts.storeKey);
+          var rprev = rsaved[r.card.id] || {};
+          rsaved[r.card.id] = {
+            x: r.card.x, y: r.card.y, manual: rprev.manual === true,
+            w: r.card.overrideW, h: r.card.overrideH
+          };
+          tileSavePositions(opts.storeKey, rsaved);
+        }
+      }
       if (pan) {
         squelchClick = pan.moved;
         pan = null;
@@ -3012,7 +3252,9 @@
           setTimeout(finish, 250);   // the measured exit: .25s out
         } else { finish(); }
       },
-      collapse: collapse
+      collapse: collapse,
+      setEditMode: setEditMode,
+      isEditing: function () { return editMode; }
     };
   }
 
@@ -3205,7 +3447,7 @@
       var boardHost = el('div', { 'class': 'cvx-board' });
       host.appendChild(boardHost);
       renderTileCanvas(boardHost, tiles, { storeKey: 'board-' + tier });
-      host.appendChild(el('p', { 'class': 'ctl-desc cvx-board-meta', text: tier + ' tier · ' + tiles.length + ' widget' + (tiles.length === 1 ? '' : 's') + ' · drag a tile to place it · drag the canvas to pan · click to expand in place' }));
+      host.appendChild(el('p', { 'class': 'ctl-desc cvx-board-meta', text: tier + ' tier · ' + tiles.length + ' widget' + (tiles.length === 1 ? '' : 's') + ' · click to expand in place · drag the canvas to pan · Edit to move and resize tiles' }));
     }
     paint();
     // Debounced resize recompose. Tier/mode changes repaint instantly (no
@@ -3919,14 +4161,44 @@
     // never jump at the cut — they glide from where they were into the new layout.
     var lodRaf = null, TWEEN_MAX = 160;
     function screenCentre(n) { var w = n.w || 300, h = n.h || 128; return { x: view.tx + (n.x + w / 2) * view.scale, y: view.ty + (n.y + h / 2) * view.scale }; }
-    function switchMode(next) {
+    // M21 — LOD switch PRESERVES THE VIEWPOINT.
+    //
+    // Bug (operator round 10): a few wheel zoom-ins from the overview landed the
+    // view hard against the top-left corner at ~60%. Root cause was HERE: the
+    // switch called frame(activeDims) and overwrote scale/tx/ty with the FIT of
+    // the incoming layout. Because M13 made ring and card share ONE organic
+    // geometry (cardDims === ringDims === orgDims, line ~3608), that fit is the
+    // same framing fitView() computes at boot — so crossing the threshold threw
+    // the operator's zoom away. And when the layout is wider than the viewport,
+    // frame()'s `Math.max(0, (availW - d.width * s) / 2)` centring term is 0, so
+    // tx/ty collapse to `pad` (30,30): the layer's top-left corner. That is the
+    // reported jump, exactly.
+    //
+    // Fix: keep the world point under the anchor (the cursor for a wheel zoom,
+    // the viewport centre otherwise) pinned across the cut, and carry the current
+    // scale over — clamped only by the incoming mode's zoom bounds. The remap by
+    // the dims ratio is a no-op while the two layouts share geometry, and stays
+    // correct if they ever diverge again.
+    function lodBounds(m) { return (m === 'ring') ? { min: 0.03, max: 1.3 } : { min: 0.42, max: 2.4 }; }
+    function switchMode(next, anchor) {
       if (next === mode) { return; }
+      var sw = stage.clientWidth || 960, sh = stage.clientHeight || 640;
+      var ax = (anchor && isFinite(anchor.x)) ? anchor.x : sw / 2;
+      var ay = (anchor && isFinite(anchor.y)) ? anchor.y : sh / 2;
+      // The layer-space point currently sitting under the anchor.
+      var wx = (ax - view.tx) / view.scale, wy = (ay - view.ty) / view.scale;
+      var prevDims = activeDims;
       var sc = {}; model.nodes.forEach(function (n) { sc[n.key] = screenCentre(n); });
       mode = next; activeDims = (mode === 'ring') ? ringDims : cardDims;
       layer.style.width = activeDims.width + 'px'; layer.style.height = activeDims.height + 'px';
       svg.setAttribute('width', activeDims.width); svg.setAttribute('height', activeDims.height);
       layer.setAttribute('data-lod', mode);
-      var f = frame(activeDims); view.scale = f.scale; view.tx = f.tx; view.ty = f.ty; apply();
+      var b = lodBounds(mode);
+      var rx = wx * (prevDims.width ? (activeDims.width / prevDims.width) : 1);
+      var ry = wy * (prevDims.height ? (activeDims.height / prevDims.height) : 1);
+      view.scale = Math.max(b.min, Math.min(b.max, view.scale));
+      view.tx = ax - rx * view.scale; view.ty = ay - ry * view.scale;
+      apply();
       updateZoomChip();   // M20 — the corner chip reports the new LOD + zoom %
       var from = {}, to = {};
       model.nodes.forEach(function (n) {
@@ -3966,17 +4238,17 @@
     // (sx, sy) are STAGE-relative pixels; the layer sits at the stage origin with
     // transform-origin 0 0 (see .cv-graph-layer), so no extra offset is needed.
     function zoomAtPoint(sx, sy, factor) {
-      var b = (mode === 'ring') ? { min: 0.03, max: 1.3 } : { min: 0.42, max: 2.4 };
+      var b = lodBounds(mode);
       var ns = Math.max(b.min, Math.min(b.max, view.scale * factor));
       var k = ns / view.scale;
       view.tx = sx - (sx - view.tx) * k;
       view.ty = sy - (sy - view.ty) * k;
       view.scale = ns; apply();
       updateZoomChip();
-      // Crossing the LOD threshold re-frames the whole layout (switchMode), which
-      // deliberately re-centres — the anchor applies WITHIN a level of detail.
-      if (mode === 'card' && factor < 1 && ns <= LOD_THRESHOLD) { switchMode('ring'); }
-      else if (mode === 'ring' && factor > 1 && ns >= LOD_THRESHOLD) { switchMode('card'); }
+      // M21 — crossing the LOD threshold hands the SAME anchor to switchMode, so
+      // the point under the cursor survives the cut (it used to re-frame to fit).
+      if (mode === 'card' && factor < 1 && ns <= LOD_THRESHOLD) { switchMode('ring', { x: sx, y: sy }); }
+      else if (mode === 'ring' && factor > 1 && ns >= LOD_THRESHOLD) { switchMode('card', { x: sx, y: sy }); }
     }
     // Button zoom keeps the viewport centre fixed (there is no pointer to anchor on).
     function zoomBy(factor) { zoomAtPoint((stage.clientWidth || 960) / 2, (stage.clientHeight || 640) / 2, factor); }
@@ -4148,6 +4420,34 @@
         var bk = null, bd = -1; Object.keys(deg).forEach(function (k) { if (deg[k] > bd) { bd = deg[k]; bk = k; } });
         if (bk != null && index[bk]) { select(bk); onSelect(index[bk]); if (focusMode) { applyFocus(bk); } }
         return { key: bk, deg: bd };
+      };
+      // M21 — zoom probe. Reports the live view transform, the LOD mode and (when
+      // given a node key) that node's CENTRE in stage pixels, so the mirror walk
+      // can assert "the node under the cursor is still under the cursor" across a
+      // LOD cut instead of eyeballing a screenshot.
+      window.__cvZoomProbe = function (key) {
+        var out = { mode: mode, scale: view.scale, tx: view.tx, ty: view.ty,
+          stage: { w: stage.clientWidth, h: stage.clientHeight }, threshold: LOD_THRESHOLD };
+        var n = key != null ? index[key] : null;
+        if (n) {
+          var w = n.w || 300, h = n.h || 128;
+          out.node = { key: n.key, sx: view.tx + (n.x + w / 2) * view.scale, sy: view.ty + (n.y + h / 2) * view.scale };
+        }
+        return out;
+      };
+      // Drive one wheel-equivalent zoom step anchored at stage-relative (sx, sy) —
+      // the exact code path the wheel listener uses.
+      window.__cvZoomAt = function (sx, sy, factor) { zoomAtPoint(sx, sy, factor); return window.__cvZoomProbe(); };
+      // The node whose centre is nearest a stage point (the "node under the cursor").
+      window.__cvNodeNear = function (sx, sy) {
+        var best = null, bd = Infinity;
+        model.nodes.forEach(function (n) {
+          var w = n.w || 300, h = n.h || 128;
+          var dx = (view.tx + (n.x + w / 2) * view.scale) - sx, dy = (view.ty + (n.y + h / 2) * view.scale) - sy;
+          var d = dx * dx + dy * dy;
+          if (d < bd) { bd = d; best = n.key; }
+        });
+        return best;
       };
     }
   }
@@ -6886,18 +7186,17 @@
     var view = ctx.view === 'graph' ? 'graph' : (ctx.view === 'tree' ? 'tree' : (ctx.view === 'studio' ? 'studio' : 'board'));
     host.textContent = '';
     var region = el('div', { 'class': 'canvas-region' });
-    var seg = el('div', { 'class': 'modeseg canvas-seg', role: 'group', 'aria-label': 'Canvas view' });
-    [['board', 'Board'], ['graph', 'Graph'], ['tree', 'Tree'], ['studio', 'Studio']].forEach(function (v) {
-      var b = el('button', { 'class': 'modeseg-btn', type: 'button', 'data-view': v[0], 'aria-pressed': v[0] === view ? 'true' : 'false' }, [v[1]]);
-      (function (vid) { b.addEventListener('click', function () { location.hash = '#/canvas/' + vid; }); })(v[0]);
-      seg.appendChild(b);
-    });
-    var head = el('div', { 'class': 'canvas-head' }, [seg]);
-    // Studio (M16b) gains a subsection switcher: Board (the tile canvas) · Pages
-    // (workspaces + pages) · Integrations (extensions). Deep-linkable via ?sub=.
+    var head = el('div', { 'class': 'canvas-head' });
     var studioSub = (view === 'studio') ? (ctx.sub === 'pages' ? 'pages' : (ctx.sub === 'integrations' ? 'integrations' : 'board')) : null;
     if (view === 'studio') {
-      var sub = el('div', { 'class': 'modeseg canvas-subseg', role: 'group', 'aria-label': 'Studio section' });
+      // M21 — inside the Studio the PRIMARY control is the Studio's OWN sections:
+      // Board (the tile canvas) · Pages (workspaces + pages) · Integrations
+      // (extensions), deep-linkable via ?sub=. The old Board|Graph|Tree|Studio
+      // segmented control is gone: M19/M20 moved Board, Graph and Tree into the
+      // Rings tab hub, so three of its four buttons pointed at views that no
+      // longer live here — it was a control for a destination that had been
+      // dissolved. Studio is now what #/canvas/* is FOR.
+      var sub = el('div', { 'class': 'modeseg canvas-seg canvas-subseg', role: 'group', 'aria-label': 'Studio section' });
       [['board', 'Board'], ['pages', 'Pages'], ['integrations', 'Integrations']].forEach(function (v) {
         var b = el('button', { 'class': 'modeseg-btn', type: 'button', 'data-sub': v[0], 'aria-pressed': v[0] === studioSub ? 'true' : 'false' }, [v[1]]);
         (function (sid) { b.addEventListener('click', function () { location.hash = '#/canvas/studio' + (sid === 'board' ? '' : '?sub=' + sid); }); })(v[0]);
@@ -6905,7 +7204,10 @@
       });
       head.appendChild(sub);
     }
-    region.appendChild(head);
+    // Non-studio views reach renderCanvas only as workspace page types
+    // (canvas/board · canvas/graph · canvas/tree) — those render bare, with no
+    // switcher, because their console home is the Rings tab hub.
+    if (head.childNodes.length) { region.appendChild(head); }
     var body = el('div', { 'class': 'canvas-body' });
     region.appendChild(body);
     host.appendChild(region);
@@ -8515,7 +8817,7 @@
       { id: 'doc-intro', chromeless: true, shape: 'hero', size: 'md', accent: 'neutral',
         title: 'Documents',
         subtitle: 'the corpus as a canvas',
-        body: 'Click a tile to read · drag a tile to place it · drag the canvas to pan.' },
+        body: 'Click a tile to read · drag the canvas to pan · engage Edit to move and resize tiles.' },
       { id: 'doc-explorer', eyebrow: 'SEARCH · CORPUS', title: 'Explorer',
         subtitle: 'Local BM25 · WikiCrux mediated',
         body: 'Search the corpus — results open in the reader.',
@@ -9452,12 +9754,42 @@
     var toolbar = el('div', { 'class': 'facts-toolbar' }, [field('filter', searchInput), el('div', { 'class': 'facts-toggles' }, [archToggle])]);
     var countLine = el('p', { 'class': 'facts-count' });
     var banner = el('div', { 'class': 'facts-banner' }); banner.style.display = 'none';
+    // M21 — SESSION ALLOCATION. "Why do so many sessions have no passport or
+    // plan?" is answered here with the daemon's own counts (GET
+    // /v1/console/sessions → `allocation`, computed over every listed row, not
+    // just the displayed page) plus the structural reason. Absent on an older
+    // daemon → the panel stays hidden rather than showing zeros.
+    var allocWrap = el('div', { 'class': 'sess-alloc' }); allocWrap.hidden = true;
     var listWrap = el('div', { 'class': 'facts-groups' });
-    host.appendChild(el('div', { 'class': 'facts-browser' }, [toolbar, countLine, banner, listWrap]));
+    host.appendChild(el('div', { 'class': 'facts-browser' }, [toolbar, countLine, banner, allocWrap, listWrap]));
+    function allocStat(label, n, of, tone) {
+      var pct = of ? Math.round((n / of) * 100) : 0;
+      return el('div', { 'class': 'sess-alloc-stat' + (tone ? ' tone-' + tone : '') }, [
+        el('span', { 'class': 'sess-alloc-n', text: nfmt(n) }),
+        el('span', { 'class': 'sess-alloc-of', text: '/ ' + nfmt(of) + ' · ' + pct + '%' }),
+        el('span', { 'class': 'sess-alloc-l', text: label })
+      ]);
+    }
+    function paintAllocation(a) {
+      allocWrap.textContent = '';
+      if (!a || typeof a.counted !== 'number') { allocWrap.hidden = true; return; }
+      allocWrap.hidden = false;
+      var of = a.counted;
+      allocWrap.appendChild(el('div', { 'class': 'sess-alloc-h', text: 'Allocation · ' + nfmt(of) + ' session' + (of === 1 ? '' : 's') + ' counted' }));
+      allocWrap.appendChild(el('div', { 'class': 'sess-alloc-row' }, [
+        allocStat('identity (actor, key prefix or binding)', a.with_any_identity || 0, of, (a.no_identity ? 'warn' : 'ok')),
+        allocStat('write-time actor stamp', a.with_actor || 0, of, null),
+        allocStat('passport binding', a.with_passport_binding || 0, of, null),
+        allocStat('plan link (binding or live announce)', a.with_any_plan_link || 0, of, (a.no_plan_link ? 'warn' : 'ok')),
+        allocStat('agent-given title', a.with_agent_title || 0, of, null)
+      ]));
+      if (a.why) { allocWrap.appendChild(el('p', { 'class': 'ctl-desc', text: a.why })); }
+    }
 
     function matches(s, q) {
       if (!q) { return true; }
-      return ((s.session_id || '') + ' ' + (s.agent || '') + ' ' + (s.passport_id || '') + ' ' + (s.execplan_slug || '') + ' ' + (planIdFor(s) || '')).toLowerCase().indexOf(q) >= 0;
+      return ((s.session_id || '') + ' ' + (s.agent || '') + ' ' + (s.actor || '') + ' ' + (s.passport_id || '')
+        + ' ' + (s.execplan_slug || '') + ' ' + (planIdFor(s) || '') + ' ' + (s.state_title || '')).toLowerCase().indexOf(q) >= 0;
     }
     function paintCount(shown) {
       countLine.textContent = '';
@@ -9478,12 +9810,18 @@
     }
     function chip(cls, text, title) { return el('span', { 'class': cls, title: title || '' }, [text]); }
     function rowEl(s) {
+      // M21 — the agent-given title leads when there is one (a convention on
+      // save_session `state.title`); the id then rides along as a mono tag. No
+      // title → the id stays the heading, exactly as before.
       var head = el('div', { 'class': 'facts-rhead' }, [
-        el('span', { 'class': 'facts-key', text: s.session_id || '(no id)' }),
+        el('span', { 'class': 'facts-key' + (s.state_title ? ' cost-name' : ''), text: s.state_title || s.session_id || '(no id)',
+          title: s.state_title ? 'title given by the agent at save_session' : '' }),
         el('span', { 'class': 'sess-sc ' + (s.state || 'idle'), text: s.state || 'idle' }),
         s.agent ? chip('sess-chip', s.agent, 'owning agent') : null,
+        s.actor ? chip('sess-chip sess-chip-pass', s.actor, 'identity stamped on this record at write time') : null,
         el('span', { 'class': 'facts-time', text: relTime(s.updated_at) })
       ]);
+      if (s.state_title) { head.appendChild(el('span', { 'class': 'cost-idtag', text: s.session_id || '' })); }
       var planId = planIdFor(s);
       var plan = planId ? state.plans[planId] : null;
       var planChipText = planId ? (planId.replace(/^execplan:/, '') + (plan && plan.state ? (' · ' + plan.state) : '')) : null;
@@ -9494,7 +9832,10 @@
         s.execplan_slug ? chip('sess-chip sess-chip-plan', s.execplan_slug + (s.milestone ? (' · ' + s.milestone) : ''), 'live coord announce') : null,
         s.archived ? chip('sess-chip', 'archived' + (s.archive_reason ? (': ' + s.archive_reason) : ''), 'archived session') : null
       ]);
-      var sub = s.state_first_line ? el('div', { 'class': 'facts-val', text: s.state_first_line }) : el('div', { 'class': 'sess-note-empty', text: 'no state summary' });
+      var subLine = s.state_summary || s.state_first_line;
+      var sub = subLine
+        ? el('div', { 'class': 'facts-val' + (s.state_summary ? ' cost-summary' : ''), text: subLine })
+        : el('div', { 'class': 'sess-note-empty', text: 'no state summary — agents: set title/summary in save_session state' });
       var detail = el('div', { 'class': 'facts-detail' });
       var row = el('div', { 'class': 'facts-row', role: 'button', tabindex: '0' }, [head, sub, metaChips, detail]);
       var opened = false;
@@ -9635,6 +9976,7 @@
         state.all = res.data.session_rows || [];
         state.totalCount = (res.data.total_count != null) ? res.data.total_count : state.all.length;
         state.archivedCount = res.data.archived_count || 0;
+        paintAllocation(res.data.allocation);
         paint();
       });
     }
@@ -9683,7 +10025,60 @@
     function isLinked(s) { return arr(s.execplan_slugs).length > 0; }
     function planIdsFor(s) { return arr(s.execplan_slugs).map(function (sl) { return 'execplan:' + sl; }); }
 
-    var state = { all: [], plans: {}, q: '', passport: '', plan: '', minBurn: 0, from: '', to: '', loading: false, token: 0 };
+    // ---- M21: session names + the fixed-scale token bar --------------------
+    // Cost rows used to be an opaque id and two numbers. They now join the
+    // session store (/v1/console/sessions) for the agent-authored name:
+    //
+    //   state.title  → the name the agent gave the session at save_session time
+    //   state.summary→ its one-paragraph "where this stands"
+    //
+    // Both are CONVENTIONS documented on the save_session tool schema, not
+    // required fields, so the fallback chain is explicit and the UI says which
+    // rung it landed on: title → state_first_line (the first conventional
+    // summary line) → a short id, labelled untitled.
+    //
+    // COST_BAR_MAX is a FIXED 2,000,000-token scale, not a per-page max: two
+    // sessions are comparable across filters, pages and days because the bar
+    // always means the same thing. A session past the ceiling clamps at full
+    // width and is marked over-scale rather than silently rescaling everything.
+    var COST_BAR_MAX = 2000000;
+    function sessTokens(s) { return (Number(s.context_tokens) || 0) + (Number(s.output_tokens) || 0); }
+    function sessMeta(s) { return state.meta[s.session_id] || null; }
+    // { text, kind } — kind ∈ title | first_line | id (drives the honest label).
+    function sessName(s) {
+      var m = sessMeta(s);
+      if (m && m.state_title) { return { text: m.state_title, kind: 'title' }; }
+      if (m && m.state_first_line) { return { text: m.state_first_line, kind: 'first_line' }; }
+      return { text: shortId(s.session_id), kind: 'id' };
+    }
+    var COST_UNTITLED_HINT = '(untitled — agents: set title/summary in save_session state)';
+    // One horizontal gradient bar, magnitude-coloured against the fixed ceiling.
+    // The gradient is sized to the WHOLE track, so a given colour always means a
+    // given token count — a short bar is green because it is small, not because
+    // it is short.
+    function costBar(tokens) {
+      var over = tokens > COST_BAR_MAX;
+      var pct = Math.max(0, Math.min(100, (tokens / COST_BAR_MAX) * 100));
+      var fill = el('div', { 'class': 'cost-tbar-fill' });
+      fill.style.width = (over ? 100 : Math.max(pct, tokens > 0 ? 0.6 : 0)) + '%';
+      if (pct > 0.6) { fill.style.backgroundSize = (10000 / pct) + '% 100%'; }
+      var track = el('div', { 'class': 'cost-tbar-track' + (over ? ' is-over' : '') }, [
+        fill,
+        el('span', { 'class': 'cost-tbar-maxline', 'aria-hidden': 'true' })
+      ]);
+      var vals = el('div', { 'class': 'cost-tbar-vals' }, [
+        el('span', { 'class': 'cost-tbar-v', text: compactN(tokens) }),
+        el('span', { 'class': 'cost-tbar-max', text: over ? 'over 2M' : '/ 2M' })
+      ]);
+      var wrap = el('div', {
+        'class': 'cost-tbar' + (over ? ' is-over' : ''),
+        role: 'img',
+        'aria-label': compactN(tokens) + ' tokens of a fixed 2,000,000-token scale' + (over ? ' (over scale — clamped)' : '')
+      }, [track, vals]);
+      return wrap;
+    }
+
+    var state = { all: [], plans: {}, meta: {}, metaCount: 0, q: '', passport: '', plan: '', minBurn: 0, from: '', to: '', loading: false, token: 0 };
 
     // ---- toolbar (filters) ----
     var searchInput = el('input', { 'class': 'facts-input', type: 'search', placeholder: 'filter id / source / passport / plan…', 'aria-label': 'filter sessions' });
@@ -9720,7 +10115,10 @@
 
     function matches(s) {
       if (state.q) {
-        var hay = ((s.session_id || '') + ' ' + (s.source || '') + ' ' + (s.actor_passport || '') + ' ' + arr(s.execplan_slugs).join(' ')).toLowerCase();
+        var mm = sessMeta(s);
+        var hay = ((s.session_id || '') + ' ' + (s.source || '') + ' ' + (s.actor_passport || '') + ' '
+          + arr(s.execplan_slugs).join(' ')
+          + ' ' + ((mm && mm.state_title) || '') + ' ' + ((mm && mm.state_summary) || '') + ' ' + ((mm && mm.actor) || '')).toLowerCase();
         if (hay.indexOf(state.q) < 0) { return false; }
       }
       if (state.passport && s.actor_passport !== state.passport) { return false; }
@@ -9750,20 +10148,29 @@
     }
 
     function rowEl(s) {
+      var nm = sessName(s), m = sessMeta(s);
       var head = el('div', { 'class': 'facts-rhead' }, [
-        el('span', { 'class': 'facts-key', text: shortId(s.session_id) }),
+        el('span', { 'class': 'facts-key cost-name' + (nm.kind === 'id' ? ' is-untitled' : ''), text: nm.text,
+          title: nm.kind === 'title' ? 'title given by the agent at save_session' :
+            (nm.kind === 'first_line' ? 'no title — first conventional line of the session state' : COST_UNTITLED_HINT) }),
         methodChip(s),
         el('span', { 'class': 'facts-time', text: windowLabel(s) })
       ]);
+      if (nm.kind !== 'id') { head.appendChild(el('span', { 'class': 'cost-idtag', text: shortId(s.session_id) })); }
       var metaChips = el('div', { 'class': 'sess-rmeta' }, [
         chip('sess-chip', compactN(s.context_tokens || 0) + ' ctx', 'measured context tokens (Σ)'),
         chip('sess-chip cost-out', compactN(s.output_tokens || 0) + ' out', 'output tokens generated (Σ)'),
         (s.assistant_turns ? chip('sess-chip', s.assistant_turns + ' turns', 'assistant turns') : null),
-        (s.actor_passport && s.actor_passport !== '__anon__') ? chip('sess-chip sess-chip-pass', s.actor_passport, 'poster passport') : null
+        (s.actor_passport && s.actor_passport !== '__anon__') ? chip('sess-chip sess-chip-pass', s.actor_passport, 'poster passport') : null,
+        (m && m.actor) ? chip('sess-chip sess-chip-pass', m.actor, 'identity stamped on the saved session at write time') : null
       ].concat(planChips(s)));
-      var sub = el('div', { 'class': 'facts-val', text: s.source || '(no source)' });
+      // Summary line: the agent's own words when they set one; otherwise the
+      // source, plus the honest hint that names the missing convention.
+      var subText = (m && m.state_summary) ? m.state_summary
+        : (nm.kind === 'id' ? ((s.source || '(no source)') + '  ' + COST_UNTITLED_HINT) : (s.source || '(no source)'));
+      var sub = el('div', { 'class': 'facts-val' + ((m && m.state_summary) ? ' cost-summary' : ''), text: subText });
       var detail = el('div', { 'class': 'facts-detail' });
-      var row = el('div', { 'class': 'facts-row', role: 'button', tabindex: '0' }, [head, sub, metaChips, detail]);
+      var row = el('div', { 'class': 'facts-row', role: 'button', tabindex: '0' }, [head, sub, costBar(sessTokens(s)), metaChips, detail]);
       var opened = false;
       function toggle() { var o = row.classList.toggle('open'); if (o && !opened) { opened = true; expandDetail(detail, s); } }
       row.addEventListener('click', function (e) { if (e.target && e.target.closest && (e.target.closest('a') || e.target.closest('.facts-detail'))) { return; } toggle(); });
@@ -9779,13 +10186,23 @@
     function expandDetail(detail, s) {
       detail.textContent = '';
       detail.appendChild(sectionLabel('session'));
+      var dm = sessMeta(s);
       detail.appendChild(kvGrid([
+        ['title', (dm && dm.state_title) || null],
+        ['summary', (dm && dm.state_summary) || null],
+        ['saved by (actor)', (dm && dm.actor) || null],
         ['session id', s.session_id], ['source', s.source],
         ['window', (s.started_at && s.ended_at) ? (s.started_at + '  →  ' + s.ended_at) : '(no transcript window — placed at ' + (s.received_at || '?') + ')'],
         ['received', s.received_at], ['generated', s.generated_at]
       ]));
+      if (!dm) {
+        detail.appendChild(el('p', { 'class': 'ctl-desc', text: 'No saved session under this id in the session store — this cost report was posted by  corecruxctl session cost --post  without a matching save_session record, so there is no agent-given title or summary to show.' }));
+      } else if (!dm.state_title) {
+        detail.appendChild(el('p', { 'class': 'ctl-desc', text: COST_UNTITLED_HINT + ' — state.title and state.summary are optional conventions read by this lens; see the save_session tool schema.' }));
+      }
       detail.appendChild(sectionLabel('burn'));
       detail.appendChild(kvGrid([
+        ['total tokens (ctx+out)', compactN(sessTokens(s)) + '  (' + sessTokens(s) + ')  ·  bar scale 2,000,000'],
         ['context tokens (Σ)', compactN(s.context_tokens || 0) + '  (' + (s.context_tokens || 0) + ')'],
         ['output tokens (Σ)', compactN(s.output_tokens || 0) + '  (' + (s.output_tokens || 0) + ')'],
         ['context / turn', compactN(s.context_tokens_per_turn || 0)], ['assistant turns', s.assistant_turns]
@@ -9837,6 +10254,12 @@
       var kids = [el('b', { text: String(shown) }), ' shown'];
       if (state.q || state.passport || state.plan || state.minBurn || state.from || state.to) { kids.push(' (filtered)'); }
       kids.push(' · '); kids.push(el('b', { text: String(state.all.length) })); kids.push(' session report' + (state.all.length === 1 ? '' : 's') + ' posted');
+      // M21 — how many rows could be NAMED, stated plainly (the title convention
+      // is new; most historical sessions will not carry one, and pretending
+      // otherwise would be the dishonest option).
+      var named = 0;
+      state.all.forEach(function (s) { if (sessName(s).kind === 'title') { named++; } });
+      kids.push(' · '); kids.push(el('b', { text: String(named) })); kids.push(' agent-titled');
       kids.forEach(function (k) { countLine.appendChild(typeof k === 'string' ? doc().createTextNode(k) : k); });
     }
     function emptyState() {
@@ -9861,6 +10284,13 @@
       renderChart(visible); renderTotals(visible);
       listWrap.textContent = '';
       if (!visible.length) { listWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'No sessions match the filters.' })); paintCount(0); return; }
+      // The bar scale, declared once above the rows — every bar below reads
+      // against this same fixed ceiling, so row heights are comparable.
+      listWrap.appendChild(el('div', { 'class': 'cost-scale' }, [
+        el('span', { 'class': 'cost-scale-k', text: 'TOKEN BAR' }),
+        el('span', { 'class': 'cost-scale-ramp', 'aria-hidden': 'true' }),
+        el('span', { 'class': 'cost-scale-v', text: '0 → 2,000,000 tokens (ctx + out) · fixed scale · over-scale sessions clamp and are marked' })
+      ]));
       visible.forEach(function (s) { listWrap.appendChild(rowEl(s)); });
       paintCount(visible.length);
     }
@@ -9874,11 +10304,29 @@
         state.plans = map;
       });
     }
+    // Join the SESSION STORE for agent-given names. Cost reports and saved
+    // sessions are separate feeds keyed by the same logical session id, so this
+    // is a plain id join — no inference. A failed/absent feed simply leaves every
+    // row on the id fallback (the UI says so); it never blocks the cost lens.
+    function loadSessionMeta() {
+      return fetchJSON('/v1/console/sessions?include_archived=true').then(function (res) {
+        var map = {}, n = 0;
+        if (res.ok && res.data) {
+          arr(res.data.session_rows).forEach(function (r) {
+            if (!r || typeof r.session_id !== 'string') { return; }
+            map[r.session_id] = { state_title: r.state_title || null, state_summary: r.state_summary || null,
+              actor: r.actor || null, state_first_line: r.state_first_line || null };
+            n++;
+          });
+        }
+        state.meta = map; state.metaCount = n;
+      }).catch(function () { state.meta = {}; state.metaCount = 0; });
+    }
     function load() {
       if (state.loading) { return; }
       state.loading = true; state.token++; var myToken = state.token;
       listWrap.textContent = ''; listWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'loading…' }));
-      Promise.all([fetchJSON('/v1/cost/report?tenant_id=default&token_budget=4000'), loadPlans()]).then(function (rr) {
+      Promise.all([fetchJSON('/v1/cost/report?tenant_id=default&token_budget=4000'), loadPlans(), loadSessionMeta()]).then(function (rr) {
         var res = rr[0];
         if (myToken !== state.token) { return; }
         state.loading = false;

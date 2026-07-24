@@ -927,11 +927,15 @@ pub(super) async fn put_session_state(
         Err(response) => return response,
     };
     let stored_session_id = scoped_session_id_for_http(&ctx, &session_id);
+    // M21 — stamp the authenticated writer. The HTTP lane is the one place a
+    // passport is already resolved on the request (HttpScopeContext), so these
+    // writes carry an identity even where the MCP lane is anonymous.
+    let actor = ctx.passport_id.clone();
     let session = match state
         .session_store
         .write()
         .await
-        .try_put(&stored_session_id, body, None)
+        .try_put_with_actor(&stored_session_id, body, None, actor)
     {
         Ok(session) => session,
         Err(err) => return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),

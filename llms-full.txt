@@ -2528,6 +2528,43 @@ You have access to Crux, a receipted memory and retrieval backend. Use these too
 - `get_session(session_id)` — Resume from where you left off in your agent namespace.
 - `list_sessions()` — See the active sessions visible to you.
 
+### Name your sessions: `state.title` + `state.summary`
+
+Two **conventional optional keys** inside `state` are read by the console (Work › Sessions
+and Meters › Token Burn) and by any other session lens. Set them on every `save_session`:
+
+| Key | Type | What it is |
+| --- | --- | --- |
+| `state.title` | string | A short human name for the session — "M21 console round 10", not "session-42". |
+| `state.summary` | string | One paragraph on what happened and where the work stands. |
+
+```json
+{ "session_id": "console-m21",
+  "state": { "title": "Console round 10 (M21)",
+             "summary": "Accordion icons + graph LOD anchor fixed; cost bars next.",
+             "decisions": ["LOD switch preserves the pointer anchor"] } }
+```
+
+Both are optional and the daemon never requires them. When `title` is absent the console
+falls back to the first conventional state line (`decisions[0]` / `note` / `context_summary` /
+`summary`) and then to a short id, and labels the row **untitled** — so an unnamed session is
+visibly unnamed rather than silently anonymous. Everything else in `state` stays opaque and
+is preserved verbatim.
+
+### Session identity is stamped for you
+
+`save_session` records the authenticated writer on the session itself (`actor`) — you do not
+pass it. Resolution matches `store_fact`'s `actor`: the agent token-name, upgraded to a
+passport_id when `CORECRUXD_AGENT_PASSPORTS=1`. A daemon with no `CRUX_AGENT_TOKENS`
+configured has no identity to stamp, so `actor` is absent there; it is never guessed, and
+there is no backfill for sessions written before the stamp existed.
+
+Note that `actor` is **not** a plan link. `passport_id` / `execplan_slug` on a console session
+row come from session *bindings* and live coord *intents*, both keyed by the sealed-plan
+`session_id_hex` minted by `POST /session`. Agent `save_session` ids live in a disjoint key
+space (`__agent_session::<agent>::<slug>`), so they never match those joins — announce with
+`coord_announce` if you want your session to appear against an ExecPlan.
+
 ### PreCompact crash recovery
 When the `crux-claude-hooks` PreCompact subcommand is installed (see [crates/crux-claude-hooks/README.md](../crates/crux-claude-hooks/README.md)), the harness calls `save_session` automatically before context compaction with `session_id = "hook:session:<claude-session-id>"`. The persisted `state.recovery` object captures the anchors needed to resume mid-ExecPlan:
 ```json

@@ -389,12 +389,23 @@
       return { strip: stage, risk: w.risk_class || null, slug: planSlug(w), title: w.title || w.id,
         milestone: w.current_milestone || null, pct: pct, prog: total ? (done + '/' + total) : null,
         passport: w.assignee_passport || null, note: w.linked_pr || null,
+        // M21 — sort keys carried onto the card so the board's sort control has
+        // real values to order by. `hasProg` is the honesty flag: only plans that
+        // report milestones_total can be ordered by completion (see the sort note).
+        updated: Number(w.updated_at_unix_ms) || 0, created: Number(w.created_at_unix_ms) || 0,
+        pctSort: pct, hasProg: !!total,
         graph: graphLink('work', w.id) };   // cross-feature launch → the relation graph, focused on this plan
     };
     var columns = KANBAN_COLS.map(function (st) {
       return { key: st[0], title: st[1], cards: items.filter(function (w) { return workStageOf(w) === st[0]; }).map(card) };
     });
-    return [{ h: 'ExecPlans', sub: head.sub, wide: true, controls: [{ t: 'search', ph: 'Filter plans…' }, { t: 'kanban', columns: columns }] }];
+    var withProg = items.filter(function (w) { return !!w.milestones_total; }).length;
+    return [{ h: 'ExecPlans', sub: head.sub, wide: true, controls: [
+      { t: 'search', ph: 'Filter plans…' },
+      // M21 — `board: 'work'` opts this kanban into the state-chip + sort toolbar,
+      // persisted under crux.console.board.work.*.
+      { t: 'kanban', board: 'work', columns: columns, total: items.length, withProgress: withProg }
+    ] }];
   }
 
   function buildGates(res) {

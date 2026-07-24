@@ -844,18 +844,35 @@ pub fn list_tools_with_flags(
         ToolDefinition {
             name: "save_session".to_string(),
             description: "Create or update your session state. Authenticated agents write \
-                          into their own session namespace."
+                          into their own session namespace. The writer's identity is stamped \
+                          onto the record automatically (no argument) — anonymous callers \
+                          store no identity rather than a guessed one. CONVENTION: give the \
+                          session a human `title` and a one-paragraph `summary` inside `state` \
+                          so the console can name it; without them it shows as an opaque id."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "session_id":   { "type": "string",  "description": "Session identifier" },
-                    "state":        { "type": "object",  "description": "Arbitrary JSON state to persist" },
+                    "state":        {
+                        "type": "object",
+                        "description": "Arbitrary JSON state to persist. Two CONVENTIONAL optional keys are read by the console \
+                                        and every other session lens — set them on every save: `title` (a short human name for what \
+                                        this session is, e.g. 'M21 console round 10') and `summary` (one paragraph on where the work \
+                                        stands). Both are plain strings and entirely optional; when absent the console falls back to \
+                                        the first conventional state line (decisions[0] / note / context_summary / summary) and then \
+                                        to a short id, and labels the row as untitled. Everything else in the object is opaque to the \
+                                        daemon and preserved verbatim.",
+                        "properties": {
+                            "title":   { "type": "string", "description": "Conventional: short human name for this session." },
+                            "summary": { "type": "string", "description": "Conventional: one paragraph on what happened / where it stands." }
+                        }
+                    },
                     "ttl_seconds":  { "type": "integer", "description": "Optional time-to-live in seconds. Session expires after this duration." }
                 },
                 "required": ["session_id", "state"],
                 "examples": [
-                    { "session_id": "session-42", "state": { "decisions": ["Use PostgreSQL"], "open_questions": ["Which cache?"] } },
+                    { "session_id": "session-42", "state": { "title": "Postgres cutover spike", "summary": "Chose PostgreSQL; cache layer still open. Next: benchmark pgbouncer.", "decisions": ["Use PostgreSQL"], "open_questions": ["Which cache?"] } },
                     { "session_id": "session-42", "state": { "step": 1 }, "ttl_seconds": 3600 }
                 ]
             }),

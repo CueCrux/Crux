@@ -2397,6 +2397,15 @@ pub(super) async fn get_console_sessions(
                     total_tokens: session.total_tokens,
                     expires_at: session.expires_at.map(|t| t.to_rfc3339()),
                     state_first_line: session_state_first_line(&session.state),
+                    // M21 — the conventional agent-authored name + summary
+                    // (`state.title` / `state.summary`, documented on the
+                    // `save_session` tool schema). Absent on every session written
+                    // before the convention existed; the console says so rather
+                    // than inventing a name.
+                    state_title: session_state_str(&session.state, "title"),
+                    state_summary: session_state_str(&session.state, "summary"),
+                    // M21 — identity stamped at write time (see SessionState::actor).
+                    actor: session.actor.clone(),
                 }
             })
             .collect();
@@ -2444,6 +2453,9 @@ pub(super) async fn get_console_sessions(
                 "total_tokens": b.total_tokens,
                 "expires_at": b.expires_at,
                 "state_first_line": b.state_first_line,
+                "state_title": b.state_title,
+                "state_summary": b.state_summary,
+                "actor": b.actor,
                 "passport_id": binding.map(|x| x.passport_id.clone()),
                 "passport_category": binding.map(|x| x.passport_category.clone()),
                 "execplan_slug": intent.and_then(|x| x.execplan_slug.clone()),
@@ -2458,6 +2470,53 @@ pub(super) async fn get_console_sessions(
             .unwrap_or(0)
             .cmp(&a["last_active_unix_ms"].as_i64().unwrap_or(0))
     });
+    // M21 — SESSION ALLOCATION, counted server-side over every listed row (before
+    // the 100-row display truncation, so the numbers describe the store and not
+    // the page). This exists because the honest answer to "why do so many sessions
+    // lack a passport / plan?" needs a measurement, not an anecdote:
+    //
+    //  * `passport_id`/`execplan_slug` come from session BINDINGS and live coord
+    //    INTENTS, both keyed by a sealed-plan `session_id_hex` ULID minted by
+    //    POST /session. Agent `save_session` ids live in a DISJOINT key space
+    //    (`__agent_session::<agent>::<slug>`), so they can never match — this is a
+    //    key-space fact, not a bug, and the count makes it legible.
+    //  * `actor` is the write-time identity stamp. It is `None` for anonymous
+    //    callers (a daemon with no CRUX_AGENT_TOKENS — the default local posture)
+    //    and for every session written before the stamp existed. There is no
+    //    backfill pass, so `actor_pre_stamp_or_anonymous` will stay non-zero.
+    let alloc_total = rows.len();
+    let count_present =
+        |key: &str| -> usize { rows.iter().filter(|r| r.get(key).is_some_and(|v| !v.is_null())).count() };
+    let with_actor = count_present("actor");
+    let with_agent = count_present("agent");
+    let with_binding = count_present("passport_id");
+    let with_intent = count_present("execplan_slug");
+    let with_title = count_present("state_title");
+    let with_any_identity = rows
+        .iter()
+        .filter(|r| !r["actor"].is_null() || !r["agent"].is_null() || !r["passport_id"].is_null())
+        .count();
+    let with_any_plan_link = rows
+        .iter()
+        .filter(|r| !r["execplan_slug"].is_null() || !r["passport_id"].is_null())
+        .count();
+    let allocation = serde_json::json!({
+        "counted": alloc_total,
+        "with_actor": with_actor,
+        "with_agent_from_key_prefix": with_agent,
+        "with_any_identity": with_any_identity,
+        "no_identity": alloc_total.saturating_sub(with_any_identity),
+        "with_passport_binding": with_binding,
+        "with_live_execplan_intent": with_intent,
+        "with_any_plan_link": with_any_plan_link,
+        "no_plan_link": alloc_total.saturating_sub(with_any_plan_link),
+        "with_agent_title": with_title,
+        "no_agent_title": alloc_total.saturating_sub(with_title),
+        "why": "passport_id/execplan_slug are keyed by the sealed-plan session_id_hex minted by POST /session; \
+                agent save_session ids are a disjoint key space (__agent_session::<agent>::<slug>) and never match. \
+                actor is stamped at write time and is absent for anonymous callers and for sessions written before the stamp.",
+    });
+
     if rows.len() > 100 {
         rows.truncate(100);
     }
@@ -2475,6 +2534,7 @@ pub(super) async fn get_console_sessions(
             "include_archived": query.include_archived,
             "sessions": session_ids,
             "session_rows": rows,
+            "allocation": allocation,
             "state_preview": "first_line",
             "raw_state_exposed": false
         })),
@@ -2499,6 +2559,39 @@ struct SessionRowBase {
     total_tokens: usize,
     expires_at: Option<String>,
     state_first_line: Option<String>,
+    /// Conventional `state.title` — the agent-given human name for the session.
+    state_title: Option<String>,
+    /// Conventional `state.summary` — one paragraph on where the work stands.
+    state_summary: Option<String>,
+    /// Identity stamped onto the record at write time (`SessionState::actor`).
+    /// `None` for anonymous writers and for every session written before the
+    /// field existed — there is no backfill and none is invented.
+    actor: Option<String>,
+}
+
+/// Read one CONVENTIONAL top-level string field out of a session `state` blob,
+/// clipped like the first-line preview. Same redaction stance as
+/// [`session_state_first_line`]: named conventional keys only, never an
+/// arbitrary-leaf walk, so an agent's stashed secret can never ride the list.
+fn session_state_str(state: &serde_json::Value, field: &str) -> Option<String> {
+    let s = state.as_object()?.get(field)?.as_str()?;
+    clip_preview(s, 240)
+}
+
+/// Collapse whitespace and clip to `max` chars with an ellipsis. Empty → `None`.
+fn clip_preview(s: &str, max: usize) -> Option<String> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let one_line: String = t.split_whitespace().collect::<Vec<_>>().join(" ");
+    Some(if one_line.chars().count() > max {
+        let mut out: String = one_line.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    } else {
+        one_line
+    })
 }
 
 /// Server-derived short (≤140 char) preview of a session `state` blob. Picks the
@@ -2514,18 +2607,7 @@ struct SessionRowBase {
 /// safe preview. The full blob is exposed only by the admin-read detail route.
 fn session_state_first_line(state: &serde_json::Value) -> Option<String> {
     fn clip140(s: &str) -> Option<String> {
-        let t = s.trim();
-        if t.is_empty() {
-            return None;
-        }
-        let one_line: String = t.split_whitespace().collect::<Vec<_>>().join(" ");
-        Some(if one_line.chars().count() > 140 {
-            let mut out: String = one_line.chars().take(139).collect();
-            out.push('…');
-            out
-        } else {
-            one_line
-        })
+        clip_preview(s, 140)
     }
     // Convention-only: the fields agents write by habit (see session_store tests
     // + CLAUDE.md fact conventions). No arbitrary-leaf fallback — see the doc note.
@@ -2650,6 +2732,9 @@ pub(super) async fn get_console_session_detail(
         "total_tokens": session.total_tokens,
         "expires_at": session.expires_at.map(|t| t.to_rfc3339()),
         "state_first_line": session_state_first_line(&session.state),
+        "state_title": session_state_str(&session.state, "title"),
+        "state_summary": session_state_str(&session.state, "summary"),
+        "actor": session.actor,
         "passport_id": binding.as_ref().map(|b| b.passport_id.clone()),
         "passport_category": binding.as_ref().map(|b| b.passport_category.clone()),
         "execplan_slug": coord_intent.as_ref().and_then(|i| i.execplan_slug.clone()),
@@ -3765,6 +3850,68 @@ mod session_detail_tests {
         // No binding / coord intent for this session → honest null.
         assert!(row["passport_id"].is_null());
         assert!(row["execplan_slug"].is_null());
+    }
+
+    #[tokio::test]
+    async fn list_carries_actor_title_summary_and_allocation() {
+        // M21 — the three new row fields plus the server-computed allocation
+        // block. The point of the block is that "why is so much unlinked?" has a
+        // measured answer: two of these three sessions carry no identity at all,
+        // and none of them can carry a plan link because agent session ids are a
+        // different key space from the sealed-plan hex the joins use.
+        let state = st();
+        {
+            let mut store = state.session_store.write().await;
+            // (a) titled + summarised + stamped, written through the actor path.
+            store.put_with_actor(
+                "__agent_session::anthropic::named",
+                json!({ "title": "M21 console round 10", "summary": "Accordion icons and the LOD anchor fix landed." }),
+                None,
+                Some("claude-work".to_string()),
+            );
+            // (b) anonymous, conventional first line only.
+            store.put("anon-one", json!({ "note": "resume here" }), None);
+            // (c) anonymous, nothing conventional at all.
+            store.put("anon-two", json!({ "n": 1 }), None);
+        }
+        let resp = get_console_sessions(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(ConsoleSessionsQuery {
+                include_archived: false,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+
+        let rows = body["session_rows"].as_array().unwrap();
+        let named = rows.iter().find(|r| r["session_id"] == "named").unwrap();
+        assert_eq!(named["actor"], "claude-work");
+        assert_eq!(named["state_title"], "M21 console round 10");
+        assert_eq!(named["state_summary"], "Accordion icons and the LOD anchor fix landed.");
+        assert_eq!(named["agent"], "anthropic");
+
+        let anon = rows.iter().find(|r| r["session_id"] == "anon-two").unwrap();
+        assert!(anon["actor"].is_null(), "anonymous writers stamp nothing");
+        assert!(anon["state_title"].is_null());
+        assert!(anon["state_summary"].is_null());
+        assert!(anon["state_first_line"].is_null());
+
+        let a = &body["allocation"];
+        assert_eq!(a["counted"], 3);
+        assert_eq!(a["with_actor"], 1);
+        assert_eq!(a["with_agent_from_key_prefix"], 1); // only the scoped key carries one
+        assert_eq!(a["with_any_identity"], 1);
+        assert_eq!(a["no_identity"], 2);
+        assert_eq!(a["with_agent_title"], 1);
+        assert_eq!(a["no_agent_title"], 2);
+        // Disjoint key spaces: no agent session id can match a sealed-plan hex.
+        assert_eq!(a["with_passport_binding"], 0);
+        assert_eq!(a["with_live_execplan_intent"], 0);
+        assert_eq!(a["no_plan_link"], 3);
+        assert!(a["why"].as_str().unwrap().contains("disjoint key space"));
     }
 
     #[tokio::test]

@@ -1292,10 +1292,20 @@ function extractThemeVars(theme) {
   check((pages.DESTS || []).some(function (d) { return d.id === 'canvas'; }), '[canvas] pages.DESTS must carry the "canvas" destination');
   check(typeof render.renderCanvas === 'function', '[canvas] render.js must export renderCanvas');
   check(/window\.CruxRender\.renderCanvas/.test(shellHtml) && /destId === 'canvas'/.test(shellHtml), '[canvas] shell.html must route the canvas destination to render.renderCanvas');
-  check(/data-view/.test(renderSrc) && /\['board', 'Board'\]/.test(renderSrc) && /\['graph', 'Graph'\]/.test(renderSrc) && renderSrc.indexOf("'#/canvas/' + vid") >= 0,
-    '[canvas] Canvas must carry a Board|Graph view switch (deep-linkable #/canvas/<view>)');
+  // M21 RETARGET (was: "Canvas must carry a Board|Graph view switch"). M19/M20
+  // moved Board, Graph and Tree into the Rings tab hub and left Canvas as
+  // Studio's route-only home, so three of the four segmented buttons pointed at
+  // views that no longer live here; M21 removed the control and promoted the
+  // Studio's OWN sections (Board · Pages · Integrations) in its place. What is
+  // still true and worth gating: renderCanvas must still RESOLVE every legacy
+  // view (a #/w/ workspace page of type canvas/board|graph|tree renders through
+  // it), and the segmented control must be GONE — no dead #/canvas/<view> links.
+  check(/ctx\.view === 'graph'/.test(renderSrc) && /ctx\.view === 'tree'/.test(renderSrc) && /ctx\.view === 'studio'/.test(renderSrc),
+    '[canvas] renderCanvas must still resolve the board/graph/tree/studio views (workspace page types depend on it)');
+  check(renderSrc.indexOf("'#/canvas/' + vid") < 0 && !/canvas-seg', role: 'group', 'aria-label': 'Canvas view'/.test(renderSrc),
+    '[canvas] the Board|Graph|Tree|Studio segmented control must be GONE (M21 — those views live in the Rings tab hub)');
   check(/setTimeout\(paint, 200\)/.test(renderSrc), '[canvas] the board must recompose on a debounced resize');
-  notes.push('canvas board: canvasTier xs/s/m/l/xl truth table + ' + (widgets ? widgets.length : 0) + '-widget registry (xs' + upTo('xs') + '·s' + upTo('s') + '·m' + upTo('m') + '·l' + upTo('l') + '·xl' + upTo('xl') + '); Board|Graph deep-linkable.');
+  notes.push('canvas board: canvasTier xs/s/m/l/xl truth table + ' + (widgets ? widgets.length : 0) + '-widget registry (xs' + upTo('xs') + '·s' + upTo('s') + '·m' + upTo('m') + '·l' + upTo('l') + '·xl' + upTo('xl') + '); M21 — the Board|Graph|Tree|Studio segmented control is retired (those views are Rings tabs), renderCanvas still resolves every view for workspace page types.');
 })();
 
 // =========================================================================
@@ -2688,8 +2698,12 @@ function extractThemeVars(theme) {
     '[plan-tree] renderPlanTree must read /v1/coord/active for announced focus + leases');
   check(!/\bfetch\s*\(/.test(renderPlanTreeBody),
     '[plan-tree] renderPlanTree must not raw-fetch — api.js is the sole network layer');
-  check(/\['tree', 'Tree'\]/.test(renderSrc) && /renderPlanTree\(body, ctx\)/.test(renderSrc),
-    '[plan-tree] Canvas must carry a Tree view switch dispatching to renderPlanTree');
+  // M21 RETARGET (was: "Canvas must carry a Tree view switch"). The Tree's home
+  // is the Rings tab hub since M19; M21 deleted the Canvas segmented control. The
+  // dispatch itself must survive — #/canvas/tree and workspace pages of type
+  // canvas/tree still resolve through renderCanvas.
+  check(/ctx\.view === 'tree'/.test(renderSrc) && /renderPlanTree\(body, ctx\)/.test(renderSrc),
+    '[plan-tree] renderCanvas must still dispatch the tree view to renderPlanTree');
   check(/parts\[1\] === 'tree'/.test(shellHtml),
     '[plan-tree] shell.html parseCanvasHash must route #/canvas/tree to the Tree view');
 
@@ -2822,8 +2836,14 @@ function extractThemeVars(theme) {
   check(/CRUX_GET_ROUTES/.test(region), '[studio] the API-tile route picker must validate against the generated client route list');
 
   // ---- (c) registry / nav wiring -----------------------------------------
-  check(/\['studio', 'Studio'\]/.test(renderSrc) && /renderTileStudio\(body, ctx\)/.test(renderSrc),
-    '[studio] Canvas must carry a Studio view switch dispatching to renderTileStudio');
+  // M21 RETARGET (was: "Canvas must carry a Studio view switch"). Inside the
+  // Studio the primary control is now the Studio's own sections; the Studio is
+  // no longer one tab of a four-view switch. Gate the dispatch + the new control.
+  check(/ctx\.view === 'studio'/.test(renderSrc) && /renderTileStudio\(body, ctx\)/.test(renderSrc),
+    '[studio] renderCanvas must dispatch the studio view to renderTileStudio');
+  check(/canvas-subseg', role: 'group', 'aria-label': 'Studio section'/.test(renderSrc)
+    && /\['board', 'Board'\], \['pages', 'Pages'\], \['integrations', 'Integrations'\]/.test(renderSrc),
+    '[studio] the Studio must expose its OWN sections (Board · Pages · Integrations) as the primary control');
   check(/parts\[1\] === 'studio'/.test(shellHtml), '[studio] shell.html parseCanvasHash must route #/canvas/studio to the Studio view');
   check(/'canvas:studio'/.test(renderSrc), '[studio] the site map must carry a canvas:studio node');
 
@@ -3995,6 +4015,143 @@ function extractThemeVars(theme) {
   check(/ledgerRows\.push\(\{ x: LEDGER_X/.test(renderSrc),
     '[m20] the ledger hit-test rects must match the drawn rows (click-to-solo stays aligned)');
   notes.push('operator round 9 (M20): the nine Rings views moved OUT of the main pane INTO the left nav as an accordion group (buildNavGroup/syncRailAccordion; one group open — the active destination\'s; height+opacity ease, reduced-motion snap), applied to BOTH the built-in and workspace rails; the topbar sub-nav PILL ROW is removed console-wide (buildSubnav + buildWorkspaceSubnav deleted) — accordion expanded / flyout collapsed, both off ONE railGroupItems list; a Rings row drives the SAME in-place fade swap via CruxRender.ringsSetTab + replaceState (a hashchange would re-route and kill the fade), and the topbar tab icons are gone; RINGS IS THE INDEX (DESTS[0], key 1, boot + "#/" land there) and Overwatch is retired to a railHidden route-only registry entry with every #/overwatch route redirected to its Rings equivalent (renderers kept — they ARE the tabs), plus sitemap/start-path/workspace-builtin/phone-tab retargets; the canvas graph zoom is ANCHORED AT THE POINTER (zoomAtPoint: t\' = s - (s - t)·k) and the Overview element is rebuilt as a compact bottom-left glass chip (LOD state + zoom %, native, var(--) tokens) over a stage that now fills the tab host; the rings bottom bar is one non-wrapping row and the top bar takes the same measure + midline; the completed-plans list starts clear of the vertical left toolbar, measured from its live geometry.');
+})();
+
+// =========================================================================
+//  M21 — operator round 10: accordion icons · graph LOD anchor · session
+//  allocation · ExecPlan list filter+sort · board edit mode · Studio sections ·
+//  settings spacing + upward settings accordion · cx-cost titles + token bars.
+// =========================================================================
+(function m21OperatorRound10() {
+  // ---- (1) accordion sub-page icons, shared by BOTH rail states -----------
+  check(/function navPageGlyph\(pageId\)/.test(shellHtml) && /var NAV_PAGE_PATHS = \{/.test(shellHtml),
+    '[m21] shell.html must carry a per-page nav glyph map + navPageGlyph resolver');
+  check(/icon: navPageGlyph\(p\.id\)/.test(shellHtml) && /icon: navPageGlyph\(p\.type\)/.test(shellHtml),
+    '[m21] BOTH railGroupItems and workspaceGroupItems must resolve a per-page mark (one list feeds accordion + flyout)');
+  check(!/icon: NAV_SUB_GLYPH, current:/.test(shellHtml),
+    '[m21] no item list may still hard-code the placeholder dot as its icon');
+  // Reuse rule: pages whose mark the ICONS registry already owns must NOT be redrawn.
+  ['cx-settings', 'cx-integrations', 'cx-workbench', 'cx-passport', 'cx-raw', 'dx-docs'].forEach(function (id) {
+    check(new RegExp("'" + id + "': '").test(shellHtml.slice(shellHtml.indexOf('var NAV_PAGE_ICON_REF'), shellHtml.indexOf('function navPageGlyph'))),
+      '[m21] ' + id + ' must reuse its existing ICONS entry, not a second drawing');
+  });
+  // Every registry page id should resolve to a real mark (map or ICONS ref).
+  (function () {
+    var mapped = {};
+    var seg = shellHtml.slice(shellHtml.indexOf('var NAV_PAGE_PATHS'), shellHtml.indexOf('function navPageGlyph'));
+    (seg.match(/'([a-z0-9-]+)':/g) || []).forEach(function (m) { mapped[m.slice(1, -2)] = true; });
+    var missing = Object.keys(pages.PAGES || {}).filter(function (id) { return !mapped[id]; });
+    check(missing.length === 0, '[m21] every registry page needs a nav mark; missing: ' + missing.join(','));
+  })();
+
+  // ---- (2) graph zoom: the LOD cut must PRESERVE the viewpoint ------------
+  var switchBody = funcBody(renderSrc, 'switchMode') || '';
+  check(switchBody.length > 0, '[m21] switchMode must be locatable');
+  check(!/var f = frame\(activeDims\); view\.scale = f\.scale/.test(switchBody),
+    '[m21] switchMode must NOT re-frame to fit on a LOD cut (that reset the operator zoom to the top-left)');
+  check(/function switchMode\(next, anchor\)/.test(renderSrc),
+    '[m21] switchMode must take the anchor the zoom was performed around');
+  check(/var wx = \(ax - view\.tx\) \/ view\.scale, wy = \(ay - view\.ty\) \/ view\.scale;/.test(switchBody)
+    && /view\.tx = ax - rx \* view\.scale; view\.ty = ay - ry \* view\.scale;/.test(switchBody),
+    '[m21] switchMode must re-pin the anchor world point after the cut');
+  check(/switchMode\('ring', \{ x: sx, y: sy \}\)/.test(renderSrc) && /switchMode\('card', \{ x: sx, y: sy \}\)/.test(renderSrc),
+    '[m21] zoomAtPoint must hand its own anchor to switchMode');
+  check(/function lodBounds\(m\)/.test(renderSrc) && !/var b = \(mode === 'ring'\) \? \{ min: 0\.03/.test(renderSrc),
+    '[m21] the per-mode zoom bounds must be ONE function shared by zoomAtPoint + switchMode');
+  check(/window\.__cvZoomProbe = function \(key\)/.test(renderSrc) && /window\.__cvZoomAt = function/.test(renderSrc),
+    '[m21] the graph must expose dev-gated zoom probes so the anchor claim is assertable, not eyeballed');
+
+  // ---- (3) session allocation: actor stamp + honest counts ---------------
+  check(/state_title/.test(renderSrc) && /state_summary/.test(renderSrc) && /\bactor\b/.test(renderSrc),
+    '[m21] the console must consume the new session row fields');
+  check(/function paintAllocation\(a\)/.test(renderSrc) && /res\.data\.allocation/.test(renderSrc),
+    '[m21] the sessions browser must render the daemon-computed allocation block');
+  check(/if \(!a \|\| typeof a\.counted !== 'number'\) \{ allocWrap\.textContent = '';/.test(renderSrc)
+    || /if \(!a \|\| typeof a\.counted !== 'number'\) \{ allocWrap\.hidden = true; return; \}/.test(renderSrc),
+    '[m21] an older daemon (no allocation block) must hide the panel, never paint zeros');
+  check(/identity stamped on this record at write time/.test(renderSrc),
+    '[m21] the actor chip must say what it is (write-time stamp, not an inference)');
+
+  // ---- (4) ExecPlan list: state chips + sort, persisted -------------------
+  check(/var KANBAN_SORTS = \[/.test(renderSrc) && /\['completion', 'Completion · most done'\]/.test(renderSrc),
+    '[m21] the board must offer date / A→Z / completion sorts');
+  check(/function kanbanReadHidden\(boardId, cols\)/.test(renderSrc) && /function kanbanWriteSort\(boardId, sort\)/.test(renderSrc)
+    && /KANBAN_LS = 'crux\.console\.board\.'/.test(renderSrc),
+    '[m21] state-chip + sort choices must persist in localStorage, keyed per board');
+  check(/board: 'work', columns: columns, total: items\.length, withProgress: withProg/.test(pagesSrc),
+    '[m21] buildWork must opt the ExecPlan list into the board controls and report how many plans have milestone counts');
+  check(/updated: Number\(w\.updated_at_unix_ms\) \|\| 0, created: Number\(w\.created_at_unix_ms\) \|\| 0/.test(pagesSrc),
+    '[m21] the sort keys must come from real /v1/work timestamps');
+  check(/if \(!!a\.hasProg !== !!b\.hasProg\) \{ return a\.hasProg \? -1 : 1; \}/.test(renderSrc),
+    '[m21] completion sort must place plans WITHOUT milestone counts last (no invented progress)');
+  check(/plans report milestone counts — the rest sort last/.test(renderSrc),
+    '[m21] the completion metric must state its coverage honestly');
+  check(/if \(!kbHidden\[col\.key\] && shown\.length <= 1\) \{ return; \}/.test(renderSrc),
+    '[m21] the last visible column must not be hideable');
+
+  // ---- (5) board edit mode + expanded-card close -------------------------
+  var tileBody = funcBody(renderSrc, 'renderTileCanvas') || '';
+  check(/var editMode = false;/.test(tileBody), '[m21] a tile board must open LOCKED');
+  check(/if \(!editMode\) \{ return; \}   \/\/ M21 — locked board: reading never moves a tile/.test(tileBody),
+    '[m21] tile drag must be refused while the board is locked');
+  check(/if \(!editMode \|\| expandedId\) \{ return; \}/.test(tileBody),
+    '[m21] the resize handle must be inert while the board is locked');
+  check(/'data-tb': 'edit', 'aria-pressed': 'false'/.test(tileBody),
+    '[m21] the board toolbar must carry an explicit Edit toggle');
+  check(/\.cvx-surface\.is-locked \.cvx-node \{ cursor: pointer; \}/.test(shellHtml)
+    && /\.cvx-surface\.is-editing \.cvx-node:not\(\[data-fixed="1"\]\) \{ cursor: move; \}/.test(shellHtml),
+    '[m21] the locked board must not show move cursors');
+  check(/'class': 'cvx-expclose'/.test(tileBody) && /\.cvx-node\.cvx-exp \.cvx-expclose \{ display: inline-flex; \}/.test(shellHtml),
+    '[m21] an expanded card must carry a top-right X close');
+  // The Studio is a separate editor — its own behaviour must not be gated by this.
+  check(!/editMode/.test(funcBody(renderSrc, 'renderTileStudio') || ''),
+    '[m21] the Studio (an inherent editor) must be untouched by the board lock');
+
+  // ---- (7) settings spacing ----------------------------------------------
+  check(/'class': 'v2grid settings-prefs'/.test(shellHtml),
+    '[m21] the Density + Theme cards must live in a grid, not as bare siblings');
+  check(/\.settings-page \{ display: flex; flex-direction: column; gap: 14px; \}/.test(shellHtml),
+    '[m21] Settings must have ONE vertical rhythm between its bands');
+  check(/:root\[data-mode="professional"\] \.settings-page \{ gap: 10px; \}/.test(shellHtml),
+    '[m21] the professional density must carry the settings gap too');
+
+  // ---- (8) settings sub-page accordion, opening upward from the footer ----
+  check(/function buildSettingsFooterNav\(\)/.test(shellHtml) && /id="railFooterNav"/.test(shellHtml),
+    '[m21] the System sub-pages must return as a footer accordion');
+  check(/buildNavGroup\(host, btn, 'system', items\)/.test(shellHtml),
+    '[m21] the footer accordion must reuse the SAME buildNavGroup idiom as the rail');
+  check(/\.rail-footer-nav \.nav-group \{ display: flex; flex-direction: column-reverse; \}/.test(shellHtml),
+    '[m21] the footer group must open UPWARD off the settings button');
+  check(/:root\[data-rail="collapsed"\] \.rail-footer-nav \{ display: none; \}/.test(shellHtml)
+    && /function acctSyncSystemRows\(\)/.test(shellHtml),
+    '[m21] collapsed rail: the account popup must carry the same System pages');
+  check(/var items = railIsCollapsed\(\) \? railGroupItems\('system'\) : \[\];/.test(shellHtml),
+    '[m21] the popup System list must come from the SAME railGroupItems source (one list, two presentations)');
+  check(/buildSettingsFooterNav\(\);   \/\/ M21/.test(shellHtml),
+    '[m21] both rail builders must (re)build the footer accordion');
+  check(/function settingsFooterSig\(\)/.test(shellHtml) && /refreshSettingsFooterNav\(\); \}\n    if \(activeKey === undefined\)/.test(shellHtml),
+    '[m21] the footer list must refresh when the System page SET changes, so both rail states never disagree');
+
+  // ---- (9) cx-cost titles + gradient token bars ---------------------------
+  var costBody = funcBody(renderSrc, 'renderCostBrowser') || '';
+  check(/var COST_BAR_MAX = 2000000;/.test(costBody), '[m21] the token bar must use a FIXED 2,000,000-token scale');
+  check(/function costBar\(tokens\)/.test(costBody) && /var over = tokens > COST_BAR_MAX;/.test(costBody),
+    '[m21] sessions past the ceiling must clamp and be marked, not rescale the scale');
+  check(/'class': 'cost-tbar-maxline'/.test(costBody) && /0 → 2,000,000 tokens \(ctx \+ out\) · fixed scale/.test(costBody),
+    '[m21] the max line + its label must be visible');
+  check(/fill\.style\.backgroundSize = \(10000 \/ pct\) \+ '% 100%'/.test(costBody),
+    '[m21] the gradient must be stretched to the whole track so colour tracks MAGNITUDE, not bar length');
+  check(/if \(m && m\.state_title\) \{ return \{ text: m\.state_title, kind: 'title' \}; \}/.test(costBody)
+    && /if \(m && m\.state_first_line\) \{ return \{ text: m\.state_first_line, kind: 'first_line' \}; \}/.test(costBody)
+    && /return \{ text: shortId\(s\.session_id\), kind: 'id' \};/.test(costBody),
+    '[m21] the cost row name must fall back title → state_first_line → short id');
+  check(/COST_UNTITLED_HINT = '\(untitled — agents: set title\/summary in save_session state\)'/.test(costBody),
+    '[m21] an unnamed session must say so, and say what to set');
+  check(/function loadSessionMeta\(\)/.test(costBody) && /fetchJSON\('\/v1\/console\/sessions\?include_archived=true'\)/.test(costBody),
+    '[m21] cx-cost must join the session store for the agent-given name');
+  check(!/\bfetch\s*\(/.test(costBody), '[m21] cx-cost must not raw-fetch');
+
+  notes.push('operator round 10 (M21): accordion + collapsed-flyout rows carry PER-PAGE marks off one NAV_PAGE_PATHS map (registry-owned marks reused, never redrawn); the graph LOD cut PRESERVES the viewpoint — switchMode no longer re-frames to fit (which is what threw the layer to (pad,pad) = the reported top-left jump at ~60%) but re-pins the cursor world point and carries the current scale, with dev-gated __cvZoomProbe/__cvZoomAt so the claim is measured; save_session now stamps the write-time actor (scope_identity, None for anonymous) and documents state.title/state.summary, /v1/console/sessions returns actor + state_title/state_summary + a server-computed allocation block and the console paints it (hidden, not zeroed, on an older daemon); the ExecPlan board gained persisted state chips + date/A→Z/completion sorts (completion states its coverage and sinks unmeasured plans); tile boards open LOCKED with an explicit Edit toggle arming move+resize and expanded cards carry a top-right X (the Studio, an inherent editor, is untouched); the Canvas segmented control is replaced by the Studio\'s own Board·Pages·Integrations; Settings gets one vertical rhythm (its two JS cards moved into a grid) and the System sub-pages return as an UPWARD accordion off the rail footer (collapsed: the same list in #acctPop); cx-cost rows show the agent title + summary with an honest fallback chain and a per-session gradient bar on a fixed 2M scale with a visible max line.');
 })();
 
 // ---- Report (awaits async renderer-driven checks) -----------------------
