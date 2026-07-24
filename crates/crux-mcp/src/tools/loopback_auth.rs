@@ -49,6 +49,7 @@ const LOOPBACK_SCOPES: &[&str] = &[
     "admin:write",
     "facts:write",
     "query:read",
+    "receipts:read",
     "sessions:read",
 ];
 
@@ -410,6 +411,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn loopback_scopes_cover_receipt_verification() {
+        // The receipt_verify tool's loopback GET requires receipts:read;
+        // under JWT auth modes header scopes are ignored, so the claim set
+        // must carry it (mcp-tool-usage-analytics follow-up, 2026-07-24).
+        assert!(LOOPBACK_SCOPES.contains(&"receipts:read"));
     }
 
     #[test]

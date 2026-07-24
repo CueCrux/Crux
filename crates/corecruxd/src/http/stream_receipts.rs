@@ -1159,4 +1159,50 @@ mod tests {
         }
         assert!(read_usage_records(&state_off, "operator").is_empty());
     }
+    #[test]
+    fn local_stream_receipt_verification_roundtrip() {
+        let state = signing_state();
+        let minted = mint_stream_receipt(&state, "operator", &injected_draft()).expect("mint");
+
+        let found = crate::http::receipts::local_stream_receipt_verification(&state, &minted.receipt_id)
+            .expect("resolve")
+            .expect("receipt found in mediation logs");
+        assert_eq!(found.tenant_id, "local", "stream receipts mint under the local tenant");
+        assert!(found.verification.signature_valid, "daemon-signed receipt verifies");
+        assert_eq!(found.verification.error_code, "OK");
+        assert_eq!(found.verification.receipt_id, minted.receipt_id);
+
+        // Unknown id resolves to None, not an error.
+        let missing =
+            crate::http::receipts::local_stream_receipt_verification(&state, "r_does-not-exist").expect("resolve");
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn local_stream_receipt_verification_rejects_tampered_log() {
+        let state = signing_state();
+        let minted = mint_stream_receipt(&state, "operator", &injected_draft()).expect("mint");
+
+        // Tamper the persisted body hex on disk: the record's daemon
+        // envelope signature no longer matches, so resolution must fail
+        // loudly rather than verify attacker-substituted material.
+        let path = crate::http::observations::observation_file_path(&state.data_dir, "mediation::s-1");
+        let text = std::fs::read_to_string(&path).expect("read log");
+        let mut record: serde_json::Value = serde_json::from_str(text.lines().next().expect("one line")).expect("json");
+        let body_hex = record["payload"]["body_cbor_hex"].as_str().expect("hex").to_string();
+        let flipped = if body_hex.starts_with('a') {
+            format!("b{}", &body_hex[1..])
+        } else {
+            format!("a{}", &body_hex[1..])
+        };
+        record["payload"]["body_cbor_hex"] = serde_json::Value::String(flipped);
+        std::fs::write(&path, format!("{}\n", record)).expect("write tampered log");
+
+        let err = crate::http::receipts::local_stream_receipt_verification(&state, &minted.receipt_id)
+            .expect_err("tampered log must not resolve");
+        assert!(
+            err.contains("observation") || err.contains("chain") || err.contains("binding"),
+            "error names the integrity failure: {err}"
+        );
+    }
 }
