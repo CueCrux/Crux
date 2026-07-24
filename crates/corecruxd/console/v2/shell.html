@@ -320,6 +320,10 @@
     content: ''; position: absolute; left: 18px; top: 2px; bottom: 4px; width: 1px;
     background: var(--edge); pointer-events: none;
   }
+  /* M23 — a row's own `display: flex` out-specifies the UA's [hidden] rule, so
+     the attribute has to be honoured explicitly. Without this, Log out on a local
+     daemon is [hidden] in the DOM but still 34px on screen. */
+  .nav-subitem[hidden] { display: none; }
   .nav-subitem svg { width: 15px; height: 15px; flex: none; opacity: .85; }
   .nav-subitem .label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .nav-subitem:hover { color: var(--ink); background: var(--surface2); border-color: var(--edge); }
@@ -338,16 +342,20 @@
   }
 
   .rail-footer { margin-top: auto; padding-top: 12px; display: flex; flex-direction: column; gap: 10px; }
-  /* M21 — the System accordion sits ABOVE the account badge in a bottom-anchored
-     footer, so its height tween reads as opening UPWARD. Its rows are the same
-     .nav-sub / .nav-subitem family as the main rail accordion; the connector
-     hairline flips to the group's underside so the tree reads bottom-up. */
+  /* M21/M23 — the footer accordion sits in a bottom-anchored footer, so its height
+     tween reads as opening UPWARD. Its rows are the same .nav-sub / .nav-subitem
+     family as the main rail accordion.
+     M23 — the separate "System" trigger button is GONE. The ACCOUNT BADGE itself
+     is the group's trigger (buildNavGroup gets #passportChip as its button), and
+     the group carries ONE merged list: the System sub-pages, a hairline, then the
+     account actions (Studio · Language · Log out) nearest the badge. That makes a
+     single footer control in both rail states and retires #acctPop outright. */
   .rail-footer-nav { display: flex; flex-direction: column; }
   .rail-footer-nav .nav-group { display: flex; flex-direction: column-reverse; }
   .rail-footer-nav .nav-sub-inner { padding: 6px 0 4px 0; }
-  .rail-footer-nav .nav-item .nav-caret { transform: rotate(-90deg); }
-  .rail-footer-nav .nav-group.is-open > .nav-item .nav-caret { transform: rotate(-90deg) scaleX(-1); }
-  .acct-sec-h { margin-top: 4px; }
+  /* A hairline between the merged sections (System pages above, account actions
+     below). Presentational only — never focusable, never in the keyboard walk. */
+  .nav-sub-sep { height: 1px; background: var(--edge); margin: 5px 10px 5px 30px; flex: none; }
   .passport-chip {
     display: flex; align-items: center; gap: 11px;
     padding: 9px 11px; border: 1px solid var(--edge); border-radius: var(--radius-sm);
@@ -402,7 +410,13 @@
     :root[data-rail="collapsed"] .rail-toggle { display: none; }
     :root[data-rail="collapsed"] .brand { flex-direction: column; justify-content: center; padding: 4px 0 12px; gap: 6px; cursor: pointer; }
     :root[data-rail="collapsed"] .brand .name { display: none; }
-    :root[data-rail="collapsed"] .nav-item { justify-content: center; padding: 0; gap: 0; }
+    /* M23 — the main destination glyph steps UP one clear tier (18 → 22px in a
+       48px-tall button). With the connector hairline gone (below), size is what
+       separates a destination from its sub-pages in the icons-only bar: 22px
+       dest vs 16px sub. 22px inside the 48px content width (64px rail − 8px
+       gutters) leaves 13px each side, so nothing clips. */
+    :root[data-rail="collapsed"] .nav-item { justify-content: center; padding: 0; gap: 0; min-height: 48px; }
+    :root[data-rail="collapsed"] .nav-item svg { width: 22px; height: 22px; }
     :root[data-rail="collapsed"] .nav-item .label,
     :root[data-rail="collapsed"] .nav-item .kbd,
     :root[data-rail="collapsed"] .nav-item .nav-caret,
@@ -413,22 +427,36 @@
        sub-pages DOWN the bar, inline, as icon buttons. One group open (the active
        destination's), same height+opacity tween, same reduced-motion snap — the
        mechanics are shared, only the row presentation differs.
-       Rows are square, smaller than the 48px destination column and inset to its
-       right, with the connector hairline running down their left, so the nesting
-       reads without any text. The page name lives in title + aria-label (the
-       tooltip is the only text). */
-    :root[data-rail="collapsed"] .nav-sub-inner { padding: 3px 0 5px 0; }
-    :root[data-rail="collapsed"] .nav-sub-inner::before { left: 6px; top: 1px; bottom: 3px; }
+       Rows are square (34px) and smaller than the 48px destination column, so the
+       nesting reads without any text. The page name lives in title + aria-label
+       (the tooltip is the only text).
+       M23 — the hierarchy is now carried by SIZE + a closing rule, not by an
+       indent and a connector line: (a) the left connector hairline is removed,
+       (b) the rows are CENTRED in the bar rather than inset to its right, and
+       (c) an open group is capped by a short hairline past its last row. */
+    :root[data-rail="collapsed"] .nav-sub-inner { padding: 3px 0 7px 0; }
+    :root[data-rail="collapsed"] .nav-sub-inner::before { display: none; }
+    /* The closing divider: only while the group is OPEN, only past the last row.
+       A downward group (every rail destination) caps at its bottom; the upward
+       footer group caps at its TOP — its far end from the trigger — so the cap
+       still reads as the end of the list in both directions. */
+    :root[data-rail="collapsed"] .nav-sub.is-open .nav-sub-inner::after {
+      content: ''; position: absolute; left: 50%; transform: translateX(-50%);
+      bottom: 0; width: 24px; height: 1px; background: var(--edge); pointer-events: none;
+    }
+    :root[data-rail="collapsed"] .rail-footer-nav .nav-sub.is-open .nav-sub-inner::after { bottom: auto; top: 0; }
     :root[data-rail="collapsed"] .nav-subitem {
       justify-content: center; gap: 0;
       width: 34px; min-height: 34px; padding: 0;
-      margin-left: auto; margin-right: 3px;
+      margin-left: auto; margin-right: auto;
     }
-    :root[data-rail="collapsed"] .nav-subitem .label { display: none; }
+    :root[data-rail="collapsed"] .nav-subitem .label,
+    :root[data-rail="collapsed"] .nav-subitem .acct-code { display: none; }
     :root[data-rail="collapsed"] .nav-subitem svg { width: 16px; height: 16px; }
-    /* M21 — the footer settings accordion is expanded-rail chrome; collapsed,
-       #acctPop carries the same System pages (acctSyncSystemRows). */
-    :root[data-rail="collapsed"] .rail-footer-nav { display: none; }
+    /* M23 — the footer accordion is NO LONGER expanded-rail-only: the account
+       badge is its trigger in BOTH rail states, so the compact bar rolls the same
+       merged System + account group up as icon rows (#acctPop is gone). */
+    :root[data-rail="collapsed"] .rail-footer-nav .nav-sub-sep { width: 24px; margin: 3px auto; }
     :root[data-rail="collapsed"] .passport-chip { justify-content: center; padding: 8px 0; gap: 0; }
     :root[data-rail="collapsed"] .passport-chip .who { display: none; }
     /* M18 — the collapsed rail is icon-only; the badge is just the avatar (the
@@ -510,19 +538,20 @@
   }
   .rail-theme-cycle:hover { color: var(--ink); border-color: var(--edge-strong); background: var(--surface); }
   .rail-theme-cycle svg { width: 13px; height: 13px; }
-  /* Bottom account / operator badge (Settings · Language · Log out). M18 — the
-     old upward roll-up (.acct-menu, absolute left:0;right:0 above the chip) was
-     clipped to the ~48px collapsed-rail width and used a bespoke idiom. It is
-     replaced by a glass rightward pop-out (#acctPop, built in JS) that REUSES
-     the M17 rail-flyout family, so the badge now matches the workspace switcher
-     + operator-options popups and stays legible in both rail states. */
-  .acct-menu-wrap { position: relative; }
+  /* Bottom account / operator badge. M18 replaced a bespoke roll-up with the
+     glass #acctPop pop-out; M23 retires that popup: the badge is now the TRIGGER
+     of the footer accordion (one footer control, both rail states), so its state
+     cue is aria-expanded + a caret that rotates like every other nav caret. */
   .passport-chip { width: 100%; font: inherit; cursor: pointer; }
   .passport-chip[aria-expanded="true"] { border-color: var(--edge-strong); background: var(--surface); }
   .passport-chip .acct-caret { margin-left: auto; display: inline-flex; width: 14px; height: 14px; color: var(--ink3); flex: none; }
-  .passport-chip .acct-caret svg { width: 14px; height: 14px; transform: rotate(180deg); }   /* chevron points right — the pop-out opens rightward (M17 idiom) */
-  /* Language locale badge, trailing the Language flyout row. */
-  .rail-flyout-item .acct-code { margin-left: 8px; font-family: var(--font-mono); font-size: 9.5px; color: var(--ink3); border: 1px solid var(--edge); border-radius: 5px; padding: 1px 6px; }
+  /* Closed: the chevron points UP — the group rolls upward off the badge.
+     Open: it points down, i.e. "collapse". Same ease as .nav-caret. */
+  .passport-chip .acct-caret svg { width: 14px; height: 14px; transform: rotate(90deg); transition: transform .26s cubic-bezier(.16,1,.3,1); }
+  .rail-footer-nav .nav-group.is-open > .passport-chip .acct-caret svg { transform: rotate(-90deg); }
+  @media (prefers-reduced-motion: reduce) { .passport-chip .acct-caret svg { transition: none; } }
+  /* Language locale badge, trailing the Language row (hidden in the compact rail). */
+  .nav-subitem .acct-code { margin-left: 8px; font-family: var(--font-mono); font-size: 9.5px; color: var(--ink3); border: 1px solid var(--edge); border-radius: 5px; padding: 1px 6px; }
   /* Settings › Theme picker */
   .theme-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
   .theme-opt { display: flex; flex-direction: column; gap: 8px; }
@@ -616,8 +645,9 @@
   /* ---- Rail pop-out glass (M11 family) -----------------------------------
      M22 — the rail's SUB-PAGE flyout is gone (sub-pages are the inline accordion
      in both rail states). This family survives as the shared glass for the rail's
-     genuine pop-outs: the operator options popup (#railOpsPop), the account
-     pop-out (#acctPop) and the workspace switcher (#wsSwitchPop). */
+     genuine pop-outs: the operator options popup (#railOpsPop) and the workspace
+     switcher (#wsSwitchPop). M23 retired the third (#acctPop) — the account badge
+     is now the footer accordion's trigger, not a popup anchor. */
   .rail-flyout {
     position: fixed; z-index: 200; min-width: 208px; max-width: 264px;
     background: var(--surface); border: 1px solid var(--edge-strong); border-radius: var(--radius);
@@ -3322,24 +3352,20 @@
       <div class="rail-icons" id="railIcons" role="group" aria-label="Surface and operator options"></div>
       <nav id="nav" aria-label="Primary"></nav>
       <div class="rail-footer">
-        <!-- M21 — the settings/System sub-page accordion. Built by
-             buildSettingsFooterNav(); it lives ABOVE the account badge in a
-             bottom-anchored footer, so opening it grows UPWARD. Hidden when the
-             rail is collapsed — there the same pages are listed in #acctPop. -->
+        <!-- M21/M23 — the footer accordion host. buildAccountFooterNav() MOVES the
+             #passportChip below into this host as the group's trigger button, so
+             the account badge and the System + account rows are ONE control that
+             rolls UPWARD, in both rail states. The badge markup stays here (not in
+             JS) so passport paint / placeMobileChrome keep one live node. -->
         <div class="rail-footer-nav" id="railFooterNav"></div>
-        <!-- M18 — the account/operator badge. Its menu (Settings · Language ·
-             Log out) is a glass rightward pop-out (#acctPop) built in JS and
-             appended to <body>, reusing the M17 rail-flyout family. -->
-        <div class="acct-menu-wrap" id="acctWrap">
-          <button class="passport-chip" id="passportChip" type="button" aria-haspopup="menu" aria-expanded="false" title="Account &amp; system">
-            <span class="avatar" aria-hidden="true"></span>
-            <span class="who">
-              <b id="passportName">Passport</b>
-              <span id="passportSub">not yet wired</span>
-            </span>
-            <span class="acct-caret" aria-hidden="true"></span>
-          </button>
-        </div>
+        <button class="passport-chip" id="passportChip" type="button" aria-expanded="false" title="Account &amp; system">
+          <span class="avatar" aria-hidden="true"></span>
+          <span class="who">
+            <b id="passportName">Passport</b>
+            <span id="passportSub">not yet wired</span>
+          </span>
+          <span class="acct-caret" aria-hidden="true"></span>
+        </button>
       </div>
     </aside>
 
@@ -3517,19 +3543,30 @@
     card.appendChild(body);
     return card;
   }
-  // ---- Account / operator badge pop-out (M18) ----------------------------
-  // The bottom-of-rail operator badge. Its menu (Settings · Language · Log out)
-  // is a glass rightward pop-out that REUSES the M17 rail-flyout family, built
-  // in JS and appended to <body> (#acctPop) — the old upward roll-up was clipped
-  // to the ~48px collapsed rail. Keyboard accessible (focus-first, Escape →
-  // refocus the badge, click-away), positioned flush to the rail's right edge
-  // (the switcher / operator-options idiom). Settings routes to System › Settings;
-  // Language is a placeholder (single locale). Log out drives the hosted BFF
-  // session (POST /api/auth/logout, CSRF double-submit): it shows only when
-  // CruxSession.probe() confirms a platform session — on a local daemon that
-  // path 404s and the item hides. Cookies live on the parent domain, so one
-  // logout signs the account out of every surface.
-  var acctPop = null, acctAnchor = null;
+  // ---- Account / operator badge — the footer accordion TRIGGER (M23) ------
+  // M18 gave the badge a glass rightward pop-out (#acctPop); M21 then added a
+  // SECOND footer control — a "System" accordion trigger sitting above it. That
+  // left two controls in one corner of the rail and two presentations of the same
+  // System list (accordion when expanded, popup when compact). M23 collapses all
+  // of it into ONE control: the badge IS the trigger of the footer accordion, the
+  // pop-out is removed outright, and the group carries a single merged list:
+  //
+  //     … System sub-pages (Settings · Integrations · … · Docs)
+  //     ──────── hairline ────────
+  //     Studio · Language · Log out          ← nearest the badge
+  //
+  // ROW ORDER: the group rolls UPWARD (.rail-footer-nav .nav-group is
+  // column-reverse), so the LAST row in DOM order is the one adjacent to the
+  // badge. Account actions go last — shortest travel from the thing you clicked —
+  // and the System pages stack above them.
+  // DEDUPE: the pop-out's own "Settings" row is dropped. System's cx-settings page
+  // IS Settings and is already in the list; two rows to one destination was the
+  // duplication this milestone exists to remove.
+  // Log out drives the hosted BFF session (POST /api/auth/logout, CSRF
+  // double-submit) and appears ONLY when CruxSession.probe() confirms a platform
+  // session — on a local daemon that path 404s and the row stays [hidden] (the
+  // M18 rule, preserved). Language is a placeholder (single locale).
+  var ACCT_HOSTED = false;
   function acctAction(acct) {
     if (acct === 'settings') { location.hash = '#/system/cx-settings'; }
     else if (acct === 'studio') { location.hash = '#/canvas/studio'; }   // M19 — Studio relocated here
@@ -3541,113 +3578,45 @@
     }
     // language — placeholder (single locale for now).
   }
-  function ensureAcctPop() {
-    if (acctPop) { return acctPop; }
-    acctPop = el('div', { id: 'acctPop', 'class': 'rail-flyout', role: 'menu', 'aria-label': 'Account & system' });
-    acctPop.hidden = true;
-    acctPop.appendChild(el('div', { 'class': 'rail-flyout-h', text: 'Account' }));
-    var mk = function (label, iconKey, acct, extra) {
-      var kids = [el('span', { 'class': 'ic', 'aria-hidden': 'true', html: ICONS[iconKey] || '' }), el('span', { 'class': 'label', text: label })];
-      if (extra) { kids.push(extra); }
-      var row = el('button', { 'class': 'rail-flyout-item', type: 'button', role: 'menuitem', 'data-acct': acct }, kids);
-      (function (a) { row.addEventListener('click', function () { closeAcctPop(); acctAction(a); }); })(acct);
-      return row;
-    };
-    acctPop.appendChild(mk('Settings', 'settings', 'settings'));
-    acctPop.appendChild(mk('Studio', 'canvas', 'studio'));   // M19 — Studio relocated between Settings and Language
-    acctPop.appendChild(mk('Language', 'globe', 'language', el('span', { 'class': 'acct-code', id: 'acctLangCode', text: 'EN' })));
-    var logoutRow = mk('Log out', 'logout', 'logout');
-    logoutRow.hidden = true;   // shown only on a hosted platform session (probe below)
-    acctPop.appendChild(logoutRow);
-    // M21 — the COLLAPSED-rail half of the settings accordion. The footer
-    // accordion is expanded-rail chrome; when the rail is collapsed the same
-    // System sub-pages have to be reachable, and this popup is where the
-    // settings button leads. Same items, same marks (railGroupItems →
-    // navPageGlyph) — one list, two presentations, exactly like the expanded
-    // and compact rail accordions. Rebuilt on open so posture/pro filtering is
-    // current.
-    acctPop.appendChild(el('div', { 'class': 'rail-flyout-h acct-sec-h', id: 'acctSysH', text: 'System' }));
-    acctPop.appendChild(el('div', { id: 'acctSysRows' }));
-    if (window.CruxSession) { window.CruxSession.probe().then(function (hosted) { logoutRow.hidden = !hosted; }); }
-    acctPop.addEventListener('keydown', function (e) {
-      if (e.key === 'Escape') { var a = acctAnchor; closeAcctPop(); if (a) { a.focus(); } }
-    });
-    document.body.appendChild(acctPop);
-    return acctPop;
+  // The ACCOUNT half of the merged footer list, in the same {key,title,icon,
+  // current,go} shape railGroupItems() returns — one item vocabulary, so
+  // buildNavGroup renders System pages and account actions identically (and the
+  // compact rail renders both as centred icon squares with tooltip-only text).
+  function acctFooterItems() {
+    var h = hashParts();
+    return [
+      { key: 'acct-studio', title: 'Studio', icon: ICONS.canvas || '',
+        current: (h[0] === 'canvas' && h[1] === 'studio'),
+        go: function () { acctAction('studio'); } },
+      { key: 'acct-language', title: 'Language', icon: ICONS.globe || '', current: false,
+        extra: el('span', { 'class': 'acct-code', id: 'acctLangCode', text: 'EN' }),
+        go: function () { acctAction('language'); } },
+      { key: 'acct-logout', title: 'Log out', icon: ICONS.logout || '', current: false,
+        hidden: !ACCT_HOSTED, go: function () { acctAction('logout'); } }
+    ];
   }
-  function closeAcctPop() {
-    if (acctAnchor) { acctAnchor.setAttribute('aria-expanded', 'false'); }
-    acctAnchor = null;
-    if (acctPop && !acctPop.hidden) { acctPop.hidden = true; }
-  }
-  // Repaint the popup's System section from the shared item list. Shown only
-  // when the rail is COLLAPSED — expanded, the footer accordion owns this job
-  // and duplicating it in the popup would be two menus for one thing.
-  function acctSyncSystemRows() {
-    var head = document.getElementById('acctSysH'), rows = document.getElementById('acctSysRows');
-    if (!head || !rows) { return; }
-    rows.textContent = '';
-    var items = railIsCollapsed() ? railGroupItems('system') : [];
-    head.hidden = !items.length;
-    items.forEach(function (it) {
-      var row = el('button', { 'class': 'rail-flyout-item', type: 'button', role: 'menuitem', 'data-syspage': it.key,
-        'aria-current': it.current ? 'page' : 'false' }, [
-        el('span', { 'class': 'ic', 'aria-hidden': 'true', html: it.icon || '' }),
-        el('span', { 'class': 'label', text: it.title })
-      ]);
-      row.addEventListener('click', function () { closeAcctPop(); it.go(); });
-      rows.appendChild(row);
-    });
-  }
-  function openAcctPop(anchorBtn) {
-    var pop = ensureAcctPop();
-    acctSyncSystemRows();
-    pop.hidden = false;
-    pop.style.width = '';   // reset any mobile width override
-    var railEl = document.querySelector('.rail');
-    var rRect = railEl ? railEl.getBoundingClientRect() : null;
-    var aRect = anchorBtn.getBoundingClientRect();
-    if (rRect && rRect.width > 0) {
-      // Desktop — flush to the rail's right edge (the M17 idiom). The badge sits
-      // at the rail BOTTOM, so open the pop UPWARD from it: it rises alongside
-      // the rail, clear of the very bottom of the viewport — so it never covers
-      // page content or the #/rings bottom control bar. Only if there is not
-      // enough room above (a very short viewport) does it clamp downward.
-      pop.style.left = Math.round(rRect.right - 1) + 'px';
-      var up = Math.round(aRect.top) - pop.offsetHeight - 8;
-      var top = up >= 8 ? up : Math.min(Math.round(aRect.top), window.innerHeight - pop.offsetHeight - 8);
-      pop.style.top = Math.max(8, top) + 'px';
-    } else {
-      // Phone (rail hidden, badge relocated into the More sheet) — open ABOVE the
-      // badge, matching its width (preserves the old roll-up placement).
-      pop.style.left = Math.round(aRect.left) + 'px';
-      pop.style.width = Math.round(aRect.width) + 'px';
-      pop.style.top = Math.max(8, Math.round(aRect.top - pop.offsetHeight - 8)) + 'px';
-    }
-    acctAnchor = anchorBtn;
-    anchorBtn.setAttribute('aria-expanded', 'true');
-    var first = pop.querySelector('.rail-flyout-item:not([hidden])');
-    if (first) { first.focus(); }
-  }
-  function toggleAcctPop(anchorBtn) {
-    if (acctPop && !acctPop.hidden) { closeAcctPop(); }
-    else {
-      if (typeof closeRailOpsPop === 'function') { closeRailOpsPop(); }
-      if (typeof closeWsSwitchPop === 'function') { closeWsSwitchPop(); }
-      openAcctPop(anchorBtn);
-    }
+  // The badge toggles its own group (it is a menu trigger, not a destination —
+  // System is railHidden and has no landing of its own). One-group-open is the
+  // shell-wide invariant, so opening it closes every other group.
+  function toggleAcctGroup() {
+    var rec = NAV_GROUPS['system'];
+    if (!rec) { return; }
+    if (rec.group.classList.contains('is-open')) { navGroupSetOpen(rec, false); NAV_OPEN_KEY = null; return; }
+    Object.keys(NAV_GROUPS).forEach(function (k) { if (k !== 'system') { navGroupSetOpen(NAV_GROUPS[k], false); } });
+    navGroupSetOpen(rec, true); NAV_OPEN_KEY = 'system';
   }
   function initAcctMenu() {
     var btn = document.getElementById('passportChip');
     if (!btn) { return; }
     var caret = btn.querySelector('.acct-caret'); if (caret) { caret.innerHTML = ICONS.chevron || ''; }
-    ensureAcctPop();
-    btn.addEventListener('click', function (e) { e.stopPropagation(); toggleAcctPop(btn); });
-  }
-  if (typeof document !== 'undefined') {
-    document.addEventListener('click', function (e) {
-      if (acctPop && !acctPop.hidden && !e.target.closest('#acctPop') && !e.target.closest('#passportChip')) { closeAcctPop(); }
-    }, true);
+    btn.addEventListener('click', function (e) { e.stopPropagation(); toggleAcctGroup(); });
+    if (window.CruxSession) {
+      window.CruxSession.probe().then(function (hosted) {
+        ACCT_HOSTED = !!hosted;
+        var row = document.querySelector('#railFooterNav [data-subpage="acct-logout"]');
+        if (row) { row.hidden = !ACCT_HOSTED; }
+      });
+    }
   }
 
   // ---- Presentation mode registry (Standard | Professional | Documents) --
@@ -4107,8 +4076,9 @@
   //      is REMOVED: the compact rail now pushes a destination's sub-pages down
   //      the bar as icons, inline, instead of pulling a panel out over the page.
   //      The other pop-outs are different mechanisms and are untouched: the
-  //      operator options popup (#railOpsPop), the account pop-out (#acctPop) and
-  //      the workspace switcher (#wsSwitchPop) all keep the .rail-flyout glass. --
+  //      operator options popup (#railOpsPop) and the workspace switcher
+  //      (#wsSwitchPop) keep the .rail-flyout glass. (M23 retired the account
+  //      pop-out too — the badge now triggers the footer accordion.) --
   // Posture / Professional gating for a destination's registry pages — the filter
   // both rail states' item lists run through (it is nav-wide, not popup-specific).
   function railDestPages(destId) {
@@ -4273,16 +4243,30 @@
   // Enter/Space are the buttons' own activation — a row navigates, a destination
   // navigates + opens its group. The rail-footer group grows UPWARD, so its two
   // vertical keys are mirrored (visual order == key order in both hosts).
-  function navGroupRows(group) {
-    return Array.prototype.slice.call(group.querySelectorAll('.nav-subitem'));
-  }
+  // M23 — [hidden] rows (Log out on a local daemon) are not in the walk, and the
+  // group's TRIGGER may be a rail destination (.nav-item) or the account badge
+  // (.passport-chip, the footer group's single control).
+  var NAV_TRIGGER_SEL = '.nav-item, .passport-chip';
   function navGroupIsUpward(group) { return !!(group.closest && group.closest('.rail-footer-nav')); }
+  // M23 — rows in WALK order: index 0 is the row nearest the trigger, and the
+  // index grows away from it. A downward group is already in that order (the
+  // trigger sits above its rows); an UPWARD group is not — the trigger sits
+  // below rows the flex column still lays out top-to-bottom in DOM order — so it
+  // reverses. M22 mirrored only the two key names, which meant ArrowUp off the
+  // account badge jumped to the FAR end of the list and then walked back
+  // downward. With the walk order reversed, `into` always moves away from the
+  // trigger and `back` always moves toward it, in both hosts.
+  function navGroupRows(group) {
+    var rows = Array.prototype.slice.call(group.querySelectorAll('.nav-subitem:not([hidden])'));
+    return navGroupIsUpward(group) ? rows.reverse() : rows;
+  }
+  function navGroupTrigger(group) { return group.querySelector(NAV_TRIGGER_SEL); }
   if (typeof document !== 'undefined') {
     document.addEventListener('keydown', function (e) {
       if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp' && e.key !== 'Escape') { return; }
       var t = e.target;
       if (!t || !t.closest || !t.closest('.rail')) { return; }
-      var item = t.closest('.nav-subitem'), dest = t.closest('.nav-item');
+      var item = t.closest('.nav-subitem'), dest = t.closest(NAV_TRIGGER_SEL);
       var group = t.closest('.nav-group');
       if (!group || !group.classList.contains('is-open')) { return; }
       var up = navGroupIsUpward(group);
@@ -4296,12 +4280,12 @@
       }
       if (!item) { return; }
       var i = rows.indexOf(item);
-      if (e.key === 'Escape') { e.preventDefault(); var b = group.querySelector('.nav-item'); if (b) { b.focus(); } return; }
+      if (e.key === 'Escape') { e.preventDefault(); var b = navGroupTrigger(group); if (b) { b.focus(); } return; }
       if (e.key === into) { e.preventDefault(); rows[Math.min(i + 1, rows.length - 1)].focus(); return; }
       if (e.key === back) {
         e.preventDefault();
         if (i > 0) { rows[i - 1].focus(); }
-        else { var d = group.querySelector('.nav-item'); if (d) { d.focus(); } }
+        else { var d = navGroupTrigger(group); if (d) { d.focus(); } }
       }
     });
   }
@@ -4479,6 +4463,10 @@
     sub.appendChild(inner);
     var rows = {};
     items.forEach(function (it) {
+      // M23 — a {sep:true} entry is a presentational hairline between merged
+      // sections (the footer group's System pages vs account actions). Never a
+      // button, so it never enters the keyboard walk.
+      if (it.sep) { inner.appendChild(el('div', { 'class': 'nav-sub-sep', 'aria-hidden': 'true' })); return; }
       // M22 — title + aria-label carry the page name because the COMPACT rail
       // renders this row as an icon-only square: the tooltip is its only text.
       var row = el('button', {
@@ -4488,6 +4476,8 @@
       });
       if (it.icon) { row.appendChild(el('span', { 'class': 'ic', 'aria-hidden': 'true', html: it.icon })); }
       row.appendChild(el('span', { 'class': 'label', text: it.title }));
+      if (it.extra) { row.appendChild(it.extra); }
+      if (it.hidden) { row.hidden = true; }   // M18/M23 — Log out on a local daemon
       row.addEventListener('click', function (e) { e.stopPropagation(); it.go(); });
       inner.appendChild(row);
       rows[it.key] = row;
@@ -4497,7 +4487,12 @@
     sub.style.height = '0px';
     var rec = { group: group, btn: btn, sub: sub, inner: inner, rows: rows, timer: null };
     NAV_GROUPS[key] = rec;
-    if (items.length) { btn.setAttribute('aria-expanded', 'false'); btn.appendChild(el('span', { 'class': 'nav-caret', 'aria-hidden': 'true', html: ICONS.chevronRight || '' })); }
+    // M23 — the footer group's trigger is the account badge, which brings its own
+    // .acct-caret; only add the nav caret when the trigger has no caret already.
+    if (items.length) {
+      btn.setAttribute('aria-expanded', 'false');
+      if (!btn.querySelector('.acct-caret')) { btn.appendChild(el('span', { 'class': 'nav-caret', 'aria-hidden': 'true', html: ICONS.chevronRight || '' })); }
+    }
     return rec;
   }
   // Open the active destination's group (closing whatever was open) and mark the
@@ -4529,58 +4524,56 @@
     NAV_OPEN_KEY = activeKey;
   }
 
-  // ---- M21: the settings sub-page accordion, in the rail FOOTER -------------
+  // ---- M21/M23: the footer accordion, triggered by the ACCOUNT BADGE --------
   // M20 deleted the topbar pill row and moved every destination's sub-pages into
   // the rail accordion. System is `railHidden` — it has no rail button — so its
   // pages (Settings · Integrations · Extensions · Workbench · Raw · Infra · Docs)
-  // lost their only menu: Settings opens from the account/operator popups, and
-  // once there you could not see its siblings.
+  // lost their only menu. M21 restored them as an upward accordion in the rail
+  // footer, off a dedicated "System" trigger sitting above the account badge.
   //
-  // This restores them in the SAME accordion idiom (buildNavGroup → the shared
-  // railGroupItems list → navPageGlyph marks → the height+opacity tween), just
-  // mounted in the bottom-anchored `.rail-footer`, so the group grows UPWARD off
-  // the settings button instead of downward off a rail destination. It registers
-  // under the `system` key in NAV_GROUPS, so syncRailAccordion opens it exactly
-  // when a System route is active and closes it when you leave — one accordion
-  // rule for the whole shell. Collapsed rail: CSS hides it and #acctPop lists the
-  // same pages (see ensureAcctPop).
-  // Rebuild the footer group when the System page SET changes (posture flips
-  // `operatorOnly` pages such as cx-raw in and out, and Professional mode adds
-  // the pro-ported pages). Without this the footer list is frozen at rail-build
-  // time while #acctPop — which repaints on open — shows a different set; the
-  // two rail states must never disagree about what System contains.
-  function settingsFooterSig() { return railGroupItems('system').map(function (i) { return i.key; }).join(','); }
+  // M23 removes that second trigger. The account badge (#passportChip) is MOVED
+  // into the group and becomes its button, and the group's list is the System
+  // pages + a hairline + the account actions (acctFooterItems) — one control, one
+  // list, both rail states. #acctPop is gone, so there is no longer a second
+  // presentation of the System list to keep in sync.
+  //
+  // It still registers under the `system` key in NAV_GROUPS, so syncRailAccordion
+  // opens it exactly when a System route is active and closes it when you leave —
+  // one accordion rule for the whole shell.
+  //
+  // Rebuild when the merged list CHANGES: posture flips `operatorOnly` pages such
+  // as cx-raw in and out, Professional mode adds the pro-ported pages, and the
+  // hosted-session probe flips Log out's visibility.
+  function accountFooterItems() {
+    var sys = railGroupItems('system');
+    var acct = acctFooterItems();
+    if (!sys.length) { return acct; }
+    return sys.concat([{ sep: true, key: 'acct-sep' }], acct);
+  }
+  function settingsFooterSig() {
+    return accountFooterItems().map(function (i) { return (i.sep ? 'sep' : i.key) + (i.hidden ? ':h' : ''); }).join(',');
+  }
   var NAV_FOOTER_SIG = null;
   function refreshSettingsFooterNav() {
-    if (settingsFooterSig() !== NAV_FOOTER_SIG) { buildSettingsFooterNav(); }
+    if (settingsFooterSig() !== NAV_FOOTER_SIG) { buildAccountFooterNav(); }
   }
-  function buildSettingsFooterNav() {
+  function buildAccountFooterNav() {
     var host = document.getElementById('railFooterNav');
-    if (!host) { return; }
+    var chip = document.getElementById('passportChip');
+    if (!host || !chip) { return; }
+    // Detach the badge BEFORE clearing the host: it is the one live passport node
+    // (passport paint + placeMobileChrome both hold onto it by id), so a rebuild
+    // must move it, never re-create it.
+    var wasOpen = !!(NAV_GROUPS['system'] && NAV_GROUPS['system'].group.classList.contains('is-open'));
+    if (chip.parentNode) { chip.parentNode.removeChild(chip); }
     host.textContent = '';
     if (NAV_GROUPS['system']) { delete NAV_GROUPS['system']; }
-    var items = railGroupItems('system');
-    NAV_FOOTER_SIG = items.map(function (i) { return i.key; }).join(',');
-    if (!items.length) { return; }
-    var dest = DEST_INDEX['system'] || { label: 'System', icon: 'settings' };
-    var btn = el('button', {
-      'class': 'nav-item', type: 'button', 'data-dest': 'system', 'aria-current': 'false',
-      title: dest.label
-    });
-    btn.innerHTML = ICONS[dest.icon] || ICONS.settings || '';
-    btn.appendChild(el('span', { 'class': 'label', text: dest.label }));
-    btn.addEventListener('click', function (e) {
-      e.stopPropagation();
-      var rec = NAV_GROUPS['system'];
-      // A menu, not a destination: the trigger toggles its own group. Rows
-      // navigate. (The main rail's dest buttons navigate because they ARE
-      // destinations; System is railHidden and has no landing of its own.)
-      if (rec && rec.group.classList.contains('is-open')) { navGroupSetOpen(rec, false); NAV_OPEN_KEY = null; return; }
-      Object.keys(NAV_GROUPS).forEach(function (k) { if (k !== 'system') { navGroupSetOpen(NAV_GROUPS[k], false); } });
-      if (rec) { navGroupSetOpen(rec, true); NAV_OPEN_KEY = 'system'; }
-    });
-    buildNavGroup(host, btn, 'system', items);
+    var items = accountFooterItems();
+    NAV_FOOTER_SIG = settingsFooterSig();
+    if (!items.length) { host.appendChild(chip); return; }
+    buildNavGroup(host, chip, 'system', items);
     applyPosture(host);
+    if (wasOpen) { navGroupSetOpen(NAV_GROUPS['system'], true); }
   }
 
   function buildRail() {
@@ -4616,7 +4609,7 @@
       buildNavGroup(nav, btn, item.id, items);
     }
     applyPosture(nav);
-    buildSettingsFooterNav();   // M21 — the System sub-pages, as an upward accordion in the footer
+    buildAccountFooterNav();   // M21/M23 — System + account rows, as one upward accordion off the badge
   }
 
   function buildThemeSwitch() {
@@ -4856,8 +4849,10 @@
   // Relocate the SAME passport-chip + theme-switch nodes between the rail footer
   // (desktop) and the sheet (phone) — one instance, so applyTheme's #themeSwitch
   // query and passport updates keep working after the move.
+  // M23 — the badge is now INSIDE the footer accordion group (it is its trigger),
+  // so the whole #railFooterNav host moves, carrying badge + rows together.
   function placeMobileChrome(isPhone) {
-    var acct = document.getElementById('acctWrap');
+    var acct = document.getElementById('railFooterNav');
     var slot = document.getElementById('sheetChromeSlot');
     var footer = document.querySelector('.rail-footer');
     if (!acct) { return; }
@@ -5092,7 +5087,7 @@
       buildNavGroup(nav, btn, d.id, items);
     });
     applyPosture(nav);
-    buildSettingsFooterNav();   // M21 — the System sub-pages, as an upward accordion in the footer
+    buildAccountFooterNav();   // M21/M23 — System + account rows, as one upward accordion off the badge
     syncRailAccordion(activeDest ? activeDest.id : null, activePageUid || null);
   }
   function renderWorkspace(wsUid, pageUid) {
@@ -5193,7 +5188,8 @@
     resetRingsTopbar();   // M16a: normalise the topbar heading before any branch paints
     if (typeof closeWsSwitchPop === 'function') { closeWsSwitchPop(); }
     if (typeof closeRailOpsPop === 'function') { closeRailOpsPop(); }
-    if (typeof closeAcctPop === 'function') { closeAcctPop(); }
+    // M23 — no account pop-out to close: the badge's group is an accordion, and
+    // syncRailAccordion (called from every render path) owns its open/closed state.
     var contentEl0 = document.getElementById('content'); if (contentEl0) { contentEl0.classList.remove('settings-page'); }
     var h = (location.hash || '').replace(/^#\/?/, '');
     var qi = h.indexOf('?'); if (qi >= 0) { h = h.slice(0, qi); }
@@ -5375,7 +5371,7 @@
     buildRailIcons();          // collapsed-rail Command · Explorer · Operator-options (M16a)
     initThemeCycle();          // rail theme-cycle icon (theme picker lives in Settings)
     applyTheme(readTheme());
-    initAcctMenu();            // bottom operator/account badge → glass pop-out (Settings · Language · Log out)
+    initAcctMenu();            // M23 — the badge is the footer accordion's trigger (System pages + Studio · Language · Log out)
     initRail();       // collapsible rail (persisted, desktop-only)
     setTopChips();    // paint the DEMO chip (+ any cached facts) immediately
     // Phone tier: build the tab bar + sheet, place the passport/theme chrome for

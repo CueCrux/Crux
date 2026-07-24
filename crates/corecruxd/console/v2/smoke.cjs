@@ -3848,20 +3848,31 @@ function extractThemeVars(theme) {
     '[m18] activateWorkspace must route the Command builtin through applySurface');
   check(/wsSwitcherList\(\)\.forEach/.test(shellHtml) && /'data-ws': ws\.uid/.test(shellHtml),
     '[m18] the switcher pop-out must derive its entries from every workspace (Command included) — reachable from a #/w/ context');
-  // (2a) the account badge menu is the glass rail-flyout pop-out, not the old
-  //      upward roll-up (which is removed).
-  check(/acctPop = el\('div', \{ id: 'acctPop', 'class': 'rail-flyout'/.test(shellHtml),
-    '[m18] the account/operator badge must open a glass rail-flyout pop-out (#acctPop)');
+  // (2a) RETARGETED in M23 — the badge no longer opens a popup at all. M18's
+  //      glass pop-out (#acctPop) replaced a clipped roll-up; M23 replaces the
+  //      pop-out with the rail's own accordion, triggered by the badge itself.
+  //      Both of M18's originals are asserted GONE, honestly, and the M18
+  //      properties that survive (one badge control, keyboard, no bespoke
+  //      roll-up) are asserted on the accordion instead.
+  check(!/id: 'acctPop'/.test(shellHtml) && !/#acctPop['"]/.test(shellHtml)
+    && !/function ensureAcctPop\(/.test(shellHtml) && !/function openAcctPop\(/.test(shellHtml)
+    && !/function closeAcctPop\(/.test(shellHtml) && !/function toggleAcctPop\(/.test(shellHtml)
+    && !/function acctSyncSystemRows\(/.test(shellHtml),
+    '[m18→m23] the account pop-out (#acctPop and its ensure/open/close/toggle/sync handlers) must be removed outright');
   check(!/id="acctMenu"/.test(shellHtml) && !/class="acct-item"/.test(shellHtml) && !/\.acct-menu\s*\{/.test(shellHtml),
     '[m18] the old upward account roll-up (#acctMenu / .acct-item / .acct-menu) must be removed');
-  // (2b) keyboard + click-away, matching the M17 popup family; route() closes it.
-  check(/function openAcctPop\(/.test(shellHtml) && /function closeAcctPop\(/.test(shellHtml) && /function toggleAcctPop\(/.test(shellHtml),
-    '[m18] the account pop-out must have open/close/toggle handlers (the rail-flyout idiom)');
-  check(/pop\.querySelector\('\.rail-flyout-item:not\(\[hidden\]\)'\)/.test(shellHtml) && /!e\.target\.closest\('#acctPop'\) && !e\.target\.closest\('#passportChip'\)/.test(shellHtml),
-    '[m18] the account pop-out must focus-first on open and close on click-away (keyboard accessible)');
-  check(/if \(typeof closeAcctPop === 'function'\) \{ closeAcctPop\(\); \}/.test(shellHtml),
-    '[m18] route() must close the account pop-out on navigation');
-  notes.push('operator round 7 (M18): switcher return-to-Command bug fixed (applyMode now leaves a #/w/ workspace route for a Command destination, mirroring its #/documents exit — before, only #/documents was cleared so the switch re-rendered the same workspace); the bottom-of-rail operator/account badge redesigned from the clipped upward roll-up into the M17 rail-flyout glass pop-out (#acctPop): Settings · Language · Log out, focus-first + Escape + click-away, flush to the rail edge, sane in both rail states + all three themes.');
+  // (2b) the badge is the accordion's TRIGGER: it toggles the group, carries
+  //      aria-expanded (driven by navGroupSetOpen, the shared code path) and
+  //      advertises no popup.
+  check(/function toggleAcctGroup\(\)/.test(shellHtml)
+    && /btn\.addEventListener\('click', function \(e\) \{ e\.stopPropagation\(\); toggleAcctGroup\(\); \}\);/.test(shellHtml),
+    '[m23] the account badge must TOGGLE its own accordion group (one footer control)');
+  check(!/aria-haspopup="menu" aria-expanded="false" title="Account/.test(shellHtml)
+    && /<button class="passport-chip" id="passportChip" type="button" aria-expanded="false"/.test(shellHtml),
+    '[m23] the badge must advertise an expandable group (aria-expanded), not a popup (no aria-haspopup)');
+  check(/rec\.btn\.setAttribute\('aria-expanded', open \? 'true' : 'false'\);/.test(shellHtml),
+    '[m23] the badge\'s expanded state must be driven by the SHARED navGroupSetOpen path, not a bespoke one');
+  notes.push('operator round 7 (M18): switcher return-to-Command bug fixed (applyMode now leaves a #/w/ workspace route for a Command destination, mirroring its #/documents exit — before, only #/documents was cleared so the switch re-rendered the same workspace); the bottom-of-rail operator/account badge redesigned from the clipped upward roll-up into the M17 rail-flyout glass pop-out (#acctPop) — SUPERSEDED by M23, which retires the pop-out entirely and makes the badge the trigger of the rail footer accordion (the M18 gates are retargeted to assert the removal + the surviving properties, not silenced).');
 })();
 
 // ---- Check 55 — (console-surfaces-remediation M19) operator round 8:
@@ -3918,11 +3929,15 @@ function extractThemeVars(theme) {
     '[m19] #/canvas/studio must remain routable (Studio stable home)');
   // (d) Studio relocation: account pop-out (between Settings/Language) + rail head;
   //     removed from the operator popup ("move", not copy).
-  const iSet = shellHtml.indexOf("mk('Settings', 'settings', 'settings')");
-  const iStu = shellHtml.indexOf("mk('Studio', 'canvas', 'studio')");
-  const iLang = shellHtml.indexOf("mk('Language', 'globe', 'language'");
-  check(iSet >= 0 && iStu > iSet && iLang > iStu,
-    '[m19] the account pop-out must carry Studio BETWEEN Settings and Language');
+  // RETARGETED in M23 — the pop-out is gone; its rows are now the account half of
+  // the merged footer accordion (acctFooterItems). Settings is DEDUPED away (the
+  // System half already carries cx-settings = Settings), so the surviving claim is
+  // that Studio still reaches #/canvas/studio from the badge, ahead of Language.
+  const iStu = shellHtml.indexOf("key: 'acct-studio'");
+  const iLang = shellHtml.indexOf("key: 'acct-language'");
+  check(iStu >= 0 && iLang > iStu && /acctAction\('studio'\)/.test(shellHtml)
+    && /else if \(acct === 'studio'\) \{ location\.hash = '#\/canvas\/studio'; \}/.test(shellHtml),
+    '[m19→m23] the badge accordion must carry Studio (→ #/canvas/studio) ahead of Language');
   check(/id="railStudioBtn"/.test(shellHtml) && /getElementById\('railStudioBtn'\)/.test(shellHtml) && /'#\/canvas\/studio'/.test(shellHtml),
     '[m19] the expanded-rail head must carry a Studio button (railStudioBtn) next to the theme control');
   check(!/mkNav\('Studio'/.test(shellHtml),
@@ -4136,19 +4151,22 @@ function extractThemeVars(theme) {
     '[m21] the professional density must carry the settings gap too');
 
   // ---- (8) settings sub-page accordion, opening upward from the footer ----
-  check(/function buildSettingsFooterNav\(\)/.test(shellHtml) && /id="railFooterNav"/.test(shellHtml),
-    '[m21] the System sub-pages must return as a footer accordion');
-  check(/buildNavGroup\(host, btn, 'system', items\)/.test(shellHtml),
-    '[m21] the footer accordion must reuse the SAME buildNavGroup idiom as the rail');
+  //      RETARGETED in M23: the builder is renamed (buildAccountFooterNav) and the
+  //      trigger is the ACCOUNT BADGE, not a separate System button; the collapsed
+  //      rail no longer hides the group (it IS the compact presentation), so the
+  //      "popup carries the same list" pair below became "one list, one control".
+  check(/function buildAccountFooterNav\(\)/.test(shellHtml) && /id="railFooterNav"/.test(shellHtml),
+    '[m21→m23] the System sub-pages must live in a footer accordion');
+  check(/buildNavGroup\(host, chip, 'system', items\)/.test(shellHtml),
+    '[m21→m23] the footer accordion must reuse the SAME buildNavGroup idiom as the rail');
   check(/\.rail-footer-nav \.nav-group \{ display: flex; flex-direction: column-reverse; \}/.test(shellHtml),
-    '[m21] the footer group must open UPWARD off the settings button');
-  check(/:root\[data-rail="collapsed"\] \.rail-footer-nav \{ display: none; \}/.test(shellHtml)
-    && /function acctSyncSystemRows\(\)/.test(shellHtml),
-    '[m21] collapsed rail: the account popup must carry the same System pages');
-  check(/var items = railIsCollapsed\(\) \? railGroupItems\('system'\) : \[\];/.test(shellHtml),
-    '[m21] the popup System list must come from the SAME railGroupItems source (one list, two presentations)');
-  check(/buildSettingsFooterNav\(\);   \/\/ M21/.test(shellHtml),
-    '[m21] both rail builders must (re)build the footer accordion');
+    '[m21] the footer group must open UPWARD off its trigger');
+  check(!/:root\[data-rail="collapsed"\] \.rail-footer-nav \{ display: none; \}/.test(shellHtml),
+    '[m23] the collapsed rail must NOT hide the footer accordion any more — it is the compact presentation');
+  check(/var sys = railGroupItems\('system'\);/.test(shellHtml) && /return sys\.concat\(\[\{ sep: true, key: 'acct-sep' \}\], acct\);/.test(shellHtml),
+    '[m21→m23] the footer System list must still come from the SAME railGroupItems source (one list, one control, both rail states)');
+  check(/buildAccountFooterNav\(\);   \/\/ M21\/M23/.test(shellHtml),
+    '[m21→m23] the rail builder must (re)build the footer accordion');
   check(/function settingsFooterSig\(\)/.test(shellHtml) && /refreshSettingsFooterNav\(\); \}\n    if \(activeKey === undefined\)/.test(shellHtml),
     '[m21] the footer list must refresh when the System page SET changes, so both rail states never disagree');
 
@@ -4171,7 +4189,7 @@ function extractThemeVars(theme) {
     '[m21] cx-cost must join the session store for the agent-given name');
   check(!/\bfetch\s*\(/.test(costBody), '[m21] cx-cost must not raw-fetch');
 
-  notes.push('operator round 10 (M21): accordion rows (expanded, and compact since M22) carry PER-PAGE marks off one NAV_PAGE_PATHS map (registry-owned marks reused, never redrawn); the graph LOD cut PRESERVES the viewpoint — switchMode no longer re-frames to fit (which is what threw the layer to (pad,pad) = the reported top-left jump at ~60%) but re-pins the cursor world point and carries the current scale, with dev-gated __cvZoomProbe/__cvZoomAt so the claim is measured; save_session now stamps the write-time actor (scope_identity, None for anonymous) and documents state.title/state.summary, /v1/console/sessions returns actor + state_title/state_summary + a server-computed allocation block and the console paints it (hidden, not zeroed, on an older daemon); the ExecPlan board gained persisted state chips + date/A→Z/completion sorts (completion states its coverage and sinks unmeasured plans); tile boards open LOCKED with an explicit Edit toggle arming move+resize and expanded cards carry a top-right X (the Studio, an inherent editor, is untouched); the Canvas segmented control is replaced by the Studio\'s own Board·Pages·Integrations; Settings gets one vertical rhythm (its two JS cards moved into a grid) and the System sub-pages return as an UPWARD accordion off the rail footer (collapsed: the same list in #acctPop); cx-cost rows show the agent title + summary with an honest fallback chain and a per-session gradient bar on a fixed 2M scale with a visible max line.');
+  notes.push('operator round 10 (M21): accordion rows (expanded, and compact since M22) carry PER-PAGE marks off one NAV_PAGE_PATHS map (registry-owned marks reused, never redrawn); the graph LOD cut PRESERVES the viewpoint — switchMode no longer re-frames to fit (which is what threw the layer to (pad,pad) = the reported top-left jump at ~60%) but re-pins the cursor world point and carries the current scale, with dev-gated __cvZoomProbe/__cvZoomAt so the claim is measured; save_session now stamps the write-time actor (scope_identity, None for anonymous) and documents state.title/state.summary, /v1/console/sessions returns actor + state_title/state_summary + a server-computed allocation block and the console paints it (hidden, not zeroed, on an older daemon); the ExecPlan board gained persisted state chips + date/A→Z/completion sorts (completion states its coverage and sinks unmeasured plans); tile boards open LOCKED with an explicit Edit toggle arming move+resize and expanded cards carry a top-right X (the Studio, an inherent editor, is untouched); the Canvas segmented control is replaced by the Studio\'s own Board·Pages·Integrations; Settings gets one vertical rhythm (its two JS cards moved into a grid) and the System sub-pages return as an UPWARD accordion off the rail footer (M23 supersedes its trigger + collapsed half: the account badge is the trigger and the same accordion serves the compact rail); cx-cost rows show the agent title + summary with an honest fallback chain and a per-session gradient bar on a fixed 2M scale with a visible max line.');
 })();
 
 // =========================================================================
@@ -4195,19 +4213,21 @@ function extractThemeVars(theme) {
   check(!/mouseenter[^\n]*railIsCollapsed/.test(shellHtml),
     '[m22] the collapsed rail must have NO hover-intent sub-page affordance');
   // The OTHER pop-outs are untouched — different mechanisms, explicitly retained.
-  check(/id: 'acctPop'/.test(shellHtml) && /id: 'wsSwitchPop'/.test(shellHtml) && /id: 'railOpsPop'/.test(shellHtml),
-    '[m22] the account, workspace-switcher and operator-options pop-outs must survive the flyout removal');
+  check(/id: 'wsSwitchPop'/.test(shellHtml) && /id: 'railOpsPop'/.test(shellHtml),
+    '[m22→m23] the workspace-switcher and operator-options pop-outs must survive the flyout removal (the account pop-out is retired by M23, deliberately — see Check 54)');
   check(/\.rail-flyout \{/.test(shellHtml),
     '[m22] the .rail-flyout glass must remain — it is the shared skin of those three pop-outs');
 
   // ---- (2) compact rows are ICON buttons, nested, off the SAME glyphs -----
   check(/:root\[data-rail="collapsed"\] \.nav-subitem \{[^}]*justify-content: center;[^}]*width: 34px; min-height: 34px/.test(shellHtml),
     '[m22] a compact sub-page row must be a square icon button');
-  check(/:root\[data-rail="collapsed"\] \.nav-subitem \{[^}]*margin-left: auto; margin-right: 3px;/.test(shellHtml)
-    && /:root\[data-rail="collapsed"\] \.nav-sub-inner::before \{ left: 6px/.test(shellHtml),
-    '[m22] compact rows must be inset from the destination column with the connector hairline at their left (hierarchy without text)');
-  check(/:root\[data-rail="collapsed"\] \.nav-subitem \.label \{ display: none; \}/.test(shellHtml),
-    '[m22] the compact row must drop its text label (tooltips are the only text)');
+  // RETARGETED in M23 — the inset + connector hairline are REPLACED by centred
+  // rows, a bigger destination glyph and a closing rule (see the M23 block).
+  check(/:root\[data-rail="collapsed"\] \.nav-subitem \{[^}]*margin-left: auto; margin-right: auto;/.test(shellHtml)
+    && !/:root\[data-rail="collapsed"\] \.nav-sub-inner::before \{ left: 6px/.test(shellHtml),
+    '[m22→m23] compact rows must be CENTRED in the bar, with no left connector hairline (hierarchy by size, not by indent)');
+  check(/:root\[data-rail="collapsed"\] \.nav-subitem \.label,\n    :root\[data-rail="collapsed"\] \.nav-subitem \.acct-code \{ display: none; \}/.test(shellHtml),
+    '[m22→m23] the compact row must drop its text label AND the Language locale code (tooltips are the only text)');
   check(/title: it\.title, 'aria-label': it\.title/.test(shellHtml),
     '[m22] every accordion row must carry the page name in title + aria-label (the compact row has no visible label)');
   check(/\.nav-subitem\[aria-current="page"\] \{/.test(shellHtml) && /\.nav-subitem\[aria-current="page"\] svg \{ opacity: 1; color: var\(--acc\); \}/.test(shellHtml),
@@ -4241,6 +4261,149 @@ function extractThemeVars(theme) {
     '[m22] an open compact group must scroll inside #nav (the M17 overflow fix), never overflow the viewport');
 
   notes.push('operator round 11 (M22): the COMPACT (icons-only) rail runs the accordion inline — clicking a destination icon navigates to its default page AND pushes that destination\'s sub-pages down the bar as square, inset icon buttons rendered from the SAME railGroupItems/workspaceGroupItems lists and the SAME navPageGlyph marks as the expanded rows (one list, two presentations; page name in title + aria-label, active row accent-marked), with the same one-open-group invariant, the same syncRailAccordion route binding, the same height+opacity ease and reduced-motion snap, and the same goRingsTab fade bridge for the nine Rings views; the right-side sub-page flyout is REMOVED outright (railFlyout element, ensureRailFlyout/openRailFlyout/openWorkspaceRailFlyout/railFlyoutRender/closeRailFlyout/scheduleRailFlyoutClose/railFlyoutFocusFirst, the hover-intent + ArrowRight entry, aria-haspopup and every close-on-route/popup-exclusion call site) while the three genuine rail pop-outs — operator options, account, workspace switcher — keep the .rail-flyout glass untouched; keyboard moves to the accordion model (ArrowDown steps into the open group, ArrowDown/ArrowUp walk its rows, ArrowUp off the first row and Escape return to the destination, Enter/Space navigate), mirrored for the upward footer group; an open group scrolls inside the #nav overflow region (M17) rather than the viewport.');
+})();
+
+// =========================================================================
+//  M23 — operator round 12: rail hierarchy styling + footer consolidation.
+//  (1) The compact rail drops the left connector hairline and the right inset:
+//      sub icons CENTRE in the bar, the destination glyph steps up a tier, and a
+//      short hairline past the LAST row closes an open group.
+//  (2) The footer loses its separate "System" trigger — the ACCOUNT BADGE is the
+//      single control, rolling ONE merged group (System pages · hairline · Studio
+//      · Language · Log out) upward, in BOTH rail states. #acctPop is retired.
+// =========================================================================
+(function m23OperatorRound12() {
+  // ---- (1a) no left connector hairline in the compact bar -----------------
+  check(/:root\[data-rail="collapsed"\] \.nav-sub-inner::before \{ display: none; \}/.test(shellHtml),
+    '[m23] the compact sub rows must have NO left connector hairline');
+  check(!/:root\[data-rail="collapsed"\][^\n]*::before \{ left: 6px/.test(shellHtml),
+    '[m23] the old left:6px compact connector must be gone, not merely overpainted');
+  // The EXPANDED rail keeps its connector — this is a compact-only change.
+  check(/\.nav-sub-inner::before \{\n    content: ''; position: absolute; left: 18px;/.test(shellHtml),
+    '[m23] the EXPANDED rail must keep its left:18px connector (compact-only change)');
+
+  // ---- (1b) compact sub rows are CENTRED ---------------------------------
+  check(/:root\[data-rail="collapsed"\] \.nav-subitem \{[^}]*margin-left: auto; margin-right: auto;/.test(shellHtml),
+    '[m23] compact sub rows must be centred horizontally (margin-left/right auto), not inset right');
+  check(!/:root\[data-rail="collapsed"\] \.nav-subitem \{[^}]*margin-right: 3px;/.test(shellHtml),
+    '[m23] the old right-inset margin trick must be removed');
+
+  // ---- (1c) destination glyph is a clear step BIGGER than a sub glyph -----
+  (function () {
+    var dest = /:root\[data-rail="collapsed"\] \.nav-item svg \{ width: (\d+)px; height: (\d+)px; \}/.exec(shellHtml);
+    var sub = /:root\[data-rail="collapsed"\] \.nav-subitem svg \{ width: (\d+)px; height: (\d+)px; \}/.exec(shellHtml);
+    check(!!dest && !!sub, '[m23] both compact glyph sizes must be declared where the compact rules live');
+    if (!dest || !sub) { return; }
+    var d = parseInt(dest[1], 10), b = parseInt(sub[1], 10);
+    check(d >= 20 && d <= 24, '[m23] the compact destination glyph must step up to 20–24px (was 18px), got ' + d);
+    check(d - b >= 4, '[m23] main vs sub hierarchy must read by SIZE alone: dest ' + d + 'px must exceed sub ' + b + 'px by >= 4px');
+    // Row heights move with it, harmoniously, and nothing may exceed the 48px
+    // content width of the 64px rail (16px 8px padding => 48px).
+    check(/:root\[data-rail="collapsed"\] \.nav-item \{ justify-content: center; padding: 0; gap: 0; min-height: 48px; \}/.test(shellHtml),
+      '[m23] the compact destination button must grow with its glyph (48px row)');
+    check(/:root\[data-rail="collapsed"\] \.nav-subitem \{[^}]*width: 34px; min-height: 34px;/.test(shellHtml),
+      '[m23] the compact sub row must stay the smaller 34px square');
+    var railW = /:root\[data-rail="collapsed"\] \.app \{ grid-template-columns: (\d+)px 1fr; \}/.exec(shellHtml);
+    var railPad = /:root\[data-rail="collapsed"\] \.rail \{ padding: 16px (\d+)px;/.exec(shellHtml);
+    check(!!railW && !!railPad, '[m23] the compact rail width + gutters must be declared');
+    if (railW && railPad) {
+      var content = parseInt(railW[1], 10) - 2 * parseInt(railPad[1], 10);
+      check(d <= content && 34 <= content,
+        '[m23] the bigger glyph (' + d + 'px) and the 34px sub square must fit the ' + content + 'px compact content width (no clipping)');
+    }
+  })();
+
+  // ---- (1d) closing divider under the LAST row of an OPEN group ----------
+  check(/:root\[data-rail="collapsed"\] \.nav-sub\.is-open \.nav-sub-inner::after \{/.test(shellHtml),
+    '[m23] an OPEN compact group must be closed by a divider (.is-open-scoped, so a closed group shows none)');
+  check(/:root\[data-rail="collapsed"\] \.nav-sub\.is-open \.nav-sub-inner::after \{[^}]*background: var\(--edge\);/.test(shellHtml),
+    '[m23] the closing divider must use the shared hairline token, not a literal colour');
+  check(/:root\[data-rail="collapsed"\] \.nav-sub\.is-open \.nav-sub-inner::after \{[^}]*bottom: 0;/.test(shellHtml)
+    && /:root\[data-rail="collapsed"\] \.nav-sub\.is-open \.nav-sub-inner::after \{[^}]*left: 50%; transform: translateX\(-50%\);/.test(shellHtml),
+    '[m23] the divider must sit past the LAST row (bottom of the group) and be centred like the rows');
+  // ONE rule on the shared .nav-sub family => builtin AND workspace rails both get
+  // it (buildWorkspaceRail goes through the same buildNavGroup).
+  check(/buildNavGroup\(nav, btn, d\.id, items\)/.test(shellHtml) && /buildNavGroup\(nav, btn, item\.id, items\)/.test(shellHtml),
+    '[m23] builtin and workspace rails must share buildNavGroup, so one divider rule covers both');
+  // UPWARD group: the cap flips to the TOP — the group\'s far end from the badge.
+  check(/:root\[data-rail="collapsed"\] \.rail-footer-nav \.nav-sub\.is-open \.nav-sub-inner::after \{ bottom: auto; top: 0; \}/.test(shellHtml),
+    '[m23] the UPWARD footer group must cap at its TOP (its far end), so the divider still reads as the list end');
+
+  // ---- (2a) ONE footer trigger: the account badge ------------------------
+  check(!/'data-dest': 'system'/.test(shellHtml) && !/text: dest\.label/.test(shellHtml.slice(shellHtml.indexOf('function buildAccountFooterNav'), shellHtml.indexOf('function buildRail()'))),
+    '[m23] the separate footer "System" trigger button must be removed');
+  check(/var chip = document\.getElementById\('passportChip'\);/.test(shellHtml)
+    && /buildNavGroup\(host, chip, 'system', items\)/.test(shellHtml),
+    '[m23] the ACCOUNT BADGE itself must be the footer group\'s trigger button');
+  (function () {
+    var footer = shellHtml.slice(shellHtml.indexOf('<div class="rail-footer">'), shellHtml.indexOf('</aside>'));
+    check((footer.match(/<button /g) || []).length === 1 && /id="passportChip"/.test(footer),
+      '[m23] the rail footer markup must carry exactly ONE control — the account badge');
+  })();
+  // The badge is a live node (passport paint + placeMobileChrome hold it by id):
+  // a rebuild must MOVE it, never re-create it.
+  check(/if \(chip\.parentNode\) \{ chip\.parentNode\.removeChild\(chip\); \}\n    host\.textContent = '';/.test(shellHtml),
+    '[m23] a footer rebuild must detach and re-mount the SAME badge node, never re-create it');
+  check(/var acct = document\.getElementById\('railFooterNav'\);/.test(shellHtml),
+    '[m23] placeMobileChrome must relocate the whole footer group (badge + rows travel together)');
+
+  // ---- (2b) merged rows: System + account, deduped, in one list ----------
+  check(/function acctFooterItems\(\)/.test(shellHtml) && /function accountFooterItems\(\)/.test(shellHtml),
+    '[m23] the account actions must be an item list in the same shape as railGroupItems');
+  ['acct-studio', 'acct-language', 'acct-logout'].forEach(function (k) {
+    check(new RegExp("key: '" + k + "'").test(shellHtml),
+      '[m23] the merged footer group must carry the account row ' + k);
+  });
+  check(!/mk\('Settings', 'settings', 'settings'\)/.test(shellHtml) && !/acctPop\.appendChild/.test(shellHtml),
+    '[m23] the pop-out\'s duplicate "Settings" row must be DEDUPED away (System\'s cx-settings is Settings)');
+  check(/return sys\.concat\(\[\{ sep: true, key: 'acct-sep' \}\], acct\);/.test(shellHtml),
+    '[m23] System pages must come FIRST and account actions LAST — the group is column-reverse, so account actions land nearest the badge');
+  check(/if \(it\.sep\) \{ inner\.appendChild\(el\('div', \{ 'class': 'nav-sub-sep', 'aria-hidden': 'true' \}\)\); return; \}/.test(shellHtml)
+    && /\.nav-sub-sep \{ height: 1px; background: var\(--edge\);/.test(shellHtml),
+    '[m23] the two merged sections must be separated by a non-focusable hairline');
+  // Compact mode gets the SAME group as icon rows (no popup fallback anywhere).
+  check(/:root\[data-rail="collapsed"\] \.rail-footer-nav \.nav-sub-sep \{ width: 24px; margin: 3px auto; \}/.test(shellHtml),
+    '[m23] the compact footer group must centre its separator like its rows');
+  check(!/railIsCollapsed\(\) \? railGroupItems\('system'\)/.test(shellHtml),
+    '[m23] no rail-state branch may serve a SECOND presentation of the System list any more');
+
+  // ---- (2c) task-1 styling applies to the upward group -------------------
+  //      (asserted above: the connector/centring/divider rules are all
+  //      :root[data-rail="collapsed"]-scoped on the shared .nav-sub family, and
+  //      the footer group is a .nav-sub — plus the upward cap flip.)
+  check(/\.rail-footer-nav \.nav-group \{ display: flex; flex-direction: column-reverse; \}/.test(shellHtml),
+    '[m23] the merged group must still roll UPWARD off the badge');
+
+  // ---- (2d) keyboard + logout-hidden -------------------------------------
+  check(/var NAV_TRIGGER_SEL = '\.nav-item, \.passport-chip';/.test(shellHtml)
+    && /var item = t\.closest\('\.nav-subitem'\), dest = t\.closest\(NAV_TRIGGER_SEL\);/.test(shellHtml),
+    '[m23] the M22 keyboard walk must recognise the badge as a group trigger');
+  check(/function navGroupTrigger\(group\) \{ return group\.querySelector\(NAV_TRIGGER_SEL\); \}/.test(shellHtml)
+    && /if \(e\.key === 'Escape'\) \{ e\.preventDefault\(\); var b = navGroupTrigger\(group\); if \(b\) \{ b\.focus\(\); \} return; \}/.test(shellHtml),
+    '[m23] Escape must return focus to the group\'s trigger — the badge, for the footer group');
+  check(/var rows = Array\.prototype\.slice\.call\(group\.querySelectorAll\('\.nav-subitem:not\(\[hidden\]\)'\)\);/.test(shellHtml),
+    '[m23] a [hidden] row (Log out on a local daemon) must not be in the keyboard walk');
+  // M22 mirrored only the two KEY NAMES for the upward group, so ArrowUp off the
+  // trigger jumped to the far end of the list and then walked back downward. The
+  // walk order itself has to reverse: index 0 = nearest the trigger, always.
+  check(/return navGroupIsUpward\(group\) \? rows\.reverse\(\) : rows;/.test(shellHtml),
+    '[m23] the UPWARD group\'s row walk must be reversed so `into` always moves AWAY from the trigger (M22 mirrored the keys but not the order)');
+  check(/if \(it\.hidden\) \{ row\.hidden = true; \}/.test(shellHtml)
+    && /hidden: !ACCT_HOSTED, go: function \(\) \{ acctAction\('logout'\); \}/.test(shellHtml)
+    && /window\.CruxSession\.probe\(\)\.then\(function \(hosted\) \{\n        ACCT_HOSTED = !!hosted;/.test(shellHtml),
+    '[m23] Log out must stay hidden until CruxSession.probe() confirms a hosted session (the M18 local-daemon rule)');
+  // A row's own `display: flex` out-specifies the UA [hidden] rule — the attribute
+  // has to be honoured explicitly or the "hidden" logout row still paints 34px.
+  check(/\.nav-subitem\[hidden\] \{ display: none; \}/.test(shellHtml),
+    '[m23] [hidden] must actually hide a nav row (its display:flex out-specifies the UA rule)');
+
+  // ---- house rules --------------------------------------------------------
+  check(!/\bfetch\s*\(/.test(shellHtml.slice(shellHtml.indexOf('function acctAction'), shellHtml.indexOf('function initAcctMenu'))),
+    '[m23] the footer accordion must not raw-fetch');
+  check(!/nav-sub-sep[^\n]*innerHTML/.test(shellHtml),
+    '[m23] the new footer DOM must be built with el()/textContent, not innerHTML');
+
+  notes.push('operator round 12 (M23): the COMPACT rail\'s hierarchy is re-cut to read by SIZE — the left connector hairline is removed, the sub icons are CENTRED in the bar (the right-inset margin trick is gone), the destination glyph steps 18 → 22px inside a 48px row against the unchanged 34px/16px sub square, and an OPEN group is capped by a short centred var(--edge) hairline past its last row (one rule on the shared .nav-sub family, so the builtin and workspace rails both get it; the upward footer group flips the cap to its TOP so it still reads as the end of the list). The expanded rail is untouched (its left:18px connector is asserted intact). The rail FOOTER loses its second control: the separate System accordion trigger is deleted and the ACCOUNT BADGE (#passportChip, moved into the group by buildAccountFooterNav) becomes the single trigger of ONE merged upward group — System sub-pages, a non-focusable hairline, then Studio · Language · Log out nearest the badge (column-reverse ⇒ last in DOM is closest to the trigger). #acctPop is retired outright (element, ensure/open/close/toggle handlers, acctSyncSystemRows, the click-away listener and the route() close call), taking with it the duplicate "Settings" row (System\'s cx-settings IS Settings) and the collapsed-rail branch that served a second presentation of the same list; the compact rail now rolls the same group up as centred icon squares with tooltip-only text. Keyboard is unchanged in model — NAV_TRIGGER_SEL just admits .passport-chip, so ArrowUp steps into the upward group from the badge and Escape returns to it — and [hidden] rows are excluded from the walk, so Log out (hidden until CruxSession.probe() confirms a hosted session) is skipped on a local daemon.');
 })();
 
 // ---- Report (awaits async renderer-driven checks) -----------------------
