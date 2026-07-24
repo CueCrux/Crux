@@ -286,6 +286,56 @@
     min-width: 20px; text-align: center;
   }
 
+  /* ---- M20: accordion sub-navigation (THE standard sub-page pattern) -------
+     Every rail destination — built-in AND user-workspace — owns a group that
+     expands downward when that destination is active, listing its sub-pages as
+     indented rows. Exactly ONE group is open at a time: the active destination's.
+     Navigating elsewhere collapses this group and expands that one. This REPLACES
+     the topbar sub-nav pill row (buildSubnav / buildWorkspaceSubnav are gone), so
+     there is one sub-page idiom in the console, not two.
+
+     The height animation is driven from JS (0 ↔ scrollHeight px, then released to
+     auto) because a group's height is content-dependent. Reduced motion snaps.
+     The collapsed rail never shows groups — it keeps the M19 behaviour (icon
+     click = page-level nav, hover-intent flyout listing the SAME rows). */
+  .nav-group { display: block; }
+  .nav-sub {
+    display: flex; flex-direction: column; gap: 2px;
+    height: 0; overflow: hidden; opacity: 0;
+    transition: height .26s cubic-bezier(.16,1,.3,1), opacity .18s ease;
+  }
+  .nav-sub.is-open { opacity: 1; }
+  .nav-sub-inner { display: flex; flex-direction: column; gap: 2px; padding: 4px 0 6px 0; }
+  .nav-subitem {
+    display: flex; align-items: center; gap: 9px;
+    min-height: 32px; padding: 0 10px 0 30px; width: 100%; text-align: left;
+    border: 1px solid transparent; border-radius: var(--radius-sm);
+    background: none; color: var(--ink2); font: 500 12.5px/1.2 inherit; cursor: pointer;
+    transition: color .15s ease, background .15s ease, border-color .15s ease;
+  }
+  /* The connector rail: a hairline down the group so the rows read as children. */
+  .nav-sub-inner { position: relative; }
+  .nav-sub-inner::before {
+    content: ''; position: absolute; left: 18px; top: 2px; bottom: 4px; width: 1px;
+    background: var(--edge); pointer-events: none;
+  }
+  .nav-subitem svg { width: 15px; height: 15px; flex: none; opacity: .85; }
+  .nav-subitem .label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .nav-subitem:hover { color: var(--ink); background: var(--surface2); border-color: var(--edge); }
+  .nav-subitem:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; }
+  .nav-subitem[aria-current="page"] {
+    color: var(--acc); background: color-mix(in srgb, var(--acc) 11%, transparent);
+    border-color: color-mix(in srgb, var(--acc) 34%, transparent);
+  }
+  .nav-subitem[aria-current="page"] svg { opacity: 1; color: var(--acc); }
+  /* Expand affordance on the parent: a caret that rotates when its group is open. */
+  .nav-item .nav-caret { flex: none; width: 14px; height: 14px; opacity: .55; transition: transform .26s cubic-bezier(.16,1,.3,1); }
+  .nav-group.is-open > .nav-item .nav-caret { transform: rotate(90deg); opacity: .9; }
+  @media (prefers-reduced-motion: reduce) {
+    .nav-sub { transition: none; }
+    .nav-item .nav-caret { transition: none; }
+  }
+
   .rail-footer { margin-top: auto; padding-top: 12px; display: flex; flex-direction: column; gap: 10px; }
   .passport-chip {
     display: flex; align-items: center; gap: 11px;
@@ -344,7 +394,11 @@
     :root[data-rail="collapsed"] .nav-item { justify-content: center; padding: 0; gap: 0; }
     :root[data-rail="collapsed"] .nav-item .label,
     :root[data-rail="collapsed"] .nav-item .kbd,
+    :root[data-rail="collapsed"] .nav-item .nav-caret,
     :root[data-rail="collapsed"] .nav-group-label { display: none; }
+    /* M20 — the accordion belongs to the EXPANDED rail only. Collapsed keeps the
+       M19 idiom: icon click = page-level nav, hover-intent flyout for the rows. */
+    :root[data-rail="collapsed"] .nav-sub { display: none; }
     :root[data-rail="collapsed"] .passport-chip { justify-content: center; padding: 8px 0; gap: 0; }
     :root[data-rail="collapsed"] .passport-chip .who { display: none; }
     /* M18 — the collapsed rail is icon-only; the badge is just the avatar (the
@@ -546,7 +600,7 @@
     color: var(--ink3); font-weight: 600; padding: 4px 10px 6px;
   }
   .rail-flyout-item {
-    display: flex; align-items: center; min-height: 36px; padding: 0 10px; width: 100%;
+    display: flex; align-items: center; gap: 9px; min-height: 36px; padding: 0 10px; width: 100%;
     text-align: left; border: 1px solid transparent; border-radius: var(--radius-sm);
     background: none; color: var(--ink2); cursor: pointer; font: inherit;
     transition: background .16s ease, color .16s ease, border-color .16s ease;
@@ -729,7 +783,34 @@
      live scrub-date. The scrubber shrinks (min 40px) before the row wraps; the
      static labels drop first on narrow viewports. The date PICKERS moved to the
      bottom bar (M19). */
-  .rings-playbar { position: relative; display: inline-flex; align-items: center; gap: 8px; flex: 1 1 auto; min-width: 90px; margin-left: 10px; padding: 4px 10px; background: var(--surface2); border: 1px solid var(--edge); border-radius: var(--radius-sm); }
+  .rings-playbar { position: relative; display: inline-flex; align-items: center; gap: 8px; flex: 1 1 auto; min-width: 90px; padding: 4px 10px; background: var(--surface2); border: 1px solid var(--edge); border-radius: var(--radius-sm); }
+  /* M20 — the nine tab icons LEFT this row (they are the rail accordion now), so
+     the play bar takes the same MEASURE and the same CENTRING as the bottom bar:
+     both are width:760px-capped and centred on the main column's midline (.topbar
+     is position:sticky, so it is the containing block, and it spans exactly the
+     same horizontal extent as the rings stage). The absolute placement only turns
+     on where it cannot collide with the search field; below that the bar returns to
+     the flow and simply fills the row (an honest responsive fallback, not a claim
+     that the widths still match). */
+  /* ONE measure for BOTH bars. It is declared on :root because a custom property's
+     value is substituted textually — the `100%` resolves at the USE site, i.e.
+     against the topbar padding box for the play bar and against the rings stage for
+     the bottom bar. Those two boxes are the SAME main-column width, so the bars come
+     out byte-for-byte equal and share one midline. */
+  :root { --rings-bar-measure: min(760px, calc(100% - 28px)); }
+  /* The search field narrows on this page (it is the only other thing on the row),
+     which is what makes a centred, bottom-bar-width play bar geometrically possible. */
+  .topbar.rings-tabmode .searchstub { width: 200px; max-width: 30%; }
+  @media (min-width: 1500px) {
+    /* The −520px reserve keeps the centred bar clear of the 200px search field on
+       both sides, so the centred placement can never collide with it. */
+    :root { --rings-bar-measure: min(760px, calc(100% - 520px)); }
+    .topbar.rings-tabmode .rings-playbar {
+      position: absolute; left: 50%; transform: translateX(-50%);
+      width: var(--rings-bar-measure); flex: none; margin: 0;
+    }
+    .topbar.rings-tabmode .rings-tabicons-slot { flex: 1 1 auto; }
+  }
   .rings-playbar .ic { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; flex: none; color: var(--ink2); background: var(--surface); border: 1px solid var(--edge); border-radius: 8px; cursor: pointer; }
   .rings-playbar .ic svg { width: 16px; height: 16px; }
   .rings-playbar .ic:hover { color: var(--ink); background: var(--surface2); }
@@ -818,11 +899,19 @@
 
   /* bottom control bar (M12) — centred + opaque, SAME measure as the play bar:
      window sliders + canvas zoom (the date pickers moved up into the play bar) */
-  .rings-bottombar { position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%); width: min(680px, calc(100% - 24px)); z-index: 15; display: flex; align-items: center; gap: 14px; flex-wrap: wrap; justify-content: center; background: var(--rings-bar-bg); border: 1px solid var(--rings-hairline-strong); border-radius: 12px; padding: 8px 16px; box-shadow: 0 10px 30px rgba(0,0,0,.35); }
-  .rings-bottombar .grp { display: flex; align-items: center; gap: 8px; }
+  /* M20 — ONE ROW. The M19 bar wrapped at typical widths (two date pickers + the
+     window sliders + the zoom cluster overflowed the 680px measure), so it read as
+     two stacked bars. The measure widens to --rings-bar-measure (shared with the
+     play bar, task 4), wrapping is switched OFF, and the controls compact: the
+     range inputs shrink before anything else, the date pickers hold their intrinsic
+     width, the zoom buttons drop to 30px. */
+  .rings-bottombar { position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%); width: var(--rings-bar-measure); z-index: 15; display: flex; align-items: center; gap: 12px; flex-wrap: nowrap; justify-content: center; background: var(--rings-bar-bg); border: 1px solid var(--rings-hairline-strong); border-radius: 12px; padding: 8px 14px; box-shadow: 0 10px 30px rgba(0,0,0,.35); }
+  .rings-bottombar .grp { display: flex; align-items: center; gap: 8px; min-width: 0; }
   .rings-bottombar .bb-window { flex: 1 1 auto; }
-  .rings-bottombar label { font: 600 10.5px var(--font-mono); color: var(--rings-ink3); text-transform: uppercase; letter-spacing: .04em; }
-  .rings-bottombar input[type=range] { accent-color: var(--rings-accent-deep); flex: 1 1 auto; min-width: 60px; }
+  .rings-bottombar .bb-zoom { flex: none; gap: 4px; }
+  .rings-bottombar .bb-zoom .rings-iconbtn { width: 30px; min-width: 30px; height: 30px; }
+  .rings-bottombar label { font: 600 10.5px var(--font-mono); color: var(--rings-ink3); text-transform: uppercase; letter-spacing: .04em; flex: none; }
+  .rings-bottombar input[type=range] { accent-color: var(--rings-accent-deep); flex: 1 1 auto; min-width: 44px; }
   .rings-bottombar input:focus-visible { outline: 2px solid var(--rings-accent); outline-offset: 2px; }
   .bb-zoom { padding-left: 12px; border-left: 1px solid var(--rings-hairline); gap: 5px; flex: none; }
 
@@ -2543,28 +2632,47 @@
      Zoomed OUT the nodes ride concentric type-shells (the ring overview); zoomed
      IN they snap to the card/force columns. A +/- cluster carries a live label
      ("overview" / "detail"); wheel + pinch still zoom. */
+  /* M20 — the "Overview" element, rebuilt for this page. It is NATIVE DOM (never
+     an iframe): a compact glass chip pinned to the BOTTOM-LEFT corner of the graph
+     VIEWPORT, carrying the −/+ controls, the live LOD state (overview | detail),
+     the zoom percentage and the focus toggle. Console var(--) tokens only, so it
+     reads correctly in all three themes. `max-width` + the inspector's z-index keep
+     it clear of the tab-host edges at typical sizes. */
   .cv-zoom {
     position: absolute; left: 14px; bottom: 14px; z-index: 5;
-    display: flex; align-items: center; gap: 2px; padding: 3px;
-    border: 1px solid var(--edge); border-radius: 9px;
-    background: color-mix(in srgb, var(--surface) 92%, var(--bg));
-    backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
-    box-shadow: 0 6px 18px rgba(0,0,0,.35);
+    display: flex; align-items: center; gap: 2px; padding: 3px 4px;
+    max-width: calc(100% - 28px);
+    border: 1px solid var(--edge); border-radius: 10px;
+    background: color-mix(in srgb, var(--surface) 88%, var(--bg));
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    box-shadow: 0 8px 22px rgba(0,0,0,.30);
   }
   .cv-zoom-btn {
-    width: 28px; height: 28px; display: inline-flex; align-items: center; justify-content: center;
+    width: 26px; height: 26px; display: inline-flex; align-items: center; justify-content: center;
     border: none; border-radius: 6px; background: none; color: var(--ink2);
-    font-size: 16px; line-height: 1; cursor: pointer; transition: color .12s ease, background .12s ease;
+    font-size: 15px; line-height: 1; cursor: pointer; transition: color .12s ease, background .12s ease;
   }
   .cv-zoom-btn:hover { color: var(--ink); background: var(--surface2); }
-  .cv-zoom-btn svg { width: 16px; height: 16px; }
+  .cv-zoom-btn:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; }
+  .cv-zoom-btn svg { width: 15px; height: 15px; }
   /* M13 — focus-mode toggle in the canvas controls (unified icon idiom). */
-  .cv-zoom-div { width: 1px; align-self: stretch; margin: 3px 2px; background: var(--edge); }
+  .cv-zoom-div { width: 1px; align-self: stretch; margin: 4px 3px; background: var(--edge); }
   .cv-focus-btn[aria-pressed="true"], .cv-focus-btn.is-on { color: var(--acc); background: color-mix(in srgb, var(--acc) 16%, transparent); }
+  /* The readout: LOD state over the zoom percentage, two tight mono lines. */
+  .cv-zoom-read { display: flex; flex-direction: column; justify-content: center; padding: 0 7px; min-width: 62px; }
   .cv-zoom-mode {
     font-family: var(--font-mono); font-size: 9px; letter-spacing: .12em; text-transform: uppercase;
-    color: var(--ink3); padding: 0 8px; min-width: 58px; text-align: center;
+    color: var(--ink3); line-height: 1.25; text-align: left;
   }
+  .cv-zoom-pct {
+    font-family: var(--font-mono); font-size: 11px; font-weight: 700;
+    color: var(--ink); line-height: 1.15; text-align: left;
+  }
+  /* Inside the Rings tab host the graph must FILL the viewport, otherwise the
+     stage's fixed 74vh leaves the chip floating mid-page instead of in the corner
+     (the M7 stage was sized for a scrolling destination page, not a tab host). */
+  .rings-tabhost .canvas-graph { display: flex; flex-direction: column; min-height: 0; height: 100%; }
+  .rings-tabhost .canvas-graph-stage { height: auto; min-height: 0; flex: 1 1 auto; }
   .cv-graph-note {
     position: absolute; left: 14px; top: 14px; z-index: 5; max-width: 62%;
     font-family: var(--font-mono); font-size: 10px; color: var(--ink3);
@@ -3133,6 +3241,8 @@
     passport: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="9" r="3"/><path d="M6 20a6 6 0 0 1 12 0"/></svg>',
     more: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="19" cy="12" r="1.4"/></svg>',
     chevron: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"/></svg>',
+    // M20 — the accordion caret on a rail destination (rotates 90° when its group opens).
+    chevronRight: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>',
     glass: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l2.2 4.8L19 9l-3.5 3.4.9 4.9L12 15l-4.4 2.3.9-4.9L5 9l4.8-1.2z"/></svg>',
     dark: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a7 7 0 1 0 10.5 10.5z"/></svg>',
     light: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4.2"/><path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M19.1 4.9l-1.8 1.8M6.7 17.3l-1.8 1.8"/></svg>'
@@ -3840,7 +3950,9 @@
     fo.textContent = '';
     fo.appendChild(el('div', { 'class': 'rail-flyout-h', text: label }));
     pages.forEach(function (p) {
-      var row = el('button', { 'class': 'rail-flyout-item', type: 'button', role: 'menuitem', 'data-page': p.key, 'aria-current': p.current ? 'page' : 'false' }, [el('span', { 'class': 'label', text: p.title })]);
+      var row = el('button', { 'class': 'rail-flyout-item', type: 'button', role: 'menuitem', 'data-page': p.key, 'aria-current': p.current ? 'page' : 'false' });
+      if (p.icon) { row.appendChild(el('span', { 'class': 'ic', 'aria-hidden': 'true', html: p.icon })); }   // M20 — unified glyph, same as the accordion row
+      row.appendChild(el('span', { 'class': 'label', text: p.title }));
       row.addEventListener('click', function () { p.go(); closeRailFlyout(); });
       fo.appendChild(row);
     });
@@ -3854,16 +3966,81 @@
     railFlyoutAnchor = anchorBtn;
     anchorBtn.setAttribute('aria-expanded', 'true');
   }
-  // Built-in destination flyout (Command surface).
-  function openRailFlyout(destId, anchorBtn) {
-    var pages = railFlyoutPages(destId);
-    if (!pages.length) { closeRailFlyout(); return; }   // single-page destinations (canvas / rings / sitemap): no flyout
-    var dest = DEST_INDEX[destId];
-    var h = (location.hash || '').replace(/^#\/?/, '').split('?')[0].split('/');
+  // ---- M20: ONE sub-page item list per destination -----------------------
+  // railGroupItems is the single source the EXPANDED-rail accordion AND the
+  // COLLAPSED-rail flyout both render, so the two rail states can never disagree
+  // about what a destination contains. Item shape: { key, title, icon, current, go }.
+  //
+  // Rings is the special case: its nine views are not registry pages, they are
+  // the tab hub's views (CruxRender.ringsTabDefs, ordered by the shared
+  // CruxPages.RINGS_TAB_SLUGS hash grammar). Selecting one drives the SAME
+  // in-place fade swap the topbar tab icons used to (see goRingsTab).
+  var NAV_SUB_GLYPH = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.1"/></svg>';
+  function ringsGlyph(paths) { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' + (paths || '') + '</svg>'; }
+  function hashParts() { return (location.hash || '').replace(/^#\/?/, '').split('?')[0].split('/').filter(Boolean); }
+  function ringsSlugDefs() { return (CP && CP.RINGS_TAB_SLUGS) || []; }
+  function ringsTabIdForSlug(slug) {
+    var hit = null;
+    ringsSlugDefs().forEach(function (s) { if (s.slug === slug) { hit = s.tab; } });
+    return (hit && hit !== 'ring') ? hit : null;   // 'ring' is the default view — no initial swap
+  }
+  function activeRingsSlug() {
+    var h = hashParts();
+    if (h[0] !== 'rings' || !h[1]) { return 'ring'; }
+    var known = false;
+    ringsSlugDefs().forEach(function (s) { if (s.slug === h[1]) { known = true; } });
+    return known ? h[1] : 'ring';
+  }
+  // Switch a Rings view from the nav. While the Rings page is MOUNTED we call the
+  // renderer's bridge and rewrite the hash with replaceState — a real hash change
+  // would re-route, tear the page down and destroy the fade + canvas state the
+  // operator asked to keep. From anywhere else it is an ordinary deep link.
+  function goRingsTab(slug, tabId) {
+    var R = (typeof window !== 'undefined') ? window.CruxRender : null;
+    var target = '#/rings' + (slug === 'ring' ? '' : '/' + slug);
+    if (hashParts()[0] === 'rings' && R && R.ringsTabMounted && R.ringsTabMounted()) {
+      R.ringsSetTab(tabId);
+      if (typeof history !== 'undefined' && history.replaceState) {
+        history.replaceState(null, '', location.pathname + location.search + target);
+      }
+      syncRailAccordion();
+      return;
+    }
+    location.hash = target;
+  }
+  function railGroupItems(destId) {
+    if (destId === 'rings') {
+      var R = (typeof window !== 'undefined') ? window.CruxRender : null;
+      var defs = (R && R.ringsTabDefs) ? R.ringsTabDefs() : [];
+      var cur = activeRingsSlug();
+      return defs.map(function (t) {
+        return { key: t.slug, title: t.title, icon: ringsGlyph(t.icon), current: t.slug === cur,
+          go: function () { goRingsTab(t.slug, t.id); } };
+      });
+    }
+    var h = hashParts();
     var activePage = h[0] === destId ? h[1] : null;
-    railFlyoutRender(anchorBtn, dest ? dest.label : destId, pages.map(function (p) {
-      return { key: p.id, title: p.title, current: p.id === activePage, go: function () { location.hash = '#/' + destId + '/' + p.id; } };
-    }));
+    return railFlyoutPages(destId).map(function (p) {
+      return { key: p.id, title: p.title, icon: NAV_SUB_GLYPH, current: p.id === activePage,
+        go: function () { location.hash = '#/' + destId + '/' + p.id; } };
+    });
+  }
+  function workspaceGroupItems(ws, dest) {
+    var h = hashParts();
+    var activePage = (h[0] === 'w' && h[1] === ws.uid) ? h[2] : null;
+    return workspaceDestPages(dest).map(function (p) {
+      return { key: p.uid, title: p.title, icon: NAV_SUB_GLYPH, current: p.uid === activePage,
+        go: function () { location.hash = '#/w/' + ws.uid + '/' + p.uid; } };
+    });
+  }
+
+  // Built-in destination flyout (Command surface) — the collapsed-rail twin of the
+  // accordion, rendering the SAME railGroupItems (incl. the nine Rings views).
+  function openRailFlyout(destId, anchorBtn) {
+    var items = railGroupItems(destId);
+    if (items.length < 2) { closeRailFlyout(); return; }   // single-page destinations: click navigates directly
+    var dest = DEST_INDEX[destId];
+    railFlyoutRender(anchorBtn, dest ? dest.label : destId, items);
   }
   // Workspace destination pages (M17 bug fix): resolve each pageUid's title from
   // the config model (falling back to a registry page title, then the uid).
@@ -3876,13 +4053,9 @@
   }
   // Workspace destination flyout — the config-driven twin of openRailFlyout.
   function openWorkspaceRailFlyout(ws, dest, anchorBtn) {
-    var pages = workspaceDestPages(dest);
-    if (pages.length < 2) { closeRailFlyout(); return; }   // single-page group: click navigates directly
-    var h = (location.hash || '').replace(/^#\/?/, '').split('?')[0].split('/');
-    var activePage = (h[0] === 'w' && h[1] === ws.uid) ? h[2] : null;
-    railFlyoutRender(anchorBtn, dest.label || dest.id, pages.map(function (p) {
-      return { key: p.uid, title: p.title, current: p.uid === activePage, go: function () { location.hash = '#/w/' + ws.uid + '/' + p.uid; } };
-    }));
+    var items = workspaceGroupItems(ws, dest);
+    if (items.length < 2) { closeRailFlyout(); return; }   // single-page group: click navigates directly
+    railFlyoutRender(anchorBtn, dest.label || dest.id, items);
   }
   function railFlyoutFocusFirst() {
     if (railFlyout && !railFlyout.hidden) { var r = railFlyout.querySelector('.rail-flyout-item'); if (r) { r.focus(); return true; } }
@@ -4030,9 +4203,92 @@
     if (slot && slot.parentNode) { slot.parentNode.removeChild(slot); }
   }
 
+  // ---- M20: the accordion groups -----------------------------------------
+  // NAV_GROUPS maps a group key (a built-in dest id, or a workspace dest id) to
+  // its live DOM record. Exactly one group is open — the active destination's.
+  // The height tween runs on explicit pixels (a group's height is content-
+  // dependent) and is released to `auto` afterwards so a later content change
+  // can't be clipped. Reduced motion snaps (CSS kills the transition; the JS
+  // still sets the end state, so open/closed is always correct).
+  var NAV_GROUPS = {}, NAV_OPEN_KEY = null;
+  function navReduceMotion() {
+    return !!(typeof window !== 'undefined' && window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  }
+  function navGroupSetOpen(rec, open) {
+    if (!rec) { return; }
+    rec.group.classList.toggle('is-open', !!open);
+    rec.btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (rec.timer) { clearTimeout(rec.timer); rec.timer = null; }
+    var target = rec.inner.offsetHeight;
+    if (open) {
+      rec.sub.classList.add('is-open');
+      if (navReduceMotion()) { rec.sub.style.height = 'auto'; return; }
+      rec.sub.style.height = target + 'px';
+      rec.timer = setTimeout(function () { if (rec.sub.classList.contains('is-open')) { rec.sub.style.height = 'auto'; } }, 320);
+    } else {
+      if (navReduceMotion()) { rec.sub.classList.remove('is-open'); rec.sub.style.height = '0px'; return; }
+      rec.sub.style.height = target + 'px';
+      void rec.sub.offsetHeight;   // force a reflow so the collapse has a start value to tween FROM
+      rec.sub.classList.remove('is-open');
+      rec.sub.style.height = '0px';
+    }
+  }
+  // Build a destination's group: the dest button + its (initially closed) sub-list.
+  function buildNavGroup(nav, btn, key, items) {
+    var group = el('div', { 'class': 'nav-group', 'data-group': key });
+    group.appendChild(btn);
+    var sub = el('div', { 'class': 'nav-sub', role: 'group', 'aria-label': (btn.getAttribute('title') || key) + ' pages' });
+    var inner = el('div', { 'class': 'nav-sub-inner' });
+    sub.appendChild(inner);
+    var rows = {};
+    items.forEach(function (it) {
+      var row = el('button', { 'class': 'nav-subitem', type: 'button', 'data-subpage': it.key, 'aria-current': it.current ? 'page' : 'false' });
+      if (it.icon) { row.appendChild(el('span', { 'class': 'ic', 'aria-hidden': 'true', html: it.icon })); }
+      row.appendChild(el('span', { 'class': 'label', text: it.title }));
+      row.addEventListener('click', function (e) { e.stopPropagation(); it.go(); });
+      inner.appendChild(row);
+      rows[it.key] = row;
+    });
+    group.appendChild(sub);
+    nav.appendChild(group);
+    sub.style.height = '0px';
+    var rec = { group: group, btn: btn, sub: sub, inner: inner, rows: rows, timer: null };
+    NAV_GROUPS[key] = rec;
+    if (items.length) { btn.setAttribute('aria-expanded', 'false'); btn.appendChild(el('span', { 'class': 'nav-caret', 'aria-hidden': 'true', html: ICONS.chevronRight || '' })); }
+    return rec;
+  }
+  // Open the active destination's group (closing whatever was open) and mark the
+  // current row. Called after every route + after an in-place Rings tab swap.
+  function syncRailAccordion(activeKey, activeSub) {
+    if (activeKey === undefined) {
+      var h = hashParts();
+      if (h[0] === 'w' && h[1]) { activeKey = null; activeSub = h[2] || null; }
+      else if (h[0] === 'rings') { activeKey = 'rings'; activeSub = activeRingsSlug(); }
+      else { activeKey = DEST_INDEX[h[0]] ? h[0] : (DESTS[0] && DESTS[0].id); activeSub = h[1] || null; }
+      if (h[0] === 'w' && h[1]) {
+        // Workspace route: the active group is the dest that owns the page.
+        var wsA = wsFind(h[1]);
+        var dA = wsA ? wsDestOfPage(wsA, h[2] || wsFirstPage(wsA)) : null;
+        activeKey = dA ? dA.id : null;
+      }
+    }
+    Object.keys(NAV_GROUPS).forEach(function (k) {
+      var rec = NAV_GROUPS[k];
+      var open = (k === activeKey);
+      if (open) {
+        Object.keys(rec.rows).forEach(function (rk) { rec.rows[rk].setAttribute('aria-current', rk === activeSub ? 'page' : 'false'); });
+      } else {
+        Object.keys(rec.rows).forEach(function (rk) { rec.rows[rk].setAttribute('aria-current', 'false'); });
+      }
+      navGroupSetOpen(rec, open);
+    });
+    NAV_OPEN_KEY = activeKey;
+  }
+
   function buildRail() {
     var nav = document.getElementById('nav');
     nav.textContent = '';
+    NAV_GROUPS = {}; NAV_OPEN_KEY = null;
     RAIL_MODE = 'dest';   // restored to the destination nav
     closeRailFlyout();
     for (var i = 0; i < DESTS.length; i++) {
@@ -4046,24 +4302,26 @@
       btn.innerHTML = ICONS[item.icon] || '';   // inline SVG glyph
       btn.appendChild(el('span', { 'class': 'label', text: item.label }));
       if (item.key) { btn.appendChild(el('span', { 'class': 'kbd', text: item.key })); }
+      var items = railGroupItems(item.id);
       (function (id, b) {
-        var hasPages = railFlyoutPages(id).length > 1;
+        var hasPages = items.length > 1;
         // M19 — a dest icon CLICK always navigates to the destination's default
         // page (page-level nav), in BOTH rail states (Enter/Space navigate too).
-        // The sub-page flyout is a HOVER-intent affordance for pointer users;
-        // keyboard users open it with ArrowRight (Escape/click-away close it).
+        // M20 — in the EXPANDED rail that navigation also expands this group's
+        // accordion (route() → syncRailAccordion). The flyout stays the COLLAPSED
+        // rail's affordance: hover-intent for pointer users, ArrowRight for
+        // keyboard (Escape/click-away close it).
         b.addEventListener('click', function () { location.hash = '#/' + id; });
         if (hasPages) {
           b.setAttribute('aria-haspopup', 'true');
-          b.setAttribute('aria-expanded', 'false');
-          b.addEventListener('mouseenter', function () { openRailFlyout(id, b); });
+          b.addEventListener('mouseenter', function () { if (railIsCollapsed()) { openRailFlyout(id, b); } });
           b.addEventListener('mouseleave', scheduleRailFlyoutClose);
           b.addEventListener('keydown', function (e) {
             if (e.key === 'ArrowRight') { e.preventDefault(); openRailFlyout(id, b); railFlyoutFocusFirst(); }
           });
         }
       })(item.id, btn);
-      nav.appendChild(btn);
+      buildNavGroup(nav, btn, item.id, items);
     }
     applyPosture(nav);
   }
@@ -4226,7 +4484,9 @@
   // The tab bar mirrors three destinations directly (Overwatch · Work · Trust);
   // every other destination (Memory · Meters · System) lives behind "More". The
   // set is data-driven from DESTS so a new destination is one registry edit.
-  var TAB_DEST_IDS = ['overwatch', 'work', 'trust'];   // the three direct tabs; rest → "More"
+  // M20 — Rings replaces the retired Overwatch as the phone tier's first tab (it
+  // is the console index now); Work + Trust unchanged, the rest → "More".
+  var TAB_DEST_IDS = ['rings', 'work', 'trust'];   // the three direct tabs; rest → "More"
   function isMoreDest(id) { return TAB_DEST_IDS.indexOf(id) < 0; }
 
   function buildTabbar() {
@@ -4312,35 +4572,13 @@
     else if (footer) { footer.appendChild(acct); }
   }
 
-  // ---- Sub-nav (pill row) + page render ----------------------------------
-  function buildSubnav(destId, activePageId) {
-    var row = el('div', { 'class': 'subnav', role: 'tablist', 'aria-label': 'Pages in this destination' });
-    var list = pagesForDest(destId);
-    var pro = (typeof window !== 'undefined' && window.CRUX_MODE === 'professional');
-    for (var i = 0; i < list.length; i++) {
-      var p = list[i];
-      // Standard mode: pages tagged pill:false are folded out of the pill row
-      // (reachable via the landing / direct hash), and pro:true ported pages are
-      // hidden entirely. Professional mode shows ALL pages of the destination as
-      // pills — incl. the pill:false cx-overview and the ported Pro pages.
-      if (!pro) {
-        if (p.pill === false) { continue; }
-        if (p.pro === true) { continue; }
-      }
-      var pill = el('button', {
-        'class': 'pill', type: 'button', 'data-page': p.id,
-        'aria-current': p.id === activePageId ? 'page' : 'false'
-      }, [p.title]);
-      if (p.operatorOnly) { pill.setAttribute('data-requires', 'operator'); }   // hidden for customers
-      (function (dest, pid) {
-        pill.addEventListener('click', function () { location.hash = '#/' + dest + '/' + pid; });
-      })(destId, p.id);
-      row.appendChild(pill);
-    }
-    applyPosture(row);
-    return row;
-  }
-
+  // ---- Page render --------------------------------------------------------
+  // M20 — buildSubnav (the topbar sub-nav PILL ROW) is REMOVED. Sub-page
+  // navigation is now the rail accordion (buildNavGroup/syncRailAccordion) in the
+  // expanded rail and the rail flyout in the collapsed rail — both fed by the one
+  // railGroupItems list. Two competing idioms for the same job was the problem;
+  // the accordion is the standard. Nothing else changes: the same page ids, the
+  // same routes, the same posture/pro gating (railFlyoutPages applies it).
   function renderDestination(destId, pageId) {
     // Leaving Documents mode or a user workspace: restore the Command
     // destination nav into the rail (it was swapped to the document tree / the
@@ -4455,12 +4693,19 @@
       // M19 — a #/rings/<tab> deep link (board|graph|tree — landed here from a
       // #/canvas/* redirect) opens that absorbed Canvas tab; a graph link carries
       // ?focus=. Map the sub-path to the tab id and parse the focus.
+      // M20 — the hash grammar covers ALL NINE views (CruxPages.RINGS_TAB_SLUGS),
+      // not just the three absorbed Canvas ones: every rail accordion row and every
+      // #/overwatch redirect lands on a #/rings/<slug> deep link.
       var ringsSub = (location.hash || '').replace(/^#\/?/, '').split('?')[0].split('/')[1] || '';
-      var RINGS_TAB_MAP = { board: 'cv-board', graph: 'cv-graph', tree: 'cv-tree' };
-      var ringsInitialTab = RINGS_TAB_MAP[ringsSub] || null;
+      var ringsInitialTab = ringsTabIdForSlug(ringsSub);
       var ringsCanvasFocus = ringsInitialTab === 'cv-graph' ? parseCanvasHash(location.hash).focus : null;
       if (window.CruxRender && window.CruxRender.renderRings) {
-        window.CruxRender.renderRings(ringsHost, { summary: BOOT.summary, tabSlot: ringsTabSlot, initialTab: ringsInitialTab, canvasFocus: ringsCanvasFocus });
+        window.CruxRender.renderRings(ringsHost, {
+          summary: BOOT.summary, tabSlot: ringsTabSlot, initialTab: ringsInitialTab, canvasFocus: ringsCanvasFocus,
+          // The rail accordion is the tab CONTROL now — keep its current row in
+          // step with an in-page switch (deep link / initialTab).
+          onTab: function (tabId, slug) { syncRailAccordion('rings', slug || 'ring'); }
+        });
       } else {
         ringsHost.appendChild(el('p', { 'class': 'v2card-sub', text: 'Renderer module unavailable.' }));
       }
@@ -4471,21 +4716,18 @@
 
     document.getElementById('destTitle').textContent = page ? page.title : dest.label;
     document.getElementById('destSub').textContent = page ? (page.sub || '') : (dest.sub || '');
-    // Overwatch is the real landing: Daemon-at-a-glance tiles → Needs-you + Fleet
-    // (left) → the destination page nav (right). The page nav lives IN the landing
-    // (owPageNav), so the top sub-nav pill row is suppressed for overwatch only —
-    // every other destination keeps its pills. cx-overview etc. still render below.
+    // M20 — the Overwatch LANDING is retired with its destination: route() sends
+    // every #/overwatch[/<page>] to its Rings equivalent, so this branch is only
+    // reachable if a caller renders the dest directly. renderOverwatchLanding
+    // itself stays (its tab renderers ARE the Rings views, via owRenderTab).
     if (destId === 'overwatch' && window.CruxRender && window.CruxRender.renderOverwatchLanding) {
       var landing = el('div', { 'class': 'ow-landing-region', id: 'owLanding' });
       content.appendChild(landing);
       window.CruxRender.renderOverwatchLanding(landing, { summary: BOOT.summary });
     }
-    if (destId !== 'overwatch') { content.appendChild(buildSubnav(destId, pageId)); }
     // Settings owns the Command-density switch (moved off the top-level toggle).
     // M17 — mark the region so its cards render as one equal-height grid system.
     if (destId === 'system' && page && page.id === 'cx-settings') { content.classList.add('settings-page'); content.appendChild(buildDensityCard()); content.appendChild(buildThemeCard()); }
-    // Overwatch IS its landing (tiles + view tabs) — don't also render the resolved
-    // page below it (that duplicated the Activity page's Live-activity card).
     if (destId !== 'overwatch') {
       var host = el('div', { 'class': 'page-host', id: 'pageHost' });
       content.appendChild(host);
@@ -4523,6 +4765,7 @@
   function buildWorkspaceRail(ws, activePageUid) {
     var nav = document.getElementById('nav');
     nav.textContent = '';
+    NAV_GROUPS = {}; NAV_OPEN_KEY = null;
     RAIL_MODE = 'ws';
     closeRailFlyout();
     var activeDest = wsDestOfPage(ws, activePageUid);
@@ -4530,42 +4773,31 @@
       var btn = el('button', { 'class': 'nav-item', type: 'button', 'data-wsdest': d.id, 'aria-current': (activeDest && activeDest.id === d.id) ? 'page' : 'false', title: d.label });
       btn.innerHTML = ICONS[d.icon] || ICONS.work || '';
       btn.appendChild(el('span', { 'class': 'label', text: d.label }));
+      var items = workspaceGroupItems(ws, d);
       (function (dest, b) {
-        var multi = workspaceDestPages(dest).length > 1;
+        var multi = items.length > 1;
         // M19 — same idiom as the built-in rail: a group icon CLICK navigates to
-        // its first page (page-level, both rail states); the flyout is a hover +
-        // ArrowRight (keyboard) affordance for the group's pages.
+        // its first page (page-level, both rail states). M20 — the EXPANDED rail
+        // then accordion-expands this group (the workspace rail is standardised on
+        // the SAME pattern as the built-ins); the flyout is the COLLAPSED rail's
+        // hover + ArrowRight (keyboard) affordance.
         b.addEventListener('click', function () {
           var first = (dest.pages && dest.pages[0]) || null;
           location.hash = first ? ('#/w/' + ws.uid + '/' + first) : ('#/w/' + ws.uid);
         });
         if (multi) {
           b.setAttribute('aria-haspopup', 'true');
-          b.setAttribute('aria-expanded', 'false');
-          b.addEventListener('mouseenter', function () { openWorkspaceRailFlyout(ws, dest, b); });
+          b.addEventListener('mouseenter', function () { if (railIsCollapsed()) { openWorkspaceRailFlyout(ws, dest, b); } });
           b.addEventListener('mouseleave', scheduleRailFlyoutClose);
           b.addEventListener('keydown', function (e) {
             if (e.key === 'ArrowRight') { e.preventDefault(); openWorkspaceRailFlyout(ws, dest, b); railFlyoutFocusFirst(); }
           });
         }
       })(d, btn);
-      nav.appendChild(btn);
+      buildNavGroup(nav, btn, d.id, items);
     });
     applyPosture(nav);
-  }
-  // The pages of a workspace group as a sub-nav pill row — the config-driven twin
-  // of buildSubnav. THIS is the M17 bug fix: before, a workspace's pages appeared
-  // nowhere (the rail showed only the group label), so a dest like "Main" read as
-  // empty and a newly added page never surfaced. Now every page is a visible,
-  // navigable pill (expanded rail) + a flyout row (compressed rail).
-  function buildWorkspaceSubnav(ws, dest, activePageUid) {
-    var row = el('div', { 'class': 'subnav', role: 'tablist', 'aria-label': 'Pages in this group' });
-    workspaceDestPages(dest).forEach(function (p) {
-      var pill = el('button', { 'class': 'pill', type: 'button', 'data-page': p.uid, 'aria-current': p.uid === activePageUid ? 'page' : 'false' }, [p.title]);
-      (function (uid) { pill.addEventListener('click', function () { location.hash = '#/w/' + ws.uid + '/' + uid; }); })(p.uid);
-      row.appendChild(pill);
-    });
-    return row;
+    syncRailAccordion(activeDest ? activeDest.id : null, activePageUid || null);
   }
   function renderWorkspace(wsUid, pageUid) {
     var R = (typeof window !== 'undefined') ? window.CruxRender : null;
@@ -4601,11 +4833,11 @@
     if (!pdef) {
       renderWorkspaceEmpty(content, ws);
     } else {
-      // M17 bug fix — surface the group's pages as a sub-nav pill row (the
-      // built-in console has always had this; the workspace path never did, so
-      // pages were invisible/unreachable). Every page renders through the SAME
-      // builders as the console (real data).
-      if (dest && workspaceDestPages(dest).length) { content.appendChild(buildWorkspaceSubnav(ws, dest, pageU)); }
+      // M17 bug fix — a workspace group's pages must be VISIBLE and navigable.
+      // M20 moves that listing from the topbar pill row into the rail accordion
+      // (buildWorkspaceRail → buildNavGroup), so there is ONE sub-page idiom in
+      // the console. Every page still renders through the SAME builders as the
+      // built-in console (real data).
       var host = el('div', { 'class': 'page-host', id: 'pageHost' });
       content.appendChild(host);
       if (R && R.renderWorkspacePage) { R.renderWorkspacePage(host, pdef, { summary: BOOT.summary }); }
@@ -4676,6 +4908,16 @@
     // an existing #/canvas/board|graph|tree deep link (incl. a bare #/canvas) is
     // REDIRECTED to #/rings/<view>, preserving any ?focus= (graph). #/canvas/studio
     // keeps working (Studio's stable home) and falls through to renderDestination.
+    // M20 — Overwatch is retired as a destination: Rings IS the console index and
+    // its tabs ARE the Overwatch views (the SAME owRenderTab renderers). Every
+    // #/overwatch route therefore redirects to its Rings equivalent, so no old
+    // deep link (or bookmark, or sitemap node) dead-ends.
+    if (first === 'overwatch') {
+      var owMap = (CP && CP.OVERWATCH_TO_RINGS) || {};
+      var owSlug = owMap[parts[1]] || 'ring';
+      location.hash = '#/rings' + (owSlug === 'ring' ? '' : '/' + owSlug);   // hashchange → route()
+      return;
+    }
     if (first === 'canvas') {
       var cvView = parts[1] || 'board';
       if (cvView !== 'studio') {
@@ -4711,6 +4953,9 @@
     var r = currentRoute();
     renderDestination(r.dest, r.page);
     syncRailIcons();   // M16a: reflect the active surface on the collapsed-rail icons
+    // M20 — one accordion group open: the destination we just navigated to. For
+    // Rings the "page" is the tab slug (the ring itself when none is given).
+    syncRailAccordion(r.dest, r.dest === 'rings' ? activeRingsSlug() : r.page);
   }
 
   // Documents-mode render: swap the rail to the document tree (render.js builds

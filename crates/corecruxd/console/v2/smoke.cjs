@@ -844,9 +844,13 @@ function extractThemeVars(theme) {
   const tabM = shellHtml.match(/TAB_DEST_IDS\s*=\s*\[([^\]]*)\]/);
   check(!!tabM, '[phone] shell.html must declare TAB_DEST_IDS (the three direct tabs)');
   const tabIds = tabM ? (tabM[1].match(/'([^']+)'/g) || []).map(function (s) { return s.replace(/'/g, ''); }) : [];
-  ['overwatch', 'work', 'trust'].forEach(function (id) {
+  // M20 RETARGET (operator directive): Overwatch is retired as a destination —
+  // Rings is the console index and its tabs ARE the Overwatch views. The phone
+  // tier's first direct tab moves with it. Work + Trust are unchanged.
+  ['rings', 'work', 'trust'].forEach(function (id) {
     check(tabIds.indexOf(id) >= 0, '[phone] TAB_DEST_IDS must include the "' + id + '" tab');
   });
+  check(tabIds.indexOf('overwatch') < 0, '[phone] the retired Overwatch destination must NOT be a phone tab (M20)');
   check(/label:\s*'More'/.test(shellHtml), '[phone] the 4th tab must be "More"');
   check((tabIds.length + 1) === 4, '[phone] tab bar must have exactly 4 tabs (3 direct + More); got ' + (tabIds.length + 1));
   // Safe-area inset respected (fixed bar + content padding).
@@ -2009,9 +2013,14 @@ function extractThemeVars(theme) {
   ['mcpSeries', 'integrationsSeries', 'engineLatencySeries'].forEach(function (k) {
     check(Array.isArray(demo[k]) && demo[k].length >= 2, '[overwatch] CruxDemo.' + k + ' must be a demo-only series (length >= 2)');
   });
-  // Shell suppresses the sub-nav pill row for overwatch ONLY.
-  check(/if \(destId !== 'overwatch'\) \{ content\.appendChild\(buildSubnav/.test(shellHtml),
-    '[overwatch] shell.html must suppress the sub-nav pill row for the overwatch destination only');
+  // M20 RETARGET: the sub-nav PILL ROW is gone from the whole console — sub-page
+  // navigation is the rail accordion (one idiom, not two). The original assertion
+  // ("suppressed for overwatch only") no longer has a subject; the honest successor
+  // is that buildSubnav does not exist at all and the accordion does.
+  check(!/function buildSubnav\(/.test(shellHtml) && !/appendChild\(buildSubnav/.test(shellHtml),
+    '[overwatch] shell.html must NOT build a sub-nav pill row any more (M20: buildSubnav removed)');
+  check(/function buildNavGroup\(/.test(shellHtml) && /function syncRailAccordion\(/.test(shellHtml),
+    '[overwatch] shell.html must build the rail accordion instead (buildNavGroup + syncRailAccordion)');
   // CSS: the new tokens exist (all colours are var(--…) — checked below).
   check(/\.stat\.stat-lg \.v/.test(shellHtml), '[overwatch] shell.html must style the legacy stat-lg number size');
   check(/\.ow-pagenav/.test(shellHtml), '[overwatch] shell.html must style the .ow-pagenav right-column nav');
@@ -3578,20 +3587,33 @@ function extractThemeVars(theme) {
 
     // Every non-Pro registered page has exactly one live node at its real route.
     // (Operator posture, so operator-only pages are included.)
+    // M20 RETARGET: the Overwatch destination is retired, so its pages have no
+    // #/overwatch/<id> route any more — they are Rings VIEWS (#/rings/<slug>), and
+    // the map emits them there. The coverage rule is unchanged in substance: every
+    // non-Pro registered page must still have exactly one live click-through node.
+    const OW_TO_RINGS = pages.OVERWATCH_TO_RINGS || {};
     let expectedPages = 0;
     Object.keys(pages.PAGES).forEach(function (id) {
       const p = pages.PAGES[id];
       if (p.pro === true) { return; }
       expectedPages++;
-      const want = '#/' + p.dest + '/' + id;
+      let want = '#/' + p.dest + '/' + id;
+      if (p.dest === 'overwatch') {
+        const slug = OW_TO_RINGS[id] || 'ring';
+        want = slug === 'ring' ? '#/rings' : '#/rings/' + slug;
+      }
       check(hrefs.has(want), '[sitemap] registered page ' + id + ' has no click-through node (' + want + ')');
     });
+    check(!Array.from(hrefs).some(function (h) { return /^#\/overwatch/.test(h); }),
+      '[sitemap] no node may point at the retired #/overwatch destination (M20)');
 
     // The destination-IS-the-page surfaces get their real routes. M19 — Board/
     // Graph/Tree are absorbed into the Rings tab hub, so their map nodes moved from
     // #/canvas/<view> to #/rings/<view> (the Canvas destination is retired from the
     // map; Studio moved to the account menu + rail head). Honest retarget.
-    ['#/overwatch', '#/rings/board', '#/rings/graph', '#/rings/tree', '#/explorer', '#/sitemap', '#/rings'].forEach(function (route) {
+    // M20 — '#/overwatch' is gone from this list with the destination; the five
+    // Overwatch views now appear as Rings tab nodes (asserted above).
+    ['#/rings/board', '#/rings/graph', '#/rings/tree', '#/explorer', '#/sitemap', '#/rings'].forEach(function (route) {
       check(hrefs.has(route), '[sitemap] missing destination-is-page node for ' + route);
     });
 
@@ -3604,7 +3626,8 @@ function extractThemeVars(theme) {
       '[sitemap] the you-are-here node must set aria-current="page"');
 
     // (e) the recommended first-run path is numbered on its cards.
-    const startRoutes = ['#/overwatch', '#/work/cx-sessions', '#/memory/cx-facts', '#/trust/cx-receipts'];
+    // M20 RETARGET: step 1 is Rings — it is where boot lands now.
+    const startRoutes = ['#/rings', '#/work/cx-sessions', '#/memory/cx-facts', '#/trust/cx-receipts'];
     startRoutes.forEach(function (route) {
       const node = nodeAnchors.find(function (a) { return a.getAttribute('href') === route; });
       check(!!node, '[sitemap] start-path node missing: ' + route);
@@ -3729,8 +3752,17 @@ function extractThemeVars(theme) {
   // (a) BUG FIX — a workspace group's pages render as a sub-nav pill row driven
   //     by the SAME config model as the flyout (before M17 the rail showed only
   //     the group label, so pages — incl. a newly added one — appeared nowhere).
-  check(/function buildWorkspaceSubnav\(/.test(shellHtml) && /buildWorkspaceSubnav\(ws, dest, pageU\)/.test(shellHtml),
-    '[m17] renderWorkspace must render a config-driven page sub-nav (buildWorkspaceSubnav) — the workspace-pages bug fix');
+  // M20 RETARGET: the M17 fix was "a workspace group's pages must be VISIBLE and
+  // navigable". That requirement is unchanged — only its vehicle moved, from the
+  // topbar pill row (buildWorkspaceSubnav, now removed with buildSubnav) into the
+  // rail accordion, which the workspace rail builds from the SAME workspaceDestPages
+  // join. The assertion follows the requirement, not the removed function name.
+  check(!/function buildWorkspaceSubnav\(/.test(shellHtml),
+    '[m17] the workspace pill row must be gone (M20: one sub-page idiom — the accordion)');
+  check(/function workspaceGroupItems\(ws, dest\)/.test(shellHtml) && /workspaceDestPages\(dest\)/.test(shellHtml),
+    '[m17] a workspace group\'s pages must still resolve from the config model (workspaceGroupItems → workspaceDestPages)');
+  check(/buildNavGroup\(nav, btn, d\.id, items\)/.test(shellHtml),
+    '[m17] buildWorkspaceRail must render each group\'s pages as an accordion group — the workspace-pages bug fix, M20 vehicle');
   check(/function workspaceDestPages\(/.test(shellHtml) && /function openWorkspaceRailFlyout\(/.test(shellHtml),
     '[m17] workspace dests must resolve their pages (workspaceDestPages) + open the flyout (openWorkspaceRailFlyout)');
   // (b) live pick-up: a stored console:workspace:/console:page: fact reloads the
@@ -3830,8 +3862,16 @@ function extractThemeVars(theme) {
     '[m19] the facts glance tile must chart the real facts-stored_at series (no fabricated trend)');
   // (c) Canvas absorbed: Board/Graph/Tree are Rings tabs; #/canvas/* redirects;
   //     the Canvas destination is railHidden (route-only, Studio's stable home).
-  check(/id: 'cv-board'/.test(renderSrc) && /id: 'cv-graph'/.test(renderSrc) && /id: 'cv-tree'/.test(renderSrc),
-    '[m19] RINGS_TABS must carry the absorbed Board/Graph/Tree tabs (cv-board/cv-graph/cv-tree)');
+  // M20 RETARGET: the nine tab DEFINITIONS moved out of renderRings into the shared
+  // registry (CruxPages.RINGS_TAB_SLUGS + render.js RINGS_TAB_ICONS) because the rail
+  // accordion renders them now. The substance holds: Board/Graph/Tree are still three
+  // of the nine Rings views.
+  const slugDefs = pages.RINGS_TAB_SLUGS || [];
+  const slugTabs = slugDefs.map(function (t) { return t.tab; });
+  ['cv-board', 'cv-graph', 'cv-tree'].forEach(function (t) {
+    check(slugTabs.indexOf(t) >= 0, '[m19] the Rings view registry must carry the absorbed ' + t + ' tab');
+  });
+  check(slugDefs.length === 9, '[m19] the Rings tab hub must carry nine views (got ' + slugDefs.length + ')');
   check(/CANVAS_TAB_IDS/.test(renderSrc) && /renderCanvasGraph\(tabHost/.test(renderSrc) && /renderPlanTree\(tabHost/.test(renderSrc) && /renderCanvasBoard\(tabHost/.test(renderSrc),
     '[m19] the rings tab hub must render Board/Graph/Tree through their normal renderers into the swap host');
   check(/function teardownCanvasTab\(/.test(renderSrc) && /__canvasGraphCleanup/.test(renderSrc),
@@ -3841,8 +3881,10 @@ function extractThemeVars(theme) {
     '[m19] the Canvas destination must be railHidden + keyless (route-only home for Studio; not in the rail/keyboard)');
   check(/first === 'canvas'/.test(shellHtml) && /'#\/rings\/' \+ target/.test(shellHtml),
     '[m19] route() must redirect #/canvas/board|graph|tree to #/rings/<view> (deep links never dead-end)');
-  check(/initialTab: ringsInitialTab/.test(shellHtml) && /RINGS_TAB_MAP/.test(shellHtml),
-    '[m19] the rings route must map a #/rings/<view> deep link to the matching tab (initialTab)');
+  // M20 RETARGET: the ad-hoc RINGS_TAB_MAP (board|graph|tree only) is replaced by
+  // ringsTabIdForSlug over the shared nine-slug grammar — a strictly wider mapping.
+  check(/initialTab: ringsInitialTab/.test(shellHtml) && /function ringsTabIdForSlug\(/.test(shellHtml),
+    '[m19] the rings route must map a #/rings/<slug> deep link to the matching tab (initialTab)');
   check(/d\.id !== 'explorer' && d\.id !== 'canvas'/.test(renderSrc),
     '[m19] the Command workspace builtin must skip the retired Canvas destination');
   check(/#\/canvas\/studio keeps working/.test(shellHtml) || /studio' \)/.test(shellHtml) || /parts\[1\] === 'studio'/.test(shellHtml),
@@ -3862,6 +3904,97 @@ function extractThemeVars(theme) {
   check(/a dest icon CLICK always navigates/.test(shellHtml) && /e\.key === 'ArrowRight'/.test(shellHtml),
     '[m19] a rail dest click must navigate page-level; the flyout is a hover + ArrowRight (keyboard) affordance');
   notes.push('operator round 8 (M19): rings play bar moved inline with the tab icons + search (static, aria-hidden range labels where the pickers were); date pickers returned to the bottom bar flanking the window sliders; duplicate execplans/sessions glance tiles removed; sessions tile + facts glance gained real per-day histograms (last_active_unix_ms / facts stored_at); Board/Graph/Tree absorbed into the Rings tab hub (renderCanvasBoard/Graph + renderPlanTree into the swap host, clean teardown), Canvas destination retired to a railHidden route-only home, #/canvas/board|graph|tree redirect to #/rings/<view>, sitemap Check 50 retargeted; Studio relocated to the account pop-out (between Settings and Language) + a rail-head button next to the theme control, removed from the operator popup; rail dest click navigates page-level with a hover + ArrowRight flyout (built-in + workspace rails).');
+})();
+
+// ---- Check 56 — (console-surfaces-remediation M20) operator round 9:
+//  accordion nav (the nine Rings views move out of the main pane into the left
+//  nav; ONE group open — the active destination's; pills removed console-wide),
+//  Rings as the console INDEX (default route, top of the rail, #/overwatch
+//  redirects), graph zoom anchored at the POINTER + the Overview element rebuilt
+//  as a bottom-left glass chip, one-row rings bottom bar with a width-matched top
+//  bar, and the completed-plans list nudged clear of the left toolbar.
+(function () {
+  // (a) ONE sub-page item list feeds BOTH rail states; pills are gone.
+  check(/function railGroupItems\(destId\)/.test(shellHtml) && /function workspaceGroupItems\(ws, dest\)/.test(shellHtml),
+    '[m20] the shell must define railGroupItems + workspaceGroupItems (one list for the accordion AND the flyout)');
+  check(!/function buildSubnav\(/.test(shellHtml) && !/function buildWorkspaceSubnav\(/.test(shellHtml) && !/'class': 'subnav'/.test(shellHtml),
+    '[m20] the topbar sub-nav PILL ROW must be removed console-wide (built-in + workspace)');
+  check(/function openRailFlyout\(destId, anchorBtn\) \{\s*\n\s*var items = railGroupItems\(destId\);/.test(shellHtml),
+    '[m20] the collapsed-rail flyout must render the SAME railGroupItems (so the two rail states cannot disagree)');
+  // (b) the accordion itself: one group open, animated, reduced-motion aware.
+  check(/function buildNavGroup\(nav, btn, key, items\)/.test(shellHtml) && /function navGroupSetOpen\(rec, open\)/.test(shellHtml) && /function syncRailAccordion\(/.test(shellHtml),
+    '[m20] the shell must build accordion groups (buildNavGroup / navGroupSetOpen / syncRailAccordion)');
+  check(/\.nav-sub \{[^}]*height: 0[^}]*transition: height/.test(shellHtml) && /\.nav-sub \{[^}]*opacity: 0/.test(shellHtml),
+    '[m20] .nav-sub must animate height + opacity (the downward expand)');
+  check(/prefers-reduced-motion: reduce\) \{\s*\n\s*\.nav-sub \{ transition: none/.test(shellHtml) && /function navReduceMotion\(/.test(shellHtml),
+    '[m20] the accordion must respect prefers-reduced-motion (CSS + the JS end-state snap)');
+  check(/var open = \(k === activeKey\);/.test(shellHtml),
+    '[m20] exactly one group may be open — the active destination\'s');
+  check(/:root\[data-rail="collapsed"\] \.nav-sub \{ display: none; \}/.test(shellHtml),
+    '[m20] the collapsed rail must NOT show the accordion (it keeps the M19 click + flyout idiom)');
+  check(/buildNavGroup\(nav, btn, item\.id, items\)/.test(shellHtml) && /buildNavGroup\(nav, btn, d\.id, items\)/.test(shellHtml),
+    '[m20] BOTH rails (built-in + workspace) must build accordion groups — the standard applies to all nav links');
+  // (c) the nine Rings views are the Rings group; switching drives the SAME swap.
+  const slugs = (pages.RINGS_TAB_SLUGS || []).map(function (t) { return t.slug; });
+  check(slugs.length === 9, '[m20] CruxPages.RINGS_TAB_SLUGS must define the nine Rings views (got ' + slugs.length + ')');
+  check(slugs[0] === 'ring' && slugs.indexOf('graph') > 0 && slugs.indexOf('agent') > 0,
+    '[m20] the Rings slug grammar must start at "ring" and cover the absorbed + Overwatch views');
+  check(/ringsTabDefs: ringsTabDefs/.test(renderSrc) && /ringsSetTab: ringsSetTab/.test(renderSrc) && /ringsTabMounted: ringsTabMounted/.test(renderSrc),
+    '[m20] render.js must export the rail contract (ringsTabDefs / ringsSetTab / ringsTabMounted)');
+  check(/ringsSetTabHook = ringsSetTabBridge/.test(renderSrc) && /if \(ringsSetTabHook === ringsSetTabBridge\) \{ ringsSetTabHook = null; \}/.test(renderSrc),
+    '[m20] renderRings must publish its setTab bridge while mounted and clear it on teardown');
+  check(/R\.ringsSetTab\(tabId\);/.test(shellHtml) && /history\.replaceState\(null, '', location\.pathname \+ location\.search \+ target\)/.test(shellHtml),
+    '[m20] an accordion row must drive the in-place swap + replaceState (a hashchange would re-route and kill the fade)');
+  check(!/'class': 'rings-tabicons'/.test(renderSrc) && !/ringTabBar/.test(renderSrc),
+    '[m20] the topbar #ringsTabSlot tab ICONS must be removed (the rail owns the controls now)');
+  // (d) Rings is the index; Overwatch is retired but its renderers stay.
+  check((pages.DESTS[0] || {}).id === 'rings' && (pages.DESTS[0] || {}).key === '1',
+    '[m20] Rings must be DESTS[0] (the default route + top of the rail) with the "1" shortcut');
+  const owDest = (pages.DESTS || []).find(function (d) { return d.id === 'overwatch'; });
+  check(!!owDest && owDest.railHidden === true && owDest.key === undefined,
+    '[m20] the Overwatch destination must be railHidden + keyless (retired, registry kept coherent)');
+  check(/if \(first === 'overwatch'\)/.test(shellHtml) && /OVERWATCH_TO_RINGS/.test(shellHtml),
+    '[m20] route() must redirect every #/overwatch route to its Rings equivalent');
+  check(Object.keys(pages.OVERWATCH_TO_RINGS || {}).length === 6,
+    '[m20] every Overwatch page must have a Rings redirect target (got ' + Object.keys(pages.OVERWATCH_TO_RINGS || {}).length + ')');
+  check(/function renderOverwatchLanding\(/.test(renderSrc) && /function owRenderTab\(/.test(renderSrc),
+    '[m20] the Overwatch RENDERERS must stay — they power the Rings tabs');
+  check(/d\.id !== 'explorer' && d\.id !== 'canvas' && d\.id !== 'overwatch'/.test(renderSrc),
+    '[m20] the Command workspace builtin must skip the retired Overwatch destination');
+  check(/if \(d\.id === 'overwatch'\) \{ return \{ dest: d, nodes: \[\] \}; \}/.test(renderSrc),
+    '[m20] the site map must emit NO Overwatch section (its views are Rings nodes)');
+  check((function () { const m = renderSrc.match(/var SITEMAP_START = \[([^\]]*)\]/); return !!m && /'rings'/.test(m[1]) && !/overwatch/.test(m[1]); })(),
+    '[m20] the site map start path must begin at Rings (where boot lands)');
+  // (e) graph zoom anchored at the pointer + the rebuilt Overview chip.
+  check(/function zoomAtPoint\(sx, sy, factor\)/.test(renderSrc) && /view\.tx = sx - \(sx - view\.tx\) \* k;/.test(renderSrc) && /view\.ty = sy - \(sy - view\.ty\) \* k;/.test(renderSrc),
+    '[m20] the canvas graph must anchor the zoom transform at a point (not the layer origin)');
+  check(/zoomAtPoint\(ev\.clientX - sr\.left, ev\.clientY - sr\.top, ev\.deltaY < 0 \? 1\.1 : 0\.9\)/.test(renderSrc),
+    '[m20] the graph wheel handler must pass the POINTER position to zoomAtPoint');
+  check(/function zoomBy\(factor\) \{ zoomAtPoint\(/.test(renderSrc),
+    '[m20] the +/- buttons must go through the same anchored zoom (viewport centre)');
+  check(/'class': 'cv-zoom-pct'/.test(renderSrc) && /function updateZoomChip\(/.test(renderSrc),
+    '[m20] the Overview chip must report the live zoom percentage alongside the LOD state');
+  check(/\.cv-zoom \{[^}]*position: absolute;[^}]*left: 14px;[^}]*bottom: 14px/.test(shellHtml),
+    '[m20] the Overview chip must sit in the BOTTOM-LEFT corner of the graph viewport');
+  check(/\.rings-tabhost \.canvas-graph-stage \{ height: auto; min-height: 0; flex: 1 1 auto; \}/.test(shellHtml),
+    '[m20] inside the Rings tab host the graph stage must FILL the viewport (so the corner is the real corner)');
+  check(!/<iframe/i.test(renderSrc.slice(renderSrc.indexOf('function drawGraph'), renderSrc.indexOf('function renderCanvasGraph'))),
+    '[m20] the graph (and its Overview element) must be NATIVE — no iframe');
+  // (f) rings bars: one row, one shared measure.
+  check(/:root \{ --rings-bar-measure: min\(760px, calc\(100% - 28px\)\); \}/.test(shellHtml),
+    '[m20] both rings bars must share ONE measure custom property');
+  check(/\.rings-bottombar \{[^}]*width: var\(--rings-bar-measure\)[^}]*flex-wrap: nowrap/.test(shellHtml),
+    '[m20] the rings bottom bar must be a single non-wrapping row on the shared measure');
+  check(/\.topbar\.rings-tabmode \.rings-playbar \{\s*\n\s*position: absolute; left: 50%; transform: translateX\(-50%\);\s*\n\s*width: var\(--rings-bar-measure\)/.test(shellHtml),
+    '[m20] the rings top bar must take the shared measure + the same centring as the bottom bar');
+  // (g) the completed-plans list clears the left toolbar.
+  check(/var LEDGER_X = Math\.round\(toolsRight\) \+ 14;/.test(renderSrc) && /tR\.right - cR\.left/.test(renderSrc),
+    '[m20] the completed-plans list must start clear of the left toolbar, measured from its live geometry');
+  check(!/ctx\.fillRect\(12, y - 11, 218, 15\)/.test(renderSrc) && /ctx\.fillRect\(LEDGER_X, y - 11, 218, 15\)/.test(renderSrc),
+    '[m20] the ledger rows (and their hit boxes) must move with LEDGER_X');
+  check(/ledgerRows\.push\(\{ x: LEDGER_X/.test(renderSrc),
+    '[m20] the ledger hit-test rects must match the drawn rows (click-to-solo stays aligned)');
+  notes.push('operator round 9 (M20): the nine Rings views moved OUT of the main pane INTO the left nav as an accordion group (buildNavGroup/syncRailAccordion; one group open — the active destination\'s; height+opacity ease, reduced-motion snap), applied to BOTH the built-in and workspace rails; the topbar sub-nav PILL ROW is removed console-wide (buildSubnav + buildWorkspaceSubnav deleted) — accordion expanded / flyout collapsed, both off ONE railGroupItems list; a Rings row drives the SAME in-place fade swap via CruxRender.ringsSetTab + replaceState (a hashchange would re-route and kill the fade), and the topbar tab icons are gone; RINGS IS THE INDEX (DESTS[0], key 1, boot + "#/" land there) and Overwatch is retired to a railHidden route-only registry entry with every #/overwatch route redirected to its Rings equivalent (renderers kept — they ARE the tabs), plus sitemap/start-path/workspace-builtin/phone-tab retargets; the canvas graph zoom is ANCHORED AT THE POINTER (zoomAtPoint: t\' = s - (s - t)·k) and the Overview element is rebuilt as a compact bottom-left glass chip (LOD state + zoom %, native, var(--) tokens) over a stage that now fills the tab host; the rings bottom bar is one non-wrapping row and the top bar takes the same measure + midline; the completed-plans list starts clear of the vertical left toolbar, measured from its live geometry.');
 })();
 
 // ---- Report (awaits async renderer-driven checks) -----------------------

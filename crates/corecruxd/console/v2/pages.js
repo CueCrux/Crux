@@ -1271,7 +1271,16 @@
 
   // ---- Destinations (rail order + pill grouping) ------------------------
   var DESTS = [
-    { id: 'overwatch', label: 'Overwatch', icon: 'overwatch', key: '1', sub: 'Needs-you queue, fleet, and live activity.' },
+    // Rings (M20) — THE CONSOLE INDEX. It is the default route (DESTS[0] drives
+    // currentRoute's fallback + the boot landing) and sits at the top of the rail.
+    // Its nine views (Ring · Activity · Live board · Orchestrators · Punchcards ·
+    // Agent · Board · Graph · Tree) are the rail's accordion group for this
+    // destination — deep-linked as #/rings/<slug> (see RINGS_TAB_SLUGS below).
+    // Rendered NATIVELY by render.js renderRings (canvas "clock of work"; no
+    // iframe, no base64 blob): the real work board, daemon glance and visible fact
+    // store, replayed as an animated ring, live-wired through the console's CruxApi
+    // client with snapshot fallbacks. Reads only, so it shows in every posture.
+    { id: 'rings', label: 'Rings', icon: 'rings', key: '1', sub: 'The clock of work — the live work board, facts and glance as an animated ring.' },
     { id: 'work', label: 'Work', icon: 'work', key: '2', sub: 'ExecPlans, projects, and sessions.' },
     { id: 'memory', label: 'Memory', icon: 'memory', key: '3', sub: 'Facts, tenants, documents, and retrieval tuning.' },
     { id: 'trust', label: 'Trust', icon: 'trust', key: '4', sub: 'Receipts, gates, identity, and posture.' },
@@ -1302,13 +1311,37 @@
     // to a registered route derived from this registry (render.js renderSiteMap,
     // M8) — so it cannot drift from the nav. Reads nothing; shows in every posture.
     { id: 'sitemap', label: 'Site map', icon: 'map', key: '7', sub: 'Every surface, one click away — with what each is for' },
-    // Rings — a destination with no sub-pills: it IS the page. Rendered NATIVELY
-    // by render.js renderRings (canvas "clock of work"; no iframe, no base64
-    // blob): the real work board, daemon glance and visible fact store, replayed
-    // as an animated ring, live-wired through the console's CruxApi client with
-    // snapshot fallbacks. Reads only, so it shows in every posture.
-    { id: 'rings', label: 'Rings', icon: 'rings', key: '8', sub: 'The clock of work — the live work board, facts and glance as an animated ring.' }
+    // Overwatch (M20) — RETIRED as a destination. Its five views ARE Rings tabs
+    // 2-6 (they always were: the Rings hub calls the SHARED owRenderTab), so the
+    // landing duplicated the index. `railHidden` + no key keeps the page registry
+    // coherent (cx-activity / cx-coord / cx-orchestrators / cx-punchcards /
+    // ax-agent / cx-overview still hang off this dest and still power the tabs)
+    // while removing it from the rail, the site map, the Command workspace
+    // builtin, the phone tab bar and the keyboard shortcuts. Every #/overwatch
+    // route REDIRECTS to its Rings equivalent (shell.html route()).
+    { id: 'overwatch', label: 'Overwatch', icon: 'overwatch', railHidden: true, sub: 'Retired — its views are Rings tabs (#/overwatch redirects).' }
   ];
+
+  // ---- Rings tab slugs (M20) --------------------------------------------
+  // The nine Rings views, as the hash grammar (#/rings/<slug>) AND the rail
+  // accordion group for the Rings destination. ONE source of truth shared by the
+  // shell (rail accordion + route parsing + #/overwatch redirects) and render.js
+  // (the tab hub). `page` names the Overwatch page id a tab renders through
+  // owRenderTab (null = the ring canvas or an absorbed Canvas view).
+  var RINGS_TAB_SLUGS = [
+    { slug: 'ring', tab: 'ring', title: 'Ring', page: null },
+    { slug: 'activity', tab: 'cx-activity', title: 'Activity', page: 'cx-activity' },
+    { slug: 'live-board', tab: 'cx-coord', title: 'Live board', page: 'cx-coord' },
+    { slug: 'orchestrators', tab: 'cx-orchestrators', title: 'Orchestrators', page: 'cx-orchestrators' },
+    { slug: 'punchcards', tab: 'cx-punchcards', title: 'Punchcards', page: 'cx-punchcards' },
+    { slug: 'agent', tab: 'ax-agent', title: 'Agent', page: 'ax-agent' },
+    { slug: 'board', tab: 'cv-board', title: 'Board', page: null },
+    { slug: 'graph', tab: 'cv-graph', title: 'Graph', page: null },
+    { slug: 'tree', tab: 'cv-tree', title: 'Tree', page: null }
+  ];
+  // #/overwatch/<pageId> → #/rings/<slug>. A bare #/overwatch (or cx-overview,
+  // whose tiles the ring itself supersedes) lands on the ring.
+  var OVERWATCH_TO_RINGS = { 'cx-overview': 'ring', 'cx-activity': 'activity', 'cx-coord': 'live-board', 'cx-orchestrators': 'orchestrators', 'cx-punchcards': 'punchcards', 'ax-agent': 'agent' };
 
   // ---- Legacy id inventory (the 26 CX pages this plan must keep reachable)
   var LEGACY_IDS = [
@@ -1846,6 +1879,8 @@
   return {
     PAGES: PAGES,
     DESTS: DESTS,
+    RINGS_TAB_SLUGS: RINGS_TAB_SLUGS,
+    OVERWATCH_TO_RINGS: OVERWATCH_TO_RINGS,
     LEGACY_IDS: LEGACY_IDS,
     PRO_PORTED_IDS: PRO_PORTED_IDS,
     LEGACY_PORT: LEGACY_PORT,

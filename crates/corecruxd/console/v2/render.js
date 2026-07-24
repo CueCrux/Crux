@@ -2344,6 +2344,34 @@
     return wrap;
   }
 
+  // ---- Rings view definitions (M20) -------------------------------------
+  // The nine Rings views, with their unified-family glyphs. ONE definition,
+  // consumed by the rail accordion + the collapsed-rail flyout (shell.html) and
+  // by renderRings' swap host. Order + slugs come from CruxPages.RINGS_TAB_SLUGS
+  // (the hash grammar), so the nav, the routes and the renderer cannot drift.
+  var RINGS_TAB_ICONS = {
+    'ring': '<circle cx="12" cy="12" r="8.6"/><circle cx="12" cy="12" r="3.3"/>',
+    'cx-activity': '<path d="M3 12h3.6l2.4-7 4 14 2.4-7H21"/>',
+    'cx-coord': '<circle cx="12" cy="12" r="2.3"/><path d="M8.6 8.6a5 5 0 0 0 0 6.8M15.4 8.6a5 5 0 0 1 0 6.8M6.1 6.1a9 9 0 0 0 0 11.8M17.9 6.1a9 9 0 0 1 0 11.8"/>',
+    'cx-orchestrators': '<circle cx="12" cy="5" r="2.2"/><circle cx="5.5" cy="18.5" r="2.2"/><circle cx="18.5" cy="18.5" r="2.2"/><path d="M12 7.2v3.4M12 10.6l-6 5.9M12 10.6l6 5.9"/>',
+    'cx-punchcards': '<rect x="3.5" y="5" width="17" height="14" rx="2"/><circle cx="8" cy="10" r="1.05" fill="currentColor" stroke="none"/><circle cx="12" cy="10" r="1.05" fill="currentColor" stroke="none"/><path d="M7 14.5h10"/>',
+    'ax-agent': '<rect x="4.5" y="8" width="15" height="10" rx="2.5"/><path d="M12 4.6v3.4"/><circle cx="12" cy="4" r="1.05"/><circle cx="9.6" cy="13" r="1.05" fill="currentColor" stroke="none"/><circle cx="14.4" cy="13" r="1.05" fill="currentColor" stroke="none"/>',
+    'cv-board': '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
+    'cv-graph': '<circle cx="6" cy="7" r="2.1"/><circle cx="18" cy="7" r="2.1"/><circle cx="12" cy="17" r="2.1"/><path d="M8 7h8M7.6 8.6l3.6 6.8M16.4 8.6l-3.6 6.8"/>',
+    'cv-tree': '<rect x="9" y="3" width="6" height="4.4" rx="1"/><rect x="3" y="15" width="6" height="4.4" rx="1"/><rect x="15" y="15" width="6" height="4.4" rx="1"/><path d="M12 7.4v3.6M6 15v-2.4h12V15"/>'
+  };
+  function ringsTabDefs() {
+    var CP = (typeof window !== 'undefined') ? window.CruxPages : null;
+    var slugs = (CP && CP.RINGS_TAB_SLUGS) || [];
+    return slugs.map(function (s) { return { id: s.tab, slug: s.slug, title: s.title, icon: RINGS_TAB_ICONS[s.tab] || '' }; });
+  }
+  // Live switch hook — renderRings registers a setTab bridge here while it is
+  // mounted (cleared on teardown) so the rail accordion can drive the SAME
+  // in-place view swap instead of a full re-route (which would kill the fade).
+  var ringsSetTabHook = null;
+  function ringsSetTab(tabId) { if (ringsSetTabHook) { ringsSetTabHook(tabId); return true; } return false; }
+  function ringsTabMounted() { return !!ringsSetTabHook; }
+
   // Shared Overwatch tab-content renderer (M13). One source of truth for what a
   // view tab paints, reused by BOTH the Overwatch landing (renderTab) AND the
   // Rings tab hub (renderRings) — the Rings hub does NOT fork the view renderers,
@@ -3882,7 +3910,7 @@
       var s = Math.max(floor, Math.min(availW / d.width, availH / d.height, cap));
       return { scale: s, tx: pad + Math.max(0, (availW - d.width * s) / 2), ty: pad + Math.max(0, (availH - d.height * s) / 2) };
     }
-    function fitView() { var f = frame(activeDims); view.scale = f.scale; view.tx = f.tx; view.ty = f.ty; apply(); }
+    function fitView() { var f = frame(activeDims); view.scale = f.scale; view.tx = f.tx; view.ty = f.ty; apply(); updateZoomChip(); }
     fitView();
     // Zoom-aware LOD: crossing the threshold morphs the nodes between the ring
     // overview and the card detail arrangement over ~300ms (snap under reduced
@@ -3898,8 +3926,8 @@
       layer.style.width = activeDims.width + 'px'; layer.style.height = activeDims.height + 'px';
       svg.setAttribute('width', activeDims.width); svg.setAttribute('height', activeDims.height);
       layer.setAttribute('data-lod', mode);
-      if (modeLbl) { modeLbl.textContent = (mode === 'ring') ? 'overview' : 'detail'; }
       var f = frame(activeDims); view.scale = f.scale; view.tx = f.tx; view.ty = f.ty; apply();
+      updateZoomChip();   // M20 — the corner chip reports the new LOD + zoom %
       var from = {}, to = {};
       model.nodes.forEach(function (n) {
         var w = n.w || 300, h = n.h || 128;
@@ -3931,15 +3959,37 @@
       }
       lodRaf = window.requestAnimationFrame(stepFn);
     }
-    function zoomBy(factor) {
+    // M20 — ZOOM ANCHORED AT A POINT. The old zoomBy changed `scale` only, which
+    // pins the transform at the layer's origin (top-left) and slides everything
+    // under the cursor away. Standard pan/zoom keeps the world point under (sx,sy)
+    // fixed: world = (s - t) / k, so t' = s - (s - t) * (k' / k).
+    // (sx, sy) are STAGE-relative pixels; the layer sits at the stage origin with
+    // transform-origin 0 0 (see .cv-graph-layer), so no extra offset is needed.
+    function zoomAtPoint(sx, sy, factor) {
       var b = (mode === 'ring') ? { min: 0.03, max: 1.3 } : { min: 0.42, max: 2.4 };
       var ns = Math.max(b.min, Math.min(b.max, view.scale * factor));
+      var k = ns / view.scale;
+      view.tx = sx - (sx - view.tx) * k;
+      view.ty = sy - (sy - view.ty) * k;
       view.scale = ns; apply();
+      updateZoomChip();
+      // Crossing the LOD threshold re-frames the whole layout (switchMode), which
+      // deliberately re-centres — the anchor applies WITHIN a level of detail.
       if (mode === 'card' && factor < 1 && ns <= LOD_THRESHOLD) { switchMode('ring'); }
       else if (mode === 'ring' && factor > 1 && ns >= LOD_THRESHOLD) { switchMode('card'); }
     }
-    // Unobtrusive +/- zoom cluster (wheel/pinch still work) carrying a live LOD label.
+    // Button zoom keeps the viewport centre fixed (there is no pointer to anchor on).
+    function zoomBy(factor) { zoomAtPoint((stage.clientWidth || 960) / 2, (stage.clientHeight || 640) / 2, factor); }
+    // M20 — the "Overview" element, rebuilt for this page: a compact glass chip in
+    // the BOTTOM-LEFT corner of the graph viewport carrying the live LOD state
+    // (overview | detail) + the zoom percentage, with the −/+ and focus controls.
+    // Native DOM (no iframe), console var(--) tokens only. See .cv-zoom in shell.html.
     var modeLbl = el('span', { 'class': 'cv-zoom-mode', text: (mode === 'ring') ? 'overview' : 'detail' });
+    var zoomPct = el('span', { 'class': 'cv-zoom-pct', text: '100%' });
+    function updateZoomChip() {
+      if (modeLbl) { modeLbl.textContent = (mode === 'ring') ? 'overview' : 'detail'; }
+      if (zoomPct) { zoomPct.textContent = Math.round(view.scale * 100) + '%'; }
+    }
     var zoomOut = el('button', { 'class': 'cv-zoom-btn', type: 'button', 'aria-label': 'Zoom out', title: 'Zoom out' }, ['−']);
     var zoomIn = el('button', { 'class': 'cv-zoom-btn', type: 'button', 'aria-label': 'Zoom in', title: 'Zoom in' }, ['+']);
     zoomOut.addEventListener('click', function (e) { e.stopPropagation(); zoomBy(0.8); });
@@ -3950,7 +4000,14 @@
       'aria-label': 'Focus mode: isolate the selected node and its connections', title: 'Focus: isolate selected + connections' });
     focusBtn.innerHTML = svgIcon('<circle cx="12" cy="12" r="3.4"/><path d="M12 2.5v3.4M12 18.1v3.4M2.5 12h3.4M18.1 12h3.4"/>', 1.8);
     focusBtn.addEventListener('click', function (e) { e.stopPropagation(); setFocusMode(!focusMode); });
-    stage.appendChild(el('div', { 'class': 'cv-zoom' }, [zoomOut, modeLbl, zoomIn, el('span', { 'class': 'cv-zoom-div', 'aria-hidden': 'true' }), focusBtn]));
+    stage.appendChild(el('div', { 'class': 'cv-zoom', role: 'group', 'aria-label': 'Graph zoom and level of detail' }, [
+      zoomOut, zoomIn,
+      el('span', { 'class': 'cv-zoom-div', 'aria-hidden': 'true' }),
+      el('span', { 'class': 'cv-zoom-read' }, [modeLbl, zoomPct]),
+      el('span', { 'class': 'cv-zoom-div', 'aria-hidden': 'true' }),
+      focusBtn
+    ]));
+    updateZoomChip();
     var currentSel = null;   // M13 — the selected node key (drives focus mode)
     function select(key) {
       currentSel = key;
@@ -4062,7 +4119,13 @@
     stage.addEventListener('click', function (ev) { if (!onEmpty(ev)) { return; } if (!moved) { select(null); onSelect(null); if (focusMode) { clearFocus(); } } });   // M13 — deselect restores the full graph
     function onMove(ev) { if (!drag) { return; } moved = true; view.tx = drag.tx + (ev.clientX - drag.x); view.ty = drag.ty + (ev.clientY - drag.y); apply(); }
     function onUp() { drag = null; }
-    stage.addEventListener('wheel', function (ev) { ev.preventDefault(); zoomBy(ev.deltaY < 0 ? 1.1 : 0.9); });
+    // M20 — the wheel anchors at the POINTER: the world point under the cursor
+    // stays under the cursor (stage-relative coordinates feed zoomAtPoint).
+    stage.addEventListener('wheel', function (ev) {
+      ev.preventDefault();
+      var sr = stage.getBoundingClientRect();
+      zoomAtPoint(ev.clientX - sr.left, ev.clientY - sr.top, ev.deltaY < 0 ? 1.1 : 0.9);
+    });
     if (typeof window !== 'undefined') { window.addEventListener('mousemove', onMove); window.addEventListener('mouseup', onUp); }
     __canvasGraphCleanup = function () {
       if (rafId != null && typeof window !== 'undefined' && window.cancelAnimationFrame) { window.cancelAnimationFrame(rafId); rafId = null; }
@@ -4805,7 +4868,9 @@
     // M19 — Explorer is its own builtin workspace; Canvas is retired (Board/Graph/
     // Tree are Rings tabs, Studio moved to the account menu), so neither belongs in
     // the Command builtin's dest set.
-    return pages.DESTS.filter(function (d) { return d.id !== 'explorer' && d.id !== 'canvas'; }).map(function (d) {
+    // M20 — Overwatch is retired the same way: Rings IS the index and its tabs ARE
+    // the Overwatch views, so the Command builtin lists Rings, not both.
+    return pages.DESTS.filter(function (d) { return d.id !== 'explorer' && d.id !== 'canvas' && d.id !== 'overwatch'; }).map(function (d) {
       var list = byDest[d.id] || [];
       if (!list.length) {
         // Destination-IS-the-page surfaces (sitemap/rings): a single surface page
@@ -8756,7 +8821,6 @@
   // the Overwatch landing root (`#/overwatch`). Missing key → the registry `sub`
   // (endpoint noise stripped) is the honest fallback.
   var SITEMAP_META = {
-    '#/overwatch':     'Start here — needs-you, fleet and live pulse at a glance',
     'cx-overview':     'Daemon posture, readiness and capacity, one screen',
     'cx-activity':     'Live session stream beside the needs-you and fleet panels',
     'cx-coord':        'Who is working right now — live sessions and leases',
@@ -8791,7 +8855,16 @@
     'canvas:studio':   'Build a board of tiles (notes · API · web); saved daemon-side',
     'explorer':        'Search the corpus — local retrieval or mediated WikiCrux',
     'sitemap':         "You're here — the whole console, one guided map",
-    'rings':           'The clock of work — the live work board, facts and glance as an animated ring'
+    // M20 — Rings is the index; its nine views each get a node.
+    'rings':              'Start here — the clock of work: the live board, facts and glance as an animated ring',
+    'rings:activity':     'Live session stream beside the needs-you and fleet panels',
+    'rings:live-board':   'Who is working right now — live sessions and leases',
+    'rings:orchestrators':'Group plans running under one session',
+    'rings:punchcards':   'Advisory path leases, grouped by session',
+    'rings:agent':        'Agent-side cockpit — MCP tools, graph, and where each surface lives',
+    'rings:board':        'Size-adaptive tile dashboard — drag, pan, expand in place',
+    'rings:graph':        'Relation graph — real edges, ring layout when zoomed out',
+    'rings:tree':         'Plan tree — colour-coded by kind and state, filterable'
   };
   // Honest per-node badges — access posture + feature-gating, stated on the card.
   var SITEMAP_BADGE = {
@@ -8806,8 +8879,10 @@
   // Recommended first-run path (node keys, in order). Rendered as small numerals
   // on the matching cards + a legend; steps whose node is absent in this posture
   // are skipped so the numbering stays honest.
-  var SITEMAP_START = ['#/overwatch', 'cx-sessions', 'cx-facts', 'cx-receipts'];
-  var SITEMAP_START_LABEL = { '#/overwatch': 'Overwatch', 'cx-sessions': 'Sessions', 'cx-facts': 'Facts', 'cx-receipts': 'Receipts' };
+  // M20 — the first step is Rings: it is the console index (the retired Overwatch
+  // landing's views ARE its tabs), so the start path begins where boot lands.
+  var SITEMAP_START = ['rings', 'cx-sessions', 'cx-facts', 'cx-receipts'];
+  var SITEMAP_START_LABEL = { 'rings': 'Rings', 'cx-sessions': 'Sessions', 'cx-facts': 'Facts', 'cx-receipts': 'Receipts' };
 
   // Strip trailing "· /v1/…" endpoint noise from a registry sub for map display.
   function siteMapCleanSub(sub) {
@@ -8830,10 +8905,12 @@
     var sections = pages.DESTS.map(function (d) {
       var nodes = [];
       var list = byDest[d.id] || [];
+      // M20 — Overwatch is retired: its pages ARE the Rings tabs (emitted under
+      // Rings below), and #/overwatch redirects. It gets NO section at all — not
+      // its pages (they would duplicate the Rings nodes) and not a destination
+      // node (it would point at a redirect). Empty → filtered out below.
+      if (d.id === 'overwatch') { return { dest: d, nodes: [] }; }
       if (list.length) {
-        if (d.id === 'overwatch') {
-          nodes.push({ key: '#/overwatch', name: 'Home · at a glance', href: '#/overwatch' });
-        }
         list.forEach(function (p) {
           if (p.pro === true) { return; }               // Pro-mode-only → not on this map
           if (p.operatorOnly && !isOp) { return; }      // customer can't reach it → skip
@@ -8845,11 +8922,19 @@
         // menu + rail head (#/canvas/studio stays routable, but not a map node).
         // Empty section → filtered out.
       } else if (d.id === 'rings') {
-        // Rings IS the page, plus the three absorbed Canvas views as tab deep links.
-        nodes.push({ key: 'rings', name: d.label, href: '#/rings' });
-        nodes.push({ key: 'rings:board', name: 'Board', href: '#/rings/board' });
-        nodes.push({ key: 'rings:graph', name: 'Graph', href: '#/rings/graph' });
-        nodes.push({ key: 'rings:tree', name: 'Tree', href: '#/rings/tree' });
+        // M20 — Rings IS the console index; its NINE views are the map's Rings
+        // nodes (Ring = the index itself). Every slug comes from the shared
+        // CruxPages.RINGS_TAB_SLUGS grammar, so map ↔ nav ↔ routes cannot drift.
+        // ax-agent is pro:true, so its view is omitted in Standard mode exactly
+        // like every other Pro page on this map.
+        var proMap = (typeof window !== 'undefined' && window.CRUX_MODE === 'professional');
+        (pages.RINGS_TAB_SLUGS || []).forEach(function (s) {
+          var pg = s.page ? pages.PAGES[s.page] : null;
+          if (pg && pg.pro === true && !proMap) { return; }
+          if (pg && pg.operatorOnly && !isOp) { return; }
+          if (s.slug === 'ring') { nodes.push({ key: 'rings', name: d.label, href: '#/rings' }); return; }
+          nodes.push({ key: 'rings:' + s.slug, name: s.title, href: '#/rings/' + s.slug, sub: pg ? pg.sub : '' });
+        });
       } else {
         // explorer / sitemap — the destination IS the page.
         nodes.push({ key: d.id, name: d.label, href: '#/' + d.id });
@@ -8890,9 +8975,15 @@
     if (!dest || dest === 'sitemap') { return 'sitemap'; }
     // M19 — Board/Graph/Tree map to Rings tab nodes; Studio has no map node.
     if (dest === 'canvas') { return (leaf === 'graph' || leaf === 'tree' || leaf === 'board') ? 'rings:' + leaf : 'sitemap'; }
-    if (dest === 'rings') { return (leaf === 'board' || leaf === 'graph' || leaf === 'tree') ? 'rings:' + leaf : 'rings'; }
+    // M20 — any Rings view slug is a map node (rings:<slug>); the bare page is 'rings'.
+    if (dest === 'rings') { return (leaf && leaf !== 'ring') ? 'rings:' + leaf : 'rings'; }
     if (dest === 'explorer') { return dest; }
-    if (dest === 'overwatch' && !leaf) { return '#/overwatch'; }
+    // M20 — an #/overwatch origin resolves to the Rings node it redirects to.
+    if (dest === 'overwatch') {
+      var CPo = (typeof window !== 'undefined') ? window.CruxPages : null;
+      var slug = (CPo && CPo.OVERWATCH_TO_RINGS && CPo.OVERWATCH_TO_RINGS[leaf]) || 'ring';
+      return slug === 'ring' ? 'rings' : 'rings:' + slug;
+    }
     var present = {};
     sections.forEach(function (s) { s.nodes.forEach(function (n) { present[n.key] = s.dest.id; }); });
     if (leaf && present[leaf]) { return leaf; }         // explicit page node
@@ -11582,26 +11673,39 @@
       }
       ledgerRows = [];
       if (lens === 'work' && showLedger) {
+        // M20 — the completed-plans list starts to the RIGHT of the vertical left
+        // toolbar (.rings-tools: left 12px, 40px buttons → right edge ~52px) instead
+        // of overlapping it. LEDGER_X is measured from that toolbar's live geometry
+        // so the clearance holds if the toolbar is ever restyled.
+        var toolsRight = 52;
+        if (tools && typeof tools.getBoundingClientRect === 'function' && cv && typeof cv.getBoundingClientRect === 'function') {
+          var tR = tools.getBoundingClientRect(), cR = cv.getBoundingClientRect();
+          if (tR.width) { toolsRight = Math.max(0, tR.right - cR.left); }
+        }
+        var LEDGER_X = Math.round(toolsRight) + 14;   // rect left edge, clear of the toolbar
         var doneList = PLANS.filter(function (p) { return p.st === 0 && p.exit <= T && p.b <= E && p.e >= S - 0.001; }).sort(function (a, b) { return b.exit - a.exit; });
         ctx.font = '700 11px ' + MONO; ctx.fillStyle = hex2rgba(PAL.gate, .9);
-        ctx.fillText('completed · ' + doneList.length + (solo ? '  (filtering — click row again or background to clear)' : ''), 18, 52);
+        ctx.fillText('completed · ' + doneList.length + (solo ? '  (filtering — click row again or background to clear)' : ''), LEDGER_X + 6, 52);
         ctx.font = '9.5px ' + MONO;
         var maxRows = Math.floor((H - 140) / 16);
         doneList.slice(0, maxRows).forEach(function (p, k) {
           var fresh = T - p.exit < 2.0, isSolo = solo === p, y = 70 + k * 16;
-          if (isSolo) { ctx.fillStyle = acc(.16); ctx.fillRect(12, y - 11, 218, 15); }
+          if (isSolo) { ctx.fillStyle = acc(.16); ctx.fillRect(LEDGER_X, y - 11, 218, 15); }
           ctx.fillStyle = fresh || isSolo ? hex2rgba(PAL.gate, .95) : ink3c(.75);
-          ctx.fillText('✓', 18, y);
+          ctx.fillText('✓', LEDGER_X + 6, y);
           ctx.fillStyle = isSolo ? ink(1) : fresh ? ink(.95) : ink3c(.8);
           var lbl = p.short.length > 26 ? p.short.slice(0, 25) + '…' : p.short;
-          ctx.fillText(lbl, 32, y);
+          ctx.fillText(lbl, LEDGER_X + 20, y);
           ctx.fillStyle = ink3c(.55);
-          ctx.fillText(dayDate(p.exit).slice(5), 32 + 27 * 6.0, y);
-          ledgerRows.push({ x: 12, y: y - 11, w: 218, h: 15, p: p });
+          ctx.fillText(dayDate(p.exit).slice(5), LEDGER_X + 20 + 27 * 6.0, y);
+          ledgerRows.push({ x: LEDGER_X, y: y - 11, w: 218, h: 15, p: p });
         });
         if (doneList.length > maxRows) {
           ctx.fillStyle = ink3c(.6);
-          ctx.fillText('… +' + (doneList.length - maxRows) + ' more', 18, 70 + maxRows * 16);
+          ctx.fillText('… +' + (doneList.length - maxRows) + ' more', LEDGER_X + 6, 70 + maxRows * 16);
+        }
+        if (typeof window !== 'undefined' && window.__CRUX_CONSOLE_DEV__) {
+          window.__ringsLedger = { x: LEDGER_X, w: 218, toolsRight: toolsRight, rows: ledgerRows.length };
         }
       }
       var __ms = performance.now() - __t0;
@@ -12322,9 +12426,14 @@
       if (themeObs) { try { themeObs.disconnect(); } catch (e) { /* noop */ } }
       if (typeof document !== 'undefined') { document.removeEventListener('visibilitychange', onVis); document.removeEventListener('click', onDocClick, true); }
       if (typeof window !== 'undefined') { window.removeEventListener('keydown', onKey); }
+      if (ringsSetTabHook === ringsSetTabBridge) { ringsSetTabHook = null; }   // M20 — the rail's live switch bridge dies with the page
       if (__ringsCleanupFn === teardown) { __ringsCleanupFn = null; }
     }
     __ringsCleanupFn = teardown;
+    // M20 — the live switch bridge the rail accordion calls so a sub-page row runs
+    // the in-place fade swap instead of a full route re-render. Published only
+    // once the tab hub is built (see below), cleared in teardown.
+    function ringsSetTabBridge(id) { setTab(id); }
 
     // ---- sparklines (M11): colour-coded mini-charts in the lens tiles, from the
     //      ring's OWN per-day series (real data — no fabricated trend; tiles with
@@ -12370,40 +12479,21 @@
     //   never move (fixed top-left, independent of the active tab). Reduced motion
     //   → instant swap (no fade, no cascade). The draw loop is paused while hidden.
     var fadeTimer = null, pauseWatch = null;
-    // Tab buttons are ICON buttons (M16a): the unified ricon family (24 viewBox /
-    // 1.8 stroke). The full view name rides on aria-label + the title tooltip; the
-    // text label is gone. The bar is mounted into the shell topbar slot
-    // (ctxIn.tabSlot) so it sits on the console search field's row, in the space
-    // the page heading used to occupy — falling back to the ring stage if no slot
-    // is provided (defensive; the shell always supplies one for #/rings).
+    // M20 — the nine tab BUTTONS have left this page. They now live in the left
+    // nav as the Rings destination's accordion group (shell.html buildRail →
+    // railGroupItems → RINGS_TAB_DEFS), which is the console-wide standard for
+    // sub-page navigation. The topbar slot keeps ONLY the play bar + the shell
+    // search field (task 4). Switching is driven from the rail through the
+    // registered CruxRender.ringsSetTab hook below, so an accordion row runs the
+    // EXACT same swap this page always did (fade + owRenderTab / canvas hosts).
     // Tabs 1-6 fade the ring out and swap in the corresponding Overwatch view via
     // owRenderTab. Tabs 7-9 (M19) absorb the former Canvas destination — Board,
     // Graph and Tree render in the SAME swap host through their normal renderers
     // (renderCanvasBoard / renderCanvasGraph / renderPlanTree), with clean teardown
-    // on tab switch (see teardownCanvasTab). Icons are the unified ricon family.
+    // on tab switch (see teardownCanvasTab).
     var CANVAS_TAB_IDS = { 'cv-board': 'board', 'cv-graph': 'graph', 'cv-tree': 'tree' };
-    var RINGS_TABS = [
-      { id: 'ring', title: 'Ring', icon: '<circle cx="12" cy="12" r="8.6"/><circle cx="12" cy="12" r="3.3"/>' },
-      { id: 'cx-activity', title: 'Activity', icon: '<path d="M3 12h3.6l2.4-7 4 14 2.4-7H21"/>' },
-      { id: 'cx-coord', title: 'Live board', icon: '<circle cx="12" cy="12" r="2.3"/><path d="M8.6 8.6a5 5 0 0 0 0 6.8M15.4 8.6a5 5 0 0 1 0 6.8M6.1 6.1a9 9 0 0 0 0 11.8M17.9 6.1a9 9 0 0 1 0 11.8"/>' },
-      { id: 'cx-orchestrators', title: 'Orchestrators', icon: '<circle cx="12" cy="5" r="2.2"/><circle cx="5.5" cy="18.5" r="2.2"/><circle cx="18.5" cy="18.5" r="2.2"/><path d="M12 7.2v3.4M12 10.6l-6 5.9M12 10.6l6 5.9"/>' },
-      { id: 'cx-punchcards', title: 'Punchcards', icon: '<rect x="3.5" y="5" width="17" height="14" rx="2"/><circle cx="8" cy="10" r="1.05" fill="currentColor" stroke="none"/><circle cx="12" cy="10" r="1.05" fill="currentColor" stroke="none"/><path d="M7 14.5h10"/>' },
-      { id: 'ax-agent', title: 'Agent', icon: '<rect x="4.5" y="8" width="15" height="10" rx="2.5"/><path d="M12 4.6v3.4"/><circle cx="12" cy="4" r="1.05"/><circle cx="9.6" cy="13" r="1.05" fill="currentColor" stroke="none"/><circle cx="14.4" cy="13" r="1.05" fill="currentColor" stroke="none"/>' },
-      { id: 'cv-board', title: 'Board', icon: '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>' },
-      { id: 'cv-graph', title: 'Graph', icon: '<circle cx="6" cy="7" r="2.1"/><circle cx="18" cy="7" r="2.1"/><circle cx="12" cy="17" r="2.1"/><path d="M8 7h8M7.6 8.6l3.6 6.8M16.4 8.6l-3.6 6.8"/>' },
-      { id: 'cv-tree', title: 'Tree', icon: '<rect x="9" y="3" width="6" height="4.4" rx="1"/><rect x="3" y="15" width="6" height="4.4" rx="1"/><rect x="15" y="15" width="6" height="4.4" rx="1"/><path d="M12 7.4v3.6M6 15v-2.4h12V15"/>' }
-    ];
-    var ringTabBtns = {};
-    var ringTabBar = el('div', { 'class': 'rings-tabicons', role: 'tablist', 'aria-label': 'Rings views' });
-    RINGS_TABS.forEach(function (t) {
-      var b = el('button', { 'class': 'rtab', type: 'button', role: 'tab', 'data-tab': t.id, 'aria-selected': t.id === 'ring' ? 'true' : 'false', 'aria-label': t.title, title: t.title });
-      b.innerHTML = ricon(t.icon);
-      b.addEventListener('click', function () { setTab(t.id); });
-      ringTabBar.appendChild(b); ringTabBtns[t.id] = b;
-    });
     var ringTabMount = (ctxIn && ctxIn.tabSlot) ? ctxIn.tabSlot : stage;
-    ringTabMount.appendChild(ringTabBar);
-    ringTabMount.appendChild(playbar);   // M19 — the compact play bar rides the topbar row, next to the tab icons
+    ringTabMount.appendChild(playbar);   // M19/M20 — the compact play bar owns the topbar row (with the search field)
     var tabHost = el('div', { 'class': 'rings-tabhost', role: 'region', 'aria-label': 'View' });
     tabHost.hidden = true;
     stage.appendChild(tabHost);
@@ -12466,9 +12556,11 @@
       if (id === activeTab) { return; }
       teardownCanvasTab();   // stop any outgoing Board/Graph/Tree RAF before the swap
       activeTab = id;
-      var tab = null; RINGS_TABS.forEach(function (t) { if (t.id === id) { tab = t; } });
+      var tab = null; ringsTabDefs().forEach(function (t) { if (t.id === id) { tab = t; } });
       tabHost.setAttribute('aria-label', tab ? tab.title : 'View');
-      Object.keys(ringTabBtns).forEach(function (k) { ringTabBtns[k].setAttribute('aria-selected', k === id ? 'true' : 'false'); });
+      // M20 — the rail accordion owns the tab CONTROLS now; tell it which row is
+      // current so the nav reflects an in-page switch (deep link / initialTab).
+      if (ctxIn && typeof ctxIn.onTab === 'function') { ctxIn.onTab(id, tab ? tab.slug : null); }
       closePop(); closeModal();
       if (fadeTimer) { clearTimeout(fadeTimer); fadeTimer = null; }
       if (pauseWatch) { clearInterval(pauseWatch); pauseWatch = null; }
@@ -12514,7 +12606,9 @@
     // M19 — deep-link: a #/canvas/board|graph|tree redirect lands on #/rings/<view>
     // and passes initialTab (+ canvasFocus for graph), opening that tab on load so
     // the old Canvas deep links never dead-end.
-    if (ctxIn && ctxIn.initialTab && ctxIn.initialTab !== 'ring' && ringTabBtns[ctxIn.initialTab]) { setTab(ctxIn.initialTab); }
+    if (ctxIn && ctxIn.initialTab && ctxIn.initialTab !== 'ring'
+      && ringsTabDefs().some(function (t) { return t.id === ctxIn.initialTab; })) { setTab(ctxIn.initialTab); }
+    ringsSetTabHook = ringsSetTabBridge;   // M20 — the rail accordion can now drive this page's view swap
 
     // ---- live wire: swap the embedded snapshot for the real board when the
     //      daemon feeds are reachable (through the console's CruxApi client).
@@ -12708,6 +12802,12 @@
     // M10 (console-surfaces-remediation, review round 1) — the native Rings page
     // (canvas "clock of work"; replaced the embedded iframe mock).
     renderRings: renderRings,
+    // M20 — the rail accordion's contract with the Rings page: the nine view
+    // definitions (nav rows), a live switch bridge (in-place fade swap) and a
+    // "is the page mounted" probe so the rail knows whether to swap or route.
+    ringsTabDefs: ringsTabDefs,
+    ringsSetTab: ringsSetTab,
+    ringsTabMounted: ringsTabMounted,
     renderPage: renderPage,
     renderSections: renderSections,
     fetchJSON: fetchJSON,
