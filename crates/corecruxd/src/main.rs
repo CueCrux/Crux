@@ -1136,7 +1136,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 state.edge_store.clone(),
                 state.kind_registry.clone(),
             )
-            .with_artefact_store(state.artefact_store.clone()),
+            .with_artefact_store(state.artefact_store.clone())
+            // Dense re-rank on the MCP `query` tool (parity with the REST
+            // text-search lane): the `.ccxv` companion readers live in this
+            // crate, so hand crux-mcp a constructor instead of the readers.
+            .with_dense_provider_factory({
+                let data_dir = state.data_dir.clone();
+                std::sync::Arc::new(move |index_mgr: &corecrux_retrieval::IndexManager,
+                                          query_embedding: &[f32],
+                                          expected_fingerprint: Option<&str>| {
+                    crate::local_ingest::build_dense_provider(
+                        index_mgr,
+                        &data_dir,
+                        query_embedding,
+                        expected_fingerprint,
+                    )
+                })
+            }),
         )
     } else {
         None

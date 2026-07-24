@@ -4382,7 +4382,9 @@ async fn get_receipt_signature_returns_501_without_dataplane() {
 // ── get_receipt_verification_v1 (no dataplane) ──────────────────
 
 #[tokio::test]
-async fn get_receipt_verification_returns_501_without_dataplane() {
+async fn get_receipt_verification_resolves_locally_without_dataplane() {
+    // Dataplane off: the local mediation-log resolver answers — an unknown
+    // id is a 404, not the pre-2026-07-24 unconditional 501.
     let state = test_app_state(16);
     let resp = receipts::get_receipt_verification_v1(
         State(state),
@@ -4394,7 +4396,7 @@ async fn get_receipt_verification_returns_501_without_dataplane() {
     )
     .await
     .into_response();
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

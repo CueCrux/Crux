@@ -301,6 +301,205 @@ fn is_local_approval_receipt_id(receipt_id: &str) -> bool {
     receipt_id.starts_with("ad_ga_") || receipt_id.starts_with("ad_mr_")
 }
 
+/// A stream receipt resolved from the local mediation observation logs,
+/// carrying the receipt's OWN tenant so the caller can re-gate
+/// authorization against it (never the query tenant — stream receipts are
+/// minted under `"local"` while callers typically default to `"default"`).
+#[derive(Debug)]
+pub(super) struct LocalStreamReceipt {
+    pub(super) tenant_id: String,
+    pub(super) verification: corecrux_receipts::VerificationReportV1,
+}
+
+/// Verify one observation record's daemon envelope signature against the
+/// node passport key. Generic sibling of
+/// [`verify_local_approval_observation`]: stream-receipt payloads do not
+/// embed `signer_public_key_hex`, so the binding is directly to this
+/// node's passport key.
+fn verify_observation_envelope(
+    state: &AppState,
+    record: &super::observations::ObservationRecordV1,
+) -> Result<(), String> {
+    use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
+
+    if record.receipt.signed_by != state.passport_fpr || record.receipt.alg != "ed25519" {
+        return Err("local stream receipt observation signer binding mismatch".to_string());
+    }
+    let public_key: [u8; 32] = hex::decode(&state.passport_public_key_hex)
+        .map_err(|err| format!("decode node passport public key: {err}"))?
+        .try_into()
+        .map_err(|bytes: Vec<u8>| format!("node passport public key is {} bytes", bytes.len()))?;
+    let body_bytes = super::observations::canonical_body_bytes(record)?;
+    let body_hash = blake3::hash(&body_bytes);
+    if record.receipt.body_hash != format!("blake3:{}", hex::encode(body_hash.as_bytes())) {
+        return Err("local stream receipt observation body hash mismatch".to_string());
+    }
+    let signature = Signature::from_slice(
+        &hex::decode(&record.receipt.signature)
+            .map_err(|err| format!("decode local stream receipt observation signature: {err}"))?,
+    )
+    .map_err(|err| format!("parse local stream receipt observation signature: {err}"))?;
+    let verifying_key =
+        VerifyingKey::from_bytes(&public_key).map_err(|err| format!("parse node passport public key: {err}"))?;
+    verifying_key
+        .verify(body_hash.as_bytes(), &signature)
+        .map_err(|err| format!("verify local stream receipt observation signature: {err}"))
+}
+
+/// Best-effort top-level `tenant_id` text field from a CBOR receipt body.
+fn cbor_top_level_tenant(body_bytes: &[u8]) -> Option<String> {
+    let value: ciborium::Value = ciborium::de::from_reader(std::io::Cursor::new(body_bytes)).ok()?;
+    let ciborium::Value::Map(map) = value else { return None };
+    for (k, v) in &map {
+        if let (ciborium::Value::Text(k), ciborium::Value::Text(v)) = (k, v) {
+            if k == "tenant_id" {
+                return Some(v.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Locate and verify an `r_…` stream receipt (context-injected /
+/// stream-end / model-invocation, minted by `stream_receipts.rs`) in the
+/// local mediation observation logs. Stream receipts persist through the
+/// signed-observation path — one JSONL per mediation group — with the
+/// canonical CBOR body (`body_cbor_hex`) and its ed25519 signature
+/// embedded in the payload, so a CPU-only deployment can re-verify them
+/// without the dataplane. Returns the report verbatim (a failed signature
+/// is a `signature_valid: false` report, not an error), mirroring the
+/// dataplane branch.
+///
+/// The matched file's hash chain is validated and the matched record's
+/// daemon envelope signature is re-verified before the receipt material
+/// is trusted; unmatched records in other files are not signature-checked
+/// (unlike the single-file approval chain) to keep lookup cost sane.
+// ponytail: O(files × records) scan per lookup, no r_id→file index — add one
+// at mint time in stream_receipts.rs if this ever gets slow.
+pub(super) fn local_stream_receipt_verification(
+    state: &AppState,
+    receipt_id: &str,
+) -> Result<Option<LocalStreamReceipt>, String> {
+    use corecrux_receipts::{verify_receipt_v1, Ed25519KeyEntryV1, Ed25519KeyRingV1, ReceiptSigV1, VerifyReceiptInput};
+
+    let obs_dir = state.data_dir.join("observations");
+    let mut files: Vec<std::path::PathBuf> = match std::fs::read_dir(&obs_dir) {
+        Ok(entries) => entries
+            .flatten()
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                let is_jsonl = std::path::Path::new(&name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"));
+                is_jsonl && (name.starts_with("mediation__") || name.contains("__mediation__"))
+            })
+            .map(|e| e.path())
+            .collect(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(format!("list mediation observation logs: {err}")),
+    };
+    files.sort();
+
+    for path in files {
+        let records = super::observations::read_observations_strict(&path)
+            .map_err(|err| format!("read mediation observations {}: {err}", path.display()))?;
+        let Some(record) = records.iter().find(|r| {
+            r.payload.get("receipt_id").and_then(serde_json::Value::as_str) == Some(receipt_id)
+                && r.payload.get("body_cbor_hex").is_some()
+                && r.payload.get("sig").is_some()
+        }) else {
+            continue;
+        };
+        if !matches!(
+            super::observations::validate_chain(&records),
+            super::observations::ChainStatus::Ok { .. }
+        ) {
+            return Err("local stream receipt observation chain is invalid".to_string());
+        }
+        verify_observation_envelope(state, record)?;
+
+        let Some(body_hex) = record.payload.get("body_cbor_hex").and_then(serde_json::Value::as_str) else {
+            return Err("local stream receipt body is missing".to_string());
+        };
+        let sig_obj = record
+            .payload
+            .get("sig")
+            .ok_or_else(|| "local stream receipt sig envelope is missing".to_string())?;
+        let sig_field = |field: &str| -> Result<String, String> {
+            sig_obj
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| format!("local stream receipt sig {field} is missing"))
+        };
+        let signature_hex = sig_field("signature_hex")?;
+        if body_hex.len() > 2_097_152 || signature_hex.len() > 16_384 {
+            return Err("local stream receipt material exceeds size limits".to_string());
+        }
+        let body_bytes =
+            hex::decode(body_hex).map_err(|err| format!("local stream receipt body is not valid hex: {err}"))?;
+        let signature_bytes = hex::decode(&signature_hex)
+            .map_err(|err| format!("local stream receipt signature is not valid hex: {err}"))?;
+        let body_hash = corecrux_frame::compute_payload_hash(&body_bytes);
+        let expected_body_hash = format!("blake3:{}", hex::encode(body_hash));
+        if record.payload.get("body_hash").and_then(serde_json::Value::as_str) != Some(expected_body_hash.as_str()) {
+            return Err("local stream receipt body hash binding mismatch".to_string());
+        }
+
+        // Rebuild the CBOR sig envelope `verify_receipt_v1` expects from
+        // the persisted fields (the mint stores them unpacked). The raw
+        // signature bytes are untouched, so a forged envelope still fails
+        // ed25519 verification over the body bytes.
+        let sig_envelope = ReceiptSigV1 {
+            schema: sig_field("schema")?,
+            receipt_id: receipt_id.to_string(),
+            alg: sig_field("alg")?,
+            key_id: sig_field("key_id")?,
+            signed_at: sig_field("signed_at")?,
+            signature: signature_bytes,
+            signed_payload_hash: body_hash.to_vec(),
+        };
+        let mut sig_bytes = Vec::new();
+        ciborium::ser::into_writer(&sig_envelope, &mut sig_bytes)
+            .map_err(|err| format!("encode local stream receipt sig envelope: {err}"))?;
+
+        // Keyring holds only this node's passport key — a sig envelope
+        // naming any other key_id simply fails to resolve and the report
+        // comes back unverified.
+        let public_key: [u8; 32] = hex::decode(&state.passport_public_key_hex)
+            .map_err(|err| format!("decode node passport public key: {err}"))?
+            .try_into()
+            .map_err(|bytes: Vec<u8>| format!("node passport public key is {} bytes", bytes.len()))?;
+        let keyring = Ed25519KeyRingV1 {
+            v: 1,
+            keys: vec![Ed25519KeyEntryV1 {
+                key_id: sig_envelope.key_id.clone(),
+                pub_key_base64: base64::engine::general_purpose::STANDARD.encode(public_key),
+            }],
+        };
+
+        let tenant_id = cbor_top_level_tenant(&body_bytes).unwrap_or_else(|| "local".to_string());
+        let verified_at = record.ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let verification = verify_receipt_v1(VerifyReceiptInput {
+            tenant_id: &tenant_id,
+            receipt_id,
+            body_bytes: &body_bytes,
+            stored_body_payload_hash: body_hash,
+            sig_bytes: Some(&sig_bytes),
+            keyring: Some(&keyring),
+            verified_at: &verified_at,
+            verifier_build: &state.build,
+            recompute_candidate_digest: false,
+        })
+        .map_err(|err| format!("verify local stream receipt: {err}"))?;
+        return Ok(Some(LocalStreamReceipt {
+            tenant_id,
+            verification,
+        }));
+    }
+    Ok(None)
+}
+
 #[utoipa::path(
     get,
     path = "/v1/receipts/{receiptId}",
@@ -562,7 +761,25 @@ pub(super) async fn get_receipt_verification_v1(
         };
     }
     if !state.http_dataplane.enabled() {
-        return problem_response(StatusCode::NOT_IMPLEMENTED, "dataplane disabled");
+        // CPU-only deployment: stream receipts (`r_…`) live in the local
+        // mediation observation logs, not the dataplane — resolve and
+        // verify them there instead of 501ing.
+        return match local_stream_receipt_verification(&state, &receipt_id) {
+            Ok(Some(found)) => {
+                // Re-gate against the receipt's OWN tenant (stream receipts
+                // mint under "local"; the query default is "default"). A
+                // caller not authorized for that tenant gets the same 404 as
+                // a missing receipt, so tenant probing can't confirm
+                // existence.
+                if require_http_scopes_for_tenant(&state.auth, &headers, &["receipts:read"], &found.tenant_id).is_err()
+                {
+                    return problem_response(StatusCode::NOT_FOUND, "receipt body not found");
+                }
+                (StatusCode::OK, Json(found.verification)).into_response()
+            }
+            Ok(None) => problem_response(StatusCode::NOT_FOUND, "receipt body not found"),
+            Err(detail) => problem_response(StatusCode::INTERNAL_SERVER_ERROR, detail),
+        };
     }
 
     match state
@@ -1618,6 +1835,8 @@ mod receipts_tests {
 
     #[tokio::test]
     async fn verification_disabled_501_and_not_found_404() {
+        // Dataplane off: the local mediation-log resolver runs instead of
+        // the old unconditional 501 — an unknown id is an honest 404.
         let resp = get_receipt_verification_v1(
             State(test_app_state(16)),
             Path("r".to_string()),
@@ -1626,7 +1845,7 @@ mod receipts_tests {
         )
         .await
         .into_response();
-        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         // Enabled but the stub returns no verification report → 404.
         let resp = get_receipt_verification_v1(
