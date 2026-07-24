@@ -296,8 +296,9 @@
 
      The height animation is driven from JS (0 ↔ scrollHeight px, then released to
      auto) because a group's height is content-dependent. Reduced motion snaps.
-     The collapsed rail never shows groups — it keeps the M19 behaviour (icon
-     click = page-level nav, hover-intent flyout listing the SAME rows). */
+     M22 — the COMPACT (icons-only) rail runs the same accordion, inline in the
+     bar, with icon-only rows (see the compact block below); the old right-side
+     sub-page flyout is removed. */
   .nav-group { display: block; }
   .nav-sub {
     display: flex; flex-direction: column; gap: 2px;
@@ -406,9 +407,25 @@
     :root[data-rail="collapsed"] .nav-item .kbd,
     :root[data-rail="collapsed"] .nav-item .nav-caret,
     :root[data-rail="collapsed"] .nav-group-label { display: none; }
-    /* M20 — the accordion belongs to the EXPANDED rail only. Collapsed keeps the
-       M19 idiom: icon click = page-level nav, hover-intent flyout for the rows. */
-    :root[data-rail="collapsed"] .nav-sub { display: none; }
+    /* M22 — COMPACT-RAIL ACCORDION (replaces the M11–M21 right-side flyout).
+       The collapsed rail runs the SAME accordion as the expanded rail: clicking a
+       destination icon navigates to its default page AND pushes that destination's
+       sub-pages DOWN the bar, inline, as icon buttons. One group open (the active
+       destination's), same height+opacity tween, same reduced-motion snap — the
+       mechanics are shared, only the row presentation differs.
+       Rows are square, smaller than the 48px destination column and inset to its
+       right, with the connector hairline running down their left, so the nesting
+       reads without any text. The page name lives in title + aria-label (the
+       tooltip is the only text). */
+    :root[data-rail="collapsed"] .nav-sub-inner { padding: 3px 0 5px 0; }
+    :root[data-rail="collapsed"] .nav-sub-inner::before { left: 6px; top: 1px; bottom: 3px; }
+    :root[data-rail="collapsed"] .nav-subitem {
+      justify-content: center; gap: 0;
+      width: 34px; min-height: 34px; padding: 0;
+      margin-left: auto; margin-right: 3px;
+    }
+    :root[data-rail="collapsed"] .nav-subitem .label { display: none; }
+    :root[data-rail="collapsed"] .nav-subitem svg { width: 16px; height: 16px; }
     /* M21 — the footer settings accordion is expanded-rail chrome; collapsed,
        #acctPop carries the same System pages (acctSyncSystemRows). */
     :root[data-rail="collapsed"] .rail-footer-nav { display: none; }
@@ -596,10 +613,11 @@
   .health.degraded .dot { background: var(--warn); }
   .health.down .dot { background: var(--crit); }
 
-  /* ---- Rail secondary flyout (M11) --------------------------------------
-     Hover/focus a rail destination → a panel pulls out flush to the rail,
-     listing that destination's pages, in the rail's own glass idiom. An
-     advisory overlay (click still navigates to the default page). */
+  /* ---- Rail pop-out glass (M11 family) -----------------------------------
+     M22 — the rail's SUB-PAGE flyout is gone (sub-pages are the inline accordion
+     in both rail states). This family survives as the shared glass for the rail's
+     genuine pop-outs: the operator options popup (#railOpsPop), the account
+     pop-out (#acctPop) and the workspace switcher (#wsSwitchPop). */
   .rail-flyout {
     position: fixed; z-index: 200; min-width: 208px; max-width: 264px;
     background: var(--surface); border: 1px solid var(--edge-strong); border-radius: var(--radius);
@@ -3545,8 +3563,9 @@
     // accordion is expanded-rail chrome; when the rail is collapsed the same
     // System sub-pages have to be reachable, and this popup is where the
     // settings button leads. Same items, same marks (railGroupItems →
-    // navPageGlyph) — one list, two presentations, exactly like the rail/flyout
-    // pair. Rebuilt on open so posture/pro filtering is current.
+    // navPageGlyph) — one list, two presentations, exactly like the expanded
+    // and compact rail accordions. Rebuilt on open so posture/pro filtering is
+    // current.
     acctPop.appendChild(el('div', { 'class': 'rail-flyout-h acct-sec-h', id: 'acctSysH', text: 'System' }));
     acctPop.appendChild(el('div', { id: 'acctSysRows' }));
     if (window.CruxSession) { window.CruxSession.probe().then(function (hosted) { logoutRow.hidden = !hosted; }); }
@@ -3615,7 +3634,6 @@
     else {
       if (typeof closeRailOpsPop === 'function') { closeRailOpsPop(); }
       if (typeof closeWsSwitchPop === 'function') { closeWsSwitchPop(); }
-      if (typeof closeRailFlyout === 'function') { closeRailFlyout(); }
       openAcctPop(anchorBtn);
     }
   }
@@ -3672,8 +3690,8 @@
   //      workspaces. Zero config == exactly today's Command | Explorer toggle;
   //      user workspaces (config facts) append. The model is loaded async at boot
   //      (loadWorkspaceModel) and cached in WS_MODEL; builtins always render even
-  //      when the load is absent/erroring (fully useful unconfigured). The rail +
-  //      flyout + sitemap all derive from the ACTIVE workspace.
+  //      when the load is absent/erroring (fully useful unconfigured). The rail
+  //      accordion + switcher + sitemap all derive from the ACTIVE workspace.
   var WS_MODEL = null;   // { workspaces:[def…], pages:{uid→def}, overlays } or null
   function wsSwitcherList() {
     if (WS_MODEL && WS_MODEL.workspaces && WS_MODEL.workspaces.length) { return WS_MODEL.workspaces; }
@@ -3795,7 +3813,7 @@
   }
   function toggleWsSwitchPop(anchorBtn) {
     if (wsSwitchPop && !wsSwitchPop.hidden) { closeWsSwitchPop(); }
-    else { if (typeof closeRailOpsPop === 'function') { closeRailOpsPop(); } if (typeof closeRailFlyout === 'function') { closeRailFlyout(); } openWsSwitchPop(anchorBtn); }
+    else { if (typeof closeRailOpsPop === 'function') { closeRailOpsPop(); } openWsSwitchPop(anchorBtn); }
   }
   if (typeof document !== 'undefined') {
     document.addEventListener('click', function (e) {
@@ -4083,21 +4101,17 @@
   }
 
   // ---- Renderers ---------------------------------------------------------
-  // ---- Rail secondary flyout (M11) — hovering or focusing a rail destination
-  //      pulls out a panel, flush to the rail, listing that destination's pages
-  //      (the same set the sub-nav pills show). Advisory overlay: click still
-  //      navigates to the default page. Closes on route change / Escape / away. --
-  var railFlyout = null, railFlyoutTimer = null, railFlyoutAnchor = null;
-  function ensureRailFlyout() {
-    if (railFlyout) { return railFlyout; }
-    railFlyout = el('div', { id: 'railFlyout', 'class': 'rail-flyout', role: 'menu', 'aria-label': 'Destination pages' });
-    railFlyout.hidden = true;
-    railFlyout.addEventListener('mouseenter', function () { clearTimeout(railFlyoutTimer); });
-    railFlyout.addEventListener('mouseleave', scheduleRailFlyoutClose);
-    document.body.appendChild(railFlyout);
-    return railFlyout;
-  }
-  function railFlyoutPages(destId) {
+  // ---- M22: the rail's secondary navigation is the ACCORDION, in both rail
+  //      states. The M11 right-side sub-page flyout (railFlyout / openRailFlyout /
+  //      openWorkspaceRailFlyout, with its hover-intent + ArrowRight affordances)
+  //      is REMOVED: the compact rail now pushes a destination's sub-pages down
+  //      the bar as icons, inline, instead of pulling a panel out over the page.
+  //      The other pop-outs are different mechanisms and are untouched: the
+  //      operator options popup (#railOpsPop), the account pop-out (#acctPop) and
+  //      the workspace switcher (#wsSwitchPop) all keep the .rail-flyout glass. --
+  // Posture / Professional gating for a destination's registry pages — the filter
+  // both rail states' item lists run through (it is nav-wide, not popup-specific).
+  function railDestPages(destId) {
     var pro = (typeof window !== 'undefined' && window.CRUX_MODE === 'professional');
     return pagesForDest(destId).filter(function (p) {
       if (!pro) { if (p.pill === false) { return false; } if (p.pro === true) { return false; } }
@@ -4105,46 +4119,12 @@
       return true;
     });
   }
-  function closeRailFlyout() {
-    clearTimeout(railFlyoutTimer);
-    if (!railFlyout || railFlyout.hidden) { return; }
-    railFlyout.hidden = true;
-    if (railFlyoutAnchor) { railFlyoutAnchor.setAttribute('aria-expanded', 'false'); }
-    railFlyoutAnchor = null;
-  }
-  function scheduleRailFlyoutClose() { clearTimeout(railFlyoutTimer); railFlyoutTimer = setTimeout(closeRailFlyout, 220); }
   function railIsCollapsed() { return document.documentElement.getAttribute('data-rail') === 'collapsed'; }
-  // Generic flyout renderer (M17): a label header + text rows. Each page =
-  // { key, title, current, go }. Positioned flush to the rail's right edge. The
-  // built-in AND workspace rails both drive this, so compressed navigation is
-  // identical for Command and any user workspace.
-  function railFlyoutRender(anchorBtn, label, pages) {
-    if (!pages || !pages.length) { closeRailFlyout(); return; }
-    var fo = ensureRailFlyout();
-    clearTimeout(railFlyoutTimer);
-    fo.textContent = '';
-    fo.appendChild(el('div', { 'class': 'rail-flyout-h', text: label }));
-    pages.forEach(function (p) {
-      var row = el('button', { 'class': 'rail-flyout-item', type: 'button', role: 'menuitem', 'data-page': p.key, 'aria-current': p.current ? 'page' : 'false' });
-      if (p.icon) { row.appendChild(el('span', { 'class': 'ic', 'aria-hidden': 'true', html: p.icon })); }   // M20 — unified glyph, same as the accordion row
-      row.appendChild(el('span', { 'class': 'label', text: p.title }));
-      row.addEventListener('click', function () { p.go(); closeRailFlyout(); });
-      fo.appendChild(row);
-    });
-    applyPosture(fo);
-    var railEl = document.querySelector('.rail'), aRect = anchorBtn.getBoundingClientRect(), rRect = railEl.getBoundingClientRect();
-    fo.hidden = false;
-    fo.style.left = Math.round(rRect.right - 1) + 'px';
-    var maxTop = window.innerHeight - fo.offsetHeight - 8;
-    fo.style.top = Math.max(8, Math.min(Math.round(aRect.top), maxTop)) + 'px';
-    if (railFlyoutAnchor && railFlyoutAnchor !== anchorBtn) { railFlyoutAnchor.setAttribute('aria-expanded', 'false'); }
-    railFlyoutAnchor = anchorBtn;
-    anchorBtn.setAttribute('aria-expanded', 'true');
-  }
   // ---- M20: ONE sub-page item list per destination -----------------------
-  // railGroupItems is the single source the EXPANDED-rail accordion AND the
-  // COLLAPSED-rail flyout both render, so the two rail states can never disagree
-  // about what a destination contains. Item shape: { key, title, icon, current, go }.
+  // railGroupItems is the single source the accordion renders in BOTH rail states
+  // (M22: expanded = icon+label rows, compact = the same glyphs as inset icon
+  // buttons), so the two rail states can never disagree about what a destination
+  // contains. Item shape: { key, title, icon, current, go }.
   //
   // Rings is the special case: its nine views are not registry pages, they are
   // the tab hub's views (CruxRender.ringsTabDefs, ordered by the shared
@@ -4152,7 +4132,7 @@
   // in-place fade swap the topbar tab icons used to (see goRingsTab).
   var NAV_SUB_GLYPH = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.1"/></svg>';
   function ringsGlyph(paths) { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' + (paths || '') + '</svg>'; }
-  // M21 — SUB-PAGE ICONS. Until now every accordion / flyout row carried the same
+  // M21 — SUB-PAGE ICONS. Until now every accordion row carried the same
   // placeholder dot (NAV_SUB_GLYPH), so a group of nine rows was a column of nine
   // identical marks. NAV_PAGE_GLYPH gives each registry page its own mark in the
   // ONE console family (24-unit box, fill:none, stroke currentColor @1.8, round
@@ -4254,8 +4234,8 @@
     }
     var h = hashParts();
     var activePage = h[0] === destId ? h[1] : null;
-    return railFlyoutPages(destId).map(function (p) {
-      // M21 — per-page mark (shared by the expanded accordion AND the collapsed flyout).
+    return railDestPages(destId).map(function (p) {
+      // M21 — per-page mark (shared by the expanded rows AND the compact icons).
       return { key: p.id, title: p.title, icon: navPageGlyph(p.id), current: p.id === activePage,
         go: function () { location.hash = '#/' + destId + '/' + p.id; } };
     });
@@ -4273,14 +4253,6 @@
     });
   }
 
-  // Built-in destination flyout (Command surface) — the collapsed-rail twin of the
-  // accordion, rendering the SAME railGroupItems (incl. the nine Rings views).
-  function openRailFlyout(destId, anchorBtn) {
-    var items = railGroupItems(destId);
-    if (items.length < 2) { closeRailFlyout(); return; }   // single-page destinations: click navigates directly
-    var dest = DEST_INDEX[destId];
-    railFlyoutRender(anchorBtn, dest ? dest.label : destId, items);
-  }
   // Workspace destination pages (M17 bug fix): resolve each pageUid's title from
   // the config model (falling back to a registry page title, then the uid).
   function workspaceDestPages(dest) {
@@ -4293,21 +4265,44 @@
       return { uid: pageUid, title: title, type: type };
     });
   }
-  // Workspace destination flyout — the config-driven twin of openRailFlyout.
-  function openWorkspaceRailFlyout(ws, dest, anchorBtn) {
-    var items = workspaceGroupItems(ws, dest);
-    if (items.length < 2) { closeRailFlyout(); return; }   // single-page group: click navigates directly
-    railFlyoutRender(anchorBtn, dest.label || dest.id, items);
+  // ---- M22: accordion keyboard walk (replaces the flyout's ArrowRight entry) --
+  // The sub-pages are now IN the rail, in both rail states, so the keyboard model
+  // is the accordion's: from a destination button ArrowDown steps into its open
+  // group; inside the group ArrowDown/ArrowUp walk the rows and ArrowUp off the
+  // first row returns to the destination; Escape returns to the destination.
+  // Enter/Space are the buttons' own activation — a row navigates, a destination
+  // navigates + opens its group. The rail-footer group grows UPWARD, so its two
+  // vertical keys are mirrored (visual order == key order in both hosts).
+  function navGroupRows(group) {
+    return Array.prototype.slice.call(group.querySelectorAll('.nav-subitem'));
   }
-  function railFlyoutFocusFirst() {
-    if (railFlyout && !railFlyout.hidden) { var r = railFlyout.querySelector('.rail-flyout-item'); if (r) { r.focus(); return true; } }
-    return false;
-  }
+  function navGroupIsUpward(group) { return !!(group.closest && group.closest('.rail-footer-nav')); }
   if (typeof document !== 'undefined') {
-    document.addEventListener('click', function (e) { if (railFlyout && !railFlyout.hidden && !e.target.closest('#railFlyout') && !e.target.closest('#nav .nav-item')) { closeRailFlyout(); } }, true);
     document.addEventListener('keydown', function (e) {
-      if (e.key === 'Escape' && railFlyout && !railFlyout.hidden) { var a = railFlyoutAnchor; closeRailFlyout(); if (a) { a.focus(); } }
-      else if (e.key === 'ArrowDown' && railFlyoutAnchor && document.activeElement === railFlyoutAnchor && railFlyout && !railFlyout.hidden) { e.preventDefault(); railFlyoutFocusFirst(); }
+      if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp' && e.key !== 'Escape') { return; }
+      var t = e.target;
+      if (!t || !t.closest || !t.closest('.rail')) { return; }
+      var item = t.closest('.nav-subitem'), dest = t.closest('.nav-item');
+      var group = t.closest('.nav-group');
+      if (!group || !group.classList.contains('is-open')) { return; }
+      var up = navGroupIsUpward(group);
+      var into = up ? 'ArrowUp' : 'ArrowDown';        // key that steps INTO / DOWN the visual list
+      var back = up ? 'ArrowDown' : 'ArrowUp';
+      var rows = navGroupRows(group);
+      if (!rows.length) { return; }
+      if (dest && !item) {
+        if (e.key === into) { e.preventDefault(); rows[0].focus(); }
+        return;
+      }
+      if (!item) { return; }
+      var i = rows.indexOf(item);
+      if (e.key === 'Escape') { e.preventDefault(); var b = group.querySelector('.nav-item'); if (b) { b.focus(); } return; }
+      if (e.key === into) { e.preventDefault(); rows[Math.min(i + 1, rows.length - 1)].focus(); return; }
+      if (e.key === back) {
+        e.preventDefault();
+        if (i > 0) { rows[i - 1].focus(); }
+        else { var d = group.querySelector('.nav-item'); if (d) { d.focus(); } }
+      }
     });
   }
 
@@ -4484,7 +4479,13 @@
     sub.appendChild(inner);
     var rows = {};
     items.forEach(function (it) {
-      var row = el('button', { 'class': 'nav-subitem', type: 'button', 'data-subpage': it.key, 'aria-current': it.current ? 'page' : 'false' });
+      // M22 — title + aria-label carry the page name because the COMPACT rail
+      // renders this row as an icon-only square: the tooltip is its only text.
+      var row = el('button', {
+        'class': 'nav-subitem', type: 'button', 'data-subpage': it.key,
+        'aria-current': it.current ? 'page' : 'false',
+        title: it.title, 'aria-label': it.title
+      });
       if (it.icon) { row.appendChild(el('span', { 'class': 'ic', 'aria-hidden': 'true', html: it.icon })); }
       row.appendChild(el('span', { 'class': 'label', text: it.title }));
       row.addEventListener('click', function (e) { e.stopPropagation(); it.go(); });
@@ -4587,7 +4588,6 @@
     nav.textContent = '';
     NAV_GROUPS = {}; NAV_OPEN_KEY = null;
     RAIL_MODE = 'dest';   // restored to the destination nav
-    closeRailFlyout();
     for (var i = 0; i < DESTS.length; i++) {
       var item = DESTS[i];
       if (item.railHidden) { continue; }   // reachable via search / Explore menu, not the Command rail
@@ -4601,22 +4601,17 @@
       if (item.key) { btn.appendChild(el('span', { 'class': 'kbd', text: item.key })); }
       var items = railGroupItems(item.id);
       (function (id, b) {
-        var hasPages = items.length > 1;
         // M19 — a dest icon CLICK always navigates to the destination's default
         // page (page-level nav), in BOTH rail states (Enter/Space navigate too).
-        // M20 — in the EXPANDED rail that navigation also expands this group's
-        // accordion (route() → syncRailAccordion). The flyout stays the COLLAPSED
-        // rail's affordance: hover-intent for pointer users, ArrowRight for
-        // keyboard (Escape/click-away close it).
-        b.addEventListener('click', function () { location.hash = '#/' + id; });
-        if (hasPages) {
-          b.setAttribute('aria-haspopup', 'true');
-          b.addEventListener('mouseenter', function () { if (railIsCollapsed()) { openRailFlyout(id, b); } });
-          b.addEventListener('mouseleave', scheduleRailFlyoutClose);
-          b.addEventListener('keydown', function (e) {
-            if (e.key === 'ArrowRight') { e.preventDefault(); openRailFlyout(id, b); railFlyoutFocusFirst(); }
-          });
-        }
+        // M20/M22 — that navigation also opens this group's accordion (route() →
+        // syncRailAccordion), in BOTH rail states: expanded rows, compact icons.
+        // Re-clicking the destination you are already on fires no hashchange, so
+        // the sync is called directly — the group must open either way.
+        b.addEventListener('click', function () {
+          var target = '#/' + id;
+          if (location.hash === target) { syncRailAccordion(); return; }
+          location.hash = target;
+        });
       })(item.id, btn);
       buildNavGroup(nav, btn, item.id, items);
     }
@@ -4872,11 +4867,12 @@
 
   // ---- Page render --------------------------------------------------------
   // M20 — buildSubnav (the topbar sub-nav PILL ROW) is REMOVED. Sub-page
-  // navigation is now the rail accordion (buildNavGroup/syncRailAccordion) in the
-  // expanded rail and the rail flyout in the collapsed rail — both fed by the one
-  // railGroupItems list. Two competing idioms for the same job was the problem;
+  // navigation is now the rail accordion (buildNavGroup/syncRailAccordion) in
+  // BOTH rail states — M22 removed the collapsed-rail flyout, so the compact bar
+  // pushes the same railGroupItems down as icons. Two competing idioms was the
+  // problem;
   // the accordion is the standard. Nothing else changes: the same page ids, the
-  // same routes, the same posture/pro gating (railFlyoutPages applies it).
+  // same routes, the same posture/pro gating (railDestPages applies it).
   function renderDestination(destId, pageId) {
     // Leaving Documents mode or a user workspace: restore the Command
     // destination nav into the rail (it was swapped to the document tree / the
@@ -5074,7 +5070,6 @@
     nav.textContent = '';
     NAV_GROUPS = {}; NAV_OPEN_KEY = null;
     RAIL_MODE = 'ws';
-    closeRailFlyout();
     var activeDest = wsDestOfPage(ws, activePageUid);
     (ws.dests || []).forEach(function (d) {
       var btn = el('button', { 'class': 'nav-item', type: 'button', 'data-wsdest': d.id, 'aria-current': (activeDest && activeDest.id === d.id) ? 'page' : 'false', title: d.label });
@@ -5082,24 +5077,17 @@
       btn.appendChild(el('span', { 'class': 'label', text: d.label }));
       var items = workspaceGroupItems(ws, d);
       (function (dest, b) {
-        var multi = items.length > 1;
         // M19 — same idiom as the built-in rail: a group icon CLICK navigates to
-        // its first page (page-level, both rail states). M20 — the EXPANDED rail
-        // then accordion-expands this group (the workspace rail is standardised on
-        // the SAME pattern as the built-ins); the flyout is the COLLAPSED rail's
-        // hover + ArrowRight (keyboard) affordance.
+        // its first page (page-level, both rail states). M20/M22 — it also opens
+        // this group's accordion in BOTH rail states (expanded rows / compact
+        // icons); the workspace rail is standardised on the SAME pattern as the
+        // built-ins. Same-route re-click syncs directly (no hashchange fires).
         b.addEventListener('click', function () {
           var first = (dest.pages && dest.pages[0]) || null;
-          location.hash = first ? ('#/w/' + ws.uid + '/' + first) : ('#/w/' + ws.uid);
+          var target = first ? ('#/w/' + ws.uid + '/' + first) : ('#/w/' + ws.uid);
+          if (location.hash === target) { syncRailAccordion(dest.id, first || null); return; }
+          location.hash = target;
         });
-        if (multi) {
-          b.setAttribute('aria-haspopup', 'true');
-          b.addEventListener('mouseenter', function () { if (railIsCollapsed()) { openWorkspaceRailFlyout(ws, dest, b); } });
-          b.addEventListener('mouseleave', scheduleRailFlyoutClose);
-          b.addEventListener('keydown', function (e) {
-            if (e.key === 'ArrowRight') { e.preventDefault(); openWorkspaceRailFlyout(ws, dest, b); railFlyoutFocusFirst(); }
-          });
-        }
       })(d, btn);
       buildNavGroup(nav, btn, d.id, items);
     });
@@ -5203,7 +5191,6 @@
   // — mode is presentation, not a route). #/documents[/<docId>] keeps the reader.
   function route() {
     resetRingsTopbar();   // M16a: normalise the topbar heading before any branch paints
-    if (typeof closeRailFlyout === 'function') { closeRailFlyout(); }
     if (typeof closeWsSwitchPop === 'function') { closeWsSwitchPop(); }
     if (typeof closeRailOpsPop === 'function') { closeRailOpsPop(); }
     if (typeof closeAcctPop === 'function') { closeAcctPop(); }
@@ -5411,7 +5398,6 @@
         var oi = ev.oldURL.indexOf('#');
         window.CRUX_PREV_HASH = (oi >= 0) ? ev.oldURL.slice(oi) : '';
       }
-      closeRailFlyout();   // route change closes the rail flyout
       route();
     });
     document.addEventListener('keydown', onKey);

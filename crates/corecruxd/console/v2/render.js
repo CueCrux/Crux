@@ -2485,7 +2485,7 @@
 
   // ---- Rings view definitions (M20) -------------------------------------
   // The nine Rings views, with their unified-family glyphs. ONE definition,
-  // consumed by the rail accordion + the collapsed-rail flyout (shell.html) and
+  // consumed by the rail accordion in both rail states (shell.html) and
   // by renderRings' swap host. Order + slugs come from CruxPages.RINGS_TAB_SLUGS
   // (the hash grammar), so the nav, the routes and the renderer cannot drift.
   var RINGS_TAB_ICONS = {

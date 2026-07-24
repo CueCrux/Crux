@@ -3783,8 +3783,15 @@ function extractThemeVars(theme) {
     '[m17] a workspace group\'s pages must still resolve from the config model (workspaceGroupItems → workspaceDestPages)');
   check(/buildNavGroup\(nav, btn, d\.id, items\)/.test(shellHtml),
     '[m17] buildWorkspaceRail must render each group\'s pages as an accordion group — the workspace-pages bug fix, M20 vehicle');
-  check(/function workspaceDestPages\(/.test(shellHtml) && /function openWorkspaceRailFlyout\(/.test(shellHtml),
-    '[m17] workspace dests must resolve their pages (workspaceDestPages) + open the flyout (openWorkspaceRailFlyout)');
+  // M22 RETARGET: the M17 requirement was "a workspace dest must resolve its pages
+  // AND surface them in the COMPRESSED rail too". The vehicle moved again — from
+  // the right-side flyout (openWorkspaceRailFlyout, deleted in M22) to the compact
+  // inline accordion, which renders the SAME workspaceGroupItems list the expanded
+  // rail renders. The assertion follows the requirement, not the removed function.
+  check(/function workspaceDestPages\(/.test(shellHtml) && !/function openWorkspaceRailFlyout\(/.test(shellHtml),
+    '[m17] workspace dests must resolve their pages (workspaceDestPages); the flyout vehicle is gone (M22)');
+  check(/workspaceGroupItems\(ws, d\)/.test(shellHtml) && !/:root\[data-rail="collapsed"\] \.nav-sub \{ display: none; \}/.test(shellHtml),
+    '[m17] a workspace group\'s pages must reach the COMPRESSED rail — now the inline accordion, not a flyout');
   // (b) live pick-up: a stored console:workspace:/console:page: fact reloads the
   //     model (refresh always works; this is the "ideally live" upgrade).
   check(/EventSource\('\/v1\/events\/stream\?types=fact\.stored'\)/.test(shellHtml) && /console:workspace:'\) !== 0 && entity\.indexOf\('console:page:/.test(shellHtml),
@@ -3817,7 +3824,7 @@ function extractThemeVars(theme) {
   // (g) unified Settings cards — equal-height grid rows.
   check(/\.settings-page \.v2grid\s*\{\s*align-items:\s*stretch/.test(shellHtml) && /content\.classList\.add\('settings-page'\)/.test(shellHtml),
     '[m17] the Settings region must render as one equal-height card grid (.settings-page)');
-  notes.push('operator round 6 (M17): workspace-pages bug fixed (config-driven buildWorkspaceSubnav pill row + openWorkspaceRailFlyout, both off workspaceDestPages) + live model reload on console:workspace/page fact.stored; collapsed rail reworked (chevron removed → expand via the logo, icons-only, a dest icon CLICK opens the flyout — primary compressed nav for touch/keyboard); single workspace switcher button + rightward pop-out (wsSwitchPop) replacing the multi-button data-ws strip, reachable collapsed + expanded; operator popup gains Studio + Options nav entries (theme + connection kept); Settings shows an honest, non-milestone gate reason (generic "wired in M3+" stays the default choke point) + drops the stale Appearance section + renders one equal-height card grid.');
+  notes.push('operator round 6 (M17): workspace-pages bug fixed (config-driven buildWorkspaceSubnav pill row + openWorkspaceRailFlyout, both off workspaceDestPages) + live model reload on console:workspace/page fact.stored; collapsed rail reworked (chevron removed → expand via the logo, icons-only, a dest icon CLICK opens the flyout — primary compressed nav for touch/keyboard; M22 retired the flyout, the compact bar now carries the sub-pages inline as icons); single workspace switcher button + rightward pop-out (wsSwitchPop) replacing the multi-button data-ws strip, reachable collapsed + expanded; operator popup gains Studio + Options nav entries (theme + connection kept); Settings shows an honest, non-milestone gate reason (generic "wired in M3+" stays the default choke point) + drops the stale Appearance section + renders one equal-height card grid.');
 })();
 
 // ---- Check 54 — (console-surfaces-remediation M18) operator round 7:
@@ -3921,9 +3928,13 @@ function extractThemeVars(theme) {
   check(!/mkNav\('Studio'/.test(shellHtml),
     '[m19] the operator popup must NOT carry a Studio nav entry (moved to the account pop-out + rail head)');
   // (e) collapsed rail click = page-level nav; flyout on hover + ArrowRight.
-  check(/a dest icon CLICK always navigates/.test(shellHtml) && /e\.key === 'ArrowRight'/.test(shellHtml),
-    '[m19] a rail dest click must navigate page-level; the flyout is a hover + ArrowRight (keyboard) affordance');
-  notes.push('operator round 8 (M19): rings play bar moved inline with the tab icons + search (static, aria-hidden range labels where the pickers were); date pickers returned to the bottom bar flanking the window sliders; duplicate execplans/sessions glance tiles removed; sessions tile + facts glance gained real per-day histograms (last_active_unix_ms / facts stored_at); Board/Graph/Tree absorbed into the Rings tab hub (renderCanvasBoard/Graph + renderPlanTree into the swap host, clean teardown), Canvas destination retired to a railHidden route-only home, #/canvas/board|graph|tree redirect to #/rings/<view>, sitemap Check 50 retargeted; Studio relocated to the account pop-out (between Settings and Language) + a rail-head button next to the theme control, removed from the operator popup; rail dest click navigates page-level with a hover + ArrowRight flyout (built-in + workspace rails).');
+  // M22 RETARGET: the click semantics are unchanged (page-level nav in BOTH rail
+  // states) — but the sub-page affordance it used to sit beside is gone. The
+  // hover-intent + ArrowRight flyout entry is replaced by the compact inline
+  // accordion, so this gate asserts the click contract plus the flyout's absence.
+  check(/a dest icon CLICK always navigates/.test(shellHtml) && !/e\.key === 'ArrowRight'/.test(shellHtml),
+    '[m19] a rail dest click must navigate page-level; the hover/ArrowRight flyout entry is gone (M22)');
+  notes.push('operator round 8 (M19): rings play bar moved inline with the tab icons + search (static, aria-hidden range labels where the pickers were); date pickers returned to the bottom bar flanking the window sliders; duplicate execplans/sessions glance tiles removed; sessions tile + facts glance gained real per-day histograms (last_active_unix_ms / facts stored_at); Board/Graph/Tree absorbed into the Rings tab hub (renderCanvasBoard/Graph + renderPlanTree into the swap host, clean teardown), Canvas destination retired to a railHidden route-only home, #/canvas/board|graph|tree redirect to #/rings/<view>, sitemap Check 50 retargeted; Studio relocated to the account pop-out (between Settings and Language) + a rail-head button next to the theme control, removed from the operator popup; rail dest click navigates page-level (built-in + workspace rails) — the hover + ArrowRight flyout that accompanied it is retired in M22.');
 })();
 
 // ---- Check 56 — (console-surfaces-remediation M20) operator round 9:
@@ -3939,8 +3950,13 @@ function extractThemeVars(theme) {
     '[m20] the shell must define railGroupItems + workspaceGroupItems (one list for the accordion AND the flyout)');
   check(!/function buildSubnav\(/.test(shellHtml) && !/function buildWorkspaceSubnav\(/.test(shellHtml) && !/'class': 'subnav'/.test(shellHtml),
     '[m20] the topbar sub-nav PILL ROW must be removed console-wide (built-in + workspace)');
-  check(/function openRailFlyout\(destId, anchorBtn\) \{\s*\n\s*var items = railGroupItems\(destId\);/.test(shellHtml),
-    '[m20] the collapsed-rail flyout must render the SAME railGroupItems (so the two rail states cannot disagree)');
+  // M22 RETARGET: the shared-list invariant is unchanged — only its second
+  // consumer moved. It was the collapsed-rail flyout (openRailFlyout); it is now
+  // the compact inline accordion, which is literally the same buildNavGroup call
+  // over the same railGroupItems, restyled by CSS. One list, two presentations.
+  check(/buildNavGroup\(nav, btn, item\.id, items\)/.test(shellHtml) && /var items = railGroupItems\(item\.id\);/.test(shellHtml)
+    && !/function openRailFlyout\(/.test(shellHtml),
+    '[m20] ONE railGroupItems list must feed the rail in BOTH states (M22: the compact accordion replaced the flyout)');
   // (b) the accordion itself: one group open, animated, reduced-motion aware.
   check(/function buildNavGroup\(nav, btn, key, items\)/.test(shellHtml) && /function navGroupSetOpen\(rec, open\)/.test(shellHtml) && /function syncRailAccordion\(/.test(shellHtml),
     '[m20] the shell must build accordion groups (buildNavGroup / navGroupSetOpen / syncRailAccordion)');
@@ -3950,8 +3966,12 @@ function extractThemeVars(theme) {
     '[m20] the accordion must respect prefers-reduced-motion (CSS + the JS end-state snap)');
   check(/var open = \(k === activeKey\);/.test(shellHtml),
     '[m20] exactly one group may be open — the active destination\'s');
-  check(/:root\[data-rail="collapsed"\] \.nav-sub \{ display: none; \}/.test(shellHtml),
-    '[m20] the collapsed rail must NOT show the accordion (it keeps the M19 click + flyout idiom)');
+  // M22 RETARGET: M20 scoped the accordion to the expanded rail (collapsed had the
+  // flyout). M22 gives the collapsed rail the accordion too, as icons — so the rule
+  // that hid it must be GONE and the compact row styling must be present.
+  check(!/:root\[data-rail="collapsed"\] \.nav-sub \{ display: none; \}/.test(shellHtml)
+    && /:root\[data-rail="collapsed"\] \.nav-subitem \{/.test(shellHtml),
+    '[m20] the collapsed rail must show the accordion as ICONS (M22), not hide it');
   check(/buildNavGroup\(nav, btn, item\.id, items\)/.test(shellHtml) && /buildNavGroup\(nav, btn, d\.id, items\)/.test(shellHtml),
     '[m20] BOTH rails (built-in + workspace) must build accordion groups — the standard applies to all nav links');
   // (c) the nine Rings views are the Rings group; switching drives the SAME swap.
@@ -4014,7 +4034,7 @@ function extractThemeVars(theme) {
     '[m20] the ledger rows (and their hit boxes) must move with LEDGER_X');
   check(/ledgerRows\.push\(\{ x: LEDGER_X/.test(renderSrc),
     '[m20] the ledger hit-test rects must match the drawn rows (click-to-solo stays aligned)');
-  notes.push('operator round 9 (M20): the nine Rings views moved OUT of the main pane INTO the left nav as an accordion group (buildNavGroup/syncRailAccordion; one group open — the active destination\'s; height+opacity ease, reduced-motion snap), applied to BOTH the built-in and workspace rails; the topbar sub-nav PILL ROW is removed console-wide (buildSubnav + buildWorkspaceSubnav deleted) — accordion expanded / flyout collapsed, both off ONE railGroupItems list; a Rings row drives the SAME in-place fade swap via CruxRender.ringsSetTab + replaceState (a hashchange would re-route and kill the fade), and the topbar tab icons are gone; RINGS IS THE INDEX (DESTS[0], key 1, boot + "#/" land there) and Overwatch is retired to a railHidden route-only registry entry with every #/overwatch route redirected to its Rings equivalent (renderers kept — they ARE the tabs), plus sitemap/start-path/workspace-builtin/phone-tab retargets; the canvas graph zoom is ANCHORED AT THE POINTER (zoomAtPoint: t\' = s - (s - t)·k) and the Overview element is rebuilt as a compact bottom-left glass chip (LOD state + zoom %, native, var(--) tokens) over a stage that now fills the tab host; the rings bottom bar is one non-wrapping row and the top bar takes the same measure + midline; the completed-plans list starts clear of the vertical left toolbar, measured from its live geometry.');
+  notes.push('operator round 9 (M20): the nine Rings views moved OUT of the main pane INTO the left nav as an accordion group (buildNavGroup/syncRailAccordion; one group open — the active destination\'s; height+opacity ease, reduced-motion snap), applied to BOTH the built-in and workspace rails; the topbar sub-nav PILL ROW is removed console-wide (buildSubnav + buildWorkspaceSubnav deleted) — one accordion in both rail states off ONE railGroupItems list (M22 replaced the collapsed-rail flyout with the compact inline accordion); a Rings row drives the SAME in-place fade swap via CruxRender.ringsSetTab + replaceState (a hashchange would re-route and kill the fade), and the topbar tab icons are gone; RINGS IS THE INDEX (DESTS[0], key 1, boot + "#/" land there) and Overwatch is retired to a railHidden route-only registry entry with every #/overwatch route redirected to its Rings equivalent (renderers kept — they ARE the tabs), plus sitemap/start-path/workspace-builtin/phone-tab retargets; the canvas graph zoom is ANCHORED AT THE POINTER (zoomAtPoint: t\' = s - (s - t)·k) and the Overview element is rebuilt as a compact bottom-left glass chip (LOD state + zoom %, native, var(--) tokens) over a stage that now fills the tab host; the rings bottom bar is one non-wrapping row and the top bar takes the same measure + midline; the completed-plans list starts clear of the vertical left toolbar, measured from its live geometry.');
 })();
 
 // =========================================================================
@@ -4151,7 +4171,76 @@ function extractThemeVars(theme) {
     '[m21] cx-cost must join the session store for the agent-given name');
   check(!/\bfetch\s*\(/.test(costBody), '[m21] cx-cost must not raw-fetch');
 
-  notes.push('operator round 10 (M21): accordion + collapsed-flyout rows carry PER-PAGE marks off one NAV_PAGE_PATHS map (registry-owned marks reused, never redrawn); the graph LOD cut PRESERVES the viewpoint — switchMode no longer re-frames to fit (which is what threw the layer to (pad,pad) = the reported top-left jump at ~60%) but re-pins the cursor world point and carries the current scale, with dev-gated __cvZoomProbe/__cvZoomAt so the claim is measured; save_session now stamps the write-time actor (scope_identity, None for anonymous) and documents state.title/state.summary, /v1/console/sessions returns actor + state_title/state_summary + a server-computed allocation block and the console paints it (hidden, not zeroed, on an older daemon); the ExecPlan board gained persisted state chips + date/A→Z/completion sorts (completion states its coverage and sinks unmeasured plans); tile boards open LOCKED with an explicit Edit toggle arming move+resize and expanded cards carry a top-right X (the Studio, an inherent editor, is untouched); the Canvas segmented control is replaced by the Studio\'s own Board·Pages·Integrations; Settings gets one vertical rhythm (its two JS cards moved into a grid) and the System sub-pages return as an UPWARD accordion off the rail footer (collapsed: the same list in #acctPop); cx-cost rows show the agent title + summary with an honest fallback chain and a per-session gradient bar on a fixed 2M scale with a visible max line.');
+  notes.push('operator round 10 (M21): accordion rows (expanded, and compact since M22) carry PER-PAGE marks off one NAV_PAGE_PATHS map (registry-owned marks reused, never redrawn); the graph LOD cut PRESERVES the viewpoint — switchMode no longer re-frames to fit (which is what threw the layer to (pad,pad) = the reported top-left jump at ~60%) but re-pins the cursor world point and carries the current scale, with dev-gated __cvZoomProbe/__cvZoomAt so the claim is measured; save_session now stamps the write-time actor (scope_identity, None for anonymous) and documents state.title/state.summary, /v1/console/sessions returns actor + state_title/state_summary + a server-computed allocation block and the console paints it (hidden, not zeroed, on an older daemon); the ExecPlan board gained persisted state chips + date/A→Z/completion sorts (completion states its coverage and sinks unmeasured plans); tile boards open LOCKED with an explicit Edit toggle arming move+resize and expanded cards carry a top-right X (the Studio, an inherent editor, is untouched); the Canvas segmented control is replaced by the Studio\'s own Board·Pages·Integrations; Settings gets one vertical rhythm (its two JS cards moved into a grid) and the System sub-pages return as an UPWARD accordion off the rail footer (collapsed: the same list in #acctPop); cx-cost rows show the agent title + summary with an honest fallback chain and a per-session gradient bar on a fixed 2M scale with a visible max line.');
+})();
+
+// =========================================================================
+//  M22 — operator round 11: the COMPACT-rail inline accordion. Clicking a
+//  destination icon in the icons-only rail pushes its sub-pages DOWN the bar as
+//  icons — the icons-only twin of the expanded accordion — and the right-side
+//  sub-page flyout is REMOVED. The other rail pop-outs (operator options,
+//  account, workspace switcher) are different mechanisms and stay.
+// =========================================================================
+(function m22OperatorRound11() {
+  // ---- (1) the flyout is GONE (state assertion, not just "unused") --------
+  ['ensureRailFlyout', 'openRailFlyout', 'openWorkspaceRailFlyout', 'railFlyoutRender',
+   'closeRailFlyout', 'scheduleRailFlyoutClose', 'railFlyoutFocusFirst'].forEach(function (fn) {
+    check(!new RegExp('function ' + fn + '\\(').test(shellHtml) && shellHtml.indexOf(fn + '(') < 0,
+      '[m22] the sub-page flyout function ' + fn + ' must be removed (no definition, no call site)');
+  });
+  check(!/id: 'railFlyout'/.test(shellHtml) && !/#railFlyout/.test(shellHtml),
+    '[m22] no #railFlyout element may be built or queried any more');
+  check(!/aria-haspopup/.test(shellHtml.slice(shellHtml.indexOf('function buildRail()'), shellHtml.indexOf('function buildThemeSwitch'))),
+    '[m22] a rail destination must no longer advertise a popup (it owns an accordion group)');
+  check(!/mouseenter[^\n]*railIsCollapsed/.test(shellHtml),
+    '[m22] the collapsed rail must have NO hover-intent sub-page affordance');
+  // The OTHER pop-outs are untouched — different mechanisms, explicitly retained.
+  check(/id: 'acctPop'/.test(shellHtml) && /id: 'wsSwitchPop'/.test(shellHtml) && /id: 'railOpsPop'/.test(shellHtml),
+    '[m22] the account, workspace-switcher and operator-options pop-outs must survive the flyout removal');
+  check(/\.rail-flyout \{/.test(shellHtml),
+    '[m22] the .rail-flyout glass must remain — it is the shared skin of those three pop-outs');
+
+  // ---- (2) compact rows are ICON buttons, nested, off the SAME glyphs -----
+  check(/:root\[data-rail="collapsed"\] \.nav-subitem \{[^}]*justify-content: center;[^}]*width: 34px; min-height: 34px/.test(shellHtml),
+    '[m22] a compact sub-page row must be a square icon button');
+  check(/:root\[data-rail="collapsed"\] \.nav-subitem \{[^}]*margin-left: auto; margin-right: 3px;/.test(shellHtml)
+    && /:root\[data-rail="collapsed"\] \.nav-sub-inner::before \{ left: 6px/.test(shellHtml),
+    '[m22] compact rows must be inset from the destination column with the connector hairline at their left (hierarchy without text)');
+  check(/:root\[data-rail="collapsed"\] \.nav-subitem \.label \{ display: none; \}/.test(shellHtml),
+    '[m22] the compact row must drop its text label (tooltips are the only text)');
+  check(/title: it\.title, 'aria-label': it\.title/.test(shellHtml),
+    '[m22] every accordion row must carry the page name in title + aria-label (the compact row has no visible label)');
+  check(/\.nav-subitem\[aria-current="page"\] \{/.test(shellHtml) && /\.nav-subitem\[aria-current="page"\] svg \{ opacity: 1; color: var\(--acc\); \}/.test(shellHtml),
+    '[m22] the active sub-page must be marked (accent fill + accent glyph) — it is the only state cue a compact icon has');
+  // ONE glyph source for both presentations: the compact icons ARE the expanded icons.
+  check(/if \(it\.icon\) \{ row\.appendChild\(el\('span', \{ 'class': 'ic', 'aria-hidden': 'true', html: it\.icon \}\)\); \}/.test(shellHtml),
+    '[m22] both presentations must render the item list\'s own icon (no second compact glyph set)');
+
+  // ---- (3) same accordion mechanics as expanded ---------------------------
+  check(/M22 — COMPACT-RAIL ACCORDION/.test(shellHtml),
+    '[m22] the compact accordion must be documented where its rules live (CSS)');
+  check(/var open = \(k === activeKey\);/.test(shellHtml) && /function syncRailAccordion\(/.test(shellHtml),
+    '[m22] the one-open invariant + route sync are the SAME code in both rail states');
+  check(/\.nav-sub \{[^}]*transition: height/.test(shellHtml) && /function navReduceMotion\(/.test(shellHtml),
+    '[m22] the compact group must use the same height/opacity ease and reduced-motion snap');
+  check(/if \(location\.hash === target\) \{ syncRailAccordion\(\); return; \}/.test(shellHtml),
+    '[m22] clicking the destination you are already on must still open its group (no hashchange fires)');
+  check(/if \(location\.hash === target\) \{ syncRailAccordion\(dest\.id, first \|\| null\); return; \}/.test(shellHtml),
+    '[m22] the workspace rail must do the same (both rails, one behaviour)');
+  check(/function goRingsTab\(slug, tabId\)/.test(shellHtml) && /R\.ringsSetTab\(tabId\);/.test(shellHtml),
+    '[m22] a Rings row must drive the in-place fade bridge — from the compact rail exactly as from the expanded one');
+
+  // ---- (4) keyboard: the accordion replaces the flyout's key model --------
+  check(/function navGroupRows\(group\)/.test(shellHtml) && /rows\[Math\.min\(i \+ 1, rows\.length - 1\)\]\.focus\(\)/.test(shellHtml),
+    '[m22] ArrowDown/ArrowUp must walk the open group\'s rows');
+  check(/function navGroupIsUpward\(group\)/.test(shellHtml),
+    '[m22] the upward footer group must mirror its two vertical keys (visual order == key order)');
+
+  // ---- (5) overflow containment ------------------------------------------
+  check(/#nav \{ flex: 1 1 auto; min-height: 0; scrollbar-width: thin; \}/.test(shellHtml) && /nav \{[^}]*overflow-y: auto/.test(shellHtml),
+    '[m22] an open compact group must scroll inside #nav (the M17 overflow fix), never overflow the viewport');
+
+  notes.push('operator round 11 (M22): the COMPACT (icons-only) rail runs the accordion inline — clicking a destination icon navigates to its default page AND pushes that destination\'s sub-pages down the bar as square, inset icon buttons rendered from the SAME railGroupItems/workspaceGroupItems lists and the SAME navPageGlyph marks as the expanded rows (one list, two presentations; page name in title + aria-label, active row accent-marked), with the same one-open-group invariant, the same syncRailAccordion route binding, the same height+opacity ease and reduced-motion snap, and the same goRingsTab fade bridge for the nine Rings views; the right-side sub-page flyout is REMOVED outright (railFlyout element, ensureRailFlyout/openRailFlyout/openWorkspaceRailFlyout/railFlyoutRender/closeRailFlyout/scheduleRailFlyoutClose/railFlyoutFocusFirst, the hover-intent + ArrowRight entry, aria-haspopup and every close-on-route/popup-exclusion call site) while the three genuine rail pop-outs — operator options, account, workspace switcher — keep the .rail-flyout glass untouched; keyboard moves to the accordion model (ArrowDown steps into the open group, ArrowDown/ArrowUp walk its rows, ArrowUp off the first row and Escape return to the destination, Enter/Space navigate), mirrored for the upward footer group; an open group scrolls inside the #nav overflow region (M17) rather than the viewport.');
 })();
 
 // ---- Report (awaits async renderer-driven checks) -----------------------
