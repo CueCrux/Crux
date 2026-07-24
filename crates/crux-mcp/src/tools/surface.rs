@@ -106,6 +106,15 @@ impl ToolSurfaceMode {
             _ => Self::Full,
         }
     }
+
+    /// Stable lowercase wire string (ledger `agent.tools_offered.v1` events).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Minimal => "minimal",
+            Self::Dynamic => "dynamic",
+        }
+    }
 }
 
 /// Shape an authorisation-filtered tool list according to `mode`.
