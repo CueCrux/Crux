@@ -17705,9 +17705,9 @@ async fn mcp_tools_usage_admin_gets_catalog_joined_rollup() {
     assert_eq!(body["calls_total"], 1);
     let catalog_len = crux_mcp::tools::list_tools().len();
     assert_eq!(body["tools_in_catalog"], catalog_len as u64);
-    let tools = body["tools"].as_array().unwrap();
+    let tools = &body["tools"];
     assert!(
-        tools.len() >= catalog_len,
+        tools.as_array().map_or(0, Vec::len) >= catalog_len,
         "every catalog tool present (zeros included)"
     );
     // The one called tool sorts first with its stats; the rest are zeros.
