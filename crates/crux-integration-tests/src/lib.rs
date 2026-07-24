@@ -15,14 +15,18 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Default per-attempt boot budget. A cold corecruxd boot builds/loads the
-/// `.ccxi` index and passes the `/readyz` gates (routing_loaded, capacity,
-/// control_evidence, …); under a loaded self-hosted CI runner — or `cargo
-/// llvm-cov` instrumentation — that regularly exceeds the old fixed 10s and
-/// flaked PR CI even on near-solo reruns. 30s comfortably covers a cold boot
-/// while still failing fast on a genuinely wedged daemon. Override without a
-/// rebuild via `CORECRUXD_STARTUP_TIMEOUT_SECS` so CI can tune per runner.
-const STARTUP_TIMEOUT_SECS_DEFAULT: u64 = 30;
+/// Default per-attempt boot budget. A healthy corecruxd — even a cold boot that
+/// builds/loads the `.ccxi` index and clears the `/readyz` gates (routing_loaded,
+/// data_dir_capacity, control_evidence, …) — is serve-ready in well under a
+/// second, so 10s is already generous. The failures this was once raised to
+/// paper over were not slow boots: they were a `/readyz` gate hard-failing (a
+/// full `/srv/data` tripping `data_dir_capacity`), which no timeout can wait
+/// out — a longer default only makes each of those failing tests take longer to
+/// give up. `wait_healthy` now names the failing gate, so a genuine timeout is
+/// diagnosable rather than guessed at. Runners that genuinely need more headroom
+/// (e.g. heavy `cargo llvm-cov` instrumentation) override without a rebuild via
+/// `CORECRUXD_STARTUP_TIMEOUT_SECS`.
+const STARTUP_TIMEOUT_SECS_DEFAULT: u64 = 10;
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(750);
 const START_ATTEMPTS: usize = 3;
 /// Cap on the `/readyz` body echoed into a startup-failure message — enough for
@@ -477,7 +481,21 @@ impl Drop for TestDaemon {
 
 #[cfg(test)]
 mod tests {
-    use super::{truncate, ProbeSnapshot, READYZ_BODY_LIMIT};
+    use super::{startup_timeout, truncate, ProbeSnapshot, READYZ_BODY_LIMIT, STARTUP_TIMEOUT_SECS_DEFAULT};
+
+    #[test]
+    fn startup_timeout_default_is_ten_seconds() {
+        // Locks the decision to keep the default tight: a healthy daemon is
+        // ready in <1s, and a longer default only delays failure when a
+        // `/readyz` gate is hard-failing (e.g. data_dir_capacity on a full
+        // disk). Runners that need more headroom set CORECRUXD_STARTUP_TIMEOUT_SECS.
+        assert_eq!(STARTUP_TIMEOUT_SECS_DEFAULT, 10);
+        // With the override unset the resolved budget is the default. (CI does
+        // not set this var; the daemon-boot tests that would are #[ignore]/serial.)
+        if std::env::var_os("CORECRUXD_STARTUP_TIMEOUT_SECS").is_none() {
+            assert_eq!(startup_timeout(), std::time::Duration::from_secs(10));
+        }
+    }
 
     #[test]
     fn probe_snapshot_reports_unfilled_probes_as_unknown() {
