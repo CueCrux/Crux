@@ -4630,6 +4630,391 @@
   }
 
   // =======================================================================
+  //  Configurable Workspaces (console-surfaces-remediation M16b) — the
+  //  fact-driven nav/page system. Operator-named "Workspaces": a signed pack
+  //  installs a workspace (of pages) built in the Studio.
+  //
+  //  ARTIFACTS (facts, canonical key-sorted JSON, one artifact / two editors):
+  //    console:workspace:<uid> key "def" →
+  //      { schema_version, uid, name, icon, order, dests:[{id,label,icon,pages:[pageUid…]}],
+  //        source:"user"|"builtin-fork", forked_from? }
+  //    console:page:<uid> key "def" →
+  //      { schema_version, uid, type:<page-type-id>, title, sub, dest, config:{…},
+  //        source, forked_from? }
+  //
+  //  DESIGN RULES (M16 decision log + memo §4 — CONTRACT):
+  //    * Version-stamped from day one (schema_version); the daemon owns migration.
+  //    * TOLERANT READER: spread/merge — unknown keys survive Studio round-trips
+  //      untouched (never rebuild field-by-field); a schema_version newer than we
+  //      understand renders an honest "newer config" state, never destroys.
+  //    * Built-ins (Command · Explorer) are AUTO-GENERATED from the current page
+  //      registry — zero config == exactly today's console (fully useful unconfigured).
+  //    * TAKE CONTROL: a built-in renders from the registry until reversibly forked
+  //      to an overlay (source:"builtin-fork", forked_from); revert = tombstone the
+  //      overlay (a soft-delete through the SAME gated fact-add path — there is no
+  //      gated fact-DELETE client method, and the daemon's own model is soft-delete)
+  //      → auto-generation resumes. Fork-on-edit with a visible provenance chip.
+  //    * ONE ARTIFACT / TWO EDITORS: cwsCanonical() is the byte-stable form the
+  //      Studio AND an MCP store_fact writer both produce; a raw-JSON escape hatch
+  //      ships in the Studio. (docs/agent/console-workspaces.md documents it.)
+  //    * Packs carry workspaces/pages ADDITIVELY (crux.studio.v1 stays valid).
+  //
+  //  Pure helpers (cws*) are unit-tested by the smoke; the runtime nav lives in
+  //  shell.html (which calls these through window.CruxRender) and the Studio
+  //  "Pages" / "Integrations" subsections live below in renderWorkspaceStudio /
+  //  renderIntegrationsStudio. Writes route ONLY through operatorGatedCall →
+  //  consoleFactsAdd (via tstudioWriteFact); reads through the generated client.
+  // =======================================================================
+  var CWS_SCHEMA_VERSION = 1;
+  var CWS_WS_ENTITY = 'console:workspace:';
+  var CWS_PAGE_ENTITY = 'console:page:';
+  var CWS_DEF_KEY = 'def';
+  // Built-in workspace uids (reserved — a user workspace never claims these).
+  var CWS_BUILTIN_COMMAND = 'command';
+  var CWS_BUILTIN_EXPLORE = 'explore';
+  var CWS_STUDIO_SCHEMA = 'crux.studio.v1';
+
+  function cwsWorkspaceEntity(uid) { return CWS_WS_ENTITY + uid; }
+  function cwsPageEntity(uid) { return CWS_PAGE_ENTITY + uid; }
+  function cwsStr(v) { return (typeof v === 'string') ? v : (v == null ? '' : String(v)); }
+  function cwsSlugify(name) {
+    return cwsStr(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'item';
+  }
+
+  // Canonical, byte-stable JSON: keys sorted deeply, arrays order-preserved,
+  // no whitespace. The one form the Studio AND an MCP writer both produce.
+  function cwsSortValue(v) {
+    if (Array.isArray(v)) { return v.map(cwsSortValue); }
+    if (v && typeof v === 'object') {
+      var out = {};
+      Object.keys(v).sort().forEach(function (k) { out[k] = cwsSortValue(v[k]); });
+      return out;
+    }
+    return v;
+  }
+  function cwsCanonical(v) { return JSON.stringify(cwsSortValue(v)); }
+
+  // ---- Tolerant readers ---------------------------------------------------
+  // Return { def, unknownVersion, reverted, valid }. `def` preserves EVERY key of
+  // the input (spread first, then coerce only the known fields) so a Studio save
+  // round-trips hand-written / newer config untouched. A schema_version we do not
+  // understand short-circuits: the raw def is returned verbatim + unknownVersion,
+  // so the runtime paints an honest "newer config" panel instead of interpreting.
+  function cwsNormalizeDest(raw) {
+    var r = (raw && typeof raw === 'object') ? raw : {};
+    var out = {};
+    Object.keys(r).forEach(function (k) { out[k] = r[k]; });   // preserve unknowns (incl. nested)
+    out.id = cwsStr(r.id) || cwsSlugify(r.label) || 'group';
+    out.label = cwsStr(r.label) || out.id;
+    out.icon = cwsStr(r.icon) || 'work';
+    out.pages = Array.isArray(r.pages) ? r.pages.filter(function (p) { return typeof p === 'string' && p; }) : [];
+    return out;
+  }
+  function cwsReadWorkspaceDef(raw) {
+    if (!raw || typeof raw !== 'object') { return { def: null, valid: false, unknownVersion: false, reverted: false }; }
+    if (raw.reverted === true) { return { def: raw, valid: true, unknownVersion: false, reverted: true }; }
+    var sv = (typeof raw.schema_version === 'number') ? raw.schema_version : CWS_SCHEMA_VERSION;
+    if (sv > CWS_SCHEMA_VERSION) { return { def: raw, valid: true, unknownVersion: true, reverted: false }; }
+    var out = {};
+    Object.keys(raw).forEach(function (k) { out[k] = raw[k]; });   // preserve unknown keys
+    out.schema_version = sv;
+    out.uid = cwsStr(raw.uid);
+    out.name = cwsStr(raw.name) || out.uid;
+    out.icon = cwsStr(raw.icon) || 'work';
+    out.order = (typeof raw.order === 'number') ? raw.order : 100;
+    out.source = (raw.source === 'builtin-fork' || raw.source === 'builtin') ? raw.source : 'user';
+    out.dests = Array.isArray(raw.dests) ? raw.dests.map(cwsNormalizeDest) : [];
+    return { def: out, valid: !!out.uid, unknownVersion: false, reverted: false };
+  }
+  function cwsReadPageDef(raw) {
+    if (!raw || typeof raw !== 'object') { return { def: null, valid: false, unknownVersion: false, reverted: false }; }
+    if (raw.reverted === true) { return { def: raw, valid: true, unknownVersion: false, reverted: true }; }
+    var sv = (typeof raw.schema_version === 'number') ? raw.schema_version : CWS_SCHEMA_VERSION;
+    if (sv > CWS_SCHEMA_VERSION) { return { def: raw, valid: true, unknownVersion: true, reverted: false }; }
+    var out = {};
+    Object.keys(raw).forEach(function (k) { out[k] = raw[k]; });   // preserve unknown keys (incl. config sub-keys)
+    out.schema_version = sv;
+    out.uid = cwsStr(raw.uid);
+    out.type = cwsStr(raw.type);
+    out.title = cwsStr(raw.title) || out.type;
+    out.sub = cwsStr(raw.sub);
+    out.dest = cwsStr(raw.dest);
+    out.config = (raw.config && typeof raw.config === 'object') ? raw.config : {};
+    out.source = (raw.source === 'builtin-fork' || raw.source === 'builtin') ? raw.source : 'user';
+    return { def: out, valid: !!(out.uid && out.type), unknownVersion: false, reverted: false };
+  }
+
+  // ---- Page types (whatever exists now is generatable) --------------------
+  // Every registry page id is a page TYPE; plus the destination-IS-the-page
+  // surfaces. A user page instance names a type and renders through the SAME
+  // builder (renderWorkspacePage → renderPage / the special renderers).
+  var CWS_SURFACE_TYPES = [
+    { type: 'canvas/board', label: 'Canvas · Board', dest: 'canvas' },
+    { type: 'canvas/graph', label: 'Canvas · Graph', dest: 'canvas' },
+    { type: 'canvas/tree', label: 'Canvas · Tree', dest: 'canvas' },
+    { type: 'explorer', label: 'Explorer · search', dest: 'explorer' },
+    { type: 'sitemap', label: 'Site map', dest: 'sitemap' },
+    { type: 'rings', label: 'Rings', dest: 'rings' }
+  ];
+  // Type-specific config options (only where a type has REAL query options that
+  // change what data loads — endpoint-driven pages). The Studio renders a form
+  // for these; config is stored under def.config.query and merged into the load
+  // endpoint at render time. Types absent here carry no options form.
+  var CWS_TYPE_OPTIONS = {
+    'cx-work': [{ key: 'source', label: 'Source', kind: 'select', options: ['all', 'kanban', 'execplans'], dflt: 'all' }],
+    'cx-memory': [{ key: 'top_k', label: 'Top K', kind: 'text', placeholder: '50' }],
+    'cx-review': [{ key: 'limit', label: 'Limit', kind: 'text', placeholder: '50' }]
+  };
+  function cwsPageTypes() {
+    var pages = (typeof window !== 'undefined') ? window.CruxPages : null;
+    var out = [];
+    if (pages && pages.PAGES) {
+      Object.keys(pages.PAGES).forEach(function (id) {
+        var p = pages.PAGES[id];
+        out.push({ type: id, label: p.title + ' (' + p.dest + ')', dest: p.dest, kind: 'page', options: CWS_TYPE_OPTIONS[id] || null });
+      });
+    }
+    CWS_SURFACE_TYPES.forEach(function (s) { out.push({ type: s.type, label: s.label, dest: s.dest, kind: 'surface', options: null }); });
+    return out;
+  }
+  function cwsTypeExists(type) {
+    var pages = (typeof window !== 'undefined') ? window.CruxPages : null;
+    if (pages && pages.PAGES && pages.PAGES[type]) { return true; }
+    for (var i = 0; i < CWS_SURFACE_TYPES.length; i++) { if (CWS_SURFACE_TYPES[i].type === type) { return true; } }
+    return false;
+  }
+
+  // ---- Built-in generation (the defaults layer) ---------------------------
+  // Command == the current console destinations/pages; Explorer == the
+  // explore/documents reader surface. Generalises the binary surface toggle
+  // into N workspaces. These render through the EXISTING shell paths when
+  // unforked; the defs here drive the switcher, the Studio Pages tree and forking.
+  function cwsRegistryDests() {
+    var pages = (typeof window !== 'undefined') ? window.CruxPages : null;
+    if (!pages || !pages.DESTS) { return []; }
+    var byDest = {};
+    Object.keys(pages.PAGES).forEach(function (id) {
+      var p = pages.PAGES[id];
+      (byDest[p.dest] = byDest[p.dest] || []).push(id);
+    });
+    return pages.DESTS.filter(function (d) { return d.id !== 'explorer'; }).map(function (d) {
+      var list = byDest[d.id] || [];
+      if (!list.length) {
+        // Destination-IS-the-page surfaces (canvas/sitemap/rings): a single
+        // surface page whose type is the destination itself.
+        if (d.id === 'canvas') { list = ['canvas/board']; }
+        else { list = [d.id]; }
+      }
+      return { id: d.id, label: d.label, icon: d.icon, pages: list };
+    });
+  }
+  function cwsBuiltinWorkspaces() {
+    var command = {
+      schema_version: CWS_SCHEMA_VERSION, uid: CWS_BUILTIN_COMMAND, name: 'Command', icon: 'overwatch',
+      order: 0, source: 'builtin', builtin: true, surface: 'command', dests: cwsRegistryDests()
+    };
+    var explore = {
+      schema_version: CWS_SCHEMA_VERSION, uid: CWS_BUILTIN_EXPLORE, name: 'Explorer', icon: 'search',
+      order: 1, source: 'builtin', builtin: true, surface: 'explore',
+      dests: [{ id: 'explorer', label: 'Explorer', icon: 'search', pages: ['explorer'] }]
+    };
+    return [command, explore];
+  }
+  function cwsIsBuiltinUid(uid) { return uid === CWS_BUILTIN_COMMAND || uid === CWS_BUILTIN_EXPLORE; }
+
+  // Effective workspace list: builtins (auto-generated) overlaid by config facts.
+  // A builtin-fork overlay REPLACES its builtin's def (take control); a reverted
+  // overlay is ignored (auto-generation resumes). User workspaces append.
+  // `overlays` = array of { def } (already read via cwsReadWorkspaceDef).
+  function cwsEffectiveWorkspaces(overlays) {
+    var builtins = cwsBuiltinWorkspaces();
+    var byUid = {};
+    builtins.forEach(function (b) { byUid[b.uid] = b; });
+    (overlays || []).forEach(function (o) {
+      if (!o || !o.def || !o.valid) { return; }
+      if (o.reverted) { return; }   // tombstone → keep the auto-generated builtin (or drop a user ws)
+      var d = o.def;
+      if (!d.uid) { return; }
+      if (cwsIsBuiltinUid(d.uid)) { d.builtin = true; }   // a fork keeps its builtin identity + surface
+      if (byUid[d.uid] && byUid[d.uid].surface) { d.surface = byUid[d.uid].surface; }
+      byUid[d.uid] = d;
+    });
+    // Reverted user workspaces (a tombstone with a non-builtin uid) drop out.
+    (overlays || []).forEach(function (o) {
+      if (o && o.reverted && o.def && o.def.uid && !cwsIsBuiltinUid(o.def.uid)) { delete byUid[o.def.uid]; }
+    });
+    var list = Object.keys(byUid).map(function (k) { return byUid[k]; });
+    list.sort(function (a, b) { return (a.order || 0) - (b.order || 0) || cwsStr(a.name).localeCompare(cwsStr(b.name)); });
+    return list;
+  }
+
+  // ---- Fork / revert (take control) ---------------------------------------
+  function cwsForkWorkspace(builtinDef) {
+    var out = {};
+    Object.keys(builtinDef || {}).forEach(function (k) { out[k] = builtinDef[k]; });
+    delete out.builtin;
+    out.schema_version = CWS_SCHEMA_VERSION;
+    out.source = 'builtin-fork';
+    out.forked_from = builtinDef.uid;
+    return out;
+  }
+  function cwsTombstone(uid) { return { schema_version: CWS_SCHEMA_VERSION, uid: cwsStr(uid), reverted: true }; }
+
+  // ---- Starter templates (remix-not-blank; Blank is last) -----------------
+  function cwsStarterTemplates() {
+    return [
+      {
+        id: 'duplicate-command', label: 'Duplicate Command',
+        desc: 'Start from a copy of the full Command console — every destination and page, ready to trim.',
+        build: function (uid, name) {
+          var cmd = cwsBuiltinWorkspaces()[0];
+          return { workspace: { schema_version: CWS_SCHEMA_VERSION, uid: uid, name: name, icon: 'overwatch', order: 100, source: 'user', dests: cmd.dests.map(cwsNormalizeDest) }, pages: [] };
+        }
+      },
+      {
+        id: 'minimal-ops', label: 'Minimal ops',
+        desc: 'A tight operator surface — Overview, ExecPlans and Facts in one group. Add more from the registry.',
+        build: function (uid, name) {
+          var mk = function (t, title, sub, dest) { var puid = uid + '-' + cwsSlugify(title); return { schema_version: CWS_SCHEMA_VERSION, uid: puid, type: t, title: title, sub: sub, dest: dest, config: {}, source: 'user' }; };
+          var pages = [mk('cx-overview', 'Overview', 'daemon posture at a glance', 'ops'), mk('cx-work', 'ExecPlans', 'read-time projection over the work board', 'ops'), mk('cx-facts', 'Facts', 'the durable record — paged + searchable', 'ops')];
+          return { workspace: { schema_version: CWS_SCHEMA_VERSION, uid: uid, name: name, icon: 'meters', order: 100, source: 'user', dests: [{ id: 'ops', label: 'Ops', icon: 'meters', pages: pages.map(function (p) { return p.uid; }) }] }, pages: pages };
+        }
+      },
+      {
+        id: 'blank', label: 'Blank',
+        desc: 'An empty workspace with one group. Add pages from the registry yourself.',
+        build: function (uid, name) {
+          return { workspace: { schema_version: CWS_SCHEMA_VERSION, uid: uid, name: name, icon: 'work', order: 100, source: 'user', dests: [{ id: 'main', label: 'Main', icon: 'work', pages: [] }] }, pages: [] };
+        }
+      }
+    ];
+  }
+
+  // ---- Pack (crux.studio.v1) additive workspaces/pages --------------------
+  // Extend a studio payload with workspaces + pages WITHOUT breaking older
+  // importers (both arrays are optional). Import applies them as the defaults
+  // layer with provenance (the pack uid), edits overlay per the memo.
+  function cwsPackEmbed(payload, workspaces, pages) {
+    var out = payload && typeof payload === 'object' ? payload : {};
+    if (Array.isArray(workspaces) && workspaces.length) { out.workspaces = workspaces; }
+    if (Array.isArray(pages) && pages.length) { out.pages = pages; }
+    return out;
+  }
+  function cwsPackExtract(payload) {
+    var p = payload && typeof payload === 'object' ? payload : {};
+    return {
+      workspaces: Array.isArray(p.workspaces) ? p.workspaces : [],
+      pages: Array.isArray(p.pages) ? p.pages : []
+    };
+  }
+  // Merge a query object into an endpoint that may already carry a query string.
+  function cwsMergeQuery(endpoint, query) {
+    var e = cwsStr(endpoint);
+    if (!query || typeof query !== 'object') { return e; }
+    var qi = e.indexOf('?');
+    var base = qi >= 0 ? e.slice(0, qi) : e;
+    var params = {};
+    if (qi >= 0) { e.slice(qi + 1).split('&').forEach(function (kv) { if (!kv) { return; } var eq = kv.indexOf('='); var k = eq >= 0 ? kv.slice(0, eq) : kv; params[decodeURIComponent(k)] = eq >= 0 ? decodeURIComponent(kv.slice(eq + 1)) : ''; }); }
+    Object.keys(query).forEach(function (k) { if (query[k] != null && query[k] !== '') { params[k] = query[k]; } });
+    var qs = Object.keys(params).map(function (k) { return encodeURIComponent(k) + '=' + encodeURIComponent(params[k]); }).join('&');
+    return qs ? base + '?' + qs : base;
+  }
+
+  // ---- Overlay loading (config facts through the read client) -------------
+  // Discovery via /v1/facts/list?entity_prefix= (M1 route); full value re-read via
+  // /v1/facts/entity/<e> when the listing truncated it. Never throws.
+  function cwsListEntities(prefix) {
+    return fetchJSON('/v1/facts/list?entity_prefix=' + encodeURIComponent(prefix) + '&include_superseded=false&limit=500')
+      .then(function (res) {
+        var rows = (res.ok && res.data && Array.isArray(res.data.facts)) ? res.data.facts : [];
+        var byEntity = {};
+        rows.forEach(function (f) {
+          if (f.key !== CWS_DEF_KEY) { return; }
+          var cur = byEntity[f.entity];
+          if (!cur || (Number(f.version) || 0) > (Number(cur.version) || 0)) { byEntity[f.entity] = f; }
+        });
+        return Object.keys(byEntity).map(function (ent) { return byEntity[ent]; });
+      }).catch(function () { return []; });
+  }
+  function cwsHydrate(fact) {
+    if (!fact.value_truncated) { var v = null; try { v = JSON.parse(fact.value); } catch (e) { v = null; } return Promise.resolve(v); }
+    var api = (typeof window !== 'undefined') ? window.CruxApi : null;
+    if (!api || typeof api.factsEntityByEntity !== 'function') { return Promise.resolve(null); }
+    return api.factsEntityByEntity(fact.entity)
+      .then(function (r) { return r.json(); })
+      .then(function (d) { var latest = tstudioLatestFact((d && d.facts) || [], CWS_DEF_KEY); if (!latest) { return null; } try { return JSON.parse(latest.value); } catch (e) { return null; } })
+      .catch(function () { return null; });
+  }
+  function cwsReadEntry(prefix, reader, fact) {
+    return cwsHydrate(fact).then(function (raw) {
+      var r = reader(raw);
+      return { entity: fact.entity, uid: fact.entity.slice(prefix.length), raw: raw, def: r.def, valid: r.valid, unknownVersion: r.unknownVersion, reverted: r.reverted, fact: fact };
+    });
+  }
+  function cwsLoadOverlays() {
+    return Promise.all([cwsListEntities(CWS_WS_ENTITY), cwsListEntities(CWS_PAGE_ENTITY)]).then(function (both) {
+      return Promise.all([
+        Promise.all(both[0].map(function (f) { return cwsReadEntry(CWS_WS_ENTITY, cwsReadWorkspaceDef, f); })),
+        Promise.all(both[1].map(function (f) { return cwsReadEntry(CWS_PAGE_ENTITY, cwsReadPageDef, f); }))
+      ]).then(function (res) { return { workspaces: res[0], pages: res[1] }; });
+    }).catch(function () { return { workspaces: [], pages: [] }; });
+  }
+  // Build the full runtime model the shell + Studio share: effective workspaces
+  // (builtins overlaid by config) + a uid→page-def map (valid, non-reverted).
+  function cwsBuildModel(overlays) {
+    overlays = overlays || { workspaces: [], pages: [] };
+    var workspaces = cwsEffectiveWorkspaces(overlays.workspaces);
+    var pageByUid = {};
+    (overlays.pages || []).forEach(function (p) { if (p && p.valid && !p.reverted && p.def && p.def.uid) { pageByUid[p.def.uid] = p.def; } });
+    return { workspaces: workspaces, pages: pageByUid, overlays: overlays };
+  }
+
+  // Render one workspace page (user or forked) into a host by its TYPE — reusing
+  // the SAME builders as the built-in console so "whatever exists now" renders
+  // real data. Called by the shell's #/w/<uid>/<pageUid> route. Never throws.
+  function cwsHonest(host, title, lines) {
+    host.textContent = '';
+    var controls = [{ t: 'info', label: 'page', v: title }];
+    (lines || []).forEach(function (l) { controls.push({ t: 'info', label: l[0], v: l[1] }); });
+    renderSections(host, [{ h: title, wide: true, controls: controls }]);
+  }
+  function renderWorkspacePage(host, pageDef, ctx) {
+    ctx = ctx || {};
+    var read = cwsReadPageDef(pageDef);
+    if (!read.valid || !read.def) { cwsHonest(host, 'Page unavailable', [['reason', 'this page config is missing a uid or type'], ['fix', 'edit it in the Studio › Pages raw-JSON editor']]); return Promise.resolve(); }
+    if (read.unknownVersion) {
+      cwsHonest(host, read.def.title || 'Newer configuration', [
+        ['schema', 'this page was written by a newer console (schema_version ' + read.def.schema_version + ')'],
+        ['safe', 'the config is preserved untouched — upgrade this console to render it, or open it in the raw-JSON editor']
+      ]);
+      return Promise.resolve();
+    }
+    var def = read.def, type = def.type;
+    // Destination-IS-the-page surface types → the existing special renderers.
+    if (type === 'canvas/board' || type === 'canvas/graph' || type === 'canvas/tree' || type === 'canvas/studio') {
+      return renderCanvas(host, { summary: ctx.summary, view: type.split('/')[1] });
+    }
+    if (type === 'explorer') { renderExplorer(host, { summary: ctx.summary }); return Promise.resolve(); }
+    if (type === 'sitemap') { renderSiteMap(host); return Promise.resolve(); }
+    if (type === 'rings') { renderRings(host, { summary: ctx.summary }); return Promise.resolve(); }
+    var pages = (typeof window !== 'undefined') ? window.CruxPages : null;
+    var base = pages && pages.PAGES ? pages.PAGES[type] : null;
+    if (!base) { cwsHonest(host, def.title || type, [['unknown type', type], ['note', 'this page type is not in the registry on this build']]); return Promise.resolve(); }
+    // Synthetic page: reuse the built-in builder, override title/sub, and (where
+    // the type declares options) merge config.query into the load endpoint.
+    var synthetic = {};
+    Object.keys(base).forEach(function (k) { synthetic[k] = base[k]; });
+    synthetic.title = def.title || base.title;
+    synthetic.sub = def.sub != null && def.sub !== '' ? def.sub : base.sub;
+    if (base.load && def.config && def.config.query && typeof def.config.query === 'object') {
+      var load = {}; Object.keys(base.load).forEach(function (k) { load[k] = base.load[k]; });
+      load.endpoint = cwsMergeQuery(base.load.endpoint, def.config.query);
+      synthetic.load = load;
+    }
+    return renderPage(synthetic, host) || Promise.resolve();
+  }
+
+  // =======================================================================
   //  Canvas Studio (M14) — the ported diagram-builder engine.
   //
   //  Ported from MediaCrux/dashboard/public/canvas/assets/diagram-builder.js
@@ -6277,11 +6662,17 @@
       var designs = Array.isArray(studio.designs) ? studio.designs : [];
       var writes = [tstudioWriteFact(tstudioBoardEntity(boardId), TSTUDIO_DOC_KEY, tstudioSerializeDoc(d))];
       designs.forEach(function (dz) { if (dz && dz.slug && dz.config) { writes.push(tstudioSaveDesign(tstudioSlugify(dz.slug), dz.name || dz.slug, dz.config)); } });
+      // M16b — a pack may ALSO carry workspaces/pages (additive). Apply them as the
+      // defaults layer so a pack can install a whole workspace, not just a board.
+      var wsPack = cwsPackExtract(studio);
+      wsPack.workspaces.forEach(function (w) { if (w && w.uid) { writes.push(tstudioWriteFact(cwsWorkspaceEntity(w.uid), CWS_DEF_KEY, cwsCanonical(w))); } });
+      wsPack.pages.forEach(function (pg) { if (pg && pg.uid) { writes.push(tstudioWriteFact(cwsPageEntity(pg.uid), CWS_DEF_KEY, cwsCanonical(pg))); } });
       return Promise.all(writes).then(function (results) {
         var ok = results.every(function (r) { return r && r.ok; });
         if (ok) {
           S.nodes = d.nodes; S.links = d.links; S.texts = d.texts; S.pan = d.pan; S.zoom = d.zoom; S.settings = d.settings;
           renderBoard(); applyBoardSettings(); refreshLibrary(); setSaveState('saved');
+          if (typeof window !== 'undefined' && typeof window.CRUX_WS_RELOAD === 'function' && (wsPack.workspaces.length || wsPack.pages.length)) { window.CRUX_WS_RELOAD(); }
         }
         return { ok: ok };
       }).catch(function (e) { return { ok: false, error: String(e && e.message || e) }; });
@@ -6429,16 +6820,629 @@
       (function (vid) { b.addEventListener('click', function () { location.hash = '#/canvas/' + vid; }); })(v[0]);
       seg.appendChild(b);
     });
-    region.appendChild(el('div', { 'class': 'canvas-head' }, [seg]));
+    var head = el('div', { 'class': 'canvas-head' }, [seg]);
+    // Studio (M16b) gains a subsection switcher: Board (the tile canvas) · Pages
+    // (workspaces + pages) · Integrations (extensions). Deep-linkable via ?sub=.
+    var studioSub = (view === 'studio') ? (ctx.sub === 'pages' ? 'pages' : (ctx.sub === 'integrations' ? 'integrations' : 'board')) : null;
+    if (view === 'studio') {
+      var sub = el('div', { 'class': 'modeseg canvas-subseg', role: 'group', 'aria-label': 'Studio section' });
+      [['board', 'Board'], ['pages', 'Pages'], ['integrations', 'Integrations']].forEach(function (v) {
+        var b = el('button', { 'class': 'modeseg-btn', type: 'button', 'data-sub': v[0], 'aria-pressed': v[0] === studioSub ? 'true' : 'false' }, [v[1]]);
+        (function (sid) { b.addEventListener('click', function () { location.hash = '#/canvas/studio' + (sid === 'board' ? '' : '?sub=' + sid); }); })(v[0]);
+        sub.appendChild(b);
+      });
+      head.appendChild(sub);
+    }
+    region.appendChild(head);
     var body = el('div', { 'class': 'canvas-body' });
     region.appendChild(body);
     host.appendChild(region);
     if (view === 'graph') { return renderCanvasGraph(body, ctx, ctx.focus); }
     if (view === 'tree') { return renderPlanTree(body, ctx); }
-    if (view === 'studio') { return renderTileStudio(body, ctx); }
+    if (view === 'studio') {
+      if (studioSub === 'pages') { return renderWorkspaceStudio(body, ctx); }
+      if (studioSub === 'integrations') { return renderIntegrationsStudio(body, ctx); }
+      return renderTileStudio(body, ctx);
+    }
     renderCanvasBoard(body, ctx);
     return Promise.resolve();
   }
+
+  // =======================================================================
+  //  Studio › Pages (M16b) — the workspace/page manager. Create workspaces from
+  //  starter templates (remix-not-blank), add pages of ANY registry type, edit
+  //  title/sub/dest/config, take control of built-ins (reversible fork), and a
+  //  raw-JSON escape hatch per artifact (preserves unknown keys). Every write is
+  //  a canonical fact through operatorGatedCall → consoleFactsAdd; every read
+  //  through the generated client. The SAME artifact an MCP store_fact writer
+  //  produces (docs/agent/console-workspaces.md).
+  // =======================================================================
+  var CWS_ICON_CHOICES = ['overwatch', 'work', 'memory', 'trust', 'meters', 'canvas', 'search', 'map', 'rings', 'settings', 'integrations', 'dataplane', 'globe', 'developer'];
+  function cwsModal(title) {
+    var overlay = el('div', { 'class': 'cws-modal-overlay', role: 'dialog', 'aria-modal': 'true', 'aria-label': title });
+    var box = el('div', { 'class': 'cws-modal' });
+    var head = el('div', { 'class': 'cws-modal-head' }, [el('h3', { text: title })]);
+    function close() { if (overlay.parentNode) { overlay.parentNode.removeChild(overlay); } if (doc() && doc().removeEventListener) { doc().removeEventListener('keydown', onKey); } }
+    function onKey(e) { if (e.key === 'Escape') { close(); } }
+    var x = el('button', { 'class': 'cws-modal-x', type: 'button', 'aria-label': 'Close' }, ['×']);
+    x.addEventListener('click', close); head.appendChild(x); box.appendChild(head);
+    var body = el('div', { 'class': 'cws-modal-body' }); box.appendChild(body);
+    overlay.appendChild(box);
+    overlay.addEventListener('click', function (e) { if (e.target === overlay) { close(); } });
+    if (doc() && doc().addEventListener) { doc().addEventListener('keydown', onKey); }
+    var mount = (doc() && doc().body) || host0() || null;
+    if (mount) { mount.appendChild(overlay); }
+    return { overlay: overlay, body: body, close: close };
+  }
+  function host0() { return (typeof document !== 'undefined') ? document.getElementById('main') : null; }
+  function cwsField(label, node) {
+    var f = el('div', { 'class': 'cws-field' });
+    f.appendChild(el('label', { 'class': 'tstudio-field-lab', text: label }));
+    f.appendChild(node);
+    return f;
+  }
+  function cwsIconSelect(current) {
+    var sel = el('select', { 'class': 'tstudio-input cws-icon-sel' });
+    CWS_ICON_CHOICES.forEach(function (ic) { var o = el('option', { value: ic, text: ic }); if (ic === current) { o.setAttribute('selected', 'selected'); } sel.appendChild(o); });
+    return sel;
+  }
+
+  function renderWorkspaceStudio(host, ctx) {
+    ctx = ctx || {};
+    host.textContent = '';
+    var operator = isOperator();
+    var root = el('div', { 'class': 'cwstudio' });
+    host.appendChild(root);
+
+    var header = el('div', { 'class': 'cwstudio-header' });
+    header.appendChild(el('div', { 'class': 'cwstudio-title' }, [
+      el('h2', { text: 'Pages' }),
+      el('p', { 'class': 'cwstudio-sub', text: 'Workspaces and the pages inside them. Built-ins (Command · Explorer) render from the registry until you take control; every save is a canonical fact an agent can also write via MCP store_fact.' })
+    ]));
+    var newBtn = el('button', { 'class': 'tstudio-btn tstudio-btn-primary', type: 'button' }, ['＋ New workspace']);
+    if (!operator) { newBtn.disabled = true; newBtn.setAttribute('title', 'Read-only — operator posture required'); }
+    newBtn.addEventListener('click', function () { if (operator) { openStarterPicker(); } });
+    header.appendChild(newBtn);
+    root.appendChild(header);
+
+    if (!operator) {
+      root.appendChild(el('div', { 'class': 'tstudio-banner', role: 'status' }, [
+        el('span', { 'class': 'tstudio-banner-dot' }),
+        el('span', { text: 'Read-only — operator posture required to create, edit, fork or revert. Everything below is live and browsable.' })
+      ]));
+    }
+
+    var body = el('div', { 'class': 'cwstudio-body' });
+    var treeAside = el('aside', { 'class': 'cwstudio-tree', 'aria-label': 'Workspaces' });
+    var editor = el('section', { 'class': 'cwstudio-editor', 'aria-label': 'Editor' });
+    body.appendChild(treeAside); body.appendChild(editor);
+    root.appendChild(body);
+    root.appendChild(el('p', { 'class': 'cwstudio-foot', text: 'Entities: console:workspace:<uid> · console:page:<uid>, key "def", canonical key-sorted JSON. See docs/agent/console-workspaces.md — an agent can generate identical workspaces via PUT /v1/facts / MCP store_fact.' }));
+
+    var MODEL = null, SEL = null;
+
+    function reload() {
+      treeAside.textContent = ''; treeAside.appendChild(el('div', { 'class': 'cwstudio-loading', text: 'loading workspaces…' }));
+      // Reload through the shell's model (single source of truth) so the studio
+      // tree, the switcher and the rail icons never drift; AWAIT it so a
+      // programmatic sequence (create → wipe → reimport) reads a consistent model.
+      var hasShell = (typeof window !== 'undefined' && typeof window.CRUX_WS_RELOAD === 'function');
+      var loader = hasShell ? window.CRUX_WS_RELOAD() : cwsLoadOverlays().then(function (ov) { if (typeof window !== 'undefined') { window.CRUX_WS_MODEL = cwsBuildModel(ov); } });
+      return Promise.resolve(loader).then(function () {
+        MODEL = (typeof window !== 'undefined' && window.CRUX_WS_MODEL) ? window.CRUX_WS_MODEL : cwsBuildModel({ workspaces: [], pages: [] });
+        paintTree(); paintEditor();
+        return MODEL;
+      });
+    }
+
+    function overlayFor(kind, uid) {
+      var arr = (MODEL.overlays && MODEL.overlays[kind === 'workspace' ? 'workspaces' : 'pages']) || [];
+      for (var i = 0; i < arr.length; i++) { if (arr[i].uid === uid) { return arr[i]; } }
+      return null;
+    }
+    function resolvePage(pageUid) {
+      // A page uid resolves to: a config page fact (user/forked) OR a registry
+      // built-in page id (type == uid) OR a surface type id.
+      if (MODEL.pages[pageUid]) { return { def: MODEL.pages[pageUid], builtin: false }; }
+      var pages = (typeof window !== 'undefined') ? window.CruxPages : null;
+      if (pages && pages.PAGES && pages.PAGES[pageUid]) {
+        var p = pages.PAGES[pageUid];
+        return { def: { schema_version: CWS_SCHEMA_VERSION, uid: pageUid, type: pageUid, title: p.title, sub: p.sub, dest: p.dest, config: {}, source: 'builtin' }, builtin: true };
+      }
+      if (cwsTypeExists(pageUid)) { return { def: { schema_version: CWS_SCHEMA_VERSION, uid: pageUid, type: pageUid, title: pageUid, sub: '', dest: '', config: {}, source: 'builtin' }, builtin: true }; }
+      return null;
+    }
+
+    // ---- tree ----
+    function paintTree() {
+      treeAside.textContent = '';
+      MODEL.workspaces.forEach(function (ws) {
+        var wsRow = el('button', { 'class': 'cwstudio-wsrow' + (SEL && SEL.kind === 'workspace' && SEL.uid === ws.uid ? ' is-sel' : ''), type: 'button', 'data-ws': ws.uid });
+        var ico = el('span', { 'class': 'cwstudio-wsico' }); ico.innerHTML = (SITEMAP_ICONS && SITEMAP_ICONS[ws.icon]) ? SITEMAP_ICONS[ws.icon] : (SITEMAP_ICONS.work || '');
+        wsRow.appendChild(ico);
+        wsRow.appendChild(el('span', { 'class': 'cwstudio-wsname', text: ws.name }));
+        var badge = ws.builtin ? (ws.source === 'builtin-fork' ? 'forked' : 'builtin') : 'user';
+        wsRow.appendChild(el('span', { 'class': 'cwstudio-wsbadge cwstudio-badge-' + badge, text: badge }));
+        wsRow.addEventListener('click', function () { SEL = { kind: 'workspace', uid: ws.uid }; paintTree(); paintEditor(); });
+        treeAside.appendChild(wsRow);
+        // dests → pages
+        (ws.dests || []).forEach(function (d) {
+          treeAside.appendChild(el('div', { 'class': 'cwstudio-destrow', text: d.label }));
+          (d.pages || []).forEach(function (pu) {
+            var rp = resolvePage(pu);
+            var pRow = el('button', { 'class': 'cwstudio-pagerow' + (SEL && SEL.kind === 'page' && SEL.uid === pu ? ' is-sel' : ''), type: 'button', 'data-page': pu });
+            pRow.appendChild(el('span', { 'class': 'cwstudio-pagename', text: rp ? rp.def.title : pu }));
+            if (rp && !rp.builtin && rp.def.source === 'builtin-fork') { pRow.appendChild(el('span', { 'class': 'cwstudio-pagebadge', text: 'forked' })); }
+            pRow.addEventListener('click', function () { SEL = { kind: 'page', uid: pu, ws: ws.uid, dest: d.id }; paintTree(); paintEditor(); });
+            treeAside.appendChild(pRow);
+          });
+          if (!ws.builtin || ws.source === 'builtin-fork') {
+            var addP = el('button', { 'class': 'cwstudio-addpage', type: 'button', text: '＋ page' });
+            if (!operator) { addP.disabled = true; }
+            addP.addEventListener('click', function () { if (operator) { openAddPage(ws.uid, d.id); } });
+            treeAside.appendChild(addP);
+          }
+        });
+      });
+    }
+
+    // ---- editor ----
+    function paintEditor() {
+      editor.textContent = '';
+      if (!SEL) { editor.appendChild(el('div', { 'class': 'cwstudio-empty', text: 'Select a workspace or page on the left, or create a new workspace.' })); return; }
+      if (SEL.kind === 'workspace') { paintWorkspaceEditor(); return; }
+      paintPageEditor();
+    }
+
+    function provenanceChip(box, ws) {
+      var chip = el('div', { 'class': 'cwstudio-provenance' });
+      chip.appendChild(el('span', { 'class': 'cwstudio-prov-dot' }));
+      chip.appendChild(el('span', { text: 'forked from built-in "' + (ws.forked_from || ws.uid) + '"' }));
+      var revert = el('button', { 'class': 'tstudio-btn cwstudio-revert', type: 'button', text: 'revert' });
+      if (!operator) { revert.disabled = true; }
+      revert.addEventListener('click', function () { if (operator) { doRevert('workspace', ws.uid); } });
+      chip.appendChild(revert);
+      box.appendChild(chip);
+    }
+
+    function paintWorkspaceEditor() {
+      var ws = null; MODEL.workspaces.forEach(function (w) { if (w.uid === SEL.uid) { ws = w; } });
+      if (!ws) { editor.appendChild(el('div', { 'class': 'cwstudio-empty', text: 'Workspace not found (it may have been reverted). Pick another.' })); return; }
+      editor.appendChild(el('h3', { 'class': 'cwstudio-eh', text: ws.name }));
+      var editable = !ws.builtin || ws.source === 'builtin-fork';
+      if (ws.source === 'builtin-fork') { provenanceChip(editor, ws); }
+      if (ws.builtin && ws.source !== 'builtin-fork') {
+        editor.appendChild(el('p', { 'class': 'cwstudio-note', text: 'This is an auto-generated built-in workspace. It renders from the page registry. Take control to edit its nav — a reversible fork copies it to an overlay fact; revert restores auto-generation.' }));
+        var forkBtn = el('button', { 'class': 'tstudio-btn tstudio-btn-primary', type: 'button', text: 'Take control (fork)' });
+        if (!operator) { forkBtn.disabled = true; forkBtn.setAttribute('title', 'operator posture required'); }
+        forkBtn.addEventListener('click', function () { if (operator) { doForkWorkspace(ws); } });
+        editor.appendChild(forkBtn);
+      }
+      // Metadata form
+      var nameInp = el('input', { 'class': 'tstudio-input', type: 'text', value: ws.name });
+      var iconSel = cwsIconSelect(ws.icon);
+      var orderInp = el('input', { 'class': 'tstudio-input', type: 'number', value: String(ws.order != null ? ws.order : 100) });
+      if (!editable || !operator) { [nameInp, iconSel, orderInp].forEach(function (n) { n.setAttribute('disabled', 'disabled'); }); }
+      editor.appendChild(cwsField('Name', nameInp));
+      editor.appendChild(cwsField('Icon', iconSel));
+      editor.appendChild(cwsField('Order', orderInp));
+      if (editable && operator) {
+        var save = el('button', { 'class': 'tstudio-btn tstudio-btn-primary', type: 'button', text: 'Save workspace' });
+        var out = el('div', { 'class': 'cwstudio-status' });
+        save.addEventListener('click', function () {
+          var def = {}; var ov = overlayFor('workspace', ws.uid);
+          var basis = (ov && ov.def) ? ov.def : ws;
+          Object.keys(basis).forEach(function (k) { def[k] = basis[k]; });   // preserve unknown keys
+          delete def.builtin;
+          def.schema_version = CWS_SCHEMA_VERSION; def.uid = ws.uid;
+          def.name = nameInp.value || ws.uid; def.icon = iconSel.value; def.order = Number(orderInp.value) || 0;
+          if (ws.source === 'builtin-fork') { def.source = 'builtin-fork'; def.forked_from = ws.forked_from || ws.uid; }
+          else { def.source = 'user'; }
+          out.textContent = 'saving…';
+          saveDef('workspace', def).then(function (r) { out.textContent = r.ok ? 'saved' : ('save failed: ' + (r.error || r.status)); if (r.ok) { reload(); } });
+        });
+        editor.appendChild(save); editor.appendChild(out);
+        if (!ws.builtin) {
+          var del = el('button', { 'class': 'tstudio-btn cwstudio-danger', type: 'button', text: 'Delete workspace' });
+          del.addEventListener('click', function () { doRevert('workspace', ws.uid); });
+          editor.appendChild(del);
+        }
+      }
+      // Export this workspace as a pack
+      var exp = el('button', { 'class': 'tstudio-btn', type: 'button', text: 'Export as pack' });
+      exp.addEventListener('click', function () { openExportWorkspace(ws); });
+      editor.appendChild(exp);
+      // Raw JSON escape hatch
+      editor.appendChild(rawJsonEditor('workspace', ws.uid, (overlayFor('workspace', ws.uid) && overlayFor('workspace', ws.uid).def) || ws, editable && operator));
+    }
+
+    function paintPageEditor() {
+      var rp = resolvePage(SEL.uid);
+      if (!rp) { editor.appendChild(el('div', { 'class': 'cwstudio-empty', text: 'Page "' + SEL.uid + '" is not resolvable (unknown type or reverted).' })); return; }
+      var def = rp.def;
+      editor.appendChild(el('h3', { 'class': 'cwstudio-eh', text: def.title }));
+      editor.appendChild(el('div', { 'class': 'cwstudio-typechip', text: 'type · ' + def.type }));
+      if (rp.def.source === 'builtin-fork') {
+        var pchip = el('div', { 'class': 'cwstudio-provenance' });
+        pchip.appendChild(el('span', { 'class': 'cwstudio-prov-dot' }));
+        pchip.appendChild(el('span', { text: 'forked from built-in "' + (def.forked_from || def.uid) + '"' }));
+        var prev = el('button', { 'class': 'tstudio-btn cwstudio-revert', type: 'button', text: 'revert' });
+        if (!operator) { prev.disabled = true; }
+        prev.addEventListener('click', function () { if (operator) { doRevert('page', def.uid); } });
+        pchip.appendChild(prev); editor.appendChild(pchip);
+      }
+      if (rp.builtin) {
+        editor.appendChild(el('p', { 'class': 'cwstudio-note', text: 'Built-in page — renders from the registry. Take control to override its title/sub/config; revert restores the registry default.' }));
+        var forkP = el('button', { 'class': 'tstudio-btn tstudio-btn-primary', type: 'button', text: 'Take control (fork page)' });
+        if (!operator) { forkP.disabled = true; }
+        forkP.addEventListener('click', function () { if (operator) { doForkPage(def); } });
+        editor.appendChild(forkP);
+      }
+      var editable = !rp.builtin && operator;
+      var titleInp = el('input', { 'class': 'tstudio-input', type: 'text', value: def.title });
+      var subInp = el('input', { 'class': 'tstudio-input', type: 'text', value: def.sub || '' });
+      if (!editable) { titleInp.setAttribute('disabled', 'disabled'); subInp.setAttribute('disabled', 'disabled'); }
+      editor.appendChild(cwsField('Title', titleInp));
+      editor.appendChild(cwsField('Subtitle', subInp));
+      // config form for typed options
+      var optDefs = CWS_TYPE_OPTIONS[def.type] || null;
+      var cfgInputs = {};
+      if (optDefs) {
+        var curQ = (def.config && def.config.query) || {};
+        optDefs.forEach(function (o) {
+          var node;
+          if (o.kind === 'select') {
+            node = el('select', { 'class': 'tstudio-input' });
+            o.options.forEach(function (opt) { var oe = el('option', { value: opt, text: opt }); if (String(curQ[o.key] != null ? curQ[o.key] : o.dflt) === opt) { oe.setAttribute('selected', 'selected'); } node.appendChild(oe); });
+          } else {
+            node = el('input', { 'class': 'tstudio-input', type: 'text', value: curQ[o.key] != null ? String(curQ[o.key]) : '', placeholder: o.placeholder || '' });
+          }
+          if (!editable) { node.setAttribute('disabled', 'disabled'); }
+          cfgInputs[o.key] = node;
+          editor.appendChild(cwsField(o.label, node));
+        });
+      } else {
+        editor.appendChild(el('p', { 'class': 'cwstudio-note', text: 'This page type takes no configurable options — it renders the registry default.' }));
+      }
+      if (editable) {
+        var save = el('button', { 'class': 'tstudio-btn tstudio-btn-primary', type: 'button', text: 'Save page' });
+        var out = el('div', { 'class': 'cwstudio-status' });
+        save.addEventListener('click', function () {
+          var ndef = {}; var ov = overlayFor('page', def.uid); var basis = (ov && ov.def) ? ov.def : def;
+          Object.keys(basis).forEach(function (k) { ndef[k] = basis[k]; });   // preserve unknown keys
+          ndef.schema_version = CWS_SCHEMA_VERSION; ndef.uid = def.uid; ndef.type = def.type;
+          ndef.title = titleInp.value || def.type; ndef.sub = subInp.value; ndef.dest = def.dest;
+          ndef.source = def.source === 'builtin-fork' ? 'builtin-fork' : 'user';
+          if (def.forked_from) { ndef.forked_from = def.forked_from; }
+          if (optDefs) { var q = (ndef.config && ndef.config.query) || {}; var nq = {}; Object.keys(q).forEach(function (k) { nq[k] = q[k]; }); optDefs.forEach(function (o) { var v = cfgInputs[o.key].value; if (v !== '' && v != null) { nq[o.key] = v; } else { delete nq[o.key]; } }); ndef.config = ndef.config && typeof ndef.config === 'object' ? Object.assign({}, ndef.config, { query: nq }) : { query: nq }; }
+          out.textContent = 'saving…';
+          saveDef('page', ndef).then(function (r) { out.textContent = r.ok ? 'saved' : ('save failed: ' + (r.error || r.status)); if (r.ok) { reload(); } });
+        });
+        editor.appendChild(save); editor.appendChild(out);
+        var rm = el('button', { 'class': 'tstudio-btn cwstudio-danger', type: 'button', text: 'Remove page' });
+        rm.addEventListener('click', function () { doRemovePage(def.uid); });
+        editor.appendChild(rm);
+      }
+      editor.appendChild(rawJsonEditor('page', def.uid, (overlayFor('page', def.uid) && overlayFor('page', def.uid).def) || def, editable));
+    }
+
+    // ---- raw-JSON escape hatch (preserves unknown keys) ----
+    function rawJsonEditor(kind, uid, def, editable) {
+      var wrap = el('details', { 'class': 'cwstudio-raw' });
+      wrap.appendChild(el('summary', { text: 'Raw JSON (canonical)' }));
+      var ta = el('textarea', { 'class': 'tstudio-input cwstudio-rawta', rows: '10', spellcheck: 'false' });
+      ta.value = cwsCanonical(def);
+      var out = el('div', { 'class': 'cwstudio-status' });
+      if (!editable) { ta.setAttribute('disabled', 'disabled'); }
+      wrap.appendChild(ta);
+      if (editable) {
+        var apply = el('button', { 'class': 'tstudio-btn', type: 'button', text: 'Validate + save JSON' });
+        apply.addEventListener('click', function () {
+          var parsed; try { parsed = JSON.parse(ta.value); } catch (e) { out.textContent = 'invalid JSON: ' + (e && e.message || e); return; }
+          var reader = kind === 'workspace' ? cwsReadWorkspaceDef : cwsReadPageDef;
+          var r = reader(parsed);
+          if (!r.valid) { out.textContent = 'schema check failed — missing ' + (kind === 'workspace' ? 'uid' : 'uid/type'); return; }
+          if (r.def.uid !== uid) { out.textContent = 'uid mismatch (this editor targets "' + uid + '")'; return; }
+          out.textContent = 'saving…';
+          // Write the parsed def verbatim (canonicalised) — unknown keys survive.
+          saveDef(kind, parsed).then(function (res) { out.textContent = res.ok ? 'saved (unknown keys preserved)' : 'save failed'; if (res.ok) { reload(); } });
+        });
+        wrap.appendChild(apply);
+      }
+      wrap.appendChild(out);
+      return wrap;
+    }
+
+    // ---- writes (all through the gated console fact-add) ----
+    function saveDef(kind, def) {
+      var entity = kind === 'workspace' ? cwsWorkspaceEntity(def.uid) : cwsPageEntity(def.uid);
+      return tstudioWriteFact(entity, CWS_DEF_KEY, cwsCanonical(def));
+    }
+    function doForkWorkspace(ws) {
+      var fork = cwsForkWorkspace(ws);
+      saveDef('workspace', fork).then(function (r) { if (r.ok) { reload(); } });
+    }
+    function doForkPage(def) {
+      var fork = {}; Object.keys(def).forEach(function (k) { fork[k] = def[k]; });
+      fork.schema_version = CWS_SCHEMA_VERSION; fork.source = 'builtin-fork'; fork.forked_from = def.uid; delete fork.builtin;
+      saveDef('page', fork).then(function (r) { if (r.ok) { reload(); } });
+    }
+    function doRevert(kind, uid) {
+      var entity = kind === 'workspace' ? cwsWorkspaceEntity(uid) : cwsPageEntity(uid);
+      tstudioWriteFact(entity, CWS_DEF_KEY, cwsCanonical(cwsTombstone(uid))).then(function (r) { if (r.ok) { if (SEL && SEL.uid === uid) { SEL = null; } reload(); } });
+    }
+    function doRemovePage(uid) {
+      // Remove from its workspace dest membership, then tombstone the page fact.
+      var ws = null; MODEL.workspaces.forEach(function (w) { if (SEL && w.uid === SEL.ws) { ws = w; } });
+      var chain = Promise.resolve({ ok: true });
+      if (ws && (ws.source === 'builtin-fork' || !ws.builtin)) {
+        var def = {}; var ov = overlayFor('workspace', ws.uid); var basis = (ov && ov.def) ? ov.def : ws;
+        Object.keys(basis).forEach(function (k) { def[k] = basis[k]; }); delete def.builtin;
+        def.dests = (def.dests || []).map(function (d) { var nd = {}; Object.keys(d).forEach(function (k) { nd[k] = d[k]; }); nd.pages = (d.pages || []).filter(function (p) { return p !== uid; }); return nd; });
+        chain = saveDef('workspace', def);
+      }
+      chain.then(function () { doRevert('page', uid); });
+    }
+
+    // ---- create workspace (starter templates) ----
+    function openStarterPicker() {
+      var m = cwsModal('New workspace — pick a starting point');
+      m.body.appendChild(el('p', { 'class': 'cwstudio-note', text: 'Remix, do not start blank. Duplicate the full Command console, take a minimal ops set, or start (nearly) empty.' }));
+      cwsStarterTemplates().forEach(function (t) {
+        var card = el('button', { 'class': 'cwstudio-startcard', type: 'button' });
+        card.appendChild(el('span', { 'class': 'cwstudio-startlab', text: t.label }));
+        card.appendChild(el('span', { 'class': 'cwstudio-startdesc', text: t.desc }));
+        card.addEventListener('click', function () { m.close(); promptName(t); });
+        m.body.appendChild(card);
+      });
+    }
+    function promptName(t) {
+      var m = cwsModal('Name your ' + t.label.toLowerCase() + ' workspace');
+      var nameInp = el('input', { 'class': 'tstudio-input', type: 'text', value: '', placeholder: 'e.g. My ops board' });
+      m.body.appendChild(cwsField('Workspace name', nameInp));
+      var out = el('div', { 'class': 'cwstudio-status' });
+      var go = el('button', { 'class': 'tstudio-btn tstudio-btn-primary', type: 'button', text: 'Create' });
+      go.addEventListener('click', function () {
+        var name = (nameInp.value || t.label).trim();
+        var base = 'ws-' + cwsSlugify(name); var uid = base; var n = 1;
+        var taken = {}; MODEL.workspaces.forEach(function (w) { taken[w.uid] = true; });
+        while (taken[uid]) { n++; uid = base + '-' + n; }
+        var built = t.build(uid, name);
+        out.textContent = 'creating…';
+        var writes = [saveDef('workspace', built.workspace)];
+        (built.pages || []).forEach(function (p) { writes.push(saveDef('page', p)); });
+        Promise.all(writes).then(function (rs) {
+          var ok = rs.every(function (r) { return r && r.ok; });
+          out.textContent = ok ? 'created' : 'create failed';
+          if (ok) { m.close(); SEL = { kind: 'workspace', uid: uid }; reload(); }
+        });
+      });
+      m.body.appendChild(go); m.body.appendChild(out);
+      if (nameInp.focus) { setTimeout(function () { try { nameInp.focus(); } catch (e) { } }, 0); }
+    }
+
+    // ---- add page (type picker = every registry type) ----
+    function openAddPage(wsUid, destId) {
+      var m = cwsModal('Add a page');
+      m.body.appendChild(el('p', { 'class': 'cwstudio-note', text: 'Pick any page type from the registry — whatever exists in the console is generatable here.' }));
+      var typeSel = el('select', { 'class': 'tstudio-input' });
+      cwsPageTypes().forEach(function (pt) { typeSel.appendChild(el('option', { value: pt.type, text: pt.label })); });
+      var titleInp = el('input', { 'class': 'tstudio-input', type: 'text', value: '', placeholder: 'Page title' });
+      var subInp = el('input', { 'class': 'tstudio-input', type: 'text', value: '', placeholder: 'Subtitle (optional)' });
+      m.body.appendChild(cwsField('Type', typeSel));
+      m.body.appendChild(cwsField('Title', titleInp));
+      m.body.appendChild(cwsField('Subtitle', subInp));
+      var out = el('div', { 'class': 'cwstudio-status' });
+      var add = el('button', { 'class': 'tstudio-btn tstudio-btn-primary', type: 'button', text: 'Add page' });
+      add.addEventListener('click', function () {
+        var type = typeSel.value;
+        var title = (titleInp.value || '').trim() || type;
+        var puid = wsUid + '-' + cwsSlugify(title); var base = puid; var n = 1;
+        while (MODEL.pages[puid]) { n++; puid = base + '-' + n; }
+        var pdef = { schema_version: CWS_SCHEMA_VERSION, uid: puid, type: type, title: title, sub: subInp.value || '', dest: destId, config: {}, source: 'user' };
+        // add to workspace dest membership
+        var ws = null; MODEL.workspaces.forEach(function (w) { if (w.uid === wsUid) { ws = w; } });
+        var wdef = {}; var ov = overlayFor('workspace', wsUid); var basis = (ov && ov.def) ? ov.def : ws;
+        Object.keys(basis).forEach(function (k) { wdef[k] = basis[k]; }); delete wdef.builtin;
+        wdef.dests = (wdef.dests || []).map(function (d) { var nd = {}; Object.keys(d).forEach(function (k) { nd[k] = d[k]; }); if (d.id === destId) { nd.pages = (d.pages || []).concat([puid]); } return nd; });
+        out.textContent = 'adding…';
+        Promise.all([saveDef('page', pdef), saveDef('workspace', wdef)]).then(function (rs) {
+          var ok = rs.every(function (r) { return r && r.ok; });
+          out.textContent = ok ? 'added' : 'add failed';
+          if (ok) { m.close(); SEL = { kind: 'page', uid: puid, ws: wsUid, dest: destId }; reload(); }
+        });
+      });
+      m.body.appendChild(add); m.body.appendChild(out);
+    }
+
+    // ---- export a workspace as a crux.studio.v1 pack (additive) ----
+    function openExportWorkspace(ws) {
+      var m = cwsModal('Export "' + ws.name + '" as a pack');
+      // collect this workspace's page defs (config facts only — built-ins render
+      // from the registry and travel as type references inside the workspace dests).
+      var pageDefs = [];
+      (ws.dests || []).forEach(function (d) { (d.pages || []).forEach(function (pu) { if (MODEL.pages[pu]) { pageDefs.push(MODEL.pages[pu]); } }); });
+      var wsDef = {}; var ov = overlayFor('workspace', ws.uid); var basis = (ov && ov.def) ? ov.def : ws;
+      Object.keys(basis).forEach(function (k) { wsDef[k] = basis[k]; }); delete wsDef.builtin;
+      var idInp = el('input', { 'class': 'tstudio-input', type: 'text', value: 'studio.' + cwsSlugify(ws.name) });
+      var verInp = el('input', { 'class': 'tstudio-input', type: 'text', value: '0.1.0' });
+      var pubInp = el('input', { 'class': 'tstudio-input', type: 'text', value: 'p_your_passport_fpr' });
+      m.body.appendChild(cwsField('Pack id', idInp));
+      m.body.appendChild(cwsField('Version', verInp));
+      m.body.appendChild(cwsField('Publisher fpr', pubInp));
+      m.body.appendChild(el('p', { 'class': 'cwstudio-note', text: 'Carries ' + (1) + ' workspace + ' + pageDefs.length + ' page(s) as additive workspaces/pages arrays on a valid crux.studio.v1 payload (with an empty board). Re-import applies them as a defaults layer.' }));
+      var out = el('div', { 'class': 'cwstudio-status' });
+      var build = el('button', { 'class': 'tstudio-btn tstudio-btn-primary', type: 'button', text: 'Build + download' });
+      build.addEventListener('click', function () {
+        var studio = cwsPackEmbed(tstudioBuildStudioPayload('workspace-' + ws.uid, tstudioNormalizeDoc({}), [], tstudioDefaultSettings()), [wsDef], pageDefs);
+        var rp = (typeof window !== 'undefined') ? window.CruxApiRead : null;
+        if (!rp || typeof rp.studioPackBuild !== 'function') { out.textContent = 'pack client unavailable'; return; }
+        out.textContent = 'building…';
+        rp.studioPackBuild({ studio: studio, id: idInp.value, name: ws.name, version: verInp.value, publisher_passport_fpr: pubInp.value, summary: 'Workspace pack: ' + ws.name })
+          .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, data: d }; }, function () { return { ok: false }; }); })
+          .then(function (res) {
+            if (!res.ok || !res.data || !res.data.pack) { out.textContent = 'build failed'; return; }
+            try {
+              var blob = new Blob([JSON.stringify(res.data.pack, null, 2)], { type: 'application/json' });
+              var url = URL.createObjectURL(blob);
+              var a = el('a', { href: url, download: (cwsSlugify(ws.name) || 'workspace') + '.cruxstudio.json' });
+              root.appendChild(a); a.click(); setTimeout(function () { if (a.parentNode) { a.parentNode.removeChild(a); } URL.revokeObjectURL(url); }, 0);
+            } catch (e) { }
+            out.textContent = res.data.signed ? 'Signed pack downloaded.' : 'Unsigned pack downloaded (sign before publishing).';
+          });
+      });
+      m.body.appendChild(build); m.body.appendChild(out);
+    }
+
+    // ---- deterministic verification hooks (Playwright; harmless assignments) ----
+    if (typeof window !== 'undefined') {
+      window.__cwstudio = {
+        model: function () { return MODEL; },
+        select: function (kind, uid, ws, dest) { SEL = { kind: kind, uid: uid, ws: ws, dest: dest }; paintTree(); paintEditor(); },
+        createFromTemplate: function (tid, name) {
+          var t = null; cwsStarterTemplates().forEach(function (x) { if (x.id === tid) { t = x; } });
+          if (!t) { return Promise.resolve({ ok: false }); }
+          var uid = 'ws-' + cwsSlugify(name); var built = t.build(uid, name);
+          var writes = [saveDef('workspace', built.workspace)]; (built.pages || []).forEach(function (p) { writes.push(saveDef('page', p)); });
+          return Promise.all(writes).then(function (rs) { var ok = rs.every(function (r) { return r && r.ok; }); return reload().then(function () { return { ok: ok, uid: uid }; }); });
+        },
+        addPage: function (wsUid, destId, type, title) {
+          var puid = wsUid + '-' + cwsSlugify(title || type);
+          var pdef = { schema_version: CWS_SCHEMA_VERSION, uid: puid, type: type, title: title || type, sub: '', dest: destId, config: {}, source: 'user' };
+          var ws = null; MODEL.workspaces.forEach(function (w) { if (w.uid === wsUid) { ws = w; } });
+          if (!ws) { return Promise.resolve({ ok: false }); }
+          var wdef = {}; var ov = overlayFor('workspace', wsUid); var basis = (ov && ov.def) ? ov.def : ws; Object.keys(basis).forEach(function (k) { wdef[k] = basis[k]; }); delete wdef.builtin;
+          wdef.dests = (wdef.dests || []).map(function (d) { var nd = {}; Object.keys(d).forEach(function (k) { nd[k] = d[k]; }); if (d.id === destId) { nd.pages = (d.pages || []).concat([puid]); } return nd; });
+          return Promise.all([saveDef('page', pdef), saveDef('workspace', wdef)]).then(function (rs) { var ok = rs.every(function (r) { return r && r.ok; }); return reload().then(function () { return { ok: ok, uid: puid }; }); });
+        },
+        forkWorkspace: function (uid) { var ws = null; MODEL.workspaces.forEach(function (w) { if (w.uid === uid) { ws = w; } }); if (!ws) { return Promise.resolve({ ok: false }); } return saveDef('workspace', cwsForkWorkspace(ws)).then(function (r) { return reload().then(function () { return r; }); }); },
+        forkPage: function (uid) { var rp = resolvePage(uid); if (!rp || !rp.builtin) { return Promise.resolve({ ok: false }); } var fork = {}; Object.keys(rp.def).forEach(function (k) { fork[k] = rp.def[k]; }); fork.source = 'builtin-fork'; fork.forked_from = uid; delete fork.builtin; return saveDef('page', fork).then(function (r) { return reload().then(function () { return r; }); }); },
+        revert: function (kind, uid) { var entity = kind === 'workspace' ? cwsWorkspaceEntity(uid) : cwsPageEntity(uid); return tstudioWriteFact(entity, CWS_DEF_KEY, cwsCanonical(cwsTombstone(uid))).then(function (r) { return reload().then(function () { return r; }); }); },
+        openStarter: function () { openStarterPicker(); },
+        openExport: function (uid) { var ws = null; MODEL.workspaces.forEach(function (w) { if (w.uid === uid) { ws = w; } }); if (ws) { openExportWorkspace(ws); } },
+        // Pack round-trip: build a workspace pack (additive workspaces/pages on a
+        // valid crux.studio.v1 payload) then re-apply it (defaults layer). Used
+        // by the Playwright round-trip proof; harmless plain window assignments.
+        buildWorkspacePack: function (uid) {
+          var ws = null; MODEL.workspaces.forEach(function (w) { if (w.uid === uid) { ws = w; } });
+          if (!ws) { return Promise.resolve({ ok: false }); }
+          var pageDefs = []; (ws.dests || []).forEach(function (d) { (d.pages || []).forEach(function (pu) { if (MODEL.pages[pu]) { pageDefs.push(MODEL.pages[pu]); } }); });
+          var wsDef = {}; var ov = overlayFor('workspace', uid); var basis = (ov && ov.def) ? ov.def : ws; Object.keys(basis).forEach(function (k) { wsDef[k] = basis[k]; }); delete wsDef.builtin;
+          var studio = cwsPackEmbed(tstudioBuildStudioPayload('workspace-' + uid, tstudioNormalizeDoc({}), [], tstudioDefaultSettings()), [wsDef], pageDefs);
+          var rp = window.CruxApiRead;
+          return rp.studioPackBuild({ studio: studio, id: 'studio.' + cwsSlugify(ws.name), name: ws.name, version: '0.1.0', publisher_passport_fpr: 'p_rt', summary: 'rt' }).then(function (r) { return r.json(); });
+        },
+        applyWorkspacePack: function (pack) {
+          var studio = pack && pack.studio; if (!studio) { return Promise.resolve({ ok: false }); }
+          var ex = cwsPackExtract(studio); var writes = [];
+          ex.workspaces.forEach(function (w) { if (w && w.uid) { writes.push(tstudioWriteFact(cwsWorkspaceEntity(w.uid), CWS_DEF_KEY, cwsCanonical(w))); } });
+          ex.pages.forEach(function (pg) { if (pg && pg.uid) { writes.push(tstudioWriteFact(cwsPageEntity(pg.uid), CWS_DEF_KEY, cwsCanonical(pg))); } });
+          return Promise.all(writes).then(function (rs) { var ok = rs.every(function (r) { return r && r.ok; }); return reload().then(function () { return { ok: ok, applied: ex.workspaces.length + ex.pages.length }; }); });
+        },
+        reload: function () { return reload(); }
+      };
+    }
+
+    return reload();
+  }
+
+  // =======================================================================
+  //  Studio › Integrations (M16b) — manage the extension/integration plane
+  //  from the Studio. Live reads over /v1/console/integrations (posture +
+  //  installed packs) + /v1/extensions (registry) + /v1/extensions/keys
+  //  (trusted keys), capability disclosure per pack/manifest, honest-empty on a
+  //  bare mirror with the REAL install flow explained. Install / grant / disable
+  //  are operator-gated: the console adds NO new arbitrary mutation surface
+  //  (plan Non-goals) — the shipping rail is the community PR + curator-signed
+  //  index (M15), or POST /v1/extensions/install-from-registry from the CLI.
+  // =======================================================================
+  function renderIntegrationsStudio(host, ctx) {
+    ctx = ctx || {};
+    host.textContent = '';
+    var root = el('div', { 'class': 'cwstudio cwstudio-integrations' });
+    host.appendChild(root);
+    root.appendChild(el('div', { 'class': 'cwstudio-header' }, [
+      el('div', { 'class': 'cwstudio-title' }, [
+        el('h2', { text: 'Integrations' }),
+        el('p', { 'class': 'cwstudio-sub', text: 'The extension plane — installed packs, the community registry, and trusted keys. Reads are live; install / grant / disable run through the signed community rail (no arbitrary mutation from the console).' })
+      ])
+    ]));
+    var grid = el('div', { 'class': 'cwstudio-intgrid' });
+    root.appendChild(grid);
+
+    function card(title) { var c = el('div', { 'class': 'v2card wide cwstudio-intcard' }); c.appendChild(el('h3', { 'class': 'v2card-h', text: title })); return c; }
+    function loading(c) { var l = el('div', { 'class': 'cwstudio-loading', text: 'loading…' }); c.appendChild(l); return l; }
+
+    // Card 1: plane posture + installed packs (/v1/console/integrations)
+    var planeCard = card('Integration plane');
+    grid.appendChild(planeCard);
+    var planeLoad = loading(planeCard);
+    var api = (typeof window !== 'undefined') ? window.CruxApi : null;
+    (api && typeof api.consoleIntegrations === 'function' ? api.consoleIntegrations() : Promise.reject())
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (planeLoad.parentNode) { planeLoad.parentNode.removeChild(planeLoad); }
+        var row = el('div', { 'class': 'cwstudio-postrow' });
+        row.appendChild(el('span', { 'class': 'cwstudio-postchip ' + (d.enabled ? 'is-on' : 'is-off'), text: d.enabled ? 'enabled' : 'disabled' }));
+        row.appendChild(el('span', { 'class': 'cwstudio-postchip ' + (d.safe_mode ? 'is-warn' : 'is-on'), text: d.safe_mode ? 'safe mode' : 'live' }));
+        row.appendChild(el('span', { 'class': 'cwstudio-postchip ' + (d.allow_executable_helpers ? 'is-warn' : 'is-on'), text: 'executable helpers ' + (d.allow_executable_helpers ? 'allowed' : 'off') }));
+        planeCard.appendChild(row);
+        planeCard.appendChild(el('div', { 'class': 'tstudio-field-lab', text: 'Allowed capabilities' }));
+        var caps = el('div', { 'class': 'cwstudio-chips' });
+        (d.allowed_capabilities || []).forEach(function (c) { caps.appendChild(el('span', { 'class': 'tstudio-cap-chip', text: c })); });
+        planeCard.appendChild(caps);
+        // installed packs
+        var packs = Array.isArray(d.packs) ? d.packs : [];
+        planeCard.appendChild(el('div', { 'class': 'tstudio-field-lab', text: 'Installed packs (' + packs.length + ')' }));
+        if (!packs.length) { planeCard.appendChild(el('p', { 'class': 'cwstudio-note', text: 'No packs installed.' })); }
+        packs.forEach(function (p) {
+          var m = p.manifest || {};
+          var pc = el('div', { 'class': 'cwstudio-packrow' });
+          pc.appendChild(el('span', { 'class': 'cwstudio-packid', text: String(m.id || m.name || '—') + ' · ' + String(m.version || '') }));
+          var disc = el('div', { 'class': 'cwstudio-chips' });
+          (Array.isArray(m.capabilities) ? m.capabilities : []).forEach(function (c) { disc.appendChild(el('span', { 'class': 'tstudio-cap-chip', text: c })); });
+          if (!(m.capabilities && m.capabilities.length)) { disc.appendChild(el('span', { 'class': 'cwstudio-note', text: 'no capabilities declared' })); }
+          pc.appendChild(disc);
+          var dis = el('button', { 'class': 'tstudio-btn cwstudio-danger', type: 'button', text: 'Disable', title: 'Disable runs through POST /v1/console/integrations/{packId}/disable (operator-gated; not an in-console mutation)' });
+          dis.disabled = true; dis.setAttribute('aria-disabled', 'true');
+          pc.appendChild(dis);
+          planeCard.appendChild(pc);
+        });
+      })
+      .catch(function () { if (planeLoad.parentNode) { planeLoad.parentNode.removeChild(planeLoad); } planeCard.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'integration plane unavailable on this daemon (404 — feature not configured).' })); });
+
+    // Card 2: extensions registry (/v1/extensions) — capability disclosure + honest-empty + install flow
+    var extCard = card('Extensions (registry-backed)');
+    grid.appendChild(extCard);
+    var extLoad = loading(extCard);
+    fetchJSON('/v1/extensions').then(function (res) {
+      if (extLoad.parentNode) { extLoad.parentNode.removeChild(extLoad); }
+      var d = res.data || {};
+      extCard.appendChild(tstudioRenderExtensions(d, { operator: isOperator() }));
+      extCard.appendChild(el('div', { 'class': 'cwstudio-installflow' }, [
+        el('div', { 'class': 'tstudio-field-lab', text: 'How to install (capability disclosure at install)' }),
+        el('p', { 'class': 'cwstudio-note', text: '1. Find a signed pack in the curator-signed community index (integrations/community/). 2. Its manifest declares exactly the capabilities it needs — you review them before installing. 3. Install via corecruxctl extensions install or POST /v1/extensions/install-from-registry {id, index_path}. 4. Grant per-passport scopes via POST /v1/extensions/{id}/grants.' }),
+        el('p', { 'class': 'cwstudio-note', text: 'There is no arbitrary install button here by design — trust rides the signed community rail, not an unsigned URL box.' })
+      ]));
+    }).catch(function () { if (extLoad.parentNode) { extLoad.parentNode.removeChild(extLoad); } extCard.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'extensions endpoint unavailable' })); });
+
+    // Card 3: trusted keys (/v1/extensions/keys)
+    var keyCard = card('Trusted keys');
+    grid.appendChild(keyCard);
+    var keyLoad = loading(keyCard);
+    fetchJSON('/v1/extensions/keys').then(function (res) {
+      if (keyLoad.parentNode) { keyLoad.parentNode.removeChild(keyLoad); }
+      var d = res.data || {}; var keys = d.keys || {}; var ids = Object.keys(keys);
+      if (!ids.length) {
+        keyCard.appendChild(el('p', { 'class': 'cwstudio-note', text: 'No trusted keys registered. A trusted Ed25519 publisher key lets you install that publisher\'s signed packs. Add one via POST /v1/extensions/keys (operator, on the Extensions surface).' }));
+      } else {
+        ids.forEach(function (k) { keyCard.appendChild(el('div', { 'class': 'cwstudio-packrow', text: k })); });
+      }
+    }).catch(function () { if (keyLoad.parentNode) { keyLoad.parentNode.removeChild(keyLoad); } keyCard.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'keys endpoint unavailable' })); });
+
+    return Promise.resolve();
+  }
+
 
   // =======================================================================
   //  Documents mode (M10) — the console-as-reader.
@@ -7816,7 +8820,7 @@
       var p = pages.PAGES[id];
       (byDest[p.dest] = byDest[p.dest] || []).push(p);
     });
-    return pages.DESTS.map(function (d) {
+    var sections = pages.DESTS.map(function (d) {
       var nodes = [];
       var list = byDest[d.id] || [];
       if (list.length) {
@@ -7839,6 +8843,27 @@
       }
       return { dest: d, nodes: nodes };
     }).filter(function (s) { return s.nodes.length; });
+    // M16b — user workspaces (config-driven) append their own map sections so the
+    // sitemap can never dead-link: each page node is a real #/w/<uid>/<pageUid>.
+    var model = (typeof window !== 'undefined') ? window.CRUX_WS_MODEL : null;
+    if (model && Array.isArray(model.workspaces)) {
+      model.workspaces.forEach(function (ws) {
+        if (ws.builtin) { return; }   // Command/Explorer are already mapped above
+        var wnodes = [];
+        (ws.dests || []).forEach(function (d) {
+          (d.pages || []).forEach(function (pu) {
+            var pd = model.pages && model.pages[pu];
+            var title = pd ? pd.title : ((pages.PAGES[pu] && pages.PAGES[pu].title) || pu);
+            var sub = pd ? pd.sub : ((pages.PAGES[pu] && pages.PAGES[pu].sub) || '');
+            wnodes.push({ key: 'w/' + ws.uid + '/' + pu, name: title, href: '#/w/' + ws.uid + '/' + pu, sub: sub });
+          });
+        });
+        if (wnodes.length) {
+          sections.push({ dest: { id: 'w/' + ws.uid, label: ws.name, icon: ws.icon, sub: 'Workspace · ' + (ws.source === 'builtin-fork' ? 'forked built-in' : 'user') }, nodes: wnodes });
+        }
+      });
+    }
+    return sections;
   }
 
   // Resolve which node the operator came FROM (window.CRUX_PREV_HASH) → node key,
@@ -11548,6 +12573,33 @@
     tstudioJsonPath: tstudioJsonPath,
     tstudioLatestFact: tstudioLatestFact,
     tstudioSlugify: tstudioSlugify,
+    // M16b — configurable Workspaces (fact-driven nav/page system). Pure helpers
+    // are unit-tested by the smoke; the shell drives the nav runtime through them,
+    // and the Studio Pages/Integrations subsections render below.
+    CWS_SCHEMA_VERSION: CWS_SCHEMA_VERSION,
+    CWS_WS_ENTITY: CWS_WS_ENTITY,
+    CWS_PAGE_ENTITY: CWS_PAGE_ENTITY,
+    cwsCanonical: cwsCanonical,
+    cwsReadWorkspaceDef: cwsReadWorkspaceDef,
+    cwsReadPageDef: cwsReadPageDef,
+    cwsBuiltinWorkspaces: cwsBuiltinWorkspaces,
+    cwsEffectiveWorkspaces: cwsEffectiveWorkspaces,
+    cwsForkWorkspace: cwsForkWorkspace,
+    cwsTombstone: cwsTombstone,
+    cwsStarterTemplates: cwsStarterTemplates,
+    cwsPageTypes: cwsPageTypes,
+    cwsTypeExists: cwsTypeExists,
+    cwsPackEmbed: cwsPackEmbed,
+    cwsPackExtract: cwsPackExtract,
+    cwsMergeQuery: cwsMergeQuery,
+    cwsWorkspaceEntity: cwsWorkspaceEntity,
+    cwsPageEntity: cwsPageEntity,
+    cwsSlugify: cwsSlugify,
+    cwsLoadOverlays: cwsLoadOverlays,
+    cwsBuildModel: cwsBuildModel,
+    renderWorkspacePage: renderWorkspacePage,
+    renderWorkspaceStudio: renderWorkspaceStudio,
+    renderIntegrationsStudio: renderIntegrationsStudio,
     // M15 — live tiles, automated-data-handling tile kinds, packs, settings,
     // parameterised designs (pure helpers unit-tested by the smoke).
     tstudioCoverageNote: tstudioCoverageNote,

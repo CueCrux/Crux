@@ -2328,6 +2328,75 @@
   .tstudio-verdict-detail { font: 600 10.5px var(--font-mono); color: var(--crit); overflow: hidden; text-overflow: ellipsis; }
   .tstudio-help-step { margin: 0; font-size: 11.5px; color: var(--ink2); line-height: 1.5; }
 
+  /* ---- Studio › Pages + Integrations (M16b) — configurable Workspaces ---- */
+  .canvas-subseg { flex: none; }
+  .modeseg.modeseg-wrap { display: flex; flex-wrap: wrap; gap: 4px; }
+  .modeseg.modeseg-wrap .modeseg-btn { flex: 1 1 auto; }
+  .cwstudio { display: flex; flex-direction: column; gap: 14px; padding: 16px; height: 100%; overflow: auto; }
+  .cwstudio-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .cwstudio-title h2 { margin: 0 0 3px; font-size: 17px; font-weight: 700; color: var(--ink); }
+  .cwstudio-sub { margin: 0; font-size: 12px; color: var(--ink2); max-width: 70ch; line-height: 1.5; }
+  .cwstudio-foot { margin: 0; font-size: 11px; color: var(--ink3); line-height: 1.5; }
+  .cwstudio-body { display: grid; grid-template-columns: minmax(220px, 300px) 1fr; gap: 14px; align-items: start; }
+  @media (max-width: 720px) { .cwstudio-body { grid-template-columns: 1fr; } }
+  .cwstudio-tree { border: 1px solid var(--edge); border-radius: var(--radius); background: var(--surface); padding: 8px; display: flex; flex-direction: column; gap: 2px; max-height: 62vh; overflow: auto; }
+  .cwstudio-loading, .cwstudio-empty { font-size: 12px; color: var(--ink3); padding: 10px; }
+  .cwstudio-wsrow { display: flex; align-items: center; gap: 8px; padding: 7px 8px; border: 1px solid transparent; border-radius: var(--radius-sm); background: none; color: var(--ink); cursor: pointer; text-align: left; font: inherit; }
+  .cwstudio-wsrow:hover { background: var(--surface2); }
+  .cwstudio-wsrow.is-sel { border-color: var(--edge-strong); background: var(--surface2); }
+  .cwstudio-wsico { display: inline-flex; width: 16px; height: 16px; color: var(--ink2); }
+  .cwstudio-wsico svg { width: 16px; height: 16px; }
+  .cwstudio-wsname { flex: 1; font-weight: 650; font-size: 12.5px; }
+  .cwstudio-wsbadge, .cwstudio-pagebadge { font-size: 9px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--edge); color: var(--ink3); background: var(--surface2); }
+  .cwstudio-badge-builtin { color: var(--ink3); }
+  .cwstudio-badge-user { color: var(--acc); border-color: color-mix(in srgb, var(--acc) 40%, var(--edge)); }
+  .cwstudio-badge-forked { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--edge)); }
+  .cwstudio-destrow { font-size: 10px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: var(--ink3); padding: 6px 8px 2px 14px; }
+  .cwstudio-pagerow { display: flex; align-items: center; gap: 6px; padding: 5px 8px 5px 20px; border: 1px solid transparent; border-radius: var(--radius-sm); background: none; color: var(--ink2); cursor: pointer; text-align: left; font: inherit; font-size: 12px; }
+  .cwstudio-pagerow:hover { background: var(--surface2); color: var(--ink); }
+  .cwstudio-pagerow.is-sel { border-color: var(--edge-strong); background: var(--surface2); color: var(--ink); }
+  .cwstudio-pagename { flex: 1; }
+  .cwstudio-addpage { align-self: flex-start; margin-left: 20px; font-size: 11px; color: var(--acc); background: none; border: 1px dashed var(--edge); border-radius: var(--radius-sm); padding: 3px 8px; cursor: pointer; }
+  .cwstudio-addpage:disabled { color: var(--ink3); cursor: not-allowed; }
+  .cwstudio-editor { border: 1px solid var(--edge); border-radius: var(--radius); background: var(--surface); padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; min-height: 200px; }
+  .cwstudio-eh { margin: 0; font-size: 15px; font-weight: 700; color: var(--ink); }
+  .cwstudio-typechip { align-self: flex-start; font: 600 10.5px var(--font-mono); color: var(--ink2); background: var(--surface2); border: 1px solid var(--edge); border-radius: 999px; padding: 2px 9px; }
+  .cwstudio-note { margin: 0; font-size: 11.5px; color: var(--ink3); line-height: 1.5; }
+  .cwstudio-status { font-size: 11.5px; color: var(--ink2); min-height: 15px; }
+  .cwstudio-field { display: flex; flex-direction: column; gap: 4px; }
+  .cwstudio-provenance { display: inline-flex; align-items: center; gap: 8px; align-self: flex-start; font-size: 11px; color: var(--warn); background: color-mix(in srgb, var(--warn) 8%, var(--surface2)); border: 1px solid color-mix(in srgb, var(--warn) 34%, var(--edge)); border-radius: 999px; padding: 4px 6px 4px 10px; }
+  .cwstudio-prov-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--warn); flex: none; }
+  .cwstudio-revert { padding: 2px 10px; font-size: 11px; }
+  .cwstudio-danger { color: var(--crit); border-color: color-mix(in srgb, var(--crit) 40%, var(--edge)); align-self: flex-start; }
+  .cwstudio-raw { border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2); padding: 6px 10px; }
+  .cwstudio-raw summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--ink2); }
+  .cwstudio-rawta { width: 100%; font: 11px/1.45 var(--font-mono); margin-top: 8px; min-height: 120px; resize: vertical; }
+  /* create-workspace starter cards */
+  .cwstudio-startcard { display: flex; flex-direction: column; gap: 3px; width: 100%; text-align: left; padding: 12px 14px; border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2); color: var(--ink); cursor: pointer; font: inherit; }
+  .cwstudio-startcard:hover { border-color: var(--acc); background: color-mix(in srgb, var(--acc) 8%, var(--surface2)); }
+  .cwstudio-startlab { font-weight: 700; font-size: 13px; }
+  .cwstudio-startdesc { font-size: 11.5px; color: var(--ink2); line-height: 1.45; }
+  /* integrations subsection */
+  .cwstudio-intgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
+  .cwstudio-intcard { display: flex; flex-direction: column; gap: 8px; }
+  .cwstudio-postrow { display: flex; flex-wrap: wrap; gap: 6px; }
+  .cwstudio-postchip { font: 600 10.5px var(--font-mono); padding: 2px 9px; border-radius: 999px; border: 1px solid var(--edge); color: var(--ink2); background: var(--surface2); }
+  .cwstudio-postchip.is-on { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--edge)); }
+  .cwstudio-postchip.is-off { color: var(--crit); border-color: color-mix(in srgb, var(--crit) 40%, var(--edge)); }
+  .cwstudio-postchip.is-warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--edge)); }
+  .cwstudio-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+  .cwstudio-packrow { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 7px 9px; border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2); font-size: 12px; }
+  .cwstudio-packid { font-weight: 650; color: var(--ink); }
+  .cwstudio-installflow { margin-top: 4px; padding-top: 8px; border-top: 1px solid var(--edge); }
+  /* modal (self-contained, mounts on #main) */
+  .cws-modal-overlay { position: fixed; inset: 0; z-index: 200; display: flex; align-items: center; justify-content: center; background: color-mix(in srgb, var(--bg) 70%, transparent); padding: 20px; }
+  .cws-modal { width: 100%; max-width: 480px; max-height: 86vh; display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--edge-strong); border-radius: var(--radius); box-shadow: var(--card-shadow); overflow: hidden; }
+  .cws-modal-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid var(--edge); }
+  .cws-modal-head h3 { margin: 0; font-size: 14px; font-weight: 700; color: var(--ink); }
+  .cws-modal-x { border: none; background: none; color: var(--ink3); font-size: 20px; line-height: 1; cursor: pointer; padding: 0 4px; }
+  .cws-modal-x:hover { color: var(--ink); }
+  .cws-modal-body { padding: 14px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+
   /* ---- Canvas relation graph — card nodes + node inspector --------------- */
   .canvas-graph { position: relative; }
   /* No frame — nodes drop straight onto the page; the stage is just the pannable area. */
@@ -3212,27 +3281,81 @@
     catch (e) { return DEFAULT_DENSITY; }
   }
   function surfaceOf(mode) { return mode === 'documents' ? 'explore' : 'command'; }
-  function syncModeSeg(mode) {
-    var surface = surfaceOf(mode);
+
+  // ---- Configurable Workspaces (M16b) — the surface toggle GENERALISED into N
+  //      workspaces. Zero config == exactly today's Command | Explorer toggle;
+  //      user workspaces (config facts) append. The model is loaded async at boot
+  //      (loadWorkspaceModel) and cached in WS_MODEL; builtins always render even
+  //      when the load is absent/erroring (fully useful unconfigured). The rail +
+  //      flyout + sitemap all derive from the ACTIVE workspace.
+  var WS_MODEL = null;   // { workspaces:[def…], pages:{uid→def}, overlays } or null
+  function wsSwitcherList() {
+    if (WS_MODEL && WS_MODEL.workspaces && WS_MODEL.workspaces.length) { return WS_MODEL.workspaces; }
+    var R = (typeof window !== 'undefined') ? window.CruxRender : null;
+    if (R && R.cwsBuiltinWorkspaces) { try { return R.cwsBuiltinWorkspaces(); } catch (e) { /* pages.js not ready */ } }
+    return [{ uid: 'command', name: 'Command', icon: 'overwatch' }, { uid: 'explore', name: 'Explorer', icon: 'search' }];
+  }
+  function wsFind(uid) { var l = wsSwitcherList(); for (var i = 0; i < l.length; i++) { if (l[i].uid === uid) { return l[i]; } } return null; }
+  // The active workspace uid, derived from the live hash + presentation mode.
+  function activeWorkspaceUid() {
+    var h = (location.hash || '').replace(/^#\/?/, '');
+    var parts = h.split('?')[0].split('/').filter(Boolean);
+    if (parts[0] === 'w' && parts[1]) { return parts[1]; }
+    var mode = (typeof window !== 'undefined' && window.CRUX_MODE) || document.documentElement.getAttribute('data-mode');
+    if (mode === 'documents' || /^documents(\/|$)|^explorer(\/|\?|$)/.test(h)) { return 'explore'; }
+    return 'command';
+  }
+  function activateWorkspace(uid) {
+    if (uid === 'command') { applySurface('command'); return; }
+    if (uid === 'explore') { applySurface('explore'); return; }
+    location.hash = '#/w/' + uid;   // hashchange → route()
+  }
+  // syncModeSeg keeps its signature (callers pass a mode) but reflects the ACTIVE
+  // WORKSPACE onto the switcher buttons via data-ws.
+  function syncModeSeg() {
+    var active = activeWorkspaceUid();
     var btns = document.querySelectorAll('#modeSeg .modeseg-btn');
     for (var i = 0; i < btns.length; i++) {
-      btns[i].setAttribute('aria-pressed', btns[i].getAttribute('data-surface') === surface ? 'true' : 'false');
+      btns[i].setAttribute('aria-pressed', btns[i].getAttribute('data-ws') === active ? 'true' : 'false');
     }
   }
   function buildModeSeg() {
     var wrap = document.getElementById('modeSeg');
     if (!wrap) { return; }
     wrap.textContent = '';
-    for (var i = 0; i < SURFACES.length; i++) {
-      var s = SURFACES[i];
+    var list = wsSwitcherList();
+    for (var i = 0; i < list.length; i++) {
+      var s = list[i];
       var b = el('button', {
-        'class': 'modeseg-btn', type: 'button', 'data-surface': s.id, 'aria-pressed': 'false',
-        title: s.label
-      }, [s.label]);
-      (function (id) { b.addEventListener('click', function () { applySurface(id); }); })(s.id);
+        'class': 'modeseg-btn', type: 'button', 'data-ws': s.uid, 'aria-pressed': 'false',
+        title: s.name + (s.builtin === false || s.source === 'user' ? ' · workspace' : '')
+      }, [s.name]);
+      (function (id) { b.addEventListener('click', function () { activateWorkspace(id); }); })(s.uid);
       wrap.appendChild(b);
     }
+    // >2 workspaces: let the switcher wrap into rows instead of squeezing.
+    wrap.classList.toggle('modeseg-wrap', list.length > 2);
+    syncModeSeg();
   }
+  // Async model load — never blocks first paint; rebuilds the switcher + rail
+  // icons, and re-routes if we are sitting on a user-workspace route that only
+  // became resolvable once the config facts arrived. Graceful on every failure.
+  function loadWorkspaceModel() {
+    var R = (typeof window !== 'undefined') ? window.CruxRender : null;
+    if (!R || typeof R.cwsLoadOverlays !== 'function' || typeof R.cwsBuildModel !== 'function') { return Promise.resolve(); }
+    return R.cwsLoadOverlays().then(function (ov) {
+      WS_MODEL = R.cwsBuildModel(ov);
+      window.CRUX_WS_MODEL = WS_MODEL;
+      buildModeSeg();
+      buildRailIcons();
+      // Re-render the routes whose content derives from the model once it lands:
+      // a user workspace (#/w/) and the site map (its workspace sections). Never
+      // re-route the Studio (that would clobber an in-progress editor).
+      var hh = location.hash || '';
+      if (/^#\/w\//.test(hh) || /^#\/?sitemap(\/|\?|$)/.test(hh)) { route(); }
+    }).catch(function () { /* builtins already usable */ });
+  }
+  if (typeof window !== 'undefined') { window.CRUX_WS_RELOAD = loadWorkspaceModel; }
   // Set the mode WITHOUT re-rendering (used by route() when a deep link to a real
   // destination auto-switches the reader back to a console density). Presentation only.
   function setModeSilently(id) {
@@ -3622,10 +3745,13 @@
     if (!cmd || !exp) { return; }
     var h = (location.hash || '').replace(/^#\/?/, '');
     var mode = document.documentElement.getAttribute('data-mode');
-    var onExplorer = /^explorer(\/|\?|$)/.test(h);
-    var onDocs = mode === 'documents' || /^documents(\/|$)/.test(h);
-    exp.setAttribute('aria-pressed', onExplorer ? 'true' : 'false');
-    cmd.setAttribute('aria-pressed', (!onExplorer && !onDocs) ? 'true' : 'false');
+    var active = activeWorkspaceUid();
+    exp.setAttribute('aria-pressed', active === 'explore' ? 'true' : 'false');
+    cmd.setAttribute('aria-pressed', active === 'command' ? 'true' : 'false');
+    var wsBtns = wrap.querySelectorAll('[data-railic="ws"]');
+    for (var i = 0; i < wsBtns.length; i++) {
+      wsBtns[i].setAttribute('aria-pressed', wsBtns[i].getAttribute('data-ws') === active ? 'true' : 'false');
+    }
   }
   function buildRailIcons() {
     var wrap = document.getElementById('railIcons');
@@ -3639,11 +3765,23 @@
     var exp = el('button', { 'class': 'rail-ic', type: 'button', 'data-railic': 'explorer', 'aria-label': 'Explorer', title: 'Explorer', 'aria-pressed': 'false' });
     exp.innerHTML = ICONS.search;
     exp.addEventListener('click', function () { closeRailOpsPop(); location.hash = '#/explorer'; });
+    wrap.appendChild(cmd); wrap.appendChild(exp);
+    // User workspaces (M16b) — an icon button per configured workspace, so the
+    // switcher stays reachable when the rail is collapsed (rail-meta hidden).
+    var list = wsSwitcherList();
+    for (var i = 0; i < list.length; i++) {
+      var ws = list[i];
+      if (ws.uid === 'command' || ws.uid === 'explore') { continue; }
+      var wb = el('button', { 'class': 'rail-ic', type: 'button', 'data-railic': 'ws', 'data-ws': ws.uid, 'aria-label': ws.name + ' workspace', title: ws.name, 'aria-pressed': 'false' });
+      wb.innerHTML = (ICONS[ws.icon] || ICONS.work || '');
+      (function (uid) { wb.addEventListener('click', function () { closeRailOpsPop(); activateWorkspace(uid); }); })(ws.uid);
+      wrap.appendChild(wb);
+    }
     // Operator options — opens the glass popup (theme + connection).
     var ops = el('button', { 'class': 'rail-ic', type: 'button', 'data-railic': 'ops', 'aria-label': 'Operator options', title: 'Operator options', 'aria-haspopup': 'menu', 'aria-expanded': 'false' });
     ops.innerHTML = RAIL_IC.ops;
     ops.addEventListener('click', function (e) { e.stopPropagation(); if (railOpsPop && !railOpsPop.hidden) { closeRailOpsPop(); } else { openRailOpsPop(ops); } });
-    wrap.appendChild(cmd); wrap.appendChild(exp); wrap.appendChild(ops);
+    wrap.appendChild(ops);
     syncRailIcons();
   }
   if (typeof document !== 'undefined') {
@@ -3956,9 +4094,10 @@
   }
 
   function renderDestination(destId, pageId) {
-    // Leaving Documents mode: restore the destination nav into the rail (it was
-    // swapped to the document tree by renderDocumentsRoute).
-    if (RAIL_MODE === 'docs') { buildRail(); }
+    // Leaving Documents mode or a user workspace: restore the Command
+    // destination nav into the rail (it was swapped to the document tree / the
+    // workspace dests).
+    if (RAIL_MODE !== 'dest') { buildRail(); }
     var dest = DEST_INDEX[destId] || DESTS[0];
     destId = dest.id;
     var page = PAGES[pageId];
@@ -3987,14 +4126,18 @@
       document.getElementById('destSub').textContent = cr.view === 'graph'
         ? 'Relation graph — real edges only (projects ⋈ work ⋈ gates ⋈ passports ⋈ sessions)'
         : cr.view === 'studio'
-          ? 'Studio — build a board of tiles (notes · API · web); positions + configs persist daemon-side'
+          ? (cr.sub === 'pages'
+              ? 'Studio › Pages — workspaces and the pages inside them; built-ins render from the registry until you take control'
+              : cr.sub === 'integrations'
+                ? 'Studio › Integrations — installed packs, the community registry, and trusted keys'
+                : 'Studio — build a board of tiles (notes · API · web); positions + configs persist daemon-side')
           : cr.view === 'tree'
             ? 'Plan tree — Project → ExecPlan → Milestone → live session'
             : 'Tile canvas — drag, pan, expand in place; composes to your viewport (4K+ = the full board)';
       var canvasHost = el('div', { 'class': 'canvas-region-host', id: 'canvasHost' });
       content.appendChild(canvasHost);
       if (window.CruxRender && window.CruxRender.renderCanvas) {
-        window.CruxRender.renderCanvas(canvasHost, { summary: BOOT.summary, view: cr.view, focus: cr.focus });
+        window.CruxRender.renderCanvas(canvasHost, { summary: BOOT.summary, view: cr.view, focus: cr.focus, sub: cr.sub });
       } else {
         canvasHost.appendChild(el('p', { 'class': 'v2card-sub', text: 'Renderer module unavailable.' }));
       }
@@ -4097,6 +4240,101 @@
     if (typeof content.scrollTo === 'function') { content.scrollTo(0, 0); }
   }
 
+  // ---- User workspace render (M16b) --------------------------------------
+  // A configured workspace: its dests become the rail, its pages render through
+  // CruxRender.renderWorkspacePage (the SAME builders as the built-in console).
+  // Graceful when the model has not loaded yet or the workspace is unknown.
+  function wsResolvePageDef(ws, pageUid) {
+    // 1) a config page fact (user / forked page)
+    if (WS_MODEL && WS_MODEL.pages && WS_MODEL.pages[pageUid]) { return WS_MODEL.pages[pageUid]; }
+    // 2) a registry built-in page id used directly as a type
+    if (PAGES[pageUid]) { var p = PAGES[pageUid]; return { schema_version: 1, uid: pageUid, type: pageUid, title: p.title, sub: p.sub, dest: p.dest, config: {}, source: 'builtin' }; }
+    // 3) a surface type id (canvas/board, explorer, sitemap, rings)
+    var R = window.CruxRender;
+    if (R && R.cwsTypeExists && R.cwsTypeExists(pageUid)) { return { schema_version: 1, uid: pageUid, type: pageUid, title: pageUid, sub: '', dest: '', config: {}, source: 'builtin' }; }
+    return null;
+  }
+  function wsFirstPage(ws) {
+    var dests = ws.dests || [];
+    for (var i = 0; i < dests.length; i++) { if (dests[i].pages && dests[i].pages.length) { return dests[i].pages[0]; } }
+    return null;
+  }
+  function wsDestOfPage(ws, pageUid) {
+    var dests = ws.dests || [];
+    for (var i = 0; i < dests.length; i++) { if ((dests[i].pages || []).indexOf(pageUid) >= 0) { return dests[i]; } }
+    return dests[0] || null;
+  }
+  function buildWorkspaceRail(ws, activePageUid) {
+    var nav = document.getElementById('nav');
+    nav.textContent = '';
+    RAIL_MODE = 'ws';
+    closeRailFlyout();
+    var activeDest = wsDestOfPage(ws, activePageUid);
+    (ws.dests || []).forEach(function (d) {
+      var btn = el('button', { 'class': 'nav-item', type: 'button', 'data-wsdest': d.id, 'aria-current': (activeDest && activeDest.id === d.id) ? 'page' : 'false', title: d.label });
+      btn.innerHTML = ICONS[d.icon] || ICONS.work || '';
+      btn.appendChild(el('span', { 'class': 'label', text: d.label }));
+      (function (dest) {
+        btn.addEventListener('click', function () {
+          var first = (dest.pages && dest.pages[0]) || null;
+          location.hash = first ? ('#/w/' + ws.uid + '/' + first) : ('#/w/' + ws.uid);
+        });
+      })(d);
+      nav.appendChild(btn);
+    });
+    applyPosture(nav);
+  }
+  function renderWorkspace(wsUid, pageUid) {
+    var R = (typeof window !== 'undefined') ? window.CruxRender : null;
+    var ws = (WS_MODEL && WS_MODEL.workspaces) ? (function () { for (var i = 0; i < WS_MODEL.workspaces.length; i++) { if (WS_MODEL.workspaces[i].uid === wsUid) { return WS_MODEL.workspaces[i]; } } return null; })() : null;
+    if (!ws) {
+      // Model not loaded yet → kick a load (it re-routes on completion). Show a
+      // light honest placeholder meanwhile; an unknown workspace after load
+      // falls back to Command so there is never a dead screen.
+      var content0 = document.getElementById('content'); content0.textContent = '';
+      if (!WS_MODEL) {
+        document.getElementById('destTitle').textContent = 'Workspace';
+        document.getElementById('destSub').textContent = 'loading configuration…';
+        content0.appendChild(el('p', { 'class': 'v2card-sub', text: 'Loading workspace configuration…' }));
+        loadWorkspaceModel();
+        return;
+      }
+      // known-empty model, unknown uid → Command.
+      location.hash = '#/' + (DESTS[0] && DESTS[0].id);
+      return;
+    }
+    // A forked/user workspace that carries a surface (a builtin-fork of Command/
+    // Explorer that only edited metadata) still delegates to the surface path.
+    var pageU = pageUid || wsFirstPage(ws);
+    var pdef = pageU ? wsResolvePageDef(ws, pageU) : null;
+    var dest = wsDestOfPage(ws, pageU);
+    buildWorkspaceRail(ws, pageU);
+    // active dest highlight already set in buildWorkspaceRail
+    document.getElementById('destTitle').textContent = pdef ? pdef.title : ws.name;
+    document.getElementById('destSub').textContent = pdef ? (pdef.sub || '') : ('Workspace · ' + (ws.dests || []).length + ' group(s)');
+    syncMobileChrome(null);
+    var content = document.getElementById('content');
+    content.textContent = '';
+    if (!pdef) {
+      renderWorkspaceEmpty(content, ws);
+    } else {
+      var host = el('div', { 'class': 'page-host', id: 'pageHost' });
+      content.appendChild(host);
+      if (R && R.renderWorkspacePage) { R.renderWorkspacePage(host, pdef, { summary: BOOT.summary }); }
+      else { host.appendChild(el('p', { 'class': 'v2card-sub', text: 'Renderer module unavailable.' })); }
+    }
+    applyPosture(content);
+    if (typeof content.scrollTo === 'function') { content.scrollTo(0, 0); }
+  }
+  function renderWorkspaceEmpty(content, ws) {
+    var card = el('div', { 'class': 'v2card wide' });
+    card.appendChild(el('h3', { 'class': 'v2card-h', text: ws.name }));
+    card.appendChild(el('p', { 'class': 'v2card-sub', text: 'This workspace has no pages yet. Add pages of any registry type in Studio › Pages.' }));
+    var go = el('a', { 'class': 'btn-quiet', href: '#/canvas/studio?sub=pages', text: 'Open Studio › Pages' });
+    card.appendChild(go);
+    content.appendChild(card);
+  }
+
   function currentRoute() {
     var h = (location.hash || '').replace(/^#\/?/, '');
     var qi = h.indexOf('?');
@@ -4124,7 +4362,10 @@
       try { raw = decodeURIComponent(m[1]); } catch (e) { raw = m[1]; }
       focus = (window.CruxRender && window.CruxRender.parseFocus) ? window.CruxRender.parseFocus(raw) : null;
     }
-    return { view: view, focus: focus };
+    // M16b — the Studio subsection (Board | Pages | Integrations) rides ?sub=.
+    var sm = q.match(/(?:^|&)sub=([^&]+)/);
+    var sub = sm ? (sm[1] === 'pages' ? 'pages' : (sm[1] === 'integrations' ? 'integrations' : 'board')) : 'board';
+    return { view: view, focus: focus, sub: sub };
   }
 
   // Route. Documents mode (M10) is presentation: it renders the reader instead of
@@ -4138,6 +4379,16 @@
     var qi = h.indexOf('?'); if (qi >= 0) { h = h.slice(0, qi); }
     var parts = h.split('/').filter(Boolean);
     var first = parts[0];
+    // M16b — a user workspace route (#/w/<uid>[/<pageUid>]). Config-driven nav;
+    // built-ins keep their existing routes. Exits Documents mode (a destination
+    // wins over the reader, like every other real route).
+    if (first === 'w' && parts[1]) {
+      if (typeof window !== 'undefined' && window.CRUX_MODE === 'documents') { setModeSilently('standard'); }
+      renderWorkspace(parts[1], parts[2]);
+      syncRailIcons();
+      syncModeSeg();
+      return;
+    }
     var inDocsMode = (typeof window !== 'undefined' && window.CRUX_MODE === 'documents');
     var docsHash = first === 'documents';
     if (docsHash || inDocsMode) {
@@ -4226,6 +4477,10 @@
         setTopChips();
         setBrand();
         route();
+        // M16b — load the workspace config model (async, non-blocking): rebuilds
+        // the switcher + rail icons and re-routes if we booted onto a #/w/ route.
+        // Built-ins are already usable, so a slow/absent load costs nothing.
+        loadWorkspaceModel();
         // Derive posture from the server, then re-render with it (nav + pills +
         // landing + mutating controls all follow). Never blocks the first paint.
         return derivePostureFromServer().then(applyDerivedPosture);

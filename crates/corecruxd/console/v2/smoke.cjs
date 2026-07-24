@@ -3617,6 +3617,105 @@ function extractThemeVars(theme) {
   }
 })();
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Check 52 — (console-surfaces-remediation M16b) Configurable Workspaces: the
+//  config-schema pure functions honour the CONTRACT (memo §4 + the M16 decision
+//  log): canonical key-sorted JSON, a TOLERANT reader that preserves unknown
+//  keys and version-gates, built-in generation, reversible fork/revert, and
+//  additive packs. The runtime nav + Studio subsections drive these; the
+//  invariants live here so a regression fails the smoke, not production.
+// ─────────────────────────────────────────────────────────────────────────────
+(function checkConfigurableWorkspaces() {
+  const need = ['cwsCanonical', 'cwsReadWorkspaceDef', 'cwsReadPageDef', 'cwsBuiltinWorkspaces',
+    'cwsEffectiveWorkspaces', 'cwsForkWorkspace', 'cwsTombstone', 'cwsStarterTemplates',
+    'cwsPageTypes', 'cwsPackEmbed', 'cwsPackExtract', 'cwsMergeQuery', 'renderWorkspacePage',
+    'renderWorkspaceStudio', 'renderIntegrationsStudio'];
+  need.forEach(function (fn) { check(typeof render[fn] === 'function', '[workspaces] render.js must export ' + fn); });
+
+  // (a) canonical JSON is byte-stable + key-order independent (one artifact, two editors).
+  const c1 = render.cwsCanonical({ b: 1, a: { z: 9, y: 8 }, arr: [3, 1, 2] });
+  const c2 = render.cwsCanonical({ a: { y: 8, z: 9 }, arr: [3, 1, 2], b: 1 });
+  check(c1 === c2, '[workspaces] canonical JSON must be key-order independent');
+  check(c1 === '{"a":{"y":8,"z":9},"arr":[3,1,2],"b":1}', '[workspaces] canonical JSON must be sorted + whitespace-free');
+
+  // (b) TOLERANT reader: unknown keys survive (top + nested) through a canonical round-trip.
+  const rd = render.cwsReadWorkspaceDef({ schema_version: 1, uid: 'ws-x', name: 'X',
+    dests: [{ id: 'g', label: 'G', pages: ['p1'], futureField: 42 }], newTopKey: { deep: 'keep' } });
+  check(rd.valid && !rd.unknownVersion, '[workspaces] a known-version workspace def must read valid');
+  const rt = JSON.parse(render.cwsCanonical(rd.def));
+  check(rt.newTopKey && rt.newTopKey.deep === 'keep', '[workspaces] tolerant reader must preserve an unknown TOP-level key through a round-trip');
+  check(rt.dests[0].futureField === 42, '[workspaces] tolerant reader must preserve an unknown NESTED key (dest.futureField)');
+  const pr = render.cwsReadPageDef({ schema_version: 1, uid: 'p1', type: 'cx-facts', title: 'F', extra: { x: 1 } });
+  check(pr.valid && JSON.parse(render.cwsCanonical(pr.def)).extra.x === 1, '[workspaces] page tolerant reader must preserve unknown keys');
+
+  // (c) version gate: a NEWER schema_version renders an honest state, never destroys.
+  const nv = render.cwsReadWorkspaceDef({ schema_version: 99, uid: 'ws-n', weird: 'data' });
+  check(nv.unknownVersion === true && nv.def.weird === 'data', '[workspaces] a newer schema_version must be flagged + returned untouched (never rebuilt)');
+
+  // (d) tombstone → reverted.
+  check(render.cwsReadWorkspaceDef(render.cwsTombstone('ws-x')).reverted === true, '[workspaces] a tombstone def must read as reverted');
+
+  // (e) built-ins + fork/revert semantics (over a stubbed registry).
+  const savedWin = global.window;
+  global.window = { CruxPages: { DESTS: [{ id: 'work', label: 'Work', icon: 'work' }, { id: 'canvas', label: 'Canvas', icon: 'canvas' }, { id: 'explorer', label: 'Explorer', icon: 'search' }],
+    PAGES: { 'cx-work': { title: 'ExecPlans', sub: 's', dest: 'work' } } } };
+  try {
+    const bw = render.cwsBuiltinWorkspaces();
+    check(bw.length === 2 && bw[0].uid === 'command' && bw[1].uid === 'explore', '[workspaces] built-ins must be exactly Command + Explorer, auto-generated from the registry');
+    check(bw[0].source === 'builtin' && bw[0].builtin === true, '[workspaces] a built-in must be marked source:builtin');
+    const fork = render.cwsForkWorkspace(bw[0]);
+    check(fork.source === 'builtin-fork' && fork.forked_from === 'command' && !fork.builtin, '[workspaces] fork must set source:builtin-fork + forked_from and drop the builtin flag (take control)');
+    const forkedEff = render.cwsEffectiveWorkspaces([{ def: fork, valid: true, reverted: false }]);
+    const cmdForked = forkedEff.find(function (w) { return w.uid === 'command'; });
+    check(cmdForked && cmdForked.source === 'builtin-fork', '[workspaces] a fork overlay must REPLACE its built-in in the effective set');
+    const revEff = render.cwsEffectiveWorkspaces([{ def: render.cwsReadWorkspaceDef(render.cwsTombstone('command')).def, valid: true, reverted: true }]);
+    const cmdRev = revEff.find(function (w) { return w.uid === 'command'; });
+    check(cmdRev && cmdRev.source === 'builtin' && cmdRev.builtin === true, '[workspaces] reverting a fork (tombstone) must restore auto-generation (built-in resumes)');
+    const userEff = render.cwsEffectiveWorkspaces([{ def: { schema_version: 1, uid: 'ws-mine', name: 'Mine', source: 'user', order: 5, dests: [] }, valid: true, reverted: false }]);
+    check(userEff.length === 3 && userEff.some(function (w) { return w.uid === 'ws-mine'; }), '[workspaces] a user workspace must append to the built-ins');
+    const userRev = render.cwsEffectiveWorkspaces([{ def: render.cwsReadWorkspaceDef(render.cwsTombstone('ws-mine')).def, valid: true, reverted: true }]);
+    check(!userRev.some(function (w) { return w.uid === 'ws-mine'; }), '[workspaces] a tombstoned user workspace must drop out of the effective set');
+
+    // (f) page-type coverage: EVERY registry page id is generatable as a type.
+    const types = render.cwsPageTypes();
+    const tset = new Set(types.map(function (t) { return t.type; }));
+    check(tset.has('cx-work'), '[workspaces] every registry page id must be a generatable page type (cx-work present)');
+    check(tset.has('canvas/graph') && tset.has('explorer') && tset.has('sitemap') && tset.has('rings'), '[workspaces] destination-IS-the-page surfaces must be generatable page types');
+
+    // (g) starter templates: remix-not-blank (Blank is last), Duplicate Command builds dests.
+    const st = render.cwsStarterTemplates();
+    check(st.length >= 3 && st[st.length - 1].id === 'blank', '[workspaces] starter templates must be remix-first (Blank last)');
+    const dup = st[0].build('ws-dup', 'Dup');
+    check(dup.workspace.dests.length >= 1 && dup.workspace.source === 'user', '[workspaces] Duplicate Command starter must produce a user workspace with dests');
+  } finally { if (savedWin === undefined) { delete global.window; } else { global.window = savedWin; } }
+
+  // (h) additive packs: crux.studio.v1 stays valid; workspaces/pages round-trip.
+  const pay = render.cwsPackEmbed({ schema: 'crux.studio.v1', board: {} }, [{ uid: 'ws-mine' }], [{ uid: 'p1', type: 'cx-work' }]);
+  check(pay.schema === 'crux.studio.v1' && pay.workspaces.length === 1 && pay.pages.length === 1, '[workspaces] pack embed must be additive (schema preserved + workspaces/pages arrays)');
+  const ext = render.cwsPackExtract(pay);
+  check(ext.workspaces.length === 1 && ext.pages.length === 1, '[workspaces] pack extract must recover workspaces/pages');
+  check(render.cwsPackExtract({ schema: 'crux.studio.v1' }).workspaces.length === 0, '[workspaces] an older pack (no workspaces) must extract to empty arrays (backward compatible)');
+
+  // (i) config query merge (type-specific page config over an endpoint).
+  check(render.cwsMergeQuery('/v1/work?source=all', { source: 'kanban' }) === '/v1/work?source=kanban', '[workspaces] cwsMergeQuery must override an existing query param');
+
+  // (j) writes go ONLY through the gated console fact-add (no new mutation client / no raw fetch in the studio subsections).
+  const wsA = renderSrc.indexOf('Studio › Pages (M16b)');
+  const wsB = renderSrc.indexOf('Documents mode (M10)');
+  const wsRegion = (wsA >= 0 && wsB > wsA) ? renderSrc.slice(wsA, wsB) : '';
+  check(!!wsRegion, '[workspaces] the Studio subsection region must be locatable');
+  check(!/\bfetch\s*\(/.test(wsRegion), '[workspaces] the Studio subsections must issue NO raw fetch (reads via fetchJSON/CruxApi)');
+  check(/tstudioWriteFact\(/.test(wsRegion) && !/CruxApiGated/.test(wsRegion), '[workspaces] writes must route through tstudioWriteFact (operatorGatedCall→consoleFactsAdd), never the gated client directly');
+  check(/CWS_WS_ENTITY|console:workspace:/.test(renderSrc) && /CWS_PAGE_ENTITY|console:page:/.test(renderSrc), '[workspaces] config must persist under console:workspace: / console:page: entities');
+
+  // (k) the shell wires the switcher + #/w route + model load off the pure helpers.
+  check(/activateWorkspace\(/.test(shellHtml) && /data-ws/.test(shellHtml), '[workspaces] the shell switcher must build per-workspace buttons (data-ws) + activateWorkspace');
+  check(/first === 'w' && parts\[1\]/.test(shellHtml) && /renderWorkspace\(/.test(shellHtml), '[workspaces] the shell must route #/w/<uid> to renderWorkspace');
+  check(/loadWorkspaceModel\(/.test(shellHtml) && /CRUX_WS_RELOAD/.test(shellHtml), '[workspaces] the shell must load the workspace model at boot + expose CRUX_WS_RELOAD');
+
+  notes.push('configurable workspaces (M16b): canonical key-sorted JSON (one artifact / two editors); tolerant reader preserves unknown keys (top + nested) + version-gates a newer schema; built-ins Command+Explorer auto-generated from the registry; reversible fork (source:builtin-fork+forked_from) / revert (tombstone → auto-generation resumes); every registry page id + the destination-IS-the-page surfaces are generatable page types; remix-not-blank starters (Blank last); additive crux.studio.v1 packs (workspaces/pages, older packs still valid); Studio subsections write ONLY through tstudioWriteFact→consoleFactsAdd under console:workspace:/console:page: (no raw fetch, no direct gated client); shell wires the switcher + #/w route + boot model load.');
+})();
+
 // ---- Report (awaits async renderer-driven checks) -----------------------
 Promise.all(asyncChecks).then(function () { return passportMintInteraction(); }).then(function () {
   console.log('unified-shell-console v2 — M14 + desktop mission control M2 smoke');
