@@ -128,6 +128,7 @@ async fn handle_mcp_post(State(ctx): State<Arc<McpContext>>, headers: HeaderMap,
             passport_mint_requests_enabled: ctx.passport_mint_requests_enabled,
             agent_passport_map: ctx.agent_passport_map.clone(),
             revocation_enforced: ctx.revocation_enforced,
+            dense_provider_factory: ctx.dense_provider_factory.clone(),
         }
     };
 

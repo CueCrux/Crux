@@ -10,10 +10,15 @@ use serde_json::{json, Value};
 use crate::dispatch::McpContext;
 use crate::protocol::{JsonRpcError, INVALID_PARAMS};
 
-use corecrux_memory::semantic::{MIXED_PROFILE_MERGE_RULE, SCORE_MERGE_RULE_SINGLE_SPACE, SCORE_SPACE_BM25_LEXICAL};
+use corecrux_memory::semantic::{
+    MIXED_PROFILE_MERGE_RULE, SCORE_MERGE_RULE_SINGLE_SPACE, SCORE_MERGE_RULE_WEIGHTED_LINEAR,
+    SCORE_SPACE_BM25_DENSE_FUSED, SCORE_SPACE_BM25_LEXICAL,
+};
 use corecrux_retrieval::bm25::{self, Bm25Params};
 
-/// `query` — BM25 + graph fusion search with optional token budget and min_score.
+/// `query` — BM25 search with an optional dense cosine re-rank (when the
+/// daemon wires a dense-provider factory and the corpus has vectors),
+/// token budget, and min_score.
 pub async fn handle_query(params: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let tenant_hash = require_tenant_hash(params)?;
     let query = require_str(params, "query")?;
@@ -37,7 +42,7 @@ pub async fn handle_query(params: &Value, ctx: &McpContext) -> Result<Value, Jso
     }
 
     let readers = index.readers();
-    let result = bm25::bm25_search(
+    let mut result = bm25::bm25_search(
         &readers,
         query,
         limit,
@@ -45,6 +50,42 @@ pub async fn handle_query(params: &Value, ctx: &McpContext) -> Result<Value, Jso
         &Bm25Params::default(),
         min_score,
     );
+
+    // Dense re-rank (parity with `POST /v1/query/text-search`): when the
+    // node has an embedder and this corpus has `.ccxv` vector companions,
+    // fuse `0.7*bm25_norm + 0.3*cosine` over the BM25 candidate pool.
+    // Any missing piece — no factory (tests/stdio), no embedder, embed
+    // failure, no vectors — degrades to bit-identical BM25. The
+    // delegation fail-closed contract stays on the REST surface; the MCP
+    // tool always answers.
+    const BM25_WEIGHT: f32 = 0.7;
+    const DENSE_WEIGHT: f32 = 0.3;
+    let mut dense_lane_active = false;
+    if let Some(factory) = ctx.dense_provider_factory.as_ref() {
+        let query_embedding = ctx.fact_store.read().await.try_embed_text(query).ok().flatten();
+        if let Some(query_embedding) = query_embedding {
+            let expected_fingerprint = embedding_fingerprint
+                .as_ref()
+                .map(|fingerprint| fingerprint.hash.as_str());
+            if let Some(provider) = factory(&index, &query_embedding, expected_fingerprint) {
+                use corecrux_retrieval::dense::DenseProvider as _;
+                let max_bm25 = result.hits.iter().map(|h| h.score).fold(0.0f32, f32::max).max(1e-9);
+                for h in &mut result.hits {
+                    let dense = provider.dense_score(h.doc_id, h.segment_index).unwrap_or(0.0);
+                    h.score = BM25_WEIGHT * (h.score / max_bm25) + DENSE_WEIGHT * dense;
+                }
+                result
+                    .hits
+                    .sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+                dense_lane_active = true;
+            }
+        }
+    }
+    let (score_space, score_merge_rule) = if dense_lane_active {
+        (SCORE_SPACE_BM25_DENSE_FUSED, SCORE_MERGE_RULE_WEIGHTED_LINEAR)
+    } else {
+        (SCORE_SPACE_BM25_LEXICAL, SCORE_MERGE_RULE_SINGLE_SPACE)
+    };
 
     // Apply token budget. M1 reversible overflow (unconditional since CO-5): the
     // response is pointer-only, so budget the *emitted* pointer tier — admit
@@ -86,7 +127,7 @@ pub async fn handle_query(params: &Value, ctx: &McpContext) -> Result<Value, Jso
                 "rank": idx + 1,
                 "score": h.score,
                 "source_label": "local_tenant_index",
-                "score_space": SCORE_SPACE_BM25_LEXICAL,
+                "score_space": score_space,
                 "semantic_profile_id": null,
                 "local_semantic_profile_id": local_semantic_profile_id.clone(),
                 "segment_index": h.segment_index,
@@ -106,8 +147,8 @@ pub async fn handle_query(params: &Value, ctx: &McpContext) -> Result<Value, Jso
         },
         "meta": {
             "source_label": "local_tenant_index",
-            "score_space": SCORE_SPACE_BM25_LEXICAL,
-            "score_merge_rule": SCORE_MERGE_RULE_SINGLE_SPACE,
+            "score_space": score_space,
+            "score_merge_rule": score_merge_rule,
             "mixed_profile_merge_rule": MIXED_PROFILE_MERGE_RULE,
             "semantic_profile_id": null,
             "local_semantic_profile_id": local_semantic_profile_id.clone(),
@@ -463,6 +504,60 @@ mod tests {
     }
 
     // ── M1: reversible overflow (unconditional since CO-5) ────────────────────
+
+    /// Two docs, near-equal BM25 ("alpha" tf 21 vs 20) so a dense cosine
+    /// boost on the runner-up flips the order.
+    async fn seed_two_doc_index(ctx: &McpContext, tenant: &str) {
+        use corecrux_index::CcxiBuilder;
+        let th = xxhash_rust::xxh64::xxh64(tenant.as_bytes(), 0);
+        let mut b = CcxiBuilder::new(0, 1, 1);
+        b.add_document(0, &["alpha"; 21].join(" "), 0, th);
+        b.add_document(1, &["alpha"; 20].join(" "), 1000, th);
+        let bytes = b.build();
+        ctx.retrieval_index.write().await.load_ccxi_bytes(&bytes).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dense_rerank_flips_order_and_labels_score_space() {
+        let _g = crate::test_env_lock().lock().await;
+        std::env::set_var(crate::holdout::HOLDOUT_ENV, "0");
+        let ctx = test_ctx();
+        seed_two_doc_index(&ctx, "t1").await;
+        ctx.fact_store
+            .write()
+            .await
+            .set_embedder(Box::new(corecrux_memory::embeddings::LocalHashEmbedder::default()));
+
+        // BM25-only baseline: doc0 (higher tf) ranks first, lexical label.
+        let baseline = handle_query(&json!({"tenant_id": "t1", "query": "alpha", "limit": 10}), &ctx)
+            .await
+            .unwrap();
+        let text = baseline["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("bm25_lexical"), "no factory -> lexical: {text}");
+        assert!(
+            text.find("0:0").unwrap() < text.find("0:1").unwrap(),
+            "BM25 order doc0 first: {text}"
+        );
+
+        // Factory gives doc1 a perfectly aligned vector (cosine 1) and doc0
+        // nothing -> fused order flips, score space says so.
+        let mut ctx = ctx;
+        ctx.dense_provider_factory = Some(std::sync::Arc::new(|_, emb: &[f32], _| {
+            let mut vectors = std::collections::HashMap::new();
+            vectors.insert((1u32, 0usize), emb.to_vec());
+            Some(corecrux_retrieval::CosineDenseProvider::new(emb, vectors))
+        }));
+        let fused = handle_query(&json!({"tenant_id": "t1", "query": "alpha", "limit": 10}), &ctx)
+            .await
+            .unwrap();
+        let text = fused["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("bm25_dense_fused"), "fused label: {text}");
+        assert!(
+            text.find("0:1").unwrap() < text.find("0:0").unwrap(),
+            "dense re-rank lifts doc1 above doc0: {text}"
+        );
+        std::env::remove_var(crate::holdout::HOLDOUT_ENV);
+    }
 
     /// Seed an index with `n` docs of varied length, all matching "alpha".
     async fn seed_alpha_index(ctx: &McpContext, tenant: &str, n: u32) {

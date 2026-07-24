@@ -92,7 +92,19 @@ pub struct McpContext {
     /// learn it was revoked — M4). Wired from `corecruxd::main` off
     /// `CRUX_PASSPORT_REVOCATION` — **launch default ON**; `=0` disables enforcement.
     pub revocation_enforced: bool,
+    /// corecruxd-injected constructor for the CPU cosine dense lane
+    /// (`(index, query_embedding, expected_fingerprint) → provider`). The
+    /// `.ccxv` companion readers live in corecruxd, so the daemon supplies
+    /// this at wiring time; `None` (tests, stdio-only) keeps `query`
+    /// BM25-only — bit-identical pre-existing behaviour.
+    pub dense_provider_factory: Option<DenseProviderFactory>,
 }
+
+/// Constructor for the dense re-rank provider on the MCP `query` path.
+/// Returns `None` when the corpus has no usable vectors — the caller then
+/// stays BM25-only.
+pub type DenseProviderFactory =
+    Arc<dyn Fn(&IndexManager, &[f32], Option<&str>) -> Option<corecrux_retrieval::CosineDenseProvider> + Send + Sync>;
 
 /// passport-revocation M3: read the `CRUX_PASSPORT_REVOCATION` flag. Launch
 /// default ON (proven live) — a revoked passport is reduced to read-only.
@@ -134,6 +146,7 @@ impl McpContext {
             passport_mint_requests_enabled: false,
             agent_passport_map: crate::agent_passport::AgentPassportMap::empty(),
             revocation_enforced: false,
+            dense_provider_factory: None,
         }
     }
 
@@ -168,6 +181,7 @@ impl McpContext {
             passport_mint_requests_enabled: false,
             agent_passport_map: crate::agent_passport::AgentPassportMap::empty(),
             revocation_enforced: false,
+            dense_provider_factory: None,
         }
     }
 
@@ -216,6 +230,7 @@ impl McpContext {
             passport_mint_requests_enabled: self.passport_mint_requests_enabled,
             agent_passport_map: self.agent_passport_map.clone(),
             revocation_enforced: self.revocation_enforced,
+            dense_provider_factory: self.dense_provider_factory.clone(),
         }
     }
 
@@ -242,6 +257,15 @@ impl McpContext {
     /// use it directly to exercise the flag-ON path without a process-global env.
     pub fn with_revocation_enforced(mut self, enabled: bool) -> Self {
         self.revocation_enforced = enabled;
+        self
+    }
+
+    /// Attach the corecruxd dense-provider constructor so the `query` tool
+    /// can run the CPU cosine re-rank (parity with `POST
+    /// /v1/query/text-search`). Unset → BM25-only, the pre-existing
+    /// behaviour.
+    pub fn with_dense_provider_factory(mut self, factory: DenseProviderFactory) -> Self {
+        self.dense_provider_factory = Some(factory);
         self
     }
 
