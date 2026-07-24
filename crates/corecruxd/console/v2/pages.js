@@ -684,7 +684,7 @@
     var a = s.auth || {}, e = s.embedding || {};
     // The status pill dropped the origin + node id (item 3); they land here.
     var origin = (typeof window !== 'undefined' && window.location && window.location.origin) ? window.location.origin : '—';
-    return [
+    var out = [
       { h: 'Node', sub: 'this daemon origin + identity',
         controls: [
           info('origin', origin),
@@ -728,9 +728,26 @@
         controls: [
           info('build', s && s.daemon ? [get(s, ['daemon', 'build', 'version']), ':14800'].filter(Boolean).join(' · ') : ':14800'),
           mbtn('Restart daemon', { danger: true, hint: 'needs restart: unless-stopped policy' })
-        ] },
-      { h: 'Appearance', sub: 'applies immediately', controls: [{ t: 'theme' }, info('canvas', '2D | 3D toolbar switch')] }
+        ] }
+      // NB: no "Appearance" section — the console theme has its own dedicated card
+      // (shell buildThemeCard), and the old "canvas 2D | 3D toolbar switch" row was
+      // stale (no such control). Removed in M17 to de-duplicate + drop stale copy.
     ];
+    // M17 honesty pass: Settings sits well past M3, and its gated writes are daemon
+    // config / host actions that the console deliberately never performs. Render
+    // them disabled with an honest, non-milestone reason instead of the stale
+    // "wired in M3+" promise (the M6 honesty standard, applied to a page that was
+    // outside the original 11-surface sweep). The generic gate stays for the rest.
+    return stampSettingsGate(out);
+  }
+  var SETTINGS_GATE_REASON = 'read-only in the console — set on the daemon host';
+  function stampSettingsGate(sections) {
+    (sections || []).forEach(function (sec) {
+      (sec && sec.controls || []).forEach(function (c) {
+        if (c && c.mut && !c.gateReason) { c.gateReason = SETTINGS_GATE_REASON; }
+      });
+    });
+    return sections;
   }
 
   // A full-width trend card (item 5). No real time-series endpoint exists for

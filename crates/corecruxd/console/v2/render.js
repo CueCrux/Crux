@@ -489,14 +489,19 @@
   // disabled until M3+. This is the single choke point the smoke audits.
   function applyMutationGate(node, control) {
     if (!control || !control.mut) { return node; }
+    // A control may carry an honest, page-specific reason (control.gateReason) —
+    // used by surfaces past M3 whose gated writes will never be "wired in M3+"
+    // (e.g. Settings, whose config/actions live on the daemon host). The generic
+    // GATE_TITLE stays the default so the choke point (and its audits) hold.
+    var reason = (control.gateReason && String(control.gateReason)) || GATE_TITLE;
     node.setAttribute('data-requires', 'operator');   // shell.applyPosture hides for customers
     node.hidden = !isOperator();                       // and belt-and-braces at render time
     var target = node.querySelector('input, select, textarea, button') || node;
     if (target && 'disabled' in target) { target.disabled = true; }
     node.classList.add('is-gated');
-    node.setAttribute('title', GATE_TITLE);
+    node.setAttribute('title', reason);
     var tag = node.querySelector('.gate-tag');
-    if (!tag) { node.appendChild(el('span', { 'class': 'gate-tag', text: GATE_TITLE })); }
+    if (!tag) { node.appendChild(el('span', { 'class': 'gate-tag', text: reason })); }
     return node;
   }
 

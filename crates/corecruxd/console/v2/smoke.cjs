@@ -3716,6 +3716,51 @@ function extractThemeVars(theme) {
   notes.push('configurable workspaces (M16b): canonical key-sorted JSON (one artifact / two editors); tolerant reader preserves unknown keys (top + nested) + version-gates a newer schema; built-ins Command+Explorer auto-generated from the registry; reversible fork (source:builtin-fork+forked_from) / revert (tombstone → auto-generation resumes); every registry page id + the destination-IS-the-page surfaces are generatable page types; remix-not-blank starters (Blank last); additive crux.studio.v1 packs (workspaces/pages, older packs still valid); Studio subsections write ONLY through tstudioWriteFact→consoleFactsAdd under console:workspace:/console:page: (no raw fetch, no direct gated client); shell wires the switcher + #/w route + boot model load.');
 })();
 
+// ---- Check 53 — (console-surfaces-remediation M17) operator round 6:
+//  the workspace-pages BUG fix (sub-nav + flyout from the config model), the
+//  collapsed-rail rework (no chevron, icons-only, dest-click → flyout), the
+//  single workspace switcher + rightward pop-out (replacing the multi-button
+//  strip), the operator popup gaining Studio + Options, and Settings honesty
+//  (an honest gate reason instead of the stale "wired in M3+" promise).
+(function () {
+  // (a) BUG FIX — a workspace group's pages render as a sub-nav pill row driven
+  //     by the SAME config model as the flyout (before M17 the rail showed only
+  //     the group label, so pages — incl. a newly added one — appeared nowhere).
+  check(/function buildWorkspaceSubnav\(/.test(shellHtml) && /buildWorkspaceSubnav\(ws, dest, pageU\)/.test(shellHtml),
+    '[m17] renderWorkspace must render a config-driven page sub-nav (buildWorkspaceSubnav) — the workspace-pages bug fix');
+  check(/function workspaceDestPages\(/.test(shellHtml) && /function openWorkspaceRailFlyout\(/.test(shellHtml),
+    '[m17] workspace dests must resolve their pages (workspaceDestPages) + open the flyout (openWorkspaceRailFlyout)');
+  // (b) live pick-up: a stored console:workspace:/console:page: fact reloads the
+  //     model (refresh always works; this is the "ideally live" upgrade).
+  check(/EventSource\('\/v1\/events\/stream\?types=fact\.stored'\)/.test(shellHtml) && /console:workspace:'\) !== 0 && entity\.indexOf\('console:page:/.test(shellHtml),
+    '[m17] the shell must live-reload the workspace model on a console:workspace/page fact.stored event');
+  // (c) collapsed rail: the expander chevron is removed (icons only) + a dest
+  //     icon CLICK opens the flyout (works for touch/keyboard, not only hover).
+  check(/\[data-rail="collapsed"\]\s+\.rail-toggle\s*\{\s*display:\s*none/.test(shellHtml),
+    '[m17] the compressed rail must hide the expander chevron (rail-toggle display:none)');
+  check(/function railIsCollapsed\(/.test(shellHtml) && /railIsCollapsed\(\) && hasPages/.test(shellHtml),
+    '[m17] a compressed-rail dest click must open the flyout (railIsCollapsed → openRailFlyout)');
+  // (d) single workspace switcher button + rightward pop-out (replaces the
+  //     multi-button data-ws strip); reachable in both rail states.
+  check(/ws-switch-btn/.test(shellHtml) && /function openWsSwitchPop\(/.test(shellHtml) && /id: 'wsSwitchPop'/.test(shellHtml),
+    '[m17] the switcher must be ONE button opening a rightward workspace pop-out (wsSwitchPop)');
+  check(/'data-railic': 'ws-switch'/.test(shellHtml) && !/'data-railic': 'command'/.test(shellHtml),
+    '[m17] the collapsed rail must carry the single ws-switch icon (command/explorer folded into the pop-out)');
+  // (e) operator popup gains Studio + Options (both navigate); theme+connection stay.
+  check(/rail-ops-nav/.test(shellHtml) && /'#\/canvas\/studio'/.test(shellHtml) && /'#\/system\/cx-settings'/.test(shellHtml),
+    '[m17] the operator popup must gain Studio (#/canvas/studio) + Options (#/system/cx-settings) nav entries');
+  // (f) Settings honesty — a page-specific honest gate reason; the generic
+  //     "wired in M3+" stays the DEFAULT choke point everywhere else.
+  check(/gateReason/.test(renderSrc) && /wired in M3\+/.test(renderSrc),
+    '[m17] applyMutationGate must honour a page-specific honest gateReason while keeping "wired in M3+" as the default');
+  check(/SETTINGS_GATE_REASON/.test(pagesSrc) && /stampSettingsGate\(/.test(pagesSrc) && !/'Appearance'/.test(pagesSrc),
+    '[m17] Settings must stamp an honest gate reason + drop the stale Appearance section (duplicate theme + dead canvas info)');
+  // (g) unified Settings cards — equal-height grid rows.
+  check(/\.settings-page \.v2grid\s*\{\s*align-items:\s*stretch/.test(shellHtml) && /content\.classList\.add\('settings-page'\)/.test(shellHtml),
+    '[m17] the Settings region must render as one equal-height card grid (.settings-page)');
+  notes.push('operator round 6 (M17): workspace-pages bug fixed (config-driven buildWorkspaceSubnav pill row + openWorkspaceRailFlyout, both off workspaceDestPages) + live model reload on console:workspace/page fact.stored; collapsed rail reworked (chevron removed → expand via the logo, icons-only, a dest icon CLICK opens the flyout — primary compressed nav for touch/keyboard); single workspace switcher button + rightward pop-out (wsSwitchPop) replacing the multi-button data-ws strip, reachable collapsed + expanded; operator popup gains Studio + Options nav entries (theme + connection kept); Settings shows an honest, non-milestone gate reason (generic "wired in M3+" stays the default choke point) + drops the stale Appearance section + renders one equal-height card grid.');
+})();
+
 // ---- Report (awaits async renderer-driven checks) -----------------------
 Promise.all(asyncChecks).then(function () { return passportMintInteraction(); }).then(function () {
   console.log('unified-shell-console v2 — M14 + desktop mission control M2 smoke');

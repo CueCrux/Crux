@@ -231,6 +231,10 @@
   .brand .name small { display: block; font-weight: 500; font-size: 11px; color: var(--ink3); letter-spacing: .02em; }
 
   nav { display: flex; flex-direction: column; gap: 3px; overflow-y: auto; }
+  /* M17 overflow fix: the primary nav is the rail's scrolling region, so a tall
+     destination set (or a workspace with many groups) never clips the brand,
+     icon strip or footer — they stay pinned; the nav scrolls between them. */
+  #nav { flex: 1 1 auto; min-height: 0; scrollbar-width: thin; }
   .nav-group-label {
     font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
     color: var(--ink3); font-weight: 600; padding: 14px 10px 6px;
@@ -331,11 +335,12 @@
   @media (min-width: 721px) {
     :root[data-rail="collapsed"] .app { grid-template-columns: 64px 1fr; }
     :root[data-rail="collapsed"] .rail { padding: 16px 8px; align-items: stretch; }
-    :root[data-rail="collapsed"] .rail-toggle { margin: -4px auto 2px; }
-    :root[data-rail="collapsed"] .rail-toggle svg { transform: rotate(180deg); }
-    :root[data-rail="collapsed"] .brand { flex-direction: column; justify-content: center; padding: 4px 0 12px; gap: 6px; }
+    /* M17: the expander chevron is REMOVED from the compressed rail — it reads as
+       chrome, not an icon. Expansion moves to the brand logo (click to expand;
+       cursor + title set in JS). The compressed rail is a clean icon column. */
+    :root[data-rail="collapsed"] .rail-toggle { display: none; }
+    :root[data-rail="collapsed"] .brand { flex-direction: column; justify-content: center; padding: 4px 0 12px; gap: 6px; cursor: pointer; }
     :root[data-rail="collapsed"] .brand .name { display: none; }
-    :root[data-rail="collapsed"] .rail-toggle { margin: 0 auto; }
     :root[data-rail="collapsed"] .nav-item { justify-content: center; padding: 0; gap: 0; }
     :root[data-rail="collapsed"] .nav-item .label,
     :root[data-rail="collapsed"] .nav-item .kbd,
@@ -932,6 +937,12 @@
   /* ---- Page card grid + control DSL ------------------------------------- */
   .page-host { min-height: 40px; }
   .v2grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; align-items: start; }
+  /* M17 — Settings reads as one card system: equal-height grid rows (a short
+     card no longer leaves a broken gap beside a tall neighbour) + a uniform
+     card anatomy (title/sub, then a body that fills to the row height). */
+  .settings-page .v2grid { align-items: stretch; }
+  .settings-page .v2card { display: flex; flex-direction: column; }
+  .settings-page .v2card-body { flex: 1 1 auto; }
   .v2card {
     padding: 16px 18px; border: 1px solid var(--edge); border-radius: var(--radius);
     background: var(--surface); box-shadow: var(--card-shadow);
@@ -1648,6 +1659,30 @@
   .modeseg-btn:hover:not(:disabled) { color: var(--ink); }
   .modeseg-btn[aria-pressed="true"] { background: var(--surface); color: var(--ink); border-color: var(--edge-strong); }
   .modeseg-btn:disabled { opacity: .5; cursor: not-allowed; }
+
+  /* ---- M17 — single workspace switcher button + rightward pop-out ---------
+     Replaces the multi-button data-ws strip (which wrapped + read as broken).
+     One button shows the ACTIVE workspace's icon + name; click pops a menu (the
+     rail-flyout glass) listing ALL workspaces (builtins + user), active marked.
+     Works in both rail states — the collapsed rail renders the icon-only twin
+     via #railIcons. */
+  .ws-switch-btn {
+    display: flex; align-items: center; gap: 8px; width: 100%;
+    min-height: 32px; padding: 0 9px;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm);
+    background: var(--surface2); color: var(--ink); cursor: pointer;
+    transition: background .16s ease, color .16s ease, border-color .16s ease;
+  }
+  .ws-switch-btn:hover, .ws-switch-btn[aria-expanded="true"] { border-color: var(--edge-strong); background: var(--surface); }
+  .ws-switch-btn .ws-ic { display: inline-flex; align-items: center; width: 18px; height: 18px; flex: none; color: var(--acc); }
+  .ws-switch-btn .ws-ic svg { width: 18px; height: 18px; }
+  .ws-switch-btn .ws-name { flex: 1; text-align: left; font-size: 12.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ws-switch-btn .ws-caret { display: inline-flex; align-items: center; width: 14px; height: 14px; flex: none; color: var(--ink3); }
+  .ws-switch-btn .ws-caret svg { width: 14px; height: 14px; transform: rotate(180deg); }   /* chevron points right (opens rightward) */
+  /* Icon slot for flyout / pop-out rows (workspace switcher + operator menu). */
+  .rail-flyout-item .ic { display: inline-flex; align-items: center; width: 18px; height: 18px; flex: none; opacity: .9; color: var(--ink2); }
+  .rail-flyout-item .ic svg { width: 18px; height: 18px; }
+  .rail-flyout-item[aria-current="page"] .ic { color: var(--acc); opacity: 1; }
 
   /* Extra mono metadata on list rows — hidden in Standard, revealed in Pro. */
   .exp-meta {
@@ -3310,32 +3345,111 @@
     if (uid === 'explore') { applySurface('explore'); return; }
     location.hash = '#/w/' + uid;   // hashchange → route()
   }
-  // syncModeSeg keeps its signature (callers pass a mode) but reflects the ACTIVE
-  // WORKSPACE onto the switcher buttons via data-ws.
+  // The icon glyph for a workspace (its own icon, falling back to work).
+  function wsIcon(ws) { return (ws && (ICONS[ws.icon] || ICONS.work)) || ICONS.work || ''; }
+  // M17 — the switcher is now ONE button (expanded rail) showing the active
+  // workspace; syncModeSeg repaints that button's icon + name and keeps the
+  // collapsed-rail twin + any open pop-out in sync. (Signature kept for callers.)
   function syncModeSeg() {
     var active = activeWorkspaceUid();
-    var btns = document.querySelectorAll('#modeSeg .modeseg-btn');
-    for (var i = 0; i < btns.length; i++) {
-      btns[i].setAttribute('aria-pressed', btns[i].getAttribute('data-ws') === active ? 'true' : 'false');
+    var ws = wsFind(active) || { uid: active, name: active, icon: 'work' };
+    var btn = document.querySelector('#modeSeg .ws-switch-btn');
+    if (btn) {
+      var ico = btn.querySelector('.ws-ic'); if (ico) { ico.innerHTML = wsIcon(ws); }
+      var nm = btn.querySelector('.ws-name'); if (nm) { nm.textContent = ws.name || ws.uid; }
+      btn.setAttribute('aria-label', 'Workspace: ' + (ws.name || ws.uid) + ' — switch workspace');
+      btn.setAttribute('title', (ws.name || ws.uid) + ' · switch workspace');
     }
+    if (typeof syncRailIcons === 'function') { syncRailIcons(); }
+    syncWsSwitchPop();
   }
+  // A single workspace button (M17): the active workspace's icon + name; click
+  // pops a rightward menu listing ALL workspaces. Replaces the multi-button
+  // data-ws strip (which wrapped into rows and read as broken).
   function buildModeSeg() {
     var wrap = document.getElementById('modeSeg');
     if (!wrap) { return; }
     wrap.textContent = '';
-    var list = wsSwitcherList();
-    for (var i = 0; i < list.length; i++) {
-      var s = list[i];
-      var b = el('button', {
-        'class': 'modeseg-btn', type: 'button', 'data-ws': s.uid, 'aria-pressed': 'false',
-        title: s.name + (s.builtin === false || s.source === 'user' ? ' · workspace' : '')
-      }, [s.name]);
-      (function (id) { b.addEventListener('click', function () { activateWorkspace(id); }); })(s.uid);
-      wrap.appendChild(b);
-    }
-    // >2 workspaces: let the switcher wrap into rows instead of squeezing.
-    wrap.classList.toggle('modeseg-wrap', list.length > 2);
+    wrap.classList.remove('modeseg-wrap');
+    var b = el('button', { 'class': 'modeseg-btn ws-switch-btn', type: 'button', 'aria-haspopup': 'menu', 'aria-expanded': 'false' }, [
+      el('span', { 'class': 'ws-ic', 'aria-hidden': 'true' }),
+      el('span', { 'class': 'ws-name', text: 'Workspace' }),
+      el('span', { 'class': 'ws-caret', 'aria-hidden': 'true', html: ICONS.chevron || '' })
+    ]);
+    b.addEventListener('click', function (e) { e.stopPropagation(); toggleWsSwitchPop(b); });
+    wrap.appendChild(b);
     syncModeSeg();
+  }
+
+  // ---- Workspace switcher pop-out (M17) — one button, rightward menu --------
+  // The SAME menu opens from the expanded-rail button and the collapsed-rail
+  // icon. Reuses the rail-flyout glass, positioned flush to the rail's right
+  // edge (the M11 idiom). Lists every workspace (builtins + user); active marked.
+  var wsSwitchPop = null, wsSwitchAnchor = null;
+  function ensureWsSwitchPop() {
+    if (wsSwitchPop) { return wsSwitchPop; }
+    wsSwitchPop = el('div', { id: 'wsSwitchPop', 'class': 'rail-flyout', role: 'menu', 'aria-label': 'Workspaces' });
+    wsSwitchPop.hidden = true;
+    wsSwitchPop.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') { var a = wsSwitchAnchor; closeWsSwitchPop(); if (a) { a.focus(); } }
+    });
+    document.body.appendChild(wsSwitchPop);
+    return wsSwitchPop;
+  }
+  function buildWsSwitchPop() {
+    var pop = ensureWsSwitchPop();
+    pop.textContent = '';
+    pop.appendChild(el('div', { 'class': 'rail-flyout-h', text: 'Workspaces' }));
+    var active = activeWorkspaceUid();
+    wsSwitcherList().forEach(function (ws) {
+      var row = el('button', {
+        'class': 'rail-flyout-item', type: 'button', role: 'menuitemradio', 'data-ws': ws.uid,
+        'aria-current': ws.uid === active ? 'page' : 'false', 'aria-checked': ws.uid === active ? 'true' : 'false'
+      }, [
+        el('span', { 'class': 'ic', 'aria-hidden': 'true', html: wsIcon(ws) }),
+        el('span', { 'class': 'label', text: ws.name || ws.uid })
+      ]);
+      (function (uid) { row.addEventListener('click', function () { closeWsSwitchPop(); activateWorkspace(uid); }); })(ws.uid);
+      pop.appendChild(row);
+    });
+    applyPosture(pop);
+  }
+  function syncWsSwitchPop() {
+    if (!wsSwitchPop || wsSwitchPop.hidden) { return; }
+    var active = activeWorkspaceUid();
+    var rows = wsSwitchPop.querySelectorAll('.rail-flyout-item');
+    for (var i = 0; i < rows.length; i++) {
+      var on = rows[i].getAttribute('data-ws') === active;
+      rows[i].setAttribute('aria-current', on ? 'page' : 'false');
+      rows[i].setAttribute('aria-checked', on ? 'true' : 'false');
+    }
+  }
+  function closeWsSwitchPop() {
+    if (wsSwitchAnchor) { wsSwitchAnchor.setAttribute('aria-expanded', 'false'); }
+    wsSwitchAnchor = null;
+    if (wsSwitchPop && !wsSwitchPop.hidden) { wsSwitchPop.hidden = true; }
+  }
+  function openWsSwitchPop(anchorBtn) {
+    buildWsSwitchPop();
+    var pop = wsSwitchPop;
+    var railEl = document.querySelector('.rail'), aRect = anchorBtn.getBoundingClientRect(), rRect = railEl.getBoundingClientRect();
+    pop.hidden = false;
+    pop.style.left = Math.round(rRect.right - 1) + 'px';
+    var maxTop = window.innerHeight - pop.offsetHeight - 8;
+    pop.style.top = Math.max(8, Math.min(Math.round(aRect.top), maxTop)) + 'px';
+    wsSwitchAnchor = anchorBtn;
+    anchorBtn.setAttribute('aria-expanded', 'true');
+    var first = pop.querySelector('.rail-flyout-item[aria-current="page"]') || pop.querySelector('.rail-flyout-item');
+    if (first) { first.focus(); }
+  }
+  function toggleWsSwitchPop(anchorBtn) {
+    if (wsSwitchPop && !wsSwitchPop.hidden) { closeWsSwitchPop(); }
+    else { if (typeof closeRailOpsPop === 'function') { closeRailOpsPop(); } if (typeof closeRailFlyout === 'function') { closeRailFlyout(); } openWsSwitchPop(anchorBtn); }
+  }
+  if (typeof document !== 'undefined') {
+    document.addEventListener('click', function (e) {
+      if (wsSwitchPop && !wsSwitchPop.hidden && !e.target.closest('#wsSwitchPop') && !e.target.closest('.ws-switch-btn') && !e.target.closest('[data-railic="ws-switch"]')) { closeWsSwitchPop(); }
+    }, true);
   }
   // Async model load — never blocks first paint; rebuilds the switcher + rail
   // icons, and re-routes if we are sitting on a user-workspace route that only
@@ -3356,6 +3470,23 @@
     }).catch(function () { /* builtins already usable */ });
   }
   if (typeof window !== 'undefined') { window.CRUX_WS_RELOAD = loadWorkspaceModel; }
+  // M17 — live-reload the workspace model when a console:workspace:/console:page:
+  // config fact is stored (an operator/MCP writes or edits a page). The switcher,
+  // rail and any open #/w route pick it up with no manual refresh. Refresh always
+  // works too (boot's loadWorkspaceModel); this is the "ideally live" upgrade.
+  var __wsLiveES = null, __wsLiveTimer = null;
+  function initWorkspaceLiveReload() {
+    if (__wsLiveES || typeof EventSource === 'undefined') { return; }
+    try { __wsLiveES = new EventSource('/v1/events/stream?types=fact.stored'); }
+    catch (e) { __wsLiveES = null; return; }
+    __wsLiveES.addEventListener('fact.stored', function (ev) {
+      var entity = '';
+      try { entity = (JSON.parse(ev.data || '{}').entity) || ''; } catch (e2) { entity = ''; }
+      if (entity.indexOf('console:workspace:') !== 0 && entity.indexOf('console:page:') !== 0) { return; }
+      if (__wsLiveTimer) { clearTimeout(__wsLiveTimer); }
+      __wsLiveTimer = setTimeout(function () { __wsLiveTimer = null; loadWorkspaceModel(); }, 600);
+    });
+  }
   // Set the mode WITHOUT re-rendering (used by route() when a deep link to a real
   // destination auto-switches the reader back to a console density). Presentation only.
   function setModeSilently(id) {
@@ -3626,18 +3757,20 @@
     railFlyoutAnchor = null;
   }
   function scheduleRailFlyoutClose() { clearTimeout(railFlyoutTimer); railFlyoutTimer = setTimeout(closeRailFlyout, 220); }
-  function openRailFlyout(destId, anchorBtn) {
-    var pages = railFlyoutPages(destId);
-    if (!pages.length) { closeRailFlyout(); return; }   // single-page destinations (canvas / rings / sitemap): no flyout
-    var dest = DEST_INDEX[destId], fo = ensureRailFlyout();
+  function railIsCollapsed() { return document.documentElement.getAttribute('data-rail') === 'collapsed'; }
+  // Generic flyout renderer (M17): a label header + text rows. Each page =
+  // { key, title, current, go }. Positioned flush to the rail's right edge. The
+  // built-in AND workspace rails both drive this, so compressed navigation is
+  // identical for Command and any user workspace.
+  function railFlyoutRender(anchorBtn, label, pages) {
+    if (!pages || !pages.length) { closeRailFlyout(); return; }
+    var fo = ensureRailFlyout();
     clearTimeout(railFlyoutTimer);
     fo.textContent = '';
-    fo.appendChild(el('div', { 'class': 'rail-flyout-h', text: dest ? dest.label : destId }));
-    var h = (location.hash || '').replace(/^#\/?/, '').split('?')[0].split('/');
-    var activePage = h[0] === destId ? h[1] : null;
+    fo.appendChild(el('div', { 'class': 'rail-flyout-h', text: label }));
     pages.forEach(function (p) {
-      var row = el('button', { 'class': 'rail-flyout-item', type: 'button', role: 'menuitem', 'data-page': p.id, 'aria-current': p.id === activePage ? 'page' : 'false' }, [el('span', { 'class': 'label', text: p.title })]);
-      (function (pid) { row.addEventListener('click', function () { location.hash = '#/' + destId + '/' + pid; closeRailFlyout(); }); })(p.id);
+      var row = el('button', { 'class': 'rail-flyout-item', type: 'button', role: 'menuitem', 'data-page': p.key, 'aria-current': p.current ? 'page' : 'false' }, [el('span', { 'class': 'label', text: p.title })]);
+      row.addEventListener('click', function () { p.go(); closeRailFlyout(); });
       fo.appendChild(row);
     });
     applyPosture(fo);
@@ -3649,6 +3782,36 @@
     if (railFlyoutAnchor && railFlyoutAnchor !== anchorBtn) { railFlyoutAnchor.setAttribute('aria-expanded', 'false'); }
     railFlyoutAnchor = anchorBtn;
     anchorBtn.setAttribute('aria-expanded', 'true');
+  }
+  // Built-in destination flyout (Command surface).
+  function openRailFlyout(destId, anchorBtn) {
+    var pages = railFlyoutPages(destId);
+    if (!pages.length) { closeRailFlyout(); return; }   // single-page destinations (canvas / rings / sitemap): no flyout
+    var dest = DEST_INDEX[destId];
+    var h = (location.hash || '').replace(/^#\/?/, '').split('?')[0].split('/');
+    var activePage = h[0] === destId ? h[1] : null;
+    railFlyoutRender(anchorBtn, dest ? dest.label : destId, pages.map(function (p) {
+      return { key: p.id, title: p.title, current: p.id === activePage, go: function () { location.hash = '#/' + destId + '/' + p.id; } };
+    }));
+  }
+  // Workspace destination pages (M17 bug fix): resolve each pageUid's title from
+  // the config model (falling back to a registry page title, then the uid).
+  function workspaceDestPages(dest) {
+    return (dest && dest.pages || []).map(function (pageUid) {
+      var pdef = (WS_MODEL && WS_MODEL.pages && WS_MODEL.pages[pageUid]) || null;
+      var title = pdef ? (pdef.title || pageUid) : ((PAGES[pageUid] && PAGES[pageUid].title) || pageUid);
+      return { uid: pageUid, title: title };
+    });
+  }
+  // Workspace destination flyout — the config-driven twin of openRailFlyout.
+  function openWorkspaceRailFlyout(ws, dest, anchorBtn) {
+    var pages = workspaceDestPages(dest);
+    if (pages.length < 2) { closeRailFlyout(); return; }   // single-page group: click navigates directly
+    var h = (location.hash || '').replace(/^#\/?/, '').split('?')[0].split('/');
+    var activePage = (h[0] === 'w' && h[1] === ws.uid) ? h[2] : null;
+    railFlyoutRender(anchorBtn, dest.label || dest.id, pages.map(function (p) {
+      return { key: p.uid, title: p.title, current: p.uid === activePage, go: function () { location.hash = '#/w/' + ws.uid + '/' + p.uid; } };
+    }));
   }
   function railFlyoutFocusFirst() {
     if (railFlyout && !railFlyout.hidden) { var r = railFlyout.querySelector('.rail-flyout-item'); if (r) { r.focus(); return true; } }
@@ -3697,6 +3860,20 @@
     railOpsPop = el('div', { id: 'railOpsPop', 'class': 'rail-flyout', role: 'menu', 'aria-label': 'Operator options' });
     railOpsPop.hidden = true;
     railOpsPop.appendChild(el('div', { 'class': 'rail-flyout-h', text: 'Operator options' }));
+    // M17 — nav entries: Studio + Options (both navigate). Studio → the tile
+    // builder; Options → the Settings page. They sit above Theme / Connection.
+    var nsec = el('div', { 'class': 'rail-ops-sec rail-ops-nav' });
+    var mkNav = function (label, iconHtml, hash) {
+      var row = el('button', { 'class': 'rail-flyout-item', type: 'button', role: 'menuitem' }, [
+        el('span', { 'class': 'ic', 'aria-hidden': 'true', html: iconHtml || '' }),
+        el('span', { 'class': 'label', text: label })
+      ]);
+      row.addEventListener('click', function () { closeRailOpsPop(); location.hash = hash; });
+      return row;
+    };
+    nsec.appendChild(mkNav('Studio', ICONS.canvas || '', '#/canvas/studio'));
+    nsec.appendChild(mkNav('Options', ICONS.settings || '', '#/system/cx-settings'));
+    railOpsPop.appendChild(nsec);
     var tsec = el('div', { 'class': 'rail-ops-sec' });
     tsec.appendChild(el('div', { 'class': 'rail-ops-label', text: 'Theme' }));
     var trow = el('div', { 'class': 'rail-ops-themes', role: 'group', 'aria-label': 'Theme' });
@@ -3736,51 +3913,34 @@
     anchorBtn.setAttribute('aria-expanded', 'true');
     var first = pop.querySelector('.theme-btn'); if (first) { first.focus(); }
   }
-  // Reflect the current surface (Command | Explorer) on the collapsed icons.
+  // Reflect the ACTIVE workspace on the collapsed-rail single switcher icon.
   function syncRailIcons() {
     var wrap = document.getElementById('railIcons');
     if (!wrap) { return; }
-    var cmd = wrap.querySelector('[data-railic="command"]');
-    var exp = wrap.querySelector('[data-railic="explorer"]');
-    if (!cmd || !exp) { return; }
-    var h = (location.hash || '').replace(/^#\/?/, '');
-    var mode = document.documentElement.getAttribute('data-mode');
+    var wsb = wrap.querySelector('[data-railic="ws-switch"]');
+    if (!wsb) { return; }
     var active = activeWorkspaceUid();
-    exp.setAttribute('aria-pressed', active === 'explore' ? 'true' : 'false');
-    cmd.setAttribute('aria-pressed', active === 'command' ? 'true' : 'false');
-    var wsBtns = wrap.querySelectorAll('[data-railic="ws"]');
-    for (var i = 0; i < wsBtns.length; i++) {
-      wsBtns[i].setAttribute('aria-pressed', wsBtns[i].getAttribute('data-ws') === active ? 'true' : 'false');
-    }
+    var ws = wsFind(active) || { uid: active, name: active, icon: 'work' };
+    wsb.innerHTML = wsIcon(ws);
+    wsb.setAttribute('aria-label', 'Workspace: ' + (ws.name || ws.uid) + ' — switch');
+    wsb.setAttribute('title', (ws.name || ws.uid) + ' · switch workspace');
   }
+  // M17 — the collapsed rail carries just TWO controls: a single workspace
+  // switcher (icon of the active workspace, opens the SAME rightward pop-out as
+  // the expanded button) and the operator-options button. Command / Explorer are
+  // workspaces inside the pop-out now, so the icon column stays short + clean.
   function buildRailIcons() {
     var wrap = document.getElementById('railIcons');
     if (!wrap) { return; }
     wrap.textContent = '';
-    // Command — the ops-console surface (mirrors the rail-meta Command toggle).
-    var cmd = el('button', { 'class': 'rail-ic', type: 'button', 'data-railic': 'command', 'aria-label': 'Command surface', title: 'Command', 'aria-pressed': 'false' });
-    cmd.innerHTML = RAIL_IC.command;
-    cmd.addEventListener('click', function () { closeRailOpsPop(); applySurface('command'); syncRailIcons(); });
-    // Explorer — the corpus-search destination (#/explorer, railHidden).
-    var exp = el('button', { 'class': 'rail-ic', type: 'button', 'data-railic': 'explorer', 'aria-label': 'Explorer', title: 'Explorer', 'aria-pressed': 'false' });
-    exp.innerHTML = ICONS.search;
-    exp.addEventListener('click', function () { closeRailOpsPop(); location.hash = '#/explorer'; });
-    wrap.appendChild(cmd); wrap.appendChild(exp);
-    // User workspaces (M16b) — an icon button per configured workspace, so the
-    // switcher stays reachable when the rail is collapsed (rail-meta hidden).
-    var list = wsSwitcherList();
-    for (var i = 0; i < list.length; i++) {
-      var ws = list[i];
-      if (ws.uid === 'command' || ws.uid === 'explore') { continue; }
-      var wb = el('button', { 'class': 'rail-ic', type: 'button', 'data-railic': 'ws', 'data-ws': ws.uid, 'aria-label': ws.name + ' workspace', title: ws.name, 'aria-pressed': 'false' });
-      wb.innerHTML = (ICONS[ws.icon] || ICONS.work || '');
-      (function (uid) { wb.addEventListener('click', function () { closeRailOpsPop(); activateWorkspace(uid); }); })(ws.uid);
-      wrap.appendChild(wb);
-    }
-    // Operator options — opens the glass popup (theme + connection).
+    // Single workspace switcher.
+    var wsb = el('button', { 'class': 'rail-ic', type: 'button', 'data-railic': 'ws-switch', 'aria-haspopup': 'menu', 'aria-expanded': 'false', 'aria-label': 'Switch workspace', title: 'Switch workspace' });
+    wsb.addEventListener('click', function (e) { e.stopPropagation(); toggleWsSwitchPop(wsb); });
+    wrap.appendChild(wsb);
+    // Operator options — opens the glass popup (Studio · Options · Theme · Connection).
     var ops = el('button', { 'class': 'rail-ic', type: 'button', 'data-railic': 'ops', 'aria-label': 'Operator options', title: 'Operator options', 'aria-haspopup': 'menu', 'aria-expanded': 'false' });
     ops.innerHTML = RAIL_IC.ops;
-    ops.addEventListener('click', function (e) { e.stopPropagation(); if (railOpsPop && !railOpsPop.hidden) { closeRailOpsPop(); } else { openRailOpsPop(ops); } });
+    ops.addEventListener('click', function (e) { e.stopPropagation(); if (railOpsPop && !railOpsPop.hidden) { closeRailOpsPop(); } else { closeWsSwitchPop(); openRailOpsPop(ops); } });
     wrap.appendChild(ops);
     syncRailIcons();
   }
@@ -3816,8 +3976,15 @@
       btn.appendChild(el('span', { 'class': 'label', text: item.label }));
       if (item.key) { btn.appendChild(el('span', { 'class': 'kbd', text: item.key })); }
       (function (id, b) {
-        b.addEventListener('click', function () { location.hash = '#/' + id; });
-        // Flyout only for destinations that carry pages (the sub-pill set).
+        var hasPages = railFlyoutPages(id).length > 1;
+        b.addEventListener('click', function () {
+          // M17 — in the compressed rail a dest icon CLICK opens the flyout (the
+          // primary compressed nav: works for touch/keyboard, not just hover).
+          // Expanded, click navigates (the sub-nav pill row shows the pages).
+          if (railIsCollapsed() && hasPages) { openRailFlyout(id, b); return; }
+          location.hash = '#/' + id;
+        });
+        // Flyout on hover/focus for destinations that carry pages (the sub-pill set).
         if (railFlyoutPages(id).length) {
           b.setAttribute('aria-haspopup', 'true');
           b.setAttribute('aria-expanded', 'false');
@@ -3952,6 +4119,17 @@
       btn.innerHTML = ICONS.chevron;
       btn.addEventListener('click', function () {
         applyRail(document.documentElement.getAttribute('data-rail') === 'collapsed' ? 'open' : 'collapsed');
+      });
+    }
+    // M17 — the compressed rail drops the chevron (icons only). Expansion moves
+    // to the brand logo: click it while collapsed to open the rail (the toggle
+    // in the brand row still collapses it when expanded).
+    var brand = document.querySelector('.brand');
+    if (brand) {
+      brand.addEventListener('click', function (e) {
+        if (document.documentElement.getAttribute('data-rail') !== 'collapsed') { return; }
+        if (e.target && e.target.closest && e.target.closest('#railToggle')) { return; }
+        applyRail('open');
       });
     }
     applyRail(readRail());
@@ -4227,7 +4405,8 @@
     }
     if (destId !== 'overwatch') { content.appendChild(buildSubnav(destId, pageId)); }
     // Settings owns the Command-density switch (moved off the top-level toggle).
-    if (destId === 'system' && page && page.id === 'cx-settings') { content.appendChild(buildDensityCard()); content.appendChild(buildThemeCard()); }
+    // M17 — mark the region so its cards render as one equal-height grid system.
+    if (destId === 'system' && page && page.id === 'cx-settings') { content.classList.add('settings-page'); content.appendChild(buildDensityCard()); content.appendChild(buildThemeCard()); }
     // Overwatch IS its landing (tiles + view tabs) — don't also render the resolved
     // page below it (that duplicated the Activity page's Live-activity card).
     if (destId !== 'overwatch') {
@@ -4274,15 +4453,40 @@
       var btn = el('button', { 'class': 'nav-item', type: 'button', 'data-wsdest': d.id, 'aria-current': (activeDest && activeDest.id === d.id) ? 'page' : 'false', title: d.label });
       btn.innerHTML = ICONS[d.icon] || ICONS.work || '';
       btn.appendChild(el('span', { 'class': 'label', text: d.label }));
-      (function (dest) {
-        btn.addEventListener('click', function () {
+      (function (dest, b) {
+        var multi = workspaceDestPages(dest).length > 1;
+        b.addEventListener('click', function () {
+          // M17 — same idiom as the built-in rail: compressed click on a group
+          // with >1 page opens the flyout; otherwise navigate to its first page.
+          if (railIsCollapsed() && multi) { openWorkspaceRailFlyout(ws, dest, b); return; }
           var first = (dest.pages && dest.pages[0]) || null;
           location.hash = first ? ('#/w/' + ws.uid + '/' + first) : ('#/w/' + ws.uid);
         });
-      })(d);
+        if (multi) {
+          b.setAttribute('aria-haspopup', 'true');
+          b.setAttribute('aria-expanded', 'false');
+          b.addEventListener('mouseenter', function () { openWorkspaceRailFlyout(ws, dest, b); });
+          b.addEventListener('focus', function () { openWorkspaceRailFlyout(ws, dest, b); });
+          b.addEventListener('mouseleave', scheduleRailFlyoutClose);
+        }
+      })(d, btn);
       nav.appendChild(btn);
     });
     applyPosture(nav);
+  }
+  // The pages of a workspace group as a sub-nav pill row — the config-driven twin
+  // of buildSubnav. THIS is the M17 bug fix: before, a workspace's pages appeared
+  // nowhere (the rail showed only the group label), so a dest like "Main" read as
+  // empty and a newly added page never surfaced. Now every page is a visible,
+  // navigable pill (expanded rail) + a flyout row (compressed rail).
+  function buildWorkspaceSubnav(ws, dest, activePageUid) {
+    var row = el('div', { 'class': 'subnav', role: 'tablist', 'aria-label': 'Pages in this group' });
+    workspaceDestPages(dest).forEach(function (p) {
+      var pill = el('button', { 'class': 'pill', type: 'button', 'data-page': p.uid, 'aria-current': p.uid === activePageUid ? 'page' : 'false' }, [p.title]);
+      (function (uid) { pill.addEventListener('click', function () { location.hash = '#/w/' + ws.uid + '/' + uid; }); })(p.uid);
+      row.appendChild(pill);
+    });
+    return row;
   }
   function renderWorkspace(wsUid, pageUid) {
     var R = (typeof window !== 'undefined') ? window.CruxRender : null;
@@ -4318,6 +4522,11 @@
     if (!pdef) {
       renderWorkspaceEmpty(content, ws);
     } else {
+      // M17 bug fix — surface the group's pages as a sub-nav pill row (the
+      // built-in console has always had this; the workspace path never did, so
+      // pages were invisible/unreachable). Every page renders through the SAME
+      // builders as the console (real data).
+      if (dest && workspaceDestPages(dest).length) { content.appendChild(buildWorkspaceSubnav(ws, dest, pageU)); }
       var host = el('div', { 'class': 'page-host', id: 'pageHost' });
       content.appendChild(host);
       if (R && R.renderWorkspacePage) { R.renderWorkspacePage(host, pdef, { summary: BOOT.summary }); }
@@ -4375,6 +4584,10 @@
   // — mode is presentation, not a route). #/documents[/<docId>] keeps the reader.
   function route() {
     resetRingsTopbar();   // M16a: normalise the topbar heading before any branch paints
+    if (typeof closeRailFlyout === 'function') { closeRailFlyout(); }
+    if (typeof closeWsSwitchPop === 'function') { closeWsSwitchPop(); }
+    if (typeof closeRailOpsPop === 'function') { closeRailOpsPop(); }
+    var contentEl0 = document.getElementById('content'); if (contentEl0) { contentEl0.classList.remove('settings-page'); }
     var h = (location.hash || '').replace(/^#\/?/, '');
     var qi = h.indexOf('?'); if (qi >= 0) { h = h.slice(0, qi); }
     var parts = h.split('/').filter(Boolean);
@@ -4481,6 +4694,7 @@
         // the switcher + rail icons and re-routes if we booted onto a #/w/ route.
         // Built-ins are already usable, so a slow/absent load costs nothing.
         loadWorkspaceModel();
+        initWorkspaceLiveReload();   // M17 — live pick-up of new/edited workspace + page facts
         // Derive posture from the server, then re-render with it (nav + pills +
         // landing + mutating controls all follow). Never blocks the first paint.
         return derivePostureFromServer().then(applyDerivedPosture);
