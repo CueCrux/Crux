@@ -472,7 +472,9 @@ function extractThemeVars(theme) {
     ['POST', '/v1/query/text-search/expand'],
     ['POST', '/v1/query/graph-expand'],
     ['POST', '/v1/query/time-range'],
-    ['POST', '/v1/console/engine/search']
+    ['POST', '/v1/console/engine/search'],
+    ['POST', '/v1/studio/pack/build'],
+    ['POST', '/v1/studio/pack/verify']
   ];
   // CruxSession (hosted BFF /api/auth/*) carries exactly ONE non-GET call —
   // the logout POST. It is a platform-session call, not a daemon mutation, so
@@ -1455,13 +1457,17 @@ function extractThemeVars(theme) {
   check(/window\.CruxApiRead\s*=\s*CruxApiRead/.test(apiSrc), '[read-post] api.js must expose window.CruxApiRead');
   check(/window\.CRUX_READ_POST_ROUTES\s*=\s*READ_POST_ROUTES/.test(apiSrc), '[read-post] api.js must expose window.CRUX_READ_POST_ROUTES');
 
-  // The curated read-POST set the M11 plan authorises — the ONLY read POSTs.
+  // The curated read-POST set. M11 authorised the query/search POSTs; M15
+  // (console-surfaces-remediation) adds the two Studio pack read POSTs (build +
+  // verify) — pure transforms/validators, no store mutation.
   const EXPECTED = [
     ['POST', '/v1/query/text-search'],
     ['POST', '/v1/query/text-search/expand'],
     ['POST', '/v1/query/graph-expand'],
     ['POST', '/v1/query/time-range'],
-    ['POST', '/v1/console/engine/search']
+    ['POST', '/v1/console/engine/search'],
+    ['POST', '/v1/studio/pack/build'],
+    ['POST', '/v1/studio/pack/verify']
   ];
   const arrM = apiSrc.match(/const READ_POST_ROUTES = Object\.freeze\(\[([\s\S]*?)\]\);/);
   check(!!arrM, '[read-post] api.js must declare the READ_POST_ROUTES array');
@@ -2897,6 +2903,112 @@ function extractThemeVars(theme) {
   }
 
   notes.push('canvas studio (M14): ported diagram-builder as a fourth canvas view (#/canvas/studio); pure doc subset round-trips + sanitises (same-origin web src, known-route API bind, dangling-link drop, dropped 3D/PDF kinds); NO innerHTML / NO raw fetch in the engine; boards + designs persist daemon-side via operatorGatedCall→consoleFactsAdd under console:tileboard:/console:tiledesign:; mock-DOM drive builds a seeded 5-tile board incl. a same-origin iframe; read-only posture paints the banner + disables Save.');
+
+  // ---- M15: live tiles, automated-data-handling kinds, packs, settings ----
+  // (a) new pure helpers (smoke-tested, no DOM).
+  check(render.tstudioCoverageNote(0.42).low === true && /corpus may not cover this/.test(render.tstudioCoverageNote(0.42).text),
+    '[studio-m15] coverage below 0.5 is flagged honestly');
+  check(render.tstudioCoverageNote(0.8).low === false, '[studio-m15] coverage at/above 0.5 is not flagged');
+  var capsBoard = { nodes: [ { kind: 'api', api: { route: '/v1/facts/list' } }, { kind: 'search', search: { route: '/v1/query/text-search' } }, { kind: 'receipts', api: { route: '/v1/receipts/list' } } ] };
+  var caps = render.tstudioDerivePackCaps(capsBoard);
+  check(caps.indexOf('integrations:read') >= 0 && caps.indexOf('facts:read') >= 0 && caps.indexOf('admin:read') >= 0,
+    '[studio-m15] derived caps include the minimal read set (integrations:read + facts:read + admin:read for a receipts tile)');
+  check(JSON.stringify(caps) === JSON.stringify(caps.slice().sort()), '[studio-m15] derived caps are sorted + deterministic');
+  check(render.tstudioTileEvents({ kind: 'search' }).indexOf('fact.stored') >= 0, '[studio-m15] a search tile depends on fact.stored for live refresh');
+  check(render.tstudioTileEvents({ kind: 'api', api: { route: '/v1/activity' } }).indexOf('activity.appended') >= 0, '[studio-m15] an activity-bound tile depends on activity.appended');
+  check(render.tstudioTileEvents({ kind: 'extensions' }).length === 0, '[studio-m15] the extensions tile takes no live event (registry rarely changes)');
+  var ph = render.tstudioFindPlaceholders({ search: { query: '{{q}} in {{scope}}' } });
+  check(ph.indexOf('q') >= 0 && ph.indexOf('scope') >= 0, '[studio-m15] parameterised designs expose {{placeholder}} fields');
+  var filled = render.tstudioApplyPlaceholders({ q: '{{q}}' }, { q: 'execplan' });
+  check(filled.q === 'execplan', '[studio-m15] placeholders are substituted on instantiate');
+  var st = render.tstudioNormalizeSettings({ grid: 999, accent: 'nope', title: 'T' });
+  check(st.grid === 20 && st.accent === 'cool' && st.title === 'T', '[studio-m15] settings normalise: unknown grid/accent fall back, title kept');
+  var payload = render.tstudioBuildStudioPayload('b1', render.tstudioNormalizeDoc({ nodes: [{ id: 'x', kind: 'note' }] }), [], { title: 'Board' });
+  check(payload.schema === 'crux.studio.v1' && payload.board.doc.nodes.length === 1 && payload.settings.title === 'Board',
+    '[studio-m15] a studio payload wraps the board doc + settings under crux.studio.v1');
+  // settings survive a serialize → normalize round-trip (persistence identity).
+  var withSettings = render.tstudioNormalizeDoc({ nodes: [], settings: { grid: 32, accent: 'ok', title: 'RT' } });
+  var rtSettings = render.tstudioNormalizeDoc(JSON.parse(render.tstudioSerializeDoc(withSettings))).settings;
+  check(rtSettings.grid === 32 && rtSettings.accent === 'ok' && rtSettings.title === 'RT', '[studio-m15] board settings survive the serialize→normalize round-trip');
+
+  // (b) pure content renderers against a mock document (el()/textContent only).
+  function withMockDoc(fn) {
+    var savedDoc = global.document;
+    global.document = {
+      createElement: mkEl, createElementNS: function (ns, tag) { return mkEl(tag); },
+      createTextNode: function (v) { return { nodeType: 3, textContent: String(v), childNodes: [] }; },
+      addEventListener: function () {}, removeEventListener: function () {}, body: mkEl('body')
+    };
+    try { return fn(); } finally { if (savedDoc === undefined) { delete global.document; } else { global.document = savedDoc; } }
+  }
+  withMockDoc(function () {
+    // search: coverage honesty text renders.
+    var sEl = render.tstudioRenderSearch({ coverage: { score: 0.42 }, results: [{ entity: 'e1', score: 1.2 }] }, { query: 'x' }, {});
+    var sTxt = collectAll(sEl).map(function (n) { return n.textContent || ''; }).join(' ');
+    check(/corpus may not cover this/.test(sTxt), '[studio-m15] the search tile renders the honest low-coverage note');
+    // corpus: store counts render.
+    var cEl = render.tstudioRenderCorpus({ stores: { facts: 5202, sessions: 76 }, integrations: { builtin_pack_count: 3 }, daemon: { build: { version: '0.5.46' } } });
+    var cTxt = collectAll(cEl).map(function (n) { return n.textContent || ''; }).join(' ');
+    check(/5,202/.test(cTxt) || /5202/.test(cTxt), '[studio-m15] the corpus tile renders the fact count');
+    // receipts: rows render.
+    var rEl = render.tstudioRenderReceipts({ rows: [{ kind: 'approval_decision', principal: 'operator', receipt_id: 'ad_ga_abc' }] });
+    check(collectAll(rEl).some(function (n) { return /approval_decision/.test(n.textContent || ''); }), '[studio-m15] the receipts tile renders newest rows');
+    // extensions: honest empty on a bare mirror.
+    var eEmpty = render.tstudioRenderExtensions({ count: 0, extensions: [] }, { operator: true });
+    check(/No extensions installed/.test(collectAll(eEmpty).map(function (n) { return n.textContent || ''; }).join(' ')), '[studio-m15] the extensions tile is honest-empty on a bare mirror + explains install');
+    // extensions: a fixture extension WITH a data endpoint renders capability
+    // chips + a capability-gated Invoke affordance (proves the outbound binding).
+    var eFix = render.tstudioRenderExtensions({ count: 1, extensions: [{ id: 'ext.quote', trust_tier: 'community_reviewed', manifest: { capabilities: ['facts:read'], external_tool_endpoint: 'https://x/', tools: [{ name: 'quote.daily' }] } }] }, { operator: true });
+    var fixAll = collectAll(eFix);
+    check(fixAll.some(function (n) { return /\btstudio-cap-chip\b/.test(n.className || '') && /facts:read/.test(n.textContent || ''); }), '[studio-m15] extensions tile renders capability chips');
+    check(fixAll.some(function (n) { return /\btstudio-ext-invoke\b/.test(n.className || ''); }), '[studio-m15] a declared data endpoint renders a capability-gated Invoke affordance (extension_outbound)');
+    // non-operator posture disables the Invoke affordance.
+    var eRo = render.tstudioRenderExtensions({ count: 1, extensions: [{ id: 'ext.quote', manifest: { capabilities: [], tools: [{ name: 't' }] } }] }, { operator: false });
+    check(collectAll(eRo).some(function (n) { return /\btstudio-ext-invoke\b/.test(n.className || '') && n.disabled === true; }), '[studio-m15] Invoke is disabled without operator posture');
+  });
+
+  // (c) the new kinds are registered with fixed routes + the live option.
+  ['search', 'corpus', 'receipts', 'extensions'].forEach(function (k) {
+    check(!!render.TSTUDIO_KINDS[k], '[studio-m15] kind "' + k + '" is registered');
+  });
+  check(/\['live', 'Live'\]/.test(renderSrc), '[studio-m15] the refresh options include a Live mode');
+  check(/new EventSource\('\/v1\/events\/stream'\)/.test(renderSrc), '[studio-m15] live tiles subscribe to /v1/events/stream (EventSource, not fetch)');
+  // pack routes ride the curated read-POST client (added to READ_POST in M15).
+  check(/window\.CruxApiRead\.studioPackBuild|CruxApiRead[\s\S]{0,40}studioPackBuild/.test(renderSrc) || /studioPackBuild/.test(renderSrc), '[studio-m15] export builds through the read-POST client (studioPackBuild)');
+  check(/studioPackVerify/.test(renderSrc), '[studio-m15] import verifies through the read-POST client (studioPackVerify)');
+
+  // (d) a seeded board with the new kinds builds without throwing (mock DOM).
+  try {
+    var savedDoc2 = global.document, savedWin2 = global.window;
+    global.document = {
+      createElement: mkEl, createElementNS: function (ns, tag) { return mkEl(tag); },
+      createTextNode: function (v) { return { nodeType: 3, textContent: String(v), childNodes: [] }; },
+      addEventListener: function () {}, removeEventListener: function () {}, elementFromPoint: function () { return null; }, body: mkEl('body')
+    };
+    global.window = {
+      CRUX_POSTURE: 'operator', CRUX_GET_ROUTES: ['/v1/console/summary', '/v1/receipts/list', '/v1/extensions'],
+      CruxApi: { get: function () { return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve({ stores: { facts: 1, sessions: 1 }, rows: [], extensions: [], count: 0 }); } }); } },
+      CruxApiGated: { consoleFactsAdd: function () { return Promise.resolve({ ok: true, status: 201 }); } },
+      CruxApiRead: { queryTextSearch: function () { return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ coverage: { score: 0 }, results: [] }); } }); } }
+    };
+    var seededM15 = { nodes: [
+      { id: 's', kind: 'search', x: 40, y: 40, w: 480, h: 240, search: { route: '/v1/query/text-search', query: 'q', tenant: 'default', tokenBudget: '800', refresh: 'off' } },
+      { id: 'co', kind: 'corpus', x: 540, y: 40, w: 240, h: 170, api: { route: '/v1/console/summary', refresh: 'live' } },
+      { id: 're', kind: 'receipts', x: 40, y: 300, w: 340, h: 220, api: { route: '/v1/receipts/list', refresh: 'off', limit: '7' } },
+      { id: 'ex', kind: 'extensions', x: 400, y: 300, w: 340, h: 220, api: { route: '/v1/extensions', refresh: 'off' } }
+    ], links: [], texts: [], pan: { x: 0, y: 0 }, zoom: 1, version: 1, settings: { grid: 24, accent: 'trust', title: 'M15' } };
+    var hostM15 = mkEl('div');
+    render.renderTileStudio(hostM15, { seedDoc: seededM15 });
+    var tilesM15 = collectAll(hostM15).filter(function (n) { return /\btstudio-node\b/.test(n.className || ''); });
+    check(tilesM15.length === 4, '[studio-m15] a seeded board with the 4 new kinds builds 4 tiles (got ' + tilesM15.length + ')');
+    check(collectAll(hostM15).some(function (n) { return /\btstudio-livechip\b/.test(n.className || ''); }), '[studio-m15] the toolbar carries a live connection chip');
+    check(collectAll(hostM15).some(function (n) { return /\btstudio-lib-item\b/.test(n.className || '') && /Text search|Corpus|Receipts|Extensions/.test(collectAll(n).map(function (c) { return c.textContent || ''; }).join('')); }), '[studio-m15] the library palette offers the new kinds');
+    if (savedDoc2 === undefined) { delete global.document; } else { global.document = savedDoc2; }
+    if (savedWin2 === undefined) { delete global.window; } else { global.window = savedWin2; }
+  } catch (e) {
+    check(false, '[studio-m15] seeded new-kind board threw: ' + (e && e.stack || e));
+  }
+  notes.push('studio M15: live tiles (per-tile live/interval/off via one shared /v1/events/stream EventSource, targeted debounced refetch, honest connection chip); 4 automated-data-handling kinds (text-search w/ coverage honesty, corpus status, receipts, registry-backed extensions w/ capability chips + capability-gated extension_outbound Invoke, honest-empty); Studio packs export/import (crux.studio.v1 in a signed crux.integration.v1 manifest via /v1/studio/pack/{build,verify}; hashes + verbatim verdict + operator-gated apply); board settings (grid/refresh/accent/title/description, exported in the pack) + parameterised design instantiation; a signed community example pack passes the community_packs gate.');
 })();
 
 // =========================================================================

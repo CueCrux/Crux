@@ -22,6 +22,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# The community_packs test regenerates + signs the example Studio pack.
+blake3 = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["std", "rand_core"] }
 # The M4 Vault integration test (tests/vault_c2pa_m4_evidence.rs,
 # #[ignore]-gated) re-verifies the emitted signature against the leaf

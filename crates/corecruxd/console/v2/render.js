@@ -4662,7 +4662,9 @@
   // the budget field only for these (Insights friction #1: budgets are mandatory
   // on retrieval reads). The rest hide it.
   var TSTUDIO_BUDGET_ROUTES = { '/v1/activity': true, '/v1/facts': true, '/v1/context': true };
-  var TSTUDIO_REFRESH = [['off', 'Off'], ['30000', '30s'], ['60000', '60s'], ['300000', '5m']];
+  // 'live' streams via /v1/events/stream (targeted refetch on relevant events);
+  // the numeric options fall back to a poll interval; 'off' is manual.
+  var TSTUDIO_REFRESH = [['off', 'Off'], ['live', 'Live'], ['30000', '30s'], ['60000', '60s'], ['300000', '5m']];
   var TSTUDIO_PRESETS = ['stat', 'list', 'sparkline', 'gauge', 'badge'];
 
   // ---- Kind registry (the ported KINDS that survive) --------------------
@@ -4679,7 +4681,12 @@
     output:  { label: 'Output',  accent: 'var(--ok)',    content: 'standard', icon: ['M4 4h11l5 5v11H4z', 'M14 4v6h6', 'M8 14h8M8 17h5'] },
     box:     { label: 'Box',     accent: 'var(--ink3)',  content: 'box',      icon: ['M4 5.5h16v13H4z'] },
     web:     { label: 'Web embed', accent: 'var(--acc)', content: 'web',      icon: ['M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z', 'M3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18'] },
-    api:     { label: 'API tile', accent: 'var(--ok)',   content: 'api',      icon: ['M4 7l-2.5 5L4 17', 'M20 7l2.5 5L20 17', 'M14 4l-4 16'] }
+    api:     { label: 'API tile', accent: 'var(--ok)',   content: 'api',      icon: ['M4 7l-2.5 5L4 17', 'M20 7l2.5 5L20 17', 'M14 4l-4 16'] },
+    // M15 automated-data-handling kinds — fixed-route, purpose-built tiles.
+    search:  { label: 'Text search', accent: 'var(--acc)', content: 'search', icon: ['M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14z', 'M20 20l-3.5-3.5'] },
+    corpus:  { label: 'Corpus status', accent: 'var(--trust)', content: 'corpus', icon: ['M4 6c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3z', 'M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6', 'M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3'] },
+    receipts:{ label: 'Receipts', accent: 'var(--warn)', content: 'receipts', icon: ['M6 2h9l3 3v17l-3-2-3 2-3-2-3 2z', 'M9 8h6M9 12h6M9 16h4'] },
+    extensions:{ label: 'Extensions', accent: 'var(--ok)', content: 'extensions', icon: ['M10 3h4v4h4v4h-4v4h-4v-4H6V7h4z', 'M14 15h4v6h-6v-4'] }
   };
   // Legacy kinds that were dropped on the port (3D + PDF): render an honest
   // unsupported note rather than silently mis-rendering.
@@ -4780,6 +4787,25 @@
           tokenBudget: typeof n.api.tokenBudget === 'string' ? n.api.tokenBudget : ''
         };
       }
+      // M15 automated-data-handling kinds: fixed route, kind-specific config.
+      if (kind === 'corpus' || kind === 'receipts' || kind === 'extensions') {
+        var ax = (n.api && typeof n.api === 'object') ? n.api : {};
+        node.api = {
+          route: TSTUDIO_FIXED_ROUTE[kind],
+          refresh: typeof ax.refresh === 'string' ? ax.refresh : 'off',
+          limit: typeof ax.limit === 'string' ? ax.limit : (kind === 'receipts' ? '7' : '')
+        };
+      }
+      if (kind === 'search') {
+        var sc = (n.search && typeof n.search === 'object') ? n.search : {};
+        node.search = {
+          route: TSTUDIO_FIXED_ROUTE.search,
+          query: typeof sc.query === 'string' ? sc.query : '',
+          tenant: typeof sc.tenant === 'string' ? sc.tenant : 'default',
+          tokenBudget: typeof sc.tokenBudget === 'string' ? sc.tokenBudget : '800',
+          refresh: typeof sc.refresh === 'string' ? sc.refresh : 'off'
+        };
+      }
       out.nodes.push(node);
     });
     var nodeIds = seen;
@@ -4795,10 +4821,11 @@
     if (d.pan && typeof d.pan === 'object') { out.pan = { x: tstudioNum(d.pan.x, 0), y: tstudioNum(d.pan.y, 0) }; }
     out.zoom = Math.max(0.2, Math.min(3, tstudioNum(d.zoom, 1)));
     out.version = tstudioNum(d.version, TSTUDIO_DOC_VERSION);
+    out.settings = tstudioNormalizeSettings(d.settings);
     return out;
   }
   function tstudioSerializeDoc(state) {
-    return JSON.stringify({ nodes: state.nodes, links: state.links, texts: state.texts, pan: state.pan, zoom: state.zoom, version: TSTUDIO_DOC_VERSION, savedAt: Date.now() });
+    return JSON.stringify({ nodes: state.nodes, links: state.links, texts: state.texts, pan: state.pan, zoom: state.zoom, settings: state.settings || tstudioDefaultSettings(), version: TSTUDIO_DOC_VERSION, savedAt: Date.now() });
   }
   // Pick the newest (max-version, non-deleted) fact for `key` from a /v1/facts/
   // entity/<entity> read (which returns EVERY version). Returns the fact or null.
@@ -4809,6 +4836,263 @@
       if (!best || tstudioNum(f.version, 0) > tstudioNum(best.version, 0)) { best = f; }
     });
     return best;
+  }
+
+  // =======================================================================
+  //  M15 — live tiles, automated-data-handling tile kinds, board settings,
+  //  and portable Studio packs. Everything below the "Canvas Studio (M14)"
+  //  banner stays inside the region the smoke checks (NO innerHTML, NO raw
+  //  fetch — reads via fetchJSON / window.CruxApiRead; live via EventSource;
+  //  writes via operatorGatedCall → consoleFactsAdd).
+  // =======================================================================
+  var TSTUDIO_STUDIO_SCHEMA = 'crux.studio.v1';
+  var TSTUDIO_PACK_SCHEMA = 'crux.integration.v1';
+  // Board accent themes (all var(--)) — grid/refresh/accent live in the doc
+  // settings and travel inside exported packs.
+  var TSTUDIO_ACCENTS = {
+    cool: { label: 'Cool', v: 'var(--acc)' },
+    trust: { label: 'Violet', v: 'var(--trust)' },
+    ok: { label: 'Green', v: 'var(--ok)' },
+    warn: { label: 'Amber', v: 'var(--warn)' }
+  };
+  var TSTUDIO_GRID_SIZES = [16, 20, 24, 32, 40];
+  // The automated-data-handling tile kinds get FIXED read routes (the operator
+  // does not pick a route — the kind IS the binding). Search rides the curated
+  // read-POST client; the rest ride the GET client.
+  var TSTUDIO_FIXED_ROUTE = {
+    search: '/v1/query/text-search',
+    corpus: '/v1/console/summary',
+    receipts: '/v1/receipts/list',
+    extensions: '/v1/extensions'
+  };
+
+  function tstudioAccentVar(accent) {
+    var a = TSTUDIO_ACCENTS[accent];
+    return a ? a.v : 'var(--acc)';
+  }
+  function tstudioDefaultSettings() {
+    return { grid: TSTUDIO_GRID, refresh: 'off', accent: 'cool', title: '', description: '' };
+  }
+  function tstudioNormalizeSettings(raw) {
+    var s = (raw && typeof raw === 'object') ? raw : {};
+    var grid = tstudioNum(s.grid, TSTUDIO_GRID);
+    if (TSTUDIO_GRID_SIZES.indexOf(grid) < 0) { grid = TSTUDIO_GRID; }
+    var refresh = (typeof s.refresh === 'string') ? s.refresh : 'off';
+    var accent = TSTUDIO_ACCENTS[s.accent] ? s.accent : 'cool';
+    return {
+      grid: grid,
+      refresh: refresh,
+      accent: accent,
+      title: (typeof s.title === 'string') ? s.title.slice(0, 120) : '',
+      description: (typeof s.description === 'string') ? s.description.slice(0, 400) : ''
+    };
+  }
+  function tstudioFmt(v) {
+    if (typeof v === 'number' && isFinite(v)) { try { return v.toLocaleString('en-US'); } catch (e) { return String(v); } }
+    return v == null ? '—' : String(v);
+  }
+  // Honest coverage copy for the text-search tile: below 0.5 the corpus may not
+  // cover the query (Insights honesty rule — never imply a full answer from a
+  // thin index). Pure; smoke-tested.
+  function tstudioCoverageNote(score) {
+    var s = Number(score);
+    if (!isFinite(s)) { s = 0; }
+    var txt = 'coverage ' + s.toFixed(2);
+    var low = s < 0.5;
+    if (low) { txt += ' — corpus may not cover this'; }
+    return { text: txt, low: low, score: s };
+  }
+  // Which /v1/events/stream event types a tile depends on, so a live tile
+  // refetches ONLY on relevant mutations (draw no more than needed).
+  function tstudioTileEvents(node) {
+    if (!node || typeof node !== 'object') { return []; }
+    var kind = node.kind;
+    var route = (node.api && node.api.route) || (node.search && node.search.route) || TSTUDIO_FIXED_ROUTE[kind] || '';
+    if (kind === 'search' || kind === 'corpus') { return ['fact.stored', 'fact.deleted', 'session.stored']; }
+    if (kind === 'receipts') { return ['fact.stored']; }
+    if (kind === 'extensions') { return []; }               // registry rarely changes; interval/manual only
+    if (route.indexOf('/v1/activity') === 0) { return ['activity.appended']; }
+    if (route.indexOf('/v1/facts') === 0 || route.indexOf('/v1/console/facts') === 0 || route.indexOf('/v1/query') === 0 || route.indexOf('/v1/console/summary') === 0) { return ['fact.stored', 'fact.deleted']; }
+    if (route.indexOf('/v1/console/sessions') === 0 || route.indexOf('/v1/sessions') === 0) { return ['session.stored', 'session.archived']; }
+    return ['fact.stored'];                                  // sensible default for a generic bound read
+  }
+
+  // ---- Pure content renderers for the new tile kinds (smoke-tested) --------
+  // Each takes an already-parsed response body + opts, returns ONE element
+  // built with el() (no innerHTML). Honest empty / error states included.
+  function tstudioRenderSearch(data, cfg, opts) {
+    opts = opts || {};
+    var wrap = el('div', { 'class': 'tstudio-searchbody' });
+    if (!data) { wrap.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'no response' })); return wrap; }
+    var cov = tstudioCoverageNote(data.coverage && data.coverage.score);
+    var covEl = el('div', { 'class': 'tstudio-cov' + (cov.low ? ' is-low' : '') });
+    covEl.appendChild(el('span', { 'class': 'tstudio-cov-dot' }));
+    covEl.appendChild(el('span', { 'class': 'tstudio-cov-txt', text: cov.text }));
+    wrap.appendChild(covEl);
+    var results = (data && Array.isArray(data.results)) ? data.results : [];
+    var q = (cfg && cfg.query) ? String(cfg.query) : '';
+    wrap.appendChild(el('div', { 'class': 'tstudio-search-meta', text: results.length + ' hit' + (results.length === 1 ? '' : 's') + (q ? (' · "' + q + '"') : '') }));
+    var list = el('div', { 'class': 'tstudio-list' });
+    if (!results.length) {
+      list.appendChild(el('div', { 'class': 'tstudio-placeholder', text: cov.low ? 'No hits — the local index may not cover this query or tenant.' : 'No hits.' }));
+    }
+    results.slice(0, 6).forEach(function (r) {
+      var label = (r && (r.entity || r.title || r.key || r.snippet)) || (r && typeof r === 'object' ? JSON.stringify(r).slice(0, 80) : String(r));
+      var row = el('div', { 'class': 'tstudio-list-row' });
+      row.appendChild(el('span', { 'class': 'tstudio-list-cell', text: String(label) }));
+      if (r && typeof r.score === 'number') { row.appendChild(el('span', { 'class': 'tstudio-hit-score', text: r.score.toFixed(2) })); }
+      list.appendChild(row);
+    });
+    wrap.appendChild(list);
+    return wrap;
+  }
+  function tstudioRenderCorpus(data) {
+    var wrap = el('div', { 'class': 'tstudio-corpusbody' });
+    if (!data) { wrap.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'no response' })); return wrap; }
+    var stores = data.stores || {};
+    var stats = el('div', { 'class': 'tstudio-corpus-stats' });
+    [['facts', tstudioJsonPath(stores, 'facts')], ['sessions', tstudioJsonPath(stores, 'sessions')]].forEach(function (kv) {
+      stats.appendChild(el('div', { 'class': 'tstudio-corpus-stat' }, [
+        el('div', { 'class': 'tstudio-corpus-v', text: tstudioFmt(kv[1]) }),
+        el('div', { 'class': 'tstudio-corpus-k', text: kv[0] })
+      ]));
+    });
+    wrap.appendChild(stats);
+    var packs = tstudioJsonPath(data, 'integrations.builtin_pack_count');
+    var ver = tstudioJsonPath(data, 'daemon.build.version');
+    wrap.appendChild(el('div', { 'class': 'tstudio-corpus-meta', text: 'daemon ' + tstudioFmt(ver) + ' · ' + tstudioFmt(packs) + ' built-in packs' }));
+    wrap.appendChild(el('div', { 'class': 'tstudio-placeholder', text: 'Counts this daemon exposes. Ingest corpora appear here as the store grows.' }));
+    return wrap;
+  }
+  function tstudioRenderReceipts(data) {
+    var wrap = el('div', { 'class': 'tstudio-receiptsbody' });
+    if (!data) { wrap.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'no response' })); return wrap; }
+    var rows = Array.isArray(data.rows) ? data.rows : [];
+    var list = el('div', { 'class': 'tstudio-list' });
+    if (!rows.length) { list.appendChild(el('div', { 'class': 'tstudio-placeholder', text: 'No receipts yet. Gated actions + observations mint signed receipts here.' })); }
+    rows.slice(0, 7).forEach(function (r) {
+      var row = el('div', { 'class': 'tstudio-list-row' });
+      row.appendChild(el('span', { 'class': 'tstudio-list-cell', text: String((r && r.kind) || '—') }));
+      var who = (r && (r.principal || (r.receipt && r.receipt.signed_by_short))) || '';
+      row.appendChild(el('span', { 'class': 'tstudio-list-cell', text: String(who).slice(0, 22) }));
+      var id = (r && (r.receipt_id || r.observation_id)) || '';
+      row.appendChild(el('span', { 'class': 'tstudio-rec-id', text: String(id).slice(0, 14) }));
+      list.appendChild(row);
+    });
+    wrap.appendChild(list);
+    return wrap;
+  }
+  // Extensions tile: installed extensions + capability chips + grant/trust
+  // state; honest empty on a bare mirror. If an extension declares a data
+  // endpoint (external_tool_endpoint / tools) reachable via extension_outbound,
+  // render a CAPABILITY-GATED invoke affordance (disabled unless operator).
+  function tstudioRenderExtensions(data, opts) {
+    opts = opts || {};
+    var wrap = el('div', { 'class': 'tstudio-extbody' });
+    if (!data) { wrap.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'no response' })); return wrap; }
+    var exts = Array.isArray(data.extensions) ? data.extensions : [];
+    if (!exts.length) {
+      wrap.appendChild(el('div', { 'class': 'tstudio-ext-empty' }, [
+        el('div', { 'class': 'tstudio-placeholder', text: 'No extensions installed on this daemon.' }),
+        el('div', { 'class': 'tstudio-placeholder', text: 'Install one via corecruxctl, POST /v1/extensions/register (a signed crux.integration.v1 manifest), or install-from-registry against the curator-signed community index.' })
+      ]));
+      return wrap;
+    }
+    exts.slice(0, 6).forEach(function (ext) {
+      var m = ext.manifest || {};
+      var card = el('div', { 'class': 'tstudio-ext-card' });
+      var head = el('div', { 'class': 'tstudio-ext-head' });
+      head.appendChild(el('span', { 'class': 'tstudio-ext-id', text: String(ext.id || m.id || '—') }));
+      head.appendChild(el('span', { 'class': 'tstudio-ext-tier', text: String(ext.trust_tier || 'unknown') }));
+      card.appendChild(head);
+      var chips = el('div', { 'class': 'tstudio-ext-chips' });
+      (Array.isArray(m.capabilities) ? m.capabilities : []).forEach(function (c) {
+        chips.appendChild(el('span', { 'class': 'tstudio-cap-chip', text: String(c) }));
+      });
+      if (!(m.capabilities && m.capabilities.length)) { chips.appendChild(el('span', { 'class': 'tstudio-placeholder', text: 'no capabilities declared' })); }
+      card.appendChild(chips);
+      var hasEndpoint = !!m.external_tool_endpoint || (Array.isArray(m.tools) && m.tools.length > 0);
+      if (hasEndpoint) {
+        var tool = (Array.isArray(m.tools) && m.tools[0] && m.tools[0].name) ? m.tools[0].name : '';
+        var ep = el('div', { 'class': 'tstudio-ext-ep' });
+        ep.appendChild(el('span', { 'class': 'tstudio-ext-ep-lab', text: 'data endpoint' + (tool ? (' · ' + tool) : '') }));
+        var btn = el('button', { 'class': 'tstudio-btn tstudio-ext-invoke', type: 'button', title: 'Invoke through extension_outbound (capability + grant gated)' }, ['Invoke']);
+        // Capability-gated: needs operator posture AND a grant. On a bare
+        // mirror this stays disabled with an honest reason.
+        if (!opts.operator) { btn.disabled = true; }
+        btn.setAttribute('aria-disabled', btn.disabled ? 'true' : 'false');
+        ep.appendChild(btn);
+        card.appendChild(ep);
+        card.appendChild(el('div', { 'class': 'tstudio-placeholder', text: 'Routes via POST /v1/extensions/' + String(ext.id || '') + '/tools/{tool}/invoke — grant-scoped, rate-limited (extension_outbound).' }));
+      }
+      wrap.appendChild(card);
+    });
+    return wrap;
+  }
+
+  // Client-side capability preview mirroring the daemon's derive_capabilities
+  // (studio_pack.rs) — shown in the export dialog so the operator sees the
+  // minimal read set before building. The daemon re-derives authoritatively.
+  function tstudioCapabilityForRoute(route) {
+    route = String(route || '');
+    if (route.indexOf('/v1/facts') === 0 || route.indexOf('/v1/console/facts') === 0 || route.indexOf('/v1/query') === 0) { return 'facts:read'; }
+    if (route.indexOf('/v1/console/sessions') === 0 || route.indexOf('/v1/sessions') === 0) { return 'sessions:read'; }
+    if (route.indexOf('/v1/passports') === 0 || route.indexOf('/v1/console/passports') === 0) { return 'passport:read'; }
+    if (route.indexOf('/v1/receipts') === 0) { return 'admin:read'; }
+    if (route.indexOf('/v1/console/tenants') === 0) { return 'tenant:metadata:read'; }
+    return 'integrations:read';
+  }
+  function tstudioDerivePackCaps(doc) {
+    var caps = { 'integrations:read': true };
+    var nodes = (doc && Array.isArray(doc.nodes)) ? doc.nodes : [];
+    nodes.forEach(function (n) {
+      if (n && n.api && n.api.route) { caps[tstudioCapabilityForRoute(n.api.route)] = true; }
+      if (n && n.search && n.search.route) { caps[tstudioCapabilityForRoute(n.search.route)] = true; }
+      if (n && n.kind === 'search') { caps['facts:read'] = true; }
+      if (n && n.kind === 'receipts') { caps['admin:read'] = true; }
+    });
+    return Object.keys(caps).sort();
+  }
+  // Assemble a crux.studio.v1 payload from a board doc + designs + settings.
+  // Pure — the export flow sends this to /v1/studio/pack/build for hashing/sign.
+  function tstudioBuildStudioPayload(boardId, doc, designs, settings) {
+    return {
+      schema: TSTUDIO_STUDIO_SCHEMA,
+      version: 1,
+      created_at_unix_ms: (typeof Date !== 'undefined') ? Date.now() : 0,
+      board: { id: boardId || TSTUDIO_DEFAULT_BOARD, doc: doc },
+      designs: Array.isArray(designs) ? designs : [],
+      settings: tstudioNormalizeSettings(settings)
+    };
+  }
+  // Parameterised designs: any string value containing {{name}} is a fill-on-
+  // instantiate placeholder (e.g. a saved search design with query "{{q}}").
+  // Both pure; smoke-tested.
+  function tstudioFindPlaceholders(obj) {
+    var found = {};
+    (function walk(v) {
+      if (typeof v === 'string') {
+        var re = /\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}/g, m;
+        while ((m = re.exec(v)) !== null) { found[m[1]] = true; }
+      } else if (v && typeof v === 'object') {
+        Object.keys(v).forEach(function (k) { walk(v[k]); });
+      }
+    })(obj);
+    return Object.keys(found);
+  }
+  function tstudioApplyPlaceholders(obj, values) {
+    if (typeof obj === 'string') {
+      return obj.replace(/\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}/g, function (whole, name) {
+        return Object.prototype.hasOwnProperty.call(values || {}, name) ? String(values[name]) : whole;
+      });
+    }
+    if (Array.isArray(obj)) { return obj.map(function (x) { return tstudioApplyPlaceholders(x, values); }); }
+    if (obj && typeof obj === 'object') {
+      var out = {};
+      Object.keys(obj).forEach(function (k) { out[k] = tstudioApplyPlaceholders(obj[k], values); });
+      return out;
+    }
+    return obj;
   }
 
   // =======================================================================
@@ -4916,9 +5200,15 @@
       pan: { x: 0, y: 0 }, zoom: 1,
       nodeEls: {}, selected: null, selectedLink: null,
       linking: null, designs: [],
+      settings: tstudioDefaultSettings(),
       saveState: operator ? 'clean' : 'readonly',   // clean | unsaved | saving | saved | error | readonly
-      cleanups: [], intervals: {}, saveTimer: null, refreshTimers: {}
+      cleanups: [], intervals: {}, saveTimer: null, refreshTimers: {},
+      // M15 live tiles: per-tile refetch closures + a single shared EventSource.
+      tileLoaders: {}, es: null, esState: 'off', liveDebounce: {}
     };
+    // Board grid (settings-driven) for interactive snapping; the module-level
+    // tstudioSnap stays at the 20px default (normalise + smoke identity).
+    function vSnap(v) { var g = (S.settings && S.settings.grid) || TSTUDIO_GRID; return Math.round((Number(v) || 0) / g) * g; }
 
     function trackInterval(id) { S.cleanups.push(function () { if (typeof clearInterval === 'function') { clearInterval(id); } }); return id; }
     function onDoc(type, fn) { var d = doc(); if (d && d.addEventListener) { d.addEventListener(type, fn); S.cleanups.push(function () { d.removeEventListener(type, fn); }); } }
@@ -5062,6 +5352,8 @@
       else if (kdef.content === 'box') { buildBoxContent(eln, n); }
       else if (kdef.content === 'web') { buildWebContent(eln, n); }
       else if (kdef.content === 'api') { buildApiContent(eln, n); }
+      else if (kdef.content === 'search') { buildSearchTile(eln, n); }
+      else if (kdef.content === 'corpus' || kdef.content === 'receipts' || kdef.content === 'extensions') { buildDataTile(eln, n, kdef.content); }
       else { buildStandardContent(eln, n); }
       // handles
       var del = el('button', { 'class': 'tstudio-del', type: 'button', title: 'Delete tile', 'aria-label': 'Delete tile' }, ['×']);
@@ -5153,16 +5445,130 @@
       var foot = el('div', { 'class': 'tstudio-apifoot' });
       content.appendChild(foot);
       eln.appendChild(content);
-      loadApiTile(n, body, foot);
-      // refresh timer
-      var iv = n.api && n.api.refresh;
-      if (iv && iv !== 'off' && isFinite(Number(iv)) && typeof setInterval === 'function') {
-        if (S.refreshTimers[n.id]) { clearInterval(S.refreshTimers[n.id]); }
+      S.tileLoaders[n.id] = function () { loadApiTile(n, body, foot); };
+      S.tileLoaders[n.id]();
+      wireTileRefresh(n, n.api && n.api.refresh);
+    }
+
+    // ---- refresh wiring (interval | live | off) — one path for every tile --
+    // 'live' registers the tile with the shared EventSource and refetches ONLY
+    // on the event types it depends on; a numeric value polls; 'off' is manual.
+    function wireTileRefresh(n, refreshVal) {
+      if (S.refreshTimers[n.id]) { clearInterval(S.refreshTimers[n.id]); delete S.refreshTimers[n.id]; }
+      var v = refreshVal || 'off';
+      if (v === 'live') { ensureLive(); return; }
+      if (v !== 'off' && isFinite(Number(v)) && typeof setInterval === 'function') {
         S.refreshTimers[n.id] = trackInterval(setInterval(function () {
-          if (!S.nodeEls[n.id]) { return; }
-          loadApiTile(n, body, foot);
-        }, Math.max(30000, Number(iv))));
+          if (!S.nodeEls[n.id] || !S.tileLoaders[n.id]) { return; }
+          S.tileLoaders[n.id]();
+        }, Math.max(30000, Number(v))));
       }
+    }
+    function nodeRefresh(n) { return (n.api && n.api.refresh) || (n.search && n.search.refresh) || 'off'; }
+
+    // ---- live tiles: one shared EventSource, debounced targeted refetch ----
+    function paintLiveChip() {
+      var chip = toolbar.querySelector('.tstudio-livechip');
+      if (!chip) { return; }
+      chip.textContent = '';
+      var map = { off: ['live off', ''], connecting: ['connecting…', 'busy'], live: ['live', 'ok'], error: ['live lost', 'err'], unsupported: ['live n/a', 'ro'] };
+      var m = map[S.esState] || map.off;
+      chip.appendChild(el('span', { 'class': 'tstudio-livedot tstudio-save-' + (m[1] || 'ro') }));
+      chip.appendChild(doc().createTextNode(m[0]));
+    }
+    function setEsState(st) { S.esState = st; paintLiveChip(); }
+    function anyLive() { return S.nodes.some(function (n) { return nodeRefresh(n) === 'live'; }); }
+    function ensureLive() {
+      if (!anyLive()) { return; }
+      if (S.es) { return; }
+      if (typeof EventSource === 'undefined') { setEsState('unsupported'); return; }
+      setEsState('connecting');
+      var es;
+      try { es = new EventSource('/v1/events/stream'); }
+      catch (e) { setEsState('error'); return; }
+      S.es = es;
+      S.cleanups.push(function () { try { es.close(); } catch (e) { /* ignore */ } });
+      es.onopen = function () { setEsState('live'); };
+      es.onerror = function () { if (S.esState !== 'live') { setEsState('error'); } };
+      ['fact.stored', 'fact.deleted', 'session.stored', 'session.archived', 'activity.appended'].forEach(function (type) {
+        es.addEventListener(type, function () { onLiveEvent(type); });
+      });
+    }
+    function onLiveEvent(type) {
+      if (S.esState === 'connecting' || S.esState === 'error') { setEsState('live'); }
+      S.nodes.forEach(function (n) {
+        if (nodeRefresh(n) !== 'live') { return; }
+        if (tstudioTileEvents(n).indexOf(type) < 0) { return; }
+        if (!S.nodeEls[n.id] || !S.tileLoaders[n.id]) { return; }
+        // Debounce per-tile so a burst of events draws each tile once.
+        if (S.liveDebounce[n.id]) { clearTimeout(S.liveDebounce[n.id]); }
+        S.liveDebounce[n.id] = setTimeout(function () {
+          delete S.liveDebounce[n.id];
+          if (S.nodeEls[n.id] && S.tileLoaders[n.id]) { S.tileLoaders[n.id](); }
+        }, 400);
+      });
+    }
+
+    // ---- search tile (curated read-POST client) ----------------------------
+    function buildSearchTile(eln, n) {
+      var content = el('div', { 'class': 'tstudio-content tstudio-apicontent' });
+      content.appendChild(nodeHead(n));
+      var body = el('div', { 'class': 'tstudio-apibody' });
+      content.appendChild(body);
+      var foot = el('div', { 'class': 'tstudio-apifoot' });
+      content.appendChild(foot);
+      eln.appendChild(content);
+      S.tileLoaders[n.id] = function () { loadSearchTile(n, body, foot); };
+      S.tileLoaders[n.id]();
+      wireTileRefresh(n, n.search && n.search.refresh);
+    }
+    function loadSearchTile(n, body, foot) {
+      var cfg = n.search || {};
+      body.textContent = ''; foot.textContent = '';
+      if (!cfg.query) { body.appendChild(el('div', { 'class': 'tstudio-placeholder', text: 'Text search — set a query in the inspector.' })); return; }
+      var rp = (typeof window !== 'undefined') ? window.CruxApiRead : null;
+      if (!rp || typeof rp.queryTextSearch !== 'function') { body.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'read-post client unavailable' })); return; }
+      body.appendChild(el('div', { 'class': 'tstudio-loading', text: 'searching…' }));
+      var req = { tenant_id: cfg.tenant || 'default', query: cfg.query };
+      if (cfg.tokenBudget) { req.token_budget = Number(cfg.tokenBudget) || undefined; }
+      rp.queryTextSearch(req).then(function (r) {
+        return r.json().then(function (d) { return { ok: r.ok, data: d }; }, function () { return { ok: false, data: null }; });
+      }).then(function (res) {
+        body.textContent = ''; foot.textContent = '';
+        if (!res.ok) { body.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'search failed' })); return; }
+        body.appendChild(tstudioRenderSearch(res.data, cfg, { operator: operator }));
+        foot.appendChild(el('span', { 'class': 'tstudio-apiroute', text: cfg.route }));
+        foot.appendChild(el('span', { 'class': 'tstudio-apipreset', text: 'search' }));
+      }).catch(function () { body.textContent = ''; body.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'search error' })); });
+    }
+
+    // ---- data tiles (corpus | receipts | extensions) — fixed GET routes ----
+    function buildDataTile(eln, n, kind) {
+      var content = el('div', { 'class': 'tstudio-content tstudio-apicontent' });
+      content.appendChild(nodeHead(n));
+      var body = el('div', { 'class': 'tstudio-apibody' });
+      content.appendChild(body);
+      var foot = el('div', { 'class': 'tstudio-apifoot' });
+      content.appendChild(foot);
+      eln.appendChild(content);
+      S.tileLoaders[n.id] = function () { loadDataTile(n, kind, body, foot); };
+      S.tileLoaders[n.id]();
+      wireTileRefresh(n, n.api && n.api.refresh);
+    }
+    function loadDataTile(n, kind, body, foot) {
+      var cfg = n.api || {};
+      var url = cfg.route || TSTUDIO_FIXED_ROUTE[kind];
+      if (kind === 'receipts') { url += '?limit=' + encodeURIComponent(String(Number(cfg.limit) || 7)); }
+      body.textContent = ''; foot.textContent = '';
+      body.appendChild(el('div', { 'class': 'tstudio-loading', text: 'loading…' }));
+      fetchJSON(url).then(function (res) {
+        body.textContent = ''; foot.textContent = '';
+        if (!res.ok) { body.appendChild(el('div', { 'class': 'tstudio-apierr', text: (res.status === 0 ? 'unreachable' : ('HTTP ' + res.status)) })); return; }
+        if (kind === 'corpus') { body.appendChild(tstudioRenderCorpus(res.data)); }
+        else if (kind === 'receipts') { body.appendChild(tstudioRenderReceipts(res.data)); }
+        else if (kind === 'extensions') { body.appendChild(tstudioRenderExtensions(res.data, { operator: operator })); }
+        foot.appendChild(el('span', { 'class': 'tstudio-apiroute', text: cfg.route || url }));
+      }).catch(function () { body.textContent = ''; body.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'load error' })); });
     }
     function apiTileUrl(cfg) {
       var q = {};
@@ -5265,7 +5671,7 @@
         function up() {
           doc().removeEventListener('mousemove', mv); doc().removeEventListener('mouseup', up);
           eln.classList.remove('is-dragging');
-          if (moved) { n.x = tstudioSnap(n.x); n.y = tstudioSnap(n.y); eln.style.left = n.x + 'px'; eln.style.top = n.y + 'px'; drawLinks(); markDirty(); }
+          if (moved) { n.x = vSnap(n.x); n.y = vSnap(n.y); eln.style.left = n.x + 'px'; eln.style.top = n.y + 'px'; drawLinks(); markDirty(); }
         }
         doc().addEventListener('mousemove', mv); doc().addEventListener('mouseup', up);
       });
@@ -5283,7 +5689,7 @@
         }
         function up() {
           doc().removeEventListener('mousemove', mv); doc().removeEventListener('mouseup', up);
-          n.w = Math.max(TSTUDIO_MIN_W, tstudioSnap(n.w)); n.h = Math.max(TSTUDIO_MIN_H, tstudioSnap(n.h));
+          n.w = Math.max(TSTUDIO_MIN_W, vSnap(n.w)); n.h = Math.max(TSTUDIO_MIN_H, vSnap(n.h));
           eln.style.width = n.w + 'px'; eln.style.height = n.h + 'px';
           drawLinks(); markDirty();
         }
@@ -5348,6 +5754,10 @@
       if (kdef === 'box') { n.w = 240; n.h = 150; n.label = ''; }
       else if (kdef === 'web') { n.w = 380; n.h = 260; n.url = ''; n.label = 'Web embed'; }
       else if (kdef === 'api') { n.w = 240; n.h = 150; n.label = 'API tile'; n.api = { route: '', params: '', jsonPath: '', preset: 'stat', fields: '', max: '', refresh: 'off', tokenBudget: '' }; }
+      else if (kdef === 'search') { n.w = 480; n.h = 240; n.label = 'Text search'; n.search = { route: TSTUDIO_FIXED_ROUTE.search, query: '', tenant: 'default', tokenBudget: '800', refresh: 'off' }; }
+      else if (kdef === 'corpus') { n.w = 240; n.h = 170; n.label = 'Corpus'; n.api = { route: TSTUDIO_FIXED_ROUTE.corpus, refresh: 'off' }; }
+      else if (kdef === 'receipts') { n.w = 340; n.h = 220; n.label = 'Receipts'; n.api = { route: TSTUDIO_FIXED_ROUTE.receipts, refresh: 'off', limit: '7' }; }
+      else if (kdef === 'extensions') { n.w = 340; n.h = 220; n.label = 'Extensions'; n.api = { route: TSTUDIO_FIXED_ROUTE.extensions, refresh: 'off' }; }
       else { n.label = tstudioKind(kdef).label; n.sub = ''; n.body = ''; }
       if (cfgOverride && typeof cfgOverride === 'object') {
         Object.keys(cfgOverride).forEach(function (k) { if (k !== 'id' && k !== 'x' && k !== 'y' && k !== 'z') { n[k] = cfgOverride[k]; } });
@@ -5385,6 +5795,8 @@
 
       if (n.kind === 'web') { paintWebInspector(n); }
       else if (n.kind === 'api') { paintApiInspector(n); }
+      else if (n.kind === 'search') { paintSearchInspector(n); }
+      else if (n.kind === 'corpus' || n.kind === 'receipts' || n.kind === 'extensions') { paintDataInspector(n); }
 
       // actions (all kinds)
       var actions = el('div', { 'class': 'tstudio-insp-actions' });
@@ -5464,6 +5876,43 @@
       refresh.addEventListener('change', function () { cfg.refresh = refresh.value; refreshNode(n.id); markDirty(); });
       box.appendChild(inspectorField('Auto-refresh', refresh));
     }
+    // Shared refresh select (includes 'live') for any bound tile.
+    function refreshField(n, cfg) {
+      var refresh = el('select', { 'class': 'tstudio-select' });
+      TSTUDIO_REFRESH.forEach(function (r) { var o = el('option', { value: r[0] }, [r[1]]); if ((cfg.refresh || 'off') === r[0]) { o.setAttribute('selected', 'selected'); } refresh.appendChild(o); });
+      if (!operator) { refresh.disabled = true; }
+      refresh.addEventListener('change', function () { cfg.refresh = refresh.value; refreshNode(n.id); markDirty(); });
+      return inspectorField('Auto-refresh', refresh);
+    }
+    function paintSearchInspector(n) {
+      var cfg = n.search = n.search || { route: TSTUDIO_FIXED_ROUTE.search, query: '', tenant: 'default', tokenBudget: '800', refresh: 'off' };
+      function mk(key, label, ph) {
+        var inp = el('input', { 'class': 'tstudio-input', type: 'text', value: cfg[key] || '', placeholder: ph || '' });
+        if (!operator) { inp.disabled = true; }
+        inp.addEventListener('change', function () { cfg[key] = inp.value; refreshNode(n.id); markDirty(); });
+        inspector.appendChild(inspectorField(label, inp));
+      }
+      mk('query', 'Query', 'execplan console');
+      mk('tenant', 'Tenant', 'default');
+      mk('tokenBudget', 'token_budget (required)', '800');
+      inspector.appendChild(el('p', { 'class': 'tstudio-insp-note', text: 'Rides the curated read-POST client (/v1/query/text-search). Below-0.5 coverage is shown honestly.' }));
+      inspector.appendChild(refreshField(n, cfg));
+    }
+    function paintDataInspector(n) {
+      var cfg = n.api = n.api || { route: TSTUDIO_FIXED_ROUTE[n.kind], refresh: 'off' };
+      inspector.appendChild(inspectorField('Route (fixed)', el('div', { 'class': 'tstudio-fixedroute', text: cfg.route })));
+      if (n.kind === 'receipts') {
+        var lim = el('input', { 'class': 'tstudio-input', type: 'text', value: cfg.limit || '7', placeholder: '7' });
+        if (!operator) { lim.disabled = true; }
+        lim.addEventListener('change', function () { cfg.limit = lim.value; refreshNode(n.id); markDirty(); });
+        inspector.appendChild(inspectorField('Rows', lim));
+      }
+      if (n.kind === 'extensions') {
+        inspector.appendChild(el('p', { 'class': 'tstudio-insp-note', text: 'Installed extensions + capability chips + grant/trust state. A declared data endpoint renders a capability-gated Invoke (extension_outbound).' }));
+      }
+      inspector.appendChild(refreshField(n, cfg));
+    }
+
     function paintLinkInspector() {
       var l = findLink(S.selectedLink);
       if (!l) { S.selectedLink = null; paintInspector(); return; }
@@ -5511,7 +5960,7 @@
 
       library.appendChild(el('div', { 'class': 'tstudio-lib-sec', text: 'Built-in' }));
       var kinds = el('div', { 'class': 'tstudio-lib-grid' });
-      ['note', 'box', 'web', 'api', 'project', 'server', 'storage', 'client', 'output'].forEach(function (k) {
+      ['note', 'box', 'web', 'api', 'search', 'corpus', 'receipts', 'extensions', 'project', 'server', 'storage', 'client', 'output'].forEach(function (k) {
         var kdef = tstudioKind(k);
         var b = el('button', { 'class': 'tstudio-lib-item', type: 'button', title: 'Add a ' + kdef.label + ' tile' });
         b.style.setProperty('--ts-accent', kdef.accent);
@@ -5541,9 +5990,23 @@
     }
     function instantiateDesign(d) {
       if (!operator) { return; }
-      if (d.config) { addNode(d.config.kind, d.config); return; }
+      if (d.config) { instantiateFrom(d.config); return; }
       // truncated in the listing — re-read the full value first
-      tstudioLoadDesign(d.entity).then(function (def) { if (def && def.config) { addNode(def.config.kind, def.config); } });
+      tstudioLoadDesign(d.entity).then(function (def) { if (def && def.config) { instantiateFrom(def.config); } });
+    }
+    // Fill-on-instantiate for parameterised designs ({{placeholder}} fields).
+    function instantiateFrom(config) {
+      var ph = tstudioFindPlaceholders(config);
+      if (ph.length && typeof prompt === 'function') {
+        var vals = {};
+        for (var i = 0; i < ph.length; i++) {
+          var v = prompt('Fill "' + ph[i] + '" for this tile:', '');
+          if (v === null) { return; }   // cancelled
+          vals[ph[i]] = v;
+        }
+        config = tstudioApplyPlaceholders(config, vals);
+      }
+      addNode(config.kind, config);
     }
     function refreshLibrary() {
       tstudioListDesigns().then(function (list) { S.designs = list; paintLibrary(); });
@@ -5575,6 +6038,25 @@
       toolbar.appendChild(mid);
 
       var right = el('div', { 'class': 'tstudio-tb-right' });
+      // live connection chip (honest state)
+      var live = el('span', { 'class': 'tstudio-livechip', title: 'Live-tile stream state (/v1/events/stream)' });
+      right.appendChild(live);
+      // board settings
+      var setBtn = el('button', { 'class': 'tstudio-btn tstudio-icbtn', type: 'button', title: 'Board settings', 'aria-label': 'Board settings' });
+      setBtn.appendChild(tstudioIcon(['M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7z', 'M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.5-2.4 1a7 7 0 0 0-1.7-1L14.5 3h-5l-.3 2.5a7 7 0 0 0-1.7 1l-2.4-1-2 3.5 2 1.5a7 7 0 0 0 0 2l-2 1.5 2 3.5 2.4-1a7 7 0 0 0 1.7 1l.3 2.5h5l.3-2.5a7 7 0 0 0 1.7-1l2.4 1 2-3.5-2-1.5a7 7 0 0 0 .1-1z'], 16));
+      setBtn.addEventListener('click', function () { openSettingsPanel(); });
+      right.appendChild(setBtn);
+      // pack export / import
+      var expBtn = el('button', { 'class': 'tstudio-btn', type: 'button', title: 'Export this board as a portable, signed pack' }, ['Export']);
+      expBtn.addEventListener('click', function () { openExportDialog(); });
+      right.appendChild(expBtn);
+      var impBtn = el('button', { 'class': 'tstudio-btn', type: 'button', title: operator ? 'Import a Studio pack' : 'Read-only — operator posture required to apply an import' }, ['Import']);
+      impBtn.addEventListener('click', function () { triggerImport(); });
+      right.appendChild(impBtn);
+      // publish help
+      var helpBtn = el('button', { 'class': 'tstudio-btn tstudio-icbtn', type: 'button', title: 'How to publish a pack', 'aria-label': 'How to publish' }, ['?']);
+      helpBtn.addEventListener('click', function () { openPublishHelp(); });
+      right.appendChild(helpBtn);
       var chip = el('span', { 'class': 'tstudio-savechip' });
       right.appendChild(chip);
       var saveBtn = el('button', { 'class': 'tstudio-btn tstudio-btn-primary', type: 'button', title: operator ? 'Save the board now' : 'Read-only — operator posture required' }, ['Save']);
@@ -5583,6 +6065,7 @@
       right.appendChild(saveBtn);
       toolbar.appendChild(right);
       paintSaveState();
+      paintLiveChip();
     }
     function fitAll() {
       if (!S.nodes.length) { S.pan = { x: 40, y: 40 }; S.zoom = 1; applyTransform(); return; }
@@ -5594,6 +6077,225 @@
       S.zoom = z;
       S.pan = { x: r.width / 2 - (minx + bw / 2) * z, y: r.height / 2 - (miny + bh / 2) * z };
       markDirty(); applyTransform();
+    }
+
+    // ---- board settings (grid / refresh / accent / title) ------------------
+    function applyBoardSettings() {
+      var s = S.settings || tstudioDefaultSettings();
+      var g = s.grid || TSTUDIO_GRID;
+      if (grid && grid.style) { grid.style.backgroundSize = g + 'px ' + g + 'px'; }
+      root.style.setProperty('--ts-board-accent', tstudioAccentVar(s.accent));
+      var t = toolbar.querySelector('.tstudio-tb-title');
+      if (t) { t.textContent = 'Studio · ' + (s.title || boardId); }
+    }
+    function openSettingsPanel() {
+      var m = tstudioModal('Board settings');
+      var s = S.settings || tstudioDefaultSettings();
+      var title = el('input', { 'class': 'tstudio-input', type: 'text', value: s.title || '', placeholder: 'Board title' });
+      var desc = el('textarea', { 'class': 'tstudio-input tstudio-textarea', placeholder: 'Description', rows: '3' }); desc.value = s.description || '';
+      var gridSel = el('select', { 'class': 'tstudio-select' });
+      TSTUDIO_GRID_SIZES.forEach(function (g) { var o = el('option', { value: String(g) }, [g + ' px']); if (s.grid === g) { o.setAttribute('selected', 'selected'); } gridSel.appendChild(o); });
+      var refresh = el('select', { 'class': 'tstudio-select' });
+      TSTUDIO_REFRESH.forEach(function (r) { var o = el('option', { value: r[0] }, [r[1]]); if ((s.refresh || 'off') === r[0]) { o.setAttribute('selected', 'selected'); } refresh.appendChild(o); });
+      var accent = el('select', { 'class': 'tstudio-select' });
+      Object.keys(TSTUDIO_ACCENTS).forEach(function (k) { var o = el('option', { value: k }, [TSTUDIO_ACCENTS[k].label]); if (s.accent === k) { o.setAttribute('selected', 'selected'); } accent.appendChild(o); });
+      [['Title', title], ['Description', desc], ['Grid size', gridSel], ['Default refresh', refresh], ['Accent', accent]].forEach(function (f) { m.body.appendChild(inspectorField(f[0], f[1])); });
+      if (!operator) { [title, desc, gridSel, refresh, accent].forEach(function (c) { c.disabled = true; }); m.body.appendChild(el('p', { 'class': 'tstudio-insp-hint', text: 'Read-only — operator posture required to change board settings.' })); }
+      var actions = el('div', { 'class': 'tstudio-insp-actions' });
+      var apply = el('button', { 'class': 'tstudio-btn tstudio-btn-primary', type: 'button' }, ['Apply']);
+      if (!operator) { apply.disabled = true; }
+      apply.addEventListener('click', function () {
+        S.settings = tstudioNormalizeSettings({ title: title.value, description: desc.value, grid: Number(gridSel.value), refresh: refresh.value, accent: accent.value });
+        applyBoardSettings(); markDirty(); m.close();
+      });
+      actions.appendChild(apply);
+      m.body.appendChild(actions);
+    }
+
+    // ---- modal helper -------------------------------------------------------
+    function tstudioModal(titleText) {
+      var overlay = el('div', { 'class': 'tstudio-modal-overlay', role: 'dialog', 'aria-modal': 'true', 'aria-label': titleText });
+      var box = el('div', { 'class': 'tstudio-modal' });
+      var head = el('div', { 'class': 'tstudio-modal-head' });
+      head.appendChild(el('h3', { 'class': 'tstudio-modal-h', text: titleText }));
+      function close() { if (overlay.parentNode) { overlay.parentNode.removeChild(overlay); } if (doc()) { doc().removeEventListener('keydown', onKey); } }
+      function onKey(e) { if (e.key === 'Escape') { close(); } }
+      var x = el('button', { 'class': 'tstudio-modal-x', type: 'button', 'aria-label': 'Close' }, ['×']);
+      x.addEventListener('click', close);
+      head.appendChild(x);
+      box.appendChild(head);
+      var body = el('div', { 'class': 'tstudio-modal-body' });
+      box.appendChild(body);
+      overlay.appendChild(box);
+      overlay.addEventListener('click', function (e) { if (e.target === overlay) { close(); } });
+      if (doc()) { doc().addEventListener('keydown', onKey); }
+      root.appendChild(overlay);
+      return { overlay: overlay, body: body, close: close };
+    }
+
+    // ---- Studio packs: export (build via daemon) + import (verify + apply) --
+    function currentStudioPayload() {
+      var d = tstudioNormalizeDoc(JSON.parse(tstudioSerializeDoc(S)));
+      var designs = (S.designs || []).map(function (x) { return { slug: x.slug, name: x.name, config: x.config }; });
+      return tstudioBuildStudioPayload(boardId, d, designs, S.settings);
+    }
+    function buildPack(meta) {
+      var rp = (typeof window !== 'undefined') ? window.CruxApiRead : null;
+      if (!rp || typeof rp.studioPackBuild !== 'function') { return Promise.resolve({ ok: false, error: 'pack client unavailable' }); }
+      return rp.studioPackBuild({
+        studio: currentStudioPayload(),
+        id: meta.id, name: meta.name, version: meta.version,
+        publisher_passport_fpr: meta.publisher_passport_fpr, summary: meta.summary
+      }).then(function (r) {
+        return r.json().then(
+          function (d) { return { ok: r.ok, status: r.status, data: d, error: (!r.ok && d && (d.detail || d.title)) || '' }; },
+          function () { return { ok: false, error: 'bad response' }; }
+        );
+      }).catch(function (e) { return { ok: false, error: String(e && e.message || e) }; });
+    }
+    function downloadPack(id, pack) {
+      try {
+        var blob = new Blob([JSON.stringify(pack, null, 2)], { type: 'application/json' });
+        var url = URL.createObjectURL(blob);
+        var a = el('a', { href: url, download: (tstudioSlugify(id) || 'studio-pack') + '.cruxstudio.json' });
+        root.appendChild(a); a.click();
+        setTimeout(function () { if (a.parentNode) { a.parentNode.removeChild(a); } URL.revokeObjectURL(url); }, 0);
+      } catch (e) { /* ignore */ }
+    }
+    function openExportDialog() {
+      var m = tstudioModal('Export pack');
+      var s = S.settings || tstudioDefaultSettings();
+      var idInp = el('input', { 'class': 'tstudio-input', type: 'text', value: 'studio.' + (tstudioSlugify(s.title || boardId) || 'board'), placeholder: 'pack id' });
+      var nameInp = el('input', { 'class': 'tstudio-input', type: 'text', value: s.title || ('Studio board ' + boardId), placeholder: 'name' });
+      var verInp = el('input', { 'class': 'tstudio-input', type: 'text', value: '0.1.0', placeholder: '0.1.0' });
+      var pubInp = el('input', { 'class': 'tstudio-input', type: 'text', value: 'p_your_passport_fpr', placeholder: 'publisher passport fpr' });
+      var sumInp = el('input', { 'class': 'tstudio-input', type: 'text', value: s.description || '', placeholder: 'summary' });
+      [['Pack id', idInp], ['Name', nameInp], ['Version', verInp], ['Publisher fpr', pubInp], ['Summary', sumInp]].forEach(function (f) { m.body.appendChild(inspectorField(f[0], f[1])); });
+      var capWrap = el('div', { 'class': 'tstudio-caps-preview' });
+      capWrap.appendChild(el('span', { 'class': 'tstudio-field-lab', text: 'Capabilities (minimal read set)' }));
+      var capRow = el('div', { 'class': 'tstudio-ext-chips' });
+      tstudioDerivePackCaps({ nodes: S.nodes }).forEach(function (c) { capRow.appendChild(el('span', { 'class': 'tstudio-cap-chip', text: c })); });
+      capWrap.appendChild(capRow);
+      m.body.appendChild(capWrap);
+      var status = el('div', { 'class': 'tstudio-modal-status' });
+      m.body.appendChild(status);
+      var actions = el('div', { 'class': 'tstudio-insp-actions' });
+      var build = el('button', { 'class': 'tstudio-btn tstudio-btn-primary', type: 'button' }, ['Build + download']);
+      build.addEventListener('click', function () {
+        status.textContent = 'building…';
+        buildPack({ id: idInp.value, name: nameInp.value, version: verInp.value, publisher_passport_fpr: pubInp.value, summary: sumInp.value }).then(function (res) {
+          status.textContent = '';
+          if (!res || !res.ok || !res.data) { status.appendChild(el('div', { 'class': 'tstudio-apierr', text: (res && res.error) || 'build failed' })); return; }
+          downloadPack(idInp.value, res.data.pack);
+          status.appendChild(el('div', { 'class': 'tstudio-modal-ok', text: res.data.signed ? 'Signed pack downloaded.' : 'Unsigned pack downloaded.' }));
+          (res.data.sign_instructions || []).forEach(function (line) { status.appendChild(el('div', { 'class': 'tstudio-placeholder', text: line })); });
+          if (res.data.trust_note) { status.appendChild(el('div', { 'class': 'tstudio-placeholder', text: res.data.trust_note })); }
+        });
+      });
+      actions.appendChild(build);
+      m.body.appendChild(actions);
+    }
+    var __importInput = null;
+    function triggerImport() {
+      if (!doc()) { return; }
+      if (!__importInput) {
+        __importInput = el('input', { type: 'file', accept: '.json,application/json', 'class': 'tstudio-hidden' });
+        __importInput.addEventListener('change', function () {
+          var f = __importInput.files && __importInput.files[0];
+          if (!f) { return; }
+          var reader = new FileReader();
+          reader.onload = function () { openImportPreview(String(reader.result || '')); if (__importInput) { __importInput.value = ''; } };
+          reader.onerror = function () { openImportError('could not read file'); };
+          reader.readAsText(f);
+        });
+        root.appendChild(__importInput);
+      }
+      __importInput.click();
+    }
+    function openImportError(msg) { var m = tstudioModal('Import pack'); m.body.appendChild(el('div', { 'class': 'tstudio-apierr', text: msg })); }
+    function openImportPreview(text) {
+      var pack;
+      try { pack = JSON.parse(text); } catch (e) { openImportError('not valid JSON: ' + String(e && e.message || e)); return; }
+      var rp = (typeof window !== 'undefined') ? window.CruxApiRead : null;
+      if (!rp || typeof rp.studioPackVerify !== 'function') { openImportError('pack client unavailable'); return; }
+      var m = tstudioModal('Import pack');
+      m.body.appendChild(el('div', { 'class': 'tstudio-loading', text: 'verifying…' }));
+      rp.studioPackVerify({ pack: pack }).then(function (r) {
+        return r.json().then(function (d) { return { ok: r.ok, data: d }; }, function () { return { ok: false, data: null }; });
+      }).then(function (res) {
+        m.body.textContent = '';
+        if (!res.ok || !res.data) { m.body.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'verify failed' })); return; }
+        renderImportPreview(m, pack, res.data);
+      }).catch(function () { m.body.textContent = ''; m.body.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'verify error' })); });
+    }
+    function renderImportPreview(m, pack, v) {
+      var verdict = el('div', { 'class': 'tstudio-verdict' });
+      function line(label, ok, detail) {
+        var row = el('div', { 'class': 'tstudio-verdict-row' });
+        row.appendChild(el('span', { 'class': 'tstudio-verdict-dot ' + (ok ? 'is-ok' : 'is-bad') }));
+        row.appendChild(el('span', { 'class': 'tstudio-verdict-lab', text: label }));
+        if (detail) { row.appendChild(el('span', { 'class': 'tstudio-verdict-detail', text: detail })); }
+        verdict.appendChild(row);
+      }
+      line('schema', v.schema_ok);
+      line('manifest hash', v.manifest_hash_ok);
+      line('bundle hash', v.bundle_hash_ok);
+      var sig = v.signature || {};
+      line('signature: ' + (sig.verdict || 'unsigned'), sig.verdict !== 'invalid', sig.error || '');
+      m.body.appendChild(verdict);
+      (v.errors || []).forEach(function (e) { m.body.appendChild(el('div', { 'class': 'tstudio-apierr', text: e })); });
+      var st = v.studio || {};
+      m.body.appendChild(el('div', { 'class': 'tstudio-modal-status', text: (st.board_title || '(untitled)') + ' — ' + (st.tile_count || 0) + ' tile(s), ' + (st.design_count || 0) + ' design(s)' }));
+      var kchips = el('div', { 'class': 'tstudio-ext-chips' });
+      (st.kinds || []).forEach(function (k) { kchips.appendChild(el('span', { 'class': 'tstudio-cap-chip', text: k })); });
+      m.body.appendChild(kchips);
+      var capchips = el('div', { 'class': 'tstudio-ext-chips' });
+      (v.capabilities || []).forEach(function (c) { capchips.appendChild(el('span', { 'class': 'tstudio-cap-chip', text: c })); });
+      m.body.appendChild(capchips);
+      var actions = el('div', { 'class': 'tstudio-insp-actions' });
+      var apply = el('button', { 'class': 'tstudio-btn tstudio-btn-primary', type: 'button', title: operator ? 'Write this board + designs' : 'Read-only — operator posture required' }, ['Apply to this board']);
+      if (!(operator && v.ok)) { apply.disabled = true; }
+      if (!v.ok) { m.body.appendChild(el('p', { 'class': 'tstudio-insp-note is-err', text: 'Pack failed validation — apply is blocked.' })); }
+      else if (!operator) { m.body.appendChild(el('p', { 'class': 'tstudio-insp-hint', text: 'Read-only — operator posture required to apply.' })); }
+      var out = el('div', { 'class': 'tstudio-modal-status' });
+      apply.addEventListener('click', function () {
+        apply.disabled = true;
+        applyPack(pack).then(function (r) {
+          out.appendChild(el('div', { 'class': (r.ok ? 'tstudio-modal-ok' : 'tstudio-apierr'), text: r.ok ? 'Applied. Board reloaded.' : ('apply failed: ' + (r.error || '')) }));
+          if (r.ok) { setTimeout(m.close, 700); }
+        });
+      });
+      actions.appendChild(apply);
+      m.body.appendChild(actions);
+      m.body.appendChild(out);
+    }
+    function applyPack(pack) {
+      if (!operator) { return Promise.resolve({ ok: false, error: 'operator posture required' }); }
+      var studio = pack && pack.studio;
+      if (!studio || studio.schema !== TSTUDIO_STUDIO_SCHEMA) { return Promise.resolve({ ok: false, error: 'no studio payload' }); }
+      var d = tstudioNormalizeDoc(studio.board && studio.board.doc);
+      var designs = Array.isArray(studio.designs) ? studio.designs : [];
+      var writes = [tstudioWriteFact(tstudioBoardEntity(boardId), TSTUDIO_DOC_KEY, tstudioSerializeDoc(d))];
+      designs.forEach(function (dz) { if (dz && dz.slug && dz.config) { writes.push(tstudioSaveDesign(tstudioSlugify(dz.slug), dz.name || dz.slug, dz.config)); } });
+      return Promise.all(writes).then(function (results) {
+        var ok = results.every(function (r) { return r && r.ok; });
+        if (ok) {
+          S.nodes = d.nodes; S.links = d.links; S.texts = d.texts; S.pan = d.pan; S.zoom = d.zoom; S.settings = d.settings;
+          renderBoard(); applyBoardSettings(); refreshLibrary(); setSaveState('saved');
+        }
+        return { ok: ok };
+      }).catch(function (e) { return { ok: false, error: String(e && e.message || e) }; });
+    }
+    function openPublishHelp() {
+      var m = tstudioModal('Publish a Studio pack');
+      [
+        'A pack is a crux.studio.v1 payload wrapped in a signed crux.integration.v1 manifest — the same trust rails as any community integration.',
+        '1. Export this board (Export → Build + download). It signs for real only if CORECRUXD_STUDIO_SIGNING_KEY_HEX is set on this daemon; otherwise it downloads unsigned with sign instructions.',
+        '2. Open a PR placing manifest.json + studio-board.json + README.md under integrations/community/<id>/<version>/ (see integrations/community/studio-board-example/).',
+        '3. CI runs `cargo test -p crux-integrations --test community_packs`: it validates schema, both hashes, the Ed25519 signature, and (for dangerous capabilities) an adjacent review.json.',
+        '4. Once merged, the curator-signed community index endorses it. Operators install via the Extensions surface or POST /v1/extensions/install-from-registry.',
+        'There is NO upload endpoint — the community PR + curator-signed index IS the publishing rail.'
+      ].forEach(function (line) { m.body.appendChild(el('p', { 'class': 'tstudio-help-step', text: line })); });
     }
 
     // ---- stage interactions (pan on empty, deselect) -----------------------
@@ -5645,6 +6347,7 @@
     __tstudioCleanup = function () {
       if (S.saveTimer) { clearTimeout(S.saveTimer); }
       Object.keys(S.refreshTimers).forEach(function (id) { if (typeof clearInterval === 'function') { clearInterval(S.refreshTimers[id]); } });
+      Object.keys(S.liveDebounce).forEach(function (id) { if (typeof clearTimeout === 'function') { clearTimeout(S.liveDebounce[id]); } });
       S.cleanups.forEach(function (fn) { try { fn(); } catch (e) { /* ignore */ } });
       S.cleanups = [];
     };
@@ -5663,7 +6366,20 @@
         setWeb: function (id, url) { var n = findNode(id); if (n) { n.url = tstudioWebSrcOk(url) ? url : ''; refreshNode(id); markDirty(); } },
         saveDesign: function (id, name) { var n = findNode(id); if (!n) { return Promise.resolve({ ok: false }); } return tstudioSaveDesign(tstudioSlugify(name), name, nodeTemplate(n)).then(function (r) { if (r.ok) { refreshLibrary(); } return r; }); },
         save: function () { return doSave(); },
-        state: function () { return { count: S.nodes.length, saveState: S.saveState, zoom: S.zoom, pan: { x: S.pan.x, y: S.pan.y }, designs: S.designs.length, nodes: S.nodes.map(function (n) { return { id: n.id, kind: n.kind, x: n.x, y: n.y, w: n.w, h: n.h, route: n.api && n.api.route, url: n.url }; }) }; }
+        state: function () { return { count: S.nodes.length, saveState: S.saveState, zoom: S.zoom, pan: { x: S.pan.x, y: S.pan.y }, designs: S.designs.length, live: S.esState, settings: S.settings, nodes: S.nodes.map(function (n) { return { id: n.id, kind: n.kind, x: n.x, y: n.y, w: n.w, h: n.h, route: (n.api && n.api.route) || (n.search && n.search.route), url: n.url }; }) }; }
+      };
+      // M15 pack round-trip hooks (deterministic Playwright driving; plain
+      // window assignments, harmless to users).
+      window.__tstudioPack = {
+        build: function (meta) { return buildPack(meta || { id: 'studio.rt', name: 'Round-trip', version: '0.1.0', publisher_passport_fpr: 'p_roundtrip_example', summary: 'round-trip proof' }); },
+        verify: function (pack) { var rp = window.CruxApiRead; return rp.studioPackVerify({ pack: pack }).then(function (r) { return r.json(); }); },
+        apply: function (pack) { return applyPack(pack); },
+        payload: function () { return currentStudioPayload(); },
+        setSettings: function (s) { S.settings = tstudioNormalizeSettings(s); applyBoardSettings(); markDirty(); return S.settings; },
+        clear: function () { S.nodes = []; S.links = []; S.texts = []; S.selected = null; renderBoard(); markDirty(); return doSave(); },
+        openImport: function (text) { openImportPreview(text); },
+        openExport: function () { openExportDialog(); },
+        openSettings: function () { openSettingsPanel(); }
       };
     }
 
@@ -5673,9 +6389,10 @@
     if (ctx.seedDoc) {
       var seeded = tstudioNormalizeDoc(ctx.seedDoc);
       S.nodes = seeded.nodes; S.links = seeded.links; S.texts = seeded.texts;
-      S.pan = seeded.pan; S.zoom = seeded.zoom;
+      S.pan = seeded.pan; S.zoom = seeded.zoom; S.settings = seeded.settings;
       S.designs = Array.isArray(ctx.seedDesigns) ? ctx.seedDesigns : [];
       renderBoard();
+      applyBoardSettings();
       paintLibrary();
       setSaveState(operator ? 'clean' : 'readonly');
       return Promise.resolve({ boardId: boardId, found: true, seeded: true });
@@ -5687,9 +6404,10 @@
       if (loading.parentNode) { loading.parentNode.removeChild(loading); }
       var res = out[0];
       S.nodes = res.doc.nodes; S.links = res.doc.links; S.texts = res.doc.texts;
-      S.pan = res.doc.pan; S.zoom = res.doc.zoom;
+      S.pan = res.doc.pan; S.zoom = res.doc.zoom; S.settings = res.doc.settings;
       S.designs = out[1] || [];
       renderBoard();
+      applyBoardSettings();
       paintLibrary();
       setSaveState(operator ? (res.found ? 'saved' : 'clean') : 'readonly');
       return { boardId: boardId, found: res.found };
@@ -10822,6 +11540,19 @@
     tstudioJsonPath: tstudioJsonPath,
     tstudioLatestFact: tstudioLatestFact,
     tstudioSlugify: tstudioSlugify,
+    // M15 — live tiles, automated-data-handling tile kinds, packs, settings,
+    // parameterised designs (pure helpers unit-tested by the smoke).
+    tstudioCoverageNote: tstudioCoverageNote,
+    tstudioTileEvents: tstudioTileEvents,
+    tstudioRenderSearch: tstudioRenderSearch,
+    tstudioRenderCorpus: tstudioRenderCorpus,
+    tstudioRenderReceipts: tstudioRenderReceipts,
+    tstudioRenderExtensions: tstudioRenderExtensions,
+    tstudioNormalizeSettings: tstudioNormalizeSettings,
+    tstudioDerivePackCaps: tstudioDerivePackCaps,
+    tstudioBuildStudioPayload: tstudioBuildStudioPayload,
+    tstudioFindPlaceholders: tstudioFindPlaceholders,
+    tstudioApplyPlaceholders: tstudioApplyPlaceholders,
     TSTUDIO_KINDS: TSTUDIO_KINDS,
     // M10 (console-surfaces-remediation, review round 1) — the native Rings page
     // (canvas "clock of work"; replaced the embedded iframe mock).

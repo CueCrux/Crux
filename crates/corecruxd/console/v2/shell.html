@@ -2215,6 +2215,65 @@
     .tstudio-gauge-fill { transition: none; }
   }
 
+  /* ---- M15: live chip, new tile kinds, packs, settings ------------------- */
+  /* board accent (settings-driven) tints the primary action. */
+  .tstudio-btn-primary { background: var(--ts-board-accent, var(--acc)); border-color: var(--ts-board-accent, var(--acc)); }
+  .tstudio-livechip { display: inline-flex; align-items: center; gap: 6px; font: 600 11px var(--font-mono); color: var(--ink3); }
+  .tstudio-livedot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink3); }
+  .tstudio-livedot.tstudio-save-ok { background: var(--ok); }
+  .tstudio-livedot.tstudio-save-busy { background: var(--acc); animation: tstudio-pulse 1s ease-in-out infinite; }
+  .tstudio-livedot.tstudio-save-err { background: var(--crit); }
+  /* search tile */
+  .tstudio-searchbody { display: flex; flex-direction: column; gap: 5px; overflow: hidden; }
+  .tstudio-cov { display: inline-flex; align-items: center; gap: 6px; font: 600 11px var(--font-mono); color: var(--ok); }
+  .tstudio-cov.is-low { color: var(--warn); }
+  .tstudio-cov-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; flex: none; }
+  .tstudio-search-meta { font: 600 10px var(--font-mono); color: var(--ink3); }
+  .tstudio-hit-score { font: 700 10px var(--font-mono); color: var(--acc); flex: none; font-variant-numeric: tabular-nums; }
+  /* corpus tile */
+  .tstudio-corpusbody { display: flex; flex-direction: column; gap: 6px; }
+  .tstudio-corpus-stats { display: flex; gap: 16px; }
+  .tstudio-corpus-v { font-size: 22px; font-weight: 800; color: var(--ink); font-variant-numeric: tabular-nums; line-height: 1; }
+  .tstudio-corpus-k { font: 600 9.5px var(--font-mono); color: var(--ink3); margin-top: 3px; }
+  .tstudio-corpus-meta { font: 600 10px var(--font-mono); color: var(--ink2); }
+  /* receipts tile */
+  .tstudio-rec-id { font: 600 9.5px var(--font-mono); color: var(--acc); flex: none; }
+  /* extensions tile */
+  .tstudio-extbody { display: flex; flex-direction: column; gap: 6px; overflow-y: auto; }
+  .tstudio-ext-empty { display: flex; flex-direction: column; gap: 6px; }
+  .tstudio-ext-card { border: 1px solid var(--edge); border-radius: var(--radius-sm); padding: 6px 8px; display: flex; flex-direction: column; gap: 5px; }
+  .tstudio-ext-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .tstudio-ext-id { font: 700 11.5px var(--font-mono); color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tstudio-ext-tier { font: 600 9px var(--font-mono); text-transform: uppercase; letter-spacing: .08em; color: var(--trust); }
+  .tstudio-ext-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+  .tstudio-cap-chip { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 999px; background: color-mix(in srgb, var(--acc) 14%, transparent); color: var(--acc); font: 600 10px var(--font-mono); }
+  .tstudio-ext-ep { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .tstudio-ext-ep-lab { font: 600 10px var(--font-mono); color: var(--warn); }
+  .tstudio-ext-invoke { height: 24px; padding: 0 9px; font-size: 11px; }
+  /* fixed-route + caps preview */
+  .tstudio-fixedroute { font: 600 11px var(--font-mono); color: var(--ink2); padding: 6px 9px; border: 1px dashed var(--edge); border-radius: var(--radius-sm); background: var(--surface2); word-break: break-all; }
+  .tstudio-caps-preview { display: flex; flex-direction: column; gap: 5px; }
+  /* modal */
+  .tstudio-modal-overlay { position: absolute; inset: 0; z-index: 40; display: flex; align-items: center; justify-content: center; background: color-mix(in srgb, var(--bg) 70%, transparent); padding: 20px; }
+  .tstudio-modal { width: 100%; max-width: 460px; max-height: 86%; display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--edge-strong); border-radius: var(--radius); box-shadow: var(--card-shadow); overflow: hidden; }
+  .tstudio-modal-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid var(--edge); }
+  .tstudio-modal-h { margin: 0; font-size: 14px; font-weight: 700; color: var(--ink); }
+  .tstudio-modal-x { border: none; background: none; color: var(--ink3); font-size: 20px; line-height: 1; cursor: pointer; padding: 0 4px; }
+  .tstudio-modal-x:hover { color: var(--ink); }
+  .tstudio-modal-body { padding: 14px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+  .tstudio-modal-status { font-size: 11.5px; color: var(--ink2); line-height: 1.45; }
+  .tstudio-modal-ok { font-size: 11.5px; color: var(--ok); font-weight: 600; }
+  .tstudio-textarea { height: auto; min-height: 60px; padding: 8px 9px; resize: vertical; line-height: 1.4; }
+  /* verdict */
+  .tstudio-verdict { display: flex; flex-direction: column; gap: 5px; padding: 8px 10px; border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2); }
+  .tstudio-verdict-row { display: flex; align-items: center; gap: 8px; }
+  .tstudio-verdict-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--ink3); }
+  .tstudio-verdict-dot.is-ok { background: var(--ok); }
+  .tstudio-verdict-dot.is-bad { background: var(--crit); }
+  .tstudio-verdict-lab { font: 600 11.5px var(--font-mono); color: var(--ink); }
+  .tstudio-verdict-detail { font: 600 10.5px var(--font-mono); color: var(--crit); overflow: hidden; text-overflow: ellipsis; }
+  .tstudio-help-step { margin: 0; font-size: 11.5px; color: var(--ink2); line-height: 1.5; }
+
   /* ---- Canvas relation graph — card nodes + node inspector --------------- */
   .canvas-graph { position: relative; }
   /* No frame — nodes drop straight onto the page; the stage is just the pannable area. */

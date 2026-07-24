@@ -136,6 +136,18 @@ pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContra
         ));
     }
 
+    // Studio board packs (console-surfaces-remediation M15). Read class: both
+    // routes are pure transforms/validators over a client-supplied payload
+    // (build = hash + optional sign; verify = schema/hash/signature verdict).
+    // Neither mutates the fact store; the apply step reuses the gated
+    // /v1/console/facts/add write route.
+    if path.starts_with("/v1/studio/") {
+        return Some(RouteAuthContract::new(
+            RouteAuthClass::Read,
+            &["query:read", "admin:read"],
+        ));
+    }
+
     if path.starts_with("/v1/projections/") {
         let class = if method == "GET" {
             RouteAuthClass::AdminRead

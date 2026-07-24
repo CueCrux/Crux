@@ -80,6 +80,7 @@ mod routing;
 pub mod session;
 mod storybook;
 mod stream_receipts;
+mod studio_pack;
 mod sync;
 mod witness;
 mod work;
@@ -657,6 +658,17 @@ pub(crate) fn router_with_route_auth(
         .route(
             "/v1/query/text-search/expand",
             axum::routing::post(self::query::post_query_text_search_expand),
+        )
+        // console-surfaces-remediation M15: Studio board packs — curated read
+        // POSTs (hash/sign a pack; verify an uploaded pack). Neither mutates the
+        // fact store; the apply step reuses the gated /v1/console/facts/add.
+        .route(
+            "/v1/studio/pack/build",
+            axum::routing::post(self::studio_pack::post_build_pack),
+        )
+        .route(
+            "/v1/studio/pack/verify",
+            axum::routing::post(self::studio_pack::post_verify_pack),
         )
         // Memory primitives (Phase 1.5)
         .route("/v1/facts", axum::routing::put(self::facts::put_fact))

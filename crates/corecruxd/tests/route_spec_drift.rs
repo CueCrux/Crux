@@ -145,12 +145,20 @@ const GATED_MUTATIONS: &[(&str, &str, &str)] = &[
 //   * query.rs::post_query_time_range         — POST /v1/query/time-range
 //   * engine_console.rs::post_engine_search   — POST /v1/console/engine/search
 //     (the ONE mediated read POST; proxies CruxEngine POST /v1/retrieve)
+//   * studio_pack.rs::post_build_pack   — POST /v1/studio/pack/build
+//   * studio_pack.rs::post_verify_pack  — POST /v1/studio/pack/verify
+//     (console-surfaces-remediation M15: Studio board pack export/import. Both
+//     are pure transforms/validators over a client-supplied payload — no store
+//     mutation, no operator posture — so they are read POSTs, not gated
+//     mutations. The apply step reuses the gated /v1/console/facts/add.)
 const READ_POST_ROUTES: &[(&str, &str, &str)] = &[
     ("POST", "/v1/query/text-search", "queryTextSearch"),
     ("POST", "/v1/query/text-search/expand", "queryTextSearchExpand"),
     ("POST", "/v1/query/graph-expand", "queryGraphExpand"),
     ("POST", "/v1/query/time-range", "queryTimeRange"),
     ("POST", "/v1/console/engine/search", "engineSearch"),
+    ("POST", "/v1/studio/pack/build", "studioPackBuild"),
+    ("POST", "/v1/studio/pack/verify", "studioPackVerify"),
 ];
 
 // ── Router source scanning (mirrors route_auth::parse_routes_in_source) ──────

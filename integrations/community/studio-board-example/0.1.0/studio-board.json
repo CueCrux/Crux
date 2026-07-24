@@ -1,0 +1,97 @@
+{
+  "board": {
+    "doc": {
+      "links": [],
+      "nodes": [
+        {
+          "api": {
+            "fields": "",
+            "jsonPath": "stores.facts",
+            "max": "",
+            "params": "",
+            "preset": "stat",
+            "refresh": "live",
+            "route": "/v1/console/summary",
+            "tokenBudget": ""
+          },
+          "h": 140,
+          "id": "facts",
+          "kind": "api",
+          "label": "Facts",
+          "w": 220,
+          "x": 40,
+          "y": 40,
+          "z": 2
+        },
+        {
+          "api": {
+            "fields": "",
+            "jsonPath": "count",
+            "max": "",
+            "params": "",
+            "preset": "stat",
+            "refresh": "off",
+            "route": "/v1/console/sessions",
+            "tokenBudget": ""
+          },
+          "h": 140,
+          "id": "sessions",
+          "kind": "api",
+          "label": "Sessions",
+          "w": 220,
+          "x": 300,
+          "y": 40,
+          "z": 2
+        },
+        {
+          "h": 240,
+          "id": "search",
+          "kind": "search",
+          "label": "Search",
+          "search": {
+            "query": "execplan",
+            "refresh": "off",
+            "route": "/v1/query/text-search",
+            "tenant": "default",
+            "tokenBudget": "800"
+          },
+          "w": 480,
+          "x": 40,
+          "y": 220,
+          "z": 2
+        },
+        {
+          "body": "A portable Studio board: two live-capable stat tiles, a text-search tile, this note.",
+          "h": 180,
+          "id": "note",
+          "kind": "note",
+          "label": "About",
+          "sub": "Example board",
+          "w": 260,
+          "x": 560,
+          "y": 40,
+          "z": 2
+        }
+      ],
+      "pan": {
+        "x": 0,
+        "y": 0
+      },
+      "texts": [],
+      "version": 1,
+      "zoom": 1
+    },
+    "id": "studio-board-example"
+  },
+  "created_at_unix_ms": 1753000000000,
+  "designs": [],
+  "schema": "crux.studio.v1",
+  "settings": {
+    "accent": "cool",
+    "description": "A minimal, portable Studio board demonstrating the pack format.",
+    "grid": 20,
+    "refresh": "live",
+    "title": "Example board"
+  },
+  "version": 1
+}

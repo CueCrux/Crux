@@ -826,6 +826,8 @@ const READ_POST_ROUTES = Object.freeze([
   Object.freeze(['POST', '/v1/query/graph-expand']),
   Object.freeze(['POST', '/v1/query/time-range']),
   Object.freeze(['POST', '/v1/console/engine/search']),
+  Object.freeze(['POST', '/v1/studio/pack/build']),
+  Object.freeze(['POST', '/v1/studio/pack/verify']),
 ]);
 
 const CruxApiRead = Object.freeze({
@@ -843,6 +845,12 @@ const CruxApiRead = Object.freeze({
   },
   engineSearch(body) {
     return fetch(`/v1/console/engine/search`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  studioPackBuild(body) {
+    return fetch(`/v1/studio/pack/build`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  studioPackVerify(body) {
+    return fetch(`/v1/studio/pack/verify`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
   },
 });
 

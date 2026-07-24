@@ -417,6 +417,8 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/shard-map", methods: &["GET"], tag: "Routing", auth: "admin-read", summary: "Shard map" },
     RouteEntry { path: "/v1/shards", methods: &["GET"], tag: "Routing", auth: "admin-read", summary: "Shards" },
     RouteEntry { path: "/v1/status-feed", methods: &["GET"], tag: "StatusFeed", auth: "read", summary: "Status feed" },
+    RouteEntry { path: "/v1/studio/pack/build", methods: &["POST"], tag: "Studio", auth: "read", summary: "Build a Studio board pack (curated read POST; hashes + optional sign)" },
+    RouteEntry { path: "/v1/studio/pack/verify", methods: &["POST"], tag: "Studio", auth: "read", summary: "Verify an uploaded Studio board pack (curated read POST; schema/hash/signature)" },
     RouteEntry { path: "/v1/sync/handshake/nonce", methods: &["POST"], tag: "Sync", auth: "public", summary: "Issue sync peer handshake nonce" },
     RouteEntry { path: "/v1/sync/tenants/{tenantId}/collections/{collection}", methods: &["GET"], tag: "Sync", auth: "read", summary: "Sync tenants {tenantId} collections {collection}" },
     RouteEntry { path: "/v1/sync/tenants/{tenantId}/manifest", methods: &["GET"], tag: "Sync", auth: "read", summary: "Sync tenants {tenantId} manifest" },
