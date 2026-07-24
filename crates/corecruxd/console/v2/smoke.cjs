@@ -3587,8 +3587,11 @@ function extractThemeVars(theme) {
       check(hrefs.has(want), '[sitemap] registered page ' + id + ' has no click-through node (' + want + ')');
     });
 
-    // The destination-IS-the-page surfaces get their real routes.
-    ['#/overwatch', '#/canvas/board', '#/canvas/graph', '#/canvas/tree', '#/explorer', '#/sitemap', '#/rings'].forEach(function (route) {
+    // The destination-IS-the-page surfaces get their real routes. M19 — Board/
+    // Graph/Tree are absorbed into the Rings tab hub, so their map nodes moved from
+    // #/canvas/<view> to #/rings/<view> (the Canvas destination is retired from the
+    // map; Studio moved to the account menu + rail head). Honest retarget.
+    ['#/overwatch', '#/rings/board', '#/rings/graph', '#/rings/tree', '#/explorer', '#/sitemap', '#/rings'].forEach(function (route) {
       check(hrefs.has(route), '[sitemap] missing destination-is-page node for ' + route);
     });
 
@@ -3734,21 +3737,25 @@ function extractThemeVars(theme) {
   //     model (refresh always works; this is the "ideally live" upgrade).
   check(/EventSource\('\/v1\/events\/stream\?types=fact\.stored'\)/.test(shellHtml) && /console:workspace:'\) !== 0 && entity\.indexOf\('console:page:/.test(shellHtml),
     '[m17] the shell must live-reload the workspace model on a console:workspace/page fact.stored event');
-  // (c) collapsed rail: the expander chevron is removed (icons only) + a dest
-  //     icon CLICK opens the flyout (works for touch/keyboard, not only hover).
+  // (c) collapsed rail: the expander chevron is removed (icons only). M19 changed
+  //     the click semantics — a dest icon CLICK now navigates PAGE-LEVEL in both
+  //     rail states; the sub-page flyout is a hover + ArrowRight (keyboard)
+  //     affordance (see Check 55). Honest retarget of the M17 click assertion.
   check(/\[data-rail="collapsed"\]\s+\.rail-toggle\s*\{\s*display:\s*none/.test(shellHtml),
     '[m17] the compressed rail must hide the expander chevron (rail-toggle display:none)');
-  check(/function railIsCollapsed\(/.test(shellHtml) && /railIsCollapsed\(\) && hasPages/.test(shellHtml),
-    '[m17] a compressed-rail dest click must open the flyout (railIsCollapsed → openRailFlyout)');
+  check(/function railIsCollapsed\(/.test(shellHtml),
+    '[m17] railIsCollapsed() must exist (collapsed-rail state helper)');
   // (d) single workspace switcher button + rightward pop-out (replaces the
   //     multi-button data-ws strip); reachable in both rail states.
   check(/ws-switch-btn/.test(shellHtml) && /function openWsSwitchPop\(/.test(shellHtml) && /id: 'wsSwitchPop'/.test(shellHtml),
     '[m17] the switcher must be ONE button opening a rightward workspace pop-out (wsSwitchPop)');
   check(/'data-railic': 'ws-switch'/.test(shellHtml) && !/'data-railic': 'command'/.test(shellHtml),
     '[m17] the collapsed rail must carry the single ws-switch icon (command/explorer folded into the pop-out)');
-  // (e) operator popup gains Studio + Options (both navigate); theme+connection stay.
-  check(/rail-ops-nav/.test(shellHtml) && /'#\/canvas\/studio'/.test(shellHtml) && /'#\/system\/cx-settings'/.test(shellHtml),
-    '[m17] the operator popup must gain Studio (#/canvas/studio) + Options (#/system/cx-settings) nav entries');
+  // (e) operator popup keeps Options (theme+connection stay). M19 — Studio moved
+  //     OUT of this popup to the account pop-out + rail head (see Check 55), so it
+  //     is no longer asserted here (was M17). Honest retarget.
+  check(/rail-ops-nav/.test(shellHtml) && /'#\/system\/cx-settings'/.test(shellHtml),
+    '[m17] the operator popup must keep the Options (#/system/cx-settings) nav entry');
   // (f) Settings honesty — a page-specific honest gate reason; the generic
   //     "wired in M3+" stays the DEFAULT choke point everywhere else.
   check(/gateReason/.test(renderSrc) && /wired in M3\+/.test(renderSrc),
@@ -3796,6 +3803,65 @@ function extractThemeVars(theme) {
   check(/if \(typeof closeAcctPop === 'function'\) \{ closeAcctPop\(\); \}/.test(shellHtml),
     '[m18] route() must close the account pop-out on navigation');
   notes.push('operator round 7 (M18): switcher return-to-Command bug fixed (applyMode now leaves a #/w/ workspace route for a Command destination, mirroring its #/documents exit — before, only #/documents was cleared so the switch re-rendered the same workspace); the bottom-of-rail operator/account badge redesigned from the clipped upward roll-up into the M17 rail-flyout glass pop-out (#acctPop): Settings · Language · Log out, focus-first + Escape + click-away, flush to the rail edge, sane in both rail states + all three themes.');
+})();
+
+// ---- Check 55 — (console-surfaces-remediation M19) operator round 8:
+//  rings consolidation (play bar inline with the tab icons + search; date pickers
+//  return to the bottom bar; static aria-hidden range labels where they were),
+//  right-tile dedup + real-series charts, Canvas absorbed into the Rings tab hub
+//  (Board/Graph/Tree tabs; #/canvas/* deep-link redirects), and Studio relocated
+//  (account pop-out between Settings and Language + a rail-head button; removed
+//  from the operator popup). Collapsed-rail click becomes page-level nav.
+(function () {
+  // (a) rings play bar rides the topbar row; dates moved to the bottom bar; the
+  //     old date-picker slots are NON-clickable static (aria-hidden) range labels.
+  check(/'class': 'rings-playbar'/.test(renderSrc) && /ringTabMount\.appendChild\(playbar\)/.test(renderSrc),
+    '[m19] the rings play bar (rings-playbar) must mount into the topbar tab slot (next to the tab icons + search)');
+  check(/rings-rangelabel/.test(renderSrc) && /\.rings-playbar \.rings-rangelabel/.test(shellHtml) && /pointer-events: none/.test(shellHtml),
+    '[m19] the play bar must render NON-clickable, aria-hidden static range labels where the pickers were');
+  check(/'class': 'rings-bottombar' \}, \[dStart, grpWindow, dEnd, grpZoom\]/.test(renderSrc),
+    '[m19] the date pickers must return to the bottom bar, flanking the window sliders ([start][sliders][end] + zoom)');
+  // (b) right-tile dedup + real per-day charts (no fabricated trends).
+  check(!/glExecplans/.test(renderSrc) && !/glSessions/.test(renderSrc),
+    '[m19] the duplicate execplans + sessions glance tiles must be removed (they mirrored the ExecPlans/Sessions lens tiles)');
+  check(/SESS_DAYS/.test(renderSrc) && /last_active_unix_ms/.test(renderSrc) && /daySpark\(tSess\.sp/.test(renderSrc),
+    '[m19] the sessions tile must chart a real last_active_unix_ms per-day histogram');
+  check(/daySpark\(glFacts\.sp, dataS/.test(renderSrc),
+    '[m19] the facts glance tile must chart the real facts-stored_at series (no fabricated trend)');
+  // (c) Canvas absorbed: Board/Graph/Tree are Rings tabs; #/canvas/* redirects;
+  //     the Canvas destination is railHidden (route-only, Studio's stable home).
+  check(/id: 'cv-board'/.test(renderSrc) && /id: 'cv-graph'/.test(renderSrc) && /id: 'cv-tree'/.test(renderSrc),
+    '[m19] RINGS_TABS must carry the absorbed Board/Graph/Tree tabs (cv-board/cv-graph/cv-tree)');
+  check(/CANVAS_TAB_IDS/.test(renderSrc) && /renderCanvasGraph\(tabHost/.test(renderSrc) && /renderPlanTree\(tabHost/.test(renderSrc) && /renderCanvasBoard\(tabHost/.test(renderSrc),
+    '[m19] the rings tab hub must render Board/Graph/Tree through their normal renderers into the swap host');
+  check(/function teardownCanvasTab\(/.test(renderSrc) && /__canvasGraphCleanup/.test(renderSrc),
+    '[m19] switching away from a canvas tab must tear down its RAF/listener (teardownCanvasTab)');
+  const canvasDest = (pages.DESTS || []).find(function (d) { return d.id === 'canvas'; });
+  check(!!canvasDest && canvasDest.railHidden === true && canvasDest.key === undefined,
+    '[m19] the Canvas destination must be railHidden + keyless (route-only home for Studio; not in the rail/keyboard)');
+  check(/first === 'canvas'/.test(shellHtml) && /'#\/rings\/' \+ target/.test(shellHtml),
+    '[m19] route() must redirect #/canvas/board|graph|tree to #/rings/<view> (deep links never dead-end)');
+  check(/initialTab: ringsInitialTab/.test(shellHtml) && /RINGS_TAB_MAP/.test(shellHtml),
+    '[m19] the rings route must map a #/rings/<view> deep link to the matching tab (initialTab)');
+  check(/d\.id !== 'explorer' && d\.id !== 'canvas'/.test(renderSrc),
+    '[m19] the Command workspace builtin must skip the retired Canvas destination');
+  check(/#\/canvas\/studio keeps working/.test(shellHtml) || /studio' \)/.test(shellHtml) || /parts\[1\] === 'studio'/.test(shellHtml),
+    '[m19] #/canvas/studio must remain routable (Studio stable home)');
+  // (d) Studio relocation: account pop-out (between Settings/Language) + rail head;
+  //     removed from the operator popup ("move", not copy).
+  const iSet = shellHtml.indexOf("mk('Settings', 'settings', 'settings')");
+  const iStu = shellHtml.indexOf("mk('Studio', 'canvas', 'studio')");
+  const iLang = shellHtml.indexOf("mk('Language', 'globe', 'language'");
+  check(iSet >= 0 && iStu > iSet && iLang > iStu,
+    '[m19] the account pop-out must carry Studio BETWEEN Settings and Language');
+  check(/id="railStudioBtn"/.test(shellHtml) && /getElementById\('railStudioBtn'\)/.test(shellHtml) && /'#\/canvas\/studio'/.test(shellHtml),
+    '[m19] the expanded-rail head must carry a Studio button (railStudioBtn) next to the theme control');
+  check(!/mkNav\('Studio'/.test(shellHtml),
+    '[m19] the operator popup must NOT carry a Studio nav entry (moved to the account pop-out + rail head)');
+  // (e) collapsed rail click = page-level nav; flyout on hover + ArrowRight.
+  check(/a dest icon CLICK always navigates/.test(shellHtml) && /e\.key === 'ArrowRight'/.test(shellHtml),
+    '[m19] a rail dest click must navigate page-level; the flyout is a hover + ArrowRight (keyboard) affordance');
+  notes.push('operator round 8 (M19): rings play bar moved inline with the tab icons + search (static, aria-hidden range labels where the pickers were); date pickers returned to the bottom bar flanking the window sliders; duplicate execplans/sessions glance tiles removed; sessions tile + facts glance gained real per-day histograms (last_active_unix_ms / facts stored_at); Board/Graph/Tree absorbed into the Rings tab hub (renderCanvasBoard/Graph + renderPlanTree into the swap host, clean teardown), Canvas destination retired to a railHidden route-only home, #/canvas/board|graph|tree redirect to #/rings/<view>, sitemap Check 50 retargeted; Studio relocated to the account pop-out (between Settings and Language) + a rail-head button next to the theme control, removed from the operator popup; rail dest click navigates page-level with a hover + ArrowRight flyout (built-in + workspace rails).');
 })();
 
 // ---- Report (awaits async renderer-driven checks) -----------------------

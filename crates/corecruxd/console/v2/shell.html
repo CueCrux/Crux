@@ -679,7 +679,7 @@
      since they now live outside .rings-root. */
   .rings-root.rings-tab-active .rings-canvas { opacity: 0; pointer-events: none; }
   /* Rings page: the topbar drops the page heading and hosts the icon tabs. */
-  .topbar.rings-tabmode .topbar-title { display: flex; align-items: center; }
+  .topbar.rings-tabmode .topbar-title { display: flex; align-items: center; gap: 8px; flex: 1 1 auto; min-width: 0; }
   .topbar.rings-tabmode .topbar-title > h1,
   .topbar.rings-tabmode .topbar-title > .sub { display: none; }
   .rings-tabicons-slot { display: inline-flex; align-items: center; min-width: 0; }
@@ -723,21 +723,31 @@
      cluster (left) and the unified colour-coded card group (right) beneath it.
      Bottom: one centred, opaque control bar (date window + sliders + zoom). --- */
 
-  /* top play/timeline bar (M12) — centred, SAME measure as the bottom bar.
-     Layout: start-date · play · slider · finish-date; cDate floats below centre. */
-  .rings-topbar { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); width: min(680px, calc(100% - 24px)); z-index: 14; display: flex; align-items: center; gap: 11px; background: var(--rings-topbar-bg); border: 1px solid var(--rings-hairline); border-radius: 12px; padding: 8px 14px; -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
-  .rings-topbar .ic { display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; flex: none; color: var(--rings-ink2); background: var(--rings-panel-strong); border: 1px solid var(--rings-hairline-strong); border-radius: 8px; cursor: pointer; }
-  .rings-topbar .ic svg { width: 17px; height: 17px; }
-  .rings-topbar .ic:hover { color: var(--rings-ink); background: var(--rings-btn-bg-hover); }
-  .rings-topbar .ic[aria-pressed="true"] { color: var(--rings-accent); border-color: color-mix(in srgb, var(--rings-accent) 55%, transparent); background: color-mix(in srgb, var(--rings-accent) 14%, transparent); }
-  .rings-topbar .ic:focus-visible, .rings-topbar input:focus-visible { outline: 2px solid var(--rings-accent); outline-offset: 2px; }
-  .rings-topbar .rings-bdate { flex: none; font: 600 11px var(--font-mono); color: var(--rings-ink2); background: var(--rings-panel-strong); border: 1px solid var(--rings-hairline-strong); border-radius: 7px; padding: 5px 7px; color-scheme: var(--rings-scheme); }
-  input.rings-timeline { flex: 1 1 auto; min-width: 0; height: 26px; accent-color: var(--rings-accent); cursor: pointer; }
-  .rings-topbar .chip { position: absolute; left: 50%; top: calc(100% + 5px); transform: translateX(-50%); background: var(--rings-panel-strong); border: 1px solid var(--rings-hairline); color: var(--rings-ink2); border-radius: 999px; padding: 2px 12px; font: 700 11px var(--font-mono); white-space: nowrap; -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
+  /* M19 — the compact play bar rides the TOPBAR ROW (tab icons + search), so it
+     uses the SHELL design tokens (it lives outside .rings-root, like the tab icons).
+     Layout: static start-range label · play · scrubber · static end-range label ·
+     live scrub-date. The scrubber shrinks (min 40px) before the row wraps; the
+     static labels drop first on narrow viewports. The date PICKERS moved to the
+     bottom bar (M19). */
+  .rings-playbar { position: relative; display: inline-flex; align-items: center; gap: 8px; flex: 1 1 auto; min-width: 90px; margin-left: 10px; padding: 4px 10px; background: var(--surface2); border: 1px solid var(--edge); border-radius: var(--radius-sm); }
+  .rings-playbar .ic { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; flex: none; color: var(--ink2); background: var(--surface); border: 1px solid var(--edge); border-radius: 8px; cursor: pointer; }
+  .rings-playbar .ic svg { width: 16px; height: 16px; }
+  .rings-playbar .ic:hover { color: var(--ink); background: var(--surface2); }
+  .rings-playbar .ic[aria-pressed="true"] { color: var(--acc); border-color: color-mix(in srgb, var(--acc) 55%, transparent); background: color-mix(in srgb, var(--acc) 14%, transparent); }
+  .rings-playbar .ic:focus-visible, .rings-playbar input:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; }
+  /* NON-clickable, muted static range labels — where the date PICKERS used to sit
+     (they moved to the bottom bar). aria-hidden in the DOM (AT uses the pickers). */
+  .rings-playbar .rings-rangelabel { flex: none; font: 600 11px var(--font-mono); color: var(--ink3); white-space: nowrap; pointer-events: none; user-select: none; }
+  .rings-playbar input.rings-timeline { flex: 1 1 auto; min-width: 40px; height: 22px; accent-color: var(--acc); cursor: pointer; }
+  .rings-playbar .rings-playdate { flex: none; background: var(--surface); border: 1px solid var(--edge); color: var(--ink2); border-radius: 999px; padding: 2px 10px; font: 700 10.5px var(--font-mono); white-space: nowrap; }
+  @media (max-width: 1180px) { .rings-playbar .rings-rangelabel { display: none; } }
+  /* the bottom bar now carries the date pickers, flanking the window sliders */
+  .rings-bottombar .rings-bdate { flex: none; font: 600 11px var(--font-mono); color: var(--rings-ink2); background: var(--rings-panel-strong); border: 1px solid var(--rings-hairline-strong); border-radius: 7px; padding: 5px 7px; color-scheme: var(--rings-scheme); }
+  .rings-bottombar .rings-bdate:focus-visible { outline: 2px solid var(--rings-accent); outline-offset: 2px; }
 
   /* tool + filter + help cluster (M12) — VERTICAL toolbar down the top-left
      corner; rail-size tier (40px square, 18px icon); popovers open to the right. */
-  .rings-tools { position: absolute; top: 88px; left: 12px; z-index: 16; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; max-width: none; max-height: calc(100% - 172px); }
+  .rings-tools { position: absolute; top: 16px; left: 12px; z-index: 16; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; max-width: none; max-height: calc(100% - 104px); }
   .rings-tools .grp { display: flex; flex-direction: column; align-items: stretch; gap: 6px; }
   .rings-tools .ic, .rings-tools .grp button, .rings-tools .rings-iconbtn { width: 40px; min-width: 40px; height: 40px; padding: 0; display: inline-flex; align-items: center; justify-content: center; font: 600 12px var(--font-mono); color: var(--rings-ink2); background: var(--rings-btn-bg); border: 1px solid var(--rings-hairline-strong); border-radius: 9px; cursor: pointer; }
   .rings-tools .ic svg, .rings-tools .grp button svg, .rings-tools .rings-iconbtn svg { width: 18px; height: 18px; flex: none; }
@@ -777,7 +787,7 @@
 
   /* top-right lens/glance tile group (M12) — ONE vertical column, colour-coded.
      Responsive: ≤1180px drop the sparklines + compact to single rows; ≤980px shrink. */
-  .rings-cards { position: absolute; top: 88px; right: 12px; z-index: 15; display: flex; flex-direction: column; gap: 6px; width: 186px; max-width: 42%; max-height: calc(100% - 172px); overflow-y: auto; overflow-x: hidden; }
+  .rings-cards { position: absolute; top: 16px; right: 12px; z-index: 15; display: flex; flex-direction: column; gap: 6px; width: 186px; max-width: 42%; max-height: calc(100% - 104px); overflow-y: auto; overflow-x: hidden; }
   .rings-card { text-align: left; display: flex; flex-direction: column; gap: 1px; background: var(--rings-tile-bg); border: 1px solid var(--rings-hairline); border-top: 2px solid var(--h, var(--rings-accent)); border-radius: 10px; padding: 6px 10px 7px; color: var(--rings-ink2); font-family: var(--font-sans); }
   button.rings-card { cursor: pointer; transition: border-color .15s, background .15s; }
   button.rings-card:hover { border-color: var(--rings-hairline-strong); background: var(--rings-tile-bg-hover); }
@@ -3033,6 +3043,9 @@
             <span id="healthText">Connecting…</span>
           </span>
           <button class="rail-theme-cycle" id="themeCycle" type="button" title="Cycle theme" aria-label="Cycle theme"></button>
+          <!-- M19 — Studio button, next to the theme control (expanded-rail head).
+               Studio also lives in the account pop-out; both open #/canvas/studio. -->
+          <button class="rail-theme-cycle rail-studio-btn" id="railStudioBtn" type="button" title="Open Studio" aria-label="Open Studio"></button>
         </div>
       </div>
       <!-- Collapsed-rail icon controls (M16a): Command · Explorer · Operator
@@ -3195,6 +3208,9 @@
     cyc.innerHTML = ICONS.palette || '';
     cyc.addEventListener('click', cycleTheme);
     applyTheme(readTheme());   // set the tooltip
+    // M19 — the Studio button that sits next to the theme control (expanded rail).
+    var st = document.getElementById('railStudioBtn');
+    if (st) { st.innerHTML = ICONS.canvas || ''; st.addEventListener('click', function () { location.hash = '#/canvas/studio'; }); }
   }
   // System › Settings › Theme — the theme picker (moved off the rail footer) plus
   // per-theme "in cycle" allocation for the rail quick-cycle button.
@@ -3241,6 +3257,7 @@
   var acctPop = null, acctAnchor = null;
   function acctAction(acct) {
     if (acct === 'settings') { location.hash = '#/system/cx-settings'; }
+    else if (acct === 'studio') { location.hash = '#/canvas/studio'; }   // M19 — Studio relocated here
     else if (acct === 'logout') {
       if (!window.CruxSession) { return; }
       window.CruxSession.logout()
@@ -3262,6 +3279,7 @@
       return row;
     };
     acctPop.appendChild(mk('Settings', 'settings', 'settings'));
+    acctPop.appendChild(mk('Studio', 'canvas', 'studio'));   // M19 — Studio relocated between Settings and Language
     acctPop.appendChild(mk('Language', 'globe', 'language', el('span', { 'class': 'acct-code', id: 'acctLangCode', text: 'EN' })));
     var logoutRow = mk('Log out', 'logout', 'logout');
     logoutRow.hidden = true;   // shown only on a hosted platform session (probe below)
@@ -3913,8 +3931,9 @@
     railOpsPop = el('div', { id: 'railOpsPop', 'class': 'rail-flyout', role: 'menu', 'aria-label': 'Operator options' });
     railOpsPop.hidden = true;
     railOpsPop.appendChild(el('div', { 'class': 'rail-flyout-h', text: 'Operator options' }));
-    // M17 — nav entries: Studio + Options (both navigate). Studio → the tile
-    // builder; Options → the Settings page. They sit above Theme / Connection.
+    // M19 — nav entry: Options only. Studio MOVED to the account pop-out (between
+    // Settings and Language) + a button next to the theme control in the expanded
+    // rail head, so it is no longer duplicated here (M17 added it; M19 relocates it).
     var nsec = el('div', { 'class': 'rail-ops-sec rail-ops-nav' });
     var mkNav = function (label, iconHtml, hash) {
       var row = el('button', { 'class': 'rail-flyout-item', type: 'button', role: 'menuitem' }, [
@@ -3924,7 +3943,6 @@
       row.addEventListener('click', function () { closeRailOpsPop(); location.hash = hash; });
       return row;
     };
-    nsec.appendChild(mkNav('Studio', ICONS.canvas || '', '#/canvas/studio'));
     nsec.appendChild(mkNav('Options', ICONS.settings || '', '#/system/cx-settings'));
     railOpsPop.appendChild(nsec);
     var tsec = el('div', { 'class': 'rail-ops-sec' });
@@ -4030,20 +4048,19 @@
       if (item.key) { btn.appendChild(el('span', { 'class': 'kbd', text: item.key })); }
       (function (id, b) {
         var hasPages = railFlyoutPages(id).length > 1;
-        b.addEventListener('click', function () {
-          // M17 — in the compressed rail a dest icon CLICK opens the flyout (the
-          // primary compressed nav: works for touch/keyboard, not just hover).
-          // Expanded, click navigates (the sub-nav pill row shows the pages).
-          if (railIsCollapsed() && hasPages) { openRailFlyout(id, b); return; }
-          location.hash = '#/' + id;
-        });
-        // Flyout on hover/focus for destinations that carry pages (the sub-pill set).
-        if (railFlyoutPages(id).length) {
+        // M19 — a dest icon CLICK always navigates to the destination's default
+        // page (page-level nav), in BOTH rail states (Enter/Space navigate too).
+        // The sub-page flyout is a HOVER-intent affordance for pointer users;
+        // keyboard users open it with ArrowRight (Escape/click-away close it).
+        b.addEventListener('click', function () { location.hash = '#/' + id; });
+        if (hasPages) {
           b.setAttribute('aria-haspopup', 'true');
           b.setAttribute('aria-expanded', 'false');
           b.addEventListener('mouseenter', function () { openRailFlyout(id, b); });
-          b.addEventListener('focus', function () { openRailFlyout(id, b); });
           b.addEventListener('mouseleave', scheduleRailFlyoutClose);
+          b.addEventListener('keydown', function (e) {
+            if (e.key === 'ArrowRight') { e.preventDefault(); openRailFlyout(id, b); railFlyoutFocusFirst(); }
+          });
         }
       })(item.id, btn);
       nav.appendChild(btn);
@@ -4435,8 +4452,15 @@
       if (ringsTt) { ringsTt.appendChild(ringsTabSlot); }
       var ringsHost = el('div', { 'class': 'rings-region-host', id: 'ringsHost' });
       content.appendChild(ringsHost);
+      // M19 — a #/rings/<tab> deep link (board|graph|tree — landed here from a
+      // #/canvas/* redirect) opens that absorbed Canvas tab; a graph link carries
+      // ?focus=. Map the sub-path to the tab id and parse the focus.
+      var ringsSub = (location.hash || '').replace(/^#\/?/, '').split('?')[0].split('/')[1] || '';
+      var RINGS_TAB_MAP = { board: 'cv-board', graph: 'cv-graph', tree: 'cv-tree' };
+      var ringsInitialTab = RINGS_TAB_MAP[ringsSub] || null;
+      var ringsCanvasFocus = ringsInitialTab === 'cv-graph' ? parseCanvasHash(location.hash).focus : null;
       if (window.CruxRender && window.CruxRender.renderRings) {
-        window.CruxRender.renderRings(ringsHost, { summary: BOOT.summary, tabSlot: ringsTabSlot });
+        window.CruxRender.renderRings(ringsHost, { summary: BOOT.summary, tabSlot: ringsTabSlot, initialTab: ringsInitialTab, canvasFocus: ringsCanvasFocus });
       } else {
         ringsHost.appendChild(el('p', { 'class': 'v2card-sub', text: 'Renderer module unavailable.' }));
       }
@@ -4508,10 +4532,10 @@
       btn.appendChild(el('span', { 'class': 'label', text: d.label }));
       (function (dest, b) {
         var multi = workspaceDestPages(dest).length > 1;
+        // M19 — same idiom as the built-in rail: a group icon CLICK navigates to
+        // its first page (page-level, both rail states); the flyout is a hover +
+        // ArrowRight (keyboard) affordance for the group's pages.
         b.addEventListener('click', function () {
-          // M17 — same idiom as the built-in rail: compressed click on a group
-          // with >1 page opens the flyout; otherwise navigate to its first page.
-          if (railIsCollapsed() && multi) { openWorkspaceRailFlyout(ws, dest, b); return; }
           var first = (dest.pages && dest.pages[0]) || null;
           location.hash = first ? ('#/w/' + ws.uid + '/' + first) : ('#/w/' + ws.uid);
         });
@@ -4519,8 +4543,10 @@
           b.setAttribute('aria-haspopup', 'true');
           b.setAttribute('aria-expanded', 'false');
           b.addEventListener('mouseenter', function () { openWorkspaceRailFlyout(ws, dest, b); });
-          b.addEventListener('focus', function () { openWorkspaceRailFlyout(ws, dest, b); });
           b.addEventListener('mouseleave', scheduleRailFlyoutClose);
+          b.addEventListener('keydown', function (e) {
+            if (e.key === 'ArrowRight') { e.preventDefault(); openWorkspaceRailFlyout(ws, dest, b); railFlyoutFocusFirst(); }
+          });
         }
       })(d, btn);
       nav.appendChild(btn);
@@ -4646,6 +4672,19 @@
     var qi = h.indexOf('?'); if (qi >= 0) { h = h.slice(0, qi); }
     var parts = h.split('/').filter(Boolean);
     var first = parts[0];
+    // M19 — the Canvas destination is retired. Board/Graph/Tree are Rings tabs, so
+    // an existing #/canvas/board|graph|tree deep link (incl. a bare #/canvas) is
+    // REDIRECTED to #/rings/<view>, preserving any ?focus= (graph). #/canvas/studio
+    // keeps working (Studio's stable home) and falls through to renderDestination.
+    if (first === 'canvas') {
+      var cvView = parts[1] || 'board';
+      if (cvView !== 'studio') {
+        var cq = ''; var cqi = (location.hash || '').indexOf('?'); if (cqi >= 0) { cq = location.hash.slice(cqi); }
+        var target = 'graph' === cvView || 'tree' === cvView ? cvView : 'board';
+        location.hash = '#/rings/' + target + cq;   // hashchange → route()
+        return;
+      }
+    }
     // M16b — a user workspace route (#/w/<uid>[/<pageUid>]). Config-driven nav;
     // built-ins keep their existing routes. Exits Documents mode (a destination
     // wins over the reader, like every other real route).

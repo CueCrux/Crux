@@ -4802,13 +4802,15 @@
       var p = pages.PAGES[id];
       (byDest[p.dest] = byDest[p.dest] || []).push(id);
     });
-    return pages.DESTS.filter(function (d) { return d.id !== 'explorer'; }).map(function (d) {
+    // M19 — Explorer is its own builtin workspace; Canvas is retired (Board/Graph/
+    // Tree are Rings tabs, Studio moved to the account menu), so neither belongs in
+    // the Command builtin's dest set.
+    return pages.DESTS.filter(function (d) { return d.id !== 'explorer' && d.id !== 'canvas'; }).map(function (d) {
       var list = byDest[d.id] || [];
       if (!list.length) {
-        // Destination-IS-the-page surfaces (canvas/sitemap/rings): a single
-        // surface page whose type is the destination itself.
-        if (d.id === 'canvas') { list = ['canvas/board']; }
-        else { list = [d.id]; }
+        // Destination-IS-the-page surfaces (sitemap/rings): a single surface page
+        // whose type is the destination itself.
+        list = [d.id];
       }
       return { id: d.id, label: d.label, icon: d.icon, pages: list };
     });
@@ -8838,12 +8840,18 @@
           nodes.push({ key: p.id, name: p.title, href: '#/' + d.id + '/' + p.id, sub: p.sub });
         });
       } else if (d.id === 'canvas') {
-        nodes.push({ key: 'canvas:board', name: 'Board', href: '#/canvas/board' });
-        nodes.push({ key: 'canvas:graph', name: 'Graph', href: '#/canvas/graph' });
-        nodes.push({ key: 'canvas:tree', name: 'Tree', href: '#/canvas/tree' });
-        nodes.push({ key: 'canvas:studio', name: 'Studio', href: '#/canvas/studio' });
+        // M19 — the Canvas destination is retired from the map: Board/Graph/Tree
+        // are Rings tabs (emitted under Rings below); Studio moved to the account
+        // menu + rail head (#/canvas/studio stays routable, but not a map node).
+        // Empty section → filtered out.
+      } else if (d.id === 'rings') {
+        // Rings IS the page, plus the three absorbed Canvas views as tab deep links.
+        nodes.push({ key: 'rings', name: d.label, href: '#/rings' });
+        nodes.push({ key: 'rings:board', name: 'Board', href: '#/rings/board' });
+        nodes.push({ key: 'rings:graph', name: 'Graph', href: '#/rings/graph' });
+        nodes.push({ key: 'rings:tree', name: 'Tree', href: '#/rings/tree' });
       } else {
-        // explorer / sitemap / rings — the destination IS the page.
+        // explorer / sitemap — the destination IS the page.
         nodes.push({ key: d.id, name: d.label, href: '#/' + d.id });
       }
       return { dest: d, nodes: nodes };
@@ -8880,8 +8888,10 @@
     var parts = h.split('/').filter(Boolean);
     var dest = parts[0], leaf = parts[1];
     if (!dest || dest === 'sitemap') { return 'sitemap'; }
-    if (dest === 'canvas') { return 'canvas:' + (leaf === 'graph' || leaf === 'tree' || leaf === 'studio' ? leaf : 'board'); }
-    if (dest === 'explorer' || dest === 'rings') { return dest; }
+    // M19 — Board/Graph/Tree map to Rings tab nodes; Studio has no map node.
+    if (dest === 'canvas') { return (leaf === 'graph' || leaf === 'tree' || leaf === 'board') ? 'rings:' + leaf : 'sitemap'; }
+    if (dest === 'rings') { return (leaf === 'board' || leaf === 'graph' || leaf === 'tree') ? 'rings:' + leaf : 'rings'; }
+    if (dest === 'explorer') { return dest; }
     if (dest === 'overwatch' && !leaf) { return '#/overwatch'; }
     var present = {};
     sections.forEach(function (s) { s.nodes.forEach(function (n) { present[n.key] = s.dest.id; }); });
@@ -10918,11 +10928,20 @@
       var sp = el('span', { 'class': 'sp', 'aria-hidden': 'true' });
       return { el: el('div', { 'class': 'rings-gl rings-card rings-stat', style: '--h:' + hue }, [el('span', { 'class': 't' }, [el('i', { style: 'background:' + hue }), label]), nEl, sp]), n: nEl, sp: sp, hue: hue };
     }
-    var glFacts = glEl('facts', '5,026', '#8b96f2'), glSessions = glEl('sessions', '76', '#22d3ee'), glExecplans = glEl('execplans', '1,081', '#a78bfa');
+    // M19 — the M11 merge left overlapping metrics: the "execplans" glance
+    // duplicated the ExecPlans lens tile (both = /v1/work count) and the "sessions"
+    // glance duplicated the Sessions lens tile (both = stores.sessions). The lower
+    // duplicates are REMOVED. The "facts" glance stays (total store — distinct from
+    // the Data-graph tile's rendered visible-node count). glMcp/glInt/glEngine are
+    // genuinely scalar (agent count · integration count · engine on/off) → chartless.
+    var glFacts = glEl('facts', '5,026', '#8b96f2');
     var glMcp = glEl('mcp agents', '5', '#34d399'), glInt = glEl('integrations', '3', '#f5a623'), glEngine = glEl('engine', 'off', '#7e8595');
     var cards = el('div', { 'class': 'rings-cards', role: 'group', 'aria-label': 'Ring lenses and daemon glance' },
-      [tWork.b, tData.b, tMem.b, tSess.b, tTok.b, glFacts.el, glSessions.el, glExecplans.el, glMcp.el, glInt.el, glEngine.el]);
+      [tWork.b, tData.b, tMem.b, tSess.b, tTok.b, glFacts.el, glMcp.el, glInt.el, glEngine.el]);
     stage.appendChild(cards);
+    // M19 — real per-day series for the sessions tile (filled from
+    // /v1/console/sessions last_active_unix_ms in liveInit); null until fetched.
+    var SESS_DAYS = null;
 
     // ---- unified SVG icon set (M11) — one viewBox / one stroke-width / one
     //      family, matching the Command rail + Explore rail glyphs. ----
@@ -11027,20 +11046,25 @@
     var tools = el('div', { 'class': 'rings-tools' }, [grpTools, kindMenu.wrap, agentMenu.wrap, helpBtn, grpTokViews, grpDataFocus]);
     stage.appendChild(tools);
 
-    // ---- top play/timeline bar (M12): SAME measure as the bottom bar, centred.
-    //      Layout left→right: start-date · play · slider · finish-date. The date
-    //      pickers moved UP from the bottom bar; cDate is the live scrub-date,
-    //      floated just below the bar centre. ----
-    var dStart = el('input', { type: 'date', min: '2026-05-18', max: '2026-07-22', value: '2026-05-18', 'aria-label': 'Window start date', 'class': 'rings-bdate' });
-    var dEnd = el('input', { type: 'date', min: '2026-05-18', max: '2026-07-22', value: '2026-07-22', 'aria-label': 'Window end date', 'class': 'rings-bdate' });
+    // ---- M19: compact play bar joins the TOPBAR ROW (tab icons + search).
+    //      Layout left→right: static start-range label · play · scrubber · static
+    //      end-range label · live scrub-date. The date PICKERS moved DOWN to the
+    //      bottom bar (task 2); in the play bar's old date slots we now render
+    //      NON-clickable muted range labels (aria-hidden — assistive tech reaches
+    //      the real, interactive pickers in the bottom bar). Mounted into
+    //      ctxIn.tabSlot next to the tab icons; the scrubber shrinks before wrap. --
+    var lblStart = el('span', { 'class': 'rings-rangelabel', 'aria-hidden': 'true', text: '2026-05-18' });
+    var lblEnd = el('span', { 'class': 'rings-rangelabel', 'aria-hidden': 'true', text: '2026-07-22' });
     var bPlay = svgTool('play', 'Replay the window', false);
     var rTime = el('input', { type: 'range', min: '0', max: '1000', value: '1000', 'aria-label': 'Time', 'class': 'rings-timeline' });
-    var cDate = el('span', { 'class': 'chip', text: '2026-07-22' });
-    var topbar = el('div', { 'class': 'rings-topbar' }, [dStart, bPlay, rTime, dEnd, cDate]);
-    stage.appendChild(topbar);
+    var cDate = el('span', { 'class': 'rings-playdate', text: '2026-07-22' });
+    var playbar = el('div', { 'class': 'rings-playbar' }, [lblStart, bPlay, rTime, lblEnd, cDate]);
 
-    // ---- bottom control bar (M12): window sliders + canvas zoom, centred + opaque,
-    //      the SAME measure as the play bar above (date pickers now live up top). ----
+    // ---- bottom control bar (M12/M19): date pickers · window sliders · zoom,
+    //      centred + opaque. The pickers RETURN here (M19), flanking the sliders:
+    //      [start-date][window sliders][end-date], with the zoom cluster kept. ----
+    var dStart = el('input', { type: 'date', min: '2026-05-18', max: '2026-07-22', value: '2026-05-18', 'aria-label': 'Window start date', 'class': 'rings-bdate' });
+    var dEnd = el('input', { type: 'date', min: '2026-05-18', max: '2026-07-22', value: '2026-07-22', 'aria-label': 'Window end date', 'class': 'rings-bdate' });
     var rStart = el('input', { type: 'range', min: '0', max: '1000', value: '0', 'aria-label': 'Window start' });
     var rEnd = el('input', { type: 'range', min: '0', max: '1000', value: '1000', 'aria-label': 'Window end' });
     var grpWindow = el('span', { 'class': 'grp bb-window' }, [el('label', { text: 'window' }), rStart, rEnd]);
@@ -11048,7 +11072,7 @@
     var bZout = svgIconBtn('rings-iconbtn', RIC.zout, 'Zoom out');
     var bZfit = svgIconBtn('rings-iconbtn', RIC.fit, 'Fit to view');
     var grpZoom = el('span', { 'class': 'grp bb-zoom' }, [bZout, bZfit, bZin]);
-    var bottombar = el('div', { 'class': 'rings-bottombar' }, [grpWindow, grpZoom]);
+    var bottombar = el('div', { 'class': 'rings-bottombar' }, [dStart, grpWindow, dEnd, grpZoom]);
     stage.appendChild(bottombar);
 
     var pane = el('aside', { 'class': 'rings-pane', 'aria-label': 'Detail pane' });
@@ -11213,7 +11237,10 @@
     var hover = null, pinned = null, sel = null, solo = null, ledgerRows = [];
     // M13 — tab hub state: the draw loop pauses while a non-Ring view is shown
     // (canvas faded out) so it never burns frames behind the swapped-in content.
-    var activeTab = 'ring', paused = false;
+    // M19 — activeCanvasView tracks an absorbed Canvas tab (board|graph|tree) for
+    // teardown; canvasTabFocus carries a deep-link focus into the Graph tab.
+    var activeTab = 'ring', paused = false, activeCanvasView = null;
+    var canvasTabFocus = (ctxIn && ctxIn.canvasFocus) || null;
     var mxAbs = 0, myAbs = 0, dragging = false, dragMoved = 0, lastPX = 0, lastPY = 0;
     var flashes = [];
 
@@ -11903,6 +11930,7 @@
       S = 11 + s * (NOW - 11); E = 11 + e * (NOW - 11); T = Math.max(S, Math.min(E, T));
       rTime.value = Math.round((T - S) / Math.max(0.5, E - S) * 1000);
       cDate.textContent = dayDate(T); dStart.value = dayDate(S); dEnd.value = dayDate(E);
+      lblStart.textContent = dayDate(S); lblEnd.textContent = dayDate(E);   // M19 static range labels (topbar play bar)
     }
     rStart.addEventListener('input', syncWindow);
     rEnd.addEventListener('input', syncWindow);
@@ -11921,7 +11949,9 @@
     function fitView() {
       if (!W || !H) { return; }
       var g = geom();
-      var topH = barPx(topbar) + 12, botH = barPx(bottombar) + 12;
+      // M19 — the play bar left the stage top (it now rides the shell topbar row),
+      // so only the bottom control bar reserves vertical space in the stage.
+      var topH = 14, botH = barPx(bottombar) + 12;
       var availH = Math.max(60, H - topH - botH);
       var availW = Math.max(60, W - 24);
       // M12 — contentR reserves the full drawn extent past the ring (lens-label
@@ -12282,6 +12312,7 @@
     function onVis() { kick(); }
     if (typeof document !== 'undefined') { document.addEventListener('visibilitychange', onVis); }
     function teardown() {
+      teardownCanvasTab();   // M19 — stop any absorbed Board/Graph/Tree RAF/listener
       if (rafId != null && typeof cancelAnimationFrame === 'function') { cancelAnimationFrame(rafId); }
       rafId = null;
       if (fadeTimer) { clearTimeout(fadeTimer); fadeTimer = null; }       // M13 tab-hub timers
@@ -12317,9 +12348,13 @@
       for (var d = 11; d <= hi; d += step) { var c = 0; PLANS.forEach(function (p) { if (p.b <= d && p.exit > d) { c++; } }); workS.push(c); }
       daySpark(tWork.sp, workS, tWork.hue);
       var dataS = binByDay(function (n) { return { ok: isFinite(n.d), d: n.d }; }, GNODES);
-      if (dataS) { daySpark(tData.sp, dataS, tData.hue); }
+      // M19 — the facts glance reuses the SAME real facts-stored_at histogram as the
+      // Data-graph lens tile (no fabricated trend; the visible-fact walk is the source).
+      if (dataS) { daySpark(tData.sp, dataS, tData.hue); daySpark(glFacts.sp, dataS, glFacts.hue); }
       var memS = binByDay(function (c2) { return { ok: c2.kind === 'memory' && isFinite(c2.day), d: c2.day }; }, cells);
       if (memS) { daySpark(tMem.sp, memS, tMem.hue); }
+      // M19 — sessions tile: a real last_active_unix_ms per-day histogram.
+      if (SESS_DAYS && SESS_DAYS.length >= 2) { daySpark(tSess.sp, SESS_DAYS, tSess.hue); }
       if (TOK && TOK.spent) {
         var days = Object.keys(TOK.spent).map(Number).filter(isFinite).sort(function (a, b) { return a - b; });
         if (days.length >= 2) { daySpark(tTok.sp, days.map(function (dd) { return TOK.spent[dd]; }), tTok.hue); }
@@ -12341,13 +12376,22 @@
     // (ctxIn.tabSlot) so it sits on the console search field's row, in the space
     // the page heading used to occupy — falling back to the ring stage if no slot
     // is provided (defensive; the shell always supplies one for #/rings).
+    // Tabs 1-6 fade the ring out and swap in the corresponding Overwatch view via
+    // owRenderTab. Tabs 7-9 (M19) absorb the former Canvas destination — Board,
+    // Graph and Tree render in the SAME swap host through their normal renderers
+    // (renderCanvasBoard / renderCanvasGraph / renderPlanTree), with clean teardown
+    // on tab switch (see teardownCanvasTab). Icons are the unified ricon family.
+    var CANVAS_TAB_IDS = { 'cv-board': 'board', 'cv-graph': 'graph', 'cv-tree': 'tree' };
     var RINGS_TABS = [
       { id: 'ring', title: 'Ring', icon: '<circle cx="12" cy="12" r="8.6"/><circle cx="12" cy="12" r="3.3"/>' },
       { id: 'cx-activity', title: 'Activity', icon: '<path d="M3 12h3.6l2.4-7 4 14 2.4-7H21"/>' },
       { id: 'cx-coord', title: 'Live board', icon: '<circle cx="12" cy="12" r="2.3"/><path d="M8.6 8.6a5 5 0 0 0 0 6.8M15.4 8.6a5 5 0 0 1 0 6.8M6.1 6.1a9 9 0 0 0 0 11.8M17.9 6.1a9 9 0 0 1 0 11.8"/>' },
       { id: 'cx-orchestrators', title: 'Orchestrators', icon: '<circle cx="12" cy="5" r="2.2"/><circle cx="5.5" cy="18.5" r="2.2"/><circle cx="18.5" cy="18.5" r="2.2"/><path d="M12 7.2v3.4M12 10.6l-6 5.9M12 10.6l6 5.9"/>' },
       { id: 'cx-punchcards', title: 'Punchcards', icon: '<rect x="3.5" y="5" width="17" height="14" rx="2"/><circle cx="8" cy="10" r="1.05" fill="currentColor" stroke="none"/><circle cx="12" cy="10" r="1.05" fill="currentColor" stroke="none"/><path d="M7 14.5h10"/>' },
-      { id: 'ax-agent', title: 'Agent', icon: '<rect x="4.5" y="8" width="15" height="10" rx="2.5"/><path d="M12 4.6v3.4"/><circle cx="12" cy="4" r="1.05"/><circle cx="9.6" cy="13" r="1.05" fill="currentColor" stroke="none"/><circle cx="14.4" cy="13" r="1.05" fill="currentColor" stroke="none"/>' }
+      { id: 'ax-agent', title: 'Agent', icon: '<rect x="4.5" y="8" width="15" height="10" rx="2.5"/><path d="M12 4.6v3.4"/><circle cx="12" cy="4" r="1.05"/><circle cx="9.6" cy="13" r="1.05" fill="currentColor" stroke="none"/><circle cx="14.4" cy="13" r="1.05" fill="currentColor" stroke="none"/>' },
+      { id: 'cv-board', title: 'Board', icon: '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>' },
+      { id: 'cv-graph', title: 'Graph', icon: '<circle cx="6" cy="7" r="2.1"/><circle cx="18" cy="7" r="2.1"/><circle cx="12" cy="17" r="2.1"/><path d="M8 7h8M7.6 8.6l3.6 6.8M16.4 8.6l-3.6 6.8"/>' },
+      { id: 'cv-tree', title: 'Tree', icon: '<rect x="9" y="3" width="6" height="4.4" rx="1"/><rect x="3" y="15" width="6" height="4.4" rx="1"/><rect x="15" y="15" width="6" height="4.4" rx="1"/><path d="M12 7.4v3.6M6 15v-2.4h12V15"/>' }
     ];
     var ringTabBtns = {};
     var ringTabBar = el('div', { 'class': 'rings-tabicons', role: 'tablist', 'aria-label': 'Rings views' });
@@ -12359,13 +12403,26 @@
     });
     var ringTabMount = (ctxIn && ctxIn.tabSlot) ? ctxIn.tabSlot : stage;
     ringTabMount.appendChild(ringTabBar);
-    var tabHost = el('div', { 'class': 'rings-tabhost', role: 'region', 'aria-label': 'Overwatch view' });
+    ringTabMount.appendChild(playbar);   // M19 — the compact play bar rides the topbar row, next to the tab icons
+    var tabHost = el('div', { 'class': 'rings-tabhost', role: 'region', 'aria-label': 'View' });
     tabHost.hidden = true;
     stage.appendChild(tabHost);
 
-    var ringChrome = [tools, cards, topbar, bottombar, pane];
+    // The play bar joins the chrome that hides on a non-Ring tab (a list/board view
+    // has no timeline to scrub). The tab icons themselves stay visible (they ARE
+    // the switcher). tabHost's default aria-label updates per active tab.
+    var ringChrome = [tools, cards, playbar, bottombar, pane];
     function setChromeHidden(hide) {
       ringChrome.forEach(function (elm) { if (elm) { elm.classList.toggle('rings-chrome-hidden', hide); } });
+    }
+    // M19 — teardown for an absorbed Canvas tab (Board/Graph/Tree). The graph +
+    // board own module-level cleanups (RAF loops / resize listener); the tree has
+    // only element listeners that GC with the cleared host. Called on tab switch
+    // and in the rings teardown so no canvas RAF leaks behind a hidden view.
+    function teardownCanvasTab() {
+      if (activeCanvasView === 'graph') { if (__canvasGraphCleanup) { try { __canvasGraphCleanup(); } catch (e) { /* noop */ } __canvasGraphCleanup = null; } }
+      else if (activeCanvasView === 'board') { if (__canvasResizeHandler && typeof window !== 'undefined') { try { window.removeEventListener('resize', __canvasResizeHandler); } catch (e2) { /* noop */ } __canvasResizeHandler = null; } }
+      activeCanvasView = null;
     }
     // "wow" cascade: staggered, lightly-scattered entrance of the view's real
     // cards/panels (the honest read of the operator's "mesh, no alignment" — the
@@ -12387,13 +12444,30 @@
       }
     }
     function paintTab(id) {
+      // M19 — Board/Graph/Tree are rendered by the SAME canvas renderers as the
+      // former Canvas destination, into the tab swap host (not owRenderTab).
+      if (CANVAS_TAB_IDS[id]) {
+        var view = CANVAS_TAB_IDS[id];
+        activeCanvasView = view;
+        var cbctx = { summary: ctxIn && ctxIn.summary };
+        var pc = null;
+        if (view === 'graph') { pc = renderCanvasGraph(tabHost, cbctx, canvasTabFocus); canvasTabFocus = null; }
+        else if (view === 'tree') { pc = renderPlanTree(tabHost, cbctx); }
+        else { renderCanvasBoard(tabHost, cbctx); }
+        ringsCascade(tabHost);
+        if (pc && typeof pc.then === 'function') { pc.then(function () { ringsCascade(tabHost); }); }
+        return;
+      }
       var p = owRenderTab(id, tabHost, ctxIn);
       ringsCascade(tabHost);                                   // synchronous skeleton content
       if (p && typeof p.then === 'function') { p.then(function () { ringsCascade(tabHost); }); }   // + the async data swap
     }
     function setTab(id) {
       if (id === activeTab) { return; }
+      teardownCanvasTab();   // stop any outgoing Board/Graph/Tree RAF before the swap
       activeTab = id;
+      var tab = null; RINGS_TABS.forEach(function (t) { if (t.id === id) { tab = t; } });
+      tabHost.setAttribute('aria-label', tab ? tab.title : 'View');
       Object.keys(ringTabBtns).forEach(function (k) { ringTabBtns[k].setAttribute('aria-selected', k === id ? 'true' : 'false'); });
       closePop(); closeModal();
       if (fadeTimer) { clearTimeout(fadeTimer); fadeTimer = null; }
@@ -12437,6 +12511,10 @@
     fitView();   // default fit accounts for the top timeline + bottom control bar
     updateSparks();
     kick();
+    // M19 — deep-link: a #/canvas/board|graph|tree redirect lands on #/rings/<view>
+    // and passes initialTab (+ canvasFocus for graph), opening that tab on load so
+    // the old Canvas deep links never dead-end.
+    if (ctxIn && ctxIn.initialTab && ctxIn.initialTab !== 'ring' && ringTabBtns[ctxIn.initialTab]) { setTab(ctxIn.initialTab); }
 
     // ---- live wire: swap the embedded snapshot for the real board when the
     //      daemon feeds are reachable (through the console's CruxApi client).
@@ -12465,8 +12543,7 @@
             dStart.max = dEnd.max = dayDate(NOW);
             syncWindow();
             dataSrc = 'live · prod-mirror';
-            glExecplans.n.textContent = num(j.count);
-            tWork.n.textContent = num(j.count);
+            tWork.n.textContent = num(j.count);   // M19 — the duplicate "execplans" glance tile was removed
             root.setAttribute('data-src', 'live');   // liveness signal (the visible "live · date" stamp was removed in M11)
             fitView(); updateSparks();
           }
@@ -12475,13 +12552,22 @@
       fetchJSON('/v1/console/summary').then(function (res) {
         if (res.ok && res.data) {
           var s2 = res.data;
-          if (s2.stores) { glFacts.n.textContent = num(s2.stores.facts); glSessions.n.textContent = num(s2.stores.sessions); tSess.n.textContent = num(s2.stores.sessions); }
+          if (s2.stores) { glFacts.n.textContent = num(s2.stores.facts); tSess.n.textContent = num(s2.stores.sessions); }   // M19 — dup "sessions" glance removed
           if (s2.daemon && s2.daemon.mcp_agent_count !== undefined) { glMcp.n.textContent = num(s2.daemon.mcp_agent_count); }
           if (s2.integrations !== undefined) {
             var gi = s2.integrations;
             glInt.n.textContent = Array.isArray(gi) ? String(gi.length) : (gi && typeof gi === 'object') ? num(gi.builtin_pack_count !== undefined ? gi.builtin_pack_count : Object.keys(gi).length) : num(gi);
           }
           if (s2.daemon) { glEngine.n.textContent = s2.daemon.dataplane_enabled ? 'on' : 'off'; }
+        }
+      });
+      // M19 — sessions tile sparkline: a real per-day activity histogram bucketed
+      // from /v1/console/sessions last_active_unix_ms (through the generated client).
+      fetchJSON('/v1/console/sessions').then(function (res) {
+        if (res.ok && res.data) {
+          var rows = res.data.session_rows || [];
+          var series = binByDay(function (r) { var ms = r && r.last_active_unix_ms; return { ok: isFinite(ms) && ms > 0, d: ms / 86400000 - 20580 }; }, rows);
+          if (series) { SESS_DAYS = series; updateSparks(); }
         }
       });
       // data graph: page the WHOLE visible store through /v1/facts/list (cursor

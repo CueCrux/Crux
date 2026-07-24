@@ -1279,11 +1279,14 @@
     // railHidden — System lives in the bottom account roll-up menu (Settings ·
     // Language · Log out), not the Command rail; still routable at #/system/*.
     { id: 'system', label: 'System', icon: 'settings', railHidden: true, sub: 'Settings, integrations, and developer tools.' },
-    // Canvas (M9) — a destination with no sub-pills: it IS the page. A
-    // size-adaptive Board plus a real-edge relation Graph, switched by a
-    // nav-family segmented control (deep-linkable #/canvas/board · #/canvas/graph).
-    // Phone tier: lives in the "More" sheet (not one of the three direct tabs).
-    { id: 'canvas', label: 'Canvas', icon: 'canvas', key: '6', sub: 'Size-adaptive dashboard + relation graph.' },
+    // Canvas (M19) — the destination is RETIRED from the rail/sitemap/workspace
+    // builtins: Board, Graph and Tree are now tabs 7-9 of the Rings tab hub, and
+    // Studio moved to the account menu + the expanded-rail head. `railHidden` (no
+    // key) keeps ONLY the route alive so #/canvas/studio stays Studio's stable home
+    // and existing #/canvas/board|graph|tree deep links redirect to #/rings/<view>
+    // (route()). It is intentionally absent from the rail, the sitemap and the
+    // Command workspace builtin (siteMapSections + cwsRegistryDests skip it).
+    { id: 'canvas', label: 'Canvas', icon: 'canvas', railHidden: true, sub: 'Studio — route-only home (Board/Graph/Tree are Rings tabs).' },
     // Explorer (M11) — a destination with no sub-pills: it IS a search surface.
     // A query box + a Local | WikiCrux backend toggle (nav-family, aria-pressed) +
     // a budget/top_k control; results as cards (title/snippet · source · score ·
