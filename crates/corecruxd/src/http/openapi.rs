@@ -298,6 +298,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/legal-holds/{id}", methods: &["DELETE"], tag: "Legal holds", auth: "feature-gated", summary: "Release a legal hold" },
     RouteEntry { path: "/v1/local/ingest", methods: &["POST"], tag: "Local", auth: "admin-write", summary: "Local ingest" },
     RouteEntry { path: "/v1/mcp/tools", methods: &["GET"], tag: "MCP", auth: "read", summary: "Mcp tools" },
+    RouteEntry { path: "/v1/mcp/tools/usage", methods: &["GET"], tag: "MCP", auth: "read", summary: "Mcp tools usage" },
     RouteEntry { path: "/v1/mediation/receipts", methods: &["POST"], tag: "Mediation", auth: "write", summary: "Mediation receipts" },
     RouteEntry { path: "/v1/memory/engrams/resolve", methods: &["POST"], tag: "Memory", auth: "write", summary: "Memory engrams resolve" },
     RouteEntry { path: "/v1/memory/import", methods: &["POST"], tag: "Memory", auth: "write", summary: "Memory import" },

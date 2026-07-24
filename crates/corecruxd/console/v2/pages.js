@@ -883,23 +883,46 @@
     return [engrams, bench, sites, factstore];
   }
 
-  // AX / Agent — the agent-side cockpit. MCP tools load live (/v1/mcp/tools,
-  // allowlisted); activity / memory / snapshots already have v2 homes; graph
-  // opens on the Pro 3D substrate; bulk / handoff / storybook / story / dossiers
-  // have no daemon read endpoint (deferred, honest notes).
+  // AX / Agent — the agent-side cockpit. MCP tools load live with their
+  // 30-day call rollup (/v1/mcp/tools/usage — catalog joined against the
+  // agent.tool_invocation.v1 ledger, sorted by calls desc, zeros included);
+  // activity / memory / snapshots already have v2 homes; graph opens on the
+  // Pro 3D substrate; bulk / handoff / storybook / story / dossiers have no
+  // daemon read endpoint (deferred, honest notes).
   function buildAgent(res) {
+    var sections = [];
     var tools;
     if (!res.ok || !res.data) {
-      tools = { h: 'MCP tools', sub: 'the agent tool surface · /v1/mcp/tools', wide: true, controls: [{ t: 'search', ph: 'Filter tools…' }].concat(degraded(res.status, 'MCP tools unavailable — GET /v1/mcp/tools')) };
+      tools = { h: 'MCP tools', sub: 'catalog × call ledger · /v1/mcp/tools/usage', wide: true, controls: [{ t: 'search', ph: 'Filter tools…' }].concat(degraded(res.status, 'Tool usage unavailable — GET /v1/mcp/tools/usage')) };
     } else {
-      var list = arr(res.data.tools || res.data.items || res.data);
-      tools = { h: 'MCP tools', sub: list.length + ' tool' + (list.length === 1 ? '' : 's') + ' loaded at session bind · /v1/mcp/tools', wide: true,
-        controls: [{ t: 'search', ph: 'Filter tools…' }].concat(list.length ? list.map(function (tl) {
-          var name = tl.name || tl.tool || tl.id || 'tool';
-          return { t: 'exp', label: name, sub: clip(tl.description || tl.summary || '', 90) || 'mcp tool', badge: tl.scope || 'tool',
-            meta: (arr(tl.scopes).length ? arr(tl.scopes).join(' · ') : str(tl.scope)),
-            controls: [info('description', clip(tl.description || tl.summary || '—', 200))] };
-        }) : [info('none', 'no MCP tools reported')]) };
+      var d = res.data;
+      var list = arr(d.tools);
+      var errPct = d.calls_total > 0 ? Math.round((d.errors_total / d.calls_total) * 1000) / 10 : 0;
+      sections.push({ h: 'Tool surface health', sub: 'window ' + str(d.window) + ' · ledger agent.tool_invocation.v1 · /v1/mcp/tools/usage', wide: true, controls: [
+        info('calls', String(d.calls_total || 0) + ' calls · ' + String(d.passports_total || 0) + ' passports · ' + errPct + '% errors'),
+        info('catalog', String(d.tools_in_catalog || 0) + ' tools · ' + String(d.tools_called || 0) + ' called · ' + String(d.tools_never_called || 0) + ' never called in window'),
+        info('triage', 'unused = demote-from-surface candidates · high err% = friction to fix · filter "unused" or "errors" below')
+      ] });
+      tools = { h: 'MCP tools', sub: list.length + ' tool' + (list.length === 1 ? '' : 's') + ' · sorted by calls (' + str(d.window) + ') · zeros = never called in window', wide: true,
+        controls: [{ t: 'search', ph: 'Filter tools… (try: unused · errors · uncatalogued)' }].concat(list.length ? list.map(function (tl) {
+          var name = tl.tool || tl.name || 'tool';
+          var calls = tl.calls || 0;
+          var toolErrPct = calls > 0 ? Math.round(((tl.errors || 0) / calls) * 1000) / 10 : 0;
+          var badge = calls > 0 ? (String(calls) + '×' + (tl.errors ? ' · errors' : '')) : 'unused';
+          var meta = calls > 0
+            ? (String(tl.passports || 0) + ' passports · p50 ' + str(tl.p50_ms) + 'ms · ~' + String(tl.avg_tokens || 0) + ' tok · last ' + clip(str(tl.last_called), 10))
+            : (tl.in_catalog === false ? 'uncatalogued (removed/renamed?)' : 'never called in window');
+          return { t: 'exp', label: name, sub: clip(tl.description || '', 90) || (tl.in_catalog === false ? 'not in the current catalog' : 'mcp tool'), badge: badge,
+            meta: meta,
+            controls: [
+              info('description', clip(tl.description || '—', 300)),
+              info('calls', String(calls) + (calls > 0 ? ' · ' + String(tl.errors || 0) + ' errors (' + toolErrPct + '%)' : '')),
+              info('reach', String(tl.passports || 0) + ' distinct passports'),
+              info('cost', 'avg ~' + String(tl.avg_tokens || 0) + ' tokens · p50 ' + str(tl.p50_ms) + ' ms'),
+              info('last called', str(tl.last_called)),
+              info('in catalog', tl.in_catalog === false ? 'no — called historically but absent from tools/list now' : 'yes')
+            ] };
+        }) : [info('none', 'no tools reported')]) };
     }
     var cockpit = { h: 'Agent cockpit', sub: 'agent observability — where each legacy AX surface lives now', wide: true, controls: [
       info('activity', 'live tool stream → Overwatch › Activity'),
@@ -915,7 +938,8 @@
       info('story', 'call-tree story view stays on the Pro / 3D canvas'),
       info('dossiers', 'per-project — see Work › Projects (/v1/projects/{id}/dossiers)')
     ] };
-    return [tools, cockpit, deferred];
+    sections.push(tools, cockpit, deferred);
+    return sections;
   }
 
   // CX / Workbench (M13a) — the operator deep-machinery surface, ported native
@@ -1202,7 +1226,7 @@
     'ix-infra': page('ix-infra', 'system', 'Infra', 'machines, auth rails, config + session sync · /v1/console/infra/summary', { pro: true, load: { endpoint: '/v1/console/infra/summary', build: buildInfra } }),
     'dx-docs': page('dx-docs', 'system', 'Docs', 'daemon reference + platform docs', { pro: true }),
     'gx-global': page('gx-global', 'memory', 'Global', 'shared surfaces that outlive a session — engrams, bench, sites, fact store', { pro: true, load: { endpoint: '/v1/engrams', build: buildGlobal } }),
-    'ax-agent': page('ax-agent', 'overwatch', 'Agent', 'agent-side cockpit — MCP tools, graph, and where each surface lives', { pro: true, load: { endpoint: '/v1/mcp/tools', build: buildAgent } })
+    'ax-agent': page('ax-agent', 'overwatch', 'Agent', 'agent-side cockpit — MCP tool usage, graph, and where each surface lives', { pro: true, load: { endpoint: '/v1/mcp/tools/usage?window_hours=720', build: buildAgent } })
   };
 
   // ---- Pro-ported page ids (the DX/GX/AX/IX pages above) ----------------

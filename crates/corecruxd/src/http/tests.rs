@@ -17667,6 +17667,56 @@ async fn agent_usage_raw_admin_reads_others_200() {
     assert_eq!(body["window"], "24h");
 }
 
+// ── Fleet tool usage: /v1/mcp/tools/usage ────────────────────────────────
+
+#[tokio::test]
+async fn mcp_tools_usage_unauthenticated_denied_401() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = agent_usage::get_mcp_tools_usage(State(state), HeaderMap::new(), usage_query(None))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn mcp_tools_usage_non_admin_denied_403() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = agent_usage::get_mcp_tools_usage(State(state), dev_scope_headers("sessions:read"), usage_query(None))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn mcp_tools_usage_admin_gets_catalog_joined_rollup() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    seed_ledger_file(
+        &state,
+        "alice",
+        &[
+            serde_json::json!({"tool": "query_facts", "passport": "alice", "est_tokens_in": 10, "est_tokens_out": 90, "latency_ms": 4, "outcome": "ok"}),
+        ],
+    );
+    let resp = agent_usage::get_mcp_tools_usage(State(state), dev_scope_headers("admin:read"), usage_query(None))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["calls_total"], 1);
+    let catalog_len = crux_mcp::tools::list_tools().len();
+    assert_eq!(body["tools_in_catalog"], catalog_len as u64);
+    let tools = body["tools"].as_array().unwrap();
+    assert!(
+        tools.len() >= catalog_len,
+        "every catalog tool present (zeros included)"
+    );
+    // The one called tool sorts first with its stats; the rest are zeros.
+    assert_eq!(tools[0]["tool"], "query_facts");
+    assert_eq!(tools[0]["calls"], 1);
+    assert_eq!(tools[0]["passports"], 1);
+    assert_eq!(tools[1]["calls"], 0);
+}
+
 #[tokio::test]
 async fn agent_usage_empty_ledger_is_200_zeroes() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
