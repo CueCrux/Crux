@@ -1,7 +1,7 @@
 +++
 name = "execplan-discipline"
-version = 1
-description = "Multi-milestone work goes through an ExecPlan first. Codifies the Insights-report `ExecPlan Workflow` snippet (M1..Mn pattern in 15+ sessions)."
+version = 2
+description = "Multi-milestone work goes through an ExecPlan first. Codifies the Insights-report `ExecPlan Workflow` snippet (M1..Mn pattern in 15+ sessions), plus the board-drift guard that keeps plan `Status:` lines aligned with derived state."
 targets = ["claude_md", "agents_md"]
 order = 30
 risk_class = "low"
@@ -50,3 +50,14 @@ On session boot, before picking up a new task or proposing one, call `mcp__crux_
 - The `current_milestone` field on an ExecPlan item tells you where the previous session left off. Read the corresponding `gate:M<n-1>` fact for context.
 
 Do not invent work that already exists in the table; do not let the table go stale by completing work without storing a `gate:M<n>` fact.
+
+### Board-drift guard
+
+Three layers keep a plan's `Status:` line from lagging its derived state (facts say "done", markdown still reads "In progress"). Install on a new machine with `bash scripts/setup-drift-guard.sh` in the Crux repo — it copies the scripts to `~/.local/share/crux/hooks/` and prints the config snippets below (it never edits your agent configs).
+
+- **Write-time guard** — `execplan-status-guard.sh` runs as a `store_fact` **PostToolUse** hook. When you store a plan-terminal fact (`decision:close*`, or a `gate:*` marked plan-complete) but the plan's leading `Status:` token is still non-terminal, it exits 2 and nags you to flip the line while you have context. Only the *leading* token counts: `Status: In progress (design complete)` is non-terminal.
+  - Claude Code `.claude/settings.json` → `hooks.PostToolUse` matcher `mcp__crux__store_fact`.
+  - codex `.codex/hooks.json` → `hooks.PostToolUse` matcher `store_fact`.
+- **Boot sweep** — run `reconcile-execplan-status.sh --quiet` on **SessionStart** (both agents). It GETs `/v1/work?source=all`, and for every `execplan:*` whose derived state is terminal but whose leading `Status:` token isn't, prints one compact line naming the plans to flip. Silent when clean; graceful skip (exit 0) if the daemon is down. Set `CRUX_EXECPLANS_ROOT` so it can resolve `<slug>.md`.
+
+Both hook scripts are print-only / advisory — they never mutate a plan or block real work.
