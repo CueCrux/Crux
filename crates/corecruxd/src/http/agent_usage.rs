@@ -561,7 +561,7 @@ mod tests {
     }
 
     #[test]
-    fn fleet_rollup_joins_catalog_with_zeros_and_flags_uncatalogued() {
+    fn fleet_rollup_joins_catalog_with_zeros_and_flags_uncataloged() {
         let catalog = vec![
             ("query_facts".to_string(), "Recall stored facts".to_string()),
             ("query_scan".to_string(), "Scan the substrate".to_string()),

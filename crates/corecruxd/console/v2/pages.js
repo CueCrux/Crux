@@ -904,7 +904,7 @@
         info('triage', 'unused = demote-from-surface candidates · high err% = friction to fix · filter "unused" or "errors" below')
       ] });
       tools = { h: 'MCP tools', sub: list.length + ' tool' + (list.length === 1 ? '' : 's') + ' · sorted by calls (' + str(d.window) + ') · zeros = never called in window', wide: true,
-        controls: [{ t: 'search', ph: 'Filter tools… (try: unused · errors · uncatalogued)' }].concat(list.length ? list.map(function (tl) {
+        controls: [{ t: 'search', ph: 'Filter tools… (try: unused · errors · uncataloged)' }].concat(list.length ? list.map(function (tl) {
           var name = tl.tool || tl.name || 'tool';
           var calls = tl.calls || 0;
           var toolErrPct = calls > 0 ? Math.round(((tl.errors || 0) / calls) * 1000) / 10 : 0;
@@ -916,7 +916,7 @@
           var badge = calls > 0 ? (String(calls) + '×' + (tl.errors ? ' · errors' : '')) : unusedBadge;
           var meta = calls > 0
             ? (String(tl.passports || 0) + ' passports · p50 ' + str(tl.p50_ms) + 'ms · ~' + String(tl.avg_tokens || 0) + ' tok · last ' + clip(str(tl.last_called), 10))
-            : (tl.in_catalog === false ? 'uncatalogued (removed/renamed?)'
+            : (tl.in_catalog === false ? 'uncataloged (removed/renamed?)'
               : tl.classification === 'never_offered' ? 'in catalog but absent from every session surface'
               : tl.classification === 'offered_never_called' ? ('offered to ' + String(tl.offered_passports || 0) + ' passport(s), never called')
               : 'never called in window');
