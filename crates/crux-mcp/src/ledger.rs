@@ -437,6 +437,71 @@ pub fn record_truncation(tool: &str, reason: &str) {
         .inc();
 }
 
+// ── Offered-surface events (mcp-tool-usage-analytics M3) ─────────────────
+
+/// Observation `kind` for offered-surface events. One event records the
+/// exact tool set a `tools/list` response OFFERED a passport, so usage
+/// analysis can distinguish "offered but ignored" from "never offered" —
+/// the split the invocation ledger alone cannot make.
+pub const OFFERED_EVENT_KIND: &str = "agent.tools_offered.v1";
+
+/// `blake3:<16-hex>` of the offered tool-name set (order-insensitive:
+/// callers pass the listing order, which is deterministic per surface).
+pub fn offered_set_hash(tool_names: &[String]) -> String {
+    let joined = tool_names.join("\n");
+    let hash = blake3::hash(joined.as_bytes());
+    format!("blake3:{}", &hash.to_hex().as_str()[..ARGS_HASH_PREFIX_LEN])
+}
+
+/// Build the observation body for one offered-surface event. Pure so the
+/// field mapping is unit-testable.
+pub fn build_tools_offered_body(passport: &str, tool_names: &[String], surface_mode: &str, set_hash: &str) -> Value {
+    json!({
+        "kind": OFFERED_EVENT_KIND,
+        "provider": PROVIDER,
+        "payload": {
+            "passport": passport,
+            "tools": tool_names,
+            "count": tool_names.len(),
+            "surface_mode": surface_mode,
+            "set_hash": set_hash,
+        },
+    })
+}
+
+/// True when this (passport, set_hash) pair has not been recorded yet by
+/// this process — and marks it recorded. Re-listing an unchanged surface
+/// is a no-op; a reshaped surface (dynamic mode, flag change, restart)
+/// re-emits. ponytail: in-process dedupe only — a daemon restart re-emits
+/// one event per passport, which is noise the rollup tolerates.
+pub fn offered_set_is_new(passport: &str, set_hash: &str) -> bool {
+    static SEEN: OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let Ok(mut seen) = seen.lock() else {
+        return false; // poisoned lock: skip rather than double-emit
+    };
+    if seen.get(passport).map(String::as_str) == Some(set_hash) {
+        return false;
+    }
+    seen.insert(passport.to_string(), set_hash.to_string());
+    true
+}
+
+/// Flag-gated, deduped, fire-and-forget emission of one offered-surface
+/// event. Call from the `tools/list` serve path with the FINAL (shaped,
+/// authz-filtered) tool names.
+pub fn emit_tools_offered(daemon_base_url: Option<String>, passport: &str, tool_names: &[String], surface_mode: &str) {
+    if !ledger_enabled() {
+        return;
+    }
+    let set_hash = offered_set_hash(tool_names);
+    if !offered_set_is_new(passport, &set_hash) {
+        return;
+    }
+    let body = build_tools_offered_body(passport, tool_names, surface_mode, &set_hash);
+    emit(daemon_base_url, passport, body);
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -659,6 +724,44 @@ mod tests {
         assert!(
             p50 < Duration::from_millis(1),
             "on-path ledger emission p50 {p50:?} must be < 1ms"
+        );
+    }
+
+    #[test]
+    fn tools_offered_body_maps_fields() {
+        let names = vec!["query_facts".to_string(), "store_fact".to_string()];
+        let hash = offered_set_hash(&names);
+        let body = build_tools_offered_body("alice", &names, "full", &hash);
+        assert_eq!(body["kind"], OFFERED_EVENT_KIND);
+        assert_eq!(body["provider"], PROVIDER);
+        assert_eq!(body["payload"]["passport"], "alice");
+        assert_eq!(body["payload"]["count"], 2);
+        assert_eq!(body["payload"]["surface_mode"], "full");
+        assert_eq!(body["payload"]["tools"][1], "store_fact");
+        assert!(body["payload"]["set_hash"].as_str().unwrap().starts_with("blake3:"));
+    }
+
+    #[test]
+    fn offered_set_hash_is_deterministic_and_content_sensitive() {
+        let a = vec!["a".to_string(), "b".to_string()];
+        let b = vec!["a".to_string(), "c".to_string()];
+        assert_eq!(offered_set_hash(&a), offered_set_hash(&a));
+        assert_ne!(offered_set_hash(&a), offered_set_hash(&b));
+    }
+
+    #[test]
+    fn offered_dedupe_is_per_passport_and_rearms_on_change() {
+        // Unique passport names — the dedupe map is process-global and
+        // tests run in parallel.
+        let h1 = "blake3:aaaa";
+        let h2 = "blake3:bbbb";
+        assert!(offered_set_is_new("dedupe-test-p1", h1));
+        assert!(!offered_set_is_new("dedupe-test-p1", h1), "same set is deduped");
+        assert!(offered_set_is_new("dedupe-test-p2", h1), "other passport unaffected");
+        assert!(offered_set_is_new("dedupe-test-p1", h2), "changed set re-arms");
+        assert!(
+            !offered_set_is_new("dedupe-test-p1", h2),
+            "new set now the recorded one"
         );
     }
 }

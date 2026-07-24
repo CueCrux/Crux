@@ -412,6 +412,21 @@ pub async fn dispatch(req: JsonRpcRequest, ctx: &McpContext, _agent: Option<&Age
         // ── Tool surface ───────────────────────────────────────────────
         "tools/list" => {
             let result = tools::list_tools_json_for_context(ctx, current_unix_seconds()).await;
+            // mcp-tool-usage-analytics M3: record the FINAL offered set so
+            // usage analysis can split "offered but ignored" from "never
+            // offered". Flag-gated, deduped per (passport, set-hash),
+            // fire-and-forget — never on the response path's error flow.
+            if crate::ledger::ledger_enabled() {
+                let names: Vec<String> = result["tools"]
+                    .as_array()
+                    .map(|ts| ts.iter().filter_map(|t| t["name"].as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                let passport = crate::scope::agent_name(ctx.agent.as_ref())
+                    .unwrap_or(crate::traces::ANON_PASSPORT)
+                    .to_string();
+                let mode = tools::surface::ToolSurfaceMode::from_env().as_str();
+                crate::ledger::emit_tools_offered(ctx.daemon_base_url.clone(), &passport, &names, mode);
+            }
             JsonRpcResponse::success(req.id, result)
         }
 

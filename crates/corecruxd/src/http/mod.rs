@@ -777,6 +777,7 @@ pub(crate) fn router_with_route_auth(
         )
         // Per-passport tool-usage rollup over the action ledger (action-ledger M3).
         .route("/v1/agents/{passport}/usage", get(self::agent_usage::get_agent_usage))
+        .route("/v1/mcp/tools/usage", get(self::agent_usage::get_mcp_tools_usage))
         // Token-burn cost lens — POST a ground-truth report, GET it for the console.
         .route("/v1/cost/report", get(self::cost::get_cost_report))
         .route("/v1/cost/report", axum::routing::post(self::cost::post_cost_report))
