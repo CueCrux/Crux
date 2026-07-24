@@ -91,6 +91,7 @@ fetch_work() {
 declare -a FLIP=()
 declare -a INVERSE=()
 SCANNED=0
+UNRESOLVED=0
 run_sweep() {
   local root="$1" work_json="$2"
   if ! command -v jq >/dev/null 2>&1; then
@@ -103,9 +104,21 @@ run_sweep() {
   while IFS=$'\t' read -r id state plan_path; do
     [[ -z "$id" ]] && continue
     slug="${id#execplan:}"
-    path="$plan_path"
-    [[ -z "$path" && -n "$root" ]] && path="${root}/${slug}.md"
-    [[ -f "$path" ]] || continue
+    # plan_path is the DAEMON's absolute path (e.g. /srv/.../<slug>.md) and
+    # usually doesn't exist on an operator machine. Use it only if it resolves
+    # locally; otherwise fall back to ${root}/<slug>.md. A silent 100% miss (all
+    # items skipped -> "No drift") is the worst failure mode for a drift
+    # detector, so unresolvable items are counted, not quietly dropped.
+    path=""
+    if [[ -n "$plan_path" && -f "$plan_path" ]]; then
+      path="$plan_path"
+    elif [[ -n "$root" && -f "${root}/${slug}.md" ]]; then
+      path="${root}/${slug}.md"
+    fi
+    if [[ -z "$path" ]]; then
+      UNRESOLVED=$((UNRESOLVED + 1))
+      continue
+    fi
     SCANNED=$((SCANNED + 1))
     sval="$(leading_status "$path")"
     cls="$(classify_status "$sval")"
@@ -149,10 +162,22 @@ report_full() {
   if (( ${#FLIP[@]} == 0 && ${#INVERSE[@]} == 0 )); then
     printf 'No drift.\n'
   fi
+  if (( UNRESOLVED > 0 )); then
+    printf '\nNOTE: %d execplan item(s) had no locally resolvable .md — set CRUX_EXECPLANS_ROOT\n' "${UNRESOLVED}"
+    if (( SCANNED == 0 )); then
+      printf '      (0 scanned: the sweep saw nothing — this is NOT a clean board)\n'
+    fi
+  fi
   return 0
 }
 
 report_quiet() {
+  # Silent on unresolvables (boot noise) EXCEPT a 100% miss — 0 scanned while
+  # items exist is the false-clean bug, so surface exactly that one case.
+  if (( SCANNED == 0 && UNRESOLVED > 0 )); then
+    printf 'execplan-status sweep: 0 of %d items had a locally resolvable .md — set CRUX_EXECPLANS_ROOT (board NOT verified)\n' "${UNRESOLVED}"
+    return 0
+  fi
   (( ${#FLIP[@]} == 0 )) && return 0
   local slugs=()
   local slug _rest
@@ -196,15 +221,19 @@ self_test() {
   printf '# Fix widget\n\n> **Status:** Superseded by [[next]]\n'                   >"$tmp/aligned-superseded.md"
   printf '# Fix widget\n\nSome preamble, no status line here.\n'                    >"$tmp/drift-nostatus.md"
   printf '# Fix widget\n\nStatus: Complete\n'                                       >"$tmp/inverse-facts-missing.md"
+  # Fixture reachable ONLY via the ${root}/<slug>.md fallback: its work item
+  # carries a daemon-side plan_path that doesn't exist on this machine.
+  printf '# Fix widget\n\nStatus: In progress\n'                                   >"$tmp/fallback-inprog.md"
 
   cat >"$tmp/work.json" <<EOF
-{"count":6,"source":"all","work":[
+{"count":7,"source":"all","work":[
   {"id":"execplan:drift-inprog","state":"complete","plan_path":"$tmp/drift-inprog.md"},
   {"id":"execplan:drift-trailer","state":"archive","plan_path":"$tmp/drift-trailer.md"},
   {"id":"execplan:aligned-complete","state":"complete","plan_path":"$tmp/aligned-complete.md"},
   {"id":"execplan:aligned-superseded","state":"archive","plan_path":"$tmp/aligned-superseded.md"},
   {"id":"execplan:drift-nostatus","state":"complete","plan_path":"$tmp/drift-nostatus.md"},
   {"id":"execplan:inverse-facts-missing","state":"in_progress","plan_path":"$tmp/inverse-facts-missing.md"},
+  {"id":"execplan:fallback-inprog","state":"complete","plan_path":"/nonexistent/daemon/fallback-inprog.md"},
   {"id":"w_kanban_ignored","state":"complete"}
 ]}
 EOF
@@ -225,24 +254,44 @@ EOF
   check "leading blockquote" "$(leading_status "$tmp/aligned-superseded.md")" "Superseded by [[next]]"
 
   # Integration: full sweep against canned JSON (no live daemon).
-  FLIP=(); INVERSE=(); SCANNED=0
+  # fallback-inprog resolves via ${root}/<slug>.md despite a dead plan_path.
+  FLIP=(); INVERSE=(); SCANNED=0; UNRESOLVED=0
   run_sweep "$tmp" "$(cat "$tmp/work.json")"
-  check "scanned count"   "$SCANNED"        6
-  check "flip count"      "${#FLIP[@]}"     3
-  check "inverse count"   "${#INVERSE[@]}"  1
+  check "scanned count"      "$SCANNED"        7
+  check "unresolved count"   "$UNRESOLVED"     0
+  check "flip count"         "${#FLIP[@]}"     4
+  check "inverse count"      "${#INVERSE[@]}"  1
 
   local flip_slugs; flip_slugs="$(printf '%s\n' "${FLIP[@]}" | cut -f1 | sort | tr '\n' ' ')"
-  check "flip slugs" "$flip_slugs" "drift-inprog drift-nostatus drift-trailer "
+  check "flip slugs (inc. fallback)" "$flip_slugs" "drift-inprog drift-nostatus drift-trailer fallback-inprog "
 
   # Quiet-mode output shape.
   local q; q="$(report_quiet)"
   case "$q" in
-    "execplan-status drift: 3 plan(s) need a Status flip: "*) echo "ok   quiet line" ;;
+    "execplan-status drift: 4 plan(s) need a Status flip: "*) echo "ok   quiet line" ;;
     *) echo "FAIL quiet line (got '$q')"; fails=$((fails+1)) ;;
   esac
   # Quiet mode silent when clean.
   FLIP=(); local q2; q2="$(report_quiet)"
   check "quiet clean silent" "$q2" ""
+
+  # All-unresolvable: every plan_path dead + no fixture at ${root}/<slug>.md.
+  # This is the false-clean bug — must NOT read as clean.
+  cat >"$tmp/allmiss.json" <<'EOF'
+{"count":2,"source":"all","work":[
+  {"id":"execplan:ghost-a","state":"complete","plan_path":"/nonexistent/a.md"},
+  {"id":"execplan:ghost-b","state":"archive","plan_path":"/nonexistent/b.md"}
+]}
+EOF
+  FLIP=(); INVERSE=(); SCANNED=0; UNRESOLVED=0
+  run_sweep "$tmp/no-such-root" "$(cat "$tmp/allmiss.json")"
+  check "allmiss scanned"    "$SCANNED"      0
+  check "allmiss unresolved" "$UNRESOLVED"   2
+  local qm; qm="$(report_quiet)"
+  case "$qm" in
+    "execplan-status sweep: 0 of 2 items had a locally resolvable .md"*) echo "ok   quiet 100%-miss warning" ;;
+    *) echo "FAIL quiet 100%-miss warning (got '$qm')"; fails=$((fails+1)) ;;
+  esac
 
   [[ $fails -eq 0 ]] && echo "SELF-TEST PASS" || { echo "SELF-TEST FAIL ($fails)"; return 1; }
 }
