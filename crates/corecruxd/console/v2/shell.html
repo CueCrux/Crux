@@ -562,6 +562,46 @@
   .rail-flyout-item[aria-current="page"] { background: var(--surface2); color: var(--ink); border-color: var(--edge-strong); }
   @media (prefers-reduced-motion: reduce) { .rail-flyout-item { transition: none; } }
 
+  /* ---- Collapsed-rail icon controls (M16a) -------------------------------
+     When the rail collapses the rail-meta cluster (Command | Explore surface
+     toggle + status + theme) is hidden, leaving those affordances homeless.
+     This icon strip restores them: dedicated Command + Explorer buttons and a
+     single Operator-options button that opens a glass popup (the rail-flyout
+     idiom) with the remaining operator chrome. Desktop-collapsed only — the
+     expanded rail keeps the rail-meta as-is; the phone tier hides the rail. */
+  .rail-icons { display: none; }
+  @media (min-width: 721px) {
+    :root[data-rail="collapsed"] .rail-icons {
+      display: flex; flex-direction: column; align-items: center; gap: 4px;
+      padding: 2px 0 10px; margin-bottom: 6px; border-bottom: 1px solid var(--edge);
+    }
+  }
+  .rail-ic {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 44px; height: 40px; flex: none;
+    border: 1px solid transparent; border-radius: var(--radius-sm);
+    background: none; color: var(--ink2); cursor: pointer;
+    transition: color .16s ease, background .16s ease, border-color .16s ease;
+  }
+  .rail-ic svg { width: 20px; height: 20px; }
+  .rail-ic:hover { color: var(--ink); background: var(--surface2); border-color: var(--edge-strong); }
+  .rail-ic:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; }
+  .rail-ic[aria-pressed="true"], .rail-ic[aria-expanded="true"] {
+    color: var(--acc); background: color-mix(in srgb, var(--acc) 12%, transparent);
+    border-color: color-mix(in srgb, var(--acc) 40%, transparent);
+  }
+  /* Operator-options popup — reuses .rail-flyout glass; laid-out sections. */
+  .rail-ops-sec { padding: 2px 4px 8px; }
+  .rail-ops-sec + .rail-ops-sec { border-top: 1px solid var(--edge); padding-top: 8px; }
+  .rail-ops-label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--ink3); font-weight: 600; padding: 2px 4px 6px; }
+  .rail-ops-themes { display: flex; gap: 4px; }
+  .rail-ops-themes .theme-btn { flex: 1; min-height: 38px; min-width: 0; border: 1px solid var(--edge); border-radius: var(--radius-sm); }
+  .rail-ops-status { display: flex; align-items: center; gap: 8px; padding: 2px 4px; font-size: 12.5px; color: var(--ink2); }
+  .rail-ops-status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink3); flex: none; }
+  .rail-ops-status.ok .dot { background: var(--ok); }
+  .rail-ops-status.degraded .dot { background: var(--warn); }
+  .rail-ops-status.down .dot { background: var(--crit); }
+
   .content { padding: 26px 28px 48px; }
 
   /* ---- Rings page — NATIVE (no iframe) -----------------------------------
@@ -632,29 +672,43 @@
   .rings-stage { position: relative; flex: 1 1 auto; min-height: 460px; overflow: hidden; }
   .rings-canvas { display: block; position: absolute; inset: 0; width: 100%; height: 100%; cursor: crosshair; touch-action: none; transition: opacity .32s ease; }
 
-  /* ---- M13: fixed tab hub (top-left) + Overwatch view swap ----------------
+  /* ---- M13/M16a: Rings tab hub (icon tabs in the topbar) + view swap -------
      The Ring tab shows the canvas; the other five fade it out and swap in an
-     Overwatch view (.rings-tabhost). The tab buttons NEVER move (fixed top-left,
-     independent of the active tab). Reduced motion → instant swap, no cascade. */
+     Overwatch view (.rings-tabhost). The tab buttons render as ICON buttons
+     (M16a) mounted into the shell topbar slot (#ringsTabSlot), on the search
+     field's row, in the space the page heading used to occupy — so they never
+     overlap the canvas and never move. Reduced motion → instant swap, no cascade.
+     The icon tabs use the console token vocabulary (not the rings-scoped tokens)
+     since they now live outside .rings-root. */
   .rings-root.rings-tab-active .rings-canvas { opacity: 0; pointer-events: none; }
-  .rings-tabs {
-    position: absolute; top: 12px; left: 14px; z-index: 22;
-    display: flex; flex-wrap: wrap; gap: 4px; align-items: center; padding: 4px;
-    border-radius: 12px; background: var(--rings-bar-bg); border: 1px solid var(--rings-hairline-strong);
-    -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); box-shadow: 0 8px 24px rgba(0,0,0,.3);
+  /* Rings page: the topbar drops the page heading and hosts the icon tabs. */
+  .topbar.rings-tabmode .topbar-title { display: flex; align-items: center; }
+  .topbar.rings-tabmode .topbar-title > h1,
+  .topbar.rings-tabmode .topbar-title > .sub { display: none; }
+  .rings-tabicons-slot { display: inline-flex; align-items: center; min-width: 0; }
+  .rings-tabicons { display: inline-flex; align-items: center; gap: 4px; height: 38px; }
+  .rtab {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 38px; height: 38px; flex: none;
+    border: 1px solid transparent; border-radius: var(--radius-sm);
+    background: none; color: var(--ink2); cursor: pointer;
+    transition: color .16s ease, background .16s ease, border-color .16s ease;
   }
-  .rings-tab {
-    font: 600 12px var(--font-sans); color: var(--rings-ink2); background: transparent;
-    border: 1px solid transparent; border-radius: 8px; padding: 6px 11px; min-height: 30px;
-    cursor: pointer; white-space: nowrap; transition: color .14s ease, background .14s ease, border-color .14s ease;
+  .rtab svg { width: 20px; height: 20px; }
+  .rtab:hover { color: var(--ink); background: var(--surface2); }
+  .rtab:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; }
+  .rtab[aria-selected="true"] {
+    color: var(--acc); background: color-mix(in srgb, var(--acc) 12%, transparent);
+    border-color: color-mix(in srgb, var(--acc) 40%, transparent);
   }
-  .rings-tab:hover { color: var(--rings-ink); background: var(--rings-btn-bg-hover); }
-  .rings-tab:focus-visible { outline: 2px solid var(--rings-accent); outline-offset: 2px; }
-  .rings-tab[aria-selected="true"] {
-    color: var(--rings-accent); background: color-mix(in srgb, var(--rings-accent) 15%, var(--rings-btn-bg));
-    border-color: color-mix(in srgb, var(--rings-accent) 55%, transparent);
-  }
-  .rings-tabhost { position: absolute; inset: 0; z-index: 12; overflow: auto; padding: 62px 20px 24px; color: var(--rings-ink2); }
+  /* Defensive fallback if the tab bar is ever mounted inside the ring stage
+     (no topbar slot supplied) — pin it top-left as the M13 hub did. */
+  .rings-root .rings-tabicons { position: absolute; top: 12px; left: 14px; z-index: 22;
+    padding: 4px; border-radius: 12px; background: var(--rings-bar-bg); border: 1px solid var(--rings-hairline-strong); }
+  .rings-root .rtab { color: var(--rings-ink2); }
+  .rings-root .rtab:hover { color: var(--rings-ink); background: var(--rings-btn-bg-hover); }
+  .rings-root .rtab[aria-selected="true"] { color: var(--rings-accent); background: color-mix(in srgb, var(--rings-accent) 15%, var(--rings-btn-bg)); border-color: color-mix(in srgb, var(--rings-accent) 55%, transparent); }
+  .rings-tabhost { position: absolute; inset: 0; z-index: 12; overflow: auto; padding: 22px 20px 24px; color: var(--rings-ink2); }
   .rings-tabhost[hidden] { display: none; }
   .rings-chrome-hidden { display: none !important; }
   @keyframes ringsCascIn {
@@ -2885,6 +2939,10 @@
           <button class="rail-theme-cycle" id="themeCycle" type="button" title="Cycle theme" aria-label="Cycle theme"></button>
         </div>
       </div>
+      <!-- Collapsed-rail icon controls (M16a): Command · Explorer · Operator
+           options. Built by buildRailIcons(); shown only when the rail is
+           collapsed (CSS), where the rail-meta cluster above is hidden. -->
+      <div class="rail-icons" id="railIcons" role="group" aria-label="Surface and operator options"></div>
       <nav id="nav" aria-label="Primary"></nav>
       <div class="rail-footer">
         <div class="acct-menu-wrap" id="acctWrap">
@@ -3481,6 +3539,128 @@
     });
   }
 
+  // ---- Collapsed-rail icon controls + operator-options popup (M16a) -------
+  // When the rail collapses, the rail-meta cluster (Command | Explore surface
+  // toggle + status + theme) is hidden, so those affordances become homeless.
+  // buildRailIcons restores them: dedicated Command + Explorer icon buttons, and
+  // an Operator-options button that opens a glass popup (the rail-flyout idiom)
+  // carrying the remaining operator chrome (theme picker + connection readout).
+  // Presentation only — never posture (posture is server-derived at boot).
+  var RAIL_IC = {
+    command: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="2.5"/><path d="M7.5 9.5l3 2.5-3 2.5"/><path d="M12.5 15h4"/></svg>',
+    ops: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h9M17 7h3"/><path d="M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2.2"/><circle cx="9" cy="17" r="2.2"/></svg>'
+  };
+  var railOpsPop = null, railOpsAnchor = null;
+  function railOpsThemeSync() {
+    if (!railOpsPop) { return; }
+    var cur = readTheme();
+    var btns = railOpsPop.querySelectorAll('.theme-btn');
+    for (var i = 0; i < btns.length; i++) { btns[i].setAttribute('aria-pressed', btns[i].getAttribute('data-theme') === cur ? 'true' : 'false'); }
+  }
+  function railOpsStatusSync() {
+    if (!railOpsPop) { return; }
+    var src = document.getElementById('health');
+    var box = document.getElementById('railOpsStatus');
+    var txt = document.getElementById('railOpsStatusText');
+    if (!box || !txt) { return; }
+    var kind = 'ok';
+    if (src) { ['ok', 'degraded', 'down'].forEach(function (k) { if (src.classList.contains(k)) { kind = k; } }); }
+    box.className = 'rail-ops-status ' + kind;
+    var ht = document.getElementById('healthText');
+    txt.textContent = ht ? ht.textContent : '';
+  }
+  function ensureRailOpsPop() {
+    if (railOpsPop) { return railOpsPop; }
+    railOpsPop = el('div', { id: 'railOpsPop', 'class': 'rail-flyout', role: 'menu', 'aria-label': 'Operator options' });
+    railOpsPop.hidden = true;
+    railOpsPop.appendChild(el('div', { 'class': 'rail-flyout-h', text: 'Operator options' }));
+    var tsec = el('div', { 'class': 'rail-ops-sec' });
+    tsec.appendChild(el('div', { 'class': 'rail-ops-label', text: 'Theme' }));
+    var trow = el('div', { 'class': 'rail-ops-themes', role: 'group', 'aria-label': 'Theme' });
+    for (var i = 0; i < THEMES.length; i++) {
+      var t = THEMES[i];
+      var tb = el('button', { 'class': 'theme-btn', type: 'button', 'data-theme': t.id, 'aria-pressed': 'false', 'aria-label': t.label + ' theme', title: t.label + ' theme', html: ICONS[t.icon] || '' });
+      (function (id) { tb.addEventListener('click', function () { applyTheme(id); railOpsThemeSync(); }); })(t.id);
+      trow.appendChild(tb);
+    }
+    tsec.appendChild(trow); railOpsPop.appendChild(tsec);
+    var csec = el('div', { 'class': 'rail-ops-sec' });
+    csec.appendChild(el('div', { 'class': 'rail-ops-label', text: 'Connection' }));
+    var stat = el('div', { 'class': 'rail-ops-status', id: 'railOpsStatus' });
+    stat.appendChild(el('span', { 'class': 'dot', 'aria-hidden': 'true' }));
+    stat.appendChild(el('span', { 'class': 'txt', id: 'railOpsStatusText', text: '—' }));
+    csec.appendChild(stat); railOpsPop.appendChild(csec);
+    railOpsPop.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') { var a = railOpsAnchor; closeRailOpsPop(); if (a) { a.focus(); } }
+    });
+    document.body.appendChild(railOpsPop);
+    return railOpsPop;
+  }
+  function closeRailOpsPop() {
+    if (railOpsAnchor) { railOpsAnchor.setAttribute('aria-expanded', 'false'); }
+    railOpsAnchor = null;
+    if (railOpsPop && !railOpsPop.hidden) { railOpsPop.hidden = true; }
+  }
+  function openRailOpsPop(anchorBtn) {
+    var pop = ensureRailOpsPop();
+    railOpsThemeSync(); railOpsStatusSync();
+    var railEl = document.querySelector('.rail'), aRect = anchorBtn.getBoundingClientRect(), rRect = railEl.getBoundingClientRect();
+    pop.hidden = false;
+    pop.style.left = Math.round(rRect.right - 1) + 'px';
+    var maxTop = window.innerHeight - pop.offsetHeight - 8;
+    pop.style.top = Math.max(8, Math.min(Math.round(aRect.top), maxTop)) + 'px';
+    railOpsAnchor = anchorBtn;
+    anchorBtn.setAttribute('aria-expanded', 'true');
+    var first = pop.querySelector('.theme-btn'); if (first) { first.focus(); }
+  }
+  // Reflect the current surface (Command | Explorer) on the collapsed icons.
+  function syncRailIcons() {
+    var wrap = document.getElementById('railIcons');
+    if (!wrap) { return; }
+    var cmd = wrap.querySelector('[data-railic="command"]');
+    var exp = wrap.querySelector('[data-railic="explorer"]');
+    if (!cmd || !exp) { return; }
+    var h = (location.hash || '').replace(/^#\/?/, '');
+    var mode = document.documentElement.getAttribute('data-mode');
+    var onExplorer = /^explorer(\/|\?|$)/.test(h);
+    var onDocs = mode === 'documents' || /^documents(\/|$)/.test(h);
+    exp.setAttribute('aria-pressed', onExplorer ? 'true' : 'false');
+    cmd.setAttribute('aria-pressed', (!onExplorer && !onDocs) ? 'true' : 'false');
+  }
+  function buildRailIcons() {
+    var wrap = document.getElementById('railIcons');
+    if (!wrap) { return; }
+    wrap.textContent = '';
+    // Command — the ops-console surface (mirrors the rail-meta Command toggle).
+    var cmd = el('button', { 'class': 'rail-ic', type: 'button', 'data-railic': 'command', 'aria-label': 'Command surface', title: 'Command', 'aria-pressed': 'false' });
+    cmd.innerHTML = RAIL_IC.command;
+    cmd.addEventListener('click', function () { closeRailOpsPop(); applySurface('command'); syncRailIcons(); });
+    // Explorer — the corpus-search destination (#/explorer, railHidden).
+    var exp = el('button', { 'class': 'rail-ic', type: 'button', 'data-railic': 'explorer', 'aria-label': 'Explorer', title: 'Explorer', 'aria-pressed': 'false' });
+    exp.innerHTML = ICONS.search;
+    exp.addEventListener('click', function () { closeRailOpsPop(); location.hash = '#/explorer'; });
+    // Operator options — opens the glass popup (theme + connection).
+    var ops = el('button', { 'class': 'rail-ic', type: 'button', 'data-railic': 'ops', 'aria-label': 'Operator options', title: 'Operator options', 'aria-haspopup': 'menu', 'aria-expanded': 'false' });
+    ops.innerHTML = RAIL_IC.ops;
+    ops.addEventListener('click', function (e) { e.stopPropagation(); if (railOpsPop && !railOpsPop.hidden) { closeRailOpsPop(); } else { openRailOpsPop(ops); } });
+    wrap.appendChild(cmd); wrap.appendChild(exp); wrap.appendChild(ops);
+    syncRailIcons();
+  }
+  if (typeof document !== 'undefined') {
+    document.addEventListener('click', function (e) {
+      if (railOpsPop && !railOpsPop.hidden && !e.target.closest('#railOpsPop') && !e.target.closest('[data-railic="ops"]')) { closeRailOpsPop(); }
+    }, true);
+  }
+  // Rings page (M16a): the topbar drops its heading and hosts the icon tabs. This
+  // resets the topbar to its normal heading on EVERY route so leaving #/rings is
+  // deterministic (the rings branch of renderDestination re-arms it).
+  function resetRingsTopbar() {
+    var tb = document.querySelector('.topbar');
+    if (tb) { tb.classList.remove('rings-tabmode'); }
+    var slot = document.getElementById('ringsTabSlot');
+    if (slot && slot.parentNode) { slot.parentNode.removeChild(slot); }
+  }
+
   function buildRail() {
     var nav = document.getElementById('nav');
     nav.textContent = '';
@@ -3617,6 +3797,7 @@
   }
   function applyRail(state) {
     var collapsed = state === 'collapsed';
+    if (!collapsed && typeof closeRailOpsPop === 'function') { closeRailOpsPop(); }   // M16a: expanding hides the collapsed ops popup
     document.documentElement.setAttribute('data-rail', collapsed ? 'collapsed' : 'open');
     try { localStorage.setItem(LS_RAIL, collapsed ? 'collapsed' : 'open'); } catch (e) { /* private mode */ }
     var btn = document.getElementById('railToggle');
@@ -3867,12 +4048,21 @@
     // clearing #content (renderRings' RAF/observers/listeners self-cancel once
     // the canvas leaves the DOM). Reads only, so it shows in every posture.
     if (destId === 'rings') {
+      // M16a: no page heading — the rings tab hub (icon buttons) is mounted into
+      // the topbar slot, on the search field's row, in the heading's space. The
+      // destTitle/destSub text is still set (hidden via .rings-tabmode CSS) so the
+      // topbar restores cleanly on the next route (resetRingsTopbar in route()).
       document.getElementById('destTitle').textContent = dest.label;
       document.getElementById('destSub').textContent = dest.sub || '';
+      var ringsTb = document.querySelector('.topbar');
+      if (ringsTb) { ringsTb.classList.add('rings-tabmode'); }
+      var ringsTabSlot = el('div', { id: 'ringsTabSlot', 'class': 'rings-tabicons-slot' });
+      var ringsTt = document.querySelector('.topbar-title');
+      if (ringsTt) { ringsTt.appendChild(ringsTabSlot); }
       var ringsHost = el('div', { 'class': 'rings-region-host', id: 'ringsHost' });
       content.appendChild(ringsHost);
       if (window.CruxRender && window.CruxRender.renderRings) {
-        window.CruxRender.renderRings(ringsHost, { summary: BOOT.summary });
+        window.CruxRender.renderRings(ringsHost, { summary: BOOT.summary, tabSlot: ringsTabSlot });
       } else {
         ringsHost.appendChild(el('p', { 'class': 'v2card-sub', text: 'Renderer module unavailable.' }));
       }
@@ -3943,6 +4133,7 @@
   // mode AUTO-SWITCHES the mode back to standard (destinations win over the reader
   // — mode is presentation, not a route). #/documents[/<docId>] keeps the reader.
   function route() {
+    resetRingsTopbar();   // M16a: normalise the topbar heading before any branch paints
     var h = (location.hash || '').replace(/^#\/?/, '');
     var qi = h.indexOf('?'); if (qi >= 0) { h = h.slice(0, qi); }
     var parts = h.split('/').filter(Boolean);
@@ -3956,11 +4147,13 @@
       } else {
         if (!inDocsMode) { setModeSilently('documents'); }
         renderDocumentsRoute(parts[1]);
+        syncRailIcons();   // M16a: Explore surface → reflect on the collapsed-rail icons
         return;
       }
     }
     var r = currentRoute();
     renderDestination(r.dest, r.page);
+    syncRailIcons();   // M16a: reflect the active surface on the collapsed-rail icons
   }
 
   // Documents-mode render: swap the rail to the document tree (render.js builds
@@ -4077,6 +4270,7 @@
     initSearchStub();   // wire the top-right search stub → Explorer
     wireTopbarScroll(); // transparent top bar → glass on scroll
     buildRail();
+    buildRailIcons();          // collapsed-rail Command · Explorer · Operator-options (M16a)
     initThemeCycle();          // rail theme-cycle icon (theme picker lives in Settings)
     applyTheme(readTheme());
     initAcctMenu();            // bottom account roll-up (Settings · Language · Log out)

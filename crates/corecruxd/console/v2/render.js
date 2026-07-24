@@ -11305,22 +11305,30 @@
     //   never move (fixed top-left, independent of the active tab). Reduced motion
     //   → instant swap (no fade, no cascade). The draw loop is paused while hidden.
     var fadeTimer = null, pauseWatch = null;
+    // Tab buttons are ICON buttons (M16a): the unified ricon family (24 viewBox /
+    // 1.8 stroke). The full view name rides on aria-label + the title tooltip; the
+    // text label is gone. The bar is mounted into the shell topbar slot
+    // (ctxIn.tabSlot) so it sits on the console search field's row, in the space
+    // the page heading used to occupy — falling back to the ring stage if no slot
+    // is provided (defensive; the shell always supplies one for #/rings).
     var RINGS_TABS = [
-      { id: 'ring', title: 'Ring' },
-      { id: 'cx-activity', title: 'Activity' },
-      { id: 'cx-coord', title: 'Live board' },
-      { id: 'cx-orchestrators', title: 'Orchestrators' },
-      { id: 'cx-punchcards', title: 'Punchcards' },
-      { id: 'ax-agent', title: 'Agent' }
+      { id: 'ring', title: 'Ring', icon: '<circle cx="12" cy="12" r="8.6"/><circle cx="12" cy="12" r="3.3"/>' },
+      { id: 'cx-activity', title: 'Activity', icon: '<path d="M3 12h3.6l2.4-7 4 14 2.4-7H21"/>' },
+      { id: 'cx-coord', title: 'Live board', icon: '<circle cx="12" cy="12" r="2.3"/><path d="M8.6 8.6a5 5 0 0 0 0 6.8M15.4 8.6a5 5 0 0 1 0 6.8M6.1 6.1a9 9 0 0 0 0 11.8M17.9 6.1a9 9 0 0 1 0 11.8"/>' },
+      { id: 'cx-orchestrators', title: 'Orchestrators', icon: '<circle cx="12" cy="5" r="2.2"/><circle cx="5.5" cy="18.5" r="2.2"/><circle cx="18.5" cy="18.5" r="2.2"/><path d="M12 7.2v3.4M12 10.6l-6 5.9M12 10.6l6 5.9"/>' },
+      { id: 'cx-punchcards', title: 'Punchcards', icon: '<rect x="3.5" y="5" width="17" height="14" rx="2"/><circle cx="8" cy="10" r="1.05" fill="currentColor" stroke="none"/><circle cx="12" cy="10" r="1.05" fill="currentColor" stroke="none"/><path d="M7 14.5h10"/>' },
+      { id: 'ax-agent', title: 'Agent', icon: '<rect x="4.5" y="8" width="15" height="10" rx="2.5"/><path d="M12 4.6v3.4"/><circle cx="12" cy="4" r="1.05"/><circle cx="9.6" cy="13" r="1.05" fill="currentColor" stroke="none"/><circle cx="14.4" cy="13" r="1.05" fill="currentColor" stroke="none"/>' }
     ];
     var ringTabBtns = {};
-    var ringTabBar = el('div', { 'class': 'rings-tabs', role: 'tablist', 'aria-label': 'Rings views' });
+    var ringTabBar = el('div', { 'class': 'rings-tabicons', role: 'tablist', 'aria-label': 'Rings views' });
     RINGS_TABS.forEach(function (t) {
-      var b = el('button', { 'class': 'rings-tab', type: 'button', role: 'tab', 'data-tab': t.id, 'aria-selected': t.id === 'ring' ? 'true' : 'false' }, [t.title]);
+      var b = el('button', { 'class': 'rtab', type: 'button', role: 'tab', 'data-tab': t.id, 'aria-selected': t.id === 'ring' ? 'true' : 'false', 'aria-label': t.title, title: t.title });
+      b.innerHTML = ricon(t.icon);
       b.addEventListener('click', function () { setTab(t.id); });
       ringTabBar.appendChild(b); ringTabBtns[t.id] = b;
     });
-    stage.appendChild(ringTabBar);
+    var ringTabMount = (ctxIn && ctxIn.tabSlot) ? ctxIn.tabSlot : stage;
+    ringTabMount.appendChild(ringTabBar);
     var tabHost = el('div', { 'class': 'rings-tabhost', role: 'region', 'aria-label': 'Overwatch view' });
     tabHost.hidden = true;
     stage.appendChild(tabHost);
