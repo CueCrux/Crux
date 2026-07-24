@@ -347,6 +347,9 @@
     :root[data-rail="collapsed"] .nav-group-label { display: none; }
     :root[data-rail="collapsed"] .passport-chip { justify-content: center; padding: 8px 0; gap: 0; }
     :root[data-rail="collapsed"] .passport-chip .who { display: none; }
+    /* M18 — the collapsed rail is icon-only; the badge is just the avatar (the
+       caret reads as chrome). Click still opens the operator pop-out. */
+    :root[data-rail="collapsed"] .passport-chip .acct-caret { display: none; }
     :root[data-rail="collapsed"] .theme-switch { flex-direction: column; }
   }
 
@@ -423,31 +426,19 @@
   }
   .rail-theme-cycle:hover { color: var(--ink); border-color: var(--edge-strong); background: var(--surface); }
   .rail-theme-cycle svg { width: 13px; height: 13px; }
-  /* Bottom account roll-up menu (Settings · Language · Log out) — the System button. */
+  /* Bottom account / operator badge (Settings · Language · Log out). M18 — the
+     old upward roll-up (.acct-menu, absolute left:0;right:0 above the chip) was
+     clipped to the ~48px collapsed-rail width and used a bespoke idiom. It is
+     replaced by a glass rightward pop-out (#acctPop, built in JS) that REUSES
+     the M17 rail-flyout family, so the badge now matches the workspace switcher
+     + operator-options popups and stays legible in both rail states. */
   .acct-menu-wrap { position: relative; }
   .passport-chip { width: 100%; font: inherit; cursor: pointer; }
-  .passport-chip[aria-expanded="true"] { border-color: var(--edge-strong); }
+  .passport-chip[aria-expanded="true"] { border-color: var(--edge-strong); background: var(--surface); }
   .passport-chip .acct-caret { margin-left: auto; display: inline-flex; width: 14px; height: 14px; color: var(--ink3); flex: none; }
-  .passport-chip .acct-caret svg { width: 14px; height: 14px; transform: rotate(-90deg); }
-  .passport-chip[aria-expanded="true"] .acct-caret svg { transform: rotate(90deg); }
-  .acct-menu {
-    position: absolute; left: 0; right: 0; bottom: calc(100% + 8px); z-index: 30;
-    display: flex; flex-direction: column; gap: 2px; padding: 6px;
-    border: 1px solid var(--edge); border-radius: var(--radius-sm);
-    background: var(--surface); box-shadow: var(--card-shadow);
-    backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
-  }
-  .acct-menu[hidden] { display: none; }
-  .acct-item {
-    display: flex; align-items: center; gap: 11px; width: 100%; min-height: 38px; padding: 8px 10px;
-    border: 0; border-radius: 8px; background: none; color: var(--ink);
-    font: inherit; font-size: 13px; text-align: left; cursor: pointer;
-  }
-  .acct-item:hover { background: var(--surface2); }
-  .acct-ico { display: inline-flex; width: 16px; height: 16px; flex: none; color: var(--ink2); }
-  .acct-ico svg { width: 16px; height: 16px; }
-  .acct-sep { height: 1px; margin: 4px 2px; background: var(--edge); }
-  .acct-code { margin-left: auto; font-family: var(--font-mono); font-size: 9.5px; color: var(--ink3); border: 1px solid var(--edge); border-radius: 5px; padding: 1px 6px; }
+  .passport-chip .acct-caret svg { width: 14px; height: 14px; transform: rotate(180deg); }   /* chevron points right — the pop-out opens rightward (M17 idiom) */
+  /* Language locale badge, trailing the Language flyout row. */
+  .rail-flyout-item .acct-code { margin-left: 8px; font-family: var(--font-mono); font-size: 9.5px; color: var(--ink3); border: 1px solid var(--edge); border-radius: 5px; padding: 1px 6px; }
   /* Settings › Theme picker */
   .theme-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
   .theme-opt { display: flex; flex-direction: column; gap: 8px; }
@@ -565,6 +556,7 @@
     background: var(--surface2); color: var(--ink); border-color: var(--edge-strong); outline: none;
   }
   .rail-flyout-item[aria-current="page"] { background: var(--surface2); color: var(--ink); border-color: var(--edge-strong); }
+  .rail-flyout-item[hidden] { display: none; }   /* the flex display would otherwise override the [hidden] UA rule (e.g. Log out on a local daemon) */
   @media (prefers-reduced-motion: reduce) { .rail-flyout-item { transition: none; } }
 
   /* ---- Collapsed-rail icon controls (M16a) -------------------------------
@@ -3049,13 +3041,10 @@
       <div class="rail-icons" id="railIcons" role="group" aria-label="Surface and operator options"></div>
       <nav id="nav" aria-label="Primary"></nav>
       <div class="rail-footer">
+        <!-- M18 — the account/operator badge. Its menu (Settings · Language ·
+             Log out) is a glass rightward pop-out (#acctPop) built in JS and
+             appended to <body>, reusing the M17 rail-flyout family. -->
         <div class="acct-menu-wrap" id="acctWrap">
-          <div class="acct-menu" id="acctMenu" role="menu" aria-label="Account &amp; system" hidden>
-            <button class="acct-item" type="button" data-acct="settings" role="menuitem"><span class="acct-ico" data-ico="settings" aria-hidden="true"></span>Settings</button>
-            <button class="acct-item" type="button" data-acct="language" role="menuitem"><span class="acct-ico" data-ico="globe" aria-hidden="true"></span>Language<span class="acct-code" id="acctLangCode">EN</span></button>
-            <div class="acct-sep"></div>
-            <button class="acct-item" type="button" data-acct="logout" role="menuitem"><span class="acct-ico" data-ico="logout" aria-hidden="true"></span>Log out</button>
-          </div>
           <button class="passport-chip" id="passportChip" type="button" aria-haspopup="menu" aria-expanded="false" title="Account &amp; system">
             <span class="avatar" aria-hidden="true"></span>
             <span class="who">
@@ -3237,48 +3226,107 @@
     card.appendChild(body);
     return card;
   }
-  // Bottom account roll-up menu (Settings · Language · Log out) — the System
-  // destination moved here, Claude-desktop style. Settings routes to System ›
-  // Settings; Language stays a placeholder. Log out is wired to the hosted
-  // BFF session (POST /api/auth/logout, CSRF double-submit): on a hosted
-  // deployment the BFF answers /api/auth/session (200/401) and the item shows;
-  // on a local daemon that path 404s, there is no session to end, and the
-  // item hides. Cookies live on the parent domain, so one logout signs the
-  // account out of every surface.
-  function initAcctMenu() {
-    var btn = document.getElementById('passportChip');
-    var menu = document.getElementById('acctMenu');
-    if (!btn || !menu) { return; }
-    var icons = menu.querySelectorAll('.acct-ico');
-    for (var i = 0; i < icons.length; i++) { icons[i].innerHTML = ICONS[icons[i].getAttribute('data-ico')] || ''; }
-    var caret = btn.querySelector('.acct-caret'); if (caret) { caret.innerHTML = ICONS.chevron || ''; }
-    function closeMenu() { menu.hidden = true; btn.setAttribute('aria-expanded', 'false'); }
-    function openMenu() { menu.hidden = false; btn.setAttribute('aria-expanded', 'true'); }
-    var logoutItem = menu.querySelector('[data-acct="logout"]');
-    if (logoutItem && window.CruxSession) {
-      logoutItem.hidden = true;
-      window.CruxSession.probe().then(function (hosted) { logoutItem.hidden = !hosted; });
-    }
-    function doLogout() {
+  // ---- Account / operator badge pop-out (M18) ----------------------------
+  // The bottom-of-rail operator badge. Its menu (Settings · Language · Log out)
+  // is a glass rightward pop-out that REUSES the M17 rail-flyout family, built
+  // in JS and appended to <body> (#acctPop) — the old upward roll-up was clipped
+  // to the ~48px collapsed rail. Keyboard accessible (focus-first, Escape →
+  // refocus the badge, click-away), positioned flush to the rail's right edge
+  // (the switcher / operator-options idiom). Settings routes to System › Settings;
+  // Language is a placeholder (single locale). Log out drives the hosted BFF
+  // session (POST /api/auth/logout, CSRF double-submit): it shows only when
+  // CruxSession.probe() confirms a platform session — on a local daemon that
+  // path 404s and the item hides. Cookies live on the parent domain, so one
+  // logout signs the account out of every surface.
+  var acctPop = null, acctAnchor = null;
+  function acctAction(acct) {
+    if (acct === 'settings') { location.hash = '#/system/cx-settings'; }
+    else if (acct === 'logout') {
       if (!window.CruxSession) { return; }
       window.CruxSession.logout()
-        .then(function (ok) {
-          if (ok) { location.assign('/'); }
-          else { console.warn('logout failed'); }
-        })
+        .then(function (ok) { if (ok) { location.assign('/'); } else { console.warn('logout failed'); } })
         .catch(function (err) { console.warn('logout unavailable', err); });
     }
-    btn.addEventListener('click', function (e) { e.stopPropagation(); if (menu.hidden) { openMenu(); } else { closeMenu(); } });
-    menu.addEventListener('click', function (e) {
-      var item = (e.target && e.target.closest) ? e.target.closest('.acct-item') : null;
-      if (!item) { return; }
-      closeMenu();
-      if (item.getAttribute('data-acct') === 'settings') { location.hash = '#/system/cx-settings'; }
-      if (item.getAttribute('data-acct') === 'logout') { doLogout(); }
-      // language — placeholder.
+    // language — placeholder (single locale for now).
+  }
+  function ensureAcctPop() {
+    if (acctPop) { return acctPop; }
+    acctPop = el('div', { id: 'acctPop', 'class': 'rail-flyout', role: 'menu', 'aria-label': 'Account & system' });
+    acctPop.hidden = true;
+    acctPop.appendChild(el('div', { 'class': 'rail-flyout-h', text: 'Account' }));
+    var mk = function (label, iconKey, acct, extra) {
+      var kids = [el('span', { 'class': 'ic', 'aria-hidden': 'true', html: ICONS[iconKey] || '' }), el('span', { 'class': 'label', text: label })];
+      if (extra) { kids.push(extra); }
+      var row = el('button', { 'class': 'rail-flyout-item', type: 'button', role: 'menuitem', 'data-acct': acct }, kids);
+      (function (a) { row.addEventListener('click', function () { closeAcctPop(); acctAction(a); }); })(acct);
+      return row;
+    };
+    acctPop.appendChild(mk('Settings', 'settings', 'settings'));
+    acctPop.appendChild(mk('Language', 'globe', 'language', el('span', { 'class': 'acct-code', id: 'acctLangCode', text: 'EN' })));
+    var logoutRow = mk('Log out', 'logout', 'logout');
+    logoutRow.hidden = true;   // shown only on a hosted platform session (probe below)
+    acctPop.appendChild(logoutRow);
+    if (window.CruxSession) { window.CruxSession.probe().then(function (hosted) { logoutRow.hidden = !hosted; }); }
+    acctPop.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') { var a = acctAnchor; closeAcctPop(); if (a) { a.focus(); } }
     });
-    document.addEventListener('click', function () { if (!menu.hidden) { closeMenu(); } });
-    document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !menu.hidden) { closeMenu(); } });
+    document.body.appendChild(acctPop);
+    return acctPop;
+  }
+  function closeAcctPop() {
+    if (acctAnchor) { acctAnchor.setAttribute('aria-expanded', 'false'); }
+    acctAnchor = null;
+    if (acctPop && !acctPop.hidden) { acctPop.hidden = true; }
+  }
+  function openAcctPop(anchorBtn) {
+    var pop = ensureAcctPop();
+    pop.hidden = false;
+    pop.style.width = '';   // reset any mobile width override
+    var railEl = document.querySelector('.rail');
+    var rRect = railEl ? railEl.getBoundingClientRect() : null;
+    var aRect = anchorBtn.getBoundingClientRect();
+    if (rRect && rRect.width > 0) {
+      // Desktop — flush to the rail's right edge (the M17 idiom). The badge sits
+      // at the rail BOTTOM, so open the pop UPWARD from it: it rises alongside
+      // the rail, clear of the very bottom of the viewport — so it never covers
+      // page content or the #/rings bottom control bar. Only if there is not
+      // enough room above (a very short viewport) does it clamp downward.
+      pop.style.left = Math.round(rRect.right - 1) + 'px';
+      var up = Math.round(aRect.top) - pop.offsetHeight - 8;
+      var top = up >= 8 ? up : Math.min(Math.round(aRect.top), window.innerHeight - pop.offsetHeight - 8);
+      pop.style.top = Math.max(8, top) + 'px';
+    } else {
+      // Phone (rail hidden, badge relocated into the More sheet) — open ABOVE the
+      // badge, matching its width (preserves the old roll-up placement).
+      pop.style.left = Math.round(aRect.left) + 'px';
+      pop.style.width = Math.round(aRect.width) + 'px';
+      pop.style.top = Math.max(8, Math.round(aRect.top - pop.offsetHeight - 8)) + 'px';
+    }
+    acctAnchor = anchorBtn;
+    anchorBtn.setAttribute('aria-expanded', 'true');
+    var first = pop.querySelector('.rail-flyout-item:not([hidden])');
+    if (first) { first.focus(); }
+  }
+  function toggleAcctPop(anchorBtn) {
+    if (acctPop && !acctPop.hidden) { closeAcctPop(); }
+    else {
+      if (typeof closeRailOpsPop === 'function') { closeRailOpsPop(); }
+      if (typeof closeWsSwitchPop === 'function') { closeWsSwitchPop(); }
+      if (typeof closeRailFlyout === 'function') { closeRailFlyout(); }
+      openAcctPop(anchorBtn);
+    }
+  }
+  function initAcctMenu() {
+    var btn = document.getElementById('passportChip');
+    if (!btn) { return; }
+    var caret = btn.querySelector('.acct-caret'); if (caret) { caret.innerHTML = ICONS.chevron || ''; }
+    ensureAcctPop();
+    btn.addEventListener('click', function (e) { e.stopPropagation(); toggleAcctPop(btn); });
+  }
+  if (typeof document !== 'undefined') {
+    document.addEventListener('click', function (e) {
+      if (acctPop && !acctPop.hidden && !e.target.closest('#acctPop') && !e.target.closest('#passportChip')) { closeAcctPop(); }
+    }, true);
   }
 
   // ---- Presentation mode registry (Standard | Professional | Documents) --
@@ -3504,7 +3552,12 @@
     setModeSilently(id);
     if (id === 'documents') {
       if (!/^#\/documents/.test(location.hash || '')) { location.hash = '#/documents'; return; }   // hashchange → route()
-    } else if (/^#\/documents/.test(location.hash || '')) {
+    } else if (/^#\/documents/.test(location.hash || '') || /^#\/w\//.test(location.hash || '')) {
+      // M18 bug fix — leaving the reader OR a user workspace (#/w/<uid>) for the
+      // Command surface must DRIVE the hash to a Command destination. Before this,
+      // only #/documents was cleared; a switch back to Command from #/w/ fell
+      // through to route(), which re-read the still-#/w/ hash and re-rendered the
+      // SAME workspace — so the switcher could never return to Command.
       location.hash = '#/' + (DESTS[0] && DESTS[0].id); return;   // hashchange → route()
     }
     route();   // re-render: density change / Pro-only surface, or the reader
@@ -4587,6 +4640,7 @@
     if (typeof closeRailFlyout === 'function') { closeRailFlyout(); }
     if (typeof closeWsSwitchPop === 'function') { closeWsSwitchPop(); }
     if (typeof closeRailOpsPop === 'function') { closeRailOpsPop(); }
+    if (typeof closeAcctPop === 'function') { closeAcctPop(); }
     var contentEl0 = document.getElementById('content'); if (contentEl0) { contentEl0.classList.remove('settings-page'); }
     var h = (location.hash || '').replace(/^#\/?/, '');
     var qi = h.indexOf('?'); if (qi >= 0) { h = h.slice(0, qi); }
@@ -4742,7 +4796,7 @@
     buildRailIcons();          // collapsed-rail Command · Explorer · Operator-options (M16a)
     initThemeCycle();          // rail theme-cycle icon (theme picker lives in Settings)
     applyTheme(readTheme());
-    initAcctMenu();            // bottom account roll-up (Settings · Language · Log out)
+    initAcctMenu();            // bottom operator/account badge → glass pop-out (Settings · Language · Log out)
     initRail();       // collapsible rail (persisted, desktop-only)
     setTopChips();    // paint the DEMO chip (+ any cached facts) immediately
     // Phone tier: build the tab bar + sheet, place the passport/theme chrome for

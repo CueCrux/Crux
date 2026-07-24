@@ -3761,6 +3761,43 @@ function extractThemeVars(theme) {
   notes.push('operator round 6 (M17): workspace-pages bug fixed (config-driven buildWorkspaceSubnav pill row + openWorkspaceRailFlyout, both off workspaceDestPages) + live model reload on console:workspace/page fact.stored; collapsed rail reworked (chevron removed → expand via the logo, icons-only, a dest icon CLICK opens the flyout — primary compressed nav for touch/keyboard); single workspace switcher button + rightward pop-out (wsSwitchPop) replacing the multi-button data-ws strip, reachable collapsed + expanded; operator popup gains Studio + Options nav entries (theme + connection kept); Settings shows an honest, non-milestone gate reason (generic "wired in M3+" stays the default choke point) + drops the stale Appearance section + renders one equal-height card grid.');
 })();
 
+// ---- Check 54 — (console-surfaces-remediation M18) operator round 7:
+//  (1) the switcher return-to-Command BUG — from a user workspace (#/w/<uid>) a
+//      switch to Command must LEAVE the workspace hash. Before M18, applyMode
+//      only cleared a #/documents hash, so a switch back to Command from #/w/
+//      fell through to route(), which re-read the still-#/w/ hash and re-rendered
+//      the SAME workspace — the switcher could never return to Command.
+//  (2) the bottom-of-rail operator/account badge redesigned into the M17
+//      rail-flyout pop-out family (glass, keyboard, Escape/click-away); the old
+//      upward roll-up (clipped to the ~48px collapsed rail) is removed.
+(function () {
+  // (1a) applyMode must drive a #/w/ workspace route to a Command destination on
+  //      a Command-surface switch (the fix), exactly as it does for the reader.
+  check(shellHtml.indexOf("/^#\\/w\\//.test(location.hash") >= 0,
+    '[m18] applyMode must exit a #/w/ workspace route when switching to Command (return-to-Command bug fix)');
+  // (1b) the switcher still routes the Command builtin through applySurface (the
+  //      choke point the fix repairs) and derives every workspace (Command
+  //      included) into the pop-out, so Command is listed from a #/w/ context.
+  check(/if \(uid === 'command'\) \{ applySurface\('command'\)/.test(shellHtml) && /function activateWorkspace\(/.test(shellHtml),
+    '[m18] activateWorkspace must route the Command builtin through applySurface');
+  check(/wsSwitcherList\(\)\.forEach/.test(shellHtml) && /'data-ws': ws\.uid/.test(shellHtml),
+    '[m18] the switcher pop-out must derive its entries from every workspace (Command included) — reachable from a #/w/ context');
+  // (2a) the account badge menu is the glass rail-flyout pop-out, not the old
+  //      upward roll-up (which is removed).
+  check(/acctPop = el\('div', \{ id: 'acctPop', 'class': 'rail-flyout'/.test(shellHtml),
+    '[m18] the account/operator badge must open a glass rail-flyout pop-out (#acctPop)');
+  check(!/id="acctMenu"/.test(shellHtml) && !/class="acct-item"/.test(shellHtml) && !/\.acct-menu\s*\{/.test(shellHtml),
+    '[m18] the old upward account roll-up (#acctMenu / .acct-item / .acct-menu) must be removed');
+  // (2b) keyboard + click-away, matching the M17 popup family; route() closes it.
+  check(/function openAcctPop\(/.test(shellHtml) && /function closeAcctPop\(/.test(shellHtml) && /function toggleAcctPop\(/.test(shellHtml),
+    '[m18] the account pop-out must have open/close/toggle handlers (the rail-flyout idiom)');
+  check(/pop\.querySelector\('\.rail-flyout-item:not\(\[hidden\]\)'\)/.test(shellHtml) && /!e\.target\.closest\('#acctPop'\) && !e\.target\.closest\('#passportChip'\)/.test(shellHtml),
+    '[m18] the account pop-out must focus-first on open and close on click-away (keyboard accessible)');
+  check(/if \(typeof closeAcctPop === 'function'\) \{ closeAcctPop\(\); \}/.test(shellHtml),
+    '[m18] route() must close the account pop-out on navigation');
+  notes.push('operator round 7 (M18): switcher return-to-Command bug fixed (applyMode now leaves a #/w/ workspace route for a Command destination, mirroring its #/documents exit — before, only #/documents was cleared so the switch re-rendered the same workspace); the bottom-of-rail operator/account badge redesigned from the clipped upward roll-up into the M17 rail-flyout glass pop-out (#acctPop): Settings · Language · Log out, focus-first + Escape + click-away, flush to the rail edge, sane in both rail states + all three themes.');
+})();
+
 // ---- Report (awaits async renderer-driven checks) -----------------------
 Promise.all(asyncChecks).then(function () { return passportMintInteraction(); }).then(function () {
   console.log('unified-shell-console v2 — M14 + desktop mission control M2 smoke');
