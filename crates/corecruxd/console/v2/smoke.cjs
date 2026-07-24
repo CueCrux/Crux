@@ -440,7 +440,9 @@ function extractThemeVars(theme) {
     ['POST', '/v1/workbench/impact-preflight'],
     ['POST', '/v1/workbench/policy-simulation'],
     ['POST', '/v1/workbench/route-probe'],
-    ['POST', '/v1/features/capabilities/{id}/audit']
+    ['POST', '/v1/features/capabilities/{id}/audit'],
+    // console-surfaces-remediation M14: Canvas Studio daemon-side board/design persistence.
+    ['POST', '/v1/console/facts/add']
   ];
   // Parse the machine-readable GATED_MUTATIONS array and assert set-equality.
   const arrM = apiSrc.match(/const GATED_MUTATIONS = Object\.freeze\(\[([\s\S]*?)\]\);/);
@@ -2735,6 +2737,166 @@ function extractThemeVars(theme) {
   }
 
   notes.push('plan tree (M4a): buildPlanTree joins Project→ExecPlan→Milestone→live session from /v1/work?source=all + /v1/coord/active; kanban items render as plain work nodes (no milestone synthesis) and a kanban-announcing session hangs directly off them; unresolved sessions land under an explicit unattached root painting the failed slug (no fabricated edges); milestone nodes only from named ids (current/next-ready/announced), never from milestones_total; session nodes carry announced focus + held leases (model + mock-DOM paint); renderPlanTree fails honest per feed (coord-503 notice alongside a healthy tree); null-proto lookups; wired as Canvas #/canvas/tree through the generated client.');
+})();
+
+// =========================================================================
+//  Check 51 — (console-surfaces-remediation M14) Canvas Studio: the ported
+//  diagram-builder engine as a fourth canvas view. Asserts (a) the pure doc
+//  subset round-trips + sanitises (same-origin web src, known-route API bind,
+//  dangling-link drop, dropped-kind normalise); (b) the tstudio region carries
+//  NO innerHTML and NO raw fetch, and persists ONLY through operatorGatedCall →
+//  consoleFactsAdd against the console:tileboard: / console:tiledesign: entities;
+//  (c) the registry wiring (renderCanvas dispatch, parseCanvasHash, sitemap
+//  node); (d) the view paints its shell against a mock DOM and builds a seeded
+//  multi-kind board (incl. a same-origin iframe) without throwing; (e) read-only
+//  posture paints the banner and disables Save.
+// =========================================================================
+(function checkTileStudio() {
+  // ---- (a) pure doc subset ------------------------------------------------
+  check(typeof render.renderTileStudio === 'function', '[studio] render.js must export renderTileStudio');
+  check(typeof render.tstudioNormalizeDoc === 'function', '[studio] render.js must export tstudioNormalizeDoc');
+  check(render.tstudioSnap(33) === 40 && render.tstudioSnap(50) === 60, '[studio] tstudioSnap must snap to the 20px grid (matches the incumbent canvas grammar)');
+  check(render.tstudioWebSrcOk('/console') === true, '[studio] a same-origin path must be an allowed web src');
+  check(render.tstudioWebSrcOk('http://x.test') === false && render.tstudioWebSrcOk('//host') === false && render.tstudioWebSrcOk('javascript:1') === false,
+    '[studio] external / protocol-relative / javascript: web srcs must be rejected');
+  check(render.tstudioJsonPath({ a: { b: [7, 8] } }, 'a.b[1]') === 8, '[studio] tstudioJsonPath must resolve dot/bracket paths');
+  // Round-trip identity + sanitisation over a multi-kind board.
+  const raw = {
+    nodes: [
+      { id: 'n1', kind: 'note', x: 40, y: 40, w: 220, h: 140, label: 'A', body: 'b' },
+      { id: 'n2', kind: 'box', x: 60, y: 200, w: 240, h: 150 },
+      { id: 'n3', kind: 'web', x: 300, y: 40, w: 380, h: 260, url: 'http://evil.test' },
+      { id: 'n4', kind: 'api', x: 300, y: 320, w: 240, h: 150, api: { route: '/v1/facts/list', preset: 'stat', jsonPath: 'total_visible' } },
+      { id: 'n5', kind: 'model', x: 700, y: 40 },       // dropped kind → normalised
+      { id: 'n1', kind: 'note' }                          // duplicate id → dropped
+    ],
+    links: [ { from: 'n1', to: 'n2', label: 'flows' }, { from: 'n1', to: 'ghost' } ],  // second link dangles
+    texts: [ { text: 'title', x: 10, y: 10, size: 30, bold: true } ],
+    pan: { x: 5, y: 6 }, zoom: 9, version: 1
+  };
+  const norm = render.tstudioNormalizeDoc(raw);
+  check(norm.nodes.length === 5, '[studio] normalizeDoc must drop duplicate node ids (5 unique of 6)');
+  check(norm.nodes[2].url === '', '[studio] normalizeDoc must strip an external web url to empty (same-origin only)');
+  check(norm.links.length === 1, '[studio] normalizeDoc must drop links whose endpoints are missing');
+  check(norm.zoom === 3, '[studio] normalizeDoc must clamp zoom into range');
+  const round = render.tstudioNormalizeDoc(JSON.parse(render.tstudioSerializeDoc(norm)));
+  check(round.nodes.length === norm.nodes.length && round.links.length === norm.links.length && round.texts.length === norm.texts.length,
+    '[studio] doc must survive a serialize → normalize round-trip (board persistence identity)');
+  // Known-route allowlist for API tiles (drives the real tstudioApiRouteKnown
+  // against a stubbed window.CRUX_GET_ROUTES).
+  {
+    const savedWin = global.window;
+    global.window = { CRUX_GET_ROUTES: ['/v1/facts/list', '/v1/activity'] };
+    check(render.tstudioApiRouteKnown('/v1/facts/list') === true, '[studio] a known GET route must validate for an API tile');
+    check(render.tstudioApiRouteKnown('/v1/../etc') === false && render.tstudioApiRouteKnown('http://x') === false,
+      '[studio] an arbitrary / unknown route must be rejected for an API tile');
+    if (savedWin === undefined) { delete global.window; } else { global.window = savedWin; }
+  }
+
+  // ---- (b) region invariants + gated-write choke --------------------------
+  const tsA = renderSrc.indexOf('Canvas Studio (M14)');
+  const tsB = renderSrc.indexOf('function renderCanvas(host, ctx)');
+  const region = (tsA >= 0 && tsB > tsA) ? renderSrc.slice(tsA, tsB) : '';
+  check(!!region, '[studio] the tstudio region must be locatable in render.js');
+  check(!/\.innerHTML/.test(region), '[studio] the studio engine must contain NO innerHTML (el()/svgEl()/textContent only)');
+  check(!/\bfetch\s*\(/.test(region), '[studio] the studio engine must issue NO raw fetch — reads via fetchJSON/CruxApi, writes via the gated client');
+  check(/operatorGatedCall\(function \(g\) \{ return g\.consoleFactsAdd\(/.test(region),
+    '[studio] persistence must write ONLY through operatorGatedCall → consoleFactsAdd');
+  check(/console:tileboard:/.test(region) && /console:tiledesign:/.test(region),
+    '[studio] boards + designs must persist under the console:tileboard: / console:tiledesign: entities');
+  check(/CRUX_GET_ROUTES/.test(region), '[studio] the API-tile route picker must validate against the generated client route list');
+
+  // ---- (c) registry / nav wiring -----------------------------------------
+  check(/\['studio', 'Studio'\]/.test(renderSrc) && /renderTileStudio\(body, ctx\)/.test(renderSrc),
+    '[studio] Canvas must carry a Studio view switch dispatching to renderTileStudio');
+  check(/parts\[1\] === 'studio'/.test(shellHtml), '[studio] shell.html parseCanvasHash must route #/canvas/studio to the Studio view');
+  check(/'canvas:studio'/.test(renderSrc), '[studio] the site map must carry a canvas:studio node');
+
+  // ---- (d)+(e) mock-DOM drive --------------------------------------------
+  function mkEl(tag) {
+    const node = {
+      tagName: String(tag || 'div').toUpperCase(), nodeType: 1, childNodes: [], _attrs: {}, className: '',
+      style: { _p: {}, setProperty: function (k, v) { this._p[k] = v; } },
+      classList: {
+        _s: {},
+        add: function (c) { this._s[c] = true; },
+        remove: function (c) { delete this._s[c]; },
+        contains: function (c) { return !!this._s[c]; },
+        toggle: function (c, on) { const want = (on === undefined) ? !this._s[c] : !!on; if (want) { this._s[c] = true; } else { delete this._s[c]; } return want; }
+      },
+      setAttribute: function (k, v) { this._attrs[k] = String(v); if (k === 'class') { this.className = String(v); } },
+      getAttribute: function (k) { return Object.prototype.hasOwnProperty.call(this._attrs, k) ? this._attrs[k] : null; },
+      appendChild: function (c) { this.childNodes.push(c); c.parentNode = this; return c; },
+      removeChild: function (c) { const i = this.childNodes.indexOf(c); if (i >= 0) { this.childNodes.splice(i, 1); } return c; },
+      addEventListener: function () {}, removeEventListener: function () {},
+      getBoundingClientRect: function () { return { left: 0, top: 0, width: 960, height: 640, right: 960, bottom: 640 }; },
+      focus: function () {},
+      querySelector: function (sel) { const out = []; sel_collect(this, sel, out); return out[0] || null; },
+      querySelectorAll: function (sel) { const out = []; sel_collect(this, sel, out); return out; }
+    };
+    Object.defineProperty(node, 'textContent', { get: function () { return this._text || ''; }, set: function (v) { this._text = String(v); this.childNodes.length = 0; } });
+    Object.defineProperty(node, 'lastChild', { get: function () { return this.childNodes[this.childNodes.length - 1] || null; } });
+    Object.defineProperty(node, 'firstChild', { get: function () { return this.childNodes[0] || null; } });
+    return node;
+  }
+  function sel_match(node, sel) {
+    if (sel.charAt(0) === '.') { return String(node.className).split(/\s+/).indexOf(sel.slice(1)) >= 0; }
+    if (sel.charAt(0) === '#') { return node._attrs && node._attrs.id === sel.slice(1); }
+    return node.tagName === sel.toUpperCase();
+  }
+  function sel_collect(node, sel, out) {
+    (node.childNodes || []).forEach(function (c) { if (c && c.nodeType === 1) { if (sel_match(c, sel)) { out.push(c); } sel_collect(c, sel, out); } });
+  }
+  function collectAll(node, out) { out = out || []; (node.childNodes || []).forEach(function (c) { if (c && c.nodeType === 1) { out.push(c); collectAll(c, out); } }); return out; }
+
+  const seededDoc = {
+    nodes: [
+      { id: 'a', kind: 'note', x: 40, y: 40, w: 220, h: 140, label: 'Note' },
+      { id: 'b', kind: 'box', x: 40, y: 220, w: 240, h: 150 },
+      { id: 'c', kind: 'web', x: 320, y: 40, w: 380, h: 260, url: '/console' },
+      { id: 'd', kind: 'api', x: 320, y: 340, w: 240, h: 150, label: 'API', api: { route: '', preset: 'stat', jsonPath: '', params: '', fields: '', max: '', refresh: 'off', tokenBudget: '' } },
+      { id: 'e', kind: 'server', x: 720, y: 40, w: 220, h: 140, label: 'Server' }
+    ],
+    links: [{ id: 'l1', from: 'a', to: 'e', label: 'reads' }],
+    texts: [], pan: { x: 0, y: 0 }, zoom: 1, version: 1
+  };
+  // The seed path renders synchronously (no async load) → no global.document
+  // race with other async checks; assertions land in the same sync tick.
+  function driveStudio(posture) {
+    const savedDoc = global.document, savedWin = global.window;
+    global.document = {
+      createElement: mkEl, createElementNS: function (ns, tag) { return mkEl(tag); },
+      createTextNode: function (v) { return { nodeType: 3, textContent: String(v), childNodes: [] }; },
+      addEventListener: function () {}, removeEventListener: function () {},
+      elementFromPoint: function () { return null; }, body: mkEl('body')
+    };
+    global.window = { CRUX_POSTURE: posture, CRUX_GET_ROUTES: ['/v1/facts/list', '/v1/activity'], CruxApi: { get: function () { return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve({ facts: [] }); } }); } }, CruxApiGated: { consoleFactsAdd: function () { return Promise.resolve({ ok: true, status: 201 }); } } };
+    const host = mkEl('div');
+    try { render.renderTileStudio(host, { seedDoc: seededDoc }); }
+    catch (e) { check(false, '[studio] renderTileStudio threw on the seeded paint (' + posture + '): ' + (e && e.stack || e)); }
+    check(host.querySelectorAll('.tstudio').length === 1, '[studio] renderTileStudio must paint the .tstudio shell (' + posture + ')');
+    check(host.querySelectorAll('.tstudio-toolbar').length === 1, '[studio] the toolbar must paint (' + posture + ')');
+    check(host.querySelectorAll('.tstudio-library').length === 1, '[studio] the library panel must paint (' + posture + ')');
+    check(host.querySelectorAll('.tstudio-stage').length === 1, '[studio] the stage must paint (' + posture + ')');
+    if (savedDoc === undefined) { delete global.document; } else { global.document = savedDoc; }
+    if (savedWin === undefined) { delete global.window; } else { global.window = savedWin; }
+    return host;
+  }
+  try {
+    const hostOp = driveStudio('operator');
+    const allOp = collectAll(hostOp);
+    const nodes = allOp.filter(function (n) { return /\btstudio-node\b/.test(n.className || ''); });
+    check(nodes.length === 5, '[studio] the seeded 5-node board must build 5 tiles (got ' + nodes.length + ')');
+    check(allOp.some(function (n) { return n.tagName === 'IFRAME'; }), '[studio] a same-origin web tile must render an iframe embed');
+    check(allOp.some(function (n) { return /\btstudio-savechip\b/.test(n.className || ''); }), '[studio] the toolbar must carry a save-state chip');
+    const hostRo = driveStudio('customer');
+    const allRo = collectAll(hostRo);
+    check(allRo.some(function (n) { return /\btstudio-banner\b/.test(n.className || ''); }), '[studio] read-only posture must paint the honest read-only banner');
+  } catch (e) {
+    check(false, '[studio] mock-DOM drive threw: ' + (e && e.stack || e));
+  }
+
+  notes.push('canvas studio (M14): ported diagram-builder as a fourth canvas view (#/canvas/studio); pure doc subset round-trips + sanitises (same-origin web src, known-route API bind, dangling-link drop, dropped 3D/PDF kinds); NO innerHTML / NO raw fetch in the engine; boards + designs persist daemon-side via operatorGatedCall→consoleFactsAdd under console:tileboard:/console:tiledesign:; mock-DOM drive builds a seeded 5-tile board incl. a same-origin iframe; read-only posture paints the banner + disables Save.');
 })();
 
 // =========================================================================

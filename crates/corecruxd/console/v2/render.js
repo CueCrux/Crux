@@ -4629,13 +4629,1084 @@
     });
   }
 
+  // =======================================================================
+  //  Canvas Studio (M14) — the ported diagram-builder engine.
+  //
+  //  Ported from MediaCrux/dashboard/public/canvas/assets/diagram-builder.js
+  //  (an Obsidian-Canvas-style nodes+edges engine) into the v2 console:
+  //    * 2 CDN loads (pdf.js, model-viewer) STRIPPED — no 3D tiles, no PDF doc
+  //      tiles (rendered as an honest unsupported note if a legacy kind appears);
+  //    * every innerHTML site rebuilt with el()/svgEl()/textContent (the console
+  //      keeps zero dynamic-HTML injection — see smoke checkTileStudio);
+  //    * IndexedDB/localStorage persistence REPLACED by daemon-side facts
+  //      (console:tileboard:<id> key "doc"; console:tiledesign:<slug> key "def")
+  //      through the operator-gated console fact-add route;
+  //    * web tiles restricted to SAME-ORIGIN relative paths (external embeds
+  //      rejected with honest inline copy);
+  //    * a NEW "api" tile kind binds any known daemon GET route to a preset
+  //      (stat/list/sparkline/gauge/badge) through the generated read client.
+  //
+  //  Namespace: tstudio*. The incumbent renderTileCanvas (#/canvas/board) and
+  //  its smoke gates are untouched — Studio is a fourth canvas view.
+  // =======================================================================
+  var TSTUDIO_GRID = 20;                      // snap grid — matches the incumbent canvas grammar
+  var TSTUDIO_BOARD_ENTITY = 'console:tileboard:';
+  var TSTUDIO_DESIGN_ENTITY = 'console:tiledesign:';
+  var TSTUDIO_DOC_KEY = 'doc';
+  var TSTUDIO_DESIGN_KEY = 'def';
+  var TSTUDIO_DEFAULT_BOARD = 'default';
+  var TSTUDIO_DOC_VERSION = 1;                // schema stamp on every saved doc
+  var TSTUDIO_AUTOSAVE_MS = 1500;             // debounced autosave after move/resize/edit
+  var TSTUDIO_MIN_W = 140, TSTUDIO_MIN_H = 90;
+  // Known GET routes that ACCEPT a token_budget query param — the editor surfaces
+  // the budget field only for these (Insights friction #1: budgets are mandatory
+  // on retrieval reads). The rest hide it.
+  var TSTUDIO_BUDGET_ROUTES = { '/v1/activity': true, '/v1/facts': true, '/v1/context': true };
+  var TSTUDIO_REFRESH = [['off', 'Off'], ['30000', '30s'], ['60000', '60s'], ['300000', '5m']];
+  var TSTUDIO_PRESETS = ['stat', 'list', 'sparkline', 'gauge', 'badge'];
+
+  // ---- Kind registry (the ported KINDS that survive) --------------------
+  // Each entry: accent token + a single-colour SVG icon (path 'd' strings, built
+  // via svgEl — never innerHTML). `content` selects the node body builder.
+  //   standard → title/sub/body card    box → blank container
+  //   web      → same-origin iframe      api → route-bound preset tile
+  var TSTUDIO_KINDS = {
+    note:    { label: 'Note',    accent: 'var(--acc)',   content: 'standard', icon: ['M6 2h8l4 4v16H6z', 'M14 2v4h4', 'M9 12h6M9 15h6M9 18h4'] },
+    project: { label: 'Project', accent: 'var(--acc)',   content: 'standard', icon: ['M4 4h7v7H4z', 'M13 4h7v7h-7z', 'M4 13h7v7H4z', 'M13 13h7v7h-7z'] },
+    server:  { label: 'Server',  accent: 'var(--trust)', content: 'standard', icon: ['M3 4.5h18v6H3z', 'M3 13.5h18v6H3z', 'M7 7.5h.01M7 16.5h.01'] },
+    storage: { label: 'Storage', accent: 'var(--warn)',  content: 'standard', icon: ['M4 6c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3z', 'M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6', 'M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3'] },
+    client:  { label: 'Client',  accent: 'var(--acc)',   content: 'standard', icon: ['M3 4.5h18v12H3z', 'M8 20h8M12 16.5v3.5'] },
+    output:  { label: 'Output',  accent: 'var(--ok)',    content: 'standard', icon: ['M4 4h11l5 5v11H4z', 'M14 4v6h6', 'M8 14h8M8 17h5'] },
+    box:     { label: 'Box',     accent: 'var(--ink3)',  content: 'box',      icon: ['M4 5.5h16v13H4z'] },
+    web:     { label: 'Web embed', accent: 'var(--acc)', content: 'web',      icon: ['M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z', 'M3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18'] },
+    api:     { label: 'API tile', accent: 'var(--ok)',   content: 'api',      icon: ['M4 7l-2.5 5L4 17', 'M20 7l2.5 5L20 17', 'M14 4l-4 16'] }
+  };
+  // Legacy kinds that were dropped on the port (3D + PDF): render an honest
+  // unsupported note rather than silently mis-rendering.
+  var TSTUDIO_DROPPED_KINDS = { model: '3D model tiles are not supported in the console.', doc_pdf: 'PDF document tiles are not supported in the console.' };
+
+  function tstudioKind(kind) { return TSTUDIO_KINDS[kind] || TSTUDIO_KINDS.note; }
+  // Build a kind glyph as an <svg> element (no innerHTML). `paths` is a list of
+  // path 'd' strings sharing the unified 24-viewBox / round-join family.
+  function tstudioIcon(paths, size) {
+    var svg = svgEl('svg', { viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '1.8', 'stroke-linecap': 'round', 'stroke-linejoin': 'round', width: size || 16, height: size || 16, 'aria-hidden': 'true' });
+    (paths || []).forEach(function (d) { svg.appendChild(svgEl('path', { d: d })); });
+    return svg;
+  }
+
+  // =======================================================================
+  //  Pure helpers (exported; the smoke unit-tests these against a fixture)
+  // =======================================================================
+  function tstudioSnap(v) { return Math.round((Number(v) || 0) / TSTUDIO_GRID) * TSTUDIO_GRID; }
+  function tstudioNum(v, dflt) { var n = Number(v); return isFinite(n) ? n : dflt; }
+  // Monotonic id (no RNG — render.js forbids non-deterministic layout via the
+  // canvas-graph determinism gate). Unique within a session; ids are only ever
+  // local handles, never a security boundary.
+  var __tstudioSeq = 0;
+  function tstudioUid(p) { __tstudioSeq += 1; return (p || 'n') + Date.now().toString(36) + '-' + __tstudioSeq.toString(36); }
+
+  // A web tile may embed ONLY a same-origin, root-relative path ("/…"). External
+  // URLs (http[s]://, protocol-relative //host, javascript:, data:) are rejected:
+  // the operator ingests the data and binds an API tile instead.
+  function tstudioWebSrcOk(src) {
+    if (typeof src !== 'string') { return false; }
+    var s = src.trim();
+    if (!s) { return false; }
+    if (s.charAt(0) !== '/') { return false; }   // must be root-relative
+    if (s.charAt(1) === '/') { return false; }    // protocol-relative //host → external
+    return true;
+  }
+  // A route is bindable only if it is a KNOWN literal GET route of the generated
+  // client (window.CRUX_GET_ROUTES, emitted by api.js from LITERAL_GET_PATHS).
+  function tstudioKnownRoutes() {
+    var r = (typeof window !== 'undefined' && window.CRUX_GET_ROUTES) || [];
+    return Array.isArray(r) ? r : [];
+  }
+  function tstudioApiRouteKnown(route) {
+    if (typeof route !== 'string' || !route) { return false; }
+    var known = tstudioKnownRoutes();
+    for (var i = 0; i < known.length; i++) { if (known[i] === route) { return true; } }
+    return false;
+  }
+
+  // Dot / bracket JSON path extractor ("a.b[0].c" / "a[2]"). Pure; returns
+  // undefined for any miss (never throws).
+  function tstudioJsonPath(obj, path) {
+    if (obj == null) { return undefined; }
+    if (path == null || String(path).trim() === '') { return obj; }
+    var parts = String(path).replace(/\[(\d+)\]/g, '.$1').split('.').filter(function (p) { return p !== ''; });
+    var cur = obj;
+    for (var i = 0; i < parts.length; i++) {
+      if (cur == null) { return undefined; }
+      cur = cur[parts[i]];
+    }
+    return cur;
+  }
+
+  // Normalise a raw board doc (from the fact store OR an in-memory state) into a
+  // clean, safe doc: coerces geometry to finite numbers, drops unknown node
+  // fields, forces same-origin web src, and keeps only the doc schema
+  // (nodes/links/texts/pan/zoom/version). This is the round-trip identity the
+  // smoke asserts, and the security choke for loaded (possibly stale) boards.
+  function tstudioNormalizeDoc(raw) {
+    var d = (raw && typeof raw === 'object') ? raw : {};
+    var out = { nodes: [], links: [], texts: [], pan: { x: 0, y: 0 }, zoom: 1, version: TSTUDIO_DOC_VERSION };
+    var seen = {};
+    (Array.isArray(d.nodes) ? d.nodes : []).forEach(function (n) {
+      if (!n || typeof n !== 'object') { return; }
+      var id = (typeof n.id === 'string' && n.id) ? n.id : tstudioUid();
+      if (seen[id]) { return; }               // drop duplicate ids
+      seen[id] = true;
+      var kind = TSTUDIO_KINDS[n.kind] ? n.kind : (n.kind === 'doc' ? 'note' : (TSTUDIO_DROPPED_KINDS[n.kind] ? n.kind : 'note'));
+      var node = {
+        id: id, kind: kind,
+        x: tstudioNum(n.x, 40), y: tstudioNum(n.y, 40),
+        w: tstudioNum(n.w, 220), h: tstudioNum(n.h, 140),
+        z: tstudioNum(n.z, 2)
+      };
+      if (typeof n.label === 'string') { node.label = n.label; }
+      if (typeof n.sub === 'string') { node.sub = n.sub; }
+      if (typeof n.body === 'string') { node.body = n.body; }
+      if (kind === 'web') { node.url = tstudioWebSrcOk(n.url) ? n.url.trim() : ''; }
+      if (kind === 'api' && n.api && typeof n.api === 'object') {
+        node.api = {
+          route: typeof n.api.route === 'string' ? n.api.route : '',
+          params: typeof n.api.params === 'string' ? n.api.params : '',
+          jsonPath: typeof n.api.jsonPath === 'string' ? n.api.jsonPath : '',
+          preset: TSTUDIO_PRESETS.indexOf(n.api.preset) >= 0 ? n.api.preset : 'stat',
+          fields: typeof n.api.fields === 'string' ? n.api.fields : '',
+          max: typeof n.api.max === 'string' ? n.api.max : '',
+          refresh: typeof n.api.refresh === 'string' ? n.api.refresh : 'off',
+          tokenBudget: typeof n.api.tokenBudget === 'string' ? n.api.tokenBudget : ''
+        };
+      }
+      out.nodes.push(node);
+    });
+    var nodeIds = seen;
+    (Array.isArray(d.links) ? d.links : []).forEach(function (l) {
+      if (!l || typeof l !== 'object') { return; }
+      if (!nodeIds[l.from] || !nodeIds[l.to] || l.from === l.to) { return; }   // drop dangling / self
+      out.links.push({ id: (typeof l.id === 'string' && l.id) ? l.id : tstudioUid('l'), from: l.from, to: l.to, label: typeof l.label === 'string' ? l.label : '', bidir: !!l.bidir });
+    });
+    (Array.isArray(d.texts) ? d.texts : []).forEach(function (t) {
+      if (!t || typeof t !== 'object') { return; }
+      out.texts.push({ id: (typeof t.id === 'string' && t.id) ? t.id : tstudioUid('t'), text: typeof t.text === 'string' ? t.text : 'Text', x: tstudioNum(t.x, 40), y: tstudioNum(t.y, 40), size: Math.max(11, Math.min(120, tstudioNum(t.size, 28))), bold: !!t.bold });
+    });
+    if (d.pan && typeof d.pan === 'object') { out.pan = { x: tstudioNum(d.pan.x, 0), y: tstudioNum(d.pan.y, 0) }; }
+    out.zoom = Math.max(0.2, Math.min(3, tstudioNum(d.zoom, 1)));
+    out.version = tstudioNum(d.version, TSTUDIO_DOC_VERSION);
+    return out;
+  }
+  function tstudioSerializeDoc(state) {
+    return JSON.stringify({ nodes: state.nodes, links: state.links, texts: state.texts, pan: state.pan, zoom: state.zoom, version: TSTUDIO_DOC_VERSION, savedAt: Date.now() });
+  }
+  // Pick the newest (max-version, non-deleted) fact for `key` from a /v1/facts/
+  // entity/<entity> read (which returns EVERY version). Returns the fact or null.
+  function tstudioLatestFact(facts, key) {
+    var best = null;
+    (facts || []).forEach(function (f) {
+      if (!f || f.key !== key) { return; }
+      if (!best || tstudioNum(f.version, 0) > tstudioNum(best.version, 0)) { best = f; }
+    });
+    return best;
+  }
+
+  // =======================================================================
+  //  Persistence — daemon-side facts through the gated console fact-add route.
+  //  Reads: /v1/facts/entity/<entity> (full value) + /v1/facts/list (discovery,
+  //  M1 route). Write: operatorGatedCall → consoleFactsAdd (the gated client).
+  // =======================================================================
+  function tstudioBoardEntity(boardId) { return TSTUDIO_BOARD_ENTITY + (boardId || TSTUDIO_DEFAULT_BOARD); }
+  function tstudioDesignEntity(slug) { return TSTUDIO_DESIGN_ENTITY + slug; }
+
+  // Load one board's doc → normalised state, or a fresh empty state. Never throws.
+  function tstudioLoadBoard(boardId) {
+    var api = (typeof window !== 'undefined') ? window.CruxApi : null;
+    if (!api || typeof api.factsEntityByEntity !== 'function') { return Promise.resolve({ doc: tstudioNormalizeDoc({}), found: false }); }
+    return api.factsEntityByEntity(tstudioBoardEntity(boardId))
+      .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, data: d }; }, function () { return { ok: false, data: null }; }); })
+      .then(function (res) {
+        var facts = (res.ok && res.data && Array.isArray(res.data.facts)) ? res.data.facts : [];
+        var latest = tstudioLatestFact(facts, TSTUDIO_DOC_KEY);
+        if (!latest) { return { doc: tstudioNormalizeDoc({}), found: false }; }
+        var parsed = null;
+        try { parsed = JSON.parse(latest.value); } catch (e) { parsed = null; }
+        return { doc: tstudioNormalizeDoc(parsed || {}), found: !!parsed };
+      })
+      .catch(function () { return { doc: tstudioNormalizeDoc({}), found: false }; });
+  }
+  // Discover every board (entity_prefix listing, M1 route). Returns [{id, savedAt}].
+  function tstudioListBoards() {
+    return fetchJSON('/v1/facts/list?entity_prefix=' + encodeURIComponent(TSTUDIO_BOARD_ENTITY) + '&include_superseded=false&limit=200')
+      .then(function (res) {
+        var rows = (res.ok && res.data && Array.isArray(res.data.facts)) ? res.data.facts : [];
+        var out = [];
+        rows.forEach(function (f) {
+          if (f.key !== TSTUDIO_DOC_KEY) { return; }
+          var id = String(f.entity || '').slice(TSTUDIO_BOARD_ENTITY.length);
+          if (id) { out.push({ id: id, savedAt: f.stored_at_unix_ms }); }
+        });
+        return out;
+      })
+      .catch(function () { return []; });
+  }
+  // Discover saved tile designs (entity_prefix listing). Returns [{slug, name, config}].
+  function tstudioListDesigns() {
+    return fetchJSON('/v1/facts/list?entity_prefix=' + encodeURIComponent(TSTUDIO_DESIGN_ENTITY) + '&include_superseded=false&limit=200')
+      .then(function (res) {
+        var rows = (res.ok && res.data && Array.isArray(res.data.facts)) ? res.data.facts : [];
+        // The listing truncates long values; designs are small (one node template)
+        // so the value survives, but re-read the full value defensively if truncated.
+        var byEntity = {};
+        rows.forEach(function (f) { if (f.key === TSTUDIO_DESIGN_KEY) { var cur = byEntity[f.entity]; if (!cur || tstudioNum(f.version, 0) > tstudioNum(cur.version, 0)) { byEntity[f.entity] = f; } } });
+        var out = [];
+        Object.keys(byEntity).forEach(function (ent) {
+          var f = byEntity[ent];
+          var slug = ent.slice(TSTUDIO_DESIGN_ENTITY.length);
+          var def = null;
+          if (!f.value_truncated) { try { def = JSON.parse(f.value); } catch (e) { def = null; } }
+          out.push({ slug: slug, name: (def && def.name) ? def.name : slug, config: def && def.config ? def.config : null, truncated: !!f.value_truncated, entity: ent });
+        });
+        return out;
+      })
+      .catch(function () { return []; });
+  }
+  // Re-read one design's FULL value (used when the listing truncated it).
+  function tstudioLoadDesign(entity) {
+    var api = (typeof window !== 'undefined') ? window.CruxApi : null;
+    if (!api || typeof api.factsEntityByEntity !== 'function') { return Promise.resolve(null); }
+    return api.factsEntityByEntity(entity)
+      .then(function (r) { return r.json(); })
+      .then(function (d) { var latest = tstudioLatestFact((d && d.facts) || [], TSTUDIO_DESIGN_KEY); if (!latest) { return null; } try { return JSON.parse(latest.value); } catch (e) { return null; } })
+      .catch(function () { return null; });
+  }
+  // Write a fact through the operator-gated console route (the ONLY mutation
+  // path). Resolves {ok, status}. Rejects (caught → {ok:false}) in non-operator
+  // posture — the caller flags the board unsaved rather than fabricating a save.
+  function tstudioWriteFact(entity, key, value) {
+    return operatorGatedCall(function (g) { return g.consoleFactsAdd({ entity: entity, key: key, value: value }); })
+      .then(function (r) { return { ok: r.ok, status: r.status }; })
+      .catch(function (e) { return { ok: false, status: 0, error: String(e && e.message || e) }; });
+  }
+  function tstudioSaveBoard(boardId, state) {
+    return tstudioWriteFact(tstudioBoardEntity(boardId), TSTUDIO_DOC_KEY, tstudioSerializeDoc(state));
+  }
+  function tstudioSaveDesign(slug, name, config) {
+    return tstudioWriteFact(tstudioDesignEntity(slug), TSTUDIO_DESIGN_KEY, JSON.stringify({ name: name, config: config }));
+  }
+  function tstudioSlugify(name) {
+    return String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || ('design-' + Date.now().toString(36));
+  }
+
+  // =======================================================================
+  //  The view.
+  // =======================================================================
+  var __tstudioCleanup = null;
+  function renderTileStudio(host, ctx) {
+    ctx = ctx || {};
+    if (__tstudioCleanup) { try { __tstudioCleanup(); } catch (e) { /* ignore */ } __tstudioCleanup = null; }
+    host.textContent = '';
+    var REDUCED = (typeof matchMedia === 'function') && matchMedia('(prefers-reduced-motion: reduce)').matches;
+    var operator = isOperator();
+    var boardId = (ctx.board && String(ctx.board)) || TSTUDIO_DEFAULT_BOARD;
+
+    // ---- state --------------------------------------------------------------
+    var S = {
+      nodes: [], links: [], texts: [],
+      pan: { x: 0, y: 0 }, zoom: 1,
+      nodeEls: {}, selected: null, selectedLink: null,
+      linking: null, designs: [],
+      saveState: operator ? 'clean' : 'readonly',   // clean | unsaved | saving | saved | error | readonly
+      cleanups: [], intervals: {}, saveTimer: null, refreshTimers: {}
+    };
+
+    function trackInterval(id) { S.cleanups.push(function () { if (typeof clearInterval === 'function') { clearInterval(id); } }); return id; }
+    function onDoc(type, fn) { var d = doc(); if (d && d.addEventListener) { d.addEventListener(type, fn); S.cleanups.push(function () { d.removeEventListener(type, fn); }); } }
+
+    // ---- shell scaffolding --------------------------------------------------
+    var root = el('div', { 'class': 'tstudio' });
+    host.appendChild(root);
+
+    var readonlyBanner = null;
+    if (!operator) {
+      readonlyBanner = el('div', { 'class': 'tstudio-banner', role: 'status' }, [
+        el('span', { 'class': 'tstudio-banner-dot' }),
+        el('span', { text: 'Read-only — operator posture required to save. The board loads from the last saved state; local edits are not persisted.' })
+      ]);
+      root.appendChild(readonlyBanner);
+    }
+
+    var toolbar = el('div', { 'class': 'tstudio-toolbar' });
+    root.appendChild(toolbar);
+
+    var main = el('div', { 'class': 'tstudio-main' });
+    root.appendChild(main);
+
+    var library = el('aside', { 'class': 'tstudio-library', 'aria-label': 'Tile library' });
+    main.appendChild(library);
+
+    var stageWrap = el('div', { 'class': 'tstudio-stagewrap' });
+    main.appendChild(stageWrap);
+    var stage = el('div', { 'class': 'tstudio-stage', tabindex: '0', 'aria-label': 'Canvas Studio board' });
+    stageWrap.appendChild(stage);
+    var world = el('div', { 'class': 'tstudio-world' });
+    stage.appendChild(world);
+    var grid = el('div', { 'class': 'tstudio-grid', 'aria-hidden': 'true' });
+    world.appendChild(grid);
+    var linkLayer = svgEl('svg', { 'class': 'tstudio-links' });
+    world.appendChild(linkLayer);
+    var labelLayer = el('div', { 'class': 'tstudio-labels' });
+    world.appendChild(labelLayer);
+
+    var inspector = el('aside', { 'class': 'tstudio-inspector', 'aria-label': 'Tile inspector' });
+    main.appendChild(inspector);
+
+    // ---- world transform ----------------------------------------------------
+    function applyTransform() {
+      world.style.transform = 'translate(' + Math.round(S.pan.x) + 'px,' + Math.round(S.pan.y) + 'px) scale(' + S.zoom.toFixed(4) + ')';
+      var zl = toolbar.querySelector('.tstudio-zoomlab');
+      if (zl) { zl.textContent = Math.round(S.zoom * 100) + '%'; }
+    }
+    function stageRect() { return stage.getBoundingClientRect ? stage.getBoundingClientRect() : { left: 0, top: 0, width: 900, height: 600 }; }
+    function screenToWorld(cx, cy) { var r = stageRect(); return { x: (cx - r.left - S.pan.x) / S.zoom, y: (cy - r.top - S.pan.y) / S.zoom }; }
+    function viewCenter() { var r = stageRect(); return screenToWorld(r.left + r.width / 2, r.top + r.height / 2); }
+    function setZoomAt(nz, cx, cy) {
+      nz = Math.max(0.2, Math.min(3, nz));
+      var r = stageRect(), px = cx - r.left, py = cy - r.top;
+      var wx = (px - S.pan.x) / S.zoom, wy = (py - S.pan.y) / S.zoom;
+      S.zoom = nz; S.pan.x = px - wx * nz; S.pan.y = py - wy * nz;
+      applyTransform();
+    }
+
+    // ---- save orchestration -------------------------------------------------
+    function setSaveState(st) { S.saveState = st; paintSaveState(); }
+    function paintSaveState() {
+      var chip = toolbar.querySelector('.tstudio-savechip');
+      if (!chip) { return; }
+      chip.textContent = '';
+      var map = { clean: ['saved', 'ok'], saved: ['saved', 'ok'], unsaved: ['unsaved', 'warn'], saving: ['saving…', 'busy'], error: ['save failed', 'err'], readonly: ['read-only', 'ro'] };
+      var m = map[S.saveState] || ['—', ''];
+      chip.appendChild(el('span', { 'class': 'tstudio-savedot tstudio-save-' + m[1] }));
+      chip.appendChild(doc().createTextNode(m[0]));
+    }
+    function markDirty() {
+      if (!operator) { return; }   // read-only: local edits never persist
+      setSaveState('unsaved');
+      scheduleSave();
+    }
+    function scheduleSave() {
+      if (!operator) { return; }
+      if (S.saveTimer) { clearTimeout(S.saveTimer); }
+      S.saveTimer = setTimeout(function () { doSave(); }, TSTUDIO_AUTOSAVE_MS);
+    }
+    function doSave() {
+      if (!operator) { return Promise.resolve(); }
+      if (S.saveTimer) { clearTimeout(S.saveTimer); S.saveTimer = null; }
+      setSaveState('saving');
+      return tstudioSaveBoard(boardId, S).then(function (r) {
+        setSaveState(r.ok ? 'saved' : 'error');
+      });
+    }
+
+    // ---- node geometry / links ---------------------------------------------
+    function findNode(id) { for (var i = 0; i < S.nodes.length; i++) { if (S.nodes[i].id === id) { return S.nodes[i]; } } return null; }
+    function findLink(id) { for (var i = 0; i < S.links.length; i++) { if (S.links[i].id === id) { return S.links[i]; } } return null; }
+    function nodeCenter(n) { return { x: n.x + n.w / 2, y: n.y + n.h / 2, w: n.w, h: n.h }; }
+    function edgePoint(c, tx, ty) {
+      var dx = tx - c.x, dy = ty - c.y; if (!dx && !dy) { return { x: c.x, y: c.y }; }
+      var hw = c.w / 2 + 4, hh = c.h / 2 + 4;
+      var s = Math.min(hw / Math.abs(dx || 1e-6), hh / Math.abs(dy || 1e-6));
+      return { x: c.x + dx * s, y: c.y + dy * s };
+    }
+    var __arrowSeq = 0;
+    function drawLinks() {
+      linkLayer.textContent = '';
+      labelLayer.textContent = '';
+      var defs = svgEl('defs');
+      var mid = 'tstudio-arrow-' + (++__arrowSeq);
+      var marker = svgEl('marker', { id: mid, viewBox: '0 0 10 10', refX: '8.5', refY: '5', markerWidth: '7', markerHeight: '7', orient: 'auto-start-reverse' });
+      marker.appendChild(svgEl('path', { d: 'M0 0L10 5L0 10z', 'class': 'tstudio-arrowhead' }));
+      defs.appendChild(marker);
+      linkLayer.appendChild(defs);
+      S.links.forEach(function (l) {
+        var a = findNode(l.from), b = findNode(l.to); if (!a || !b) { return; }
+        var ca = nodeCenter(a), cb = nodeCenter(b);
+        var p1 = edgePoint(ca, cb.x, cb.y), p2 = edgePoint(cb, ca.x, ca.y);
+        var d = 'M' + p1.x + ' ' + p1.y + ' L' + p2.x + ' ' + p2.y;
+        var attrs = { d: d, 'class': 'tstudio-wire' + (S.selectedLink === l.id ? ' is-sel' : ''), 'marker-end': 'url(#' + mid + ')' };
+        if (l.bidir) { attrs['marker-start'] = 'url(#' + mid + ')'; }
+        var hit = svgEl('path', { d: d, 'class': 'tstudio-wire-hit' });
+        var wire = svgEl('path', attrs);
+        function sel(ev) { if (ev.stopPropagation) { ev.stopPropagation(); } S.selectedLink = (S.selectedLink === l.id ? null : l.id); S.selected = null; drawLinks(); paintInspector(); }
+        hit.addEventListener('click', sel); wire.addEventListener('click', sel);
+        linkLayer.appendChild(hit); linkLayer.appendChild(wire);
+        var mx = (p1.x + p2.x) / 2, my = (p1.y + p2.y) / 2;
+        if (l.label || S.selectedLink === l.id) {
+          var lab = el('div', { 'class': 'tstudio-wlabel', text: l.label || '' });
+          lab.style.left = mx + 'px'; lab.style.top = (my - 10) + 'px';
+          labelLayer.appendChild(lab);
+        }
+      });
+    }
+
+    // ---- node rendering -----------------------------------------------------
+    function placeNode(n, eln) { eln.style.left = n.x + 'px'; eln.style.top = n.y + 'px'; eln.style.width = n.w + 'px'; eln.style.height = n.h + 'px'; eln.style.zIndex = String(n.z != null ? n.z : 2); }
+    function buildNode(n) {
+      var kdef = tstudioKind(n.kind);
+      var eln = el('div', { 'class': 'tstudio-node tstudio-kind-' + n.kind, tabindex: '0', 'data-id': n.id });
+      eln.style.setProperty('--ts-accent', kdef.accent);
+      placeNode(n, eln);
+      var accent = el('div', { 'class': 'tstudio-accent' });
+      eln.appendChild(accent);
+      if (TSTUDIO_DROPPED_KINDS[n.kind]) { buildDroppedContent(eln, n); }
+      else if (kdef.content === 'box') { buildBoxContent(eln, n); }
+      else if (kdef.content === 'web') { buildWebContent(eln, n); }
+      else if (kdef.content === 'api') { buildApiContent(eln, n); }
+      else { buildStandardContent(eln, n); }
+      // handles
+      var del = el('button', { 'class': 'tstudio-del', type: 'button', title: 'Delete tile', 'aria-label': 'Delete tile' }, ['×']);
+      del.addEventListener('mousedown', function (e) { e.stopPropagation(); });
+      del.addEventListener('click', function (e) { e.stopPropagation(); deleteNode(n.id); });
+      eln.appendChild(del);
+      var lh = el('div', { 'class': 'tstudio-lh', title: 'Drag to another tile to link' });
+      lh.addEventListener('mousedown', function (e) { e.stopPropagation(); e.preventDefault(); startLink(n.id, e); });
+      eln.appendChild(lh);
+      var rz = el('div', { 'class': 'tstudio-rz', title: 'Drag to resize' });
+      attachResize(rz, eln, n);
+      eln.appendChild(rz);
+      attachNodeDrag(eln, n);
+      eln.addEventListener('click', function (e) {
+        if (e.target && e.target.closest && e.target.closest('button, input, select, textarea, a, .tstudio-rz, .tstudio-lh')) { return; }
+        selectNode(n.id);
+      });
+      world.appendChild(eln);
+      S.nodeEls[n.id] = eln;
+      return eln;
+    }
+    function nodeHead(n) {
+      var kdef = tstudioKind(n.kind);
+      var head = el('div', { 'class': 'tstudio-nhead' });
+      var chip = el('span', { 'class': 'tstudio-chip' }); chip.appendChild(tstudioIcon(kdef.icon, 15));
+      head.appendChild(chip);
+      var ttl = el('div', { 'class': 'tstudio-ttl', contenteditable: operator ? 'true' : 'false', spellcheck: 'false' });
+      ttl.textContent = n.label != null ? n.label : '';
+      if (operator) { ttl.addEventListener('input', function () { n.label = ttl.textContent; markDirty(); }); ttl.addEventListener('mousedown', function (e) { e.stopPropagation(); }); }
+      head.appendChild(ttl);
+      return head;
+    }
+    function buildStandardContent(eln, n) {
+      var content = el('div', { 'class': 'tstudio-content' });
+      content.appendChild(nodeHead(n));
+      var sub = el('div', { 'class': 'tstudio-sub', contenteditable: operator ? 'true' : 'false', spellcheck: 'false' });
+      sub.textContent = n.sub != null ? n.sub : '';
+      if (operator) { sub.addEventListener('input', function () { n.sub = sub.textContent; markDirty(); }); sub.addEventListener('mousedown', function (e) { e.stopPropagation(); }); }
+      content.appendChild(sub);
+      var body = el('div', { 'class': 'tstudio-body', contenteditable: operator ? 'true' : 'false', spellcheck: 'false' });
+      body.textContent = n.body != null ? n.body : '';
+      if (operator) { body.addEventListener('input', function () { n.body = body.textContent; markDirty(); }); body.addEventListener('mousedown', function (e) { e.stopPropagation(); }); }
+      content.appendChild(body);
+      eln.appendChild(content);
+    }
+    function buildBoxContent(eln, n) {
+      var content = el('div', { 'class': 'tstudio-content tstudio-boxcontent' });
+      var ttl = el('div', { 'class': 'tstudio-boxlabel', contenteditable: operator ? 'true' : 'false', spellcheck: 'false' });
+      ttl.textContent = n.label != null ? n.label : '';
+      if (operator) { ttl.addEventListener('input', function () { n.label = ttl.textContent; markDirty(); }); ttl.addEventListener('mousedown', function (e) { e.stopPropagation(); }); }
+      content.appendChild(ttl);
+      eln.appendChild(content);
+    }
+    function buildDroppedContent(eln, n) {
+      var content = el('div', { 'class': 'tstudio-content' });
+      content.appendChild(nodeHead(n));
+      content.appendChild(el('div', { 'class': 'tstudio-unsupported', text: TSTUDIO_DROPPED_KINDS[n.kind] || 'This tile kind is not supported in the console.' }));
+      eln.appendChild(content);
+    }
+    function buildWebContent(eln, n) {
+      var content = el('div', { 'class': 'tstudio-content tstudio-webcontent' });
+      content.appendChild(nodeHead(n));
+      var holder = el('div', { 'class': 'tstudio-webholder' });
+      if (tstudioWebSrcOk(n.url)) {
+        var fr = el('iframe', {
+          src: n.url,
+          referrerpolicy: 'no-referrer',
+          // Same sandbox posture as the source engine (advisory for same-origin
+          // daemon pages); no allow-top-navigation / allow-modals.
+          sandbox: 'allow-scripts allow-same-origin allow-forms allow-popups allow-pointer-lock',
+          title: 'Embedded ' + (n.url || '')
+        });
+        holder.appendChild(fr);
+      } else if (n.url) {
+        holder.appendChild(el('div', { 'class': 'tstudio-unsupported', text: 'External embeds are disabled in the console — ingest the data and bind an API tile instead. Only same-origin paths (e.g. /console) are allowed.' }));
+      } else {
+        holder.appendChild(el('div', { 'class': 'tstudio-placeholder', text: 'Web embed — set a same-origin path (e.g. /console) in the inspector.' }));
+      }
+      content.appendChild(holder);
+      eln.appendChild(content);
+    }
+
+    // ---- API tile -----------------------------------------------------------
+    function buildApiContent(eln, n) {
+      var content = el('div', { 'class': 'tstudio-content tstudio-apicontent' });
+      content.appendChild(nodeHead(n));
+      var body = el('div', { 'class': 'tstudio-apibody' });
+      content.appendChild(body);
+      var foot = el('div', { 'class': 'tstudio-apifoot' });
+      content.appendChild(foot);
+      eln.appendChild(content);
+      loadApiTile(n, body, foot);
+      // refresh timer
+      var iv = n.api && n.api.refresh;
+      if (iv && iv !== 'off' && isFinite(Number(iv)) && typeof setInterval === 'function') {
+        if (S.refreshTimers[n.id]) { clearInterval(S.refreshTimers[n.id]); }
+        S.refreshTimers[n.id] = trackInterval(setInterval(function () {
+          if (!S.nodeEls[n.id]) { return; }
+          loadApiTile(n, body, foot);
+        }, Math.max(30000, Number(iv))));
+      }
+    }
+    function apiTileUrl(cfg) {
+      var q = {};
+      String(cfg.params || '').split(/[\n,]+/).forEach(function (line) {
+        var kv = line.split('='); var k = (kv[0] || '').trim(); if (!k) { return; }
+        q[k] = (kv.slice(1).join('=') || '').trim();
+      });
+      if (TSTUDIO_BUDGET_ROUTES[cfg.route] && cfg.tokenBudget) { q.token_budget = String(cfg.tokenBudget).trim(); }
+      var qs = Object.keys(q).map(function (k) { return encodeURIComponent(k) + '=' + encodeURIComponent(q[k]); }).join('&');
+      return cfg.route + (qs ? ('?' + qs) : '');
+    }
+    function loadApiTile(n, body, foot) {
+      var cfg = n.api || {};
+      body.textContent = ''; foot.textContent = '';
+      if (!cfg.route) { body.appendChild(el('div', { 'class': 'tstudio-placeholder', text: 'API tile — pick a route in the inspector.' })); return; }
+      if (!tstudioApiRouteKnown(cfg.route)) { body.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'Unknown route "' + cfg.route + '" — not in the generated client allowlist.' })); return; }
+      body.appendChild(el('div', { 'class': 'tstudio-loading', text: 'loading…' }));
+      fetchJSON(apiTileUrl(cfg)).then(function (res) {
+        body.textContent = ''; foot.textContent = '';
+        if (!res.ok) {
+          body.appendChild(el('div', { 'class': 'tstudio-apierr', text: (res.status === 0 ? 'unreachable' : ('HTTP ' + res.status)) }));
+          foot.appendChild(el('span', { 'class': 'tstudio-apiroute', text: cfg.route }));
+          return;
+        }
+        try { renderApiPreset(cfg, res.data, body); }
+        catch (e) { body.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'render error: ' + String(e && e.message || e) })); }
+        foot.appendChild(el('span', { 'class': 'tstudio-apiroute', text: cfg.route }));
+        foot.appendChild(el('span', { 'class': 'tstudio-apipreset', text: cfg.preset }));
+      });
+    }
+    function fmtNum(v) {
+      if (typeof v === 'number' && isFinite(v)) { try { return v.toLocaleString('en-US'); } catch (e) { return String(v); } }
+      return v == null ? '—' : String(v);
+    }
+    function renderApiPreset(cfg, data, body) {
+      var val = tstudioJsonPath(data, cfg.jsonPath);
+      if (cfg.preset === 'stat') {
+        body.appendChild(el('div', { 'class': 'tstudio-stat' }, [
+          el('div', { 'class': 'tstudio-stat-v', text: fmtNum(val) }),
+          el('div', { 'class': 'tstudio-stat-k', text: cfg.jsonPath || cfg.route })
+        ]));
+      } else if (cfg.preset === 'badge') {
+        body.appendChild(el('div', { 'class': 'tstudio-badgewrap' }, [el('span', { 'class': 'tstudio-badge', text: fmtNum(val) })]));
+      } else if (cfg.preset === 'gauge') {
+        var num = Number(val);
+        var max = Number(cfg.max);
+        if (!isFinite(max) || max === 0) { var mv = tstudioJsonPath(data, cfg.max); max = Number(mv); }
+        var ratio = (isFinite(num) && isFinite(max) && max > 0) ? Math.max(0, Math.min(1, num / max)) : 0;
+        var g = el('div', { 'class': 'tstudio-gauge' });
+        var track = el('div', { 'class': 'tstudio-gauge-track' });
+        var fill = el('div', { 'class': 'tstudio-gauge-fill' }); fill.style.width = (ratio * 100).toFixed(1) + '%';
+        track.appendChild(fill); g.appendChild(track);
+        g.appendChild(el('div', { 'class': 'tstudio-gauge-lab', text: fmtNum(num) + ' / ' + (isFinite(max) ? fmtNum(max) : '—') }));
+        body.appendChild(g);
+      } else if (cfg.preset === 'sparkline') {
+        var arr = Array.isArray(val) ? val : [];
+        var series = arr.map(function (row) {
+          if (typeof row === 'number') { return row; }
+          if (row && typeof row === 'object' && cfg.fields) { return Number(tstudioJsonPath(row, String(cfg.fields).split(',')[0].trim())); }
+          return Number(row);
+        }).filter(function (x) { return isFinite(x); });
+        var chart = areaChart(series, { spark: true });
+        if (chart) {
+          body.appendChild(el('div', { 'class': 'tstudio-spark' }, [chart, el('span', { 'class': 'tstudio-spark-v', text: fmtNum(series[series.length - 1]) })]));
+        } else { body.appendChild(el('div', { 'class': 'tstudio-placeholder', text: 'not enough numeric points to plot' })); }
+      } else if (cfg.preset === 'list') {
+        var rows = Array.isArray(val) ? val : [];
+        var fields = String(cfg.fields || '').split(',').map(function (f) { return f.trim(); }).filter(Boolean);
+        var list = el('div', { 'class': 'tstudio-list' });
+        rows.slice(0, 8).forEach(function (row) {
+          var line = el('div', { 'class': 'tstudio-list-row' });
+          if (fields.length) {
+            fields.forEach(function (f) { line.appendChild(el('span', { 'class': 'tstudio-list-cell', text: fmtNum(tstudioJsonPath(row, f)) })); });
+          } else {
+            line.appendChild(el('span', { 'class': 'tstudio-list-cell', text: (typeof row === 'object' ? JSON.stringify(row).slice(0, 80) : fmtNum(row)) }));
+          }
+          list.appendChild(line);
+        });
+        if (!rows.length) { list.appendChild(el('div', { 'class': 'tstudio-placeholder', text: 'no rows at "' + (cfg.jsonPath || '') + '"' })); }
+        body.appendChild(list);
+      }
+    }
+
+    // ---- drag / resize / linking -------------------------------------------
+    function attachNodeDrag(eln, n) {
+      eln.addEventListener('mousedown', function (e) {
+        if (!operator) { return; }
+        if (e.button !== 0) { return; }
+        var t = e.target;
+        if (t && (t.isContentEditable || /INPUT|SELECT|TEXTAREA|BUTTON|IFRAME/.test(t.tagName) || (t.classList && (t.classList.contains('tstudio-rz') || t.classList.contains('tstudio-lh') || t.classList.contains('tstudio-del'))))) { return; }
+        var sx = e.clientX, sy = e.clientY, ox = n.x, oy = n.y, moved = false;
+        eln.classList.add('is-dragging');
+        function mv(ev) {
+          var dx = (ev.clientX - sx) / S.zoom, dy = (ev.clientY - sy) / S.zoom;
+          if (Math.abs(ev.clientX - sx) + Math.abs(ev.clientY - sy) > 3) { moved = true; }
+          n.x = Math.max(0, ox + dx); n.y = Math.max(0, oy + dy);
+          eln.style.left = n.x + 'px'; eln.style.top = n.y + 'px';
+          drawLinks();
+        }
+        function up() {
+          doc().removeEventListener('mousemove', mv); doc().removeEventListener('mouseup', up);
+          eln.classList.remove('is-dragging');
+          if (moved) { n.x = tstudioSnap(n.x); n.y = tstudioSnap(n.y); eln.style.left = n.x + 'px'; eln.style.top = n.y + 'px'; drawLinks(); markDirty(); }
+        }
+        doc().addEventListener('mousemove', mv); doc().addEventListener('mouseup', up);
+      });
+    }
+    function attachResize(rz, eln, n) {
+      rz.addEventListener('mousedown', function (e) {
+        if (!operator) { return; }
+        e.stopPropagation(); e.preventDefault();
+        var sx = e.clientX, sy = e.clientY, sw = n.w, sh = n.h;
+        function mv(ev) {
+          n.w = Math.max(TSTUDIO_MIN_W, sw + (ev.clientX - sx) / S.zoom);
+          n.h = Math.max(TSTUDIO_MIN_H, sh + (ev.clientY - sy) / S.zoom);
+          eln.style.width = n.w + 'px'; eln.style.height = n.h + 'px';
+          drawLinks();
+        }
+        function up() {
+          doc().removeEventListener('mousemove', mv); doc().removeEventListener('mouseup', up);
+          n.w = Math.max(TSTUDIO_MIN_W, tstudioSnap(n.w)); n.h = Math.max(TSTUDIO_MIN_H, tstudioSnap(n.h));
+          eln.style.width = n.w + 'px'; eln.style.height = n.h + 'px';
+          drawLinks(); markDirty();
+        }
+        doc().addEventListener('mousemove', mv); doc().addEventListener('mouseup', up);
+      });
+    }
+    function startLink(fromId, e) {
+      if (!operator) { return; }
+      var tempLine = svgEl('line', { 'class': 'tstudio-templine' });
+      linkLayer.appendChild(tempLine);
+      var from = findNode(fromId); var c = nodeCenter(from);
+      var hover = null;
+      function mv(ev) {
+        var w = screenToWorld(ev.clientX, ev.clientY);
+        tempLine.setAttribute('x1', c.x); tempLine.setAttribute('y1', c.y);
+        tempLine.setAttribute('x2', w.x); tempLine.setAttribute('y2', w.y);
+        var over = doc().elementFromPoint ? doc().elementFromPoint(ev.clientX, ev.clientY) : null;
+        var nd = over && over.closest ? over.closest('.tstudio-node') : null;
+        hover = (nd && nd.getAttribute('data-id') !== fromId) ? nd.getAttribute('data-id') : null;
+      }
+      function up() {
+        doc().removeEventListener('mousemove', mv); doc().removeEventListener('mouseup', up);
+        if (tempLine.parentNode) { tempLine.parentNode.removeChild(tempLine); }
+        if (hover) { addLink(fromId, hover); }
+      }
+      doc().addEventListener('mousemove', mv); doc().addEventListener('mouseup', up);
+    }
+    function addLink(from, to) {
+      if (from === to) { return; }
+      var dup = S.links.some(function (l) { return (l.from === from && l.to === to) || (l.from === to && l.to === from); });
+      if (dup) { return; }
+      S.links.push({ id: tstudioUid('l'), from: from, to: to, label: '', bidir: false });
+      drawLinks(); markDirty();
+    }
+
+    // ---- node lifecycle -----------------------------------------------------
+    function refreshNode(id) {
+      var n = findNode(id); if (!n) { return; }
+      if (S.refreshTimers[id]) { clearInterval(S.refreshTimers[id]); delete S.refreshTimers[id]; }
+      if (S.nodeEls[id] && S.nodeEls[id].parentNode) { S.nodeEls[id].parentNode.removeChild(S.nodeEls[id]); }
+      delete S.nodeEls[id];
+      buildNode(n);
+      applySelectionUI();
+      drawLinks();
+    }
+    function deleteNode(id) {
+      S.nodes = S.nodes.filter(function (n) { return n.id !== id; });
+      S.links = S.links.filter(function (l) { return l.from !== id && l.to !== id; });
+      if (S.refreshTimers[id]) { clearInterval(S.refreshTimers[id]); delete S.refreshTimers[id]; }
+      if (S.nodeEls[id] && S.nodeEls[id].parentNode) { S.nodeEls[id].parentNode.removeChild(S.nodeEls[id]); }
+      delete S.nodeEls[id];
+      if (S.selected === id) { S.selected = null; paintInspector(); }
+      drawLinks(); markDirty();
+    }
+    function allZ() { return S.nodes.map(function (n) { return n.z != null ? n.z : 2; }); }
+    function bringFront(id) { var n = findNode(id); if (!n) { return; } n.z = Math.max.apply(null, allZ().concat([2])) + 1; if (S.nodeEls[id]) { S.nodeEls[id].style.zIndex = String(n.z); } markDirty(); }
+    function sendBack(id) { var n = findNode(id); if (!n) { return; } n.z = Math.min.apply(null, allZ().concat([2])) - 1; if (S.nodeEls[id]) { S.nodeEls[id].style.zIndex = String(n.z); } markDirty(); }
+    function addNode(kind, cfgOverride) {
+      var vc = viewCenter();
+      var kdef = TSTUDIO_KINDS[kind] ? kind : 'note';
+      var n = { id: tstudioUid(), kind: kdef, x: tstudioSnap(vc.x - 110), y: tstudioSnap(vc.y - 70), w: 220, h: 140, z: Math.max.apply(null, allZ().concat([2])) + 1 };
+      if (kdef === 'box') { n.w = 240; n.h = 150; n.label = ''; }
+      else if (kdef === 'web') { n.w = 380; n.h = 260; n.url = ''; n.label = 'Web embed'; }
+      else if (kdef === 'api') { n.w = 240; n.h = 150; n.label = 'API tile'; n.api = { route: '', params: '', jsonPath: '', preset: 'stat', fields: '', max: '', refresh: 'off', tokenBudget: '' }; }
+      else { n.label = tstudioKind(kdef).label; n.sub = ''; n.body = ''; }
+      if (cfgOverride && typeof cfgOverride === 'object') {
+        Object.keys(cfgOverride).forEach(function (k) { if (k !== 'id' && k !== 'x' && k !== 'y' && k !== 'z') { n[k] = cfgOverride[k]; } });
+      }
+      var clean = tstudioNormalizeDoc({ nodes: [n] }).nodes[0];
+      clean.x = n.x; clean.y = n.y; clean.z = n.z;
+      S.nodes.push(clean);
+      buildNode(clean);
+      selectNode(clean.id);
+      markDirty();
+      return clean;
+    }
+
+    // ---- selection + inspector ---------------------------------------------
+    function selectNode(id) { S.selected = id; S.selectedLink = null; applySelectionUI(); drawLinks(); paintInspector(); }
+    function applySelectionUI() { Object.keys(S.nodeEls).forEach(function (id) { S.nodeEls[id].classList.toggle('is-selected', id === S.selected); }); }
+    function inspectorField(labelText, controlEl) {
+      return el('label', { 'class': 'tstudio-field' }, [el('span', { 'class': 'tstudio-field-lab', text: labelText }), controlEl]);
+    }
+    function paintInspector() {
+      inspector.textContent = '';
+      if (S.selectedLink) { paintLinkInspector(); return; }
+      var n = S.selected ? findNode(S.selected) : null;
+      if (!n) {
+        inspector.appendChild(el('div', { 'class': 'tstudio-insp-empty' }, [
+          el('h3', { 'class': 'tstudio-insp-h', text: 'Inspector' }),
+          el('p', { 'class': 'tstudio-insp-hint', text: 'Select a tile to edit it. Add tiles from the library on the left.' })
+        ]));
+        return;
+      }
+      var head = el('div', { 'class': 'tstudio-insp-head' });
+      head.appendChild(el('h3', { 'class': 'tstudio-insp-h', text: tstudioKind(n.kind).label }));
+      inspector.appendChild(head);
+      if (!operator) { inspector.appendChild(el('p', { 'class': 'tstudio-insp-hint', text: 'Read-only — operator posture required to edit.' })); }
+
+      if (n.kind === 'web') { paintWebInspector(n); }
+      else if (n.kind === 'api') { paintApiInspector(n); }
+
+      // actions (all kinds)
+      var actions = el('div', { 'class': 'tstudio-insp-actions' });
+      var bFront = el('button', { 'class': 'tstudio-btn', type: 'button' }, ['Bring front']);
+      bFront.addEventListener('click', function () { bringFront(n.id); });
+      var bBack = el('button', { 'class': 'tstudio-btn', type: 'button' }, ['Send back']);
+      bBack.addEventListener('click', function () { sendBack(n.id); });
+      var bSave = el('button', { 'class': 'tstudio-btn', type: 'button', title: 'Save this configured tile as a reusable design in the library' }, ['Save as design']);
+      bSave.addEventListener('click', function () { saveAsDesign(n); });
+      var bDel = el('button', { 'class': 'tstudio-btn tstudio-btn-danger', type: 'button' }, ['Delete tile']);
+      bDel.addEventListener('click', function () { deleteNode(n.id); });
+      [bFront, bBack, bSave, bDel].forEach(function (b) { if (!operator) { b.disabled = true; } actions.appendChild(b); });
+      inspector.appendChild(actions);
+    }
+    function paintWebInspector(n) {
+      var input = el('input', { 'class': 'tstudio-input', type: 'text', value: n.url || '', placeholder: '/console', 'aria-label': 'Same-origin path' });
+      if (!operator) { input.disabled = true; }
+      var note = el('p', { 'class': 'tstudio-insp-note' });
+      function sync() { note.textContent = tstudioWebSrcOk(input.value) ? 'Same-origin path — will embed.' : (input.value ? 'Rejected: external embeds are disabled. Use a /path.' : 'Enter a same-origin path (starts with /).'); note.classList.toggle('is-err', !!input.value && !tstudioWebSrcOk(input.value)); }
+      input.addEventListener('input', function () { sync(); });
+      input.addEventListener('change', function () { n.url = tstudioWebSrcOk(input.value) ? input.value.trim() : ''; refreshNode(n.id); markDirty(); });
+      sync();
+      inspector.appendChild(inspectorField('Same-origin path', input));
+      inspector.appendChild(note);
+    }
+    function paintApiInspector(n) {
+      var cfg = n.api = n.api || { route: '', params: '', jsonPath: '', preset: 'stat', fields: '', max: '', refresh: 'off', tokenBudget: '' };
+      // route picker (datalist over known routes)
+      var listId = 'tstudio-routes-' + n.id;
+      var dl = el('datalist', { id: listId });
+      tstudioKnownRoutes().forEach(function (r) { dl.appendChild(el('option', { value: r })); });
+      var route = el('input', { 'class': 'tstudio-input', type: 'text', value: cfg.route || '', list: listId, placeholder: '/v1/…', 'aria-label': 'Daemon GET route' });
+      var routeNote = el('p', { 'class': 'tstudio-insp-note' });
+      function syncRoute() {
+        var ok = tstudioApiRouteKnown(route.value);
+        routeNote.textContent = route.value ? (ok ? 'Known route.' : 'Unknown route — not in the client allowlist.') : ('Pick from ' + tstudioKnownRoutes().length + ' known routes.');
+        routeNote.classList.toggle('is-err', !!route.value && !ok);
+      }
+      route.addEventListener('input', syncRoute);
+      var rebuild = function () { cfg.route = route.value.trim(); refreshNode(n.id); rebuildInspectorApi(n); markDirty(); };
+      route.addEventListener('change', rebuild);
+      if (!operator) { route.disabled = true; }
+      inspector.appendChild(inspectorField('Route', route));
+      inspector.appendChild(el('div', { 'class': 'tstudio-hidden' }, [dl]));
+      inspector.appendChild(routeNote);
+      syncRoute();
+      // container the preset-conditional controls rebuild into
+      var apiBox = el('div', { 'class': 'tstudio-apiconf', id: 'tstudio-apiconf-' + n.id });
+      inspector.appendChild(apiBox);
+      buildApiConf(n, apiBox);
+    }
+    function rebuildInspectorApi(n) { var box = inspector.querySelector('#tstudio-apiconf-' + n.id); if (box) { buildApiConf(n, box); } }
+    function buildApiConf(n, box) {
+      box.textContent = '';
+      var cfg = n.api;
+      function mkInput(key, label, ph) {
+        var inp = el('input', { 'class': 'tstudio-input', type: 'text', value: cfg[key] || '', placeholder: ph || '' });
+        if (!operator) { inp.disabled = true; }
+        inp.addEventListener('change', function () { cfg[key] = inp.value; refreshNode(n.id); markDirty(); });
+        box.appendChild(inspectorField(label, inp));
+      }
+      // preset select
+      var preset = el('select', { 'class': 'tstudio-select' });
+      TSTUDIO_PRESETS.forEach(function (p) { var o = el('option', { value: p }, [p]); if (cfg.preset === p) { o.setAttribute('selected', 'selected'); } preset.appendChild(o); });
+      if (!operator) { preset.disabled = true; }
+      preset.addEventListener('change', function () { cfg.preset = preset.value; buildApiConf(n, box); refreshNode(n.id); markDirty(); });
+      box.appendChild(inspectorField('Preset', preset));
+      mkInput('params', 'Query params', 'key=value, one per line');
+      mkInput('jsonPath', 'JSON path', 'e.g. total_visible or facts[0].value');
+      if (cfg.preset === 'list' || cfg.preset === 'sparkline') { mkInput('fields', cfg.preset === 'list' ? 'Row fields (comma)' : 'Numeric field', cfg.preset === 'list' ? 'entity,value' : 'value'); }
+      if (cfg.preset === 'gauge') { mkInput('max', 'Max (number or path)', 'e.g. 100 or total'); }
+      if (TSTUDIO_BUDGET_ROUTES[cfg.route]) { mkInput('tokenBudget', 'token_budget (required)', '500'); }
+      // refresh interval
+      var refresh = el('select', { 'class': 'tstudio-select' });
+      TSTUDIO_REFRESH.forEach(function (r) { var o = el('option', { value: r[0] }, [r[1]]); if ((cfg.refresh || 'off') === r[0]) { o.setAttribute('selected', 'selected'); } refresh.appendChild(o); });
+      if (!operator) { refresh.disabled = true; }
+      refresh.addEventListener('change', function () { cfg.refresh = refresh.value; refreshNode(n.id); markDirty(); });
+      box.appendChild(inspectorField('Auto-refresh', refresh));
+    }
+    function paintLinkInspector() {
+      var l = findLink(S.selectedLink);
+      if (!l) { S.selectedLink = null; paintInspector(); return; }
+      inspector.appendChild(el('h3', { 'class': 'tstudio-insp-h', text: 'Link' }));
+      var lab = el('input', { 'class': 'tstudio-input', type: 'text', value: l.label || '', placeholder: 'label', 'aria-label': 'Link label' });
+      if (!operator) { lab.disabled = true; }
+      lab.addEventListener('change', function () { l.label = lab.value; drawLinks(); markDirty(); });
+      inspector.appendChild(inspectorField('Label', lab));
+      var actions = el('div', { 'class': 'tstudio-insp-actions' });
+      var bDir = el('button', { 'class': 'tstudio-btn', type: 'button' }, [l.bidir ? 'Make one-way' : 'Make two-way']);
+      bDir.addEventListener('click', function () { l.bidir = !l.bidir; drawLinks(); paintInspector(); markDirty(); });
+      var bDel = el('button', { 'class': 'tstudio-btn tstudio-btn-danger', type: 'button' }, ['Delete link']);
+      bDel.addEventListener('click', function () { S.links = S.links.filter(function (x) { return x.id !== l.id; }); S.selectedLink = null; drawLinks(); paintInspector(); markDirty(); });
+      [bDir, bDel].forEach(function (b) { if (!operator) { b.disabled = true; } actions.appendChild(b); });
+      inspector.appendChild(actions);
+    }
+
+    // ---- library ------------------------------------------------------------
+    function nodeTemplate(n) {
+      var t = { kind: n.kind, w: n.w, h: n.h };
+      if (n.label != null) { t.label = n.label; }
+      if (n.sub != null) { t.sub = n.sub; }
+      if (n.body != null) { t.body = n.body; }
+      if (n.kind === 'web') { t.url = n.url || ''; }
+      if (n.kind === 'api' && n.api) { t.api = JSON.parse(JSON.stringify(n.api)); }
+      return t;
+    }
+    function saveAsDesign(n) {
+      if (!operator) { return; }
+      var suggested = (n.label || tstudioKind(n.kind).label || 'design').trim();
+      var name = (typeof prompt === 'function') ? prompt('Save this tile as a reusable design. Name:', suggested) : suggested;
+      if (name == null) { return; }
+      name = String(name).trim(); if (!name) { return; }
+      var slug = tstudioSlugify(name);
+      tstudioSaveDesign(slug, name, nodeTemplate(n)).then(function (r) {
+        if (r.ok) { refreshLibrary(); }
+      });
+    }
+    function paintLibrary() {
+      library.textContent = '';
+      var toggle = el('button', { 'class': 'tstudio-lib-collapse', type: 'button', title: 'Hide library', 'aria-label': 'Hide library' }, ['❮']);
+      toggle.addEventListener('click', function () { root.classList.toggle('tstudio-lib-hidden'); });
+      var head = el('div', { 'class': 'tstudio-lib-head' }, [el('h3', { 'class': 'tstudio-lib-h', text: 'Tile library' }), toggle]);
+      library.appendChild(head);
+
+      library.appendChild(el('div', { 'class': 'tstudio-lib-sec', text: 'Built-in' }));
+      var kinds = el('div', { 'class': 'tstudio-lib-grid' });
+      ['note', 'box', 'web', 'api', 'project', 'server', 'storage', 'client', 'output'].forEach(function (k) {
+        var kdef = tstudioKind(k);
+        var b = el('button', { 'class': 'tstudio-lib-item', type: 'button', title: 'Add a ' + kdef.label + ' tile' });
+        b.style.setProperty('--ts-accent', kdef.accent);
+        b.appendChild(el('span', { 'class': 'tstudio-lib-ico' }));
+        b.lastChild.appendChild(tstudioIcon(kdef.icon, 16));
+        b.appendChild(el('span', { 'class': 'tstudio-lib-name', text: kdef.label }));
+        if (!operator) { b.disabled = true; }
+        b.addEventListener('click', function () { addNode(k); });
+        kinds.appendChild(b);
+      });
+      library.appendChild(kinds);
+
+      library.appendChild(el('div', { 'class': 'tstudio-lib-sec', text: 'Saved designs' }));
+      var designs = el('div', { 'class': 'tstudio-lib-designs' });
+      if (!S.designs.length) {
+        designs.appendChild(el('p', { 'class': 'tstudio-lib-empty', text: operator ? 'Configure a tile, then "Save as design" to reuse it here.' : 'No saved designs yet.' }));
+      }
+      S.designs.forEach(function (d) {
+        var b = el('button', { 'class': 'tstudio-lib-design', type: 'button', title: 'Add "' + d.name + '"' });
+        b.appendChild(el('span', { 'class': 'tstudio-lib-name', text: d.name }));
+        b.appendChild(el('span', { 'class': 'tstudio-lib-kind', text: d.config ? (tstudioKind(d.config.kind).label) : 'design' }));
+        if (!operator) { b.disabled = true; }
+        b.addEventListener('click', function () { instantiateDesign(d); });
+        designs.appendChild(b);
+      });
+      library.appendChild(designs);
+    }
+    function instantiateDesign(d) {
+      if (!operator) { return; }
+      if (d.config) { addNode(d.config.kind, d.config); return; }
+      // truncated in the listing — re-read the full value first
+      tstudioLoadDesign(d.entity).then(function (def) { if (def && def.config) { addNode(def.config.kind, def.config); } });
+    }
+    function refreshLibrary() {
+      tstudioListDesigns().then(function (list) { S.designs = list; paintLibrary(); });
+    }
+
+    // ---- toolbar ------------------------------------------------------------
+    function paintToolbar() {
+      toolbar.textContent = '';
+      var left = el('div', { 'class': 'tstudio-tb-left' });
+      var libBtn = el('button', { 'class': 'tstudio-btn tstudio-icbtn', type: 'button', title: 'Toggle library', 'aria-label': 'Toggle library' });
+      libBtn.appendChild(tstudioIcon(['M4 5.5h16v13H4z', 'M9 5.5v13'], 16));
+      libBtn.addEventListener('click', function () { root.classList.toggle('tstudio-lib-hidden'); });
+      left.appendChild(libBtn);
+      left.appendChild(el('span', { 'class': 'tstudio-tb-title', text: 'Studio · ' + boardId }));
+      toolbar.appendChild(left);
+
+      var mid = el('div', { 'class': 'tstudio-tb-mid' });
+      var zOut = el('button', { 'class': 'tstudio-btn tstudio-icbtn', type: 'button', title: 'Zoom out', 'aria-label': 'Zoom out' }, ['−']);
+      zOut.addEventListener('click', function () { var r = stageRect(); setZoomAt(S.zoom / 1.2, r.left + r.width / 2, r.top + r.height / 2); });
+      var zLab = el('span', { 'class': 'tstudio-zoomlab', text: Math.round(S.zoom * 100) + '%' });
+      var zIn = el('button', { 'class': 'tstudio-btn tstudio-icbtn', type: 'button', title: 'Zoom in', 'aria-label': 'Zoom in' }, ['+']);
+      zIn.addEventListener('click', function () { var r = stageRect(); setZoomAt(S.zoom * 1.2, r.left + r.width / 2, r.top + r.height / 2); });
+      var fit = el('button', { 'class': 'tstudio-btn', type: 'button', title: 'Fit all tiles' }, ['Fit']);
+      fit.addEventListener('click', function () { fitAll(); });
+      var gridBtn = el('button', { 'class': 'tstudio-btn tstudio-icbtn is-on', type: 'button', title: 'Toggle grid', 'aria-label': 'Toggle grid' });
+      gridBtn.appendChild(tstudioIcon(['M4 4h16v16H4z', 'M4 10h16M4 15h16M10 4v16M15 4v16'], 16));
+      gridBtn.addEventListener('click', function () { var on = grid.classList.toggle('is-off'); gridBtn.classList.toggle('is-on', !on); });
+      [zOut, zLab, zIn, fit, gridBtn].forEach(function (x) { mid.appendChild(x); });
+      toolbar.appendChild(mid);
+
+      var right = el('div', { 'class': 'tstudio-tb-right' });
+      var chip = el('span', { 'class': 'tstudio-savechip' });
+      right.appendChild(chip);
+      var saveBtn = el('button', { 'class': 'tstudio-btn tstudio-btn-primary', type: 'button', title: operator ? 'Save the board now' : 'Read-only — operator posture required' }, ['Save']);
+      if (!operator) { saveBtn.disabled = true; }
+      saveBtn.addEventListener('click', function () { doSave(); });
+      right.appendChild(saveBtn);
+      toolbar.appendChild(right);
+      paintSaveState();
+    }
+    function fitAll() {
+      if (!S.nodes.length) { S.pan = { x: 40, y: 40 }; S.zoom = 1; applyTransform(); return; }
+      var minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+      S.nodes.forEach(function (n) { minx = Math.min(minx, n.x); miny = Math.min(miny, n.y); maxx = Math.max(maxx, n.x + n.w); maxy = Math.max(maxy, n.y + n.h); });
+      var bw = Math.max(50, maxx - minx), bh = Math.max(50, maxy - miny);
+      var r = stageRect(), pad = 80;
+      var z = Math.max(0.2, Math.min(2, Math.min((r.width - pad) / bw, (r.height - pad) / bh)));
+      S.zoom = z;
+      S.pan = { x: r.width / 2 - (minx + bw / 2) * z, y: r.height / 2 - (miny + bh / 2) * z };
+      markDirty(); applyTransform();
+    }
+
+    // ---- stage interactions (pan on empty, deselect) -----------------------
+    stage.addEventListener('mousedown', function (e) {
+      if (e.target !== stage && e.target !== world && e.target !== grid && e.target !== linkLayer) { return; }
+      if (e.button !== 0 && e.button !== 1) { return; }
+      var sx = e.clientX, sy = e.clientY, px = S.pan.x, py = S.pan.y, moved = false;
+      stage.classList.add('is-panning');
+      function mv(ev) { S.pan.x = px + (ev.clientX - sx); S.pan.y = py + (ev.clientY - sy); if (Math.abs(ev.clientX - sx) + Math.abs(ev.clientY - sy) > 3) { moved = true; } applyTransform(); }
+      function up() {
+        doc().removeEventListener('mousemove', mv); doc().removeEventListener('mouseup', up); stage.classList.remove('is-panning');
+        if (!moved) { if (S.selected || S.selectedLink) { S.selected = null; S.selectedLink = null; applySelectionUI(); drawLinks(); paintInspector(); } }
+        else { markDirty(); }
+      }
+      doc().addEventListener('mousemove', mv); doc().addEventListener('mouseup', up);
+    });
+    var wheelHandler = function (e) {
+      if (e.preventDefault) { e.preventDefault(); }
+      var f = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+      setZoomAt(S.zoom * f, e.clientX, e.clientY);
+    };
+    stage.addEventListener('wheel', wheelHandler, { passive: false });
+    S.cleanups.push(function () { stage.removeEventListener('wheel', wheelHandler); });
+    onDoc('keydown', function (e) {
+      if (!operator) { return; }
+      var t = e.target, editing = t && (t.isContentEditable || /INPUT|TEXTAREA|SELECT/.test(t.tagName));
+      if ((e.key === 'Delete' || e.key === 'Backspace') && !editing) {
+        if (S.selectedLink) { e.preventDefault(); S.links = S.links.filter(function (x) { return x.id !== S.selectedLink; }); S.selectedLink = null; drawLinks(); paintInspector(); markDirty(); }
+        else if (S.selected) { e.preventDefault(); deleteNode(S.selected); }
+      }
+      if (e.key === 'Escape') { S.selected = null; S.selectedLink = null; applySelectionUI(); drawLinks(); paintInspector(); }
+    });
+
+    // ---- render the loaded board -------------------------------------------
+    function renderBoard() {
+      Object.keys(S.nodeEls).forEach(function (id) { if (S.nodeEls[id].parentNode) { S.nodeEls[id].parentNode.removeChild(S.nodeEls[id]); } });
+      S.nodeEls = {};
+      S.nodes.forEach(function (n) { buildNode(n); });
+      drawLinks();
+      applyTransform();
+    }
+
+    // ---- boot ---------------------------------------------------------------
+    paintToolbar();
+    paintLibrary();
+    paintInspector();
+    applyTransform();
+
+    __tstudioCleanup = function () {
+      if (S.saveTimer) { clearTimeout(S.saveTimer); }
+      Object.keys(S.refreshTimers).forEach(function (id) { if (typeof clearInterval === 'function') { clearInterval(S.refreshTimers[id]); } });
+      S.cleanups.forEach(function (fn) { try { fn(); } catch (e) { /* ignore */ } });
+      S.cleanups = [];
+    };
+
+    // Verification hooks (mirroring the rings / canvas-graph __rings*/__cv* dev
+    // hooks). They drive the real internal add/move/resize/save/design paths so
+    // the Playwright persistence proof is deterministic — no synthetic gestures,
+    // no bespoke behaviour. Harmless to users (plain window assignments).
+    if (typeof window !== 'undefined') {
+      window.__tstudio = {
+        add: function (kind, cfg) { return addNode(kind, cfg).id; },
+        select: function (id) { selectNode(id); },
+        move: function (id, x, y) { var n = findNode(id); if (n) { n.x = tstudioSnap(x); n.y = tstudioSnap(y); if (S.nodeEls[id]) { placeNode(n, S.nodeEls[id]); } drawLinks(); markDirty(); } },
+        resize: function (id, w, h) { var n = findNode(id); if (n) { n.w = Math.max(TSTUDIO_MIN_W, tstudioSnap(w)); n.h = Math.max(TSTUDIO_MIN_H, tstudioSnap(h)); if (S.nodeEls[id]) { placeNode(n, S.nodeEls[id]); } drawLinks(); markDirty(); } },
+        setApi: function (id, cfg) { var n = findNode(id); if (!n) { return; } n.api = n.api || {}; Object.keys(cfg || {}).forEach(function (k) { n.api[k] = cfg[k]; }); refreshNode(id); markDirty(); },
+        setWeb: function (id, url) { var n = findNode(id); if (n) { n.url = tstudioWebSrcOk(url) ? url : ''; refreshNode(id); markDirty(); } },
+        saveDesign: function (id, name) { var n = findNode(id); if (!n) { return Promise.resolve({ ok: false }); } return tstudioSaveDesign(tstudioSlugify(name), name, nodeTemplate(n)).then(function (r) { if (r.ok) { refreshLibrary(); } return r; }); },
+        save: function () { return doSave(); },
+        state: function () { return { count: S.nodes.length, saveState: S.saveState, zoom: S.zoom, pan: { x: S.pan.x, y: S.pan.y }, designs: S.designs.length, nodes: S.nodes.map(function (n) { return { id: n.id, kind: n.kind, x: n.x, y: n.y, w: n.w, h: n.h, route: n.api && n.api.route, url: n.url }; }) }; }
+      };
+    }
+
+    // Synchronous seed path (no network): render a pre-supplied board doc
+    // immediately. Used for previews + the smoke's mock-DOM drive (which must
+    // build the board without an async yield). Real navigation loads async below.
+    if (ctx.seedDoc) {
+      var seeded = tstudioNormalizeDoc(ctx.seedDoc);
+      S.nodes = seeded.nodes; S.links = seeded.links; S.texts = seeded.texts;
+      S.pan = seeded.pan; S.zoom = seeded.zoom;
+      S.designs = Array.isArray(ctx.seedDesigns) ? ctx.seedDesigns : [];
+      renderBoard();
+      paintLibrary();
+      setSaveState(operator ? 'clean' : 'readonly');
+      return Promise.resolve({ boardId: boardId, found: true, seeded: true });
+    }
+
+    var loading = el('div', { 'class': 'tstudio-boot', text: 'loading board…' });
+    world.appendChild(loading);
+    return Promise.all([tstudioLoadBoard(boardId), tstudioListDesigns()]).then(function (out) {
+      if (loading.parentNode) { loading.parentNode.removeChild(loading); }
+      var res = out[0];
+      S.nodes = res.doc.nodes; S.links = res.doc.links; S.texts = res.doc.texts;
+      S.pan = res.doc.pan; S.zoom = res.doc.zoom;
+      S.designs = out[1] || [];
+      renderBoard();
+      paintLibrary();
+      setSaveState(operator ? (res.found ? 'saved' : 'clean') : 'readonly');
+      return { boardId: boardId, found: res.found };
+    }).catch(function () {
+      if (loading.parentNode) { loading.parentNode.removeChild(loading); }
+      renderBoard();
+      return { boardId: boardId, found: false };
+    });
+  }
+
   function renderCanvas(host, ctx) {
     ctx = ctx || {};
-    var view = ctx.view === 'graph' ? 'graph' : (ctx.view === 'tree' ? 'tree' : 'board');
+    var view = ctx.view === 'graph' ? 'graph' : (ctx.view === 'tree' ? 'tree' : (ctx.view === 'studio' ? 'studio' : 'board'));
     host.textContent = '';
     var region = el('div', { 'class': 'canvas-region' });
     var seg = el('div', { 'class': 'modeseg canvas-seg', role: 'group', 'aria-label': 'Canvas view' });
-    [['board', 'Board'], ['graph', 'Graph'], ['tree', 'Tree']].forEach(function (v) {
+    [['board', 'Board'], ['graph', 'Graph'], ['tree', 'Tree'], ['studio', 'Studio']].forEach(function (v) {
       var b = el('button', { 'class': 'modeseg-btn', type: 'button', 'data-view': v[0], 'aria-pressed': v[0] === view ? 'true' : 'false' }, [v[1]]);
       (function (vid) { b.addEventListener('click', function () { location.hash = '#/canvas/' + vid; }); })(v[0]);
       seg.appendChild(b);
@@ -4646,6 +5717,7 @@
     host.appendChild(region);
     if (view === 'graph') { return renderCanvasGraph(body, ctx, ctx.focus); }
     if (view === 'tree') { return renderPlanTree(body, ctx); }
+    if (view === 'studio') { return renderTileStudio(body, ctx); }
     renderCanvasBoard(body, ctx);
     return Promise.resolve();
   }
@@ -5987,6 +7059,7 @@
     'canvas:board':    'Size-adaptive tile dashboard — drag, pan, expand in place',
     'canvas:graph':    'Relation graph — real edges, ring layout when zoomed out',
     'canvas:tree':     'Plan tree — colour-coded by kind and state, filterable',
+    'canvas:studio':   'Build a board of tiles (notes · API · web); saved daemon-side',
     'explorer':        'Search the corpus — local retrieval or mediated WikiCrux',
     'sitemap':         "You're here — the whole console, one guided map",
     'rings':           'The clock of work — the live work board, facts and glance as an animated ring'
@@ -6041,6 +7114,7 @@
         nodes.push({ key: 'canvas:board', name: 'Board', href: '#/canvas/board' });
         nodes.push({ key: 'canvas:graph', name: 'Graph', href: '#/canvas/graph' });
         nodes.push({ key: 'canvas:tree', name: 'Tree', href: '#/canvas/tree' });
+        nodes.push({ key: 'canvas:studio', name: 'Studio', href: '#/canvas/studio' });
       } else {
         // explorer / sitemap / rings — the destination IS the page.
         nodes.push({ key: d.id, name: d.label, href: '#/' + d.id });
@@ -6058,7 +7132,7 @@
     var parts = h.split('/').filter(Boolean);
     var dest = parts[0], leaf = parts[1];
     if (!dest || dest === 'sitemap') { return 'sitemap'; }
-    if (dest === 'canvas') { return 'canvas:' + (leaf === 'graph' || leaf === 'tree' ? leaf : 'board'); }
+    if (dest === 'canvas') { return 'canvas:' + (leaf === 'graph' || leaf === 'tree' || leaf === 'studio' ? leaf : 'board'); }
     if (dest === 'explorer' || dest === 'rings') { return dest; }
     if (dest === 'overwatch' && !leaf) { return '#/overwatch'; }
     var present = {};
@@ -9736,6 +10810,19 @@
     paintSessionDetail: paintSessionDetail,
     renderSessionDetail: renderSessionDetail,
     renderCanvas: renderCanvas,
+    // M14 (console-surfaces-remediation) — Canvas Studio: the ported diagram-builder
+    // engine (a fourth canvas view; the incumbent board is untouched). The pure
+    // subset is unit-tested by the smoke; the view is driven against a mock DOM.
+    renderTileStudio: renderTileStudio,
+    tstudioSnap: tstudioSnap,
+    tstudioNormalizeDoc: tstudioNormalizeDoc,
+    tstudioSerializeDoc: tstudioSerializeDoc,
+    tstudioWebSrcOk: tstudioWebSrcOk,
+    tstudioApiRouteKnown: tstudioApiRouteKnown,
+    tstudioJsonPath: tstudioJsonPath,
+    tstudioLatestFact: tstudioLatestFact,
+    tstudioSlugify: tstudioSlugify,
+    TSTUDIO_KINDS: TSTUDIO_KINDS,
     // M10 (console-surfaces-remediation, review round 1) — the native Rings page
     // (canvas "clock of work"; replaced the embedded iframe mock).
     renderRings: renderRings,

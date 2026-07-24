@@ -116,6 +116,12 @@ const GATED_MUTATIONS: &[(&str, &str, &str)] = &[
     ("POST", "/v1/workbench/policy-simulation", "workbenchPolicySimulation"),
     ("POST", "/v1/workbench/route-probe", "workbenchRouteProbe"),
     ("POST", "/v1/features/capabilities/{id}/audit", "featureCapabilityAudit"),
+    // console-surfaces-remediation M14: Canvas Studio persists tile boards + saved
+    // tile designs daemon-side. The write is the existing facts-add console route
+    // (facts:write scope, category-enforced); the console reaches it ONLY through
+    // operatorGatedCall, and the entity is fixed to the `console:tileboard:` /
+    // `console:tiledesign:` prefixes by the caller (render.js tileStudio*).
+    ("POST", "/v1/console/facts/add", "consoleFactsAdd"),
 ];
 
 // ── Curated read-POST allowlist (unified-shell-console M11) ───────────────────
@@ -655,6 +661,10 @@ fn generate_api_js() -> String {
     s.push_str("  window.CruxSession = CruxSession;\n");
     s.push_str("  window.CRUX_GATED_MUTATIONS = GATED_MUTATIONS;\n");
     s.push_str("  window.CRUX_READ_POST_ROUTES = READ_POST_ROUTES;\n");
+    s.push_str("  // Known literal (query-less) GET routes — the validated source for the\n");
+    s.push_str("  // Canvas Studio API-tile route picker (M14). An API tile may bind ONLY to a\n");
+    s.push_str("  // route in this list; arbitrary strings are rejected before any fetch.\n");
+    s.push_str("  window.CRUX_GET_ROUTES = Object.freeze(Object.keys(LITERAL_GET_PATHS));\n");
     s.push_str("}\n");
     s
 }

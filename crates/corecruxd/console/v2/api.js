@@ -10,7 +10,7 @@
 // Customer-safe posture: CruxApi (below) exposes only GET (read) routes; its
 // generic get(path) is allowlist-guarded to literal manifest GET paths. The ONLY
 // writes this console can perform live in the separate CruxApiGated object at the
-// bottom — exactly 25 curated, operator-posture-gated mutation(s), no more.
+// bottom — exactly 26 curated, operator-posture-gated mutation(s), no more.
 //
 // Every call is same-origin credentialed; the browser never holds a bearer
 // token (the daemon authenticates the session at its own origin).
@@ -721,6 +721,7 @@ const GATED_MUTATIONS = Object.freeze([
   Object.freeze(['POST', '/v1/workbench/policy-simulation']),
   Object.freeze(['POST', '/v1/workbench/route-probe']),
   Object.freeze(['POST', '/v1/features/capabilities/{id}/audit']),
+  Object.freeze(['POST', '/v1/console/facts/add']),
 ]);
 
 const CruxApiGated = Object.freeze({
@@ -799,6 +800,9 @@ const CruxApiGated = Object.freeze({
   featureCapabilityAudit(id, body) {
     return fetch(`/v1/features/capabilities/${encodeURIComponent(id)}/audit`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
   },
+  consoleFactsAdd(body) {
+    return fetch(`/v1/console/facts/add`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -876,4 +880,8 @@ if (typeof window !== 'undefined') {
   window.CruxSession = CruxSession;
   window.CRUX_GATED_MUTATIONS = GATED_MUTATIONS;
   window.CRUX_READ_POST_ROUTES = READ_POST_ROUTES;
+  // Known literal (query-less) GET routes — the validated source for the
+  // Canvas Studio API-tile route picker (M14). An API tile may bind ONLY to a
+  // route in this list; arbitrary strings are rejected before any fetch.
+  window.CRUX_GET_ROUTES = Object.freeze(Object.keys(LITERAL_GET_PATHS));
 }

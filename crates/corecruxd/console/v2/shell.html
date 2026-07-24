@@ -2058,6 +2058,163 @@
     .cvx-node.cvx-dim { filter: none; opacity: .3; transform: none; }
   }
 
+  /* ---- Canvas Studio (M14) — the ported diagram-builder engine ----------- */
+  /* All colours are theme tokens; --ts-accent is set per node from the kind. */
+  .tstudio { display: flex; flex-direction: column; height: calc(100vh - 150px); min-height: 560px; border: 1px solid var(--edge); border-radius: var(--radius); overflow: hidden; background: var(--surface2); }
+  .tstudio-banner { display: flex; align-items: center; gap: 8px; padding: 8px 14px; font-size: 12px; color: var(--ink2); background: color-mix(in srgb, var(--warn) 12%, var(--surface)); border-bottom: 1px solid var(--edge); }
+  .tstudio-banner-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--warn); flex: none; }
+
+  .tstudio-toolbar { display: flex; align-items: center; gap: 10px; padding: 8px 12px; background: var(--surface); border-bottom: 1px solid var(--edge); flex: none; }
+  .tstudio-tb-left, .tstudio-tb-mid, .tstudio-tb-right { display: flex; align-items: center; gap: 8px; }
+  .tstudio-tb-mid { margin: 0 auto; }
+  .tstudio-tb-title { font: 600 12px var(--font-mono); color: var(--ink2); letter-spacing: .02em; }
+  .tstudio-zoomlab { min-width: 44px; text-align: center; font: 600 12px var(--font-mono); color: var(--ink2); font-variant-numeric: tabular-nums; }
+
+  .tstudio-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 30px; padding: 0 11px; border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface); color: var(--ink); font-size: 12.5px; font-weight: 600; cursor: pointer; transition: border-color .12s ease, background .12s ease; }
+  .tstudio-btn:hover:not(:disabled) { border-color: var(--edge-strong); }
+  .tstudio-btn:disabled { opacity: .45; cursor: not-allowed; }
+  .tstudio-btn:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; }
+  .tstudio-icbtn { width: 30px; padding: 0; }
+  .tstudio-icbtn svg { color: var(--ink2); }
+  .tstudio-icbtn.is-on { border-color: var(--acc); color: var(--acc); }
+  .tstudio-icbtn.is-on svg { color: var(--acc); }
+  .tstudio-btn-primary { background: var(--acc); border-color: var(--acc); color: #fff; }
+  :root[data-theme="light"] .tstudio-btn-primary { color: #fff; }
+  .tstudio-btn-danger:hover:not(:disabled) { border-color: var(--crit); color: var(--crit); }
+  .tstudio-savechip { display: inline-flex; align-items: center; gap: 6px; font: 600 11.5px var(--font-mono); color: var(--ink2); }
+  .tstudio-savedot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink3); }
+  .tstudio-save-ok { background: var(--ok); }
+  .tstudio-save-warn { background: var(--warn); }
+  .tstudio-save-busy { background: var(--acc); animation: tstudio-pulse 1s ease-in-out infinite; }
+  .tstudio-save-err { background: var(--crit); }
+  .tstudio-save-ro { background: var(--ink3); }
+  @keyframes tstudio-pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+
+  .tstudio-main { flex: 1; min-height: 0; display: grid; grid-template-columns: 210px 1fr 260px; }
+  .tstudio.tstudio-lib-hidden .tstudio-main { grid-template-columns: 0 1fr 260px; }
+  .tstudio.tstudio-lib-hidden .tstudio-library { display: none; }
+
+  /* library */
+  .tstudio-library { border-right: 1px solid var(--edge); background: var(--surface); overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 6px; }
+  .tstudio-lib-head { display: flex; align-items: center; justify-content: space-between; }
+  .tstudio-lib-h { margin: 0; font-size: 12.5px; font-weight: 700; color: var(--ink); }
+  .tstudio-lib-collapse { border: none; background: none; color: var(--ink3); cursor: pointer; font-size: 13px; padding: 2px 6px; }
+  .tstudio-lib-sec { margin-top: 8px; font: 600 9.5px var(--font-mono); letter-spacing: .12em; text-transform: uppercase; color: var(--ink3); }
+  .tstudio-lib-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .tstudio-lib-item { display: flex; flex-direction: column; align-items: center; gap: 5px; padding: 9px 4px; border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2); color: var(--ink2); cursor: pointer; transition: border-color .12s ease, color .12s ease; }
+  .tstudio-lib-item:hover:not(:disabled) { border-color: var(--ts-accent, var(--acc)); color: var(--ink); }
+  .tstudio-lib-item:disabled { opacity: .5; cursor: not-allowed; }
+  .tstudio-lib-ico { color: var(--ts-accent, var(--acc)); display: inline-flex; }
+  .tstudio-lib-name { font-size: 11px; font-weight: 600; text-align: center; line-height: 1.2; }
+  .tstudio-lib-designs { display: flex; flex-direction: column; gap: 5px; }
+  .tstudio-lib-design { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 7px 9px; border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2); color: var(--ink); cursor: pointer; text-align: left; }
+  .tstudio-lib-design:hover:not(:disabled) { border-color: var(--acc); }
+  .tstudio-lib-design:disabled { opacity: .5; cursor: not-allowed; }
+  .tstudio-lib-design .tstudio-lib-kind { font: 600 9.5px var(--font-mono); color: var(--ink3); }
+  .tstudio-lib-empty { margin: 2px 0; font-size: 11px; color: var(--ink3); line-height: 1.4; }
+
+  /* stage */
+  .tstudio-stagewrap { position: relative; overflow: hidden; background: var(--bg); }
+  .tstudio-stage { position: absolute; inset: 0; overflow: hidden; cursor: grab; touch-action: none; outline: none; }
+  .tstudio-stage.is-panning { cursor: grabbing; }
+  .tstudio-world { position: absolute; top: 0; left: 0; transform-origin: 0 0; will-change: transform; }
+  .tstudio-grid { position: absolute; top: -2000px; left: -2000px; width: 8000px; height: 8000px; pointer-events: none;
+    background-image: linear-gradient(var(--edge) 1px, transparent 1px), linear-gradient(90deg, var(--edge) 1px, transparent 1px);
+    background-size: 20px 20px; opacity: .5; }
+  .tstudio-grid.is-off { display: none; }
+  .tstudio-links { position: absolute; top: 0; left: 0; overflow: visible; pointer-events: none; width: 1px; height: 1px; }
+  .tstudio-labels { position: absolute; top: 0; left: 0; }
+  .tstudio-boot { position: absolute; top: 24px; left: 24px; font-size: 12px; color: var(--ink3); }
+
+  .tstudio-wire { stroke: var(--edge-strong); stroke-width: 2; fill: none; pointer-events: stroke; }
+  .tstudio-wire.is-sel { stroke: var(--acc); stroke-width: 2.6; }
+  .tstudio-wire-hit { stroke: transparent; stroke-width: 14; fill: none; pointer-events: stroke; cursor: pointer; }
+  .tstudio-arrowhead { fill: var(--edge-strong); stroke: none; }
+  .tstudio-templine { stroke: var(--warn); stroke-width: 2.4; stroke-dasharray: 6 6; pointer-events: none; }
+  .tstudio-wlabel { position: absolute; transform: translate(-50%, -50%); padding: 1px 7px; font-size: 11px; color: var(--ink); background: var(--surface); border: 1px solid var(--edge); border-radius: 999px; white-space: nowrap; pointer-events: none; }
+
+  /* nodes */
+  .tstudio-node { position: absolute; box-sizing: border-box; border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface); box-shadow: var(--card-shadow); overflow: hidden; outline: none; }
+  .tstudio-node:hover { border-color: var(--edge-strong); }
+  .tstudio-node.is-selected { border-color: var(--ts-accent, var(--acc)); box-shadow: 0 0 0 2px color-mix(in srgb, var(--ts-accent, var(--acc)) 40%, transparent); }
+  .tstudio-node.is-dragging { cursor: grabbing; z-index: 999 !important; }
+  .tstudio-node:focus-visible { border-color: var(--acc); box-shadow: 0 0 0 2px color-mix(in srgb, var(--acc) 40%, transparent); }
+  .tstudio-accent { position: absolute; top: 0; left: 0; right: 0; height: 3px; background: var(--ts-accent, var(--acc)); }
+  .tstudio-content { position: absolute; inset: 3px 0 0 0; padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; overflow: hidden; }
+  .tstudio-nhead { display: flex; align-items: center; gap: 7px; }
+  .tstudio-chip { display: inline-flex; color: var(--ts-accent, var(--acc)); flex: none; }
+  .tstudio-ttl { font-size: 13.5px; font-weight: 700; color: var(--ink); line-height: 1.2; outline: none; min-width: 20px; flex: 1; }
+  .tstudio-sub { font-size: 11.5px; font-weight: 500; color: var(--ts-accent, var(--ink2)); outline: none; }
+  .tstudio-body { font-size: 11.5px; color: var(--ink2); line-height: 1.45; outline: none; overflow: hidden; flex: 1; }
+  .tstudio-ttl:empty::before { content: 'Untitled'; color: var(--ink3); }
+  .tstudio-body:empty::before { content: ''; }
+  .tstudio-boxcontent { justify-content: flex-start; }
+  .tstudio-boxlabel { font-size: 12px; font-weight: 600; color: var(--ink2); outline: none; }
+  .tstudio-unsupported { font-size: 11px; color: var(--ink3); line-height: 1.45; padding: 4px 0; }
+  .tstudio-placeholder { font-size: 11px; color: var(--ink3); line-height: 1.4; }
+
+  /* per-node handles */
+  .tstudio-del { position: absolute; top: 4px; right: 4px; width: 18px; height: 18px; padding: 0; line-height: 16px; text-align: center; border: 1px solid var(--edge); border-radius: 50%; background: var(--surface); color: var(--ink3); font-size: 13px; cursor: pointer; opacity: 0; transition: opacity .12s ease; z-index: 3; }
+  .tstudio-node:hover .tstudio-del, .tstudio-node.is-selected .tstudio-del { opacity: 1; }
+  .tstudio-del:hover { color: var(--crit); border-color: var(--crit); }
+  .tstudio-lh { position: absolute; left: 50%; bottom: -6px; transform: translateX(-50%); width: 12px; height: 12px; border-radius: 50%; background: var(--ts-accent, var(--acc)); border: 2px solid var(--surface); cursor: crosshair; opacity: 0; transition: opacity .12s ease; z-index: 3; }
+  .tstudio-node:hover .tstudio-lh, .tstudio-node.is-selected .tstudio-lh { opacity: 1; }
+  .tstudio-rz { position: absolute; right: 0; bottom: 0; width: 16px; height: 16px; cursor: nwse-resize; z-index: 3; }
+  .tstudio-rz::after { content: ''; position: absolute; right: 3px; bottom: 3px; width: 7px; height: 7px; border-right: 2px solid var(--ink3); border-bottom: 2px solid var(--ink3); }
+
+  /* web tile */
+  .tstudio-webcontent { padding-bottom: 0; }
+  .tstudio-webholder { flex: 1; min-height: 0; border-radius: 6px; overflow: hidden; border: 1px solid var(--edge); background: #fff; margin-top: 2px; }
+  .tstudio-webholder iframe { width: 100%; height: 100%; border: 0; display: block; }
+
+  /* api tile */
+  .tstudio-apibody { flex: 1; min-height: 0; display: flex; flex-direction: column; justify-content: center; overflow: hidden; }
+  .tstudio-apifoot { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+  .tstudio-apiroute { font: 600 9.5px var(--font-mono); color: var(--ink3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tstudio-apipreset { font: 600 9px var(--font-mono); color: var(--ts-accent, var(--acc)); text-transform: uppercase; letter-spacing: .1em; }
+  .tstudio-apierr { font-size: 11px; color: var(--crit); line-height: 1.4; }
+  .tstudio-loading { font-size: 11px; color: var(--ink3); }
+  .tstudio-stat-v { font-size: 30px; font-weight: 800; color: var(--ink); letter-spacing: -.02em; font-variant-numeric: tabular-nums; line-height: 1; }
+  .tstudio-stat-k { font: 600 10px var(--font-mono); color: var(--ink3); margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tstudio-badgewrap { display: flex; }
+  .tstudio-badge { display: inline-flex; align-items: center; padding: 4px 12px; border-radius: 999px; background: color-mix(in srgb, var(--ts-accent, var(--acc)) 16%, transparent); color: var(--ts-accent, var(--acc)); font-size: 14px; font-weight: 700; }
+  .tstudio-gauge { display: flex; flex-direction: column; gap: 6px; }
+  .tstudio-gauge-track { height: 10px; border-radius: 999px; background: var(--surface2); overflow: hidden; border: 1px solid var(--edge); }
+  .tstudio-gauge-fill { height: 100%; background: var(--ts-accent, var(--acc)); border-radius: 999px; transition: width .3s ease; }
+  .tstudio-gauge-lab { font: 700 12px var(--font-mono); color: var(--ink); font-variant-numeric: tabular-nums; }
+  .tstudio-spark { display: flex; align-items: center; gap: 8px; }
+  .tstudio-spark svg { flex: 1; height: 32px; }
+  .tstudio-spark-v { font: 700 13px var(--font-mono); color: var(--ink); font-variant-numeric: tabular-nums; }
+  .tstudio-list { display: flex; flex-direction: column; gap: 2px; overflow-y: auto; }
+  .tstudio-list-row { display: flex; gap: 8px; padding: 2px 0; border-bottom: 1px solid var(--edge); }
+  .tstudio-list-cell { font-size: 11px; color: var(--ink2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; font-variant-numeric: tabular-nums; }
+
+  /* inspector */
+  .tstudio-inspector { border-left: 1px solid var(--edge); background: var(--surface); overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+  .tstudio-insp-head { display: flex; align-items: center; justify-content: space-between; }
+  .tstudio-insp-h { margin: 0; font-size: 13px; font-weight: 700; color: var(--ink); }
+  .tstudio-insp-hint { margin: 0; font-size: 11.5px; color: var(--ink3); line-height: 1.45; }
+  .tstudio-insp-note { margin: -4px 0 0; font-size: 10.5px; color: var(--ink3); line-height: 1.4; }
+  .tstudio-insp-note.is-err { color: var(--crit); }
+  .tstudio-field { display: flex; flex-direction: column; gap: 4px; }
+  .tstudio-field-lab { font: 600 10px var(--font-mono); letter-spacing: .06em; text-transform: uppercase; color: var(--ink3); }
+  .tstudio-input, .tstudio-select { width: 100%; box-sizing: border-box; height: 30px; padding: 0 9px; border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2); color: var(--ink); font-size: 12px; font-family: var(--font-sans); }
+  .tstudio-input:focus, .tstudio-select:focus { outline: none; border-color: var(--acc); }
+  .tstudio-input:disabled, .tstudio-select:disabled { opacity: .55; }
+  .tstudio-apiconf { display: flex; flex-direction: column; gap: 10px; }
+  .tstudio-insp-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; padding-top: 10px; border-top: 1px solid var(--edge); }
+  .tstudio-hidden { display: none; }
+
+  @media (max-width: 1100px) {
+    .tstudio-main { grid-template-columns: 180px 1fr; }
+    .tstudio-inspector { display: none; }
+    .tstudio.tstudio-lib-hidden .tstudio-main { grid-template-columns: 0 1fr; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .tstudio-save-busy { animation: none; }
+    .tstudio-gauge-fill { transition: none; }
+  }
+
   /* ---- Canvas relation graph — card nodes + node inspector --------------- */
   .canvas-graph { position: relative; }
   /* No frame — nodes drop straight onto the page; the stage is just the pannable area. */
@@ -3589,7 +3746,11 @@
       document.getElementById('destTitle').textContent = dest.label;
       document.getElementById('destSub').textContent = cr.view === 'graph'
         ? 'Relation graph — real edges only (projects ⋈ work ⋈ gates ⋈ passports ⋈ sessions)'
-        : 'Tile canvas — drag, pan, expand in place; composes to your viewport (4K+ = the full board)';
+        : cr.view === 'studio'
+          ? 'Studio — build a board of tiles (notes · API · web); positions + configs persist daemon-side'
+          : cr.view === 'tree'
+            ? 'Plan tree — Project → ExecPlan → Milestone → live session'
+            : 'Tile canvas — drag, pan, expand in place; composes to your viewport (4K+ = the full board)';
       var canvasHost = el('div', { 'class': 'canvas-region-host', id: 'canvasHost' });
       content.appendChild(canvasHost);
       if (window.CruxRender && window.CruxRender.renderCanvas) {
@@ -3706,7 +3867,7 @@
     var qi = h.indexOf('?');
     if (qi >= 0) { q = h.slice(qi + 1); h = h.slice(0, qi); }
     var parts = h.split('/').filter(Boolean);
-    var view = (parts[1] === 'graph') ? 'graph' : (parts[1] === 'tree') ? 'tree' : 'board';
+    var view = (parts[1] === 'graph') ? 'graph' : (parts[1] === 'tree') ? 'tree' : (parts[1] === 'studio') ? 'studio' : 'board';
     var focus = null;
     var m = q.match(/(?:^|&)focus=([^&]+)/);
     if (m) {
