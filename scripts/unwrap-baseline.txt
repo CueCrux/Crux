@@ -50,7 +50,12 @@ corecrux-segment 32
 corecrux-storage 48
 corecrux-types 1
 corecruxctl 9
-corecruxd 794
+# 2026-07-25 +55 corecruxd: PR #519 integrations+library HTTP fixtures in
+# http/tests.rs only (extensions registry list 4, audit-trail keyring round-trip,
+# studio library GET/install family 10 incl. locally-served signed index + pack
+# servers) — all #[cfg(test)]-gated via mod.rs; zero production-path additions
+# (verified per-file against origin/main: every non-tests.rs delta is 0).
+corecruxd 849
 crux-claude-hooks 1
 crux-config-wizard 8
 crux-contrib 0
