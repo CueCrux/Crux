@@ -479,15 +479,19 @@
            rendered inside the row);
        (b) the rail takes a z-index ABOVE the chip, so the chip's first ~14px
            genuinely slide out from behind the bar rather than appearing on top
-           of it;
+           of it — AND the pair sits above every main-pane overlay band (the
+           rings left toolbar z 16 / tab icons z 22 / fixed tips z 90 painted
+           over the original 5/6 pair, hiding the label behind the ring
+           buttons), so the chip is 100 and the rail 101: chip below rail,
+           both above the page;
        (c) the ease is transform+opacity only (no layout), 200ms on the same
            cubic-bezier(.16,1,.3,1) the accordion uses, and reduced motion snaps.
      The native title attrs are REMOVED from these rows (buildRail /
      buildNavGroup / buildWorkspaceRail) so the two never fight; `aria-label`
      stays, so the accessible name is unchanged. */
-  .rail { z-index: 6; }              /* (b) — the chip (z-index 5) slides out from behind it */
+  .rail { z-index: 101; }            /* (b) — the chip (z-index 100) slides out from behind it */
   .rail-hlabel {
-    position: fixed; z-index: 5; pointer-events: none;
+    position: fixed; z-index: 100; pointer-events: none;
     max-width: 240px; padding: 6px 11px;
     font-size: 12.5px; font-weight: 550; line-height: 1.25; color: var(--ink);
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;

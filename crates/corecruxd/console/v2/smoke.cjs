@@ -4480,8 +4480,18 @@ function extractThemeVars(theme) {
   check(/document\.body\.appendChild\(railHLabelEl\);/.test(shellHtml)
     && /\.rail-hlabel \{\n    position: fixed;/.test(shellHtml),
     '[m24] the label must render OUTSIDE the scroll container (body child, position:fixed) so #nav overflow cannot clip it');
-  check(/\.rail \{ z-index: 6; \}/.test(shellHtml) && /\.rail-hlabel \{[^}]*z-index: 5;/.test(shellHtml),
-    '[m24] the rail must paint ABOVE the label, so the chip genuinely eases out from BEHIND the bar');
+  // m24 set the pair at 5/6, which lost to the rings page's own overlay bands
+  // (left toolbar z 16, tab icons z 22, fixed tips z 90) — the label slid out
+  // UNDER the ring buttons. The invariant is relational + a floor: rail strictly
+  // above chip (ease-out-from-behind) and chip strictly above every main-pane
+  // overlay (highest is .rings-tip at 90), asserted numerically, not as pinned
+  // literals.
+  {
+    const railZ = (shellHtml.match(/\.rail \{ z-index: (\d+); \}/) || [])[1];
+    const chipZ = (shellHtml.match(/\.rail-hlabel \{[^}]*z-index: (\d+);/) || [])[1];
+    check(railZ && chipZ && Number(railZ) > Number(chipZ) && Number(chipZ) > 90,
+      '[m24→m26] the rail must paint ABOVE the label (ease-out-from-behind) and the label ABOVE every main-pane overlay band (rings toolbar/tips top out at z 90) — got rail=' + railZ + ' chip=' + chipZ);
+  }
   check(/\.rail-hlabel \{[^}]*transform: translate\(-14px, -50%\);[^}]*transition: opacity \.16s ease, transform \.2s cubic-bezier\(\.16,1,\.3,1\);/.test(shellHtml)
     && /\.rail-hlabel\.is-out \{ opacity: 1; transform: translate\(0, -50%\); \}/.test(shellHtml),
     '[m24] the ease must be a ~200ms transform+opacity slide to the right (no layout animation)');
