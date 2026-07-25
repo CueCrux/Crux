@@ -17,13 +17,13 @@ canonical, key-sorted JSON value.
 
 | Entity | Key | Contents |
 |---|---|---|
-| `console:tileboard:<id>` | `doc` | A board document — nodes, links, texts, pan, zoom ([render.js:5434](../../crates/corecruxd/console/v2/render.js#L5434)) |
-| `console:tiledesign:<slug>` | `def` | A saved tile design: `{name, config}` ([render.js:5435](../../crates/corecruxd/console/v2/render.js#L5435)) |
+| `console:tileboard:<id>` | `doc` | A board document — nodes, links, texts, pan, zoom ([render.js:5516](../../crates/corecruxd/console/v2/render.js#L5516)) |
+| `console:tiledesign:<slug>` | `def` | A saved tile design: `{name, config}` ([render.js:5517](../../crates/corecruxd/console/v2/render.js#L5517)) |
 | `console:workspace:<uid>` | `def` | A workspace: ordered destinations, each holding page uids ([docs/agent/console-workspaces.md:22](../agent/console-workspaces.md)) |
 | `console:page:<uid>` | `def` | A page instance: a typed page with title, sub, dest, config |
 
 Default board id is `default`; the board document version is 1
-([render.js:5438](../../crates/corecruxd/console/v2/render.js#L5438)).
+([render.js:5521](../../crates/corecruxd/console/v2/render.js#L5521)).
 
 ### Workspace definition
 
@@ -271,7 +271,7 @@ For a pack a human drags into the console there is no apply endpoint. Importing
 means writing its board doc, designs, workspaces and pages back as facts through
 the operator-gated `POST /v1/console/facts/add`
 ([studio_pack.rs:34](../../crates/corecruxd/src/http/studio_pack.rs#L34),
-[render.js:7058](../../crates/corecruxd/console/v2/render.js#L7058)).
+[render.js:7193](../../crates/corecruxd/console/v2/render.js#L7193)).
 
 That is a deliberate split: transform and verify are free and unprivileged;
 mutation goes through the one audited, operator-gated write path.
@@ -598,7 +598,7 @@ posture, and the daemon enforces its own scopes regardless
 Destructive rows additionally require a two-step in-DOM confirmation.
 
 The Studio Integrations home
-(`renderIntegrationsStudio`, [render.js:8469](../../crates/corecruxd/console/v2/render.js#L8469))
+(`renderIntegrationsStudio`, [render.js:8624](../../crates/corecruxd/console/v2/render.js#L8624))
 paints four sections — Connectors, Packs, Extensions and catalog, Trusted keys —
 and its section subtitles state the model plainly, including
 `Install is not grant — a pack does nothing until a passport grant names its capabilities.`
@@ -611,8 +611,8 @@ and its section subtitles state the model plainly, including
 - [crates/corecruxd/src/http/studio_pack.rs:523](../../crates/corecruxd/src/http/studio_pack.rs#L523) — `canonicalize`
 - [crates/corecruxd/src/http/studio_pack.rs:604](../../crates/corecruxd/src/http/studio_pack.rs#L604) — `derive_capabilities`
 - [crates/corecruxd/src/http/mod.rs:667](../../crates/corecruxd/src/http/mod.rs#L667) — studio routes
-- [crates/corecruxd/console/v2/render.js:5434](../../crates/corecruxd/console/v2/render.js#L5434) — board and design entities
-- [crates/corecruxd/console/v2/render.js:8469](../../crates/corecruxd/console/v2/render.js#L8469) — `renderIntegrationsStudio`
+- [crates/corecruxd/console/v2/render.js:5516](../../crates/corecruxd/console/v2/render.js#L5516) — board and design entities
+- [crates/corecruxd/console/v2/render.js:8624](../../crates/corecruxd/console/v2/render.js#L8624) — `renderIntegrationsStudio`
 - [crates/corecruxd/tests/route_spec_drift.rs:106](../../crates/corecruxd/tests/route_spec_drift.rs#L106) — `GATED_MUTATIONS` (40 rows)
 - [crates/crux-integrations/src/studio_index.rs:45](../../crates/crux-integrations/src/studio_index.rs#L45) — `crux.studio.index.v1`
 - [crates/crux-integrations/src/studio_index.rs:93](../../crates/crux-integrations/src/studio_index.rs#L93) — `StudioLibraryEntry`
