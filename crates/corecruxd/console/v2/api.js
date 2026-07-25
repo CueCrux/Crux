@@ -10,12 +10,12 @@
 // Customer-safe posture: CruxApi (below) exposes only GET (read) routes; its
 // generic get(path) is allowlist-guarded to literal manifest GET paths. The ONLY
 // writes this console can perform live in the separate CruxApiGated object at the
-// bottom — exactly 39 curated, operator-posture-gated mutation(s), no more.
+// bottom — exactly 40 curated, operator-posture-gated mutation(s), no more.
 //
 // Every call is same-origin credentialed; the browser never holds a bearer
 // token (the daemon authenticates the session at its own origin).
 //
-// 172 read endpoints, generated from the route manifest.
+// 173 read endpoints, generated from the route manifest.
 
 /**
  * Append a plain query object to a path as a URL search string.
@@ -134,6 +134,7 @@ const LITERAL_GET_PATHS = Object.freeze({
   '/v1/shard-map': true,
   '/v1/shards': true,
   '/v1/status-feed': true,
+  '/v1/studio/library': true,
   '/v1/version': true,
   '/v1/witness/smoke': true,
   '/v1/work': true,
@@ -632,6 +633,9 @@ const CruxApi = Object.freeze({
   statusFeed(query) {
     return fetch(withQuery(`/v1/status-feed`, query), { credentials: 'same-origin' });
   },
+  studioLibrary(query) {
+    return fetch(withQuery(`/v1/studio/library`, query), { credentials: 'same-origin' });
+  },
   syncTenantsByTenantIdCollectionsByCollection(tenantId, collection, query) {
     return fetch(withQuery(`/v1/sync/tenants/${encodeURIComponent(tenantId)}/collections/${encodeURIComponent(collection)}`, query), { credentials: 'same-origin' });
   },
@@ -739,6 +743,7 @@ const GATED_MUTATIONS = Object.freeze([
   Object.freeze(['DELETE', '/v1/extensions/{id}/grants/{passport_fpr}']),
   Object.freeze(['DELETE', '/v1/extensions/keys/{passport_fpr}']),
   Object.freeze(['POST', '/v1/extensions/{id}/tools/{tool_name}/invoke']),
+  Object.freeze(['POST', '/v1/studio/library/{id}/install']),
 ]);
 
 const CruxApiGated = Object.freeze({
@@ -858,6 +863,9 @@ const CruxApiGated = Object.freeze({
   },
   extensionInvoke(id, tool_name, body) {
     return fetch(`/v1/extensions/${encodeURIComponent(id)}/tools/${encodeURIComponent(tool_name)}/invoke`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  studioLibraryInstall(id, body) {
+    return fetch(`/v1/studio/library/${encodeURIComponent(id)}/install`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
   },
 });
 

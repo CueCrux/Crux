@@ -19423,3 +19423,556 @@ async fn route_auth_enforce_contract_matrix() {
         );
     }
 }
+
+// ── Central Studio template library (crux-integrations-and-template-library L2) ─
+//
+// GET  /v1/studio/library              — verified cached catalog + installed join
+// POST /v1/studio/library/{id}/install — sha256-pinned, require-signed install
+//
+// The install tests serve BOTH the index (from disk) and the pack (over a
+// one-shot loopback TCP listener), mirroring
+// `extensions_install_from_registry_verifies_index_and_manifest_sha`.
+
+fn studio_test_payload() -> serde_json::Value {
+    serde_json::json!({
+        "schema": "crux.studio.v1",
+        "version": 1,
+        "created_at_unix_ms": 1_700_000_000_000_u64,
+        "board": {
+            "id": "default",
+            "doc": { "nodes": [{ "id": "a", "kind": "note" }], "links": [], "texts": [], "pan": { "x": 0, "y": 0 }, "zoom": 1, "version": 1 }
+        },
+        "designs": [{ "slug": "latency-tile", "name": "Latency", "config": { "kind": "api" } }],
+        "workspaces": [{
+            "schema_version": 1, "uid": "ops", "name": "Ops", "icon": "meters", "order": 100, "source": "user",
+            "dests": [{ "id": "main", "label": "Main", "icon": "work", "pages": ["ops-overview", "explorer"] }]
+        }],
+        "pages": [{ "schema_version": 1, "uid": "ops-overview", "type": "facts", "title": "Overview", "dest": "main" }]
+    })
+}
+
+/// Build a Studio pack exactly as `POST /v1/studio/pack/build` would: a
+/// `crux.integration.v1` manifest with `hashes.bundle` over the canonical
+/// studio payload, optionally signed by `signing_key`.
+fn build_studio_pack(
+    id: &str,
+    version: &str,
+    publisher_fpr: &str,
+    studio: &serde_json::Value,
+    signing_key: Option<&ed25519_dalek::SigningKey>,
+) -> serde_json::Value {
+    use crux_integrations::{
+        sign_manifest, DataAccess, EntryKind, IntegrationEntry, IntegrationManifest, ManifestHashes, NetworkAccess,
+        SafetyPolicy, INTEGRATION_SCHEMA_V1,
+    };
+    let canonical = super::studio_pack::canonical_json_string(studio);
+    let bundle_hash = format!("blake3:{}", blake3::hash(canonical.as_bytes()).to_hex());
+    let mut manifest = IntegrationManifest {
+        schema: INTEGRATION_SCHEMA_V1.to_string(),
+        id: id.to_string(),
+        name: "Ops Overview".to_string(),
+        version: version.to_string(),
+        publisher_passport_fpr: publisher_fpr.to_string(),
+        summary: "Studio board pack.".to_string(),
+        entry: IntegrationEntry {
+            kind: EntryKind::SdkRecipe,
+            path: "studio-board.json".to_string(),
+        },
+        capabilities: vec!["integrations:read".to_string()],
+        network: NetworkAccess::default(),
+        data_access: DataAccess::default(),
+        safety: SafetyPolicy::default(),
+        hashes: ManifestHashes::default(),
+        signature: None,
+        external_tool_endpoint: None,
+        tools: Vec::new(),
+        wasm_module_path: None,
+        wasm_module_url: None,
+        wasm_module_sha256: None,
+    };
+    manifest.hashes.bundle = Some(bundle_hash.clone());
+    match signing_key {
+        Some(key) => {
+            sign_manifest(&mut manifest, key, publisher_fpr.to_string()).expect("sign pack");
+            manifest.hashes.bundle = Some(bundle_hash);
+        }
+        None => {
+            manifest.hashes.manifest = Some(manifest.manifest_hash().expect("manifest hash"));
+        }
+    }
+    let mut pack = match serde_json::to_value(&manifest).expect("manifest value") {
+        serde_json::Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    pack.insert("studio".to_string(), studio.clone());
+    serde_json::Value::Object(pack)
+}
+
+/// Serve `bytes` once over loopback HTTP; returns the base URL.
+fn serve_pack_once(bytes: Vec<u8>) -> String {
+    use std::io::{Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind pack server");
+    let url = format!("http://{}", listener.local_addr().expect("addr"));
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept pack request");
+        let mut request_buf = [0u8; 1024];
+        let _ = stream.read(&mut request_buf);
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            bytes.len()
+        )
+        .expect("write response head");
+        stream.write_all(&bytes).expect("write response body");
+    });
+    url
+}
+
+/// Write a signed Studio library index carrying one entry to the daemon's
+/// default cache path. `signing_key` may differ from the key trusted under
+/// `curator_fpr` — that is how the bad-signature case is built.
+fn write_cached_studio_index(
+    data_dir: &std::path::Path,
+    curator_fpr: &str,
+    signing_key: &ed25519_dalek::SigningKey,
+    entries: Vec<crux_integrations::StudioLibraryEntry>,
+) {
+    let mut index = crux_integrations::StudioLibraryIndex::new(curator_fpr, 1_700_000_000_000);
+    index.entries = entries;
+    index.sign(signing_key).expect("sign studio index");
+    let path = data_dir.join("studio/library/index.json");
+    std::fs::create_dir_all(path.parent().expect("index parent")).expect("index dir");
+    std::fs::write(&path, serde_json::to_vec(&index).expect("index bytes")).expect("write index");
+}
+
+fn studio_library_entry(id: &str, pack_url: &str, pack_sha256: &str) -> crux_integrations::StudioLibraryEntry {
+    crux_integrations::StudioLibraryEntry {
+        id: id.to_string(),
+        kind: crux_integrations::StudioEntryKind::Pack,
+        name: "Ops Overview".to_string(),
+        version: "0.1.0".to_string(),
+        summary: "Retrieval latency + receipt freshness.".to_string(),
+        publisher_passport_fpr: "p_test_studio_pub".to_string(),
+        tags: vec!["ops".to_string()],
+        required_tier: Some(crux_integrations::RcxTier::Pro),
+        pack_url: pack_url.to_string(),
+        pack_sha256: pack_sha256.to_string(),
+        repo_url: Some("https://example.invalid/studio-library".to_string()),
+        preview: Some("1 tile, 1 design, 1 workspace.".to_string()),
+    }
+}
+
+fn sha256_hex_of(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+#[tokio::test]
+async fn studio_library_requires_read_scope() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::studio_library::get_studio_library(State(state), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn studio_library_without_cache_returns_404_naming_studio_sync() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::studio_library::get_studio_library(State(state), dev_scope_headers("query:read"))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let detail = json_body(resp).await["detail"].as_str().unwrap_or_default().to_string();
+    assert!(
+        detail.contains("corecruxctl studio sync"),
+        "expected the sync hint in the 404 detail, got: {detail}"
+    );
+}
+
+#[tokio::test]
+async fn studio_library_with_bad_signature_returns_403() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let curator_key = ed25519_dalek::SigningKey::from_bytes(&[0xb1; 32]);
+    let attacker_key = ed25519_dalek::SigningKey::from_bytes(&[0xb2; 32]);
+    let curator_fpr = "p_test_studio_curator_real";
+    add_test_key(&state, curator_fpr, hex::encode(curator_key.verifying_key().to_bytes())).await;
+
+    // Index claims the curator's fpr but is signed by someone else.
+    write_cached_studio_index(
+        &state.data_dir,
+        curator_fpr,
+        &attacker_key,
+        vec![studio_library_entry(
+            "studio.forged",
+            "https://example.invalid/p.json",
+            &"0".repeat(64),
+        )],
+    );
+
+    let resp = super::studio_library::get_studio_library(State(state), dev_scope_headers("query:read"))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let detail = json_body(resp).await["detail"].as_str().unwrap_or_default().to_string();
+    assert!(
+        detail.contains("signature verification failed"),
+        "expected a signature-verification detail, got: {detail}"
+    );
+}
+
+#[tokio::test]
+async fn studio_library_lists_verified_entries_with_installed_join() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let curator_key = ed25519_dalek::SigningKey::from_bytes(&[0xb3; 32]);
+    let curator_fpr = "p_test_studio_curator";
+    add_test_key(&state, curator_fpr, hex::encode(curator_key.verifying_key().to_bytes())).await;
+
+    write_cached_studio_index(
+        &state.data_dir,
+        curator_fpr,
+        &curator_key,
+        vec![
+            studio_library_entry("studio.installed", "https://example.invalid/a.json", &"0".repeat(64)),
+            studio_library_entry("studio.notyet", "https://example.invalid/b.json", &"1".repeat(64)),
+        ],
+    );
+
+    // Simulate a prior install: a console fact carrying the provenance stamp.
+    {
+        let mut store = state.fact_store.write().await;
+        store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "console:tileboard:studio.installed".to_string(),
+            key: "doc".to_string(),
+            value: serde_json::json!({
+                "nodes": [],
+                "installed_from": {
+                    "library_id": "studio.installed",
+                    "version": "0.1.0",
+                    "pack_sha256": "a".repeat(64),
+                    "publisher_passport_fpr": "p_test_studio_pub",
+                    "installed_at_unix_ms": 1_700_000_000_001_u64
+                }
+            })
+            .to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+    }
+
+    let resp = super::studio_library::get_studio_library(State(state), dev_scope_headers("query:read"))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["schema"], "crux.studio.library_list.v1");
+    assert_eq!(body["curator_passport_fpr"], curator_fpr);
+    assert_eq!(body["updated_at_unix_ms"], 1_700_000_000_000_u64);
+    // The daemon never gates on the tier — it says so in the response.
+    assert_eq!(body["tier_enforcement"], "advisory");
+
+    let entries = body["entries"].as_array().expect("entries array");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["id"], "studio.installed");
+    assert_eq!(entries[0]["installed"], true);
+    assert_eq!(entries[0]["installed_version"], "0.1.0");
+    assert_eq!(
+        entries[0]["installed_entities"][0],
+        "console:tileboard:studio.installed"
+    );
+    // Curator metadata rides through unchanged for the console badges.
+    assert_eq!(entries[0]["kind"], "pack");
+    assert_eq!(entries[0]["required_tier"], "pro");
+    assert_eq!(entries[1]["id"], "studio.notyet");
+    assert_eq!(entries[1]["installed"], false);
+    assert!(entries[1]["installed_version"].is_null());
+}
+
+#[tokio::test]
+async fn studio_library_install_writes_console_facts_with_provenance() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let key = ed25519_dalek::SigningKey::from_bytes(&[0xb4; 32]);
+    let fpr = "p_test_studio_pub";
+    add_test_key(&state, fpr, hex::encode(key.verifying_key().to_bytes())).await;
+
+    let studio = studio_test_payload();
+    let pack = build_studio_pack("studio.ops", "0.1.0", fpr, &studio, Some(&key));
+    let pack_bytes = serde_json::to_vec(&pack).expect("pack bytes");
+    let pack_sha256 = sha256_hex_of(&pack_bytes);
+    let pack_url = serve_pack_once(pack_bytes);
+
+    let mut entry = studio_library_entry("studio.ops", &pack_url, &pack_sha256);
+    entry.publisher_passport_fpr = fpr.to_string();
+    write_cached_studio_index(&state.data_dir, fpr, &key, vec![entry]);
+
+    let resp = super::studio_library::post_studio_library_install(
+        State(state.clone()),
+        Path("studio.ops".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::studio_library::InstallFromLibraryBody { index_path: None }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = json_body(resp).await;
+    assert_eq!(body["schema"], "crux.studio.library_install.v1");
+    assert_eq!(body["library_id"], "studio.ops");
+    assert_eq!(body["pack_sha256"], pack_sha256);
+    assert_eq!(body["signed"], true);
+    // Tier is echoed for display only.
+    assert_eq!(body["required_tier"], "pro");
+    assert_eq!(body["tier_enforcement"], "advisory");
+    assert!(body["remaps"].as_array().expect("remaps").is_empty());
+
+    let written: Vec<String> = body["written"]
+        .as_array()
+        .expect("written")
+        .iter()
+        .map(|w| w["entity"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        written,
+        vec![
+            "console:tileboard:studio.ops".to_string(),
+            "console:tiledesign:latency-tile".to_string(),
+            "console:page:ops-overview".to_string(),
+            "console:workspace:ops".to_string(),
+        ]
+    );
+
+    // Every written fact carries the provenance stamp, and the values are the
+    // canonical key-sorted JSON the console itself writes.
+    let store = state.fact_store.read().await;
+    for entity in &written {
+        let fact = store
+            .get_by_entity(entity)
+            .into_iter()
+            .max_by_key(|f| f.version)
+            .expect("stored fact");
+        let value: serde_json::Value = serde_json::from_str(&fact.value).expect("fact value json");
+        let provenance = &value["installed_from"];
+        assert_eq!(provenance["library_id"], "studio.ops", "{entity}");
+        assert_eq!(provenance["version"], "0.1.0", "{entity}");
+        assert_eq!(provenance["pack_sha256"], pack_sha256, "{entity}");
+        assert_eq!(provenance["publisher_passport_fpr"], fpr, "{entity}");
+        assert!(provenance["installed_at_unix_ms"].as_u64().unwrap_or(0) > 0, "{entity}");
+        assert_eq!(
+            fact.value,
+            super::studio_pack::canonical_json_string(&value),
+            "{entity} value must be canonical key-sorted JSON"
+        );
+    }
+    drop(store);
+}
+
+#[tokio::test]
+async fn studio_library_install_remaps_collisions_and_never_overwrites() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let key = ed25519_dalek::SigningKey::from_bytes(&[0xb5; 32]);
+    let fpr = "p_test_studio_pub";
+    add_test_key(&state, fpr, hex::encode(key.verifying_key().to_bytes())).await;
+
+    // Pre-existing operator artifacts that the install MUST NOT touch.
+    {
+        let mut store = state.fact_store.write().await;
+        for (entity, key_name) in [
+            ("console:tileboard:studio.ops", "doc"),
+            ("console:page:ops-overview", "def"),
+        ] {
+            store.store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: entity.to_string(),
+                key: key_name.to_string(),
+                value: r#"{"mine":true}"#.to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            });
+        }
+    }
+
+    let studio = studio_test_payload();
+    let pack = build_studio_pack("studio.ops", "0.1.0", fpr, &studio, Some(&key));
+    let pack_bytes = serde_json::to_vec(&pack).expect("pack bytes");
+    let pack_sha256 = sha256_hex_of(&pack_bytes);
+    let pack_url = serve_pack_once(pack_bytes);
+
+    let mut entry = studio_library_entry("studio.ops", &pack_url, &pack_sha256);
+    entry.publisher_passport_fpr = fpr.to_string();
+    write_cached_studio_index(&state.data_dir, fpr, &key, vec![entry]);
+
+    let resp = super::studio_library::post_studio_library_install(
+        State(state.clone()),
+        Path("studio.ops".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::studio_library::InstallFromLibraryBody { index_path: None }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = json_body(resp).await;
+
+    let remaps = body["remaps"].as_array().expect("remaps");
+    assert_eq!(remaps.len(), 2, "board + page collided, workspace + design did not");
+    let written: Vec<String> = body["written"]
+        .as_array()
+        .expect("written")
+        .iter()
+        .map(|w| w["entity"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        written.contains(&"console:tileboard:studio.ops-2".to_string()),
+        "{written:?}"
+    );
+    assert!(
+        written.contains(&"console:page:ops-overview-2".to_string()),
+        "{written:?}"
+    );
+
+    let store = state.fact_store.read().await;
+    // The operator's originals are untouched (still the ONLY version, still theirs).
+    for entity in ["console:tileboard:studio.ops", "console:page:ops-overview"] {
+        let facts = store.get_by_entity(entity);
+        assert_eq!(facts.len(), 1, "{entity} must not have been rewritten");
+        assert_eq!(facts[0].value, r#"{"mine":true}"#, "{entity}");
+    }
+    // The installed workspace points at the REMAPPED page, not the operator's.
+    let workspace = store
+        .get_by_entity("console:workspace:ops")
+        .into_iter()
+        .max_by_key(|f| f.version)
+        .expect("workspace fact");
+    let value: serde_json::Value = serde_json::from_str(&workspace.value).expect("workspace json");
+    let pages = value["dests"][0]["pages"].as_array().expect("pages");
+    assert_eq!(pages[0], "ops-overview-2");
+    // A reference the pack does not carry (built-in `explorer`) is left alone.
+    assert_eq!(pages[1], "explorer");
+    drop(store);
+}
+
+#[tokio::test]
+async fn studio_library_install_rejects_sha256_mismatch_with_409() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let key = ed25519_dalek::SigningKey::from_bytes(&[0xb6; 32]);
+    let fpr = "p_test_studio_pub";
+    add_test_key(&state, fpr, hex::encode(key.verifying_key().to_bytes())).await;
+
+    let pack = build_studio_pack("studio.ops", "0.1.0", fpr, &studio_test_payload(), Some(&key));
+    let pack_url = serve_pack_once(serde_json::to_vec(&pack).expect("pack bytes"));
+
+    // The index pins a DIFFERENT sha than the bytes the URL serves.
+    let mut entry = studio_library_entry("studio.ops", &pack_url, &"c".repeat(64));
+    entry.publisher_passport_fpr = fpr.to_string();
+    write_cached_studio_index(&state.data_dir, fpr, &key, vec![entry]);
+
+    let resp = super::studio_library::post_studio_library_install(
+        State(state.clone()),
+        Path("studio.ops".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::studio_library::InstallFromLibraryBody { index_path: None }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let detail = json_body(resp).await["detail"].as_str().unwrap_or_default().to_string();
+    assert!(detail.contains("pack_sha256 mismatch"), "{detail}");
+
+    // Nothing was written.
+    let store = state.fact_store.read().await;
+    assert!(store.get_by_entity("console:tileboard:studio.ops").is_empty());
+    drop(store);
+}
+
+#[tokio::test]
+async fn studio_library_install_refuses_unsigned_pack_naming_the_env_var() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let key = ed25519_dalek::SigningKey::from_bytes(&[0xb7; 32]);
+    let fpr = "p_test_studio_pub";
+    add_test_key(&state, fpr, hex::encode(key.verifying_key().to_bytes())).await;
+
+    // Pack is well-formed and hash-bound, but carries NO signature.
+    let pack = build_studio_pack("studio.ops", "0.1.0", fpr, &studio_test_payload(), None);
+    let pack_bytes = serde_json::to_vec(&pack).expect("pack bytes");
+    let pack_sha256 = sha256_hex_of(&pack_bytes);
+    let pack_url = serve_pack_once(pack_bytes);
+
+    let mut entry = studio_library_entry("studio.ops", &pack_url, &pack_sha256);
+    entry.publisher_passport_fpr = fpr.to_string();
+    write_cached_studio_index(&state.data_dir, fpr, &key, vec![entry]);
+
+    let resp = super::studio_library::post_studio_library_install(
+        State(state.clone()),
+        Path("studio.ops".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::studio_library::InstallFromLibraryBody { index_path: None }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let detail = json_body(resp).await["detail"].as_str().unwrap_or_default().to_string();
+    assert!(detail.contains("unsigned"), "{detail}");
+    assert!(
+        detail.contains("CORECRUXD_STUDIO_ALLOW_UNSIGNED"),
+        "the 403 must name the dev bypass env var, got: {detail}"
+    );
+
+    let store = state.fact_store.read().await;
+    assert!(store.get_by_entity("console:tileboard:studio.ops").is_empty());
+    drop(store);
+}
+
+#[tokio::test]
+async fn studio_library_install_unknown_id_returns_404() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let key = ed25519_dalek::SigningKey::from_bytes(&[0xb8; 32]);
+    let fpr = "p_test_studio_curator_404";
+    add_test_key(&state, fpr, hex::encode(key.verifying_key().to_bytes())).await;
+    write_cached_studio_index(
+        &state.data_dir,
+        fpr,
+        &key,
+        vec![studio_library_entry(
+            "studio.present",
+            "https://example.invalid/p.json",
+            &"0".repeat(64),
+        )],
+    );
+
+    let resp = super::studio_library::post_studio_library_install(
+        State(state),
+        Path("studio.missing".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::studio_library::InstallFromLibraryBody { index_path: None }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let detail = json_body(resp).await["detail"].as_str().unwrap_or_default().to_string();
+    assert!(detail.contains("not found in the Studio library index"), "{detail}");
+}
+
+#[tokio::test]
+async fn studio_library_install_requires_write_scope() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::studio_library::post_studio_library_install(
+        State(state),
+        Path("studio.ops".to_string()),
+        dev_scope_headers("query:read"),
+        Json(super::studio_library::InstallFromLibraryBody { index_path: None }),
+    )
+    .await
+    .into_response();
+    assert!(
+        resp.status() == StatusCode::UNAUTHORIZED || resp.status() == StatusCode::FORBIDDEN,
+        "a read-only scope must not authorize an install, got {}",
+        resp.status()
+    );
+}

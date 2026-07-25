@@ -136,11 +136,24 @@ pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContra
         ));
     }
 
-    // Studio board packs (console-surfaces-remediation M15). Read class: both
-    // routes are pure transforms/validators over a client-supplied payload
-    // (build = hash + optional sign; verify = schema/hash/signature verdict).
-    // Neither mutates the fact store; the apply step reuses the gated
-    // /v1/console/facts/add write route.
+    // Studio template library install (crux-integrations-and-template-library
+    // L2). This is the ONE /v1/studio/ route that mutates: it writes the
+    // installed pack's board / designs / workspaces / pages as console facts,
+    // so it must be write-class and must NOT be swept into the read-class
+    // prefix rule below (a read token must never authorize an install).
+    if method == "POST" && path.starts_with("/v1/studio/library/") {
+        return Some(RouteAuthContract::new(
+            RouteAuthClass::Write,
+            &["facts:write", "admin:write"],
+        ));
+    }
+
+    // Studio board packs (console-surfaces-remediation M15) + the read-only
+    // library browse. Read class: the pack routes are pure transforms /
+    // validators over a client-supplied payload (build = hash + optional sign;
+    // verify = schema/hash/signature verdict) and `GET /v1/studio/library`
+    // reads the verified cached index. None of them mutates the fact store;
+    // the console apply step reuses the gated /v1/console/facts/add write route.
     if path.starts_with("/v1/studio/") {
         return Some(RouteAuthContract::new(
             RouteAuthClass::Read,

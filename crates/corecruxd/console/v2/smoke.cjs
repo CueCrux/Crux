@@ -459,7 +459,11 @@ function extractThemeVars(theme) {
     ['POST', '/v1/extensions/{id}/grants'],
     ['DELETE', '/v1/extensions/{id}/grants/{passport_fpr}'],
     ['DELETE', '/v1/extensions/keys/{passport_fpr}'],
-    ['POST', '/v1/extensions/{id}/tools/{tool_name}/invoke']
+    ['POST', '/v1/extensions/{id}/tools/{tool_name}/invoke'],
+    // crux-integrations-and-template-library L2: the ONE mutating /v1/studio/
+    // route — install a signed catalog entry as fresh console facts (write-
+    // class in route_auth; provenance + collision remap daemon-side).
+    ['POST', '/v1/studio/library/{id}/install']
   ];
   // Parse the machine-readable GATED_MUTATIONS array and assert set-equality.
   const arrM = apiSrc.match(/const GATED_MUTATIONS = Object\.freeze\(\[([\s\S]*?)\]\);/);

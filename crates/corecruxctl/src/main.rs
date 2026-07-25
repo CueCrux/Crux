@@ -21,7 +21,7 @@ use corecruxctl::{
     deploy_audit, evidence, explain, export, extensions, fixture_digest, gaps, hooks, identity_cli, incident, ingest,
     inspect_receipt, learn, login, machine, memory, memory_pack, observe_ingest, openclaw, output_verify, parity,
     projections, receipts, reconcile, replay, repo, session_sync, shard, shardmap, smoke, snapshot, stage1_import,
-    start, storage, structured_log, tooling_env, verify_store,
+    start, storage, structured_log, studio, tooling_env, verify_store,
 };
 
 #[derive(Debug, Parser)]
@@ -575,6 +575,15 @@ enum Command {
     Extensions {
         #[command(subcommand)]
         command: ExtensionsCommand,
+    },
+
+    /// Central Studio template library — sync + browse + install boards, tile
+    /// designs, workspaces, and full packs from a curator-signed catalog
+    /// (L1/L2 of crux-integrations-and-template-library-2026-07-25).
+    #[command(name = "studio")]
+    Studio {
+        #[command(subcommand)]
+        command: StudioCommand,
     },
 
     /// Readable / editable memory panel (agent-ux-01). Operates against the
@@ -1377,6 +1386,52 @@ enum ExtensionsCommand {
         /// Daemon-side index override. Relative paths resolve under the
         /// daemon's data dir; absolute paths are taken as-is. Defaults to
         /// `<data-dir>/extensions/registry/index.json`.
+        #[arg(long)]
+        index_path: Option<PathBuf>,
+        /// Daemon HTTP base URL (defaults to CORECRUXD_HTTP_URL or localhost).
+        #[arg(long)]
+        http_url: Option<String>,
+        /// Bearer token (defaults to CRUX_AGENT_TOKEN).
+        #[arg(long)]
+        token: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum StudioCommand {
+    /// Download the curator-signed Studio library index, verify its signature
+    /// against the supplied curator public key, and cache the verified bytes
+    /// under `<data-dir>/studio/library/index.json`.
+    Sync {
+        /// HTTPS URL of the library index.
+        #[arg(long)]
+        url: String,
+        /// Curator passport fingerprint (the `passport_fpr` on the signed index).
+        #[arg(long)]
+        pubkey_fpr: String,
+        /// Curator public key, hex-encoded (64 lowercase chars).
+        #[arg(long)]
+        pubkey_hex: String,
+        /// Daemon data directory; the cache lands at
+        /// `<data-dir>/studio/library/index.json`.
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Pretty-print the cached library from
+    /// `<data-dir>/studio/library/index.json`. Run `sync` first.
+    ListLibrary {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Install one template by id from the daemon's verified cached library
+    /// index (`POST /v1/studio/library/{id}/install`). Run `sync`, then
+    /// `list-library` to review the entry, before installing.
+    Install {
+        /// Library id exactly as published in the index.
+        id: String,
+        /// Daemon-side index override. Relative paths resolve under the
+        /// daemon's data dir; absolute paths are taken as-is. Defaults to
+        /// `<data-dir>/studio/library/index.json`.
         #[arg(long)]
         index_path: Option<PathBuf>,
         /// Daemon HTTP base URL (defaults to CORECRUXD_HTTP_URL or localhost).
@@ -4099,6 +4154,107 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     body["installed"]["trust_tier"].as_str().unwrap_or("-")
                 );
                 println!("  grants:          none yet — POST /v1/extensions/{id}/grants to scope a passport");
+                Ok(())
+            }
+        },
+
+        // ── Central Studio template library (L1/L2) ─────────────────
+        Command::Studio { command } => match command {
+            StudioCommand::Sync {
+                url,
+                pubkey_fpr,
+                pubkey_hex,
+                data_dir,
+            } => {
+                let index = studio::sync(&url, &pubkey_fpr, &pubkey_hex, &data_dir)?;
+                println!("Verified Studio library index from {url}");
+                println!("  curator:        {}", index.curator_passport_fpr);
+                println!("  updated_at_ms:  {}", index.updated_at_unix_ms);
+                println!("  entries:        {}", index.entries.len());
+                println!("  cached at:      {}", studio::cached_index_path(&data_dir).display());
+                for entry in &index.entries {
+                    println!(
+                        "  - {:<32} v{:<10} {:<10} {}",
+                        entry.id,
+                        entry.version,
+                        entry.kind.as_str(),
+                        entry.required_tier_str().unwrap_or("-")
+                    );
+                }
+                Ok(())
+            }
+            StudioCommand::ListLibrary { data_dir } => {
+                let index = studio::list_library(&data_dir)?;
+                let path = studio::cached_index_path(&data_dir);
+                println!("Cached Studio library: {}", path.display());
+                println!("  curator:        {}", index.curator_passport_fpr);
+                println!("  updated_at_ms:  {}", index.updated_at_unix_ms);
+                println!("  entries:        {}", index.entries.len());
+                println!();
+                for entry in &index.entries {
+                    println!("• {} (v{})", entry.name, entry.version);
+                    println!("    id:            {}", entry.id);
+                    println!("    kind:          {}", entry.kind.as_str());
+                    println!("    publisher:     {}", entry.publisher_passport_fpr);
+                    println!("    summary:       {}", entry.summary);
+                    if !entry.tags.is_empty() {
+                        println!("    tags:          {}", entry.tags.join(", "));
+                    }
+                    // Advisory only: the catalog server enforces tiers, the daemon does not.
+                    println!(
+                        "    required_tier: {} (advisory — enforced by the catalog server, not the daemon)",
+                        entry.required_tier_str().unwrap_or("none")
+                    );
+                    if let Some(preview) = &entry.preview {
+                        println!("    preview:       {preview}");
+                    }
+                    if let Some(repo) = &entry.repo_url {
+                        println!("    repo:          {repo}");
+                    }
+                    println!("    pack_url:      {}", entry.pack_url);
+                    println!("    pack_sha256:   {}", entry.pack_sha256);
+                    println!();
+                }
+                Ok(())
+            }
+            StudioCommand::Install {
+                id,
+                index_path,
+                http_url,
+                token,
+            } => {
+                let body = studio::install(&studio::InstallArgs {
+                    id: id.clone(),
+                    http_url,
+                    token,
+                    index_path,
+                })?;
+                println!("Installed {id} from the cached Studio library index.");
+                println!("  schema:          {}", body["schema"].as_str().unwrap_or("-"));
+                println!("  version:         {}", body["version"].as_str().unwrap_or("-"));
+                println!("  pack_sha256:     {}", body["pack_sha256"].as_str().unwrap_or("-"));
+                println!("  signed:          {}", body["signed"].as_bool().unwrap_or(false));
+                println!(
+                    "  required_tier:   {} ({})",
+                    body["required_tier"].as_str().unwrap_or("none"),
+                    body["tier_enforcement"].as_str().unwrap_or("advisory")
+                );
+                for written in body["written"].as_array().unwrap_or(&Vec::new()) {
+                    println!(
+                        "  + {} {} (key {})",
+                        written["artifact"].as_str().unwrap_or("?"),
+                        written["entity"].as_str().unwrap_or("?"),
+                        written["key"].as_str().unwrap_or("?")
+                    );
+                }
+                for remap in body["remaps"].as_array().unwrap_or(&Vec::new()) {
+                    println!(
+                        "  ~ {} id remapped {} -> {} (existing artifact preserved)",
+                        remap["artifact"].as_str().unwrap_or("?"),
+                        remap["from"].as_str().unwrap_or("?"),
+                        remap["to"].as_str().unwrap_or("?")
+                    );
+                }
                 Ok(())
             }
         },

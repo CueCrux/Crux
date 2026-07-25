@@ -418,6 +418,8 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/shard-map", methods: &["GET"], tag: "Routing", auth: "admin-read", summary: "Shard map" },
     RouteEntry { path: "/v1/shards", methods: &["GET"], tag: "Routing", auth: "admin-read", summary: "Shards" },
     RouteEntry { path: "/v1/status-feed", methods: &["GET"], tag: "StatusFeed", auth: "read", summary: "Status feed" },
+    RouteEntry { path: "/v1/studio/library", methods: &["GET"], tag: "Studio", auth: "read", summary: "Browse the verified cached Studio template library (curator-signed index + installed join)" },
+    RouteEntry { path: "/v1/studio/library/{id}/install", methods: &["POST"], tag: "Studio", auth: "write", summary: "Install one Studio template from the verified library index (sha256-pinned, require-signed)" },
     RouteEntry { path: "/v1/studio/pack/build", methods: &["POST"], tag: "Studio", auth: "read", summary: "Build a Studio board pack (curated read POST; hashes + optional sign)" },
     RouteEntry { path: "/v1/studio/pack/verify", methods: &["POST"], tag: "Studio", auth: "read", summary: "Verify an uploaded Studio board pack (curated read POST; schema/hash/signature)" },
     RouteEntry { path: "/v1/sync/handshake/nonce", methods: &["POST"], tag: "Sync", auth: "public", summary: "Issue sync peer handshake nonce" },

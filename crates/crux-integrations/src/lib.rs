@@ -11,8 +11,12 @@
 
 pub mod c2pa_signer_selector;
 pub mod signing;
+pub mod studio_index;
 
 pub use signing::{fingerprint_from_public_key, sign_manifest, TrustedKeyEntry, TrustedKeyring};
+pub use studio_index::{
+    RcxTier, StudioEntryKind, StudioLibraryEntry, StudioLibraryIndex, STUDIO_LIBRARY_INDEX_SCHEMA_V1,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};

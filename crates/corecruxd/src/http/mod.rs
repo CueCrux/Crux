@@ -80,6 +80,7 @@ mod routing;
 pub mod session;
 mod storybook;
 mod stream_receipts;
+mod studio_library;
 mod studio_pack;
 mod sync;
 mod witness;
@@ -669,6 +670,16 @@ pub(crate) fn router_with_route_auth(
         .route(
             "/v1/studio/pack/verify",
             axum::routing::post(self::studio_pack::post_verify_pack),
+        )
+        // crux-integrations-and-template-library L2: the CENTRAL Studio
+        // template library. Read-only browse over the verified cached
+        // curator-signed index (populated by `corecruxctl studio sync`), plus
+        // the operator-gated install that writes console facts. Static
+        // `library` segment, so it never shadows `/v1/studio/pack/*`.
+        .route("/v1/studio/library", get(self::studio_library::get_studio_library))
+        .route(
+            "/v1/studio/library/{id}/install",
+            axum::routing::post(self::studio_library::post_studio_library_install),
         )
         // Memory primitives (Phase 1.5)
         .route("/v1/facts", axum::routing::put(self::facts::put_fact))

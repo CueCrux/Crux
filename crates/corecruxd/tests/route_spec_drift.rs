@@ -92,6 +92,17 @@ fn manifest_dir() -> PathBuf {
 //   * integrations_github.rs::post_sync       — POST /v1/integrations/github/sync              (no body; blocking sync of selected repos into the fact store; scope integrations:install) [mod.rs:1276]
 //   * integrations_openai.rs::post_connect    — POST /v1/integrations/openai/connect           (ConnectOpenAiBody {api_key,organization_id?,default_model?,skip_verify}; scope integrations:install) [mod.rs:1305]
 //   * integrations_openai.rs::post_disconnect — POST /v1/integrations/openai/disconnect        (no body; deletes the sealed key; scope integrations:disable) [mod.rs:1309]
+//
+// crux-integrations-and-template-library L2 — the CENTRAL Studio template library.
+// Browsing is a plain GET (flows from the manifest into `CruxApi`); installing is a
+// mutation and therefore lands here. Grounded against the handler:
+//   * studio_library.rs::post_studio_library_install — POST /v1/studio/library/{id}/install
+//     (InstallFromLibraryBody {index_path?}; scopes admin:read+facts:write; route_auth
+//     Write class with facts:write/admin:write. Re-verifies the curator-signed cached
+//     index, pins entry.pack_sha256 over the fetched pack, requires a pack signature that
+//     validates against the operator TrustedKeyring — 403 naming CORECRUXD_STUDIO_ALLOW_UNSIGNED
+//     otherwise — then writes console:tileboard: / console:tiledesign: / console:workspace: /
+//     console:page: facts, remapping every colliding id so an install can only ever add.)
 const GATED_MUTATIONS: &[(&str, &str, &str)] = &[
     ("POST", "/v1/work/gate/{actionId}/approve", "gateApprove"),
     ("POST", "/v1/work/gate/{actionId}/reject", "gateReject"),
@@ -183,6 +194,8 @@ const GATED_MUTATIONS: &[(&str, &str, &str)] = &[
         "/v1/extensions/{id}/tools/{tool_name}/invoke",
         "extensionInvoke",
     ),
+    // ── L2: central Studio template library — install one signed template ──
+    ("POST", "/v1/studio/library/{id}/install", "studioLibraryInstall"),
 ];
 
 // ── Curated read-POST allowlist (unified-shell-console M11) ───────────────────

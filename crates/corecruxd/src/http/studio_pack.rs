@@ -31,9 +31,17 @@
 //!   preview (tile count / kinds / capabilities) so the console can gate the
 //!   apply step.
 //!
-//! The *apply* step (writing the imported board + designs back into the fact
-//! store) reuses the existing operator-gated `POST /v1/console/facts/add`
-//! route — this module never writes.
+//! The *apply* step for a console-uploaded pack (writing the imported board +
+//! designs back into the fact store) reuses the existing operator-gated
+//! `POST /v1/console/facts/add` route — these two routes never write.
+//!
+//! The pack CHECKS themselves are reusable: [`evaluate_pack`] is the single
+//! implementation of "is this pack well-formed, integrity-bound, and signed by
+//! a key this operator trusts", and [`sibling http::studio_library`] runs it
+//! under a **require-signed** policy ([`PackEvaluation::signed`]) before it
+//! writes anything from the central template library. `/verify` keeps its
+//! permissive verdict-reporting contract: it *reports* `unsigned`, it does not
+//! refuse it.
 
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
@@ -42,7 +50,7 @@ use serde_json::{Map, Value};
 use super::{problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, State, StatusCode};
 use crux_integrations::{
     sign_manifest, DataAccess, EntryKind, IntegrationEntry, IntegrationManifest, ManifestHashes, NetworkAccess,
-    SafetyPolicy, INTEGRATION_SCHEMA_V1,
+    SafetyPolicy, ValidationPolicy, INTEGRATION_SCHEMA_V1,
 };
 
 /// Schema stamp on the studio payload embedded in a pack.
@@ -241,6 +249,9 @@ struct VerifyPackResponse {
     manifest_hash_ok: bool,
     bundle_hash_ok: bool,
     signature: SignatureVerdict,
+    /// Additive convenience mirror of `signature.verdict == "valid"` — the one
+    /// bit the require-signed install path in `studio_library.rs` gates on.
+    signed: bool,
     manifest: Value,
     capabilities: Vec<String>,
     studio: StudioPreview,
@@ -248,50 +259,91 @@ struct VerifyPackResponse {
     errors: Vec<String>,
 }
 
-/// `POST /v1/studio/pack/verify` — validate an uploaded pack; never writes.
-pub(super) async fn post_verify_pack(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<VerifyPackBody>,
-) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["query:read"]) {
-        return problem.into_response();
+/// Everything the pack checks concluded. One implementation, two callers:
+/// `/v1/studio/pack/verify` (reports it) and
+/// `http::studio_library::post_studio_library_install` (gates on it).
+pub(crate) struct PackEvaluation {
+    /// `Some` when the pack object is not a decodable `crux.integration.v1`
+    /// manifest at all — every other field is then at its rejecting default.
+    pub decode_error: Option<String>,
+    pub manifest: Option<IntegrationManifest>,
+    /// The `studio` key of the pack (`Value::Null` when absent).
+    pub studio: Value,
+    pub schema_ok: bool,
+    pub manifest_hash_ok: bool,
+    pub bundle_hash_ok: bool,
+    pub studio_schema_ok: bool,
+    pub signature_present: bool,
+    /// `"valid"` | `"unsigned"` | `"invalid"`.
+    pub signature_verdict: &'static str,
+    pub signature_error: String,
+    pub errors: Vec<String>,
+}
+
+impl PackEvaluation {
+    /// Integrity + schema all green and the signature is not actively bad.
+    /// NOTE: an UNSIGNED pack can be `ok()` — that is the `/verify` route's
+    /// long-standing contract (it reports the verdict; it does not enforce a
+    /// signing policy). Callers that must not install unsigned content gate on
+    /// [`Self::signed`] as well; see `studio_library.rs`.
+    pub fn ok(&self) -> bool {
+        self.decode_error.is_none()
+            && self.schema_ok
+            && self.manifest_hash_ok
+            && self.bundle_hash_ok
+            && self.studio_schema_ok
+            && self.signature_verdict != "invalid"
     }
 
-    let Some(obj) = body.pack.as_object() else {
-        return problem_response(StatusCode::BAD_REQUEST, "pack must be a JSON object");
+    /// The REQUIRE-SIGNED bit: the pack carries an Ed25519 signature that
+    /// validated against this operator's [`crux_integrations::TrustedKeyring`].
+    pub fn signed(&self) -> bool {
+        self.signature_verdict == "valid"
+    }
+
+    fn rejected(reason: String) -> Self {
+        Self {
+            decode_error: Some(reason.clone()),
+            manifest: None,
+            studio: Value::Null,
+            schema_ok: false,
+            manifest_hash_ok: false,
+            bundle_hash_ok: false,
+            studio_schema_ok: false,
+            signature_present: false,
+            signature_verdict: "unsigned",
+            signature_error: String::new(),
+            errors: vec![reason],
+        }
+    }
+}
+
+/// Run every pack check: manifest decode, `crux.integration.v1` schema,
+/// `hashes.manifest`, `hashes.bundle` over the canonical studio payload,
+/// `crux.studio.v1` schema, and the Ed25519 signature against the operator
+/// keyring.
+///
+/// `policy` is a closure so the (fallible, file-reading) trusted-keyring load
+/// happens ONLY when the pack actually carries a signature — preserving the
+/// original `/verify` behaviour where an unsigned pack never touches the
+/// keyring. `Err` means the keyring itself could not be read (a 500, not a
+/// verdict about the pack).
+pub(crate) fn evaluate_pack<F>(pack: &Value, policy: F) -> Result<PackEvaluation, String>
+where
+    F: FnOnce() -> Result<ValidationPolicy, String>,
+{
+    let Some(obj) = pack.as_object() else {
+        return Ok(PackEvaluation::rejected("pack must be a JSON object".to_string()));
     };
     let studio = obj.get("studio").cloned().unwrap_or(Value::Null);
 
     // Deserialize the manifest portion (the extra `studio` key is ignored).
-    let manifest: IntegrationManifest = match serde_json::from_value(body.pack.clone()) {
+    let manifest: IntegrationManifest = match serde_json::from_value(pack.clone()) {
         Ok(m) => m,
         Err(err) => {
-            return (
-                StatusCode::OK,
-                Json(VerifyPackResponse {
-                    ok: false,
-                    schema_ok: false,
-                    manifest_hash_ok: false,
-                    bundle_hash_ok: false,
-                    signature: SignatureVerdict {
-                        present: false,
-                        verdict: "unsigned".to_string(),
-                        error: String::new(),
-                    },
-                    manifest: Value::Null,
-                    capabilities: Vec::new(),
-                    studio: StudioPreview {
-                        schema_ok: false,
-                        tile_count: 0,
-                        kinds: Vec::new(),
-                        board_title: String::new(),
-                        design_count: 0,
-                    },
-                    errors: vec![format!("not a valid crux.integration.v1 manifest: {err}")],
-                }),
-            )
-                .into_response();
+            let mut rejected = PackEvaluation::rejected(format!("not a valid crux.integration.v1 manifest: {err}"));
+            rejected.studio = studio;
+            return Ok(rejected);
         }
     };
 
@@ -339,33 +391,16 @@ pub(super) async fn post_verify_pack(
     };
 
     // Signature verdict — verbatim. Validate against the operator keyring.
-    let signature = if manifest.signature.is_none() {
-        SignatureVerdict {
-            present: false,
-            verdict: "unsigned".to_string(),
-            error: String::new(),
-        }
+    let (signature_present, signature_verdict, signature_error) = if manifest.signature.is_none() {
+        (false, "unsigned", String::new())
     } else {
-        let policy = match crate::extension_registry::build_policy(&state.data_dir) {
-            Ok(p) => p,
-            Err(err) => {
-                return problem_response(StatusCode::INTERNAL_SERVER_ERROR, format!("keyring read failed: {err}"));
-            }
-        };
+        let policy = policy()?;
         match manifest.validate(&policy) {
-            Ok(()) => SignatureVerdict {
-                present: true,
-                verdict: "valid".to_string(),
-                error: String::new(),
-            },
+            Ok(()) => (true, "valid", String::new()),
             Err(err) => {
                 let msg = err.to_string();
                 errors.push(format!("signature/validation: {msg}"));
-                SignatureVerdict {
-                    present: true,
-                    verdict: "invalid".to_string(),
-                    error: msg,
-                }
+                (true, "invalid", msg)
             }
         }
     };
@@ -374,34 +409,86 @@ pub(super) async fn post_verify_pack(
     if !studio_schema_ok {
         errors.push(format!("studio.schema must be '{STUDIO_SCHEMA_V1}'"));
     }
+
+    Ok(PackEvaluation {
+        decode_error: None,
+        manifest: Some(manifest),
+        studio,
+        schema_ok,
+        manifest_hash_ok,
+        bundle_hash_ok,
+        studio_schema_ok,
+        signature_present,
+        signature_verdict,
+        signature_error,
+        errors,
+    })
+}
+
+/// `POST /v1/studio/pack/verify` — validate an uploaded pack; never writes.
+pub(super) async fn post_verify_pack(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<VerifyPackBody>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["query:read"]) {
+        return problem.into_response();
+    }
+    if !body.pack.is_object() {
+        return problem_response(StatusCode::BAD_REQUEST, "pack must be a JSON object");
+    }
+
+    let data_dir = state.data_dir.clone();
+    let evaluation = match evaluate_pack(&body.pack, || {
+        crate::extension_registry::build_policy(&data_dir).map_err(|err| format!("keyring read failed: {err}"))
+    }) {
+        Ok(evaluation) => evaluation,
+        Err(err) => return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+
     let preview = StudioPreview {
-        schema_ok: studio_schema_ok,
-        tile_count: tile_count(&studio),
-        kinds: tile_kinds(&studio),
-        board_title: studio
+        schema_ok: evaluation.studio_schema_ok,
+        tile_count: tile_count(&evaluation.studio),
+        kinds: tile_kinds(&evaluation.studio),
+        board_title: evaluation
+            .studio
             .get("settings")
             .and_then(|s| s.get("title"))
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
-        design_count: studio.get("designs").and_then(Value::as_array).map_or(0, Vec::len),
+        design_count: evaluation
+            .studio
+            .get("designs")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len),
     };
 
-    let ok = schema_ok && manifest_hash_ok && bundle_hash_ok && studio_schema_ok && signature.verdict != "invalid";
+    let (manifest_value, capabilities) = match &evaluation.manifest {
+        Some(manifest) => (
+            serde_json::to_value(manifest).unwrap_or(Value::Null),
+            manifest.capabilities.clone(),
+        ),
+        None => (Value::Null, Vec::new()),
+    };
 
-    let manifest_value = serde_json::to_value(&manifest).unwrap_or(Value::Null);
     (
         StatusCode::OK,
         Json(VerifyPackResponse {
-            ok,
-            schema_ok,
-            manifest_hash_ok,
-            bundle_hash_ok,
-            signature,
+            ok: evaluation.ok(),
+            schema_ok: evaluation.schema_ok,
+            manifest_hash_ok: evaluation.manifest_hash_ok,
+            bundle_hash_ok: evaluation.bundle_hash_ok,
+            signature: SignatureVerdict {
+                present: evaluation.signature_present,
+                verdict: evaluation.signature_verdict.to_string(),
+                error: evaluation.signature_error.clone(),
+            },
+            signed: evaluation.signed(),
             manifest: manifest_value,
-            capabilities: manifest.capabilities.clone(),
+            capabilities,
             studio: preview,
-            errors,
+            errors: evaluation.errors,
         }),
     )
         .into_response()
@@ -422,6 +509,15 @@ fn blake3_hash(bytes: &[u8]) -> String {
 /// here is what makes the export→import bundle-hash match.
 fn canonical_bytes(value: &Value) -> Vec<u8> {
     serde_json::to_vec(&canonicalize(value)).unwrap_or_default()
+}
+
+/// Canonical (deeply key-sorted, whitespace-free) JSON **string** — the exact
+/// byte form the console's `cwsCanonical()` produces for
+/// `console:workspace:` / `console:page:` / `console:tiledesign:` fact values
+/// (`console/v2/render.js`). The library installer writes through this so an
+/// installed artifact is byte-identical to one the Studio would have saved.
+pub(crate) fn canonical_json_string(value: &Value) -> String {
+    serde_json::to_string(&canonicalize(value)).unwrap_or_else(|_| "{}".to_string())
 }
 
 fn canonicalize(value: &Value) -> Value {
