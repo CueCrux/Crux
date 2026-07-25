@@ -4939,6 +4939,331 @@ function extractThemeVars(theme) {
   notes.push('studio integrations (I1+I2): Studio › Integrations is the one actionable integrations home — four sections (connectors · packs · extensions+catalog · keys) over 15 gated methods, every call site inside operatorGatedCall with no raw fetch and no direct gated client; connector secrets are password-type and cleared on submit; the previously-inert Invoke is wired (verbatim result) and the board tile routes to it; the catalog renders a per-entry safety scorecard built from index provenance plus the installed manifest, with honest un-synced (names `corecruxctl extensions sync`), verified-empty and absent-route states; cx-projects/cx-integrations/cx-extensions link through and their CONTROL_DIFF rows say so.');
 })();
 
+// =========================================================================
+//  Check 58 — (crux-integrations-and-template-library L1+L2) Studio › Library.
+//  The Studio's FOURTH section: the curator-signed central template library.
+//  Registered in the segmented control + dispatch; painted from ONE read whose
+//  honest states are distinct (verified index · un-synced 404 naming
+//  `corecruxctl studio sync` · 403 signature failure · verified-but-empty); the
+//  install is the ONE mutation and it routes through the same
+//  operatorGatedCall choke as every other Studio write; tier chips say plainly
+//  that enforcement is advisory/server-side; artifact provenance is chipped
+//  wherever boards / designs / workspaces / pages are listed; and a MANUAL pack
+//  import stamps its own `imported_from` (never the daemon's `installed_from`).
+// =========================================================================
+(function checkStudioLibrary() {
+  // Minimal mock DOM — same idiom as Check 57.
+  function mkNode(tag) {
+    const n = { tagName: String(tag).toUpperCase(), nodeType: 1, childNodes: [], _attrs: {}, className: '',
+      setAttribute: function (k, v) { this._attrs[k] = String(v); if (k === 'class') { this.className = String(v); } },
+      getAttribute: function (k) { return Object.prototype.hasOwnProperty.call(this._attrs, k) ? this._attrs[k] : null; },
+      appendChild: function (c) { this.childNodes.push(c); c.parentNode = this; return c; },
+      removeChild: function (c) { const i = this.childNodes.indexOf(c); if (i >= 0) { this.childNodes.splice(i, 1); } return c; },
+      addEventListener: function () {} };
+    Object.defineProperty(n, 'textContent', { get: function () { return this._t || ''; }, set: function (v) { this._t = String(v); this.childNodes.length = 0; } });
+    return n;
+  }
+  function mkDoc() { return { createElement: mkNode, createTextNode: function (v) { return { nodeType: 3, textContent: String(v), childNodes: [] }; } }; }
+  function collect(n, out) { out = out || []; (n.childNodes || []).forEach(function (c) { if (c && c.nodeType === 1) { out.push(c); collect(c, out); } }); return out; }
+  function hasClass(n, c) { return String(n.className || '').split(/\s+/).indexOf(c) >= 0; }
+  function textOf(nodes) { return nodes.map(function (n) { return n.textContent || ''; }).join('|'); }
+  function withDom(posture, fn) {
+    const savedDoc = global.document, savedWin = global.window;
+    global.document = mkDoc();
+    global.window = { CRUX_POSTURE: posture, CruxApi: { get: function () { return new Promise(function () {}); } } };
+    try { return fn(); }
+    finally {
+      if (savedDoc === undefined) { delete global.document; } else { global.document = savedDoc; }
+      if (savedWin === undefined) { delete global.window; } else { global.window = savedWin; }
+    }
+  }
+
+  // ---- (a) the fourth section is registered -------------------------------
+  check(/\[\['board', 'Board'\], \['pages', 'Pages'\], \['integrations', 'Integrations'\], \['library', 'Library'\]\]/.test(renderSrc),
+    '[library] the Studio segmented control must carry a fourth Library section');
+  check(/ctx\.sub === 'library' \? 'library'/.test(renderSrc),
+    '[library] ?sub=library must resolve to the library section (deep-linkable)');
+  check(/if \(studioSub === 'library'\) \{ return renderLibraryStudio\(body, ctx\); \}/.test(renderSrc),
+    '[library] renderCanvas must dispatch the library section to renderLibraryStudio');
+  check(JSON.stringify(render.CLIB_KINDS || []) === JSON.stringify(['board', 'design', 'workspace', 'pack']),
+    '[library] render.js must declare the four catalog kinds in the daemon\'s order');
+
+  // ---- (b) paint the verified index over a fixture ------------------------
+  // Two entries: one workspace already installed at an OLDER version under the
+  // advisory "pro" tier, one free board that is not installed.
+  const INSTALLED = {
+    id: 'studio.ops-overview', kind: 'workspace', name: 'Ops overview', version: '1.2.0',
+    summary: 'Retrieval latency + receipt freshness for an ops on-call.',
+    publisher_passport_fpr: 'p_publisher_9f2c41ab77', tags: ['ops', 'latency'], required_tier: 'pro',
+    pack_url: 'https://packs.example.test/ops-overview-1.2.0.json',
+    pack_sha256: 'aa11bb22cc33dd44ee55', repo_url: 'https://example.test/ops-overview',
+    preview: '12 tiles: retrieval latency, receipt freshness, lane weights',
+    installed: true, installed_version: '1.1.0',
+    installed_entities: ['console:workspace:ops-overview', 'console:page:ops-latency'],
+    installed_at_unix_ms: 1753400000000
+  };
+  const FREE = {
+    id: 'studio.latency-board', kind: 'board', name: 'Latency board', version: '0.3.0',
+    summary: 'A single tile board for p50/p95 lane latency.',
+    publisher_passport_fpr: 'p_publisher_9f2c41ab77', tags: ['latency'],
+    pack_url: 'https://packs.example.test/latency-0.3.0.json', pack_sha256: 'ff99ee88dd77cc66',
+    installed: false, installed_version: null, installed_entities: [], installed_at_unix_ms: null
+  };
+  const INDEX_OK = { ok: true, status: 200, data: {
+    schema: 'crux.studio.library_list.v1', curator_passport_fpr: 'p_curator_5150aa',
+    updated_at_unix_ms: 1753390000000, tier_enforcement: 'advisory', entries: [INSTALLED, FREE]
+  } };
+  withDom('operator', function () {
+    const host = mkNode('div');
+    try { render.clibPaintIndex(host, INDEX_OK, function () {}); }
+    catch (e) { check(false, '[library] clibPaintIndex threw on the verified-index fixture: ' + (e && e.stack || e)); return; }
+    const nodes = collect(host);
+    const text = textOf(nodes);
+    // header card
+    check(text.indexOf('p_curator_5150aa') >= 0, '[library] the header must name the curator passport fpr');
+    check(/advisory/.test(text) && /catalog server enforces required_tier/.test(text),
+      '[library] the header must state tier_enforcement: advisory in plain words');
+    check(text.indexOf('corecruxctl studio sync') >= 0,
+      '[library] the header must name `corecruxctl studio sync` as the refresh path (there is no fetch route to button)');
+    check(nodes.some(function (n) { return hasClass(n, 'clib-syncnote'); }) &&
+      !nodes.some(function (n) { return /Refresh/.test(n.textContent || '') && n.tagName === 'BUTTON'; }),
+      '[library] the surface must NOT offer a refresh button the daemon cannot serve');
+    // one card per entry, grouped by kind in the declared order
+    const cards = nodes.filter(function (n) { return hasClass(n, 'clib-card'); });
+    check(cards.length === 2, '[library] the catalog must paint one card per entry (got ' + cards.length + ')');
+    const groups = nodes.filter(function (n) { return hasClass(n, 'clib-group'); }).map(function (n) { return n.getAttribute('data-group'); });
+    check(JSON.stringify(groups) === JSON.stringify(['board', 'workspace']),
+      '[library] entries must be GROUPED by kind in the declared order (got ' + JSON.stringify(groups) + ')');
+    check(JSON.stringify(cards.map(function (c) { return c.getAttribute('data-kind'); })) === JSON.stringify(['board', 'workspace']),
+      '[library] each card must declare its kind');
+    // tier chips: absent required_tier reads Free; "pro" is marked distinctly and
+    // every chip says the enforcement is advisory.
+    const tiers = nodes.filter(function (n) { return hasClass(n, 'clib-tier'); });
+    check(tiers.length === 2 && tiers.map(function (t) { return t.textContent; }).join(',') === 'Free,Pro',
+      '[library] every entry must carry a tier chip, an absent required_tier reading Free (got ' + tiers.map(function (t) { return t.textContent; }).join(',') + ')');
+    check(tiers.every(function (t) { return /Advisory only/.test(t.getAttribute('title') || ''); }),
+      '[library] the tier chip must state in its title that enforcement is advisory / server-side');
+    check(tiers[1].className.indexOf('is-pro') >= 0 && tiers[0].className.indexOf('is-free') >= 0,
+      '[library] a paid tier must be styled distinctly from Free');
+    // installed state: version, entity count + the entities, and installed-at.
+    check(/installed 1\.1\.0 · update available/.test(text),
+      '[library] an entry installed at an older version must say so');
+    check(/not installed/.test(text), '[library] an uninstalled entry must say so');
+    check(text.indexOf('console:workspace:ops-overview') >= 0 && /2 ·/.test(text),
+      '[library] the installed entry must list its written entities and their count');
+    check(/2026-07-24|2025-|202\d-\d\d-\d\d/.test(text), '[library] the installed entry must show an installed-at date');
+    // per-entry identity + provenance rows
+    check(text.indexOf('aa11bb22cc33dd44') >= 0, '[library] the card must show the curator-pinned pack sha256 (short form)');
+    check(text.indexOf('p_publisher_9f2c') >= 0, '[library] the card must show the publisher fpr (short form)');
+    check(text.indexOf('12 tiles: retrieval latency') >= 0, '[library] the card must show the entry preview hint');
+    check(nodes.some(function (n) { return n.tagName === 'A' && n.getAttribute('href') === 'https://example.test/ops-overview'; }),
+      '[library] the card must link the source repo');
+    check(nodes.some(function (n) { return n.tagName === 'BUTTON' && /POST \/v1\/studio\/library\/studio\.ops-overview\/install/.test(n.getAttribute('title') || ''); }),
+      '[library] each card must carry an install control naming its route');
+  });
+  // Customer posture: the install control is stamped operator-only (hidden, the
+  // cint idiom) AND the refusal reason is stated in its place.
+  withDom('customer', function () {
+    const host = mkNode('div');
+    render.clibPaintIndex(host, INDEX_OK, function () {});
+    const nodes = collect(host);
+    const btns = nodes.filter(function (n) { return n.tagName === 'BUTTON' && /\/install/.test(n.getAttribute('title') || ''); });
+    check(btns.length === 2 && btns.every(function (b) { return b.hidden === true && b.getAttribute('data-requires') === 'operator'; }),
+      '[library] in customer posture the install control must be operator-stamped and withheld');
+    check(nodes.some(function (n) { return hasClass(n, 'clib-gate') && /operator posture/.test(n.textContent || ''); }),
+      '[library] a customer view must be told WHY install is unavailable, not left with a silent gap');
+  });
+
+  // ---- (c) the honest states are distinct ---------------------------------
+  withDom('operator', function () {
+    const un = mkNode('div');
+    render.clibPaintIndex(un, { ok: false, status: 404, data: { detail: 'no cached index (run `corecruxctl studio sync` …)' } }, function () {});
+    const unText = textOf(collect(un));
+    check(/corecruxctl studio sync/.test(unText) && collect(un).some(function (n) { return hasClass(n, 'clib-unsynced'); }),
+      '[library] a 404 must read as un-synced and NAME `corecruxctl studio sync`');
+    check(!/carries no entries/.test(unText), '[library] an un-synced daemon must NOT read as a verified-but-empty index');
+
+    const bad = mkNode('div');
+    render.clibPaintIndex(bad, { ok: false, status: 403, data: { detail: 'studio library index signature invalid' } }, function () {});
+    const badNodes = collect(bad);
+    check(badNodes.some(function (n) { return hasClass(n, 'clib-badsig'); }) && /did NOT verify/.test(textOf(badNodes)),
+      '[library] a 403 must read as a SIGNATURE failure, not as an absent index');
+    check(/studio library index signature invalid/.test(textOf(badNodes)),
+      '[library] the 403 detail must be shown verbatim');
+
+    const empty = mkNode('div');
+    render.clibPaintIndex(empty, { ok: true, status: 200, data: { curator_passport_fpr: 'p_curator_5150aa', updated_at_unix_ms: 1753390000000, tier_enforcement: 'advisory', entries: [] } }, function () {});
+    const emptyNodes = collect(empty);
+    check(emptyNodes.some(function (n) { return hasClass(n, 'clib-empty'); }) && /carries no entries/.test(textOf(emptyNodes)),
+      '[library] a verified-but-EMPTY index must say so, distinctly from the un-synced 404');
+    check(!emptyNodes.some(function (n) { return hasClass(n, 'clib-unsynced'); }),
+      '[library] the verified-empty state must not name the sync command as if nothing were cached');
+
+    const gone = mkNode('div');
+    render.clibPaintIndex(gone, { ok: false, status: 0, data: null }, function () {});
+    check(/unreachable/.test(textOf(collect(gone))), '[library] an unreachable daemon must read as unreachable');
+  });
+
+  // ---- (d) the catalog filter + grouping are pure -------------------------
+  const ALL = [INSTALLED, FREE];
+  check(render.clibFilterEntries(ALL, { kind: 'board' }).length === 1 &&
+    render.clibFilterEntries(ALL, { kind: 'board' })[0].id === 'studio.latency-board',
+    '[library] the kind filter must select by entry kind');
+  check(render.clibFilterEntries(ALL, { text: 'ops' }).length === 1, '[library] the text filter must match a tag');
+  check(render.clibFilterEntries(ALL, { text: 'receipt freshness' }).length === 1, '[library] the text filter must match the summary');
+  check(render.clibFilterEntries(ALL, { text: 'Latency Board' }).length === 1, '[library] the text filter must match the name, case-insensitively');
+  check(render.clibFilterEntries(ALL, {}).length === 2, '[library] an empty filter must select everything');
+  check(render.clibFilterEntries(ALL, { kind: 'pack', text: 'ops' }).length === 0, '[library] kind + text must AND');
+  const grouped = render.clibGroupByKind(ALL.concat([{ id: 'x', kind: 'lens' }]));
+  check(JSON.stringify(grouped.map(function (g) { return g.kind; })) === JSON.stringify(['board', 'workspace', 'other']),
+    '[library] an unknown kind must group under "other" rather than being dropped');
+
+  // ---- (e) the install is the ONE mutation, through the ONE choke ---------
+  const lA = renderSrc.indexOf('Studio › Library (crux-integrations-and-template-library L1+L2)');
+  const lB = renderSrc.indexOf('Documents mode (M10)');
+  const lib = (lA >= 0 && lB > lA) ? renderSrc.slice(lA, lB) : '';
+  check(!!lib, '[library] the Studio › Library region must be locatable in render.js');
+  check(!/\.innerHTML/.test(lib), '[library] the surface must contain NO innerHTML (el()/textContent only)');
+  check(!/\bfetch\s*\(/.test(lib), '[library] the surface must issue NO raw fetch — the read goes through fetchJSON');
+  check(!/CruxApiGated/.test(lib), '[library] the surface must never touch the gated client directly');
+  const libCalls = (lib.match(/\bg\.[a-zA-Z]+\(/g) || []);
+  const libChokes = (lib.match(/operatorGatedCall\(function \(g\) \{ return g\./g) || []);
+  check(libCalls.length === 1 && libChokes.length === 1 && /g\.studioLibraryInstall\(id, \{\}\)/.test(lib),
+    '[library] install must be the ONLY gated call site and must sit inside operatorGatedCall (sites=' + libCalls.length + ', chokes=' + libChokes.length + ')');
+  check((lib.match(/fetchJSON\('\/v1\/studio\/library'\)/g) || []).length === 1,
+    '[library] the catalog read must go through the allowlisted GET /v1/studio/library exactly once');
+  const instAt = lib.indexOf('g.studioLibraryInstall(');
+  const before = instAt > 0 ? lib.slice(Math.max(0, instAt - 900), instAt) : '';
+  check(/confirm:\s*'/.test(before) && /pack sha256/.test(before) && /required tier/.test(before) && /Publisher/.test(before),
+    '[library] the install control must confirm first, naming kind, id@version, publisher, sha and tier');
+  check(/render: clibInstallResult/.test(lib), '[library] the install result must render in the response\'s own shape');
+  // The result surfaces written entities, remaps and provenance; errors verbatim.
+  withDom('operator', function () {
+    const out = mkNode('div');
+    render.clibInstallResult(out, { ok: true, status: 201, data: {
+      schema: 'crux.studio.library_install.v1', library_id: 'studio.ops-overview', version: '1.2.0', kind: 'workspace',
+      pack_sha256: 'aa11bb22cc33dd44ee55', publisher_passport_fpr: 'p_publisher_9f2c41ab77', signed: true,
+      allow_unsigned_dev: false, required_tier: 'pro', tier_enforcement: 'advisory',
+      provenance: { library_id: 'studio.ops-overview', version: '1.2.0', pack_sha256: 'aa11bb22cc33dd44ee55' },
+      written: [{ artifact: 'workspace', entity: 'console:workspace:ops-overview', key: 'def', fact_id: 'f_1' },
+        { artifact: 'page', entity: 'console:page:ops-latency-2', key: 'def', fact_id: 'f_2' }],
+      remaps: [{ artifact: 'page', from: 'ops-latency', to: 'ops-latency-2' }]
+    } });
+    const t = textOf(collect(out));
+    check(/HTTP 201 · installed studio\.ops-overview@1\.2\.0/.test(t), '[library] a successful install must report the daemon\'s own 201 shape');
+    check(/Written entities \(2\)/.test(t) && t.indexOf('console:page:ops-latency-2') >= 0,
+      '[library] the install result must list every written entity');
+    check(/Collision remaps \(1\)/.test(t) && /ops-latency → ops-latency-2/.test(t),
+      '[library] the install result must show each collision remap as from → to');
+    check(/Provenance stamped/.test(t) && /"pack_sha256": "aa11bb22cc33dd44ee55"/.test(t),
+      '[library] the install result must show the provenance block');
+    check(/tier_enforcement: advisory/.test(t), '[library] the install result must repeat that the tier echo is advisory');
+
+    const err = mkNode('div');
+    render.clibInstallResult(err, { ok: false, status: 409, data: { title: 'Conflict', detail: 'pack sha256 mismatch: index says aa11…, bytes hash to bb22…' } });
+    const et = textOf(collect(err));
+    check(/HTTP 409/.test(et) && /pack sha256 mismatch/.test(et) && /"detail"/.test(et),
+      '[library] an install failure must show the daemon\'s status + detail verbatim');
+  });
+
+  // ---- (f) provenance chips wherever artifacts are listed -----------------
+  withDom('operator', function () {
+    const libChip = render.studioProvenanceChip({ uid: 'ops', installed_from: { library_id: 'studio.ops-overview', version: '1.2.0', pack_sha256: 'aa11', publisher_passport_fpr: 'p_pub' } });
+    check(!!libChip && /library: studio\.ops-overview@1\.2\.0/.test(textOf(collect(libChip))),
+      '[library] an artifact installed from the library must chip "library: <id>@<version>"');
+    check(libChip && /Installed from the Studio template library/.test(libChip.getAttribute('title') || ''),
+      '[library] the provenance chip must name its publisher + pinned sha in its title');
+    const impChip = render.studioProvenanceChip({ uid: 'mine', imported_from: { pack_id: 'studio.mine', signed: false, imported_at_unix_ms: 1753400000000 } });
+    check(!!impChip && /import: studio\.mine · unsigned/.test(textOf(collect(impChip))),
+      '[library] a hand-imported artifact must chip its import provenance, distinctly from a library install');
+    check(render.studioProvenanceChip({ uid: 'plain' }) === null && render.studioProvenanceChip(null) === null,
+      '[library] an artifact with no provenance must render NO chip (nothing to claim)');
+    check(render.studioProvenanceChip({ installed_from: { version: '1' } }) === null,
+      '[library] a provenance stamp with no library_id is not a claim — no chip');
+  });
+  // The four listing sites: cws workspace rows, cws page rows, the design
+  // library panel, and the board toolbar (this console has no board switcher —
+  // tstudioListBoards has no call site — so the toolbar IS the board listing).
+  check(/var wsProv = studioProvenanceChip\(ws\);/.test(renderSrc), '[library] the Studio › Pages workspace rows must chip provenance');
+  check(/var pProv = \(rp && rp\.def\) \? studioProvenanceChip\(rp\.def\) : null;/.test(renderSrc), '[library] the Studio › Pages page rows must chip provenance');
+  check(/var dProv = studioProvenanceChip\(d\);/.test(renderSrc), '[library] the saved-designs library panel must chip provenance');
+  check(/var boardProv = studioProvenanceChip\(S\);/.test(renderSrc), '[library] the board toolbar must chip the loaded board\'s provenance');
+  check(/installed_from: def \? def\.installed_from : null/.test(renderSrc),
+    '[library] the design listing must carry the def\'s provenance through to the panel');
+  // The board doc's security choke ADMITS provenance (coerced), so an operator
+  // save cannot silently orphan an installed board.
+  const docWithProv = render.tstudioNormalizeDoc({ nodes: [{ id: 'a', kind: 'note' }], installed_from: { library_id: 'studio.ops-overview', version: '1.2.0', pack_sha256: 'aa11', publisher_passport_fpr: 'p_pub', installed_at_unix_ms: 1753400000000 } });
+  check(docWithProv.installed_from && docWithProv.installed_from.library_id === 'studio.ops-overview',
+    '[library] tstudioNormalizeDoc must preserve an installed board\'s provenance');
+  const docRound = render.tstudioNormalizeDoc(JSON.parse(render.tstudioSerializeDoc(docWithProv)));
+  check(JSON.stringify(docRound.installed_from) === JSON.stringify(docWithProv.installed_from),
+    '[library] board provenance must survive the serialize → normalize round-trip (a save must not orphan it)');
+  check(render.tstudioNormalizeDoc({ nodes: [] }).installed_from === undefined,
+    '[library] a board with no provenance must gain none');
+
+  // ---- (g) import preview states signedness ------------------------------
+  const preview = funcBody(renderSrc, 'renderImportPreview');
+  check(!!preview, '[library] render.js must define renderImportPreview');
+  check(preview && /typeof v\.signed === 'boolean'/.test(preview) && /sig\.verdict === 'valid'/.test(preview),
+    '[library] the import preview must read the verify response\'s additive `signed` boolean (falling back to the verdict)');
+  check(preview && /packSigned \? 'signed' : 'unsigned'/.test(preview) && /cwstudio-postchip ' \+ \(packSigned \? 'is-on' : 'is-warn'\)/.test(preview),
+    '[library] signed must paint an ok chip and unsigned a warning chip');
+  check(preview && /applies only under operator posture and carries NO publisher trust/.test(preview),
+    '[library] the unsigned chip must state that an unsigned pack carries no publisher trust');
+  check(preview && /if \(!\(operator && v\.ok\)\) \{ apply\.disabled = true; \}/.test(preview),
+    '[library] the existing operator && v.ok apply gate must be UNCHANGED (signedness is stated, not newly enforced)');
+
+  // ---- (h) manual imports stamp imported_from (never installed_from) ------
+  const stamp = render.studioImportStamp({ id: 'studio.mine', version: '0.1.0' }, { signed: true }, 1753400000000);
+  check(stamp.pack_id === 'studio.mine' && stamp.imported_at_unix_ms === 1753400000000 && stamp.signed === true,
+    '[library] the import stamp must carry the manifest pack id, the import time and the verified signedness');
+  check(!('library_id' in stamp) && !('installed_from' in stamp),
+    '[library] a manual import must NOT borrow the catalog install\'s field vocabulary');
+  check(render.studioImportStamp({ id: 'studio.mine' }, null, 1).signed === false,
+    '[library] an unverified pack must stamp signed:false, never an assumed true');
+  const stampedWs = render.studioStampImported({ schema_version: 1, uid: 'ws-mine', name: 'Mine', newTopKey: { deep: 'keep' } }, stamp);
+  check(stampedWs.imported_from && stampedWs.imported_from.pack_id === 'studio.mine' && stampedWs.uid === 'ws-mine',
+    '[library] studioStampImported must add imported_from without disturbing the def');
+  check(render.studioStampImported({ uid: 'x' }, { pack_id: '' }).imported_from === undefined,
+    '[library] a pack with no manifest id must stamp nothing rather than an empty claim');
+  // The tolerant reader keeps it, and the canonical form still round-trips.
+  const rtWs = render.cwsReadWorkspaceDef(JSON.parse(render.cwsCanonical(stampedWs)));
+  check(rtWs.valid && rtWs.def.imported_from && rtWs.def.imported_from.pack_id === 'studio.mine' && rtWs.def.newTopKey.deep === 'keep',
+    '[library] imported_from must survive the canonical write → tolerant read round-trip');
+  check(render.cwsCanonical(rtWs.def) === render.cwsCanonical(render.cwsReadWorkspaceDef(JSON.parse(render.cwsCanonical(rtWs.def))).def),
+    '[library] the canonicalisation must still be stable with provenance present');
+  const rtPage = render.cwsReadPageDef(JSON.parse(render.cwsCanonical(render.studioStampImported({ schema_version: 1, uid: 'p1', type: 'cx-work' }, stamp))));
+  check(rtPage.valid && rtPage.def.imported_from.signed === true, '[library] a page def must carry imported_from through the same round-trip');
+  check(render.tstudioDesignDef('Latency', { kind: 'api' }, stamp).imported_from.pack_id === 'studio.mine' &&
+    render.tstudioDesignDef('Latency', { kind: 'api' }, null).imported_from === undefined,
+    '[library] a design def must carry the import stamp when there is one, and nothing when there is not');
+  // …and applyPack actually uses them, for every artifact class it writes.
+  const ap = funcBody(renderSrc, 'applyPack');
+  check(ap && /var stamp = studioImportStamp\(pack, verify\);/.test(ap), '[library] applyPack must build one import stamp per apply');
+  check(ap && /tstudioNormalizeDoc\(studioStampImported\(studio\.board && studio\.board\.doc, stamp\)\)/.test(ap),
+    '[library] the imported BOARD doc must carry the import stamp');
+  check(ap && /tstudioSaveDesign\(tstudioSlugify\(dz\.slug\), dz\.name \|\| dz\.slug, dz\.config, stamp\)/.test(ap),
+    '[library] each imported DESIGN must carry the import stamp');
+  check(ap && /cwsCanonical\(studioStampImported\(w, stamp\)\)/.test(ap) && /cwsCanonical\(studioStampImported\(pg, stamp\)\)/.test(ap),
+    '[library] each imported WORKSPACE and PAGE must carry the import stamp');
+  check(!/installed_from: stamp/.test(ap || ''), '[library] a manual import must never write the daemon\'s installed_from');
+  check(/applyPack\(pack, v\)\.then/.test(renderSrc), '[library] the apply control must hand applyPack the verify result it gated on');
+
+  // ---- (i) the CSS family ------------------------------------------------
+  ['.clib-headcard', '.clib-card', '.clib-tier', '.clib-kindchip', '.clib-group', '.clib-provchip'].forEach(function (sel) {
+    check(shellHtml.indexOf(sel + ' ') >= 0 || shellHtml.indexOf(sel + ',') >= 0 || shellHtml.indexOf(sel + '.') >= 0,
+      '[library] shell.html must style ' + sel);
+  });
+  const cssAt = shellHtml.indexOf('/* Studio › Library (L1+L2)');
+  const cssEnd = shellHtml.indexOf('/* modal (self-contained', cssAt);
+  const css = (cssAt >= 0 && cssEnd > cssAt) ? shellHtml.slice(cssAt, cssEnd) : '';
+  check(!!css, '[library] the Studio › Library CSS block must be locatable');
+  check(css && !/#[0-9a-fA-F]{3,8}\b/.test(css) && !/\brgba?\(/.test(css),
+    '[library] the Library CSS must use var(--) tokens only — no literal colours');
+
+  notes.push('studio library (L1+L2 console): Studio gains a fourth section — Library (#/canvas/studio?sub=library) — over the daemon\'s cached, curator-signed template index: a header stating curator, index age, entry count and that tier_enforcement is ADVISORY (the catalog server is the gate; the daemon only echoes required_tier, and every tier chip says so in its title), plus kind-grouped, kind/text-filterable entry cards carrying name·version·kind·tier·publisher·tags·summary·preview·repo·pinned sha and, when installed, the version, the written entities and the install date. There is deliberately NO refresh button — the daemon has no fetch-index route — so the surface names `corecruxctl studio sync` instead, and its four read states stay distinct (verified · un-synced 404 · 403 signature failure shown verbatim · verified-but-empty). Install is the one mutation: the same cintWrite harness as Studio › Integrations (posture + Art.14 bound passport + a confirm naming kind, id@version, publisher, sha and advisory tier) through the single operatorGatedCall choke, rendering the response\'s own shape — written entities, from → to collision remaps, the provenance block — and 404/409/403 details verbatim. Provenance is now visible wherever a Studio artifact is listed (workspace + page rows, the saved-designs panel, and the board toolbar, which is this console\'s only board listing): "library: <id>@<version>" for a catalog install, "import: <pack_id> · signed|unsigned" for a hand-import, read defensively and rendered as one chip. The board doc\'s field-dropping security choke now admits (coerced) provenance so an operator save cannot orphan an installed board. The import preview states SIGNEDNESS as a first-class chip off the verify route\'s additive `signed` bit — unsigned says plainly that it applies only under operator posture and carries no publisher trust — with the existing operator && v.ok apply gate untouched; and a manual apply stamps every artifact it writes with its OWN `imported_from` {pack_id, imported_at_unix_ms, signed}, never the daemon\'s `installed_from`, surviving the canonical write → tolerant read round-trip.');
+})();
+
 // ---- Report (awaits async renderer-driven checks) -----------------------
 Promise.all(asyncChecks).then(function () { return passportMintInteraction(); }).then(function () {
   console.log('unified-shell-console v2 — M14 + desktop mission control M2 smoke');

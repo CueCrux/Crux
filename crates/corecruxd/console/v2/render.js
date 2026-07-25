@@ -5411,6 +5411,88 @@
   }
 
   // =======================================================================
+  //  Studio artifact PROVENANCE (crux-integrations-and-template-library L1+L2)
+  //
+  //  Two — deliberately distinct — stamps can ride inside a Studio artifact's
+  //  def/doc value:
+  //
+  //    installed_from — written by the DAEMON when a curator-signed catalog
+  //      entry is installed (POST /v1/studio/library/{id}/install). Carries
+  //      library_id + version + pack_sha256 + publisher fpr, so the daemon can
+  //      read the installed set back out of the fact store.
+  //    imported_from  — written by the CONSOLE when an operator hand-imports a
+  //      pack file (Studio › Board › Import). A local import is NOT a catalog
+  //      install: there is no library id, no curator endorsement and no
+  //      installed-join, so it never borrows the daemon's field name. It
+  //      carries the manifest's own pack id, when it was imported, and whether
+  //      the verify route said the pack was signed.
+  //
+  //  Both are read DEFENSIVELY (any shape, any daemon version) and rendered as
+  //  one small chip wherever the artifact is listed.
+  // =======================================================================
+  function studioProvStr(v) { return (typeof v === 'string') ? v : (v == null ? '' : String(v)); }
+  // Coerce a provenance object to the fields we render/persist. Returns null for
+  // anything that is not an object, so an absent stamp never invents one.
+  function studioReadInstalledFrom(raw) {
+    if (!raw || typeof raw !== 'object') { return null; }
+    var out = {
+      library_id: studioProvStr(raw.library_id),
+      version: studioProvStr(raw.version),
+      pack_sha256: studioProvStr(raw.pack_sha256),
+      publisher_passport_fpr: studioProvStr(raw.publisher_passport_fpr)
+    };
+    var at = Number(raw.installed_at_unix_ms);
+    if (isFinite(at) && at > 0) { out.installed_at_unix_ms = at; }
+    return out.library_id ? out : null;
+  }
+  function studioReadImportedFrom(raw) {
+    if (!raw || typeof raw !== 'object') { return null; }
+    var out = { pack_id: studioProvStr(raw.pack_id), signed: !!raw.signed };
+    var at = Number(raw.imported_at_unix_ms);
+    if (isFinite(at) && at > 0) { out.imported_at_unix_ms = at; }
+    return out.pack_id ? out : null;
+  }
+  // The stamp the console writes on a MANUAL import. Pure (the clock is injected
+  // by the caller in tests). `pack.id` is the crux.integration.v1 manifest id.
+  function studioImportStamp(pack, verify, nowMs) {
+    var id = (pack && typeof pack === 'object') ? studioProvStr(pack.id) : '';
+    var now = Number(nowMs);
+    return {
+      pack_id: id,
+      imported_at_unix_ms: (isFinite(now) && now > 0) ? now : Date.now(),
+      signed: !!(verify && verify.signed)
+    };
+  }
+  // Pure: a COPY of an artifact def carrying the import stamp. Never mutates the
+  // input, and never touches installed_from (a catalog install is a different
+  // provenance class — see the block comment above).
+  function studioStampImported(value, stamp) {
+    var out = {};
+    if (value && typeof value === 'object') { Object.keys(value).forEach(function (k) { out[k] = value[k]; }); }
+    if (stamp && stamp.pack_id) { out.imported_from = stamp; }
+    return out;
+  }
+  // One chip, both stamps. Returns null when the artifact carries neither, so
+  // every listing can append unconditionally.
+  function studioProvenanceChip(value) {
+    var v = (value && typeof value === 'object') ? value : {};
+    var lib = studioReadInstalledFrom(v.installed_from);
+    var imp = lib ? null : studioReadImportedFrom(v.imported_from);
+    if (!lib && !imp) { return null; }
+    var text = lib
+      ? ('library: ' + lib.library_id + (lib.version ? '@' + lib.version : ''))
+      : ('import: ' + imp.pack_id + (imp.signed ? ' · signed' : ' · unsigned'));
+    var title = lib
+      ? ('Installed from the Studio template library. publisher ' + (lib.publisher_passport_fpr || 'unknown')
+         + ' · pack sha256 ' + (lib.pack_sha256 || 'unknown'))
+      : ('Imported from a local pack file' + (imp.signed ? ' whose signature verified against this daemon\'s trusted keyring.' : ' that carried NO verified signature — no publisher trust.'));
+    var chip = el('span', { 'class': 'clib-provchip' + (lib ? ' is-library' : ' is-import'), title: title });
+    chip.appendChild(el('span', { 'class': 'cwstudio-prov-dot' }));
+    chip.appendChild(el('span', { 'class': 'clib-provchip-t', text: text }));
+    return chip;
+  }
+
+  // =======================================================================
   //  Canvas Studio (M14) — the ported diagram-builder engine.
   //
   //  Ported from MediaCrux/dashboard/public/canvas/assets/diagram-builder.js
@@ -5603,10 +5685,25 @@
     out.zoom = Math.max(0.2, Math.min(3, tstudioNum(d.zoom, 1)));
     out.version = tstudioNum(d.version, TSTUDIO_DOC_VERSION);
     out.settings = tstudioNormalizeSettings(d.settings);
+    // Provenance is the ONE exception to "drop unknown fields": a board doc
+    // installed from the template library (or imported from a pack) carries a
+    // stamp the daemon reads back to compute its installed set. Dropping it here
+    // would silently orphan the artifact on the operator's next save. It is
+    // coerced to known scalar fields (never interpreted as markup) exactly like
+    // every other field this choke point admits.
+    var prov = studioReadInstalledFrom(d.installed_from);
+    if (prov) { out.installed_from = prov; }
+    var imp = studioReadImportedFrom(d.imported_from);
+    if (imp) { out.imported_from = imp; }
     return out;
   }
   function tstudioSerializeDoc(state) {
-    return JSON.stringify({ nodes: state.nodes, links: state.links, texts: state.texts, pan: state.pan, zoom: state.zoom, settings: state.settings || tstudioDefaultSettings(), version: TSTUDIO_DOC_VERSION, savedAt: Date.now() });
+    var doc = { nodes: state.nodes, links: state.links, texts: state.texts, pan: state.pan, zoom: state.zoom, settings: state.settings || tstudioDefaultSettings(), version: TSTUDIO_DOC_VERSION, savedAt: Date.now() };
+    var prov = studioReadInstalledFrom(state.installed_from);
+    if (prov) { doc.installed_from = prov; }
+    var imp = studioReadImportedFrom(state.imported_from);
+    if (imp) { doc.imported_from = imp; }
+    return JSON.stringify(doc);
   }
   // Pick the newest (max-version, non-deleted) fact for `key` from a /v1/facts/
   // entity/<entity> read (which returns EVERY version). Returns the fact or null.
@@ -5935,7 +6032,14 @@
           var slug = ent.slice(TSTUDIO_DESIGN_ENTITY.length);
           var def = null;
           if (!f.value_truncated) { try { def = JSON.parse(f.value); } catch (e) { def = null; } }
-          out.push({ slug: slug, name: (def && def.name) ? def.name : slug, config: def && def.config ? def.config : null, truncated: !!f.value_truncated, entity: ent });
+          out.push({
+            slug: slug, name: (def && def.name) ? def.name : slug, config: def && def.config ? def.config : null,
+            truncated: !!f.value_truncated, entity: ent,
+            // Provenance rides on the def value (library install / manual import);
+            // carried through so the library panel can chip the row.
+            installed_from: def ? def.installed_from : null,
+            imported_from: def ? def.imported_from : null
+          });
         });
         return out;
       })
@@ -5961,8 +6065,13 @@
   function tstudioSaveBoard(boardId, state) {
     return tstudioWriteFact(tstudioBoardEntity(boardId), TSTUDIO_DOC_KEY, tstudioSerializeDoc(state));
   }
-  function tstudioSaveDesign(slug, name, config) {
-    return tstudioWriteFact(tstudioDesignEntity(slug), TSTUDIO_DESIGN_KEY, JSON.stringify({ name: name, config: config }));
+  // Pure: the design def value. `stamp` (optional) is a MANUAL-import stamp —
+  // catalog installs are written daemon-side and never come through here.
+  function tstudioDesignDef(name, config, stamp) {
+    return studioStampImported({ name: name, config: config }, stamp);
+  }
+  function tstudioSaveDesign(slug, name, config, stamp) {
+    return tstudioWriteFact(tstudioDesignEntity(slug), TSTUDIO_DESIGN_KEY, JSON.stringify(tstudioDesignDef(name, config, stamp)));
   }
   function tstudioSlugify(name) {
     return String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || ('design-' + Date.now().toString(36));
@@ -6768,6 +6877,8 @@
         var b = el('button', { 'class': 'tstudio-lib-design', type: 'button', title: 'Add "' + d.name + '"' });
         b.appendChild(el('span', { 'class': 'tstudio-lib-name', text: d.name }));
         b.appendChild(el('span', { 'class': 'tstudio-lib-kind', text: d.config ? (tstudioKind(d.config.kind).label) : 'design' }));
+        var dProv = studioProvenanceChip(d);
+        if (dProv) { b.appendChild(dProv); }
         if (!operator) { b.disabled = true; }
         b.addEventListener('click', function () { instantiateDesign(d); });
         designs.appendChild(b);
@@ -6807,6 +6918,11 @@
       libBtn.addEventListener('click', function () { root.classList.toggle('tstudio-lib-hidden'); });
       left.appendChild(libBtn);
       left.appendChild(el('span', { 'class': 'tstudio-tb-title', text: 'Studio · ' + boardId }));
+      // This console has no board SWITCHER (tstudioListBoards has no call site) —
+      // the toolbar's board identity IS where a board is named, so the board's
+      // library/import provenance chips here, beside the id it belongs to.
+      var boardProv = studioProvenanceChip(S);
+      if (boardProv) { left.appendChild(boardProv); }
       toolbar.appendChild(left);
 
       var mid = el('div', { 'class': 'tstudio-tb-mid' });
@@ -7029,6 +7145,25 @@
       var sig = v.signature || {};
       line('signature: ' + (sig.verdict || 'unsigned'), sig.verdict !== 'invalid', sig.error || '');
       m.body.appendChild(verdict);
+      // SIGNEDNESS is the bit that decides publisher trust, so it is stated as a
+      // chip of its own rather than left inside the verdict list: /verify REPORTS
+      // unsigned (it does not refuse it), and an unsigned pack is exactly the case
+      // an operator must see before applying. `signed` is the daemon's additive
+      // mirror of signature.verdict === 'valid'; read defensively so an older
+      // daemon that omits it falls back to the verdict itself.
+      var packSigned = (typeof v.signed === 'boolean') ? v.signed : (sig.verdict === 'valid');
+      var sRow = el('div', { 'class': 'tstudio-ext-chips clib-signrow' });
+      sRow.appendChild(el('span', {
+        'class': 'cwstudio-postchip ' + (packSigned ? 'is-on' : 'is-warn'),
+        text: packSigned ? 'signed' : 'unsigned'
+      }));
+      sRow.appendChild(el('span', {
+        'class': 'cwstudio-note',
+        text: packSigned
+          ? 'The Ed25519 signature verified against this daemon\'s trusted keyring — the publisher fingerprint is attributable.'
+          : 'No verified signature. An unsigned pack applies only under operator posture and carries NO publisher trust: nothing attests who built it or that the bytes are the ones they published.'
+      }));
+      m.body.appendChild(sRow);
       (v.errors || []).forEach(function (e) { m.body.appendChild(el('div', { 'class': 'tstudio-apierr', text: e })); });
       var st = v.studio || {};
       m.body.appendChild(el('div', { 'class': 'tstudio-modal-status', text: (st.board_title || '(untitled)') + ' — ' + (st.tile_count || 0) + ' tile(s), ' + (st.design_count || 0) + ' design(s)' }));
@@ -7046,7 +7181,7 @@
       var out = el('div', { 'class': 'tstudio-modal-status' });
       apply.addEventListener('click', function () {
         apply.disabled = true;
-        applyPack(pack).then(function (r) {
+        applyPack(pack, v).then(function (r) {
           out.appendChild(el('div', { 'class': (r.ok ? 'tstudio-modal-ok' : 'tstudio-apierr'), text: r.ok ? 'Applied. Board reloaded.' : ('apply failed: ' + (r.error || '')) }));
           if (r.ok) { setTimeout(m.close, 700); }
         });
@@ -7055,24 +7190,31 @@
       m.body.appendChild(actions);
       m.body.appendChild(out);
     }
-    function applyPack(pack) {
+    function applyPack(pack, verify) {
       if (!operator) { return Promise.resolve({ ok: false, error: 'operator posture required' }); }
       var studio = pack && pack.studio;
       if (!studio || studio.schema !== TSTUDIO_STUDIO_SCHEMA) { return Promise.resolve({ ok: false, error: 'no studio payload' }); }
-      var d = tstudioNormalizeDoc(studio.board && studio.board.doc);
+      // Manual-import provenance parity with a library install: every artifact
+      // this write touches carries WHERE it came from. A hand-imported pack is
+      // NOT a catalog install, so the stamp is `imported_from` (manifest pack id
+      // + when + whether /verify said signed) — never the daemon's
+      // `installed_from`, which means "endorsed by the curator-signed index".
+      var stamp = studioImportStamp(pack, verify);
+      var d = tstudioNormalizeDoc(studioStampImported(studio.board && studio.board.doc, stamp));
       var designs = Array.isArray(studio.designs) ? studio.designs : [];
       var writes = [tstudioWriteFact(tstudioBoardEntity(boardId), TSTUDIO_DOC_KEY, tstudioSerializeDoc(d))];
-      designs.forEach(function (dz) { if (dz && dz.slug && dz.config) { writes.push(tstudioSaveDesign(tstudioSlugify(dz.slug), dz.name || dz.slug, dz.config)); } });
+      designs.forEach(function (dz) { if (dz && dz.slug && dz.config) { writes.push(tstudioSaveDesign(tstudioSlugify(dz.slug), dz.name || dz.slug, dz.config, stamp)); } });
       // M16b — a pack may ALSO carry workspaces/pages (additive). Apply them as the
       // defaults layer so a pack can install a whole workspace, not just a board.
       var wsPack = cwsPackExtract(studio);
-      wsPack.workspaces.forEach(function (w) { if (w && w.uid) { writes.push(tstudioWriteFact(cwsWorkspaceEntity(w.uid), CWS_DEF_KEY, cwsCanonical(w))); } });
-      wsPack.pages.forEach(function (pg) { if (pg && pg.uid) { writes.push(tstudioWriteFact(cwsPageEntity(pg.uid), CWS_DEF_KEY, cwsCanonical(pg))); } });
+      wsPack.workspaces.forEach(function (w) { if (w && w.uid) { writes.push(tstudioWriteFact(cwsWorkspaceEntity(w.uid), CWS_DEF_KEY, cwsCanonical(studioStampImported(w, stamp)))); } });
+      wsPack.pages.forEach(function (pg) { if (pg && pg.uid) { writes.push(tstudioWriteFact(cwsPageEntity(pg.uid), CWS_DEF_KEY, cwsCanonical(studioStampImported(pg, stamp)))); } });
       return Promise.all(writes).then(function (results) {
         var ok = results.every(function (r) { return r && r.ok; });
         if (ok) {
           S.nodes = d.nodes; S.links = d.links; S.texts = d.texts; S.pan = d.pan; S.zoom = d.zoom; S.settings = d.settings;
-          renderBoard(); applyBoardSettings(); refreshLibrary(); setSaveState('saved');
+          S.installed_from = d.installed_from || null; S.imported_from = d.imported_from || null;
+          renderBoard(); applyBoardSettings(); paintToolbar(); refreshLibrary(); setSaveState('saved');
           if (typeof window !== 'undefined' && typeof window.CRUX_WS_RELOAD === 'function' && (wsPack.workspaces.length || wsPack.pages.length)) { window.CRUX_WS_RELOAD(); }
         }
         return { ok: ok };
@@ -7182,6 +7324,7 @@
       var seeded = tstudioNormalizeDoc(ctx.seedDoc);
       S.nodes = seeded.nodes; S.links = seeded.links; S.texts = seeded.texts;
       S.pan = seeded.pan; S.zoom = seeded.zoom; S.settings = seeded.settings;
+      S.installed_from = seeded.installed_from || null; S.imported_from = seeded.imported_from || null;
       S.designs = Array.isArray(ctx.seedDesigns) ? ctx.seedDesigns : [];
       renderBoard();
       applyBoardSettings();
@@ -7197,6 +7340,7 @@
       var res = out[0];
       S.nodes = res.doc.nodes; S.links = res.doc.links; S.texts = res.doc.texts;
       S.pan = res.doc.pan; S.zoom = res.doc.zoom; S.settings = res.doc.settings;
+      S.installed_from = res.doc.installed_from || null; S.imported_from = res.doc.imported_from || null;
       S.designs = out[1] || [];
       renderBoard();
       applyBoardSettings();
@@ -7216,7 +7360,7 @@
     host.textContent = '';
     var region = el('div', { 'class': 'canvas-region' });
     var head = el('div', { 'class': 'canvas-head' });
-    var studioSub = (view === 'studio') ? (ctx.sub === 'pages' ? 'pages' : (ctx.sub === 'integrations' ? 'integrations' : 'board')) : null;
+    var studioSub = (view === 'studio') ? (ctx.sub === 'pages' ? 'pages' : (ctx.sub === 'integrations' ? 'integrations' : (ctx.sub === 'library' ? 'library' : 'board'))) : null;
     if (view === 'studio') {
       // M21 — inside the Studio the PRIMARY control is the Studio's OWN sections:
       // Board (the tile canvas) · Pages (workspaces + pages) · Integrations
@@ -7226,7 +7370,11 @@
       // longer live here — it was a control for a destination that had been
       // dissolved. Studio is now what #/canvas/* is FOR.
       var sub = el('div', { 'class': 'modeseg canvas-seg canvas-subseg', role: 'group', 'aria-label': 'Studio section' });
-      [['board', 'Board'], ['pages', 'Pages'], ['integrations', 'Integrations']].forEach(function (v) {
+      // L1 adds a FOURTH section: Library — the curator-signed central template
+      // library (boards / designs / workspaces / packs) the daemon caches and
+      // installs from. It sits last because it is where new Studio content comes
+      // FROM, after the three sections that operate on what is already here.
+      [['board', 'Board'], ['pages', 'Pages'], ['integrations', 'Integrations'], ['library', 'Library']].forEach(function (v) {
         var b = el('button', { 'class': 'modeseg-btn', type: 'button', 'data-sub': v[0], 'aria-pressed': v[0] === studioSub ? 'true' : 'false' }, [v[1]]);
         (function (sid) { b.addEventListener('click', function () { location.hash = '#/canvas/studio' + (sid === 'board' ? '' : '?sub=' + sid); }); })(v[0]);
         sub.appendChild(b);
@@ -7245,6 +7393,7 @@
     if (view === 'studio') {
       if (studioSub === 'pages') { return renderWorkspaceStudio(body, ctx); }
       if (studioSub === 'integrations') { return renderIntegrationsStudio(body, ctx); }
+      if (studioSub === 'library') { return renderLibraryStudio(body, ctx); }
       return renderTileStudio(body, ctx);
     }
     renderCanvasBoard(body, ctx);
@@ -7366,6 +7515,10 @@
         wsRow.appendChild(el('span', { 'class': 'cwstudio-wsname', text: ws.name }));
         var badge = ws.builtin ? (ws.source === 'builtin-fork' ? 'forked' : 'builtin') : 'user';
         wsRow.appendChild(el('span', { 'class': 'cwstudio-wsbadge cwstudio-badge-' + badge, text: badge }));
+        // The tolerant reader preserves unknown keys, so a workspace installed
+        // from the template library still carries its installed_from stamp here.
+        var wsProv = studioProvenanceChip(ws);
+        if (wsProv) { wsRow.appendChild(wsProv); }
         wsRow.addEventListener('click', function () { SEL = { kind: 'workspace', uid: ws.uid }; paintTree(); paintEditor(); });
         treeAside.appendChild(wsRow);
         // dests → pages
@@ -7376,6 +7529,8 @@
             var pRow = el('button', { 'class': 'cwstudio-pagerow' + (SEL && SEL.kind === 'page' && SEL.uid === pu ? ' is-sel' : ''), type: 'button', 'data-page': pu });
             pRow.appendChild(el('span', { 'class': 'cwstudio-pagename', text: rp ? rp.def.title : pu }));
             if (rp && !rp.builtin && rp.def.source === 'builtin-fork') { pRow.appendChild(el('span', { 'class': 'cwstudio-pagebadge', text: 'forked' })); }
+            var pProv = (rp && rp.def) ? studioProvenanceChip(rp.def) : null;
+            if (pProv) { pRow.appendChild(pProv); }
             pRow.addEventListener('click', function () { SEL = { kind: 'page', uid: pu, ws: ws.uid, dest: d.id }; paintTree(); paintEditor(); });
             treeAside.appendChild(pRow);
           });
@@ -8499,6 +8654,330 @@
     cintCatalogCard(extensions, extGrid);
     cintKeysCard(keys);
     return Promise.resolve();
+  }
+
+  // =======================================================================
+  //  Studio › Library (crux-integrations-and-template-library L1+L2) — the
+  //  central template library: the curator-signed catalog of Studio boards,
+  //  tile designs, workspaces and full packs, browsed from the daemon's CACHED
+  //  index and installed by id.
+  //
+  //  Two routes, both already generated in api.js:
+  //    GET  /v1/studio/library              → the verified cached index, joined
+  //                                           against what is already installed.
+  //    POST /v1/studio/library/{id}/install → the ONE mutation (operator-gated,
+  //                                           through operatorGatedCall).
+  //
+  //  Three things this surface refuses to fake:
+  //
+  //  1. There is NO refresh button. The daemon has no fetch-index route — the
+  //     cache is populated by `corecruxctl studio sync` — so the surface names
+  //     the command instead of offering a control that would do nothing.
+  //  2. `required_tier` is ADVISORY. The catalog SERVER is the tier gate; this
+  //     daemon echoes the field and stamps every response
+  //     `tier_enforcement: "advisory"`. The chip says so in its title text, and
+  //     the header states it in plain words, so no operator reads a "Pro" chip
+  //     as a local entitlement check.
+  //  3. The install result is rendered in the RESPONSE's own shape — the
+  //     written entities, the collision remaps (from → to) and the provenance
+  //     block — and errors verbatim. 404/409/403 each carry the daemon's own
+  //     detail string; none of them is smoothed into "install failed".
+  // =======================================================================
+  var CLIB_KINDS = ['board', 'design', 'workspace', 'pack'];
+  var CLIB_KIND_LABEL = { board: 'Boards', design: 'Designs', workspace: 'Workspaces', pack: 'Packs' };
+  var CLIB_TIER_LABEL = { free: 'Free', pro: 'Pro', team: 'Team', enterprise: 'Enterprise' };
+  // The one sentence that keeps a tier chip honest wherever it is rendered.
+  var CLIB_TIER_TITLE = 'Advisory only: required_tier is enforced by the catalog SERVER that serves the pack. This daemon echoes it (tier_enforcement: "advisory") and never gates an install on it.';
+  var CLIB_SYNC_CMD = 'corecruxctl studio sync';
+
+  function clibShort(v, n) {
+    var s = String(v == null ? '' : v);
+    var max = n || 12;
+    return s.length > max ? s.slice(0, max) + '…' : s;
+  }
+  // Absent required_tier means Free — the daemon omits the field entirely for a
+  // free entry, so "no chip" would read as "unknown" instead of "no tier needed".
+  function clibTierKey(entry) {
+    var t = String((entry && entry.required_tier) || '').toLowerCase();
+    return CLIB_TIER_LABEL[t] ? t : 'free';
+  }
+  function clibKindKey(entry) {
+    var k = String((entry && entry.kind) || '').toLowerCase();
+    return CLIB_KINDS.indexOf(k) >= 0 ? k : 'other';
+  }
+  // Pure: the catalog filter. `kind` is 'all' or one of CLIB_KINDS; `text` is a
+  // case-insensitive substring over name · id · tags · summary. Unit-tested.
+  function clibFilterEntries(entries, filter) {
+    var f = filter || {};
+    var kind = String(f.kind || 'all').toLowerCase();
+    var q = String(f.text || '').trim().toLowerCase();
+    return (Array.isArray(entries) ? entries : []).filter(function (e) {
+      if (!e || typeof e !== 'object') { return false; }
+      if (kind !== 'all' && clibKindKey(e) !== kind) { return false; }
+      if (!q) { return true; }
+      var hay = [e.name, e.id, e.summary, (Array.isArray(e.tags) ? e.tags.join(' ') : '')].join(' ').toLowerCase();
+      return hay.indexOf(q) >= 0;
+    });
+  }
+  // Pure: group into the declared kind order, dropping empty groups. An entry
+  // whose kind this console does not know is grouped under 'other' rather than
+  // silently dropped.
+  function clibGroupByKind(entries) {
+    var buckets = {};
+    (Array.isArray(entries) ? entries : []).forEach(function (e) {
+      var k = clibKindKey(e);
+      (buckets[k] = buckets[k] || []).push(e);
+    });
+    var out = [];
+    CLIB_KINDS.concat(['other']).forEach(function (k) {
+      if (buckets[k] && buckets[k].length) {
+        out.push({ kind: k, label: CLIB_KIND_LABEL[k] || 'Other kinds', entries: buckets[k] });
+      }
+    });
+    return out;
+  }
+
+  // The install RESULT, in the response's own shape. Success: what was written,
+  // what was remapped, and the provenance stamped into every artifact. Failure:
+  // the daemon's problem body verbatim (409 sha mismatch / 403 unsigned / 404
+  // unknown id all carry their own detail).
+  function clibInstallResult(out, r) {
+    out.textContent = '';
+    var d = (r && r.data) || {};
+    if (!r || !r.ok) {
+      out.appendChild(el('p', { 'class': 'wired-result is-err', text: 'HTTP ' + ((r && r.status) || 0) + ((d && d.detail) ? ' · ' + d.detail : '') }));
+      var text;
+      try { text = (d == null) ? '(empty body)' : JSON.stringify(d, null, 2); }
+      catch (e) { text = String(d); }
+      out.appendChild(el('pre', { 'class': 'cint-verbatim', text: text }));
+      return;
+    }
+    out.appendChild(el('p', { 'class': 'wired-result is-ok', text: 'HTTP ' + r.status + ' · installed ' + String(d.library_id || '') + '@' + String(d.version || '') }));
+    var meta = el('div', { 'class': 'clib-result' });
+    meta.appendChild(cintRow('kind', d.kind));
+    meta.appendChild(cintRow('pack sha256', d.pack_sha256));
+    meta.appendChild(cintRow('publisher', d.publisher_passport_fpr));
+    meta.appendChild(cintRow('signature', d.signed ? 'signed — verified against the trusted keyring' : 'UNSIGNED' + (d.allow_unsigned_dev ? ' — installed under the CORECRUXD_STUDIO_ALLOW_UNSIGNED dev bypass' : '')));
+    meta.appendChild(cintRow('required tier', (d.required_tier ? String(d.required_tier) : 'free') + ' · tier_enforcement: ' + String(d.tier_enforcement || 'advisory')));
+    out.appendChild(meta);
+
+    var written = Array.isArray(d.written) ? d.written : [];
+    out.appendChild(el('div', { 'class': 'tstudio-field-lab', text: 'Written entities (' + written.length + ')' }));
+    if (!written.length) {
+      out.appendChild(el('p', { 'class': 'cwstudio-note', text: 'The pack carried no installable artifact — nothing was written.' }));
+    }
+    written.forEach(function (w) {
+      var row = el('div', { 'class': 'clib-written' });
+      row.appendChild(el('span', { 'class': 'cwstudio-postchip', text: String((w && w.artifact) || 'artifact') }));
+      row.appendChild(el('span', { 'class': 'cint-row-v cint-mono', text: String((w && w.entity) || '') + ' · key ' + String((w && w.key) || '') }));
+      row.appendChild(el('span', { 'class': 'cwstudio-note', text: 'fact ' + clibShort((w && w.fact_id) || '', 16) }));
+      out.appendChild(row);
+    });
+
+    var remaps = Array.isArray(d.remaps) ? d.remaps : [];
+    out.appendChild(el('div', { 'class': 'tstudio-field-lab', text: 'Collision remaps (' + remaps.length + ')' }));
+    if (!remaps.length) {
+      out.appendChild(el('p', { 'class': 'cwstudio-note', text: 'None — no installed id collided with a live console artifact.' }));
+    }
+    remaps.forEach(function (m) {
+      var row = el('div', { 'class': 'clib-remap' });
+      row.appendChild(el('span', { 'class': 'cwstudio-postchip is-warn', text: String((m && m.artifact) || 'artifact') }));
+      row.appendChild(el('span', { 'class': 'cint-row-v cint-mono', text: String((m && m.from) || '') + ' → ' + String((m && m.to) || '') }));
+      out.appendChild(row);
+    });
+
+    out.appendChild(el('div', { 'class': 'tstudio-field-lab', text: 'Provenance stamped into every written artifact' }));
+    var prov;
+    try { prov = JSON.stringify(d.provenance == null ? {} : d.provenance, null, 2); }
+    catch (e) { prov = String(d.provenance); }
+    out.appendChild(el('pre', { 'class': 'cint-verbatim clib-prov', text: prov }));
+  }
+
+  // One catalog entry. Pure DOM (the smoke paints it over a fixture); the only
+  // side effect is the install click, which goes through cintWrite → the single
+  // operatorGatedCall choke point.
+  function clibEntryCard(entry, reload) {
+    entry = entry || {};
+    var id = String(entry.id || '—');
+    var version = String(entry.version || '');
+    var kind = clibKindKey(entry);
+    var tier = clibTierKey(entry);
+    var installedVersion = String(entry.installed_version || '');
+    var stale = !!entry.installed && !!installedVersion && installedVersion !== version;
+    var wrap = el('div', { 'class': 'clib-card', 'data-kind': kind, 'data-id': id });
+
+    var head = el('div', { 'class': 'cwstudio-packrow clib-head' });
+    head.appendChild(el('span', { 'class': 'cwstudio-packid', text: String(entry.name || id) + (version ? ' · ' + version : '') }));
+    head.appendChild(el('span', { 'class': 'clib-kindchip', text: kind }));
+    head.appendChild(el('span', {
+      'class': 'clib-tier is-' + tier,
+      title: CLIB_TIER_TITLE,
+      text: CLIB_TIER_LABEL[tier]
+    }));
+    head.appendChild(el('span', {
+      'class': 'cwstudio-postchip ' + (entry.installed ? (stale ? 'is-warn' : 'is-on') : ''),
+      text: entry.installed
+        ? (stale ? 'installed ' + installedVersion + ' · update available' : 'installed ' + (installedVersion || version))
+        : 'not installed'
+    }));
+    wrap.appendChild(head);
+
+    if (entry.summary) { wrap.appendChild(el('p', { 'class': 'cwstudio-note', text: String(entry.summary) })); }
+    if (entry.preview) { wrap.appendChild(el('p', { 'class': 'clib-preview', text: 'Preview: ' + String(entry.preview) })); }
+
+    var tags = Array.isArray(entry.tags) ? entry.tags : [];
+    if (tags.length) {
+      var tagRow = el('div', { 'class': 'cwstudio-chips clib-tags' });
+      tags.forEach(function (t) { tagRow.appendChild(el('span', { 'class': 'tstudio-cap-chip', text: String(t) })); });
+      wrap.appendChild(tagRow);
+    }
+
+    wrap.appendChild(cintRow('library id', id));
+    wrap.appendChild(cintRow('publisher', clibShort(entry.publisher_passport_fpr, 16)));
+    wrap.appendChild(cintRow('pack sha256 (pinned)', clibShort(entry.pack_sha256, 16)));
+    var repo = String(entry.repo_url || '');
+    if (/^https:\/\//.test(repo)) {
+      var rr = el('div', { 'class': 'cint-row' });
+      rr.appendChild(el('span', { 'class': 'cint-row-k', text: 'source repo' }));
+      rr.appendChild(el('a', { 'class': 'cint-row-v cint-link', href: repo, rel: 'noopener noreferrer', target: '_blank', text: repo }));
+      wrap.appendChild(rr);
+    } else if (repo) {
+      wrap.appendChild(cintRow('source repo', repo));
+    }
+    if (entry.installed) {
+      var ents = Array.isArray(entry.installed_entities) ? entry.installed_entities : [];
+      wrap.appendChild(cintRow('installed entities', ents.length + (ents.length ? ' · ' + ents.join(' · ') : '')));
+      wrap.appendChild(cintRow('installed at', cintWhen(entry.installed_at_unix_ms)));
+    }
+
+    var out;
+    var acts = cintActions(wrap);
+    var install = cintBtn(entry.installed ? (stale ? 'Update' : 'Install again') : 'Install', {
+      primary: !entry.installed,
+      title: 'POST /v1/studio/library/' + id + '/install'
+    });
+    install.addEventListener('click', function () {
+      cintWrite(out, {
+        confirm: 'Installs the ' + kind + ' "' + id + '"@' + version
+          + ' from the curator-signed Studio library. Publisher ' + clibShort(entry.publisher_passport_fpr, 16)
+          + ', pack sha256 ' + clibShort(entry.pack_sha256, 16)
+          + ', required tier ' + CLIB_TIER_LABEL[tier] + ' (advisory — enforced by the catalog server, not by this daemon).'
+          + ' The daemon re-verifies the index signature, fetches the pack, pins that sha256 and requires a valid publisher signature.'
+          + ' Nothing is overwritten: a colliding id is remapped and reported. Proceed?',
+        run: function () { return operatorGatedCall(function (g) { return g.studioLibraryInstall(id, {}); }).then(readJson); },
+        render: clibInstallResult,
+        after: function (r) { if (r.ok && typeof reload === 'function') { reload(); } }
+      });
+    });
+    acts.appendChild(install);
+    // cintBtn is stampOperatorOnly'd (hidden, never greyed) — so the REASON is
+    // stated in its place for a customer view, rather than leaving a silent gap.
+    if (!isOperator()) {
+      wrap.appendChild(el('p', { 'class': 'cwstudio-note clib-gate', text: 'Install is unavailable in customer view — installing writes durable console artifacts and requires operator posture plus a bound passport.' }));
+    }
+    out = cintOut(wrap);
+    return wrap;
+  }
+
+  // Paint the whole surface body from ONE read result. Split out from the
+  // renderer so the smoke can drive every honest state (verified index, 404
+  // un-synced, 403 bad signature, verified-but-empty) over a fixture.
+  function clibPaintIndex(body, res, reload) {
+    body.textContent = '';
+    res = res || { ok: false, status: 0, data: null };
+    var problem = (res.data && (res.data.detail || res.data.title)) || '';
+    // 404 is the fresh-daemon case, not a fault: nothing has ever been synced.
+    // Name the command that populates the cache (there is no fetch route to
+    // offer as a button).
+    if (res.status === 404) {
+      body.appendChild(el('p', { 'class': 'cwstudio-note clib-unsynced', text: 'No cached Studio library index on this daemon. Run `' + CLIB_SYNC_CMD + '` to fetch and verify the curator-signed index, then reload this page.' }));
+      if (problem) { body.appendChild(el('p', { 'class': 'cwstudio-note', text: problem })); }
+      return;
+    }
+    // 403 is a TRUST failure, not an absence: a cached index exists but does not
+    // verify against this operator's keyring. Never render its entries.
+    if (res.status === 403) {
+      body.appendChild(el('div', { 'class': 'tstudio-apierr clib-badsig', text: 'The cached Studio library index did NOT verify against this daemon\'s trusted keyring. Nothing from it is shown or installable until the curator key is trusted and the index is re-synced.' }));
+      if (problem) { body.appendChild(el('pre', { 'class': 'cint-verbatim', text: problem })); }
+      return;
+    }
+    if (!res.ok) { cintUnavailable(body, 'The Studio template library', res.status); return; }
+
+    var d = res.data || {};
+    var entries = Array.isArray(d.entries) ? d.entries : [];
+    var head = el('div', { 'class': 'clib-headcard' });
+    head.appendChild(cintRow('curator', d.curator_passport_fpr));
+    head.appendChild(cintRow('index updated', cintWhen(d.updated_at_unix_ms)));
+    head.appendChild(cintRow('entries', entries.length));
+    head.appendChild(cintRow('tier_enforcement', String(d.tier_enforcement || 'advisory') + ' — the catalog server enforces required_tier; this daemon only echoes it'));
+    head.appendChild(el('p', { 'class': 'cwstudio-note clib-syncnote', text: 'This is a CACHED, signature-verified index — the console never fetches the catalog itself. Run `' + CLIB_SYNC_CMD + '` to refresh it, then reload this page.' }));
+    body.appendChild(head);
+
+    if (!entries.length) {
+      body.appendChild(el('p', { 'class': 'cwstudio-note clib-empty', text: 'The verified index carries no entries — the curator has published none yet. (This is a valid, signed index: distinct from an un-synced daemon.)' }));
+      return;
+    }
+
+    var filter = { kind: 'all', text: '' };
+    var controls = el('div', { 'class': 'cint-form clib-filters' });
+    var kindSel = cintSelect(['all'].concat(CLIB_KINDS), 'all');
+    var textInp = cintInput({ ph: 'filter by name, tag or summary' });
+    controls.appendChild(cintField('kind', kindSel));
+    controls.appendChild(cintField('search', textInp));
+    body.appendChild(controls);
+
+    var list = el('div', { 'class': 'clib-list' });
+    body.appendChild(list);
+    function paintList() {
+      list.textContent = '';
+      var shown = clibFilterEntries(entries, filter);
+      if (!shown.length) {
+        list.appendChild(el('p', { 'class': 'cwstudio-note clib-nomatch', text: 'No entry in the verified index matches this filter (' + entries.length + ' total).' }));
+        return;
+      }
+      clibGroupByKind(shown).forEach(function (group) {
+        list.appendChild(el('div', { 'class': 'clib-group', 'data-group': group.kind }, [
+          el('span', { 'class': 'tstudio-field-lab', text: group.label }),
+          el('span', { 'class': 'cwstudio-note', text: group.entries.length + ' entr' + (group.entries.length === 1 ? 'y' : 'ies') })
+        ]));
+        group.entries.forEach(function (e) { list.appendChild(clibEntryCard(e, reload)); });
+      });
+    }
+    kindSel.addEventListener('change', function () { filter.kind = kindSel.value || 'all'; paintList(); });
+    textInp.addEventListener('input', function () { filter.text = textInp.value || ''; paintList(); });
+    paintList();
+  }
+
+  function renderLibraryStudio(host, ctx) {
+    ctx = ctx || {};
+    host.textContent = '';
+    var root = el('div', { 'class': 'cwstudio cwstudio-library' });
+    host.appendChild(root);
+    root.appendChild(el('div', { 'class': 'cwstudio-header' }, [
+      el('div', { 'class': 'cwstudio-title' }, [
+        el('h2', { text: 'Library' }),
+        el('p', { 'class': 'cwstudio-sub', text: 'The central template library: boards, tile designs, workspaces and full packs from a curator-signed catalog. Installing writes NEW console artifacts — an install can only ever add, and a colliding id is remapped rather than overwritten.' })
+      ])
+    ]));
+    if (!isOperator()) {
+      root.appendChild(el('div', { 'class': 'tstudio-banner', text: 'Read-only — customer posture. The catalog is live; installing needs operator posture and a bound passport.' }));
+    }
+    var section = cintSection('library', 'Template library', 'Browsed from the daemon\'s cached, signature-verified index. Install re-verifies the index, pins the published pack sha256 and requires a signed pack.');
+    root.appendChild(section);
+    var grid = cintGrid(section);
+    var card = cintCard('Catalog — curator-signed Studio library');
+    grid.appendChild(card);
+    var load = cintLoading(card);
+    var body = el('div', { 'class': 'cint-cardbody' });
+    card.appendChild(body);
+    function paint() {
+      body.textContent = '';
+      return fetchJSON('/v1/studio/library').then(function (res) {
+        cintDrop(load);
+        clibPaintIndex(body, res, paint);
+      });
+    }
+    return paint();
   }
 
 
@@ -14899,6 +15378,23 @@
     // and provenance rows come from data, not from copy).
     CINT_SECTIONS: CINT_SECTIONS,
     renderIntegrationsStudio: renderIntegrationsStudio,
-    cintScorecard: cintScorecard
+    cintScorecard: cintScorecard,
+    // crux-integrations-and-template-library L1+L2 — Studio › Library. The kind
+    // vocabulary, the entry point, the pure catalog helpers (filter/group) and
+    // the two pure DOM builders the smoke paints over fixtures, plus the shared
+    // artifact-provenance helpers (library install vs manual import).
+    CLIB_KINDS: CLIB_KINDS,
+    renderLibraryStudio: renderLibraryStudio,
+    clibPaintIndex: clibPaintIndex,
+    clibEntryCard: clibEntryCard,
+    clibInstallResult: clibInstallResult,
+    clibFilterEntries: clibFilterEntries,
+    clibGroupByKind: clibGroupByKind,
+    studioProvenanceChip: studioProvenanceChip,
+    studioReadInstalledFrom: studioReadInstalledFrom,
+    studioReadImportedFrom: studioReadImportedFrom,
+    studioImportStamp: studioImportStamp,
+    studioStampImported: studioStampImported,
+    tstudioDesignDef: tstudioDesignDef
   };
 });
