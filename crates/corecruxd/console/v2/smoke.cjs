@@ -4172,15 +4172,36 @@ function extractThemeVars(theme) {
 
   // ---- (9) cx-cost titles + gradient token bars ---------------------------
   var costBody = funcBody(renderSrc, 'renderCostBrowser') || '';
-  check(/var COST_BAR_MAX = 2000000;/.test(costBody), '[m21] the token bar must use a FIXED 2,000,000-token scale');
-  check(/function costBar\(tokens\)/.test(costBody) && /var over = tokens > COST_BAR_MAX;/.test(costBody),
-    '[m21] sessions past the ceiling must clamp and be marked, not rescale the scale');
-  // M24 RETARGET: the scale caption now covers the CHART as well as the rows
-  // (both draw on the same ceiling), so it no longer says "(ctx + out)" — the
-  // chart's bars are output tokens on the same scale. The requirement is
-  // unchanged: a visible max line and a caption that states the fixed ceiling.
-  check(/'class': 'cost-tbar-maxline'/.test(costBody) && /0 → 2,000,000 tokens · fixed scale, chart and rows alike/.test(costBody),
-    '[m21→m24] the max line + its label must be visible (and the label must now cover the chart too)');
+  // M25 RETARGET (operator decision, round 14). M21's requirement was "a FIXED
+  // 2,000,000-token scale"; M24 measured that 51 of the 83 real rows clamp
+  // against it, so the operator resolved the finding by going ADAPTIVE. These
+  // two gates are retargeted honestly — the underlying requirement (two rows
+  // comparable within a view, nothing silently rescaled per row, the 2M mark
+  // still readable) is unchanged; only the mechanism moved.
+  check(/var COST_REF_TOKENS = 2000000;/.test(costBody) && /var COST_SCALE_MIN = 10000;/.test(costBody)
+    && /function computeCostScale\(visible\)/.test(costBody),
+    '[m21→m25] the token bar must use ONE adaptive scale per painted view, keeping 2,000,000 as a named reference');
+  check(/computeCostScale\(visible\);\n      renderChart\(visible\); renderTotals\(visible\);/.test(costBody),
+    '[m25] the scale must be computed BEFORE anything paints, so the chart and every row share one axis');
+  check(/var mx = COST_REF_TOKENS;/.test(costBody) && /var t = sessTokens\(s\); if \(t > mx\) \{ mx = t; \}/.test(costBody)
+    && /var o = Number\(s\.output_tokens\) \|\| 0; if \(o > mx\) \{ mx = o; \}/.test(costBody),
+    '[m25] the adaptive maximum must cover BOTH quantities the page draws (row ctx+out AND chart output) — one length, one meaning');
+  check(/function costPos\(tokens, sc\) \{ sc = sc \|\| costScale; return logBarPos\(tokens, sc\.min, sc\.max\); \}/.test(costBody),
+    '[m25] cx-cost must position its bars through the shared logBarPos helper (the rings arc lens uses the same one)');
+  // The 2M ceiling survives as a REFERENCE TICK on every track, plus a decade
+  // axis, and the caption must state the adaptivity AND the non-proportionality.
+  check(/'class': 'cost-tbar-refline'/.test(costBody)
+    && /ref\.style\.left = \(costPos\(COST_REF_TOKENS\) \* 100\)\.toFixed\(2\) \+ '%';/.test(costBody),
+    '[m21→m25] the 2,000,000-token mark must stay on every track, now as a reference tick at its log position');
+  check(/bar scale: adaptive to the ' \+ costScale\.n \+ ' visible sessions · log, '/.test(costBody)
+    && /length is orders of magnitude, NOT proportion/.test(costBody)
+    && /the tick marks the old fixed 2M ceiling/.test(costBody),
+    '[m25] the scale strip must declare the adaptivity, the range, the reference tick AND that length is not proportional');
+  check(/function costScaleStrip\(\)/.test(costBody) && /'class': 'cost-axis-tick'/.test(costBody)
+    && /for \(var d = COST_SCALE_MIN; d <= costScale\.max \* 1\.0001; d \*= 10\)/.test(costBody),
+    '[m25] the log-ness must be VISIBLE — real decade ticks on the axis, not an assertion in prose');
+  check(/Top sessions by output tokens · same adaptive log scale as the rows/.test(costBody),
+    '[m24→m25] the top-10 chart must stay on the SAME idiom and say which scale it is on');
   check(/fill\.style\.backgroundSize = \(10000 \/ pct\) \+ '% 100%'/.test(costBody),
     '[m21] the gradient must be stretched to the whole track so colour tracks MAGNITUDE, not bar length');
   check(/if \(m && m\.state_title\) \{ return \{ text: m\.state_title, kind: 'title' \}; \}/.test(costBody)
@@ -4540,7 +4561,7 @@ function extractThemeVars(theme) {
     '[m24] the per-turn average must divide like by like — reports with no turn count contribute neither numerator nor denominator');
   check(/var USAGE_BAR_MAX = 2000000;/.test(pagesSrc) && /ramp: true/.test(pagesSrc)
     && /\.ctl-bar-fill\.ramp \{\n    background-image: linear-gradient\(90deg, var\(--ok\) 0%, var\(--trust\) 34%, var\(--warn\) 68%, var\(--crit\) 100%\);/.test(shellHtml),
-    '[m24] cx-usage bars must use the cost lens\'s gradient on the cost lens\'s fixed 2M ceiling');
+    '[m24→m25] cx-usage bars must use the cost lens\'s gradient on the 2,000,000-token mark — which cx-cost now draws as its REFERENCE tick rather than its ceiling (cx-usage keeps a fixed scale: it plots one averaged session size, not a ranked 5-order-of-magnitude spread)');
 
   // ---- (5) ring dots shrink with zoom ------------------------------------
   var ringsBody = funcBody(renderSrc, 'renderRings') || '';
@@ -4552,7 +4573,164 @@ function extractThemeVars(theme) {
   check(/window\.__ringsZ = Z; window\.__ringsDotScale = zdot;/.test(ringsBody),
     '[m24] the zoom/dot-size relationship must be measurable from the mirror, not merely asserted');
 
+  // =====================================================================
+  //  M25 — operator round 14: adaptive session bars + the ExecPlans-arc lens
+  // =====================================================================
+  (function m25Gates() {
+    // ---- (1) the shared log bar scale (pure; unit-tested, not asserted) ----
+    check(typeof render.logBarPos === 'function', '[m25] logBarPos must be exported as the console-wide bar scale');
+    check(render.logBarPos(0, 1e4, 1e8) === 0 && render.logBarPos(-5, 1e4, 1e8) === 0,
+      '[m25] a zero/negative token count must be 0 on the axis, never a fabricated stub');
+    check(Math.abs(render.logBarPos(1e4, 1e4, 1e8) - 0) < 1e-9 && Math.abs(render.logBarPos(1e8, 1e4, 1e8) - 1) < 1e-9,
+      '[m25] the axis must run exactly floor→max');
+    check(Math.abs(render.logBarPos(1e6, 1e4, 1e8) - 0.5) < 1e-9,
+      '[m25] the axis must be LOGARITHMIC (1e6 is the geometric midpoint of 1e4..1e8)');
+    check(render.logBarPos(500, 1e4, 1e8) === 0,
+      '[m25] anything at or below the floor is a stub, not a rescale of the whole axis');
+    // The measured claim the design rests on: on the review corpus (max
+    // 613,105,748, median 3,171,069) linear-to-max buries the median row and the
+    // log axis does not. Asserted with the real numbers.
+    var LMAX = 613105748, LMED = 3171069;
+    check((LMED / LMAX) < 0.006, '[m25] the linear-to-max alternative must be shown to bury the median row (<0.6% of the track)');
+    check(render.logBarPos(LMED, 10000, LMAX) > 0.45 && render.logBarPos(LMED, 10000, LMAX) < 0.6,
+      '[m25] on the shipped log axis the same median row must land mid-track');
+
+    // ---- (2) the ExecPlans-arc lens registry + geometry --------------------
+    var ringsBody25 = funcBody(renderSrc, 'renderRings') || '';
+    check(/var tArc = tileEl\('arc', '#34d399', 'ExecPlans arc', '—'\);/.test(ringsBody25)
+      && /var tileByLens = \{ work: tWork, arc: tArc, data: tData, memory: tMem, sessions: tSess, tokens: tTok \};/.test(ringsBody25),
+      '[m25] the arc lens must join the SAME tile registry as the five incumbents (one new tile, none replaced)');
+    check(/\[tWork\.b, tArc\.b, tData\.b, tMem\.b, tSess\.b, tTok\.b, glFacts\.el/.test(ringsBody25),
+      '[m25] the new tile must be mounted in the existing card group, in lens order');
+    check(/var ARC_A0 = -Math\.PI \/ 2;/.test(ringsBody25) && /var ARC_SPAN = Math\.PI \* 1\.5;/.test(ringsBody25),
+      '[m25] the arc must be 270° starting at 12 o’clock (clockwise to 9 o’clock)');
+    check(/if \(lens === 'arc'\) \{ drawArcLens\(ctx2, g, time\); return; \}/.test(ringsBody25)
+      && /if \(lens === 'arc'\) \{ arcStep\(dt\); \}/.test(ringsBody25)
+      && /if \(lens === 'arc'\) \{ arcPointerMove\(e\); return; \}/.test(ringsBody25)
+      && /if \(lens === 'arc'\) \{ arcClick\(e\); return; \}/.test(ringsBody25),
+      '[m25] the lens must be dispatched additively — one guarded branch per shared entry point, no existing branch rewritten');
+    // Every incumbent lens branch must still be exactly where it was.
+    check(/if \(lens === 'data'\) \{ drawDataLens\(ctx2, g\); return; \}/.test(ringsBody25)
+      && /if \(lens === 'tokens'\) \{ drawTokensLens\(ctx2, g\); return; \}/.test(ringsBody25)
+      && /if \(lens === 'receipts'\) \{ drawReceiptsLens\(ctx2, g, time\); return; \}/.test(ringsBody25),
+      '[m25] the incumbent lens dispatch must be untouched');
+    check(/window\.__ringsArc = \{ tracks: vis\.length/.test(ringsBody25),
+      '[m25] the arc lens must publish a dev probe so the population + ordering claims are measurable from the mirror');
+
+    // ---- (3) no second network read: the arc rides the existing feeds ------
+    check(/arcWork = j\.work \|\| \[\]; arcBuild\(\);/.test(ringsBody25)
+      && /arcFactIdx = idx; arcBuild\(\);/.test(ringsBody25),
+      '[m25] the arc model must be fed from the SAME /v1/work response and the SAME fact walk — no lens-private fetch');
+
+    // ---- (4) progress: measured vs estimated, never blurred ----------------
+    var pm = render.arcProgress({ state: 'in_progress', current_milestone: 'M4', milestones_total: 8 });
+    check(pm.f === 0.5 && pm.via === 'milestone' && pm.measured === true,
+      '[m25] current_milestone / milestones_total must be the measured progress path');
+    var pd = render.arcProgress({ state: 'in_progress', milestones_done: 3, milestones_total: 6 });
+    check(pd.f === 0.5 && pd.via === 'done' && pd.measured === true,
+      '[m25] milestones_done / milestones_total must be the second measured path');
+    var ps = render.arcProgress({ state: 'in_progress' });
+    check(ps.via === 'state' && ps.measured === false,
+      '[m25] a plan that reports NO milestone position must be flagged unmeasured, never presented as measured');
+    check(render.arcProgress({ state: 'complete' }).f === 1 && render.arcProgress({ state: 'archive' }).f === 1,
+      '[m25] a completed plan must reach 9 o’clock');
+    check(render.arcProgress({ state: 'complete', milestones_done: 2, milestones_total: 6 }).f === 1,
+      '[m25] a completed plan whose milestone counters LAG (measured on the real corpus) must still reach 9 o’clock — the declared state wins');
+    check(/ctx2\.setLineDash\(meas \? \[\] : \[5 \/ Z, 5 \/ Z\]\);/.test(ringsBody25)
+      && /solid arc = measured \(current_milestone \/ milestones_total\) · dashed = state-estimated/.test(ringsBody25),
+      '[m25] estimated progress must be visually distinct (dashed) AND named in the on-canvas note');
+
+    // ---- (5) radial order: newest innermost, oldest at the rim ------------
+    var mk = function (id, start, upd, st) {
+      return { id: 'execplan:' + id, state: st || 'in_progress', updated_at_unix_ms: upd, created_at_unix_ms: start };
+    };
+    var now25 = 1784938789271, D = 86400000;
+    var selA = render.arcSelectPlans([
+      mk('old', now25 - 60 * D, now25 - D),
+      mk('new', now25 - 2 * D, now25),
+      mk('mid', now25 - 30 * D, now25 - 2 * D)
+    ], now25, 16);
+    check(selA.picked.map(function (w) { return w.id; }).join(',') === 'execplan:new,execplan:mid,execplan:old',
+      '[m25] tracks must be ordered NEWEST first (index 0 = innermost), oldest at the outer edge');
+    check(render.arcStartMs({ created_at_unix_ms: 5, provenance: { first_activity_unix_ms: 7 } }).via === 'provenance.first_activity'
+      && render.arcStartMs({ created_at_unix_ms: 5 }).via === 'created_at',
+      '[m25] the ordering key must prefer the plan\'s own first-activity provenance and DECLARE which source it used');
+
+    // ---- (6) population honesty on a 1,000-plan corpus --------------------
+    var many = [];
+    for (var i = 0; i < 400; i++) { many.push(mk('a' + i, now25 - (i + 1) * D, now25 - i * 1000, 'in_progress')); }
+    for (var j = 0; j < 300; j++) { many.push(mk('c' + j, now25 - (j + 1) * D, now25 - j * 1000, 'complete')); }
+    for (var k = 0; k < 300; k++) { many.push(mk('p' + k, now25 - (k + 1) * D, now25 - k * 1000, 'planned')); }
+    var selB = render.arcSelectPlans(many, now25, render.ARC_TRACK_CAP);
+    check(selB.picked.length === render.ARC_TRACK_CAP, '[m25] the population must be capped to what stays readable');
+    check(selB.total === 1000, '[m25] the cap must report the FULL corpus size it is a subset of');
+    check(selB.picked.filter(function (w) { return w.state === 'planned'; }).length === 0,
+      '[m25] the default population is active-first — never a silent sample of everything');
+    check(selB.completing > 0 && selB.picked.filter(function (w) { return w.state === 'complete'; }).length === selB.completing,
+      '[m25] recently-completed plans must keep slots (they are the ones mid-fade)');
+    check(/showing ' \+ vis\.length \+ ' of ' \+ arcTotal \+ ' plans — active first/.test(ringsBody25),
+      '[m25] the canvas must carry the "showing N of M" count note');
+
+    // ---- (7) dot placement: the mapping is declared, per dot --------------
+    check(render.arcKeyMilestone('gate:M7') === 7 && render.arcKeyMilestone('milestone:M3.2') === 3.2
+      && render.arcKeyMilestone('decision:idp') === null,
+      '[m25] milestone facts must be recognised from the real key convention (gate:M<n> / milestone:M<n>)');
+    var byIdx = render.arcFactFrac({ key: 'gate:M3', ms: 0 }, 6, [], 0, 100);
+    check(byIdx.f === 0.5 && byIdx.via === 'index', '[m25] an indexed milestone fact must sit exactly at n/total');
+    var marks25 = [{ ms: 0, f: 0 }, { ms: 100, f: 1 }];
+    var byBucket = render.arcFactFrac({ key: 'decision:x', ms: 50 }, 6, marks25, 0, 100);
+    check(byBucket.via === 'bucket' && Math.abs(byBucket.f - 0.5) < 1e-9,
+      '[m25] a non-milestone fact must fall in the milestone BUCKET it was written in when the plan has indexed milestones');
+    var byTime = render.arcFactFrac({ key: 'decision:x', ms: 25 }, 0, [], 0, 100);
+    check(byTime.via === 'time' && Math.abs(byTime.f - 0.25) < 1e-9,
+      '[m25] with no milestone axis available the fallback must be the plan timeline fraction — and say so');
+    check(/' placed by milestone index, ' \+ \(arcViaMix\.bucket \|\| 0\) \+ ' by milestone bucket, ' \+ \(arcViaMix\.time \|\| 0\) \+ ' by timeline fraction'/.test(ringsBody25),
+      '[m25] the canvas must publish HOW MANY dots used each mapping — the reader can see the approximation');
+    check(render.arcDotKind('gate:M1') === 'milestone' && render.arcDotKind('milestone:M2') === 'milestone'
+      && render.arcDotKind('decision:auth') === 'decision' && render.arcDotKind('handoff:2026-07-24') === 'handoff'
+      && render.arcDotKind('design:foo') === 'fact',
+      '[m25] the dot vocabulary must key off the real fact-key convention');
+    check(/var rr = \(big \? 3\.6 : 2\.3\) \* zdot \*/.test(ringsBody25) && /var zdot = zoomDotScale\(\);   \/\/ M24/.test(ringsBody25),
+      '[m25] arc dots must reuse M24\'s zoomDotScale so zoom separates clusters here too');
+
+    // ---- (8) completion fade + inward collapse ---------------------------
+    var trkDone = { startMs: 0, done: true, doneMs: 1000 };
+    check(render.arcAlphaAt(trkDone, 1000) === 1
+      && Math.abs(render.arcAlphaAt(trkDone, 1000 + 5 * D) - 0.5) < 1e-9
+      && render.arcAlphaAt(trkDone, 1000 + 20 * D) === 0,
+      '[m25] a completed plan must fade to nothing over ARC_FADE_DAYS');
+    check(render.arcAlphaAt({ startMs: 500, done: false }, 100) === 0
+      && render.arcAlphaAt({ startMs: 500, done: false }, 600) === 1,
+      '[m25] a plan not yet started at the scrub time must be absent — that is how a new plan enters and pushes the stack outward');
+    check(/if \(t\.alphaT > 0\.02\) \{ slots\.push\(t\); \}/.test(ringsBody25)
+      && /slots\.forEach\(function \(t, i\) \{ t\.rT = n > 1 \? rIn \+ \(rOut - rIn\) \* \(i \/ \(n - 1\)\) : \(rIn \+ rOut\) \/ 2; \}\);/.test(ringsBody25)
+      && /var k = REDUCED \? 1 : Math\.min\(1, dt \* 6\);/.test(ringsBody25),
+      '[m25] a faded-out track must surrender its slot and the survivors must EASE inward (instant under reduced motion)');
+
+    // ---- (9) the 12 o'clock label column + leftward token bars ------------
+    check(/var LBLW = g\.R \* 0\.44, BARW = g\.R \* 0\.18/.test(ringsBody25)
+      && /ctx2\.textAlign = 'right';/.test(ringsBody25)
+      && /ctx2\.fillRect\(barRight - w2, y - 2 \/ Z, w2, 4 \/ Z\);/.test(ringsBody25),
+      '[m25] each track must carry a right-aligned title LEFT of the 12 o’clock line with its token bar extending further left');
+    check(/var w2 = BARW \* logBarPos\(t\.burn, ARC_BAR_MIN, arcBarMax\);/.test(ringsBody25)
+      && /var ARC_BAR_MIN = 10000;/.test(ringsBody25)
+      && /if \(t\.burn\) \{/.test(ringsBody25),
+      '[m25] the token bar must use the SAME adaptive log idiom as cx-cost, and a plan with no reported burn must get NO bar');
+    check(/token burn \(log, 10k → ' \+ arcNum\(arcBarMax\) \+ '\)/.test(ringsBody25),
+      '[m25] the token-bar column must label its own scale');
+
+    // ---- (10) theme + interaction reuse ----------------------------------
+    check(/hex2rgba\(PAL\.done, 0\.42\)/.test(ringsBody25) && /arcHue/.test(ringsBody25)
+      && !/#[0-9a-f]{6}'\)/i.test((funcBody(renderSrc, 'drawArcLens') || '')),
+      '[m25] the arc lens must draw from the theme-responsive PAL/KIND_HUE tokens only — no hard-coded canvas colours');
+    check(/setSel\(\{ type: 'plan', p: PLANS\[i\] \}\);/.test(ringsBody25),
+      '[m25] clicking a track must open the EXISTING plan detail pane, not a forked one');
+    check(/showTip\(e\.clientX, e\.clientY, \[tb\(h\.dot\.key\)/.test(ringsBody25),
+      '[m25] hover must use the existing tooltip idiom');
+  })();
+
   notes.push('operator round 13 (M24): the compact rail\'s native `title` tooltips are REMOVED from all three row builders (dest buttons, sub-page icons, the account badge) and replaced by ONE console-drawn glass chip — a body-level position:fixed .rail-hlabel that cannot be clipped by #nav\'s scroll region, eased out from BEHIND the bar (the rail takes z-index 6 over the chip\'s 5) after 900ms of steady hover, centred on the row, 200ms transform+opacity on the accordion\'s own cubic-bezier, snapping under reduced motion, and dismissed by mouseleave / any scroll / click / Escape / route change; aria-label carries the accessible name unchanged (data-hlabel is what the chip reads), and the expanded rail is untouched. cx-cost: the top-sessions chart now calls the SAME costBar() as the rows — same track, gradient, height and fixed 2,000,000-token ceiling (fixed beat proportional-to-max: a proportional chart would put a full-width bar directly above a row bar of the same length meaning 2M) — labelled by the cx-sessions naming chain instead of raw UUIDs, and the chart\'s own flat bar CSS is deleted. Tokens-per-turn ships as a first-class signal beside the magnitude bar (turns / ctx-per-turn / out-per-turn chips, four new sorts, missing turn counts declared rather than zeroed, unsortable rows sinking) and "how to cut it" becomes real: five named thresholds over THIS session\'s numbers, each recommendation naming a feature the daemon ships (token_budget QC.2 · query_scan→query_expand · save_session/get_session · store_fact/query_facts), the thresholds published in an inline help note, no savings percentage claimed anywhere, and a session that trips nothing getting no line at all. cx-usage ("Average Token Usage") was STATIC — every figure a literal in STATIC[\'cx-usage\'] painted as page()\'s pre-load skeleton, plus a −31% savings card measured against an invented baseline, while its declared /v1/observations/aggregate feed was never called; the static entry is DELETED and the page is computed from /v1/cost/report (period + per-session + per-turn averages, session size on the same 2M gradient scale, a real bucketed output series), with the savings card replaced by a statement that no counterfactual is measured. Ring dots are damped by Z^0.6 with a 0.28 floor and an exact identity at or below overview zoom, so clusters separate as you zoom in; the factor is computed once per frame and published as __ringsZ/__ringsDotScale so the claim is measurable.');
+  notes.push('operator round 14 (M25): cx-cost\'s bar scale goes ADAPTIVE — M21\'s fixed 2,000,000-token ceiling clamped 51 of the 83 real session reports, so the page now computes ONE log axis per painted view over both quantities it draws (row ctx+out AND chart output), floor 10k, max = the visible maximum, never below 2M. Log beat the two linear alternatives on the measured distribution (max 613,105,748 · p90 144,734,710 · median 3,171,069): linear-to-max puts the median row at 0.5% of the track and linear-capped-at-p90 puts it at 2.2% while re-clamping eight rows — the exact failure being fixed — where the log axis lands it at ~52%. The 2M ceiling survives as a REFERENCE TICK at its log position on every track plus a named tick on a decade-ticked axis strip, and the caption states the adaptivity, the range, the tick and that length is orders of magnitude and NOT proportion; the top-10 chart stays on the identical costBar idiom and says which scale it is on. Rings gains a sixth, strictly additive lens: ExecPlans arc — a 270° arc per plan from 12 o\'clock clockwise to 9 o\'clock where the angular axis is fraction-of-declared-milestones, so a just-started plan is a line at 12 and a completed plan reaches 9; progress is measured from current_milestone/milestones_total (or milestones_done/total, or the declared complete state) and drawn SOLID, while a plan reporting no milestone position gets a nominal state fraction drawn DASHED and counted in the on-canvas note. Dots ride the arc: big diamonds for gate:/milestone: facts placed exactly at n/total, smaller circles for decisions, handoffs and other facts placed in the milestone BUCKET they were written in (or, with no milestone axis available, at their timeline fraction) — with the per-mapping counts published on the canvas — all damped by M24\'s zoomDotScale. The newest plan is innermost (ordered by provenance.first_activity, falling back to created_at, and which source was used is stated); a new plan pushes the stack outward and a completed one fades over 10 days and the survivors ease inward to fill the slot, instantly under reduced motion. Titles sit right-aligned LEFT of the 12 o\'clock line with a token-burn bar extending further left on the same shared logBarPos idiom as cx-cost (no reported burn = no bar). The default population is active-first, capped at 16 tracks with 4 slots held for just-completed plans, labelled "showing N of M plans"; the model is fed from the SAME /v1/work response and the SAME fact walk the data lens already performs, so the lens adds no network read. Every incumbent lens branch, tile and dispatch line is asserted untouched.');
 })();
 
 // ---- Report (awaits async renderer-driven checks) -----------------------

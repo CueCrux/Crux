@@ -3185,13 +3185,15 @@
   .cost-method.link { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); background: color-mix(in srgb, var(--ok) 11%, transparent); }
   .cost-method.window { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); background: color-mix(in srgb, var(--warn) 11%, transparent); }
   .cost-out { color: var(--acc); border-color: color-mix(in srgb, var(--acc) 32%, transparent); }
-  /* ---- M21: named cost rows + the fixed-scale token bar --------------------
-     Every bar reads against ONE 2,000,000-token ceiling, so two rows are
-     comparable across filters and pages. The fill's gradient is stretched to the
-     full TRACK (background-size set inline from the percentage), which makes the
-     colour a function of magnitude rather than of the bar's own length: a small
-     session is green because it is small. Sessions past the ceiling clamp at
-     full width and carry the over-scale marker — never a silent rescale. */
+  /* ---- M21 → M25: named cost rows + the ADAPTIVE LOG token bar -------------
+     M21's fixed 2,000,000-token ceiling clamped 51 of 83 real rows, so the scale
+     is now adaptive: one log axis per painted view, spanning 10k → the visible
+     maximum, shared by the rows and the top-sessions chart. The fill's gradient
+     is still stretched to the full TRACK (background-size set inline from the
+     percentage), so colour is a function of position on the axis rather than of
+     the bar's own length. The 2M ceiling survives as the .cost-tbar-refline tick
+     drawn at its log position on every track, and the caption states plainly
+     that length is orders of magnitude, not proportion. */
   /* M21 — the session ALLOCATION panel: how many sessions carry an identity and
      a plan link, with the structural reason underneath. Plain counts, no gauge
      theatre. */
@@ -3220,21 +3222,37 @@
     background-repeat: no-repeat; background-size: 100% 100%;
     transition: width .3s cubic-bezier(.16,1,.3,1);
   }
-  /* The max line: the ceiling, drawn at the right edge of every track. */
-  .cost-tbar-maxline { position: absolute; top: -1px; bottom: -1px; right: 0; width: 2px; background: var(--ink3); opacity: .75; }
+  /* M25 — the REFERENCE tick: 2,000,000 tokens at its log position on the axis
+     (the ceiling M21/M24 drew as a wall at the right edge). Positioned inline. */
+  .cost-tbar-refline { position: absolute; top: -1px; bottom: -1px; width: 2px; margin-left: -1px; background: var(--ink3); opacity: .55; }
   .cost-tbar-track.is-over { border-color: var(--crit); }
-  .cost-tbar-track.is-over .cost-tbar-maxline { background: var(--crit); opacity: 1; width: 3px; }
+  .cost-tbar-track.is-over .cost-tbar-refline { background: var(--crit); opacity: 1; width: 3px; }
   .cost-tbar-vals { display: flex; align-items: baseline; gap: 5px; flex: none; }
   .cost-tbar-v { font-family: var(--font-mono); font-size: 11.5px; color: var(--ink); font-variant-numeric: tabular-nums; }
   .cost-tbar-max { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink3); }
   .cost-tbar.is-over .cost-tbar-max { color: var(--crit); }
-  .cost-scale { display: flex; align-items: center; gap: 10px; padding: 2px 0 6px; flex-wrap: wrap; }
+  .cost-scale { display: flex; align-items: center; gap: 10px 14px; padding: 2px 0 10px; flex-wrap: wrap; }
   .cost-scale-k { font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--ink3); }
-  .cost-scale-ramp {
-    width: 120px; height: 8px; border-radius: 999px; border: 1px solid var(--edge);
+  /* M25 — the scale strip is a real AXIS: the gradient ramp with decade ticks at
+     their log positions, plus the named 2M reference tick. It is the one place
+     that shows the reader what the log spacing looks like. */
+  .cost-axis { position: relative; flex: 1 1 260px; min-width: 220px; height: 24px; }
+  .cost-axis-ramp {
+    height: 8px; border-radius: 999px; border: 1px solid var(--edge);
     background-image: linear-gradient(90deg, var(--ok) 0%, var(--trust) 34%, var(--warn) 68%, var(--crit) 100%);
   }
-  .cost-scale-v { font-size: 11.5px; color: var(--ink3); }
+  .cost-axis-tick {
+    position: absolute; top: 12px; transform: translateX(-50%); white-space: nowrap;
+    font-family: var(--font-mono); font-size: 9.5px; color: var(--ink3); font-variant-numeric: tabular-nums;
+  }
+  .cost-axis-tick::before { content: ''; position: absolute; left: 50%; top: -10px; width: 1px; height: 9px; background: var(--ink3); opacity: .55; }
+  .cost-axis-tick.is-first { transform: none; }
+  .cost-axis-tick.is-last { transform: translateX(-100%); }
+  .cost-axis-tick.is-first::before { left: 0; }
+  .cost-axis-tick.is-last::before { left: auto; right: 0; }
+  .cost-axis-tick.is-ref { color: var(--ink2); font-weight: 650; }
+  .cost-axis-tick.is-ref::before { width: 2px; opacity: 1; background: var(--ink2); }
+  .cost-scale-v { flex: 1 1 100%; font-size: 11.5px; color: var(--ink3); }
   @media (prefers-reduced-motion: reduce) { .cost-tbar-fill { transition: none; } }
   .cost-chart { display: flex; flex-direction: column; gap: 4px; }
   .cost-chart:empty { display: none; }

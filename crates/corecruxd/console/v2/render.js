@@ -157,6 +157,25 @@
     return cur;
   }
 
+  // ---- M25: ONE token-magnitude bar scale for the whole console -------------
+  // Pure. Returns the 0..1 position of `tokens` on a LOGARITHMIC axis running
+  // from `min` to `max`. Adopted in M25 because token magnitudes across the real
+  // corpus span five orders of magnitude (10k → 613M on the review mirror), a
+  // range no linear axis can draw: linear-to-max puts the median row at 0.5% of
+  // the track, and a quantile cap re-clamps the top decile — the failure M25 was
+  // opened to fix. Log renders the whole range at the cost of proportionality,
+  // so every surface that uses it must SAY it is a log scale (cx-cost's scale
+  // strip + aria-labels; the rings ExecPlans-arc lens's token-bar caption).
+  // Anything at or below `min` is a stub, not a lie about zero: callers pass
+  // 0-token rows through and get 0 back.
+  function logBarPos(tokens, min, max) {
+    var t = Number(tokens);
+    if (!isFinite(t) || t <= 0) { return 0; }
+    var lo = Math.log(Math.max(1, min)), hi = Math.log(Math.max(max, min * 10));
+    if (!(hi > lo)) { return 0; }
+    return Math.max(0, Math.min(1, (Math.log(Math.max(t, min)) - lo) / (hi - lo)));
+  }
+
   function el(tag, attrs, children) {
     var node = doc().createElement(tag);
     if (attrs) {
@@ -10042,11 +10061,53 @@
     // rung it landed on: title → state_first_line (the first conventional
     // summary line) → a short id, labelled untitled.
     //
-    // COST_BAR_MAX is a FIXED 2,000,000-token scale, not a per-page max: two
-    // sessions are comparable across filters, pages and days because the bar
-    // always means the same thing. A session past the ceiling clamps at full
-    // width and is marked over-scale rather than silently rescaling everything.
-    var COST_BAR_MAX = 2000000;
+    // ---- M25: the bar scale goes ADAPTIVE (operator decision, round 14) -----
+    // M21 shipped a FIXED 2,000,000-token ceiling. M24 measured what that costs
+    // on the real corpus (GET /v1/cost/report?tenant_id=default, 83 posted
+    // session reports on the review mirror): 51 of the 83 rows sit PAST 2M, so
+    // more than half the page drew the same clamped full-width bar and the bar
+    // stopped ranking anything. The operator's decision resolving that finding is
+    // this milestone: scale to the data.
+    //
+    // WHICH adaptive scale — decided on the measured distribution, not taste
+    // (ctx + out per session, same corpus):
+    //     max 613,105,748 · p90 144,734,710 · median 3,171,069 · min 0
+    //   · linear to the visible MAX  → the median row is 0.5% of the track. The
+    //     one 613M outlier flattens 80 rows into invisible stubs.
+    //   · linear capped at p90       → the median row is 2.2% AND eight rows
+    //     clamp at full width — i.e. it reintroduces the very failure being fixed.
+    //   · log10, floor 10k → max     → the median row is ~52% of the track and
+    //     every row from 10k to 613M separates.
+    // The spread is five orders of magnitude; only a log axis renders it. The
+    // price is that LENGTH IS NO LONGER PROPORTIONAL — a bar twice as long is not
+    // twice the tokens — so the page says exactly that, in the scale strip, in
+    // every bar's aria-label and in the expanded detail. The strip carries real
+    // decade ticks (10k · 100k · 1M · 10M · 100M) so the log-ness is visible
+    // rather than merely asserted.
+    //
+    // The 2,000,000 ceiling does NOT disappear: it stays on every track as a
+    // REFERENCE TICK, so the mark the previous rounds trained the eye on is
+    // still readable — now as a landmark on the axis instead of a wall.
+    var COST_REF_TOKENS = 2000000;    // the M21/M24 fixed ceiling, kept as a tick
+    var COST_SCALE_MIN = 10000;       // log floor — below 10k a session is a stub
+    // ONE scale per painted view, computed over BOTH quantities this page draws
+    // (row bars = ctx+out, chart bars = output) so one length means one thing on
+    // one screen — M24's consistency rule, carried forward. Never below the 2M
+    // reference, so the reference tick is always on the track.
+    var costScale = { min: COST_SCALE_MIN, max: COST_REF_TOKENS, n: 0 };
+    function computeCostScale(visible) {
+      var mx = COST_REF_TOKENS;
+      (visible || []).forEach(function (s) {
+        var t = sessTokens(s); if (t > mx) { mx = t; }
+        var o = Number(s.output_tokens) || 0; if (o > mx) { mx = o; }
+      });
+      costScale = { min: COST_SCALE_MIN, max: mx, n: (visible || []).length };
+      return costScale;
+    }
+    // 0..1 position of a token count on the current log axis (logBarPos is the
+    // console-wide helper — the rings ExecPlans-arc lens draws its per-plan
+    // token bars on the same idiom so the two surfaces agree).
+    function costPos(tokens, sc) { sc = sc || costScale; return logBarPos(tokens, sc.min, sc.max); }
     function sessTokens(s) { return (Number(s.context_tokens) || 0) + (Number(s.output_tokens) || 0); }
     function sessMeta(s) { return state.meta[s.session_id] || null; }
     // { text, kind } — kind ∈ title | first_line | id (drives the honest label).
@@ -10057,30 +10118,54 @@
       return { text: shortId(s.session_id), kind: 'id' };
     }
     var COST_UNTITLED_HINT = '(untitled — agents: set title/summary in save_session state)';
-    // One horizontal gradient bar, magnitude-coloured against the fixed ceiling.
-    // The gradient is sized to the WHOLE track, so a given colour always means a
-    // given token count — a short bar is green because it is small, not because
-    // it is short.
+    // One horizontal gradient bar on the adaptive log axis. The gradient is still
+    // sized to the WHOLE track, so a given colour always means a given position
+    // on the scale — a short bar is green because it is small, not because it is
+    // short. Every track carries the 2,000,000-token REFERENCE TICK at its log
+    // position, so the old fixed ceiling stays readable as a landmark.
     function costBar(tokens) {
-      var over = tokens > COST_BAR_MAX;
-      var pct = Math.max(0, Math.min(100, (tokens / COST_BAR_MAX) * 100));
+      var over = tokens > costScale.max;   // cannot happen within a painted view
+      var pct = costPos(tokens) * 100;
       var fill = el('div', { 'class': 'cost-tbar-fill' });
-      fill.style.width = (over ? 100 : Math.max(pct, tokens > 0 ? 0.6 : 0)) + '%';
+      fill.style.width = Math.max(pct, tokens > 0 ? 0.6 : 0) + '%';
       if (pct > 0.6) { fill.style.backgroundSize = (10000 / pct) + '% 100%'; }
-      var track = el('div', { 'class': 'cost-tbar-track' + (over ? ' is-over' : '') }, [
-        fill,
-        el('span', { 'class': 'cost-tbar-maxline', 'aria-hidden': 'true' })
-      ]);
+      var ref = el('span', { 'class': 'cost-tbar-refline', 'aria-hidden': 'true' });
+      ref.style.left = (costPos(COST_REF_TOKENS) * 100).toFixed(2) + '%';
+      var track = el('div', { 'class': 'cost-tbar-track' + (over ? ' is-over' : '') }, [fill, ref]);
       var vals = el('div', { 'class': 'cost-tbar-vals' }, [
         el('span', { 'class': 'cost-tbar-v', text: compactN(tokens) }),
-        el('span', { 'class': 'cost-tbar-max', text: over ? 'over 2M' : '/ 2M' })
+        el('span', { 'class': 'cost-tbar-max', text: '/ ' + compactN(costScale.max) })
       ]);
       var wrap = el('div', {
         'class': 'cost-tbar' + (over ? ' is-over' : ''),
         role: 'img',
-        'aria-label': compactN(tokens) + ' tokens of a fixed 2,000,000-token scale' + (over ? ' (over scale — clamped)' : '')
+        'aria-label': compactN(tokens) + ' tokens on a logarithmic bar scale from ' + compactN(COST_SCALE_MIN)
+          + ' to ' + compactN(costScale.max) + ' tokens, adaptive to the ' + costScale.n
+          + ' sessions in view; bar length is orders of magnitude, not proportion. Tick marks 2,000,000 tokens.'
       }, [track, vals]);
       return wrap;
+    }
+    // The scale strip: a real axis. Decade ticks make the log spacing visible,
+    // the 2M reference tick is called out by name, and the caption states the
+    // adaptivity, the range and the non-proportionality in one line.
+    function costScaleStrip() {
+      var axis = el('div', { 'class': 'cost-axis' }, [el('div', { 'class': 'cost-axis-ramp', 'aria-hidden': 'true' })]);
+      for (var d = COST_SCALE_MIN; d <= costScale.max * 1.0001; d *= 10) {
+        var lp = costPos(d) * 100;
+        // Edge ticks anchor to the edge instead of centring, so the first label
+        // does not hang off the left of the axis and collide with the caption.
+        var tk2 = el('span', { 'class': 'cost-axis-tick' + (lp < 2 ? ' is-first' : (lp > 98 ? ' is-last' : '')), text: compactN(d) });
+        tk2.style.left = lp.toFixed(2) + '%';
+        axis.appendChild(tk2);
+      }
+      var refT = el('span', { 'class': 'cost-axis-tick is-ref', text: '2M ref' });
+      refT.style.left = (costPos(COST_REF_TOKENS) * 100).toFixed(2) + '%';
+      axis.appendChild(refT);
+      return el('div', { 'class': 'cost-scale' }, [
+        el('span', { 'class': 'cost-scale-k', text: 'TOKEN BAR' }),
+        axis,
+        el('span', { 'class': 'cost-scale-v', text: 'bar scale: adaptive to the ' + costScale.n + ' visible sessions · log, ' + compactN(COST_SCALE_MIN) + ' → ' + compactN(costScale.max) + ' tokens · chart and rows alike · length is orders of magnitude, NOT proportion · the tick marks the old fixed 2M ceiling' })
+      ]);
     }
 
     // ---- M24: tokens-per-turn, and advice computed from it -----------------
@@ -10135,7 +10220,7 @@
     var ADV_CTX_PER_TURN = 200000;  // context tokens carried per assistant turn
     var ADV_TURNS = 300;            // assistant turns in one session
     var ADV_OUT_PER_TURN = 2500;    // output tokens per assistant turn
-    var ADV_TOTAL = COST_BAR_MAX;   // ctx + out past the 2M bar ceiling
+    var ADV_TOTAL = COST_REF_TOKENS;   // ctx + out past the 2,000,000-token reference mark
     function costAdvice(s) {
       var out = [];
       var r = ctxRatio(s), cpt = ctxPerTurn(s), t = turnsOf(s), opt = outPerTurn(s);
@@ -10152,7 +10237,7 @@
         out.push({ tag: 'verbose turns', text: compactN(Math.round(opt)) + ' output tokens per turn — write long artefacts (plans, audits, tables) to files and reference the path, so the transcript carries the pointer instead of the document.' });
       }
       if (sessTokens(s) > ADV_TOTAL) {
-        out.push({ tag: 'over scale', text: compactN(sessTokens(s)) + ' total tokens, past the 2M bar ceiling — this one session is the budget; it is the first candidate for a split.' });
+        out.push({ tag: 'over scale', text: compactN(sessTokens(s)) + ' total tokens, past the 2M reference mark — this one session is the budget; it is the first candidate for a split.' });
       }
       return out;
     }
@@ -10356,7 +10441,7 @@
       }
       detail.appendChild(sectionLabel('burn'));
       detail.appendChild(kvGrid([
-        ['total tokens (ctx+out)', compactN(sessTokens(s)) + '  (' + sessTokens(s) + ')  ·  bar scale 2,000,000'],
+        ['total tokens (ctx+out)', compactN(sessTokens(s)) + '  (' + sessTokens(s) + ')  ·  bar: log scale ' + COST_SCALE_MIN.toLocaleString() + ' → ' + costScale.max.toLocaleString() + ' (adaptive to the ' + costScale.n + ' sessions in view)'],
         ['context tokens (Σ)', compactN(s.context_tokens || 0) + '  (' + (s.context_tokens || 0) + ')'],
         ['output tokens (Σ)', compactN(s.output_tokens || 0) + '  (' + (s.output_tokens || 0) + ')'],
         ['assistant turns', turnsOf(s) != null ? String(turnsOf(s)) : 'unavailable — this report carries no turn count'],
@@ -10407,7 +10492,7 @@
       chartWrap.textContent = '';
       var top = visible.slice().sort(function (a, b) { return (b.output_tokens || 0) - (a.output_tokens || 0); }).slice(0, 10);
       if (!top.length || (top[0].output_tokens || 0) <= 0) { return; }
-      chartWrap.appendChild(el('div', { 'class': 'cost-chart-title', text: 'Top sessions by output tokens · same fixed 2M scale as the rows' }));
+      chartWrap.appendChild(el('div', { 'class': 'cost-chart-title', text: 'Top sessions by output tokens · same adaptive log scale as the rows' }));
       top.forEach(function (s) {
         var nm = sessName(s);
         chartWrap.appendChild(el('div', { 'class': 'cost-bar' }, [
@@ -10459,16 +10544,15 @@
       state.sort = sortSel.value || 'burn';
       if (!state.all.length) { emptyState(); return; }
       var visible = sortVisible(state.all.filter(matches), state.sort);
+      // M25 — ONE adaptive scale per painted view, computed BEFORE anything draws
+      // a bar, so the chart above and every row below read against the same axis.
+      computeCostScale(visible);
       renderChart(visible); renderTotals(visible);
       listWrap.textContent = '';
       if (!visible.length) { listWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'No sessions match the filters.' })); paintCount(0); return; }
-      // The bar scale, declared once above the rows — every bar below (and every
-      // bar in the chart above) reads against this same fixed ceiling.
-      listWrap.appendChild(el('div', { 'class': 'cost-scale' }, [
-        el('span', { 'class': 'cost-scale-k', text: 'TOKEN BAR' }),
-        el('span', { 'class': 'cost-scale-ramp', 'aria-hidden': 'true' }),
-        el('span', { 'class': 'cost-scale-v', text: '0 → 2,000,000 tokens · fixed scale, chart and rows alike · over-scale sessions clamp and are marked' })
-      ]));
+      // The bar axis, declared once above the rows — every bar below (and every
+      // bar in the chart above) reads against this same adaptive log scale.
+      listWrap.appendChild(costScaleStrip());
       listWrap.appendChild(adviceHelp());
       visible.forEach(function (s) { listWrap.appendChild(rowEl(s)); });
       paintCount(visible.length);
@@ -11589,6 +11673,142 @@
   // =========================================================================
   var __ringsCleanupFn = null;   // module-scope teardown handle (see renderRings)
 
+  // =========================================================================
+  //  M25 — "ExecPlans arc" rings lens: the pure model layer.
+  //  ------------------------------------------------------------------------
+  //  A STRICTLY ADDITIVE sixth lens. Every function below is pure (plain data
+  //  in, plain data out) and exported, so the smoke unit-tests the arc's maths
+  //  instead of asserting on a canvas. Nothing here touches the other lenses.
+  //
+  //  Geometry contract: a 270° arc from 12 o'clock sweeping CLOCKWISE to
+  //  9 o'clock. The angular axis is "fraction of the plan's declared milestones"
+  //  — 12 o'clock is 0%, 9 o'clock is 100%. A plan's drawn arc is its progress
+  //  along that axis, so a just-started plan is a line at 12 and a finished plan
+  //  reaches 9.
+  // =========================================================================
+  var ARC_ACTIVE_STATES = ['in_progress', 'blocked', 'review', 'drafting'];
+  var ARC_TRACK_CAP = 16;          // readable ceiling (measured: 16 tracks ≈ 15px apart at the default fit)
+  var ARC_DONE_SLOTS = 4;          // of the cap, how many go to recently-completed (fading) plans
+  var ARC_FADE_DAYS = 10;          // a completed plan fades to nothing over this many days, then the stack collapses
+  var ARC_DAY_MS = 86400000;
+  // Nominal fractions for plans that report NO milestone position. These are
+  // estimates, never presented as measurement: arcProgress returns measured:false
+  // and the lens draws those arcs DASHED with a stated note.
+  // (complete/archive never reach this map — arcProgress short-circuits them.)
+  var ARC_STATE_FRAC = { review: 0.8, in_progress: 0.35, blocked: 0.35, drafting: 0.06, planned: 0.02 };
+
+  // "M7" / "M3.2" → 7 / 3.2. Null when the string is not a milestone id.
+  function arcMilestoneNum(s) {
+    var m = /^M(\d+(?:\.\d+)?)/.exec(String(s == null ? '' : s).trim());
+    return m ? parseFloat(m[1]) : null;
+  }
+  // "gate:M7" / "milestone:M3.2" → 7 / 3.2 (the fact keys the ExecPlan
+  // convention actually writes — see CLAUDE.md fact-storage conventions).
+  function arcKeyMilestone(key) {
+    var m = /^(?:gate|milestone):M(\d+(?:\.\d+)?)/.exec(String(key == null ? '' : key));
+    return m ? parseFloat(m[1]) : null;
+  }
+  // How far round the arc a plan has swept, and WHERE that number came from.
+  //   milestone — current_milestone ("M7") over milestones_total. Measured.
+  //   done      — milestones_done over milestones_total. Measured.
+  //   state     — nothing reported: a nominal fraction from the plan's state.
+  //               measured:false, and the lens says so on the canvas.
+  function arcProgress(w) {
+    var total = Number(w && w.milestones_total) || 0;
+    // A plan the board calls complete IS complete: its arc reaches 9 o'clock.
+    // The milestone counters lag on real plans (a plan can close with
+    // milestones_done still at 2 of 6 — measured on the review corpus), and the
+    // declared state is the stronger, equally real signal.
+    var stx = String((w && w.state) || '');
+    if (stx === 'complete' || stx === 'archive') { return { f: 1, via: 'complete', measured: true, total: total }; }
+    var cur = arcMilestoneNum(w && w.current_milestone);
+    if (cur != null && total > 0) { return { f: Math.max(0, Math.min(1, cur / total)), via: 'milestone', measured: true, total: total }; }
+    var done = Number(w && w.milestones_done) || 0;
+    if (done > 0 && total > 0) { return { f: Math.max(0, Math.min(1, done / total)), via: 'done', measured: true, total: total }; }
+    var st = String((w && w.state) || '');
+    var f = ARC_STATE_FRAC[st];
+    return { f: f === undefined ? 0.02 : f, via: 'state', measured: false, total: total };
+  }
+  // When the plan started. provenance.first_activity_unix_ms is the plan's own
+  // earliest recorded activity (the daemon derives it from the plan's facts);
+  // created_at_unix_ms is the aggregator's record. Both are real; the source is
+  // reported rather than blended.
+  function arcStartMs(w) {
+    var p = w && w.provenance;
+    if (p && Number(p.first_activity_unix_ms) > 0) { return { ms: Number(p.first_activity_unix_ms), via: 'provenance.first_activity' }; }
+    return { ms: Number(w && w.created_at_unix_ms) || 0, via: 'created_at' };
+  }
+  function arcBurn(w) {
+    var b = w && w.token_burn;
+    if (!b) { return null; }
+    var t = (Number(b.context_tokens) || 0) + (Number(b.output_tokens) || 0);
+    return t > 0 ? t : null;
+  }
+  // The honest default population for a 1,000+ plan corpus: every ACTIVE plan
+  // (newest activity first) up to the cap, with a few slots reserved for plans
+  // that completed recently — those are the ones mid-fade, and dropping them
+  // would hide the completion animation the lens exists to show.
+  // Returns the tracks in RADIAL order: index 0 is the newest plan (innermost);
+  // the oldest lands at the outer edge.
+  function arcSelectPlans(items, nowMs, cap) {
+    cap = cap || ARC_TRACK_CAP;
+    var ex = (items || []).filter(function (w) { return w && typeof w.id === 'string' && w.id.indexOf('execplan:') === 0; });
+    var byUpd = function (a, b) { return (Number(b.updated_at_unix_ms) || 0) - (Number(a.updated_at_unix_ms) || 0); };
+    var active = ex.filter(function (w) { return ARC_ACTIVE_STATES.indexOf(w.state) >= 0; }).sort(byUpd);
+    var recent = ex.filter(function (w) {
+      return w.state === 'complete' && (nowMs - (Number(w.updated_at_unix_ms) || 0)) <= ARC_FADE_DAYS * ARC_DAY_MS;
+    }).sort(byUpd);
+    var nDone = Math.min(recent.length, ARC_DONE_SLOTS, Math.max(0, cap - Math.min(active.length, cap - ARC_DONE_SLOTS)));
+    var picked = active.slice(0, cap - nDone).concat(recent.slice(0, nDone));
+    picked.sort(function (a, b) { return arcStartMs(b).ms - arcStartMs(a).ms; });   // newest start innermost
+    return { picked: picked, total: ex.length, active: active.length, completing: nDone, cap: cap };
+  }
+  // Where one fact sits on a plan's arc, and how that position was derived.
+  //   index  — the key names a milestone (gate:M7 / milestone:M3.2) and the plan
+  //            declares a total: n/total, exactly the arc's own axis.
+  //   bucket — no milestone in the key, but the plan HAS indexed milestone facts:
+  //            interpolate between the two bracketing it in time, i.e. the
+  //            milestone bucket the fact was written in.
+  //   time   — neither is available: the fact's fraction of the plan's own fact
+  //            timeline. Declared on the canvas, not hidden.
+  // `marks` must be the plan's indexed facts as [{ ms, f }] sorted by ms.
+  function arcFactFrac(fact, total, marks, t0, t1) {
+    var idx = arcKeyMilestone(fact && fact.key);
+    if (idx != null && total > 0) { return { f: Math.max(0, Math.min(1, idx / total)), via: 'index' }; }
+    var ms = Number(fact && fact.ms) || 0;
+    if (marks && marks.length) {
+      var lo = null, hi = null;
+      for (var i = 0; i < marks.length; i++) {
+        if (marks[i].ms <= ms) { lo = marks[i]; } else { hi = marks[i]; break; }
+      }
+      if (lo && hi && hi.ms > lo.ms) { return { f: lo.f + (hi.f - lo.f) * ((ms - lo.ms) / (hi.ms - lo.ms)), via: 'bucket' }; }
+      if (lo && !hi) { return { f: lo.f, via: 'bucket' }; }
+      if (!lo && hi) { return { f: hi.f * (hi.ms > t0 ? Math.max(0, Math.min(1, (ms - t0) / (hi.ms - t0))) : 0), via: 'bucket' }; }
+    }
+    if (t1 > t0) { return { f: Math.max(0, Math.min(1, (ms - t0) / (t1 - t0))), via: 'time' }; }
+    return { f: 0, via: 'time' };
+  }
+  // A completed plan's opacity as the clock passes its completion: 1 at the
+  // moment it completes, 0 after ARC_FADE_DAYS. Non-complete plans never fade.
+  // Zero also for a plan that has not STARTED as of the scrub time — that is how
+  // a new plan enters and pushes the older tracks outward.
+  function arcAlphaAt(track, atMs) {
+    if (!track || atMs < track.startMs) { return 0; }
+    if (!track.done) { return 1; }
+    var age = (atMs - track.doneMs) / ARC_DAY_MS;
+    if (age <= 0) { return 1; }
+    return Math.max(0, 1 - age / ARC_FADE_DAYS);
+  }
+  // Fact kind → the dot vocabulary. Hues come from the ring's existing KIND_HUE
+  // palette (gate/decision/handoff/memory), so the arc adds no new colours.
+  function arcDotKind(key) {
+    var k = String(key == null ? '' : key);
+    if (/^(?:gate|milestone):/.test(k)) { return 'milestone'; }
+    if (/^decision:/.test(k)) { return 'decision'; }
+    if (/^handoff/.test(k)) { return 'handoff'; }
+    return 'fact';
+  }
+
   function renderRings(container, ctxIn) {
     ctxIn = ctxIn || {};
     // Tear down any previous instance (re-entry / rings→rings) before building.
@@ -11635,11 +11855,16 @@
       return { b: b, n: nEl, sp: sp, hue: hue };
     }
     var tWork = tileEl('work', '#a78bfa', 'ExecPlans', '1,040');
+    // M25 — the sixth lens tile. Registered exactly like the five above (same
+    // tileEl, same tileByLens registry, same click handler loop); the existing
+    // five are untouched. Chartless on purpose: its headline is "tracks shown of
+    // plans in the corpus", which is a ratio, not a per-day series.
+    var tArc = tileEl('arc', '#34d399', 'ExecPlans arc', '—');
     var tData = tileEl('data', '#8b96f2', 'Data graph', '66');
     var tMem = tileEl('memory', '#2dd4bf', 'Memory', '21');
     var tSess = tileEl('sessions', '#22d3ee', 'Sessions', '32');
     var tTok = tileEl('tokens', '#f5a623', 'Tokens', '—');
-    var tileByLens = { work: tWork, data: tData, memory: tMem, sessions: tSess, tokens: tTok };
+    var tileByLens = { work: tWork, arc: tArc, data: tData, memory: tMem, sessions: tSess, tokens: tTok };
 
     function glEl(label, n, hue) {
       var nEl = el('span', { 'class': 'n', text: n });
@@ -11655,7 +11880,7 @@
     var glFacts = glEl('facts', '5,026', '#8b96f2');
     var glMcp = glEl('mcp agents', '5', '#34d399'), glInt = glEl('integrations', '3', '#f5a623'), glEngine = glEl('engine', 'off', '#7e8595');
     var cards = el('div', { 'class': 'rings-cards', role: 'group', 'aria-label': 'Ring lenses and daemon glance' },
-      [tWork.b, tData.b, tMem.b, tSess.b, tTok.b, glFacts.el, glMcp.el, glInt.el, glEngine.el]);
+      [tWork.b, tArc.b, tData.b, tMem.b, tSess.b, tTok.b, glFacts.el, glMcp.el, glInt.el, glEngine.el]);
     stage.appendChild(cards);
     // M19 — real per-day series for the sessions tile (filled from
     // /v1/console/sessions last_active_unix_ms in liveInit); null until fetched.
@@ -11807,7 +12032,7 @@
         mH('The rings'),
         mP(['The clock of work: the live ExecPlan portfolio (', el('code', { text: '/v1/work?source=all' }), '), the daemon glance (', el('code', { text: '/v1/console/summary' }), ') and the visible fact store (', el('code', { text: '/v1/facts/list' }), ') replayed as an animated ring. Angle is time; the rim is the latest day. A snapshot stands in when a feed is absent.']),
         mH('Lenses'),
-        mP(['The top-right tiles switch the lens: ', el('b', { text: 'ExecPlans' }), ' (the work board — keeps solo / ledger / lineage / filters), ', el('b', { text: 'Data graph' }), ' (facts, angle = source date, centre = higher confidence, edges join shared entities), ', el('b', { text: 'Memory' }), ', ', el('b', { text: 'Sessions' }), ' and ', el('b', { text: 'Tokens' }), '. Each tile shows its headline count and a sparkline.']),
+        mP(['The top-right tiles switch the lens: ', el('b', { text: 'ExecPlans' }), ' (the work board — keeps solo / ledger / lineage / filters), ', el('b', { text: 'ExecPlans arc' }), ' (M25 — a 270° arc per plan, 12 o\'clock = 0% of its declared milestones and 9 o\'clock = complete; newest plan innermost, completed plans fade and the stack collapses inward; titles and token-burn bars sit left of the 12 o\'clock line), ', el('b', { text: 'Data graph' }), ' (facts, angle = source date, centre = higher confidence, edges join shared entities), ', el('b', { text: 'Memory' }), ', ', el('b', { text: 'Sessions' }), ' and ', el('b', { text: 'Tokens' }), '. Each tile shows its headline count and a sparkline.']),
         mH('Filters, zoom & solo'),
         mP(['The ', el('b', { text: 'kinds' }), ' and ', el('b', { text: 'agents' }), ' icons (top-left) open menus to filter which nodes show; an active filter keeps a dot + its value on the icon. ', el('b', { text: 'Wheel' }), ' zooms and ', el('b', { text: 'drag' }), ' pans; the bottom bar carries the date window, sliders and the ', el('b', { text: '+ / − / fit' }), ' zoom. Click a plan sector (or a ledger row) to ', el('b', { text: 'solo' }), ' it — the ring reframes to that plan; click the background to clear and reframe the whole set.'])
       ])
@@ -12085,6 +12310,7 @@
         cDate.textContent = dayDate(T);
       }
       if (lens === 'work') { stepLayout(dt); }
+      if (lens === 'arc') { arcStep(dt); }        // M25 — radial slots + fade/collapse easing
       if (lens === 'data') { stepDataFocus(dt); }
       updateRadLo();
       var g = geom();
@@ -12592,6 +12818,7 @@
 
     function drawLensInFrame(ctx2, g, time) {
       cells.forEach(function (c) { c._x = undefined; c._on = false; c._bx = undefined; });
+      if (lens === 'arc') { drawArcLens(ctx2, g, time); return; }   // M25
       if (lens === 'data') { drawDataLens(ctx2, g); return; }
       if (lens === 'tokens') { drawTokensLens(ctx2, g); return; }
       if (lens === 'receipts') { drawReceiptsLens(ctx2, g, time); return; }
@@ -12647,6 +12874,324 @@
         ctx2.beginPath(); ctx2.arc(Math.cos(a2) * r, Math.sin(a2) * r, 1.8, 0, 7); ctx2.fill();
       }
       lensLabels.push({ x: 0, y: g.R + 42, cap: true, t: 'receipts lens · chain ticks forward only · illustrative until /v1/receipts/export is wired' });
+    }
+
+    // =====================================================================
+    //  M25 — "ExecPlans arc" lens (additive; the five lenses above are
+    //  untouched). 270° from 12 o'clock clockwise to 9 o'clock; one concentric
+    //  arc per ExecPlan; newest plan innermost; completed plans fade and the
+    //  stack collapses inward. All model maths lives in the pure arc* helpers
+    //  above renderRings — this half is geometry, paint and hit-testing.
+    // =====================================================================
+    var ARC_A0 = -Math.PI / 2;              // 12 o'clock
+    var ARC_SPAN = Math.PI * 1.5;           // 270°, clockwise → 9 o'clock
+    var ARC_DAY0 = Date.UTC(2026, 4, 7);    // ring day 0 (see dayDate)
+    var ARC_BAR_MIN = 10000;                // token-bar log floor — the SAME floor cx-cost uses
+    function arcMsOfDay(d) { return ARC_DAY0 + d * 86400000; }
+    // The ring's clock ticks in DAYS (day N is the instant of its midnight), so
+    // "as of T" means the END of day T — otherwise a plan created at 09:00 today
+    // reads as not-yet-started at T = today. Measured: three of the sixteen
+    // picked tracks vanished on the review corpus before this was applied.
+    function arcClockMs() { return arcMsOfDay(Math.floor(T) + 1) - 1; }
+    function arcDayOfMs(ms) { return (ms - ARC_DAY0) / 86400000; }
+    var arcTracks = [], arcSrc = 'snapshot', arcTotal = 0, arcActiveN = 0, arcCompleting = 0;
+    var arcOrderVia = 'created_at', arcOrderMix = {}, arcViaMix = {}, arcBarMax = 0;
+    var arcWork = null, arcFactIdx = null;
+    var arcHoverT = null, arcHoverD = null, arcSelT = null, arcLabelBoxes = [];
+
+    // The snapshot degradation: the embedded RINGS_PLANS_RAW board, shaped like
+    // /v1/work items so ONE model path serves both. Titles are the shortened
+    // slug because the snapshot carries no titles — stated, not invented.
+    function arcSnapshotItems() {
+      return PLANS.map(function (p) {
+        return { id: 'execplan:' + p.slug, title: p.short,
+          state: p.st === 0 ? 'complete' : p.st === 2 ? 'blocked' : 'in_progress',
+          milestones_done: p.done, milestones_total: p.total,
+          created_at_unix_ms: arcMsOfDay(p.b), updated_at_unix_ms: arcMsOfDay(p.e),
+          token_burn: p.o ? { output_tokens: p.o * 100000 } : null, __snapPlan: p };
+      });
+    }
+    // Dots come from the fact walk the DATA lens already performs (one pass over
+    // /v1/facts/list) — the arc lens adds no network call of its own. Snapshot
+    // mode falls back to the ring's own illustrative cells.
+    function arcSnapFactsFor(slug) {
+      var out = [];
+      PLANS.forEach(function (p) {
+        if (p.slug !== slug) { return; }
+        p.cells.forEach(function (c) { out.push({ key: c.key, ms: arcMsOfDay(c.day), real: !!c.real }); });
+      });
+      return out;
+    }
+    function arcBuild() {
+      var live = !!(arcWork && arcWork.length);
+      var items = live ? arcWork : arcSnapshotItems();
+      arcSrc = live ? 'live · /v1/work?source=all' : 'snapshot';
+      var sel = arcSelectPlans(items, arcMsOfDay(NOW), ARC_TRACK_CAP);
+      arcTotal = sel.total; arcActiveN = sel.active; arcCompleting = sel.completing;
+      var starts = {}, vias = {};
+      arcTracks = sel.picked.map(function (w) {
+        var slug = w.id.slice(9);
+        var pr = arcProgress(w), st = arcStartMs(w);
+        starts[st.via] = (starts[st.via] || 0) + 1;
+        var fs = arcFactIdx ? (arcFactIdx[w.id] || []) : arcSnapFactsFor(slug);
+        var total = Number(w.milestones_total) || 0;
+        var t0 = st.ms, t1 = Math.max(Number(w.updated_at_unix_ms) || t0, t0 + 1);
+        var marks = [];
+        fs.forEach(function (f) {
+          var n = arcKeyMilestone(f.key);
+          if (n != null && total > 0) { marks.push({ ms: f.ms, f: Math.max(0, Math.min(1, n / total)) }); }
+        });
+        marks.sort(function (a, b) { return a.ms - b.ms; });
+        var dots = fs.map(function (f) {
+          var pos = arcFactFrac(f, total, marks, t0, t1);
+          vias[pos.via] = (vias[pos.via] || 0) + 1;
+          return { f: pos.f, via: pos.via, kind: arcDotKind(f.key), key: f.key, ms: f.ms };
+        });
+        return { slug: slug, id: w.id, title: w.title || slug, state: w.state || '?',
+          frac: pr.f, fracVia: pr.via, measured: pr.measured, total: total,
+          cur: w.current_milestone || null,
+          startMs: st.ms, startVia: st.via, updMs: t1,
+          done: (w.state === 'complete' || w.state === 'archive'), doneMs: t1,
+          burn: arcBurn(w), dots: dots, nDots: dots.length,
+          rT: null, _r: null, _a: null, alphaT: 0 };
+      });
+      arcOrderMix = starts; arcViaMix = vias;
+      arcOrderVia = (starts['provenance.first_activity'] || 0) >= (starts['created_at'] || 0) ? 'provenance.first_activity' : 'created_at';
+      arcBarMax = ARC_BAR_MIN;
+      arcTracks.forEach(function (t) { if (t.burn > arcBarMax) { arcBarMax = t.burn; } });
+      arcHoverT = null; arcHoverD = null; arcSelT = null; arcLabelBoxes = [];
+      tArc.n.textContent = arcTracks.length + ' / ' + (arcTotal || 0);
+    }
+    // Radial slots + eased transitions. A track whose alpha target is 0 (not yet
+    // started as of the scrub time, or faded out after completing) surrenders its
+    // slot — the survivors re-slot and EASE inward, which is the collapse.
+    function arcStep(dt) {
+      var g = geom(), atMs = arcClockMs(), slots = [];
+      arcTracks.forEach(function (t) { t.alphaT = arcAlphaAt(t, atMs); if (t.alphaT > 0.02) { slots.push(t); } });
+      var n = Math.max(1, slots.length);
+      var rIn = g.r0 * 1.35, rOut = g.R * 0.94;
+      arcGap = n > 1 ? (rOut - rIn) / (n - 1) : (rOut - rIn);
+      slots.forEach(function (t, i) { t.rT = n > 1 ? rIn + (rOut - rIn) * (i / (n - 1)) : (rIn + rOut) / 2; });
+      var k = REDUCED ? 1 : Math.min(1, dt * 6);
+      arcTracks.forEach(function (t) {
+        if (t.rT == null) { t.rT = rOut; }
+        if (t._r == null) { t._r = t.rT; t._a = 0; }
+        t._r = mix(t._r, t.rT, k);
+        t._a = mix(t._a, t.alphaT, k);
+      });
+    }
+    var arcGap = 20;
+    function arcHue(t) {
+      if (t.done) { return PAL.done; }
+      if (t.state === 'blocked') { return PAL.block; }
+      if (t.state === 'drafting' || t.state === 'planned') { return PAL.untraced; }
+      if (t.state === 'review') { return PAL.gate; }
+      return PAL.prog;
+    }
+    var ARC_DOT_HUE = { milestone: 'gate', decision: 'decision', handoff: 'handoff', fact: 'memory' };
+    function arcNum(n) {
+      if (!isFinite(n)) { return '—'; }
+      if (n >= 1e6) { return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + 'M'; }
+      if (n >= 1000) { return (n / 1000).toFixed(n >= 1e5 ? 0 : 1) + 'k'; }
+      return String(Math.round(n));
+    }
+    function arcFitText(c2, s, maxW) {
+      var t = String(s || '');
+      if (c2.measureText(t).width <= maxW) { return t; }
+      var lo = 1, hi = t.length;
+      while (lo < hi) {
+        var mid = (lo + hi + 1) >> 1;
+        if (c2.measureText(t.slice(0, mid) + '…').width <= maxW) { lo = mid; } else { hi = mid - 1; }
+      }
+      return t.slice(0, lo) + '…';
+    }
+    function drawArcLens(ctx2, g, time) {
+      var zdot = zoomDotScale();   // M24 — zoom separates dot clusters here too
+      var vis = [];
+      arcTracks.forEach(function (t) { t.dots.forEach(function (d) { d._x = undefined; }); if (t._a > 0.02) { vis.push(t); } });
+      var atMs = arcClockMs();
+      // ---- axes: the 12 o'clock start line is the frame's own accent line;
+      //      the 9 o'clock line is completion.
+      ctx2.strokeStyle = hex2rgba(PAL.done, 0.42); ctx2.lineWidth = 1.4 / Z;
+      ctx2.beginPath(); ctx2.moveTo(-g.r0 * 0.9, 0); ctx2.lineTo(-(g.R + 14), 0); ctx2.stroke();
+      ctx2.fillStyle = hex2rgba(PAL.done, 0.75); ctx2.font = '700 ' + (9.5 / Z) + 'px ' + MONO;
+      ctx2.textAlign = 'left'; ctx2.textBaseline = 'bottom';
+      ctx2.fillText('100% · complete', -(g.R + 12), -4 / Z);
+      ctx2.textAlign = 'center'; ctx2.fillStyle = acc(0.8);
+      ctx2.fillText('0%', 0, -(g.R + 18));
+      ctx2.textBaseline = 'alphabetic';
+      // ---- pass 1: every track's UNSWEPT remainder, one style for all of them
+      ctx2.strokeStyle = hair(0.075); ctx2.lineWidth = 1.4 / Z; ctx2.setLineDash([]);
+      vis.forEach(function (t) {
+        if (t.frac >= 0.999) { return; }
+        ctx2.beginPath(); ctx2.arc(0, 0, t._r, ARC_A0 + ARC_SPAN * t.frac, ARC_A0 + ARC_SPAN); ctx2.stroke();
+      });
+      // ---- pass 2: progress arcs, grouped by state hue then by measured/estimated
+      //      (dash state is set once per group, not per track).
+      var buckets = {};
+      vis.forEach(function (t) { var h = arcHue(t); (buckets[h] = buckets[h] || []).push(t); });
+      Object.keys(buckets).forEach(function (h) {
+        [true, false].forEach(function (meas) {
+          var set = buckets[h].filter(function (t) { return t.measured === meas; });
+          if (!set.length) { return; }
+          ctx2.setLineDash(meas ? [] : [5 / Z, 5 / Z]);
+          set.forEach(function (t) {
+            var lit = (t === arcHoverT || t === arcSelT);
+            ctx2.strokeStyle = hex2rgba(h, (lit ? 1 : 0.82) * t._a);
+            ctx2.lineWidth = (lit ? 5.5 : 3.4) / Z;
+            ctx2.beginPath(); ctx2.arc(0, 0, t._r, ARC_A0, ARC_A0 + ARC_SPAN * Math.max(t.frac, 0.003)); ctx2.stroke();
+            // the start tick at 12 — a just-started plan reads as a LINE at 12
+            ctx2.beginPath();
+            ctx2.moveTo(0, -(t._r - 5 / Z)); ctx2.lineTo(0, -(t._r + 5 / Z)); ctx2.stroke();
+          });
+        });
+      });
+      ctx2.setLineDash([]); ctx2.lineWidth = 1 / Z;
+      // ---- pass 3: dots ON the arc, batched by kind (one hue per group).
+      //      Milestones are the big diamonds; decisions / handoffs / other facts
+      //      are smaller circles. Radius is damped by zoom (M24 zoomDotScale) so
+      //      a cluster resolves as you zoom in.
+      ['milestone', 'decision', 'handoff', 'fact'].forEach(function (kind) {
+        var hue = KIND_HUE[ARC_DOT_HUE[kind]] || PAL.memory;
+        var big = kind === 'milestone';
+        vis.forEach(function (t) {
+          var some = false;
+          for (var i = 0; i < t.dots.length; i++) { if (t.dots[i].kind === kind && t.dots[i].ms <= atMs) { some = true; break; } }
+          if (!some) { return; }
+          ctx2.fillStyle = hex2rgba(hue, (big ? 0.95 : 0.72) * t._a);
+          t.dots.forEach(function (d) {
+            if (d.kind !== kind || d.ms > atMs) { return; }
+            var a = ARC_A0 + ARC_SPAN * d.f;
+            var x = Math.cos(a) * t._r, y = Math.sin(a) * t._r;
+            var rr = (big ? 3.6 : 2.3) * zdot * (d === arcHoverD ? 1.8 : 1);
+            if (big) {
+              ctx2.beginPath();
+              ctx2.moveTo(x, y - rr - 0.8); ctx2.lineTo(x + rr, y); ctx2.lineTo(x, y + rr + 0.8); ctx2.lineTo(x - rr, y);
+              ctx2.closePath(); ctx2.fill();
+            } else {
+              ctx2.beginPath(); ctx2.arc(x, y, rr, 0, 7); ctx2.fill();
+            }
+            d._x = x; d._y = y; d._r = rr;
+          });
+        });
+      });
+      // ---- pass 4: the 12 o'clock label column (LEFT of the line) and, further
+      //      left again, the token-burn bar. Same log idiom as cx-cost's bars
+      //      (logBarPos, 10k floor), adaptive to the tracks on screen.
+      var LBLW = g.R * 0.44, BARW = g.R * 0.18, GAP = 9 / Z, PADR = 7 / Z;
+      var labelRight = -PADR, barRight = labelRight - LBLW - GAP;
+      arcLabelBoxes = [];
+      ctx2.font = '600 ' + (10.5 / Z) + 'px ' + MONO;
+      ctx2.textAlign = 'right'; ctx2.textBaseline = 'middle';
+      vis.forEach(function (t) {
+        var y = -t._r;
+        ctx2.fillStyle = (t === arcHoverT || t === arcSelT) ? ink(1) : ink2c(0.92 * t._a);
+        ctx2.fillText(arcFitText(ctx2, t.title, LBLW), labelRight, y);
+        if (t.burn) {
+          var w2 = BARW * logBarPos(t.burn, ARC_BAR_MIN, arcBarMax);
+          ctx2.fillStyle = hex2rgba(PAL.accent, 0.6 * t._a);
+          ctx2.fillRect(barRight - w2, y - 2 / Z, w2, 4 / Z);
+        }
+        arcLabelBoxes.push({ t: t, x0: barRight - BARW, x1: labelRight, y: y });
+      });
+      // the token-bar column's own axis label, once
+      ctx2.font = (8.5 / Z) + 'px ' + MONO; ctx2.fillStyle = ink3c(0.8);
+      ctx2.textAlign = 'left';
+      ctx2.fillText('token burn (log, 10k → ' + arcNum(arcBarMax) + ')', barRight - BARW, -(g.R * 0.94) - 14 / Z);
+      ctx2.textAlign = 'left'; ctx2.textBaseline = 'alphabetic';
+      // ---- the honest notes, on the canvas where the claim is made.
+      var estN = 0; vis.forEach(function (t) { if (!t.measured) { estN++; } });
+      lensLabels.push({ x: 0, y: g.R + 42, cap: true,
+        t: 'ExecPlans arc · 12 → 9 o\'clock = 0 → 100% of declared milestones · showing ' + vis.length + ' of ' + arcTotal + ' plans — active first (' + arcActiveN + ' active, ' + arcCompleting + ' just-completed, fading) · ' + arcSrc });
+      lensLabels.push({ x: 0, y: g.R + 42 + 15 / Z, cap: true,
+        t: 'solid arc = measured (current_milestone / milestones_total) · dashed = state-estimated, ' + estN + ' here · dots: ◆ milestone · ● decision · ● handoff · ● other fact — ' + (arcViaMix.index || 0) + ' placed by milestone index, ' + (arcViaMix.bucket || 0) + ' by milestone bucket, ' + (arcViaMix.time || 0) + ' by timeline fraction' });
+      lensLabels.push({ x: 0, y: g.R + 42 + 30 / Z, cap: true,
+        t: 'newest plan innermost · radial order from ' + arcOrderVia + ' · a completed plan fades over ' + ARC_FADE_DAYS + ' days and the stack collapses inward (scrub or play the window to watch it)' });
+      if (typeof window !== 'undefined' && window.__CRUX_CONSOLE_DEV__) {
+        var nd = 0; vis.forEach(function (t) { nd += t.dots.length; });
+        window.__ringsArc = { tracks: vis.length, total: arcTotal, active: arcActiveN, completing: arcCompleting,
+          dots: nd, src: arcSrc, orderVia: arcOrderVia, orderMix: arcOrderMix, viaMix: arcViaMix,
+          factEntities: arcFactIdx ? Object.keys(arcFactIdx).length : -1,
+          estimated: estN, barMax: arcBarMax, radii: vis.map(function (t) { return Math.round(t._r); }),
+          alphas: vis.map(function (t) { return +t._a.toFixed(3); }),
+          titles: vis.map(function (t) { return t.title; }) };
+      }
+    }
+    // ---- arc hit-testing: label column first (it is the biggest target), then
+    //      dots, then the track band. Reuses the ring's own toDisc/geom.
+    function arcAt(e) {
+      var r = cv.getBoundingClientRect(), g = geom();
+      var p = toDisc(g, e.clientX - r.left, e.clientY - r.top);
+      for (var li = 0; li < arcLabelBoxes.length; li++) {
+        var b = arcLabelBoxes[li];
+        if (p.x >= b.x0 && p.x <= b.x1 && Math.abs(p.y - b.y) < Math.max(6 / Z, arcGap * 0.45)) { return { t: b.t, label: true }; }
+      }
+      var vis = arcTracks.filter(function (t) { return t._a > 0.3; });
+      var best = null, bd = 9 / Z;
+      vis.forEach(function (t) {
+        t.dots.forEach(function (d) {
+          if (d._x === undefined) { return; }
+          var dd = Math.hypot(d._x - p.x, d._y - p.y);
+          if (dd < bd + d._r) { bd = dd; best = { t: t, dot: d }; }
+        });
+      });
+      if (best) { return best; }
+      var pr = Math.hypot(p.x, p.y), pa = Math.atan2(p.y, p.x);
+      var aRel = pa - ARC_A0; while (aRel < 0) { aRel += TAU; }
+      if (aRel <= ARC_SPAN + 0.06) {
+        var band = Math.max(4 / Z, Math.min(11 / Z, arcGap * 0.45));
+        for (var i = 0; i < vis.length; i++) { if (Math.abs(pr - vis[i]._r) < band) { return { t: vis[i] }; } }
+      }
+      return null;
+    }
+    function arcPointerMove(e) {
+      var h = arcAt(e);
+      arcHoverT = h ? h.t : null; arcHoverD = (h && h.dot) || null;
+      hover = null; hoverSec = null;
+      if (!h) { hideTip(); return; }
+      var t = h.t;
+      if (h.dot) {
+        showTip(e.clientX, e.clientY, [tb(h.dot.key), br(),
+          tk('plan'), ' ' + t.title, br(),
+          tk('stored'), ' ' + dayDate(arcDayOfMs(h.dot.ms)), br(),
+          tk('on the arc at'), ' ' + Math.round(h.dot.f * 100) + '% ', tk('(' + h.dot.via + '-mapped)')]);
+        return;
+      }
+      showTip(e.clientX, e.clientY, [tb(t.title), br(),
+        tk('slug'), ' ' + t.slug, br(),
+        tk(t.state), ' · ' + Math.round(t.frac * 100) + '% ' + (t.measured ? ('(' + t.fracVia + (t.cur ? ' ' + t.cur : '') + (t.total ? ' of ' + t.total : '') + ')') : '(state-estimated — no milestone position reported)'), br(),
+        tk('started'), ' ' + dayDate(arcDayOfMs(t.startMs)) + ' ', tk('(' + t.startVia + ')'), br(),
+        tk('facts'), ' ' + t.nDots, (t.burn ? br() : null), (t.burn ? tk('token burn') : null), (t.burn ? ' ' + arcNum(t.burn) : null)]);
+    }
+    // Click reuses the EXISTING plan detail: when the plan is on the ring's own
+    // board the pane is the identical planBlock the ExecPlans lens opens. Solo is
+    // deliberately NOT forked here — solo is an ExecPlans-lens reframing of the
+    // work ring and has no meaning on the arc geometry.
+    function arcClick(e) {
+      var h = arcAt(e);
+      if (!h || arcSelT === h.t) { arcSelT = null; setSel(null); return; }
+      arcSelT = h.t;
+      for (var i = 0; i < PLANS.length; i++) {
+        if (PLANS[i].slug === h.t.slug) { setSel({ type: 'plan', p: PLANS[i] }); return; }
+      }
+      arcPane(h.t);
+    }
+    function arcPane(t) {
+      sel = null; pinned = null;
+      pane.textContent = '';
+      pane.appendChild(el('h4', { text: t.title }));
+      pane.appendChild(el('span', { 'class': 'kindchip' }, [el('i', { style: 'background:' + arcHue(t) }), t.state + (t.measured ? '' : ' · progress estimated')]));
+      var bar = el('div', { 'class': 'bar' }); var bi = el('i');
+      bi.style.width = Math.round(100 * t.frac) + '%'; bi.style.background = arcHue(t); bar.appendChild(bi);
+      pane.appendChild(bar);
+      pane.appendChild(pRow('slug', t.slug));
+      pane.appendChild(pRow('progress', Math.round(t.frac * 100) + '% · ' + (t.measured ? ('measured from ' + t.fracVia + (t.cur ? ' (' + t.cur + ' of ' + t.total + ')' : '')) : 'state-estimated — this plan reports no current_milestone / milestones_total')));
+      pane.appendChild(pRow('started', dayDate(arcDayOfMs(t.startMs)) + ' (' + t.startVia + ')'));
+      pane.appendChild(pRow('last update', dayDate(arcDayOfMs(t.updMs))));
+      pane.appendChild(pRow('facts on the arc', String(t.nDots)));
+      if (t.burn) { pane.appendChild(pRow('token burn', arcNum(t.burn) + ' (context + output)')); }
+      pane.appendChild(el('p', { 'class': 'note', text: 'Not on the ExecPlans ring (that lens keeps the plans with a first-activity provenance stamp), so this is the arc lens\'s own read of the same /v1/work item.' }));
+      pane.classList.add('open');
     }
 
     function kick() { if (rafId === null && !paused && cv.isConnected) { rafId = requestAnimationFrame(draw); } }
@@ -12725,6 +13270,7 @@
         if (dragMoved > 5) { panX += dx; panY += dy; }
         lastPX = e.clientX; lastPY = e.clientY; return;
       }
+      if (lens === 'arc') { arcPointerMove(e); return; }   // M25
       if (lens === 'tokens') {
         var g2 = geom();
         var pd = toDisc(g2, e.clientX - cv.getBoundingClientRect().left, e.clientY - cv.getBoundingClientRect().top);
@@ -12807,6 +13353,7 @@
       return best;
     }
     function handleClick(e) {
+      if (lens === 'arc') { arcClick(e); return; }   // M25
       if (lens === 'data') {
         var hit0 = hitTest(e); gSel = (hit0 && hit0.i !== undefined) ? (gSel === hit0.i ? null : hit0.i) : null;
         if (gFocus) { if (gSel === null) { releaseDataFocus(); } else { applyDataFocus(); } }   // M13 — re-cluster / restore
@@ -13026,6 +13573,11 @@
         Object.keys(tileByLens).forEach(function (x) { tileByLens[x].b.setAttribute('aria-pressed', String(x === ln)); });
         setSel(null); solo = null; hover = null; hoverSec = null; gSel = null; tokSel = null; hideTip();
         setLedger(false);
+        // M25 — the arc lens is drawn against FIXED 12 and 9 o'clock axes, so
+        // entering it parks the ambient spin at 12 (the same reset the clock
+        // button performs). Leaving it drops the arc selection.
+        arcHoverT = null; arcHoverD = null; arcSelT = null;
+        if (lens === 'arc') { spinning = false; bSpin.setAttribute('aria-pressed', 'false'); resetTween = true; arcBuild(); }
         // M13 — leaving the data lens clears any focus isolation.
         gFocus = false; gConn = null; gClusterTargets = null; gFocusK = 0; gViewTweening = false; bDataFocus.setAttribute('aria-pressed', 'false');
         if (lens === 'data') { var minD = Math.min.apply(null, GNODES.map(function (n) { return n.d; })) - 0.5; if (S < minD - 1) { rStart.value = Math.round((minD - 11) / (NOW - 11) * 1000); syncWindow(); } }
@@ -13233,6 +13785,7 @@
       if (REDUCED) { stop(); } else { fadeTimer = setTimeout(stop, 360); }
     }
 
+    arcBuild();      // M25 — seed the ExecPlans-arc model (snapshot until liveInit lands)
     readPalette();   // M12 — seed the canvas palette from the theme tokens
     // React to live theme toggles: the console stamps data-theme on <html> — re-read
     // the palette + repaint without a reload (layout is unchanged, so no re-fit).
@@ -13261,6 +13814,9 @@
       fetchJSON('/v1/work?source=all').then(function (res) {
         if (res.ok && res.data) {
           var j = res.data;
+          // M25 — the arc lens reads the FULL board (every state, no provenance
+          // requirement) from this same response: no extra request.
+          arcWork = j.work || []; arcBuild(); if (lens === 'arc') { kick(); }
           var items = (j.work || []).filter(function (w) {
             return w.id && w.id.indexOf('execplan:') === 0 && w.provenance && w.provenance.first_activity_unix_ms && ['in_progress', 'complete', 'blocked'].indexOf(w.state) >= 0;
           });
@@ -13278,7 +13834,16 @@
             loadPlans(raws); rebuildLineage(); buildCells(); refreshTok();
             if (TOK.totS < 1 && SNAP_TOK.totS >= 1) { TOK = SNAP_TOK; tTok.n.textContent = Math.round(TOK.totS) + 'M (snap)'; }
             dStart.max = dEnd.max = dayDate(NOW);
+            // M25 — the scrub clock was PARKED at the snapshot's last day (76 =
+            // 2026-07-22) and syncWindow only clamps it INTO the window, so a
+            // live board that reaches day 79 left the ring rendering three days
+            // in the past: plans created since the snapshot read as "not yet
+            // started" (measured — three of the arc lens's sixteen picked tracks
+            // were invisible). If the clock was parked at the end of the old
+            // window, carry it to the end of the new one.
+            var parkedAtEnd = T >= E - 0.001;
             syncWindow();
+            if (parkedAtEnd) { T = E; rTime.value = 1000; cDate.textContent = dayDate(T); }
             dataSrc = 'live · prod-mirror';
             tWork.n.textContent = num(j.count);   // M19 — the duplicate "execplans" glance tile was removed
             root.setAttribute('data-src', 'live');   // liveness signal (the visible "live · date" stamp was removed in M11)
@@ -13332,7 +13897,18 @@
         function finish() {
           var live = [];
           for (var id in seen) { var n = seen[id]; if (isFinite(n.d) && n.d > 0) { live.push(n); } }
-          if (ok && live.length) { gSel = null; loadGraph(live); gTotal = total; gCap = capped; tData.n.textContent = num(live.length); updateSparks(); }
+          if (ok && live.length) {
+            gSel = null; loadGraph(live); gTotal = total; gCap = capped; tData.n.textContent = num(live.length); updateSparks();
+            // M25 — index the SAME walked facts by ExecPlan entity for the arc
+            // lens's dots. No second network read.
+            var idx = {};
+            live.forEach(function (n2) {
+              if (!n2.e || n2.e.indexOf('execplan:') !== 0) { return; }
+              (idx[n2.e] = idx[n2.e] || []).push({ key: n2.k, ms: arcMsOfDay(n2.d), real: true });
+            });
+            for (var ek in idx) { idx[ek].sort(function (a, b) { return a.ms - b.ms; }); }
+            arcFactIdx = idx; arcBuild(); if (lens === 'arc') { kick(); }
+          }
           else if (total) { gTotal = total; }
         }
         page2(0);
@@ -13445,6 +14021,21 @@
     // M10 (console-surfaces-remediation, review round 1) — the native Rings page
     // (canvas "clock of work"; replaced the embedded iframe mock).
     renderRings: renderRings,
+    // M25 — the ExecPlans-arc lens's pure model layer (population, progress,
+    // radial order, dot placement, completion fade) + the console-wide log bar
+    // scale it shares with cx-cost. Exported so the smoke unit-tests the arc's
+    // maths instead of asserting on canvas pixels.
+    logBarPos: logBarPos,
+    arcProgress: arcProgress,
+    arcStartMs: arcStartMs,
+    arcSelectPlans: arcSelectPlans,
+    arcFactFrac: arcFactFrac,
+    arcAlphaAt: arcAlphaAt,
+    arcDotKind: arcDotKind,
+    arcKeyMilestone: arcKeyMilestone,
+    ARC_TRACK_CAP: ARC_TRACK_CAP,
+    ARC_ACTIVE_STATES: ARC_ACTIVE_STATES,
+    ARC_FADE_DAYS: ARC_FADE_DAYS,
     // M20 — the rail accordion's contract with the Rings page: the nine view
     // definitions (nav rows), a live switch bridge (in-place fade swap) and a
     // "is the page mounted" probe so the rail knows whether to swap or route.
