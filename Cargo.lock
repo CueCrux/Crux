@@ -1386,6 +1386,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "p256",
+ "rcx-capability-token",
  "serde",
  "serde_json",
  "serial_test",

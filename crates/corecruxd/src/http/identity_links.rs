@@ -14,7 +14,7 @@ use super::{
     http_scope_context, problem_response, require_http_any_scope, AppState, HeaderMap, IntoResponse, Json, Path, Query,
     Response, State, StatusCode,
 };
-use crate::candidate_links::{self, CandidateLinkError};
+use crate::candidate_links::{self, CandidateLinkError, CandidateObservation, ProposerConfig};
 use crate::identity_links::{self, CreateLinkRequest, LinkError};
 use corecrux_memory::candidate_link::CandidateLinkStatus;
 use corecrux_memory::identity_link::LinkVerifyError;
@@ -177,6 +177,172 @@ pub(super) async fn get_identity_candidates(
             })
     });
     (StatusCode::OK, Json(serde_json::json!({"candidates": candidates}))).into_response()
+}
+
+/// Upper bound on candidate observations returned from the journals. The
+/// proposer is O(n²) over its input, so this caps the cost even against a
+/// pathologically multi-principal corpus (the CE mirror already carries ~140k
+/// observation records across ~39k sessions).
+const MAX_JOURNAL_CANDIDATE_OBSERVATIONS: usize = 4000;
+
+/// Build candidate observations from the on-disk observation journals — the
+/// second evidence source ("observation principals", Part C.7). Recon proved the
+/// candidate proposers have no shipped caller, so the propose route is the
+/// deliberate seed path. `local_passport_fpr` is the daemon's first local
+/// passport (validated by `create_candidate`); `observed_subject` is the
+/// record's signing principal; `project_id` is the session id.
+///
+/// The proposer only fires for two *distinct* principals sharing a `project_id`
+/// (session) inside the temporal window, so this deduplicates to one observation
+/// per `(session, principal)` and DROPS single-principal sessions entirely —
+/// they can never yield a cross-principal candidate. That collapses the 140k-row
+/// journal to the handful of genuinely multi-signer sessions, keeping the
+/// proposer's O(n²) tractable (cross-session pairs never fire — distinct
+/// `project_id` — so dropping them changes no output). Read lock-free (no store
+/// locks held); returns empty when there is no local anchor.
+fn journal_candidate_observations(data_dir: &std::path::Path, anchor: &str) -> Vec<CandidateObservation> {
+    let records = match super::observations::read_all_observations(data_dir) {
+        Ok(records) => records,
+        Err(err) => {
+            tracing::warn!(target = "identity", error = %err, "reading observation journals for candidate seeding");
+            return Vec::new();
+        }
+    };
+    // session_id -> (principal -> earliest observation for that principal).
+    let mut by_session: std::collections::BTreeMap<String, std::collections::BTreeMap<String, CandidateObservation>> =
+        Default::default();
+    for record in records {
+        let principals = by_session.entry(record.session_id.clone()).or_default();
+        principals
+            .entry(record.principal.clone())
+            .or_insert_with(|| CandidateObservation {
+                local_passport_fpr: anchor.to_string(),
+                observed_subject: record.principal.clone(),
+                tenant_id: "local".to_string(),
+                project_id: Some(record.session_id.clone()),
+                observed_at_unix_ms: record.ts.timestamp_millis().max(0) as u64,
+                evidence_ref: format!("observation:{}", record.observation_id),
+                cruxpack_source_receipt: None,
+            });
+    }
+    let mut out = Vec::new();
+    for (_session, principals) in by_session {
+        if principals.len() < 2 {
+            continue; // single-signer session — no cross-principal candidate possible
+        }
+        for observation in principals.into_values() {
+            out.push(observation);
+            if out.len() >= MAX_JOURNAL_CANDIDATE_OBSERVATIONS {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+/// `POST /v1/identity/candidates/propose` — run the (previously uncalled)
+/// candidate proposers so a fresh workspace can populate
+/// `GET /v1/identity/candidates`. Deliberate write: it is the ONLY shipped
+/// producer of candidate-link records (see the module + `docs/agent/
+/// identity-candidate-links.md`). Idempotent — `create_candidate` dedups by a
+/// content-derived id, so re-proposing over the same evidence creates nothing.
+/// Two evidence sources: `bindings` (session→passport bindings) and
+/// `observations` (observation-journal principals). `admin:write`, and 404 when
+/// `CORECRUXD_IDENTITY_LINKS` is off (same posture as the rest of the group).
+#[utoipa::path(
+    post,
+    path = "/v1/identity/candidates/propose",
+    tag = "Identity",
+    responses(
+        (status = 200, description = "Proposers run; counts of created + examined candidate observations by source"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Missing admin write scope"),
+        (status = 404, description = "Disabled"),
+        (status = 500, description = "Local passport lookup failed for a proposed candidate"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub(super) async fn post_identity_candidates_propose(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !state.identity_links_enabled {
+        return links_disabled();
+    }
+    if let Err(problem) = require_http_any_scope(&state.auth, &headers, &["admin:write"]) {
+        return problem.into_response();
+    }
+    let ctx = match http_scope_context(&state.auth, &headers) {
+        Ok(ctx) => ctx,
+        Err(problem) => return problem.into_response(),
+    };
+    let actor = actor_for(&ctx);
+    let config = ProposerConfig::default();
+
+    // Gather the binding-source observations and the local anchor under a brief
+    // read lock, then release it — the journal scan below is slow (tens of
+    // thousands of files) and must NOT hold the fact/entity store locks.
+    let (binding_obs, anchor) = {
+        let facts = state.fact_store.read().await;
+        let binding_obs = candidate_links::observations_from_session_bindings(&facts);
+        let anchor = crate::passports::list_passports(&facts, None)
+            .into_iter()
+            .map(|passport| passport.principal_id)
+            .next();
+        (binding_obs, anchor)
+    };
+
+    // Source 2 read: scan the observation journals lock-free on a blocking task
+    // (140k+ records across ~39k files on the mirror).
+    let journal_obs = match anchor {
+        Some(anchor) => {
+            let data_dir = state.data_dir.clone();
+            match tokio::task::spawn_blocking(move || journal_candidate_observations(&data_dir, &anchor)).await {
+                Ok(obs) => obs,
+                Err(err) => {
+                    tracing::warn!(target = "identity", error = %err, "journal scan task failed");
+                    Vec::new()
+                }
+            }
+        }
+        None => Vec::new(),
+    };
+
+    let examined_bindings = binding_obs.len();
+    let examined_observations = journal_obs.len();
+
+    // Propose under the store locks — both proposers are now over small inputs.
+    let facts = state.fact_store.read().await;
+    let mut entities = state.entity_store.write().await;
+    let created_bindings =
+        match candidate_links::propose_from_observations(&mut entities, &facts, &binding_obs, &actor, &config) {
+            Ok(created) => created.len(),
+            Err(err) => return candidate_error_response(&err),
+        };
+    let created_observations =
+        match candidate_links::propose_from_observations(&mut entities, &facts, &journal_obs, &actor, &config) {
+            Ok(created) => created.len(),
+            Err(err) => return candidate_error_response(&err),
+        };
+    drop(entities);
+    drop(facts);
+
+    tracing::info!(
+        created_bindings,
+        created_observations,
+        examined_bindings,
+        examined_observations,
+        "identity-candidates-proposed"
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "created": created_bindings + created_observations,
+            "examined": examined_bindings + examined_observations,
+            "by_source": {
+                "bindings": { "created": created_bindings, "examined": examined_bindings },
+                "observations": { "created": created_observations, "examined": examined_observations },
+            },
+        })),
+    )
+        .into_response()
 }
 
 #[utoipa::path(

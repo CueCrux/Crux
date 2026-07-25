@@ -1842,6 +1842,337 @@ pub(super) async fn get_observations_aggregate(
         .into_response()
 }
 
+// ── Receipts listing (console-surfaces-remediation M6) ─────────────────────
+//
+// `GET /v1/receipts/list` — a CE-local, newest-first, cursor-paginated listing
+// over the on-disk observation journals (the only receipt source a CPU-only
+// daemon holds: it has no dataplane pool, so the by-id receipt family 501s for
+// everything except the local `ad_ga_*` gate-approval receipts). Each
+// observation carries a CROWN-style receipt envelope (`ReceiptEnvelopeV1`); this
+// route surfaces the envelope summary plus whether a full body/signature/
+// verification is dereferenceable via `/v1/receipts/{id}` (the `ad_ga_*` class,
+// stored in the reserved gate-receipt journal) versus envelope-only (a regular
+// session observation, whose body lives only in the hosted-tier dataplane).
+//
+// Contract mirrors `/v1/activity`'s infinite-scroll: `before` (opaque cursor
+// from a prior page's `next_cursor`) + `limit`, newest-first, per-session `seq`
+// as the tiebreak. Auth reuses the by-id receipt read guard (`receipts:read`).
+
+/// Console cap for a single `/v1/receipts/list` page.
+const RECEIPTS_LIST_DEFAULT_LIMIT: usize = 100;
+const RECEIPTS_LIST_MAX_LIMIT: usize = 1000;
+
+/// The `ad_ga_*` receipt-id class: the ONLY receipts whose full CROWN body,
+/// signature, and verification are dereferenceable on a CPU-only daemon (via the
+/// local approval-receipt fallback in `receipts.rs`). Everything else is
+/// envelope-only here.
+const FETCHABLE_RECEIPT_ID_PREFIX: &str = "ad_ga_";
+
+fn default_receipts_list_tenant() -> String {
+    "default".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ReceiptsListQuery {
+    /// Tenant scope for the read guard — mirrors the by-id receipt routes'
+    /// `tenant_id`. Defaults to `default` so the console (loopback, auth-off)
+    /// need not carry it; the guard still runs against this tenant.
+    #[serde(default = "default_receipts_list_tenant")]
+    pub tenant_id: String,
+    /// Opaque cursor (`<ts_ms>:<seq>:<observation_id>`) from a prior page's
+    /// `next_cursor`. The next page returns rows strictly older than it.
+    #[serde(default)]
+    pub before: Option<String>,
+    /// Page size. Defaults to [`RECEIPTS_LIST_DEFAULT_LIMIT`], capped at
+    /// [`RECEIPTS_LIST_MAX_LIMIT`].
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Optional observation-kind filter (`tool_use`, the gate approval-decision
+    /// kind, …).
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Optional principal filter (signing passport fpr).
+    #[serde(default)]
+    pub principal: Option<String>,
+    /// Optional session filter (matches the record's `session_id`, raw or
+    /// filesystem-sanitised).
+    #[serde(default)]
+    pub session: Option<String>,
+}
+
+/// Envelope summary for one listed receipt — the CROWN fields a caller needs to
+/// eyeball provenance without pulling the full body. Short forms are precomputed
+/// for the list row; full forms feed the detail drawer.
+#[derive(Debug, Serialize)]
+pub(super) struct ReceiptEnvelopeSummaryV1 {
+    pub alg: String,
+    pub signed_by: String,
+    pub signed_by_short: String,
+    pub body_hash: String,
+    pub body_hash_short: String,
+}
+
+/// One row of `GET /v1/receipts/list`.
+#[derive(Debug, Serialize)]
+pub(super) struct ReceiptListRowV1 {
+    pub observation_id: String,
+    pub session_id: String,
+    pub session_short: String,
+    pub ts: DateTime<Utc>,
+    pub principal: String,
+    pub kind: String,
+    pub receipt: ReceiptEnvelopeSummaryV1,
+    /// Per-session chain sequence (`None` for pre-M5e legacy records).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    /// True iff the full CROWN body/signature/verification is dereferenceable via
+    /// `/v1/receipts/{id}` on this daemon (the `ad_ga_*` gate-approval class).
+    pub fetchable: bool,
+    /// The dereferenceable receipt id (present iff `fetchable`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipt_id: Option<String>,
+    /// Opaque pagination cursor for this row — pass back as `before`.
+    pub cursor: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct ReceiptsListResponse {
+    pub rows: Vec<ReceiptListRowV1>,
+    /// Rows returned in this page (after cursor + limit).
+    pub returned: usize,
+    /// Total rows matching the filters, before cursor/limit truncation.
+    pub matched: usize,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+    /// Exact kind/principal histograms over the full matched set, so the console
+    /// can render filter chips without guessing labels from a sampled page.
+    pub kind_counts: std::collections::BTreeMap<String, usize>,
+    pub principal_counts: std::collections::BTreeMap<String, usize>,
+}
+
+fn short_hex(value: &str, keep: usize) -> String {
+    if value.chars().count() <= keep {
+        value.to_string()
+    } else {
+        value.chars().take(keep).collect()
+    }
+}
+
+/// A tuple that totally orders receipts newest-first: `(ts_ms, seq, obs_id)`
+/// compared in reverse. `seq` breaks ties inside one session's chain; the
+/// observation id is the final, always-present tiebreak.
+type ReceiptOrderKey = (i64, u64, String);
+
+fn receipt_order_key(record: &ObservationRecordV1) -> ReceiptOrderKey {
+    (
+        record.ts.timestamp_millis(),
+        record.seq.unwrap_or(0),
+        record.observation_id.clone(),
+    )
+}
+
+fn encode_receipt_cursor(key: &ReceiptOrderKey) -> String {
+    format!("{}:{}:{}", key.0, key.1, key.2)
+}
+
+/// Parse a `before` cursor back into an order key. Malformed cursors are a
+/// client error (400) rather than a silent full-scan-from-newest.
+fn parse_receipt_cursor(raw: &str) -> Option<ReceiptOrderKey> {
+    let mut parts = raw.splitn(3, ':');
+    let ts_ms = parts.next()?.parse::<i64>().ok()?;
+    let seq = parts.next()?.parse::<u64>().ok()?;
+    let obs_id = parts.next()?.to_string();
+    Some((ts_ms, seq, obs_id))
+}
+
+/// Does this observation dereference to a full CROWN receipt on a CPU-only
+/// daemon? True only for the `ad_ga_*` gate-approval receipts, whose id lives in
+/// the record payload. Returns that id so the console can fetch it.
+fn fetchable_receipt_id(record: &ObservationRecordV1) -> Option<String> {
+    record
+        .payload
+        .get("receipt_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| id.starts_with(FETCHABLE_RECEIPT_ID_PREFIX))
+        .map(str::to_string)
+}
+
+/// `GET /v1/receipts/list` — CE-local receipt listing. See the module comment
+/// above `ReceiptsListQuery`. Scans every session journal plus the reserved
+/// gate-receipt journal, applies the optional `kind`/`principal`/`session`
+/// filters, orders newest-first, and pages via the `before` cursor + `limit`.
+#[utoipa::path(
+    get,
+    path = "/v1/receipts/list",
+    tag = "Receipts",
+    params(
+        ("tenant_id" = Option<String>, Query, description = "Tenant scope for the read guard (default 'default')"),
+        ("before" = Option<String>, Query, description = "Opaque cursor from a prior page's next_cursor; returns strictly-older rows"),
+        ("limit" = Option<usize>, Query, description = "Page size (default 100, max 1000)"),
+        ("kind" = Option<String>, Query, description = "Filter by observation kind"),
+        ("principal" = Option<String>, Query, description = "Filter by signing principal (passport fpr)"),
+        ("session" = Option<String>, Query, description = "Filter by session id (raw or sanitised)"),
+    ),
+    responses(
+        (status = 200, description = "Newest-first, cursor-paginated CE-local receipt listing over the observation journals"),
+        (status = 400, description = "Malformed cursor"),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub(super) async fn get_receipts_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ReceiptsListQuery>,
+) -> Response {
+    if let Err(problem) =
+        super::require_http_scopes_for_tenant(&state.auth, &headers, &["receipts:read"], &params.tenant_id)
+    {
+        return problem.into_response();
+    }
+
+    let cursor = match params.before.as_deref() {
+        None => None,
+        Some(raw) => match parse_receipt_cursor(raw) {
+            Some(key) => Some(key),
+            None => {
+                return problem_response(StatusCode::BAD_REQUEST, format!("malformed `before` cursor: {raw}"));
+            }
+        },
+    };
+    let limit = params
+        .limit
+        .unwrap_or(RECEIPTS_LIST_DEFAULT_LIMIT)
+        .clamp(1, RECEIPTS_LIST_MAX_LIMIT);
+
+    // Every regular session journal, PLUS the reserved gate-receipt journal
+    // (`list_observation_files` deliberately skips the latter, but it is exactly
+    // where the fetchable `ad_ga_*` receipts live, so add it explicitly).
+    let mut files = match list_observation_files(&state.data_dir) {
+        Ok(files) => files,
+        Err(err) => {
+            return problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("list observation files: {err}"),
+            );
+        }
+    };
+    let gate_journal = observation_file_path(&state.data_dir, super::work::WORK_GATE_RECEIPT_SESSION);
+    if gate_journal.is_file() {
+        files.push(gate_journal);
+    }
+
+    let session_filter = params
+        .session
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(sanitize_session_id_for_filename);
+
+    let mut rows: Vec<ReceiptListRowV1> = Vec::new();
+    let mut kind_counts: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut principal_counts: std::collections::BTreeMap<String, usize> = Default::default();
+
+    for path in files {
+        let records = match read_observations(&path) {
+            Ok(records) => records,
+            Err(err) => {
+                tracing::warn!(
+                    target = "receipts",
+                    file = %path.display(),
+                    error = %err,
+                    "skipping unreadable observation file for receipts listing"
+                );
+                continue;
+            }
+        };
+        for record in records {
+            if let Some(kind) = params.kind.as_deref() {
+                if record.kind != kind {
+                    continue;
+                }
+            }
+            if let Some(principal) = params.principal.as_deref() {
+                if record.principal != principal {
+                    continue;
+                }
+            }
+            if let Some(target) = session_filter.as_deref() {
+                if sanitize_session_id_for_filename(&record.session_id) != target {
+                    continue;
+                }
+            }
+            count_observation_field(&mut kind_counts, &record.kind, "(missing)");
+            count_observation_field(&mut principal_counts, &record.principal, "(missing)");
+
+            let key = receipt_order_key(&record);
+            let receipt_id = fetchable_receipt_id(&record);
+            let body_hash = &record.receipt.body_hash;
+            let body_hash_hex = body_hash.strip_prefix("blake3:").unwrap_or(body_hash);
+            rows.push(ReceiptListRowV1 {
+                observation_id: record.observation_id.clone(),
+                session_short: short_hex(&record.session_id, 12),
+                session_id: record.session_id.clone(),
+                ts: record.ts,
+                principal: record.principal.clone(),
+                kind: record.kind.clone(),
+                receipt: ReceiptEnvelopeSummaryV1 {
+                    alg: record.receipt.alg.clone(),
+                    signed_by_short: short_hex(&record.receipt.signed_by, 12),
+                    signed_by: record.receipt.signed_by.clone(),
+                    body_hash: body_hash.clone(),
+                    body_hash_short: short_hex(body_hash_hex, 12),
+                },
+                seq: record.seq,
+                fetchable: receipt_id.is_some(),
+                receipt_id,
+                cursor: encode_receipt_cursor(&key),
+            });
+        }
+    }
+
+    // Newest-first: (ts_ms, seq, obs_id) descending.
+    rows.sort_by_key(|row| std::cmp::Reverse(receipt_order_key_of_row(row)));
+    let matched = rows.len();
+
+    // Cursor: drop everything at-or-newer than `before` (strictly-older page).
+    if let Some(ref cur) = cursor {
+        rows.retain(|row| receipt_order_key_of_row(row) < *cur);
+    }
+    let has_more = rows.len() > limit;
+    rows.truncate(limit);
+    let next_cursor = if has_more {
+        rows.last().map(|row| row.cursor.clone())
+    } else {
+        None
+    };
+    let returned = rows.len();
+
+    (
+        StatusCode::OK,
+        Json(ReceiptsListResponse {
+            rows,
+            returned,
+            matched,
+            next_cursor,
+            has_more,
+            kind_counts,
+            principal_counts,
+        }),
+    )
+        .into_response()
+}
+
+/// Reconstruct the order key from a built row (avoids re-borrowing the source
+/// record after the row is moved into the vector).
+fn receipt_order_key_of_row(row: &ReceiptListRowV1) -> ReceiptOrderKey {
+    (
+        row.ts.timestamp_millis(),
+        row.seq.unwrap_or(0),
+        row.observation_id.clone(),
+    )
+}
+
 // ── Dataplane stream writer (M5f.3) ───────────────────────────────────────
 
 /// Tenant id used when streaming observations through a Tier 2+
@@ -3009,6 +3340,235 @@ mod tests {
         assert_eq!(body["observations"].as_array().unwrap().len(), 1);
         assert_eq!(body["provider_counts"]["claude-code"], 2);
         assert_eq!(body["provider_counts"]["openai"], 2);
+    }
+
+    // ── Receipts listing (M6) ──────────────────────────────────────────────
+
+    fn receipts_list_query() -> ReceiptsListQuery {
+        ReceiptsListQuery {
+            tenant_id: "default".to_string(),
+            before: None,
+            limit: None,
+            kind: None,
+            principal: None,
+            session: None,
+        }
+    }
+
+    /// Pagination walks the full multi-session set exactly once — no dupes, no
+    /// omissions — across `before`-cursor pages, newest-first.
+    #[tokio::test]
+    async fn receipts_list_pagination_walk_covers_all_exactly_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("passport.key");
+        let key = crux_session::LocalPassportKey::from_path(&key_path).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+
+        // 3 sessions × 3 records = 9 receipts across journals.
+        let mut expected: std::collections::BTreeSet<String> = Default::default();
+        for sess in ["rl-a", "rl-b", "rl-c"] {
+            for i in 0..3 {
+                let (resp, _tip) = append_one(
+                    &state,
+                    sess,
+                    key.passport_fpr(),
+                    PostObservationBody {
+                        kind: "tool_use".to_string(),
+                        provider: "claude-code".to_string(),
+                        client_ts: None,
+                        payload: serde_json::json!({ "i": i }),
+                    },
+                    None,
+                )
+                .unwrap();
+                expected.insert(resp.observation_id);
+            }
+        }
+
+        // Page with limit=2; thread next_cursor as `before` until drained.
+        let mut seen: Vec<String> = Vec::new();
+        let mut before: Option<String> = None;
+        let mut prev_key: Option<(i64, u64, String)> = None;
+        for _ in 0..100 {
+            let mut q = receipts_list_query();
+            q.limit = Some(2);
+            q.before = before.clone();
+            let resp = get_receipts_list(State(state.clone()), HeaderMap::new(), Query(q)).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = response_to_json(resp).await;
+            assert_eq!(body["matched"], 9);
+            let rows = body["rows"].as_array().unwrap();
+            assert!(rows.len() <= 2);
+            for row in rows {
+                let obs_id = row["observation_id"].as_str().unwrap().to_string();
+                seen.push(obs_id);
+                // Strictly-descending order key across the whole walk.
+                let key_now = (
+                    row["ts"]
+                        .as_str()
+                        .map(|s| chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp_millis())
+                        .unwrap(),
+                    row["seq"].as_u64().unwrap_or(0),
+                    row["observation_id"].as_str().unwrap().to_string(),
+                );
+                if let Some(prev) = &prev_key {
+                    assert!(key_now < *prev, "rows must be strictly newest-first across pages");
+                }
+                prev_key = Some(key_now);
+            }
+            if body["has_more"].as_bool().unwrap() {
+                before = body["next_cursor"].as_str().map(str::to_string);
+                assert!(before.is_some());
+            } else {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), 9, "walk visited every receipt exactly once");
+        let unique: std::collections::BTreeSet<String> = seen.iter().cloned().collect();
+        assert_eq!(unique.len(), 9, "no duplicate rows across pages");
+        assert_eq!(unique, expected, "walk covered exactly the fixture set");
+    }
+
+    /// `kind` and `session` filters narrow the matched set; a fetchable
+    /// `ad_ga_*` gate-journal receipt is flagged and carries its receipt id.
+    #[tokio::test]
+    async fn receipts_list_filters_and_fetchable_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("passport.key");
+        let key = crux_session::LocalPassportKey::from_path(&key_path).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+
+        append_one(
+            &state,
+            "flt-a",
+            key.passport_fpr(),
+            PostObservationBody {
+                kind: "tool_use".to_string(),
+                provider: "claude-code".to_string(),
+                client_ts: None,
+                payload: serde_json::Value::Null,
+            },
+            None,
+        )
+        .unwrap();
+        append_one(
+            &state,
+            "flt-b",
+            key.passport_fpr(),
+            PostObservationBody {
+                kind: "model_response".to_string(),
+                provider: "openai".to_string(),
+                client_ts: None,
+                payload: serde_json::Value::Null,
+            },
+            None,
+        )
+        .unwrap();
+        // A record in the reserved gate-receipt journal carrying an ad_ga_* id:
+        // the fetchable class. `list_observation_files` skips this journal, so the
+        // listing route must add it back explicitly.
+        append_one(
+            &state,
+            crate::http::work::WORK_GATE_RECEIPT_SESSION,
+            key.passport_fpr(),
+            PostObservationBody {
+                kind: "approval_decision".to_string(),
+                provider: "corecruxd".to_string(),
+                client_ts: None,
+                payload: serde_json::json!({ "receipt_id": "ad_ga_test123", "decision": "approve" }),
+            },
+            None,
+        )
+        .unwrap();
+
+        // No filter → all 3 (2 session journals + 1 gate-journal record).
+        let resp = get_receipts_list(State(state.clone()), HeaderMap::new(), Query(receipts_list_query())).await;
+        let body = response_to_json(resp).await;
+        assert_eq!(body["matched"], 3);
+        let fetchable: Vec<&serde_json::Value> = body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["fetchable"].as_bool() == Some(true))
+            .collect();
+        assert_eq!(fetchable.len(), 1, "only the ad_ga_* gate receipt is fetchable");
+        assert_eq!(fetchable[0]["receipt_id"], "ad_ga_test123");
+
+        // kind filter.
+        let mut q = receipts_list_query();
+        q.kind = Some("model_response".to_string());
+        let resp = get_receipts_list(State(state.clone()), HeaderMap::new(), Query(q)).await;
+        let body = response_to_json(resp).await;
+        assert_eq!(body["matched"], 1);
+        assert_eq!(body["rows"][0]["kind"], "model_response");
+
+        // session filter (raw id → sanitised match).
+        let mut q = receipts_list_query();
+        q.session = Some("flt-a".to_string());
+        let resp = get_receipts_list(State(state.clone()), HeaderMap::new(), Query(q)).await;
+        let body = response_to_json(resp).await;
+        assert_eq!(body["matched"], 1);
+        assert_eq!(body["rows"][0]["kind"], "tool_use");
+        // Envelope summary is present with a short form derived from the full one.
+        assert_eq!(body["rows"][0]["receipt"]["alg"], "ed25519");
+        assert!(body["rows"][0]["receipt"]["signed_by_short"].as_str().unwrap().len() <= 12);
+
+        // Malformed cursor → 400.
+        let mut q = receipts_list_query();
+        q.before = Some("not-a-cursor".to_string());
+        let resp = get_receipts_list(State(state), HeaderMap::new(), Query(q)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Router precedence: matchit resolves static `/v1/receipts/list` to the
+    /// listing handler, NOT the `/{receiptId}` param route (which would 501 on a
+    /// dataplane-less CE). Mounts both in mod.rs order and drives them.
+    #[tokio::test]
+    async fn receipts_list_static_route_beats_by_id_param() {
+        use axum::routing::get;
+        use axum::Router;
+        use tower::ServiceExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("passport.key");
+        let key = crux_session::LocalPassportKey::from_path(&key_path).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+
+        let app = Router::new()
+            .route("/v1/receipts/list", get(get_receipts_list))
+            .route(
+                "/v1/receipts/{receiptId}",
+                get(crate::http::receipts::get_receipt_body_v1),
+            )
+            .with_state(state);
+
+        // /list → the listing handler (200 + rows array), never the by-id 501.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/receipts/list?tenant_id=default")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_to_json(resp).await;
+        assert!(body["rows"].is_array(), "static /list hits the listing handler");
+
+        // A genuine by-id lookup (non ad_ga_*) still falls to the param route,
+        // which 501s with the dataplane disabled — proving the two are distinct.
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/receipts/some-random-id?tenant_id=default")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     #[tokio::test]

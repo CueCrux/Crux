@@ -44,6 +44,22 @@ pub struct SessionState {
     pub archived_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archive_reason: Option<String>,
+    /// Authenticated identity that wrote this snapshot, resolved at write time.
+    ///
+    /// This is the same passport string `store_fact` records as its `actor`
+    /// (agent token-name, upgraded to a passport_id when
+    /// `CORECRUXD_AGENT_PASSPORTS` is on). It exists because the session store
+    /// previously carried NO identity at all: the console had to infer the agent
+    /// by parsing the `__agent_session::<agent>::` key prefix, which is empty for
+    /// every session written by an unauthenticated caller.
+    ///
+    /// `None` is the honest value, not a failure: an anonymous caller (no
+    /// `CRUX_AGENT_TOKENS` configured — the default local posture) has no
+    /// identity to stamp. `#[serde(default, skip_serializing_if)]` keeps
+    /// pre-actor journal lines replay-safe AND keeps anonymous writes
+    /// byte-identical to what this store wrote before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
 }
 
 /// In-memory session store with optional JSONL persistence.
@@ -125,7 +141,22 @@ impl SessionStore {
     /// If `ttl_seconds` is `Some`, the session will expire after the given
     /// duration and be reaped on the next cleanup pass.
     pub fn put(&mut self, session_id: &str, state: serde_json::Value, ttl_seconds: Option<u64>) -> SessionState {
-        let session = self.build_session(session_id, state, ttl_seconds);
+        self.put_with_actor(session_id, state, ttl_seconds, None)
+    }
+
+    /// [`put`](Self::put), stamping the authenticated identity that wrote it.
+    ///
+    /// Kept as a separate entry point so the six existing `put`/`try_put` call
+    /// sites stay untouched; callers that HAVE an identity opt in.
+    pub fn put_with_actor(
+        &mut self,
+        session_id: &str,
+        state: serde_json::Value,
+        ttl_seconds: Option<u64>,
+        actor: Option<String>,
+    ) -> SessionState {
+        let mut session = self.build_session(session_id, state, ttl_seconds);
+        session.actor = actor;
 
         self.sessions.insert(session_id.to_string(), session.clone());
 
@@ -147,7 +178,19 @@ impl SessionStore {
         state: serde_json::Value,
         ttl_seconds: Option<u64>,
     ) -> std::io::Result<SessionState> {
-        let session = self.build_session(session_id, state, ttl_seconds);
+        self.try_put_with_actor(session_id, state, ttl_seconds, None)
+    }
+
+    /// [`try_put`](Self::try_put), stamping the authenticated writer identity.
+    pub fn try_put_with_actor(
+        &mut self,
+        session_id: &str,
+        state: serde_json::Value,
+        ttl_seconds: Option<u64>,
+        actor: Option<String>,
+    ) -> std::io::Result<SessionState> {
+        let mut session = self.build_session(session_id, state, ttl_seconds);
+        session.actor = actor;
         self.append_journal(&SessionJournalEvent::Store {
             session: session.clone(),
         })?;
@@ -170,6 +213,7 @@ impl SessionStore {
             archived: false,
             archived_at: None,
             archive_reason: None,
+            actor: None,
         }
     }
 
@@ -719,7 +763,44 @@ mod tests {
         let s = store.get("legacy").expect("legacy session replays");
         assert!(!s.archived);
         assert!(s.archived_at.is_none());
+        assert!(
+            s.actor.is_none(),
+            "a pre-actor line must replay with no identity, not a guessed one"
+        );
         assert_eq!(s.state, json!({"a": 1}));
+    }
+
+    #[test]
+    fn actor_stamp_is_additive_and_replay_safe() {
+        // The write-time identity stamp must behave exactly like the archive
+        // fields did: absent on legacy lines, absent on the wire when the caller
+        // is anonymous (so an anonymous write is byte-identical to what this
+        // store produced before the field existed), and durable across replay
+        // when it IS supplied.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = SessionStore::with_persistence(dir.path()).unwrap();
+            store.try_put("anon", json!({"v": 1}), None).unwrap();
+            store
+                .try_put_with_actor("known", json!({"v": 2}), None, Some("claude-work".to_string()))
+                .unwrap();
+        }
+        let raw = std::fs::read_to_string(dir.path().join("sessions.jsonl")).unwrap();
+        let anon_line = raw.lines().find(|l| l.contains("\"anon\"")).unwrap();
+        assert!(
+            !anon_line.contains("actor"),
+            "an anonymous write must not emit the key at all: {anon_line}"
+        );
+        assert!(raw.lines().any(|l| l.contains("\"actor\":\"claude-work\"")));
+
+        let store = SessionStore::with_persistence(dir.path()).unwrap();
+        assert!(store.get("anon").unwrap().actor.is_none());
+        assert_eq!(store.get("known").unwrap().actor.as_deref(), Some("claude-work"));
+
+        // Archiving rewrites the whole record — the stamp must survive it.
+        let mut store = SessionStore::with_persistence(dir.path()).unwrap();
+        let archived = store.try_set_archived("known", true, None).unwrap().unwrap();
+        assert_eq!(archived.actor.as_deref(), Some("claude-work"));
     }
 
     #[test]

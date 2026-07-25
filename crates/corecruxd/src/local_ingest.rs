@@ -17,10 +17,34 @@
 //! ExecPlan: `cpu-prose-ingest-door-2026-07-01`.
 //! - M0: CPU seal spike (this module's `seal_prose_documents` + roundtrip test).
 //! - M2: consumed by the `/v1/local/ingest` handler for the real write path.
+//!
+//! ExecPlan `crux-integrations-and-template-library-2026-07-25` (I4) adds two
+//! reusable pieces on top, so an in-process producer (the vault watcher) writes
+//! through exactly the same path as an HTTP caller:
+//! - [`chunk_markdown`] / [`chunk_plain_text`] — the document chunker.
+//! - [`ingest_prose_documents`] — seal + timeline + index-reload, shared with
+//!   the `POST /v1/local/ingest` handler.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use corecrux_storage::{AppendEventInput, ShardStorage, ShardStorageOptions, StorageError};
+use tokio::sync::{Mutex, RwLock};
+
+/// Single-node local ingest writes to shard 0 at a fixed epoch. Segment
+/// sequence auto-increments within the shard and persists via the MANIFEST.
+pub const LOCAL_INGEST_SHARD_ID: u32 = 0;
+/// Epoch stamped on every locally-sealed prose segment.
+pub const LOCAL_INGEST_EPOCH: u64 = 1;
+
+/// Chunker target size, in characters. Matches `corecruxctl::ingest` (the
+/// `crux-ingest` CLI that feeds `POST /v1/local/ingest`) so a note ingested by
+/// the watcher and the same note ingested by the CLI produce identical chunks.
+const CHUNK_TARGET_CHARS: usize = 1_800;
+/// Earliest character offset a chunk boundary may be pulled back to.
+const CHUNK_MIN_BOUNDARY_CHARS: usize = 1_200;
+/// Characters of overlap carried into the next window.
+const CHUNK_OVERLAP_CHARS: usize = 180;
 
 /// Event type stamped on every sealed prose chunk frame.
 pub const PROSE_CHUNK_EVENT_TYPE: &str = "corecrux.prose.chunk.v1";
@@ -552,12 +576,251 @@ fn hex16(bytes: &[u8; 16]) -> String {
     s
 }
 
+// ── Chunking ─────────────────────────────────────────────────────────────
+//
+// `POST /v1/local/ingest` takes chunks pre-split by the caller; the reference
+// splitter has always lived in `corecruxctl::ingest` (`crux-ingest`). The
+// vault watcher is the first *in-process* producer, so the splitter is
+// restated here as the daemon-side reusable function rather than open-coded
+// inside the watcher. Algorithm + constants are identical to
+// `corecruxctl::ingest::{chunk_markdown, chunk_plain_text}`; a shared crate
+// would be the next step if a third producer appears (the two binaries have no
+// common library crate that owns text processing today).
+
+/// True when `line` opens an ATX markdown heading (`# ` … `###### `).
+fn markdown_heading(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let hashes = trimmed.bytes().take_while(|byte| *byte == b'#').count();
+    (1..=6).contains(&hashes) && trimmed.as_bytes().get(hashes).is_some_and(u8::is_ascii_whitespace)
+}
+
+/// Chunk Markdown at ATX headings, then window unusually long sections.
+pub fn chunk_markdown(input: &str) -> Vec<String> {
+    let mut sections = Vec::new();
+    let mut current = String::new();
+    for line in input.split_inclusive('\n') {
+        if markdown_heading(line) && !current.trim().is_empty() {
+            sections.push(std::mem::take(&mut current));
+        }
+        current.push_str(line);
+    }
+    if !current.trim().is_empty() {
+        sections.push(current);
+    }
+    sections
+        .into_iter()
+        .flat_map(|section| chunk_plain_text(&section))
+        .collect()
+}
+
+/// Paragraph-aware sliding windows of approximately 1,800 characters.
+pub fn chunk_plain_text(input: &str) -> Vec<String> {
+    let text = input.trim();
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= CHUNK_TARGET_CHARS {
+        return vec![text.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    while start < chars.len() {
+        let ideal_end = (start + CHUNK_TARGET_CHARS).min(chars.len());
+        let mut end = ideal_end;
+        if ideal_end < chars.len() {
+            let minimum = (start + CHUNK_MIN_BOUNDARY_CHARS).min(ideal_end);
+            for candidate in (minimum..=ideal_end).rev() {
+                if candidate >= 2 && chars[candidate - 2] == '\n' && chars[candidate - 1] == '\n' {
+                    end = candidate;
+                    break;
+                }
+            }
+            if end == ideal_end {
+                for candidate in (minimum..=ideal_end).rev() {
+                    if chars[candidate - 1].is_whitespace() {
+                        end = candidate;
+                        break;
+                    }
+                }
+            }
+        }
+        let chunk: String = chars[start..end].iter().collect::<String>().trim().to_string();
+        if !chunk.is_empty() {
+            chunks.push(chunk);
+        }
+        if end == chars.len() {
+            break;
+        }
+        let next = end.saturating_sub(CHUNK_OVERLAP_CHARS);
+        start = if next > start { next } else { end };
+    }
+    chunks
+}
+
+// ── Shared write path ────────────────────────────────────────────────────
+
+/// The pieces of `AppState` the local-ingest write path needs. Carried as its
+/// own struct so an in-process producer (the vault watcher) can drive the same
+/// path without an `AppState`, and so this module keeps no dependency on the
+/// HTTP layer.
+#[derive(Clone)]
+pub struct LocalIngestHandles {
+    pub data_dir: PathBuf,
+    /// Serializes seals — each one takes the shard's exclusive lock.
+    pub ingest_lock: Arc<Mutex<()>>,
+    /// Hot-reloaded after every seal so the fresh `.ccxi` is queryable.
+    pub retrieval_index: Arc<RwLock<corecrux_retrieval::IndexManager>>,
+}
+
+/// Seal `documents`, record the console timeline rows, and hot-reload the
+/// retrieval index — the durable tail shared by `POST /v1/local/ingest` and the
+/// vault watcher.
+///
+/// Callers own policy (auth, payload validation, dense-vector/profile
+/// negotiation) and hand over documents that are ready to seal. Returns the
+/// seal summary, or a human-readable error string; timeline-index failures are
+/// logged and never fail an otherwise-durable ingest.
+pub async fn ingest_prose_documents(
+    handles: &LocalIngestHandles,
+    tenant_id: &str,
+    corpus_id: &str,
+    documents: Vec<ProseDocument>,
+    dense_profile: Option<corecrux_memory::embeddings::SemanticProfile>,
+) -> Result<SealSummary, String> {
+    let data_dir = handles.data_dir.clone();
+    let tenant = tenant_id.to_string();
+    let corpus = corpus_id.to_string();
+    let ingested_at = chrono::Utc::now().to_rfc3339();
+    let now_ms = crate::ops_events::now_unix_ms();
+
+    let _guard = handles.ingest_lock.lock().await;
+    let sealed = tokio::task::spawn_blocking(move || -> Result<SealSummary, String> {
+        let summary = seal_prose_documents(
+            &data_dir,
+            LOCAL_INGEST_SHARD_ID,
+            LOCAL_INGEST_EPOCH,
+            &tenant,
+            &corpus,
+            &ingested_at,
+            &documents,
+            dense_profile.as_ref(),
+        )
+        .map_err(|e| e.to_string())?;
+
+        // T.4: record a timeline row per document (same console index the
+        // `/v1/append` path writes). Best-effort — a timeline miss never fails
+        // an otherwise-durable ingest.
+        for doc in &documents {
+            let events: Vec<corecrux_proto::dataplane_v1::AppendEvent> = doc
+                .chunks
+                .iter()
+                .map(|c| corecrux_proto::dataplane_v1::AppendEvent {
+                    event_id: c.chunk_id.clone(),
+                    occurred_at: ingested_at.clone(),
+                    event_type: PROSE_CHUNK_EVENT_TYPE.to_string(),
+                    content_type: PROSE_CHUNK_CONTENT_TYPE.to_string(),
+                    payload: c.text.as_bytes().to_vec(),
+                })
+                .collect();
+            if let Err(err) = crate::console_index::record_appended_events(
+                &data_dir,
+                &tenant,
+                &corpus,
+                &doc.doc_id,
+                0,
+                &events,
+                now_ms,
+            ) {
+                tracing::warn!(?err, doc_id = %doc.doc_id, "local-ingest timeline indexing failed");
+            }
+        }
+        Ok(summary)
+    })
+    .await;
+
+    let summary = match sealed {
+        Ok(Ok(summary)) => summary,
+        Ok(Err(msg)) => return Err(msg),
+        Err(join_err) => return Err(format!("local ingest seal task failed: {join_err}")),
+    };
+
+    // Load-at-runtime wiring: hot-reload the retrieval index so the freshly
+    // sealed `.ccxi` is queryable immediately (idempotent — scan skips
+    // already-loaded segments).
+    {
+        let mut guard = handles.retrieval_index.write().await;
+        let shards_dir = handles.data_dir.join("shards");
+        if let Ok(entries) = std::fs::read_dir(&shards_dir) {
+            for entry in entries.flatten() {
+                let seg_dir = entry.path().join("segments");
+                if let Err(err) = guard.scan_and_load(&seg_dir) {
+                    tracing::warn!(?err, dir = ?seg_dir, "local-ingest ccxi reload failed");
+                }
+            }
+        }
+    }
+    drop(_guard);
+
+    Ok(summary)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use corecrux_retrieval::bm25::{bm25_search, Bm25Params};
     use corecrux_retrieval::IndexManager;
+
+    // ── Chunker parity with `corecruxctl::ingest` ────────────────────────
+    //
+    // These mirror `corecruxctl::ingest::tests::{markdown_chunks_start_at_headings,
+    // text_windows_have_bounded_size_and_overlap}` assertion-for-assertion. The
+    // two chunkers are separate copies of one algorithm (no shared library crate
+    // between the two binaries yet), so parity is asserted, not assumed.
+
+    #[test]
+    fn markdown_chunks_start_at_headings() {
+        let input = format!("# First\n\n{}\n\n## Second\n\nshort ending", "alpha ".repeat(400));
+        let chunks = chunk_markdown(&input);
+        assert!(chunks.first().unwrap().starts_with("# First"));
+        assert!(chunks.iter().any(|chunk| chunk.starts_with("## Second")));
+        assert!(chunks
+            .iter()
+            .all(|chunk| !(chunk.contains("# First") && chunk.contains("## Second"))));
+    }
+
+    #[test]
+    fn text_windows_have_bounded_size_and_overlap() {
+        let input = (0..900).map(|index| format!("word{index:04} ")).collect::<String>();
+        let chunks = chunk_plain_text(&input);
+        assert!(chunks.len() > 2);
+        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= CHUNK_TARGET_CHARS));
+        for pair in chunks.windows(2) {
+            let left: Vec<char> = pair[0].chars().collect();
+            let right: Vec<char> = pair[1].chars().collect();
+            let mut overlap = 0;
+            let max = CHUNK_OVERLAP_CHARS.min(left.len()).min(right.len());
+            for length in 1..=max {
+                if left[left.len() - length..] == right[..length] {
+                    overlap = length;
+                }
+            }
+            assert!(overlap > 0);
+            assert!(overlap <= CHUNK_OVERLAP_CHARS);
+        }
+    }
+
+    #[test]
+    fn chunker_handles_empty_and_short_input() {
+        assert!(chunk_markdown("").is_empty());
+        assert!(chunk_markdown("   \n\n  ").is_empty());
+        assert!(chunk_plain_text("").is_empty());
+        assert_eq!(chunk_plain_text("  hello  "), vec!["hello".to_string()]);
+        // A short note is exactly one chunk, verbatim (trimmed).
+        assert_eq!(chunk_markdown("# Title\n\nbody\n"), vec!["# Title\n\nbody".to_string()]);
+    }
 
     // These tests seal through `corecrux-storage`, whose seal/append path reads a
     // process-global env var (`CORECRUX_STORAGE_FAILPOINT`) in non-test builds —

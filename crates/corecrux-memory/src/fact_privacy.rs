@@ -127,6 +127,10 @@ pub const DEFAULT_PRIVATE_PREFIXES: &[&str] = &[
     "__bootstrap__::",
     "__project__::",
     "__tenant_metadata__::",
+    // Periodic-job bookkeeping written by `corecruxd::sync_scheduler`
+    // (`__sync__::<job_id>` key=`status`, plus per-job cursors). Node-local
+    // operational state — never push-eligible to a remote.
+    "__sync__::",
     "decisions::",
     "github::",
 ];

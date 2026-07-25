@@ -65,6 +65,7 @@ pub mod stage1_import;
 pub mod start;
 pub mod storage;
 pub mod structured_log;
+pub mod studio;
 pub mod tooling_env;
 pub mod verify_store;
 

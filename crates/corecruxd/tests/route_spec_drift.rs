@@ -75,6 +75,34 @@ fn manifest_dir() -> PathBuf {
 //   * workbench.rs::post_policy_simulation   — POST /v1/workbench/policy-simulation           (flattened ActionEnrichmentInput {tool_name,action_description,tool_parameters}; returns receipt.receipt_id) [mod.rs:702]
 //   * workbench.rs::post_route_probe         — POST /v1/workbench/route-probe                 (body {route,include_storyline,include_tests}; returns receipt.receipt_id) [mod.rs:697]
 //   * features.rs::post_audit                — POST /v1/features/capabilities/{id}/audit      (body {status,auditor,notes}) [mod.rs:591]
+//
+// crux-integrations-and-template-library I1+I2 — Studio › Integrations becomes the
+// ONE actionable integrations home, so the routes that already existed daemon-side
+// but had no console reach are added here. Grounded against the handlers:
+//   * extensions.rs::install_from_registry   — POST   /v1/extensions/install-from-registry     (InstallFromRegistryBody {id, index_path?}; scopes admin:read+facts:write) [mod.rs:1059]
+//   * extensions.rs::delete_extension        — DELETE /v1/extensions/{id}                      (no body; 204; scopes admin:read+facts:write) [mod.rs:1086]
+//   * extensions.rs::issue_grant             — POST   /v1/extensions/{id}/grants               (IssueGrantBody {passport_fpr,allowed_tool_names,allowed_prefixes_read,allowed_prefixes_write,rate_limit_per_min?}; scopes admin:read+facts:write) [mod.rs:1096]
+//   * extensions.rs::revoke_grant            — DELETE /v1/extensions/{id}/grants/{passport_fpr} (no body; 204; scopes admin:read+facts:write) [mod.rs:1100]
+//   * extensions.rs::delete_trusted_key      — DELETE /v1/extensions/keys/{passport_fpr}       (no body; 204; scopes admin:read+facts:write) [mod.rs:1078]
+//   * extensions.rs::invoke_extension_tool   — POST   /v1/extensions/{id}/tools/{tool_name}/invoke (InvokeToolBody {passport_fpr?,args}; grant-scoped + rate-limited; scopes admin:read+facts:write) [mod.rs:1106]
+//   * console.rs::post_console_integration_install — POST /v1/console/integrations/{packId}/install (InstallIntegrationBody {manifest?,pack_id?,version?}; scope integrations:install; 403 under safe mode) [mod.rs:1415]
+//   * console.rs::post_console_integration_grant   — POST /v1/console/integrations/{packId}/grant   (GrantIntegrationBody {version,capabilities,reason?}; scope integrations:grant; 403 under safe mode) [mod.rs:1419]
+//   * console.rs::post_console_integration_disable — POST /v1/console/integrations/{packId}/disable (DisableIntegrationBody {reason?}; scope integrations:disable) [mod.rs:1423]
+//   * integrations_github.rs::post_disconnect — POST /v1/integrations/github/disconnect        (no body; deletes sealed PAT + selected_repos.json; scope integrations:disable) [mod.rs:1272]
+//   * integrations_github.rs::post_sync       — POST /v1/integrations/github/sync              (no body; blocking sync of selected repos into the fact store; scope integrations:install) [mod.rs:1276]
+//   * integrations_openai.rs::post_connect    — POST /v1/integrations/openai/connect           (ConnectOpenAiBody {api_key,organization_id?,default_model?,skip_verify}; scope integrations:install) [mod.rs:1305]
+//   * integrations_openai.rs::post_disconnect — POST /v1/integrations/openai/disconnect        (no body; deletes the sealed key; scope integrations:disable) [mod.rs:1309]
+//
+// crux-integrations-and-template-library L2 — the CENTRAL Studio template library.
+// Browsing is a plain GET (flows from the manifest into `CruxApi`); installing is a
+// mutation and therefore lands here. Grounded against the handler:
+//   * studio_library.rs::post_studio_library_install — POST /v1/studio/library/{id}/install
+//     (InstallFromLibraryBody {index_path?}; scopes admin:read+facts:write; route_auth
+//     Write class with facts:write/admin:write. Re-verifies the curator-signed cached
+//     index, pins entry.pack_sha256 over the fetched pack, requires a pack signature that
+//     validates against the operator TrustedKeyring — 403 naming CORECRUXD_STUDIO_ALLOW_UNSIGNED
+//     otherwise — then writes console:tileboard: / console:tiledesign: / console:workspace: /
+//     console:page: facts, remapping every colliding id so an install can only ever add.)
 const GATED_MUTATIONS: &[(&str, &str, &str)] = &[
     ("POST", "/v1/work/gate/{actionId}/approve", "gateApprove"),
     ("POST", "/v1/work/gate/{actionId}/reject", "gateReject"),
@@ -99,6 +127,9 @@ const GATED_MUTATIONS: &[(&str, &str, &str)] = &[
         "/v1/identity/candidates/{candidateId}/confirm",
         "identityCandidateConfirm",
     ),
+    // console-surfaces-remediation M6: operator-gated "Seed candidates" — runs the
+    // candidate proposers so a fresh workspace can populate /v1/identity/candidates.
+    ("POST", "/v1/identity/candidates/propose", "identityCandidatePropose"),
     ("PUT", "/v1/console/corecrux/lane-weights", "laneWeightsApply"),
     ("DELETE", "/v1/console/corecrux/lane-weights", "laneWeightsReset"),
     ("POST", "/v1/admin/restart", "adminRestart"),
@@ -113,6 +144,58 @@ const GATED_MUTATIONS: &[(&str, &str, &str)] = &[
     ("POST", "/v1/workbench/policy-simulation", "workbenchPolicySimulation"),
     ("POST", "/v1/workbench/route-probe", "workbenchRouteProbe"),
     ("POST", "/v1/features/capabilities/{id}/audit", "featureCapabilityAudit"),
+    // console-surfaces-remediation M14: Canvas Studio persists tile boards + saved
+    // tile designs daemon-side. The write is the existing facts-add console route
+    // (facts:write scope, category-enforced); the console reaches it ONLY through
+    // operatorGatedCall, and the entity is fixed to the `console:tileboard:` /
+    // `console:tiledesign:` prefixes by the caller (render.js tileStudio*).
+    ("POST", "/v1/console/facts/add", "consoleFactsAdd"),
+    // ── crux-integrations-and-template-library I1: connectors (GitHub/OpenAI) ──
+    // Connect already shipped (githubConnect); the rest of each connector's
+    // lifecycle had no console reach, which is why the setup surface dead-ended.
+    ("POST", "/v1/integrations/github/disconnect", "githubDisconnect"),
+    ("POST", "/v1/integrations/github/sync", "githubSync"),
+    ("POST", "/v1/integrations/openai/connect", "openaiConnect"),
+    ("POST", "/v1/integrations/openai/disconnect", "openaiDisconnect"),
+    // ── I1: built-in integration packs (install / grant / disable) ─────────────
+    (
+        "POST",
+        "/v1/console/integrations/{packId}/install",
+        "integrationPackInstall",
+    ),
+    (
+        "POST",
+        "/v1/console/integrations/{packId}/grant",
+        "integrationPackGrant",
+    ),
+    (
+        "POST",
+        "/v1/console/integrations/{packId}/disable",
+        "integrationPackDisable",
+    ),
+    // ── I2: community extensions — catalog install, uninstall, grants, invoke ──
+    // Install rides the curator-signed index the daemon re-verifies locally; the
+    // console never posts an unsigned manifest URL.
+    (
+        "POST",
+        "/v1/extensions/install-from-registry",
+        "extensionInstallFromRegistry",
+    ),
+    ("DELETE", "/v1/extensions/{id}", "extensionUninstall"),
+    ("POST", "/v1/extensions/{id}/grants", "extensionGrantAdd"),
+    (
+        "DELETE",
+        "/v1/extensions/{id}/grants/{passport_fpr}",
+        "extensionGrantRemove",
+    ),
+    ("DELETE", "/v1/extensions/keys/{passport_fpr}", "extensionRemoveKey"),
+    (
+        "POST",
+        "/v1/extensions/{id}/tools/{tool_name}/invoke",
+        "extensionInvoke",
+    ),
+    // ── L2: central Studio template library — install one signed template ──
+    ("POST", "/v1/studio/library/{id}/install", "studioLibraryInstall"),
 ];
 
 // ── Curated read-POST allowlist (unified-shell-console M11) ───────────────────
@@ -136,12 +219,20 @@ const GATED_MUTATIONS: &[(&str, &str, &str)] = &[
 //   * query.rs::post_query_time_range         — POST /v1/query/time-range
 //   * engine_console.rs::post_engine_search   — POST /v1/console/engine/search
 //     (the ONE mediated read POST; proxies CruxEngine POST /v1/retrieve)
+//   * studio_pack.rs::post_build_pack   — POST /v1/studio/pack/build
+//   * studio_pack.rs::post_verify_pack  — POST /v1/studio/pack/verify
+//     (console-surfaces-remediation M15: Studio board pack export/import. Both
+//     are pure transforms/validators over a client-supplied payload — no store
+//     mutation, no operator posture — so they are read POSTs, not gated
+//     mutations. The apply step reuses the gated /v1/console/facts/add.)
 const READ_POST_ROUTES: &[(&str, &str, &str)] = &[
     ("POST", "/v1/query/text-search", "queryTextSearch"),
     ("POST", "/v1/query/text-search/expand", "queryTextSearchExpand"),
     ("POST", "/v1/query/graph-expand", "queryGraphExpand"),
     ("POST", "/v1/query/time-range", "queryTimeRange"),
     ("POST", "/v1/console/engine/search", "engineSearch"),
+    ("POST", "/v1/studio/pack/build", "studioPackBuild"),
+    ("POST", "/v1/studio/pack/verify", "studioPackVerify"),
 ];
 
 // ── Router source scanning (mirrors route_auth::parse_routes_in_source) ──────
@@ -652,6 +743,10 @@ fn generate_api_js() -> String {
     s.push_str("  window.CruxSession = CruxSession;\n");
     s.push_str("  window.CRUX_GATED_MUTATIONS = GATED_MUTATIONS;\n");
     s.push_str("  window.CRUX_READ_POST_ROUTES = READ_POST_ROUTES;\n");
+    s.push_str("  // Known literal (query-less) GET routes — the validated source for the\n");
+    s.push_str("  // Canvas Studio API-tile route picker (M14). An API tile may bind ONLY to a\n");
+    s.push_str("  // route in this list; arbitrary strings are rejected before any fetch.\n");
+    s.push_str("  window.CRUX_GET_ROUTES = Object.freeze(Object.keys(LITERAL_GET_PATHS));\n");
     s.push_str("}\n");
     s
 }

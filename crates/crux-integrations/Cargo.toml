@@ -15,6 +15,9 @@ corecrux-receipts = { path = "../corecrux-receipts" }
 # from caller-supplied RNG (also enables pack-time signing in tools).
 ed25519-dalek = { workspace = true, features = ["std", "rand_core"] }
 hex = { workspace = true }
+# The Studio template library reuses the RCX subscription-tier vocabulary
+# (`RcxTier`) verbatim for `required_tier` rather than forking a parallel enum.
+rcx-capability-token = { path = "../rcx-capability-token" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -22,6 +25,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# The community_packs test regenerates + signs the example Studio pack.
+blake3 = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["std", "rand_core"] }
 # The M4 Vault integration test (tests/vault_c2pa_m4_evidence.rs,
 # #[ignore]-gated) re-verifies the emitted signature against the leaf

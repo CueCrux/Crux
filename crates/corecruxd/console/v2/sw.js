@@ -19,7 +19,7 @@
 // build step to inject a content hash, so the discipline is manual — bump BOTH
 // this line and shell.html's copy whenever any app-shell asset changes, and the
 // old cache is dropped on the next activate.
-const SW_REV = 'ushell-v2-r13';
+const SW_REV = 'ushell-v2-r15';
 const CACHE_NAME = 'crux-console-v2::' + SW_REV;
 
 // The EXACT app-shell precache set. Cache-first with background refresh. Keep this

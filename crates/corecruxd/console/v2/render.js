@@ -130,6 +130,16 @@
   function enrichAction(input) {
     return operatorGatedCall(function (g) { return g.actionsEnrich(input); });
   }
+  // M6 cx-identity: run the candidate proposers (the ONLY shipped producer of
+  // /v1/identity/candidates). Operator-gated, server admin:write-gated.
+  function seedIdentityCandidates() {
+    return operatorGatedCall(function (g) { return g.identityCandidatePropose({}); });
+  }
+  // M6 cx-identity: confirm a candidate by supplying the cross-signature proof —
+  // mints the resolving identity_link only after both signatures verify (daemon).
+  function confirmIdentityCandidate(candidateId, proof) {
+    return operatorGatedCall(function (g) { return g.identityCandidateConfirm(candidateId, proof); });
+  }
 
   // Parse a fetch Response without ever throwing — the read counterpart of the
   // gated helpers above.
@@ -145,6 +155,25 @@
     var cur = obj;
     for (var i = 0; i < path.length; i++) { if (cur == null) { return undefined; } cur = cur[path[i]]; }
     return cur;
+  }
+
+  // ---- M25: ONE token-magnitude bar scale for the whole console -------------
+  // Pure. Returns the 0..1 position of `tokens` on a LOGARITHMIC axis running
+  // from `min` to `max`. Adopted in M25 because token magnitudes across the real
+  // corpus span five orders of magnitude (10k → 613M on the review mirror), a
+  // range no linear axis can draw: linear-to-max puts the median row at 0.5% of
+  // the track, and a quantile cap re-clamps the top decile — the failure M25 was
+  // opened to fix. Log renders the whole range at the cost of proportionality,
+  // so every surface that uses it must SAY it is a log scale (cx-cost's scale
+  // strip + aria-labels; the rings ExecPlans-arc lens's token-bar caption).
+  // Anything at or below `min` is a stub, not a lie about zero: callers pass
+  // 0-token rows through and get 0 back.
+  function logBarPos(tokens, min, max) {
+    var t = Number(tokens);
+    if (!isFinite(t) || t <= 0) { return 0; }
+    var lo = Math.log(Math.max(1, min)), hi = Math.log(Math.max(max, min * 10));
+    if (!(hi > lo)) { return 0; }
+    return Math.max(0, Math.min(1, (Math.log(Math.max(t, min)) - lo) / (hi - lo)));
   }
 
   function el(tag, attrs, children) {
@@ -479,14 +508,19 @@
   // disabled until M3+. This is the single choke point the smoke audits.
   function applyMutationGate(node, control) {
     if (!control || !control.mut) { return node; }
+    // A control may carry an honest, page-specific reason (control.gateReason) —
+    // used by surfaces past M3 whose gated writes will never be "wired in M3+"
+    // (e.g. Settings, whose config/actions live on the daemon host). The generic
+    // GATE_TITLE stays the default so the choke point (and its audits) hold.
+    var reason = (control.gateReason && String(control.gateReason)) || GATE_TITLE;
     node.setAttribute('data-requires', 'operator');   // shell.applyPosture hides for customers
     node.hidden = !isOperator();                       // and belt-and-braces at render time
     var target = node.querySelector('input, select, textarea, button') || node;
     if (target && 'disabled' in target) { target.disabled = true; }
     node.classList.add('is-gated');
-    node.setAttribute('title', GATE_TITLE);
+    node.setAttribute('title', reason);
     var tag = node.querySelector('.gate-tag');
-    if (!tag) { node.appendChild(el('span', { 'class': 'gate-tag', text: GATE_TITLE })); }
+    if (!tag) { node.appendChild(el('span', { 'class': 'gate-tag', text: reason })); }
     return node;
   }
 
@@ -1004,6 +1038,106 @@
     return details;
   }
 
+  // ---- M21: kanban board controls (state chips + sort) ---------------------
+  // The ExecPlan list is a kanban board, so "which states show" is column
+  // visibility and "sort" orders the cards INSIDE each column. Both live in
+  // localStorage keyed by the board id, so the operator's view of the plan list
+  // is the same on the next reload.
+  //
+  // Sort metrics, stated honestly:
+  //   updated / created — /v1/work's updated_at_unix_ms / created_at_unix_ms,
+  //                       newest first. Present on every item.
+  //   az               — title, locale-compared.
+  //   completion       — milestones_done / milestones_total. NOT every plan
+  //                      reports milestone counts; those sort last and the
+  //                      control says how many do (no invented progress).
+  var KANBAN_SORTS = [
+    ['updated', 'Updated · newest'],
+    ['created', 'Created · newest'],
+    ['az', 'Title · A→Z'],
+    ['completion', 'Completion · most done']
+  ];
+  var KANBAN_LS = 'crux.console.board.';
+  function kanbanReadHidden(boardId, cols) {
+    var out = {};
+    try {
+      var raw = localStorage.getItem(KANBAN_LS + boardId + '.hidden');
+      var list = raw ? JSON.parse(raw) : [];
+      if (Object.prototype.toString.call(list) === '[object Array]') {
+        list.forEach(function (k) { out[String(k)] = true; });
+      }
+    } catch (e) { /* quota / private mode — fall back to "everything shown" */ }
+    // Never restore a state that hides every column (an unusable board).
+    var shown = (cols || []).filter(function (c) { return !out[c.key]; });
+    return shown.length ? out : {};
+  }
+  function kanbanWriteHidden(boardId, hidden) {
+    try {
+      var list = Object.keys(hidden).filter(function (k) { return hidden[k]; });
+      localStorage.setItem(KANBAN_LS + boardId + '.hidden', JSON.stringify(list));
+    } catch (e) { /* non-fatal — the session keeps the choice in memory */ }
+  }
+  function kanbanReadSort(boardId) {
+    var v = null;
+    try { v = localStorage.getItem(KANBAN_LS + boardId + '.sort'); } catch (e) { v = null; }
+    for (var i = 0; i < KANBAN_SORTS.length; i++) { if (KANBAN_SORTS[i][0] === v) { return v; } }
+    return 'updated';
+  }
+  function kanbanWriteSort(boardId, sort) {
+    try { localStorage.setItem(KANBAN_LS + boardId + '.sort', sort); } catch (e) { /* non-fatal */ }
+  }
+  // Pure: order a card list by the chosen metric. Cards without the metric keep
+  // their feed order at the end rather than being dropped or faked.
+  function kanbanSortCards(cards, sort) {
+    var list = (cards || []).slice();
+    if (!sort || sort === 'feed') { return list; }
+    if (sort === 'az') {
+      return list.sort(function (a, b) { return String(a.title || '').localeCompare(String(b.title || '')); });
+    }
+    if (sort === 'completion') {
+      return list.sort(function (a, b) {
+        if (!!a.hasProg !== !!b.hasProg) { return a.hasProg ? -1 : 1; }   // unmeasured plans last
+        return (Number(b.pctSort) || 0) - (Number(a.pctSort) || 0);
+      });
+    }
+    var key = (sort === 'created') ? 'created' : 'updated';
+    return list.sort(function (a, b) { return (Number(b[key]) || 0) - (Number(a[key]) || 0); });
+  }
+  // Paint one column into a board host.
+  function kanbanColumn(board, col, sort) {
+    var cards = kanbanSortCards(col.cards, sort);
+    var colEl = el('div', { 'class': 'cvx-kcol', 'data-col': col.key });
+    colEl.appendChild(el('div', { 'class': 'cvx-kcol-head' }, [
+      el('span', { 'class': 'cvx-kcol-title', text: col.title }),
+      el('span', { 'class': 'cvx-kcol-count', text: String(cards.length) })
+    ]));
+    var colBody = el('div', { 'class': 'cvx-kcol-body' });
+    if (!cards.length) { colBody.appendChild(el('p', { 'class': 'cvx-kempty', text: 'none' })); }
+    cards.forEach(function (c) {
+      var kc = el('div', { 'class': 'cvx-kcard', 'data-strip': c.strip });
+      var top = el('div', { 'class': 'cvx-kcard-top' });
+      if (c.risk) { top.appendChild(el('span', { 'class': 'cvx-krisk risk-' + c.risk, text: c.risk })); }
+      if (c.milestone) { top.appendChild(el('span', { 'class': 'cvx-kms', text: c.milestone })); }
+      kc.appendChild(top);
+      if (c.slug) { kc.appendChild(el('div', { 'class': 'cvx-kslug', text: c.slug })); }
+      kc.appendChild(el('div', { 'class': 'cvx-ktitle', text: c.title }));
+      if (c.prog != null) {
+        var ktrack = el('div', { 'class': 'cvx-ktrack' }, [el('div', { 'class': 'cvx-kfill' })]);
+        ktrack.firstChild.style.width = Math.max(0, Math.min(100, Number(c.pct) || 0)) + '%';
+        kc.appendChild(el('div', { 'class': 'cvx-kprog' }, [ktrack, el('span', { 'class': 'cvx-kprogv', text: String(c.prog) })]));
+      }
+      var foot = el('div', { 'class': 'cvx-kcard-foot' });
+      if (c.passport) { foot.appendChild(el('span', { 'class': 'cvx-kpass', text: c.passport })); }
+      if (c.note) { foot.appendChild(el('span', { 'class': 'cvx-knote', text: c.note })); }
+      if (c.graph && c.graph.href) { foot.appendChild(el('a', { 'class': 'btn-quiet cx-graphlink cvx-kgraph', href: c.graph.href, title: 'View in relation graph' }, ['graph'])); }
+      if (foot.childNodes.length) { kc.appendChild(foot); }
+      colBody.appendChild(kc);
+    });
+    colEl.appendChild(colBody);
+    board.appendChild(colEl);
+    return colEl;
+  }
+
   function renderControl(control, sectionCard) {
     var t = control.t;
     var node;
@@ -1110,8 +1244,13 @@
       }
       case 'bar': {
         var pct = Math.max(0, Math.min(100, Number(control.pct) || 0));
-        var track = el('div', { 'class': 'ctl-bar-track' }, [el('div', { 'class': 'ctl-bar-fill' + (control.tone ? ' ' + control.tone : '') })]);
+        // M24 — `ramp: true` opts a declarative bar into the SAME magnitude
+        // gradient the cost lens paints (ok → trust → warn → crit sized to the
+        // whole track), so a colour means one token count console-wide. Used by
+        // cx-usage, whose bars sit on the same fixed 2M scale as cx-cost's.
+        var track = el('div', { 'class': 'ctl-bar-track' }, [el('div', { 'class': 'ctl-bar-fill' + (control.ramp ? ' ramp' : '') + (control.tone ? ' ' + control.tone : '') })]);
         track.firstChild.style.width = pct + '%';
+        if (control.ramp && pct > 0.6) { track.firstChild.style.backgroundSize = (10000 / pct) + '% 100%'; }
         node = el('div', { 'class': 'ctl-bar' }, [
           el('div', { 'class': 'ctl-bar-head' }, [el('span', { text: control.label || '' }), el('span', { 'class': 'ctl-bar-val', text: control.v != null ? String(control.v) : '' })]),
           track
@@ -1133,40 +1272,79 @@
         // ExecPlans as a clean board: columns keyed by work state; each card
         // carries a risk badge, execplan slug, bold title, a gradient progress
         // bar with its milestone count, the owner passport + a graph link.
+        //
+        // M21 — when the section opts in with `board: '<id>'` the board grows a
+        // toolbar: state chips (which columns show) and a sort control. Both are
+        // remembered in localStorage per board id, so the operator's view of the
+        // ExecPlan list survives a reload and a session.
         var board = el('div', { 'class': 'cvx-kanban' });
-        (control.columns || []).forEach(function (col) {
-          var cards = col.cards || [];
-          var colEl = el('div', { 'class': 'cvx-kcol' });
-          colEl.appendChild(el('div', { 'class': 'cvx-kcol-head' }, [
-            el('span', { 'class': 'cvx-kcol-title', text: col.title }),
-            el('span', { 'class': 'cvx-kcol-count', text: String(cards.length) })
-          ]));
-          var colBody = el('div', { 'class': 'cvx-kcol-body' });
-          if (!cards.length) { colBody.appendChild(el('p', { 'class': 'cvx-kempty', text: 'none' })); }
-          cards.forEach(function (c) {
-            var kc = el('div', { 'class': 'cvx-kcard', 'data-strip': c.strip });
-            var top = el('div', { 'class': 'cvx-kcard-top' });
-            if (c.risk) { top.appendChild(el('span', { 'class': 'cvx-krisk risk-' + c.risk, text: c.risk })); }
-            if (c.milestone) { top.appendChild(el('span', { 'class': 'cvx-kms', text: c.milestone })); }
-            kc.appendChild(top);
-            if (c.slug) { kc.appendChild(el('div', { 'class': 'cvx-kslug', text: c.slug })); }
-            kc.appendChild(el('div', { 'class': 'cvx-ktitle', text: c.title }));
-            if (c.prog != null) {
-              var ktrack = el('div', { 'class': 'cvx-ktrack' }, [el('div', { 'class': 'cvx-kfill' })]);
-              ktrack.firstChild.style.width = Math.max(0, Math.min(100, Number(c.pct) || 0)) + '%';
-              kc.appendChild(el('div', { 'class': 'cvx-kprog' }, [ktrack, el('span', { 'class': 'cvx-kprogv', text: String(c.prog) })]));
-            }
-            var foot = el('div', { 'class': 'cvx-kcard-foot' });
-            if (c.passport) { foot.appendChild(el('span', { 'class': 'cvx-kpass', text: c.passport })); }
-            if (c.note) { foot.appendChild(el('span', { 'class': 'cvx-knote', text: c.note })); }
-            if (c.graph && c.graph.href) { foot.appendChild(el('a', { 'class': 'btn-quiet cx-graphlink cvx-kgraph', href: c.graph.href, title: 'View in relation graph' }, ['graph'])); }
-            if (foot.childNodes.length) { kc.appendChild(foot); }
-            colBody.appendChild(kc);
+        var kbId = control.board || null;
+        var kbCols = control.columns || [];
+        var kbHidden = kbId ? kanbanReadHidden(kbId, kbCols) : {};
+        var kbSort = kbId ? kanbanReadSort(kbId) : 'updated';
+        function kanbanPaint() {
+          board.textContent = '';
+          kbCols.filter(function (col) { return !kbHidden[col.key]; }).forEach(function (col) {
+            kanbanColumn(board, col, kbSort);
           });
-          colEl.appendChild(colBody);
-          board.appendChild(colEl);
+        }
+        if (!kbId) {
+          kbCols.forEach(function (col) { kanbanColumn(board, col, null); });
+          node = board;
+          break;
+        }
+        // ---- toolbar: state chips + sort ----------------------------------
+        var bar = el('div', { 'class': 'cvx-kbar' });
+        var chipWrap = el('div', { 'class': 'cvx-kchips', role: 'group', 'aria-label': 'Show states' });
+        chipWrap.appendChild(el('span', { 'class': 'cvx-kbar-lbl', text: 'States' }));
+        kbCols.forEach(function (col) {
+          var chip = el('button', {
+            'class': 'cvx-kchip', type: 'button', 'data-state': col.key,
+            'aria-pressed': kbHidden[col.key] ? 'false' : 'true',
+            title: 'Show / hide the ' + col.title + ' column'
+          }, [
+            el('span', { 'class': 'cvx-kchip-dot', 'data-strip': col.key, 'aria-hidden': 'true' }),
+            el('span', { 'class': 'cvx-kchip-t', text: col.title }),
+            el('span', { 'class': 'cvx-kchip-n', text: String((col.cards || []).length) })
+          ]);
+          chip.addEventListener('click', function () {
+            var shown = kbCols.filter(function (c) { return !kbHidden[c.key]; });
+            if (!kbHidden[col.key] && shown.length <= 1) { return; }   // never hide the last column
+            kbHidden[col.key] = !kbHidden[col.key];
+            chip.setAttribute('aria-pressed', kbHidden[col.key] ? 'false' : 'true');
+            kanbanWriteHidden(kbId, kbHidden);
+            kanbanPaint();
+          });
+          chipWrap.appendChild(chip);
         });
-        node = board;
+        bar.appendChild(chipWrap);
+        var sortWrap = el('div', { 'class': 'cvx-ksort' });
+        var sortSel = el('select', { 'class': 'ctl-select cvx-ksort-sel', 'aria-label': 'Sort plans' });
+        KANBAN_SORTS.forEach(function (s) {
+          var o = el('option', { value: s[0], text: s[1] });
+          if (s[0] === kbSort) { o.selected = true; }
+          sortSel.appendChild(o);
+        });
+        // Honest metric note: completion orders by milestones_done/milestones_total,
+        // which only exists on plans that report milestones. Say how many do.
+        var sortNote = el('span', { 'class': 'cvx-ksort-note' });
+        function syncSortNote() {
+          if (kbSort !== 'completion') { sortNote.textContent = ''; return; }
+          var t = Number(control.total) || 0, wp = Number(control.withProgress) || 0;
+          sortNote.textContent = wp + ' of ' + t + ' plans report milestone counts — the rest sort last';
+        }
+        sortSel.addEventListener('change', function () {
+          kbSort = sortSel.value;
+          kanbanWriteSort(kbId, kbSort);
+          syncSortNote(); kanbanPaint();
+        });
+        sortWrap.appendChild(el('span', { 'class': 'cvx-kbar-lbl', text: 'Sort' }));
+        sortWrap.appendChild(sortSel);
+        sortWrap.appendChild(sortNote);
+        bar.appendChild(sortWrap);
+        syncSortNote();
+        kanbanPaint();
+        node = el('div', { 'class': 'cvx-kwrap' }, [bar, board]);
         break;
       }
       case 'sesscard': {
@@ -2329,6 +2507,67 @@
     return wrap;
   }
 
+  // ---- Rings view definitions (M20) -------------------------------------
+  // The nine Rings views, with their unified-family glyphs. ONE definition,
+  // consumed by the rail accordion in both rail states (shell.html) and
+  // by renderRings' swap host. Order + slugs come from CruxPages.RINGS_TAB_SLUGS
+  // (the hash grammar), so the nav, the routes and the renderer cannot drift.
+  var RINGS_TAB_ICONS = {
+    'ring': '<circle cx="12" cy="12" r="8.6"/><circle cx="12" cy="12" r="3.3"/>',
+    'cx-activity': '<path d="M3 12h3.6l2.4-7 4 14 2.4-7H21"/>',
+    'cx-coord': '<circle cx="12" cy="12" r="2.3"/><path d="M8.6 8.6a5 5 0 0 0 0 6.8M15.4 8.6a5 5 0 0 1 0 6.8M6.1 6.1a9 9 0 0 0 0 11.8M17.9 6.1a9 9 0 0 1 0 11.8"/>',
+    'cx-orchestrators': '<circle cx="12" cy="5" r="2.2"/><circle cx="5.5" cy="18.5" r="2.2"/><circle cx="18.5" cy="18.5" r="2.2"/><path d="M12 7.2v3.4M12 10.6l-6 5.9M12 10.6l6 5.9"/>',
+    'cx-punchcards': '<rect x="3.5" y="5" width="17" height="14" rx="2"/><circle cx="8" cy="10" r="1.05" fill="currentColor" stroke="none"/><circle cx="12" cy="10" r="1.05" fill="currentColor" stroke="none"/><path d="M7 14.5h10"/>',
+    'ax-agent': '<rect x="4.5" y="8" width="15" height="10" rx="2.5"/><path d="M12 4.6v3.4"/><circle cx="12" cy="4" r="1.05"/><circle cx="9.6" cy="13" r="1.05" fill="currentColor" stroke="none"/><circle cx="14.4" cy="13" r="1.05" fill="currentColor" stroke="none"/>',
+    'cv-board': '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
+    'cv-graph': '<circle cx="6" cy="7" r="2.1"/><circle cx="18" cy="7" r="2.1"/><circle cx="12" cy="17" r="2.1"/><path d="M8 7h8M7.6 8.6l3.6 6.8M16.4 8.6l-3.6 6.8"/>',
+    'cv-tree': '<rect x="9" y="3" width="6" height="4.4" rx="1"/><rect x="3" y="15" width="6" height="4.4" rx="1"/><rect x="15" y="15" width="6" height="4.4" rx="1"/><path d="M12 7.4v3.6M6 15v-2.4h12V15"/>'
+  };
+  function ringsTabDefs() {
+    var CP = (typeof window !== 'undefined') ? window.CruxPages : null;
+    var slugs = (CP && CP.RINGS_TAB_SLUGS) || [];
+    return slugs.map(function (s) { return { id: s.tab, slug: s.slug, title: s.title, icon: RINGS_TAB_ICONS[s.tab] || '' }; });
+  }
+  // Live switch hook — renderRings registers a setTab bridge here while it is
+  // mounted (cleared on teardown) so the rail accordion can drive the SAME
+  // in-place view swap instead of a full re-route (which would kill the fade).
+  var ringsSetTabHook = null;
+  function ringsSetTab(tabId) { if (ringsSetTabHook) { ringsSetTabHook(tabId); return true; } return false; }
+  function ringsTabMounted() { return !!ringsSetTabHook; }
+
+  // Shared Overwatch tab-content renderer (M13). One source of truth for what a
+  // view tab paints, reused by BOTH the Overwatch landing (renderTab) AND the
+  // Rings tab hub (renderRings) — the Rings hub does NOT fork the view renderers,
+  // it calls this. The Activity tab reuses the exact Needs-you + Fleet + Activity
+  // arrangement; every other tab renders its page (renderPage) full-width. All
+  // reads stay on the generated client (renderPage → fetchJSON). Returns the
+  // renderPage promise so a caller can time a post-render animation (the Rings
+  // cascade) against the async data swap.
+  function owRenderTab(id, content, ctx) {
+    content.textContent = '';
+    var CP = (typeof window !== 'undefined') ? window.CruxPages : null;
+    var PAGES = (CP && CP.PAGES) || {};
+    var page = PAGES[id];
+    if (id === 'cx-activity') {
+      var cols = el('div', { 'class': 'ow-cols' });
+      var left = el('div', { 'class': 'ow-col' });
+      var right = el('div', { 'class': 'ow-col' });
+      cols.appendChild(left); cols.appendChild(right);
+      content.appendChild(cols);
+      var needs = panel('Needs you', 'loading gate queue…', true);
+      var fleet = panel('Fleet', 'loading live sessions…', false);
+      left.appendChild(needs); left.appendChild(fleet);   // Needs-you then Fleet (left 50%)
+      var actHost = el('div', { 'class': 'page-host' });
+      right.appendChild(actHost);
+      var pr = page ? renderPage(page, actHost) : null;    // Activity (cx-activity) on the right 50%
+      fillNeedsYou(needs); fillFleet(fleet);
+      return pr || Promise.resolve();
+    }
+    var host = el('div', { 'class': 'page-host' });
+    content.appendChild(host);
+    return (page ? renderPage(page, host) : null) || Promise.resolve();
+  }
+
   // The Overwatch landing entry point (shell.html calls this for the overwatch
   // destination, above the — now suppressed — page-pill row). Nodes are appended
   // in order first, then filled async, so ordering is stable regardless of fetch
@@ -2376,28 +2615,11 @@
       });
       tabBar.appendChild(b); tabBtns[t.id] = b;
     });
-    function renderTab(id) {
-      content.textContent = '';
-      var page = PAGES[id];
-      if (id === 'cx-activity') {
-        var cols = el('div', { 'class': 'ow-cols' });
-        var left = el('div', { 'class': 'ow-col' });
-        var right = el('div', { 'class': 'ow-col' });
-        cols.appendChild(left); cols.appendChild(right);
-        content.appendChild(cols);
-        var needs = panel('Needs you', 'loading gate queue…', true);
-        var fleet = panel('Fleet', 'loading live sessions…', false);
-        left.appendChild(needs); left.appendChild(fleet);   // Needs-you then Fleet (left 50%)
-        var actHost = el('div', { 'class': 'page-host' });
-        right.appendChild(actHost);
-        if (page) { renderPage(page, actHost); }             // Activity (cx-activity) on the right 50%
-        fillNeedsYou(needs); fillFleet(fleet);
-        return;
-      }
-      var host = el('div', { 'class': 'page-host' });
-      content.appendChild(host);
-      if (page) { renderPage(page, host); }
-    }
+    // Tab content is painted by the shared module-level owRenderTab so the Rings
+    // tab hub reuses the EXACT same view renderers + arrangement (M13). The
+    // activity-layout static-source assertions moved with it (smoke check 39 →
+    // owRenderTab). ow-tabs / ow-tabcontent / renderTab identity stays here.
+    function renderTab(id) { owRenderTab(id, content, ctx); }
     if (active) { renderTab(active); }
     return fillTiles(tileCard, ctx);
   }
@@ -2415,6 +2637,14 @@
     }
     // Custom-rendered pages (no section model).
     if (page.id === 'cx-activity-log') { container.textContent = ''; renderActivityLog(container); return Promise.resolve(); }
+    if (page.id === 'cx-facts') { container.textContent = ''; renderFactsBrowser(container); return Promise.resolve(); }
+    if (page.id === 'cx-sessions') { container.textContent = ''; renderSessionsBrowser(container); return Promise.resolve(); }
+    if (page.id === 'cx-cost') { container.textContent = ''; renderCostBrowser(container); return Promise.resolve(); }
+    // M6 trust cluster — custom-rendered (live listing / honest posture panels).
+    if (page.id === 'cx-receipts') { container.textContent = ''; renderReceiptsBrowser(container); return Promise.resolve(); }
+    if (page.id === 'cx-gates') { container.textContent = ''; renderGatesBoard(container); return Promise.resolve(); }
+    if (page.id === 'cx-identity') { container.textContent = ''; renderIdentityBrowser(container); return Promise.resolve(); }
+    if (page.id === 'cx-mediation') { container.textContent = ''; renderMediationPosture(container); return Promise.resolve(); }
     if (page.operatorOnly && !isOperator()) {
       renderSections(container, [{ h: page.title, wide: true, controls: [
         { t: 'info', label: 'operator only', v: 'This surface is only available in operator posture.' },
@@ -2745,11 +2975,49 @@
     var hostW = host.clientWidth || (typeof window !== 'undefined' && window.innerWidth) || 1280;
     if (hostW < TILE_FORM_BREAK) { return renderTileStack(host, cards, opts); }
 
-    var surface = el('div', { 'class': 'cvx-surface' });
+    // M21 — EXPLICIT EDIT MODE. Until now every board tile was draggable the
+    // moment it rendered, so an operator reading the board moved it by accident.
+    // The board is now LOCKED by default: no drag, no resize, no move cursor.
+    // Engaging the toolbar's Edit toggle arms move + resize; disengaging re-locks
+    // and drops the affordances. Deliberately NOT persisted — a board should
+    // always open read-only, whatever the last session did to it.
+    //
+    // This lives in renderTileCanvas so every host gets it from one place: the
+    // Rings Board tab (renderCanvasBoard) and the Documents corpus canvas
+    // (renderDocCanvas). The Studio has its own editor chrome and does not route
+    // through here — its editing behaviour is untouched.
+    var editMode = false;
+    var wrap = el('div', { 'class': 'cvx-boardwrap' });
+    var toolbar = el('div', { 'class': 'cvx-tb', role: 'toolbar', 'aria-label': 'Board controls' });
+    var editBtn = el('button', {
+      'class': 'cvx-tb-btn', type: 'button', 'data-tb': 'edit', 'aria-pressed': 'false',
+      'aria-label': 'Edit layout', title: 'Edit layout — move and resize tiles'
+    });
+    editBtn.innerHTML = svgIcon('<path d="M4 20h4.2L19 9.2a2.1 2.1 0 0 0-3-3L5.2 17z"/><path d="M14.6 6.8l2.6 2.6"/><path d="M4 20l.9-3.4"/>', 1.8);
+    var editLbl = el('span', { 'class': 'cvx-tb-state', text: 'Locked' });
+    toolbar.appendChild(editBtn);
+    toolbar.appendChild(editLbl);
+    wrap.appendChild(toolbar);
+    var surface = el('div', { 'class': 'cvx-surface is-locked' });
     surface.appendChild(el('div', { 'class': 'cvx-grid', 'aria-hidden': 'true' }));
     var layer = el('div', { 'class': 'cvx-layer' });
     surface.appendChild(layer);
-    host.appendChild(surface);
+    wrap.appendChild(surface);
+    host.appendChild(wrap);
+    function setEditMode(on) {
+      editMode = !!on;
+      editBtn.setAttribute('aria-pressed', editMode ? 'true' : 'false');
+      editBtn.setAttribute('title', editMode ? 'Editing — click to lock the layout' : 'Edit layout — move and resize tiles');
+      editLbl.textContent = editMode ? 'Editing' : 'Locked';
+      surface.classList.toggle('is-locked', !editMode);
+      surface.classList.toggle('is-editing', editMode);
+      Object.keys(nodes).forEach(function (k) { syncNodeEdit(nodes[k]); });
+    }
+    editBtn.addEventListener('click', function (ev) {
+      if (ev.stopPropagation) { ev.stopPropagation(); }
+      if (expandedId) { collapse(); }   // editing and a drilled-in card are different jobs
+      setEditMode(!editMode);
+    });
     function vp() {
       return {
         w: surface.clientWidth || hostW,
@@ -2813,14 +3081,50 @@
       applyLayerPan(TILE_PAN_TARGET.x - card.x, TILE_PAN_TARGET.y - card.y);
     }
 
+    // Show/hide a node's edit affordances for the current mode. A chromeless or
+    // pinned tile is never movable, so it never grows a handle.
+    function syncNodeEdit(node) {
+      if (!node) { return; }
+      var movable = editMode && node.getAttribute('data-fixed') !== '1';
+      setClass(node, 'cvx-editable', movable);
+      var rz = node.querySelector ? node.querySelector('.cvx-rz') : null;
+      if (rz) { rz.hidden = !movable; }
+    }
+
     function mountCard(card, idx) {
       var node = tileNode(card, idx);
       placeNode(card, node);
       nodes[card.id] = node;
+      if (card.chromeless || card.pinned) { node.setAttribute('data-fixed', '1'); }
       layer.appendChild(node);
+      // Close control for the EXPANDED state (M21). Present on every openable
+      // tile, CSS-hidden until .cvx-exp — a second, obvious way out alongside the
+      // existing Escape / click-away / click-again releases.
+      if (!card.chromeless) {
+        var xb = el('button', { 'class': 'cvx-expclose', type: 'button', 'aria-label': 'Close ' + (card.title || 'card'), title: 'Close' });
+        xb.innerHTML = svgIcon('<path d="M6 6l12 12M18 6L6 18"/>', 1.9);
+        xb.addEventListener('click', function (ev) { if (ev.stopPropagation) { ev.stopPropagation(); } collapse(); });
+        node.appendChild(xb);
+      }
+      // Resize handle — armed only in edit mode (syncNodeEdit toggles `hidden`).
+      // Writes through the SAME overrideW/overrideH + tileSavePositions path the
+      // grid-derived dims already use, so a resized tile survives a reload.
+      if (!card.chromeless && !card.pinned) {
+        var rz = el('div', { 'class': 'cvx-rz', 'aria-hidden': 'true', title: 'Drag to resize' });
+        rz.hidden = true;
+        rz.addEventListener('pointerdown', function (ev) {
+          if (!editMode || expandedId) { return; }
+          if (ev.stopPropagation) { ev.stopPropagation(); }
+          var dim = tileRenderedDims(card);
+          resize = { x: ev.clientX, y: ev.clientY, w: dim.w, h: dim.h, card: card, node: node, moved: false };
+          setClass(node, 'cvx-resizing', true);
+        });
+        node.appendChild(rz);
+      }
       node.addEventListener('pointerdown', function (ev) {
+        if (!editMode) { return; }   // M21 — locked board: reading never moves a tile
         if (expandedId || card.chromeless || card.pinned) { return; }
-        if (ev.target && ev.target.closest && ev.target.closest('button, a, input, select, textarea, details')) { return; }
+        if (ev.target && ev.target.closest && ev.target.closest('button, a, input, select, textarea, details, .cvx-rz')) { return; }
         drag = { x: ev.clientX, y: ev.clientY, cx: card.x, cy: card.y, card: card, node: node, moved: false };
         setClass(node, 'cvx-dragging', true);
       });
@@ -2845,6 +3149,7 @@
         if (pos.h != null) { card.overrideH = pos.h; }
         if (nodes[card.id]) { placeNode(card, nodes[card.id]); }
         else { mountCard(card, i); }
+        syncNodeEdit(nodes[card.id]);
       });
     }
     layoutAndMount();
@@ -2852,7 +3157,7 @@
     // Manual pan — pointer-drag on empty surface, 4px deadzone, translate
     // clamped ≤ 0 (pan right/down only); the layer transition is CSS-disabled
     // while .cvx-panning so the drag tracks 1:1.
-    var pan = null, drag = null;
+    var pan = null, drag = null, resize = null;
     surface.addEventListener('pointerdown', function (ev) {
       if (ev.target && ev.target.closest && ev.target.closest('.cvx-node')) { return; }
       if (expandedId) { return; }   // manual pan is a base-level gesture
@@ -2865,6 +3170,17 @@
       if (expandedId) { collapse(); }   // click on empty canvas releases
     });
     function onPointerMove(ev) {
+      if (resize) {
+        var rdx = ev.clientX - resize.x, rdy = ev.clientY - resize.y;
+        if (!resize.moved && Math.abs(rdx) < TILE_PAN_DEAD_ZONE && Math.abs(rdy) < TILE_PAN_DEAD_ZONE) { return; }
+        resize.moved = true;
+        // Snap to the same 20px grid the move gesture uses; floor at one cell.
+        resize.card.overrideW = Math.max(TILE_GRID * 6, tileSnap(resize.w + rdx));
+        resize.card.overrideH = Math.max(TILE_GRID * 4, tileSnap(resize.h + rdy));
+        resize.node.style.width = resize.card.overrideW + 'px';
+        resize.node.style.height = resize.card.overrideH + 'px';
+        return;
+      }
       if (pan) {
         var dx = ev.clientX - pan.x, dy = ev.clientY - pan.y;
         if (!pan.moved && Math.abs(dx) < TILE_PAN_DEAD_ZONE && Math.abs(dy) < TILE_PAN_DEAD_ZONE) { return; }
@@ -2884,6 +3200,21 @@
       }
     }
     function onPointerUp() {
+      if (resize) {
+        var r = resize;
+        resize = null;
+        setClass(r.node, 'cvx-resizing', false);
+        squelchClick = squelchClick || r.moved;
+        if (r.moved && opts.storeKey) {
+          var rsaved = tileLoadPositions(opts.storeKey);
+          var rprev = rsaved[r.card.id] || {};
+          rsaved[r.card.id] = {
+            x: r.card.x, y: r.card.y, manual: rprev.manual === true,
+            w: r.card.overrideW, h: r.card.overrideH
+          };
+          tileSavePositions(opts.storeKey, rsaved);
+        }
+      }
       if (pan) {
         squelchClick = pan.moved;
         pan = null;
@@ -2945,7 +3276,9 @@
           setTimeout(finish, 250);   // the measured exit: .25s out
         } else { finish(); }
       },
-      collapse: collapse
+      collapse: collapse,
+      setEditMode: setEditMode,
+      isEditing: function () { return editMode; }
     };
   }
 
@@ -3138,7 +3471,7 @@
       var boardHost = el('div', { 'class': 'cvx-board' });
       host.appendChild(boardHost);
       renderTileCanvas(boardHost, tiles, { storeKey: 'board-' + tier });
-      host.appendChild(el('p', { 'class': 'ctl-desc cvx-board-meta', text: tier + ' tier · ' + tiles.length + ' widget' + (tiles.length === 1 ? '' : 's') + ' · drag a tile to place it · drag the canvas to pan · click to expand in place' }));
+      host.appendChild(el('p', { 'class': 'ctl-desc cvx-board-meta', text: tier + ' tier · ' + tiles.length + ' widget' + (tiles.length === 1 ? '' : 's') + ' · click to expand in place · drag the canvas to pan · Edit to move and resize tiles' }));
     }
     paint();
     // Debounced resize recompose. Tier/mode changes repaint instantly (no
@@ -3479,6 +3812,122 @@
     });
     return { width: marginX * 2 + Math.max(1, used.length) * colGap, height: marginY * 2 + Math.max(1, maxRows) * rowGap };
   }
+  // Concentric type-shell (radial) layout — the zoomed-OUT overview. Nodes are
+  // arranged on rings by node type: projects innermost (the anchors), work/gates
+  // next, then sessions, then passports/repos outermost. Deterministic: nodes are
+  // sorted by (type, id) and placed at evenly-spaced angles (no randomness —
+  // stability across renders is the point). A shell that can't hold its band on
+  // one ring wraps to further concentric sub-rings; ring radius always clears the
+  // previous band by at least a card's span, so cards never stack/overlap. Sets
+  // n.ringX / n.ringY (card top-left, layer coords) and returns the box dims.
+  function layoutGraphRing(nodes) {
+    var CARD_W = 300, CARD_H = 128, SEP = 340, RING_GAP = 210;
+    var BANDS = [['project'], ['work', 'gate'], ['session'], ['passport', 'repo']];
+    var bandOf = {}; BANDS.forEach(function (ts, i) { ts.forEach(function (t) { bandOf[t] = i; }); });
+    var byBand = {};
+    nodes.forEach(function (n) { var b = bandOf[n.type]; if (b == null) { b = BANDS.length; } (byBand[b] || (byBand[b] = [])).push(n); });
+    var bandKeys = Object.keys(byBand).map(Number).sort(function (a, b) { return a - b; });
+    var minR = 0, maxR = 0;
+    bandKeys.forEach(function (bk) {
+      var list = byBand[bk].slice().sort(function (a, b) {
+        if (a.type !== b.type) { return a.type < b.type ? -1 : 1; }
+        var ai = String(a.id), bi = String(b.id); return ai < bi ? -1 : (ai > bi ? 1 : 0);
+      });
+      var r = Math.max(minR + RING_GAP, SEP * 0.9), idx = 0, sub = 0;
+      while (idx < list.length) {
+        var cap = Math.max(1, Math.floor((2 * Math.PI * r) / SEP));
+        var take = Math.min(cap, list.length - idx);
+        var phase = bk * 0.7 + sub * 0.35;   // deterministic per-ring stagger
+        for (var k = 0; k < take; k++) {
+          var n = list[idx + k], a = phase + (k / take) * 2 * Math.PI;
+          n.__rx = r * Math.cos(a); n.__ry = r * Math.sin(a);
+        }
+        idx += take; maxR = Math.max(maxR, r); r += RING_GAP; sub++;
+      }
+      minR = maxR;
+    });
+    var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    nodes.forEach(function (n) {
+      var x = (n.__rx || 0) - CARD_W / 2, y = (n.__ry || 0) - CARD_H / 2;
+      if (x < minX) { minX = x; } if (y < minY) { minY = y; }
+      if (x + CARD_W > maxX) { maxX = x + CARD_W; } if (y + CARD_H > maxY) { maxY = y + CARD_H; }
+    });
+    if (!isFinite(minX)) { minX = 0; minY = 0; maxX = CARD_W; maxY = CARD_H; }
+    var pad = 80;
+    nodes.forEach(function (n) {
+      n.ringX = (n.__rx || 0) - CARD_W / 2 - minX + pad;
+      n.ringY = (n.__ry || 0) - CARD_H / 2 - minY + pad;
+      delete n.__rx; delete n.__ry;
+    });
+    return { width: (maxX - minX) + pad * 2, height: (maxY - minY) + pad * 2 };
+  }
+  // Organic (mesh) layout — the zoom-agnostic placement (M13). Nodes sit on a
+  // golden-angle phyllotaxis so there is NO row/column alignment at ANY zoom
+  // level; the same positions serve the zoomed-out overview and the zoomed-in
+  // card view (LOD only swaps DETAIL — dot vs full card — never the geometry).
+  // Deterministic: the spiral index is the node's (type,id)-sorted rank, so the
+  // mesh is stable across renders. Spacing is chosen so full 300×128 cards never
+  // overlap (nearest-neighbour distance ≈ 1.77·SP ≥ 340 ⇒ if dy<128 then dx>300).
+  function layoutGraphOrganic(nodes, edges) {
+    var CARD_W = 300, CARD_H = 128, SP = 212, pad = 80;
+    var list = nodes.slice().sort(function (a, b) {
+      if (a.type !== b.type) { return a.type < b.type ? -1 : 1; }
+      var ai = String(a.id), bi = String(b.id); return ai < bi ? -1 : (ai > bi ? 1 : 0);
+    });
+    var GA = Math.PI * (3 - Math.sqrt(5));
+    var pos = {};
+    list.forEach(function (n, i) {
+      var r = SP * Math.sqrt(i + 0.5), a = i * GA;
+      pos[n.key] = { x: Math.cos(a) * r, y: Math.sin(a) * r };
+    });
+    var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    nodes.forEach(function (n) {
+      var p = pos[n.key], x = p.x - CARD_W / 2, y = p.y - CARD_H / 2;
+      if (x < minX) { minX = x; } if (y < minY) { minY = y; }
+      if (x + CARD_W > maxX) { maxX = x + CARD_W; } if (y + CARD_H > maxY) { maxY = y + CARD_H; }
+    });
+    if (!isFinite(minX)) { minX = 0; minY = 0; maxX = CARD_W; maxY = CARD_H; }
+    nodes.forEach(function (n) {
+      var p = pos[n.key];
+      n.orgX = p.x - CARD_W / 2 - minX + pad;
+      n.orgY = p.y - CARD_H / 2 - minY + pad;
+    });
+    return { width: (maxX - minX) + pad * 2, height: (maxY - minY) + pad * 2 };
+  }
+  // Graph legibility cap: /v1/work?source=all can carry >1,000 items (mostly
+  // complete/archived) — a relation graph of the whole set is an unreadable
+  // hairball. Keep an active-first, deterministic slice (in-progress/blocked/
+  // review/drafting first, then deployed, planned, finally complete/archive;
+  // ties broken by recency then id) and ALWAYS keep the focused node so a
+  // ?focus=work:… deep-link still resolves. Honest: the caller shows "N of M".
+  function graphWorkPriority(w) {
+    var s = String((w && w.state) || '').toLowerCase();
+    if (s === 'in_progress' || s === 'blocked' || s === 'review' || s === 'drafting') { return 0; }
+    if (s === 'deployed') { return 1; }
+    if (s === 'planned') { return 2; }
+    return 3;   // complete / archive / done / unknown
+  }
+  function capGraphWork(list, focus, cap) {
+    cap = cap || 80;
+    if (!Array.isArray(list) || list.length <= cap) { return list; }
+    var focusId = (focus && focus.type === 'work' && focus.id != null) ? String(focus.id) : null;
+    var sorted = list.slice().sort(function (a, b) {
+      var pa = graphWorkPriority(a), pb = graphWorkPriority(b);
+      if (pa !== pb) { return pa - pb; }
+      var ua = Number(a.updated_at_unix_ms || a.created_at_unix_ms || 0), ub = Number(b.updated_at_unix_ms || b.created_at_unix_ms || 0);
+      if (ua !== ub) { return ub - ua; }
+      var ai = String(a.id), bi = String(b.id); return ai < bi ? -1 : (ai > bi ? 1 : 0);
+    });
+    var kept = sorted.slice(0, cap);
+    if (focusId) {
+      var has = kept.some(function (w) { return String(w.id) === focusId || String(w.id) === 'execplan:' + focusId || 'execplan:' + String(w.id) === focusId; });
+      if (!has) {
+        var f = list.filter(function (w) { return String(w.id) === focusId || 'execplan:' + String(w.id) === focusId; })[0];
+        if (f) { kept = kept.slice(0, cap - 1); kept.push(f); }
+      }
+    }
+    return kept;
+  }
   function graphNodeRadius(type) { return type === 'project' ? 9 : (type === 'work' ? 8 : 6); }
   function graphNeighbourhood(edges, key) {
     var out = {};
@@ -3555,13 +4004,38 @@
         focus = { type: fnode.type, id: fnode.id };   // normalise for the select() below
       }
     }
-    var dims = layoutGraph(model.nodes);
+    // M13 — ONE organic (mesh) layout used at ALL zoom levels: no snap-to-columns
+    // on zoom-in. cardX/cardY and ringX/ringY reference the SAME positions, so the
+    // LOD switch changes card DETAIL only (see switchMode), never the geometry.
+    // baseX/baseY snapshot these positions so focus mode can tween back to them.
+    var orgDims = layoutGraphOrganic(model.nodes, model.edges);
+    model.nodes.forEach(function (n) {
+      n.cardX = n.orgX; n.cardY = n.orgY; n.ringX = n.orgX; n.ringY = n.orgY;
+      n.baseX = n.orgX; n.baseY = n.orgY;
+    });
+    var cardDims = orgDims, ringDims = orgDims;
+    var reduceMotion = (typeof window !== 'undefined' && window.matchMedia) ? window.matchMedia('(prefers-reduced-motion: reduce)').matches : false;
+    // LOD threshold on the layer scale (view.scale): below it the nodes ride the
+    // ring overview, above it the card view. Open in whichever the CARD layout's
+    // natural fit lands in — a huge graph opens as the constellation, a small one
+    // straight into cards.
+    var LOD_THRESHOLD = 0.62;
+    var focusReserve = (focus && focus.type && focus.id != null) ? 380 : 0;
+    function fitScaleFor(d, reserveR) {
+      var sw = stage.clientWidth || 960, sh = stage.clientHeight || 640, pad = 30;
+      var availW = Math.max(260, sw - (reserveR || 0) - pad * 2), availH = Math.max(200, sh - pad * 2);
+      return Math.min(availW / d.width, availH / d.height);
+    }
+    var mode = fitScaleFor(cardDims, focusReserve) < LOD_THRESHOLD ? 'ring' : 'card';
+    model.nodes.forEach(function (n) { n.x = (mode === 'ring') ? n.ringX : n.cardX; n.y = (mode === 'ring') ? n.ringY : n.cardY; });
+    var activeDims = (mode === 'ring') ? ringDims : cardDims;
     var index = {}; model.nodes.forEach(function (n) { index[n.key] = n; });
     // One transformed layer holds the SVG edge canvas + the HTML node cards, so
     // pan/zoom moves cards and edges together.
     var layer = el('div', { 'class': 'cv-graph-layer' });
-    layer.style.width = dims.width + 'px'; layer.style.height = dims.height + 'px';
-    var svg = svgEl('svg', { 'class': 'cv-graph-edges', width: dims.width, height: dims.height, 'aria-hidden': 'true' });
+    layer.setAttribute('data-lod', mode);
+    layer.style.width = activeDims.width + 'px'; layer.style.height = activeDims.height + 'px';
+    var svg = svgEl('svg', { 'class': 'cv-graph-edges', width: activeDims.width, height: activeDims.height, 'aria-hidden': 'true' });
     // Two solid arrowhead markers (idle + hot) — userSpaceOnUse keeps them a
     // constant size regardless of stroke width; fill is set per class in CSS.
     var defs = svgEl('defs');
@@ -3572,7 +4046,6 @@
     });
     svg.appendChild(defs);
     layer.appendChild(svg);
-    var reduceMotion = (typeof window !== 'undefined' && window.matchMedia) ? window.matchMedia('(prefers-reduced-motion: reduce)').matches : false;
     // --- Edge routing with attachment "ports" -----------------------------
     // Each edge attaches to the SIDE of a node that faces the other node, at a
     // point distributed along that side — so multiple wires sharing one side fan
@@ -3663,7 +4136,7 @@
       }
       var idline = (n.extra && n.extra.session_id) || (n.type === 'work' ? n.id : null);
       if (idline) { card.appendChild(el('div', { 'class': 'cv-card-id', text: idline })); }
-      function open() { select(n.key); onSelect(n); }
+      function open() { select(n.key); onSelect(n); if (focusMode) { applyFocus(n.key); } }   // M13 — re-cluster on select in focus mode
       // Drag to move: delta ÷ view.scale → layer space; wires reflow every frame.
       // A ≤3px press is a click (select + inspect); a real drag just repositions.
       card.addEventListener('mousedown', function (ev) {
@@ -3692,23 +4165,150 @@
 
     var view = { tx: 16, ty: 16, scale: 1 };
     function apply() { layer.style.transform = 'translate(' + view.tx + 'px,' + view.ty + 'px) scale(' + view.scale + ')'; }
-    // Fit-to-viewport: scale + centre the whole graph into the stage so it lands
-    // on-screen without panning. When a node is focused the inspector slides in
-    // over the right edge, so reserve that width and centre in the space left.
-    function fitView() {
+    function placeCard(n) { var c = cardEls[n.key]; if (c) { c.style.left = n.x + 'px'; c.style.top = n.y + 'px'; } }
+    // Frame a layout into the stage (centre + scale). Floor is mode-aware: the
+    // ring overview may shrink far (the whole constellation on-screen), the card
+    // view stays legible. Reserves the inspector width when a node is focused.
+    function frame(d) {
       var sw = stage.clientWidth || 960, sh = stage.clientHeight || 640, pad = 30;
-      var reserveR = (focus && focus.type && focus.id != null) ? 380 : 0;
-      var availW = Math.max(260, sw - reserveR - pad * 2), availH = Math.max(200, sh - pad * 2);
-      var s = Math.max(0.42, Math.min(availW / dims.width, availH / dims.height, 1.15));
-      view.scale = s;
-      view.tx = pad + Math.max(0, (availW - dims.width * s) / 2);
-      view.ty = pad + Math.max(0, (availH - dims.height * s) / 2);
-      apply();
+      var availW = Math.max(260, sw - focusReserve - pad * 2), availH = Math.max(200, sh - pad * 2);
+      var floor = (mode === 'ring') ? 0.03 : 0.42, cap = (mode === 'ring') ? 1.0 : 1.15;
+      var s = Math.max(floor, Math.min(availW / d.width, availH / d.height, cap));
+      return { scale: s, tx: pad + Math.max(0, (availW - d.width * s) / 2), ty: pad + Math.max(0, (availH - d.height * s) / 2) };
     }
+    function fitView() { var f = frame(activeDims); view.scale = f.scale; view.tx = f.tx; view.ty = f.ty; apply(); updateZoomChip(); }
     fitView();
+    // Zoom-aware LOD: crossing the threshold morphs the nodes between the ring
+    // overview and the card detail arrangement over ~300ms (snap under reduced
+    // motion or on very large graphs). Each node's tween START is its exact
+    // current on-screen position re-expressed under the NEW framing, so nodes
+    // never jump at the cut — they glide from where they were into the new layout.
+    var lodRaf = null, TWEEN_MAX = 160;
+    function screenCentre(n) { var w = n.w || 300, h = n.h || 128; return { x: view.tx + (n.x + w / 2) * view.scale, y: view.ty + (n.y + h / 2) * view.scale }; }
+    // M21 — LOD switch PRESERVES THE VIEWPOINT.
+    //
+    // Bug (operator round 10): a few wheel zoom-ins from the overview landed the
+    // view hard against the top-left corner at ~60%. Root cause was HERE: the
+    // switch called frame(activeDims) and overwrote scale/tx/ty with the FIT of
+    // the incoming layout. Because M13 made ring and card share ONE organic
+    // geometry (cardDims === ringDims === orgDims, line ~3608), that fit is the
+    // same framing fitView() computes at boot — so crossing the threshold threw
+    // the operator's zoom away. And when the layout is wider than the viewport,
+    // frame()'s `Math.max(0, (availW - d.width * s) / 2)` centring term is 0, so
+    // tx/ty collapse to `pad` (30,30): the layer's top-left corner. That is the
+    // reported jump, exactly.
+    //
+    // Fix: keep the world point under the anchor (the cursor for a wheel zoom,
+    // the viewport centre otherwise) pinned across the cut, and carry the current
+    // scale over — clamped only by the incoming mode's zoom bounds. The remap by
+    // the dims ratio is a no-op while the two layouts share geometry, and stays
+    // correct if they ever diverge again.
+    function lodBounds(m) { return (m === 'ring') ? { min: 0.03, max: 1.3 } : { min: 0.42, max: 2.4 }; }
+    function switchMode(next, anchor) {
+      if (next === mode) { return; }
+      var sw = stage.clientWidth || 960, sh = stage.clientHeight || 640;
+      var ax = (anchor && isFinite(anchor.x)) ? anchor.x : sw / 2;
+      var ay = (anchor && isFinite(anchor.y)) ? anchor.y : sh / 2;
+      // The layer-space point currently sitting under the anchor.
+      var wx = (ax - view.tx) / view.scale, wy = (ay - view.ty) / view.scale;
+      var prevDims = activeDims;
+      var sc = {}; model.nodes.forEach(function (n) { sc[n.key] = screenCentre(n); });
+      mode = next; activeDims = (mode === 'ring') ? ringDims : cardDims;
+      layer.style.width = activeDims.width + 'px'; layer.style.height = activeDims.height + 'px';
+      svg.setAttribute('width', activeDims.width); svg.setAttribute('height', activeDims.height);
+      layer.setAttribute('data-lod', mode);
+      var b = lodBounds(mode);
+      var rx = wx * (prevDims.width ? (activeDims.width / prevDims.width) : 1);
+      var ry = wy * (prevDims.height ? (activeDims.height / prevDims.height) : 1);
+      view.scale = Math.max(b.min, Math.min(b.max, view.scale));
+      view.tx = ax - rx * view.scale; view.ty = ay - ry * view.scale;
+      apply();
+      updateZoomChip();   // M20 — the corner chip reports the new LOD + zoom %
+      var from = {}, to = {};
+      model.nodes.forEach(function (n) {
+        var w = n.w || 300, h = n.h || 128;
+        from[n.key] = { x: (sc[n.key].x - view.tx) / view.scale - w / 2, y: (sc[n.key].y - view.ty) / view.scale - h / 2 };
+        // M13 — organic positions are identical across LOD; while focus mode holds
+        // a cluster, keep nodes where they are (don't snap back to the base mesh).
+        to[n.key] = focusMode ? { x: n.x, y: n.y } : ((mode === 'ring') ? { x: n.ringX, y: n.ringY } : { x: n.cardX, y: n.cardY });
+      });
+      if (lodRaf != null && typeof window !== 'undefined' && window.cancelAnimationFrame) { window.cancelAnimationFrame(lodRaf); lodRaf = null; }
+      var canAnim = !reduceMotion && model.nodes.length <= TWEEN_MAX && typeof window !== 'undefined' && window.requestAnimationFrame;
+      if (!canAnim) {
+        model.nodes.forEach(function (n) { n.x = to[n.key].x; n.y = to[n.key].y; placeCard(n); });
+        layoutEdges(); return;
+      }
+      var t0 = null, DUR = 300;
+      model.nodes.forEach(function (n) { n.x = from[n.key].x; n.y = from[n.key].y; placeCard(n); });
+      layoutEdges();
+      function stepFn(ts) {
+        if (t0 == null) { t0 = ts; }
+        var p = Math.min(1, (ts - t0) / DUR);
+        var e = p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;   // easeInOutQuad
+        model.nodes.forEach(function (n) {
+          n.x = from[n.key].x + (to[n.key].x - from[n.key].x) * e;
+          n.y = from[n.key].y + (to[n.key].y - from[n.key].y) * e;
+          placeCard(n);
+        });
+        layoutEdges();
+        if (p < 1) { lodRaf = window.requestAnimationFrame(stepFn); } else { lodRaf = null; }
+      }
+      lodRaf = window.requestAnimationFrame(stepFn);
+    }
+    // M20 — ZOOM ANCHORED AT A POINT. The old zoomBy changed `scale` only, which
+    // pins the transform at the layer's origin (top-left) and slides everything
+    // under the cursor away. Standard pan/zoom keeps the world point under (sx,sy)
+    // fixed: world = (s - t) / k, so t' = s - (s - t) * (k' / k).
+    // (sx, sy) are STAGE-relative pixels; the layer sits at the stage origin with
+    // transform-origin 0 0 (see .cv-graph-layer), so no extra offset is needed.
+    function zoomAtPoint(sx, sy, factor) {
+      var b = lodBounds(mode);
+      var ns = Math.max(b.min, Math.min(b.max, view.scale * factor));
+      var k = ns / view.scale;
+      view.tx = sx - (sx - view.tx) * k;
+      view.ty = sy - (sy - view.ty) * k;
+      view.scale = ns; apply();
+      updateZoomChip();
+      // M21 — crossing the LOD threshold hands the SAME anchor to switchMode, so
+      // the point under the cursor survives the cut (it used to re-frame to fit).
+      if (mode === 'card' && factor < 1 && ns <= LOD_THRESHOLD) { switchMode('ring', { x: sx, y: sy }); }
+      else if (mode === 'ring' && factor > 1 && ns >= LOD_THRESHOLD) { switchMode('card', { x: sx, y: sy }); }
+    }
+    // Button zoom keeps the viewport centre fixed (there is no pointer to anchor on).
+    function zoomBy(factor) { zoomAtPoint((stage.clientWidth || 960) / 2, (stage.clientHeight || 640) / 2, factor); }
+    // M20 — the "Overview" element, rebuilt for this page: a compact glass chip in
+    // the BOTTOM-LEFT corner of the graph viewport carrying the live LOD state
+    // (overview | detail) + the zoom percentage, with the −/+ and focus controls.
+    // Native DOM (no iframe), console var(--) tokens only. See .cv-zoom in shell.html.
+    var modeLbl = el('span', { 'class': 'cv-zoom-mode', text: (mode === 'ring') ? 'overview' : 'detail' });
+    var zoomPct = el('span', { 'class': 'cv-zoom-pct', text: '100%' });
+    function updateZoomChip() {
+      if (modeLbl) { modeLbl.textContent = (mode === 'ring') ? 'overview' : 'detail'; }
+      if (zoomPct) { zoomPct.textContent = Math.round(view.scale * 100) + '%'; }
+    }
+    var zoomOut = el('button', { 'class': 'cv-zoom-btn', type: 'button', 'aria-label': 'Zoom out', title: 'Zoom out' }, ['−']);
+    var zoomIn = el('button', { 'class': 'cv-zoom-btn', type: 'button', 'aria-label': 'Zoom in', title: 'Zoom in' }, ['+']);
+    zoomOut.addEventListener('click', function (e) { e.stopPropagation(); zoomBy(0.8); });
+    zoomIn.addEventListener('click', function (e) { e.stopPropagation(); zoomBy(1.25); });
+    // M13 — connected-focus toggle (unified icon idiom, svgIcon): ON + a selected
+    // node → isolate its connections into a compact cluster (see setFocusMode).
+    var focusBtn = el('button', { 'class': 'cv-zoom-btn cv-focus-btn', type: 'button', 'aria-pressed': 'false',
+      'aria-label': 'Focus mode: isolate the selected node and its connections', title: 'Focus: isolate selected + connections' });
+    focusBtn.innerHTML = svgIcon('<circle cx="12" cy="12" r="3.4"/><path d="M12 2.5v3.4M12 18.1v3.4M2.5 12h3.4M18.1 12h3.4"/>', 1.8);
+    focusBtn.addEventListener('click', function (e) { e.stopPropagation(); setFocusMode(!focusMode); });
+    stage.appendChild(el('div', { 'class': 'cv-zoom', role: 'group', 'aria-label': 'Graph zoom and level of detail' }, [
+      zoomOut, zoomIn,
+      el('span', { 'class': 'cv-zoom-div', 'aria-hidden': 'true' }),
+      el('span', { 'class': 'cv-zoom-read' }, [modeLbl, zoomPct]),
+      el('span', { 'class': 'cv-zoom-div', 'aria-hidden': 'true' }),
+      focusBtn
+    ]));
+    updateZoomChip();
+    var currentSel = null;   // M13 — the selected node key (drives focus mode)
     function select(key) {
+      currentSel = key;
       if (key == null) {
-        Object.keys(cardEls).forEach(function (k) { cardEls[k].classList.remove('is-sel'); cardEls[k].classList.remove('is-dim'); });
+        Object.keys(cardEls).forEach(function (k) { cardEls[k].classList.remove('is-sel'); cardEls[k].classList.remove('is-dim'); cardEls[k].classList.remove('is-linked'); });
         edgeEls.forEach(function (ln) {
           ln.classList.remove('is-dim'); ln.classList.remove('is-hot'); ln.setAttribute('marker-end', 'url(#cvArrow)');
           if (ln.__eo && ln.__eo.pulse) { ln.__eo.pulse.classList.remove('is-dim'); ln.__eo.pulse.classList.remove('is-hot'); }
@@ -3719,6 +4319,7 @@
       var hasLinks = Object.keys(nbr).length > 1;   // don't grey the world for an isolated node
       Object.keys(cardEls).forEach(function (k) {
         cardEls[k].classList.toggle('is-sel', k === key);
+        cardEls[k].classList.toggle('is-linked', !!(hasLinks && nbr[k] && k !== key));   // M13 — obvious connection highlight (coerce: toggle(undefined) would FLIP)
         cardEls[k].classList.toggle('is-dim', hasLinks && !nbr[k]);
       });
       edgeEls.forEach(function (ln) {
@@ -3731,17 +4332,101 @@
       });
     }
 
+    // ---- M13: connected-focus mode ---------------------------------------
+    // Toggle ON with a node selected → hide every non-connected node + its edges,
+    // then zoom + REARRANGE the connected set into a compact organic cluster with
+    // an eased tween (the "wow", ~420ms ease-out; reduced-motion → instant).
+    // Toggle OFF / deselect → the full graph tweens back to the base mesh. Drag /
+    // select / hover stay live throughout (the tween only writes x/y + the view).
+    var focusMode = false, focusKey = null, focusRaf = null, CW = 300, CH = 128;
+    function setFocusBtn() { if (focusBtn) { focusBtn.setAttribute('aria-pressed', focusMode ? 'true' : 'false'); focusBtn.classList.toggle('is-on', focusMode); } }
+    function focusSetVisible(keys) {
+      Object.keys(cardEls).forEach(function (k) { cardEls[k].classList.toggle('cv-hidden', !!keys && !keys[k]); });
+      edgeEls.forEach(function (ln) {
+        var vis = !keys || (keys[ln.__from] && keys[ln.__to]);
+        ln.classList.toggle('cv-hidden', !vis);
+        if (ln.__eo && ln.__eo.pulse) { ln.__eo.pulse.classList.toggle('cv-hidden', !vis); }
+      });
+    }
+    function clusterTargets(keyList) {
+      // compact golden-angle cluster centred in the layer; selected node at centre.
+      var GA = Math.PI * (3 - Math.sqrt(5)), SP = 208;
+      var cx = activeDims.width / 2, cy = activeDims.height / 2, out = {};
+      keyList.forEach(function (k, i) {
+        var r = i === 0 ? 0 : SP * Math.sqrt(i + 0.15), a = i * GA;
+        out[k] = { x: cx + Math.cos(a) * r - CW / 2, y: cy + Math.sin(a) * r - CH / 2 };
+      });
+      return out;
+    }
+    function fitTransformFor(posMap, keys) {
+      var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      keys.forEach(function (k) { var p = posMap[k]; if (!p) { return; } if (p.x < minX) { minX = p.x; } if (p.y < minY) { minY = p.y; } if (p.x + CW > maxX) { maxX = p.x + CW; } if (p.y + CH > maxY) { maxY = p.y + CH; } });
+      if (!isFinite(minX)) { return { scale: view.scale, tx: view.tx, ty: view.ty }; }
+      var sw = stage.clientWidth || 960, sh = stage.clientHeight || 640, pad = 44;
+      var bw = maxX - minX, bh = maxY - minY;
+      var availW = Math.max(240, sw - focusReserve - pad * 2), availH = Math.max(200, sh - pad * 2);
+      var s = Math.max(0.2, Math.min(availW / bw, availH / bh, 1.15));
+      return { scale: s, tx: pad + Math.max(0, (availW - bw * s) / 2) - minX * s, ty: pad + Math.max(0, (availH - bh * s) / 2) - minY * s };
+    }
+    function focusTween(nodePosTargets, viewTarget, dur) {
+      if (focusRaf != null && typeof window !== 'undefined' && window.cancelAnimationFrame) { window.cancelAnimationFrame(focusRaf); focusRaf = null; }
+      var fromPos = {}, keys = Object.keys(nodePosTargets);
+      keys.forEach(function (k) { var n = index[k]; if (n) { fromPos[k] = { x: n.x, y: n.y }; } });
+      var v0 = { scale: view.scale, tx: view.tx, ty: view.ty };
+      function setAll(e) {
+        keys.forEach(function (k) { var n = index[k]; if (!n) { return; } n.x = fromPos[k].x + (nodePosTargets[k].x - fromPos[k].x) * e; n.y = fromPos[k].y + (nodePosTargets[k].y - fromPos[k].y) * e; placeCard(n); });
+        view.scale = v0.scale + (viewTarget.scale - v0.scale) * e;
+        view.tx = v0.tx + (viewTarget.tx - v0.tx) * e;
+        view.ty = v0.ty + (viewTarget.ty - v0.ty) * e;
+        apply(); layoutEdges();
+      }
+      if (reduceMotion || typeof window === 'undefined' || !window.requestAnimationFrame) { setAll(1); return; }
+      var t0 = null, DUR = dur || 420;
+      function step(ts) { if (t0 == null) { t0 = ts; } var p = Math.min(1, (ts - t0) / DUR); var e = 1 - Math.pow(1 - p, 3); setAll(e); if (p < 1) { focusRaf = window.requestAnimationFrame(step); } else { focusRaf = null; } }
+      focusRaf = window.requestAnimationFrame(step);
+    }
+    function applyFocus(key) {
+      if (key == null || !index[key]) { return; }
+      var nbr = graphNeighbourhood(model.edges, key); nbr[key] = true;
+      var setKeys = {}; Object.keys(nbr).forEach(function (k) { if (index[k]) { setKeys[k] = true; } });
+      var ordered = [key].concat(Object.keys(setKeys).filter(function (k) { return k !== key; }).sort());
+      focusSetVisible(setKeys);
+      var targets = clusterTargets(ordered);
+      focusTween(targets, fitTransformFor(targets, ordered), 420);
+      focusKey = key;
+    }
+    function clearFocus() {
+      focusSetVisible(null);   // show all
+      var targets = {}; model.nodes.forEach(function (n) { targets[n.key] = { x: n.baseX, y: n.baseY }; });
+      focusTween(targets, frame(activeDims), 420);
+      focusKey = null;
+    }
+    function setFocusMode(v) {
+      focusMode = v; setFocusBtn();
+      if (v) { if (currentSel) { applyFocus(currentSel); } }
+      else { clearFocus(); }
+    }
+
     // Pan (drag on empty stage) + wheel zoom. A click on empty space (no drag)
     // deselects — the inspector then slides away unless it's pinned.
     var drag = null, moved = false;
-    stage.addEventListener('mousedown', function (ev) { if (ev.target.closest && ev.target.closest('.cv-card')) { return; } drag = { x: ev.clientX, y: ev.clientY, tx: view.tx, ty: view.ty }; moved = false; });
-    stage.addEventListener('click', function (ev) { if (ev.target.closest && ev.target.closest('.cv-card')) { return; } if (!moved) { select(null); onSelect(null); } });
+    function onEmpty(ev) { return !(ev.target.closest && (ev.target.closest('.cv-card') || ev.target.closest('.cv-zoom'))); }
+    stage.addEventListener('mousedown', function (ev) { if (!onEmpty(ev)) { return; } drag = { x: ev.clientX, y: ev.clientY, tx: view.tx, ty: view.ty }; moved = false; });
+    stage.addEventListener('click', function (ev) { if (!onEmpty(ev)) { return; } if (!moved) { select(null); onSelect(null); if (focusMode) { clearFocus(); } } });   // M13 — deselect restores the full graph
     function onMove(ev) { if (!drag) { return; } moved = true; view.tx = drag.tx + (ev.clientX - drag.x); view.ty = drag.ty + (ev.clientY - drag.y); apply(); }
     function onUp() { drag = null; }
-    stage.addEventListener('wheel', function (ev) { ev.preventDefault(); var f = ev.deltaY < 0 ? 1.1 : 0.9; view.scale = Math.max(0.4, Math.min(2.2, view.scale * f)); apply(); });
+    // M20 — the wheel anchors at the POINTER: the world point under the cursor
+    // stays under the cursor (stage-relative coordinates feed zoomAtPoint).
+    stage.addEventListener('wheel', function (ev) {
+      ev.preventDefault();
+      var sr = stage.getBoundingClientRect();
+      zoomAtPoint(ev.clientX - sr.left, ev.clientY - sr.top, ev.deltaY < 0 ? 1.1 : 0.9);
+    });
     if (typeof window !== 'undefined') { window.addEventListener('mousemove', onMove); window.addEventListener('mouseup', onUp); }
     __canvasGraphCleanup = function () {
       if (rafId != null && typeof window !== 'undefined' && window.cancelAnimationFrame) { window.cancelAnimationFrame(rafId); rafId = null; }
+      if (lodRaf != null && typeof window !== 'undefined' && window.cancelAnimationFrame) { window.cancelAnimationFrame(lodRaf); lodRaf = null; }
+      if (focusRaf != null && typeof window !== 'undefined' && window.cancelAnimationFrame) { window.cancelAnimationFrame(focusRaf); focusRaf = null; }
       if (typeof window !== 'undefined') { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); }
     };
 
@@ -3749,6 +4434,45 @@
     if (focus && focus.type && focus.id != null) {
       var fn = index[focus.type + ':' + focus.id] || graphMatchNode(model.nodes, focus);
       if (fn) { select(fn.key); onSelect(fn); }
+    }
+    // Dev-only hook (mirror verification): select the highest-degree node so the
+    // connection highlight + focus cluster can be exercised deterministically
+    // (same code path as a card click: select + onSelect). Flag-gated, never prod.
+    if (typeof window !== 'undefined' && window.__CRUX_CONSOLE_DEV__) {
+      window.__cvSelectConnected = function () {
+        var deg = {}; model.edges.forEach(function (e) { deg[e.from] = (deg[e.from] || 0) + 1; deg[e.to] = (deg[e.to] || 0) + 1; });
+        var bk = null, bd = -1; Object.keys(deg).forEach(function (k) { if (deg[k] > bd) { bd = deg[k]; bk = k; } });
+        if (bk != null && index[bk]) { select(bk); onSelect(index[bk]); if (focusMode) { applyFocus(bk); } }
+        return { key: bk, deg: bd };
+      };
+      // M21 — zoom probe. Reports the live view transform, the LOD mode and (when
+      // given a node key) that node's CENTRE in stage pixels, so the mirror walk
+      // can assert "the node under the cursor is still under the cursor" across a
+      // LOD cut instead of eyeballing a screenshot.
+      window.__cvZoomProbe = function (key) {
+        var out = { mode: mode, scale: view.scale, tx: view.tx, ty: view.ty,
+          stage: { w: stage.clientWidth, h: stage.clientHeight }, threshold: LOD_THRESHOLD };
+        var n = key != null ? index[key] : null;
+        if (n) {
+          var w = n.w || 300, h = n.h || 128;
+          out.node = { key: n.key, sx: view.tx + (n.x + w / 2) * view.scale, sy: view.ty + (n.y + h / 2) * view.scale };
+        }
+        return out;
+      };
+      // Drive one wheel-equivalent zoom step anchored at stage-relative (sx, sy) —
+      // the exact code path the wheel listener uses.
+      window.__cvZoomAt = function (sx, sy, factor) { zoomAtPoint(sx, sy, factor); return window.__cvZoomProbe(); };
+      // The node whose centre is nearest a stage point (the "node under the cursor").
+      window.__cvNodeNear = function (sx, sy) {
+        var best = null, bd = Infinity;
+        model.nodes.forEach(function (n) {
+          var w = n.w || 300, h = n.h || 128;
+          var dx = (view.tx + (n.x + w / 2) * view.scale) - sx, dy = (view.ty + (n.y + h / 2) * view.scale) - sy;
+          var d = dx * dx + dy * dy;
+          if (d < bd) { bd = d; best = n.key; }
+        });
+        return best;
+      };
     }
   }
 
@@ -3764,7 +4488,7 @@
     var pinBtn = el('button', { 'class': 'cv-insp-btn cv-insp-pin', type: 'button', title: 'Pin inspector', 'aria-pressed': 'false' });
     pinBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4h6l-1 6 3 3v2H7v-2l3-3z"/><path d="M12 15v5"/></svg>';
     var closeBtn = el('button', { 'class': 'cv-insp-btn cv-insp-close', type: 'button', title: 'Close', 'aria-label': 'Close inspector' });
-    closeBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>';
+    closeBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 6l12 12M18 6L6 18"/></svg>';
     var inspBody = el('div', { 'class': 'cv-insp-body' });
     inspector.appendChild(el('div', { 'class': 'cv-insp-topbar' }, [el('span', { 'class': 'canvas-insp-type', text: 'Node inspector' }), pinBtn, closeBtn]));
     inspector.appendChild(inspBody);
@@ -3790,9 +4514,23 @@
         fetchJSON('/v1/console/sessions')
       ]);
     }).then(function (r) {
+      // Cap the work feed to an active-first, deterministic slice so the relation
+      // graph stays legible (the full source=all set can be >1,000 items). Keeps
+      // the focused node so a ?focus=work:… deep-link still resolves; honest count
+      // shown below. buildGraphModel + the card/focus paths are otherwise untouched.
+      var workData = (r[1].ok && r[1].data) || null, totalWork = 0, shownWork = 0;
+      if (workData) {
+        var wlist = workData.work || workData.items || [];
+        totalWork = wlist.length;
+        var capped = capGraphWork(wlist, focus, 80);
+        shownWork = capped.length;
+        var wd = {}; for (var wk in workData) { wd[wk] = workData[wk]; }
+        if (workData.work) { wd.work = capped; } else { wd.items = capped; }
+        workData = wd;
+      }
       var data = {
         projects: (r[0].ok && r[0].data) || null,
-        work: (r[1].ok && r[1].data) || null,
+        work: workData,
         gates: (r[2].ok && r[2].data) || null,
         passports: (r[3].ok && r[3].data) || null,
         sessions: (r[4].ok && r[4].data) || null,   // /v1/coord/active 404 → null (tolerated)
@@ -3823,6 +4561,9 @@
         }
       }
       drawGraph(stage, onSelect, model, focus);
+      if (!demoOn() && totalWork > shownWork) {
+        stage.appendChild(el('div', { 'class': 'cv-graph-note', text: 'showing ' + shownWork + ' of ' + totalWork + ' work items — active first (zoom in or open a node to explore)' }));
+      }
     }).catch(function () { stage.textContent = ''; stage.appendChild(el('p', { 'class': 'ctl-desc', text: 'Graph unavailable.' })); });
   }
 
@@ -3894,9 +4635,14 @@
   function planTreeNode(node, depth, onSelect) {
     var pad = (depth * 14 + 8) + 'px';
     var rowCls = 'plan-tree-row plan-tree-' + node.type;
+    // M7: kind (data-kind) and state (data-state) travel on every row so the CSS
+    // can colour by the console's existing status/kind hue vocabulary. Nulls are
+    // dropped by el(), so stateless kinds (project/milestone/session) carry no
+    // data-state. Additive — the existing classes + chips are untouched.
+    var kindAttr = node.type, stateAttr = (node.state != null && node.state !== '') ? node.state : null;
     if (node.children && node.children.length) {
       var det = el('details', { 'class': 'plan-tree-node', open: 'open' });
-      det.appendChild(el('summary', { 'class': rowCls, style: 'padding-left:' + pad }, planTreeRowInner(node)));
+      det.appendChild(el('summary', { 'class': rowCls, style: 'padding-left:' + pad, 'data-kind': kindAttr, 'data-state': stateAttr }, planTreeRowInner(node)));
       node.children.forEach(function (c) { det.appendChild(planTreeNode(c, depth + 1, onSelect)); });
       return det;
     }
@@ -3905,12 +4651,13 @@
     // handler (and non-session leaves stay inert).
     if (node.type === 'session' && typeof onSelect === 'function') {
       var srow = el('div', { 'class': rowCls + ' plan-tree-session-open', style: 'padding-left:' + pad,
+        'data-kind': kindAttr, 'data-state': stateAttr,
         role: 'button', tabindex: '0', 'aria-label': 'View session evidence: ' + (node.label || node.id || 'session') }, planTreeRowInner(node));
       srow.addEventListener('click', function () { onSelect(node); });
       srow.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelect(node); } });
       return srow;
     }
-    return el('div', { 'class': rowCls, style: 'padding-left:' + pad }, planTreeRowInner(node));
+    return el('div', { 'class': rowCls, style: 'padding-left:' + pad, 'data-kind': kindAttr, 'data-state': stateAttr }, planTreeRowInner(node));
   }
   function renderPlanTree(host, ctx) {
     host.textContent = '';
@@ -3951,18 +4698,107 @@
         wrap.appendChild(el('p', { 'class': 'ctl-desc', text: 'Plan tree empty — ' + why + '.' }));
         return;
       }
+      // ---- M7: colour legend + kind/state/text filters -------------------
+      // Colour is added in CSS keyed on the row's data-kind / data-state (planTreeNode);
+      // here we build the legend + the live filter controls. Filtering keeps
+      // ancestors of matches visible (a node shows if it matches OR any descendant
+      // does) so the tree stays navigable, and reports an honest "N of M" count.
+      var KIND_LABELS = [['project', 'Project'], ['execplan', 'ExecPlan'], ['milestone', 'Milestone'], ['session', 'Session'], ['work', 'Kanban'], ['unattached', 'Unattached']];
+      var STATE_ORDER = ['planned', 'in_progress', 'drafting', 'blocked', 'review', 'deployed', 'done', 'complete', 'archive'];
+      var kindsPresent = {}, statesPresent = {}, totalNodes = 0;
+      tree.roots.forEach(function (root) { (function w(n) { totalNodes++; kindsPresent[n.type] = true; if (n.state != null && n.state !== '') { statesPresent[n.state] = true; } (n.children || []).forEach(w); })(root); });
+      var kindOn = {}, stateOn = {}, textq = '';
+      Object.keys(kindsPresent).forEach(function (k) { kindOn[k] = true; });
+      Object.keys(statesPresent).forEach(function (s) { stateOn[s] = true; });
+
+      var controls = el('div', { 'class': 'plan-tree-controls' });
+      var legend = el('div', { 'class': 'plan-tree-legend' });
+      legend.appendChild(el('span', { 'class': 'plan-tree-legend-h', text: 'Kind' }));
+      KIND_LABELS.forEach(function (kl) {
+        if (!kindsPresent[kl[0]]) { return; }
+        legend.appendChild(el('span', { 'class': 'plan-tree-legend-item' }, [
+          el('span', { 'class': 'plan-tree-legend-swatch', 'data-kind': kl[0] }),
+          el('span', { 'class': 'plan-tree-legend-lab', text: kl[1] })
+        ]));
+      });
+      legend.appendChild(el('span', { 'class': 'plan-tree-legend-h', text: 'State' }));
+      STATE_ORDER.forEach(function (s) {
+        if (!statesPresent[s]) { return; }
+        legend.appendChild(el('span', { 'class': 'plan-tree-legend-item' }, [
+          el('span', { 'class': 'plan-tree-legend-swatch', 'data-state': s }),
+          el('span', { 'class': 'plan-tree-legend-lab', text: s })
+        ]));
+      });
+
+      var toolbar = el('div', { 'class': 'plan-tree-filters' });
+      var kindRow = el('div', { 'class': 'plan-tree-filter-row' }, [el('span', { 'class': 'plan-tree-filter-lab', text: 'Kinds' })]);
+      KIND_LABELS.forEach(function (kl) {
+        if (!kindsPresent[kl[0]]) { return; }
+        var chip = el('button', { 'class': 'plan-tree-toggle is-on', type: 'button', 'data-kind': kl[0], 'aria-pressed': 'true' }, [kl[1]]);
+        chip.addEventListener('click', function () { kindOn[kl[0]] = !kindOn[kl[0]]; chip.classList.toggle('is-on', kindOn[kl[0]]); chip.setAttribute('aria-pressed', kindOn[kl[0]] ? 'true' : 'false'); repaint(); });
+        kindRow.appendChild(chip);
+      });
+      var stateRow = el('div', { 'class': 'plan-tree-filter-row' }, [el('span', { 'class': 'plan-tree-filter-lab', text: 'States' })]);
+      STATE_ORDER.forEach(function (s) {
+        if (!statesPresent[s]) { return; }
+        var chip = el('button', { 'class': 'plan-tree-toggle is-on', type: 'button', 'data-state': s, 'aria-pressed': 'true' }, [s]);
+        chip.addEventListener('click', function () { stateOn[s] = !stateOn[s]; chip.classList.toggle('is-on', stateOn[s]); chip.setAttribute('aria-pressed', stateOn[s] ? 'true' : 'false'); repaint(); });
+        stateRow.appendChild(chip);
+      });
+      var textInput = el('input', { 'class': 'plan-tree-search', type: 'search', placeholder: 'Filter by label, id or slug…', 'aria-label': 'Filter tree by text' });
+      textInput.addEventListener('input', function () { textq = String(textInput.value || '').trim().toLowerCase(); repaint(); });
+      var searchRow = el('div', { 'class': 'plan-tree-filter-row' }, [el('span', { 'class': 'plan-tree-filter-lab', text: 'Find' }), textInput]);
+      toolbar.appendChild(kindRow); toolbar.appendChild(stateRow); toolbar.appendChild(searchRow);
+      var countLine = el('p', { 'class': 'plan-tree-count', role: 'status' });
+      controls.appendChild(legend); controls.appendChild(toolbar); controls.appendChild(countLine);
+      wrap.appendChild(controls);
+
       // M4b: split into the tree column + a session-detail column. Clicking a
       // session paints its evidence (receipts, fact provenance, announced focus)
-      // through the generated client. Notices stay above the split (fail-honest).
+      // through the generated client. Notices + filters stay above the split.
       var layout = el('div', { 'class': 'plan-tree-layout' });
       var treeCol = el('div', { 'class': 'plan-tree-col' });
       var detailCol = el('div', { 'class': 'session-detail-col' },
         [el('p', { 'class': 'ctl-desc', text: 'Select a session to view its evidence — receipts, fact provenance, announced focus.' })]);
       function onSelect(node) { renderSessionDetail(detailCol, node, api); }
-      tree.roots.forEach(function (root) { treeCol.appendChild(planTreeNode(root, 0, onSelect)); });
       layout.appendChild(treeCol);
       layout.appendChild(detailCol);
       wrap.appendChild(layout);
+
+      function nodeMatches(n) {
+        if (!kindOn[n.type]) { return false; }
+        if (n.state != null && n.state !== '' && !stateOn[n.state]) { return false; }
+        if (textq) {
+          var hay = String(n.label || '') + ' ' + String(n.id || '');
+          if (String(n.id || '').indexOf('execplan:') === 0) { hay += ' ' + String(n.id).slice(9); }
+          if (n.unresolvedSlug) { hay += ' ' + n.unresolvedSlug; }
+          if (hay.toLowerCase().indexOf(textq) < 0) { return false; }
+        }
+        return true;
+      }
+      // Keep ancestors of matches: a node survives if it matches OR any descendant
+      // survives; its whole subtree is dropped only when nothing under it matches.
+      function filterNode(n) {
+        var kids = (n.children || []).map(filterNode).filter(Boolean);
+        var self = nodeMatches(n);
+        if (!self && kids.length === 0) { return null; }
+        var copy = {}; for (var k in n) { copy[k] = n[k]; }
+        copy.children = kids;
+        return copy;
+      }
+      function repaint() {
+        var froots = tree.roots.map(filterNode).filter(Boolean);
+        treeCol.textContent = '';
+        if (!froots.length) {
+          treeCol.appendChild(el('p', { 'class': 'ctl-desc', text: 'No nodes match the current filters.' }));
+        } else {
+          froots.forEach(function (root) { treeCol.appendChild(planTreeNode(root, 0, onSelect)); });
+        }
+        var shown = 0;
+        froots.forEach(function (root) { (function w(n) { shown++; (n.children || []).forEach(w); })(root); });
+        countLine.textContent = 'showing ' + shown + ' of ' + totalNodes + ' nodes';
+      }
+      repaint();
     }).catch(function () {
       wrap.textContent = '';
       wrap.appendChild(el('p', { 'class': 'ctl-desc', text: 'Plan tree unavailable.' }));
@@ -4185,26 +5021,3965 @@
     });
   }
 
+  // =======================================================================
+  //  Configurable Workspaces (console-surfaces-remediation M16b) — the
+  //  fact-driven nav/page system. Operator-named "Workspaces": a signed pack
+  //  installs a workspace (of pages) built in the Studio.
+  //
+  //  ARTIFACTS (facts, canonical key-sorted JSON, one artifact / two editors):
+  //    console:workspace:<uid> key "def" →
+  //      { schema_version, uid, name, icon, order, dests:[{id,label,icon,pages:[pageUid…]}],
+  //        source:"user"|"builtin-fork", forked_from? }
+  //    console:page:<uid> key "def" →
+  //      { schema_version, uid, type:<page-type-id>, title, sub, dest, config:{…},
+  //        source, forked_from? }
+  //
+  //  DESIGN RULES (M16 decision log + memo §4 — CONTRACT):
+  //    * Version-stamped from day one (schema_version); the daemon owns migration.
+  //    * TOLERANT READER: spread/merge — unknown keys survive Studio round-trips
+  //      untouched (never rebuild field-by-field); a schema_version newer than we
+  //      understand renders an honest "newer config" state, never destroys.
+  //    * Built-ins (Command · Explorer) are AUTO-GENERATED from the current page
+  //      registry — zero config == exactly today's console (fully useful unconfigured).
+  //    * TAKE CONTROL: a built-in renders from the registry until reversibly forked
+  //      to an overlay (source:"builtin-fork", forked_from); revert = tombstone the
+  //      overlay (a soft-delete through the SAME gated fact-add path — there is no
+  //      gated fact-DELETE client method, and the daemon's own model is soft-delete)
+  //      → auto-generation resumes. Fork-on-edit with a visible provenance chip.
+  //    * ONE ARTIFACT / TWO EDITORS: cwsCanonical() is the byte-stable form the
+  //      Studio AND an MCP store_fact writer both produce; a raw-JSON escape hatch
+  //      ships in the Studio. (docs/agent/console-workspaces.md documents it.)
+  //    * Packs carry workspaces/pages ADDITIVELY (crux.studio.v1 stays valid).
+  //
+  //  Pure helpers (cws*) are unit-tested by the smoke; the runtime nav lives in
+  //  shell.html (which calls these through window.CruxRender) and the Studio
+  //  "Pages" / "Integrations" subsections live below in renderWorkspaceStudio /
+  //  renderIntegrationsStudio. Writes route ONLY through operatorGatedCall →
+  //  consoleFactsAdd (via tstudioWriteFact); reads through the generated client.
+  // =======================================================================
+  var CWS_SCHEMA_VERSION = 1;
+  var CWS_WS_ENTITY = 'console:workspace:';
+  var CWS_PAGE_ENTITY = 'console:page:';
+  var CWS_DEF_KEY = 'def';
+  // Built-in workspace uids (reserved — a user workspace never claims these).
+  var CWS_BUILTIN_COMMAND = 'command';
+  var CWS_BUILTIN_EXPLORE = 'explore';
+  var CWS_STUDIO_SCHEMA = 'crux.studio.v1';
+
+  function cwsWorkspaceEntity(uid) { return CWS_WS_ENTITY + uid; }
+  function cwsPageEntity(uid) { return CWS_PAGE_ENTITY + uid; }
+  function cwsStr(v) { return (typeof v === 'string') ? v : (v == null ? '' : String(v)); }
+  function cwsSlugify(name) {
+    return cwsStr(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'item';
+  }
+
+  // Canonical, byte-stable JSON: keys sorted deeply, arrays order-preserved,
+  // no whitespace. The one form the Studio AND an MCP writer both produce.
+  function cwsSortValue(v) {
+    if (Array.isArray(v)) { return v.map(cwsSortValue); }
+    if (v && typeof v === 'object') {
+      var out = {};
+      Object.keys(v).sort().forEach(function (k) { out[k] = cwsSortValue(v[k]); });
+      return out;
+    }
+    return v;
+  }
+  function cwsCanonical(v) { return JSON.stringify(cwsSortValue(v)); }
+
+  // ---- Tolerant readers ---------------------------------------------------
+  // Return { def, unknownVersion, reverted, valid }. `def` preserves EVERY key of
+  // the input (spread first, then coerce only the known fields) so a Studio save
+  // round-trips hand-written / newer config untouched. A schema_version we do not
+  // understand short-circuits: the raw def is returned verbatim + unknownVersion,
+  // so the runtime paints an honest "newer config" panel instead of interpreting.
+  function cwsNormalizeDest(raw) {
+    var r = (raw && typeof raw === 'object') ? raw : {};
+    var out = {};
+    Object.keys(r).forEach(function (k) { out[k] = r[k]; });   // preserve unknowns (incl. nested)
+    out.id = cwsStr(r.id) || cwsSlugify(r.label) || 'group';
+    out.label = cwsStr(r.label) || out.id;
+    out.icon = cwsStr(r.icon) || 'work';
+    out.pages = Array.isArray(r.pages) ? r.pages.filter(function (p) { return typeof p === 'string' && p; }) : [];
+    return out;
+  }
+  function cwsReadWorkspaceDef(raw) {
+    if (!raw || typeof raw !== 'object') { return { def: null, valid: false, unknownVersion: false, reverted: false }; }
+    if (raw.reverted === true) { return { def: raw, valid: true, unknownVersion: false, reverted: true }; }
+    var sv = (typeof raw.schema_version === 'number') ? raw.schema_version : CWS_SCHEMA_VERSION;
+    if (sv > CWS_SCHEMA_VERSION) { return { def: raw, valid: true, unknownVersion: true, reverted: false }; }
+    var out = {};
+    Object.keys(raw).forEach(function (k) { out[k] = raw[k]; });   // preserve unknown keys
+    out.schema_version = sv;
+    out.uid = cwsStr(raw.uid);
+    out.name = cwsStr(raw.name) || out.uid;
+    out.icon = cwsStr(raw.icon) || 'work';
+    out.order = (typeof raw.order === 'number') ? raw.order : 100;
+    out.source = (raw.source === 'builtin-fork' || raw.source === 'builtin') ? raw.source : 'user';
+    out.dests = Array.isArray(raw.dests) ? raw.dests.map(cwsNormalizeDest) : [];
+    return { def: out, valid: !!out.uid, unknownVersion: false, reverted: false };
+  }
+  function cwsReadPageDef(raw) {
+    if (!raw || typeof raw !== 'object') { return { def: null, valid: false, unknownVersion: false, reverted: false }; }
+    if (raw.reverted === true) { return { def: raw, valid: true, unknownVersion: false, reverted: true }; }
+    var sv = (typeof raw.schema_version === 'number') ? raw.schema_version : CWS_SCHEMA_VERSION;
+    if (sv > CWS_SCHEMA_VERSION) { return { def: raw, valid: true, unknownVersion: true, reverted: false }; }
+    var out = {};
+    Object.keys(raw).forEach(function (k) { out[k] = raw[k]; });   // preserve unknown keys (incl. config sub-keys)
+    out.schema_version = sv;
+    out.uid = cwsStr(raw.uid);
+    out.type = cwsStr(raw.type);
+    out.title = cwsStr(raw.title) || out.type;
+    out.sub = cwsStr(raw.sub);
+    out.dest = cwsStr(raw.dest);
+    out.config = (raw.config && typeof raw.config === 'object') ? raw.config : {};
+    out.source = (raw.source === 'builtin-fork' || raw.source === 'builtin') ? raw.source : 'user';
+    return { def: out, valid: !!(out.uid && out.type), unknownVersion: false, reverted: false };
+  }
+
+  // ---- Page types (whatever exists now is generatable) --------------------
+  // Every registry page id is a page TYPE; plus the destination-IS-the-page
+  // surfaces. A user page instance names a type and renders through the SAME
+  // builder (renderWorkspacePage → renderPage / the special renderers).
+  var CWS_SURFACE_TYPES = [
+    { type: 'canvas/board', label: 'Canvas · Board', dest: 'canvas' },
+    { type: 'canvas/graph', label: 'Canvas · Graph', dest: 'canvas' },
+    { type: 'canvas/tree', label: 'Canvas · Tree', dest: 'canvas' },
+    { type: 'explorer', label: 'Explorer · search', dest: 'explorer' },
+    { type: 'sitemap', label: 'Site map', dest: 'sitemap' },
+    { type: 'rings', label: 'Rings', dest: 'rings' }
+  ];
+  // Type-specific config options (only where a type has REAL query options that
+  // change what data loads — endpoint-driven pages). The Studio renders a form
+  // for these; config is stored under def.config.query and merged into the load
+  // endpoint at render time. Types absent here carry no options form.
+  var CWS_TYPE_OPTIONS = {
+    'cx-work': [{ key: 'source', label: 'Source', kind: 'select', options: ['all', 'kanban', 'execplans'], dflt: 'all' }],
+    'cx-memory': [{ key: 'top_k', label: 'Top K', kind: 'text', placeholder: '50' }],
+    'cx-review': [{ key: 'limit', label: 'Limit', kind: 'text', placeholder: '50' }]
+  };
+  function cwsPageTypes() {
+    var pages = (typeof window !== 'undefined') ? window.CruxPages : null;
+    var out = [];
+    if (pages && pages.PAGES) {
+      Object.keys(pages.PAGES).forEach(function (id) {
+        var p = pages.PAGES[id];
+        out.push({ type: id, label: p.title + ' (' + p.dest + ')', dest: p.dest, kind: 'page', options: CWS_TYPE_OPTIONS[id] || null });
+      });
+    }
+    CWS_SURFACE_TYPES.forEach(function (s) { out.push({ type: s.type, label: s.label, dest: s.dest, kind: 'surface', options: null }); });
+    return out;
+  }
+  function cwsTypeExists(type) {
+    var pages = (typeof window !== 'undefined') ? window.CruxPages : null;
+    if (pages && pages.PAGES && pages.PAGES[type]) { return true; }
+    for (var i = 0; i < CWS_SURFACE_TYPES.length; i++) { if (CWS_SURFACE_TYPES[i].type === type) { return true; } }
+    return false;
+  }
+
+  // ---- Built-in generation (the defaults layer) ---------------------------
+  // Command == the current console destinations/pages; Explorer == the
+  // explore/documents reader surface. Generalises the binary surface toggle
+  // into N workspaces. These render through the EXISTING shell paths when
+  // unforked; the defs here drive the switcher, the Studio Pages tree and forking.
+  function cwsRegistryDests() {
+    var pages = (typeof window !== 'undefined') ? window.CruxPages : null;
+    if (!pages || !pages.DESTS) { return []; }
+    var byDest = {};
+    Object.keys(pages.PAGES).forEach(function (id) {
+      var p = pages.PAGES[id];
+      (byDest[p.dest] = byDest[p.dest] || []).push(id);
+    });
+    // M19 — Explorer is its own builtin workspace; Canvas is retired (Board/Graph/
+    // Tree are Rings tabs, Studio moved to the account menu), so neither belongs in
+    // the Command builtin's dest set.
+    // M20 — Overwatch is retired the same way: Rings IS the index and its tabs ARE
+    // the Overwatch views, so the Command builtin lists Rings, not both.
+    return pages.DESTS.filter(function (d) { return d.id !== 'explorer' && d.id !== 'canvas' && d.id !== 'overwatch'; }).map(function (d) {
+      var list = byDest[d.id] || [];
+      if (!list.length) {
+        // Destination-IS-the-page surfaces (sitemap/rings): a single surface page
+        // whose type is the destination itself.
+        list = [d.id];
+      }
+      return { id: d.id, label: d.label, icon: d.icon, pages: list };
+    });
+  }
+  function cwsBuiltinWorkspaces() {
+    var command = {
+      schema_version: CWS_SCHEMA_VERSION, uid: CWS_BUILTIN_COMMAND, name: 'Command', icon: 'overwatch',
+      order: 0, source: 'builtin', builtin: true, surface: 'command', dests: cwsRegistryDests()
+    };
+    var explore = {
+      schema_version: CWS_SCHEMA_VERSION, uid: CWS_BUILTIN_EXPLORE, name: 'Explorer', icon: 'search',
+      order: 1, source: 'builtin', builtin: true, surface: 'explore',
+      dests: [{ id: 'explorer', label: 'Explorer', icon: 'search', pages: ['explorer'] }]
+    };
+    return [command, explore];
+  }
+  function cwsIsBuiltinUid(uid) { return uid === CWS_BUILTIN_COMMAND || uid === CWS_BUILTIN_EXPLORE; }
+
+  // Effective workspace list: builtins (auto-generated) overlaid by config facts.
+  // A builtin-fork overlay REPLACES its builtin's def (take control); a reverted
+  // overlay is ignored (auto-generation resumes). User workspaces append.
+  // `overlays` = array of { def } (already read via cwsReadWorkspaceDef).
+  function cwsEffectiveWorkspaces(overlays) {
+    var builtins = cwsBuiltinWorkspaces();
+    var byUid = {};
+    builtins.forEach(function (b) { byUid[b.uid] = b; });
+    (overlays || []).forEach(function (o) {
+      if (!o || !o.def || !o.valid) { return; }
+      if (o.reverted) { return; }   // tombstone → keep the auto-generated builtin (or drop a user ws)
+      var d = o.def;
+      if (!d.uid) { return; }
+      if (cwsIsBuiltinUid(d.uid)) { d.builtin = true; }   // a fork keeps its builtin identity + surface
+      if (byUid[d.uid] && byUid[d.uid].surface) { d.surface = byUid[d.uid].surface; }
+      byUid[d.uid] = d;
+    });
+    // Reverted user workspaces (a tombstone with a non-builtin uid) drop out.
+    (overlays || []).forEach(function (o) {
+      if (o && o.reverted && o.def && o.def.uid && !cwsIsBuiltinUid(o.def.uid)) { delete byUid[o.def.uid]; }
+    });
+    var list = Object.keys(byUid).map(function (k) { return byUid[k]; });
+    list.sort(function (a, b) { return (a.order || 0) - (b.order || 0) || cwsStr(a.name).localeCompare(cwsStr(b.name)); });
+    return list;
+  }
+
+  // ---- Fork / revert (take control) ---------------------------------------
+  function cwsForkWorkspace(builtinDef) {
+    var out = {};
+    Object.keys(builtinDef || {}).forEach(function (k) { out[k] = builtinDef[k]; });
+    delete out.builtin;
+    out.schema_version = CWS_SCHEMA_VERSION;
+    out.source = 'builtin-fork';
+    out.forked_from = builtinDef.uid;
+    return out;
+  }
+  function cwsTombstone(uid) { return { schema_version: CWS_SCHEMA_VERSION, uid: cwsStr(uid), reverted: true }; }
+
+  // ---- Starter templates (remix-not-blank; Blank is last) -----------------
+  function cwsStarterTemplates() {
+    return [
+      {
+        id: 'duplicate-command', label: 'Duplicate Command',
+        desc: 'Start from a copy of the full Command console — every destination and page, ready to trim.',
+        build: function (uid, name) {
+          var cmd = cwsBuiltinWorkspaces()[0];
+          return { workspace: { schema_version: CWS_SCHEMA_VERSION, uid: uid, name: name, icon: 'overwatch', order: 100, source: 'user', dests: cmd.dests.map(cwsNormalizeDest) }, pages: [] };
+        }
+      },
+      {
+        id: 'minimal-ops', label: 'Minimal ops',
+        desc: 'A tight operator surface — Overview, ExecPlans and Facts in one group. Add more from the registry.',
+        build: function (uid, name) {
+          var mk = function (t, title, sub, dest) { var puid = uid + '-' + cwsSlugify(title); return { schema_version: CWS_SCHEMA_VERSION, uid: puid, type: t, title: title, sub: sub, dest: dest, config: {}, source: 'user' }; };
+          var pages = [mk('cx-overview', 'Overview', 'daemon posture at a glance', 'ops'), mk('cx-work', 'ExecPlans', 'read-time projection over the work board', 'ops'), mk('cx-facts', 'Facts', 'the durable record — paged + searchable', 'ops')];
+          return { workspace: { schema_version: CWS_SCHEMA_VERSION, uid: uid, name: name, icon: 'meters', order: 100, source: 'user', dests: [{ id: 'ops', label: 'Ops', icon: 'meters', pages: pages.map(function (p) { return p.uid; }) }] }, pages: pages };
+        }
+      },
+      {
+        id: 'blank', label: 'Blank',
+        desc: 'An empty workspace with one group. Add pages from the registry yourself.',
+        build: function (uid, name) {
+          return { workspace: { schema_version: CWS_SCHEMA_VERSION, uid: uid, name: name, icon: 'work', order: 100, source: 'user', dests: [{ id: 'main', label: 'Main', icon: 'work', pages: [] }] }, pages: [] };
+        }
+      }
+    ];
+  }
+
+  // ---- Pack (crux.studio.v1) additive workspaces/pages --------------------
+  // Extend a studio payload with workspaces + pages WITHOUT breaking older
+  // importers (both arrays are optional). Import applies them as the defaults
+  // layer with provenance (the pack uid), edits overlay per the memo.
+  function cwsPackEmbed(payload, workspaces, pages) {
+    var out = payload && typeof payload === 'object' ? payload : {};
+    if (Array.isArray(workspaces) && workspaces.length) { out.workspaces = workspaces; }
+    if (Array.isArray(pages) && pages.length) { out.pages = pages; }
+    return out;
+  }
+  function cwsPackExtract(payload) {
+    var p = payload && typeof payload === 'object' ? payload : {};
+    return {
+      workspaces: Array.isArray(p.workspaces) ? p.workspaces : [],
+      pages: Array.isArray(p.pages) ? p.pages : []
+    };
+  }
+  // Merge a query object into an endpoint that may already carry a query string.
+  function cwsMergeQuery(endpoint, query) {
+    var e = cwsStr(endpoint);
+    if (!query || typeof query !== 'object') { return e; }
+    var qi = e.indexOf('?');
+    var base = qi >= 0 ? e.slice(0, qi) : e;
+    var params = {};
+    if (qi >= 0) { e.slice(qi + 1).split('&').forEach(function (kv) { if (!kv) { return; } var eq = kv.indexOf('='); var k = eq >= 0 ? kv.slice(0, eq) : kv; params[decodeURIComponent(k)] = eq >= 0 ? decodeURIComponent(kv.slice(eq + 1)) : ''; }); }
+    Object.keys(query).forEach(function (k) { if (query[k] != null && query[k] !== '') { params[k] = query[k]; } });
+    var qs = Object.keys(params).map(function (k) { return encodeURIComponent(k) + '=' + encodeURIComponent(params[k]); }).join('&');
+    return qs ? base + '?' + qs : base;
+  }
+
+  // ---- Overlay loading (config facts through the read client) -------------
+  // Discovery via /v1/facts/list?entity_prefix= (M1 route); full value re-read via
+  // /v1/facts/entity/<e> when the listing truncated it. Never throws.
+  function cwsListEntities(prefix) {
+    return fetchJSON('/v1/facts/list?entity_prefix=' + encodeURIComponent(prefix) + '&include_superseded=false&limit=500')
+      .then(function (res) {
+        var rows = (res.ok && res.data && Array.isArray(res.data.facts)) ? res.data.facts : [];
+        var byEntity = {};
+        rows.forEach(function (f) {
+          if (f.key !== CWS_DEF_KEY) { return; }
+          var cur = byEntity[f.entity];
+          if (!cur || (Number(f.version) || 0) > (Number(cur.version) || 0)) { byEntity[f.entity] = f; }
+        });
+        return Object.keys(byEntity).map(function (ent) { return byEntity[ent]; });
+      }).catch(function () { return []; });
+  }
+  function cwsHydrate(fact) {
+    if (!fact.value_truncated) { var v = null; try { v = JSON.parse(fact.value); } catch (e) { v = null; } return Promise.resolve(v); }
+    var api = (typeof window !== 'undefined') ? window.CruxApi : null;
+    if (!api || typeof api.factsEntityByEntity !== 'function') { return Promise.resolve(null); }
+    return api.factsEntityByEntity(fact.entity)
+      .then(function (r) { return r.json(); })
+      .then(function (d) { var latest = tstudioLatestFact((d && d.facts) || [], CWS_DEF_KEY); if (!latest) { return null; } try { return JSON.parse(latest.value); } catch (e) { return null; } })
+      .catch(function () { return null; });
+  }
+  function cwsReadEntry(prefix, reader, fact) {
+    return cwsHydrate(fact).then(function (raw) {
+      var r = reader(raw);
+      return { entity: fact.entity, uid: fact.entity.slice(prefix.length), raw: raw, def: r.def, valid: r.valid, unknownVersion: r.unknownVersion, reverted: r.reverted, fact: fact };
+    });
+  }
+  function cwsLoadOverlays() {
+    return Promise.all([cwsListEntities(CWS_WS_ENTITY), cwsListEntities(CWS_PAGE_ENTITY)]).then(function (both) {
+      return Promise.all([
+        Promise.all(both[0].map(function (f) { return cwsReadEntry(CWS_WS_ENTITY, cwsReadWorkspaceDef, f); })),
+        Promise.all(both[1].map(function (f) { return cwsReadEntry(CWS_PAGE_ENTITY, cwsReadPageDef, f); }))
+      ]).then(function (res) { return { workspaces: res[0], pages: res[1] }; });
+    }).catch(function () { return { workspaces: [], pages: [] }; });
+  }
+  // Build the full runtime model the shell + Studio share: effective workspaces
+  // (builtins overlaid by config) + a uid→page-def map (valid, non-reverted).
+  function cwsBuildModel(overlays) {
+    overlays = overlays || { workspaces: [], pages: [] };
+    var workspaces = cwsEffectiveWorkspaces(overlays.workspaces);
+    var pageByUid = {};
+    (overlays.pages || []).forEach(function (p) { if (p && p.valid && !p.reverted && p.def && p.def.uid) { pageByUid[p.def.uid] = p.def; } });
+    return { workspaces: workspaces, pages: pageByUid, overlays: overlays };
+  }
+
+  // Render one workspace page (user or forked) into a host by its TYPE — reusing
+  // the SAME builders as the built-in console so "whatever exists now" renders
+  // real data. Called by the shell's #/w/<uid>/<pageUid> route. Never throws.
+  function cwsHonest(host, title, lines) {
+    host.textContent = '';
+    var controls = [{ t: 'info', label: 'page', v: title }];
+    (lines || []).forEach(function (l) { controls.push({ t: 'info', label: l[0], v: l[1] }); });
+    renderSections(host, [{ h: title, wide: true, controls: controls }]);
+  }
+  function renderWorkspacePage(host, pageDef, ctx) {
+    ctx = ctx || {};
+    var read = cwsReadPageDef(pageDef);
+    if (!read.valid || !read.def) { cwsHonest(host, 'Page unavailable', [['reason', 'this page config is missing a uid or type'], ['fix', 'edit it in the Studio › Pages raw-JSON editor']]); return Promise.resolve(); }
+    if (read.unknownVersion) {
+      cwsHonest(host, read.def.title || 'Newer configuration', [
+        ['schema', 'this page was written by a newer console (schema_version ' + read.def.schema_version + ')'],
+        ['safe', 'the config is preserved untouched — upgrade this console to render it, or open it in the raw-JSON editor']
+      ]);
+      return Promise.resolve();
+    }
+    var def = read.def, type = def.type;
+    // Destination-IS-the-page surface types → the existing special renderers.
+    if (type === 'canvas/board' || type === 'canvas/graph' || type === 'canvas/tree' || type === 'canvas/studio') {
+      return renderCanvas(host, { summary: ctx.summary, view: type.split('/')[1] });
+    }
+    if (type === 'explorer') { renderExplorer(host, { summary: ctx.summary }); return Promise.resolve(); }
+    if (type === 'sitemap') { renderSiteMap(host); return Promise.resolve(); }
+    if (type === 'rings') { renderRings(host, { summary: ctx.summary }); return Promise.resolve(); }
+    var pages = (typeof window !== 'undefined') ? window.CruxPages : null;
+    var base = pages && pages.PAGES ? pages.PAGES[type] : null;
+    if (!base) { cwsHonest(host, def.title || type, [['unknown type', type], ['note', 'this page type is not in the registry on this build']]); return Promise.resolve(); }
+    // Synthetic page: reuse the built-in builder, override title/sub, and (where
+    // the type declares options) merge config.query into the load endpoint.
+    var synthetic = {};
+    Object.keys(base).forEach(function (k) { synthetic[k] = base[k]; });
+    synthetic.title = def.title || base.title;
+    synthetic.sub = def.sub != null && def.sub !== '' ? def.sub : base.sub;
+    if (base.load && def.config && def.config.query && typeof def.config.query === 'object') {
+      var load = {}; Object.keys(base.load).forEach(function (k) { load[k] = base.load[k]; });
+      load.endpoint = cwsMergeQuery(base.load.endpoint, def.config.query);
+      synthetic.load = load;
+    }
+    return renderPage(synthetic, host) || Promise.resolve();
+  }
+
+  // =======================================================================
+  //  Studio artifact PROVENANCE (crux-integrations-and-template-library L1+L2)
+  //
+  //  Two — deliberately distinct — stamps can ride inside a Studio artifact's
+  //  def/doc value:
+  //
+  //    installed_from — written by the DAEMON when a curator-signed catalog
+  //      entry is installed (POST /v1/studio/library/{id}/install). Carries
+  //      library_id + version + pack_sha256 + publisher fpr, so the daemon can
+  //      read the installed set back out of the fact store.
+  //    imported_from  — written by the CONSOLE when an operator hand-imports a
+  //      pack file (Studio › Board › Import). A local import is NOT a catalog
+  //      install: there is no library id, no curator endorsement and no
+  //      installed-join, so it never borrows the daemon's field name. It
+  //      carries the manifest's own pack id, when it was imported, and whether
+  //      the verify route said the pack was signed.
+  //
+  //  Both are read DEFENSIVELY (any shape, any daemon version) and rendered as
+  //  one small chip wherever the artifact is listed.
+  // =======================================================================
+  function studioProvStr(v) { return (typeof v === 'string') ? v : (v == null ? '' : String(v)); }
+  // Coerce a provenance object to the fields we render/persist. Returns null for
+  // anything that is not an object, so an absent stamp never invents one.
+  function studioReadInstalledFrom(raw) {
+    if (!raw || typeof raw !== 'object') { return null; }
+    var out = {
+      library_id: studioProvStr(raw.library_id),
+      version: studioProvStr(raw.version),
+      pack_sha256: studioProvStr(raw.pack_sha256),
+      publisher_passport_fpr: studioProvStr(raw.publisher_passport_fpr)
+    };
+    var at = Number(raw.installed_at_unix_ms);
+    if (isFinite(at) && at > 0) { out.installed_at_unix_ms = at; }
+    return out.library_id ? out : null;
+  }
+  function studioReadImportedFrom(raw) {
+    if (!raw || typeof raw !== 'object') { return null; }
+    var out = { pack_id: studioProvStr(raw.pack_id), signed: !!raw.signed };
+    var at = Number(raw.imported_at_unix_ms);
+    if (isFinite(at) && at > 0) { out.imported_at_unix_ms = at; }
+    return out.pack_id ? out : null;
+  }
+  // The stamp the console writes on a MANUAL import. Pure (the clock is injected
+  // by the caller in tests). `pack.id` is the crux.integration.v1 manifest id.
+  function studioImportStamp(pack, verify, nowMs) {
+    var id = (pack && typeof pack === 'object') ? studioProvStr(pack.id) : '';
+    var now = Number(nowMs);
+    return {
+      pack_id: id,
+      imported_at_unix_ms: (isFinite(now) && now > 0) ? now : Date.now(),
+      signed: !!(verify && verify.signed)
+    };
+  }
+  // Pure: a COPY of an artifact def carrying the import stamp. Never mutates the
+  // input, and never touches installed_from (a catalog install is a different
+  // provenance class — see the block comment above).
+  function studioStampImported(value, stamp) {
+    var out = {};
+    if (value && typeof value === 'object') { Object.keys(value).forEach(function (k) { out[k] = value[k]; }); }
+    if (stamp && stamp.pack_id) { out.imported_from = stamp; }
+    return out;
+  }
+  // One chip, both stamps. Returns null when the artifact carries neither, so
+  // every listing can append unconditionally.
+  function studioProvenanceChip(value) {
+    var v = (value && typeof value === 'object') ? value : {};
+    var lib = studioReadInstalledFrom(v.installed_from);
+    var imp = lib ? null : studioReadImportedFrom(v.imported_from);
+    if (!lib && !imp) { return null; }
+    var text = lib
+      ? ('library: ' + lib.library_id + (lib.version ? '@' + lib.version : ''))
+      : ('import: ' + imp.pack_id + (imp.signed ? ' · signed' : ' · unsigned'));
+    var title = lib
+      ? ('Installed from the Studio template library. publisher ' + (lib.publisher_passport_fpr || 'unknown')
+         + ' · pack sha256 ' + (lib.pack_sha256 || 'unknown'))
+      : ('Imported from a local pack file' + (imp.signed ? ' whose signature verified against this daemon\'s trusted keyring.' : ' that carried NO verified signature — no publisher trust.'));
+    var chip = el('span', { 'class': 'clib-provchip' + (lib ? ' is-library' : ' is-import'), title: title });
+    chip.appendChild(el('span', { 'class': 'cwstudio-prov-dot' }));
+    chip.appendChild(el('span', { 'class': 'clib-provchip-t', text: text }));
+    return chip;
+  }
+
+  // =======================================================================
+  //  Canvas Studio (M14) — the ported diagram-builder engine.
+  //
+  //  Ported from MediaCrux/dashboard/public/canvas/assets/diagram-builder.js
+  //  (an Obsidian-Canvas-style nodes+edges engine) into the v2 console:
+  //    * 2 CDN loads (pdf.js, model-viewer) STRIPPED — no 3D tiles, no PDF doc
+  //      tiles (rendered as an honest unsupported note if a legacy kind appears);
+  //    * every innerHTML site rebuilt with el()/svgEl()/textContent (the console
+  //      keeps zero dynamic-HTML injection — see smoke checkTileStudio);
+  //    * IndexedDB/localStorage persistence REPLACED by daemon-side facts
+  //      (console:tileboard:<id> key "doc"; console:tiledesign:<slug> key "def")
+  //      through the operator-gated console fact-add route;
+  //    * web tiles restricted to SAME-ORIGIN relative paths (external embeds
+  //      rejected with honest inline copy);
+  //    * a NEW "api" tile kind binds any known daemon GET route to a preset
+  //      (stat/list/sparkline/gauge/badge) through the generated read client.
+  //
+  //  Namespace: tstudio*. The incumbent renderTileCanvas (#/canvas/board) and
+  //  its smoke gates are untouched — Studio is a fourth canvas view.
+  // =======================================================================
+  var TSTUDIO_GRID = 20;                      // snap grid — matches the incumbent canvas grammar
+  var TSTUDIO_BOARD_ENTITY = 'console:tileboard:';
+  var TSTUDIO_DESIGN_ENTITY = 'console:tiledesign:';
+  var TSTUDIO_DOC_KEY = 'doc';
+  var TSTUDIO_DESIGN_KEY = 'def';
+  var TSTUDIO_DEFAULT_BOARD = 'default';
+  var TSTUDIO_DOC_VERSION = 1;                // schema stamp on every saved doc
+  var TSTUDIO_AUTOSAVE_MS = 1500;             // debounced autosave after move/resize/edit
+  var TSTUDIO_MIN_W = 140, TSTUDIO_MIN_H = 90;
+  // Known GET routes that ACCEPT a token_budget query param — the editor surfaces
+  // the budget field only for these (Insights friction #1: budgets are mandatory
+  // on retrieval reads). The rest hide it.
+  var TSTUDIO_BUDGET_ROUTES = { '/v1/activity': true, '/v1/facts': true, '/v1/context': true };
+  // 'live' streams via /v1/events/stream (targeted refetch on relevant events);
+  // the numeric options fall back to a poll interval; 'off' is manual.
+  var TSTUDIO_REFRESH = [['off', 'Off'], ['live', 'Live'], ['30000', '30s'], ['60000', '60s'], ['300000', '5m']];
+  var TSTUDIO_PRESETS = ['stat', 'list', 'sparkline', 'gauge', 'badge'];
+
+  // ---- Kind registry (the ported KINDS that survive) --------------------
+  // Each entry: accent token + a single-colour SVG icon (path 'd' strings, built
+  // via svgEl — never innerHTML). `content` selects the node body builder.
+  //   standard → title/sub/body card    box → blank container
+  //   web      → same-origin iframe      api → route-bound preset tile
+  var TSTUDIO_KINDS = {
+    note:    { label: 'Note',    accent: 'var(--acc)',   content: 'standard', icon: ['M6 2h8l4 4v16H6z', 'M14 2v4h4', 'M9 12h6M9 15h6M9 18h4'] },
+    project: { label: 'Project', accent: 'var(--acc)',   content: 'standard', icon: ['M4 4h7v7H4z', 'M13 4h7v7h-7z', 'M4 13h7v7H4z', 'M13 13h7v7h-7z'] },
+    server:  { label: 'Server',  accent: 'var(--trust)', content: 'standard', icon: ['M3 4.5h18v6H3z', 'M3 13.5h18v6H3z', 'M7 7.5h.01M7 16.5h.01'] },
+    storage: { label: 'Storage', accent: 'var(--warn)',  content: 'standard', icon: ['M4 6c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3z', 'M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6', 'M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3'] },
+    client:  { label: 'Client',  accent: 'var(--acc)',   content: 'standard', icon: ['M3 4.5h18v12H3z', 'M8 20h8M12 16.5v3.5'] },
+    output:  { label: 'Output',  accent: 'var(--ok)',    content: 'standard', icon: ['M4 4h11l5 5v11H4z', 'M14 4v6h6', 'M8 14h8M8 17h5'] },
+    box:     { label: 'Box',     accent: 'var(--ink3)',  content: 'box',      icon: ['M4 5.5h16v13H4z'] },
+    web:     { label: 'Web embed', accent: 'var(--acc)', content: 'web',      icon: ['M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z', 'M3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18'] },
+    api:     { label: 'API tile', accent: 'var(--ok)',   content: 'api',      icon: ['M4 7l-2.5 5L4 17', 'M20 7l2.5 5L20 17', 'M14 4l-4 16'] },
+    // M15 automated-data-handling kinds — fixed-route, purpose-built tiles.
+    search:  { label: 'Text search', accent: 'var(--acc)', content: 'search', icon: ['M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14z', 'M20 20l-3.5-3.5'] },
+    corpus:  { label: 'Corpus status', accent: 'var(--trust)', content: 'corpus', icon: ['M4 6c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3z', 'M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6', 'M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3'] },
+    receipts:{ label: 'Receipts', accent: 'var(--warn)', content: 'receipts', icon: ['M6 2h9l3 3v17l-3-2-3 2-3-2-3 2z', 'M9 8h6M9 12h6M9 16h4'] },
+    extensions:{ label: 'Extensions', accent: 'var(--ok)', content: 'extensions', icon: ['M10 3h4v4h4v4h-4v4h-4v-4H6V7h4z', 'M14 15h4v6h-6v-4'] }
+  };
+  // Legacy kinds that were dropped on the port (3D + PDF): render an honest
+  // unsupported note rather than silently mis-rendering.
+  var TSTUDIO_DROPPED_KINDS = { model: '3D model tiles are not supported in the console.', doc_pdf: 'PDF document tiles are not supported in the console.' };
+
+  function tstudioKind(kind) { return TSTUDIO_KINDS[kind] || TSTUDIO_KINDS.note; }
+  // Build a kind glyph as an <svg> element (no innerHTML). `paths` is a list of
+  // path 'd' strings sharing the unified 24-viewBox / round-join family.
+  function tstudioIcon(paths, size) {
+    var svg = svgEl('svg', { viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '1.8', 'stroke-linecap': 'round', 'stroke-linejoin': 'round', width: size || 16, height: size || 16, 'aria-hidden': 'true' });
+    (paths || []).forEach(function (d) { svg.appendChild(svgEl('path', { d: d })); });
+    return svg;
+  }
+
+  // =======================================================================
+  //  Pure helpers (exported; the smoke unit-tests these against a fixture)
+  // =======================================================================
+  function tstudioSnap(v) { return Math.round((Number(v) || 0) / TSTUDIO_GRID) * TSTUDIO_GRID; }
+  function tstudioNum(v, dflt) { var n = Number(v); return isFinite(n) ? n : dflt; }
+  // Monotonic id (no RNG — render.js forbids non-deterministic layout via the
+  // canvas-graph determinism gate). Unique within a session; ids are only ever
+  // local handles, never a security boundary.
+  var __tstudioSeq = 0;
+  function tstudioUid(p) { __tstudioSeq += 1; return (p || 'n') + Date.now().toString(36) + '-' + __tstudioSeq.toString(36); }
+
+  // A web tile may embed ONLY a same-origin, root-relative path ("/…"). External
+  // URLs (http[s]://, protocol-relative //host, javascript:, data:) are rejected:
+  // the operator ingests the data and binds an API tile instead.
+  function tstudioWebSrcOk(src) {
+    if (typeof src !== 'string') { return false; }
+    var s = src.trim();
+    if (!s) { return false; }
+    if (s.charAt(0) !== '/') { return false; }   // must be root-relative
+    if (s.charAt(1) === '/') { return false; }    // protocol-relative //host → external
+    return true;
+  }
+  // A route is bindable only if it is a KNOWN literal GET route of the generated
+  // client (window.CRUX_GET_ROUTES, emitted by api.js from LITERAL_GET_PATHS).
+  function tstudioKnownRoutes() {
+    var r = (typeof window !== 'undefined' && window.CRUX_GET_ROUTES) || [];
+    return Array.isArray(r) ? r : [];
+  }
+  function tstudioApiRouteKnown(route) {
+    if (typeof route !== 'string' || !route) { return false; }
+    var known = tstudioKnownRoutes();
+    for (var i = 0; i < known.length; i++) { if (known[i] === route) { return true; } }
+    return false;
+  }
+
+  // Dot / bracket JSON path extractor ("a.b[0].c" / "a[2]"). Pure; returns
+  // undefined for any miss (never throws).
+  function tstudioJsonPath(obj, path) {
+    if (obj == null) { return undefined; }
+    if (path == null || String(path).trim() === '') { return obj; }
+    var parts = String(path).replace(/\[(\d+)\]/g, '.$1').split('.').filter(function (p) { return p !== ''; });
+    var cur = obj;
+    for (var i = 0; i < parts.length; i++) {
+      if (cur == null) { return undefined; }
+      cur = cur[parts[i]];
+    }
+    return cur;
+  }
+
+  // Normalise a raw board doc (from the fact store OR an in-memory state) into a
+  // clean, safe doc: coerces geometry to finite numbers, drops unknown node
+  // fields, forces same-origin web src, and keeps only the doc schema
+  // (nodes/links/texts/pan/zoom/version). This is the round-trip identity the
+  // smoke asserts, and the security choke for loaded (possibly stale) boards.
+  function tstudioNormalizeDoc(raw) {
+    var d = (raw && typeof raw === 'object') ? raw : {};
+    var out = { nodes: [], links: [], texts: [], pan: { x: 0, y: 0 }, zoom: 1, version: TSTUDIO_DOC_VERSION };
+    var seen = {};
+    (Array.isArray(d.nodes) ? d.nodes : []).forEach(function (n) {
+      if (!n || typeof n !== 'object') { return; }
+      var id = (typeof n.id === 'string' && n.id) ? n.id : tstudioUid();
+      if (seen[id]) { return; }               // drop duplicate ids
+      seen[id] = true;
+      var kind = TSTUDIO_KINDS[n.kind] ? n.kind : (n.kind === 'doc' ? 'note' : (TSTUDIO_DROPPED_KINDS[n.kind] ? n.kind : 'note'));
+      var node = {
+        id: id, kind: kind,
+        x: tstudioNum(n.x, 40), y: tstudioNum(n.y, 40),
+        w: tstudioNum(n.w, 220), h: tstudioNum(n.h, 140),
+        z: tstudioNum(n.z, 2)
+      };
+      if (typeof n.label === 'string') { node.label = n.label; }
+      if (typeof n.sub === 'string') { node.sub = n.sub; }
+      if (typeof n.body === 'string') { node.body = n.body; }
+      if (kind === 'web') { node.url = tstudioWebSrcOk(n.url) ? n.url.trim() : ''; }
+      if (kind === 'api' && n.api && typeof n.api === 'object') {
+        node.api = {
+          route: typeof n.api.route === 'string' ? n.api.route : '',
+          params: typeof n.api.params === 'string' ? n.api.params : '',
+          jsonPath: typeof n.api.jsonPath === 'string' ? n.api.jsonPath : '',
+          preset: TSTUDIO_PRESETS.indexOf(n.api.preset) >= 0 ? n.api.preset : 'stat',
+          fields: typeof n.api.fields === 'string' ? n.api.fields : '',
+          max: typeof n.api.max === 'string' ? n.api.max : '',
+          refresh: typeof n.api.refresh === 'string' ? n.api.refresh : 'off',
+          tokenBudget: typeof n.api.tokenBudget === 'string' ? n.api.tokenBudget : ''
+        };
+      }
+      // M15 automated-data-handling kinds: fixed route, kind-specific config.
+      if (kind === 'corpus' || kind === 'receipts' || kind === 'extensions') {
+        var ax = (n.api && typeof n.api === 'object') ? n.api : {};
+        node.api = {
+          route: TSTUDIO_FIXED_ROUTE[kind],
+          refresh: typeof ax.refresh === 'string' ? ax.refresh : 'off',
+          limit: typeof ax.limit === 'string' ? ax.limit : (kind === 'receipts' ? '7' : '')
+        };
+      }
+      if (kind === 'search') {
+        var sc = (n.search && typeof n.search === 'object') ? n.search : {};
+        node.search = {
+          route: TSTUDIO_FIXED_ROUTE.search,
+          query: typeof sc.query === 'string' ? sc.query : '',
+          tenant: typeof sc.tenant === 'string' ? sc.tenant : 'default',
+          tokenBudget: typeof sc.tokenBudget === 'string' ? sc.tokenBudget : '800',
+          refresh: typeof sc.refresh === 'string' ? sc.refresh : 'off'
+        };
+      }
+      out.nodes.push(node);
+    });
+    var nodeIds = seen;
+    (Array.isArray(d.links) ? d.links : []).forEach(function (l) {
+      if (!l || typeof l !== 'object') { return; }
+      if (!nodeIds[l.from] || !nodeIds[l.to] || l.from === l.to) { return; }   // drop dangling / self
+      out.links.push({ id: (typeof l.id === 'string' && l.id) ? l.id : tstudioUid('l'), from: l.from, to: l.to, label: typeof l.label === 'string' ? l.label : '', bidir: !!l.bidir });
+    });
+    (Array.isArray(d.texts) ? d.texts : []).forEach(function (t) {
+      if (!t || typeof t !== 'object') { return; }
+      out.texts.push({ id: (typeof t.id === 'string' && t.id) ? t.id : tstudioUid('t'), text: typeof t.text === 'string' ? t.text : 'Text', x: tstudioNum(t.x, 40), y: tstudioNum(t.y, 40), size: Math.max(11, Math.min(120, tstudioNum(t.size, 28))), bold: !!t.bold });
+    });
+    if (d.pan && typeof d.pan === 'object') { out.pan = { x: tstudioNum(d.pan.x, 0), y: tstudioNum(d.pan.y, 0) }; }
+    out.zoom = Math.max(0.2, Math.min(3, tstudioNum(d.zoom, 1)));
+    out.version = tstudioNum(d.version, TSTUDIO_DOC_VERSION);
+    out.settings = tstudioNormalizeSettings(d.settings);
+    // Provenance is the ONE exception to "drop unknown fields": a board doc
+    // installed from the template library (or imported from a pack) carries a
+    // stamp the daemon reads back to compute its installed set. Dropping it here
+    // would silently orphan the artifact on the operator's next save. It is
+    // coerced to known scalar fields (never interpreted as markup) exactly like
+    // every other field this choke point admits.
+    var prov = studioReadInstalledFrom(d.installed_from);
+    if (prov) { out.installed_from = prov; }
+    var imp = studioReadImportedFrom(d.imported_from);
+    if (imp) { out.imported_from = imp; }
+    return out;
+  }
+  function tstudioSerializeDoc(state) {
+    var doc = { nodes: state.nodes, links: state.links, texts: state.texts, pan: state.pan, zoom: state.zoom, settings: state.settings || tstudioDefaultSettings(), version: TSTUDIO_DOC_VERSION, savedAt: Date.now() };
+    var prov = studioReadInstalledFrom(state.installed_from);
+    if (prov) { doc.installed_from = prov; }
+    var imp = studioReadImportedFrom(state.imported_from);
+    if (imp) { doc.imported_from = imp; }
+    return JSON.stringify(doc);
+  }
+  // Pick the newest (max-version, non-deleted) fact for `key` from a /v1/facts/
+  // entity/<entity> read (which returns EVERY version). Returns the fact or null.
+  function tstudioLatestFact(facts, key) {
+    var best = null;
+    (facts || []).forEach(function (f) {
+      if (!f || f.key !== key) { return; }
+      if (!best || tstudioNum(f.version, 0) > tstudioNum(best.version, 0)) { best = f; }
+    });
+    return best;
+  }
+
+  // =======================================================================
+  //  M15 — live tiles, automated-data-handling tile kinds, board settings,
+  //  and portable Studio packs. Everything below the "Canvas Studio (M14)"
+  //  banner stays inside the region the smoke checks (NO innerHTML, NO raw
+  //  fetch — reads via fetchJSON / window.CruxApiRead; live via EventSource;
+  //  writes via operatorGatedCall → consoleFactsAdd).
+  // =======================================================================
+  var TSTUDIO_STUDIO_SCHEMA = 'crux.studio.v1';
+  var TSTUDIO_PACK_SCHEMA = 'crux.integration.v1';
+  // Board accent themes (all var(--)) — grid/refresh/accent live in the doc
+  // settings and travel inside exported packs.
+  var TSTUDIO_ACCENTS = {
+    cool: { label: 'Cool', v: 'var(--acc)' },
+    trust: { label: 'Violet', v: 'var(--trust)' },
+    ok: { label: 'Green', v: 'var(--ok)' },
+    warn: { label: 'Amber', v: 'var(--warn)' }
+  };
+  var TSTUDIO_GRID_SIZES = [16, 20, 24, 32, 40];
+  // The automated-data-handling tile kinds get FIXED read routes (the operator
+  // does not pick a route — the kind IS the binding). Search rides the curated
+  // read-POST client; the rest ride the GET client.
+  var TSTUDIO_FIXED_ROUTE = {
+    search: '/v1/query/text-search',
+    corpus: '/v1/console/summary',
+    receipts: '/v1/receipts/list',
+    extensions: '/v1/extensions'
+  };
+
+  function tstudioAccentVar(accent) {
+    var a = TSTUDIO_ACCENTS[accent];
+    return a ? a.v : 'var(--acc)';
+  }
+  function tstudioDefaultSettings() {
+    return { grid: TSTUDIO_GRID, refresh: 'off', accent: 'cool', title: '', description: '' };
+  }
+  function tstudioNormalizeSettings(raw) {
+    var s = (raw && typeof raw === 'object') ? raw : {};
+    var grid = tstudioNum(s.grid, TSTUDIO_GRID);
+    if (TSTUDIO_GRID_SIZES.indexOf(grid) < 0) { grid = TSTUDIO_GRID; }
+    var refresh = (typeof s.refresh === 'string') ? s.refresh : 'off';
+    var accent = TSTUDIO_ACCENTS[s.accent] ? s.accent : 'cool';
+    return {
+      grid: grid,
+      refresh: refresh,
+      accent: accent,
+      title: (typeof s.title === 'string') ? s.title.slice(0, 120) : '',
+      description: (typeof s.description === 'string') ? s.description.slice(0, 400) : ''
+    };
+  }
+  function tstudioFmt(v) {
+    if (typeof v === 'number' && isFinite(v)) { try { return v.toLocaleString('en-US'); } catch (e) { return String(v); } }
+    return v == null ? '—' : String(v);
+  }
+  // Honest coverage copy for the text-search tile: below 0.5 the corpus may not
+  // cover the query (Insights honesty rule — never imply a full answer from a
+  // thin index). Pure; smoke-tested.
+  function tstudioCoverageNote(score) {
+    var s = Number(score);
+    if (!isFinite(s)) { s = 0; }
+    var txt = 'coverage ' + s.toFixed(2);
+    var low = s < 0.5;
+    if (low) { txt += ' — corpus may not cover this'; }
+    return { text: txt, low: low, score: s };
+  }
+  // Which /v1/events/stream event types a tile depends on, so a live tile
+  // refetches ONLY on relevant mutations (draw no more than needed).
+  function tstudioTileEvents(node) {
+    if (!node || typeof node !== 'object') { return []; }
+    var kind = node.kind;
+    var route = (node.api && node.api.route) || (node.search && node.search.route) || TSTUDIO_FIXED_ROUTE[kind] || '';
+    if (kind === 'search' || kind === 'corpus') { return ['fact.stored', 'fact.deleted', 'session.stored']; }
+    if (kind === 'receipts') { return ['fact.stored']; }
+    if (kind === 'extensions') { return []; }               // registry rarely changes; interval/manual only
+    if (route.indexOf('/v1/activity') === 0) { return ['activity.appended']; }
+    if (route.indexOf('/v1/facts') === 0 || route.indexOf('/v1/console/facts') === 0 || route.indexOf('/v1/query') === 0 || route.indexOf('/v1/console/summary') === 0) { return ['fact.stored', 'fact.deleted']; }
+    if (route.indexOf('/v1/console/sessions') === 0 || route.indexOf('/v1/sessions') === 0) { return ['session.stored', 'session.archived']; }
+    return ['fact.stored'];                                  // sensible default for a generic bound read
+  }
+
+  // ---- Pure content renderers for the new tile kinds (smoke-tested) --------
+  // Each takes an already-parsed response body + opts, returns ONE element
+  // built with el() (no innerHTML). Honest empty / error states included.
+  function tstudioRenderSearch(data, cfg, opts) {
+    opts = opts || {};
+    var wrap = el('div', { 'class': 'tstudio-searchbody' });
+    if (!data) { wrap.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'no response' })); return wrap; }
+    var cov = tstudioCoverageNote(data.coverage && data.coverage.score);
+    var covEl = el('div', { 'class': 'tstudio-cov' + (cov.low ? ' is-low' : '') });
+    covEl.appendChild(el('span', { 'class': 'tstudio-cov-dot' }));
+    covEl.appendChild(el('span', { 'class': 'tstudio-cov-txt', text: cov.text }));
+    wrap.appendChild(covEl);
+    var results = (data && Array.isArray(data.results)) ? data.results : [];
+    var q = (cfg && cfg.query) ? String(cfg.query) : '';
+    wrap.appendChild(el('div', { 'class': 'tstudio-search-meta', text: results.length + ' hit' + (results.length === 1 ? '' : 's') + (q ? (' · "' + q + '"') : '') }));
+    var list = el('div', { 'class': 'tstudio-list' });
+    if (!results.length) {
+      list.appendChild(el('div', { 'class': 'tstudio-placeholder', text: cov.low ? 'No hits — the local index may not cover this query or tenant.' : 'No hits.' }));
+    }
+    results.slice(0, 6).forEach(function (r) {
+      var label = (r && (r.entity || r.title || r.key || r.snippet)) || (r && typeof r === 'object' ? JSON.stringify(r).slice(0, 80) : String(r));
+      var row = el('div', { 'class': 'tstudio-list-row' });
+      row.appendChild(el('span', { 'class': 'tstudio-list-cell', text: String(label) }));
+      if (r && typeof r.score === 'number') { row.appendChild(el('span', { 'class': 'tstudio-hit-score', text: r.score.toFixed(2) })); }
+      list.appendChild(row);
+    });
+    wrap.appendChild(list);
+    return wrap;
+  }
+  function tstudioRenderCorpus(data) {
+    var wrap = el('div', { 'class': 'tstudio-corpusbody' });
+    if (!data) { wrap.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'no response' })); return wrap; }
+    var stores = data.stores || {};
+    var stats = el('div', { 'class': 'tstudio-corpus-stats' });
+    [['facts', tstudioJsonPath(stores, 'facts')], ['sessions', tstudioJsonPath(stores, 'sessions')]].forEach(function (kv) {
+      stats.appendChild(el('div', { 'class': 'tstudio-corpus-stat' }, [
+        el('div', { 'class': 'tstudio-corpus-v', text: tstudioFmt(kv[1]) }),
+        el('div', { 'class': 'tstudio-corpus-k', text: kv[0] })
+      ]));
+    });
+    wrap.appendChild(stats);
+    var packs = tstudioJsonPath(data, 'integrations.builtin_pack_count');
+    var ver = tstudioJsonPath(data, 'daemon.build.version');
+    wrap.appendChild(el('div', { 'class': 'tstudio-corpus-meta', text: 'daemon ' + tstudioFmt(ver) + ' · ' + tstudioFmt(packs) + ' built-in packs' }));
+    wrap.appendChild(el('div', { 'class': 'tstudio-placeholder', text: 'Counts this daemon exposes. Ingest corpora appear here as the store grows.' }));
+    return wrap;
+  }
+  function tstudioRenderReceipts(data) {
+    var wrap = el('div', { 'class': 'tstudio-receiptsbody' });
+    if (!data) { wrap.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'no response' })); return wrap; }
+    var rows = Array.isArray(data.rows) ? data.rows : [];
+    var list = el('div', { 'class': 'tstudio-list' });
+    if (!rows.length) { list.appendChild(el('div', { 'class': 'tstudio-placeholder', text: 'No receipts yet. Gated actions + observations mint signed receipts here.' })); }
+    rows.slice(0, 7).forEach(function (r) {
+      var row = el('div', { 'class': 'tstudio-list-row' });
+      row.appendChild(el('span', { 'class': 'tstudio-list-cell', text: String((r && r.kind) || '—') }));
+      var who = (r && (r.principal || (r.receipt && r.receipt.signed_by_short))) || '';
+      row.appendChild(el('span', { 'class': 'tstudio-list-cell', text: String(who).slice(0, 22) }));
+      var id = (r && (r.receipt_id || r.observation_id)) || '';
+      row.appendChild(el('span', { 'class': 'tstudio-rec-id', text: String(id).slice(0, 14) }));
+      list.appendChild(row);
+    });
+    wrap.appendChild(list);
+    return wrap;
+  }
+  // Extensions tile: installed extensions + capability chips + grant/trust
+  // state; honest empty on a bare mirror. If an extension declares a data
+  // endpoint (external_tool_endpoint / tools) reachable via extension_outbound,
+  // render a CAPABILITY-GATED invoke affordance (disabled unless operator).
+  function tstudioRenderExtensions(data, opts) {
+    opts = opts || {};
+    var wrap = el('div', { 'class': 'tstudio-extbody' });
+    if (!data) { wrap.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'no response' })); return wrap; }
+    var exts = Array.isArray(data.extensions) ? data.extensions : [];
+    if (!exts.length) {
+      wrap.appendChild(el('div', { 'class': 'tstudio-ext-empty' }, [
+        el('div', { 'class': 'tstudio-placeholder', text: 'No extensions installed on this daemon.' }),
+        el('div', { 'class': 'tstudio-placeholder', text: 'Install one via corecruxctl, POST /v1/extensions/register (a signed crux.integration.v1 manifest), or install-from-registry against the curator-signed community index.' })
+      ]));
+      return wrap;
+    }
+    exts.slice(0, 6).forEach(function (ext) {
+      var m = ext.manifest || {};
+      var card = el('div', { 'class': 'tstudio-ext-card' });
+      var head = el('div', { 'class': 'tstudio-ext-head' });
+      head.appendChild(el('span', { 'class': 'tstudio-ext-id', text: String(ext.id || m.id || '—') }));
+      head.appendChild(el('span', { 'class': 'tstudio-ext-tier', text: String(ext.trust_tier || 'unknown') }));
+      card.appendChild(head);
+      var chips = el('div', { 'class': 'tstudio-ext-chips' });
+      (Array.isArray(m.capabilities) ? m.capabilities : []).forEach(function (c) {
+        chips.appendChild(el('span', { 'class': 'tstudio-cap-chip', text: String(c) }));
+      });
+      if (!(m.capabilities && m.capabilities.length)) { chips.appendChild(el('span', { 'class': 'tstudio-placeholder', text: 'no capabilities declared' })); }
+      card.appendChild(chips);
+      var hasEndpoint = !!m.external_tool_endpoint || (Array.isArray(m.tools) && m.tools.length > 0);
+      if (hasEndpoint) {
+        var tool = (Array.isArray(m.tools) && m.tools[0] && m.tools[0].name) ? m.tools[0].name : '';
+        var ep = el('div', { 'class': 'tstudio-ext-ep' });
+        ep.appendChild(el('span', { 'class': 'tstudio-ext-ep-lab', text: 'data endpoint' + (tool ? (' · ' + tool) : '') }));
+        var btn = el('button', { 'class': 'tstudio-btn tstudio-ext-invoke', type: 'button', title: 'Open Studio › Integrations, where invoke runs under an operator-gated grant' }, ['Invoke']);
+        // A board tile is a READ surface, so the tile does not itself mutate: the
+        // button routes to the one place invoke is actually wired (Studio ›
+        // Integrations, which owns the args form, the grant and the receipt).
+        // It used to carry no handler at all — enabled and inert.
+        btn.addEventListener('click', function () { location.hash = '#/canvas/studio?sub=integrations'; });
+        // Capability-gated: needs operator posture AND a grant. On a bare
+        // mirror this stays disabled with an honest reason.
+        if (!opts.operator) { btn.disabled = true; }
+        btn.setAttribute('aria-disabled', btn.disabled ? 'true' : 'false');
+        ep.appendChild(btn);
+        card.appendChild(ep);
+        card.appendChild(el('div', { 'class': 'tstudio-placeholder', text: 'Routes via POST /v1/extensions/' + String(ext.id || '') + '/tools/{tool}/invoke — grant-scoped, rate-limited (extension_outbound).' }));
+      }
+      wrap.appendChild(card);
+    });
+    return wrap;
+  }
+
+  // Client-side capability preview mirroring the daemon's derive_capabilities
+  // (studio_pack.rs) — shown in the export dialog so the operator sees the
+  // minimal read set before building. The daemon re-derives authoritatively.
+  function tstudioCapabilityForRoute(route) {
+    route = String(route || '');
+    if (route.indexOf('/v1/facts') === 0 || route.indexOf('/v1/console/facts') === 0 || route.indexOf('/v1/query') === 0) { return 'facts:read'; }
+    if (route.indexOf('/v1/console/sessions') === 0 || route.indexOf('/v1/sessions') === 0) { return 'sessions:read'; }
+    if (route.indexOf('/v1/passports') === 0 || route.indexOf('/v1/console/passports') === 0) { return 'passport:read'; }
+    if (route.indexOf('/v1/receipts') === 0) { return 'admin:read'; }
+    if (route.indexOf('/v1/console/tenants') === 0) { return 'tenant:metadata:read'; }
+    return 'integrations:read';
+  }
+  function tstudioDerivePackCaps(doc) {
+    var caps = { 'integrations:read': true };
+    var nodes = (doc && Array.isArray(doc.nodes)) ? doc.nodes : [];
+    nodes.forEach(function (n) {
+      if (n && n.api && n.api.route) { caps[tstudioCapabilityForRoute(n.api.route)] = true; }
+      if (n && n.search && n.search.route) { caps[tstudioCapabilityForRoute(n.search.route)] = true; }
+      if (n && n.kind === 'search') { caps['facts:read'] = true; }
+      if (n && n.kind === 'receipts') { caps['admin:read'] = true; }
+    });
+    return Object.keys(caps).sort();
+  }
+  // Assemble a crux.studio.v1 payload from a board doc + designs + settings.
+  // Pure — the export flow sends this to /v1/studio/pack/build for hashing/sign.
+  function tstudioBuildStudioPayload(boardId, doc, designs, settings) {
+    return {
+      schema: TSTUDIO_STUDIO_SCHEMA,
+      version: 1,
+      created_at_unix_ms: (typeof Date !== 'undefined') ? Date.now() : 0,
+      board: { id: boardId || TSTUDIO_DEFAULT_BOARD, doc: doc },
+      designs: Array.isArray(designs) ? designs : [],
+      settings: tstudioNormalizeSettings(settings)
+    };
+  }
+  // Parameterised designs: any string value containing {{name}} is a fill-on-
+  // instantiate placeholder (e.g. a saved search design with query "{{q}}").
+  // Both pure; smoke-tested.
+  function tstudioFindPlaceholders(obj) {
+    var found = {};
+    (function walk(v) {
+      if (typeof v === 'string') {
+        var re = /\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}/g, m;
+        while ((m = re.exec(v)) !== null) { found[m[1]] = true; }
+      } else if (v && typeof v === 'object') {
+        Object.keys(v).forEach(function (k) { walk(v[k]); });
+      }
+    })(obj);
+    return Object.keys(found);
+  }
+  function tstudioApplyPlaceholders(obj, values) {
+    if (typeof obj === 'string') {
+      return obj.replace(/\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}/g, function (whole, name) {
+        return Object.prototype.hasOwnProperty.call(values || {}, name) ? String(values[name]) : whole;
+      });
+    }
+    if (Array.isArray(obj)) { return obj.map(function (x) { return tstudioApplyPlaceholders(x, values); }); }
+    if (obj && typeof obj === 'object') {
+      var out = {};
+      Object.keys(obj).forEach(function (k) { out[k] = tstudioApplyPlaceholders(obj[k], values); });
+      return out;
+    }
+    return obj;
+  }
+
+  // =======================================================================
+  //  Persistence — daemon-side facts through the gated console fact-add route.
+  //  Reads: /v1/facts/entity/<entity> (full value) + /v1/facts/list (discovery,
+  //  M1 route). Write: operatorGatedCall → consoleFactsAdd (the gated client).
+  // =======================================================================
+  function tstudioBoardEntity(boardId) { return TSTUDIO_BOARD_ENTITY + (boardId || TSTUDIO_DEFAULT_BOARD); }
+  function tstudioDesignEntity(slug) { return TSTUDIO_DESIGN_ENTITY + slug; }
+
+  // Load one board's doc → normalised state, or a fresh empty state. Never throws.
+  function tstudioLoadBoard(boardId) {
+    var api = (typeof window !== 'undefined') ? window.CruxApi : null;
+    if (!api || typeof api.factsEntityByEntity !== 'function') { return Promise.resolve({ doc: tstudioNormalizeDoc({}), found: false }); }
+    return api.factsEntityByEntity(tstudioBoardEntity(boardId))
+      .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, data: d }; }, function () { return { ok: false, data: null }; }); })
+      .then(function (res) {
+        var facts = (res.ok && res.data && Array.isArray(res.data.facts)) ? res.data.facts : [];
+        var latest = tstudioLatestFact(facts, TSTUDIO_DOC_KEY);
+        if (!latest) { return { doc: tstudioNormalizeDoc({}), found: false }; }
+        var parsed = null;
+        try { parsed = JSON.parse(latest.value); } catch (e) { parsed = null; }
+        return { doc: tstudioNormalizeDoc(parsed || {}), found: !!parsed };
+      })
+      .catch(function () { return { doc: tstudioNormalizeDoc({}), found: false }; });
+  }
+  // Discover every board (entity_prefix listing, M1 route). Returns [{id, savedAt}].
+  function tstudioListBoards() {
+    return fetchJSON('/v1/facts/list?entity_prefix=' + encodeURIComponent(TSTUDIO_BOARD_ENTITY) + '&include_superseded=false&limit=200')
+      .then(function (res) {
+        var rows = (res.ok && res.data && Array.isArray(res.data.facts)) ? res.data.facts : [];
+        var out = [];
+        rows.forEach(function (f) {
+          if (f.key !== TSTUDIO_DOC_KEY) { return; }
+          var id = String(f.entity || '').slice(TSTUDIO_BOARD_ENTITY.length);
+          if (id) { out.push({ id: id, savedAt: f.stored_at_unix_ms }); }
+        });
+        return out;
+      })
+      .catch(function () { return []; });
+  }
+  // Discover saved tile designs (entity_prefix listing). Returns [{slug, name, config}].
+  function tstudioListDesigns() {
+    return fetchJSON('/v1/facts/list?entity_prefix=' + encodeURIComponent(TSTUDIO_DESIGN_ENTITY) + '&include_superseded=false&limit=200')
+      .then(function (res) {
+        var rows = (res.ok && res.data && Array.isArray(res.data.facts)) ? res.data.facts : [];
+        // The listing truncates long values; designs are small (one node template)
+        // so the value survives, but re-read the full value defensively if truncated.
+        var byEntity = {};
+        rows.forEach(function (f) { if (f.key === TSTUDIO_DESIGN_KEY) { var cur = byEntity[f.entity]; if (!cur || tstudioNum(f.version, 0) > tstudioNum(cur.version, 0)) { byEntity[f.entity] = f; } } });
+        var out = [];
+        Object.keys(byEntity).forEach(function (ent) {
+          var f = byEntity[ent];
+          var slug = ent.slice(TSTUDIO_DESIGN_ENTITY.length);
+          var def = null;
+          if (!f.value_truncated) { try { def = JSON.parse(f.value); } catch (e) { def = null; } }
+          out.push({
+            slug: slug, name: (def && def.name) ? def.name : slug, config: def && def.config ? def.config : null,
+            truncated: !!f.value_truncated, entity: ent,
+            // Provenance rides on the def value (library install / manual import);
+            // carried through so the library panel can chip the row.
+            installed_from: def ? def.installed_from : null,
+            imported_from: def ? def.imported_from : null
+          });
+        });
+        return out;
+      })
+      .catch(function () { return []; });
+  }
+  // Re-read one design's FULL value (used when the listing truncated it).
+  function tstudioLoadDesign(entity) {
+    var api = (typeof window !== 'undefined') ? window.CruxApi : null;
+    if (!api || typeof api.factsEntityByEntity !== 'function') { return Promise.resolve(null); }
+    return api.factsEntityByEntity(entity)
+      .then(function (r) { return r.json(); })
+      .then(function (d) { var latest = tstudioLatestFact((d && d.facts) || [], TSTUDIO_DESIGN_KEY); if (!latest) { return null; } try { return JSON.parse(latest.value); } catch (e) { return null; } })
+      .catch(function () { return null; });
+  }
+  // Write a fact through the operator-gated console route (the ONLY mutation
+  // path). Resolves {ok, status}. Rejects (caught → {ok:false}) in non-operator
+  // posture — the caller flags the board unsaved rather than fabricating a save.
+  function tstudioWriteFact(entity, key, value) {
+    return operatorGatedCall(function (g) { return g.consoleFactsAdd({ entity: entity, key: key, value: value }); })
+      .then(function (r) { return { ok: r.ok, status: r.status }; })
+      .catch(function (e) { return { ok: false, status: 0, error: String(e && e.message || e) }; });
+  }
+  function tstudioSaveBoard(boardId, state) {
+    return tstudioWriteFact(tstudioBoardEntity(boardId), TSTUDIO_DOC_KEY, tstudioSerializeDoc(state));
+  }
+  // Pure: the design def value. `stamp` (optional) is a MANUAL-import stamp —
+  // catalog installs are written daemon-side and never come through here.
+  function tstudioDesignDef(name, config, stamp) {
+    return studioStampImported({ name: name, config: config }, stamp);
+  }
+  function tstudioSaveDesign(slug, name, config, stamp) {
+    return tstudioWriteFact(tstudioDesignEntity(slug), TSTUDIO_DESIGN_KEY, JSON.stringify(tstudioDesignDef(name, config, stamp)));
+  }
+  function tstudioSlugify(name) {
+    return String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || ('design-' + Date.now().toString(36));
+  }
+
+  // =======================================================================
+  //  The view.
+  // =======================================================================
+  var __tstudioCleanup = null;
+  function renderTileStudio(host, ctx) {
+    ctx = ctx || {};
+    if (__tstudioCleanup) { try { __tstudioCleanup(); } catch (e) { /* ignore */ } __tstudioCleanup = null; }
+    host.textContent = '';
+    var REDUCED = (typeof matchMedia === 'function') && matchMedia('(prefers-reduced-motion: reduce)').matches;
+    var operator = isOperator();
+    var boardId = (ctx.board && String(ctx.board)) || TSTUDIO_DEFAULT_BOARD;
+
+    // ---- state --------------------------------------------------------------
+    var S = {
+      nodes: [], links: [], texts: [],
+      pan: { x: 0, y: 0 }, zoom: 1,
+      nodeEls: {}, selected: null, selectedLink: null,
+      linking: null, designs: [],
+      settings: tstudioDefaultSettings(),
+      saveState: operator ? 'clean' : 'readonly',   // clean | unsaved | saving | saved | error | readonly
+      cleanups: [], intervals: {}, saveTimer: null, refreshTimers: {},
+      // M15 live tiles: per-tile refetch closures + a single shared EventSource.
+      tileLoaders: {}, es: null, esState: 'off', liveDebounce: {}
+    };
+    // Board grid (settings-driven) for interactive snapping; the module-level
+    // tstudioSnap stays at the 20px default (normalise + smoke identity).
+    function vSnap(v) { var g = (S.settings && S.settings.grid) || TSTUDIO_GRID; return Math.round((Number(v) || 0) / g) * g; }
+
+    function trackInterval(id) { S.cleanups.push(function () { if (typeof clearInterval === 'function') { clearInterval(id); } }); return id; }
+    function onDoc(type, fn) { var d = doc(); if (d && d.addEventListener) { d.addEventListener(type, fn); S.cleanups.push(function () { d.removeEventListener(type, fn); }); } }
+
+    // ---- shell scaffolding --------------------------------------------------
+    var root = el('div', { 'class': 'tstudio' });
+    host.appendChild(root);
+
+    var readonlyBanner = null;
+    if (!operator) {
+      readonlyBanner = el('div', { 'class': 'tstudio-banner', role: 'status' }, [
+        el('span', { 'class': 'tstudio-banner-dot' }),
+        el('span', { text: 'Read-only — operator posture required to save. The board loads from the last saved state; local edits are not persisted.' })
+      ]);
+      root.appendChild(readonlyBanner);
+    }
+
+    var toolbar = el('div', { 'class': 'tstudio-toolbar' });
+    root.appendChild(toolbar);
+
+    var main = el('div', { 'class': 'tstudio-main' });
+    root.appendChild(main);
+
+    var library = el('aside', { 'class': 'tstudio-library', 'aria-label': 'Tile library' });
+    main.appendChild(library);
+
+    var stageWrap = el('div', { 'class': 'tstudio-stagewrap' });
+    main.appendChild(stageWrap);
+    var stage = el('div', { 'class': 'tstudio-stage', tabindex: '0', 'aria-label': 'Canvas Studio board' });
+    stageWrap.appendChild(stage);
+    var world = el('div', { 'class': 'tstudio-world' });
+    stage.appendChild(world);
+    var grid = el('div', { 'class': 'tstudio-grid', 'aria-hidden': 'true' });
+    world.appendChild(grid);
+    var linkLayer = svgEl('svg', { 'class': 'tstudio-links' });
+    world.appendChild(linkLayer);
+    var labelLayer = el('div', { 'class': 'tstudio-labels' });
+    world.appendChild(labelLayer);
+
+    var inspector = el('aside', { 'class': 'tstudio-inspector', 'aria-label': 'Tile inspector' });
+    main.appendChild(inspector);
+
+    // ---- world transform ----------------------------------------------------
+    function applyTransform() {
+      world.style.transform = 'translate(' + Math.round(S.pan.x) + 'px,' + Math.round(S.pan.y) + 'px) scale(' + S.zoom.toFixed(4) + ')';
+      var zl = toolbar.querySelector('.tstudio-zoomlab');
+      if (zl) { zl.textContent = Math.round(S.zoom * 100) + '%'; }
+    }
+    function stageRect() { return stage.getBoundingClientRect ? stage.getBoundingClientRect() : { left: 0, top: 0, width: 900, height: 600 }; }
+    function screenToWorld(cx, cy) { var r = stageRect(); return { x: (cx - r.left - S.pan.x) / S.zoom, y: (cy - r.top - S.pan.y) / S.zoom }; }
+    function viewCenter() { var r = stageRect(); return screenToWorld(r.left + r.width / 2, r.top + r.height / 2); }
+    function setZoomAt(nz, cx, cy) {
+      nz = Math.max(0.2, Math.min(3, nz));
+      var r = stageRect(), px = cx - r.left, py = cy - r.top;
+      var wx = (px - S.pan.x) / S.zoom, wy = (py - S.pan.y) / S.zoom;
+      S.zoom = nz; S.pan.x = px - wx * nz; S.pan.y = py - wy * nz;
+      applyTransform();
+    }
+
+    // ---- save orchestration -------------------------------------------------
+    function setSaveState(st) { S.saveState = st; paintSaveState(); }
+    function paintSaveState() {
+      var chip = toolbar.querySelector('.tstudio-savechip');
+      if (!chip) { return; }
+      chip.textContent = '';
+      var map = { clean: ['saved', 'ok'], saved: ['saved', 'ok'], unsaved: ['unsaved', 'warn'], saving: ['saving…', 'busy'], error: ['save failed', 'err'], readonly: ['read-only', 'ro'] };
+      var m = map[S.saveState] || ['—', ''];
+      chip.appendChild(el('span', { 'class': 'tstudio-savedot tstudio-save-' + m[1] }));
+      chip.appendChild(doc().createTextNode(m[0]));
+    }
+    function markDirty() {
+      if (!operator) { return; }   // read-only: local edits never persist
+      setSaveState('unsaved');
+      scheduleSave();
+    }
+    function scheduleSave() {
+      if (!operator) { return; }
+      if (S.saveTimer) { clearTimeout(S.saveTimer); }
+      S.saveTimer = setTimeout(function () { doSave(); }, TSTUDIO_AUTOSAVE_MS);
+    }
+    function doSave() {
+      if (!operator) { return Promise.resolve(); }
+      if (S.saveTimer) { clearTimeout(S.saveTimer); S.saveTimer = null; }
+      setSaveState('saving');
+      return tstudioSaveBoard(boardId, S).then(function (r) {
+        setSaveState(r.ok ? 'saved' : 'error');
+      });
+    }
+
+    // ---- node geometry / links ---------------------------------------------
+    function findNode(id) { for (var i = 0; i < S.nodes.length; i++) { if (S.nodes[i].id === id) { return S.nodes[i]; } } return null; }
+    function findLink(id) { for (var i = 0; i < S.links.length; i++) { if (S.links[i].id === id) { return S.links[i]; } } return null; }
+    function nodeCenter(n) { return { x: n.x + n.w / 2, y: n.y + n.h / 2, w: n.w, h: n.h }; }
+    function edgePoint(c, tx, ty) {
+      var dx = tx - c.x, dy = ty - c.y; if (!dx && !dy) { return { x: c.x, y: c.y }; }
+      var hw = c.w / 2 + 4, hh = c.h / 2 + 4;
+      var s = Math.min(hw / Math.abs(dx || 1e-6), hh / Math.abs(dy || 1e-6));
+      return { x: c.x + dx * s, y: c.y + dy * s };
+    }
+    var __arrowSeq = 0;
+    function drawLinks() {
+      linkLayer.textContent = '';
+      labelLayer.textContent = '';
+      var defs = svgEl('defs');
+      var mid = 'tstudio-arrow-' + (++__arrowSeq);
+      var marker = svgEl('marker', { id: mid, viewBox: '0 0 10 10', refX: '8.5', refY: '5', markerWidth: '7', markerHeight: '7', orient: 'auto-start-reverse' });
+      marker.appendChild(svgEl('path', { d: 'M0 0L10 5L0 10z', 'class': 'tstudio-arrowhead' }));
+      defs.appendChild(marker);
+      linkLayer.appendChild(defs);
+      S.links.forEach(function (l) {
+        var a = findNode(l.from), b = findNode(l.to); if (!a || !b) { return; }
+        var ca = nodeCenter(a), cb = nodeCenter(b);
+        var p1 = edgePoint(ca, cb.x, cb.y), p2 = edgePoint(cb, ca.x, ca.y);
+        var d = 'M' + p1.x + ' ' + p1.y + ' L' + p2.x + ' ' + p2.y;
+        var attrs = { d: d, 'class': 'tstudio-wire' + (S.selectedLink === l.id ? ' is-sel' : ''), 'marker-end': 'url(#' + mid + ')' };
+        if (l.bidir) { attrs['marker-start'] = 'url(#' + mid + ')'; }
+        var hit = svgEl('path', { d: d, 'class': 'tstudio-wire-hit' });
+        var wire = svgEl('path', attrs);
+        function sel(ev) { if (ev.stopPropagation) { ev.stopPropagation(); } S.selectedLink = (S.selectedLink === l.id ? null : l.id); S.selected = null; drawLinks(); paintInspector(); }
+        hit.addEventListener('click', sel); wire.addEventListener('click', sel);
+        linkLayer.appendChild(hit); linkLayer.appendChild(wire);
+        var mx = (p1.x + p2.x) / 2, my = (p1.y + p2.y) / 2;
+        if (l.label || S.selectedLink === l.id) {
+          var lab = el('div', { 'class': 'tstudio-wlabel', text: l.label || '' });
+          lab.style.left = mx + 'px'; lab.style.top = (my - 10) + 'px';
+          labelLayer.appendChild(lab);
+        }
+      });
+    }
+
+    // ---- node rendering -----------------------------------------------------
+    function placeNode(n, eln) { eln.style.left = n.x + 'px'; eln.style.top = n.y + 'px'; eln.style.width = n.w + 'px'; eln.style.height = n.h + 'px'; eln.style.zIndex = String(n.z != null ? n.z : 2); }
+    function buildNode(n) {
+      var kdef = tstudioKind(n.kind);
+      var eln = el('div', { 'class': 'tstudio-node tstudio-kind-' + n.kind, tabindex: '0', 'data-id': n.id });
+      eln.style.setProperty('--ts-accent', kdef.accent);
+      placeNode(n, eln);
+      var accent = el('div', { 'class': 'tstudio-accent' });
+      eln.appendChild(accent);
+      if (TSTUDIO_DROPPED_KINDS[n.kind]) { buildDroppedContent(eln, n); }
+      else if (kdef.content === 'box') { buildBoxContent(eln, n); }
+      else if (kdef.content === 'web') { buildWebContent(eln, n); }
+      else if (kdef.content === 'api') { buildApiContent(eln, n); }
+      else if (kdef.content === 'search') { buildSearchTile(eln, n); }
+      else if (kdef.content === 'corpus' || kdef.content === 'receipts' || kdef.content === 'extensions') { buildDataTile(eln, n, kdef.content); }
+      else { buildStandardContent(eln, n); }
+      // handles
+      var del = el('button', { 'class': 'tstudio-del', type: 'button', title: 'Delete tile', 'aria-label': 'Delete tile' }, ['×']);
+      del.addEventListener('mousedown', function (e) { e.stopPropagation(); });
+      del.addEventListener('click', function (e) { e.stopPropagation(); deleteNode(n.id); });
+      eln.appendChild(del);
+      var lh = el('div', { 'class': 'tstudio-lh', title: 'Drag to another tile to link' });
+      lh.addEventListener('mousedown', function (e) { e.stopPropagation(); e.preventDefault(); startLink(n.id, e); });
+      eln.appendChild(lh);
+      var rz = el('div', { 'class': 'tstudio-rz', title: 'Drag to resize' });
+      attachResize(rz, eln, n);
+      eln.appendChild(rz);
+      attachNodeDrag(eln, n);
+      eln.addEventListener('click', function (e) {
+        if (e.target && e.target.closest && e.target.closest('button, input, select, textarea, a, .tstudio-rz, .tstudio-lh')) { return; }
+        selectNode(n.id);
+      });
+      world.appendChild(eln);
+      S.nodeEls[n.id] = eln;
+      return eln;
+    }
+    function nodeHead(n) {
+      var kdef = tstudioKind(n.kind);
+      var head = el('div', { 'class': 'tstudio-nhead' });
+      var chip = el('span', { 'class': 'tstudio-chip' }); chip.appendChild(tstudioIcon(kdef.icon, 15));
+      head.appendChild(chip);
+      var ttl = el('div', { 'class': 'tstudio-ttl', contenteditable: operator ? 'true' : 'false', spellcheck: 'false' });
+      ttl.textContent = n.label != null ? n.label : '';
+      if (operator) { ttl.addEventListener('input', function () { n.label = ttl.textContent; markDirty(); }); ttl.addEventListener('mousedown', function (e) { e.stopPropagation(); }); }
+      head.appendChild(ttl);
+      return head;
+    }
+    function buildStandardContent(eln, n) {
+      var content = el('div', { 'class': 'tstudio-content' });
+      content.appendChild(nodeHead(n));
+      var sub = el('div', { 'class': 'tstudio-sub', contenteditable: operator ? 'true' : 'false', spellcheck: 'false' });
+      sub.textContent = n.sub != null ? n.sub : '';
+      if (operator) { sub.addEventListener('input', function () { n.sub = sub.textContent; markDirty(); }); sub.addEventListener('mousedown', function (e) { e.stopPropagation(); }); }
+      content.appendChild(sub);
+      var body = el('div', { 'class': 'tstudio-body', contenteditable: operator ? 'true' : 'false', spellcheck: 'false' });
+      body.textContent = n.body != null ? n.body : '';
+      if (operator) { body.addEventListener('input', function () { n.body = body.textContent; markDirty(); }); body.addEventListener('mousedown', function (e) { e.stopPropagation(); }); }
+      content.appendChild(body);
+      eln.appendChild(content);
+    }
+    function buildBoxContent(eln, n) {
+      var content = el('div', { 'class': 'tstudio-content tstudio-boxcontent' });
+      var ttl = el('div', { 'class': 'tstudio-boxlabel', contenteditable: operator ? 'true' : 'false', spellcheck: 'false' });
+      ttl.textContent = n.label != null ? n.label : '';
+      if (operator) { ttl.addEventListener('input', function () { n.label = ttl.textContent; markDirty(); }); ttl.addEventListener('mousedown', function (e) { e.stopPropagation(); }); }
+      content.appendChild(ttl);
+      eln.appendChild(content);
+    }
+    function buildDroppedContent(eln, n) {
+      var content = el('div', { 'class': 'tstudio-content' });
+      content.appendChild(nodeHead(n));
+      content.appendChild(el('div', { 'class': 'tstudio-unsupported', text: TSTUDIO_DROPPED_KINDS[n.kind] || 'This tile kind is not supported in the console.' }));
+      eln.appendChild(content);
+    }
+    function buildWebContent(eln, n) {
+      var content = el('div', { 'class': 'tstudio-content tstudio-webcontent' });
+      content.appendChild(nodeHead(n));
+      var holder = el('div', { 'class': 'tstudio-webholder' });
+      if (tstudioWebSrcOk(n.url)) {
+        var fr = el('iframe', {
+          src: n.url,
+          referrerpolicy: 'no-referrer',
+          // Same sandbox posture as the source engine (advisory for same-origin
+          // daemon pages); no allow-top-navigation / allow-modals.
+          sandbox: 'allow-scripts allow-same-origin allow-forms allow-popups allow-pointer-lock',
+          title: 'Embedded ' + (n.url || '')
+        });
+        holder.appendChild(fr);
+      } else if (n.url) {
+        holder.appendChild(el('div', { 'class': 'tstudio-unsupported', text: 'External embeds are disabled in the console — ingest the data and bind an API tile instead. Only same-origin paths (e.g. /console) are allowed.' }));
+      } else {
+        holder.appendChild(el('div', { 'class': 'tstudio-placeholder', text: 'Web embed — set a same-origin path (e.g. /console) in the inspector.' }));
+      }
+      content.appendChild(holder);
+      eln.appendChild(content);
+    }
+
+    // ---- API tile -----------------------------------------------------------
+    function buildApiContent(eln, n) {
+      var content = el('div', { 'class': 'tstudio-content tstudio-apicontent' });
+      content.appendChild(nodeHead(n));
+      var body = el('div', { 'class': 'tstudio-apibody' });
+      content.appendChild(body);
+      var foot = el('div', { 'class': 'tstudio-apifoot' });
+      content.appendChild(foot);
+      eln.appendChild(content);
+      S.tileLoaders[n.id] = function () { loadApiTile(n, body, foot); };
+      S.tileLoaders[n.id]();
+      wireTileRefresh(n, n.api && n.api.refresh);
+    }
+
+    // ---- refresh wiring (interval | live | off) — one path for every tile --
+    // 'live' registers the tile with the shared EventSource and refetches ONLY
+    // on the event types it depends on; a numeric value polls; 'off' is manual.
+    function wireTileRefresh(n, refreshVal) {
+      if (S.refreshTimers[n.id]) { clearInterval(S.refreshTimers[n.id]); delete S.refreshTimers[n.id]; }
+      var v = refreshVal || 'off';
+      if (v === 'live') { ensureLive(); return; }
+      if (v !== 'off' && isFinite(Number(v)) && typeof setInterval === 'function') {
+        S.refreshTimers[n.id] = trackInterval(setInterval(function () {
+          if (!S.nodeEls[n.id] || !S.tileLoaders[n.id]) { return; }
+          S.tileLoaders[n.id]();
+        }, Math.max(30000, Number(v))));
+      }
+    }
+    function nodeRefresh(n) { return (n.api && n.api.refresh) || (n.search && n.search.refresh) || 'off'; }
+
+    // ---- live tiles: one shared EventSource, debounced targeted refetch ----
+    function paintLiveChip() {
+      var chip = toolbar.querySelector('.tstudio-livechip');
+      if (!chip) { return; }
+      chip.textContent = '';
+      var map = { off: ['live off', ''], connecting: ['connecting…', 'busy'], live: ['live', 'ok'], error: ['live lost', 'err'], unsupported: ['live n/a', 'ro'] };
+      var m = map[S.esState] || map.off;
+      chip.appendChild(el('span', { 'class': 'tstudio-livedot tstudio-save-' + (m[1] || 'ro') }));
+      chip.appendChild(doc().createTextNode(m[0]));
+    }
+    function setEsState(st) { S.esState = st; paintLiveChip(); }
+    function anyLive() { return S.nodes.some(function (n) { return nodeRefresh(n) === 'live'; }); }
+    function ensureLive() {
+      if (!anyLive()) { return; }
+      if (S.es) { return; }
+      if (typeof EventSource === 'undefined') { setEsState('unsupported'); return; }
+      setEsState('connecting');
+      var es;
+      try { es = new EventSource('/v1/events/stream'); }
+      catch (e) { setEsState('error'); return; }
+      S.es = es;
+      S.cleanups.push(function () { try { es.close(); } catch (e) { /* ignore */ } });
+      es.onopen = function () { setEsState('live'); };
+      es.onerror = function () { if (S.esState !== 'live') { setEsState('error'); } };
+      ['fact.stored', 'fact.deleted', 'session.stored', 'session.archived', 'activity.appended'].forEach(function (type) {
+        es.addEventListener(type, function () { onLiveEvent(type); });
+      });
+    }
+    function onLiveEvent(type) {
+      if (S.esState === 'connecting' || S.esState === 'error') { setEsState('live'); }
+      S.nodes.forEach(function (n) {
+        if (nodeRefresh(n) !== 'live') { return; }
+        if (tstudioTileEvents(n).indexOf(type) < 0) { return; }
+        if (!S.nodeEls[n.id] || !S.tileLoaders[n.id]) { return; }
+        // Debounce per-tile so a burst of events draws each tile once.
+        if (S.liveDebounce[n.id]) { clearTimeout(S.liveDebounce[n.id]); }
+        S.liveDebounce[n.id] = setTimeout(function () {
+          delete S.liveDebounce[n.id];
+          if (S.nodeEls[n.id] && S.tileLoaders[n.id]) { S.tileLoaders[n.id](); }
+        }, 400);
+      });
+    }
+
+    // ---- search tile (curated read-POST client) ----------------------------
+    function buildSearchTile(eln, n) {
+      var content = el('div', { 'class': 'tstudio-content tstudio-apicontent' });
+      content.appendChild(nodeHead(n));
+      var body = el('div', { 'class': 'tstudio-apibody' });
+      content.appendChild(body);
+      var foot = el('div', { 'class': 'tstudio-apifoot' });
+      content.appendChild(foot);
+      eln.appendChild(content);
+      S.tileLoaders[n.id] = function () { loadSearchTile(n, body, foot); };
+      S.tileLoaders[n.id]();
+      wireTileRefresh(n, n.search && n.search.refresh);
+    }
+    function loadSearchTile(n, body, foot) {
+      var cfg = n.search || {};
+      body.textContent = ''; foot.textContent = '';
+      if (!cfg.query) { body.appendChild(el('div', { 'class': 'tstudio-placeholder', text: 'Text search — set a query in the inspector.' })); return; }
+      var rp = (typeof window !== 'undefined') ? window.CruxApiRead : null;
+      if (!rp || typeof rp.queryTextSearch !== 'function') { body.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'read-post client unavailable' })); return; }
+      body.appendChild(el('div', { 'class': 'tstudio-loading', text: 'searching…' }));
+      var req = { tenant_id: cfg.tenant || 'default', query: cfg.query };
+      if (cfg.tokenBudget) { req.token_budget = Number(cfg.tokenBudget) || undefined; }
+      rp.queryTextSearch(req).then(function (r) {
+        return r.json().then(function (d) { return { ok: r.ok, data: d }; }, function () { return { ok: false, data: null }; });
+      }).then(function (res) {
+        body.textContent = ''; foot.textContent = '';
+        if (!res.ok) { body.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'search failed' })); return; }
+        body.appendChild(tstudioRenderSearch(res.data, cfg, { operator: operator }));
+        foot.appendChild(el('span', { 'class': 'tstudio-apiroute', text: cfg.route }));
+        foot.appendChild(el('span', { 'class': 'tstudio-apipreset', text: 'search' }));
+      }).catch(function () { body.textContent = ''; body.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'search error' })); });
+    }
+
+    // ---- data tiles (corpus | receipts | extensions) — fixed GET routes ----
+    function buildDataTile(eln, n, kind) {
+      var content = el('div', { 'class': 'tstudio-content tstudio-apicontent' });
+      content.appendChild(nodeHead(n));
+      var body = el('div', { 'class': 'tstudio-apibody' });
+      content.appendChild(body);
+      var foot = el('div', { 'class': 'tstudio-apifoot' });
+      content.appendChild(foot);
+      eln.appendChild(content);
+      S.tileLoaders[n.id] = function () { loadDataTile(n, kind, body, foot); };
+      S.tileLoaders[n.id]();
+      wireTileRefresh(n, n.api && n.api.refresh);
+    }
+    function loadDataTile(n, kind, body, foot) {
+      var cfg = n.api || {};
+      var url = cfg.route || TSTUDIO_FIXED_ROUTE[kind];
+      if (kind === 'receipts') { url += '?limit=' + encodeURIComponent(String(Number(cfg.limit) || 7)); }
+      body.textContent = ''; foot.textContent = '';
+      body.appendChild(el('div', { 'class': 'tstudio-loading', text: 'loading…' }));
+      fetchJSON(url).then(function (res) {
+        body.textContent = ''; foot.textContent = '';
+        if (!res.ok) { body.appendChild(el('div', { 'class': 'tstudio-apierr', text: (res.status === 0 ? 'unreachable' : ('HTTP ' + res.status)) })); return; }
+        if (kind === 'corpus') { body.appendChild(tstudioRenderCorpus(res.data)); }
+        else if (kind === 'receipts') { body.appendChild(tstudioRenderReceipts(res.data)); }
+        else if (kind === 'extensions') { body.appendChild(tstudioRenderExtensions(res.data, { operator: operator })); }
+        foot.appendChild(el('span', { 'class': 'tstudio-apiroute', text: cfg.route || url }));
+      }).catch(function () { body.textContent = ''; body.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'load error' })); });
+    }
+    function apiTileUrl(cfg) {
+      var q = {};
+      String(cfg.params || '').split(/[\n,]+/).forEach(function (line) {
+        var kv = line.split('='); var k = (kv[0] || '').trim(); if (!k) { return; }
+        q[k] = (kv.slice(1).join('=') || '').trim();
+      });
+      if (TSTUDIO_BUDGET_ROUTES[cfg.route] && cfg.tokenBudget) { q.token_budget = String(cfg.tokenBudget).trim(); }
+      var qs = Object.keys(q).map(function (k) { return encodeURIComponent(k) + '=' + encodeURIComponent(q[k]); }).join('&');
+      return cfg.route + (qs ? ('?' + qs) : '');
+    }
+    function loadApiTile(n, body, foot) {
+      var cfg = n.api || {};
+      body.textContent = ''; foot.textContent = '';
+      if (!cfg.route) { body.appendChild(el('div', { 'class': 'tstudio-placeholder', text: 'API tile — pick a route in the inspector.' })); return; }
+      if (!tstudioApiRouteKnown(cfg.route)) { body.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'Unknown route "' + cfg.route + '" — not in the generated client allowlist.' })); return; }
+      body.appendChild(el('div', { 'class': 'tstudio-loading', text: 'loading…' }));
+      fetchJSON(apiTileUrl(cfg)).then(function (res) {
+        body.textContent = ''; foot.textContent = '';
+        if (!res.ok) {
+          body.appendChild(el('div', { 'class': 'tstudio-apierr', text: (res.status === 0 ? 'unreachable' : ('HTTP ' + res.status)) }));
+          foot.appendChild(el('span', { 'class': 'tstudio-apiroute', text: cfg.route }));
+          return;
+        }
+        try { renderApiPreset(cfg, res.data, body); }
+        catch (e) { body.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'render error: ' + String(e && e.message || e) })); }
+        foot.appendChild(el('span', { 'class': 'tstudio-apiroute', text: cfg.route }));
+        foot.appendChild(el('span', { 'class': 'tstudio-apipreset', text: cfg.preset }));
+      });
+    }
+    function fmtNum(v) {
+      if (typeof v === 'number' && isFinite(v)) { try { return v.toLocaleString('en-US'); } catch (e) { return String(v); } }
+      return v == null ? '—' : String(v);
+    }
+    function renderApiPreset(cfg, data, body) {
+      var val = tstudioJsonPath(data, cfg.jsonPath);
+      if (cfg.preset === 'stat') {
+        body.appendChild(el('div', { 'class': 'tstudio-stat' }, [
+          el('div', { 'class': 'tstudio-stat-v', text: fmtNum(val) }),
+          el('div', { 'class': 'tstudio-stat-k', text: cfg.jsonPath || cfg.route })
+        ]));
+      } else if (cfg.preset === 'badge') {
+        body.appendChild(el('div', { 'class': 'tstudio-badgewrap' }, [el('span', { 'class': 'tstudio-badge', text: fmtNum(val) })]));
+      } else if (cfg.preset === 'gauge') {
+        var num = Number(val);
+        var max = Number(cfg.max);
+        if (!isFinite(max) || max === 0) { var mv = tstudioJsonPath(data, cfg.max); max = Number(mv); }
+        var ratio = (isFinite(num) && isFinite(max) && max > 0) ? Math.max(0, Math.min(1, num / max)) : 0;
+        var g = el('div', { 'class': 'tstudio-gauge' });
+        var track = el('div', { 'class': 'tstudio-gauge-track' });
+        var fill = el('div', { 'class': 'tstudio-gauge-fill' }); fill.style.width = (ratio * 100).toFixed(1) + '%';
+        track.appendChild(fill); g.appendChild(track);
+        g.appendChild(el('div', { 'class': 'tstudio-gauge-lab', text: fmtNum(num) + ' / ' + (isFinite(max) ? fmtNum(max) : '—') }));
+        body.appendChild(g);
+      } else if (cfg.preset === 'sparkline') {
+        var arr = Array.isArray(val) ? val : [];
+        var series = arr.map(function (row) {
+          if (typeof row === 'number') { return row; }
+          if (row && typeof row === 'object' && cfg.fields) { return Number(tstudioJsonPath(row, String(cfg.fields).split(',')[0].trim())); }
+          return Number(row);
+        }).filter(function (x) { return isFinite(x); });
+        var chart = areaChart(series, { spark: true });
+        if (chart) {
+          body.appendChild(el('div', { 'class': 'tstudio-spark' }, [chart, el('span', { 'class': 'tstudio-spark-v', text: fmtNum(series[series.length - 1]) })]));
+        } else { body.appendChild(el('div', { 'class': 'tstudio-placeholder', text: 'not enough numeric points to plot' })); }
+      } else if (cfg.preset === 'list') {
+        var rows = Array.isArray(val) ? val : [];
+        var fields = String(cfg.fields || '').split(',').map(function (f) { return f.trim(); }).filter(Boolean);
+        var list = el('div', { 'class': 'tstudio-list' });
+        rows.slice(0, 8).forEach(function (row) {
+          var line = el('div', { 'class': 'tstudio-list-row' });
+          if (fields.length) {
+            fields.forEach(function (f) { line.appendChild(el('span', { 'class': 'tstudio-list-cell', text: fmtNum(tstudioJsonPath(row, f)) })); });
+          } else {
+            line.appendChild(el('span', { 'class': 'tstudio-list-cell', text: (typeof row === 'object' ? JSON.stringify(row).slice(0, 80) : fmtNum(row)) }));
+          }
+          list.appendChild(line);
+        });
+        if (!rows.length) { list.appendChild(el('div', { 'class': 'tstudio-placeholder', text: 'no rows at "' + (cfg.jsonPath || '') + '"' })); }
+        body.appendChild(list);
+      }
+    }
+
+    // ---- drag / resize / linking -------------------------------------------
+    function attachNodeDrag(eln, n) {
+      eln.addEventListener('mousedown', function (e) {
+        if (!operator) { return; }
+        if (e.button !== 0) { return; }
+        var t = e.target;
+        if (t && (t.isContentEditable || /INPUT|SELECT|TEXTAREA|BUTTON|IFRAME/.test(t.tagName) || (t.classList && (t.classList.contains('tstudio-rz') || t.classList.contains('tstudio-lh') || t.classList.contains('tstudio-del'))))) { return; }
+        var sx = e.clientX, sy = e.clientY, ox = n.x, oy = n.y, moved = false;
+        eln.classList.add('is-dragging');
+        function mv(ev) {
+          var dx = (ev.clientX - sx) / S.zoom, dy = (ev.clientY - sy) / S.zoom;
+          if (Math.abs(ev.clientX - sx) + Math.abs(ev.clientY - sy) > 3) { moved = true; }
+          n.x = Math.max(0, ox + dx); n.y = Math.max(0, oy + dy);
+          eln.style.left = n.x + 'px'; eln.style.top = n.y + 'px';
+          drawLinks();
+        }
+        function up() {
+          doc().removeEventListener('mousemove', mv); doc().removeEventListener('mouseup', up);
+          eln.classList.remove('is-dragging');
+          if (moved) { n.x = vSnap(n.x); n.y = vSnap(n.y); eln.style.left = n.x + 'px'; eln.style.top = n.y + 'px'; drawLinks(); markDirty(); }
+        }
+        doc().addEventListener('mousemove', mv); doc().addEventListener('mouseup', up);
+      });
+    }
+    function attachResize(rz, eln, n) {
+      rz.addEventListener('mousedown', function (e) {
+        if (!operator) { return; }
+        e.stopPropagation(); e.preventDefault();
+        var sx = e.clientX, sy = e.clientY, sw = n.w, sh = n.h;
+        function mv(ev) {
+          n.w = Math.max(TSTUDIO_MIN_W, sw + (ev.clientX - sx) / S.zoom);
+          n.h = Math.max(TSTUDIO_MIN_H, sh + (ev.clientY - sy) / S.zoom);
+          eln.style.width = n.w + 'px'; eln.style.height = n.h + 'px';
+          drawLinks();
+        }
+        function up() {
+          doc().removeEventListener('mousemove', mv); doc().removeEventListener('mouseup', up);
+          n.w = Math.max(TSTUDIO_MIN_W, vSnap(n.w)); n.h = Math.max(TSTUDIO_MIN_H, vSnap(n.h));
+          eln.style.width = n.w + 'px'; eln.style.height = n.h + 'px';
+          drawLinks(); markDirty();
+        }
+        doc().addEventListener('mousemove', mv); doc().addEventListener('mouseup', up);
+      });
+    }
+    function startLink(fromId, e) {
+      if (!operator) { return; }
+      var tempLine = svgEl('line', { 'class': 'tstudio-templine' });
+      linkLayer.appendChild(tempLine);
+      var from = findNode(fromId); var c = nodeCenter(from);
+      var hover = null;
+      function mv(ev) {
+        var w = screenToWorld(ev.clientX, ev.clientY);
+        tempLine.setAttribute('x1', c.x); tempLine.setAttribute('y1', c.y);
+        tempLine.setAttribute('x2', w.x); tempLine.setAttribute('y2', w.y);
+        var over = doc().elementFromPoint ? doc().elementFromPoint(ev.clientX, ev.clientY) : null;
+        var nd = over && over.closest ? over.closest('.tstudio-node') : null;
+        hover = (nd && nd.getAttribute('data-id') !== fromId) ? nd.getAttribute('data-id') : null;
+      }
+      function up() {
+        doc().removeEventListener('mousemove', mv); doc().removeEventListener('mouseup', up);
+        if (tempLine.parentNode) { tempLine.parentNode.removeChild(tempLine); }
+        if (hover) { addLink(fromId, hover); }
+      }
+      doc().addEventListener('mousemove', mv); doc().addEventListener('mouseup', up);
+    }
+    function addLink(from, to) {
+      if (from === to) { return; }
+      var dup = S.links.some(function (l) { return (l.from === from && l.to === to) || (l.from === to && l.to === from); });
+      if (dup) { return; }
+      S.links.push({ id: tstudioUid('l'), from: from, to: to, label: '', bidir: false });
+      drawLinks(); markDirty();
+    }
+
+    // ---- node lifecycle -----------------------------------------------------
+    function refreshNode(id) {
+      var n = findNode(id); if (!n) { return; }
+      if (S.refreshTimers[id]) { clearInterval(S.refreshTimers[id]); delete S.refreshTimers[id]; }
+      if (S.nodeEls[id] && S.nodeEls[id].parentNode) { S.nodeEls[id].parentNode.removeChild(S.nodeEls[id]); }
+      delete S.nodeEls[id];
+      buildNode(n);
+      applySelectionUI();
+      drawLinks();
+    }
+    function deleteNode(id) {
+      S.nodes = S.nodes.filter(function (n) { return n.id !== id; });
+      S.links = S.links.filter(function (l) { return l.from !== id && l.to !== id; });
+      if (S.refreshTimers[id]) { clearInterval(S.refreshTimers[id]); delete S.refreshTimers[id]; }
+      if (S.nodeEls[id] && S.nodeEls[id].parentNode) { S.nodeEls[id].parentNode.removeChild(S.nodeEls[id]); }
+      delete S.nodeEls[id];
+      if (S.selected === id) { S.selected = null; paintInspector(); }
+      drawLinks(); markDirty();
+    }
+    function allZ() { return S.nodes.map(function (n) { return n.z != null ? n.z : 2; }); }
+    function bringFront(id) { var n = findNode(id); if (!n) { return; } n.z = Math.max.apply(null, allZ().concat([2])) + 1; if (S.nodeEls[id]) { S.nodeEls[id].style.zIndex = String(n.z); } markDirty(); }
+    function sendBack(id) { var n = findNode(id); if (!n) { return; } n.z = Math.min.apply(null, allZ().concat([2])) - 1; if (S.nodeEls[id]) { S.nodeEls[id].style.zIndex = String(n.z); } markDirty(); }
+    function addNode(kind, cfgOverride) {
+      var vc = viewCenter();
+      var kdef = TSTUDIO_KINDS[kind] ? kind : 'note';
+      var n = { id: tstudioUid(), kind: kdef, x: tstudioSnap(vc.x - 110), y: tstudioSnap(vc.y - 70), w: 220, h: 140, z: Math.max.apply(null, allZ().concat([2])) + 1 };
+      if (kdef === 'box') { n.w = 240; n.h = 150; n.label = ''; }
+      else if (kdef === 'web') { n.w = 380; n.h = 260; n.url = ''; n.label = 'Web embed'; }
+      else if (kdef === 'api') { n.w = 240; n.h = 150; n.label = 'API tile'; n.api = { route: '', params: '', jsonPath: '', preset: 'stat', fields: '', max: '', refresh: 'off', tokenBudget: '' }; }
+      else if (kdef === 'search') { n.w = 480; n.h = 240; n.label = 'Text search'; n.search = { route: TSTUDIO_FIXED_ROUTE.search, query: '', tenant: 'default', tokenBudget: '800', refresh: 'off' }; }
+      else if (kdef === 'corpus') { n.w = 240; n.h = 170; n.label = 'Corpus'; n.api = { route: TSTUDIO_FIXED_ROUTE.corpus, refresh: 'off' }; }
+      else if (kdef === 'receipts') { n.w = 340; n.h = 220; n.label = 'Receipts'; n.api = { route: TSTUDIO_FIXED_ROUTE.receipts, refresh: 'off', limit: '7' }; }
+      else if (kdef === 'extensions') { n.w = 340; n.h = 220; n.label = 'Extensions'; n.api = { route: TSTUDIO_FIXED_ROUTE.extensions, refresh: 'off' }; }
+      else { n.label = tstudioKind(kdef).label; n.sub = ''; n.body = ''; }
+      if (cfgOverride && typeof cfgOverride === 'object') {
+        Object.keys(cfgOverride).forEach(function (k) { if (k !== 'id' && k !== 'x' && k !== 'y' && k !== 'z') { n[k] = cfgOverride[k]; } });
+      }
+      var clean = tstudioNormalizeDoc({ nodes: [n] }).nodes[0];
+      clean.x = n.x; clean.y = n.y; clean.z = n.z;
+      S.nodes.push(clean);
+      buildNode(clean);
+      selectNode(clean.id);
+      markDirty();
+      return clean;
+    }
+
+    // ---- selection + inspector ---------------------------------------------
+    function selectNode(id) { S.selected = id; S.selectedLink = null; applySelectionUI(); drawLinks(); paintInspector(); }
+    function applySelectionUI() { Object.keys(S.nodeEls).forEach(function (id) { S.nodeEls[id].classList.toggle('is-selected', id === S.selected); }); }
+    function inspectorField(labelText, controlEl) {
+      return el('label', { 'class': 'tstudio-field' }, [el('span', { 'class': 'tstudio-field-lab', text: labelText }), controlEl]);
+    }
+    function paintInspector() {
+      inspector.textContent = '';
+      if (S.selectedLink) { paintLinkInspector(); return; }
+      var n = S.selected ? findNode(S.selected) : null;
+      if (!n) {
+        inspector.appendChild(el('div', { 'class': 'tstudio-insp-empty' }, [
+          el('h3', { 'class': 'tstudio-insp-h', text: 'Inspector' }),
+          el('p', { 'class': 'tstudio-insp-hint', text: 'Select a tile to edit it. Add tiles from the library on the left.' })
+        ]));
+        return;
+      }
+      var head = el('div', { 'class': 'tstudio-insp-head' });
+      head.appendChild(el('h3', { 'class': 'tstudio-insp-h', text: tstudioKind(n.kind).label }));
+      inspector.appendChild(head);
+      if (!operator) { inspector.appendChild(el('p', { 'class': 'tstudio-insp-hint', text: 'Read-only — operator posture required to edit.' })); }
+
+      if (n.kind === 'web') { paintWebInspector(n); }
+      else if (n.kind === 'api') { paintApiInspector(n); }
+      else if (n.kind === 'search') { paintSearchInspector(n); }
+      else if (n.kind === 'corpus' || n.kind === 'receipts' || n.kind === 'extensions') { paintDataInspector(n); }
+
+      // actions (all kinds)
+      var actions = el('div', { 'class': 'tstudio-insp-actions' });
+      var bFront = el('button', { 'class': 'tstudio-btn', type: 'button' }, ['Bring front']);
+      bFront.addEventListener('click', function () { bringFront(n.id); });
+      var bBack = el('button', { 'class': 'tstudio-btn', type: 'button' }, ['Send back']);
+      bBack.addEventListener('click', function () { sendBack(n.id); });
+      var bSave = el('button', { 'class': 'tstudio-btn', type: 'button', title: 'Save this configured tile as a reusable design in the library' }, ['Save as design']);
+      bSave.addEventListener('click', function () { saveAsDesign(n); });
+      var bDel = el('button', { 'class': 'tstudio-btn tstudio-btn-danger', type: 'button' }, ['Delete tile']);
+      bDel.addEventListener('click', function () { deleteNode(n.id); });
+      [bFront, bBack, bSave, bDel].forEach(function (b) { if (!operator) { b.disabled = true; } actions.appendChild(b); });
+      inspector.appendChild(actions);
+    }
+    function paintWebInspector(n) {
+      var input = el('input', { 'class': 'tstudio-input', type: 'text', value: n.url || '', placeholder: '/console', 'aria-label': 'Same-origin path' });
+      if (!operator) { input.disabled = true; }
+      var note = el('p', { 'class': 'tstudio-insp-note' });
+      function sync() { note.textContent = tstudioWebSrcOk(input.value) ? 'Same-origin path — will embed.' : (input.value ? 'Rejected: external embeds are disabled. Use a /path.' : 'Enter a same-origin path (starts with /).'); note.classList.toggle('is-err', !!input.value && !tstudioWebSrcOk(input.value)); }
+      input.addEventListener('input', function () { sync(); });
+      input.addEventListener('change', function () { n.url = tstudioWebSrcOk(input.value) ? input.value.trim() : ''; refreshNode(n.id); markDirty(); });
+      sync();
+      inspector.appendChild(inspectorField('Same-origin path', input));
+      inspector.appendChild(note);
+    }
+    function paintApiInspector(n) {
+      var cfg = n.api = n.api || { route: '', params: '', jsonPath: '', preset: 'stat', fields: '', max: '', refresh: 'off', tokenBudget: '' };
+      // route picker (datalist over known routes)
+      var listId = 'tstudio-routes-' + n.id;
+      var dl = el('datalist', { id: listId });
+      tstudioKnownRoutes().forEach(function (r) { dl.appendChild(el('option', { value: r })); });
+      var route = el('input', { 'class': 'tstudio-input', type: 'text', value: cfg.route || '', list: listId, placeholder: '/v1/…', 'aria-label': 'Daemon GET route' });
+      var routeNote = el('p', { 'class': 'tstudio-insp-note' });
+      function syncRoute() {
+        var ok = tstudioApiRouteKnown(route.value);
+        routeNote.textContent = route.value ? (ok ? 'Known route.' : 'Unknown route — not in the client allowlist.') : ('Pick from ' + tstudioKnownRoutes().length + ' known routes.');
+        routeNote.classList.toggle('is-err', !!route.value && !ok);
+      }
+      route.addEventListener('input', syncRoute);
+      var rebuild = function () { cfg.route = route.value.trim(); refreshNode(n.id); rebuildInspectorApi(n); markDirty(); };
+      route.addEventListener('change', rebuild);
+      if (!operator) { route.disabled = true; }
+      inspector.appendChild(inspectorField('Route', route));
+      inspector.appendChild(el('div', { 'class': 'tstudio-hidden' }, [dl]));
+      inspector.appendChild(routeNote);
+      syncRoute();
+      // container the preset-conditional controls rebuild into
+      var apiBox = el('div', { 'class': 'tstudio-apiconf', id: 'tstudio-apiconf-' + n.id });
+      inspector.appendChild(apiBox);
+      buildApiConf(n, apiBox);
+    }
+    function rebuildInspectorApi(n) { var box = inspector.querySelector('#tstudio-apiconf-' + n.id); if (box) { buildApiConf(n, box); } }
+    function buildApiConf(n, box) {
+      box.textContent = '';
+      var cfg = n.api;
+      function mkInput(key, label, ph) {
+        var inp = el('input', { 'class': 'tstudio-input', type: 'text', value: cfg[key] || '', placeholder: ph || '' });
+        if (!operator) { inp.disabled = true; }
+        inp.addEventListener('change', function () { cfg[key] = inp.value; refreshNode(n.id); markDirty(); });
+        box.appendChild(inspectorField(label, inp));
+      }
+      // preset select
+      var preset = el('select', { 'class': 'tstudio-select' });
+      TSTUDIO_PRESETS.forEach(function (p) { var o = el('option', { value: p }, [p]); if (cfg.preset === p) { o.setAttribute('selected', 'selected'); } preset.appendChild(o); });
+      if (!operator) { preset.disabled = true; }
+      preset.addEventListener('change', function () { cfg.preset = preset.value; buildApiConf(n, box); refreshNode(n.id); markDirty(); });
+      box.appendChild(inspectorField('Preset', preset));
+      mkInput('params', 'Query params', 'key=value, one per line');
+      mkInput('jsonPath', 'JSON path', 'e.g. total_visible or facts[0].value');
+      if (cfg.preset === 'list' || cfg.preset === 'sparkline') { mkInput('fields', cfg.preset === 'list' ? 'Row fields (comma)' : 'Numeric field', cfg.preset === 'list' ? 'entity,value' : 'value'); }
+      if (cfg.preset === 'gauge') { mkInput('max', 'Max (number or path)', 'e.g. 100 or total'); }
+      if (TSTUDIO_BUDGET_ROUTES[cfg.route]) { mkInput('tokenBudget', 'token_budget (required)', '500'); }
+      // refresh interval
+      var refresh = el('select', { 'class': 'tstudio-select' });
+      TSTUDIO_REFRESH.forEach(function (r) { var o = el('option', { value: r[0] }, [r[1]]); if ((cfg.refresh || 'off') === r[0]) { o.setAttribute('selected', 'selected'); } refresh.appendChild(o); });
+      if (!operator) { refresh.disabled = true; }
+      refresh.addEventListener('change', function () { cfg.refresh = refresh.value; refreshNode(n.id); markDirty(); });
+      box.appendChild(inspectorField('Auto-refresh', refresh));
+    }
+    // Shared refresh select (includes 'live') for any bound tile.
+    function refreshField(n, cfg) {
+      var refresh = el('select', { 'class': 'tstudio-select' });
+      TSTUDIO_REFRESH.forEach(function (r) { var o = el('option', { value: r[0] }, [r[1]]); if ((cfg.refresh || 'off') === r[0]) { o.setAttribute('selected', 'selected'); } refresh.appendChild(o); });
+      if (!operator) { refresh.disabled = true; }
+      refresh.addEventListener('change', function () { cfg.refresh = refresh.value; refreshNode(n.id); markDirty(); });
+      return inspectorField('Auto-refresh', refresh);
+    }
+    function paintSearchInspector(n) {
+      var cfg = n.search = n.search || { route: TSTUDIO_FIXED_ROUTE.search, query: '', tenant: 'default', tokenBudget: '800', refresh: 'off' };
+      function mk(key, label, ph) {
+        var inp = el('input', { 'class': 'tstudio-input', type: 'text', value: cfg[key] || '', placeholder: ph || '' });
+        if (!operator) { inp.disabled = true; }
+        inp.addEventListener('change', function () { cfg[key] = inp.value; refreshNode(n.id); markDirty(); });
+        inspector.appendChild(inspectorField(label, inp));
+      }
+      mk('query', 'Query', 'execplan console');
+      mk('tenant', 'Tenant', 'default');
+      mk('tokenBudget', 'token_budget (required)', '800');
+      inspector.appendChild(el('p', { 'class': 'tstudio-insp-note', text: 'Rides the curated read-POST client (/v1/query/text-search). Below-0.5 coverage is shown honestly.' }));
+      inspector.appendChild(refreshField(n, cfg));
+    }
+    function paintDataInspector(n) {
+      var cfg = n.api = n.api || { route: TSTUDIO_FIXED_ROUTE[n.kind], refresh: 'off' };
+      inspector.appendChild(inspectorField('Route (fixed)', el('div', { 'class': 'tstudio-fixedroute', text: cfg.route })));
+      if (n.kind === 'receipts') {
+        var lim = el('input', { 'class': 'tstudio-input', type: 'text', value: cfg.limit || '7', placeholder: '7' });
+        if (!operator) { lim.disabled = true; }
+        lim.addEventListener('change', function () { cfg.limit = lim.value; refreshNode(n.id); markDirty(); });
+        inspector.appendChild(inspectorField('Rows', lim));
+      }
+      if (n.kind === 'extensions') {
+        inspector.appendChild(el('p', { 'class': 'tstudio-insp-note', text: 'Installed extensions + capability chips + grant/trust state. A declared data endpoint renders a capability-gated Invoke (extension_outbound).' }));
+      }
+      inspector.appendChild(refreshField(n, cfg));
+    }
+
+    function paintLinkInspector() {
+      var l = findLink(S.selectedLink);
+      if (!l) { S.selectedLink = null; paintInspector(); return; }
+      inspector.appendChild(el('h3', { 'class': 'tstudio-insp-h', text: 'Link' }));
+      var lab = el('input', { 'class': 'tstudio-input', type: 'text', value: l.label || '', placeholder: 'label', 'aria-label': 'Link label' });
+      if (!operator) { lab.disabled = true; }
+      lab.addEventListener('change', function () { l.label = lab.value; drawLinks(); markDirty(); });
+      inspector.appendChild(inspectorField('Label', lab));
+      var actions = el('div', { 'class': 'tstudio-insp-actions' });
+      var bDir = el('button', { 'class': 'tstudio-btn', type: 'button' }, [l.bidir ? 'Make one-way' : 'Make two-way']);
+      bDir.addEventListener('click', function () { l.bidir = !l.bidir; drawLinks(); paintInspector(); markDirty(); });
+      var bDel = el('button', { 'class': 'tstudio-btn tstudio-btn-danger', type: 'button' }, ['Delete link']);
+      bDel.addEventListener('click', function () { S.links = S.links.filter(function (x) { return x.id !== l.id; }); S.selectedLink = null; drawLinks(); paintInspector(); markDirty(); });
+      [bDir, bDel].forEach(function (b) { if (!operator) { b.disabled = true; } actions.appendChild(b); });
+      inspector.appendChild(actions);
+    }
+
+    // ---- library ------------------------------------------------------------
+    function nodeTemplate(n) {
+      var t = { kind: n.kind, w: n.w, h: n.h };
+      if (n.label != null) { t.label = n.label; }
+      if (n.sub != null) { t.sub = n.sub; }
+      if (n.body != null) { t.body = n.body; }
+      if (n.kind === 'web') { t.url = n.url || ''; }
+      if (n.kind === 'api' && n.api) { t.api = JSON.parse(JSON.stringify(n.api)); }
+      return t;
+    }
+    function saveAsDesign(n) {
+      if (!operator) { return; }
+      var suggested = (n.label || tstudioKind(n.kind).label || 'design').trim();
+      var name = (typeof prompt === 'function') ? prompt('Save this tile as a reusable design. Name:', suggested) : suggested;
+      if (name == null) { return; }
+      name = String(name).trim(); if (!name) { return; }
+      var slug = tstudioSlugify(name);
+      tstudioSaveDesign(slug, name, nodeTemplate(n)).then(function (r) {
+        if (r.ok) { refreshLibrary(); }
+      });
+    }
+    function paintLibrary() {
+      library.textContent = '';
+      var toggle = el('button', { 'class': 'tstudio-lib-collapse', type: 'button', title: 'Hide library', 'aria-label': 'Hide library' }, ['❮']);
+      toggle.addEventListener('click', function () { root.classList.toggle('tstudio-lib-hidden'); });
+      var head = el('div', { 'class': 'tstudio-lib-head' }, [el('h3', { 'class': 'tstudio-lib-h', text: 'Tile library' }), toggle]);
+      library.appendChild(head);
+
+      library.appendChild(el('div', { 'class': 'tstudio-lib-sec', text: 'Built-in' }));
+      var kinds = el('div', { 'class': 'tstudio-lib-grid' });
+      ['note', 'box', 'web', 'api', 'search', 'corpus', 'receipts', 'extensions', 'project', 'server', 'storage', 'client', 'output'].forEach(function (k) {
+        var kdef = tstudioKind(k);
+        var b = el('button', { 'class': 'tstudio-lib-item', type: 'button', title: 'Add a ' + kdef.label + ' tile' });
+        b.style.setProperty('--ts-accent', kdef.accent);
+        b.appendChild(el('span', { 'class': 'tstudio-lib-ico' }));
+        b.lastChild.appendChild(tstudioIcon(kdef.icon, 16));
+        b.appendChild(el('span', { 'class': 'tstudio-lib-name', text: kdef.label }));
+        if (!operator) { b.disabled = true; }
+        b.addEventListener('click', function () { addNode(k); });
+        kinds.appendChild(b);
+      });
+      library.appendChild(kinds);
+
+      library.appendChild(el('div', { 'class': 'tstudio-lib-sec', text: 'Saved designs' }));
+      var designs = el('div', { 'class': 'tstudio-lib-designs' });
+      if (!S.designs.length) {
+        designs.appendChild(el('p', { 'class': 'tstudio-lib-empty', text: operator ? 'Configure a tile, then "Save as design" to reuse it here.' : 'No saved designs yet.' }));
+      }
+      S.designs.forEach(function (d) {
+        var b = el('button', { 'class': 'tstudio-lib-design', type: 'button', title: 'Add "' + d.name + '"' });
+        b.appendChild(el('span', { 'class': 'tstudio-lib-name', text: d.name }));
+        b.appendChild(el('span', { 'class': 'tstudio-lib-kind', text: d.config ? (tstudioKind(d.config.kind).label) : 'design' }));
+        var dProv = studioProvenanceChip(d);
+        if (dProv) { b.appendChild(dProv); }
+        if (!operator) { b.disabled = true; }
+        b.addEventListener('click', function () { instantiateDesign(d); });
+        designs.appendChild(b);
+      });
+      library.appendChild(designs);
+    }
+    function instantiateDesign(d) {
+      if (!operator) { return; }
+      if (d.config) { instantiateFrom(d.config); return; }
+      // truncated in the listing — re-read the full value first
+      tstudioLoadDesign(d.entity).then(function (def) { if (def && def.config) { instantiateFrom(def.config); } });
+    }
+    // Fill-on-instantiate for parameterised designs ({{placeholder}} fields).
+    function instantiateFrom(config) {
+      var ph = tstudioFindPlaceholders(config);
+      if (ph.length && typeof prompt === 'function') {
+        var vals = {};
+        for (var i = 0; i < ph.length; i++) {
+          var v = prompt('Fill "' + ph[i] + '" for this tile:', '');
+          if (v === null) { return; }   // cancelled
+          vals[ph[i]] = v;
+        }
+        config = tstudioApplyPlaceholders(config, vals);
+      }
+      addNode(config.kind, config);
+    }
+    function refreshLibrary() {
+      tstudioListDesigns().then(function (list) { S.designs = list; paintLibrary(); });
+    }
+
+    // ---- toolbar ------------------------------------------------------------
+    function paintToolbar() {
+      toolbar.textContent = '';
+      var left = el('div', { 'class': 'tstudio-tb-left' });
+      var libBtn = el('button', { 'class': 'tstudio-btn tstudio-icbtn', type: 'button', title: 'Toggle library', 'aria-label': 'Toggle library' });
+      libBtn.appendChild(tstudioIcon(['M4 5.5h16v13H4z', 'M9 5.5v13'], 16));
+      libBtn.addEventListener('click', function () { root.classList.toggle('tstudio-lib-hidden'); });
+      left.appendChild(libBtn);
+      left.appendChild(el('span', { 'class': 'tstudio-tb-title', text: 'Studio · ' + boardId }));
+      // This console has no board SWITCHER (tstudioListBoards has no call site) —
+      // the toolbar's board identity IS where a board is named, so the board's
+      // library/import provenance chips here, beside the id it belongs to.
+      var boardProv = studioProvenanceChip(S);
+      if (boardProv) { left.appendChild(boardProv); }
+      toolbar.appendChild(left);
+
+      var mid = el('div', { 'class': 'tstudio-tb-mid' });
+      var zOut = el('button', { 'class': 'tstudio-btn tstudio-icbtn', type: 'button', title: 'Zoom out', 'aria-label': 'Zoom out' }, ['−']);
+      zOut.addEventListener('click', function () { var r = stageRect(); setZoomAt(S.zoom / 1.2, r.left + r.width / 2, r.top + r.height / 2); });
+      var zLab = el('span', { 'class': 'tstudio-zoomlab', text: Math.round(S.zoom * 100) + '%' });
+      var zIn = el('button', { 'class': 'tstudio-btn tstudio-icbtn', type: 'button', title: 'Zoom in', 'aria-label': 'Zoom in' }, ['+']);
+      zIn.addEventListener('click', function () { var r = stageRect(); setZoomAt(S.zoom * 1.2, r.left + r.width / 2, r.top + r.height / 2); });
+      var fit = el('button', { 'class': 'tstudio-btn', type: 'button', title: 'Fit all tiles' }, ['Fit']);
+      fit.addEventListener('click', function () { fitAll(); });
+      var gridBtn = el('button', { 'class': 'tstudio-btn tstudio-icbtn is-on', type: 'button', title: 'Toggle grid', 'aria-label': 'Toggle grid' });
+      gridBtn.appendChild(tstudioIcon(['M4 4h16v16H4z', 'M4 10h16M4 15h16M10 4v16M15 4v16'], 16));
+      gridBtn.addEventListener('click', function () { var on = grid.classList.toggle('is-off'); gridBtn.classList.toggle('is-on', !on); });
+      [zOut, zLab, zIn, fit, gridBtn].forEach(function (x) { mid.appendChild(x); });
+      toolbar.appendChild(mid);
+
+      var right = el('div', { 'class': 'tstudio-tb-right' });
+      // live connection chip (honest state)
+      var live = el('span', { 'class': 'tstudio-livechip', title: 'Live-tile stream state (/v1/events/stream)' });
+      right.appendChild(live);
+      // board settings
+      var setBtn = el('button', { 'class': 'tstudio-btn tstudio-icbtn', type: 'button', title: 'Board settings', 'aria-label': 'Board settings' });
+      setBtn.appendChild(tstudioIcon(['M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7z', 'M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.5-2.4 1a7 7 0 0 0-1.7-1L14.5 3h-5l-.3 2.5a7 7 0 0 0-1.7 1l-2.4-1-2 3.5 2 1.5a7 7 0 0 0 0 2l-2 1.5 2 3.5 2.4-1a7 7 0 0 0 1.7 1l.3 2.5h5l.3-2.5a7 7 0 0 0 1.7-1l2.4 1 2-3.5-2-1.5a7 7 0 0 0 .1-1z'], 16));
+      setBtn.addEventListener('click', function () { openSettingsPanel(); });
+      right.appendChild(setBtn);
+      // pack export / import
+      var expBtn = el('button', { 'class': 'tstudio-btn', type: 'button', title: 'Export this board as a portable, signed pack' }, ['Export']);
+      expBtn.addEventListener('click', function () { openExportDialog(); });
+      right.appendChild(expBtn);
+      var impBtn = el('button', { 'class': 'tstudio-btn', type: 'button', title: operator ? 'Import a Studio pack' : 'Read-only — operator posture required to apply an import' }, ['Import']);
+      impBtn.addEventListener('click', function () { triggerImport(); });
+      right.appendChild(impBtn);
+      // publish help
+      var helpBtn = el('button', { 'class': 'tstudio-btn tstudio-icbtn', type: 'button', title: 'How to publish a pack', 'aria-label': 'How to publish' }, ['?']);
+      helpBtn.addEventListener('click', function () { openPublishHelp(); });
+      right.appendChild(helpBtn);
+      var chip = el('span', { 'class': 'tstudio-savechip' });
+      right.appendChild(chip);
+      var saveBtn = el('button', { 'class': 'tstudio-btn tstudio-btn-primary', type: 'button', title: operator ? 'Save the board now' : 'Read-only — operator posture required' }, ['Save']);
+      if (!operator) { saveBtn.disabled = true; }
+      saveBtn.addEventListener('click', function () { doSave(); });
+      right.appendChild(saveBtn);
+      toolbar.appendChild(right);
+      paintSaveState();
+      paintLiveChip();
+    }
+    function fitAll() {
+      if (!S.nodes.length) { S.pan = { x: 40, y: 40 }; S.zoom = 1; applyTransform(); return; }
+      var minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+      S.nodes.forEach(function (n) { minx = Math.min(minx, n.x); miny = Math.min(miny, n.y); maxx = Math.max(maxx, n.x + n.w); maxy = Math.max(maxy, n.y + n.h); });
+      var bw = Math.max(50, maxx - minx), bh = Math.max(50, maxy - miny);
+      var r = stageRect(), pad = 80;
+      var z = Math.max(0.2, Math.min(2, Math.min((r.width - pad) / bw, (r.height - pad) / bh)));
+      S.zoom = z;
+      S.pan = { x: r.width / 2 - (minx + bw / 2) * z, y: r.height / 2 - (miny + bh / 2) * z };
+      markDirty(); applyTransform();
+    }
+
+    // ---- board settings (grid / refresh / accent / title) ------------------
+    function applyBoardSettings() {
+      var s = S.settings || tstudioDefaultSettings();
+      var g = s.grid || TSTUDIO_GRID;
+      if (grid && grid.style) { grid.style.backgroundSize = g + 'px ' + g + 'px'; }
+      root.style.setProperty('--ts-board-accent', tstudioAccentVar(s.accent));
+      var t = toolbar.querySelector('.tstudio-tb-title');
+      if (t) { t.textContent = 'Studio · ' + (s.title || boardId); }
+    }
+    function openSettingsPanel() {
+      var m = tstudioModal('Board settings');
+      var s = S.settings || tstudioDefaultSettings();
+      var title = el('input', { 'class': 'tstudio-input', type: 'text', value: s.title || '', placeholder: 'Board title' });
+      var desc = el('textarea', { 'class': 'tstudio-input tstudio-textarea', placeholder: 'Description', rows: '3' }); desc.value = s.description || '';
+      var gridSel = el('select', { 'class': 'tstudio-select' });
+      TSTUDIO_GRID_SIZES.forEach(function (g) { var o = el('option', { value: String(g) }, [g + ' px']); if (s.grid === g) { o.setAttribute('selected', 'selected'); } gridSel.appendChild(o); });
+      var refresh = el('select', { 'class': 'tstudio-select' });
+      TSTUDIO_REFRESH.forEach(function (r) { var o = el('option', { value: r[0] }, [r[1]]); if ((s.refresh || 'off') === r[0]) { o.setAttribute('selected', 'selected'); } refresh.appendChild(o); });
+      var accent = el('select', { 'class': 'tstudio-select' });
+      Object.keys(TSTUDIO_ACCENTS).forEach(function (k) { var o = el('option', { value: k }, [TSTUDIO_ACCENTS[k].label]); if (s.accent === k) { o.setAttribute('selected', 'selected'); } accent.appendChild(o); });
+      [['Title', title], ['Description', desc], ['Grid size', gridSel], ['Default refresh', refresh], ['Accent', accent]].forEach(function (f) { m.body.appendChild(inspectorField(f[0], f[1])); });
+      if (!operator) { [title, desc, gridSel, refresh, accent].forEach(function (c) { c.disabled = true; }); m.body.appendChild(el('p', { 'class': 'tstudio-insp-hint', text: 'Read-only — operator posture required to change board settings.' })); }
+      var actions = el('div', { 'class': 'tstudio-insp-actions' });
+      var apply = el('button', { 'class': 'tstudio-btn tstudio-btn-primary', type: 'button' }, ['Apply']);
+      if (!operator) { apply.disabled = true; }
+      apply.addEventListener('click', function () {
+        S.settings = tstudioNormalizeSettings({ title: title.value, description: desc.value, grid: Number(gridSel.value), refresh: refresh.value, accent: accent.value });
+        applyBoardSettings(); markDirty(); m.close();
+      });
+      actions.appendChild(apply);
+      m.body.appendChild(actions);
+    }
+
+    // ---- modal helper -------------------------------------------------------
+    function tstudioModal(titleText) {
+      var overlay = el('div', { 'class': 'tstudio-modal-overlay', role: 'dialog', 'aria-modal': 'true', 'aria-label': titleText });
+      var box = el('div', { 'class': 'tstudio-modal' });
+      var head = el('div', { 'class': 'tstudio-modal-head' });
+      head.appendChild(el('h3', { 'class': 'tstudio-modal-h', text: titleText }));
+      function close() { if (overlay.parentNode) { overlay.parentNode.removeChild(overlay); } if (doc()) { doc().removeEventListener('keydown', onKey); } }
+      function onKey(e) { if (e.key === 'Escape') { close(); } }
+      var x = el('button', { 'class': 'tstudio-modal-x', type: 'button', 'aria-label': 'Close' }, ['×']);
+      x.addEventListener('click', close);
+      head.appendChild(x);
+      box.appendChild(head);
+      var body = el('div', { 'class': 'tstudio-modal-body' });
+      box.appendChild(body);
+      overlay.appendChild(box);
+      overlay.addEventListener('click', function (e) { if (e.target === overlay) { close(); } });
+      if (doc()) { doc().addEventListener('keydown', onKey); }
+      root.appendChild(overlay);
+      return { overlay: overlay, body: body, close: close };
+    }
+
+    // ---- Studio packs: export (build via daemon) + import (verify + apply) --
+    function currentStudioPayload() {
+      var d = tstudioNormalizeDoc(JSON.parse(tstudioSerializeDoc(S)));
+      var designs = (S.designs || []).map(function (x) { return { slug: x.slug, name: x.name, config: x.config }; });
+      return tstudioBuildStudioPayload(boardId, d, designs, S.settings);
+    }
+    function buildPack(meta) {
+      var rp = (typeof window !== 'undefined') ? window.CruxApiRead : null;
+      if (!rp || typeof rp.studioPackBuild !== 'function') { return Promise.resolve({ ok: false, error: 'pack client unavailable' }); }
+      return rp.studioPackBuild({
+        studio: currentStudioPayload(),
+        id: meta.id, name: meta.name, version: meta.version,
+        publisher_passport_fpr: meta.publisher_passport_fpr, summary: meta.summary
+      }).then(function (r) {
+        return r.json().then(
+          function (d) { return { ok: r.ok, status: r.status, data: d, error: (!r.ok && d && (d.detail || d.title)) || '' }; },
+          function () { return { ok: false, error: 'bad response' }; }
+        );
+      }).catch(function (e) { return { ok: false, error: String(e && e.message || e) }; });
+    }
+    function downloadPack(id, pack) {
+      try {
+        var blob = new Blob([JSON.stringify(pack, null, 2)], { type: 'application/json' });
+        var url = URL.createObjectURL(blob);
+        var a = el('a', { href: url, download: (tstudioSlugify(id) || 'studio-pack') + '.cruxstudio.json' });
+        root.appendChild(a); a.click();
+        setTimeout(function () { if (a.parentNode) { a.parentNode.removeChild(a); } URL.revokeObjectURL(url); }, 0);
+      } catch (e) { /* ignore */ }
+    }
+    function openExportDialog() {
+      var m = tstudioModal('Export pack');
+      var s = S.settings || tstudioDefaultSettings();
+      var idInp = el('input', { 'class': 'tstudio-input', type: 'text', value: 'studio.' + (tstudioSlugify(s.title || boardId) || 'board'), placeholder: 'pack id' });
+      var nameInp = el('input', { 'class': 'tstudio-input', type: 'text', value: s.title || ('Studio board ' + boardId), placeholder: 'name' });
+      var verInp = el('input', { 'class': 'tstudio-input', type: 'text', value: '0.1.0', placeholder: '0.1.0' });
+      var pubInp = el('input', { 'class': 'tstudio-input', type: 'text', value: 'p_your_passport_fpr', placeholder: 'publisher passport fpr' });
+      var sumInp = el('input', { 'class': 'tstudio-input', type: 'text', value: s.description || '', placeholder: 'summary' });
+      [['Pack id', idInp], ['Name', nameInp], ['Version', verInp], ['Publisher fpr', pubInp], ['Summary', sumInp]].forEach(function (f) { m.body.appendChild(inspectorField(f[0], f[1])); });
+      var capWrap = el('div', { 'class': 'tstudio-caps-preview' });
+      capWrap.appendChild(el('span', { 'class': 'tstudio-field-lab', text: 'Capabilities (minimal read set)' }));
+      var capRow = el('div', { 'class': 'tstudio-ext-chips' });
+      tstudioDerivePackCaps({ nodes: S.nodes }).forEach(function (c) { capRow.appendChild(el('span', { 'class': 'tstudio-cap-chip', text: c })); });
+      capWrap.appendChild(capRow);
+      m.body.appendChild(capWrap);
+      var status = el('div', { 'class': 'tstudio-modal-status' });
+      m.body.appendChild(status);
+      var actions = el('div', { 'class': 'tstudio-insp-actions' });
+      var build = el('button', { 'class': 'tstudio-btn tstudio-btn-primary', type: 'button' }, ['Build + download']);
+      build.addEventListener('click', function () {
+        status.textContent = 'building…';
+        buildPack({ id: idInp.value, name: nameInp.value, version: verInp.value, publisher_passport_fpr: pubInp.value, summary: sumInp.value }).then(function (res) {
+          status.textContent = '';
+          if (!res || !res.ok || !res.data) { status.appendChild(el('div', { 'class': 'tstudio-apierr', text: (res && res.error) || 'build failed' })); return; }
+          downloadPack(idInp.value, res.data.pack);
+          status.appendChild(el('div', { 'class': 'tstudio-modal-ok', text: res.data.signed ? 'Signed pack downloaded.' : 'Unsigned pack downloaded.' }));
+          (res.data.sign_instructions || []).forEach(function (line) { status.appendChild(el('div', { 'class': 'tstudio-placeholder', text: line })); });
+          if (res.data.trust_note) { status.appendChild(el('div', { 'class': 'tstudio-placeholder', text: res.data.trust_note })); }
+        });
+      });
+      actions.appendChild(build);
+      m.body.appendChild(actions);
+    }
+    var __importInput = null;
+    function triggerImport() {
+      if (!doc()) { return; }
+      if (!__importInput) {
+        __importInput = el('input', { type: 'file', accept: '.json,application/json', 'class': 'tstudio-hidden' });
+        __importInput.addEventListener('change', function () {
+          var f = __importInput.files && __importInput.files[0];
+          if (!f) { return; }
+          var reader = new FileReader();
+          reader.onload = function () { openImportPreview(String(reader.result || '')); if (__importInput) { __importInput.value = ''; } };
+          reader.onerror = function () { openImportError('could not read file'); };
+          reader.readAsText(f);
+        });
+        root.appendChild(__importInput);
+      }
+      __importInput.click();
+    }
+    function openImportError(msg) { var m = tstudioModal('Import pack'); m.body.appendChild(el('div', { 'class': 'tstudio-apierr', text: msg })); }
+    function openImportPreview(text) {
+      var pack;
+      try { pack = JSON.parse(text); } catch (e) { openImportError('not valid JSON: ' + String(e && e.message || e)); return; }
+      var rp = (typeof window !== 'undefined') ? window.CruxApiRead : null;
+      if (!rp || typeof rp.studioPackVerify !== 'function') { openImportError('pack client unavailable'); return; }
+      var m = tstudioModal('Import pack');
+      m.body.appendChild(el('div', { 'class': 'tstudio-loading', text: 'verifying…' }));
+      rp.studioPackVerify({ pack: pack }).then(function (r) {
+        return r.json().then(function (d) { return { ok: r.ok, data: d }; }, function () { return { ok: false, data: null }; });
+      }).then(function (res) {
+        m.body.textContent = '';
+        if (!res.ok || !res.data) { m.body.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'verify failed' })); return; }
+        renderImportPreview(m, pack, res.data);
+      }).catch(function () { m.body.textContent = ''; m.body.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'verify error' })); });
+    }
+    function renderImportPreview(m, pack, v) {
+      var verdict = el('div', { 'class': 'tstudio-verdict' });
+      function line(label, ok, detail) {
+        var row = el('div', { 'class': 'tstudio-verdict-row' });
+        row.appendChild(el('span', { 'class': 'tstudio-verdict-dot ' + (ok ? 'is-ok' : 'is-bad') }));
+        row.appendChild(el('span', { 'class': 'tstudio-verdict-lab', text: label }));
+        if (detail) { row.appendChild(el('span', { 'class': 'tstudio-verdict-detail', text: detail })); }
+        verdict.appendChild(row);
+      }
+      line('schema', v.schema_ok);
+      line('manifest hash', v.manifest_hash_ok);
+      line('bundle hash', v.bundle_hash_ok);
+      var sig = v.signature || {};
+      line('signature: ' + (sig.verdict || 'unsigned'), sig.verdict !== 'invalid', sig.error || '');
+      m.body.appendChild(verdict);
+      // SIGNEDNESS is the bit that decides publisher trust, so it is stated as a
+      // chip of its own rather than left inside the verdict list: /verify REPORTS
+      // unsigned (it does not refuse it), and an unsigned pack is exactly the case
+      // an operator must see before applying. `signed` is the daemon's additive
+      // mirror of signature.verdict === 'valid'; read defensively so an older
+      // daemon that omits it falls back to the verdict itself.
+      var packSigned = (typeof v.signed === 'boolean') ? v.signed : (sig.verdict === 'valid');
+      var sRow = el('div', { 'class': 'tstudio-ext-chips clib-signrow' });
+      sRow.appendChild(el('span', {
+        'class': 'cwstudio-postchip ' + (packSigned ? 'is-on' : 'is-warn'),
+        text: packSigned ? 'signed' : 'unsigned'
+      }));
+      sRow.appendChild(el('span', {
+        'class': 'cwstudio-note',
+        text: packSigned
+          ? 'The Ed25519 signature verified against this daemon\'s trusted keyring — the publisher fingerprint is attributable.'
+          : 'No verified signature. An unsigned pack applies only under operator posture and carries NO publisher trust: nothing attests who built it or that the bytes are the ones they published.'
+      }));
+      m.body.appendChild(sRow);
+      (v.errors || []).forEach(function (e) { m.body.appendChild(el('div', { 'class': 'tstudio-apierr', text: e })); });
+      var st = v.studio || {};
+      m.body.appendChild(el('div', { 'class': 'tstudio-modal-status', text: (st.board_title || '(untitled)') + ' — ' + (st.tile_count || 0) + ' tile(s), ' + (st.design_count || 0) + ' design(s)' }));
+      var kchips = el('div', { 'class': 'tstudio-ext-chips' });
+      (st.kinds || []).forEach(function (k) { kchips.appendChild(el('span', { 'class': 'tstudio-cap-chip', text: k })); });
+      m.body.appendChild(kchips);
+      var capchips = el('div', { 'class': 'tstudio-ext-chips' });
+      (v.capabilities || []).forEach(function (c) { capchips.appendChild(el('span', { 'class': 'tstudio-cap-chip', text: c })); });
+      m.body.appendChild(capchips);
+      var actions = el('div', { 'class': 'tstudio-insp-actions' });
+      var apply = el('button', { 'class': 'tstudio-btn tstudio-btn-primary', type: 'button', title: operator ? 'Write this board + designs' : 'Read-only — operator posture required' }, ['Apply to this board']);
+      if (!(operator && v.ok)) { apply.disabled = true; }
+      if (!v.ok) { m.body.appendChild(el('p', { 'class': 'tstudio-insp-note is-err', text: 'Pack failed validation — apply is blocked.' })); }
+      else if (!operator) { m.body.appendChild(el('p', { 'class': 'tstudio-insp-hint', text: 'Read-only — operator posture required to apply.' })); }
+      var out = el('div', { 'class': 'tstudio-modal-status' });
+      apply.addEventListener('click', function () {
+        apply.disabled = true;
+        applyPack(pack, v).then(function (r) {
+          out.appendChild(el('div', { 'class': (r.ok ? 'tstudio-modal-ok' : 'tstudio-apierr'), text: r.ok ? 'Applied. Board reloaded.' : ('apply failed: ' + (r.error || '')) }));
+          if (r.ok) { setTimeout(m.close, 700); }
+        });
+      });
+      actions.appendChild(apply);
+      m.body.appendChild(actions);
+      m.body.appendChild(out);
+    }
+    function applyPack(pack, verify) {
+      if (!operator) { return Promise.resolve({ ok: false, error: 'operator posture required' }); }
+      var studio = pack && pack.studio;
+      if (!studio || studio.schema !== TSTUDIO_STUDIO_SCHEMA) { return Promise.resolve({ ok: false, error: 'no studio payload' }); }
+      // Manual-import provenance parity with a library install: every artifact
+      // this write touches carries WHERE it came from. A hand-imported pack is
+      // NOT a catalog install, so the stamp is `imported_from` (manifest pack id
+      // + when + whether /verify said signed) — never the daemon's
+      // `installed_from`, which means "endorsed by the curator-signed index".
+      var stamp = studioImportStamp(pack, verify);
+      var d = tstudioNormalizeDoc(studioStampImported(studio.board && studio.board.doc, stamp));
+      var designs = Array.isArray(studio.designs) ? studio.designs : [];
+      var writes = [tstudioWriteFact(tstudioBoardEntity(boardId), TSTUDIO_DOC_KEY, tstudioSerializeDoc(d))];
+      designs.forEach(function (dz) { if (dz && dz.slug && dz.config) { writes.push(tstudioSaveDesign(tstudioSlugify(dz.slug), dz.name || dz.slug, dz.config, stamp)); } });
+      // M16b — a pack may ALSO carry workspaces/pages (additive). Apply them as the
+      // defaults layer so a pack can install a whole workspace, not just a board.
+      var wsPack = cwsPackExtract(studio);
+      wsPack.workspaces.forEach(function (w) { if (w && w.uid) { writes.push(tstudioWriteFact(cwsWorkspaceEntity(w.uid), CWS_DEF_KEY, cwsCanonical(studioStampImported(w, stamp)))); } });
+      wsPack.pages.forEach(function (pg) { if (pg && pg.uid) { writes.push(tstudioWriteFact(cwsPageEntity(pg.uid), CWS_DEF_KEY, cwsCanonical(studioStampImported(pg, stamp)))); } });
+      return Promise.all(writes).then(function (results) {
+        var ok = results.every(function (r) { return r && r.ok; });
+        if (ok) {
+          S.nodes = d.nodes; S.links = d.links; S.texts = d.texts; S.pan = d.pan; S.zoom = d.zoom; S.settings = d.settings;
+          S.installed_from = d.installed_from || null; S.imported_from = d.imported_from || null;
+          renderBoard(); applyBoardSettings(); paintToolbar(); refreshLibrary(); setSaveState('saved');
+          if (typeof window !== 'undefined' && typeof window.CRUX_WS_RELOAD === 'function' && (wsPack.workspaces.length || wsPack.pages.length)) { window.CRUX_WS_RELOAD(); }
+        }
+        return { ok: ok };
+      }).catch(function (e) { return { ok: false, error: String(e && e.message || e) }; });
+    }
+    function openPublishHelp() {
+      var m = tstudioModal('Publish a Studio pack');
+      [
+        'A pack is a crux.studio.v1 payload wrapped in a signed crux.integration.v1 manifest — the same trust rails as any community integration.',
+        '1. Export this board (Export → Build + download). It signs for real only if CORECRUXD_STUDIO_SIGNING_KEY_HEX is set on this daemon; otherwise it downloads unsigned with sign instructions.',
+        '2. Open a PR placing manifest.json + studio-board.json + README.md under integrations/community/<id>/<version>/ (see integrations/community/studio-board-example/).',
+        '3. CI runs `cargo test -p crux-integrations --test community_packs`: it validates schema, both hashes, the Ed25519 signature, and (for dangerous capabilities) an adjacent review.json.',
+        '4. Once merged, the curator-signed community index endorses it. Operators install via the Extensions surface or POST /v1/extensions/install-from-registry.',
+        'There is NO upload endpoint — the community PR + curator-signed index IS the publishing rail.'
+      ].forEach(function (line) { m.body.appendChild(el('p', { 'class': 'tstudio-help-step', text: line })); });
+    }
+
+    // ---- stage interactions (pan on empty, deselect) -----------------------
+    stage.addEventListener('mousedown', function (e) {
+      if (e.target !== stage && e.target !== world && e.target !== grid && e.target !== linkLayer) { return; }
+      if (e.button !== 0 && e.button !== 1) { return; }
+      var sx = e.clientX, sy = e.clientY, px = S.pan.x, py = S.pan.y, moved = false;
+      stage.classList.add('is-panning');
+      function mv(ev) { S.pan.x = px + (ev.clientX - sx); S.pan.y = py + (ev.clientY - sy); if (Math.abs(ev.clientX - sx) + Math.abs(ev.clientY - sy) > 3) { moved = true; } applyTransform(); }
+      function up() {
+        doc().removeEventListener('mousemove', mv); doc().removeEventListener('mouseup', up); stage.classList.remove('is-panning');
+        if (!moved) { if (S.selected || S.selectedLink) { S.selected = null; S.selectedLink = null; applySelectionUI(); drawLinks(); paintInspector(); } }
+        else { markDirty(); }
+      }
+      doc().addEventListener('mousemove', mv); doc().addEventListener('mouseup', up);
+    });
+    var wheelHandler = function (e) {
+      if (e.preventDefault) { e.preventDefault(); }
+      var f = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+      setZoomAt(S.zoom * f, e.clientX, e.clientY);
+    };
+    stage.addEventListener('wheel', wheelHandler, { passive: false });
+    S.cleanups.push(function () { stage.removeEventListener('wheel', wheelHandler); });
+    onDoc('keydown', function (e) {
+      if (!operator) { return; }
+      var t = e.target, editing = t && (t.isContentEditable || /INPUT|TEXTAREA|SELECT/.test(t.tagName));
+      if ((e.key === 'Delete' || e.key === 'Backspace') && !editing) {
+        if (S.selectedLink) { e.preventDefault(); S.links = S.links.filter(function (x) { return x.id !== S.selectedLink; }); S.selectedLink = null; drawLinks(); paintInspector(); markDirty(); }
+        else if (S.selected) { e.preventDefault(); deleteNode(S.selected); }
+      }
+      if (e.key === 'Escape') { S.selected = null; S.selectedLink = null; applySelectionUI(); drawLinks(); paintInspector(); }
+    });
+
+    // ---- render the loaded board -------------------------------------------
+    function renderBoard() {
+      Object.keys(S.nodeEls).forEach(function (id) { if (S.nodeEls[id].parentNode) { S.nodeEls[id].parentNode.removeChild(S.nodeEls[id]); } });
+      S.nodeEls = {};
+      S.nodes.forEach(function (n) { buildNode(n); });
+      drawLinks();
+      applyTransform();
+    }
+
+    // ---- boot ---------------------------------------------------------------
+    paintToolbar();
+    paintLibrary();
+    paintInspector();
+    applyTransform();
+
+    __tstudioCleanup = function () {
+      if (S.saveTimer) { clearTimeout(S.saveTimer); }
+      Object.keys(S.refreshTimers).forEach(function (id) { if (typeof clearInterval === 'function') { clearInterval(S.refreshTimers[id]); } });
+      Object.keys(S.liveDebounce).forEach(function (id) { if (typeof clearTimeout === 'function') { clearTimeout(S.liveDebounce[id]); } });
+      S.cleanups.forEach(function (fn) { try { fn(); } catch (e) { /* ignore */ } });
+      S.cleanups = [];
+    };
+
+    // Verification hooks (mirroring the rings / canvas-graph __rings*/__cv* dev
+    // hooks). They drive the real internal add/move/resize/save/design paths so
+    // the Playwright persistence proof is deterministic — no synthetic gestures,
+    // no bespoke behaviour. Harmless to users (plain window assignments).
+    if (typeof window !== 'undefined') {
+      window.__tstudio = {
+        add: function (kind, cfg) { return addNode(kind, cfg).id; },
+        select: function (id) { selectNode(id); },
+        move: function (id, x, y) { var n = findNode(id); if (n) { n.x = tstudioSnap(x); n.y = tstudioSnap(y); if (S.nodeEls[id]) { placeNode(n, S.nodeEls[id]); } drawLinks(); markDirty(); } },
+        resize: function (id, w, h) { var n = findNode(id); if (n) { n.w = Math.max(TSTUDIO_MIN_W, tstudioSnap(w)); n.h = Math.max(TSTUDIO_MIN_H, tstudioSnap(h)); if (S.nodeEls[id]) { placeNode(n, S.nodeEls[id]); } drawLinks(); markDirty(); } },
+        setApi: function (id, cfg) { var n = findNode(id); if (!n) { return; } n.api = n.api || {}; Object.keys(cfg || {}).forEach(function (k) { n.api[k] = cfg[k]; }); refreshNode(id); markDirty(); },
+        setWeb: function (id, url) { var n = findNode(id); if (n) { n.url = tstudioWebSrcOk(url) ? url : ''; refreshNode(id); markDirty(); } },
+        saveDesign: function (id, name) { var n = findNode(id); if (!n) { return Promise.resolve({ ok: false }); } return tstudioSaveDesign(tstudioSlugify(name), name, nodeTemplate(n)).then(function (r) { if (r.ok) { refreshLibrary(); } return r; }); },
+        save: function () { return doSave(); },
+        state: function () { return { count: S.nodes.length, saveState: S.saveState, zoom: S.zoom, pan: { x: S.pan.x, y: S.pan.y }, designs: S.designs.length, live: S.esState, settings: S.settings, nodes: S.nodes.map(function (n) { return { id: n.id, kind: n.kind, x: n.x, y: n.y, w: n.w, h: n.h, route: (n.api && n.api.route) || (n.search && n.search.route), url: n.url }; }) }; }
+      };
+      // M15 pack round-trip hooks (deterministic Playwright driving; plain
+      // window assignments, harmless to users).
+      window.__tstudioPack = {
+        build: function (meta) { return buildPack(meta || { id: 'studio.rt', name: 'Round-trip', version: '0.1.0', publisher_passport_fpr: 'p_roundtrip_example', summary: 'round-trip proof' }); },
+        verify: function (pack) { var rp = window.CruxApiRead; return rp.studioPackVerify({ pack: pack }).then(function (r) { return r.json(); }); },
+        apply: function (pack) { return applyPack(pack); },
+        payload: function () { return currentStudioPayload(); },
+        setSettings: function (s) { S.settings = tstudioNormalizeSettings(s); applyBoardSettings(); markDirty(); return S.settings; },
+        clear: function () { S.nodes = []; S.links = []; S.texts = []; S.selected = null; renderBoard(); markDirty(); return doSave(); },
+        openImport: function (text) { openImportPreview(text); },
+        openExport: function () { openExportDialog(); },
+        openSettings: function () { openSettingsPanel(); }
+      };
+    }
+
+    // Synchronous seed path (no network): render a pre-supplied board doc
+    // immediately. Used for previews + the smoke's mock-DOM drive (which must
+    // build the board without an async yield). Real navigation loads async below.
+    if (ctx.seedDoc) {
+      var seeded = tstudioNormalizeDoc(ctx.seedDoc);
+      S.nodes = seeded.nodes; S.links = seeded.links; S.texts = seeded.texts;
+      S.pan = seeded.pan; S.zoom = seeded.zoom; S.settings = seeded.settings;
+      S.installed_from = seeded.installed_from || null; S.imported_from = seeded.imported_from || null;
+      S.designs = Array.isArray(ctx.seedDesigns) ? ctx.seedDesigns : [];
+      renderBoard();
+      applyBoardSettings();
+      paintLibrary();
+      setSaveState(operator ? 'clean' : 'readonly');
+      return Promise.resolve({ boardId: boardId, found: true, seeded: true });
+    }
+
+    var loading = el('div', { 'class': 'tstudio-boot', text: 'loading board…' });
+    world.appendChild(loading);
+    return Promise.all([tstudioLoadBoard(boardId), tstudioListDesigns()]).then(function (out) {
+      if (loading.parentNode) { loading.parentNode.removeChild(loading); }
+      var res = out[0];
+      S.nodes = res.doc.nodes; S.links = res.doc.links; S.texts = res.doc.texts;
+      S.pan = res.doc.pan; S.zoom = res.doc.zoom; S.settings = res.doc.settings;
+      S.installed_from = res.doc.installed_from || null; S.imported_from = res.doc.imported_from || null;
+      S.designs = out[1] || [];
+      renderBoard();
+      applyBoardSettings();
+      paintLibrary();
+      setSaveState(operator ? (res.found ? 'saved' : 'clean') : 'readonly');
+      return { boardId: boardId, found: res.found };
+    }).catch(function () {
+      if (loading.parentNode) { loading.parentNode.removeChild(loading); }
+      renderBoard();
+      return { boardId: boardId, found: false };
+    });
+  }
+
   function renderCanvas(host, ctx) {
     ctx = ctx || {};
-    var view = ctx.view === 'graph' ? 'graph' : (ctx.view === 'tree' ? 'tree' : 'board');
+    var view = ctx.view === 'graph' ? 'graph' : (ctx.view === 'tree' ? 'tree' : (ctx.view === 'studio' ? 'studio' : 'board'));
     host.textContent = '';
     var region = el('div', { 'class': 'canvas-region' });
-    var seg = el('div', { 'class': 'modeseg canvas-seg', role: 'group', 'aria-label': 'Canvas view' });
-    [['board', 'Board'], ['graph', 'Graph'], ['tree', 'Tree']].forEach(function (v) {
-      var b = el('button', { 'class': 'modeseg-btn', type: 'button', 'data-view': v[0], 'aria-pressed': v[0] === view ? 'true' : 'false' }, [v[1]]);
-      (function (vid) { b.addEventListener('click', function () { location.hash = '#/canvas/' + vid; }); })(v[0]);
-      seg.appendChild(b);
-    });
-    region.appendChild(el('div', { 'class': 'canvas-head' }, [seg]));
+    var head = el('div', { 'class': 'canvas-head' });
+    var studioSub = (view === 'studio') ? (ctx.sub === 'pages' ? 'pages' : (ctx.sub === 'integrations' ? 'integrations' : (ctx.sub === 'library' ? 'library' : 'board'))) : null;
+    if (view === 'studio') {
+      // M21 — inside the Studio the PRIMARY control is the Studio's OWN sections:
+      // Board (the tile canvas) · Pages (workspaces + pages) · Integrations
+      // (extensions), deep-linkable via ?sub=. The old Board|Graph|Tree|Studio
+      // segmented control is gone: M19/M20 moved Board, Graph and Tree into the
+      // Rings tab hub, so three of its four buttons pointed at views that no
+      // longer live here — it was a control for a destination that had been
+      // dissolved. Studio is now what #/canvas/* is FOR.
+      var sub = el('div', { 'class': 'modeseg canvas-seg canvas-subseg', role: 'group', 'aria-label': 'Studio section' });
+      // L1 adds a FOURTH section: Library — the curator-signed central template
+      // library (boards / designs / workspaces / packs) the daemon caches and
+      // installs from. It sits last because it is where new Studio content comes
+      // FROM, after the three sections that operate on what is already here.
+      [['board', 'Board'], ['pages', 'Pages'], ['integrations', 'Integrations'], ['library', 'Library']].forEach(function (v) {
+        var b = el('button', { 'class': 'modeseg-btn', type: 'button', 'data-sub': v[0], 'aria-pressed': v[0] === studioSub ? 'true' : 'false' }, [v[1]]);
+        (function (sid) { b.addEventListener('click', function () { location.hash = '#/canvas/studio' + (sid === 'board' ? '' : '?sub=' + sid); }); })(v[0]);
+        sub.appendChild(b);
+      });
+      head.appendChild(sub);
+    }
+    // Non-studio views reach renderCanvas only as workspace page types
+    // (canvas/board · canvas/graph · canvas/tree) — those render bare, with no
+    // switcher, because their console home is the Rings tab hub.
+    if (head.childNodes.length) { region.appendChild(head); }
     var body = el('div', { 'class': 'canvas-body' });
     region.appendChild(body);
     host.appendChild(region);
     if (view === 'graph') { return renderCanvasGraph(body, ctx, ctx.focus); }
     if (view === 'tree') { return renderPlanTree(body, ctx); }
+    if (view === 'studio') {
+      if (studioSub === 'pages') { return renderWorkspaceStudio(body, ctx); }
+      if (studioSub === 'integrations') { return renderIntegrationsStudio(body, ctx); }
+      if (studioSub === 'library') { return renderLibraryStudio(body, ctx); }
+      return renderTileStudio(body, ctx);
+    }
     renderCanvasBoard(body, ctx);
     return Promise.resolve();
   }
+
+  // =======================================================================
+  //  Studio › Pages (M16b) — the workspace/page manager. Create workspaces from
+  //  starter templates (remix-not-blank), add pages of ANY registry type, edit
+  //  title/sub/dest/config, take control of built-ins (reversible fork), and a
+  //  raw-JSON escape hatch per artifact (preserves unknown keys). Every write is
+  //  a canonical fact through operatorGatedCall → consoleFactsAdd; every read
+  //  through the generated client. The SAME artifact an MCP store_fact writer
+  //  produces (docs/agent/console-workspaces.md).
+  // =======================================================================
+  var CWS_ICON_CHOICES = ['overwatch', 'work', 'memory', 'trust', 'meters', 'canvas', 'search', 'map', 'rings', 'settings', 'integrations', 'dataplane', 'globe', 'developer'];
+  function cwsModal(title) {
+    var overlay = el('div', { 'class': 'cws-modal-overlay', role: 'dialog', 'aria-modal': 'true', 'aria-label': title });
+    var box = el('div', { 'class': 'cws-modal' });
+    var head = el('div', { 'class': 'cws-modal-head' }, [el('h3', { text: title })]);
+    function close() { if (overlay.parentNode) { overlay.parentNode.removeChild(overlay); } if (doc() && doc().removeEventListener) { doc().removeEventListener('keydown', onKey); } }
+    function onKey(e) { if (e.key === 'Escape') { close(); } }
+    var x = el('button', { 'class': 'cws-modal-x', type: 'button', 'aria-label': 'Close' }, ['×']);
+    x.addEventListener('click', close); head.appendChild(x); box.appendChild(head);
+    var body = el('div', { 'class': 'cws-modal-body' }); box.appendChild(body);
+    overlay.appendChild(box);
+    overlay.addEventListener('click', function (e) { if (e.target === overlay) { close(); } });
+    if (doc() && doc().addEventListener) { doc().addEventListener('keydown', onKey); }
+    var mount = (doc() && doc().body) || host0() || null;
+    if (mount) { mount.appendChild(overlay); }
+    return { overlay: overlay, body: body, close: close };
+  }
+  function host0() { return (typeof document !== 'undefined') ? document.getElementById('main') : null; }
+  function cwsField(label, node) {
+    var f = el('div', { 'class': 'cws-field' });
+    f.appendChild(el('label', { 'class': 'tstudio-field-lab', text: label }));
+    f.appendChild(node);
+    return f;
+  }
+  function cwsIconSelect(current) {
+    var sel = el('select', { 'class': 'tstudio-input cws-icon-sel' });
+    CWS_ICON_CHOICES.forEach(function (ic) { var o = el('option', { value: ic, text: ic }); if (ic === current) { o.setAttribute('selected', 'selected'); } sel.appendChild(o); });
+    return sel;
+  }
+
+  function renderWorkspaceStudio(host, ctx) {
+    ctx = ctx || {};
+    host.textContent = '';
+    var operator = isOperator();
+    var root = el('div', { 'class': 'cwstudio' });
+    host.appendChild(root);
+
+    var header = el('div', { 'class': 'cwstudio-header' });
+    header.appendChild(el('div', { 'class': 'cwstudio-title' }, [
+      el('h2', { text: 'Pages' }),
+      el('p', { 'class': 'cwstudio-sub', text: 'Workspaces and the pages inside them. Built-ins (Command · Explorer) render from the registry until you take control; every save is a canonical fact an agent can also write via MCP store_fact.' })
+    ]));
+    var newBtn = el('button', { 'class': 'tstudio-btn tstudio-btn-primary', type: 'button' }, ['＋ New workspace']);
+    if (!operator) { newBtn.disabled = true; newBtn.setAttribute('title', 'Read-only — operator posture required'); }
+    newBtn.addEventListener('click', function () { if (operator) { openStarterPicker(); } });
+    header.appendChild(newBtn);
+    root.appendChild(header);
+
+    if (!operator) {
+      root.appendChild(el('div', { 'class': 'tstudio-banner', role: 'status' }, [
+        el('span', { 'class': 'tstudio-banner-dot' }),
+        el('span', { text: 'Read-only — operator posture required to create, edit, fork or revert. Everything below is live and browsable.' })
+      ]));
+    }
+
+    var body = el('div', { 'class': 'cwstudio-body' });
+    var treeAside = el('aside', { 'class': 'cwstudio-tree', 'aria-label': 'Workspaces' });
+    var editor = el('section', { 'class': 'cwstudio-editor', 'aria-label': 'Editor' });
+    body.appendChild(treeAside); body.appendChild(editor);
+    root.appendChild(body);
+    root.appendChild(el('p', { 'class': 'cwstudio-foot', text: 'Entities: console:workspace:<uid> · console:page:<uid>, key "def", canonical key-sorted JSON. See docs/agent/console-workspaces.md — an agent can generate identical workspaces via PUT /v1/facts / MCP store_fact.' }));
+
+    var MODEL = null, SEL = null;
+
+    function reload() {
+      treeAside.textContent = ''; treeAside.appendChild(el('div', { 'class': 'cwstudio-loading', text: 'loading workspaces…' }));
+      // Reload through the shell's model (single source of truth) so the studio
+      // tree, the switcher and the rail icons never drift; AWAIT it so a
+      // programmatic sequence (create → wipe → reimport) reads a consistent model.
+      var hasShell = (typeof window !== 'undefined' && typeof window.CRUX_WS_RELOAD === 'function');
+      var loader = hasShell ? window.CRUX_WS_RELOAD() : cwsLoadOverlays().then(function (ov) { if (typeof window !== 'undefined') { window.CRUX_WS_MODEL = cwsBuildModel(ov); } });
+      return Promise.resolve(loader).then(function () {
+        MODEL = (typeof window !== 'undefined' && window.CRUX_WS_MODEL) ? window.CRUX_WS_MODEL : cwsBuildModel({ workspaces: [], pages: [] });
+        paintTree(); paintEditor();
+        return MODEL;
+      });
+    }
+
+    function overlayFor(kind, uid) {
+      var arr = (MODEL.overlays && MODEL.overlays[kind === 'workspace' ? 'workspaces' : 'pages']) || [];
+      for (var i = 0; i < arr.length; i++) { if (arr[i].uid === uid) { return arr[i]; } }
+      return null;
+    }
+    function resolvePage(pageUid) {
+      // A page uid resolves to: a config page fact (user/forked) OR a registry
+      // built-in page id (type == uid) OR a surface type id.
+      if (MODEL.pages[pageUid]) { return { def: MODEL.pages[pageUid], builtin: false }; }
+      var pages = (typeof window !== 'undefined') ? window.CruxPages : null;
+      if (pages && pages.PAGES && pages.PAGES[pageUid]) {
+        var p = pages.PAGES[pageUid];
+        return { def: { schema_version: CWS_SCHEMA_VERSION, uid: pageUid, type: pageUid, title: p.title, sub: p.sub, dest: p.dest, config: {}, source: 'builtin' }, builtin: true };
+      }
+      if (cwsTypeExists(pageUid)) { return { def: { schema_version: CWS_SCHEMA_VERSION, uid: pageUid, type: pageUid, title: pageUid, sub: '', dest: '', config: {}, source: 'builtin' }, builtin: true }; }
+      return null;
+    }
+
+    // ---- tree ----
+    function paintTree() {
+      treeAside.textContent = '';
+      MODEL.workspaces.forEach(function (ws) {
+        var wsRow = el('button', { 'class': 'cwstudio-wsrow' + (SEL && SEL.kind === 'workspace' && SEL.uid === ws.uid ? ' is-sel' : ''), type: 'button', 'data-ws': ws.uid });
+        var ico = el('span', { 'class': 'cwstudio-wsico' }); ico.innerHTML = (SITEMAP_ICONS && SITEMAP_ICONS[ws.icon]) ? SITEMAP_ICONS[ws.icon] : (SITEMAP_ICONS.work || '');
+        wsRow.appendChild(ico);
+        wsRow.appendChild(el('span', { 'class': 'cwstudio-wsname', text: ws.name }));
+        var badge = ws.builtin ? (ws.source === 'builtin-fork' ? 'forked' : 'builtin') : 'user';
+        wsRow.appendChild(el('span', { 'class': 'cwstudio-wsbadge cwstudio-badge-' + badge, text: badge }));
+        // The tolerant reader preserves unknown keys, so a workspace installed
+        // from the template library still carries its installed_from stamp here.
+        var wsProv = studioProvenanceChip(ws);
+        if (wsProv) { wsRow.appendChild(wsProv); }
+        wsRow.addEventListener('click', function () { SEL = { kind: 'workspace', uid: ws.uid }; paintTree(); paintEditor(); });
+        treeAside.appendChild(wsRow);
+        // dests → pages
+        (ws.dests || []).forEach(function (d) {
+          treeAside.appendChild(el('div', { 'class': 'cwstudio-destrow', text: d.label }));
+          (d.pages || []).forEach(function (pu) {
+            var rp = resolvePage(pu);
+            var pRow = el('button', { 'class': 'cwstudio-pagerow' + (SEL && SEL.kind === 'page' && SEL.uid === pu ? ' is-sel' : ''), type: 'button', 'data-page': pu });
+            pRow.appendChild(el('span', { 'class': 'cwstudio-pagename', text: rp ? rp.def.title : pu }));
+            if (rp && !rp.builtin && rp.def.source === 'builtin-fork') { pRow.appendChild(el('span', { 'class': 'cwstudio-pagebadge', text: 'forked' })); }
+            var pProv = (rp && rp.def) ? studioProvenanceChip(rp.def) : null;
+            if (pProv) { pRow.appendChild(pProv); }
+            pRow.addEventListener('click', function () { SEL = { kind: 'page', uid: pu, ws: ws.uid, dest: d.id }; paintTree(); paintEditor(); });
+            treeAside.appendChild(pRow);
+          });
+          if (!ws.builtin || ws.source === 'builtin-fork') {
+            var addP = el('button', { 'class': 'cwstudio-addpage', type: 'button', text: '＋ page' });
+            if (!operator) { addP.disabled = true; }
+            addP.addEventListener('click', function () { if (operator) { openAddPage(ws.uid, d.id); } });
+            treeAside.appendChild(addP);
+          }
+        });
+      });
+    }
+
+    // ---- editor ----
+    function paintEditor() {
+      editor.textContent = '';
+      if (!SEL) { editor.appendChild(el('div', { 'class': 'cwstudio-empty', text: 'Select a workspace or page on the left, or create a new workspace.' })); return; }
+      if (SEL.kind === 'workspace') { paintWorkspaceEditor(); return; }
+      paintPageEditor();
+    }
+
+    function provenanceChip(box, ws) {
+      var chip = el('div', { 'class': 'cwstudio-provenance' });
+      chip.appendChild(el('span', { 'class': 'cwstudio-prov-dot' }));
+      chip.appendChild(el('span', { text: 'forked from built-in "' + (ws.forked_from || ws.uid) + '"' }));
+      var revert = el('button', { 'class': 'tstudio-btn cwstudio-revert', type: 'button', text: 'revert' });
+      if (!operator) { revert.disabled = true; }
+      revert.addEventListener('click', function () { if (operator) { doRevert('workspace', ws.uid); } });
+      chip.appendChild(revert);
+      box.appendChild(chip);
+    }
+
+    function paintWorkspaceEditor() {
+      var ws = null; MODEL.workspaces.forEach(function (w) { if (w.uid === SEL.uid) { ws = w; } });
+      if (!ws) { editor.appendChild(el('div', { 'class': 'cwstudio-empty', text: 'Workspace not found (it may have been reverted). Pick another.' })); return; }
+      editor.appendChild(el('h3', { 'class': 'cwstudio-eh', text: ws.name }));
+      var editable = !ws.builtin || ws.source === 'builtin-fork';
+      if (ws.source === 'builtin-fork') { provenanceChip(editor, ws); }
+      if (ws.builtin && ws.source !== 'builtin-fork') {
+        editor.appendChild(el('p', { 'class': 'cwstudio-note', text: 'This is an auto-generated built-in workspace. It renders from the page registry. Take control to edit its nav — a reversible fork copies it to an overlay fact; revert restores auto-generation.' }));
+        var forkBtn = el('button', { 'class': 'tstudio-btn tstudio-btn-primary', type: 'button', text: 'Take control (fork)' });
+        if (!operator) { forkBtn.disabled = true; forkBtn.setAttribute('title', 'operator posture required'); }
+        forkBtn.addEventListener('click', function () { if (operator) { doForkWorkspace(ws); } });
+        editor.appendChild(forkBtn);
+      }
+      // Metadata form
+      var nameInp = el('input', { 'class': 'tstudio-input', type: 'text', value: ws.name });
+      var iconSel = cwsIconSelect(ws.icon);
+      var orderInp = el('input', { 'class': 'tstudio-input', type: 'number', value: String(ws.order != null ? ws.order : 100) });
+      if (!editable || !operator) { [nameInp, iconSel, orderInp].forEach(function (n) { n.setAttribute('disabled', 'disabled'); }); }
+      editor.appendChild(cwsField('Name', nameInp));
+      editor.appendChild(cwsField('Icon', iconSel));
+      editor.appendChild(cwsField('Order', orderInp));
+      if (editable && operator) {
+        var save = el('button', { 'class': 'tstudio-btn tstudio-btn-primary', type: 'button', text: 'Save workspace' });
+        var out = el('div', { 'class': 'cwstudio-status' });
+        save.addEventListener('click', function () {
+          var def = {}; var ov = overlayFor('workspace', ws.uid);
+          var basis = (ov && ov.def) ? ov.def : ws;
+          Object.keys(basis).forEach(function (k) { def[k] = basis[k]; });   // preserve unknown keys
+          delete def.builtin;
+          def.schema_version = CWS_SCHEMA_VERSION; def.uid = ws.uid;
+          def.name = nameInp.value || ws.uid; def.icon = iconSel.value; def.order = Number(orderInp.value) || 0;
+          if (ws.source === 'builtin-fork') { def.source = 'builtin-fork'; def.forked_from = ws.forked_from || ws.uid; }
+          else { def.source = 'user'; }
+          out.textContent = 'saving…';
+          saveDef('workspace', def).then(function (r) { out.textContent = r.ok ? 'saved' : ('save failed: ' + (r.error || r.status)); if (r.ok) { reload(); } });
+        });
+        editor.appendChild(save); editor.appendChild(out);
+        if (!ws.builtin) {
+          var del = el('button', { 'class': 'tstudio-btn cwstudio-danger', type: 'button', text: 'Delete workspace' });
+          del.addEventListener('click', function () { doRevert('workspace', ws.uid); });
+          editor.appendChild(del);
+        }
+      }
+      // Export this workspace as a pack
+      var exp = el('button', { 'class': 'tstudio-btn', type: 'button', text: 'Export as pack' });
+      exp.addEventListener('click', function () { openExportWorkspace(ws); });
+      editor.appendChild(exp);
+      // Raw JSON escape hatch
+      editor.appendChild(rawJsonEditor('workspace', ws.uid, (overlayFor('workspace', ws.uid) && overlayFor('workspace', ws.uid).def) || ws, editable && operator));
+    }
+
+    function paintPageEditor() {
+      var rp = resolvePage(SEL.uid);
+      if (!rp) { editor.appendChild(el('div', { 'class': 'cwstudio-empty', text: 'Page "' + SEL.uid + '" is not resolvable (unknown type or reverted).' })); return; }
+      var def = rp.def;
+      editor.appendChild(el('h3', { 'class': 'cwstudio-eh', text: def.title }));
+      editor.appendChild(el('div', { 'class': 'cwstudio-typechip', text: 'type · ' + def.type }));
+      if (rp.def.source === 'builtin-fork') {
+        var pchip = el('div', { 'class': 'cwstudio-provenance' });
+        pchip.appendChild(el('span', { 'class': 'cwstudio-prov-dot' }));
+        pchip.appendChild(el('span', { text: 'forked from built-in "' + (def.forked_from || def.uid) + '"' }));
+        var prev = el('button', { 'class': 'tstudio-btn cwstudio-revert', type: 'button', text: 'revert' });
+        if (!operator) { prev.disabled = true; }
+        prev.addEventListener('click', function () { if (operator) { doRevert('page', def.uid); } });
+        pchip.appendChild(prev); editor.appendChild(pchip);
+      }
+      if (rp.builtin) {
+        editor.appendChild(el('p', { 'class': 'cwstudio-note', text: 'Built-in page — renders from the registry. Take control to override its title/sub/config; revert restores the registry default.' }));
+        var forkP = el('button', { 'class': 'tstudio-btn tstudio-btn-primary', type: 'button', text: 'Take control (fork page)' });
+        if (!operator) { forkP.disabled = true; }
+        forkP.addEventListener('click', function () { if (operator) { doForkPage(def); } });
+        editor.appendChild(forkP);
+      }
+      var editable = !rp.builtin && operator;
+      var titleInp = el('input', { 'class': 'tstudio-input', type: 'text', value: def.title });
+      var subInp = el('input', { 'class': 'tstudio-input', type: 'text', value: def.sub || '' });
+      if (!editable) { titleInp.setAttribute('disabled', 'disabled'); subInp.setAttribute('disabled', 'disabled'); }
+      editor.appendChild(cwsField('Title', titleInp));
+      editor.appendChild(cwsField('Subtitle', subInp));
+      // config form for typed options
+      var optDefs = CWS_TYPE_OPTIONS[def.type] || null;
+      var cfgInputs = {};
+      if (optDefs) {
+        var curQ = (def.config && def.config.query) || {};
+        optDefs.forEach(function (o) {
+          var node;
+          if (o.kind === 'select') {
+            node = el('select', { 'class': 'tstudio-input' });
+            o.options.forEach(function (opt) { var oe = el('option', { value: opt, text: opt }); if (String(curQ[o.key] != null ? curQ[o.key] : o.dflt) === opt) { oe.setAttribute('selected', 'selected'); } node.appendChild(oe); });
+          } else {
+            node = el('input', { 'class': 'tstudio-input', type: 'text', value: curQ[o.key] != null ? String(curQ[o.key]) : '', placeholder: o.placeholder || '' });
+          }
+          if (!editable) { node.setAttribute('disabled', 'disabled'); }
+          cfgInputs[o.key] = node;
+          editor.appendChild(cwsField(o.label, node));
+        });
+      } else {
+        editor.appendChild(el('p', { 'class': 'cwstudio-note', text: 'This page type takes no configurable options — it renders the registry default.' }));
+      }
+      if (editable) {
+        var save = el('button', { 'class': 'tstudio-btn tstudio-btn-primary', type: 'button', text: 'Save page' });
+        var out = el('div', { 'class': 'cwstudio-status' });
+        save.addEventListener('click', function () {
+          var ndef = {}; var ov = overlayFor('page', def.uid); var basis = (ov && ov.def) ? ov.def : def;
+          Object.keys(basis).forEach(function (k) { ndef[k] = basis[k]; });   // preserve unknown keys
+          ndef.schema_version = CWS_SCHEMA_VERSION; ndef.uid = def.uid; ndef.type = def.type;
+          ndef.title = titleInp.value || def.type; ndef.sub = subInp.value; ndef.dest = def.dest;
+          ndef.source = def.source === 'builtin-fork' ? 'builtin-fork' : 'user';
+          if (def.forked_from) { ndef.forked_from = def.forked_from; }
+          if (optDefs) { var q = (ndef.config && ndef.config.query) || {}; var nq = {}; Object.keys(q).forEach(function (k) { nq[k] = q[k]; }); optDefs.forEach(function (o) { var v = cfgInputs[o.key].value; if (v !== '' && v != null) { nq[o.key] = v; } else { delete nq[o.key]; } }); ndef.config = ndef.config && typeof ndef.config === 'object' ? Object.assign({}, ndef.config, { query: nq }) : { query: nq }; }
+          out.textContent = 'saving…';
+          saveDef('page', ndef).then(function (r) { out.textContent = r.ok ? 'saved' : ('save failed: ' + (r.error || r.status)); if (r.ok) { reload(); } });
+        });
+        editor.appendChild(save); editor.appendChild(out);
+        var rm = el('button', { 'class': 'tstudio-btn cwstudio-danger', type: 'button', text: 'Remove page' });
+        rm.addEventListener('click', function () { doRemovePage(def.uid); });
+        editor.appendChild(rm);
+      }
+      editor.appendChild(rawJsonEditor('page', def.uid, (overlayFor('page', def.uid) && overlayFor('page', def.uid).def) || def, editable));
+    }
+
+    // ---- raw-JSON escape hatch (preserves unknown keys) ----
+    function rawJsonEditor(kind, uid, def, editable) {
+      var wrap = el('details', { 'class': 'cwstudio-raw' });
+      wrap.appendChild(el('summary', { text: 'Raw JSON (canonical)' }));
+      var ta = el('textarea', { 'class': 'tstudio-input cwstudio-rawta', rows: '10', spellcheck: 'false' });
+      ta.value = cwsCanonical(def);
+      var out = el('div', { 'class': 'cwstudio-status' });
+      if (!editable) { ta.setAttribute('disabled', 'disabled'); }
+      wrap.appendChild(ta);
+      if (editable) {
+        var apply = el('button', { 'class': 'tstudio-btn', type: 'button', text: 'Validate + save JSON' });
+        apply.addEventListener('click', function () {
+          var parsed; try { parsed = JSON.parse(ta.value); } catch (e) { out.textContent = 'invalid JSON: ' + (e && e.message || e); return; }
+          var reader = kind === 'workspace' ? cwsReadWorkspaceDef : cwsReadPageDef;
+          var r = reader(parsed);
+          if (!r.valid) { out.textContent = 'schema check failed — missing ' + (kind === 'workspace' ? 'uid' : 'uid/type'); return; }
+          if (r.def.uid !== uid) { out.textContent = 'uid mismatch (this editor targets "' + uid + '")'; return; }
+          out.textContent = 'saving…';
+          // Write the parsed def verbatim (canonicalised) — unknown keys survive.
+          saveDef(kind, parsed).then(function (res) { out.textContent = res.ok ? 'saved (unknown keys preserved)' : 'save failed'; if (res.ok) { reload(); } });
+        });
+        wrap.appendChild(apply);
+      }
+      wrap.appendChild(out);
+      return wrap;
+    }
+
+    // ---- writes (all through the gated console fact-add) ----
+    function saveDef(kind, def) {
+      var entity = kind === 'workspace' ? cwsWorkspaceEntity(def.uid) : cwsPageEntity(def.uid);
+      return tstudioWriteFact(entity, CWS_DEF_KEY, cwsCanonical(def));
+    }
+    function doForkWorkspace(ws) {
+      var fork = cwsForkWorkspace(ws);
+      saveDef('workspace', fork).then(function (r) { if (r.ok) { reload(); } });
+    }
+    function doForkPage(def) {
+      var fork = {}; Object.keys(def).forEach(function (k) { fork[k] = def[k]; });
+      fork.schema_version = CWS_SCHEMA_VERSION; fork.source = 'builtin-fork'; fork.forked_from = def.uid; delete fork.builtin;
+      saveDef('page', fork).then(function (r) { if (r.ok) { reload(); } });
+    }
+    function doRevert(kind, uid) {
+      var entity = kind === 'workspace' ? cwsWorkspaceEntity(uid) : cwsPageEntity(uid);
+      tstudioWriteFact(entity, CWS_DEF_KEY, cwsCanonical(cwsTombstone(uid))).then(function (r) { if (r.ok) { if (SEL && SEL.uid === uid) { SEL = null; } reload(); } });
+    }
+    function doRemovePage(uid) {
+      // Remove from its workspace dest membership, then tombstone the page fact.
+      var ws = null; MODEL.workspaces.forEach(function (w) { if (SEL && w.uid === SEL.ws) { ws = w; } });
+      var chain = Promise.resolve({ ok: true });
+      if (ws && (ws.source === 'builtin-fork' || !ws.builtin)) {
+        var def = {}; var ov = overlayFor('workspace', ws.uid); var basis = (ov && ov.def) ? ov.def : ws;
+        Object.keys(basis).forEach(function (k) { def[k] = basis[k]; }); delete def.builtin;
+        def.dests = (def.dests || []).map(function (d) { var nd = {}; Object.keys(d).forEach(function (k) { nd[k] = d[k]; }); nd.pages = (d.pages || []).filter(function (p) { return p !== uid; }); return nd; });
+        chain = saveDef('workspace', def);
+      }
+      chain.then(function () { doRevert('page', uid); });
+    }
+
+    // ---- create workspace (starter templates) ----
+    function openStarterPicker() {
+      var m = cwsModal('New workspace — pick a starting point');
+      m.body.appendChild(el('p', { 'class': 'cwstudio-note', text: 'Remix, do not start blank. Duplicate the full Command console, take a minimal ops set, or start (nearly) empty.' }));
+      cwsStarterTemplates().forEach(function (t) {
+        var card = el('button', { 'class': 'cwstudio-startcard', type: 'button' });
+        card.appendChild(el('span', { 'class': 'cwstudio-startlab', text: t.label }));
+        card.appendChild(el('span', { 'class': 'cwstudio-startdesc', text: t.desc }));
+        card.addEventListener('click', function () { m.close(); promptName(t); });
+        m.body.appendChild(card);
+      });
+    }
+    function promptName(t) {
+      var m = cwsModal('Name your ' + t.label.toLowerCase() + ' workspace');
+      var nameInp = el('input', { 'class': 'tstudio-input', type: 'text', value: '', placeholder: 'e.g. My ops board' });
+      m.body.appendChild(cwsField('Workspace name', nameInp));
+      var out = el('div', { 'class': 'cwstudio-status' });
+      var go = el('button', { 'class': 'tstudio-btn tstudio-btn-primary', type: 'button', text: 'Create' });
+      go.addEventListener('click', function () {
+        var name = (nameInp.value || t.label).trim();
+        var base = 'ws-' + cwsSlugify(name); var uid = base; var n = 1;
+        var taken = {}; MODEL.workspaces.forEach(function (w) { taken[w.uid] = true; });
+        while (taken[uid]) { n++; uid = base + '-' + n; }
+        var built = t.build(uid, name);
+        out.textContent = 'creating…';
+        var writes = [saveDef('workspace', built.workspace)];
+        (built.pages || []).forEach(function (p) { writes.push(saveDef('page', p)); });
+        Promise.all(writes).then(function (rs) {
+          var ok = rs.every(function (r) { return r && r.ok; });
+          out.textContent = ok ? 'created' : 'create failed';
+          if (ok) { m.close(); SEL = { kind: 'workspace', uid: uid }; reload(); }
+        });
+      });
+      m.body.appendChild(go); m.body.appendChild(out);
+      if (nameInp.focus) { setTimeout(function () { try { nameInp.focus(); } catch (e) { } }, 0); }
+    }
+
+    // ---- add page (type picker = every registry type) ----
+    function openAddPage(wsUid, destId) {
+      var m = cwsModal('Add a page');
+      m.body.appendChild(el('p', { 'class': 'cwstudio-note', text: 'Pick any page type from the registry — whatever exists in the console is generatable here.' }));
+      var typeSel = el('select', { 'class': 'tstudio-input' });
+      cwsPageTypes().forEach(function (pt) { typeSel.appendChild(el('option', { value: pt.type, text: pt.label })); });
+      var titleInp = el('input', { 'class': 'tstudio-input', type: 'text', value: '', placeholder: 'Page title' });
+      var subInp = el('input', { 'class': 'tstudio-input', type: 'text', value: '', placeholder: 'Subtitle (optional)' });
+      m.body.appendChild(cwsField('Type', typeSel));
+      m.body.appendChild(cwsField('Title', titleInp));
+      m.body.appendChild(cwsField('Subtitle', subInp));
+      var out = el('div', { 'class': 'cwstudio-status' });
+      var add = el('button', { 'class': 'tstudio-btn tstudio-btn-primary', type: 'button', text: 'Add page' });
+      add.addEventListener('click', function () {
+        var type = typeSel.value;
+        var title = (titleInp.value || '').trim() || type;
+        var puid = wsUid + '-' + cwsSlugify(title); var base = puid; var n = 1;
+        while (MODEL.pages[puid]) { n++; puid = base + '-' + n; }
+        var pdef = { schema_version: CWS_SCHEMA_VERSION, uid: puid, type: type, title: title, sub: subInp.value || '', dest: destId, config: {}, source: 'user' };
+        // add to workspace dest membership
+        var ws = null; MODEL.workspaces.forEach(function (w) { if (w.uid === wsUid) { ws = w; } });
+        var wdef = {}; var ov = overlayFor('workspace', wsUid); var basis = (ov && ov.def) ? ov.def : ws;
+        Object.keys(basis).forEach(function (k) { wdef[k] = basis[k]; }); delete wdef.builtin;
+        wdef.dests = (wdef.dests || []).map(function (d) { var nd = {}; Object.keys(d).forEach(function (k) { nd[k] = d[k]; }); if (d.id === destId) { nd.pages = (d.pages || []).concat([puid]); } return nd; });
+        out.textContent = 'adding…';
+        Promise.all([saveDef('page', pdef), saveDef('workspace', wdef)]).then(function (rs) {
+          var ok = rs.every(function (r) { return r && r.ok; });
+          out.textContent = ok ? 'added' : 'add failed';
+          if (ok) { m.close(); SEL = { kind: 'page', uid: puid, ws: wsUid, dest: destId }; reload(); }
+        });
+      });
+      m.body.appendChild(add); m.body.appendChild(out);
+    }
+
+    // ---- export a workspace as a crux.studio.v1 pack (additive) ----
+    function openExportWorkspace(ws) {
+      var m = cwsModal('Export "' + ws.name + '" as a pack');
+      // collect this workspace's page defs (config facts only — built-ins render
+      // from the registry and travel as type references inside the workspace dests).
+      var pageDefs = [];
+      (ws.dests || []).forEach(function (d) { (d.pages || []).forEach(function (pu) { if (MODEL.pages[pu]) { pageDefs.push(MODEL.pages[pu]); } }); });
+      var wsDef = {}; var ov = overlayFor('workspace', ws.uid); var basis = (ov && ov.def) ? ov.def : ws;
+      Object.keys(basis).forEach(function (k) { wsDef[k] = basis[k]; }); delete wsDef.builtin;
+      var idInp = el('input', { 'class': 'tstudio-input', type: 'text', value: 'studio.' + cwsSlugify(ws.name) });
+      var verInp = el('input', { 'class': 'tstudio-input', type: 'text', value: '0.1.0' });
+      var pubInp = el('input', { 'class': 'tstudio-input', type: 'text', value: 'p_your_passport_fpr' });
+      m.body.appendChild(cwsField('Pack id', idInp));
+      m.body.appendChild(cwsField('Version', verInp));
+      m.body.appendChild(cwsField('Publisher fpr', pubInp));
+      m.body.appendChild(el('p', { 'class': 'cwstudio-note', text: 'Carries ' + (1) + ' workspace + ' + pageDefs.length + ' page(s) as additive workspaces/pages arrays on a valid crux.studio.v1 payload (with an empty board). Re-import applies them as a defaults layer.' }));
+      var out = el('div', { 'class': 'cwstudio-status' });
+      var build = el('button', { 'class': 'tstudio-btn tstudio-btn-primary', type: 'button', text: 'Build + download' });
+      build.addEventListener('click', function () {
+        var studio = cwsPackEmbed(tstudioBuildStudioPayload('workspace-' + ws.uid, tstudioNormalizeDoc({}), [], tstudioDefaultSettings()), [wsDef], pageDefs);
+        var rp = (typeof window !== 'undefined') ? window.CruxApiRead : null;
+        if (!rp || typeof rp.studioPackBuild !== 'function') { out.textContent = 'pack client unavailable'; return; }
+        out.textContent = 'building…';
+        rp.studioPackBuild({ studio: studio, id: idInp.value, name: ws.name, version: verInp.value, publisher_passport_fpr: pubInp.value, summary: 'Workspace pack: ' + ws.name })
+          .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, data: d }; }, function () { return { ok: false }; }); })
+          .then(function (res) {
+            if (!res.ok || !res.data || !res.data.pack) { out.textContent = 'build failed'; return; }
+            try {
+              var blob = new Blob([JSON.stringify(res.data.pack, null, 2)], { type: 'application/json' });
+              var url = URL.createObjectURL(blob);
+              var a = el('a', { href: url, download: (cwsSlugify(ws.name) || 'workspace') + '.cruxstudio.json' });
+              root.appendChild(a); a.click(); setTimeout(function () { if (a.parentNode) { a.parentNode.removeChild(a); } URL.revokeObjectURL(url); }, 0);
+            } catch (e) { }
+            out.textContent = res.data.signed ? 'Signed pack downloaded.' : 'Unsigned pack downloaded (sign before publishing).';
+          });
+      });
+      m.body.appendChild(build); m.body.appendChild(out);
+    }
+
+    // ---- deterministic verification hooks (Playwright; harmless assignments) ----
+    if (typeof window !== 'undefined') {
+      window.__cwstudio = {
+        model: function () { return MODEL; },
+        select: function (kind, uid, ws, dest) { SEL = { kind: kind, uid: uid, ws: ws, dest: dest }; paintTree(); paintEditor(); },
+        createFromTemplate: function (tid, name) {
+          var t = null; cwsStarterTemplates().forEach(function (x) { if (x.id === tid) { t = x; } });
+          if (!t) { return Promise.resolve({ ok: false }); }
+          var uid = 'ws-' + cwsSlugify(name); var built = t.build(uid, name);
+          var writes = [saveDef('workspace', built.workspace)]; (built.pages || []).forEach(function (p) { writes.push(saveDef('page', p)); });
+          return Promise.all(writes).then(function (rs) { var ok = rs.every(function (r) { return r && r.ok; }); return reload().then(function () { return { ok: ok, uid: uid }; }); });
+        },
+        addPage: function (wsUid, destId, type, title) {
+          var puid = wsUid + '-' + cwsSlugify(title || type);
+          var pdef = { schema_version: CWS_SCHEMA_VERSION, uid: puid, type: type, title: title || type, sub: '', dest: destId, config: {}, source: 'user' };
+          var ws = null; MODEL.workspaces.forEach(function (w) { if (w.uid === wsUid) { ws = w; } });
+          if (!ws) { return Promise.resolve({ ok: false }); }
+          var wdef = {}; var ov = overlayFor('workspace', wsUid); var basis = (ov && ov.def) ? ov.def : ws; Object.keys(basis).forEach(function (k) { wdef[k] = basis[k]; }); delete wdef.builtin;
+          wdef.dests = (wdef.dests || []).map(function (d) { var nd = {}; Object.keys(d).forEach(function (k) { nd[k] = d[k]; }); if (d.id === destId) { nd.pages = (d.pages || []).concat([puid]); } return nd; });
+          return Promise.all([saveDef('page', pdef), saveDef('workspace', wdef)]).then(function (rs) { var ok = rs.every(function (r) { return r && r.ok; }); return reload().then(function () { return { ok: ok, uid: puid }; }); });
+        },
+        forkWorkspace: function (uid) { var ws = null; MODEL.workspaces.forEach(function (w) { if (w.uid === uid) { ws = w; } }); if (!ws) { return Promise.resolve({ ok: false }); } return saveDef('workspace', cwsForkWorkspace(ws)).then(function (r) { return reload().then(function () { return r; }); }); },
+        forkPage: function (uid) { var rp = resolvePage(uid); if (!rp || !rp.builtin) { return Promise.resolve({ ok: false }); } var fork = {}; Object.keys(rp.def).forEach(function (k) { fork[k] = rp.def[k]; }); fork.source = 'builtin-fork'; fork.forked_from = uid; delete fork.builtin; return saveDef('page', fork).then(function (r) { return reload().then(function () { return r; }); }); },
+        revert: function (kind, uid) { var entity = kind === 'workspace' ? cwsWorkspaceEntity(uid) : cwsPageEntity(uid); return tstudioWriteFact(entity, CWS_DEF_KEY, cwsCanonical(cwsTombstone(uid))).then(function (r) { return reload().then(function () { return r; }); }); },
+        openStarter: function () { openStarterPicker(); },
+        openExport: function (uid) { var ws = null; MODEL.workspaces.forEach(function (w) { if (w.uid === uid) { ws = w; } }); if (ws) { openExportWorkspace(ws); } },
+        // Pack round-trip: build a workspace pack (additive workspaces/pages on a
+        // valid crux.studio.v1 payload) then re-apply it (defaults layer). Used
+        // by the Playwright round-trip proof; harmless plain window assignments.
+        buildWorkspacePack: function (uid) {
+          var ws = null; MODEL.workspaces.forEach(function (w) { if (w.uid === uid) { ws = w; } });
+          if (!ws) { return Promise.resolve({ ok: false }); }
+          var pageDefs = []; (ws.dests || []).forEach(function (d) { (d.pages || []).forEach(function (pu) { if (MODEL.pages[pu]) { pageDefs.push(MODEL.pages[pu]); } }); });
+          var wsDef = {}; var ov = overlayFor('workspace', uid); var basis = (ov && ov.def) ? ov.def : ws; Object.keys(basis).forEach(function (k) { wsDef[k] = basis[k]; }); delete wsDef.builtin;
+          var studio = cwsPackEmbed(tstudioBuildStudioPayload('workspace-' + uid, tstudioNormalizeDoc({}), [], tstudioDefaultSettings()), [wsDef], pageDefs);
+          var rp = window.CruxApiRead;
+          return rp.studioPackBuild({ studio: studio, id: 'studio.' + cwsSlugify(ws.name), name: ws.name, version: '0.1.0', publisher_passport_fpr: 'p_rt', summary: 'rt' }).then(function (r) { return r.json(); });
+        },
+        applyWorkspacePack: function (pack) {
+          var studio = pack && pack.studio; if (!studio) { return Promise.resolve({ ok: false }); }
+          var ex = cwsPackExtract(studio); var writes = [];
+          ex.workspaces.forEach(function (w) { if (w && w.uid) { writes.push(tstudioWriteFact(cwsWorkspaceEntity(w.uid), CWS_DEF_KEY, cwsCanonical(w))); } });
+          ex.pages.forEach(function (pg) { if (pg && pg.uid) { writes.push(tstudioWriteFact(cwsPageEntity(pg.uid), CWS_DEF_KEY, cwsCanonical(pg))); } });
+          return Promise.all(writes).then(function (rs) { var ok = rs.every(function (r) { return r && r.ok; }); return reload().then(function () { return { ok: ok, applied: ex.workspaces.length + ex.pages.length }; }); });
+        },
+        reload: function () { return reload(); }
+      };
+    }
+
+    return reload();
+  }
+
+  // =======================================================================
+  //  Studio › Integrations (M16b · rebuilt for crux-integrations I1+I2) — the
+  //  ONE actionable integrations home (console plan M16: "integrations setup
+  //  moves into the Studio"). Four sections, in setup order:
+  //
+  //    connectors — GitHub / OpenAI credential lifecycle (connect · sync · disconnect)
+  //    packs      — built-in integration packs (install · grant · disable)
+  //    extensions — installed community extensions (invoke · grants · uninstall)
+  //                 plus the verified catalog with a per-entry safety scorecard
+  //    keys       — the Ed25519 keyring signed manifests verify against
+  //
+  //  Reads go through the generated GET client (fetchJSON for literal paths,
+  //  named CruxApi methods for parameterised ones) — no raw fetch. Every write
+  //  goes through operatorGatedCall → the frozen gated client generated from
+  //  GATED_MUTATIONS, under the same five guards as the M13b page harness:
+  //  operator posture, a bound-passport Art.14 refusal, a confirm dialog on the
+  //  destructive subset, the single gated choke point, and the REAL backend
+  //  response (verbatim JSON for invoke). A missing route or 404 reads as "not
+  //  available on this daemon" — nothing here fabricates a success.
+  //
+  //  Secrets are write-only: PAT / API-key fields are type=password, are never
+  //  populated from a status read, and are cleared the moment the write fires.
+  // =======================================================================
+  var CINT_SECTIONS = ['connectors', 'packs', 'extensions', 'keys'];
+  var CINT_TRUST_TIERS = ['community_reviewed', 'locally_signed', 'first_party', 'unknown'];
+
+  function cintSection(key, title, sub) {
+    var s = el('section', { 'class': 'cint-section', 'data-section': key, 'aria-label': title });
+    var head = el('div', { 'class': 'cint-sechead' });
+    head.appendChild(el('h3', { 'class': 'cint-sectitle', text: title }));
+    if (sub) { head.appendChild(el('p', { 'class': 'cwstudio-note', text: sub })); }
+    s.appendChild(head);
+    return s;
+  }
+  function cintCard(title) {
+    var c = el('div', { 'class': 'v2card wide cwstudio-intcard' });
+    c.appendChild(el('h3', { 'class': 'v2card-h', text: title }));
+    return c;
+  }
+  function cintGrid(section) { var g = el('div', { 'class': 'cwstudio-intgrid' }); section.appendChild(g); return g; }
+  function cintLoading(host) { var l = el('div', { 'class': 'cwstudio-loading', text: 'loading…' }); host.appendChild(l); return l; }
+  function cintDrop(node) { if (node && node.parentNode) { node.parentNode.removeChild(node); } }
+  // The honest absent-route state. A daemon built without a feature answers 404;
+  // an unreachable one answers status 0. Both are reported, never smoothed over.
+  function cintUnavailable(host, what, status) {
+    host.appendChild(el('div', { 'class': 'tstudio-apierr', text: what + ' is not available on this daemon' + (status ? ' (HTTP ' + status + ')' : ' (unreachable)') + '.' }));
+  }
+  function cintField(label, node) {
+    var f = el('div', { 'class': 'cint-field' });
+    f.appendChild(el('label', { 'class': 'tstudio-field-lab', text: label }));
+    f.appendChild(node);
+    return f;
+  }
+  function cintInput(opts) {
+    opts = opts || {};
+    return el('input', {
+      'class': 'tstudio-input' + (opts.mono ? ' cint-mono' : ''),
+      type: opts.type || 'text',
+      placeholder: opts.ph || '',
+      // Password fields opt out of autofill so a browser never re-populates a
+      // secret the daemon deliberately refuses to hand back.
+      autocomplete: opts.type === 'password' ? 'new-password' : 'off'
+    });
+  }
+  function cintCheck() { return el('input', { 'class': 'cint-check', type: 'checkbox' }); }
+  function cintSelect(options, initial) {
+    var s = el('select', { 'class': 'tstudio-select' });
+    options.forEach(function (o) {
+      var opt = el('option', { value: o, text: o });
+      if (o === initial) { opt.setAttribute('selected', 'selected'); }
+      s.appendChild(opt);
+    });
+    return s;
+  }
+  function cintOut(host) { var o = el('div', { 'class': 'wired-out', 'aria-live': 'polite' }); host.appendChild(o); return o; }
+  function cintRow(label, value) {
+    var r = el('div', { 'class': 'cint-row' });
+    r.appendChild(el('span', { 'class': 'cint-row-k', text: label }));
+    r.appendChild(el('span', { 'class': 'cint-row-v', text: (value == null || value === '') ? '—' : String(value) }));
+    return r;
+  }
+  function cintWhen(ms) {
+    var n = Number(ms);
+    if (!isFinite(n) || n <= 0) { return '—'; }
+    try { return new Date(n).toISOString().replace('T', ' ').slice(0, 16) + 'Z'; }
+    catch (e) { return String(ms); }
+  }
+  // Operator-only, and never rendered disabled: the refusal reason belongs in the
+  // result line (posture / bound passport), not in a greyed control with no voice.
+  function cintBtn(label, opts) {
+    opts = opts || {};
+    var cls = 'tstudio-btn'
+      + (opts.danger ? ' tstudio-btn-danger cwstudio-danger' : '')
+      + (opts.primary ? ' tstudio-btn-primary' : '');
+    return stampOperatorOnly(el('button', { 'class': cls, type: 'button', title: opts.title || '' }, [label]));
+  }
+  function cintActions(host) { var a = el('div', { 'class': 'cint-actions' }); host.appendChild(a); return a; }
+
+  // The write harness for this surface: the M13b WIRED_WRITES guards expressed
+  // for hand-built Studio DOM instead of the page DSL. Every mutation in Studio ›
+  // Integrations goes through here, so there is exactly one place that decides
+  // whether a write may fire.
+  function cintWrite(out, opts) {
+    opts = opts || {};
+    if (!isOperator()) { showWiredResult(out, 'Operator posture required — this control is unavailable in customer view.', true); return; }
+    var pp = boundPassport();
+    if (!pp) { showWiredResult(out, ART14_MSG, true); return; }
+    function fire() {
+      showWiredResult(out, 'working…', false);
+      opts.run(pp).then(function (r) {
+        if (opts.render) { opts.render(out, r); }
+        else { showWiredResult(out, formatReceipt(r), !r.ok); }
+        if (opts.after) { opts.after(r); }
+      }, function (err) { showWiredResult(out, String((err && err.message) || err), true); });
+    }
+    if (opts.confirm) { showConfirm(out, opts.confirm, fire); } else { fire(); }
+  }
+  // Invoke results are shown verbatim: an extension's response is third-party
+  // data the operator is judging, so it is never summarised or reshaped.
+  function cintVerbatim(out, r) {
+    out.textContent = '';
+    out.appendChild(el('p', { 'class': 'wired-result ' + (r.ok ? 'is-ok' : 'is-err'), text: 'HTTP ' + r.status }));
+    var text;
+    try { text = (r.data == null) ? '(empty body)' : JSON.stringify(r.data, null, 2); }
+    catch (e) { text = String(r.data); }
+    out.appendChild(el('pre', { 'class': 'cint-verbatim', text: text }));
+  }
+  // Parameterised GETs have no literal-path entry in the generated allowlist, so
+  // they go through the named client method rather than fetchJSON.
+  function cintApiJson(name, args) {
+    var api = (typeof window !== 'undefined') ? window.CruxApi : null;
+    if (!api || typeof api[name] !== 'function') { return Promise.resolve({ ok: false, status: 0, data: null }); }
+    return api[name].apply(api, args || []).then(function (r) {
+      return r.json().then(
+        function (d) { return { ok: r.ok, status: r.status, data: d }; },
+        function () { return { ok: r.ok, status: r.status, data: null }; }
+      );
+    }, function () { return { ok: false, status: 0, data: null }; });
+  }
+
+  // Safety scorecard for one catalog row. The curator-signed index pins identity
+  // and provenance (kind, tier, manifest sha256, repo) but NOT the capability set
+  // — that lives in the manifest the daemon fetches and sha-checks at install. So
+  // capabilities / allowed hosts render from the INSTALLED manifest when there is
+  // one, and say plainly that they are not in the index when there is not.
+  function cintScorecard(entry, manifest) {
+    entry = entry || {};
+    manifest = manifest || null;
+    var wrap = el('div', { 'class': 'cint-scorecard' });
+    wrap.appendChild(el('div', { 'class': 'tstudio-field-lab', text: 'Safety scorecard' }));
+    var caps = el('div', { 'class': 'cwstudio-chips cint-scorecard-caps' });
+    var declared = (manifest && Array.isArray(manifest.capabilities)) ? manifest.capabilities : [];
+    declared.forEach(function (c) { caps.appendChild(el('span', { 'class': 'tstudio-cap-chip', text: String(c) })); });
+    if (!declared.length) {
+      caps.appendChild(el('span', {
+        'class': 'cwstudio-note',
+        text: manifest ? 'no capabilities declared' : 'not in the index — declared in the manifest, shown at install and verified against the pinned sha256'
+      }));
+    }
+    wrap.appendChild(cintField('declared capabilities', caps));
+    var hosts = (manifest && manifest.network && Array.isArray(manifest.network.allowed_hosts)) ? manifest.network.allowed_hosts : [];
+    wrap.appendChild(cintRow('entry kind', entry.kind || (manifest && manifest.entry && manifest.entry.kind)));
+    wrap.appendChild(cintRow('network allowed_hosts', hosts.length ? hosts.join(' · ') : (manifest ? 'none — endpoint pinning only' : 'not in the index')));
+    wrap.appendChild(cintRow('trust tier', String(entry.trust_tier || (manifest && manifest.trust_tier) || 'unknown')));
+    wrap.appendChild(cintRow('signature', manifest ? (manifest.signature ? 'signed manifest' : 'unsigned manifest') : 'curator-signed index row'));
+    wrap.appendChild(cintRow('manifest sha256 (pinned)', entry.manifest_sha256));
+    var repo = String(entry.repo_url || '');
+    if (/^https:\/\//.test(repo)) {
+      var r = el('div', { 'class': 'cint-row' });
+      r.appendChild(el('span', { 'class': 'cint-row-k', text: 'source repo' }));
+      r.appendChild(el('a', { 'class': 'cint-row-v cint-link', href: repo, rel: 'noopener noreferrer', target: '_blank', text: repo }));
+      wrap.appendChild(r);
+    } else {
+      wrap.appendChild(cintRow('source repo', repo));
+    }
+    return wrap;
+  }
+
+  // ---- Section 1: connectors ---------------------------------------------
+  function cintGithubCard(grid) {
+    var card = cintCard('GitHub');
+    grid.appendChild(card);
+    var load = cintLoading(card);
+    var body = el('div', { 'class': 'cint-cardbody' });
+    card.appendChild(body);
+    function paint() {
+      body.textContent = '';
+      return Promise.all([fetchJSON('/v1/integrations/github/status'), fetchJSON('/v1/integrations/github/repos')])
+        .then(function (res) {
+          cintDrop(load);
+          var st = res[0], repos = res[1];
+          if (!st.ok) { cintUnavailable(body, 'The GitHub integration', st.status); return; }
+          var d = st.data || {};
+          var chips = el('div', { 'class': 'cwstudio-postrow' });
+          chips.appendChild(el('span', { 'class': 'cwstudio-postchip ' + (d.connected ? 'is-on' : 'is-off'), text: d.connected ? 'connected' : 'not connected' }));
+          (Array.isArray(d.scopes) ? d.scopes : []).forEach(function (s) { chips.appendChild(el('span', { 'class': 'cwstudio-postchip', text: String(s) })); });
+          body.appendChild(chips);
+          body.appendChild(cintRow('account', d.username));
+          body.appendChild(cintRow('connected', cintWhen(d.connected_at_unix_ms)));
+          body.appendChild(cintRow('last verified', cintWhen(d.last_verified_at_unix_ms)));
+          body.appendChild(cintRow('selected repos', repos.ok ? ((repos.data && repos.data.count != null) ? repos.data.count : 0) : 'unavailable (HTTP ' + repos.status + ')'));
+
+          var pat = cintInput({ type: 'password', ph: 'ghp_…', mono: true });
+          var skip = cintCheck();
+          var form = el('div', { 'class': 'cint-form' });
+          form.appendChild(cintField('personal access token (write-only)', pat));
+          form.appendChild(cintField('skip verification (dev only)', skip));
+          stampOperatorOnly(form);
+          body.appendChild(form);
+
+          var out;
+          var acts = cintActions(body);
+          stampOperatorOnly(acts);
+          var connect = cintBtn(d.connected ? 'Replace token' : 'Connect', { primary: !d.connected, title: 'POST /v1/integrations/github/connect' });
+          connect.addEventListener('click', function () {
+            var secret = String(pat.value || '');
+            pat.value = '';
+            cintWrite(out, {
+              run: function () { return operatorGatedCall(function (g) { return g.githubConnect({ pat: secret, skip_verify: !!skip.checked }); }).then(readJson); },
+              after: function (r) { if (r.ok) { paint(); } }
+            });
+          });
+          acts.appendChild(connect);
+          if (d.connected) {
+            var sync = cintBtn('Sync now', { title: 'POST /v1/integrations/github/sync' });
+            sync.addEventListener('click', function () {
+              cintWrite(out, { run: function () { return operatorGatedCall(function (g) { return g.githubSync({}); }).then(readJson); } });
+            });
+            acts.appendChild(sync);
+            var disc = cintBtn('Disconnect', { danger: true, title: 'POST /v1/integrations/github/disconnect' });
+            disc.addEventListener('click', function () {
+              cintWrite(out, {
+                confirm: 'Deletes the sealed GitHub token AND the selected-repo list on this daemon. Repo sync stops until a new token is connected. Proceed?',
+                run: function () { return operatorGatedCall(function (g) { return g.githubDisconnect({}); }).then(readJson); },
+                after: function (r) { if (r.ok) { paint(); } }
+              });
+            });
+            acts.appendChild(disc);
+          }
+          out = cintOut(body);
+        });
+    }
+    return paint();
+  }
+
+  function cintOpenAiCard(grid) {
+    var card = cintCard('OpenAI-compatible LLM');
+    grid.appendChild(card);
+    var load = cintLoading(card);
+    var body = el('div', { 'class': 'cint-cardbody' });
+    card.appendChild(body);
+    function paint() {
+      body.textContent = '';
+      return fetchJSON('/v1/integrations/openai/status').then(function (st) {
+        cintDrop(load);
+        if (!st.ok) { cintUnavailable(body, 'The OpenAI integration', st.status); return; }
+        var d = st.data || {};
+        var chips = el('div', { 'class': 'cwstudio-postrow' });
+        chips.appendChild(el('span', { 'class': 'cwstudio-postchip ' + (d.connected ? 'is-on' : 'is-off'), text: d.connected ? 'connected' : 'not connected' }));
+        body.appendChild(chips);
+        body.appendChild(cintRow('organisation', d.organization_id));
+        body.appendChild(cintRow('default model', d.default_model));
+        body.appendChild(cintRow('models discovered', (Array.isArray(d.available_models) ? d.available_models.length : 0)));
+        body.appendChild(cintRow('connected', cintWhen(d.connected_at_unix_ms)));
+        body.appendChild(cintRow('last verified', cintWhen(d.last_verified_at_unix_ms)));
+
+        var key = cintInput({ type: 'password', ph: 'sk-…', mono: true });
+        var org = cintInput({ ph: 'org-… (optional)', mono: true });
+        var model = cintInput({ ph: 'gpt-4o-mini (optional)', mono: true });
+        var skip = cintCheck();
+        var form = el('div', { 'class': 'cint-form' });
+        form.appendChild(cintField('API key (write-only)', key));
+        form.appendChild(cintField('organisation', org));
+        form.appendChild(cintField('default model', model));
+        form.appendChild(cintField('skip verification (dev only)', skip));
+        stampOperatorOnly(form);
+        body.appendChild(form);
+
+        var out;
+        var acts = cintActions(body);
+        stampOperatorOnly(acts);
+        var connect = cintBtn(d.connected ? 'Replace key' : 'Connect', { primary: !d.connected, title: 'POST /v1/integrations/openai/connect' });
+        connect.addEventListener('click', function () {
+          var secret = String(key.value || '');
+          var orgv = String(org.value || '');
+          var modelv = String(model.value || '');
+          key.value = '';
+          cintWrite(out, {
+            run: function () { return operatorGatedCall(function (g) { return g.openaiConnect({ api_key: secret, organization_id: orgv || undefined, default_model: modelv || undefined, skip_verify: !!skip.checked }); }).then(readJson); },
+            after: function (r) { if (r.ok) { paint(); } }
+          });
+        });
+        acts.appendChild(connect);
+        if (d.connected) {
+          var disc = cintBtn('Disconnect', { danger: true, title: 'POST /v1/integrations/openai/disconnect' });
+          disc.addEventListener('click', function () {
+            cintWrite(out, {
+              confirm: 'Deletes the sealed OpenAI API key on this daemon. Embedding + chat calls that depend on it start failing immediately. Proceed?',
+              run: function () { return operatorGatedCall(function (g) { return g.openaiDisconnect({}); }).then(readJson); },
+              after: function (r) { if (r.ok) { paint(); } }
+            });
+          });
+          acts.appendChild(disc);
+        }
+        out = cintOut(body);
+      });
+    }
+    return paint();
+  }
+
+  // ---- Section 2: packs ---------------------------------------------------
+  function cintPacksCard(section) {
+    var card = cintCard('Integration plane');
+    cintGrid(section).appendChild(card);
+    var load = cintLoading(card);
+    var body = el('div', { 'class': 'cint-cardbody' });
+    card.appendChild(body);
+    function paint() {
+      body.textContent = '';
+      return fetchJSON('/v1/console/integrations').then(function (res) {
+        cintDrop(load);
+        if (!res.ok) { cintUnavailable(body, 'The integration plane', res.status); return; }
+        var d = res.data || {};
+        var row = el('div', { 'class': 'cwstudio-postrow' });
+        row.appendChild(el('span', { 'class': 'cwstudio-postchip ' + (d.enabled ? 'is-on' : 'is-off'), text: d.enabled ? 'enabled' : 'disabled' }));
+        row.appendChild(el('span', { 'class': 'cwstudio-postchip ' + (d.safe_mode ? 'is-warn' : 'is-on'), text: d.safe_mode ? 'safe mode' : 'live' }));
+        row.appendChild(el('span', { 'class': 'cwstudio-postchip ' + (d.allow_executable_helpers ? 'is-warn' : 'is-on'), text: 'executable helpers ' + (d.allow_executable_helpers ? 'allowed' : 'off') }));
+        body.appendChild(row);
+        body.appendChild(el('div', { 'class': 'tstudio-field-lab', text: 'Allowed capabilities' }));
+        var caps = el('div', { 'class': 'cwstudio-chips' });
+        (Array.isArray(d.allowed_capabilities) ? d.allowed_capabilities : []).forEach(function (c) {
+          caps.appendChild(el('span', { 'class': 'tstudio-cap-chip', text: String(c) }));
+        });
+        body.appendChild(caps);
+        if (!d.enabled) {
+          body.appendChild(el('p', { 'class': 'cwstudio-note', text: 'Integrations are disabled on this daemon — install and grant answer 403 until CRUX_INTEGRATIONS is enabled.' }));
+        } else if (d.safe_mode) {
+          body.appendChild(el('p', { 'class': 'cwstudio-note', text: 'Safe mode is on — install and grant answer 403, and non-first-party packs read as blocked.' }));
+        }
+        var packs = Array.isArray(d.packs) ? d.packs : [];
+        body.appendChild(el('div', { 'class': 'tstudio-field-lab', text: 'Packs (' + packs.length + ')' }));
+        if (!packs.length) { body.appendChild(el('p', { 'class': 'cwstudio-note', text: 'No packs reported by this daemon.' })); }
+        packs.forEach(function (p) { body.appendChild(cintPackRow(p, paint)); });
+      });
+    }
+    return paint();
+  }
+
+  function cintPackRow(pack, reload) {
+    pack = pack || {};
+    var m = pack.manifest || {};
+    var id = String(m.id || m.name || '—');
+    var version = String(m.version || '');
+    var caps = Array.isArray(m.capabilities) ? m.capabilities : [];
+    var wrap = el('div', { 'class': 'cint-packcard' });
+    var head = el('div', { 'class': 'cwstudio-packrow' });
+    head.appendChild(el('span', { 'class': 'cwstudio-packid', text: id + (version ? ' · ' + version : '') }));
+    head.appendChild(el('span', { 'class': 'cwstudio-postchip', text: String(pack.install_state || 'available') }));
+    head.appendChild(el('span', { 'class': 'tstudio-ext-tier', text: String(pack.trust_tier || 'unknown') }));
+    if (pack.risk_level) {
+      head.appendChild(el('span', { 'class': 'cwstudio-postchip ' + (pack.risk_level === 'low' ? 'is-on' : 'is-warn'), text: 'risk ' + pack.risk_level }));
+    }
+    wrap.appendChild(head);
+    var chips = el('div', { 'class': 'cwstudio-chips' });
+    caps.forEach(function (c) { chips.appendChild(el('span', { 'class': 'tstudio-cap-chip', text: String(c) })); });
+    if (!caps.length) { chips.appendChild(el('span', { 'class': 'cwstudio-note', text: 'no capabilities declared' })); }
+    wrap.appendChild(chips);
+
+    var out;
+    var acts = cintActions(wrap);
+    stampOperatorOnly(acts);
+    var install = cintBtn(pack.install_state === 'available' ? 'Install' : 'Reinstall', { title: 'POST /v1/console/integrations/' + id + '/install' });
+    install.addEventListener('click', function () {
+      cintWrite(out, {
+        run: function () { return operatorGatedCall(function (g) { return g.integrationPackInstall(id, { pack_id: id, version: version }); }).then(readJson); },
+        after: function (r) { if (r.ok) { reload(); } }
+      });
+    });
+    acts.appendChild(install);
+    // Grant issues exactly the capabilities the manifest declares — install alone
+    // never grants, and the console never widens the set the publisher asked for.
+    var grant = cintBtn('Grant declared capabilities', { title: 'POST /v1/console/integrations/' + id + '/grant' });
+    grant.addEventListener('click', function () {
+      cintWrite(out, {
+        confirm: 'Grants "' + id + '" the ' + caps.length + ' capability/ies its manifest declares (' + (caps.join(', ') || 'none — the daemon will reject an empty set') + '). Proceed?',
+        run: function () { return operatorGatedCall(function (g) { return g.integrationPackGrant(id, { version: version, capabilities: caps, reason: 'granted from Studio › Integrations' }); }).then(readJson); },
+        after: function (r) { if (r.ok) { reload(); } }
+      });
+    });
+    acts.appendChild(grant);
+    var disable = cintBtn('Disable', { danger: true, title: 'POST /v1/console/integrations/' + id + '/disable' });
+    disable.addEventListener('click', function () {
+      cintWrite(out, {
+        confirm: 'Disables the "' + id + '" grant on this daemon — every capability it unlocked stops resolving for the granted passport. Proceed?',
+        run: function () { return operatorGatedCall(function (g) { return g.integrationPackDisable(id, { reason: 'disabled from Studio › Integrations' }); }).then(readJson); },
+        after: function (r) { if (r.ok) { reload(); } }
+      });
+    });
+    acts.appendChild(disable);
+    out = cintOut(wrap);
+    return wrap;
+  }
+
+  // ---- Section 3: extensions + catalog ------------------------------------
+  function cintExtensionsCard(section, grid) {
+    var card = cintCard('Installed extensions');
+    grid.appendChild(card);
+    var load = cintLoading(card);
+    var body = el('div', { 'class': 'cint-cardbody' });
+    card.appendChild(body);
+    function paint() {
+      body.textContent = '';
+      return fetchJSON('/v1/extensions').then(function (res) {
+        cintDrop(load);
+        if (!res.ok) { cintUnavailable(body, 'The extensions registry', res.status); return; }
+        var d = res.data || {};
+        var exts = Array.isArray(d.extensions) ? d.extensions : [];
+        if (!exts.length) {
+          body.appendChild(el('p', { 'class': 'cwstudio-note', text: 'No extensions installed. Install one from the catalog below, or with `corecruxctl extensions install`.' }));
+          return;
+        }
+        exts.forEach(function (ext) { body.appendChild(cintExtensionCard(ext, paint)); });
+      });
+    }
+    return paint();
+  }
+
+  function cintExtensionCard(ext, reload) {
+    ext = ext || {};
+    var m = ext.manifest || {};
+    var id = String(ext.id || m.id || '—');
+    var tools = Array.isArray(m.tools) ? m.tools : [];
+    var caps = Array.isArray(m.capabilities) ? m.capabilities : [];
+    var card = el('div', { 'class': 'tstudio-ext-card cint-extcard' });
+    var head = el('div', { 'class': 'tstudio-ext-head' });
+    head.appendChild(el('span', { 'class': 'tstudio-ext-id', text: id + (m.version ? ' · ' + m.version : '') }));
+    head.appendChild(el('span', { 'class': 'tstudio-ext-tier', text: String(ext.trust_tier || 'unknown') }));
+    head.appendChild(el('span', { 'class': 'cwstudio-postchip', text: String((m.entry && m.entry.kind) || 'unknown kind') }));
+    card.appendChild(head);
+    var chips = el('div', { 'class': 'tstudio-ext-chips' });
+    caps.forEach(function (c) { chips.appendChild(el('span', { 'class': 'tstudio-cap-chip', text: String(c) })); });
+    if (!caps.length) { chips.appendChild(el('span', { 'class': 'cwstudio-note', text: 'no capabilities declared' })); }
+    card.appendChild(chips);
+    var hosts = (m.network && Array.isArray(m.network.allowed_hosts)) ? m.network.allowed_hosts : [];
+    card.appendChild(cintRow('allowed hosts', hosts.length ? hosts.join(' · ') : 'endpoint pinning only'));
+    var safety = m.safety || {};
+    card.appendChild(cintRow('budgets', 'sandbox ' + String(safety.sandbox || 'none')
+      + ' · runtime ' + (safety.max_runtime_ms ? safety.max_runtime_ms + 'ms' : 'daemon default')
+      + ' · output ' + (safety.max_output_bytes ? safety.max_output_bytes + 'B' : 'daemon default')));
+
+    // Invoke — the control that used to render with no click handler at all.
+    var out;
+    if (tools.length || m.external_tool_endpoint) {
+      var inv = el('div', { 'class': 'cint-invoke' });
+      inv.appendChild(el('div', { 'class': 'tstudio-field-lab', text: 'Invoke a tool' }));
+      var toolNames = tools.map(function (t) { return String((t && t.name) || ''); }).filter(Boolean);
+      var toolPick = toolNames.length > 1 ? cintSelect(toolNames, toolNames[0]) : null;
+      if (toolPick) { inv.appendChild(cintField('tool', toolPick)); }
+      else { inv.appendChild(cintRow('tool', toolNames[0] || '(none declared)')); }
+      var args = el('textarea', { 'class': 'tstudio-input tstudio-textarea cint-args', rows: '3', placeholder: '{ }' });
+      inv.appendChild(cintField('args (JSON)', args));
+      var invActs = cintActions(inv);
+      stampOperatorOnly(invActs);
+      var invoke = cintBtn('Invoke', { title: 'POST /v1/extensions/' + id + '/tools/{tool}/invoke — grant-scoped, rate-limited' });
+      invoke.addEventListener('click', function () {
+        var tool = toolPick ? String(toolPick.value || '') : (toolNames[0] || '');
+        var parsed, raw = String(args.value || '').trim();
+        try { parsed = raw ? JSON.parse(raw) : {}; }
+        catch (e) { showWiredResult(out, 'args must be a JSON object — ' + String(e && e.message || e), true); return; }
+        if (!tool) { showWiredResult(out, 'this extension declares no tools to invoke', true); return; }
+        cintWrite(out, {
+          confirm: 'Invokes "' + tool + '" on extension ' + id + '. The daemon makes an OUTBOUND call to the declared endpoint under your grant. Proceed?',
+          run: function (pp) { return operatorGatedCall(function (g) { return g.extensionInvoke(id, tool, { passport_fpr: pp, args: parsed }); }).then(readJson); },
+          render: cintVerbatim
+        });
+      });
+      invActs.appendChild(invoke);
+      card.appendChild(inv);
+    }
+
+    card.appendChild(cintGrantsPanel(id));
+
+    var acts = cintActions(card);
+    stampOperatorOnly(acts);
+    var uninstall = cintBtn('Uninstall', { danger: true, title: 'DELETE /v1/extensions/' + id });
+    uninstall.addEventListener('click', function () {
+      cintWrite(out, {
+        confirm: 'Uninstalls extension "' + id + '" from this daemon. Its tools leave the MCP catalog and every grant issued against it stops resolving. Proceed?',
+        run: function () { return operatorGatedCall(function (g) { return g.extensionUninstall(id, {}); }).then(readJson); },
+        after: function (r) { if (r.ok) { reload(); } }
+      });
+    });
+    acts.appendChild(uninstall);
+    out = cintOut(card);
+    return card;
+  }
+
+  // Per-extension grants: who may call it, which tools, at what rate.
+  function cintGrantsPanel(id) {
+    var panel = el('div', { 'class': 'cint-grants' });
+    panel.appendChild(el('div', { 'class': 'tstudio-field-lab', text: 'Grants' }));
+    var list = el('div', { 'class': 'cint-grantlist' });
+    panel.appendChild(list);
+    function paint() {
+      list.textContent = '';
+      return cintApiJson('extensionsByIdGrants', [id]).then(function (res) {
+        if (!res.ok) { cintUnavailable(list, 'Grants for ' + id, res.status); return; }
+        var grants = (res.data && Array.isArray(res.data.grants)) ? res.data.grants : [];
+        if (!grants.length) { list.appendChild(el('p', { 'class': 'cwstudio-note', text: 'No grants — no passport can call this extension yet.' })); }
+        grants.forEach(function (gr) { list.appendChild(cintGrantRow(id, gr, paint)); });
+      });
+    }
+    var fpr = cintInput({ ph: 'passport fingerprint', mono: true });
+    var toolFilter = cintInput({ ph: 'tool names (optional, comma-separated)', mono: true });
+    var form = el('div', { 'class': 'cint-form' });
+    form.appendChild(cintField('passport fpr', fpr));
+    form.appendChild(cintField('tool filter', toolFilter));
+    stampOperatorOnly(form);
+    panel.appendChild(form);
+    var out;
+    var acts = cintActions(panel);
+    stampOperatorOnly(acts);
+    var add = cintBtn('Issue grant', { title: 'POST /v1/extensions/' + id + '/grants' });
+    add.addEventListener('click', function () {
+      var who = String(fpr.value || '').trim();
+      var toolNames = splitIds(toolFilter.value);
+      if (!who) { showWiredResult(out, 'a passport fingerprint is required — a grant is always attributed', true); return; }
+      cintWrite(out, {
+        run: function () { return operatorGatedCall(function (g) { return g.extensionGrantAdd(id, { passport_fpr: who, allowed_tool_names: toolNames }); }).then(readJson); },
+        after: function (r) { if (r.ok) { fpr.value = ''; toolFilter.value = ''; paint(); } }
+      });
+    });
+    acts.appendChild(add);
+    out = cintOut(panel);
+    paint();
+    return panel;
+  }
+
+  function cintGrantRow(id, grant, reload) {
+    grant = grant || {};
+    var who = String(grant.passport_fpr || '—');
+    var wrap = el('div', { 'class': 'cwstudio-packrow cint-grantrow' });
+    wrap.appendChild(el('span', { 'class': 'cwstudio-packid', text: who }));
+    var toolNames = Array.isArray(grant.allowed_tool_names) ? grant.allowed_tool_names : [];
+    wrap.appendChild(el('span', { 'class': 'cint-row-v', text: toolNames.length ? toolNames.join(' · ') : 'all declared tools' }));
+    wrap.appendChild(el('span', { 'class': 'cwstudio-postchip', text: grant.rate_limit_per_min ? grant.rate_limit_per_min + '/min' : 'daemon default rate' }));
+    var out;
+    var revoke = cintBtn('Revoke', { danger: true, title: 'DELETE /v1/extensions/' + id + '/grants/' + who });
+    revoke.addEventListener('click', function () {
+      cintWrite(out, {
+        confirm: 'Revokes the grant for ' + who + ' on extension ' + id + '. That passport can no longer call any of its tools. Proceed?',
+        run: function () { return operatorGatedCall(function (g) { return g.extensionGrantRemove(id, who, {}); }).then(readJson); },
+        after: function (r) { if (r.ok) { reload(); } }
+      });
+    });
+    wrap.appendChild(revoke);
+    out = cintOut(wrap);
+    return wrap;
+  }
+
+  function cintCatalogCard(section, grid) {
+    var card = cintCard('Catalog — curator-signed registry');
+    grid.appendChild(card);
+    var load = cintLoading(card);
+    var body = el('div', { 'class': 'cint-cardbody' });
+    card.appendChild(body);
+    function paint() {
+      body.textContent = '';
+      return fetchJSON('/v1/extensions/registry').then(function (res) {
+        cintDrop(load);
+        // 404 is the fresh-daemon case, not a fault: the cached index has never
+        // been synced. Name the command that populates it.
+        if (res.status === 404) {
+          body.appendChild(el('p', { 'class': 'cwstudio-note', text: 'No cached registry index on this daemon. Run `corecruxctl extensions sync` to fetch and verify the curator-signed index, then reload this page.' }));
+          return;
+        }
+        if (!res.ok) { cintUnavailable(body, 'The registry catalog', res.status); return; }
+        var d = res.data || {};
+        body.appendChild(cintRow('curator', d.curator_passport_fpr));
+        body.appendChild(cintRow('index updated', cintWhen(d.updated_at_unix_ms)));
+        var entries = Array.isArray(d.entries) ? d.entries : [];
+        if (!entries.length) {
+          body.appendChild(el('p', { 'class': 'cwstudio-note', text: 'The verified index carries no entries — the curator has published none yet.' }));
+          return;
+        }
+        entries.forEach(function (e) { body.appendChild(cintCatalogRow(e, paint)); });
+      });
+    }
+    return paint();
+  }
+
+  function cintCatalogRow(entry, reload) {
+    entry = entry || {};
+    var id = String(entry.id || '—');
+    var installedVersion = String(entry.installed_version || '');
+    var stale = !!entry.installed && !!installedVersion && installedVersion !== String(entry.version || '');
+    var wrap = el('div', { 'class': 'cint-catrow' });
+    var head = el('div', { 'class': 'cwstudio-packrow' });
+    head.appendChild(el('span', { 'class': 'cwstudio-packid', text: String(entry.name || id) + ' · ' + String(entry.version || '') }));
+    head.appendChild(el('span', { 'class': 'tstudio-ext-tier', text: String(entry.trust_tier || 'unknown') }));
+    head.appendChild(el('span', {
+      'class': 'cwstudio-postchip ' + (entry.installed ? (stale ? 'is-warn' : 'is-on') : ''),
+      text: entry.installed ? (stale ? 'installed ' + installedVersion + ' · update available' : 'installed') : 'not installed'
+    }));
+    wrap.appendChild(head);
+    if (entry.summary) { wrap.appendChild(el('p', { 'class': 'cwstudio-note', text: String(entry.summary) })); }
+
+    var detail = el('div', { 'class': 'cint-detail' });
+    detail.hidden = true;
+    var out;
+    var acts = cintActions(wrap);
+    var more = el('button', { 'class': 'tstudio-btn cint-disclose', type: 'button', 'aria-expanded': 'false' }, ['Safety scorecard']);
+    more.addEventListener('click', function () {
+      var open = !!detail.hidden;
+      detail.hidden = !open;
+      more.setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (!open || detail.childNodes.length) { return; }
+      // Index-only scorecard first (always available), then upgrade it with the
+      // installed manifest's capability + network truth when there is one.
+      detail.appendChild(cintScorecard(entry, null));
+      if (entry.installed) {
+        cintApiJson('extensionsById', [id]).then(function (r) {
+          var m = r.ok && r.data && (r.data.manifest || (r.data.extension && r.data.extension.manifest));
+          if (m) { detail.textContent = ''; detail.appendChild(cintScorecard(entry, m)); }
+        });
+      }
+    });
+    acts.appendChild(more);
+    var install = cintBtn(entry.installed ? (stale ? 'Update' : 'Reinstall') : 'Install', { primary: !entry.installed, title: 'POST /v1/extensions/install-from-registry' });
+    install.addEventListener('click', function () {
+      cintWrite(out, {
+        confirm: 'Installs "' + id + '" from the curator-signed index. The daemon re-verifies the index signature, fetches the manifest and enforces the published sha256 before anything is registered. Proceed?',
+        run: function () { return operatorGatedCall(function (g) { return g.extensionInstallFromRegistry({ id: id }); }).then(readJson); },
+        after: function (r) { if (r.ok) { reload(); } }
+      });
+    });
+    acts.appendChild(install);
+    wrap.appendChild(detail);
+    out = cintOut(wrap);
+    return wrap;
+  }
+
+  // ---- Section 4: trusted keys --------------------------------------------
+  function cintKeysCard(section) {
+    var card = cintCard('Trusted signing keys');
+    cintGrid(section).appendChild(card);
+    var load = cintLoading(card);
+    var body = el('div', { 'class': 'cint-cardbody' });
+    card.appendChild(body);
+    function paint() {
+      body.textContent = '';
+      return fetchJSON('/v1/extensions/keys').then(function (res) {
+        cintDrop(load);
+        if (!res.ok) { cintUnavailable(body, 'The trusted keyring', res.status); return; }
+        var d = res.data || {};
+        var keys = d.keys || {};
+        var ids = Object.keys(keys);
+        if (!ids.length) {
+          body.appendChild(el('p', { 'class': 'cwstudio-note', text: 'No trusted keys registered. A signed manifest installs only when its publisher key is in this keyring.' }));
+        }
+        ids.forEach(function (fpr) { body.appendChild(cintKeyRow(fpr, keys[fpr], paint)); });
+        body.appendChild(cintKeyForm(paint));
+      });
+    }
+    return paint();
+  }
+
+  function cintKeyRow(fpr, entry, reload) {
+    entry = entry || {};
+    var wrap = el('div', { 'class': 'cwstudio-packrow cint-keyrow' });
+    wrap.appendChild(el('span', { 'class': 'cwstudio-packid', text: String(fpr) }));
+    wrap.appendChild(el('span', { 'class': 'tstudio-ext-tier', text: String(entry.trust_tier || 'unknown') }));
+    wrap.appendChild(el('span', { 'class': 'cint-row-v', text: 'added ' + cintWhen(entry.added_at_unix_ms) + (entry.added_by ? ' by ' + entry.added_by : '') }));
+    var out;
+    var remove = cintBtn('Remove', { danger: true, title: 'DELETE /v1/extensions/keys/' + fpr });
+    remove.addEventListener('click', function () {
+      cintWrite(out, {
+        confirm: 'Removes ' + fpr + ' from the trusted keyring. Manifests signed by that key stop verifying, so its packs can no longer be installed or re-verified. Proceed?',
+        run: function () { return operatorGatedCall(function (g) { return g.extensionRemoveKey(fpr, {}); }).then(readJson); },
+        after: function (r) { if (r.ok) { reload(); } }
+      });
+    });
+    wrap.appendChild(remove);
+    out = cintOut(wrap);
+    return wrap;
+  }
+
+  function cintKeyForm(reload) {
+    var panel = el('div', { 'class': 'cint-keyform' });
+    var fpr = cintInput({ ph: 'passport fingerprint', mono: true });
+    var pub = cintInput({ ph: 'ed25519 public key (hex)', mono: true });
+    var tier = cintSelect(CINT_TRUST_TIERS, 'community_reviewed');
+    var form = el('div', { 'class': 'cint-form' });
+    form.appendChild(cintField('passport fpr', fpr));
+    form.appendChild(cintField('public key hex', pub));
+    form.appendChild(cintField('trust tier', tier));
+    stampOperatorOnly(form);
+    panel.appendChild(form);
+    var out;
+    var acts = cintActions(panel);
+    stampOperatorOnly(acts);
+    var add = cintBtn('Add key', { title: 'POST /v1/extensions/keys' });
+    add.addEventListener('click', function () {
+      var who = String(fpr.value || '').trim();
+      var hex = String(pub.value || '').trim();
+      var tierv = String(tier.value || 'community_reviewed');
+      if (!who || !hex) { showWiredResult(out, 'both a passport fingerprint and a public key are required', true); return; }
+      cintWrite(out, {
+        run: function (pp) { return operatorGatedCall(function (g) { return g.extensionAddKey({ passport_fpr: who, public_key_hex: hex, trust_tier: tierv, added_by: pp }); }).then(readJson); },
+        after: function (r) { if (r.ok) { fpr.value = ''; pub.value = ''; reload(); } }
+      });
+    });
+    acts.appendChild(add);
+    out = cintOut(panel);
+    return panel;
+  }
+
+  function renderIntegrationsStudio(host, ctx) {
+    ctx = ctx || {};
+    host.textContent = '';
+    var root = el('div', { 'class': 'cwstudio cwstudio-integrations' });
+    host.appendChild(root);
+    root.appendChild(el('div', { 'class': 'cwstudio-header' }, [
+      el('div', { 'class': 'cwstudio-title' }, [
+        el('h2', { text: 'Integrations' }),
+        el('p', { 'class': 'cwstudio-sub', text: 'Set up and operate every integration here: source connectors, built-in packs, community extensions and the signing keys they verify against. Reads are live; writes are operator-gated and passport-attributed.' })
+      ])
+    ]));
+    if (!isOperator()) {
+      root.appendChild(el('div', { 'class': 'tstudio-banner', text: 'Read-only — customer posture. Status is live; connect, install, grant, invoke and revoke need operator posture.' }));
+    }
+
+    var connectors = cintSection('connectors', 'Connectors', 'Credentials are sealed daemon-side. The console posts them once and never reads them back.');
+    var packs = cintSection('packs', 'Packs', 'Built-in integration packs. Install is not grant — a pack does nothing until a passport grant names its capabilities.');
+    var extensions = cintSection('extensions', 'Extensions + catalog', 'Community extensions, installed from a curator-signed index the daemon re-verifies locally against its trusted keyring.');
+    var keys = cintSection('keys', 'Trusted keys', 'The Ed25519 keyring every signed manifest verifies against.');
+    root.appendChild(connectors);
+    root.appendChild(packs);
+    root.appendChild(extensions);
+    root.appendChild(keys);
+
+    var connGrid = cintGrid(connectors);
+    cintGithubCard(connGrid);
+    cintOpenAiCard(connGrid);
+    cintPacksCard(packs);
+    var extGrid = cintGrid(extensions);
+    cintExtensionsCard(extensions, extGrid);
+    cintCatalogCard(extensions, extGrid);
+    cintKeysCard(keys);
+    return Promise.resolve();
+  }
+
+  // =======================================================================
+  //  Studio › Library (crux-integrations-and-template-library L1+L2) — the
+  //  central template library: the curator-signed catalog of Studio boards,
+  //  tile designs, workspaces and full packs, browsed from the daemon's CACHED
+  //  index and installed by id.
+  //
+  //  Two routes, both already generated in api.js:
+  //    GET  /v1/studio/library              → the verified cached index, joined
+  //                                           against what is already installed.
+  //    POST /v1/studio/library/{id}/install → the ONE mutation (operator-gated,
+  //                                           through operatorGatedCall).
+  //
+  //  Three things this surface refuses to fake:
+  //
+  //  1. There is NO refresh button. The daemon has no fetch-index route — the
+  //     cache is populated by `corecruxctl studio sync` — so the surface names
+  //     the command instead of offering a control that would do nothing.
+  //  2. `required_tier` is ADVISORY. The catalog SERVER is the tier gate; this
+  //     daemon echoes the field and stamps every response
+  //     `tier_enforcement: "advisory"`. The chip says so in its title text, and
+  //     the header states it in plain words, so no operator reads a "Pro" chip
+  //     as a local entitlement check.
+  //  3. The install result is rendered in the RESPONSE's own shape — the
+  //     written entities, the collision remaps (from → to) and the provenance
+  //     block — and errors verbatim. 404/409/403 each carry the daemon's own
+  //     detail string; none of them is smoothed into "install failed".
+  // =======================================================================
+  var CLIB_KINDS = ['board', 'design', 'workspace', 'pack'];
+  var CLIB_KIND_LABEL = { board: 'Boards', design: 'Designs', workspace: 'Workspaces', pack: 'Packs' };
+  var CLIB_TIER_LABEL = { free: 'Free', pro: 'Pro', team: 'Team', enterprise: 'Enterprise' };
+  // The one sentence that keeps a tier chip honest wherever it is rendered.
+  var CLIB_TIER_TITLE = 'Advisory only: required_tier is enforced by the catalog SERVER that serves the pack. This daemon echoes it (tier_enforcement: "advisory") and never gates an install on it.';
+  var CLIB_SYNC_CMD = 'corecruxctl studio sync';
+
+  function clibShort(v, n) {
+    var s = String(v == null ? '' : v);
+    var max = n || 12;
+    return s.length > max ? s.slice(0, max) + '…' : s;
+  }
+  // Absent required_tier means Free — the daemon omits the field entirely for a
+  // free entry, so "no chip" would read as "unknown" instead of "no tier needed".
+  function clibTierKey(entry) {
+    var t = String((entry && entry.required_tier) || '').toLowerCase();
+    return CLIB_TIER_LABEL[t] ? t : 'free';
+  }
+  function clibKindKey(entry) {
+    var k = String((entry && entry.kind) || '').toLowerCase();
+    return CLIB_KINDS.indexOf(k) >= 0 ? k : 'other';
+  }
+  // Pure: the catalog filter. `kind` is 'all' or one of CLIB_KINDS; `text` is a
+  // case-insensitive substring over name · id · tags · summary. Unit-tested.
+  function clibFilterEntries(entries, filter) {
+    var f = filter || {};
+    var kind = String(f.kind || 'all').toLowerCase();
+    var q = String(f.text || '').trim().toLowerCase();
+    return (Array.isArray(entries) ? entries : []).filter(function (e) {
+      if (!e || typeof e !== 'object') { return false; }
+      if (kind !== 'all' && clibKindKey(e) !== kind) { return false; }
+      if (!q) { return true; }
+      var hay = [e.name, e.id, e.summary, (Array.isArray(e.tags) ? e.tags.join(' ') : '')].join(' ').toLowerCase();
+      return hay.indexOf(q) >= 0;
+    });
+  }
+  // Pure: group into the declared kind order, dropping empty groups. An entry
+  // whose kind this console does not know is grouped under 'other' rather than
+  // silently dropped.
+  function clibGroupByKind(entries) {
+    var buckets = {};
+    (Array.isArray(entries) ? entries : []).forEach(function (e) {
+      var k = clibKindKey(e);
+      (buckets[k] = buckets[k] || []).push(e);
+    });
+    var out = [];
+    CLIB_KINDS.concat(['other']).forEach(function (k) {
+      if (buckets[k] && buckets[k].length) {
+        out.push({ kind: k, label: CLIB_KIND_LABEL[k] || 'Other kinds', entries: buckets[k] });
+      }
+    });
+    return out;
+  }
+
+  // The install RESULT, in the response's own shape. Success: what was written,
+  // what was remapped, and the provenance stamped into every artifact. Failure:
+  // the daemon's problem body verbatim (409 sha mismatch / 403 unsigned / 404
+  // unknown id all carry their own detail).
+  function clibInstallResult(out, r) {
+    out.textContent = '';
+    var d = (r && r.data) || {};
+    if (!r || !r.ok) {
+      out.appendChild(el('p', { 'class': 'wired-result is-err', text: 'HTTP ' + ((r && r.status) || 0) + ((d && d.detail) ? ' · ' + d.detail : '') }));
+      var text;
+      try { text = (d == null) ? '(empty body)' : JSON.stringify(d, null, 2); }
+      catch (e) { text = String(d); }
+      out.appendChild(el('pre', { 'class': 'cint-verbatim', text: text }));
+      return;
+    }
+    out.appendChild(el('p', { 'class': 'wired-result is-ok', text: 'HTTP ' + r.status + ' · installed ' + String(d.library_id || '') + '@' + String(d.version || '') }));
+    var meta = el('div', { 'class': 'clib-result' });
+    meta.appendChild(cintRow('kind', d.kind));
+    meta.appendChild(cintRow('pack sha256', d.pack_sha256));
+    meta.appendChild(cintRow('publisher', d.publisher_passport_fpr));
+    meta.appendChild(cintRow('signature', d.signed ? 'signed — verified against the trusted keyring' : 'UNSIGNED' + (d.allow_unsigned_dev ? ' — installed under the CORECRUXD_STUDIO_ALLOW_UNSIGNED dev bypass' : '')));
+    meta.appendChild(cintRow('required tier', (d.required_tier ? String(d.required_tier) : 'free') + ' · tier_enforcement: ' + String(d.tier_enforcement || 'advisory')));
+    out.appendChild(meta);
+
+    var written = Array.isArray(d.written) ? d.written : [];
+    out.appendChild(el('div', { 'class': 'tstudio-field-lab', text: 'Written entities (' + written.length + ')' }));
+    if (!written.length) {
+      out.appendChild(el('p', { 'class': 'cwstudio-note', text: 'The pack carried no installable artifact — nothing was written.' }));
+    }
+    written.forEach(function (w) {
+      var row = el('div', { 'class': 'clib-written' });
+      row.appendChild(el('span', { 'class': 'cwstudio-postchip', text: String((w && w.artifact) || 'artifact') }));
+      row.appendChild(el('span', { 'class': 'cint-row-v cint-mono', text: String((w && w.entity) || '') + ' · key ' + String((w && w.key) || '') }));
+      row.appendChild(el('span', { 'class': 'cwstudio-note', text: 'fact ' + clibShort((w && w.fact_id) || '', 16) }));
+      out.appendChild(row);
+    });
+
+    var remaps = Array.isArray(d.remaps) ? d.remaps : [];
+    out.appendChild(el('div', { 'class': 'tstudio-field-lab', text: 'Collision remaps (' + remaps.length + ')' }));
+    if (!remaps.length) {
+      out.appendChild(el('p', { 'class': 'cwstudio-note', text: 'None — no installed id collided with a live console artifact.' }));
+    }
+    remaps.forEach(function (m) {
+      var row = el('div', { 'class': 'clib-remap' });
+      row.appendChild(el('span', { 'class': 'cwstudio-postchip is-warn', text: String((m && m.artifact) || 'artifact') }));
+      row.appendChild(el('span', { 'class': 'cint-row-v cint-mono', text: String((m && m.from) || '') + ' → ' + String((m && m.to) || '') }));
+      out.appendChild(row);
+    });
+
+    out.appendChild(el('div', { 'class': 'tstudio-field-lab', text: 'Provenance stamped into every written artifact' }));
+    var prov;
+    try { prov = JSON.stringify(d.provenance == null ? {} : d.provenance, null, 2); }
+    catch (e) { prov = String(d.provenance); }
+    out.appendChild(el('pre', { 'class': 'cint-verbatim clib-prov', text: prov }));
+  }
+
+  // One catalog entry. Pure DOM (the smoke paints it over a fixture); the only
+  // side effect is the install click, which goes through cintWrite → the single
+  // operatorGatedCall choke point.
+  function clibEntryCard(entry, reload) {
+    entry = entry || {};
+    var id = String(entry.id || '—');
+    var version = String(entry.version || '');
+    var kind = clibKindKey(entry);
+    var tier = clibTierKey(entry);
+    var installedVersion = String(entry.installed_version || '');
+    var stale = !!entry.installed && !!installedVersion && installedVersion !== version;
+    var wrap = el('div', { 'class': 'clib-card', 'data-kind': kind, 'data-id': id });
+
+    var head = el('div', { 'class': 'cwstudio-packrow clib-head' });
+    head.appendChild(el('span', { 'class': 'cwstudio-packid', text: String(entry.name || id) + (version ? ' · ' + version : '') }));
+    head.appendChild(el('span', { 'class': 'clib-kindchip', text: kind }));
+    head.appendChild(el('span', {
+      'class': 'clib-tier is-' + tier,
+      title: CLIB_TIER_TITLE,
+      text: CLIB_TIER_LABEL[tier]
+    }));
+    head.appendChild(el('span', {
+      'class': 'cwstudio-postchip ' + (entry.installed ? (stale ? 'is-warn' : 'is-on') : ''),
+      text: entry.installed
+        ? (stale ? 'installed ' + installedVersion + ' · update available' : 'installed ' + (installedVersion || version))
+        : 'not installed'
+    }));
+    wrap.appendChild(head);
+
+    if (entry.summary) { wrap.appendChild(el('p', { 'class': 'cwstudio-note', text: String(entry.summary) })); }
+    if (entry.preview) { wrap.appendChild(el('p', { 'class': 'clib-preview', text: 'Preview: ' + String(entry.preview) })); }
+
+    var tags = Array.isArray(entry.tags) ? entry.tags : [];
+    if (tags.length) {
+      var tagRow = el('div', { 'class': 'cwstudio-chips clib-tags' });
+      tags.forEach(function (t) { tagRow.appendChild(el('span', { 'class': 'tstudio-cap-chip', text: String(t) })); });
+      wrap.appendChild(tagRow);
+    }
+
+    wrap.appendChild(cintRow('library id', id));
+    wrap.appendChild(cintRow('publisher', clibShort(entry.publisher_passport_fpr, 16)));
+    wrap.appendChild(cintRow('pack sha256 (pinned)', clibShort(entry.pack_sha256, 16)));
+    var repo = String(entry.repo_url || '');
+    if (/^https:\/\//.test(repo)) {
+      var rr = el('div', { 'class': 'cint-row' });
+      rr.appendChild(el('span', { 'class': 'cint-row-k', text: 'source repo' }));
+      rr.appendChild(el('a', { 'class': 'cint-row-v cint-link', href: repo, rel: 'noopener noreferrer', target: '_blank', text: repo }));
+      wrap.appendChild(rr);
+    } else if (repo) {
+      wrap.appendChild(cintRow('source repo', repo));
+    }
+    if (entry.installed) {
+      var ents = Array.isArray(entry.installed_entities) ? entry.installed_entities : [];
+      wrap.appendChild(cintRow('installed entities', ents.length + (ents.length ? ' · ' + ents.join(' · ') : '')));
+      wrap.appendChild(cintRow('installed at', cintWhen(entry.installed_at_unix_ms)));
+    }
+
+    var out;
+    var acts = cintActions(wrap);
+    var install = cintBtn(entry.installed ? (stale ? 'Update' : 'Install again') : 'Install', {
+      primary: !entry.installed,
+      title: 'POST /v1/studio/library/' + id + '/install'
+    });
+    install.addEventListener('click', function () {
+      cintWrite(out, {
+        confirm: 'Installs the ' + kind + ' "' + id + '"@' + version
+          + ' from the curator-signed Studio library. Publisher ' + clibShort(entry.publisher_passport_fpr, 16)
+          + ', pack sha256 ' + clibShort(entry.pack_sha256, 16)
+          + ', required tier ' + CLIB_TIER_LABEL[tier] + ' (advisory — enforced by the catalog server, not by this daemon).'
+          + ' The daemon re-verifies the index signature, fetches the pack, pins that sha256 and requires a valid publisher signature.'
+          + ' Nothing is overwritten: a colliding id is remapped and reported. Proceed?',
+        run: function () { return operatorGatedCall(function (g) { return g.studioLibraryInstall(id, {}); }).then(readJson); },
+        render: clibInstallResult,
+        after: function (r) { if (r.ok && typeof reload === 'function') { reload(); } }
+      });
+    });
+    acts.appendChild(install);
+    // cintBtn is stampOperatorOnly'd (hidden, never greyed) — so the REASON is
+    // stated in its place for a customer view, rather than leaving a silent gap.
+    if (!isOperator()) {
+      wrap.appendChild(el('p', { 'class': 'cwstudio-note clib-gate', text: 'Install is unavailable in customer view — installing writes durable console artifacts and requires operator posture plus a bound passport.' }));
+    }
+    out = cintOut(wrap);
+    return wrap;
+  }
+
+  // Paint the whole surface body from ONE read result. Split out from the
+  // renderer so the smoke can drive every honest state (verified index, 404
+  // un-synced, 403 bad signature, verified-but-empty) over a fixture.
+  function clibPaintIndex(body, res, reload) {
+    body.textContent = '';
+    res = res || { ok: false, status: 0, data: null };
+    var problem = (res.data && (res.data.detail || res.data.title)) || '';
+    // 404 is the fresh-daemon case, not a fault: nothing has ever been synced.
+    // Name the command that populates the cache (there is no fetch route to
+    // offer as a button).
+    if (res.status === 404) {
+      body.appendChild(el('p', { 'class': 'cwstudio-note clib-unsynced', text: 'No cached Studio library index on this daemon. Run `' + CLIB_SYNC_CMD + '` to fetch and verify the curator-signed index, then reload this page.' }));
+      if (problem) { body.appendChild(el('p', { 'class': 'cwstudio-note', text: problem })); }
+      return;
+    }
+    // 403 is a TRUST failure, not an absence: a cached index exists but does not
+    // verify against this operator's keyring. Never render its entries.
+    if (res.status === 403) {
+      body.appendChild(el('div', { 'class': 'tstudio-apierr clib-badsig', text: 'The cached Studio library index did NOT verify against this daemon\'s trusted keyring. Nothing from it is shown or installable until the curator key is trusted and the index is re-synced.' }));
+      if (problem) { body.appendChild(el('pre', { 'class': 'cint-verbatim', text: problem })); }
+      return;
+    }
+    if (!res.ok) { cintUnavailable(body, 'The Studio template library', res.status); return; }
+
+    var d = res.data || {};
+    var entries = Array.isArray(d.entries) ? d.entries : [];
+    var head = el('div', { 'class': 'clib-headcard' });
+    head.appendChild(cintRow('curator', d.curator_passport_fpr));
+    head.appendChild(cintRow('index updated', cintWhen(d.updated_at_unix_ms)));
+    head.appendChild(cintRow('entries', entries.length));
+    head.appendChild(cintRow('tier_enforcement', String(d.tier_enforcement || 'advisory') + ' — the catalog server enforces required_tier; this daemon only echoes it'));
+    head.appendChild(el('p', { 'class': 'cwstudio-note clib-syncnote', text: 'This is a CACHED, signature-verified index — the console never fetches the catalog itself. Run `' + CLIB_SYNC_CMD + '` to refresh it, then reload this page.' }));
+    body.appendChild(head);
+
+    if (!entries.length) {
+      body.appendChild(el('p', { 'class': 'cwstudio-note clib-empty', text: 'The verified index carries no entries — the curator has published none yet. (This is a valid, signed index: distinct from an un-synced daemon.)' }));
+      return;
+    }
+
+    var filter = { kind: 'all', text: '' };
+    var controls = el('div', { 'class': 'cint-form clib-filters' });
+    var kindSel = cintSelect(['all'].concat(CLIB_KINDS), 'all');
+    var textInp = cintInput({ ph: 'filter by name, tag or summary' });
+    controls.appendChild(cintField('kind', kindSel));
+    controls.appendChild(cintField('search', textInp));
+    body.appendChild(controls);
+
+    var list = el('div', { 'class': 'clib-list' });
+    body.appendChild(list);
+    function paintList() {
+      list.textContent = '';
+      var shown = clibFilterEntries(entries, filter);
+      if (!shown.length) {
+        list.appendChild(el('p', { 'class': 'cwstudio-note clib-nomatch', text: 'No entry in the verified index matches this filter (' + entries.length + ' total).' }));
+        return;
+      }
+      clibGroupByKind(shown).forEach(function (group) {
+        list.appendChild(el('div', { 'class': 'clib-group', 'data-group': group.kind }, [
+          el('span', { 'class': 'tstudio-field-lab', text: group.label }),
+          el('span', { 'class': 'cwstudio-note', text: group.entries.length + ' entr' + (group.entries.length === 1 ? 'y' : 'ies') })
+        ]));
+        group.entries.forEach(function (e) { list.appendChild(clibEntryCard(e, reload)); });
+      });
+    }
+    kindSel.addEventListener('change', function () { filter.kind = kindSel.value || 'all'; paintList(); });
+    textInp.addEventListener('input', function () { filter.text = textInp.value || ''; paintList(); });
+    paintList();
+  }
+
+  function renderLibraryStudio(host, ctx) {
+    ctx = ctx || {};
+    host.textContent = '';
+    var root = el('div', { 'class': 'cwstudio cwstudio-library' });
+    host.appendChild(root);
+    root.appendChild(el('div', { 'class': 'cwstudio-header' }, [
+      el('div', { 'class': 'cwstudio-title' }, [
+        el('h2', { text: 'Library' }),
+        el('p', { 'class': 'cwstudio-sub', text: 'The central template library: boards, tile designs, workspaces and full packs from a curator-signed catalog. Installing writes NEW console artifacts — an install can only ever add, and a colliding id is remapped rather than overwritten.' })
+      ])
+    ]));
+    if (!isOperator()) {
+      root.appendChild(el('div', { 'class': 'tstudio-banner', text: 'Read-only — customer posture. The catalog is live; installing needs operator posture and a bound passport.' }));
+    }
+    var section = cintSection('library', 'Template library', 'Browsed from the daemon\'s cached, signature-verified index. Install re-verifies the index, pins the published pack sha256 and requires a signed pack.');
+    root.appendChild(section);
+    var grid = cintGrid(section);
+    var card = cintCard('Catalog — curator-signed Studio library');
+    grid.appendChild(card);
+    var load = cintLoading(card);
+    var body = el('div', { 'class': 'cint-cardbody' });
+    card.appendChild(body);
+    function paint() {
+      body.textContent = '';
+      return fetchJSON('/v1/studio/library').then(function (res) {
+        cintDrop(load);
+        clibPaintIndex(body, res, paint);
+      });
+    }
+    return paint();
+  }
+
 
   // =======================================================================
   //  Documents mode (M10) — the console-as-reader.
@@ -5205,7 +9980,7 @@
       { id: 'doc-intro', chromeless: true, shape: 'hero', size: 'md', accent: 'neutral',
         title: 'Documents',
         subtitle: 'the corpus as a canvas',
-        body: 'Click a tile to read · drag a tile to place it · drag the canvas to pan.' },
+        body: 'Click a tile to read · drag the canvas to pan · engage Edit to move and resize tiles.' },
       { id: 'doc-explorer', eyebrow: 'SEARCH · CORPUS', title: 'Explorer',
         subtitle: 'Local BM25 · WikiCrux mediated',
         body: 'Search the corpus — results open in the reader.',
@@ -5474,85 +10249,276 @@
   }
 
   // =======================================================================
-  //  Site map — a static reference destination: the console's flat rail
-  //  rearranged into 5 destinations + System. Bespoke card grid (no sections
-  //  model). Reads nothing; renders in every posture. Ported from the unified-
-  //  shell concept (rev 1 · 2026-07-03).
+  //  Site map (console-surfaces-remediation M8) — a real, click-through map of
+  //  the console. Every node is an <a href="#/…"> to a REAL registered route,
+  //  DERIVED at render time from the page registry (window.CruxPages.DESTS +
+  //  PAGES) so it can never drift from the nav. The registry lacks two things a
+  //  map needs — operator-voiced "what you'll find / when to use" copy, and the
+  //  destination-IS-the-page routes (canvas views, explorer, sitemap, rings) —
+  //  so those live in the small SITEMAP_META / synthetic-node maps below and are
+  //  the ONLY hand-authored surface. Reads nothing; renders in every posture.
+  //  Highlights where the operator just came from ("you are here", from
+  //  window.CRUX_PREV_HASH) and numbers a recommended first-run path.
   // =======================================================================
+  // Section glyphs, keyed by DEST *icon* id (copied from the shell's ICONS so the
+  // map header art matches the Command rail 1:1).
   var SITEMAP_ICONS = {
-    radar: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/><path d="M12 12l6-6"/></svg>',
-    board: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="5" height="16" rx="1"/><rect x="10" y="4" width="5" height="10" rx="1"/><rect x="17" y="4" width="4" height="13" rx="1"/></svg>',
-    brain: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="5" width="16" height="4.5" rx="2"/><rect x="4" y="12" width="16" height="4.5" rx="2"/><path d="M11 19.5h6"/></svg>',
-    shield: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"/><path d="M9 12l2 2 4-4"/></svg>',
-    gauge: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14a8 8 0 1 1 16 0"/><path d="M12 14l3.5-3.5"/><path d="M4 19h16"/></svg>',
-    server: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="4" width="17" height="6.5" rx="1.8"/><rect x="3.5" y="13.5" width="17" height="6.5" rx="1.8"/><path d="M7 7.2h.01M7 16.7h.01"/></svg>'
+    overwatch: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/></svg>',
+    work: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="5" height="16" rx="1"/><rect x="10" y="4" width="5" height="10" rx="1"/><rect x="17" y="4" width="4" height="13" rx="1"/></svg>',
+    memory: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>',
+    trust: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"/><path d="M9 12l2 2 4-4"/></svg>',
+    meters: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19a8 8 0 0 1 16 0"/><path d="M12 19l4-5"/><circle cx="12" cy="19" r="1.4"/></svg>',
+    settings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.6 1.6 0 0 0-1-1.5 1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.6 1.6 0 0 0 1.5-1 1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H9a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V9a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z"/></svg>',
+    canvas: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>',
+    search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>',
+    map: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="5" rx="1.4"/><rect x="3" y="16" width="6" height="5" rx="1.4"/><rect x="15" y="16" width="6" height="5" rx="1.4"/><path d="M12 8v4M6 16v-2.5h12V16"/></svg>',
+    rings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5.5"/><circle cx="12" cy="12" r="2"/><path d="M12 3v3"/></svg>'
   };
-  var SITEMAP = [
-    { icon: 'radar', color: 'var(--acc)', title: 'Overwatch', tag: "the arm's-length home — glance, decide, get out", items: [
-      { name: 'Home · Needs you', anno: { t: 'PROMOTED', cls: 'promote' }, why: 'Gates rise from rail item #8 to the first thing you see. Review counts and blocked-plan questions surface here too.', provs: [{ t: 'cx-overview' }, { t: 'cx-gates (actionable)' }, { t: 'cx-review (count)' }] },
-      { name: 'Fleet', anno: { t: '4 → 1', cls: 'merge' }, why: "Live board, sessions, orchestrators and punchcards are four rail items describing one question — \"who is working and on what?\" Leases and intents become facets of a session row.", provs: [{ t: 'cx-coord' }, { t: 'cx-sessions (live)' }, { t: 'cx-orchestrators' }, { t: 'cx-punchcards' }] },
-      { name: 'Activity', why: 'The rolling all-sessions log, unchanged — plus the human-lane page folds in as a filter, not a separate URL.', provs: [{ t: 'cx-activity' }, { t: '/console/activity' }] }
-    ] },
-    { icon: 'board', color: '#5EC2E7', title: 'Work', tag: "plans are true north — resume, don't respawn", items: [
-      { name: 'Board', anno: { t: 'VIEW SWITCH', cls: 'vsw' }, why: 'Kanban graduates from a rail pull-out to the primary view; list and graph become a segmented switch on the page — the DUAL_VIEW pattern, made explicit.', provs: [{ t: 'cx-work' }, { t: 'kanban pull-out' }, { t: 'console-3d (work graph)' }] },
-      { name: 'Projects', why: 'Repo pairing, planning repo, working tenants — unchanged, but now feeds Board filters instead of standing alone.', provs: [{ t: 'cx-projects' }] },
-      { name: 'Runs', why: 'Session history splits from the live fleet: archived sessions with their per-run token usage attached, searchable by plan.', provs: [{ t: 'cx-sessions (archive)' }, { t: 'cx-usage (per-run)' }] }
-    ] },
-    { icon: 'brain', color: 'var(--trust)', title: 'Memory', tag: 'the substrate — what the node knows and how fresh it is', items: [
-      { name: 'Facts', anno: { t: '2 → 1', cls: 'merge' }, why: 'cx-facts (by entity prefix) and cx-memory (recent per tenant) are the same data with different lenses — one page, three lenses: by entity · recent · by tenant.', provs: [{ t: 'cx-facts' }, { t: 'cx-memory' }] },
-      { name: 'Tenants & lanes', why: 'Store list with AMR lane policy per tenant; system tenants stay hidden by default.', provs: [{ t: 'cx-tenants' }] },
-      { name: 'Documents · ingest', why: 'What the daemon has read, per tenant — and how to feed it more. Unchanged.', provs: [{ t: 'cx-documents' }] },
-      { name: 'Review', anno: { t: 'COUNT → HOME', cls: 'promote' }, why: 'Contradictions + guarded consolidation live here; the pending count is an Overwatch card because it needs human judgment.', provs: [{ t: 'cx-review' }] },
-      { name: 'Tuning', anno: { t: 'ADVANCED', cls: 'adv' }, why: 'RRF lane weights are expert controls — kept, but behind a disclosure so they stop competing with daily pages.', provs: [{ t: 'cx-lane-weights' }] }
-    ] },
-    { icon: 'shield', color: 'var(--ok)', title: 'Trust', tag: 'regulation is a destination, not a settings page', items: [
-      { name: 'Receipts', anno: { t: 'VIEW SWITCH', cls: 'vsw' }, why: 'CROWN receipt list with the graph pull-out as a view switch; the receipts-vs-console demo becomes the "why receipts" explainer here.', provs: [{ t: 'cx-receipts' }, { t: '/console/receipts-vs-console' }] },
-      { name: 'Gates', why: 'The full Art.14 queue + history + timeout policy. Overwatch shows the actionable slice; this is the canonical record.', provs: [{ t: 'cx-gates' }] },
-      { name: 'Identity', anno: { t: '2 → 1', cls: 'merge' }, why: 'Passports and identity-link ceremonies are one story: who exists, who signs, what links. Device grants (/activate) approve from here too.', provs: [{ t: 'cx-passport' }, { t: 'cx-identity' }, { t: '/activate' }] },
-      { name: 'Policy & posture', anno: { t: 'NEW', cls: 'new' }, why: 'Mediation (capability ladder, foresight) joins a compliance posture panel — the Art.10–15 cards from this concept. Today that story is implicit; regulated buyers need it on one page.', provs: [{ t: 'cx-mediation' }, { t: 'posture panel (new)', 'new': true }] }
-    ] },
-    { icon: 'gauge', color: 'var(--warn)', title: 'Meters', tag: 'cost, capacity, evidence — replaces "Benchmarks" as the 5th section', items: [
-      { name: 'Token burn', why: 'The ground-truth cost lens, unchanged — headline number surfaces as an Overwatch tile.', provs: [{ t: 'cx-cost' }] },
-      { name: 'Usage', why: 'Observation-derived usage aggregates; per-run slices move to Work → Runs.', provs: [{ t: 'cx-usage' }] },
-      { name: 'Storage & node', anno: { t: 'UNBURIED', cls: 'promote' }, why: "Storage breakdown, infra summary, ops health and update/bootstrap status escape the Settings page — they're monitoring, not configuration.", provs: [{ t: 'storage-breakdown' }, { t: 'infra/summary' }, { t: 'ops health' }] },
-      { name: 'Benchmarks', anno: { t: 'NEW', cls: 'new' }, why: 'bench:* facts get a real page — corpus identity, commit, lane flags — with deep links to scorecrux.com for published suites.', provs: [{ t: 'bench:* facts' }, { t: 'ScoreCrux links', 'new': true }] }
-    ] },
-    { icon: 'server', color: 'var(--ink3)', title: 'System', note: 'bottom of rail', tag: 'configure rarely, then leave', items: [
-      { name: 'Settings', why: 'Access posture, embedding endpoint, sync, freshness horizons, retention, appearance, coordination toggles — minus the monitoring sections that moved to Meters.', provs: [{ t: 'cx-settings' }] },
-      { name: 'Integrations', anno: { t: '2 → 1', cls: 'merge' }, why: 'Packs and signed extensions are one catalog with two provenance badges; install stays inert until a passport grant exists.', provs: [{ t: 'cx-integrations' }, { t: 'cx-extensions' }] },
-      { name: 'Developer', why: 'Raw JSON-RPC console and the DX docs scope live under Developer; the GX global-search scope becomes ⌘K everywhere.', provs: [{ t: 'cx-raw' }, { t: 'DX scope' }, { t: 'GX scope → ⌘K' }] }
-    ] }
-  ];
+  // Section accent, keyed by DEST *id* (var(--) tokens only).
+  var SITEMAP_ACCENT = {
+    overwatch: 'var(--acc)', work: 'var(--acc)', memory: 'var(--trust)', trust: 'var(--ok)',
+    meters: 'var(--warn)', system: 'var(--ink3)', canvas: 'var(--acc)', explorer: 'var(--trust)',
+    sitemap: 'var(--acc)', rings: 'var(--trust)'
+  };
+  // One-line operator copy per node — "what you'll find / when to use", grounded
+  // in what each page does TODAY (post M2–M7), honest where feature-gated. Keyed
+  // by page id, plus synthetic keys for the destination-IS-the-page surfaces and
+  // the Overwatch landing root (`#/overwatch`). Missing key → the registry `sub`
+  // (endpoint noise stripped) is the honest fallback.
+  var SITEMAP_META = {
+    'cx-overview':     'Daemon posture, readiness and capacity, one screen',
+    'cx-activity':     'Live session stream beside the needs-you and fleet panels',
+    'cx-coord':        'Who is working right now — live sessions and leases',
+    'cx-orchestrators':'Group plans running under one session',
+    'cx-punchcards':   'Advisory path leases, grouped by session',
+    'cx-work':         "ExecPlans as true north — resume, don't respawn",
+    'cx-activity-log': 'The all-sessions live journal — searchable, streaming',
+    'cx-projects':     'Repos, planning target, passports and working tenants',
+    'cx-sessions':     'Who worked, on what plan, with what tokens',
+    'cx-facts':        'Browse and search the whole visible fact store — time-machine included',
+    'cx-memory':       'Recent facts per tenant — system tenants hidden by default',
+    'cx-tenants':      'Memory stores and their AMR lane routing',
+    'cx-documents':    'What the daemon has read — and how to feed it more',
+    'cx-review':       'Contradictions and guarded consolidation, waiting for judgment',
+    'cx-lane-weights': 'Expert RRF lane weights — operator controls',
+    'cx-receipts':     'The signed evidence trail — verify Ed25519 proofs verbatim',
+    'cx-gates':        'Approvals waiting on you — high-risk transitions pause here',
+    'cx-mints':        'Agent-requested passports — review, then accept or reject',
+    'cx-passport':     'Agent and people identities — create and view passports',
+    'cx-identity':     'Cross-daemon identity links — inference proposes, consent disposes',
+    'cx-mediation':    'Engine gateway posture — off on this CPU-only node',
+    'cx-cost':         'Sessions × token burn, with plan attribution',
+    'cx-usage':        'Aggregate call volume and average spend',
+    'cx-settings':     'Access, sync, freshness, retention, appearance — configure rarely',
+    'cx-integrations': 'Installed packs and their passport grants',
+    'cx-extensions':   'Signed third-party manifests — per-passport grants',
+    'cx-workbench':    'Operator tooling — read tools live, writes gated',
+    'cx-raw':          'Raw JSON-RPC console — scopes attach automatically',
+    'canvas:board':    'Size-adaptive tile dashboard — drag, pan, expand in place',
+    'canvas:graph':    'Relation graph — real edges, ring layout when zoomed out',
+    'canvas:tree':     'Plan tree — colour-coded by kind and state, filterable',
+    'canvas:studio':   'Build a board of tiles (notes · API · web); saved daemon-side',
+    'explorer':        'Search the corpus — local retrieval or mediated WikiCrux',
+    'sitemap':         "You're here — the whole console, one guided map",
+    // M20 — Rings is the index; its nine views each get a node.
+    'rings':              'Start here — the clock of work: the live board, facts and glance as an animated ring',
+    'rings:activity':     'Live session stream beside the needs-you and fleet panels',
+    'rings:live-board':   'Who is working right now — live sessions and leases',
+    'rings:orchestrators':'Group plans running under one session',
+    'rings:punchcards':   'Advisory path leases, grouped by session',
+    'rings:agent':        'Agent-side cockpit — MCP tools, graph, and where each surface lives',
+    'rings:board':        'Size-adaptive tile dashboard — drag, pan, expand in place',
+    'rings:graph':        'Relation graph — real edges, ring layout when zoomed out',
+    'rings:tree':         'Plan tree — colour-coded by kind and state, filterable'
+  };
+  // Honest per-node badges — access posture + feature-gating, stated on the card.
+  var SITEMAP_BADGE = {
+    'cx-lane-weights': { t: 'OPERATOR', cls: 'op' },
+    'cx-mints':        { t: 'OPERATOR', cls: 'op' },
+    'cx-raw':          { t: 'OPERATOR', cls: 'op' },
+    'cx-identity':     { t: 'FEATURE-GATED', cls: 'gate' },
+    'cx-mediation':    { t: 'ENGINE OFF', cls: 'gate' }
+    // rings: no badge — it is now a native, live-wired page like every other
+    // content surface (was PROTOTYPE while it shipped as an embedded iframe mock).
+  };
+  // Recommended first-run path (node keys, in order). Rendered as small numerals
+  // on the matching cards + a legend; steps whose node is absent in this posture
+  // are skipped so the numbering stays honest.
+  // M20 — the first step is Rings: it is the console index (the retired Overwatch
+  // landing's views ARE its tabs), so the start path begins where boot lands.
+  var SITEMAP_START = ['rings', 'cx-sessions', 'cx-facts', 'cx-receipts'];
+  var SITEMAP_START_LABEL = { 'rings': 'Rings', 'cx-sessions': 'Sessions', 'cx-facts': 'Facts', 'cx-receipts': 'Receipts' };
+
+  // Strip trailing "· /v1/…" endpoint noise from a registry sub for map display.
+  function siteMapCleanSub(sub) {
+    if (!sub) { return ''; }
+    return String(sub).replace(/\s*·\s*\/v1\/\S*/g, '').trim();
+  }
+
+  // Build the map sections from the live registry. Returns [{ dest, nodes:[{ key,
+  // name, href, sub }] }]. Pro-only pages are omitted (Pro mode owns them);
+  // operator-only pages are omitted for a customer view so every rendered node
+  // resolves to a live route in the current posture (no dead nodes).
+  function siteMapSections(isOp) {
+    var pages = (typeof window !== 'undefined') ? window.CruxPages : null;
+    if (!pages || !pages.DESTS) { return []; }
+    var byDest = {};
+    Object.keys(pages.PAGES).forEach(function (id) {
+      var p = pages.PAGES[id];
+      (byDest[p.dest] = byDest[p.dest] || []).push(p);
+    });
+    var sections = pages.DESTS.map(function (d) {
+      var nodes = [];
+      var list = byDest[d.id] || [];
+      // M20 — Overwatch is retired: its pages ARE the Rings tabs (emitted under
+      // Rings below), and #/overwatch redirects. It gets NO section at all — not
+      // its pages (they would duplicate the Rings nodes) and not a destination
+      // node (it would point at a redirect). Empty → filtered out below.
+      if (d.id === 'overwatch') { return { dest: d, nodes: [] }; }
+      if (list.length) {
+        list.forEach(function (p) {
+          if (p.pro === true) { return; }               // Pro-mode-only → not on this map
+          if (p.operatorOnly && !isOp) { return; }      // customer can't reach it → skip
+          nodes.push({ key: p.id, name: p.title, href: '#/' + d.id + '/' + p.id, sub: p.sub });
+        });
+      } else if (d.id === 'canvas') {
+        // M19 — the Canvas destination is retired from the map: Board/Graph/Tree
+        // are Rings tabs (emitted under Rings below); Studio moved to the account
+        // menu + rail head (#/canvas/studio stays routable, but not a map node).
+        // Empty section → filtered out.
+      } else if (d.id === 'rings') {
+        // M20 — Rings IS the console index; its NINE views are the map's Rings
+        // nodes (Ring = the index itself). Every slug comes from the shared
+        // CruxPages.RINGS_TAB_SLUGS grammar, so map ↔ nav ↔ routes cannot drift.
+        // ax-agent is pro:true, so its view is omitted in Standard mode exactly
+        // like every other Pro page on this map.
+        var proMap = (typeof window !== 'undefined' && window.CRUX_MODE === 'professional');
+        (pages.RINGS_TAB_SLUGS || []).forEach(function (s) {
+          var pg = s.page ? pages.PAGES[s.page] : null;
+          if (pg && pg.pro === true && !proMap) { return; }
+          if (pg && pg.operatorOnly && !isOp) { return; }
+          if (s.slug === 'ring') { nodes.push({ key: 'rings', name: d.label, href: '#/rings' }); return; }
+          nodes.push({ key: 'rings:' + s.slug, name: s.title, href: '#/rings/' + s.slug, sub: pg ? pg.sub : '' });
+        });
+      } else {
+        // explorer / sitemap — the destination IS the page.
+        nodes.push({ key: d.id, name: d.label, href: '#/' + d.id });
+      }
+      return { dest: d, nodes: nodes };
+    }).filter(function (s) { return s.nodes.length; });
+    // M16b — user workspaces (config-driven) append their own map sections so the
+    // sitemap can never dead-link: each page node is a real #/w/<uid>/<pageUid>.
+    var model = (typeof window !== 'undefined') ? window.CRUX_WS_MODEL : null;
+    if (model && Array.isArray(model.workspaces)) {
+      model.workspaces.forEach(function (ws) {
+        if (ws.builtin) { return; }   // Command/Explorer are already mapped above
+        var wnodes = [];
+        (ws.dests || []).forEach(function (d) {
+          (d.pages || []).forEach(function (pu) {
+            var pd = model.pages && model.pages[pu];
+            var title = pd ? pd.title : ((pages.PAGES[pu] && pages.PAGES[pu].title) || pu);
+            var sub = pd ? pd.sub : ((pages.PAGES[pu] && pages.PAGES[pu].sub) || '');
+            wnodes.push({ key: 'w/' + ws.uid + '/' + pu, name: title, href: '#/w/' + ws.uid + '/' + pu, sub: sub });
+          });
+        });
+        if (wnodes.length) {
+          sections.push({ dest: { id: 'w/' + ws.uid, label: ws.name, icon: ws.icon, sub: 'Workspace · ' + (ws.source === 'builtin-fork' ? 'forked built-in' : 'user') }, nodes: wnodes });
+        }
+      });
+    }
+    return sections;
+  }
+
+  // Resolve which node the operator came FROM (window.CRUX_PREV_HASH) → node key,
+  // for the "you are here" marker. Falls back to the Site map's own node when the
+  // origin is unknown or was the map itself.
+  function siteMapHereKey(prevHash, sections) {
+    var h = String(prevHash || '').replace(/^#\/?/, '');
+    var qi = h.indexOf('?'); if (qi >= 0) { h = h.slice(0, qi); }
+    var parts = h.split('/').filter(Boolean);
+    var dest = parts[0], leaf = parts[1];
+    if (!dest || dest === 'sitemap') { return 'sitemap'; }
+    // M19 — Board/Graph/Tree map to Rings tab nodes; Studio has no map node.
+    if (dest === 'canvas') { return (leaf === 'graph' || leaf === 'tree' || leaf === 'board') ? 'rings:' + leaf : 'sitemap'; }
+    // M20 — any Rings view slug is a map node (rings:<slug>); the bare page is 'rings'.
+    if (dest === 'rings') { return (leaf && leaf !== 'ring') ? 'rings:' + leaf : 'rings'; }
+    if (dest === 'explorer') { return dest; }
+    // M20 — an #/overwatch origin resolves to the Rings node it redirects to.
+    if (dest === 'overwatch') {
+      var CPo = (typeof window !== 'undefined') ? window.CruxPages : null;
+      var slug = (CPo && CPo.OVERWATCH_TO_RINGS && CPo.OVERWATCH_TO_RINGS[leaf]) || 'ring';
+      return slug === 'ring' ? 'rings' : 'rings:' + slug;
+    }
+    var present = {};
+    sections.forEach(function (s) { s.nodes.forEach(function (n) { present[n.key] = s.dest.id; }); });
+    if (leaf && present[leaf]) { return leaf; }         // explicit page node
+    // Dest root with no explicit (or a hidden) page → that section's first node.
+    var hit = null;
+    sections.forEach(function (s) { if (!hit && s.dest.id === dest) { hit = s.nodes[0] && s.nodes[0].key; } });
+    return hit || 'sitemap';
+  }
+
   function renderSiteMap(host) {
     host.textContent = '';
+    var isOp = (typeof window !== 'undefined' && window.CRUX_POSTURE === 'operator');
+    var sections = siteMapSections(isOp);
+    var prev = (typeof window !== 'undefined' && window.CRUX_PREV_HASH) || '';
+    var hereKey = siteMapHereKey(prev, sections);
+
+    // Start-here numerals — number only the steps whose node is present.
+    var present = {};
+    sections.forEach(function (s) { s.nodes.forEach(function (n) { present[n.key] = true; }); });
+    var stepOf = {}; var step = 0;
+    SITEMAP_START.forEach(function (k) { if (present[k]) { step++; stepOf[k] = step; } });
+
     var grid = el('div', { 'class': 'map-grid' });
-    SITEMAP.forEach(function (s) {
+    var nodeCount = 0;
+    sections.forEach(function (s) {
+      var d = s.dest;
       var sec = el('div', { 'class': 'map-sec' });
-      sec.style.setProperty('--sec-c', s.color);
-      var ico = el('span', { 'class': 'map-ico' }); ico.innerHTML = SITEMAP_ICONS[s.icon] || '';
-      var icoSvg = ico.querySelector('svg'); if (icoSvg) { icoSvg.setAttribute('width', '16'); icoSvg.setAttribute('height', '16'); }
-      var h = el('h3', null, [ico, doc().createTextNode(s.title)]);
-      if (s.note) { h.appendChild(el('span', { 'class': 'map-h-note', text: ' · ' + s.note })); }
-      sec.appendChild(h);
-      sec.appendChild(el('div', { 'class': 'tag', text: s.tag }));
-      s.items.forEach(function (it) {
-        var b = el('b', null, [doc().createTextNode(it.name)]);
-        if (it.anno) { b.appendChild(el('span', { 'class': 'anno ' + it.anno.cls, text: it.anno.t })); }
-        var pg = el('div', { 'class': 'map-page' }, [b, el('div', { 'class': 'why', text: it.why })]);
-        if (it.provs && it.provs.length) {
-          var provs = el('div', { 'class': 'provs' });
-          it.provs.forEach(function (pv) { provs.appendChild(el('span', { 'class': 'prov' + (pv['new'] ? ' new' : ''), text: pv.t })); });
-          pg.appendChild(provs);
-        }
-        sec.appendChild(pg);
+      if (sec.style && sec.style.setProperty) { sec.style.setProperty('--sec-c', SITEMAP_ACCENT[d.id] || 'var(--acc)'); }
+      var ico = el('span', { 'class': 'map-ico' }); ico.innerHTML = SITEMAP_ICONS[d.icon] || '';
+      if (ico.querySelector) { var icoSvg = ico.querySelector('svg'); if (icoSvg) { icoSvg.setAttribute('width', '16'); icoSvg.setAttribute('height', '16'); } }
+      // Header links to the destination root.
+      var head = el('a', { 'class': 'map-head', href: '#/' + d.id },
+        [el('h3', null, [ico, doc().createTextNode(d.label)])]);
+      sec.appendChild(head);
+      sec.appendChild(el('div', { 'class': 'tag', text: d.sub || '' }));
+      s.nodes.forEach(function (n) {
+        nodeCount++;
+        var isHere = (n.key === hereKey);
+        var a = el('a', { 'class': 'map-page' + (isHere ? ' is-here' : ''), href: n.href });
+        if (isHere) { a.setAttribute('aria-current', 'page'); }
+        var b = el('b');
+        if (stepOf[n.key]) { b.appendChild(el('span', { 'class': 'map-step', 'aria-hidden': 'true', text: String(stepOf[n.key]) })); }
+        b.appendChild(doc().createTextNode(n.name));
+        var badge = SITEMAP_BADGE[n.key];
+        if (badge) { b.appendChild(el('span', { 'class': 'anno ' + badge.cls, text: badge.t })); }
+        if (isHere) { b.appendChild(el('span', { 'class': 'map-here', text: 'YOU ARE HERE' })); }
+        a.appendChild(b);
+        a.appendChild(el('div', { 'class': 'why', text: SITEMAP_META[n.key] || siteMapCleanSub(n.sub) }));
+        a.appendChild(el('div', { 'class': 'map-route', text: n.href }));
+        sec.appendChild(a);
       });
       grid.appendChild(sec);
     });
     host.appendChild(grid);
+
+    // Footer: recommended first-run path + honest counts.
     var note = el('div', { 'class': 'map-note' });
-    note.innerHTML =
-      '<b>The count:</b> today\'s console is 26 flat rail items in the CX scope plus 4 sibling scopes (DX · GX · AX · IX). This arrangement lands the same surface in <b>5 destinations + System</b> — 9 pages merge into 4, three buried things get promoted (gates, review, node health), two get built new (posture, benchmarks), and nothing is dropped. The 2D|3D substrate switch and the kanban/graph pull-outs survive as per-page view switches. Phone gets Overwatch · Work · Trust + More; Memory, Meters and System sit behind More because approving a gate at a bus stop is real and re-tuning lane weights is not.'
-      + '<br><br><b>The function census behind this map:</b> Crux Daemon exposes 118 HTTP routes (~40 groups), 114 registered MCP tools (14 live at free tier — the console renders from the capability plan, not the registry), 98 corecruxctl subcommands; CruxEngine adds 295 paths on port 14343 + 164 on 14344. ≈789 functions total, each assigned a destination in <span class="mono">PlanCrux/docs/architecture/function-map-daemon-engine-2026-07-03.md</span>. Engine functions reach this UI only through daemon-mediated proxy routes (the lane-weights / gpu1 precedent) — one origin, one passport, receipts on every cross-system mutation.';
+    var legend = el('div', { 'class': 'map-legend' });
+    legend.appendChild(el('span', { 'class': 'map-legend-h', text: 'New here? Follow the path:' }));
+    SITEMAP_START.forEach(function (k) {
+      if (!stepOf[k]) { return; }
+      legend.appendChild(el('span', { 'class': 'map-legend-step' },
+        [el('span', { 'class': 'map-step', text: String(stepOf[k]) }), doc().createTextNode(' ' + (SITEMAP_START_LABEL[k] || k))]));
+    });
+    note.appendChild(legend);
+    var count = el('p', { 'class': 'map-count' }, [
+      el('b', { text: sections.length + ' destinations · ' + nodeCount + ' surfaces.' }),
+      doc().createTextNode(' Every card is a live link to its route — derived from the page registry, so this map cannot drift from the nav. Operator-only and feature-gated surfaces are labelled; the highlighted card is where you came from.')
+    ]);
+    note.appendChild(count);
     host.appendChild(note);
   }
 
@@ -5582,71 +10548,1392 @@
       return r.json().then(function (d) { return { ok: r.ok, status: r.status, data: d }; }, function () { return { ok: r.ok, status: r.status, data: null }; });
     }).catch(function () { return { ok: false, status: 0, data: null }; });
   }
-  function renderActivityLog(host) {
-    host.textContent = '';
-    if (__actLogES) { try { __actLogES.close(); } catch (e) { /* noop */ } __actLogES = null; }
-    var state = { tenant: 'default', session: '', budget: 2000, kinds: {}, rows: [], deb: null };
-    ACT_KINDS.forEach(function (k) { state.kinds[k] = true; });
-    var sessionInput = el('input', { 'class': 'act-input', type: 'text', placeholder: 'session id…', 'aria-label': 'session id' });
-    var budgetInput = el('input', { 'class': 'act-input act-budget', type: 'number', min: '1', value: '2000', 'aria-label': 'token budget' });
-    var searchInput = el('input', { 'class': 'act-input', type: 'search', placeholder: 'filter text…', 'aria-label': 'search' });
-    function field(label, node) { return el('label', { 'class': 'act-field' }, [el('span', { text: label }), node]); }
-    var kindsWrap = el('div', { 'class': 'act-kinds' });
-    var loadBtn = el('button', { 'class': 'btn-primary', type: 'button' }, ['Load']);
-    var liveBtn = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Go live']);
-    var controls = el('div', { 'class': 'act-controls' }, [field('session', sessionInput), field('token budget', budgetInput), field('search', searchInput), kindsWrap, loadBtn, liveBtn]);
-    var liveDot = el('span', { 'class': 'act-livedot' });
-    var statusText = el('span', { 'class': 'act-statustext', text: 'Enter a session id and Load. The activity log is gated by CORECRUXD_FEATURE_ACTIVITY_LOG.' });
-    var list = el('div', { 'class': 'act-list' }, [el('p', { 'class': 'ctl-desc', text: 'No activity loaded yet.' })]);
-    host.appendChild(el('div', { 'class': 'act-log' }, [controls, el('div', { 'class': 'act-status' }, [liveDot, statusText]), list]));
+  // =======================================================================
+  //  Facts browser (console-surfaces-remediation M2) — the durable record,
+  //  paged over GET /v1/facts/list. Custom-rendered (like the activity log)
+  //  because the section model is a pure data→DOM transform: this surface needs
+  //  server-side pagination + search (q=), an ingest-time as_of time-machine
+  //  (as_of_unix_ms), and per-row detail that dereferences the FULL (untruncated)
+  //  value by id. Every read routes through the generated client (fetchJSON +
+  //  CruxApi.factsByFactId via fetchVia) — no raw network here. Degrades honestly
+  //  on an older daemon (list route 404) to the recent-window console feed,
+  //  banner-labelled.
+  // =======================================================================
+  var FACTS_PAGE_LIMIT = 100;      // rows per server page
+  var FACTS_DOM_CAP = 2000;        // hard ceiling on rendered rows (never all-in)
 
-    function setStatus(t) { statusText.textContent = t; }
-    function activeKinds() { return ACT_KINDS.filter(function (k) { return state.kinds[k]; }); }
-    function renderKinds() {
-      kindsWrap.textContent = '';
-      ACT_KINDS.forEach(function (k) {
-        var chip = el('button', { 'class': 'act-kchip k-' + k + (state.kinds[k] ? ' on' : ''), type: 'button', 'aria-pressed': state.kinds[k] ? 'true' : 'false', text: k });
-        chip.addEventListener('click', function () { state.kinds[k] = !state.kinds[k]; renderKinds(); paint(); });
-        kindsWrap.appendChild(chip);
+  // Entity-prefix → the console's status/kind hue token (border-left tint).
+  function factKindTone(prefix) {
+    switch (prefix) {
+      case 'execplan': return 'acc';
+      case 'bench': return 'ok';
+      case 'incident': return 'crit';
+      case 'design': return 'trust';
+      case 'session': return 'warn';
+      default: return 'ink3';
+    }
+  }
+  // Group key: the entity prefix up to the first ':' (execplan, bench, …);
+  // reserved '__x::' entities group under their '__x::' stem; else 'other'.
+  function factGroupKey(entity) {
+    var e = String(entity || '');
+    var m = e.match(/^([a-z0-9_]+):/i);
+    if (m) { return m[1]; }
+    var r = e.match(/^(__[a-z0-9_]+::)/i);
+    if (r) { return r[1]; }
+    return 'other';
+  }
+  function factGroupLabel(k) { return (/::$/.test(k)) ? k : (k === 'other' ? 'other' : k + ':*'); }
+
+  function renderFactsBrowser(host) {
+    host.textContent = '';
+    function nfmt(n) {
+      if (typeof n !== 'number' || !isFinite(n)) { return (n == null) ? '—' : String(n); }
+      try { return n.toLocaleString('en-US'); } catch (e) { return String(n); }
+    }
+    function shortTime(iso) { var s = String(iso || ''); return s.length >= 16 ? s.slice(0, 16).replace('T', ' ') : (s || '—'); }
+    function fmtConf(c) { return (typeof c === 'number' && isFinite(c)) ? c.toFixed(2) : '—'; }
+    function prettyValue(v) {
+      if (typeof v !== 'string') { try { return JSON.stringify(v, null, 2); } catch (e) { return String(v); } }
+      var t = v.trim();
+      if (t && (t.charAt(0) === '{' || t.charAt(0) === '[')) { try { return JSON.stringify(JSON.parse(v), null, 2); } catch (e) { return v; } }
+      return v;
+    }
+    function qs(obj) {
+      var parts = [];
+      Object.keys(obj).forEach(function (k) { parts.push(encodeURIComponent(k) + '=' + encodeURIComponent(obj[k])); });
+      return parts.join('&');
+    }
+
+    var state = {
+      rows: [], seen: {}, groupBodies: {}, groupsExpanded: {},
+      nextCursor: null, hasMore: false, totalVisible: null, totalNondeleted: null,
+      census: null, q: '', entityPrefix: '',
+      includeReserved: false, includeSuperseded: true, asOfMs: null,
+      loading: false, fallback: false, deb: null, token: 0
+    };
+
+    // ---- toolbar ----
+    var searchInput = el('input', { 'class': 'facts-input', type: 'search', placeholder: 'search entity / key / value…', 'aria-label': 'search facts' });
+    var asOfInput = el('input', { 'class': 'facts-input facts-asof', type: 'datetime-local', 'aria-label': 'as of (ingest-time machine)' });
+    var supToggle = el('button', { 'class': 'facts-toggle on', type: 'button', 'aria-pressed': 'true', title: 'include cross-entity-retired (superseded) facts' }, ['superseded']);
+    var resToggle = el('button', { 'class': 'facts-toggle', type: 'button', 'aria-pressed': 'false', title: 'include daemon-reserved (__*) entities' }, ['reserved __*']);
+    function field(label, node) { return el('label', { 'class': 'facts-field' }, [el('span', { text: label }), node]); }
+    var toolbar = el('div', { 'class': 'facts-toolbar' }, [
+      field('search', searchInput),
+      field('as of', asOfInput),
+      el('div', { 'class': 'facts-toggles' }, [supToggle, resToggle])
+    ]);
+    var countLine = el('p', { 'class': 'facts-count' });
+    var chipsWrap = el('div', { 'class': 'facts-chips' });
+    var banner = el('div', { 'class': 'facts-banner' }); banner.style.display = 'none';
+    var groupsWrap = el('div', { 'class': 'facts-groups' });
+    var moreWrap = el('div', { 'class': 'facts-more' });
+    var sentinel = el('div', { 'class': 'facts-sentinel' });
+    host.appendChild(el('div', { 'class': 'facts-browser' }, [toolbar, countLine, chipsWrap, banner, groupsWrap, moreWrap, sentinel]));
+
+    function syncToggles() {
+      supToggle.classList.toggle('on', state.includeSuperseded); supToggle.setAttribute('aria-pressed', state.includeSuperseded ? 'true' : 'false');
+      resToggle.classList.toggle('on', state.includeReserved); resToggle.setAttribute('aria-pressed', state.includeReserved ? 'true' : 'false');
+    }
+    function baseQuery(extra) {
+      var q = { limit: FACTS_PAGE_LIMIT };
+      if (state.q) { q.q = state.q; }
+      if (state.entityPrefix) { q.entity_prefix = state.entityPrefix; }
+      if (state.includeReserved) { q.include_reserved = 1; }
+      if (!state.includeSuperseded) { q.include_superseded = 0; }
+      if (state.asOfMs != null) { q.as_of_unix_ms = state.asOfMs; }
+      if (extra) { for (var k in extra) { q[k] = extra[k]; } }
+      return q;
+    }
+
+    function paintCount() {
+      var shown = state.rows.length, vis = state.totalVisible;
+      var filtered = !!(state.q || state.entityPrefix);
+      var label = filtered ? (vis === 1 ? 'match' : 'matches') : 'visible';
+      var kids = [el('b', { text: nfmt(shown) }), ' shown of ', el('b', { text: (vis == null ? '—' : nfmt(vis)) }), ' ' + label];
+      var c = state.census;
+      if (c && c.stored != null) {
+        kids.push(' · '); kids.push(el('b', { text: nfmt(c.stored) })); kids.push(' stored');
+        if (c.priv != null && c.reserved != null) {
+          kids.push(' (' + nfmt(c.priv) + ' private + ' + nfmt(c.reserved) + ' reserved ' + (state.includeReserved ? 'shown' : 'hidden') + ')');
+        }
+      } else if (state.totalNondeleted != null) {
+        kids.push(' · '); kids.push(el('b', { text: nfmt(state.totalNondeleted) })); kids.push(' stored');
+      }
+      if (state.asOfMs != null) { kids.push(el('span', { 'class': 'facts-asof-tag', text: '⏱ as of ' + shortTime(new Date(state.asOfMs).toISOString()) })); }
+      countLine.textContent = '';
+      kids.forEach(function (k) { countLine.appendChild(typeof k === 'string' ? doc().createTextNode(k) : k); });
+    }
+
+    // Census: two limit=1 probes (reserved off / on, superseded included, current
+    // as_of) yield the exact private + reserved split from the SAME response
+    // fields — derived, never hardcoded.
+    function loadCensus() {
+      var probe = { limit: 1 };
+      if (state.asOfMs != null) { probe.as_of_unix_ms = state.asOfMs; }
+      var onQ = {}; for (var k in probe) { onQ[k] = probe[k]; } onQ.include_reserved = 1;
+      var myToken = state.token;
+      Promise.all([fetchJSON('/v1/facts/list?' + qs(probe)), fetchJSON('/v1/facts/list?' + qs(onQ))]).then(function (rr) {
+        if (myToken !== state.token) { return; }
+        var a = rr[0], b = rr[1];
+        if (!a.ok || !a.data) { return; }
+        var visible = a.data.total_visible, stored = a.data.total_nondeleted;
+        var withReserved = (b.ok && b.data && b.data.total_visible != null) ? b.data.total_visible : visible;
+        state.census = {
+          stored: stored,
+          reserved: (withReserved != null && visible != null) ? Math.max(0, withReserved - visible) : null,
+          priv: (stored != null && withReserved != null) ? Math.max(0, stored - withReserved) : null
+        };
+        paintCount();
       });
     }
-    function load() {
-      state.session = (sessionInput.value || '').trim();
-      state.budget = parseInt(budgetInput.value, 10) || 2000;
-      if (!state.session) { setStatus('Enter a session id first.'); return; }
-      var ak = activeKinds();
-      var query = { tenant_id: state.tenant, session: state.session, token_budget: state.budget };
-      if (ak.length < ACT_KINDS.length) { query.kinds = ak.join(','); }
-      activityBackfill(query).then(function (res) {
-        if (res.status === 404) { state.rows = []; setStatus('Activity log disabled on this daemon (set CORECRUXD_FEATURE_ACTIVITY_LOG=1).'); paint(); return; }
-        if (!res.ok || !res.data) { state.rows = []; setStatus('Load failed (HTTP ' + (res.status || '?') + ').'); paint(); return; }
-        state.rows = res.data.rows || [];
-        setStatus((res.data.returned != null ? res.data.returned : state.rows.length) + ' row(s)' + (res.data.truncated ? ' (budget-truncated — raise token_budget)' : '') + ' · session ' + state.session);
-        paint();
+
+    function rowEl(f) {
+      var badges = el('div', { 'class': 'facts-rbadges' });
+      if (f.superseded_by) { badges.appendChild(el('span', { 'class': 'facts-badge sup', title: 'superseded by ' + f.superseded_by, text: 'superseded' })); }
+      if (f.value_truncated) { badges.appendChild(el('span', { 'class': 'facts-badge', title: f.value_len + ' chars — open the row for the full value', text: nfmt(f.value_len) + ' ch' })); }
+      var head = el('div', { 'class': 'facts-rhead' }, [
+        el('span', { 'class': 'facts-key', text: f.key || '(no key)' }),
+        el('span', { 'class': 'facts-entity', text: f.entity || '' }),
+        badges,
+        el('span', { 'class': 'facts-time', text: shortTime(f.stored_at) })
+      ]);
+      var val = el('div', { 'class': 'facts-val', text: (f.value || '') + (f.value_truncated ? ' …' : '') });
+      var detail = el('div', { 'class': 'facts-detail' });
+      var row = el('div', { 'class': 'facts-row tone-' + factKindTone(factGroupKey(f.entity)), role: 'button', tabindex: '0' }, [head, val, detail]);
+      var opened = false;
+      function toggle() { var o = row.classList.toggle('open'); if (o && !opened) { opened = true; expandRow(detail, f); } }
+      row.addEventListener('click', toggle);
+      row.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+      return row;
+    }
+    function expandRow(detail, f) {
+      detail.textContent = '';
+      detail.appendChild(el('div', { 'class': 'facts-loading', text: 'loading full fact…' }));
+      fetchVia(function () { return window.CruxApi.factsByFactId(f.fact_id); }).then(function (res) {
+        detail.textContent = '';
+        var full = (res.ok && res.data) ? res.data : null;
+        var value = full ? full.value : (f.value || '');
+        var meta = el('div', { 'class': 'facts-kv' });
+        function kv(k, v) { meta.appendChild(el('span', { 'class': 'facts-kv-k', text: k })); meta.appendChild(el('span', { 'class': 'facts-kv-v', text: (v == null || v === '') ? '—' : String(v) })); }
+        kv('fact_id', f.fact_id);
+        kv('entity', f.entity);
+        kv('key', f.key);
+        kv('actor', (full && full.actor != null) ? full.actor : f.actor);
+        kv('confidence', fmtConf(full ? full.confidence : f.confidence));
+        kv('horizon_class', (full && full.horizon_class) || f.horizon_class);
+        kv('tokens', (full && full.tokens != null) ? full.tokens : f.tokens);
+        kv('version', (full && full.version != null) ? full.version : f.version);
+        kv('stored_at', (full && full.stored_at) || f.stored_at);
+        if (f.superseded_by || (full && full.superseded_by)) { kv('superseded_by', f.superseded_by || (full && full.superseded_by)); }
+        detail.appendChild(meta);
+        if (!full) { detail.appendChild(el('p', { 'class': 'ctl-desc', text: 'Full value unavailable (HTTP ' + (res.status || '?') + ') — showing the row value.' })); }
+        detail.appendChild(el('div', { 'class': 'facts-vlabel', text: (full && f.value_truncated) ? 'value (full)' : 'value' }));
+        detail.appendChild(el('pre', { 'class': 'facts-vfull', text: prettyValue(value) }));
       });
     }
-    function matches(r, q) {
+
+    function ensureGroup(k) {
+      if (state.groupBodies[k]) { return state.groupBodies[k]; }
+      if (!(k in state.groupsExpanded)) { state.groupsExpanded[k] = false; }
+      var det = el('details', { 'class': 'facts-group tone-' + factKindTone(k) });
+      if (state.groupsExpanded[k]) { det.setAttribute('open', 'open'); }
+      var count = el('span', { 'class': 'facts-gcount' });
+      var sum = el('summary', { 'class': 'facts-gsum' }, [el('span', { 'class': 'facts-gdot' }), el('span', { 'class': 'facts-gname', text: factGroupLabel(k) }), count]);
+      det.appendChild(sum);
+      det.addEventListener('toggle', function () { state.groupsExpanded[k] = det.open; });
+      var body = el('div', { 'class': 'facts-glist' });
+      det.appendChild(body);
+      groupsWrap.appendChild(det);
+      state.groupBodies[k] = { body: body, count: count, n: 0 };
+      return state.groupBodies[k];
+    }
+    function appendRows(facts) {
+      facts.forEach(function (f) { var g = ensureGroup(factGroupKey(f.entity)); g.body.appendChild(rowEl(f)); g.n++; g.count.textContent = g.n + ' loaded'; });
+    }
+    function firstPaint(facts) {
+      groupsWrap.textContent = ''; state.groupBodies = {};
+      if (!facts.length) { groupsWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'No facts match.' })); return; }
+      var counts = {};
+      facts.forEach(function (f) { var k = factGroupKey(f.entity); counts[k] = (counts[k] || 0) + 1; });
+      Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a]; }).forEach(function (k, idx) { state.groupsExpanded[k] = idx < 4; });
+      appendRows(facts);
+    }
+
+    function paintChips() {
+      if (state.fallback) { chipsWrap.textContent = ''; return; }
+      var counts = {};
+      state.rows.forEach(function (f) { var k = factGroupKey(f.entity); counts[k] = (counts[k] || 0) + 1; });
+      var keys = Object.keys(counts).filter(function (k) { return k !== 'other'; }).sort(function (a, b) { return counts[b] - counts[a]; }).slice(0, 12);
+      chipsWrap.textContent = '';
+      var allChip = el('button', { 'class': 'facts-chip' + (state.entityPrefix ? '' : ' on'), type: 'button', title: 'clear the entity-prefix filter' }, ['all']);
+      allChip.addEventListener('click', function () { if (!state.entityPrefix) { return; } state.entityPrefix = ''; resetAndLoad(); });
+      chipsWrap.appendChild(allChip);
+      keys.forEach(function (k) {
+        var pref = (/::$/.test(k)) ? k : k + ':';
+        var active = state.entityPrefix === pref;
+        var chip = el('button', { 'class': 'facts-chip' + (active ? ' on' : ''), type: 'button', title: 'filter to ' + pref + '* server-side' }, [el('span', { text: factGroupLabel(k) }), el('span', { 'class': 'c', text: String(counts[k]) })]);
+        chip.addEventListener('click', function () {
+          if (active) { state.entityPrefix = ''; }
+          else { state.entityPrefix = pref; if (/^__/.test(pref) && !state.includeReserved) { state.includeReserved = true; syncToggles(); } }
+          resetAndLoad();
+        });
+        chipsWrap.appendChild(chip);
+      });
+    }
+
+    function paintMore() {
+      moreWrap.textContent = '';
+      if (state.fallback) { return; }
+      if (state.rows.length >= FACTS_DOM_CAP) { moreWrap.appendChild(el('p', { 'class': 'facts-cap', text: 'Rendered ' + nfmt(FACTS_DOM_CAP) + '+ rows — narrow with search or a prefix chip to load the rest.' })); return; }
+      if (state.hasMore) {
+        var remaining = (state.totalVisible != null) ? Math.max(0, state.totalVisible - state.rows.length) : null;
+        var btn = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Load more' + (remaining != null ? ' (' + nfmt(remaining) + ' remaining)' : '')]);
+        btn.addEventListener('click', loadNext);
+        moreWrap.appendChild(btn);
+      } else if (state.rows.length) {
+        moreWrap.appendChild(el('p', { 'class': 'ctl-desc', text: 'End of ' + ((state.q || state.entityPrefix) ? 'matches' : 'the visible store') + '.' }));
+      }
+    }
+
+    function loadPage(cursor, isFirst) {
+      if (state.loading) { return; }
+      state.loading = true;
+      if (isFirst) { groupsWrap.textContent = ''; groupsWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'loading…' })); }
+      var myToken = state.token;
+      fetchJSON('/v1/facts/list?' + qs(baseQuery(cursor ? { cursor: cursor } : null))).then(function (res) {
+        if (myToken !== state.token) { return; }
+        state.loading = false;
+        if (isFirst && res.status === 404) { state.fallback = true; fallbackLoad(); return; }
+        if (!res.ok || !res.data) {
+          if (isFirst) { banner.style.display = ''; banner.className = 'facts-banner err'; banner.textContent = 'Facts listing unavailable — ' + (res.status === 0 ? 'daemon unreachable' : 'HTTP ' + res.status) + '.'; groupsWrap.textContent = ''; }
+          return;
+        }
+        var d = res.data;
+        state.totalVisible = d.total_visible; state.totalNondeleted = d.total_nondeleted;
+        state.nextCursor = d.next_cursor || null; state.hasMore = !!d.has_more;
+        var fresh = [];
+        (d.facts || []).forEach(function (f) { if (f.fact_id && state.seen[f.fact_id]) { return; } if (f.fact_id) { state.seen[f.fact_id] = true; } state.rows.push(f); fresh.push(f); });
+        if (isFirst) { firstPaint(state.rows); } else { appendRows(fresh); }
+        paintCount(); paintChips(); paintMore();
+      });
+    }
+    function loadNext() {
+      if (state.fallback || state.loading || !state.hasMore) { return; }
+      if (state.rows.length >= FACTS_DOM_CAP) { paintMore(); return; }
+      loadPage(state.nextCursor, false);
+    }
+    function resetAndLoad() {
+      state.token++;
+      state.rows = []; state.seen = {}; state.groupBodies = {}; state.groupsExpanded = {};
+      state.nextCursor = null; state.hasMore = false; state.loading = false; state.fallback = false;
+      banner.style.display = 'none'; moreWrap.textContent = '';
+      loadCensus();
+      loadPage(null, true);
+    }
+    // Older daemon (no /v1/facts/list): fall back to the recent-window console
+    // feed, honestly labelled — read-only, no server paging or search.
+    function fallbackLoad() {
+      banner.style.display = ''; banner.className = 'facts-banner warn';
+      banner.textContent = 'Listing route unavailable on this daemon (needs the console-surfaces-remediation branch). Showing the recent window from /v1/console/facts only.';
+      chipsWrap.textContent = ''; moreWrap.textContent = '';
+      fetchJSON('/v1/console/facts?top_k=100').then(function (res) {
+        groupsWrap.textContent = '';
+        if (!res.ok || !res.data) { groupsWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'Recent-window feed also unavailable (HTTP ' + (res.status || '?') + ').' })); return; }
+        var facts = res.data.facts || [];
+        state.rows = facts;
+        state.totalVisible = (res.data.visible_count != null) ? res.data.visible_count : facts.length;
+        state.totalNondeleted = (res.data.count != null) ? res.data.count : null;
+        state.census = null;
+        firstPaint(facts); paintCount();
+        moreWrap.appendChild(el('p', { 'class': 'ctl-desc', text: 'Recent window: ' + nfmt(facts.length) + (state.totalNondeleted != null ? ' of ' + nfmt(state.totalNondeleted) + ' stored' : '') + ' (no server-side paging on this daemon).' }));
+      });
+    }
+
+    // ---- wiring ----
+    searchInput.addEventListener('input', function () { clearTimeout(state.deb); state.deb = setTimeout(function () { state.q = (searchInput.value || '').trim(); resetAndLoad(); }, 250); });
+    asOfInput.addEventListener('change', function () { var v = asOfInput.value; if (!v) { state.asOfMs = null; } else { var t = new Date(v).getTime(); state.asOfMs = isFinite(t) ? t : null; } resetAndLoad(); });
+    supToggle.addEventListener('click', function () { state.includeSuperseded = !state.includeSuperseded; syncToggles(); resetAndLoad(); });
+    resToggle.addEventListener('click', function () { state.includeReserved = !state.includeReserved; syncToggles(); resetAndLoad(); });
+    if (typeof IntersectionObserver !== 'undefined') {
+      var io = new IntersectionObserver(function (entries) { if (entries[0] && entries[0].isIntersecting) { loadNext(); } }, { rootMargin: '500px' });
+      io.observe(sentinel);
+    }
+    resetAndLoad();
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  cx-sessions (console-surfaces-remediation M3): a searchable session list
+  //  over /v1/console/sessions (session_rows — NOT the bare id strings the old
+  //  builder read), with a row-click detail drawer over the new
+  //  /v1/console/sessions/detail route. Custom-rendered like renderFactsBrowser;
+  //  through-client only (fetchJSON → CruxApi.get), el()/textContent, no innerHTML.
+  //  Deliberately SEPARATE from the canvas renderSessionDetail path (whose smoke
+  //  gate forbids reading session state) — this drawer shows the full state blob
+  //  the daemon exposes under admin-read.
+  // ─────────────────────────────────────────────────────────────────────────
+  function renderSessionsBrowser(host) {
+    host.textContent = '';
+    function nfmt(n) { if (typeof n !== 'number' || !isFinite(n)) { return (n == null) ? '—' : String(n); } try { return n.toLocaleString('en-US'); } catch (e) { return String(n); } }
+    function compactTokens(n) {
+      if (typeof n !== 'number' || !isFinite(n)) { return '—'; }
+      if (n >= 1000) { var k = n / 1000; return (k >= 100 ? Math.round(k) : k.toFixed(1)) + 'k'; }
+      return String(n);
+    }
+    function relTime(iso) {
+      var t = Date.parse(iso || ''); if (!isFinite(t)) { return '—'; }
+      var s = Math.max(0, Math.round((Date.now() - t) / 1000));
+      if (s < 60) { return s + 's ago'; }
+      var m = Math.round(s / 60); if (m < 60) { return m + 'm ago'; }
+      var h = Math.round(m / 60); if (h < 48) { return h + 'h ago'; }
+      return Math.round(h / 24) + 'd ago';
+    }
+    function prettyValue(v) {
+      if (typeof v !== 'string') { try { return JSON.stringify(v, null, 2); } catch (e) { return String(v); } }
+      var t = v.trim();
+      if (t && (t.charAt(0) === '{' || t.charAt(0) === '[')) { try { return JSON.stringify(JSON.parse(v), null, 2); } catch (e) { return v; } }
+      return v;
+    }
+    function shortId(id) { var s = String(id || ''); return s.length > 8 ? s.slice(0, 8) : s; }
+
+    // Same-id ExecPlan lane (M3 follow-up): EXACT linkage — a session whose
+    // logical id names an ExecPlan work-board item (`execplan:<slug>`, or a bare
+    // `<slug>` that resolves to one). `state.plans` maps that id → the work item
+    // {state, current_milestone, title}, fetched once alongside the session list.
+    // Distinct from the coord live-announce lane (TTL) and the fact-authorship
+    // heuristic lane — this is identity, not inference.
+    var state = { all: [], q: '', includeArchived: false, totalCount: 0, archivedCount: 0, loading: false, token: 0, plans: {} };
+    function planIdFor(s) {
+      var lid = String((s && s.session_id) || '');
+      if (!lid) { return null; }
+      var id = lid.indexOf('execplan:') === 0 ? lid : 'execplan:' + lid;
+      return state.plans[id] ? id : null;
+    }
+
+    var searchInput = el('input', { 'class': 'facts-input', type: 'search', placeholder: 'filter id / agent / passport / plan…', 'aria-label': 'filter sessions' });
+    var archToggle = el('button', { 'class': 'facts-toggle', type: 'button', 'aria-pressed': 'false', title: 'include archived sessions' }, ['archived']);
+    function field(label, node) { return el('label', { 'class': 'facts-field' }, [el('span', { text: label }), node]); }
+    var toolbar = el('div', { 'class': 'facts-toolbar' }, [field('filter', searchInput), el('div', { 'class': 'facts-toggles' }, [archToggle])]);
+    var countLine = el('p', { 'class': 'facts-count' });
+    var banner = el('div', { 'class': 'facts-banner' }); banner.style.display = 'none';
+    // M21 — SESSION ALLOCATION. "Why do so many sessions have no passport or
+    // plan?" is answered here with the daemon's own counts (GET
+    // /v1/console/sessions → `allocation`, computed over every listed row, not
+    // just the displayed page) plus the structural reason. Absent on an older
+    // daemon → the panel stays hidden rather than showing zeros.
+    var allocWrap = el('div', { 'class': 'sess-alloc' }); allocWrap.hidden = true;
+    var listWrap = el('div', { 'class': 'facts-groups' });
+    host.appendChild(el('div', { 'class': 'facts-browser' }, [toolbar, countLine, banner, allocWrap, listWrap]));
+    function allocStat(label, n, of, tone) {
+      var pct = of ? Math.round((n / of) * 100) : 0;
+      return el('div', { 'class': 'sess-alloc-stat' + (tone ? ' tone-' + tone : '') }, [
+        el('span', { 'class': 'sess-alloc-n', text: nfmt(n) }),
+        el('span', { 'class': 'sess-alloc-of', text: '/ ' + nfmt(of) + ' · ' + pct + '%' }),
+        el('span', { 'class': 'sess-alloc-l', text: label })
+      ]);
+    }
+    function paintAllocation(a) {
+      allocWrap.textContent = '';
+      if (!a || typeof a.counted !== 'number') { allocWrap.hidden = true; return; }
+      allocWrap.hidden = false;
+      var of = a.counted;
+      allocWrap.appendChild(el('div', { 'class': 'sess-alloc-h', text: 'Allocation · ' + nfmt(of) + ' session' + (of === 1 ? '' : 's') + ' counted' }));
+      allocWrap.appendChild(el('div', { 'class': 'sess-alloc-row' }, [
+        allocStat('identity (actor, key prefix or binding)', a.with_any_identity || 0, of, (a.no_identity ? 'warn' : 'ok')),
+        allocStat('write-time actor stamp', a.with_actor || 0, of, null),
+        allocStat('passport binding', a.with_passport_binding || 0, of, null),
+        allocStat('plan link (binding or live announce)', a.with_any_plan_link || 0, of, (a.no_plan_link ? 'warn' : 'ok')),
+        allocStat('agent-given title', a.with_agent_title || 0, of, null)
+      ]));
+      if (a.why) { allocWrap.appendChild(el('p', { 'class': 'ctl-desc', text: a.why })); }
+    }
+
+    function matches(s, q) {
       if (!q) { return true; }
-      return ((r.kind || '') + ' ' + (r.preview || '') + ' ' + (r.tool || '') + ' ' + (r.intent || '') + ' ' + (r.turn_id || '')).toLowerCase().indexOf(q) >= 0;
+      return ((s.session_id || '') + ' ' + (s.agent || '') + ' ' + (s.actor || '') + ' ' + (s.passport_id || '')
+        + ' ' + (s.execplan_slug || '') + ' ' + (planIdFor(s) || '') + ' ' + (s.state_title || '')).toLowerCase().indexOf(q) >= 0;
+    }
+    function paintCount(shown) {
+      countLine.textContent = '';
+      var loaded = state.all.length;
+      // Rows the server would return for this view (archived are excluded unless
+      // the toggle is on) — distinct from the 100-row cap below.
+      var expected = state.includeArchived ? state.totalCount : Math.max(0, state.totalCount - state.archivedCount);
+      var scope = state.includeArchived ? 'all' : 'active';
+      var kids = [el('b', { text: nfmt(shown) }), ' shown'];
+      if (state.q) { kids.push(' (filtered)'); }
+      kids.push(' · '); kids.push(el('b', { text: nfmt(loaded) })); kids.push(' ' + scope + ' session' + (loaded === 1 ? '' : 's') + ' loaded');
+      kids.push(' · '); kids.push(el('b', { text: nfmt(state.totalCount) })); kids.push(' total');
+      if (state.archivedCount) { kids.push(' · ' + nfmt(state.archivedCount) + ' archived'); }
+      // The server caps the row set at 100 — the ONLY real truncation signal
+      // (archived exclusion is not truncation). Say so honestly when it bites.
+      if (loaded >= 100 && expected > loaded) { kids.push(' · '); kids.push(el('span', { 'class': 'facts-asof-tag', text: 'showing first ' + nfmt(loaded) + ' of ' + nfmt(expected) })); }
+      kids.forEach(function (k) { countLine.appendChild(typeof k === 'string' ? doc().createTextNode(k) : k); });
+    }
+    function chip(cls, text, title) { return el('span', { 'class': cls, title: title || '' }, [text]); }
+    function rowEl(s) {
+      // M21 — the agent-given title leads when there is one (a convention on
+      // save_session `state.title`); the id then rides along as a mono tag. No
+      // title → the id stays the heading, exactly as before.
+      var head = el('div', { 'class': 'facts-rhead' }, [
+        el('span', { 'class': 'facts-key' + (s.state_title ? ' cost-name' : ''), text: s.state_title || s.session_id || '(no id)',
+          title: s.state_title ? 'title given by the agent at save_session' : '' }),
+        el('span', { 'class': 'sess-sc ' + (s.state || 'idle'), text: s.state || 'idle' }),
+        s.agent ? chip('sess-chip', s.agent, 'owning agent') : null,
+        s.actor ? chip('sess-chip sess-chip-pass', s.actor, 'identity stamped on this record at write time') : null,
+        el('span', { 'class': 'facts-time', text: relTime(s.updated_at) })
+      ]);
+      if (s.state_title) { head.appendChild(el('span', { 'class': 'cost-idtag', text: s.session_id || '' })); }
+      var planId = planIdFor(s);
+      var plan = planId ? state.plans[planId] : null;
+      var planChipText = planId ? (planId.replace(/^execplan:/, '') + (plan && plan.state ? (' · ' + plan.state) : '')) : null;
+      var metaChips = el('div', { 'class': 'sess-rmeta' }, [
+        chip('sess-chip', compactTokens(s.total_tokens) + ' tok', 'total tokens (bytes/4 estimate)'),
+        s.passport_id ? chip('sess-chip sess-chip-pass', s.passport_id, 'bound passport') : null,
+        planId ? chip('sess-chip sess-chip-plan sess-chip-idmatch', planChipText, 'ExecPlan — matched by session id (exact)') : null,
+        s.execplan_slug ? chip('sess-chip sess-chip-plan', s.execplan_slug + (s.milestone ? (' · ' + s.milestone) : ''), 'live coord announce') : null,
+        s.archived ? chip('sess-chip', 'archived' + (s.archive_reason ? (': ' + s.archive_reason) : ''), 'archived session') : null
+      ]);
+      var subLine = s.state_summary || s.state_first_line;
+      var sub = subLine
+        ? el('div', { 'class': 'facts-val' + (s.state_summary ? ' cost-summary' : ''), text: subLine })
+        : el('div', { 'class': 'sess-note-empty', text: 'no state summary — agents: set title/summary in save_session state' });
+      var detail = el('div', { 'class': 'facts-detail' });
+      var row = el('div', { 'class': 'facts-row', role: 'button', tabindex: '0' }, [head, sub, metaChips, detail]);
+      var opened = false;
+      function toggle() { var o = row.classList.toggle('open'); if (o && !opened) { opened = true; expandDetail(detail, s); } }
+      // A click inside the open drawer (the state-JSON <details> summary, text
+      // selection) must NOT bubble up and collapse the row — only head/meta toggle.
+      row.addEventListener('click', function (e) { if (e.target && e.target.closest && (e.target.closest('a') || e.target.closest('.facts-detail'))) { return; } toggle(); });
+      row.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+      return row;
+    }
+    function kvGrid(pairs) {
+      var meta = el('div', { 'class': 'facts-kv' });
+      pairs.forEach(function (kv) {
+        if (kv[1] == null || kv[1] === '') { return; }
+        meta.appendChild(el('span', { 'class': 'facts-kv-k', text: kv[0] }));
+        meta.appendChild(el('span', { 'class': 'facts-kv-v', text: String(kv[1]) }));
+      });
+      return meta;
+    }
+    function sectionLabel(t) { return el('div', { 'class': 'facts-vlabel', text: t }); }
+    function emptyNote(t) { return el('p', { 'class': 'ctl-desc sess-empty', text: t }); }
+    function expandDetail(detail, s) {
+      detail.textContent = '';
+      detail.appendChild(el('div', { 'class': 'facts-loading', text: 'loading session detail…' }));
+      fetchJSON('/v1/console/sessions/detail?key=' + encodeURIComponent(s.raw_key || s.session_id || '')).then(function (res) {
+        detail.textContent = '';
+        if (!res.ok || !res.data) { detail.appendChild(emptyNote('Detail unavailable (HTTP ' + (res.status || '?') + ') — GET /v1/console/sessions/detail.')); return; }
+        var d = res.data;
+        var meta = d.session || {};
+        // 1) session meta
+        detail.appendChild(sectionLabel('session'));
+        detail.appendChild(kvGrid([
+          ['raw key', meta.raw_key], ['agent', meta.agent], ['state', meta.state],
+          ['updated', meta.updated_at], ['expires', meta.expires_at],
+          ['archived', meta.archived ? ('yes' + (meta.archive_reason ? (' · ' + meta.archive_reason) : '')) : 'no']
+        ]));
+        // 2) passport binding
+        detail.appendChild(sectionLabel('passport'));
+        if (d.binding) { detail.appendChild(kvGrid([['passport', d.binding.passport_id], ['category', d.binding.passport_category], ['project', d.binding.project_id]])); }
+        else { detail.appendChild(emptyNote('No passport binding for this session. Bindings are minted on POST /session (sealed-plan sessions); agent save_session ids resolve to none.')); }
+        // 3) linked ExecPlan — three lanes, most-authoritative first.
+        detail.appendChild(sectionLabel('linked ExecPlan'));
+        // 3a) same-id match (EXACT — the session id names a work-board ExecPlan).
+        var planId = planIdFor(s);
+        if (planId) {
+          var plan = state.plans[planId] || {};
+          detail.appendChild(kvGrid([
+            ['same-id match', planId],
+            ['title', plan.title],
+            ['state', plan.state],
+            ['current milestone', plan.current_milestone]
+          ]));
+          detail.appendChild(el('p', { 'class': 'ctl-desc', text: 'exact: this session’s id equals ExecPlan work item ' + planId + ' — identity, not inference.' }));
+        } else {
+          detail.appendChild(emptyNote('same-id match: none — this session’s id does not name an ExecPlan on the work board (/v1/work).'));
+        }
+        // 3b) live announce (coord intent, TTL-scoped).
+        if (d.coord_intent) {
+          detail.appendChild(kvGrid([
+            ['live announce', (d.coord_intent.execplan_slug || '—') + (d.coord_intent.milestone ? (' · ' + d.coord_intent.milestone) : '')],
+            ['paths', (d.coord_intent.paths || []).join(', ')], ['note', d.coord_intent.note]
+          ]));
+        } else { detail.appendChild(emptyNote('live announce: none — populated by coord_announce (TTL-scoped presence).')); }
+        var plans = d.linked_plans_heuristic || [];
+        if (plans.length) {
+          var plist = el('div', { 'class': 'facts-kv' });
+          plans.forEach(function (p) {
+            plist.appendChild(el('span', { 'class': 'facts-kv-k', text: p.entity }));
+            plist.appendChild(el('span', { 'class': 'facts-kv-v', text: p.matches + ' fact' + (p.matches === 1 ? '' : 's') }));
+          });
+          detail.appendChild(plist);
+          detail.appendChild(el('p', { 'class': 'ctl-desc', text: 'derived from fact authorship — journaled session-plan linkage is a daemon follow-up.' }));
+        } else { detail.appendChild(emptyNote('heuristic plan linkage: none — execplan:* facts authored by this session’s passport would appear here.')); }
+        // 4) gates approved
+        detail.appendChild(sectionLabel('gates decided'));
+        var gates = d.gates || [];
+        if (gates.length) {
+          var glist = el('div', { 'class': 'facts-kv' });
+          gates.forEach(function (g) {
+            var left = g.gate_status + ' · ' + (g.work_title || g.work_id);
+            var right = (g.receipt_id ? (shortId(g.receipt_id) + '…') : 'no receipt');
+            glist.appendChild(el('span', { 'class': 'facts-kv-k', text: left }));
+            glist.appendChild(el('span', { 'class': 'facts-kv-v', text: right }));
+          });
+          detail.appendChild(glist);
+        } else { detail.appendChild(emptyNote('No gate decisions by this passport. Populated by gate approvals (WorkTransition receipts).')); }
+        // 5) token usage
+        detail.appendChild(sectionLabel('token usage'));
+        detail.appendChild(kvGrid([['total tokens', nfmt(meta.total_tokens)], ['estimate', 'serialized-state bytes / 4']]));
+        // 6) full state blob — collapsible, textContent only (admin-read decision).
+        var pre = el('pre', { 'class': 'facts-vfull', text: prettyValue(d.state) });
+        var det = el('details', { 'class': 'sess-state-details' }, [el('summary', {}, ['state JSON (full blob)']), pre]);
+        detail.appendChild(det);
+      });
     }
     function paint() {
       var q = (searchInput.value || '').trim().toLowerCase();
+      state.q = q;
+      var visible = state.all.filter(function (s) { return matches(s, q); });
+      listWrap.textContent = '';
+      if (!state.all.length) { listWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: state.loading ? 'loading…' : 'No sessions. Sessions are written by save_session / cuecrux_session.' })); paintCount(0); return; }
+      if (!visible.length) { listWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'No sessions match the filter.' })); paintCount(0); return; }
+      visible.forEach(function (s) { listWrap.appendChild(rowEl(s)); });
+      paintCount(visible.length);
+    }
+    // Build the same-id ExecPlan map from the work board. Cheap, best-effort:
+    // a failed/absent work feed just leaves state.plans empty (no plan chips /
+    // "same-id: none" in the drawer) — honest degradation, never blocking.
+    function loadPlans() {
+      return fetchJSON('/v1/work?source=all').then(function (res) {
+        var map = {};
+        if (res.ok && res.data) {
+          var items = res.data.work || res.data.items || res.data.work_items || [];
+          items.forEach(function (w) {
+            var id = w && w.id;
+            if (typeof id === 'string' && id.indexOf('execplan:') === 0) {
+              map[id] = { state: w.state || null, current_milestone: w.current_milestone || null, title: w.title || null };
+            }
+          });
+        }
+        state.plans = map;
+      });
+    }
+    function load() {
+      if (state.loading) { return; }
+      state.loading = true; state.token++;
+      var myToken = state.token;
+      listWrap.textContent = ''; listWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'loading…' }));
+      Promise.all([
+        fetchJSON('/v1/console/sessions?include_archived=' + (state.includeArchived ? 'true' : 'false')),
+        loadPlans()
+      ]).then(function (rr) {
+        var res = rr[0];
+        if (myToken !== state.token) { return; }
+        state.loading = false;
+        if (!res.ok || !res.data) { banner.style.display = ''; banner.className = 'facts-banner err'; banner.textContent = 'Sessions unavailable — ' + (res.status === 0 ? 'daemon unreachable' : 'HTTP ' + res.status) + '.'; listWrap.textContent = ''; return; }
+        banner.style.display = 'none';
+        state.all = res.data.session_rows || [];
+        state.totalCount = (res.data.total_count != null) ? res.data.total_count : state.all.length;
+        state.archivedCount = res.data.archived_count || 0;
+        paintAllocation(res.data.allocation);
+        paint();
+      });
+    }
+
+    searchInput.addEventListener('input', paint);
+    archToggle.addEventListener('click', function () { state.includeArchived = !state.includeArchived; archToggle.classList.toggle('on', state.includeArchived); archToggle.setAttribute('aria-pressed', state.includeArchived ? 'true' : 'false'); load(); });
+    load();
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  cx-cost — sessions × token burn (console-surfaces-remediation M5)
+  //
+  //  Custom-rendered like renderSessionsBrowser: a table of one row per posted
+  //  session cost report, filters (passport / date range / plan / min-burn), a
+  //  totals row, and a top-burn horizontal bar chart. Data comes from the
+  //  in-memory cost store via GET /v1/cost/report (sessions[] carries the window,
+  //  burn totals, poster passport, and producer-derived execplan_slugs — the
+  //  additive M5 fields); the ExecPlan join is client-side over /v1/work.
+  //
+  //  Honesty: the store is POST-fed by `corecruxctl session cost --post` and gated
+  //  by CORECRUXD_FEATURE_COST_LENS — the empty state names both. A session that
+  //  carries execplan_slugs links PRECISELY to those plans (method "link"); one
+  //  without falls back to window-overlap on the board (method "window-inferred"),
+  //  labelled so it never reads as falsely precise.
+  //  Through-client only (fetchJSON → CruxApi.get), el()/textContent, no innerHTML.
+  // ─────────────────────────────────────────────────────────────────────────
+  function renderCostBrowser(host) {
+    host.textContent = '';
+    function arr(v) { return Array.isArray(v) ? v : []; }
+    function compactN(n) {
+      if (typeof n !== 'number' || !isFinite(n)) { return '—'; }
+      if (n >= 1e6) { return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + 'M'; }
+      if (n >= 1000) { var k = n / 1000; return (k >= 100 ? Math.round(k) : k.toFixed(1)) + 'k'; }
+      return String(n);
+    }
+    function shortId(id) { var s = String(id || ''); return s.length > 10 ? s.slice(0, 8) + '…' : (s || '(no id)'); }
+    function tsOf(s) { var t = Date.parse(s.started_at || s.received_at || s.generated_at || ''); return isFinite(t) ? t : null; }
+    function fmtDay(iso) { var t = Date.parse(iso || ''); if (!isFinite(t)) { return '—'; } try { return new Date(t).toISOString().slice(0, 16).replace('T', ' '); } catch (e) { return '—'; } }
+    function windowLabel(s) {
+      if (s.started_at && s.ended_at) {
+        var a = fmtDay(s.started_at), b = Date.parse(s.ended_at); var bt = isFinite(b) ? new Date(b).toISOString().slice(11, 16) : '';
+        return a + (bt ? ('→' + bt) : '');
+      }
+      return 'rcvd ' + fmtDay(s.received_at);
+    }
+    function isLinked(s) { return arr(s.execplan_slugs).length > 0; }
+    function planIdsFor(s) { return arr(s.execplan_slugs).map(function (sl) { return 'execplan:' + sl; }); }
+
+    // ---- M21: session names + the fixed-scale token bar --------------------
+    // Cost rows used to be an opaque id and two numbers. They now join the
+    // session store (/v1/console/sessions) for the agent-authored name:
+    //
+    //   state.title  → the name the agent gave the session at save_session time
+    //   state.summary→ its one-paragraph "where this stands"
+    //
+    // Both are CONVENTIONS documented on the save_session tool schema, not
+    // required fields, so the fallback chain is explicit and the UI says which
+    // rung it landed on: title → state_first_line (the first conventional
+    // summary line) → a short id, labelled untitled.
+    //
+    // ---- M25: the bar scale goes ADAPTIVE (operator decision, round 14) -----
+    // M21 shipped a FIXED 2,000,000-token ceiling. M24 measured what that costs
+    // on the real corpus (GET /v1/cost/report?tenant_id=default, 83 posted
+    // session reports on the review mirror): 51 of the 83 rows sit PAST 2M, so
+    // more than half the page drew the same clamped full-width bar and the bar
+    // stopped ranking anything. The operator's decision resolving that finding is
+    // this milestone: scale to the data.
+    //
+    // WHICH adaptive scale — decided on the measured distribution, not taste
+    // (ctx + out per session, same corpus):
+    //     max 613,105,748 · p90 144,734,710 · median 3,171,069 · min 0
+    //   · linear to the visible MAX  → the median row is 0.5% of the track. The
+    //     one 613M outlier flattens 80 rows into invisible stubs.
+    //   · linear capped at p90       → the median row is 2.2% AND eight rows
+    //     clamp at full width — i.e. it reintroduces the very failure being fixed.
+    //   · log10, floor 10k → max     → the median row is ~52% of the track and
+    //     every row from 10k to 613M separates.
+    // The spread is five orders of magnitude; only a log axis renders it. The
+    // price is that LENGTH IS NO LONGER PROPORTIONAL — a bar twice as long is not
+    // twice the tokens — so the page says exactly that, in the scale strip, in
+    // every bar's aria-label and in the expanded detail. The strip carries real
+    // decade ticks (10k · 100k · 1M · 10M · 100M) so the log-ness is visible
+    // rather than merely asserted.
+    //
+    // The 2,000,000 ceiling does NOT disappear: it stays on every track as a
+    // REFERENCE TICK, so the mark the previous rounds trained the eye on is
+    // still readable — now as a landmark on the axis instead of a wall.
+    var COST_REF_TOKENS = 2000000;    // the M21/M24 fixed ceiling, kept as a tick
+    var COST_SCALE_MIN = 10000;       // log floor — below 10k a session is a stub
+    // ONE scale per painted view, computed over BOTH quantities this page draws
+    // (row bars = ctx+out, chart bars = output) so one length means one thing on
+    // one screen — M24's consistency rule, carried forward. Never below the 2M
+    // reference, so the reference tick is always on the track.
+    var costScale = { min: COST_SCALE_MIN, max: COST_REF_TOKENS, n: 0 };
+    function computeCostScale(visible) {
+      var mx = COST_REF_TOKENS;
+      (visible || []).forEach(function (s) {
+        var t = sessTokens(s); if (t > mx) { mx = t; }
+        var o = Number(s.output_tokens) || 0; if (o > mx) { mx = o; }
+      });
+      costScale = { min: COST_SCALE_MIN, max: mx, n: (visible || []).length };
+      return costScale;
+    }
+    // 0..1 position of a token count on the current log axis (logBarPos is the
+    // console-wide helper — the rings ExecPlans-arc lens draws its per-plan
+    // token bars on the same idiom so the two surfaces agree).
+    function costPos(tokens, sc) { sc = sc || costScale; return logBarPos(tokens, sc.min, sc.max); }
+    function sessTokens(s) { return (Number(s.context_tokens) || 0) + (Number(s.output_tokens) || 0); }
+    function sessMeta(s) { return state.meta[s.session_id] || null; }
+    // { text, kind } — kind ∈ title | first_line | id (drives the honest label).
+    function sessName(s) {
+      var m = sessMeta(s);
+      if (m && m.state_title) { return { text: m.state_title, kind: 'title' }; }
+      if (m && m.state_first_line) { return { text: m.state_first_line, kind: 'first_line' }; }
+      return { text: shortId(s.session_id), kind: 'id' };
+    }
+    var COST_UNTITLED_HINT = '(untitled — agents: set title/summary in save_session state)';
+    // One horizontal gradient bar on the adaptive log axis. The gradient is still
+    // sized to the WHOLE track, so a given colour always means a given position
+    // on the scale — a short bar is green because it is small, not because it is
+    // short. Every track carries the 2,000,000-token REFERENCE TICK at its log
+    // position, so the old fixed ceiling stays readable as a landmark.
+    function costBar(tokens) {
+      var over = tokens > costScale.max;   // cannot happen within a painted view
+      var pct = costPos(tokens) * 100;
+      var fill = el('div', { 'class': 'cost-tbar-fill' });
+      fill.style.width = Math.max(pct, tokens > 0 ? 0.6 : 0) + '%';
+      if (pct > 0.6) { fill.style.backgroundSize = (10000 / pct) + '% 100%'; }
+      var ref = el('span', { 'class': 'cost-tbar-refline', 'aria-hidden': 'true' });
+      ref.style.left = (costPos(COST_REF_TOKENS) * 100).toFixed(2) + '%';
+      var track = el('div', { 'class': 'cost-tbar-track' + (over ? ' is-over' : '') }, [fill, ref]);
+      var vals = el('div', { 'class': 'cost-tbar-vals' }, [
+        el('span', { 'class': 'cost-tbar-v', text: compactN(tokens) }),
+        el('span', { 'class': 'cost-tbar-max', text: '/ ' + compactN(costScale.max) })
+      ]);
+      var wrap = el('div', {
+        'class': 'cost-tbar' + (over ? ' is-over' : ''),
+        role: 'img',
+        'aria-label': compactN(tokens) + ' tokens on a logarithmic bar scale from ' + compactN(COST_SCALE_MIN)
+          + ' to ' + compactN(costScale.max) + ' tokens, adaptive to the ' + costScale.n
+          + ' sessions in view; bar length is orders of magnitude, not proportion. Tick marks 2,000,000 tokens.'
+      }, [track, vals]);
+      return wrap;
+    }
+    // The scale strip: a real axis. Decade ticks make the log spacing visible,
+    // the 2M reference tick is called out by name, and the caption states the
+    // adaptivity, the range and the non-proportionality in one line.
+    function costScaleStrip() {
+      var axis = el('div', { 'class': 'cost-axis' }, [el('div', { 'class': 'cost-axis-ramp', 'aria-hidden': 'true' })]);
+      for (var d = COST_SCALE_MIN; d <= costScale.max * 1.0001; d *= 10) {
+        var lp = costPos(d) * 100;
+        // Edge ticks anchor to the edge instead of centring, so the first label
+        // does not hang off the left of the axis and collide with the caption.
+        var tk2 = el('span', { 'class': 'cost-axis-tick' + (lp < 2 ? ' is-first' : (lp > 98 ? ' is-last' : '')), text: compactN(d) });
+        tk2.style.left = lp.toFixed(2) + '%';
+        axis.appendChild(tk2);
+      }
+      var refT = el('span', { 'class': 'cost-axis-tick is-ref', text: '2M ref' });
+      refT.style.left = (costPos(COST_REF_TOKENS) * 100).toFixed(2) + '%';
+      axis.appendChild(refT);
+      return el('div', { 'class': 'cost-scale' }, [
+        el('span', { 'class': 'cost-scale-k', text: 'TOKEN BAR' }),
+        axis,
+        el('span', { 'class': 'cost-scale-v', text: 'bar scale: adaptive to the ' + costScale.n + ' visible sessions · log, ' + compactN(COST_SCALE_MIN) + ' → ' + compactN(costScale.max) + ' tokens · chart and rows alike · length is orders of magnitude, NOT proportion · the tick marks the old fixed 2M ceiling' })
+      ]);
+    }
+
+    // ---- M24: tokens-per-turn, and advice computed from it -----------------
+    // MAGNITUDE vs RATE. The bar answers "which sessions cost the most" — it
+    // finds the big spenders. Tokens-per-turn answers a different question:
+    // "which sessions are INEFFICIENT" — a short session with 400k context per
+    // turn is burning more per unit of work than a long one at 40k, and the bar
+    // will never say so because its total is small. Both ship: the bar ranks,
+    // the per-turn chips diagnose, and the sort switches between the two views.
+    //
+    // Where the numbers come from (verified against the report payload, not
+    // assumed): cost.rs SessionCostRow carries `assistant_turns` and
+    // `context_tokens_per_turn` server-side; output-per-turn is DERIVED here as
+    // output_tokens / assistant_turns. A report with no turn count (3 of 83 on
+    // the review corpus) gets an explicit "turns unavailable" chip and is
+    // excluded from per-turn sorts — never a fabricated 0.
+    function turnsOf(s) { var t = Number(s.assistant_turns); return (isFinite(t) && t > 0) ? t : null; }
+    function outPerTurn(s) { var t = turnsOf(s); return t ? (Number(s.output_tokens) || 0) / t : null; }
+    function ctxPerTurn(s) {
+      var v = Number(s.context_tokens_per_turn);
+      if (isFinite(v) && v > 0) { return v; }           // server-computed (headline)
+      var t = turnsOf(s);
+      return t ? (Number(s.context_tokens) || 0) / t : null;
+    }
+    function ctxRatio(s) {
+      var o = Number(s.output_tokens) || 0;
+      return o > 0 ? (Number(s.context_tokens) || 0) / o : null;
+    }
+
+    // ---- "how to cut it": the page strapline, made real --------------------
+    // Every line below is (a) triggered by a threshold on THIS session's own
+    // numbers and (b) points at a token-reduction feature this daemon actually
+    // ships. Nothing generic, nothing that fires on every row: a session with
+    // nothing notable gets NO advice line (silence is the honest output).
+    //
+    // Grounding for each recommendation:
+    //   token_budget  — mandatory on every retrieval read, enforced server-side
+    //                   (crates/corecruxd/src/http/cost.rs QC.2; same gate on
+    //                   /v1/activity). It caps what a read can return.
+    //   scan → expand — query_scan narrows, query_expand pulls only the hit
+    //                   (crates/crux-mcp/src/oauth.rs tool roster).
+    //   session state — save_session / get_session checkpoint the session so the
+    //                   next turn resumes from a summary instead of replaying
+    //                   the transcript (crates/crux-mcp/src/tools/sessions.rs);
+    //                   the pre-compact hook writes one automatically
+    //                   (crates/crux-claude-hooks/src/cmds/pre_compact.rs).
+    //   fact memory   — store_fact / query_facts keep durable state out of the
+    //                   context window (crates/crux-mcp/src/tools/facts.rs).
+    // No savings PERCENTAGE is claimed anywhere: the daemon measures no
+    // counterfactual, so a number here would be invented.
+    var ADV_CTX_RATIO = 150;        // context : output — above this the session is reading far more than it writes
+    var ADV_CTX_PER_TURN = 200000;  // context tokens carried per assistant turn
+    var ADV_TURNS = 300;            // assistant turns in one session
+    var ADV_OUT_PER_TURN = 2500;    // output tokens per assistant turn
+    var ADV_TOTAL = COST_REF_TOKENS;   // ctx + out past the 2,000,000-token reference mark
+    function costAdvice(s) {
+      var out = [];
+      var r = ctxRatio(s), cpt = ctxPerTurn(s), t = turnsOf(s), opt = outPerTurn(s);
+      if (r != null && r >= ADV_CTX_RATIO) {
+        out.push({ tag: 'context-heavy', text: 'reads ' + Math.round(r) + '× more context than it writes — pass token_budget on every retrieval call (the daemon requires it, QC.2) and narrow with query_scan before query_expand instead of pulling whole documents.' });
+      }
+      if (cpt != null && cpt >= ADV_CTX_PER_TURN) {
+        out.push({ tag: 'replay', text: compactN(Math.round(cpt)) + ' context tokens carried per turn — checkpoint with save_session and resume via get_session so the next turn starts from state, not from a replayed transcript (the pre-compact hook already writes one at every compaction).' });
+      }
+      if (t != null && t >= ADV_TURNS) {
+        out.push({ tag: 'long session', text: t + ' assistant turns in one session — split it at milestone boundaries and carry the state forward as facts (store_fact / query_facts) rather than one growing window.' });
+      }
+      if (opt != null && opt >= ADV_OUT_PER_TURN) {
+        out.push({ tag: 'verbose turns', text: compactN(Math.round(opt)) + ' output tokens per turn — write long artefacts (plans, audits, tables) to files and reference the path, so the transcript carries the pointer instead of the document.' });
+      }
+      if (sessTokens(s) > ADV_TOTAL) {
+        out.push({ tag: 'over scale', text: compactN(sessTokens(s)) + ' total tokens, past the 2M reference mark — this one session is the budget; it is the first candidate for a split.' });
+      }
+      return out;
+    }
+    function adviceNode(s) {
+      var adv = costAdvice(s);
+      if (!adv.length) { return null; }
+      var wrap = el('div', { 'class': 'cost-advice' });
+      adv.forEach(function (a) {
+        wrap.appendChild(el('div', { 'class': 'cost-advice-row' }, [
+          el('span', { 'class': 'cost-advice-tag', text: a.tag }),
+          el('span', { 'class': 'cost-advice-t', text: a.text })
+        ]));
+      });
+      return wrap;
+    }
+    // The thresholds, stated where the advice appears — a rule you cannot read
+    // is a rule you cannot check.
+    function adviceHelp() {
+      var d = el('details', { 'class': 'cost-help' });
+      d.appendChild(el('summary', { text: 'how to cut it — when each line fires' }));
+      var g = el('div', { 'class': 'facts-kv' });
+      [['context-heavy', 'context ÷ output ≥ ' + ADV_CTX_RATIO],
+       ['replay', 'context per turn ≥ ' + compactN(ADV_CTX_PER_TURN)],
+       ['long session', 'assistant turns ≥ ' + ADV_TURNS],
+       ['verbose turns', 'output per turn ≥ ' + compactN(ADV_OUT_PER_TURN)],
+       ['over scale', 'context + output > ' + compactN(ADV_TOTAL)]
+      ].forEach(function (kv) {
+        g.appendChild(el('span', { 'class': 'facts-kv-k', text: kv[0] }));
+        g.appendChild(el('span', { 'class': 'facts-kv-v', text: kv[1] }));
+      });
+      d.appendChild(g);
+      d.appendChild(el('p', { 'class': 'ctl-desc', text: 'A session that trips none of these gets no advice line. Every recommendation names a feature this daemon ships (token_budget · query_scan/query_expand · save_session/get_session · store_fact/query_facts); no savings percentage is claimed, because the daemon measures no counterfactual to compare against.' }));
+      return d;
+    }
+
+    var COST_SORTS = [
+      ['burn', 'total burn (ctx+out)'],
+      ['out', 'output tokens'],
+      ['outturn', 'output / turn'],
+      ['ctxturn', 'context / turn'],
+      ['ratio', 'context : output'],
+      ['recent', 'most recent']
+    ];
+    function sortVisible(rows, key) {
+      var r = rows.slice();
+      function byDesc(fn) {
+        // Rows with no value for this key sink to the bottom rather than
+        // sorting as zero — "unavailable" is not "cheap".
+        return r.sort(function (a, b) {
+          var va = fn(a), vb = fn(b);
+          if (va == null && vb == null) { return 0; }
+          if (va == null) { return 1; }
+          if (vb == null) { return -1; }
+          return vb - va;
+        });
+      }
+      if (key === 'out') { return byDesc(function (s) { return Number(s.output_tokens) || 0; }); }
+      if (key === 'outturn') { return byDesc(outPerTurn); }
+      if (key === 'ctxturn') { return byDesc(ctxPerTurn); }
+      if (key === 'ratio') { return byDesc(ctxRatio); }
+      if (key === 'recent') { return byDesc(tsOf); }
+      return byDesc(sessTokens);
+    }
+
+    var state = { all: [], plans: {}, meta: {}, metaCount: 0, q: '', passport: '', plan: '', minBurn: 0, from: '', to: '', sort: 'burn', loading: false, token: 0 };
+
+    // ---- toolbar (filters) ----
+    var searchInput = el('input', { 'class': 'facts-input', type: 'search', placeholder: 'filter id / source / passport / plan…', 'aria-label': 'filter sessions' });
+    var passportSel = el('select', { 'class': 'facts-input', 'aria-label': 'passport filter' });
+    var planSel = el('select', { 'class': 'facts-input', 'aria-label': 'plan filter' });
+    var minBurnInput = el('input', { 'class': 'facts-input facts-asof', type: 'number', min: '0', step: '1000', placeholder: 'min output tok', 'aria-label': 'minimum output-token burn' });
+    var fromInput = el('input', { 'class': 'facts-input facts-asof', type: 'date', 'aria-label': 'from date' });
+    var toInput = el('input', { 'class': 'facts-input facts-asof', type: 'date', 'aria-label': 'to date' });
+    // M24 — sort switches between the two readings of the same rows: magnitude
+    // (which sessions cost most) and rate (which sessions are inefficient).
+    var sortSel = el('select', { 'class': 'facts-input', 'aria-label': 'sort sessions' });
+    COST_SORTS.forEach(function (o) { sortSel.appendChild(el('option', { value: o[0] }, [o[1]])); });
+    sortSel.value = 'burn';
+    function field(label, node) { return el('label', { 'class': 'facts-field' }, [el('span', { text: label }), node]); }
+    var toolbar = el('div', { 'class': 'facts-toolbar' }, [
+      field('filter', searchInput), field('passport', passportSel), field('plan', planSel),
+      field('min burn (out)', minBurnInput), field('from', fromInput), field('to', toInput),
+      field('sort', sortSel)
+    ]);
+    var countLine = el('p', { 'class': 'facts-count' });
+    var banner = el('div', { 'class': 'facts-banner' }); banner.style.display = 'none';
+    var chartWrap = el('div', { 'class': 'cost-chart' });
+    var totalsRow = el('div', { 'class': 'cost-totals' });
+    var listWrap = el('div', { 'class': 'facts-groups' });
+    host.appendChild(el('div', { 'class': 'facts-browser' }, [toolbar, countLine, banner, chartWrap, totalsRow, listWrap]));
+
+    function opt(sel, value, label) { sel.appendChild(el('option', { value: value }, [label])); }
+    function fillSelects() {
+      passportSel.textContent = ''; planSel.textContent = '';
+      opt(passportSel, '', 'all passports'); opt(planSel, '', 'all plans');
+      var pps = {}, pls = {};
+      state.all.forEach(function (s) {
+        var pp = s.actor_passport || ''; if (pp && pp !== '__anon__') { pps[pp] = 1; }
+        arr(s.execplan_slugs).forEach(function (sl) { pls[sl] = 1; });
+      });
+      Object.keys(pps).sort().forEach(function (p) { opt(passportSel, p, p); });
+      Object.keys(pls).sort().forEach(function (p) { opt(planSel, p, p); });
+      passportSel.value = state.passport; planSel.value = state.plan;
+    }
+
+    function matches(s) {
+      if (state.q) {
+        var mm = sessMeta(s);
+        var hay = ((s.session_id || '') + ' ' + (s.source || '') + ' ' + (s.actor_passport || '') + ' '
+          + arr(s.execplan_slugs).join(' ')
+          + ' ' + ((mm && mm.state_title) || '') + ' ' + ((mm && mm.state_summary) || '') + ' ' + ((mm && mm.actor) || '')).toLowerCase();
+        if (hay.indexOf(state.q) < 0) { return false; }
+      }
+      if (state.passport && s.actor_passport !== state.passport) { return false; }
+      if (state.plan && arr(s.execplan_slugs).indexOf(state.plan) < 0) { return false; }
+      if (state.minBurn > 0 && !((s.output_tokens || 0) >= state.minBurn)) { return false; }
+      if (state.from || state.to) {
+        var t = tsOf(s); if (t == null) { return false; }
+        if (state.from) { var f = Date.parse(state.from + 'T00:00:00Z'); if (isFinite(f) && t < f) { return false; } }
+        if (state.to) { var e = Date.parse(state.to + 'T23:59:59Z'); if (isFinite(e) && t > e) { return false; } }
+      }
+      return true;
+    }
+
+    function chip(cls, text, title) { return el('span', { 'class': cls, title: title || '' }, [text]); }
+    function planChips(s) {
+      if (!isLinked(s)) { return [chip('sess-chip', 'window-inferred', 'no producer link — burn attributes to plans by window-overlap on the board')]; }
+      return planIdsFor(s).map(function (id) {
+        var p = state.plans[id];
+        var txt = id.replace(/^execplan:/, '') + (p && p.state ? (' · ' + p.state) : '');
+        return chip('sess-chip sess-chip-plan', txt, p ? ('ExecPlan (producer link) — ' + (p.title || id)) : (id + ' — not yet on the work board'));
+      });
+    }
+    function methodChip(s) {
+      return isLinked(s)
+        ? chip('sess-chip cost-method link', 'link', 'precise: this session named the plan(s) it worked')
+        : chip('sess-chip cost-method window', 'window', 'coarse: attributed to overlapping plan windows');
+    }
+
+    function rowEl(s) {
+      var nm = sessName(s), m = sessMeta(s);
+      var head = el('div', { 'class': 'facts-rhead' }, [
+        el('span', { 'class': 'facts-key cost-name' + (nm.kind === 'id' ? ' is-untitled' : ''), text: nm.text,
+          title: nm.kind === 'title' ? 'title given by the agent at save_session' :
+            (nm.kind === 'first_line' ? 'no title — first conventional line of the session state' : COST_UNTITLED_HINT) }),
+        methodChip(s),
+        el('span', { 'class': 'facts-time', text: windowLabel(s) })
+      ]);
+      if (nm.kind !== 'id') { head.appendChild(el('span', { 'class': 'cost-idtag', text: shortId(s.session_id) })); }
+      var turns = turnsOf(s), opt = outPerTurn(s), cpt = ctxPerTurn(s);
+      var metaChips = el('div', { 'class': 'sess-rmeta' }, [
+        chip('sess-chip', compactN(s.context_tokens || 0) + ' ctx', 'measured context tokens (Σ)'),
+        chip('sess-chip cost-out', compactN(s.output_tokens || 0) + ' out', 'output tokens generated (Σ)'),
+        // M24 — the per-turn RATE, first-class next to the magnitude. Derived
+        // from assistant_turns; absent turn counts say so rather than showing 0.
+        (turns ? chip('sess-chip', turns + ' turns', 'assistant turns in this session') : chip('sess-chip cost-na', 'turns unavailable', 'this cost report carries no assistant_turns count — per-turn rates cannot be computed for it')),
+        (cpt != null ? chip('sess-chip cost-rate', compactN(Math.round(cpt)) + ' ctx/turn', 'context tokens carried per assistant turn' + (Number(s.context_tokens_per_turn) > 0 ? ' (server headline)' : ' (derived: context ÷ turns)')) : null),
+        (opt != null ? chip('sess-chip cost-rate', compactN(Math.round(opt)) + ' out/turn', 'output tokens per assistant turn (derived: output ÷ turns)') : null),
+        (s.actor_passport && s.actor_passport !== '__anon__') ? chip('sess-chip sess-chip-pass', s.actor_passport, 'poster passport') : null,
+        (m && m.actor) ? chip('sess-chip sess-chip-pass', m.actor, 'identity stamped on the saved session at write time') : null
+      ].concat(planChips(s)));
+      // Summary line: the agent's own words when they set one; otherwise the
+      // source, plus the honest hint that names the missing convention.
+      var subText = (m && m.state_summary) ? m.state_summary
+        : (nm.kind === 'id' ? ((s.source || '(no source)') + '  ' + COST_UNTITLED_HINT) : (s.source || '(no source)'));
+      var sub = el('div', { 'class': 'facts-val' + ((m && m.state_summary) ? ' cost-summary' : ''), text: subText });
+      var detail = el('div', { 'class': 'facts-detail' });
+      var kids = [head, sub, costBar(sessTokens(s)), metaChips];
+      var adv = adviceNode(s);
+      if (adv) { kids.push(adv); }   // silent when this session trips no threshold
+      kids.push(detail);
+      var row = el('div', { 'class': 'facts-row' + (adv ? ' has-advice' : ''), role: 'button', tabindex: '0' }, kids);
+      var opened = false;
+      function toggle() { var o = row.classList.toggle('open'); if (o && !opened) { opened = true; expandDetail(detail, s); } }
+      row.addEventListener('click', function (e) { if (e.target && e.target.closest && (e.target.closest('a') || e.target.closest('.facts-detail'))) { return; } toggle(); });
+      row.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+      return row;
+    }
+    function kvGrid(pairs) {
+      var meta = el('div', { 'class': 'facts-kv' });
+      pairs.forEach(function (kv) { if (kv[1] == null || kv[1] === '') { return; } meta.appendChild(el('span', { 'class': 'facts-kv-k', text: kv[0] })); meta.appendChild(el('span', { 'class': 'facts-kv-v', text: String(kv[1]) })); });
+      return meta;
+    }
+    function sectionLabel(t) { return el('div', { 'class': 'facts-vlabel', text: t }); }
+    function expandDetail(detail, s) {
+      detail.textContent = '';
+      detail.appendChild(sectionLabel('session'));
+      var dm = sessMeta(s);
+      detail.appendChild(kvGrid([
+        ['title', (dm && dm.state_title) || null],
+        ['summary', (dm && dm.state_summary) || null],
+        ['saved by (actor)', (dm && dm.actor) || null],
+        ['session id', s.session_id], ['source', s.source],
+        ['window', (s.started_at && s.ended_at) ? (s.started_at + '  →  ' + s.ended_at) : '(no transcript window — placed at ' + (s.received_at || '?') + ')'],
+        ['received', s.received_at], ['generated', s.generated_at]
+      ]));
+      if (!dm) {
+        detail.appendChild(el('p', { 'class': 'ctl-desc', text: 'No saved session under this id in the session store — this cost report was posted by  corecruxctl session cost --post  without a matching save_session record, so there is no agent-given title or summary to show.' }));
+      } else if (!dm.state_title) {
+        detail.appendChild(el('p', { 'class': 'ctl-desc', text: COST_UNTITLED_HINT + ' — state.title and state.summary are optional conventions read by this lens; see the save_session tool schema.' }));
+      }
+      detail.appendChild(sectionLabel('burn'));
+      detail.appendChild(kvGrid([
+        ['total tokens (ctx+out)', compactN(sessTokens(s)) + '  (' + sessTokens(s) + ')  ·  bar: log scale ' + COST_SCALE_MIN.toLocaleString() + ' → ' + costScale.max.toLocaleString() + ' (adaptive to the ' + costScale.n + ' sessions in view)'],
+        ['context tokens (Σ)', compactN(s.context_tokens || 0) + '  (' + (s.context_tokens || 0) + ')'],
+        ['output tokens (Σ)', compactN(s.output_tokens || 0) + '  (' + (s.output_tokens || 0) + ')'],
+        ['assistant turns', turnsOf(s) != null ? String(turnsOf(s)) : 'unavailable — this report carries no turn count'],
+        ['context / turn', ctxPerTurn(s) != null ? (compactN(Math.round(ctxPerTurn(s))) + '  (' + Math.round(ctxPerTurn(s)) + ')') : '—'],
+        ['output / turn', outPerTurn(s) != null ? (compactN(Math.round(outPerTurn(s))) + '  (' + Math.round(outPerTurn(s)) + ')') : '—'],
+        ['context : output', ctxRatio(s) != null ? (Math.round(ctxRatio(s)) + ' : 1') : '—']
+      ]));
+      // M24 — the same advice as the row, restated where the numbers behind it
+      // are visible, plus the thresholds that produced it.
+      detail.appendChild(sectionLabel('how to cut it'));
+      var dAdv = adviceNode(s);
+      if (dAdv) { detail.appendChild(dAdv); }
+      else { detail.appendChild(el('p', { 'class': 'ctl-desc sess-empty', text: 'Nothing notable — this session trips none of the token-reduction thresholds, so there is no advice to give.' })); }
+      detail.appendChild(adviceHelp());
+      detail.appendChild(sectionLabel('linked ExecPlan'));
+      if (isLinked(s)) {
+        var list = el('div', { 'class': 'facts-kv' });
+        planIdsFor(s).forEach(function (id) {
+          var p = state.plans[id];
+          list.appendChild(el('span', { 'class': 'facts-kv-k', text: id }));
+          list.appendChild(el('span', { 'class': 'facts-kv-v', text: p ? ((p.title || '—') + (p.state ? (' · ' + p.state) : '') + (p.current_milestone ? (' · ' + p.current_milestone) : '')) : 'not yet on the work board (rsync lag)' }));
+        });
+        detail.appendChild(list);
+        detail.appendChild(el('p', { 'class': 'ctl-desc', text: 'producer link (method "link"): this session named these plans in its transcript — the burn credits them precisely (even-split across N).' }));
+      } else {
+        detail.appendChild(el('p', { 'class': 'ctl-desc sess-empty', text: 'no producer link — this session had no execplan_slugs. Its burn attributes to plans whose fact-window overlaps the session window (method "window", coarse). See the plan board /v1/work for the per-plan token_burn rollup.' }));
+      }
+      detail.appendChild(el('p', { 'class': 'ctl-desc', text: 'attribution recomputed read-time in cost_attribution.rs; passport = poster identity (' + (s.actor_passport || '__anon__') + ').' }));
+    }
+
+    // M24 — ONE visual language for token magnitude. The chart used to draw its
+    // own flat var(--acc) bar rescaled to the top-10 max, sitting a few pixels
+    // above rows whose bars were gradient-on-a-fixed-2M-scale: the same length
+    // meant two different things on one screen.
+    //
+    // It now calls the SAME costBar() as the rows — same track, same gradient,
+    // same 8px height, same fixed 2,000,000-token ceiling. Fixed scale beat
+    // proportional-to-max on the deciding argument: a proportional chart would
+    // stretch the top session to 100% of the track and put a bar of that length
+    // directly above a row bar of the same length meaning 2M — i.e. it would
+    // reintroduce the exact inconsistency being removed. Rank order is carried
+    // by the sort, not by the scale, so the top-10 comparison still reads (on
+    // the review corpus the ten bars span 71% → 30% of the track).
+    //
+    // Labels use the cx-sessions naming chain (title → first line → short id),
+    // not a raw UUID.
+    function renderChart(visible) {
+      chartWrap.textContent = '';
+      var top = visible.slice().sort(function (a, b) { return (b.output_tokens || 0) - (a.output_tokens || 0); }).slice(0, 10);
+      if (!top.length || (top[0].output_tokens || 0) <= 0) { return; }
+      chartWrap.appendChild(el('div', { 'class': 'cost-chart-title', text: 'Top sessions by output tokens · same adaptive log scale as the rows' }));
+      top.forEach(function (s) {
+        var nm = sessName(s);
+        chartWrap.appendChild(el('div', { 'class': 'cost-bar' }, [
+          el('div', { 'class': 'cost-bar-label' + (nm.kind === 'id' ? ' is-untitled' : ''), text: nm.text }),
+          costBar(s.output_tokens || 0)
+        ]));
+      });
+    }
+    function renderTotals(visible) {
+      totalsRow.textContent = '';
+      if (!visible.length) { return; }
+      var ctx = 0, out = 0;
+      visible.forEach(function (s) { ctx += (s.context_tokens || 0); out += (s.output_tokens || 0); });
+      totalsRow.appendChild(el('span', { 'class': 'cost-totals-k', text: 'TOTALS' }));
+      totalsRow.appendChild(el('span', { 'class': 'cost-totals-v' }, [el('b', { text: compactN(ctx) }), ' context']));
+      totalsRow.appendChild(el('span', { 'class': 'cost-totals-v' }, [el('b', { text: compactN(out) }), ' output']));
+      totalsRow.appendChild(el('span', { 'class': 'cost-totals-v' }, [el('b', { text: String(visible.length) }), ' session' + (visible.length === 1 ? '' : 's')]));
+    }
+    function paintCount(shown) {
+      countLine.textContent = '';
+      var kids = [el('b', { text: String(shown) }), ' shown'];
+      if (state.q || state.passport || state.plan || state.minBurn || state.from || state.to) { kids.push(' (filtered)'); }
+      kids.push(' · '); kids.push(el('b', { text: String(state.all.length) })); kids.push(' session report' + (state.all.length === 1 ? '' : 's') + ' posted');
+      // M21 — how many rows could be NAMED, stated plainly (the title convention
+      // is new; most historical sessions will not carry one, and pretending
+      // otherwise would be the dishonest option).
+      var named = 0;
+      state.all.forEach(function (s) { if (sessName(s).kind === 'title') { named++; } });
+      kids.push(' · '); kids.push(el('b', { text: String(named) })); kids.push(' agent-titled');
+      kids.forEach(function (k) { countLine.appendChild(typeof k === 'string' ? doc().createTextNode(k) : k); });
+    }
+    function emptyState() {
+      listWrap.textContent = '';
+      chartWrap.textContent = ''; totalsRow.textContent = '';
+      var box = el('div', { 'class': 'facts-empty ctl-desc' }, [
+        el('p', { text: 'No session cost reports posted for this tenant.' }),
+        el('p', { text: 'The token-burn lens is POST-fed: it renders reports produced by  corecruxctl session cost --post  (which parses your local Claude Code transcript). Nothing is computed until a report is posted.' }),
+        el('p', { text: 'Feature gate: CORECRUXD_FEATURE_COST_LENS must be enabled on the daemon.' })
+      ]);
+      listWrap.appendChild(box);
+      paintCount(0);
+    }
+    function paint() {
+      state.q = (searchInput.value || '').trim().toLowerCase();
+      state.passport = passportSel.value || '';
+      state.plan = planSel.value || '';
+      state.minBurn = Math.max(0, parseInt(minBurnInput.value, 10) || 0);
+      state.from = fromInput.value || ''; state.to = toInput.value || '';
+      state.sort = sortSel.value || 'burn';
+      if (!state.all.length) { emptyState(); return; }
+      var visible = sortVisible(state.all.filter(matches), state.sort);
+      // M25 — ONE adaptive scale per painted view, computed BEFORE anything draws
+      // a bar, so the chart above and every row below read against the same axis.
+      computeCostScale(visible);
+      renderChart(visible); renderTotals(visible);
+      listWrap.textContent = '';
+      if (!visible.length) { listWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'No sessions match the filters.' })); paintCount(0); return; }
+      // The bar axis, declared once above the rows — every bar below (and every
+      // bar in the chart above) reads against this same adaptive log scale.
+      listWrap.appendChild(costScaleStrip());
+      listWrap.appendChild(adviceHelp());
+      visible.forEach(function (s) { listWrap.appendChild(rowEl(s)); });
+      paintCount(visible.length);
+    }
+    function loadPlans() {
+      return fetchJSON('/v1/work?source=all').then(function (res) {
+        var map = {};
+        if (res.ok && res.data) {
+          var items = res.data.work || res.data.items || res.data.work_items || [];
+          items.forEach(function (w) { if (w && typeof w.id === 'string' && w.id.indexOf('execplan:') === 0) { map[w.id] = { state: w.state || null, current_milestone: w.current_milestone || null, title: w.title || null }; } });
+        }
+        state.plans = map;
+      });
+    }
+    // Join the SESSION STORE for agent-given names. Cost reports and saved
+    // sessions are separate feeds keyed by the same logical session id, so this
+    // is a plain id join — no inference. A failed/absent feed simply leaves every
+    // row on the id fallback (the UI says so); it never blocks the cost lens.
+    function loadSessionMeta() {
+      return fetchJSON('/v1/console/sessions?include_archived=true').then(function (res) {
+        var map = {}, n = 0;
+        if (res.ok && res.data) {
+          arr(res.data.session_rows).forEach(function (r) {
+            if (!r || typeof r.session_id !== 'string') { return; }
+            map[r.session_id] = { state_title: r.state_title || null, state_summary: r.state_summary || null,
+              actor: r.actor || null, state_first_line: r.state_first_line || null };
+            n++;
+          });
+        }
+        state.meta = map; state.metaCount = n;
+      }).catch(function () { state.meta = {}; state.metaCount = 0; });
+    }
+    function load() {
+      if (state.loading) { return; }
+      state.loading = true; state.token++; var myToken = state.token;
+      listWrap.textContent = ''; listWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'loading…' }));
+      Promise.all([fetchJSON('/v1/cost/report?tenant_id=default&token_budget=4000'), loadPlans(), loadSessionMeta()]).then(function (rr) {
+        var res = rr[0];
+        if (myToken !== state.token) { return; }
+        state.loading = false;
+        if (!res.ok || !res.data) {
+          banner.style.display = ''; banner.className = 'facts-banner err';
+          banner.textContent = (res.status === 404)
+            ? 'Cost lens off — set CORECRUXD_FEATURE_COST_LENS=1 on the daemon (GET /v1/cost/report → 404).'
+            : 'Cost report unavailable — ' + (res.status === 0 ? 'daemon unreachable' : 'HTTP ' + res.status) + '.';
+          listWrap.textContent = ''; chartWrap.textContent = ''; totalsRow.textContent = ''; return;
+        }
+        banner.style.display = 'none';
+        state.all = arr(res.data.sessions);
+        fillSelects();
+        paint();
+      });
+    }
+    [searchInput, minBurnInput].forEach(function (n) { n.addEventListener('input', paint); });
+    [passportSel, planSel, fromInput, toInput, sortSel].forEach(function (n) { n.addEventListener('change', paint); });
+    load();
+  }
+
+  // console-surfaces-remediation M4: the activity log is DEFAULT-ON. On open it
+  // pulls the all-sessions lane (GET /v1/activity with `session` OMITTED —
+  // recent_all across every session for the tenant, cursor-paged by `before` =
+  // last row's `cursor`) so the operator sees the live rolling record without
+  // typing a session id. Entering a session id switches to that single session
+  // (server `recent`, newest `limit`, no older paging); clearing it returns to
+  // all-sessions. Search + kind chips are CLIENT-SIDE over the LOADED rows
+  // (labelled so — the daemon has no activity full-text search). Live tail: the
+  // `activity.appended` SSE carries ids-only, so the honest-cheap merge refetches
+  // page 1 for the current mode and prepends genuinely-new rows. Through-client
+  // only (activityBackfill → CruxApi.activity), el()/textContent, no innerHTML.
+  var ACT_DOM_CAP = 1500;               // hard ceiling on rendered rows (never all-in)
+  // Page-size budget for the default-on first pull: sized so the all-sessions
+  // lane opens ALREADY populated (a rolling-log surface, not an empty prompt) —
+  // ~80 rows on production-shaped data (200-char previews); `limit` caps at 100
+  // and the budget binds first. Older pages reuse the same budget via `before`.
+  var ACT_DEFAULT_BUDGET = 8000;
+  var ACT_PAGE_LIMIT = 100;
+  function renderActivityLog(host) {
+    host.textContent = '';
+    if (__actLogES) { try { __actLogES.close(); } catch (e) { /* noop */ } __actLogES = null; }
+
+    function nfmt(n) { if (typeof n !== 'number' || !isFinite(n)) { return (n == null) ? '—' : String(n); } try { return n.toLocaleString('en-US'); } catch (e) { return String(n); } }
+    function shortId(id) { var s = String(id || ''); return s.length > 8 ? s.slice(0, 8) : (s || '—'); }
+    function relTime(iso) {
+      var t = Date.parse(iso || ''); if (!isFinite(t)) { return String(iso || '—'); }
+      var s = Math.max(0, Math.round((Date.now() - t) / 1000));
+      if (s < 60) { return s + 's ago'; }
+      var m = Math.round(s / 60); if (m < 60) { return m + 'm ago'; }
+      var h = Math.round(m / 60); if (h < 48) { return h + 'h ago'; }
+      return Math.round(h / 24) + 'd ago';
+    }
+
+    var state = {
+      tenant: 'default', session: '', budget: ACT_DEFAULT_BUDGET, limit: ACT_PAGE_LIMIT,
+      rows: [], seen: {}, kindsPresent: {}, kindsOff: {},
+      nextCursor: null, hasMore: false, truncated: false,
+      loading: false, token: 0, deb: null, liveDeb: null
+    };
+    function rowKey(r) { return (r.session_id || '') + ':' + r.seq; }
+    // Newest-first invariant. Rows carry a monotonic per-row `cursor` (µs since
+    // epoch) — the authoritative recency key; ts+seq is the honest fallback when
+    // an older daemon omits it. state.rows is kept sorted DESC by this key after
+    // every load/merge so the FIRST rendered row is ALWAYS the newest, regardless
+    // of which path (initial page, Load-older append, or SSE merge) added it or
+    // what order the server returned them in. (Previously order was implicit —
+    // trusting the server's DESC feed + the correct insertion side — with no
+    // enforced invariant, so any out-of-order page or merge inverted the DOM.)
+    function actSortKey(r) {
+      var c = Number(r && r.cursor);
+      if (isFinite(c)) { return c; }
+      var t = Date.parse((r && r.ts) || '');
+      return (isFinite(t) ? t * 1000 : 0) + (parseInt(r && r.seq, 10) || 0);
+    }
+    function sortRowsNewestFirst() { state.rows.sort(function (a, b) { return actSortKey(b) - actSortKey(a); }); }
+    function anyKindOff() { return Object.keys(state.kindsOff).some(function (k) { return state.kindsOff[k]; }); }
+    function isFiltered() { return !!((searchInput.value || '').trim()) || anyKindOff(); }
+
+    // ---- controls ----
+    var sessionInput = el('input', { 'class': 'act-input', type: 'text', placeholder: 'session id — blank = all sessions', 'aria-label': 'session id filter' });
+    var budgetInput = el('input', { 'class': 'act-input act-budget', type: 'number', min: '1', value: String(ACT_DEFAULT_BUDGET), 'aria-label': 'token budget per page' });
+    var searchInput = el('input', { 'class': 'act-input', type: 'search', placeholder: 'filter loaded rows (client-side)…', 'aria-label': 'search loaded activity' });
+    function field(label, node) { return el('label', { 'class': 'act-field' }, [el('span', { text: label }), node]); }
+    var kindsWrap = el('div', { 'class': 'act-kinds' });
+    var reloadBtn = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Reload']);
+    var liveBtn = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Go live']);
+    var controls = el('div', { 'class': 'act-controls' }, [field('session', sessionInput), field('token budget', budgetInput), field('search (client-side)', searchInput), kindsWrap, reloadBtn, liveBtn]);
+    var liveDot = el('span', { 'class': 'act-livedot' });
+    var statusText = el('span', { 'class': 'act-statustext', text: 'loading the all-sessions activity lane…' });
+    var countLine = el('p', { 'class': 'facts-count' });
+    var banner = el('div', { 'class': 'facts-banner' }); banner.style.display = 'none';
+    var list = el('div', { 'class': 'act-list' }, [el('p', { 'class': 'ctl-desc', text: 'loading…' })]);
+    var moreWrap = el('div', { 'class': 'facts-more' });
+    var sentinel = el('div', { 'class': 'facts-sentinel' });
+    host.appendChild(el('div', { 'class': 'act-log' }, [controls, el('div', { 'class': 'act-status' }, [liveDot, statusText]), countLine, banner, list, moreWrap, sentinel]));
+
+    function setStatus(t) { statusText.textContent = t; }
+    function modeLabel() { return state.session ? ('session ' + shortId(state.session)) : 'all sessions'; }
+
+    // Kind chips are derived from the LOADED rows (kind → count) and filter
+    // client-side (toggle off to hide). Stable ACT_KINDS order first, then any
+    // unknown kinds. A chip carries its loaded count; toggling never re-queries.
+    function updateKindsPresent() {
+      var c = {};
+      state.rows.forEach(function (r) { var k = r.kind || 'idle'; c[k] = (c[k] || 0) + 1; });
+      state.kindsPresent = c;
+    }
+    function renderKinds() {
+      kindsWrap.textContent = '';
+      var order = ACT_KINDS.filter(function (k) { return state.kindsPresent[k]; });
+      Object.keys(state.kindsPresent).forEach(function (k) { if (order.indexOf(k) < 0) { order.push(k); } });
+      if (!order.length) { return; }
+      order.forEach(function (k) {
+        var on = !state.kindsOff[k];
+        var chip = el('button', { 'class': 'act-kchip k-' + k + (on ? ' on' : ''), type: 'button', 'aria-pressed': on ? 'true' : 'false', title: 'client-side filter — toggle ' + k + ' rows' },
+          [el('span', { text: k }), el('span', { 'class': 'act-kc', text: String(state.kindsPresent[k]) })]);
+        chip.addEventListener('click', function () { state.kindsOff[k] = on; renderKinds(); paint(); });
+        kindsWrap.appendChild(chip);
+      });
+    }
+
+    function matches(r, q) {
+      if (!q) { return true; }
+      return ((r.session_id || '') + ' ' + (r.kind || '') + ' ' + (r.preview || '') + ' ' + (r.tool || '') + ' ' + (r.intent || '') + ' ' + (r.turn_id || '')).toLowerCase().indexOf(q) >= 0;
+    }
+    function visibleRows() {
+      var q = (searchInput.value || '').trim().toLowerCase();
+      return state.rows.filter(function (r) { return !state.kindsOff[r.kind || 'idle'] && matches(r, q); });
+    }
+    function emptyMsg() {
+      return state.session
+        ? ('No activity for session ' + shortId(state.session) + ' yet.')
+        : 'The activity journal is empty. It fills as agents work — every question, answer, reasoning step, tool command, fact write, ExecPlan update, and handoff is appended to the activity journal (GET /v1/activity, gated by CORECRUXD_FEATURE_ACTIVITY_LOG).';
+    }
+
+    function paintCount(shown) {
+      countLine.textContent = '';
+      var loaded = state.rows.length;
+      var kids = [el('b', { text: nfmt(shown) }), ' shown'];
+      if (isFiltered()) { kids.push(' (filtered client-side)'); }
+      kids.push(' of '); kids.push(el('b', { text: nfmt(loaded) })); kids.push(' loaded · ' + modeLabel());
+      if (!state.session && state.hasMore) { kids.push(' · journal holds more — Load older'); }
+      kids.forEach(function (k) { countLine.appendChild(typeof k === 'string' ? doc().createTextNode(k) : k); });
+    }
+    function paintMore() {
+      moreWrap.textContent = '';
+      if (state.session) {
+        // Single-session view: the daemon's per-session read returns the newest
+        // `limit` with no `before` older-paging. Say so honestly when it's full.
+        if (state.hasMore && state.rows.length >= state.limit) {
+          moreWrap.appendChild(el('p', { 'class': 'ctl-desc', text: 'Showing the most recent ' + nfmt(state.rows.length) + ' for this session — the single-session view is not paginated. Raise the token budget, or clear the session for the paged all-sessions timeline.' }));
+        }
+        return;
+      }
+      if (state.rows.length >= ACT_DOM_CAP) { moreWrap.appendChild(el('p', { 'class': 'facts-cap', text: 'Rendered ' + nfmt(ACT_DOM_CAP) + '+ rows — narrow with search or kind chips to keep paging.' })); return; }
+      if (state.hasMore) {
+        var btn = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Load older']);
+        btn.addEventListener('click', loadOlder);
+        moreWrap.appendChild(btn);
+      } else if (state.rows.length) {
+        moreWrap.appendChild(el('p', { 'class': 'ctl-desc', text: 'End of the activity journal.' }));
+      }
+    }
+    function paint() {
+      var vis = visibleRows();
       list.textContent = '';
-      var visible = state.rows.filter(function (r) { return state.kinds[r.kind] && matches(r, q); });
-      if (!visible.length) { list.appendChild(el('p', { 'class': 'ctl-desc', text: state.rows.length ? 'No matching activity.' : 'No activity loaded yet.' })); return; }
-      visible.forEach(function (r) { list.appendChild(rowEl(r)); });
+      if (!vis.length) {
+        list.appendChild(el('p', { 'class': 'ctl-desc', text: state.rows.length ? 'No loaded rows match the current search / kind filter.' : emptyMsg() }));
+      } else {
+        vis.forEach(function (r) { list.appendChild(rowEl(r)); });
+      }
+      paintCount(vis.length);
+      paintMore();
+    }
+
+    function refChip(cls, glyph, id, kind) {
+      return el('span', { 'class': 'act-ref ' + cls, title: kind + ' ' + id, text: glyph + ' ' + String(id).slice(0, 14) });
     }
     function rowEl(r) {
-      var meta = el('div', { 'class': 'act-meta' }, [
-        el('span', { 'class': 'act-kind', text: r.kind || '' }),
-        el('span', { text: 'seq ' + r.seq }),
-        el('span', { text: r.ts || '' }),
-        el('span', { text: r.turn_id ? ('turn ' + r.turn_id) : '—' })
-      ]);
+      var meta = el('div', { 'class': 'act-meta' });
+      meta.appendChild(el('span', { 'class': 'act-kind', text: r.kind || '' }));
+      // Session short-id pill — click prefills the session filter (single-session).
+      var sess = el('button', { 'class': 'act-sess', type: 'button', title: 'filter to session ' + (r.session_id || ''), text: shortId(r.session_id) });
+      sess.addEventListener('click', function (e) { e.stopPropagation(); focusSession(r.session_id); });
+      meta.appendChild(sess);
+      // Relative time; absolute ISO on hover (title).
+      meta.appendChild(el('span', { 'class': 'act-time', title: r.ts || '', text: relTime(r.ts) }));
+      meta.appendChild(el('span', { text: 'seq ' + r.seq }));
       var extra = [r.tool, r.intent, (r.confidence != null ? ('conf ' + r.confidence) : null)].filter(Boolean).join(' · ');
       if (extra) { meta.appendChild(el('span', { text: extra })); }
+      var kids = [meta, el('div', { 'class': 'act-preview', text: r.preview || '' })];
+      // Receipt / fact-ref chips where present.
+      var receipts = r.receipt_ids || [], facts = r.fact_refs || [];
+      if (receipts.length || facts.length) {
+        var refs = el('div', { 'class': 'act-refs' });
+        receipts.slice(0, 3).forEach(function (rid) { refs.appendChild(refChip('rc', '✎', rid, 'receipt')); });
+        if (receipts.length > 3) { refs.appendChild(el('span', { 'class': 'act-ref', text: '+' + (receipts.length - 3) + ' receipts' })); }
+        facts.slice(0, 2).forEach(function (fid) { refs.appendChild(refChip('fr', '◆', fid, 'fact')); });
+        if (facts.length > 2) { refs.appendChild(el('span', { 'class': 'act-ref', text: '+' + (facts.length - 2) + ' facts' })); }
+        kids.push(refs);
+      }
       var expand = el('div', { 'class': 'act-expand' }, [el('div', { 'class': 'act-verbatim', text: 'loading verbatim…' }), el('div', { 'class': 'act-receipts' })]);
-      var row = el('div', { 'class': 'act-row k-' + (r.kind || 'idle'), role: 'button', tabindex: '0' }, [meta, el('div', { 'class': 'act-preview', text: r.preview || '' }), expand]);
+      kids.push(expand);
+      var row = el('div', { 'class': 'act-row k-' + (r.kind || 'idle'), role: 'button', tabindex: '0' }, kids);
       var opened = false;
       function toggle() { var o = row.classList.toggle('open'); if (o && !opened) { opened = true; expandRow(row, r); } }
       row.addEventListener('click', toggle);
@@ -5655,8 +11942,10 @@
     }
     function expandRow(row, r) {
       var vb = row.querySelector('.act-verbatim'), rc = row.querySelector('.act-receipts');
-      if (!r.turn_id) { vb.textContent = r.preview || '(no turn id — preview only)'; return; }
-      var query = { tenant_id: state.tenant, session: state.session };
+      // Deref uses the ROW's own session (all-sessions rows each carry one).
+      var sess = r.session_id || state.session;
+      if (!r.turn_id || !sess) { vb.textContent = r.preview || '(no turn id — preview only)'; return; }
+      var query = { tenant_id: state.tenant, session: sess };
       activityTurnCall('activityTurnByTurnId', r.turn_id, query).then(function (res) {
         if (!res.ok || !res.data) { vb.textContent = 'deref failed (HTTP ' + (res.status || '?') + ')'; return; }
         var entries = res.data.entries || [];
@@ -5677,32 +11966,677 @@
         });
       });
     }
+
+    // ---- loaders ----
+    function buildQuery(before) {
+      var q = { tenant_id: state.tenant, token_budget: state.budget, limit: state.limit };
+      if (state.session) { q.session = state.session; }           // omit ⇒ all-sessions lane
+      if (before != null) { q.before = before; }                  // older-page cursor (all-sessions only)
+      return q;
+    }
+    function ingest(rows) {
+      var fresh = [];
+      (rows || []).forEach(function (r) { var k = rowKey(r); if (state.seen[k]) { return; } state.seen[k] = true; state.rows.push(r); fresh.push(r); });
+      sortRowsNewestFirst();   // enforce newest-first regardless of page/server order
+      return fresh;
+    }
+    function loadFresh() {
+      state.session = (sessionInput.value || '').trim();
+      state.budget = parseInt(budgetInput.value, 10) || ACT_DEFAULT_BUDGET;
+      state.token++;
+      state.rows = []; state.seen = {}; state.kindsPresent = {}; state.kindsOff = {};
+      state.nextCursor = null; state.hasMore = false; state.truncated = false; state.loading = false;
+      banner.style.display = 'none'; moreWrap.textContent = ''; kindsWrap.textContent = '';
+      list.textContent = ''; list.appendChild(el('p', { 'class': 'ctl-desc', text: 'loading…' }));
+      setStatus('loading the ' + modeLabel() + ' lane…');
+      loadPage(null, true);
+    }
+    function loadPage(before, isFirst) {
+      if (state.loading) { return; }
+      state.loading = true;
+      var myToken = state.token;
+      activityBackfill(buildQuery(before)).then(function (res) {
+        if (myToken !== state.token) { return; }
+        state.loading = false;
+        if (res.status === 404) { handle404(); return; }
+        if (!res.ok || !res.data) {
+          if (isFirst) { banner.style.display = ''; banner.className = 'facts-banner err'; banner.textContent = 'Activity load failed — ' + (res.status === 0 ? 'daemon unreachable' : 'HTTP ' + res.status) + '.'; list.textContent = ''; countLine.textContent = ''; }
+          setStatus('load failed (HTTP ' + (res.status || '?') + ')');
+          return;
+        }
+        var d = res.data;
+        state.hasMore = !!d.has_more;
+        state.nextCursor = (d.next_cursor != null) ? d.next_cursor : null;
+        state.truncated = !!d.truncated;
+        ingest(d.rows);
+        updateKindsPresent(); renderKinds();
+        setStatus(nfmt(state.rows.length) + ' row(s) loaded' + (state.truncated ? ' · page budget-truncated (raise token budget)' : '') + ' · ' + modeLabel());
+        paint();
+      });
+    }
+    function loadOlder() {
+      if (state.loading || state.session || !state.hasMore) { return; }   // older-paging is all-sessions only
+      if (state.rows.length >= ACT_DOM_CAP) { paintMore(); return; }
+      if (state.nextCursor == null) { return; }
+      loadPage(state.nextCursor, false);
+    }
+
+    // Honest flag-off state — keep the CORECRUXD_FEATURE_ACTIVITY_LOG copy. Under
+    // ?demo=1 a labelled fixture stands in (a real, enabled daemon never 404s).
+    function handle404() {
+      var demoAct = demoOn() ? demoData('activityLog') : null;
+      if (demoAct && demoAct.length) {
+        state.rows = demoAct.map(function (r) { var c = {}; for (var k in r) { c[k] = r[k]; } if (!c.session_id) { c.session_id = 'sess_demo01'; } return c; });
+        state.seen = {}; state.rows.forEach(function (r) { state.seen[rowKey(r)] = true; });
+        sortRowsNewestFirst();
+        state.hasMore = false; state.nextCursor = null;
+        updateKindsPresent(); renderKinds();
+        banner.style.display = ''; banner.className = 'facts-banner';
+        banner.textContent = 'Activity log route is off (CORECRUXD_FEATURE_ACTIVITY_LOG) — showing a labelled demo fixture. Enable the flag for live data.';
+        setStatus(nfmt(state.rows.length) + ' row(s) · demo');
+        paint();
+        return;
+      }
+      state.rows = []; state.hasMore = false; state.nextCursor = null;
+      banner.style.display = ''; banner.className = 'facts-banner warn';
+      banner.textContent = 'Activity log disabled on this daemon — set CORECRUXD_FEATURE_ACTIVITY_LOG=1 to enable GET /v1/activity and the live stream.';
+      setStatus('route unavailable (404)');
+      list.textContent = ''; list.appendChild(el('p', { 'class': 'ctl-desc', text: 'The activity journal route is off on this daemon.' }));
+      countLine.textContent = ''; moreWrap.textContent = '';
+    }
+
+    // ---- live tail: the SSE event is ids-only, so refetch page 1 for the
+    //      current mode (budgeted) and prepend genuinely-new rows (dedup on
+    //      session:seq). Cheap + honest — no fabricated rows from the event. ----
+    function focusSession(id) { sessionInput.value = id || ''; loadFresh(); }
+    function scheduleLiveMerge() { clearTimeout(state.liveDeb); state.liveDeb = setTimeout(mergeNewest, 500); }
+    function mergeNewest() {
+      var myToken = state.token;
+      activityBackfill(buildQuery(null)).then(function (res) {
+        if (myToken !== state.token) { return; }
+        if (!res.ok || !res.data) { return; }
+        var incoming = res.data.rows || [], added = 0;
+        for (var i = 0; i < incoming.length; i++) {                   // dedup-append; sort restores newest-first
+          var r = incoming[i], k = rowKey(r);
+          if (state.seen[k]) { continue; }
+          state.seen[k] = true; state.rows.push(r); added++;
+        }
+        if (added) {
+          sortRowsNewestFirst();                                      // genuinely-new rows float to the top by cursor
+          updateKindsPresent(); renderKinds(); paint();
+          setStatus('+' + added + ' new · ' + nfmt(state.rows.length) + ' loaded · live · ' + modeLabel());
+        }
+      });
+    }
     function toggleLive() {
       if (__actLogES) { try { __actLogES.close(); } catch (e) { /* noop */ } __actLogES = null; liveDot.classList.remove('on'); liveBtn.textContent = 'Go live'; return; }
       if (typeof EventSource === 'undefined') { setStatus('Live streaming unsupported in this browser.'); return; }
       try { __actLogES = new EventSource('/v1/events/stream?types=activity.appended'); }
       catch (e) { setStatus('Live stream unavailable.'); return; }
-      __actLogES.addEventListener('activity.appended', function () { clearTimeout(state.deb); state.deb = setTimeout(load, 400); });
+      __actLogES.addEventListener('activity.appended', function () { scheduleLiveMerge(); });
       __actLogES.onerror = function () { liveBtn.textContent = 'Live (reconnecting)'; };
       liveDot.classList.add('on'); liveBtn.textContent = 'Stop live';
     }
-    loadBtn.addEventListener('click', load);
+
+    // ---- wiring ----
+    reloadBtn.addEventListener('click', loadFresh);
     liveBtn.addEventListener('click', toggleLive);
-    searchInput.addEventListener('input', paint);
-    sessionInput.addEventListener('keydown', function (e) { if (e.key === 'Enter') { load(); } });
-    renderKinds();
-    // Demo mode: a fresh daemon gates the activity log (CORECRUXD_FEATURE_ACTIVITY_LOG),
-    // so the surface is blank until Loaded. Under ?demo=1 paint a labelled fixture
-    // of a session's rolling turns (via the demoData() choke point) — a real
-    // session id + Load still overrides it.
-    var demoAct = demoData('activityLog');
-    if (demoAct && demoAct.length) {
-      state.session = 'sess_7f3a1c2b';
-      sessionInput.value = state.session;
-      state.rows = demoAct;
-      setStatus(state.rows.length + ' row(s) · session ' + state.session + ' · demo');
-      paint();
+    searchInput.addEventListener('input', function () { clearTimeout(state.deb); state.deb = setTimeout(paint, 200); });
+    sessionInput.addEventListener('keydown', function (e) { if (e.key === 'Enter') { loadFresh(); } });
+    budgetInput.addEventListener('keydown', function (e) { if (e.key === 'Enter') { loadFresh(); } });
+    if (typeof IntersectionObserver !== 'undefined') {
+      var io = new IntersectionObserver(function (entries) { if (entries[0] && entries[0].isIntersecting) { loadOlder(); } }, { rootMargin: '500px' });
+      io.observe(sentinel);
     }
+    // DEFAULT-ON: pull the all-sessions lane immediately (no session id required).
+    loadFresh();
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  M6 trust cluster — shared helpers for the four custom-rendered pages below.
+  // ─────────────────────────────────────────────────────────────────────────
+  function m6ShortTime(iso) { var s = String(iso || ''); return s.length >= 19 ? s.slice(0, 19).replace('T', ' ') : (s || '—'); }
+  function m6Short(v, n) { var s = String(v == null ? '' : v); return s.length > n ? s.slice(0, n) + '…' : s; }
+  function m6PrettyJson(v) { try { return JSON.stringify(v, null, 2); } catch (e) { return String(v); } }
+  function m6Kv(pairs) {
+    var meta = el('div', { 'class': 'facts-kv' });
+    pairs.forEach(function (kv) {
+      if (kv[1] == null || kv[1] === '') { return; }
+      meta.appendChild(el('span', { 'class': 'facts-kv-k', text: kv[0] }));
+      meta.appendChild(el('span', { 'class': 'facts-kv-v', text: String(kv[1]) }));
+    });
+    return meta;
+  }
+  function m6Label(t) { return el('div', { 'class': 'facts-vlabel', text: t }); }
+  function m6Empty(t) { return el('p', { 'class': 'ctl-desc sess-empty', text: t }); }
+  function m6Chip(cls, text, title) { return el('span', { 'class': cls, title: title || '' }, [String(text)]); }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  cx-receipts (M6): live CROWN receipt listing over GET /v1/receipts/list
+  //  (the new CE-local route). Newest-first rows (ts · kind chip · principal ·
+  //  session pill · signer short + alg · body-hash short), Load-older cursor
+  //  pagination, client-side search + kind chips. Row click → detail drawer:
+  //  envelope fields, and for the fetchable ad_ga_* class the drawer pulls
+  //  /v1/receipts/{id} + /signature + /verification THROUGH THE CLIENT and renders
+  //  the daemon verification verdict VERBATIM (never a client-side "valid" claim).
+  //  Envelope-only rows say why the body is unavailable on a CPU-only daemon.
+  //  Through-client only (fetchJSON + CruxApi named methods), el()/textContent.
+  // ─────────────────────────────────────────────────────────────────────────
+  function renderReceiptsBrowser(host) {
+    host.textContent = '';
+    var TENANT = 'default';
+    function kindTone(kind) {
+      var k = String(kind || '');
+      if (k.indexOf('approval') >= 0 || k.indexOf('gate') >= 0) { return 'trust'; }
+      if (k.indexOf('mediation') >= 0 || k.indexOf('witness') >= 0) { return 'acc'; }
+      if (k.indexOf('error') >= 0 || k.indexOf('deny') >= 0 || k.indexOf('reject') >= 0) { return 'crit'; }
+      if (k.indexOf('model') >= 0 || k.indexOf('response') >= 0 || k.indexOf('stop') >= 0) { return 'ok'; }
+      return 'ink3';
+    }
+    function qs(obj) { var p = []; Object.keys(obj).forEach(function (k) { if (obj[k] != null && obj[k] !== '') { p.push(encodeURIComponent(k) + '=' + encodeURIComponent(obj[k])); } }); return p.join('&'); }
+
+    var state = { rows: [], seen: {}, q: '', kind: '', nextCursor: null, hasMore: false, matched: null, kindCounts: {}, loading: false, token: 0, deb: null };
+
+    var searchInput = el('input', { 'class': 'facts-input', type: 'search', placeholder: 'search id / principal / kind / signer…', 'aria-label': 'search receipts' });
+    function field(label, node) { return el('label', { 'class': 'facts-field' }, [el('span', { text: label }), node]); }
+    var toolbar = el('div', { 'class': 'facts-toolbar' }, [field('search', searchInput)]);
+    var countLine = el('p', { 'class': 'facts-count' });
+    var chipsWrap = el('div', { 'class': 'facts-chips' });
+    var banner = el('div', { 'class': 'facts-banner' }); banner.style.display = 'none';
+    var listWrap = el('div', { 'class': 'facts-groups' });
+    var moreWrap = el('div', { 'class': 'facts-more' });
+    var help = el('div', { 'class': 'facts-banner m6-help' }, [
+      el('div', { 'class': 'm6-help-h', text: 'Verify a receipt offline' }),
+      el('p', { 'class': 'ctl-desc', text: 'The signed envelope (signer · alg · body hash · chain seq) is listed here for every observation. A CPU-only Crux daemon holds no dataplane, so the full CROWN body / signature / verification is dereferenceable only for the local ad_ga_* gate-approval receipts (open one to pull the daemon verdict verbatim). Dataplane receipts live in the hosted tier.' }),
+      el('p', { 'class': 'ctl-desc', text: 'Offline: corecruxctl inspect-receipt <id> (or corecruxctl evidence <id> --keyring <path>) checks the Ed25519 signature without the daemon. Bundle export: GET /v1/replay/exports/receipts/{id}.' })
+    ]);
+    host.appendChild(el('div', { 'class': 'facts-browser' }, [toolbar, countLine, chipsWrap, banner, listWrap, moreWrap, help]));
+
+    function matches(r, q) {
+      if (!q) { return true; }
+      var rc = r.receipt || {};
+      return ((r.observation_id || '') + ' ' + (r.principal || '') + ' ' + (r.kind || '') + ' ' + (r.session_id || '') + ' ' + (rc.signed_by || '') + ' ' + (r.receipt_id || '')).toLowerCase().indexOf(q) >= 0;
+    }
+    function visibleRows() {
+      var q = state.q;
+      return state.rows.filter(function (r) { return (!state.kind || r.kind === state.kind) && matches(r, q); });
+    }
+    function paintCount() {
+      countLine.textContent = '';
+      var vis = visibleRows().length;
+      var kids = [el('b', { text: String(vis) }), ' shown'];
+      if (state.q || state.kind) { kids.push(' (filtered)'); }
+      kids.push(' · '); kids.push(el('b', { text: String(state.rows.length) })); kids.push(' loaded');
+      if (state.matched != null) { kids.push(' · '); kids.push(el('b', { text: String(state.matched) })); kids.push(' on this daemon'); }
+      kids.forEach(function (k) { countLine.appendChild(typeof k === 'string' ? doc().createTextNode(k) : k); });
+    }
+    function paintChips() {
+      chipsWrap.textContent = '';
+      var counts = state.kindCounts || {};
+      var keys = Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a]; }).slice(0, 12);
+      if (!keys.length) { return; }
+      var allChip = el('button', { 'class': 'facts-chip' + (state.kind ? '' : ' on'), type: 'button', title: 'all kinds' }, ['all']);
+      allChip.addEventListener('click', function () { state.kind = ''; paint(); });
+      chipsWrap.appendChild(allChip);
+      keys.forEach(function (k) {
+        var active = state.kind === k;
+        var chip = el('button', { 'class': 'facts-chip' + (active ? ' on' : ''), type: 'button', title: 'filter to kind ' + k }, [el('span', { text: k }), el('span', { 'class': 'c', text: String(counts[k]) })]);
+        chip.addEventListener('click', function () { state.kind = active ? '' : k; paint(); });
+        chipsWrap.appendChild(chip);
+      });
+    }
+    function rowEl(r) {
+      var rc = r.receipt || {};
+      var head = el('div', { 'class': 'facts-rhead' }, [
+        m6Chip('rcpt-kind tone-' + kindTone(r.kind), r.kind || 'observation', 'observation kind'),
+        el('span', { 'class': 'facts-entity', text: r.principal || '(no principal)' }),
+        r.session_short ? m6Chip('sess-chip', r.session_short, 'session ' + (r.session_id || '')) : null,
+        el('span', { 'class': 'facts-time', text: m6ShortTime(r.ts) })
+      ]);
+      var metaChips = el('div', { 'class': 'sess-rmeta' }, [
+        m6Chip('sess-chip', (rc.alg || '?') + ' · ' + (rc.signed_by_short || '—'), 'signer ' + (rc.signed_by || '')),
+        m6Chip('sess-chip', 'hash ' + (rc.body_hash_short || '—'), rc.body_hash || ''),
+        (r.seq != null) ? m6Chip('sess-chip', 'seq ' + r.seq, 'per-session chain sequence') : null,
+        r.fetchable ? m6Chip('sess-chip rcpt-fetchable', 'CROWN body ✓', 'full body/signature/verification fetchable (ad_ga_*)') : m6Chip('sess-chip rcpt-envonly', 'envelope only', 'body lives in the hosted-tier dataplane')
+      ]);
+      var detail = el('div', { 'class': 'facts-detail' });
+      var row = el('div', { 'class': 'facts-row tone-' + kindTone(r.kind), role: 'button', tabindex: '0' }, [head, metaChips, detail]);
+      var opened = false;
+      function toggle() { if (row.classList.contains('open')) { row.classList.remove('open'); return; } row.classList.add('open'); if (!opened) { opened = true; expandDetail(detail, r); } }
+      row.addEventListener('click', function (e) { if (e.target && e.target.closest && e.target.closest('.facts-detail')) { return; } toggle(); });
+      row.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+      return row;
+    }
+    function expandDetail(detail, r) {
+      var rc = r.receipt || {};
+      detail.textContent = '';
+      detail.appendChild(m6Label('receipt envelope'));
+      detail.appendChild(m6Kv([
+        ['observation_id', r.observation_id], ['session_id', r.session_id], ['ts', r.ts],
+        ['principal', r.principal], ['kind', r.kind], ['chain seq', r.seq],
+        ['alg', rc.alg], ['signed_by', rc.signed_by], ['body_hash', rc.body_hash]
+      ]));
+      if (!r.fetchable) {
+        detail.appendChild(m6Empty('Envelope only. This CPU-only daemon holds no dataplane pool, so the full CROWN body, signature, and verification are not dereferenceable here — dataplane receipts live in the hosted tier. The signed envelope above is the daemon record for this observation.'));
+        return;
+      }
+      detail.appendChild(m6Label('CROWN body / signature / verification'));
+      var slot = el('div', { 'class': 'facts-loading', text: 'fetching receipt ' + m6Short(r.receipt_id, 20) + '…' });
+      detail.appendChild(slot);
+      var id = r.receipt_id;
+      Promise.all([
+        fetchVia(function () { return window.CruxApi.receiptsByReceiptId(id, { tenant_id: TENANT }); }),
+        fetchVia(function () { return window.CruxApi.receiptsByReceiptIdSignature(id, { tenant_id: TENANT }); }),
+        fetchVia(function () { return window.CruxApi.receiptsByReceiptIdVerification(id, { tenant_id: TENANT }); })
+      ]).then(function (rr) {
+        var body = rr[0], sig = rr[1], ver = rr[2];
+        slot.textContent = '';
+        var wrap = el('div', {});
+        wrap.appendChild(m6Kv([
+          ['receipt_id', id],
+          ['body', body.ok ? ('seq ' + (body.data && body.data.seq) + ' · ' + (body.data && body.data.contentType || 'body')) : ('unavailable (HTTP ' + (body.status || '?') + ')')],
+          ['signature', sig.ok ? ('seq ' + (sig.data && sig.data.seq) + ' · ' + (sig.data && sig.data.contentType || 'sig')) : ('unavailable (HTTP ' + (sig.status || '?') + ')')]
+        ]));
+        // Verification verdict — rendered VERBATIM from the daemon report; the
+        // console NEVER computes or claims "valid" itself.
+        wrap.appendChild(m6Label('verification verdict (daemon, verbatim)'));
+        if (!ver.ok || !ver.data) {
+          wrap.appendChild(m6Empty('Verification unavailable (HTTP ' + (ver.status || '?') + ') — GET /v1/receipts/' + id + '/verification.'));
+        } else {
+          var v = ver.data;
+          var verdictClass = (v.signature_valid === true && v.error_code === 'OK') ? 'rcpt-verdict ok' : 'rcpt-verdict bad';
+          wrap.appendChild(el('div', { 'class': verdictClass }, [
+            el('span', { 'class': 'rcpt-verdict-k', text: 'signature_valid' }), el('b', { text: String(v.signature_valid) }),
+            el('span', { 'class': 'rcpt-verdict-k', text: 'error_code' }), el('b', { text: String(v.error_code) })
+          ]));
+          wrap.appendChild(el('pre', { 'class': 'facts-vfull', text: m6PrettyJson(v) }));
+        }
+        detail.appendChild(wrap);
+      });
+    }
+    function paint() {
+      var q = (searchInput.value || '').trim().toLowerCase();
+      state.q = q;
+      listWrap.textContent = '';
+      var vis = visibleRows();
+      if (!state.rows.length) { listWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: state.loading ? 'loading receipts…' : 'No receipts. Receipts are minted on every signed observation (POST /v1/sessions/{id}/observations) and on gate approvals.' })); }
+      else if (!vis.length) { listWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'No receipts match the filter.' })); }
+      else { vis.forEach(function (r) { listWrap.appendChild(rowEl(r)); }); }
+      paintCount(); paintChips();
+    }
+    function paintMore() {
+      moreWrap.textContent = '';
+      if (state.hasMore) {
+        var btn = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Load older']);
+        btn.addEventListener('click', loadNext);
+        moreWrap.appendChild(btn);
+      } else if (state.rows.length) {
+        moreWrap.appendChild(el('p', { 'class': 'ctl-desc', text: 'End of the receipt journal.' }));
+      }
+    }
+    function loadPage(cursor, isFirst) {
+      if (state.loading) { return; }
+      state.loading = true;
+      if (isFirst) { paint(); }
+      var myToken = state.token;
+      var query = { limit: 50 };
+      if (cursor) { query.before = cursor; }
+      fetchJSON('/v1/receipts/list?' + qs(query)).then(function (res) {
+        if (myToken !== state.token) { return; }
+        state.loading = false;
+        if (!res.ok || !res.data) {
+          banner.style.display = ''; banner.className = 'facts-banner err';
+          banner.textContent = 'Receipts listing unavailable — ' + (res.status === 0 ? 'daemon unreachable' : 'HTTP ' + res.status) + ' (needs the console-surfaces-remediation branch: GET /v1/receipts/list).';
+          return;
+        }
+        banner.style.display = 'none';
+        var d = res.data;
+        state.matched = d.matched; state.nextCursor = d.next_cursor || null; state.hasMore = !!d.has_more;
+        if (isFirst && d.kind_counts) { state.kindCounts = d.kind_counts; }
+        (d.rows || []).forEach(function (r) { var k = r.observation_id; if (k && state.seen[k]) { return; } if (k) { state.seen[k] = true; } state.rows.push(r); });
+        paint(); paintMore();
+      });
+    }
+    function loadNext() { if (!state.loading && state.hasMore) { loadPage(state.nextCursor, false); } }
+    searchInput.addEventListener('input', function () { clearTimeout(state.deb); state.deb = setTimeout(paint, 200); });
+    loadPage(null, true);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  cx-gates (M6): the canonical Art.14 approval queue. Live pending list over
+  //  GET /v1/work/gate/pending (unchanged endpoint); when empty, a RICH,
+  //  code-grounded empty state — what a gate is (PendingGateAction), the
+  //  BlockerKind taxonomy (needs_info | needs_approval), how one is created, and
+  //  a client-side join over /v1/work linking blocked items owed an approval.
+  //  Approvals stay operator-gated (approveGate/rejectGate → operatorGatedCall).
+  // ─────────────────────────────────────────────────────────────────────────
+  function renderGatesBoard(host) {
+    host.textContent = '';
+    function ageOf(unixMs) {
+      var at = Number(unixMs); if (!isFinite(at) || at <= 0) { return 'age unknown'; }
+      var m = Math.floor(Math.max(0, Date.now() - at) / 60000);
+      if (m < 1) { return 'just now'; } if (m < 60) { return m + 'm ago'; }
+      var h = Math.floor(m / 60); if (h < 24) { return h + 'h ago'; } return Math.floor(h / 24) + 'd ago';
+    }
+    var state = { pending: [], work: [], loading: false, token: 0 };
+    var head = el('p', { 'class': 'facts-count' });
+    var banner = el('div', { 'class': 'facts-banner' }); banner.style.display = 'none';
+    var listWrap = el('div', { 'class': 'facts-groups' });
+    host.appendChild(el('div', { 'class': 'facts-browser' }, [head, banner, listWrap]));
+
+    function workLink(id) {
+      return el('a', { 'class': 'btn-quiet cx-graphlink', href: '#/canvas/graph?focus=work:' + id, title: 'open ' + id + ' in the relation graph' }, ['View work item']);
+    }
+    function pendingRow(p) {
+      var rows = m6Kv([
+        ['action id', p.action_id], ['work id', p.work_id],
+        ['requested', (p.requested_action || 'update_state') + (p.target_state ? ' → ' + p.target_state : '')],
+        ['by passport', p.requested_by_passport], ['status', p.status || 'pending'], ['requested', ageOf(p.requested_at_unix_ms)]
+      ]);
+      var links = el('div', { 'class': 'sess-rmeta' }, [workLink(p.work_id)]);
+      var actions = el('div', { 'class': 'gate-actions' });
+      if (isOperator()) {
+        var msg = el('span', { 'class': 'ctl-desc' });
+        var approve = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Approve']);
+        var reject = el('button', { 'class': 'btn-quiet danger', type: 'button' }, ['Reject']);
+        function run(fn, verb) {
+          var pp = boundPassport();
+          if (!pp) { msg.textContent = 'Bind a passport first (Art.14 — approvals are passport-attributed).'; return; }
+          approve.disabled = reject.disabled = true; msg.textContent = verb + '…';
+          fn(p.action_id, pp).then(readJson).then(function (r) {
+            msg.textContent = (r && r.ok) ? (verb + ' recorded · receipt ' + m6Short((r.data && (r.data.receipt_id || (r.data.gate && r.data.gate.receipt_id))) || '—', 18)) : (verb + ' failed (HTTP ' + (r && r.status) + ')');
+            load();
+          }, function () { msg.textContent = verb + ' failed.'; approve.disabled = reject.disabled = false; });
+        }
+        approve.addEventListener('click', function () { run(approveGate, 'Approve'); });
+        reject.addEventListener('click', function () { run(rejectGate, 'Reject'); });
+        actions.appendChild(approve); actions.appendChild(reject); actions.appendChild(msg);
+      } else {
+        actions.appendChild(el('p', { 'class': 'ctl-desc', text: 'Approvals are operator-gated (Art.14) — grant an operator scope to approve or reject from the Overwatch “needs you” lane.' }));
+      }
+      var detail = el('div', { 'class': 'facts-detail' }, [rows, links, actions]);
+      var badge = m6Chip('sess-chip sess-chip-plan', 'GATED', 'Art.14 human approval');
+      var body = el('div', {}, [
+        el('div', { 'class': 'facts-rhead' }, [el('span', { 'class': 'facts-key', text: p.work_id || '(work)' }), badge, el('span', { 'class': 'facts-time', text: ageOf(p.requested_at_unix_ms) })]),
+        el('div', { 'class': 'facts-val', text: (p.requested_action || 'update_state') + (p.target_state ? ' → ' + p.target_state : '') + ' · by ' + (p.requested_by_passport || '?') }),
+        detail
+      ]);
+      var row = el('div', { 'class': 'facts-row open tone-warn' }, [body]);
+      return row;
+    }
+    function richEmpty() {
+      var wrap = el('div', {});
+      wrap.appendChild(el('div', { 'class': 'facts-banner ok-empty' }, [
+        el('div', { 'class': 'm6-help-h', text: 'No gates pending — the queue is clear.' }),
+        el('p', { 'class': 'ctl-desc', text: 'This is the canonical Art.14 approval queue. A gate is a PendingGateAction: it is created when an agent requests a work-item state transition that the work-gate policy holds for a human go/no-go (e.g. a destructive or high-risk update_state). It waits here with status “pending” until an operator approves or rejects — that decision mints a CROWN approval receipt (ad_ga_*), visible on the Receipts page.' })
+      ]));
+      wrap.appendChild(m6Label('how a gate is created'));
+      wrap.appendChild(m6Kv([
+        ['producer', 'work-gate policy on a state transition (WorkTransition → PendingGateAction)'],
+        ['endpoint', 'GET /v1/work/gate/pending (this page) · POST /v1/work/gate/{actionId}/approve|reject'],
+        ['requested_action', 'update_state (the only gated action today) + target_state'],
+        ['resolution', 'approve/reject → CROWN ad_ga_* receipt, attributed to the approving passport']
+      ]));
+      wrap.appendChild(m6Label('blocker taxonomy (work.rs BlockerKind)'));
+      wrap.appendChild(m6Kv([
+        ['needs_info', 'blocked, waiting on an answer about the task'],
+        ['needs_approval', 'blocked, waiting on an owner’s go/no-go — a HINT an approval is owed (not the gate itself; the gate stays keyed on passport/risk)']
+      ]));
+      // Client-side join: blocked work items owed an approval → the producers a
+      // gate would come from. Cheap single read of /v1/work.
+      var owed = state.work.filter(function (w) { return w && w.state === 'blocked' && (w.blocker_kind === 'needs_approval'); });
+      wrap.appendChild(m6Label('work items owed an approval (blocked · needs_approval)'));
+      if (!owed.length) {
+        wrap.appendChild(m6Empty('None — no blocked work item currently carries blocker_kind = needs_approval on /v1/work.'));
+      } else {
+        owed.slice(0, 25).forEach(function (w) {
+          var r = el('div', { 'class': 'facts-row tone-warn' }, [
+            el('div', { 'class': 'facts-rhead' }, [el('span', { 'class': 'facts-key', text: w.id }), m6Chip('sess-chip', 'needs_approval', 'blocker kind'), el('span', { 'class': 'facts-time', text: w.state })]),
+            w.title ? el('div', { 'class': 'facts-val', text: w.title }) : null,
+            el('div', { 'class': 'sess-rmeta' }, [workLink(w.id)])
+          ]);
+          wrap.appendChild(r);
+        });
+      }
+      return wrap;
+    }
+    function paint() {
+      listWrap.textContent = '';
+      var pend = (state.pending || []).filter(function (p) { return (p.status || 'pending') === 'pending'; });
+      head.textContent = '';
+      head.appendChild(el('b', { text: String(pend.length) }));
+      head.appendChild(doc().createTextNode(' pending · /v1/work/gate/pending'));
+      if (pend.length) { pend.forEach(function (p) { listWrap.appendChild(pendingRow(p)); }); }
+      else { listWrap.appendChild(richEmpty()); }
+    }
+    function load() {
+      if (state.loading) { return; } state.loading = true; state.token++;
+      var myToken = state.token;
+      Promise.all([fetchJSON('/v1/work/gate/pending'), fetchJSON('/v1/work?source=all')]).then(function (rr) {
+        if (myToken !== state.token) { return; }
+        state.loading = false;
+        var g = rr[0], w = rr[1];
+        if (!g.ok || !g.data) { banner.style.display = ''; banner.className = 'facts-banner err'; banner.textContent = 'Gates unavailable — ' + (g.status === 0 ? 'daemon unreachable' : 'HTTP ' + g.status) + '.'; listWrap.textContent = ''; return; }
+        banner.style.display = 'none';
+        state.pending = g.data.pending || [];
+        state.work = (w.ok && w.data) ? (w.data.work || w.data.items || w.data.work_items || []) : [];
+        paint();
+      });
+    }
+    load();
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  cx-identity (M6): the candidate-links surface. (a) an in-page help panel
+  //  grounded in the code (what a candidate is, the NEW propose route + its two
+  //  inputs, how consent disposes, the flag); (b) live candidates from
+  //  /v1/identity/candidates (honest 404 naming the flag when off); (c) an
+  //  operator-gated "Seed candidates" action wired to POST /v1/identity/candidates/
+  //  propose through operatorGatedCall (disabled + reason in customer posture);
+  //  confirm kept under the operator-gating idiom.
+  // ─────────────────────────────────────────────────────────────────────────
+  function renderIdentityBrowser(host) {
+    host.textContent = '';
+    var state = { candidates: [], status: 0, loading: false, token: 0 };
+
+    var help = el('div', { 'class': 'facts-banner m6-help' }, [
+      el('div', { 'class': 'm6-help-h', text: 'Candidate links — inference proposes, consent disposes' }),
+      el('p', { 'class': 'ctl-desc', text: 'A candidate is a PROPOSAL that two identities (a local passport and an observed subject) may be the same principal. Candidates never resolve on their own — the principal resolver ignores them until an operator confirms.' })
+    ]);
+    var pipeline = el('div', {});
+    pipeline.appendChild(m6Label('what writes candidates'));
+    pipeline.appendChild(m6Kv([
+      ['producer', 'POST /v1/identity/candidates/propose (the NEW M6 seed route — the only shipped producer)'],
+      ['input · bindings', 'session→passport bindings: two distinct passports co-occurring in one tenant+project within the temporal window'],
+      ['input · observations', 'observation-journal principals: distinct signing identities co-occurring in one session'],
+      ['confirm', 'POST …/{id}/confirm with the cross-signature proof → mints a resolving, cross-signed identity_link'],
+      ['reject', 'POST …/{id}/reject → keeps the audit trail, never resolves'],
+      ['revoke', 'POST /v1/identity/links/{id}/revoke → retires a confirmed link'],
+      ['flag', 'CORECRUXD_IDENTITY_LINKS=1 (all /v1/identity/* 404 when off)']
+    ]));
+    help.appendChild(pipeline);
+
+    var seedWrap = el('div', { 'class': 'facts-toolbar', 'style': 'margin-top:10px' });
+    var seedMsg = el('span', { 'class': 'ctl-desc' });
+    var seedBtn = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Seed candidates']);
+    if (!isOperator()) {
+      seedBtn.disabled = true;
+      seedBtn.setAttribute('data-requires', 'operator');
+      seedBtn.setAttribute('title', 'operator posture required — the seed route is admin:write');
+      seedMsg.textContent = 'Operator posture required to run the proposers (admin:write).';
+    } else {
+      seedBtn.addEventListener('click', function () {
+        seedBtn.disabled = true; seedMsg.textContent = 'running proposers…';
+        seedIdentityCandidates().then(readJson).then(function (r) {
+          seedBtn.disabled = false;
+          if (r && r.ok && r.data) {
+            var by = r.data.by_source || {};
+            seedMsg.textContent = 'created ' + r.data.created + ' (examined ' + r.data.examined + ') · bindings ' + ((by.bindings && by.bindings.created) || 0) + '/' + ((by.bindings && by.bindings.examined) || 0) + ' · observations ' + ((by.observations && by.observations.created) || 0) + '/' + ((by.observations && by.observations.examined) || 0);
+            load();
+          } else { seedMsg.textContent = 'seed failed (HTTP ' + (r && r.status) + ')'; }
+        }, function () { seedBtn.disabled = false; seedMsg.textContent = 'seed failed.'; });
+      });
+    }
+    seedWrap.appendChild(seedBtn); seedWrap.appendChild(seedMsg);
+    help.appendChild(seedWrap);
+
+    var countLine = el('p', { 'class': 'facts-count' });
+    var banner = el('div', { 'class': 'facts-banner' }); banner.style.display = 'none';
+    var listWrap = el('div', { 'class': 'facts-groups' });
+    host.appendChild(el('div', { 'class': 'facts-browser' }, [help, countLine, banner, listWrap]));
+
+    function candidateRow(c) {
+      var cand = c.candidate || c;
+      var id = c.candidate_id || cand.candidate_id || c.id;
+      var status = String(cand.status || 'proposed');
+      var signals = (cand.signals || []).map(function (s) { return s.kind; }).join(' · ');
+      var detail = el('div', { 'class': 'facts-detail' }, [
+        m6Kv([
+          ['candidate_id', id], ['status', status],
+          ['local passport', cand.local_passport_fpr], ['observed subject', cand.observed_subject],
+          ['confidence', cand.confidence], ['signals', signals || '—'],
+          ['evidence', (cand.evidence_refs || []).join(', ')], ['proposed at', cand.proposed_at],
+          ['resolved link', cand.resolved_link_id]
+        ])
+      ]);
+      if (status === 'proposed' && isOperator()) {
+        detail.appendChild(m6Label('confirm (operator — needs the cross-signature proof)'));
+        var f = {};
+        function inp(k, ph, v) { var i = el('input', { 'class': 'facts-input', type: 'text', placeholder: ph }); if (v) { i.value = v; } f[k] = i; return el('label', { 'class': 'facts-field' }, [el('span', { text: k }), i]); }
+        var form = el('div', { 'class': 'facts-toolbar' }, [
+          inp('local_passport_id', 'personal-default', 'personal-default'),
+          inp('remote_fpr', 'p_… (= observed subject)', cand.observed_subject || ''),
+          inp('remote_public_key_hex', '64 hex chars'),
+          inp('created_at', '2026-06-15T00:00:00Z'),
+          inp('sig_local', '128 hex chars'),
+          inp('sig_remote', '128 hex chars')
+        ]);
+        var cmsg = el('span', { 'class': 'ctl-desc' });
+        var confirmBtn = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Confirm candidate']);
+        confirmBtn.addEventListener('click', function () {
+          confirmBtn.disabled = true; cmsg.textContent = 'verifying signatures…';
+          confirmIdentityCandidate(id, {
+            local_passport_id: f.local_passport_id.value, remote_fpr: f.remote_fpr.value,
+            remote_public_key_hex: f.remote_public_key_hex.value, created_at: f.created_at.value,
+            sig_local: f.sig_local.value, sig_remote: f.sig_remote.value
+          }).then(readJson).then(function (r) {
+            confirmBtn.disabled = false;
+            cmsg.textContent = (r && r.ok) ? 'confirmed → identity_link minted' : 'rejected by daemon (HTTP ' + (r && r.status) + ') — ' + m6Short((r.data && (r.data.detail || r.data.title)) || 'signatures must verify', 80);
+            if (r && r.ok) { load(); }
+          }, function () { confirmBtn.disabled = false; cmsg.textContent = 'confirm failed.'; });
+        });
+        detail.appendChild(form); detail.appendChild(confirmBtn); detail.appendChild(cmsg);
+        detail.appendChild(el('p', { 'class': 'ctl-desc', text: 'Reject is an API/CLI action: POST /v1/identity/candidates/' + id + '/reject (keeps the audit trail).' }));
+      }
+      var tone = status === 'confirmed' ? 'ok' : (status === 'rejected' ? 'crit' : 'trust');
+      var row = el('div', { 'class': 'facts-row tone-' + tone, role: 'button', tabindex: '0' }, [
+        el('div', { 'class': 'facts-rhead' }, [el('span', { 'class': 'facts-key', text: id }), m6Chip('sess-chip', status, 'candidate status'), el('span', { 'class': 'facts-time', text: (cand.confidence != null ? 'conf ' + cand.confidence : '') })]),
+        el('div', { 'class': 'facts-val', text: (cand.observed_subject || '') + (signals ? ' · ' + signals : '') }),
+        detail
+      ]);
+      var opened = false;
+      function toggle() { var o = row.classList.toggle('open'); if (o && !opened) { opened = true; } }
+      row.addEventListener('click', function (e) { if (e.target && e.target.closest && e.target.closest('.facts-detail')) { return; } toggle(); });
+      row.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+      return row;
+    }
+    function paint() {
+      listWrap.textContent = ''; countLine.textContent = '';
+      if (state.status === 404) {
+        banner.style.display = ''; banner.className = 'facts-banner warn';
+        banner.textContent = 'Identity links are disabled on this daemon (all /v1/identity/* return 404). Set CORECRUXD_IDENTITY_LINKS=1 to enable candidates, the seed route, and confirmation.';
+        return;
+      }
+      banner.style.display = 'none';
+      countLine.appendChild(el('b', { text: String(state.candidates.length) }));
+      countLine.appendChild(doc().createTextNode(' candidate' + (state.candidates.length === 1 ? '' : 's') + ' · /v1/identity/candidates'));
+      if (!state.candidates.length) { listWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'No candidates yet. Run “Seed candidates” above (operator) to propose from session bindings + observation principals — a fresh workspace has no other producer.' })); return; }
+      state.candidates.forEach(function (c) { listWrap.appendChild(candidateRow(c)); });
+    }
+    function load() {
+      if (state.loading) { return; } state.loading = true; state.token++;
+      var myToken = state.token;
+      fetchJSON('/v1/identity/candidates').then(function (res) {
+        if (myToken !== state.token) { return; }
+        state.loading = false; state.status = res.status;
+        if (res.status === 404) { paint(); return; }
+        if (!res.ok || !res.data) { banner.style.display = ''; banner.className = 'facts-banner err'; banner.textContent = 'Candidates unavailable — HTTP ' + res.status + '.'; return; }
+        state.candidates = res.data.candidates || [];
+        paint();
+      });
+    }
+    load();
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  cx-mediation (M6): honest CE posture over GET /v1/console/engine/summary,
+  //  branching on the THREE real states — 404 "engine mediation not configured"
+  //  → CE posture card; 502 "engine upstream unavailable" → configured-but-
+  //  unreachable card; 200 → the proxied summary with its mediated/reachable/
+  //  latency stamps. No dead controls are rendered (customer-safe by omission).
+  // ─────────────────────────────────────────────────────────────────────────
+  function renderMediationPosture(host) {
+    host.textContent = '';
+    var banner = el('div', { 'class': 'facts-banner' }); banner.style.display = 'none';
+    var body = el('div', {});
+    host.appendChild(el('div', { 'class': 'facts-browser' }, [banner, body]));
+
+    function ceCard() {
+      var wrap = el('div', {});
+      wrap.appendChild(el('div', { 'class': 'facts-banner m6-help' }, [
+        el('div', { 'class': 'm6-help-h', text: 'CE posture — engine mediation not configured' }),
+        el('p', { 'class': 'ctl-desc', text: 'The gateway (mediation) plane is where a hosted CruxEngine mediates identity, the capability ladder, and Art.15 foresight on the browser’s behalf. This CPU-only Crux daemon holds NO engine state — it only proxies a small, curated set of read summaries when an engine base URL is configured. Right now none is, so the read side is honestly empty rather than a dead pane.' })
+      ]));
+      wrap.appendChild(m6Label('what exists on this daemon'));
+      wrap.appendChild(m6Kv([
+        ['engine state held here', 'none — the daemon proxies, it does not run the engine'],
+        ['configured by', 'CORECRUXD_ENGINE_BASE_URL (+ optional CORECRUXD_ENGINE_API_KEY)'],
+        ['read routes (when configured)', 'GET /v1/console/engine/summary · /bench · /spend (proxied, read-only)'],
+        ['status now', '404 “engine mediation not configured” — base URL unset']
+      ]));
+      wrap.appendChild(m6Label('what a configured engine (M3+) unlocks'));
+      wrap.appendChild(m6Kv([
+        ['summary', 'engine liveness + reachability + latency stamps'],
+        ['bench / spend', 'benchmark manifest + committed escrow spend, proxied'],
+        ['search', 'mediated WikiCrux retrieval (POST /v1/console/engine/search)']
+      ]));
+      return wrap;
+    }
+    function unreachableCard() {
+      var wrap = el('div', {});
+      wrap.appendChild(el('div', { 'class': 'facts-banner warn' }, [
+        el('div', { 'class': 'm6-help-h', text: 'Engine configured — upstream unavailable (502)' }),
+        el('p', { 'class': 'ctl-desc', text: 'CORECRUXD_ENGINE_BASE_URL is set, but the daemon’s proxied read to the engine failed (transport error or non-2xx). The upstream body, headers, and API key are never forwarded — this is the terse 502 posture. Check the engine base URL, the API key, and engine health, then reload.' })
+      ]));
+      return wrap;
+    }
+    function summaryCard(d) {
+      var wrap = el('div', {});
+      wrap.appendChild(el('div', { 'class': 'facts-banner ok-empty' }, [
+        el('div', { 'class': 'm6-help-h', text: 'Engine reachable — mediated summary' })
+      ]));
+      wrap.appendChild(m6Kv([
+        ['mediated', d.mediated === true ? 'yes · daemon-proxied' : String(d.mediated)],
+        ['engine_reachable', String(d.engine_reachable)],
+        ['engine_latency_ms', d.engine_latency_ms],
+        ['fetched_at_unix_ms', d.fetched_at_unix_ms]
+      ]));
+      wrap.appendChild(m6Label('proxied engine summary (verbatim)'));
+      wrap.appendChild(el('pre', { 'class': 'facts-vfull', text: m6PrettyJson(d) }));
+      return wrap;
+    }
+    function load() {
+      body.textContent = ''; body.appendChild(el('p', { 'class': 'facts-loading', text: 'probing engine mediation…' }));
+      fetchJSON('/v1/console/engine/summary').then(function (res) {
+        body.textContent = '';
+        if (res.status === 404) { body.appendChild(ceCard()); return; }
+        if (res.status === 502) { body.appendChild(unreachableCard()); return; }
+        if (res.ok && res.data) { body.appendChild(summaryCard(res.data)); return; }
+        banner.style.display = ''; banner.className = 'facts-banner err';
+        banner.textContent = 'Engine summary unavailable — ' + (res.status === 0 ? 'daemon unreachable' : 'HTTP ' + res.status) + '.';
+      });
+    }
+    load();
   }
 
   function renderExplorer(host, ctx) {
@@ -5987,6 +12921,2297 @@
     return { search: doPath, expand: onNodeClick };
   }
 
+  // =========================================================================
+  //  Rings snapshot data — the honest degradation for the native Rings page
+  //  (renderRings below). Ported verbatim from UI-prototype/rings-clock/
+  //  console-mock.html; live feeds (/v1/work, /v1/console/summary,
+  //  /v1/facts/list) supersede these at runtime when reachable.
+  // =========================================================================
+  var RINGS_PLANS_RAW = [{"s":"corecrux-object-storage-tier-2026-07-07","st":0,"d":6,"t":6,"b":61,"e":76,"o":59,"dep":["corecrux-memory-manager-2026-07-05"],"ext":[],"od":[]},{"s":"tier-packaging-p1-remediation-2026-07-13","st":1,"d":0,"t":1,"b":67,"e":76,"o":55,"dep":[],"ext":[],"od":[]},{"s":"crux-daemon-buyer-fit-buildout-2026-07-13","st":1,"d":1,"t":8,"b":67,"e":76,"o":64,"dep":[],"ext":[],"od":[]},{"s":"crux-audit-v2-closeout-2026-07-15","st":0,"d":7,"t":7,"b":69,"e":75,"o":56,"dep":["crux-audit-v2-remediation-2026-07-13"],"ext":[],"od":[]},{"s":"vault-consolidation-2026-04-07","st":1,"d":0,"t":8,"b":54,"e":75,"o":80,"dep":[],"ext":[],"od":[]},{"s":"cross-site-auth-sso-cuecrux-2026-07-13","st":1,"d":3,"t":6,"b":67,"e":75,"o":67,"dep":["paddle-billing-state-2026-07-13","unified-shell-console-2026-07-03"],"ext":["cuecrux-selfserve-launch-readiness-2026-07-16"],"od":[]},{"s":"wikicrux-agent-publish-plane-shared-tenant-2026-07-09","st":1,"d":1,"t":6,"b":73,"e":74,"o":5,"dep":["wikicrux-agent-adoption-sequence-2026-07-08","wikicrux-agent-first-wiki-service-2026-06-11"],"ext":["wikicrux-adoption-telemetry-and-corpus-flywheel-2026-07-09"],"od":[]},{"s":"portfolio-burn-down-orchestration-2026-07-10","st":2,"d":2,"t":8,"b":64,"e":74,"o":54,"dep":["commerce-paddle-billing-2026-06-11","crux-credit-burn-rail-2026-06-22","production-cutover-orchestration-2026-07-07"],"ext":[],"od":["OD-1"]},{"s":"commerce-paddle-billing-2026-06-11","st":1,"d":0,"t":8,"b":58,"e":72,"o":51,"dep":[],"ext":["portfolio-burn-down-orchestration-2026-07-10"],"od":[]},{"s":"daemon-distribution-packaging-2026-06-11","st":0,"d":7,"t":7,"b":36,"e":72,"o":137,"dep":[],"ext":[],"od":[]},{"s":"esi-v2-no-blindspot-live-write-2026-06-03","st":2,"d":3,"t":6,"b":27,"e":72,"o":137,"dep":[],"ext":[],"od":[]},{"s":"unified-shell-console-2026-07-03","st":1,"d":12,"t":13,"b":57,"e":58,"o":17,"dep":["open-engine-coordination-surfaces-2026-06-30"],"ext":["cross-site-auth-sso-cuecrux-2026-07-13"],"od":[]},{"s":"wikicrux-prose-dense-reembed-float16-pool-2026-06-27","st":0,"d":3,"t":5,"b":51,"e":51,"o":7,"dep":[],"ext":["wikicrux-retrieval-quality-hardening-2026-06-28"],"od":[]},{"s":"wikicrux-public-codemaps-2026-07-10","st":1,"d":4,"t":4,"b":64,"e":64,"o":0,"dep":[],"ext":["codemaps-cross-repo-graph-and-value-expansion-2026-07-10"],"od":[]},{"s":"wikicrux-retrieval-quality-hardening-2026-06-28","st":0,"d":6,"t":7,"b":52,"e":52,"o":11,"dep":["wikicrux-prose-dense-reembed-float16-pool-2026-06-27"],"ext":[],"od":[]},{"s":"wiki-prose-residual-extraction-2026-06-30","st":0,"d":3,"t":4,"b":54,"e":55,"o":15,"dep":[],"ext":["unified-retrieval-hardening-2026-07-02"],"od":[]},{"s":"vernacular-retrieval-lift-check-2026-05-21","st":0,"d":0,"t":7,"b":14,"e":14,"o":0,"dep":[],"ext":[],"od":[]},{"s":"wiki-cuecrux-com-prod-deploy-2026-07-08","st":0,"d":0,"t":5,"b":62,"e":62,"o":4,"dep":["wikicrux-agent-first-wiki-service-2026-06-11","wikicrux-grounding-poisoning-defense-2026-07-08"],"ext":["wikicrux-adoption-telemetry-and-corpus-flywheel-2026-07-09"],"od":[]},{"s":"wikicrux-agent-language-encode-2026-06-28","st":1,"d":5,"t":10,"b":52,"e":53,"o":30,"dep":["classical-ner-at-ingest-2026-05-05","wikicrux-agent-first-wiki-service-2026-06-11","wikicrux-full-enwiki-ingest-2026-06-28"],"ext":["unified-reasoner-encode-evidence-2026-06-29"],"od":[]},{"s":"wikicrux-grounding-poisoning-defense-2026-07-08","st":0,"d":5,"t":6,"b":62,"e":62,"o":4,"dep":["wikicrux-agent-first-wiki-service-2026-06-11"],"ext":["wiki-cuecrux-com-prod-deploy-2026-07-08","wikicrux-adoption-telemetry-and-corpus-flywheel-2026-07-09"],"od":[]},{"s":"vaultcrux-search-outcome-corpus-pollution-2026-05-31","st":0,"d":2,"t":3,"b":24,"e":24,"o":0,"dep":[],"ext":[],"od":[]},{"s":"wikicrux-idempotent-ingestion-2026-06-14","st":1,"d":4,"t":10,"b":38,"e":52,"o":48,"dep":[],"ext":["wikicrux-adoption-telemetry-and-corpus-flywheel-2026-07-09"],"od":[]},{"s":"wikicrux-agent-first-wiki-service-2026-06-11","st":1,"d":3,"t":8,"b":35,"e":37,"o":1,"dep":[],"ext":["wiki-cuecrux-com-prod-deploy-2026-07-08","wikicrux-adoption-telemetry-and-corpus-flywheel-2026-07-09","wikicrux-agent-adoption-sequence-2026-07-08","wikicrux-agent-language-encode-2026-06-28","wikicrux-agent-publish-plane-shared-tenant-2026-07-09","wikicrux-grounding-poisoning-defense-2026-07-08"],"od":[]},{"s":"wikicrux-full-enwiki-ingest-2026-06-28","st":1,"d":2,"t":9,"b":52,"e":54,"o":33,"dep":[],"ext":["enwiki-prose-dedicated-serving-data-1-2026-07-03","wikicrux-adoption-telemetry-and-corpus-flywheel-2026-07-09","wikicrux-agent-language-encode-2026-06-28"],"od":[]},{"s":"wikicrux-adoption-telemetry-and-corpus-flywheel-2026-07-09","st":1,"d":5,"t":10,"b":63,"e":67,"o":8,"dep":["enwiki-prose-dedicated-serving-data-1-2026-07-03","wiki-cuecrux-com-prod-deploy-2026-07-08","wikicrux-agent-adoption-sequence-2026-07-08","wikicrux-agent-first-wiki-service-2026-06-11","wikicrux-agent-publish-plane-shared-tenant-2026-07-09","wikicrux-full-enwiki-ingest-2026-06-28","wikicrux-grounding-poisoning-defense-2026-07-08","wikicrux-idempotent-ingestion-2026-06-14"],"ext":[],"od":[]},{"s":"vaultcrux-companion-lane-transforms-and-ccxev-2026-05-20","st":0,"d":0,"t":10,"b":15,"e":15,"o":0,"dep":[],"ext":[],"od":[]},{"s":"vaultcrux-multi-predicate-enumerate-2026-04-29","st":0,"d":0,"t":3,"b":20,"e":20,"o":0,"dep":[],"ext":[],"od":[]},{"s":"vaultcrux-multi-predicate-m3-verify-build-2026-06-09","st":0,"d":1,"t":5,"b":34,"e":34,"o":0,"dep":[],"ext":[],"od":[]},{"s":"tenant-isolation-policy-and-silo-2026-06-24","st":0,"d":7,"t":7,"b":48,"e":50,"o":25,"dep":[],"ext":[],"od":[]},{"s":"release-readiness-master-2026-06-11","st":1,"d":0,"t":6,"b":35,"e":49,"o":52,"dep":[],"ext":[],"od":[]},{"s":"tier0-deterministic-levers-2026-06-30","st":0,"d":5,"t":5,"b":54,"e":54,"o":6,"dep":[],"ext":[],"od":[]},{"s":"scorecrux-coding-intelligence-refresh-2026-06-25","st":1,"d":0,"t":5,"b":49,"e":50,"o":5,"dep":[],"ext":[],"od":[]},{"s":"tier-packaging-and-site-reframe-2026-07-13","st":1,"d":7,"t":8,"b":66,"e":67,"o":5,"dep":[],"ext":[],"od":[]},{"s":"unified-retrieval-hardening-2026-07-02","st":2,"d":7,"t":10,"b":55,"e":56,"o":1,"dep":["ccxi-query-shape-routing-2026-06-30","corecrux-offline-attach-candidate-selection-2026-07-01","embedder-pool-distribution-manager-2026-07-01","unified-production-claims-source-2026-06-30","unified-reasoner-encode-evidence-2026-06-29","wiki-prose-residual-extraction-2026-06-30"],"ext":[],"od":["OD-1","OD-2","OD-3"]},{"s":"proof-carrying-adaptive-packs-2026-07-13","st":1,"d":0,"t":7,"b":67,"e":67,"o":5,"dep":[],"ext":[],"od":[]},{"s":"security-critical-7-tenant-isolation-2026-06-11","st":0,"d":4,"t":7,"b":65,"e":65,"o":0,"dep":[],"ext":[],"od":[]},{"s":"topology-ccxn-entity-coverage-backfill-lme-s-2026-06-06","st":0,"d":3,"t":5,"b":31,"e":31,"o":0,"dep":[],"ext":[],"od":[]},{"s":"token-burn-precise-attribution-2026-06-26","st":0,"d":3,"t":3,"b":50,"e":50,"o":7,"dep":["execplan-token-burn-per-execplan-2026-06-26"],"ext":[],"od":["OD-28"]},{"s":"unified-reasoner-encode-evidence-2026-06-29","st":1,"d":0,"t":1,"b":53,"e":54,"o":25,"dep":["lme-s-aggregation-projection-lane-wikicrux-bridge-2026-06-28","wikicrux-agent-language-encode-2026-06-28"],"ext":["ccxi-query-shape-routing-2026-06-30","unified-retrieval-hardening-2026-07-02"],"od":[]},{"s":"unified-production-claims-source-2026-06-30","st":1,"d":3,"t":4,"b":54,"e":54,"o":6,"dep":[],"ext":["ccxi-query-shape-routing-2026-06-30","enwiki-prose-dedicated-serving-data-1-2026-07-03","unified-retrieval-hardening-2026-07-02"],"od":[]},{"s":"rcx-registry-deployment-readiness-2026-06-14","st":0,"d":5,"t":5,"b":38,"e":38,"o":0,"dep":[],"ext":[],"od":[]},{"s":"production-cutover-orchestration-2026-07-07","st":1,"d":39,"t":40,"b":61,"e":65,"o":2,"dep":[],"ext":["portfolio-burn-down-orchestration-2026-07-10"],"od":[]},{"s":"provider-integration-surfaces-2026-06-11","st":1,"d":5,"t":6,"b":36,"e":36,"o":1,"dep":[],"ext":[],"od":[]},{"s":"scratchpad-survival-wizard-standard-2026-06-30","st":1,"d":4,"t":4,"b":54,"e":55,"o":8,"dep":[],"ext":[],"od":[]},{"s":"topology-ccxn-weight-and-noise-tune-lme-s-2026-06-07","st":0,"d":4,"t":4,"b":31,"e":31,"o":0,"dep":[],"ext":[],"od":[]},{"s":"tokenburn-ab-harness-2026-06-10","st":0,"d":1,"t":7,"b":34,"e":34,"o":0,"dep":[],"ext":[],"od":[]},{"s":"prod-engine-reconcile-deploy-2026-06-26","st":0,"d":0,"t":1,"b":50,"e":50,"o":4,"dep":[],"ext":[],"od":[]},{"s":"phase-t-usage-receipts-2026-07-03","st":0,"d":3,"t":3,"b":64,"e":64,"o":3,"dep":[],"ext":[],"od":[]},{"s":"lme-s-gated-accuracy-push-2026-05-29","st":0,"d":0,"t":5,"b":22,"e":28,"o":0,"dep":[],"ext":[],"od":[]},{"s":"phase-t-cross-vendor-instrumentation-2026-07-03","st":1,"d":1,"t":3,"b":61,"e":64,"o":5,"dep":[],"ext":[],"od":[]},{"s":"passport-revocation-and-agent-card-discovery-2026-06-29","st":0,"d":7,"t":7,"b":53,"e":53,"o":26,"dep":[],"ext":[],"od":[]},{"s":"phase-0-hygiene-debt-2026-07-02","st":1,"d":3,"t":10,"b":56,"e":60,"o":27,"dep":["master-plan-refresh-and-docs-unification-2026-07-02"],"ext":[],"od":[]},{"s":"phase-t-usage-receipts-autoemit-version-notify-2026-07-03","st":0,"d":3,"t":3,"b":57,"e":57,"o":3,"dep":[],"ext":[],"od":[]},{"s":"master-plan-canonical-consolidation-2026-06-14","st":0,"d":4,"t":4,"b":38,"e":38,"o":0,"dep":[],"ext":[],"od":[]},{"s":"portfolio-status-decisions-registry-2026-06-11","st":0,"d":0,"t":4,"b":36,"e":36,"o":0,"dep":[],"ext":[],"od":[]},{"s":"open-engine-coordination-surfaces-2026-06-30","st":0,"d":0,"t":5,"b":54,"e":55,"o":9,"dep":[],"ext":["unified-shell-console-2026-07-03"],"od":[]},{"s":"plancrux-retirement-master-2026-05-19","st":1,"d":0,"t":9,"b":12,"e":34,"o":0,"dep":[],"ext":[],"od":[]},{"s":"mh-ab-v2-harness-build-2026-06-12","st":0,"d":1,"t":5,"b":36,"e":36,"o":0,"dep":[],"ext":["context-dependence-benchmark-scorecrux-2026-07-03"],"od":[]},{"s":"lme-s-multi-lane-retrieval-gemma-2026-05-23","st":0,"d":0,"t":7,"b":16,"e":16,"o":0,"dep":[],"ext":[],"od":[]},{"s":"lme-knowledge-reingest-and-legacy-segment-retire-2026-05-29","st":0,"d":0,"t":1,"b":22,"e":22,"o":0,"dep":[],"ext":[],"od":[]},{"s":"lane-coverage-backfill-2026-05-22","st":0,"d":2,"t":5,"b":15,"e":15,"o":0,"dep":[],"ext":[],"od":[]},{"s":"lme-ordering-day-precision-extraction-2026-06-12","st":1,"d":3,"t":6,"b":36,"e":37,"o":0,"dep":[],"ext":[],"od":[]},{"s":"lme-s-8-lever-deepdive-2026-06-04","st":0,"d":0,"t":1,"b":28,"e":29,"o":0,"dep":[],"ext":[],"od":[]},{"s":"lme-s-aggregation-projection-lane-wikicrux-bridge-2026-06-28","st":1,"d":0,"t":6,"b":52,"e":53,"o":26,"dep":["lme-s-aggregation-count-extraction-2026-06-18"],"ext":["unified-reasoner-encode-evidence-2026-06-29"],"od":[]},{"s":"lme-agent-native-retrieval-harness-2026-05-30","st":0,"d":2,"t":5,"b":23,"e":32,"o":0,"dep":[],"ext":[],"od":[]},{"s":"lme-s-aggregation-count-extraction-2026-06-18","st":0,"d":5,"t":5,"b":42,"e":47,"o":59,"dep":[],"ext":["lme-s-aggregation-projection-lane-wikicrux-bridge-2026-06-28"],"od":[]},{"s":"knowledge-state-production-hooks-2026-06-13","st":0,"d":6,"t":6,"b":37,"e":39,"o":9,"dep":[],"ext":[],"od":[]},{"s":"extraction-lane-observability-2026-05-21","st":0,"d":7,"t":7,"b":14,"e":35,"o":0,"dep":[],"ext":[],"od":[]},{"s":"execplan-lineage-provenance-open-questions-2026-06-25","st":0,"d":4,"t":5,"b":49,"e":49,"o":5,"dep":["coord-plane-p1-execplan-board-2026-06-23","crux-work-panel-execplans-as-truenorth-2026-05-26"],"ext":["execplan-board-fidelity-states-console-cost-2026-06-26"],"od":["OD-3","OD-24"]},{"s":"generative-execplans-and-deploy-coordination-2026-06-26","st":0,"d":0,"t":1,"b":50,"e":53,"o":27,"dep":["crux-work-panel-execplans-as-truenorth-2026-05-26","execplan-board-fidelity-states-console-cost-2026-06-26"],"ext":[],"od":[]},{"s":"identity-memory-portability-2026-06-11","st":0,"d":6,"t":6,"b":36,"e":36,"o":1,"dep":[],"ext":[],"od":[]},{"s":"fable5-d1-redteam-kill-risk-register-2026-07-02","st":0,"d":6,"t":6,"b":56,"e":56,"o":6,"dep":[],"ext":[],"od":[]},{"s":"gated-tiered-aggregation-prompt-fixes-2026-05-24","st":0,"d":0,"t":8,"b":17,"e":33,"o":0,"dep":[],"ext":[],"od":[]},{"s":"execplan-token-burn-per-execplan-2026-06-26","st":0,"d":2,"t":3,"b":50,"e":50,"o":12,"dep":["execplan-board-fidelity-states-console-cost-2026-06-26"],"ext":["token-burn-precise-attribution-2026-06-26"],"od":["OD-28"]},{"s":"event-lane-semantic-recall-2026-06-05","st":0,"d":6,"t":7,"b":29,"e":30,"o":0,"dep":[],"ext":[],"od":[]},{"s":"glassbox-eu-ai-act-soc2-compliance-bench-2026-06-26","st":0,"d":11,"t":11,"b":50,"e":51,"o":22,"dep":[],"ext":[],"od":[]},{"s":"event-counter-noise-reduction-2026-06-06","st":0,"d":6,"t":7,"b":30,"e":30,"o":0,"dep":[],"ext":[],"od":[]},{"s":"frontdoor-agent-ux-nuxt-feature-flag-wiring-2026-05-29","st":1,"d":0,"t":8,"b":21,"e":22,"o":0,"dep":[],"ext":[],"od":[]},{"s":"gold-free-extraction-automation-2026-05-31","st":1,"d":2,"t":11,"b":24,"e":28,"o":0,"dep":[],"ext":[],"od":[]},{"s":"execplan-board-fidelity-states-console-cost-2026-06-26","st":0,"d":3,"t":4,"b":50,"e":50,"o":5,"dep":["execplan-lineage-provenance-open-questions-2026-06-25"],"ext":["execplan-token-burn-per-execplan-2026-06-26","generative-execplans-and-deploy-coordination-2026-06-26"],"od":[]},{"s":"embedder-pool-distribution-manager-2026-07-01","st":1,"d":2,"t":6,"b":55,"e":55,"o":11,"dep":[],"ext":["unified-retrieval-hardening-2026-07-02"],"od":[]},{"s":"enwiki-prose-dedicated-serving-data-1-2026-07-03","st":0,"d":1,"t":6,"b":64,"e":64,"o":0,"dep":["claims-resident-bm25-and-next-steps-2026-06-30","unified-production-claims-source-2026-06-30","wikicrux-full-enwiki-ingest-2026-06-28"],"ext":["wikicrux-adoption-telemetry-and-corpus-flywheel-2026-07-09"],"od":[]},{"s":"embedder-pool-per-tenant-bundle-2026-06-16","st":0,"d":5,"t":5,"b":40,"e":40,"o":12,"dep":[],"ext":[],"od":[]},{"s":"enwiki-claims-coverage-expansion-2026-07-04","st":1,"d":2,"t":6,"b":64,"e":64,"o":0,"dep":[],"ext":[],"od":[]},{"s":"esi-v2-live-fact-write-path-2026-06-03","st":0,"d":0,"t":4,"b":27,"e":27,"o":0,"dep":[],"ext":[],"od":[]},{"s":"engine-ci-layer-7-remaining-highs-2026-05-21","st":0,"d":0,"t":4,"b":14,"e":14,"o":0,"dep":[],"ext":[],"od":[]},{"s":"enwiki-prose-ranking-quality-2026-07-03","st":0,"d":3,"t":5,"b":64,"e":64,"o":0,"dep":[],"ext":[],"od":["OD-1","OD-2"]},{"s":"cuecrux-feature-registry-and-router-2026-05-26","st":0,"d":0,"t":17,"b":19,"e":19,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-http-ingress-hardening-2026-06-11","st":1,"d":4,"t":5,"b":35,"e":36,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-self-hosting-hygiene-2026-06-05","st":0,"d":4,"t":5,"b":29,"e":29,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-prod-deploy-2026-06-05","st":0,"d":3,"t":4,"b":29,"e":29,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-gateway-production-2026-06-10","st":0,"d":0,"t":1,"b":34,"e":35,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-mcp-oauth-for-hosted-clients-2026-06-23","st":1,"d":5,"t":8,"b":47,"e":49,"o":44,"dep":[],"ext":[],"od":["OD-3","OD-24"]},{"s":"crux-session-capability-graph-completion-2026-06-08","st":1,"d":1,"t":5,"b":32,"e":32,"o":0,"dep":[],"ext":[],"od":[]},{"s":"cruxengine-companion-installer-deploy-hardening-2026-07-12","st":0,"d":4,"t":4,"b":66,"e":66,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-repo-audit-fixing-2026-06-15","st":0,"d":8,"t":8,"b":39,"e":39,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-moat-m4-memory-hook-m8-buyer-package-2026-06-11","st":0,"d":0,"t":2,"b":35,"e":35,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-repo-audit-hardening-followup-2026-06-15","st":0,"d":0,"t":1,"b":39,"e":39,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-signed-session-recorder-2026-06-21","st":0,"d":3,"t":3,"b":46,"e":46,"o":40,"dep":[],"ext":[],"od":[]},{"s":"crux-hook-client-wire-activity-2026-06-22","st":0,"d":5,"t":5,"b":46,"e":46,"o":38,"dep":[],"ext":[],"od":[]},{"s":"crux-headroom-token-efficiency-learnings-2026-06-24","st":0,"d":3,"t":6,"b":48,"e":49,"o":17,"dep":[],"ext":[],"od":[]},{"s":"crux-orchestrator-orcplan-2026-05-29","st":0,"d":0,"t":7,"b":22,"e":22,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-punchcard-resource-leases-2026-05-29","st":0,"d":0,"t":7,"b":22,"e":22,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-session-archive-and-friendly-titles-2026-06-13","st":0,"d":2,"t":7,"b":37,"e":37,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-growth-upsell-master-2026-06-11","st":1,"d":0,"t":4,"b":35,"e":36,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-mcp-notification-202-native-http-2026-07-06","st":0,"d":1,"t":3,"b":60,"e":61,"o":4,"dep":[],"ext":[],"od":[]},{"s":"crux-work-panel-execplans-as-truenorth-2026-05-26","st":0,"d":8,"t":8,"b":19,"e":20,"o":0,"dep":[],"ext":["execplan-lineage-provenance-open-questions-2026-06-25","generative-execplans-and-deploy-coordination-2026-06-26"],"od":[]},{"s":"crux-tenant-category-model-2026-05-22","st":0,"d":7,"t":7,"b":15,"e":15,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-new-tool-probe-fixes-2026-06-05","st":0,"d":3,"t":8,"b":29,"e":29,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-response-contract-v1-default-schema-2026-06-08","st":0,"d":6,"t":7,"b":32,"e":34,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-supply-chain-attestation-2026-06-11","st":0,"d":5,"t":5,"b":35,"e":48,"o":47,"dep":[],"ext":[],"od":[]},{"s":"cruxengine-companion-lane-port-2026-06-09","st":0,"d":7,"t":7,"b":33,"e":34,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-mcp-dynamic-tool-surface-2026-06-08","st":0,"d":1,"t":6,"b":32,"e":34,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-log-redaction-2026-06-11","st":1,"d":3,"t":5,"b":35,"e":36,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-integration-platform-surfaces","st":0,"d":0,"t":7,"b":31,"e":31,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-session-capability-catalog-refresh-2026-05-29","st":0,"d":0,"t":6,"b":21,"e":21,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-segment-integrity-audit-remediation-2026-06-13","st":0,"d":7,"t":7,"b":37,"e":37,"o":2,"dep":[],"ext":[],"od":[]},{"s":"crux-moat-track-master-2026-06-05","st":1,"d":0,"t":9,"b":35,"e":66,"o":90,"dep":[],"ext":[],"od":[]},{"s":"crux-agent-presence-coordination-2026-06-11","st":0,"d":0,"t":7,"b":35,"e":35,"o":1,"dep":[],"ext":[],"od":[]},{"s":"crux-config-wizard-dedup-lint-2026-06-23","st":0,"d":5,"t":5,"b":47,"e":47,"o":37,"dep":[],"ext":[],"od":["OD-18"]},{"s":"crux-audit-ii-gap-closure-codebase-audit-2026-06-13","st":0,"d":4,"t":4,"b":37,"e":37,"o":2,"dep":[],"ext":[],"od":[]},{"s":"crux-agent-passport-grouped-collaboration-2026-06-05","st":0,"d":5,"t":5,"b":29,"e":29,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-console-graph-cutover-2026-05-30","st":0,"d":0,"t":1,"b":23,"e":23,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-console-public-exposure-2026-05-17","st":1,"d":0,"t":6,"b":11,"e":11,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-daemon-full-audit-2026-06-05","st":0,"d":6,"t":6,"b":29,"e":29,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-dual-surface-activity-log-2026-06-18","st":0,"d":5,"t":5,"b":42,"e":46,"o":51,"dep":[],"ext":[],"od":[]},{"s":"cross-model-agreement-router-2026-06-04","st":0,"d":2,"t":3,"b":28,"e":28,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-audit-ii-gap-closure-implementation-2026-06-14","st":0,"d":14,"t":14,"b":38,"e":38,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-console-3d-substrate-concept-2026-06-11","st":0,"d":1,"t":4,"b":35,"e":35,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-daemon-security-gap-scan-2026-06-12","st":0,"d":3,"t":4,"b":36,"e":36,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crucible-gateway-supersede-clawd-2026-06-26","st":0,"d":0,"t":1,"b":50,"e":50,"o":5,"dep":[],"ext":[],"od":[]},{"s":"crux-freshness-dogfood-2026-06-04","st":0,"d":4,"t":8,"b":28,"e":29,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-daemon-console-lane-weights-2026-06-13","st":0,"d":7,"t":7,"b":37,"e":37,"o":2,"dep":[],"ext":[],"od":[]},{"s":"crux-credit-burn-rail-2026-06-22","st":1,"d":1,"t":7,"b":61,"e":62,"o":2,"dep":[],"ext":["portfolio-burn-down-orchestration-2026-07-10"],"od":[]},{"s":"crux-daemon-v8-coverage-scan-2026-06-13","st":0,"d":3,"t":3,"b":37,"e":37,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-domain-substrate-and-features-lens-2026-05-18","st":0,"d":6,"t":7,"b":11,"e":11,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crucible-control-plane-and-deep-retrieval-2026-06-18","st":1,"d":0,"t":1,"b":48,"e":50,"o":53,"dep":[],"ext":[],"od":[]},{"s":"crux-console-data-plane-wiring-2026-05-21","st":0,"d":3,"t":6,"b":14,"e":14,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-external-findings-remediation-2026-07-10","st":0,"d":7,"t":7,"b":64,"e":65,"o":3,"dep":[],"ext":[],"od":[]},{"s":"crux-daemon-hardening-audit-findings-2026-06-07","st":0,"d":6,"t":6,"b":31,"e":31,"o":0,"dep":[],"ext":[],"od":[]},{"s":"cross-session-identity-resolution-2026-06-15","st":0,"d":7,"t":7,"b":39,"e":39,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-console-lane-weight-polish-2026-06-14","st":0,"d":6,"t":6,"b":38,"e":38,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-ci-merge-queue-wiring-2026-06-26","st":0,"d":3,"t":4,"b":50,"e":53,"o":20,"dep":[],"ext":[],"od":[]},{"s":"crux-agent-action-ledger-token-accounting-2026-06-11","st":0,"d":6,"t":6,"b":35,"e":48,"o":47,"dep":[],"ext":[],"od":[]},{"s":"crux-activity-log-completion-2026-06-23","st":0,"d":4,"t":5,"b":47,"e":48,"o":38,"dep":[],"ext":[],"od":[]},{"s":"crux-codex-authentication-2026-06-12","st":0,"d":4,"t":4,"b":36,"e":57,"o":76,"dep":[],"ext":[],"od":[]},{"s":"crux-audit-chain-data-contract-2026-05-29","st":0,"d":1,"t":7,"b":22,"e":22,"o":0,"dep":[],"ext":[],"od":[]},{"s":"crux-agent-passport-mcp-binding-2026-06-10","st":0,"d":0,"t":1,"b":34,"e":34,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-skip-companions-projection-control-2026-05-29","st":0,"d":0,"t":1,"b":21,"e":22,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecruxd-c2pa-vault-pki-runtime-enablement-2026-05-29","st":1,"d":0,"t":7,"b":21,"e":21,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecruxd-boost-overlay-persistence-2026-05-21","st":0,"d":1,"t":6,"b":14,"e":15,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-turboquant-ccxe-quant-mode","st":1,"d":0,"t":6,"b":36,"e":36,"o":11,"dep":[],"ext":[],"od":[]},{"s":"corecrux-trait-expansion-lme-s-structural-losses-2026-05-21","st":0,"d":3,"t":6,"b":14,"e":15,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-vernacular-v4-schema-and-prefilter-2026-05-20","st":0,"d":0,"t":8,"b":13,"e":13,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-text-search-tenant-isolation-2026-06-30","st":0,"d":5,"t":6,"b":54,"e":54,"o":2,"dep":["corecrux-offline-serving-companions-2026-06-30"],"ext":["ccxi-query-shape-routing-2026-06-30"],"od":[]},{"s":"corpus-segregation-bulk-repartition-2026-06-26","st":0,"d":4,"t":6,"b":50,"e":52,"o":33,"dep":[],"ext":[],"od":[]},{"s":"corecrux-transition-doc-content-plane-contamination-2026-06-12","st":0,"d":2,"t":6,"b":36,"e":37,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-topology-no-link-prune-2026-05-27","st":0,"d":3,"t":6,"b":20,"e":21,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-trait-expansion-global-default-on-2026-05-21","st":1,"d":0,"t":6,"b":14,"e":33,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-trait-expansion-substrate-density-auto-tune-2026-05-21","st":0,"d":4,"t":6,"b":14,"e":15,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecruxd-companion-hot-reload-2026-05-18","st":0,"d":0,"t":6,"b":11,"e":35,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-offline-serving-companions-2026-06-30","st":0,"d":6,"t":6,"b":54,"e":54,"o":34,"dep":[],"ext":["ccxi-query-shape-routing-2026-06-30","corecrux-text-search-tenant-isolation-2026-06-30"],"od":[]},{"s":"corecrux-recstyle-keyword-extension-2026-05-21","st":0,"d":3,"t":5,"b":14,"e":14,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-prometheus-indexmanager-double-count-2026-05-28","st":0,"d":0,"t":3,"b":21,"e":21,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-seal-shard-vs-tick-shard-mismatch-2026-06-01","st":0,"d":0,"t":1,"b":25,"e":25,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-query-expansion-via-trait-embeddings-2026-05-20","st":0,"d":4,"t":6,"b":14,"e":14,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-ingest-extraction-followups-2026-06-11","st":1,"d":6,"t":9,"b":35,"e":36,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-retrieve-agent-shaped-payload-2026-05-15","st":1,"d":2,"t":9,"b":23,"e":24,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-loadedsegment-memstats-2026-05-23","st":0,"d":3,"t":6,"b":15,"e":15,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-gpu1-memory-stabilization-2026-05-28","st":0,"d":2,"t":6,"b":21,"e":24,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-ingest-extraction-top10-2026-06-11","st":0,"d":0,"t":1,"b":35,"e":35,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-query-expansion-rollout-completion-2026-05-21","st":0,"d":3,"t":5,"b":14,"e":35,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-no-link-prune-substrate-rebuild-2026-05-29","st":0,"d":0,"t":1,"b":21,"e":21,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-daemon-fast-startup-2026-06-16","st":0,"d":4,"t":6,"b":40,"e":40,"o":17,"dep":[],"ext":[],"od":[]},{"s":"corecrux-evictor-convergence-2026-05-31","st":0,"d":3,"t":4,"b":24,"e":24,"o":0,"dep":[],"ext":[],"od":[]},{"s":"codex-crux-session-banner-2026-06-01","st":0,"d":8,"t":8,"b":25,"e":29,"o":0,"dep":[],"ext":[],"od":[]},{"s":"chaincrux-phase1-5-event-edges-and-temporal-filter-2026-05-22","st":0,"d":0,"t":8,"b":17,"e":17,"o":0,"dep":[],"ext":[],"od":[]},{"s":"context-mediation-injection-2026-06-11","st":1,"d":6,"t":7,"b":36,"e":36,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-bm25-64bit-tenant-filter-2026-06-13","st":1,"d":0,"t":1,"b":37,"e":37,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-cascade-engagement-lme-s-2026-05-22","st":0,"d":2,"t":6,"b":15,"e":15,"o":0,"dep":[],"ext":[],"od":[]},{"s":"claudeclaw-subscription-sonnet-backend-2026-06-03","st":0,"d":6,"t":6,"b":27,"e":28,"o":0,"dep":[],"ext":[],"od":[]},{"s":"context-bench-v2-100point-thirdparty-board-2026-07-03","st":1,"d":6,"t":7,"b":57,"e":65,"o":22,"dep":["context-dependence-benchmark-scorecrux-2026-07-03"],"ext":[],"od":[]},{"s":"corecrux-document-index-lane-2026-05-15","st":0,"d":0,"t":11,"b":11,"e":11,"o":0,"dep":[],"ext":[],"od":[]},{"s":"chaincrux-phase1-prove-earned-edge-2026-05-22","st":0,"d":0,"t":7,"b":15,"e":15,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-bulk-ingest-at-scale-2026-06-14","st":0,"d":0,"t":1,"b":38,"e":48,"o":61,"dep":[],"ext":[],"od":[]},{"s":"corecrux-bulk-ingest-polish-2026-05-03","st":1,"d":0,"t":1,"b":64,"e":64,"o":0,"dep":[],"ext":[],"od":[]},{"s":"codemap-endpoint-and-agent-docs-hardening-2026-07-10","st":0,"d":4,"t":4,"b":63,"e":63,"o":0,"dep":[],"ext":["codemaps-cross-repo-graph-and-value-expansion-2026-07-10"],"od":[]},{"s":"clawd-unified-daemon-relocation-data1-2026-06-13","st":0,"d":7,"t":7,"b":36,"e":37,"o":0,"dep":[],"ext":[],"od":[]},{"s":"corecrux-evidence-hash-replay-dedup-2026-06-23","st":0,"d":5,"t":5,"b":47,"e":48,"o":44,"dep":[],"ext":[],"od":[]},{"s":"companion-build-429-hardening-2026-06-16","st":0,"d":6,"t":6,"b":40,"e":40,"o":7,"dep":[],"ext":[],"od":[]},{"s":"chaincrux-zero-events-substrate-investigation-2026-05-28","st":1,"d":0,"t":5,"b":21,"e":21,"o":0,"dep":[],"ext":[],"od":[]},{"s":"codemaps-facet-coverage-completion-2026-07-12","st":1,"d":0,"t":6,"b":66,"e":66,"o":0,"dep":["codemaps-cross-repo-graph-and-value-expansion-2026-07-10"],"ext":[],"od":[]},{"s":"corecrux-curator-clustering-spike-2026-07-07","st":0,"d":2,"t":3,"b":61,"e":61,"o":0,"dep":["corecrux-memory-manager-2026-07-05"],"ext":[],"od":[]},{"s":"corecrux-event-lane-rrf-wiring-2026-05-24","st":0,"d":0,"t":8,"b":17,"e":17,"o":0,"dep":[],"ext":[],"od":[]},{"s":"context-custody-surface-2026-06-30","st":0,"d":0,"t":1,"b":54,"e":54,"o":6,"dep":[],"ext":[],"od":[]},{"s":"context-dependence-benchmark-scorecrux-2026-07-03","st":0,"d":1,"t":7,"b":56,"e":57,"o":15,"dep":["mh-ab-v2-harness-build-2026-06-12"],"ext":["context-bench-v2-100point-thirdparty-board-2026-07-03"],"od":[]},{"s":"corecrux-fleet-control-plane-2026-07-03","st":1,"d":1,"t":7,"b":64,"e":64,"o":2,"dep":[],"ext":[],"od":[]},{"s":"codexclaw-deterministic-gate-orchestration-2026-05-26","st":0,"d":1,"t":8,"b":19,"e":35,"o":0,"dep":[],"ext":[],"od":[]},{"s":"chaincrux-cascade-route-integration-2026-05-25","st":0,"d":4,"t":8,"b":18,"e":21,"o":0,"dep":[],"ext":[],"od":[]},{"s":"ccxi-query-shape-routing-2026-06-30","st":1,"d":4,"t":6,"b":54,"e":54,"o":3,"dep":["corecrux-offline-serving-companions-2026-06-30","corecrux-text-search-tenant-isolation-2026-06-30","unified-production-claims-source-2026-06-30","unified-reasoner-encode-evidence-2026-06-29"],"ext":["unified-retrieval-hardening-2026-07-02"],"od":[]},{"s":"audit-ii-gap-closure-hardening-2026-06-14","st":0,"d":0,"t":10,"b":47,"e":47,"o":33,"dep":[],"ext":["domain-index-source-authority-signal-2026-07-08"],"od":[]},{"s":"ast-polyglot-code-graph-and-repo-watch-2026-07-08","st":0,"d":10,"t":10,"b":62,"e":63,"o":2,"dep":[],"ext":[],"od":[]},{"s":"audit-ii-operational-hardening-rollout-2026-06-14","st":0,"d":10,"t":10,"b":38,"e":38,"o":0,"dep":[],"ext":[],"od":[]},{"s":"atlas-manifest-routing-production-2026-06-05","st":0,"d":11,"t":11,"b":29,"e":64,"o":90,"dep":[],"ext":[],"od":["OD-10"]},{"s":"agent-ux-02-acknowledged-memory-use-2026-05-27","st":0,"d":4,"t":4,"b":20,"e":20,"o":0,"dep":[],"ext":[],"od":[]},{"s":"agent-native-noise-reduction-2026-06-08","st":1,"d":0,"t":8,"b":32,"e":65,"o":90,"dep":[],"ext":[],"od":[]},{"s":"agent-ux-03-freshness-decay-2026-05-27","st":0,"d":5,"t":6,"b":20,"e":20,"o":0,"dep":[],"ext":["dense-lane-and-extraction-upsell-2026-06-26"],"od":[]},{"s":"agent-query-eval-corpus-2026-06-07","st":0,"d":0,"t":6,"b":31,"e":31,"o":0,"dep":[],"ext":[],"od":[]},{"s":"agent-ux-best-in-class-master-2026-05-27","st":0,"d":1,"t":9,"b":20,"e":21,"o":0,"dep":[],"ext":[],"od":[]},{"s":"agent-ux-08-identity-continuity-2026-05-27","st":0,"d":3,"t":5,"b":21,"e":21,"o":0,"dep":[],"ext":[],"od":[]},{"s":"agent-ux-05-risk-tiered-hitl-2026-05-27","st":0,"d":3,"t":6,"b":21,"e":21,"o":0,"dep":[],"ext":[],"od":[]},{"s":"agent-ux-07-verifiable-output-receipts-2026-05-27","st":0,"d":5,"t":6,"b":21,"e":21,"o":0,"dep":[],"ext":[],"od":[]},{"s":"agent-ux-04-source-linked-traceability-2026-05-27","st":0,"d":3,"t":5,"b":20,"e":21,"o":0,"dep":[],"ext":["domain-index-source-authority-signal-2026-07-08"],"od":[]},{"s":"agent-ux-06-typed-action-traces-2026-05-27","st":0,"d":5,"t":8,"b":20,"e":20,"o":0,"dep":[],"ext":[],"od":[]},{"s":"agent-ux-11-byo-audit-trail-2026-05-27","st":1,"d":4,"t":6,"b":20,"e":20,"o":0,"dep":[],"ext":[],"od":[]},{"s":"agent-query-eval-lanes-on-retest-2026-06-08","st":0,"d":0,"t":5,"b":32,"e":33,"o":0,"dep":[],"ext":[],"od":[]},{"s":"agent-ux-10-visible-autonomy-contract-2026-05-27","st":0,"d":2,"t":6,"b":20,"e":20,"o":0,"dep":[],"ext":[],"od":[]},{"s":"amr-lane-authority-credit-gating-2026-06-07","st":1,"d":2,"t":7,"b":31,"e":32,"o":0,"dep":[],"ext":["domain-index-source-authority-signal-2026-07-08"],"od":[]},{"s":"agent-config-wizard-2026-05-19","st":0,"d":3,"t":8,"b":12,"e":12,"o":5,"dep":[],"ext":[],"od":[]},{"s":"agent-ux-01-readable-editable-memory-2026-05-27","st":0,"d":4,"t":4,"b":20,"e":20,"o":0,"dep":[],"ext":[],"od":[]},{"s":"agent-harness-testbench-messyworld-2026-06-18","st":1,"d":0,"t":7,"b":41,"e":65,"o":94,"dep":[],"ext":[],"od":[]},{"s":"agent-ux-12-calm-deferred-output-2026-05-27","st":0,"d":0,"t":6,"b":21,"e":21,"o":0,"dep":[],"ext":[],"od":[]},{"s":"agent-ux-09-scoped-forget-2026-05-27","st":0,"d":2,"t":5,"b":20,"e":20,"o":0,"dep":[],"ext":[],"od":[]}];
+
+  var RINGS_RFACTS = [
+  ['sso', 'brief', 'memory', 0.920, 'codex-work', 'medium', 205, 1],
+  ['sso', 'gate:M0', 'gate', 0.936, 'codex-work', 'medium', 205, 1],
+  ['sso', 'decision:topology-corrected-cruxengine', 'decision', 0.948, 'codex-work', 'medium', 207, 1],
+  ['sso', 'milestone:M1-partial', 'memory', 0.990, 'codex-work', 'medium', 275, 1],
+  ['bf', 'gate:M0', 'gate', 1.356, 'codex-work', 'stable', 412, 1],
+  ['sso', 'gate:M1', 'gate', 1.381, 'codex-work', 'medium', 296, 1],
+  ['sso', 'gate:M2', 'gate', 1.649, 'codex-work', 'medium', 236, 1],
+  ['bf', 'gate:M1', 'gate', 1.669, 'codex-work', 'stable', 536, 1],
+  ['sso', 'gate:M3-M4', 'gate', 1.829, 'codex-work', 'medium', 328, 1],
+  ['bf', 'gate:M2', 'gate', 1.847, 'codex-work', 'stable', 463, 1],
+  ['bf', 'gate:M4', 'gate', 1.858, 'codex-work', 'stable', 409, 1],
+  ['bf', 'handoff:2026-07-14', 'handoff', 1.882, 'codex-work', 'stable', 409, 1],
+  ['sso', 'console-v1-removed', 'memory', 1.892, 'codex-work', 'medium', 288, 1],
+  ['bf', 'progress:M3', 'memory', 1.909, 'codex-work', 'volatile', 274, 1],
+  ['bf', 'gate:M3', 'gate', 1.951, 'codex-work', 'stable', 316, 1],
+  ['bf', 'gate:M3', 'gate', 2.032, 'codex-work', 'stable', 215, 2],
+  ['sso', 'console-v1-removed-followup-done', 'memory', 2.891, 'codex-work', 'medium', 329, 1],
+  ['sso', 'gate:M1-R-code', 'gate', 8.597, 'claude-work', 'medium', 127, 1],
+  ['sso', 'decision:vault-target-regression-repair', 'decision', 8.597, 'claude-work', 'stable', 155, 1],
+  ['bf', 'gate:M5b', 'gate', 9.367, 'claude-work', 'stable', 184, 1],
+  ['bf', 'decision:m5b-installer-transaction', 'decision', 9.367, 'claude-work', 'stable', 232, 1],
+];
+
+  var RINGS_GRAPH_RAW = [{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"gate:M1-R-code","d":75.59696759259168,"a":"claude-work","h":"medium","c":1.0,"t":127},{"e":"execplan:verifiable-record-products-2026-07-17","k":"gate:M3-core-pointer-producer-code-2026-07-22","d":76.75865740740846,"a":"claude-work","h":"stable","c":1.0,"t":158},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"gate:M3","d":68.95072916666686,"a":"codex-work","h":"stable","c":1.0,"t":316},{"e":"incident:2026-07-22","k":"gpu1-cargo-deploy-help-side-effect","d":76.43028935185066,"a":"claude-work","h":"stable","c":1.0,"t":291},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"decision:vault-target-regression-repair","d":75.59696759259168,"a":"claude-work","h":"stable","c":1.0,"t":155},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"progress:M3","d":68.90971064814948,"a":"codex-work","h":"volatile","c":1.0,"t":274},{"e":"execplan:production-ethos-audit-harness-2026-07-17","k":"gate:M5","d":74.60589120370423,"a":"codex-work","h":"volatile","c":1.0,"t":323},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"gate:M1","d":68.38157407407562,"a":"codex-work","h":"medium","c":1.0,"t":296},{"e":"execplan:wikicrux-public-readiness-hardening-2026-07-21","k":"gate:M3b-blocked","d":75.82773148148044,"a":"drivew-host","h":"stable","c":1.0,"t":221},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"decision:m5b-installer-transaction","d":76.36789351851985,"a":"claude-work","h":"stable","c":1.0,"t":232},{"e":"incident:2026-07-22","k":"crc-v1-resident-ordinal-handle-alias","d":76.47960648148,"a":"claude-work","h":"stable","c":1.0,"t":185},{"e":"execplan:verifiable-record-products-2026-07-17","k":"gate:M9-evidence-publication","d":76.67115740740701,"a":"claude-work","h":"stable","c":1.0,"t":125},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"brief","d":67.92068287037182,"a":"codex-work","h":"medium","c":1.0,"t":205},{"e":"execplan:wikicrux-m5-pricing-enforcement-2026-07-17","k":"decision:m3b-refund-contract-parity","d":76.02534722222117,"a":"claude-work","h":"stable","c":1.0,"t":153},{"e":"execplan:verifiable-record-products-2026-07-17","k":"gate:M3-engine-consumer-deploy-2026-07-22","d":76.73957175925898,"a":"claude-work","h":"stable","c":1.0,"t":223},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"gate:M0","d":67.93586805555606,"a":"codex-work","h":"medium","c":1.0,"t":205},{"e":"execplan:crux-macaroon-token-attenuation-2026-07-16","k":"design:sync-delegation-convention","d":76.4979745370365,"a":"codex-work","h":"stable","c":1.0,"t":408},{"e":"execplan:crux-macaroon-token-attenuation-2026-07-16","k":"gate:M2prime-hotfix-reviewed-and-reconciliation-plan","d":76.41813657407329,"a":"codex-work","h":"stable","c":1.0,"t":743},{"e":"execplan:wikicrux-market-wedge-offers-2026-07-16","k":"decision:canonical-pricing","d":75.82225694444423,"a":"claude-work","h":"stable","c":1.0,"t":146},{"e":"execplan:wikicrux-m5-pricing-enforcement-2026-07-17","k":"gate:M3b","d":76.02534722222117,"a":"claude-work","h":"stable","c":1.0,"t":223},{"e":"execplan:verifiable-record-products-2026-07-17","k":"gate:M3","d":76.7468518518508,"a":"claude-work","h":"stable","c":1.0,"t":150},{"e":"execplan:cuecrux-selfserve-launch-readiness-2026-07-16","k":"gate:M8-edge-repair","d":76.54800925925883,"a":"claude-work","h":"none","c":1.0,"t":254},{"e":"bench:provenance-byok-local-20260721T174751Z-8e711150","k":"result","d":75.74369212962847,"a":"claude-work","h":"stable","c":1.0,"t":145},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"gate:M3-M4","d":68.8297453703708,"a":"codex-work","h":"medium","c":1.0,"t":328},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"console-v1-removed-followup-done","d":69.89159722222394,"a":"codex-work","h":"medium","c":1.0,"t":329},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"gate:M2","d":68.64881944444278,"a":"codex-work","h":"medium","c":1.0,"t":236},{"e":"execplan:crux-macaroon-token-attenuation-2026-07-16","k":"design:M3prime-sync-enforcement-on-v11","d":76.43527777777854,"a":"codex-work","h":"stable","c":1.0,"t":870},{"e":"incident:2026-07-22","k":"release-v0.5.48-macos-socket-fixture","d":76.56612268518438,"a":"claude-work","h":"stable","c":1.0,"t":147},{"e":"execplan:wikicrux-public-readiness-hardening-2026-07-21","k":"gate:M3b","d":75.84260416666802,"a":"drivew-host","h":"stable","c":1.0,"t":287},{"e":"execplan:wikicrux-market-wedge-offers-2026-07-16","k":"gate:M0","d":75.82225694444423,"a":"claude-work","h":"stable","c":1.0,"t":74},{"e":"execplan:corecrux-object-storage-tier-2026-07-07","k":"gate:G3-code-merge","d":76.63100694444438,"a":"claude-work","h":"stable","c":1.0,"t":125},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"gate:M1","d":68.6698958333327,"a":"codex-work","h":"stable","c":1.0,"t":536},{"e":"execplan:wikicrux-m5-pricing-enforcement-2026-07-17","k":"gate:M5a","d":75.79510416666744,"a":"claude-work","h":"stable","c":1.0,"t":230},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"decision:topology-corrected-cruxengine-14343","d":67.94807870370278,"a":"codex-work","h":"medium","c":1.0,"t":207},{"e":"incident:2026-07-22","k":"passport-mint-pre-m2-approval-live","d":76.75064814814687,"a":"claude-work","h":"stable","c":1.0,"t":203},{"e":"incident:2026-07-22","k":"core-sidecar-snapshot-path","d":76.8100694444438,"a":"claude-work","h":"stable","c":1.0,"t":172},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"gate:M5b","d":76.36789351851985,"a":"claude-work","h":"stable","c":1.0,"t":184},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"handoff:2026-07-14","d":68.88217592592628,"a":"codex-work","h":"stable","c":1.0,"t":409},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"milestone:M1-partial","d":67.99072916666773,"a":"codex-work","h":"medium","c":1.0,"t":275},{"e":"execplan:crux-macaroon-token-attenuation-2026-07-16","k":"gate:M2-rustdoc-fix-and-M3-grounding","d":75.82988425925942,"a":"codex-work","h":"stable","c":1.0,"t":732},{"e":"execplan:sdkcrux-dependency-vuln-remediation-2026-07-20","k":"audit-snapshot","d":74.56193287036876,"a":"codex-work","h":"volatile","c":1.0,"t":415},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"gate:M0","d":68.35657407407416,"a":"codex-work","h":"stable","c":1.0,"t":412},{"e":"execplan:crux-passport-mint-request-gate-2026-07-17","k":"gate:M2.1-integration","d":76.65032407407489,"a":"claude-work","h":"stable","c":1.0,"t":207},{"e":"execplan:cuecrux-selfserve-launch-readiness-2026-07-16","k":"decision:edge-cutover-gate","d":76.54349537036978,"a":"claude-work","h":"none","c":1.0,"t":167},{"e":"incident:2026-07-20","k":"sdkcrux-ci-runner-move-and-stacked-failures","d":74.54767361111226,"a":"codex-work","h":"volatile","c":1.0,"t":564},{"e":"execplan:production-ethos-audit-harness-2026-07-17","k":"gate:M7","d":75.6126157407416,"a":"claude-work","h":"stable","c":1.0,"t":116},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"gate:M2","d":68.84675925926058,"a":"codex-work","h":"stable","c":1.0,"t":463},{"e":"execplan:crux-banner-redesign-2026-07-21","k":"gate:deploy-v0.5.47","d":76.39510416666599,"a":"codex-work","h":"volatile","c":1.0,"t":216},{"e":"execplan:wikicrux-market-wedge-offers-2026-07-16","k":"gate:M1","d":75.82225694444423,"a":"claude-work","h":"medium","c":1.0,"t":162},{"e":"execplan:verifiable-record-products-2026-07-17","k":"gate:M3-deploy-automation-2026-07-22","d":76.7569560185184,"a":"claude-work","h":"stable","c":1.0,"t":175},{"e":"execplan:crux-macaroon-token-attenuation-2026-07-16","k":"incident:M3-M4-collision-with-concurrent-security-hotfix","d":75.92763888889021,"a":"codex-work","h":"stable","c":1.0,"t":822},{"e":"execplan:crux-macaroon-token-attenuation-2026-07-16","k":"gate:M3prime-sync-delegation","d":76.61583333333328,"a":"codex-work","h":"stable","c":1.0,"t":638},{"e":"__work_comment__::w_51752647ca6e4bdbbe4c3b45d30241c9::c_9a7285cbf6604152be964e81d7de0367","k":"record","d":76.73920138888934,"a":null,"h":"none","c":1.0,"t":173},{"e":"execplan:crux-passport-mint-request-gate-2026-07-17","k":"gate:M2-live-containment-2026-07-22","d":76.75064814814687,"a":"claude-work","h":"stable","c":1.0,"t":159},{"e":"execplan:sdkcrux-dependency-vuln-remediation-2026-07-20","k":"gate:M4","d":74.58318287037036,"a":"codex-work","h":"volatile","c":1.0,"t":220},{"e":"execplan:corecrux-object-storage-tier-2026-07-07","k":"gate:G3-prod-safety-recheck","d":76.6583912037022,"a":"claude-work","h":"volatile","c":1.0,"t":131},{"e":"execplan:wikicrux-m5-pricing-enforcement-2026-07-17","k":"gate:M3a-harness","d":75.91656249999869,"a":"claude-work","h":"stable","c":1.0,"t":244},{"e":"execplan:production-ethos-audit-harness-2026-07-17","k":"gate:M4","d":74.578125,"a":"codex-work","h":"volatile","c":1.0,"t":344},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"gate:M4","d":68.85881944444554,"a":"codex-work","h":"stable","c":1.0,"t":409},{"e":"execplan:crux-passport-mint-request-gate-2026-07-17","k":"gate:M2.1-integration","d":76.64783564814934,"a":"claude-work","h":"stable","c":1.0,"t":185},{"e":"execplan:wikicrux-public-readiness-hardening-2026-07-21","k":"gate:M3b","d":75.9136111111111,"a":"drivew-host","h":"stable","c":1.0,"t":293},{"e":"execplan:cross-site-auth-sso-cuecrux-2026-07-13","k":"console-v1-removed","d":68.89186342592438,"a":"codex-work","h":"medium","c":1.0,"t":288},{"e":"incident:2026-07-22","k":"vaultcrux-public-edge-loopback-regression","d":76.54800925925883,"a":"claude-work","h":"stable","c":1.0,"t":157},{"e":"incident:2026-07-22","k":"legal-hold-canary-mcp-auth-mismatch","d":76.43935185185182,"a":"codex-work","h":"stable","c":1.0,"t":214},{"e":"execplan:crux-daemon-buyer-fit-buildout-2026-07-13","k":"gate:M3","d":69.03211805555475,"a":"codex-work","h":"stable","c":1.0,"t":215},{"e":"incident:2026-07-22","k":"legal-hold-canary-mcp-auth-mismatch","d":76.43893518518598,"a":"codex-work","h":"stable","c":1.0,"t":214}];
+
+  // =========================================================================
+  //  Rings — the "clock of work" (console-surfaces-remediation M10). NATIVE
+  //  port of UI-prototype/rings-clock/console-mock.html: a canvas 2D engine
+  //  that replays the real ExecPlan portfolio as an animated ring, with lens
+  //  tiles, a control bar, and a slide-out detail pane. Ported from the mock's
+  //  string-built DOM to el()/svgEl() safe construction (no raw HTML strings);
+  //  every raw network read rewired to the console's CruxApi client (fetchJSON); an
+  //  explicit teardown cancels the RAF + observers + document/window listeners
+  //  once the canvas leaves the DOM (route change clears #content). Snapshot
+  //  data (RINGS_PLANS_RAW / RINGS_GRAPH_RAW / RINGS_RFACTS) is the honest
+  //  degradation when a live feed is absent.
+  // =========================================================================
+  var __ringsCleanupFn = null;   // module-scope teardown handle (see renderRings)
+
+  // =========================================================================
+  //  M25 — "ExecPlans arc" rings lens: the pure model layer.
+  //  ------------------------------------------------------------------------
+  //  A STRICTLY ADDITIVE sixth lens. Every function below is pure (plain data
+  //  in, plain data out) and exported, so the smoke unit-tests the arc's maths
+  //  instead of asserting on a canvas. Nothing here touches the other lenses.
+  //
+  //  Geometry contract: a 270° arc from 12 o'clock sweeping CLOCKWISE to
+  //  9 o'clock. The angular axis is "fraction of the plan's declared milestones"
+  //  — 12 o'clock is 0%, 9 o'clock is 100%. A plan's drawn arc is its progress
+  //  along that axis, so a just-started plan is a line at 12 and a finished plan
+  //  reaches 9.
+  // =========================================================================
+  var ARC_ACTIVE_STATES = ['in_progress', 'blocked', 'review', 'drafting'];
+  var ARC_TRACK_CAP = 16;          // readable ceiling (measured: 16 tracks ≈ 15px apart at the default fit)
+  var ARC_DONE_SLOTS = 4;          // of the cap, how many go to recently-completed (fading) plans
+  var ARC_FADE_DAYS = 10;          // a completed plan fades to nothing over this many days, then the stack collapses
+  var ARC_DAY_MS = 86400000;
+  // Nominal fractions for plans that report NO milestone position. These are
+  // estimates, never presented as measurement: arcProgress returns measured:false
+  // and the lens draws those arcs DASHED with a stated note.
+  // (complete/archive never reach this map — arcProgress short-circuits them.)
+  var ARC_STATE_FRAC = { review: 0.8, in_progress: 0.35, blocked: 0.35, drafting: 0.06, planned: 0.02 };
+
+  // "M7" / "M3.2" → 7 / 3.2. Null when the string is not a milestone id.
+  function arcMilestoneNum(s) {
+    var m = /^M(\d+(?:\.\d+)?)/.exec(String(s == null ? '' : s).trim());
+    return m ? parseFloat(m[1]) : null;
+  }
+  // "gate:M7" / "milestone:M3.2" → 7 / 3.2 (the fact keys the ExecPlan
+  // convention actually writes — see CLAUDE.md fact-storage conventions).
+  function arcKeyMilestone(key) {
+    var m = /^(?:gate|milestone):M(\d+(?:\.\d+)?)/.exec(String(key == null ? '' : key));
+    return m ? parseFloat(m[1]) : null;
+  }
+  // How far round the arc a plan has swept, and WHERE that number came from.
+  //   milestone — current_milestone ("M7") over milestones_total. Measured.
+  //   done      — milestones_done over milestones_total. Measured.
+  //   state     — nothing reported: a nominal fraction from the plan's state.
+  //               measured:false, and the lens says so on the canvas.
+  function arcProgress(w) {
+    var total = Number(w && w.milestones_total) || 0;
+    // A plan the board calls complete IS complete: its arc reaches 9 o'clock.
+    // The milestone counters lag on real plans (a plan can close with
+    // milestones_done still at 2 of 6 — measured on the review corpus), and the
+    // declared state is the stronger, equally real signal.
+    var stx = String((w && w.state) || '');
+    if (stx === 'complete' || stx === 'archive') { return { f: 1, via: 'complete', measured: true, total: total }; }
+    var cur = arcMilestoneNum(w && w.current_milestone);
+    if (cur != null && total > 0) { return { f: Math.max(0, Math.min(1, cur / total)), via: 'milestone', measured: true, total: total }; }
+    var done = Number(w && w.milestones_done) || 0;
+    if (done > 0 && total > 0) { return { f: Math.max(0, Math.min(1, done / total)), via: 'done', measured: true, total: total }; }
+    var st = String((w && w.state) || '');
+    var f = ARC_STATE_FRAC[st];
+    return { f: f === undefined ? 0.02 : f, via: 'state', measured: false, total: total };
+  }
+  // When the plan started. provenance.first_activity_unix_ms is the plan's own
+  // earliest recorded activity (the daemon derives it from the plan's facts);
+  // created_at_unix_ms is the aggregator's record. Both are real; the source is
+  // reported rather than blended.
+  function arcStartMs(w) {
+    var p = w && w.provenance;
+    if (p && Number(p.first_activity_unix_ms) > 0) { return { ms: Number(p.first_activity_unix_ms), via: 'provenance.first_activity' }; }
+    return { ms: Number(w && w.created_at_unix_ms) || 0, via: 'created_at' };
+  }
+  function arcBurn(w) {
+    var b = w && w.token_burn;
+    if (!b) { return null; }
+    var t = (Number(b.context_tokens) || 0) + (Number(b.output_tokens) || 0);
+    return t > 0 ? t : null;
+  }
+  // The honest default population for a 1,000+ plan corpus: every ACTIVE plan
+  // (newest activity first) up to the cap, with a few slots reserved for plans
+  // that completed recently — those are the ones mid-fade, and dropping them
+  // would hide the completion animation the lens exists to show.
+  // Returns the tracks in RADIAL order: index 0 is the newest plan (innermost);
+  // the oldest lands at the outer edge.
+  function arcSelectPlans(items, nowMs, cap) {
+    cap = cap || ARC_TRACK_CAP;
+    var ex = (items || []).filter(function (w) { return w && typeof w.id === 'string' && w.id.indexOf('execplan:') === 0; });
+    var byUpd = function (a, b) { return (Number(b.updated_at_unix_ms) || 0) - (Number(a.updated_at_unix_ms) || 0); };
+    var active = ex.filter(function (w) { return ARC_ACTIVE_STATES.indexOf(w.state) >= 0; }).sort(byUpd);
+    var recent = ex.filter(function (w) {
+      return w.state === 'complete' && (nowMs - (Number(w.updated_at_unix_ms) || 0)) <= ARC_FADE_DAYS * ARC_DAY_MS;
+    }).sort(byUpd);
+    var nDone = Math.min(recent.length, ARC_DONE_SLOTS, Math.max(0, cap - Math.min(active.length, cap - ARC_DONE_SLOTS)));
+    var picked = active.slice(0, cap - nDone).concat(recent.slice(0, nDone));
+    picked.sort(function (a, b) { return arcStartMs(b).ms - arcStartMs(a).ms; });   // newest start innermost
+    return { picked: picked, total: ex.length, active: active.length, completing: nDone, cap: cap };
+  }
+  // Where one fact sits on a plan's arc, and how that position was derived.
+  //   index  — the key names a milestone (gate:M7 / milestone:M3.2) and the plan
+  //            declares a total: n/total, exactly the arc's own axis.
+  //   bucket — no milestone in the key, but the plan HAS indexed milestone facts:
+  //            interpolate between the two bracketing it in time, i.e. the
+  //            milestone bucket the fact was written in.
+  //   time   — neither is available: the fact's fraction of the plan's own fact
+  //            timeline. Declared on the canvas, not hidden.
+  // `marks` must be the plan's indexed facts as [{ ms, f }] sorted by ms.
+  function arcFactFrac(fact, total, marks, t0, t1) {
+    var idx = arcKeyMilestone(fact && fact.key);
+    if (idx != null && total > 0) { return { f: Math.max(0, Math.min(1, idx / total)), via: 'index' }; }
+    var ms = Number(fact && fact.ms) || 0;
+    if (marks && marks.length) {
+      var lo = null, hi = null;
+      for (var i = 0; i < marks.length; i++) {
+        if (marks[i].ms <= ms) { lo = marks[i]; } else { hi = marks[i]; break; }
+      }
+      if (lo && hi && hi.ms > lo.ms) { return { f: lo.f + (hi.f - lo.f) * ((ms - lo.ms) / (hi.ms - lo.ms)), via: 'bucket' }; }
+      if (lo && !hi) { return { f: lo.f, via: 'bucket' }; }
+      if (!lo && hi) { return { f: hi.f * (hi.ms > t0 ? Math.max(0, Math.min(1, (ms - t0) / (hi.ms - t0))) : 0), via: 'bucket' }; }
+    }
+    if (t1 > t0) { return { f: Math.max(0, Math.min(1, (ms - t0) / (t1 - t0))), via: 'time' }; }
+    return { f: 0, via: 'time' };
+  }
+  // A completed plan's opacity as the clock passes its completion: 1 at the
+  // moment it completes, 0 after ARC_FADE_DAYS. Non-complete plans never fade.
+  // Zero also for a plan that has not STARTED as of the scrub time — that is how
+  // a new plan enters and pushes the older tracks outward.
+  function arcAlphaAt(track, atMs) {
+    if (!track || atMs < track.startMs) { return 0; }
+    if (!track.done) { return 1; }
+    var age = (atMs - track.doneMs) / ARC_DAY_MS;
+    if (age <= 0) { return 1; }
+    return Math.max(0, 1 - age / ARC_FADE_DAYS);
+  }
+  // Fact kind → the dot vocabulary. Hues come from the ring's existing KIND_HUE
+  // palette (gate/decision/handoff/memory), so the arc adds no new colours.
+  function arcDotKind(key) {
+    var k = String(key == null ? '' : key);
+    if (/^(?:gate|milestone):/.test(k)) { return 'milestone'; }
+    if (/^decision:/.test(k)) { return 'decision'; }
+    if (/^handoff/.test(k)) { return 'handoff'; }
+    return 'fact';
+  }
+
+  function renderRings(container, ctxIn) {
+    ctxIn = ctxIn || {};
+    // Tear down any previous instance (re-entry / rings→rings) before building.
+    if (typeof __ringsCleanupFn === 'function') { try { __ringsCleanupFn(); } catch (e) { /* noop */ } __ringsCleanupFn = null; }
+    container.textContent = '';
+
+    var REDUCED = (typeof matchMedia === 'function') && matchMedia('(prefers-reduced-motion: reduce)').matches;
+    // M11 — data-graph node cap raised 2,000 → 10,000 (feasibility-verified: the
+    // batched drawDataLens renders the mirror's full ~3.7K visible facts at 60fps,
+    // ~1.5ms/frame, so 10K stays well inside the frame budget).
+    var RINGS_NODE_CAP = 10000;
+    var MONO = 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+    var TAU = Math.PI * 2;
+    var mix = function (a, b, k) { return a + (b - a) * k; };
+    function mulberry32(a) {
+      return function () {
+        a |= 0; a = a + 0x6D2B79F5 | 0;
+        var t = Math.imul(a ^ a >>> 15, 1 | a);
+        t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+        return ((t ^ t >>> 14) >>> 0) / 4294967296;
+      };
+    }
+    function hex2rgba(hex, a) {
+      var n = parseInt(hex.slice(1), 16);
+      return 'rgba(' + (n >> 16 & 255) + ',' + (n >> 8 & 255) + ',' + (n & 255) + ',' + Math.max(0, Math.min(1, a)) + ')';
+    }
+
+    // ---- DOM scaffold (replaces the mock's markup; refs kept, no getElementById) ----
+    var root = el('div', { 'class': 'rings-root' });
+    var stage = el('div', { 'class': 'rings-stage' });
+    var cv = el('canvas', { 'class': 'rings-canvas', 'aria-label': 'Rings: the ExecPlan portfolio replayed as an animated clock; tiles switch the lens' });
+    stage.appendChild(cv);
+
+    // ---- top-right unified card group (M11): the lens switchers and the daemon
+    //      glance merged into ONE colour-coded tile group, each with a sparkline.
+    //      Lens tiles stay clickable (switch the ring lens); glance tiles are
+    //      read-outs. Colour-coding + mini-charts follow the Overwatch tile idiom;
+    //      hues are the ring's own kind/state palette (this region is dark-fixed).
+    function tileEl(lens, hue, label, n) {
+      var nEl = el('span', { 'class': 'n', text: n });
+      var sp = el('span', { 'class': 'sp', 'aria-hidden': 'true' });
+      var b = el('button', { 'class': 'rings-tile rings-card', type: 'button', 'data-lens': lens, 'aria-pressed': lens === 'work' ? 'true' : 'false', style: '--h:' + hue },
+        [el('span', { 'class': 't' }, [el('i', { style: 'background:' + hue }), label]), nEl, sp]);
+      return { b: b, n: nEl, sp: sp, hue: hue };
+    }
+    var tWork = tileEl('work', '#a78bfa', 'ExecPlans', '1,040');
+    // M25 — the sixth lens tile. Registered exactly like the five above (same
+    // tileEl, same tileByLens registry, same click handler loop); the existing
+    // five are untouched. Chartless on purpose: its headline is "tracks shown of
+    // plans in the corpus", which is a ratio, not a per-day series.
+    var tArc = tileEl('arc', '#34d399', 'ExecPlans arc', '—');
+    var tData = tileEl('data', '#8b96f2', 'Data graph', '66');
+    var tMem = tileEl('memory', '#2dd4bf', 'Memory', '21');
+    var tSess = tileEl('sessions', '#22d3ee', 'Sessions', '32');
+    var tTok = tileEl('tokens', '#f5a623', 'Tokens', '—');
+    var tileByLens = { work: tWork, arc: tArc, data: tData, memory: tMem, sessions: tSess, tokens: tTok };
+
+    function glEl(label, n, hue) {
+      var nEl = el('span', { 'class': 'n', text: n });
+      var sp = el('span', { 'class': 'sp', 'aria-hidden': 'true' });
+      return { el: el('div', { 'class': 'rings-gl rings-card rings-stat', style: '--h:' + hue }, [el('span', { 'class': 't' }, [el('i', { style: 'background:' + hue }), label]), nEl, sp]), n: nEl, sp: sp, hue: hue };
+    }
+    // M19 — the M11 merge left overlapping metrics: the "execplans" glance
+    // duplicated the ExecPlans lens tile (both = /v1/work count) and the "sessions"
+    // glance duplicated the Sessions lens tile (both = stores.sessions). The lower
+    // duplicates are REMOVED. The "facts" glance stays (total store — distinct from
+    // the Data-graph tile's rendered visible-node count). glMcp/glInt/glEngine are
+    // genuinely scalar (agent count · integration count · engine on/off) → chartless.
+    var glFacts = glEl('facts', '5,026', '#8b96f2');
+    var glMcp = glEl('mcp agents', '5', '#34d399'), glInt = glEl('integrations', '3', '#f5a623'), glEngine = glEl('engine', 'off', '#7e8595');
+    var cards = el('div', { 'class': 'rings-cards', role: 'group', 'aria-label': 'Ring lenses and daemon glance' },
+      [tWork.b, tArc.b, tData.b, tMem.b, tSess.b, tTok.b, glFacts.el, glMcp.el, glInt.el, glEngine.el]);
+    stage.appendChild(cards);
+    // M19 — real per-day series for the sessions tile (filled from
+    // /v1/console/sessions last_active_unix_ms in liveInit); null until fetched.
+    var SESS_DAYS = null;
+
+    // ---- unified SVG icon set (M11) — one viewBox / one stroke-width / one
+    //      family, matching the Command rail + Explore rail glyphs. ----
+    function ricon(inner) { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' + inner + '</svg>'; }
+    var RIC = {
+      kinds: ricon('<path d="M3 5.5h18l-7 8v5l-4 2v-7z"/>'),
+      agents: ricon('<circle cx="12" cy="9" r="3"/><path d="M6 20a6 6 0 0 1 12 0"/>'),
+      help: ricon('<circle cx="12" cy="12" r="9"/><path d="M9.7 9.3a2.3 2.3 0 0 1 4.5.7c0 1.5-2.2 1.8-2.2 3"/><circle cx="12" cy="16" r=".7" fill="currentColor" stroke="none"/>'),
+      zin: ricon('<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3M11 8.2v5.6M8.2 11h5.6"/>'),
+      zout: ricon('<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3M8.2 11h5.6"/>'),
+      fit: ricon('<path d="M9 4H5a1 1 0 0 0-1 1v4M15 4h4a1 1 0 0 1 1 1v4M9 20H5a1 1 0 0 1-1-1v-4M15 20h4a1 1 0 0 1 1-1v-4"/>'),
+      close: ricon('<path d="M6 6l12 12M18 6L6 18"/>'),
+      // M12 — the top-left tool toggles, unified into the same SVG family
+      // (24 viewBox · 1.8 stroke) — completes the icon unification A2 skipped.
+      spin: ricon('<path d="M20.5 12a8.5 8.5 0 1 1-2.4-5.9"/><path d="M20.5 4.5v3.6h-3.6"/>'),
+      clock: ricon('<circle cx="12" cy="12" r="8.5"/><path d="M12 7v5l3.2 2"/>'),
+      mode: ricon('<circle cx="12" cy="12" r="1.7"/><path d="M12 4v4.6M12 15.4V20M4 12h4.6M15.4 12H20M6.4 6.4l3.2 3.2M14.4 14.4l3.2 3.2M17.6 6.4l-3.2 3.2M9.6 14.4l-3.2 3.2"/>'),
+      dir: ricon('<path d="M12 3v8M12 3l-3 3M12 3l3 3M12 21v-8M12 21l-3-3M12 21l3-3"/>'),
+      census: ricon('<circle cx="12" cy="12" r="8" stroke-dasharray="2 2.6"/><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/>'),
+      done: ricon('<path d="M20 6.5L9.5 17 4 11.5"/>'),
+      ledger: ricon('<path d="M4 6.5h16M4 12h16M4 17.5h10"/>'),
+      state: ricon('<circle cx="12" cy="12" r="8.5"/><path d="M12 3.5a8.5 8.5 0 0 1 0 17z" fill="currentColor" stroke="none"/>'),
+      lineage: ricon('<circle cx="7" cy="7" r="2"/><circle cx="17" cy="17" r="2"/><path d="M9 7h4a2 2 0 0 1 2 2v6"/>'),
+      play: ricon('<path d="M8 5.5v13l11-6.5z" fill="currentColor"/>'),
+      pause: ricon('<path d="M9 5v14M15 5v14"/>'),
+      // M13 — data-lens connected-focus toggle (same idiom as the canvas focus btn)
+      focus: ricon('<circle cx="12" cy="12" r="3.4"/><path d="M12 2.5v3.4M12 18.1v3.4M2.5 12h3.4M18.1 12h3.4"/>')
+    };
+    function svgIconBtn(cls, svg, aria, extra) {
+      var b = el('button', { 'class': cls, type: 'button', 'aria-label': aria, title: aria });
+      if (extra) { for (var a in extra) { b.setAttribute(a, extra[a]); } }
+      b.innerHTML = svg; return b;
+    }
+
+    // ---- tool toggles (M12: unified SVG icon buttons in the vertical left toolbar;
+    //      svgTool renders an RIC icon toggle — pressed=null → momentary action) --
+    function svgTool(key, title, pressed) {
+      var b = el('button', { 'class': 'ic', type: 'button', title: title, 'aria-label': title });
+      if (pressed !== null) { b.setAttribute('aria-pressed', pressed ? 'true' : 'false'); }
+      b.innerHTML = RIC[key];
+      return b;
+    }
+    var bSpin = svgTool('spin', 'Ambient spin', !REDUCED);
+    var bClock = svgTool('clock', 'Reset clock to 12 (also stops spin)', null);
+    var bMode = svgTool('mode', 'Bars: spoke from centre to each node', true);
+    var bDir = svgTool('dir', 'Time edge: outward (rings grow) / inward (nodes sink from rim)', false);
+    var bAll = svgTool('census', 'Census: every plan stays on the clock; hover names sectors', false);
+    var bDone = svgTool('done', 'Show completed plans on the clock (auto-on during playback)', false);
+    var bLedger = svgTool('ledger', 'Completed-plans list (left). Auto-shows during playback; hides on lens swap.', false);
+    var bState = svgTool('state', 'State colours: complete green · in progress purple · blocked red', false);
+    var bLin = svgTool('lineage', 'Lineage chords (depends_on)', false);
+    var grpTools = el('span', { 'class': 'grp' }, [bSpin, bClock, bMode, bDir, bAll, bDone, bLedger, bState, bLin]);
+
+    var bTokCum = el('button', { type: 'button', 'aria-pressed': 'true', title: 'Running total across the window' }, ['cumulative']);
+    var bTokDay = el('button', { type: 'button', 'aria-pressed': 'false', title: 'Tokens per day' }, ['per day']);
+    var grpTokViews = el('span', { 'class': 'grp toktoggle' }, [bTokCum, bTokDay]); grpTokViews.style.display = 'none';
+
+    // ---- M13: data-lens connected-focus toggle (only meaningful in the data
+    //      graph lens; shown just for that lens, like the token toggle). ----
+    var bDataFocus = svgTool('focus', 'Focus: isolate the selected fact node and its connections', false);
+    var grpDataFocus = el('span', { 'class': 'grp' }, [bDataFocus]); grpDataFocus.style.display = 'none';
+
+    // ---- kinds / agents filters → icon buttons that expand a popover menu ----
+    // Single-select (matches the fKind / fAgent state); active state stays visible
+    // when collapsed via a dot + the selected value on the icon.
+    var openPop = null, openPopBtn = null;
+    function closePop() { if (openPop) { openPop.hidden = true; if (openPopBtn) { openPopBtn.setAttribute('aria-expanded', 'false'); } openPop = null; openPopBtn = null; } }
+    function togglePop(panel, btn) { if (openPop === panel) { closePop(); return; } closePop(); panel.hidden = false; btn.setAttribute('aria-expanded', 'true'); openPop = panel; openPopBtn = btn; var f = panel.querySelector('[aria-checked="true"]') || panel.querySelector('.rings-pop-row'); if (f) { f.focus(); } }
+    function filterMenu(svg, aria, items, getVal, setVal) {
+      var badge = el('span', { 'class': 'fbadge', 'aria-hidden': 'true' });
+      var btn = svgIconBtn('rings-iconbtn rings-filterbtn', svg, aria, { 'aria-haspopup': 'true', 'aria-expanded': 'false' });
+      btn.appendChild(badge);
+      var panel = el('div', { 'class': 'rings-pop', role: 'menu', 'aria-label': aria });
+      panel.hidden = true;
+      panel.appendChild(el('div', { 'class': 'rings-pop-h', text: aria }));
+      var rows = {};
+      items.forEach(function (it) {
+        var row = el('button', { 'class': 'rings-pop-row', type: 'button', role: 'menuitemradio', 'aria-checked': 'false', 'data-val': it[0] },
+          [el('i', { 'class': 'dot', style: it[2] ? 'background:' + it[2] : 'opacity:0' }), el('span', { text: it[1] })]);
+        row.addEventListener('click', function () { setVal(it[0]); sync(); closePop(); btn.focus(); });
+        rows[it[0]] = row; panel.appendChild(row);
+      });
+      function sync() {
+        var v = getVal();
+        Object.keys(rows).forEach(function (k) { rows[k].setAttribute('aria-checked', String(k === v)); });
+        var active = v && v !== 'all';
+        btn.setAttribute('data-active', active ? '1' : '0');
+        badge.textContent = active ? v : '';
+      }
+      btn.addEventListener('click', function () { togglePop(panel, btn); });
+      var wrap = el('span', { 'class': 'rings-menuwrap' }, [btn, panel]);
+      sync();
+      return { wrap: wrap, sync: sync };
+    }
+    var kindMenu = filterMenu(RIC.kinds, 'Filter by node kind',
+      [['all', 'all kinds', ''], ['gate', 'gates', '#2dd4bf'], ['decision', 'decisions (OD)', '#a78bfa'], ['memory', 'memory', '#8b96f2'], ['handoff', 'handoffs', '#f5a623']],
+      function () { return fKind; }, function (v) { fKind = v; });
+    var agentMenu = filterMenu(RIC.agents, 'Filter by agent passport',
+      [['all', 'all agents', ''], ['claude-work', 'claude-work', '#8b96f2'], ['codex-work', 'codex-work', '#22d3ee']],
+      function () { return fAgent; }, function (v) { fAgent = v; });
+    var helpBtn = svgIconBtn('rings-iconbtn rings-helpbtn', RIC.help, 'How the rings page works', { 'aria-haspopup': 'dialog' });
+    var tools = el('div', { 'class': 'rings-tools' }, [grpTools, kindMenu.wrap, agentMenu.wrap, helpBtn, grpTokViews, grpDataFocus]);
+    stage.appendChild(tools);
+
+    // ---- M19: compact play bar joins the TOPBAR ROW (tab icons + search).
+    //      Layout left→right: static start-range label · play · scrubber · static
+    //      end-range label · live scrub-date. The date PICKERS moved DOWN to the
+    //      bottom bar (task 2); in the play bar's old date slots we now render
+    //      NON-clickable muted range labels (aria-hidden — assistive tech reaches
+    //      the real, interactive pickers in the bottom bar). Mounted into
+    //      ctxIn.tabSlot next to the tab icons; the scrubber shrinks before wrap. --
+    var lblStart = el('span', { 'class': 'rings-rangelabel', 'aria-hidden': 'true', text: '2026-05-18' });
+    var lblEnd = el('span', { 'class': 'rings-rangelabel', 'aria-hidden': 'true', text: '2026-07-22' });
+    var bPlay = svgTool('play', 'Replay the window', false);
+    var rTime = el('input', { type: 'range', min: '0', max: '1000', value: '1000', 'aria-label': 'Time', 'class': 'rings-timeline' });
+    var cDate = el('span', { 'class': 'rings-playdate', text: '2026-07-22' });
+    var playbar = el('div', { 'class': 'rings-playbar' }, [lblStart, bPlay, rTime, lblEnd, cDate]);
+
+    // ---- bottom control bar (M12/M19): date pickers · window sliders · zoom,
+    //      centred + opaque. The pickers RETURN here (M19), flanking the sliders:
+    //      [start-date][window sliders][end-date], with the zoom cluster kept. ----
+    var dStart = el('input', { type: 'date', min: '2026-05-18', max: '2026-07-22', value: '2026-05-18', 'aria-label': 'Window start date', 'class': 'rings-bdate' });
+    var dEnd = el('input', { type: 'date', min: '2026-05-18', max: '2026-07-22', value: '2026-07-22', 'aria-label': 'Window end date', 'class': 'rings-bdate' });
+    var rStart = el('input', { type: 'range', min: '0', max: '1000', value: '0', 'aria-label': 'Window start' });
+    var rEnd = el('input', { type: 'range', min: '0', max: '1000', value: '1000', 'aria-label': 'Window end' });
+    var grpWindow = el('span', { 'class': 'grp bb-window' }, [el('label', { text: 'window' }), rStart, rEnd]);
+    var bZin = svgIconBtn('rings-iconbtn', RIC.zin, 'Zoom in');
+    var bZout = svgIconBtn('rings-iconbtn', RIC.zout, 'Zoom out');
+    var bZfit = svgIconBtn('rings-iconbtn', RIC.fit, 'Fit to view');
+    var grpZoom = el('span', { 'class': 'grp bb-zoom' }, [bZout, bZfit, bZin]);
+    var bottombar = el('div', { 'class': 'rings-bottombar' }, [dStart, grpWindow, dEnd, grpZoom]);
+    stage.appendChild(bottombar);
+
+    var pane = el('aside', { 'class': 'rings-pane', 'aria-label': 'Detail pane' });
+    stage.appendChild(pane);
+
+    // ---- help modal (M11): ports the removed description bars into a structured,
+    //      focus-trapped explainer (what the rings are · lenses · filters/zoom/solo) --
+    var modalClose = svgIconBtn('rings-modal-x', RIC.close, 'Close');
+    function mH(t) { return el('h4', { text: t }); }
+    function mP(children) { return el('p', {}, children); }
+    var modalCard = el('div', { 'class': 'rings-modal-card', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'How the rings page works' }, [
+      el('div', { 'class': 'rings-modal-head' }, [el('h3', { text: 'How the rings page works' }), modalClose]),
+      el('div', { 'class': 'rings-modal-body' }, [
+        mH('The rings'),
+        mP(['The clock of work: the live ExecPlan portfolio (', el('code', { text: '/v1/work?source=all' }), '), the daemon glance (', el('code', { text: '/v1/console/summary' }), ') and the visible fact store (', el('code', { text: '/v1/facts/list' }), ') replayed as an animated ring. Angle is time; the rim is the latest day. A snapshot stands in when a feed is absent.']),
+        mH('Lenses'),
+        mP(['The top-right tiles switch the lens: ', el('b', { text: 'ExecPlans' }), ' (the work board — keeps solo / ledger / lineage / filters), ', el('b', { text: 'ExecPlans arc' }), ' (M25 — a 270° arc per plan, 12 o\'clock = 0% of its declared milestones and 9 o\'clock = complete; newest plan innermost, completed plans fade and the stack collapses inward; titles and token-burn bars sit left of the 12 o\'clock line), ', el('b', { text: 'Data graph' }), ' (facts, angle = source date, centre = higher confidence, edges join shared entities), ', el('b', { text: 'Memory' }), ', ', el('b', { text: 'Sessions' }), ' and ', el('b', { text: 'Tokens' }), '. Each tile shows its headline count and a sparkline.']),
+        mH('Filters, zoom & solo'),
+        mP(['The ', el('b', { text: 'kinds' }), ' and ', el('b', { text: 'agents' }), ' icons (top-left) open menus to filter which nodes show; an active filter keeps a dot + its value on the icon. ', el('b', { text: 'Wheel' }), ' zooms and ', el('b', { text: 'drag' }), ' pans; the bottom bar carries the date window, sliders and the ', el('b', { text: '+ / − / fit' }), ' zoom. Click a plan sector (or a ledger row) to ', el('b', { text: 'solo' }), ' it — the ring reframes to that plan; click the background to clear and reframe the whole set.'])
+      ])
+    ]);
+    var modal = el('div', { 'class': 'rings-modal' }, [modalCard]);
+    modal.hidden = true;
+    function openModal() { closePop(); modal.hidden = false; modalClose.focus(); }
+    function closeModal() { if (!modal.hidden) { modal.hidden = true; helpBtn.focus(); } }
+    helpBtn.addEventListener('click', openModal);
+    modalClose.addEventListener('click', closeModal);
+    modal.addEventListener('click', function (e) { if (e.target === modal) { closeModal(); } });
+    modalCard.addEventListener('keydown', function (e) {
+      if (e.key !== 'Tab') { return; }
+      var f = modalCard.querySelectorAll('button, a, [tabindex]');
+      if (!f.length) { return; }
+      var first = f[0], last = f[f.length - 1];
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    });
+    root.appendChild(stage);
+    root.appendChild(modal);
+
+    // click-away closes an open popover (not clicks inside a menu wrap)
+    function onDocClick(e) { if (openPop && !e.target.closest('.rings-menuwrap')) { closePop(); } }
+    if (typeof document !== 'undefined') { document.addEventListener('click', onDocClick, true); }
+
+    var tip = el('div', { 'class': 'rings-tip', role: 'status' });
+    root.appendChild(tip);
+    container.appendChild(root);
+
+    // ---- tooltip: DOM builder (safe DOM, no raw HTML) ----
+    function tb(t) { return el('b', { text: t }); }
+    function tk(t) { return el('span', { 'class': 'k', text: t }); }
+    function br() { return el('br'); }
+    function showTip(x, y, nodes) {
+      tip.textContent = '';
+      nodes.forEach(function (n2) { if (n2 == null) { return; } tip.appendChild(typeof n2 === 'string' ? doc().createTextNode(n2) : n2); });
+      var pad = 14, w = tip.offsetWidth || 220;
+      tip.style.left = Math.min(x + pad, (typeof innerWidth !== 'undefined' ? innerWidth : 1440) - w - 10) + 'px';
+      tip.style.top = (y + pad + tip.offsetHeight > (typeof innerHeight !== 'undefined' ? innerHeight : 900) ? y - tip.offsetHeight - 8 : y + pad) + 'px';
+      tip.style.opacity = 1;
+    }
+    function hideTip() { tip.style.opacity = 0; }
+
+    // ---- time base: day 0 = 2026-05-07 ----
+    var NOW = 76, dataSrc = 'snapshot';
+    function dayDate(d) { return new Date(Date.UTC(2026, 4, 7) + d * 86400000).toISOString().slice(0, 10); }
+
+    // ---- dataset ----
+    var KIND_HUE = { gate: '#2dd4bf', decision: '#a78bfa', memory: '#8b96f2', handoff: '#f5a623', incident: '#ef4444' };
+    var STATE = { 0: 'complete', 1: 'in_progress', 2: 'blocked' };
+    var STATE_HUE = { 0: '#34d399', 1: '#a78bfa', 2: '#ef4444' };
+    var stateHue = function (p) { return STATE_HUE[p.st]; };
+    // ---- theme-responsive canvas palette (M12): the draw code reads its ink /
+    //      hairline / accent / hub / kind+state hues from CSS custom properties on
+    //      .rings-root, so the light theme gets a legible variant with no reload.
+    //      Semantic hues keep their hue family (deepened for contrast on light).
+    //      readPalette() is called once after the root is attached + on every live
+    //      theme toggle; the KIND_HUE/STATE_HUE objects are mutated in place so the
+    //      closures that captured them (G_FAM_HUE, draw) see the new values. ----
+    var PAL = {
+      ink: '#eef0f6', ink2: '#c8cedb', ink3: '#7e8595', hair: '#ffffff',
+      accent: '#8b96f2', hub: '#12151d', gate: '#2dd4bf', decision: '#a78bfa',
+      memory: '#8b96f2', handoff: '#f5a623', incident: '#ef4444',
+      done: '#34d399', prog: '#a78bfa', block: '#ef4444', codex: '#22d3ee', untraced: '#7e8595'
+    };
+    function readPalette() {
+      var cs = (typeof getComputedStyle === 'function') ? getComputedStyle(root) : null;
+      if (!cs) { return; }
+      var v = function (name, dflt) { var x = (cs.getPropertyValue(name) || '').trim(); return /^#[0-9a-fA-F]{6}$/.test(x) ? x : dflt; };
+      PAL.ink = v('--rings-cv-ink', PAL.ink); PAL.ink2 = v('--rings-cv-ink2', PAL.ink2); PAL.ink3 = v('--rings-cv-ink3', PAL.ink3);
+      PAL.hair = v('--rings-cv-hair', PAL.hair); PAL.accent = v('--rings-cv-accent', PAL.accent); PAL.hub = v('--rings-cv-hub', PAL.hub);
+      PAL.gate = v('--rings-cv-gate', PAL.gate); PAL.decision = v('--rings-cv-decision', PAL.decision); PAL.memory = v('--rings-cv-memory', PAL.memory);
+      PAL.handoff = v('--rings-cv-handoff', PAL.handoff); PAL.incident = v('--rings-cv-incident', PAL.incident);
+      PAL.done = v('--rings-cv-state-done', PAL.done); PAL.prog = v('--rings-cv-state-prog', PAL.prog); PAL.block = v('--rings-cv-state-block', PAL.block);
+      PAL.codex = v('--rings-cv-sess-codex', PAL.codex); PAL.untraced = v('--rings-cv-untraced', PAL.untraced);
+      KIND_HUE.gate = PAL.gate; KIND_HUE.decision = PAL.decision; KIND_HUE.memory = PAL.memory; KIND_HUE.handoff = PAL.handoff; KIND_HUE.incident = PAL.incident;
+      STATE_HUE[0] = PAL.done; STATE_HUE[1] = PAL.prog; STATE_HUE[2] = PAL.block;
+    }
+    function ink(a) { return hex2rgba(PAL.ink, a); }
+    function ink2c(a) { return hex2rgba(PAL.ink2, a); }
+    function ink3c(a) { return hex2rgba(PAL.ink3, a); }
+    function hair(a) { return hex2rgba(PAL.hair, a); }
+    function acc(a) { return hex2rgba(PAL.accent, a); }
+    var PARK_DAYS = 18;
+
+    var PLANS = [], DEP_EDGES = [], cells = [];
+    function mapRaw(p, i) {
+      var short = p.s.replace(/-2026-\d\d-\d\d$/, '').replace(/-2026$/, '');
+      var exit = p.st === 0 ? p.e + 1.5 : (NOW - p.e > PARK_DAYS ? p.e + PARK_DAYS : Infinity);
+      return { i: i, slug: p.s, short: short, st: p.st, done: p.d, total: p.t || 1, b: Math.max(0, p.b), e: p.e, o: p.o, exit: exit,
+        dep: p.dep || [], ext: p.ext || [], od: p.od || [],
+        traced: p.s.indexOf('crux-daemon-buyer-fit') === 0 || p.s.indexOf('cross-site-auth-sso') === 0 };
+    }
+    function loadPlans(raws) { PLANS.length = 0; raws.forEach(function (p, i) { PLANS.push(mapRaw(p, i)); }); }
+    function rebuildLineage() {
+      DEP_EDGES.length = 0;
+      var bySlug = {}; PLANS.forEach(function (p) { bySlug[p.slug] = p; });
+      PLANS.forEach(function (p) { p.dep.forEach(function (d) { var t2 = bySlug[d]; if (t2) { DEP_EDGES.push({ a: p, b: t2 }); } }); });
+    }
+    var J13 = 67;
+    var RFACTS = RINGS_RFACTS;
+    function buildCells() {
+      cells.length = 0;
+      var rr = mulberry32(0xC4C4);
+      PLANS.forEach(function (p) {
+        if (p.traced) {
+          var tag = p.slug.indexOf('crux-daemon-buyer-fit') === 0 ? 'bf' : 'sso';
+          RFACTS.forEach(function (r) {
+            if (r[0] !== tag) { return; }
+            cells.push({ p: p, key: r[1], kind: r[2], day: J13 + r[3], actor: r[4], horizon: r[5], tokens: r[6], version: r[7], real: true, ja: rr(), jr: rr() });
+          });
+          return;
+        }
+        var span = Math.max(0.5, p.e - p.b);
+        var nGates = Math.min(p.done, 12);
+        for (var m = 0; m < nGates; m++) {
+          cells.push({ p: p, key: 'gate:M' + m, kind: 'gate', day: p.b + span * ((m + 1) / (nGates + 1)), real: false, ja: rr(), jr: rr() });
+        }
+        var nMem = Math.max(1, Math.min(6, Math.round(span / 6) + (p.o > 0 ? 2 : 0)));
+        for (var mm = 0; mm < nMem; mm++) {
+          var kinds = ['memory', 'memory', 'decision'];
+          var kk = kinds[Math.floor(rr() * 3)];
+          cells.push({ p: p, key: kk, kind: kk, day: p.b + span * rr(), real: false, ja: rr(), jr: rr() });
+        }
+      });
+      PLANS.forEach(function (p) {
+        p.cells = cells.filter(function (c) { return c.p === p; }).sort(function (a, b) { return b.day - a.day; });
+        var asc = p.cells.slice().sort(function (a, b) { return a.day - b.day; });
+        asc.forEach(function (c, k) { c.rank = k; c.n = asc.length; });
+        asc.forEach(function (c) { c.tokW = (c.kind === 'gate' ? 3 : c.kind === 'decision' ? 2 : 1) + (c.tokens ? c.tokens / 250 : 0); });
+        p.tokMax = Math.max.apply(null, [0.001].concat(asc.map(function (c) { return c.tokW; })));
+        p.tokScale = 0.35 + 0.65 * Math.min(1, Math.log(1 + p.o) / Math.log(81));
+      });
+    }
+    loadPlans(RINGS_PLANS_RAW); rebuildLineage(); buildCells();
+
+    // ---- view state ----
+    var rot = 0, spinning = !REDUCED, resetTween = false;
+    var mode = 'bars', showCompleted = false, showLedger = false, dir = 'out', showAll = false;
+    var hoverSec = null, colorByState = false, showLineage = false, lens = 'work', lensLabels = [];
+    var fKind = 'all', fAgent = 'all';
+    var passFilter = function (c) { return (fKind === 'all' || c.kind === fKind) && (fAgent === 'all' || c.actor === fAgent); };
+    var S = 11, E = NOW, T = NOW, playing = false, Z = 1, panX = 0, panY = 0;
+    var hover = null, pinned = null, sel = null, solo = null, ledgerRows = [];
+    // M13 — tab hub state: the draw loop pauses while a non-Ring view is shown
+    // (canvas faded out) so it never burns frames behind the swapped-in content.
+    // M19 — activeCanvasView tracks an absorbed Canvas tab (board|graph|tree) for
+    // teardown; canvasTabFocus carries a deep-link focus into the Graph tab.
+    var activeTab = 'ring', paused = false, activeCanvasView = null;
+    var canvasTabFocus = (ctxIn && ctxIn.canvasFocus) || null;
+    var mxAbs = 0, myAbs = 0, dragging = false, dragMoved = 0, lastPX = 0, lastPY = 0;
+    var flashes = [];
+
+    var SEAM = 0.10, BASE = -Math.PI / 2 + SEAM / 2, EPOCH_RINGS = 10;
+    function activePlans(t) {
+      if (solo) { return [solo]; }
+      var out;
+      if (showAll) { out = PLANS.filter(function (p) { return p.b <= t && p.e >= S - 0.001 && p.b <= E; }); }
+      else { out = PLANS.filter(function (p) { return p.b <= t && t < p.exit && p.e >= S - 0.001 && p.b <= E; }); }
+      if (!showCompleted) { out = out.filter(function (p) { return p.st !== 0; }); }
+      return out;
+    }
+    function layoutTargets(t) {
+      if (solo) { var o1 = new Map(); o1.set(solo.i, { a0: -Math.PI / 2 + 0.02, a1: Math.PI - 0.02 }); return o1; }
+      var act = activePlans(t).sort(function (a, b) { return b.b - a.b || a.i - b.i; });
+      var width = (TAU - SEAM) / Math.max(1, act.length);
+      var out = new Map();
+      act.forEach(function (p, k) { out.set(p.i, { a0: BASE + k * width, a1: BASE + (k + 1) * width }); });
+      return out;
+    }
+    function stepLayout(dt) {
+      var targets = layoutTargets(T);
+      var k = REDUCED ? 1 : Math.min(1, dt * 7);
+      PLANS.forEach(function (p) {
+        var tg = targets.get(p.i);
+        if (tg) {
+          if (!p.lay) {
+            var mid0 = (tg.a0 + tg.a1) / 2;
+            p.lay = { a0: mid0, a1: mid0, alpha: 0 };
+            if (flashes.length < 40) { flashes.push({ kind: 'enter', ang: mid0, t0: performance.now() / 1000, hue: '#8b96f2' }); }
+          }
+          p.lay.a0 = mix(p.lay.a0, tg.a0, k); p.lay.a1 = mix(p.lay.a1, tg.a1, k); p.lay.alpha = mix(p.lay.alpha, 1, k);
+        } else if (p.lay) {
+          if (!p.lay.exiting) {
+            p.lay.exiting = true;
+            var mid1 = (p.lay.a0 + p.lay.a1) / 2;
+            var hue = p.st === 0 ? '#34d399' : p.st === 2 ? '#ef4444' : '#7e8595';
+            flashes.push({ kind: 'exit', ang: mid1, t0: performance.now() / 1000, hue: hue });
+          }
+          var mid = (p.lay.a0 + p.lay.a1) / 2;
+          p.lay.a0 = mix(p.lay.a0, mid, k); p.lay.a1 = mix(p.lay.a1, mid, k); p.lay.alpha = mix(p.lay.alpha, 0, k);
+          if (p.lay.alpha < 0.02) { p.lay = null; }
+        }
+        if (p.lay && !targets.get(p.i)) { /* keep exiting */ } else if (p.lay) { p.lay.exiting = false; }
+      });
+    }
+
+    // ---- stage geometry ----
+    var ctx = cv.getContext('2d');
+    var W = 0, H = 0, visible = true, rafId = null, lastT = performance.now();
+    function resize() {
+      var r = cv.getBoundingClientRect(), dpr = Math.min((typeof devicePixelRatio !== 'undefined' ? devicePixelRatio : 1) || 1, 2);
+      W = r.width; H = r.height;
+      cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    var ro = (typeof ResizeObserver !== 'undefined') ? new ResizeObserver(resize) : null;
+    if (ro) { ro.observe(cv); }
+    var io = (typeof IntersectionObserver !== 'undefined') ? new IntersectionObserver(function (es) { visible = es[0].isIntersecting; }, { rootMargin: '60px' }) : null;
+    if (io) { io.observe(cv); }
+
+    function geom() {
+      var cx = W / 2, cy = H / 2;
+      var R = Math.min(W * 0.9, H * 0.78) * 0.44;
+      var r0 = R * 0.13;
+      return { cx: cx, cy: cy, R: R, r0: r0 };
+    }
+    var RAD_LO = 11;
+    function dayR(g, day) {
+      if (dir === 'in') { var age = Math.max(0, Math.min(1, (T - day) / Math.max(0.5, T - RAD_LO))); return g.r0 + (g.R - g.r0) * (0.96 - 0.88 * age); }
+      var f = Math.max(0, Math.min(1, (day - RAD_LO) / Math.max(0.5, E - RAD_LO)));
+      return g.r0 + (g.R - g.r0) * (0.08 + 0.88 * f);
+    }
+    function updateRadLo() {
+      RAD_LO = S;
+      if (lens !== 'work' || showAll || solo) { return; }
+      var lo = Infinity;
+      activePlans(T).forEach(function (p) { p.cells.forEach(function (c) { if (c.day <= T && c.day >= S && c.day <= E && c.day < lo) { lo = c.day; } }); });
+      if (lo < Infinity) { RAD_LO = Math.max(S, Math.min(lo, E - 1)); }
+    }
+    function toScreen(g, x, y) { var c = Math.cos(rot), s = Math.sin(rot); return { x: g.cx + panX + (x * c - y * s) * Z, y: g.cy + panY + (x * s + y * c) * Z }; }
+    function toDisc(g, sx, sy) { var ux = (sx - g.cx - panX) / Z, uy = (sy - g.cy - panY) / Z; var c = Math.cos(-rot), s = Math.sin(-rot); return { x: ux * c - uy * s, y: ux * s + uy * c }; }
+    var soloRingR = function (g, c) { var unit = g.R - g.r0; var rMax = g.r0 + unit * 0.92, rMin = g.r0 + unit * 0.18; return c.n > 1 ? rMax - (rMax - rMin) * (c.rank / (c.n - 1)) : (rMax + rMin) / 2; };
+    function cellPos(g, c) {
+      if (!c.p.lay) { return null; }
+      var frac = c.n > 1 ? (c.rank + 0.5) / c.n : 0.5;
+      var a = c.p.lay.a0 + (c.p.lay.a1 - c.p.lay.a0) * (0.06 + 0.88 * frac);
+      var r = solo === c.p ? soloRingR(g, c) : dayR(g, c.day) * (0.995 + c.jr * 0.01);
+      return { a: a, r: r, x: Math.cos(a) * r, y: Math.sin(a) * r };
+    }
+    function dotR(c) { return (c.real ? 3.4 + (c.tokens || 200) / 260 : c.kind === 'gate' ? 3.2 : 2.6); }
+    // M24 — DOT SIZE vs ZOOM. The canvas draws in world units scaled by Z, so a
+    // dot's on-screen radius was dotR·Z: zooming in magnified the dots at
+    // exactly the rate it magnified the gaps between them, and a dense cluster
+    // stayed one blob however far you zoomed. Damping the world radius by
+    // Z^ZOOM_DOT_K makes the screen radius grow as Z^(1-K) while the spacing
+    // still grows as Z — so the gaps open up and the cluster resolves.
+    //   Z ≤ 1 (overview and further out): factor is exactly 1, sizes unchanged.
+    //   Z = 3:  ×0.51   Z = 7 (max zoom): ×0.31, floored at ZOOM_DOT_MIN so a
+    //   dot never shrinks below a comfortably clickable ~2px on screen.
+    // Pure arithmetic on a value the loop already holds — no extra state, no
+    // per-dot allocation, and it does not touch the hue-batched draw order.
+    var ZOOM_DOT_K = 0.6, ZOOM_DOT_MIN = 0.28;
+    function zoomDotScale() { return Z <= 1 ? 1 : Math.max(ZOOM_DOT_MIN, 1 / Math.pow(Z, ZOOM_DOT_K)); }
+
+    // ---- main draw loop ----
+    var drawMsEMA = 0;   // exponential moving average of draw-loop cost (ms)
+    function draw(now) {
+      if (!cv.isConnected) { teardown(); return; }   // route change cleared #content
+      var __t0 = performance.now();
+      var dt = Math.min(0.05, (now - lastT) / 1000); lastT = now;
+      var time = now / 1000;
+      if (spinning && !REDUCED && !resetTween) { rot += dt * 0.02; }
+      if (resetTween) {
+        var target = rot - (((rot % TAU) + TAU) % TAU);
+        if (((rot % TAU) + TAU) % TAU > Math.PI) { target += TAU; }
+        rot = mix(rot, target, REDUCED ? 1 : 0.12);
+        if (Math.abs(rot - target) < 0.002) { rot = 0; resetTween = false; }
+      }
+      if (playing) {
+        T += dt * (E - S) / 24;
+        if (T >= E) { T = E; setPlaying(false); }
+        rTime.value = Math.round((T - S) / Math.max(0.5, E - S) * 1000);
+        cDate.textContent = dayDate(T);
+      }
+      if (lens === 'work') { stepLayout(dt); }
+      if (lens === 'arc') { arcStep(dt); }        // M25 — radial slots + fade/collapse easing
+      if (lens === 'data') { stepDataFocus(dt); }
+      updateRadLo();
+      var g = geom();
+      var zdot = zoomDotScale();   // M24 — one value per frame, read by every dot below
+      ctx.clearRect(0, 0, W, H);
+      ctx.save();
+      ctx.translate(g.cx + panX, g.cy + panY);
+      ctx.scale(Z, Z);
+      ctx.rotate(rot);
+      if (!solo) {
+        for (var i = 1; i <= EPOCH_RINGS; i++) {
+          var rr0 = g.r0 + (g.R - g.r0) * (i / EPOCH_RINGS);
+          ctx.strokeStyle = hair(.09); ctx.lineWidth = 1 / Z;
+          ctx.beginPath(); ctx.arc(0, 0, rr0, 0, 7); ctx.stroke();
+        }
+      }
+      ctx.strokeStyle = acc(.6); ctx.lineWidth = 1.5 / Z;
+      ctx.beginPath();
+      ctx.moveTo(Math.cos(-Math.PI / 2) * g.r0 * 0.9, Math.sin(-Math.PI / 2) * g.r0 * 0.9);
+      ctx.lineTo(Math.cos(-Math.PI / 2) * (g.R + 10), Math.sin(-Math.PI / 2) * (g.R + 10));
+      ctx.stroke();
+      lensLabels = [];
+      var soloLabels = null;
+      if (lens !== 'work') {
+        drawLensInFrame(ctx, g, time);
+      } else {
+        ctx.lineWidth = 1 / Z;
+        PLANS.forEach(function (p) {
+          if (!p.lay || p.lay.alpha < 0.02) { return; }
+          var L = p.lay, al = L.alpha, wSec = L.a1 - L.a0;
+          if (wSec * g.R * Z > 8) {
+            ctx.strokeStyle = hair(0.06 * al);
+            ctx.beginPath(); ctx.moveTo(Math.cos(L.a0) * g.r0, Math.sin(L.a0) * g.r0); ctx.lineTo(Math.cos(L.a0) * g.R, Math.sin(L.a0) * g.R); ctx.stroke();
+          }
+          var hue = stateHue(p);
+          if (p === hoverSec) {
+            ctx.strokeStyle = hex2rgba(hue, 0.28 * al); ctx.lineWidth = 10 / Z;
+            ctx.beginPath(); ctx.arc(0, 0, g.R - 5 / Z, L.a0, L.a1); ctx.stroke(); ctx.lineWidth = 1 / Z;
+          }
+          var aPad = Math.min(0.02, wSec * 0.10);
+          ctx.strokeStyle = hex2rgba(hue, 0.28 * al); ctx.lineWidth = 1.6 / Z;
+          ctx.beginPath(); ctx.arc(0, 0, g.R + 3, L.a0 + aPad, L.a1 - aPad); ctx.stroke();
+          ctx.strokeStyle = hex2rgba(hue, 0.8 * al); ctx.lineWidth = 4.5 / Z;
+          ctx.beginPath(); ctx.arc(0, 0, g.R + 3, L.a0 + aPad, L.a0 + aPad + Math.max(0.008, (wSec - 2 * aPad) * (p.done / p.total))); ctx.stroke();
+          ctx.lineWidth = 1 / Z;
+          if (p.od.length) {
+            var nT = Math.min(p.od.length, Math.max(1, Math.floor((wSec - 2 * aPad) / 0.02)));
+            ctx.strokeStyle = hex2rgba(PAL.handoff, 0.95 * al); ctx.lineWidth = 1.8 / Z;
+            for (var oi = 0; oi < nT; oi++) {
+              var oa = L.a0 + aPad + (oi + 0.5) * 0.019;
+              ctx.beginPath(); ctx.moveTo(Math.cos(oa) * (g.R + 8), Math.sin(oa) * (g.R + 8)); ctx.lineTo(Math.cos(oa) * (g.R + 13), Math.sin(oa) * (g.R + 13)); ctx.stroke();
+            }
+            ctx.lineWidth = 1 / Z;
+          }
+          if (p.st === 2) {
+            var pulse = REDUCED ? 0.5 : 0.35 + 0.3 * Math.sin(time * 4);
+            ctx.strokeStyle = hex2rgba(PAL.block, pulse * al);
+            ctx.beginPath(); ctx.arc(0, 0, g.R + 8, L.a0 + 0.01, L.a1 - 0.01); ctx.stroke();
+          }
+          var isHovSec = p === hoverSec;
+          if ((wSec * g.R * Z > 46 || isHovSec) && solo !== p) {
+            var midA = (L.a0 + L.a1) / 2, lr = g.R + 14;
+            ctx.save();
+            ctx.translate(Math.cos(midA) * lr, Math.sin(midA) * lr);
+            ctx.rotate(midA + (Math.cos(midA + rot) < 0 ? Math.PI : 0));
+            ctx.fillStyle = isHovSec ? ink(1) : ink2c(0.95 * al);
+            ctx.font = '700 ' + (12 / Z) + 'px ' + MONO;
+            ctx.textAlign = Math.cos(midA + rot) < 0 ? 'right' : 'left'; ctx.textBaseline = 'middle';
+            var lbl = isHovSec ? (p.short.length > 34 ? p.short.slice(0, 33) + '…' : p.short) : (p.short.length > 16 ? p.short.slice(0, 15) + '…' : p.short);
+            ctx.fillText(lbl + ' ' + p.done + '/' + p.total, 0, 0);
+            ctx.restore();
+          }
+          p.cells.forEach(function (c) {
+            if (c.day > T || c.day < S || c.day > E) { return; }
+            if (!passFilter(c)) { c._x = undefined; return; }
+            var pos = cellPos(g, c);
+            if (!pos) { return; }
+            var chue = colorByState ? stateHue(c.p) : (KIND_HUE[c.kind] || PAL.memory);
+            var isSel = (hover === c || pinned === c);
+            var age = T - c.day;
+            var pop = REDUCED ? 1 : Math.min(1, age / 0.8);
+            var rr = dotR(c) * zdot * (isSel ? 1.7 : 1) * (0.4 + 0.6 * pop);
+            if (mode === 'bars') {
+              ctx.strokeStyle = hex2rgba(chue, (0.34 + (c.real ? 0.3 : 0)) * al * pop);
+              ctx.lineWidth = (isSel ? 3.6 : 2.6) / Math.sqrt(Z);
+              ctx.beginPath(); ctx.moveTo(Math.cos(pos.a) * g.r0, Math.sin(pos.a) * g.r0); ctx.lineTo(pos.x, pos.y); ctx.stroke();
+            }
+            ctx.fillStyle = hex2rgba(chue, (c.real ? 0.92 : 0.55) * al * pop);
+            if (c.kind === 'gate' && c.real) {
+              ctx.beginPath();
+              ctx.moveTo(pos.x, pos.y - rr - 1); ctx.lineTo(pos.x + rr, pos.y); ctx.lineTo(pos.x, pos.y + rr + 1); ctx.lineTo(pos.x - rr, pos.y);
+              ctx.closePath(); ctx.fill();
+            } else {
+              ctx.beginPath(); ctx.arc(pos.x, pos.y, rr, 0, 7); ctx.fill();
+            }
+            if (c.version > 1) {
+              ctx.strokeStyle = hex2rgba(chue, 0.8 * al); ctx.lineWidth = 1 / Z;
+              ctx.beginPath(); ctx.arc(pos.x, pos.y, rr + 2.5 / Z, 0, 7); ctx.stroke();
+            }
+            if (!REDUCED && age < 0.8) {
+              ctx.strokeStyle = hex2rgba(chue, (1 - age / 0.8) * 0.8); ctx.lineWidth = 1.5 / Z;
+              ctx.beginPath(); ctx.arc(pos.x, pos.y, rr + (age / 0.8) * 14, 0, 7); ctx.stroke();
+            }
+            if (isSel) {
+              ctx.strokeStyle = hex2rgba(chue, 0.95); ctx.lineWidth = 1.5 / Z;
+              ctx.beginPath(); ctx.arc(pos.x, pos.y, rr + 4 / Z, 0, 7); ctx.stroke();
+            }
+            c._x = pos.x; c._y = pos.y; c._a = pos.a; c._r = pos.r; c._dr = rr;
+          });
+        });
+      }
+      if (!solo) {
+        DEP_EDGES.forEach(function (ed) {
+          var lit = hoverSec === ed.a || hoverSec === ed.b;
+          if (!showLineage && !lit) { return; }
+          if (!ed.a.lay || !ed.b.lay || ed.a.lay.alpha < 0.3 || ed.b.lay.alpha < 0.3) { return; }
+          var am = (ed.a.lay.a0 + ed.a.lay.a1) / 2, bm = (ed.b.lay.a0 + ed.b.lay.a1) / 2;
+          var r1 = g.R * 0.97;
+          var ax = Math.cos(am) * r1, ay = Math.sin(am) * r1, bx = Math.cos(bm) * r1, by = Math.sin(bm) * r1;
+          var alpha2 = lit ? 0.65 : 0.10;
+          ctx.strokeStyle = acc(alpha2); ctx.lineWidth = (lit ? 1.6 : 1.1) / Z;
+          ctx.beginPath(); ctx.moveTo(ax, ay); ctx.quadraticCurveTo((ax + bx) / 2 * 0.2, (ay + by) / 2 * 0.2, bx, by); ctx.stroke();
+          ctx.fillStyle = acc(Math.min(1, alpha2 * 1.6));
+          ctx.beginPath(); ctx.arc(bx, by, (lit ? 3 : 2.2) / Z, 0, 7); ctx.fill();
+        });
+        ctx.lineWidth = 1 / Z;
+      }
+      if (solo && solo.lay && solo.lay.alpha > 0.5) {
+        soloLabels = [];
+        var unit = g.R - g.r0, L2 = solo.lay;
+        var evs = solo.cells.slice().sort(function (a, b) { return a.day - b.day; }).filter(function (c) { return c.day <= T && c.day >= S && c.day <= E && passFilter(c); });
+        ctx.strokeStyle = hair(.16); ctx.lineWidth = 1 / Z;
+        ctx.beginPath(); ctx.moveTo(-(g.R + 10), 0); ctx.lineTo(-g.r0 * 0.72, 0); ctx.stroke();
+        evs.forEach(function (c) {
+          var r = soloRingR(g, c);
+          var frac = c.n > 1 ? (c.rank + 0.5) / c.n : 0.5;
+          var aNode = L2.a0 + (L2.a1 - L2.a0) * (0.06 + 0.88 * frac);
+          var chue = KIND_HUE[c.kind] || PAL.memory;
+          var isSelBar = pinned === c;
+          ctx.strokeStyle = hex2rgba(chue, 0.07); ctx.lineWidth = 1 / Z;
+          ctx.beginPath(); ctx.arc(0, 0, r, L2.a0, aNode); ctx.stroke();
+          ctx.strokeStyle = hex2rgba(chue, isSelBar ? 0.75 : 0.30); ctx.lineWidth = (isSelBar ? 2 : 1.3) / Z;
+          ctx.beginPath(); ctx.arc(0, 0, r, aNode, Math.PI); ctx.stroke();
+          var y1 = 0;
+          var segs = [
+            { h: unit * (0.06 + Math.min(0.30, ((c.tokens || 160) / 550) * 0.34)), col: acc(0.55) },
+            { h: unit * 0.055, col: hex2rgba(chue, 0.95) }
+          ];
+          if (c.version > 1) { segs.push({ h: unit * 0.022, col: ink(.85) }); }
+          segs.forEach(function (sg) {
+            ctx.strokeStyle = sg.col; ctx.lineWidth = (5 / Z) * (isSelBar ? 1.5 : 1);
+            ctx.beginPath(); ctx.moveTo(-r, -y1); y1 += sg.h; ctx.lineTo(-r, -y1); ctx.stroke();
+          });
+          c._bx = -r; c._bh = y1;
+        });
+        ctx.lineWidth = 1 / Z;
+        var picks = evs.length ? [evs[0], evs[Math.floor((evs.length - 1) / 2)], evs[evs.length - 1]] : [];
+        var seen = {};
+        picks.forEach(function (c) { if (seen[c.rank]) { return; } seen[c.rank] = 1; soloLabels.push({ x: -soloRingR(g, c), y: 16, t: dayDate(c.day) }); });
+        soloLabels.push({ x: -(g.r0 + unit * 0.55), y: -(unit * 0.62), t: 'event ledger · outer ring = first event', cap: true });
+      }
+      {
+        var er = dir === 'in' ? g.r0 + (g.R - g.r0) * 0.96 : dayR(g, T);
+        if (dir === 'in' || T < E - 0.01) {
+          var grow = REDUCED ? 0.86 : (0.55 + 0.45 * ((time * 0.06) % 1));
+          ctx.strokeStyle = acc(.7); ctx.lineWidth = 1.6 / Z;
+          ctx.setLineDash([5 / Z, 7 / Z]);
+          ctx.beginPath(); ctx.arc(0, 0, er, -Math.PI / 2, -Math.PI / 2 + TAU * grow); ctx.stroke();
+          ctx.setLineDash([]);
+        }
+      }
+      for (var fi = flashes.length - 1; fi >= 0; fi--) {
+        var f = flashes[fi];
+        var kf = (time - f.t0) / 1.1;
+        if (kf > 1) { flashes.splice(fi, 1); continue; }
+        if (REDUCED) { continue; }
+        var rrf = f.kind === 'exit' ? g.R * (1 + kf * 0.14) : g.R * (1.14 - kf * 0.14);
+        ctx.strokeStyle = hex2rgba(f.hue, (1 - kf) * 0.9); ctx.lineWidth = (2.5 * (1 - kf) + 0.5) / Z;
+        ctx.beginPath(); ctx.arc(0, 0, rrf, f.ang - 0.3 * (1 - kf * 0.5), f.ang + 0.3 * (1 - kf * 0.5)); ctx.stroke();
+      }
+      ctx.lineWidth = 1;
+      var glow = ctx.createRadialGradient(0, 0, 0, 0, 0, g.r0 * 1.5);
+      glow.addColorStop(0, acc(.5)); glow.addColorStop(1, 'transparent');
+      ctx.fillStyle = glow; ctx.beginPath(); ctx.arc(0, 0, g.r0 * 1.5, 0, 7); ctx.fill();
+      ctx.fillStyle = PAL.hub; ctx.beginPath(); ctx.arc(0, 0, g.r0 * 0.7, 0, 7); ctx.fill();
+      ctx.strokeStyle = acc(.85); ctx.lineWidth = 1 / Z;
+      ctx.beginPath(); ctx.arc(0, 0, g.r0 * 0.7, 0, 7); ctx.stroke();
+      ctx.restore();
+
+      var nAct = activePlans(T).length;
+      ctx.fillStyle = ink(.95); ctx.font = '600 10.5px ' + MONO;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      var core = toScreen(g, 0, 0);
+      ctx.fillText('crux', core.x, core.y - 6);
+      ctx.fillStyle = ink3c(.9); ctx.font = '8.5px ' + MONO;
+      ctx.fillText(lens === 'work' ? nAct + (showAll ? ' plans' : ' live') : lens, core.x, core.y + 7);
+      ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+      // M13 — the single top-left status line (window range · zoom · dataSrc) was
+      // removed: that corner now hosts the fixed tab hub (Ring · Activity · …).
+      // The same facts remain reachable — window dates in the play/bottom bars,
+      // dataSrc via the root's data-src liveness attribute, zoom on the bottom bar.
+      if (soloLabels) {
+        ctx.font = '9px ' + MONO; ctx.textAlign = 'center';
+        soloLabels.forEach(function (L3) {
+          var sp = toScreen(g, L3.x, L3.y);
+          ctx.fillStyle = L3.cap ? ink2c(.9) : ink3c(.85);
+          ctx.fillText(L3.t, sp.x, sp.y);
+        });
+        var tip2 = toScreen(g, 0, -(g.R + 24));
+        ctx.fillStyle = ink(.92); ctx.font = '700 10px ' + MONO;
+        ctx.fillText(dayDate(solo.b) + ' → ' + dayDate(solo.e), tip2.x, tip2.y);
+        ctx.textAlign = 'left';
+      }
+      if (lensLabels.length) {
+        ctx.font = '9.5px ' + MONO; ctx.textAlign = 'center';
+        lensLabels.forEach(function (L4) {
+          var sp = toScreen(g, L4.x, L4.y);
+          ctx.save();
+          if (L4.rot !== undefined) { ctx.translate(sp.x, sp.y); ctx.rotate(L4.rot + rot); ctx.translate(-sp.x, -sp.y); }
+          ctx.fillStyle = L4.cap ? ink2c(.9) : ink2c(.95);
+          if (!L4.cap) { ctx.font = '700 11px ' + MONO; }
+          ctx.fillText(L4.t, sp.x, sp.y);
+          ctx.restore();
+          ctx.font = '9.5px ' + MONO;
+        });
+        ctx.textAlign = 'left';
+      }
+      ledgerRows = [];
+      if (lens === 'work' && showLedger) {
+        // M20 — the completed-plans list starts to the RIGHT of the vertical left
+        // toolbar (.rings-tools: left 12px, 40px buttons → right edge ~52px) instead
+        // of overlapping it. LEDGER_X is measured from that toolbar's live geometry
+        // so the clearance holds if the toolbar is ever restyled.
+        var toolsRight = 52;
+        if (tools && typeof tools.getBoundingClientRect === 'function' && cv && typeof cv.getBoundingClientRect === 'function') {
+          var tR = tools.getBoundingClientRect(), cR = cv.getBoundingClientRect();
+          if (tR.width) { toolsRight = Math.max(0, tR.right - cR.left); }
+        }
+        var LEDGER_X = Math.round(toolsRight) + 14;   // rect left edge, clear of the toolbar
+        var doneList = PLANS.filter(function (p) { return p.st === 0 && p.exit <= T && p.b <= E && p.e >= S - 0.001; }).sort(function (a, b) { return b.exit - a.exit; });
+        ctx.font = '700 11px ' + MONO; ctx.fillStyle = hex2rgba(PAL.gate, .9);
+        ctx.fillText('completed · ' + doneList.length + (solo ? '  (filtering — click row again or background to clear)' : ''), LEDGER_X + 6, 52);
+        ctx.font = '9.5px ' + MONO;
+        var maxRows = Math.floor((H - 140) / 16);
+        doneList.slice(0, maxRows).forEach(function (p, k) {
+          var fresh = T - p.exit < 2.0, isSolo = solo === p, y = 70 + k * 16;
+          if (isSolo) { ctx.fillStyle = acc(.16); ctx.fillRect(LEDGER_X, y - 11, 218, 15); }
+          ctx.fillStyle = fresh || isSolo ? hex2rgba(PAL.gate, .95) : ink3c(.75);
+          ctx.fillText('✓', LEDGER_X + 6, y);
+          ctx.fillStyle = isSolo ? ink(1) : fresh ? ink(.95) : ink3c(.8);
+          var lbl = p.short.length > 26 ? p.short.slice(0, 25) + '…' : p.short;
+          ctx.fillText(lbl, LEDGER_X + 20, y);
+          ctx.fillStyle = ink3c(.55);
+          ctx.fillText(dayDate(p.exit).slice(5), LEDGER_X + 20 + 27 * 6.0, y);
+          ledgerRows.push({ x: LEDGER_X, y: y - 11, w: 218, h: 15, p: p });
+        });
+        if (doneList.length > maxRows) {
+          ctx.fillStyle = ink3c(.6);
+          ctx.fillText('… +' + (doneList.length - maxRows) + ' more', LEDGER_X + 6, 70 + maxRows * 16);
+        }
+        if (typeof window !== 'undefined' && window.__CRUX_CONSOLE_DEV__) {
+          window.__ringsLedger = { x: LEDGER_X, w: 218, toolsRight: toolsRight, rows: ledgerRows.length };
+        }
+      }
+      var __ms = performance.now() - __t0;
+      drawMsEMA = drawMsEMA ? drawMsEMA * 0.9 + __ms * 0.1 : __ms;
+      // Dev-only perf probe (the dev console override sets __CRUX_CONSOLE_DEV__).
+      // Never leaks a global in prod; lets the mirror measure draw-loop cost.
+      if (typeof window !== 'undefined' && window.__CRUX_CONSOLE_DEV__) {
+        window.__ringsDrawMs = drawMsEMA; window.__ringsLastDrawMs = __ms;
+        var __g = geom(); window.__ringsCenter = { x: __g.cx + panX, y: __g.cy + panY, R: __g.R * Z };
+        window.__ringsSolo = solo ? (solo.slug || solo.s || true) : null;
+        window.__ringsActiveTab = activeTab; window.__ringsPaused = paused;
+        window.__ringsFrame = (window.__ringsFrame || 0) + 1;   // stops advancing when the loop pauses
+        window.__ringsLens = lens; window.__ringsDataFocus = gFocus; window.__ringsDataFocusK = gFocusK;
+        window.__ringsDataSel = gSel; window.__ringsDataConn = gConn ? Object.keys(gConn).length : 0;
+        // M24 — the zoom/dot-size relationship, measurable rather than asserted.
+        window.__ringsZ = Z; window.__ringsDotScale = zdot;
+      }
+      rafId = null;
+      if (visible && !paused && !doc().hidden && cv.isConnected) { rafId = requestAnimationFrame(draw); }
+    }
+
+    // ---- data graph lens ----
+    var GNODES = [], GEDGES = [], GADJ = {}, gTotal = null, gCap = false;
+    function loadGraph(raws) {
+      GNODES.length = 0; GEDGES.length = 0;
+      for (var k2 in GADJ) { delete GADJ[k2]; }
+      raws.forEach(function (n, i) { var o = {}; for (var kk in n) { o[kk] = n[kk]; } o.i = i; GNODES.push(o); });
+      var byE = {};
+      GNODES.forEach(function (n) { (byE[n.e] = byE[n.e] || []).push(n); });
+      for (var e in byE) {
+        var arr = byE[e].sort(function (a, b) { return a.d - b.d; });
+        for (var i = 1; i < arr.length; i++) { GEDGES.push({ a: arr[i - 1], b: arr[i] }); }
+      }
+      GEDGES.forEach(function (ed) { (GADJ[ed.a.i] = GADJ[ed.a.i] || []).push(ed.b.i); (GADJ[ed.b.i] = GADJ[ed.b.i] || []).push(ed.a.i); });
+    }
+    loadGraph(RINGS_GRAPH_RAW);
+    var gSel = null;
+    function gHops(i0) {
+      var l1 = {}, l2 = {};
+      (GADJ[i0] || []).forEach(function (j) { l1[j] = 1; });
+      (GADJ[i0] || []).forEach(function (j) { (GADJ[j] || []).forEach(function (k2) { if (k2 !== i0 && !l1[k2]) { l2[k2] = 1; } }); });
+      return { l1: l1, l2: l2 };
+    }
+    // ---- M13: data-lens connected-focus (the canvas focus mode, on the ring
+    //      fact graph). ON + a selected node → hide unconnected nodes/edges +
+    //      rearrange the connected set into a compact organic cluster + zoom, all
+    //      via an eased tween advanced in the RAF loop (stepDataFocus). The draw
+    //      stays hue-batched (no per-node ops added to the hot path beyond one
+    //      lerp), so the 60fps budget holds. Reduced motion → instant.
+    var gFocus = false, gFocusK = 0, gConn = null, gClusterTargets = null;
+    var gViewTarget = null, gViewTweening = false, gPrevView = null;
+    function gConnSet(i0) { var s = {}; s[i0] = true; (GADJ[i0] || []).forEach(function (j) { s[j] = true; }); return s; }
+    function applyDataFocus() {
+      if (gSel === null) { gConn = null; gClusterTargets = null; return; }
+      gConn = gConnSet(gSel);
+      var ids = Object.keys(gConn).map(Number);
+      ids.sort(function (a, b) { return a === gSel ? -1 : (b === gSel ? 1 : a - b); });
+      var g = geom();
+      var GA = Math.PI * (3 - Math.sqrt(5));
+      var SP = Math.max(24, (g.R * 0.6) / Math.sqrt(Math.max(1, ids.length)));
+      gClusterTargets = {};
+      ids.forEach(function (i, k) { var r = k === 0 ? 0 : SP * Math.sqrt(k + 0.2), a = k * GA; gClusterTargets[i] = { x: Math.cos(a) * r, y: Math.sin(a) * r }; });
+      gViewTarget = { Z: Math.min(3, Math.max(Z, 1.7)), panX: 0, panY: 0 };
+      gViewTweening = true;
+      spinning = false; bSpin.setAttribute('aria-pressed', 'false');
+    }
+    function releaseDataFocus() { gConn = null; gClusterTargets = null; gViewTarget = gPrevView || { Z: 1, panX: 0, panY: 0 }; gViewTweening = true; }
+    function stepDataFocus(dt) {
+      var kf = REDUCED ? 1 : Math.min(1, dt * 6);
+      var wantK = (gFocus && gSel !== null && gClusterTargets) ? 1 : 0;
+      gFocusK += (wantK - gFocusK) * kf;
+      if (Math.abs(wantK - gFocusK) < 0.002) { gFocusK = wantK; }
+      if (gViewTweening && gViewTarget) {
+        Z += (gViewTarget.Z - Z) * kf; panX += (gViewTarget.panX - panX) * kf; panY += (gViewTarget.panY - panY) * kf;
+        if (Math.abs(gViewTarget.Z - Z) < 0.01 && Math.abs(gViewTarget.panX - panX) < 0.5 && Math.abs(gViewTarget.panY - panY) < 0.5) {
+          Z = gViewTarget.Z; panX = gViewTarget.panX; panY = gViewTarget.panY; gViewTweening = false;
+        }
+      }
+    }
+    var G_FAM_HUE = function (e) {
+      return e.indexOf('execplan:') === 0 ? PAL.decision : e.indexOf('bench:') === 0 ? PAL.handoff : e.indexOf('incident:') === 0 ? PAL.incident : e.indexOf('design:') === 0 ? PAL.codex : e.indexOf('__work_comment__') === 0 ? PAL.done : PAL.untraced;
+    };
+    var G_THR = { volatile: 1, medium: 35, stable: 365, none: Infinity };
+    function gEffConf(n) {
+      var age = Math.max(0, T - n.d), thr = G_THR[n.h] || Infinity;
+      if (thr === Infinity) { return n.c; }
+      return age > thr ? n.c * 0.5 : n.c * (1 - 0.35 * (age / thr));
+    }
+    function drawDataLens(ctx2, g) {
+      // M11 — batched render: fills/strokes are grouped by (hue, alpha) into one
+      // path per bucket, so a full-store graph (thousands of fact nodes + edges)
+      // costs ~a dozen canvas ops per frame instead of one per node/edge. Node
+      // positions are computed once and cached on the node (_px/_py) so edges
+      // reuse them. This is what makes the raised node cap interactive.
+      var span = Math.max(0.5, E - S);
+      var rIn = g.r0 * 1.25, rOut = g.R * 0.96;
+      var vis = [], cMin = 1, cMax = 0;
+      GNODES.forEach(function (n) {
+        n._x = undefined; n._on = false; n._px = undefined;
+        if (n.d > T || n.d < S || n.d > E) { return; }
+        var ec = gEffConf(n); n._ec = ec;
+        if (ec < cMin) { cMin = ec; } if (ec > cMax) { cMax = ec; }
+        vis.push(n);
+      });
+      var cSpan = Math.max(0.02, cMax - cMin);
+      vis.forEach(function (n) {
+        var a = BASE + (TAU - SEAM) * Math.max(0, Math.min(1, (n.d - S) / span));
+        var norm = (n._ec - cMin) / cSpan;
+        var r = rIn + (rOut - rIn) * (1 - (0.08 + 0.84 * norm));
+        n._px = Math.cos(a) * r; n._py = Math.sin(a) * r;
+      });
+      // M13 focus mode — lerp the connected set's positions toward the compact
+      // cluster by gFocusK (0 = natural angle/radius, 1 = clustered). Unconnected
+      // nodes keep their natural spot and fade out (see the node/edge alpha below).
+      if (gFocusK > 0.001 && gClusterTargets) {
+        vis.forEach(function (n) { var t2 = gClusterTargets[n.i]; if (t2) { n._px += (t2.x - n._px) * gFocusK; n._py += (t2.y - n._py) * gFocusK; } });
+      }
+      var hops = gSel !== null ? gHops(gSel) : null;
+      var gFoc = gFocusK > 0.001 && gConn;
+      var inFocus = function (i2) { return gSel === null ? null : (i2 === gSel ? 0 : hops.l1[i2] ? 1 : hops.l2[i2] ? 2 : -1); };
+      ctx2.strokeStyle = hair(.04); ctx2.lineWidth = 1 / Z;
+      [0.25, 0.5, 0.75].forEach(function (cf) { ctx2.beginPath(); ctx2.arc(0, 0, rIn + (rOut - rIn) * cf, 0, 7); ctx2.stroke(); });
+      // edges — bucket by (hue, alpha), one stroked path per bucket
+      var edgeBuckets = {};
+      GEDGES.forEach(function (ed) {
+        var na = ed.a, nb = ed.b;
+        if (na._px === undefined || nb._px === undefined) { return; }
+        var alpha = 0.16;
+        if (hops) { var fa = inFocus(na.i), fb = inFocus(nb.i); alpha = (fa >= 0 && fb >= 0) ? 0.6 : 0.03; }
+        if (gFoc) { var ec = gConn[na.i] && gConn[nb.i]; if (ec) { alpha = Math.max(alpha, 0.5); } else { alpha *= (1 - gFocusK); if (gFocusK > 0.98) { return; } } }
+        var hue2 = G_FAM_HUE(na.e), key = hue2 + '|' + alpha;
+        (edgeBuckets[key] = edgeBuckets[key] || { hue: hue2, alpha: alpha, segs: [] }).segs.push(na, nb);
+      });
+      ctx2.lineWidth = 1.1 / Z;
+      Object.keys(edgeBuckets).forEach(function (key) {
+        var bk = edgeBuckets[key];
+        ctx2.strokeStyle = hex2rgba(bk.hue, bk.alpha); ctx2.beginPath();
+        for (var i = 0; i < bk.segs.length; i += 2) {
+          var pa2 = bk.segs[i], pb2 = bk.segs[i + 1];
+          ctx2.moveTo(pa2._px, pa2._py);
+          ctx2.quadraticCurveTo((pa2._px + pb2._px) / 2 * 0.55, (pa2._py + pb2._py) / 2 * 0.55, pb2._px, pb2._py);
+        }
+        ctx2.stroke();
+      });
+      // nodes — bucket by (hue, alpha), one filled path per bucket; hover / focus
+      // centre nodes get an extra ring, drawn last (there are only a handful)
+      var nodeBuckets = {}, special = [];
+      vis.forEach(function (n) {
+        var hue2 = G_FAM_HUE(n.e), f2 = inFocus(n.i), isH = hover === n;
+        var alpha = 0.85;
+        if (f2 !== null) { alpha = f2 === -1 ? 0.10 : f2 === 0 ? 1 : f2 === 1 ? 0.95 : 0.6; }
+        if (gFoc && !gConn[n.i]) { if (gFocusK > 0.98) { n._on = false; n._x = undefined; return; } alpha *= (1 - gFocusK); }
+        var rr = (2.2 + Math.min(3, (n.t || 150) / 180)) * (isH || f2 === 0 ? 1.7 : 1);
+        n._x = n._px; n._y = n._py; n._dr = rr; n._on = true;
+        if (isH || f2 === 0) { special.push({ n: n, hue: hue2, rr: rr, f0: f2 === 0 }); }
+        var key = hue2 + '|' + alpha.toFixed(2);
+        (nodeBuckets[key] = nodeBuckets[key] || { hue: hue2, alpha: alpha, nodes: [] }).nodes.push(n);
+      });
+      Object.keys(nodeBuckets).forEach(function (key) {
+        var bk = nodeBuckets[key];
+        ctx2.fillStyle = hex2rgba(bk.hue, bk.alpha); ctx2.beginPath();
+        bk.nodes.forEach(function (n) { ctx2.moveTo(n._x + n._dr, n._y); ctx2.arc(n._x, n._y, n._dr, 0, 7); });
+        ctx2.fill();
+      });
+      special.forEach(function (s) {
+        ctx2.strokeStyle = hex2rgba(s.hue, s.f0 ? 0.95 : 0.9); ctx2.lineWidth = (s.f0 ? 1.5 : 1) / Z;
+        ctx2.beginPath(); ctx2.arc(s.n._x, s.n._y, s.rr + (s.f0 ? 5 : 4) / Z, 0, 7); ctx2.stroke();
+      });
+      var capTxt = 'data graph · ' + GNODES.length + (gTotal ? ' of ' + gTotal.toLocaleString() + ' visible facts' + (gCap ? ' (node cap ' + RINGS_NODE_CAP.toLocaleString() + ')' : '') : ' live facts') +
+        ' · angle = source date · centre = higher confidence (rank-scaled ' + cMin.toFixed(2) + '–' + cMax.toFixed(2) + ') · edge = shared entity · click = 2-hop';
+      lensLabels.push({ x: 0, y: g.R + 42, cap: true, t: capTxt });
+      if (typeof window !== 'undefined' && window.__CRUX_CONSOLE_DEV__) { window.__ringsDataCaption = capTxt; window.__ringsNodeCap = RINGS_NODE_CAP; window.__ringsNodes = GNODES.length; window.__ringsCapped = gCap; }
+    }
+
+    // ---- tokens lens ----
+    var TOK = null;
+    function buildTok() {
+      var spent = {}, saved = {};
+      PLANS.forEach(function (p) {
+        if (!p.cells.length || !p.o) { return; }
+        var per = (p.o / 10) / p.cells.length;
+        p.cells.forEach(function (c) { var d2 = Math.floor(c.day); spent[d2] = (spent[d2] || 0) + per; });
+      });
+      cells.forEach(function (c) { var d2 = Math.floor(c.day); saved[d2] = (saved[d2] || 0) + 0.003; });
+      var totS = 0, totV = 0;
+      for (var d2 in spent) { totS += spent[d2]; }
+      for (var d3 in saved) { totV += saved[d3]; }
+      return { spent: spent, saved: saved, totS: totS, totV: totV };
+    }
+    function refreshTok() { TOK = buildTok(); tTok.n.textContent = Math.round(TOK.totS) + 'M'; }
+    refreshTok();
+    var SNAP_TOK = TOK;
+    var tokBins = [], tokView = 'cum', tokSel = null;
+    function drawTokensLens(ctx2, g) {
+      tokBins = [];
+      var cum = tokView === 'cum';
+      var rB = g.r0 * 1.7;
+      var spanOut = g.R * 0.94 - rB, spanIn = rB - g.r0 * 0.8;
+      var d0 = Math.ceil(S), d1 = Math.floor(Math.min(T, E));
+      var cs = 0, cv2 = 0, maxS = 0.001, maxV = 0.001, rows = [];
+      for (var d2 = d0; d2 <= d1; d2++) { var sp = TOK.spent[d2] || 0, sv = TOK.saved[d2] || 0; cs += sp; cv2 += sv; rows.push({ d: d2, sp: sp, sv: sv, cs: cs, cv: cv2 }); }
+      rows.forEach(function (r2) { maxS = Math.max(maxS, cum ? r2.cs : r2.sp); maxV = Math.max(maxV, cum ? r2.cv : r2.sv); });
+      ctx2.strokeStyle = hair(.12); ctx2.lineWidth = 1 / Z;
+      ctx2.beginPath(); ctx2.arc(0, 0, rB, BASE, BASE + TAU - SEAM); ctx2.stroke();
+      var wA = (TAU - SEAM) / Math.max(1, (Math.floor(E) - Math.ceil(S) + 1));
+      rows.forEach(function (r2) {
+        var a = BASE + (TAU - SEAM) * ((r2.d + 0.5 - S) / Math.max(0.5, E - S));
+        var hS = ((cum ? r2.cs : r2.sp) / maxS) * spanOut;
+        var wBar = Math.max(1.5, wA * rB * 0.55) / Math.max(1, Math.sqrt(Z));
+        var isSelDay = tokSel === r2.d;
+        if (cum) {
+          var hV = ((r2.cv) / maxV) * spanIn;
+          ctx2.lineWidth = wBar;
+          ctx2.strokeStyle = hex2rgba(PAL.decision, 0.55);
+          ctx2.beginPath(); ctx2.moveTo(Math.cos(a) * rB, Math.sin(a) * rB); ctx2.lineTo(Math.cos(a) * (rB + hS), Math.sin(a) * (rB + hS)); ctx2.stroke();
+          ctx2.strokeStyle = hex2rgba(PAL.done, 0.6);
+          ctx2.beginPath(); ctx2.moveTo(Math.cos(a) * rB, Math.sin(a) * rB); ctx2.lineTo(Math.cos(a) * (rB - hV), Math.sin(a) * (rB - hV)); ctx2.stroke();
+        } else {
+          var hV2 = ((r2.sv) / maxV) * spanOut * 0.85;
+          ctx2.lineWidth = wBar;
+          ctx2.strokeStyle = hex2rgba(PAL.decision, isSelDay ? 0.9 : 0.5);
+          ctx2.beginPath(); ctx2.moveTo(Math.cos(a) * rB, Math.sin(a) * rB); ctx2.lineTo(Math.cos(a) * (rB + hS), Math.sin(a) * (rB + hS)); ctx2.stroke();
+          ctx2.lineWidth = Math.max(1.2, wBar * 0.38);
+          ctx2.strokeStyle = hex2rgba(PAL.done, isSelDay ? 1 : 0.8);
+          ctx2.beginPath(); ctx2.moveTo(Math.cos(a) * rB, Math.sin(a) * rB); ctx2.lineTo(Math.cos(a) * (rB + hV2), Math.sin(a) * (rB + hV2)); ctx2.stroke();
+          ctx2.lineWidth = 1 / Z;
+          ctx2.fillStyle = hex2rgba(PAL.decision, isSelDay ? 1 : 0.85);
+          ctx2.beginPath(); ctx2.arc(Math.cos(a) * (rB + hS), Math.sin(a) * (rB + hS), (isSelDay ? 3.4 : 2.4) / Math.sqrt(Z), 0, 7); ctx2.fill();
+          ctx2.fillStyle = hex2rgba(PAL.done, isSelDay ? 1 : 0.85);
+          ctx2.beginPath(); ctx2.arc(Math.cos(a) * (rB + hV2), Math.sin(a) * (rB + hV2), (isSelDay ? 2.8 : 2) / Math.sqrt(Z), 0, 7); ctx2.fill();
+          if (isSelDay) { ctx2.strokeStyle = ink(.5); ctx2.beginPath(); ctx2.arc(0, 0, rB, a - 0.02, a + 0.02); ctx2.stroke(); }
+        }
+        tokBins.push({ d: r2.d, sp: r2.sp, sv: r2.sv, cs: r2.cs, cv: r2.cv, a: a, rTip: rB + hS });
+      });
+      ctx2.lineWidth = 1 / Z;
+      var pct = TOK.totS > 0 ? Math.round(100 * TOK.totV / TOK.totS) : 0;
+      var nDays = Math.max(1, rows.length);
+      lensLabels.push({ x: 0, y: g.R + 42, cap: true,
+        t: cum
+          ? 'tokens · cumulative · outward = spent ' + Math.round(TOK.totS) + 'M · inward = est. saved ' + TOK.totV.toFixed(1) + 'M (~' + pct + '%, from 12-token fact recalls vs ~3k replays)'
+          : 'tokens · per day · avg ' + (cs / nDays).toFixed(1) + 'M/day spent · peak ' + maxS.toFixed(1) + 'M · est. saved avg ' + (cv2 / nDays * 1000).toFixed(0) + 'k/day' });
+    }
+
+    function drawLensInFrame(ctx2, g, time) {
+      cells.forEach(function (c) { c._x = undefined; c._on = false; c._bx = undefined; });
+      if (lens === 'arc') { drawArcLens(ctx2, g, time); return; }   // M25
+      if (lens === 'data') { drawDataLens(ctx2, g); return; }
+      if (lens === 'tokens') { drawTokensLens(ctx2, g); return; }
+      if (lens === 'receipts') { drawReceiptsLens(ctx2, g, time); return; }
+      var groups = lens === 'memory'
+        ? [['gate', PAL.gate], ['decision', PAL.decision], ['memory', PAL.memory], ['handoff', PAL.handoff], ['incident', PAL.incident]]
+        : [['claude-work', PAL.memory], ['codex-work', PAL.codex], ['untraced', PAL.untraced]];
+      var keyOf = function (c) { return lens === 'memory' ? c.kind : (c.actor || 'untraced'); };
+      var N2 = groups.length;
+      groups.forEach(function (grp, gi) {
+        var k2 = grp[0], hue2 = grp[1];
+        var a0 = BASE + (gi / N2) * (TAU - SEAM), a1 = BASE + ((gi + 1) / N2) * (TAU - SEAM);
+        ctx2.strokeStyle = hair(.06); ctx2.lineWidth = 1 / Z;
+        ctx2.beginPath(); ctx2.moveTo(Math.cos(a0) * g.r0, Math.sin(a0) * g.r0); ctx2.lineTo(Math.cos(a0) * g.R, Math.sin(a0) * g.R); ctx2.stroke();
+        var members = cells.filter(function (c) { return keyOf(c) === k2 && c.day <= T && c.day >= S && c.day <= E && passFilter(c); });
+        ctx2.strokeStyle = hex2rgba(hue2, 0.5); ctx2.lineWidth = 3 / Z;
+        ctx2.beginPath(); ctx2.arc(0, 0, g.R + 3, a0 + 0.02, a1 - 0.02); ctx2.stroke();
+        ctx2.lineWidth = 1 / Z;
+        var mid = (a0 + a1) / 2;
+        lensLabels.push({ x: Math.cos(mid) * (g.R + 20), y: Math.sin(mid) * (g.R + 20), t: k2 + ' · ' + members.length });
+        members.forEach(function (c) {
+          var a = a0 + (a1 - a0) * (0.08 + c.ja * 0.84);
+          var r = dayR(g, c.day) * (0.995 + c.jr * 0.01);
+          var x = Math.cos(a) * r, y = Math.sin(a) * r, isH = hover === c;
+          var alpha = c.real ? 0.9 : 0.45;
+          if (lens === 'memory') { var ageFrac = Math.max(0, Math.min(1, (T - c.day) / Math.max(0.5, E - S))); alpha *= 1 - 0.5 * ageFrac; }
+          var rr = (c.real ? 3.2 : 2.4) * (isH ? 1.8 : 1);
+          ctx2.fillStyle = hex2rgba(hue2, alpha * (hover && !isH ? 0.5 : 1));
+          if (c.kind === 'gate' && c.real) {
+            ctx2.beginPath(); ctx2.moveTo(x, y - rr - 1); ctx2.lineTo(x + rr, y); ctx2.lineTo(x, y + rr + 1); ctx2.lineTo(x - rr, y); ctx2.closePath(); ctx2.fill();
+          } else { ctx2.beginPath(); ctx2.arc(x, y, rr, 0, 7); ctx2.fill(); }
+          if (isH) { ctx2.strokeStyle = hex2rgba(hue2, 0.95); ctx2.beginPath(); ctx2.arc(x, y, rr + 4 / Z, 0, 7); ctx2.stroke(); }
+          c._x = x; c._y = y; c._dr = rr; c._on = true;
+        });
+      });
+      lensLabels.push({ x: 0, y: g.R + 42, cap: true,
+        t: lens === 'memory' ? 'memory lens · sector = fact kind · ring = day · fade = age (decay illustrative)' : 'sessions lens · sector = agent passport · ring = day · untraced plans have no actor' });
+    }
+    function drawReceiptsLens(ctx2, g, time) {
+      var teeth = 120;
+      var sealedFrac = Math.max(0, Math.min(1, (T - S) / Math.max(0.5, E - S)));
+      for (var i = 0; i < teeth; i++) {
+        var a = BASE + (i / teeth) * (TAU - SEAM);
+        var sealed = i / teeth <= sealedFrac;
+        ctx2.strokeStyle = sealed ? hex2rgba(PAL.done, .8) : hair(.10); ctx2.lineWidth = (sealed ? 1.8 : 1) / Z;
+        ctx2.beginPath(); ctx2.moveTo(Math.cos(a) * g.R, Math.sin(a) * g.R); ctx2.lineTo(Math.cos(a) * (g.R + (sealed ? 9 : 6)), Math.sin(a) * (g.R + (sealed ? 9 : 6))); ctx2.stroke();
+      }
+      ctx2.lineWidth = 1 / Z;
+      var n = Math.floor(90 * sealedFrac) + 8;
+      for (var j = 0; j < n; j++) {
+        var a2 = j * 2.399963;
+        var r = g.r0 + (g.R - g.r0) * (0.12 + (j / 98) * 0.78);
+        ctx2.fillStyle = hex2rgba(PAL.done, 0.25 + (j / n) * 0.5);
+        ctx2.beginPath(); ctx2.arc(Math.cos(a2) * r, Math.sin(a2) * r, 1.8, 0, 7); ctx2.fill();
+      }
+      lensLabels.push({ x: 0, y: g.R + 42, cap: true, t: 'receipts lens · chain ticks forward only · illustrative until /v1/receipts/export is wired' });
+    }
+
+    // =====================================================================
+    //  M25 — "ExecPlans arc" lens (additive; the five lenses above are
+    //  untouched). 270° from 12 o'clock clockwise to 9 o'clock; one concentric
+    //  arc per ExecPlan; newest plan innermost; completed plans fade and the
+    //  stack collapses inward. All model maths lives in the pure arc* helpers
+    //  above renderRings — this half is geometry, paint and hit-testing.
+    // =====================================================================
+    var ARC_A0 = -Math.PI / 2;              // 12 o'clock
+    var ARC_SPAN = Math.PI * 1.5;           // 270°, clockwise → 9 o'clock
+    var ARC_DAY0 = Date.UTC(2026, 4, 7);    // ring day 0 (see dayDate)
+    var ARC_BAR_MIN = 10000;                // token-bar log floor — the SAME floor cx-cost uses
+    function arcMsOfDay(d) { return ARC_DAY0 + d * 86400000; }
+    // The ring's clock ticks in DAYS (day N is the instant of its midnight), so
+    // "as of T" means the END of day T — otherwise a plan created at 09:00 today
+    // reads as not-yet-started at T = today. Measured: three of the sixteen
+    // picked tracks vanished on the review corpus before this was applied.
+    function arcClockMs() { return arcMsOfDay(Math.floor(T) + 1) - 1; }
+    function arcDayOfMs(ms) { return (ms - ARC_DAY0) / 86400000; }
+    var arcTracks = [], arcSrc = 'snapshot', arcTotal = 0, arcActiveN = 0, arcCompleting = 0;
+    var arcOrderVia = 'created_at', arcOrderMix = {}, arcViaMix = {}, arcBarMax = 0;
+    var arcWork = null, arcFactIdx = null;
+    var arcHoverT = null, arcHoverD = null, arcSelT = null, arcLabelBoxes = [];
+
+    // The snapshot degradation: the embedded RINGS_PLANS_RAW board, shaped like
+    // /v1/work items so ONE model path serves both. Titles are the shortened
+    // slug because the snapshot carries no titles — stated, not invented.
+    function arcSnapshotItems() {
+      return PLANS.map(function (p) {
+        return { id: 'execplan:' + p.slug, title: p.short,
+          state: p.st === 0 ? 'complete' : p.st === 2 ? 'blocked' : 'in_progress',
+          milestones_done: p.done, milestones_total: p.total,
+          created_at_unix_ms: arcMsOfDay(p.b), updated_at_unix_ms: arcMsOfDay(p.e),
+          token_burn: p.o ? { output_tokens: p.o * 100000 } : null, __snapPlan: p };
+      });
+    }
+    // Dots come from the fact walk the DATA lens already performs (one pass over
+    // /v1/facts/list) — the arc lens adds no network call of its own. Snapshot
+    // mode falls back to the ring's own illustrative cells.
+    function arcSnapFactsFor(slug) {
+      var out = [];
+      PLANS.forEach(function (p) {
+        if (p.slug !== slug) { return; }
+        p.cells.forEach(function (c) { out.push({ key: c.key, ms: arcMsOfDay(c.day), real: !!c.real }); });
+      });
+      return out;
+    }
+    function arcBuild() {
+      var live = !!(arcWork && arcWork.length);
+      var items = live ? arcWork : arcSnapshotItems();
+      arcSrc = live ? 'live · /v1/work?source=all' : 'snapshot';
+      var sel = arcSelectPlans(items, arcMsOfDay(NOW), ARC_TRACK_CAP);
+      arcTotal = sel.total; arcActiveN = sel.active; arcCompleting = sel.completing;
+      var starts = {}, vias = {};
+      arcTracks = sel.picked.map(function (w) {
+        var slug = w.id.slice(9);
+        var pr = arcProgress(w), st = arcStartMs(w);
+        starts[st.via] = (starts[st.via] || 0) + 1;
+        var fs = arcFactIdx ? (arcFactIdx[w.id] || []) : arcSnapFactsFor(slug);
+        var total = Number(w.milestones_total) || 0;
+        var t0 = st.ms, t1 = Math.max(Number(w.updated_at_unix_ms) || t0, t0 + 1);
+        var marks = [];
+        fs.forEach(function (f) {
+          var n = arcKeyMilestone(f.key);
+          if (n != null && total > 0) { marks.push({ ms: f.ms, f: Math.max(0, Math.min(1, n / total)) }); }
+        });
+        marks.sort(function (a, b) { return a.ms - b.ms; });
+        var dots = fs.map(function (f) {
+          var pos = arcFactFrac(f, total, marks, t0, t1);
+          vias[pos.via] = (vias[pos.via] || 0) + 1;
+          return { f: pos.f, via: pos.via, kind: arcDotKind(f.key), key: f.key, ms: f.ms };
+        });
+        return { slug: slug, id: w.id, title: w.title || slug, state: w.state || '?',
+          frac: pr.f, fracVia: pr.via, measured: pr.measured, total: total,
+          cur: w.current_milestone || null,
+          startMs: st.ms, startVia: st.via, updMs: t1,
+          done: (w.state === 'complete' || w.state === 'archive'), doneMs: t1,
+          burn: arcBurn(w), dots: dots, nDots: dots.length,
+          rT: null, _r: null, _a: null, alphaT: 0 };
+      });
+      arcOrderMix = starts; arcViaMix = vias;
+      arcOrderVia = (starts['provenance.first_activity'] || 0) >= (starts['created_at'] || 0) ? 'provenance.first_activity' : 'created_at';
+      arcBarMax = ARC_BAR_MIN;
+      arcTracks.forEach(function (t) { if (t.burn > arcBarMax) { arcBarMax = t.burn; } });
+      arcHoverT = null; arcHoverD = null; arcSelT = null; arcLabelBoxes = [];
+      tArc.n.textContent = arcTracks.length + ' / ' + (arcTotal || 0);
+    }
+    // Radial slots + eased transitions. A track whose alpha target is 0 (not yet
+    // started as of the scrub time, or faded out after completing) surrenders its
+    // slot — the survivors re-slot and EASE inward, which is the collapse.
+    function arcStep(dt) {
+      var g = geom(), atMs = arcClockMs(), slots = [];
+      arcTracks.forEach(function (t) { t.alphaT = arcAlphaAt(t, atMs); if (t.alphaT > 0.02) { slots.push(t); } });
+      var n = Math.max(1, slots.length);
+      var rIn = g.r0 * 1.35, rOut = g.R * 0.94;
+      arcGap = n > 1 ? (rOut - rIn) / (n - 1) : (rOut - rIn);
+      slots.forEach(function (t, i) { t.rT = n > 1 ? rIn + (rOut - rIn) * (i / (n - 1)) : (rIn + rOut) / 2; });
+      var k = REDUCED ? 1 : Math.min(1, dt * 6);
+      arcTracks.forEach(function (t) {
+        if (t.rT == null) { t.rT = rOut; }
+        if (t._r == null) { t._r = t.rT; t._a = 0; }
+        t._r = mix(t._r, t.rT, k);
+        t._a = mix(t._a, t.alphaT, k);
+      });
+    }
+    var arcGap = 20;
+    function arcHue(t) {
+      if (t.done) { return PAL.done; }
+      if (t.state === 'blocked') { return PAL.block; }
+      if (t.state === 'drafting' || t.state === 'planned') { return PAL.untraced; }
+      if (t.state === 'review') { return PAL.gate; }
+      return PAL.prog;
+    }
+    var ARC_DOT_HUE = { milestone: 'gate', decision: 'decision', handoff: 'handoff', fact: 'memory' };
+    function arcNum(n) {
+      if (!isFinite(n)) { return '—'; }
+      if (n >= 1e6) { return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + 'M'; }
+      if (n >= 1000) { return (n / 1000).toFixed(n >= 1e5 ? 0 : 1) + 'k'; }
+      return String(Math.round(n));
+    }
+    function arcFitText(c2, s, maxW) {
+      var t = String(s || '');
+      if (c2.measureText(t).width <= maxW) { return t; }
+      var lo = 1, hi = t.length;
+      while (lo < hi) {
+        var mid = (lo + hi + 1) >> 1;
+        if (c2.measureText(t.slice(0, mid) + '…').width <= maxW) { lo = mid; } else { hi = mid - 1; }
+      }
+      return t.slice(0, lo) + '…';
+    }
+    function drawArcLens(ctx2, g, time) {
+      var zdot = zoomDotScale();   // M24 — zoom separates dot clusters here too
+      var vis = [];
+      arcTracks.forEach(function (t) { t.dots.forEach(function (d) { d._x = undefined; }); if (t._a > 0.02) { vis.push(t); } });
+      var atMs = arcClockMs();
+      // ---- axes: the 12 o'clock start line is the frame's own accent line;
+      //      the 9 o'clock line is completion.
+      ctx2.strokeStyle = hex2rgba(PAL.done, 0.42); ctx2.lineWidth = 1.4 / Z;
+      ctx2.beginPath(); ctx2.moveTo(-g.r0 * 0.9, 0); ctx2.lineTo(-(g.R + 14), 0); ctx2.stroke();
+      ctx2.fillStyle = hex2rgba(PAL.done, 0.75); ctx2.font = '700 ' + (9.5 / Z) + 'px ' + MONO;
+      ctx2.textAlign = 'left'; ctx2.textBaseline = 'bottom';
+      ctx2.fillText('100% · complete', -(g.R + 12), -4 / Z);
+      ctx2.textAlign = 'center'; ctx2.fillStyle = acc(0.8);
+      ctx2.fillText('0%', 0, -(g.R + 18));
+      ctx2.textBaseline = 'alphabetic';
+      // ---- pass 1: every track's UNSWEPT remainder, one style for all of them
+      ctx2.strokeStyle = hair(0.075); ctx2.lineWidth = 1.4 / Z; ctx2.setLineDash([]);
+      vis.forEach(function (t) {
+        if (t.frac >= 0.999) { return; }
+        ctx2.beginPath(); ctx2.arc(0, 0, t._r, ARC_A0 + ARC_SPAN * t.frac, ARC_A0 + ARC_SPAN); ctx2.stroke();
+      });
+      // ---- pass 2: progress arcs, grouped by state hue then by measured/estimated
+      //      (dash state is set once per group, not per track).
+      var buckets = {};
+      vis.forEach(function (t) { var h = arcHue(t); (buckets[h] = buckets[h] || []).push(t); });
+      Object.keys(buckets).forEach(function (h) {
+        [true, false].forEach(function (meas) {
+          var set = buckets[h].filter(function (t) { return t.measured === meas; });
+          if (!set.length) { return; }
+          ctx2.setLineDash(meas ? [] : [5 / Z, 5 / Z]);
+          set.forEach(function (t) {
+            var lit = (t === arcHoverT || t === arcSelT);
+            ctx2.strokeStyle = hex2rgba(h, (lit ? 1 : 0.82) * t._a);
+            ctx2.lineWidth = (lit ? 5.5 : 3.4) / Z;
+            ctx2.beginPath(); ctx2.arc(0, 0, t._r, ARC_A0, ARC_A0 + ARC_SPAN * Math.max(t.frac, 0.003)); ctx2.stroke();
+            // the start tick at 12 — a just-started plan reads as a LINE at 12
+            ctx2.beginPath();
+            ctx2.moveTo(0, -(t._r - 5 / Z)); ctx2.lineTo(0, -(t._r + 5 / Z)); ctx2.stroke();
+          });
+        });
+      });
+      ctx2.setLineDash([]); ctx2.lineWidth = 1 / Z;
+      // ---- pass 3: dots ON the arc, batched by kind (one hue per group).
+      //      Milestones are the big diamonds; decisions / handoffs / other facts
+      //      are smaller circles. Radius is damped by zoom (M24 zoomDotScale) so
+      //      a cluster resolves as you zoom in.
+      ['milestone', 'decision', 'handoff', 'fact'].forEach(function (kind) {
+        var hue = KIND_HUE[ARC_DOT_HUE[kind]] || PAL.memory;
+        var big = kind === 'milestone';
+        vis.forEach(function (t) {
+          var some = false;
+          for (var i = 0; i < t.dots.length; i++) { if (t.dots[i].kind === kind && t.dots[i].ms <= atMs) { some = true; break; } }
+          if (!some) { return; }
+          ctx2.fillStyle = hex2rgba(hue, (big ? 0.95 : 0.72) * t._a);
+          t.dots.forEach(function (d) {
+            if (d.kind !== kind || d.ms > atMs) { return; }
+            var a = ARC_A0 + ARC_SPAN * d.f;
+            var x = Math.cos(a) * t._r, y = Math.sin(a) * t._r;
+            var rr = (big ? 3.6 : 2.3) * zdot * (d === arcHoverD ? 1.8 : 1);
+            if (big) {
+              ctx2.beginPath();
+              ctx2.moveTo(x, y - rr - 0.8); ctx2.lineTo(x + rr, y); ctx2.lineTo(x, y + rr + 0.8); ctx2.lineTo(x - rr, y);
+              ctx2.closePath(); ctx2.fill();
+            } else {
+              ctx2.beginPath(); ctx2.arc(x, y, rr, 0, 7); ctx2.fill();
+            }
+            d._x = x; d._y = y; d._r = rr;
+          });
+        });
+      });
+      // ---- pass 4: the 12 o'clock label column (LEFT of the line) and, further
+      //      left again, the token-burn bar. Same log idiom as cx-cost's bars
+      //      (logBarPos, 10k floor), adaptive to the tracks on screen.
+      var LBLW = g.R * 0.44, BARW = g.R * 0.18, GAP = 9 / Z, PADR = 7 / Z;
+      var labelRight = -PADR, barRight = labelRight - LBLW - GAP;
+      arcLabelBoxes = [];
+      ctx2.font = '600 ' + (10.5 / Z) + 'px ' + MONO;
+      ctx2.textAlign = 'right'; ctx2.textBaseline = 'middle';
+      vis.forEach(function (t) {
+        var y = -t._r;
+        ctx2.fillStyle = (t === arcHoverT || t === arcSelT) ? ink(1) : ink2c(0.92 * t._a);
+        ctx2.fillText(arcFitText(ctx2, t.title, LBLW), labelRight, y);
+        if (t.burn) {
+          var w2 = BARW * logBarPos(t.burn, ARC_BAR_MIN, arcBarMax);
+          ctx2.fillStyle = hex2rgba(PAL.accent, 0.6 * t._a);
+          ctx2.fillRect(barRight - w2, y - 2 / Z, w2, 4 / Z);
+        }
+        arcLabelBoxes.push({ t: t, x0: barRight - BARW, x1: labelRight, y: y });
+      });
+      // the token-bar column's own axis label, once
+      ctx2.font = (8.5 / Z) + 'px ' + MONO; ctx2.fillStyle = ink3c(0.8);
+      ctx2.textAlign = 'left';
+      ctx2.fillText('token burn (log, 10k → ' + arcNum(arcBarMax) + ')', barRight - BARW, -(g.R * 0.94) - 14 / Z);
+      ctx2.textAlign = 'left'; ctx2.textBaseline = 'alphabetic';
+      // ---- the honest notes, on the canvas where the claim is made.
+      var estN = 0; vis.forEach(function (t) { if (!t.measured) { estN++; } });
+      lensLabels.push({ x: 0, y: g.R + 42, cap: true,
+        t: 'ExecPlans arc · 12 → 9 o\'clock = 0 → 100% of declared milestones · showing ' + vis.length + ' of ' + arcTotal + ' plans — active first (' + arcActiveN + ' active, ' + arcCompleting + ' just-completed, fading) · ' + arcSrc });
+      lensLabels.push({ x: 0, y: g.R + 42 + 15 / Z, cap: true,
+        t: 'solid arc = measured (current_milestone / milestones_total) · dashed = state-estimated, ' + estN + ' here · dots: ◆ milestone · ● decision · ● handoff · ● other fact — ' + (arcViaMix.index || 0) + ' placed by milestone index, ' + (arcViaMix.bucket || 0) + ' by milestone bucket, ' + (arcViaMix.time || 0) + ' by timeline fraction' });
+      lensLabels.push({ x: 0, y: g.R + 42 + 30 / Z, cap: true,
+        t: 'newest plan innermost · radial order from ' + arcOrderVia + ' · a completed plan fades over ' + ARC_FADE_DAYS + ' days and the stack collapses inward (scrub or play the window to watch it)' });
+      if (typeof window !== 'undefined' && window.__CRUX_CONSOLE_DEV__) {
+        var nd = 0; vis.forEach(function (t) { nd += t.dots.length; });
+        window.__ringsArc = { tracks: vis.length, total: arcTotal, active: arcActiveN, completing: arcCompleting,
+          dots: nd, src: arcSrc, orderVia: arcOrderVia, orderMix: arcOrderMix, viaMix: arcViaMix,
+          factEntities: arcFactIdx ? Object.keys(arcFactIdx).length : -1,
+          estimated: estN, barMax: arcBarMax, radii: vis.map(function (t) { return Math.round(t._r); }),
+          alphas: vis.map(function (t) { return +t._a.toFixed(3); }),
+          titles: vis.map(function (t) { return t.title; }) };
+      }
+    }
+    // ---- arc hit-testing: label column first (it is the biggest target), then
+    //      dots, then the track band. Reuses the ring's own toDisc/geom.
+    function arcAt(e) {
+      var r = cv.getBoundingClientRect(), g = geom();
+      var p = toDisc(g, e.clientX - r.left, e.clientY - r.top);
+      for (var li = 0; li < arcLabelBoxes.length; li++) {
+        var b = arcLabelBoxes[li];
+        if (p.x >= b.x0 && p.x <= b.x1 && Math.abs(p.y - b.y) < Math.max(6 / Z, arcGap * 0.45)) { return { t: b.t, label: true }; }
+      }
+      var vis = arcTracks.filter(function (t) { return t._a > 0.3; });
+      var best = null, bd = 9 / Z;
+      vis.forEach(function (t) {
+        t.dots.forEach(function (d) {
+          if (d._x === undefined) { return; }
+          var dd = Math.hypot(d._x - p.x, d._y - p.y);
+          if (dd < bd + d._r) { bd = dd; best = { t: t, dot: d }; }
+        });
+      });
+      if (best) { return best; }
+      var pr = Math.hypot(p.x, p.y), pa = Math.atan2(p.y, p.x);
+      var aRel = pa - ARC_A0; while (aRel < 0) { aRel += TAU; }
+      if (aRel <= ARC_SPAN + 0.06) {
+        var band = Math.max(4 / Z, Math.min(11 / Z, arcGap * 0.45));
+        for (var i = 0; i < vis.length; i++) { if (Math.abs(pr - vis[i]._r) < band) { return { t: vis[i] }; } }
+      }
+      return null;
+    }
+    function arcPointerMove(e) {
+      var h = arcAt(e);
+      arcHoverT = h ? h.t : null; arcHoverD = (h && h.dot) || null;
+      hover = null; hoverSec = null;
+      if (!h) { hideTip(); return; }
+      var t = h.t;
+      if (h.dot) {
+        showTip(e.clientX, e.clientY, [tb(h.dot.key), br(),
+          tk('plan'), ' ' + t.title, br(),
+          tk('stored'), ' ' + dayDate(arcDayOfMs(h.dot.ms)), br(),
+          tk('on the arc at'), ' ' + Math.round(h.dot.f * 100) + '% ', tk('(' + h.dot.via + '-mapped)')]);
+        return;
+      }
+      showTip(e.clientX, e.clientY, [tb(t.title), br(),
+        tk('slug'), ' ' + t.slug, br(),
+        tk(t.state), ' · ' + Math.round(t.frac * 100) + '% ' + (t.measured ? ('(' + t.fracVia + (t.cur ? ' ' + t.cur : '') + (t.total ? ' of ' + t.total : '') + ')') : '(state-estimated — no milestone position reported)'), br(),
+        tk('started'), ' ' + dayDate(arcDayOfMs(t.startMs)) + ' ', tk('(' + t.startVia + ')'), br(),
+        tk('facts'), ' ' + t.nDots, (t.burn ? br() : null), (t.burn ? tk('token burn') : null), (t.burn ? ' ' + arcNum(t.burn) : null)]);
+    }
+    // Click reuses the EXISTING plan detail: when the plan is on the ring's own
+    // board the pane is the identical planBlock the ExecPlans lens opens. Solo is
+    // deliberately NOT forked here — solo is an ExecPlans-lens reframing of the
+    // work ring and has no meaning on the arc geometry.
+    function arcClick(e) {
+      var h = arcAt(e);
+      if (!h || arcSelT === h.t) { arcSelT = null; setSel(null); return; }
+      arcSelT = h.t;
+      for (var i = 0; i < PLANS.length; i++) {
+        if (PLANS[i].slug === h.t.slug) { setSel({ type: 'plan', p: PLANS[i] }); return; }
+      }
+      arcPane(h.t);
+    }
+    function arcPane(t) {
+      sel = null; pinned = null;
+      pane.textContent = '';
+      pane.appendChild(el('h4', { text: t.title }));
+      pane.appendChild(el('span', { 'class': 'kindchip' }, [el('i', { style: 'background:' + arcHue(t) }), t.state + (t.measured ? '' : ' · progress estimated')]));
+      var bar = el('div', { 'class': 'bar' }); var bi = el('i');
+      bi.style.width = Math.round(100 * t.frac) + '%'; bi.style.background = arcHue(t); bar.appendChild(bi);
+      pane.appendChild(bar);
+      pane.appendChild(pRow('slug', t.slug));
+      pane.appendChild(pRow('progress', Math.round(t.frac * 100) + '% · ' + (t.measured ? ('measured from ' + t.fracVia + (t.cur ? ' (' + t.cur + ' of ' + t.total + ')' : '')) : 'state-estimated — this plan reports no current_milestone / milestones_total')));
+      pane.appendChild(pRow('started', dayDate(arcDayOfMs(t.startMs)) + ' (' + t.startVia + ')'));
+      pane.appendChild(pRow('last update', dayDate(arcDayOfMs(t.updMs))));
+      pane.appendChild(pRow('facts on the arc', String(t.nDots)));
+      if (t.burn) { pane.appendChild(pRow('token burn', arcNum(t.burn) + ' (context + output)')); }
+      pane.appendChild(el('p', { 'class': 'note', text: 'Not on the ExecPlans ring (that lens keeps the plans with a first-activity provenance stamp), so this is the arc lens\'s own read of the same /v1/work item.' }));
+      pane.classList.add('open');
+    }
+
+    function kick() { if (rafId === null && !paused && cv.isConnected) { rafId = requestAnimationFrame(draw); } }
+
+    // ---- controls ----
+    function setPlaying(v) {
+      playing = v;
+      bPlay.innerHTML = v ? RIC.pause : RIC.play;
+      bPlay.setAttribute('aria-pressed', String(v));
+      if (v && !showCompleted) { setCompleted(true); }
+      if (v && !showLedger) { setLedger(true); }
+    }
+    function setLedger(v) { showLedger = v; bLedger.setAttribute('aria-pressed', String(v)); }
+    function setCompleted(v) { showCompleted = v; bDone.setAttribute('aria-pressed', String(v)); }
+    bPlay.addEventListener('click', function () { if (!playing && T >= E - 0.01) { T = S; } setPlaying(!playing); });
+    bSpin.addEventListener('click', function () { spinning = !spinning; bSpin.setAttribute('aria-pressed', String(spinning)); });
+    bDone.addEventListener('click', function () { setCompleted(!showCompleted); });
+    bLedger.addEventListener('click', function () { setLedger(!showLedger); });
+    bClock.addEventListener('click', function () { resetTween = true; spinning = false; bSpin.setAttribute('aria-pressed', 'false'); });
+    bMode.addEventListener('click', function () { mode = mode === 'dots' ? 'bars' : 'dots'; bMode.setAttribute('aria-pressed', String(mode === 'bars')); });
+    bDir.addEventListener('click', function () { dir = dir === 'out' ? 'in' : 'out'; bDir.setAttribute('aria-pressed', String(dir === 'in')); });
+    bAll.addEventListener('click', function () { showAll = !showAll; bAll.setAttribute('aria-pressed', String(showAll)); });
+    bState.addEventListener('click', function () { colorByState = !colorByState; bState.setAttribute('aria-pressed', String(colorByState)); });
+    bLin.addEventListener('click', function () { showLineage = !showLineage; bLin.setAttribute('aria-pressed', String(showLineage)); });
+    function syncWindow() {
+      var s = Math.min(rStart.value / 1000, rEnd.value / 1000 - 0.03);
+      var e = Math.max(rEnd.value / 1000, rStart.value / 1000 + 0.03);
+      S = 11 + s * (NOW - 11); E = 11 + e * (NOW - 11); T = Math.max(S, Math.min(E, T));
+      rTime.value = Math.round((T - S) / Math.max(0.5, E - S) * 1000);
+      cDate.textContent = dayDate(T); dStart.value = dayDate(S); dEnd.value = dayDate(E);
+      lblStart.textContent = dayDate(S); lblEnd.textContent = dayDate(E);   // M19 static range labels (topbar play bar)
+    }
+    rStart.addEventListener('input', syncWindow);
+    rEnd.addEventListener('input', syncWindow);
+    function dateToDay(v) { return Date.parse(v + 'T00:00:00Z') / 86400000 - 20580; }
+    dStart.addEventListener('change', function () { var d = Math.max(11, Math.min(NOW - 1, dateToDay(dStart.value))); rStart.value = Math.round((d - 11) / (NOW - 11) * 1000); syncWindow(); });
+    dEnd.addEventListener('change', function () { var d = Math.max(12, Math.min(NOW, dateToDay(dEnd.value))); rEnd.value = Math.round((d - 11) / (NOW - 11) * 1000); syncWindow(); });
+    rTime.addEventListener('input', function () { T = S + (rTime.value / 1000) * (E - S); setPlaying(false); cDate.textContent = dayDate(T); });
+    function zoomAt(sx, sy, factor) { var g = geom(); var before = toDisc(g, sx, sy); Z = Math.max(0.6, Math.min(7, Z * factor)); var after = toScreen(g, before.x, before.y); panX += sx - after.x; panY += sy - after.y; }
+    cv.addEventListener('wheel', function (e) { e.preventDefault(); var r = cv.getBoundingClientRect(); zoomAt(e.clientX - r.left, e.clientY - r.top, e.deltaY < 0 ? 1.15 : 1 / 1.15); }, { passive: false });
+    bZin.addEventListener('click', function () { zoomAt(W / 2, H / 2, 1.35); });
+    bZout.addEventListener('click', function () { zoomAt(W / 2, H / 2, 1 / 1.35); });
+    // ---- fit-to-view (M11): frame the ring inside the band left clear by the top
+    //      timeline + the bottom control bar (no overlap), and centre it there. Used
+    //      for the default fit, the fit button, and on solo / return-to-all. ----
+    function barPx(elm) { if (!elm) { return 0; } var r = elm.getBoundingClientRect(); return isFinite(r.height) ? r.height : 0; }
+    function fitView() {
+      if (!W || !H) { return; }
+      var g = geom();
+      // M19 — the play bar left the stage top (it now rides the shell topbar row),
+      // so only the bottom control bar reserves vertical space in the stage.
+      var topH = 14, botH = barPx(bottombar) + 12;
+      var availH = Math.max(60, H - topH - botH);
+      var availW = Math.max(60, W - 24);
+      // M12 — contentR reserves the full drawn extent past the ring (lens-label
+      // ring g.R+42, sector labels g.R+20, OD ticks g.R+13, flash rings ~g.R*1.14)
+      // and the 0.86 fill factor leaves a clear radius margin top+bottom so the
+      // ring stops clipping into the play/control bars at the default fit.
+      var contentR = g.R + 56;
+      Z = Math.max(0.6, Math.min(7, (Math.min(availW, availH) * 0.5 * 0.86) / contentR));
+      panX = 0;
+      var bandCenterY = topH + availH / 2;
+      panY = bandCenterY - g.cy;
+      if (typeof window !== 'undefined' && window.__CRUX_CONSOLE_DEV__) {
+        window.__ringsFit = { contentBottom: bandCenterY + contentR * Z, barTop: H - botH, topH: topH, botH: botH, Z: Z };
+      }
+    }
+    bZfit.addEventListener('click', fitView);
+    cv.addEventListener('pointerdown', function (e) { dragging = true; dragMoved = 0; lastPX = e.clientX; lastPY = e.clientY; cv.setPointerCapture(e.pointerId); });
+    cv.addEventListener('pointerup', function (e) { dragging = false; if (dragMoved < 5) { handleClick(e); } });
+    cv.addEventListener('pointermove', function (e) {
+      mxAbs = e.clientX; myAbs = e.clientY;
+      if (dragging) {
+        var dx = e.clientX - lastPX, dy = e.clientY - lastPY;
+        dragMoved += Math.abs(dx) + Math.abs(dy);
+        if (dragMoved > 5) { panX += dx; panY += dy; }
+        lastPX = e.clientX; lastPY = e.clientY; return;
+      }
+      if (lens === 'arc') { arcPointerMove(e); return; }   // M25
+      if (lens === 'tokens') {
+        var g2 = geom();
+        var pd = toDisc(g2, e.clientX - cv.getBoundingClientRect().left, e.clientY - cv.getBoundingClientRect().top);
+        var pr2 = Math.hypot(pd.x, pd.y);
+        var pa2 = Math.atan2(pd.y, pd.x); while (pa2 < BASE) { pa2 += TAU; }
+        var bin = null, bd2 = 0.05;
+        tokBins.forEach(function (b2) { var ba = b2.a; while (ba < BASE) { ba += TAU; } var da2 = Math.abs(pa2 - ba); if (da2 < bd2 && pr2 > g2.r0 * 0.7 && pr2 < g2.R) { bd2 = da2; bin = b2; } });
+        if (bin) {
+          showTip(e.clientX, e.clientY, [tb(dayDate(bin.d)), br(), tk('spent'), ' ' + bin.sp.toFixed(1) + 'M ', tk('day'), ' · ' + bin.cs.toFixed(1) + 'M ', tk('cum'), br(), tk('saved'), ' ' + bin.sv.toFixed(2) + 'M ', tk('day'), ' · ' + bin.cv.toFixed(2) + 'M ', tk('cum (est.)')]);
+        } else { hideTip(); }
+        hover = null; hoverSec = null; return;
+      }
+      hover = hitTest(e);
+      hoverSec = hover && hover.p ? hover.p : sectorAt(e);
+      if (hover && lens === 'data') {
+        var n = hover;
+        showTip(mxAbs, myAbs, [tb(n.k), br(), tk('entity'), ' ' + (n.e.length > 40 ? n.e.slice(0, 39) + '…' : n.e), br(), tk('source'), ' ' + dayDate(n.d) + (n.a ? '' : ''), (n.a ? tk('by') : null), (n.a ? ' ' + n.a : null), br(), tk('confidence'), ' ' + gEffConf(n).toFixed(2) + ' ', tk('(' + (n.h || 'none') + ')'), ' · ', tk('links'), ' ' + ((GADJ[n.i] || []).length)]);
+        return;
+      }
+      if (hover) {
+        var c = hover;
+        if (c.real) {
+          showTip(mxAbs, myAbs, [tb(c.key), (c.version > 1 ? ' ' : null), (c.version > 1 ? tk('v' + c.version) : null), br(), tk('plan'), ' ' + c.p.short, br(), tk('stored'), ' ' + dayDate(c.day) + ' ', tk('by'), ' ' + c.actor, br(), tk('kind'), ' ' + c.kind + ' · ', tk('horizon'), ' ' + c.horizon]);
+        } else {
+          showTip(mxAbs, myAbs, [tb(c.p.short), br(), tk(STATE[c.p.st] + ' · ' + c.p.done + '/' + c.p.total + ' · born ' + dayDate(c.p.b)), br(), tk(c.kind === 'gate' ? c.key : 'untraced density — one query_facts call away')]);
+        }
+      } else if (hoverSec) {
+        var p = hoverSec;
+        var nDepIn = DEP_EDGES.filter(function (ed) { return ed.b === p; }).length;
+        var parts = [tb(p.short), br(), tk(STATE[p.st] + ' · ' + p.done + '/' + p.total), br(), tk('born'), ' ' + dayDate(p.b) + ' ', tk('· last'), ' ' + dayDate(p.e)];
+        if (p.o) { parts.push(br(), tk('output'), ' ' + (p.o / 10).toFixed(1) + 'M tok'); }
+        if (p.od.length) { parts.push(br(), tk('open decisions'), ' ' + p.od.join(' ')); }
+        if (p.dep.length || nDepIn) { parts.push(br(), tk('lineage'), ' depends on ' + p.dep.length + ' · depended on by ' + nDepIn); }
+        showTip(mxAbs, myAbs, parts);
+      } else { hideTip(); }
+    });
+    function sectorAt(e) {
+      if (lens !== 'work') { return null; }
+      var r = cv.getBoundingClientRect(), g = geom();
+      var p = toDisc(g, e.clientX - r.left, e.clientY - r.top);
+      var pr = Math.hypot(p.x, p.y);
+      if (pr < g.r0 * 0.85 || pr > g.R + 30) { return null; }
+      var pa = Math.atan2(p.y, p.x);
+      for (var i = 0; i < PLANS.length; i++) {
+        var pl = PLANS[i];
+        if (!pl.lay || pl.lay.alpha < 0.4) { continue; }
+        var da = pa - pl.lay.a0; while (da < 0) { da += TAU; } while (da >= TAU) { da -= TAU; }
+        if (da <= pl.lay.a1 - pl.lay.a0) { return pl; }
+      }
+      return null;
+    }
+    cv.addEventListener('pointerleave', function () { hover = null; hoverSec = null; hideTip(); });
+    function hitTest(e) {
+      var r = cv.getBoundingClientRect(), g = geom();
+      var p = toDisc(g, e.clientX - r.left, e.clientY - r.top);
+      var pr = Math.hypot(p.x, p.y), pa = Math.atan2(p.y, p.x);
+      if (lens === 'data') {
+        var best2 = null, bd2 = 9 / Z;
+        GNODES.forEach(function (n) { if (!n._on || n._x === undefined) { return; } var d2 = Math.hypot(n._x - p.x, n._y - p.y); if (d2 < bd2 + n._dr) { bd2 = d2; best2 = n; } });
+        return best2;
+      }
+      if (solo) {
+        for (var si = 0; si < solo.cells.length; si++) {
+          var c0 = solo.cells[si];
+          if (c0._bx === undefined || c0.day > T) { continue; }
+          if (Math.abs(p.x - c0._bx) < 6 / Z && p.y < 5 / Z && p.y > -(c0._bh + 9 / Z)) { return c0; }
+        }
+      }
+      var best = null, bd = 10 / Z;
+      for (var ci = 0; ci < cells.length; ci++) {
+        var c = cells[ci];
+        if (c._x === undefined || c.day > T || !c.p.lay || c.p.lay.alpha < 0.3 || !passFilter(c)) { continue; }
+        var d = Math.hypot(c._x - p.x, c._y - p.y);
+        if (d < bd + c._dr) { bd = d; best = c; }
+        if (mode === 'bars' && !best) {
+          var da = pa - c._a; while (da > Math.PI) { da -= TAU; } while (da < -Math.PI) { da += TAU; }
+          if (Math.abs(da) * pr < 4 / Z && pr > g.r0 - 2 && pr < c._r + c._dr) { best = c; }
+        }
+      }
+      return best;
+    }
+    function handleClick(e) {
+      if (lens === 'arc') { arcClick(e); return; }   // M25
+      if (lens === 'data') {
+        var hit0 = hitTest(e); gSel = (hit0 && hit0.i !== undefined) ? (gSel === hit0.i ? null : hit0.i) : null;
+        if (gFocus) { if (gSel === null) { releaseDataFocus(); } else { applyDataFocus(); } }   // M13 — re-cluster / restore
+        return;
+      }
+      if (lens === 'tokens') {
+        var r2 = cv.getBoundingClientRect(), g2 = geom();
+        var pd = toDisc(g2, e.clientX - r2.left, e.clientY - r2.top);
+        var pr2 = Math.hypot(pd.x, pd.y);
+        var pa2 = Math.atan2(pd.y, pd.x); while (pa2 < BASE) { pa2 += TAU; }
+        var bin = null, bd2 = 0.05;
+        tokBins.forEach(function (b2) { var ba = b2.a; while (ba < BASE) { ba += TAU; } var da2 = Math.abs(pa2 - ba); if (da2 < bd2 && pr2 > g2.r0 * 0.7 && pr2 < g2.R + 14) { bd2 = da2; bin = b2; } });
+        if (bin && tokSel !== bin.d) { tokSel = bin.d; renderTokenDayPane(bin); } else { tokSel = null; pane.classList.remove('open'); }
+        return;
+      }
+      if (lens !== 'work') { return; }
+      var r = cv.getBoundingClientRect();
+      var cxp = e.clientX - r.left, cyp = e.clientY - r.top;
+      for (var li = 0; li < ledgerRows.length; li++) {
+        var row = ledgerRows[li];
+        if (cxp >= row.x && cxp <= row.x + row.w && cyp >= row.y && cyp <= row.y + row.h) {
+          if (solo === row.p) { setSel(null); solo = null; } else { solo = row.p; setSel({ type: 'plan', p: row.p }); }
+          fitView();   // zoom-to-fit the solo'd plan / the whole set on toggle-off
+          return;
+        }
+      }
+      var hit = hitTest(e);
+      if (hit) { setSel(sel && sel.c === hit ? null : { type: 'cell', c: hit }); return; }
+      var sec = sectorAt(e);
+      if (sec) { if (solo === sec) { setSel(null); solo = null; } else { solo = sec; setSel({ type: 'plan', p: sec }); } fitView(); return; }
+      if (solo) {
+        var g3 = geom();
+        var pd2 = toDisc(g3, cxp, cyp);
+        var pr3 = Math.hypot(pd2.x, pd2.y);
+        var pa3 = Math.atan2(pd2.y, pd2.x); if (pa3 < 0) { pa3 += TAU; }
+        if (pr3 > g3.r0 && pr3 < g3.R + 12 && pa3 > Math.PI && pa3 < Math.PI * 1.5) { return; }
+      }
+      var hadSolo = !!solo;
+      setSel(null); solo = null;
+      if (hadSolo) { fitView(); }   // returning to all-execplans → zoom-to-fit the set
+    }
+    function setSel(s) { sel = s; pinned = s && s.type === 'cell' ? s.c : null; renderPane(); }
+
+    // ---- detail pane (DOM builders; no innerHTML) ----
+    function pRow(k, v) {
+      var val = el('span', {});
+      if (Array.isArray(v)) { v.forEach(function (x) { val.appendChild(typeof x === 'string' ? doc().createTextNode(x) : x); }); }
+      else { val.textContent = String(v); }
+      return el('div', { 'class': 'row' }, [el('span', { text: k }), val]);
+    }
+    function pSect(t) { return el('div', { 'class': 'sect', text: t }); }
+    function joinBr(arr) { var out = []; arr.forEach(function (s, i) { if (i) { out.push(el('br')); } out.push(s); }); return out; }
+    function tokChart(p) {
+      var evs = p.cells.slice().sort(function (a, b) { return a.day - b.day; });
+      if (!evs.length) { return null; }
+      var W2 = 288, H2 = 92, padT = 10, padB = 20, padX = 2;
+      var b = p.b, e = Math.max(p.e, b + 0.5);
+      var tot = evs.reduce(function (a, c) { return a + c.tokW; }, 0) || 1;
+      var hue = stateHue(p);
+      var X2 = function (d) { return padX + Math.max(0, Math.min(1, (d - b) / (e - b))) * (W2 - 2 * padX); };
+      var Y2 = function (f) { return (H2 - padB) - f * (H2 - padB - padT); };
+      var cum = 0, pts = evs.map(function (c) { cum += c.tokW; return { x: X2(c.day), y: Y2(cum / tot), c: c }; });
+      var line = 'M' + padX + ',' + Y2(0) + pts.map(function (pt) { return 'L' + pt.x.toFixed(1) + ',' + pt.y.toFixed(1); }).join('') + 'L' + (W2 - padX) + ',' + pts[pts.length - 1].y.toFixed(1);
+      var area = line + 'L' + (W2 - padX) + ',' + Y2(0) + 'Z';
+      var gid = 'rtg' + p.i;
+      var wrap = el('div', {});
+      wrap.appendChild(pSect('TOKEN USAGE' + (p.o ? ' · ' + (p.o / 10).toFixed(1) + 'M out' : '')));
+      var svg = svgEl('svg', { width: '100%', viewBox: '0 0 ' + W2 + ' ' + H2, style: 'display:block;margin-top:6px', role: 'img', 'aria-label': "Cumulative token usage over the plan's life" });
+      var defs = svgEl('defs');
+      var grad = svgEl('linearGradient', { id: gid, x1: '0', y1: '0', x2: '0', y2: '1' });
+      grad.appendChild(svgEl('stop', { offset: '0', 'stop-color': hue, 'stop-opacity': '.38' }));
+      grad.appendChild(svgEl('stop', { offset: '1', 'stop-color': hue, 'stop-opacity': '0' }));
+      defs.appendChild(grad); svg.appendChild(defs);
+      svg.appendChild(svgEl('path', { d: area, fill: 'url(#' + gid + ')' }));
+      svg.appendChild(svgEl('path', { d: line, fill: 'none', stroke: hue, 'stroke-opacity': '.85', 'stroke-width': '1.4' }));
+      pts.forEach(function (pt) { svg.appendChild(svgEl('circle', { cx: pt.x.toFixed(1), cy: pt.y.toFixed(1), r: (pt.c.kind === 'gate' ? 3 : 2.2), fill: (KIND_HUE[pt.c.kind] || '#8b96f2') })); });
+      svg.appendChild(svgEl('text', { x: padX, y: (H2 - 5), fill: ink3c(.8), 'font-size': '9', 'font-family': 'monospace' }));
+      svg.lastChild.textContent = dayDate(b);
+      svg.appendChild(svgEl('text', { x: (W2 - padX), y: (H2 - 5), 'text-anchor': 'end', fill: ink3c(.8), 'font-size': '9', 'font-family': 'monospace' }));
+      svg.lastChild.textContent = dayDate(p.e);
+      wrap.appendChild(svg);
+      return wrap;
+    }
+    function planBlock(p) {
+      var hue = stateHue(p);
+      var nCells = p.cells.length, gates = p.cells.filter(function (c) { return c.kind === 'gate'; }).length;
+      var frag = doc().createDocumentFragment();
+      frag.appendChild(pSect('EXECPLAN'));
+      frag.appendChild(el('h4', { text: p.slug }));
+      var bar = el('div', { 'class': 'bar' }); var bi = el('i'); bi.style.width = Math.round(100 * p.done / p.total) + '%'; bi.style.background = hue; bar.appendChild(bi); frag.appendChild(bar);
+      frag.appendChild(pRow('state', STATE[p.st] + ' · ' + p.done + '/' + p.total));
+      frag.appendChild(pRow('born', dayDate(p.b)));
+      frag.appendChild(pRow('last activity', dayDate(p.e)));
+      if (p.o) { frag.appendChild(pRow('output tokens', (p.o / 10).toFixed(1) + 'M')); }
+      frag.appendChild(pRow('nodes', nCells + ' (' + gates + ' gates)'));
+      if (p.od.length) { frag.appendChild(pRow('open decisions', p.od.join(' · '))); }
+      if (p.dep.length) { frag.appendChild(pRow('depends on', joinBr(p.dep.map(function (d) { return doc().createTextNode(d.replace(/-2026-\d\d-\d\d$/, '')); })))); }
+      if (p.ext.length) { frag.appendChild(pRow('extended by', joinBr(p.ext.map(function (d) { return doc().createTextNode(d.replace(/-2026-\d\d-\d\d$/, '')); })))); }
+      var tc = tokChart(p); if (tc) { frag.appendChild(tc); }
+      if (p.traced) {
+        frag.appendChild(pSect('FACTS (real)'));
+        var ul = el('ul', { 'class': 'facts' });
+        p.cells.slice().sort(function (a, b) { return a.day - b.day; }).forEach(function (c) {
+          var li = el('li', (sel && sel.c === c) ? { 'class': 'sel' } : {}, [el('b', { text: c.key }), ' · ' + dayDate(c.day) + (c.actor ? ' · ' + c.actor : '')]);
+          ul.appendChild(li);
+        });
+        frag.appendChild(ul);
+      } else {
+        var note2 = el('p', { 'class': 'note' }, ['Untraced plan — node density is milestone-derived. One call makes it real:', el('br'), el('code', { text: 'query_facts(entity="execplan:' + p.slug + '", token_budget=4000)' })]);
+        frag.appendChild(note2);
+      }
+      return frag;
+    }
+    function renderPane() {
+      if (!sel) { pane.classList.remove('open'); return; }
+      pane.textContent = '';
+      if (sel.type === 'cell') {
+        var c = sel.c, hue = KIND_HUE[c.kind] || PAL.memory;
+        var h4 = el('h4', { text: c.key });
+        if (c.version > 1) { var vspan = el('span', { text: ' v' + c.version }); vspan.style.color = 'var(--rings-ink3)'; h4.appendChild(vspan); }
+        pane.appendChild(h4);
+        pane.appendChild(el('span', { 'class': 'kindchip' }, [el('i', { style: 'background:' + hue }), c.kind + (c.real ? ' · real fact' : ' · illustrative')]));
+        if (c.real) {
+          pane.appendChild(pRow('stored', dayDate(c.day)));
+          pane.appendChild(pRow('actor', c.actor));
+          pane.appendChild(pRow('horizon', c.horizon));
+          pane.appendChild(pRow('tokens', c.tokens));
+          if (c.version > 1) { pane.appendChild(pRow('supersedes', 'v' + (c.version - 1) + ' of same key')); }
+        } else {
+          pane.appendChild(pRow('day', dayDate(c.day)));
+        }
+        pane.appendChild(planBlock(c.p));
+      } else {
+        pane.appendChild(planBlock(sel.p));
+        if (solo === sel.p) { pane.appendChild(el('p', { 'class': 'note', text: 'Ring filtered to this plan — click the background to clear.' })); }
+      }
+      pane.classList.add('open');
+    }
+    function tokPaneChart(selDay) {
+      var W2 = 288, H2 = 92, padT = 10, padB = 20, padX = 2;
+      var d0 = Math.ceil(S), d1 = Math.floor(E);
+      var days = [], mS = 0.001, mV = 0.001;
+      for (var d3 = d0; d3 <= d1; d3++) { var sp = TOK.spent[d3] || 0, sv = TOK.saved[d3] || 0; days.push({ d: d3, sp: sp, sv: sv }); mS = Math.max(mS, sp); mV = Math.max(mV, sv); }
+      if (!days.length) { return null; }
+      var X2 = function (d3) { return padX + ((d3 - d0) / Math.max(1, d1 - d0)) * (W2 - 2 * padX); };
+      var YS = function (v) { return (H2 - padB) - (v / mS) * (H2 - padB - padT); };
+      var YV = function (v) { return (H2 - padB) - (v / mV) * (H2 - padB - padT); };
+      var lineS = days.map(function (r2, i2) { return (i2 ? 'L' : 'M') + X2(r2.d).toFixed(1) + ',' + YS(r2.sp).toFixed(1); }).join('');
+      var areaS = lineS + 'L' + X2(d1).toFixed(1) + ',' + (H2 - padB) + 'L' + X2(d0).toFixed(1) + ',' + (H2 - padB) + 'Z';
+      var lineV = days.map(function (r2, i2) { return (i2 ? 'L' : 'M') + X2(r2.d).toFixed(1) + ',' + YV(r2.sv).toFixed(1); }).join('');
+      var selX = X2(selDay).toFixed(1);
+      var selRow = days.filter(function (r2) { return r2.d === selDay; })[0];
+      var wrap = doc().createDocumentFragment();
+      var svg = svgEl('svg', { width: '100%', viewBox: '0 0 ' + W2 + ' ' + H2, style: 'display:block;margin:10px 0 2px', role: 'img', 'aria-label': 'Daily token spend with the selected day marked' });
+      var defs = svgEl('defs');
+      var grad = svgEl('linearGradient', { id: 'rtp', x1: '0', y1: '0', x2: '0', y2: '1' });
+      grad.appendChild(svgEl('stop', { offset: '0', 'stop-color': '#a78bfa', 'stop-opacity': '.4' }));
+      grad.appendChild(svgEl('stop', { offset: '1', 'stop-color': '#a78bfa', 'stop-opacity': '0' }));
+      defs.appendChild(grad); svg.appendChild(defs);
+      svg.appendChild(svgEl('path', { d: areaS, fill: 'url(#rtp)' }));
+      svg.appendChild(svgEl('path', { d: lineS, fill: 'none', stroke: '#a78bfa', 'stroke-opacity': '.9', 'stroke-width': '1.4' }));
+      svg.appendChild(svgEl('path', { d: lineV, fill: 'none', stroke: '#34d399', 'stroke-opacity': '.8', 'stroke-width': '1.1' }));
+      svg.appendChild(svgEl('line', { x1: selX, y1: padT, x2: selX, y2: (H2 - padB), stroke: ink(.5), 'stroke-dasharray': '2 3' }));
+      if (selRow) {
+        svg.appendChild(svgEl('circle', { cx: selX, cy: YS(selRow.sp).toFixed(1), r: '3.2', fill: '#a78bfa' }));
+        svg.appendChild(svgEl('circle', { cx: selX, cy: YV(selRow.sv).toFixed(1), r: '2.4', fill: '#34d399' }));
+      }
+      var tx0 = svgEl('text', { x: padX, y: (H2 - 5), fill: ink3c(.8), 'font-size': '9', 'font-family': 'monospace' }); tx0.textContent = dayDate(d0); svg.appendChild(tx0);
+      var tx1 = svgEl('text', { x: (W2 - padX), y: (H2 - 5), 'text-anchor': 'end', fill: ink3c(.8), 'font-size': '9', 'font-family': 'monospace' }); tx1.textContent = dayDate(d1); svg.appendChild(tx1);
+      wrap.appendChild(svg);
+      wrap.appendChild(el('p', { 'class': 'note', style: 'margin-top:0', text: 'purple = spent/day (max ' + mS.toFixed(1) + 'M) · green = est. saved/day (own scale, max ' + (mV * 1000).toFixed(0) + 'k)' }));
+      return wrap;
+    }
+    function renderTokenDayPane(bin) {
+      var d2 = bin.d;
+      var act = PLANS.filter(function (p) { return p.b <= d2 && d2 <= p.e; }).map(function (p) {
+        var dayCells = p.cells.filter(function (c) { return Math.floor(c.day) === d2; }).length;
+        var sp = (p.o && p.cells.length) ? (p.o / 10) / p.cells.length * dayCells : 0;
+        return { p: p, dayCells: dayCells, sp: sp };
+      }).sort(function (x, y) { return y.sp - x.sp || y.dayCells - x.dayCells; });
+      pane.textContent = '';
+      pane.appendChild(el('h4', { text: dayDate(d2) }));
+      pane.appendChild(el('span', { 'class': 'kindchip' }, [el('i', { style: 'background:#f5a623' }), 'token day']));
+      pane.appendChild(pRow('spent', bin.sp.toFixed(1) + 'M day · ' + bin.cs.toFixed(1) + 'M cum'));
+      pane.appendChild(pRow('saved (est.)', (bin.sv * 1000).toFixed(0) + 'k day · ' + bin.cv.toFixed(2) + 'M cum'));
+      var tpc = tokPaneChart(d2); if (tpc) { pane.appendChild(tpc); }
+      pane.appendChild(pSect('ACTIVE EXECPLANS · ' + act.length));
+      if (act.length) {
+        var ul = el('ul', { 'class': 'facts' });
+        act.slice(0, 22).forEach(function (x2) {
+          var dot = el('b', { text: '●' }); dot.style.color = stateHue(x2.p);
+          ul.appendChild(el('li', {}, [dot, ' ', el('b', { text: x2.p.short.slice(0, 30) }), ' · ' + STATE[x2.p.st] + ' ' + x2.p.done + '/' + x2.p.total + (x2.sp ? ' · ~' + x2.sp.toFixed(1) + 'M' : '') + (x2.dayCells ? ' · ' + x2.dayCells + ' events' : '')]));
+        });
+        if (act.length > 22) { ul.appendChild(el('li', { text: '… +' + (act.length - 22) + ' more' })); }
+        pane.appendChild(ul);
+      } else {
+        pane.appendChild(el('p', { 'class': 'note', text: 'no plans with activity spans covering this day' }));
+      }
+      pane.appendChild(el('p', { 'class': 'note', text: 'spend attribution: plan output-token totals distributed across their event days (estimate until per-day token_burn is wired)' }));
+      pane.classList.add('open');
+    }
+
+    function onKey(e) {
+      if (e.key !== 'Escape') { return; }
+      if (!modal.hidden) { closeModal(); return; }
+      if (openPop) { closePop(); return; }
+      var hadSolo = !!solo;
+      setSel(null); solo = null; tokSel = null;
+      if (hadSolo) { fitView(); }
+    }
+    if (typeof window !== 'undefined') { window.addEventListener('keydown', onKey); }
+
+    // tiles: press to switch the lens
+    Object.keys(tileByLens).forEach(function (ln) {
+      tileByLens[ln].b.addEventListener('click', function () {
+        lens = ln;
+        Object.keys(tileByLens).forEach(function (x) { tileByLens[x].b.setAttribute('aria-pressed', String(x === ln)); });
+        setSel(null); solo = null; hover = null; hoverSec = null; gSel = null; tokSel = null; hideTip();
+        setLedger(false);
+        // M25 — the arc lens is drawn against FIXED 12 and 9 o'clock axes, so
+        // entering it parks the ambient spin at 12 (the same reset the clock
+        // button performs). Leaving it drops the arc selection.
+        arcHoverT = null; arcHoverD = null; arcSelT = null;
+        if (lens === 'arc') { spinning = false; bSpin.setAttribute('aria-pressed', 'false'); resetTween = true; arcBuild(); }
+        // M13 — leaving the data lens clears any focus isolation.
+        gFocus = false; gConn = null; gClusterTargets = null; gFocusK = 0; gViewTweening = false; bDataFocus.setAttribute('aria-pressed', 'false');
+        if (lens === 'data') { var minD = Math.min.apply(null, GNODES.map(function (n) { return n.d; })) - 0.5; if (S < minD - 1) { rStart.value = Math.round((minD - 11) / (NOW - 11) * 1000); syncWindow(); } }
+        grpTokViews.style.display = lens === 'tokens' ? 'flex' : 'none';
+        grpDataFocus.style.display = lens === 'data' ? 'flex' : 'none';
+        fitView();   // reframe the ring for the new lens (clear of the bars)
+      });
+    });
+    function setTokView(v) { tokView = v; bTokCum.setAttribute('aria-pressed', String(v === 'cum')); bTokDay.setAttribute('aria-pressed', String(v === 'day')); }
+    bTokCum.addEventListener('click', function () { setTokView('cum'); });
+    bTokDay.addEventListener('click', function () { setTokView('day'); });
+    bDataFocus.addEventListener('click', function () {
+      gFocus = !gFocus; bDataFocus.setAttribute('aria-pressed', String(gFocus));
+      if (gFocus) { gPrevView = { Z: Z, panX: panX, panY: panY }; applyDataFocus(); }
+      else { releaseDataFocus(); }
+      kick();
+    });
+    // Dev-only hook (mirror verification): deterministically select the highest-
+    // degree fact node so the data-lens focus mode can be exercised without a
+    // pixel-precise canvas click. Never present in prod (flag-gated).
+    if (typeof window !== 'undefined' && window.__CRUX_CONSOLE_DEV__) {
+      window.__ringsSelectDataNode = function () {
+        var best = -1, bi = null;
+        GNODES.forEach(function (n) { var d = (GADJ[n.i] || []).length; if (d > best) { best = d; bi = n.i; } });
+        gSel = bi; if (gFocus) { applyDataFocus(); } kick();
+        return { i: bi, deg: best };
+      };
+    }
+
+    // ---- teardown + boot ----
+    function onVis() { kick(); }
+    if (typeof document !== 'undefined') { document.addEventListener('visibilitychange', onVis); }
+    function teardown() {
+      teardownCanvasTab();   // M19 — stop any absorbed Board/Graph/Tree RAF/listener
+      if (rafId != null && typeof cancelAnimationFrame === 'function') { cancelAnimationFrame(rafId); }
+      rafId = null;
+      if (fadeTimer) { clearTimeout(fadeTimer); fadeTimer = null; }       // M13 tab-hub timers
+      if (pauseWatch) { clearInterval(pauseWatch); pauseWatch = null; }
+      if (ro) { try { ro.disconnect(); } catch (e) { /* noop */ } }
+      if (io) { try { io.disconnect(); } catch (e) { /* noop */ } }
+      if (themeObs) { try { themeObs.disconnect(); } catch (e) { /* noop */ } }
+      if (typeof document !== 'undefined') { document.removeEventListener('visibilitychange', onVis); document.removeEventListener('click', onDocClick, true); }
+      if (typeof window !== 'undefined') { window.removeEventListener('keydown', onKey); }
+      if (ringsSetTabHook === ringsSetTabBridge) { ringsSetTabHook = null; }   // M20 — the rail's live switch bridge dies with the page
+      if (__ringsCleanupFn === teardown) { __ringsCleanupFn = null; }
+    }
+    __ringsCleanupFn = teardown;
+    // M20 — the live switch bridge the rail accordion calls so a sub-page row runs
+    // the in-place fade swap instead of a full route re-render. Published only
+    // once the tab hub is built (see below), cleared in teardown.
+    function ringsSetTabBridge(id) { setTab(id); }
+
+    // ---- sparklines (M11): colour-coded mini-charts in the lens tiles, from the
+    //      ring's OWN per-day series (real data — no fabricated trend; tiles with
+    //      no natural series stay chart-less). Each spark inherits its tile hue. --
+    function daySpark(host, series, hue) {
+      if (!host) { return; }
+      host.textContent = '';
+      var svg = areaChart(series, { spark: true });
+      if (svg) { host.style.setProperty('--acc', hue); host.appendChild(svg); }
+    }
+    function binByDay(getDay, keep) {
+      var bins = {}, lo = Infinity, hi = -Infinity;
+      keep.forEach(function (o) { if (!getDay(o).ok) { return; } var d = Math.floor(getDay(o).d); bins[d] = (bins[d] || 0) + 1; if (d < lo) { lo = d; } if (d > hi) { hi = d; } });
+      if (!isFinite(lo)) { return null; }
+      var out = []; for (var d = lo; d <= hi; d++) { out.push(bins[d] || 0); }
+      return out.length >= 2 ? out : null;
+    }
+    function updateSparks() {
+      var hi = Math.max(12, Math.round(NOW)), step = Math.max(1, Math.round((hi - 11) / 40));
+      var workS = [];
+      for (var d = 11; d <= hi; d += step) { var c = 0; PLANS.forEach(function (p) { if (p.b <= d && p.exit > d) { c++; } }); workS.push(c); }
+      daySpark(tWork.sp, workS, tWork.hue);
+      var dataS = binByDay(function (n) { return { ok: isFinite(n.d), d: n.d }; }, GNODES);
+      // M19 — the facts glance reuses the SAME real facts-stored_at histogram as the
+      // Data-graph lens tile (no fabricated trend; the visible-fact walk is the source).
+      if (dataS) { daySpark(tData.sp, dataS, tData.hue); daySpark(glFacts.sp, dataS, glFacts.hue); }
+      var memS = binByDay(function (c2) { return { ok: c2.kind === 'memory' && isFinite(c2.day), d: c2.day }; }, cells);
+      if (memS) { daySpark(tMem.sp, memS, tMem.hue); }
+      // M19 — sessions tile: a real last_active_unix_ms per-day histogram.
+      if (SESS_DAYS && SESS_DAYS.length >= 2) { daySpark(tSess.sp, SESS_DAYS, tSess.hue); }
+      if (TOK && TOK.spent) {
+        var days = Object.keys(TOK.spent).map(Number).filter(isFinite).sort(function (a, b) { return a - b; });
+        if (days.length >= 2) { daySpark(tTok.sp, days.map(function (dd) { return TOK.spent[dd]; }), tTok.hue); }
+      }
+    }
+
+    // ---- M13: fixed tab hub (top-left) + swap-in host for the Overwatch views ----
+    //   Ring (default) shows the canvas; the other five tabs FADE the ring out,
+    //   hide the rings-only chrome (toolbar · play bar · bottom bar · tiles ·
+    //   detail pane — none of it applies to a list/board view), and swap in the
+    //   corresponding Overwatch view via the SHARED owRenderTab (same renderers,
+    //   same data paths — through the generated client only). The tab buttons
+    //   never move (fixed top-left, independent of the active tab). Reduced motion
+    //   → instant swap (no fade, no cascade). The draw loop is paused while hidden.
+    var fadeTimer = null, pauseWatch = null;
+    // M20 — the nine tab BUTTONS have left this page. They now live in the left
+    // nav as the Rings destination's accordion group (shell.html buildRail →
+    // railGroupItems → RINGS_TAB_DEFS), which is the console-wide standard for
+    // sub-page navigation. The topbar slot keeps ONLY the play bar + the shell
+    // search field (task 4). Switching is driven from the rail through the
+    // registered CruxRender.ringsSetTab hook below, so an accordion row runs the
+    // EXACT same swap this page always did (fade + owRenderTab / canvas hosts).
+    // Tabs 1-6 fade the ring out and swap in the corresponding Overwatch view via
+    // owRenderTab. Tabs 7-9 (M19) absorb the former Canvas destination — Board,
+    // Graph and Tree render in the SAME swap host through their normal renderers
+    // (renderCanvasBoard / renderCanvasGraph / renderPlanTree), with clean teardown
+    // on tab switch (see teardownCanvasTab).
+    var CANVAS_TAB_IDS = { 'cv-board': 'board', 'cv-graph': 'graph', 'cv-tree': 'tree' };
+    var ringTabMount = (ctxIn && ctxIn.tabSlot) ? ctxIn.tabSlot : stage;
+    ringTabMount.appendChild(playbar);   // M19/M20 — the compact play bar owns the topbar row (with the search field)
+    var tabHost = el('div', { 'class': 'rings-tabhost', role: 'region', 'aria-label': 'View' });
+    tabHost.hidden = true;
+    stage.appendChild(tabHost);
+
+    // The play bar joins the chrome that hides on a non-Ring tab (a list/board view
+    // has no timeline to scrub). The tab icons themselves stay visible (they ARE
+    // the switcher). tabHost's default aria-label updates per active tab.
+    var ringChrome = [tools, cards, playbar, bottombar, pane];
+    function setChromeHidden(hide) {
+      ringChrome.forEach(function (elm) { if (elm) { elm.classList.toggle('rings-chrome-hidden', hide); } });
+    }
+    // M19 — teardown for an absorbed Canvas tab (Board/Graph/Tree). The graph +
+    // board own module-level cleanups (RAF loops / resize listener); the tree has
+    // only element listeners that GC with the cleared host. Called on tab switch
+    // and in the rings teardown so no canvas RAF leaks behind a hidden view.
+    function teardownCanvasTab() {
+      if (activeCanvasView === 'graph') { if (__canvasGraphCleanup) { try { __canvasGraphCleanup(); } catch (e) { /* noop */ } __canvasGraphCleanup = null; } }
+      else if (activeCanvasView === 'board') { if (__canvasResizeHandler && typeof window !== 'undefined') { try { window.removeEventListener('resize', __canvasResizeHandler); } catch (e2) { /* noop */ } __canvasResizeHandler = null; } }
+      activeCanvasView = null;
+    }
+    // "wow" cascade: staggered, lightly-scattered entrance of the view's real
+    // cards/panels (the honest read of the operator's "mesh, no alignment" — the
+    // list/board views have no fabricated entity mesh, so the cascade IS the mesh-
+    // assembling entrance of the REAL cards). Each item flies in from a seeded
+    // offset; final layout + data are untouched. Reduced-motion → no-op.
+    function jr(n) { var x = Math.sin(n * 99.71) * 43758.5453; return x - Math.floor(x); }
+    function ringsCascade(host) {
+      if (REDUCED) { return; }
+      var items = host.querySelectorAll('.v2card, .ow-panel');
+      for (var i = 0; i < items.length; i++) {
+        var it = items[i];
+        if (it.getAttribute('data-casc') === '1') { continue; }   // animate each card once
+        it.setAttribute('data-casc', '1');
+        it.style.setProperty('--casc-i', String(i));
+        it.style.setProperty('--casc-dx', ((jr(i) * 2 - 1) * 34).toFixed(1) + 'px');
+        it.style.setProperty('--casc-dy', (10 + jr(i + 7) * 20).toFixed(1) + 'px');
+        it.classList.add('rings-casc-item');
+      }
+    }
+    function paintTab(id) {
+      // M19 — Board/Graph/Tree are rendered by the SAME canvas renderers as the
+      // former Canvas destination, into the tab swap host (not owRenderTab).
+      if (CANVAS_TAB_IDS[id]) {
+        var view = CANVAS_TAB_IDS[id];
+        activeCanvasView = view;
+        var cbctx = { summary: ctxIn && ctxIn.summary };
+        var pc = null;
+        if (view === 'graph') { pc = renderCanvasGraph(tabHost, cbctx, canvasTabFocus); canvasTabFocus = null; }
+        else if (view === 'tree') { pc = renderPlanTree(tabHost, cbctx); }
+        else { renderCanvasBoard(tabHost, cbctx); }
+        ringsCascade(tabHost);
+        if (pc && typeof pc.then === 'function') { pc.then(function () { ringsCascade(tabHost); }); }
+        return;
+      }
+      var p = owRenderTab(id, tabHost, ctxIn);
+      ringsCascade(tabHost);                                   // synchronous skeleton content
+      if (p && typeof p.then === 'function') { p.then(function () { ringsCascade(tabHost); }); }   // + the async data swap
+    }
+    function setTab(id) {
+      if (id === activeTab) { return; }
+      teardownCanvasTab();   // stop any outgoing Board/Graph/Tree RAF before the swap
+      activeTab = id;
+      var tab = null; ringsTabDefs().forEach(function (t) { if (t.id === id) { tab = t; } });
+      tabHost.setAttribute('aria-label', tab ? tab.title : 'View');
+      // M20 — the rail accordion owns the tab CONTROLS now; tell it which row is
+      // current so the nav reflects an in-page switch (deep link / initialTab).
+      if (ctxIn && typeof ctxIn.onTab === 'function') { ctxIn.onTab(id, tab ? tab.slug : null); }
+      closePop(); closeModal();
+      if (fadeTimer) { clearTimeout(fadeTimer); fadeTimer = null; }
+      if (pauseWatch) { clearInterval(pauseWatch); pauseWatch = null; }
+      if (id === 'ring') {
+        tabHost.hidden = true; tabHost.textContent = '';
+        setChromeHidden(false);
+        root.classList.remove('rings-tab-active');            // fade the canvas back in
+        paused = false;
+        resize(); fitView(); kick();                          // resume the draw loop
+        return;
+      }
+      // Non-Ring: fade the ring out, hide the ring-only chrome, swap in the view.
+      setChromeHidden(true);
+      root.classList.add('rings-tab-active');                 // .rings-canvas opacity → 0 (CSS)
+      tabHost.hidden = false; tabHost.scrollTop = 0;
+      paintTab(id);
+      // Pause the RAF once the fade has finished (don't burn frames while hidden).
+      // A cheap watchdog still tears down cleanly if the route changes while paused
+      // (the paused RAF can't detect the canvas leaving the DOM on its own).
+      var stop = function () {
+        paused = true;
+        if (rafId != null && typeof cancelAnimationFrame === 'function') { cancelAnimationFrame(rafId); rafId = null; }
+        if (!pauseWatch && typeof setInterval === 'function') {
+          pauseWatch = setInterval(function () { if (!cv.isConnected) { clearInterval(pauseWatch); pauseWatch = null; teardown(); } }, 600);
+        }
+      };
+      if (REDUCED) { stop(); } else { fadeTimer = setTimeout(stop, 360); }
+    }
+
+    arcBuild();      // M25 — seed the ExecPlans-arc model (snapshot until liveInit lands)
+    readPalette();   // M12 — seed the canvas palette from the theme tokens
+    // React to live theme toggles: the console stamps data-theme on <html> — re-read
+    // the palette + repaint without a reload (layout is unchanged, so no re-fit).
+    var themeObs = null;
+    if (typeof MutationObserver === 'function' && typeof document !== 'undefined') {
+      themeObs = new MutationObserver(function () { readPalette(); kick(); });
+      themeObs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    }
+    syncWindow();
+    resize();
+    fitView();   // default fit accounts for the top timeline + bottom control bar
+    updateSparks();
+    kick();
+    // M19 — deep-link: a #/canvas/board|graph|tree redirect lands on #/rings/<view>
+    // and passes initialTab (+ canvasFocus for graph), opening that tab on load so
+    // the old Canvas deep links never dead-end.
+    if (ctxIn && ctxIn.initialTab && ctxIn.initialTab !== 'ring'
+      && ringsTabDefs().some(function (t) { return t.id === ctxIn.initialTab; })) { setTab(ctxIn.initialTab); }
+    ringsSetTabHook = ringsSetTabBridge;   // M20 — the rail accordion can now drive this page's view swap
+
+    // ---- live wire: swap the embedded snapshot for the real board when the
+    //      daemon feeds are reachable (through the console's CruxApi client).
+    //      Fails silently back to the snapshot on any absent/failed feed. ----
+    (function liveInit() {
+      var num = function (v) { return (v === null || v === undefined) ? '—' : Number(v).toLocaleString(); };
+      fetchJSON('/v1/work?source=all').then(function (res) {
+        if (res.ok && res.data) {
+          var j = res.data;
+          // M25 — the arc lens reads the FULL board (every state, no provenance
+          // requirement) from this same response: no extra request.
+          arcWork = j.work || []; arcBuild(); if (lens === 'arc') { kick(); }
+          var items = (j.work || []).filter(function (w) {
+            return w.id && w.id.indexOf('execplan:') === 0 && w.provenance && w.provenance.first_activity_unix_ms && ['in_progress', 'complete', 'blocked'].indexOf(w.state) >= 0;
+          });
+          if (items.length >= 50) {
+            NOW = Math.max(76, Math.floor(Date.now() / 86400000) - 20580);
+            var raws = items.map(function (w) {
+              return { s: w.id.slice(9), st: w.state === 'in_progress' ? 1 : w.state === 'blocked' ? 2 : 0,
+                d: w.milestones_done || 0, t: w.milestones_total || 1,
+                b: Math.floor(w.provenance.first_activity_unix_ms / 86400000) - 20580,
+                e: Math.floor(w.provenance.last_activity_unix_ms / 86400000) - 20580,
+                o: Math.floor(((w.token_burn && w.token_burn.output_tokens) || 0) / 1e5),
+                dep: w.depends_on || [], ext: w.extended_by || [], od: w.open_decisions || [] };
+            });
+            setSel(null); solo = null; hover = null; hoverSec = null; gSel = null; tokSel = null;
+            loadPlans(raws); rebuildLineage(); buildCells(); refreshTok();
+            if (TOK.totS < 1 && SNAP_TOK.totS >= 1) { TOK = SNAP_TOK; tTok.n.textContent = Math.round(TOK.totS) + 'M (snap)'; }
+            dStart.max = dEnd.max = dayDate(NOW);
+            // M25 — the scrub clock was PARKED at the snapshot's last day (76 =
+            // 2026-07-22) and syncWindow only clamps it INTO the window, so a
+            // live board that reaches day 79 left the ring rendering three days
+            // in the past: plans created since the snapshot read as "not yet
+            // started" (measured — three of the arc lens's sixteen picked tracks
+            // were invisible). If the clock was parked at the end of the old
+            // window, carry it to the end of the new one.
+            var parkedAtEnd = T >= E - 0.001;
+            syncWindow();
+            if (parkedAtEnd) { T = E; rTime.value = 1000; cDate.textContent = dayDate(T); }
+            dataSrc = 'live · prod-mirror';
+            tWork.n.textContent = num(j.count);   // M19 — the duplicate "execplans" glance tile was removed
+            root.setAttribute('data-src', 'live');   // liveness signal (the visible "live · date" stamp was removed in M11)
+            fitView(); updateSparks();
+          }
+        }
+      });
+      fetchJSON('/v1/console/summary').then(function (res) {
+        if (res.ok && res.data) {
+          var s2 = res.data;
+          if (s2.stores) { glFacts.n.textContent = num(s2.stores.facts); tSess.n.textContent = num(s2.stores.sessions); }   // M19 — dup "sessions" glance removed
+          if (s2.daemon && s2.daemon.mcp_agent_count !== undefined) { glMcp.n.textContent = num(s2.daemon.mcp_agent_count); }
+          if (s2.integrations !== undefined) {
+            var gi = s2.integrations;
+            glInt.n.textContent = Array.isArray(gi) ? String(gi.length) : (gi && typeof gi === 'object') ? num(gi.builtin_pack_count !== undefined ? gi.builtin_pack_count : Object.keys(gi).length) : num(gi);
+          }
+          if (s2.daemon) { glEngine.n.textContent = s2.daemon.dataplane_enabled ? 'on' : 'off'; }
+        }
+      });
+      // M19 — sessions tile sparkline: a real per-day activity histogram bucketed
+      // from /v1/console/sessions last_active_unix_ms (through the generated client).
+      fetchJSON('/v1/console/sessions').then(function (res) {
+        if (res.ok && res.data) {
+          var rows = res.data.session_rows || [];
+          var series = binByDay(function (r) { var ms = r && r.last_active_unix_ms; return { ok: isFinite(ms) && ms > 0, d: ms / 86400000 - 20580 }; }, rows);
+          if (series) { SESS_DAYS = series; updateSparks(); }
+        }
+      });
+      // data graph: page the WHOLE visible store through /v1/facts/list (cursor
+      // pagination, reserved included), up to a sane node cap. Snapshot stands on 404.
+      (function walkFacts() {
+        var NODE_CAP = RINGS_NODE_CAP, seen = {}, seenCount = 0, total = null, cursor = null, capped = false, ok = false;
+        function page2(count) {
+          if (count > 55) { finish(); return; }
+          var u = '/v1/facts/list?limit=200&include_reserved=1' + (cursor ? '&cursor=' + encodeURIComponent(cursor) : '');
+          fetchJSON(u).then(function (res) {
+            if (res.status === 404 || !res.ok || !res.data) { finish(); return; }
+            var j3 = res.data; ok = true;
+            if (total === null && j3.total_visible != null) { total = j3.total_visible; }
+            (j3.facts || []).forEach(function (f) {
+              if (capped || !f.fact_id || !f.stored_at || seen[f.fact_id]) { return; }
+              var ms = Date.parse(f.stored_at); if (!isFinite(ms)) { return; }
+              seen[f.fact_id] = { e: f.entity || '?', k: f.key || '?', d: ms / 86400000 - 20580, a: f.actor || null, h: f.horizon_class || 'none', c: f.confidence === undefined ? 1 : f.confidence, t: f.tokens || 100 };
+              seenCount++; if (seenCount >= NODE_CAP) { capped = true; }
+            });
+            cursor = j3.next_cursor || null;
+            if (capped || !cursor || !j3.has_more) { finish(); return; }
+            page2(count + 1);
+          });
+        }
+        function finish() {
+          var live = [];
+          for (var id in seen) { var n = seen[id]; if (isFinite(n.d) && n.d > 0) { live.push(n); } }
+          if (ok && live.length) {
+            gSel = null; loadGraph(live); gTotal = total; gCap = capped; tData.n.textContent = num(live.length); updateSparks();
+            // M25 — index the SAME walked facts by ExecPlan entity for the arc
+            // lens's dots. No second network read.
+            var idx = {};
+            live.forEach(function (n2) {
+              if (!n2.e || n2.e.indexOf('execplan:') !== 0) { return; }
+              (idx[n2.e] = idx[n2.e] || []).push({ key: n2.k, ms: arcMsOfDay(n2.d), real: true });
+            });
+            for (var ek in idx) { idx[ek].sort(function (a, b) { return a.ms - b.ms; }); }
+            arcFactIdx = idx; arcBuild(); if (lens === 'arc') { kick(); }
+          }
+          else if (total) { gTotal = total; }
+        }
+        page2(0);
+      })();
+    })();
+  }
+
   return {
     CONTROL_TYPES: CONTROL_TYPES,
     GATE_TITLE: GATE_TITLE,
@@ -5999,6 +15224,12 @@
     capabilityAvailable: capabilityAvailable,
     // Site map — static reference destination (rail → destinations map).
     renderSiteMap: renderSiteMap,
+    // M2 (console-surfaces-remediation) — the paged, searchable facts browser.
+    renderFactsBrowser: renderFactsBrowser,
+    // M3 (console-surfaces-remediation) — sessions browser + detail drawer.
+    renderSessionsBrowser: renderSessionsBrowser,
+    // M5 (console-surfaces-remediation) — sessions × token-burn browser.
+    renderCostBrowser: renderCostBrowser,
     // M10 — Documents mode (the console-as-reader).
     renderDocuments: renderDocuments,
     DOC_REFERENCE: DOC_REFERENCE,
@@ -6030,6 +15261,83 @@
     paintSessionDetail: paintSessionDetail,
     renderSessionDetail: renderSessionDetail,
     renderCanvas: renderCanvas,
+    // M14 (console-surfaces-remediation) — Canvas Studio: the ported diagram-builder
+    // engine (a fourth canvas view; the incumbent board is untouched). The pure
+    // subset is unit-tested by the smoke; the view is driven against a mock DOM.
+    renderTileStudio: renderTileStudio,
+    tstudioSnap: tstudioSnap,
+    tstudioNormalizeDoc: tstudioNormalizeDoc,
+    tstudioSerializeDoc: tstudioSerializeDoc,
+    tstudioWebSrcOk: tstudioWebSrcOk,
+    tstudioApiRouteKnown: tstudioApiRouteKnown,
+    tstudioJsonPath: tstudioJsonPath,
+    tstudioLatestFact: tstudioLatestFact,
+    tstudioSlugify: tstudioSlugify,
+    // M16b — configurable Workspaces (fact-driven nav/page system). Pure helpers
+    // are unit-tested by the smoke; the shell drives the nav runtime through them,
+    // and the Studio Pages/Integrations subsections render below.
+    CWS_SCHEMA_VERSION: CWS_SCHEMA_VERSION,
+    CWS_WS_ENTITY: CWS_WS_ENTITY,
+    CWS_PAGE_ENTITY: CWS_PAGE_ENTITY,
+    cwsCanonical: cwsCanonical,
+    cwsReadWorkspaceDef: cwsReadWorkspaceDef,
+    cwsReadPageDef: cwsReadPageDef,
+    cwsBuiltinWorkspaces: cwsBuiltinWorkspaces,
+    cwsEffectiveWorkspaces: cwsEffectiveWorkspaces,
+    cwsForkWorkspace: cwsForkWorkspace,
+    cwsTombstone: cwsTombstone,
+    cwsStarterTemplates: cwsStarterTemplates,
+    cwsPageTypes: cwsPageTypes,
+    cwsTypeExists: cwsTypeExists,
+    cwsPackEmbed: cwsPackEmbed,
+    cwsPackExtract: cwsPackExtract,
+    cwsMergeQuery: cwsMergeQuery,
+    cwsWorkspaceEntity: cwsWorkspaceEntity,
+    cwsPageEntity: cwsPageEntity,
+    cwsSlugify: cwsSlugify,
+    cwsLoadOverlays: cwsLoadOverlays,
+    cwsBuildModel: cwsBuildModel,
+    renderWorkspacePage: renderWorkspacePage,
+    renderWorkspaceStudio: renderWorkspaceStudio,
+    renderIntegrationsStudio: renderIntegrationsStudio,
+    // M15 — live tiles, automated-data-handling tile kinds, packs, settings,
+    // parameterised designs (pure helpers unit-tested by the smoke).
+    tstudioCoverageNote: tstudioCoverageNote,
+    tstudioTileEvents: tstudioTileEvents,
+    tstudioRenderSearch: tstudioRenderSearch,
+    tstudioRenderCorpus: tstudioRenderCorpus,
+    tstudioRenderReceipts: tstudioRenderReceipts,
+    tstudioRenderExtensions: tstudioRenderExtensions,
+    tstudioNormalizeSettings: tstudioNormalizeSettings,
+    tstudioDerivePackCaps: tstudioDerivePackCaps,
+    tstudioBuildStudioPayload: tstudioBuildStudioPayload,
+    tstudioFindPlaceholders: tstudioFindPlaceholders,
+    tstudioApplyPlaceholders: tstudioApplyPlaceholders,
+    TSTUDIO_KINDS: TSTUDIO_KINDS,
+    // M10 (console-surfaces-remediation, review round 1) — the native Rings page
+    // (canvas "clock of work"; replaced the embedded iframe mock).
+    renderRings: renderRings,
+    // M25 — the ExecPlans-arc lens's pure model layer (population, progress,
+    // radial order, dot placement, completion fade) + the console-wide log bar
+    // scale it shares with cx-cost. Exported so the smoke unit-tests the arc's
+    // maths instead of asserting on canvas pixels.
+    logBarPos: logBarPos,
+    arcProgress: arcProgress,
+    arcStartMs: arcStartMs,
+    arcSelectPlans: arcSelectPlans,
+    arcFactFrac: arcFactFrac,
+    arcAlphaAt: arcAlphaAt,
+    arcDotKind: arcDotKind,
+    arcKeyMilestone: arcKeyMilestone,
+    ARC_TRACK_CAP: ARC_TRACK_CAP,
+    ARC_ACTIVE_STATES: ARC_ACTIVE_STATES,
+    ARC_FADE_DAYS: ARC_FADE_DAYS,
+    // M20 — the rail accordion's contract with the Rings page: the nine view
+    // definitions (nav rows), a live switch bridge (in-place fade swap) and a
+    // "is the page mounted" probe so the rail knows whether to swap or route.
+    ringsTabDefs: ringsTabDefs,
+    ringsSetTab: ringsSetTab,
+    ringsTabMounted: ringsTabMounted,
     renderPage: renderPage,
     renderSections: renderSections,
     fetchJSON: fetchJSON,
@@ -6063,6 +15371,30 @@
     // every entry fires through operatorGatedCall; the destructive subset carries
     // a confirm). The runtime never reaches the gated write client except via these + the
     // operator helpers above, all funnelling through operatorGatedCall.
-    WIRED_WRITES: WIRED_WRITES
+    WIRED_WRITES: WIRED_WRITES,
+    // crux-integrations I1+I2 — Studio › Integrations. The section keys the smoke
+    // asserts against, the entry point, and the catalog safety scorecard (a pure
+    // DOM builder the smoke drives with a fixture to prove the capability chips
+    // and provenance rows come from data, not from copy).
+    CINT_SECTIONS: CINT_SECTIONS,
+    renderIntegrationsStudio: renderIntegrationsStudio,
+    cintScorecard: cintScorecard,
+    // crux-integrations-and-template-library L1+L2 — Studio › Library. The kind
+    // vocabulary, the entry point, the pure catalog helpers (filter/group) and
+    // the two pure DOM builders the smoke paints over fixtures, plus the shared
+    // artifact-provenance helpers (library install vs manual import).
+    CLIB_KINDS: CLIB_KINDS,
+    renderLibraryStudio: renderLibraryStudio,
+    clibPaintIndex: clibPaintIndex,
+    clibEntryCard: clibEntryCard,
+    clibInstallResult: clibInstallResult,
+    clibFilterEntries: clibFilterEntries,
+    clibGroupByKind: clibGroupByKind,
+    studioProvenanceChip: studioProvenanceChip,
+    studioReadInstalledFrom: studioReadInstalledFrom,
+    studioReadImportedFrom: studioReadImportedFrom,
+    studioImportStamp: studioImportStamp,
+    studioStampImported: studioStampImported,
+    tstudioDesignDef: tstudioDesignDef
   };
 });
