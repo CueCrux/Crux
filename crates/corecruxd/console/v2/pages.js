@@ -41,6 +41,13 @@
     if (extra) { for (var k in extra) { c[k] = extra[k]; } }
     return c;
   }
+  // crux-integrations I1: the single actionable integrations home. The cx-*
+  // integration pages are read/audit surfaces; connect, install, grant, invoke
+  // and revoke all live in Studio › Integrations, so every one of them links
+  // through rather than restating a flow it cannot run.
+  var STUDIO_INTEGRATIONS_HREF = '#/canvas/studio?sub=integrations';
+  var STUDIO_INTEGRATIONS_LINK = link('Manage in Studio › Integrations', STUDIO_INTEGRATIONS_HREF,
+    { hint: 'connect · install · grant · invoke · revoke — the operator-gated controls live there' });
 
   // Runtime capability contract for rendered controls. Keys are stable control
   // ids; values name the /v1/version capability and every route that control can
@@ -327,7 +334,11 @@
   function projectAddRepos(p) {
     return { t: 'disclose', label: '＋ Add repos', requires: 'operator',
       controls: [
-        info('github', 'not connected — connect under Integrations to add repos'),
+        // Names the ONE surface that can actually connect GitHub. Before I1 this
+        // said "connect under Integrations", which was a dead end: no console
+        // surface carried a connect flow.
+        info('github', 'not connected — connect it in Studio › Integrations, then repos appear here'),
+        STUDIO_INTEGRATIONS_LINK,
         { t: 'select', k: 'gh_addrepo_' + p.id, label: 'repo', options: ['— connect GitHub first —'], v: '— connect GitHub first —', mut: true },
         mbtn('Add repo', { hint: 'POST /v1/projects/' + p.id + '/repos' }),
         mbtn('Set as planning repo', { hint: 'designates where ExecPlans live' })
@@ -530,6 +541,15 @@
   }
 
   function buildIntegrations(res) {
+    // I1 — this page reads the plane; the Studio operates it. The link-through
+    // leads so nobody hunts for a connect flow that was never here.
+    var home = { h: 'Where integrations are set up', wide: true,
+      sub: 'Studio › Integrations is the actionable home: connectors, packs, extensions + catalog, and trusted keys',
+      controls: [
+        info('this page', 'read + audit — live plane posture, packs, grants'),
+        info('studio', 'connect GitHub / OpenAI · install, grant, disable packs · install from the signed catalog · issue and revoke grants · manage trusted keys'),
+        STUDIO_INTEGRATIONS_LINK
+      ] };
     var cat = { h: 'Catalog', sub: 'toggle = install / disable · grants are separate', wide: true,
       controls: [{ t: 'search', ph: 'Filter integrations…' }] };
     if (res.ok && res.data) {
@@ -547,14 +567,16 @@
     }
     // Source connectors (secrets held daemon-side; connect flows are mutating).
     cat.controls.push({ t: 'exp', label: 'GitHub', sub: 'repos · PRs · issues → facts', badge: 'source',
-      desc: 'Sync GitHub into the fact store. The PAT is held encrypted by the daemon — never in browser storage.',
+      desc: 'Sync GitHub into the fact store. The PAT is held encrypted by the daemon — never in browser storage. Disconnect and sync-now live in Studio › Integrations.',
       controls: [info('status', 'not connected'),
+        STUDIO_INTEGRATIONS_LINK,
         { t: 'input', k: 'gh_pat', label: 'personal access token', ph: 'ghp_…', mono: true, secret: true, mut: true },
         { t: 'toggle', k: 'gh_skiptls', label: 'skip TLS verify (dev only)', v: false, mut: true },
         mbtn('Verify connection')] });
     cat.controls.push({ t: 'exp', label: 'OpenAI-compatible LLM', sub: 'embeddings · chat · model discovery', badge: 'source',
-      desc: 'Connect any OpenAI-compatible endpoint. The API key is held encrypted by the daemon.',
+      desc: 'Connect any OpenAI-compatible endpoint. The API key is held encrypted by the daemon. Connect and disconnect live in Studio › Integrations; this page only tests a connected one.',
       controls: [info('status', 'not connected'),
+        STUDIO_INTEGRATIONS_LINK,
         { t: 'select', k: 'oa_model', label: 'default model', options: ['none', 'gpt-5.5', 'gpt-4o'], v: 'none', mut: true },
         { t: 'input', k: 'oa_key', label: 'API key', ph: 'sk-…', mono: true, secret: true, mut: true },
         { t: 'input', k: 'oa_org', label: 'organisation', ph: 'org-…', mono: true, mut: true },
@@ -564,10 +586,20 @@
       var n = Array.isArray(res.data.grants) ? res.data.grants.length : (res.data.grants && res.data.grants.count);
       if (n != null) { grants.controls[0].v = n + ' active'; }
     }
-    return [cat, grants];
+    grants.controls.push(STUDIO_INTEGRATIONS_LINK);
+    return [home, cat, grants];
   }
 
   function buildExtensions(res) {
+    // I2 — same split as cx-integrations: read here, operate in the Studio, which
+    // also carries the catalog browser and the per-entry safety scorecard.
+    var home = { h: 'Where extensions are managed', wide: true,
+      sub: 'Studio › Integrations owns install-from-catalog, invoke, grants and uninstall',
+      controls: [
+        info('this page', 'read + audit — installed manifests, trusted keyring'),
+        info('studio', 'browse the curator-signed catalog with a safety scorecard · install · invoke a tool under a grant · issue and revoke grants · uninstall · add and remove trusted keys'),
+        STUDIO_INTEGRATIONS_LINK
+      ] };
     var installed = { h: 'Installed', wide: true, controls: [{ t: 'search', ph: 'Filter extensions…' }] };
     if (res.ok && res.data) {
       var list = arr(res.data.extensions);
@@ -587,9 +619,15 @@
         { t: 'input', k: 'key_pub', label: 'public key', ph: 'ed25519:…', mono: true, mut: true },
         mbtn('Add key')
       ] };
+    keys.controls.push(STUDIO_INTEGRATIONS_LINK);
     var install = { h: 'Install manifest', wide: true,
-      controls: [{ t: 'input', k: 'manifest_url', label: 'manifest URL / path', ph: 'https://… or ./ext.json', mono: true, mut: true }, mbtn('Install')] };
-    return [installed, keys, install];
+      sub: 'a raw manifest URL has no groundable body here — install from the signed catalog in the Studio instead',
+      controls: [
+        { t: 'input', k: 'manifest_url', label: 'manifest URL / path', ph: 'https://… or ./ext.json', mono: true, mut: true },
+        mbtn('Install'),
+        STUDIO_INTEGRATIONS_LINK
+      ] };
+    return [home, installed, keys, install];
   }
 
   function buildIdentity(res) {
@@ -1624,7 +1662,7 @@
       'Add repo': 'GATED — POST /v1/projects/{id}/repos (projects.rs:324) needs a project id + a real repo; the ＋Add repos disclosure has neither (GitHub unconnected, placeholder select). No groundable body.',
       'Set as planning repo': 'GATED — same as Add repo: the disclosure form carries no project id / repo to target PATCH /v1/projects/{id} (projects.rs:133).',
       'Queue ingest': 'GATED — the only real route (POST /v1/local/ingest, local_ingest.rs:183) is a SYNCHRONOUS ingest needing a documents[] payload; the control models "queue a path fact for the agent". Shape mismatch — no path→documents bridge to ground.',
-      'Install': 'GATED — POST /v1/extensions/register (extensions.rs:117) wants a full IntegrationManifest object and install-from-registry wants {id,index_path}; the form supplies only a URL/path. No groundable body.',
+      'Install': 'GATED — POST /v1/extensions/register (extensions.rs:118) wants a full IntegrationManifest object; the form supplies only a URL/path, so there is still no groundable body HERE. install-from-registry {id} IS wired (crux-integrations I2), in the Studio catalog browser where the entry id and its curator-pinned sha256 are known — this control links through to it.',
       'Apply defaults to all tenants': 'GATED — no bulk route; only per-tenant PATCH /v1/console/tenants/{id}/category (console.rs:1953). "All" would be an unbounded client loop over every tenant — out of scope for a curated single-call mutation.',
       'Run sweep now': 'GATED — no HTTP route: memory_sweep_candidates is an MCP tool (dry-run) and the real sweep is a background timer (ephemeral_gc::run_sweep_once) with no daemon endpoint.',
       'Export audit bundle': 'GATED — GET /v1/observe/sessions/{id}/audit/export (observe_audit.rs:481) is a READ needing a session id + CORECRUXD_OBSERVE; not a write, and no unparameterised console trigger.',
@@ -1651,8 +1689,11 @@
     'cx-receipts':      { legacy: { projection: 'list' }, v2_present: ['browser-local lookup', 'search', 'verify dock (read)'], v2_missing_read: [], v2_gated_write: [] },
     'cx-mediation':     { legacy: { search: 1, exp: 4, info: 7, btn: 4, input: 1 }, v2_present: ['live /v1/console/engine/summary', 'principal/ladder/foresight info', 'search'], v2_missing_read: [], v2_gated_write: [] },
     'cx-workbench':     { legacy: { btn: 11, info: 5, input: 5, select: 3 }, v2_present: ['live /v1/workbench/contract', 'api-drift (read)', 'command-ledger (read)', 'reasoning-timeline (read)', 'audit-triage (read)', 'brief (read)', 'tenant filter', 'search', 'query inputs/selects'], v2_missing_read: ['live text-search/graph-expand/time-range in-page (available in Explorer)', 'live entity loader'], v2_gated_write: ['Build context pack', 'Run impact preflight', 'Simulate policy', 'Probe route', 'Record capability audit'] },
-    'cx-integrations':  { legacy: { search: 1, exp: 14, info: 18, input: 3, toggle: 1, btn: 4, select: 1 }, v2_present: ['live /v1/console/integrations', 'pack expanders', 'grants (read)', 'search'], v2_missing_read: ['per-pack capability display rows'], v2_gated_write: ['Verify connection', 'Test call'] },
-    'cx-extensions':    { legacy: { search: 1, exp: 2, info: 5, input: 3, select: 1, btn: 2 }, v2_present: ['live /v1/extensions', 'manifest expanders', 'search'], v2_missing_read: ['per-grant scope display'], v2_gated_write: ['Add key', 'Install'] },
+    // crux-integrations I1+I2 — the writes these two pages could not run now exist,
+    // in Studio › Integrations, which both pages link through to. Listed here as
+    // present (the console CAN do them) rather than pretended-on-page.
+    'cx-integrations':  { legacy: { search: 1, exp: 14, info: 18, input: 3, toggle: 1, btn: 4, select: 1 }, v2_present: ['live /v1/console/integrations', 'pack expanders', 'grants (read)', 'search', 'link-through to Studio › Integrations, where pack install/grant/disable + the GitHub and OpenAI connect/disconnect/sync lifecycle are wired'], v2_missing_read: ['per-pack capability display rows (shown in the Studio)'], v2_gated_write: ['Verify connection', 'Test call'] },
+    'cx-extensions':    { legacy: { search: 1, exp: 2, info: 5, input: 3, select: 1, btn: 2 }, v2_present: ['live /v1/extensions', 'manifest expanders', 'search', 'link-through to Studio › Integrations, where catalog install, tool invoke, grant issue/revoke, uninstall and trusted-key removal are wired'], v2_missing_read: ['per-grant scope display (shown in the Studio)'], v2_gated_write: ['Add key', 'Install'] },
     'cx-facts':         { legacy: { projection: 'cascade' }, v2_present: ['live /v1/facts/list (paged full store)', 'entity-prefix groups + quick-filter chips', 'server-side search (q=)', 'as_of time-machine (as_of_unix_ms)', 'superseded + reserved toggles', 'row detail (full value by id)'], v2_missing_read: [], v2_gated_write: [] },
     'cx-memory':        { legacy: { search: 1, toggle: 1, exp: 2, info: 4, btn: 1 }, v2_present: ['live /v1/console/facts', 'per-tenant groups', 'hide-system toggle (display)', 'search'], v2_missing_read: [], v2_gated_write: [] },
     'cx-tenants':       { legacy: { info: 1, btn: 2, search: 1, toggle: 1 }, v2_present: ['live /v1/console/tenants', 'AMR lane toggles (display)', 'search'], v2_missing_read: [], v2_gated_write: ['Apply defaults to all tenants'] },

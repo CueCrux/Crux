@@ -2702,6 +2702,29 @@
   .cwstudio-packrow { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 7px 9px; border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2); font-size: 12px; }
   .cwstudio-packid { font-weight: 650; color: var(--ink); }
   .cwstudio-installflow { margin-top: 4px; padding-top: 8px; border-top: 1px solid var(--edge); }
+  /* Studio › Integrations (I1+I2): four stacked sections, each a card grid. */
+  .cint-section { display: flex; flex-direction: column; gap: 10px; margin-top: 18px; }
+  .cint-section:first-of-type { margin-top: 10px; }
+  .cint-sechead { display: flex; flex-direction: column; gap: 3px; }
+  .cint-sectitle { margin: 0; font-size: 13px; font-weight: 700; letter-spacing: .01em; color: var(--ink); }
+  .cint-cardbody { display: flex; flex-direction: column; gap: 8px; }
+  .cint-row { display: flex; align-items: baseline; gap: 8px; font-size: 12px; }
+  .cint-row-k { flex: 0 0 auto; min-width: 118px; font: 600 10px var(--font-mono); letter-spacing: .06em; text-transform: uppercase; color: var(--ink3); }
+  .cint-row-v { flex: 1 1 auto; color: var(--ink2); word-break: break-word; }
+  .cint-link { color: var(--acc); text-decoration: none; }
+  .cint-link:hover { text-decoration: underline; }
+  .cint-form { display: flex; flex-direction: column; gap: 7px; padding-top: 6px; border-top: 1px solid var(--edge); }
+  .cint-field { display: flex; flex-direction: column; gap: 3px; }
+  .cint-mono { font-family: var(--font-mono); }
+  .cint-check { width: 15px; height: 15px; accent-color: var(--acc); }
+  .cint-actions { display: flex; flex-wrap: wrap; gap: 7px; }
+  .cint-packcard, .cint-extcard, .cint-catrow { display: flex; flex-direction: column; gap: 7px; padding: 9px 10px; border: 1px solid var(--edge); border-radius: var(--radius-sm); }
+  .cint-invoke, .cint-grants, .cint-keyform { display: flex; flex-direction: column; gap: 7px; padding-top: 7px; border-top: 1px solid var(--edge); }
+  .cint-grantlist { display: flex; flex-direction: column; gap: 6px; }
+  .cint-args { font-family: var(--font-mono); font-size: 11.5px; }
+  .cint-verbatim { margin: 6px 0 0; padding: 8px 9px; max-height: 260px; overflow: auto; border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2); color: var(--ink2); font: 11.5px/1.5 var(--font-mono); white-space: pre-wrap; word-break: break-word; }
+  .cint-detail { padding-top: 7px; border-top: 1px solid var(--edge); }
+  .cint-scorecard { display: flex; flex-direction: column; gap: 6px; }
   /* modal (self-contained, mounts on #main) */
   .cws-modal-overlay { position: fixed; inset: 0; z-index: 200; display: flex; align-items: center; justify-content: center; background: color-mix(in srgb, var(--bg) 70%, transparent); padding: 20px; }
   .cws-modal { width: 100%; max-width: 480px; max-height: 86vh; display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--edge-strong); border-radius: var(--radius); box-shadow: var(--card-shadow); overflow: hidden; }

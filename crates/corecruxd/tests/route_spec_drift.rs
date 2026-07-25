@@ -75,6 +75,23 @@ fn manifest_dir() -> PathBuf {
 //   * workbench.rs::post_policy_simulation   — POST /v1/workbench/policy-simulation           (flattened ActionEnrichmentInput {tool_name,action_description,tool_parameters}; returns receipt.receipt_id) [mod.rs:702]
 //   * workbench.rs::post_route_probe         — POST /v1/workbench/route-probe                 (body {route,include_storyline,include_tests}; returns receipt.receipt_id) [mod.rs:697]
 //   * features.rs::post_audit                — POST /v1/features/capabilities/{id}/audit      (body {status,auditor,notes}) [mod.rs:591]
+//
+// crux-integrations-and-template-library I1+I2 — Studio › Integrations becomes the
+// ONE actionable integrations home, so the routes that already existed daemon-side
+// but had no console reach are added here. Grounded against the handlers:
+//   * extensions.rs::install_from_registry   — POST   /v1/extensions/install-from-registry     (InstallFromRegistryBody {id, index_path?}; scopes admin:read+facts:write) [mod.rs:1059]
+//   * extensions.rs::delete_extension        — DELETE /v1/extensions/{id}                      (no body; 204; scopes admin:read+facts:write) [mod.rs:1086]
+//   * extensions.rs::issue_grant             — POST   /v1/extensions/{id}/grants               (IssueGrantBody {passport_fpr,allowed_tool_names,allowed_prefixes_read,allowed_prefixes_write,rate_limit_per_min?}; scopes admin:read+facts:write) [mod.rs:1096]
+//   * extensions.rs::revoke_grant            — DELETE /v1/extensions/{id}/grants/{passport_fpr} (no body; 204; scopes admin:read+facts:write) [mod.rs:1100]
+//   * extensions.rs::delete_trusted_key      — DELETE /v1/extensions/keys/{passport_fpr}       (no body; 204; scopes admin:read+facts:write) [mod.rs:1078]
+//   * extensions.rs::invoke_extension_tool   — POST   /v1/extensions/{id}/tools/{tool_name}/invoke (InvokeToolBody {passport_fpr?,args}; grant-scoped + rate-limited; scopes admin:read+facts:write) [mod.rs:1106]
+//   * console.rs::post_console_integration_install — POST /v1/console/integrations/{packId}/install (InstallIntegrationBody {manifest?,pack_id?,version?}; scope integrations:install; 403 under safe mode) [mod.rs:1415]
+//   * console.rs::post_console_integration_grant   — POST /v1/console/integrations/{packId}/grant   (GrantIntegrationBody {version,capabilities,reason?}; scope integrations:grant; 403 under safe mode) [mod.rs:1419]
+//   * console.rs::post_console_integration_disable — POST /v1/console/integrations/{packId}/disable (DisableIntegrationBody {reason?}; scope integrations:disable) [mod.rs:1423]
+//   * integrations_github.rs::post_disconnect — POST /v1/integrations/github/disconnect        (no body; deletes sealed PAT + selected_repos.json; scope integrations:disable) [mod.rs:1272]
+//   * integrations_github.rs::post_sync       — POST /v1/integrations/github/sync              (no body; blocking sync of selected repos into the fact store; scope integrations:install) [mod.rs:1276]
+//   * integrations_openai.rs::post_connect    — POST /v1/integrations/openai/connect           (ConnectOpenAiBody {api_key,organization_id?,default_model?,skip_verify}; scope integrations:install) [mod.rs:1305]
+//   * integrations_openai.rs::post_disconnect — POST /v1/integrations/openai/disconnect        (no body; deletes the sealed key; scope integrations:disable) [mod.rs:1309]
 const GATED_MUTATIONS: &[(&str, &str, &str)] = &[
     ("POST", "/v1/work/gate/{actionId}/approve", "gateApprove"),
     ("POST", "/v1/work/gate/{actionId}/reject", "gateReject"),
@@ -122,6 +139,50 @@ const GATED_MUTATIONS: &[(&str, &str, &str)] = &[
     // operatorGatedCall, and the entity is fixed to the `console:tileboard:` /
     // `console:tiledesign:` prefixes by the caller (render.js tileStudio*).
     ("POST", "/v1/console/facts/add", "consoleFactsAdd"),
+    // ── crux-integrations-and-template-library I1: connectors (GitHub/OpenAI) ──
+    // Connect already shipped (githubConnect); the rest of each connector's
+    // lifecycle had no console reach, which is why the setup surface dead-ended.
+    ("POST", "/v1/integrations/github/disconnect", "githubDisconnect"),
+    ("POST", "/v1/integrations/github/sync", "githubSync"),
+    ("POST", "/v1/integrations/openai/connect", "openaiConnect"),
+    ("POST", "/v1/integrations/openai/disconnect", "openaiDisconnect"),
+    // ── I1: built-in integration packs (install / grant / disable) ─────────────
+    (
+        "POST",
+        "/v1/console/integrations/{packId}/install",
+        "integrationPackInstall",
+    ),
+    (
+        "POST",
+        "/v1/console/integrations/{packId}/grant",
+        "integrationPackGrant",
+    ),
+    (
+        "POST",
+        "/v1/console/integrations/{packId}/disable",
+        "integrationPackDisable",
+    ),
+    // ── I2: community extensions — catalog install, uninstall, grants, invoke ──
+    // Install rides the curator-signed index the daemon re-verifies locally; the
+    // console never posts an unsigned manifest URL.
+    (
+        "POST",
+        "/v1/extensions/install-from-registry",
+        "extensionInstallFromRegistry",
+    ),
+    ("DELETE", "/v1/extensions/{id}", "extensionUninstall"),
+    ("POST", "/v1/extensions/{id}/grants", "extensionGrantAdd"),
+    (
+        "DELETE",
+        "/v1/extensions/{id}/grants/{passport_fpr}",
+        "extensionGrantRemove",
+    ),
+    ("DELETE", "/v1/extensions/keys/{passport_fpr}", "extensionRemoveKey"),
+    (
+        "POST",
+        "/v1/extensions/{id}/tools/{tool_name}/invoke",
+        "extensionInvoke",
+    ),
 ];
 
 // ── Curated read-POST allowlist (unified-shell-console M11) ───────────────────

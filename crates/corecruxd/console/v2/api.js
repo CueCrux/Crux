@@ -10,7 +10,7 @@
 // Customer-safe posture: CruxApi (below) exposes only GET (read) routes; its
 // generic get(path) is allowlist-guarded to literal manifest GET paths. The ONLY
 // writes this console can perform live in the separate CruxApiGated object at the
-// bottom — exactly 26 curated, operator-posture-gated mutation(s), no more.
+// bottom — exactly 39 curated, operator-posture-gated mutation(s), no more.
 //
 // Every call is same-origin credentialed; the browser never holds a bearer
 // token (the daemon authenticates the session at its own origin).
@@ -726,6 +726,19 @@ const GATED_MUTATIONS = Object.freeze([
   Object.freeze(['POST', '/v1/workbench/route-probe']),
   Object.freeze(['POST', '/v1/features/capabilities/{id}/audit']),
   Object.freeze(['POST', '/v1/console/facts/add']),
+  Object.freeze(['POST', '/v1/integrations/github/disconnect']),
+  Object.freeze(['POST', '/v1/integrations/github/sync']),
+  Object.freeze(['POST', '/v1/integrations/openai/connect']),
+  Object.freeze(['POST', '/v1/integrations/openai/disconnect']),
+  Object.freeze(['POST', '/v1/console/integrations/{packId}/install']),
+  Object.freeze(['POST', '/v1/console/integrations/{packId}/grant']),
+  Object.freeze(['POST', '/v1/console/integrations/{packId}/disable']),
+  Object.freeze(['POST', '/v1/extensions/install-from-registry']),
+  Object.freeze(['DELETE', '/v1/extensions/{id}']),
+  Object.freeze(['POST', '/v1/extensions/{id}/grants']),
+  Object.freeze(['DELETE', '/v1/extensions/{id}/grants/{passport_fpr}']),
+  Object.freeze(['DELETE', '/v1/extensions/keys/{passport_fpr}']),
+  Object.freeze(['POST', '/v1/extensions/{id}/tools/{tool_name}/invoke']),
 ]);
 
 const CruxApiGated = Object.freeze({
@@ -806,6 +819,45 @@ const CruxApiGated = Object.freeze({
   },
   consoleFactsAdd(body) {
     return fetch(`/v1/console/facts/add`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  githubDisconnect(body) {
+    return fetch(`/v1/integrations/github/disconnect`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  githubSync(body) {
+    return fetch(`/v1/integrations/github/sync`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  openaiConnect(body) {
+    return fetch(`/v1/integrations/openai/connect`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  openaiDisconnect(body) {
+    return fetch(`/v1/integrations/openai/disconnect`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  integrationPackInstall(packId, body) {
+    return fetch(`/v1/console/integrations/${encodeURIComponent(packId)}/install`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  integrationPackGrant(packId, body) {
+    return fetch(`/v1/console/integrations/${encodeURIComponent(packId)}/grant`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  integrationPackDisable(packId, body) {
+    return fetch(`/v1/console/integrations/${encodeURIComponent(packId)}/disable`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  extensionInstallFromRegistry(body) {
+    return fetch(`/v1/extensions/install-from-registry`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  extensionUninstall(id, body) {
+    return fetch(`/v1/extensions/${encodeURIComponent(id)}`, { method: 'DELETE', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  extensionGrantAdd(id, body) {
+    return fetch(`/v1/extensions/${encodeURIComponent(id)}/grants`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  extensionGrantRemove(id, passport_fpr, body) {
+    return fetch(`/v1/extensions/${encodeURIComponent(id)}/grants/${encodeURIComponent(passport_fpr)}`, { method: 'DELETE', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  extensionRemoveKey(passport_fpr, body) {
+    return fetch(`/v1/extensions/keys/${encodeURIComponent(passport_fpr)}`, { method: 'DELETE', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  extensionInvoke(id, tool_name, body) {
+    return fetch(`/v1/extensions/${encodeURIComponent(id)}/tools/${encodeURIComponent(tool_name)}/invoke`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
   },
 });
 

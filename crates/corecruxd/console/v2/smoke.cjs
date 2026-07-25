@@ -442,7 +442,24 @@ function extractThemeVars(theme) {
     ['POST', '/v1/workbench/route-probe'],
     ['POST', '/v1/features/capabilities/{id}/audit'],
     // console-surfaces-remediation M14: Canvas Studio daemon-side board/design persistence.
-    ['POST', '/v1/console/facts/add']
+    ['POST', '/v1/console/facts/add'],
+    // crux-integrations I1: connector lifecycle (connect already shipped above).
+    ['POST', '/v1/integrations/github/disconnect'],
+    ['POST', '/v1/integrations/github/sync'],
+    ['POST', '/v1/integrations/openai/connect'],
+    ['POST', '/v1/integrations/openai/disconnect'],
+    // crux-integrations I1: built-in integration packs.
+    ['POST', '/v1/console/integrations/{packId}/install'],
+    ['POST', '/v1/console/integrations/{packId}/grant'],
+    ['POST', '/v1/console/integrations/{packId}/disable'],
+    // crux-integrations I2: community extensions — catalog install, uninstall,
+    // grants and grant-scoped tool invoke.
+    ['POST', '/v1/extensions/install-from-registry'],
+    ['DELETE', '/v1/extensions/{id}'],
+    ['POST', '/v1/extensions/{id}/grants'],
+    ['DELETE', '/v1/extensions/{id}/grants/{passport_fpr}'],
+    ['DELETE', '/v1/extensions/keys/{passport_fpr}'],
+    ['POST', '/v1/extensions/{id}/tools/{tool_name}/invoke']
   ];
   // Parse the machine-readable GATED_MUTATIONS array and assert set-equality.
   const arrM = apiSrc.match(/const GATED_MUTATIONS = Object\.freeze\(\[([\s\S]*?)\]\);/);
@@ -3747,7 +3764,9 @@ function extractThemeVars(theme) {
 
   // (j) writes go ONLY through the gated console fact-add (no new mutation client / no raw fetch in the studio subsections).
   const wsA = renderSrc.indexOf('Studio › Pages (M16b)');
-  const wsB = renderSrc.indexOf('Documents mode (M10)');
+  // Ends at the Integrations subsection, which has its own region gate (check 62)
+  // — otherwise this assertion silently covered a surface it does not describe.
+  const wsB = renderSrc.indexOf('Studio › Integrations (M16b');
   const wsRegion = (wsA >= 0 && wsB > wsA) ? renderSrc.slice(wsA, wsB) : '';
   check(!!wsRegion, '[workspaces] the Studio subsection region must be locatable');
   check(!/\bfetch\s*\(/.test(wsRegion), '[workspaces] the Studio subsections must issue NO raw fetch (reads via fetchJSON/CruxApi)');
@@ -4741,6 +4760,179 @@ function extractThemeVars(theme) {
 
   notes.push('operator round 13 (M24): the compact rail\'s native `title` tooltips are REMOVED from all three row builders (dest buttons, sub-page icons, the account badge) and replaced by ONE console-drawn glass chip — a body-level position:fixed .rail-hlabel that cannot be clipped by #nav\'s scroll region, eased out from BEHIND the bar (the rail takes z-index 6 over the chip\'s 5) after 900ms of steady hover, centred on the row, 200ms transform+opacity on the accordion\'s own cubic-bezier, snapping under reduced motion, and dismissed by mouseleave / any scroll / click / Escape / route change; aria-label carries the accessible name unchanged (data-hlabel is what the chip reads), and the expanded rail is untouched. cx-cost: the top-sessions chart now calls the SAME costBar() as the rows — same track, gradient, height and fixed 2,000,000-token ceiling (fixed beat proportional-to-max: a proportional chart would put a full-width bar directly above a row bar of the same length meaning 2M) — labelled by the cx-sessions naming chain instead of raw UUIDs, and the chart\'s own flat bar CSS is deleted. Tokens-per-turn ships as a first-class signal beside the magnitude bar (turns / ctx-per-turn / out-per-turn chips, four new sorts, missing turn counts declared rather than zeroed, unsortable rows sinking) and "how to cut it" becomes real: five named thresholds over THIS session\'s numbers, each recommendation naming a feature the daemon ships (token_budget QC.2 · query_scan→query_expand · save_session/get_session · store_fact/query_facts), the thresholds published in an inline help note, no savings percentage claimed anywhere, and a session that trips nothing getting no line at all. cx-usage ("Average Token Usage") was STATIC — every figure a literal in STATIC[\'cx-usage\'] painted as page()\'s pre-load skeleton, plus a −31% savings card measured against an invented baseline, while its declared /v1/observations/aggregate feed was never called; the static entry is DELETED and the page is computed from /v1/cost/report (period + per-session + per-turn averages, session size on the same 2M gradient scale, a real bucketed output series), with the savings card replaced by a statement that no counterfactual is measured. Ring dots are damped by Z^0.6 with a 0.28 floor and an exact identity at or below overview zoom, so clusters separate as you zoom in; the factor is computed once per frame and published as __ringsZ/__ringsDotScale so the claim is measurable.');
   notes.push('operator round 14 (M25): cx-cost\'s bar scale goes ADAPTIVE — M21\'s fixed 2,000,000-token ceiling clamped 51 of the 83 real session reports, so the page now computes ONE log axis per painted view over both quantities it draws (row ctx+out AND chart output), floor 10k, max = the visible maximum, never below 2M. Log beat the two linear alternatives on the measured distribution (max 613,105,748 · p90 144,734,710 · median 3,171,069): linear-to-max puts the median row at 0.5% of the track and linear-capped-at-p90 puts it at 2.2% while re-clamping eight rows — the exact failure being fixed — where the log axis lands it at ~52%. The 2M ceiling survives as a REFERENCE TICK at its log position on every track plus a named tick on a decade-ticked axis strip, and the caption states the adaptivity, the range, the tick and that length is orders of magnitude and NOT proportion; the top-10 chart stays on the identical costBar idiom and says which scale it is on. Rings gains a sixth, strictly additive lens: ExecPlans arc — a 270° arc per plan from 12 o\'clock clockwise to 9 o\'clock where the angular axis is fraction-of-declared-milestones, so a just-started plan is a line at 12 and a completed plan reaches 9; progress is measured from current_milestone/milestones_total (or milestones_done/total, or the declared complete state) and drawn SOLID, while a plan reporting no milestone position gets a nominal state fraction drawn DASHED and counted in the on-canvas note. Dots ride the arc: big diamonds for gate:/milestone: facts placed exactly at n/total, smaller circles for decisions, handoffs and other facts placed in the milestone BUCKET they were written in (or, with no milestone axis available, at their timeline fraction) — with the per-mapping counts published on the canvas — all damped by M24\'s zoomDotScale. The newest plan is innermost (ordered by provenance.first_activity, falling back to created_at, and which source was used is stated); a new plan pushes the stack outward and a completed one fades over 10 days and the survivors ease inward to fill the slot, instantly under reduced motion. Titles sit right-aligned LEFT of the 12 o\'clock line with a token-burn bar extending further left on the same shared logBarPos idiom as cx-cost (no reported burn = no bar). The default population is active-first, capped at 16 tracks with 4 slots held for just-completed plans, labelled "showing N of M plans"; the model is fed from the SAME /v1/work response and the SAME fact walk the data lens already performs, so the lens adds no network read. Every incumbent lens branch, tile and dispatch line is asserted untouched.');
+})();
+
+// =========================================================================
+//  Check 57 — (crux-integrations I1+I2) Studio › Integrations is the ONE
+//  actionable integrations home. Four sections paint; every mutation in the
+//  region dispatches through operatorGatedCall (no raw fetch, no direct gated
+//  client); the Invoke control that used to render inert now carries a click
+//  handler; the catalog safety scorecard builds its capability chips from data;
+//  and the catalog's empty / 404 states are honest, naming the command that
+//  populates the cached index.
+// =========================================================================
+(function checkIntegrationsStudio() {
+  // Minimal mock DOM (same idiom as the studio drive): enough for el()/textContent.
+  function mkNode(tag) {
+    const n = { tagName: String(tag).toUpperCase(), nodeType: 1, childNodes: [], _attrs: {}, className: '',
+      setAttribute: function (k, v) { this._attrs[k] = String(v); if (k === 'class') { this.className = String(v); } },
+      getAttribute: function (k) { return Object.prototype.hasOwnProperty.call(this._attrs, k) ? this._attrs[k] : null; },
+      appendChild: function (c) { this.childNodes.push(c); c.parentNode = this; return c; },
+      removeChild: function (c) { const i = this.childNodes.indexOf(c); if (i >= 0) { this.childNodes.splice(i, 1); } return c; },
+      addEventListener: function () {} };
+    Object.defineProperty(n, 'textContent', { get: function () { return this._t || ''; }, set: function (v) { this._t = String(v); this.childNodes.length = 0; } });
+    return n;
+  }
+  function mkDoc() { return { createElement: mkNode, createTextNode: function (v) { return { nodeType: 3, textContent: String(v), childNodes: [] }; } }; }
+  function collect(n, out) { out = out || []; (n.childNodes || []).forEach(function (c) { if (c && c.nodeType === 1) { out.push(c); collect(c, out); } }); return out; }
+  function hasClass(n, c) { return String(n.className || '').split(/\s+/).indexOf(c) >= 0; }
+
+  // ---- (a) the four sections ---------------------------------------------
+  const SECTIONS = ['connectors', 'packs', 'extensions', 'keys'];
+  check(JSON.stringify(render.CINT_SECTIONS || []) === JSON.stringify(SECTIONS),
+    '[integrations] render.js must declare the four Studio › Integrations sections in setup order');
+  SECTIONS.forEach(function (key) {
+    check(new RegExp("cintSection\\('" + key + "'").test(renderSrc),
+      '[integrations] Studio › Integrations must build the "' + key + '" section');
+  });
+  // Drive the real renderer. Reads are handed a never-settling promise so the
+  // whole paint is the SYNCHRONOUS scaffold — no continuation can run against a
+  // restored global.document, and the assertions land in the same tick.
+  (function drivePaint() {
+    const savedDoc = global.document, savedWin = global.window;
+    global.document = mkDoc();
+    global.window = { CRUX_POSTURE: 'operator', CruxApi: { get: function () { return new Promise(function () {}); } } };
+    const host = mkNode('div');
+    try { render.renderIntegrationsStudio(host, {}); }
+    catch (e) { check(false, '[integrations] renderIntegrationsStudio threw on paint: ' + (e && e.stack || e)); }
+    const nodes = collect(host);
+    const secs = nodes.filter(function (n) { return hasClass(n, 'cint-section'); });
+    check(secs.length === 4, '[integrations] the Studio must paint exactly four sections (got ' + secs.length + ')');
+    check(JSON.stringify(secs.map(function (s) { return s.getAttribute('data-section'); })) === JSON.stringify(SECTIONS),
+      '[integrations] the four sections must be connectors · packs · extensions · keys, in that order');
+    // Six cards: GitHub + OpenAI + packs + installed extensions + catalog + keys.
+    check(nodes.filter(function (n) { return hasClass(n, 'cwstudio-intcard'); }).length === 6,
+      '[integrations] each section must paint its cards (2 connectors + packs + extensions + catalog + keys)');
+    if (savedDoc === undefined) { delete global.document; } else { global.document = savedDoc; }
+    if (savedWin === undefined) { delete global.window; } else { global.window = savedWin; }
+  })();
+
+  // ---- region invariants: no raw fetch, no direct gated client ------------
+  const iA = renderSrc.indexOf('Studio › Integrations (M16b');
+  const iB = renderSrc.indexOf('Documents mode (M10)');
+  const region = (iA >= 0 && iB > iA) ? renderSrc.slice(iA, iB) : '';
+  check(!!region, '[integrations] the Studio › Integrations region must be locatable in render.js');
+  check(!/\.innerHTML/.test(region), '[integrations] the surface must contain NO innerHTML (el()/textContent only)');
+  check(!/\bfetch\s*\(/.test(region), '[integrations] the surface must issue NO raw fetch — reads via fetchJSON / named CruxApi methods');
+  check(!/CruxApiGated/.test(region), '[integrations] the surface must never touch the gated client directly — only operatorGatedCall');
+
+  // ---- (b) reverse coverage: every gated call site goes through the choke --
+  // Each mutation is written exactly as operatorGatedCall(function (g) { return g.X(…) }),
+  // so the count of gated-method call sites must equal the count of choke-point
+  // wrappers. A bare `g.foo(` anywhere else would break the equality.
+  const gatedCalls = (region.match(/\bg\.[a-zA-Z]+\(/g) || []).length;
+  const chokes = (region.match(/operatorGatedCall\(function \(g\) \{ return g\./g) || []).length;
+  check(gatedCalls > 0 && gatedCalls === chokes,
+    '[integrations] every gated call site must sit inside operatorGatedCall (sites=' + gatedCalls + ', chokes=' + chokes + ')');
+  // And every write this package added is actually reachable from the surface.
+  ['githubConnect', 'githubDisconnect', 'githubSync', 'openaiConnect', 'openaiDisconnect',
+    'integrationPackInstall', 'integrationPackGrant', 'integrationPackDisable',
+    'extensionInstallFromRegistry', 'extensionUninstall', 'extensionGrantAdd',
+    'extensionGrantRemove', 'extensionAddKey', 'extensionRemoveKey', 'extensionInvoke'
+  ].forEach(function (m) {
+    check(new RegExp('g\\.' + m + '\\(').test(region),
+      '[integrations] Studio › Integrations must reach the gated method ' + m + '()');
+  });
+  // The destructive subset names its consequence before firing.
+  ['githubDisconnect', 'openaiDisconnect', 'integrationPackDisable', 'extensionUninstall',
+    'extensionGrantRemove', 'extensionRemoveKey', 'extensionInvoke'
+  ].forEach(function (m) {
+    const at = region.indexOf('g.' + m + '(');
+    const before = at > 0 ? region.slice(Math.max(0, at - 700), at) : '';
+    check(/confirm:\s*'/.test(before), '[integrations] the ' + m + '() control must carry a confirm dialog');
+  });
+  // The single write harness enforces posture + the Art.14 bound passport.
+  const cw = funcBody(renderSrc, 'cintWrite');
+  check(!!cw, '[integrations] render.js must define the cintWrite harness');
+  check(cw && /isOperator\(\)/.test(cw) && /ART14_MSG/.test(cw) && /showConfirm\(/.test(cw),
+    '[integrations] cintWrite must guard posture, refuse without a bound passport, and confirm the destructive subset');
+
+  // ---- secrets are write-only --------------------------------------------
+  check(/type:\s*'password'/.test(region), '[integrations] connector secrets must use a password-type input');
+  check(/pat\.value = '';/.test(region) && /key\.value = '';/.test(region),
+    '[integrations] the PAT / API-key fields must be cleared the moment the write fires');
+
+  // ---- (c) Invoke now has a handler ---------------------------------------
+  const invAt = region.indexOf("var invoke = cintBtn('Invoke'");
+  check(invAt >= 0, '[integrations] the Studio must render an Invoke control');
+  check(invAt >= 0 && /invoke\.addEventListener\('click'/.test(region.slice(invAt, invAt + 400)),
+    '[integrations] the Invoke control must carry a click handler (it shipped inert)');
+  check(/render:\s*cintVerbatim/.test(region), '[integrations] the invoke result must render verbatim');
+  // The board tile's Invoke was enabled and inert too — it now routes to the Studio.
+  const tileInv = renderSrc.slice(renderSrc.indexOf('function tstudioRenderExtensions'), renderSrc.indexOf('function tstudioCapabilityForRoute'));
+  check(/btn\.addEventListener\('click', function \(\) \{ location\.hash = '#\/canvas\/studio\?sub=integrations'; \}\);/.test(tileInv),
+    '[integrations] the extensions TILE Invoke button must route to Studio › Integrations instead of doing nothing');
+
+  // ---- (d) the safety scorecard builds from data --------------------------
+  (function driveScorecard() {
+    const savedDoc = global.document;
+    global.document = mkDoc();
+    const all = collect;
+    try {
+      const entry = { id: 'ext.quote', name: 'Quote', version: '1.2.0', kind: 'external_tool', trust_tier: 'community_reviewed',
+        manifest_sha256: 'a1b2c3', repo_url: 'https://example.test/quote', installed: true, installed_version: '1.1.0' };
+      const manifest = { capabilities: ['facts:read', 'integrations:read'], network: { allowed_hosts: ['api.example.test'] }, signature: { alg: 'ed25519' } };
+      const withM = all(render.cintScorecard(entry, manifest));
+      const chips = withM.filter(function (n) { return /\btstudio-cap-chip\b/.test(n.className || ''); });
+      check(chips.length === 2 && chips[0].textContent === 'facts:read',
+        '[integrations] the scorecard must render one capability chip per declared capability (got ' + chips.length + ')');
+      const text = withM.map(function (n) { return n.textContent || ''; }).join('|');
+      check(text.indexOf('api.example.test') >= 0, '[integrations] the scorecard must show the manifest network allowed_hosts');
+      check(text.indexOf('a1b2c3') >= 0, '[integrations] the scorecard must show the curator-pinned manifest sha256');
+      check(text.indexOf('external_tool') >= 0, '[integrations] the scorecard must show the entry kind');
+      check(text.indexOf('community_reviewed') >= 0, '[integrations] the scorecard must show the trust tier');
+      check(withM.some(function (n) { return n.tagName === 'A' && n.getAttribute('href') === 'https://example.test/quote'; }),
+        '[integrations] the scorecard must link the source repo');
+      // Not installed: capabilities are NOT in the index, and the scorecard says so
+      // rather than implying an empty capability set.
+      const noM = all(render.cintScorecard({ id: 'ext.other', trust_tier: 'unknown' }, null));
+      const noMText = noM.map(function (n) { return n.textContent || ''; }).join('|');
+      check(noMText.indexOf('not in the index') >= 0,
+        '[integrations] with no installed manifest the scorecard must declare that capabilities/hosts are not in the index');
+      check(noM.filter(function (n) { return /\btstudio-cap-chip\b/.test(n.className || ''); }).length === 0,
+        '[integrations] an uninstalled entry must render NO capability chips (nothing to claim)');
+    } catch (e) {
+      check(false, '[integrations] cintScorecard drive threw: ' + (e && e.stack || e));
+    } finally {
+      if (savedDoc === undefined) { delete global.document; } else { global.document = savedDoc; }
+    }
+  })();
+
+  // ---- (e) catalog honest-empty + 404 -------------------------------------
+  check(/res\.status === 404/.test(region) && /corecruxctl extensions sync/.test(region),
+    '[integrations] a 404 from /v1/extensions/registry must name `corecruxctl extensions sync`, not read as a fault');
+  check(/The verified index carries no entries/.test(region),
+    '[integrations] a verified-but-empty index must say so (distinct from the un-synced 404)');
+  const cu = funcBody(renderSrc, 'cintUnavailable');
+  check(cu && /not available on this daemon/.test(cu) && /unreachable/.test(cu),
+    '[integrations] an absent route must read as "not available on this daemon", and status 0 as unreachable');
+
+  // ---- the dead-end is closed --------------------------------------------
+  check(/STUDIO_INTEGRATIONS_HREF = '#\/canvas\/studio\?sub=integrations'/.test(pagesSrc),
+    '[integrations] pages.js must define the Studio › Integrations link-through target');
+  check(!/connect under Integrations to add repos/.test(pagesSrc),
+    '[integrations] the cx-projects "connect under Integrations" dead-end text must be gone');
+  const linkUses = (pagesSrc.match(/STUDIO_INTEGRATIONS_LINK/g) || []).length;
+  check(linkUses >= 7, '[integrations] cx-projects, cx-integrations and cx-extensions must all link through to the Studio (uses=' + linkUses + ')');
+  const CD = pages.CONTROL_DIFF || {};
+  ['cx-integrations', 'cx-extensions'].forEach(function (id) {
+    check((CD[id] && CD[id].v2_present || []).some(function (s) { return /Studio › Integrations/.test(s); }),
+      '[integrations] CONTROL_DIFF.' + id + ' must record the Studio link-through as present');
+  });
+  check(/install-from-registry \{id\} IS wired/.test(pagesSrc),
+    '[integrations] the still-gated cx-extensions "Install" grounding must state where install IS wired');
+
+  notes.push('studio integrations (I1+I2): Studio › Integrations is the one actionable integrations home — four sections (connectors · packs · extensions+catalog · keys) over 15 gated methods, every call site inside operatorGatedCall with no raw fetch and no direct gated client; connector secrets are password-type and cleared on submit; the previously-inert Invoke is wired (verbatim result) and the board tile routes to it; the catalog renders a per-entry safety scorecard built from index provenance plus the installed manifest, with honest un-synced (names `corecruxctl extensions sync`), verified-empty and absent-route states; cx-projects/cx-integrations/cx-extensions link through and their CONTROL_DIFF rows say so.');
 })();
 
 // ---- Report (awaits async renderer-driven checks) -----------------------

@@ -5797,7 +5797,12 @@
         var tool = (Array.isArray(m.tools) && m.tools[0] && m.tools[0].name) ? m.tools[0].name : '';
         var ep = el('div', { 'class': 'tstudio-ext-ep' });
         ep.appendChild(el('span', { 'class': 'tstudio-ext-ep-lab', text: 'data endpoint' + (tool ? (' · ' + tool) : '') }));
-        var btn = el('button', { 'class': 'tstudio-btn tstudio-ext-invoke', type: 'button', title: 'Invoke through extension_outbound (capability + grant gated)' }, ['Invoke']);
+        var btn = el('button', { 'class': 'tstudio-btn tstudio-ext-invoke', type: 'button', title: 'Open Studio › Integrations, where invoke runs under an operator-gated grant' }, ['Invoke']);
+        // A board tile is a READ surface, so the tile does not itself mutate: the
+        // button routes to the one place invoke is actually wired (Studio ›
+        // Integrations, which owns the args form, the grant and the receipt).
+        // It used to carry no handler at all — enabled and inert.
+        btn.addEventListener('click', function () { location.hash = '#/canvas/studio?sub=integrations'; });
         // Capability-gated: needs operator posture AND a grant. On a bare
         // mirror this stays disabled with an honest reason.
         if (!opts.operator) { btn.disabled = true; }
@@ -7745,15 +7750,722 @@
   }
 
   // =======================================================================
-  //  Studio › Integrations (M16b) — manage the extension/integration plane
-  //  from the Studio. Live reads over /v1/console/integrations (posture +
-  //  installed packs) + /v1/extensions (registry) + /v1/extensions/keys
-  //  (trusted keys), capability disclosure per pack/manifest, honest-empty on a
-  //  bare mirror with the REAL install flow explained. Install / grant / disable
-  //  are operator-gated: the console adds NO new arbitrary mutation surface
-  //  (plan Non-goals) — the shipping rail is the community PR + curator-signed
-  //  index (M15), or POST /v1/extensions/install-from-registry from the CLI.
+  //  Studio › Integrations (M16b · rebuilt for crux-integrations I1+I2) — the
+  //  ONE actionable integrations home (console plan M16: "integrations setup
+  //  moves into the Studio"). Four sections, in setup order:
+  //
+  //    connectors — GitHub / OpenAI credential lifecycle (connect · sync · disconnect)
+  //    packs      — built-in integration packs (install · grant · disable)
+  //    extensions — installed community extensions (invoke · grants · uninstall)
+  //                 plus the verified catalog with a per-entry safety scorecard
+  //    keys       — the Ed25519 keyring signed manifests verify against
+  //
+  //  Reads go through the generated GET client (fetchJSON for literal paths,
+  //  named CruxApi methods for parameterised ones) — no raw fetch. Every write
+  //  goes through operatorGatedCall → the frozen gated client generated from
+  //  GATED_MUTATIONS, under the same five guards as the M13b page harness:
+  //  operator posture, a bound-passport Art.14 refusal, a confirm dialog on the
+  //  destructive subset, the single gated choke point, and the REAL backend
+  //  response (verbatim JSON for invoke). A missing route or 404 reads as "not
+  //  available on this daemon" — nothing here fabricates a success.
+  //
+  //  Secrets are write-only: PAT / API-key fields are type=password, are never
+  //  populated from a status read, and are cleared the moment the write fires.
   // =======================================================================
+  var CINT_SECTIONS = ['connectors', 'packs', 'extensions', 'keys'];
+  var CINT_TRUST_TIERS = ['community_reviewed', 'locally_signed', 'first_party', 'unknown'];
+
+  function cintSection(key, title, sub) {
+    var s = el('section', { 'class': 'cint-section', 'data-section': key, 'aria-label': title });
+    var head = el('div', { 'class': 'cint-sechead' });
+    head.appendChild(el('h3', { 'class': 'cint-sectitle', text: title }));
+    if (sub) { head.appendChild(el('p', { 'class': 'cwstudio-note', text: sub })); }
+    s.appendChild(head);
+    return s;
+  }
+  function cintCard(title) {
+    var c = el('div', { 'class': 'v2card wide cwstudio-intcard' });
+    c.appendChild(el('h3', { 'class': 'v2card-h', text: title }));
+    return c;
+  }
+  function cintGrid(section) { var g = el('div', { 'class': 'cwstudio-intgrid' }); section.appendChild(g); return g; }
+  function cintLoading(host) { var l = el('div', { 'class': 'cwstudio-loading', text: 'loading…' }); host.appendChild(l); return l; }
+  function cintDrop(node) { if (node && node.parentNode) { node.parentNode.removeChild(node); } }
+  // The honest absent-route state. A daemon built without a feature answers 404;
+  // an unreachable one answers status 0. Both are reported, never smoothed over.
+  function cintUnavailable(host, what, status) {
+    host.appendChild(el('div', { 'class': 'tstudio-apierr', text: what + ' is not available on this daemon' + (status ? ' (HTTP ' + status + ')' : ' (unreachable)') + '.' }));
+  }
+  function cintField(label, node) {
+    var f = el('div', { 'class': 'cint-field' });
+    f.appendChild(el('label', { 'class': 'tstudio-field-lab', text: label }));
+    f.appendChild(node);
+    return f;
+  }
+  function cintInput(opts) {
+    opts = opts || {};
+    return el('input', {
+      'class': 'tstudio-input' + (opts.mono ? ' cint-mono' : ''),
+      type: opts.type || 'text',
+      placeholder: opts.ph || '',
+      // Password fields opt out of autofill so a browser never re-populates a
+      // secret the daemon deliberately refuses to hand back.
+      autocomplete: opts.type === 'password' ? 'new-password' : 'off'
+    });
+  }
+  function cintCheck() { return el('input', { 'class': 'cint-check', type: 'checkbox' }); }
+  function cintSelect(options, initial) {
+    var s = el('select', { 'class': 'tstudio-select' });
+    options.forEach(function (o) {
+      var opt = el('option', { value: o, text: o });
+      if (o === initial) { opt.setAttribute('selected', 'selected'); }
+      s.appendChild(opt);
+    });
+    return s;
+  }
+  function cintOut(host) { var o = el('div', { 'class': 'wired-out', 'aria-live': 'polite' }); host.appendChild(o); return o; }
+  function cintRow(label, value) {
+    var r = el('div', { 'class': 'cint-row' });
+    r.appendChild(el('span', { 'class': 'cint-row-k', text: label }));
+    r.appendChild(el('span', { 'class': 'cint-row-v', text: (value == null || value === '') ? '—' : String(value) }));
+    return r;
+  }
+  function cintWhen(ms) {
+    var n = Number(ms);
+    if (!isFinite(n) || n <= 0) { return '—'; }
+    try { return new Date(n).toISOString().replace('T', ' ').slice(0, 16) + 'Z'; }
+    catch (e) { return String(ms); }
+  }
+  // Operator-only, and never rendered disabled: the refusal reason belongs in the
+  // result line (posture / bound passport), not in a greyed control with no voice.
+  function cintBtn(label, opts) {
+    opts = opts || {};
+    var cls = 'tstudio-btn'
+      + (opts.danger ? ' tstudio-btn-danger cwstudio-danger' : '')
+      + (opts.primary ? ' tstudio-btn-primary' : '');
+    return stampOperatorOnly(el('button', { 'class': cls, type: 'button', title: opts.title || '' }, [label]));
+  }
+  function cintActions(host) { var a = el('div', { 'class': 'cint-actions' }); host.appendChild(a); return a; }
+
+  // The write harness for this surface: the M13b WIRED_WRITES guards expressed
+  // for hand-built Studio DOM instead of the page DSL. Every mutation in Studio ›
+  // Integrations goes through here, so there is exactly one place that decides
+  // whether a write may fire.
+  function cintWrite(out, opts) {
+    opts = opts || {};
+    if (!isOperator()) { showWiredResult(out, 'Operator posture required — this control is unavailable in customer view.', true); return; }
+    var pp = boundPassport();
+    if (!pp) { showWiredResult(out, ART14_MSG, true); return; }
+    function fire() {
+      showWiredResult(out, 'working…', false);
+      opts.run(pp).then(function (r) {
+        if (opts.render) { opts.render(out, r); }
+        else { showWiredResult(out, formatReceipt(r), !r.ok); }
+        if (opts.after) { opts.after(r); }
+      }, function (err) { showWiredResult(out, String((err && err.message) || err), true); });
+    }
+    if (opts.confirm) { showConfirm(out, opts.confirm, fire); } else { fire(); }
+  }
+  // Invoke results are shown verbatim: an extension's response is third-party
+  // data the operator is judging, so it is never summarised or reshaped.
+  function cintVerbatim(out, r) {
+    out.textContent = '';
+    out.appendChild(el('p', { 'class': 'wired-result ' + (r.ok ? 'is-ok' : 'is-err'), text: 'HTTP ' + r.status }));
+    var text;
+    try { text = (r.data == null) ? '(empty body)' : JSON.stringify(r.data, null, 2); }
+    catch (e) { text = String(r.data); }
+    out.appendChild(el('pre', { 'class': 'cint-verbatim', text: text }));
+  }
+  // Parameterised GETs have no literal-path entry in the generated allowlist, so
+  // they go through the named client method rather than fetchJSON.
+  function cintApiJson(name, args) {
+    var api = (typeof window !== 'undefined') ? window.CruxApi : null;
+    if (!api || typeof api[name] !== 'function') { return Promise.resolve({ ok: false, status: 0, data: null }); }
+    return api[name].apply(api, args || []).then(function (r) {
+      return r.json().then(
+        function (d) { return { ok: r.ok, status: r.status, data: d }; },
+        function () { return { ok: r.ok, status: r.status, data: null }; }
+      );
+    }, function () { return { ok: false, status: 0, data: null }; });
+  }
+
+  // Safety scorecard for one catalog row. The curator-signed index pins identity
+  // and provenance (kind, tier, manifest sha256, repo) but NOT the capability set
+  // — that lives in the manifest the daemon fetches and sha-checks at install. So
+  // capabilities / allowed hosts render from the INSTALLED manifest when there is
+  // one, and say plainly that they are not in the index when there is not.
+  function cintScorecard(entry, manifest) {
+    entry = entry || {};
+    manifest = manifest || null;
+    var wrap = el('div', { 'class': 'cint-scorecard' });
+    wrap.appendChild(el('div', { 'class': 'tstudio-field-lab', text: 'Safety scorecard' }));
+    var caps = el('div', { 'class': 'cwstudio-chips cint-scorecard-caps' });
+    var declared = (manifest && Array.isArray(manifest.capabilities)) ? manifest.capabilities : [];
+    declared.forEach(function (c) { caps.appendChild(el('span', { 'class': 'tstudio-cap-chip', text: String(c) })); });
+    if (!declared.length) {
+      caps.appendChild(el('span', {
+        'class': 'cwstudio-note',
+        text: manifest ? 'no capabilities declared' : 'not in the index — declared in the manifest, shown at install and verified against the pinned sha256'
+      }));
+    }
+    wrap.appendChild(cintField('declared capabilities', caps));
+    var hosts = (manifest && manifest.network && Array.isArray(manifest.network.allowed_hosts)) ? manifest.network.allowed_hosts : [];
+    wrap.appendChild(cintRow('entry kind', entry.kind || (manifest && manifest.entry && manifest.entry.kind)));
+    wrap.appendChild(cintRow('network allowed_hosts', hosts.length ? hosts.join(' · ') : (manifest ? 'none — endpoint pinning only' : 'not in the index')));
+    wrap.appendChild(cintRow('trust tier', String(entry.trust_tier || (manifest && manifest.trust_tier) || 'unknown')));
+    wrap.appendChild(cintRow('signature', manifest ? (manifest.signature ? 'signed manifest' : 'unsigned manifest') : 'curator-signed index row'));
+    wrap.appendChild(cintRow('manifest sha256 (pinned)', entry.manifest_sha256));
+    var repo = String(entry.repo_url || '');
+    if (/^https:\/\//.test(repo)) {
+      var r = el('div', { 'class': 'cint-row' });
+      r.appendChild(el('span', { 'class': 'cint-row-k', text: 'source repo' }));
+      r.appendChild(el('a', { 'class': 'cint-row-v cint-link', href: repo, rel: 'noopener noreferrer', target: '_blank', text: repo }));
+      wrap.appendChild(r);
+    } else {
+      wrap.appendChild(cintRow('source repo', repo));
+    }
+    return wrap;
+  }
+
+  // ---- Section 1: connectors ---------------------------------------------
+  function cintGithubCard(grid) {
+    var card = cintCard('GitHub');
+    grid.appendChild(card);
+    var load = cintLoading(card);
+    var body = el('div', { 'class': 'cint-cardbody' });
+    card.appendChild(body);
+    function paint() {
+      body.textContent = '';
+      return Promise.all([fetchJSON('/v1/integrations/github/status'), fetchJSON('/v1/integrations/github/repos')])
+        .then(function (res) {
+          cintDrop(load);
+          var st = res[0], repos = res[1];
+          if (!st.ok) { cintUnavailable(body, 'The GitHub integration', st.status); return; }
+          var d = st.data || {};
+          var chips = el('div', { 'class': 'cwstudio-postrow' });
+          chips.appendChild(el('span', { 'class': 'cwstudio-postchip ' + (d.connected ? 'is-on' : 'is-off'), text: d.connected ? 'connected' : 'not connected' }));
+          (Array.isArray(d.scopes) ? d.scopes : []).forEach(function (s) { chips.appendChild(el('span', { 'class': 'cwstudio-postchip', text: String(s) })); });
+          body.appendChild(chips);
+          body.appendChild(cintRow('account', d.username));
+          body.appendChild(cintRow('connected', cintWhen(d.connected_at_unix_ms)));
+          body.appendChild(cintRow('last verified', cintWhen(d.last_verified_at_unix_ms)));
+          body.appendChild(cintRow('selected repos', repos.ok ? ((repos.data && repos.data.count != null) ? repos.data.count : 0) : 'unavailable (HTTP ' + repos.status + ')'));
+
+          var pat = cintInput({ type: 'password', ph: 'ghp_…', mono: true });
+          var skip = cintCheck();
+          var form = el('div', { 'class': 'cint-form' });
+          form.appendChild(cintField('personal access token (write-only)', pat));
+          form.appendChild(cintField('skip verification (dev only)', skip));
+          stampOperatorOnly(form);
+          body.appendChild(form);
+
+          var out;
+          var acts = cintActions(body);
+          stampOperatorOnly(acts);
+          var connect = cintBtn(d.connected ? 'Replace token' : 'Connect', { primary: !d.connected, title: 'POST /v1/integrations/github/connect' });
+          connect.addEventListener('click', function () {
+            var secret = String(pat.value || '');
+            pat.value = '';
+            cintWrite(out, {
+              run: function () { return operatorGatedCall(function (g) { return g.githubConnect({ pat: secret, skip_verify: !!skip.checked }); }).then(readJson); },
+              after: function (r) { if (r.ok) { paint(); } }
+            });
+          });
+          acts.appendChild(connect);
+          if (d.connected) {
+            var sync = cintBtn('Sync now', { title: 'POST /v1/integrations/github/sync' });
+            sync.addEventListener('click', function () {
+              cintWrite(out, { run: function () { return operatorGatedCall(function (g) { return g.githubSync({}); }).then(readJson); } });
+            });
+            acts.appendChild(sync);
+            var disc = cintBtn('Disconnect', { danger: true, title: 'POST /v1/integrations/github/disconnect' });
+            disc.addEventListener('click', function () {
+              cintWrite(out, {
+                confirm: 'Deletes the sealed GitHub token AND the selected-repo list on this daemon. Repo sync stops until a new token is connected. Proceed?',
+                run: function () { return operatorGatedCall(function (g) { return g.githubDisconnect({}); }).then(readJson); },
+                after: function (r) { if (r.ok) { paint(); } }
+              });
+            });
+            acts.appendChild(disc);
+          }
+          out = cintOut(body);
+        });
+    }
+    return paint();
+  }
+
+  function cintOpenAiCard(grid) {
+    var card = cintCard('OpenAI-compatible LLM');
+    grid.appendChild(card);
+    var load = cintLoading(card);
+    var body = el('div', { 'class': 'cint-cardbody' });
+    card.appendChild(body);
+    function paint() {
+      body.textContent = '';
+      return fetchJSON('/v1/integrations/openai/status').then(function (st) {
+        cintDrop(load);
+        if (!st.ok) { cintUnavailable(body, 'The OpenAI integration', st.status); return; }
+        var d = st.data || {};
+        var chips = el('div', { 'class': 'cwstudio-postrow' });
+        chips.appendChild(el('span', { 'class': 'cwstudio-postchip ' + (d.connected ? 'is-on' : 'is-off'), text: d.connected ? 'connected' : 'not connected' }));
+        body.appendChild(chips);
+        body.appendChild(cintRow('organisation', d.organization_id));
+        body.appendChild(cintRow('default model', d.default_model));
+        body.appendChild(cintRow('models discovered', (Array.isArray(d.available_models) ? d.available_models.length : 0)));
+        body.appendChild(cintRow('connected', cintWhen(d.connected_at_unix_ms)));
+        body.appendChild(cintRow('last verified', cintWhen(d.last_verified_at_unix_ms)));
+
+        var key = cintInput({ type: 'password', ph: 'sk-…', mono: true });
+        var org = cintInput({ ph: 'org-… (optional)', mono: true });
+        var model = cintInput({ ph: 'gpt-4o-mini (optional)', mono: true });
+        var skip = cintCheck();
+        var form = el('div', { 'class': 'cint-form' });
+        form.appendChild(cintField('API key (write-only)', key));
+        form.appendChild(cintField('organisation', org));
+        form.appendChild(cintField('default model', model));
+        form.appendChild(cintField('skip verification (dev only)', skip));
+        stampOperatorOnly(form);
+        body.appendChild(form);
+
+        var out;
+        var acts = cintActions(body);
+        stampOperatorOnly(acts);
+        var connect = cintBtn(d.connected ? 'Replace key' : 'Connect', { primary: !d.connected, title: 'POST /v1/integrations/openai/connect' });
+        connect.addEventListener('click', function () {
+          var secret = String(key.value || '');
+          var orgv = String(org.value || '');
+          var modelv = String(model.value || '');
+          key.value = '';
+          cintWrite(out, {
+            run: function () { return operatorGatedCall(function (g) { return g.openaiConnect({ api_key: secret, organization_id: orgv || undefined, default_model: modelv || undefined, skip_verify: !!skip.checked }); }).then(readJson); },
+            after: function (r) { if (r.ok) { paint(); } }
+          });
+        });
+        acts.appendChild(connect);
+        if (d.connected) {
+          var disc = cintBtn('Disconnect', { danger: true, title: 'POST /v1/integrations/openai/disconnect' });
+          disc.addEventListener('click', function () {
+            cintWrite(out, {
+              confirm: 'Deletes the sealed OpenAI API key on this daemon. Embedding + chat calls that depend on it start failing immediately. Proceed?',
+              run: function () { return operatorGatedCall(function (g) { return g.openaiDisconnect({}); }).then(readJson); },
+              after: function (r) { if (r.ok) { paint(); } }
+            });
+          });
+          acts.appendChild(disc);
+        }
+        out = cintOut(body);
+      });
+    }
+    return paint();
+  }
+
+  // ---- Section 2: packs ---------------------------------------------------
+  function cintPacksCard(section) {
+    var card = cintCard('Integration plane');
+    cintGrid(section).appendChild(card);
+    var load = cintLoading(card);
+    var body = el('div', { 'class': 'cint-cardbody' });
+    card.appendChild(body);
+    function paint() {
+      body.textContent = '';
+      return fetchJSON('/v1/console/integrations').then(function (res) {
+        cintDrop(load);
+        if (!res.ok) { cintUnavailable(body, 'The integration plane', res.status); return; }
+        var d = res.data || {};
+        var row = el('div', { 'class': 'cwstudio-postrow' });
+        row.appendChild(el('span', { 'class': 'cwstudio-postchip ' + (d.enabled ? 'is-on' : 'is-off'), text: d.enabled ? 'enabled' : 'disabled' }));
+        row.appendChild(el('span', { 'class': 'cwstudio-postchip ' + (d.safe_mode ? 'is-warn' : 'is-on'), text: d.safe_mode ? 'safe mode' : 'live' }));
+        row.appendChild(el('span', { 'class': 'cwstudio-postchip ' + (d.allow_executable_helpers ? 'is-warn' : 'is-on'), text: 'executable helpers ' + (d.allow_executable_helpers ? 'allowed' : 'off') }));
+        body.appendChild(row);
+        body.appendChild(el('div', { 'class': 'tstudio-field-lab', text: 'Allowed capabilities' }));
+        var caps = el('div', { 'class': 'cwstudio-chips' });
+        (Array.isArray(d.allowed_capabilities) ? d.allowed_capabilities : []).forEach(function (c) {
+          caps.appendChild(el('span', { 'class': 'tstudio-cap-chip', text: String(c) }));
+        });
+        body.appendChild(caps);
+        if (!d.enabled) {
+          body.appendChild(el('p', { 'class': 'cwstudio-note', text: 'Integrations are disabled on this daemon — install and grant answer 403 until CRUX_INTEGRATIONS is enabled.' }));
+        } else if (d.safe_mode) {
+          body.appendChild(el('p', { 'class': 'cwstudio-note', text: 'Safe mode is on — install and grant answer 403, and non-first-party packs read as blocked.' }));
+        }
+        var packs = Array.isArray(d.packs) ? d.packs : [];
+        body.appendChild(el('div', { 'class': 'tstudio-field-lab', text: 'Packs (' + packs.length + ')' }));
+        if (!packs.length) { body.appendChild(el('p', { 'class': 'cwstudio-note', text: 'No packs reported by this daemon.' })); }
+        packs.forEach(function (p) { body.appendChild(cintPackRow(p, paint)); });
+      });
+    }
+    return paint();
+  }
+
+  function cintPackRow(pack, reload) {
+    pack = pack || {};
+    var m = pack.manifest || {};
+    var id = String(m.id || m.name || '—');
+    var version = String(m.version || '');
+    var caps = Array.isArray(m.capabilities) ? m.capabilities : [];
+    var wrap = el('div', { 'class': 'cint-packcard' });
+    var head = el('div', { 'class': 'cwstudio-packrow' });
+    head.appendChild(el('span', { 'class': 'cwstudio-packid', text: id + (version ? ' · ' + version : '') }));
+    head.appendChild(el('span', { 'class': 'cwstudio-postchip', text: String(pack.install_state || 'available') }));
+    head.appendChild(el('span', { 'class': 'tstudio-ext-tier', text: String(pack.trust_tier || 'unknown') }));
+    if (pack.risk_level) {
+      head.appendChild(el('span', { 'class': 'cwstudio-postchip ' + (pack.risk_level === 'low' ? 'is-on' : 'is-warn'), text: 'risk ' + pack.risk_level }));
+    }
+    wrap.appendChild(head);
+    var chips = el('div', { 'class': 'cwstudio-chips' });
+    caps.forEach(function (c) { chips.appendChild(el('span', { 'class': 'tstudio-cap-chip', text: String(c) })); });
+    if (!caps.length) { chips.appendChild(el('span', { 'class': 'cwstudio-note', text: 'no capabilities declared' })); }
+    wrap.appendChild(chips);
+
+    var out;
+    var acts = cintActions(wrap);
+    stampOperatorOnly(acts);
+    var install = cintBtn(pack.install_state === 'available' ? 'Install' : 'Reinstall', { title: 'POST /v1/console/integrations/' + id + '/install' });
+    install.addEventListener('click', function () {
+      cintWrite(out, {
+        run: function () { return operatorGatedCall(function (g) { return g.integrationPackInstall(id, { pack_id: id, version: version }); }).then(readJson); },
+        after: function (r) { if (r.ok) { reload(); } }
+      });
+    });
+    acts.appendChild(install);
+    // Grant issues exactly the capabilities the manifest declares — install alone
+    // never grants, and the console never widens the set the publisher asked for.
+    var grant = cintBtn('Grant declared capabilities', { title: 'POST /v1/console/integrations/' + id + '/grant' });
+    grant.addEventListener('click', function () {
+      cintWrite(out, {
+        confirm: 'Grants "' + id + '" the ' + caps.length + ' capability/ies its manifest declares (' + (caps.join(', ') || 'none — the daemon will reject an empty set') + '). Proceed?',
+        run: function () { return operatorGatedCall(function (g) { return g.integrationPackGrant(id, { version: version, capabilities: caps, reason: 'granted from Studio › Integrations' }); }).then(readJson); },
+        after: function (r) { if (r.ok) { reload(); } }
+      });
+    });
+    acts.appendChild(grant);
+    var disable = cintBtn('Disable', { danger: true, title: 'POST /v1/console/integrations/' + id + '/disable' });
+    disable.addEventListener('click', function () {
+      cintWrite(out, {
+        confirm: 'Disables the "' + id + '" grant on this daemon — every capability it unlocked stops resolving for the granted passport. Proceed?',
+        run: function () { return operatorGatedCall(function (g) { return g.integrationPackDisable(id, { reason: 'disabled from Studio › Integrations' }); }).then(readJson); },
+        after: function (r) { if (r.ok) { reload(); } }
+      });
+    });
+    acts.appendChild(disable);
+    out = cintOut(wrap);
+    return wrap;
+  }
+
+  // ---- Section 3: extensions + catalog ------------------------------------
+  function cintExtensionsCard(section, grid) {
+    var card = cintCard('Installed extensions');
+    grid.appendChild(card);
+    var load = cintLoading(card);
+    var body = el('div', { 'class': 'cint-cardbody' });
+    card.appendChild(body);
+    function paint() {
+      body.textContent = '';
+      return fetchJSON('/v1/extensions').then(function (res) {
+        cintDrop(load);
+        if (!res.ok) { cintUnavailable(body, 'The extensions registry', res.status); return; }
+        var d = res.data || {};
+        var exts = Array.isArray(d.extensions) ? d.extensions : [];
+        if (!exts.length) {
+          body.appendChild(el('p', { 'class': 'cwstudio-note', text: 'No extensions installed. Install one from the catalog below, or with `corecruxctl extensions install`.' }));
+          return;
+        }
+        exts.forEach(function (ext) { body.appendChild(cintExtensionCard(ext, paint)); });
+      });
+    }
+    return paint();
+  }
+
+  function cintExtensionCard(ext, reload) {
+    ext = ext || {};
+    var m = ext.manifest || {};
+    var id = String(ext.id || m.id || '—');
+    var tools = Array.isArray(m.tools) ? m.tools : [];
+    var caps = Array.isArray(m.capabilities) ? m.capabilities : [];
+    var card = el('div', { 'class': 'tstudio-ext-card cint-extcard' });
+    var head = el('div', { 'class': 'tstudio-ext-head' });
+    head.appendChild(el('span', { 'class': 'tstudio-ext-id', text: id + (m.version ? ' · ' + m.version : '') }));
+    head.appendChild(el('span', { 'class': 'tstudio-ext-tier', text: String(ext.trust_tier || 'unknown') }));
+    head.appendChild(el('span', { 'class': 'cwstudio-postchip', text: String((m.entry && m.entry.kind) || 'unknown kind') }));
+    card.appendChild(head);
+    var chips = el('div', { 'class': 'tstudio-ext-chips' });
+    caps.forEach(function (c) { chips.appendChild(el('span', { 'class': 'tstudio-cap-chip', text: String(c) })); });
+    if (!caps.length) { chips.appendChild(el('span', { 'class': 'cwstudio-note', text: 'no capabilities declared' })); }
+    card.appendChild(chips);
+    var hosts = (m.network && Array.isArray(m.network.allowed_hosts)) ? m.network.allowed_hosts : [];
+    card.appendChild(cintRow('allowed hosts', hosts.length ? hosts.join(' · ') : 'endpoint pinning only'));
+    var safety = m.safety || {};
+    card.appendChild(cintRow('budgets', 'sandbox ' + String(safety.sandbox || 'none')
+      + ' · runtime ' + (safety.max_runtime_ms ? safety.max_runtime_ms + 'ms' : 'daemon default')
+      + ' · output ' + (safety.max_output_bytes ? safety.max_output_bytes + 'B' : 'daemon default')));
+
+    // Invoke — the control that used to render with no click handler at all.
+    var out;
+    if (tools.length || m.external_tool_endpoint) {
+      var inv = el('div', { 'class': 'cint-invoke' });
+      inv.appendChild(el('div', { 'class': 'tstudio-field-lab', text: 'Invoke a tool' }));
+      var toolNames = tools.map(function (t) { return String((t && t.name) || ''); }).filter(Boolean);
+      var toolPick = toolNames.length > 1 ? cintSelect(toolNames, toolNames[0]) : null;
+      if (toolPick) { inv.appendChild(cintField('tool', toolPick)); }
+      else { inv.appendChild(cintRow('tool', toolNames[0] || '(none declared)')); }
+      var args = el('textarea', { 'class': 'tstudio-input tstudio-textarea cint-args', rows: '3', placeholder: '{ }' });
+      inv.appendChild(cintField('args (JSON)', args));
+      var invActs = cintActions(inv);
+      stampOperatorOnly(invActs);
+      var invoke = cintBtn('Invoke', { title: 'POST /v1/extensions/' + id + '/tools/{tool}/invoke — grant-scoped, rate-limited' });
+      invoke.addEventListener('click', function () {
+        var tool = toolPick ? String(toolPick.value || '') : (toolNames[0] || '');
+        var parsed, raw = String(args.value || '').trim();
+        try { parsed = raw ? JSON.parse(raw) : {}; }
+        catch (e) { showWiredResult(out, 'args must be a JSON object — ' + String(e && e.message || e), true); return; }
+        if (!tool) { showWiredResult(out, 'this extension declares no tools to invoke', true); return; }
+        cintWrite(out, {
+          confirm: 'Invokes "' + tool + '" on extension ' + id + '. The daemon makes an OUTBOUND call to the declared endpoint under your grant. Proceed?',
+          run: function (pp) { return operatorGatedCall(function (g) { return g.extensionInvoke(id, tool, { passport_fpr: pp, args: parsed }); }).then(readJson); },
+          render: cintVerbatim
+        });
+      });
+      invActs.appendChild(invoke);
+      card.appendChild(inv);
+    }
+
+    card.appendChild(cintGrantsPanel(id));
+
+    var acts = cintActions(card);
+    stampOperatorOnly(acts);
+    var uninstall = cintBtn('Uninstall', { danger: true, title: 'DELETE /v1/extensions/' + id });
+    uninstall.addEventListener('click', function () {
+      cintWrite(out, {
+        confirm: 'Uninstalls extension "' + id + '" from this daemon. Its tools leave the MCP catalog and every grant issued against it stops resolving. Proceed?',
+        run: function () { return operatorGatedCall(function (g) { return g.extensionUninstall(id, {}); }).then(readJson); },
+        after: function (r) { if (r.ok) { reload(); } }
+      });
+    });
+    acts.appendChild(uninstall);
+    out = cintOut(card);
+    return card;
+  }
+
+  // Per-extension grants: who may call it, which tools, at what rate.
+  function cintGrantsPanel(id) {
+    var panel = el('div', { 'class': 'cint-grants' });
+    panel.appendChild(el('div', { 'class': 'tstudio-field-lab', text: 'Grants' }));
+    var list = el('div', { 'class': 'cint-grantlist' });
+    panel.appendChild(list);
+    function paint() {
+      list.textContent = '';
+      return cintApiJson('extensionsByIdGrants', [id]).then(function (res) {
+        if (!res.ok) { cintUnavailable(list, 'Grants for ' + id, res.status); return; }
+        var grants = (res.data && Array.isArray(res.data.grants)) ? res.data.grants : [];
+        if (!grants.length) { list.appendChild(el('p', { 'class': 'cwstudio-note', text: 'No grants — no passport can call this extension yet.' })); }
+        grants.forEach(function (gr) { list.appendChild(cintGrantRow(id, gr, paint)); });
+      });
+    }
+    var fpr = cintInput({ ph: 'passport fingerprint', mono: true });
+    var toolFilter = cintInput({ ph: 'tool names (optional, comma-separated)', mono: true });
+    var form = el('div', { 'class': 'cint-form' });
+    form.appendChild(cintField('passport fpr', fpr));
+    form.appendChild(cintField('tool filter', toolFilter));
+    stampOperatorOnly(form);
+    panel.appendChild(form);
+    var out;
+    var acts = cintActions(panel);
+    stampOperatorOnly(acts);
+    var add = cintBtn('Issue grant', { title: 'POST /v1/extensions/' + id + '/grants' });
+    add.addEventListener('click', function () {
+      var who = String(fpr.value || '').trim();
+      var toolNames = splitIds(toolFilter.value);
+      if (!who) { showWiredResult(out, 'a passport fingerprint is required — a grant is always attributed', true); return; }
+      cintWrite(out, {
+        run: function () { return operatorGatedCall(function (g) { return g.extensionGrantAdd(id, { passport_fpr: who, allowed_tool_names: toolNames }); }).then(readJson); },
+        after: function (r) { if (r.ok) { fpr.value = ''; toolFilter.value = ''; paint(); } }
+      });
+    });
+    acts.appendChild(add);
+    out = cintOut(panel);
+    paint();
+    return panel;
+  }
+
+  function cintGrantRow(id, grant, reload) {
+    grant = grant || {};
+    var who = String(grant.passport_fpr || '—');
+    var wrap = el('div', { 'class': 'cwstudio-packrow cint-grantrow' });
+    wrap.appendChild(el('span', { 'class': 'cwstudio-packid', text: who }));
+    var toolNames = Array.isArray(grant.allowed_tool_names) ? grant.allowed_tool_names : [];
+    wrap.appendChild(el('span', { 'class': 'cint-row-v', text: toolNames.length ? toolNames.join(' · ') : 'all declared tools' }));
+    wrap.appendChild(el('span', { 'class': 'cwstudio-postchip', text: grant.rate_limit_per_min ? grant.rate_limit_per_min + '/min' : 'daemon default rate' }));
+    var out;
+    var revoke = cintBtn('Revoke', { danger: true, title: 'DELETE /v1/extensions/' + id + '/grants/' + who });
+    revoke.addEventListener('click', function () {
+      cintWrite(out, {
+        confirm: 'Revokes the grant for ' + who + ' on extension ' + id + '. That passport can no longer call any of its tools. Proceed?',
+        run: function () { return operatorGatedCall(function (g) { return g.extensionGrantRemove(id, who, {}); }).then(readJson); },
+        after: function (r) { if (r.ok) { reload(); } }
+      });
+    });
+    wrap.appendChild(revoke);
+    out = cintOut(wrap);
+    return wrap;
+  }
+
+  function cintCatalogCard(section, grid) {
+    var card = cintCard('Catalog — curator-signed registry');
+    grid.appendChild(card);
+    var load = cintLoading(card);
+    var body = el('div', { 'class': 'cint-cardbody' });
+    card.appendChild(body);
+    function paint() {
+      body.textContent = '';
+      return fetchJSON('/v1/extensions/registry').then(function (res) {
+        cintDrop(load);
+        // 404 is the fresh-daemon case, not a fault: the cached index has never
+        // been synced. Name the command that populates it.
+        if (res.status === 404) {
+          body.appendChild(el('p', { 'class': 'cwstudio-note', text: 'No cached registry index on this daemon. Run `corecruxctl extensions sync` to fetch and verify the curator-signed index, then reload this page.' }));
+          return;
+        }
+        if (!res.ok) { cintUnavailable(body, 'The registry catalog', res.status); return; }
+        var d = res.data || {};
+        body.appendChild(cintRow('curator', d.curator_passport_fpr));
+        body.appendChild(cintRow('index updated', cintWhen(d.updated_at_unix_ms)));
+        var entries = Array.isArray(d.entries) ? d.entries : [];
+        if (!entries.length) {
+          body.appendChild(el('p', { 'class': 'cwstudio-note', text: 'The verified index carries no entries — the curator has published none yet.' }));
+          return;
+        }
+        entries.forEach(function (e) { body.appendChild(cintCatalogRow(e, paint)); });
+      });
+    }
+    return paint();
+  }
+
+  function cintCatalogRow(entry, reload) {
+    entry = entry || {};
+    var id = String(entry.id || '—');
+    var installedVersion = String(entry.installed_version || '');
+    var stale = !!entry.installed && !!installedVersion && installedVersion !== String(entry.version || '');
+    var wrap = el('div', { 'class': 'cint-catrow' });
+    var head = el('div', { 'class': 'cwstudio-packrow' });
+    head.appendChild(el('span', { 'class': 'cwstudio-packid', text: String(entry.name || id) + ' · ' + String(entry.version || '') }));
+    head.appendChild(el('span', { 'class': 'tstudio-ext-tier', text: String(entry.trust_tier || 'unknown') }));
+    head.appendChild(el('span', {
+      'class': 'cwstudio-postchip ' + (entry.installed ? (stale ? 'is-warn' : 'is-on') : ''),
+      text: entry.installed ? (stale ? 'installed ' + installedVersion + ' · update available' : 'installed') : 'not installed'
+    }));
+    wrap.appendChild(head);
+    if (entry.summary) { wrap.appendChild(el('p', { 'class': 'cwstudio-note', text: String(entry.summary) })); }
+
+    var detail = el('div', { 'class': 'cint-detail' });
+    detail.hidden = true;
+    var out;
+    var acts = cintActions(wrap);
+    var more = el('button', { 'class': 'tstudio-btn cint-disclose', type: 'button', 'aria-expanded': 'false' }, ['Safety scorecard']);
+    more.addEventListener('click', function () {
+      var open = !!detail.hidden;
+      detail.hidden = !open;
+      more.setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (!open || detail.childNodes.length) { return; }
+      // Index-only scorecard first (always available), then upgrade it with the
+      // installed manifest's capability + network truth when there is one.
+      detail.appendChild(cintScorecard(entry, null));
+      if (entry.installed) {
+        cintApiJson('extensionsById', [id]).then(function (r) {
+          var m = r.ok && r.data && (r.data.manifest || (r.data.extension && r.data.extension.manifest));
+          if (m) { detail.textContent = ''; detail.appendChild(cintScorecard(entry, m)); }
+        });
+      }
+    });
+    acts.appendChild(more);
+    var install = cintBtn(entry.installed ? (stale ? 'Update' : 'Reinstall') : 'Install', { primary: !entry.installed, title: 'POST /v1/extensions/install-from-registry' });
+    install.addEventListener('click', function () {
+      cintWrite(out, {
+        confirm: 'Installs "' + id + '" from the curator-signed index. The daemon re-verifies the index signature, fetches the manifest and enforces the published sha256 before anything is registered. Proceed?',
+        run: function () { return operatorGatedCall(function (g) { return g.extensionInstallFromRegistry({ id: id }); }).then(readJson); },
+        after: function (r) { if (r.ok) { reload(); } }
+      });
+    });
+    acts.appendChild(install);
+    wrap.appendChild(detail);
+    out = cintOut(wrap);
+    return wrap;
+  }
+
+  // ---- Section 4: trusted keys --------------------------------------------
+  function cintKeysCard(section) {
+    var card = cintCard('Trusted signing keys');
+    cintGrid(section).appendChild(card);
+    var load = cintLoading(card);
+    var body = el('div', { 'class': 'cint-cardbody' });
+    card.appendChild(body);
+    function paint() {
+      body.textContent = '';
+      return fetchJSON('/v1/extensions/keys').then(function (res) {
+        cintDrop(load);
+        if (!res.ok) { cintUnavailable(body, 'The trusted keyring', res.status); return; }
+        var d = res.data || {};
+        var keys = d.keys || {};
+        var ids = Object.keys(keys);
+        if (!ids.length) {
+          body.appendChild(el('p', { 'class': 'cwstudio-note', text: 'No trusted keys registered. A signed manifest installs only when its publisher key is in this keyring.' }));
+        }
+        ids.forEach(function (fpr) { body.appendChild(cintKeyRow(fpr, keys[fpr], paint)); });
+        body.appendChild(cintKeyForm(paint));
+      });
+    }
+    return paint();
+  }
+
+  function cintKeyRow(fpr, entry, reload) {
+    entry = entry || {};
+    var wrap = el('div', { 'class': 'cwstudio-packrow cint-keyrow' });
+    wrap.appendChild(el('span', { 'class': 'cwstudio-packid', text: String(fpr) }));
+    wrap.appendChild(el('span', { 'class': 'tstudio-ext-tier', text: String(entry.trust_tier || 'unknown') }));
+    wrap.appendChild(el('span', { 'class': 'cint-row-v', text: 'added ' + cintWhen(entry.added_at_unix_ms) + (entry.added_by ? ' by ' + entry.added_by : '') }));
+    var out;
+    var remove = cintBtn('Remove', { danger: true, title: 'DELETE /v1/extensions/keys/' + fpr });
+    remove.addEventListener('click', function () {
+      cintWrite(out, {
+        confirm: 'Removes ' + fpr + ' from the trusted keyring. Manifests signed by that key stop verifying, so its packs can no longer be installed or re-verified. Proceed?',
+        run: function () { return operatorGatedCall(function (g) { return g.extensionRemoveKey(fpr, {}); }).then(readJson); },
+        after: function (r) { if (r.ok) { reload(); } }
+      });
+    });
+    wrap.appendChild(remove);
+    out = cintOut(wrap);
+    return wrap;
+  }
+
+  function cintKeyForm(reload) {
+    var panel = el('div', { 'class': 'cint-keyform' });
+    var fpr = cintInput({ ph: 'passport fingerprint', mono: true });
+    var pub = cintInput({ ph: 'ed25519 public key (hex)', mono: true });
+    var tier = cintSelect(CINT_TRUST_TIERS, 'community_reviewed');
+    var form = el('div', { 'class': 'cint-form' });
+    form.appendChild(cintField('passport fpr', fpr));
+    form.appendChild(cintField('public key hex', pub));
+    form.appendChild(cintField('trust tier', tier));
+    stampOperatorOnly(form);
+    panel.appendChild(form);
+    var out;
+    var acts = cintActions(panel);
+    stampOperatorOnly(acts);
+    var add = cintBtn('Add key', { title: 'POST /v1/extensions/keys' });
+    add.addEventListener('click', function () {
+      var who = String(fpr.value || '').trim();
+      var hex = String(pub.value || '').trim();
+      var tierv = String(tier.value || 'community_reviewed');
+      if (!who || !hex) { showWiredResult(out, 'both a passport fingerprint and a public key are required', true); return; }
+      cintWrite(out, {
+        run: function (pp) { return operatorGatedCall(function (g) { return g.extensionAddKey({ passport_fpr: who, public_key_hex: hex, trust_tier: tierv, added_by: pp }); }).then(readJson); },
+        after: function (r) { if (r.ok) { fpr.value = ''; pub.value = ''; reload(); } }
+      });
+    });
+    acts.appendChild(add);
+    out = cintOut(panel);
+    return panel;
+  }
+
   function renderIntegrationsStudio(host, ctx) {
     ctx = ctx || {};
     host.textContent = '';
@@ -7762,82 +8474,30 @@
     root.appendChild(el('div', { 'class': 'cwstudio-header' }, [
       el('div', { 'class': 'cwstudio-title' }, [
         el('h2', { text: 'Integrations' }),
-        el('p', { 'class': 'cwstudio-sub', text: 'The extension plane — installed packs, the community registry, and trusted keys. Reads are live; install / grant / disable run through the signed community rail (no arbitrary mutation from the console).' })
+        el('p', { 'class': 'cwstudio-sub', text: 'Set up and operate every integration here: source connectors, built-in packs, community extensions and the signing keys they verify against. Reads are live; writes are operator-gated and passport-attributed.' })
       ])
     ]));
-    var grid = el('div', { 'class': 'cwstudio-intgrid' });
-    root.appendChild(grid);
+    if (!isOperator()) {
+      root.appendChild(el('div', { 'class': 'tstudio-banner', text: 'Read-only — customer posture. Status is live; connect, install, grant, invoke and revoke need operator posture.' }));
+    }
 
-    function card(title) { var c = el('div', { 'class': 'v2card wide cwstudio-intcard' }); c.appendChild(el('h3', { 'class': 'v2card-h', text: title })); return c; }
-    function loading(c) { var l = el('div', { 'class': 'cwstudio-loading', text: 'loading…' }); c.appendChild(l); return l; }
+    var connectors = cintSection('connectors', 'Connectors', 'Credentials are sealed daemon-side. The console posts them once and never reads them back.');
+    var packs = cintSection('packs', 'Packs', 'Built-in integration packs. Install is not grant — a pack does nothing until a passport grant names its capabilities.');
+    var extensions = cintSection('extensions', 'Extensions + catalog', 'Community extensions, installed from a curator-signed index the daemon re-verifies locally against its trusted keyring.');
+    var keys = cintSection('keys', 'Trusted keys', 'The Ed25519 keyring every signed manifest verifies against.');
+    root.appendChild(connectors);
+    root.appendChild(packs);
+    root.appendChild(extensions);
+    root.appendChild(keys);
 
-    // Card 1: plane posture + installed packs (/v1/console/integrations)
-    var planeCard = card('Integration plane');
-    grid.appendChild(planeCard);
-    var planeLoad = loading(planeCard);
-    var api = (typeof window !== 'undefined') ? window.CruxApi : null;
-    (api && typeof api.consoleIntegrations === 'function' ? api.consoleIntegrations() : Promise.reject())
-      .then(function (r) { return r.json(); })
-      .then(function (d) {
-        if (planeLoad.parentNode) { planeLoad.parentNode.removeChild(planeLoad); }
-        var row = el('div', { 'class': 'cwstudio-postrow' });
-        row.appendChild(el('span', { 'class': 'cwstudio-postchip ' + (d.enabled ? 'is-on' : 'is-off'), text: d.enabled ? 'enabled' : 'disabled' }));
-        row.appendChild(el('span', { 'class': 'cwstudio-postchip ' + (d.safe_mode ? 'is-warn' : 'is-on'), text: d.safe_mode ? 'safe mode' : 'live' }));
-        row.appendChild(el('span', { 'class': 'cwstudio-postchip ' + (d.allow_executable_helpers ? 'is-warn' : 'is-on'), text: 'executable helpers ' + (d.allow_executable_helpers ? 'allowed' : 'off') }));
-        planeCard.appendChild(row);
-        planeCard.appendChild(el('div', { 'class': 'tstudio-field-lab', text: 'Allowed capabilities' }));
-        var caps = el('div', { 'class': 'cwstudio-chips' });
-        (d.allowed_capabilities || []).forEach(function (c) { caps.appendChild(el('span', { 'class': 'tstudio-cap-chip', text: c })); });
-        planeCard.appendChild(caps);
-        // installed packs
-        var packs = Array.isArray(d.packs) ? d.packs : [];
-        planeCard.appendChild(el('div', { 'class': 'tstudio-field-lab', text: 'Installed packs (' + packs.length + ')' }));
-        if (!packs.length) { planeCard.appendChild(el('p', { 'class': 'cwstudio-note', text: 'No packs installed.' })); }
-        packs.forEach(function (p) {
-          var m = p.manifest || {};
-          var pc = el('div', { 'class': 'cwstudio-packrow' });
-          pc.appendChild(el('span', { 'class': 'cwstudio-packid', text: String(m.id || m.name || '—') + ' · ' + String(m.version || '') }));
-          var disc = el('div', { 'class': 'cwstudio-chips' });
-          (Array.isArray(m.capabilities) ? m.capabilities : []).forEach(function (c) { disc.appendChild(el('span', { 'class': 'tstudio-cap-chip', text: c })); });
-          if (!(m.capabilities && m.capabilities.length)) { disc.appendChild(el('span', { 'class': 'cwstudio-note', text: 'no capabilities declared' })); }
-          pc.appendChild(disc);
-          var dis = el('button', { 'class': 'tstudio-btn cwstudio-danger', type: 'button', text: 'Disable', title: 'Disable runs through POST /v1/console/integrations/{packId}/disable (operator-gated; not an in-console mutation)' });
-          dis.disabled = true; dis.setAttribute('aria-disabled', 'true');
-          pc.appendChild(dis);
-          planeCard.appendChild(pc);
-        });
-      })
-      .catch(function () { if (planeLoad.parentNode) { planeLoad.parentNode.removeChild(planeLoad); } planeCard.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'integration plane unavailable on this daemon (404 — feature not configured).' })); });
-
-    // Card 2: extensions registry (/v1/extensions) — capability disclosure + honest-empty + install flow
-    var extCard = card('Extensions (registry-backed)');
-    grid.appendChild(extCard);
-    var extLoad = loading(extCard);
-    fetchJSON('/v1/extensions').then(function (res) {
-      if (extLoad.parentNode) { extLoad.parentNode.removeChild(extLoad); }
-      var d = res.data || {};
-      extCard.appendChild(tstudioRenderExtensions(d, { operator: isOperator() }));
-      extCard.appendChild(el('div', { 'class': 'cwstudio-installflow' }, [
-        el('div', { 'class': 'tstudio-field-lab', text: 'How to install (capability disclosure at install)' }),
-        el('p', { 'class': 'cwstudio-note', text: '1. Find a signed pack in the curator-signed community index (integrations/community/). 2. Its manifest declares exactly the capabilities it needs — you review them before installing. 3. Install via corecruxctl extensions install or POST /v1/extensions/install-from-registry {id, index_path}. 4. Grant per-passport scopes via POST /v1/extensions/{id}/grants.' }),
-        el('p', { 'class': 'cwstudio-note', text: 'There is no arbitrary install button here by design — trust rides the signed community rail, not an unsigned URL box.' })
-      ]));
-    }).catch(function () { if (extLoad.parentNode) { extLoad.parentNode.removeChild(extLoad); } extCard.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'extensions endpoint unavailable' })); });
-
-    // Card 3: trusted keys (/v1/extensions/keys)
-    var keyCard = card('Trusted keys');
-    grid.appendChild(keyCard);
-    var keyLoad = loading(keyCard);
-    fetchJSON('/v1/extensions/keys').then(function (res) {
-      if (keyLoad.parentNode) { keyLoad.parentNode.removeChild(keyLoad); }
-      var d = res.data || {}; var keys = d.keys || {}; var ids = Object.keys(keys);
-      if (!ids.length) {
-        keyCard.appendChild(el('p', { 'class': 'cwstudio-note', text: 'No trusted keys registered. A trusted Ed25519 publisher key lets you install that publisher\'s signed packs. Add one via POST /v1/extensions/keys (operator, on the Extensions surface).' }));
-      } else {
-        ids.forEach(function (k) { keyCard.appendChild(el('div', { 'class': 'cwstudio-packrow', text: k })); });
-      }
-    }).catch(function () { if (keyLoad.parentNode) { keyLoad.parentNode.removeChild(keyLoad); } keyCard.appendChild(el('div', { 'class': 'tstudio-apierr', text: 'keys endpoint unavailable' })); });
-
+    var connGrid = cintGrid(connectors);
+    cintGithubCard(connGrid);
+    cintOpenAiCard(connGrid);
+    cintPacksCard(packs);
+    var extGrid = cintGrid(extensions);
+    cintExtensionsCard(extensions, extGrid);
+    cintCatalogCard(extensions, extGrid);
+    cintKeysCard(keys);
     return Promise.resolve();
   }
 
@@ -14232,6 +14892,13 @@
     // every entry fires through operatorGatedCall; the destructive subset carries
     // a confirm). The runtime never reaches the gated write client except via these + the
     // operator helpers above, all funnelling through operatorGatedCall.
-    WIRED_WRITES: WIRED_WRITES
+    WIRED_WRITES: WIRED_WRITES,
+    // crux-integrations I1+I2 — Studio › Integrations. The section keys the smoke
+    // asserts against, the entry point, and the catalog safety scorecard (a pure
+    // DOM builder the smoke drives with a fixture to prove the capability chips
+    // and provenance rows come from data, not from copy).
+    CINT_SECTIONS: CINT_SECTIONS,
+    renderIntegrationsStudio: renderIntegrationsStudio,
+    cintScorecard: cintScorecard
   };
 });
