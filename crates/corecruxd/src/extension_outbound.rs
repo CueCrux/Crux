@@ -10,15 +10,20 @@
 //! `entry.kind == ExternalTool`, and a tool name + args object, this
 //! module:
 //!
-//! 1. Confirms the tool name is in the manifest's `tools[]` list.
-//! 2. Looks up the per-passport `ExtensionGrant` (see [`super::extension_grants`])
+//! 1. Confirms the manifest entry is `ExternalTool` and has an endpoint.
+//! 2. Requires HTTPS unless the daemon's development-only plain-HTTP flag is set.
+//! 3. Enforces `network.allowed_hosts` against the endpoint host and optional port.
+//! 4. Confirms the tool name is in the manifest's `tools[]` list.
+//! 5. Looks up the per-passport `ExtensionGrant` (see [`super::extension_grants`])
 //!    from the fact store and verifies the calling passport is allowed
 //!    to call this tool.
-//! 3. Enforces the daemon-wide payload + rate limits + the per-grant
-//!    rate-limit override.
-//! 4. POSTs a JSON envelope `{ tool, args, calling_passport_id, request_id }`
-//!    to the manifest's `external_tool_endpoint`.
-//! 5. Validates the response shape and any `fact_writes[]` against the
+//! 6. Enforces the grant's `allowed_tool_names`.
+//! 7. Tightens the daemon-wide timeout and response cap with non-zero
+//!    manifest safety values, then enforces the configured/grant rate limit.
+//! 8. Enforces the request cap, POSTs a JSON envelope
+//!    `{ tool, args, calling_passport_id, request_id }`, and enforces the
+//!    response cap.
+//! 9. Validates the response shape and any `fact_writes[]` against the
 //!    grant's `allowed_prefixes_write`. Out-of-scope writes are dropped
 //!    + warning-logged; the caller still gets the `result` payload.
 //!
@@ -58,6 +63,10 @@ pub enum OutboundError {
     ResponseTooLarge(usize, usize),
     #[error("plain http endpoint blocked (set CORECRUXD_EXTENSIONS_ALLOW_PLAIN_HTTP=true for dev)")]
     PlainHttpBlocked,
+    #[error("invalid external tool endpoint '{0}'")]
+    InvalidEndpoint(String),
+    #[error("endpoint '{1}' is not allowed by extension '{0}' network.allowed_hosts")]
+    EndpointNotAllowed(String, String),
     #[error("transport: {0}")]
     Transport(String),
     #[error("upstream returned {status}: {body}")]
@@ -253,6 +262,60 @@ fn write_allowed_by_grant(grant_prefixes_write: &[String], proposed_entity: &str
         .any(|prefix| proposed_entity.starts_with(prefix))
 }
 
+/// Parse an `allowed_hosts` entry into a host and optional port. Entries
+/// are deliberately literal: wildcards, URL schemes, paths, and malformed
+/// ports do not match.
+fn parse_allowed_host_entry(entry: &str) -> Option<(&str, Option<u16>)> {
+    let entry = entry.trim();
+    if entry.is_empty() || entry.contains("://") || entry.contains(['/', '?', '#', '*']) {
+        return None;
+    }
+
+    if let Some(bracketed) = entry.strip_prefix('[') {
+        let closing = bracketed.find(']')?;
+        let host = &bracketed[..closing];
+        let remainder = &bracketed[closing + 1..];
+        return if remainder.is_empty() {
+            Some((host, None))
+        } else {
+            let port = remainder.strip_prefix(':')?.parse::<u16>().ok()?;
+            Some((host, Some(port)))
+        };
+    }
+
+    match entry.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') && !host.is_empty() => Some((host, Some(port.parse::<u16>().ok()?))),
+        Some(_) => None,
+        None => Some((entry, None)),
+    }
+}
+
+fn endpoint_allowed_by_network(endpoint: &url::Url, allowed_hosts: &[String]) -> bool {
+    if allowed_hosts.is_empty() {
+        return true;
+    }
+    let Some(endpoint_host) = endpoint.host_str() else {
+        return false;
+    };
+
+    allowed_hosts.iter().any(|entry| {
+        let Some((allowed_host, allowed_port)) = parse_allowed_host_entry(entry) else {
+            return false;
+        };
+        if !endpoint_host.eq_ignore_ascii_case(allowed_host) {
+            return false;
+        }
+        allowed_port.is_none() || endpoint.port_or_known_default() == allowed_port
+    })
+}
+
+fn u64_to_usize_saturating(value: u64) -> usize {
+    match usize::try_from(value) {
+        Ok(value) => value,
+        Err(_) => usize::MAX,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_external_tool(
     transport: &dyn OutboundTransport,
@@ -279,6 +342,20 @@ pub fn dispatch_external_tool(
     if !endpoint.starts_with("https://") && (!endpoint.starts_with("http://") || !config.allow_plain_http) {
         return Err(OutboundError::PlainHttpBlocked);
     }
+    let endpoint_url = url::Url::parse(endpoint).map_err(|_| OutboundError::InvalidEndpoint(endpoint.to_string()))?;
+    let endpoint_host = endpoint_url
+        .host_str()
+        .ok_or_else(|| OutboundError::InvalidEndpoint(endpoint.to_string()))?;
+    if !endpoint_allowed_by_network(&endpoint_url, &manifest.network.allowed_hosts) {
+        let endpoint_authority = match endpoint_url.port() {
+            Some(port) => format!("{endpoint_host}:{port}"),
+            None => endpoint_host.to_string(),
+        };
+        return Err(OutboundError::EndpointNotAllowed(
+            manifest.id.clone(),
+            endpoint_authority,
+        ));
+    }
 
     let _ = find_tool(manifest, tool_name)?;
 
@@ -296,6 +373,21 @@ pub fn dispatch_external_tool(
             tool_name.to_string(),
         ));
     }
+
+    let effective_timeout = if manifest.safety.max_runtime_ms == 0 {
+        config.timeout
+    } else {
+        config
+            .timeout
+            .min(Duration::from_millis(manifest.safety.max_runtime_ms))
+    };
+    let effective_max_response_bytes = if manifest.safety.max_output_bytes == 0 {
+        config.max_response_bytes
+    } else {
+        config
+            .max_response_bytes
+            .min(u64_to_usize_saturating(manifest.safety.max_output_bytes))
+    };
 
     let cap = grant.rate_limit_per_min.unwrap_or(config.default_rate_per_min);
     rate_table.check_and_record(&manifest.id, calling_passport_fpr, cap)?;
@@ -315,13 +407,13 @@ pub fn dispatch_external_tool(
     }
 
     let started = Instant::now();
-    let resp = transport.invoke(endpoint, auth_secret_resolved.as_deref(), body_json, config.timeout)?;
+    let resp = transport.invoke(endpoint, auth_secret_resolved.as_deref(), body_json, effective_timeout)?;
     let elapsed_ms = started.elapsed().as_millis() as u64;
 
-    if resp.body.len() > config.max_response_bytes {
+    if resp.body.len() > effective_max_response_bytes {
         return Err(OutboundError::ResponseTooLarge(
             resp.body.len(),
-            config.max_response_bytes,
+            effective_max_response_bytes,
         ));
     }
     if !(200..=299).contains(&resp.status) {
@@ -411,7 +503,7 @@ mod tests {
     /// Configurable canned-response transport.
     struct MockTransport {
         canned: Arc<Mutex<Vec<TransportResponse>>>,
-        seen: Arc<Mutex<Vec<(String, Option<String>, String)>>>,
+        seen: Arc<Mutex<Vec<(String, Option<String>, String, Duration)>>>,
     }
 
     impl MockTransport {
@@ -434,7 +526,7 @@ mod tests {
             self.seen
                 .lock()
                 .unwrap()
-                .push((url.to_string(), bearer.map(str::to_string), body_json));
+                .push((url.to_string(), bearer.map(str::to_string), body_json, _timeout));
             self.canned
                 .lock()
                 .unwrap()
@@ -528,6 +620,78 @@ mod tests {
         assert_eq!(outcome.accepted_fact_writes, 1);
         assert_eq!(outcome.dropped_fact_writes, 0);
         assert_eq!(parsed.fact_writes.len(), 1);
+    }
+
+    #[test]
+    fn allowed_hosts_mismatch_rejected() {
+        let transport = MockTransport::new(vec![happy_response()]);
+        let seen = transport.seen.clone();
+        let mut m = manifest("ext.example.quote");
+        m.network.allowed_hosts = vec!["other.example.com".to_string()];
+
+        let err = dispatch_external_tool(
+            &transport,
+            &RateTable::new(),
+            &OutboundConfig::default(),
+            &m,
+            &grant("ext.example.quote", "p_alice"),
+            "quote.daily",
+            &serde_json::json!({}),
+            "p_alice",
+            "req-host-mismatch",
+            None,
+        )
+        .expect_err("host mismatch must reject");
+
+        assert!(matches!(err, OutboundError::EndpointNotAllowed(_, _)));
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn allowed_hosts_exact_case_insensitive_match_passes() {
+        let transport = MockTransport::new(vec![happy_response()]);
+        let mut m = manifest("ext.example.quote");
+        m.network.allowed_hosts = vec!["QUOTE.EXAMPLE.COM".to_string()];
+
+        dispatch_external_tool(
+            &transport,
+            &RateTable::new(),
+            &OutboundConfig::default(),
+            &m,
+            &grant("ext.example.quote", "p_alice"),
+            "quote.daily",
+            &serde_json::json!({}),
+            "p_alice",
+            "req-host-match",
+            None,
+        )
+        .expect("case-insensitive exact host match");
+    }
+
+    #[test]
+    fn allowed_hosts_port_mismatch_rejected() {
+        let transport = MockTransport::new(vec![happy_response()]);
+        let seen = transport.seen.clone();
+        let mut m = manifest("ext.example.quote");
+        m.external_tool_endpoint = Some("https://quote.example.com:8443/invoke".to_string());
+        m.network.allowed_hosts = vec!["quote.example.com:443".to_string()];
+
+        let err = dispatch_external_tool(
+            &transport,
+            &RateTable::new(),
+            &OutboundConfig::default(),
+            &m,
+            &grant("ext.example.quote", "p_alice"),
+            "quote.daily",
+            &serde_json::json!({}),
+            "p_alice",
+            "req-port-mismatch",
+            None,
+        )
+        .expect_err("port mismatch must reject");
+
+        assert!(matches!(err, OutboundError::EndpointNotAllowed(_, _)));
+        assert!(seen.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -782,6 +946,128 @@ mod tests {
         )
         .expect_err("oversize");
         assert!(matches!(err, OutboundError::ResponseTooLarge(_, _)));
+    }
+
+    #[test]
+    fn safety_tightens_timeout() {
+        let transport = MockTransport::new(vec![happy_response()]);
+        let seen = transport.seen.clone();
+        let cfg = OutboundConfig {
+            timeout: Duration::from_secs(5),
+            ..OutboundConfig::default()
+        };
+        let mut m = manifest("ext.example.quote");
+        m.safety.max_runtime_ms = 125;
+
+        dispatch_external_tool(
+            &transport,
+            &RateTable::new(),
+            &cfg,
+            &m,
+            &grant("ext.example.quote", "p_alice"),
+            "quote.daily",
+            &serde_json::json!({}),
+            "p_alice",
+            "req-safety-timeout",
+            None,
+        )
+        .expect("dispatch");
+
+        assert_eq!(seen.lock().unwrap()[0].3, Duration::from_millis(125));
+    }
+
+    #[test]
+    fn safety_tightens_response_limit() {
+        let transport = MockTransport::new(vec![TransportResponse {
+            status: 200,
+            body: "{}".to_string(),
+        }]);
+        let cfg = OutboundConfig {
+            max_response_bytes: 100,
+            ..OutboundConfig::default()
+        };
+        let mut m = manifest("ext.example.quote");
+        m.safety.max_output_bytes = 1;
+
+        let err = dispatch_external_tool(
+            &transport,
+            &RateTable::new(),
+            &cfg,
+            &m,
+            &grant("ext.example.quote", "p_alice"),
+            "quote.daily",
+            &serde_json::json!({}),
+            "p_alice",
+            "req-safety-response",
+            None,
+        )
+        .expect_err("manifest output cap must tighten env cap");
+
+        assert!(matches!(err, OutboundError::ResponseTooLarge(2, 1)));
+    }
+
+    #[test]
+    fn safety_cannot_raise_env_limits() {
+        let transport = MockTransport::new(vec![TransportResponse {
+            status: 200,
+            body: "{}".to_string(),
+        }]);
+        let seen = transport.seen.clone();
+        let cfg = OutboundConfig {
+            timeout: Duration::from_millis(250),
+            max_response_bytes: 1,
+            ..OutboundConfig::default()
+        };
+        let mut m = manifest("ext.example.quote");
+        m.safety.max_runtime_ms = 5_000;
+        m.safety.max_output_bytes = 100;
+
+        let err = dispatch_external_tool(
+            &transport,
+            &RateTable::new(),
+            &cfg,
+            &m,
+            &grant("ext.example.quote", "p_alice"),
+            "quote.daily",
+            &serde_json::json!({}),
+            "p_alice",
+            "req-safety-cannot-raise",
+            None,
+        )
+        .expect_err("manifest safety must not raise env limits");
+
+        assert!(matches!(err, OutboundError::ResponseTooLarge(2, 1)));
+        assert_eq!(seen.lock().unwrap()[0].3, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn zero_safety_fields_leave_env_limits_unchanged() {
+        let response = happy_response();
+        let response_len = response.body.len();
+        let transport = MockTransport::new(vec![response]);
+        let seen = transport.seen.clone();
+        let cfg = OutboundConfig {
+            timeout: Duration::from_millis(750),
+            max_response_bytes: response_len,
+            ..OutboundConfig::default()
+        };
+        let m = manifest("ext.example.quote");
+
+        dispatch_external_tool(
+            &transport,
+            &RateTable::new(),
+            &cfg,
+            &m,
+            &grant("ext.example.quote", "p_alice"),
+            "quote.daily",
+            &serde_json::json!({}),
+            "p_alice",
+            "req-safety-zero",
+            None,
+        )
+        .expect("zero safety fields retain env limits");
+
+        assert_eq!(seen.lock().unwrap()[0].3, Duration::from_millis(750));
     }
 
     #[test]
