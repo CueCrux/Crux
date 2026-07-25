@@ -59,11 +59,11 @@ against the mirror just like against prod.
 - `CORECRUXD_CONSOLE_DEV_PATH=/console-dev` — hot-serve the modified console from the bind-mounted repo dir (see below).
 
 The prod-parity ExecPlan work board (`/v1/work?source=all` ≈ 1000+ items) needs the
-PlanCrux ExecPlan tree, which lives OUTSIDE the data volume. It is bind-mounted
-**read-only** from the local workstation tree (prod projects the same tree, rsynced
-from here):
-- `/home/myles/CueCrux/PlanCrux/.agent/execplans` → `/srv/plancrux-execplans:ro` (`CRUX_EXECPLANS_ROOT`)
-- `/home/myles/CueCrux/PlanCrux/docs/master-plan/tracking` → `/srv/plancrux-tracking:ro` (`CRUX_OPEN_DECISIONS_PATH`)
+operator's ExecPlan tree, which lives OUTSIDE the data volume (in the operator's
+private planning checkout, not this repo). It is bind-mounted **read-only** from the
+local workstation tree (prod projects the same tree, rsynced from here):
+- `<planning-checkout>/.agent/execplans` → `/srv/execplans:ro` (`CRUX_EXECPLANS_ROOT`)
+- `<planning-checkout>/docs/master-plan/tracking` → `/srv/tracking:ro` (`CRUX_OPEN_DECISIONS_PATH`)
 
 ## Console dev override (why no rebuild is needed)
 
@@ -183,8 +183,8 @@ docker run -d --name crux-mirror \
   -p 127.0.0.1:14802:14800 \
   -v /home/myles/crux-prod-mirror/data:/data \
   -v /home/myles/CueCrux/Crux/crates/corecruxd/console:/console-dev:ro \
-  -v /home/myles/CueCrux/PlanCrux/.agent/execplans:/srv/plancrux-execplans:ro \
-  -v /home/myles/CueCrux/PlanCrux/docs/master-plan/tracking:/srv/plancrux-tracking:ro \
+  -v "$PLANNING_CHECKOUT/.agent/execplans":/srv/execplans:ro \
+  -v "$PLANNING_CHECKOUT/docs/master-plan/tracking":/srv/tracking:ro \
   --env-file /home/myles/crux-prod-mirror/crux.env \
   --env-file /home/myles/crux-prod-mirror/override.env \
   --env-file /home/myles/crux-prod-mirror/mirror.env \

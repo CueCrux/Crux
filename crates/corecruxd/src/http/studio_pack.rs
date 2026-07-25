@@ -27,7 +27,7 @@
 //!   unsigned with an honest "sign before publishing" instruction embedded.
 //! - `POST /v1/studio/pack/verify` — validate an uploaded pack: schema, both
 //!   hashes, and (when present) the Ed25519 signature against the operator's
-//!   [`TrustedKeyring`]. Returns the verification verdict **verbatim** plus a
+//!   `TrustedKeyring`. Returns the verification verdict **verbatim** plus a
 //!   preview (tile count / kinds / capabilities) so the console can gate the
 //!   apply step.
 //!

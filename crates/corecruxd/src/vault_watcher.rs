@@ -8,7 +8,7 @@
 //! ExecPlan `crux-integrations-and-template-library-2026-07-25` (I4, package D0).
 //!
 //! The integration-pack manifest contract has declared an
-//! [`EntryKind::FileWatcher`] variant since v1 with no runtime behind it. This
+//! `EntryKind::FileWatcher` variant since v1 with no runtime behind it. This
 //! module is that runtime, and its first (only) target is a directory of
 //! markdown notes: each cycle it scans the configured roots, diffs against a
 //! persisted cursor, and pushes changed notes through the same local prose
