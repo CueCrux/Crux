@@ -34,9 +34,13 @@
 //! Production binds to [`UreqTransport`], matching the in-tree
 //! `cuecrux_session` pattern that already uses ureq via spawn_blocking.
 
-use crux_integrations::{ExternalToolDefinition, IntegrationManifest};
+use crux_integrations::{
+    append_audit_event, ExternalToolDefinition, IntegrationAuditEvent, IntegrationManifest, AUDIT_EXTENSION_INVOKE_OK,
+    AUDIT_EXTENSION_INVOKE_REJECTED, AUDIT_SUPPRESSED,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -44,6 +48,7 @@ const DEFAULT_TIMEOUT_SECONDS: u64 = 5;
 const DEFAULT_MAX_REQUEST_BYTES: usize = 256 * 1024;
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 256 * 1024;
 const DEFAULT_RATE_PER_MIN: u32 = 10;
+const AUDIT_INVOKE_RATE_PER_MIN: u32 = 60;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OutboundError {
@@ -157,6 +162,22 @@ impl OutboundConfig {
 #[derive(Debug, Default)]
 pub struct RateTable {
     inner: Mutex<HashMap<(String, String), Vec<Instant>>>,
+    audit_inner: Mutex<HashMap<String, InvokeAuditWindow>>,
+}
+
+#[derive(Debug)]
+struct InvokeAuditWindow {
+    started: Instant,
+    appended: u32,
+    suppressed: u64,
+    marker_emitted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvokeAuditDecision {
+    Append,
+    AppendSuppressedMarker { count: u64 },
+    Suppress,
 }
 
 impl RateTable {
@@ -191,6 +212,40 @@ impl RateTable {
         }
         entries.push(now);
         Ok(())
+    }
+
+    fn invoke_audit_decision(&self, extension_id: &str) -> InvokeAuditDecision {
+        let mut guard = self.audit_inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Instant::now();
+        let entry = guard
+            .entry(extension_id.to_string())
+            .or_insert_with(|| InvokeAuditWindow {
+                started: now,
+                appended: 0,
+                suppressed: 0,
+                marker_emitted: false,
+            });
+        if now.duration_since(entry.started) >= Duration::from_secs(60) {
+            *entry = InvokeAuditWindow {
+                started: now,
+                appended: 0,
+                suppressed: 0,
+                marker_emitted: false,
+            };
+        }
+        if entry.appended < AUDIT_INVOKE_RATE_PER_MIN {
+            entry.appended += 1;
+            return InvokeAuditDecision::Append;
+        }
+        entry.suppressed = entry.suppressed.saturating_add(1);
+        if entry.marker_emitted {
+            InvokeAuditDecision::Suppress
+        } else {
+            entry.marker_emitted = true;
+            InvokeAuditDecision::AppendSuppressedMarker {
+                count: entry.suppressed,
+            }
+        }
     }
 }
 
@@ -318,6 +373,36 @@ fn u64_to_usize_saturating(value: u64) -> usize {
 
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_external_tool(
+    transport: &dyn OutboundTransport,
+    rate_table: &RateTable,
+    config: &OutboundConfig,
+    data_dir: &Path,
+    manifest: &IntegrationManifest,
+    grant: &crate::extension_grants::ExtensionGrant,
+    tool_name: &str,
+    args: &serde_json::Value,
+    calling_passport_fpr: &str,
+    request_id: &str,
+    auth_secret_resolved: Option<String>,
+) -> Result<(DispatchOutcome, ExternalToolResponse), OutboundError> {
+    let result = dispatch_external_tool_inner(
+        transport,
+        rate_table,
+        config,
+        manifest,
+        grant,
+        tool_name,
+        args,
+        calling_passport_fpr,
+        request_id,
+        auth_secret_resolved,
+    );
+    audit_dispatch_result(data_dir, rate_table, manifest, tool_name, calling_passport_fpr, &result);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_external_tool_inner(
     transport: &dyn OutboundTransport,
     rate_table: &RateTable,
     config: &OutboundConfig,
@@ -454,6 +539,80 @@ pub fn dispatch_external_tool(
     Ok((outcome, parsed))
 }
 
+fn audit_dispatch_result(
+    data_dir: &Path,
+    rate_table: &RateTable,
+    manifest: &IntegrationManifest,
+    tool_name: &str,
+    calling_passport_fpr: &str,
+    result: &Result<(DispatchOutcome, ExternalToolResponse), OutboundError>,
+) {
+    let now_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as u64);
+    let event = match rate_table.invoke_audit_decision(&manifest.id) {
+        InvokeAuditDecision::Append => match result {
+            Ok(_) => IntegrationAuditEvent::extension(
+                now_unix_ms,
+                AUDIT_EXTENSION_INVOKE_OK,
+                Some(calling_passport_fpr),
+                &manifest.id,
+                Some(&manifest.version),
+                "ok",
+                serde_json::json!({ "tool_name": tool_name }),
+            ),
+            Err(error) => IntegrationAuditEvent::extension(
+                now_unix_ms,
+                AUDIT_EXTENSION_INVOKE_REJECTED,
+                Some(calling_passport_fpr),
+                &manifest.id,
+                Some(&manifest.version),
+                "rejected",
+                serde_json::json!({
+                    "tool_name": tool_name,
+                    "reason": error.audit_reason(),
+                }),
+            ),
+        },
+        InvokeAuditDecision::AppendSuppressedMarker { count } => IntegrationAuditEvent::extension(
+            now_unix_ms,
+            AUDIT_SUPPRESSED,
+            Some(calling_passport_fpr),
+            &manifest.id,
+            Some(&manifest.version),
+            "suppressed",
+            serde_json::json!({
+                "event_family": "extension_invoke",
+                "count": count,
+                "limit_per_min": AUDIT_INVOKE_RATE_PER_MIN,
+            }),
+        ),
+        InvokeAuditDecision::Suppress => return,
+    };
+    append_audit_event(data_dir, &event);
+}
+
+impl OutboundError {
+    fn audit_reason(&self) -> &'static str {
+        match self {
+            Self::NotExternalTool(_) => "not_external_tool",
+            Self::ToolNotInManifest(_, _) => "tool_not_in_manifest",
+            Self::NoGrant(_, _) => "no_grant",
+            Self::ToolNotInGrant(_, _, _) => "tool_not_in_grant",
+            Self::RateLimited(_, _, _) => "rate_limited",
+            Self::RequestTooLarge(_, _) => "request_too_large",
+            Self::ResponseTooLarge(_, _) => "response_too_large",
+            Self::PlainHttpBlocked => "plain_http_blocked",
+            Self::InvalidEndpoint(_) => "invalid_endpoint",
+            Self::EndpointNotAllowed(_, _) => "endpoint_not_allowed",
+            Self::Transport(_) => "transport",
+            Self::UpstreamError { .. } => "upstream_error",
+            Self::MalformedResponse(_) => "malformed_response",
+            Self::Json(_) => "json",
+        }
+    }
+}
+
 /// Production transport: ureq via spawn_blocking at the call site
 /// (matches `cuecrux_session` pattern).
 pub struct UreqTransport;
@@ -498,7 +657,13 @@ mod tests {
         DataAccess, EntryKind, ExternalToolDefinition, IntegrationEntry, ManifestHashes, NetworkAccess, SafetyPolicy,
         INTEGRATION_SCHEMA_V1,
     };
+    use std::path::Path;
     use std::sync::{Arc, Mutex};
+
+    fn audit_dir() -> &'static Path {
+        static AUDIT_DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        AUDIT_DIR.get_or_init(|| tempfile::tempdir().expect("tempdir")).path()
+    }
 
     /// Configurable canned-response transport.
     struct MockTransport {
@@ -607,6 +772,7 @@ mod tests {
             &transport,
             &rates,
             &cfg,
+            audit_dir(),
             &m,
             &g,
             "quote.daily",
@@ -633,6 +799,7 @@ mod tests {
             &transport,
             &RateTable::new(),
             &OutboundConfig::default(),
+            audit_dir(),
             &m,
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
@@ -657,6 +824,7 @@ mod tests {
             &transport,
             &RateTable::new(),
             &OutboundConfig::default(),
+            audit_dir(),
             &m,
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
@@ -680,6 +848,7 @@ mod tests {
             &transport,
             &RateTable::new(),
             &OutboundConfig::default(),
+            audit_dir(),
             &m,
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
@@ -724,6 +893,7 @@ mod tests {
             &transport,
             &rates,
             &cfg,
+            audit_dir(),
             &manifest("ext.example.quote"),
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
@@ -745,6 +915,7 @@ mod tests {
             &transport,
             &RateTable::new(),
             &OutboundConfig::default(),
+            audit_dir(),
             &manifest("ext.example.quote"),
             &grant("ext.example.quote", "p_alice"),
             "quote.unknown",
@@ -764,6 +935,7 @@ mod tests {
             &transport,
             &RateTable::new(),
             &OutboundConfig::default(),
+            audit_dir(),
             &manifest("ext.example.quote"),
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
@@ -785,6 +957,7 @@ mod tests {
             &transport,
             &RateTable::new(),
             &OutboundConfig::default(),
+            audit_dir(),
             &manifest("ext.example.quote"),
             &g,
             "quote.daily",
@@ -813,6 +986,7 @@ mod tests {
                 &transport,
                 &rates,
                 &cfg,
+                audit_dir(),
                 &m,
                 &g,
                 "quote.daily",
@@ -827,6 +1001,7 @@ mod tests {
             &transport,
             &rates,
             &cfg,
+            audit_dir(),
             &m,
             &g,
             "quote.daily",
@@ -848,6 +1023,7 @@ mod tests {
             &transport,
             &RateTable::new(),
             &OutboundConfig::default(),
+            audit_dir(),
             &m,
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
@@ -869,6 +1045,7 @@ mod tests {
             &transport,
             &RateTable::new(),
             &cfg,
+            audit_dir(),
             &m,
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
@@ -890,6 +1067,7 @@ mod tests {
             &transport,
             &RateTable::new(),
             &OutboundConfig::default(),
+            audit_dir(),
             &manifest("ext.example.quote"),
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
@@ -912,6 +1090,7 @@ mod tests {
             &transport,
             &RateTable::new(),
             &OutboundConfig::default(),
+            audit_dir(),
             &manifest("ext.example.quote"),
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
@@ -936,6 +1115,7 @@ mod tests {
             &transport,
             &RateTable::new(),
             &cfg,
+            audit_dir(),
             &manifest("ext.example.quote"),
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
@@ -963,6 +1143,7 @@ mod tests {
             &transport,
             &RateTable::new(),
             &cfg,
+            audit_dir(),
             &m,
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
@@ -993,6 +1174,7 @@ mod tests {
             &transport,
             &RateTable::new(),
             &cfg,
+            audit_dir(),
             &m,
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
@@ -1026,6 +1208,7 @@ mod tests {
             &transport,
             &RateTable::new(),
             &cfg,
+            audit_dir(),
             &m,
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
@@ -1057,6 +1240,7 @@ mod tests {
             &transport,
             &RateTable::new(),
             &cfg,
+            audit_dir(),
             &m,
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
@@ -1079,6 +1263,7 @@ mod tests {
             &transport,
             &RateTable::new(),
             &OutboundConfig::default(),
+            audit_dir(),
             &manifest("ext.example.quote"),
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
@@ -1091,5 +1276,101 @@ mod tests {
         let captured = seen.lock().unwrap();
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].1.as_deref(), Some("super-secret-token"));
+    }
+
+    #[test]
+    fn invoke_ok_and_rejected_emit_sanitized_audit_events() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rates = RateTable::new();
+        let transport = MockTransport::new(vec![happy_response()]);
+        let manifest = manifest("ext.example.audit");
+        let grant = grant("ext.example.audit", "p_alice");
+
+        dispatch_external_tool(
+            &transport,
+            &rates,
+            &OutboundConfig::default(),
+            dir.path(),
+            &manifest,
+            &grant,
+            "quote.daily",
+            &serde_json::json!({"secret": "must-not-be-audited"}),
+            "p_alice",
+            "req-audit-ok",
+            Some("bearer-must-not-be-audited".to_string()),
+        )
+        .expect("ok");
+        let rejected = dispatch_external_tool(
+            &transport,
+            &rates,
+            &OutboundConfig::default(),
+            dir.path(),
+            &manifest,
+            &grant,
+            "quote.undeclared",
+            &serde_json::json!({"secret": "also-not-audited"}),
+            "p_alice",
+            "req-audit-rejected",
+            None,
+        )
+        .expect_err("rejected");
+        assert!(matches!(rejected, OutboundError::ToolNotInManifest(_, _)));
+
+        let audit = crux_integrations::read_audit_tail(dir.path(), 50).expect("audit");
+        assert_eq!(audit.len(), 2);
+        assert_eq!(audit[0].action, AUDIT_EXTENSION_INVOKE_OK);
+        assert_eq!(audit[1].action, AUDIT_EXTENSION_INVOKE_REJECTED);
+        assert_eq!(
+            audit[1].detail.as_ref().and_then(|detail| detail.get("reason")),
+            Some(&serde_json::json!("tool_not_in_manifest"))
+        );
+        let serialized = serde_json::to_string(&audit).expect("serialize");
+        assert!(!serialized.contains("must-not-be-audited"));
+        assert!(!serialized.contains("bearer-must-not-be-audited"));
+    }
+
+    #[test]
+    fn invoke_audit_caps_at_sixty_and_emits_one_suppression_marker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rates = RateTable::new();
+        let transport = MockTransport::new(Vec::new());
+        let mut manifest = manifest("ext.example.audit-storm");
+        manifest.external_tool_endpoint = Some("http://quote.example.com/invoke".to_string());
+        let grant = grant("ext.example.audit-storm", "p_alice");
+
+        for index in 0..62 {
+            let error = dispatch_external_tool(
+                &transport,
+                &rates,
+                &OutboundConfig::default(),
+                dir.path(),
+                &manifest,
+                &grant,
+                "quote.daily",
+                &serde_json::json!({}),
+                "p_alice",
+                &format!("req-storm-{index}"),
+                None,
+            )
+            .expect_err("plain HTTP rejected");
+            assert!(matches!(error, OutboundError::PlainHttpBlocked));
+        }
+
+        let audit = crux_integrations::read_audit_tail(dir.path(), 100).expect("audit");
+        assert_eq!(audit.len(), 61);
+        assert_eq!(
+            audit
+                .iter()
+                .filter(|event| event.action == AUDIT_EXTENSION_INVOKE_REJECTED)
+                .count(),
+            60
+        );
+        let markers: Vec<&IntegrationAuditEvent> =
+            audit.iter().filter(|event| event.action == AUDIT_SUPPRESSED).collect();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(
+            markers[0].detail.as_ref().and_then(|detail| detail.get("count")),
+            Some(&serde_json::json!(1))
+        );
     }
 }

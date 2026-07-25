@@ -346,14 +346,63 @@ pub struct IntegrationGrant {
 pub struct IntegrationAuditEvent {
     pub ts_unix_ms: u64,
     pub action: String,
+    #[serde(default = "default_audit_actor")]
+    pub actor: String,
+    /// Retained for compatibility with the original pack-audit JSONL
+    /// shape. New extension events put the acting passport in `actor`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub passport_fpr: String,
     pub pack_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub version: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub outcome: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
+    pub detail: Option<serde_json::Value>,
 }
+
+fn default_audit_actor() -> String {
+    "operator".to_string()
+}
+
+impl IntegrationAuditEvent {
+    pub fn extension(
+        ts_unix_ms: u64,
+        action: impl Into<String>,
+        actor: Option<&str>,
+        extension_id: impl Into<String>,
+        version: Option<&str>,
+        outcome: impl Into<String>,
+        detail: serde_json::Value,
+    ) -> Self {
+        Self {
+            ts_unix_ms,
+            action: action.into(),
+            actor: actor
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("operator")
+                .to_string(),
+            passport_fpr: String::new(),
+            pack_id: extension_id.into(),
+            version: version.unwrap_or_default().to_string(),
+            capabilities: Vec::new(),
+            outcome: outcome.into(),
+            detail: Some(detail),
+        }
+    }
+}
+
+pub const AUDIT_EXTENSION_INSTALL: &str = "extension_install";
+pub const AUDIT_EXTENSION_UNINSTALL: &str = "extension_uninstall";
+pub const AUDIT_EXTENSION_GRANT_ADDED: &str = "extension_grant_added";
+pub const AUDIT_EXTENSION_GRANT_REMOVED: &str = "extension_grant_removed";
+pub const AUDIT_TRUSTED_KEY_ADDED: &str = "trusted_key_added";
+pub const AUDIT_TRUSTED_KEY_REMOVED: &str = "trusted_key_removed";
+pub const AUDIT_EXTENSION_INVOKE_OK: &str = "extension_invoke_ok";
+pub const AUDIT_EXTENSION_INVOKE_REJECTED: &str = "extension_invoke_rejected";
+pub const AUDIT_SUPPRESSED: &str = "audit_suppressed";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IntegrationLibrarySnapshot {
@@ -771,7 +820,7 @@ pub fn library_snapshot(
     passport_fpr: &str,
     policy: &ValidationPolicy,
 ) -> Result<IntegrationLibrarySnapshot, IntegrationError> {
-    let root = integration_root(data_dir);
+    let root = integration_root(&data_dir);
     let index = read_index(&root)?;
     let grants = load_grants_from_root(&root, passport_fpr)?;
     let enabled_keys: BTreeSet<(String, String)> = grants
@@ -834,7 +883,7 @@ pub fn library_snapshot(
     Ok(IntegrationLibrarySnapshot {
         packs: descriptors,
         grants,
-        audit_tail: read_audit_tail(&root, 50)?,
+        audit_tail: read_audit_tail_from_root(&root, 50)?,
     })
 }
 
@@ -846,7 +895,7 @@ pub fn install_pack(
     policy: &ValidationPolicy,
 ) -> Result<IntegrationPackDescriptor, IntegrationError> {
     manifest.validate(policy)?;
-    let root = integration_root(data_dir);
+    let root = integration_root(&data_dir);
     let manifest_hash = manifest.manifest_hash()?;
     let id_component = safe_path_component(&manifest.id)?;
     let version_component = safe_path_component(&manifest.version)?;
@@ -884,18 +933,19 @@ pub fn install_pack(
         .sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.version.cmp(&b.version)));
     write_json_atomic(&root.join("index.json"), &index)?;
     append_audit_event(
-        &root,
+        data_dir,
         &IntegrationAuditEvent {
             ts_unix_ms: installed_at_unix_ms,
             action: "install".to_string(),
+            actor: manifest.publisher_passport_fpr.clone(),
             passport_fpr: manifest.publisher_passport_fpr.clone(),
             pack_id: manifest.id.clone(),
             version: manifest.version.clone(),
             capabilities: manifest.capabilities.clone(),
             outcome: "installed".to_string(),
-            detail: Some(format!("manifest_hash={manifest_hash}")),
+            detail: Some(serde_json::json!({ "manifest_hash": manifest_hash })),
         },
-    )?;
+    );
 
     Ok(IntegrationPackDescriptor {
         risk_level: risk_level(manifest),
@@ -910,7 +960,7 @@ pub fn grant_pack(
     data_dir: impl AsRef<Path>,
     request: GrantPackRequest<'_>,
 ) -> Result<IntegrationGrant, IntegrationError> {
-    let root = integration_root(data_dir);
+    let root = integration_root(&data_dir);
     let manifest = read_installed_manifest(&root, request.pack_id, request.version)?;
     validate_capability_list(request.pack_id, request.capabilities)?;
     for capability in request.capabilities {
@@ -938,10 +988,11 @@ pub fn grant_pack(
     };
     write_json_atomic(&grant_path(&root, request.passport_fpr, request.pack_id)?, &grant)?;
     append_audit_event(
-        &root,
+        data_dir,
         &IntegrationAuditEvent {
             ts_unix_ms: request.now_unix_ms,
             action: "grant".to_string(),
+            actor: request.granted_by_passport_fpr.to_string(),
             passport_fpr: request.passport_fpr.to_string(),
             pack_id: request.pack_id.to_string(),
             version: request.version.to_string(),
@@ -949,7 +1000,7 @@ pub fn grant_pack(
             outcome: "enabled".to_string(),
             detail: None,
         },
-    )?;
+    );
     Ok(grant)
 }
 
@@ -960,7 +1011,7 @@ pub fn disable_pack(
     reason: Option<String>,
     now_unix_ms: u64,
 ) -> Result<IntegrationGrant, IntegrationError> {
-    let root = integration_root(data_dir);
+    let root = integration_root(&data_dir);
     let path = grant_path(&root, passport_fpr, pack_id)?;
     if !path.exists() {
         return Err(IntegrationError::GrantNotFound {
@@ -977,10 +1028,11 @@ pub fn disable_pack(
     }
     write_json_atomic(&path, &grant)?;
     append_audit_event(
-        &root,
+        data_dir,
         &IntegrationAuditEvent {
             ts_unix_ms: now_unix_ms,
             action: "disable".to_string(),
+            actor: passport_fpr.to_string(),
             passport_fpr: passport_fpr.to_string(),
             pack_id: pack_id.to_string(),
             version: grant.version.clone(),
@@ -988,7 +1040,7 @@ pub fn disable_pack(
             outcome: "disabled".to_string(),
             detail: None,
         },
-    )?;
+    );
     Ok(grant)
 }
 
@@ -1237,7 +1289,14 @@ fn read_installed_manifest(root: &Path, pack_id: &str, version: &str) -> Result<
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-fn read_audit_tail(root: &Path, max_events: usize) -> Result<Vec<IntegrationAuditEvent>, IntegrationError> {
+pub fn read_audit_tail(
+    data_dir: impl AsRef<Path>,
+    max_events: usize,
+) -> Result<Vec<IntegrationAuditEvent>, IntegrationError> {
+    read_audit_tail_from_root(&integration_root(data_dir), max_events)
+}
+
+fn read_audit_tail_from_root(root: &Path, max_events: usize) -> Result<Vec<IntegrationAuditEvent>, IntegrationError> {
     let path = root.join("audit.jsonl");
     if !path.exists() {
         return Ok(Vec::new());
@@ -1251,14 +1310,31 @@ fn read_audit_tail(root: &Path, max_events: usize) -> Result<Vec<IntegrationAudi
     Ok(events)
 }
 
-fn append_audit_event(root: &Path, event: &IntegrationAuditEvent) -> Result<(), IntegrationError> {
+/// Append to the unified pack + extension audit log. Audit persistence is
+/// deliberately best-effort: a broken audit path is warn-logged but never
+/// changes the outcome of the primary operation.
+pub fn append_audit_event(data_dir: impl AsRef<Path>, event: &IntegrationAuditEvent) {
+    let path = integration_root(data_dir);
+    if let Err(error) = append_audit_event_to_root(&path, event) {
+        tracing::warn!(
+            audit_path = %path.join("audit.jsonl").display(),
+            action = %event.action,
+            subject_id = %event.pack_id,
+            %error,
+            "failed to append integration audit event"
+        );
+    }
+}
+
+fn append_audit_event_to_root(root: &Path, event: &IntegrationAuditEvent) -> Result<(), IntegrationError> {
     fs::create_dir_all(root)?;
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(root.join("audit.jsonl"))?;
-    serde_json::to_writer(&mut file, event)?;
-    file.write_all(b"\n")?;
+    let mut line = serde_json::to_vec(event)?;
+    line.push(b'\n');
+    file.write_all(&line)?;
     Ok(())
 }
 
@@ -1705,6 +1781,65 @@ mod tests {
             .expect("disabled pack in snapshot");
         assert_eq!(pack.install_state, InstallState::Installed);
         assert_eq!(snapshot.audit_tail.len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn audit_tail_parses_pre_extension_jsonl_and_includes_extension_events() -> Result<(), IntegrationError> {
+        let tmp = temp_data_dir("audit-backward-compat");
+        let audit_root = integration_root(tmp.path());
+        fs::create_dir_all(&audit_root)?;
+        fs::write(
+            audit_root.join("audit.jsonl"),
+            concat!(
+                "{\"ts_unix_ms\":1000,\"action\":\"install\",\"passport_fpr\":\"p_legacy\",",
+                "\"pack_id\":\"legacy.pack\",\"version\":\"0.1.0\",\"capabilities\":[\"facts:read\"],",
+                "\"outcome\":\"installed\",\"detail\":\"manifest_hash=abc\"}\n"
+            ),
+        )?;
+        append_audit_event(
+            tmp.path(),
+            &IntegrationAuditEvent::extension(
+                2_000,
+                AUDIT_EXTENSION_INSTALL,
+                Some("p_operator"),
+                "ext.example.quote",
+                Some("0.2.0"),
+                "installed",
+                serde_json::json!({ "manifest_hash": "def" }),
+            ),
+        );
+
+        let snapshot = library_snapshot(tmp.path(), "p_local", &ValidationPolicy::default())?;
+        assert_eq!(snapshot.audit_tail.len(), 2);
+        assert_eq!(snapshot.audit_tail[0].action, "install");
+        assert_eq!(snapshot.audit_tail[0].actor, "operator");
+        assert_eq!(
+            snapshot.audit_tail[0].detail,
+            Some(serde_json::Value::String("manifest_hash=abc".to_string()))
+        );
+        assert_eq!(snapshot.audit_tail[1].action, AUDIT_EXTENSION_INSTALL);
+        assert_eq!(snapshot.audit_tail[1].actor, "p_operator");
+        Ok(())
+    }
+
+    #[test]
+    fn audit_append_failure_does_not_fail_pack_install() -> Result<(), IntegrationError> {
+        let tmp = temp_data_dir("audit-append-failure");
+        fs::create_dir_all(integration_root(tmp.path()).join("audit.jsonl"))?;
+        let manifest = builtin_manifests()
+            .into_iter()
+            .find(|manifest| manifest.id == "sdk.typescript.quickstart")
+            .expect("builtin manifest");
+
+        let descriptor = install_pack(
+            tmp.path(),
+            &manifest,
+            TrustTier::FirstParty,
+            1_000,
+            &ValidationPolicy::default(),
+        )?;
+        assert_eq!(descriptor.install_state, InstallState::Installed);
         Ok(())
     }
 

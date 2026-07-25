@@ -19,7 +19,10 @@
 //! [`InstalledExtension`] records this module produces.
 
 use corecrux_memory::fact_store::{FactQuery, FactStore, StoreFact};
-use crux_integrations::{IntegrationError, IntegrationManifest, TrustTier, TrustedKeyring, ValidationPolicy};
+use crux_integrations::{
+    append_audit_event, IntegrationAuditEvent, IntegrationError, IntegrationManifest, TrustTier, TrustedKeyring,
+    ValidationPolicy, AUDIT_EXTENSION_INSTALL, AUDIT_EXTENSION_UNINSTALL,
+};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -173,6 +176,21 @@ pub fn install_extension(
     // in `fact_privacy::DEFAULT_PRIVATE_PREFIXES`).
     crate::fact_privacy::enforce_global(&mut sf);
     store.try_store(sf)?;
+    append_audit_event(
+        &data_dir,
+        &IntegrationAuditEvent::extension(
+            now_unix_ms,
+            AUDIT_EXTENSION_INSTALL,
+            record.installed_by_passport.as_deref(),
+            &manifest.id,
+            Some(&manifest.version),
+            "installed",
+            serde_json::json!({
+                "manifest_hash": record.manifest_hash,
+                "trust_tier": record.trust_tier,
+            }),
+        ),
+    );
     Ok(record)
 }
 
@@ -201,10 +219,14 @@ pub fn get_extension(store: &FactStore, id: &str) -> Option<InstalledExtension> 
     list_extensions(store).into_iter().find(|e| e.manifest.id == id)
 }
 
-pub fn delete_extension(store: &mut FactStore, id: &str) -> Result<(), ExtensionsError> {
-    if get_extension(store, id).is_none() {
-        return Err(ExtensionsError::NotFound(id.to_string()));
-    }
+pub fn delete_extension(
+    store: &mut FactStore,
+    data_dir: impl AsRef<Path>,
+    id: &str,
+    deleted_by_passport: Option<&str>,
+    now_unix_ms: u64,
+) -> Result<(), ExtensionsError> {
+    let installed = get_extension(store, id).ok_or_else(|| ExtensionsError::NotFound(id.to_string()))?;
     // Tombstone via empty-value write; same pattern as project_repo_links.
     let mut sf = StoreFact {
         tenant_hash: "default".to_string(),
@@ -219,6 +241,18 @@ pub fn delete_extension(store: &mut FactStore, id: &str) -> Result<(), Extension
     };
     crate::fact_privacy::enforce_global(&mut sf);
     store.try_store(sf)?;
+    append_audit_event(
+        data_dir,
+        &IntegrationAuditEvent::extension(
+            now_unix_ms,
+            AUDIT_EXTENSION_UNINSTALL,
+            deleted_by_passport,
+            id,
+            Some(&installed.manifest.version),
+            "uninstalled",
+            serde_json::json!({}),
+        ),
+    );
     Ok(())
 }
 
@@ -304,8 +338,21 @@ mod tests {
         let got = get_extension(&store, "ext.example.quote").expect("get");
         assert_eq!(got.installed_by_passport.as_deref(), Some("agent-claude"));
 
-        delete_extension(&mut store, "ext.example.quote").expect("delete");
+        delete_extension(
+            &mut store,
+            dir.path(),
+            "ext.example.quote",
+            Some("agent-claude"),
+            17_700_000_000_001,
+        )
+        .expect("delete");
         assert!(list_extensions(&store).is_empty());
+
+        let audit = crux_integrations::read_audit_tail(dir.path(), 50).expect("audit");
+        assert_eq!(audit.len(), 2);
+        assert_eq!(audit[0].action, AUDIT_EXTENSION_INSTALL);
+        assert_eq!(audit[1].action, AUDIT_EXTENSION_UNINSTALL);
+        assert_eq!(audit[1].actor, "agent-claude");
     }
 
     #[test]
@@ -374,8 +421,21 @@ mod tests {
     #[test]
     fn delete_unknown_returns_not_found() {
         let mut store = FactStore::new();
-        let err = delete_extension(&mut store, "ext.does-not-exist").expect_err("not found");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = delete_extension(&mut store, dir.path(), "ext.does-not-exist", None, 1).expect_err("not found");
         assert!(matches!(err, ExtensionsError::NotFound(_)));
+    }
+
+    #[test]
+    fn audit_append_failure_does_not_fail_install() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = fixture_manifest("ext.example.audit-failure", "p_alice");
+        std::fs::create_dir_all(dir.path().join("integrations").join("audit.jsonl")).expect("blocking directory");
+
+        let mut store = FactStore::new();
+        let installed = install_extension(&mut store, dir.path(), manifest, None, 1, true).expect("install succeeds");
+        assert_eq!(installed.manifest.id, "ext.example.audit-failure");
+        assert!(get_extension(&store, "ext.example.audit-failure").is_some());
     }
 
     fn store_temp() -> FactStore {

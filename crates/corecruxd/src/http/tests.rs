@@ -16957,6 +16957,21 @@ async fn extensions_keyring_add_list_remove_round_trip() {
     .into_response();
     assert_eq!(del_resp.status(), StatusCode::NO_CONTENT);
 
+    let audit = crux_integrations::read_audit_tail(&state.data_dir, 50).expect("audit tail");
+    let key_events: Vec<&crux_integrations::IntegrationAuditEvent> = audit
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.action.as_str(),
+                crux_integrations::AUDIT_TRUSTED_KEY_ADDED | crux_integrations::AUDIT_TRUSTED_KEY_REMOVED
+            )
+        })
+        .collect();
+    assert_eq!(key_events.len(), 2);
+    assert_eq!(key_events[0].pack_id, "p_alice");
+    assert_eq!(key_events[0].actor, "operator");
+    assert_eq!(key_events[1].pack_id, "p_alice");
+
     let list2 = super::extensions::list_trusted_keys(State(state), dev_scope_headers("admin:read"))
         .await
         .into_response();

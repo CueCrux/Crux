@@ -25,7 +25,10 @@ use std::io::Read as _;
 use std::path::{Path as FsPath, PathBuf};
 
 use super::{problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Path, State, StatusCode};
-use crux_integrations::{CommunityExtensionsIndex, IntegrationManifest, TrustTier, TrustedKeyEntry, TrustedKeyring};
+use crux_integrations::{
+    append_audit_event, CommunityExtensionsIndex, IntegrationAuditEvent, IntegrationManifest, TrustTier,
+    TrustedKeyEntry, TrustedKeyring, AUDIT_TRUSTED_KEY_ADDED, AUDIT_TRUSTED_KEY_REMOVED,
+};
 use sha2::Digest as _;
 
 const ALLOW_UNSIGNED_ENV: &str = "CORECRUXD_EXTENSIONS_ALLOW_UNSIGNED";
@@ -466,8 +469,15 @@ pub(super) async fn delete_extension(
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read", "facts:write"]) {
         return problem.into_response();
     }
+    let deleted_by = extract_passport_id(&headers);
     let mut store = state.fact_store.write().await;
-    let result = crate::extension_registry::delete_extension(&mut store, &id);
+    let result = crate::extension_registry::delete_extension(
+        &mut store,
+        &state.data_dir,
+        &id,
+        deleted_by.as_deref(),
+        now_unix_ms(),
+    );
     drop(store);
     match result {
         Ok(()) => (StatusCode::NO_CONTENT, ()).into_response(),
@@ -518,6 +528,9 @@ pub(super) async fn add_trusted_key(
         return problem.into_response();
     }
     let path = crate::extension_registry::trusted_keys_path(&state.data_dir);
+    let actor = extract_passport_id(&headers);
+    let added_at_unix_ms = now_unix_ms();
+    let trust_tier = body.trust_tier;
     let mut keyring = match TrustedKeyring::load(&path) {
         Ok(k) => k,
         Err(err) => {
@@ -528,14 +541,26 @@ pub(super) async fn add_trusted_key(
         body.passport_fpr.clone(),
         TrustedKeyEntry {
             public_key_hex: body.public_key_hex,
-            trust_tier: body.trust_tier,
-            added_at_unix_ms: now_unix_ms(),
+            trust_tier,
+            added_at_unix_ms,
             added_by: body.added_by,
         },
     );
     if let Err(err) = keyring.save(&path) {
         return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
     }
+    append_audit_event(
+        &state.data_dir,
+        &IntegrationAuditEvent::extension(
+            added_at_unix_ms,
+            AUDIT_TRUSTED_KEY_ADDED,
+            actor.as_deref(),
+            &body.passport_fpr,
+            None,
+            "added",
+            serde_json::json!({ "trust_tier": trust_tier }),
+        ),
+    );
     (
         StatusCode::CREATED,
         Json(serde_json::json!({ "passport_fpr": body.passport_fpr })),
@@ -596,14 +621,17 @@ pub(super) async fn issue_grant(
     // Check the extension is installed *before* delegating; the grant
     // module also asserts this but we surface a 404 (more specific than
     // 400) here for clarity.
-    let installed = crate::extension_registry::get_extension(&store, &id).is_some();
-    if !installed {
+    let installed = crate::extension_registry::get_extension(&store, &id);
+    let Some(installed) = installed else {
         drop(store);
         return problem_response(StatusCode::NOT_FOUND, format!("extension '{id}' not installed"));
-    }
+    };
+    let version = installed.manifest.version;
     let result = crate::extension_grants::issue_grant(
         &mut store,
+        &state.data_dir,
         true,
+        Some(&version),
         crate::extension_grants::IssueGrantInput {
             extension_id: id.clone(),
             passport_fpr: body.passport_fpr,
@@ -739,12 +767,14 @@ pub(super) async fn invoke_extension_tool(
     let grant_clone = grant.clone();
     let calling_clone = calling_passport.clone();
     let rid = request_id.clone();
+    let data_dir = state.data_dir.clone();
     let dispatch_result = tokio::task::spawn_blocking(move || {
         let transport = crate::extension_outbound::UreqTransport;
         crate::extension_outbound::dispatch_external_tool(
             &transport,
             &rate_table,
             &cfg,
+            &data_dir,
             &manifest_clone,
             &grant_clone,
             &tool_name,
@@ -812,8 +842,19 @@ pub(super) async fn revoke_grant(
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read", "facts:write"]) {
         return problem.into_response();
     }
+    let revoked_by = extract_passport_id(&headers);
     let mut store = state.fact_store.write().await;
-    let result = crate::extension_grants::revoke_grant(&mut store, &id, &passport_fpr);
+    let extension_version =
+        crate::extension_registry::get_extension(&store, &id).map(|installed| installed.manifest.version);
+    let result = crate::extension_grants::revoke_grant(
+        &mut store,
+        &state.data_dir,
+        &id,
+        extension_version.as_deref(),
+        &passport_fpr,
+        revoked_by.as_deref(),
+        now_unix_ms(),
+    );
     drop(store);
     match result {
         Ok(()) => (StatusCode::NO_CONTENT, ()).into_response(),
@@ -834,6 +875,7 @@ pub(super) async fn delete_trusted_key(
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read", "facts:write"]) {
         return problem.into_response();
     }
+    let actor = extract_passport_id(&headers);
     let path = crate::extension_registry::trusted_keys_path(&state.data_dir);
     let mut keyring = match TrustedKeyring::load(&path) {
         Ok(k) => k,
@@ -850,6 +892,18 @@ pub(super) async fn delete_trusted_key(
     if let Err(err) = keyring.save(&path) {
         return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
     }
+    append_audit_event(
+        &state.data_dir,
+        &IntegrationAuditEvent::extension(
+            now_unix_ms(),
+            AUDIT_TRUSTED_KEY_REMOVED,
+            actor.as_deref(),
+            &passport_fpr,
+            None,
+            "removed",
+            serde_json::json!({}),
+        ),
+    );
     (StatusCode::NO_CONTENT, ()).into_response()
 }
 
