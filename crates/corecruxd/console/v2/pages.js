@@ -1450,6 +1450,15 @@
     // to a registered route derived from this registry (render.js renderSiteMap,
     // M8) — so it cannot drift from the nav. Reads nothing; shows in every posture.
     { id: 'sitemap', label: 'Site map', icon: 'map', key: '7', sub: 'Every surface, one click away — with what each is for' },
+    // Link graph (ExecPlan wikicrux-link-graph-explorer M4) — a destination with
+    // no sub-pills: it IS a WebGL six-degrees explorer over the enwiki-prose link
+    // graph, served through the Crux daemon's read-only CoreCrux mediation proxy
+    // (/v1/console/corecrux/graph/*). `capability` gates VISIBILITY on the daemon's
+    // runtime capability plan (render from the plan, never the route registry —
+    // unified-shell rule): the pane is dark until the proxy env is configured. No
+    // key + capability-gated, so it never appears in the rail on a daemon without
+    // the proxy. Delegates to render.js renderLinkGraph (custom three.js r165).
+    { id: 'linkgraph', label: 'Link graph', icon: 'linkgraph', capability: 'console_link_graph', sub: 'Six-degrees explorer over the enwiki-prose link graph (CoreCrux mediation proxy).' },
     // Overwatch (M20) — RETIRED as a destination. Its five views ARE Rings tabs
     // 2-6 (they always were: the Rings hub calls the SHARED owRenderTab), so the
     // landing duplicated the index. `railHidden` + no key keeps the page registry

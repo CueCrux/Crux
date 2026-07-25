@@ -3505,6 +3505,7 @@
     search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>',
     map: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="5" rx="1.4"/><rect x="3" y="16" width="6" height="5" rx="1.4"/><rect x="15" y="16" width="6" height="5" rx="1.4"/><path d="M12 8v4M6 16v-2.5h12V16"/></svg>',
     rings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5.5"/><circle cx="12" cy="12" r="2"/><path d="M12 3v3"/></svg>',
+    linkgraph: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="6" r="2.4"/><circle cx="19" cy="6" r="2.4"/><circle cx="12" cy="18" r="2.4"/><path d="M7 7l3 9M17 7l-3 9M7 6h10"/></svg>',
     lock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>',
     palette: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 1 0 0 18c1 0 1.6-.8 1.6-1.7 0-.5-.2-.9-.5-1.2-.3-.3-.5-.7-.5-1.1 0-.9.8-1.7 1.7-1.7H16a5 5 0 0 0 5-5c0-4.1-4-7.3-9-7.3z"/><circle cx="7.5" cy="11.5" r="1"/><circle cx="12" cy="8" r="1"/><circle cx="16.5" cy="11.5" r="1"/></svg>',
     globe: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.6 2.5 4 5.6 4 9s-1.4 6.5-4 9c-2.6-2.5-4-5.6-4-9s1.4-6.5 4-9z"/></svg>',
@@ -5092,6 +5093,26 @@
         window.CruxRender.renderExplorer(explorerHost, { summary: BOOT.summary });
       } else {
         explorerHost.appendChild(el('p', { 'class': 'v2card-sub', text: 'Renderer module unavailable.' }));
+      }
+      applyPosture(content);
+      if (typeof content.scrollTo === 'function') { content.scrollTo(0, 0); }
+      return;
+    }
+
+    // Link graph (M4) — no sub-pills: it IS a WebGL six-degrees explorer over the
+    // CoreCrux link graph via the read-only mediation proxy. Delegates to render.js
+    // renderLinkGraph (custom three.js r165, dynamically imported). Capability-gated
+    // (console_link_graph): render.renderLinkGraph itself fails to an honest empty
+    // state when the proxy is unconfigured, so a deep-link here is always safe.
+    if (destId === 'linkgraph') {
+      document.getElementById('destTitle').textContent = dest.label;
+      document.getElementById('destSub').textContent = dest.sub || '';
+      var lgHost = el('div', { 'class': 'linkgraph-region-host', id: 'linkgraphHost' });
+      content.appendChild(lgHost);
+      if (window.CruxRender && window.CruxRender.renderLinkGraph) {
+        window.CruxRender.renderLinkGraph(lgHost, { summary: BOOT.summary });
+      } else {
+        lgHost.appendChild(el('p', { 'class': 'v2card-sub', text: 'Renderer module unavailable.' }));
       }
       applyPosture(content);
       if (typeof content.scrollTo === 'function') { content.scrollTo(0, 0); }
