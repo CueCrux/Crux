@@ -23,14 +23,21 @@
 //! State derivation rules (in order; first match wins):
 //!
 //! 1. a recognised leading `Status:` token declares state (never trailing prose);
-//!    leading non-terminal tokens (`Blocked`, `In progress`, `Planned`, and
-//!    `Parked`) deliberately short-circuit before fact-derived rules because
-//!    the human declaration outranks facts
+//!    leading non-terminal tokens (`Blocked`, `Planned`, and `Parked`)
+//!    deliberately short-circuit before fact-derived rules because the human
+//!    declaration outranks facts. `In progress` is the one exception: a
+//!    *terminal fact signal* (see rule 4) outranks a stale `In progress` pin, so
+//!    a finished plan whose author forgot to flip its Status line still reads
+//!    `complete`/`archive` instead of being pinned `in_progress` forever.
 //! 2. `parsed.superseded_by` is set                       → `archive` + `superseded_by`
 //!    (including when the leading status is a completion token)
 //! 3. `Parked` always maps to `archive`, including when milestone facts exist;
 //!    this matches the 2026-07-10 corrected-audit parking of 21 plans
-//! 4. all declared milestones have a gate fact `status=complete` → `complete`
+//! 4. terminal completion — an explicit `decision:close*` fact (→ `complete`, or
+//!    → `archive` when the plan also names a superseding plan), OR all declared
+//!    milestones done (gate `status` a done-synonym / every markdown checkbox
+//!    ticked) → `complete`. Applied both on fall-through AND ahead of an
+//!    `In progress` pin (rule 1), via the shared `terminal_completion` check.
 //! 5. highest milestone with a fact has gate `status=blocked`    → `blocked`
 //! 6. any milestone/gate fact exists                      → `in_progress`
 //! 7. no facts, file mtime ≤ 90 days old                  → `planned`
@@ -217,6 +224,11 @@ pub struct ExecplanFactSummary {
     /// Earliest `stored_at` across all related facts (ms since epoch).
     pub first_fact_at_unix_ms: Option<u64>,
     pub decision_count: usize,
+    /// True when a `decision:close*` fact exists for this plan — an explicit
+    /// operator "this plan is done" decision. A terminal fact signal that
+    /// outranks a stale non-terminal `Status:` line (e.g. a plan left pinned
+    /// `In progress` whose milestones aren't each individually gate-recorded).
+    pub close_decision: bool,
     /// Distinct commit SHAs pulled from `decision:*` fact values (`commit_sha`
     /// field; QC.1 guarantees decisions carry one). Insertion order, deduped.
     pub commit_shas: Vec<String>,
@@ -718,8 +730,18 @@ pub fn summarise_facts(facts: &[(String, String, DateTime<Utc>)]) -> ExecplanFac
                 })
                 .unwrap_or_default();
             summary.deps_by_id.insert(id.to_string(), after);
-        } else if key.starts_with("decision:") {
+        } else if let Some(topic) = key.strip_prefix("decision:") {
             summary.decision_count += 1;
+            // A `decision:close` / `decision:close-<date>` fact is an explicit
+            // operator close. Match the exact token or the `close-` prefix only,
+            // so unrelated topics (`close-beta-pricing`) never silently complete
+            // a live plan. Key presence is the signal (audited convention:
+            // `decision:close-<date>`, value `complete`).
+            // ponytail: key-based — we don't parse the value for a "reopened"
+            // close; upgrade to value-aware if that convention ever appears.
+            if topic == "close" || topic.starts_with("close-") {
+                summary.close_decision = true;
+            }
             // QC.1: decision facts carry a `commit_sha`. Collect distinct ones
             // (insertion order) for the provenance rollup.
             if let Some(sha) = serde_json::from_str::<serde_json::Value>(value)
@@ -783,6 +805,58 @@ fn compute_next_ready(
     ready.first().map(|id| (*id).clone())
 }
 
+/// Terminal-completion check shared by the leading `In progress` Status arm and
+/// the fact-only fall-through (Rule 4). Returns `Some(item)` when the plan has
+/// crossed a terminal signal that outranks any *non-terminal* state — including
+/// a stale `Status: In progress` pin:
+///   - an explicit `decision:close*` fact, or
+///   - every declared milestone gate-complete (any `is_complete_status` synonym)
+///     OR every declared milestone's markdown checkbox ticked.
+///
+/// Either way, a plan that also names a superseding plan in its markdown
+/// archives with that pointer instead of `complete` — mirroring the
+/// `DeclaredStatus::Complete` arm so a plan projects the same terminal state on
+/// the In-progress-pin path and the fall-through path.
+///
+/// Returns `None` when no terminal signal is present, so the caller continues
+/// with its own state derivation. Factored out so the two call sites can't drift
+/// apart (the bug this guards against: a finished plan pinned `In progress`
+/// forever because the In-progress arm returned before the Rule-4 check).
+fn terminal_completion(file: &ExecplanFile, parsed: &ParsedPlan, facts: &ExecplanFactSummary) -> Option<WorkItem> {
+    // Is the plan terminally done? Either an explicit operator close (even
+    // without every gate recorded) OR all declared milestones done — via gate
+    // facts (any "done" synonym) OR every markdown checkbox ticked. Empty
+    // `milestones_declared` never trips the all-done branch (vacuous truth).
+    let all_milestones_done = !parsed.milestones_declared.is_empty() && {
+        let all_gated = parsed
+            .milestones_declared
+            .iter()
+            .all(|n| facts.gate_statuses.get(n).is_some_and(|s| is_complete_status(s)));
+        let all_checked = parsed
+            .milestones_declared
+            .iter()
+            .all(|n| parsed.milestones_checked.contains(n));
+        all_gated || all_checked
+    };
+    if !facts.close_decision && !all_milestones_done {
+        return None;
+    }
+    // Terminal. A plan that also names its replacement archives with the graph
+    // edge (mirrors the `DeclaredStatus::Complete` arm and the Rule-2 back-compat
+    // fall-through), so both call sites agree regardless of entry path.
+    if parsed.superseded_by.is_some() {
+        return Some(mk_item(
+            file,
+            parsed,
+            "archive",
+            None,
+            parsed.superseded_by.clone(),
+            facts,
+        ));
+    }
+    Some(mk_item(file, parsed, "complete", None, None, facts))
+}
+
 /// Deterministic state derivation. See module docs for the rule list.
 pub fn derive_state(
     file: &ExecplanFile,
@@ -800,8 +874,10 @@ pub fn derive_state(
         return mk_item(file, parsed, "drafting", None, None, facts);
     }
 
-    // Rules 1–3: only the leading Status token is authoritative. In particular,
-    // `Status: In progress — M0 complete` remains live.
+    // Rules 1–3: the leading Status token is authoritative for non-terminal
+    // tokens (`Status: In progress — M0 complete` stays live). The one exception
+    // is `In progress`, which yields to a terminal fact signal (rule 4 /
+    // `terminal_completion`) so a stale pin can't outlive a finished plan.
     match declared {
         Some(DeclaredStatus::Archived | DeclaredStatus::Parked | DeclaredStatus::Superseded) => {
             return mk_item(file, parsed, "archive", None, parsed.superseded_by.clone(), facts);
@@ -826,6 +902,13 @@ pub fn derive_state(
             return item;
         }
         Some(DeclaredStatus::InProgress) => {
+            // Terminal fact signals outrank a stale `In progress` pin: an
+            // explicit close decision, or all declared milestones done. Without
+            // this the arm returned in_progress before the fall-through Rule 4,
+            // pinning finished plans in_progress forever.
+            if let Some(item) = terminal_completion(file, parsed, facts) {
+                return item;
+            }
             let current = facts.highest_milestone_with_fact.map(|n| format!("M{n}"));
             let mut item = mk_item(file, parsed, "in_progress", current, None, facts);
             let last_activity = facts
@@ -847,22 +930,12 @@ pub fn derive_state(
         return mk_item(file, parsed, "archive", None, parsed.superseded_by.clone(), facts);
     }
 
-    // Rule 4: all declared milestones complete — via gate facts (any "done"
-    // synonym, see is_complete_status) OR every milestone's markdown checkbox
-    // ticked. Either signal flips the board so a finished plan stops reading as
-    // in_progress.
-    if !parsed.milestones_declared.is_empty() {
-        let all_gated = parsed
-            .milestones_declared
-            .iter()
-            .all(|n| facts.gate_statuses.get(n).is_some_and(|s| is_complete_status(s)));
-        let all_checked = parsed
-            .milestones_declared
-            .iter()
-            .all(|n| parsed.milestones_checked.contains(n));
-        if all_gated || all_checked {
-            return mk_item(file, parsed, "complete", None, None, facts);
-        }
+    // Rule 4: terminal completion — an explicit `decision:close*` fact, OR all
+    // declared milestones done (gate synonyms / ticked checkboxes). Shared with
+    // the `In progress` arm above via `terminal_completion` so the two can't
+    // drift apart.
+    if let Some(item) = terminal_completion(file, parsed, facts) {
+        return item;
     }
 
     // Rule 5: blocked gate on the highest fact'd milestone.
@@ -2361,6 +2434,146 @@ mod tests {
         let s = summarise_facts(&[("milestone:M1".to_string(), "{}".to_string(), ts(2_000))]);
         let item = derive_state(&f, &p, &s, 4_000);
         assert_eq!(item.state, "in_progress");
+    }
+
+    // ── Board-drift guard: terminal fact signals outrank a stale `In progress` pin ──
+
+    #[test]
+    fn in_progress_pin_yields_to_all_gates_complete() {
+        // The drift class this milestone fixes: a plan left pinned `In progress`
+        // whose declared milestones are all gate-complete must read `complete`,
+        // not stay in_progress forever.
+        let f = file(
+            "finished",
+            1_000,
+            "# Finished\n\nStatus: In progress\n## Milestones\n- M1\n- M2\n",
+        );
+        let p = parse_plan(&f.content);
+        let s = summarise_facts(&[
+            (
+                "gate:M1".to_string(),
+                r#"{"status":"passed+merged"}"#.to_string(),
+                ts(2_000),
+            ),
+            ("gate:M2".to_string(), r#"{"status":"complete"}"#.to_string(), ts(3_000)),
+        ]);
+        assert_eq!(derive_state(&f, &p, &s, 4_000).state, "complete");
+    }
+
+    #[test]
+    fn in_progress_pin_with_partial_gates_stays_in_progress() {
+        // Unchanged behaviour: not every milestone gated → still in_progress.
+        let f = file(
+            "midflight",
+            1_000,
+            "# Midflight\n\nStatus: In progress\n## Milestones\n- M1\n- M2\n",
+        );
+        let p = parse_plan(&f.content);
+        let s = summarise_facts(&[("gate:M1".to_string(), r#"{"status":"complete"}"#.to_string(), ts(2_000))]);
+        assert_eq!(derive_state(&f, &p, &s, 4_000).state, "in_progress");
+    }
+
+    #[test]
+    fn in_progress_reopens_when_a_new_milestone_is_declared_after_gates() {
+        // Self-correcting: a plan that was all-gated but then grows a new,
+        // ungated milestone reverts to in_progress on the next projection.
+        let f = file(
+            "reopened",
+            1_000,
+            "# Reopened\n\nStatus: In progress\n## Milestones\n- M1\n- M2\n- M3\n",
+        );
+        let p = parse_plan(&f.content);
+        assert_eq!(p.milestones_declared, vec![1, 2, 3]);
+        // M1+M2 gated, M3 newly declared with no gate yet.
+        let s = summarise_facts(&[
+            ("gate:M1".to_string(), r#"{"status":"complete"}"#.to_string(), ts(2_000)),
+            ("gate:M2".to_string(), r#"{"status":"complete"}"#.to_string(), ts(3_000)),
+        ]);
+        assert_eq!(derive_state(&f, &p, &s, 4_000).state, "in_progress");
+    }
+
+    #[test]
+    fn close_decision_completes_a_pinned_in_progress_plan() {
+        // An explicit `decision:close*` fact closes the plan even when its
+        // per-milestone gates aren't all individually recorded.
+        let f = file(
+            "closed",
+            1_000,
+            "# Closed\n\nStatus: In progress\n## Milestones\n- M1\n- M2\n",
+        );
+        let p = parse_plan(&f.content);
+        let s = summarise_facts(&[
+            ("gate:M1".to_string(), r#"{"status":"complete"}"#.to_string(), ts(2_000)),
+            (
+                "decision:close-2026-07-23".to_string(),
+                r#"{"outcome":"complete","commit_sha":"abc123"}"#.to_string(),
+                ts(3_000),
+            ),
+        ]);
+        assert!(s.close_decision);
+        assert_eq!(derive_state(&f, &p, &s, 4_000).state, "complete");
+    }
+
+    #[test]
+    fn close_decision_with_superseder_archives_with_pointer() {
+        // Close + a named superseding plan archives and keeps the graph edge,
+        // even under a stale `In progress` pin.
+        let f = file(
+            "closed-super",
+            1_000,
+            "# ClosedSuper\n\nStatus: In progress\n\nSuperseded by [[next-plan]]\n## Milestones\n- M1\n",
+        );
+        let p = parse_plan(&f.content);
+        let s = summarise_facts(&[(
+            "decision:close-2026-07-23".to_string(),
+            r#"{"outcome":"complete","commit_sha":"abc123"}"#.to_string(),
+            ts(3_000),
+        )]);
+        let item = derive_state(&f, &p, &s, 4_000);
+        assert_eq!(item.state, "archive");
+        assert_eq!(item.superseded_by.as_deref(), Some("next-plan"));
+    }
+
+    #[test]
+    fn in_progress_all_gated_with_superseder_archives_with_pointer() {
+        // The In-progress-pin path must agree with the fall-through path: an
+        // all-gated plan that also names a superseder archives with the edge,
+        // not bare `complete`.
+        let f = file(
+            "done-super",
+            1_000,
+            "# DoneSuper\n\nStatus: In progress\n\nSuperseded by [[next-plan]]\n## Milestones\n- M1\n- M2\n",
+        );
+        let p = parse_plan(&f.content);
+        let s = summarise_facts(&[
+            ("gate:M1".to_string(), r#"{"status":"complete"}"#.to_string(), ts(2_000)),
+            ("gate:M2".to_string(), r#"{"status":"complete"}"#.to_string(), ts(3_000)),
+        ]);
+        let item = derive_state(&f, &p, &s, 4_000);
+        assert_eq!(item.state, "archive");
+        assert_eq!(item.superseded_by.as_deref(), Some("next-plan"));
+    }
+
+    #[test]
+    fn unrelated_close_prefixed_decision_topic_is_not_a_close() {
+        // `decision:closed-beta-pricing` must NOT read as an operator close and
+        // must not complete a live pinned plan.
+        let f = file(
+            "live-pricing",
+            1_000,
+            "# Live\n\nStatus: In progress\n## Milestones\n- M1\n- M2\n",
+        );
+        let p = parse_plan(&f.content);
+        let s = summarise_facts(&[
+            ("gate:M1".to_string(), r#"{"status":"complete"}"#.to_string(), ts(2_000)),
+            (
+                "decision:closed-beta-pricing".to_string(),
+                r#"{"commit_sha":"abc123"}"#.to_string(),
+                ts(3_000),
+            ),
+        ]);
+        assert!(!s.close_decision);
+        assert_eq!(derive_state(&f, &p, &s, 4_000).state, "in_progress");
     }
 
     // ---- walker ----
