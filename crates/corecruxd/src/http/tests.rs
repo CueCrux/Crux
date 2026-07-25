@@ -16712,6 +16712,129 @@ async fn extensions_install_from_registry_verifies_index_and_manifest_sha() {
     assert_eq!(body["installed"]["trust_tier"], "community_reviewed");
 }
 
+/// Build a signed index with the given entry ids and write it to the
+/// daemon's default cache path. `signing_key` may differ from the key
+/// trusted under `curator_fpr` — that is how the bad-signature case is
+/// constructed.
+fn write_cached_registry_index(
+    data_dir: &std::path::Path,
+    curator_fpr: &str,
+    signing_key: &ed25519_dalek::SigningKey,
+    ids: &[&str],
+) {
+    use crux_integrations::{CommunityExtensionEntry, CommunityExtensionsIndex, EntryKind, TrustTier};
+    let mut index = CommunityExtensionsIndex::new(curator_fpr, 1_700_000_000_000);
+    for id in ids {
+        index.entries.push(CommunityExtensionEntry {
+            id: (*id).to_string(),
+            name: format!("Entry {id}"),
+            version: "0.1.0".to_string(),
+            summary: "Catalog entry.".to_string(),
+            manifest_url: format!("https://example.invalid/{id}.json"),
+            manifest_sha256: "0".repeat(64),
+            repo_url: format!("https://example.invalid/{id}"),
+            kind: EntryKind::HttpRecipe,
+            trust_tier: TrustTier::CommunityReviewed,
+        });
+    }
+    index.sign(signing_key).expect("sign index");
+    let index_path = data_dir.join("extensions/registry/index.json");
+    std::fs::create_dir_all(index_path.parent().expect("index parent")).expect("index dir");
+    std::fs::write(&index_path, serde_json::to_vec(&index).expect("index bytes")).expect("write index");
+}
+
+#[tokio::test]
+async fn extensions_registry_lists_verified_entries_with_installed_join() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xad; 32]);
+    let curator_fpr = "p_test_curator";
+    add_test_key(&state, curator_fpr, hex::encode(signing_key.verifying_key().to_bytes())).await;
+
+    // One entry is already installed; the other is catalog-only.
+    let manifest = build_signed_manifest("ext.example.installed", &signing_key, curator_fpr);
+    let reg_resp = super::extensions::register_extension(
+        State(state.clone()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::extensions::RegisterExtensionBody { manifest }),
+    )
+    .await
+    .into_response();
+    assert_eq!(reg_resp.status(), StatusCode::CREATED);
+
+    write_cached_registry_index(
+        &state.data_dir,
+        curator_fpr,
+        &signing_key,
+        &["ext.example.installed", "ext.example.notyet"],
+    );
+
+    let resp = super::extensions::list_registry_entries(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["schema"], "crux.extensions.registry_list.v1");
+    assert_eq!(body["curator_passport_fpr"], curator_fpr);
+    assert_eq!(body["updated_at_unix_ms"], 1_700_000_000_000_u64);
+
+    let entries = body["entries"].as_array().expect("entries array");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["id"], "ext.example.installed");
+    assert_eq!(entries[0]["installed"], true);
+    assert_eq!(entries[0]["installed_version"], "0.1.0");
+    // Curator metadata rides through unchanged for the console badges.
+    assert_eq!(entries[0]["kind"], "http_recipe");
+    assert_eq!(entries[0]["trust_tier"], "community_reviewed");
+    assert_eq!(entries[1]["id"], "ext.example.notyet");
+    assert_eq!(entries[1]["installed"], false);
+    assert!(entries[1]["installed_version"].is_null());
+}
+
+#[tokio::test]
+async fn extensions_registry_requires_admin_read() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::extensions::list_registry_entries(State(state), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn extensions_registry_without_cache_returns_404_naming_sync() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::extensions::list_registry_entries(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let detail = json_body(resp).await["detail"].as_str().unwrap_or_default().to_string();
+    assert!(
+        detail.contains("corecruxctl extensions sync"),
+        "expected the sync hint in the 404 detail, got: {detail}"
+    );
+}
+
+#[tokio::test]
+async fn extensions_registry_with_bad_signature_returns_403() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let curator_key = ed25519_dalek::SigningKey::from_bytes(&[0xae; 32]);
+    let attacker_key = ed25519_dalek::SigningKey::from_bytes(&[0xaf; 32]);
+    let curator_fpr = "p_test_curator_real";
+    add_test_key(&state, curator_fpr, hex::encode(curator_key.verifying_key().to_bytes())).await;
+
+    // Index claims the curator's fpr but is signed by someone else.
+    write_cached_registry_index(&state.data_dir, curator_fpr, &attacker_key, &["ext.example.forged"]);
+
+    let resp = super::extensions::list_registry_entries(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let detail = json_body(resp).await["detail"].as_str().unwrap_or_default().to_string();
+    assert!(
+        detail.contains("signature verification failed"),
+        "expected a signature-verification detail, got: {detail}"
+    );
+}
+
 #[tokio::test]
 async fn extensions_register_unsigned_returns_400_with_dev_hint() {
     use crux_integrations::{

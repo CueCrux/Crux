@@ -1368,6 +1368,24 @@ enum ExtensionsCommand {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// Install one extension by id from the daemon's verified cached
+    /// registry index (`POST /v1/extensions/install-from-registry`).
+    /// Run `sync` first, then `list-registry` to review the entry.
+    Install {
+        /// Extension id exactly as published in the registry index.
+        id: String,
+        /// Daemon-side index override. Relative paths resolve under the
+        /// daemon's data dir; absolute paths are taken as-is. Defaults to
+        /// `<data-dir>/extensions/registry/index.json`.
+        #[arg(long)]
+        index_path: Option<PathBuf>,
+        /// Daemon HTTP base URL (defaults to CORECRUXD_HTTP_URL or localhost).
+        #[arg(long)]
+        http_url: Option<String>,
+        /// Bearer token (defaults to CRUX_AGENT_TOKEN).
+        #[arg(long)]
+        token: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -4055,6 +4073,32 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     println!("    sha256:       {}", entry.manifest_sha256);
                     println!();
                 }
+                Ok(())
+            }
+            ExtensionsCommand::Install {
+                id,
+                index_path,
+                http_url,
+                token,
+            } => {
+                let body = extensions::install(&extensions::InstallArgs {
+                    id: id.clone(),
+                    http_url,
+                    token,
+                    index_path,
+                })?;
+                println!("Installed {id} from the cached registry index.");
+                println!("  schema:          {}", body["schema"].as_str().unwrap_or("-"));
+                println!("  manifest_sha256: {}", body["manifest_sha256"].as_str().unwrap_or("-"));
+                println!(
+                    "  version:         {}",
+                    body["installed"]["manifest"]["version"].as_str().unwrap_or("-")
+                );
+                println!(
+                    "  trust_tier:      {}",
+                    body["installed"]["trust_tier"].as_str().unwrap_or("-")
+                );
+                println!("  grants:          none yet — POST /v1/extensions/{id}/grants to scope a passport");
                 Ok(())
             }
         },

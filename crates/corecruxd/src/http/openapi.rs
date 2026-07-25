@@ -238,6 +238,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/extensions/keys", methods: &["GET", "POST"], tag: "Extensions", auth: "read-write", summary: "Extensions keys" },
     RouteEntry { path: "/v1/extensions/keys/{passport_fpr}", methods: &["DELETE"], tag: "Extensions", auth: "write", summary: "Extensions keys {passport fpr}" },
     RouteEntry { path: "/v1/extensions/register", methods: &["POST"], tag: "Extensions", auth: "write", summary: "Extensions register" },
+    RouteEntry { path: "/v1/extensions/registry", methods: &["GET"], tag: "Extensions", auth: "read", summary: "Extensions registry" },
     RouteEntry { path: "/v1/extensions/{id}", methods: &["GET", "DELETE"], tag: "Extensions", auth: "read-write", summary: "Extensions {id}" },
     RouteEntry { path: "/v1/extensions/{id}/grants", methods: &["GET", "POST"], tag: "Extensions", auth: "read-write", summary: "Extensions {id} grants" },
     RouteEntry { path: "/v1/extensions/{id}/grants/{passport_fpr}", methods: &["DELETE"], tag: "Extensions", auth: "write", summary: "Extensions {id} grants {passport fpr}" },

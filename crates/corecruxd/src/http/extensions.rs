@@ -215,6 +215,64 @@ pub(super) async fn register_extension(
     }
 }
 
+/// `GET /v1/extensions/registry` — browse the VERIFIED cached community
+/// index so a console can render the catalog before anyone installs.
+///
+/// Read-only twin of `install_from_registry`: same cache path, same
+/// signature verification, no network. Entries are joined against the
+/// installed set so the caller can render "installed / update available"
+/// without a second round-trip.
+pub(super) async fn list_registry_entries(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+    let index_path = registry_index_path(&state.data_dir, None);
+    let index = match load_and_verify_registry_index(&state.data_dir, &index_path) {
+        Ok(index) => index,
+        // The no-cache case is the common one on a fresh daemon; name the
+        // command that populates it rather than leaking a bare io error.
+        Err((StatusCode::NOT_FOUND, msg)) => {
+            return problem_response(
+                StatusCode::NOT_FOUND,
+                format!("{msg} (run `corecruxctl extensions sync` to populate the cached registry index)"),
+            );
+        }
+        Err((status, msg)) => return problem_response(status, msg),
+    };
+
+    let store = state.fact_store.read().await;
+    let installed = crate::extension_registry::list_extensions(&store);
+    drop(store);
+
+    let entries: Vec<serde_json::Value> = index
+        .entries
+        .iter()
+        .map(|entry| {
+            let installed_version = installed
+                .iter()
+                .find(|record| record.manifest.id == entry.id)
+                .map(|record| record.manifest.version.clone());
+            let mut value = serde_json::to_value(entry).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("installed".to_string(), serde_json::json!(installed_version.is_some()));
+                obj.insert("installed_version".to_string(), serde_json::json!(installed_version));
+            }
+            value
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "schema": "crux.extensions.registry_list.v1",
+            "curator_passport_fpr": index.curator_passport_fpr,
+            "updated_at_unix_ms": index.updated_at_unix_ms,
+            "entries": entries,
+        })),
+    )
+        .into_response()
+}
+
 /// `POST /v1/extensions/install-from-registry` — install by id from a
 /// verified cached community-extension index. The daemon re-verifies the
 /// signed index against the local trusted-keyring, fetches the manifest URL,

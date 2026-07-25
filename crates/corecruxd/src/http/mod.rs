@@ -1059,6 +1059,13 @@ pub(crate) fn router_with_route_auth(
             "/v1/extensions/install-from-registry",
             axum::routing::post(self::extensions::install_from_registry),
         )
+        // Read-only catalog browse over the same verified cached index the
+        // install route consumes. Static segment, so it wins over
+        // `/v1/extensions/{id}` in the router's match order.
+        .route(
+            "/v1/extensions/registry",
+            get(self::extensions::list_registry_entries),
+        )
         .route(
             "/v1/extensions/keys",
             get(self::extensions::list_trusted_keys),
