@@ -4175,8 +4175,12 @@ function extractThemeVars(theme) {
   check(/var COST_BAR_MAX = 2000000;/.test(costBody), '[m21] the token bar must use a FIXED 2,000,000-token scale');
   check(/function costBar\(tokens\)/.test(costBody) && /var over = tokens > COST_BAR_MAX;/.test(costBody),
     '[m21] sessions past the ceiling must clamp and be marked, not rescale the scale');
-  check(/'class': 'cost-tbar-maxline'/.test(costBody) && /0 → 2,000,000 tokens \(ctx \+ out\) · fixed scale/.test(costBody),
-    '[m21] the max line + its label must be visible');
+  // M24 RETARGET: the scale caption now covers the CHART as well as the rows
+  // (both draw on the same ceiling), so it no longer says "(ctx + out)" — the
+  // chart's bars are output tokens on the same scale. The requirement is
+  // unchanged: a visible max line and a caption that states the fixed ceiling.
+  check(/'class': 'cost-tbar-maxline'/.test(costBody) && /0 → 2,000,000 tokens · fixed scale, chart and rows alike/.test(costBody),
+    '[m21→m24] the max line + its label must be visible (and the label must now cover the chart too)');
   check(/fill\.style\.backgroundSize = \(10000 \/ pct\) \+ '% 100%'/.test(costBody),
     '[m21] the gradient must be stretched to the whole track so colour tracks MAGNITUDE, not bar length');
   check(/if \(m && m\.state_title\) \{ return \{ text: m\.state_title, kind: 'title' \}; \}/.test(costBody)
@@ -4228,8 +4232,15 @@ function extractThemeVars(theme) {
     '[m22→m23] compact rows must be CENTRED in the bar, with no left connector hairline (hierarchy by size, not by indent)');
   check(/:root\[data-rail="collapsed"\] \.nav-subitem \.label,\n    :root\[data-rail="collapsed"\] \.nav-subitem \.acct-code \{ display: none; \}/.test(shellHtml),
     '[m22→m23] the compact row must drop its text label AND the Language locale code (tooltips are the only text)');
-  check(/title: it\.title, 'aria-label': it\.title/.test(shellHtml),
-    '[m22] every accordion row must carry the page name in title + aria-label (the compact row has no visible label)');
+  // M24 RETARGET: the requirement was "the compact row must carry its page name
+  // somewhere, because it has no visible label". That still holds — but the
+  // vehicle changed. The native `title` is REMOVED (it drew an uncontrolled
+  // OS tooltip that fought the new glass hover label), so the name now rides on
+  // aria-label (accessible name, unchanged) + data-hlabel (what the hover label
+  // reads). Both are asserted, and the absence of `title` is asserted too, so a
+  // future edit cannot quietly reintroduce the double tooltip.
+  check(/'aria-label': it\.title, 'data-hlabel': it\.title/.test(shellHtml),
+    '[m22→m24] every accordion row must carry the page name in aria-label + data-hlabel (the compact row has no visible label)');
   check(/\.nav-subitem\[aria-current="page"\] \{/.test(shellHtml) && /\.nav-subitem\[aria-current="page"\] svg \{ opacity: 1; color: var\(--acc\); \}/.test(shellHtml),
     '[m22] the active sub-page must be marked (accent fill + accent glyph) — it is the only state cue a compact icon has');
   // ONE glyph source for both presentations: the compact icons ARE the expanded icons.
@@ -4404,6 +4415,144 @@ function extractThemeVars(theme) {
     '[m23] the new footer DOM must be built with el()/textContent, not innerHTML');
 
   notes.push('operator round 12 (M23): the COMPACT rail\'s hierarchy is re-cut to read by SIZE — the left connector hairline is removed, the sub icons are CENTRED in the bar (the right-inset margin trick is gone), the destination glyph steps 18 → 22px inside a 48px row against the unchanged 34px/16px sub square, and an OPEN group is capped by a short centred var(--edge) hairline past its last row (one rule on the shared .nav-sub family, so the builtin and workspace rails both get it; the upward footer group flips the cap to its TOP so it still reads as the end of the list). The expanded rail is untouched (its left:18px connector is asserted intact). The rail FOOTER loses its second control: the separate System accordion trigger is deleted and the ACCOUNT BADGE (#passportChip, moved into the group by buildAccountFooterNav) becomes the single trigger of ONE merged upward group — System sub-pages, a non-focusable hairline, then Studio · Language · Log out nearest the badge (column-reverse ⇒ last in DOM is closest to the trigger). #acctPop is retired outright (element, ensure/open/close/toggle handlers, acctSyncSystemRows, the click-away listener and the route() close call), taking with it the duplicate "Settings" row (System\'s cx-settings IS Settings) and the collapsed-rail branch that served a second presentation of the same list; the compact rail now rolls the same group up as centred icon squares with tooltip-only text. Keyboard is unchanged in model — NAV_TRIGGER_SEL just admits .passport-chip, so ArrowUp steps into the upward group from the badge and Escape returns to it — and [hidden] rows are excluded from the walk, so Log out (hidden until CruxSession.probe() confirms a hosted session) is skipped on a local daemon.');
+})();
+
+// =========================================================================
+//  Check 56 — M24, operator round 13.
+//    (1) the compact rail's native title tooltips are REPLACED by a glass
+//        hover label that eases out from under the bar;
+//    (2) the Token Burn chart draws the SAME bar as its rows, named by the
+//        cx-sessions naming chain;
+//    (3) tokens-per-turn is a first-class signal (chips + sort) and the
+//        "how to cut it" strapline is backed by per-session advice computed
+//        from real numbers against features the daemon ships;
+//    (4) "Average Token Usage" is live (its static mock is deleted) and its
+//        bars use the cost lens's gradient;
+//    (5) ring dots shrink (damped, floored) as zoom increases.
+// =========================================================================
+(function checkM24OperatorRound13() {
+  // ---- (1) compact-rail hover label --------------------------------------
+  // The native tooltip must be GONE from all three rail row builders — a
+  // leftover `title:` would draw the OS box on top of the glass chip.
+  check(!/'class': 'nav-item', type: 'button', 'data-dest': item\.id[^}]*title:/.test(shellHtml)
+    && !/'data-wsdest': d\.id[^}]*title: d\.label/.test(shellHtml)
+    && !/'class': 'nav-subitem', type: 'button'[^}]*\btitle:/.test(shellHtml),
+    '[m24] no rail row builder may set a native title (it would fight the hover label)');
+  check(/'aria-label': item\.label, 'data-hlabel': item\.label/.test(shellHtml)
+    && /'aria-label': d\.label, 'data-hlabel': d\.label/.test(shellHtml),
+    '[m24] destination buttons (built-in AND workspace rails) must name themselves via aria-label + data-hlabel');
+  check(/id="passportChip"[^>]*aria-label="Account &amp; system" data-hlabel="Account &amp; system"/.test(shellHtml)
+    && !/id="passportChip"[^>]*\btitle=/.test(shellHtml),
+    '[m24] the footer account badge must follow the same rule (aria-label + data-hlabel, no native title)');
+  // The accessible name must not regress: buildNavGroup used to read the
+  // trigger's title for its group label, so it has to read aria-label now.
+  check(/'aria-label': \(btn\.getAttribute\('aria-label'\) \|\| btn\.getAttribute\('data-hlabel'\) \|\| key\) \+ ' pages'/.test(shellHtml),
+    '[m24] the sub-group\'s accessible name must come off the trigger\'s aria-label, not its removed title');
+  check(/var RAIL_HLABEL_DELAY = 900;/.test(shellHtml),
+    '[m24] the label must wait for steady hover (~1s), not fire on every pass of the pointer');
+  check(/function railIsCompact\(\)/.test(shellHtml)
+    && /data-rail'\) !== 'collapsed'\) \{ return false; \}/.test(shellHtml)
+    && /matchMedia\('\(min-width: 721px\)'\)/.test(shellHtml),
+    '[m24] the hover label is COMPACT-rail + desktop only — the expanded rail shows its labels inline and must be untouched');
+  // Rendered on <body>, position:fixed — the reason it cannot be clipped by
+  // #nav's overflow-y:auto scroll region.
+  check(/document\.body\.appendChild\(railHLabelEl\);/.test(shellHtml)
+    && /\.rail-hlabel \{\n    position: fixed;/.test(shellHtml),
+    '[m24] the label must render OUTSIDE the scroll container (body child, position:fixed) so #nav overflow cannot clip it');
+  check(/\.rail \{ z-index: 6; \}/.test(shellHtml) && /\.rail-hlabel \{[^}]*z-index: 5;/.test(shellHtml),
+    '[m24] the rail must paint ABOVE the label, so the chip genuinely eases out from BEHIND the bar');
+  check(/\.rail-hlabel \{[^}]*transform: translate\(-14px, -50%\);[^}]*transition: opacity \.16s ease, transform \.2s cubic-bezier\(\.16,1,\.3,1\);/.test(shellHtml)
+    && /\.rail-hlabel\.is-out \{ opacity: 1; transform: translate\(0, -50%\); \}/.test(shellHtml),
+    '[m24] the ease must be a ~200ms transform+opacity slide to the right (no layout animation)');
+  check(/@media \(prefers-reduced-motion: reduce\) \{ \.rail-hlabel \{ transition: none; \} \}/.test(shellHtml),
+    '[m24] reduced motion must snap the label instead of sliding it');
+  check(/lab\.style\.top = Math\.round\(rr\.top \+ rr\.height \/ 2\) \+ 'px';/.test(shellHtml),
+    '[m24] the label must sit at the row\'s vertical centre');
+  check(/rail\.addEventListener\('mouseleave', hideRailHLabel\);/.test(shellHtml)
+    && /window\.addEventListener\('scroll', hideRailHLabel, true\);/.test(shellHtml)
+    && /if \(typeof hideRailHLabel === 'function'\) \{ hideRailHLabel\(\); \}/.test(shellHtml),
+    '[m24] the label must leave on mouseleave, on any scroll, and on every route change');
+  check(/'class': 'rail-hlabel', id: 'railHoverLabel', 'aria-hidden': 'true'/.test(shellHtml),
+    '[m24] the label is decoration for sighted users — aria-hidden, because aria-label already names the row');
+  check(/initRailHoverLabels\(\);/.test(shellHtml) && !/railHLabel[^\n]*innerHTML/.test(shellHtml),
+    '[m24] the label must be wired at init and built with el()/textContent');
+
+  // ---- (2) the chart speaks the rows' visual language ---------------------
+  var costBody24 = funcBody(renderSrc, 'renderCostBrowser') || '';
+  check(/costBar\(s\.output_tokens \|\| 0\)/.test(costBody24)
+    && !/'class': 'cost-bar-fill'/.test(costBody24)
+    && !/'class': 'cost-bar-track'/.test(costBody24),
+    '[m24] the top-sessions chart must draw the SAME costBar() as the rows — its own flat track/fill is gone');
+  check(!/\.cost-bar-fill \{/.test(shellHtml) && !/\.cost-bar-track \{/.test(shellHtml),
+    '[m24] the retired chart-bar CSS must go with the markup that used it (one bar idiom, not two)');
+  check(/var nm = sessName\(s\);[\s\S]{0,220}'class': 'cost-bar-label'/.test(costBody24),
+    '[m24] chart labels must use the cx-sessions naming chain (title → first line → short id), not a raw UUID');
+
+  // ---- (3) tokens-per-turn + advice grounded in real numbers -------------
+  check(/function turnsOf\(s\)/.test(costBody24) && /function outPerTurn\(s\)/.test(costBody24)
+    && /function ctxPerTurn\(s\)/.test(costBody24) && /function ctxRatio\(s\)/.test(costBody24),
+    '[m24] per-turn rates must be first-class derivations, not inline arithmetic');
+  check(/'turns unavailable'/.test(costBody24) && /return \(isFinite\(t\) && t > 0\) \? t : null;/.test(costBody24),
+    '[m24] a report with no turn count must SAY so — never a fabricated 0');
+  check(/COST_SORTS/.test(costBody24) && /\['outturn', 'output \/ turn'\]/.test(costBody24)
+    && /\['ctxturn', 'context \/ turn'\]/.test(costBody24) && /function sortVisible\(rows, key\)/.test(costBody24),
+    '[m24] the rows must be sortable BY the per-turn rate (magnitude finds the expensive, rate finds the inefficient)');
+  check(/if \(va == null\) \{ return 1; \}/.test(costBody24),
+    '[m24] rows with no value for the active sort must sink, not sort as zero');
+  check(/var ADV_CTX_RATIO = 150;/.test(costBody24) && /var ADV_CTX_PER_TURN = 200000;/.test(costBody24)
+    && /var ADV_TURNS = 300;/.test(costBody24) && /var ADV_OUT_PER_TURN = 2500;/.test(costBody24),
+    '[m24] every advice threshold must be a named constant, not a magic number buried in a branch');
+  check(/function adviceHelp\(\)/.test(costBody24) && /how to cut it — when each line fires/.test(costBody24),
+    '[m24] the thresholds must be VISIBLE to the operator (a rule you cannot read is a rule you cannot check)');
+  check(/if \(!adv\.length\) \{ return null; \}/.test(costBody24)
+    && /if \(adv\) \{ kids\.push\(adv\); \}/.test(costBody24),
+    '[m24] a session that trips nothing must get NO advice line (honest silence, not filler)');
+  // Each recommendation must name a feature this daemon actually ships.
+  ['token_budget', 'query_scan', 'query_expand', 'save_session', 'get_session', 'store_fact', 'query_facts'].forEach(function (f) {
+    check(costBody24.indexOf(f) >= 0, '[m24] the advice must name the real token-reduction feature `' + f + '`');
+  });
+  check(/no savings percentage is claimed, because the daemon measures no counterfactual/.test(costBody24),
+    '[m24] no savings percentage may be claimed — nothing measures the counterfactual');
+
+  // ---- (4) Average Token Usage is live -----------------------------------
+  // The literals must be gone as CONTROL VALUES. (buildUsageLive's header quotes
+  // them verbatim to record what was removed — that is documentation, not a
+  // rendered figure — so the assertion is scoped to the code, not the comments.)
+  var pagesCode = pagesSrc.replace(/^\s*\/\/.*$/gm, '');
+  check(!/STATIC\['cx-usage'\]/.test(pagesCode)
+    && !/info\('daily avg', '~83k/.test(pagesCode)
+    && !/info\('this week', '517k/.test(pagesCode)
+    && !/≈233k in tokens\/week · −31%/.test(pagesCode)
+    && !/pct: 100, v: '750k in\/wk'/.test(pagesCode),
+    '[m24] every hardcoded cx-usage figure must be DELETED (page() paints STATIC first, so a mock there is what operators saw)');
+  check(/'cx-usage': page\('cx-usage', 'meters', 'Average Token Usage', 'measured per-period and per-turn averages · \/v1\/cost\/report', \{ load: \{ endpoint: '\/v1\/cost\/report/.test(pagesSrc),
+    '[m24] cx-usage must load the real feed it names');
+  check(/function buildUsageLive\(res\)/.test(pagesSrc) && /function usageAgg\(rows\)/.test(pagesSrc)
+    && /function usageSeriesFrom\(rows\)/.test(pagesSrc),
+    '[m24] cx-usage numbers must be COMPUTED from the report rows');
+  check(/turns unavailable — no report in this set carries an assistant_turns count/.test(pagesSrc)
+    && /No session cost reports have been posted for this tenant/.test(pagesSrc),
+    '[m24] cx-usage must degrade honestly (empty feed, missing turn counts) rather than estimate');
+  check(/measured saving', 'none — the daemon records no counterfactual/.test(pagesSrc),
+    '[m24] the savings card must state that nothing is measured, not carry an invented percentage');
+  check(/turn-less reports are excluded from this average, not counted as zero/.test(pagesSrc)
+    && /a\.ctxOnTurns \+= c; a\.outOnTurns \+= o;/.test(pagesSrc),
+    '[m24] the per-turn average must divide like by like — reports with no turn count contribute neither numerator nor denominator');
+  check(/var USAGE_BAR_MAX = 2000000;/.test(pagesSrc) && /ramp: true/.test(pagesSrc)
+    && /\.ctl-bar-fill\.ramp \{\n    background-image: linear-gradient\(90deg, var\(--ok\) 0%, var\(--trust\) 34%, var\(--warn\) 68%, var\(--crit\) 100%\);/.test(shellHtml),
+    '[m24] cx-usage bars must use the cost lens\'s gradient on the cost lens\'s fixed 2M ceiling');
+
+  // ---- (5) ring dots shrink with zoom ------------------------------------
+  var ringsBody = funcBody(renderSrc, 'renderRings') || '';
+  check(/var ZOOM_DOT_K = 0\.6, ZOOM_DOT_MIN = 0\.28;/.test(ringsBody)
+    && /function zoomDotScale\(\) \{ return Z <= 1 \? 1 : Math\.max\(ZOOM_DOT_MIN, 1 \/ Math\.pow\(Z, ZOOM_DOT_K\)\); \}/.test(ringsBody),
+    '[m24] dot radius must be damped by zoom, with a floor — and be EXACTLY 1 at or below the overview zoom');
+  check(/var rr = dotR\(c\) \* zdot \*/.test(ringsBody) && /var zdot = zoomDotScale\(\);   \/\/ M24/.test(ringsBody),
+    '[m24] the damping must be computed ONCE per frame and applied to the dot radius (no per-dot allocation)');
+  check(/window\.__ringsZ = Z; window\.__ringsDotScale = zdot;/.test(ringsBody),
+    '[m24] the zoom/dot-size relationship must be measurable from the mirror, not merely asserted');
+
+  notes.push('operator round 13 (M24): the compact rail\'s native `title` tooltips are REMOVED from all three row builders (dest buttons, sub-page icons, the account badge) and replaced by ONE console-drawn glass chip — a body-level position:fixed .rail-hlabel that cannot be clipped by #nav\'s scroll region, eased out from BEHIND the bar (the rail takes z-index 6 over the chip\'s 5) after 900ms of steady hover, centred on the row, 200ms transform+opacity on the accordion\'s own cubic-bezier, snapping under reduced motion, and dismissed by mouseleave / any scroll / click / Escape / route change; aria-label carries the accessible name unchanged (data-hlabel is what the chip reads), and the expanded rail is untouched. cx-cost: the top-sessions chart now calls the SAME costBar() as the rows — same track, gradient, height and fixed 2,000,000-token ceiling (fixed beat proportional-to-max: a proportional chart would put a full-width bar directly above a row bar of the same length meaning 2M) — labelled by the cx-sessions naming chain instead of raw UUIDs, and the chart\'s own flat bar CSS is deleted. Tokens-per-turn ships as a first-class signal beside the magnitude bar (turns / ctx-per-turn / out-per-turn chips, four new sorts, missing turn counts declared rather than zeroed, unsortable rows sinking) and "how to cut it" becomes real: five named thresholds over THIS session\'s numbers, each recommendation naming a feature the daemon ships (token_budget QC.2 · query_scan→query_expand · save_session/get_session · store_fact/query_facts), the thresholds published in an inline help note, no savings percentage claimed anywhere, and a session that trips nothing getting no line at all. cx-usage ("Average Token Usage") was STATIC — every figure a literal in STATIC[\'cx-usage\'] painted as page()\'s pre-load skeleton, plus a −31% savings card measured against an invented baseline, while its declared /v1/observations/aggregate feed was never called; the static entry is DELETED and the page is computed from /v1/cost/report (period + per-session + per-turn averages, session size on the same 2M gradient scale, a real bucketed output series), with the savings card replaced by a statement that no counterfactual is measured. Ring dots are damped by Z^0.6 with a 0.28 floor and an exact identity at or below overview zoom, so clusters separate as you zoom in; the factor is computed once per frame and published as __ringsZ/__ringsDotScale so the claim is measurable.');
 })();
 
 // ---- Report (awaits async renderer-driven checks) -----------------------

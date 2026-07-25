@@ -399,8 +399,9 @@
      phone media query that hides the rail entirely. Toggled via
      :root[data-rail="collapsed"]; state persists in localStorage
      (crux.console.rail). Labels, group labels, kbd hints, the brand name, the
-     passport identity text and the footer collapse; nav items keep a title
-     tooltip (set in JS) and the theme switch stacks its icons vertically. */
+     passport identity text and the footer collapse; M24 — nav rows name
+     themselves through the glass hover label below (the native title tooltip is
+     gone) and the theme switch stacks its icons vertically. */
   @media (min-width: 721px) {
     :root[data-rail="collapsed"] .app { grid-template-columns: 64px 1fr; }
     :root[data-rail="collapsed"] .rail { padding: 16px 8px; align-items: stretch; }
@@ -428,8 +429,9 @@
        destination's), same height+opacity tween, same reduced-motion snap — the
        mechanics are shared, only the row presentation differs.
        Rows are square (34px) and smaller than the 48px destination column, so the
-       nesting reads without any text. The page name lives in title + aria-label
-       (the tooltip is the only text).
+       nesting reads without any text. The page name lives in aria-label +
+       data-hlabel — M24 retired the native title in favour of the glass hover
+       label that eases out from under the bar (.rail-hlabel, below).
        M23 — the hierarchy is now carried by SIZE + a closing rule, not by an
        indent and a connector line: (a) the left connector hairline is removed,
        (b) the rows are CENTRED in the bar rather than inset to its right, and
@@ -464,6 +466,41 @@
     :root[data-rail="collapsed"] .passport-chip .acct-caret { display: none; }
     :root[data-rail="collapsed"] .theme-switch { flex-direction: column; }
   }
+
+  /* ---- M24 — COMPACT-RAIL HOVER LABEL ------------------------------------
+     The compact rail's rows have no visible text, so until M24 their only name
+     was the native `title` tooltip: an OS-drawn white box, ~1.5s late, in the
+     wrong place, in a style the console does not control. M24 replaces it with
+     a console-drawn glass chip that EASES OUT FROM UNDER THE RAIL.
+
+     Three rules make that work:
+       (a) it is a direct child of <body> with position:fixed, so #nav's
+           overflow-y:auto scroll region cannot clip it (the reason it is not
+           rendered inside the row);
+       (b) the rail takes a z-index ABOVE the chip, so the chip's first ~14px
+           genuinely slide out from behind the bar rather than appearing on top
+           of it;
+       (c) the ease is transform+opacity only (no layout), 200ms on the same
+           cubic-bezier(.16,1,.3,1) the accordion uses, and reduced motion snaps.
+     The native title attrs are REMOVED from these rows (buildRail /
+     buildNavGroup / buildWorkspaceRail) so the two never fight; `aria-label`
+     stays, so the accessible name is unchanged. */
+  .rail { z-index: 6; }              /* (b) — the chip (z-index 5) slides out from behind it */
+  .rail-hlabel {
+    position: fixed; z-index: 5; pointer-events: none;
+    max-width: 240px; padding: 6px 11px;
+    font-size: 12.5px; font-weight: 550; line-height: 1.25; color: var(--ink);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    background: var(--surface); border: 1px solid var(--edge-strong);
+    border-radius: var(--radius-sm);
+    box-shadow: var(--card-shadow), 0 10px 26px rgba(0,0,0,.34);
+    backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
+    opacity: 0; transform: translate(-14px, -50%);
+    transition: opacity .16s ease, transform .2s cubic-bezier(.16,1,.3,1);
+  }
+  .rail-hlabel.is-out { opacity: 1; transform: translate(0, -50%); }
+  .rail-hlabel[hidden] { display: none; }
+  @media (prefers-reduced-motion: reduce) { .rail-hlabel { transition: none; } }
 
   /* ---- Main column ------------------------------------------------------- */
   .main { min-width: 0; display: flex; flex-direction: column; }
@@ -1240,6 +1277,14 @@
   .ctl-bar-fill.err { background: var(--crit); }
   /* Gradient bar fills (Sessions token/progress bars) — a horizontal gradient
      reading cool→accent for progress and accent→warm for token burn. */
+  /* M24 — `.ramp` is the cost lens's magnitude gradient, verbatim (see
+     .cost-tbar-fill): sized to the WHOLE track by the renderer, so a given
+     colour always means a given token count whether it is drawn on cx-cost or
+     on cx-usage. Declared once here and reused, never re-mixed per page. */
+  .ctl-bar-fill.ramp {
+    background-image: linear-gradient(90deg, var(--ok) 0%, var(--trust) 34%, var(--warn) 68%, var(--crit) 100%);
+    background-repeat: no-repeat; background-size: 100% 100%;
+  }
   .ctl-bar-fill.grad-prog { background: linear-gradient(90deg, var(--ok), var(--acc)); }
   .ctl-bar-fill.grad-tok { background: linear-gradient(90deg, var(--acc), var(--warn)); }
 
@@ -3194,11 +3239,30 @@
   .cost-chart { display: flex; flex-direction: column; gap: 4px; }
   .cost-chart:empty { display: none; }
   .cost-chart-title { font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--ink3); margin-bottom: 2px; }
-  .cost-bar { display: grid; grid-template-columns: 96px 1fr 52px; align-items: center; gap: 8px; }
-  .cost-bar-label { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .cost-bar-track { height: 12px; background: var(--surface2); border: 1px solid var(--edge); border-radius: 6px; overflow: hidden; }
-  .cost-bar-fill { height: 100%; background: var(--acc); border-radius: 6px 0 0 6px; min-width: 2px; }
-  .cost-bar-val { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink2); text-align: right; }
+  /* M24 — the top-sessions chart row is now [name | costBar]: the bar itself is
+     the SAME .cost-tbar the session rows use (track, gradient, height, 2M scale
+     and value pair all come from costBar()), so the chart and the rows below it
+     speak one visual language. The chart's own flat .cost-bar-track/-fill/-val
+     rules are deleted with the markup that used them. */
+  .cost-bar { display: grid; grid-template-columns: 190px 1fr; align-items: center; gap: 10px; }
+  .cost-bar .cost-tbar { margin: 2px 0; }
+  .cost-bar-label { font-size: 11.5px; font-weight: 550; color: var(--ink2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cost-bar-label.is-untitled { font-family: var(--font-mono); font-weight: 500; color: var(--ink3); }
+  /* Per-turn RATE chips — the second signal beside the magnitude bar. */
+  .sess-chip.cost-rate { border-color: var(--edge-strong); color: var(--ink); }
+  .sess-chip.cost-na { color: var(--ink3); font-style: italic; }
+  /* "How to cut it" — per-session advice, only on rows that trip a threshold. */
+  .cost-advice { display: flex; flex-direction: column; gap: 4px; margin: 8px 0 2px; padding: 8px 10px; border: 1px solid var(--edge); border-left: 3px solid var(--warn); border-radius: 8px; background: var(--surface2); }
+  .cost-advice-row { display: flex; align-items: baseline; gap: 9px; }
+  .cost-advice-tag {
+    flex: none; font-family: var(--font-mono); font-size: 9.5px; text-transform: uppercase; letter-spacing: .05em;
+    color: var(--warn); border: 1px solid var(--edge-strong); border-radius: 5px; padding: 1px 6px; white-space: nowrap;
+  }
+  .cost-advice-t { font-size: 12px; line-height: 1.45; color: var(--ink2); }
+  .cost-help { margin: 2px 0 8px; }
+  .cost-help > summary { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink3); cursor: pointer; padding: 3px 0; }
+  .cost-help > summary:hover { color: var(--ink2); }
+  .cost-help .facts-kv { margin-top: 6px; }
   .cost-totals { display: flex; gap: 14px; align-items: baseline; flex-wrap: wrap; padding: 8px 12px; border: 1px solid var(--edge); border-left: 3px solid var(--acc); border-radius: 8px; background: var(--surface2); }
   .cost-totals:empty { display: none; }
   .cost-totals-k { font-family: var(--font-mono); font-size: 10px; letter-spacing: .06em; color: var(--ink3); }
@@ -3358,7 +3422,9 @@
              rolls UPWARD, in both rail states. The badge markup stays here (not in
              JS) so passport paint / placeMobileChrome keep one live node. -->
         <div class="rail-footer-nav" id="railFooterNav"></div>
-        <button class="passport-chip" id="passportChip" type="button" aria-expanded="false" title="Account &amp; system">
+        <!-- M24 — the native title is replaced by the glass hover label (data-hlabel);
+             aria-label keeps the accessible name. -->
+        <button class="passport-chip" id="passportChip" type="button" aria-expanded="false" aria-label="Account &amp; system" data-hlabel="Account &amp; system">
           <span class="avatar" aria-hidden="true"></span>
           <span class="who">
             <b id="passportName">Passport</b>
@@ -4454,11 +4520,79 @@
       rec.sub.style.height = '0px';
     }
   }
+  // ---- M24: the compact rail's hover label --------------------------------
+  // Replaces the native `title` tooltip on every compact rail row (destinations,
+  // sub-page icons, the footer's System + account rows). Steady hover for
+  // RAIL_HLABEL_DELAY eases a glass chip out from under the bar, vertically
+  // centred on the row; it leaves on mouseleave, on any scroll, on a click, on
+  // Escape, and on every route change. Rendered on <body> (position:fixed) so
+  // #nav's scroll region cannot clip it. Compact rail + desktop tier only — the
+  // expanded rail shows its labels inline and is deliberately untouched.
+  var RAIL_HLABEL_DELAY = 900;
+  var railHLabelEl = null, railHLabelTimer = null, railHLabelRow = null;
+  function railIsCompact() {
+    if (document.documentElement.getAttribute('data-rail') !== 'collapsed') { return false; }
+    return !(window.matchMedia && !window.matchMedia('(min-width: 721px)').matches);
+  }
+  function ensureRailHLabel() {
+    if (railHLabelEl && railHLabelEl.isConnected) { return railHLabelEl; }
+    railHLabelEl = el('div', { 'class': 'rail-hlabel', id: 'railHoverLabel', 'aria-hidden': 'true' });
+    railHLabelEl.hidden = true;
+    document.body.appendChild(railHLabelEl);
+    return railHLabelEl;
+  }
+  function hideRailHLabel() {
+    if (railHLabelTimer) { clearTimeout(railHLabelTimer); railHLabelTimer = null; }
+    railHLabelRow = null;
+    if (railHLabelEl) { railHLabelEl.classList.remove('is-out'); railHLabelEl.hidden = true; }
+  }
+  function showRailHLabel(row) {
+    var text = row.getAttribute('data-hlabel') || row.getAttribute('aria-label') || '';
+    if (!text) { return; }
+    var rail = document.querySelector('.rail');
+    if (!rail) { return; }
+    var lab = ensureRailHLabel();
+    lab.textContent = text;
+    lab.hidden = false;
+    lab.classList.remove('is-out');
+    var rr = row.getBoundingClientRect(), br = rail.getBoundingClientRect();
+    // Tucked 10px INSIDE the rail's right edge: that overlap is what the chip
+    // slides out of (the rail paints over it — see the .rail z-index rule).
+    lab.style.left = Math.round(br.right - 10) + 'px';
+    lab.style.top = Math.round(rr.top + rr.height / 2) + 'px';
+    void lab.offsetWidth;   // reflow so the transition has a start value to ease FROM
+    lab.classList.add('is-out');
+  }
+  function railHLabelOver(e) {
+    var row = (e.target && e.target.closest) ? e.target.closest('[data-hlabel]') : null;
+    if (!row || !railIsCompact()) { if (railHLabelRow) { hideRailHLabel(); } return; }
+    if (row === railHLabelRow) { return; }
+    hideRailHLabel();
+    railHLabelRow = row;
+    railHLabelTimer = setTimeout(function () {
+      railHLabelTimer = null;
+      if (railHLabelRow === row && row.isConnected && railIsCompact()) { showRailHLabel(row); }
+    }, RAIL_HLABEL_DELAY);
+  }
+  function initRailHoverLabels() {
+    var rail = document.querySelector('.rail');
+    if (!rail) { return; }
+    rail.addEventListener('mouseover', railHLabelOver);
+    rail.addEventListener('mouseleave', hideRailHLabel);
+    rail.addEventListener('click', hideRailHLabel);
+    // Any scroll — the rail's own #nav region or the page — invalidates the
+    // fixed position, so the chip leaves rather than floating detached.
+    window.addEventListener('scroll', hideRailHLabel, true);
+    window.addEventListener('resize', hideRailHLabel);
+    window.addEventListener('blur', hideRailHLabel);
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') { hideRailHLabel(); } });
+  }
+
   // Build a destination's group: the dest button + its (initially closed) sub-list.
   function buildNavGroup(nav, btn, key, items) {
     var group = el('div', { 'class': 'nav-group', 'data-group': key });
     group.appendChild(btn);
-    var sub = el('div', { 'class': 'nav-sub', role: 'group', 'aria-label': (btn.getAttribute('title') || key) + ' pages' });
+    var sub = el('div', { 'class': 'nav-sub', role: 'group', 'aria-label': (btn.getAttribute('aria-label') || btn.getAttribute('data-hlabel') || key) + ' pages' });
     var inner = el('div', { 'class': 'nav-sub-inner' });
     sub.appendChild(inner);
     var rows = {};
@@ -4467,12 +4601,16 @@
       // sections (the footer group's System pages vs account actions). Never a
       // button, so it never enters the keyboard walk.
       if (it.sep) { inner.appendChild(el('div', { 'class': 'nav-sub-sep', 'aria-hidden': 'true' })); return; }
-      // M22 — title + aria-label carry the page name because the COMPACT rail
-      // renders this row as an icon-only square: the tooltip is its only text.
+      // M22 — the page name rides on the row because the COMPACT rail renders it
+      // as an icon-only square with no visible label.
+      // M24 — the native `title` is GONE: it drew an uncontrolled white OS
+      // tooltip that fought the new glass hover label. `aria-label` keeps the
+      // accessible name (unchanged for screen readers) and `data-hlabel` is what
+      // the hover label reads. The expanded rail still shows .label inline.
       var row = el('button', {
         'class': 'nav-subitem', type: 'button', 'data-subpage': it.key,
         'aria-current': it.current ? 'page' : 'false',
-        title: it.title, 'aria-label': it.title
+        'aria-label': it.title, 'data-hlabel': it.title
       });
       if (it.icon) { row.appendChild(el('span', { 'class': 'ic', 'aria-hidden': 'true', html: it.icon })); }
       row.appendChild(el('span', { 'class': 'label', text: it.title }));
@@ -4587,7 +4725,9 @@
       if (!destVisible(item)) { continue; }   // capability-gated dest not granted by the runtime plan
       var btn = el('button', {
         'class': 'nav-item', type: 'button', 'data-dest': item.id, 'aria-current': 'false',
-        title: item.label   // tooltip — the only label shown when the rail is collapsed
+        // M24 — no native `title`: the compact rail's name comes from the glass
+        // hover label (data-hlabel), the accessible name from aria-label.
+        'aria-label': item.label, 'data-hlabel': item.label
       });
       btn.innerHTML = ICONS[item.icon] || '';   // inline SVG glyph
       btn.appendChild(el('span', { 'class': 'label', text: item.label }));
@@ -5067,7 +5207,7 @@
     RAIL_MODE = 'ws';
     var activeDest = wsDestOfPage(ws, activePageUid);
     (ws.dests || []).forEach(function (d) {
-      var btn = el('button', { 'class': 'nav-item', type: 'button', 'data-wsdest': d.id, 'aria-current': (activeDest && activeDest.id === d.id) ? 'page' : 'false', title: d.label });
+      var btn = el('button', { 'class': 'nav-item', type: 'button', 'data-wsdest': d.id, 'aria-current': (activeDest && activeDest.id === d.id) ? 'page' : 'false', 'aria-label': d.label, 'data-hlabel': d.label });
       btn.innerHTML = ICONS[d.icon] || ICONS.work || '';
       btn.appendChild(el('span', { 'class': 'label', text: d.label }));
       var items = workspaceGroupItems(ws, d);
@@ -5188,6 +5328,7 @@
     resetRingsTopbar();   // M16a: normalise the topbar heading before any branch paints
     if (typeof closeWsSwitchPop === 'function') { closeWsSwitchPop(); }
     if (typeof closeRailOpsPop === 'function') { closeRailOpsPop(); }
+    if (typeof hideRailHLabel === 'function') { hideRailHLabel(); }   // M24 — the hover label never survives a route change
     // M23 — no account pop-out to close: the badge's group is an accordion, and
     // syncRailAccordion (called from every render path) owns its open/closed state.
     var contentEl0 = document.getElementById('content'); if (contentEl0) { contentEl0.classList.remove('settings-page'); }
@@ -5373,6 +5514,7 @@
     applyTheme(readTheme());
     initAcctMenu();            // M23 — the badge is the footer accordion's trigger (System pages + Studio · Language · Log out)
     initRail();       // collapsible rail (persisted, desktop-only)
+    initRailHoverLabels();     // M24 — glass hover labels replace the native title tooltips on the compact rail
     setTopChips();    // paint the DEMO chip (+ any cached facts) immediately
     // Phone tier: build the tab bar + sheet, place the passport/theme chrome for
     // the current breakpoint, and keep it in sync as the viewport crosses 720px.

@@ -826,15 +826,151 @@
     ];
     return sec;
   }
-  // cx-usage gets a full-width trend card too (item 5). Same posture as the cost
-  // trend: demo fixture when demo mode is on, else an honest empty state.
-  function usageTrend() {
-    return { h: 'Call volume over time', wide: true, controls: [
-      { t: 'chart', title: 'Tokens in / period', sub: 'aggregate call volume', demoKey: 'usageSeries', fmt: 'compact', range: 'week',
-        hint: '/v1/observations/aggregate has no bucketed series yet — enable demo mode (?demo=1) to preview' }
-    ] };
+  // ---- M24: "Average Token Usage", made live ------------------------------
+  // FINDING (operator round 13): this page was STATIC. Every number on it was a
+  // literal in STATIC['cx-usage'] — "~83k in · 11k out", "517k in · 67k out ·
+  // 75 turns", "2.22M in · 288k out · 13 sessions" — and the "Savings vs
+  // standard session" card asserted a −31% saving against an invented 750k/wk
+  // baseline. Its declared feed, /v1/observations/aggregate, was named in the
+  // strapline but never called; the page actually loaded
+  // /v1/console/engine/summary (mediation status, unrelated to token usage,
+  // and "engine mediation not configured" on a plain daemon), and its trend
+  // chart was a demo fixture.
+  //
+  // A real feed DOES exist: /v1/cost/report — the same posted session cost
+  // reports the Token Burn lens renders, carrying context_tokens,
+  // output_tokens, assistant_turns and a session window each. The page is now
+  // computed from those rows and nothing else.
+  //
+  // Deliberately NOT carried over: the savings card. The daemon measures no
+  // counterfactual "standard session", so any savings figure would be invented.
+  // It is replaced by a card that states that in as many words.
+  function usageSessions(res) {
+    var d = res && res.ok && res.data ? res.data : null;
+    return (d && Array.isArray(d.sessions)) ? d.sessions : [];
   }
-  function buildUsageEngine(res) { return STATIC['cx-usage'].concat([usageTrend(), engineMediatedSection(res)]); }
+  function usageNum(n) {
+    if (typeof n !== 'number' || !isFinite(n)) { return '—'; }
+    if (Math.abs(n) >= 1e6) { return (n / 1e6).toFixed(1) + 'M'; }
+    if (Math.abs(n) >= 1e3) { return (n / 1e3).toFixed(1) + 'k'; }
+    return String(Math.round(n));
+  }
+  function usageWhen(s) {
+    var t = Date.parse(s.ended_at || s.started_at || s.received_at || s.generated_at || '');
+    return isFinite(t) ? t : null;
+  }
+  function usageAgg(rows) {
+    // ctxOnTurns / outOnTurns accumulate ONLY over reports that carry a turn
+    // count, so the per-turn average divides like by like — folding the
+    // turn-less reports' tokens into the numerator would deflate it silently.
+    var a = { n: rows.length, ctx: 0, out: 0, turns: 0, turnRows: 0, ctxOnTurns: 0, outOnTurns: 0, first: null, last: null, totals: [], outs: [] };
+    rows.forEach(function (s) {
+      var c = Number(s.context_tokens) || 0, o = Number(s.output_tokens) || 0, t = Number(s.assistant_turns) || 0;
+      a.ctx += c; a.out += o;
+      if (t > 0) { a.turns += t; a.turnRows++; a.ctxOnTurns += c; a.outOnTurns += o; }
+      a.totals.push(c + o); a.outs.push(o);
+      var w = usageWhen(s);
+      if (w != null) { if (a.first == null || w < a.first) { a.first = w; } if (a.last == null || w > a.last) { a.last = w; } }
+    });
+    a.totals.sort(function (x, y) { return x - y; });
+    a.outs.sort(function (x, y) { return x - y; });
+    return a;
+  }
+  function usageSince(rows, days) {
+    var cut = Date.now() - days * 86400000;
+    return rows.filter(function (s) { var w = usageWhen(s); return w != null && w >= cut; });
+  }
+  function usagePeriodLine(rows) {
+    if (!rows.length) { return 'no reports in this window'; }
+    var a = usageAgg(rows);
+    return usageNum(a.ctx) + ' in · ' + usageNum(a.out) + ' out · '
+      + (a.turnRows ? (a.turns + ' turns · ') : 'turns unavailable · ')
+      + a.n + ' session' + (a.n === 1 ? '' : 's');
+  }
+  // Per-day / per-week / per-month output-token buckets over the session
+  // windows — a REAL series, so the trend card stops needing a demo fixture.
+  function usageSeriesFrom(rows) {
+    function bucket(spanMs, count) {
+      var now = Date.now(), out = new Array(count).fill(0), any = false;
+      rows.forEach(function (s) {
+        var w = usageWhen(s); if (w == null) { return; }
+        var i = count - 1 - Math.floor((now - w) / spanMs);
+        if (i >= 0 && i < count) { out[i] += (Number(s.output_tokens) || 0); any = true; }
+      });
+      return any ? out : [];
+    }
+    return { day: bucket(86400000, 14), week: bucket(7 * 86400000, 12), month: bucket(30 * 86400000, 12) };
+  }
+  // A bar on the SAME fixed 2,000,000-token scale (and the same gradient ramp)
+  // the Token Burn lens uses, so a bar length/colour means one thing console-wide.
+  //
+  // These bars measure OUTPUT tokens, matching the Token Burn CHART exactly —
+  // measured, not chosen for looks: on the review corpus context is 99% of all
+  // tokens, so context+output per session runs 3.2M (median) to 613M (max) and
+  // every such bar pins at the 2M ceiling, conveying nothing. Output per session
+  // spans 0 → 1.4M and never reaches the ceiling, so the same scale that is
+  // saturated for totals discriminates cleanly for output. Context is not
+  // dropped — it is stated as a share, in numbers, in the row beneath.
+  var USAGE_BAR_MAX = 2000000;
+  function usageBar(label, tokens) {
+    return { t: 'bar', label: label, ramp: true,
+      pct: Math.max(0, Math.min(100, (tokens / USAGE_BAR_MAX) * 100)),
+      v: usageNum(tokens) + (tokens > USAGE_BAR_MAX ? ' · over 2M' : ' / 2M') };
+  }
+  function buildUsageLive(res) {
+    var rows = usageSessions(res);
+    if (!res || !res.ok) {
+      return [{ h: 'Measured usage', wide: true, controls: [
+        info('feed', '/v1/cost/report'),
+        info('status', res && res.status === 404
+          ? 'cost lens off — set CORECRUXD_FEATURE_COST_LENS=1 on the daemon'
+          : ('unavailable — ' + (res && res.status === 0 ? 'daemon unreachable' : 'HTTP ' + (res && res.status)))),
+        info('note', 'This page shows measured numbers only; with no feed it shows none.')
+      ] }];
+    }
+    if (!rows.length) {
+      return [{ h: 'Measured usage', wide: true, controls: [
+        info('feed', '/v1/cost/report — reachable, empty'),
+        info('producer', 'corecruxctl session cost --post (parses a local Claude Code transcript and posts the report)'),
+        info('note', 'No session cost reports have been posted for this tenant, so there are no averages to compute. Nothing here is estimated.')
+      ] }];
+    }
+    var all = usageAgg(rows), d7 = usageSince(rows, 7), d30 = usageSince(rows, 30);
+    var spanDays = (all.first != null && all.last != null) ? Math.max(1, Math.round((all.last - all.first) / 86400000)) : null;
+    var medOut = all.outs.length ? all.outs[Math.floor(all.outs.length / 2)] : 0;
+    var meanOut = all.n ? all.out / all.n : 0;
+    var maxOut = all.outs.length ? all.outs[all.outs.length - 1] : 0;
+    var medTot = all.totals.length ? all.totals[Math.floor(all.totals.length / 2)] : 0;
+    return [
+      { h: 'Measured usage', sub: 'computed from posted session cost reports · /v1/cost/report', wide: true, controls: [
+        info('reports counted', all.n + ' session' + (all.n === 1 ? '' : 's') + (spanDays ? (' over ' + spanDays + ' day' + (spanDays === 1 ? '' : 's')) : '')),
+        info('last 7 days', usagePeriodLine(d7)),
+        info('last 30 days', usagePeriodLine(d30)),
+        info('all reports', usagePeriodLine(rows)),
+        info('daily average', spanDays ? (usageNum(all.ctx / spanDays) + ' in · ' + usageNum(all.out / spanDays) + ' out per day') : '—'),
+        info('average per session', usageNum(all.ctx / all.n) + ' in · ' + usageNum(all.out / all.n) + ' out'),
+        info('average per turn', all.turnRows
+          ? (usageNum(all.ctxOnTurns / all.turns) + ' in · ' + usageNum(all.outOnTurns / all.turns) + ' out  (over ' + all.turns + ' assistant turns in ' + all.turnRows + ' of ' + all.n + ' reports — turn-less reports are excluded from this average, not counted as zero)')
+          : 'turns unavailable — no report in this set carries an assistant_turns count')
+      ] },
+      { h: 'Output per session on the token-burn scale', sub: 'same fixed 2,000,000-token ceiling and gradient as the Token Burn chart', wide: true, controls: [
+        usageBar('median session', medOut),
+        usageBar('mean session', meanOut),
+        usageBar('largest session', maxOut),
+        info('context share', all.ctx + all.out ? (Math.round(100 * all.ctx / (all.ctx + all.out)) + '% of all measured tokens are context, ' + Math.round(100 * all.out / (all.ctx + all.out)) + '% output') : '—'),
+        info('why output', 'These bars measure OUTPUT because context dominates: the median session carries ' + usageNum(medTot) + ' context+output tokens, so a context+output bar would sit at the 2M ceiling for most sessions and say nothing. Output shares the same scale as the Token Burn chart and stays under it.')
+      ] },
+      { h: 'Output tokens over time', wide: true, controls: [
+        { t: 'chart', title: 'Output tokens / period', sub: 'bucketed from the session windows in /v1/cost/report', fmt: 'compact', range: 'week',
+          series: usageSeriesFrom(rows),
+          hint: 'no session in this set carries a usable window timestamp' }
+      ] },
+      { h: 'Savings', wide: true, controls: [
+        info('measured saving', 'none — the daemon records no counterfactual'),
+        info('why', 'A "saved vs a standard session" figure needs a baseline run of the same work WITHOUT the daemon. Nothing measures that, so this page states no percentage. Per-session, actionable reductions are computed from real numbers on Token Burn (Session) → "how to cut it".')
+      ] }
+    ];
+  }
   function buildMediationEngine(res) { return STATIC['cx-mediation'].concat([engineMediatedSection(res)]); }
 
   // =======================================================================
@@ -1032,22 +1168,12 @@
           info('note', 'the full receipt-cross-walked activity log is the Work › Activity surface in this console — no separate page')
         ] }
     ],
-    'cx-usage': [
-      { h: 'Periods', sub: 'derived from save_session / pre-compact hooks · /v1/observations/aggregate', wide: true,
-        controls: [
-          { t: 'select', k: 'win', label: 'window', options: ['7d', '30d', '90d'], v: '7d' },
-          { t: 'search', ph: 'Filter sessions / plans…' },
-          info('daily avg', '~83k in · 11k out'),
-          info('this week', '517k in · 67k out · 75 turns'),
-          info('this month', '2.22M in · 288k out · 13 sessions')
-        ] },
-      { h: 'Savings vs standard session', sub: 'estimate — boot banner + injected facts replace context re-reads', wide: true,
-        controls: [
-          { t: 'bar', label: 'standard session (est.)', pct: 100, v: '750k in/wk', tone: 'err' },
-          { t: 'bar', label: 'with Crux Daemon', pct: 69, v: '517k in/wk', tone: 'ok' },
-          info('saved', '≈233k in tokens/week · −31%')
-        ] }
-    ],
+    // M24 — STATIC['cx-usage'] is DELETED, not edited. `page()` uses a STATIC
+    // entry as the pre-load skeleton, so those literal "~83k in · 11k out" /
+    // "−31% saved" figures painted first on every visit and were the page most
+    // operators saw. cx-usage now has no static sections at all: its first paint
+    // is the generic loading skeleton, and every number it shows afterwards is
+    // computed by buildUsageLive from /v1/cost/report.
     'cx-documents': [
       { h: 'Tenants & documents', sub: '/v1/console/tenants · click a tenant to expand its documents', wide: true,
         controls: [
@@ -1257,7 +1383,9 @@
     'cx-mediation': page('cx-mediation', 'trust', 'Mediation', 'the gateway plane — identity, capability ladder, foresight', { load: { endpoint: '/v1/console/engine/summary', build: buildMediationEngine } }),
     // ---- Meters ----------------------------------------------------------
     'cx-cost': page('cx-cost', 'meters', 'Token Burn (Session)', 'ground-truth cost lens — what each session cost + how to cut it', { load: { endpoint: '/v1/cost/report?tenant_id=default&token_budget=4000', build: buildCost } }),
-    'cx-usage': page('cx-usage', 'meters', 'Average Token Usage', 'aggregate call volume and spend · /v1/observations/aggregate', { load: { endpoint: '/v1/console/engine/summary', build: buildUsageEngine } }),
+    // M24 — was static/demo (see buildUsageLive). Now computed from the same
+    // posted session cost reports the Token Burn lens renders.
+    'cx-usage': page('cx-usage', 'meters', 'Average Token Usage', 'measured per-period and per-turn averages · /v1/cost/report', { load: { endpoint: '/v1/cost/report?tenant_id=default&token_budget=4000', build: buildUsageLive } }),
     // ---- System ----------------------------------------------------------
     'cx-settings': page('cx-settings', 'system', 'Settings', 'daemon configuration and console preferences', { load: { endpoint: '/v1/console/settings', build: buildSettings } }),
     'cx-integrations': page('cx-integrations', 'system', 'Integrations', 'installed packs and their grants', { load: { endpoint: '/v1/console/integrations', build: buildIntegrations } }),
@@ -1499,7 +1627,9 @@
     'cx-cost':          { legacy: { select: 1, info: 1 }, v2_present: ['live /v1/cost/report', 'D/W/M chart', 'window select'], v2_missing_read: [], v2_gated_write: [] },
     'cx-projects':      { legacy: { search: 1, btn: 8, exp: 1, select: 6, toggle: 8, input: 5, info: 1 }, v2_present: ['live /v1/projects', 'repo grid', 'search', 'disclosure'], v2_missing_read: ['per-repo role/plane display selects'], v2_gated_write: ['Create project', 'Add repo', 'Set as planning repo'] },
     'cx-work':          { legacy: { projection: 'kanban' }, v2_present: ['live /v1/work?source=all', 'state strips', 'graph link'], v2_missing_read: [], v2_gated_write: [] },
-    'cx-usage':         { legacy: { select: 1, search: 1, info: 7, bar: 12, exp: 10 }, v2_present: ['window select', 'search', 'info rows', 'savings bars', 'D/W/M chart'], v2_missing_read: [], v2_gated_write: [] },
+    // M24 — the mocked "window select / search / savings bars" are gone with the
+    // static page; what replaced them is measured, so the manifest says so.
+    'cx-usage':         { legacy: { select: 1, search: 1, info: 7, bar: 12, exp: 10 }, v2_present: ['live /v1/cost/report', 'measured period + per-turn averages', '2M-scale session-size bars', 'real D/W/M output series'], v2_missing_read: ['window select (the periods are computed and shown together)', 'savings estimate (no counterfactual is measured — stated on the page)'], v2_gated_write: [] },
     'cx-documents':     { legacy: { search: 1, exp: 3, info: 9, btn: 5, input: 2, select: 2, toggle: 3 }, v2_present: ['live /v1/console/tenants', 'search', 'ingest inputs/selects (read)'], v2_missing_read: ['per-tenant chunk/doc counts display'], v2_gated_write: ['Queue ingest', 'Scan path'] },
     'cx-gates':         { legacy: { search: 1, exp: 2, info: 3, btn: 5 }, v2_present: ['live /v1/work/gate/pending', 'search', 'approve/reject (operator-gated, wired)'], v2_missing_read: [], v2_gated_write: ['Withhold all'] },
     'cx-review':        { legacy: { search: 1, info: 3, btn: 6, input: 6, textarea: 3, select: 2, toggle: 1 }, v2_present: ['live /v1/console/review/contradictions', 'search'], v2_missing_read: ['side-by-side contradiction display rows'], v2_gated_write: ['Consolidate facts'] },

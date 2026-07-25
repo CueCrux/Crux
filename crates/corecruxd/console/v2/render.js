@@ -1225,8 +1225,13 @@
       }
       case 'bar': {
         var pct = Math.max(0, Math.min(100, Number(control.pct) || 0));
-        var track = el('div', { 'class': 'ctl-bar-track' }, [el('div', { 'class': 'ctl-bar-fill' + (control.tone ? ' ' + control.tone : '') })]);
+        // M24 — `ramp: true` opts a declarative bar into the SAME magnitude
+        // gradient the cost lens paints (ok → trust → warn → crit sized to the
+        // whole track), so a colour means one token count console-wide. Used by
+        // cx-usage, whose bars sit on the same fixed 2M scale as cx-cost's.
+        var track = el('div', { 'class': 'ctl-bar-track' }, [el('div', { 'class': 'ctl-bar-fill' + (control.ramp ? ' ramp' : '') + (control.tone ? ' ' + control.tone : '') })]);
         track.firstChild.style.width = pct + '%';
+        if (control.ramp && pct > 0.6) { track.firstChild.style.backgroundSize = (10000 / pct) + '% 100%'; }
         node = el('div', { 'class': 'ctl-bar' }, [
           el('div', { 'class': 'ctl-bar-head' }, [el('span', { text: control.label || '' }), el('span', { 'class': 'ctl-bar-val', text: control.v != null ? String(control.v) : '' })]),
           track
@@ -10078,7 +10083,141 @@
       return wrap;
     }
 
-    var state = { all: [], plans: {}, meta: {}, metaCount: 0, q: '', passport: '', plan: '', minBurn: 0, from: '', to: '', loading: false, token: 0 };
+    // ---- M24: tokens-per-turn, and advice computed from it -----------------
+    // MAGNITUDE vs RATE. The bar answers "which sessions cost the most" — it
+    // finds the big spenders. Tokens-per-turn answers a different question:
+    // "which sessions are INEFFICIENT" — a short session with 400k context per
+    // turn is burning more per unit of work than a long one at 40k, and the bar
+    // will never say so because its total is small. Both ship: the bar ranks,
+    // the per-turn chips diagnose, and the sort switches between the two views.
+    //
+    // Where the numbers come from (verified against the report payload, not
+    // assumed): cost.rs SessionCostRow carries `assistant_turns` and
+    // `context_tokens_per_turn` server-side; output-per-turn is DERIVED here as
+    // output_tokens / assistant_turns. A report with no turn count (3 of 83 on
+    // the review corpus) gets an explicit "turns unavailable" chip and is
+    // excluded from per-turn sorts — never a fabricated 0.
+    function turnsOf(s) { var t = Number(s.assistant_turns); return (isFinite(t) && t > 0) ? t : null; }
+    function outPerTurn(s) { var t = turnsOf(s); return t ? (Number(s.output_tokens) || 0) / t : null; }
+    function ctxPerTurn(s) {
+      var v = Number(s.context_tokens_per_turn);
+      if (isFinite(v) && v > 0) { return v; }           // server-computed (headline)
+      var t = turnsOf(s);
+      return t ? (Number(s.context_tokens) || 0) / t : null;
+    }
+    function ctxRatio(s) {
+      var o = Number(s.output_tokens) || 0;
+      return o > 0 ? (Number(s.context_tokens) || 0) / o : null;
+    }
+
+    // ---- "how to cut it": the page strapline, made real --------------------
+    // Every line below is (a) triggered by a threshold on THIS session's own
+    // numbers and (b) points at a token-reduction feature this daemon actually
+    // ships. Nothing generic, nothing that fires on every row: a session with
+    // nothing notable gets NO advice line (silence is the honest output).
+    //
+    // Grounding for each recommendation:
+    //   token_budget  — mandatory on every retrieval read, enforced server-side
+    //                   (crates/corecruxd/src/http/cost.rs QC.2; same gate on
+    //                   /v1/activity). It caps what a read can return.
+    //   scan → expand — query_scan narrows, query_expand pulls only the hit
+    //                   (crates/crux-mcp/src/oauth.rs tool roster).
+    //   session state — save_session / get_session checkpoint the session so the
+    //                   next turn resumes from a summary instead of replaying
+    //                   the transcript (crates/crux-mcp/src/tools/sessions.rs);
+    //                   the pre-compact hook writes one automatically
+    //                   (crates/crux-claude-hooks/src/cmds/pre_compact.rs).
+    //   fact memory   — store_fact / query_facts keep durable state out of the
+    //                   context window (crates/crux-mcp/src/tools/facts.rs).
+    // No savings PERCENTAGE is claimed anywhere: the daemon measures no
+    // counterfactual, so a number here would be invented.
+    var ADV_CTX_RATIO = 150;        // context : output — above this the session is reading far more than it writes
+    var ADV_CTX_PER_TURN = 200000;  // context tokens carried per assistant turn
+    var ADV_TURNS = 300;            // assistant turns in one session
+    var ADV_OUT_PER_TURN = 2500;    // output tokens per assistant turn
+    var ADV_TOTAL = COST_BAR_MAX;   // ctx + out past the 2M bar ceiling
+    function costAdvice(s) {
+      var out = [];
+      var r = ctxRatio(s), cpt = ctxPerTurn(s), t = turnsOf(s), opt = outPerTurn(s);
+      if (r != null && r >= ADV_CTX_RATIO) {
+        out.push({ tag: 'context-heavy', text: 'reads ' + Math.round(r) + '× more context than it writes — pass token_budget on every retrieval call (the daemon requires it, QC.2) and narrow with query_scan before query_expand instead of pulling whole documents.' });
+      }
+      if (cpt != null && cpt >= ADV_CTX_PER_TURN) {
+        out.push({ tag: 'replay', text: compactN(Math.round(cpt)) + ' context tokens carried per turn — checkpoint with save_session and resume via get_session so the next turn starts from state, not from a replayed transcript (the pre-compact hook already writes one at every compaction).' });
+      }
+      if (t != null && t >= ADV_TURNS) {
+        out.push({ tag: 'long session', text: t + ' assistant turns in one session — split it at milestone boundaries and carry the state forward as facts (store_fact / query_facts) rather than one growing window.' });
+      }
+      if (opt != null && opt >= ADV_OUT_PER_TURN) {
+        out.push({ tag: 'verbose turns', text: compactN(Math.round(opt)) + ' output tokens per turn — write long artefacts (plans, audits, tables) to files and reference the path, so the transcript carries the pointer instead of the document.' });
+      }
+      if (sessTokens(s) > ADV_TOTAL) {
+        out.push({ tag: 'over scale', text: compactN(sessTokens(s)) + ' total tokens, past the 2M bar ceiling — this one session is the budget; it is the first candidate for a split.' });
+      }
+      return out;
+    }
+    function adviceNode(s) {
+      var adv = costAdvice(s);
+      if (!adv.length) { return null; }
+      var wrap = el('div', { 'class': 'cost-advice' });
+      adv.forEach(function (a) {
+        wrap.appendChild(el('div', { 'class': 'cost-advice-row' }, [
+          el('span', { 'class': 'cost-advice-tag', text: a.tag }),
+          el('span', { 'class': 'cost-advice-t', text: a.text })
+        ]));
+      });
+      return wrap;
+    }
+    // The thresholds, stated where the advice appears — a rule you cannot read
+    // is a rule you cannot check.
+    function adviceHelp() {
+      var d = el('details', { 'class': 'cost-help' });
+      d.appendChild(el('summary', { text: 'how to cut it — when each line fires' }));
+      var g = el('div', { 'class': 'facts-kv' });
+      [['context-heavy', 'context ÷ output ≥ ' + ADV_CTX_RATIO],
+       ['replay', 'context per turn ≥ ' + compactN(ADV_CTX_PER_TURN)],
+       ['long session', 'assistant turns ≥ ' + ADV_TURNS],
+       ['verbose turns', 'output per turn ≥ ' + compactN(ADV_OUT_PER_TURN)],
+       ['over scale', 'context + output > ' + compactN(ADV_TOTAL)]
+      ].forEach(function (kv) {
+        g.appendChild(el('span', { 'class': 'facts-kv-k', text: kv[0] }));
+        g.appendChild(el('span', { 'class': 'facts-kv-v', text: kv[1] }));
+      });
+      d.appendChild(g);
+      d.appendChild(el('p', { 'class': 'ctl-desc', text: 'A session that trips none of these gets no advice line. Every recommendation names a feature this daemon ships (token_budget · query_scan/query_expand · save_session/get_session · store_fact/query_facts); no savings percentage is claimed, because the daemon measures no counterfactual to compare against.' }));
+      return d;
+    }
+
+    var COST_SORTS = [
+      ['burn', 'total burn (ctx+out)'],
+      ['out', 'output tokens'],
+      ['outturn', 'output / turn'],
+      ['ctxturn', 'context / turn'],
+      ['ratio', 'context : output'],
+      ['recent', 'most recent']
+    ];
+    function sortVisible(rows, key) {
+      var r = rows.slice();
+      function byDesc(fn) {
+        // Rows with no value for this key sink to the bottom rather than
+        // sorting as zero — "unavailable" is not "cheap".
+        return r.sort(function (a, b) {
+          var va = fn(a), vb = fn(b);
+          if (va == null && vb == null) { return 0; }
+          if (va == null) { return 1; }
+          if (vb == null) { return -1; }
+          return vb - va;
+        });
+      }
+      if (key === 'out') { return byDesc(function (s) { return Number(s.output_tokens) || 0; }); }
+      if (key === 'outturn') { return byDesc(outPerTurn); }
+      if (key === 'ctxturn') { return byDesc(ctxPerTurn); }
+      if (key === 'ratio') { return byDesc(ctxRatio); }
+      if (key === 'recent') { return byDesc(tsOf); }
+      return byDesc(sessTokens);
+    }
+
+    var state = { all: [], plans: {}, meta: {}, metaCount: 0, q: '', passport: '', plan: '', minBurn: 0, from: '', to: '', sort: 'burn', loading: false, token: 0 };
 
     // ---- toolbar (filters) ----
     var searchInput = el('input', { 'class': 'facts-input', type: 'search', placeholder: 'filter id / source / passport / plan…', 'aria-label': 'filter sessions' });
@@ -10087,10 +10226,16 @@
     var minBurnInput = el('input', { 'class': 'facts-input facts-asof', type: 'number', min: '0', step: '1000', placeholder: 'min output tok', 'aria-label': 'minimum output-token burn' });
     var fromInput = el('input', { 'class': 'facts-input facts-asof', type: 'date', 'aria-label': 'from date' });
     var toInput = el('input', { 'class': 'facts-input facts-asof', type: 'date', 'aria-label': 'to date' });
+    // M24 — sort switches between the two readings of the same rows: magnitude
+    // (which sessions cost most) and rate (which sessions are inefficient).
+    var sortSel = el('select', { 'class': 'facts-input', 'aria-label': 'sort sessions' });
+    COST_SORTS.forEach(function (o) { sortSel.appendChild(el('option', { value: o[0] }, [o[1]])); });
+    sortSel.value = 'burn';
     function field(label, node) { return el('label', { 'class': 'facts-field' }, [el('span', { text: label }), node]); }
     var toolbar = el('div', { 'class': 'facts-toolbar' }, [
       field('filter', searchInput), field('passport', passportSel), field('plan', planSel),
-      field('min burn (out)', minBurnInput), field('from', fromInput), field('to', toInput)
+      field('min burn (out)', minBurnInput), field('from', fromInput), field('to', toInput),
+      field('sort', sortSel)
     ]);
     var countLine = el('p', { 'class': 'facts-count' });
     var banner = el('div', { 'class': 'facts-banner' }); banner.style.display = 'none';
@@ -10157,10 +10302,15 @@
         el('span', { 'class': 'facts-time', text: windowLabel(s) })
       ]);
       if (nm.kind !== 'id') { head.appendChild(el('span', { 'class': 'cost-idtag', text: shortId(s.session_id) })); }
+      var turns = turnsOf(s), opt = outPerTurn(s), cpt = ctxPerTurn(s);
       var metaChips = el('div', { 'class': 'sess-rmeta' }, [
         chip('sess-chip', compactN(s.context_tokens || 0) + ' ctx', 'measured context tokens (Σ)'),
         chip('sess-chip cost-out', compactN(s.output_tokens || 0) + ' out', 'output tokens generated (Σ)'),
-        (s.assistant_turns ? chip('sess-chip', s.assistant_turns + ' turns', 'assistant turns') : null),
+        // M24 — the per-turn RATE, first-class next to the magnitude. Derived
+        // from assistant_turns; absent turn counts say so rather than showing 0.
+        (turns ? chip('sess-chip', turns + ' turns', 'assistant turns in this session') : chip('sess-chip cost-na', 'turns unavailable', 'this cost report carries no assistant_turns count — per-turn rates cannot be computed for it')),
+        (cpt != null ? chip('sess-chip cost-rate', compactN(Math.round(cpt)) + ' ctx/turn', 'context tokens carried per assistant turn' + (Number(s.context_tokens_per_turn) > 0 ? ' (server headline)' : ' (derived: context ÷ turns)')) : null),
+        (opt != null ? chip('sess-chip cost-rate', compactN(Math.round(opt)) + ' out/turn', 'output tokens per assistant turn (derived: output ÷ turns)') : null),
         (s.actor_passport && s.actor_passport !== '__anon__') ? chip('sess-chip sess-chip-pass', s.actor_passport, 'poster passport') : null,
         (m && m.actor) ? chip('sess-chip sess-chip-pass', m.actor, 'identity stamped on the saved session at write time') : null
       ].concat(planChips(s)));
@@ -10170,7 +10320,11 @@
         : (nm.kind === 'id' ? ((s.source || '(no source)') + '  ' + COST_UNTITLED_HINT) : (s.source || '(no source)'));
       var sub = el('div', { 'class': 'facts-val' + ((m && m.state_summary) ? ' cost-summary' : ''), text: subText });
       var detail = el('div', { 'class': 'facts-detail' });
-      var row = el('div', { 'class': 'facts-row', role: 'button', tabindex: '0' }, [head, sub, costBar(sessTokens(s)), metaChips, detail]);
+      var kids = [head, sub, costBar(sessTokens(s)), metaChips];
+      var adv = adviceNode(s);
+      if (adv) { kids.push(adv); }   // silent when this session trips no threshold
+      kids.push(detail);
+      var row = el('div', { 'class': 'facts-row' + (adv ? ' has-advice' : ''), role: 'button', tabindex: '0' }, kids);
       var opened = false;
       function toggle() { var o = row.classList.toggle('open'); if (o && !opened) { opened = true; expandDetail(detail, s); } }
       row.addEventListener('click', function (e) { if (e.target && e.target.closest && (e.target.closest('a') || e.target.closest('.facts-detail'))) { return; } toggle(); });
@@ -10205,8 +10359,18 @@
         ['total tokens (ctx+out)', compactN(sessTokens(s)) + '  (' + sessTokens(s) + ')  ·  bar scale 2,000,000'],
         ['context tokens (Σ)', compactN(s.context_tokens || 0) + '  (' + (s.context_tokens || 0) + ')'],
         ['output tokens (Σ)', compactN(s.output_tokens || 0) + '  (' + (s.output_tokens || 0) + ')'],
-        ['context / turn', compactN(s.context_tokens_per_turn || 0)], ['assistant turns', s.assistant_turns]
+        ['assistant turns', turnsOf(s) != null ? String(turnsOf(s)) : 'unavailable — this report carries no turn count'],
+        ['context / turn', ctxPerTurn(s) != null ? (compactN(Math.round(ctxPerTurn(s))) + '  (' + Math.round(ctxPerTurn(s)) + ')') : '—'],
+        ['output / turn', outPerTurn(s) != null ? (compactN(Math.round(outPerTurn(s))) + '  (' + Math.round(outPerTurn(s)) + ')') : '—'],
+        ['context : output', ctxRatio(s) != null ? (Math.round(ctxRatio(s)) + ' : 1') : '—']
       ]));
+      // M24 — the same advice as the row, restated where the numbers behind it
+      // are visible, plus the thresholds that produced it.
+      detail.appendChild(sectionLabel('how to cut it'));
+      var dAdv = adviceNode(s);
+      if (dAdv) { detail.appendChild(dAdv); }
+      else { detail.appendChild(el('p', { 'class': 'ctl-desc sess-empty', text: 'Nothing notable — this session trips none of the token-reduction thresholds, so there is no advice to give.' })); }
+      detail.appendChild(adviceHelp());
       detail.appendChild(sectionLabel('linked ExecPlan'));
       if (isLinked(s)) {
         var list = el('div', { 'class': 'facts-kv' });
@@ -10223,19 +10387,32 @@
       detail.appendChild(el('p', { 'class': 'ctl-desc', text: 'attribution recomputed read-time in cost_attribution.rs; passport = poster identity (' + (s.actor_passport || '__anon__') + ').' }));
     }
 
+    // M24 — ONE visual language for token magnitude. The chart used to draw its
+    // own flat var(--acc) bar rescaled to the top-10 max, sitting a few pixels
+    // above rows whose bars were gradient-on-a-fixed-2M-scale: the same length
+    // meant two different things on one screen.
+    //
+    // It now calls the SAME costBar() as the rows — same track, same gradient,
+    // same 8px height, same fixed 2,000,000-token ceiling. Fixed scale beat
+    // proportional-to-max on the deciding argument: a proportional chart would
+    // stretch the top session to 100% of the track and put a bar of that length
+    // directly above a row bar of the same length meaning 2M — i.e. it would
+    // reintroduce the exact inconsistency being removed. Rank order is carried
+    // by the sort, not by the scale, so the top-10 comparison still reads (on
+    // the review corpus the ten bars span 71% → 30% of the track).
+    //
+    // Labels use the cx-sessions naming chain (title → first line → short id),
+    // not a raw UUID.
     function renderChart(visible) {
       chartWrap.textContent = '';
       var top = visible.slice().sort(function (a, b) { return (b.output_tokens || 0) - (a.output_tokens || 0); }).slice(0, 10);
       if (!top.length || (top[0].output_tokens || 0) <= 0) { return; }
-      chartWrap.appendChild(el('div', { 'class': 'cost-chart-title', text: 'Top sessions by output tokens' }));
-      var max = top[0].output_tokens || 1;
+      chartWrap.appendChild(el('div', { 'class': 'cost-chart-title', text: 'Top sessions by output tokens · same fixed 2M scale as the rows' }));
       top.forEach(function (s) {
-        var pct = Math.max(2, Math.round(100 * (s.output_tokens || 0) / max));
-        var fill = el('div', { 'class': 'cost-bar-fill' }); fill.style.width = pct + '%';
+        var nm = sessName(s);
         chartWrap.appendChild(el('div', { 'class': 'cost-bar' }, [
-          el('div', { 'class': 'cost-bar-label', title: s.session_id || '', text: shortId(s.session_id) }),
-          el('div', { 'class': 'cost-bar-track' }, [fill]),
-          el('div', { 'class': 'cost-bar-val', text: compactN(s.output_tokens || 0) })
+          el('div', { 'class': 'cost-bar-label' + (nm.kind === 'id' ? ' is-untitled' : ''), text: nm.text }),
+          costBar(s.output_tokens || 0)
         ]));
       });
     }
@@ -10279,18 +10456,20 @@
       state.plan = planSel.value || '';
       state.minBurn = Math.max(0, parseInt(minBurnInput.value, 10) || 0);
       state.from = fromInput.value || ''; state.to = toInput.value || '';
+      state.sort = sortSel.value || 'burn';
       if (!state.all.length) { emptyState(); return; }
-      var visible = state.all.filter(matches);
+      var visible = sortVisible(state.all.filter(matches), state.sort);
       renderChart(visible); renderTotals(visible);
       listWrap.textContent = '';
       if (!visible.length) { listWrap.appendChild(el('p', { 'class': 'facts-empty ctl-desc', text: 'No sessions match the filters.' })); paintCount(0); return; }
-      // The bar scale, declared once above the rows — every bar below reads
-      // against this same fixed ceiling, so row heights are comparable.
+      // The bar scale, declared once above the rows — every bar below (and every
+      // bar in the chart above) reads against this same fixed ceiling.
       listWrap.appendChild(el('div', { 'class': 'cost-scale' }, [
         el('span', { 'class': 'cost-scale-k', text: 'TOKEN BAR' }),
         el('span', { 'class': 'cost-scale-ramp', 'aria-hidden': 'true' }),
-        el('span', { 'class': 'cost-scale-v', text: '0 → 2,000,000 tokens (ctx + out) · fixed scale · over-scale sessions clamp and are marked' })
+        el('span', { 'class': 'cost-scale-v', text: '0 → 2,000,000 tokens · fixed scale, chart and rows alike · over-scale sessions clamp and are marked' })
       ]));
+      listWrap.appendChild(adviceHelp());
       visible.forEach(function (s) { listWrap.appendChild(rowEl(s)); });
       paintCount(visible.length);
     }
@@ -10344,7 +10523,7 @@
       });
     }
     [searchInput, minBurnInput].forEach(function (n) { n.addEventListener('input', paint); });
-    [passportSel, planSel, fromInput, toInput].forEach(function (n) { n.addEventListener('change', paint); });
+    [passportSel, planSel, fromInput, toInput, sortSel].forEach(function (n) { n.addEventListener('change', paint); });
     load();
   }
 
@@ -11871,6 +12050,19 @@
       return { a: a, r: r, x: Math.cos(a) * r, y: Math.sin(a) * r };
     }
     function dotR(c) { return (c.real ? 3.4 + (c.tokens || 200) / 260 : c.kind === 'gate' ? 3.2 : 2.6); }
+    // M24 — DOT SIZE vs ZOOM. The canvas draws in world units scaled by Z, so a
+    // dot's on-screen radius was dotR·Z: zooming in magnified the dots at
+    // exactly the rate it magnified the gaps between them, and a dense cluster
+    // stayed one blob however far you zoomed. Damping the world radius by
+    // Z^ZOOM_DOT_K makes the screen radius grow as Z^(1-K) while the spacing
+    // still grows as Z — so the gaps open up and the cluster resolves.
+    //   Z ≤ 1 (overview and further out): factor is exactly 1, sizes unchanged.
+    //   Z = 3:  ×0.51   Z = 7 (max zoom): ×0.31, floored at ZOOM_DOT_MIN so a
+    //   dot never shrinks below a comfortably clickable ~2px on screen.
+    // Pure arithmetic on a value the loop already holds — no extra state, no
+    // per-dot allocation, and it does not touch the hue-batched draw order.
+    var ZOOM_DOT_K = 0.6, ZOOM_DOT_MIN = 0.28;
+    function zoomDotScale() { return Z <= 1 ? 1 : Math.max(ZOOM_DOT_MIN, 1 / Math.pow(Z, ZOOM_DOT_K)); }
 
     // ---- main draw loop ----
     var drawMsEMA = 0;   // exponential moving average of draw-loop cost (ms)
@@ -11896,6 +12088,7 @@
       if (lens === 'data') { stepDataFocus(dt); }
       updateRadLo();
       var g = geom();
+      var zdot = zoomDotScale();   // M24 — one value per frame, read by every dot below
       ctx.clearRect(0, 0, W, H);
       ctx.save();
       ctx.translate(g.cx + panX, g.cy + panY);
@@ -11973,7 +12166,7 @@
             var isSel = (hover === c || pinned === c);
             var age = T - c.day;
             var pop = REDUCED ? 1 : Math.min(1, age / 0.8);
-            var rr = dotR(c) * (isSel ? 1.7 : 1) * (0.4 + 0.6 * pop);
+            var rr = dotR(c) * zdot * (isSel ? 1.7 : 1) * (0.4 + 0.6 * pop);
             if (mode === 'bars') {
               ctx.strokeStyle = hex2rgba(chue, (0.34 + (c.real ? 0.3 : 0)) * al * pop);
               ctx.lineWidth = (isSel ? 3.6 : 2.6) / Math.sqrt(Z);
@@ -12168,6 +12361,8 @@
         window.__ringsFrame = (window.__ringsFrame || 0) + 1;   // stops advancing when the loop pauses
         window.__ringsLens = lens; window.__ringsDataFocus = gFocus; window.__ringsDataFocusK = gFocusK;
         window.__ringsDataSel = gSel; window.__ringsDataConn = gConn ? Object.keys(gConn).length : 0;
+        // M24 — the zoom/dot-size relationship, measurable rather than asserted.
+        window.__ringsZ = Z; window.__ringsDotScale = zdot;
       }
       rafId = null;
       if (visible && !paused && !doc().hidden && cv.isConnected) { rafId = requestAnimationFrame(draw); }
