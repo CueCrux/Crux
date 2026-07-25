@@ -95,6 +95,7 @@ pub const CRUXPACK_RESERVED_PREFIXES: &[&str] = &[
     "__bootstrap__::",
     "__project__::",
     "__tenant_metadata__::",
+    "__sync__::",
     "__memory_pin::",
     "__decisions__::",
     "decisions::",

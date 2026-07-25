@@ -204,6 +204,11 @@ pub enum EntryKind {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NetworkAccess {
+    /// Literal outbound host allowlist for `ExternalTool` endpoints. Entries
+    /// are case-insensitive host names with an optional `:port`; when a port
+    /// is present, it must match the endpoint's effective port. Wildcards,
+    /// URL schemes, and paths are not supported. An empty list retains
+    /// endpoint-pinning only.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
     #[serde(default)]
@@ -233,7 +238,11 @@ impl Default for DataAccess {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SafetyPolicy {
     pub sandbox: SandboxKind,
+    /// For `ExternalTool`, a non-zero value tightens (but never raises) the
+    /// daemon-configured outbound request timeout.
     pub max_runtime_ms: u64,
+    /// For `ExternalTool`, a non-zero value tightens (but never raises) the
+    /// daemon-configured maximum response size.
     pub max_output_bytes: u64,
 }
 
@@ -983,6 +992,87 @@ pub fn disable_pack(
     Ok(grant)
 }
 
+/// Manifests of every pack that is **installed AND enabled by at least one
+/// passport** whose entry kind matches `kind`.
+///
+/// This is the runtime activation predicate for daemon-side entry-kind
+/// runtimes (the file-watcher runtime is the first client). It deliberately
+/// scans grants across *all* passports rather than taking one
+/// `passport_fpr` the way [`library_snapshot`] does: a background daemon job
+/// has no calling passport, and the operator's intent ("this pack may run
+/// here") is expressed by any enabled grant on the node.
+///
+/// A grant can only be written by [`grant_pack`], which first resolves an
+/// installed manifest — so an enabled grant implies installed. The installed
+/// index is still consulted so the returned manifest is the on-disk one
+/// (or the builtin, when the pack ships first-party).
+///
+/// Missing integration root, missing grants directory, or zero grants all
+/// return an empty vector — never an error. Grant files that fail to parse
+/// are skipped rather than failing the whole scan, so one corrupt file cannot
+/// wedge an unrelated runtime.
+pub fn enabled_packs_of_kind(
+    data_dir: impl AsRef<Path>,
+    kind: EntryKind,
+) -> Result<Vec<IntegrationManifest>, IntegrationError> {
+    let root = integration_root(data_dir);
+    let grants_root = root.join("grants");
+    if !grants_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let builtins: BTreeMap<(String, String), IntegrationManifest> = builtin_manifests()
+        .into_iter()
+        .map(|manifest| ((manifest.id.clone(), manifest.version.clone()), manifest))
+        .collect();
+
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut out = Vec::new();
+    for passport_dir in fs::read_dir(&grants_root)? {
+        let passport_dir = passport_dir?;
+        if !passport_dir.file_type()?.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(passport_dir.path())? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file()
+                || entry.path().extension().and_then(|extension| extension.to_str()) != Some("json")
+            {
+                continue;
+            }
+            let Ok(bytes) = fs::read(entry.path()) else {
+                continue;
+            };
+            let Ok(grant) = serde_json::from_slice::<IntegrationGrant>(&bytes) else {
+                continue;
+            };
+            if !grant.enabled {
+                continue;
+            }
+            let key = (grant.pack_id.clone(), grant.version.clone());
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            let manifest = match read_installed_manifest(&root, &grant.pack_id, &grant.version) {
+                Ok(manifest) => manifest,
+                // A first-party builtin that was granted without an on-disk
+                // copy still counts: the manifest is compiled in.
+                Err(IntegrationError::PackNotInstalled { .. }) => match builtins.get(&key) {
+                    Some(manifest) => manifest.clone(),
+                    None => continue,
+                },
+                Err(err) => return Err(err),
+            };
+            if manifest.entry.kind == kind {
+                out.push(manifest);
+            }
+        }
+    }
+
+    out.sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.version.cmp(&b.version)));
+    Ok(out)
+}
+
 pub fn builtin_manifests() -> Vec<IntegrationManifest> {
     vec![
         IntegrationManifest {
@@ -1048,6 +1138,34 @@ pub fn builtin_manifests() -> Vec<IntegrationManifest> {
                 "facts:write".to_string(),
                 "sessions:read".to_string(),
             ],
+            network: NetworkAccess::default(),
+            data_access: DataAccess::default(),
+            safety: SafetyPolicy::default(),
+            hashes: ManifestHashes::default(),
+            signature: None,
+            external_tool_endpoint: None,
+            tools: Vec::new(),
+            wasm_module_path: None,
+            wasm_module_url: None,
+            wasm_module_sha256: None,
+        },
+        IntegrationManifest {
+            schema: INTEGRATION_SCHEMA_V1.to_string(),
+            id: "vault.markdown-watcher".to_string(),
+            name: "Markdown Vault Watcher".to_string(),
+            version: "0.1.0".to_string(),
+            publisher_passport_fpr: FIRST_PARTY_PASSPORT.to_string(),
+            summary: "Poll local Obsidian-shaped markdown vaults and ingest changed notes into the \
+                      local docs corpus. Inert until the operator sets CORECRUXD_VAULT_WATCH_ROOTS \
+                      (colon-separated absolute directories); cadence via \
+                      CORECRUXD_VAULT_WATCH_INTERVAL_SECS (default 300). Both this grant and the \
+                      roots env are required — either alone does nothing."
+                .to_string(),
+            entry: IntegrationEntry {
+                kind: EntryKind::FileWatcher,
+                path: "recipes/watcher/markdown-vault.json".to_string(),
+            },
+            capabilities: vec!["facts:write".to_string(), "facts:read".to_string()],
             network: NetworkAccess::default(),
             data_access: DataAccess::default(),
             safety: SafetyPolicy::default(),
@@ -1321,10 +1439,92 @@ mod tests {
     #[test]
     fn builtin_manifests_validate() -> Result<(), IntegrationError> {
         let packs = builtin_packs()?;
-        // 3 first-party packs ship by default after `github.pr-facts` was
-        // dropped (live GitHub indexer integration covers PR fact capture).
-        assert_eq!(packs.len(), 3);
+        // 4 first-party packs ship by default: 2 MCP configs, the TypeScript
+        // SDK quickstart, and the markdown-vault file watcher. (`github.pr-facts`
+        // was dropped — the live GitHub indexer covers PR fact capture.)
+        assert_eq!(packs.len(), 4);
         assert!(packs.iter().all(|pack| pack.trust_tier == TrustTier::FirstParty));
+        Ok(())
+    }
+
+    /// Install + grant the builtin markdown-vault watcher under `passport`.
+    fn install_and_grant_vault_watcher(root: &Path, passport: &str) -> Result<(), IntegrationError> {
+        let manifest = builtin_manifests()
+            .into_iter()
+            .find(|manifest| manifest.id == "vault.markdown-watcher")
+            .expect("builtin vault watcher manifest");
+        install_pack(
+            root,
+            &manifest,
+            TrustTier::FirstParty,
+            1_000,
+            &ValidationPolicy::default(),
+        )?;
+        grant_pack(
+            root,
+            GrantPackRequest {
+                passport_fpr: passport,
+                granted_by_passport_fpr: "p_operator",
+                pack_id: "vault.markdown-watcher",
+                version: "0.1.0",
+                capabilities: &["facts:write".to_string(), "facts:read".to_string()],
+                reason: None,
+                now_unix_ms: 2_000,
+            },
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn enabled_packs_of_kind_is_empty_without_grants() -> Result<(), IntegrationError> {
+        let tmp = temp_data_dir("watcher-ungranted");
+        let root = tmp.path().to_path_buf();
+        // Installed but never granted → not active.
+        let manifest = builtin_manifests()
+            .into_iter()
+            .find(|manifest| manifest.id == "vault.markdown-watcher")
+            .expect("builtin vault watcher manifest");
+        install_pack(
+            &root,
+            &manifest,
+            TrustTier::FirstParty,
+            1_000,
+            &ValidationPolicy::default(),
+        )?;
+        assert!(enabled_packs_of_kind(&root, EntryKind::FileWatcher)?.is_empty());
+        // Missing integration root entirely → empty, not an error.
+        let empty = temp_data_dir("watcher-nothing");
+        assert!(enabled_packs_of_kind(empty.path(), EntryKind::FileWatcher)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn enabled_packs_of_kind_finds_granted_file_watcher() -> Result<(), IntegrationError> {
+        let tmp = temp_data_dir("watcher-granted");
+        let root = tmp.path().to_path_buf();
+        install_and_grant_vault_watcher(&root, "p_agent")?;
+
+        let found = enabled_packs_of_kind(&root, EntryKind::FileWatcher)?;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "vault.markdown-watcher");
+        assert_eq!(found[0].entry.kind, EntryKind::FileWatcher);
+
+        // Kind filter is exact: the same grant must not surface as an MCP pack.
+        assert!(enabled_packs_of_kind(&root, EntryKind::McpConfig)?.is_empty());
+
+        // Disabling the grant deactivates it.
+        disable_pack(&root, "p_agent", "vault.markdown-watcher", None, 3_000)?;
+        assert!(enabled_packs_of_kind(&root, EntryKind::FileWatcher)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn enabled_packs_of_kind_dedupes_across_passports() -> Result<(), IntegrationError> {
+        let tmp = temp_data_dir("watcher-multi-passport");
+        let root = tmp.path().to_path_buf();
+        install_and_grant_vault_watcher(&root, "p_agent")?;
+        install_and_grant_vault_watcher(&root, "p_other")?;
+        assert_eq!(enabled_packs_of_kind(&root, EntryKind::FileWatcher)?.len(), 1);
         Ok(())
     }
 

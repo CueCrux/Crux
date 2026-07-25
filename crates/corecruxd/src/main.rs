@@ -99,11 +99,13 @@ mod shard_map;
 mod status_feed;
 mod storybook;
 mod structured_log;
+mod sync_scheduler;
 mod tenant_metadata;
 #[cfg(test)]
 mod test_support;
 mod update;
 mod usage_submit;
+mod vault_watcher;
 #[cfg(feature = "wasm-extensions")]
 mod wasm_dispatcher;
 #[cfg(feature = "wasm-extensions")]
@@ -1100,6 +1102,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let github_fact_store_handle = state.fact_store.clone();
     let github_encryption_key = state.integration_encryption_key.clone();
+    // Handles the periodic-job scheduler needs; cloned here because `state` is
+    // moved into the router well before the scheduler is built.
+    let scheduler_fact_store = state.fact_store.clone();
+    let vault_ingest_handles = crate::local_ingest::LocalIngestHandles {
+        data_dir: state.data_dir.clone(),
+        ingest_lock: state.local_ingest_lock.clone(),
+        retrieval_index: state.retrieval_index.clone(),
+    };
     // Build the MCP dispatch context once and share it between the MCP
     // server (:14801) and the HTTP OpenAI tools shim (`/v1/openai/*`,
     // provider-integration-surfaces M2) — single source for the tool surface.
@@ -1473,58 +1483,101 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         })
     };
 
-    // GitHub indexer polling loop (Plan B G3) — spawned unconditionally; skips
-    // its own work when GitHub isn't connected. Configurable via
-    // `CORECRUXD_GITHUB_SYNC_INTERVAL_SECS` (default 900s = 15 min). The
-    // manual `POST /v1/integrations/github/sync` runs the same code path.
+    // Periodic integration jobs (ExecPlan `crux-integrations-and-template-library`
+    // I4). One driver task for all of them; per-job status lands under
+    // `__sync__::<job_id>` key `status` and is readable through `GET /v1/facts`.
+    // See `crate::sync_scheduler`.
     {
-        let interval_secs = std::env::var("CORECRUXD_GITHUB_SYNC_INTERVAL_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(900);
-        let data_dir = config.data_dir.clone();
-        let key = github_encryption_key.clone();
-        let fact_store = github_fact_store_handle.clone();
-        let mut rx = shutdown_tx.subscribe();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-            tick.tick().await; // burn the immediate tick — wait one full interval before first poll
-            loop {
-                tokio::select! {
-                    _ = rx.recv() => break,
-                    _ = tick.tick() => {
-                        let dd = data_dir.clone();
-                        let k = key.clone();
-                        let fs = fact_store.clone();
-                        let now_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0, |d| d.as_millis() as u64);
+        let mut scheduler = sync_scheduler::SyncScheduler::new(scheduler_fact_store.clone());
+
+        // GitHub indexer poll (Plan B G3) — registered unconditionally; the job
+        // itself skips (writing nothing) when GitHub isn't connected. Interval
+        // via `CORECRUXD_GITHUB_SYNC_INTERVAL_SECS` (default 900s = 15 min);
+        // first poll one full interval after boot, as before. The manual
+        // `POST /v1/integrations/github/sync` runs the same code path.
+        {
+            let interval_secs = std::env::var("CORECRUXD_GITHUB_SYNC_INTERVAL_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(900);
+            let data_dir = config.data_dir.clone();
+            let key = github_encryption_key.clone();
+            let fact_store = github_fact_store_handle.clone();
+            scheduler.register(
+                "github-sync",
+                std::time::Duration::from_secs(interval_secs),
+                move || {
+                    let dd = data_dir.clone();
+                    let k = key.clone();
+                    let fs = fact_store.clone();
+                    async move {
+                        let now_ms = crate::ops_events::now_unix_ms();
                         let result = tokio::task::spawn_blocking(move || {
                             let mut store = match fs.try_write() {
                                 Ok(g) => g,
-                                Err(_) => return Err(crate::integrations_github::GithubIntegrationError::Network(
-                                    "fact store busy".to_string(),
-                                )),
+                                Err(_) => {
+                                    return Err(crate::integrations_github::GithubIntegrationError::Network(
+                                        "fact store busy".to_string(),
+                                    ))
+                                }
                             };
                             crate::integrations_github_sync::run_sync_with_key(&dd, &mut store, k.as_ref(), now_ms)
-                        }).await;
+                        })
+                        .await;
                         match result {
                             Ok(Ok(run)) => {
                                 let total_added: usize = run.repos.iter().map(|r| r.commits_added).sum();
                                 if !run.repos.is_empty() {
                                     info!(repos = run.repos.len(), commits_added = total_added, "github-sync-tick");
                                 }
+                                Ok(sync_scheduler::JobOutcome::Ran(Some(serde_json::json!({
+                                    "repos": run.repos.len(),
+                                    "commits_added": total_added,
+                                }))))
                             }
+                            // Not connected is the unconfigured default, not a
+                            // failure: skip silently and don't arm backoff.
                             Ok(Err(crate::integrations_github::GithubIntegrationError::NotConnected)) => {
-                                tracing::trace!("github not connected; skipping sync tick");
+                                Ok(sync_scheduler::JobOutcome::Skipped("github not connected".to_string()))
                             }
-                            Ok(Err(err)) => tracing::warn!(?err, "github-sync-tick-failed"),
-                            Err(err) => tracing::warn!(?err, "github-sync-task-join-error"),
+                            Ok(Err(err)) => Err(format!("{err:?}")),
+                            Err(err) => Err(format!("sync task join error: {err}")),
                         }
                     }
-                }
+                },
+            );
+        }
+
+        // Markdown vault watcher — the `EntryKind::FileWatcher` runtime. Double
+        // gated: a file-watcher pack must be installed AND granted, and
+        // `CORECRUXD_VAULT_WATCH_ROOTS` must name at least one absolute
+        // directory. See `crate::vault_watcher`.
+        match vault_watcher::activation(&config.data_dir) {
+            (vault_watcher::Activation::Active { pack_ids, roots }, Some(vault_config)) => {
+                let watcher = std::sync::Arc::new(vault_watcher::VaultWatcher::new(
+                    vault_config,
+                    scheduler_fact_store.clone(),
+                    vault_ingest_handles.clone(),
+                ));
+                let interval = watcher.interval();
+                info!(
+                    packs = ?pack_ids,
+                    roots,
+                    interval_secs = interval.as_secs(),
+                    "vault-watcher enabled"
+                );
+                scheduler.register(vault_watcher::JOB_ID, interval, move || {
+                    let watcher = watcher.clone();
+                    async move { watcher.run_cycle().await }
+                });
             }
-        });
+            (vault_watcher::Activation::HalfConfigured(reason), _) => {
+                info!(reason = %reason, "vault-watcher inactive");
+            }
+            _ => {}
+        }
+
+        scheduler.spawn(shutdown_tx.subscribe());
     }
 
     let mcp_task = mcp_app.map(|mcp_app| {

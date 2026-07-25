@@ -24,13 +24,8 @@ use super::{
     problem_response, AppState, HeaderMap, IntoResponse, Json, ProblemDetails, ProblemResponse, Response, State,
     StatusCode,
 };
-use crate::local_ingest::{seal_prose_documents, ProseChunk, ProseDocument};
+use crate::local_ingest::{ingest_prose_documents, LocalIngestHandles, ProseChunk, ProseDocument};
 use corecrux_memory::embeddings::SemanticProfile;
-
-/// Single-node local ingest writes to shard 0 at a fixed epoch. Segment
-/// sequence auto-increments within the shard and persists via the MANIFEST.
-const LOCAL_INGEST_SHARD_ID: u32 = 0;
-const LOCAL_INGEST_EPOCH: u64 = 1;
 
 /// Max documents accepted in a single request.
 const MAX_DOCUMENTS_PER_REQUEST: usize = 4096;
@@ -183,6 +178,15 @@ pub(super) fn validate_payload(body: &LocalIngestBody) -> Result<AcceptedCounts,
         documents: body.documents.len(),
         chunks: total_chunks,
     })
+}
+
+/// Project the request state onto the handles the shared write path needs.
+fn local_ingest_handles(state: &AppState) -> LocalIngestHandles {
+    LocalIngestHandles {
+        data_dir: state.data_dir.clone(),
+        ingest_lock: state.local_ingest_lock.clone(),
+        retrieval_index: state.retrieval_index.clone(),
+    }
 }
 
 fn local_ingest_disabled_response() -> Response {
@@ -456,103 +460,36 @@ pub(super) async fn post_local_ingest(
             .collect()
     };
 
-    let data_dir = state.data_dir.clone();
-    let tenant = body.tenant_id.clone();
-    let corpus = body.corpus_id.clone();
-    let ingested_at = chrono::Utc::now().to_rfc3339();
-    let now_ms = crate::ops_events::now_unix_ms();
-
-    // Serialize ingests (each seal takes the shard's exclusive lock), then run
-    // the blocking seal + timeline write off the async runtime.
-    let _guard = state.local_ingest_lock.lock().await;
-    let seal_result = tokio::task::spawn_blocking(move || -> Result<SealOutcome, String> {
-        let summary = seal_prose_documents(
-            &data_dir,
-            LOCAL_INGEST_SHARD_ID,
-            LOCAL_INGEST_EPOCH,
-            &tenant,
-            &corpus,
-            &ingested_at,
-            &documents,
-            dense_profile.as_ref(),
-        )
-        .map_err(|e| e.to_string())?;
-
-        // T.4: record a timeline row per document (same console index the
-        // `/v1/append` path writes). Best-effort — a timeline miss never fails
-        // an otherwise-durable ingest.
-        for doc in &documents {
-            let events: Vec<corecrux_proto::dataplane_v1::AppendEvent> = doc
-                .chunks
-                .iter()
-                .map(|c| corecrux_proto::dataplane_v1::AppendEvent {
-                    event_id: c.chunk_id.clone(),
-                    occurred_at: ingested_at.clone(),
-                    event_type: crate::local_ingest::PROSE_CHUNK_EVENT_TYPE.to_string(),
-                    content_type: crate::local_ingest::PROSE_CHUNK_CONTENT_TYPE.to_string(),
-                    payload: c.text.as_bytes().to_vec(),
-                })
-                .collect();
-            if let Err(err) = crate::console_index::record_appended_events(
-                &data_dir,
-                &tenant,
-                &corpus,
-                &doc.doc_id,
-                0,
-                &events,
-                now_ms,
-            ) {
-                tracing::warn!(?err, doc_id = %doc.doc_id, "local-ingest timeline indexing failed");
-            }
-        }
-
-        Ok(SealOutcome {
-            segment_seq: summary.segment_seq,
-            frame_count: summary.frame_count,
-            documents: summary.documents,
-            chunks: summary.chunks,
-            sealed: summary.sealed,
-            receipt_id: summary.receipt_material_hash.map(hex32),
-            dense_dim: summary.dense_dim,
-            dense_vectors: summary.dense_vectors,
-        })
-    })
-    .await;
-
-    let outcome = match seal_result {
-        Ok(Ok(outcome)) => outcome,
-        Ok(Err(msg)) => {
+    // Seal + timeline + index reload run through the shared write path so the
+    // in-process producers (the vault watcher) are byte-identical to this route.
+    let summary = match ingest_prose_documents(
+        &local_ingest_handles(&state),
+        &body.tenant_id,
+        &body.corpus_id,
+        documents,
+        dense_profile,
+    )
+    .await
+    {
+        Ok(summary) => summary,
+        Err(msg) => {
             tracing::error!(error = %msg, "local-ingest seal failed");
             return problem_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("local ingest seal failed: {msg}"),
             );
         }
-        Err(join_err) => {
-            tracing::error!(error = %join_err, "local-ingest seal task panicked");
-            return problem_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "local ingest seal task failed".to_string(),
-            );
-        }
     };
-
-    // Load-at-runtime wiring: hot-reload the retrieval index so the freshly
-    // sealed `.ccxi` is queryable immediately (idempotent — scan skips
-    // already-loaded segments).
-    {
-        let mut guard = state.retrieval_index.write().await;
-        let shards_dir = state.data_dir.join("shards");
-        if let Ok(entries) = std::fs::read_dir(&shards_dir) {
-            for entry in entries.flatten() {
-                let seg_dir = entry.path().join("segments");
-                if let Err(err) = guard.scan_and_load(&seg_dir) {
-                    tracing::warn!(?err, dir = ?seg_dir, "local-ingest ccxi reload failed");
-                }
-            }
-        }
-    }
-    drop(_guard);
+    let outcome = SealOutcome {
+        segment_seq: summary.segment_seq,
+        frame_count: summary.frame_count,
+        documents: summary.documents,
+        chunks: summary.chunks,
+        sealed: summary.sealed,
+        receipt_id: summary.receipt_material_hash.map(hex32),
+        dense_dim: summary.dense_dim,
+        dense_vectors: summary.dense_vectors,
+    };
 
     (
         StatusCode::ACCEPTED,
@@ -903,10 +840,10 @@ mod tests {
                 dense_vector: Some(vec![0.0, 1.0]),
             }],
         }];
-        seal_prose_documents(
+        crate::local_ingest::seal_prose_documents(
             &state.data_dir,
-            LOCAL_INGEST_SHARD_ID,
-            LOCAL_INGEST_EPOCH,
+            crate::local_ingest::LOCAL_INGEST_SHARD_ID,
+            crate::local_ingest::LOCAL_INGEST_EPOCH,
             "t1",
             "mediacrux-archive",
             "2026-07-20T00:00:00Z",
