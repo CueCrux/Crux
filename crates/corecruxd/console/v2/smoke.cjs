@@ -2862,9 +2862,12 @@ function extractThemeVars(theme) {
   // no longer one tab of a four-view switch. Gate the dispatch + the new control.
   check(/ctx\.view === 'studio'/.test(renderSrc) && /renderTileStudio\(body, ctx\)/.test(renderSrc),
     '[studio] renderCanvas must dispatch the studio view to renderTileStudio');
+  // L1 added a fourth section (Library) to this same control — Check 58 gates
+  // the full four-entry list and its routing; this gate keeps the M16b three and
+  // the control's identity.
   check(/canvas-subseg', role: 'group', 'aria-label': 'Studio section'/.test(renderSrc)
     && /\['board', 'Board'\], \['pages', 'Pages'\], \['integrations', 'Integrations'\]/.test(renderSrc),
-    '[studio] the Studio must expose its OWN sections (Board · Pages · Integrations) as the primary control');
+    '[studio] the Studio must expose its OWN sections (Board · Pages · Integrations, + Library per Check 58) as the primary control');
   check(/parts\[1\] === 'studio'/.test(shellHtml), '[studio] shell.html parseCanvasHash must route #/canvas/studio to the Studio view');
   check(/'canvas:studio'/.test(renderSrc), '[studio] the site map must carry a canvas:studio node');
 
@@ -3939,7 +3942,13 @@ function extractThemeVars(theme) {
     '[m19] switching away from a canvas tab must tear down its RAF/listener (teardownCanvasTab)');
   const canvasDest = (pages.DESTS || []).find(function (d) { return d.id === 'canvas'; });
   check(!!canvasDest && canvasDest.railHidden === true && canvasDest.key === undefined,
-    '[m19] the Canvas destination must be railHidden + keyless (route-only home for Studio; not in the rail/keyboard)');
+    '[m19] the canvas destination must be railHidden + keyless (route-only home for Studio; not in the rail/keyboard)');
+  // The dest ID stays 'canvas' (route stability: #/canvas/studio, the
+  // canvas/board|graph|tree workspace page types and the #/rings redirect all
+  // key off it) but its LABEL is the topbar heading of the only surface it
+  // still serves — the Studio. "Canvas" headed a destination retired in M19.
+  check(!!canvasDest && canvasDest.id === 'canvas' && canvasDest.label === 'Studio',
+    '[m19] the canvas destination must keep id "canvas" (routes) and read "Studio" (the heading of the surface it serves)');
   check(/first === 'canvas'/.test(shellHtml) && /'#\/rings\/' \+ target/.test(shellHtml),
     '[m19] route() must redirect #/canvas/board|graph|tree to #/rings/<view> (deep links never dead-end)');
   // M20 RETARGET: the ad-hoc RINGS_TAB_MAP (board|graph|tree only) is replaced by
@@ -4985,6 +4994,37 @@ function extractThemeVars(theme) {
     '[library] ?sub=library must resolve to the library section (deep-linkable)');
   check(/if \(studioSub === 'library'\) \{ return renderLibraryStudio\(body, ctx\); \}/.test(renderSrc),
     '[library] renderCanvas must dispatch the library section to renderLibraryStudio');
+  // THE MISSING HALF (fixed here): L1 gated render.js alone, but the ROUTER is
+  // shell.html's parseCanvasHash — and it still carried M16b's three-value
+  // ?sub= allowlist, so ?sub=library normalised to 'board'. The control painted
+  // a Library button that landed the operator back on the board, and the page
+  // had no reachable route. Gate the shared allowlist AND its use, so a future
+  // section cannot be half-wired the same way.
+  check(/var STUDIO_SUBS = \{ board: 1, pages: 1, integrations: 1, library: 1 \};/.test(shellHtml),
+    '[library] shell.html must allowlist every Studio section (board · pages · integrations · library) in ONE STUDIO_SUBS list');
+  check(/Object\.prototype\.hasOwnProperty\.call\(STUDIO_SUBS, sm\[1\]\)/.test(shellHtml),
+    '[library] parseCanvasHash must validate ?sub= against STUDIO_SUBS (so #/canvas/studio?sub=library resolves to the Library, not the board)');
+  check(!/sm\[1\] === 'integrations' \? 'integrations' : 'board'/.test(shellHtml),
+    '[library] the old three-value ?sub= ladder must be gone (it silently downgraded ?sub=library to the board)');
+  check(/Studio › Library —/.test(shellHtml),
+    '[library] the topbar sub-line must name the Library section (every other Studio section has one)');
+  // Pure re-implementation of the parser's ?sub= rule, driven over the real
+  // deep links: the fix is a routing claim, so assert the routing.
+  (function () {
+    const SUBS = { board: 1, pages: 1, integrations: 1, library: 1 };
+    function subOf(hash) {
+      const h = String(hash || '').replace(/^#\/?/, '');
+      const qi = h.indexOf('?');
+      const q = qi >= 0 ? h.slice(qi + 1) : '';
+      const sm2 = q.match(/(?:^|&)sub=([^&]+)/);
+      return (sm2 && Object.prototype.hasOwnProperty.call(SUBS, sm2[1])) ? sm2[1] : 'board';
+    }
+    check(subOf('#/canvas/studio?sub=library') === 'library', '[library] #/canvas/studio?sub=library must resolve to the library section');
+    check(subOf('#/canvas/studio?sub=pages') === 'pages' && subOf('#/canvas/studio?sub=integrations') === 'integrations',
+      '[library] the incumbent Studio sections must keep resolving');
+    check(subOf('#/canvas/studio') === 'board' && subOf('#/canvas/studio?sub=nope') === 'board' && subOf('#/canvas/studio?sub=__proto__') === 'board',
+      '[library] an absent or unknown ?sub= (including a prototype key) must fall back to the board');
+  })();
   check(JSON.stringify(render.CLIB_KINDS || []) === JSON.stringify(['board', 'design', 'workspace', 'pack']),
     '[library] render.js must declare the four catalog kinds in the daemon\'s order');
 
@@ -5261,7 +5301,7 @@ function extractThemeVars(theme) {
   check(css && !/#[0-9a-fA-F]{3,8}\b/.test(css) && !/\brgba?\(/.test(css),
     '[library] the Library CSS must use var(--) tokens only — no literal colours');
 
-  notes.push('studio library (L1+L2 console): Studio gains a fourth section — Library (#/canvas/studio?sub=library) — over the daemon\'s cached, curator-signed template index: a header stating curator, index age, entry count and that tier_enforcement is ADVISORY (the catalog server is the gate; the daemon only echoes required_tier, and every tier chip says so in its title), plus kind-grouped, kind/text-filterable entry cards carrying name·version·kind·tier·publisher·tags·summary·preview·repo·pinned sha and, when installed, the version, the written entities and the install date. There is deliberately NO refresh button — the daemon has no fetch-index route — so the surface names `corecruxctl studio sync` instead, and its four read states stay distinct (verified · un-synced 404 · 403 signature failure shown verbatim · verified-but-empty). Install is the one mutation: the same cintWrite harness as Studio › Integrations (posture + Art.14 bound passport + a confirm naming kind, id@version, publisher, sha and advisory tier) through the single operatorGatedCall choke, rendering the response\'s own shape — written entities, from → to collision remaps, the provenance block — and 404/409/403 details verbatim. Provenance is now visible wherever a Studio artifact is listed (workspace + page rows, the saved-designs panel, and the board toolbar, which is this console\'s only board listing): "library: <id>@<version>" for a catalog install, "import: <pack_id> · signed|unsigned" for a hand-import, read defensively and rendered as one chip. The board doc\'s field-dropping security choke now admits (coerced) provenance so an operator save cannot orphan an installed board. The import preview states SIGNEDNESS as a first-class chip off the verify route\'s additive `signed` bit — unsigned says plainly that it applies only under operator posture and carries no publisher trust — with the existing operator && v.ok apply gate untouched; and a manual apply stamps every artifact it writes with its OWN `imported_from` {pack_id, imported_at_unix_ms, signed}, never the daemon\'s `installed_from`, surviving the canonical write → tolerant read round-trip.');
+  notes.push('studio library (L1+L2 console): Studio gains a fourth section — Library (#/canvas/studio?sub=library) — over the daemon\'s cached, curator-signed template index: a header stating curator, index age, entry count and that tier_enforcement is ADVISORY (the catalog server is the gate; the daemon only echoes required_tier, and every tier chip says so in its title), plus kind-grouped, kind/text-filterable entry cards carrying name·version·kind·tier·publisher·tags·summary·preview·repo·pinned sha and, when installed, the version, the written entities and the install date. There is deliberately NO refresh button — the daemon has no fetch-index route — so the surface names `corecruxctl studio sync` instead, and its four read states stay distinct (verified · un-synced 404 · 403 signature failure shown verbatim · verified-but-empty). Install is the one mutation: the same cintWrite harness as Studio › Integrations (posture + Art.14 bound passport + a confirm naming kind, id@version, publisher, sha and advisory tier) through the single operatorGatedCall choke, rendering the response\'s own shape — written entities, from → to collision remaps, the provenance block — and 404/409/403 details verbatim. Provenance is now visible wherever a Studio artifact is listed (workspace + page rows, the saved-designs panel, and the board toolbar, which is this console\'s only board listing): "library: <id>@<version>" for a catalog install, "import: <pack_id> · signed|unsigned" for a hand-import, read defensively and rendered as one chip. The board doc\'s field-dropping security choke now admits (coerced) provenance so an operator save cannot orphan an installed board. The import preview states SIGNEDNESS as a first-class chip off the verify route\'s additive `signed` bit — unsigned says plainly that it applies only under operator posture and carries no publisher trust — with the existing operator && v.ok apply gate untouched; and a manual apply stamps every artifact it writes with its OWN `imported_from` {pack_id, imported_at_unix_ms, signed}, never the daemon\'s `installed_from`, surviving the canonical write → tolerant read round-trip. ROUTE FIX (M27): L1 wired the fourth section in render.js only — shell.html\'s parseCanvasHash, which is the actual router, still carried M16b\'s three-value ?sub= ladder, so ?sub=library normalised to \'board\'. The Library button painted, clicking it repainted the board, and the page had no reachable route from the Studio at all. The ladder is replaced by ONE shared STUDIO_SUBS allowlist (board · pages · integrations · library) validated with hasOwnProperty (so a prototype key falls back to the board), the topbar sub-line gains its Studio › Library sentence, and the gates now assert the SHELL half as well as the render half — including the resolved routing for every deep link and the fallbacks.');
 })();
 
 // ---- Report (awaits async renderer-driven checks) -----------------------

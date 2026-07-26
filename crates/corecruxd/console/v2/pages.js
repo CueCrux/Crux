@@ -1310,7 +1310,7 @@
           rbtn('Graph expand', { hint: 'POST /v1/query/graph-expand — curated read-POST' }),
           { t: 'select', k: 'wbq_window', label: 'time window', options: ['24h', '7d', '30d'], v: '24h' },
           rbtn('Time range', { hint: 'POST /v1/query/time-range — curated read-POST' }),
-          rbtn('Browse results as graph', { hint: 'opens the Canvas relation graph' })
+          rbtn('Browse results as graph', { hint: 'opens the Rings relation graph' })
         ] },
       { h: 'Entities', sub: '/v1/entities/{kind}/{id} + /history (read)', wide: true,
         controls: [
@@ -1472,7 +1472,13 @@
     // and existing #/canvas/board|graph|tree deep links redirect to #/rings/<view>
     // (route()). It is intentionally absent from the rail, the sitemap and the
     // Command workspace builtin (siteMapSections + cwsRegistryDests skip it).
-    { id: 'canvas', label: 'Canvas', icon: 'canvas', railHidden: true, sub: 'Studio — route-only home (Board/Graph/Tree are Rings tabs).' },
+    // The dest id stays 'canvas' — #/canvas/studio is Studio's stable home and
+    // every existing deep link, workspace page type (canvas/board|graph|tree)
+    // and redirect keys off it. Only the LABEL changes: it is the topbar
+    // heading for #/canvas/studio, and the surface it heads has been the Studio
+    // since M19 moved Board/Graph/Tree to Rings. "Canvas" as a heading named a
+    // destination that no longer exists.
+    { id: 'canvas', label: 'Studio', icon: 'canvas', railHidden: true, sub: 'Studio — route-only home (Board/Graph/Tree are Rings tabs).' },
     // Explorer (M11) — a destination with no sub-pills: it IS a search surface.
     // A query box + a Local | WikiCrux backend toggle (nav-family, aria-pressed) +
     // a budget/top_k control; results as cards (title/snippet · source · score ·
