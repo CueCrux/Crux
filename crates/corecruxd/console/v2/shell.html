@@ -5124,7 +5124,9 @@
               ? 'Studio › Pages — workspaces and the pages inside them; built-ins render from the registry until you take control'
               : cr.sub === 'integrations'
                 ? 'Studio › Integrations — installed packs, the community registry, and trusted keys'
-                : 'Studio — build a board of tiles (notes · API · web); positions + configs persist daemon-side')
+                : cr.sub === 'library'
+                  ? 'Studio › Library — the curator-signed template catalog: boards, designs, workspaces and packs this daemon has cached'
+                  : 'Studio — build a board of tiles (notes · API · web); positions + configs persist daemon-side')
           : cr.view === 'tree'
             ? 'Plan tree — Project → ExecPlan → Milestone → live session'
             : 'Tile canvas — drag, pan, expand in place; composes to your viewport (4K+ = the full board)';
@@ -5395,6 +5397,11 @@
     return { dest: destId, page: pageId };
   }
 
+  // The Studio's sections, in the order render.js paints them as the primary
+  // control (Board | Pages | Integrations | Library). This is the ONE allowlist
+  // ?sub= is validated against — an unknown value falls back to the board.
+  var STUDIO_SUBS = { board: 1, pages: 1, integrations: 1, library: 1 };
+
   // Canvas (M9) parses its own hash: #/canvas/<view>?focus=<type>:<id>. The view
   // is the nav-family Board|Graph switch; the focus (graph only) is parsed by the
   // pure render.js parseFocus so board/graph share one deep-link grammar.
@@ -5412,9 +5419,16 @@
       try { raw = decodeURIComponent(m[1]); } catch (e) { raw = m[1]; }
       focus = (window.CruxRender && window.CruxRender.parseFocus) ? window.CruxRender.parseFocus(raw) : null;
     }
-    // M16b — the Studio subsection (Board | Pages | Integrations) rides ?sub=.
+    // M16b — the Studio subsection rides ?sub=. L1 (crux-integrations-and-
+    // template-library) added a FOURTH section, Library, to render.js's Studio
+    // control and dispatch but left THIS parser at the three M16b values, so
+    // ?sub=library normalised to 'board': the button painted, the route said
+    // Board, and the Library page was unreachable from the Studio. The
+    // allowlist is now ONE list (STUDIO_SUBS) covering every section the
+    // control offers, so adding a section is one edit in each file, not a
+    // silent downgrade here.
     var sm = q.match(/(?:^|&)sub=([^&]+)/);
-    var sub = sm ? (sm[1] === 'pages' ? 'pages' : (sm[1] === 'integrations' ? 'integrations' : 'board')) : 'board';
+    var sub = (sm && Object.prototype.hasOwnProperty.call(STUDIO_SUBS, sm[1])) ? sm[1] : 'board';
     return { view: view, focus: focus, sub: sub };
   }
 

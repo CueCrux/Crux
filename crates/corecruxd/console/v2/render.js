@@ -1639,8 +1639,8 @@
       meta.appendChild(lz);
     }
     // Cross-feature launch point (M9): open this session's neighbourhood in the
-    // Canvas relation graph. Read-only link — visible in both postures.
-    meta.appendChild(el('a', { 'class': 'btn-quiet cx-graphlink', href: '#/canvas/graph?focus=session:' + (row.sessionHex || row.passport || ''), title: 'Open in the Canvas relation graph' }, ['View graph']));
+    // Rings relation graph. Read-only link — visible in both postures.
+    meta.appendChild(el('a', { 'class': 'btn-quiet cx-graphlink', href: '#/canvas/graph?focus=session:' + (row.sessionHex || row.passport || ''), title: 'Open in the Rings relation graph' }, ['View graph']));
     frow.appendChild(meta);
     var side = el('div', { 'class': 'ow-fleet-side' });
     if ((row.orchestrators || []).length) { side.appendChild(el('div', { text: row.orchestrators.join(', ') })); }
@@ -2053,7 +2053,7 @@
     ]));
     if (i.note) { card.appendChild(el('p', { 'class': 'ow-await', text: i.note })); }
     card.appendChild(el('span', { 'class': 'ow-chip ow-inferred', title: 'inferred from the session’s announced intent note — coord has no structured waiting-for-input signal', text: 'inferred from intent' }));
-    card.appendChild(el('a', { 'class': 'btn-quiet cx-graphlink', href: '#/canvas/graph?focus=session:' + (s.session_id_hex || pid), title: 'Open in the Canvas relation graph' }, ['View graph']));
+    card.appendChild(el('a', { 'class': 'btn-quiet cx-graphlink', href: '#/canvas/graph?focus=session:' + (s.session_id_hex || pid), title: 'Open in the Rings relation graph' }, ['View graph']));
     return card;
   }
 
@@ -6132,7 +6132,7 @@
 
     var stageWrap = el('div', { 'class': 'tstudio-stagewrap' });
     main.appendChild(stageWrap);
-    var stage = el('div', { 'class': 'tstudio-stage', tabindex: '0', 'aria-label': 'Canvas Studio board' });
+    var stage = el('div', { 'class': 'tstudio-stage', tabindex: '0', 'aria-label': 'Studio board' });
     stageWrap.appendChild(stage);
     var world = el('div', { 'class': 'tstudio-world' });
     stage.appendChild(world);
