@@ -23,7 +23,7 @@ fn full_init_regenerate_loop() {
     let workspace = dir.path();
 
     let bundled = load_bundled_profiles().expect("bundled profiles parse");
-    assert_eq!(bundled.len(), 11, "11 bundled profiles expected");
+    assert_eq!(bundled.len(), 13, "13 bundled profiles expected");
 
     // init with all defaults.
     let mut cfg = AgentProfileConfig::new(workspace_fingerprint(workspace));
@@ -39,11 +39,25 @@ fn full_init_regenerate_loop() {
         .cloned()
         .collect();
 
+    // Both targets land 10 sections: 9 shared profiles, plus exactly one of the
+    // target-split pair (claude-5 → CLAUDE.md, agent-harness-parity → AGENTS.md).
     for t in [Target::ClaudeMd, Target::AgentsMd] {
         let r = compose_file(workspace, t, &enabled, false, false).unwrap();
         assert!(r.wrote);
         assert_eq!(r.managed_sections_added, 10);
     }
+
+    // The two files must no longer be identical. CLAUDE.md omits the rules Claude
+    // Code's own system prompt supplies; AGENTS.md states them for harnesses that
+    // do not. A regression here silently re-introduces the duplicated-instruction
+    // cost that the claude-5 / agent-harness-parity split exists to remove.
+    let claude_md = std::fs::read_to_string(workspace.join("CLAUDE.md")).unwrap();
+    let agents_md = std::fs::read_to_string(workspace.join("AGENTS.md")).unwrap();
+    assert_ne!(claude_md, agents_md, "CLAUDE.md and AGENTS.md must diverge");
+    assert!(claude_md.contains("BEGIN-CRUX-MANAGED:claude-5"));
+    assert!(!claude_md.contains("BEGIN-CRUX-MANAGED:agent-harness-parity"));
+    assert!(agents_md.contains("BEGIN-CRUX-MANAGED:agent-harness-parity"));
+    assert!(!agents_md.contains("BEGIN-CRUX-MANAGED:claude-5"));
 
     // idempotency: second compose makes no change.
     for t in [Target::ClaudeMd, Target::AgentsMd] {

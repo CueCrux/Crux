@@ -33,6 +33,8 @@ server run on your machine without a hosted account.
 - [API reference](api-reference.md) - HTTP, gRPC, and MCP surfaces.
 - [Agent guide](agent-guide.md) - using Crux as an agent memory and retrieval
   backend.
+- [ExecPlan drift guard](execplan-drift-guard.md) - installing and wiring the
+  advisory hooks that keep plan `Status:` lines aligned with derived state.
 - [Session handshake](session-handshake.md) - identity, install UUIDs, and
   session binding.
 - [MCP system prompt](mcp-system-prompt.md) - recommended agent runtime

@@ -99,6 +99,11 @@ fn bundled_raw() -> Vec<(&'static str, &'static str)> {
             "token-conservation.md",
             include_str!("../profiles/token-conservation.md"),
         ),
+        ("claude-5.md", include_str!("../profiles/claude-5.md")),
+        (
+            "agent-harness-parity.md",
+            include_str!("../profiles/agent-harness-parity.md"),
+        ),
         (
             "execplan-discipline.md",
             include_str!("../profiles/execplan-discipline.md"),
@@ -176,7 +181,7 @@ This is the body.
     #[test]
     fn bundled_load_returns_all_in_order() {
         let bundled = load_bundled_profiles().unwrap();
-        assert_eq!(bundled.len(), 11);
+        assert_eq!(bundled.len(), 13);
         for win in bundled.windows(2) {
             assert!(
                 win[0].frontmatter.order <= win[1].frontmatter.order,
@@ -221,6 +226,184 @@ This is the body.
         ] {
             assert!(!claims.contains(unsupported), "unsupported claim: {unsupported}");
         }
+    }
+
+    /// The `claude-5` profile exists to *remove* two instruction classes that cost
+    /// tokens without improving results on Claude 5 generation models: re-verification
+    /// prompts and fixed numeric output ceilings. Both are the kind of rule that creeps
+    /// back in during a well-meaning edit, so guard them here.
+    #[test]
+    fn claude_5_omits_numeric_caps_and_keeps_the_no_reverify_carve_out() {
+        let bundled = load_bundled_profiles().unwrap();
+        let p = bundled
+            .iter()
+            .find(|f| f.frontmatter.name == "claude-5")
+            .expect("claude-5 fragment must be bundled");
+
+        // claude_md only. Rendering this into AGENTS.md would duplicate what Claude
+        // Code's own system prompt already supplies — see `agent-harness-parity`.
+        assert_eq!(p.frontmatter.targets, vec![Target::ClaudeMd]);
+        assert!(
+            p.frontmatter.conflicts_with.iter().any(|c| c == "token-conservation"),
+            "claude-5 supersedes token-conservation and must declare the conflict"
+        );
+
+        // Match against description + body, normalised to one space-joined line, so a
+        // reflow cannot silently defeat these guards. The rationale lives in the
+        // description on purpose: it is *why* the profile is shaped this way, and
+        // frontmatter is not rendered into CLAUDE.md, so it costs no session context.
+        let claims = format!("{}\n{}", p.frontmatter.description, p.body)
+            .to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for cap in ["500-token", "at most 10 lines", "token output max", "2,000 for design"] {
+            assert!(
+                !claims.contains(cap),
+                "claude-5 must not carry a fixed output cap: {cap}"
+            );
+        }
+        assert!(
+            claims.contains("self-verification is already the model's default behaviour"),
+            "the no-reverification rationale must stay explicit or the profile rots"
+        );
+        assert!(
+            claims.contains("verification belongs in the main loop"),
+            "subagent-verification carve-out must survive"
+        );
+
+        // The body is the part that costs context on every session. Keep it lean —
+        // this profile replaces a 19-line one, and a subtraction pass that grows the
+        // rendered file has failed at its own premise.
+        let body_lines = p.body.lines().filter(|l| !l.trim().is_empty()).count();
+        assert!(
+            body_lines <= 40,
+            "claude-5 body is {body_lines} non-blank lines; keep rationale in `description`"
+        );
+    }
+
+    /// `agent-harness-parity` carries the rules Claude Code's harness supplies natively,
+    /// for harnesses that do not. It must never render into CLAUDE.md, or it re-introduces
+    /// exactly the duplication `claude-5` was written to remove.
+    #[test]
+    fn agent_harness_parity_is_agents_md_only_and_disjoint_from_claude_5() {
+        let bundled = load_bundled_profiles().unwrap();
+        let p = bundled
+            .iter()
+            .find(|f| f.frontmatter.name == "agent-harness-parity")
+            .expect("agent-harness-parity fragment must be bundled");
+        assert_eq!(p.frontmatter.targets, vec![Target::AgentsMd]);
+
+        let body = p.body.to_lowercase();
+        assert!(body.contains("single message"), "tool-batching rule must be stated");
+        assert!(
+            body.contains("\"x exists now\""),
+            "memory-staleness rule must be stated for non-Claude harnesses"
+        );
+
+        // The two profiles must not both land in the same file.
+        let claude5 = bundled
+            .iter()
+            .find(|f| f.frontmatter.name == "claude-5")
+            .expect("claude-5 fragment must be bundled");
+        for t in &p.frontmatter.targets {
+            assert!(
+                !claude5.frontmatter.targets.contains(t),
+                "claude-5 and agent-harness-parity must not share a target"
+            );
+        }
+    }
+
+    /// v2 narrowed this profile to source-citation and corpus-identity. The dropped
+    /// sections were re-verification instructions; re-adding them would reintroduce the
+    /// over-verification this generation is prone to.
+    #[test]
+    fn code_grounding_v2_drops_the_reverification_sections() {
+        let bundled = load_bundled_profiles().unwrap();
+        let p = bundled
+            .iter()
+            .find(|f| f.frontmatter.name == "code-grounding")
+            .expect("code-grounding fragment must be bundled");
+        assert_eq!(p.frontmatter.version, 2);
+
+        let body = p.body.to_lowercase();
+        for dropped in [
+            "when the result surprises you",
+            "memory-versus-current-state",
+            "substrate scans need budgets",
+        ] {
+            assert!(
+                !body.contains(dropped),
+                "code-grounding v2 dropped this section: {dropped}"
+            );
+        }
+        assert!(body.contains("file:line"), "citation rule survives");
+        assert!(body.contains("corpus"), "corpus-identity rule survives");
+    }
+
+    /// v2 collapsed four competing boot rituals into one, and handed the retrieval-budget
+    /// and entity-prefix rules to the MCP tool schemas. Guard both.
+    #[test]
+    fn memory_practices_v2_declares_a_single_boot_and_defers_to_tool_schemas() {
+        let bundled = load_bundled_profiles().unwrap();
+        let p = bundled
+            .iter()
+            .find(|f| f.frontmatter.name == "memory-practices")
+            .expect("memory-practices fragment must be bundled");
+        assert_eq!(p.frontmatter.version, 2);
+
+        let body = p.body.to_lowercase();
+        assert!(
+            body.contains("this is the **only** boot sequence"),
+            "the single-boot claim must be explicit"
+        );
+        assert!(
+            !body.contains("is mandatory on every retrieval call"),
+            "the token_budget mandate now lives in the MCP tool schemas, not here"
+        );
+        assert!(
+            !body.contains("entity=\"execplan:"),
+            "entity conventions now live in the store_fact schema, not here"
+        );
+    }
+
+    /// v3 moved the drift guard's install/wiring detail into
+    /// `docs/execplan-drift-guard.md`. The body keeps only what an agent needs
+    /// mid-session; operator setup is read on demand. Guard both halves.
+    #[test]
+    fn execplan_discipline_v3_defers_drift_guard_setup_to_docs() {
+        let bundled = load_bundled_profiles().unwrap();
+        let p = bundled
+            .iter()
+            .find(|f| f.frontmatter.name == "execplan-discipline")
+            .expect("execplan-discipline fragment must be bundled");
+        assert_eq!(p.frontmatter.version, 3);
+
+        let body = p.body.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
+
+        // Operator-time setup detail belongs in the doc, not in every session.
+        for setup in [
+            ".claude/settings.json",
+            ".codex/hooks.json",
+            "xdg_data_home",
+            "--print-only",
+            "crux_execplans_root",
+            "~/.local/share/crux/hooks",
+        ] {
+            assert!(
+                !body.contains(setup),
+                "execplan-discipline v3 defers setup detail to docs: {setup}"
+            );
+        }
+
+        // Agent-time behaviour must survive: the hook can fire mid-session, and the
+        // leading-token rule is a real semantic gotcha that is not inferable.
+        assert!(body.contains("posttooluse"), "the agent must know the hook exists");
+        assert!(body.contains("leading"), "leading-Status:-token semantics must survive");
+        assert!(
+            body.contains("docs/execplan-drift-guard.md"),
+            "must point at the reference doc"
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 +++
 name = "execplan-discipline"
-version = 2
-description = "Multi-milestone work goes through an ExecPlan first. Codifies the Insights-report `ExecPlan Workflow` snippet (M1..Mn pattern in 15+ sessions), plus the board-drift guard that keeps plan `Status:` lines aligned with derived state."
+version = 3
+description = "Multi-milestone work goes through an ExecPlan first. Codifies the Insights-report `ExecPlan Workflow` snippet (M1..Mn pattern in 15+ sessions), plus the board-drift guard that keeps plan `Status:` lines aligned with derived state. v3 moves the drift guard's install and wiring detail (hook paths, per-agent JSON matchers, script flags) out of this always-loaded body and into `docs/execplan-drift-guard.md`, keeping only the behaviour an agent needs mid-session: that the hook may fire, and that only the leading `Status:` token counts. The installer already prints the exact snippets on demand, so the body was duplicating a self-documenting interface."
 targets = ["claude_md", "agents_md"]
 order = 30
 risk_class = "low"
@@ -41,7 +41,7 @@ Before writing the plan, call `get_gaps(query="<area>")` on the Feature Registry
 
 ### Work table is true north
 
-On session boot, before picking up a new task or proposing one, call `mcp__crux__list_work(source="all")`. The response merges the kanban `work_items` table with the read-time projection over `*/.agent/execplans/*.md` (per ExecPlan `crux-work-panel-execplans-as-truenorth-2026-05-26`).
+`list_work(source="all")` — step 4 of the single boot sequence, not a second boot — merges the kanban `work_items` table with the read-time projection over `*/.agent/execplans/*.md` (per ExecPlan `crux-work-panel-execplans-as-truenorth-2026-05-26`). Consult it before picking up a new task or proposing one.
 
 - Treat unfinished entries (state in `{planned, in_progress, blocked}`) as the prioritized task set.
 - If the user's request matches an in_progress plan's next milestone, resume it — do not start a parallel plan.
@@ -53,11 +53,6 @@ Do not invent work that already exists in the table; do not let the table go sta
 
 ### Board-drift guard
 
-Three layers keep a plan's `Status:` line from lagging its derived state (facts say "done", markdown still reads "In progress"). Install on a new machine with `bash scripts/setup-drift-guard.sh` in the Crux repo — it copies the scripts to `~/.local/share/crux/hooks/` and prints the config snippets below (it never edits your agent configs).
+If wired, a `store_fact` PostToolUse hook exits 2 and prompts you when you store a plan-terminal fact (`decision:close*`, or a `gate:*` marked plan-complete) while the plan's leading `Status:` token is still non-terminal — flip the line while you have the context. Only the **leading** token counts, so `Status: In progress (design complete)` is non-terminal. A SessionStart sweep names any plans whose derived state has outrun their `Status:` line. Both are advisory: they print, never mutate or block.
 
-- **Write-time guard** — `execplan-status-guard.sh` runs as a `store_fact` **PostToolUse** hook. When you store a plan-terminal fact (`decision:close*`, or a `gate:*` marked plan-complete) but the plan's leading `Status:` token is still non-terminal, it exits 2 and nags you to flip the line while you have context. Only the *leading* token counts: `Status: In progress (design complete)` is non-terminal.
-  - Claude Code `.claude/settings.json` → `hooks.PostToolUse` matcher `mcp__crux__store_fact`.
-  - codex `.codex/hooks.json` → `hooks.PostToolUse` matcher `store_fact`.
-- **Boot sweep** — run `reconcile-execplan-status.sh --quiet` on **SessionStart** (both agents). It GETs `/v1/work?source=all`, and for every `execplan:*` whose derived state is terminal but whose leading `Status:` token isn't, prints one compact line naming the plans to flip. Silent when clean; graceful skip (exit 0) if the daemon is down. Set `CRUX_EXECPLANS_ROOT` so it can resolve `<slug>.md`.
-
-Both hook scripts are print-only / advisory — they never mutate a plan or block real work.
+Install, wiring, and semantics: `bash scripts/setup-drift-guard.sh` (prints the config snippets; never edits your agent configs) and `docs/execplan-drift-guard.md`.
