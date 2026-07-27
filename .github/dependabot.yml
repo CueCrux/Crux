@@ -6,6 +6,12 @@ updates:
       interval: "weekly"
     open-pull-requests-limit: 10
     labels: ["dependencies"]
+    ignore:
+      # serial_test 4.x requires rustc 1.93.1; the workspace MSRV is 1.88.0
+      # (Cargo.toml `rust-version`). Drop this entry once the MSRV moves past
+      # 1.93.1 and the MSRV CI job is bumped to match.
+      - dependency-name: "serial_test"
+        versions: ["4.x"]
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
