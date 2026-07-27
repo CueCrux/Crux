@@ -27,6 +27,7 @@ pub(super) struct ResolvePrincipalQuery {
 /// `{passport_id, category, tier, tier_rank, capabilities[], tenant_id,
 /// agent_work_gate, resolved_via}` so a mediator can authorize and attribute
 /// tool calls against the real identity.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_resolve_principal(
     State(state): State<AppState>,
     Query(query): Query<ResolvePrincipalQuery>,

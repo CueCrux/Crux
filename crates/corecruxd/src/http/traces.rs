@@ -32,6 +32,7 @@ const DEFAULT_SPAN_LIMIT: usize = 500;
 /// `dropped` is the honest data-loss counter: the ring evicts oldest-first when
 /// full, so a rising `dropped` means the flush interval or capacity needs
 /// raising, not that the daemon is misbehaving.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_trace_stats(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
@@ -60,6 +61,7 @@ pub(super) async fn get_trace_stats(State(state): State<AppState>, headers: Head
 ///
 /// Read-only and non-draining, so polling this never destroys data the M4
 /// flusher has not yet persisted.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_trace_spans(
     State(state): State<AppState>,
     headers: HeaderMap,

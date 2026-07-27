@@ -1091,6 +1091,7 @@ pub(super) fn validate_chain(records: &[ObservationRecordV1]) -> ChainStatus {
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_observation(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1112,6 +1113,7 @@ pub(super) async fn post_observation(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_observations_batch(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1578,6 +1580,7 @@ pub(super) fn handle_witness_receipt(state: &AppState, headers: &HeaderMap, raw:
 /// recognized before top-level `kind` dispatch, strictly verified against
 /// their inline Ed25519 public key, and retained as daemon-signed mediation
 /// observations. Invalid signatures are rejected before any append.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_mediation_receipt(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1682,6 +1685,7 @@ pub(super) async fn post_mediation_receipt(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_observations(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1734,6 +1738,7 @@ pub(super) async fn get_observations(
 /// `limit`. Each session's chain status is included so callers can spot
 /// "the feed is fresh, but session X's chain is broken on disk" without
 /// a follow-up call.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_observations_aggregate(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2020,6 +2025,7 @@ fn fetchable_receipt_id(record: &ObservationRecordV1) -> Option<String> {
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_receipts_list(
     State(state): State<AppState>,
     headers: HeaderMap,

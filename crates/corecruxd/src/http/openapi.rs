@@ -499,6 +499,7 @@ fn apply_route_manifest(spec: &mut serde_json::Value) {
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn openapi_json() -> Json<serde_json::Value> {
     let mut spec =
         serde_json::to_value(ApiDoc::openapi()).unwrap_or_else(|_| serde_json::json!({ "openapi": "3.1.0" }));

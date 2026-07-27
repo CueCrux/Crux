@@ -114,6 +114,7 @@ fn map_registry_error(err: crate::repo_registry::RepoRegistryError) -> axum::res
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_repo(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -568,6 +569,7 @@ fn repo_scan_test_hook(repo_id: &str) -> Option<RepoScanTestOutcome> {
     })
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_repos(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -583,6 +585,7 @@ pub(super) async fn get_repos(
     (StatusCode::OK, Json(serde_json::json!({ "repos": repos }))).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_repo_scan_job(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -603,6 +606,7 @@ pub(super) async fn get_repo_scan_job(
 /// `GET /v1/repos/dependents` — daemon-owned package reverse-dependency
 /// lookup. Version requirements are returned as raw manifest strings only;
 /// version range semantics and filtering live in upstream clients/proxies.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_repo_dependents(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -725,6 +729,7 @@ fn repo_reverse_map(id_store: &crate::repo_codegraph::CodeGraphIdStore) -> BTree
         .collect()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_repo(
     State(state): State<AppState>,
     Path(repo_id): Path<String>,
@@ -780,6 +785,7 @@ pub(super) struct SymbolResolveQuery {
 ///
 /// `404` means no symbol of that name exists in that file — a genuine miss,
 /// distinct from an ambiguous match, which is `200`.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_symbol_resolve(
     State(state): State<AppState>,
     Path(repo_id): Path<String>,
@@ -861,6 +867,7 @@ pub(super) async fn get_symbol_resolve(
 /// daemon persisted when the repo was registered (or last re-indexed by the
 /// watch loop). This is the read side of the `POST /v1/repos` scan: same
 /// tenant scoping, same auth as the sibling repo reads.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_repo_codemap(
     State(state): State<AppState>,
     Path(repo_id): Path<String>,
@@ -956,6 +963,7 @@ pub(super) async fn get_repo_codemap(
     (StatusCode::OK, Json(body)).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_repo(
     State(state): State<AppState>,
     Path(repo_id): Path<String>,

@@ -1573,7 +1573,32 @@ pub(crate) fn router_with_route_auth(
         .layer(CatchPanicLayer::custom(self::health::handle_panic))
         .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, Duration::from_secs(30)))
         .layer(middleware::from_fn(traceparent_middleware))
+        .layer(middleware::from_fn(request_span_middleware))
         .layer(middleware::from_fn(request_id_middleware))
+}
+
+/// Opens one root span per HTTP request so every downstream span has a trace to
+/// belong to (ExecPlan crux-runtime-codemap M3).
+///
+/// This span deliberately carries the *route*, not a symbol: its `file`/`line`
+/// point here, at the middleware, not at the handler. Handler identity comes
+/// from `#[tracing::instrument]` on the handlers themselves, which nest beneath
+/// this root and resolve correctly through `symbol_resolve`. The root's job is
+/// to bound the request and name the entry point.
+///
+/// Uses the matched route pattern where axum exposes one, so `/v1/facts/{id}`
+/// aggregates rather than producing a distinct span name per id.
+async fn request_span_middleware(req: Request<axum::body::Body>, next: Next) -> impl IntoResponse {
+    use tracing::Instrument as _;
+
+    let method = req.method().clone();
+    let route = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map_or_else(|| req.uri().path().to_string(), |m| m.as_str().to_string());
+
+    let span = tracing::info_span!("http_request", method = %method, route = %route);
+    next.run(req).instrument(span).await
 }
 
 /// Updates the presence tracker on every request that carries

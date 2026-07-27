@@ -319,6 +319,7 @@ fn receipt_id(op: &str, card_id: &str) -> String {
     format!("rcx-punchcard:{op}:{card_id}")
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn acquire(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -465,6 +466,7 @@ pub(super) async fn acquire(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn release(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -547,6 +549,7 @@ pub(super) async fn release(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn list_punchcards(
     State(state): State<AppState>,
     Query(q): Query<ListPunchcardsQuery>,
@@ -591,6 +594,7 @@ pub(super) async fn list_punchcards(
     (StatusCode::OK, Json(json!({"punchcards": punchcards, "count": count}))).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn check(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<CheckBody>) -> Response {
     // `check` always returns 200 (even when disabled / no conflict) so the
     // PreToolUse hook can read the body and fail-open. When the surface is
@@ -664,6 +668,7 @@ pub(super) async fn check(State(state): State<AppState>, headers: HeaderMap, Jso
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn force_release(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,

@@ -68,6 +68,7 @@ pub(super) struct ResolveEngramsBody {
 }
 
 /// `GET /v1/engrams` — list active engrams without content.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn list_engrams(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -119,6 +120,7 @@ pub(super) async fn list_engrams(
 
 /// `POST /v1/memory/session-init` — hosted-compatible session procedure +
 /// engram manifest handshake.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn memory_session_init(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -163,6 +165,7 @@ pub(super) async fn memory_session_init(
 
 /// `POST /v1/memory/engrams/resolve` — resolve requested `name@version`
 /// engrams and return content when the local capability class may use them.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn resolve_engrams(
     State(state): State<AppState>,
     headers: HeaderMap,

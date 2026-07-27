@@ -850,6 +850,7 @@ async fn build_incident_bundle(
     Ok((bytes, key_class, bundle_id))
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_incident(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -900,6 +901,7 @@ pub(super) async fn post_incident(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn list_incidents(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -929,6 +931,7 @@ pub(super) async fn list_incidents(
     .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_incident(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -955,6 +958,7 @@ pub(super) async fn get_incident(
     Json(json!({ "case": case, "case_record_id": fact.fact_id })).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn export_incident(
     State(state): State<AppState>,
     headers: HeaderMap,

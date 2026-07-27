@@ -13,6 +13,7 @@ use axum::{
     Json,
 };
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_cloud_access_contract(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(problem) = require_http_any_scope(&state.auth, &headers, &["admin:read", "query:read"]) {
         return problem.into_response();

@@ -25,6 +25,7 @@ pub(super) struct ReplayQuery {
     pub(super) shard_id: Option<String>,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_answer_replay(
     State(state): State<AppState>,
     Path(answer_id): Path<String>,
@@ -59,6 +60,7 @@ pub(super) async fn get_answer_replay(
     .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_answer_replay_validity(
     State(state): State<AppState>,
     Path(answer_id): Path<String>,
@@ -143,6 +145,7 @@ pub(super) async fn get_answer_replay_validity(
 // (ExecPlan crux-external-findings-remediation M4); the replay READ endpoints
 // remain mounted. Test builds still exercise this writer directly.
 #[cfg_attr(not(feature = "hosted-surfaces"), allow(dead_code))]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn store_answer_capsule(state: &AppState, capsule: &AnswerReplayCapsule) -> std::io::Result<()> {
     let mut fact = StoreFact {
         tenant_hash: "default".to_string(),
@@ -160,6 +163,7 @@ pub(super) async fn store_answer_capsule(state: &AppState, capsule: &AnswerRepla
     Ok(())
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn load_answer_capsule(
     state: &AppState,
     tenant_id: &str,
@@ -170,6 +174,7 @@ pub(super) async fn load_answer_capsule(
     load_answer_capsule_from_store(&store, tenant_id, answer_id, tenant_hash)
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn export_answer_capsule_if_present(
     state: &AppState,
     tenant_id: &str,

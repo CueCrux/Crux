@@ -351,6 +351,13 @@ pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContra
         return Some(RouteAuthContract::new(class, scopes));
     }
 
+    // Runtime span capture (ExecPlan crux-runtime-codemap M2). Read-only, and
+    // admin-scoped: captured spans expose internal file paths and call
+    // structure, which is operator information rather than tenant data.
+    if path.starts_with("/v1/traces") {
+        return Some(RouteAuthContract::new(RouteAuthClass::AdminRead, &["admin:read"]));
+    }
+
     if method == "GET" && path == "/v1/passport/mint-requests/pending" {
         return Some(RouteAuthContract::gated(
             RouteAuthClass::FeatureGated,

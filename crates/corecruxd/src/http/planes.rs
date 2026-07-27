@@ -58,6 +58,7 @@ pub(super) struct PutPlaneLayerBody {
     pub content: String,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_planes(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
@@ -80,6 +81,7 @@ pub(super) async fn get_planes(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_plane(
     State(state): State<AppState>,
     Path((project_id, plane_id)): Path<(String, String)>,
@@ -97,6 +99,7 @@ pub(super) async fn get_plane(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_plane(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
@@ -129,6 +132,7 @@ pub(super) async fn post_plane(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_plane(
     State(state): State<AppState>,
     Path((project_id, plane_id)): Path<(String, String)>,
@@ -147,6 +151,7 @@ pub(super) async fn delete_plane(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_plane_member(
     State(state): State<AppState>,
     Path((project_id, plane_id)): Path<(String, String)>,
@@ -173,6 +178,7 @@ pub(super) async fn post_plane_member(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_plane_member(
     State(state): State<AppState>,
     Path((project_id, plane_id, passport_id)): Path<(String, String, String)>,
@@ -190,6 +196,7 @@ pub(super) async fn delete_plane_member(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_plane_tenant(
     State(state): State<AppState>,
     Path((project_id, plane_id)): Path<(String, String)>,
@@ -216,6 +223,7 @@ pub(super) async fn post_plane_tenant(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_plane_tenant(
     State(state): State<AppState>,
     Path((project_id, plane_id, tenant_id)): Path<(String, String, String)>,
@@ -233,6 +241,7 @@ pub(super) async fn delete_plane_tenant(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_plane_layers(
     State(state): State<AppState>,
     Path((project_id, plane_id)): Path<(String, String)>,
@@ -294,6 +303,7 @@ pub(super) async fn get_plane_layers(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn put_plane_layer(
     State(state): State<AppState>,
     Path((project_id, plane_id, layer)): Path<(String, String, String)>,
@@ -360,6 +370,7 @@ fn default_sync_max_bytes() -> usize {
     24 * 1024 // 24 KB per layer is plenty for keyword-overlap signal
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_sync_layers(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
@@ -397,6 +408,7 @@ pub(super) async fn post_sync_layers(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_plane_layer(
     State(state): State<AppState>,
     Path((project_id, plane_id, layer)): Path<(String, String, String)>,

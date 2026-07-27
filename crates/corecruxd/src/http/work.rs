@@ -151,6 +151,7 @@ fn now_unix_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_work(
     State(state): State<AppState>,
     Query(q): Query<ListWorkQuery>,
@@ -314,6 +315,7 @@ fn execplan_items_for_query(
         .collect()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_work_item(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -331,6 +333,7 @@ pub(super) async fn get_work_item(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_work(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -363,6 +366,7 @@ pub(super) async fn post_work(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn patch_work(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -410,6 +414,7 @@ pub(super) async fn patch_work(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_comment(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -432,6 +437,7 @@ pub(super) async fn post_comment(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_comments(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -450,6 +456,7 @@ pub(super) async fn get_comments(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_transitions(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -468,6 +475,7 @@ pub(super) async fn get_transitions(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_pending_gates(
     State(state): State<AppState>,
     Query(q): Query<GateListQuery>,
@@ -486,6 +494,7 @@ pub(super) async fn get_pending_gates(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_gate_approve(
     State(state): State<AppState>,
     Path(action_id): Path<String>,
@@ -495,6 +504,7 @@ pub(super) async fn post_gate_approve(
     resolve_gate_http(&state, &action_id, &headers, &body, true).await
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_gate_reject(
     State(state): State<AppState>,
     Path(action_id): Path<String>,
@@ -685,6 +695,7 @@ pub(super) struct StatusFeedQuery {
 /// Flag-gated behind `CORECRUXD_FEATURE_STATUS_FEED` (default OFF). When off,
 /// returns a 200 disabled-notice (mirroring the `context_custody_audit`
 /// handler-gate idiom) rather than an error, so clients can probe it safely.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_status_feed(
     State(state): State<AppState>,
     Query(q): Query<StatusFeedQuery>,

@@ -75,6 +75,7 @@ async fn persist_dossier(
     Ok(dossier.dossier_id.clone())
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_auto(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
@@ -104,6 +105,7 @@ pub(super) async fn post_auto(
     (StatusCode::OK, Json(dossier)).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_publish(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
@@ -299,6 +301,7 @@ fn budget_dossier(mut d: crate::dossier::Dossier, token_budget: Option<usize>) -
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn list_dossiers(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
@@ -359,6 +362,7 @@ pub(super) async fn list_dossiers(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_dossier(
     State(state): State<AppState>,
     Path((project_id, dossier_id)): Path<(String, String)>,
@@ -380,6 +384,7 @@ pub(super) struct DiffQuery {
     pub b: String,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_diff(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
@@ -492,6 +497,7 @@ fn budget_reconciliation(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_reconciliation(
     State(state): State<AppState>,
     Path(project_id): Path<String>,

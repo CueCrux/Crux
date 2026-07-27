@@ -16,6 +16,7 @@ use super::{AppState, IntoResponse, Json, State, StatusCode};
         (status = 503, description = "Witness/TSA local configuration smoke failed"),
     )
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_witness_smoke(State(state): State<AppState>) -> impl IntoResponse {
     let report = state.witness.smoke_report();
     let status = if report.ok {

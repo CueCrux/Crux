@@ -51,6 +51,7 @@ pub(super) struct PostCostBody {
 }
 
 /// `POST /v1/cost/report` — store a ground-truth cost report for a session.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_cost_report(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -108,6 +109,7 @@ pub(super) async fn post_cost_report(
 /// `GET /v1/cost/report` — read the report for a session (or the tenant's
 /// latest) plus the session picker. Query: `tenant_id` (required),
 /// `token_budget` (**required**, QC.2), `session` (optional).
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_cost_report(
     State(state): State<AppState>,
     headers: HeaderMap,

@@ -315,6 +315,7 @@ async fn require_sync_peer(
     outcome
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_handshake_nonce(State(state): State<AppState>) -> Response {
     if !state.sync_mutual_auth {
         return problem_response(StatusCode::NOT_FOUND, "sync mutual authentication is disabled");
@@ -432,6 +433,7 @@ async fn require_sync_write(state: &AppState, headers: &HeaderMap, tenant_id: &s
         .map_err(IntoResponse::into_response)
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_tenant_manifest(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -458,6 +460,7 @@ pub(super) async fn get_tenant_manifest(
     Json(manifest).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_tenant_collection(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -484,6 +487,7 @@ pub(super) async fn get_tenant_collection(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_promotion_preview(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -501,6 +505,7 @@ pub(super) async fn post_promotion_preview(
     Json(preview).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_promotion_confirm(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -547,6 +552,7 @@ pub(super) async fn post_promotion_confirm(
     .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_tenant_offboard(
     State(state): State<AppState>,
     headers: HeaderMap,

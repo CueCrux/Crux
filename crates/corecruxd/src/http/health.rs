@@ -20,6 +20,7 @@ use super::{
         (status = 200, description = "Node health status"),
     )
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     let _ = state.commit_level;
     // Minimal public mode: omit routing (node id, shard map) and valve state so
@@ -141,6 +142,7 @@ pub(super) fn evaluate_replicated_commit_topology(
         (status = 503, description = "Node not ready"),
     )
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     // Phase 3 readiness: lock held + routing table loaded + control evidence + capacity checks.
     let routing = state.routing.read().await;
@@ -346,6 +348,7 @@ pub(super) async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
         (status = 200, description = "Prometheus metrics", content_type = "text/plain"),
     )
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     match state.metrics.render() {
         Ok(body) => {
@@ -488,6 +491,7 @@ fn runtime_capability_descriptor(
         (status = 200, description = "Build version and feature flags"),
     )
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoResponse {
     let sync_status = sync_runtime_status();
     let cloud = crate::product::CloudPosture::from_sync(&sync_status);
@@ -594,6 +598,7 @@ pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoRespo
     }))
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_admin_version(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();

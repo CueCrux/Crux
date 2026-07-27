@@ -210,6 +210,7 @@ pub(super) fn workbench_posture(state: &AppState) -> Value {
     })
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_workbench_contract(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(problem) = require_http_any_scope(&state.auth, &headers, &["query:read", "admin:read"]) {
         return problem.into_response();
@@ -217,6 +218,7 @@ pub(super) async fn get_workbench_contract(State(state): State<AppState>, header
     Json(workbench_posture(&state)).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_agent_brief(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -284,6 +286,7 @@ pub(super) async fn get_agent_brief(
     .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_context_pack(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -359,6 +362,7 @@ pub(super) async fn post_context_pack(
     Json(response).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_impact_preflight(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -414,6 +418,7 @@ pub(super) async fn post_impact_preflight(
     Json(response).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_command_ledger(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -459,6 +464,7 @@ pub(super) async fn post_command_ledger(
     Json(response).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_command_ledger(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -487,6 +493,7 @@ pub(super) async fn get_command_ledger(
     .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_audit_triage(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -520,6 +527,7 @@ pub(super) async fn get_audit_triage(
     .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_reasoning_timeline(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -548,6 +556,7 @@ pub(super) async fn get_reasoning_timeline(
     .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_handoff_v2(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -622,6 +631,7 @@ pub(super) async fn post_handoff_v2(
     Json(response).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_route_probe(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -682,6 +692,7 @@ pub(super) async fn post_route_probe(
     .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_api_drift(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -700,6 +711,7 @@ pub(super) async fn get_api_drift(
     Json(drift).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_policy_simulation(
     State(state): State<AppState>,
     headers: HeaderMap,

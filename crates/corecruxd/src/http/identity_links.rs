@@ -94,6 +94,7 @@ fn parse_candidate_status(raw: Option<&str>) -> Result<Option<CandidateLinkStatu
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_identity_link(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -144,6 +145,7 @@ pub(super) async fn post_identity_link(
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_identity_candidates(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -262,6 +264,7 @@ fn journal_candidate_observations(data_dir: &std::path::Path, anchor: &str) -> V
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_identity_candidates_propose(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if !state.identity_links_enabled {
         return links_disabled();
@@ -361,6 +364,7 @@ pub(super) async fn post_identity_candidates_propose(State(state): State<AppStat
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_identity_candidate_confirm(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -416,6 +420,7 @@ pub(super) async fn post_identity_candidate_confirm(
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_identity_candidate_reject(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -457,6 +462,7 @@ pub(super) async fn post_identity_candidate_reject(
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_identity_links(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if !state.identity_links_enabled {
         return links_disabled();
@@ -484,6 +490,7 @@ pub(super) async fn get_identity_links(State(state): State<AppState>, headers: H
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_identity_link_revoke(
     State(state): State<AppState>,
     headers: HeaderMap,

@@ -19,6 +19,7 @@ pub(super) fn observe_not_enabled_response() -> Response {
     problem_response(StatusCode::NOT_IMPLEMENTED, "self-observation not enabled")
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn query_ops_facts(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -53,6 +54,7 @@ pub(super) async fn query_ops_facts(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn query_ops_errors(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -100,6 +102,7 @@ pub(super) async fn query_ops_errors(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_ops_health(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
         if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
@@ -153,6 +156,7 @@ pub(super) fn default_bootstrap_top_k() -> usize {
     10
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_bootstrap_pull(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -179,6 +183,7 @@ pub(super) async fn post_bootstrap_pull(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_bootstrap_status(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
         if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {

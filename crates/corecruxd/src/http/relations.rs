@@ -73,6 +73,7 @@ fn default_budget() -> usize {
     50
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_relation(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -123,6 +124,7 @@ pub(super) async fn post_relation(
     (StatusCode::CREATED, Json(record)).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_relations(
     State(state): State<AppState>,
     Query(query): Query<ListRelationsQuery>,
@@ -163,6 +165,7 @@ pub(super) async fn get_relations(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_incoming_relations(
     State(state): State<AppState>,
     Query(query): Query<IncomingRelationsQuery>,
@@ -224,6 +227,7 @@ pub(super) async fn get_incoming_relations(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_expand(
     State(state): State<AppState>,
     headers: HeaderMap,

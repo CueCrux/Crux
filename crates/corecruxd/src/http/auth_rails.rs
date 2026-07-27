@@ -177,6 +177,7 @@ pub(super) fn peer_identity_trusted(peer: Option<IpAddr>, trusted: &[(IpAddr, u8
 }
 
 /// `GET /v1/auth/whoami` — echo the identity the daemon trusts for this caller.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_whoami(
     State(_state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -204,6 +205,7 @@ pub(super) async fn get_whoami(
 
 /// `POST /v1/auth/tailscale/token` — mint a scoped short-lived JWT for a verified,
 /// allowlisted tailnet identity.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_tailscale_token(
     State(_state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,

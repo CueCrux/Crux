@@ -1310,6 +1310,7 @@ pub(super) fn parse_receipt_export_options_v1(
     })
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn export_receipt_bundle_v1(
     state: &AppState,
     tenant_id: &str,

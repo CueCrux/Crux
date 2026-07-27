@@ -657,6 +657,7 @@ fn guard(state: &AppState, headers: &HeaderMap, tenant: &str) -> Option<Response
     None
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_provenance_sign(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -672,6 +673,7 @@ pub(super) async fn post_provenance_sign(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_provenance_verify(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -687,6 +689,7 @@ pub(super) async fn post_provenance_verify(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_provenance_verify_record(
     State(state): State<AppState>,
     headers: HeaderMap,
