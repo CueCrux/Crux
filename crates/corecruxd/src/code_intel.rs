@@ -664,6 +664,21 @@ mod tests {
     }
 
     #[test]
+    fn ladder_withholds_actionable_when_the_file_was_never_exercised() {
+        let scan = scan_with(vec!["ghost", "other"], vec!["ghost"]);
+        // A non-empty window, but every span came from a DIFFERENT file, so we
+        // never exercised ghost's file and learned nothing about ghost.
+        let mut elsewhere = stored(1, 1, None, 0, "other", 10);
+        elsewhere.span.file = Some("elsewhere.rs".into());
+        let l = dead_code_ladder(&scan, &[elsewhere], 100_000);
+        let v = l.verdicts.iter().find(|v| v.symbol == "ghost").unwrap();
+        assert!(
+            !v.actionable,
+            "a runtime negative is only evidence when the symbol's own file ran"
+        );
+    }
+
+    #[test]
     fn ladder_surfaces_extractor_false_positives_as_a_calibration_corpus() {
         let scan = scan_with(vec!["runner"], vec!["runner"]);
         let spans = vec![stored(1, 1, None, 0, "runner", 10)];
@@ -794,6 +809,17 @@ pub fn dead_code_ladder(scan: &WorkspaceScan, spans: &[StoredSpan], token_budget
     });
     let runtime_window_empty = spans.is_empty();
 
+    // Which FILES were observed executing. This is the guard that makes a
+    // runtime negative meaningful.
+    //
+    // Found by running M7 against the real repo: with only "window is
+    // non-empty" as the bar, a 79-span window over six endpoints marked all
+    // 100 dead candidates `actionable` — which is exactly the over-claiming the
+    // window caveat warns about. A symbol's absence is only evidence when its
+    // own file demonstrably ran; otherwise we never exercised that code path at
+    // all and learned nothing about it.
+    let executed_files: BTreeSet<&str> = spans.iter().filter_map(|s| s.span.file.as_deref()).collect();
+
     let mut verdicts = Vec::new();
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut false_positives = Vec::new();
@@ -841,9 +867,13 @@ pub fn dead_code_ladder(scan: &WorkspaceScan, spans: &[StoredSpan], token_budget
             evidence,
             agreeing_tiers: agreeing,
             single_signal: single,
-            // Only a two-tier agreement over a non-empty window is safe to act
-            // on. Everything else is a lead, not a licence to delete.
-            actionable: agreeing >= 2 && !runtime_window_empty && runs == 0,
+            // Two tiers agreeing is necessary but not sufficient: the symbol's
+            // own file must have been exercised, or the runtime tier never had
+            // a chance to see it.
+            actionable: agreeing >= 2
+                && !runtime_window_empty
+                && runs == 0
+                && executed_files.contains(d.file_rel_path.as_str()),
             finding_id: format!("dead:{}:{}", d.file_rel_path, d.line),
         });
     }
