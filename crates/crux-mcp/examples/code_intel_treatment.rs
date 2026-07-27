@@ -76,6 +76,10 @@ fn encode(value: &str) -> String {
 /// surface that carries the per-tier evidence and the `actionable` flag that a
 /// deletion decision needs. It is also the more expensive of the two, which is
 /// the direction this benchmark errs in.
+///
+/// It passes `symbol`, because that is what an agent with a symbol in mind
+/// would do. Before the ladder could be scoped, this question was unanswerable
+/// at any budget: the repo-wide list truncated away the symbol asked about.
 fn route(kind: &str, probe: &str, budget: u64) -> String {
     let base = daemon_base();
     let repo = repo_id();
@@ -95,8 +99,9 @@ fn route(kind: &str, probe: &str, budget: u64) -> String {
             encode(probe)
         ),
         "dead_code" => format!(
-            "{base}/v1/code-intel/dead-code?tenant_id={TENANT}&repo_id={}&token_budget={budget}",
-            encode(&repo)
+            "{base}/v1/code-intel/dead-code?tenant_id={TENANT}&repo_id={}&symbol={}&token_budget={budget}",
+            encode(&repo),
+            encode(probe)
         ),
         other => panic!("no route for question kind {other}"),
     }

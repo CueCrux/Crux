@@ -350,6 +350,10 @@ pub(super) async fn get_trace_diff(
 /// One verdict per statically-flagged symbol, each carrying the tiers that
 /// spoke and whether they agree. `actionable` is true only when two independent
 /// tiers agree over a non-empty observation window; everything else is a lead.
+///
+/// Pass `symbol` to ask about one symbol. Without it the answer is the whole
+/// repo, which a token budget will truncate — and truncation used to drop the
+/// symbol the caller cared about.
 #[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_dead_code_ladder(
     State(state): State<AppState>,
@@ -364,7 +368,7 @@ pub(super) async fn get_dead_code_ladder(
         return problem_response(StatusCode::NOT_FOUND, "no scan for this repo; register it first");
     };
     let spans = load_spans(&state);
-    let ladder = crate::code_intel::dead_code_ladder(&scan, &spans, q.token_budget);
+    let ladder = crate::code_intel::dead_code_ladder(&scan, &spans, q.symbol.as_deref(), q.token_budget);
     (StatusCode::OK, Json(ladder)).into_response()
 }
 

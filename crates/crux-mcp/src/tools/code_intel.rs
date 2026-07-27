@@ -76,7 +76,8 @@ pub fn trace_diff_description() -> &'static str {
 }
 
 pub fn dead_code_description() -> &'static str {
-    "Which statically-flagged dead symbols are actually safe to delete. Returns \
+    "Is this symbol safe to delete — or which ones are, across the repo. Pass \
+     `symbol` to ask about one; omit it for the whole repo. Returns \
      one verdict per candidate with the evidence from each tier that spoke \
      (compiler lint, AST reachability, binary symbols, runtime execution) and \
      whether those tiers agree. `actionable` is true only when independent tiers \
@@ -196,10 +197,16 @@ pub fn dead_code_schema() -> Value {
         json!({
             "tenant_id": tenant_property(),
             "repo_id": repo_property(),
+            "symbol": {
+                "type": "string",
+                "description": "Ask about one symbol. Strongly preferred when you have one in mind: \
+                                without it the answer is every candidate in the repo, and a token \
+                                budget will truncate that list — possibly dropping the symbol you asked about."
+            },
             "token_budget": token_budget_property()
         }),
         &["tenant_id", "token_budget"],
-        json!([{ "tenant_id": "local", "repo_id": "crux", "token_budget": 2000 }]),
+        json!([{ "tenant_id": "local", "symbol": "lookup_session", "token_budget": 500 }]),
     )
 }
 
@@ -332,8 +339,9 @@ pub async fn handle_code_dead_code(args: &Value, ctx: &McpContext) -> Result<Val
     let base = base_url(ctx, TOOL)?;
     let tenant = required_string(args, "tenant_id", TOOL)?;
     let budget = token_budget(args, TOOL)?;
+    let symbol = optional_string(args, "symbol").map_or_else(String::new, |s| format!("&symbol={}", encode_query(&s)));
     let url = format!(
-        "{base}/v1/code-intel/dead-code?tenant_id={}&token_budget={budget}{}",
+        "{base}/v1/code-intel/dead-code?tenant_id={}&token_budget={budget}{}{symbol}",
         encode_query(&tenant),
         repo_param(args)
     );

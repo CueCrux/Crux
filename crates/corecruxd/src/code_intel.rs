@@ -292,6 +292,10 @@ pub struct Liveness {
     pub flagged_dead_static: bool,
     /// The joined verdict, spelled out so a caller does not have to infer it.
     pub verdict: &'static str,
+    /// True when the symbol's own file executed in this window, so a runtime
+    /// negative is evidence rather than silence. When false, only the static
+    /// tier has actually spoken, whatever the verdict may sound like.
+    pub runtime_had_evidence: bool,
     pub window: Window,
 }
 
@@ -302,13 +306,32 @@ pub fn liveness(scan: &WorkspaceScan, spans: &[StoredSpan], symbol: &str) -> Liv
     let flagged_dead = scan.dead_code.iter().any(|d| d.name == symbol);
     let executed = !executions.is_empty();
 
+    // Did the runtime tier get a chance to speak about this symbol at all?
+    //
+    // "Not observed" is only evidence of death if the symbol's own file ran and
+    // it still did not. Otherwise the window simply never reached that code, and
+    // reporting it as agreement lets a silent tier vote — which is how a static
+    // false positive gets laundered into what reads as two-tier confirmation.
+    // Same guard the ladder applies to `actionable`; the verdict string needs it
+    // too, because the string is what an agent reads.
+    let own_file = scan
+        .symbols
+        .iter()
+        .find(|s| s.name == symbol)
+        .map(|s| s.file_rel_path.clone());
+    let runtime_had_evidence = own_file
+        .as_deref()
+        .is_some_and(|f| spans.iter().any(|s| s.span.file.as_deref().is_some_and(|sf| sf == f)));
+
     // The cross-product that no single tier can produce.
-    let verdict = match (exists, flagged_dead, executed) {
-        (false, _, _) => "unknown_symbol",
-        (true, true, true) => "static_dead_but_executed__extractor_false_positive",
-        (true, true, false) => "dead_candidate__static_and_runtime_agree",
-        (true, false, true) => "live",
-        (true, false, false) => "reachable_but_unobserved__widen_the_window",
+    let verdict = match (exists, flagged_dead, executed, runtime_had_evidence) {
+        (false, ..) => "unknown_symbol",
+        (true, true, true, _) => "static_dead_but_executed__extractor_false_positive",
+        (true, true, false, true) => "dead_candidate__static_and_runtime_agree",
+        // Static says dead, runtime never ran the file: one tier, not two.
+        (true, true, false, false) => "dead_candidate__static_only__runtime_window_never_reached_it",
+        (true, false, true, _) => "live",
+        (true, false, false, _) => "reachable_but_unobserved__widen_the_window",
     };
 
     Liveness {
@@ -319,6 +342,7 @@ pub fn liveness(scan: &WorkspaceScan, spans: &[StoredSpan], symbol: &str) -> Liv
         exists_statically: exists,
         flagged_dead_static: flagged_dead,
         verdict,
+        runtime_had_evidence,
         window: Window::of(spans),
     }
 }
@@ -444,6 +468,70 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    /// A span in a named file, so a test can express "the window ran, but not
+    /// this symbol's file" — the distinction the M3 measurement showed the
+    /// verdict was collapsing.
+    fn stored_in_file(name: &str, file: &str) -> StoredSpan {
+        let mut s = stored(9, 99, None, 0, name, 10);
+        s.span.file = Some(file.into());
+        s
+    }
+
+    /// The M3 finding: a static false positive plus a window that never reached
+    /// the symbol's file was rendered as `..._agree`, which reads as two tiers
+    /// confirming each other. Only one tier spoke; the other was absent.
+    #[test]
+    fn a_window_that_never_ran_the_file_is_not_agreement() {
+        let scan = scan_with(vec!["wired"], vec!["wired"]);
+        let l = liveness(&scan, &[stored_in_file("other", "somewhere_else.rs")], "wired");
+        assert!(!l.runtime_had_evidence);
+        assert_eq!(
+            l.verdict,
+            "dead_candidate__static_only__runtime_window_never_reached_it"
+        );
+        assert!(
+            !l.verdict.contains("agree"),
+            "a silent tier must not be reported as agreeing: {}",
+            l.verdict
+        );
+    }
+
+    /// When the file *did* run and the symbol still did not, the runtime tier
+    /// has genuinely spoken and agreement is the honest word.
+    #[test]
+    fn a_window_that_ran_the_file_is_agreement() {
+        let scan = scan_with(vec!["wired"], vec!["wired"]);
+        let l = liveness(&scan, &[stored_in_file("neighbour", "a.rs")], "wired");
+        assert!(l.runtime_had_evidence);
+        assert_eq!(l.verdict, "dead_candidate__static_and_runtime_agree");
+    }
+
+    /// The ladder used to answer "is X safe to delete" by omission: at a small
+    /// budget it returned the head of a repo-wide list and dropped X entirely.
+    #[test]
+    fn the_ladder_answers_for_a_named_symbol_at_a_small_budget() {
+        let filler: Vec<String> = (0..80).map(|i| format!("filler_{i:02}")).collect();
+        let mut names: Vec<&str> = filler.iter().map(String::as_str).collect();
+        names.push("wanted");
+        let scan = scan_with(names.clone(), names);
+
+        let whole_repo = dead_code_ladder(&scan, &[], None, 300);
+        assert!(
+            !whole_repo.verdicts.iter().any(|v| v.symbol == "wanted"),
+            "precondition: at this budget the repo-wide ladder truncates `wanted` away"
+        );
+
+        let scoped = dead_code_ladder(&scan, &[], Some("wanted"), 300);
+        assert_eq!(scoped.verdicts.len(), 1);
+        assert_eq!(scoped.verdicts[0].symbol, "wanted");
+        assert!(!scoped.truncated);
+        assert_eq!(
+            scoped.counts.values().sum::<usize>(),
+            1,
+            "counts must describe the answer returned, not the repo behind it"
+        );
     }
 
     #[test]
@@ -642,7 +730,7 @@ mod tests {
         let scan = scan_with(vec!["ghost"], vec!["ghost"]);
         // Empty runtime window: the static tier is alone, so nothing is
         // actionable no matter how confident that tier is.
-        let l = dead_code_ladder(&scan, &[], 100_000);
+        let l = dead_code_ladder(&scan, &[], None, 100_000);
         assert_eq!(l.verdicts.len(), 1);
         let v = &l.verdicts[0];
         assert_eq!(v.verdict, "dead_candidate__static_only");
@@ -655,7 +743,7 @@ mod tests {
         let scan = scan_with(vec!["ghost", "other"], vec!["ghost"]);
         // Non-empty window that never saw `ghost`: static + runtime agree.
         let spans = vec![stored(1, 1, None, 0, "other", 10)];
-        let l = dead_code_ladder(&scan, &spans, 100_000);
+        let l = dead_code_ladder(&scan, &spans, None, 100_000);
         let v = l.verdicts.iter().find(|v| v.symbol == "ghost").unwrap();
         assert_eq!(v.verdict, "dead_candidate__static_and_runtime_agree");
         assert_eq!(v.agreeing_tiers, 2);
@@ -670,7 +758,7 @@ mod tests {
         // never exercised ghost's file and learned nothing about ghost.
         let mut elsewhere = stored(1, 1, None, 0, "other", 10);
         elsewhere.span.file = Some("elsewhere.rs".into());
-        let l = dead_code_ladder(&scan, &[elsewhere], 100_000);
+        let l = dead_code_ladder(&scan, &[elsewhere], None, 100_000);
         let v = l.verdicts.iter().find(|v| v.symbol == "ghost").unwrap();
         assert!(
             !v.actionable,
@@ -682,7 +770,7 @@ mod tests {
     fn ladder_surfaces_extractor_false_positives_as_a_calibration_corpus() {
         let scan = scan_with(vec!["runner"], vec!["runner"]);
         let spans = vec![stored(1, 1, None, 0, "runner", 10)];
-        let l = dead_code_ladder(&scan, &spans, 100_000);
+        let l = dead_code_ladder(&scan, &spans, None, 100_000);
         let v = &l.verdicts[0];
         assert_eq!(v.verdict, "extractor_false_positive__static_dead_but_executed");
         assert!(!v.actionable, "a false positive must never be actionable-for-deletion");
@@ -698,7 +786,7 @@ mod tests {
     #[test]
     fn ladder_finding_ids_match_code_health_so_verdicts_supersede() {
         let scan = scan_with(vec!["ghost"], vec!["ghost"]);
-        let l = dead_code_ladder(&scan, &[], 100_000);
+        let l = dead_code_ladder(&scan, &[], None, 100_000);
         assert_eq!(l.verdicts[0].finding_id, "dead:a.rs:10");
     }
 
@@ -708,7 +796,7 @@ mod tests {
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let scan = scan_with(refs.clone(), refs);
         for budget in [300usize, 1000, 5000] {
-            let l = dead_code_ladder(&scan, &[], budget);
+            let l = dead_code_ladder(&scan, &[], None, budget);
             let bytes = serde_json::to_string(&l.verdicts).unwrap().len();
             // Either it fits, or it says plainly that it could not. One verdict
             // carries several evidence strings and can exceed a small budget on
@@ -802,7 +890,12 @@ pub struct DeadCodeLadder {
 /// Build the ladder over every symbol the AST tier flagged dead, plus any
 /// symbol observed at runtime (so false positives surface even when the static
 /// tier is silent).
-pub fn dead_code_ladder(scan: &WorkspaceScan, spans: &[StoredSpan], token_budget: usize) -> DeadCodeLadder {
+pub fn dead_code_ladder(
+    scan: &WorkspaceScan,
+    spans: &[StoredSpan],
+    symbol: Option<&str>,
+    token_budget: usize,
+) -> DeadCodeLadder {
     let executed: BTreeMap<&str, usize> = spans.iter().fold(BTreeMap::new(), |mut m, s| {
         *m.entry(s.span.name.as_str()).or_insert(0) += 1;
         m
@@ -858,7 +951,9 @@ pub fn dead_code_ladder(scan: &WorkspaceScan, spans: &[StoredSpan], token_budget
         };
 
         let single = evidence.len() < 2;
-        *counts.entry(verdict.to_string()).or_insert(0) += 1;
+        if symbol.is_none_or(|want| want == d.name) {
+            *counts.entry(verdict.to_string()).or_insert(0) += 1;
+        }
         verdicts.push(SymbolVerdict {
             symbol: d.name.clone(),
             file: Some(d.file_rel_path.clone()),
@@ -876,6 +971,15 @@ pub fn dead_code_ladder(scan: &WorkspaceScan, spans: &[StoredSpan], token_budget
                 && executed_files.contains(d.file_rel_path.as_str()),
             finding_id: format!("dead:{}:{}", d.file_rel_path, d.line),
         });
+    }
+
+    // "Is *this* symbol safe to delete" is the question an agent actually asks,
+    // and the whole-repo ladder answered it by omission: at a 2000-token budget
+    // it returned 11 verdicts of 229 and dropped the one that was asked about.
+    // Filtering here rather than making the caller page through the ladder is
+    // the difference between an answer and a payload.
+    if let Some(want) = symbol {
+        verdicts.retain(|v| v.symbol == want);
     }
 
     // Rank so the most decision-ready entries survive truncation, and the
