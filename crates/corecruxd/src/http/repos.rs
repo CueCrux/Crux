@@ -61,7 +61,7 @@ pub(crate) struct RepoScanJob {
 }
 
 #[derive(Debug, serde::Deserialize)]
-pub(super) struct RepoTenantQuery {
+pub(crate) struct RepoTenantQuery {
     pub tenant_id: String,
 }
 

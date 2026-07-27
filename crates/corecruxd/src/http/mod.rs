@@ -989,6 +989,8 @@ pub(crate) fn router_with_route_auth(
         .route("/v1/code-intel/blast-radius", get(self::traces::get_blast_radius))
         .route("/v1/code-intel/liveness", get(self::traces::get_liveness))
         .route("/v1/code-intel/trace-diff", get(self::traces::get_trace_diff))
+        .route("/v1/code-intel/dead-code", get(self::traces::get_dead_code_ladder))
+        .route("/v1/repos/{repo_id}/spatial", get(self::traces::get_repo_spatial))
         .route(
             "/v1/projects/{id}/tenants/{tenantId}",
             axum::routing::delete(self::projects::delete_project_tenant),

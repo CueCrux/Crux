@@ -344,3 +344,50 @@ pub(super) async fn get_trace_diff(
     let d = crate::code_intel::trace_diff(&spans, a, b, q.token_budget);
     (StatusCode::OK, Json(d)).into_response()
 }
+
+/// `GET /v1/code-intel/dead-code` — the M6 evidence ladder.
+///
+/// One verdict per statically-flagged symbol, each carrying the tiers that
+/// spoke and whether they agree. `actionable` is true only when two independent
+/// tiers agree over a non-empty observation window; everything else is a lead.
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn get_dead_code_ladder(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<CodeIntelQuery>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
+        return problem.into_response();
+    }
+    let repo_id = q.repo_id.as_deref().unwrap_or("crux");
+    let Some(scan) = load_scan(&state, &q.tenant_id, repo_id).await else {
+        return problem_response(StatusCode::NOT_FOUND, "no scan for this repo; register it first");
+    };
+    let spans = load_spans(&state);
+    let ladder = crate::code_intel::dead_code_ladder(&scan, &spans, q.token_budget);
+    (StatusCode::OK, Json(ladder)).into_response()
+}
+
+/// `GET /v1/repos/{repo_id}/spatial` — the M8 spatial seam.
+///
+/// Deterministic coordinates for a future 3D renderer: districts (crates),
+/// buildings (files, sized by LOC and symbol count), and district-level edge
+/// bundles. No renderer here; `layout_digest` lets a client verify the map did
+/// not move between scans.
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn get_repo_spatial(
+    State(state): State<AppState>,
+    Path(repo_id): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<super::repos::RepoTenantQuery>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
+        return problem.into_response();
+    }
+    let Some(scan) = load_scan(&state, &q.tenant_id, &repo_id).await else {
+        return problem_response(StatusCode::NOT_FOUND, "no scan for this repo; register it first");
+    };
+    let spans = load_spans(&state);
+    let map = crate::code_intel::spatial_map(&scan, &spans);
+    (StatusCode::OK, Json(map)).into_response()
+}

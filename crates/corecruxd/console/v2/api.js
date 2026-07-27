@@ -15,7 +15,7 @@
 // Every call is same-origin credentialed; the browser never holds a bearer
 // token (the daemon authenticates the session at its own origin).
 //
-// 182 read endpoints, generated from the route manifest.
+// 184 read endpoints, generated from the route manifest.
 
 /**
  * Append a plain query object to a path as a URL search string.
@@ -54,6 +54,7 @@ const LITERAL_GET_PATHS = Object.freeze({
   '/v1/bootstrap/status': true,
   '/v1/cloud/access-contract': true,
   '/v1/code-intel/blast-radius': true,
+  '/v1/code-intel/dead-code': true,
   '/v1/code-intel/liveness': true,
   '/v1/code-intel/path': true,
   '/v1/code-intel/trace-diff': true,
@@ -246,6 +247,9 @@ const CruxApi = Object.freeze({
   },
   codeIntelBlastRadius(query) {
     return fetch(withQuery(`/v1/code-intel/blast-radius`, query), { credentials: 'same-origin' });
+  },
+  codeIntelDeadCode(query) {
+    return fetch(withQuery(`/v1/code-intel/dead-code`, query), { credentials: 'same-origin' });
   },
   codeIntelLiveness(query) {
     return fetch(withQuery(`/v1/code-intel/liveness`, query), { credentials: 'same-origin' });
@@ -621,6 +625,9 @@ const CruxApi = Object.freeze({
   },
   reposByRepoIdCodemap(repo_id, query) {
     return fetch(withQuery(`/v1/repos/${encodeURIComponent(repo_id)}/codemap`, query), { credentials: 'same-origin' });
+  },
+  reposByRepoIdSpatial(repo_id, query) {
+    return fetch(withQuery(`/v1/repos/${encodeURIComponent(repo_id)}/spatial`, query), { credentials: 'same-origin' });
   },
   reposByRepoIdSymbolsResolve(repo_id, query) {
     return fetch(withQuery(`/v1/repos/${encodeURIComponent(repo_id)}/symbols/resolve`, query), { credentials: 'same-origin' });
