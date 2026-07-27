@@ -222,8 +222,9 @@ pub fn list_tools_with_flags(
         ToolDefinition {
             name: "query".to_string(),
             description: "Search the retrieval index using BM25 + graph fusion. Returns \
-                          scored results with query coverage. Use `token_budget` to cap \
-                          results by token count (60-80% cost reduction vs top-K)."
+                          scored results with query coverage. ALWAYS pass `token_budget` — \
+                          it is the primary defence against output-token blowouts and cuts \
+                          cost 60-80% vs top-K. Omitting it returns an untrimmed result set."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -231,7 +232,7 @@ pub fn list_tools_with_flags(
                     "tenant_id":    { "type": "string",  "description": "Tenant identifier for scoped search" },
                     "query":        { "type": "string",  "description": "Natural-language search query" },
                     "limit":        { "type": "integer", "description": "Maximum results to return", "default": 10 },
-                    "token_budget": { "type": "integer", "description": "Optional token budget for result trimming" },
+                    "token_budget": { "type": "integer", "description": "Token ceiling for the trimmed result set. Pass on EVERY call, including exploratory ones. Conventional defaults: 500 to confirm a fact, 2000 for a scan, 4000 for a design pull. Prefer this over `limit` — it caps cost directly instead of by result count." },
                     "min_score":    { "type": "number",  "description": "Minimum relevance score threshold" }
                 },
                 "required": ["tenant_id", "query"],
@@ -245,25 +246,29 @@ pub fn list_tools_with_flags(
             name: "query_scan".to_string(),
             description: "Lightweight scan returning metadata only (no content). Useful for \
                           checking what exists before expanding. Returns scores and token \
-                          counts per result. Use to decide what to expand."
+                          counts per result. Use to decide what to expand. ALWAYS pass \
+                          `token_budget` — 2000 is the conventional default for a scan."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "tenant_id": { "type": "string",  "description": "Tenant identifier" },
-                    "query":     { "type": "string",  "description": "Search query" },
-                    "limit":     { "type": "integer", "description": "Maximum results", "default": 20 }
+                    "tenant_id":    { "type": "string",  "description": "Tenant identifier" },
+                    "query":        { "type": "string",  "description": "Search query" },
+                    "limit":        { "type": "integer", "description": "Maximum results", "default": 20 },
+                    "token_budget": { "type": "integer", "description": "Token ceiling for the scan. Pass on EVERY call, including exploratory ones. 2000 is the conventional scan default." }
                 },
                 "required": ["tenant_id", "query"],
                 "examples": [
-                    { "tenant_id": "my-project", "query": "authentication flow", "limit": 20 }
+                    { "tenant_id": "my-project", "query": "authentication flow", "limit": 20, "token_budget": 2000 }
                 ]
             }),
         },
         ToolDefinition {
             name: "query_expand".to_string(),
             description: "Expand previously retrieved results by segment/doc IDs to get full \
-                          content."
+                          content. This is the expensive half of the scan-then-expand \
+                          pattern — ALWAYS pass `token_budget`, and expand only the IDs \
+                          the scan showed you need."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -273,11 +278,12 @@ pub fn list_tools_with_flags(
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Result IDs from a prior query/query_scan to expand"
-                    }
+                    },
+                    "token_budget": { "type": "integer", "description": "Token ceiling for the expanded content. Pass on EVERY call. 4000 is the conventional default for a design pull; use less when confirming a single fact." }
                 },
                 "required": ["tenant_id", "result_ids"],
                 "examples": [
-                    { "tenant_id": "my-project", "result_ids": ["r_01J_abc", "r_01J_def"] }
+                    { "tenant_id": "my-project", "result_ids": ["r_01J_abc", "r_01J_def"], "token_budget": 4000 }
                 ]
             }),
         },
@@ -286,12 +292,16 @@ pub fn list_tools_with_flags(
             name: "store_fact".to_string(),
             description: "Store a key-value fact against an entity. Facts carry optional \
                           receipt references and confidence scores. Set `private: true` to \
-                          scope the fact to your agent identity only."
+                          scope the fact to your agent identity only. Use the conventional \
+                          entity prefixes (see the `entity` field) — they are what keeps \
+                          `query_facts` recall consistent across sessions. Store facts \
+                          deliberately, not reflexively: volume dilutes recall, so do not \
+                          drive this tool from a PostToolUse hook."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "entity":         { "type": "string",  "description": "Entity the fact belongs to" },
+                    "entity":         { "type": "string",  "description": "Entity the fact belongs to. Conventional prefixes, which downstream recall depends on: `execplan:<slug>` (keys `decision:<topic>`, `milestone:M<n>`, `gate:M<n>`; decision values must carry a commit_sha) · `bench:<id>` (value requires {metric, value, corpus, lane_flags, commit_sha, run_id} — `corpus` is mandatory, misattributing a corpus is the known failure mode) · `incident:<YYYY-MM-DD>` (value requires {symptom, cause, fix_sha, repro_steps}) · `design:<slug>` (value carries a `doc_path` pointing at the design doc)." },
                     "key":            { "type": "string",  "description": "Fact key" },
                     "value":          { "type": "string",  "description": "Fact value" },
                     "source_receipt": { "type": "string",  "description": "CROWN receipt reference" },
@@ -321,7 +331,9 @@ pub fn list_tools_with_flags(
                           only (a binary stale-demotion, not a continuous time-decay \
                           curve); stored confidence is never mutated. Pass \
                           `min_effective_confidence` to drop facts below a floor. Private \
-                          facts are visible only to their owning agent."
+                          facts are visible only to their owning agent. ALWAYS pass \
+                          `token_budget` — 500 is the conventional default for confirming \
+                          a fact."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -329,7 +341,7 @@ pub fn list_tools_with_flags(
                     "query":        { "type": "string",  "description": "Keyword search across fact values, keys, and entities" },
                     "entity":       { "type": "string",  "description": "Filter to a specific entity" },
                     "top_k":        { "type": "integer", "description": "Maximum facts to return", "default": 10 },
-                    "token_budget": { "type": "integer", "description": "Optional token budget" },
+                    "token_budget": { "type": "integer", "description": "Token ceiling for the returned facts. Pass on EVERY call, including exploratory ones. Conventional defaults: 500 to confirm a fact, 2000 for a scan, 4000 for a design pull." },
                     "include_superseded": { "type": "boolean", "description": "If true, also return facts explicitly retired via cross-entity supersession (their `superseded_by` is exposed). Default false (retired facts are hidden).", "default": false },
                     "as_of": { "type": "string", "description": "Bi-temporal as-of filter (RFC 3339). Return only facts that were TRUE IN THE WORLD at this instant — whose valid-time interval [valid_from, valid_to) contains it — regardless of when they were learned. Omit for present-day recall." },
                     "min_effective_confidence": { "type": "number", "description": "Confidence floor in 0..1. Drop facts whose recall-time EFFECTIVE confidence (stored confidence, halved once the fact is past its freshness horizon) is below this. The response's structuredContent carries `filtered_below_threshold` so you can tell 'no facts' apart from 'nothing above the floor' and fall back to a non-LLM path. Omit for no floor." }
