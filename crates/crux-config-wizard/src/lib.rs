@@ -18,12 +18,14 @@ pub mod commands;
 pub mod compose;
 pub mod config;
 pub mod drift;
+pub mod hooks_install;
 pub mod profile;
 pub mod selfcheck;
 
 pub use compose::{compose_file, ComposeError, ComposeReport};
 pub use config::{AgentProfileConfig, ConfigError, ProfileEntry};
 pub use drift::{check_workspace, DriftReport};
+pub use hooks_install::{audit as audit_hooks, ComponentState, InstallAudit};
 pub use profile::{load_bundled_profiles, ProfileError, ProfileFragment, ProfileFrontmatter};
 pub use selfcheck::{evaluate as evaluate_boot, BootObservations};
 

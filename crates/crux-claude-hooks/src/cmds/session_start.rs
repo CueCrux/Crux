@@ -185,6 +185,17 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
                 eprintln!("crux-hook session-start: wizard drift check failed: {err}");
             }
         }
+
+        // Banner-stack self-check. The drift check above covers the *composed
+        // profile text*; this covers the *installed client components* — a
+        // different failure with the same symptom of looking fine. Channels 1
+        // and 3 (statusline, first-reply card) are the two a human can see, so
+        // when they are missing or stale nobody notices: the agent brief still
+        // arrives, in a place only the model reads. Filesystem-only, no daemon
+        // I/O, and silent when healthy so it costs nothing on a good machine.
+        if let Some(advice) = crux_config_wizard::hooks_install::audit().advice() {
+            sections.push((Stability::Stable, format!("**Crux banner**\n{advice}")));
+        }
     }
 
     // Boot self-check: catch the class of failure where the daemon is healthy

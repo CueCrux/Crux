@@ -68,4 +68,33 @@ pub enum Command {
         #[arg(long)]
         strict: bool,
     },
+    /// Install or inspect the Claude Code hooks and banner stack.
+    ///
+    /// Self-contained: the assets ship inside this binary, so a client machine
+    /// needs nothing else installed. `corecruxctl hooks install` remains
+    /// available and additionally configures the daemon endpoint the hooks read.
+    Hooks {
+        #[command(subcommand)]
+        action: HooksAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HooksAction {
+    /// Write the hook scripts + banner stack and wire them into settings.json.
+    /// Idempotent: unchanged files are not rewritten, foreign hooks are
+    /// preserved, and an existing `statusLine` is never overwritten.
+    Install {
+        /// Target the user settings (`~/.claude/settings.json`) instead of the
+        /// project-local `.claude/settings.local.json`.
+        #[arg(long)]
+        user: bool,
+    },
+    /// Report which hooks are wired, and whether the banner stack on disk
+    /// matches the bytes this binary ships.
+    Status {
+        /// Inspect the user settings rather than the project-local file.
+        #[arg(long)]
+        user: bool,
+    },
 }

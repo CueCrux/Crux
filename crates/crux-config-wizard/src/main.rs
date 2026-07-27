@@ -28,6 +28,14 @@ fn main() -> ExitCode {
     let args = cli::Cli::parse();
     let workspace = args.workspace.clone().unwrap_or_else(|| PathBuf::from("."));
 
+    // `hooks` is a standalone client-side action: it composes nothing, so it is
+    // dispatched here rather than threaded through the profile pipeline in
+    // `run`, which is built around a CommandReport it has no business faking.
+    if let cli::Command::Hooks { action } = args.command {
+        let workspace = workspace.canonicalize().unwrap_or(workspace);
+        return run_hooks(&workspace, action);
+    }
+
     match run(&workspace, args.command) {
         Ok(code) => code,
         Err(e) => {
@@ -69,6 +77,8 @@ fn run(workspace: &Path, cmd: cli::Command) -> std::io::Result<ExitCode> {
         cli::Command::Add { name } => run_add(&workspace, &name)?,
         cli::Command::Remove { name } => run_remove(&workspace, &name)?,
         cli::Command::Diff { strict } => run_diff(&workspace, strict)?,
+        // Dispatched in `main` before this pipeline runs.
+        cli::Command::Hooks { .. } => unreachable!("hooks is handled in main()"),
     };
     emit(&report);
 
@@ -136,4 +146,45 @@ fn emit(report: &CommandReport) {
 fn is_tty() -> bool {
     use std::io::IsTerminal as _;
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+/// `crux-config-wizard hooks {install,status}`.
+///
+/// Deliberately self-contained: everything it writes is embedded in this binary,
+/// so a client machine with only `crux-hook` installed can repair its own banner
+/// stack without `corecruxctl` or a source checkout. A hooks failure is reported
+/// and exits non-zero, but it never touches the composed profile files.
+fn run_hooks(workspace: &Path, action: cli::HooksAction) -> ExitCode {
+    let (result, what) = match action {
+        cli::HooksAction::Install { user } => {
+            let project = (!user).then(|| workspace.to_path_buf());
+            (
+                crux_config_wizard::hooks_install::install(user, project).map(|summary| {
+                    println!("{summary}");
+                }),
+                "install",
+            )
+        }
+        cli::HooksAction::Status { user } => {
+            let project = (!user).then(|| workspace.to_path_buf());
+            let r = crux_config_wizard::hooks_install::status(user, project).map(|report| {
+                println!("{report}");
+            });
+            // Status also reports banner-stack drift, which plain settings
+            // inspection cannot see: a present-but-stale script looks wired.
+            let a = crux_config_wizard::hooks_install::audit();
+            match a.advice() {
+                Some(advice) => println!("banner stack: {advice}"),
+                None => println!("banner stack: current"),
+            }
+            (r, "status")
+        }
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("hooks {what}: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
