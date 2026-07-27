@@ -99,6 +99,7 @@ mod shard_map;
 mod status_feed;
 mod storybook;
 mod structured_log;
+mod symbol_resolve;
 mod sync_scheduler;
 mod tenant_metadata;
 #[cfg(test)]

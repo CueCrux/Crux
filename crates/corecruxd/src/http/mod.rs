@@ -971,6 +971,12 @@ pub(crate) fn router_with_route_auth(
             "/v1/repos/{repo_id}/codemap",
             get(self::repos::get_repo_codemap),
         )
+        // Runtime→static join: map a (file, name[, line]) callsite onto a
+        // stable symbol_id. Consumed by the span layer; never guesses.
+        .route(
+            "/v1/repos/{repo_id}/symbols/resolve",
+            get(self::repos::get_symbol_resolve),
+        )
         .route(
             "/v1/projects/{id}/tenants/{tenantId}",
             axum::routing::delete(self::projects::delete_project_tenant),

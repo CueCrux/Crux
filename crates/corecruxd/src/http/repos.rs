@@ -753,6 +753,110 @@ pub(super) struct CodemapQuery {
     pub format: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct SymbolResolveQuery {
+    pub tenant_id: String,
+    /// Repo-relative path, exactly as `tracing::Metadata::file()` reports it.
+    pub file: String,
+    /// Symbol name. For `#[tracing::instrument]` spans this is the span name,
+    /// which defaults to the function name.
+    pub name: String,
+    /// Callsite line, when known. Optional because it is only needed to break
+    /// `(file, name)` collisions — 2.02% of symbols in the Crux workspace.
+    #[serde(default)]
+    pub line: Option<usize>,
+    /// Optional `fn` / `struct` / `enum` / … pre-filter.
+    #[serde(default)]
+    pub kind: Option<String>,
+}
+
+/// `GET /v1/repos/{repo_id}/symbols/resolve` — map a `(file, name[, line])`
+/// callsite onto a stable `symbol_id`.
+///
+/// This is the runtime→static join the span layer (M2) depends on. It answers
+/// with an explicit confidence and **never guesses**: an unresolvable collision
+/// returns `confidence: "ambiguous"` with the candidate list, because
+/// mis-attributing a trace to the wrong symbol corrupts silently.
+///
+/// `404` means no symbol of that name exists in that file — a genuine miss,
+/// distinct from an ambiguous match, which is `200`.
+pub(super) async fn get_symbol_resolve(
+    State(state): State<AppState>,
+    Path(repo_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<SymbolResolveQuery>,
+) -> impl IntoResponse {
+    let tenant_id = query.tenant_id.trim().to_string();
+    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &tenant_id) {
+        return problem.into_response();
+    }
+
+    let store = state.fact_store.read().await;
+    if crate::repo_registry::get_repo(&store, &tenant_id, &repo_id).is_none() {
+        drop(store);
+        return problem_response(StatusCode::NOT_FOUND, "repo not found");
+    }
+    let scan_json = crate::repo_registry::load_scan_json(&store, &tenant_id, &repo_id);
+    drop(store);
+
+    let Some(scan_json) = scan_json else {
+        return problem_response(
+            StatusCode::NOT_FOUND,
+            "no scan persisted for this repo. Register with root_path (POST /v1/repos) to run a scan.",
+        );
+    };
+    let scan: crate::workspace_scan::WorkspaceScan = match serde_json::from_str(&scan_json) {
+        Ok(scan) => scan,
+        Err(err) => {
+            return problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("persisted scan failed to decode: {err}"),
+            )
+        }
+    };
+
+    let resolver = crate::symbol_resolve::SymbolResolver::from_scan(&scan);
+    if resolver.is_empty() {
+        // Distinguish "this scan indexed nothing" from "that symbol isn't here";
+        // otherwise an empty scan looks like a repo full of missing symbols.
+        return problem_response(
+            StatusCode::CONFLICT,
+            "the persisted scan contains no symbols; re-scan the repo before resolving callsites",
+        );
+    }
+    let Some(resolution) = resolver.resolve(&query.file, &query.name, query.line, query.kind.as_deref()) else {
+        return problem_response(
+            StatusCode::NOT_FOUND,
+            format!("no symbol named '{}' in '{}'", query.name, query.file),
+        );
+    };
+
+    let symbol = resolution.symbol_id().and_then(|id| resolver.get(id));
+    let clusters = resolver.collision_clusters().len();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "repo_id": repo_id,
+            "tenant_id": tenant_id,
+            "query": {
+                "file": query.file,
+                "name": query.name,
+                "line": query.line,
+                "kind": query.kind,
+            },
+            "resolution": resolution,
+            "symbol": symbol,
+            // How ambiguous this repo is overall — lets a caller judge how much
+            // to trust joins here without a second round trip.
+            "index": {
+                "symbols": resolver.len(),
+                "collision_clusters": clusters,
+            },
+        })),
+    )
+        .into_response()
+}
+
 /// `GET /v1/repos/{repo_id}/codemap` — serve the AST-derived code map the
 /// daemon persisted when the repo was registered (or last re-indexed by the
 /// watch loop). This is the read side of the `POST /v1/repos` scan: same
