@@ -104,6 +104,7 @@ mod sync_scheduler;
 mod tenant_metadata;
 #[cfg(test)]
 mod test_support;
+mod trace_store;
 mod update;
 mod usage_submit;
 mod vault_watcher;
@@ -1078,6 +1079,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // handlers route inline (immediate); this sweep is the catch-all so a flag
     // from a non-HTTP path never sits unrouted. Gated: with dedup off, no flags
     // are ever produced, so the task is not spawned.
+    // Runtime trace flusher (ExecPlan crux-runtime-codemap M4). Drains the M2
+    // ring, resolves each span to a stable symbol_id, and appends JSONL. Spawned
+    // only when BOTH capture and persistence are on — capture alone is a valid
+    // configuration for live inspection with nothing written to disk.
+    if crate::trace_store::persist_enabled() {
+        if let Some(ring) = crate::trace_span_ring() {
+            let ring = std::sync::Arc::clone(ring);
+            let fact_store = state.fact_store.clone();
+            let path = config.data_dir.join("traces").join("spans.jsonl");
+            let interval_secs = crate::trace_store::flush_interval_secs();
+            let max_records = crate::trace_store::max_records();
+            let repo_id = std::env::var("CORECRUXD_TRACE_REPO_ID").unwrap_or_else(|_| "crux".to_string());
+            let tenant_id = std::env::var("CORECRUXD_TRACE_TENANT_ID").unwrap_or_else(|_| "local".to_string());
+            let mut rx = shutdown_tx.subscribe();
+            match crate::trace_store::TraceStore::open(path.clone(), max_records) {
+                Ok(store) => {
+                    info!(path = %path.display(), interval_secs, "trace-flusher-started");
+                    tokio::spawn(async move {
+                        let mut cache = crate::trace_store::ResolverCache::default();
+                        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+                        loop {
+                            tokio::select! {
+                                _ = interval.tick() => {
+                                    let spans = ring.drain();
+                                    if spans.is_empty() { continue; }
+                                    let resolver = {
+                                        let store_guard = fact_store.read().await;
+                                        cache.get(&store_guard, &tenant_id, &repo_id)
+                                    };
+                                    match store.append_resolved(spans, resolver.as_deref()) {
+                                        Ok(r) => info!(
+                                            drained = r.spans_drained, resolved = r.resolved,
+                                            ambiguous = r.ambiguous, missed = r.missed,
+                                            no_location = r.no_location, "trace-flush"
+                                        ),
+                                        // Never fail loudly: a full disk must not
+                                        // take down the daemon over telemetry.
+                                        Err(err) => tracing::warn!(error = %err, "trace-flush-failed"),
+                                    }
+                                }
+                                _ = rx.recv() => {
+                                    // Final drain so a clean shutdown does not
+                                    // discard the last interval's spans.
+                                    let spans = ring.drain();
+                                    if !spans.is_empty() {
+                                        let resolver = {
+                                            let store_guard = fact_store.read().await;
+                                            cache.get(&store_guard, &tenant_id, &repo_id)
+                                        };
+                                        let _ = store.append_resolved(spans, resolver.as_deref());
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                }
+                Err(err) => tracing::warn!(error = %err, "trace-store-open-failed; persistence disabled"),
+            }
+        }
+    }
+
     if config.semantic_dedup_threshold.is_some() {
         let fact_store = state.fact_store.clone();
         let mut rx = shutdown_tx.subscribe();

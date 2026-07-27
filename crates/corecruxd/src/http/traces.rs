@@ -12,7 +12,106 @@
 //! distinguish "capture is off" from "capture is on and nothing ran", and those
 //! are very different answers.
 
-use super::{require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Query, State, StatusCode};
+use super::{
+    problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Path, Query, State, StatusCode,
+};
+
+/// Open the persisted store, or `None` when persistence is off.
+fn open_store(state: &AppState) -> Option<crate::trace_store::TraceStore> {
+    if !crate::trace_store::persist_enabled() {
+        return None;
+    }
+    crate::trace_store::TraceStore::open(
+        state.data_dir.join("traces").join("spans.jsonl"),
+        crate::trace_store::max_records(),
+    )
+    .ok()
+}
+
+/// `GET /v1/traces/{trace_id}` — one persisted trace, spans resolved to symbols.
+///
+/// This is the M4 read side: the ordered path a request actually took through
+/// the code, with each step carrying the `symbol_id` it was joined to and the
+/// `join` quality that produced it.
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn get_trace(
+    State(state): State<AppState>,
+    Path(trace_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+    let Ok(trace_id) = trace_id.parse::<u64>() else {
+        return problem_response(StatusCode::BAD_REQUEST, "trace_id must be a u64");
+    };
+    let Some(store) = open_store(&state) else {
+        return problem_response(
+            StatusCode::CONFLICT,
+            format!(
+                "trace persistence is off; set {}=1",
+                crate::trace_store::TRACE_PERSIST_ENV
+            ),
+        );
+    };
+    match store.load_trace(trace_id) {
+        Ok(spans) if spans.is_empty() => problem_response(StatusCode::NOT_FOUND, "no such trace"),
+        Ok(spans) => {
+            let resolved = spans.iter().filter(|s| s.symbol_id.is_some()).count();
+            let total_ns: u64 = spans
+                .iter()
+                .filter(|s| s.span.depth == 0)
+                .map(|s| s.span.duration_ns)
+                .sum();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "trace_id": trace_id,
+                    "span_count": spans.len(),
+                    "resolved_symbols": resolved,
+                    "root_duration_ns": total_ns,
+                    "spans": spans,
+                })),
+            )
+                .into_response()
+        }
+        Err(err) => problem_response(StatusCode::INTERNAL_SERVER_ERROR, format!("trace read failed: {err}")),
+    }
+}
+
+/// `GET /v1/traces` — persisted traces, newest first.
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn list_traces(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<TraceSpansQuery>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+    let Some(store) = open_store(&state) else {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "persist_enabled": false,
+                "traces": [],
+                "hint": format!("set {}=1 to persist traces", crate::trace_store::TRACE_PERSIST_ENV),
+            })),
+        )
+            .into_response();
+    };
+    match store.list_traces(query.limit.unwrap_or(100)) {
+        Ok(traces) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "persist_enabled": true,
+                "traces": traces.iter().map(|(id, n)| serde_json::json!({"trace_id": id, "span_count": n})).collect::<Vec<_>>(),
+            })),
+        )
+            .into_response(),
+        Err(err) => problem_response(StatusCode::INTERNAL_SERVER_ERROR, format!("trace list failed: {err}")),
+    }
+}
 
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct TraceSpansQuery {
