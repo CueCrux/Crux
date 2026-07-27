@@ -30,9 +30,17 @@ pub use selfcheck::{evaluate as evaluate_boot, BootObservations};
 /// Default profile set for the CueCrux workspace, per the M6 of the
 /// agent-config-wizard ExecPlan. Other workspaces opt in to whichever subset
 /// matches their posture.
+///
+/// `claude-5` + `agent-harness-parity` replace `token-conservation` here: the
+/// former pair splits response-shape guidance by target (Claude Code's own
+/// system prompt supplies most of it, non-Claude harnesses need it spelled
+/// out), where `token-conservation` rendered one body with fixed numeric
+/// output caps into both. `token-conservation` stays bundled for workspaces
+/// still on pre-Claude-5 models.
 pub const DEFAULT_PROFILES: &[&str] = &[
     "memory-practices",
-    "token-conservation",
+    "claude-5",
+    "agent-harness-parity",
     "execplan-discipline",
     "code-grounding",
     "scratchpad-survival",
@@ -72,12 +80,17 @@ mod tests {
 
     #[test]
     fn default_profiles_present_and_unique() {
-        assert_eq!(DEFAULT_PROFILES.len(), 10);
+        assert_eq!(DEFAULT_PROFILES.len(), 11);
         let mut seen = std::collections::HashSet::new();
         for p in DEFAULT_PROFILES {
             assert!(seen.insert(*p), "duplicate default profile '{p}'");
         }
         assert!(DEFAULT_PROFILES.contains(&"boot-banner"), "boot-banner in default set");
+        assert!(DEFAULT_PROFILES.contains(&"claude-5"), "claude-5 in default set");
+        assert!(
+            !DEFAULT_PROFILES.contains(&"token-conservation"),
+            "token-conservation is superseded by claude-5 and must not ship in the default set"
+        );
     }
 
     #[test]

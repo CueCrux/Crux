@@ -1,7 +1,7 @@
 +++
 name = "code-grounding"
-version = 1
-description = "Verify claims against the actual codebase before attribution. Codifies the Insights-report `Code Grounding` snippet (22 buggy_code + 15 wrong_approach events)."
+version = 2
+description = "Cite the source for any claim that names code. v2 narrows the profile to its two durable rules — source citation and corpus identity — after an Opus 5 review: the former 'memory-versus-current-state' and 'when the result surprises you' sections were re-verification instructions, which cost tokens without improving results on Claude 5 generation models (the memory rule survives for non-Claude harnesses in agent-harness-parity). The retrieval-budget rule moved to the MCP tool schemas. Historical driver: the Insights report's 22 buggy_code and 15 wrong_approach events."
 targets = ["claude_md", "agents_md"]
 order = 40
 risk_class = "low"
@@ -11,28 +11,17 @@ risk_class = "low"
 
 ### No unverified claims
 
-- Before proposing an architectural change or attributing a benchmark lift to a fix, verify the claim against the actual codebase path and the actual corpus.
-- Every claim that names a function, file, or flag includes a `file:line` reference (markdown link) or a `commit_sha` so the reader can verify.
-- "I think this is in `foo.rs`" is not a claim. Read the file first, then state.
+- Before proposing an architectural change, or attributing a benchmark lift to a fix, check the claim
+  against the actual codebase path and the actual corpus.
+- Every claim that names a function, file, or flag carries a `file:line` reference (as a markdown link)
+  or a `commit_sha`, so the reader can check it independently.
+- "I think this is in `foo.rs`" is not a claim. Read the file, then state.
+
+This is a citation requirement, not a re-checking ritual: the cost is naming your source as you write,
+not going back over finished work.
 
 ### Corpus identity is mandatory
 
-When reporting any retrieval / benchmark result, declare the corpus by name (`LME-S`, `LME-M`, `LME-500`, custom-name). Misattributing a lift on LME-S to LME-M is the failure mode the Insights report flagged.
-
-### Substrate scans need budgets
-
-Calls to `query`, `query_scan`, `query_facts`, `query_expand` are not free. Pass `token_budget` on every call, even exploratory ones. Default to 500 unless you've earned more.
-
-### Memory-versus-current-state rule
-
-A Crux memory record that names a specific function, file, or flag is a claim that it existed *when the memory was written*. Before recommending action based on a memory:
-
-- If the memory names a file path: `Read` the file or grep for it.
-- If the memory names a function or flag: grep for it.
-- If the user is about to act on your recommendation, verify first.
-
-"The memory says X exists" is not the same as "X exists now."
-
-### When the result surprises you
-
-If a benchmark or retrieval result contradicts what you expected, the first move is to verify the result, not to invent a theory for why it changed. Re-run with the same inputs. Confirm the corpus. Check the commit_sha.
+Any retrieval or benchmark result names its corpus (`LME-S`, `LME-M`, `LME-500`, or the custom name).
+A lift measured on one corpus reported against another is the known failure mode here, and it is not
+recoverable after the fact — the number and the corpus travel together or the number is worthless.

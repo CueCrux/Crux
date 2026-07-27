@@ -1,7 +1,7 @@
 +++
 name = "workspace-cuecrux"
-version = 3
-description = "CueCrux workspace specifics: ExecPlan paths, daemon ports, live-session coordination protocol, Chainguard rule, JobClaw/MirrorClaw, three-place wiring. CueCrux-internal — only enable inside the CueCrux planning monorepo."
+version = 4
+description = "CueCrux workspace specifics: ExecPlan paths, daemon endpoints, live-session coordination protocol, Chainguard rule, JobClaw/MirrorClaw, three-place wiring. v4 corrects the daemon endpoints from loopback to the live Tailscale host (the rendered files had been hand-patched, so regenerating would have silently reverted them) and demotes the PlanCrux read and the coordination check from standalone boot rituals to steps of the single sequence in memory-practices. CueCrux-internal — only enable inside the CueCrux planning monorepo."
 targets = ["claude_md", "agents_md"]
 order = 90
 risk_class = "low"
@@ -16,9 +16,9 @@ risk_class = "low"
 - Preferred path: `PlanCrux/.agent/execplans/<slug>.md`.
 - Format defined in `PlanCrux/.agent/PLANS.md` (Purpose, Non-goals, Context, Constraints, Proposed design, Milestones, Test plan, Rollout/rollback, Risks, Progress, Decision log).
 
-### PlanCrux read-once boot
+### PlanCrux reference reading
 
-On the first interaction of a session, read `PlanCrux/README.md` and `PlanCrux/buildguide.md` once. Retain key goals, definitions, canonical flows, constraints, and Do/Don't lists as working context. Re-read only when:
+Not part of the boot sequence — read `PlanCrux/README.md` and `PlanCrux/buildguide.md` when the task actually touches PlanCrux goals, definitions, or canonical flows, then retain them as working context. Re-read only when:
 
 - The user explicitly asks to refresh.
 - You detect a version change (`PlanCrux/README.version` or front-matter, or last-modified timestamp).
@@ -26,10 +26,10 @@ On the first interaction of a session, read `PlanCrux/README.md` and `PlanCrux/b
 
 ### Crux Daemon endpoints
 
-- HTTP API: `127.0.0.1:14800` (or configured).
-- MCP server: `127.0.0.1:14801`.
-- gRPC: `127.0.0.1:4007`.
-- Do not change these defaults; see `Crux/CLAUDE.md` "Port 14800" rule.
+- HTTP API: `http://100.70.12.73:14800` on the Tailscale host `crux`.
+- MCP server: `http://100.70.12.73:14801/mcp`.
+- gRPC: `100.70.12.73:4007`.
+- Use `.crux/agent-profile.toml` / `~/.config/cuecrux/env` as the source of truth for runtime endpoints; do not assume loopback endpoints unless the operator explicitly asks for a local daemon.
 
 ### ExecPlan Work board
 
@@ -46,7 +46,7 @@ The daemon's coordination plane (`CORECRUXD_COORD=1`, live on host crux since v0
 
 Protocol when other sessions may be active on the same repo:
 
-1. **Boot**: read the boot banner's `— LIVE SESSIONS —` section (or call `coord_status`). It lists peers' focus, paths, leases, and ⚠ overlap rows.
+1. **Check who is live** (boot step 5): the boot banner's `— LIVE SESSIONS —` section, or `coord_status`. It lists peers' focus, paths, leases, and ⚠ overlap rows.
 2. **Announce on every ExecPlan or milestone switch**: `coord_announce(session_id, project_id, execplan_slug, milestone, paths, note?)`. Re-announce replaces; `ttl_seconds: 0` clears on the way out. The response carries `overlaps[]` — surface any to the operator before proceeding.
 3. **Lease before multi-file mutation**: `punch_in` a `tree://<dir>` or `file://<path>` punchcard for paths you will modify. The PreToolUse hook checks leases on every Edit/Write.
 4. **Exit cleanly**: prefer `create_handoff` (bundles facts + work ids) over letting intents/leases time out; clear your intent with a zero-TTL announce when finishing.
