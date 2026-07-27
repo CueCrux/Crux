@@ -7,6 +7,10 @@ license.workspace = true
 build = "build.rs"
 
 [dependencies]
+# Owns the client-side hook + banner-stack install (assets, settings.json merge).
+# corecruxctl is the front door; the wizard crate holds the logic so `crux-hook`,
+# which already depends on it, carries the assets to client machines too.
+crux-config-wizard = { path = "../crux-config-wizard" }
 base64 = { workspace = true }
 blake3 = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
