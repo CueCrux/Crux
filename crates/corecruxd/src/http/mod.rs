@@ -984,6 +984,11 @@ pub(crate) fn router_with_route_auth(
         .route("/v1/traces/stats", get(self::traces::get_trace_stats))
         .route("/v1/traces/spans", get(self::traces::get_trace_spans))
         .route("/v1/traces/{trace_id}", get(self::traces::get_trace))
+        // M5 agent query API — every route takes a mandatory token_budget.
+        .route("/v1/code-intel/path", get(self::traces::get_code_path))
+        .route("/v1/code-intel/blast-radius", get(self::traces::get_blast_radius))
+        .route("/v1/code-intel/liveness", get(self::traces::get_liveness))
+        .route("/v1/code-intel/trace-diff", get(self::traces::get_trace_diff))
         .route(
             "/v1/projects/{id}/tenants/{tenantId}",
             axum::routing::delete(self::projects::delete_project_tenant),

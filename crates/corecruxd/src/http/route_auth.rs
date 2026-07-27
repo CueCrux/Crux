@@ -354,6 +354,12 @@ pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContra
     // Runtime span capture (ExecPlan crux-runtime-codemap M2). Read-only, and
     // admin-scoped: captured spans expose internal file paths and call
     // structure, which is operator information rather than tenant data.
+    // M5 agent query API: same posture as /v1/traces — it exposes internal
+    // call structure and file paths, which is operator information.
+    if path.starts_with("/v1/code-intel") {
+        return Some(RouteAuthContract::new(RouteAuthClass::AdminRead, &["admin:read"]));
+    }
+
     if path.starts_with("/v1/traces") {
         return Some(RouteAuthContract::new(RouteAuthClass::AdminRead, &["admin:read"]));
     }

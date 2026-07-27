@@ -13,7 +13,8 @@
 //! are very different answers.
 
 use super::{
-    problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Path, Query, State, StatusCode,
+    problem_response, require_http_scopes, require_http_scopes_for_tenant, AppState, HeaderMap, IntoResponse, Json,
+    Path, Query, State, StatusCode,
 };
 
 /// Open the persisted store, or `None` when persistence is off.
@@ -206,4 +207,140 @@ pub(super) async fn get_trace_spans(
         })),
     )
         .into_response()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// M5 — the agent query API.
+//
+// Every handler here takes a mandatory `token_budget` (QC.2) and answers in a
+// compact, ranked form. The point is that "what runs when X fires" costs an
+// agent a few hundred tokens instead of forty file reads.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct CodeIntelQuery {
+    pub tenant_id: String,
+    #[serde(default)]
+    pub repo_id: Option<String>,
+    /// Mandatory per the workspace retrieval contract. No default that silently
+    /// returns an unbounded answer.
+    pub token_budget: usize,
+    #[serde(default)]
+    pub entry_point: Option<String>,
+    #[serde(default)]
+    pub symbol: Option<String>,
+    #[serde(default)]
+    pub trace_a: Option<u64>,
+    #[serde(default)]
+    pub trace_b: Option<u64>,
+}
+
+/// Load persisted spans, falling back to the live ring when persistence is off
+/// so the API still answers on a capture-only daemon.
+fn load_spans(state: &AppState) -> Vec<crate::trace_store::StoredSpan> {
+    if let Some(store) = open_store(state) {
+        if let Ok(spans) = store.load_all() {
+            if !spans.is_empty() {
+                return spans;
+            }
+        }
+    }
+    crate::trace_span_ring().map_or_else(Vec::new, |ring| {
+        ring.snapshot()
+            .into_iter()
+            .map(|span| crate::trace_store::StoredSpan {
+                span,
+                symbol_id: None,
+                join: "unresolved_live".to_string(),
+                stored_at_unix_ms: 0,
+            })
+            .collect()
+    })
+}
+
+async fn load_scan(state: &AppState, tenant_id: &str, repo_id: &str) -> Option<crate::workspace_scan::WorkspaceScan> {
+    let store = state.fact_store.read().await;
+    let json = crate::repo_registry::load_scan_json(&store, tenant_id, repo_id)?;
+    drop(store);
+    serde_json::from_str(&json).ok()
+}
+
+/// `GET /v1/code-intel/path` — what actually executes for an entry point.
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn get_code_path(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<CodeIntelQuery>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
+        return problem.into_response();
+    }
+    let Some(entry) = q.entry_point.as_deref() else {
+        return problem_response(StatusCode::BAD_REQUEST, "entry_point is required");
+    };
+    let spans = load_spans(&state);
+    let path = crate::code_intel::code_path(&spans, entry, q.token_budget);
+    (StatusCode::OK, Json(path)).into_response()
+}
+
+/// `GET /v1/code-intel/blast-radius` — who breaks if this changes.
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn get_blast_radius(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<CodeIntelQuery>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
+        return problem.into_response();
+    }
+    let Some(symbol) = q.symbol.as_deref() else {
+        return problem_response(StatusCode::BAD_REQUEST, "symbol is required");
+    };
+    let repo_id = q.repo_id.as_deref().unwrap_or("crux");
+    let Some(scan) = load_scan(&state, &q.tenant_id, repo_id).await else {
+        return problem_response(StatusCode::NOT_FOUND, "no scan for this repo; register it first");
+    };
+    let spans = load_spans(&state);
+    let radius = crate::code_intel::blast_radius(&scan, &spans, symbol, q.token_budget);
+    (StatusCode::OK, Json(radius)).into_response()
+}
+
+/// `GET /v1/code-intel/liveness` — did this run, in a stated window.
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn get_liveness(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<CodeIntelQuery>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
+        return problem.into_response();
+    }
+    let Some(symbol) = q.symbol.as_deref() else {
+        return problem_response(StatusCode::BAD_REQUEST, "symbol is required");
+    };
+    let repo_id = q.repo_id.as_deref().unwrap_or("crux");
+    let Some(scan) = load_scan(&state, &q.tenant_id, repo_id).await else {
+        return problem_response(StatusCode::NOT_FOUND, "no scan for this repo; register it first");
+    };
+    let spans = load_spans(&state);
+    let l = crate::code_intel::liveness(&scan, &spans, symbol);
+    (StatusCode::OK, Json(l)).into_response()
+}
+
+/// `GET /v1/code-intel/trace-diff` — where two traces diverge.
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn get_trace_diff(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<CodeIntelQuery>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
+        return problem.into_response();
+    }
+    let (Some(a), Some(b)) = (q.trace_a, q.trace_b) else {
+        return problem_response(StatusCode::BAD_REQUEST, "trace_a and trace_b are required");
+    };
+    let spans = load_spans(&state);
+    let d = crate::code_intel::trace_diff(&spans, a, b, q.token_budget);
+    (StatusCode::OK, Json(d)).into_response()
 }

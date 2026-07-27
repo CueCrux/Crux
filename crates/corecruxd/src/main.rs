@@ -27,6 +27,7 @@
 mod activity;
 mod agentgraph_kinds;
 mod auth;
+mod code_intel;
 mod codegraph_fusion;
 mod config;
 mod console_index;
