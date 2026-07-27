@@ -1421,3 +1421,180 @@ fn context_graph_tools_are_listed_and_callable() {
         assert!(names.contains(&tool), "tools/list is missing {tool}");
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Runtime code intelligence — MCP ↔ HTTP parity.
+//
+// The five `code_*` MCP tools are thin adapters over `GET /v1/code-intel/*`.
+// The failure this guards against is a future maintainer reimplementing any of
+// the logic on the MCP side: the two surfaces would then answer differently for
+// the same question and nothing would say so. Comparing whole payloads — not a
+// field or a status code — is what makes that impossible to do quietly.
+//
+// Trace capture is off in this daemon, so the runtime side of every answer is
+// empty. That is deliberate and does not weaken the test: parity is a property
+// of the adapter, not of the data, and an empty-window answer still exercises
+// argument mapping, encoding, scope and serialisation end to end.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A path that exists, is small enough to scan instantly, and is real Rust —
+/// this test crate's own source.
+const CODE_INTEL_REPO_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+
+fn code_intel_repo() -> &'static str {
+    static REGISTERED: OnceLock<String> = OnceLock::new();
+    REGISTERED.get_or_init(|| {
+        let repo_id = unique_id("codeintel");
+        let raw = mcp_tool_call(
+            "register_repo",
+            json!({
+                "tenant_id": "local",
+                "repo_id": repo_id,
+                "root_path": CODE_INTEL_REPO_ROOT,
+                "languages": ["rust"],
+            }),
+        );
+        let body = mcp_payload(&raw);
+        assert_eq!(
+            body["repo"]["repo_id"], repo_id,
+            "register_repo did not return the registration: {raw}"
+        );
+        assert!(
+            body["repo"]["last_scan_id"].is_string(),
+            "registration did not trigger a scan, so the scan-backed tools have nothing to read: {raw}"
+        );
+        repo_id
+    })
+}
+
+fn http_json(path: &str) -> serde_json::Value {
+    daemon().get(path).unwrap().into_body().read_json().unwrap()
+}
+
+/// The tool's own payload, however this daemon chose to frame it.
+///
+/// Tool results arrive either as a bare `result` object or wrapped in the MCP
+/// `content[0].text` envelope depending on the negotiated shape. Which framing
+/// is in use is not what these tests are about, so normalise it away rather
+/// than pinning one and failing spuriously when the envelope flag flips.
+fn mcp_payload(body: &serde_json::Value) -> serde_json::Value {
+    assert!(body.get("error").is_none(), "MCP call returned an error: {body}");
+    if body["result"]["content"][0]["text"].is_string() {
+        mcp_text_json(body)
+    } else {
+        body["result"].clone()
+    }
+}
+
+#[test]
+fn code_intel_tools_are_listed_with_a_mandatory_token_budget() {
+    let body: serde_json::Value = daemon()
+        .mcp_post_json(json!({ "jsonrpc": "2.0", "id": unique_id("mcp"), "method": "tools/list" }))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    let tools = body["result"]["tools"].as_array().unwrap();
+
+    for name in [
+        "code_path",
+        "code_blast_radius",
+        "code_liveness",
+        "code_trace_diff",
+        "code_dead_code",
+    ] {
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} not listed by tools/list — registered but undiscoverable"));
+        let required: Vec<&str> = tool["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(
+            required.contains(&"token_budget"),
+            "{name}: token_budget must be required over the wire, got {required:?}"
+        );
+        assert_eq!(
+            tool["inputSchema"]["x-crux-min-tier"], "free",
+            "{name}: tier floor missing from the listed schema"
+        );
+    }
+}
+
+#[test]
+fn code_intel_mcp_answers_match_http_exactly() {
+    let repo = code_intel_repo();
+    let budget = 500;
+
+    for (tool, args, http_path) in [
+        (
+            "code_path",
+            json!({ "tenant_id": "local", "entry_point": "post_query_text_search", "token_budget": budget }),
+            format!("/v1/code-intel/path?tenant_id=local&entry_point=post_query_text_search&token_budget={budget}"),
+        ),
+        (
+            "code_blast_radius",
+            json!({ "tenant_id": "local", "repo_id": repo, "symbol": "TestDaemon", "token_budget": budget }),
+            format!(
+                "/v1/code-intel/blast-radius?tenant_id=local&repo_id={repo}&symbol=TestDaemon&token_budget={budget}"
+            ),
+        ),
+        (
+            "code_liveness",
+            json!({ "tenant_id": "local", "repo_id": repo, "symbol": "TestDaemon", "token_budget": budget }),
+            format!("/v1/code-intel/liveness?tenant_id=local&repo_id={repo}&symbol=TestDaemon&token_budget={budget}"),
+        ),
+        (
+            "code_trace_diff",
+            json!({ "tenant_id": "local", "trace_a": 1, "trace_b": 2, "token_budget": budget }),
+            format!("/v1/code-intel/trace-diff?tenant_id=local&trace_a=1&trace_b=2&token_budget={budget}"),
+        ),
+        (
+            "code_dead_code",
+            json!({ "tenant_id": "local", "repo_id": repo, "token_budget": 2000 }),
+            format!("/v1/code-intel/dead-code?tenant_id=local&repo_id={repo}&token_budget=2000"),
+        ),
+    ] {
+        let via_mcp = mcp_payload(&mcp_tool_call(tool, args));
+        let via_http = http_json(&http_path);
+        assert_eq!(
+            via_mcp, via_http,
+            "{tool}: MCP and HTTP answers diverged — the adapter is no longer thin.\n  mcp:  {via_mcp}\n  http: {via_http}"
+        );
+    }
+}
+
+#[test]
+fn code_intel_rejects_a_missing_token_budget() {
+    // A tool that silently defaults to "everything" defeats the purpose of the
+    // surface, so the omission must be an error the caller can read, not a
+    // large answer they did not ask for.
+    let body = mcp_tool_call("code_path", json!({ "tenant_id": "local", "entry_point": "x" }));
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("token_budget"),
+        "expected a token_budget error, got: {body}"
+    );
+}
+
+#[test]
+fn code_liveness_never_reports_an_unseen_symbol_as_dead() {
+    // The window is part of the answer. With capture off the window is empty,
+    // so the only honest verdict is "not observed" — never "dead".
+    let repo = code_intel_repo();
+    let body = mcp_payload(&mcp_tool_call(
+        "code_liveness",
+        json!({ "tenant_id": "local", "repo_id": repo, "symbol": "TestDaemon", "token_budget": 300 }),
+    ));
+    assert_eq!(body["executed"], false);
+    assert!(body["window"].is_object(), "liveness must state its window: {body}");
+    let verdict = body["verdict"].as_str().unwrap_or_default();
+    assert!(
+        !verdict.eq_ignore_ascii_case("dead"),
+        "an empty observation window must not yield a `dead` verdict, got {verdict:?}"
+    );
+}
+

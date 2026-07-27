@@ -3,7 +3,10 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
-#![recursion_limit = "256"]
+// The `json!` literal behind `tool_output_catalogue` has one element per tool
+// and expands recursively, so this tracks the tool count rather than any
+// pathological nesting. Raise it when adding tools tips it over again.
+#![recursion_limit = "512"]
 
 //! `crux-mcp` — MCP server for agent integration with Crux Daemon.
 //!

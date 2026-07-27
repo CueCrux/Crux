@@ -2337,6 +2337,10 @@ mod tests {
             "punch_in" | "punch_out" => json!({"resource": "res", "holder_passport": "p_stub"}),
             "check_punchcard" | "force_release" => json!({"resource": "res"}),
             "list_punchcards" => json!({"punchcard_id": "pc_stub", "confirm": true}),
+            "code_path" => json!({"tenant_id": "t", "entry_point": "handler", "token_budget": 500}),
+            "code_blast_radius" | "code_liveness" => json!({"tenant_id": "t", "symbol": "sym", "token_budget": 500}),
+            "code_trace_diff" => json!({"tenant_id": "t", "trace_a": 1, "trace_b": 2, "token_budget": 500}),
+            "code_dead_code" => json!({"tenant_id": "t", "token_budget": 2000}),
             // Tools with no required fields default to an empty object.
             _ => json!({}),
         }
