@@ -933,7 +933,7 @@ dependencies = [
  "serde_yaml",
  "serial_test",
  "sha2 0.11.0",
- "syn 3.0.0",
+ "syn 3.0.3",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
@@ -1001,7 +1001,7 @@ dependencies = [
  "serde_yaml",
  "serial_test",
  "sha2 0.11.0",
- "syn 3.0.0",
+ "syn 3.0.3",
  "tar",
  "tempfile",
  "thiserror 2.0.19",
@@ -4760,9 +4760,9 @@ dependencies = [
 
 [[package]]
 name = "syn"
-version = "3.0.0"
+version = "3.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2fac314a64dc9a36e61a9eb4261a5e9bbfbc922b27e518af97bc32b926cf967"
+checksum = "53e9bae58849f64dfa4f5d5ae372c8341f7305f82a3868709269343628b659a3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4865,7 +4865,7 @@ checksum = "43cbfe0cf76104d42a574802844187e84a305e531ed54455f11fbde0f10541cd"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.0",
+ "syn 3.0.3",
 ]
 
 [[package]]
