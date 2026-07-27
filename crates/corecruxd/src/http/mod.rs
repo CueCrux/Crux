@@ -84,6 +84,7 @@ mod stream_receipts;
 mod studio_library;
 mod studio_pack;
 mod sync;
+mod traces;
 mod witness;
 mod work;
 mod workbench;
@@ -977,6 +978,10 @@ pub(crate) fn router_with_route_auth(
             "/v1/repos/{repo_id}/symbols/resolve",
             get(self::repos::get_symbol_resolve),
         )
+        // Runtime span capture (M2): inert and honest about it when
+        // CORECRUXD_TRACE_CAPTURE is unset.
+        .route("/v1/traces/stats", get(self::traces::get_trace_stats))
+        .route("/v1/traces/spans", get(self::traces::get_trace_spans))
         .route(
             "/v1/projects/{id}/tenants/{tenantId}",
             axum::routing::delete(self::projects::delete_project_tenant),

@@ -15,7 +15,7 @@
 // Every call is same-origin credentialed; the browser never holds a bearer
 // token (the daemon authenticates the session at its own origin).
 //
-// 173 read endpoints, generated from the route manifest.
+// 176 read endpoints, generated from the route manifest.
 
 /**
  * Append a plain query object to a path as a URL search string.
@@ -135,6 +135,8 @@ const LITERAL_GET_PATHS = Object.freeze({
   '/v1/shards': true,
   '/v1/status-feed': true,
   '/v1/studio/library': true,
+  '/v1/traces/spans': true,
+  '/v1/traces/stats': true,
   '/v1/version': true,
   '/v1/witness/smoke': true,
   '/v1/work': true,
@@ -603,6 +605,9 @@ const CruxApi = Object.freeze({
   reposByRepoIdCodemap(repo_id, query) {
     return fetch(withQuery(`/v1/repos/${encodeURIComponent(repo_id)}/codemap`, query), { credentials: 'same-origin' });
   },
+  reposByRepoIdSymbolsResolve(repo_id, query) {
+    return fetch(withQuery(`/v1/repos/${encodeURIComponent(repo_id)}/symbols/resolve`, query), { credentials: 'same-origin' });
+  },
   route(query) {
     return fetch(withQuery(`/v1/route`, query), { credentials: 'same-origin' });
   },
@@ -641,6 +646,12 @@ const CruxApi = Object.freeze({
   },
   syncTenantsByTenantIdManifest(tenantId, query) {
     return fetch(withQuery(`/v1/sync/tenants/${encodeURIComponent(tenantId)}/manifest`, query), { credentials: 'same-origin' });
+  },
+  tracesSpans(query) {
+    return fetch(withQuery(`/v1/traces/spans`, query), { credentials: 'same-origin' });
+  },
+  tracesStats(query) {
+    return fetch(withQuery(`/v1/traces/stats`, query), { credentials: 'same-origin' });
   },
   version(query) {
     return fetch(withQuery(`/v1/version`, query), { credentials: 'same-origin' });

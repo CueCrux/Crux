@@ -405,6 +405,8 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/repos/{repo_id}", methods: &["GET", "DELETE"], tag: "Repos", auth: "admin", summary: "Repos {repo_id}" },
     RouteEntry { path: "/v1/repos/{repo_id}/codemap", methods: &["GET"], tag: "Repos", auth: "admin-read", summary: "Repos {repo_id} codemap" },
     RouteEntry { path: "/v1/repos/{repo_id}/symbols/resolve", methods: &["GET"], tag: "Repos", auth: "admin-read", summary: "Resolve a (file, name[, line]) callsite to a stable symbol_id" },
+    RouteEntry { path: "/v1/traces/stats", methods: &["GET"], tag: "Traces", auth: "admin-read", summary: "Runtime span capture stats" },
+    RouteEntry { path: "/v1/traces/spans", methods: &["GET"], tag: "Traces", auth: "admin-read", summary: "Captured runtime spans" },
     RouteEntry { path: "/v1/result-envelope/import", methods: &["POST"], tag: "ResultEnvelope", auth: "write", summary: "Result envelope import" },
     RouteEntry { path: "/v1/route", methods: &["GET"], tag: "Routing", auth: "admin-read", summary: "Route" },
     RouteEntry { path: "/v1/routing/route", methods: &["GET"], tag: "Routing", auth: "admin-read", summary: "Routing route" },

@@ -1465,6 +1465,7 @@ dependencies = [
  "blake3",
  "chrono",
  "corecrux-memory",
+ "criterion",
  "regex",
  "serde",
  "serde_json",

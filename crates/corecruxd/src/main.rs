@@ -2063,10 +2063,29 @@ fn validate_mcp_bind_posture(
     ))
 }
 
+/// The process-wide span ring, present only when `CORECRUXD_TRACE_CAPTURE` is on.
+///
+/// Held in a `OnceLock` because the layer is installed inside `init_tracing`,
+/// long before `AppState` exists, and the HTTP surface needs to read it later.
+static TRACE_SPAN_RING: std::sync::OnceLock<std::sync::Arc<crux_observe::span_layer::SpanRing>> =
+    std::sync::OnceLock::new();
+
+/// Runtime span capture ring, or `None` when trace capture is disabled.
+pub(crate) fn trace_span_ring() -> Option<&'static std::sync::Arc<crux_observe::span_layer::SpanRing>> {
+    TRACE_SPAN_RING.get()
+}
+
 fn init_tracing(level: &str) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
     let log_format = std::env::var("LOG_FORMAT").unwrap_or_default();
+    // Runtime code-map capture (ExecPlan crux-runtime-codemap M2). `from_env`
+    // yields None unless CORECRUXD_TRACE_CAPTURE is set, so the disabled path
+    // installs no layer at all rather than an inert one.
+    let span_layer = crux_observe::span_layer::CruxSpanLayer::from_env().map(|(layer, ring)| {
+        let _ = TRACE_SPAN_RING.set(ring);
+        layer
+    });
     // Sink-boundary redaction (ExecPlan crux-log-redaction-2026-06-11 M2):
     // every formatted event is scrubbed before reaching stdout. Mode is
     // CORECRUXD_REDACT=on|off|audit (default audit: count, don't mutate).
@@ -2121,22 +2140,34 @@ fn init_tracing(level: &str) {
                     .with(filter)
                     .with(fmt_layer)
                     .with(otel_layer)
+                    .with(span_layer)
                     .init();
                 return;
             }
         }
     }
 
-    if log_format.eq_ignore_ascii_case("json") {
-        tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(filter)
-            .with_writer(redacting_writer)
-            .init();
-    } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(redacting_writer)
+    // Registry-based rather than the `fmt()` builder so the span layer can
+    // compose. `Layer` is implemented for `Option<L>`, so a `None` span layer
+    // adds no runtime work.
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        use tracing_subscriber::Layer as _;
+
+        let fmt_layer = if log_format.eq_ignore_ascii_case("json") {
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(redacting_writer)
+                .boxed()
+        } else {
+            tracing_subscriber::fmt::layer().with_writer(redacting_writer).boxed()
+        };
+
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt_layer)
+            .with(span_layer)
             .init();
     }
 }
