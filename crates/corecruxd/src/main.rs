@@ -91,6 +91,7 @@ mod projects;
 mod protocol_posture;
 mod redaction;
 mod relations;
+mod repo_allowance;
 mod repo_codegraph;
 mod repo_registry;
 mod repo_watch;

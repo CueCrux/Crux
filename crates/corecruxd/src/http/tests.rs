@@ -20070,3 +20070,173 @@ async fn studio_library_install_requires_write_scope() {
         resp.status()
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Repo allowance accounting — crux-code-intel-pro-hosted-surface M1.
+//
+// The gate is "counts correct across add/remove/disable, verified on a seeded
+// multi-tenant fixture, zero behaviour change for any existing caller". The unit
+// tests in `repo_allowance` cover the arithmetic; these cover the store read, the
+// route, and the one property that matters most — a tenant's allowance must be
+// computed from its own repos and nobody else's.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn seed_repo(store: &mut corecrux_memory::FactStore, tenant_id: &str, repo_id: &str, enabled: bool) {
+    let registration = crate::repo_registry::RepoRegistration {
+        repo_id: repo_id.to_string(),
+        tenant_id: tenant_id.to_string(),
+        root_path: None,
+        clone_url: None,
+        languages: Vec::new(),
+        enabled,
+        added_at_unix_ms: 1,
+        last_scan_id: None,
+        scan_status: None,
+        scan_error: None,
+        scan_queued_at_unix_ms: None,
+        scan_finished_at_unix_ms: None,
+    };
+    crate::repo_registry::store_repo(store, &registration).expect("seed repo");
+}
+
+async fn allowance_body(state: &AppState, tenant: &str, seats: u32, packs: u32) -> serde_json::Value {
+    let resp = super::repos::get_repo_allowance(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::RepoAllowanceQuery {
+            tenant_id: tenant.to_string(),
+            seats: Some(seats),
+            packs: Some(packs),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    json_body(resp).await
+}
+
+#[tokio::test]
+async fn repo_allowance_counts_only_the_requesting_tenants_enabled_repos() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        // tenant-a: 3 enabled + 1 disabled. tenant-b: 5 enabled, none of which
+        // may ever appear in tenant-a's count.
+        seed_repo(&mut store, "tenant-a", "a1", true);
+        seed_repo(&mut store, "tenant-a", "a2", true);
+        seed_repo(&mut store, "tenant-a", "a3", true);
+        seed_repo(&mut store, "tenant-a", "a4", false);
+        for i in 0..5 {
+            seed_repo(&mut store, "tenant-b", &format!("b{i}"), true);
+        }
+    }
+
+    let a = allowance_body(&state, "tenant-a", 1, 0).await;
+    assert_eq!(a["used"], 3, "tenant-b's repos must not be counted for tenant-a");
+    assert_eq!(a["disabled"], 1);
+    assert_eq!(a["included"], 8);
+    assert_eq!(a["over_allowance"], false);
+    assert_eq!(a["remaining"], 5);
+
+    let b = allowance_body(&state, "tenant-b", 1, 0).await;
+    assert_eq!(b["used"], 5);
+    assert_eq!(b["disabled"], 0);
+}
+
+#[tokio::test]
+async fn repo_allowance_tracks_add_and_disable() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        for i in 0..8 {
+            seed_repo(&mut store, "tenant-a", &format!("r{i}"), true);
+        }
+    }
+    let at_limit = allowance_body(&state, "tenant-a", 1, 0).await;
+    assert_eq!(at_limit["used"], 8);
+    assert_eq!(at_limit["over_allowance"], false, "exactly at the line is within it");
+
+    // Add a ninth: over allowance, and the report says so without clamping `used`.
+    {
+        let mut store = state.fact_store.write().await;
+        seed_repo(&mut store, "tenant-a", "r8", true);
+    }
+    let over = allowance_body(&state, "tenant-a", 1, 0).await;
+    assert_eq!(over["used"], 9);
+    assert_eq!(over["over_allowance"], true);
+    assert_eq!(over["over_by"], 1);
+
+    // Disabling it releases the allowance — a disabled repo is not aggregated,
+    // so charging for it would be indefensible.
+    {
+        let mut store = state.fact_store.write().await;
+        seed_repo(&mut store, "tenant-a", "r8", false);
+    }
+    let after_disable = allowance_body(&state, "tenant-a", 1, 0).await;
+    assert_eq!(after_disable["used"], 8);
+    assert_eq!(after_disable["disabled"], 1);
+    assert_eq!(after_disable["over_allowance"], false);
+}
+
+#[tokio::test]
+async fn repo_allowance_pack_restores_headroom_without_changing_usage() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        for i in 0..9 {
+            seed_repo(&mut store, "tenant-a", &format!("r{i}"), true);
+        }
+    }
+    let before = allowance_body(&state, "tenant-a", 1, 0).await;
+    assert_eq!(before["over_allowance"], true);
+
+    let after = allowance_body(&state, "tenant-a", 1, 1).await;
+    assert_eq!(after["over_allowance"], false);
+    assert_eq!(after["included"], 18);
+    assert_eq!(after["used"], 9, "a pack changes entitlement, not usage");
+}
+
+#[tokio::test]
+async fn repo_allowance_requires_read_scope_for_the_named_tenant() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::repos::get_repo_allowance(
+        State(state.clone()),
+        dev_scope_headers("facts:read"),
+        Query(super::repos::RepoAllowanceQuery {
+            tenant_id: "tenant-a".to_string(),
+            seats: None,
+            packs: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert!(
+        resp.status() == StatusCode::UNAUTHORIZED || resp.status() == StatusCode::FORBIDDEN,
+        "allowance is an admin:read surface, got {}",
+        resp.status()
+    );
+}
+
+#[tokio::test]
+async fn repo_allowance_defaults_to_one_seat_no_packs() {
+    // Seats are not sourced from a subscription yet. The default must be the
+    // honest "we do not know" (one seat), not an optimistic guess.
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::repos::get_repo_allowance(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::RepoAllowanceQuery {
+            tenant_id: "tenant-empty".to_string(),
+            seats: None,
+            packs: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["seats"], 1);
+    assert_eq!(body["packs"], 0);
+    assert_eq!(body["included"], 8);
+    assert_eq!(body["used"], 0);
+}
