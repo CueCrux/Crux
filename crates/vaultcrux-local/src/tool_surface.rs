@@ -230,6 +230,57 @@ pub const TOOL_SURFACE: &[ToolSurfaceEntry] = &[
         tier: ToolTier::HostedGated,
         marker: "[tier:hosted]",
     },
+    // ── Context graph — storybook readout + agent dossier exchange ──────────
+    // Local tier: every one of these executes against the project graph, the
+    // workspace scan and the fact store of whichever daemon the client is
+    // connected to. No hosted control plane is involved, which is also why they
+    // declare `x-crux-min-tier: free`.
+    //
+    // Without an entry here `is_local_tool` is false, so the capability
+    // `crux-mcp.<tool>` never enters `rcx_local_capabilities`, and the RCX
+    // router refuses every call with `denied:capability_not_permitted`. Absent
+    // from this table a tool is not merely unadvertised — it is DEAD on any
+    // RCX-gated daemon, which is what host `crux` runs.
+    ToolSurfaceEntry {
+        name: "get_project_storybook",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "generate_project_storybook",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "diff_project_storybook",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "get_project_dossiers",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "generate_project_dossier",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "publish_project_dossier",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "reconcile_project_dossiers",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "diff_project_dossiers",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
 ];
 
 pub fn tool_tier(name: &str) -> ToolTier {
