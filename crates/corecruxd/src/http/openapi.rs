@@ -206,6 +206,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/console/facts", methods: &["GET"], tag: "Console", auth: "admin-read", summary: "Console facts" },
     RouteEntry { path: "/v1/console/facts/add", methods: &["POST"], tag: "Console", auth: "admin-write", summary: "Console facts add" },
     RouteEntry { path: "/v1/console/infra/summary", methods: &["GET"], tag: "Console", auth: "admin-read", summary: "Console infra summary" },
+    RouteEntry { path: "/v1/console/connections", methods: &["GET"], tag: "Console", auth: "admin-read", summary: "Console connections" },
     RouteEntry { path: "/v1/console/integrations", methods: &["GET"], tag: "Console", auth: "admin-read", summary: "Console integrations" },
     RouteEntry { path: "/v1/console/integrations/{packId}/disable", methods: &["POST"], tag: "Console", auth: "admin-write", summary: "Console integrations {packId} disable" },
     RouteEntry { path: "/v1/console/integrations/{packId}/grant", methods: &["POST"], tag: "Console", auth: "admin-write", summary: "Console integrations {packId} grant" },

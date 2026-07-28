@@ -1364,6 +1364,10 @@ pub(crate) fn router_with_route_auth(
             axum::routing::post(self::relations::post_expand),
         )
         // Console settings (auth posture + embedding config).
+        .route(
+            "/v1/console/connections",
+            get(self::console::get_console_connections),
+        )
         .route("/v1/console/settings", get(self::console::get_console_settings))
         .route(
             "/v1/console/settings",
