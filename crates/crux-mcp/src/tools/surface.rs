@@ -231,7 +231,22 @@ pub fn tool_affinity(tool: &str) -> &'static str {
         | "accept_handoff"
         | "get_workspace_storyline"
         | "register_repo"
-        | "list_repos" => "session",
+        | "list_repos"
+        // Context graph (storybook + dossiers). These belong beside
+        // create_handoff/accept_handoff rather than under "memory": a dossier IS
+        // the cross-session handoff of what an agent worked out, and the
+        // storybook is the project state a resuming session reads first.
+        // Without an entry here they score 0 and never surface beyond the floor
+        // in ANY intent, so an agent could only reach them by already knowing
+        // their names — which is the discovery problem they were built to solve.
+        | "get_project_storybook"
+        | "generate_project_storybook"
+        | "diff_project_storybook"
+        | "get_project_dossiers"
+        | "generate_project_dossier"
+        | "publish_project_dossier"
+        | "reconcile_project_dossiers"
+        | "diff_project_dossiers" => "session",
         "audit_config"
         | "check_config_audit"
         | "audit_export_bundle"
@@ -468,6 +483,45 @@ mod tests {
         assert_eq!(tool_affinity("receipt_verify"), "proof");
         assert_eq!(tool_affinity("save_session"), "session");
         assert_eq!(tool_affinity("github_search"), "", "unmapped tool ⇒ no affinity");
+    }
+
+    /// An unmapped tool scores 0 and is unreachable beyond the floor in every
+    /// intent. That is correct for a tool an agent would never want surfaced,
+    /// and wrong for one whose whole purpose is to be found — so the
+    /// context-graph family is asserted mapped, by name, rather than left to be
+    /// silently forgotten the next time a tool is added.
+    #[test]
+    fn every_context_graph_tool_has_an_affinity() {
+        for tool in [
+            "get_project_storybook",
+            "generate_project_storybook",
+            "diff_project_storybook",
+            "get_project_dossiers",
+            "generate_project_dossier",
+            "publish_project_dossier",
+            "reconcile_project_dossiers",
+            "diff_project_dossiers",
+        ] {
+            assert_eq!(
+                tool_affinity(tool),
+                "session",
+                "{tool} must carry an affinity or it can never be surfaced beyond the floor"
+            );
+        }
+    }
+
+    /// The pairing an agent actually needs must be reachable from a declared
+    /// intent, not only by knowing the names.
+    #[test]
+    fn session_review_intent_surfaces_the_context_graph_tools() {
+        let shaped = shape_dynamic(list_tools(), Some("session_review"), DYNAMIC_TOP_N);
+        let names: Vec<&str> = shaped.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names
+                .iter()
+                .any(|n| n.starts_with("get_project_dossiers") || n.starts_with("get_project_storybook")),
+            "a session_review intent must surface at least one context-graph read; got {names:?}"
+        );
     }
 
     #[test]
