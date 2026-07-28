@@ -296,7 +296,12 @@ pub fn list_tools_with_flags(
                           entity prefixes (see the `entity` field) — they are what keeps \
                           `query_facts` recall consistent across sessions. Store facts \
                           deliberately, not reflexively: volume dilutes recall, so do not \
-                          drive this tool from a PostToolUse hook."
+                          drive this tool from a PostToolUse hook. Writes to whichever \
+                          daemon this MCP client is connected to (see your client's \
+                          configured server url) — the `[tier:local]` marker is an \
+                          entitlement tier, not a statement that the write stays on this \
+                          machine. There is no need to hand-roll an HTTP `PUT /v1/facts` \
+                          to reach a remote daemon; this tool already goes there."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -333,7 +338,10 @@ pub fn list_tools_with_flags(
                           `min_effective_confidence` to drop facts below a floor. Private \
                           facts are visible only to their owning agent. ALWAYS pass \
                           `token_budget` — 500 is the conventional default for confirming \
-                          a fact."
+                          a fact. Reads from whichever daemon this MCP client is connected \
+                          to (see your client's configured server url); the `[tier:local]` \
+                          marker is an entitlement tier, not a claim that the store is on \
+                          this machine."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -2456,7 +2464,7 @@ pub fn list_tools_with_flags(
         // static `[hosted]` from the tool-surface table. No other tool is
         // affected, and flag-off uses the static marker unchanged.
         let marker = if agent_passports_enabled && t.name == "issue_passport" {
-            "[local]"
+            "[tier:local]"
         } else {
             vaultcrux_local::tool_surface::marker_for_tool(&t.name)
         };
@@ -2603,7 +2611,7 @@ fn tools_to_json(tools: Vec<ToolDefinition>, auth: Option<ToolAuthMetadata>) -> 
             // description marker. Mirror that decision as structured metadata
             // so agents don't have to parse description prefixes. Honest
             // signpost only — no filtering or dispatch change.
-            if t.description.starts_with("[hosted]") {
+            if t.description.starts_with("[tier:hosted]") {
                 crux_meta["upgrade"] = json!({
                     "platform_available": true,
                     "requires": "rcx_capability_token",
@@ -3348,12 +3356,12 @@ mod tests {
         let tools = list_tools();
         let by_name = |n: &str| tools.iter().find(|t| t.name == n).unwrap();
 
-        assert!(by_name("query").description.starts_with("[local]"));
-        assert!(by_name("enrich_action").description.starts_with("[local]"));
-        assert!(by_name("sync_status").description.starts_with("[local]"));
-        assert!(by_name("issue_passport").description.starts_with("[hosted]"));
-        assert!(by_name("sync_pull").description.starts_with("[hosted]"));
-        assert!(by_name("sync_push").description.starts_with("[hosted]"));
+        assert!(by_name("query").description.starts_with("[tier:local]"));
+        assert!(by_name("enrich_action").description.starts_with("[tier:local]"));
+        assert!(by_name("sync_status").description.starts_with("[tier:local]"));
+        assert!(by_name("issue_passport").description.starts_with("[tier:hosted]"));
+        assert!(by_name("sync_pull").description.starts_with("[tier:hosted]"));
+        assert!(by_name("sync_push").description.starts_with("[tier:hosted]"));
     }
 
     #[test]
@@ -3364,9 +3372,9 @@ mod tests {
         let tools = list_tools_local_surface(true);
         let by_name = |n: &str| tools.iter().find(|t| t.name == n).unwrap();
 
-        assert!(by_name("issue_passport").description.starts_with("[local]"));
-        assert!(by_name("sync_pull").description.starts_with("[hosted]"));
-        assert!(by_name("sync_push").description.starts_with("[hosted]"));
+        assert!(by_name("issue_passport").description.starts_with("[tier:local]"));
+        assert!(by_name("sync_pull").description.starts_with("[tier:hosted]"));
+        assert!(by_name("sync_push").description.starts_with("[tier:hosted]"));
     }
 
     #[test]
@@ -3380,7 +3388,7 @@ mod tests {
             .iter()
             .find(|tool| tool.name == "request_passport_mint")
             .expect("mint-request tool should be listed while enabled");
-        assert!(tool.description.starts_with("[local]"));
+        assert!(tool.description.starts_with("[tier:local]"));
         assert!(tool.input_schema["properties"].get("requester_id").is_none());
         assert!(tool.input_schema["properties"].get("requested_category").is_some());
         assert!(tool.input_schema["properties"].get("reason").is_some());

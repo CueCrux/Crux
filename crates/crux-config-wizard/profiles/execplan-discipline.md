@@ -1,7 +1,7 @@
 +++
 name = "execplan-discipline"
-version = 3
-description = "Multi-milestone work goes through an ExecPlan first. Codifies the Insights-report `ExecPlan Workflow` snippet (M1..Mn pattern in 15+ sessions), plus the board-drift guard that keeps plan `Status:` lines aligned with derived state. v3 moves the drift guard's install and wiring detail (hook paths, per-agent JSON matchers, script flags) out of this always-loaded body and into `docs/execplan-drift-guard.md`, keeping only the behaviour an agent needs mid-session: that the hook may fire, and that only the leading `Status:` token counts. The installer already prints the exact snippets on demand, so the body was duplicating a self-documenting interface."
+version = 4
+description = "Multi-milestone work goes through an ExecPlan first. Codifies the Insights-report `ExecPlan Workflow` snippet (M1..Mn pattern in 15+ sessions), plus the board-drift guard that keeps plan `Status:` lines aligned with derived state. v4 corrects the Pre-flight step: it pointed at `get_gaps(query=...)`, which reads retrieval-coverage facts rather than the capability registry, and at a Feature Registry endpoint that moved into the Crux daemon when the PlanCrux API was retired 2026-07-24. Now gives the real HTTP call, its auth scope, and the dev-mode path. v3 moved the drift guard's install and wiring detail (hook paths, per-agent JSON matchers, script flags) out of this always-loaded body and into `docs/execplan-drift-guard.md`, keeping only the behaviour an agent needs mid-session: that the hook may fire, and that only the leading `Status:` token counts."
 targets = ["claude_md", "agents_md"]
 order = 30
 risk_class = "low"
@@ -37,7 +37,16 @@ Each ExecPlan declares a risk class (`low | medium | high`) in its Purpose secti
 
 ### Pre-flight
 
-Before writing the plan, call `get_gaps(query="<area>")` on the Feature Registry endpoint and note any critical/high gaps in the plan's `Risk` or `Decision Log`.
+Before writing the plan, pull capability gaps from the Crux daemon's Features lens and note any critical/high ones in the plan's `Risks` or `Decision log`:
+
+```bash
+source ~/.config/cuecrux/env   # CRUX_HTTP_URL + CRUX_AGENT_TOKEN
+curl -s -H "Authorization: Bearer $CRUX_AGENT_TOKEN" "$CRUX_HTTP_URL/v1/features/capabilities/analysis/gaps"
+```
+
+Needs scope `facts:read` or `admin:read`; unauthenticated calls return 401. Local dev: run `corecruxd` with `CORECRUXD_AUTH_MODE=dev_scopes` and send `X-Corecrux-Scopes: facts:read`.
+
+The MCP tool `get_gaps` is **not** this — it reads retrieval-coverage facts (`__ops__::coverage`), not capabilities. The MCP equivalent is `feature_suggest_next({limit})`, currently hidden from `tools/list` by RCX capability filtering, so prefer HTTP.
 
 ### Work table is true north
 
