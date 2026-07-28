@@ -45,6 +45,13 @@ the same `CRUX_MCP_HANDOFF_SECRET` on every instance.
 prompts for the two values it needs — the MCP endpoint URL and the agent token —
 so there is no config file to hand-edit.
 
+The URL field defaults to `http://127.0.0.1:14801/mcp`, which is right when
+Desktop and the daemon share a machine. Point it at your own host when they do
+not — `http://<host-or-tailnet-ip>:14801/mcp` on a private network, or
+`https://<your-host>/mcp` if a TLS proxy fronts the daemon (the MCP port is
+usually not exposed directly). Note that Desktop runs on the Windows side of
+WSL, so a daemon inside WSL is *not* on Desktop's localhost.
+
 That page also reports the endpoint URLs and the agent-token state. The token's
 raw value is shown only when the daemon sets
 `CORECRUXD_CONSOLE_REVEAL_AGENT_TOKEN=1`; otherwise you get a fingerprint and
