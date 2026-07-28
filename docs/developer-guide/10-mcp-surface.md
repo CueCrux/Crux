@@ -62,7 +62,7 @@ added ([extensions.rs:57](../../crates/crux-mcp/src/tools/extensions.rs#L57)):
 ```json
 {
   "name": "ext.example.quote.daily",
-  "description": "[local][extension:ext.example.quote][trust:CommunityReviewed] Return today's quote.",
+  "description": "[tier:local][extension:ext.example.quote][trust:CommunityReviewed] Return today's quote.",
   "inputSchema": {
     "type": "object",
     "properties": { "topic": { "type": "string" } },
@@ -79,7 +79,7 @@ added ([extensions.rs:57](../../crates/crux-mcp/src/tools/extensions.rs#L57)):
 
 | Element | Purpose |
 |---|---|
-| Description prefix | `[local][extension:<id>][trust:<Tier>]` — provenance is visible in the tool list itself |
+| Description prefix | `[tier:local][extension:<id>][trust:<Tier>]` — provenance is visible in the tool list itself |
 | `x-crux-extension.manifest_hash` | Lets a client detect that the extension changed under it |
 | `x-crux-extension.trust_tier` | Snake-case slug ([extensions.rs:183](../../crates/crux-mcp/src/tools/extensions.rs#L183)) |
 | `x-crux-consequence-metadata` | Your `consequence_metadata` if you set one; otherwise the daemon's derived metadata for the tool name ([extensions.rs:69](../../crates/crux-mcp/src/tools/extensions.rs#L69)) |
@@ -146,7 +146,7 @@ just your `result`. A client wanting the payload alone must parse it and read
 
 1. Name it `ext.<publisher>.<tool>` — the `ext.` prefix is load-bearing.
 2. Write a `description` that survives being prefixed with
-   `[local][extension:<id>][trust:<tier>]`.
+   `[tier:local][extension:<id>][trust:<tier>]`.
 3. Supply a real `input_schema`. Nothing validates against it, so it is
    documentation for the agent — make it accurate.
 4. Add `consequence_metadata` for anything irreversible or material.

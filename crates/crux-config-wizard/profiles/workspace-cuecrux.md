@@ -1,7 +1,7 @@
 +++
 name = "workspace-cuecrux"
-version = 4
-description = "CueCrux workspace specifics: ExecPlan paths, daemon endpoints, live-session coordination protocol, Chainguard rule, JobClaw/MirrorClaw, three-place wiring. v4 corrects the daemon endpoints from loopback to the live Tailscale host (the rendered files had been hand-patched, so regenerating would have silently reverted them) and demotes the PlanCrux read and the coordination check from standalone boot rituals to steps of the single sequence in memory-practices. CueCrux-internal — only enable inside the CueCrux planning monorepo."
+version = 5
+description = "CueCrux workspace specifics: ExecPlan paths, daemon endpoints, live-session coordination protocol, Chainguard rule, JobClaw/MirrorClaw, three-place wiring. v5 rewrites the Feature Registry section: the PlanCrux API (:3334) and its MCP server were retired 2026-07-24, so the daemon's Features lens is now the only surface, not the 'prefer for new clients' alternative. Also names FeatureCrux explicitly as an unrelated flag router, because the name collision sends agents to the wrong service. v4 corrected the daemon endpoints from loopback to the live Tailscale host (the rendered files had been hand-patched, so regenerating would have silently reverted them) and demoted the PlanCrux read and the coordination check to steps of the single boot sequence in memory-practices. CueCrux-internal — only enable inside the CueCrux planning monorepo."
 targets = ["claude_md", "agents_md"]
 order = 90
 risk_class = "low"
@@ -77,8 +77,8 @@ Two operator-in-the-loop tools live in `AuditCrux/benchmarks/`:
 
 ### Feature Registry
 
-The PlanCrux API serves a Feature Registry on port 3334 (`pnpm dev:api`). After the M5 cutover in `crux-domain-substrate-and-features-lens-2026-05-18`, the same surface is also available at `http://<crux-host>:14800/v1/features/capabilities/*`. Prefer Crux endpoints for new clients; legacy clients hit the proxy on PlanCrux side.
+The Crux daemon serves the Feature Registry at `http://<crux-host>:14800/v1/features/capabilities/*`. The PlanCrux API (`:3334`, `pnpm dev:api`) and the `plancrux` MCP server were **retired 2026-07-24** (`plancrux-retirement-master-2026-05-19`, complete at M2) — do not target them. `FeatureCrux/` is an unrelated per-tenant feature-flag router on :3335, not this registry.
 
-Key endpoints (PlanCrux): `GET /capabilities` (list/filter), `GET /capabilities/analysis/gaps` (gap analysis), `GET /capabilities/analysis/promises`, `GET /capabilities/analysis/coverage`.
+Key endpoints: `GET /v1/features/capabilities` (list/filter), `GET /v1/features/capabilities/{id}`, `GET /v1/features/capabilities/{id}/tree`, `GET /v1/features/capabilities/analysis/gaps`, `.../analysis/promises`, `.../analysis/coverage`. Reads need scope `facts:read` or `admin:read`. The capability store is global — no tenant scoping.
 
-After capability work, record an audit via `POST /capabilities/:id/audit` (PlanCrux) or `POST /v1/features/capabilities/:id/audit` (Crux post-cutover).
+After capability work, record an audit via `POST /v1/features/capabilities/{id}/audit` (needs `facts:write` or `admin:write`). Capability seed JSON still lives at `PlanCrux/tools/feature-registry/capabilities/*.json`; the PlanCrux repo remains the ExecPlan and docs home.

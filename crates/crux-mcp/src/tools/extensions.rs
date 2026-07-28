@@ -75,7 +75,7 @@ pub async fn list_extension_tools(ctx: &McpContext) -> Vec<ToolDefinition> {
             tools.push(ToolDefinition {
                 name: tool.name.clone(),
                 description: format!(
-                    "[local][extension:{}][trust:{:?}] {}",
+                    "[tier:local][extension:{}][trust:{:?}] {}",
                     extension.manifest.id, extension.trust_tier, tool.description
                 ),
                 input_schema,

@@ -344,13 +344,13 @@ This is the body.
     /// v2 collapsed four competing boot rituals into one, and handed the retrieval-budget
     /// and entity-prefix rules to the MCP tool schemas. Guard both.
     #[test]
-    fn memory_practices_v2_declares_a_single_boot_and_defers_to_tool_schemas() {
+    fn memory_practices_v3_declares_a_single_boot_and_pins_tool_routing() {
         let bundled = load_bundled_profiles().unwrap();
         let p = bundled
             .iter()
             .find(|f| f.frontmatter.name == "memory-practices")
             .expect("memory-practices fragment must be bundled");
-        assert_eq!(p.frontmatter.version, 2);
+        assert_eq!(p.frontmatter.version, 3);
 
         let body = p.body.to_lowercase();
         assert!(
@@ -365,19 +365,32 @@ This is the body.
             !body.contains("entity=\"execplan:"),
             "entity conventions now live in the store_fact schema, not here"
         );
+
+        // v3: the three signals that were being misread as "the tools cannot
+        // reach the daemon" must each be named, or the misreading recurs.
+        for signal in ["[tier:local]", "local_only", "unreachable"] {
+            assert!(
+                body.contains(signal),
+                "v3 must disambiguate the `{signal}` signal from tool routing"
+            );
+        }
+        assert!(
+            body.contains("fall back to raw http only on an actual failure"),
+            "v3 must state the call-then-fall-back rule, not merely explain the markers"
+        );
     }
 
     /// v3 moved the drift guard's install/wiring detail into
     /// `docs/execplan-drift-guard.md`. The body keeps only what an agent needs
     /// mid-session; operator setup is read on demand. Guard both halves.
     #[test]
-    fn execplan_discipline_v3_defers_drift_guard_setup_to_docs() {
+    fn execplan_discipline_v4_defers_drift_guard_setup_and_pins_the_real_gap_preflight() {
         let bundled = load_bundled_profiles().unwrap();
         let p = bundled
             .iter()
             .find(|f| f.frontmatter.name == "execplan-discipline")
             .expect("execplan-discipline fragment must be bundled");
-        assert_eq!(p.frontmatter.version, 3);
+        assert_eq!(p.frontmatter.version, 4);
 
         let body = p.body.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
 
@@ -403,6 +416,18 @@ This is the body.
         assert!(
             body.contains("docs/execplan-drift-guard.md"),
             "must point at the reference doc"
+        );
+
+        // v4: the pre-flight pointed at `get_gaps`, which reads retrieval-coverage
+        // facts, and at the retired PlanCrux API. Pin the real endpoint and the
+        // disambiguation, or agents silently pre-flight against the wrong surface.
+        assert!(
+            body.contains("/v1/features/capabilities/analysis/gaps"),
+            "the pre-flight must name the Features-lens endpoint"
+        );
+        assert!(
+            body.contains("get_gaps` is **not** this"),
+            "the get_gaps/capability-registry distinction must be explicit"
         );
     }
 
