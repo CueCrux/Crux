@@ -40,6 +40,7 @@ pub(super) struct EventStreamParams {
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn event_stream(
     State(state): State<AppState>,
     headers: HeaderMap,

@@ -55,6 +55,7 @@ pub(super) struct CompleteOnboardingBody {
 
 const SUPPORTED_ONBOARDING_AUTH_MODES: &[&str] = &["off", "dev_scopes", "jwt_hs256", "jwt_jwks"];
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_onboarding(State(state): State<AppState>) -> impl IntoResponse {
     let onboarding = state.onboarding.read().await;
     (
@@ -71,6 +72,7 @@ pub(super) async fn get_console_onboarding(State(state): State<AppState>) -> imp
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_console_onboarding_complete(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -143,6 +145,7 @@ pub(super) struct UpdateSettingsBody {
     pub embedding_model: Option<String>,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_settings(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_console_read(&state, &headers) {
         return problem.into_response();
@@ -178,6 +181,7 @@ pub(super) async fn get_console_settings(State(state): State<AppState>, headers:
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn put_console_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -264,6 +268,7 @@ pub(super) struct ProbeEmbeddingBody {
 /// (`GET {url}/api/tags`) first, falls back to OpenAI-compatible
 /// (`GET {url}/v1/models`). Returns whichever shape parsed; the UI shows the
 /// flat list and lets the operator override manually if both probes fail.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_console_embedding_probe(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -342,6 +347,7 @@ fn default_true() -> bool {
     true
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_corecrux_lane_weights(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -370,6 +376,7 @@ pub(super) async fn get_console_corecrux_lane_weights(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn put_console_corecrux_lane_weights(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -417,6 +424,7 @@ pub(super) async fn put_console_corecrux_lane_weights(
 /// returning that scope to its process-env / inherited defaults. Other boost
 /// overlay keys are left untouched — this is intentionally narrower than
 /// CoreCrux's whole-overlay `DELETE /v1/admin/boost-config/tenant`.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_console_corecrux_lane_weights(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -485,6 +493,7 @@ const GRAPH_PATH_PARAMS: &[&str] = &["src", "dst", "max_hops", "k", "context_edg
 
 /// `GET /v1/console/corecrux/graph/stats` — GET-passthrough to upstream
 /// `GET /v1/graph/stats` (corpus counts, snapshot id, build digest, degree histogram).
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_corecrux_graph_stats(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -505,6 +514,7 @@ pub(super) async fn get_console_corecrux_graph_stats(
 /// `GET /v1/console/corecrux/graph/resolve?titles=A|B|C` — translated to upstream
 /// `POST /v1/graph/resolve {titles:[...]}`. `|` is the delimiter (invalid in ns0
 /// titles, so it can never appear inside one).
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_corecrux_graph_resolve(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -549,6 +559,7 @@ pub(super) async fn get_console_corecrux_graph_resolve(
 /// upstream `POST /v1/graph/ego`. Budgets are mandatory (mirroring the upstream
 /// contract, R3); all params validated + capped server-side before any network
 /// call.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_corecrux_graph_ego(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -576,6 +587,7 @@ pub(super) async fn get_console_corecrux_graph_ego(
 
 /// `GET /v1/console/corecrux/graph/path?src=1&dst=2&max_hops=6&…` → upstream
 /// `POST /v1/graph/path` (k-shortest bidirectional BFS + 1-hop context subgraph).
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_corecrux_graph_path(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -902,6 +914,7 @@ pub(super) struct ConsoleReviewQuery {
     pub limit: Option<usize>,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_review_contradictions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -934,6 +947,7 @@ pub(super) async fn get_console_review_contradictions(
 /// review body (contradiction + expiry proposals). This is the data the embedded
 /// `/console/review` page renders. Distinct from
 /// `GET /v1/console/review/contradictions`, which runs a LIVE contradiction pass.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_review_queue(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1014,6 +1028,7 @@ pub(super) struct ConsoleExpiryApplyRequest {
 /// deleted. There is no cutoff, so a future timestamp can no longer mass-delete.
 /// Deletion uses the fallible [`corecrux_memory::FactStore::try_delete`] so an
 /// unpersisted tombstone is reported as skipped, not expired (finding 3).
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_console_review_expiries(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1086,6 +1101,7 @@ pub(super) async fn post_console_review_expiries(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_console_review_consolidation(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1151,6 +1167,7 @@ pub(super) struct ConsolidationUndoRequest {
 /// consolidation (retire the canonical, restore its sources) and emit a signed
 /// undo receipt (M2). Idempotent: undoing an already-undone consolidation
 /// returns `status = "already_undone"`.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_console_review_consolidation_undo(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2018,6 +2035,7 @@ fn build_probe_candidates(url: &str) -> Vec<String> {
     out
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_storage_breakdown(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2081,6 +2099,7 @@ pub(super) async fn get_console_storage_breakdown(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_console_onboarding_restart(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2103,6 +2122,7 @@ pub(super) async fn post_console_onboarding_restart(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_summary(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_console_read(&state, &headers) {
         return problem.into_response();
@@ -2167,6 +2187,7 @@ pub(super) async fn get_console_summary(State(state): State<AppState>, headers: 
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_integrations(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_console_read(&state, &headers) {
         return problem.into_response();
@@ -2207,6 +2228,7 @@ pub(super) async fn get_console_integrations(State(state): State<AppState>, head
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_console_integration_install(
     State(state): State<AppState>,
     Path(pack_id): Path<String>,
@@ -2242,6 +2264,7 @@ pub(super) async fn post_console_integration_install(
     (StatusCode::CREATED, Json(descriptor)).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_console_integration_grant(
     State(state): State<AppState>,
     Path(pack_id): Path<String>,
@@ -2280,6 +2303,7 @@ pub(super) async fn post_console_integration_grant(
     (StatusCode::OK, Json(grant)).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_console_integration_disable(
     State(state): State<AppState>,
     Path(pack_id): Path<String>,
@@ -2304,6 +2328,7 @@ pub(super) async fn post_console_integration_disable(
     (StatusCode::OK, Json(grant)).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_passports(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_console_read(&state, &headers) {
         return problem.into_response();
@@ -2340,6 +2365,7 @@ pub(super) struct ConsoleSessionsQuery {
     pub include_archived: bool,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_sessions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2649,6 +2675,7 @@ pub(super) struct ConsoleSessionDetailQuery {
 ///   * `linked_plans_heuristic` — `execplan:*` facts authored by the bound
 ///     passport, grouped by entity, top 5 by latest write. Fact-authorship is a
 ///     heuristic — journaled session↔plan linkage is a daemon follow-up.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_session_detail(
     State(state): State<AppState>,
     Query(query): Query<ConsoleSessionDetailQuery>,
@@ -2851,6 +2878,7 @@ fn default_console_confidence() -> f32 {
     1.0
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_facts(
     State(state): State<AppState>,
     Query(query): Query<ConsoleFactsQuery>,
@@ -2902,6 +2930,7 @@ pub(super) async fn get_console_facts(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_console_fact_add(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2956,6 +2985,7 @@ pub(super) struct ConsoleTenantsQuery {
     pub category: Option<String>,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_tenants(
     State(state): State<AppState>,
     Query(query): Query<ConsoleTenantsQuery>,
@@ -3028,6 +3058,7 @@ pub(super) async fn get_console_tenants(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_tenant_chunks(
     State(state): State<AppState>,
     Path(tenant_id): Path<String>,
@@ -3061,6 +3092,7 @@ pub(super) async fn get_console_tenant_chunks(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_chunk(
     State(state): State<AppState>,
     Path(chunk_digest): Path<String>,
@@ -3091,6 +3123,7 @@ pub(super) async fn get_console_chunk(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_chunk_preview(
     State(state): State<AppState>,
     Path(chunk_digest): Path<String>,
@@ -3149,6 +3182,7 @@ fn tenant_category_response(
     })
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_tenant_category(
     State(state): State<AppState>,
     Path(tenant_id): Path<String>,
@@ -3166,6 +3200,7 @@ pub(super) async fn get_console_tenant_category(
     (StatusCode::OK, Json(body)).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn patch_console_tenant_category(
     State(state): State<AppState>,
     Path(tenant_id): Path<String>,

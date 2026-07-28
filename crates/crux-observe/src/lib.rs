@@ -17,3 +17,4 @@ pub mod ops_layer;
 pub mod redact;
 pub mod redact_writer;
 pub mod schema;
+pub mod span_layer;

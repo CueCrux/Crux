@@ -73,6 +73,7 @@ pub(super) struct InstallFromRegistryBody {
 }
 
 /// `GET /v1/extensions` — list every installed extension.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn list_extensions(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
@@ -92,6 +93,7 @@ pub(super) async fn list_extensions(State(state): State<AppState>, headers: Head
 }
 
 /// `GET /v1/extensions/{id}` — fetch one installed extension.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_extension(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -118,6 +120,7 @@ pub(super) async fn get_extension(
 /// persisted manifest to use the cached path form. Once cached, the
 /// daemon never re-fetches; an extension that wants a new module
 /// version is uninstalled + re-installed.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn register_extension(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -225,6 +228,7 @@ pub(super) async fn register_extension(
 /// signature verification, no network. Entries are joined against the
 /// installed set so the caller can render "installed / update available"
 /// without a second round-trip.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn list_registry_entries(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
@@ -281,6 +285,7 @@ pub(super) async fn list_registry_entries(State(state): State<AppState>, headers
 /// signed index against the local trusted-keyring, fetches the manifest URL,
 /// enforces the curator-published `manifest_sha256`, then delegates to the
 /// same signed-manifest installer as `/v1/extensions/register`.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn install_from_registry(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -461,6 +466,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// `DELETE /v1/extensions/{id}` — uninstall.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_extension(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -500,6 +506,7 @@ pub(super) struct AddTrustedKeyBody {
 }
 
 /// `GET /v1/extensions/keys` — list trusted signing keys.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn list_trusted_keys(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
@@ -519,6 +526,7 @@ pub(super) async fn list_trusted_keys(State(state): State<AppState>, headers: He
 }
 
 /// `POST /v1/extensions/keys` — add a trusted signing key.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn add_trusted_key(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -584,6 +592,7 @@ pub(super) struct IssueGrantBody {
 }
 
 /// `GET /v1/extensions/{id}/grants` — list grants for one extension.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn list_grants(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -607,6 +616,7 @@ pub(super) async fn list_grants(
 }
 
 /// `POST /v1/extensions/{id}/grants` — issue a grant to a passport.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn issue_grant(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -683,6 +693,7 @@ fn make_request_id() -> String {
 /// surface for an installed extension. Branches on `manifest.entry.kind`:
 /// `ExternalTool` → Phase A HTTPS path; `Wasm` → Phase B in-process
 /// wasmtime path (M6.3, requires `--features wasm-extensions`).
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn invoke_extension_tool(
     State(state): State<AppState>,
     Path((extension_id, tool_name)): Path<(String, String)>,
@@ -834,6 +845,7 @@ pub(super) async fn invoke_extension_tool(
 }
 
 /// `DELETE /v1/extensions/{id}/grants/{passport_fpr}` — revoke a grant.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn revoke_grant(
     State(state): State<AppState>,
     Path((id, passport_fpr)): Path<(String, String)>,
@@ -867,6 +879,7 @@ pub(super) async fn revoke_grant(
 }
 
 /// `DELETE /v1/extensions/keys/{passport_fpr}` — revoke a trusted key.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_trusted_key(
     State(state): State<AppState>,
     Path(passport_fpr): Path<String>,

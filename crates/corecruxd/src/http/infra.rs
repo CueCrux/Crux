@@ -53,6 +53,7 @@ fn latest_by_key<F: Fn(&str, &corecrux_memory::fact_store::Fact, &serde_json::Va
         .collect()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_infra_summary(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();

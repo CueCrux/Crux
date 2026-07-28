@@ -225,6 +225,7 @@ fn usage_rollup(passport: &str, payloads: &[Value], window: &str) -> Value {
 }
 
 /// `GET /v1/agents/{passport}/usage`.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_agent_usage(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -433,6 +434,7 @@ fn fleet_rollup(
 /// `GET /v1/mcp/tools/usage` — fleet-wide per-tool call rollup joined
 /// against the full MCP catalog. Admin-read (same posture as the
 /// `/v1/mcp/tools` catalog proxy it augments).
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_mcp_tools_usage(
     State(state): State<AppState>,
     headers: HeaderMap,

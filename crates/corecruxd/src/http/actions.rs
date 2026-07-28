@@ -32,6 +32,7 @@ pub(super) fn action_enrichment_posture(state: &AppState) -> serde_json::Value {
     })
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_action_enrich(
     State(state): State<AppState>,
     headers: HeaderMap,

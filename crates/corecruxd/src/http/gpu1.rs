@@ -317,6 +317,7 @@ pub(super) fn compute_posture(state: &AppState) -> Gpu1ComputeContract {
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_gpu1_contract(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(problem) = require_http_any_scope(&state.auth, &headers, &["admin:read", "query:read"]) {
         return problem.into_response();
@@ -324,6 +325,7 @@ pub(super) async fn get_gpu1_contract(State(state): State<AppState>, headers: He
     Json(compute_posture(&state)).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_gpu1_answer(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -348,6 +350,7 @@ pub(super) async fn post_gpu1_answer(
     .await
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_gpu1_rerank(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -388,6 +391,7 @@ pub(super) async fn post_gpu1_rerank(
     .await
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_gpu1_enrich(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -414,6 +418,7 @@ pub(super) async fn post_gpu1_enrich(
     .await
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_gpu1_coverage(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -434,6 +439,7 @@ pub(super) async fn post_gpu1_coverage(
     .await
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_gpu1_developer(
     State(state): State<AppState>,
     headers: HeaderMap,

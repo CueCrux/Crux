@@ -97,6 +97,7 @@ pub(super) struct ExtractResponse {
 }
 
 /// `POST /v1/memory/extract`
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_extract(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -180,6 +181,7 @@ pub(super) struct ListQuery {
 }
 
 /// `GET /v1/memory/candidates`
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_candidates(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -223,6 +225,7 @@ pub(super) struct PromoteRequest {
 }
 
 /// `POST /v1/memory/candidates/{id}/promote`
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_promote(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -273,6 +276,7 @@ pub(super) struct RejectRequest {
 }
 
 /// `POST /v1/memory/candidates/{id}/reject`
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_reject(
     State(state): State<AppState>,
     headers: HeaderMap,

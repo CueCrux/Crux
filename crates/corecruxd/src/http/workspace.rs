@@ -18,6 +18,7 @@ use crate::workspace_scan::{LATEST_SCAN_ENTITY, SCAN_KEY};
 /// `POST /v1/workspace/scan` — kick off a scan of the configured workspace
 /// path. Returns the scan summary (no file contents) inline; full payload is
 /// persisted as a fact.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_scan(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
@@ -76,6 +77,7 @@ pub(super) async fn post_scan(State(state): State<AppState>, headers: HeaderMap)
 /// main HTTP port (14800) so the in-browser console can read it without
 /// crossing CORS to the MCP port (14801). Returns the same shape as the
 /// JSON-RPC tools/list result, minus the JSON-RPC envelope.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_mcp_tools(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
@@ -102,6 +104,7 @@ pub(super) async fn get_mcp_tools(State(state): State<AppState>, headers: Header
 }
 
 /// `GET /v1/workspace/scan` — return the latest persisted scan in full.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_scan(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
@@ -149,6 +152,7 @@ fn parse_truthy(s: Option<&str>) -> bool {
 /// - `?format=json` — full compact graph (no root needed; agents want it all).
 /// - `?root=POST /v1/projects&format=tree` — single route storyline as text.
 /// - `?root=crates/corecruxd/src/main.rs&format=tree` — root at any file.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_storyline(
     State(state): State<AppState>,
     headers: HeaderMap,

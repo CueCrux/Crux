@@ -28,6 +28,7 @@ fn now_unix_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_status(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
@@ -36,6 +37,7 @@ pub(super) async fn get_status(State(state): State<AppState>, headers: HeaderMap
     (StatusCode::OK, Json(status)).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_connect(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -88,6 +90,7 @@ pub(super) async fn post_connect(
     (StatusCode::OK, Json(status)).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_disconnect(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["integrations:disable"]) {
         return problem.into_response();
@@ -109,6 +112,7 @@ pub(super) async fn post_disconnect(State(state): State<AppState>, headers: Head
     (StatusCode::NO_CONTENT, ()).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_accessible_repos(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
@@ -145,6 +149,7 @@ pub(super) async fn get_accessible_repos(State(state): State<AppState>, headers:
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_select_repo(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
@@ -190,6 +195,7 @@ pub(super) struct PlanningFlagBody {
     pub planning: bool,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn put_planning_flag(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
@@ -205,6 +211,7 @@ pub(super) async fn put_planning_flag(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_selected_repo(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
@@ -219,6 +226,7 @@ pub(super) async fn delete_selected_repo(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_sync(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["integrations:install"]) {
         return problem.into_response();
@@ -248,6 +256,7 @@ pub(super) async fn post_sync(State(state): State<AppState>, headers: HeaderMap)
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_selected_repos(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();

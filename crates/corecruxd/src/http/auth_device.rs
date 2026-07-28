@@ -201,6 +201,7 @@ pub(super) struct DeviceStartReq {
     // scopes (threat ref T.1).
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_device_start(
     State(_state): State<AppState>,
     headers: HeaderMap,
@@ -280,6 +281,7 @@ pub(super) struct DeviceApproveReq {
     pub deny: bool,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_device_approve(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -350,6 +352,7 @@ pub(super) struct DeviceTokenReq {
     pub device_code: String,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_device_token(State(_state): State<AppState>, Json(req): Json<DeviceTokenReq>) -> Response {
     if !env_flag_enabled(DEVICE_ENABLED_ENV) {
         return device_disabled_response();
@@ -450,6 +453,7 @@ fn split_refresh(token: &str) -> Option<(&str, &str)> {
         .filter(|(id, secret)| !id.is_empty() && !secret.is_empty())
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_device_refresh(State(_state): State<AppState>, Json(req): Json<RefreshReq>) -> Response {
     if !env_flag_enabled(DEVICE_ENABLED_ENV) {
         return device_disabled_response();
@@ -503,6 +507,7 @@ pub(super) async fn post_device_refresh(State(_state): State<AppState>, Json(req
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_device_revoke(State(_state): State<AppState>, Json(req): Json<RefreshReq>) -> Response {
     if !env_flag_enabled(DEVICE_ENABLED_ENV) {
         return device_disabled_response();

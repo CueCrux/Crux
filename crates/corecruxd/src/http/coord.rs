@@ -112,6 +112,7 @@ async fn live_lease_summaries(state: &AppState, now_ms: i64) -> Vec<LeaseSummary
 
 /// `GET /v1/coord/active?project_id=` — merged "who is live, what are they
 /// doing" view.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_coord_active(
     State(state): State<AppState>,
     Query(q): Query<ActiveQuery>,
@@ -162,6 +163,7 @@ pub(super) async fn get_coord_active(
 
 /// `POST /v1/coord/announce` — declare this session's focus. Re-announcing
 /// replaces; `ttl_seconds: 0` clears.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_coord_announce(
     State(state): State<AppState>,
     headers: HeaderMap,

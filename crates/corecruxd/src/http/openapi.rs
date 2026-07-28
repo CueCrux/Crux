@@ -189,6 +189,11 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/console/chunks/{chunkDigest}", methods: &["GET"], tag: "Console", auth: "admin-read", summary: "Console chunks {chunkDigest}" },
     RouteEntry { path: "/v1/console/chunks/{chunkDigest}/preview", methods: &["GET"], tag: "Console", auth: "admin-read", summary: "Console chunks {chunkDigest} preview" },
     RouteEntry { path: "/v1/console/corecrux/lane-weights", methods: &["GET", "PUT", "DELETE"], tag: "Console", auth: "admin", summary: "Console corecrux lane weights" },
+    RouteEntry { path: "/v1/code-intel/blast-radius", methods: &["GET"], tag: "CodeIntel", auth: "admin-read", summary: "Static + observed dependents of a symbol" },
+    RouteEntry { path: "/v1/code-intel/dead-code", methods: &["GET"], tag: "CodeIntel", auth: "admin-read", summary: "Dead-code evidence ladder across tiers" },
+    RouteEntry { path: "/v1/code-intel/liveness", methods: &["GET"], tag: "CodeIntel", auth: "admin-read", summary: "Did this symbol execute, in a stated window" },
+    RouteEntry { path: "/v1/code-intel/path", methods: &["GET"], tag: "CodeIntel", auth: "admin-read", summary: "What actually executes for an entry point" },
+    RouteEntry { path: "/v1/code-intel/trace-diff", methods: &["GET"], tag: "CodeIntel", auth: "admin-read", summary: "Where two traces diverge" },
     RouteEntry { path: "/v1/console/corecrux/graph/stats", methods: &["GET"], tag: "console-graph", auth: "admin-read", summary: "Console CoreCrux link-graph stats (read-only mediation proxy)" },
     RouteEntry { path: "/v1/console/corecrux/graph/resolve", methods: &["GET"], tag: "console-graph", auth: "admin-read", summary: "Console CoreCrux link-graph title resolve (read-only mediation proxy)" },
     RouteEntry { path: "/v1/console/corecrux/graph/ego", methods: &["GET"], tag: "console-graph", auth: "admin-read", summary: "Console CoreCrux link-graph ego expansion (read-only mediation proxy)" },
@@ -404,6 +409,12 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/repos/scan-jobs/{job_id}", methods: &["GET"], tag: "Repos", auth: "admin-read", summary: "Repos scan jobs {job_id}" },
     RouteEntry { path: "/v1/repos/{repo_id}", methods: &["GET", "DELETE"], tag: "Repos", auth: "admin", summary: "Repos {repo_id}" },
     RouteEntry { path: "/v1/repos/{repo_id}/codemap", methods: &["GET"], tag: "Repos", auth: "admin-read", summary: "Repos {repo_id} codemap" },
+    RouteEntry { path: "/v1/repos/{repo_id}/spatial", methods: &["GET"], tag: "Repos", auth: "admin-read", summary: "Deterministic spatial layout (districts, buildings, bundles)" },
+    RouteEntry { path: "/v1/repos/{repo_id}/symbols/resolve", methods: &["GET"], tag: "Repos", auth: "admin-read", summary: "Resolve a (file, name[, line]) callsite to a stable symbol_id" },
+    RouteEntry { path: "/v1/traces", methods: &["GET"], tag: "Traces", auth: "admin-read", summary: "List persisted runtime traces" },
+    RouteEntry { path: "/v1/traces/stats", methods: &["GET"], tag: "Traces", auth: "admin-read", summary: "Runtime span capture stats" },
+    RouteEntry { path: "/v1/traces/spans", methods: &["GET"], tag: "Traces", auth: "admin-read", summary: "Captured runtime spans" },
+    RouteEntry { path: "/v1/traces/{trace_id}", methods: &["GET"], tag: "Traces", auth: "admin-read", summary: "One persisted trace, spans resolved to symbols" },
     RouteEntry { path: "/v1/result-envelope/import", methods: &["POST"], tag: "ResultEnvelope", auth: "write", summary: "Result envelope import" },
     RouteEntry { path: "/v1/route", methods: &["GET"], tag: "Routing", auth: "admin-read", summary: "Route" },
     RouteEntry { path: "/v1/routing/route", methods: &["GET"], tag: "Routing", auth: "admin-read", summary: "Routing route" },
@@ -496,6 +507,7 @@ fn apply_route_manifest(spec: &mut serde_json::Value) {
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn openapi_json() -> Json<serde_json::Value> {
     let mut spec =
         serde_json::to_value(ApiDoc::openapi()).unwrap_or_else(|_| serde_json::json!({ "openapi": "3.1.0" }));

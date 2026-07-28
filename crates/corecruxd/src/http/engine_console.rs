@@ -137,14 +137,17 @@ impl EngineRoute {
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_engine_summary(State(state): State<AppState>, headers: HeaderMap) -> Response {
     proxy(state, headers, EngineRoute::Summary).await
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_engine_bench(State(state): State<AppState>, headers: HeaderMap) -> Response {
     proxy(state, headers, EngineRoute::Bench).await
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_engine_spend(State(state): State<AppState>, headers: HeaderMap) -> Response {
     proxy(state, headers, EngineRoute::Spend).await
 }
@@ -169,6 +172,7 @@ pub(super) struct EngineSearchBody {
 /// server-side (never downstream) and a fixed/overridable corpus tenant. Env
 /// unset ⇒ 404 feature-off, exactly like the GET mediation routes. Read-only
 /// semantics: a search carries no write.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_engine_search(
     State(state): State<AppState>,
     headers: HeaderMap,

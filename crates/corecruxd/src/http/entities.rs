@@ -40,6 +40,7 @@ pub(super) struct UpsertEntityBody {
     pub payload: Value,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_entity(
     State(state): State<AppState>,
     Path((kind, id)): Path<(String, String)>,
@@ -55,6 +56,7 @@ pub(super) async fn get_entity(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn list_entities(
     State(state): State<AppState>,
     Query(q): Query<ListEntitiesQuery>,
@@ -74,6 +76,7 @@ pub(super) async fn list_entities(
     (StatusCode::OK, Json(json!({"entities": entities, "count": count}))).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn put_entity(
     State(state): State<AppState>,
     Path((kind, id)): Path<(String, String)>,
@@ -97,6 +100,7 @@ pub(super) async fn put_entity(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_entity_history(
     State(state): State<AppState>,
     Path((kind, id)): Path<(String, String)>,
@@ -111,6 +115,7 @@ pub(super) async fn get_entity_history(
     (StatusCode::OK, Json(json!({"versions": versions, "count": count}))).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_entity(
     State(state): State<AppState>,
     Path((kind, id)): Path<(String, String)>,
@@ -161,6 +166,7 @@ pub(super) struct DeleteEdgeBody {
     pub to_id: String,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn list_edges(
     State(state): State<AppState>,
     Query(q): Query<ListEdgesQuery>,
@@ -184,6 +190,7 @@ pub(super) async fn list_edges(
     (StatusCode::OK, Json(json!({"edges": edges, "count": count}))).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn put_edge(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -208,6 +215,7 @@ pub(super) async fn put_edge(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_edge(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -233,6 +241,7 @@ pub(super) async fn delete_edge(
 
 // ── Kinds ────────────────────────────────────────────────────────────
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn list_kinds(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(p) = require_http_any_scope(&state.auth, &headers, &["facts:read", "admin:read"]) {
         return p.into_response();
@@ -243,6 +252,7 @@ pub(super) async fn list_kinds(State(state): State<AppState>, headers: HeaderMap
     (StatusCode::OK, Json(json!({"kinds": kinds, "count": count}))).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_kind(
     State(state): State<AppState>,
     Path(kind): Path<String>,

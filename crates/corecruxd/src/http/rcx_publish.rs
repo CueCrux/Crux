@@ -32,6 +32,7 @@ pub(super) struct PublishBody {
     pub operator_metadata: Option<Value>,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn preview_passport(
     State(state): State<AppState>,
     Path(passport_id): Path<String>,
@@ -47,6 +48,7 @@ pub(super) async fn preview_passport(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn emit_passport(
     State(state): State<AppState>,
     Path(passport_id): Path<String>,
@@ -63,6 +65,7 @@ pub(super) async fn emit_passport(
     emit_response(state, "passport", &passport_id, record, body.registry_url).await
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn preview_project(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
@@ -78,6 +81,7 @@ pub(super) async fn preview_project(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn emit_project(
     State(state): State<AppState>,
     Path(project_id): Path<String>,

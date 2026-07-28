@@ -165,6 +165,7 @@ fn mint_invoke_receipt(
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_tools_json(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if !state.openai_shim_enabled {
         return shim_disabled_response();
@@ -216,6 +217,7 @@ pub(super) async fn get_tools_json(State(state): State<AppState>, headers: Heade
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_invoke(
     State(state): State<AppState>,
     headers: HeaderMap,

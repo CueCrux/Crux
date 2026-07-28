@@ -271,6 +271,7 @@ fn redact_output_refs(redactor: &Redactor, outputs: &mut [TraceOutput]) {
 /// Mints the monotonic `seq`, stamps `status = running`, and persists a new
 /// `agent_trace_node`. The body supplies the opening facts (label, actor,
 /// inputs, …); the response is the stored node.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn open_step(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -336,6 +337,7 @@ pub(super) async fn open_step(
 /// mutating outputs that didn't carry their own, and stamps the step-level
 /// `receipt_id` from `mutation_receipt_id` when none was supplied — so a
 /// close that names one receipt yields a chain that passes `receipt_chain_ok`.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn close_step(
     State(state): State<AppState>,
     Path((session_id, node_id)): Path<(String, String)>,
@@ -429,6 +431,7 @@ fn apply_close(node: &mut TraceNode, mut body: CloseStepBody) {
 
 /// `GET /v1/observe/sessions/{id}/audit` — return the ordered audit chain for
 /// one session, reconstructed from the `agent_trace_node` substrate.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_session_audit(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -479,6 +482,7 @@ struct ReceiptVerification {
 /// rather than failing the export. The bundle's `conformance` block carries
 /// the contract-level gate (`receipt_chain_ok` etc.) which does not require a
 /// live dataplane.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_session_audit_export(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -647,6 +651,7 @@ fn conformance_report(nodes: &[TraceNode]) -> ConformanceReport {
 
 /// `GET /v1/observe/sessions/{id}/audit/conformance` — assert the three M6
 /// gates across the session, enumerating every failure.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_session_audit_conformance(
     State(state): State<AppState>,
     Path(id): Path<String>,

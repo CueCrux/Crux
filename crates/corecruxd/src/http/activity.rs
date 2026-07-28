@@ -91,6 +91,7 @@ fn activity_disabled_response() -> Response {
 /// body's `tenant_id` (T.1). The append id is recorded as a receipt
 /// reference (T.4) and an `activity.appended` event is broadcast (the cheap
 /// projection — never the verbatim text).
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_activity(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -163,6 +164,7 @@ fn parse_kinds(raw: Option<&String>) -> Option<Vec<JournalKind>> {
 /// seq), `kinds` (csv), `token_budget` (**required**, QC.2). Returns compact
 /// rows newest-first, reserved-prefix-stripped and privacy-scoped, trimmed to
 /// fit the budget. Missing `token_budget` ⇒ 400.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_activity(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -266,6 +268,7 @@ pub(super) async fn get_activity(
 /// `GET /v1/activity/turn/{turn_id}` — deref one turn to its full verbatim
 /// entries (human-lane row-expand and the agent's full-fidelity pull). Query:
 /// `tenant_id` + `session` (both required). Privacy-scoped like the pull.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_activity_turn(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -342,6 +345,7 @@ fn verify_entry(entry: &JournalEntry, passport_pubkey_hex: &str) -> serde_json::
 /// `GET /v1/activity/turn/{turn_id}/verify` — verify the embedded receipts for
 /// a turn against the daemon passport key (M2). Reuses the same tenant/session
 /// scope as the deref. The console ✓verify badge calls this.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_activity_turn_verify(
     State(state): State<AppState>,
     headers: HeaderMap,

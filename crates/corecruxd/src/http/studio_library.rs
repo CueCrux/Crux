@@ -113,6 +113,7 @@ pub(super) struct InstallFromLibraryBody {
 /// Honest failure modes, mirroring [`super::extensions::list_registry_entries`]:
 /// 404 naming `corecruxctl studio sync` when no index is cached, 403 when the
 /// cached index does not verify against the operator keyring.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_studio_library(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["query:read"]) {
         return problem.into_response();
@@ -284,6 +285,7 @@ struct AppliedRemap {
 /// Operator-gated: `admin:read` + `facts:write`, the same posture as
 /// [`super::extensions::install_from_registry`], because this writes durable
 /// console artifacts.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_studio_library_install(
     State(state): State<AppState>,
     Path(id): Path<String>,

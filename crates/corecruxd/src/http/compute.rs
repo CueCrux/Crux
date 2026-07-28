@@ -60,6 +60,7 @@ struct ComputeEmbedReceiptPayload<'a> {
     dimensions: usize,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_compute_embed(
     State(state): State<AppState>,
     headers: HeaderMap,

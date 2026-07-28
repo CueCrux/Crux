@@ -54,6 +54,17 @@ pub struct WorkspaceScan {
     pub deps: Vec<DepEdge>,
     pub stubs: Vec<StubHit>,
     pub dead_code: Vec<DeadSymbol>,
+    /// Public symbols referenced somewhere in the workspace, but **never from
+    /// outside a `#[cfg(test)]` scope or a test file**.
+    ///
+    /// The third category. Every reference-counting tier sees these as alive
+    /// (they are referenced) and every execution tier sees them as unobserved
+    /// (production never calls them), so neither can name what they actually
+    /// are: code kept alive only by its own tests. Deleting one is a judgement
+    /// call about the test, not an automatic win — which is a different answer
+    /// from both "dead" and "live", and worth being able to give.
+    #[serde(default)]
+    pub test_only_symbols: Vec<String>,
     /// Parsed HTTP routes (axum `.route("/path", METHOD(handler))` calls).
     /// Each entry resolves the handler to its definition file/line so the
     /// storyline composer can root a tree at the right place.

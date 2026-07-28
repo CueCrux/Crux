@@ -208,6 +208,7 @@ fn deny_mint_request_self_review(
     Ok(())
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_passports(
     State(state): State<AppState>,
     Query(query): Query<ListPassportsQuery>,
@@ -238,6 +239,7 @@ pub(super) async fn get_passports(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_pending_mint_requests(
     State(state): State<AppState>,
     Query(query): Query<ListPendingMintRequestsQuery>,
@@ -268,6 +270,7 @@ pub(super) async fn get_pending_mint_requests(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_mint_request_approve(
     State(state): State<AppState>,
     Path(request_id): Path<String>,
@@ -405,6 +408,7 @@ pub(super) async fn post_mint_request_approve(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_mint_request_reject(
     State(state): State<AppState>,
     Path(request_id): Path<String>,
@@ -474,6 +478,7 @@ pub(super) async fn post_mint_request_reject(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_passport(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -491,6 +496,7 @@ pub(super) async fn get_passport(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_passport(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -528,6 +534,7 @@ pub(super) async fn post_passport(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn patch_passport(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -565,6 +572,7 @@ pub(super) async fn patch_passport(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_passport(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -588,6 +596,7 @@ pub(super) async fn delete_passport(
 /// `GET /v1/passports/presence` — multi-agent presence snapshot. Returns the
 /// list of passports the daemon has observed in the last process lifetime,
 /// most-recently-seen first. In-memory only; never touches disk.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_presence(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();

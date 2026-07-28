@@ -153,6 +153,7 @@ async fn persist_signed_receipt(
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_legal_hold(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -210,6 +211,7 @@ pub(super) async fn post_legal_hold(
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_legal_hold(
     State(state): State<AppState>,
     headers: HeaderMap,

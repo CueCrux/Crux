@@ -72,6 +72,10 @@ pub(crate) struct CachedFile {
     deps: Vec<DepEdge>,
     routes: Vec<ParsedRoute>,
     ident_refs: HashMap<String, usize>,
+    /// Same counts, but excluding anything inside a `#[cfg(test)]` scope.
+    /// The difference between the two is what makes "referenced only by tests"
+    /// sayable — a category invisible to every reference-counting tier.
+    ident_refs_nontest: HashMap<String, usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +165,7 @@ fn assemble_scan_at(root: &Path, cache: &AstScanCache, started_ms: u64) -> Works
     let mut file_idx_by_path: HashMap<String, usize> = HashMap::new();
     let mut local_symbol_to_global: HashMap<(String, usize), usize> = HashMap::new();
     let mut ident_refs: HashMap<String, usize> = HashMap::new();
+    let mut ident_refs_nontest: HashMap<String, usize> = HashMap::new();
 
     for cname in &cache.crate_order {
         let Some(crate_root) = cache.crate_dirs.get(cname) else {
@@ -196,6 +201,9 @@ fn assemble_scan_at(root: &Path, cache: &AstScanCache, started_ms: u64) -> Works
             }
             for (ident, count) in &file.ident_refs {
                 *ident_refs.entry(ident.clone()).or_insert(0) += *count;
+            }
+            for (ident, count) in &file.ident_refs_nontest {
+                *ident_refs_nontest.entry(ident.clone()).or_insert(0) += *count;
             }
         }
         scan.crates.push(CrateInfo {
@@ -234,6 +242,7 @@ fn assemble_scan_at(root: &Path, cache: &AstScanCache, started_ms: u64) -> Works
     resolve_references(&mut scan, &index, &file_idx_by_path);
     build_referenced_by(&mut scan);
     compute_dead_code(&mut scan, &ident_refs);
+    compute_test_only(&mut scan, &ident_refs, &ident_refs_nontest);
     crate::workspace_scan_manifests::attach_external_deps_if_enabled(root, &mut scan);
     roll_up_stats(&mut scan);
     scan
@@ -415,6 +424,9 @@ impl Index {
     }
 
     fn resolve(&self, call: &CallRef, from: &FnDef) -> Option<usize> {
+        if call.kind == CallKind::Method {
+            return self.resolve_method(call);
+        }
         if call.kind != CallKind::Func {
             return None;
         }
@@ -465,6 +477,29 @@ impl Index {
             _ => None,
         }
     }
+
+    /// Resolve `x.method()` — but only when the name is unambiguous.
+    ///
+    /// A method call carries no receiver type, so the only honest resolution is
+    /// by name. Guessing between candidates would manufacture edges that look
+    /// like evidence, so this resolves **only when exactly one definition in the
+    /// whole workspace bears the name**. `.new()`, `.len()` and `.push()` are
+    /// therefore skipped, and `replay_available` or `resource_metadata_url`
+    /// resolve.
+    ///
+    /// The failure mode is deliberately asymmetric: this can miss an edge, and
+    /// cannot invent one between two workspace symbols. That matters because the
+    /// answer a missing edge produces — an empty blast radius — reads as
+    /// "nothing breaks".
+    fn resolve_method(&self, call: &CallRef) -> Option<usize> {
+        let [name] = call.segs.as_slice() else {
+            return None;
+        };
+        match self.by_simple.get(name).map(Vec::as_slice) {
+            Some([one]) => Some(*one),
+            _ => None,
+        }
+    }
 }
 
 struct CallCollector {
@@ -500,8 +535,82 @@ impl<'ast> Visit<'ast> for CallCollector {
                 kind: CallKind::Macro,
             });
         }
+        // A macro body is an opaque token stream to `syn::visit`, so every call
+        // inside one used to be invisible to the reference graph. In a daemon
+        // that is not an edge case: a `tokio::select!` arm can hold most of a
+        // subsystem. `select_witness_signer` had ZERO recorded callers for
+        // exactly this reason, despite being called from `main`.
+        //
+        // Tokens cannot be type-checked, so this is lexical: it recovers the
+        // call *shapes* and leaves resolution to the same index every other
+        // call goes through.
+        collect_calls_in_tokens(m.tokens.clone(), &mut self.calls);
         syn::visit::visit_macro(self, m);
     }
+}
+
+/// Recover `path::to::fn(..)` and `.method(..)` call shapes from a raw token
+/// stream.
+///
+/// Lexical by necessity — macro bodies are not required to be valid Rust
+/// expressions (`tokio::select!` arms certainly are not), so parsing is not an
+/// option. The shapes recognised are:
+///
+///   * `ident (` — a plain call,
+///   * `a :: b :: c (` — a path call, emitted with its full segment list,
+///   * `. ident (` — a method call.
+///
+/// Over-collection is the safe direction here: an unresolvable name simply
+/// finds nothing in the index and disappears. Under-collection is what produced
+/// an empty blast radius for a symbol with a live caller.
+fn collect_calls_in_tokens(stream: proc_macro2::TokenStream, out: &mut Vec<CallRef>) {
+    let tokens: Vec<proc_macro2::TokenTree> = stream.into_iter().collect();
+    let mut i = 0usize;
+    while i < tokens.len() {
+        match &tokens[i] {
+            proc_macro2::TokenTree::Group(g) => {
+                collect_calls_in_tokens(g.stream(), out);
+                i += 1;
+            }
+            proc_macro2::TokenTree::Ident(ident) => {
+                // Walk back over any `::`-joined prefix so `crate::a::b(..)` is
+                // emitted whole rather than as its last segment.
+                let mut segs = vec![ident.to_string()];
+                let mut j = i;
+                // `… prev :: ident` — step back three tokens at a time.
+                while j >= 3 && is_path_sep(&tokens[j - 2..j]) {
+                    let proc_macro2::TokenTree::Ident(prev) = &tokens[j - 3] else {
+                        break;
+                    };
+                    segs.insert(0, prev.to_string());
+                    j -= 3;
+                }
+                let followed_by_call = matches!(
+                    tokens.get(i + 1),
+                    Some(proc_macro2::TokenTree::Group(g)) if g.delimiter() == proc_macro2::Delimiter::Parenthesis
+                );
+                if followed_by_call {
+                    let is_method =
+                        i >= 1 && matches!(&tokens[i - 1], proc_macro2::TokenTree::Punct(p) if p.as_char() == '.');
+                    out.push(CallRef {
+                        kind: if is_method { CallKind::Method } else { CallKind::Func },
+                        segs: if is_method { vec![ident.to_string()] } else { segs },
+                    });
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+}
+
+/// True when the two tokens are a `::` separator.
+fn is_path_sep(pair: &[proc_macro2::TokenTree]) -> bool {
+    matches!(
+        (&pair[0], &pair[1]),
+        (proc_macro2::TokenTree::Punct(a), proc_macro2::TokenTree::Punct(b))
+            if a.as_char() == ':' && b.as_char() == ':'
+    )
 }
 
 fn collect_calls(block: &syn::Block) -> Vec<CallRef> {
@@ -513,6 +622,8 @@ fn collect_calls(block: &syn::Block) -> Vec<CallRef> {
 #[derive(Default)]
 struct IdentRefCollector {
     counts: HashMap<String, usize>,
+    /// When set, `#[cfg(test)]` items are not descended into.
+    skip_test_scopes: bool,
 }
 
 impl<'ast> Visit<'ast> for IdentRefCollector {
@@ -532,6 +643,12 @@ impl<'ast> Visit<'ast> for IdentRefCollector {
         for seg in &m.path.segments {
             self.bump(seg.ident.to_string());
         }
+        // The macro's *body* counts too. Without this, a symbol used only from
+        // inside a `tokio::select!` arm, a `json!` literal or an `assert!` reads
+        // as unreferenced and is reported dead — the single largest source of
+        // false positives in this tier, and the one that produced
+        // `dead_candidate__static_and_runtime_agree` for live symbols.
+        self.bump_tokens(m.tokens.clone());
         syn::visit::visit_macro(self, m);
     }
 
@@ -539,11 +656,63 @@ impl<'ast> Visit<'ast> for IdentRefCollector {
         self.visit_use_tree_idents(&item.tree);
         syn::visit::visit_item_use(self, item);
     }
+
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        if self.skip_test_scopes && item_is_cfg_test(item) {
+            return;
+        }
+        syn::visit::visit_item(self, item);
+    }
+}
+
+/// True when an item carries `#[cfg(test)]`.
+///
+/// Matched on the attribute's tokens rather than by parsing the full `cfg`
+/// grammar: `cfg(test)` and `cfg(all(test, …))` both mention `test` at the top
+/// level, and anything cleverer would be guessing. Over-matching here would
+/// hide a real reference, so the check stays literal.
+fn item_is_cfg_test(item: &syn::Item) -> bool {
+    let attrs: &[syn::Attribute] = match item {
+        syn::Item::Mod(m) => &m.attrs,
+        syn::Item::Fn(f) => &f.attrs,
+        syn::Item::Impl(i) => &i.attrs,
+        syn::Item::Struct(s) => &s.attrs,
+        syn::Item::Enum(e) => &e.attrs,
+        _ => return false,
+    };
+    attrs.iter().any(|a| match &a.meta {
+        // `cfg(test)`, `cfg(all(test, …))`, `cfg(any(test, …))` all mention
+        // `test` as a bare token inside the list.
+        syn::Meta::List(list) if a.path().is_ident("cfg") => {
+            list.tokens
+                .clone()
+                .into_iter()
+                .any(|t| matches!(t, proc_macro2::TokenTree::Ident(ref i) if i == "test"))
+                || list.tokens.to_string().replace(' ', "").contains("(test")
+        }
+        _ => false,
+    })
 }
 
 impl IdentRefCollector {
     fn bump(&mut self, ident: String) {
         *self.counts.entry(ident).or_insert(0) += 1;
+    }
+
+    /// Count every identifier in a macro's token stream, recursing into groups.
+    ///
+    /// Deliberately indiscriminate: this tier asks "is this name mentioned
+    /// anywhere at all", and for that question a false *mention* only ever
+    /// withholds a dead-code flag, whereas a missed mention reports live code as
+    /// dead. Those costs are not symmetric.
+    fn bump_tokens(&mut self, stream: proc_macro2::TokenStream) {
+        for tt in stream {
+            match tt {
+                proc_macro2::TokenTree::Ident(ident) => self.bump(ident.to_string()),
+                proc_macro2::TokenTree::Group(g) => self.bump_tokens(g.stream()),
+                _ => {}
+            }
+        }
     }
 
     fn visit_use_tree_idents(&mut self, tree: &syn::UseTree) {
@@ -566,6 +735,18 @@ impl IdentRefCollector {
 
 fn collect_identifier_refs(file: &syn::File, into: &mut HashMap<String, usize>) {
     let mut collector = IdentRefCollector::default();
+    collector.visit_file(file);
+    for (ident, count) in collector.counts {
+        *into.entry(ident).or_insert(0) += count;
+    }
+}
+
+/// As [`collect_identifier_refs`], but blind to everything under `#[cfg(test)]`.
+fn collect_identifier_refs_nontest(file: &syn::File, into: &mut HashMap<String, usize>) {
+    let mut collector = IdentRefCollector {
+        skip_test_scopes: true,
+        ..IdentRefCollector::default()
+    };
     collector.visit_file(file);
     for (ident, count) in collector.counts {
         *into.entry(ident).or_insert(0) += count;
@@ -608,6 +789,12 @@ fn parse_file_ast(
     if let Ok(parsed) = syn::parse_file(&src) {
         let mut ident_refs = HashMap::new();
         collect_identifier_refs(&parsed, &mut ident_refs);
+        // Second pass with test scopes elided. A file that *is* a test file
+        // contributes nothing here: every reference in it is a test reference.
+        let mut ident_refs_nontest = HashMap::new();
+        if !is_test_file {
+            collect_identifier_refs_nontest(&parsed, &mut ident_refs_nontest);
+        }
         let mut line_lookup = LineLookup::new(&src);
         index_items(
             &mut parts,
@@ -638,6 +825,7 @@ fn parse_file_ast(
             deps: parts.deps,
             routes: parse_routes_in_source(&src, &rel_str),
             ident_refs,
+            ident_refs_nontest,
         })
     } else {
         Ok(CachedFile {
@@ -657,6 +845,7 @@ fn parse_file_ast(
             deps: Vec::new(),
             routes: parse_routes_in_source(&src, &rel_str),
             ident_refs: HashMap::new(),
+            ident_refs_nontest: HashMap::new(),
         })
     }
 }
@@ -1120,6 +1309,35 @@ fn compute_dead_code(scan: &mut WorkspaceScan, ident_refs: &HashMap<String, usiz
     }
 }
 
+/// Name the symbols that are referenced, but only ever from tests.
+///
+/// Runs after `compute_dead_code` and is deliberately disjoint from it: a
+/// symbol with zero references anywhere is dead, not test-only. The distinction
+/// an agent needs is between "nothing uses this" and "only its own test uses
+/// this", and those call for different actions.
+fn compute_test_only(
+    scan: &mut WorkspaceScan,
+    ident_refs: &HashMap<String, usize>,
+    ident_refs_nontest: &HashMap<String, usize>,
+) {
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    for sym in &scan.symbols {
+        if !sym.is_pub || sym.name.starts_with('_') || sym.name.len() < 4 {
+            continue;
+        }
+        let all = ident_refs.get(&sym.name).copied().unwrap_or(0);
+        let nontest = ident_refs_nontest.get(&sym.name).copied().unwrap_or(0);
+        // `all > 0` excludes the genuinely dead; `nontest == 0` is the claim.
+        // A definition site counts as a reference to itself in the non-test map
+        // when the symbol lives outside a test scope, so a production symbol
+        // never lands here on the strength of its own declaration alone.
+        if all > 0 && nontest == 0 {
+            out.insert(sym.name.clone());
+        }
+    }
+    scan.test_only_symbols = out.into_iter().collect();
+}
+
 fn roll_up_stats(scan: &mut WorkspaceScan) {
     let route_count = scan.routes.len();
     let file_reference_count = scan.files.iter().map(|f| f.references.len()).sum();
@@ -1198,6 +1416,137 @@ pub fn called() {}
 "#,
         )
         .expect("b");
+    }
+
+    /// The three call shapes the M3 measurement found missing from a symbol's
+    /// reference set. Each is written the way the real code writes it:
+    ///
+    ///   * a `crate::module::fn()` call from a **binary** crate (`main.rs`, no
+    ///     `lib.rs`) — the shape at `corecruxd/src/main.rs:1432`;
+    ///   * `x.field.method()` — the shape at `http/projections.rs:143`;
+    ///   * `self.method()` — the shape at `crux-mcp/src/oauth.rs:91`.
+    ///
+    /// A missing reference makes `blast_radius` answer "nothing breaks" for a
+    /// symbol that has callers, which is the worst shape a wrong answer can take.
+    fn write_call_shape_fixture(root: &Path) {
+        let crate_dir = root.join("crates/binbox");
+        std::fs::create_dir_all(crate_dir.join("src")).expect("fixture dirs");
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\"crates/binbox\"]\n")
+            .expect("workspace toml");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"binbox\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("crate toml");
+        // Binary crate: main.rs and no lib.rs.
+        std::fs::write(
+            crate_dir.join("src/main.rs"),
+            r#"//! Binary crate.
+mod helper;
+mod holder;
+
+fn main() {
+    let h = crate::holder::Holder::new();
+    let _ = h.status.is_ready();
+    let _ = h.describe();
+}
+
+async fn run() {
+    tokio::spawn(async move {
+        let Some(_s) = crate::helper::pick_signer(1) else {
+            return;
+        };
+    });
+}
+"#,
+        )
+        .expect("main");
+        std::fs::write(
+            crate_dir.join("src/helper.rs"),
+            r#"//! Helper module.
+pub fn pick_signer(_timeout: u64) -> Option<u8> {
+    None
+}
+"#,
+        )
+        .expect("helper");
+        std::fs::write(
+            crate_dir.join("src/holder.rs"),
+            r#"//! Holder module.
+pub struct Status;
+
+impl Status {
+    pub fn is_ready(&self) -> bool {
+        true
+    }
+}
+
+pub struct Holder {
+    pub status: Status,
+}
+
+impl Holder {
+    pub fn new() -> Self {
+        Self { status: Status }
+    }
+
+    pub fn label(&self) -> &'static str {
+        "holder"
+    }
+
+    pub fn describe(&self) -> String {
+        self.label().to_string()
+    }
+}
+"#,
+        )
+        .expect("holder");
+    }
+
+    fn refs_to(scan: &WorkspaceScan, symbol: &str) -> Vec<String> {
+        scan.files
+            .iter()
+            .flat_map(|f| {
+                f.references
+                    .iter()
+                    .filter(|r| r.to_symbol == symbol)
+                    .map(move |r| format!("{}::{}", f.rel_path, r.from_symbol.clone().unwrap_or_default()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn qualified_path_call_from_a_binary_crate_is_a_reference() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_call_shape_fixture(tmp.path());
+        let scan = run_scan_ast_at(tmp.path()).expect("ast scan");
+        let found = refs_to(&scan, "pick_signer");
+        assert!(
+            !found.is_empty(),
+            "`crate::helper::pick_signer()` in a binary crate produced no reference — \
+             blast_radius would report an empty radius for a symbol with a caller"
+        );
+    }
+
+    #[test]
+    fn method_through_a_field_is_a_reference() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_call_shape_fixture(tmp.path());
+        let scan = run_scan_ast_at(tmp.path()).expect("ast scan");
+        let found = refs_to(&scan, "is_ready");
+        assert!(
+            !found.is_empty(),
+            "`h.status.is_ready()` produced no reference — the ident-counting blind spot"
+        );
+    }
+
+    #[test]
+    fn method_through_self_is_a_reference() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_call_shape_fixture(tmp.path());
+        let scan = run_scan_ast_at(tmp.path()).expect("ast scan");
+        let found = refs_to(&scan, "label");
+        assert!(!found.is_empty(), "`self.label()` produced no reference");
     }
 
     #[test]

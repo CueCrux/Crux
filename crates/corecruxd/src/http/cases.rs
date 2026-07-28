@@ -58,6 +58,7 @@ fn require_read(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
 }
 
 /// `POST /v1/cases` — record a procedural-memory case.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn record_case(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -75,6 +76,7 @@ pub(super) async fn record_case(
 }
 
 /// `POST /v1/cases/retrieve` — return cases analogous to a task, best first.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn retrieve_cases(
     State(state): State<AppState>,
     headers: HeaderMap,

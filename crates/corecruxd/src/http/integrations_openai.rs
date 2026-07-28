@@ -35,6 +35,7 @@ fn now_unix_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_status(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
@@ -43,6 +44,7 @@ pub(super) async fn get_status(State(state): State<AppState>, headers: HeaderMap
     (StatusCode::OK, Json(status)).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_connect(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -104,6 +106,7 @@ pub(super) async fn post_connect(
     (StatusCode::OK, Json(status)).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_disconnect(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["integrations:disable"]) {
         return problem.into_response();
@@ -114,6 +117,7 @@ pub(super) async fn post_disconnect(State(state): State<AppState>, headers: Head
     (StatusCode::NO_CONTENT, ()).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn patch_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -167,6 +171,7 @@ pub(super) struct ChatBody {
 /// the box. Returns the upstream OpenAI response body verbatim, plus a
 /// `_proxy` envelope with model used + duration so the console can render it
 /// without re-parsing.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_chat(
     State(state): State<AppState>,
     headers: HeaderMap,

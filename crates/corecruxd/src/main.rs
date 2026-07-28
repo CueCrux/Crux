@@ -27,6 +27,7 @@
 mod activity;
 mod agentgraph_kinds;
 mod auth;
+mod code_intel;
 mod codegraph_fusion;
 mod config;
 mod console_index;
@@ -99,10 +100,12 @@ mod shard_map;
 mod status_feed;
 mod storybook;
 mod structured_log;
+mod symbol_resolve;
 mod sync_scheduler;
 mod tenant_metadata;
 #[cfg(test)]
 mod test_support;
+mod trace_store;
 mod update;
 mod usage_submit;
 mod vault_watcher;
@@ -1077,6 +1080,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // handlers route inline (immediate); this sweep is the catch-all so a flag
     // from a non-HTTP path never sits unrouted. Gated: with dedup off, no flags
     // are ever produced, so the task is not spawned.
+    // Runtime trace flusher (ExecPlan crux-runtime-codemap M4). Drains the M2
+    // ring, resolves each span to a stable symbol_id, and appends JSONL. Spawned
+    // only when BOTH capture and persistence are on — capture alone is a valid
+    // configuration for live inspection with nothing written to disk.
+    if crate::trace_store::persist_enabled() {
+        if let Some(ring) = crate::trace_span_ring() {
+            let ring = std::sync::Arc::clone(ring);
+            let fact_store = state.fact_store.clone();
+            let path = config.data_dir.join("traces").join("spans.jsonl");
+            let interval_secs = crate::trace_store::flush_interval_secs();
+            let max_records = crate::trace_store::max_records();
+            let repo_id = std::env::var("CORECRUXD_TRACE_REPO_ID").unwrap_or_else(|_| "crux".to_string());
+            let tenant_id = std::env::var("CORECRUXD_TRACE_TENANT_ID").unwrap_or_else(|_| "local".to_string());
+            let mut rx = shutdown_tx.subscribe();
+            match crate::trace_store::TraceStore::open(path.clone(), max_records) {
+                Ok(store) => {
+                    info!(path = %path.display(), interval_secs, "trace-flusher-started");
+                    tokio::spawn(async move {
+                        let mut cache = crate::trace_store::ResolverCache::default();
+                        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+                        loop {
+                            tokio::select! {
+                                _ = interval.tick() => {
+                                    let spans = ring.drain();
+                                    if spans.is_empty() { continue; }
+                                    let resolver = {
+                                        let store_guard = fact_store.read().await;
+                                        cache.get(&store_guard, &tenant_id, &repo_id)
+                                    };
+                                    match store.append_resolved(spans, resolver.as_deref()) {
+                                        Ok(r) => info!(
+                                            drained = r.spans_drained, resolved = r.resolved,
+                                            ambiguous = r.ambiguous, missed = r.missed,
+                                            no_location = r.no_location, "trace-flush"
+                                        ),
+                                        // Never fail loudly: a full disk must not
+                                        // take down the daemon over telemetry.
+                                        Err(err) => tracing::warn!(error = %err, "trace-flush-failed"),
+                                    }
+                                }
+                                _ = rx.recv() => {
+                                    // Final drain so a clean shutdown does not
+                                    // discard the last interval's spans.
+                                    let spans = ring.drain();
+                                    if !spans.is_empty() {
+                                        let resolver = {
+                                            let store_guard = fact_store.read().await;
+                                            cache.get(&store_guard, &tenant_id, &repo_id)
+                                        };
+                                        let _ = store.append_resolved(spans, resolver.as_deref());
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                }
+                Err(err) => tracing::warn!(error = %err, "trace-store-open-failed; persistence disabled"),
+            }
+        }
+    }
+
     if config.semantic_dedup_threshold.is_some() {
         let fact_store = state.fact_store.clone();
         let mut rx = shutdown_tx.subscribe();
@@ -2062,10 +2127,29 @@ fn validate_mcp_bind_posture(
     ))
 }
 
+/// The process-wide span ring, present only when `CORECRUXD_TRACE_CAPTURE` is on.
+///
+/// Held in a `OnceLock` because the layer is installed inside `init_tracing`,
+/// long before `AppState` exists, and the HTTP surface needs to read it later.
+static TRACE_SPAN_RING: std::sync::OnceLock<std::sync::Arc<crux_observe::span_layer::SpanRing>> =
+    std::sync::OnceLock::new();
+
+/// Runtime span capture ring, or `None` when trace capture is disabled.
+pub(crate) fn trace_span_ring() -> Option<&'static std::sync::Arc<crux_observe::span_layer::SpanRing>> {
+    TRACE_SPAN_RING.get()
+}
+
 fn init_tracing(level: &str) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
     let log_format = std::env::var("LOG_FORMAT").unwrap_or_default();
+    // Runtime code-map capture (ExecPlan crux-runtime-codemap M2). `from_env`
+    // yields None unless CORECRUXD_TRACE_CAPTURE is set, so the disabled path
+    // installs no layer at all rather than an inert one.
+    let span_layer = crux_observe::span_layer::CruxSpanLayer::from_env().map(|(layer, ring)| {
+        let _ = TRACE_SPAN_RING.set(ring);
+        layer
+    });
     // Sink-boundary redaction (ExecPlan crux-log-redaction-2026-06-11 M2):
     // every formatted event is scrubbed before reaching stdout. Mode is
     // CORECRUXD_REDACT=on|off|audit (default audit: count, don't mutate).
@@ -2120,22 +2204,34 @@ fn init_tracing(level: &str) {
                     .with(filter)
                     .with(fmt_layer)
                     .with(otel_layer)
+                    .with(span_layer)
                     .init();
                 return;
             }
         }
     }
 
-    if log_format.eq_ignore_ascii_case("json") {
-        tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(filter)
-            .with_writer(redacting_writer)
-            .init();
-    } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(redacting_writer)
+    // Registry-based rather than the `fmt()` builder so the span layer can
+    // compose. `Layer` is implemented for `Option<L>`, so a `None` span layer
+    // adds no runtime work.
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        use tracing_subscriber::Layer as _;
+
+        let fmt_layer = if log_format.eq_ignore_ascii_case("json") {
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(redacting_writer)
+                .boxed()
+        } else {
+            tracing_subscriber::fmt::layer().with_writer(redacting_writer).boxed()
+        };
+
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt_layer)
+            .with(span_layer)
             .init();
     }
 }

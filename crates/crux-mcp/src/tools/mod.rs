@@ -16,6 +16,7 @@ pub mod artefacts;
 pub mod audit;
 pub mod audit_export;
 pub mod autonomy;
+pub mod code_intel;
 pub mod consolidation;
 pub mod constraint;
 pub mod context_custody_audit;
@@ -2038,6 +2039,37 @@ pub fn list_tools_with_flags(
             description: repos::list_description().to_string(),
             input_schema: repos::list_schema(),
         },
+        // ── Runtime code intelligence ────────────────────────────────
+        // Thin adapters over GET /v1/code-intel/*. Answers come from spans
+        // actually captured while the code ran, joined to file:line — the
+        // distinction from static navigation, which can only say what might
+        // run. `code_*` prefix keeps these clear of `tool_trace_recent`
+        // (agent tool-call traces, unrelated).
+        ToolDefinition {
+            name: "code_path".to_string(),
+            description: code_intel::path_description().to_string(),
+            input_schema: code_intel::path_schema(),
+        },
+        ToolDefinition {
+            name: "code_blast_radius".to_string(),
+            description: code_intel::blast_radius_description().to_string(),
+            input_schema: code_intel::blast_radius_schema(),
+        },
+        ToolDefinition {
+            name: "code_liveness".to_string(),
+            description: code_intel::liveness_description().to_string(),
+            input_schema: code_intel::liveness_schema(),
+        },
+        ToolDefinition {
+            name: "code_trace_diff".to_string(),
+            description: code_intel::trace_diff_description().to_string(),
+            input_schema: code_intel::trace_diff_schema(),
+        },
+        ToolDefinition {
+            name: "code_dead_code".to_string(),
+            description: code_intel::dead_code_description().to_string(),
+            input_schema: code_intel::dead_code_schema(),
+        },
         // ── Substrate: entities / edges / kinds (M1) ──────────────
         ToolDefinition {
             name: "entity_upsert".to_string(),
@@ -2916,7 +2948,12 @@ pub fn tool_output_docs() -> Value {
         { "tool": "force_release",            "output": "Force-released punchcard record (status=force_released, force_released_by, receipt_release). Requires confirm=true (Art.14)." },
         { "tool": "check_punchcard",          "output": "Lease probe { held_by_other, enforce, holder_passport, resource, mode, expires_at_unix_ms }. Always 200 (fail-open); the PreToolUse hook denies only when held_by_other && enforce." },
         { "tool": "register_repo",            "output": "Proxied POST /v1/repos: the registration { repo_id, tenant_id, root_path?, clone_url?, languages: [string], enabled, added_at_unix_ms, last_scan_id? }. Registering a local root_path runs a one-shot scan and sets last_scan_id; clone_url registration defers the scan." },
-        { "tool": "list_repos",               "output": "Proxied GET /v1/repos?tenant_id=…: { repos: [{ repo_id, tenant_id, root_path?, clone_url?, languages, enabled, last_scan_id? }] } scoped to the caller's tenant." }
+        { "tool": "list_repos",               "output": "Proxied GET /v1/repos?tenant_id=…: { repos: [{ repo_id, tenant_id, root_path?, clone_url?, languages, enabled, last_scan_id? }] } scoped to the caller's tenant." },
+        { "tool": "code_path",                "output": "Proxied GET /v1/code-intel/path: { entry_point, matched_traces, steps: [{ depth, name, symbol_id?, file?, line?, calls, total_ns, join, had_error }], truncated, omitted_steps, window }. Steps are the observed execution order; `window` states the observation period the answer is true for." },
+        { "tool": "code_blast_radius",        "output": "Proxied GET /v1/code-intel/blast-radius: { symbol, static_dependents, runtime_callers, dependents: [{ name, file?, evidence: 'static'|'runtime'|'both' }], truncated, omitted, window }. `evidence: 'both'` is the strongest signal; 'runtime' alone catches callers grep cannot see." },
+        { "tool": "code_liveness",            "output": "Proxied GET /v1/code-intel/liveness: { symbol, executed, executions, total_ns, exists_statically, flagged_dead_static, verdict, window }. `executed: false` means 'not seen in this window', never 'dead' — read `window` before concluding anything." },
+        { "tool": "code_trace_diff",          "output": "Proxied GET /v1/code-intel/trace-diff: { trace_a, trace_b, first_divergence?, only_in_a: [string], only_in_b: [string], slower_in_b: [string], truncated }. `slower_in_b` lists steps in both traces where b took >2x and >1ms longer." },
+        { "tool": "code_dead_code",           "output": "Proxied GET /v1/code-intel/dead-code (pass `symbol` to scope it to one): { verdicts: [{ symbol, file?, line?, verdict, evidence: [{ tier, says, detail }], agreeing_tiers, single_signal, actionable, finding_id }], counts, extractor_false_positives: [string], window, truncated, omitted, budget_exceeded }. Act only on `actionable: true`; `single_signal: true` needs a human. `budget_exceeded` means one verdict alone did not fit the budget — the answer is honest about overshooting rather than returning nothing." }
     ]) {
         Value::Array(v) => v,
         other => return other,
@@ -3092,6 +3129,11 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "get_workspace_storyline" => storyline::handle_get_workspace_storyline(args, ctx).await,
         "register_repo" => repos::handle_register_repo(args, ctx).await,
         "list_repos" => repos::handle_list_repos(args, ctx).await,
+        "code_path" => code_intel::handle_code_path(args, ctx).await,
+        "code_blast_radius" => code_intel::handle_code_blast_radius(args, ctx).await,
+        "code_liveness" => code_intel::handle_code_liveness(args, ctx).await,
+        "code_trace_diff" => code_intel::handle_code_trace_diff(args, ctx).await,
+        "code_dead_code" => code_intel::handle_code_dead_code(args, ctx).await,
         // Substrate (M1).
         "entity_upsert" => entities::handle_entity_upsert(args, ctx).await,
         "entity_get" => entities::handle_entity_get(args, ctx).await,
@@ -3209,7 +3251,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 126; // +8 context_graph (3 storybook + 5 dossier, crux-storybook-dossier-agent-and-console-surface M2). // +1 engram_resolve +1 reuse_check (minimalism plane M2/M3). +2 register_repo + list_repos (repo-watch M3). +1 status_feed (open-engine-coordination-surfaces M3). +1 context_custody_audit (race-to-context positioning). +1 revoke_passport (passport-revocation M2). main 94 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check + 2 coord-plane: coord_status + coord_announce + session_token_usage (action-ledger M1)) + 2 session-archive (archive_session + unarchive_session) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard) + 1 activity (activity_recent, crux-dual-surface-activity-log M2) + 2 consolidation (memory_contradictions + memory_consolidate, audit-ii M4) + 1 session-mining (learn, token-efficiency M4) + 1 holdout (token_savings, token-efficiency cutover CO-4).
+    const TOOL_COUNT: usize = 131; // +5 code_intel (code_path/blast_radius/liveness/trace_diff/dead_code, crux-codemap-agent-surface M1). +8 context_graph (3 storybook + 5 dossier, crux-storybook-dossier-agent-and-console-surface M2). // +1 engram_resolve +1 reuse_check (minimalism plane M2/M3). +2 register_repo + list_repos (repo-watch M3). +1 status_feed (open-engine-coordination-surfaces M3). +1 context_custody_audit (race-to-context positioning). +1 revoke_passport (passport-revocation M2). main 94 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check + 2 coord-plane: coord_status + coord_announce + session_token_usage (action-ledger M1)) + 2 session-archive (archive_session + unarchive_session) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard) + 1 activity (activity_recent, crux-dual-surface-activity-log M2) + 2 consolidation (memory_contradictions + memory_consolidate, audit-ii M4) + 1 session-mining (learn, token-efficiency M4) + 1 holdout (token_savings, token-efficiency cutover CO-4).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")

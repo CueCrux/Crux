@@ -489,6 +489,7 @@ async fn handle_context(state: AppState, headers: HeaderMap, req: ContextRequest
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_context(
     State(state): State<AppState>,
     Query(req): Query<ContextRequest>,
@@ -511,6 +512,7 @@ pub(super) async fn get_context(
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_context(
     State(state): State<AppState>,
     headers: HeaderMap,

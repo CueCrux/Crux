@@ -19,6 +19,7 @@ pub(super) struct SpendCreditsBody {
     pub quote: PinnedCreditQuote,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_credit_spend(
     State(state): State<AppState>,
     headers: HeaderMap,

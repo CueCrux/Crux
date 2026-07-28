@@ -76,6 +76,7 @@ fn verify_status(err: &PackVerifyError) -> StatusCode {
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_memory_import(
     State(state): State<AppState>,
     headers: HeaderMap,

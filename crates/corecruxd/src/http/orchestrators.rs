@@ -208,6 +208,7 @@ pub(super) struct CreateOrchestratorBody {
     pub state: Option<String>,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn create_orchestrator(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -265,6 +266,7 @@ pub(super) struct ListOrchestratorsQuery {
     pub limit: Option<usize>,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn list_orchestrators(
     State(state): State<AppState>,
     Query(q): Query<ListOrchestratorsQuery>,
@@ -311,6 +313,7 @@ pub(super) async fn list_orchestrators(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_orchestrator(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -339,6 +342,7 @@ pub(super) struct PatchOrchestratorBody {
     pub state: Option<String>,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn patch_orchestrator(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -506,6 +510,7 @@ async fn validate_member(
     })
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn add_member(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -615,6 +620,7 @@ async fn stamp_work_orchestrator(
     Ok(())
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn remove_member(
     State(state): State<AppState>,
     Path((id, member_ref)): Path<(String, String)>,
@@ -678,6 +684,7 @@ pub(super) async fn remove_member(
 
 // ── M3: member resolution ────────────────────────────────────────────
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn list_orchestrator_work(
     State(state): State<AppState>,
     Path(id): Path<String>,

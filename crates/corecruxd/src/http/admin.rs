@@ -246,6 +246,7 @@ pub(super) fn checkpoint_event_id(checkpoint_id: &str) -> String {
     format!("{EVT_CONTROL_CHECKPOINT_MATERIALIZED_V1}:{checkpoint_id}")
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn append_control_evidence_event<T: serde::Serialize>(
     state: &AppState,
     event_type: &str,
@@ -383,6 +384,7 @@ pub(super) fn build_control_checkpoint_materialized_event(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn append_control_checkpoint_materialized_event(
     state: &AppState,
     action_id: &str,
@@ -471,6 +473,7 @@ fn build_erasure_receipt<'a>(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn execute_admin_action(
     state: &AppState,
     action_id: &str,
@@ -1301,6 +1304,7 @@ pub(super) async fn execute_admin_action(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn run_admin_action(state: AppState, action_id: String) {
     let started_at_ms = now_unix_ms();
     let (action_type, params, auth_context, request_context, authenticated_passport) = {
@@ -2239,6 +2243,7 @@ pub(super) async fn post_stream_meta(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_replication_status(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
@@ -2397,6 +2402,7 @@ pub(super) async fn get_replication_status(State(state): State<AppState>, header
 /// not currently enforce v6 fingerprint guard or calibration metadata, so this
 /// route reports the local BM25/.ccxi state and names the missing pieces
 /// explicitly instead of pretending parity.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_segment_fingerprints(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
@@ -2461,6 +2467,7 @@ pub(super) async fn get_segment_fingerprints(State(state): State<AppState>, head
 /// state: which prefixes are forced-private, share-overrides, fact counts
 /// (private vs pushable), and whether remote sync is configured. Used by
 /// the AX → Activity "Sharing posture" card.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_sharing_posture(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
@@ -2551,6 +2558,7 @@ pub(super) struct BackfillBody {
 /// Append-only safe: each backfill creates a new fact version; the previous
 /// (non-private) version stays in the journal but the latest is private.
 /// Default is preview-mode; pass `{confirm: true}` to actually write.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_sharing_backfill(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2642,6 +2650,7 @@ pub(super) async fn post_sharing_backfill(
 /// up; bare-metal / `cargo run` users see the daemon stop and must restart it
 /// manually. We schedule the exit on a background task so the HTTP response
 /// has time to flush before the process disappears.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_restart_daemon(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();

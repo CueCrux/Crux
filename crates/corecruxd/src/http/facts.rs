@@ -450,6 +450,7 @@ fn render_session_for_http(
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn put_fact(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -480,6 +481,7 @@ pub(super) async fn put_fact(
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn put_facts_bulk(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -524,6 +526,7 @@ pub(super) async fn put_facts_bulk(
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_fact(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -558,6 +561,7 @@ pub(super) async fn get_fact(
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_fact(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -601,6 +605,7 @@ pub(super) async fn delete_fact(
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_facts_by_entity(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -636,6 +641,7 @@ pub(super) async fn get_facts_by_entity(
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn query_facts(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -709,6 +715,7 @@ pub(super) async fn query_facts(
 /// `POST /v1/facts/aggregate` — deterministic, 0-LLM aggregate lane (buyer-fit
 /// M4, knock-out #5). Answers count / sum_numeric / distinct / temporal_diff
 /// over the visible fact set, under an optional `token_budget`. No model call.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_aggregate(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -732,6 +739,7 @@ pub(super) async fn post_aggregate(
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn export_facts(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -802,6 +810,7 @@ pub(super) async fn export_facts(
 /// Always excludes private and deleted facts. Tenant scoping mirrors
 /// `query_facts`: a raw-admin (auth-off) caller sees the store; a scoped caller
 /// is filtered to its read-tenant.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn list_facts(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -916,6 +925,7 @@ pub(super) async fn list_facts(
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn put_session_state(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -958,6 +968,7 @@ pub(super) async fn put_session_state(
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_session_state(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1048,6 +1059,7 @@ async fn set_session_archived(
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn archive_session(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1070,6 +1082,7 @@ pub(super) async fn archive_session(
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn unarchive_session(
     State(state): State<AppState>,
     headers: HeaderMap,

@@ -93,6 +93,7 @@ struct BuildPackResponse {
 }
 
 /// `POST /v1/studio/pack/build` — assemble + hash + (optionally) sign a pack.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_build_pack(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -426,6 +427,7 @@ where
 }
 
 /// `POST /v1/studio/pack/verify` — validate an uploaded pack; never writes.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_verify_pack(
     State(state): State<AppState>,
     headers: HeaderMap,

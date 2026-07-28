@@ -53,6 +53,7 @@ fn extract_passport_id(headers: &HeaderMap) -> String {
         .unwrap_or_else(|| "anonymous".to_string())
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_generate(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
@@ -285,6 +286,7 @@ fn select_sections(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_latest(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
@@ -310,6 +312,7 @@ pub(super) async fn get_latest(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn list_versions(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
@@ -330,6 +333,7 @@ pub(super) async fn list_versions(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_version(
     State(state): State<AppState>,
     Path((project_id, ts)): Path<(String, u64)>,
@@ -354,6 +358,7 @@ pub(super) struct DiffQuery {
     pub b: u64,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_diff(
     State(state): State<AppState>,
     Path(project_id): Path<String>,

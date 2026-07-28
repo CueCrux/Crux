@@ -13,6 +13,7 @@ use super::{require_http_any_scope, AppState, HeaderMap, IntoResponse, Json, Sta
 /// Return the canonical tool-capability policy document
 /// (`crate::policy::policy_document`). Non-sensitive, but gated behind a low
 /// read scope so it isn't world-readable on an authenticated daemon.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_policy_capabilities(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(p) = require_http_any_scope(&state.auth, &headers, &["query:read", "facts:read", "admin:read"]) {
         return p.into_response();

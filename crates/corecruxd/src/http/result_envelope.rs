@@ -93,6 +93,7 @@ fn verify_status(err: &EnvelopeVerifyError) -> StatusCode {
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_result_envelope_import(
     State(state): State<AppState>,
     headers: HeaderMap,
