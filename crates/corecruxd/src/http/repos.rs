@@ -65,6 +65,20 @@ pub(crate) struct RepoTenantQuery {
     pub tenant_id: String,
 }
 
+/// Query for the read-only allowance report.
+///
+/// `seats` and `packs` are supplied by the caller because neither is sourced from
+/// a subscription yet — that arrives with the entitlement work. Defaulting seats
+/// to one is the honest reading of "not known", not a claim about the account.
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct RepoAllowanceQuery {
+    pub tenant_id: String,
+    #[serde(default)]
+    pub seats: Option<u32>,
+    #[serde(default)]
+    pub packs: Option<u32>,
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct RepoDependentsQuery {
     pub tenant_id: String,
@@ -583,6 +597,27 @@ pub(super) async fn get_repos(
     let repos = crate::repo_registry::list_repos(&store, &tenant_id);
     drop(store);
     (StatusCode::OK, Json(serde_json::json!({ "repos": repos }))).into_response()
+}
+
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn get_repo_allowance(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<RepoAllowanceQuery>,
+) -> impl IntoResponse {
+    let tenant_id = query.tenant_id.trim().to_string();
+    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &tenant_id) {
+        return problem.into_response();
+    }
+    let store = state.fact_store.read().await;
+    let allowance = crate::repo_allowance::allowance_for_tenant(
+        &store,
+        &tenant_id,
+        query.seats.unwrap_or(1),
+        query.packs.unwrap_or(0),
+    );
+    drop(store);
+    (StatusCode::OK, Json(serde_json::json!(allowance))).into_response()
 }
 
 #[tracing::instrument(level = "info", skip_all)]

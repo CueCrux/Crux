@@ -406,6 +406,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/replay/exports/receipts/{receiptId}", methods: &["GET"], tag: "Replay", auth: "read", summary: "Replay exports receipts {receiptId}" },
     RouteEntry { path: "/v1/replay/exports/streams/{streamType}/{streamId}", methods: &["GET"], tag: "Replay", auth: "read", summary: "Replay exports streams {streamType} {streamId}" },
     RouteEntry { path: "/v1/repos", methods: &["GET", "POST"], tag: "Repos", auth: "admin", summary: "Repos" },
+    RouteEntry { path: "/v1/repos/allowance", methods: &["GET"], tag: "Repos", auth: "admin-read", summary: "Pro repo allowance: included vs used, reporting only" },
     RouteEntry { path: "/v1/repos/dependents", methods: &["GET"], tag: "Repos", auth: "admin-read", summary: "Repos dependents" },
     RouteEntry { path: "/v1/repos/scan-jobs/{job_id}", methods: &["GET"], tag: "Repos", auth: "admin-read", summary: "Repos scan jobs {job_id}" },
     RouteEntry { path: "/v1/repos/{repo_id}", methods: &["GET", "DELETE"], tag: "Repos", auth: "admin", summary: "Repos {repo_id}" },

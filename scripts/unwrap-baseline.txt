@@ -52,6 +52,14 @@
 # excludes */tests/* but not */examples/*. Widening that exclusion would reduce
 # the ratchet's coverage for every crate, so it is a decision to take on its own
 # merits rather than a side effect of making this PR pass.
+# 2026-07-28 +1 corecruxd: one `.expect("seed repo")` in the repo-allowance test
+# seed helper in http/tests.rs (crux-code-intel-pro-hosted-surface M1). #[cfg(test)]
+# code, counted only because tests.rs is an out-of-file #[path] mod — the same case
+# as the 2026-07-12 and 2026-07-15 entries above. Zero production-path additions:
+# repo_allowance.rs contains no unwrap()/expect() at all; its two uses are
+# `unwrap_or`, which the scan does not match and which cannot panic. A seed helper
+# that swallowed a store error would assert against wrong data, so failing loudly
+# is correct — contorting it to dodge the counter would be the wrong trade.
 corecrux-frame 0
 corecrux-index 3
 corecrux-memory 0
@@ -74,7 +82,7 @@ corecruxctl 9
 # the scan counts it. The sibling console.rs assertion added by the same PR sits
 # after an in-file #[cfg(test)] and is correctly excluded. Zero production-path
 # additions (verified per-file against origin/main).
-corecruxd 856
+corecruxd 857
 crux-claude-hooks 1
 crux-config-wizard 8
 crux-contrib 0
