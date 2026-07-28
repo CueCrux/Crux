@@ -174,9 +174,9 @@ async fn list_dossier_ids_internal(
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
         min_effective_confidence: None,
         tenant_hash: None,
-        query: Some(prefix.clone()),
+        query: None,
         entity: None,
-        entity_prefix: None,
+        entity_prefix: Some(prefix.clone()),
         top_k: 500,
         token_budget: None,
     });
@@ -682,6 +682,62 @@ mod tests {
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(body["agent"], "p_filled");
         assert_eq!(body["claim_count"], 1);
+    }
+
+    /// A prefix scan must return every match, however many unrelated facts
+    /// share the store.
+    ///
+    /// Regression for the whole class: these listers passed the prefix as
+    /// `query:`, which is a substring filter (or, with a dense provider, no
+    /// filter at all — cosine ranking over every fact) and is then truncated to
+    /// `top_k`. Unrelated facts could rank above the dossiers and the list came
+    /// back short with no error. `entity_prefix` is a structural filter applied
+    /// before ranking, so it cannot be crowded out.
+    #[tokio::test]
+    async fn listing_survives_a_store_full_of_unrelated_facts() {
+        let st = state();
+        for i in 0..8 {
+            publish(
+                &st,
+                dossier(&format!("d{i:02}"), "proj", "agent-1", 1000 + i, vec![claim("c1")]),
+            )
+            .await;
+        }
+        // Flood the store past the lister's top_k with facts that mention the
+        // prefix in their VALUE — exactly what a substring query would match.
+        {
+            let mut store = st.fact_store.write().await;
+            for i in 0..600 {
+                store.store(corecrux_memory::fact_store::StoreFact {
+                    tenant_hash: "default".to_string(),
+                    entity: format!("__noise__::{i}"),
+                    key: "content".to_string(),
+                    value: "__dossier__::proj:: mentioned here on purpose".to_string(),
+                    source_receipt: None,
+                    confidence: 1.0,
+                    private: false,
+                    horizon_class: None,
+                    actor: None,
+                });
+            }
+        }
+
+        let (status, body) = parts(
+            list_dossiers(
+                State(st.clone()),
+                Path("proj".into()),
+                Query(BudgetQuery::default()),
+                HeaderMap::new(),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["count"], 8,
+            "every dossier must survive a store full of facts that merely mention the prefix"
+        );
     }
 
     #[tokio::test]

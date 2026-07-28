@@ -199,9 +199,9 @@ pub fn list_extensions(store: &FactStore) -> Vec<InstalledExtension> {
     let result = store.query(&FactQuery {
         min_effective_confidence: None,
         tenant_hash: None,
-        query: Some(prefix.clone()),
+        query: None,
         entity: None,
-        entity_prefix: None,
+        entity_prefix: Some(prefix.clone()),
         top_k: 500,
         token_budget: None,
     });
