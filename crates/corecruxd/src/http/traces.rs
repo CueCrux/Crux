@@ -237,7 +237,13 @@ pub(super) struct CodeIntelQuery {
 
 /// Load persisted spans, falling back to the live ring when persistence is off
 /// so the API still answers on a capture-only daemon.
-fn load_spans(state: &AppState) -> Vec<crate::trace_store::StoredSpan> {
+/// Load the runtime span window: the persisted store if enabled and non-empty,
+/// otherwise the in-memory ring.
+///
+/// `pub(super)` so `dossier::post_auto` can feed the same window the code-intel
+/// routes answer from — a dossier whose runtime tier disagreed with
+/// `/v1/code-intel/dead-code` would be worse than one with no runtime tier.
+pub(super) fn load_spans(state: &AppState) -> Vec<crate::trace_store::StoredSpan> {
     if let Some(store) = open_store(state) {
         if let Ok(spans) = store.load_all() {
             if !spans.is_empty() {

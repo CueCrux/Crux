@@ -71,7 +71,13 @@ pub struct Window {
 }
 
 impl Window {
-    fn of(spans: &[StoredSpan]) -> Self {
+    /// The window a set of spans represents.
+    ///
+    /// Public so a consumer that derives a claim from runtime evidence can
+    /// record which window that claim is true for — the same rule as corpus
+    /// identity on a benchmark number: the figure and its window travel
+    /// together or the figure is unusable later.
+    pub fn of(spans: &[StoredSpan]) -> Self {
         let traces: BTreeSet<u64> = spans.iter().map(|s| s.span.trace_id).collect();
         Self {
             spans_examined: spans.len(),
@@ -984,6 +990,73 @@ pub struct DeadCodeLadder {
     /// return one and say so — the contract is "never silently overshoot",
     /// not "never exceed".
     pub budget_exceeded: bool,
+}
+
+/// Every dead-code verdict, unbudgeted.
+///
+/// [`dead_code_ladder`] ranks and truncates these to a token budget, which is
+/// right for an agent answering a question and wrong for a consumer that needs
+/// the whole picture — `dossier::generate_auto` builds one claim per candidate
+/// and must not have that set silently trimmed. Passing `usize::MAX` as a
+/// budget would overflow the ladder's `used + cost` accumulator, so the
+/// construction is shared here instead and the budgeting stays where it
+/// belongs.
+///
+/// One implementation of the tier rules, two callers.
+pub fn dead_code_verdicts(scan: &WorkspaceScan, spans: &[StoredSpan]) -> Vec<SymbolVerdict> {
+    let executed: BTreeMap<&str, usize> = spans.iter().fold(BTreeMap::new(), |mut m, s| {
+        *m.entry(s.span.name.as_str()).or_insert(0) += 1;
+        m
+    });
+    let runtime_window_empty = spans.is_empty();
+    let executed_files: BTreeSet<&str> = spans.iter().filter_map(|s| s.span.file.as_deref()).collect();
+
+    scan.dead_code
+        .iter()
+        .map(|d| {
+            let runs = executed.get(d.name.as_str()).copied().unwrap_or(0);
+            let mut evidence = vec![TierEvidence {
+                tier: "ast_reachability",
+                says: "dead",
+                detail: format!("{} (confidence {})", d.note, d.confidence),
+            }];
+            if runs > 0 {
+                evidence.push(TierEvidence {
+                    tier: "runtime_execution",
+                    says: "alive",
+                    detail: format!("observed executing {runs}x in the window"),
+                });
+            } else if !runtime_window_empty {
+                evidence.push(TierEvidence {
+                    tier: "runtime_execution",
+                    says: "dead",
+                    detail: "not observed in the window".to_string(),
+                });
+            }
+            let (verdict, agreeing) = if runs > 0 {
+                ("extractor_false_positive__static_dead_but_executed", 1)
+            } else if runtime_window_empty {
+                ("dead_candidate__static_only", 1)
+            } else {
+                ("dead_candidate__static_and_runtime_agree", 2)
+            };
+            let single = evidence.len() < 2;
+            SymbolVerdict {
+                symbol: d.name.clone(),
+                file: Some(d.file_rel_path.clone()),
+                line: Some(d.line),
+                verdict,
+                evidence,
+                agreeing_tiers: agreeing,
+                single_signal: single,
+                actionable: agreeing >= 2
+                    && !runtime_window_empty
+                    && runs == 0
+                    && executed_files.contains(d.file_rel_path.as_str()),
+                finding_id: format!("dead:{}:{}", d.file_rel_path, d.line),
+            }
+        })
+        .collect()
 }
 
 /// Build the ladder over every symbol the AST tier flagged dead, plus any

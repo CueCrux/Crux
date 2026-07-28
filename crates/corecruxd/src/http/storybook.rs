@@ -65,6 +65,9 @@ pub(super) async fn post_generate(
     let by_passport = extract_passport_id(&headers);
     let now_ms = now_unix_ms();
 
+    // The same window /v1/code-intel/dead-code answers from, so the readout and
+    // the code-intel route cannot disagree about the same symbols.
+    let spans = super::traces::load_spans(&state);
     let store = state.fact_store.read().await;
     let doc = match crate::storybook::generate(
         &store,
@@ -72,6 +75,7 @@ pub(super) async fn post_generate(
             project_id: &project_id,
             by_passport: &by_passport,
             now_unix_ms: now_ms,
+            spans: &spans,
         },
     ) {
         Some(d) => d,

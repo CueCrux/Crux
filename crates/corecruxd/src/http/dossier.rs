@@ -86,6 +86,10 @@ pub(super) async fn post_auto(
     }
     let agent = extract_passport_id(&headers);
     let now = now_unix_ms();
+    // The same window /v1/code-intel/dead-code answers from. Empty unless
+    // CORECRUXD_TRACE_CAPTURE is on, in which case the dead-code claims stay
+    // exactly as they were before the runtime tier existed.
+    let spans = super::traces::load_spans(&state);
     let store = state.fact_store.read().await;
     let dossier = match crate::dossier::generate_auto(
         &store,
@@ -93,6 +97,7 @@ pub(super) async fn post_auto(
             project_id: &project_id,
             agent_passport: &agent,
             now_unix_ms: now,
+            spans: &spans,
         },
     ) {
         Some(d) => d,

@@ -80,6 +80,47 @@ pub struct BasedOn {
     pub workspace_scan_id: Option<String>,
     pub plane_count: usize,
     pub graph_node_count: usize,
+    /// The runtime observation window any runtime-derived claim rests on.
+    ///
+    /// Present only when trace capture is on and spans exist. A claim whose
+    /// confidence came from a runtime tier is uncheckable later without the
+    /// window it was computed over — the same rule as corpus identity on a
+    /// benchmark number. `None` means no runtime tier spoke, which is
+    /// materially different from "the runtime tier saw nothing".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_window: Option<TraceWindow>,
+}
+
+/// A dossier-owned copy of `code_intel::Window`.
+///
+/// Deliberately not a re-export: `code_intel::Window` carries a
+/// `&'static str` caveat and is serialise-only, while a dossier round-trips
+/// through the fact store and must deserialise. Owning the shape also keeps the
+/// published wire format from moving whenever the code-intel internals do.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct TraceWindow {
+    pub spans_examined: usize,
+    pub traces_examined: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub earliest_unix_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_unix_ms: Option<u64>,
+    /// Carried verbatim from the code-intel window so a reader cannot mistake a
+    /// runtime negative for proof of death.
+    pub caveat: String,
+}
+
+impl From<&crate::code_intel::Window> for TraceWindow {
+    fn from(w: &crate::code_intel::Window) -> Self {
+        Self {
+            spans_examined: w.spans_examined,
+            traces_examined: w.traces_examined,
+            earliest_unix_ms: w.earliest_unix_ms,
+            latest_unix_ms: w.latest_unix_ms,
+            caveat: w.caveat.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -136,6 +177,10 @@ pub struct AutoInput<'a> {
     pub project_id: &'a str,
     pub agent_passport: &'a str,
     pub now_unix_ms: u64,
+    /// Runtime spans for the dead-code tier. Empty is the normal case —
+    /// `CORECRUXD_TRACE_CAPTURE` is default-off — and yields exactly the
+    /// pre-runtime behaviour, so this degrades rather than changing shape.
+    pub spans: &'a [crate::trace_store::StoredSpan],
 }
 
 /// Build a dossier deterministically by walking the storybook (if present),
@@ -166,6 +211,11 @@ pub fn generate_auto(store: &corecrux_memory::FactStore, input: AutoInput<'_>) -
             workspace_scan_id: workspace.as_ref().map(|w| w.scan_id.clone()),
             plane_count: planes.len(),
             graph_node_count: graph.nodes.len(),
+            // Only when a runtime tier actually had something to say. An empty
+            // window recorded as a window would read as "we looked and saw
+            // nothing", which is the confusion the caveat exists to prevent.
+            trace_window: (!input.spans.is_empty())
+                .then(|| TraceWindow::from(&crate::code_intel::Window::of(input.spans))),
         },
         claims: Vec::new(),
         uncertainties: Vec::new(),
@@ -297,43 +347,102 @@ pub fn generate_auto(store: &corecrux_memory::FactStore, input: AutoInput<'_>) -
                 rationale: Some(stub.snippet.clone()),
             });
         }
-        // Dead-code candidates as inferred claims with the scanner's own
-        // confidence (currently 0.6 with a warning).
-        for dc in &ws.dead_code {
-            d.claims.push(Claim {
-                claim_id: next_claim_id(),
-                kind: "dead_code_likely".into(),
-                subject: format!("symbol:{}:{}", dc.file_rel_path, dc.line),
-                object: None,
-                confidence: dc.confidence,
-                evidence: vec![
-                    format!("regex_zero_references_in_workspace({})", dc.name),
-                    format!("workspace_scan({})", ws.scan_id),
-                ],
-                rationale: Some(dc.note.clone()),
-            });
-        }
-        // The dead-code tier is ONE signal, and its blind spots are known and
-        // measured, not merely suspected: the reference extractor does not read
-        // macro token streams and does not resolve method calls, so a symbol
-        // called only from inside `tokio::select!` or only as `self.foo()` is
-        // reported as unreferenced. That is a systematic bias in a single
-        // direction, and a consumer that treats these claims as a delete-list
-        // will delete live code.
+        // ── Dead code, graded across tiers ────────────────────────────
         //
-        // Recording it as an uncertainty rather than burying it in each claim's
-        // rationale is the point of the field: it states what the dossier does
-        // not know, once, where a reader looks for exactly that. It is replaced
-        // by real cross-tier evidence when the runtime code-intel surface lands
-        // — see the M5 assessment in the ExecPlan.
-        if !ws.dead_code.is_empty() {
+        // The AST tier alone cannot tell "unreachable" from "called somewhere
+        // the reference extractor cannot see" — it does not read macro token
+        // streams and does not resolve method calls, so a symbol invoked only
+        // inside `tokio::select!` or only as `self.foo()` reads as
+        // unreferenced. `code_intel::dead_code_verdicts` joins it to the
+        // runtime tier; the three outcomes are genuinely different claims, and
+        // flattening them into one `dead_code_likely` was the old behaviour's
+        // real defect.
+        let verdicts = crate::code_intel::dead_code_verdicts(ws, input.spans);
+        let mut runtime_spoke = false;
+        let mut static_only = 0usize;
+        for v in &verdicts {
+            let subject = format!("symbol:{}:{}", v.file.as_deref().unwrap_or("?"), v.line.unwrap_or(0));
+            let evidence: Vec<String> = v
+                .evidence
+                .iter()
+                .map(|e| format!("{}:{} — {}", e.tier, e.says, e.detail))
+                .chain(std::iter::once(format!("workspace_scan({})", ws.scan_id)))
+                .collect();
+
+            match v.verdict {
+                // Observed executing. The static tier was WRONG, and emitting
+                // `dead_code_likely` here would hand the next agent a
+                // delete-list entry for live code. The useful claim is the
+                // opposite one, and it is near-certain: we watched it run.
+                "extractor_false_positive__static_dead_but_executed" => {
+                    runtime_spoke = true;
+                    d.claims.push(Claim {
+                        claim_id: next_claim_id(),
+                        kind: "extractor_false_positive".into(),
+                        subject,
+                        object: Some(format!("symbol_name:{}", v.symbol)),
+                        confidence: 0.95,
+                        evidence,
+                        rationale: Some(
+                            "flagged dead by static reachability but observed executing — \
+                             calibration signal for the extractor, not a deletion candidate"
+                                .into(),
+                        ),
+                    });
+                }
+                // Two independent tiers agree AND the symbol's own file ran, so
+                // the runtime silence is informative rather than incidental.
+                // `actionable` is the ladder's own bar; anything short of it
+                // keeps the extractor's confidence rather than inheriting
+                // certainty it has not earned.
+                "dead_candidate__static_and_runtime_agree" => {
+                    runtime_spoke = true;
+                    let conf = if v.actionable { 0.9 } else { 0.6 };
+                    d.claims.push(Claim {
+                        claim_id: next_claim_id(),
+                        kind: "dead_code_likely".into(),
+                        subject,
+                        object: Some(format!("symbol_name:{}", v.symbol)),
+                        confidence: conf,
+                        evidence,
+                        rationale: Some(if v.actionable {
+                            "static and runtime tiers agree, and the symbol's own file executed \
+                             in the window — the negative is evidence, not absence of evidence"
+                                .into()
+                        } else {
+                            "tiers agree, but the symbol's own file never executed in the window, \
+                             so the runtime tier never had a chance to see it"
+                                .to_string()
+                        }),
+                    });
+                }
+                // Empty window: unchanged from the pre-runtime behaviour.
+                _ => {
+                    static_only += 1;
+                    d.claims.push(Claim {
+                        claim_id: next_claim_id(),
+                        kind: "dead_code_likely".into(),
+                        subject,
+                        object: Some(format!("symbol_name:{}", v.symbol)),
+                        confidence: 0.6,
+                        evidence,
+                        rationale: Some("single static tier; no runtime observation window to corroborate it".into()),
+                    });
+                }
+            }
+        }
+
+        // The uncertainty is about what the tiers could NOT see, so it is only
+        // honest while a tier is actually missing. Once the runtime tier has
+        // spoken the claims carry their own graded evidence and repeating the
+        // blanket caveat would understate what is now known.
+        if static_only > 0 && !runtime_spoke {
             d.uncertainties.push(Uncertainty {
                 topic: "dead_code_likely".into(),
                 question: format!(
-                    "Which of the {} dead-code candidates are genuinely unreachable, rather than \
-                     called from a macro body or through a method call the reference extractor \
-                     cannot resolve?",
-                    ws.dead_code.len()
+                    "Which of the {static_only} dead-code candidates are genuinely unreachable, \
+                     rather than called from a macro body or through a method call the reference \
+                     extractor cannot resolve?"
                 ),
                 best_guess: Some(
                     "A single static tier. No runtime, binary-symbol or compiler-lint tier has \
@@ -906,6 +1015,112 @@ mod tests {
             u[0].confidence < 0.5,
             "an unresolved known-unknown must not read as confident"
         );
+    }
+
+    // ── The runtime dead-code tier (J1 of the codemap join) ──────────────
+
+    fn dead_symbol(name: &str, file: &str, line: usize) -> crate::workspace_scan::DeadSymbol {
+        crate::workspace_scan::DeadSymbol {
+            crate_name: "corecruxd".into(),
+            module_path: "m".into(),
+            file_rel_path: file.into(),
+            line,
+            kind: "fn".into(),
+            name: name.into(),
+            confidence: 0.6,
+            note: "no references found".into(),
+        }
+    }
+
+    fn span(name: &str, file: &str) -> crate::trace_store::StoredSpan {
+        crate::trace_store::StoredSpan {
+            span: crux_observe::span_layer::SpanRecord {
+                trace_id: 1,
+                span_id: 2,
+                parent_span_id: None,
+                name: name.into(),
+                target: "t".into(),
+                file: Some(file.into()),
+                line: Some(1),
+                module_path: None,
+                duration_ns: 10,
+                depth: 0,
+                had_error: false,
+            },
+            symbol_id: None,
+            join: "extracted".into(),
+            stored_at_unix_ms: 1_000,
+        }
+    }
+
+    fn scan_with(dead: Vec<crate::workspace_scan::DeadSymbol>) -> crate::workspace_scan::WorkspaceScan {
+        let mut ws = crate::workspace_scan::WorkspaceScan::default();
+        ws.scan_id = "ws_test".into();
+        ws.dead_code = dead;
+        ws
+    }
+
+    /// An empty window must change nothing. Trace capture is default-off, so
+    /// this is the shape almost every install sees.
+    #[test]
+    fn an_empty_window_reproduces_the_pre_runtime_behaviour() {
+        let ws = scan_with(vec![dead_symbol("orphan", "src/a.rs", 10)]);
+        let v = crate::code_intel::dead_code_verdicts(&ws, &[]);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].verdict, "dead_candidate__static_only");
+        assert!(!v[0].actionable, "nothing is actionable without a window");
+    }
+
+    /// Observed executing ⇒ the static tier was wrong. Emitting
+    /// `dead_code_likely` here would put live code on a delete-list.
+    #[test]
+    fn a_symbol_observed_running_is_not_a_dead_code_claim() {
+        let ws = scan_with(vec![dead_symbol("actually_alive", "src/a.rs", 10)]);
+        let spans = vec![span("actually_alive", "src/a.rs")];
+        let v = crate::code_intel::dead_code_verdicts(&ws, &spans);
+        assert_eq!(v[0].verdict, "extractor_false_positive__static_dead_but_executed");
+    }
+
+    /// Two tiers agreeing is necessary but not sufficient: the symbol's own
+    /// file must have run, or the runtime tier never had a chance to see it.
+    /// This is the distinction #542's own M6 gate was opened to fix.
+    #[test]
+    fn tiers_agreeing_is_only_actionable_when_the_symbols_file_executed() {
+        let ws = scan_with(vec![dead_symbol("orphan", "src/quiet.rs", 10)]);
+
+        // A window that never touched src/quiet.rs: agreement, but not evidence.
+        let elsewhere = vec![span("something_else", "src/busy.rs")];
+        let v = crate::code_intel::dead_code_verdicts(&ws, &elsewhere);
+        assert_eq!(v[0].verdict, "dead_candidate__static_and_runtime_agree");
+        assert!(
+            !v[0].actionable,
+            "the symbol's file never executed — silence there proves nothing"
+        );
+
+        // A window that DID exercise the file, without hitting the symbol.
+        let same_file = vec![span("neighbour", "src/quiet.rs")];
+        let v = crate::code_intel::dead_code_verdicts(&ws, &same_file);
+        assert!(v[0].actionable, "file ran, symbol did not — now the negative counts");
+    }
+
+    /// The window travels with the claims it graded, or the confidences are
+    /// not re-derivable later.
+    #[test]
+    fn the_trace_window_is_recorded_only_when_a_runtime_tier_spoke() {
+        let none: BasedOn = BasedOn {
+            trace_window: None,
+            ..Default::default()
+        };
+        assert!(none.trace_window.is_none());
+
+        let spans = vec![span("x", "src/a.rs"), span("y", "src/a.rs")];
+        let w = TraceWindow::from(&crate::code_intel::Window::of(&spans));
+        assert_eq!(w.spans_examined, 2);
+        assert_eq!(w.traces_examined, 1);
+        assert!(!w.caveat.is_empty(), "the caveat must survive the conversion");
+        // Round-trips through the fact store, unlike code_intel::Window.
+        let json = serde_json::to_string(&w).unwrap();
+        assert_eq!(serde_json::from_str::<TraceWindow>(&json).unwrap(), w);
     }
 
     #[test]
