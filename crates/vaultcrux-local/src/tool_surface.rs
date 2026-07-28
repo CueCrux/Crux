@@ -375,6 +375,37 @@ pub const TOOL_SURFACE: &[ToolSurfaceEntry] = &[
         tier: ToolTier::Local,
         marker: "[tier:local]",
     },
+    // Runtime code intelligence (crux-codemap-agent-surface M1). Local because
+    // each one proxies a /v1/code-intel/* route on whichever daemon the client
+    // is already connected to, reading that daemon's own workspace scan and
+    // trace store — no hosted control plane is involved. The Pro surface these
+    // could sit behind is specified in that plan's M5 and deliberately not
+    // built, so HostedGated would gate them on a plane that does not exist.
+    ToolSurfaceEntry {
+        name: "code_blast_radius",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "code_dead_code",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "code_liveness",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "code_path",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "code_trace_diff",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
     ToolSurfaceEntry {
         name: "comment_on_work",
         tier: ToolTier::Local,
