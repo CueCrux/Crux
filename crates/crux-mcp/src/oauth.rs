@@ -90,6 +90,35 @@ impl ResourceConfig {
     pub fn www_authenticate_value(&self) -> String {
         format!("Bearer resource_metadata=\"{}\"", self.resource_metadata_url())
     }
+
+    /// The RFC 6750 §3 challenge for a *refused* credential.
+    ///
+    /// RFC 6750 is explicit that `error` is omitted when the request carried no
+    /// credentials at all (that is a plain "authenticate here" challenge, not a
+    /// complaint) — so `error` is `None` for the missing-token case and set
+    /// otherwise. `scope` accompanies `insufficient_scope` so the client knows
+    /// what to ask the AS for rather than guessing.
+    pub fn www_authenticate_error(&self, error: Option<&str>, description: &str) -> String {
+        let mut parts = vec!["Bearer".to_string()];
+        let mut params = Vec::new();
+        if let Some(code) = error {
+            params.push(format!("error=\"{code}\""));
+            params.push(format!("error_description=\"{}\"", escape_quoted(description)));
+            if code == "insufficient_scope" {
+                params.push("scope=\"mcp:read\"".to_string());
+            }
+        }
+        params.push(format!("resource_metadata=\"{}\"", self.resource_metadata_url()));
+        parts.push(params.join(", "));
+        parts.join(" ")
+    }
+}
+
+/// RFC 7230 quoted-string escaping for the one field we interpolate. The
+/// descriptions are our own literals, but a header value that can be broken by
+/// a stray quote is a header value that will be.
+fn escape_quoted(raw: &str) -> String {
+    raw.replace('\\', "\\\\").replace('"', "\\'")
 }
 
 /// Extract `scheme://host[:port]` from a URL without pulling in a URL crate.
@@ -324,24 +353,59 @@ pub fn require_resource_aud() -> bool {
 /// and if so return the [`crate::agent::AgentIdentity`] it maps to (named after
 /// the configured tenant so `scope_identity` resolves there). Returns `None`
 /// (deny) unless active + holds `mcp:read` + passes the `aud` check.
+/// Why an OAuth bearer was refused, so the HTTP layer can emit the right
+/// RFC 6750 `error` code instead of a bare 401.
+///
+/// The distinction is not cosmetic: `invalid_token` tells a client to re-run the
+/// authorization flow, `insufficient_scope` tells it the flow succeeded but it
+/// asked for the wrong scope. Collapsing both into an unlabelled 401 leaves a
+/// client unable to tell a wrong-scope token from garbage — it has to guess, and
+/// a client that guesses "re-authorize" on an insufficient-scope response loops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OauthDenial {
+    /// Introspection says the token is not active — expired, revoked, unknown.
+    Inactive,
+    /// Active token, but it does not carry `mcp:read`.
+    InsufficientScope,
+    /// Active and scoped, but issued for a different resource.
+    WrongAudience,
+}
+
+/// `authorize_oauth_with`, but reporting *why* on refusal.
+pub fn authorize_oauth_detailed(
+    intro: &Introspection,
+    resource_url: &str,
+    tenant: &str,
+    require_aud: bool,
+) -> Result<crate::agent::AgentIdentity, OauthDenial> {
+    if !intro.active {
+        return Err(OauthDenial::Inactive);
+    }
+    if !intro.has_scope("mcp:read") {
+        return Err(OauthDenial::InsufficientScope);
+    }
+    if require_aud && !intro.aud_allows(resource_url) {
+        return Err(OauthDenial::WrongAudience);
+    }
+    Ok(identity_for(intro, tenant))
+}
+
 pub fn authorize_oauth_with(
     intro: &Introspection,
     resource_url: &str,
     tenant: &str,
     require_aud: bool,
 ) -> Option<crate::agent::AgentIdentity> {
-    if !intro.active || !intro.has_scope("mcp:read") {
-        return None;
-    }
-    if require_aud && !intro.aud_allows(resource_url) {
-        return None;
-    }
+    authorize_oauth_detailed(intro, resource_url, tenant, require_aud).ok()
+}
+
+fn identity_for(intro: &Introspection, tenant: &str) -> crate::agent::AgentIdentity {
     let sub = intro.sub.as_deref().unwrap_or("anon");
     let marker = format!("oauth-mcp:{tenant}:{sub}");
-    Some(crate::agent::AgentIdentity {
+    crate::agent::AgentIdentity {
         name: tenant.to_string(),
         token_hash: blake3::hash(marker.as_bytes()).into(),
-    })
+    }
 }
 
 pub fn authorize_oauth(intro: &Introspection, resource_url: &str) -> Option<crate::agent::AgentIdentity> {
@@ -499,6 +563,68 @@ mod tests {
             aud: vec![],
             exp: None,
         }
+    }
+
+    #[test]
+    fn authorize_oauth_detailed_reports_why_it_refused() {
+        let res = "https://crux.cuecrux.com/mcp";
+        assert!(authorize_oauth_detailed(&read_token(), res, "work", false).is_ok());
+
+        let inactive = Introspection {
+            active: false,
+            ..read_token()
+        };
+        assert_eq!(
+            authorize_oauth_detailed(&inactive, res, "work", false).err(),
+            Some(OauthDenial::Inactive)
+        );
+
+        // The case that matters: a real token that simply lacks mcp:read must
+        // be distinguishable from junk, or the client cannot know to re-request
+        // the scope rather than re-run the whole flow.
+        let no_scope = Introspection {
+            scopes: vec!["openid".to_string()],
+            ..read_token()
+        };
+        assert_eq!(
+            authorize_oauth_detailed(&no_scope, res, "work", false).err(),
+            Some(OauthDenial::InsufficientScope)
+        );
+
+        let other_aud = Introspection {
+            aud: vec!["https://other.example/mcp".to_string()],
+            ..read_token()
+        };
+        assert_eq!(
+            authorize_oauth_detailed(&other_aud, res, "work", true).err(),
+            Some(OauthDenial::WrongAudience)
+        );
+    }
+
+    #[test]
+    fn www_authenticate_carries_rfc6750_error_and_scope() {
+        let cfg = ResourceConfig {
+            resource_url: "https://crux.cuecrux.com/mcp".to_string(),
+            authorization_servers: vec!["https://api.vaultcrux.com".to_string()],
+        };
+
+        // No credentials → challenge only, no `error` (RFC 6750 §3).
+        let bare = cfg.www_authenticate_error(None, "no bearer token");
+        assert!(
+            !bare.contains("error="),
+            "bare challenge must not claim an error: {bare}"
+        );
+        assert!(bare.contains("resource_metadata="));
+
+        let invalid = cfg.www_authenticate_error(Some("invalid_token"), "nope");
+        assert!(invalid.contains(r#"error="invalid_token""#), "{invalid}");
+        assert!(invalid.contains("error_description="), "{invalid}");
+        assert!(invalid.contains("resource_metadata="), "{invalid}");
+
+        // insufficient_scope must name the scope the client should request.
+        let scope = cfg.www_authenticate_error(Some("insufficient_scope"), "needs mcp:read");
+        assert!(scope.contains(r#"error="insufficient_scope""#), "{scope}");
+        assert!(scope.contains(r#"scope="mcp:read""#), "{scope}");
     }
 
     #[test]
