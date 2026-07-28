@@ -76,6 +76,19 @@ fn describe_probe(result: Result<ureq::http::Response<ureq::Body>, ureq::Error>)
     }
 }
 
+/// Liveness variant of [`describe_probe`]: any HTTP answer means the transport
+/// is up. Used for the MCP port, where an authenticated daemon answers an
+/// unauthenticated probe with `401` — a live, correct response.
+fn describe_liveness_probe(result: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> (bool, String) {
+    match result {
+        Ok(resp) => (true, resp.status().as_u16().to_string()),
+        // ureq surfaces non-2xx as StatusCode errors; a status at all is proof
+        // of life. Only a transport failure means "not up".
+        Err(ureq::Error::StatusCode(code)) => (true, code.to_string()),
+        Err(err) => (false, format!("error({err})")),
+    }
+}
+
 /// Truncate on a char boundary so a multi-byte body can never panic the harness.
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -344,7 +357,12 @@ impl TestDaemon {
             // racing `/readyz` against `start()` flake. Wait here until the
             // daemon is *actually* serve-ready, not just port-bound.
             let (healthz_ok, healthz) = describe_probe(self.get("/healthz"));
-            let (mcp_ok, mcp) = describe_probe(self.mcp_get());
+            // The MCP probe is a LIVENESS check, not an authorization check: a
+            // `401` proves the listener is up, speaking HTTP, and enforcing auth
+            // — which is exactly what a token-configured daemon should answer an
+            // unauthenticated `GET /mcp`. Treating only `200` as healthy meant a
+            // daemon that correctly challenges never looked ready.
+            let (mcp_ok, mcp) = describe_liveness_probe(self.mcp_get());
             let grpc_ok = self.grpc_listening();
             probes.healthz = healthz;
             probes.mcp = mcp;

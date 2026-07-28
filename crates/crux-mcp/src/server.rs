@@ -232,6 +232,18 @@ async fn handle_mcp_get(State(ctx): State<Arc<McpContext>>, req: axum::extract::
         .and_then(|v| v.to_str().ok())
         .is_some_and(|a| a.contains("text/event-stream"));
 
+    // Authenticate BEFORE branching. The discovery banner used to answer any
+    // non-SSE GET unconditionally, which meant two things on an authenticated
+    // daemon: it disclosed server identity to an unauthenticated caller, and —
+    // worse for interoperability — a client probing with a plain GET got a 200
+    // and therefore never saw the `WWW-Authenticate` challenge that tells it
+    // where the Authorization Server is. Discovery has to be reachable, but the
+    // challenge is the thing a probing client actually needs.
+    let auth = match authenticate_agent(&ctx, headers).await {
+        Ok(outcome) => outcome,
+        Err(problem) => return problem.into_response(),
+    };
+
     if !wants_sse {
         return Json(json!({
             "protocolVersion": PROTOCOL_VERSION,
@@ -243,10 +255,7 @@ async fn handle_mcp_get(State(ctx): State<Arc<McpContext>>, req: axum::extract::
         .into_response();
     }
 
-    let agent = match authenticate_agent(&ctx, headers).await {
-        Ok(outcome) => outcome.into_identity(),
-        Err(problem) => return problem.into_response(),
-    };
+    let agent = auth.into_identity();
     let session_id = match mcp_session_id_from_headers(headers) {
         Ok(Some(session_id)) => session_id,
         Ok(None) => uuid::Uuid::new_v4().simple().to_string(),
@@ -299,12 +308,62 @@ impl IntoResponse for InvalidMcpSessionId {
     }
 }
 
+/// Why a request was refused, mapped to its RFC 6750 wire form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthDenial {
+    /// No `Authorization` header on a daemon that requires one. RFC 6750 §3:
+    /// a challenge with no `error` — nothing was wrong, nothing was offered.
+    MissingToken,
+    /// A credential was presented and is not usable: unknown to the registry,
+    /// inactive per introspection, or issued for another resource.
+    InvalidToken,
+    /// The caller authenticated, but the token does not carry `mcp:read`.
+    InsufficientScope,
+}
+
+impl AuthDenial {
+    /// (status, RFC 6750 error code, human description).
+    ///
+    /// `insufficient_scope` is a 403, not a 401 — re-authenticating with the
+    /// same rights changes nothing, and a 401 would invite exactly that loop.
+    fn rfc6750(self) -> (StatusCode, Option<&'static str>, &'static str) {
+        match self {
+            AuthDenial::MissingToken => (
+                StatusCode::UNAUTHORIZED,
+                None,
+                "no bearer token on a daemon that requires one",
+            ),
+            AuthDenial::InvalidToken => (
+                StatusCode::UNAUTHORIZED,
+                Some("invalid_token"),
+                "the bearer token is not recognised, has expired, or was issued for a different resource",
+            ),
+            AuthDenial::InsufficientScope => (
+                StatusCode::FORBIDDEN,
+                Some("insufficient_scope"),
+                "the bearer token does not carry the 'mcp:read' scope",
+            ),
+        }
+    }
+}
+
+impl From<crate::oauth::OauthDenial> for AuthDenial {
+    fn from(denial: crate::oauth::OauthDenial) -> Self {
+        match denial {
+            crate::oauth::OauthDenial::InsufficientScope => AuthDenial::InsufficientScope,
+            // Inactive and wrong-audience are both "this credential cannot be
+            // used here" — RFC 6750 gives them the same code.
+            crate::oauth::OauthDenial::Inactive | crate::oauth::OauthDenial::WrongAudience => AuthDenial::InvalidToken,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
-struct UnauthorizedAgent;
+struct UnauthorizedAgent(AuthDenial);
 
 impl IntoResponse for UnauthorizedAgent {
     fn into_response(self) -> Response {
-        unauthorized_response()
+        auth_challenge_response(self.0)
     }
 }
 
@@ -338,17 +397,22 @@ async fn authenticate_agent(ctx: &McpContext, headers: &HeaderMap) -> Result<Aut
         return if ctx.agent_registry.is_empty() {
             Ok(AuthOutcome::Anonymous)
         } else {
-            Err(UnauthorizedAgent)
+            Err(UnauthorizedAgent(AuthDenial::MissingToken))
         };
     };
 
-    // 1. Registered static agent token — exact pre-OAuth behaviour.
+    // 1. Registered static agent token — exact pre-OAuth behaviour. This is an
+    //    opaque-string registry lookup, NOT a JWT verification: a token on this
+    //    rail is never parsed, so its iss/aud/scope/kid are irrelevant here.
     if let Some(agent) = ctx.agent_registry.lookup(token).cloned() {
         return Ok(AuthOutcome::Agent(agent));
     }
 
     // 2. Hosted-client OAuth bearer. Introspection is blocking (ureq) so it runs
     //    on a blocking thread; the ≤60s cache keeps the common case off the wire.
+    //    A denial here is specific (inactive / wrong scope / wrong audience) and
+    //    is reported as such rather than folded into a bare 401.
+    let mut oauth_denial = None;
     if crate::oauth::introspection_enabled() {
         let token_owned = token.to_string();
         let introspection = tokio::task::spawn_blocking(move || {
@@ -359,18 +423,25 @@ async fn authenticate_agent(ctx: &McpContext, headers: &HeaderMap) -> Result<Aut
         .flatten();
         if let Some(intro) = introspection {
             if let Some(resource) = crate::oauth::ResourceConfig::from_env() {
-                if let Some(identity) = crate::oauth::authorize_oauth(&intro, &resource.resource_url) {
-                    return Ok(AuthOutcome::OAuth(identity));
+                match crate::oauth::authorize_oauth_detailed(
+                    &intro,
+                    &resource.resource_url,
+                    &crate::oauth::oauth_tenant(),
+                    crate::oauth::require_resource_aud(),
+                ) {
+                    Ok(identity) => return Ok(AuthOutcome::OAuth(identity)),
+                    Err(denial) => oauth_denial = Some(AuthDenial::from(denial)),
                 }
             }
         }
     }
 
-    // 3. Unknown bearer: anonymous only on a no-auth daemon, else 401.
-    if ctx.agent_registry.is_empty() {
+    // 3. Unknown bearer: anonymous only on a no-auth daemon, else refuse — with
+    //    the OAuth reason when we have one, otherwise "this token is not valid".
+    if ctx.agent_registry.is_empty() && oauth_denial.is_none() {
         Ok(AuthOutcome::Anonymous)
     } else {
-        Err(UnauthorizedAgent)
+        Err(UnauthorizedAgent(oauth_denial.unwrap_or(AuthDenial::InvalidToken)))
     }
 }
 
@@ -381,19 +452,45 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .and_then(|auth| auth.strip_prefix("Bearer "))
 }
 
-fn unauthorized_response() -> Response {
+/// Build the 401/403 for a refused request, carrying the RFC 6750 `error` code
+/// that says *which* kind of refusal it was.
+///
+/// Without the code, a client cannot distinguish "your token is junk" from "your
+/// token is fine but lacks `mcp:read`" — the two demand opposite responses, and
+/// the ambiguity costs a human three probes to characterise.
+fn auth_challenge_response(denial: AuthDenial) -> Response {
+    let oauth = crate::oauth::ResourceConfig::from_env();
+    let (status, error, description) = denial.rfc6750();
+
+    // The body hint must not contradict the challenge beside it. When this
+    // daemon fronts OAuth, naming only CRUX_AGENT_TOKEN sends a client down the
+    // static-token path the same response is telling it not to use.
+    let hint = match (&oauth, denial) {
+        (Some(_), AuthDenial::InsufficientScope) => {
+            "the token is valid but lacks the 'mcp:read' scope; request it from the authorization \
+             server named in WWW-Authenticate"
+        }
+        (Some(_), _) => {
+            "authenticate via the authorization server named in WWW-Authenticate, or send a \
+             registered agent token as Authorization: Bearer <token>"
+        }
+        (None, _) => "set Authorization: Bearer <CRUX_AGENT_TOKEN>",
+    };
+
     let mut response = (
-        StatusCode::UNAUTHORIZED,
+        status,
         Json(json!({
-            "error": "unauthorized",
-            "hint": "set Authorization: Bearer <CRUX_AGENT_TOKEN>"
+            "error": error.unwrap_or("unauthorized"),
+            "error_description": description,
+            "hint": hint,
         })),
     )
         .into_response();
-    // When this daemon fronts a hosted-client OAuth flow, add the RFC 9728
-    // challenge so claude.ai / ChatGPT can discover the Authorization Server.
-    if let Some(cfg) = crate::oauth::ResourceConfig::from_env() {
-        if let Ok(value) = HeaderValue::from_str(&cfg.www_authenticate_value()) {
+
+    // RFC 9728 challenge so claude.ai / ChatGPT can discover the Authorization
+    // Server, now carrying the RFC 6750 error code too.
+    if let Some(cfg) = oauth {
+        if let Ok(value) = HeaderValue::from_str(&cfg.www_authenticate_error(error, description)) {
             response
                 .headers_mut()
                 .insert(axum::http::header::WWW_AUTHENTICATE, value);
@@ -699,6 +796,89 @@ mod tests {
         // Do NOT read the long-lived body. Clean up the registry entry.
         drop(resp);
         crate::sse::unregister("test-sse-session");
+    }
+
+    /// The discovery banner used to answer ANY non-SSE GET with a 200 before
+    /// authentication ran, so a probing client on an authenticated daemon never
+    /// saw the challenge and could not discover the Authorization Server.
+    #[tokio::test]
+    async fn get_banner_requires_bearer_when_registry_configured() {
+        let mut ctx = McpContext::new_default("test-node");
+        ctx.agent_registry = crate::agent::AgentRegistry::from_single_token(TEST_AGENT_TOKEN);
+        let app = test_app_with_ctx(ctx);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/mcp")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "an unauthenticated GET must be challenged, not handed serverInfo"
+        );
+    }
+
+    /// ...but it must still answer an AUTHENTICATED GET, and must stay open on a
+    /// no-auth daemon (covered by `get_returns_server_info`).
+    #[tokio::test]
+    async fn get_banner_served_to_authenticated_caller() {
+        let mut ctx = McpContext::new_default("test-node");
+        ctx.agent_registry = crate::agent::AgentRegistry::from_single_token(TEST_AGENT_TOKEN);
+        let app = test_app_with_ctx(ctx);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/mcp")
+            .header("authorization", format!("Bearer {TEST_AGENT_TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let info: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(info["serverInfo"]["name"], SERVER_NAME);
+    }
+
+    /// The RFC 6750 codes. Without these a client cannot tell a wrong-scope
+    /// token from garbage — the ambiguity that cost three probes to diagnose.
+    #[test]
+    fn auth_denial_maps_to_rfc6750_codes() {
+        assert_eq!(AuthDenial::MissingToken.rfc6750().0, StatusCode::UNAUTHORIZED);
+        // RFC 6750 §3: no `error` when the request carried no credentials.
+        assert_eq!(AuthDenial::MissingToken.rfc6750().1, None);
+
+        let (status, code, _) = AuthDenial::InvalidToken.rfc6750();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(code, Some("invalid_token"));
+
+        // 403, not 401 — re-authenticating with the same rights would loop.
+        let (status, code, _) = AuthDenial::InsufficientScope.rfc6750();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(code, Some("insufficient_scope"));
+    }
+
+    #[tokio::test]
+    async fn unknown_bearer_is_labelled_invalid_token() {
+        let mut ctx = McpContext::new_default("test-node");
+        ctx.agent_registry = crate::agent::AgentRegistry::from_single_token(TEST_AGENT_TOKEN);
+        let app = test_app_with_ctx(ctx);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/mcp")
+            .header("authorization", "Bearer not-the-registered-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(
+            body["error"], "invalid_token",
+            "a presented-but-unusable token is invalid_token, not a bare 'unauthorized'"
+        );
     }
 
     #[tokio::test]
