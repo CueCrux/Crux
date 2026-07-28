@@ -13,8 +13,7 @@
 
 use super::{problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, State, StatusCode};
 
-const LATEST_SCAN_ENTITY: &str = "__workspace_scan__::latest";
-const SCAN_KEY: &str = "content";
+use crate::workspace_scan::{LATEST_SCAN_ENTITY, SCAN_KEY};
 
 /// `POST /v1/workspace/scan` — kick off a scan of the configured workspace
 /// path. Returns the scan summary (no file contents) inline; full payload is

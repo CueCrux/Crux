@@ -1149,11 +1149,18 @@
     var deferred = { h: 'Not yet ported', sub: 'surfaces with no read endpoint on this daemon', wide: true, controls: [
       info('bulk ops', 'batch import / sweep are mutations — no read surface'),
       info('handoff', 'create_handoff is MCP-only — no list endpoint'),
-      info('storybook', 'tile/pattern catalog is a design artifact, not a data feed'),
-      info('story', 'call-tree story view stays on the Pro / 3D canvas'),
-      info('dossiers', 'per-project — see Work › Projects (/v1/projects/{id}/dossiers)')
+      info('story', 'call-tree story view stays on the Pro / 3D canvas')
     ] };
-    sections.push(tools, cockpit, deferred);
+    // storybook + dossiers now have a home. They were listed above as deferred
+    // on a mis-reading of the name; both are live daemon surfaces with eight MCP
+    // tools and a console page of their own.
+    var contextGraph = { h: 'Context graph', sub: 'the project readout + what each agent believes · phases 3 and 4', wide: true, controls: [
+      info('storybook', 'per-project narrative readout → Work › Storybook'),
+      info('dossiers', 'agent belief snapshots + cross-agent reconciliation → Work › Storybook'),
+      link('Open Storybook & dossiers', '#/work/cx-storybook', { hint: '/v1/projects/{id}/storybook · .../dossiers' }),
+      info('mcp', 'get_project_storybook · diff_project_storybook · get_project_dossiers · reconcile_project_dossiers · publish_project_dossier (+3)')
+    ] };
+    sections.push(tools, cockpit, contextGraph, deferred);
     return sections;
   }
 
@@ -1399,6 +1406,15 @@
     // renderPage id switch); no section build.
     'cx-activity-log': page('cx-activity-log', 'work', 'Activity', 'live rolling activity log — streaming events + receipt cross-walk'),
     'cx-projects': page('cx-projects', 'work', 'Projects', 'repos to track + search, a planning repo, passports and working tenants', { load: { endpoint: '/v1/projects', build: buildProjects } }),
+    // Storybook & dossiers — phases 3 and 4 of the context graph, and the ONE
+    // surface that shows where two agents disagree about the same project.
+    // Custom-rendered by render.js renderContextGraph (see the renderPage id
+    // switch): a project picker driving the storybook readout (sections, version
+    // list, two-version diff) and the dossier board (claims by kind with
+    // confidence + evidence, and the cross-agent reconciliation). No section
+    // build — the readout is markdown and the dossiers are a nested shape
+    // neither of which the control model can express.
+    'cx-storybook': page('cx-storybook', 'work', 'Storybook', 'where each project is + what every agent believes about it · /v1/projects/{id}/storybook · .../dossiers'),
     'cx-sessions': page('cx-sessions', 'work', 'Sessions', 'saved session snapshots for resume + audit · /v1/console/sessions', { load: { endpoint: '/v1/console/sessions', build: buildSessions } }),
     // ---- Memory ----------------------------------------------------------
     // cx-facts is custom-rendered by render.js renderFactsBrowser (see the
@@ -1584,9 +1600,17 @@
     'ax-activity': 'home:cx-activity', 'ax-memory': 'home:cx-memory', 'ax-snapshots': 'home:cx-sessions',
     'ax-bulk': 'deferred:batch ops are mutations — no read surface',
     'ax-handoff': 'deferred:create_handoff is MCP-only — no list endpoint',
-    'ax-storybook': 'deferred:tile/pattern catalog is a design artifact, not a data feed',
+    // Corrected 2026-07-28: this was NEVER the JS component-gallery tool. It sits
+    // in the legacy AX (Agent) scope beside ax-handoff / ax-story / ax-dossiers,
+    // and it is the project storybook readout — five live daemon routes under
+    // /v1/projects/{id}/storybook. Filing a live endpoint as a design artifact
+    // put a real surface out of reach and locked the claim in via check 24.
+    'ax-storybook': 'home:cx-storybook',
     'ax-story': 'deferred:call-tree story view stays on the Pro / 3D canvas',
-    'ax-dossiers': 'deferred:per-project — /v1/projects/{id}/dossiers is per-project (see Work › Projects)',
+    // Corrected 2026-07-28: per-project, yes — but Work › Projects never rendered
+    // them, so the pointer led nowhere. cx-storybook carries the project picker
+    // both phases need.
+    'ax-dossiers': 'home:cx-storybook',
     // ── IX (Infra) — all five panels fed by one live endpoint → one Pro page ──
     'ix-index': 'ported-pro:ix-infra', 'ix-machines': 'ported-pro:ix-infra', 'ix-rails': 'ported-pro:ix-infra',
     'ix-config': 'ported-pro:ix-infra', 'ix-sync': 'ported-pro:ix-infra',

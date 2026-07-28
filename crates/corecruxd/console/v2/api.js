@@ -10,7 +10,7 @@
 // Customer-safe posture: CruxApi (below) exposes only GET (read) routes; its
 // generic get(path) is allowlist-guarded to literal manifest GET paths. The ONLY
 // writes this console can perform live in the separate CruxApiGated object at the
-// bottom — exactly 40 curated, operator-posture-gated mutation(s), no more.
+// bottom — exactly 42 curated, operator-posture-gated mutation(s), no more.
 //
 // Every call is same-origin credentialed; the browser never holds a bearer
 // token (the daemon authenticates the session at its own origin).
@@ -744,6 +744,8 @@ const GATED_MUTATIONS = Object.freeze([
   Object.freeze(['DELETE', '/v1/extensions/keys/{passport_fpr}']),
   Object.freeze(['POST', '/v1/extensions/{id}/tools/{tool_name}/invoke']),
   Object.freeze(['POST', '/v1/studio/library/{id}/install']),
+  Object.freeze(['POST', '/v1/projects/{id}/storybook']),
+  Object.freeze(['POST', '/v1/projects/{id}/dossiers/auto']),
 ]);
 
 const CruxApiGated = Object.freeze({
@@ -866,6 +868,12 @@ const CruxApiGated = Object.freeze({
   },
   studioLibraryInstall(id, body) {
     return fetch(`/v1/studio/library/${encodeURIComponent(id)}/install`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  projectStorybookGenerate(id, body) {
+    return fetch(`/v1/projects/${encodeURIComponent(id)}/storybook`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  projectDossierGenerate(id, body) {
+    return fetch(`/v1/projects/${encodeURIComponent(id)}/dossiers/auto`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
   },
 });
 

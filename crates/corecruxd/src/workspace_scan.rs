@@ -810,24 +810,42 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
     Ok(scan)
 }
 
+/// Entity the newest scan is written to. One row, overwritten each scan.
+///
+/// Shared by the writer (`http::workspace::post_scan`) and both readers, so a
+/// rename cannot desynchronise them — which is exactly how the previous
+/// text-search lookup failed silently.
+pub const LATEST_SCAN_ENTITY: &str = "__workspace_scan__::latest";
+/// Fact key holding the serialised scan.
+pub const SCAN_KEY: &str = "content";
+
 /// Read the most recent persisted scan from the fact store, if any.
 pub async fn load_latest(
     fact_store: &std::sync::Arc<tokio::sync::RwLock<corecrux_memory::FactStore>>,
 ) -> Option<WorkspaceScan> {
     let store = fact_store.read().await;
+    // Exact-entity lookup, NOT a `query:` text search.
+    //
+    // The text-search form this replaced ranked with BM25 over `top_k: 16`, and
+    // a scan fact's value is the ENTIRE serialised scan — hundreds of KB. BM25
+    // length normalisation buried it under a handful of short facts, so on a
+    // real store the lookup silently returned None and every consumer reported
+    // a workspace of zero LOC, zero stubs and zero dead code as though no scan
+    // had ever run. There is exactly one entity to fetch and its id is a
+    // constant; asking for it by name cannot be outranked.
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
         min_effective_confidence: None,
         tenant_hash: None,
-        query: Some("__workspace_scan__::latest".to_string()),
-        entity: None,
+        query: None,
+        entity: Some(LATEST_SCAN_ENTITY.to_string()),
         entity_prefix: None,
-        top_k: 16,
+        top_k: 8,
         token_budget: None,
     });
     let latest = crate::fact_helpers::dedup_latest(result.facts);
     let fact = latest
         .into_iter()
-        .find(|f| f.entity == "__workspace_scan__::latest" && f.key == "content")?;
+        .find(|f| f.entity == LATEST_SCAN_ENTITY && f.key == SCAN_KEY)?;
     serde_json::from_str::<WorkspaceScan>(&fact.value).ok()
 }
 

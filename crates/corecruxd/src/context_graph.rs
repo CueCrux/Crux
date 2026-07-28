@@ -466,19 +466,28 @@ pub fn load_latest_workspace_blocking_pub(store: &FactStore) -> Option<crate::wo
 }
 
 fn load_latest_workspace_blocking(store: &FactStore) -> Option<crate::workspace_scan::WorkspaceScan> {
+    // Exact-entity lookup, NOT a `query:` text search.
+    //
+    // The text-search form this replaced ranked with BM25 over `top_k: 16`, and
+    // a scan fact's value is the ENTIRE serialised scan — hundreds of KB. BM25
+    // length normalisation buried it under a handful of short facts, so on a
+    // real store the lookup silently returned None and every consumer reported
+    // a workspace of zero LOC, zero stubs and zero dead code as though no scan
+    // had ever run. There is exactly one entity to fetch and its id is a
+    // constant; asking for it by name cannot be outranked.
     let result = store.query(&FactQuery {
         min_effective_confidence: None,
         tenant_hash: None,
-        query: Some("__workspace_scan__::latest".to_string()),
-        entity: None,
+        query: None,
+        entity: Some(crate::workspace_scan::LATEST_SCAN_ENTITY.to_string()),
         entity_prefix: None,
-        top_k: 16,
+        top_k: 8,
         token_budget: None,
     });
     let latest = crate::fact_helpers::dedup_latest(result.facts);
     let fact = latest
         .into_iter()
-        .find(|f| f.entity == "__workspace_scan__::latest" && f.key == "content")?;
+        .find(|f| f.entity == crate::workspace_scan::LATEST_SCAN_ENTITY && f.key == crate::workspace_scan::SCAN_KEY)?;
     serde_json::from_str::<crate::workspace_scan::WorkspaceScan>(&fact.value).ok()
 }
 
@@ -682,6 +691,60 @@ fn count_facts_with_prefix(store: &FactStore, prefix: &str) -> usize {
 mod tests {
     use super::*;
     use corecrux_memory::FactStore;
+
+    /// The scan fact must be found however large it is, and however many other
+    /// facts share its vocabulary.
+    ///
+    /// Regression: this loader used a BM25 `query:` over `top_k: 16`. A scan
+    /// fact's value is the entire serialised scan, so length normalisation sank
+    /// it below shorter facts and the lookup returned None — reported to the
+    /// operator as a workspace with zero LOC, zero stubs and zero dead code,
+    /// which is indistinguishable from never having scanned.
+    #[test]
+    fn a_large_scan_fact_is_still_found_among_competing_facts() {
+        let mut store = FactStore::new();
+
+        let mut scan = crate::workspace_scan::WorkspaceScan::default();
+        scan.scan_id = "ws_test".into();
+        scan.stats.total_loc = 9151;
+        scan.stats.crate_count = 8;
+        // Pad the value so BM25 length normalisation has something to punish.
+        scan.root_path = format!("/{}", "workspace_scan_latest_padding/".repeat(4000));
+        let value = serde_json::to_string(&scan).expect("encode");
+        assert!(value.len() > 100_000, "the point of the test is a large value");
+
+        // Decoys that share the query's whole vocabulary and are far shorter,
+        // so a text search ranks every one of them above the real fact.
+        for i in 0..40 {
+            store.store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: format!("__workspace_scan__::decoy_{i}"),
+                key: "content".to_string(),
+                value: "workspace scan latest".to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            });
+        }
+        store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: crate::workspace_scan::LATEST_SCAN_ENTITY.to_string(),
+            key: crate::workspace_scan::SCAN_KEY.to_string(),
+            value,
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+
+        let found = load_latest_workspace_blocking(&store).expect("the scan must be found");
+        assert_eq!(found.scan_id, "ws_test");
+        assert_eq!(found.stats.total_loc, 9151);
+        assert_eq!(found.stats.crate_count, 8);
+    }
 
     #[test]
     fn unknown_project_returns_empty_graph() {

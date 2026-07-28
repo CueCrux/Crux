@@ -22,6 +22,7 @@ mod cloud;
 mod compute;
 mod console;
 mod consolidation_receipt;
+mod context_budget;
 mod context_surface;
 mod coord;
 mod cost;
