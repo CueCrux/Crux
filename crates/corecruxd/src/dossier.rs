@@ -1113,6 +1113,7 @@ mod tests {
             },
             symbol_id: None,
             join: "extracted".into(),
+            tenant_id: String::new(),
             stored_at_unix_ms: 1_000,
         }
     }

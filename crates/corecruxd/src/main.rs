@@ -1110,7 +1110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                         let store_guard = fact_store.read().await;
                                         cache.get(&store_guard, &tenant_id, &repo_id)
                                     };
-                                    match store.append_resolved(spans, resolver.as_deref()) {
+                                    match store.append_resolved(spans, resolver.as_deref(), &tenant_id) {
                                         Ok(r) => info!(
                                             drained = r.spans_drained, resolved = r.resolved,
                                             ambiguous = r.ambiguous, missed = r.missed,
@@ -1130,7 +1130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                             let store_guard = fact_store.read().await;
                                             cache.get(&store_guard, &tenant_id, &repo_id)
                                         };
-                                        let _ = store.append_resolved(spans, resolver.as_deref());
+                                        let _ = store.append_resolved(spans, resolver.as_deref(), &tenant_id);
                                     }
                                     break;
                                 }
