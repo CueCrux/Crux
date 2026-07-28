@@ -236,11 +236,12 @@ pub const TOOL_SURFACE: &[ToolSurfaceEntry] = &[
     // connected to. No hosted control plane is involved, which is also why they
     // declare `x-crux-min-tier: free`.
     //
-    // Without an entry here `is_local_tool` is false, so the capability
-    // `crux-mcp.<tool>` never enters `rcx_local_capabilities`, and the RCX
-    // router refuses every call with `denied:capability_not_permitted`. Absent
-    // from this table a tool is not merely unadvertised — it is DEAD on any
-    // RCX-gated daemon, which is what host `crux` runs.
+    // Correction (2026-07-28): an earlier version of this comment claimed that a
+    // tool absent from this table is refused by the RCX router. It is not.
+    // `tool_tier` below returns `Local` for any unknown name, so the table is
+    // default-allow with a three-item deny-list, and an untiered tool works.
+    // These entries make the tier EXPLICIT rather than inherited — which matters
+    // because the default silently grants the free tier to anything new.
     ToolSurfaceEntry {
         name: "get_project_storybook",
         tier: ToolTier::Local,

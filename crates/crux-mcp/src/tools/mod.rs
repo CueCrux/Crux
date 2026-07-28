@@ -3338,26 +3338,31 @@ mod tests {
         }
     }
 
-    /// Every catalogued tool must carry a `TOOL_SURFACE` tier, or the RCX router
-    /// refuses it outright.
+    /// Every catalogued tool should carry an EXPLICIT `TOOL_SURFACE` tier.
     ///
-    /// `rcx_local_capabilities` builds the permitted capability set by filtering
-    /// the catalogue through `is_local_tool`, so a tool absent from
-    /// `TOOL_SURFACE` never contributes `crux-mcp.<name>` and every call is
-    /// denied with `denied:capability_not_permitted`. That is not a degraded
-    /// surface — the tool is unreachable on any RCX-gated daemon, which is what
-    /// host `crux` runs.
+    /// **Correction (2026-07-28).** This test shipped with a doc comment saying
+    /// an absent entry causes the RCX router to refuse the tool. That is wrong.
+    /// `tool_tier` returns `ToolTier::Local` for any name it does not find
+    /// (`vaultcrux-local/src/tool_surface.rs`), so the table is a
+    /// **default-allow model with a three-item deny-list** — `issue_passport`,
+    /// `sync_pull`, `sync_push`. An untiered tool is permitted, not denied.
+    /// Verified live: `list_work` has no entry and answers normally through a
+    /// real capability token, while `issue_passport` is correctly refused.
     ///
-    /// Nothing asserted this, which is why it kept happening: the daemon's own
-    /// test suite runs with no RCX router, so `enforce_rcx_tool_capability`
-    /// returns early and every tool appears to work. The gap is invisible until
-    /// something calls the tool through a real capability token.
+    /// The `denied:capability_not_permitted` that prompted the original claim
+    /// had a duller cause — the deployed binary predated the tools being called,
+    /// so `list_tools()` never emitted them and their capability was never
+    /// minted. Absent from the catalogue, not absent from this table.
     ///
-    /// `KNOWN_UNTIERED` enumerates the tools already in that state when this
-    /// test was written. It is a **defect list, not an exemption**: which tools
-    /// are free-local and which are hosted-gated is an entitlement decision, so
-    /// they are recorded here to be triaged deliberately rather than silently
-    /// tiered by whoever noticed. Adding a NEW tool without a tier now fails.
+    /// The guard is still worth keeping, for a different and smaller reason:
+    /// because the default is Local, a future **hosted** tool ships free unless
+    /// someone remembers to gate it. Defaulting an entitlement is a commercial
+    /// decision made by omission. Requiring an explicit entry makes each new
+    /// tool state its tier once, deliberately.
+    ///
+    /// `KNOWN_UNTIERED` is therefore a **backlog of undeclared tiers, not a
+    /// defect list**: every tool on it works today. It exists so new additions
+    /// fail this test rather than inheriting a default silently.
     #[test]
     fn every_catalogued_tool_carries_a_tier() {
         // Emptied 2026-07-28: all 85 were classified and tiered Local in
