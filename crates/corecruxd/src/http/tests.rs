@@ -16430,9 +16430,14 @@ async fn planes_delete_removes_record() {
 #[tokio::test]
 async fn dossier_list_when_empty_returns_empty_array() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
-    let resp = super::dossier::list_dossiers(State(state), Path("alpha".to_string()), dev_scope_headers("admin:read"))
-        .await
-        .into_response();
+    let resp = super::dossier::list_dossiers(
+        State(state),
+        Path("alpha".to_string()),
+        Query(Default::default()),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
     let body = json_body(resp).await;
     assert!(body["dossiers"].is_array());
 }
@@ -16440,9 +16445,14 @@ async fn dossier_list_when_empty_returns_empty_array() {
 #[tokio::test]
 async fn dossier_list_requires_admin_read() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
-    let resp = super::dossier::list_dossiers(State(state), Path("alpha".to_string()), HeaderMap::new())
-        .await
-        .into_response();
+    let resp = super::dossier::list_dossiers(
+        State(state),
+        Path("alpha".to_string()),
+        Query(Default::default()),
+        HeaderMap::new(),
+    )
+    .await
+    .into_response();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -16463,6 +16473,7 @@ async fn storybook_post_generate_then_get_latest() {
     let latest_resp = super::storybook::get_latest(
         State(state.clone()),
         Path("alpha".to_string()),
+        Query(Default::default()),
         dev_scope_headers("admin:read"),
     )
     .await
@@ -16487,6 +16498,7 @@ async fn storybook_get_latest_when_none_returns_404() {
     let resp = super::storybook::get_latest(
         State(state),
         Path("nonexistent".to_string()),
+        Query(Default::default()),
         dev_scope_headers("admin:read"),
     )
     .await
@@ -16513,6 +16525,7 @@ async fn dossier_get_unknown_returns_404() {
     let resp = super::dossier::get_dossier(
         State(state),
         Path(("alpha".to_string(), "nonexistent".to_string())),
+        Query(Default::default()),
         dev_scope_headers("admin:read"),
     )
     .await
