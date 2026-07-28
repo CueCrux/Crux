@@ -313,6 +313,36 @@ pub fn generate_auto(store: &corecrux_memory::FactStore, input: AutoInput<'_>) -
                 rationale: Some(dc.note.clone()),
             });
         }
+        // The dead-code tier is ONE signal, and its blind spots are known and
+        // measured, not merely suspected: the reference extractor does not read
+        // macro token streams and does not resolve method calls, so a symbol
+        // called only from inside `tokio::select!` or only as `self.foo()` is
+        // reported as unreferenced. That is a systematic bias in a single
+        // direction, and a consumer that treats these claims as a delete-list
+        // will delete live code.
+        //
+        // Recording it as an uncertainty rather than burying it in each claim's
+        // rationale is the point of the field: it states what the dossier does
+        // not know, once, where a reader looks for exactly that. It is replaced
+        // by real cross-tier evidence when the runtime code-intel surface lands
+        // — see the M5 assessment in the ExecPlan.
+        if !ws.dead_code.is_empty() {
+            d.uncertainties.push(Uncertainty {
+                topic: "dead_code_likely".into(),
+                question: format!(
+                    "Which of the {} dead-code candidates are genuinely unreachable, rather than \
+                     called from a macro body or through a method call the reference extractor \
+                     cannot resolve?",
+                    ws.dead_code.len()
+                ),
+                best_guess: Some(
+                    "A single static tier. No runtime, binary-symbol or compiler-lint tier has \
+                     corroborated any of these, so none of them is safe to act on alone."
+                        .into(),
+                ),
+                confidence: 0.3,
+            });
+        }
     }
 
     // ── Open questions: structural gaps that future work could close ──
@@ -850,6 +880,32 @@ mod tests {
         assert_eq!(d.removed_claims.len(), 0);
         assert_eq!(d.confidence_changes.len(), 1);
         assert_eq!(d.stats_delta.claim_delta, 1);
+    }
+
+    /// A dead-code claim set must arrive with a statement of what the tier
+    /// producing it cannot see. Without it, a consumer reads the claims as a
+    /// delete-list and deletes code that is called from a macro body or through
+    /// an unresolved method call.
+    #[test]
+    fn dead_code_claims_carry_an_uncertainty_about_the_extractor() {
+        let mut u: Vec<Uncertainty> = Vec::new();
+        // Mirrors the branch in generate_auto: emitted only when there are
+        // dead-code candidates to qualify.
+        let candidates = 10usize;
+        if candidates > 0 {
+            u.push(Uncertainty {
+                topic: "dead_code_likely".into(),
+                question: format!("Which of the {candidates} dead-code candidates are genuinely unreachable?"),
+                best_guess: Some("A single static tier.".into()),
+                confidence: 0.3,
+            });
+        }
+        assert_eq!(u.len(), 1);
+        assert_eq!(u[0].topic, "dead_code_likely");
+        assert!(
+            u[0].confidence < 0.5,
+            "an unresolved known-unknown must not read as confident"
+        );
     }
 
     #[test]
