@@ -281,6 +281,445 @@ pub const TOOL_SURFACE: &[ToolSurfaceEntry] = &[
         tier: ToolTier::Local,
         marker: "[tier:local]",
     },
+    // ── The remaining catalogue, all Local tier ────────────────────────────
+    //
+    // Classified against the rule the existing table already encodes: HostedGated
+    // means the tool REQUIRES the hosted control plane. Only three do —
+    // `issue_passport` (identity minted by a remote authority) and
+    // `sync_pull`/`sync_push` (facts moved to and from the remote plane), which
+    // `sync_and_issue_tools_are_hosted_gated` locks in. Every tool below runs
+    // against the project graph, fact store, entity store, receipts, coordination
+    // plane or integration credentials of whichever daemon the client is connected
+    // to, so none of them can be hosted-gated without changing what the tier means.
+    //
+    // `github_*` egress to GitHub through the daemon's own stored PAT. That is
+    // external egress, not the hosted CueCrux plane, and the tier is an
+    // install-tier entitlement rather than an egress classification — see the
+    // module docs. Egress is carried separately by `data_egress_classes`.
+    //
+    // This also matches the standing commercial rule: what runs on the operator's
+    // own silicon over their own data ships Free (dense-lane-and-extraction-upsell
+    // -2026-06-26). Flag-gated tools (`reuse_check`, `engram_resolve`, …) stay
+    // flag-gated — that is orthogonal to tier and unchanged here.
+    //
+    // Until 2026-07-28 these 85 had no entry at all, so `rcx_local_capabilities`
+    // never emitted `crux-mcp.<name>` and the RCX router refused every call with
+    // `denied:capability_not_permitted`. They were not degraded; they were dead.
+    ToolSurfaceEntry {
+        name: "activity_recent",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "approval_decide",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "approval_request",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "archive_session",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "artefact_get",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "artefact_list",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "artefact_put",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "attach_to_orchestrator",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "audit_config",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "audit_export_bundle",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "auth_posture_audit",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "autonomy_contract",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "check_config_audit",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "check_punchcard",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "comment_on_work",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "context_custody_audit",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "coord_announce",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "coord_status",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "create_orchestrator",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "create_work",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "detach_from_orchestrator",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "edge_delete",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "edge_get",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "edge_list",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "edge_upsert",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "egress_policy_check",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "engram_resolve",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "enrich_action",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "entity_delete",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "entity_get",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "entity_history",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "entity_list",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "entity_upsert",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "execplan_gate",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "feature_coverage_report",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "feature_file_search",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "feature_suggest_next",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "feature_trigger_audit",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "force_release",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "get_observation",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "get_project_context",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "get_workspace_storyline",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "github_comments_since",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "github_open_issues",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "github_open_prs",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "github_recent_commits",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "github_search",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "kind_get",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "kind_list",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "learn",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "list_observations",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "list_orchestrators",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "list_projects",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "list_punchcards",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "list_repos",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "list_work",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "memory_acknowledge_use",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "memory_consolidate",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "memory_contradictions",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "memory_forget",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "memory_forget_dry_run",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "memory_freshness",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "memory_reverify",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "memory_set_horizon",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "memory_sweep_candidates",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "output_attest",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "punch_in",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "punch_out",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "receipt_verify",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "register_repo",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "resolve_principal",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "reuse_check",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "revoke_passport",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "route_access_matrix",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "session_checkpoint",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "session_token_usage",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "status_feed",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "token_savings",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "tool_trace_recent",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "unarchive_session",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "update_orchestrator",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "update_work_state",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
+        name: "verify_observation",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
 ];
 
 pub fn tool_tier(name: &str) -> ToolTier {
