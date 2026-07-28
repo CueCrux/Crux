@@ -540,6 +540,66 @@
     return liveSec ? [candSec, liveSec, consSec] : [candSec, consSec];
   }
 
+  // How a client connects to THIS daemon: endpoint URLs, the agent-token state,
+  // and the one-click Claude Desktop bundle. The token's raw value arrives only
+  // when the daemon sets CORECRUXD_CONSOLE_REVEAL_AGENT_TOKEN=1 — the console
+  // renders whatever the server chose to disclose and never reconstructs it.
+  function buildConnections(res) {
+    if (!res.ok || !res.data) {
+      return [{ h: 'Connections', wide: true,
+        controls: degraded(res.status, 'Connections unavailable — GET /v1/console/connections') }];
+    }
+    var d = res.data;
+    var mcp = d.mcp || {};
+    var tok = d.agent_token || {};
+    var desk = d.claude_desktop || {};
+
+    var endpointSec = { h: 'MCP endpoint', sub: mcp.note || 'point an MCP client here', wide: true,
+      controls: [
+        info('path', mcp.path || '/mcp'),
+        info('same machine', mcp.local_url || '—'),
+        info('published', 'whatever host proxies ' + (mcp.path || '/mcp') + ' on 443 — the MCP port is not usually exposed directly')
+      ] };
+
+    var tokRows;
+    if (!tok.configured) {
+      tokRows = [
+        info('status', 'not configured'),
+        info('what that means', tok.hint || 'this daemon accepts MCP requests without a bearer token')
+      ];
+    } else if (tok.token) {
+      tokRows = [
+        info('status', 'configured · revealed'),
+        info('source', tok.source_env || '—'),
+        info('token', tok.token),
+        info('fingerprint', tok.fingerprint || '—')
+      ];
+    } else {
+      tokRows = [
+        info('status', 'configured · hidden'),
+        info('source', tok.source_env || '—'),
+        info('fingerprint', tok.fingerprint || '—'),
+        info('length', tok.length ? String(tok.length) + ' characters' : '—'),
+        info('to reveal', tok.hint || 'set CORECRUXD_CONSOLE_REVEAL_AGENT_TOKEN=1 on this daemon')
+      ];
+      if (tok.agent_names) { tokRows.splice(2, 0, info('agents', tok.agent_names)); }
+    }
+    var tokenSec = { h: 'Agent token', wide: true,
+      sub: 'the bearer an MCP client sends; read from the daemon environment at startup, never stored by the console',
+      controls: tokRows };
+
+    var deskSec = { h: 'Claude Desktop', wide: true,
+      sub: 'download, then drag the file onto Claude Desktop → Settings → Extensions',
+      controls: [
+        link('Download ' + (desk.filename || 'crux.mcpb'), desk.bundle_url || '/console-assets/crux.mcpb',
+          { hint: 'MCP bundle — installs Crux as a Desktop extension' }),
+        info('Desktop will ask for', 'the endpoint URL above, and the agent token'),
+        info('token field', 'paste the raw token — the "Bearer " prefix is added for you')
+      ] };
+
+    return [endpointSec, tokenSec, deskSec];
+  }
+
   function buildIntegrations(res) {
     // I1 — this page reads the plane; the Studio operates it. The link-through
     // leads so nobody hunts for a connect flow that was never here.
@@ -1442,6 +1502,7 @@
     'cx-usage': page('cx-usage', 'meters', 'Average Token Usage', 'measured per-period and per-turn averages · /v1/cost/report', { load: { endpoint: '/v1/cost/report?tenant_id=default&token_budget=4000', build: buildUsageLive } }),
     // ---- System ----------------------------------------------------------
     'cx-settings': page('cx-settings', 'system', 'Settings', 'daemon configuration and console preferences', { load: { endpoint: '/v1/console/settings', build: buildSettings } }),
+    'cx-connections': page('cx-connections', 'system', 'Connections', 'endpoints, agent token, and the Claude Desktop bundle', { load: { endpoint: '/v1/console/connections', build: buildConnections } }),
     'cx-integrations': page('cx-integrations', 'system', 'Integrations', 'installed packs and their grants', { load: { endpoint: '/v1/console/integrations', build: buildIntegrations } }),
     'cx-extensions': page('cx-extensions', 'system', 'Extensions', 'signed third-party manifests · per-passport grants', { load: { endpoint: '/v1/extensions', build: buildExtensions } }),
     'cx-workbench': page('cx-workbench', 'system', 'Workbench', 'operator tooling over /v1/workbench/* — read tools live, writes gated (M13b)', { load: { endpoint: '/v1/workbench/contract', build: buildWorkbench } }),
