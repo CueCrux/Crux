@@ -7,7 +7,7 @@
 //!
 //! ExecPlan `crux-runtime-codemap-and-agent-query-api-2026-07-27`, milestone M4.
 //!
-//! Drains the M2 [`SpanRing`], resolves each span's `(file, name, line)` to a
+//! Drains the M2 [`SpanRing`](crux_observe::span_layer::SpanRing), resolves each span's `(file, name, line)` to a
 //! stable `symbol_id` via M1's resolver, and appends the result to a rolling
 //! JSONL file under the data dir.
 //!

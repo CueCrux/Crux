@@ -1597,4 +1597,3 @@ fn code_liveness_never_reports_an_unseen_symbol_as_dead() {
         "an empty observation window must not yield a `dead` verdict, got {verdict:?}"
     );
 }
-

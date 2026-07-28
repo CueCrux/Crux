@@ -12,8 +12,8 @@
 //!
 //! # Why the key is `(file, name)` and not the line
 //!
-//! Measured over the Crux workspace at 93b41a7 (17,725 symbols — see
-//! `PlanCrux/artifacts/codemap-baseline-2026-07-27.md`):
+//! Measured over the Crux workspace at 93b41a7 (17,725 symbols; reproduce with
+//! `cargo run -p corecruxd --example symbol_resolve_gate`):
 //!
 //! * `line == 0` never occurs (0.00%), so scanner line numbers *are* reliable;
 //! * but `(file, name)` alone leaves **2.02%** of symbols ambiguous — 134 keys
@@ -26,7 +26,7 @@
 //!
 //! So: `(file, name)` selects a candidate set, and `line` disambiguates within
 //! it by proximity. A collision that cannot be separated returns
-//! [`Confidence::Ambiguous`] — never a confident wrong answer. Mis-attributing
+//! [`Resolution::Ambiguous`] — never a confident wrong answer. Mis-attributing
 //! a trace to the wrong symbol is silently corrupting, so this module treats
 //! "I don't know" as the correct output rather than a failure.
 

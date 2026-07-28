@@ -39,6 +39,19 @@
 #   gate tests) — #[cfg(test)] only, counted because tests.rs is an out-of-file
 #   #[path] mod; zero production-path additions (require_sync_peer /
 #   verify_sync_delegation use Result/Option, no unwrap/expect).
+# 2026-07-28 +4 corecruxd, +39 crux-mcp: all in examples/ measurement harnesses
+# for the runtime code-map programme — corecruxd/examples/symbol_resolve_gate.rs
+# (the M1 resolution gate) and crux-mcp/examples/code_intel_{control,treatment,
+# score}.rs (the M0/M2/M3 benchmark arms). Every one carries
+# #![allow(clippy::expect_used, clippy::unwrap_used)] and follows the existing
+# examples/token_bench.rs precedent: a benchmark that panics on malformed input
+# is correct — the alternative is a harness that swallows an error and reports a
+# number that is quietly wrong. ZERO production-path additions in either crate
+# (verified by diff: crux-mcp/src/tools/code_intel.rs adds 0 sites).
+# Observation for the operator, deliberately NOT acted on here: count_sites()
+# excludes */tests/* but not */examples/*. Widening that exclusion would reduce
+# the ratchet's coverage for every crate, so it is a decision to take on its own
+# merits rather than a side effect of making this PR pass.
 corecrux-frame 0
 corecrux-index 3
 corecrux-memory 0
@@ -55,7 +68,7 @@ corecruxctl 9
 # studio library GET/install family 10 incl. locally-served signed index + pack
 # servers) — all #[cfg(test)]-gated via mod.rs; zero production-path additions
 # (verified per-file against origin/main: every non-tests.rs delta is 0).
-corecruxd 849
+corecruxd 853
 crux-claude-hooks 1
 crux-config-wizard 8
 crux-contrib 0
@@ -64,7 +77,7 @@ crux-enterprise-shim 0
 crux-integration-tests 7
 crux-integrations 0
 crux-lens-features 0
-crux-mcp 114
+crux-mcp 153
 crux-observe-api 0
 crux-observe 9
 crux-router 0
