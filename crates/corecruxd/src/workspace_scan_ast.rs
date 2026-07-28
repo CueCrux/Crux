@@ -72,6 +72,10 @@ pub(crate) struct CachedFile {
     deps: Vec<DepEdge>,
     routes: Vec<ParsedRoute>,
     ident_refs: HashMap<String, usize>,
+    /// Same counts, but excluding anything inside a `#[cfg(test)]` scope.
+    /// The difference between the two is what makes "referenced only by tests"
+    /// sayable — a category invisible to every reference-counting tier.
+    ident_refs_nontest: HashMap<String, usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +165,7 @@ fn assemble_scan_at(root: &Path, cache: &AstScanCache, started_ms: u64) -> Works
     let mut file_idx_by_path: HashMap<String, usize> = HashMap::new();
     let mut local_symbol_to_global: HashMap<(String, usize), usize> = HashMap::new();
     let mut ident_refs: HashMap<String, usize> = HashMap::new();
+    let mut ident_refs_nontest: HashMap<String, usize> = HashMap::new();
 
     for cname in &cache.crate_order {
         let Some(crate_root) = cache.crate_dirs.get(cname) else {
@@ -196,6 +201,9 @@ fn assemble_scan_at(root: &Path, cache: &AstScanCache, started_ms: u64) -> Works
             }
             for (ident, count) in &file.ident_refs {
                 *ident_refs.entry(ident.clone()).or_insert(0) += *count;
+            }
+            for (ident, count) in &file.ident_refs_nontest {
+                *ident_refs_nontest.entry(ident.clone()).or_insert(0) += *count;
             }
         }
         scan.crates.push(CrateInfo {
@@ -234,6 +242,7 @@ fn assemble_scan_at(root: &Path, cache: &AstScanCache, started_ms: u64) -> Works
     resolve_references(&mut scan, &index, &file_idx_by_path);
     build_referenced_by(&mut scan);
     compute_dead_code(&mut scan, &ident_refs);
+    compute_test_only(&mut scan, &ident_refs, &ident_refs_nontest);
     crate::workspace_scan_manifests::attach_external_deps_if_enabled(root, &mut scan);
     roll_up_stats(&mut scan);
     scan
@@ -613,6 +622,8 @@ fn collect_calls(block: &syn::Block) -> Vec<CallRef> {
 #[derive(Default)]
 struct IdentRefCollector {
     counts: HashMap<String, usize>,
+    /// When set, `#[cfg(test)]` items are not descended into.
+    skip_test_scopes: bool,
 }
 
 impl<'ast> Visit<'ast> for IdentRefCollector {
@@ -645,6 +656,42 @@ impl<'ast> Visit<'ast> for IdentRefCollector {
         self.visit_use_tree_idents(&item.tree);
         syn::visit::visit_item_use(self, item);
     }
+
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        if self.skip_test_scopes && item_is_cfg_test(item) {
+            return;
+        }
+        syn::visit::visit_item(self, item);
+    }
+}
+
+/// True when an item carries `#[cfg(test)]`.
+///
+/// Matched on the attribute's tokens rather than by parsing the full `cfg`
+/// grammar: `cfg(test)` and `cfg(all(test, …))` both mention `test` at the top
+/// level, and anything cleverer would be guessing. Over-matching here would
+/// hide a real reference, so the check stays literal.
+fn item_is_cfg_test(item: &syn::Item) -> bool {
+    let attrs: &[syn::Attribute] = match item {
+        syn::Item::Mod(m) => &m.attrs,
+        syn::Item::Fn(f) => &f.attrs,
+        syn::Item::Impl(i) => &i.attrs,
+        syn::Item::Struct(s) => &s.attrs,
+        syn::Item::Enum(e) => &e.attrs,
+        _ => return false,
+    };
+    attrs.iter().any(|a| match &a.meta {
+        // `cfg(test)`, `cfg(all(test, …))`, `cfg(any(test, …))` all mention
+        // `test` as a bare token inside the list.
+        syn::Meta::List(list) if a.path().is_ident("cfg") => {
+            list.tokens
+                .clone()
+                .into_iter()
+                .any(|t| matches!(t, proc_macro2::TokenTree::Ident(ref i) if i == "test"))
+                || list.tokens.to_string().replace(' ', "").contains("(test")
+        }
+        _ => false,
+    })
 }
 
 impl IdentRefCollector {
@@ -694,6 +741,18 @@ fn collect_identifier_refs(file: &syn::File, into: &mut HashMap<String, usize>) 
     }
 }
 
+/// As [`collect_identifier_refs`], but blind to everything under `#[cfg(test)]`.
+fn collect_identifier_refs_nontest(file: &syn::File, into: &mut HashMap<String, usize>) {
+    let mut collector = IdentRefCollector {
+        skip_test_scopes: true,
+        ..IdentRefCollector::default()
+    };
+    collector.visit_file(file);
+    for (ident, count) in collector.counts {
+        *into.entry(ident).or_insert(0) += count;
+    }
+}
+
 fn parse_file_ast(
     root: &Path,
     crate_name: &str,
@@ -730,6 +789,12 @@ fn parse_file_ast(
     if let Ok(parsed) = syn::parse_file(&src) {
         let mut ident_refs = HashMap::new();
         collect_identifier_refs(&parsed, &mut ident_refs);
+        // Second pass with test scopes elided. A file that *is* a test file
+        // contributes nothing here: every reference in it is a test reference.
+        let mut ident_refs_nontest = HashMap::new();
+        if !is_test_file {
+            collect_identifier_refs_nontest(&parsed, &mut ident_refs_nontest);
+        }
         let mut line_lookup = LineLookup::new(&src);
         index_items(
             &mut parts,
@@ -760,6 +825,7 @@ fn parse_file_ast(
             deps: parts.deps,
             routes: parse_routes_in_source(&src, &rel_str),
             ident_refs,
+            ident_refs_nontest,
         })
     } else {
         Ok(CachedFile {
@@ -779,6 +845,7 @@ fn parse_file_ast(
             deps: Vec::new(),
             routes: parse_routes_in_source(&src, &rel_str),
             ident_refs: HashMap::new(),
+            ident_refs_nontest: HashMap::new(),
         })
     }
 }
@@ -1240,6 +1307,35 @@ fn compute_dead_code(scan: &mut WorkspaceScan, ident_refs: &HashMap<String, usiz
             });
         }
     }
+}
+
+/// Name the symbols that are referenced, but only ever from tests.
+///
+/// Runs after `compute_dead_code` and is deliberately disjoint from it: a
+/// symbol with zero references anywhere is dead, not test-only. The distinction
+/// an agent needs is between "nothing uses this" and "only its own test uses
+/// this", and those call for different actions.
+fn compute_test_only(
+    scan: &mut WorkspaceScan,
+    ident_refs: &HashMap<String, usize>,
+    ident_refs_nontest: &HashMap<String, usize>,
+) {
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    for sym in &scan.symbols {
+        if !sym.is_pub || sym.name.starts_with('_') || sym.name.len() < 4 {
+            continue;
+        }
+        let all = ident_refs.get(&sym.name).copied().unwrap_or(0);
+        let nontest = ident_refs_nontest.get(&sym.name).copied().unwrap_or(0);
+        // `all > 0` excludes the genuinely dead; `nontest == 0` is the claim.
+        // A definition site counts as a reference to itself in the non-test map
+        // when the symbol lives outside a test scope, so a production symbol
+        // never lands here on the strength of its own declaration alone.
+        if all > 0 && nontest == 0 {
+            out.insert(sym.name.clone());
+        }
+    }
+    scan.test_only_symbols = out.into_iter().collect();
 }
 
 fn roll_up_stats(scan: &mut WorkspaceScan) {

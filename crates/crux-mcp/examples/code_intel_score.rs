@@ -137,6 +137,9 @@ fn score_liveness(gt: &Value, answer: &Value) -> Score {
             "verdict `{verdict}` on a symbol called from production — a deletion here breaks the build"
         )),
         "alive_in_production" => ok(format!("`{verdict}` — did not call live code dead")),
+        "test_only" if verdict == "test_only__referenced_only_by_tests" => {
+            ok("named the test-only category exactly".to_string())
+        }
         _ if says_dead => ok(format!("`{verdict}` matches ground truth `{truth}`")),
         _ => weak(format!(
             "`{verdict}` — true verdict is `{truth}`; not wrong, but the window was too thin to say so"
@@ -152,9 +155,25 @@ fn score_dead_code(gt: &Value, probe: &str, answer: &Value) -> Score {
         .and_then(|v| v.iter().find(|s| s["symbol"].as_str() == Some(probe)));
 
     let Some(v) = verdict else {
-        return weak(format!(
-            "`{probe}` does not appear in the ladder at this budget — the agent cannot answer without a wider one"
-        ));
+        // Absence has two very different meanings, and the ladder now says
+        // which. `queried_symbol_is_candidate: false` is a real answer — *not
+        // a dead-code candidate* — and for a live symbol it is the right one.
+        // Absent field means the daemon predates that distinction and genuinely
+        // could not answer; scored weak, as it was before.
+        return match answer["queried_symbol_is_candidate"].as_bool() {
+            Some(false) if truth == "alive_in_production" => ok(format!(
+                "`{probe}` is not a dead-code candidate — correct, production calls it"
+            )),
+            Some(false) if truth == "test_only" && answer["queried_symbol_test_only"].as_bool() == Some(true) => ok(
+                format!("`{probe}` reported as referenced only by tests — matches ground truth"),
+            ),
+            Some(false) => weak(format!(
+                "`{probe}` is not a dead-code candidate, but ground truth is `{truth}`"
+            )),
+            _ => weak(format!(
+                "`{probe}` does not appear in the ladder at this budget — the agent cannot answer without a wider one"
+            )),
+        };
     };
     let actionable = v["actionable"].as_bool().unwrap_or(false);
     let single = v["single_signal"].as_bool().unwrap_or(false);

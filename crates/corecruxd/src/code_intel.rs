@@ -290,6 +290,11 @@ pub struct Liveness {
     pub exists_statically: bool,
     /// Flagged dead by the AST reachability tier.
     pub flagged_dead_static: bool,
+    /// Referenced in the workspace, but only ever from tests.
+    ///
+    /// Distinct from both dead and live: something uses it, and nothing that
+    /// ships does. Deleting it is a decision about the test.
+    pub referenced_only_by_tests: bool,
     /// The joined verdict, spelled out so a caller does not have to infer it.
     pub verdict: &'static str,
     /// True when the symbol's own file executed in this window, so a runtime
@@ -304,6 +309,7 @@ pub fn liveness(scan: &WorkspaceScan, spans: &[StoredSpan], symbol: &str) -> Liv
     let executions: Vec<&StoredSpan> = spans.iter().filter(|s| s.span.name == symbol).collect();
     let exists = scan.symbols.iter().any(|s| s.name == symbol);
     let flagged_dead = scan.dead_code.iter().any(|d| d.name == symbol);
+    let test_only = scan.test_only_symbols.iter().any(|n| n == symbol);
     let executed = !executions.is_empty();
 
     // Did the runtime tier get a chance to speak about this symbol at all?
@@ -331,6 +337,10 @@ pub fn liveness(scan: &WorkspaceScan, spans: &[StoredSpan], symbol: &str) -> Liv
         // Static says dead, runtime never ran the file: one tier, not two.
         (true, true, false, false) => "dead_candidate__static_only__runtime_window_never_reached_it",
         (true, false, true, _) => "live",
+        // Referenced, but only by tests, and never seen running. Neither dead
+        // nor live — the answer "reachable_but_unobserved" was true and useless,
+        // because the thing keeping it reachable is its own test.
+        (true, false, false, _) if test_only => "test_only__referenced_only_by_tests",
         (true, false, false, _) => "reachable_but_unobserved__widen_the_window",
     };
 
@@ -341,6 +351,7 @@ pub fn liveness(scan: &WorkspaceScan, spans: &[StoredSpan], symbol: &str) -> Liv
         total_ns: executions.iter().map(|s| s.span.duration_ns).sum(),
         exists_statically: exists,
         flagged_dead_static: flagged_dead,
+        referenced_only_by_tests: test_only,
         verdict,
         runtime_had_evidence,
         window: Window::of(spans),
@@ -532,6 +543,75 @@ mod tests {
             1,
             "counts must describe the answer returned, not the repo behind it"
         );
+    }
+
+    /// "Is X safe to delete" when X is not a dead-code candidate at all.
+    ///
+    /// The ladder used to answer this with an empty list, which reads exactly
+    /// like "your budget truncated it away" — the opposite conclusion from the
+    /// true one. The answer has to be sayable.
+    #[test]
+    fn the_ladder_says_not_a_candidate_rather_than_answering_with_silence() {
+        let scan = scan_with(vec!["alive", "ghost"], vec!["ghost"]);
+
+        let alive = dead_code_ladder(&scan, &[], Some("alive"), 2000);
+        assert!(alive.verdicts.is_empty());
+        assert_eq!(alive.queried_symbol.as_deref(), Some("alive"));
+        assert_eq!(
+            alive.queried_symbol_is_candidate,
+            Some(false),
+            "an empty verdict list must be distinguishable from a truncated one"
+        );
+        assert!(!alive.truncated, "nothing was dropped — it was never a candidate");
+
+        let ghost = dead_code_ladder(&scan, &[], Some("ghost"), 2000);
+        assert_eq!(ghost.queried_symbol_is_candidate, Some(true));
+        assert_eq!(ghost.verdicts.len(), 1);
+
+        // Repo-wide queries say nothing about a symbol, because none was asked for.
+        let all = dead_code_ladder(&scan, &[], None, 2000);
+        assert_eq!(all.queried_symbol, None);
+        assert_eq!(all.queried_symbol_is_candidate, None);
+    }
+
+    /// The third category: referenced, but only by tests. Every
+    /// reference-counting tier calls this alive and every execution tier calls
+    /// it unobserved, so before this neither could name it.
+    #[test]
+    fn liveness_names_the_test_only_category() {
+        let mut scan = scan_with(vec!["helper"], vec![]);
+        scan.test_only_symbols = vec!["helper".to_string()];
+        let l = liveness(&scan, &[], "helper");
+        assert!(l.referenced_only_by_tests);
+        assert_eq!(l.verdict, "test_only__referenced_only_by_tests");
+        assert!(!l.executed);
+        assert!(!l.flagged_dead_static, "it is referenced, so it is not dead");
+    }
+
+    /// A production symbol must never be mistaken for a test-only one, since
+    /// the two point at opposite actions.
+    #[test]
+    fn a_production_symbol_is_not_test_only() {
+        let scan = scan_with(vec!["shipped"], vec![]);
+        let l = liveness(&scan, &[], "shipped");
+        assert!(!l.referenced_only_by_tests);
+        assert_eq!(l.verdict, "reachable_but_unobserved__widen_the_window");
+    }
+
+    /// "Not a dead-code candidate" is true of both a production symbol and a
+    /// test-only one. The ladder has to say which.
+    #[test]
+    fn the_ladder_distinguishes_test_only_from_production() {
+        let mut scan = scan_with(vec!["shipped", "helper"], vec![]);
+        scan.test_only_symbols = vec!["helper".to_string()];
+
+        let helper = dead_code_ladder(&scan, &[], Some("helper"), 2000);
+        assert_eq!(helper.queried_symbol_is_candidate, Some(false));
+        assert_eq!(helper.queried_symbol_test_only, Some(true));
+
+        let shipped = dead_code_ladder(&scan, &[], Some("shipped"), 2000);
+        assert_eq!(shipped.queried_symbol_is_candidate, Some(false));
+        assert_eq!(shipped.queried_symbol_test_only, Some(false));
     }
 
     #[test]
@@ -876,6 +956,25 @@ pub struct DeadCodeLadder {
     /// corpus for the extractor, not merely a defect list.
     pub extractor_false_positives: Vec<String>,
     pub window: Window,
+    /// Echoes the `symbol` filter, so a caller can tell a scoped answer from a
+    /// repo-wide one without tracking what it asked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queried_symbol: Option<String>,
+    /// Whether the queried symbol is a dead-code candidate at all.
+    ///
+    /// `Some(false)` is a real answer to "is this safe to delete" — *no, it is
+    /// not even a candidate* — and it is the answer for every live symbol. An
+    /// empty `verdicts` list alone could not say that: it read identically to
+    /// "your budget truncated it away", which is the opposite conclusion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queried_symbol_is_candidate: Option<bool>,
+    /// Set when the queried symbol is referenced only from tests.
+    ///
+    /// "Not a dead-code candidate" is true of a production symbol and of a
+    /// test-only one, and they call for opposite actions, so the ladder says
+    /// which rather than leaving the caller to assume the safer-sounding one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queried_symbol_test_only: Option<bool>,
     pub truncated: bool,
     pub omitted: usize,
     /// Set when even a single verdict could not fit the requested budget.
@@ -978,6 +1077,8 @@ pub fn dead_code_ladder(
     // it returned 11 verdicts of 229 and dropped the one that was asked about.
     // Filtering here rather than making the caller page through the ladder is
     // the difference between an answer and a payload.
+    let queried_symbol_is_candidate = symbol.map(|want| verdicts.iter().any(|v| v.symbol == want));
+    let queried_symbol_test_only = symbol.map(|want| scan.test_only_symbols.iter().any(|n| n == want));
     if let Some(want) = symbol {
         verdicts.retain(|v| v.symbol == want);
     }
@@ -1018,6 +1119,9 @@ pub fn dead_code_ladder(
         verdicts: kept,
         counts,
         extractor_false_positives: false_positives,
+        queried_symbol: symbol.map(str::to_string),
+        queried_symbol_is_candidate,
+        queried_symbol_test_only,
         window: Window::of(spans),
         truncated: omitted > 0,
         omitted,
