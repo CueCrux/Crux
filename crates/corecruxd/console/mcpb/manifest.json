@@ -1,0 +1,50 @@
+{
+  "manifest_version": "0.3",
+  "name": "crux",
+  "display_name": "Crux Daemon",
+  "version": "0.1.0",
+  "description": "Local-first memory, retrieval, and receipts backend for agents (MCP over Streamable HTTP).",
+  "long_description": "Connects Claude Desktop to a Crux Daemon: durable facts, token-budgeted retrieval, sessions, cross-agent handoffs, and receipted mutations. The daemon runs on your machine or your tailnet; nothing is sent anywhere else.",
+  "author": { "name": "CueCrux" },
+  "homepage": "https://cuecrux.com",
+  "license": "LicenseRef-CCL-1.0",
+  "keywords": ["memory", "retrieval", "receipts", "local-first", "agents"],
+  "server": {
+    "type": "node",
+    "entry_point": "server/node_modules/mcp-remote/dist/proxy.js",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/server/node_modules/mcp-remote/dist/proxy.js",
+        "${user_config.server_url}",
+        "--transport",
+        "http-only",
+        "--allow-http",
+        "--header",
+        "Authorization:${CRUX_AUTH_HEADER}"
+      ],
+      "env": {
+        "CRUX_AUTH_HEADER": "Bearer ${user_config.agent_token}"
+      }
+    }
+  },
+  "user_config": {
+    "server_url": {
+      "type": "string",
+      "title": "Crux MCP endpoint",
+      "description": "Streamable-HTTP MCP URL. Public daemon: https://crux.cuecrux.com/mcp (no port). Same machine: http://127.0.0.1:14801/mcp. Tailnet: http://<tailnet-ip>:14801/mcp.",
+      "default": "https://crux.cuecrux.com/mcp",
+      "required": true
+    },
+    "agent_token": {
+      "type": "string",
+      "title": "Agent token",
+      "description": "The daemon's CRUX_AGENT_TOKEN. Paste the raw token only — the 'Bearer ' prefix is added for you. Find it on the console's Connections page. Leave blank only if the daemon runs without token auth.",
+      "sensitive": true,
+      "required": false
+    }
+  },
+  "compatibility": {
+    "runtimes": { "node": ">=18.0.0" }
+  }
+}

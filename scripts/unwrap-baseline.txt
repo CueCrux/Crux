@@ -68,7 +68,13 @@ corecruxctl 9
 # studio library GET/install family 10 incl. locally-served signed index + pack
 # servers) — all #[cfg(test)]-gated via mod.rs; zero production-path additions
 # (verified per-file against origin/main: every non-tests.rs delta is 0).
-corecruxd 853
+# 2026-07-28 +3 corecruxd: GET /v1/console/connections token-non-disclosure
+# tests in http/tests.rs (payload serialises x2, fingerprint present) — that
+# file carries no in-file #[cfg(test)] attribute (it is gated from mod.rs), so
+# the scan counts it. The sibling console.rs assertion added by the same PR sits
+# after an in-file #[cfg(test)] and is correctly excluded. Zero production-path
+# additions (verified per-file against origin/main).
+corecruxd 856
 crux-claude-hooks 1
 crux-config-wizard 8
 crux-contrib 0

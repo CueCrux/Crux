@@ -230,7 +230,9 @@ function walkPage(page, fn) {
   // the agent dossier board (phase 4), custom-rendered because a markdown
   // narrative and a nested claim/evidence shape are not expressible in the
   // control model.
-  const nativeExtra = new Set(['cx-activity-log', 'cx-mints', 'cx-storybook']);
+  // cx-connections is System › Connections — how a client reaches THIS daemon
+  // (MCP endpoints, the agent-token rail, the Claude Desktop .mcpb bundle).
+  const nativeExtra = new Set(['cx-activity-log', 'cx-mints', 'cx-storybook', 'cx-connections']);
   Object.keys(pages.PAGES).forEach(function (id) {
     if (LEGACY_26.indexOf(id) >= 0) { return; }
     if (nativeExtra.has(id)) {

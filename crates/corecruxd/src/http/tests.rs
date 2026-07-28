@@ -10307,6 +10307,87 @@ async fn console_settings_get_returns_running_and_chosen_state() {
     assert!(body["onboarding"]["completed_at_unix_ms"].is_null());
 }
 
+/// The reason this route is allowed to exist. The console is publicly exposed and
+/// the agent token authenticates the whole MCP surface, so "no raw token in the
+/// body unless explicitly armed" is the security boundary — not a nicety.
+#[tokio::test]
+#[serial_test::serial]
+async fn console_connections_never_reveals_the_token_by_default() {
+    const AGENT_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
+    let _token = EnvVarGuard::set("CRUX_AGENT_TOKEN", AGENT_TOKEN);
+    let _tokens = EnvVarGuard::unset("CRUX_AGENT_TOKENS");
+    let _reveal = EnvVarGuard::unset("CORECRUXD_CONSOLE_REVEAL_AGENT_TOKEN");
+
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::get_console_connections(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    assert_eq!(body["agent_token"]["configured"], true);
+    assert_eq!(body["agent_token"]["reveal_enabled"], false);
+    assert!(
+        body["agent_token"]["token"].is_null(),
+        "raw token must be absent when the reveal flag is unset"
+    );
+    // Belt and braces: the token must not appear ANYWHERE in the payload — not
+    // in a hint string, not in a fingerprint, not in a URL.
+    let serialised = serde_json::to_string(&body).expect("body serialises");
+    assert!(
+        !serialised.contains(AGENT_TOKEN),
+        "agent token leaked into the connections payload: {serialised}"
+    );
+    // The fingerprint identifies the credential without disclosing it.
+    let fingerprint = body["agent_token"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint present");
+    assert_eq!(fingerprint.len(), 8);
+    assert!(
+        !AGENT_TOKEN.contains(fingerprint),
+        "fingerprint is a digest, not a token slice"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn console_connections_reveals_the_token_when_explicitly_armed() {
+    const AGENT_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
+    let _token = EnvVarGuard::set("CRUX_AGENT_TOKEN", AGENT_TOKEN);
+    let _tokens = EnvVarGuard::unset("CRUX_AGENT_TOKENS");
+    let _reveal = EnvVarGuard::set("CORECRUXD_CONSOLE_REVEAL_AGENT_TOKEN", "1");
+
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::get_console_connections(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["agent_token"]["reveal_enabled"], true);
+    assert_eq!(body["agent_token"]["token"], AGENT_TOKEN);
+}
+
+/// Per-agent tokens are a map of other people's credentials; the reveal flag is a
+/// single-token affordance and must not spill the map.
+#[tokio::test]
+#[serial_test::serial]
+async fn console_connections_never_reveals_named_agent_tokens() {
+    const AGENT_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
+    let _tokens = EnvVarGuard::set("CRUX_AGENT_TOKENS", &format!("alice:{AGENT_TOKEN}"));
+    let _reveal = EnvVarGuard::set("CORECRUXD_CONSOLE_REVEAL_AGENT_TOKEN", "1");
+
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::get_console_connections(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    let body = json_body(resp).await;
+    let serialised = serde_json::to_string(&body).expect("body serialises");
+    assert!(
+        !serialised.contains(AGENT_TOKEN),
+        "named agent token leaked even though only the single-token rail is revealable: {serialised}"
+    );
+    assert_eq!(body["agent_token"]["agent_names"], "alice");
+}
+
 #[tokio::test]
 async fn console_settings_put_persists_choices_and_flags_restart() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);

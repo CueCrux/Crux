@@ -3161,6 +3161,121 @@ fn require_console_read(state: &AppState, headers: &HeaderMap) -> Result<(), cra
     require_http_scopes(&state.auth, headers, &["admin:read"])
 }
 
+/// Opt-in for returning the raw agent token from `GET /v1/console/connections`.
+///
+/// Default OFF, and it must stay that way. The console is publicly exposed
+/// (`crux.cuecrux.com`), and the agent token is the credential for the entire MCP
+/// surface — a route that hands it back is a credential-disclosure route, so the
+/// operator has to arm it deliberately on a daemon they administer.
+///
+/// Note for anyone tempted to replace this with a peer-address check: the public
+/// console is proxied by Caddy on the same host, so every public request arrives
+/// from loopback. `auth_rails::peer_identity_trusted` would return `true` for the
+/// open internet — an address gate here would leak the token while looking like a
+/// security control.
+const CONSOLE_REVEAL_AGENT_TOKEN_ENV: &str = "CORECRUXD_CONSOLE_REVEAL_AGENT_TOKEN";
+
+/// Non-reversible identifier for a token: first 8 hex of its SHA-256.
+///
+/// Enough for an operator to confirm the console, the daemon env, and their
+/// client all mean the same credential, without disclosing any of it. Deliberately
+/// a digest prefix rather than a slice of the token itself.
+fn token_fingerprint(token: &str) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(token.as_bytes());
+    hex::encode(digest)[..8].to_string()
+}
+
+/// `GET /v1/console/connections` — how a client connects to this daemon.
+///
+/// Returns endpoint URLs plus the state of the agent-token rail. The token's raw
+/// value is included ONLY when `CORECRUXD_CONSOLE_REVEAL_AGENT_TOKEN=1`; otherwise
+/// the response carries a fingerprint and length so the operator can identify the
+/// credential without the route disclosing it.
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn get_console_connections(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Err(problem) = require_console_read(&state, &headers) {
+        return problem.into_response();
+    }
+
+    // Mirrors the resolution order in `crux_mcp::agent`: the multi-agent map
+    // wins, then the single-token var.
+    let named = std::env::var("CRUX_AGENT_TOKENS").ok().filter(|s| !s.trim().is_empty());
+    let single = std::env::var("CRUX_AGENT_TOKEN").ok().filter(|s| !s.trim().is_empty());
+
+    let reveal = super::auth_rails::env_flag_enabled(CONSOLE_REVEAL_AGENT_TOKEN_ENV);
+    let (source, token) = match (&named, &single) {
+        // `name:token,name:token` — report the names, never the secrets, and
+        // leave reveal to the single-token rail.
+        (Some(raw), _) => {
+            let names: Vec<&str> = raw
+                .split(',')
+                .filter_map(|pair| pair.split_once(':').map(|(name, _)| name.trim()))
+                .filter(|name| !name.is_empty())
+                .collect();
+            ("CRUX_AGENT_TOKENS", Some((names.join(", "), None::<String>)))
+        }
+        (None, Some(tok)) => ("CRUX_AGENT_TOKEN", Some((String::new(), Some(tok.clone())))),
+        (None, None) => ("", None),
+    };
+
+    let token_json = match token {
+        None => serde_json::json!({
+            "configured": false,
+            "hint": "no CRUX_AGENT_TOKEN or CRUX_AGENT_TOKENS in the daemon environment; \
+                     this daemon accepts MCP requests without a bearer token",
+        }),
+        Some((names, raw)) => {
+            let mut obj = serde_json::json!({
+                "configured": true,
+                "source_env": source,
+                "reveal_enabled": reveal,
+            });
+            if !names.is_empty() {
+                obj["agent_names"] = serde_json::json!(names);
+            }
+            if let Some(raw) = raw {
+                obj["fingerprint"] = serde_json::json!(token_fingerprint(&raw));
+                obj["length"] = serde_json::json!(raw.len());
+                if reveal {
+                    obj["token"] = serde_json::json!(raw);
+                } else {
+                    obj["hint"] = serde_json::json!(format!(
+                        "set {CONSOLE_REVEAL_AGENT_TOKEN_ENV}=1 on this daemon to reveal the \
+                         token here, or read {source} from the daemon's environment file"
+                    ));
+                }
+            } else {
+                obj["hint"] = serde_json::json!(
+                    "per-agent tokens are never revealed here; read CRUX_AGENT_TOKENS from the \
+                     daemon's environment file"
+                );
+            }
+            obj
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "mcp": {
+                "path": "/mcp",
+                "local_url": "http://127.0.0.1:14801/mcp",
+                "note": "the MCP port (14801) is separate from this HTTP port (14800); a public \
+                         deployment usually proxies /mcp on 443 instead of exposing 14801",
+            },
+            "agent_token": token_json,
+            "claude_desktop": {
+                "bundle_url": "/console-assets/crux.mcpb",
+                "filename": "crux.mcpb",
+                "install": "download, then drag onto Claude Desktop's Settings → Extensions pane",
+                "prompts_for": ["server_url", "agent_token"],
+            },
+        })),
+    )
+        .into_response()
+}
+
 #[allow(clippy::result_large_err)]
 fn require_console_write(state: &AppState, headers: &HeaderMap) -> Result<(), crate::problem::ProblemResponse> {
     require_http_scopes(&state.auth, headers, &["admin:write"])
