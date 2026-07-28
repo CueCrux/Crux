@@ -905,7 +905,14 @@ fn cold_block_path_v1(base_dir: &Path, blake3_bytes: &[u8; 32]) -> PathBuf {
     base_dir.join(prefix).join(format!("{hex}.ccxblk"))
 }
 
+// Fallible only on unix; off-unix the body compiles away and the Result looks
+// redundant to clippy. The signature is shared, so suppress rather than change it.
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn fsync_dir(path: &Path) -> std::io::Result<()> {
+    // Directory fsync is a no-op off unix; bind the parameter so the
+    // workspace-wide `unused_variables = "deny"` does not fail the build there.
+    #[cfg(not(unix))]
+    let _ = path;
     #[cfg(unix)]
     {
         let dir = std::fs::File::open(path)?;

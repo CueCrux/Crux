@@ -1897,6 +1897,9 @@ fn read_frame_bytes_physical(path: &Path, offset: u64) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+// Fallible only on unix; off-unix the body compiles away and the Result looks
+// redundant to clippy. The signature is shared, so suppress rather than change it.
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn fsync_dir(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {

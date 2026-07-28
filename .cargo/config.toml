@@ -6,3 +6,11 @@
 # parser overflows the default 2 MiB test-thread stack (first hit when the
 # deploy-audit subcommand landed). Applies to cargo-spawned processes only.
 RUST_MIN_STACK = "8388608"
+
+# aws-lc-sys (via jsonwebtoken -> aws-lc-rs) assembles its x86_64 Windows
+# routines with NASM, which is not part of a default Windows toolchain — a cold
+# `cargo build` there dies in the build script. The crate ships pre-assembled
+# objects for exactly this case. Inert elsewhere: the prebuilt path is gated on
+# target_os = "windows" and target_arch = "x86_64", so Linux and macOS builds
+# are unaffected. Does not override the variable if it is already exported.
+AWS_LC_SYS_PREBUILT_NASM = "1"
