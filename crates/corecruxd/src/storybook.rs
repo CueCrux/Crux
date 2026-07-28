@@ -178,9 +178,9 @@ pub fn generate(store: &corecrux_memory::FactStore, input: GenerateInput<'_>) ->
         }
         let plane_kws = extract_keywords(&pool);
 
-        let candidate_modules = match &workspace_scan {
-            Some(ws) => match_plane_to_modules(&plane_kws, ws),
-            None => Vec::new(),
+        let (candidate_modules, module_source) = match &workspace_scan {
+            Some(ws) => resolve_plane_modules(&plane_layers, &plane_kws, ws),
+            None => (Vec::new(), ModuleSource::KeywordOverlap),
         };
         if !candidate_modules.is_empty() {
             planes_with_modules += 1;
@@ -256,7 +256,12 @@ pub fn generate(store: &corecrux_memory::FactStore, input: GenerateInput<'_>) ->
         }
         if !candidate_modules.is_empty() {
             sec.push_str(&format!(
-                "- **Inferred matching crates** (keyword overlap, confidence ~0.5): {}\n",
+                "- **{}**: {}\n",
+                if module_source == ModuleSource::Declared {
+                    "Declared crates (plane `modules` layer)"
+                } else {
+                    "Inferred matching crates (keyword overlap, confidence ~0.5)"
+                },
                 candidate_modules
                     .iter()
                     .map(|m| format!("`{m}`"))
@@ -543,14 +548,55 @@ pub fn extract_keywords_pub(text: &str) -> HashSet<String> {
     extract_keywords(text)
 }
 
-/// Public alias for the keyword-overlap → matching crates routine, so the
-/// dossier auto-generator emits `implements` claims that are identical to
-/// the storybook's coverage matrix.
-pub fn match_plane_to_modules_pub(
+/// How a plane's crate set was arrived at. The two are not interchangeable and
+/// a consumer must be able to tell them apart: one is a statement by whoever
+/// owns the plane, the other is a guess from word overlap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleSource {
+    /// Read from the plane's `modules` layer.
+    Declared,
+    /// Derived from keyword overlap between the plane's prose and crate names.
+    KeywordOverlap,
+}
+
+/// Resolve a plane's crates, preferring a declaration over inference.
+///
+/// Replaces the old `match_plane_to_modules_pub` alias, which could only ever
+/// return the guess. The storybook and the dossier both call this, so their
+/// `implements` claims stay identical — that was the alias's purpose and it is
+/// preserved.
+///
+/// The plane-layer key is free-form (`PUT .../planes/{plane}/layers/{layer}`
+/// validates only non-empty and no `::`), so `modules` needs no schema change —
+/// it is a layer like `vision` and `goals`. An assessment of this join recorded
+/// it as blocked on "a plane→route schema decision"; that was wrong, the
+/// mechanism was already there.
+///
+/// Accepts comma-, newline- or whitespace-separated crate names, and keeps only
+/// names the scan actually knows so a typo cannot invent a crate. A declaration
+/// that matches nothing falls through to inference rather than silently
+/// emptying the plane: an all-typo declaration is a mistake, not an assertion
+/// that the plane owns no code.
+pub fn resolve_plane_modules(
+    plane_layers: &BTreeMap<String, String>,
     plane_kws: &HashSet<String>,
     scan: &crate::workspace_scan::WorkspaceScan,
-) -> Vec<String> {
-    match_plane_to_modules(plane_kws, scan)
+) -> (Vec<String>, ModuleSource) {
+    if let Some(raw) = plane_layers.get("modules") {
+        let known: BTreeSet<&str> = scan.crates.iter().map(|c| c.name.as_str()).collect();
+        let mut declared: Vec<String> = raw
+            .split([',', '\n', '\r', ' ', '\t'])
+            .map(str::trim)
+            .filter(|t| !t.is_empty() && known.contains(t))
+            .map(str::to_string)
+            .collect();
+        declared.sort();
+        declared.dedup();
+        if !declared.is_empty() {
+            return (declared, ModuleSource::Declared);
+        }
+    }
+    (match_plane_to_modules(plane_kws, scan), ModuleSource::KeywordOverlap)
 }
 
 // ────────────────────────── Helpers ──────────────────────────
@@ -979,7 +1025,7 @@ mod tests {
     fn match_plane_to_modules_via_pub_alias() {
         let scan = crate::workspace_scan::WorkspaceScan::default();
         let kws: HashSet<String> = ["daemon".to_string()].into_iter().collect();
-        let _ = match_plane_to_modules_pub(&kws, &scan);
+        let _ = match_plane_to_modules(&kws, &scan);
         let _ = extract_keywords_pub("hello daemon world");
     }
 
@@ -1068,5 +1114,66 @@ mod tests {
         let w = crate::code_intel::Window::of(&spans);
         assert_eq!(w.spans_examined, 1);
         assert_eq!(w.traces_examined, 1);
+    }
+
+    /// A plane that declares its crates must not be treated as a guess.
+    ///
+    /// The join assessment recorded this as blocked on "a plane→route schema
+    /// decision". It was not: the plane-layer key is free-form, so `modules` is
+    /// a layer like `vision` and no schema change was needed. Recorded here
+    /// because a wrong "blocked" conclusion is the kind that stays believed.
+    #[test]
+    fn a_declared_modules_layer_outranks_keyword_overlap() {
+        let mut scan = crate::workspace_scan::WorkspaceScan::default();
+        scan.crates = vec![
+            crate::workspace_scan::CrateInfo {
+                name: "corecrux-retrieval".into(),
+                rel_path: "crates/corecrux-retrieval".into(),
+                internal_deps: vec![],
+                file_count: 1,
+                total_loc: 10,
+            },
+            crate::workspace_scan::CrateInfo {
+                name: "corecrux-index".into(),
+                rel_path: "crates/corecrux-index".into(),
+                internal_deps: vec![],
+                file_count: 1,
+                total_loc: 10,
+            },
+        ];
+        let kws = extract_keywords("nothing here matches any crate name at all");
+        let mut layers: BTreeMap<String, String> = BTreeMap::new();
+
+        // No declaration ⇒ inference.
+        assert_eq!(
+            resolve_plane_modules(&layers, &kws, &scan).1,
+            ModuleSource::KeywordOverlap
+        );
+
+        // Declared ⇒ used verbatim, and marked as declared.
+        layers.insert("modules".into(), "corecrux-index, corecrux-retrieval".into());
+        let (mods, src) = resolve_plane_modules(&layers, &kws, &scan);
+        assert_eq!(src, ModuleSource::Declared);
+        assert_eq!(mods, vec!["corecrux-index", "corecrux-retrieval"]);
+
+        // Newlines and stray whitespace: an operator writes this by hand.
+        layers.insert("modules".into(), "corecrux-index\n  corecrux-retrieval\n".into());
+        assert_eq!(resolve_plane_modules(&layers, &kws, &scan).0.len(), 2);
+
+        // A typo cannot invent a crate the scan has never seen. Built by
+        // transposition rather than written out, so the repo's spell-checker
+        // does not have to be taught to ignore a deliberate misspelling.
+        let transposed = "corecrux-retrieval".replace("ie", "ei");
+        layers.insert("modules".into(), format!("corecrux-index, {transposed}"));
+        let (mods, src) = resolve_plane_modules(&layers, &kws, &scan);
+        assert_eq!(src, ModuleSource::Declared);
+        assert_eq!(mods, vec!["corecrux-index"], "the misspelling is dropped, not invented");
+
+        // An all-typo declaration falls back rather than emptying the plane.
+        layers.insert("modules".into(), "not-a-crate, also-not-a-crate".into());
+        assert_eq!(
+            resolve_plane_modules(&layers, &kws, &scan).1,
+            ModuleSource::KeywordOverlap
+        );
     }
 }

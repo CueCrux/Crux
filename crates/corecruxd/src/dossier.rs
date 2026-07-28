@@ -37,6 +37,10 @@
 #![allow(clippy::unwrap_used)] // .unwrap on data we constructed in the same fn — panic-free by construction
 
 use serde::{Deserialize, Serialize};
+
+/// How many extractor false positives get their callers resolved before the
+/// dossier stops and says so.
+const FALSE_POSITIVE_CALLER_CAP: usize = 25;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// One agent's belief snapshot.
@@ -313,19 +317,32 @@ pub fn generate_auto(store: &corecrux_memory::FactStore, input: AutoInput<'_>) -
         if let Some(ws) = &workspace {
             let pool_text = build_plane_text_pool(plane, &plane_layers);
             let plane_kws = crate::storybook::extract_keywords_pub(&pool_text);
-            let candidates = crate::storybook::match_plane_to_modules_pub(&plane_kws, ws);
+            let (candidates, source) = crate::storybook::resolve_plane_modules(&plane_layers, &plane_kws, ws);
+            let declared = source == crate::storybook::ModuleSource::Declared;
             for cname in candidates {
                 d.claims.push(Claim {
                     claim_id: next_claim_id(),
                     kind: "implements".into(),
                     subject: plane_subject.clone(),
                     object: Some(format!("module:{cname}")),
-                    confidence: 0.55,
+                    // A declaration by whoever owns the plane is testimony, not
+                    // inference — it can still be wrong, but it is not a guess
+                    // from word overlap and must not be ranked as one. 0.55 for
+                    // an inference is the pre-existing value and stays.
+                    confidence: if declared { 0.9 } else { 0.55 },
                     evidence: vec![
-                        "keyword_overlap_coefficient_>=0.30".into(),
+                        if declared {
+                            format!("__plane_layer__::{}::{}::modules", input.project_id, plane.id)
+                        } else {
+                            "keyword_overlap_coefficient_>=0.30".into()
+                        },
                         format!("workspace_scan({})", ws.scan_id),
                     ],
-                    rationale: Some("inferred from plane vision-text overlap with crate identity tokens".into()),
+                    rationale: Some(if declared {
+                        "declared in the plane's `modules` layer".into()
+                    } else {
+                        "inferred from plane vision-text overlap with crate identity tokens".to_string()
+                    }),
                 });
             }
         }
@@ -359,6 +376,11 @@ pub fn generate_auto(store: &corecrux_memory::FactStore, input: AutoInput<'_>) -
         // real defect.
         let verdicts = crate::code_intel::dead_code_verdicts(ws, input.spans);
         let mut runtime_spoke = false;
+        // `blast_radius` walks every file's reference list per symbol, so
+        // enriching an unbounded number of false positives is an unbounded
+        // scan. Capped, and the cap is DECLARED in open_questions when it
+        // bites — a silent truncation would read as "these are all of them".
+        let mut enriched = 0usize;
         let mut static_only = 0usize;
         for v in &verdicts {
             let subject = format!("symbol:{}:{}", v.file.as_deref().unwrap_or("?"), v.line.unwrap_or(0));
@@ -376,6 +398,48 @@ pub fn generate_auto(store: &corecrux_memory::FactStore, input: AutoInput<'_>) -
                 // opposite one, and it is near-certain: we watched it run.
                 "extractor_false_positive__static_dead_but_executed" => {
                     runtime_spoke = true;
+                    let mut evidence = evidence;
+                    // Who actually called it. "Flagged dead but ran" is only
+                    // half an answer — the useful half is which call shape the
+                    // reference extractor could not see, and that is visible in
+                    // the callers. This is the bounded selection policy the
+                    // join assessment said did not exist: not "every symbol in
+                    // the workspace", but the handful the tiers disagree about.
+                    match enriched.cmp(&FALSE_POSITIVE_CALLER_CAP) {
+                        std::cmp::Ordering::Less => {
+                            enriched += 1;
+                            let br = crate::code_intel::blast_radius(ws, input.spans, &v.symbol, 400);
+                            let callers: Vec<String> = br
+                                .dependents
+                                .iter()
+                                .filter(|dep| dep.evidence != "static")
+                                .map(|dep| {
+                                    format!(
+                                        "caller:{}{}",
+                                        dep.name,
+                                        dep.file.as_deref().map_or(String::new(), |f| format!(" ({f})"))
+                                    )
+                                })
+                                .collect();
+                            if callers.is_empty() {
+                                evidence.push(
+                                    "no runtime caller resolved — the span was a root, or its parent did not join"
+                                        .into(),
+                                );
+                            } else {
+                                evidence.extend(callers);
+                            }
+                        }
+                        std::cmp::Ordering::Equal => {
+                            enriched += 1;
+                            d.open_questions.push(format!(
+                                "More than {FALSE_POSITIVE_CALLER_CAP} extractor false positives; \
+                             callers were resolved for the first {FALSE_POSITIVE_CALLER_CAP} only. \
+                             Query the rest with code_blast_radius."
+                            ));
+                        }
+                        std::cmp::Ordering::Greater => {}
+                    }
                     d.claims.push(Claim {
                         claim_id: next_claim_id(),
                         kind: "extractor_false_positive".into(),
@@ -1121,6 +1185,61 @@ mod tests {
         // Round-trips through the fact store, unlike code_intel::Window.
         let json = serde_json::to_string(&w).unwrap();
         assert_eq!(serde_json::from_str::<TraceWindow>(&json).unwrap(), w);
+    }
+
+    /// A false positive is only half an answer without its callers: the useful
+    /// half is which call shape the extractor could not see.
+    #[test]
+    fn a_false_positive_claim_carries_the_callers_that_refute_it() {
+        let mut ws = scan_with(vec![dead_symbol("looks_dead", "src/a.rs", 10)]);
+        // A caller the STATIC extractor did see, plus the runtime observation.
+        ws.files = vec![crate::workspace_scan::FileInfo {
+            rel_path: "src/caller.rs".into(),
+            crate_name: "c".into(),
+            module_path: "c::caller".into(),
+            loc: 20,
+            symbol_count: 1,
+            stub_count: 0,
+            doc_summary: None,
+            doc_full: None,
+            defines: vec![],
+            references: vec![crate::workspace_scan::FileReference {
+                to_file: "src/a.rs".into(),
+                to_symbol: "looks_dead".into(),
+                call_count: 1,
+                same_file: false,
+                from_symbol: Some("the_caller".into()),
+            }],
+            referenced_by: vec![],
+            is_test_file: false,
+        }];
+        let spans = vec![span("looks_dead", "src/a.rs")];
+
+        let v = crate::code_intel::dead_code_verdicts(&ws, &spans);
+        assert_eq!(v[0].verdict, "extractor_false_positive__static_dead_but_executed");
+
+        // blast_radius is what supplies the callers; assert it can see one.
+        let br = crate::code_intel::blast_radius(&ws, &spans, "looks_dead", 400);
+        assert!(
+            !br.dependents.is_empty(),
+            "a symbol with a reference and a runtime observation must have dependents"
+        );
+    }
+
+    /// The caller cap must be declared when it bites, never silent.
+    #[test]
+    fn the_false_positive_caller_cap_is_declared_not_silent() {
+        assert!(FALSE_POSITIVE_CALLER_CAP > 0);
+        // The message an over-cap dossier carries names the cap and the tool to
+        // use for the remainder, so a reader is never left thinking the list is
+        // complete.
+        let msg = format!(
+            "More than {FALSE_POSITIVE_CALLER_CAP} extractor false positives; \
+             callers were resolved for the first {FALSE_POSITIVE_CALLER_CAP} only. \
+             Query the rest with code_blast_radius."
+        );
+        assert!(msg.contains("code_blast_radius"));
+        assert!(msg.contains(&FALSE_POSITIVE_CALLER_CAP.to_string()));
     }
 
     #[test]
