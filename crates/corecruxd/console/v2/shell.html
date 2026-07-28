@@ -3228,6 +3228,45 @@
   .facts-group.tone-warn .facts-gdot { background: var(--warn); }
   .facts-group.tone-ink3 .facts-gdot { background: var(--ink3); }
 
+  /* ── cx-storybook: the context-graph surface (readout + dossiers) ────────
+     Reuses the .facts-* family for rows and detail; these add only the two
+     shapes it does not have — a rendered markdown block, and the dossier
+     claim/evidence list. */
+  .cxg-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+  .cxg-bar label { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink3); }
+  .cxg-bar select { background: var(--surface2); color: var(--ink); border: 1px solid var(--edge); border-radius: 6px; padding: 4px 8px; font-family: var(--font-mono); font-size: 11.5px; }
+  .cxg-tabs { display: flex; gap: 6px; margin-bottom: 12px; }
+  .cxg-tab[aria-pressed="true"] { border-color: var(--acc); color: var(--ink); }
+  .cxg-stats { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+  .cxg-stat { border: 1px solid var(--edge); border-radius: 8px; padding: 6px 10px; background: var(--surface2); min-width: 92px; }
+  .cxg-stat b { display: block; font-size: 15px; color: var(--ink); }
+  .cxg-stat span { font-family: var(--font-mono); font-size: 9.5px; color: var(--ink3); }
+  .cxg-stat.warn b { color: var(--warn); }
+  /* Rendered markdown. Built as DOM nodes, never innerHTML — the readout
+     interpolates project-layer text an operator wrote. */
+  .cxmd { font-size: 12.5px; color: var(--ink2); line-height: 1.55; overflow-wrap: anywhere; }
+  .cxmd h1, .cxmd h2, .cxmd h3, .cxmd h4 { color: var(--ink); margin: 14px 0 6px; line-height: 1.3; }
+  .cxmd h1 { font-size: 16px; } .cxmd h2 { font-size: 14px; } .cxmd h3 { font-size: 12.5px; } .cxmd h4 { font-size: 11.5px; }
+  .cxmd p { margin: 6px 0; }
+  .cxmd ul, .cxmd ol { margin: 6px 0; padding-left: 20px; }
+  .cxmd li { margin: 2px 0; }
+  .cxmd code { font-family: var(--font-mono); font-size: 11px; background: var(--bg); border: 1px solid var(--edge); border-radius: 4px; padding: 0 4px; }
+  .cxmd pre { margin: 8px 0; padding: 10px; border-radius: 8px; background: var(--bg); border: 1px solid var(--edge); overflow-x: auto; }
+  .cxmd pre code { border: 0; background: none; padding: 0; }
+  .cxmd blockquote { margin: 8px 0; padding: 2px 0 2px 12px; border-left: 3px solid var(--edge-strong); color: var(--ink3); }
+  /* Wide tables scroll inside their own container; the page never scrolls
+     sideways. */
+  .cxmd-tw { overflow-x: auto; margin: 8px 0; }
+  .cxmd table { border-collapse: collapse; font-size: 11.5px; }
+  .cxmd th, .cxmd td { border: 1px solid var(--edge); padding: 4px 9px; text-align: left; white-space: nowrap; }
+  .cxmd th { color: var(--ink3); font-family: var(--font-mono); font-size: 10px; font-weight: 600; }
+  .cxg-claim { border: 1px solid var(--edge); border-left: 3px solid var(--ink3); border-radius: 6px; padding: 6px 10px; margin: 4px 0; background: var(--surface2); }
+  .cxg-claim.conf-high { border-left-color: var(--ok); }
+  .cxg-claim.conf-med { border-left-color: var(--warn); }
+  .cxg-claim.conf-low { border-left-color: var(--crit); }
+  .cxg-claim-h { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; font-family: var(--font-mono); font-size: 11.5px; color: var(--ink); }
+  .cxg-claim-ev { margin: 3px 0 0; font-family: var(--font-mono); font-size: 10px; color: var(--ink3); overflow-wrap: anywhere; }
+
   /* cx-sessions browser (M3) — reuses the facts-* chrome; these add the state
      chip, the per-row meta chip row, honest-empty notes, and the state details. */
   .sess-sc { font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: .04em; padding: 2px 8px; border-radius: 999px; border: 1px solid currentColor; }
@@ -4264,6 +4303,9 @@
     'cx-activity-log': '<path d="M3 12h3.6l2.2-6 3.4 12 2.6-8 1.8 4h4.4"/>',
     'cx-projects':     '<path d="M3 7.5a1.5 1.5 0 0 1 1.5-1.5H9l2 2.4h8.5A1.5 1.5 0 0 1 21 9.9v8.6a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 18.5z"/>',
     'cx-sessions':     '<circle cx="12" cy="12" r="8.6"/><path d="M12 7.2V12l3.2 1.9"/>',
+    // Storybook & dossiers — an open book: the project readout, and the belief
+    // snapshots filed against it.
+    'cx-storybook':    '<path d="M12 6.6C10.2 5.2 7.8 4.6 4.5 4.6V18c3.3 0 5.7.6 7.5 2 1.8-1.4 4.2-2 7.5-2V4.6c-3.3 0-5.7.6-7.5 2z"/><path d="M12 6.6V20"/>',
     // Memory
     'cx-facts':        '<path d="M5 4.5h11l3 3V19a.9.9 0 0 1-.9.9H5A.9.9 0 0 1 4.1 19V5.4A.9.9 0 0 1 5 4.5z"/><path d="M15.6 4.6v3.2h3.2"/><path d="M7.6 12.6h8M7.6 16h5.4"/>',
     'cx-memory':       '<ellipse cx="12" cy="6" rx="7.4" ry="2.8"/><path d="M4.6 6v6c0 1.6 3.3 2.8 7.4 2.8s7.4-1.2 7.4-2.8V6"/><path d="M4.6 12v6c0 1.6 3.3 2.8 7.4 2.8s7.4-1.2 7.4-2.8v-6"/>',

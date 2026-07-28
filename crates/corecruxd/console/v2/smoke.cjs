@@ -85,11 +85,41 @@ function newMockDom() {
   function mkNode(tag) {
     const node = {
       tagName: String(tag || 'div').toUpperCase(), nodeType: 1, childNodes: [], _attrs: {}, className: '',
+      // `style` and `classList` are here because real renderers use them for
+      // show/hide and open/closed state; without them a renderer-driving check
+      // fails on the harness rather than on the code under test.
+      style: {}, disabled: false,
       setAttribute: function (k, v) { this._attrs[k] = String(v); if (k === 'class') { this.className = String(v); } },
       getAttribute: function (k) { return Object.prototype.hasOwnProperty.call(this._attrs, k) ? this._attrs[k] : null; },
       appendChild: function (c) { this.childNodes.push(c); c.parentNode = this; return c; },
-      addEventListener: function () {}
+      insertBefore: function (c, ref) {
+        const i = this.childNodes.indexOf(ref);
+        if (i < 0) { this.childNodes.push(c); } else { this.childNodes.splice(i, 0, c); }
+        c.parentNode = this; return c;
+      },
+      removeChild: function (c) { const i = this.childNodes.indexOf(c); if (i >= 0) { this.childNodes.splice(i, 1); } return c; },
+      // Handlers are CAPTURED, not swallowed: a renderer whose tabs and rows
+      // only exist as click handlers cannot be asserted otherwise.
+      _handlers: {},
+      addEventListener: function (type, fn) { (this._handlers[type] = this._handlers[type] || []).push(fn); },
+      click: function (ev) { (this._handlers.click || []).forEach(function (fn) { fn(ev || { target: null }); }); },
+      closest: function (sel) {
+        const cls = sel.charAt(0) === '.' ? sel.slice(1) : sel;
+        let cur = this;
+        while (cur) {
+          if (String(cur.className || '').split(/\s+/).indexOf(cls) >= 0) { return cur; }
+          cur = cur.parentNode;
+        }
+        return null;
+      }
     };
+    node.classList = {
+      add: function (c) { const p = node.className.split(/\s+/).filter(Boolean); if (p.indexOf(c) < 0) { p.push(c); } node.className = p.join(' '); node._attrs['class'] = node.className; },
+      remove: function (c) { const p = node.className.split(/\s+/).filter(Boolean).filter(function (x) { return x !== c; }); node.className = p.join(' '); node._attrs['class'] = node.className; },
+      contains: function (c) { return node.className.split(/\s+/).indexOf(c) >= 0; },
+      toggle: function (c) { if (node.classList.contains(c)) { node.classList.remove(c); return false; } node.classList.add(c); return true; }
+    };
+    Object.defineProperty(node, 'lastChild', { get: function () { return this.childNodes[this.childNodes.length - 1] || null; } });
     Object.defineProperty(node, 'textContent', {
       get: function () { let t = this._text || ''; (this.childNodes || []).forEach(function (c) { t += (c.textContent || ''); }); return t; },
       set: function (v) { this._text = String(v); this.childNodes.length = 0; }
@@ -196,7 +226,11 @@ function walkPage(page, fn) {
   // Declared native v2 pages beyond the legacy 26 (not pro-gated). cx-activity-log
   // is the Work › Activity log — folded into this console (the standalone
   // /console/activity page was removed), custom-rendered.
-  const nativeExtra = new Set(['cx-activity-log', 'cx-mints']);
+  // cx-storybook is Work › Storybook — the context-graph readout (phase 3) and
+  // the agent dossier board (phase 4), custom-rendered because a markdown
+  // narrative and a nested claim/evidence shape are not expressible in the
+  // control model.
+  const nativeExtra = new Set(['cx-activity-log', 'cx-mints', 'cx-storybook']);
   Object.keys(pages.PAGES).forEach(function (id) {
     if (LEGACY_26.indexOf(id) >= 0) { return; }
     if (nativeExtra.has(id)) {
@@ -463,7 +497,12 @@ function extractThemeVars(theme) {
     // crux-integrations-and-template-library L2: the ONE mutating /v1/studio/
     // route — install a signed catalog entry as fresh console facts (write-
     // class in route_auth; provenance + collision remap daemon-side).
-    ['POST', '/v1/studio/library/{id}/install']
+    ['POST', '/v1/studio/library/{id}/install'],
+    // crux-storybook-dossier-agent-and-console-surface M3: the two context-graph
+    // regenerate actions. Deterministic, no body, no user content — but each
+    // persists a fact, so they are writes.
+    ['POST', '/v1/projects/{id}/storybook'],
+    ['POST', '/v1/projects/{id}/dossiers/auto']
   ];
   // Parse the machine-readable GATED_MUTATIONS array and assert set-equality.
   const arrM = apiSrc.match(/const GATED_MUTATIONS = Object\.freeze\(\[([\s\S]*?)\]\);/);
@@ -5302,6 +5341,181 @@ function extractThemeVars(theme) {
     '[library] the Library CSS must use var(--) tokens only — no literal colours');
 
   notes.push('studio library (L1+L2 console): Studio gains a fourth section — Library (#/canvas/studio?sub=library) — over the daemon\'s cached, curator-signed template index: a header stating curator, index age, entry count and that tier_enforcement is ADVISORY (the catalog server is the gate; the daemon only echoes required_tier, and every tier chip says so in its title), plus kind-grouped, kind/text-filterable entry cards carrying name·version·kind·tier·publisher·tags·summary·preview·repo·pinned sha and, when installed, the version, the written entities and the install date. There is deliberately NO refresh button — the daemon has no fetch-index route — so the surface names `corecruxctl studio sync` instead, and its four read states stay distinct (verified · un-synced 404 · 403 signature failure shown verbatim · verified-but-empty). Install is the one mutation: the same cintWrite harness as Studio › Integrations (posture + Art.14 bound passport + a confirm naming kind, id@version, publisher, sha and advisory tier) through the single operatorGatedCall choke, rendering the response\'s own shape — written entities, from → to collision remaps, the provenance block — and 404/409/403 details verbatim. Provenance is now visible wherever a Studio artifact is listed (workspace + page rows, the saved-designs panel, and the board toolbar, which is this console\'s only board listing): "library: <id>@<version>" for a catalog install, "import: <pack_id> · signed|unsigned" for a hand-import, read defensively and rendered as one chip. The board doc\'s field-dropping security choke now admits (coerced) provenance so an operator save cannot orphan an installed board. The import preview states SIGNEDNESS as a first-class chip off the verify route\'s additive `signed` bit — unsigned says plainly that it applies only under operator posture and carries no publisher trust — with the existing operator && v.ok apply gate untouched; and a manual apply stamps every artifact it writes with its OWN `imported_from` {pack_id, imported_at_unix_ms, signed}, never the daemon\'s `installed_from`, surviving the canonical write → tolerant read round-trip. ROUTE FIX (M27): L1 wired the fourth section in render.js only — shell.html\'s parseCanvasHash, which is the actual router, still carried M16b\'s three-value ?sub= ladder, so ?sub=library normalised to \'board\'. The Library button painted, clicking it repainted the board, and the page had no reachable route from the Studio at all. The ladder is replaced by ONE shared STUDIO_SUBS allowlist (board · pages · integrations · library) validated with hasOwnProperty (so a prototype key falls back to the board), the topbar sub-line gains its Studio › Library sentence, and the gates now assert the SHELL half as well as the render half — including the resolved routing for every deep link and the fallbacks.');
+})();
+
+// =========================================================================
+//  Check 55 (crux-storybook-dossier-agent-and-console-surface M3) —
+//  cx-storybook renders the context graph.
+//
+//  Two halves, both jsdom-independent:
+//    (a) renderMarkdown is a NODE builder, never innerHTML. The readout
+//        interpolates project-layer text an operator wrote, so an innerHTML
+//        path here would be a live XSS sink on a page that renders it.
+//    (b) the renderer, driven against a stubbed CruxApi carrying real response
+//        shapes, paints the section rows, the stat row, and — the reason the
+//        page exists — the cross-agent DISAGREEMENT panel.
+// =========================================================================
+(function checkContextGraphSurface() {
+  // ---- (a) markdown → DOM, no innerHTML --------------------------------
+  const mdSrc = funcBody(renderSrc, 'renderMarkdown') || '';
+  check(!!mdSrc, '[cxg] renderMarkdown must be locatable in render.js');
+  check(mdSrc.indexOf('innerHTML') < 0,
+    '[cxg] renderMarkdown must never assign innerHTML — the readout carries operator-authored layer text');
+  const inlineSrc = funcBody(renderSrc, 'cxmdInline') || '';
+  check(inlineSrc.indexOf('innerHTML') < 0, '[cxg] cxmdInline must never assign innerHTML');
+
+  const dom = newMockDom();
+  const savedDoc = global.document;
+  global.document = dom.doc;
+  try {
+    const md = render.renderMarkdown([
+      '# Storybook · crux-daemon',
+      '',
+      '> **Generated** by `p_operator`',
+      '',
+      '## What this project is',
+      '',
+      'A daemon with **receipts** and `facts`.',
+      '',
+      '| Plane | Vision | Gap |',
+      '|-------|--------|-----|',
+      '| retrieval | ✓ | — |',
+      '',
+      '- first bullet',
+      '- second bullet',
+      '',
+      '```',
+      'let x = 1;',
+      '```'
+    ].join('\n'));
+    const tags = dom.collect(md, [md]).map(function (n) { return n.tagName; });
+    ['H1', 'H2', 'P', 'BLOCKQUOTE', 'TABLE', 'THEAD', 'TBODY', 'TH', 'TD', 'UL', 'LI', 'PRE', 'CODE', 'STRONG'].forEach(function (t) {
+      check(tags.indexOf(t) >= 0, '[cxg] renderMarkdown must emit a <' + t.toLowerCase() + '> for the constructs storybook.rs writes');
+    });
+    check(dom.findByClass(md, 'cxmd-tw').length === 1,
+      '[cxg] a table must sit in its own overflow container so the page never scrolls sideways');
+    check(md.textContent.indexOf('receipts') >= 0 && md.textContent.indexOf('let x = 1;') >= 0,
+      '[cxg] no content may be dropped by the markdown pass');
+    // An unsupported construct degrades to literal text, never disappears.
+    const odd = render.renderMarkdown('~~struck~~ and <not-a-tag> survive');
+    check(odd.textContent.indexOf('<not-a-tag>') >= 0,
+      '[cxg] unrecognised markup must render as literal text, not vanish');
+  } finally { global.document = savedDoc; }
+
+  // ---- (b) the renderer, against real response shapes -------------------
+  const STORY = {
+    project_id: 'crux-daemon', generated_at_unix_ms: 1785198400000, generated_by_passport: 'p_operator',
+    markdown: '# Storybook\n\n## Gaps & alerts\n\n- No vision on 2 planes\n',
+    sections: {
+      '00_front': '# Storybook · crux-daemon\n',
+      '10_vision': '## What this project is\n\nA local-first memory daemon.\n',
+      '30_plane_retrieval': '### retrieval\n\n- **Plane vision**: BM25 + graph + dense\n',
+      '30_planes_intro': '## Planes\n',
+      '50_workspace_health': '## Workspace health\n\n**8** crates · **9151** LOC\n',
+      '60_alerts': '## Gaps & alerts\n\n- Three planes map to no code\n'
+    },
+    stats: {
+      plane_count: 3, planes_with_vision: 1, planes_with_mapped_modules: 0,
+      orphan_planes: ['retrieval', 'coordination', 'context-graph'],
+      workspace_loc: 9151, stub_count: 0, dead_code_count: 10, bytes: 3962
+    },
+    truncated: false, sections_omitted: [], available_versions: [1785198400000, 1785190000000]
+  };
+  const RECON = {
+    project_id: 'crux-daemon', generated_at_unix_ms: 1785198400000, dossier_count: 3,
+    agents: ['anonymous', 'p_opus_peer', 'p_sonnet_peer'],
+    agreement: [{ kind: 'planning_target', subject: 'project:crux-daemon', object: 'github://cuecrux/crux', agreed_by_agents: ['p_opus_peer', 'p_sonnet_peer'], max_confidence: 1.0, avg_confidence: 1.0 }],
+    disagreement: [{
+      kind: 'implements', subject: 'plane:crux-daemon:retrieval',
+      variants: [
+        { object: 'crate:corecrux-retrieval', agents: ['p_sonnet_peer'], max_confidence: 0.92 },
+        { object: 'crate:corecrux-index', agents: ['p_opus_peer'], max_confidence: 0.71 }
+      ]
+    }],
+    unique: [], stats: { agreement_count: 1, disagreement_count: 1, unique_count: 9, total_distinct_subjects: 9 },
+    truncated: false, disagreements_omitted: 0, agreements_omitted: 0, unique_omitted: 0
+  };
+  const DOSSIERS = {
+    project_id: 'crux-daemon', count: 3, returned: 3, truncated: false, dossiers_omitted: 0,
+    dossiers: [
+      { dossier_id: 'dsr-peer-opus', generated_at_unix_ms: 1785198300000, agent_passport: 'p_opus_peer' },
+      { dossier_id: 'dsr-peer-sonnet', generated_at_unix_ms: 1785198200000, agent_passport: 'p_sonnet_peer' }
+    ]
+  };
+  function jsonResponse(body) {
+    return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve(body); } });
+  }
+  const calls = [];
+  const api = {
+    get: function (path, query) { calls.push([path, query]); return jsonResponse({ projects: [{ id: 'crux-daemon', name: 'Crux Daemon', is_default: true }] }); },
+    projectsByIdStorybook: function (id, q) { calls.push(['storybook', id, q]); return jsonResponse(STORY); },
+    projectsByIdDossiers: function (id, q) { calls.push(['dossiers', id, q]); return jsonResponse(DOSSIERS); },
+    projectsByIdDossiersReconcile: function (id, q) { calls.push(['reconcile', id, q]); return jsonResponse(RECON); }
+  };
+
+  // Sequenced AFTER every check registered so far. The renderer paints in
+  // microtasks, so the mock document has to stay installed across them — and if
+  // another check's pending continuation landed in that window it would build
+  // its nodes with this mock and fail on a method the real DOM has. Chaining off
+  // the existing queue means nothing else is in flight.
+  const d2 = newMockDom();
+  const priorChecks = asyncChecks.slice();
+  asyncChecks.push(Promise.all(priorChecks).then(function () {
+    const savedDoc2 = global.document, savedWin2 = global.window;
+    global.document = d2.doc;
+    global.window = { CruxApi: api, CruxPages: pages, CRUX_MODE: 'professional' };
+    const host = d2.mkNode('div');
+    render.renderContextGraph(host);
+    // Let /v1/projects resolve, then the storybook + dossier reads it kicks
+    // off. A macrotask turn drains every pending microtask, which a fixed
+    // number of `.then` hops does not — the chain is 6+ deep here.
+    const settle = function () { return new Promise(function (r) { setTimeout(r, 0); }); };
+    return settle().then(settle).then(function () {
+    try {
+      const text = host.textContent;
+      // The project picker painted from the real /v1/projects shape.
+      check(d2.findByClass(host, 'cxg-bar').length >= 1, '[cxg] the page must carry a project picker bar');
+      check(d2.findByClass(host, 'cxg-tab').length === 2, '[cxg] two tabs: Storybook and Dossiers');
+
+      // Every read is budgeted — the page must not ask the daemon for an
+      // unbounded document any more than an agent may.
+      const reads = calls.filter(function (c) { return c[0] === 'storybook' || c[0] === 'dossiers' || c[0] === 'reconcile'; });
+      check(reads.length >= 2, '[cxg] the page must load the storybook and the dossiers (got ' + reads.length + ' reads)');
+      check(reads.every(function (c) { return c[2] && Number(c[2].token_budget) > 0; }),
+        '[cxg] every context-graph read must carry a token_budget');
+
+      // Storybook pane: stats and one row per section, alerts open by default.
+      check(d2.findByClass(host, 'cxg-stat').length >= 5, '[cxg] the storybook pane must show the stat row');
+      check(text.indexOf('9151') >= 0, '[cxg] workspace LOC from stats must be shown');
+      check(text.indexOf('dead-code candidates') >= 0, '[cxg] the dead-code count must be labelled');
+      const rows = d2.findByClass(host, 'facts-row');
+      check(rows.length === Object.keys(STORY.sections).length,
+        '[cxg] one row per section (want ' + Object.keys(STORY.sections).length + ', got ' + rows.length + ')');
+      check(text.indexOf('Workspace health') >= 0, '[cxg] section keys must render as readable titles, not 50_workspace_health');
+      check(text.indexOf('50_workspace_health') >= 0, '[cxg] ...while the raw key stays visible for grounding');
+
+      // Dossier pane: disagreement leads.
+      const tabs = d2.findByClass(host, 'cxg-tab');
+      check(tabs.length === 2 && tabs[0].getAttribute('aria-pressed') === 'true',
+        '[cxg] Storybook is the default tab');
+      tabs[1].click();
+      const dtext = host.textContent;
+      check(dtext.indexOf('disagreement') >= 0,
+        '[cxg] the dossier pane must lead with disagreement — the one thing a single dossier cannot tell you');
+      check(dtext.indexOf('plane:crux-daemon:retrieval') >= 0 &&
+            dtext.indexOf('crate:corecrux-retrieval') >= 0 &&
+            dtext.indexOf('crate:corecrux-index') >= 0,
+        '[cxg] both sides of a disagreement must be named, with the subject they disagree about');
+      check(dtext.indexOf('p_sonnet_peer') >= 0 && dtext.indexOf('p_opus_peer') >= 0,
+        '[cxg] a disagreement must attribute each variant to the agent that claimed it');
+      const disIdx = dtext.indexOf('disagreement'), agrIdx = dtext.indexOf('agreement — two or more');
+      check(disIdx >= 0 && agrIdx > disIdx, '[cxg] disagreement must precede agreement in the pane');
+      check(dtext.indexOf('dsr-peer-opus') >= 0 && dtext.indexOf('dsr-peer-sonnet') >= 0,
+        '[cxg] every saved dossier must be listed with its id');
+      notes.push('cx-storybook (M3): the context graph gets a console home — a project picker driving the storybook readout (rendered markdown as DOM nodes, one collapsible per section, stat row, version list + two-version diff) and the dossier board (claims grouped by kind with confidence + evidence, uncertainties, contradictions, open questions), with cross-agent RECONCILIATION leading the dossier pane because a disagreement is the one thing a single dossier can never tell you. Every read carries a token_budget; the two regenerate actions go through operatorGatedCall. renderMarkdown builds nodes and never touches innerHTML.');
+    } finally { global.document = savedDoc2; global.window = savedWin2; }
+    });
+  }));
 })();
 
 // ---- Report (awaits async renderer-driven checks) -----------------------

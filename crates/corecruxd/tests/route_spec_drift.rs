@@ -196,6 +196,16 @@ const GATED_MUTATIONS: &[(&str, &str, &str)] = &[
     ),
     // ── L2: central Studio template library — install one signed template ──
     ("POST", "/v1/studio/library/{id}/install", "studioLibraryInstall"),
+    // ── crux-storybook-dossier-agent-and-console-surface M3: context graph ──
+    // Both are deterministic REGENERATE actions over state the daemon already
+    // holds — no body, no user-supplied content, no external call. They are here
+    // rather than in the read-POST list because each persists a fact
+    // (`__storybook__::*` / `__dossier__::*`), which is a write however derived
+    // its content is.
+    //   * storybook.rs::post_generate — POST /v1/projects/{id}/storybook       (admin:read + facts:write) [mod.rs:1122]
+    //   * dossier.rs::post_auto       — POST /v1/projects/{id}/dossiers/auto   (admin:read + facts:write) [mod.rs:1143]
+    ("POST", "/v1/projects/{id}/storybook", "projectStorybookGenerate"),
+    ("POST", "/v1/projects/{id}/dossiers/auto", "projectDossierGenerate"),
 ];
 
 // ── Curated read-POST allowlist (unified-shell-console M11) ───────────────────

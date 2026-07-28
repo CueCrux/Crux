@@ -2645,6 +2645,9 @@
     if (page.id === 'cx-gates') { container.textContent = ''; renderGatesBoard(container); return Promise.resolve(); }
     if (page.id === 'cx-identity') { container.textContent = ''; renderIdentityBrowser(container); return Promise.resolve(); }
     if (page.id === 'cx-mediation') { container.textContent = ''; renderMediationPosture(container); return Promise.resolve(); }
+    // Context graph (storybook + dossiers) — markdown narrative + nested
+    // claim/evidence shapes, neither expressible in the control model.
+    if (page.id === 'cx-storybook') { container.textContent = ''; renderContextGraph(container); return Promise.resolve(); }
     if (page.operatorOnly && !isOperator()) {
       renderSections(container, [{ h: page.title, wide: true, controls: [
         { t: 'info', label: 'operator only', v: 'This surface is only available in operator posture.' },
@@ -12639,6 +12642,584 @@
     load();
   }
 
+
+  // =======================================================================
+  //  cx-storybook — the context graph's two human-facing halves.
+  //
+  //  Phase 3 (storybook) is a per-project markdown readout the daemon
+  //  assembles from planes, layers and the workspace scan. Phase 4 (dossiers)
+  //  is what each AGENT believes about that project, with confidence and
+  //  evidence per claim, plus a reconciliation that shows where two agents
+  //  disagree. Both shipped with live routes and no UI at all; the port
+  //  checklist had storybook filed as a component gallery, which is why.
+  //
+  //  Disagreement leads the dossier pane deliberately: agreement is derivable
+  //  from any single dossier, a conflict is a fact about the fleet that exists
+  //  nowhere else, and it is the thing an operator has to see before trusting
+  //  either side.
+  //
+  //  Reads go through the generated named methods (parameterised paths are not
+  //  in CruxApi.get's literal allowlist); the two regenerate actions go through
+  //  operatorGatedCall like every other console write.
+  // =======================================================================
+
+  // ---- Constrained markdown → DOM (cxmd) --------------------------------
+  // The readout is daemon-generated but interpolates project-layer text an
+  // operator wrote, so this builds NODES and never assigns innerHTML. Supports
+  // exactly what storybook.rs emits: ATX headings, paragraphs, bullet and
+  // ordered lists (one nesting level), pipe tables, fenced code, blockquotes,
+  // and inline `code` / **bold** / *italic*. Anything unrecognised renders as
+  // literal text rather than being dropped — an unsupported construct must not
+  // silently remove content from a readout someone is reading to make a call.
+  function cxmdInline(text) {
+    // Split on the three inline forms, longest-delimiter first so `**` is not
+    // eaten by the `*` rule. Backticks win outright: code spans are literal.
+    var out = [];
+    var re = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*)/g;
+    var last = 0, m;
+    while ((m = re.exec(text)) !== null) {
+      if (m.index > last) { out.push(doc().createTextNode(text.slice(last, m.index))); }
+      var tok = m[0];
+      if (tok.charAt(0) === '`') { out.push(el('code', { text: tok.slice(1, -1) })); }
+      else if (tok.slice(0, 2) === '**') { out.push(el('strong', { text: tok.slice(2, -2) })); }
+      else { out.push(el('em', { text: tok.slice(1, -1) })); }
+      last = m.index + tok.length;
+    }
+    if (last < text.length) { out.push(doc().createTextNode(text.slice(last))); }
+    return out;
+  }
+  function cxmdCells(line) {
+    var t = line.trim().replace(/^\|/, '').replace(/\|$/, '');
+    return t.split('|').map(function (c) { return c.trim(); });
+  }
+  function cxmdIsDivider(line) { return /^\s*\|?[\s:|-]+\|[\s:|-]*$/.test(line) && line.indexOf('-') >= 0; }
+  function renderMarkdown(src) {
+    var root = el('div', { 'class': 'cxmd' });
+    var lines = String(src == null ? '' : src).split('\n');
+    var i = 0;
+    function flushPara(buf) {
+      if (!buf.length) { return; }
+      root.appendChild(el('p', {}, cxmdInline(buf.join(' '))));
+      buf.length = 0;
+    }
+    var para = [];
+    while (i < lines.length) {
+      var line = lines[i];
+      // Fenced code — consumed verbatim, no inline parsing inside.
+      if (/^\s*```/.test(line)) {
+        flushPara(para);
+        var code = [];
+        i++;
+        while (i < lines.length && !/^\s*```/.test(lines[i])) { code.push(lines[i]); i++; }
+        i++;   // closing fence (or EOF — an unterminated fence still renders)
+        root.appendChild(el('pre', {}, [el('code', { text: code.join('\n') })]));
+        continue;
+      }
+      var h = /^(#{1,6})\s+(.*)$/.exec(line);
+      if (h) {
+        flushPara(para);
+        var lvl = Math.min(4, h[1].length);   // h5/h6 would be smaller than body
+        root.appendChild(el('h' + lvl, {}, cxmdInline(h[2])));
+        i++; continue;
+      }
+      // Table: a pipe row followed by a divider row.
+      if (line.indexOf('|') >= 0 && i + 1 < lines.length && cxmdIsDivider(lines[i + 1])) {
+        flushPara(para);
+        var table = el('table');
+        var thead = el('thead');
+        thead.appendChild(el('tr', {}, cxmdCells(line).map(function (c) { return el('th', {}, cxmdInline(c)); })));
+        table.appendChild(thead);
+        var tbody = el('tbody');
+        i += 2;
+        while (i < lines.length && lines[i].indexOf('|') >= 0 && lines[i].trim() !== '') {
+          tbody.appendChild(el('tr', {}, cxmdCells(lines[i]).map(function (c) { return el('td', {}, cxmdInline(c)); })));
+          i++;
+        }
+        table.appendChild(tbody);
+        root.appendChild(el('div', { 'class': 'cxmd-tw' }, [table]));
+        continue;
+      }
+      // Lists — one level; a nested bullet is folded into its parent item's
+      // text rather than dropped.
+      var isUl = /^\s*[-*+]\s+/.test(line), isOl = /^\s*\d+[.)]\s+/.test(line);
+      if (isUl || isOl) {
+        flushPara(para);
+        var list = el(isUl ? 'ul' : 'ol');
+        while (i < lines.length) {
+          var li = lines[i];
+          var mu = /^(\s*)(?:[-*+]|\d+[.)])\s+(.*)$/.exec(li);
+          if (!mu) { break; }
+          if (mu[1].length >= 2 && list.lastChild) {
+            list.lastChild.appendChild(doc().createTextNode(' '));
+            cxmdInline(mu[2]).forEach(function (n) { list.lastChild.appendChild(n); });
+          } else {
+            list.appendChild(el('li', {}, cxmdInline(mu[2])));
+          }
+          i++;
+        }
+        root.appendChild(list);
+        continue;
+      }
+      if (/^\s*>\s?/.test(line)) {
+        flushPara(para);
+        var quote = [];
+        while (i < lines.length && /^\s*>\s?/.test(lines[i])) { quote.push(lines[i].replace(/^\s*>\s?/, '')); i++; }
+        root.appendChild(el('blockquote', {}, cxmdInline(quote.join(' '))));
+        continue;
+      }
+      if (line.trim() === '') { flushPara(para); i++; continue; }
+      para.push(line.trim());
+      i++;
+    }
+    flushPara(para);
+    return root;
+  }
+
+  // ---- Reads (parameterised → named methods) -----------------------------
+  function cxgApi() { return (typeof window !== 'undefined') ? window.CruxApi : null; }
+  function cxgCall(name, args) {
+    var api = cxgApi();
+    if (!api || typeof api[name] !== 'function') { return Promise.resolve({ ok: false, status: 0, data: null }); }
+    return fetchVia(function () { return api[name].apply(api, args); });
+  }
+  // A budget large enough to read the whole readout on a normal project, and
+  // small enough that a pathological one degrades instead of hanging the tab.
+  var CXG_STORY_BUDGET = 60000;
+  var CXG_DOSSIER_BUDGET = 40000;
+
+  function cxgConfClass(c) {
+    var n = Number(c);
+    if (!isFinite(n)) { return ''; }
+    return n >= 0.85 ? 'conf-high' : (n >= 0.5 ? 'conf-med' : 'conf-low');
+  }
+  function cxgIso(ms) {
+    var n = Number(ms);
+    if (!isFinite(n) || n <= 0) { return '—'; }
+    try { return new Date(n).toISOString().slice(0, 19).replace('T', ' '); } catch (e) { return String(ms); }
+  }
+  // Section keys carry a numeric sort prefix that is machinery, not a title.
+  function cxgSectionTitle(key) {
+    var k = String(key || '');
+    var stripped = k.replace(/^\d+_/, '').replace(/_/g, ' ');
+    return stripped.charAt(0).toUpperCase() + stripped.slice(1);
+  }
+
+  function renderContextGraph(host) {
+    host.textContent = '';
+    var state = {
+      projects: [], projectId: '', tab: 'storybook',
+      story: null, storyStatus: 0, ts: null, diffAgainst: '', diff: null,
+      dossiers: [], dossierStatus: 0, open: {}, loaded: {}, recon: null, reconStatus: 0,
+      // One token PER LOAD, not one shared token. The two loads are kicked off
+      // together by selectProject, so a single counter meant the second bumped
+      // it while the first was still in flight and the first result was
+      // discarded as stale — the storybook pane never painted at all.
+      storyToken: 0, dossierToken: 0
+    };
+
+    var bar = el('div', { 'class': 'cxg-bar' });
+    var banner = el('div', { 'class': 'facts-banner' }); banner.style.display = 'none';
+    var tabs = el('div', { 'class': 'cxg-tabs' });
+    var pane = el('div');
+    host.appendChild(el('div', { 'class': 'facts-browser' }, [bar, banner, tabs, pane]));
+
+    function say(kind, text) {
+      if (!text) { banner.style.display = 'none'; return; }
+      banner.style.display = ''; banner.className = 'facts-banner ' + kind; banner.textContent = text;
+    }
+
+    // ---- Project picker + the two regenerate actions --------------------
+    function paintBar() {
+      bar.textContent = '';
+      var sel = el('select', { 'aria-label': 'project' });
+      if (!state.projects.length) {
+        sel.appendChild(el('option', { value: '', text: '— no projects —' }));
+        sel.disabled = true;
+      } else {
+        state.projects.forEach(function (p) {
+          var o = el('option', { value: p.id, text: (p.name || p.id) + ' · ' + p.id });
+          if (p.id === state.projectId) { o.setAttribute('selected', 'selected'); }
+          sel.appendChild(o);
+        });
+      }
+      sel.addEventListener('change', function () { selectProject(sel.value); });
+      bar.appendChild(el('label', { text: 'project' }));
+      bar.appendChild(sel);
+
+      if (isOperator()) {
+        var msg = el('span', { 'class': 'ctl-desc' });
+        function regen(label, method, after) {
+          var b = el('button', { 'class': 'btn-quiet', type: 'button' }, [label]);
+          b.addEventListener('click', function () {
+            if (!state.projectId) { msg.textContent = 'Pick a project first.'; return; }
+            b.disabled = true; msg.textContent = label + '…';
+            operatorGatedCall(function (g) { return g[method](state.projectId, {}); })
+              .then(readJson)
+              .then(function (r) {
+                b.disabled = false;
+                msg.textContent = r && r.ok ? (label + ' done.') : (label + ' failed (HTTP ' + (r && r.status) + ').');
+                if (r && r.ok) { after(); }
+              }, function (e) { b.disabled = false; msg.textContent = String((e && e.message) || 'failed'); });
+          });
+          return b;
+        }
+        bar.appendChild(regen('Regenerate storybook', 'projectStorybookGenerate', loadStorybook));
+        bar.appendChild(regen('Generate dossier', 'projectDossierGenerate', loadDossiers));
+        bar.appendChild(msg);
+      } else {
+        bar.appendChild(el('span', { 'class': 'ctl-desc', text: 'Regenerating is operator-gated — both actions persist a fact.' }));
+      }
+    }
+
+    function paintTabs() {
+      tabs.textContent = '';
+      [['storybook', 'Storybook'], ['dossiers', 'Dossiers']].forEach(function (t) {
+        var b = el('button', { 'class': 'btn-quiet cxg-tab', type: 'button', 'aria-pressed': String(state.tab === t[0]) }, [t[1]]);
+        b.addEventListener('click', function () { state.tab = t[0]; paint(); });
+        tabs.appendChild(b);
+      });
+    }
+
+    // ---- Storybook pane --------------------------------------------------
+    function statTile(value, label, warn) {
+      return el('div', { 'class': 'cxg-stat' + (warn ? ' warn' : '') }, [
+        el('b', { text: String(value == null ? '—' : value) }), el('span', { text: label })
+      ]);
+    }
+    function paintStorybook() {
+      pane.textContent = '';
+      if (!state.projectId) { pane.appendChild(m6Empty('Pick a project above.')); return; }
+      var d = state.story;
+      if (!d) {
+        if (state.storyStatus === 404) {
+          pane.appendChild(el('div', { 'class': 'facts-banner ok-empty' }, [
+            el('div', { 'class': 'm6-help-h', text: 'No readout for this project yet.' }),
+            el('p', { 'class': 'ctl-desc', text: 'A storybook is assembled deterministically from the project graph, its plane and vision layers, and the latest workspace scan — no model call. Use “Regenerate storybook” above (or POST /v1/projects/{id}/storybook) to produce the first one. Run POST /v1/workspace/scan first if you want the workspace-health and coverage sections populated.' })
+          ]));
+        } else {
+          pane.appendChild(m6Empty('Readout unavailable — ' + (state.storyStatus === 0 ? 'daemon unreachable' : 'HTTP ' + state.storyStatus) + '.'));
+        }
+        return;
+      }
+      var st = d.stats || {};
+      pane.appendChild(el('div', { 'class': 'cxg-stats' }, [
+        statTile(st.plane_count, 'planes'),
+        statTile(st.planes_with_vision, 'with vision'),
+        statTile(st.planes_with_mapped_modules, 'mapped to code'),
+        statTile((st.orphan_planes || []).length, 'orphan planes', (st.orphan_planes || []).length > 0),
+        statTile(st.workspace_loc, 'workspace loc'),
+        statTile(st.stub_count, 'stubs', Number(st.stub_count) > 0),
+        statTile(st.dead_code_count, 'dead-code candidates', Number(st.dead_code_count) > 0)
+      ]));
+
+      var versions = d.available_versions || [];
+      var vbar = el('div', { 'class': 'cxg-bar' });
+      vbar.appendChild(el('label', { text: 'version' }));
+      var vsel = el('select', { 'aria-label': 'storybook version' });
+      versions.forEach(function (ts, idx) {
+        var o = el('option', { value: String(ts), text: cxgIso(ts) + (idx === 0 ? ' · latest' : '') });
+        if (String(ts) === String(d.generated_at_unix_ms)) { o.setAttribute('selected', 'selected'); }
+        vsel.appendChild(o);
+      });
+      vsel.addEventListener('change', function () { state.ts = vsel.value; state.diff = null; loadStorybook(); });
+      vbar.appendChild(vsel);
+      if (versions.length > 1) {
+        vbar.appendChild(el('label', { text: 'diff against' }));
+        var dsel = el('select', { 'aria-label': 'diff against' });
+        dsel.appendChild(el('option', { value: '', text: '—' }));
+        versions.forEach(function (ts) {
+          if (String(ts) === String(d.generated_at_unix_ms)) { return; }
+          var o = el('option', { value: String(ts), text: cxgIso(ts) });
+          if (String(ts) === state.diffAgainst) { o.setAttribute('selected', 'selected'); }
+          dsel.appendChild(o);
+        });
+        dsel.addEventListener('change', function () { state.diffAgainst = dsel.value; loadDiff(); });
+        vbar.appendChild(dsel);
+      }
+      vbar.appendChild(el('span', { 'class': 'ctl-desc', text: 'generated ' + cxgIso(d.generated_at_unix_ms) + ' by ' + (d.generated_by_passport || 'anonymous') }));
+      pane.appendChild(vbar);
+
+      if (state.diff) {
+        var f = state.diff;
+        pane.appendChild(m6Label('diff ' + cxgIso(f.from_ts) + ' → ' + cxgIso(f.to_ts)));
+        pane.appendChild(m6Kv([
+          ['added', (f.added_sections || []).map(cxgSectionTitle).join(', ') || 'none'],
+          ['removed', (f.removed_sections || []).map(cxgSectionTitle).join(', ') || 'none'],
+          ['changed', (f.changed_sections || []).map(cxgSectionTitle).join(', ') || 'none'],
+          ['bytes', (Number(f.bytes_delta) >= 0 ? '+' : '') + String(f.bytes_delta)]
+        ]));
+      }
+
+      if (d.truncated) {
+        pane.appendChild(el('p', { 'class': 'facts-cap', text: 'Budgeted read — ' + (d.sections_omitted || []).length + ' section(s) omitted at ' + CXG_STORY_BUDGET + ' tokens: ' + (d.sections_omitted || []).map(cxgSectionTitle).join(', ') }));
+      }
+
+      var sections = d.sections || {};
+      var keys = Object.keys(sections).sort(function (a, b) {
+        // Mirror the daemon's canonical order: the planes intro precedes the
+        // planes it introduces, despite sorting after them as a plain key.
+        var ka = a === '30_planes_intro' ? '30_plane' : a;
+        var kb = b === '30_planes_intro' ? '30_plane' : b;
+        return ka < kb ? -1 : (ka > kb ? 1 : 0);
+      });
+      if (!keys.length) { pane.appendChild(m6Empty('This readout has no sections.')); return; }
+      var list = el('div', { 'class': 'facts-groups' });
+      keys.forEach(function (k) {
+        var body = el('div', { 'class': 'facts-detail' }, [renderMarkdown(sections[k])]);
+        var row = el('div', { 'class': 'facts-row' + (k === '60_alerts' || k === '00_front' ? ' open' : '') }, [
+          el('div', { 'class': 'facts-rhead' }, [
+            el('span', { 'class': 'facts-key', text: cxgSectionTitle(k) }),
+            el('span', { 'class': 'facts-entity', text: k }),
+            el('span', { 'class': 'facts-time', text: String(sections[k].length) + ' chars' })
+          ]),
+          body
+        ]);
+        row.addEventListener('click', function (ev) {
+          if (ev.target && ev.target.closest && ev.target.closest('.facts-detail')) { return; }
+          row.classList.toggle('open');
+        });
+        list.appendChild(row);
+      });
+      pane.appendChild(list);
+    }
+
+    // ---- Dossier pane ----------------------------------------------------
+    function claimRow(c) {
+      var head = el('div', { 'class': 'cxg-claim-h' }, [
+        el('b', { text: c.kind || 'claim' }),
+        el('span', { text: c.subject || '' }),
+        c.object ? el('span', { 'class': 'facts-entity', text: '→ ' + c.object }) : null,
+        el('span', { 'class': 'facts-time', text: 'conf ' + (c.confidence == null ? '—' : Number(c.confidence).toFixed(2)) })
+      ]);
+      var kids = [head];
+      if ((c.evidence || []).length) {
+        kids.push(el('p', { 'class': 'cxg-claim-ev', text: 'evidence: ' + c.evidence.join(' · ') }));
+      } else {
+        kids.push(el('p', { 'class': 'cxg-claim-ev', text: 'no evidence stated — not independently checkable' }));
+      }
+      if (c.rationale) { kids.push(el('p', { 'class': 'cxg-claim-ev', text: 'why: ' + m6Short(c.rationale, 240) })); }
+      return el('div', { 'class': 'cxg-claim ' + cxgConfClass(c.confidence) }, kids);
+    }
+
+    function paintReconciliation(into) {
+      var r = state.recon;
+      if (!r) {
+        into.appendChild(m6Empty('Reconciliation unavailable — ' + (state.reconStatus === 0 ? 'daemon unreachable' : 'HTTP ' + state.reconStatus) + '.'));
+        return;
+      }
+      var s = r.stats || {};
+      into.appendChild(el('div', { 'class': 'cxg-stats' }, [
+        statTile((r.agents || []).length, 'agents'),
+        statTile(s.disagreement_count, 'disagreements', Number(s.disagreement_count) > 0),
+        statTile(s.agreement_count, 'agreements'),
+        statTile(s.unique_count, 'single-agent claims'),
+        statTile(s.total_distinct_subjects, 'subjects')
+      ]));
+      if (r.truncated) {
+        into.appendChild(el('p', { 'class': 'facts-cap', text: 'Budgeted read at ' + CXG_DOSSIER_BUDGET + ' tokens — omitted ' + (r.disagreements_omitted || 0) + ' disagreement(s), ' + (r.agreements_omitted || 0) + ' agreement(s), ' + (r.unique_omitted || 0) + ' single-agent claim(s).' }));
+      }
+
+      into.appendChild(m6Label('disagreement — agents claim conflicting things about the same subject'));
+      var dis = r.disagreement || [];
+      if (!dis.length) {
+        into.appendChild(m6Empty('None. Every subject two or more agents touched, they agree on.'));
+      } else {
+        dis.forEach(function (g) {
+          var variants = (g.variants || []).map(function (v) {
+            return el('div', { 'class': 'cxg-claim conf-low' }, [
+              el('div', { 'class': 'cxg-claim-h' }, [
+                el('b', { text: v.object == null ? '(no object)' : v.object }),
+                el('span', { 'class': 'facts-time', text: 'max conf ' + Number(v.max_confidence || 0).toFixed(2) })
+              ]),
+              el('p', { 'class': 'cxg-claim-ev', text: 'claimed by: ' + (v.agents || []).join(', ') })
+            ]);
+          });
+          into.appendChild(el('div', { 'class': 'facts-row open tone-warn' }, [
+            el('div', { 'class': 'facts-rhead' }, [
+              el('span', { 'class': 'facts-key', text: g.subject || '(subject)' }),
+              m6Chip('facts-badge', g.kind || 'claim', 'claim kind'),
+              el('span', { 'class': 'facts-time', text: (g.variants || []).length + ' variants' })
+            ]),
+            el('div', { 'class': 'facts-detail' }, variants)
+          ]));
+        });
+      }
+
+      into.appendChild(m6Label('agreement — two or more agents concur'));
+      var agr = r.agreement || [];
+      if (!agr.length) { into.appendChild(m6Empty('None yet.')); }
+      else {
+        agr.slice(0, 50).forEach(function (a) {
+          into.appendChild(el('div', { 'class': 'cxg-claim conf-high' }, [
+            el('div', { 'class': 'cxg-claim-h' }, [
+              el('b', { text: a.kind || 'claim' }), el('span', { text: a.subject || '' }),
+              a.object ? el('span', { 'class': 'facts-entity', text: '→ ' + a.object }) : null,
+              el('span', { 'class': 'facts-time', text: 'avg ' + Number(a.avg_confidence || 0).toFixed(2) })
+            ]),
+            el('p', { 'class': 'cxg-claim-ev', text: 'agreed by: ' + (a.agreed_by_agents || []).join(', ') })
+          ]));
+        });
+        if (agr.length > 50) { into.appendChild(el('p', { 'class': 'facts-cap', text: 'showing 50 of ' + agr.length })); }
+      }
+    }
+
+    function paintDossiers() {
+      pane.textContent = '';
+      if (!state.projectId) { pane.appendChild(m6Empty('Pick a project above.')); return; }
+
+      var recon = el('div');
+      paintReconciliation(recon);
+      pane.appendChild(recon);
+
+      pane.appendChild(m6Label('dossiers — one belief snapshot per agent, newest first'));
+      if (!state.dossiers.length) {
+        if (state.dossierStatus && state.dossierStatus !== 200) {
+          pane.appendChild(m6Empty('Dossiers unavailable — ' + (state.dossierStatus === 0 ? 'daemon unreachable' : 'HTTP ' + state.dossierStatus) + '.'));
+        } else {
+          pane.appendChild(el('div', { 'class': 'facts-banner ok-empty' }, [
+            el('div', { 'class': 'm6-help-h', text: 'No dossiers for this project yet.' }),
+            el('p', { 'class': 'ctl-desc', text: 'A dossier is one agent’s structured snapshot of what it currently believes: claims with confidence and evidence, known unknowns, contradictions, and what it would investigate next. Agents write them over MCP (publish_project_dossier) so the next session does not re-derive the same conclusions; “Generate dossier” above produces the daemon’s own deterministic one from current state.' })
+          ]));
+        }
+        return;
+      }
+      var list = el('div', { 'class': 'facts-groups' });
+      state.dossiers.forEach(function (d) {
+        var detail = el('div', { 'class': 'facts-detail' });
+        var row = el('div', { 'class': 'facts-row' + (state.open[d.dossier_id] ? ' open' : '') }, [
+          el('div', { 'class': 'facts-rhead' }, [
+            el('span', { 'class': 'facts-key', text: d.agent_passport || 'anonymous' }),
+            el('span', { 'class': 'facts-entity', text: d.dossier_id }),
+            el('span', { 'class': 'facts-time', text: cxgIso(d.generated_at_unix_ms) })
+          ]),
+          detail
+        ]);
+        function fill() {
+          detail.textContent = '';
+          var full = state.loaded[d.dossier_id];
+          if (!full) { detail.appendChild(el('p', { 'class': 'facts-loading', text: 'loading…' })); return; }
+          if (full.__error) { detail.appendChild(m6Empty('Could not load — HTTP ' + full.__error)); return; }
+          var b = full.based_on || {};
+          detail.appendChild(m6Kv([
+            ['based on storybook', b.storybook_ts ? cxgIso(b.storybook_ts) : 'none'],
+            ['workspace scan', b.workspace_scan_id || 'none'],
+            ['planes', String(b.plane_count == null ? '—' : b.plane_count)],
+            ['graph nodes', String(b.graph_node_count == null ? '—' : b.graph_node_count)]
+          ]));
+          if (full.truncated) {
+            detail.appendChild(el('p', { 'class': 'facts-cap', text: 'Budgeted read — ' + full.claims_omitted + ' lowest-confidence claim(s) omitted at ' + CXG_DOSSIER_BUDGET + ' tokens.' }));
+          }
+          // Grouped by kind: a reader scanning a dossier is asking "what does
+          // this agent think it knows about X", and kind is the axis for that.
+          var byKind = {};
+          (full.claims || []).forEach(function (c) { (byKind[c.kind || 'claim'] = byKind[c.kind || 'claim'] || []).push(c); });
+          var kinds = Object.keys(byKind).sort();
+          if (!kinds.length) { detail.appendChild(m6Empty('No claims in this dossier.')); }
+          kinds.forEach(function (k) {
+            detail.appendChild(m6Label(k + ' · ' + byKind[k].length));
+            byKind[k].forEach(function (c) { detail.appendChild(claimRow(c)); });
+          });
+          [['uncertainties', 'uncertainties — known unknowns'], ['contradictions', 'contradictions'], ['open_questions', 'open questions']].forEach(function (pair) {
+            var items = full[pair[0]] || [];
+            if (!items.length) { return; }
+            detail.appendChild(m6Label(pair[1] + ' · ' + items.length));
+            items.forEach(function (u) {
+              var text = typeof u === 'string' ? u
+                : (u.question ? u.question + (u.best_guess ? ' — best guess: ' + u.best_guess : '')
+                  : (u.claim_a ? u.claim_a + ' vs ' + u.claim_b + (u.resolution ? ' — ' + u.resolution : '') : JSON.stringify(u)));
+              detail.appendChild(el('p', { 'class': 'cxg-claim-ev', text: text }));
+            });
+          });
+        }
+        row.addEventListener('click', function (ev) {
+          if (ev.target && ev.target.closest && ev.target.closest('.facts-detail')) { return; }
+          var opening = !row.classList.contains('open');
+          row.classList.toggle('open');
+          state.open[d.dossier_id] = opening;
+          if (!opening) { return; }
+          if (state.loaded[d.dossier_id]) { fill(); return; }
+          fill();   // paints the loading line
+          cxgCall('projectsByIdDossiersByDossierId', [state.projectId, d.dossier_id, { token_budget: CXG_DOSSIER_BUDGET }])
+            .then(function (r) {
+              state.loaded[d.dossier_id] = (r.ok && r.data) ? r.data : { __error: r.status };
+              fill();
+            });
+        });
+        if (state.open[d.dossier_id]) { fill(); }
+        list.appendChild(row);
+      });
+      pane.appendChild(list);
+    }
+
+    function paint() {
+      paintBar(); paintTabs();
+      if (state.tab === 'storybook') { paintStorybook(); } else { paintDossiers(); }
+    }
+
+    // ---- Loads -----------------------------------------------------------
+    function loadStorybook() {
+      if (!state.projectId) { return; }
+      var myToken = ++state.storyToken;
+      var q = { token_budget: CXG_STORY_BUDGET };
+      var call = state.ts
+        ? cxgCall('projectsByIdStorybookByTs', [state.projectId, state.ts, q])
+        : cxgCall('projectsByIdStorybook', [state.projectId, q]);
+      call.then(function (r) {
+        if (myToken !== state.storyToken) { return; }
+        state.storyStatus = r.status;
+        state.story = (r.ok && r.data) ? r.data : null;
+        if (state.tab === 'storybook') { paint(); }
+      });
+    }
+    function loadDiff() {
+      if (!state.projectId || !state.story || !state.diffAgainst) { state.diff = null; paint(); return; }
+      var a = Math.min(Number(state.diffAgainst), Number(state.story.generated_at_unix_ms));
+      var b = Math.max(Number(state.diffAgainst), Number(state.story.generated_at_unix_ms));
+      cxgCall('projectsByIdStorybookDiff', [state.projectId, { a: a, b: b }]).then(function (r) {
+        state.diff = (r.ok && r.data) ? r.data : null;
+        if (!state.diff) { say('err', 'Diff unavailable — HTTP ' + r.status + '.'); }
+        paint();
+      });
+    }
+    function loadDossiers() {
+      if (!state.projectId) { return; }
+      var myToken = ++state.dossierToken;
+      Promise.all([
+        cxgCall('projectsByIdDossiers', [state.projectId, { token_budget: CXG_DOSSIER_BUDGET }]),
+        cxgCall('projectsByIdDossiersReconcile', [state.projectId, { token_budget: CXG_DOSSIER_BUDGET }])
+      ]).then(function (rr) {
+        if (myToken !== state.dossierToken) { return; }
+        state.dossierStatus = rr[0].status;
+        state.dossiers = (rr[0].ok && rr[0].data) ? (rr[0].data.dossiers || []) : [];
+        state.reconStatus = rr[1].status;
+        state.recon = (rr[1].ok && rr[1].data) ? rr[1].data : null;
+        state.loaded = {};
+        if (state.tab === 'dossiers') { paint(); }
+      });
+    }
+    function selectProject(id) {
+      state.projectId = id; state.ts = null; state.diff = null; state.diffAgainst = '';
+      state.story = null; state.dossiers = []; state.recon = null; state.open = {}; state.loaded = {};
+      say('', '');
+      paint();
+      loadStorybook(); loadDossiers();
+    }
+
+    paint();
+    fetchJSON('/v1/projects').then(function (r) {
+      if (!r.ok || !r.data) {
+        say('err', 'Projects unavailable — ' + (r.status === 0 ? 'daemon unreachable' : 'HTTP ' + r.status) + ' (needs admin:read).');
+        paint();
+        return;
+      }
+      state.projects = r.data.projects || [];
+      var preferred = state.projects.filter(function (p) { return p.is_default && !p.archived; })[0]
+        || state.projects.filter(function (p) { return !p.archived; })[0]
+        || state.projects[0];
+      if (preferred) { selectProject(preferred.id); } else { paint(); }
+    });
+  }
+
   function renderExplorer(host, ctx) {
     ctx = ctx || {};
     host.textContent = '';
@@ -15250,6 +15831,11 @@
     renderTileCanvas: renderTileCanvas,
     buildGraphModel: buildGraphModel,
     // M4a — plan-rooted tree join (pure; unit-tested by the smoke) + its view
+    // cx-storybook (context graph). `renderMarkdown` is pure and exported so the
+    // smoke can assert the readout is built as DOM nodes, never innerHTML — the
+    // narrative interpolates project-layer text an operator wrote.
+    renderMarkdown: renderMarkdown,
+    renderContextGraph: renderContextGraph,
     // (planTreeNode exposed so the smoke can paint the model into a mock DOM).
     buildPlanTree: buildPlanTree,
     planTreeNode: planTreeNode,
