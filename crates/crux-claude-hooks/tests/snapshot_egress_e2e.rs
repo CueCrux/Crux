@@ -24,7 +24,7 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread;
 use std::time::Duration;
 
@@ -34,6 +34,22 @@ fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
+
+/// Take the env lock, tolerating poisoning.
+///
+/// This lock orders env mutation; it guards no data invariant, so a poisoned
+/// lock is still safe to use. `.lock().unwrap()` was actively harmful: when one
+/// test failed a real assertion while holding it, every *other* test panicked at
+/// its own `lock()` line. One genuine failure presented as three, and two of
+/// them pointed at a line with nothing to do with the cause — which is exactly
+/// how the underlying flake here was first misdiagnosed.
+fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+    env_lock().lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Per-connection read timeout for the mock. Bounds a hung test; it is not a
+/// latency budget. See the note in `handle_conn`.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A capturing mock MCP daemon: accepts any number of requests on a random
 /// loopback port and records each raw request body. Stop + join to collect.
@@ -86,11 +102,19 @@ impl CapturingMock {
 /// reply with a generic JSON-RPC result satisfying every tool the hook calls.
 fn handle_conn(mut stream: std::net::TcpStream, requests: &Arc<Mutex<Vec<String>>>) {
     stream.set_nonblocking(false).ok();
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+    // Deadlock guard, not a latency budget. The old 2s was tight enough to fire
+    // under `cargo test --workspace` CPU contention: the read returned early,
+    // this handler recorded a TRUNCATED request, and the caller's
+    // `joined.contains("save_session")` assertion failed — a real-looking
+    // plaintext-egress failure caused purely by machine load. Nothing here is
+    // waiting on a network, so a long timeout costs nothing except in the hang
+    // case it exists to bound.
+    stream.set_read_timeout(Some(READ_TIMEOUT)).ok();
 
     let mut buf = Vec::with_capacity(8192);
     let mut tmp = [0u8; 4096];
     let mut header_end = None;
+    let mut truncated: Option<(usize, usize)> = None;
     loop {
         match stream.read(&mut tmp) {
             Ok(0) | Err(_) => break,
@@ -119,8 +143,23 @@ fn handle_conn(mut stream: std::net::TcpStream, requests: &Arc<Mutex<Vec<String>
                 Ok(n) => buf.extend_from_slice(&tmp[..n]),
             }
         }
+        // A short read here used to be indistinguishable from "the hook never
+        // sent that tool call" — the caller just saw a missing `save_session`
+        // and reported a plaintext-egress failure. Say so explicitly instead, so
+        // a future occurrence names itself rather than accusing the hook.
+        if buf.len() < he + body_len {
+            truncated = Some((buf.len().saturating_sub(he), body_len));
+        }
     }
-    requests.lock().unwrap().push(String::from_utf8_lossy(&buf).to_string());
+    let captured = String::from_utf8_lossy(&buf).to_string();
+    let entry = match truncated {
+        Some((got, want)) => format!(
+            "__TRUNCATED_CAPTURE__ read {got} of {want} expected body bytes (mock read timeout \
+             or client disconnect — NOT evidence about what the hook sent)\n{captured}"
+        ),
+        None => captured,
+    };
+    requests.lock().unwrap_or_else(PoisonError::into_inner).push(entry);
 
     // A generic result: `content` for text tools, empty `structuredContent.rows`
     // for query_facts. Enough for every call the hook makes to succeed.
@@ -176,7 +215,7 @@ fn precompact_input() -> String {
 
 #[test]
 fn no_plaintext_egress_in_any_request_with_seed_present() {
-    let _guard = env_lock().lock().unwrap();
+    let _guard = lock_env();
     let seed_hex = "11".repeat(32); // 32-byte seed as 64 hex chars
     let key_file = std::env::temp_dir().join(format!("egress-passport-{}.key", std::process::id()));
     std::fs::write(&key_file, &seed_hex).unwrap();
@@ -197,6 +236,14 @@ fn no_plaintext_egress_in_any_request_with_seed_present() {
 
     assert!(!requests.is_empty(), "hook made no MCP requests");
     let joined = requests.join("\n----\n");
+
+    // Fail on a truncated capture BEFORE the content assertions below, so a mock
+    // read timeout is never reported as a plaintext-egress or missing-tool-call
+    // failure. This is a harness fault, not a finding about the hook.
+    assert!(
+        !joined.contains("__TRUNCATED_CAPTURE__"),
+        "mock captured a partial request — harness fault, no conclusion about egress:\n{joined}"
+    );
 
     // The red line: no plaintext marker in ANY captured request.
     assert!(
@@ -221,7 +268,7 @@ fn bearer_equal_to_seed_refuses_hosted_sync() {
     // Finding 5: if CRUX_AGENT_TOKEN IS the passport seed, the server would hold
     // the key material — refuse to enable hosted snapshot sync (no store_fact),
     // even with the flag on. (save_session to this loopback mock is allowed.)
-    let _guard = env_lock().lock().unwrap();
+    let _guard = lock_env();
     let seed_hex = "3a".repeat(32); // valid 64-hex seed
     let key_file = std::env::temp_dir().join(format!("egress-reuse-passport-{}.key", std::process::id()));
     std::fs::write(&key_file, &seed_hex).unwrap();
@@ -252,7 +299,7 @@ fn flag_off_makes_no_encrypted_fact_calls() {
     // Finding 6: with the sync flag unset, the hosted-fact path must not fire —
     // no sync_status, no store_fact, no query_facts — even with a seed present.
     // save_session (the legacy path) still fires, sealed (Finding 1).
-    let _guard = env_lock().lock().unwrap();
+    let _guard = lock_env();
     let seed_hex = "22".repeat(32);
     let key_file = std::env::temp_dir().join(format!("egress-off-passport-{}.key", std::process::id()));
     std::fs::write(&key_file, &seed_hex).unwrap();
