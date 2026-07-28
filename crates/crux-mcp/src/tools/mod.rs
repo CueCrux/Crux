@@ -19,6 +19,7 @@ pub mod autonomy;
 pub mod consolidation;
 pub mod constraint;
 pub mod context_custody_audit;
+pub mod context_graph;
 pub mod coordination;
 pub mod cuecrux_session;
 pub mod decision;
@@ -1967,6 +1968,52 @@ pub fn list_tools_with_flags(
                 "examples": [{ "limit": 30 }]
             }),
         },
+        // ── Context graph — storybook readout + agent dossier exchange ──
+        // Adapters over /v1/projects/{id}/storybook* and .../dossiers*. The
+        // storybook says where a project is; dossiers say what each agent
+        // believes about it and where those beliefs conflict. Together they are
+        // the multi-session-drift surface: without them an agent re-derives
+        // every session what the last one already worked out.
+        ToolDefinition {
+            name: "get_project_storybook".to_string(),
+            description: context_graph::get_storybook_description().to_string(),
+            input_schema: context_graph::get_storybook_schema(),
+        },
+        ToolDefinition {
+            name: "generate_project_storybook".to_string(),
+            description: context_graph::generate_storybook_description().to_string(),
+            input_schema: context_graph::generate_storybook_schema(),
+        },
+        ToolDefinition {
+            name: "diff_project_storybook".to_string(),
+            description: context_graph::diff_storybook_description().to_string(),
+            input_schema: context_graph::diff_storybook_schema(),
+        },
+        ToolDefinition {
+            name: "get_project_dossiers".to_string(),
+            description: context_graph::get_dossiers_description().to_string(),
+            input_schema: context_graph::get_dossiers_schema(),
+        },
+        ToolDefinition {
+            name: "generate_project_dossier".to_string(),
+            description: context_graph::generate_dossier_description().to_string(),
+            input_schema: context_graph::generate_dossier_schema(),
+        },
+        ToolDefinition {
+            name: "publish_project_dossier".to_string(),
+            description: context_graph::publish_dossier_description().to_string(),
+            input_schema: context_graph::publish_dossier_schema(),
+        },
+        ToolDefinition {
+            name: "reconcile_project_dossiers".to_string(),
+            description: context_graph::reconcile_dossiers_description().to_string(),
+            input_schema: context_graph::reconcile_dossiers_schema(),
+        },
+        ToolDefinition {
+            name: "diff_project_dossiers".to_string(),
+            description: context_graph::diff_dossiers_description().to_string(),
+            input_schema: context_graph::diff_dossiers_schema(),
+        },
         // ── Workspace storyline ──────────────────────────────────────
         ToolDefinition {
             name: "get_workspace_storyline".to_string(),
@@ -2738,7 +2785,11 @@ fn rcx_capability_for_tool(tool_name: &str) -> String {
 /// function provides a standalone JSON document describing each tool's response
 /// shape. Included in the `get_bootstrap` response for agent discoverability.
 pub fn tool_output_docs() -> Value {
-    json!([
+    // Split across two `json!` arrays and concatenated: one literal this long
+    // exceeds serde_json's macro recursion limit. The split point carries no
+    // meaning — append new rows to `context_graph_output_docs` and it stays
+    // under the limit for the next few additions too.
+    let mut rows = match json!([
         { "tool": "cuecrux_session",    "output": "SessionPlan (see agents.cuecrux.com/schemas/SessionPlan.v1). Contains plan_id, session_id, passport, channels {bulk?, mcp}, capability_graph[], receipt {hash, signature?, signer_kid?, mode}, budget, minted_at, session_ttl_s." },
         { "tool": "autonomy_contract",  "output": "{ feature_enabled, passport_id, tier, token_id, token_hash, capabilities: [{name, allowed, scope, backend_id, mode, cost_credits, why_denied?}], summary: {total_tools, returned, allowed, denied, truncated_by_token_budget} }. Disabled when CORECRUXD_FEATURE_AUTONOMY_CONTRACT is off (feature_enabled=false, empty capabilities)." },
         { "tool": "reuse_check",        "output": "{ schema, verdict: 'reuse-candidate-found'|'nothing-found', retrieval_candidates: [{result_id, rank, score, doc_length_tokens}], capability_candidates: [{id, name, system, maturity, files, overlap_terms}], guidance }. CAPABILITY_DENIED when CORECRUXD_FEATURE_REUSE_CHECK is off (default)." },
@@ -2858,6 +2909,30 @@ pub fn tool_output_docs() -> Value {
         { "tool": "check_punchcard",          "output": "Lease probe { held_by_other, enforce, holder_passport, resource, mode, expires_at_unix_ms }. Always 200 (fail-open); the PreToolUse hook denies only when held_by_other && enforce." },
         { "tool": "register_repo",            "output": "Proxied POST /v1/repos: the registration { repo_id, tenant_id, root_path?, clone_url?, languages: [string], enabled, added_at_unix_ms, last_scan_id? }. Registering a local root_path runs a one-shot scan and sets last_scan_id; clone_url registration defers the scan." },
         { "tool": "list_repos",               "output": "Proxied GET /v1/repos?tenant_id=…: { repos: [{ repo_id, tenant_id, root_path?, clone_url?, languages, enabled, last_scan_id? }] } scoped to the caller's tenant." }
+    ]) {
+        Value::Array(v) => v,
+        other => return other,
+    };
+    if let Value::Array(extra) = context_graph_output_docs() {
+        rows.extend(extra);
+    }
+    Value::Array(rows)
+}
+
+/// Output shapes for the context-graph tools (storybook + dossiers).
+///
+/// Split out of [`tool_output_docs`] purely to keep each `json!` literal under
+/// the macro recursion limit; the contents belong to the same document.
+fn context_graph_output_docs() -> Value {
+    json!([
+        { "tool": "get_project_storybook",      "output": "StorybookDocument + selection report: { project_id, generated_at_unix_ms, generated_by_passport, markdown, sections: {section_id: md}, stats: { plane_count, planes_with_vision, planes_with_mapped_modules, orphan_planes[], workspace_loc, stub_count, dead_code_count, bytes }, truncated, sections_omitted[], available_versions[] }. `markdown` is rebuilt from the surviving sections when `section` or `token_budget` trimmed anything." },
+        { "tool": "generate_project_storybook", "output": "{ project_id, generated_at_unix_ms, generated_by_passport, stats, bytes, section_count } — a summary, not the document. Read it back with get_project_storybook." },
+        { "tool": "diff_project_storybook",     "output": "{ from_ts, to_ts, added_sections[], removed_sections[], changed_sections[], bytes_delta }" },
+        { "tool": "get_project_dossiers",       "output": "Without dossier_id: { project_id, count, returned, truncated, dossiers_omitted, dossiers: [{ dossier_id, generated_at_unix_ms, agent_passport }] } (newest first; `count` is the total, `returned` what fit). With dossier_id: the Dossier { dossier_id, project_id, agent_passport, generated_at_unix_ms, based_on: { storybook_ts?, workspace_scan_id?, plane_count, graph_node_count }, claims: [{ claim_id, kind, subject, object?, confidence, evidence[], rationale? }], uncertainties[], contradictions[], open_questions[], stats } plus { truncated, claims_omitted }. stats always describes the STORED dossier, not the trimmed one." },
+        { "tool": "generate_project_dossier",   "output": "The freshly generated Dossier (same shape as get_project_dossiers with a dossier_id), already persisted." },
+        { "tool": "publish_project_dossier",    "output": "{ stored: true, dossier_id, agent, claim_count }" },
+        { "tool": "reconcile_project_dossiers", "output": "{ project_id, generated_at_unix_ms, dossier_count, agents[], agreement: [{ kind, subject, object?, agreed_by_agents[], max_confidence, avg_confidence }], disagreement: [{ kind, subject, variants: [{ object?, agents[], max_confidence }] }], unique: [{ kind, subject, object?, by_agent, confidence }], stats, truncated, disagreements_omitted, agreements_omitted, unique_omitted } — a budget is spent on disagreement first." },
+        { "tool": "diff_project_dossiers",      "output": "{ added_claims[], removed_claims[], confidence_changes: [{ claim_id, from, to }], stats_delta }" },
     ])
 }
 
@@ -2996,6 +3071,15 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "github_open_prs" => github::handle_github_open_prs(args, ctx).await,
         "github_open_issues" => github::handle_github_open_issues(args, ctx).await,
         "github_comments_since" => github::handle_github_comments_since(args, ctx).await,
+        // Context graph — storybook + dossiers (HTTP loopback to corecruxd).
+        "get_project_storybook" => context_graph::handle_get_project_storybook(args, ctx).await,
+        "generate_project_storybook" => context_graph::handle_generate_project_storybook(args, ctx).await,
+        "diff_project_storybook" => context_graph::handle_diff_project_storybook(args, ctx).await,
+        "get_project_dossiers" => context_graph::handle_get_project_dossiers(args, ctx).await,
+        "generate_project_dossier" => context_graph::handle_generate_project_dossier(args, ctx).await,
+        "publish_project_dossier" => context_graph::handle_publish_project_dossier(args, ctx).await,
+        "reconcile_project_dossiers" => context_graph::handle_reconcile_project_dossiers(args, ctx).await,
+        "diff_project_dossiers" => context_graph::handle_diff_project_dossiers(args, ctx).await,
         // Workspace storyline (HTTP loopback to corecruxd).
         "get_workspace_storyline" => storyline::handle_get_workspace_storyline(args, ctx).await,
         "register_repo" => repos::handle_register_repo(args, ctx).await,
@@ -3117,7 +3201,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 118; // +1 engram_resolve +1 reuse_check (minimalism plane M2/M3). +2 register_repo + list_repos (repo-watch M3). +1 status_feed (open-engine-coordination-surfaces M3). +1 context_custody_audit (race-to-context positioning). +1 revoke_passport (passport-revocation M2). main 94 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check + 2 coord-plane: coord_status + coord_announce + session_token_usage (action-ledger M1)) + 2 session-archive (archive_session + unarchive_session) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard) + 1 activity (activity_recent, crux-dual-surface-activity-log M2) + 2 consolidation (memory_contradictions + memory_consolidate, audit-ii M4) + 1 session-mining (learn, token-efficiency M4) + 1 holdout (token_savings, token-efficiency cutover CO-4).
+    const TOOL_COUNT: usize = 126; // +8 context_graph (3 storybook + 5 dossier, crux-storybook-dossier-agent-and-console-surface M2). // +1 engram_resolve +1 reuse_check (minimalism plane M2/M3). +2 register_repo + list_repos (repo-watch M3). +1 status_feed (open-engine-coordination-surfaces M3). +1 context_custody_audit (race-to-context positioning). +1 revoke_passport (passport-revocation M2). main 94 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check + 2 coord-plane: coord_status + coord_announce + session_token_usage (action-ledger M1)) + 2 session-archive (archive_session + unarchive_session) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard) + 1 activity (activity_recent, crux-dual-surface-activity-log M2) + 2 consolidation (memory_contradictions + memory_consolidate, audit-ii M4) + 1 session-mining (learn, token-efficiency M4) + 1 holdout (token_savings, token-efficiency cutover CO-4).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")

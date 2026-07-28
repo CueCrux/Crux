@@ -97,7 +97,13 @@ fn languages(args: &Value) -> Result<Vec<String>, JsonRpcError> {
     Ok(out)
 }
 
-async fn loopback_json(
+/// Proxy one request to the local corecruxd over the loopback surface and
+/// return its parsed JSON body.
+///
+/// Shared with [`super::context_graph`] so the MCP context-graph tools are thin
+/// adapters over the very same HTTP routes rather than a second implementation:
+/// a divergence between the two surfaces would be a silent correctness bug.
+pub(super) async fn loopback_json(
     tool: &'static str,
     method: &'static str,
     url: String,
@@ -213,7 +219,9 @@ pub async fn handle_list_repos(args: &Value, ctx: &McpContext) -> Result<Value, 
     loopback_json("list_repos", "GET", url, None, "admin:read").await
 }
 
-fn encode_query(value: &str) -> String {
+/// Percent-encode a value for use in a query string. Shared with
+/// [`super::context_graph`] — see [`loopback_json`].
+pub(super) fn encode_query(value: &str) -> String {
     value
         .chars()
         .map(|c| match c {

@@ -41,8 +41,13 @@ fn mcp_tool_call(tool: &str, arguments: serde_json::Value) -> serde_json::Value 
 }
 
 fn mcp_text_json(body: &serde_json::Value) -> serde_json::Value {
-    let text = body["result"]["content"][0]["text"].as_str().unwrap();
-    serde_json::from_str(text).unwrap()
+    let text = body["result"]["content"][0]["text"].as_str().unwrap_or_else(|| {
+        // A JSON-RPC error, or a tool that skipped the `content` envelope, both
+        // land here. Printing the whole body turns "unwrap on None" into a
+        // message that names the actual failure.
+        panic!("tools/call did not return result.content[0].text; body was: {body:#}")
+    });
+    serde_json::from_str(text).unwrap_or_else(|e| panic!("tools/call content was not JSON ({e}); text was: {text}"))
 }
 
 #[test]
@@ -1165,5 +1170,254 @@ fn receipt_not_found() {
             Ok(r) if [200, 400, 404, 412, 501].contains(&r.status().as_u16()) => {}
             other => panic!("{p}: {other:?}"),
         }
+    }
+}
+
+/// Context-graph MCP tools must return exactly what their HTTP counterparts do.
+///
+/// The whole design of `crux-mcp::tools::context_graph` is "thin adapter, one
+/// implementation" — the tools proxy to the same corecruxd routes rather than
+/// re-deriving anything. That claim is only worth making if it is checked: a
+/// divergence between the two surfaces would be a silent correctness bug, where
+/// an agent and an operator looking at the same project disagree about it.
+#[test]
+fn context_graph_mcp_tools_match_their_http_counterparts() {
+    let d = daemon();
+    let project_id = unique_id("ctxgraph");
+    let passport_id = unique_id("p-ctxgraph");
+
+    d.post_json(
+        "/v1/passports",
+        json!({ "id": passport_id, "category": "work", "name": "ctx graph parity" }),
+    )
+    .unwrap();
+    let created: serde_json::Value = d
+        .post_json(
+            "/v1/projects",
+            json!({
+                "id": project_id,
+                "name": "Context Graph Parity",
+                "planning_target": "github://cuecrux/crux",
+                "default_passport_id": passport_id,
+                "working_tenants": ["tenant-ctxgraph"]
+            }),
+        )
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(created["id"], project_id);
+
+    d.put_json(
+        &format!("/v1/projects/{project_id}/layers/vision"),
+        json!({ "content": "A daemon that remembers what every agent worked out." }),
+    )
+    .unwrap();
+
+    // ── Storybook ────────────────────────────────────────────────────────
+    let mcp_gen = mcp_text_json(&mcp_tool_call(
+        "generate_project_storybook",
+        json!({ "project_id": project_id }),
+    ));
+    assert_eq!(mcp_gen["project_id"], project_id.as_str());
+    let first_ts = mcp_gen["generated_at_unix_ms"].as_u64().unwrap();
+
+    let budget = 4000u64;
+    let http_story: serde_json::Value = d
+        .get(&format!("/v1/projects/{project_id}/storybook?token_budget={budget}"))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    let mcp_story = mcp_text_json(&mcp_tool_call(
+        "get_project_storybook",
+        json!({ "project_id": project_id, "token_budget": budget }),
+    ));
+    assert_eq!(
+        http_story, mcp_story,
+        "get_project_storybook diverged from GET /v1/projects/{{id}}/storybook"
+    );
+    assert!(http_story["available_versions"]
+        .as_array()
+        .is_some_and(|v| v.contains(&json!(first_ts))));
+
+    // The section filter is the reason an agent would reach for this over
+    // reading the whole readout, so it is checked for parity too.
+    let http_alerts: serde_json::Value = d
+        .get(&format!(
+            "/v1/projects/{project_id}/storybook?token_budget=1500&section=60"
+        ))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    let mcp_alerts = mcp_text_json(&mcp_tool_call(
+        "get_project_storybook",
+        json!({ "project_id": project_id, "token_budget": 1500, "section": "60" }),
+    ));
+    assert_eq!(http_alerts, mcp_alerts, "section filter diverged");
+    assert_eq!(http_alerts["truncated"], true);
+
+    // A budget is a contract, not a hint: what came back must fit it.
+    let sent = serde_json::to_string(&mcp_story).unwrap().len();
+    assert!(
+        sent.div_ceil(4) <= budget as usize,
+        "storybook overshot: {sent} bytes for a {budget}-token budget"
+    );
+
+    // Regenerate so there are two versions to diff.
+    let second = mcp_text_json(&mcp_tool_call(
+        "generate_project_storybook",
+        json!({ "project_id": project_id }),
+    ));
+    let second_ts = second["generated_at_unix_ms"].as_u64().unwrap();
+    if second_ts != first_ts {
+        let http_diff: serde_json::Value = d
+            .get(&format!(
+                "/v1/projects/{project_id}/storybook/diff?a={first_ts}&b={second_ts}"
+            ))
+            .unwrap()
+            .into_body()
+            .read_json()
+            .unwrap();
+        let mcp_diff = mcp_text_json(&mcp_tool_call(
+            "diff_project_storybook",
+            json!({ "project_id": project_id, "a": first_ts, "b": second_ts }),
+        ));
+        assert_eq!(http_diff, mcp_diff, "diff_project_storybook diverged");
+    }
+
+    // ── Dossiers ─────────────────────────────────────────────────────────
+    let auto = mcp_text_json(&mcp_tool_call(
+        "generate_project_dossier",
+        json!({ "project_id": project_id }),
+    ));
+    let auto_id = auto["dossier_id"].as_str().unwrap().to_string();
+    assert_eq!(auto["project_id"], project_id.as_str());
+
+    let published = mcp_text_json(&mcp_tool_call(
+        "publish_project_dossier",
+        json!({
+            "project_id": project_id,
+            "dossier": {
+                "dossier_id": "dsr-parity-peer",
+                "project_id": project_id,
+                "agent_passport": "p_peer_agent",
+                "claims": [{
+                    "claim_id": "c1",
+                    "kind": "implements",
+                    "subject": "plane:parity:core",
+                    "object": "crate:corecruxd",
+                    "confidence": 0.9,
+                    "evidence": ["crates/corecruxd/src/main.rs:1"]
+                }],
+                "open_questions": ["does the dense lane run on this build?"]
+            }
+        }),
+    ));
+    assert_eq!(published["stored"], true);
+    assert_eq!(published["claim_count"], 1);
+
+    let http_list: serde_json::Value = d
+        .get(&format!("/v1/projects/{project_id}/dossiers?token_budget=2000"))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    let mcp_list = mcp_text_json(&mcp_tool_call(
+        "get_project_dossiers",
+        json!({ "project_id": project_id, "token_budget": 2000 }),
+    ));
+    assert_eq!(http_list, mcp_list, "get_project_dossiers (list) diverged");
+    assert!(http_list["count"].as_u64().unwrap() >= 2);
+
+    let http_one: serde_json::Value = d
+        .get(&format!(
+            "/v1/projects/{project_id}/dossiers/{auto_id}?token_budget=3000"
+        ))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    let mcp_one = mcp_text_json(&mcp_tool_call(
+        "get_project_dossiers",
+        json!({ "project_id": project_id, "token_budget": 3000, "dossier_id": auto_id }),
+    ));
+    assert_eq!(http_one, mcp_one, "get_project_dossiers (single) diverged");
+
+    let http_rec: serde_json::Value = d
+        .get(&format!(
+            "/v1/projects/{project_id}/dossiers/reconcile?token_budget=2000"
+        ))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    let mcp_rec = mcp_text_json(&mcp_tool_call(
+        "reconcile_project_dossiers",
+        json!({ "project_id": project_id, "token_budget": 2000 }),
+    ));
+    // `generated_at_unix_ms` is the report's own wall clock, stamped per call,
+    // so it differs between two requests by construction. Everything derived
+    // from stored state must match exactly.
+    let strip_clock = |mut v: serde_json::Value| {
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("generated_at_unix_ms");
+        }
+        v
+    };
+    assert_eq!(
+        strip_clock(http_rec.clone()),
+        strip_clock(mcp_rec),
+        "reconcile_project_dossiers diverged"
+    );
+    assert!(http_rec["agents"].as_array().is_some_and(|a| a.len() >= 2));
+
+    let http_ddiff: serde_json::Value = d
+        .get(&format!(
+            "/v1/projects/{project_id}/dossiers/diff?a={auto_id}&b=dsr-parity-peer"
+        ))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    let mcp_ddiff = mcp_text_json(&mcp_tool_call(
+        "diff_project_dossiers",
+        json!({ "project_id": project_id, "a": auto_id, "b": "dsr-parity-peer" }),
+    ));
+    assert_eq!(http_ddiff, mcp_ddiff, "diff_project_dossiers diverged");
+}
+
+/// All eight context-graph tools must be listed by `tools/list` and reachable.
+#[test]
+fn context_graph_tools_are_listed_and_callable() {
+    let listed: serde_json::Value = daemon()
+        .mcp_post_json(json!({
+            "jsonrpc": "2.0",
+            "id": unique_id("mcp-list"),
+            "method": "tools/list",
+            "params": {}
+        }))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    let names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    for tool in [
+        "get_project_storybook",
+        "generate_project_storybook",
+        "diff_project_storybook",
+        "get_project_dossiers",
+        "generate_project_dossier",
+        "publish_project_dossier",
+        "reconcile_project_dossiers",
+        "diff_project_dossiers",
+    ] {
+        assert!(names.contains(&tool), "tools/list is missing {tool}");
     }
 }
