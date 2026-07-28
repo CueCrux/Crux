@@ -39,13 +39,70 @@ the same `CRUX_MCP_HANDOFF_SECRET` on every instance.
 
 ## Claude Desktop
 
-Copy `claude-desktop.json` into your Claude Desktop configuration:
+**Preferred: install the bundle from the console.** Open the console
+(`localhost:14800`) → the account badge → **Connections**, and download
+`crux.mcpb`. Drag it onto Claude Desktop's Settings → Extensions pane. Desktop
+prompts for the two values it needs — the MCP endpoint URL and the agent token —
+so there is no config file to hand-edit.
+
+That page also reports the endpoint URLs and the agent-token state. The token's
+raw value is shown only when the daemon sets
+`CORECRUXD_CONSOLE_REVEAL_AGENT_TOKEN=1`; otherwise you get a fingerprint and
+length, enough to confirm you are holding the right credential. Paste the raw
+token into Desktop — the `Bearer ` prefix is added for you. Leave the field
+blank if the daemon runs without token auth.
+
+The bundle is unsigned. Desktop accepts it today; a future Desktop policy may
+require signatures.
+
+### Hand-editing the config instead
+
+The config file lives at:
 
 - **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
 - **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
 - **Linux:** `~/.config/claude/claude_desktop_config.json`
 
-Merge the `mcpServers` object with any existing servers in your config.
+On **macOS and Linux**, merge `claude-desktop.json`'s `mcpServers` object into
+that file.
+
+On **Windows this does not work.** Claude Desktop rejects the native
+`{"url": ...}` shape there — it reports the entry as "not valid MCP server
+configurations and were skipped" and accepts only stdio-transport servers. Use
+the `mcp-remote` shim:
+
+```json
+{
+  "mcpServers": {
+    "crux": {
+      "command": "C:\\Users\\<you>\\AppData\\Roaming\\npm\\mcp-remote.cmd",
+      "args": [
+        "https://crux.example.com/mcp",
+        "--transport", "http-only",
+        "--allow-http",
+        "--header", "Authorization:${CRUX_AUTH_HEADER}"
+      ],
+      "env": { "CRUX_AUTH_HEADER": "Bearer <CRUX_AGENT_TOKEN>" }
+    }
+  }
+}
+```
+
+Three things that bite, in order:
+
+1. **Install `mcp-remote` globally** (`npm install -g mcp-remote`) and use the
+   full `.cmd` path. Setting `"command": "npx"` resolves to
+   `C:\Program Files\nodejs\npx.cmd`; Desktop wraps commands in `cmd /C` without
+   quoting, so `C:\Program` is parsed as the program name and the server dies.
+2. **The token goes in `env`, not inline in the header arg.** Desktop strips
+   spaces in args, which would mangle `Bearer <token>`. `mcp-remote` expands
+   `${VAR}` inside `--header` values, so the space survives in the environment.
+   This also keeps the secret out of the process argv.
+3. **`--allow-http`** is required for a plain-HTTP endpoint that is not
+   localhost (a tailnet daemon). Harmless on HTTPS.
+
+Read `%APPDATA%\Claude\logs\mcp*.log` after each restart — the args array is
+logged verbatim on startup, so a misconfiguration is visible immediately.
 
 ## Claude Code
 
