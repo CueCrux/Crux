@@ -77,10 +77,24 @@ const CONSOLE3D_VENDOR_THREE: &str = include_str!("../console/console-3d/vendor/
 const CONSOLE3D_VENDOR_ORBIT: &str = include_str!("../console/console-3d/vendor/OrbitControls.js");
 const CONSOLE3D_VENDOR_ROUNDED: &str = include_str!("../console/console-3d/vendor/RoundedBoxGeometry.js");
 
+// Claude Desktop connector bundle, offered as a one-click download from the
+// console's Connections page. An `.mcpb` is a zip of `manifest.json` plus the
+// server it runs; Desktop's `server.type` accepts only node/python/binary, so a
+// remote HTTP daemon has to ship a local stdio shim — here a pinned, vendored
+// `mcp-remote`. The artifact is PREBUILT and committed (rebuild with
+// `console/mcpb/build.sh`) so a `cargo build` never needs npm and can never
+// resolve a different dependency version.
+//
+// It carries no per-install state: the endpoint URL and agent token are mcpb
+// `user_config` fields that Desktop prompts for at install time, so every
+// operator downloads identical bytes.
+const ASSET_CLAUDE_DESKTOP_MCPB: &[u8] = include_bytes!("../console/assets/crux.mcpb");
+
 fn embedded_asset(name: &str) -> Option<&'static [u8]> {
     match name {
         "CueCrux-Arc-Loop.png" => Some(ASSET_LOGO_DARK),
         "CueCrux-Arc-Loop-White.png" => Some(ASSET_LOGO_WHITE),
+        "crux.mcpb" => Some(ASSET_CLAUDE_DESKTOP_MCPB),
         _ => None,
     }
 }
@@ -193,14 +207,24 @@ fn asset_response(name: &str, bytes: Vec<u8>) -> Response {
     } else {
         "application/octet-stream"
     };
-    (
+    let mut response = (
         [
             (header::CONTENT_TYPE, content_type),
             (header::CACHE_CONTROL, "public, max-age=86400"),
         ],
         bytes,
     )
-        .into_response()
+        .into_response();
+    // Connector bundles are downloads, not things to render. Without an
+    // attachment disposition a browser hands the octet-stream to its own
+    // save-file guesswork and the operator ends up with `download` or
+    // `crux.mcpb.zip` — Claude Desktop only accepts the `.mcpb` extension.
+    if ext_eq("mcpb") {
+        if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{name}\"")) {
+            response.headers_mut().insert(header::CONTENT_DISPOSITION, value);
+        }
+    }
+    response
 }
 
 /// Embedded 3D substrate assets, keyed by their path under `/console-3d/`.
@@ -1014,6 +1038,47 @@ mod tests {
             .iter()
             .map(|v| v.to_str().expect("origin is ascii").to_string())
             .collect()
+    }
+
+    #[test]
+    fn claude_desktop_bundle_is_embedded_and_is_a_zip() {
+        // The bundle is a committed build artifact, so a truncated or
+        // LFS-pointer-shaped checkout would otherwise only surface as a
+        // Claude Desktop install failure on someone's laptop.
+        let bytes = super::embedded_asset("crux.mcpb").expect("crux.mcpb is embedded");
+        assert_eq!(
+            &bytes[..4],
+            b"PK\x03\x04",
+            "an .mcpb is a zip archive; got magic {:?}",
+            &bytes[..4]
+        );
+        assert!(
+            bytes.len() > 500_000,
+            "bundle vendors mcp-remote and should be ~1.5MB, got {} bytes",
+            bytes.len()
+        );
+    }
+
+    #[test]
+    fn mcpb_asset_is_served_as_a_named_download() {
+        // Desktop only accepts the `.mcpb` extension, so the filename has to
+        // survive the download — an octet-stream with no disposition leaves the
+        // browser to guess and it guesses wrong.
+        let response = super::asset_response("crux.mcpb", vec![b'P', b'K', 3, 4]);
+        let headers = response.headers();
+        assert_eq!(
+            headers.get(super::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/octet-stream")
+        );
+        assert_eq!(
+            headers
+                .get(super::header::CONTENT_DISPOSITION)
+                .and_then(|v| v.to_str().ok()),
+            Some("attachment; filename=\"crux.mcpb\"")
+        );
+        // Images keep rendering inline — the disposition is mcpb-only.
+        let png = super::asset_response("CueCrux-Arc-Loop.png", vec![0x89, b'P', b'N', b'G']);
+        assert!(png.headers().get(super::header::CONTENT_DISPOSITION).is_none());
     }
 
     #[test]
