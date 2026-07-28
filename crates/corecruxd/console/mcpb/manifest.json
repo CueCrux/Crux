@@ -32,8 +32,8 @@
     "server_url": {
       "type": "string",
       "title": "Crux MCP endpoint",
-      "description": "Streamable-HTTP MCP URL. Public daemon: https://crux.cuecrux.com/mcp (no port). Same machine: http://127.0.0.1:14801/mcp. Tailnet: http://<tailnet-ip>:14801/mcp.",
-      "default": "https://crux.cuecrux.com/mcp",
+      "description": "Streamable-HTTP MCP URL. Defaults to a daemon on this machine. Another machine on your network: http://<host-or-tailnet-ip>:14801/mcp. Behind a TLS proxy: https://<your-host>/mcp (the MCP port is usually not exposed directly).",
+      "default": "http://127.0.0.1:14801/mcp",
       "required": true
     },
     "agent_token": {
