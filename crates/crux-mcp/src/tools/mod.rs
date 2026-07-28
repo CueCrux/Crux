@@ -3296,6 +3296,173 @@ mod tests {
         }
     }
 
+    /// Every catalogued tool must carry a `TOOL_SURFACE` tier, or the RCX router
+    /// refuses it outright.
+    ///
+    /// `rcx_local_capabilities` builds the permitted capability set by filtering
+    /// the catalogue through `is_local_tool`, so a tool absent from
+    /// `TOOL_SURFACE` never contributes `crux-mcp.<name>` and every call is
+    /// denied with `denied:capability_not_permitted`. That is not a degraded
+    /// surface — the tool is unreachable on any RCX-gated daemon, which is what
+    /// host `crux` runs.
+    ///
+    /// Nothing asserted this, which is why it kept happening: the daemon's own
+    /// test suite runs with no RCX router, so `enforce_rcx_tool_capability`
+    /// returns early and every tool appears to work. The gap is invisible until
+    /// something calls the tool through a real capability token.
+    ///
+    /// `KNOWN_UNTIERED` enumerates the tools already in that state when this
+    /// test was written. It is a **defect list, not an exemption**: which tools
+    /// are free-local and which are hosted-gated is an entitlement decision, so
+    /// they are recorded here to be triaged deliberately rather than silently
+    /// tiered by whoever noticed. Adding a NEW tool without a tier now fails.
+    #[test]
+    fn every_catalogued_tool_carries_a_tier() {
+        const KNOWN_UNTIERED: &[&str] = &[
+            "activity_recent",
+            "approval_decide",
+            "approval_request",
+            "archive_session",
+            "artefact_get",
+            "artefact_list",
+            "artefact_put",
+            "attach_to_orchestrator",
+            "audit_config",
+            "audit_export_bundle",
+            "auth_posture_audit",
+            "autonomy_contract",
+            "check_config_audit",
+            "check_punchcard",
+            "comment_on_work",
+            "context_custody_audit",
+            "coord_announce",
+            "coord_status",
+            "create_orchestrator",
+            "create_work",
+            "detach_from_orchestrator",
+            "edge_delete",
+            "edge_get",
+            "edge_list",
+            "edge_upsert",
+            "egress_policy_check",
+            "engram_resolve",
+            "enrich_action",
+            "entity_delete",
+            "entity_get",
+            "entity_history",
+            "entity_list",
+            "entity_upsert",
+            "execplan_gate",
+            "feature_coverage_report",
+            "feature_file_search",
+            "feature_suggest_next",
+            "feature_trigger_audit",
+            "force_release",
+            "get_observation",
+            "get_project_context",
+            "get_workspace_storyline",
+            "github_comments_since",
+            "github_open_issues",
+            "github_open_prs",
+            "github_recent_commits",
+            "github_search",
+            "kind_get",
+            "kind_list",
+            "learn",
+            "list_observations",
+            "list_orchestrators",
+            "list_projects",
+            "list_punchcards",
+            "list_repos",
+            "list_work",
+            "memory_acknowledge_use",
+            "memory_consolidate",
+            "memory_contradictions",
+            "memory_forget",
+            "memory_forget_dry_run",
+            "memory_freshness",
+            "memory_reverify",
+            "memory_set_horizon",
+            "memory_sweep_candidates",
+            "output_attest",
+            "punch_in",
+            "punch_out",
+            "receipt_verify",
+            "register_repo",
+            "resolve_principal",
+            "reuse_check",
+            "revoke_passport",
+            "route_access_matrix",
+            "session_checkpoint",
+            "session_token_usage",
+            "status_feed",
+            "token_savings",
+            "tool_trace_recent",
+            "unarchive_session",
+            "update_orchestrator",
+            "update_work_state",
+            "verify_observation",
+        ];
+
+        let tiered: std::collections::HashSet<&str> = vaultcrux_local::tool_surface::TOOL_SURFACE
+            .iter()
+            .map(|e| e.name)
+            .collect();
+        let known: std::collections::HashSet<&str> = KNOWN_UNTIERED.iter().copied().collect();
+
+        let mut newly_untiered: Vec<String> = list_tools()
+            .into_iter()
+            .map(|t| t.name)
+            .filter(|n| !tiered.contains(n.as_str()) && !known.contains(n.as_str()))
+            .collect();
+        newly_untiered.sort();
+        assert!(
+            newly_untiered.is_empty(),
+            "these tools have no TOOL_SURFACE tier, so the RCX router will refuse every call \
+             to them (denied:capability_not_permitted). Add a ToolSurfaceEntry in \
+             vaultcrux-local/src/tool_surface.rs: {newly_untiered:?}"
+        );
+
+        // The defect list must not rot: a name that has since been tiered, or
+        // removed from the catalogue, has to come off it.
+        let catalogue: std::collections::HashSet<String> = list_tools().into_iter().map(|t| t.name).collect();
+        let mut stale: Vec<&str> = KNOWN_UNTIERED
+            .iter()
+            .copied()
+            .filter(|n| tiered.contains(n) || !catalogue.contains(*n))
+            .collect();
+        stale.sort_unstable();
+        assert!(
+            stale.is_empty(),
+            "KNOWN_UNTIERED lists tools that are now tiered or no longer exist — remove them: {stale:?}"
+        );
+    }
+
+    /// The context-graph family specifically, by name, because it is the family
+    /// this guard was written for.
+    #[test]
+    fn context_graph_tools_are_local_tier() {
+        for name in [
+            "get_project_storybook",
+            "generate_project_storybook",
+            "diff_project_storybook",
+            "get_project_dossiers",
+            "generate_project_dossier",
+            "publish_project_dossier",
+            "reconcile_project_dossiers",
+            "diff_project_dossiers",
+        ] {
+            assert!(
+                vaultcrux_local::tool_surface::is_local_tool(name),
+                "{name} must be local tier or the RCX router denies it"
+            );
+            assert!(
+                rcx_local_capabilities().contains(&format!("crux-mcp.{name}")),
+                "{name} must contribute a permitted local capability"
+            );
+        }
+    }
+
     #[test]
     fn tool_names_unique() {
         let tools = list_tools();
