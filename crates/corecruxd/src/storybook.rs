@@ -48,6 +48,10 @@ pub struct GenerateInput<'a> {
     pub project_id: &'a str,
     pub by_passport: &'a str,
     pub now_unix_ms: u64,
+    /// Runtime spans for the dead-code tier. Empty is the normal case —
+    /// `CORECRUXD_TRACE_CAPTURE` is default-off — and the readout then says
+    /// exactly what it said before the runtime tier existed.
+    pub spans: &'a [crate::trace_store::StoredSpan],
 }
 
 /// Build the storybook from current store state. Synchronous; no LLM calls.
@@ -368,10 +372,31 @@ pub fn generate(store: &corecrux_memory::FactStore, input: GenerateInput<'_>) ->
             }
             let mut crates: Vec<_> = by_crate.iter().collect();
             crates.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
-            hs.push_str(&format!(
-                "### Dead-code candidates ({}, heuristic)\n\n*Regex-based; may miss macro / dynamic-dispatch usages. Confirm before removing.*\n\n",
-                ws.stats.dead_code_count
-            ));
+            // The heading grades the count across tiers when a runtime window
+            // exists. Previously it carried a permanent hedge — "Regex-based;
+            // may miss macro / dynamic-dispatch usages" — which is true of the
+            // static tier alone and stops being the whole story once runtime
+            // evidence is available. A caveat that never changes is one a
+            // reader learns to skip.
+            let verdicts = crate::code_intel::dead_code_verdicts(ws, input.spans);
+            let actionable = verdicts.iter().filter(|v| v.actionable).count();
+            let false_positives = verdicts
+                .iter()
+                .filter(|v| v.verdict == "extractor_false_positive__static_dead_but_executed")
+                .count();
+            if input.spans.is_empty() {
+                hs.push_str(&format!(
+                    "### Dead-code candidates ({}, static tier only)\n\n*One static tier: regex reachability, which does not read macro bodies or resolve method calls. No runtime window to corroborate it — none of these is safe to act on alone. Enable `CORECRUXD_TRACE_CAPTURE` to grade them.*\n\n",
+                    ws.stats.dead_code_count
+                ));
+            } else {
+                let w = crate::code_intel::Window::of(input.spans);
+                hs.push_str(&format!(
+                    "### Dead-code candidates ({} static · **{} actionable** · {} refuted)\n\n*Graded over a window of {} spans across {} traces. **Actionable** means two independent tiers agree AND the symbol's own file executed — a runtime negative from a file that never ran is not evidence. **Refuted** means the static tier flagged it and it was observed running.*\n\n",
+                    ws.stats.dead_code_count, actionable, false_positives,
+                    w.spans_examined, w.traces_examined
+                ));
+            }
             for (cname, items) in crates.iter().take(10) {
                 hs.push_str(&format!("- **`{}`** ({}):\n", cname, items.len()));
                 for d in items.iter().take(6) {
@@ -919,6 +944,7 @@ mod tests {
                 project_id: "p1",
                 by_passport: "personal-default",
                 now_unix_ms: 1_700_000_000_000,
+                spans: &[],
             },
         )
         .expect("storybook should generate when project exists");
@@ -943,6 +969,7 @@ mod tests {
                 project_id: "nope",
                 by_passport: "x",
                 now_unix_ms: 1,
+                spans: &[],
             },
         );
         assert!(doc.is_none());
@@ -985,5 +1012,61 @@ mod tests {
         assert!(d.added_sections.contains(&"20_goals".to_string()));
         assert!(d.changed_sections.contains(&"00_front".to_string()));
         assert_eq!(d.bytes_delta, 5);
+    }
+
+    /// The workspace-health caveat must state which tiers actually spoke.
+    ///
+    /// Before the runtime join it carried a permanent hedge — "Regex-based; may
+    /// miss macro / dynamic-dispatch usages" — on every readout forever. A
+    /// caveat that never changes is one a reader learns to skip, and it
+    /// understates the answer once a runtime tier is available.
+    #[test]
+    fn the_dead_code_caveat_reflects_which_tiers_spoke() {
+        let mut ws = crate::workspace_scan::WorkspaceScan::default();
+        ws.scan_id = "ws_t".into();
+        ws.stats.dead_code_count = 1;
+        ws.dead_code = vec![crate::workspace_scan::DeadSymbol {
+            crate_name: "c".into(),
+            module_path: "m".into(),
+            file_rel_path: "src/quiet.rs".into(),
+            line: 3,
+            kind: "fn".into(),
+            name: "orphan".into(),
+            confidence: 0.6,
+            note: "no references".into(),
+        }];
+
+        // No window: one tier, and the readout says so.
+        let none = crate::code_intel::dead_code_verdicts(&ws, &[]);
+        assert_eq!(none[0].verdict, "dead_candidate__static_only");
+        assert!(!none[0].actionable);
+
+        // A window that exercised the symbol's own file: the negative counts.
+        let spans = vec![crate::trace_store::StoredSpan {
+            span: crux_observe::span_layer::SpanRecord {
+                trace_id: 7,
+                span_id: 8,
+                parent_span_id: None,
+                name: "neighbour".into(),
+                target: "t".into(),
+                file: Some("src/quiet.rs".into()),
+                line: Some(1),
+                module_path: None,
+                duration_ns: 5,
+                depth: 0,
+                had_error: false,
+            },
+            symbol_id: None,
+            join: "extracted".into(),
+            stored_at_unix_ms: 10,
+        }];
+        let graded = crate::code_intel::dead_code_verdicts(&ws, &spans);
+        assert_eq!(graded[0].verdict, "dead_candidate__static_and_runtime_agree");
+        assert!(graded[0].actionable, "the symbol's file ran and it did not");
+
+        // And the window the grading rests on is reportable.
+        let w = crate::code_intel::Window::of(&spans);
+        assert_eq!(w.spans_examined, 1);
+        assert_eq!(w.traces_examined, 1);
     }
 }
