@@ -64,7 +64,9 @@ pub fn liveness_description() -> &'static str {
      Returns execution counts plus the window the answer is true for. Use this to \
      tell 'never called' apart from 'never called *while we were looking*' — the \
      window is part of the answer, so a negative is only ever as strong as the \
-     traffic behind it."
+     traffic behind it. If you are asking because a dossier claimed the symbol \
+     was dead, `get_project_dossiers` already carries the tier evidence and the \
+     window that claim was graded over."
 }
 
 pub fn trace_diff_description() -> &'static str {
@@ -83,7 +85,10 @@ pub fn dead_code_description() -> &'static str {
      whether those tiers agree. `actionable` is true only when independent tiers \
      agree over a non-empty observation window in which the symbol's own file ran \
      — so a verdict is a claim about evidence, never a bare heuristic. Use this \
-     rather than trusting a single dead-code lint."
+     rather than trusting a single dead-code lint. For the same verdicts folded \
+     into a project-level belief snapshot alongside everything else known about \
+     the project, see `get_project_dossiers`; for the human-readable roll-up, \
+     `get_project_storybook` with `section=50`."
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

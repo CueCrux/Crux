@@ -60,7 +60,10 @@ pub fn get_storybook_description() -> &'static str {
      and guessing: it is generated from state, so it cannot be stale in the way \
      prose is. Pass `section` to fetch one part (e.g. `60` for gaps and alerts, \
      `50` for workspace health) and `token_budget` to cap the whole answer. \
-     Returns `available_versions` so you can diff against what you last saw."
+     Returns `available_versions` so you can diff against what you last saw. Its \
+     dead-code count is graded across tiers when runtime capture is on — \
+     `code_dead_code` has the per-symbol verdicts behind it, and `code_path` \
+     shows what a given endpoint actually executes."
 }
 
 pub fn generate_storybook_description() -> &'static str {
@@ -87,7 +90,10 @@ pub fn get_dossiers_description() -> &'static str {
      every saved dossier newest-first with its author; with one, it returns \
      that dossier's full contents. Claims are dropped lowest-confidence-first \
      when `token_budget` forces a choice, so a small budget buys the things \
-     their author was most sure of."
+     their author was most sure of. A `dead_code_likely` claim carries the tiers \
+     that spoke and the window they spoke over — `code_dead_code` gives the same \
+     verdict per symbol with its full evidence ladder, and `code_liveness` \
+     answers whether one symbol ran at all."
 }
 
 pub fn generate_dossier_description() -> &'static str {
@@ -97,7 +103,11 @@ pub fn generate_dossier_description() -> &'static str {
      stubs, file existence) and medium-confidence inferred ones (vision↔code \
      mapping, dead-code candidates), each with explicit evidence. Use it as the \
      base to layer your own findings onto before `publish_project_dossier`, \
-     rather than authoring a dossier from nothing."
+     rather than authoring a dossier from nothing. When runtime capture is on, \
+     its dead-code claims are already graded against observed execution — a \
+     symbol seen running is emitted as `extractor_false_positive`, not as a \
+     deletion candidate, and `based_on.trace_window` states the window that \
+     grading rests on."
 }
 
 pub fn publish_dossier_description() -> &'static str {
