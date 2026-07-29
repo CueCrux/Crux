@@ -47,6 +47,23 @@ pub(super) struct ListWorkQuery {
     /// merged behaviour.
     #[serde(default)]
     pub orchestrator: Option<String>,
+    /// Ready-order projection. When true the response is narrowed to open work
+    /// (`planned` / `in_progress` / `blocked` / `drafting`) and sorted into a
+    /// recommended order by [`crate::work_execplans::rank_open`]. Additive:
+    /// omitting it preserves the historical unranked, unfiltered response
+    /// exactly, so existing clients are unaffected.
+    #[serde(default, deserialize_with = "deserialize_flexible_bool")]
+    pub ranked: bool,
+    /// Cap the number of returned work items. Applied after ranking, so
+    /// `?ranked=1&limit=20` yields the top twenty. Approvals are not truncated.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// `slim` emits five fields per item (id, state, current_milestone,
+    /// milestones_done, milestones_total) plus `blocked_by` when non-empty.
+    /// The full board is ~192k tokens; slim + ranked + limit=20 is under 1k,
+    /// which is what makes this readable on every agent boot.
+    #[serde(default)]
+    pub fields: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -134,6 +151,25 @@ pub(super) use super::approval_receipts::{
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct GateListQuery {
     pub by_passport: Option<String>,
+}
+
+/// Query-string booleans, permissively. Bare `serde` accepts only `true`/`false`,
+/// so `?ranked=1` — the form every caller reaches for, and the one the docs and
+/// agent instructions use — 400s. Accept the usual truthy/falsey spellings, and
+/// treat a valueless `?ranked` as true.
+fn deserialize_flexible_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let raw = String::deserialize(deserializer)?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(serde::de::Error::custom(format!(
+            "expected a boolean (1/true/yes/on or 0/false/no/off), got '{other}'"
+        ))),
+    }
 }
 
 fn deserialize_some_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
@@ -261,20 +297,76 @@ pub(super) async fn get_work(
     }
     let approval_count = approval_entries.len();
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "count": items.len() + approval_count,
-            "source": match q.source {
-                WorkSource::Kanban => "kanban",
-                WorkSource::Execplans => "execplans",
-                WorkSource::All => "all",
-            },
-            "work": items,
-            "approvals": approval_entries,
-        })),
-    )
-        .into_response()
+    // Ready-order projection. Narrow to open work, sort by `rank_open`, stamp
+    // `blocked_by`. Everything below this point is skipped when `ranked` is
+    // absent, which is what keeps the default response byte-identical.
+    let mut cycles: Vec<String> = Vec::new();
+    if q.ranked {
+        let ranked = crate::work_execplans::rank_open(&items);
+        cycles = ranked.cycles;
+        let mut reordered = Vec::with_capacity(ranked.order.len());
+        for (rank_pos, &idx) in ranked.order.iter().enumerate() {
+            let mut item = items[idx].clone();
+            item.blocked_by.clone_from(&ranked.blocked_by[rank_pos]);
+            reordered.push(item);
+        }
+        items = reordered;
+    }
+
+    if let Some(limit) = q.limit {
+        items.truncate(limit);
+    }
+
+    let slim = q.fields.as_deref() == Some("slim");
+    let work_json: serde_json::Value = if slim {
+        serde_json::Value::Array(
+            items
+                .iter()
+                .map(|w| {
+                    let mut o = serde_json::Map::new();
+                    o.insert("id".into(), serde_json::json!(w.id));
+                    o.insert("state".into(), serde_json::json!(w.state));
+                    if let Some(m) = &w.current_milestone {
+                        o.insert("current_milestone".into(), serde_json::json!(m));
+                    }
+                    if let Some(d) = w.milestones_done {
+                        o.insert("milestones_done".into(), serde_json::json!(d));
+                    }
+                    if let Some(t) = w.milestones_total {
+                        o.insert("milestones_total".into(), serde_json::json!(t));
+                    }
+                    if !w.blocked_by.is_empty() {
+                        o.insert("blocked_by".into(), serde_json::json!(w.blocked_by));
+                    }
+                    serde_json::Value::Object(o)
+                })
+                .collect(),
+        )
+    } else {
+        serde_json::json!(items)
+    };
+
+    let mut body = serde_json::json!({
+        "count": items.len() + approval_count,
+        "source": match q.source {
+            WorkSource::Kanban => "kanban",
+            WorkSource::Execplans => "execplans",
+            WorkSource::All => "all",
+        },
+        "work": work_json,
+        "approvals": approval_entries,
+    });
+    if q.ranked {
+        body["ranked"] = serde_json::json!(true);
+        // A dependency cycle makes "foundations first" undefined for the plans
+        // involved. Surface it rather than resolving it silently — the drift
+        // check turns this into an operator-visible finding.
+        if !cycles.is_empty() {
+            body["dependency_cycles"] = serde_json::json!(cycles);
+        }
+    }
+
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 /// Build the ExecPlan slice of the response. Applies the same state /

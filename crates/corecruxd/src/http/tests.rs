@@ -13682,6 +13682,9 @@ async fn work_post_then_list_then_patch_state_round_trip() {
             assignee_passport: None,
             source: super::work::WorkSource::default(),
             orchestrator: None,
+            ranked: false,
+            limit: None,
+            fields: None,
         }),
         dev_scope_headers("admin:read"),
     )
@@ -13743,6 +13746,9 @@ async fn work_source_all_handler_round_trips_plan_content_hash() -> Result<(), B
             assignee_passport: None,
             source: super::work::WorkSource::All,
             orchestrator: None,
+            ranked: false,
+            limit: None,
+            fields: None,
         }),
         dev_scope_headers("admin:read"),
     )
@@ -20478,4 +20484,284 @@ fn m2_runtime_span_plane_is_not_yet_tenant_partitioned() {
          test to assert partitioning and update \
          the accompanying isolation argument in the same commit."
     );
+}
+// ── /v1/work ready-order projection (execplan-work-order-ranking M1) ─────────
+
+/// Build a `ListWorkQuery` with the ranked-projection knobs, everything else default.
+fn ranked_work_query(ranked: bool, limit: Option<usize>, fields: Option<&str>) -> super::work::ListWorkQuery {
+    super::work::ListWorkQuery {
+        project_id: None,
+        state: None,
+        tenant_id: None,
+        assignee_passport: None,
+        source: super::work::WorkSource::default(),
+        orchestrator: None,
+        ranked,
+        limit,
+        fields: fields.map(str::to_string),
+    }
+}
+
+async fn seeded_work_state() -> crate::http::AppState {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+        crate::projects::seed_default_if_missing(&mut store, 1).expect("project seed");
+    }
+    for (title, st) in [
+        ("alpha task", "planned"),
+        ("beta task", "planned"),
+        ("gamma task", "planned"),
+    ] {
+        let resp = super::work::post_work(
+            State(state.clone()),
+            dev_scope_headers("facts:write"),
+            Json(super::work::CreateWorkBody {
+                project_id: "default".to_string(),
+                title: title.to_string(),
+                body: None,
+                state: Some(st.to_string()),
+                assignee_passport: None,
+                tenant_id: None,
+                linked_pr: None,
+                linked_issue: None,
+                created_by_passport: "personal-default".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+    state
+}
+
+/// The gate: omitting the new params must reproduce the historical response
+/// byte-for-byte. If this ever fails, the projection stopped being additive.
+#[serial_test::serial]
+#[tokio::test]
+async fn work_ranked_params_absent_is_byte_identical() {
+    let state = seeded_work_state().await;
+
+    let baseline = json_body(
+        super::work::get_work(
+            State(state.clone()),
+            Query(ranked_work_query(false, None, None)),
+            dev_scope_headers("admin:read"),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+
+    // No `ranked` key, no `dependency_cycles` key, full item shape retained.
+    assert!(
+        baseline.get("ranked").is_none(),
+        "unranked response must not carry `ranked`"
+    );
+    assert!(baseline.get("dependency_cycles").is_none());
+    assert_eq!(baseline["count"], 3);
+    let first = &baseline["work"][0];
+    assert!(first.get("title").is_some(), "full shape keeps title");
+    assert!(first.get("created_by_passport").is_some(), "full shape keeps passport");
+    assert!(
+        first.get("blocked_by").is_none(),
+        "blocked_by must never appear on an unranked response"
+    );
+
+    // Same query twice → identical bytes (determinism, not just shape).
+    let again = json_body(
+        super::work::get_work(
+            State(state),
+            Query(ranked_work_query(false, None, None)),
+            dev_scope_headers("admin:read"),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(
+        serde_json::to_string(&baseline).unwrap(),
+        serde_json::to_string(&again).unwrap()
+    );
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn work_ranked_marks_response_and_limit_truncates() {
+    let state = seeded_work_state().await;
+
+    let ranked = json_body(
+        super::work::get_work(
+            State(state.clone()),
+            Query(ranked_work_query(true, None, None)),
+            dev_scope_headers("admin:read"),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(ranked["ranked"], true);
+    assert_eq!(ranked["work"].as_array().expect("array").len(), 3);
+
+    let capped = json_body(
+        super::work::get_work(
+            State(state),
+            Query(ranked_work_query(true, Some(2), None)),
+            dev_scope_headers("admin:read"),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(capped["work"].as_array().expect("array").len(), 2);
+    assert_eq!(capped["count"], 2, "count reflects the truncated list");
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn work_ranked_slim_emits_only_the_cheap_fields() {
+    let state = seeded_work_state().await;
+    let body = json_body(
+        super::work::get_work(
+            State(state.clone()),
+            Query(ranked_work_query(true, Some(20), Some("slim"))),
+            dev_scope_headers("admin:read"),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+
+    let rows = body["work"].as_array().expect("array");
+    assert!(!rows.is_empty());
+    for row in rows {
+        let obj = row.as_object().expect("object");
+        assert!(obj.contains_key("id"));
+        assert!(obj.contains_key("state"));
+        // The expensive fields are exactly what slim exists to drop.
+        for dropped in ["title", "body", "created_by_passport", "provenance", "plan_path"] {
+            assert!(!obj.contains_key(dropped), "slim must drop `{dropped}`: {obj:?}");
+        }
+    }
+
+    // Slim must be materially cheaper than full — that is the whole point.
+    let full = json_body(
+        super::work::get_work(
+            State(state),
+            Query(ranked_work_query(true, Some(20), None)),
+            dev_scope_headers("admin:read"),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(
+        full["work"].as_array().expect("array").len(),
+        rows.len(),
+        "same board, same item count — only the per-item shape differs"
+    );
+    let slim_len = serde_json::to_string(&body["work"]).unwrap().len();
+    let full_len = serde_json::to_string(&full["work"]).unwrap().len();
+    assert!(
+        slim_len < full_len.max(1),
+        "slim ({slim_len}) must be smaller than full ({full_len})"
+    );
+}
+
+/// `ranked=1` narrows to open work: terminal states drop out entirely.
+#[serial_test::serial]
+#[tokio::test]
+async fn work_ranked_drops_terminal_states() {
+    let state = seeded_work_state().await;
+
+    // Move one item to `complete`.
+    let listed = json_body(
+        super::work::get_work(
+            State(state.clone()),
+            Query(ranked_work_query(false, None, None)),
+            dev_scope_headers("admin:read"),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    let victim = listed["work"][0]["id"].as_str().expect("id").to_string();
+    let patched = super::work::patch_work(
+        State(state.clone()),
+        Path(victim.clone()),
+        dev_scope_headers("facts:write"),
+        Json(super::work::UpdateWorkBody {
+            title: None,
+            body: None,
+            state: Some("complete".to_string()),
+            assignee_passport: None,
+            tenant_id: None,
+            linked_pr: None,
+            linked_issue: None,
+            blocker_reason: None,
+            blocker_kind: None,
+            by_passport: "personal-default".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(patched.status(), StatusCode::OK);
+
+    let ranked = json_body(
+        super::work::get_work(
+            State(state),
+            Query(ranked_work_query(true, None, None)),
+            dev_scope_headers("admin:read"),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    let ids: Vec<&str> = ranked["work"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|w| w["id"].as_str().expect("id"))
+        .collect();
+    assert!(
+        !ids.contains(&victim.as_str()),
+        "completed item must drop from ranked: {ids:?}"
+    );
+    assert_eq!(ids.len(), 2);
+}
+
+/// `?ranked=1` is the form the docs and agent instructions use; bare serde only
+/// accepts `true`/`false`, so this guards the spelling every caller reaches for.
+#[test]
+fn work_ranked_query_accepts_truthy_spellings() {
+    fn parse(qs: &str) -> Result<super::work::ListWorkQuery, ()> {
+        let uri: axum::http::Uri = format!("/v1/work?{qs}").parse().expect("uri");
+        Query::<super::work::ListWorkQuery>::try_from_uri(&uri)
+            .map(|Query(q)| q)
+            .map_err(|_| ())
+    }
+
+    for (qs, want) in [
+        ("ranked=1", true),
+        ("ranked=true", true),
+        ("ranked=yes", true),
+        ("ranked=on", true),
+        ("ranked=0", false),
+        ("ranked=false", false),
+        ("ranked=off", false),
+    ] {
+        let q = parse(qs).unwrap_or_else(|()| panic!("`{qs}` must parse"));
+        assert_eq!(q.ranked, want, "`{qs}`");
+    }
+    // Absent → false, and the rest of the query still parses.
+    let q = parse("source=all").expect("parse");
+    assert!(!q.ranked);
+    // The companion knobs parse alongside it.
+    let q = parse("ranked=1&limit=20&fields=slim").expect("parse");
+    assert!(q.ranked);
+    assert_eq!(q.limit, Some(20));
+    assert_eq!(q.fields.as_deref(), Some("slim"));
+    // Garbage is rejected rather than silently read as false.
+    assert!(parse("ranked=maybe").is_err());
 }
