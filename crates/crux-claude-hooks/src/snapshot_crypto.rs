@@ -663,6 +663,7 @@ fn write_high_water_atomic(path: &Path, high_water: u64) -> std::io::Result<()> 
 
 /// fsync a directory so a preceding `rename` into it is durable. Unix-only work;
 /// a no-op elsewhere (Windows cannot fsync a directory handle).
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn fsync_parent_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
