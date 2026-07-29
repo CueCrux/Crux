@@ -53,7 +53,7 @@ env:
 jobs:
   mutants:
     name: shard ${{ matrix.shard }}
-    runs-on: [self-hosted, ci]
+    runs-on: [self-hosted, hel1]
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -115,7 +115,7 @@ jobs:
     name: merge + ratchet
     needs: mutants
     if: always()
-    runs-on: [self-hosted, ci]
+    runs-on: [self-hosted, hel1]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
