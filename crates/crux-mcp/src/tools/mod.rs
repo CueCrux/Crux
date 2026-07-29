@@ -1787,6 +1787,24 @@ pub fn list_tools_with_flags(
             }),
         },
         ToolDefinition {
+            name: "execplan_write".to_string(),
+            description: coordination::EXECPLAN_WRITE_DESCRIPTION.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "slug":                  { "type": "string", "description": "plan filename without .md, lowercase kebab-case" },
+                    "content":               { "type": "string", "description": "full plan markdown; must carry `# Title`, `## Purpose`, `## Milestones`" },
+                    "expected_content_hash": { "type": "string", "description": "omit to create; pass the current plan_content_hash to update" },
+                    "push":                  { "type": "boolean", "description": "push after committing (default false)" },
+                    "author":                { "type": "string", "description": "passport or agent id for the commit trailer" }
+                },
+                "required": ["slug", "content"],
+                "examples": [
+                    { "slug": "my-feature-2026-07-29", "content": "# My feature\n\n## Purpose\n\nWhy.\n\n## Milestones\n\n- [ ] M0 — first.\n" }
+                ]
+            }),
+        },
+        ToolDefinition {
             name: "list_work".to_string(),
             description: coordination::LIST_WORK_DESCRIPTION.to_string(),
             input_schema: json!({
@@ -2902,6 +2920,7 @@ pub fn tool_output_docs() -> Value {
         { "tool": "update_status",      "output": "{ enabled, state, basis(binary|checkout), tracking_ref, current_commit, binary_commit, latest_commit, ahead_by, behind_by, checkout_commit, checkout_ahead_by, checkout_behind_by, checked_at, error, comparison_stale, upgrade_hint, upgrade_playbook_query, backup_playbook_query }" },
         { "tool": "list_projects",      "output": "{ projects: [{ id, name, planning_target?, default_passport_id, created_at_unix_ms }] }" },
         { "tool": "get_project_context","output": "{ id, name, planning_target?, default_passport_id, members: [{ passport_id, role }], tenants: [{ tenant_id, default_passport_id? }] }" },
+        { "tool": "execplan_write",     "output": "{ execplan: { action: created|updated, slug, rel_path, commit_sha, content_hash, pushed } }. 400 on an invalid slug/skeleton; 409 with current_content_hash on a lost update." },
         { "tool": "list_work",          "output": "{ count, work: [{ id, project_id, state, title, body, assignee_passport?, tenant_id?, linked_pr?, linked_issue?, blocker_reason?, created_by_passport, created_at_unix_ms, updated_at_unix_ms }] }" },
         { "tool": "create_work",        "output": "WorkItem record (same shape as list_work entries, includes the freshly minted id)." },
         { "tool": "update_work_state",  "output": "{ applied: bool, work?: WorkItem, queued?: { action_id, work_id, requested_by_passport, target_state, status: 'pending', requested_at_unix_ms } }" },
@@ -3090,6 +3109,7 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         // Coordination — projects + work kanban (Plan A M5).
         "list_projects" => coordination::handle_list_projects(args, ctx).await,
         "get_project_context" => coordination::handle_get_project_context(args, ctx).await,
+        "execplan_write" => coordination::handle_execplan_write(args, ctx).await,
         "list_work" => coordination::handle_list_work(args, ctx).await,
         "create_work" => coordination::handle_create_work(args, ctx).await,
         "update_work_state" => coordination::handle_update_work_state(args, ctx).await,
@@ -3251,7 +3271,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 131; // +5 code_intel (code_path/blast_radius/liveness/trace_diff/dead_code, crux-codemap-agent-surface M1). +8 context_graph (3 storybook + 5 dossier, crux-storybook-dossier-agent-and-console-surface M2). // +1 engram_resolve +1 reuse_check (minimalism plane M2/M3). +2 register_repo + list_repos (repo-watch M3). +1 status_feed (open-engine-coordination-surfaces M3). +1 context_custody_audit (race-to-context positioning). +1 revoke_passport (passport-revocation M2). main 94 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check + 2 coord-plane: coord_status + coord_announce + session_token_usage (action-ledger M1)) + 2 session-archive (archive_session + unarchive_session) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard) + 1 activity (activity_recent, crux-dual-surface-activity-log M2) + 2 consolidation (memory_contradictions + memory_consolidate, audit-ii M4) + 1 session-mining (learn, token-efficiency M4) + 1 holdout (token_savings, token-efficiency cutover CO-4).
+    const TOOL_COUNT: usize = 132; // +1 execplan_write (source-of-truth plane M2: the one legal plan write path). +5 code_intel (code_path/blast_radius/liveness/trace_diff/dead_code, crux-codemap-agent-surface M1). +8 context_graph (3 storybook + 5 dossier, crux-storybook-dossier-agent-and-console-surface M2). // +1 engram_resolve +1 reuse_check (minimalism plane M2/M3). +2 register_repo + list_repos (repo-watch M3). +1 status_feed (open-engine-coordination-surfaces M3). +1 context_custody_audit (race-to-context positioning). +1 revoke_passport (passport-revocation M2). main 94 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check + 2 coord-plane: coord_status + coord_announce + session_token_usage (action-ledger M1)) + 2 session-archive (archive_session + unarchive_session) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard) + 1 activity (activity_recent, crux-dual-surface-activity-log M2) + 2 consolidation (memory_contradictions + memory_consolidate, audit-ii M4) + 1 session-mining (learn, token-efficiency M4) + 1 holdout (token_savings, token-efficiency cutover CO-4).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")

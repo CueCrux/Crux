@@ -43,7 +43,7 @@
 //! 7. no facts, file mtime ≤ 90 days old                  → `planned`
 //! 8. no facts, file mtime > 90 days old                  → `archive`
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -546,7 +546,10 @@ fn extract_superseded_slug(line: &str) -> Option<String> {
         .chars()
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
         .collect();
-    if token.is_empty() {
+    // Bare tokens must look like a plan slug (hyphenated) — see the same guard in
+    // `extract_ref_slugs`. Higher stakes here: a phantom supersession target flips
+    // a live plan to `archive` and hides it from the board.
+    if token.is_empty() || !token.contains('-') {
         None
     } else {
         Some(token)
@@ -595,7 +598,14 @@ fn extract_ref_slugs(line: &str, keyword: &str) -> Vec<String> {
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
             .collect();
-        if !token.is_empty() {
+        // A bare token must *look like* a plan slug (kebab-case, so it contains a
+        // hyphen). Without this, ordinary prose that merely begins with the
+        // keyword mints a phantom edge target: `Depends on nothing merged.` →
+        // `nothing`, `Depends on: M1 complete` → `M1`, `Extended by declaration:
+        // none.` → `declaration`. Every real plan slug is hyphenated, so the
+        // check costs no true edges. The `[[…]]` form above is left unguarded so
+        // an explicit reference to a missing plan still surfaces as dangling.
+        if !token.is_empty() && token.contains('-') {
             slugs.push(token);
         }
     }
@@ -1067,6 +1077,7 @@ fn mk_item(
         superseded_by,
         depends_on: parsed.depends_on.clone(),
         extended_by: parsed.extended_by.clone(),
+        blocked_by: Vec::new(),
         // Raw OD refs; apply_open_decisions refines these to the open subset.
         open_decisions: parsed.open_decision_refs.clone(),
         orchestrator_id: None,
@@ -1253,6 +1264,221 @@ fn apply_reciprocal_refs(items: &mut [WorkItem]) {
         it.depends_on.dedup();
         it.extended_by.sort();
         it.extended_by.dedup();
+    }
+}
+
+// ── Ready-order ranking ──────────────────────────────────────────────────────
+//
+// The lineage edges above answer "what depends on what". They do not answer
+// "what should I pick up next", so every agent re-derived that from the full
+// board — 190k+ tokens for a question whose answer is twenty slugs. `rank_open`
+// is the missing sort key: a pure, deterministic function over items the
+// projection already built. It mutates nothing and reads no facts.
+
+/// Marker that names a plan as an **orchestrator** — a parent that other plans
+/// hang off, never one that hangs off them.
+///
+/// Operator rule, 2026-07-29: "anything that has `orchestrat` in will be
+/// parent". Encoded here rather than left as a convention because a convention
+/// that only lives in prose is one the graph cannot honour: when two plans
+/// declare `Depends on` each other, *something* has to choose a direction, and
+/// choosing alphabetically (the previous behaviour) is arbitrary where this is
+/// meaningful.
+pub const ORCHESTRATOR_SLUG_MARKER: &str = "orchestrat";
+
+/// `true` when a slug names an orchestrator plan.
+pub fn is_orchestrator_slug(slug: &str) -> bool {
+    slug.to_ascii_lowercase().contains(ORCHESTRATOR_SLUG_MARKER)
+}
+
+/// States that count as unfinished work. `deployed` is terminal-ish (shipped)
+/// and `complete`/`archive` are terminal, so none of them are rankable.
+pub const OPEN_WORK_STATES: &[&str] = &["planned", "in_progress", "blocked", "drafting"];
+
+/// Is this item still open work?
+pub fn is_open_state(state: &str) -> bool {
+    OPEN_WORK_STATES.contains(&state)
+}
+
+/// Result of ranking the open subset of a merged work list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RankedOpen {
+    /// Indices into the input slice, in recommended work order.
+    pub order: Vec<usize>,
+    /// For each ranked item (parallel to `order`), the open dependency slugs
+    /// that are holding it back. Empty = ready to start now.
+    pub blocked_by: Vec<Vec<String>>,
+    /// Slugs participating in a dependency cycle, sorted + deduped. A cycle
+    /// makes "foundations first" undefined, so it is reported rather than
+    /// silently resolved; ranking still returns every item.
+    pub cycles: Vec<String>,
+    /// Orchestrator plans that were found depending *outward* inside a cycle.
+    /// An orchestrator is a parent, so this names the plan whose `Depends on`
+    /// line should become `Extended by` — an actionable fix, not just "there is
+    /// a cycle somewhere".
+    pub inverted_orchestrator_edges: Vec<String>,
+}
+
+/// Rank the open items of a merged work list into a recommended order.
+///
+/// Sort key, in order of precedence:
+///
+/// 1. **Unblocked before blocked** — an item whose `depends_on` names another
+///    *open* plan cannot be started, so it sinks.
+/// 2. **`in_progress` before everything else** — finish what is already open
+///    before starting more. This is the whole reason the board has 56 active
+///    plans.
+/// 3. **Dependency depth ascending** — foundations before the work that builds
+///    on them.
+/// 4. **Stale before fresh** — a stale `in_progress` plan is either
+///    finished-but-unmarked or stalled; both need a decision.
+/// 5. **Oldest `updated_at` first**, then **id** — total, deterministic order.
+///
+/// Only `depends_on` edges to *open* items constrain the order. An edge to a
+/// completed plan is satisfied history, and an edge to an unknown slug (a
+/// dangling reference) cannot be evaluated, so neither blocks.
+pub fn rank_open(items: &[WorkItem]) -> RankedOpen {
+    let slug_to_idx: HashMap<&str, usize> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, it)| it.id.strip_prefix(EXECPLAN_ENTITY_PREFIX).map(|s| (s, i)))
+        .collect();
+
+    let open: Vec<usize> = (0..items.len()).filter(|&i| is_open_state(&items[i].state)).collect();
+    if open.is_empty() {
+        return RankedOpen::default();
+    }
+    let is_open_idx: HashSet<usize> = open.iter().copied().collect();
+
+    // Open dependency targets, by item index. Edges to terminal plans and to
+    // unknown slugs are dropped here, so everything downstream sees only real
+    // constraints.
+    let open_deps: HashMap<usize, Vec<usize>> = open
+        .iter()
+        .map(|&i| {
+            let deps = items[i]
+                .depends_on
+                .iter()
+                .filter_map(|slug| slug_to_idx.get(slug.as_str()).copied())
+                .filter(|j| is_open_idx.contains(j))
+                .collect::<Vec<_>>();
+            (i, deps)
+        })
+        .collect();
+
+    // Depth = longest chain of open dependencies beneath an item. Iterative DFS
+    // with an explicit on-stack set: a back edge is a cycle, and contributes no
+    // depth rather than recursing forever.
+    let mut depth: HashMap<usize, u32> = HashMap::new();
+    let mut cycles: HashSet<&str> = HashSet::new();
+    for &root in &open {
+        if depth.contains_key(&root) {
+            continue;
+        }
+        // (node, deps-already-visited) — the second element makes this a
+        // post-order walk without recursion.
+        let mut stack: Vec<(usize, usize)> = vec![(root, 0)];
+        let mut on_stack: HashSet<usize> = HashSet::from([root]);
+        while let Some(&mut (node, ref mut cursor)) = stack.last_mut() {
+            let deps = open_deps.get(&node).map_or(&[][..], Vec::as_slice);
+            if *cursor < deps.len() {
+                let next = deps[*cursor];
+                *cursor += 1;
+                if on_stack.contains(&next) {
+                    // Back edge. Record both endpoints; the cycle is real and
+                    // gets reported either way. Which edge we DROP is the
+                    // question, and the orchestrator rule answers it: an
+                    // orchestrator is a parent, so `X depends on <orchestrator>`
+                    // is the edge that survives and the reverse is the
+                    // inversion. Only the reported set is affected — ranking
+                    // still returns every item.
+                    for idx in [node, next] {
+                        if let Some(sl) = items[idx].id.strip_prefix(EXECPLAN_ENTITY_PREFIX) {
+                            cycles.insert(sl);
+                        }
+                    }
+                    continue;
+                }
+                if !depth.contains_key(&next) {
+                    stack.push((next, 0));
+                    on_stack.insert(next);
+                }
+                continue;
+            }
+            // All dependencies resolved — this node's depth is now computable.
+            let d = deps
+                .iter()
+                .filter_map(|j| depth.get(j).copied())
+                .max()
+                .map_or(0, |m| m + 1);
+            depth.insert(node, d);
+            on_stack.remove(&node);
+            stack.pop();
+        }
+    }
+
+    let mut order = open;
+    order.sort_by_key(|&i| {
+        let it = &items[i];
+        let blocked = !open_deps.get(&i).is_none_or(Vec::is_empty);
+        (
+            u8::from(blocked),
+            u8::from(it.state != "in_progress"),
+            depth.get(&i).copied().unwrap_or(0),
+            u8::from(it.stale != Some(true)),
+            it.updated_at_unix_ms,
+            it.id.clone(),
+        )
+    });
+
+    let blocked_by = order
+        .iter()
+        .map(|&i| {
+            let mut slugs: Vec<String> = open_deps
+                .get(&i)
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .filter_map(|&j| items[j].id.strip_prefix(EXECPLAN_ENTITY_PREFIX).map(str::to_string))
+                .collect();
+            slugs.sort();
+            slugs
+        })
+        .collect();
+
+    // Which edge to REVERSE, computed over the recorded cycle rather than at the
+    // back edge: a 2-cycle contains both directions, so whichever endpoint the
+    // DFS happens to reach first would otherwise decide the answer.
+    //
+    // Operator rule: an orchestrator is a parent. So an orchestrator inside a
+    // cycle that depends on a NON-orchestrator in the same cycle is the
+    // inversion — that `Depends on` should read `Extended by`.
+    let mut inverted: Vec<String> = cycles
+        .iter()
+        .filter(|slug| is_orchestrator_slug(slug))
+        .filter(|slug| {
+            let Some(&i) = slug_to_idx.get(*slug) else {
+                return false;
+            };
+            open_deps.get(&i).is_some_and(|deps| {
+                deps.iter().any(|&j| {
+                    items[j]
+                        .id
+                        .strip_prefix(EXECPLAN_ENTITY_PREFIX)
+                        .is_some_and(|d| cycles.contains(d) && !is_orchestrator_slug(d))
+                })
+            })
+        })
+        .map(|s| (*s).to_string())
+        .collect();
+    inverted.sort();
+
+    let mut cycles: Vec<String> = cycles.into_iter().map(str::to_string).collect();
+    cycles.sort();
+    RankedOpen {
+        order,
+        blocked_by,
+        cycles,
+        inverted_orchestrator_edges: inverted,
     }
 }
 
@@ -1515,6 +1741,39 @@ pub fn stamp_orchestrator_id(
     }
 }
 
+/// Orchestrator that owns work nobody has explicitly parented.
+///
+/// Overridable via `CRUX_DEFAULT_ORCHESTRATOR`.
+pub const DEFAULT_ORCHESTRATOR_ENV: &str = "CRUX_DEFAULT_ORCHESTRATOR";
+pub const DEFAULT_ORCHESTRATOR_ID: &str = "orchestrator:unassigned";
+
+/// The configured default orchestrator id.
+pub fn default_orchestrator_id() -> String {
+    std::env::var(DEFAULT_ORCHESTRATOR_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_ORCHESTRATOR_ID.to_string())
+}
+
+/// Give every item a parent.
+///
+/// Orchestrator membership is a hand-maintained list, so in practice almost
+/// nothing had a parent and "orchestration is the parent" was aspirational: a
+/// nullable field nobody could rely on. Falling back to a named default makes
+/// the relationship **total** — every item answers "whose work is this?", and
+/// `orchestrator:unassigned` is an honest answer that can be filtered on and
+/// counted, where `null` was merely absent.
+///
+/// Explicit membership always wins; this only fills the gap.
+pub fn apply_default_orchestrator(items: &mut [WorkItem], default_id: &str) {
+    for item in items.iter_mut() {
+        if item.orchestrator_id.as_deref().is_none_or(str::is_empty) {
+            item.orchestrator_id = Some(default_id.to_string());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1558,6 +1817,7 @@ mod tests {
             superseded_by: None,
             depends_on: depends_on.iter().map(|s| s.to_string()).collect(),
             extended_by: extended_by.iter().map(|s| s.to_string()).collect(),
+            blocked_by: Vec::new(),
             open_decisions: Vec::new(),
             orchestrator_id: None,
             milestones_done: None,
@@ -3125,5 +3385,302 @@ mod tests {
         std::env::remove_var(NEXT_READY_MILESTONE_FLAG_ENV);
         assert!(!drafting_state_enabled(), "A4 flag must default OFF");
         assert!(!next_ready_milestone_enabled(), "A3 flag must default OFF");
+    }
+
+    // ── rank_open: pure ordering logic ──
+
+    /// `wi` with an explicit state.
+    fn wis(slug: &str, state: &str, depends_on: &[&str]) -> WorkItem {
+        let mut w = wi(slug, depends_on, &[]);
+        w.state = state.to_string();
+        w
+    }
+
+    /// Ranked slugs, in order.
+    fn ranked_slugs(items: &[WorkItem]) -> Vec<String> {
+        rank_open(items)
+            .order
+            .into_iter()
+            .map(|i| items[i].id.trim_start_matches(EXECPLAN_ENTITY_PREFIX).to_string())
+            .collect()
+    }
+
+    #[test]
+    fn rank_open_excludes_terminal_states() {
+        let items = vec![
+            wis("done", "complete", &[]),
+            wis("gone", "archive", &[]),
+            wis("shipped", "deployed", &[]),
+            wis("live", "planned", &[]),
+        ];
+        assert_eq!(ranked_slugs(&items), vec!["live".to_string()]);
+    }
+
+    #[test]
+    fn rank_open_empty_board_is_empty() {
+        assert_eq!(rank_open(&[]), RankedOpen::default());
+        assert_eq!(rank_open(&[wis("done", "complete", &[])]), RankedOpen::default());
+    }
+
+    #[test]
+    fn rank_open_in_progress_before_planned() {
+        let items = vec![wis("b-planned", "planned", &[]), wis("a-active", "in_progress", &[])];
+        assert_eq!(ranked_slugs(&items), vec!["a-active", "b-planned"]);
+    }
+
+    #[test]
+    fn rank_open_blocked_by_open_dep_sinks() {
+        // `needs-x` depends on open `x` → sinks below the unblocked `later` even
+        // though both are planned and `needs-x` sorts first alphabetically.
+        let items = vec![
+            wis("needs-x", "planned", &["x-foundation"]),
+            wis("x-foundation", "planned", &[]),
+            wis("later", "planned", &[]),
+        ];
+        let r = rank_open(&items);
+        let slugs: Vec<&str> = r
+            .order
+            .iter()
+            .map(|&i| items[i].id.trim_start_matches(EXECPLAN_ENTITY_PREFIX))
+            .collect();
+        assert_eq!(*slugs.last().unwrap(), "needs-x", "blocked item must sink: {slugs:?}");
+        let pos = r.order.iter().position(|&i| items[i].id.ends_with("needs-x")).unwrap();
+        assert_eq!(r.blocked_by[pos], vec!["x-foundation".to_string()]);
+    }
+
+    #[test]
+    fn rank_open_dep_on_complete_plan_does_not_block() {
+        // History is satisfied, not a constraint.
+        let items = vec![
+            wis("builds-on-history", "planned", &["ancient"]),
+            wis("ancient", "complete", &[]),
+        ];
+        let r = rank_open(&items);
+        assert_eq!(r.order.len(), 1);
+        assert!(r.blocked_by[0].is_empty(), "completed dep must not block");
+    }
+
+    #[test]
+    fn rank_open_dangling_dep_does_not_block() {
+        // An edge we cannot evaluate is not a reason to sink real work.
+        let items = vec![wis("solo", "planned", &["no-such-plan-2026-01-01"])];
+        let r = rank_open(&items);
+        assert_eq!(r.order.len(), 1);
+        assert!(r.blocked_by[0].is_empty(), "unknown dep target must not block");
+    }
+
+    #[test]
+    fn rank_open_foundations_before_dependents() {
+        // c depends on b depends on a — all unblocked-at-root ordering aside,
+        // depth must put a first, then b, then c.
+        let items = vec![
+            wis("c", "in_progress", &["b"]),
+            wis("b", "in_progress", &["a"]),
+            wis("a", "in_progress", &[]),
+        ];
+        // Only `a` is unblocked, so it leads; b and c follow by depth.
+        assert_eq!(ranked_slugs(&items), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn rank_open_stale_before_fresh_and_oldest_first() {
+        let mut stale = wis("stale-one", "in_progress", &[]);
+        stale.stale = Some(true);
+        stale.updated_at_unix_ms = 500;
+        let mut fresh = wis("fresh-one", "in_progress", &[]);
+        fresh.stale = Some(false);
+        fresh.updated_at_unix_ms = 100;
+        // Stale wins on key 4 even though `fresh` has an older updated_at.
+        assert_eq!(
+            ranked_slugs(&[fresh.clone(), stale.clone()]),
+            vec!["stale-one", "fresh-one"]
+        );
+
+        // With staleness equal, oldest updated_at leads.
+        let mut older = wis("older", "in_progress", &[]);
+        older.updated_at_unix_ms = 10;
+        let mut newer = wis("newer", "in_progress", &[]);
+        newer.updated_at_unix_ms = 900;
+        assert_eq!(ranked_slugs(&[newer, older]), vec!["older", "newer"]);
+    }
+
+    #[test]
+    fn rank_open_cycle_terminates_and_is_reported() {
+        // a → b → a. Must not hang, must keep both items, must name the cycle.
+        let items = vec![wis("a", "planned", &["b"]), wis("b", "planned", &["a"])];
+        let r = rank_open(&items);
+        assert_eq!(r.order.len(), 2, "cycle must not drop items");
+        assert_eq!(r.cycles, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// Operator rule: anything with `orchestrat` in the slug is a parent. When a
+    /// cycle has exactly one orchestrator, the orchestrator's outward
+    /// dependency is the inversion — naming it turns "there is a cycle" into
+    /// "change this line in this file".
+    #[test]
+    fn rank_open_names_the_inverted_orchestrator_edge() {
+        let items = vec![
+            wis(
+                "crux-pro-entitlement-orchestration-2026-07-27",
+                "planned",
+                &["crux-pro-capabilities-rcx-entitled-2026-07-27"],
+            ),
+            wis(
+                "crux-pro-capabilities-rcx-entitled-2026-07-27",
+                "planned",
+                &["crux-pro-entitlement-orchestration-2026-07-27"],
+            ),
+        ];
+        let r = rank_open(&items);
+        assert_eq!(r.cycles.len(), 2, "the cycle is still reported: {:?}", r.cycles);
+        assert_eq!(
+            r.inverted_orchestrator_edges,
+            vec!["crux-pro-entitlement-orchestration-2026-07-27".to_string()],
+            "the orchestrator depending outward is the edge to reverse"
+        );
+        assert_eq!(r.order.len(), 2, "reporting an inversion must not drop items");
+    }
+
+    #[test]
+    fn rank_open_two_orchestrators_in_a_cycle_names_neither() {
+        // Both sides are parents, so the rule cannot choose — say nothing rather
+        // than point at an arbitrary one.
+        let items = vec![
+            wis(
+                "alpha-orchestration-2026-01-01",
+                "planned",
+                &["beta-orchestrator-2026-01-02"],
+            ),
+            wis(
+                "beta-orchestrator-2026-01-02",
+                "planned",
+                &["alpha-orchestration-2026-01-01"],
+            ),
+        ];
+        let r = rank_open(&items);
+        assert_eq!(r.cycles.len(), 2);
+        assert!(
+            r.inverted_orchestrator_edges.is_empty(),
+            "{:?}",
+            r.inverted_orchestrator_edges
+        );
+    }
+
+    #[test]
+    fn rank_open_cycle_without_an_orchestrator_names_no_inversion() {
+        let items = vec![
+            wis("plain-a", "planned", &["plain-b"]),
+            wis("plain-b", "planned", &["plain-a"]),
+        ];
+        let r = rank_open(&items);
+        assert_eq!(r.cycles.len(), 2);
+        assert!(r.inverted_orchestrator_edges.is_empty());
+    }
+
+    #[test]
+    fn orchestrator_slug_marker_matches_the_operator_rule() {
+        for yes in [
+            "crux-pro-entitlement-orchestration-2026-07-27",
+            "portfolio-burn-down-orchestration-2026-07-10",
+            "Some-Orchestrator-Plan",
+            "multi-orchestrated-thing",
+        ] {
+            assert!(is_orchestrator_slug(yes), "{yes} should read as an orchestrator");
+        }
+        for no in [
+            "crux-pro-capabilities-rcx-entitled-2026-07-27",
+            "orchestra-seating-plan",
+            "plain-plan",
+        ] {
+            assert_eq!(
+                is_orchestrator_slug(no),
+                no.contains("orchestra") && no.contains("orchestrat"),
+                "{no}"
+            );
+        }
+        assert!(
+            !is_orchestrator_slug("orchestra-seating-plan"),
+            "'orchestra' alone is not 'orchestrat'"
+        );
+    }
+
+    #[test]
+    fn rank_open_self_cycle_terminates() {
+        let items = vec![wis("loop-plan", "planned", &["loop-plan"])];
+        let r = rank_open(&items);
+        assert_eq!(r.order.len(), 1);
+        assert_eq!(r.cycles, vec!["loop-plan".to_string()]);
+    }
+
+    #[test]
+    fn rank_open_is_deterministic() {
+        // Same board, two input orders → same ranked slugs.
+        let a = wis("alpha", "planned", &[]);
+        let b = wis("beta", "planned", &[]);
+        let c = wis("gamma", "planned", &[]);
+        let one = ranked_slugs(&[a.clone(), b.clone(), c.clone()]);
+        let two = ranked_slugs(&[c, b, a]);
+        assert_eq!(one, two);
+    }
+
+    #[test]
+    fn rank_open_diamond_depth_orders_correctly() {
+        // top depends on left+right, both depend on base.
+        let items = vec![
+            wis("top", "planned", &["left", "right"]),
+            wis("left", "planned", &["base"]),
+            wis("right", "planned", &["base"]),
+            wis("base", "planned", &[]),
+        ];
+        let slugs = ranked_slugs(&items);
+        assert_eq!(slugs[0], "base", "base is the only unblocked item: {slugs:?}");
+        let pos = |s: &str| slugs.iter().position(|x| x == s).unwrap();
+        assert!(pos("left") < pos("top") && pos("right") < pos("top"), "{slugs:?}");
+    }
+
+    // ── bare-token lineage guard (phantom-node fix) ──
+
+    #[test]
+    fn parse_rejects_bare_prose_tokens_as_lineage() {
+        // Observed live on the 2026-07-29 board: lines that *begin* with the
+        // keyword but continue in prose used to mint phantom edge targets.
+        for (md, what) in [
+            ("# T\n\nDepends on nothing merged. Follow-up track later.\n", "nothing"),
+            ("# T\n\n**Depends on lever 1** (Chain-of-Note notes)\n", "lever"),
+            ("# T\n\n**Depends on:** M1 complete\n", "M1"),
+            ("# T\n\n> Depends on: M2 (VaultCrux AS metadata + DCR)\n", "M2"),
+        ] {
+            let p = parse_plan(md);
+            assert!(p.depends_on.is_empty(), "must not capture '{what}': {:?}", p.depends_on);
+        }
+        let p = parse_plan("# T\n\nExtended by declaration: none.\n");
+        assert!(
+            p.extended_by.is_empty(),
+            "must not capture 'declaration': {:?}",
+            p.extended_by
+        );
+    }
+
+    #[test]
+    fn parse_still_accepts_hyphenated_bare_slug() {
+        let p = parse_plan("# T\n\nDepends on real-plan-2026-05-01\n");
+        assert_eq!(p.depends_on, vec!["real-plan-2026-05-01".to_string()]);
+    }
+
+    #[test]
+    fn parse_superseded_rejects_bare_prose_token() {
+        // Higher stakes: a phantom target here flips a live plan to `archive`.
+        let p = parse_plan("# T\n\nSuperseded by nothing\n");
+        assert_eq!(p.superseded_by, None);
+        let ok = parse_plan("# T\n\nSuperseded by real-plan-2026-05-01\n");
+        assert_eq!(ok.superseded_by.as_deref(), Some("real-plan-2026-05-01"));
+    }
+
+    #[test]
+    fn parse_explicit_bracket_ref_survives_even_if_unhyphenated() {
+        // `[[…]]` is an explicit author declaration — keep it so the drift check
+        // can still report it as dangling rather than silently dropping it.
+        let p = parse_plan("# T\n\nDepends on [[weird]]\n");
+        assert_eq!(p.depends_on, vec!["weird".to_string()]);
     }
 }
