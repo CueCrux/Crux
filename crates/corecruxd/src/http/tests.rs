@@ -20765,3 +20765,73 @@ fn work_ranked_query_accepts_truthy_spellings() {
     // Garbage is rejected rather than silently read as false.
     assert!(parse("ranked=maybe").is_err());
 }
+
+/// The brief is the "point an agent at it and say start" surface. It used to
+/// read the kanban table alone — so the ExecPlan board, the large majority of
+/// real work, never appeared — and returned its twenty items unordered.
+#[serial_test::serial]
+#[tokio::test]
+async fn workbench_brief_open_work_is_ranked_and_slim() {
+    let state = pro_workbench_state(&["agent_brief:pro"]);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+        crate::projects::seed_default_if_missing(&mut store, 1).expect("project seed");
+    }
+    // One planned + one in_progress: ranking must put in_progress first.
+    for (title, st) in [("zzz planned work", "planned"), ("aaa active work", "in_progress")] {
+        let resp = super::work::post_work(
+            State(state.clone()),
+            dev_scope_headers("facts:write"),
+            Json(super::work::CreateWorkBody {
+                project_id: "default".to_string(),
+                title: title.to_string(),
+                body: None,
+                state: Some(st.to_string()),
+                assignee_passport: None,
+                tenant_id: Some("business::acme".to_string()),
+                linked_pr: None,
+                linked_issue: None,
+                created_by_passport: "personal-default".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    let resp = super::workbench::get_agent_brief(
+        State(state),
+        dev_scope_headers("admin:read"),
+        Query(super::workbench::TenantWorkbenchQuery {
+            tenant_id: "business::acme".to_string(),
+            project_id: None,
+            limit: None,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    assert_eq!(body["open_work_order"], "ranked", "order must be self-describing");
+    let rows = body["open_work"].as_array().expect("open_work array");
+    assert_eq!(rows.len(), 2);
+
+    // Ranked: in_progress leads even though its title sorts first alphabetically
+    // and both were created in the other order.
+    assert_eq!(rows[0]["state"], "in_progress");
+    assert_eq!(rows[1]["state"], "planned");
+
+    // Slim: the expensive fields are gone.
+    for row in rows {
+        let obj = row.as_object().expect("object");
+        assert!(obj.contains_key("id") && obj.contains_key("state"));
+        for dropped in ["title", "body", "created_by_passport", "provenance"] {
+            assert!(!obj.contains_key(dropped), "brief must drop `{dropped}`: {obj:?}");
+        }
+    }
+
+    // The whole section stays cheap — this is the reason the change exists.
+    let bytes = serde_json::to_string(&body["open_work"]).expect("serialize").len();
+    assert!(bytes < 2048, "open_work must stay under ~2 KB, got {bytes}");
+}
