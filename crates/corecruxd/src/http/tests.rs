@@ -20240,3 +20240,242 @@ async fn repo_allowance_defaults_to_one_seat_no_packs() {
     assert_eq!(body["included"], 8);
     assert_eq!(body["used"], 0);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// M2 — adversarial tenant isolation for the code-intelligence surface.
+// ExecPlan crux-code-intel-pro-hosted-surface-2026-07-28.
+//
+// These use AuthMode::JwtHs256 with a real `tenant_id` claim, NOT DevScopes.
+// DevScopes sets TenantAllow::Any (see auth.rs
+// `require_http_scopes_for_tenant_dev_scopes_always_any_tenant`), so an
+// "adversarial" test written in that mode proves nothing at all — it would pass
+// against a daemon with no isolation whatsoever.
+//
+// The written isolation argument accompanying this suite lives with the
+// ExecPlan, not in this repo.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const M2_HS256_SECRET: &str = "0123456789abcdef0123456789abcdef";
+
+fn m2_bearer_for(tenant: &str, scope: &str) -> HeaderMap {
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    #[derive(serde::Serialize)]
+    struct Claims<'a> {
+        exp: usize,
+        iss: &'a str,
+        aud: &'a str,
+        scope: &'a str,
+        tenant_id: &'a str,
+    }
+    let claims = Claims {
+        exp: (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600) as usize,
+        iss: "corecrux-test",
+        aud: "corecrux",
+        scope,
+        tenant_id: tenant,
+    };
+    let token = encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(M2_HS256_SECRET.as_bytes()),
+    )
+    .expect("jwt");
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    headers
+}
+
+fn m2_env() {
+    std::env::set_var("CORECRUXD_JWT_HS256_SECRET", M2_HS256_SECRET);
+    std::env::set_var("CORECRUXD_JWT_ISS", "corecrux-test");
+    std::env::set_var("CORECRUXD_JWT_AUD", "corecrux");
+}
+
+/// Tenant B, holding a valid token for its own tenant, attempts every
+/// tenant-scoped repo read path against tenant A's `repo_id`. Every one must be
+/// refused at the authorization boundary — not merely return empty, which would
+/// leak existence through timing or shape.
+#[tokio::test]
+#[serial_test::serial]
+async fn m2_tenant_b_cannot_read_tenant_a_repo_paths() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    {
+        let mut store = state.fact_store.write().await;
+        seed_repo(&mut store, "tenant-a", "secret-repo", true);
+    }
+    let b = || m2_bearer_for("tenant-b", "admin:read");
+
+    // /v1/repos?tenant_id=tenant-a
+    let r = super::repos::get_repos(
+        State(state.clone()),
+        b(),
+        Query(super::repos::RepoTenantQuery {
+            tenant_id: "tenant-a".into(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN, "get_repos leaked across tenants");
+
+    // /v1/repos/allowance?tenant_id=tenant-a — usage counts are commercially
+    // sensitive (team size, estate size), so this is not a benign read.
+    let r = super::repos::get_repo_allowance(
+        State(state.clone()),
+        b(),
+        Query(super::repos::RepoAllowanceQuery {
+            tenant_id: "tenant-a".into(),
+            seats: None,
+            packs: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN, "allowance leaked across tenants");
+
+    // /v1/repos/{repo_id}?tenant_id=tenant-a
+    let r = super::repos::get_repo(
+        State(state.clone()),
+        Path("secret-repo".to_string()),
+        b(),
+        Query(super::repos::RepoTenantQuery {
+            tenant_id: "tenant-a".into(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN, "get_repo leaked across tenants");
+}
+
+/// The same principal reading its *own* tenant must still succeed. Without this,
+/// the test above would pass against a daemon that simply refuses everything.
+#[tokio::test]
+#[serial_test::serial]
+async fn m2_tenant_b_can_still_read_its_own_repos() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    {
+        let mut store = state.fact_store.write().await;
+        seed_repo(&mut store, "tenant-b", "own-repo", true);
+    }
+    let r = super::repos::get_repos(
+        State(state.clone()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::repos::RepoTenantQuery {
+            tenant_id: "tenant-b".into(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        r.status(),
+        StatusCode::OK,
+        "isolation must not break the legitimate read"
+    );
+    let body = json_body(r).await;
+    assert_eq!(body["repos"][0]["repo_id"], "own-repo");
+}
+
+/// A token carrying no tenant claim at all must be refused, not defaulted.
+/// `TenantAllow::Missing` exists precisely so an unscoped token cannot silently
+/// become an any-tenant token.
+#[tokio::test]
+#[serial_test::serial]
+async fn m2_token_without_tenant_claim_is_refused() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    #[derive(serde::Serialize)]
+    struct NoTenant<'a> {
+        exp: usize,
+        iss: &'a str,
+        aud: &'a str,
+        scope: &'a str,
+    }
+    let claims = NoTenant {
+        exp: (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600) as usize,
+        iss: "corecrux-test",
+        aud: "corecrux",
+        scope: "admin:read",
+    };
+    let token = encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(M2_HS256_SECRET.as_bytes()),
+    )
+    .expect("jwt");
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    let r = super::repos::get_repos(
+        State(state.clone()),
+        headers,
+        Query(super::repos::RepoTenantQuery {
+            tenant_id: "tenant-a".into(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        r.status(),
+        StatusCode::FORBIDDEN,
+        "a token with no tenant claim must not resolve to any tenant"
+    );
+}
+
+/// **Documented gap, deliberately asserted so it cannot be forgotten.**
+///
+/// The runtime span plane is not tenant-partitioned. `StoredSpan` carries no
+/// tenant field, the store is one file per daemon
+/// (`data_dir/traces/spans.jsonl`), and `CORECRUXD_TRACE_TENANT_ID` is a single
+/// process-wide value. Every code-intel answer's runtime half is therefore
+/// computed from a daemon-global span set.
+///
+/// On a single-tenant local daemon that is correct and harmless — the spans are
+/// that daemon's own execution. It is a **blocking defect for hosted
+/// multi-tenant aggregation (M3)**, which is why M2 gates M3 rather than
+/// following it.
+///
+/// When M3 partitions the span store, this test must be rewritten to assert the
+/// partitioning, and the isolation argument updated in the same commit.
+#[test]
+fn m2_runtime_span_plane_is_not_yet_tenant_partitioned() {
+    let span = crate::trace_store::StoredSpan {
+        span: crux_observe::span_layer::SpanRecord {
+            trace_id: 1,
+            span_id: 2,
+            parent_span_id: None,
+            name: "n".into(),
+            target: "t".into(),
+            file: Some("f.rs".into()),
+            line: Some(1),
+            module_path: None,
+            duration_ns: 1,
+            depth: 0,
+            had_error: false,
+        },
+        symbol_id: None,
+        join: "miss".into(),
+        stored_at_unix_ms: 0,
+    };
+    let encoded = serde_json::to_string(&span).expect("serialise");
+    assert!(
+        !encoded.contains("tenant"),
+        "StoredSpan gained a tenant dimension — M3 may have landed. Rewrite this \
+         test to assert partitioning and update \
+         the accompanying isolation argument in the same commit."
+    );
+}

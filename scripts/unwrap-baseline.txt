@@ -60,6 +60,15 @@
 # `unwrap_or`, which the scan does not match and which cannot panic. A seed helper
 # that swallowed a store error would assert against wrong data, so failing loudly
 # is correct — contorting it to dodge the counter would be the wrong trade.
+# 2026-07-28 +7 corecruxd: the M2 adversarial tenant-isolation suite in
+# http/tests.rs (crux-code-intel-pro-hosted-surface M2) — JWT minting and header
+# parsing in the token helpers (`.expect("jwt")`, `.parse().unwrap()`) plus the
+# SystemTime reads. #[cfg(test)] code, counted only because tests.rs is an
+# out-of-file #[path] mod. Zero production-path additions: this commit adds no
+# non-test code at all. The suite must mint real HS256 tokens because DevScopes
+# sets TenantAllow::Any — an isolation test written in that mode would pass
+# against a daemon with no isolation whatsoever, so the token plumbing is the
+# part that makes the test meaningful.
 corecrux-frame 0
 corecrux-index 3
 corecrux-memory 0
@@ -82,7 +91,7 @@ corecruxctl 9
 # the scan counts it. The sibling console.rs assertion added by the same PR sits
 # after an in-file #[cfg(test)] and is correctly excluded. Zero production-path
 # additions (verified per-file against origin/main).
-corecruxd 857
+corecruxd 864
 crux-claude-hooks 1
 crux-config-wizard 8
 crux-contrib 0
