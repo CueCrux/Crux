@@ -272,6 +272,12 @@ pub(super) async fn get_work(
         }
     }
 
+    // Orchestration is the parent, so make the relationship TOTAL: anything no
+    // orchestrator claims belongs to the default one. This runs BEFORE the
+    // filter, so `?orchestrator=orchestrator:unassigned` is a real query — "what
+    // is nobody looking after" — rather than a hole in the data.
+    crate::work_execplans::apply_default_orchestrator(&mut items, &crate::work_execplans::default_orchestrator_id());
+
     // Apply the orchestrator filter so it intersects both kanban + execplan sources.
     if let Some(orc_id) = q.orchestrator.as_deref() {
         items.retain(|w| w.orchestrator_id.as_deref() == Some(orc_id));

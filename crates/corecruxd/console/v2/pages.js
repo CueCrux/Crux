@@ -449,6 +449,18 @@
     var ready = items.filter(function (w) { return !arr(w.blocked_by).length; });
     var blocked = items.filter(function (w) { return arr(w.blocked_by).length; });
 
+    // Orchestration is the parent, so the ready-list says whose work this is.
+    // Every item resolves to one (unclaimed work lands on the default), which is
+    // what makes a count here honest rather than a partial tally.
+    var byOrc = {};
+    items.forEach(function (w) { var o = w.orchestrator_id || '—'; byOrc[o] = (byOrc[o] || 0) + 1; });
+    var orcKeys = Object.keys(byOrc).sort(function (a, b) { return byOrc[b] - byOrc[a]; });
+    if (orcKeys.length > 1) {
+      head.push({ t: 'exp', label: 'Orchestrators · ' + orcKeys.length, badge: 'scope',
+        sub: 'open work by parent — append &orchestrator=<id> to scope the list',
+        controls: orcKeys.map(function (k) { return info(k, byOrc[k] + ' open'); }) });
+    }
+
     function row(w, n) {
       var slug = planSlug(w);
       var done = w.milestones_done || 0, total = w.milestones_total || 0;

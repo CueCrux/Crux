@@ -1261,16 +1261,18 @@ pub(super) async fn get_stream_export_v1(
 
     let mut resp = axum::response::Response::new(axum::body::Body::from(archive_bytes));
     *resp.status_mut() = StatusCode::OK;
-    // SAFETY: content_type() returns a static MIME string; filename is sanitised above.
+    // SAFETY: content_type() returns a static ASCII MIME string. The filename
+    // interpolates `stream_type`/`stream_id` straight off the request path, so
+    // it is sanitised inside attachment_disposition rather than unwrapped here.
     #[allow(clippy::unwrap_used)]
     {
         resp.headers_mut()
             .insert(header::CONTENT_TYPE, format.content_type().parse().unwrap());
-        resp.headers_mut().insert(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{filename}\"").parse().unwrap(),
-        );
     }
+    resp.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        super::replay::attachment_disposition(&filename),
+    );
     resp
 }
 
@@ -1486,16 +1488,18 @@ pub(super) async fn export_receipt_bundle_v1(
 
     let mut resp = axum::response::Response::new(axum::body::Body::from(export.archive_bytes));
     *resp.status_mut() = StatusCode::OK;
-    // SAFETY: content_type is a known MIME string; filename is sanitised above.
+    // SAFETY: content_type is a known ASCII MIME string. The filename embeds
+    // `receipt_id` straight off the request path, so it is sanitised inside
+    // attachment_disposition rather than unwrapped here.
     #[allow(clippy::unwrap_used)]
     {
         resp.headers_mut()
             .insert(header::CONTENT_TYPE, export.content_type.parse().unwrap());
-        resp.headers_mut().insert(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{filename}\"").parse().unwrap(),
-        );
     }
+    resp.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        super::replay::attachment_disposition(&filename),
+    );
     resp
 }
 

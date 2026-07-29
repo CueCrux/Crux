@@ -1686,6 +1686,39 @@ pub fn stamp_orchestrator_id(
     }
 }
 
+/// Orchestrator that owns work nobody has explicitly parented.
+///
+/// Overridable via `CRUX_DEFAULT_ORCHESTRATOR`.
+pub const DEFAULT_ORCHESTRATOR_ENV: &str = "CRUX_DEFAULT_ORCHESTRATOR";
+pub const DEFAULT_ORCHESTRATOR_ID: &str = "orchestrator:unassigned";
+
+/// The configured default orchestrator id.
+pub fn default_orchestrator_id() -> String {
+    std::env::var(DEFAULT_ORCHESTRATOR_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_ORCHESTRATOR_ID.to_string())
+}
+
+/// Give every item a parent.
+///
+/// Orchestrator membership is a hand-maintained list, so in practice almost
+/// nothing had a parent and "orchestration is the parent" was aspirational: a
+/// nullable field nobody could rely on. Falling back to a named default makes
+/// the relationship **total** — every item answers "whose work is this?", and
+/// `orchestrator:unassigned` is an honest answer that can be filtered on and
+/// counted, where `null` was merely absent.
+///
+/// Explicit membership always wins; this only fills the gap.
+pub fn apply_default_orchestrator(items: &mut [WorkItem], default_id: &str) {
+    for item in items.iter_mut() {
+        if item.orchestrator_id.as_deref().is_none_or(str::is_empty) {
+            item.orchestrator_id = Some(default_id.to_string());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

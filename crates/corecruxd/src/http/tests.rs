@@ -20835,3 +20835,83 @@ async fn workbench_brief_open_work_is_ranked_and_slim() {
     let bytes = serde_json::to_string(&body["open_work"]).expect("serialize").len();
     assert!(bytes < 2048, "open_work must stay under ~2 KB, got {bytes}");
 }
+
+// ── orchestrator as a TOTAL parent (source-of-truth plane M3) ────────────────
+
+/// Membership is hand-maintained, so before this almost nothing had a parent and
+/// `orchestrator_id` was a nullable field nobody could rely on. Every item must
+/// now answer "whose work is this?".
+#[serial_test::serial]
+#[tokio::test]
+async fn work_every_item_resolves_to_an_orchestrator() {
+    let state = seeded_work_state().await;
+
+    let body = json_body(
+        super::work::get_work(
+            State(state.clone()),
+            Query(ranked_work_query(false, None, None)),
+            dev_scope_headers("admin:read"),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+
+    let rows = body["work"].as_array().expect("work array");
+    assert!(!rows.is_empty());
+    for w in rows {
+        let orc = w["orchestrator_id"].as_str().unwrap_or_default();
+        assert!(!orc.is_empty(), "every item needs a parent, got {w:?}");
+    }
+    assert!(
+        rows.iter()
+            .all(|w| w["orchestrator_id"] == crate::work_execplans::DEFAULT_ORCHESTRATOR_ID),
+        "unclaimed work lands on the default orchestrator"
+    );
+
+    // And the default is a queryable value, not a hole: asking for it returns
+    // exactly the unclaimed set.
+    let mut q = ranked_work_query(false, None, None);
+    q.orchestrator = Some(crate::work_execplans::DEFAULT_ORCHESTRATOR_ID.to_string());
+    let filtered = json_body(
+        super::work::get_work(State(state), Query(q), dev_scope_headers("admin:read"))
+            .await
+            .into_response(),
+    )
+    .await;
+    assert_eq!(
+        filtered["work"].as_array().expect("array").len(),
+        rows.len(),
+        "'what is nobody looking after' must be answerable"
+    );
+}
+
+/// The scope composes with the ranked ready-list — an orchestrator's own
+/// work order, not the whole portfolio's.
+#[serial_test::serial]
+#[tokio::test]
+async fn work_orchestrator_scope_composes_with_ranked() {
+    let state = seeded_work_state().await;
+    let mut q = ranked_work_query(true, Some(20), Some("slim"));
+    q.orchestrator = Some(crate::work_execplans::DEFAULT_ORCHESTRATOR_ID.to_string());
+    let body = json_body(
+        super::work::get_work(State(state), Query(q), dev_scope_headers("admin:read"))
+            .await
+            .into_response(),
+    )
+    .await;
+    assert_eq!(body["ranked"], true);
+    assert!(!body["work"].as_array().expect("array").is_empty());
+
+    // An orchestrator nobody belongs to returns an empty ready-list, not everything.
+    let state2 = seeded_work_state().await;
+    let mut q2 = ranked_work_query(true, None, None);
+    q2.orchestrator = Some("orchestrator:nobody-here".to_string());
+    let empty = json_body(
+        super::work::get_work(State(state2), Query(q2), dev_scope_headers("admin:read"))
+            .await
+            .into_response(),
+    )
+    .await;
+    assert!(empty["work"].as_array().expect("array").is_empty());
+}
