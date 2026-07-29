@@ -196,6 +196,16 @@ pub struct ParsedPlan {
     pub deploys_to: Vec<String>,
     /// Distinct `OD-<n>` Open-Decision ids referenced anywhere in the plan body.
     pub open_decision_refs: Vec<String>,
+    /// `OD-<n>` ids the plan *declares* are holding it up, via a `Blocked by
+    /// OD-<n>` declaration line. Distinct from `open_decision_refs`, which is
+    /// every OD the prose happens to mention.
+    ///
+    /// This is the opt-in blocking signal. A plan citing an OD is not the same
+    /// claim as a plan waiting on one — and OD ids are a single global namespace
+    /// (`docs/master-plan/tracking/open-decisions.md`) while plans have
+    /// historically numbered decisions locally, so a bare mention collides across
+    /// unrelated plans. Only a declaration blocks.
+    pub blocked_by_od_refs: Vec<String>,
 }
 
 /// Rollup of facts stored under `entity = "execplan:<slug>"`. Fields cover the
@@ -372,6 +382,21 @@ pub fn parse_plan(md: &str) -> ParsedPlan {
         }
 
         collect_od_refs(trimmed, &mut out.open_decision_refs);
+
+        // Opt-in blocking: `Blocked by OD-12` / `Blocked by [[OD-12, OD-13]]`.
+        // Reuses the shared declaration parser so it inherits the keyword-anchor
+        // and separator discipline — mid-sentence prose ("…which is blocked by
+        // the vault work…") never matches. Non-`OD-` targets are dropped so a
+        // plan-slug typo can't land on this axis.
+        for target in extract_ref_slugs(trimmed, "Blocked by") {
+            let mut ids = Vec::new();
+            collect_od_refs(&target, &mut ids);
+            for id in ids {
+                if !out.blocked_by_od_refs.contains(&id) {
+                    out.blocked_by_od_refs.push(id);
+                }
+            }
+        }
 
         if trimmed.starts_with("## ") {
             let heading = trimmed.trim_start_matches("## ").trim().to_ascii_lowercase();
@@ -1189,6 +1214,7 @@ pub fn list_execplans(store: &FactStore, root: &Path, now_unix_ms: u64) -> std::
         .and_then(|p| std::fs::read_to_string(&p).ok())
         .map(|s| parse_open_decisions(&s));
     let mut out = Vec::with_capacity(files.len());
+    let mut declared_blockers: HashMap<String, Vec<String>> = HashMap::new();
     for file in files {
         let parsed = parse_plan(&file.content);
         let facts = facts_by_slug.remove(&file.slug).unwrap_or_default();
@@ -1204,10 +1230,13 @@ pub fn list_execplans(store: &FactStore, root: &Path, now_unix_ms: u64) -> std::
         // Surface attached notes (work comments keyed by the item id).
         let n = crate::work::list_comments(store, &item.id).len() as u32;
         item.notes_count = (n > 0).then_some(n);
+        if !parsed.blocked_by_od_refs.is_empty() {
+            declared_blockers.insert(item.id.clone(), parsed.blocked_by_od_refs.clone());
+        }
         out.push(item);
     }
     apply_reciprocal_refs(&mut out);
-    apply_open_decisions(&mut out, od_registry.as_ref(), now_unix_ms);
+    apply_open_decisions(&mut out, od_registry.as_ref(), &declared_blockers, now_unix_ms);
     out.sort_by(|a, b| b.updated_at_unix_ms.cmp(&a.updated_at_unix_ms));
     Ok(out)
 }
@@ -1678,14 +1707,27 @@ fn od_num(id: &str) -> u32 {
 
 /// Cross-reference each item's referenced `OD-<n>` ids (populated raw by
 /// `mk_item`) against the registry and keep only the *unresolved* ones, overdue
-/// first. An **overdue** open OD soft-blocks an otherwise-active
-/// (`planned`/`in_progress`) plan — flipping it to `blocked` with a
-/// `blocker_reason` — because the registry carries no per-OD blocker flag, so
-/// "past its decides-by date and still open" is the strongest available signal.
-/// Non-overdue open ODs annotate `open_decisions` without changing state.
+/// first. Non-blocking open ODs annotate `open_decisions` without changing state.
 /// `registry == None` (path unset/unreadable) → clears `open_decisions`, since
 /// without the registry we can't assert any are still open.
-fn apply_open_decisions(items: &mut [WorkItem], registry: Option<&HashMap<String, OpenDecision>>, now_unix_ms: u64) {
+///
+/// An open OD soft-blocks an otherwise-active (`planned`/`in_progress`) plan —
+/// flipping it to `blocked` with a `blocker_reason` — **only when that plan
+/// declares it** via `Blocked by OD-<n>`, supplied here as `declared_blockers`
+/// (item id → declared OD ids).
+///
+/// This used to block on "open and past its decides-by date" instead. That was a
+/// proxy for a missing signal and it misfired: OD ids are a single global
+/// namespace, plans have historically numbered decisions locally, so one overdue
+/// global OD silently blocked every unrelated plan that happened to write the
+/// same id. `check-od-refs.mjs` cannot catch it — it checks that an id exists,
+/// never that two plans mean the same decision by it.
+fn apply_open_decisions(
+    items: &mut [WorkItem],
+    registry: Option<&HashMap<String, OpenDecision>>,
+    declared_blockers: &HashMap<String, Vec<String>>,
+    now_unix_ms: u64,
+) {
     for item in items.iter_mut() {
         let Some(reg) = registry else {
             item.open_decisions.clear();
@@ -1710,12 +1752,19 @@ fn apply_open_decisions(items: &mut [WorkItem], registry: Option<&HashMap<String
         open.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| od_num(&a.0).cmp(&od_num(&b.0))));
         item.open_decisions = open.iter().map(|(id, _, _)| id.clone()).collect();
 
-        // An overdue open OD soft-blocks an active plan.
-        if let Some((id, decides_by, _)) = open.iter().find(|(_, _, overdue)| *overdue) {
+        // A DECLARED open OD soft-blocks an active plan. Overdue ones sort first
+        // so the reason names the most pressing of them.
+        let declared = declared_blockers.get(&item.id);
+        if let Some((id, decides_by, overdue)) = open.iter().find(|(id, _, _)| declared.is_some_and(|d| d.contains(id)))
+        {
             if item.state == "planned" || item.state == "in_progress" {
                 item.state = "blocked".to_string();
-                item.blocker_reason = Some(format!("Overdue open decision {id} (decides-by {decides_by})"));
-                // An overdue decision is waiting on an owner's call → HUMAN_HOLD.
+                item.blocker_reason = Some(if *overdue {
+                    format!("Declared blocker {id} still open (decides-by {decides_by}, overdue)")
+                } else {
+                    format!("Declared blocker {id} still open (decides-by {decides_by})")
+                });
+                // A pending decision is waiting on an owner's call → HUMAN_HOLD.
                 item.blocker_kind = Some(BlockerKind::NeedsApproval);
             }
         }
@@ -2171,38 +2220,102 @@ mod tests {
         let reg = parse_open_decisions(REGISTRY);
         let now = 1_750_000_000_000u64; // before OD-1's 2099 date
         let mut items = vec![wi_od("a", &["OD-1", "OD-9", "OD-3"])];
-        apply_open_decisions(&mut items, Some(&reg), now);
-        // OD-9 resolved → dropped; OD-1 + OD-3 open; neither overdue → no block.
+        apply_open_decisions(&mut items, Some(&reg), &HashMap::new(), now);
+        // OD-9 resolved → dropped; OD-1 + OD-3 open; undeclared → no block.
         assert_eq!(items[0].open_decisions, vec!["OD-1".to_string(), "OD-3".to_string()]);
         assert_eq!(items[0].state, "planned");
         assert!(items[0].blocker_reason.is_none());
     }
 
     #[test]
-    fn apply_open_decisions_overdue_blocks_active_plan() {
+    fn apply_open_decisions_overdue_alone_does_not_block() {
+        // Regression: this is the collision that blocked three unrelated
+        // production-readiness plans off one overdue global OD they merely
+        // mentioned. Mentioning an OD is not declaring a dependency on it.
         let reg = parse_open_decisions(REGISTRY);
         let now = 1_750_000_000_000u64; // after OD-2's 2000-01-01
         let mut items = vec![wi_od("a", &["OD-1", "OD-2"])];
-        apply_open_decisions(&mut items, Some(&reg), now);
-        // OD-2 overdue → sorted first, plan flips to blocked with a reason.
+        apply_open_decisions(&mut items, Some(&reg), &HashMap::new(), now);
+        // Overdue still sorts first for display, but state is untouched.
         assert_eq!(items[0].open_decisions, vec!["OD-2".to_string(), "OD-1".to_string()]);
+        assert_eq!(items[0].state, "planned");
+        assert!(items[0].blocker_reason.is_none());
+    }
+
+    #[test]
+    fn apply_open_decisions_declared_blocker_blocks_active_plan() {
+        let reg = parse_open_decisions(REGISTRY);
+        let now = 1_750_000_000_000u64;
+        let mut items = vec![wi_od("a", &["OD-1", "OD-2"])];
+        let declared = HashMap::from([("execplan:a".to_string(), vec!["OD-2".to_string()])]);
+        apply_open_decisions(&mut items, Some(&reg), &declared, now);
         assert_eq!(items[0].state, "blocked");
-        assert!(items[0].blocker_reason.as_deref().unwrap().contains("OD-2"));
+        let reason = items[0].blocker_reason.as_deref().unwrap();
+        assert!(reason.contains("OD-2"), "names the declared blocker: {reason}");
+        assert!(reason.contains("overdue"), "OD-2 is past its date: {reason}");
+        assert_eq!(items[0].blocker_kind, Some(BlockerKind::NeedsApproval));
+    }
+
+    #[test]
+    fn apply_open_decisions_declared_but_not_overdue_still_blocks() {
+        // A declared dependency on a decision that has not been made holds the
+        // plan up whether or not the date has passed.
+        let reg = parse_open_decisions(REGISTRY);
+        let mut items = vec![wi_od("a", &["OD-1"])];
+        let declared = HashMap::from([("execplan:a".to_string(), vec!["OD-1".to_string()])]);
+        apply_open_decisions(&mut items, Some(&reg), &declared, 1_750_000_000_000);
+        assert_eq!(items[0].state, "blocked");
+        let reason = items[0].blocker_reason.as_deref().unwrap();
+        assert!(reason.contains("OD-1") && !reason.contains("overdue"), "{reason}");
+    }
+
+    #[test]
+    fn apply_open_decisions_declaring_a_resolved_od_does_not_block() {
+        let reg = parse_open_decisions(REGISTRY);
+        let mut items = vec![wi_od("a", &["OD-9"])];
+        let declared = HashMap::from([("execplan:a".to_string(), vec!["OD-9".to_string()])]);
+        apply_open_decisions(&mut items, Some(&reg), &declared, 1_750_000_000_000);
+        assert_eq!(items[0].state, "planned", "OD-9 is resolved");
+        assert!(items[0].blocker_reason.is_none());
     }
 
     #[test]
     fn apply_open_decisions_unknown_ref_is_dropped() {
         let reg = parse_open_decisions(REGISTRY);
         let mut items = vec![wi_od("a", &["OD-999"])];
-        apply_open_decisions(&mut items, Some(&reg), 1_750_000_000_000);
+        apply_open_decisions(&mut items, Some(&reg), &HashMap::new(), 1_750_000_000_000);
         assert!(items[0].open_decisions.is_empty(), "unregistered OD dropped");
     }
 
     #[test]
     fn apply_open_decisions_none_registry_clears() {
         let mut items = vec![wi_od("a", &["OD-1"])];
-        apply_open_decisions(&mut items, None, 1_750_000_000_000);
+        apply_open_decisions(&mut items, None, &HashMap::new(), 1_750_000_000_000);
         assert!(items[0].open_decisions.is_empty());
+    }
+
+    #[test]
+    fn parse_plan_reads_blocked_by_declarations_and_ignores_mentions() {
+        let md = "# T\n\nThis plan discusses OD-3 at length and cites OD-7.\n\
+                  Blocked by OD-12\n\
+                  Blocked by [[OD-13, OD-14]]\n\
+                  It is not blocked by the vault work, which is prose.\n";
+        let p = parse_plan(md);
+        // Every mention is still annotated…
+        assert!(p.open_decision_refs.contains(&"OD-3".to_string()));
+        assert!(p.open_decision_refs.contains(&"OD-7".to_string()));
+        // …but only declarations block.
+        assert_eq!(
+            p.blocked_by_od_refs,
+            vec!["OD-12".to_string(), "OD-13".to_string(), "OD-14".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_plan_blocked_by_ignores_non_od_targets() {
+        let md = "# T\n\nBlocked by [[some-other-plan]]\nBlocked by OD-5\n";
+        let p = parse_plan(md);
+        assert_eq!(p.blocked_by_od_refs, vec!["OD-5".to_string()]);
     }
 
     #[test]
