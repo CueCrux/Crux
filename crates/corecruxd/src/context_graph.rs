@@ -446,9 +446,9 @@ fn query_prefix(store: &FactStore, prefix: &str, top_k: usize) -> Vec<corecrux_m
         .query(&FactQuery {
             min_effective_confidence: None,
             tenant_hash: None,
-            query: Some(prefix.to_string()),
+            query: None,
             entity: None,
-            entity_prefix: None,
+            entity_prefix: Some(prefix.to_string()),
             top_k,
             token_budget: None,
         })
@@ -468,13 +468,19 @@ pub fn load_latest_workspace_blocking_pub(store: &FactStore) -> Option<crate::wo
 fn load_latest_workspace_blocking(store: &FactStore) -> Option<crate::workspace_scan::WorkspaceScan> {
     // Exact-entity lookup, NOT a `query:` text search.
     //
-    // The text-search form this replaced ranked with BM25 over `top_k: 16`, and
-    // a scan fact's value is the ENTIRE serialised scan — hundreds of KB. BM25
-    // length normalisation buried it under a handful of short facts, so on a
-    // real store the lookup silently returned None and every consumer reported
-    // a workspace of zero LOC, zero stubs and zero dead code as though no scan
-    // had ever run. There is exactly one entity to fetch and its id is a
-    // constant; asking for it by name cannot be outranked.
+    // `query:` is not a prefix scan and not BM25 — an earlier version of this
+    // comment said length normalisation buried the fact, which was wrong about
+    // the mechanism though right that the lookup failed. What `query:` actually
+    // does (`corecrux_memory::fact_store::query_inner`) is one of two things:
+    // a lowercase SUBSTRING match over value/key/entity, or — when a dense
+    // provider is configured — nothing at all, because keyword filtering is
+    // skipped and every fact is ranked by cosine similarity instead. Either way
+    // the result is then truncated to `top_k`, so a specific entity can be
+    // ranked out by unrelated facts and the caller sees an empty result rather
+    // than an error.
+    //
+    // There is exactly one entity to fetch and its id is a constant. Asking for
+    // it by name cannot be ranked out.
     let result = store.query(&FactQuery {
         min_effective_confidence: None,
         tenant_hash: None,
@@ -677,9 +683,9 @@ fn count_facts_with_prefix(store: &FactStore, prefix: &str) -> usize {
     let result = store.query(&FactQuery {
         min_effective_confidence: None,
         tenant_hash: None,
-        query: Some(prefix.to_string()),
+        query: None,
         entity: None,
-        entity_prefix: None,
+        entity_prefix: Some(prefix.to_string()),
         top_k: 5000,
         token_budget: None,
     });
@@ -695,11 +701,14 @@ mod tests {
     /// The scan fact must be found however large it is, and however many other
     /// facts share its vocabulary.
     ///
-    /// Regression: this loader used a BM25 `query:` over `top_k: 16`. A scan
-    /// fact's value is the entire serialised scan, so length normalisation sank
-    /// it below shorter facts and the lookup returned None — reported to the
-    /// operator as a workspace with zero LOC, zero stubs and zero dead code,
-    /// which is indistinguishable from never having scanned.
+    /// Regression: this loader used `query:` over `top_k: 16`. That is a
+    /// substring filter, or — with a dense provider configured — no filter at
+    /// all, since keyword matching is skipped and every fact is ranked by
+    /// cosine similarity. Either way the result is truncated to `top_k`, so the
+    /// one entity being sought can be ranked out by unrelated facts and the
+    /// lookup returns None — reported to the operator as a workspace with zero
+    /// LOC, zero stubs and zero dead code, indistinguishable from never having
+    /// scanned.
     #[test]
     fn a_large_scan_fact_is_still_found_among_competing_facts() {
         let mut store = FactStore::new();
