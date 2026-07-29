@@ -34,7 +34,7 @@ jobs:
   # the full gate.
   changes:
     name: Detect change scope
-    runs-on: [self-hosted, ci]
+    runs-on: [self-hosted, ci, Linux]
     outputs:
       code: ${{ steps.scope.outputs.code }}
     steps:
@@ -90,7 +90,7 @@ jobs:
     name: Lint
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: [self-hosted, ci]
+    runs-on: [self-hosted, ci, Linux]
     env:
       # Per-job CARGO_HOME isolates the cargo package-cache file lock so the
       # four concurrent jobs on this self-hosted runner don't serialise
@@ -149,7 +149,7 @@ jobs:
     name: Test
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: [self-hosted, ci]
+    runs-on: [self-hosted, ci, Linux]
     env:
       # See `lint` job above for the per-job CARGO_HOME rationale.
       CARGO_HOME: /home/gha-runner/.cargo-${{ github.job }}-${{ github.run_id }}
@@ -292,7 +292,7 @@ jobs:
     name: Test (hosted-surfaces)
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: [self-hosted, ci]
+    runs-on: [self-hosted, ci, Linux]
     env:
       # See `lint` job above for the per-job CARGO_HOME rationale.
       CARGO_HOME: /home/gha-runner/.cargo-${{ github.job }}-${{ github.run_id }}
@@ -318,7 +318,7 @@ jobs:
     name: MSRV (1.88.0)
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: [self-hosted, ci]
+    runs-on: [self-hosted, ci, Linux]
     env:
       # See `lint` job above for the per-job CARGO_HOME rationale.
       CARGO_HOME: /home/gha-runner/.cargo-${{ github.job }}-${{ github.run_id }}
@@ -354,7 +354,7 @@ jobs:
     name: Coverage
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: [self-hosted, ci]
+    runs-on: [self-hosted, ci, Linux]
     env:
       # See `lint` job above for the per-job CARGO_HOME rationale.
       CARGO_HOME: /home/gha-runner/.cargo-${{ github.job }}-${{ github.run_id }}

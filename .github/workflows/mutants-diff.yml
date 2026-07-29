@@ -35,7 +35,7 @@ concurrency:
 jobs:
   in-diff:
     name: cargo-mutants --in-diff
-    runs-on: [self-hosted, ci]
+    runs-on: [self-hosted, ci, Linux]
     timeout-minutes: 60
     env:
       CARGO_HOME: /home/gha-runner/.cargo-mutants-diff-${{ github.run_id }}
