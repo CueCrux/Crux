@@ -447,6 +447,185 @@ mod tests {
         let _ = std::fs::remove_dir_all(&legacy);
     }
 
+    // ── write path ──
+
+    const GOOD: &str = "# Title\n\nStatus: Planned\n\n## Purpose\n\nWhy.\n\n## Milestones\n\n- [ ] M0 — thing.\n";
+
+    fn plans_subdir() -> PathBuf {
+        PathBuf::from(".agent/execplans")
+    }
+
+    #[test]
+    fn write_creates_commits_exactly_one_file_and_updates_with_hash() {
+        let repo = tmp("w-a");
+        seed_origin(&repo);
+        // An unrelated dirty file: the write path must not sweep it into the commit.
+        std::fs::write(repo.join("unrelated.txt"), "someone else's work in progress").expect("write");
+        run_git(Some(&repo), &["add", "unrelated.txt"]).expect("stage unrelated");
+
+        let out = write_plan(&repo, &plans_subdir(), "new-plan-2026-07-29", GOOD, None, false, None).expect("create");
+        assert_eq!(out.action, "created");
+        assert!(out.commit_sha.is_some());
+
+        // The commit contains ONLY the plan.
+        let files = run_git(Some(&repo), &["show", "--name-only", "--format=", "HEAD"]).expect("show");
+        let listed: Vec<&str> = files.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            listed,
+            vec![".agent/execplans/new-plan-2026-07-29.md"],
+            "commit must hold one file: {listed:?}"
+        );
+        // And the unrelated staged file is still staged, uncommitted.
+        assert!(
+            run_git(Some(&repo), &["status", "--porcelain"])
+                .expect("status")
+                .contains("unrelated.txt"),
+            "unrelated staged work must survive uncommitted"
+        );
+
+        // Update requires the current hash.
+        let updated = GOOD.replace("Why.", "Why, revised.");
+        let conflict = write_plan(
+            &repo,
+            &plans_subdir(),
+            "new-plan-2026-07-29",
+            &updated,
+            None,
+            false,
+            None,
+        );
+        assert!(
+            matches!(conflict, Err(WriteError::Conflict { .. })),
+            "no-hash update must conflict"
+        );
+
+        let out2 = write_plan(
+            &repo,
+            &plans_subdir(),
+            "new-plan-2026-07-29",
+            &updated,
+            Some(&out.content_hash),
+            false,
+            None,
+        )
+        .expect("update");
+        assert_eq!(out2.action, "updated");
+        assert_ne!(out2.commit_sha, out.commit_sha);
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn write_refuses_stale_hash_and_hands_back_the_current_one() {
+        let repo = tmp("w-b");
+        seed_origin(&repo);
+        let first =
+            write_plan(&repo, &plans_subdir(), "race-plan-2026-07-29", GOOD, None, false, None).expect("create");
+        // Peer writes.
+        let peer = GOOD.replace("Why.", "Peer got here first.");
+        write_plan(
+            &repo,
+            &plans_subdir(),
+            "race-plan-2026-07-29",
+            &peer,
+            Some(&first.content_hash),
+            false,
+            None,
+        )
+        .expect("peer update");
+        // We retry against the base we read — must be refused, with the new hash.
+        let mine = GOOD.replace("Why.", "My edit, based on a stale read.");
+        match write_plan(
+            &repo,
+            &plans_subdir(),
+            "race-plan-2026-07-29",
+            &mine,
+            Some(&first.content_hash),
+            false,
+            None,
+        ) {
+            Err(WriteError::Conflict { current_hash, .. }) => {
+                let cur = current_hash.expect("conflict must carry the current hash");
+                assert_ne!(cur, first.content_hash);
+                assert_eq!(cur, content_hash(peer.as_bytes()), "must hand back the PEER's hash");
+            }
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+        // The peer's content is intact — a refused write must change nothing.
+        let on_disk = std::fs::read_to_string(repo.join(".agent/execplans/race-plan-2026-07-29.md")).expect("read");
+        assert_eq!(on_disk, peer);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn write_rejects_path_traversal_and_bad_slugs() {
+        let repo = tmp("w-c");
+        seed_origin(&repo);
+        for bad in [
+            "../escape",
+            "a/b",
+            "UPPER",
+            "with space",
+            "..",
+            ".hidden",
+            "_fragment",
+            "",
+        ] {
+            let r = write_plan(&repo, &plans_subdir(), bad, GOOD, None, false, None);
+            assert!(
+                matches!(r, Err(WriteError::Invalid(_))),
+                "slug {bad:?} must be rejected, got {r:?}"
+            );
+        }
+        assert!(
+            !repo.parent().map(|p| p.join("escape.md").exists()).unwrap_or(false),
+            "nothing escaped"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn write_rejects_content_missing_required_sections() {
+        let repo = tmp("w-d");
+        seed_origin(&repo);
+        for (body, why) in [
+            ("no heading at all\n\n## Purpose\n\n## Milestones\n", "missing # title"),
+            ("# T\n\n## Milestones\n\n- [ ] M0\n", "missing Purpose"),
+            ("# T\n\n## Purpose\n\nWhy.\n", "missing Milestones"),
+            ("   \n", "empty"),
+        ] {
+            let r = write_plan(&repo, &plans_subdir(), "check-plan-2026-07-29", body, None, false, None);
+            assert!(
+                matches!(r, Err(WriteError::Invalid(_))),
+                "{why} must be rejected, got {r:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn write_then_projection_sees_it() {
+        // The whole point: a plan written through this path is projectable.
+        let repo = tmp("w-e");
+        seed_origin(&repo);
+        write_plan(
+            &repo,
+            &plans_subdir(),
+            "projectable-2026-07-29",
+            GOOD,
+            None,
+            false,
+            None,
+        )
+        .expect("write");
+        let files = crate::work_execplans::walk_execplans_root(&repo.join(".agent/execplans")).expect("walk");
+        assert!(
+            files.iter().any(|f| f.slug == "projectable-2026-07-29"),
+            "written plan must be visible to the projection"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     /// The checkout is the REPOSITORY; the projection root is normally
     /// `<checkout>/.agent/execplans`. Conflating them clones into the wrong
     /// place and the board silently stays empty — caught live on 2026-07-29.
@@ -555,4 +734,202 @@ mod tests {
             std::env::remove_var(k);
         }
     }
+}
+
+// ── Write path ───────────────────────────────────────────────────────────────
+//
+// The projection is read-only, which meant an agent without a checkout had no
+// legal way to author a plan. On the live host that produced three plans
+// existing in no git repository at all. This is the one legal write path:
+// validate, write, stage exactly one file, commit.
+//
+// It deliberately does NOT `git add -A`. A planning-document tool that sweeps
+// the working tree would eventually commit somebody's unrelated work in progress.
+
+/// Sections a plan must carry to be projectable. `# ` gives the title,
+/// `## Milestones` drives state derivation. Everything else in `PLANS.md` is
+/// convention this layer does not enforce — rejecting a plan for a missing
+/// `## Non-goals` would push authors back to writing files by hand, which is
+/// the behaviour this path exists to replace.
+const REQUIRED_HEADINGS: &[&str] = &["## Purpose", "## Milestones"];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WriteOutcome {
+    /// `created` | `updated`
+    pub action: String,
+    pub slug: String,
+    pub rel_path: String,
+    pub commit_sha: Option<String>,
+    pub content_hash: String,
+    pub pushed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteError {
+    /// Caller error — 400.
+    Invalid(String),
+    /// Lost-update / precondition — 409. Carries the current hash so the caller
+    /// can re-read, merge, and retry against a known base.
+    Conflict {
+        message: String,
+        current_hash: Option<String>,
+    },
+    /// Environment or git failure — 500.
+    Failed(String),
+}
+
+/// BLAKE3 of the plan bytes — the same digest `list_execplans` publishes as
+/// `plan_content_hash`, so a caller can round-trip board → edit → write without
+/// a second hashing convention.
+pub fn content_hash(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+/// A slug must be a bare filename. Rejecting separators is what stops
+/// `../../etc/whatever` from being written through this path.
+fn validate_slug(slug: &str) -> Result<(), WriteError> {
+    if slug.is_empty() || slug.len() > 160 {
+        return Err(WriteError::Invalid("slug must be 1..=160 characters".into()));
+    }
+    if !slug
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(WriteError::Invalid(
+            "slug must be lowercase alphanumeric with - _ . only".into(),
+        ));
+    }
+    if slug.contains("..") || slug.starts_with('.') || slug.starts_with('_') {
+        return Err(WriteError::Invalid(
+            "slug must not traverse, and must not start with '.' or '_' (underscore-prefixed files \
+             are excluded from the projection)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_content(content: &str) -> Result<(), WriteError> {
+    if content.trim().is_empty() {
+        return Err(WriteError::Invalid("content must not be empty".into()));
+    }
+    if !content.lines().any(|l| l.starts_with("# ")) {
+        return Err(WriteError::Invalid("plan must open with a `# <Title>` heading".into()));
+    }
+    let missing: Vec<&str> = REQUIRED_HEADINGS
+        .iter()
+        .filter(|h| !content.lines().any(|l| l.trim_start().starts_with(*h)))
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        return Err(WriteError::Invalid(format!(
+            "plan is missing required section(s): {} (see PLANS.md)",
+            missing.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// Write a plan into the checkout and commit exactly that file.
+///
+/// `expected_hash` is the lost-update guard: `None` means "must not exist",
+/// `Some(h)` means "must currently hash to `h`". Two sessions editing the same
+/// plan therefore cannot silently overwrite each other — the loser is handed the
+/// current hash rather than discovering the loss later.
+pub fn write_plan(
+    checkout: &Path,
+    plans_subdir: &Path,
+    slug: &str,
+    content: &str,
+    expected_hash: Option<&str>,
+    push: bool,
+    author: Option<&str>,
+) -> Result<WriteOutcome, WriteError> {
+    validate_slug(slug)?;
+    validate_content(content)?;
+
+    if !is_git_repo(checkout) {
+        return Err(WriteError::Failed(format!(
+            "{} is not a git repository — the write path commits, so it needs one",
+            checkout.display()
+        )));
+    }
+
+    let abs_dir = checkout.join(plans_subdir);
+    let abs_path = abs_dir.join(format!("{slug}.md"));
+    let rel_path = plans_subdir.join(format!("{slug}.md")).display().to_string();
+
+    let existing = std::fs::read(&abs_path).ok();
+    let existing_hash = existing.as_deref().map(content_hash);
+    match (expected_hash, &existing_hash) {
+        (None, Some(h)) => {
+            return Err(WriteError::Conflict {
+                message: format!("{slug} already exists; pass expected_content_hash to update it"),
+                current_hash: Some(h.clone()),
+            });
+        }
+        (Some(want), Some(have)) if want != have => {
+            return Err(WriteError::Conflict {
+                message: format!("{slug} changed since you read it — re-read, merge, and retry"),
+                current_hash: Some(have.clone()),
+            });
+        }
+        (Some(_), None) => {
+            return Err(WriteError::Conflict {
+                message: format!("{slug} does not exist, but expected_content_hash was supplied"),
+                current_hash: None,
+            });
+        }
+        _ => {}
+    }
+
+    if let Err(e) = std::fs::create_dir_all(&abs_dir) {
+        return Err(WriteError::Failed(format!("create {}: {e}", abs_dir.display())));
+    }
+    if let Err(e) = std::fs::write(&abs_path, content) {
+        return Err(WriteError::Failed(format!("write {}: {e}", abs_path.display())));
+    }
+
+    // Exactly one path. Never `-A`.
+    run_git(Some(checkout), &["add", "--", &rel_path]).map_err(WriteError::Failed)?;
+
+    let action = if existing_hash.is_some() { "updated" } else { "created" };
+    let trailer = author.map(|a| format!("\nCo-Authored-By: {a}\n")).unwrap_or_default();
+    let message = format!("plan({slug}): {action} via execplan_write\n\nExecPlan: {slug}\n{trailer}");
+    // `--only <path>` commits that path alone even when the index holds other
+    // staged changes — a session's unrelated staged work must not ride along.
+    match run_git(
+        Some(checkout),
+        &["commit", "--only", "--message", &message, "--", &rel_path],
+    ) {
+        Ok(_) => {}
+        Err(e) if e.contains("nothing to commit") || e.contains("no changes added") => {
+            // Byte-identical rewrite. Not an error; report it honestly.
+            return Ok(WriteOutcome {
+                action: "updated".into(),
+                slug: slug.to_string(),
+                rel_path,
+                commit_sha: head_sha(checkout),
+                content_hash: content_hash(content.as_bytes()),
+                pushed: false,
+            });
+        }
+        Err(e) => return Err(WriteError::Failed(e)),
+    }
+
+    let mut pushed = false;
+    if push {
+        let branch = run_git(Some(checkout), &["rev-parse", "--abbrev-ref", "HEAD"]).map_err(WriteError::Failed)?;
+        run_git(Some(checkout), &["push", "origin", &branch]).map_err(WriteError::Failed)?;
+        pushed = true;
+    }
+
+    Ok(WriteOutcome {
+        action: action.to_string(),
+        slug: slug.to_string(),
+        rel_path,
+        commit_sha: head_sha(checkout),
+        content_hash: content_hash(content.as_bytes()),
+        pushed,
+    })
 }

@@ -392,7 +392,7 @@ pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContra
     // Pulling the git-backed ExecPlan replica rewrites the projection root. It
     // mutates nothing the daemon owns, but it changes what every reader sees,
     // so it is classified as an admin write rather than a read.
-    if method == "POST" && path == "/v1/execplans/refresh" {
+    if method == "POST" && (path == "/v1/execplans/refresh" || path == "/v1/execplans") {
         return Some(RouteAuthContract::new(RouteAuthClass::AdminWrite, &["admin:write"]));
     }
 

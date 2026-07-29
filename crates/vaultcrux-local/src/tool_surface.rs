@@ -433,6 +433,11 @@ pub const TOOL_SURFACE: &[ToolSurfaceEntry] = &[
         marker: "[tier:local]",
     },
     ToolSurfaceEntry {
+        name: "execplan_write",
+        tier: ToolTier::Local,
+        marker: "[tier:local]",
+    },
+    ToolSurfaceEntry {
         name: "create_work",
         tier: ToolTier::Local,
         marker: "[tier:local]",

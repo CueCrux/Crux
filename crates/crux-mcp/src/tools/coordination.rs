@@ -914,3 +914,38 @@ mod tests {
         );
     }
 }
+
+pub const EXECPLAN_WRITE_DESCRIPTION: &str = "Write an ExecPlan and commit it. \
+The plan board is a read-time projection over a git repository, so a plan that is not committed \
+is invisible to every other session. This is the one write path that closes that gap for an agent \
+without a checkout. Validates the PLANS.md skeleton, writes the file, and commits EXACTLY that \
+file — never the rest of your working tree. Omit expected_content_hash to create (fails if the \
+plan exists); pass the plan's current plan_content_hash to update it, so two sessions editing one \
+plan cannot silently overwrite each other. push defaults to false.";
+
+pub async fn handle_execplan_write(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
+    let slug = args.get("slug").and_then(|v| v.as_str()).ok_or_else(|| JsonRpcError {
+        code: INVALID_PARAMS,
+        message: "execplan_write: slug is required (the plan filename without .md)".to_string(),
+        data: None,
+    })?;
+    let content = args
+        .get("content")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| JsonRpcError {
+            code: INVALID_PARAMS,
+            message: "execplan_write: content is required (the full plan markdown)".to_string(),
+            data: None,
+        })?;
+    let mut body = json!({ "slug": slug, "content": content });
+    for key in ["expected_content_hash", "push", "author"] {
+        if let Some(v) = args.get(key) {
+            body[key] = v.clone();
+        }
+    }
+    let base = loopback_base(ctx)?;
+    let (_, resp_body) = loopback_post(format!("{base}/v1/execplans"), body, true, ctx.scope_identity()).await?;
+    Ok(text_content(
+        serde_json::from_str(&resp_body).unwrap_or(Value::String(resp_body)),
+    ))
+}

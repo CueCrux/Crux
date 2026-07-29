@@ -910,6 +910,7 @@ pub(crate) fn router_with_route_auth(
             "/v1/execplans/refresh",
             axum::routing::post(self::work::post_execplans_refresh),
         )
+        .route("/v1/execplans", axum::routing::post(self::work::post_execplan))
         .route("/v1/work", get(self::work::get_work))
         .route("/v1/work", axum::routing::post(self::work::post_work))
         .route("/v1/work/gate/pending", get(self::work::get_pending_gates))

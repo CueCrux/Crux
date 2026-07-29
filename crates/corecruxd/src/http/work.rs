@@ -875,3 +875,80 @@ pub(super) async fn post_execplans_refresh(State(state): State<AppState>, header
     };
     (StatusCode::OK, Json(serde_json::json!({ "refresh": outcome }))).into_response()
 }
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct WriteExecplanBody {
+    pub slug: String,
+    pub content: String,
+    /// Lost-update guard. Omit to create (fails if the plan exists); supply the
+    /// plan's current `plan_content_hash` to update it.
+    #[serde(default)]
+    pub expected_content_hash: Option<String>,
+    /// Push after committing. Defaults to false — pushing is outward-facing, so
+    /// it is opt-in per call rather than ambient.
+    #[serde(default)]
+    pub push: bool,
+    #[serde(default, alias = "author_passport", alias = "by_passport")]
+    pub author: Option<String>,
+}
+
+/// `POST /v1/execplans` — the one legal write path for a plan.
+///
+/// Validates against the `PLANS.md` skeleton, writes into the git checkout, and
+/// commits **that single file**. Existed because the projection is read-only:
+/// an agent without a checkout had no way to author a plan, which is how three
+/// plans came to exist on the live host in no git repository at all.
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn post_execplan(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<WriteExecplanBody>,
+) -> Response {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
+        return problem.into_response();
+    }
+    let Some(checkout) = crate::execplan_git::checkout_path_from_env() else {
+        return problem_response(
+            StatusCode::CONFLICT,
+            "ExecPlan root is not configured — set CRUX_EXECPLANS_ROOT".to_string(),
+        );
+    };
+    // The plans directory relative to the checkout. When the root IS the
+    // checkout this is empty, which `join` handles as "write at the top level".
+    let subdir = crate::work_execplans::execplans_root_from_env()
+        .and_then(|root| root.strip_prefix(&checkout).ok().map(|p| p.to_path_buf()))
+        .unwrap_or_default();
+
+    let result = tokio::task::spawn_blocking(move || {
+        crate::execplan_git::write_plan(
+            &checkout,
+            &subdir,
+            &body.slug,
+            &body.content,
+            body.expected_content_hash.as_deref(),
+            body.push,
+            body.author.as_deref(),
+        )
+    })
+    .await;
+
+    match result {
+        Ok(Ok(outcome)) => (StatusCode::OK, Json(serde_json::json!({ "execplan": outcome }))).into_response(),
+        Ok(Err(crate::execplan_git::WriteError::Invalid(m))) => problem_response(StatusCode::BAD_REQUEST, m),
+        Ok(Err(crate::execplan_git::WriteError::Conflict { message, current_hash })) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "type": "https://errors.cuecrux.com/conflict",
+                "title": "Conflict",
+                "status": 409,
+                "detail": message,
+                // Hand back the current hash so the caller can re-read, merge and
+                // retry against a known base instead of guessing.
+                "current_content_hash": current_hash,
+            })),
+        )
+            .into_response(),
+        Ok(Err(crate::execplan_git::WriteError::Failed(m))) => problem_response(StatusCode::INTERNAL_SERVER_ERROR, m),
+        Err(e) => problem_response(StatusCode::INTERNAL_SERVER_ERROR, format!("write task failed: {e}")),
+    }
+}
