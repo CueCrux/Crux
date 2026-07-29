@@ -405,7 +405,9 @@ fn set_owner_only_perms(path: &Path) -> std::io::Result<()> {
     fs::set_permissions(path, perms)
 }
 
+// Mirrors the signature of the genuinely fallible unix implementation above.
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn set_owner_only_perms(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }

@@ -108,8 +108,9 @@ To understand what makes this tamper-evident, read these symbols in order:
 
 ## Build / test
 
-- MSRV: **1.88.0** (`rust-toolchain.toml`); edition 2021; workspace version 0.5.37
-  (`[workspace.package]` in `Cargo.toml` is authoritative).
+- MSRV: **1.88.0** (`rust-toolchain.toml`); edition 2021; workspace version 0.5.53
+  (`[workspace.package]` in `Cargo.toml` is authoritative, and
+  `scripts/check-agent-docs.sh` fails the build when this line disagrees with it).
 - `cargo build --workspace --locked`
 - `cargo test --workspace`
 - `cargo fmt --check` and `cargo clippy --workspace -- -D warnings` (both CI-gated)
@@ -449,7 +450,7 @@ schema: crux-agent-manifest/v1
 summary: Local-first, tamper-evident retrieval + memory engine with signed, replayable receipts.
 msrv: "1.88.0"
 edition: "2021"
-workspace_version: "0.5.37"
+workspace_version: "0.5.53"
 
 verify_commands:
   - cargo test --workspace
@@ -3563,7 +3564,7 @@ Report it privately per the [security policy](SECURITY.md).
 <sub><b>receipts as a literal chain</b> — click any block in the console, inspect the proof</sub>
 </div>
 
-**Testing & coverage:** 5,000+ tests and **~87%** CI-gated region coverage, with per-crate floors
+**Testing & coverage:** 6,000+ tests and **~87%** CI-gated region coverage, with per-crate floors
 on the trust core (`corecrux-receipts` / `-segment` / `-storage`) and the ungated total reported
 alongside so exclusions can't hide low-coverage code. How it's measured and exactly what's
 excluded: [docs/testing-and-coverage.md](docs/testing-and-coverage.md).
@@ -3971,6 +3972,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`CITATION.cff`.** Machine-readable citation metadata (GitHub "Cite this
   repository" button), matching the CCL v1.0 academic-use attribution
   condition.
+
+### Fixed
+
+- **A cold `cargo build` now completes on native Windows.** Three unrelated
+  stops, none of which CI can see (every runner is Linux, and the release matrix
+  is Linux + macOS — both unix):
+  - `aws-lc-sys` assembles its x86_64 Windows routines with NASM, absent from a
+    default Windows toolchain, so the build script aborted. The crate ships
+    pre-assembled objects for this case; `AWS_LC_SYS_PREBUILT_NASM = "1"` now
+    lives in `.cargo/config.toml`. Inert on Linux and macOS, where the prebuilt
+    path is gated off by target.
+  - `fsync_dir` (`corecrux-projections`) and `write_control_atomic`
+    (`corecruxd`) bound a variable consumed only inside `#[cfg(unix)]`. Against
+    the workspace-wide `unused_variables = "deny"`, that is a hard error off
+    unix. Both bind the value under `#[cfg(not(unix))]` rather than renaming to
+    `_path`/`_parent`, which would have suppressed the lint on unix where the
+    variable is load-bearing.
+
+- **`cargo clippy --workspace -- -D warnings` now passes on native Windows.**
+  Seven `clippy::unnecessary_wraps` errors across `corecrux-receipts`,
+  `corecrux-storage`, and `crux-claude-hooks`: each is a directory-fsync or
+  file-permission routine whose body is unix-only, so off-unix it collapses to
+  `Ok(())` and the `Result` looks redundant. The signature is shared with a
+  genuinely fallible unix implementation, so these are suppressed at the site
+  with a note, not "fixed" by dropping the return type.
+
+  Native Windows remains post-v1 per `docs/getting-started.md`; WSL2 is still
+  the supported path. This only stops the gap widening — there are ~49
+  `#[cfg(unix)]` sites and no Windows job to catch the next one.
+
+- **`config.example.env` no longer claims a `.env` file is read.** The daemon
+  has no dotenv support, so copying the file and starting `corecruxd` failed
+  with "CORECRUXD_AUTH_MODE must be set explicitly" — indistinguishable from a
+  genuine config error. The header now shows how to export the values.
+
+### Security
+
+- **`.mcp.json` is gitignored.** MCP clients write the daemon's agent bearer
+  token into that file at the repository root, where it was previously
+  committable.
 
 ## [0.5.38] - 2026-07-10
 

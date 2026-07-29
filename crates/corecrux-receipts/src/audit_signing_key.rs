@@ -203,7 +203,10 @@ fn set_owner_only_permissions(path: &Path) -> Result<(), AuditSigningKeyError> {
     })
 }
 
+// Signature mirrors the unix implementation, which is genuinely fallible; the
+// Result is not redundant there, so the lint is suppressed rather than obeyed.
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn set_owner_only_permissions(_path: &Path) -> Result<(), AuditSigningKeyError> {
     Ok(())
 }

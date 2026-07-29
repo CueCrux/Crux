@@ -281,9 +281,9 @@ pub fn list_grants_for_extension(store: &FactStore, extension_id: &str) -> Vec<E
     let result = store.query(&FactQuery {
         min_effective_confidence: None,
         tenant_hash: None,
-        query: Some(prefix.clone()),
+        query: None,
         entity: None,
-        entity_prefix: None,
+        entity_prefix: Some(prefix.clone()),
         top_k: 500,
         token_budget: None,
     });
@@ -308,9 +308,9 @@ pub fn list_grants_for_passport(store: &FactStore, passport_fpr: &str) -> Vec<Ex
     let result = store.query(&FactQuery {
         min_effective_confidence: None,
         tenant_hash: None,
-        query: Some(prefix.clone()),
+        query: None,
         entity: None,
-        entity_prefix: None,
+        entity_prefix: Some(prefix.clone()),
         top_k: 5_000,
         token_budget: None,
     });

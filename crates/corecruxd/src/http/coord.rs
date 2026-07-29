@@ -237,7 +237,15 @@ pub(super) async fn post_coord_announce(
         .touch(&intent.passport_id, "POST", "/v1/coord/announce")
         .await;
     let leases = live_lease_summaries(&state, now as i64).await;
-    let overlaps = crate::coord::find_overlaps(&intent, &peer_intents, &leases, now);
+    let mut overlaps = crate::coord::find_overlaps(&intent, &peer_intents, &leases, now);
+    // Fourth signal: two OPEN plans naming the same file. Unlike the other
+    // three it needs neither an announcement nor a lease, so it is the only one
+    // that sees a peer who has not announced and has not edited yet. Weakest
+    // and last, and each warning says so via its `signal`.
+    overlaps.extend(crate::coord::find_plan_path_overlaps(
+        &intent,
+        &open_plan_path_claims(&state).await,
+    ));
     let peers = peer_intents
         .iter()
         .filter(|p| p.session_id_hex != intent.session_id_hex && p.is_live(now))
@@ -554,4 +562,71 @@ mod tests {
             .into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
+}
+
+/// Repo-relative paths declared by each OPEN ExecPlan, for the plan-paths
+/// collision signal.
+///
+/// Reads the plans the projection already walked — no extra scan — and pulls
+/// the paths out of each plan's own text. Deliberately cheap and approximate:
+/// this signal exists to say "two plans name the same file", and a missed path
+/// costs a warning nobody needed rather than a wrong one.
+async fn open_plan_path_claims(state: &AppState) -> Vec<crate::coord::PlanPathClaim> {
+    let Some(root) = crate::work_execplans::execplans_root_from_env() else {
+        return Vec::new();
+    };
+    let files = match crate::work_execplans::walk_execplans_root(&root) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let store = state.fact_store.read().await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let items = crate::work_execplans::list_execplans(&store, &root, now).unwrap_or_default();
+    drop(store);
+    let open: std::collections::HashSet<&str> = items
+        .iter()
+        .filter(|i| crate::work_execplans::is_open_state(&i.state))
+        .filter_map(|i| i.id.strip_prefix("execplan:"))
+        .collect();
+
+    files
+        .iter()
+        .filter(|f| open.contains(f.slug.as_str()))
+        .map(|f| crate::coord::PlanPathClaim {
+            execplan_slug: f.slug.clone(),
+            paths: extract_declared_paths(&f.content),
+        })
+        .filter(|c| !c.paths.is_empty())
+        .collect()
+}
+
+/// Pull `<Repo>/path/to/file.ext` mentions out of a plan's markdown.
+///
+/// Vendored and generated trees carry no authorship signal — two plans
+/// "sharing" a `node_modules` file tells you nothing — so they are dropped.
+fn extract_declared_paths(md: &str) -> Vec<String> {
+    const NOISE: &[&str] = &["node_modules/", "target/", "dist/", "build/", ".git/", "vendor/"];
+    let mut out: Vec<String> = Vec::new();
+    for token in md.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '`' | '"' | ',' | ';')) {
+        let t = token.trim_matches(|c: char| matches!(c, '.' | ':' | '*' | '#' | '<' | '>'));
+        if t.len() < 5 || !t.contains('/') || !t.contains('.') {
+            continue;
+        }
+        let ext_ok = [
+            ".rs", ".ts", ".tsx", ".js", ".mjs", ".py", ".vue", ".sh", ".toml", ".sql",
+        ]
+        .iter()
+        .any(|e| t.ends_with(e));
+        if !ext_ok || NOISE.iter().any(|n| t.contains(n)) {
+            continue;
+        }
+        let s = t.to_string();
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out.truncate(64);
+    out
 }

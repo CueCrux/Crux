@@ -232,7 +232,11 @@ function walkPage(page, fn) {
   // control model.
   // cx-connections is System › Connections — how a client reaches THIS daemon
   // (MCP endpoints, the agent-token rail, the Claude Desktop .mcpb bundle).
-  const nativeExtra = new Set(['cx-activity-log', 'cx-mints', 'cx-storybook', 'cx-connections']);
+  // cx-work-order is Work › Work order — the ranked ready-list off
+  // /v1/work?ranked=1. The kanban next door answers "what is there"; this
+  // answers "what do I do next", which the board could not express because a
+  // state-grouped board has no order within a column.
+  const nativeExtra = new Set(['cx-activity-log', 'cx-mints', 'cx-storybook', 'cx-connections', 'cx-work-order']);
   Object.keys(pages.PAGES).forEach(function (id) {
     if (LEGACY_26.indexOf(id) >= 0) { return; }
     if (nativeExtra.has(id)) {

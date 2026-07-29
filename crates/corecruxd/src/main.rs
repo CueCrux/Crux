@@ -58,6 +58,9 @@ mod context_graph;
 mod dossier;
 mod encrypted_secrets;
 mod ephemeral_gc;
+// Git-backed ExecPlan projection root: clone + fast-forward only, so the
+// replica can never hold state git does not already have.
+mod execplan_git;
 mod extension_grants;
 mod extension_outbound;
 mod extension_registry;
@@ -1062,6 +1065,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // `__reverify_receipts__::*` facts past retain, via the journaled
     // delete path. See `crate::ephemeral_gc`.
     ephemeral_gc::spawn_ephemeral_gc(config.ephemeral_gc_enabled, state.clone(), shutdown_tx.subscribe());
+    // ExecPlan projection root, git-backed. A boot refresh runs first so the
+    // board is current before the first request rather than up to one interval
+    // stale; the periodic task then keeps it so. Both are no-ops unless
+    // CRUX_EXECPLANS_GIT_REMOTE is set, which keeps plain-directory deployments
+    // byte-identical. A failed refresh is logged and never fatal — the daemon
+    // serves whatever the replica already holds.
+    if let Some((root, outcome)) = execplan_git::refresh_from_env() {
+        match outcome.error {
+            Some(err) => tracing::warn!(root = %root.display(), error = %err, "execplan-git-boot-refresh-failed"),
+            None => tracing::info!(
+                root = %root.display(), action = %outcome.action, head = ?outcome.head_sha,
+                "execplan-git-boot-refresh"
+            ),
+        }
+    }
+    execplan_git::spawn_refresh_task();
     // Consolidation review scheduler (Audit II M4). Gated at spawn by
     // CORECRUXD_CONSOLIDATION_SCHEDULER (default OFF); interval config-driven.
     // Detect+surface only: each tick runs the read-only contradiction pass and

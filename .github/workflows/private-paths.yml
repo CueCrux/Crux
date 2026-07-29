@@ -18,7 +18,7 @@ concurrency:
 jobs:
   private-paths:
     name: No private-monorepo refs
-    runs-on: [self-hosted, ci, Linux]
+    runs-on: [self-hosted, hel1]
     steps:
       - uses: actions/checkout@v7
       - name: Run guard

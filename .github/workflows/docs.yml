@@ -27,7 +27,7 @@ concurrency:
 jobs:
   build:
     name: Build rustdoc
-    runs-on: [self-hosted, ci, Linux]
+    runs-on: [self-hosted, hel1]
     env:
       CARGO_HOME: /home/gha-runner/.cargo
     steps:
@@ -74,7 +74,7 @@ jobs:
     name: Deploy to GitHub Pages
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     needs: build
-    runs-on: [self-hosted, ci, Linux]
+    runs-on: [self-hosted, hel1]
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

@@ -13682,6 +13682,9 @@ async fn work_post_then_list_then_patch_state_round_trip() {
             assignee_passport: None,
             source: super::work::WorkSource::default(),
             orchestrator: None,
+            ranked: false,
+            limit: None,
+            fields: None,
         }),
         dev_scope_headers("admin:read"),
     )
@@ -13743,6 +13746,9 @@ async fn work_source_all_handler_round_trips_plan_content_hash() -> Result<(), B
             assignee_passport: None,
             source: super::work::WorkSource::All,
             orchestrator: None,
+            ranked: false,
+            limit: None,
+            fields: None,
         }),
         dev_scope_headers("admin:read"),
     )
@@ -20239,4 +20245,673 @@ async fn repo_allowance_defaults_to_one_seat_no_packs() {
     assert_eq!(body["packs"], 0);
     assert_eq!(body["included"], 8);
     assert_eq!(body["used"], 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// M2 — adversarial tenant isolation for the code-intelligence surface.
+// ExecPlan crux-code-intel-pro-hosted-surface-2026-07-28.
+//
+// These use AuthMode::JwtHs256 with a real `tenant_id` claim, NOT DevScopes.
+// DevScopes sets TenantAllow::Any (see auth.rs
+// `require_http_scopes_for_tenant_dev_scopes_always_any_tenant`), so an
+// "adversarial" test written in that mode proves nothing at all — it would pass
+// against a daemon with no isolation whatsoever.
+//
+// The written isolation argument accompanying this suite lives with the
+// ExecPlan, not in this repo.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const M2_HS256_SECRET: &str = "0123456789abcdef0123456789abcdef";
+
+fn m2_bearer_for(tenant: &str, scope: &str) -> HeaderMap {
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    #[derive(serde::Serialize)]
+    struct Claims<'a> {
+        exp: usize,
+        iss: &'a str,
+        aud: &'a str,
+        scope: &'a str,
+        tenant_id: &'a str,
+    }
+    let claims = Claims {
+        exp: (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600) as usize,
+        iss: "corecrux-test",
+        aud: "corecrux",
+        scope,
+        tenant_id: tenant,
+    };
+    let token = encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(M2_HS256_SECRET.as_bytes()),
+    )
+    .expect("jwt");
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    headers
+}
+
+fn m2_env() {
+    std::env::set_var("CORECRUXD_JWT_HS256_SECRET", M2_HS256_SECRET);
+    std::env::set_var("CORECRUXD_JWT_ISS", "corecrux-test");
+    std::env::set_var("CORECRUXD_JWT_AUD", "corecrux");
+}
+
+/// Tenant B, holding a valid token for its own tenant, attempts every
+/// tenant-scoped repo read path against tenant A's `repo_id`. Every one must be
+/// refused at the authorization boundary — not merely return empty, which would
+/// leak existence through timing or shape.
+#[tokio::test]
+#[serial_test::serial]
+async fn m2_tenant_b_cannot_read_tenant_a_repo_paths() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    {
+        let mut store = state.fact_store.write().await;
+        seed_repo(&mut store, "tenant-a", "secret-repo", true);
+    }
+    let b = || m2_bearer_for("tenant-b", "admin:read");
+
+    // /v1/repos?tenant_id=tenant-a
+    let r = super::repos::get_repos(
+        State(state.clone()),
+        b(),
+        Query(super::repos::RepoTenantQuery {
+            tenant_id: "tenant-a".into(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN, "get_repos leaked across tenants");
+
+    // /v1/repos/allowance?tenant_id=tenant-a — usage counts are commercially
+    // sensitive (team size, estate size), so this is not a benign read.
+    let r = super::repos::get_repo_allowance(
+        State(state.clone()),
+        b(),
+        Query(super::repos::RepoAllowanceQuery {
+            tenant_id: "tenant-a".into(),
+            seats: None,
+            packs: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN, "allowance leaked across tenants");
+
+    // /v1/repos/{repo_id}?tenant_id=tenant-a
+    let r = super::repos::get_repo(
+        State(state.clone()),
+        Path("secret-repo".to_string()),
+        b(),
+        Query(super::repos::RepoTenantQuery {
+            tenant_id: "tenant-a".into(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN, "get_repo leaked across tenants");
+}
+
+/// The same principal reading its *own* tenant must still succeed. Without this,
+/// the test above would pass against a daemon that simply refuses everything.
+#[tokio::test]
+#[serial_test::serial]
+async fn m2_tenant_b_can_still_read_its_own_repos() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    {
+        let mut store = state.fact_store.write().await;
+        seed_repo(&mut store, "tenant-b", "own-repo", true);
+    }
+    let r = super::repos::get_repos(
+        State(state.clone()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::repos::RepoTenantQuery {
+            tenant_id: "tenant-b".into(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        r.status(),
+        StatusCode::OK,
+        "isolation must not break the legitimate read"
+    );
+    let body = json_body(r).await;
+    assert_eq!(body["repos"][0]["repo_id"], "own-repo");
+}
+
+/// A token carrying no tenant claim at all must be refused, not defaulted.
+/// `TenantAllow::Missing` exists precisely so an unscoped token cannot silently
+/// become an any-tenant token.
+#[tokio::test]
+#[serial_test::serial]
+async fn m2_token_without_tenant_claim_is_refused() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    #[derive(serde::Serialize)]
+    struct NoTenant<'a> {
+        exp: usize,
+        iss: &'a str,
+        aud: &'a str,
+        scope: &'a str,
+    }
+    let claims = NoTenant {
+        exp: (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600) as usize,
+        iss: "corecrux-test",
+        aud: "corecrux",
+        scope: "admin:read",
+    };
+    let token = encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(M2_HS256_SECRET.as_bytes()),
+    )
+    .expect("jwt");
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    let r = super::repos::get_repos(
+        State(state.clone()),
+        headers,
+        Query(super::repos::RepoTenantQuery {
+            tenant_id: "tenant-a".into(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        r.status(),
+        StatusCode::FORBIDDEN,
+        "a token with no tenant claim must not resolve to any tenant"
+    );
+}
+
+/// **Documented gap, deliberately asserted so it cannot be forgotten.**
+///
+/// The runtime span plane is not tenant-partitioned. `StoredSpan` carries no
+/// tenant field, the store is one file per daemon
+/// (`data_dir/traces/spans.jsonl`), and `CORECRUXD_TRACE_TENANT_ID` is a single
+/// process-wide value. Every code-intel answer's runtime half is therefore
+/// computed from a daemon-global span set.
+///
+/// On a single-tenant local daemon that is correct and harmless — the spans are
+/// that daemon's own execution. It is a **blocking defect for hosted
+/// multi-tenant aggregation (M3)**, which is why M2 gates M3 rather than
+/// following it.
+///
+/// When M3 partitions the span store, this test must be rewritten to assert the
+/// partitioning, and the isolation argument updated in the same commit.
+#[test]
+fn m2_runtime_span_plane_is_not_yet_tenant_partitioned() {
+    let span = crate::trace_store::StoredSpan {
+        span: crux_observe::span_layer::SpanRecord {
+            trace_id: 1,
+            span_id: 2,
+            parent_span_id: None,
+            name: "n".into(),
+            target: "t".into(),
+            file: Some("f.rs".into()),
+            line: Some(1),
+            module_path: None,
+            duration_ns: 1,
+            depth: 0,
+            had_error: false,
+        },
+        symbol_id: None,
+        join: "miss".into(),
+        stored_at_unix_ms: 0,
+    };
+    let encoded = serde_json::to_string(&span).expect("serialise");
+    assert!(
+        !encoded.contains("tenant"),
+        "StoredSpan gained a tenant dimension — M3 may have landed. Rewrite this \
+         test to assert partitioning and update \
+         the accompanying isolation argument in the same commit."
+    );
+}
+// ── /v1/work ready-order projection (execplan-work-order-ranking M1) ─────────
+
+/// Build a `ListWorkQuery` with the ranked-projection knobs, everything else default.
+fn ranked_work_query(ranked: bool, limit: Option<usize>, fields: Option<&str>) -> super::work::ListWorkQuery {
+    super::work::ListWorkQuery {
+        project_id: None,
+        state: None,
+        tenant_id: None,
+        assignee_passport: None,
+        source: super::work::WorkSource::default(),
+        orchestrator: None,
+        ranked,
+        limit,
+        fields: fields.map(str::to_string),
+    }
+}
+
+async fn seeded_work_state() -> crate::http::AppState {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+        crate::projects::seed_default_if_missing(&mut store, 1).expect("project seed");
+    }
+    for (title, st) in [
+        ("alpha task", "planned"),
+        ("beta task", "planned"),
+        ("gamma task", "planned"),
+    ] {
+        let resp = super::work::post_work(
+            State(state.clone()),
+            dev_scope_headers("facts:write"),
+            Json(super::work::CreateWorkBody {
+                project_id: "default".to_string(),
+                title: title.to_string(),
+                body: None,
+                state: Some(st.to_string()),
+                assignee_passport: None,
+                tenant_id: None,
+                linked_pr: None,
+                linked_issue: None,
+                created_by_passport: "personal-default".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+    state
+}
+
+/// The gate: omitting the new params must reproduce the historical response
+/// byte-for-byte. If this ever fails, the projection stopped being additive.
+#[serial_test::serial]
+#[tokio::test]
+async fn work_ranked_params_absent_is_byte_identical() {
+    let state = seeded_work_state().await;
+
+    let baseline = json_body(
+        super::work::get_work(
+            State(state.clone()),
+            Query(ranked_work_query(false, None, None)),
+            dev_scope_headers("admin:read"),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+
+    // No `ranked` key, no `dependency_cycles` key, full item shape retained.
+    assert!(
+        baseline.get("ranked").is_none(),
+        "unranked response must not carry `ranked`"
+    );
+    assert!(baseline.get("dependency_cycles").is_none());
+    assert_eq!(baseline["count"], 3);
+    let first = &baseline["work"][0];
+    assert!(first.get("title").is_some(), "full shape keeps title");
+    assert!(first.get("created_by_passport").is_some(), "full shape keeps passport");
+    assert!(
+        first.get("blocked_by").is_none(),
+        "blocked_by must never appear on an unranked response"
+    );
+
+    // Same query twice → identical bytes (determinism, not just shape).
+    let again = json_body(
+        super::work::get_work(
+            State(state),
+            Query(ranked_work_query(false, None, None)),
+            dev_scope_headers("admin:read"),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(
+        serde_json::to_string(&baseline).unwrap(),
+        serde_json::to_string(&again).unwrap()
+    );
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn work_ranked_marks_response_and_limit_truncates() {
+    let state = seeded_work_state().await;
+
+    let ranked = json_body(
+        super::work::get_work(
+            State(state.clone()),
+            Query(ranked_work_query(true, None, None)),
+            dev_scope_headers("admin:read"),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(ranked["ranked"], true);
+    assert_eq!(ranked["work"].as_array().expect("array").len(), 3);
+
+    let capped = json_body(
+        super::work::get_work(
+            State(state),
+            Query(ranked_work_query(true, Some(2), None)),
+            dev_scope_headers("admin:read"),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(capped["work"].as_array().expect("array").len(), 2);
+    assert_eq!(capped["count"], 2, "count reflects the truncated list");
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn work_ranked_slim_emits_only_the_cheap_fields() {
+    let state = seeded_work_state().await;
+    let body = json_body(
+        super::work::get_work(
+            State(state.clone()),
+            Query(ranked_work_query(true, Some(20), Some("slim"))),
+            dev_scope_headers("admin:read"),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+
+    let rows = body["work"].as_array().expect("array");
+    assert!(!rows.is_empty());
+    for row in rows {
+        let obj = row.as_object().expect("object");
+        assert!(obj.contains_key("id"));
+        assert!(obj.contains_key("state"));
+        // The expensive fields are exactly what slim exists to drop.
+        for dropped in ["title", "body", "created_by_passport", "provenance", "plan_path"] {
+            assert!(!obj.contains_key(dropped), "slim must drop `{dropped}`: {obj:?}");
+        }
+    }
+
+    // Slim must be materially cheaper than full — that is the whole point.
+    let full = json_body(
+        super::work::get_work(
+            State(state),
+            Query(ranked_work_query(true, Some(20), None)),
+            dev_scope_headers("admin:read"),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(
+        full["work"].as_array().expect("array").len(),
+        rows.len(),
+        "same board, same item count — only the per-item shape differs"
+    );
+    let slim_len = serde_json::to_string(&body["work"]).unwrap().len();
+    let full_len = serde_json::to_string(&full["work"]).unwrap().len();
+    assert!(
+        slim_len < full_len.max(1),
+        "slim ({slim_len}) must be smaller than full ({full_len})"
+    );
+}
+
+/// `ranked=1` narrows to open work: terminal states drop out entirely.
+#[serial_test::serial]
+#[tokio::test]
+async fn work_ranked_drops_terminal_states() {
+    let state = seeded_work_state().await;
+
+    // Move one item to `complete`.
+    let listed = json_body(
+        super::work::get_work(
+            State(state.clone()),
+            Query(ranked_work_query(false, None, None)),
+            dev_scope_headers("admin:read"),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    let victim = listed["work"][0]["id"].as_str().expect("id").to_string();
+    let patched = super::work::patch_work(
+        State(state.clone()),
+        Path(victim.clone()),
+        dev_scope_headers("facts:write"),
+        Json(super::work::UpdateWorkBody {
+            title: None,
+            body: None,
+            state: Some("complete".to_string()),
+            assignee_passport: None,
+            tenant_id: None,
+            linked_pr: None,
+            linked_issue: None,
+            blocker_reason: None,
+            blocker_kind: None,
+            by_passport: "personal-default".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(patched.status(), StatusCode::OK);
+
+    let ranked = json_body(
+        super::work::get_work(
+            State(state),
+            Query(ranked_work_query(true, None, None)),
+            dev_scope_headers("admin:read"),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    let ids: Vec<&str> = ranked["work"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|w| w["id"].as_str().expect("id"))
+        .collect();
+    assert!(
+        !ids.contains(&victim.as_str()),
+        "completed item must drop from ranked: {ids:?}"
+    );
+    assert_eq!(ids.len(), 2);
+}
+
+/// `?ranked=1` is the form the docs and agent instructions use; bare serde only
+/// accepts `true`/`false`, so this guards the spelling every caller reaches for.
+#[test]
+fn work_ranked_query_accepts_truthy_spellings() {
+    fn parse(qs: &str) -> Result<super::work::ListWorkQuery, ()> {
+        let uri: axum::http::Uri = format!("/v1/work?{qs}").parse().expect("uri");
+        Query::<super::work::ListWorkQuery>::try_from_uri(&uri)
+            .map(|Query(q)| q)
+            .map_err(|_| ())
+    }
+
+    for (qs, want) in [
+        ("ranked=1", true),
+        ("ranked=true", true),
+        ("ranked=yes", true),
+        ("ranked=on", true),
+        ("ranked=0", false),
+        ("ranked=false", false),
+        ("ranked=off", false),
+    ] {
+        let q = parse(qs).unwrap_or_else(|()| panic!("`{qs}` must parse"));
+        assert_eq!(q.ranked, want, "`{qs}`");
+    }
+    // Absent → false, and the rest of the query still parses.
+    let q = parse("source=all").expect("parse");
+    assert!(!q.ranked);
+    // The companion knobs parse alongside it.
+    let q = parse("ranked=1&limit=20&fields=slim").expect("parse");
+    assert!(q.ranked);
+    assert_eq!(q.limit, Some(20));
+    assert_eq!(q.fields.as_deref(), Some("slim"));
+    // Garbage is rejected rather than silently read as false.
+    assert!(parse("ranked=maybe").is_err());
+}
+
+/// The brief is the "point an agent at it and say start" surface. It used to
+/// read the kanban table alone — so the ExecPlan board, the large majority of
+/// real work, never appeared — and returned its twenty items unordered.
+#[serial_test::serial]
+#[tokio::test]
+async fn workbench_brief_open_work_is_ranked_and_slim() {
+    let state = pro_workbench_state(&["agent_brief:pro"]);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+        crate::projects::seed_default_if_missing(&mut store, 1).expect("project seed");
+    }
+    // One planned + one in_progress: ranking must put in_progress first.
+    for (title, st) in [("zzz planned work", "planned"), ("aaa active work", "in_progress")] {
+        let resp = super::work::post_work(
+            State(state.clone()),
+            dev_scope_headers("facts:write"),
+            Json(super::work::CreateWorkBody {
+                project_id: "default".to_string(),
+                title: title.to_string(),
+                body: None,
+                state: Some(st.to_string()),
+                assignee_passport: None,
+                tenant_id: Some("business::acme".to_string()),
+                linked_pr: None,
+                linked_issue: None,
+                created_by_passport: "personal-default".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    let resp = super::workbench::get_agent_brief(
+        State(state),
+        dev_scope_headers("admin:read"),
+        Query(super::workbench::TenantWorkbenchQuery {
+            tenant_id: "business::acme".to_string(),
+            project_id: None,
+            limit: None,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    assert_eq!(body["open_work_order"], "ranked", "order must be self-describing");
+    let rows = body["open_work"].as_array().expect("open_work array");
+    assert_eq!(rows.len(), 2);
+
+    // Ranked: in_progress leads even though its title sorts first alphabetically
+    // and both were created in the other order.
+    assert_eq!(rows[0]["state"], "in_progress");
+    assert_eq!(rows[1]["state"], "planned");
+
+    // Slim: the expensive fields are gone.
+    for row in rows {
+        let obj = row.as_object().expect("object");
+        assert!(obj.contains_key("id") && obj.contains_key("state"));
+        for dropped in ["title", "body", "created_by_passport", "provenance"] {
+            assert!(!obj.contains_key(dropped), "brief must drop `{dropped}`: {obj:?}");
+        }
+    }
+
+    // The whole section stays cheap — this is the reason the change exists.
+    let bytes = serde_json::to_string(&body["open_work"]).expect("serialize").len();
+    assert!(bytes < 2048, "open_work must stay under ~2 KB, got {bytes}");
+}
+
+// ── orchestrator as a TOTAL parent (source-of-truth plane M3) ────────────────
+
+/// Membership is hand-maintained, so before this almost nothing had a parent and
+/// `orchestrator_id` was a nullable field nobody could rely on. Every item must
+/// now answer "whose work is this?".
+#[serial_test::serial]
+#[tokio::test]
+async fn work_every_item_resolves_to_an_orchestrator() {
+    let state = seeded_work_state().await;
+
+    let body = json_body(
+        super::work::get_work(
+            State(state.clone()),
+            Query(ranked_work_query(false, None, None)),
+            dev_scope_headers("admin:read"),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+
+    let rows = body["work"].as_array().expect("work array");
+    assert!(!rows.is_empty());
+    for w in rows {
+        let orc = w["orchestrator_id"].as_str().unwrap_or_default();
+        assert!(!orc.is_empty(), "every item needs a parent, got {w:?}");
+    }
+    assert!(
+        rows.iter()
+            .all(|w| w["orchestrator_id"] == crate::work_execplans::DEFAULT_ORCHESTRATOR_ID),
+        "unclaimed work lands on the default orchestrator"
+    );
+
+    // And the default is a queryable value, not a hole: asking for it returns
+    // exactly the unclaimed set.
+    let mut q = ranked_work_query(false, None, None);
+    q.orchestrator = Some(crate::work_execplans::DEFAULT_ORCHESTRATOR_ID.to_string());
+    let filtered = json_body(
+        super::work::get_work(State(state), Query(q), dev_scope_headers("admin:read"))
+            .await
+            .into_response(),
+    )
+    .await;
+    assert_eq!(
+        filtered["work"].as_array().expect("array").len(),
+        rows.len(),
+        "'what is nobody looking after' must be answerable"
+    );
+}
+
+/// The scope composes with the ranked ready-list — an orchestrator's own
+/// work order, not the whole portfolio's.
+#[serial_test::serial]
+#[tokio::test]
+async fn work_orchestrator_scope_composes_with_ranked() {
+    let state = seeded_work_state().await;
+    let mut q = ranked_work_query(true, Some(20), Some("slim"));
+    q.orchestrator = Some(crate::work_execplans::DEFAULT_ORCHESTRATOR_ID.to_string());
+    let body = json_body(
+        super::work::get_work(State(state), Query(q), dev_scope_headers("admin:read"))
+            .await
+            .into_response(),
+    )
+    .await;
+    assert_eq!(body["ranked"], true);
+    assert!(!body["work"].as_array().expect("array").is_empty());
+
+    // An orchestrator nobody belongs to returns an empty ready-list, not everything.
+    let state2 = seeded_work_state().await;
+    let mut q2 = ranked_work_query(true, None, None);
+    q2.orchestrator = Some("orchestrator:nobody-here".to_string());
+    let empty = json_body(
+        super::work::get_work(State(state2), Query(q2), dev_scope_headers("admin:read"))
+            .await
+            .into_response(),
+    )
+    .await;
+    assert!(empty["work"].as_array().expect("array").is_empty());
 }

@@ -1015,16 +1015,15 @@ fn export_answer_capsule(state: &AppState, capsule: &AnswerReplayCapsule, opts: 
 
     let mut response = axum::response::Response::new(axum::body::Body::from(archive));
     *response.status_mut() = StatusCode::OK;
-    #[allow(clippy::unwrap_used)] // Static content types and sanitized filenames are valid header values.
+    #[allow(clippy::unwrap_used)] // content_type() returns a static ASCII MIME string.
     {
         response
             .headers_mut()
             .insert(header::CONTENT_TYPE, opts.format.content_type().parse().unwrap());
-        response.headers_mut().insert(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{filename}\"").parse().unwrap(),
-        );
     }
+    response
+        .headers_mut()
+        .insert(header::CONTENT_DISPOSITION, attachment_disposition(&filename));
     response
 }
 
@@ -1037,7 +1036,18 @@ fn build_evidence_jsonl(evidence: &[ReplayEvidenceRef]) -> Result<Vec<u8>, Strin
     Ok(out)
 }
 
-fn sanitize_filename_part(value: &str) -> String {
+/// Build a `Content-Disposition: attachment` header value from an untrusted
+/// filename. Every byte that survives [`sanitize_filename_part`] is ASCII
+/// alphanumeric, `-`, `_` or `.`, so the resulting string is always a valid
+/// header value and this cannot fail — the callers below rely on that rather
+/// than unwrapping a `parse()` on raw path parameters.
+pub(super) fn attachment_disposition(filename: &str) -> header::HeaderValue {
+    let safe = sanitize_filename_part(filename);
+    header::HeaderValue::from_str(&format!("attachment; filename=\"{safe}\""))
+        .unwrap_or_else(|_| header::HeaderValue::from_static("attachment"))
+}
+
+pub(super) fn sanitize_filename_part(value: &str) -> String {
     let sanitized = value
         .chars()
         .map(|c| {
@@ -1057,6 +1067,24 @@ fn sanitize_filename_part(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn attachment_disposition_survives_hostile_path_params() {
+        // CR/LF and non-ASCII reach these filenames straight off the request
+        // path (GET /v1/replay/exports/streams/{streamType}/{streamId}), which
+        // HeaderValue::from_str rejects. Previously this was `.parse().unwrap()`
+        // and panicked into the CatchPanicLayer as a 500.
+        for hostile in ["a\r\nX-Evil: 1", "réçeipt", "id\u{0}null", "", "../../etc/passwd"] {
+            let v = super::attachment_disposition(hostile);
+            let s = v.to_str().expect("header value is valid ASCII");
+            assert!(s.starts_with("attachment"), "unexpected disposition: {s}");
+            assert!(!s.contains('\r') && !s.contains('\n'), "header injection: {s}");
+        }
+        assert_eq!(
+            super::attachment_disposition("receipt-abc.zip").to_str().unwrap(),
+            "attachment; filename=\"receipt-abc.zip\""
+        );
+    }
+
     use super::*;
     use corecrux_memory::replay::{BuildAnswerReplayCapsule, ProjectionReplayRef};
 

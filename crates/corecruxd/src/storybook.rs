@@ -606,9 +606,9 @@ fn read_project_layers(store: &corecrux_memory::FactStore, project_id: &str) -> 
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
         min_effective_confidence: None,
         tenant_hash: None,
-        query: Some(prefix.clone()),
+        query: None,
         entity: None,
-        entity_prefix: None,
+        entity_prefix: Some(prefix.clone()),
         top_k: 200,
         token_budget: None,
     });
@@ -629,9 +629,9 @@ fn read_plane_layers(store: &corecrux_memory::FactStore, project_id: &str, plane
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
         min_effective_confidence: None,
         tenant_hash: None,
-        query: Some(prefix.clone()),
+        query: None,
         entity: None,
-        entity_prefix: None,
+        entity_prefix: Some(prefix.clone()),
         top_k: 100,
         token_budget: None,
     });

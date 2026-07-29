@@ -151,6 +151,12 @@ pub struct WorkItem {
     pub depends_on: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extended_by: Vec<String>,
+    /// Ready-order projection only (`/v1/work?ranked=1`): the subset of
+    /// `depends_on` that is still *open*, i.e. what is actually holding this
+    /// item back. Empty = ready to start now. Never populated on an unranked
+    /// response, so the default board stays byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_by: Vec<String>,
     /// Unresolved Open-Decision ids (`OD-<n>`) this plan references, per the
     /// registry — overdue first. Empty unless the daemon has the registry path
     /// (`CRUX_OPEN_DECISIONS_PATH`) set and the plan cites a still-open OD.
@@ -329,6 +335,7 @@ pub fn create_work(store: &mut FactStore, input: CreateWorkInput, now_unix_ms: u
         superseded_by: None,
         depends_on: Vec::new(),
         extended_by: Vec::new(),
+        blocked_by: Vec::new(),
         open_decisions: Vec::new(),
         orchestrator_id: None,
         milestones_done: None,

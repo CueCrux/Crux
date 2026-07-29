@@ -256,7 +256,10 @@ fn validate_key_permissions(path: &Path, metadata: &fs::Metadata) -> anyhow::Res
     Ok(())
 }
 
+// These off-unix stubs mirror the signatures of their genuinely fallible unix
+// counterparts, so the Result is not redundant — suppress rather than diverge.
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn validate_key_permissions(_path: &Path, _metadata: &fs::Metadata) -> anyhow::Result<()> {
     Ok(())
 }
@@ -370,6 +373,7 @@ fn validate_directory_permissions(path: &Path, metadata: &fs::Metadata) -> anyho
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn validate_directory_permissions(_path: &Path, _metadata: &fs::Metadata) -> anyhow::Result<()> {
     Ok(())
 }
@@ -387,6 +391,7 @@ fn set_directory_owner_only(path: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn set_directory_owner_only(_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
@@ -404,6 +409,7 @@ fn set_key_owner_only(path: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn set_key_owner_only(_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }

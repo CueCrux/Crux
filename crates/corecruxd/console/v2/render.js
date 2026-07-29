@@ -3561,6 +3561,25 @@
       if (w.project_id) { edge('work:' + w.id, 'project:' + w.project_id, 'in-project'); }
       if (w.created_by_passport) { edge('work:' + w.id, 'passport:' + w.created_by_passport, 'created-by'); }
       if (w.assignee_passport) { edge('work:' + w.id, 'passport:' + w.assignee_passport, 'assigned-to'); }
+      // Plan→plan lineage. The graph carried work→project, work→passport and
+      // gate→work but never the edge BETWEEN two plans, so the one relation that
+      // determines what you can start next was the one it could not draw.
+      // Direction points at the prerequisite: A —depends-on→ B means B comes
+      // first. Only the declared direction is emitted; the daemon already
+      // derived the reciprocal, so drawing both would double every line.
+      // `blocked_by` is the OPEN subset of depends_on and appears only on a
+      // ranked response. It supersedes rather than supplements: on a ranked
+      // fetch every resolvable dependency IS open, so emitting both kinds drew
+      // two overlapping wires per pair. One edge per pair, the more informative
+      // kind winning.
+      var blocking = {};
+      (w.blocked_by || []).forEach(function (dep) { blocking[dep] = true; });
+      (w.blocked_by || []).forEach(function (dep) {
+        edge('work:' + w.id, 'work:execplan:' + dep, 'blocked-by');
+      });
+      (w.depends_on || []).forEach(function (dep) {
+        if (!blocking[dep]) { edge('work:' + w.id, 'work:execplan:' + dep, 'depends-on'); }
+      });
     });
 
     var gates = (data.gates && data.gates.pending) || [];

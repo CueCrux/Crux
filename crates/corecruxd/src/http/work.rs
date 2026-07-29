@@ -8,7 +8,8 @@
 #![allow(clippy::option_option)] // PATCH tri-state semantics
 
 use super::{
-    problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Path, Query, State, StatusCode,
+    problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Path, Query, Response, State,
+    StatusCode,
 };
 
 /// Where `/v1/work` reads from.
@@ -47,6 +48,23 @@ pub(super) struct ListWorkQuery {
     /// merged behaviour.
     #[serde(default)]
     pub orchestrator: Option<String>,
+    /// Ready-order projection. When true the response is narrowed to open work
+    /// (`planned` / `in_progress` / `blocked` / `drafting`) and sorted into a
+    /// recommended order by [`crate::work_execplans::rank_open`]. Additive:
+    /// omitting it preserves the historical unranked, unfiltered response
+    /// exactly, so existing clients are unaffected.
+    #[serde(default, deserialize_with = "deserialize_flexible_bool")]
+    pub ranked: bool,
+    /// Cap the number of returned work items. Applied after ranking, so
+    /// `?ranked=1&limit=20` yields the top twenty. Approvals are not truncated.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// `slim` emits five fields per item (id, state, current_milestone,
+    /// milestones_done, milestones_total) plus `blocked_by` when non-empty.
+    /// The full board is ~192k tokens; slim + ranked + limit=20 is under 1k,
+    /// which is what makes this readable on every agent boot.
+    #[serde(default)]
+    pub fields: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -134,6 +152,25 @@ pub(super) use super::approval_receipts::{
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct GateListQuery {
     pub by_passport: Option<String>,
+}
+
+/// Query-string booleans, permissively. Bare `serde` accepts only `true`/`false`,
+/// so `?ranked=1` — the form every caller reaches for, and the one the docs and
+/// agent instructions use — 400s. Accept the usual truthy/falsey spellings, and
+/// treat a valueless `?ranked` as true.
+fn deserialize_flexible_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let raw = String::deserialize(deserializer)?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(serde::de::Error::custom(format!(
+            "expected a boolean (1/true/yes/on or 0/false/no/off), got '{other}'"
+        ))),
+    }
 }
 
 fn deserialize_some_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
@@ -235,6 +272,12 @@ pub(super) async fn get_work(
         }
     }
 
+    // Orchestration is the parent, so make the relationship TOTAL: anything no
+    // orchestrator claims belongs to the default one. This runs BEFORE the
+    // filter, so `?orchestrator=orchestrator:unassigned` is a real query — "what
+    // is nobody looking after" — rather than a hole in the data.
+    crate::work_execplans::apply_default_orchestrator(&mut items, &crate::work_execplans::default_orchestrator_id());
+
     // Apply the orchestrator filter so it intersects both kanban + execplan sources.
     if let Some(orc_id) = q.orchestrator.as_deref() {
         items.retain(|w| w.orchestrator_id.as_deref() == Some(orc_id));
@@ -261,20 +304,84 @@ pub(super) async fn get_work(
     }
     let approval_count = approval_entries.len();
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "count": items.len() + approval_count,
-            "source": match q.source {
-                WorkSource::Kanban => "kanban",
-                WorkSource::Execplans => "execplans",
-                WorkSource::All => "all",
-            },
-            "work": items,
-            "approvals": approval_entries,
-        })),
-    )
-        .into_response()
+    // Ready-order projection. Narrow to open work, sort by `rank_open`, stamp
+    // `blocked_by`. Everything below this point is skipped when `ranked` is
+    // absent, which is what keeps the default response byte-identical.
+    let mut cycles: Vec<String> = Vec::new();
+    let mut inverted: Vec<String> = Vec::new();
+    if q.ranked {
+        let ranked = crate::work_execplans::rank_open(&items);
+        cycles = ranked.cycles;
+        inverted = ranked.inverted_orchestrator_edges;
+        let mut reordered = Vec::with_capacity(ranked.order.len());
+        for (rank_pos, &idx) in ranked.order.iter().enumerate() {
+            let mut item = items[idx].clone();
+            item.blocked_by.clone_from(&ranked.blocked_by[rank_pos]);
+            reordered.push(item);
+        }
+        items = reordered;
+    }
+
+    if let Some(limit) = q.limit {
+        items.truncate(limit);
+    }
+
+    let slim = q.fields.as_deref() == Some("slim");
+    let work_json: serde_json::Value = if slim {
+        serde_json::Value::Array(
+            items
+                .iter()
+                .map(|w| {
+                    let mut o = serde_json::Map::new();
+                    o.insert("id".into(), serde_json::json!(w.id));
+                    o.insert("state".into(), serde_json::json!(w.state));
+                    if let Some(m) = &w.current_milestone {
+                        o.insert("current_milestone".into(), serde_json::json!(m));
+                    }
+                    if let Some(d) = w.milestones_done {
+                        o.insert("milestones_done".into(), serde_json::json!(d));
+                    }
+                    if let Some(t) = w.milestones_total {
+                        o.insert("milestones_total".into(), serde_json::json!(t));
+                    }
+                    if !w.blocked_by.is_empty() {
+                        o.insert("blocked_by".into(), serde_json::json!(w.blocked_by));
+                    }
+                    serde_json::Value::Object(o)
+                })
+                .collect(),
+        )
+    } else {
+        serde_json::json!(items)
+    };
+
+    let mut body = serde_json::json!({
+        "count": items.len() + approval_count,
+        "source": match q.source {
+            WorkSource::Kanban => "kanban",
+            WorkSource::Execplans => "execplans",
+            WorkSource::All => "all",
+        },
+        "work": work_json,
+        "approvals": approval_entries,
+    });
+    if q.ranked {
+        body["ranked"] = serde_json::json!(true);
+        // A dependency cycle makes "foundations first" undefined for the plans
+        // involved. Surface it rather than resolving it silently — the drift
+        // check turns this into an operator-visible finding.
+        if !cycles.is_empty() {
+            body["dependency_cycles"] = serde_json::json!(cycles);
+        }
+        // Actionable half of a cycle report: an orchestrator is a parent, so an
+        // orchestrator depending outward names the exact `Depends on` line to
+        // flip. "There is a cycle" is a problem; this is a fix.
+        if !inverted.is_empty() {
+            body["inverted_orchestrator_edges"] = serde_json::json!(inverted);
+        }
+    }
+
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 /// Build the ExecPlan slice of the response. Applies the same state /
@@ -728,4 +835,134 @@ pub(super) async fn get_status_feed(
         Json(serde_json::json!({ "enabled": true, "events": events })),
     )
         .into_response()
+}
+
+/// `POST /v1/execplans/refresh` — pull the git-backed projection root to the
+/// remote branch tip, on demand.
+///
+/// The board is a read-time projection over a directory, so "the plan I just
+/// pushed is not on the board" has exactly one cause: the replica has not
+/// fetched yet. This is the operator's and the write tool's answer to that,
+/// without waiting for the periodic task.
+///
+/// Returns `409` when git backing is not configured, so a caller can tell
+/// "not configured" apart from "configured and failed" (which is `200` with an
+/// `error` in the outcome — the replica is intact either way, and the
+/// distinction matters when deciding whether to retry).
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn post_execplans_refresh(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    // Pulling rewrites the projection root, so this is an admin-write action
+    // even though it mutates nothing the daemon owns.
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
+        return problem.into_response();
+    }
+    let Some(cfg) = crate::execplan_git::git_config_from_env() else {
+        return problem_response(
+            StatusCode::CONFLICT,
+            format!(
+                "ExecPlan git backing is not configured — set {} (and {} / {})",
+                crate::execplan_git::GIT_REMOTE_ENV,
+                crate::execplan_git::GIT_BRANCH_ENV,
+                crate::execplan_git::GIT_INTERVAL_ENV
+            ),
+        );
+    };
+    // The CHECKOUT is the repository; the projection root is normally a
+    // subdirectory of it. Refreshing the root instead of the checkout is the
+    // misconfiguration this module warns about, so the route must not make it.
+    let Some(checkout) = crate::execplan_git::checkout_path_from_env() else {
+        return problem_response(
+            StatusCode::CONFLICT,
+            format!(
+                "ExecPlan root is not configured — set CRUX_EXECPLANS_ROOT (and {} when the repo \
+                 root is not the plans directory)",
+                crate::execplan_git::GIT_CHECKOUT_ENV
+            ),
+        );
+    };
+    // `git` is blocking; keep it off the async runtime.
+    let outcome = match tokio::task::spawn_blocking(move || crate::execplan_git::refresh(&cfg, &checkout)).await {
+        Ok(o) => o,
+        Err(e) => {
+            return problem_response(StatusCode::INTERNAL_SERVER_ERROR, format!("refresh task failed: {e}"));
+        }
+    };
+    (StatusCode::OK, Json(serde_json::json!({ "refresh": outcome }))).into_response()
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct WriteExecplanBody {
+    pub slug: String,
+    pub content: String,
+    /// Lost-update guard. Omit to create (fails if the plan exists); supply the
+    /// plan's current `plan_content_hash` to update it.
+    #[serde(default)]
+    pub expected_content_hash: Option<String>,
+    /// Push after committing. Defaults to false — pushing is outward-facing, so
+    /// it is opt-in per call rather than ambient.
+    #[serde(default)]
+    pub push: bool,
+    #[serde(default, alias = "author_passport", alias = "by_passport")]
+    pub author: Option<String>,
+}
+
+/// `POST /v1/execplans` — the one legal write path for a plan.
+///
+/// Validates against the `PLANS.md` skeleton, writes into the git checkout, and
+/// commits **that single file**. Existed because the projection is read-only:
+/// an agent without a checkout had no way to author a plan, which is how three
+/// plans came to exist on the live host in no git repository at all.
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn post_execplan(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<WriteExecplanBody>,
+) -> Response {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
+        return problem.into_response();
+    }
+    let Some(checkout) = crate::execplan_git::checkout_path_from_env() else {
+        return problem_response(
+            StatusCode::CONFLICT,
+            "ExecPlan root is not configured — set CRUX_EXECPLANS_ROOT".to_string(),
+        );
+    };
+    // The plans directory relative to the checkout. When the root IS the
+    // checkout this is empty, which `join` handles as "write at the top level".
+    let subdir = crate::work_execplans::execplans_root_from_env()
+        .and_then(|root| root.strip_prefix(&checkout).ok().map(|p| p.to_path_buf()))
+        .unwrap_or_default();
+
+    let result = tokio::task::spawn_blocking(move || {
+        crate::execplan_git::write_plan(
+            &checkout,
+            &subdir,
+            &body.slug,
+            &body.content,
+            body.expected_content_hash.as_deref(),
+            body.push,
+            body.author.as_deref(),
+        )
+    })
+    .await;
+
+    match result {
+        Ok(Ok(outcome)) => (StatusCode::OK, Json(serde_json::json!({ "execplan": outcome }))).into_response(),
+        Ok(Err(crate::execplan_git::WriteError::Invalid(m))) => problem_response(StatusCode::BAD_REQUEST, m),
+        Ok(Err(crate::execplan_git::WriteError::Conflict { message, current_hash })) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "type": "https://errors.cuecrux.com/conflict",
+                "title": "Conflict",
+                "status": 409,
+                "detail": message,
+                // Hand back the current hash so the caller can re-read, merge and
+                // retry against a known base instead of guessing.
+                "current_content_hash": current_hash,
+            })),
+        )
+            .into_response(),
+        Ok(Err(crate::execplan_git::WriteError::Failed(m))) => problem_response(StatusCode::INTERNAL_SERVER_ERROR, m),
+        Err(e) => problem_response(StatusCode::INTERNAL_SERVER_ERROR, format!("write task failed: {e}")),
+    }
 }

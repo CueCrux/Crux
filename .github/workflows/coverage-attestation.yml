@@ -13,7 +13,7 @@ permissions:
 jobs:
   coverage-attestation:
     name: Coverage attestation
-    runs-on: [self-hosted, ci, Linux]
+    runs-on: [self-hosted, hel1]
     env:
       CARGO_HOME: /home/gha-runner/.cargo-${{ github.job }}-${{ github.run_id }}
       # Keep in lock-step with ci.yml's COVERAGE_IGNORE_REGEX (see the rationale

@@ -23,6 +23,10 @@ proto/gen/
 # Environment
 .env
 .env.local
+
+# MCP client config. Clients write the daemon's agent bearer token into this
+# file at the repo root, so it must never be committable.
+.mcp.json
 sdks/typescript/node_modules/
 sdks/typescript/dist/
 sdks/python/dist/
