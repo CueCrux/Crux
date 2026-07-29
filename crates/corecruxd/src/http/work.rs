@@ -8,7 +8,8 @@
 #![allow(clippy::option_option)] // PATCH tri-state semantics
 
 use super::{
-    problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Path, Query, State, StatusCode,
+    problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Path, Query, Response, State,
+    StatusCode,
 };
 
 /// Where `/v1/work` reads from.
@@ -820,4 +821,57 @@ pub(super) async fn get_status_feed(
         Json(serde_json::json!({ "enabled": true, "events": events })),
     )
         .into_response()
+}
+
+/// `POST /v1/execplans/refresh` — pull the git-backed projection root to the
+/// remote branch tip, on demand.
+///
+/// The board is a read-time projection over a directory, so "the plan I just
+/// pushed is not on the board" has exactly one cause: the replica has not
+/// fetched yet. This is the operator's and the write tool's answer to that,
+/// without waiting for the periodic task.
+///
+/// Returns `409` when git backing is not configured, so a caller can tell
+/// "not configured" apart from "configured and failed" (which is `200` with an
+/// `error` in the outcome — the replica is intact either way, and the
+/// distinction matters when deciding whether to retry).
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn post_execplans_refresh(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    // Pulling rewrites the projection root, so this is an admin-write action
+    // even though it mutates nothing the daemon owns.
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
+        return problem.into_response();
+    }
+    let Some(cfg) = crate::execplan_git::git_config_from_env() else {
+        return problem_response(
+            StatusCode::CONFLICT,
+            format!(
+                "ExecPlan git backing is not configured — set {} (and {} / {})",
+                crate::execplan_git::GIT_REMOTE_ENV,
+                crate::execplan_git::GIT_BRANCH_ENV,
+                crate::execplan_git::GIT_INTERVAL_ENV
+            ),
+        );
+    };
+    // The CHECKOUT is the repository; the projection root is normally a
+    // subdirectory of it. Refreshing the root instead of the checkout is the
+    // misconfiguration this module warns about, so the route must not make it.
+    let Some(checkout) = crate::execplan_git::checkout_path_from_env() else {
+        return problem_response(
+            StatusCode::CONFLICT,
+            format!(
+                "ExecPlan root is not configured — set CRUX_EXECPLANS_ROOT (and {} when the repo \
+                 root is not the plans directory)",
+                crate::execplan_git::GIT_CHECKOUT_ENV
+            ),
+        );
+    };
+    // `git` is blocking; keep it off the async runtime.
+    let outcome = match tokio::task::spawn_blocking(move || crate::execplan_git::refresh(&cfg, &checkout)).await {
+        Ok(o) => o,
+        Err(e) => {
+            return problem_response(StatusCode::INTERNAL_SERVER_ERROR, format!("refresh task failed: {e}"));
+        }
+    };
+    (StatusCode::OK, Json(serde_json::json!({ "refresh": outcome }))).into_response()
 }
