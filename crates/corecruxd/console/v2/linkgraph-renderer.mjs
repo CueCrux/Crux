@@ -1,6 +1,6 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 //
 // Custom WebGL link-graph renderer — GPU points + LineSegments on the already-
 // vendored three.js r165 (ExecPlan wikicrux-link-graph-explorer-2026-07-23, M4;

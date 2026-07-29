@@ -10,7 +10,7 @@ name = "crux-shell-lifecycle"
 version = "0.5.34"
 edition = "2021"
 rust-version = "1.88.0"
-license = "LicenseRef-CCL-1.0"
+license = "Apache-2.0"
 publish = false
 description = "std-only supervisor for the corecruxd sidecar behind the Crux desktop shell."
 

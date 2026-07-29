@@ -119,7 +119,7 @@ To understand what makes this tamper-evident, read these symbols in order:
 
 ## Boundaries
 
-**Always:** anchor doc references by symbol name; keep the CCL licence header on every `.rs`
+**Always:** anchor doc references by symbol name; keep the Apache-2.0 licence header on every `.rs`
 file (`grep -rL "Licensed under" crates/**/*.rs` must return nothing); test and lint before
 committing.
 
@@ -1180,7 +1180,7 @@ The Crux daemon is expected to satisfy the CueCrux Trust Contract:
 - every call produces a receipt with the token-selected receipt class
 - community mods cannot bypass token policy
 
-This file is the canonical Trust Contract text. Release bundles include it next to `LICENCE.md` so operators inherit the same posture every Crux daemon claims to satisfy.
+This file is the canonical Trust Contract text. Release bundles include it next to `LICENSE` so operators inherit the same posture every Crux daemon claims to satisfy.
 
 ## Repository scope
 
@@ -1264,7 +1264,7 @@ The name "CROWN" stands for **C**ryptographic **R**eceipt for **O**peration **W*
 
 ## Context
 
-CoreCrux has dataplane-enabled distributions with GPU-accelerated operations (append, read, replay) via CUDA. The Crux Daemon is source-available under CCL v1.0 and must be fully functional without GPU hardware or CUDA dependencies.
+CoreCrux has dataplane-enabled distributions with GPU-accelerated operations (append, read, replay) via CUDA. The Crux Daemon is open source under Apache-2.0 and must be fully functional without GPU hardware or CUDA dependencies.
 
 ## Decision
 
@@ -3403,7 +3403,7 @@ passports, portable `.cruxpack` export. No account. No API keys. Nothing leaves 
 [![CI](https://github.com/CueCrux/Crux/actions/workflows/ci.yml/badge.svg)](https://github.com/CueCrux/Crux/actions/workflows/ci.yml)
 [![Coverage](https://img.shields.io/badge/coverage-CI%20gated-green)](https://github.com/CueCrux/Crux/actions/workflows/coverage-attestation.yml)
 [![MCP](https://img.shields.io/badge/MCP-native-blue)](#100-mcp-tools-memory-first)
-[![Licence: CCL-1.0 (source-available)](https://img.shields.io/badge/licence-CCL--1.0_(source--available)-blue)](LICENCE.md)
+[![Licence: Apache-2.0](https://img.shields.io/badge/licence-Apache--2.0-blue)](LICENSE)
 
 <img src="docs/Images/readme/console-overwatch.png" alt="Crux console Overwatch view: a gate queue of decisions that need you, a live fleet of agent sessions, and a rolling receipted activity ticker" width="88%">
 
@@ -3928,17 +3928,18 @@ Built in the open, verified in the open. If Crux is useful to you, a star helps 
 
 ## Licence
 
-Crux Daemon is source-available under the
-[CueCrux Community Licence (CCL v1.0)](LICENCE.md).
+Crux Daemon is open source under the
+[Apache License, Version 2.0](LICENSE).
 
-- Internal commercial use is permitted.
-- Reading, auditing, and internal modification are permitted.
-- Offering Crux as a managed, hosted, or cloud service to third parties is prohibited.
-- **Three years after each versioned release, the code converts to Apache 2.0.**
+- Commercial use, modification, distribution, and private use are permitted.
+- Running Crux as a managed, hosted, or cloud service is permitted.
+- Apache-2.0 includes an express patent grant (section 3).
+- Redistribution must retain the copyright, licence, and `NOTICE` attribution
+  (sections 4(a)–4(d)); it grants no trademark rights (section 6).
 - Curated content is covered separately by [`content/LICENCE-CONTENT.md`](content/LICENCE-CONTENT.md).
 - Plain-English answers: [`docs/LICENCE-FAQ.md`](docs/LICENCE-FAQ.md).
 
-Copyright (c) 2026 CueCrux Ltd. All rights reserved.
+Copyright (c) 2026 CueCrux Ltd.
 
 # ============================================================
 # BEGIN CHANGELOG.md
@@ -3959,6 +3960,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Relicensed to Apache-2.0 — Crux Daemon is now open source.** The CueCrux
+  Community Licence (CCL v1.0), a source-available BSL-style licence, is
+  replaced by the **Apache License, Version 2.0** across the repository. The CCL
+  already named Apache 2.0 as its Change Licence, so this brings that conversion
+  forward for every version instead of waiting out the per-release three-year
+  clock. Redistribution in competing products and offering Crux as a hosted
+  service to third parties — the two rights the CCL withheld — are now granted,
+  along with Apache-2.0's express patent grant (section 3).
+  - `LICENCE.md` → `LICENSE`, containing the unmodified upstream Apache-2.0
+    text, so GitHub and SBOM scanners detect `Apache-2.0` instead of reporting
+    an unrecognised custom licence.
+  - New `NOTICE` file carrying the attribution required by section 4(d), plus
+    the trademark and `content/` scope notes that must not be edited into the
+    verbatim licence text.
+  - Per-file headers on all 539 crate `.rs` files (and every script, workflow,
+    proto, SDK source, and console asset) now read
+    `SPDX-License-Identifier: Apache-2.0`. The contradictory
+    "All rights reserved." line is dropped.
+  - `license = "Apache-2.0"` in `[workspace.package]` and in the desktop shell,
+    Python/TypeScript SDK, deb, Homebrew, and MCPB manifests;
+    `LicenseRef-CCL-1.0` removed from the `cargo-deny` allowlist.
+  - `scripts/check-licence-headers.sh` now enforces the Apache-2.0 header and
+    SPDX line. Contribution terms in `CONTRIBUTING.md` are inbound=outbound
+    under section 5 — no CLA. `docs/LICENCE-FAQ.md` rewritten;
+    `docs/design/licence-recommendation.md` (the BUSL 1.1 proposal) marked
+    superseded.
+  - Curated content under `content/` keeps its separate licence
+    (`content/LICENCE-CONTENT.md`) and is unaffected; that directory currently
+    ships a placeholder manifest with no covered assets.
 - **Licence file layout deduplicated to a single GitHub licence tab.**
   `LICENCE-CODE.md` (a three-line stub pointing at `LICENCE.md`) is removed, and
   the content licence moved from the root to `content/LICENCE-CONTENT.md` — the
@@ -3970,8 +4000,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`CITATION.cff`.** Machine-readable citation metadata (GitHub "Cite this
-  repository" button), matching the CCL v1.0 academic-use attribution
-  condition.
+  repository" button). Under Apache-2.0 citation is appreciated but not a
+  licence condition.
 
 ### Fixed
 

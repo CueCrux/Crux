@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-CCL-1.0
-# Licensed under the CueCrux Community Licence (CCL v1.0).
-# See LICENCE.md in the repository root.
+# Copyright (c) 2026 CueCrux Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Licensed under the Apache License, Version 2.0.
+# See LICENSE in the repository root.
 """Crux statusline for Claude Code (M3 of crux-banner-redesign-2026-07-21).
 
 Hot path: read a 60s-TTL cache, render one ANSI line (<50ms, no network); if the

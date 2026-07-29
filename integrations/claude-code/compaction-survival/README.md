@@ -84,7 +84,7 @@ check that the hooks behave. Exits non-zero if any step regresses.
 
 ## Licence
 
-Part of the Crux repo — CueCrux Community Licence (CCL v1.0), source-available.
+Part of the Crux repo — Apache License, Version 2.0.
 The same capability is also available as a standalone **MIT** proof-of-loss
 mini-repo (the shareable demo) and, packaged with a one-command dual-agent
 installer, as the **$9 Compaction Survival Kit** (see `../kit/`). The capability

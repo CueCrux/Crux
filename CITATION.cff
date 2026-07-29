@@ -1,8 +1,7 @@
 cff-version: 1.2.0
 message: >-
   If you use Crux Daemon in academic research or a publication, please cite it
-  as below. Attribution is a condition of the CCL v1.0 academic-use grant
-  (LICENCE.md, Permitted Uses §5).
+  as below.
 title: "Crux Daemon"
 type: software
 authors:
@@ -10,7 +9,8 @@ authors:
     website: "https://memorycrux.com/crux"
 repository-code: "https://github.com/CueCrux/Crux"
 url: "https://memorycrux.com/crux"
-license-url: "https://github.com/CueCrux/Crux/blob/main/LICENCE.md"
+license: Apache-2.0
+license-url: "https://github.com/CueCrux/Crux/blob/main/LICENSE"
 keywords:
   - agent-memory
   - retrieval

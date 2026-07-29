@@ -39,9 +39,9 @@ bash event-report.sh     # readable report of what it has captured
 ## The capability is free
 
 **To be completely clear: the compaction-survival capability is free and
-source-available** in the Crux repo at
-`integrations/claude-code/compaction-survival/` under the CueCrux Community
-Licence (CCL), and separately MIT-licensed in the standalone `proof-of-loss-hook`
+open source** in the Crux repo at
+`integrations/claude-code/compaction-survival/` under the Apache License,
+Version 2.0, and separately MIT-licensed in the standalone `proof-of-loss-hook`
 mini-repo. You can wire it up yourself for nothing. This kit sells the
 *packaging* — the one-command dual-agent installer, the tested Codex config, the
 event report, and support — not the trick. See [`COMPARISON.md`](COMPARISON.md)

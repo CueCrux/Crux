@@ -7,7 +7,7 @@
   "long_description": "Connects Claude Desktop to a Crux Daemon: durable facts, token-budgeted retrieval, sessions, cross-agent handoffs, and receipted mutations. The daemon runs on your machine or your tailnet; nothing is sent anywhere else.",
   "author": { "name": "CueCrux" },
   "homepage": "https://cuecrux.com",
-  "license": "LicenseRef-CCL-1.0",
+  "license": "Apache-2.0",
   "keywords": ["memory", "retrieval", "receipts", "local-first", "agents"],
   "server": {
     "type": "node",

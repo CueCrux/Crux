@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Contract-drift gate for the daemon HTTP surface (unified-shell-console M2).
 //!
@@ -562,9 +562,9 @@ fn url_template(path: &str) -> String {
 fn generate_api_js() -> String {
     let paths = get_paths();
     let mut s = String::new();
-    s.push_str("// Copyright (c) 2026 CueCrux Ltd. All rights reserved.\n");
-    s.push_str("// Licensed under the CueCrux Community Licence (CCL v1.0).\n");
-    s.push_str("// See LICENCE.md in the repository root.\n");
+    s.push_str("// Copyright (c) 2026 CueCrux Ltd.\n");
+    s.push_str("// Licensed under the Apache License, Version 2.0.\n");
+    s.push_str("// See LICENSE in the repository root.\n");
     s.push_str("//\n");
     s.push_str("// @generated — DO NOT EDIT BY HAND.\n");
     s.push_str("// Source of truth: the ROUTES manifest in crates/corecruxd/src/http/openapi.rs.\n");

@@ -13,6 +13,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Relicensed to Apache-2.0 — Crux Daemon is now open source.** The CueCrux
+  Community Licence (CCL v1.0), a source-available BSL-style licence, is
+  replaced by the **Apache License, Version 2.0** across the repository. The CCL
+  already named Apache 2.0 as its Change Licence, so this brings that conversion
+  forward for every version instead of waiting out the per-release three-year
+  clock. Redistribution in competing products and offering Crux as a hosted
+  service to third parties — the two rights the CCL withheld — are now granted,
+  along with Apache-2.0's express patent grant (section 3).
+  - `LICENCE.md` → `LICENSE`, containing the unmodified upstream Apache-2.0
+    text, so GitHub and SBOM scanners detect `Apache-2.0` instead of reporting
+    an unrecognised custom licence.
+  - New `NOTICE` file carrying the attribution required by section 4(d), plus
+    the trademark and `content/` scope notes that must not be edited into the
+    verbatim licence text.
+  - Per-file headers on all 539 crate `.rs` files (and every script, workflow,
+    proto, SDK source, and console asset) now read
+    `SPDX-License-Identifier: Apache-2.0`. The contradictory
+    "All rights reserved." line is dropped.
+  - `license = "Apache-2.0"` in `[workspace.package]` and in the desktop shell,
+    Python/TypeScript SDK, deb, Homebrew, and MCPB manifests;
+    `LicenseRef-CCL-1.0` removed from the `cargo-deny` allowlist.
+  - `scripts/check-licence-headers.sh` now enforces the Apache-2.0 header and
+    SPDX line. Contribution terms in `CONTRIBUTING.md` are inbound=outbound
+    under section 5 — no CLA. `docs/LICENCE-FAQ.md` rewritten;
+    `docs/design/licence-recommendation.md` (the BUSL 1.1 proposal) marked
+    superseded.
+  - Curated content under `content/` keeps its separate licence
+    (`content/LICENCE-CONTENT.md`) and is unaffected; that directory currently
+    ships a placeholder manifest with no covered assets.
 - **Licence file layout deduplicated to a single GitHub licence tab.**
   `LICENCE-CODE.md` (a three-line stub pointing at `LICENCE.md`) is removed, and
   the content licence moved from the root to `content/LICENCE-CONTENT.md` — the
@@ -24,8 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`CITATION.cff`.** Machine-readable citation metadata (GitHub "Cite this
-  repository" button), matching the CCL v1.0 academic-use attribution
-  condition.
+  repository" button). Under Apache-2.0 citation is appreciated but not a
+  licence condition.
 
 ### Fixed
 

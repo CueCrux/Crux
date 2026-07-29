@@ -29,7 +29,6 @@ allow = [
     "CC0-1.0",
     "Unlicense",
     "CDLA-Permissive-2.0",
-    "LicenseRef-CCL-1.0",
     "bzip2-1.0.6",
 ]
 

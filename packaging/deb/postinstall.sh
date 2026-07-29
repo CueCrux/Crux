@@ -1,6 +1,6 @@
 #!/bin/sh
-# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-# Licensed under the CueCrux Community Licence (CCL v1.0).
+# Copyright (c) 2026 CueCrux Ltd.
+# Licensed under the Apache License, Version 2.0.
 # .deb postinstall: reload unit files; never enable or start the service —
 # starting the daemon is the operator's explicit action.
 set -e

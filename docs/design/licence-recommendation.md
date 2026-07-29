@@ -1,6 +1,13 @@
 # Licence Recommendation — switch CCL v1.0 → BUSL 1.1
 
-**Status:** Research / recommendation. **No licence change has been made.**
+> **SUPERSEDED (2026-07-29).** This recommendation was not adopted. The
+> repository relicensed from CCL v1.0 directly to **Apache License, Version
+> 2.0** — the CCL's own Change Licence — rather than to BUSL 1.1. The document
+> is retained as the record of the options considered. For the licence in force
+> see [`LICENSE`](../../LICENSE) and [`docs/LICENCE-FAQ.md`](../LICENCE-FAQ.md);
+> everything below describes a path not taken.
+
+**Status:** Superseded — research / recommendation, not adopted.
 **Author:** Wave-1 audit follow-up (C-as-research).
 **Date:** 2026-05-24.
 

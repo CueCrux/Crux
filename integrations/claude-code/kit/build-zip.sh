@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-# Licensed under the CueCrux Community Licence (CCL v1.0).
+# Copyright (c) 2026 CueCrux Ltd.
+# Licensed under the Apache License, Version 2.0.
 #
 # build-zip.sh — assemble the deliverable Compaction Survival Kit archive.
 # Bundles the kit files with a copy of the free preset's hook scripts + fixture,

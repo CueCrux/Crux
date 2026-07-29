@@ -229,4 +229,4 @@ configured hosted node — an explicit continuity write, not a reflexive one.
 
 ## Licence
 
-CueCrux Community Licence (CCL v1.0). See `/home/myles/CueCrux/Crux/LICENCE.md`.
+Apache License, Version 2.0. See `LICENSE` in the repository root.

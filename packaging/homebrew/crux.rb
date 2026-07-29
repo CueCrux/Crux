@@ -1,5 +1,5 @@
-# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-# Licensed under the CueCrux Community Licence (CCL v1.0).
+# Copyright (c) 2026 CueCrux Ltd.
+# Licensed under the Apache License, Version 2.0.
 #
 # Homebrew formula TEMPLATE for the cuecrux/tap tap (repo: CueCrux/homebrew-tap,
 # creation is an operator action — see ExecPlan decision log).
@@ -13,7 +13,7 @@ class Crux < Formula
   desc "Local-first agent memory, retrieval, and signed-receipts daemon"
   homepage "https://github.com/CueCrux/Crux"
   version "{{VERSION}}"
-  license "CCL-1.0" # CueCrux Community Licence — source-available
+  license "Apache-2.0"
 
   on_macos do
     on_arm do

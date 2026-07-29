@@ -5,7 +5,8 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 required=(
-  "LICENCE.md"
+  "LICENSE"
+  "NOTICE"
   "content/LICENCE-CONTENT.md"
   "TRUST-CONTRACT.md"
   "README.md"
@@ -58,7 +59,8 @@ for needle in \
   "crux-" \
   "corecruxctl-" \
   "crux-hook-" \
-  "LICENCE.md" \
+  "LICENSE" \
+  "NOTICE" \
   "content/LICENCE-CONTENT.md" \
   "TRUST-CONTRACT.md" \
   "config.example.env" \
@@ -142,7 +144,8 @@ if [[ -x "$root/target/release/corecruxd" \
     "corecruxctl-linux-amd64" \
     "crux-hook-linux-amd64" \
     "install.sh" \
-    "LICENCE.md" \
+    "LICENSE" \
+    "NOTICE" \
     "content/LICENCE-CONTENT.md" \
     "TRUST-CONTRACT.md" \
     "config.example.env" \

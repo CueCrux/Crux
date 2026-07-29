@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Embedded console HTML asset server — small static-file router for the in-process console.
 
@@ -664,10 +664,10 @@ mod tests {
 
     #[test]
     fn console_v2_shell_has_licence_header_and_no_external_runtime_deps() {
-        // CCL licence header carried in the leading HTML comment.
+        // Apache-2.0 licence header carried in the leading HTML comment.
         assert!(
-            CONSOLE_V2_HTML.contains("CueCrux Community Licence (CCL v1.0)"),
-            "v2 shell must carry the CCL licence header"
+            CONSOLE_V2_HTML.contains("Licensed under the Apache License, Version 2.0."),
+            "v2 shell must carry the Apache-2.0 licence header"
         );
         // Same no-external-runtime-deps posture as the console shell.
         for blocked in [
@@ -722,15 +722,15 @@ mod tests {
 
     #[test]
     fn console_v2_modules_carry_licence_and_no_external_runtime_deps() {
-        // Every v2 file keeps the CCL header + the no-external-runtime-deps posture.
+        // Every v2 file keeps the Apache-2.0 header + the no-external-runtime-deps posture.
         for (name, body) in [
             ("pages.js", CONSOLE_V2_PAGES_JS),
             ("render.js", CONSOLE_V2_RENDER_JS),
             ("api.js", CONSOLE_V2_API_JS),
         ] {
             assert!(
-                body.contains("CueCrux Community Licence (CCL v1.0)"),
-                "{name} must carry the CCL licence header"
+                body.contains("Licensed under the Apache License, Version 2.0."),
+                "{name} must carry the Apache-2.0 licence header"
             );
             // Block remote loaders + CDN hosts. Bare http(s) literals are NOT
             // blocked — the embedding-endpoint placeholder (`http://localhost:…`)
@@ -804,11 +804,11 @@ mod tests {
     #[test]
     fn console_v2_linkgraph_renderer_module_is_self_contained() {
         // ExecPlan wikicrux-link-graph-explorer M4: the renderer is a client-only
-        // ESM module (custom three.js r165). CCL header + public API + the vendored
+        // ESM module (custom three.js r165). Apache-2.0 header + public API + the vendored
         // three specifier + zero external runtime deps (T.5).
         assert!(
-            CONSOLE_V2_LINKGRAPH_MJS.contains("CueCrux Community Licence (CCL v1.0)"),
-            "linkgraph-renderer.mjs must carry the CCL licence header"
+            CONSOLE_V2_LINKGRAPH_MJS.contains("Licensed under the Apache License, Version 2.0."),
+            "linkgraph-renderer.mjs must carry the Apache-2.0 licence header"
         );
         assert!(
             CONSOLE_V2_LINKGRAPH_MJS.contains("import * as THREE from 'three'"),
@@ -902,13 +902,13 @@ mod tests {
 
     #[test]
     fn console_v2_pwa_assets_carry_licence_and_markers() {
-        // sw.js + icon.svg can carry the CCL header as a comment; assert it plus
+        // sw.js + icon.svg can carry the Apache-2.0 header as a comment; assert it plus
         // their structural markers. (manifest.webmanifest is pure JSON — no
         // comments — so its header is intentionally absent; markers checked below.)
         for (name, body) in [("sw.js", CONSOLE_V2_SW_JS), ("icon.svg", CONSOLE_V2_ICON_SVG)] {
             assert!(
-                body.contains("CueCrux Community Licence (CCL v1.0)"),
-                "{name} must carry the CCL licence header"
+                body.contains("Licensed under the Apache License, Version 2.0."),
+                "{name} must carry the Apache-2.0 licence header"
             );
         }
         for required in [
