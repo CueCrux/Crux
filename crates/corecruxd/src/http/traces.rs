@@ -55,7 +55,14 @@ pub(super) async fn get_trace(
             ),
         );
     };
-    match store.load_trace(trace_id) {
+    // Scoped to this daemon's own capture tenant. This surface has no tenant
+    // binding of its own (it authorises with `require_http_scopes`, not the
+    // per-tenant variant), so there is no requester tenant to honour. Pinning it
+    // to the capture tenant preserves single-tenant behaviour exactly and fails
+    // closed if this daemon ever holds more than one tenant's spans — it will
+    // simply not see them. Giving this surface real tenant binding is a
+    // prerequisite for hosting it (crux-code-intel-pro-hosted-surface M3).
+    match store.load_trace(trace_id, &crate::trace_store::TraceStore::capture_tenant()) {
         Ok(spans) if spans.is_empty() => problem_response(StatusCode::NOT_FOUND, "no such trace"),
         Ok(spans) => {
             let resolved = spans.iter().filter(|s| s.symbol_id.is_some()).count();
@@ -101,7 +108,14 @@ pub(super) async fn list_traces(
         )
             .into_response();
     };
-    match store.list_traces(query.limit.unwrap_or(100)) {
+    // Scoped to this daemon's own capture tenant. This surface has no tenant
+    // binding of its own (it authorises with `require_http_scopes`, not the
+    // per-tenant variant), so there is no requester tenant to honour. Pinning it
+    // to the capture tenant preserves single-tenant behaviour exactly and fails
+    // closed if this daemon ever holds more than one tenant's spans — it will
+    // simply not see them. Giving this surface real tenant binding is a
+    // prerequisite for hosting it (crux-code-intel-pro-hosted-surface M3).
+    match store.list_traces(query.limit.unwrap_or(100), &crate::trace_store::TraceStore::capture_tenant()) {
         Ok(traces) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -243,13 +257,25 @@ pub(super) struct CodeIntelQuery {
 /// `pub(super)` so `dossier::post_auto` can feed the same window the code-intel
 /// routes answer from — a dossier whose runtime tier disagreed with
 /// `/v1/code-intel/dead-code` would be worse than one with no runtime tier.
-pub(super) fn load_spans(state: &AppState) -> Vec<crate::trace_store::StoredSpan> {
+///
+/// **Tenant-scoped (M2 finding, `crux-code-intel-pro-hosted-surface` M3).**
+/// Every caller must name the tenant it is answering for. There is no unscoped
+/// variant: the defect M2 found was an authorization check with no matching data
+/// filter, and the fix is only durable if the unfiltered read cannot be reached.
+///
+/// The in-memory ring is process-wide and holds this daemon's own execution, so
+/// its spans belong to the capture tenant and are withheld from every other —
+/// the same rule the store applies to legacy unlabelled records.
+pub(super) fn load_spans(state: &AppState, tenant_id: &str) -> Vec<crate::trace_store::StoredSpan> {
     if let Some(store) = open_store(state) {
-        if let Ok(spans) = store.load_all() {
+        if let Ok(spans) = store.load_for_tenant(tenant_id) {
             if !spans.is_empty() {
                 return spans;
             }
         }
+    }
+    if tenant_id != crate::trace_store::TraceStore::capture_tenant() {
+        return Vec::new();
     }
     crate::trace_span_ring().map_or_else(Vec::new, |ring| {
         ring.snapshot()
@@ -259,6 +285,7 @@ pub(super) fn load_spans(state: &AppState) -> Vec<crate::trace_store::StoredSpan
                 symbol_id: None,
                 join: "unresolved_live".to_string(),
                 stored_at_unix_ms: 0,
+                tenant_id: tenant_id.to_string(),
             })
             .collect()
     })
@@ -284,7 +311,7 @@ pub(super) async fn get_code_path(
     let Some(entry) = q.entry_point.as_deref() else {
         return problem_response(StatusCode::BAD_REQUEST, "entry_point is required");
     };
-    let spans = load_spans(&state);
+    let spans = load_spans(&state, &q.tenant_id);
     let path = crate::code_intel::code_path(&spans, entry, q.token_budget);
     (StatusCode::OK, Json(path)).into_response()
 }
@@ -306,7 +333,7 @@ pub(super) async fn get_blast_radius(
     let Some(scan) = load_scan(&state, &q.tenant_id, repo_id).await else {
         return problem_response(StatusCode::NOT_FOUND, "no scan for this repo; register it first");
     };
-    let spans = load_spans(&state);
+    let spans = load_spans(&state, &q.tenant_id);
     let radius = crate::code_intel::blast_radius(&scan, &spans, symbol, q.token_budget);
     (StatusCode::OK, Json(radius)).into_response()
 }
@@ -328,7 +355,7 @@ pub(super) async fn get_liveness(
     let Some(scan) = load_scan(&state, &q.tenant_id, repo_id).await else {
         return problem_response(StatusCode::NOT_FOUND, "no scan for this repo; register it first");
     };
-    let spans = load_spans(&state);
+    let spans = load_spans(&state, &q.tenant_id);
     let l = crate::code_intel::liveness(&scan, &spans, symbol);
     (StatusCode::OK, Json(l)).into_response()
 }
@@ -346,7 +373,7 @@ pub(super) async fn get_trace_diff(
     let (Some(a), Some(b)) = (q.trace_a, q.trace_b) else {
         return problem_response(StatusCode::BAD_REQUEST, "trace_a and trace_b are required");
     };
-    let spans = load_spans(&state);
+    let spans = load_spans(&state, &q.tenant_id);
     let d = crate::code_intel::trace_diff(&spans, a, b, q.token_budget);
     (StatusCode::OK, Json(d)).into_response()
 }
@@ -373,7 +400,7 @@ pub(super) async fn get_dead_code_ladder(
     let Some(scan) = load_scan(&state, &q.tenant_id, repo_id).await else {
         return problem_response(StatusCode::NOT_FOUND, "no scan for this repo; register it first");
     };
-    let spans = load_spans(&state);
+    let spans = load_spans(&state, &q.tenant_id);
     let ladder = crate::code_intel::dead_code_ladder(&scan, &spans, q.symbol.as_deref(), q.token_budget);
     (StatusCode::OK, Json(ladder)).into_response()
 }
@@ -397,7 +424,7 @@ pub(super) async fn get_repo_spatial(
     let Some(scan) = load_scan(&state, &q.tenant_id, &repo_id).await else {
         return problem_response(StatusCode::NOT_FOUND, "no scan for this repo; register it first");
     };
-    let spans = load_spans(&state);
+    let spans = load_spans(&state, &q.tenant_id);
     let map = crate::code_intel::spatial_map(&scan, &spans);
     (StatusCode::OK, Json(map)).into_response()
 }

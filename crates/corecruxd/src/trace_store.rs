@@ -67,6 +67,18 @@ pub struct StoredSpan {
     pub join: String,
     /// Unix millis at flush time.
     pub stored_at_unix_ms: u64,
+    /// Owning tenant, stamped at flush time.
+    ///
+    /// Empty means a **legacy record** written before the store was partitioned.
+    /// It is not a wildcard: [`TraceStore::load_for_tenant`] resolves an empty
+    /// tenant to this daemon's configured capture tenant and nothing else, so a
+    /// legacy span can never answer for a tenant that did not capture it.
+    ///
+    /// `default` rather than required so an existing `spans.jsonl` keeps
+    /// deserialising — dropping a user's captured history to add a field would
+    /// be a worse failure than the one this field fixes.
+    #[serde(default)]
+    pub tenant_id: String,
 }
 
 #[derive(Debug)]
@@ -106,10 +118,16 @@ impl TraceStore {
 
     /// Resolve and append. Returns what happened, so a caller can surface the
     /// join quality rather than assuming it.
+    /// Append a drained batch, stamping each span with `tenant_id`.
+    ///
+    /// The tenant is a parameter rather than read from the environment here so
+    /// that a future multi-tenant flusher can stamp per batch without this
+    /// method changing shape, and so tests can write two tenants into one store.
     pub fn append_resolved(
         &self,
         spans: Vec<SpanRecord>,
         resolver: Option<&SymbolResolver>,
+        tenant_id: &str,
     ) -> std::io::Result<FlushReport> {
         let mut report = FlushReport {
             spans_drained: spans.len(),
@@ -159,6 +177,7 @@ impl TraceStore {
                 symbol_id,
                 join: join.to_string(),
                 stored_at_unix_ms: now,
+                tenant_id: tenant_id.to_string(),
             };
             if let Ok(line) = serde_json::to_string(&stored) {
                 buf.push_str(&line);
@@ -174,7 +193,14 @@ impl TraceStore {
     }
 
     /// Read everything back. This is the restart-survival path.
-    pub fn load_all(&self) -> std::io::Result<Vec<StoredSpan>> {
+    /// Every span in the store, **unfiltered**.
+    ///
+    /// Deliberately private. The public read is [`Self::load_for_tenant`]: a
+    /// caller that can obtain unfiltered spans is one refactor away from
+    /// answering one tenant's question with another's data, which is the defect
+    /// M2 found. Keeping this uncallable from outside the module is what stops
+    /// that regressing, rather than a convention someone has to remember.
+    fn load_all(&self) -> std::io::Result<Vec<StoredSpan>> {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
@@ -188,10 +214,46 @@ impl TraceStore {
             .collect())
     }
 
-    /// All spans of one trace, in capture order.
-    pub fn load_trace(&self, trace_id: u64) -> std::io::Result<Vec<StoredSpan>> {
-        let mut spans: Vec<StoredSpan> = self
+    /// This daemon's configured capture tenant — the tenant every span it writes
+    /// belongs to, and the only tenant a legacy unlabelled span can answer for.
+    pub fn capture_tenant() -> String {
+        std::env::var("CORECRUXD_TRACE_TENANT_ID").unwrap_or_else(|_| "local".to_string())
+    }
+
+    /// Spans belonging to `tenant_id`, and only those.
+    ///
+    /// Fails closed on two axes:
+    ///
+    /// * a span stamped with a different tenant is never returned, and
+    /// * a legacy span (empty `tenant_id`, written before partitioning) is
+    ///   returned **only** to this daemon's own capture tenant. It was captured
+    ///   by this process under that configuration, so attributing it there is
+    ///   accurate; attributing it to whoever happens to ask would recreate the
+    ///   exact defect partitioning exists to close.
+    pub fn load_for_tenant(&self, tenant_id: &str) -> std::io::Result<Vec<StoredSpan>> {
+        let capture = Self::capture_tenant();
+        Ok(self
             .load_all()?
+            .into_iter()
+            .filter(|s| {
+                if s.tenant_id.is_empty() {
+                    tenant_id == capture
+                } else {
+                    s.tenant_id == tenant_id
+                }
+            })
+            .collect())
+    }
+
+    /// All spans of one trace, in capture order.
+    /// One trace, scoped to `tenant_id`.
+    ///
+    /// `trace_id` is a u64 drawn from the same space for every tenant, so an
+    /// unscoped lookup is a trace-id-guessing oracle. Scoping here rather than
+    /// at the handler keeps the guarantee with the data.
+    pub fn load_trace(&self, trace_id: u64, tenant_id: &str) -> std::io::Result<Vec<StoredSpan>> {
+        let mut spans: Vec<StoredSpan> = self
+            .load_for_tenant(tenant_id)?
             .into_iter()
             .filter(|s| s.span.trace_id == trace_id)
             .collect();
@@ -199,10 +261,14 @@ impl TraceStore {
         Ok(spans)
     }
 
-    /// Distinct traces, newest first, with a span count each.
-    pub fn list_traces(&self, limit: usize) -> std::io::Result<Vec<(u64, usize)>> {
+    /// Distinct traces for one tenant, newest first, with a span count each.
+    ///
+    /// Scoped for the same reason as [`Self::load_trace`]: an unscoped listing
+    /// discloses the existence, count and shape of another tenant's activity
+    /// even without returning a single span body.
+    pub fn list_traces(&self, limit: usize, tenant_id: &str) -> std::io::Result<Vec<(u64, usize)>> {
         let mut counts: BTreeMap<u64, usize> = BTreeMap::new();
-        for s in self.load_all()? {
+        for s in self.load_for_tenant(tenant_id)? {
             *counts.entry(s.span.trace_id).or_insert(0) += 1;
         }
         let mut v: Vec<(u64, usize)> = counts.into_iter().collect();
@@ -346,7 +412,7 @@ mod tests {
         let r = resolver_with(vec![sym("a.rs", "handler", 10)]);
 
         let report = store
-            .append_resolved(vec![span("handler", Some("a.rs"), Some(9), 1, 1)], Some(&r))
+            .append_resolved(vec![span("handler", Some("a.rs"), Some(9), 1, 1)], Some(&r), "local")
             .unwrap();
         assert_eq!(report.resolved, 1);
         assert_eq!(report.spans_drained, 1);
@@ -375,6 +441,7 @@ mod tests {
                     span("nofile", None, None, 1, 3),           // no location
                 ],
                 Some(&r),
+                "local",
             )
             .unwrap();
 
@@ -402,7 +469,7 @@ mod tests {
 
         for i in 0..50u64 {
             store
-                .append_resolved(vec![span("h", Some("a.rs"), Some(10), i, i)], Some(&r))
+                .append_resolved(vec![span("h", Some("a.rs"), Some(10), i, i)], Some(&r), "local")
                 .unwrap();
         }
         let all = store.load_all().unwrap();
@@ -419,7 +486,7 @@ mod tests {
         let store = TraceStore::open(path.clone(), 1000).unwrap();
         let r = resolver_with(vec![sym("a.rs", "h", 10)]);
         store
-            .append_resolved(vec![span("h", Some("a.rs"), Some(10), 1, 1)], Some(&r))
+            .append_resolved(vec![span("h", Some("a.rs"), Some(10), 1, 1)], Some(&r), "local")
             .unwrap();
 
         // Simulate a crash mid-append.
@@ -446,10 +513,11 @@ mod tests {
                     span("h", Some("a.rs"), Some(10), 8, 3),
                 ],
                 Some(&r),
+                "local",
             )
             .unwrap();
 
-        let t7 = store.load_trace(7).unwrap();
+        let t7 = store.load_trace(7, "local").unwrap();
         assert_eq!(t7.len(), 2);
         assert_eq!(t7[0].span.depth, 0, "roots first");
         assert_eq!(t7[1].span.depth, 1);
@@ -459,8 +527,114 @@ mod tests {
     fn empty_flush_is_a_no_op() {
         let tmp = tempfile::tempdir().unwrap();
         let store = TraceStore::open(tmp.path().join("t.jsonl"), 1000).unwrap();
-        let report = store.append_resolved(vec![], None).unwrap();
+        let report = store.append_resolved(vec![], None, "local").unwrap();
         assert_eq!(report.spans_drained, 0);
         assert!(!store.path().exists(), "no file created for an empty flush");
+    }
+
+    // ── M3: tenant partitioning of the runtime span plane ───────────────────
+    // The defect M2 found was an authorization check with no matching data
+    // filter. These pin the filter itself, at the level the guarantee lives.
+
+    #[test]
+    fn spans_are_stamped_with_the_tenant_that_captured_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TraceStore::open(dir.path().join("s.jsonl"), 1000).unwrap();
+        store
+            .append_resolved(vec![span("a", Some("f.rs"), Some(1), 1, 1)], None, "tenant-a")
+            .unwrap();
+        let got = store.load_for_tenant("tenant-a").unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].tenant_id, "tenant-a");
+    }
+
+    #[test]
+    fn one_tenants_spans_are_invisible_to_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TraceStore::open(dir.path().join("s.jsonl"), 1000).unwrap();
+        store
+            .append_resolved(vec![span("a", Some("a.rs"), Some(1), 1, 1)], None, "tenant-a")
+            .unwrap();
+        store
+            .append_resolved(vec![span("b", Some("b.rs"), Some(1), 2, 2)], None, "tenant-b")
+            .unwrap();
+
+        let a = store.load_for_tenant("tenant-a").unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].span.name, "a", "tenant-a must not see tenant-b's span");
+
+        let b = store.load_for_tenant("tenant-b").unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].span.name, "b");
+
+        // A tenant with nothing in the store gets nothing, not everything.
+        assert!(store.load_for_tenant("tenant-c").unwrap().is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_legacy_unlabelled_span_answers_only_for_the_capture_tenant() {
+        // Records written before partitioning have no tenant field. They must
+        // not become wildcards — that would be the original defect wearing a
+        // different hat.
+        std::env::set_var("CORECRUXD_TRACE_TENANT_ID", "the-capture-tenant");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let legacy = serde_json::json!({
+            "trace_id": 1, "span_id": 1, "parent_span_id": null,
+            "name": "old", "target": "t", "file": "f.rs", "line": 1,
+            "module_path": null, "duration_ns": 1, "depth": 0, "had_error": false,
+            "join": "miss", "stored_at_unix_ms": 0
+        });
+        std::fs::write(&path, format!("{legacy}\n")).unwrap();
+        let store = TraceStore::open(path, 1000).unwrap();
+
+        assert_eq!(
+            store.load_for_tenant("the-capture-tenant").unwrap().len(),
+            1,
+            "the daemon that captured it must still see its own history"
+        );
+        assert!(
+            store.load_for_tenant("someone-else").unwrap().is_empty(),
+            "an unlabelled legacy span must never answer for another tenant"
+        );
+        std::env::remove_var("CORECRUXD_TRACE_TENANT_ID");
+    }
+
+    #[test]
+    fn trace_lookup_by_id_is_tenant_scoped() {
+        // trace_id is a u64 from one space shared by every tenant, so an
+        // unscoped lookup would be a guessing oracle.
+        let dir = tempfile::tempdir().unwrap();
+        let store = TraceStore::open(dir.path().join("s.jsonl"), 1000).unwrap();
+        store
+            .append_resolved(vec![span("a", Some("a.rs"), Some(1), 42, 1)], None, "tenant-a")
+            .unwrap();
+
+        assert_eq!(store.load_trace(42, "tenant-a").unwrap().len(), 1);
+        assert!(
+            store.load_trace(42, "tenant-b").unwrap().is_empty(),
+            "knowing the trace_id must not be enough to read it"
+        );
+    }
+
+    #[test]
+    fn trace_listing_does_not_disclose_another_tenants_activity() {
+        // Even without span bodies, a listing leaks existence, count and shape.
+        let dir = tempfile::tempdir().unwrap();
+        let store = TraceStore::open(dir.path().join("s.jsonl"), 1000).unwrap();
+        store
+            .append_resolved(vec![span("a", Some("a.rs"), Some(1), 7, 1)], None, "tenant-a")
+            .unwrap();
+        store
+            .append_resolved(vec![span("b", Some("b.rs"), Some(1), 8, 2)], None, "tenant-b")
+            .unwrap();
+
+        let a = store.list_traces(100, "tenant-a").unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].0, 7);
+        let b = store.list_traces(100, "tenant-b").unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].0, 8);
     }
 }

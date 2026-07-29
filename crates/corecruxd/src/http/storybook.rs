@@ -67,7 +67,14 @@ pub(super) async fn post_generate(
 
     // The same window /v1/code-intel/dead-code answers from, so the readout and
     // the code-intel route cannot disagree about the same symbols.
-    let spans = super::traces::load_spans(&state);
+    // Scoped to this daemon's own capture tenant. This surface has no tenant
+    // binding of its own (it authorises with `require_http_scopes`, not the
+    // per-tenant variant), so there is no requester tenant to honour. Pinning it
+    // to the capture tenant preserves single-tenant behaviour exactly and fails
+    // closed if this daemon ever holds more than one tenant's spans — it will
+    // simply not see them. Giving this surface real tenant binding is a
+    // prerequisite for hosting it (crux-code-intel-pro-hosted-surface M3).
+    let spans = super::traces::load_spans(&state, &crate::trace_store::TraceStore::capture_tenant());
     let store = state.fact_store.read().await;
     let doc = match crate::storybook::generate(
         &store,

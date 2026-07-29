@@ -20442,23 +20442,21 @@ async fn m2_token_without_tenant_claim_is_refused() {
     );
 }
 
-/// **Documented gap, deliberately asserted so it cannot be forgotten.**
+/// The runtime span plane **is** tenant-partitioned (M3).
 ///
-/// The runtime span plane is not tenant-partitioned. `StoredSpan` carries no
-/// tenant field, the store is one file per daemon
-/// (`data_dir/traces/spans.jsonl`), and `CORECRUXD_TRACE_TENANT_ID` is a single
-/// process-wide value. Every code-intel answer's runtime half is therefore
-/// computed from a daemon-global span set.
+/// This test previously asserted the opposite. It was a deliberate tripwire on
+/// the M2 finding — the runtime plane had no tenant dimension at all — and it
+/// fired the moment `StoredSpan` gained one, which is exactly what it was for.
+/// Rewritten here in the same commit that closes the gap, along with the written
+/// isolation argument.
 ///
-/// On a single-tenant local daemon that is correct and harmless — the spans are
-/// that daemon's own execution. It is a **blocking defect for hosted
-/// multi-tenant aggregation (M3)**, which is why M2 gates M3 rather than
-/// following it.
-///
-/// When M3 partitions the span store, this test must be rewritten to assert the
-/// partitioning, and the isolation argument updated in the same commit.
+/// What is now guaranteed, and where: `StoredSpan` carries the capturing tenant;
+/// `TraceStore::load_for_tenant` is the only public read and filters strictly;
+/// legacy unlabelled records resolve to this daemon's capture tenant and no
+/// other; and `load_spans` requires a tenant so no handler can reach an
+/// unfiltered set. Those are pinned by the `trace_store` tests.
 #[test]
-fn m2_runtime_span_plane_is_not_yet_tenant_partitioned() {
+fn m2_runtime_span_plane_is_tenant_partitioned() {
     let span = crate::trace_store::StoredSpan {
         span: crux_observe::span_layer::SpanRecord {
             trace_id: 1,
@@ -20476,13 +20474,12 @@ fn m2_runtime_span_plane_is_not_yet_tenant_partitioned() {
         symbol_id: None,
         join: "miss".into(),
         stored_at_unix_ms: 0,
+        tenant_id: "tenant-a".into(),
     };
     let encoded = serde_json::to_string(&span).expect("serialise");
     assert!(
-        !encoded.contains("tenant"),
-        "StoredSpan gained a tenant dimension — M3 may have landed. Rewrite this \
-         test to assert partitioning and update \
-         the accompanying isolation argument in the same commit."
+        encoded.contains("\"tenant_id\":\"tenant-a\""),
+        "a persisted span must carry the tenant that captured it: {encoded}"
     );
 }
 // ── /v1/work ready-order projection (execplan-work-order-ranking M1) ─────────
