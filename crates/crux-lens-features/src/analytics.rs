@@ -235,6 +235,10 @@ pub fn compute_promise_coverage(capabilities: &[Value]) -> PromiseCoverage {
                 "built" => built += 1,
                 "building" => building += 1,
                 "planned" => planned += 1,
+                // `deferred` and `documented` are deliberately uncounted: neither is a
+                // stage on the build path, so neither may inflate a progress bucket.
+                // `total` still includes them, so the buckets need not sum to `total`.
+                "deferred" | "documented" => {}
                 _ => {}
             }
         }
@@ -315,6 +319,35 @@ mod tests {
                 "promise_alignment":[2]
             }),
         ]
+    }
+
+    #[test]
+    fn deferred_capability_is_counted_in_total_but_in_no_progress_bucket() {
+        // A deferred track must not read as in-flight work. It stays in `total`
+        // (it exists and is aligned) but must not land in any build-path bucket.
+        let mut caps = sample();
+        caps.push(json!({
+            "id":"CUE-CLI","name":"Cue Terminal Interface","system":"Cue","maturity":"deferred",
+            "tests":{"unit":["cli.rs"],"integration":[]},
+            "audit":{"status":"audited"},
+            "dod":["compiles"],
+            "promise_alignment":[2]
+        }));
+        let cov = compute_promise_coverage(&caps);
+        let p2 = cov.coverage.iter().find(|e| e.promise == 2).expect("promise 2 entry");
+        assert!(
+            p2.capabilities.iter().any(|id| id == "CUE-CLI"),
+            "aligned, so it is in the list"
+        );
+        assert_eq!(
+            p2.shipped + p2.built + p2.building + p2.planned + 1,
+            p2.total,
+            "exactly one uncounted"
+        );
+
+        // And it still shows up in the raw maturity histogram, which is keyed dynamically.
+        let rep = compute_coverage_report(&caps);
+        assert_eq!(rep.maturity.get("deferred").copied(), Some(1));
     }
 
     #[test]

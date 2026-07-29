@@ -30,7 +30,7 @@ pub fn bootstrap_kinds(reg: &mut KindRegistry) -> Result<(), KindError> {
                     "name":         {"type": "string"},
                     "system":       {"type": "string"},
                     "subsystem":    {"type": "string"},
-                    "maturity":     {"type": "string", "enum": ["planned","documented","building","built","shipped"]},
+                    "maturity":     {"type": "string", "enum": ["planned","documented","building","built","shipped","deferred"]},
                     "description":  {"type": "string"},
                     "feature_flag": {"type": "string"},
                     "repo_id":      {"type": "string"},
@@ -90,6 +90,18 @@ mod tests {
             "tests":{"unit":["a.rs"],"integration":[],"e2e":[]},
             "audit":{"status":"audited"},
             "dod":["compiles","tested"]
+        });
+        r.validate(CAPABILITY_KIND, &payload).unwrap();
+    }
+
+    #[test]
+    fn capability_schema_accepts_deferred_maturity() {
+        // A track that has been stood down (OD-1, 2026-07-29) must be representable
+        // without claiming intent to build it, which `planned` would assert.
+        let mut r = KindRegistry::new();
+        bootstrap_kinds(&mut r).unwrap();
+        let payload = serde_json::json!({
+            "id":"CUE-CLI","name":"Cue Terminal Interface","system":"Cue","maturity":"deferred"
         });
         r.validate(CAPABILITY_KIND, &payload).unwrap();
     }
