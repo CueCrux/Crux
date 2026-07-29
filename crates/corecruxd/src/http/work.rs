@@ -308,9 +308,11 @@ pub(super) async fn get_work(
     // `blocked_by`. Everything below this point is skipped when `ranked` is
     // absent, which is what keeps the default response byte-identical.
     let mut cycles: Vec<String> = Vec::new();
+    let mut inverted: Vec<String> = Vec::new();
     if q.ranked {
         let ranked = crate::work_execplans::rank_open(&items);
         cycles = ranked.cycles;
+        inverted = ranked.inverted_orchestrator_edges;
         let mut reordered = Vec::with_capacity(ranked.order.len());
         for (rank_pos, &idx) in ranked.order.iter().enumerate() {
             let mut item = items[idx].clone();
@@ -370,6 +372,12 @@ pub(super) async fn get_work(
         // check turns this into an operator-visible finding.
         if !cycles.is_empty() {
             body["dependency_cycles"] = serde_json::json!(cycles);
+        }
+        // Actionable half of a cycle report: an orchestrator is a parent, so an
+        // orchestrator depending outward names the exact `Depends on` line to
+        // flip. "There is a cycle" is a problem; this is a fix.
+        if !inverted.is_empty() {
+            body["inverted_orchestrator_edges"] = serde_json::json!(inverted);
         }
     }
 

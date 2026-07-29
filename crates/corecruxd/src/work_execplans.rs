@@ -1275,6 +1275,22 @@ fn apply_reciprocal_refs(items: &mut [WorkItem]) {
 // is the missing sort key: a pure, deterministic function over items the
 // projection already built. It mutates nothing and reads no facts.
 
+/// Marker that names a plan as an **orchestrator** — a parent that other plans
+/// hang off, never one that hangs off them.
+///
+/// Operator rule, 2026-07-29: "anything that has `orchestrat` in will be
+/// parent". Encoded here rather than left as a convention because a convention
+/// that only lives in prose is one the graph cannot honour: when two plans
+/// declare `Depends on` each other, *something* has to choose a direction, and
+/// choosing alphabetically (the previous behaviour) is arbitrary where this is
+/// meaningful.
+pub const ORCHESTRATOR_SLUG_MARKER: &str = "orchestrat";
+
+/// `true` when a slug names an orchestrator plan.
+pub fn is_orchestrator_slug(slug: &str) -> bool {
+    slug.to_ascii_lowercase().contains(ORCHESTRATOR_SLUG_MARKER)
+}
+
 /// States that count as unfinished work. `deployed` is terminal-ish (shipped)
 /// and `complete`/`archive` are terminal, so none of them are rankable.
 pub const OPEN_WORK_STATES: &[&str] = &["planned", "in_progress", "blocked", "drafting"];
@@ -1296,6 +1312,11 @@ pub struct RankedOpen {
     /// makes "foundations first" undefined, so it is reported rather than
     /// silently resolved; ranking still returns every item.
     pub cycles: Vec<String>,
+    /// Orchestrator plans that were found depending *outward* inside a cycle.
+    /// An orchestrator is a parent, so this names the plan whose `Depends on`
+    /// line should become `Extended by` — an actionable fix, not just "there is
+    /// a cycle somewhere".
+    pub inverted_orchestrator_edges: Vec<String>,
 }
 
 /// Rank the open items of a merged work list into a recommended order.
@@ -1364,10 +1385,16 @@ pub fn rank_open(items: &[WorkItem]) -> RankedOpen {
                 let next = deps[*cursor];
                 *cursor += 1;
                 if on_stack.contains(&next) {
-                    // Back edge: record both endpoints and do not descend.
+                    // Back edge. Record both endpoints; the cycle is real and
+                    // gets reported either way. Which edge we DROP is the
+                    // question, and the orchestrator rule answers it: an
+                    // orchestrator is a parent, so `X depends on <orchestrator>`
+                    // is the edge that survives and the reverse is the
+                    // inversion. Only the reported set is affected — ranking
+                    // still returns every item.
                     for idx in [node, next] {
-                        if let Some(s) = items[idx].id.strip_prefix(EXECPLAN_ENTITY_PREFIX) {
-                            cycles.insert(s);
+                        if let Some(sl) = items[idx].id.strip_prefix(EXECPLAN_ENTITY_PREFIX) {
+                            cycles.insert(sl);
                         }
                     }
                     continue;
@@ -1418,12 +1445,40 @@ pub fn rank_open(items: &[WorkItem]) -> RankedOpen {
         })
         .collect();
 
+    // Which edge to REVERSE, computed over the recorded cycle rather than at the
+    // back edge: a 2-cycle contains both directions, so whichever endpoint the
+    // DFS happens to reach first would otherwise decide the answer.
+    //
+    // Operator rule: an orchestrator is a parent. So an orchestrator inside a
+    // cycle that depends on a NON-orchestrator in the same cycle is the
+    // inversion — that `Depends on` should read `Extended by`.
+    let mut inverted: Vec<String> = cycles
+        .iter()
+        .filter(|slug| is_orchestrator_slug(slug))
+        .filter(|slug| {
+            let Some(&i) = slug_to_idx.get(*slug) else {
+                return false;
+            };
+            open_deps.get(&i).is_some_and(|deps| {
+                deps.iter().any(|&j| {
+                    items[j]
+                        .id
+                        .strip_prefix(EXECPLAN_ENTITY_PREFIX)
+                        .is_some_and(|d| cycles.contains(d) && !is_orchestrator_slug(d))
+                })
+            })
+        })
+        .map(|s| (*s).to_string())
+        .collect();
+    inverted.sort();
+
     let mut cycles: Vec<String> = cycles.into_iter().map(str::to_string).collect();
     cycles.sort();
     RankedOpen {
         order,
         blocked_by,
         cycles,
+        inverted_orchestrator_edges: inverted,
     }
 }
 
@@ -3456,6 +3511,97 @@ mod tests {
         let r = rank_open(&items);
         assert_eq!(r.order.len(), 2, "cycle must not drop items");
         assert_eq!(r.cycles, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// Operator rule: anything with `orchestrat` in the slug is a parent. When a
+    /// cycle has exactly one orchestrator, the orchestrator's outward
+    /// dependency is the inversion — naming it turns "there is a cycle" into
+    /// "change this line in this file".
+    #[test]
+    fn rank_open_names_the_inverted_orchestrator_edge() {
+        let items = vec![
+            wis(
+                "crux-pro-entitlement-orchestration-2026-07-27",
+                "planned",
+                &["crux-pro-capabilities-rcx-entitled-2026-07-27"],
+            ),
+            wis(
+                "crux-pro-capabilities-rcx-entitled-2026-07-27",
+                "planned",
+                &["crux-pro-entitlement-orchestration-2026-07-27"],
+            ),
+        ];
+        let r = rank_open(&items);
+        assert_eq!(r.cycles.len(), 2, "the cycle is still reported: {:?}", r.cycles);
+        assert_eq!(
+            r.inverted_orchestrator_edges,
+            vec!["crux-pro-entitlement-orchestration-2026-07-27".to_string()],
+            "the orchestrator depending outward is the edge to reverse"
+        );
+        assert_eq!(r.order.len(), 2, "reporting an inversion must not drop items");
+    }
+
+    #[test]
+    fn rank_open_two_orchestrators_in_a_cycle_names_neither() {
+        // Both sides are parents, so the rule cannot choose — say nothing rather
+        // than point at an arbitrary one.
+        let items = vec![
+            wis(
+                "alpha-orchestration-2026-01-01",
+                "planned",
+                &["beta-orchestrator-2026-01-02"],
+            ),
+            wis(
+                "beta-orchestrator-2026-01-02",
+                "planned",
+                &["alpha-orchestration-2026-01-01"],
+            ),
+        ];
+        let r = rank_open(&items);
+        assert_eq!(r.cycles.len(), 2);
+        assert!(
+            r.inverted_orchestrator_edges.is_empty(),
+            "{:?}",
+            r.inverted_orchestrator_edges
+        );
+    }
+
+    #[test]
+    fn rank_open_cycle_without_an_orchestrator_names_no_inversion() {
+        let items = vec![
+            wis("plain-a", "planned", &["plain-b"]),
+            wis("plain-b", "planned", &["plain-a"]),
+        ];
+        let r = rank_open(&items);
+        assert_eq!(r.cycles.len(), 2);
+        assert!(r.inverted_orchestrator_edges.is_empty());
+    }
+
+    #[test]
+    fn orchestrator_slug_marker_matches_the_operator_rule() {
+        for yes in [
+            "crux-pro-entitlement-orchestration-2026-07-27",
+            "portfolio-burn-down-orchestration-2026-07-10",
+            "Some-Orchestrator-Plan",
+            "multi-orchestrated-thing",
+        ] {
+            assert!(is_orchestrator_slug(yes), "{yes} should read as an orchestrator");
+        }
+        for no in [
+            "crux-pro-capabilities-rcx-entitled-2026-07-27",
+            "orchestra-seating-plan",
+            "plain-plan",
+        ] {
+            assert_eq!(
+                is_orchestrator_slug(no),
+                no.contains("orchestra") && no.contains("orchestrat"),
+                "{no}"
+            );
+        }
+        assert!(
+            !is_orchestrator_slug("orchestra-seating-plan"),
+            "'orchestra' alone is not 'orchestrat'"
+        );
     }
 
     #[test]

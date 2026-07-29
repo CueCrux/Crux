@@ -440,10 +440,17 @@
     // it above the list rather than letting the order silently lie.
     var head = [];
     var cyc = arr(res.data.dependency_cycles);
+    var inv = arr(res.data.inverted_orchestrator_edges);
     if (cyc.length) {
       head.push({ t: 'exp', label: '⚠ dependency cycle — ' + cyc.length + ' plan' + (cyc.length === 1 ? '' : 's'),
-        sub: 'these plans declare Depends on each other; their relative order is undefined',
-        badge: 'cycle', controls: cyc.map(function (s) { return info(s, 'in cycle'); }) });
+        sub: inv.length
+          ? 'an orchestrator is a parent — flip its `Depends on` to `Extended by` to break this'
+          : 'these plans declare Depends on each other; their relative order is undefined',
+        badge: 'cycle',
+        controls: cyc.map(function (s) {
+          // Name the one to change, rather than leaving the reader to work it out.
+          return info(s, inv.indexOf(s) >= 0 ? 'FIX HERE — orchestrator depending outward' : 'in cycle');
+        }) });
     }
 
     var ready = items.filter(function (w) { return !arr(w.blocked_by).length; });
