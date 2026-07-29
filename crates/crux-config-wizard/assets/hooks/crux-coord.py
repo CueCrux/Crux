@@ -129,8 +129,16 @@ def check(hook):
             continue
         for p in ((s.get("intent") or {}).get("paths") or []):
             if p and (target.startswith(p.rstrip("/") + "/") or target == p):
-                slug = (s.get("intent") or {}).get("execplan_slug") or "no plan"
-                hits.append(f"{s.get('session_id_hex', '?')[:12]} ({slug})")
+                intent = s.get("intent") or {}
+                slug = intent.get("execplan_slug") or "no plan"
+                # Surface the host: matching is path-based, so a second
+                # workstation with an identical checkout path matches too. Same
+                # host means a real concurrent write; a different host means the
+                # same repo open elsewhere, which conflicts at merge, not on disk.
+                note = intent.get("note") or ""
+                host = note.rsplit("@", 1)[-1] if "@" in note else "?"
+                where = "this host" if host == socket.gethostname() else f"host {host}"
+                hits.append(f"{s.get('session_id_hex', '?')[:12]} ({slug}, {where})")
     if hits:
         # stderr, exit 0: advisory. Blocking on a peer's advisory claim would
         # turn a coordination aid into an outage the moment coord is wrong.
