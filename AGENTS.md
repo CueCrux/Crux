@@ -53,8 +53,9 @@ To understand what makes this tamper-evident, read these symbols in order:
 
 ## Build / test
 
-- MSRV: **1.88.0** (`rust-toolchain.toml`); edition 2021; workspace version 0.5.37
-  (`[workspace.package]` in `Cargo.toml` is authoritative).
+- MSRV: **1.88.0** (`rust-toolchain.toml`); edition 2021; workspace version 0.5.53
+  (`[workspace.package]` in `Cargo.toml` is authoritative, and
+  `scripts/check-agent-docs.sh` fails the build when this line disagrees with it).
 - `cargo build --workspace --locked`
 - `cargo test --workspace`
 - `cargo fmt --check` and `cargo clippy --workspace -- -D warnings` (both CI-gated)
