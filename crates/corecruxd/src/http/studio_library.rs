@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Central Studio template library — daemon half (L2 of the ExecPlan
 //! `crux-integrations-and-template-library-2026-07-25`).
@@ -42,7 +42,7 @@
 //!
 //! Catalog entries may declare a `required_tier` ([`crux_integrations::RcxTier`]
 //! — the RCX vocabulary, not a fork). **The daemon does not enforce it.** This
-//! is a source-available daemon: any operator can rebuild it with the check
+//! is an open-source daemon: any operator can rebuild it with the check
 //! removed, so a local tier gate would be security theatre that only
 //! inconveniences honest users. The enforcement point is the **catalog server**,
 //! which decides whether to serve the signed index row and the `pack_url` bytes

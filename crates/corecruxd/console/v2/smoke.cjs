@@ -1,6 +1,6 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 //
 // Unified Shell Console v2 — static-analysis smoke (ExecPlan
 // unified-shell-console-2026-07-03, M1). Zero dependencies; node only. Run:
@@ -1698,11 +1698,11 @@ function extractThemeVars(theme) {
     check(renderSrc.indexOf(route) >= 0, '[linkgraph] render.renderLinkGraph must reach the proxy route ' + route);
     check(apiSrc.indexOf("'" + route + "': true") >= 0, '[linkgraph] api.js LITERAL_GET_PATHS must allowlist ' + route);
   });
-  // The renderer is a client-only ESM module: CCL header, bare `three`, the shared
+  // The renderer is a client-only ESM module: Apache-2.0 header, bare `three`, the shared
   // public API, and zero external runtime deps (T.5). It also must not run a
   // perpetual rAF loop (reduced-motion floor) — render-on-demand only.
   const rendererSrc = fs.readFileSync(path.join(DIR, 'linkgraph-renderer.mjs'), 'utf8');
-  check(/CueCrux Community Licence \(CCL v1\.0\)/.test(rendererSrc), '[linkgraph] linkgraph-renderer.mjs must carry the CCL licence header');
+  check(/Licensed under the Apache License, Version 2\.0\./.test(rendererSrc), '[linkgraph] linkgraph-renderer.mjs must carry the Apache-2.0 licence header');
   check(/import \* as THREE from 'three'/.test(rendererSrc), '[linkgraph] renderer must import the bare `three` specifier (resolved to the vendored r165 by the shell import map)');
   ['mount', 'setData', 'expandData', 'setTheme', 'onNodeClick', 'destroy'].forEach(function (m) {
     check(rendererSrc.indexOf(m) >= 0, '[linkgraph] renderer must expose the shared public API method: ' + m);

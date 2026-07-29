@@ -1,5 +1,5 @@
-# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-# Licensed under the CueCrux Community Licence (CCL v1.0).
+# Copyright (c) 2026 CueCrux Ltd.
+# Licensed under the Apache License, Version 2.0.
 
 # --- Builder stage ---
 # Chainguard exception (workspace CLAUDE.md §9): the build stage stays on the
@@ -53,6 +53,11 @@ RUN apk add --no-cache ca-certificates curl git
 
 COPY --from=builder /build/target/release/corecruxd /usr/local/bin/corecruxd
 COPY --from=builder /build/target/release/corecruxctl /usr/local/bin/corecruxctl
+
+# Apache-2.0 sections 4(a) and 4(d): a redistribution must carry the licence and
+# the NOTICE attribution. The image ships binaries only, so the per-file source
+# headers do not travel with it — these two files are what satisfy the condition.
+COPY LICENSE NOTICE /usr/share/doc/crux-daemon/
 
 # Non-root runtime user: wolfi-base ships `nonroot` (uid/gid 65532), the
 # Chainguard/distroless convention. /data ownership transfers to named volumes

@@ -118,4 +118,4 @@ Methods that naturally return "not found" (`get_fact`, `get_session`, `delete_fa
 
 ## Licence
 
-CueCrux Community Licence (CCL v1.0). See [LICENCE.md](../../LICENCE.md).
+Apache License, Version 2.0. See [LICENSE](../../LICENSE).

@@ -43,12 +43,13 @@ edition = "2021"
 # scripts/cut-release.sh; the version-sync CI gate (.github/workflows/version-sync.yml)
 # fails any v* tag whose workspace version != the tag.
 version = "0.5.53"
-license = "LicenseRef-CCL-1.0"
+license = "Apache-2.0"
 rust-version = "1.88.0"
-# CCL crates are source-available and never published to a registry. Marking
-# them non-publishable lets cargo-deny's `allow-wildcard-paths` exempt the
-# unversioned `{ path = "../x" }` workspace deps so `wildcards = "deny"` can be
-# enforced against real (registry) wildcard requirements. (deny.toml C2)
+# Apache-2.0 licensed but not (yet) published to crates.io: the workspace uses
+# unversioned `{ path = "../x" }` deps, which a registry publish would reject.
+# Marking the crates non-publishable also lets cargo-deny's `allow-wildcard-paths`
+# exempt those path deps so `wildcards = "deny"` can be enforced against real
+# (registry) wildcard requirements. (deny.toml C2)
 publish = false
 
 [workspace.dependencies]

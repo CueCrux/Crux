@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-# Licensed under the CueCrux Community Licence (CCL v1.0).
+# Copyright (c) 2026 CueCrux Ltd.
+# Licensed under the Apache License, Version 2.0.
 #
 # Compaction Survival Kit — one-command installer.
-# Installs the FREE compaction-survival preset (also source-available in the
+# Installs the FREE compaction-survival preset (also open source in the
 # Crux repo, integrations/claude-code/compaction-survival/) and wires the same
 # PreCompact + SessionStart hooks for BOTH Claude Code and OpenAI Codex — both
 # now expose that contract. Idempotent; safe to re-run.
@@ -70,9 +70,9 @@ Done. Restart Claude Code (and/or Codex).
   Self-test the hooks:  bash "$here/hooks/selftest.sh"
   Local event report:   bash "$here/event-report.sh"
 
-The compaction-survival capability is free and source-available in the Crux
-repo (integrations/claude-code/compaction-survival/) under the CueCrux Community
-Licence; the standalone proof-of-loss mini-repo is MIT-licensed. This kit
+The compaction-survival capability is free and open source in the Crux
+repo (integrations/claude-code/compaction-survival/) under the Apache License,
+Version 2.0; the standalone proof-of-loss mini-repo is MIT-licensed. This kit
 packages the tested installer, the dual-agent configs, the event report, and
 the comparison doc — it does not gate the capability.
 

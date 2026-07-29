@@ -8,6 +8,6 @@ Use inside a Crux daemon deployment is permitted. Standalone redistribution, sub
 
 This file is the canonical Content Licence text. It lives under `content/`, the
 directory it governs, so the repository surfaces a single top-level licence
-(`LICENCE.md`, the code licence). Bundled releases ship this file under
+(`LICENSE`, the code licence). Bundled releases ship this file under
 `content/LICENCE-CONTENT.md` next to the covered assets, so operators always have
 both the code and content licences at the path layout they were built against.

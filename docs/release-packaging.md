@@ -9,8 +9,8 @@ Each target bundle includes:
 - `corecruxctl-<target>` for administrative checks and store verification.
 - `crux-hook-<target>` for agent lifecycle hooks, including encrypted
   compaction snapshot sync.
-- `LICENCE.md` (code licence) and `TRUST-CONTRACT.md`. The code licence is
-  published to scanners as SPDX `LicenseRef-CCL-1.0` (crate manifests + `.rs`
+- `LICENSE` (code licence), `NOTICE` (attribution), and `TRUST-CONTRACT.md`. The code licence is
+  published to scanners as SPDX `Apache-2.0` (crate manifests + `.rs`
   headers); see [docs/LICENCE-FAQ.md](LICENCE-FAQ.md) → "machine-readable
   metadata".
 - `README.md` and `config.example.yaml`.

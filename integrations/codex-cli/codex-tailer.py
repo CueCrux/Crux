@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-# Licensed under the CueCrux Community Licence (CCL v1.0).
+# Copyright (c) 2026 CueCrux Ltd.
+# Licensed under the Apache License, Version 2.0.
 #
 # Codex CLI session tailer → Crux Daemon observation capture.
 #

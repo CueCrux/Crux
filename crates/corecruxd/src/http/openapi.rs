@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! OpenAPI document — `GET /v1/openapi.json`.
 //!
@@ -29,7 +29,7 @@ use utoipa::OpenApi;
         title = "Crux Daemon API",
         version = env!("CARGO_PKG_VERSION"),
         description = "Append-only event store with BM25 retrieval, CROWN receipts, and fact memory.",
-        license(name = "CCL v1.0", url = "https://github.com/CueCrux/Crux/blob/main/LICENCE.md")
+        license(name = "Apache-2.0", url = "https://github.com/CueCrux/Crux/blob/main/LICENSE")
     ),
     paths(
         // Health

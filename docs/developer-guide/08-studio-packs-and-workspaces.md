@@ -362,7 +362,7 @@ stays byte-stable ([studio_index.rs:138](../../crates/crux-integrations/src/stud
 
 **The daemon does not enforce it.** The reasoning is stated in the module docs
 ([studio_library.rs:41](../../crates/corecruxd/src/http/studio_library.rs#L41)): this is a
-source-available daemon, so any operator can rebuild it with the check removed —
+open-source daemon, so any operator can rebuild it with the check removed —
 a local tier gate would be theatre that only inconveniences honest users. The
 enforcement point is the **catalogue server**, which decides whether to serve the
 signed row and the `pack_url` bytes to a given subscriber at all.

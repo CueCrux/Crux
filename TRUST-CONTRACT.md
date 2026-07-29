@@ -8,7 +8,7 @@ The Crux daemon is expected to satisfy the CueCrux Trust Contract:
 - every call produces a receipt with the token-selected receipt class
 - community mods cannot bypass token policy
 
-This file is the canonical Trust Contract text. Release bundles include it next to `LICENCE.md` so operators inherit the same posture every Crux daemon claims to satisfy.
+This file is the canonical Trust Contract text. Release bundles include it next to `LICENSE` so operators inherit the same posture every Crux daemon claims to satisfy.
 
 ## Repository scope
 

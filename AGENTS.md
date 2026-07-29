@@ -64,7 +64,7 @@ To understand what makes this tamper-evident, read these symbols in order:
 
 ## Boundaries
 
-**Always:** anchor doc references by symbol name; keep the CCL licence header on every `.rs`
+**Always:** anchor doc references by symbol name; keep the Apache-2.0 licence header on every `.rs`
 file (`grep -rL "Licensed under" crates/**/*.rs` must return nothing); test and lint before
 committing.
 

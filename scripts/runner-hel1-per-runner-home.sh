@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-# Licensed under the CueCrux Community Licence (CCL v1.0).
-# See LICENCE.md in the repository root.
+# Copyright (c) 2026 CueCrux Ltd.
+# Licensed under the Apache License, Version 2.0.
+# See LICENSE in the repository root.
 #
 # runner-hel1-per-runner-home.sh — durable fix for runner-hel1 gotcha #6
 # (and #5): give each numbered GitHub Actions runner service a PRIVATE $HOME so

@@ -1,5 +1,5 @@
-# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-# Licensed under the CueCrux Community Licence (CCL v1.0).
+# Copyright (c) 2026 CueCrux Ltd.
+# Licensed under the Apache License, Version 2.0.
 #
 # nfpm (https://nfpm.goreleaser.com) config for the crux-daemon .deb.
 # Build locally with packaging/deb/build-deb.sh after staging release
@@ -23,7 +23,7 @@ description: |
   console, no phone-home.
 vendor: CueCrux Ltd
 homepage: https://github.com/CueCrux/Crux
-license: CCL-1.0
+license: Apache-2.0
 
 contents:
   - src: dist/crux-linux-amd64
@@ -46,8 +46,10 @@ contents:
     dst: /usr/lib/systemd/system/crux.service
     file_info:
       mode: 0644
-  - src: LICENCE.md
-    dst: /usr/share/doc/crux-daemon/LICENCE.md
+  - src: LICENSE
+    dst: /usr/share/doc/crux-daemon/LICENSE
+  - src: NOTICE
+    dst: /usr/share/doc/crux-daemon/NOTICE
   - src: TRUST-CONTRACT.md
     dst: /usr/share/doc/crux-daemon/TRUST-CONTRACT.md
 

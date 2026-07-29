@@ -1,6 +1,6 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 //
 // Unified Shell Console v2 — page registry (ExecPlan unified-shell-console-2026-07-03, M1).
 // A no-build, dependency-free module (UMD: window.CruxPages in the browser,
@@ -1499,7 +1499,7 @@
         controls: [
           info('build', 'cargo build --release (CPU-only)'),
           info('architecture', 'axum HTTP :14800 + tonic gRPC · append-only shard store · Ed25519 CROWN receipts'),
-          info('key rules', 'no GPU/CUDA · CCL licence · port 14800 fixed')
+          info('key rules', 'no GPU/CUDA · Apache-2.0 licence · port 14800 fixed')
         ] },
       { h: 'External docs', sub: 'platform surfaces (open in a browser tab)', wide: true,
         controls: [

@@ -24,7 +24,7 @@ passports, portable `.cruxpack` export. No account. No API keys. Nothing leaves 
 [![CI](https://github.com/CueCrux/Crux/actions/workflows/ci.yml/badge.svg)](https://github.com/CueCrux/Crux/actions/workflows/ci.yml)
 [![Coverage](https://img.shields.io/badge/coverage-CI%20gated-green)](https://github.com/CueCrux/Crux/actions/workflows/coverage-attestation.yml)
 [![MCP](https://img.shields.io/badge/MCP-native-blue)](#100-mcp-tools-memory-first)
-[![Licence: CCL-1.0 (source-available)](https://img.shields.io/badge/licence-CCL--1.0_(source--available)-blue)](LICENCE.md)
+[![Licence: Apache-2.0](https://img.shields.io/badge/licence-Apache--2.0-blue)](LICENSE)
 
 <img src="docs/Images/readme/console-overwatch.png" alt="Crux console Overwatch view: a gate queue of decisions that need you, a live fleet of agent sessions, and a rolling receipted activity ticker" width="88%">
 
@@ -549,14 +549,15 @@ Built in the open, verified in the open. If Crux is useful to you, a star helps 
 
 ## Licence
 
-Crux Daemon is source-available under the
-[CueCrux Community Licence (CCL v1.0)](LICENCE.md).
+Crux Daemon is open source under the
+[Apache License, Version 2.0](LICENSE).
 
-- Internal commercial use is permitted.
-- Reading, auditing, and internal modification are permitted.
-- Offering Crux as a managed, hosted, or cloud service to third parties is prohibited.
-- **Three years after each versioned release, the code converts to Apache 2.0.**
+- Commercial use, modification, distribution, and private use are permitted.
+- Running Crux as a managed, hosted, or cloud service is permitted.
+- Apache-2.0 includes an express patent grant (section 3).
+- Redistribution must retain the copyright, licence, and `NOTICE` attribution
+  (sections 4(a)–4(d)); it grants no trademark rights (section 6).
 - Curated content is covered separately by [`content/LICENCE-CONTENT.md`](content/LICENCE-CONTENT.md).
 - Plain-English answers: [`docs/LICENCE-FAQ.md`](docs/LICENCE-FAQ.md).
 
-Copyright (c) 2026 CueCrux Ltd. All rights reserved.
+Copyright (c) 2026 CueCrux Ltd.
