@@ -2782,6 +2782,11 @@
   .cv-gedge { stroke: var(--edge-strong); stroke-width: 2; fill: none; opacity: .85; stroke-linecap: round; }
   .cv-gedge.is-hot { stroke: var(--acc); opacity: 1; stroke-width: 2.6; }
   .cv-gedge.is-dim { opacity: .1; }
+  /* Plan lineage reads differently from the structural wires around it: a
+     satisfied prerequisite is quiet history, an OPEN one is what is actually
+     holding the plan up and should be the line you notice. */
+  .cv-gedge[data-kind="depends-on"] { stroke: var(--trust); stroke-dasharray: 5 3; opacity: .7; }
+  .cv-gedge[data-kind="blocked-by"] { stroke: var(--warn); stroke-width: 2.4; opacity: .95; }
   .cv-arrowhead { fill: var(--edge-strong); stroke: none; }
   .cv-arrowhead-hot { fill: var(--acc); }
   .cv-pulse { fill: var(--acc); filter: drop-shadow(0 0 3px color-mix(in srgb, var(--acc) 60%, transparent)); }
