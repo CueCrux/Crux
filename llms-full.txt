@@ -108,8 +108,9 @@ To understand what makes this tamper-evident, read these symbols in order:
 
 ## Build / test
 
-- MSRV: **1.88.0** (`rust-toolchain.toml`); edition 2021; workspace version 0.5.37
-  (`[workspace.package]` in `Cargo.toml` is authoritative).
+- MSRV: **1.88.0** (`rust-toolchain.toml`); edition 2021; workspace version 0.5.53
+  (`[workspace.package]` in `Cargo.toml` is authoritative, and
+  `scripts/check-agent-docs.sh` fails the build when this line disagrees with it).
 - `cargo build --workspace --locked`
 - `cargo test --workspace`
 - `cargo fmt --check` and `cargo clippy --workspace -- -D warnings` (both CI-gated)
@@ -449,7 +450,7 @@ schema: crux-agent-manifest/v1
 summary: Local-first, tamper-evident retrieval + memory engine with signed, replayable receipts.
 msrv: "1.88.0"
 edition: "2021"
-workspace_version: "0.5.37"
+workspace_version: "0.5.53"
 
 verify_commands:
   - cargo test --workspace
@@ -3563,7 +3564,7 @@ Report it privately per the [security policy](SECURITY.md).
 <sub><b>receipts as a literal chain</b> — click any block in the console, inspect the proof</sub>
 </div>
 
-**Testing & coverage:** 5,000+ tests and **~87%** CI-gated region coverage, with per-crate floors
+**Testing & coverage:** 6,000+ tests and **~87%** CI-gated region coverage, with per-crate floors
 on the trust core (`corecrux-receipts` / `-segment` / `-storage`) and the ungated total reported
 alongside so exclusions can't hide low-coverage code. How it's measured and exactly what's
 excluded: [docs/testing-and-coverage.md](docs/testing-and-coverage.md).

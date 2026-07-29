@@ -29,7 +29,7 @@ concurrency:
 jobs:
   check:
     name: Verify agent-doc references resolve
-    runs-on: [self-hosted, ci]
+    runs-on: [self-hosted, hel1]
     steps:
       - uses: actions/checkout@v7
       - name: Check agent docs

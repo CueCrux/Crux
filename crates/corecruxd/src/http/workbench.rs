@@ -218,6 +218,70 @@ pub(super) async fn get_workbench_contract(State(state): State<AppState>, header
     Json(workbench_posture(&state)).into_response()
 }
 
+/// How many ranked items the brief carries. Twenty is enough to see the next
+/// several things worth doing and still cost well under a thousand tokens.
+const BRIEF_OPEN_WORK_LIMIT: usize = 20;
+
+/// The brief's `open_work`: kanban items **merged with** the ExecPlan projection,
+/// narrowed to open work and sorted into recommended order by
+/// [`crate::work_execplans::rank_open`], then trimmed to the cheap fields.
+///
+/// Previously this read the kanban table alone, so the ExecPlan board — the
+/// large majority of real work — never appeared in the brief at all, and the
+/// twenty items it did return were in arbitrary order. Emitting slim rows keeps
+/// the whole section under ~1 KB, which is what makes it readable on every
+/// agent boot instead of a 160 KB board fetch.
+fn ranked_open_work(
+    store: &corecrux_memory::fact_store::FactStore,
+    project_id: Option<&str>,
+    tenant_id: &str,
+) -> Vec<Value> {
+    let mut items = crate::work::list_work(store, project_id, None, Some(tenant_id), None);
+
+    // ExecPlan items are tenant-agnostic (the projection is per-root, not
+    // per-tenant), so they are appended rather than tenant-filtered — same
+    // treatment `/v1/work?source=all` gives them.
+    if let Some(root) = crate::work_execplans::execplans_root_from_env() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        match crate::work_execplans::list_execplans(store, &root, now) {
+            Ok(plans) => items.extend(plans),
+            Err(err) => {
+                tracing::warn!(error = %err, root = %root.display(), "brief-execplan-aggregator-io-error");
+            }
+        }
+    }
+
+    let ranked = crate::work_execplans::rank_open(&items);
+    ranked
+        .order
+        .iter()
+        .take(BRIEF_OPEN_WORK_LIMIT)
+        .enumerate()
+        .map(|(pos, &idx)| {
+            let w = &items[idx];
+            let mut o = serde_json::Map::new();
+            o.insert("id".into(), json!(w.id));
+            o.insert("state".into(), json!(w.state));
+            if let Some(m) = &w.current_milestone {
+                o.insert("current_milestone".into(), json!(m));
+            }
+            if let Some(d) = w.milestones_done {
+                o.insert("milestones_done".into(), json!(d));
+            }
+            if let Some(t) = w.milestones_total {
+                o.insert("milestones_total".into(), json!(t));
+            }
+            let blocked = &ranked.blocked_by[pos];
+            if !blocked.is_empty() {
+                o.insert("blocked_by".into(), json!(blocked));
+            }
+            Value::Object(o)
+        })
+        .collect()
+}
+
 #[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_agent_brief(
     State(state): State<AppState>,
@@ -252,11 +316,7 @@ pub(super) async fn get_agent_brief(
             tenant_facts_by_prefix(&store, "__decisions__::", &tenant_id, 12),
             recent_receipt_refs(&store, &tenant_id, 16),
             tenant_facts(&store, &tenant_id, 200).len(),
-            crate::work::list_work(&store, q.project_id.as_deref(), None, Some(&tenant_id), None)
-                .into_iter()
-                .filter(|item| !matches!(item.state.as_str(), "complete" | "deployed" | "archive"))
-                .take(20)
-                .collect::<Vec<_>>(),
+            ranked_open_work(&store, q.project_id.as_deref(), &tenant_id),
         )
     };
 
@@ -281,6 +341,11 @@ pub(super) async fn get_agent_brief(
         "active_constraints": constraints,
         "open_decisions": decisions,
         "open_work": open_work,
+        // The rows above are ranked, not merely filtered, and carry only the
+        // cheap fields. Stated explicitly so a consumer knows the order is
+        // meaningful (pick the first one) and that a full row lives at
+        // `/v1/work?ranked=1` without `fields=slim`.
+        "open_work_order": "ranked",
         "recent_receipts": recent_receipts,
     }))
     .into_response()

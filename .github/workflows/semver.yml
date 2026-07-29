@@ -13,7 +13,7 @@ on:
 jobs:
   semver:
     name: Semver Compatibility
-    runs-on: [self-hosted, ci]
+    runs-on: [self-hosted, hel1]
     env:
       CARGO_HOME: /home/gha-runner/.cargo
     steps:

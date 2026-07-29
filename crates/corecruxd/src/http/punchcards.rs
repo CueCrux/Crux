@@ -416,6 +416,10 @@ pub(super) async fn acquire(
         };
     }
 
+    // Set when a peer already holds this resource and advisory mode granted
+    // anyway. Carried on the 201 so the caller can warn its operator.
+    let mut advisory_conflict: Option<serde_json::Value> = None;
+
     // Conflict by a different holder → 409 with current holder + expiry.
     // Advisory mode reports the conflict but still grants (writers are never
     // denied); Enforce mode rejects with 409.
@@ -433,7 +437,16 @@ pub(super) async fn acquire(
             )
                 .into_response();
         }
-        // Advisory: fall through and grant a (possibly overlapping) lease.
+        // Advisory: fall through and grant a (possibly overlapping) lease — but
+        // SAY SO. Advisory previously granted in silence, which meant a caller
+        // could not distinguish "nobody else is here" from "someone is, and we
+        // let you in anyway". A warning nobody receives is not advisory, it is
+        // absent, so the grant carries the conflict for the caller to surface.
+        advisory_conflict = Some(json!({
+            "held_by": conflict_holder,
+            "punchcard_id": conflict_id,
+            "expires_at_unix_ms": conflict_expires,
+        }));
     }
 
     // Mint a fresh lease.
@@ -460,7 +473,11 @@ pub(super) async fn acquire(
                     id: id.clone(),
                     status: "held".to_string(),
                 });
-            (StatusCode::CREATED, Json(json!({"punchcard": rec.payload}))).into_response()
+            let mut out = json!({"punchcard": rec.payload});
+            if let Some(c) = advisory_conflict {
+                out["advisory_conflict"] = c;
+            }
+            (StatusCode::CREATED, Json(out)).into_response()
         }
         Err(e) => problem_response(StatusCode::BAD_REQUEST, e.to_string()),
     }

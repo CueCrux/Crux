@@ -123,6 +123,18 @@ const CLAUDE_BANNER_PY: &str = include_str!("../assets/hooks/crux-claude-banner.
 /// surface rendered from a 60s cache. Installed to `~/.local/bin/crux-statusline`.
 const STATUSLINE_PY: &str = include_str!("../assets/hooks/crux-statusline.py");
 
+/// Coordination-plane presence for this session. Binds via `cuecrux_session`,
+/// announces focus over `POST /v1/coord/announce`, and warns on `PreToolUse`
+/// when a peer session has claimed the path about to be edited.
+///
+/// Exists because presence is opt-in and nothing was opting in: concurrent
+/// sessions on one tree produced an empty board, so each believed it was alone.
+/// Announcing needs the *bound* `cuecrux_session` id, not the Claude session
+/// UUID — announcing with the UUID returns 200 and never joins presence, which
+/// is why the gap was invisible. Advisory and fail-open throughout; disable with
+/// `CRUX_COORD=0`. Installed to `~/.local/bin/crux-coord`.
+const COORD_PY: &str = include_str!("../assets/hooks/crux-coord.py");
+
 /// Resolve the `crux-hook` binary (banner/context/pre-compact). `None` ⇒ install
 /// observe-only and note the banner needs the binary.
 fn locate_crux_hook() -> Option<PathBuf> {
@@ -237,6 +249,7 @@ fn install_assets() -> Result<(PathBuf, PathBuf, bool), DynErr> {
     write_exec(&bin.join("crux-scratchpad-persist"), SCRATCHPAD_SH)?;
     write_exec_on_change(&bin.join("crux-claude-banner"), CLAUDE_BANNER_PY)?;
     write_exec_on_change(&bin.join("crux-statusline"), STATUSLINE_PY)?;
+    write_exec_on_change(&bin.join("crux-coord"), COORD_PY)?;
     Ok((wrapper, bin, locate_crux_hook().is_some()))
 }
 
@@ -256,6 +269,16 @@ fn settings_path(user: bool, project: Option<PathBuf>) -> Result<PathBuf, DynErr
 
 fn cmd(wrapper: &Path, args: &str) -> serde_json::Value {
     serde_json::json!({ "type": "command", "command": format!("{} {args}", wrapper.display()) })
+}
+
+/// A `crux-coord <verb>` hook entry (absolute path; not routed via the wrapper,
+/// which only dispatches `crux-hook` modes).
+fn coord(local_bin: &Path, verb: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "command",
+        "command": format!("{} {verb}", local_bin.join("crux-coord").display()),
+        "timeout": 6
+    })
 }
 
 fn event(hooks: Vec<serde_json::Value>) -> serde_json::Value {
@@ -288,6 +311,10 @@ fn build_hooks_block(wrapper: &Path, local_bin: &Path, have_binary: bool, have_p
             0,
             serde_json::json!({ "type": "command", "command": banner.display().to_string(), "timeout": 10 }),
         );
+        // Announce presence right after the banner: the banner reports the board,
+        // this puts us on it. Without it every session reads "0 live sessions"
+        // and concurrent writers stay invisible to each other.
+        session_start.push(coord(local_bin, "announce"));
     } else if have_binary {
         session_start.insert(0, cmd(wrapper, "banner"));
     }
@@ -303,10 +330,14 @@ fn build_hooks_block(wrapper: &Path, local_bin: &Path, have_binary: bool, have_p
     // PreToolUse: stash the pre-edit before-image for the opt-in filemod ledger.
     // Scoped to the edit tools; inert until the operator sets CRUX_HOOK_FILEMOD=1
     // (the script self-gates and always exits 0).
-    map.insert(
-        "PreToolUse".to_string(),
-        event_matched(FILEMOD_MATCHER, vec![cmd(wrapper, "filemod pre")]),
-    );
+    // …and, when the Python stack is present, warn if a peer session has declared
+    // the path we are about to edit. Advisory: prints to stderr and exits 0, so a
+    // coord outage never blocks an edit.
+    let mut pre_tool = vec![cmd(wrapper, "filemod pre")];
+    if have_python {
+        pre_tool.push(coord(local_bin, "check"));
+    }
+    map.insert("PreToolUse".to_string(), event_matched(FILEMOD_MATCHER, pre_tool));
     // PostToolUse: the existing observe (`.*`) group, plus the opt-in filemod
     // post leg scoped to the edit tools (hash + line-delta → daemon).
     let mut post_tool_groups = event(post_tool);
@@ -325,14 +356,17 @@ fn build_hooks_block(wrapper: &Path, local_bin: &Path, have_binary: bool, have_p
     // (all three run independent of the crux-hook binary, so always wired). The
     // scratchpad leg is best-effort + fact-free (`--hook`); deliberate handoff
     // facts come from the agent's explicit `--execplan` call.
-    map.insert(
-        "SessionEnd".to_string(),
-        event(vec![
-            cmd(wrapper, "observe session_end"),
-            cmd(wrapper, "cost"),
-            cmd(wrapper, "scratchpad"),
-        ]),
-    );
+    let mut session_end = vec![
+        cmd(wrapper, "observe session_end"),
+        cmd(wrapper, "cost"),
+        cmd(wrapper, "scratchpad"),
+    ];
+    if have_python {
+        // Release the intent on the way out; otherwise a finished session keeps
+        // claiming its paths until the presence TTL expires.
+        session_end.push(coord(local_bin, "clear"));
+    }
+    map.insert("SessionEnd".to_string(), event(session_end));
     serde_json::Value::Object(map)
 }
 

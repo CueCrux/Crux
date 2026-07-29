@@ -203,8 +203,12 @@ def summarize_work(work: dict):
 def live_sessions(coord: dict):
     """(count_live, sessions, cwd_overlap_path). Live = heartbeat <5min when a
     last_seen timestamp is present, else counted anyway (spec: else count all)."""
+    # None (not 0) when the coord call failed: "we could not ask" and "we asked
+    # and nobody is there" are different facts, and collapsing them to 0 reports
+    # an empty board with full confidence while peers are live. Callers must
+    # render the None case as unavailable rather than as a count.
     if not isinstance(coord, dict) or "_error" in coord:
-        return 0, [], None
+        return None, [], None
     sess = coord.get("active_sessions") or []
     now = coord.get("now_unix_ms")
     live = 0
@@ -284,7 +288,8 @@ def build(data: dict, card_mode: str) -> dict:
             lines.append((90, f"update: binary behind by {behind} — rebuild/redeploy before relying on newest features"))
         else:
             lines.append((90, f"update: src-clone behind by {behind}; binary drift unverified — check /v1/version commit before deploy-gating"))
-    lines.append((92, f"attention: {need_you} need you · {live_n} running · {review_n} awaiting review"))
+    running = "?" if live_n is None else live_n
+    lines.append((92, f"attention: {need_you} need you · {running} running · {review_n} awaiting review"))
     lines.append((60, f"agent={agent}"))
     if counts:
         resume = ", ".join(f"{_slug(w.get('id', '?'))}@{w.get('current_milestone', '?')}" for w in top)
@@ -352,8 +357,11 @@ def build(data: dict, card_mode: str) -> dict:
             console = (os.environ.get("CRUX_CONSOLE_BASE") or load_env_file().get("CRUX_CONSOLE_BASE") or "").rstrip("/")
             board = f"{planned} planned · {wip} active · {done30} done/30d"
             card_lines.append(f"[board]({console}#/work): {board}" if console else f"board: {board}")
-        ov = f"⚠ overlap {cwd_overlap}" if cwd_overlap else "no overlaps"
-        card_lines.append(f"live: {live_n} sessions · {ov}")
+        if live_n is None:
+            card_lines.append("live: ⚠ coord unavailable — peer sessions NOT checked")
+        else:
+            ov = f"⚠ overlap {cwd_overlap}" if cwd_overlap else "no overlaps"
+            card_lines.append(f"live: {live_n} sessions · {ov}")
         card = ("\n---\nOpen your first reply with exactly this block, then "
                 "continue normally:\n" + "\n".join(card_lines[:7]))
     else:
