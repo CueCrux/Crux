@@ -419,6 +419,71 @@
     ] }];
   }
 
+  // Work order — the ranked ready-list. The kanban next door shows *everything*
+  // grouped by state; this shows only open work, in the order the daemon
+  // recommends working through it (unblocked first, in_progress before planned,
+  // foundations before dependents). Fed by /v1/work?source=all&ranked=1, so the
+  // ordering is the daemon's `rank_open`, never re-derived here — one
+  // implementation, no drift.
+  function buildWorkOrder(res) {
+    var sub = 'recommended order · /v1/work?source=all&ranked=1';
+    if (!res.ok || !res.data) {
+      return [{ h: 'Work order', sub: sub, wide: true,
+        controls: degraded(res.status, 'Work order unavailable — GET /v1/work?source=all&ranked=1') }];
+    }
+    var items = arr(res.data.work);
+    if (!items.length) {
+      return [{ h: 'Work order', sub: sub, wide: true, controls: [info('none', 'no open work — the board is clear')] }];
+    }
+
+    // A cycle makes "foundations first" undefined for the plans involved. Surface
+    // it above the list rather than letting the order silently lie.
+    var head = [];
+    var cyc = arr(res.data.dependency_cycles);
+    if (cyc.length) {
+      head.push({ t: 'exp', label: '⚠ dependency cycle — ' + cyc.length + ' plan' + (cyc.length === 1 ? '' : 's'),
+        sub: 'these plans declare Depends on each other; their relative order is undefined',
+        badge: 'cycle', controls: cyc.map(function (s) { return info(s, 'in cycle'); }) });
+    }
+
+    var ready = items.filter(function (w) { return !arr(w.blocked_by).length; });
+    var blocked = items.filter(function (w) { return arr(w.blocked_by).length; });
+
+    function row(w, n) {
+      var slug = planSlug(w);
+      var done = w.milestones_done || 0, total = w.milestones_total || 0;
+      var bits = [w.state];
+      if (w.current_milestone) { bits.push(w.current_milestone); }
+      if (total) { bits.push(done + '/' + total); }
+      if (w.stale) { bits.push('stale'); }
+      var blockers = arr(w.blocked_by);
+      if (blockers.length) { bits.push('blocked by ' + blockers.join(', ')); }
+      return { t: 'exp', label: n + '. ' + slug, sub: bits.join(' · '),
+        badge: blockers.length ? 'blocked' : (w.state === 'in_progress' ? 'active' : 'ready'),
+        controls: [
+          info('state', w.state),
+          info('milestone', w.current_milestone || '—'),
+          info('progress', total ? (done + '/' + total) : '—'),
+          info('blocked by', blockers.length ? blockers.join(', ') : 'nothing — ready to start'),
+          graphLink('work', w.id)
+        ] };
+    }
+
+    var n = 0;
+    var readyRows = ready.map(function (w) { n += 1; return row(w, n); });
+    var blockedRows = blocked.map(function (w) { n += 1; return row(w, n); });
+
+    var sections = head.concat([{ h: 'Ready now', wide: true,
+      sub: ready.length + ' unblocked · start at the top',
+      controls: [{ t: 'search', ph: 'Filter plans…' }].concat(readyRows.length ? readyRows : [info('none', 'everything open is blocked')]) }]);
+    if (blockedRows.length) {
+      sections.push({ h: 'Blocked', wide: true,
+        sub: blocked.length + ' waiting on an open dependency',
+        controls: blockedRows });
+    }
+    return sections;
+  }
+
   function buildGates(res) {
     if (!res.ok || !res.data) { return [{ h: 'Awaiting approval', wide: true, controls: [{ t: 'search', ph: 'Filter pending gates…' }].concat(degraded(res.status, 'Gates unavailable — GET /v1/work/gate/pending')) }]; }
     var pend = arr(res.data.pending).filter(function (p) { return (p.status || 'pending') === 'pending'; });
@@ -1461,6 +1526,9 @@
     'cx-punchcards': page('cx-punchcards', 'overwatch', 'Punchcards', 'advisory path leases grouped by session · /v1/punchcards', { load: { endpoint: '/v1/punchcards', build: buildPunchcards } }),
     // ---- Work ------------------------------------------------------------
     'cx-work': page('cx-work', 'work', 'ExecPlans', 'read-time projection over .agent/execplans/*.md · /v1/work', { load: { endpoint: '/v1/work?source=all', build: buildWork } }),
+    // The ranked ready-list. Sits next to the kanban: that one answers "what is
+    // there", this one answers "what do I do next".
+    'cx-work-order': page('cx-work-order', 'work', 'Work order', 'open work in recommended order · /v1/work?ranked=1', { load: { endpoint: '/v1/work?source=all&ranked=1', build: buildWorkOrder } }),
     // Activity — the human-lane rolling activity log (ported from /console/activity
     // into the v2 theme). Custom-rendered by render.js renderActivityLog (see the
     // renderPage id switch); no section build.
