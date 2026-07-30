@@ -4026,6 +4026,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Three tests that asserted things the machine does not guarantee.** Each
+  failed CI on an unrelated PR and passed on a re-run of the identical commit;
+  two of them gate required checks, so they cost merges rather than just noise.
+  - `envelope_build_latency_under_2ms_for_10_facts` (`crux-mcp`) asserted a
+    wall-clock bound — the only one in the workspace. On a shared runner that
+    measures how busy the machine is, not how fast the code is. The figure is
+    still measured and printed; the assertion is gone, and the test is renamed
+    `envelope_build_covers_all_ten_facts` after the check that carries content
+    (`memories_used.len() == 10`). Raising the constant was rejected: it trades a
+    frequent flake for a rarer one and keeps a load-dependent test.
+  - `allowed_origins_reads_the_env_var` (`corecruxd`) round-tripped through
+    `set_var`/`getenv` and read back the built-in defaults instead of the value
+    it had just set — *while holding the module's `env_lock()`*. The mutex was
+    never the problem: `setenv` can reallocate the environment block, and a
+    concurrent `getenv` anywhere in this 2000-plus-test binary may then read a
+    stale pointer, which no Rust-level lock can fence (hence `set_var` being
+    `unsafe` from the 2024 edition). It now parses via `resolve_allowed_origins`
+    directly, matching its five neighbours, and removes the last `set_var` in
+    the file.
+  - `pick_free_port_is_bindable` (`crux-shell-lifecycle`) asserted that a port
+    picked by binding `:0` and dropping the listener is immediately re-bindable.
+    Nothing promises that — sibling tests binding `:0` in parallel can take it
+    in the gap. It now retries a bounded number of times, so only a genuinely
+    broken helper fails.
+
 - **The desktop shell no longer opens stray console windows on Windows.** Two
   spawn sites, both console-subsystem binaries launched from a GUI-subsystem app
   (`windows_subsystem = "windows"`) that has no console to inherit — so Windows
