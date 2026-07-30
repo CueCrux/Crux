@@ -1,9 +1,20 @@
+# Copyright (c) 2026 CueCrux Ltd.
+# Licensed under the Apache License, Version 2.0.
+
 # Desktop shell (Tauri v2) — build gates for `shells/desktop/**`.
 #
 # The desktop app pulls the webkit2gtk / GTK stack and cannot build on the
-# headless CueCrux CI *self-hosted* runners or the WSL dev box, so this workflow
-# runs on GitHub-hosted `ubuntu-latest` and installs the Tauri v2 Linux
-# prerequisites itself. No release/deploy steps.
+# headless CueCrux CI *self-hosted* runners or the WSL dev box, so the Linux
+# jobs here run on GitHub-hosted `ubuntu-latest` and install the Tauri v2 Linux
+# prerequisites themselves. No release/deploy steps.
+#
+# One job is the exception: `desktop GUI smoke (windows, interactive session)`
+# runs on a self-hosted Windows runner that executes inside a real logged-on
+# desktop (labels `self-hosted, windows-gui`). It exists because compiling and
+# bundling cannot answer "does the app actually start" — a Tauri/WebView2 window
+# cannot be created in a headless or Session 0 context at all, so launch,
+# sidecar spawn, and installer behaviour are only observable on a box with a
+# desktop. See `docs/self-hosted-runner.md` for how that runner is provisioned.
 #
 # `desktop app compile gate (linux)` is a REQUIRED status check. To be requirable
 # without deadlocking the merge queue, the workflow must ALWAYS trigger (so the
@@ -182,5 +193,248 @@ jobs:
         with:
           name: crux-desktop-shell-linux
           path: |
+            shells/desktop/app/target/release/bundle/**
+          if-no-files-found: warn
+
+  # 4) Windows GUI smoke: bundle the MSI, install it, launch the installed app,
+  #    and assert the things only a real desktop can show. Runs on the
+  #    operator-owned interactive runner (`self-hosted, windows-gui`).
+  #
+  #    Non-blocking on purpose. It depends on one VM, so an offline or busy box
+  #    must not gate the merge queue — but unlike the Linux jobs it can catch a
+  #    Windows-only regression (dbb3897 fixed three that no Linux runner could
+  #    see, and noted there was no Windows job to catch the next one).
+  windows-gui-smoke:
+    name: desktop GUI smoke (windows, interactive session)
+    needs: changes
+    if: needs.changes.outputs.desktop == 'true'
+    runs-on: [self-hosted, windows-gui]
+    continue-on-error: true
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v7
+
+      # Fail loudly in 5 seconds rather than 40 minutes later at app launch.
+      # Session 0 is the failure this whole runner exists to avoid: a runner
+      # installed as a Windows service, or registered with
+      # `Register-ScheduledTask -User/-Password` (which forces
+      # LogonType=Password), runs where there is no desktop and WebView2 cannot
+      # create a window.
+      - name: preflight — interactive desktop + Windows build toolchain
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\windows-gui-evidence" | Out-Null
+          $fail = @()
+
+          $sid = (Get-Process -Id $PID).SessionId
+          Write-Host "runner session id : $sid"
+          if ($sid -eq 0) {
+            $fail += 'runner is in Session 0 (no desktop). It must run as a scheduled task with LogonType=Interactive under an autologon user, not as a Windows service.'
+          }
+          $explorer = Get-Process explorer -ErrorAction SilentlyContinue
+          Write-Host "explorer.exe      : $(if ($explorer) { 'session ' + $explorer[0].SessionId } else { 'NOT RUNNING' })"
+          if (-not $explorer) {
+            $fail += 'explorer.exe is not running: this is a Server Core image, or no user is logged on. Server Core cannot be converted to Desktop Experience.'
+          }
+
+          Add-Type -AssemblyName System.Windows.Forms
+          $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+          Write-Host "virtual screen    : $($vs.Width)x$($vs.Height)"
+          if ($vs.Width -le 0 -or $vs.Height -le 0) { $fail += 'no display surface available' }
+
+          foreach ($t in 'cargo', 'rustc', 'git') {
+            $c = Get-Command $t -ErrorAction SilentlyContinue
+            Write-Host "$($t.PadRight(18)): $(if ($c) { $c.Source } else { 'MISSING' })"
+            if (-not $c) { $fail += "$t is not on PATH" }
+          }
+          if (-not (Get-Command cargo-tauri -ErrorAction SilentlyContinue)) {
+            $fail += 'cargo-tauri is not on PATH (cargo install tauri-cli --version "^2.0" --locked)'
+          }
+          $link = Get-ChildItem 'C:\Program Files*\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\x64\link.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+          Write-Host "MSVC link.exe     : $(if ($link) { $link.FullName } else { 'MISSING' })"
+          if (-not $link) { $fail += 'MSVC link.exe not found — install Visual Studio Build Tools 2022 with the VCTools workload' }
+
+          $wvKeys = @(
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}',
+            'HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+          )
+          $wv = $null
+          foreach ($k in $wvKeys) { if (-not $wv) { $wv = (Get-ItemProperty $k -ErrorAction SilentlyContinue).pv } }
+          Write-Host "WebView2 runtime  : $(if ($wv) { $wv } else { 'NOT INSTALLED' })"
+          if (-not $wv) { $fail += 'the WebView2 Evergreen runtime is not installed' }
+
+          if ($fail.Count) {
+            foreach ($f in $fail) { Write-Host "::error::$f" }
+            Write-Host "::error::Provision this runner with scripts/provision-windows-gui-runner.ps1 — see docs/self-hosted-runner.md."
+            exit 1
+          }
+          Write-Host 'preflight OK: interactive desktop with a full Windows build toolchain'
+
+      # Icons are generated, not committed — see the app-compile job for why the
+      # proc macro needs them present before any cargo build.
+      - name: generate icon set from the CueCrux arc-loop art
+        run: cargo tauri icon crates/corecruxd/console/assets/CueCrux-Arc-Loop.png --output shells/desktop/app/icons
+
+      - name: build corecruxd sidecar (release, CPU-only)
+        run: cargo build --locked --release --bin corecruxd
+
+      # Tauri resolves the sidecar as `corecruxd.exe` beside the app binary
+      # (resolve_sidecar_binary in shells/desktop/app/src/main.rs), and strips
+      # the target triple at bundle time. The staged name must carry both the
+      # triple and the .exe suffix or the bundler will not find it.
+      - name: stage sidecar into the externalBin slot
+        run: |
+          $triple = ((rustc -vV) | Select-String '^host:').ToString().Split(' ')[1]
+          Write-Host "host triple: $triple"
+          New-Item -ItemType Directory -Force -Path 'shells\desktop\app\binaries' | Out-Null
+          Copy-Item 'target\release\corecruxd.exe' "shells\desktop\app\binaries\corecruxd-$triple.exe" -Force
+          Get-ChildItem 'shells\desktop\app\binaries' | Format-Table Name, Length -AutoSize
+
+      - name: bundle (cargo tauri build)
+        working-directory: shells/desktop/app
+        run: cargo tauri build
+
+      - name: install the MSI (per-machine, silent)
+        run: |
+          $msi = Get-ChildItem 'shells\desktop\app\target\release\bundle\msi\*.msi' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $msi) {
+            Write-Host '::error::cargo tauri build produced no .msi under target/release/bundle/msi'
+            exit 1
+          }
+          Write-Host "installing $($msi.Name) ($([math]::Round($msi.Length/1MB,1)) MB)"
+          $log = "$env:GITHUB_WORKSPACE\windows-gui-evidence\msi-install.log"
+          $p = Start-Process msiexec.exe -ArgumentList '/i', "`"$($msi.FullName)`"", '/qn', '/norestart', '/l*v', "`"$log`"" -Wait -PassThru
+          Write-Host "msiexec exit: $($p.ExitCode)"
+          # 0 = installed, 3010 = installed, reboot queued
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            Write-Host "::error::MSI install failed with exit $($p.ExitCode) — see the msi-install.log artifact"
+            exit 1
+          }
+          $exe = Get-ChildItem 'C:\Program Files\Crux\Crux.exe', 'C:\Program Files (x86)\Crux\Crux.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) {
+            $exe = Get-ChildItem 'C:\Program Files' -Recurse -Depth 2 -Filter 'Crux.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          if (-not $exe) {
+            Write-Host '::error::the MSI reported success but no installed Crux.exe was found'
+            exit 1
+          }
+          $dir = $exe.DirectoryName
+          Write-Host "installed to: $dir"
+          Get-ChildItem $dir | Format-Table Name, Length -AutoSize
+          # The bundled sidecar must ship beside the app, de-tripled.
+          if (-not (Test-Path (Join-Path $dir 'corecruxd.exe'))) {
+            Write-Host '::error::corecruxd.exe is missing from the install dir — the externalBin sidecar was not bundled'
+            exit 1
+          }
+          "$($exe.FullName)" | Out-File "$env:GITHUB_WORKSPACE\windows-gui-evidence\installed-exe.txt" -Encoding ascii
+          "$($msi.FullName)" | Out-File "$env:GITHUB_WORKSPACE\windows-gui-evidence\msi-path.txt" -Encoding ascii
+
+      # The actual GUI assertions. Evidence (screenshot + process table) is
+      # written before any assertion can fail, so a red run still uploads the
+      # picture of what happened.
+      - name: launch the installed app and observe the desktop
+        run: |
+          $ev  = "$env:GITHUB_WORKSPACE\windows-gui-evidence"
+          $exe = (Get-Content "$ev\installed-exe.txt" -Raw).Trim()
+          Write-Host "launching $exe"
+          $app = Start-Process $exe -PassThru
+
+          $window = $null; $webview = @(); $sidecar = @()
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 3
+            $p = Get-Process -Id $app.Id -ErrorAction SilentlyContinue
+            if (-not $p) { break }
+            $p.Refresh()
+            if (-not $window -and $p.MainWindowHandle -ne 0) { $window = $p.MainWindowTitle }
+            $webview = @(Get-Process msedgewebview2 -ErrorAction SilentlyContinue)
+            $sidecar = @(Get-Process corecruxd -ErrorAction SilentlyContinue)
+            if ($window -and $webview.Count -and $sidecar.Count) { break }
+          }
+
+          # --- evidence first ---
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -AssemblyName System.Drawing
+          $vs  = [System.Windows.Forms.SystemInformation]::VirtualScreen
+          $bmp = New-Object System.Drawing.Bitmap $vs.Width, $vs.Height
+          $g   = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.CopyFromScreen($vs.Location, [System.Drawing.Point]::Empty, $vs.Size)
+          $bmp.Save("$ev\desktop.png", [System.Drawing.Imaging.ImageFormat]::Png)
+          $g.Dispose(); $bmp.Dispose()
+          Get-Process | Where-Object { $_.Name -match 'Crux|corecruxd|msedgewebview2' } |
+            Select-Object Name, Id, SessionId, MainWindowTitle |
+            Format-Table -AutoSize | Out-File "$ev\processes.txt" -Encoding utf8
+          Get-Content "$ev\processes.txt"
+
+          # --- assertions ---
+          $alive = [bool](Get-Process -Id $app.Id -ErrorAction SilentlyContinue)
+          $fail = @()
+          Write-Host "app process alive     : $alive"
+          if (-not $alive) { $fail += 'the app exited on its own after launch' }
+          Write-Host "main window title     : $(if ($window) { $window } else { 'NONE' })"
+          if (-not $window) { $fail += 'no top-level window appeared (setup_shell builds the main window with visible:true)' }
+          Write-Host "msedgewebview2 procs  : $($webview.Count)"
+          if (-not $webview.Count) { $fail += 'no msedgewebview2 process — the WebView2 host never started, so nothing rendered' }
+          Write-Host "corecruxd sidecar     : $($sidecar.Count)"
+          if (-not $sidecar.Count) { $fail += 'the bundled corecruxd sidecar was never spawned (default profile is bundled on a fresh box)' }
+
+          if ($fail.Count) {
+            foreach ($f in $fail) { Write-Host "::error::$f" }
+            exit 1
+          }
+          Write-Host 'GUI smoke OK: window created, WebView2 rendering, bundled sidecar running'
+
+      # The lifecycle claim: a graceful close must reap the shell-owned sidecar
+      # (on_window_event -> shutdown_owned_resources). Killing the process would
+      # legitimately orphan it, so only assert the reap when the close was clean.
+      - name: graceful close reaps the bundled sidecar
+        run: |
+          $proc = Get-Process Crux -ErrorAction SilentlyContinue
+          if (-not $proc) {
+            Write-Host '::warning::the app was already gone; nothing to close'
+            exit 0
+          }
+          $closed = $proc.CloseMainWindow()
+          Write-Host "CloseMainWindow sent: $closed"
+          $gone = $proc.WaitForExit(30000)
+          Write-Host "app exited cleanly  : $gone"
+          if (-not $gone) {
+            Write-Host '::warning::the app did not exit within 30s of WM_CLOSE; killing it, so the sidecar reap is not asserted'
+            $proc.Kill()
+            exit 0
+          }
+          Start-Sleep -Seconds 5
+          $orphans = @(Get-Process corecruxd -ErrorAction SilentlyContinue)
+          Write-Host "corecruxd after exit: $($orphans.Count)"
+          if ($orphans.Count) {
+            Write-Host '::error::the bundled corecruxd survived a graceful app exit — the lifecycle supervisor leaked a sidecar'
+            exit 1
+          }
+          Write-Host 'lifecycle OK: graceful close reaped the bundled sidecar'
+
+      - name: uninstall and clean up
+        if: always()
+        run: |
+          Get-Process Crux, corecruxd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          $msiFile = "$env:GITHUB_WORKSPACE\windows-gui-evidence\msi-path.txt"
+          if (Test-Path $msiFile) {
+            $msi = (Get-Content $msiFile -Raw).Trim()
+            if ($msi -and (Test-Path $msi)) {
+              $p = Start-Process msiexec.exe -ArgumentList '/x', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
+              Write-Host "uninstall exit: $($p.ExitCode)"
+            }
+          }
+          if (Test-Path 'C:\Program Files\Crux') {
+            Write-Host '::warning::C:\Program Files\Crux still exists after uninstall'
+          }
+
+      - name: upload GUI smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: crux-desktop-windows-gui-smoke
+          path: |
+            windows-gui-evidence/**
             shells/desktop/app/target/release/bundle/**
           if-no-files-found: warn

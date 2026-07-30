@@ -4003,6 +4003,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   repository" button). Under Apache-2.0 citation is appreciated but not a
   licence condition.
 
+- **A Windows GUI smoke lane for the desktop shell.** `desktop-shell.yml` gains
+  `desktop GUI smoke (windows, interactive session)`, running on a self-hosted
+  runner that executes inside a real logged-on desktop
+  (`[self-hosted, windows-gui]`). It bundles the MSI, installs it per-machine,
+  launches the installed app, and asserts what only a desktop can show: a window
+  appears, an `msedgewebview2` host actually starts, the bundled `corecruxd`
+  sidecar is spawned from the `externalBin` slot, and a graceful close reaps that
+  sidecar. A desktop screenshot uploads on every run, including failures.
+  Non-blocking — it depends on a single operator-owned box, so an offline runner
+  must not gate the merge queue.
+
+  This closes the gap the native-Windows build fix left open: that change noted
+  there was "no Windows job to catch the next one" of ~49 `#[cfg(unix)]` sites.
+  Compiling was never the hard part — a Tauri/WebView2 window cannot be created
+  in a headless or Session 0 context at all, so app launch was unobservable on
+  every existing runner. `scripts/provision-windows-gui-runner.ps1` provisions
+  such a box and refuses to run where a GUI cannot exist; `docs/self-hosted-runner.md`
+  records why Server Core and Session 0 are each disqualifying, and what the lane
+  deliberately does not cover (reboot re-attach, the Defender first-bind prompt,
+  WSL2 parity with a developer box).
+
 ### Fixed
 
 - **A cold `cargo build` now completes on native Windows.** Three unrelated
