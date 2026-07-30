@@ -1677,7 +1677,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // active, zero tenant_stamp_shadow_* warnings) apart from a window that
         // never ran (flag typo'd / not applied). Shadow is silent on the good
         // path, so without this the silence is ambiguous.
-        tenant_stamp_mode = crate::auth::TenantStampMode::from_env().as_str(),
+        tenant_stamp_mode = auth.tenant_stamp_mode().as_str(),
         "corecruxd starting"
     );
 

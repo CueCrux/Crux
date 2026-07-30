@@ -119,6 +119,7 @@ type InitialJwks = (
 #[derive(Clone)]
 pub struct Authz {
     mode: AuthMode,
+    tenant_stamp_mode: TenantStampMode,
     jwt_hs256: Option<JwtHs256Config>,
     jwt_jwks: Option<JwtJwksConfig>,
     /// Opt-in: under a JWT mode, also accept a registered MCP agent token
@@ -265,9 +266,11 @@ impl std::fmt::Debug for Authz {
 
 impl Authz {
     pub fn from_env(mode: AuthMode) -> Result<Self, String> {
+        let tenant_stamp_mode = TenantStampMode::from_env_for_auth(mode)?;
         match mode {
             AuthMode::Off | AuthMode::DevScopes => Ok(Self {
                 mode,
+                tenant_stamp_mode,
                 jwt_hs256: None,
                 jwt_jwks: None,
                 agent_http: None,
@@ -280,6 +283,7 @@ impl Authz {
                 let audience = std::env::var("CORECRUXD_JWT_AUD").ok();
                 Ok(Self {
                     mode,
+                    tenant_stamp_mode,
                     jwt_hs256: Some(JwtHs256Config {
                         secret,
                         issuer,
@@ -325,6 +329,7 @@ impl Authz {
 
                 Ok(Self {
                     mode,
+                    tenant_stamp_mode,
                     jwt_hs256: None,
                     jwt_jwks: Some(JwtJwksConfig {
                         issuer: resolved_issuer,
@@ -350,10 +355,15 @@ impl Authz {
         self.mode
     }
 
+    pub(crate) fn tenant_stamp_mode(&self) -> TenantStampMode {
+        self.tenant_stamp_mode
+    }
+
     #[cfg(test)]
     pub(crate) fn test_hs256(secret: &[u8], issuer: &str, audience: &str) -> Self {
         Self {
             mode: AuthMode::JwtHs256,
+            tenant_stamp_mode: TenantStampMode::On,
             jwt_hs256: Some(JwtHs256Config {
                 secret: secret.to_vec(),
                 issuer: Some(issuer.to_string()),
@@ -989,6 +999,7 @@ pub struct HttpScopeContext {
     pub scopes: Vec<String>,
     pub passport_id: Option<String>,
     auth_enforced: bool,
+    tenant_stamp_mode: TenantStampMode,
     /// Auth-off and DevScopes are explicit local-development modes. They can
     /// carry caller assertions, but those assertions are never verified
     /// principals and must be durably labelled as such.
@@ -1010,16 +1021,15 @@ pub struct HttpScopeContext {
     write_tenant_selector: Option<String>,
 }
 
-/// Enforcement posture for write-context tenant stamping (OD-37 / audit-v2 M1),
-/// parsed from `CORECRUXD_TENANT_WRITE_STAMP`. Mirrors the `RouteAuthMode` /
-/// `RedactMode` off|shadow|on ladder already used elsewhere in the daemon.
+/// Enforcement posture for HTTP fact-backed tenant stamping (OD-37 / M-08).
 ///
-/// Default **Off** (unlike `RouteAuthMode`, whose default is Shadow) because the
-/// shipped v0.5.43 contract is "stamping is dark until deliberately enabled".
+/// JWT modes default to `On`. `Off` and `Shadow` are deliberate compatibility
+/// postures for migrating historical rows from the shared `default` tenant.
+/// Auth-off and development-scope modes remain local/shared by default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TenantStampMode {
     /// Every write stamps `default`, every read resolves `default` — byte-identical
-    /// to pre-M1 behaviour. DEFAULT.
+    /// to pre-M16 behaviour. Explicit legacy compatibility only under JWT auth.
     Off,
     /// Resolve the tenant and **log what would happen**, but still stamp `default`
     /// and still read `default`. Observation only — zero behaviour change. Use this
@@ -1030,17 +1040,24 @@ pub(crate) enum TenantStampMode {
 }
 
 impl TenantStampMode {
-    pub(crate) fn from_env() -> Self {
-        match std::env::var("CORECRUXD_TENANT_WRITE_STAMP")
-            .ok()
-            .map(|v| v.trim().to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("1") | Some("true") | Some("on") | Some("enforce") => Self::On,
-            Some("shadow") | Some("audit") => Self::Shadow,
-            // Anything else (unset, "0", "off", junk) → Off. Fail-safe towards the
-            // shipped behaviour, never towards silently stamping real tenants.
-            _ => Self::Off,
+    fn from_env_for_auth(auth_mode: AuthMode) -> Result<Self, String> {
+        if !matches!(auth_mode, AuthMode::JwtHs256 | AuthMode::JwtJwks) {
+            return Ok(Self::Off);
+        }
+        let raw = match std::env::var("CORECRUXD_TENANT_WRITE_STAMP") {
+            Ok(raw) => raw,
+            Err(std::env::VarError::NotPresent) => return Ok(Self::On),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err("CORECRUXD_TENANT_WRITE_STAMP must be valid UTF-8".to_string());
+            }
+        };
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "on" | "enforce" => Ok(Self::On),
+            "shadow" | "audit" => Ok(Self::Shadow),
+            "0" | "false" | "off" | "legacy" => Ok(Self::Off),
+            _ => {
+                Err("invalid CORECRUXD_TENANT_WRITE_STAMP; valid values: on, shadow, off (JWT default: on)".to_string())
+            }
         }
     }
 
@@ -1059,10 +1076,10 @@ impl TenantStampMode {
 fn resolve_write_tenant_on(tenants: &TenantAllow, selector: Option<&str>) -> Result<Option<String>, ProblemResponse> {
     let selector = selector.map(str::trim).filter(|s| !s.is_empty());
     match tenants {
-        // No tenant claim → single-tenant deployment → default (backward-compat hinge).
+        // General authority resolution retains the local/agent compatibility
+        // default. Fact-backed HTTP storage applies its stricter JWT policy in
+        // `resolve_implicit_fact_tenant_on` below.
         TenantAllow::Missing => Ok(None),
-        // Wildcard/admin token: a selector picks the target tenant; absent → default
-        // (legacy admin writes keep landing `default`).
         TenantAllow::Any => Ok(selector.map(str::to_string)),
         TenantAllow::Only(set) => match selector {
             Some(sel) => {
@@ -1070,7 +1087,7 @@ fn resolve_write_tenant_on(tenants: &TenantAllow, selector: Option<&str>) -> Res
                     Ok(Some(sel.to_string()))
                 } else {
                     Err(ProblemResponse(
-                        ProblemDetails::forbidden("write tenant not allowed by token")
+                        ProblemDetails::forbidden("tenant not allowed by token")
                             .with_extensions(serde_json::json!({ "code": "TENANT_FORBIDDEN", "tenantId": sel })),
                     ))
                 }
@@ -1082,12 +1099,36 @@ fn resolve_write_tenant_on(tenants: &TenantAllow, selector: Option<&str>) -> Res
                     Ok(set.iter().next().cloned())
                 } else {
                     Err(ProblemResponse(
-                        ProblemDetails::forbidden("multi-tenant token must supply x-corecrux-tenant-id on write")
+                        ProblemDetails::forbidden("multi-tenant token must supply x-corecrux-tenant-id")
                             .with_extensions(serde_json::json!({ "code": "TENANT_SELECTOR_REQUIRED" })),
                     ))
                 }
             }
         },
+    }
+}
+
+/// Secure-default resolution for M16's tenant-implicit HTTP fact surfaces.
+///
+/// Unlike the general authority resolver above, authenticated fact traffic may
+/// never infer `default` from a missing claim or wildcard grant.
+#[allow(clippy::result_large_err)]
+fn resolve_implicit_fact_tenant_on(
+    tenants: &TenantAllow,
+    selector: Option<&str>,
+) -> Result<Option<String>, ProblemResponse> {
+    let selector = selector.map(str::trim).filter(|value| !value.is_empty());
+    match tenants {
+        TenantAllow::Missing => Err(ProblemResponse(
+            ProblemDetails::forbidden("token is missing a tenant claim").with_extensions(serde_json::json!({
+                "code": "TENANT_CLAIM_MISSING",
+            })),
+        )),
+        TenantAllow::Any if selector.is_none() => Err(ProblemResponse(
+            ProblemDetails::forbidden("wildcard tenant token must select one tenant")
+                .with_extensions(serde_json::json!({ "code": "TENANT_SELECTOR_REQUIRED" })),
+        )),
+        _ => resolve_write_tenant_on(tenants, selector),
     }
 }
 
@@ -1099,50 +1140,33 @@ fn resolve_write_tenant_on(tenants: &TenantAllow, selector: Option<&str>) -> Res
 /// It is deliberately SILENT when `On` would also have produced `default` — so a
 /// window with zero `tenant_stamp_shadow_*` lines proves the flip is a no-op.
 #[allow(clippy::result_large_err)]
-fn resolve_write_tenant_flagged(
+fn resolve_implicit_fact_tenant_flagged(
     tenants: &TenantAllow,
     selector: Option<&str>,
     mode: TenantStampMode,
 ) -> Result<Option<String>, ProblemResponse> {
     match mode {
         TenantStampMode::Off => Ok(None),
-        TenantStampMode::On => resolve_write_tenant_on(tenants, selector),
+        TenantStampMode::On => resolve_implicit_fact_tenant_on(tenants, selector),
         TenantStampMode::Shadow => {
-            match resolve_write_tenant_on(tenants, selector) {
+            match resolve_implicit_fact_tenant_on(tenants, selector) {
                 // Would orphan: this write would land under a non-default tenant,
                 // and reads would move with it.
                 Ok(Some(would_stamp)) => tracing::warn!(
                     would_stamp = %would_stamp,
-                    "tenant_stamp_shadow_would_stamp: enabling CORECRUXD_TENANT_WRITE_STAMP=1 would stamp a NON-default tenant here"
+                    "tenant_stamp_shadow_would_stamp: enabling CORECRUXD_TENANT_WRITE_STAMP=on would use a NON-default tenant here"
                 ),
                 // Would break: this caller would start getting a 4xx.
                 Err(problem) => tracing::warn!(
                     status = problem.0.status,
                     detail = %problem.0.detail.as_deref().unwrap_or(""),
-                    "tenant_stamp_shadow_would_reject: enabling CORECRUXD_TENANT_WRITE_STAMP=1 would REJECT this write"
+                    "tenant_stamp_shadow_would_reject: enabling CORECRUXD_TENANT_WRITE_STAMP=on would REJECT this request"
                 ),
                 // Would be `default` anyway — the quiet, safe case. No signal.
                 Ok(None) => {}
             }
             Ok(None)
         }
-    }
-}
-
-/// Resolve the tenant a reader is scoped to. `None` = default. Kept in lockstep
-/// with the write resolver so a writer and reader on the same single-tenant token
-/// agree. Multi-tenant / wildcard tokens read `default` here (their concrete-tenant
-/// reads go through the query path's `tenant_id` body selector or the admin bypass).
-///
-/// `Shadow` reads `default` — shadow must not move reads, or it would not be
-/// observation-only.
-fn resolve_read_tenant_flagged(tenants: &TenantAllow, mode: TenantStampMode) -> Option<String> {
-    if mode != TenantStampMode::On {
-        return None;
-    }
-    match tenants {
-        TenantAllow::Only(set) if set.len() == 1 => set.iter().next().cloned(),
-        _ => None,
     }
 }
 
@@ -1235,16 +1259,65 @@ impl HttpScopeContext {
     /// Tenant to stamp on an HTTP write (OD-37). `Ok(None)` → default tenant.
     #[allow(clippy::result_large_err)]
     pub(crate) fn resolve_write_tenant(&self) -> Result<Option<String>, ProblemResponse> {
-        resolve_write_tenant_flagged(
+        resolve_implicit_fact_tenant_flagged(
             &self.tenants,
             self.write_tenant_selector.as_deref(),
-            TenantStampMode::from_env(),
+            self.tenant_stamp_mode,
         )
     }
 
-    /// Tenant an HTTP read is scoped to. `None` → default tenant.
-    pub(crate) fn resolve_read_tenant(&self) -> Option<String> {
-        resolve_read_tenant_flagged(&self.tenants, TenantStampMode::from_env())
+    /// Tenant an HTTP fact-backed read is scoped to. `None` → default tenant.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn resolve_read_tenant(&self) -> Result<Option<String>, ProblemResponse> {
+        resolve_implicit_fact_tenant_flagged(
+            &self.tenants,
+            self.write_tenant_selector.as_deref(),
+            self.tenant_stamp_mode,
+        )
+    }
+
+    /// Resolve an explicit fact-backed route tenant while retaining the
+    /// operator-selected legacy shared-default posture.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn resolve_fact_tenant(&self, requested: Option<&str>) -> Result<String, ProblemResponse> {
+        match self.tenant_stamp_mode {
+            TenantStampMode::On => self.resolve_fact_tenant_on(requested),
+            TenantStampMode::Off => Ok("default".to_string()),
+            TenantStampMode::Shadow => {
+                match self.resolve_fact_tenant_on(requested) {
+                    Ok(ref tenant) if tenant != "default" => tracing::warn!(
+                        would_stamp = %tenant,
+                        "tenant_stamp_shadow_would_stamp: enabling tenant stamping would use a non-default tenant"
+                    ),
+                    Err(ref problem) => tracing::warn!(
+                        status = problem.0.status,
+                        detail = %problem.0.detail.as_deref().unwrap_or(""),
+                        "tenant_stamp_shadow_would_reject: enabling tenant stamping would reject this request"
+                    ),
+                    Ok(_) => {}
+                }
+                Ok("default".to_string())
+            }
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn resolve_fact_tenant_on(&self, requested: Option<&str>) -> Result<String, ProblemResponse> {
+        let resolved = self.resolve_authorized_tenant(requested)?;
+        let has_selector = requested.map(str::trim).filter(|value| !value.is_empty()).is_some()
+            || self
+                .write_tenant_selector
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_some();
+        if matches!(self.tenants, TenantAllow::Any) && !has_selector {
+            return Err(ProblemResponse(
+                ProblemDetails::forbidden("wildcard tenant token must select one tenant")
+                    .with_extensions(serde_json::json!({ "code": "TENANT_SELECTOR_REQUIRED" })),
+            ));
+        }
+        Ok(resolved)
     }
 
     /// Resolve one concrete tenant for an authority-sensitive surface,
@@ -1394,6 +1467,7 @@ pub fn passport_bound_context(auth: &Authz, headers: &HeaderMap) -> Result<HttpS
         scopes: ctx.scopes.into_iter().collect(),
         passport_id,
         auth_enforced: auth.mode != AuthMode::Off,
+        tenant_stamp_mode: auth.tenant_stamp_mode,
         local_unverified_identity: matches!(auth.mode, AuthMode::Off | AuthMode::DevScopes),
         passport_override_used,
         canonical_passport_claim_verified: ctx.canonical_passport_claim_verified,
@@ -2894,37 +2968,34 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
     fn write_tenant_mode_off_always_default() {
         // Backward-compat: flag OFF → default regardless of claim/selector.
         assert_eq!(
-            resolve_write_tenant_flagged(&only(&["t1"]), Some("t1"), TenantStampMode::Off).unwrap(),
+            resolve_implicit_fact_tenant_flagged(&only(&["t1"]), Some("t1"), TenantStampMode::Off).unwrap(),
             None
         );
         assert_eq!(
-            resolve_write_tenant_flagged(&TenantAllow::Any, Some("t9"), TenantStampMode::Off).unwrap(),
+            resolve_implicit_fact_tenant_flagged(&TenantAllow::Any, Some("t9"), TenantStampMode::Off).unwrap(),
             None
         );
         assert_eq!(
-            resolve_write_tenant_flagged(&TenantAllow::Missing, None, TenantStampMode::Off).unwrap(),
+            resolve_implicit_fact_tenant_flagged(&TenantAllow::Missing, None, TenantStampMode::Off).unwrap(),
             None
         );
     }
 
     #[test]
-    fn write_tenant_missing_claim_is_default() {
-        // No tenant claim (single-tenant deployment) → default even with flag ON.
-        assert_eq!(
-            resolve_write_tenant_flagged(&TenantAllow::Missing, None, TenantStampMode::On).unwrap(),
-            None
-        );
+    fn write_tenant_missing_claim_fails_closed_when_on() {
+        let err = resolve_implicit_fact_tenant_flagged(&TenantAllow::Missing, None, TenantStampMode::On).unwrap_err();
+        assert_eq!(err.0.status, 403);
     }
 
     #[test]
     fn write_tenant_single_claim_stamps_that_tenant() {
         assert_eq!(
-            resolve_write_tenant_flagged(&only(&["t1"]), None, TenantStampMode::On).unwrap(),
+            resolve_implicit_fact_tenant_flagged(&only(&["t1"]), None, TenantStampMode::On).unwrap(),
             Some("t1".to_string())
         );
         // A matching selector is fine.
         assert_eq!(
-            resolve_write_tenant_flagged(&only(&["t1"]), Some("t1"), TenantStampMode::On).unwrap(),
+            resolve_implicit_fact_tenant_flagged(&only(&["t1"]), Some("t1"), TenantStampMode::On).unwrap(),
             Some("t1".to_string())
         );
     }
@@ -2932,35 +3003,32 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
     #[test]
     fn write_tenant_unauthorized_selector_rejected() {
         // Adversarial: caller tries to stamp a tenant its token does not own.
-        let err = resolve_write_tenant_flagged(&only(&["t1"]), Some("t2"), TenantStampMode::On).unwrap_err();
+        let err = resolve_implicit_fact_tenant_flagged(&only(&["t1"]), Some("t2"), TenantStampMode::On).unwrap_err();
         assert_eq!(err.0.status, 403);
     }
 
     #[test]
     fn write_tenant_multi_claim_requires_selector() {
         // Ambiguous multi-tenant token with no selector → rejected (never guess).
-        let err = resolve_write_tenant_flagged(&only(&["t1", "t2"]), None, TenantStampMode::On).unwrap_err();
+        let err = resolve_implicit_fact_tenant_flagged(&only(&["t1", "t2"]), None, TenantStampMode::On).unwrap_err();
         assert_eq!(err.0.status, 403);
         // With a valid selector → that tenant.
         assert_eq!(
-            resolve_write_tenant_flagged(&only(&["t1", "t2"]), Some("t2"), TenantStampMode::On).unwrap(),
+            resolve_implicit_fact_tenant_flagged(&only(&["t1", "t2"]), Some("t2"), TenantStampMode::On).unwrap(),
             Some("t2".to_string())
         );
         // Selector outside the set → rejected.
-        assert!(resolve_write_tenant_flagged(&only(&["t1", "t2"]), Some("t3"), TenantStampMode::On).is_err());
+        assert!(resolve_implicit_fact_tenant_flagged(&only(&["t1", "t2"]), Some("t3"), TenantStampMode::On).is_err());
     }
 
     #[test]
-    fn write_tenant_wildcard_token_uses_selector_or_default() {
-        // Wildcard/admin: selector picks the tenant; absent → default (legacy admin writes).
+    fn write_tenant_wildcard_token_requires_selector() {
         assert_eq!(
-            resolve_write_tenant_flagged(&TenantAllow::Any, Some("t7"), TenantStampMode::On).unwrap(),
+            resolve_implicit_fact_tenant_flagged(&TenantAllow::Any, Some("t7"), TenantStampMode::On).unwrap(),
             Some("t7".to_string())
         );
-        assert_eq!(
-            resolve_write_tenant_flagged(&TenantAllow::Any, None, TenantStampMode::On).unwrap(),
-            None
-        );
+        let err = resolve_implicit_fact_tenant_flagged(&TenantAllow::Any, None, TenantStampMode::On).unwrap_err();
+        assert_eq!(err.0.status, 403);
     }
 
     // ── Shadow posture: observation only, zero behaviour change ───────────
@@ -2974,9 +3042,9 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
             (TenantAllow::Any, Some("t7")),    // On: stamps t7
             (only(&["t1", "t2"]), None),       // On: REJECTS (selector required)
             (only(&["t1"]), Some("t2")),       // On: REJECTS (forbidden)
-            (TenantAllow::Missing, None),      // On: default anyway
+            (TenantAllow::Missing, None),      // On: REJECTS (claim required)
         ] {
-            let got = resolve_write_tenant_flagged(&tenants, sel, TenantStampMode::Shadow);
+            let got = resolve_implicit_fact_tenant_flagged(&tenants, sel, TenantStampMode::Shadow);
             assert!(
                 matches!(got, Ok(None)),
                 "shadow must never stamp or reject: {tenants:?} sel={sel:?}"
@@ -2988,18 +3056,41 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
     fn shadow_never_moves_reads() {
         // If shadow moved reads, it would not be observation-only.
         assert_eq!(
-            resolve_read_tenant_flagged(&only(&["t1"]), TenantStampMode::Shadow),
+            resolve_implicit_fact_tenant_flagged(&only(&["t1"]), None, TenantStampMode::Shadow).unwrap(),
             None
         );
         assert_eq!(
-            resolve_read_tenant_flagged(&TenantAllow::Any, TenantStampMode::Shadow),
+            resolve_implicit_fact_tenant_flagged(&TenantAllow::Any, None, TenantStampMode::Shadow).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_implicit_fact_tenant_flagged(&TenantAllow::Missing, None, TenantStampMode::Shadow).unwrap(),
             None
         );
     }
 
     #[test]
-    fn tenant_stamp_mode_from_env_parsing() {
-        // Pure parse check via the same table from_env uses; fail-safe to Off.
+    #[serial_test::serial]
+    fn tenant_stamp_mode_is_secure_by_default_and_invalid_values_fail_closed() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var("CORECRUXD_TENANT_WRITE_STAMP");
+        assert_eq!(
+            TenantStampMode::from_env_for_auth(AuthMode::JwtHs256).unwrap(),
+            TenantStampMode::On
+        );
+        assert_eq!(
+            TenantStampMode::from_env_for_auth(AuthMode::JwtJwks).unwrap(),
+            TenantStampMode::On
+        );
+        assert_eq!(
+            TenantStampMode::from_env_for_auth(AuthMode::Off).unwrap(),
+            TenantStampMode::Off
+        );
+        assert_eq!(
+            TenantStampMode::from_env_for_auth(AuthMode::DevScopes).unwrap(),
+            TenantStampMode::Off
+        );
+
         for (raw, want) in [
             ("1", TenantStampMode::On),
             ("true", TenantStampMode::On),
@@ -3007,38 +3098,101 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
             ("shadow", TenantStampMode::Shadow),
             ("audit", TenantStampMode::Shadow),
             ("0", TenantStampMode::Off),
+            ("false", TenantStampMode::Off),
             ("off", TenantStampMode::Off),
-            ("banana", TenantStampMode::Off),
+            ("legacy", TenantStampMode::Off),
         ] {
-            let got = match raw.trim().to_ascii_lowercase().as_str() {
-                "1" | "true" | "on" | "enforce" => TenantStampMode::On,
-                "shadow" | "audit" => TenantStampMode::Shadow,
-                _ => TenantStampMode::Off,
-            };
-            assert_eq!(got, want, "parse {raw:?}");
+            std::env::set_var("CORECRUXD_TENANT_WRITE_STAMP", raw);
+            assert_eq!(
+                TenantStampMode::from_env_for_auth(AuthMode::JwtHs256).unwrap(),
+                want,
+                "parse {raw:?}"
+            );
         }
+        std::env::set_var("CORECRUXD_TENANT_WRITE_STAMP", "banana");
+        assert!(TenantStampMode::from_env_for_auth(AuthMode::JwtHs256).is_err());
+        std::env::remove_var("CORECRUXD_TENANT_WRITE_STAMP");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn jwt_fact_tenant_resolution_requires_claim_and_honours_multi_selector() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var("CORECRUXD_TENANT_WRITE_STAMP");
+
+        let (auth, mut headers) = hs256_auth_headers(serde_json::json!({
+            "scope": "facts:read facts:write",
+            "tenants": ["t1", "t2"],
+        }));
+        headers.insert("x-corecrux-tenant-id", "t2".parse().unwrap());
+        let ctx = http_scope_context(&auth, &headers).unwrap();
+        assert_eq!(ctx.resolve_read_tenant().unwrap(), Some("t2".to_string()));
+        assert_eq!(ctx.resolve_write_tenant().unwrap(), Some("t2".to_string()));
+
+        let (auth, headers) = hs256_auth_headers(serde_json::json!({
+            "scope": "facts:read facts:write",
+        }));
+        let ctx = http_scope_context(&auth, &headers).unwrap();
+        let err = ctx.resolve_read_tenant().unwrap_err();
+        assert_eq!(err.0.status, 403);
+
+        let (auth, headers) = hs256_auth_headers(serde_json::json!({
+            "scope": "facts:read facts:write",
+            "tenant_id": "*",
+        }));
+        let ctx = http_scope_context(&auth, &headers).unwrap();
+        assert_eq!(ctx.resolve_read_tenant().unwrap_err().0.status, 403);
+        assert_eq!(ctx.resolve_write_tenant().unwrap_err().0.status, 403);
+
+        let (auth, mut headers) = hs256_auth_headers(serde_json::json!({
+            "scope": "facts:read facts:write",
+            "tenant_id": "*",
+        }));
+        headers.insert("x-corecrux-tenant-id", "t3".parse().unwrap());
+        let ctx = http_scope_context(&auth, &headers).unwrap();
+        assert_eq!(ctx.resolve_read_tenant().unwrap(), Some("t3".to_string()));
+        assert_eq!(ctx.resolve_write_tenant().unwrap(), Some("t3".to_string()));
+
+        std::env::remove_var("CORECRUXD_TENANT_WRITE_STAMP");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn tenant_stamp_shadow_simulates_missing_claim_rejection_without_moving_reads_or_writes() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("CORECRUXD_TENANT_WRITE_STAMP", "shadow");
+        let (auth, headers) = hs256_auth_headers(serde_json::json!({
+            "scope": "facts:read facts:write",
+        }));
+        let ctx = http_scope_context(&auth, &headers).unwrap();
+
+        assert_eq!(auth.tenant_stamp_mode(), TenantStampMode::Shadow);
+        assert!(
+            resolve_implicit_fact_tenant_on(&ctx.tenants, ctx.write_tenant_selector.as_deref()).is_err(),
+            "shadow must simulate the same missing-claim rejection as On"
+        );
+        assert_eq!(ctx.resolve_read_tenant().unwrap(), None);
+        assert_eq!(ctx.resolve_write_tenant().unwrap(), None);
+        assert_eq!(ctx.resolve_fact_tenant(None).unwrap(), "default");
+
+        std::env::remove_var("CORECRUXD_TENANT_WRITE_STAMP");
     }
 
     #[test]
     fn read_tenant_lockstep_with_write() {
-        // Flag OFF → default; single-tenant token → that tenant; multi/wildcard/missing → default.
-        assert_eq!(resolve_read_tenant_flagged(&only(&["t1"]), TenantStampMode::Off), None);
+        // Flag OFF → default; On resolves exactly one authorized tenant and
+        // rejects ambiguous/wildcard/missing claims.
         assert_eq!(
-            resolve_read_tenant_flagged(&only(&["t1"]), TenantStampMode::On),
+            resolve_implicit_fact_tenant_flagged(&only(&["t1"]), None, TenantStampMode::Off).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_implicit_fact_tenant_flagged(&only(&["t1"]), None, TenantStampMode::On).unwrap(),
             Some("t1".to_string())
         );
-        assert_eq!(
-            resolve_read_tenant_flagged(&only(&["t1", "t2"]), TenantStampMode::On),
-            None
-        );
-        assert_eq!(
-            resolve_read_tenant_flagged(&TenantAllow::Any, TenantStampMode::On),
-            None
-        );
-        assert_eq!(
-            resolve_read_tenant_flagged(&TenantAllow::Missing, TenantStampMode::On),
-            None
-        );
+        assert!(resolve_implicit_fact_tenant_flagged(&only(&["t1", "t2"]), None, TenantStampMode::On).is_err());
+        assert!(resolve_implicit_fact_tenant_flagged(&TenantAllow::Any, None, TenantStampMode::On).is_err());
+        assert!(resolve_implicit_fact_tenant_flagged(&TenantAllow::Missing, None, TenantStampMode::On).is_err());
     }
 
     // ── parse_jwt_algs ────────────────────────────────────────────────────

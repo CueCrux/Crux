@@ -789,6 +789,14 @@ async fn handle_compute(
     ) {
         return problem.into_response();
     }
+    let ctx = match http_scope_context(&state.auth, &headers) {
+        Ok(ctx) => ctx,
+        Err(problem) => return problem.into_response(),
+    };
+    let tenant_hash = match super::facts::tenant_hash_for_requested_context(&ctx, &tenant_id) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
     if evidence.len() > 100 {
         return problem_response(StatusCode::BAD_REQUEST, "selected evidence must not exceed 100 items");
     }
@@ -864,11 +872,12 @@ async fn handle_compute(
         },
         None => None,
     };
-    store_receipts(&state, &tenant_id, service, &receipts).await;
+    store_receipts(&state, &tenant_id, &tenant_hash, service, &receipts).await;
     let answer_replay = if matches!(service, Gpu1Service::Answer) {
         match build_and_store_answer_capsule(
             &state,
             &tenant_id,
+            &tenant_hash,
             &payload,
             &result,
             &evidence,
@@ -1162,7 +1171,13 @@ fn build_receipts(
     }
 }
 
-async fn store_receipts(state: &AppState, tenant_id: &str, service: Gpu1Service, receipts: &Gpu1ReceiptBundle) {
+async fn store_receipts(
+    state: &AppState,
+    tenant_id: &str,
+    tenant_hash: &str,
+    service: Gpu1Service,
+    receipts: &Gpu1ReceiptBundle,
+) {
     let value = match serde_json::to_string(receipts) {
         Ok(value) => value,
         Err(err) => {
@@ -1171,7 +1186,7 @@ async fn store_receipts(state: &AppState, tenant_id: &str, service: Gpu1Service,
         }
     };
     let mut fact = StoreFact {
-        tenant_hash: "default".to_string(),
+        tenant_hash: tenant_hash.to_string(),
         entity: format!("{GPU1_RECEIPT_ENTITY_PREFIX}::{tenant_id}::{}", service.operation()),
         key: "receipt_bundle".to_string(),
         value,
@@ -1193,6 +1208,7 @@ async fn store_receipts(state: &AppState, tenant_id: &str, service: Gpu1Service,
 async fn build_and_store_answer_capsule(
     state: &AppState,
     tenant_id: &str,
+    tenant_hash: &str,
     payload: &Value,
     result: &Value,
     evidence: &[Gpu1Evidence],
@@ -1223,7 +1239,7 @@ async fn build_and_store_answer_capsule(
         local_semantic_profile_id: local_semantic_profile_id.map(str::to_string),
         created_at: chrono::Utc::now().to_rfc3339(),
     });
-    super::replay::store_answer_capsule(state, &capsule).await?;
+    super::replay::store_answer_capsule(state, &capsule, tenant_hash).await?;
     Ok(json!({
         "schema": corecrux_memory::replay::ANSWER_REPLAY_CAPSULE_SCHEMA,
         "answer_id": answer_id,

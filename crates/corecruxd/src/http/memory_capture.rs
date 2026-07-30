@@ -109,6 +109,14 @@ pub(super) async fn post_extract(
     if let Err(problem) = require_http_any_scope(&state.auth, &headers, &["facts:write", "admin:write"]) {
         return problem.into_response();
     }
+    let ctx = match crate::auth::http_scope_context(&state.auth, &headers) {
+        Ok(ctx) => ctx,
+        Err(problem) => return problem.into_response(),
+    };
+    let tenant_hash = match super::facts::tenant_hash_for_write_context(&ctx) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
 
     let profile = profile_from_str(req.profile.as_deref());
     let facts = memory_extract::extract_facts_from_text(&req.text, &profile, req.session_date.as_deref());
@@ -126,7 +134,7 @@ pub(super) async fn post_extract(
         let cid = candidate_id_for(&proposed_entity, &proposed_key, &proposed_value, f.rule);
         // Idempotent + decision-preserving: never overwrite an existing
         // candidate (which may already be promoted/rejected).
-        if candidate_store::get_candidate(&store, &cid).is_some() {
+        if candidate_store::get_candidate_for_tenant(&store, &tenant_hash, &cid).is_some() {
             skipped += 1;
             continue;
         }
@@ -155,7 +163,7 @@ pub(super) async fn post_extract(
             }
             None => None,
         };
-        match candidate_store::write_candidate(&mut store, &body, receipt_hash) {
+        match candidate_store::write_candidate_for_tenant(&mut store, &tenant_hash, &body, receipt_hash) {
             Ok(_) => {
                 written += 1;
                 out.push(body);
@@ -193,6 +201,14 @@ pub(super) async fn get_candidates(
     if let Err(problem) = require_http_any_scope(&state.auth, &headers, &["query:read", "admin:read"]) {
         return problem.into_response();
     }
+    let ctx = match crate::auth::http_scope_context(&state.auth, &headers) {
+        Ok(ctx) => ctx,
+        Err(problem) => return problem.into_response(),
+    };
+    let tenant_hash = match super::facts::tenant_hash_for_read_context(&ctx) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
     let status = match q.status.as_deref() {
         Some("candidate") => Some(CandidateStatus::Candidate),
         Some("promoted") => Some(CandidateStatus::Promoted),
@@ -204,7 +220,7 @@ pub(super) async fn get_candidates(
         None => None,
     };
     let store = state.fact_store.read().await;
-    let candidates = candidate_store::list_candidates(&store, status);
+    let candidates = candidate_store::list_candidates_for_tenant(&store, &tenant_hash, status);
     Json(serde_json::json!({
         "schema": "crux.memory_capture.candidates.v1",
         "count": candidates.len(),
@@ -238,6 +254,14 @@ pub(super) async fn post_promote(
     if let Err(problem) = require_http_any_scope(&state.auth, &headers, &["facts:write", "admin:write"]) {
         return problem.into_response();
     }
+    let ctx = match crate::auth::http_scope_context(&state.auth, &headers) {
+        Ok(ctx) => ctx,
+        Err(problem) => return problem.into_response(),
+    };
+    let tenant_hash = match super::facts::tenant_hash_for_write_context(&ctx) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
     let mode = match req.auto_threshold {
         Some(t) => PromotionMode::Auto { score_threshold: t },
         None => PromotionMode::Explicit {
@@ -246,7 +270,7 @@ pub(super) async fn post_promote(
     };
     let now = chrono::Utc::now().to_rfc3339();
     let mut store = state.fact_store.write().await;
-    match candidate_store::promote(&mut store, &id, mode, &now) {
+    match candidate_store::promote_for_tenant(&mut store, &tenant_hash, &id, mode, &now) {
         Ok(fact_id) => Json(serde_json::json!({
             "schema": "crux.memory_capture.promote.v1",
             "candidate_id": id,
@@ -294,9 +318,17 @@ pub(super) async fn post_reject(
     if let Err(problem) = require_http_any_scope(&state.auth, &headers, &["facts:write", "admin:write"]) {
         return problem.into_response();
     }
+    let ctx = match crate::auth::http_scope_context(&state.auth, &headers) {
+        Ok(ctx) => ctx,
+        Err(problem) => return problem.into_response(),
+    };
+    let tenant_hash = match super::facts::tenant_hash_for_write_context(&ctx) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
     let now = chrono::Utc::now().to_rfc3339();
     let mut store = state.fact_store.write().await;
-    match candidate_store::reject(&mut store, &id, &req.reason, &now) {
+    match candidate_store::reject_for_tenant(&mut store, &tenant_hash, &id, &req.reason, &now) {
         Ok(()) => Json(serde_json::json!({
             "schema": "crux.memory_capture.reject.v1",
             "candidate_id": id,

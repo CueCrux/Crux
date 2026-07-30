@@ -109,6 +109,7 @@ fn fact_input(fact: corecrux_memory::fact_store::Fact, addressed: bool) -> cb::F
 async fn gather_facts(
     state: &AppState,
     ctx: &crate::auth::HttpScopeContext,
+    tenant_hash: &str,
     req: &ContextRequest,
 ) -> Result<Vec<cb::FactInput>, corecrux_memory::embeddings::EmbeddingError> {
     let store = state.fact_store.read().await;
@@ -127,7 +128,7 @@ async fn gather_facts(
             top_k: RECALL_TOP_K,
             token_budget: None,
         };
-        for fact in super::facts::query_visible_http_facts(&store, &q, ctx)? {
+        for fact in super::facts::query_visible_http_facts(&store, &q, ctx, tenant_hash)? {
             if fact.superseded_by.is_some() || !seen.insert(fact.fact_id.clone()) {
                 continue;
             }
@@ -162,7 +163,7 @@ async fn gather_facts(
             },
             token_budget: None,
         };
-        for fact in super::facts::query_visible_http_facts(&store, &q, ctx)? {
+        for fact in super::facts::query_visible_http_facts(&store, &q, ctx, tenant_hash)? {
             if fact.superseded_by.is_some() || !seen.insert(fact.fact_id.clone()) {
                 continue;
             }
@@ -205,11 +206,13 @@ async fn gather_session_state(
 /// Build the structural cache key for one assembly request
 /// (`corecrux_projections::assembly_cache::AssemblyKey`).
 ///
-/// `facts_chain_head` is a digest over every mutation-relevant fact field
-/// (id, version, supersession, re-verify anchor, deletion, horizon) — any
-/// fact write moves it, which IS the invalidation mechanism (no bus, no
-/// staleness window). Folded into the same digest, because they also
-/// change the assembled bundle without moving the fact chain:
+/// `facts_chain_head` is a domain-separated digest over the concrete tenant
+/// and every assembler-relevant fact field (identity, content, actor,
+/// confidence, version, supersession, timestamps, privacy, deletion, horizon,
+/// and token estimate). Any relevant fact write moves it, which IS the
+/// invalidation mechanism (no bus, no staleness window). Folded into the same
+/// digest, because they also change the assembled bundle without moving the
+/// fact chain:
 ///
 /// - the requested session's state (the `session_state` section),
 /// - the request identity (`entity` / `query` / `token_budget` — the
@@ -218,24 +221,37 @@ async fn gather_session_state(
 /// - the current UTC hour (freshness *classes* may flip at horizon
 ///   crossings without a write; an entry therefore serves at most one
 ///   hour of class lag).
+fn hash_cache_field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
 async fn assembly_cache_key(
     state: &AppState,
     ctx: &crate::auth::HttpScopeContext,
+    tenant_hash: &str,
     req: &ContextRequest,
     principal: &str,
     now_ms: i64,
 ) -> AssemblyKey {
     let mut per_fact: Vec<[u8; 32]> = {
         let store = state.fact_store.read().await;
-        let tenant_hash = super::facts::tenant_hash_for_read_context(ctx);
         store
-            .all_facts_for_tenant(&tenant_hash)
+            .all_facts_for_tenant(tenant_hash)
             .map(|f| {
                 let mut h = blake3::Hasher::new();
-                h.update(f.fact_id.as_bytes());
+                h.update(b"crux.context.assembly-cache.fact.v2\0");
+                hash_cache_field(&mut h, f.fact_id.as_bytes());
+                hash_cache_field(&mut h, f.entity.as_bytes());
+                hash_cache_field(&mut h, f.key.as_bytes());
+                hash_cache_field(&mut h, f.value.as_bytes());
+                hash_cache_field(&mut h, f.actor.as_deref().unwrap_or("").as_bytes());
                 h.update(&f.version.to_le_bytes());
                 h.update(&[u8::from(f.deleted), u8::from(f.private)]);
-                h.update(f.superseded_by.as_deref().unwrap_or("").as_bytes());
+                h.update(&f.confidence.to_bits().to_le_bytes());
+                h.update(&f.tokens.to_le_bytes());
+                h.update(&f.stored_at.timestamp_millis().to_le_bytes());
+                hash_cache_field(&mut h, f.superseded_by.as_deref().unwrap_or("").as_bytes());
                 h.update(
                     &f.reverified_at
                         .map(|t| t.timestamp_millis())
@@ -251,6 +267,8 @@ async fn assembly_cache_key(
     per_fact.sort_unstable();
 
     let mut head = blake3::Hasher::new();
+    head.update(b"crux.context.assembly-cache.head.v2\0");
+    hash_cache_field(&mut head, tenant_hash.as_bytes());
     for h in &per_fact {
         head.update(h);
     }
@@ -320,10 +338,11 @@ fn mint_bundle_receipt(
             "budget": bundle.budget,
             "section_counts": section_counts,
             "fact_ids": bundle_fact_ids(bundle),
-            "session_id": session_id,
+        "session_id": session_id,
+        "tenant_id": bundle.tenant_id,
         }),
     };
-    let scoped = format!("context::{principal}");
+    let scoped = format!("context::{}::{principal}", bundle.tenant_id);
     append_one(state, &scoped, principal, body, None)
         .map(|(resp, _tip)| resp.observation_id)
         .map_err(|(_, msg)| msg)
@@ -389,16 +408,23 @@ async fn handle_context(state: AppState, headers: HeaderMap, req: ContextRequest
         Ok(ctx) => ctx,
         Err(resp) => return resp,
     };
+    let tenant_hash = match super::facts::tenant_hash_for_read_context(&ctx) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
 
-    // Attribution: caller passport when bound, else the operator tag
-    // (anonymous writes are operator-tagged, not silently allowed —
-    // audit-hygiene profile).
-    let principal = ctx.passport_id.clone().unwrap_or_else(|| "operator".to_string());
+    // The assembler must receive the exact passport id because private-owner
+    // visibility compares against it. Cache and receipt attribution need a
+    // collision-free namespace: a verified passport literally named
+    // `operator` must never alias an unbound local operator.
+    let bundle_actor = ctx.passport_id.clone().unwrap_or_else(|| "operator".to_string());
+    let attributed_principal = ctx
+        .passport_id
+        .as_deref()
+        .map_or_else(|| "operator:unbound".to_string(), |id| format!("passport:{id}"));
     let bundle_req = cb::BundleRequest {
-        actor: principal.clone(),
-        // Local daemon: single-tenant store; tenant identity rides the
-        // passport scoping already enforced at fetch time.
-        tenant_id: "local".to_string(),
+        actor: bundle_actor,
+        tenant_id: tenant_hash.clone(),
         session_id: req.session_id.clone(),
         requested_budget: req.token_budget.unwrap_or(DEFAULT_REQUESTED_BUDGET),
         ceiling: FREE_TIER_CEILING,
@@ -411,7 +437,17 @@ async fn handle_context(state: AppState, headers: HeaderMap, req: ContextRequest
     // before). A hit skips gather + assemble entirely; the receipt below
     // is still minted per serve (every serve is receipted).
     let cache_key = if state.assembly_cache.is_some() {
-        Some(assembly_cache_key(&state, &ctx, &req, &principal, bundle_req.now_ms).await)
+        Some(
+            assembly_cache_key(
+                &state,
+                &ctx,
+                &tenant_hash,
+                &req,
+                &attributed_principal,
+                bundle_req.now_ms,
+            )
+            .await,
+        )
     } else {
         None
     };
@@ -425,7 +461,7 @@ async fn handle_context(state: AppState, headers: HeaderMap, req: ContextRequest
     let bundle = if let Some(bundle) = cached {
         bundle
     } else {
-        let facts = match gather_facts(&state, &ctx, &req).await {
+        let facts = match gather_facts(&state, &ctx, &tenant_hash, &req).await {
             Ok(facts) => facts,
             Err(err) => {
                 tracing::warn!(error = %err, "context-fact-embedding-delegation-failed");
@@ -449,15 +485,16 @@ async fn handle_context(state: AppState, headers: HeaderMap, req: ContextRequest
     };
 
     // Receipt the assembly (spec §4 rule 7).
-    let (receipt_ref, receipt_error) = match mint_bundle_receipt(&state, &principal, req.session_id.as_deref(), &bundle)
-    {
-        Ok(id) => (Some(id), None),
-        Err(e) => (None, Some(e)),
-    };
+    let (receipt_ref, receipt_error) =
+        match mint_bundle_receipt(&state, &attributed_principal, req.session_id.as_deref(), &bundle) {
+            Ok(id) => (Some(id), None),
+            Err(e) => (None, Some(e)),
+        };
 
     let mut bundle_json = json!({
         "bundle_version": bundle.stable.bundle_version,
         "passport": ctx.passport_id,
+        "tenant_id": bundle.tenant_id,
         "session_id": req.session_id,
         "assembled_at": chrono::Utc::now().to_rfc3339(),
         "budget": bundle.budget,
@@ -548,8 +585,18 @@ mod tests {
     }
 
     fn new_fact(entity: &str, key: &str, value: &str, private: bool) -> corecrux_memory::fact_store::StoreFact {
+        new_fact_for_tenant("default", entity, key, value, private)
+    }
+
+    fn new_fact_for_tenant(
+        tenant_hash: &str,
+        entity: &str,
+        key: &str,
+        value: &str,
+        private: bool,
+    ) -> corecrux_memory::fact_store::StoreFact {
         corecrux_memory::fact_store::StoreFact {
-            tenant_hash: "default".to_string(),
+            tenant_hash: tenant_hash.to_string(),
             entity: entity.to_string(),
             key: key.to_string(),
             value: value.to_string(),
@@ -956,6 +1003,220 @@ mod tests {
         assert_eq!(stats.hits, 1, "second identical request is served from the memo");
         // Every serve is receipted, hit or miss.
         assert!(b["receipt_ref"].as_str().is_some() || b.get("receipt_error").is_some());
+    }
+
+    #[tokio::test]
+    async fn assembly_cache_and_bundle_metadata_are_tenant_bound_m16() {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+        const SECRET: &str = "0123456789abcdef0123456789abcdef";
+        let mut state = cached_state();
+        state.auth = crate::auth::Authz::test_hs256(SECRET.as_bytes(), "corecrux-test", "corecrux");
+        let headers_for = |tenant: &str| {
+            let claims = json!({
+                "exp": chrono::Utc::now().timestamp() + 3600,
+                "iss": "corecrux-test",
+                "aud": "corecrux",
+                "scope": "query:read",
+                "passport_id": "shared-principal",
+                "tenant_id": tenant,
+            });
+            let token = encode(
+                &Header::new(Algorithm::HS256),
+                &claims,
+                &EncodingKey::from_secret(SECRET.as_bytes()),
+            )
+            .expect("jwt");
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {token}").parse().unwrap(),
+            );
+            headers
+        };
+
+        let request = || QueryExtract(req(None, None, Some(2000)));
+        let a = get_context(StateExtract(state.clone()), request(), headers_for("tenant-a"))
+            .await
+            .into_response();
+        assert_eq!(a.status(), StatusCode::OK);
+        assert_eq!(body_json(a).await["tenant_id"], "tenant-a");
+
+        let b = get_context(StateExtract(state.clone()), request(), headers_for("tenant-b"))
+            .await
+            .into_response();
+        assert_eq!(b.status(), StatusCode::OK);
+        assert_eq!(body_json(b).await["tenant_id"], "tenant-b");
+
+        let stats = cache_stats(&state);
+        assert_eq!(stats.hits, 0, "same-principal tenants must not share a cache entry");
+        assert_eq!(stats.misses, 2);
+    }
+
+    #[tokio::test]
+    async fn wildcard_admin_context_cache_is_scoped_to_selected_tenant_m16() {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+        const SECRET: &str = "0123456789abcdef0123456789abcdef";
+        let mut state = cached_state();
+        state.auth = crate::auth::Authz::test_hs256(SECRET.as_bytes(), "corecrux-test", "corecrux");
+        {
+            let mut store = state.fact_store.write().await;
+            store
+                .try_store(new_fact_for_tenant(
+                    "tenant-a",
+                    "tenant-a-only",
+                    "secret",
+                    "visible only in tenant A",
+                    false,
+                ))
+                .expect("tenant A fact");
+            store
+                .try_store(new_fact_for_tenant(
+                    "tenant-b",
+                    "tenant-b-only",
+                    "secret",
+                    "must never enter tenant A bundle",
+                    false,
+                ))
+                .expect("tenant B fact");
+        }
+
+        let headers_for = |tenant_claim: &str, scope: &str, selector: Option<&str>| {
+            let claims = json!({
+                "exp": chrono::Utc::now().timestamp() + 3600,
+                "iss": "corecrux-test",
+                "aud": "corecrux",
+                "scope": scope,
+                "tenant_id": tenant_claim,
+            });
+            let token = encode(
+                &Header::new(Algorithm::HS256),
+                &claims,
+                &EncodingKey::from_secret(SECRET.as_bytes()),
+            )
+            .expect("jwt");
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {token}").parse().unwrap(),
+            );
+            if let Some(selector) = selector {
+                headers.insert("x-corecrux-tenant-id", selector.parse().unwrap());
+            }
+            headers
+        };
+
+        // Both calls have the same anonymous principal (`operator`), concrete
+        // tenant, and request shape. Before M16 the raw-admin first call cached
+        // a global bundle and the ordinary second call received it.
+        let request = || QueryExtract(req(None, None, Some(2000)));
+        let admin = get_context(
+            StateExtract(state.clone()),
+            request(),
+            headers_for("*", "admin:read", Some("tenant-a")),
+        )
+        .await
+        .into_response();
+        assert_eq!(admin.status(), StatusCode::OK);
+        let admin = body_json(admin).await;
+        assert_eq!(admin["tenant_id"], "tenant-a");
+        let admin_text = serde_json::to_string(&admin["sections"]).expect("sections");
+        assert!(admin_text.contains("tenant-a-only"));
+        assert!(!admin_text.contains("tenant-b-only"));
+
+        let ordinary = get_context(
+            StateExtract(state.clone()),
+            request(),
+            headers_for("tenant-a", "query:read", None),
+        )
+        .await
+        .into_response();
+        assert_eq!(ordinary.status(), StatusCode::OK);
+        let ordinary = body_json(ordinary).await;
+        assert_eq!(ordinary["tenant_id"], "tenant-a");
+        let ordinary_text = serde_json::to_string(&ordinary["sections"]).expect("sections");
+        assert!(ordinary_text.contains("tenant-a-only"));
+        assert!(!ordinary_text.contains("tenant-b-only"));
+
+        let stats = cache_stats(&state);
+        assert_eq!(
+            stats.misses, 1,
+            "admin and ordinary callers share only a tenant-scoped entry"
+        );
+        assert_eq!(stats.hits, 1);
+    }
+
+    #[tokio::test]
+    async fn passport_named_operator_cannot_poison_unbound_context_cache_m16() {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+        const SECRET: &str = "0123456789abcdef0123456789abcdef";
+        let mut state = cached_state();
+        state.auth = crate::auth::Authz::test_hs256(SECRET.as_bytes(), "corecrux-test", "corecrux");
+        {
+            let mut store = state.fact_store.write().await;
+            store
+                .try_store(new_fact_for_tenant(
+                    "tenant-a",
+                    "__agent::operator::private-note",
+                    "secret",
+                    "passport operator private value",
+                    true,
+                ))
+                .expect("private operator fact");
+        }
+
+        let headers_for = |passport_id: Option<&str>| {
+            let mut claims = json!({
+                "exp": chrono::Utc::now().timestamp() + 3600,
+                "iss": "corecrux-test",
+                "aud": "corecrux",
+                "scope": "query:read",
+                "tenant_id": "tenant-a",
+            });
+            if let Some(passport_id) = passport_id {
+                claims["passport_id"] = Value::String(passport_id.to_string());
+            }
+            let token = encode(
+                &Header::new(Algorithm::HS256),
+                &claims,
+                &EncodingKey::from_secret(SECRET.as_bytes()),
+            )
+            .expect("jwt");
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {token}").parse().unwrap(),
+            );
+            headers
+        };
+
+        let request = || QueryExtract(req(None, Some("private value"), Some(2000)));
+        let owner = get_context(StateExtract(state.clone()), request(), headers_for(Some("operator")))
+            .await
+            .into_response();
+        assert_eq!(owner.status(), StatusCode::OK);
+        let owner = body_json(owner).await;
+        assert!(serde_json::to_string(&owner["sections"])
+            .expect("sections")
+            .contains("passport operator private value"));
+
+        let unbound = get_context(StateExtract(state.clone()), request(), headers_for(None))
+            .await
+            .into_response();
+        assert_eq!(unbound.status(), StatusCode::OK);
+        let unbound = body_json(unbound).await;
+        assert!(
+            !serde_json::to_string(&unbound["sections"])
+                .expect("sections")
+                .contains("passport operator private value"),
+            "an unbound caller must not receive the passport owner's cached private fact"
+        );
+
+        let stats = cache_stats(&state);
+        assert_eq!(stats.hits, 0, "bound and unbound identities must not alias");
+        assert_eq!(stats.misses, 2);
     }
 
     #[tokio::test]

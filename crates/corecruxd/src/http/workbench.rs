@@ -579,7 +579,10 @@ pub(super) async fn get_audit_triage(
         Ok(ctx) => ctx,
         Err(problem) => return problem.into_response(),
     };
-    let tenant_hash = super::facts::tenant_hash_for_read_context(&ctx);
+    let tenant_hash = match super::facts::tenant_hash_for_requested_context(&ctx, &tenant_id) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
     let sync_status = super::health::sync_runtime_status();
     let scan = crate::workspace_scan::load_latest(&state.fact_store).await;
     let queues = {

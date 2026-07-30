@@ -2067,9 +2067,14 @@ async fn tenant_write_stamp_isolates_reads_end_to_end_m1() {
     std::env::set_var("CORECRUXD_JWT_HS256_SECRET", TEST_HS256_SECRET);
     std::env::set_var("CORECRUXD_JWT_ISS", "corecrux-test");
     std::env::set_var("CORECRUXD_JWT_AUD", "corecrux");
-    std::env::set_var("CORECRUXD_TENANT_WRITE_STAMP", "1");
+    std::env::remove_var("CORECRUXD_TENANT_WRITE_STAMP");
 
     let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    assert_eq!(
+        state.auth.tenant_stamp_mode(),
+        crate::auth::TenantStampMode::On,
+        "JWT fact tenant isolation must be secure without an opt-in flag"
+    );
 
     #[derive(serde::Serialize)]
     struct Claims<'a> {
@@ -2154,6 +2159,202 @@ async fn tenant_write_stamp_isolates_reads_end_to_end_m1() {
     std::env::remove_var("CORECRUXD_JWT_ISS");
     std::env::remove_var("CORECRUXD_JWT_AUD");
     std::env::remove_var("CORECRUXD_TENANT_WRITE_STAMP");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn tenant_write_stamp_legacy_off_is_an_explicit_shared_default_override_m16() {
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    const TEST_HS256_SECRET: &str = "0123456789abcdef0123456789abcdef";
+
+    let _secret = EnvVarGuard::set("CORECRUXD_JWT_HS256_SECRET", TEST_HS256_SECRET);
+    let _issuer = EnvVarGuard::set("CORECRUXD_JWT_ISS", "corecrux-test");
+    let _audience = EnvVarGuard::set("CORECRUXD_JWT_AUD", "corecrux");
+    let _legacy = EnvVarGuard::set("CORECRUXD_TENANT_WRITE_STAMP", "off");
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    assert_eq!(state.auth.tenant_stamp_mode(), crate::auth::TenantStampMode::Off);
+
+    #[derive(serde::Serialize)]
+    struct Claims<'a> {
+        exp: usize,
+        iss: &'a str,
+        aud: &'a str,
+        scope: &'a str,
+        tenant_id: &'a str,
+    }
+    let bearer = |scope: &str, tenant: &str| {
+        let claims = Claims {
+            exp: (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600) as usize,
+            iss: "corecrux-test",
+            aud: "corecrux",
+            scope,
+            tenant_id: tenant,
+        };
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(TEST_HS256_SECRET.as_bytes()),
+        )
+        .expect("jwt");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        headers
+    };
+
+    let entity = "tenant-legacy-shared-widget";
+    let body: corecrux_memory::fact_store::StoreFact =
+        serde_json::from_value(serde_json::json!({ "entity": entity, "key": "k", "value": "v" })).unwrap();
+    let resp = facts::put_fact(State(state.clone()), bearer("facts:write", "tenant-a"), Json(body))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let stored = json_body(resp).await;
+    assert_eq!(stored["tenant_hash"], "default");
+
+    let resp = facts::get_facts_by_entity(
+        State(state.clone()),
+        bearer("query:read", "tenant-b"),
+        Path(entity.to_string()),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["facts"].as_array().unwrap().len(),
+        1,
+        "the explicit legacy override intentionally retains shared-default visibility"
+    );
+
+    let aggregate = facts::post_aggregate(
+        State(state.clone()),
+        bearer("query:read", "tenant-b"),
+        Json(corecrux_memory::fact_store::AggregateRequestV1 {
+            op: corecrux_memory::fact_store::AggregateOp::Count,
+            entity: Some(entity.to_string()),
+            key: Some("k".to_string()),
+            query: None,
+            as_of: None,
+            token_budget: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(aggregate.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(aggregate).await["value"],
+        serde_json::json!(1),
+        "aggregate must read the same shared-default tenant used by legacy writes"
+    );
+
+    let export = facts::export_facts(
+        State(state),
+        bearer("query:read", "tenant-b"),
+        Query(ExportFactsParams {
+            since: None,
+            cursor: None,
+            limit: Some(10),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(export.status(), StatusCode::OK);
+    let exported = json_body(export).await;
+    assert_eq!(exported["facts"].as_array().unwrap().len(), 1);
+    assert_eq!(exported["facts"][0]["entity"], entity);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn tenant_write_stamp_shadow_keeps_generic_write_aggregate_and_export_paired_m16() {
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    const TEST_HS256_SECRET: &str = "0123456789abcdef0123456789abcdef";
+
+    let _secret = EnvVarGuard::set("CORECRUXD_JWT_HS256_SECRET", TEST_HS256_SECRET);
+    let _issuer = EnvVarGuard::set("CORECRUXD_JWT_ISS", "corecrux-test");
+    let _audience = EnvVarGuard::set("CORECRUXD_JWT_AUD", "corecrux");
+    let _shadow = EnvVarGuard::set("CORECRUXD_TENANT_WRITE_STAMP", "shadow");
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    assert_eq!(state.auth.tenant_stamp_mode(), crate::auth::TenantStampMode::Shadow);
+
+    let bearer = |scope: &str, tenant: &str| {
+        let claims = serde_json::json!({
+            "exp": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600,
+            "iss": "corecrux-test",
+            "aud": "corecrux",
+            "scope": scope,
+            "tenant_id": tenant,
+        });
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(TEST_HS256_SECRET.as_bytes()),
+        )
+        .expect("jwt");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        headers
+    };
+
+    let entity = "tenant-shadow-shared-widget";
+    let body = serde_json::from_value(serde_json::json!({
+        "entity": entity,
+        "key": "k",
+        "value": "v",
+    }))
+    .unwrap();
+    let write = facts::put_fact(State(state.clone()), bearer("facts:write", "tenant-a"), Json(body))
+        .await
+        .into_response();
+    assert_eq!(write.status(), StatusCode::CREATED);
+    assert_eq!(json_body(write).await["tenant_hash"], "default");
+
+    let aggregate = facts::post_aggregate(
+        State(state.clone()),
+        bearer("query:read", "tenant-b"),
+        Json(corecrux_memory::fact_store::AggregateRequestV1 {
+            op: corecrux_memory::fact_store::AggregateOp::Count,
+            entity: Some(entity.to_string()),
+            key: Some("k".to_string()),
+            query: None,
+            as_of: None,
+            token_budget: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(aggregate.status(), StatusCode::OK);
+    assert_eq!(json_body(aggregate).await["value"], serde_json::json!(1));
+
+    let export = facts::export_facts(
+        State(state),
+        bearer("query:read", "tenant-b"),
+        Query(ExportFactsParams {
+            since: None,
+            cursor: None,
+            limit: Some(10),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(export.status(), StatusCode::OK);
+    let exported = json_body(export).await;
+    assert_eq!(exported["facts"].as_array().unwrap().len(), 1);
+    assert_eq!(exported["facts"][0]["entity"], entity);
 }
 
 #[tokio::test]
@@ -9373,7 +9574,7 @@ async fn workbench_audit_triage_groups_replay_failures() {
             local_semantic_profile_id: None,
             created_at: "2026-05-07T00:00:00Z".to_string(),
         });
-    super::replay::store_answer_capsule(&state, &capsule)
+    super::replay::store_answer_capsule(&state, &capsule, "default")
         .await
         .expect("store replay capsule");
     {
@@ -9421,6 +9622,49 @@ async fn workbench_audit_triage_groups_replay_failures() {
         .unwrap()
         .iter()
         .any(|category| category == "fact_superseded"));
+}
+
+#[tokio::test]
+async fn explicit_tenant_workbench_route_selects_from_multi_tenant_jwt_m16() {
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+    const SECRET: &str = "0123456789abcdef0123456789abcdef";
+    let mut state = pro_workbench_state(&["audit:triage"]);
+    state.auth = crate::auth::Authz::test_hs256(SECRET.as_bytes(), "corecrux-test", "corecrux");
+    let token = encode(
+        &Header::new(Algorithm::HS256),
+        &serde_json::json!({
+            "exp": chrono::Utc::now().timestamp() + 3600,
+            "iss": "corecrux-test",
+            "aud": "corecrux",
+            "scope": "audit:triage",
+            "tenants": ["tenant-a", "tenant-b"],
+        }),
+        &EncodingKey::from_secret(SECRET.as_bytes()),
+    )
+    .expect("jwt");
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}")).expect("bearer"),
+    );
+
+    let response = super::workbench::get_audit_triage(
+        State(state),
+        headers,
+        Query(super::workbench::TenantWorkbenchQuery {
+            tenant_id: "tenant-a".to_string(),
+            project_id: None,
+            limit: None,
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the explicit query tenant is the authorized selector; no header is required"
+    );
 }
 
 // Drives the `http::cloud` and `http::gpu1` handlers directly — hosted-surface only (M4).
@@ -10295,6 +10539,50 @@ async fn console_fact_add_then_search_round_trip() {
             .any(|f| f["value"] == "ultraviolet" && f["entity"] == "personal::project"),
         "expected newly added fact in search results: {body}"
     );
+}
+
+#[tokio::test]
+async fn console_facts_are_tenant_scoped_under_jwt_m16() {
+    let state = mint_test_verified_app_state(16);
+    let entity = "tenant-console-project";
+    let add_resp = console::post_console_fact_add(
+        State(state.clone()),
+        mint_test_tenant_headers_no_identity("facts:write", "tenant-a"),
+        Json(console::ConsoleAddFactBody {
+            entity: entity.to_string(),
+            key: "secret_colour".to_string(),
+            value: "tenant-a-ultraviolet".to_string(),
+            confidence: 0.9,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(add_resp.status(), StatusCode::CREATED);
+
+    for (tenant, expected) in [("tenant-a", 1usize), ("tenant-b", 0usize)] {
+        let response = console::get_console_facts(
+            State(state.clone()),
+            Query(console::ConsoleFactsQuery {
+                q: Some("tenant-a-ultraviolet".to_string()),
+                top_k: Some(10),
+                as_of_unix_ms: None,
+            }),
+            mint_test_tenant_headers_no_identity("admin:read", tenant),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(
+            body["facts"].as_array().unwrap().len(),
+            expected,
+            "unexpected console visibility for {tenant}: {body}"
+        );
+    }
+
+    let store = state.fact_store.read().await;
+    assert_eq!(store.get_by_entity_for_tenant(entity, "tenant-a").len(), 1);
+    assert!(store.get_by_entity_for_tenant(entity, "default").is_empty());
 }
 
 #[tokio::test]
@@ -12358,6 +12646,33 @@ fn mint_test_jwt_headers(scopes: &str, identity_claim: (&str, &str)) -> HeaderMa
     headers
 }
 
+fn mint_test_tenant_headers_no_identity(scopes: &str, tenant_id: &str) -> HeaderMap {
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_secs()
+        .saturating_add(3_600) as usize;
+    let claims = serde_json::json!({
+        "exp": exp,
+        "iss": MINT_TEST_ISSUER,
+        "aud": MINT_TEST_AUDIENCE,
+        "scope": scopes,
+        "tenant_id": tenant_id,
+    });
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(MINT_TEST_HS256_SECRET.as_bytes()),
+    )
+    .expect("tenant test JWT");
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}")).expect("bearer header"),
+    );
+    headers
+}
+
 fn mint_test_verified_headers(scopes: &str, passport_id: &str) -> HeaderMap {
     mint_test_jwt_headers(scopes, ("passport_id", passport_id))
 }
@@ -14227,6 +14542,153 @@ async fn typed_engram_upsert_rejects_wrong_scope_and_malformed_name() {
         .await
         .get_by_entity("__engram__::../escape::v1")
         .is_empty());
+}
+
+#[tokio::test]
+async fn jwt_engram_overlay_reads_are_isolated_by_tenant_m16() {
+    let state = work_auth_test_state(16);
+    let mut tenant_a = test_engram_upsert_body();
+    tenant_a.content = "tenant A minimalism policy".to_string();
+    let mut tenant_b = test_engram_upsert_body();
+    tenant_b.content = "tenant B minimalism policy".to_string();
+
+    for (tenant, body) in [("tenant-a", tenant_a), ("tenant-b", tenant_b)] {
+        let response = super::engrams::upsert_engram(
+            State(state.clone()),
+            work_auth_headers(tenant, None, "admin:write"),
+            Path("code-minimalism".to_string()),
+            Json(body),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    let resolve_for = |tenant: &str| super::engrams::ResolveEngramsBody {
+        tenant_id: Some(tenant.to_string()),
+        tenant_id_camel: None,
+        agent_id: Some("codex".to_string()),
+        agent_id_camel: None,
+        names: vec!["code-minimalism@v1".to_string()],
+        manifest_hash: None,
+        model_id: Some("local-cpu".to_string()),
+        model_id_camel: None,
+    };
+    let a = super::engrams::resolve_engrams(
+        State(state.clone()),
+        work_auth_headers("tenant-a", None, "query:read"),
+        Json(resolve_for("tenant-a")),
+    )
+    .await
+    .into_response();
+    assert_eq!(a.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(a).await["engrams"][0]["content"],
+        "tenant A minimalism policy"
+    );
+
+    let b = super::engrams::resolve_engrams(
+        State(state.clone()),
+        work_auth_headers("tenant-b", None, "query:read"),
+        Json(resolve_for("tenant-b")),
+    )
+    .await
+    .into_response();
+    assert_eq!(b.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(b).await["engrams"][0]["content"],
+        "tenant B minimalism policy"
+    );
+
+    let cross_tenant = super::engrams::resolve_engrams(
+        State(state),
+        work_auth_headers("tenant-a", None, "query:read"),
+        Json(resolve_for("tenant-b")),
+    )
+    .await
+    .into_response();
+    assert_eq!(cross_tenant.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn jwt_memory_candidate_list_and_promote_are_isolated_by_tenant_m16() {
+    let mut state = work_auth_test_state(16);
+    state.auto_capture_enabled = true;
+    let candidate = |value: &str| {
+        crate::candidate_store::MemoryCandidateV1::new_candidate(
+            "same-http-id".to_string(),
+            "person:user".to_string(),
+            "owns_cat_count".to_string(),
+            value.to_string(),
+            "fixture".to_string(),
+            1.0,
+            "stable".to_string(),
+            crate::candidate_store::CandidateSource::default(),
+            None,
+            None,
+            "2026-07-30T00:00:00Z".to_string(),
+        )
+    };
+    {
+        let mut store = state.fact_store.write().await;
+        crate::candidate_store::write_candidate_for_tenant(&mut store, "tenant-a", &candidate("tenant-a-value"), None)
+            .unwrap();
+        crate::candidate_store::write_candidate_for_tenant(&mut store, "tenant-b", &candidate("tenant-b-value"), None)
+            .unwrap();
+    }
+
+    for (tenant, expected) in [("tenant-a", "tenant-a-value"), ("tenant-b", "tenant-b-value")] {
+        let response = super::memory_capture::get_candidates(
+            State(state.clone()),
+            work_auth_headers(tenant, None, "query:read"),
+            Query(super::memory_capture::ListQuery { status: None }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["candidates"][0]["proposed_value"], expected);
+    }
+
+    let promoted = super::memory_capture::post_promote(
+        State(state.clone()),
+        work_auth_headers("tenant-a", None, "facts:write"),
+        Path("same-http-id".to_string()),
+        Json(super::memory_capture::PromoteRequest {
+            reviewer: Some("reviewer-a".to_string()),
+            auto_threshold: None,
+        }),
+    )
+    .await;
+    assert_eq!(promoted.status(), StatusCode::OK);
+
+    let store = state.fact_store.read().await;
+    assert_eq!(
+        crate::candidate_store::get_candidate_for_tenant(&store, "tenant-a", "same-http-id")
+            .unwrap()
+            .status,
+        crate::candidate_store::CandidateStatus::Promoted
+    );
+    assert_eq!(
+        crate::candidate_store::get_candidate_for_tenant(&store, "tenant-b", "same-http-id")
+            .unwrap()
+            .status,
+        crate::candidate_store::CandidateStatus::Candidate
+    );
+    assert_eq!(
+        store
+            .all_facts_for_tenant("tenant-a")
+            .filter(|fact| fact.entity == "person:user" && fact.key == "owns_cat_count")
+            .count(),
+        1
+    );
+    assert_eq!(
+        store
+            .all_facts_for_tenant("tenant-b")
+            .filter(|fact| fact.entity == "person:user" && fact.key == "owns_cat_count")
+            .count(),
+        0
+    );
 }
 
 #[tokio::test]

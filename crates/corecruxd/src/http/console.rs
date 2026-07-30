@@ -2961,6 +2961,15 @@ pub(super) async fn get_console_facts(
     if let Err(problem) = require_console_read(&state, &headers) {
         return problem.into_response();
     }
+    let ctx = match crate::auth::http_scope_context(&state.auth, &headers) {
+        Ok(ctx) => ctx,
+        Err(problem) => return problem.into_response(),
+    };
+    let raw_admin = super::facts::raw_admin_read(&ctx);
+    let tenant_hash = match super::facts::tenant_hash_for_read_context(&ctx) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
     let q = query
         .q
         .as_ref()
@@ -2979,7 +2988,7 @@ pub(super) async fn get_console_facts(
     let store = state.fact_store.read().await;
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
         min_effective_confidence: None,
-        tenant_hash: None,
+        tenant_hash: (!raw_admin).then_some(tenant_hash.clone()),
         query: q.clone(),
         entity: None,
         entity_prefix: None,
@@ -3004,7 +3013,11 @@ pub(super) async fn get_console_facts(
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "count": store.count(),
+            "count": if raw_admin {
+                store.count()
+            } else {
+                store.all_facts_for_tenant(&tenant_hash).count()
+            },
             "visible_count": visible_facts.len(),
             "query": q,
             "top_k": top_k,
@@ -3051,6 +3064,10 @@ pub(super) async fn post_console_fact_add(
         .into_response();
     }
 
+    let tenant_hash = match super::facts::tenant_hash_for_write_context(&ctx) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
     let mut store = state.fact_store.write().await;
     if let Err(e) =
         crux_mcp::category_enforce::check_passport_can_write_entity(&store, ctx.passport_id.as_deref(), entity)
@@ -3058,7 +3075,7 @@ pub(super) async fn post_console_fact_add(
         return problem_response(StatusCode::FORBIDDEN, e.to_string());
     }
     let mut sf = corecrux_memory::fact_store::StoreFact {
-        tenant_hash: "default".to_string(),
+        tenant_hash,
         entity: entity.to_string(),
         key: key.to_string(),
         value: value.to_string(),

@@ -39,7 +39,10 @@ pub(super) async fn get_answer_replay(
         Ok(ctx) => ctx,
         Err(problem) => return problem.into_response(),
     };
-    let tenant_hash = super::facts::tenant_hash_for_read_context(&ctx);
+    let tenant_hash = match super::facts::tenant_hash_for_requested_context(&ctx, &q.tenant_id) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
     let Some(capsule) = load_answer_capsule(&state, &q.tenant_id, &answer_id, &tenant_hash).await else {
         return problem_response(StatusCode::NOT_FOUND, "answer replay capsule not found");
     };
@@ -74,7 +77,10 @@ pub(super) async fn get_answer_replay_validity(
         Ok(ctx) => ctx,
         Err(problem) => return problem.into_response(),
     };
-    let tenant_hash = super::facts::tenant_hash_for_read_context(&ctx);
+    let tenant_hash = match super::facts::tenant_hash_for_requested_context(&ctx, &q.tenant_id) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
     let Some(capsule) = load_answer_capsule(&state, &q.tenant_id, &answer_id, &tenant_hash).await else {
         return problem_response(StatusCode::NOT_FOUND, "answer replay capsule not found");
     };
@@ -146,9 +152,13 @@ pub(super) async fn get_answer_replay_validity(
 // remain mounted. Test builds still exercise this writer directly.
 #[cfg_attr(not(feature = "hosted-surfaces"), allow(dead_code))]
 #[tracing::instrument(level = "info", skip_all)]
-pub(super) async fn store_answer_capsule(state: &AppState, capsule: &AnswerReplayCapsule) -> std::io::Result<()> {
+pub(super) async fn store_answer_capsule(
+    state: &AppState,
+    capsule: &AnswerReplayCapsule,
+    tenant_hash: &str,
+) -> std::io::Result<()> {
     let mut fact = StoreFact {
-        tenant_hash: "default".to_string(),
+        tenant_hash: tenant_hash.to_string(),
         entity: answer_capsule_entity(&capsule.tenant_id, &capsule.answer_id),
         key: "capsule".to_string(),
         value: serde_json::to_string(capsule).map_err(std::io::Error::other)?,

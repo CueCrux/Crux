@@ -139,10 +139,24 @@ pub fn validate_local_engram(engram: &LocalEngram) -> Result<(), String> {
 /// Built-in catalog merged with fact-backed overlays under `__engram__::*`.
 /// An overlay replaces a builtin with the same `(name, version)`.
 pub fn local_catalog_with_overlays(store: &FactStore) -> Vec<LocalEngram> {
+    local_catalog_with_overlays_inner(store, Some("default"))
+}
+
+/// Built-in catalog merged only with overlays owned by `tenant_hash`.
+///
+/// HTTP callers use this form so an overlay from one JWT tenant cannot replace
+/// a same-name overlay in another tenant. The unscoped function remains for the
+/// local MCP compatibility plane, which is confined to the shared `default`
+/// tenant because it has no per-request JWT tenant claim.
+pub fn local_catalog_with_overlays_for_tenant(store: &FactStore, tenant_hash: &str) -> Vec<LocalEngram> {
+    local_catalog_with_overlays_inner(store, Some(tenant_hash))
+}
+
+fn local_catalog_with_overlays_inner(store: &FactStore, tenant_hash: Option<&str>) -> Vec<LocalEngram> {
     let mut out = builtin_engrams();
     let result = store.query(&FactQuery {
         min_effective_confidence: None,
-        tenant_hash: None,
+        tenant_hash: tenant_hash.map(str::to_string),
         query: None,
         entity: None,
         entity_prefix: Some(ENGRAM_ENTITY_PREFIX.trim_end_matches("::").to_string() + "::"),
@@ -507,6 +521,44 @@ mod tests {
         let served: Vec<_> = catalog.iter().filter(|e| e.name == "code-minimalism").collect();
         assert_eq!(served.len(), 1, "overlay must replace, not duplicate");
         assert_eq!(served[0].content, "operator-tuned ladder");
+    }
+
+    #[test]
+    fn tenant_scoped_catalog_never_merges_another_tenants_overlay() {
+        let mut store = FactStore::new();
+        for (tenant, content) in [
+            ("tenant-a", "tenant A tuned ladder"),
+            ("tenant-b", "tenant B tuned ladder"),
+        ] {
+            let mut custom = builtin_engrams()
+                .into_iter()
+                .find(|engram| engram.name == "code-minimalism")
+                .unwrap();
+            custom.content = content.to_string();
+            store.store(StoreFact {
+                tenant_hash: tenant.to_string(),
+                entity: format!("{ENGRAM_ENTITY_PREFIX}code-minimalism"),
+                key: "engram".to_string(),
+                value: serde_json::to_string(&custom).unwrap(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: true,
+                horizon_class: None,
+                actor: None,
+            });
+        }
+
+        let tenant_a = local_catalog_with_overlays_for_tenant(&store, "tenant-a");
+        let served = tenant_a.iter().find(|engram| engram.name == "code-minimalism").unwrap();
+        assert_eq!(served.content, "tenant A tuned ladder");
+        assert!(!tenant_a.iter().any(|engram| engram.content == "tenant B tuned ladder"));
+        let mcp_default = local_catalog_with_overlays(&store);
+        let served = mcp_default
+            .iter()
+            .find(|engram| engram.name == "code-minimalism")
+            .unwrap();
+        assert_ne!(served.content, "tenant A tuned ladder");
+        assert_ne!(served.content, "tenant B tuned ladder");
     }
 
     #[test]
