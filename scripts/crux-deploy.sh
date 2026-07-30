@@ -14,7 +14,21 @@
 # or from cron; it is idempotent w.r.t. a no-op (re-pull + recreate).
 #
 # Environment variables:
-#   CRUX_COMPOSE_FILE   Path to the compose file. Default: ./docker-compose.yml
+#   CRUX_COMPOSE_FILE     Path to the compose file. Default: ./docker-compose.yml
+#   CRUX_COMPOSE_OVERRIDE Path to a host-local override compose file, merged on
+#                         top of CRUX_COMPOSE_FILE (extra `-f`). Default:
+#                         <dir of CRUX_COMPOSE_FILE>/docker-compose.override.yml,
+#                         included only if it exists. Passing `-f` explicitly (as
+#                         this script always does) disables Compose's own
+#                         default-file auto-discovery, so a host that relies on
+#                         an override file needs this — its absence is exactly
+#                         how a 2026-07-29 deploy silently dropped an override
+#                         carrying prod auth mode, port bindings, and every bind
+#                         mount, recreating the service from base-file-only
+#                         config (crux-desktop-mission-control-2026-07-19
+#                         incident notes). Set to an empty string to force
+#                         base-file-only, e.g. for a host that intentionally has
+#                         no override.
 #   CRUX_IMAGE_TAG      Image tag to deploy. Default: edge
 #   CRUX_SERVICE        Compose service name. Default: crux
 #   CRUX_HEALTH_URL     readyz URL.   Default: http://127.0.0.1:14800/readyz
@@ -48,9 +62,32 @@ if [ ! -f "$COMPOSE_FILE" ]; then
   err "compose file not found: $COMPOSE_FILE"; exit 1
 fi
 
-dc() { docker compose -f "$COMPOSE_FILE" "$@"; }
+# Resolve the override file: explicit env wins (including an explicit empty
+# string, which opts out); otherwise auto-detect the sibling Compose already
+# picks up by default when no `-f` is given at all.
+if [ "${CRUX_COMPOSE_OVERRIDE+set}" = "set" ]; then
+  OVERRIDE_FILE="$CRUX_COMPOSE_OVERRIDE"
+else
+  OVERRIDE_FILE="$(dirname -- "$COMPOSE_FILE")/docker-compose.override.yml"
+  [ -f "$OVERRIDE_FILE" ] || OVERRIDE_FILE=""
+fi
+
+COMPOSE_ARGS=(-f "$COMPOSE_FILE")
+if [ -n "$OVERRIDE_FILE" ]; then
+  if [ ! -f "$OVERRIDE_FILE" ]; then
+    err "CRUX_COMPOSE_OVERRIDE set but not found: $OVERRIDE_FILE"; exit 1
+  fi
+  COMPOSE_ARGS+=(-f "$OVERRIDE_FILE")
+fi
+
+dc() { docker compose "${COMPOSE_ARGS[@]}" "$@"; }
 
 log "compose file : $COMPOSE_FILE"
+if [ -n "$OVERRIDE_FILE" ]; then
+  log "override file: $OVERRIDE_FILE"
+else
+  log "override file: none"
+fi
 log "service      : $SERVICE"
 log "image        : ${IMAGE}:${IMAGE_TAG}"
 
