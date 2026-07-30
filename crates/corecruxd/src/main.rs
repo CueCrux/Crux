@@ -40,6 +40,7 @@ mod cost_attribution;
 // rail and metered capability paths.
 #[allow(dead_code)]
 mod credit_meter;
+mod enrich_budget;
 // Dataplane store stubs: proprietary edition provides the real implementation.
 #[allow(dead_code)]
 mod dataplane_store;
@@ -741,6 +742,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         quota_hosted_surfaces: Arc::new(config.quota_hosted_surfaces.clone()),
         quota_ledger: Arc::new(std::sync::Mutex::new(crux_router::quota::QuotaLedger::new())),
         credit_meter,
+        enrich_budgets: std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
         openai_shim_enabled: config.openai_shim_enabled,
         memory_import_enabled: config.memory_import_enabled,
         identity_links_enabled: config.identity_links_enabled,
@@ -4662,6 +4664,7 @@ mod tests {
             quota_hosted_surfaces: std::sync::Arc::new(Vec::new()),
             quota_ledger: std::sync::Arc::new(std::sync::Mutex::new(crux_router::quota::QuotaLedger::new())),
             credit_meter: None,
+            enrich_budgets: std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
             openai_shim_enabled: false,
             memory_import_enabled: false,
             identity_links_enabled: false,

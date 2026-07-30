@@ -15,7 +15,7 @@
 // Every call is same-origin credentialed; the browser never holds a bearer
 // token (the daemon authenticates the session at its own origin).
 //
-// 188 read endpoints, generated from the route manifest.
+// 189 read endpoints, generated from the route manifest.
 
 /**
  * Append a plain query object to a path as a URL search string.
@@ -55,6 +55,7 @@ const LITERAL_GET_PATHS = Object.freeze({
   '/v1/cloud/access-contract': true,
   '/v1/code-intel/blast-radius': true,
   '/v1/code-intel/dead-code': true,
+  '/v1/code-intel/enrich-budget': true,
   '/v1/code-intel/liveness': true,
   '/v1/code-intel/path': true,
   '/v1/code-intel/releases': true,
@@ -254,6 +255,9 @@ const CruxApi = Object.freeze({
   },
   codeIntelDeadCode(query) {
     return fetch(withQuery(`/v1/code-intel/dead-code`, query), { credentials: 'same-origin' });
+  },
+  codeIntelEnrichBudget(query) {
+    return fetch(withQuery(`/v1/code-intel/enrich-budget`, query), { credentials: 'same-origin' });
   },
   codeIntelLiveness(query) {
     return fetch(withQuery(`/v1/code-intel/liveness`, query), { credentials: 'same-origin' });

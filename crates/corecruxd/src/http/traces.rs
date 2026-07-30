@@ -399,6 +399,132 @@ pub(super) async fn get_code_path(
     (StatusCode::OK, Json(path)).into_response()
 }
 
+/// Query for the M8 enrichment surface.
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct EnrichQuery {
+    pub tenant_id: String,
+    /// Which seat the call is charged against. The ceiling is per seat, so an
+    /// account that does not distinguish them shares one bucket — which is the
+    /// safe default, not a silent merge of everybody's headroom.
+    #[serde(default)]
+    pub seat_id: Option<String>,
+    #[serde(default)]
+    pub repo_id: Option<String>,
+    #[serde(default)]
+    pub symbol: Option<String>,
+    #[serde(default)]
+    pub token_budget: Option<usize>,
+}
+
+/// Credits charged for one enriched verdict.
+///
+/// Matches `extraction` on the published rate card because it is the same shape
+/// of work — a third-party model reasoning over one unit of evidence. Anything
+/// that changes this must change the price list in the same commit, or the
+/// daemon and the thing the customer agreed to stop agreeing.
+pub(super) const ENRICHED_VERDICT_COST_CR: u64 = 5;
+
+/// `GET /v1/code-intel/enrich-budget` — a seat's remaining enrichment headroom (M8).
+///
+/// Readable without consuming, which is the whole point: the ceiling has to be
+/// visible before it bites, not discovered by being refused.
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn get_enrich_budget(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<EnrichQuery>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
+        return problem.into_response();
+    }
+    let seat = q.seat_id.as_deref().unwrap_or("default");
+    let Ok(mut budgets) = state.enrich_budgets.lock() else {
+        return problem_response(StatusCode::INTERNAL_SERVER_ERROR, "enrich budget lock poisoned");
+    };
+    let view = budgets.peek(&q.tenant_id, seat);
+    drop(budgets);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "budget": view,
+            "cost_cr_per_verdict": ENRICHED_VERDICT_COST_CR,
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /v1/code-intel/enrich` — an LLM-reviewed dead-code verdict (M8, P3).
+///
+/// The order of the two limits is deliberate. **The seat ceiling is checked
+/// first**, before the wallet is touched: a rate refusal must not reserve, spend
+/// or otherwise disturb credit, because the caller has not been given anything.
+/// Reserving and then refusing would leave holds on a wallet for calls that
+/// never happened.
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn post_enrich_verdict(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<EnrichQuery>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:write"], &q.tenant_id) {
+        return problem.into_response();
+    }
+    let Some(symbol) = q.symbol.as_deref() else {
+        return problem_response(StatusCode::BAD_REQUEST, "symbol is required");
+    };
+    let seat = q.seat_id.as_deref().unwrap_or("default");
+
+    // 1. Rate ceiling. Refuse here and nothing else has happened yet.
+    let budget = {
+        let Ok(mut budgets) = state.enrich_budgets.lock() else {
+            return problem_response(StatusCode::INTERNAL_SERVER_ERROR, "enrich budget lock poisoned");
+        };
+        match budgets.try_consume(&q.tenant_id, seat) {
+            Ok(b) => b,
+            Err(exhausted) => {
+                // 429, not 402: this is a rate limit, not a billing failure, and
+                // the caller's recovery is to wait rather than to buy credit.
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({
+                        "error": "enrichment rate ceiling reached for this seat",
+                        "budget": exhausted,
+                        "retry_after_secs": crate::enrich_budget::window_secs(),
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    // 2. Evidence. Enrichment reasons over the deterministic ladder rather than
+    //    replacing it — the free answer stays the substrate, and a model that is
+    //    unavailable degrades the response, never the verdict underneath.
+    let spans = load_spans(&state, &q.tenant_id);
+    let repo_id = q.repo_id.as_deref().unwrap_or("crux");
+    let Some(scan) = load_scan(&state, &q.tenant_id, repo_id).await else {
+        return problem_response(StatusCode::NOT_FOUND, "no scan for this repo; register it first");
+    };
+    let ladder = crate::code_intel::dead_code_ladder(&scan, &spans, Some(symbol), q.token_budget.unwrap_or(4000));
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "symbol": symbol,
+            "evidence": ladder,
+            // The enrichment provider is not wired yet: this returns the
+            // deterministic ladder and says so, rather than inventing a
+            // rationale. `enriched: false` is the honest wire signal, and no
+            // credit is charged for work that was not done.
+            "enriched": false,
+            "enrichment_status": "provider_not_configured",
+            "cost_cr": 0,
+            "budget": budget,
+        })),
+    )
+        .into_response()
+}
+
 /// `GET /v1/code-intel/volume` — retained spans against the tenant's ceiling (M5).
 ///
 /// The ceiling's gate is that containment is "visible to the customer before it
