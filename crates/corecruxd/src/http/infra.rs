@@ -62,7 +62,10 @@ pub(super) async fn get_infra_summary(State(state): State<AppState>, headers: He
         Ok(ctx) => ctx,
         Err(problem) => return problem.into_response(),
     };
-    let tenant_hash = super::facts::tenant_hash_for_read_context(&ctx);
+    let tenant_hash = match super::facts::tenant_hash_for_read_context(&ctx) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
 
     let rails = serde_json::json!({
         "tailscale": env_flag_enabled("CORECRUXD_TS_IDENTITY_ENABLED"),

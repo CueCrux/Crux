@@ -268,6 +268,30 @@ Scopes are passed via `Authorization: Bearer <token>` header. Required scopes ar
 `X-Corecrux-Passport-Id` is only an unverified local assertion in `off` and
 `dev_scopes`; production authority must come from verified token claims.
 
+### HTTP fact tenant isolation (`CORECRUXD_TENANT_WRITE_STAMP`)
+
+In `jwt_hs256` and `jwt_jwks` modes, the default is `on`: affected HTTP
+fact-backed writes stamp the verified JWT tenant and reads filter to the same
+tenant. A token with one tenant needs no selector. On tenant-implicit routes, a
+token with multiple tenants or a wildcard tenant must send
+`X-Corecrux-Tenant-Id`; an explicit route/body tenant is itself a selector and
+must agree with that header when both are present. A missing tenant claim,
+ambiguous selection, mismatch, or unauthorized selection is rejected. The
+separately documented raw-admin fact reads remain intentionally cross-tenant.
+The policy is parsed once at startup, and an invalid value aborts startup.
+
+`off` is a deliberate legacy migration override: reads and writes use the
+shared `default` tenant even when JWT claims differ. `shadow` preserves that
+same storage behaviour while logging requests that `on` would move or reject.
+Historical `default` rows are not migrated automatically.
+
+This switch covers wired HTTP fact-backed surfaces, including generic and
+console facts, context recall, engram overlays, memory candidates, result
+envelopes, replay capsules, and their paired HTTP audit/export reads. It is not
+a universal daemon tenant switch: the MCP compatibility plane still uses
+`default`, while entity, edge, session, projection, and other control stores
+retain their own tenant contracts.
+
 ### Route authorization gate (`CORECRUXD_ROUTE_AUTH`)
 
 Independently of `CORECRUXD_AUTH_MODE`, the daemon runs a deny-by-default route

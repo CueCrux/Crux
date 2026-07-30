@@ -152,7 +152,7 @@ pub(super) fn require_session_write_ctx(
     http_scope_context(&state.auth, headers).map_err(IntoResponse::into_response)
 }
 
-fn raw_admin_read(ctx: &crate::auth::HttpScopeContext) -> bool {
+pub(super) fn raw_admin_read(ctx: &crate::auth::HttpScopeContext) -> bool {
     ctx.passport_id.is_none() && ctx.has_scope("admin:read") && ctx.has_global_tenant_authority()
 }
 
@@ -165,8 +165,9 @@ fn raw_admin_write(ctx: &crate::auth::HttpScopeContext) -> bool {
 /// The tenant is derived from the bearer token's tenant claim (`HttpScopeContext`
 /// carries `tenants`, the same authority the query path authorizes against) plus an
 /// optional `x-corecrux-tenant-id` selector for multi-tenant tokens — never from the
-/// client-supplied fact body. Gated by `CORECRUXD_TENANT_WRITE_STAMP` (default OFF →
-/// `default`, byte-identical to pre-M1). `Err` on an unauthorized/ambiguous selector.
+/// client-supplied fact body. JWT auth defaults to tenant stamping; an explicit
+/// `off` or `shadow` posture retains the historical shared `default` tenant.
+/// `Err` on an unauthorized/ambiguous selector.
 ///
 /// Sibling surfaces (kept consistent with this resolver, verified on this base):
 /// - HTTP fact reads (`get_for_tenant` / `all_facts_for_tenant`, and `export_facts`
@@ -183,9 +184,20 @@ pub(super) fn tenant_hash_for_write_context(ctx: &crate::auth::HttpScopeContext)
     }
 }
 
-pub(super) fn tenant_hash_for_read_context(ctx: &crate::auth::HttpScopeContext) -> String {
+#[allow(clippy::result_large_err)]
+pub(super) fn tenant_hash_for_read_context(ctx: &crate::auth::HttpScopeContext) -> Result<String, Response> {
     ctx.resolve_read_tenant()
-        .unwrap_or_else(corecrux_memory::fact_store::default_tenant_hash)
+        .map(|tenant| tenant.unwrap_or_else(corecrux_memory::fact_store::default_tenant_hash))
+        .map_err(IntoResponse::into_response)
+}
+
+#[allow(clippy::result_large_err)]
+pub(super) fn tenant_hash_for_requested_context(
+    ctx: &crate::auth::HttpScopeContext,
+    requested: &str,
+) -> Result<String, Response> {
+    ctx.resolve_fact_tenant(Some(requested))
+        .map_err(IntoResponse::into_response)
 }
 
 fn render_fact_for_http(
@@ -276,9 +288,15 @@ pub(super) fn query_visible_http_facts(
     store: &corecrux_memory::FactStore,
     q: &corecrux_memory::fact_store::FactQuery,
     ctx: &crate::auth::HttpScopeContext,
+    tenant_hash: &str,
 ) -> Result<Vec<corecrux_memory::fact_store::Fact>, corecrux_memory::embeddings::EmbeddingError> {
-    // Internal callers (context_surface) never set a confidence floor; drop the count.
-    Ok(query_visible_http_facts_as_of(store, q, ctx, None)?.0)
+    // `/v1/context` is always a tenant-attributed bundle. Even a raw/global
+    // administrator must select one concrete tenant before assembly; allowing
+    // the global branch here would let an admin-populated cache entry be served
+    // to an ordinary caller that shares the same anonymous principal.
+    //
+    // Internal callers never set a confidence floor; drop the count.
+    Ok(query_visible_http_facts_as_of_inner(store, q, ctx, tenant_hash, None, false)?.0)
 }
 
 /// P2 confidence floor: drop facts whose recall-time EFFECTIVE confidence
@@ -342,9 +360,21 @@ pub(super) fn query_visible_http_facts_as_of(
     store: &corecrux_memory::FactStore,
     q: &corecrux_memory::fact_store::FactQuery,
     ctx: &crate::auth::HttpScopeContext,
+    tenant_hash: &str,
     as_of: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<(Vec<corecrux_memory::fact_store::Fact>, usize), corecrux_memory::embeddings::EmbeddingError> {
-    if raw_admin_read(ctx) {
+    query_visible_http_facts_as_of_inner(store, q, ctx, tenant_hash, as_of, true)
+}
+
+fn query_visible_http_facts_as_of_inner(
+    store: &corecrux_memory::FactStore,
+    q: &corecrux_memory::fact_store::FactQuery,
+    ctx: &crate::auth::HttpScopeContext,
+    tenant_hash: &str,
+    as_of: Option<chrono::DateTime<chrono::Utc>>,
+    allow_raw_admin_global: bool,
+) -> Result<(Vec<corecrux_memory::fact_store::Fact>, usize), corecrux_memory::embeddings::EmbeddingError> {
+    if allow_raw_admin_global && raw_admin_read(ctx) {
         // Run the floor filter/count over the FULL matched+ranked set, THEN
         // apply budget/top_k — so a below-floor row never consumes the window
         // and the count reflects the whole matched set, matching the scoped
@@ -364,9 +394,8 @@ pub(super) fn query_visible_http_facts_as_of(
     }
 
     let agent_name = ctx.passport_id.as_deref();
-    let tenant_hash = tenant_hash_for_read_context(ctx);
     let mut results: Vec<&corecrux_memory::fact_store::Fact> = store
-        .all_facts_for_tenant(&tenant_hash)
+        .all_facts_for_tenant(tenant_hash)
         .filter(|fact| !fact.deleted)
         .filter(|fact| as_of.is_none_or(|instant| fact.valid_at(instant)))
         .filter(|fact| crux_mcp::scope::fact_visible_to_agent(fact, agent_name))
@@ -540,8 +569,11 @@ pub(super) async fn get_fact(
         Ok(ctx) => ctx,
         Err(response) => return response,
     };
+    let tenant_hash = match tenant_hash_for_read_context(&ctx) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
     let store = state.fact_store.read().await;
-    let tenant_hash = tenant_hash_for_read_context(&ctx);
     let fact = if raw_admin_read(&ctx) {
         store.get(&fact_id)
     } else {
@@ -575,8 +607,11 @@ pub(super) async fn delete_fact(
         Ok(ctx) => ctx,
         Err(response) => return response,
     };
+    let tenant_hash = match tenant_hash_for_read_context(&ctx) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
     let mut store = state.fact_store.write().await;
-    let tenant_hash = tenant_hash_for_read_context(&ctx);
     let fact = if raw_admin_write(&ctx) {
         store.get(&fact_id)
     } else {
@@ -650,8 +685,11 @@ pub(super) async fn get_facts_by_entity(
         Ok(ctx) => ctx,
         Err(response) => return response,
     };
+    let tenant_hash = match tenant_hash_for_read_context(&ctx) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
     let store = state.fact_store.read().await;
-    let tenant_hash = tenant_hash_for_read_context(&ctx);
     let facts: Vec<_> = if raw_admin_read(&ctx) {
         store.get_by_entity(&entity).into_iter().cloned().collect()
     } else {
@@ -720,8 +758,13 @@ pub(super) async fn query_facts(
         },
         None => None,
     };
+    let tenant_hash = match tenant_hash_for_read_context(&ctx) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
     let store = state.fact_store.read().await;
-    let (facts, filtered_below_threshold) = match query_visible_http_facts_as_of(&store, &q, &ctx, as_of) {
+    let (facts, filtered_below_threshold) = match query_visible_http_facts_as_of(&store, &q, &ctx, &tenant_hash, as_of)
+    {
         Ok(result) => result,
         Err(err) => {
             tracing::warn!(error = %err, "fact-query-embedding-delegation-failed");
@@ -760,9 +803,9 @@ pub(super) async fn post_aggregate(
         Ok(ctx) => ctx,
         Err(response) => return response,
     };
-    let tenant_hash = match ctx.resolve_authorized_tenant(None) {
+    let tenant_hash = match tenant_hash_for_read_context(&ctx) {
         Ok(tenant_hash) => tenant_hash,
-        Err(problem) => return problem.into_response(),
+        Err(response) => return response,
     };
     let store = state.fact_store.read().await;
     Json(store.aggregate_v1(&tenant_hash, &req)).into_response()
@@ -804,9 +847,9 @@ pub(super) async fn export_facts(
     let result = if raw_admin_read(&ctx) {
         store.export(since, cursor, limit)
     } else {
-        let tenant_hash = match ctx.resolve_authorized_tenant(None) {
+        let tenant_hash = match tenant_hash_for_read_context(&ctx) {
             Ok(tenant_hash) => tenant_hash,
-            Err(problem) => return problem.into_response(),
+            Err(response) => return response,
         };
         store.export_for_tenant(&tenant_hash, since, cursor, limit)
     };
@@ -895,7 +938,10 @@ pub(super) async fn list_facts(
     // Raw-admin (auth-off console) sees the whole store; a scoped caller is
     // confined to its read-tenant — same authority the query path uses.
     let is_admin = raw_admin_read(&ctx);
-    let tenant_hash = tenant_hash_for_read_context(&ctx);
+    let tenant_hash = match tenant_hash_for_read_context(&ctx) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
 
     // The consumer-surface reserved list is the single source of truth in
     // crux-mcp (`crux_mcp::tools::memory::RESERVED_ENTITY_PREFIXES`); the store

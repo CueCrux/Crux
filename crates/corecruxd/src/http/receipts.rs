@@ -871,7 +871,10 @@ pub(super) async fn get_answer_export_v1(
         Ok(ctx) => ctx,
         Err(problem) => return problem.into_response(),
     };
-    let tenant_hash = super::facts::tenant_hash_for_read_context(&ctx);
+    let tenant_hash = match super::facts::tenant_hash_for_requested_context(&ctx, &q.tenant_id) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
 
     let opts = match parse_receipt_export_options_v1(q.include.as_deref(), q.redaction.as_deref(), q.format.as_deref())
     {
