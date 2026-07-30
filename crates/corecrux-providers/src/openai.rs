@@ -9,7 +9,7 @@
 //! - `credentials.json` — `OpenAiCredentials { encrypted_api_key, organization_id?,
 //!   default_model?, connected_at_unix_ms, last_verified_at_unix_ms? }`. The API key
 //!   itself never appears in plaintext; the envelope is sealed with the daemon-root
-//!   passport-derived key (see `crate::encrypted_secrets`).
+//!   passport-derived key (see `corecrux_secrets`).
 //!
 //! Verification uses `GET https://api.openai.com/v1/models` — succeeds iff the key
 //! has at least `models.read` permission. We deliberately don't require any
@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::encrypted_secrets::{EncryptedEnvelope, EncryptedSecretError};
+use corecrux_secrets::{EncryptedEnvelope, EncryptedSecretError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpenAiIntegrationError {
@@ -128,7 +128,7 @@ pub fn delete_credentials(data_dir: &Path) -> Result<(), OpenAiIntegrationError>
 
 #[allow(dead_code)] // Read by future LLM proxy / completion routes.
 pub fn decrypt_api_key(creds: &OpenAiCredentials, key: &[u8; 32]) -> Result<String, OpenAiIntegrationError> {
-    let bytes = crate::encrypted_secrets::open(&creds.encrypted_api_key, key)?;
+    let bytes = corecrux_secrets::open(&creds.encrypted_api_key, key)?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -214,7 +214,7 @@ fn set_owner_only_perms(_path: &Path) -> Result<(), OpenAiIntegrationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encrypted_secrets::seal;
+    use corecrux_secrets::seal;
 
     fn sample_creds() -> (OpenAiCredentials, [u8; 32]) {
         let key = [7u8; 32];

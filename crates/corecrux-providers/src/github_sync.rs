@@ -16,9 +16,7 @@ use std::path::Path;
 use corecrux_memory::fact_store::{FactStore, StoreFact};
 use serde::{Deserialize, Serialize};
 
-use crate::integrations_github::{
-    decrypt_pat, list_selected_repos, read_credentials, GithubIntegrationError, SelectedRepo,
-};
+use crate::github::{decrypt_pat, list_selected_repos, read_credentials, GithubIntegrationError, SelectedRepo};
 
 #[allow(dead_code)] // documentation marker — used by the MCP tool descriptions in G5.
 pub const COMMIT_ENTITY_TEMPLATE: &str = "github::{owner}/{repo}::commit/{sha}";
@@ -50,7 +48,8 @@ pub struct SyncRunResult {
     pub repos: Vec<RepoSyncOutcome>,
 }
 
-/// Sync entry point — needs the integration encryption key (held in AppState).
+/// Sync entry point — the caller supplies the integration encryption key
+/// (the daemon holds it in its application state; this crate never sources it).
 /// Blocking — caller dispatches via `tokio::task::spawn_blocking`. The first
 /// call after `select_repo` does a full first-sync (capped at
 /// `PER_REPO_MAX_PAGES * PER_REPO_PAGE_SIZE`); subsequent calls use the

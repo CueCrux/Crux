@@ -78,6 +78,8 @@ zip = { workspace = true, features = ["default"] }
 
 corecrux-frame = { path = "../corecrux-frame" }
 corecrux-memory = { path = "../corecrux-memory" }
+corecrux-providers = { path = "../corecrux-providers" }
+corecrux-secrets = { path = "../corecrux-secrets" }
 corecrux-projections = { path = "../corecrux-projections" }
 corecrux-proto = { path = "../corecrux-proto" }
 corecrux-retrieval = { path = "../corecrux-retrieval" }

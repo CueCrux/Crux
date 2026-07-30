@@ -57,7 +57,10 @@ mod candidate_links;
 mod candidate_store;
 mod context_graph;
 mod dossier;
-mod encrypted_secrets;
+// Extracted to the `corecrux-secrets` leaf crate; aliased so existing
+// `crate::encrypted_secrets::…` call sites (7 of them, incl. wasm_host and
+// http/extensions) compile unchanged.
+use corecrux_secrets as encrypted_secrets;
 mod ephemeral_gc;
 // Git-backed ExecPlan projection root: clone + fast-forward only, so the
 // replica can never hold state git does not already have.
@@ -68,9 +71,12 @@ mod extension_registry;
 mod fact_helpers;
 mod fact_privacy;
 mod identity_links;
-mod integrations_github;
-mod integrations_github_sync;
-mod integrations_openai;
+// Extracted to the `corecrux-providers` crate (provider credentials + GitHub
+// sync); aliased so existing `crate::integrations_*::…` call sites in
+// http/integrations_{github,openai}.rs compile unchanged.
+use corecrux_providers::github as integrations_github;
+use corecrux_providers::github_sync as integrations_github_sync;
+use corecrux_providers::openai as integrations_openai;
 mod mcp_stdio;
 mod memory_extract;
 pub mod mint_requests;

@@ -10,7 +10,7 @@
 //! - `credentials.json` — `GithubCredentials { encrypted_pat, username, scopes,
 //!   connected_at_unix_ms, last_verified_at_unix_ms? }`. The PAT itself never
 //!   appears in plaintext; the envelope is sealed with the daemon-root
-//!   passport-derived key (see `crate::encrypted_secrets`).
+//!   passport-derived key (see `corecrux_secrets`).
 //!
 //! Future (G2): `selected_repos.json` for the operator-selected repo set.
 
@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::encrypted_secrets::{EncryptedEnvelope, EncryptedSecretError};
+use corecrux_secrets::{EncryptedEnvelope, EncryptedSecretError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum GithubIntegrationError {
@@ -120,7 +120,7 @@ pub fn delete_credentials(data_dir: &Path) -> Result<(), GithubIntegrationError>
 
 #[allow(dead_code)] // Used by G3 sync worker — reads PAT for outbound api.github.com calls.
 pub fn decrypt_pat(creds: &GithubCredentials, key: &[u8; 32]) -> Result<String, GithubIntegrationError> {
-    let bytes = crate::encrypted_secrets::open(&creds.encrypted_pat, key)?;
+    let bytes = corecrux_secrets::open(&creds.encrypted_pat, key)?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -432,7 +432,7 @@ mod tests {
 
     fn sample_creds() -> (GithubCredentials, [u8; 32]) {
         let key = [7u8; 32];
-        let env = crate::encrypted_secrets::seal(b"github_pat_test_token_12345", &key);
+        let env = corecrux_secrets::seal(b"github_pat_test_token_12345", &key);
         (
             GithubCredentials {
                 encrypted_pat: env,
