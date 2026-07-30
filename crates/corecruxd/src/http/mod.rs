@@ -11,7 +11,7 @@ mod admin;
 mod agent_usage;
 mod append;
 mod approval_receipts;
-mod auth_device;
+pub(crate) mod auth_device;
 mod auth_rails;
 mod cases;
 // Hosted-service HTTP surface (ExecPlan crux-external-findings-remediation M4):

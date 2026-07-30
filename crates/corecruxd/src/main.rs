@@ -896,6 +896,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Wire the shared event bus into both stores so mutations emit SSE events.
     state.fact_store.write().await.set_event_bus(state.event_bus.clone());
     state.session_store.write().await.set_event_bus(state.event_bus.clone());
+
+    // Load-at-startup: rehydrate paired-device refresh credentials, so a daemon
+    // restart no longer silently unpairs every device (ExecPlan
+    // crux-hosted-relay-gateway-2026-07-30, M1).
+    crate::http::auth_device::hydrate_refresh_credentials(&state).await;
     {
         let mut store = state.fact_store.write().await;
         match crate::repo_registry::fail_incomplete_scans(
