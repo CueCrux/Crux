@@ -564,7 +564,7 @@ pub fn status(user: bool, project: Option<PathBuf>) -> Result<String, DynErr> {
 
 // ── SessionEnd cost-capture diagnosability ──────────────────────────────────
 
-/// Version of the [`WRAPPER_SH`] launcher template this binary ships. Bumped
+/// Version of the `WRAPPER_SH` launcher template this binary ships. Bumped
 /// whenever a launcher mode changes observable behaviour; the `cost)` branch
 /// stamps it into every outcome record so a stale on-disk launcher is
 /// self-identifying rather than mysterious.
