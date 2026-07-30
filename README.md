@@ -185,7 +185,7 @@ Report it privately per the [security policy](SECURITY.md).
 <sub><b>receipts as a literal chain</b> — click any block in the console, inspect the proof</sub>
 </div>
 
-**Testing & coverage:** 6,000+ tests and **~87%** CI-gated region coverage, with per-crate floors
+**Testing & coverage:** 6,000+ tests and **~90%** CI-gated region coverage, with per-crate floors
 on the trust core (`corecrux-receipts` / `-segment` / `-storage`) and the ungated total reported
 alongside so exclusions can't hide low-coverage code. How it's measured and exactly what's
 excluded: [docs/testing-and-coverage.md](docs/testing-and-coverage.md).
