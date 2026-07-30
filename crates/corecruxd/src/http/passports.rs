@@ -541,7 +541,7 @@ pub(super) async fn patch_passport(
     headers: HeaderMap,
     Json(body): Json<UpdatePassportBody>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;
@@ -578,7 +578,7 @@ pub(super) async fn delete_passport(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;

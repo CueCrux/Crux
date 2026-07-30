@@ -128,7 +128,7 @@ understanding back to agents.
 | GET | `/v1/repos/{repoId}?tenant_id=…` | One registration | `admin:read` |
 | DELETE | `/v1/repos/{repoId}?tenant_id=…` | Unregister (stops watch) | `admin:write` |
 | GET | `/v1/repos/{repoId}/codemap?tenant_id=…&format=summary\|full` | AST code map: `summary` = stats + per-crate rollup; `full` = files, symbols, deps, routes | `admin:read` |
-| POST | `/v1/workspace/scan` | Scan the daemon's own workspace (`CORECRUXD_WORKSPACE_PATH`) | `admin:read` |
+| POST | `/v1/workspace/scan` | Scan the daemon's own workspace (`CORECRUXD_WORKSPACE_PATH`) | `admin:write` |
 | GET | `/v1/workspace/scan` | Latest self-scan in full | `admin:read` |
 | GET | `/v1/workspace/storyline?format=tree\|json` | Per-route call trees from the self-scan | `admin:read` |
 
@@ -255,8 +255,12 @@ controlled by `CORECRUXD_ROUTE_AUTH` (read once at startup):
 | Value | Behaviour |
 |-------|-----------|
 | `off` | Pass-through; the middleware does nothing. |
-| `shadow` (default) | Evaluates the contract and logs a structured `route_auth_shadow_mismatch` warning on any would-deny, but never blocks. Use it to observe coverage before switching to `enforce`. |
+| `shadow` | Evaluates the contract and logs a structured `route_auth_shadow_mismatch` warning on any would-deny, but never blocks. It is the derived default only for auth-off, loopback-only operation; otherwise it is an explicit migration override. |
 | `enforce` | Public routes (`/healthz`, `/readyz`, `/metrics`, `/session`, `/invocation/verify`, `/v1/openapi.json`, `/v1/version`, `/v1/witness/smoke`, and the `/v1/auth/*` bootstrap rails) pass with no auth headers. Every other route requires one of its contract scopes via the same primitive the handlers use. A route with **no** contract entry — or a request axum could not match to a route template — **fails closed with `403`**. |
+
+With the variable unset, authentication enabled or a non-loopback listener
+selects `enforce`; only auth-off plus loopback derives `shadow`. An empty or
+unknown explicit value also selects `enforce` and emits a startup warning.
 
 The gate authorizes scopes only; feature-flag gating for optional surfaces stays
 in the handler. When `CORECRUXD_AUTH_MODE=off`, the scope check is a no-op (there

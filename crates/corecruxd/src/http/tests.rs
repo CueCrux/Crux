@@ -12877,7 +12877,7 @@ async fn passports_patch_updates_gate_and_default_flag() {
     let resp = super::passports::patch_passport(
         State(state),
         Path("alice".to_string()),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
         Json(super::passports::UpdatePassportBody {
             category: Some("work".to_string()),
             agent_work_gate: Some(true),
@@ -12925,7 +12925,7 @@ async fn passports_delete_removes_record() {
     let del_resp = super::passports::delete_passport(
         State(state.clone()),
         Path("alice".to_string()),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
     )
     .await
     .into_response();
@@ -13495,7 +13495,7 @@ async fn projects_create_then_list_then_get() {
 
     let create_resp = super::projects::post_project(
         State(state.clone()),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
         Json(super::projects::CreateProjectBody {
             id: "alpha".to_string(),
             name: "Alpha".to_string(),
@@ -13534,7 +13534,7 @@ async fn projects_invalid_planning_target_returns_400() {
     }
     let resp = super::projects::post_project(
         State(state),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
         Json(super::projects::CreateProjectBody {
             id: "alpha".to_string(),
             name: "Alpha".to_string(),
@@ -13557,7 +13557,7 @@ async fn projects_add_unknown_passport_returns_404() {
     }
     let _ = super::projects::post_project(
         State(state.clone()),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
         Json(super::projects::CreateProjectBody {
             id: "alpha".to_string(),
             name: "Alpha".to_string(),
@@ -13572,7 +13572,7 @@ async fn projects_add_unknown_passport_returns_404() {
     let resp = super::projects::post_project_member(
         State(state),
         Path("alpha".to_string()),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
         Json(super::projects::AddMemberBody {
             passport_id: "ghost".to_string(),
             role: "contributor".to_string(),
@@ -13595,7 +13595,7 @@ async fn projects_delete_removes_subentities() {
     }
     let _ = super::projects::post_project(
         State(state.clone()),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
         Json(super::projects::CreateProjectBody {
             id: "alpha".to_string(),
             name: "Alpha".to_string(),
@@ -13609,7 +13609,7 @@ async fn projects_delete_removes_subentities() {
     let del = super::projects::delete_project(
         State(state.clone()),
         Path("alpha".to_string()),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
     )
     .await
     .into_response();
@@ -13630,7 +13630,7 @@ async fn projects_members_tenants_layers_repos_and_graph_round_trip() {
 
     let create_resp = super::projects::post_project(
         State(state.clone()),
-        dev_scope_headers("admin:read facts:write"),
+        dev_scope_headers("admin:write facts:write"),
         Json(super::projects::CreateProjectBody {
             id: "alpha".to_string(),
             name: "Alpha".to_string(),
@@ -13646,7 +13646,7 @@ async fn projects_members_tenants_layers_repos_and_graph_round_trip() {
     let patch_resp = super::projects::patch_project(
         State(state.clone()),
         Path("alpha".to_string()),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
         Json(super::projects::UpdateProjectBody {
             name: Some("Alpha Updated".to_string()),
             planning_target: Some(None),
@@ -13664,7 +13664,7 @@ async fn projects_members_tenants_layers_repos_and_graph_round_trip() {
     let member_resp = super::projects::post_project_member(
         State(state.clone()),
         Path("alpha".to_string()),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
         Json(super::projects::AddMemberBody {
             passport_id: "work-default".to_string(),
             role: "reviewer".to_string(),
@@ -13677,7 +13677,7 @@ async fn projects_members_tenants_layers_repos_and_graph_round_trip() {
     let tenant_resp = super::projects::post_project_tenant(
         State(state.clone()),
         Path("alpha".to_string()),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
         Json(super::projects::AddTenantBody {
             tenant_id: "tenant-b".to_string(),
             default_passport_id: Some("public-default".to_string()),
@@ -13778,7 +13778,7 @@ async fn projects_members_tenants_layers_repos_and_graph_round_trip() {
     let delete_tenant = super::projects::delete_project_tenant(
         State(state.clone()),
         Path(("alpha".to_string(), "tenant-b".to_string())),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
     )
     .await
     .into_response();
@@ -13787,7 +13787,7 @@ async fn projects_members_tenants_layers_repos_and_graph_round_trip() {
     let delete_member = super::projects::delete_project_member(
         State(state),
         Path(("alpha".to_string(), "work-default".to_string())),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
     )
     .await
     .into_response();
@@ -15446,7 +15446,7 @@ async fn workspace_routes_report_catalog_and_missing_scan_states() {
     assert_eq!(missing_storyline.status(), StatusCode::NOT_FOUND);
 
     std::env::remove_var("CORECRUXD_WORKSPACE_PATH");
-    let unconfigured = super::workspace::post_scan(State(state), dev_scope_headers("admin:read"))
+    let unconfigured = super::workspace::post_scan(State(state), dev_scope_headers("admin:write"))
         .await
         .into_response();
     assert_eq!(unconfigured.status(), StatusCode::PRECONDITION_FAILED);
@@ -16467,7 +16467,7 @@ async fn seed_project_for_planes_tests(state: &AppState) {
     }
     let resp = super::projects::post_project(
         State(state.clone()),
-        dev_scope_headers("admin:read facts:write"),
+        dev_scope_headers("admin:write facts:write"),
         Json(super::projects::CreateProjectBody {
             id: "alpha".to_string(),
             name: "Alpha".to_string(),
@@ -16490,7 +16490,7 @@ async fn planes_create_then_list_then_get() {
     let create_resp = super::planes::post_plane(
         State(state.clone()),
         Path("alpha".to_string()),
-        dev_scope_headers("admin:read facts:write"),
+        dev_scope_headers("admin:write facts:write"),
         Json(super::planes::CreatePlaneBody {
             id: "daemon".to_string(),
             name: "Crux Daemon".to_string(),
@@ -16543,7 +16543,7 @@ async fn planes_member_round_trip() {
     let _ = super::planes::post_plane(
         State(state.clone()),
         Path("alpha".to_string()),
-        dev_scope_headers("admin:read facts:write"),
+        dev_scope_headers("admin:write facts:write"),
         Json(super::planes::CreatePlaneBody {
             id: "daemon".to_string(),
             name: "Daemon".to_string(),
@@ -16558,7 +16558,7 @@ async fn planes_member_round_trip() {
     let add_resp = super::planes::post_plane_member(
         State(state.clone()),
         Path(("alpha".to_string(), "daemon".to_string())),
-        dev_scope_headers("admin:read facts:write"),
+        dev_scope_headers("admin:write facts:write"),
         Json(super::planes::PlaneMemberBody {
             passport_id: "work-default".to_string(),
             role: "contributor".to_string(),
@@ -16571,7 +16571,7 @@ async fn planes_member_round_trip() {
     let rm_resp = super::planes::delete_plane_member(
         State(state),
         Path(("alpha".to_string(), "daemon".to_string(), "work-default".to_string())),
-        dev_scope_headers("admin:read facts:write"),
+        dev_scope_headers("admin:write facts:write"),
     )
     .await
     .into_response();
@@ -16585,7 +16585,7 @@ async fn planes_layer_put_then_get_then_delete() {
     let _ = super::planes::post_plane(
         State(state.clone()),
         Path("alpha".to_string()),
-        dev_scope_headers("admin:read facts:write"),
+        dev_scope_headers("admin:write facts:write"),
         Json(super::planes::CreatePlaneBody {
             id: "daemon".to_string(),
             name: "Daemon".to_string(),
@@ -16639,7 +16639,7 @@ async fn planes_delete_removes_record() {
     let _ = super::planes::post_plane(
         State(state.clone()),
         Path("alpha".to_string()),
-        dev_scope_headers("admin:read facts:write"),
+        dev_scope_headers("admin:write facts:write"),
         Json(super::planes::CreatePlaneBody {
             id: "daemon".to_string(),
             name: "Daemon".to_string(),
@@ -16653,7 +16653,7 @@ async fn planes_delete_removes_record() {
     let resp = super::planes::delete_plane(
         State(state.clone()),
         Path(("alpha".to_string(), "daemon".to_string())),
-        dev_scope_headers("admin:read facts:write"),
+        dev_scope_headers("admin:write facts:write"),
     )
     .await
     .into_response();
@@ -19503,6 +19503,21 @@ fn route_auth_request(method: &str, uri: &str, scopes: Option<&str>) -> axum::ht
     builder.body(axum::body::Body::empty()).expect("build request")
 }
 
+fn route_auth_json_request(
+    method: &str,
+    uri: &str,
+    scopes: &str,
+    body: &serde_json::Value,
+) -> axum::http::Request<axum::body::Body> {
+    axum::http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("x-corecrux-scopes", scopes)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .expect("build JSON request")
+}
+
 /// (b) Enforce mode fails closed on a route with no contract entry, even when
 /// the caller presents ample scopes.
 #[tokio::test]
@@ -19673,6 +19688,117 @@ async fn route_auth_enforce_contract_matrix() {
             sufficient.status() != StatusCode::UNAUTHORIZED && sufficient.status() != StatusCode::FORBIDDEN,
             "[{label}] {method} {uri} with a sufficient scope must be admitted (not 401/403), got {}",
             sufficient.status()
+        );
+    }
+}
+
+/// Handler/contract drift gate for every structural mutation tightened by
+/// H-02. Shadow mode deliberately lets the request reach the real handler:
+/// `admin:read` must be rejected there, while `admin:write` must clear both
+/// middleware and handler authorization (the domain operation may still
+/// return a non-auth 4xx because this compact matrix does not seed every
+/// referenced object).
+#[tokio::test]
+async fn structural_mutation_handlers_reject_admin_read_and_accept_admin_write() {
+    use tower::ServiceExt;
+
+    let cases = vec![
+        (
+            "PATCH",
+            "/v1/passports/scope-passport",
+            serde_json::json!({"name": "Scope"}),
+        ),
+        ("DELETE", "/v1/passports/scope-passport", serde_json::json!({})),
+        (
+            "POST",
+            "/v1/projects",
+            serde_json::json!({
+                "id": "scope-project",
+                "default_passport_id": "personal-default"
+            }),
+        ),
+        (
+            "PATCH",
+            "/v1/projects/scope-project",
+            serde_json::json!({"name": "Scope project"}),
+        ),
+        ("DELETE", "/v1/projects/scope-project", serde_json::json!({})),
+        (
+            "POST",
+            "/v1/projects/scope-project/passports",
+            serde_json::json!({"passport_id": "work-default"}),
+        ),
+        (
+            "DELETE",
+            "/v1/projects/scope-project/passports/work-default",
+            serde_json::json!({}),
+        ),
+        (
+            "POST",
+            "/v1/projects/scope-project/tenants",
+            serde_json::json!({"tenant_id": "tenant-a"}),
+        ),
+        (
+            "DELETE",
+            "/v1/projects/scope-project/tenants/tenant-a",
+            serde_json::json!({}),
+        ),
+        (
+            "POST",
+            "/v1/projects/scope-project/planes",
+            serde_json::json!({"id": "scope-plane"}),
+        ),
+        (
+            "DELETE",
+            "/v1/projects/scope-project/planes/scope-plane",
+            serde_json::json!({}),
+        ),
+        (
+            "POST",
+            "/v1/projects/scope-project/planes/scope-plane/passports",
+            serde_json::json!({"passport_id": "work-default"}),
+        ),
+        (
+            "DELETE",
+            "/v1/projects/scope-project/planes/scope-plane/passports/work-default",
+            serde_json::json!({}),
+        ),
+        (
+            "POST",
+            "/v1/projects/scope-project/planes/scope-plane/tenants",
+            serde_json::json!({"tenant_id": "tenant-a"}),
+        ),
+        (
+            "DELETE",
+            "/v1/projects/scope-project/planes/scope-plane/tenants/tenant-a",
+            serde_json::json!({}),
+        ),
+        ("POST", "/v1/workspace/scan", serde_json::json!({})),
+    ];
+
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let app = router_with_route_auth(state, test_case_store(), RouteAuthMode::Shadow);
+    for (method, uri, body) in cases {
+        let denied = app
+            .clone()
+            .oneshot(route_auth_json_request(method, uri, "admin:read", &body))
+            .await
+            .expect("admin:read response");
+        assert_eq!(
+            denied.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {uri} must reject admin:read in the handler"
+        );
+
+        let admitted = app
+            .clone()
+            .oneshot(route_auth_json_request(method, uri, "admin:write", &body))
+            .await
+            .expect("admin:write response");
+        assert!(
+            admitted.status() != StatusCode::UNAUTHORIZED && admitted.status() != StatusCode::FORBIDDEN,
+            "{method} {uri} must admit admin:write to the domain handler, got {}",
+            admitted.status()
         );
     }
 }

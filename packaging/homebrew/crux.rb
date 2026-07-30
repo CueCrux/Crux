@@ -90,6 +90,7 @@ class Crux < Formula
     keep_alive successful_exit: false
     environment_variables CORECRUXD_DATA_DIR: var/"crux",
                           CORECRUXD_AUTH_MODE: "dev_scopes",
+                          CORECRUXD_ROUTE_AUTH: "enforce",
                           CORECRUXD_UPDATE_CHECK_ENABLED: "0"
     working_dir var/"crux"
   end

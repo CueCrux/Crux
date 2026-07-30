@@ -209,7 +209,7 @@ jobs:
           # Stride 2 so this job's MCP port can never equal a neighbour's HTTP.
           HTTP_PORT=$((15000 + 2 * (${{ github.run_id }} % 4500)))
           MCP_PORT=$((HTTP_PORT + 1))
-          CORECRUXD_AUTH_MODE=dev_scopes CORECRUXD_DATA_DIR="$DATA_DIR" \
+          CORECRUXD_AUTH_MODE=dev_scopes CORECRUXD_ROUTE_AUTH=enforce CORECRUXD_DATA_DIR="$DATA_DIR" \
             CORECRUXD_HTTP_PORT="$HTTP_PORT" CORECRUXD_MCP_PORT="$MCP_PORT" \
             ./target/debug/corecruxd &
           PID=$!

@@ -393,6 +393,7 @@ Config via environment variables or YAML (`config.example.env`, `config.example.
 | Variable | Default | Description |
 |---|---|---|
 | `CORECRUXD_AUTH_MODE` | required | `off`, `dev_scopes`, `jwt_hs256`, or `jwt_jwks`. |
+| `CORECRUXD_ROUTE_AUTH` | derived | `enforce` when auth is enabled or the listener is non-loopback; otherwise `shadow`. Shipped packaging pins `enforce`. |
 | `CORECRUXD_DATA_DIR` | `../CoreCruxData/v1` | Data directory. |
 | `CORECRUXD_HTTP_PORT` | `14800` | HTTP API port. |
 | `CORECRUXD_GRPC_PORT` | `4007` | gRPC API port. |

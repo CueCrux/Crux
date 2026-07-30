@@ -458,7 +458,8 @@ pub fn router(state: AppState, case_store: self::cases::SharedCaseStore) -> Rout
     // Route-authorization posture is read ONCE here, at router build time, not
     // per request. Tests build the router via `router_with_route_auth` to pin an
     // explicit mode without touching the process-global env.
-    router_with_route_auth(state, case_store, self::route_auth::RouteAuthMode::from_env())
+    let route_auth_mode = self::route_auth::RouteAuthMode::from_env(state.auth.mode(), state.http_bind_loopback);
+    router_with_route_auth(state, case_store, route_auth_mode)
 }
 
 pub(crate) fn router_with_route_auth(
