@@ -4164,6 +4164,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcx-revocation"
+version = "0.5.53"
+dependencies = [
+ "rcx-capability-token",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "ureq 3.3.0",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
