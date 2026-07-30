@@ -1,0 +1,63 @@
+{
+  "_comment": [
+    "Reference wiring for the hooks in this directory. NOT read by anything —",
+    "Claude Code reads <workspace>/.claude/settings.json, which is machine-local",
+    "and holds absolute paths. This file exists so the wiring is recoverable:",
+    "when the hooks lived only in an untracked .claude/ directory, losing that",
+    "directory lost both the scripts and the knowledge of how they were hooked up.",
+    "Run scripts/hooks/install.sh to create the symlinks, then mirror the blocks",
+    "below into .claude/settings.json with your own absolute paths."
+  ],
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "<workspace>/.claude/hooks/punch-in-on-edit.sh",
+            "timeout": 5,
+            "_note": "Acquires a file-level punchcard. Advisory by default; CRUX_PUNCH_MODE=enforce blocks. Exits 0 on any daemon error — a coordination outage must not become a workstation outage."
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "<workspace>/.claude/hooks/punch-out-on-commit.sh",
+            "timeout": 10,
+            "_note": "Releases the cards for the paths a git commit named, stamping release_commit_sha. Files edited but not committed stay held."
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__crux__store_fact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "<workspace>/.claude/hooks/execplan-status-guard.sh",
+            "timeout": 5,
+            "_note": "Exit 2 when a terminal fact is stored but the plan's Status: line still reads live."
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "<workspace>/.claude/hooks/execplan-drift-boot.sh",
+            "timeout": 5,
+            "_note": "Board-drift summary at boot. Set CRUX_HTTP_URL when the daemon binds a tailnet address — loopback silently no-ops there."
+          }
+        ]
+      }
+    ]
+  }
+}
