@@ -82,7 +82,7 @@ pub(super) async fn post_project(
     headers: HeaderMap,
     Json(body): Json<CreateProjectBody>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;
@@ -141,7 +141,7 @@ pub(super) async fn patch_project(
     headers: HeaderMap,
     Json(body): Json<UpdateProjectBody>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;
@@ -176,7 +176,7 @@ pub(super) async fn delete_project(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;
@@ -198,7 +198,7 @@ pub(super) async fn post_project_member(
     headers: HeaderMap,
     Json(body): Json<AddMemberBody>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;
@@ -222,7 +222,7 @@ pub(super) async fn delete_project_member(
     Path((id, passport_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;
@@ -241,7 +241,7 @@ pub(super) async fn post_project_tenant(
     headers: HeaderMap,
     Json(body): Json<AddTenantBody>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;
@@ -268,7 +268,7 @@ pub(super) async fn delete_project_tenant(
     Path((id, tenant_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;

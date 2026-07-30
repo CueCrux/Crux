@@ -41,6 +41,7 @@ services:
       # dev_scopes is the local-development posture. For anything shared,
       # switch to jwt_hs256 / jwt_jwks — see docs/getting-started.md.
       - CORECRUXD_AUTH_MODE=dev_scopes
+      - CORECRUXD_ROUTE_AUTH=enforce
       - CORECRUXD_ALLOW_INSECURE_DEV_AUTH_BIND=1
       - CORECRUXD_HTTP_HOST=0.0.0.0
       - CORECRUXD_GRPC_HOST=0.0.0.0

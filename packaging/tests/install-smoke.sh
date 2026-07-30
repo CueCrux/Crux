@@ -77,6 +77,7 @@ EXPECTED_HOOK_VERSION="crux-hook ${TAG#v}"
 
 step "5/9 boot daemon"
 CORECRUXD_AUTH_MODE=dev_scopes \
+CORECRUXD_ROUTE_AUTH=enforce \
   CORECRUXD_DATA_DIR="${DATA_DIR}" \
   CORECRUXD_HTTP_PORT=14800 \
   "${PREFIX}/bin/crux" >"${PREFIX}/daemon.log" 2>&1 &

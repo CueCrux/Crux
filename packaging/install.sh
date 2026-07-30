@@ -205,6 +205,7 @@ After=network.target
 ExecStart=${BIN_DIR}/corecruxd
 Environment=CORECRUXD_DATA_DIR=${DATA_DIR}
 Environment=CORECRUXD_AUTH_MODE=dev_scopes
+Environment=CORECRUXD_ROUTE_AUTH=enforce
 # Binary installs have no git checkout to compare against; keep the
 # no-phone-home posture explicit.
 Environment=CORECRUXD_UPDATE_CHECK_ENABLED=0
@@ -231,6 +232,7 @@ EOF
   <dict>
     <key>CORECRUXD_DATA_DIR</key><string>${DATA_DIR}</string>
     <key>CORECRUXD_AUTH_MODE</key><string>dev_scopes</string>
+    <key>CORECRUXD_ROUTE_AUTH</key><string>enforce</string>
     <key>CORECRUXD_UPDATE_CHECK_ENABLED</key><string>0</string>
   </dict>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
@@ -261,7 +263,7 @@ if [ "$WITH_SERVICE" -eq 1 ]; then
   echo "       ${SERVICE_HINT}"
 else
   echo "  1. Start the daemon:"
-  echo "       CORECRUXD_AUTH_MODE=dev_scopes CORECRUXD_DATA_DIR='${DATA_DIR}' '${BIN_DIR}/crux'"
+  echo "       CORECRUXD_AUTH_MODE=dev_scopes CORECRUXD_ROUTE_AUTH=enforce CORECRUXD_DATA_DIR='${DATA_DIR}' '${BIN_DIR}/crux'"
 fi
 echo "  2. Open the console:    http://127.0.0.1:14800"
 echo "  3. Guided first fact:   '${BIN_DIR}/corecruxctl' quickstart"

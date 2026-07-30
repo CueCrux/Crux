@@ -128,25 +128,29 @@ namespace that overlaps these strings. Do not conflate them — see chapter 3.
 ### The route-auth middleware
 
 Independent of the per-handler `require_http_scopes` calls, a middleware
-classifies routes by prefix. `CORECRUXD_ROUTE_AUTH` selects `off`, `shadow`
-(the default) or `enforce`
-([route_auth.rs:576](../../crates/corecruxd/src/http/route_auth.rs#L576)).
+classifies routes by method and matched route template.
+`CORECRUXD_ROUTE_AUTH` selects `off`, `shadow`, or `enforce`
+([route_auth.rs:692](../../crates/corecruxd/src/http/route_auth.rs#L692)).
+When unset it derives `enforce` for authenticated or non-loopback operation and
+`shadow` only for auth-off loopback development; malformed explicit values fail
+safe to `enforce`.
 
 | Prefix | Class | Any-of scopes |
 |---|---|---|
-| `/v1/studio/library/` POST | **write** | `facts:write`, `admin:write` ([route_auth.rs:144](../../crates/corecruxd/src/http/route_auth.rs#L144)) |
-| `/v1/studio/` (everything else) | read | `query:read`, `admin:read` ([route_auth.rs:157](../../crates/corecruxd/src/http/route_auth.rs#L157)) |
-| `/v1/extensions` GET | read | `admin:read`, `facts:read`, `query:read`, `sessions:read` ([route_auth.rs:386](../../crates/corecruxd/src/http/route_auth.rs#L386)) |
+| `/v1/studio/library/` POST | **write** | `facts:write`, `admin:write` ([route_auth.rs:169](../../crates/corecruxd/src/http/route_auth.rs#L169)) |
+| `/v1/studio/` (everything else) | read | `query:read`, `admin:read` ([route_auth.rs:181](../../crates/corecruxd/src/http/route_auth.rs#L181)) |
+| `/v1/extensions` GET | read | `admin:read`, `facts:read`, `query:read`, `sessions:read` ([route_auth.rs:492](../../crates/corecruxd/src/http/route_auth.rs#L492)) |
 | `/v1/extensions` non-GET | write | `admin:write`, `facts:write`, `integrations:install` |
-| `/v1/integrations/` | write | `integrations:install`, `integrations:disable` ([route_auth.rs:326](../../crates/corecruxd/src/http/route_auth.rs#L326)) |
+| `/v1/integrations/` | write | `integrations:install`, `integrations:disable` ([route_auth.rs:356](../../crates/corecruxd/src/http/route_auth.rs#L356)) |
 
-In `shadow` the middleware logs; in `enforce` it rejects. The handler's own
+In `shadow` the middleware logs; in `enforce` it rejects. Shipped packaging
+sets `enforce` explicitly. The handler's own
 `require_http_scopes` always applies.
 
 The Studio carve-out is worth noting as a pattern: the install route is the one
 `/v1/studio/` route that mutates, so it is classified ahead of the read-class
 prefix rule to guarantee a read token can never authorise an install
-([route_auth.rs:144](../../crates/corecruxd/src/http/route_auth.rs#L144)). If you add a
+([route_auth.rs:169](../../crates/corecruxd/src/http/route_auth.rs#L169)). If you add a
 mutating route under a read-class prefix, do the same.
 
 ## 1.5 Errors are RFC 7807
@@ -214,8 +218,8 @@ without failing CI.
 - [crates/corecruxd/src/auth.rs:24](../../crates/corecruxd/src/auth.rs#L24) — `AuthMode`
 - [crates/corecruxd/src/auth.rs:1320](../../crates/corecruxd/src/auth.rs#L1320) — `require_http_scopes`
 - [crates/corecruxd/src/main.rs:307](../../crates/corecruxd/src/main.rs#L307) — auth-mode-required abort
-- [crates/corecruxd/src/http/route_auth.rs:157](../../crates/corecruxd/src/http/route_auth.rs#L157) — studio route class
-- [crates/corecruxd/src/http/route_auth.rs:386](../../crates/corecruxd/src/http/route_auth.rs#L386) — extensions route class
+- [crates/corecruxd/src/http/route_auth.rs:181](../../crates/corecruxd/src/http/route_auth.rs#L181) — studio route class
+- [crates/corecruxd/src/http/route_auth.rs:492](../../crates/corecruxd/src/http/route_auth.rs#L492) — extensions route class
 - [crates/corecruxd/src/http/mod.rs:1788](../../crates/corecruxd/src/http/mod.rs#L1788) — `problem_response`
 - [crates/corecrux-types/src/lib.rs:783](../../crates/corecrux-types/src/lib.rs#L783) — `ProblemDetails`
 - [crates/corecruxd/src/extension_registry.rs:29](../../crates/corecruxd/src/extension_registry.rs#L29) — extension fact prefix

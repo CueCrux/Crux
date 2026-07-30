@@ -20,7 +20,7 @@ use crate::workspace_scan::{LATEST_SCAN_ENTITY, SCAN_KEY};
 /// persisted as a fact.
 #[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_scan(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let scan_result = tokio::task::spawn_blocking(crate::workspace_scan::run_scan).await;
