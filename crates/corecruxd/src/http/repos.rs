@@ -250,9 +250,29 @@ pub(super) async fn post_repo(
         watcher.start_repo(registration.clone()).await;
     }
 
+    // M4 soft cap. Registration is NEVER refused for being over allowance: the
+    // allowance is a commercial limit, and turning it into a technical one would
+    // break a paying customer mid-sprint over a billing question. The overage is
+    // reported on the response that created it, so the signal arrives at the
+    // moment it becomes true rather than waiting to be polled.
+    //
+    // Computed at default seats/packs because neither is sourced from a
+    // subscription yet (see repo_allowance docs); `basis` says so on the wire
+    // rather than letting a caller mistake the default for the account's real
+    // entitlement.
+    let allowance = {
+        let store = state.fact_store.read().await;
+        crate::repo_allowance::allowance_for_tenant(&store, &tenant_id, 1, 0)
+    };
+
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "repo": registration, "note": note })),
+        Json(serde_json::json!({
+            "repo": registration,
+            "note": note,
+            "allowance": allowance,
+            "allowance_basis": "default seats=1 packs=0; not yet sourced from a subscription",
+        })),
     )
         .into_response()
 }
