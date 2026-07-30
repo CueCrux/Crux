@@ -128,7 +128,68 @@ pub struct Event {
     /// only (often `HEAD`/detached or a `feat/...` name that doesn't map cleanly
     /// to a dated slug) — never introduces a slug on its own.
     pub git_branch: Option<String>,
+    /// The assistant record's `message.model`, run through [`normalize_model`].
+    /// `None` on records that named no model (user/meta turns, and the handful
+    /// of assistant records that carry none).
+    pub model: Option<String>,
+    /// The record's top-level `effort` (`xhigh` / `high` / `max`).
+    ///
+    /// **Missing non-randomly.** Across the 2026-07-30 corpus (46,239 assistant
+    /// records) its presence correlates almost perfectly with model: 100% on
+    /// `claude-opus-5` and `claude-sonnet-5`, 22.5% on `claude-fable-5`, 9.4% on
+    /// `claude-opus-4-8`. Per-effort burn *within* a model is sound; comparing
+    /// an effort level *across* models is confounded at source, which is why
+    /// every surface must carry the coverage figure beside the number.
+    pub effort: Option<String>,
+    /// The record's `cwd`. Varies within a session (a `cd` moves it), so the
+    /// report carries the most common one, like [`Self::git_branch`].
+    pub cwd: Option<String>,
 }
+
+/// Model-id normalisation, applied at parse time.
+///
+/// Deliberately narrow. It folds *presentation* variants of one id — a context
+/// window suffix (`claude-opus-5[1m]`), a vendor route prefix
+/// (`us.anthropic.claude-opus-5`), a Bedrock version suffix (`…-v1:0`) — and
+/// passes **everything else through verbatim**, so a model id this build has
+/// never seen becomes its own visible bucket rather than silently merging into
+/// a neighbouring one.
+///
+/// Floating aliases (`opus`, `sonnet`) are **not** resolved. `--model opus`
+/// resolved to `claude-opus-4-8` on 2026-07-24, and it will resolve elsewhere
+/// later; baking that mapping in would silently merge two different models the
+/// day the alias moves — precisely the failure this function exists to prevent.
+/// An unresolved alias shows up as its own row, which is a question the reader
+/// can see rather than an answer they cannot check.
+#[must_use]
+pub fn normalize_model(raw: &str) -> String {
+    let mut s = raw.trim();
+    for prefix in [
+        "us.anthropic.",
+        "eu.anthropic.",
+        "apac.anthropic.",
+        "anthropic.",
+        "bedrock/",
+        "vertex/",
+    ] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest;
+            break;
+        }
+    }
+    // `claude-opus-5[1m]` — the 1M-context variant of the same model.
+    if let Some((head, _)) = s.split_once('[') {
+        s = head;
+    }
+    // Bedrock/Vertex version suffix: `claude-opus-5-v1:0`.
+    let s = s.split_once("-v1:").map_or(s, |(head, _)| head);
+    s.trim().to_owned()
+}
+
+/// The `model` string Claude Code stamps on records it synthesised itself
+/// (compaction summaries and the like) rather than obtaining from a model.
+/// Counted, but never charted as a model — it is not one.
+pub const SYNTHETIC_MODEL: &str = "<synthetic>";
 
 /// Cheap shape check for the Claude Code transcript timestamp: a fixed-width
 /// RFC3339 UTC instant like `2026-06-25T11:38:40.060Z`. Strings of this form
@@ -249,6 +310,23 @@ fn parse_record(value: &Value, tool_names: &mut HashMap<String, String>, capture
         .filter(|s| !s.is_empty() && *s != "HEAD")
         .map(str::to_owned);
 
+    let model = message
+        .and_then(|m| m.get("model"))
+        .or_else(|| value.get("model"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(normalize_model);
+
+    let effort = value.get("effort").and_then(parse_effort);
+
+    let cwd = value
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+
     Event {
         kind,
         usage,
@@ -257,6 +335,29 @@ fn parse_record(value: &Value, tool_names: &mut HashMap<String, String>, capture
         timestamp,
         execplan_signals,
         git_branch,
+        model,
+        effort,
+        cwd,
+    }
+}
+
+/// `effort` is a plain top-level string in every Claude Code transcript measured
+/// on 2026-07-30 (18,022 string values, zero objects across 105 transcripts).
+/// The nested `{"level": …}` arm is defensive: the shape is documented for the
+/// observation payload but could not be reproduced in this corpus, and a parser
+/// that silently drops a shape it half-expects is how a coverage figure quietly
+/// becomes wrong.
+fn parse_effort(raw: &Value) -> Option<String> {
+    let s = match raw {
+        Value::String(s) => s.as_str(),
+        Value::Object(_) => raw.get("level").or_else(|| raw.get("effort")).and_then(Value::as_str)?,
+        _ => return None,
+    };
+    let s = s.trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_owned())
     }
 }
 
@@ -775,5 +876,81 @@ mod tests {
             "content":[{"type":"tool_use","id":"t1","name":"mcp__crux__store_fact","input":"oops"}]}})
         .to_string();
         assert!(first_signals(&rec).is_empty());
+    }
+
+    #[test]
+    fn model_effort_and_cwd_are_parsed_off_the_record() {
+        let rec = json!({"type":"assistant","sessionId":"s","effort":"xhigh","cwd":"/home/w",
+            "message":{"role":"assistant","model":"claude-opus-5","content":[]}})
+        .to_string();
+        let e = &parse_str(&rec)[0];
+        assert_eq!(e.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(e.effort.as_deref(), Some("xhigh"));
+        assert_eq!(e.cwd.as_deref(), Some("/home/w"));
+    }
+
+    #[test]
+    fn absent_and_blank_model_effort_cwd_are_none() {
+        // The 61%-of-corpus case: a record with no `effort` at all, and one with
+        // an empty string, must both read as absent — an empty bucket would
+        // inflate the coverage figure that qualifies every effort number.
+        let bare = json!({"type":"assistant","sessionId":"s","message":{"role":"assistant","content":[]}}).to_string();
+        let e = &parse_str(&bare)[0];
+        assert!(e.model.is_none() && e.effort.is_none() && e.cwd.is_none());
+
+        let blank = json!({"type":"assistant","sessionId":"s","effort":"  ","cwd":"",
+            "message":{"role":"assistant","model":"  ","content":[]}})
+        .to_string();
+        let e = &parse_str(&blank)[0];
+        assert!(e.model.is_none() && e.effort.is_none() && e.cwd.is_none());
+    }
+
+    #[test]
+    fn effort_accepts_the_string_and_the_nested_shape() {
+        // String is what every record in the measured corpus uses.
+        let s = json!({"type":"assistant","sessionId":"s","effort":"high","message":{"role":"assistant","content":[]}})
+            .to_string();
+        assert_eq!(parse_str(&s)[0].effort.as_deref(), Some("high"));
+        // Nested is defensive — documented for the observation payload, not
+        // reproduced in the corpus. Tolerated rather than silently dropped.
+        let nested =
+            json!({"type":"assistant","sessionId":"s","effort":{"level":"max"},"message":{"role":"assistant","content":[]}})
+                .to_string();
+        assert_eq!(parse_str(&nested)[0].effort.as_deref(), Some("max"));
+        // A shape with neither key yields nothing, and must not panic.
+        let odd =
+            json!({"type":"assistant","sessionId":"s","effort":{"x":1},"message":{"role":"assistant","content":[]}})
+                .to_string();
+        assert!(parse_str(&odd)[0].effort.is_none());
+        let numeric =
+            json!({"type":"assistant","sessionId":"s","effort":3,"message":{"role":"assistant","content":[]}})
+                .to_string();
+        assert!(parse_str(&numeric)[0].effort.is_none());
+    }
+
+    #[test]
+    fn synthetic_model_is_parsed_as_itself() {
+        let rec = json!({"type":"assistant","sessionId":"s",
+            "message":{"role":"assistant","model":"<synthetic>","content":[]}})
+        .to_string();
+        assert_eq!(parse_str(&rec)[0].model.as_deref(), Some(SYNTHETIC_MODEL));
+    }
+
+    #[test]
+    fn normalisation_folds_variants_and_passes_the_rest_through() {
+        // Context-window variant and vendor routes are presentation, not identity.
+        assert_eq!(normalize_model("claude-opus-5[1m]"), "claude-opus-5");
+        assert_eq!(normalize_model("us.anthropic.claude-opus-5"), "claude-opus-5");
+        assert_eq!(normalize_model("anthropic.claude-sonnet-5-v1:0"), "claude-sonnet-5");
+        assert_eq!(normalize_model("bedrock/claude-opus-5"), "claude-opus-5");
+        assert_eq!(normalize_model("  claude-fable-5  "), "claude-fable-5");
+        // Everything else verbatim — including floating aliases, which are
+        // deliberately NOT resolved: `--model opus` meant claude-opus-4-8 on
+        // 2026-07-24 and will mean something else later, so resolving it here
+        // would silently merge two models the day it moves.
+        assert_eq!(normalize_model("opus"), "opus");
+        assert_eq!(normalize_model("sonnet"), "sonnet");
+        assert_eq!(normalize_model("claude-opus-7-preview"), "claude-opus-7-preview");
+        assert_eq!(normalize_model(SYNTHETIC_MODEL), SYNTHETIC_MODEL);
     }
 }
