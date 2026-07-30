@@ -49,12 +49,27 @@ fn local_bin_dir() -> Result<PathBuf, DynErr> {
 const WRAPPER_SH: &str = r#"#!/usr/bin/env bash
 # Crux hook launcher for Claude Code (installed by `corecruxctl hooks install`).
 # Sources ~/.config/cuecrux/env (0600) so the token never lives in settings.json.
+# Bumped whenever a launcher mode changes behaviour an operator can observe, so
+# `corecruxctl hooks status` can name a stale install instead of leaving the
+# operator to wonder why a shipped fix appears to do nothing.
+CRUX_HOOK_ENV_VERSION=2
 set -a
 # shellcheck disable=SC1090
 . "$HOME/.config/cuecrux/env" 2>/dev/null || true
 set +a
 export PATH="$HOME/.local/bin:$PATH"
 export CRUX_MCP_URL="${CRUX_MCP_URL:-http://127.0.0.1:14801/mcp}"
+# Remember whether the endpoint came from the operator's env file or from the
+# built-in loopback default *before* defaulting collapses the difference. A
+# posting failure against an unconfigured default is a setup problem
+# ("you never ran `corecruxctl login --url`"), not an outage, and the cost
+# hook's outcome record is the only place that distinction ever surfaces.
+if [ -n "${CRUX_HTTP_URL:-}" ]; then
+  CRUX_HTTP_URL_SOURCE=config
+else
+  CRUX_HTTP_URL_SOURCE=default
+fi
+export CRUX_HTTP_URL_SOURCE
 export CRUX_HTTP_URL="${CRUX_HTTP_URL:-http://127.0.0.1:14800}"
 export CORECRUXD_URL="${CRUX_HTTP_URL}"
 export CORECRUXD_AUTH_TOKEN="${CRUX_AGENT_TOKEN:-}"
@@ -80,17 +95,55 @@ case "$mode" in
     # SessionEnd: post the just-ended transcript's token-burn cost report to the
     # daemon (feeds the cx-cost lens + per-ExecPlan token_burn). Read the hook
     # payload on stdin for the exact transcript path; fall back to the newest.
+    #
     # Quiet + non-fatal — a missing corecruxctl / expired token / parse error
-    # must never block session end (the cost-sweep timer backstops misses).
+    # must never block session end (the cost-sweep timer backstops misses), so
+    # `exit 0` is unconditional on every path below. Quiet is not the same as
+    # undiagnosable, though: the previous version swallowed all three failure
+    # modes with `|| true` and left no way to tell "no sessions ran" apart from
+    # "every session silently failed to post". Every attempt now writes its
+    # outcome to $cost_state, and failures append one line to $cost_log.
+    cost_dir="$HOME/.claude/hooks"
+    cost_state="$cost_dir/crux-cost.state.json"
+    cost_log="$cost_dir/crux-cost.errors.log"
+    mkdir -p "$cost_dir" 2>/dev/null || true
+    # Strip the two characters that would break the single-line JSON record, and
+    # flatten newlines: reasons carry CLI stderr, which is neither short nor tame.
+    cost_clean() { printf '%s' "$1" | tr -d '\\"' | tr '\n\r\t' '   ' | cut -c1-300; }
+    # $1 = ok|failed|never_attempted, $2 = reason (empty on ok), $3 = transcript
+    cost_record() {
+      cost_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
+      printf '{"at":"%s","result":"%s","reason":"%s","transcript":"%s","url":"%s","url_source":"%s","hook_version":"%s"}\n' \
+        "$cost_ts" "$1" "$(cost_clean "$2")" "$(cost_clean "$3")" \
+        "$(cost_clean "$CRUX_HTTP_URL")" "$CRUX_HTTP_URL_SOURCE" "$CRUX_HOOK_ENV_VERSION" \
+        > "$cost_state" 2>/dev/null || true
+      if [ "$1" != ok ]; then
+        printf '%s [cost] %s: %s (url=%s source=%s)\n' \
+          "$cost_ts" "$1" "$(cost_clean "$2")" "$CRUX_HTTP_URL" "$CRUX_HTTP_URL_SOURCE" \
+          >> "$cost_log" 2>/dev/null || true
+      fi
+    }
     payload="$(cat 2>/dev/null || true)"
     tx="$(printf '%s' "$payload" | jq -r '.transcript_path // empty' 2>/dev/null || true)"
     ctl="$(command -v corecruxctl 2>/dev/null || echo "$HOME/.local/bin/corecruxctl")"
-    if [ -x "$ctl" ]; then
-      if [ -n "$tx" ] && [ -f "$tx" ]; then
-        "$ctl" session cost --post --file "$tx" --url "${CRUX_HTTP_URL}" >/dev/null 2>&1 || true
-      else
-        "$ctl" session cost --post --url "${CRUX_HTTP_URL}" >/dev/null 2>&1 || true
-      fi
+    if [ ! -x "$ctl" ]; then
+      cost_record never_attempted "corecruxctl not found or not executable at $ctl" "$tx"
+      exit 0
+    fi
+    if [ -n "$tx" ] && [ -f "$tx" ]; then
+      cost_err="$("$ctl" session cost --post --file "$tx" --url "${CRUX_HTTP_URL}" 2>&1 >/dev/null)"; cost_rc=$?
+    else
+      tx=""
+      cost_err="$("$ctl" session cost --post --url "${CRUX_HTTP_URL}" 2>&1 >/dev/null)"; cost_rc=$?
+    fi
+    if [ "$cost_rc" -eq 0 ]; then
+      cost_record ok "" "$tx"
+    elif [ "$CRUX_HTTP_URL_SOURCE" = default ]; then
+      # The endpoint was never configured, so this is the loopback default. Say
+      # that rather than reporting a connection refused the operator cannot place.
+      cost_record failed "post failed (rc=$cost_rc) against the unconfigured default endpoint - run: corecruxctl hooks install --endpoint <url>: $cost_err" "$tx"
+    else
+      cost_record failed "post failed (rc=$cost_rc): $cost_err" "$tx"
     fi
     exit 0 ;;
   *) echo "crux-hook-env: unknown mode '$mode'" >&2; exit 0 ;;
@@ -496,7 +549,7 @@ pub fn status(user: bool, project: Option<PathBuf>) -> Result<String, DynErr> {
         "crux-hook binary: {}",
         locate_crux_hook().map_or("not found".into(), |p| p.display().to_string())
     );
-    let _ = write!(
+    let _ = writeln!(
         out,
         "jq: {}",
         if jq_present() {
@@ -505,7 +558,152 @@ pub fn status(user: bool, project: Option<PathBuf>) -> Result<String, DynErr> {
             "MISSING (observe hooks need it)"
         }
     );
+    let _ = write!(out, "{}", cost_capture()?.report());
     Ok(out)
+}
+
+// ── SessionEnd cost-capture diagnosability ──────────────────────────────────
+
+/// Version of the [`WRAPPER_SH`] launcher template this binary ships. Bumped
+/// whenever a launcher mode changes observable behaviour; the `cost)` branch
+/// stamps it into every outcome record so a stale on-disk launcher is
+/// self-identifying rather than mysterious.
+pub const HOOK_ENV_VERSION: &str = "2";
+
+/// Where the `cost)` launcher mode records its last outcome. Sits beside the
+/// observe/filemod error logs (`~/.claude/hooks/`) rather than under the hooks
+/// *script* dir, because it is operator-facing state, not an installed asset.
+fn cost_state_path() -> Result<PathBuf, DynErr> {
+    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
+    Ok(Path::new(&home)
+        .join(".claude")
+        .join("hooks")
+        .join("crux-cost.state.json"))
+}
+
+/// The last recorded outcome of the SessionEnd cost-capture hook, plus whether
+/// the launcher that would run next is the version this binary ships.
+///
+/// Exists because the previous `cost)` branch failed silently on three paths, so
+/// an operator had no way to tell "no sessions ran" from "every session failed
+/// to post". One command now answers that.
+#[derive(Debug, Clone)]
+pub struct CostCapture {
+    /// `ok`, `failed`, or `never_attempted`; `None` when no attempt was ever
+    /// recorded (either the hook has not run, or it predates the outcome record).
+    pub result: Option<String>,
+    /// RFC3339 timestamp of that attempt.
+    pub at: Option<String>,
+    /// Terse failure reason; empty/absent on success.
+    pub reason: Option<String>,
+    /// Endpoint the post was aimed at, and whether it was configured or the
+    /// built-in loopback default — the single most common cause of a silent miss.
+    pub url: Option<String>,
+    /// `config` or `default`.
+    pub url_source: Option<String>,
+    /// `CRUX_HOOK_ENV_VERSION` parsed out of the *installed* launcher script;
+    /// `None` when the launcher is absent or predates the marker.
+    pub installed_version: Option<String>,
+    /// Path of the state file (named so the operator can go and read it).
+    pub state_path: PathBuf,
+}
+
+impl CostCapture {
+    /// True when the installed launcher is the version this binary ships — i.e.
+    /// the shipped fix is actually the code that will run at the next session end.
+    #[must_use]
+    pub fn launcher_current(&self) -> bool {
+        self.installed_version.as_deref() == Some(HOOK_ENV_VERSION)
+    }
+
+    /// Human report block, appended to `hooks status`.
+    #[must_use]
+    pub fn report(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::from("\ncost capture (SessionEnd → /v1/cost/report):\n");
+        match self.result.as_deref() {
+            Some(r) => {
+                let _ = writeln!(out, "  last attempt: {r} at {}", self.at.as_deref().unwrap_or("?"));
+                if let Some(reason) = self.reason.as_deref().filter(|s| !s.is_empty()) {
+                    let _ = writeln!(out, "    reason: {reason}");
+                }
+                if let Some(url) = self.url.as_deref() {
+                    let src = self.url_source.as_deref().unwrap_or("?");
+                    let _ = writeln!(out, "    endpoint: {url} ({src})");
+                }
+            }
+            None => {
+                let _ = writeln!(
+                    out,
+                    "  last attempt: none recorded — no session has ended since the hook was installed, \
+                     or the launcher predates outcome recording"
+                );
+            }
+        }
+        match &self.installed_version {
+            Some(v) if v == HOOK_ENV_VERSION => {
+                let _ = writeln!(out, "  launcher: v{v} (current)");
+            }
+            Some(v) => {
+                let _ = writeln!(
+                    out,
+                    "  launcher: v{v} — STALE (this binary ships v{HOOK_ENV_VERSION}); \
+                     re-run `corecruxctl hooks install` or cost capture keeps failing silently"
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    out,
+                    "  launcher: pre-v{HOOK_ENV_VERSION} or not installed — the old `cost)` branch swallows \
+                     every failure; re-run `corecruxctl hooks install`"
+                );
+            }
+        }
+        let _ = write!(out, "  state: {}", self.state_path.display());
+        out
+    }
+}
+
+/// Read the cost-capture outcome record and the installed launcher's version.
+/// Read-only and fail-soft — a missing or malformed record reports "none", never
+/// an error, so a status call is safe on a machine that has never run the hook.
+///
+/// # Errors
+/// Returns an error only when `HOME` is unset (no path can be resolved at all).
+pub fn cost_capture() -> Result<CostCapture, DynErr> {
+    let state_path = cost_state_path()?;
+    let installed_version = std::fs::read_to_string(hooks_dir()?.join("crux-hook-env.sh"))
+        .ok()
+        .and_then(|s| parse_hook_env_version(&s));
+    let record: Option<serde_json::Value> = std::fs::read_to_string(&state_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(s.trim()).ok());
+    let field = |k: &str| {
+        record
+            .as_ref()
+            .and_then(|v| v.get(k))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    Ok(CostCapture {
+        result: field("result"),
+        at: field("at"),
+        reason: field("reason"),
+        url: field("url"),
+        url_source: field("url_source"),
+        installed_version,
+        state_path,
+    })
+}
+
+/// Pull `CRUX_HOOK_ENV_VERSION=<v>` out of an installed launcher script.
+fn parse_hook_env_version(script: &str) -> Option<String> {
+    script.lines().find_map(|l| {
+        l.trim()
+            .strip_prefix("CRUX_HOOK_ENV_VERSION=")
+            .map(|v| v.trim().trim_matches(&['"', '\''][..]).to_owned())
+            .filter(|v| !v.is_empty())
+    })
 }
 
 /// One component of the client-side banner stack, and how its on-disk state
@@ -1047,6 +1245,280 @@ mod tests {
         std::env::set_var("HOME", &home);
         // No ~/.claude/settings.json → the "not present" branch.
         status(true, None).unwrap();
+    }
+
+    #[test]
+    fn hook_env_version_marker_matches_the_shipped_constant() {
+        // The launcher stamps this into every outcome record, and `hooks status`
+        // compares it against the on-disk script to name a stale install. If the
+        // two drift, a stale launcher reports itself as current.
+        assert!(
+            WRAPPER_SH.contains(&format!("CRUX_HOOK_ENV_VERSION={HOOK_ENV_VERSION}")),
+            "WRAPPER_SH must declare CRUX_HOOK_ENV_VERSION={HOOK_ENV_VERSION}"
+        );
+        assert_eq!(parse_hook_env_version(WRAPPER_SH).as_deref(), Some(HOOK_ENV_VERSION));
+    }
+
+    #[test]
+    fn hook_env_version_parses_quoted_and_missing() {
+        assert_eq!(
+            parse_hook_env_version("CRUX_HOOK_ENV_VERSION=\"7\"\n").as_deref(),
+            Some("7")
+        );
+        assert_eq!(
+            parse_hook_env_version("CRUX_HOOK_ENV_VERSION='9'\n").as_deref(),
+            Some("9")
+        );
+        // The pre-fix launcher carried no marker at all — that is what "stale".
+        assert_eq!(parse_hook_env_version("set -a\nexec crux-hook\n"), None);
+        assert_eq!(parse_hook_env_version("CRUX_HOOK_ENV_VERSION=\n"), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cost_capture_reports_no_record_and_a_stale_launcher() {
+        let home = tmp();
+        std::env::set_var("HOME", &home);
+        // Nothing installed: no record, no launcher.
+        let c = cost_capture().unwrap();
+        assert!(c.result.is_none());
+        assert!(!c.launcher_current());
+        assert!(c.report().contains("none recorded"));
+
+        // A pre-fix launcher on disk must be named STALE, not silently accepted.
+        let dir = home.join(".local/share/crux/hooks");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("crux-hook-env.sh"), "#!/usr/bin/env bash\nexit 0\n").unwrap();
+        let c = cost_capture().unwrap();
+        assert!(!c.launcher_current());
+        assert!(c.report().contains("hooks install"), "must give the remedy");
+
+        // The shipped launcher reads as current.
+        std::fs::write(dir.join("crux-hook-env.sh"), WRAPPER_SH).unwrap();
+        let c = cost_capture().unwrap();
+        assert!(c.launcher_current());
+        assert!(c.report().contains("(current)"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cost_capture_reads_a_recorded_outcome() {
+        let home = tmp();
+        std::env::set_var("HOME", &home);
+        let hooks = home.join(".claude/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(
+            hooks.join("crux-cost.state.json"),
+            r#"{"at":"2026-07-30T10:00:00Z","result":"failed","reason":"post failed (rc=1)","transcript":"","url":"http://127.0.0.1:14800","url_source":"default","hook_version":"2"}"#,
+        )
+        .unwrap();
+        let c = cost_capture().unwrap();
+        assert_eq!(c.result.as_deref(), Some("failed"));
+        assert_eq!(c.url_source.as_deref(), Some("default"));
+        let r = c.report();
+        assert!(r.contains("failed at 2026-07-30T10:00:00Z"));
+        assert!(r.contains("post failed (rc=1)"));
+        assert!(r.contains("(default)"));
+
+        // A truncated / half-written record must degrade to "none", never error.
+        std::fs::write(hooks.join("crux-cost.state.json"), "{not json").unwrap();
+        assert!(cost_capture().unwrap().result.is_none());
+    }
+}
+
+/// Shell-level tests for the SessionEnd `cost)` launcher mode.
+///
+/// This is the branch that failed silently on three paths, and it had **no**
+/// coverage of any kind — which is exactly why the defect survived long enough
+/// for the cost leg and the observation leg to reach zero empirical overlap.
+/// Each test runs the *embedded* `WRAPPER_SH` under `bash` in a tempdir HOME, so
+/// it cannot drift from what `hooks install` writes. Every one asserts exit 0:
+/// a SessionEnd hook must never block session end, whatever else it records.
+#[cfg(all(test, unix))]
+#[allow(clippy::unwrap_used)]
+mod cost_hook_shell {
+    use super::*;
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    /// Outcome of one launcher run: exit code, the parsed state record, and the
+    /// error log (empty when absent).
+    struct Run {
+        code: i32,
+        state: Option<serde_json::Value>,
+        log: String,
+    }
+
+    impl Run {
+        fn field(&self, k: &str) -> String {
+            self.state
+                .as_ref()
+                .and_then(|v| v.get(k))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        }
+    }
+
+    /// Materialise the launcher into a tempdir HOME and run `cost` with `payload`
+    /// on stdin. `ctl` is the body of a stub `corecruxctl` (None ⇒ do not install
+    /// one, i.e. the "absent" path). `url` sets `CRUX_HTTP_URL`; None leaves it
+    /// unset, which is the unconfigured-default path.
+    fn run_cost(ctl: Option<&str>, url: Option<&str>, payload: &str) -> Run {
+        let home = super::tests::tmp();
+        let stub = home.join("stubbin");
+        std::fs::create_dir_all(&stub).unwrap();
+        if let Some(body) = ctl {
+            let p = stub.join("corecruxctl");
+            std::fs::write(&p, body).unwrap();
+            chmod_exec(&p);
+        }
+        // The launcher reads the payload with jq. Link the ambient one into the
+        // stub dir rather than trusting /usr/bin: on a machine that installs jq
+        // to ~/.local/bin (this one) the constrained PATH would not find it, and
+        // the payload test would quietly degrade into a no-op.
+        if let Some(jq) = resolve_on_path("jq") {
+            let _ = std::os::unix::fs::symlink(jq, stub.join("jq"));
+        }
+        let wrapper = home.join("crux-hook-env.sh");
+        std::fs::write(&wrapper, WRAPPER_SH).unwrap();
+        chmod_exec(&wrapper);
+
+        let path = format!("{}:/usr/bin:/bin", stub.display());
+        let mut cmd = Command::new("bash");
+        cmd.arg(&wrapper)
+            .arg("cost")
+            .env("HOME", &home)
+            .env("PATH", &path)
+            .env_remove("CRUX_HTTP_URL")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(u) = url {
+            cmd.env("CRUX_HTTP_URL", u);
+        }
+        let mut child = cmd.spawn().unwrap();
+        if let Some(mut si) = child.stdin.take() {
+            let _ = si.write_all(payload.as_bytes());
+        }
+        let code = child.wait().unwrap().code().unwrap_or(-1);
+
+        let hooks = home.join(".claude/hooks");
+        let state = std::fs::read_to_string(hooks.join("crux-cost.state.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s.trim()).ok());
+        let log = std::fs::read_to_string(hooks.join("crux-cost.errors.log")).unwrap_or_default();
+        Run { code, state, log }
+    }
+
+    fn chmod_exec(p: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// First `name` on the *ambient* PATH (the test process's, not the
+    /// constrained one handed to the launcher).
+    fn resolve_on_path(name: &str) -> Option<PathBuf> {
+        let paths = std::env::var_os("PATH")?;
+        std::env::split_paths(&paths)
+            .map(|d| d.join(name))
+            .find(|p| p.is_file())
+    }
+
+    /// Path 1 of the defect: `corecruxctl` absent or not executable. The old
+    /// branch skipped the whole `if` and exited 0 with no trace whatsoever.
+    #[test]
+    fn missing_corecruxctl_records_never_attempted_and_exits_zero() {
+        assert!(
+            !Path::new("/usr/bin/corecruxctl").exists() && !Path::new("/bin/corecruxctl").exists(),
+            "test needs corecruxctl to be unresolvable on the constrained PATH"
+        );
+        let r = run_cost(None, Some("http://127.0.0.1:14800"), "{}");
+        assert_eq!(r.code, 0, "SessionEnd must never block session end");
+        assert_eq!(r.field("result"), "never_attempted");
+        assert!(
+            r.field("reason").contains("corecruxctl"),
+            "reason: {}",
+            r.field("reason")
+        );
+        assert!(r.log.contains("never_attempted"), "failures must also hit the log");
+    }
+
+    /// Path 2: no endpoint was ever configured, so the post goes to the built-in
+    /// loopback default and fails. The record must name *that*, not a bare
+    /// connection error the operator cannot place.
+    #[test]
+    fn unconfigured_endpoint_records_failed_with_the_setup_remedy() {
+        let r = run_cost(Some("#!/bin/sh\nexit 7\n"), None, "{}");
+        assert_eq!(r.code, 0);
+        assert_eq!(r.field("result"), "failed");
+        assert_eq!(r.field("url_source"), "default");
+        assert_eq!(r.field("url"), "http://127.0.0.1:14800");
+        let reason = r.field("reason");
+        assert!(reason.contains("unconfigured default"), "reason: {reason}");
+        assert!(reason.contains("rc=7"), "reason must carry the exit code: {reason}");
+    }
+
+    /// Path 3: a configured endpoint, post rejected (expired token, daemon down,
+    /// parse error). The CLI's stderr must survive into the reason.
+    #[test]
+    fn post_failure_records_the_reason_and_exits_zero() {
+        let ctl = "#!/bin/sh\necho 'cost report post failed (HTTP 401)' >&2\nexit 1\n";
+        let r = run_cost(Some(ctl), Some("http://crux.example:14800"), "{}");
+        assert_eq!(r.code, 0);
+        assert_eq!(r.field("result"), "failed");
+        assert_eq!(r.field("url_source"), "config");
+        assert!(r.field("reason").contains("HTTP 401"), "reason: {}", r.field("reason"));
+        assert!(r.log.contains("HTTP 401"));
+    }
+
+    /// The success path stays quiet: a record, and nothing in the error log.
+    #[test]
+    fn successful_post_records_ok_and_writes_no_error_log() {
+        let r = run_cost(Some("#!/bin/sh\nexit 0\n"), Some("http://crux.example:14800"), "{}");
+        assert_eq!(r.code, 0);
+        assert_eq!(r.field("result"), "ok");
+        assert_eq!(r.field("reason"), "");
+        assert_eq!(r.field("hook_version"), HOOK_ENV_VERSION);
+        assert!(r.log.is_empty(), "success must not write to the error log");
+    }
+
+    /// Stderr is arbitrary text. Quotes, backslashes and newlines in it must not
+    /// be able to produce a state file the reader cannot parse — a corrupt record
+    /// would put us straight back to "undiagnosable".
+    #[test]
+    fn hostile_stderr_still_yields_parseable_json() {
+        let ctl = "#!/bin/sh\nprintf 'he said \"no\"\\nand \\\\ broke\\n' >&2\nexit 3\n";
+        let r = run_cost(Some(ctl), Some("http://crux.example:14800"), "{}");
+        assert_eq!(r.code, 0);
+        assert!(r.state.is_some(), "state file must still be valid JSON");
+        assert_eq!(r.field("result"), "failed");
+        let reason = r.field("reason");
+        assert!(!reason.contains('\n') && !reason.contains('"') && !reason.contains('\\'));
+        assert!(reason.contains("he said"), "reason: {reason}");
+    }
+
+    /// The transcript path from the hook payload is passed through to the CLI and
+    /// recorded, so an operator can tell *which* session was (not) captured.
+    #[test]
+    fn payload_transcript_path_is_used_and_recorded() {
+        // Only meaningful where jq is present — the launcher degrades to the
+        // newest-transcript fallback without it, by design (no new dependency).
+        let Some(_) = resolve_on_path("jq") else { return };
+        let home = super::tests::tmp();
+        let tx = home.join("session.jsonl");
+        std::fs::write(&tx, "{}\n").unwrap();
+        // Echo the argv the launcher used, so we can assert `--file <tx>`.
+        let ctl = "#!/bin/sh\necho \"$@\" >&2\nexit 5\n";
+        let payload = format!(r#"{{"transcript_path":"{}"}}"#, tx.display());
+        let r = run_cost(Some(ctl), Some("http://crux.example:14800"), &payload);
+        assert_eq!(r.code, 0);
+        assert_eq!(r.field("transcript"), tx.display().to_string());
+        assert!(
+            r.field("reason").contains("--file"),
+            "launcher must pass --file: {}",
+            r.field("reason")
+        );
     }
 }
 

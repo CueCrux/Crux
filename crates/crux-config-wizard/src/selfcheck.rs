@@ -36,6 +36,15 @@ pub struct BootObservations<'a> {
     pub sync_degraded: bool,
     /// Whether the substantive `bootstrap (patterns)` section actually rendered.
     pub bootstrap_loaded: bool,
+    /// Last recorded outcome of the SessionEnd cost-capture hook (`ok`,
+    /// `failed`, `never_attempted`), or `None` when it has never recorded one.
+    /// `None` is not itself a fault — a fresh install has simply not ended a
+    /// session yet — so only an explicit failure warns.
+    pub cost_last_result: Option<&'a str>,
+    /// The hook launcher is installed but is **not** the version this build
+    /// ships. False also covers "no launcher installed", which is a choice, not
+    /// a fault. See `hooks_install::HOOK_ENV_VERSION`.
+    pub cost_launcher_stale: bool,
 }
 
 /// Parse the `major.minor` of a semver-ish string, ignoring any pre-release or
@@ -84,6 +93,36 @@ pub fn evaluate(obs: &BootObservations) -> Vec<String> {
         );
     }
 
+    // 3. A stale hook launcher. This is the single most likely way a shipped hook
+    //    fix appears not to work: the fix ships, nobody re-runs the wizard, the
+    //    old script keeps running, and the symptom is unchanged. Say so at boot
+    //    rather than leaving the operator to conclude the fix was ineffective.
+    if obs.cost_launcher_stale {
+        warnings.push(
+            "stale hook launcher: the installed `crux-hook-env.sh` predates this build. \
+             Fixes shipped since it was written (including SessionEnd cost capture) are \
+             not running — re-run `corecruxctl hooks install`."
+                .to_string(),
+        );
+    }
+
+    // 4. Cost capture is failing. The prior launcher swallowed every failure, so
+    //    a machine could post nothing for months while looking identical to one
+    //    that simply had not run a session. The outcome record makes it sayable.
+    match obs.cost_last_result {
+        Some("failed") => warnings.push(
+            "cost capture failing: the last SessionEnd cost post did not land. \
+             Run `corecruxctl hooks status` for the reason and endpoint."
+                .to_string(),
+        ),
+        Some("never_attempted") => warnings.push(
+            "cost capture not attempted: the SessionEnd hook could not find `corecruxctl`, \
+             so no session burn is being recorded. Install it on PATH (or at ~/.local/bin)."
+                .to_string(),
+        ),
+        _ => {}
+    }
+
     warnings
 }
 
@@ -112,6 +151,8 @@ mod tests {
             sync_reachable: true,
             sync_degraded: false,
             bootstrap_loaded: true,
+            cost_last_result: Some("ok"),
+            cost_launcher_stale: false,
         }
     }
 
@@ -119,6 +160,41 @@ mod tests {
     fn clean_environment_yields_no_warnings() {
         assert!(evaluate(&healthy()).is_empty());
         assert!(render_section(&[]).is_none());
+    }
+
+    #[test]
+    fn no_cost_record_yet_is_not_a_fault() {
+        // A fresh install has simply not ended a session — warning here would
+        // train the operator to ignore the section.
+        let obs = BootObservations {
+            cost_last_result: None,
+            ..healthy()
+        };
+        assert!(evaluate(&obs).is_empty());
+    }
+
+    #[test]
+    fn stale_launcher_warns_with_the_reinstall_remedy() {
+        let obs = BootObservations {
+            cost_launcher_stale: true,
+            ..healthy()
+        };
+        let w = evaluate(&obs);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("hooks install"), "must name the remedy: {}", w[0]);
+    }
+
+    #[test]
+    fn failing_and_never_attempted_cost_capture_each_warn() {
+        for (result, needle) in [("failed", "cost capture failing"), ("never_attempted", "not attempted")] {
+            let obs = BootObservations {
+                cost_last_result: Some(result),
+                ..healthy()
+            };
+            let w = evaluate(&obs);
+            assert_eq!(w.len(), 1, "{result}: {w:?}");
+            assert!(w[0].contains(needle), "{result}: {}", w[0]);
+        }
     }
 
     #[test]
@@ -165,6 +241,7 @@ mod tests {
             sync_reachable: false,
             sync_degraded: false,
             bootstrap_loaded: false,
+            ..healthy()
         };
         assert!(evaluate(&obs).is_empty());
     }
@@ -200,6 +277,7 @@ mod tests {
             sync_reachable: true,
             sync_degraded: false,
             bootstrap_loaded: false,
+            ..healthy()
         };
         let w = evaluate(&obs);
         assert_eq!(w.len(), 2);
