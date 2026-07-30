@@ -2352,6 +2352,7 @@ fn build_integrity_scan_report(opts: &AuditPackOptionsV1) -> IntegrityScanReport
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
@@ -4257,5 +4258,1420 @@ mod tests {
         let producer = pack_producer();
         assert_eq!(producer.name, "corecruxctl");
         assert!(!producer.version.is_empty());
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Shared fixtures for the evidence-integrity tests below.
+    // ══════════════════════════════════════════════════════════════════
+
+    /// Offline, no-selector baseline. Tests mutate only the fields they
+    /// exercise, which keeps the intent of each case visible.
+    fn test_opts() -> AuditPackOptionsV1 {
+        AuditPackOptionsV1 {
+            out_dir: None,
+            offline: true,
+            corecrux_base: "http://127.0.0.1:1".to_string(),
+            data_dir: None,
+            tenant_id: None,
+            stream_type: None,
+            stream_id: None,
+            from_seq: 0,
+            max_events: 128,
+            v1_events_log: None,
+            v1_stream_jsonl: None,
+            parity_tenant_id: None,
+            parity_seed: "0".to_string(),
+            parity_sample: 10,
+            engine_base: None,
+            engine_api_key: None,
+            replay_fixture: "minimal".to_string(),
+            device_index: 0,
+            receipt_id: None,
+            answer_id: None,
+            action_id: None,
+            receipt_keyring: None,
+        }
+    }
+
+    /// A port that is guaranteed to have nothing listening on it: bound to
+    /// learn the number, then released.
+    fn dead_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        port
+    }
+
+    /// Loopback stub answering one request with raw bytes.
+    /// `crate::test_support::serve_responses` carries `String` bodies only,
+    /// which cannot express a zip archive, so binary-bodied cases use this.
+    fn serve_bytes_once(status: u16, body: Vec<u8>) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = crate::test_support::read_full_request(&mut stream);
+                let head = format!(
+                    "HTTP/1.1 {status} S\r\nContent-Type: application/zip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        (port, handle)
+    }
+
+    fn zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            for (name, bytes) in entries {
+                writer.start_file(*name, opts).expect("start entry");
+                writer.write_all(bytes).expect("write entry");
+            }
+            writer.finish().expect("finish zip");
+        }
+        cursor.into_inner()
+    }
+
+    /// One length-prefixed, CRC32C-suffixed stage-1 `events.log` record.
+    fn v1_record(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        out.extend_from_slice(payload);
+        out.extend_from_slice(&crc32c::crc32c(payload).to_be_bytes());
+        out
+    }
+
+    fn v1_envelope(seq: Option<u64>, event_id: &str, tenant: &str, stream_type: &str, stream_id: &str) -> Vec<u8> {
+        let mut value = serde_json::json!({
+            "eventId": event_id,
+            "tenantId": tenant,
+            "streamId": stream_id,
+            "streamType": stream_type,
+            "occurredAt": "2026-02-11T00:00:00Z",
+            "eventType": "evt.test",
+        });
+        if let Some(seq) = seq {
+            value["seq"] = serde_json::json!(seq);
+        }
+        serde_json::to_vec(&value).expect("serialize envelope")
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // load_v1_events_log_comparator — stage-1 framing must be validated,
+    // not trusted. Every case here is a corrupt-input rejection.
+    // ══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn load_v1_events_log_comparator_reads_records_and_sorts_by_seq() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("events.log");
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&v1_record(&v1_envelope(Some(9), "e9", "t1", "knowledge", "s1")));
+        blob.extend_from_slice(&v1_record(&v1_envelope(Some(4), "e4", "t1", "knowledge", "s1")));
+        std::fs::write(&path, &blob).expect("write log");
+
+        let rows = load_v1_events_log_comparator(&path, "t1", "knowledge", "s1").expect("parse");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].seq, 4);
+        assert_eq!(rows[1].seq, 9);
+        // Hashes are derived from the canonical header, not copied from input.
+        assert_eq!(rows[0].header_hash.len(), 64);
+        assert_eq!(rows[0].payload_hash.len(), 64);
+        assert_ne!(rows[0].header_hash, rows[1].header_hash);
+    }
+
+    /// A record whose CRC32C trailer disagrees with its payload must be
+    /// rejected outright. Regression guard: a comparator that tolerated a bad
+    /// CRC would let a tampered v1 log "prove" parity against v3.
+    #[test]
+    fn load_v1_events_log_comparator_rejects_crc_mismatch() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("events.log");
+        let mut record = v1_record(&v1_envelope(Some(1), "e1", "t1", "knowledge", "s1"));
+        let last = record.len() - 1;
+        record[last] ^= 0xff;
+        std::fs::write(&path, &record).expect("write log");
+
+        let err = load_v1_events_log_comparator(&path, "t1", "knowledge", "s1")
+            .err()
+            .expect("crc mismatch must fail");
+        assert!(err.to_string().contains("crc32c mismatch"), "{err}");
+    }
+
+    #[test]
+    fn load_v1_events_log_comparator_rejects_zero_length_record() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("events.log");
+        std::fs::write(&path, 0u32.to_be_bytes()).expect("write log");
+
+        let err = load_v1_events_log_comparator(&path, "t1", "knowledge", "s1")
+            .err()
+            .expect("zero length must fail");
+        assert!(
+            err.to_string().contains("invalid v1 events.log record length 0"),
+            "{err}"
+        );
+    }
+
+    /// The 4 MiB record ceiling must trip before the length is used to
+    /// allocate, so a hostile length prefix cannot drive an OOM.
+    #[test]
+    fn load_v1_events_log_comparator_rejects_oversized_record_length() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("events.log");
+        std::fs::write(&path, (4u32 * 1024 * 1024 + 1).to_be_bytes()).expect("write log");
+
+        let err = load_v1_events_log_comparator(&path, "t1", "knowledge", "s1")
+            .err()
+            .expect("oversized length must fail");
+        assert!(err.to_string().contains("invalid v1 events.log record length"), "{err}");
+    }
+
+    /// A payload shorter than its declared length is a truncated log; it must
+    /// error rather than yield the rows that happened to survive.
+    #[test]
+    fn load_v1_events_log_comparator_rejects_truncated_payload() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("events.log");
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&512u32.to_be_bytes());
+        blob.extend_from_slice(b"only-a-few-bytes");
+        std::fs::write(&path, &blob).expect("write log");
+
+        assert!(load_v1_events_log_comparator(&path, "t1", "knowledge", "s1").is_err());
+    }
+
+    #[test]
+    fn load_v1_events_log_comparator_rejects_missing_crc_trailer() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("events.log");
+        let payload = v1_envelope(Some(1), "e1", "t1", "knowledge", "s1");
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        blob.extend_from_slice(&payload);
+        blob.extend_from_slice(&[0u8, 1u8]); // 2 of the 4 CRC bytes
+        std::fs::write(&path, &blob).expect("write log");
+
+        assert!(load_v1_events_log_comparator(&path, "t1", "knowledge", "s1").is_err());
+    }
+
+    #[test]
+    fn load_v1_events_log_comparator_rejects_non_json_payload() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("events.log");
+        std::fs::write(&path, v1_record(b"this is not json")).expect("write log");
+
+        assert!(load_v1_events_log_comparator(&path, "t1", "knowledge", "s1").is_err());
+    }
+
+    #[test]
+    fn load_v1_events_log_comparator_empty_file_is_empty_result() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("events.log");
+        std::fs::write(&path, b"").expect("write log");
+
+        let rows = load_v1_events_log_comparator(&path, "t1", "knowledge", "s1").expect("parse");
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn load_v1_events_log_comparator_missing_file_errors() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("absent.log");
+        assert!(load_v1_events_log_comparator(&path, "t1", "knowledge", "s1").is_err());
+    }
+
+    #[test]
+    fn load_v1_events_log_comparator_filters_foreign_streams() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("events.log");
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&v1_record(&v1_envelope(Some(1), "e1", "other", "knowledge", "s1")));
+        blob.extend_from_slice(&v1_record(&v1_envelope(Some(2), "e2", "t1", "other-type", "s1")));
+        blob.extend_from_slice(&v1_record(&v1_envelope(Some(3), "e3", "t1", "knowledge", "other-id")));
+        blob.extend_from_slice(&v1_record(&v1_envelope(Some(4), "e4", "t1", "knowledge", "s1")));
+        std::fs::write(&path, &blob).expect("write log");
+
+        let rows = load_v1_events_log_comparator(&path, "t1", "knowledge", "s1").expect("parse");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_id, "e4");
+    }
+
+    /// Records without an explicit `seq` get an ordinal fallback that counts
+    /// only records surviving the tenant/stream filter. Pins the current
+    /// numbering so a refactor cannot silently renumber comparator rows.
+    #[test]
+    fn load_v1_events_log_comparator_fallback_seq_counts_only_matching_records() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("events.log");
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&v1_record(&v1_envelope(None, "skip", "other", "knowledge", "s1")));
+        blob.extend_from_slice(&v1_record(&v1_envelope(None, "a", "t1", "knowledge", "s1")));
+        blob.extend_from_slice(&v1_record(&v1_envelope(None, "b", "t1", "knowledge", "s1")));
+        std::fs::write(&path, &blob).expect("write log");
+
+        let rows = load_v1_events_log_comparator(&path, "t1", "knowledge", "s1").expect("parse");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].seq, 1);
+        assert_eq!(rows[0].event_id, "a");
+        assert_eq!(rows[1].seq, 2);
+    }
+
+    /// KNOWN BEHAVIOUR, pinned deliberately: a trailing fragment shorter than
+    /// the 4-byte length prefix is treated as clean EOF and silently dropped,
+    /// so a log truncated mid-prefix parses as complete. Reported, not changed.
+    #[test]
+    fn load_v1_events_log_comparator_trailing_partial_prefix_is_silently_ignored() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("events.log");
+        let mut blob = v1_record(&v1_envelope(Some(1), "e1", "t1", "knowledge", "s1"));
+        blob.extend_from_slice(&[0u8, 0u8]); // half a length prefix
+        std::fs::write(&path, &blob).expect("write log");
+
+        let rows = load_v1_events_log_comparator(&path, "t1", "knowledge", "s1").expect("parse");
+        assert_eq!(rows.len(), 1, "trailing fragment is currently ignored, not rejected");
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // load_v1_comparator_source dispatch
+    // ══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn load_v1_comparator_source_labels_events_log_source() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("events.log");
+        std::fs::write(&path, v1_record(&v1_envelope(Some(1), "e1", "t1", "knowledge", "s1"))).expect("write");
+
+        let (source, rows) = load_v1_comparator_source(Some(&path), None, "t1", "knowledge", "s1")
+            .expect("load")
+            .expect("some source");
+        assert!(source.starts_with("v1_events_log:"), "{source}");
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn load_v1_comparator_source_labels_jsonl_source() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("stream.jsonl");
+        std::fs::write(
+            &path,
+            "{\"seq\":1,\"eventId\":\"e1\",\"eventType\":\"t\",\"occurredAt\":\"2026-01-01T00:00:00Z\",\"headerHash\":\"aa\",\"payloadHash\":\"bb\"}\n",
+        )
+        .expect("write");
+
+        let (source, rows) = load_v1_comparator_source(None, Some(&path), "t1", "knowledge", "s1")
+            .expect("load")
+            .expect("some source");
+        assert!(source.starts_with("v1_stream_jsonl:"), "{source}");
+        assert_eq!(rows.len(), 1);
+    }
+
+    /// The parse error must name the offending line so an operator can find
+    /// it; a bare serde message on a 50k-line file is not actionable.
+    #[test]
+    fn load_v1_jsonl_comparator_error_names_the_bad_line() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("mixed.jsonl");
+        std::fs::write(
+            &path,
+            "{\"seq\":1,\"eventId\":\"e1\",\"eventType\":\"t\",\"occurredAt\":\"x\",\"headerHash\":\"a\",\"payloadHash\":\"b\"}\n{ nope }\n",
+        )
+        .expect("write");
+
+        let err = load_v1_jsonl_comparator(&path).err().expect("must fail");
+        assert!(err.to_string().contains("line 2"), "{err}");
+    }
+
+    #[test]
+    fn load_v1_jsonl_comparator_missing_file_errors() {
+        let dir = tempdir().expect("tempdir");
+        assert!(load_v1_jsonl_comparator(&dir.path().join("absent.jsonl")).is_err());
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // write_bytes failure
+    // ══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn write_bytes_errors_when_parent_directory_is_missing() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("no-such-dir").join("artifact.bin");
+        assert!(write_bytes(&path, b"payload").is_err());
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // read_zip_entry
+    // ══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn read_zip_entry_returns_entry_bytes() {
+        let bytes = zip_bytes(&[("manifest.json", b"{\"a\":1}")]);
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).expect("open zip");
+        let out = read_zip_entry(&mut zip, "manifest.json").expect("read entry");
+        assert_eq!(out, b"{\"a\":1}");
+    }
+
+    #[test]
+    fn read_zip_entry_missing_path_errors() {
+        let bytes = zip_bytes(&[("manifest.json", b"{}")]);
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).expect("open zip");
+        assert!(read_zip_entry(&mut zip, "verification/report.json").is_err());
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // fetch_stream_headers_v1
+    // ══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn fetch_stream_headers_v1_parses_zip_headers() {
+        let jsonl = b"{\"seq\":1,\"eventId\":\"e1\",\"eventType\":\"t\",\"occurredAt\":\"2026-01-01T00:00:00Z\",\"headerHash\":\"aa\",\"payloadHash\":\"bb\"}\n\n{\"seq\":2,\"eventId\":\"e2\",\"eventType\":\"t\",\"occurredAt\":\"2026-01-01T00:00:00Z\",\"headerHash\":\"cc\",\"payloadHash\":\"dd\"}\n";
+        let (port, handle) = serve_bytes_once(200, zip_bytes(&[("events/headers.jsonl", jsonl)]));
+        let headers = fetch_stream_headers_v1(&format!("http://127.0.0.1:{port}"), "t1", "knowledge", "s1", 0, 10)
+            .expect("fetch headers");
+        let _ = handle.join();
+        assert_eq!(headers.len(), 2, "blank lines are skipped, not parsed");
+        assert_eq!(headers[0].event_id, "e1");
+        assert_eq!(headers[1].seq, 2);
+    }
+
+    /// A malformed line in `events/headers.jsonl` must abort the fetch. If it
+    /// were skipped, the ordering/idempotency audit would silently run over a
+    /// subset of the stream and report a clean parity result.
+    #[test]
+    fn fetch_stream_headers_v1_rejects_malformed_header_line() {
+        let jsonl = b"{\"seq\":1,\"eventId\":\"e1\",\"eventType\":\"t\",\"occurredAt\":\"x\",\"headerHash\":\"aa\",\"payloadHash\":\"bb\"}\n{\"seq\":\"not-a-number\"}\n";
+        let (port, handle) = serve_bytes_once(200, zip_bytes(&[("events/headers.jsonl", jsonl)]));
+        let err = fetch_stream_headers_v1(&format!("http://127.0.0.1:{port}"), "t1", "knowledge", "s1", 0, 10)
+            .err()
+            .expect("malformed line must fail");
+        let _ = handle.join();
+        assert!(err.to_string().contains("headers.jsonl line 2"), "{err}");
+    }
+
+    #[test]
+    fn fetch_stream_headers_v1_errors_when_headers_entry_absent() {
+        let (port, handle) = serve_bytes_once(200, zip_bytes(&[("events/other.jsonl", b"{}")]));
+        let result = fetch_stream_headers_v1(&format!("http://127.0.0.1:{port}"), "t1", "knowledge", "s1", 0, 10);
+        let _ = handle.join();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn fetch_stream_headers_v1_rejects_non_zip_body() {
+        let (port, handle) = crate::test_support::serve_responses(vec![(200, "{\"not\":\"a zip\"}".to_string())]);
+        let result = fetch_stream_headers_v1(&format!("http://127.0.0.1:{port}"), "t1", "knowledge", "s1", 0, 10);
+        let _ = handle.join();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn fetch_stream_headers_v1_propagates_transport_failure() {
+        let port = dead_port();
+        assert!(fetch_stream_headers_v1(&format!("http://127.0.0.1:{port}"), "t1", "knowledge", "s1", 0, 10).is_err());
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // build_stream_reports
+    // ══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn build_stream_reports_offline_is_skipped_not_pass() {
+        let outputs = build_stream_reports(&test_opts()).expect("offline reports");
+        assert_eq!(outputs.ordering.status, AuditStatusV1::Skipped);
+        assert_eq!(outputs.idempotency.status, AuditStatusV1::Skipped);
+        assert!(outputs.headers.is_empty());
+        assert_eq!(outputs.ordering.note.as_deref(), Some("offline mode enabled"));
+    }
+
+    /// With an incomplete stream selector the audit must be *skipped*, never
+    /// reported as a clean pass over zero events.
+    #[test]
+    fn build_stream_reports_incomplete_selector_is_skipped_not_pass() {
+        let mut opts = test_opts();
+        opts.offline = false;
+        opts.tenant_id = Some("t1".to_string());
+        opts.stream_type = Some("knowledge".to_string());
+        opts.stream_id = None;
+
+        let outputs = build_stream_reports(&opts).expect("skipped reports");
+        assert_eq!(outputs.ordering.status, AuditStatusV1::Skipped);
+        assert_eq!(outputs.idempotency.status, AuditStatusV1::Skipped);
+        assert!(outputs
+            .ordering
+            .note
+            .as_deref()
+            .unwrap_or_default()
+            .contains("stream audit skipped"));
+    }
+
+    #[test]
+    fn build_stream_reports_propagates_export_failure() {
+        let mut opts = test_opts();
+        opts.offline = false;
+        opts.corecrux_base = format!("http://127.0.0.1:{}", dead_port());
+        opts.tenant_id = Some("t1".to_string());
+        opts.stream_type = Some("knowledge".to_string());
+        opts.stream_id = Some("s1".to_string());
+
+        assert!(build_stream_reports(&opts).is_err());
+    }
+
+    #[test]
+    fn build_stream_reports_analyzes_fetched_headers_locally() {
+        let jsonl = b"{\"seq\":1,\"eventId\":\"e1\",\"eventType\":\"t\",\"occurredAt\":\"x\",\"headerHash\":\"aa\",\"payloadHash\":\"bb\"}\n{\"seq\":2,\"eventId\":\"e1\",\"eventType\":\"t\",\"occurredAt\":\"x\",\"headerHash\":\"cc\",\"payloadHash\":\"dd\"}\n";
+        let (port, handle) = serve_bytes_once(200, zip_bytes(&[("events/headers.jsonl", jsonl)]));
+        let mut opts = test_opts();
+        opts.offline = false;
+        opts.corecrux_base = format!("http://127.0.0.1:{port}");
+        opts.tenant_id = Some("t1".to_string());
+        opts.stream_type = Some("knowledge".to_string());
+        opts.stream_id = Some("s1".to_string());
+
+        let outputs = build_stream_reports(&opts).expect("reports");
+        let _ = handle.join();
+        assert_eq!(outputs.headers.len(), 2);
+        assert_eq!(outputs.ordering.comparison, "v3_local_only");
+        // Duplicate eventId across two seqs must surface as an idempotency fail.
+        assert_eq!(outputs.idempotency.status, AuditStatusV1::Fail);
+        assert_eq!(outputs.idempotency.duplicate_count, 1);
+    }
+
+    #[test]
+    fn build_stream_reports_uses_v1_comparator_when_supplied() {
+        let dir = tempdir().expect("tempdir");
+        let comparator = dir.path().join("v1.jsonl");
+        std::fs::write(
+            &comparator,
+            "{\"seq\":1,\"eventId\":\"e1\",\"eventType\":\"t\",\"occurredAt\":\"x\",\"headerHash\":\"aa\",\"payloadHash\":\"bb\"}\n",
+        )
+        .expect("write comparator");
+        let jsonl = b"{\"seq\":1,\"eventId\":\"e1\",\"eventType\":\"t\",\"occurredAt\":\"x\",\"headerHash\":\"aa\",\"payloadHash\":\"bb\"}\n";
+        let (port, handle) = serve_bytes_once(200, zip_bytes(&[("events/headers.jsonl", jsonl)]));
+
+        let mut opts = test_opts();
+        opts.offline = false;
+        opts.corecrux_base = format!("http://127.0.0.1:{port}");
+        opts.tenant_id = Some("t1".to_string());
+        opts.stream_type = Some("knowledge".to_string());
+        opts.stream_id = Some("s1".to_string());
+        opts.v1_stream_jsonl = Some(comparator);
+
+        let outputs = build_stream_reports(&opts).expect("reports");
+        let _ = handle.join();
+        assert_eq!(outputs.ordering.comparison, "v1_cross_system");
+        assert_eq!(outputs.ordering.status, AuditStatusV1::Pass);
+        let cross = outputs.ordering.cross_system.as_ref().expect("cross-system meta");
+        assert!(cross.digest_match);
+        assert!(cross.source.starts_with("v1_stream_jsonl:"));
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // build_cross_system_reports — idempotency cardinality
+    // ══════════════════════════════════════════════════════════════════
+
+    fn comparator_row(seq: u64, event_id: &str) -> ComparatorEventRowV1 {
+        ComparatorEventRowV1 {
+            seq,
+            event_id: event_id.to_string(),
+            event_type: "evt.test".to_string(),
+            occurred_at: "2026-02-11T00:00:00Z".to_string(),
+            header_hash: format!("{:064x}", seq + 11),
+            payload_hash: format!("{:064x}", seq + 29),
+        }
+    }
+
+    /// An eventId appended twice in v3 but once in v1 is a de-duplication
+    /// regression, and must surface as a cardinality mismatch rather than
+    /// being absorbed by the plain "present in both" check.
+    #[test]
+    fn cross_system_reports_flags_duplicate_cardinality_mismatch() {
+        let v3 = vec![h(1, "e1"), h(2, "e1")];
+        let v1 = vec![comparator_row(1, "e1")];
+        let (_, idempotency) = build_cross_system_reports(&v3, &v1, "test");
+        assert_eq!(idempotency.status, AuditStatusV1::Fail);
+        assert!(idempotency
+            .issues
+            .iter()
+            .any(|i| i.kind == "IDEMPOTENCY_DUP_COUNT_MISMATCH"));
+        assert_eq!(idempotency.duplicate_count, 1);
+        assert_eq!(idempotency.unique_event_ids, 1);
+    }
+
+    /// The same eventId landing at a different first sequence on the two
+    /// systems means the append order diverged, even though counts agree.
+    #[test]
+    fn cross_system_reports_flags_first_seq_mismatch() {
+        let v3 = vec![h(2, "e1")];
+        let v1 = vec![comparator_row(1, "e1")];
+        let (_, idempotency) = build_cross_system_reports(&v3, &v1, "test");
+        assert_eq!(idempotency.status, AuditStatusV1::Fail);
+        assert!(idempotency
+            .issues
+            .iter()
+            .any(|i| i.kind == "IDEMPOTENCY_FIRST_SEQ_MISMATCH"));
+    }
+
+    /// First-seq tracking must take the *lowest* seq seen, not the first row
+    /// encountered; otherwise an out-of-order export invents a mismatch.
+    #[test]
+    fn cross_system_reports_track_lowest_seq_for_out_of_order_duplicates() {
+        let v3 = vec![h(5, "e1"), h(2, "e1")];
+        let v1 = vec![comparator_row(5, "e1"), comparator_row(2, "e1")];
+        let (ordering, idempotency) = build_cross_system_reports(&v3, &v1, "test");
+        assert_eq!(idempotency.status, AuditStatusV1::Pass);
+        assert_eq!(idempotency.duplicate_count, 1);
+        // The out-of-order sequence is still an ordering failure on both sides.
+        assert_eq!(ordering.status, AuditStatusV1::Fail);
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // stream_header_source_refs — incomplete selectors
+    // ══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn stream_header_source_refs_requires_stream_type() {
+        let mut opts = test_opts();
+        opts.tenant_id = Some("t1".to_string());
+        opts.stream_id = Some("s1".to_string());
+        assert!(stream_header_source_refs(&opts, &[h(1, "e1")]).is_empty());
+    }
+
+    #[test]
+    fn stream_header_source_refs_requires_stream_id() {
+        let mut opts = test_opts();
+        opts.tenant_id = Some("t1".to_string());
+        opts.stream_type = Some("knowledge".to_string());
+        assert!(stream_header_source_refs(&opts, &[h(1, "e1")]).is_empty());
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // observe_corecrux_identity
+    // ══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn observe_corecrux_identity_uses_daemon_healthz_values() {
+        let body = "{\"ok\":true,\"build\":{\"version\":\"9.9.9\",\"commit\":\"deadbee\"},\"compat\":{\"requires\":\">=9.0\"},\"sdkVersion\":\"9\"}";
+        let (port, handle) = crate::test_support::serve_responses(vec![(200, body.to_string())]);
+        let mut opts = test_opts();
+        opts.offline = false;
+        opts.corecrux_base = format!("http://127.0.0.1:{port}/");
+
+        let (build, compat) = observe_corecrux_identity(&opts);
+        let _ = handle.join();
+        assert_eq!(build.version, "9.9.9");
+        assert_eq!(build.commit, "deadbee");
+        assert_eq!(compat.requires, ">=9.0");
+    }
+
+    /// A daemon that answers `/healthz` with something unparsable must not
+    /// poison the pack: the CLI's own build identity is used instead.
+    #[test]
+    fn observe_corecrux_identity_falls_back_on_unparsable_healthz() {
+        let (port, handle) = crate::test_support::serve_responses(vec![(200, "not json at all".to_string())]);
+        let mut opts = test_opts();
+        opts.offline = false;
+        opts.corecrux_base = format!("http://127.0.0.1:{port}");
+
+        let (build, compat) = observe_corecrux_identity(&opts);
+        let _ = handle.join();
+        assert_eq!(build.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(compat.requires, DEFAULT_COMPAT_REQUIRES);
+    }
+
+    #[test]
+    fn observe_corecrux_identity_falls_back_when_unreachable() {
+        let mut opts = test_opts();
+        opts.offline = false;
+        opts.corecrux_base = format!("http://127.0.0.1:{}", dead_port());
+
+        let (build, compat) = observe_corecrux_identity(&opts);
+        assert_eq!(build.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(compat.requires, DEFAULT_COMPAT_REQUIRES);
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // build_integrity_scan_report
+    // ══════════════════════════════════════════════════════════════════
+
+    const HEALTHZ_OK: &str =
+        "{\"ok\":true,\"build\":{\"version\":\"1\",\"commit\":\"c\"},\"compat\":{\"requires\":\">=1\"},\"sdkVersion\":\"1\"}";
+
+    #[test]
+    fn build_integrity_scan_report_offline_is_skipped() {
+        let report = build_integrity_scan_report(&test_opts());
+        assert_eq!(report.status, AuditStatusV1::Skipped);
+        assert!(!report.health_ok);
+        assert!(!report.ready_ok);
+        assert!(!report.metrics_build_info_present);
+        assert_eq!(report.checks.len(), 1);
+        assert_eq!(report.checks[0].name, "offline_mode");
+    }
+
+    #[test]
+    fn build_integrity_scan_report_all_endpoints_healthy_passes() {
+        let (port, handle) = crate::test_support::serve_responses(vec![
+            (200, HEALTHZ_OK.to_string()),
+            (200, "{\"ok\":true}".to_string()),
+            (200, "build_info{version=\"1\"} 1\n".to_string()),
+        ]);
+        let mut opts = test_opts();
+        opts.offline = false;
+        opts.corecrux_base = format!("http://127.0.0.1:{port}");
+
+        let report = build_integrity_scan_report(&opts);
+        let _ = handle.join();
+        assert_eq!(report.status, AuditStatusV1::Pass);
+        assert!(report.health_ok && report.ready_ok && report.metrics_build_info_present);
+        assert_eq!(report.checks.len(), 3);
+    }
+
+    /// `/healthz` answering `ok:true` but omitting the build/compat/sdk
+    /// contract fields is a contract break, not a pass.
+    #[test]
+    fn build_integrity_scan_report_healthz_missing_contract_fields_fails() {
+        let (port, handle) = crate::test_support::serve_responses(vec![
+            (200, "{\"ok\":true}".to_string()),
+            (200, "{\"ok\":true}".to_string()),
+            (200, "build_info 1\n".to_string()),
+        ]);
+        let mut opts = test_opts();
+        opts.offline = false;
+        opts.corecrux_base = format!("http://127.0.0.1:{port}");
+
+        let report = build_integrity_scan_report(&opts);
+        let _ = handle.join();
+        assert!(!report.health_ok);
+        assert_eq!(report.status, AuditStatusV1::Fail);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "healthz_contract")
+            .expect("healthz_contract check");
+        assert!(!check.ok);
+        assert!(check.detail.as_deref().unwrap_or_default().contains("build=false"));
+    }
+
+    #[test]
+    fn build_integrity_scan_report_unparsable_bodies_fail() {
+        let (port, handle) = crate::test_support::serve_responses(vec![
+            (200, "<html/>".to_string()),
+            (200, "<html/>".to_string()),
+            (200, "no build info here\n".to_string()),
+        ]);
+        let mut opts = test_opts();
+        opts.offline = false;
+        opts.corecrux_base = format!("http://127.0.0.1:{port}");
+
+        let report = build_integrity_scan_report(&opts);
+        let _ = handle.join();
+        assert_eq!(report.status, AuditStatusV1::Fail);
+        assert!(report.checks.iter().any(|c| c.name == "healthz_parse" && !c.ok));
+        assert!(report.checks.iter().any(|c| c.name == "readyz_parse" && !c.ok));
+        assert!(report.checks.iter().any(|c| c.name == "metrics_build_info" && !c.ok));
+    }
+
+    /// `readyz` reporting `ok:false` must fail the scan.
+    #[test]
+    fn build_integrity_scan_report_ready_not_ok_fails() {
+        let (port, handle) = crate::test_support::serve_responses(vec![
+            (200, HEALTHZ_OK.to_string()),
+            (200, "{\"ok\":false}".to_string()),
+            (200, "build_info 1\n".to_string()),
+        ]);
+        let mut opts = test_opts();
+        opts.offline = false;
+        opts.corecrux_base = format!("http://127.0.0.1:{port}");
+
+        let report = build_integrity_scan_report(&opts);
+        let _ = handle.join();
+        assert!(report.health_ok);
+        assert!(!report.ready_ok);
+        assert_eq!(report.status, AuditStatusV1::Fail);
+    }
+
+    /// An unreachable daemon fails the scan; it must never be recorded as an
+    /// endpoint check that "could not run, therefore passed".
+    #[test]
+    fn build_integrity_scan_report_unreachable_endpoints_fail() {
+        let mut opts = test_opts();
+        opts.offline = false;
+        opts.corecrux_base = format!("http://127.0.0.1:{}", dead_port());
+
+        let report = build_integrity_scan_report(&opts);
+        assert_eq!(report.status, AuditStatusV1::Fail);
+        assert!(report.checks.iter().any(|c| c.name == "healthz_fetch" && !c.ok));
+        assert!(report.checks.iter().any(|c| c.name == "readyz_fetch" && !c.ok));
+        assert!(report.checks.iter().any(|c| c.name == "metrics_fetch" && !c.ok));
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // build_projection_parity_report
+    // ══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn build_projection_parity_report_offline_is_skipped() {
+        let report = build_projection_parity_report(&test_opts());
+        assert_eq!(report.status, AuditStatusV1::Skipped);
+        assert!(report.summary.is_none());
+        assert_eq!(report.note.as_deref(), Some("offline mode enabled"));
+    }
+
+    #[test]
+    fn build_projection_parity_report_missing_tenant_is_skipped() {
+        let mut opts = test_opts();
+        opts.offline = false;
+        let report = build_projection_parity_report(&opts);
+        assert_eq!(report.status, AuditStatusV1::Skipped);
+        assert!(report
+            .note
+            .as_deref()
+            .unwrap_or_default()
+            .contains("missing parity tenant"));
+    }
+
+    #[test]
+    fn build_projection_parity_report_missing_engine_is_skipped() {
+        let mut opts = test_opts();
+        opts.offline = false;
+        opts.parity_tenant_id = Some("t1".to_string());
+        let report = build_projection_parity_report(&opts);
+        assert_eq!(report.status, AuditStatusV1::Skipped);
+        assert_eq!(report.note.as_deref(), Some("missing --engine for projection parity"));
+    }
+
+    #[test]
+    fn build_projection_parity_report_missing_engine_api_key_is_skipped() {
+        let mut opts = test_opts();
+        opts.offline = false;
+        opts.tenant_id = Some("t1".to_string());
+        opts.engine_base = Some("http://127.0.0.1:1".to_string());
+        let report = build_projection_parity_report(&opts);
+        assert_eq!(report.status, AuditStatusV1::Skipped);
+        assert_eq!(
+            report.note.as_deref(),
+            Some("missing --engine-api-key for projection parity")
+        );
+    }
+
+    /// A parity run that cannot reach the engine is a Fail, not a Skip: the
+    /// operator asked for the check and it did not happen.
+    #[test]
+    fn build_projection_parity_report_execution_failure_is_fail() {
+        let mut opts = test_opts();
+        opts.offline = false;
+        opts.parity_tenant_id = Some("t1".to_string());
+        opts.engine_base = Some(format!("http://127.0.0.1:{}", dead_port()));
+        opts.engine_api_key = Some("key".to_string());
+
+        let report = build_projection_parity_report(&opts);
+        assert_eq!(report.status, AuditStatusV1::Fail);
+        assert!(report
+            .note
+            .as_deref()
+            .unwrap_or_default()
+            .contains("projection parity execution failed"));
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // projection_cursor_for_meta
+    // ══════════════════════════════════════════════════════════════════
+
+    fn meta_with_cursors() -> corecrux_projections::ProjectionsMetaV1 {
+        let mut meta = corecrux_projections::ProjectionsMetaV1::empty_now();
+        for (idx, entry) in [
+            &mut meta.artifact_living_state,
+            &mut meta.artifact_relations,
+            &mut meta.pressure_events,
+            &mut meta.artifact_dependents,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            entry.cursor = Some(corecrux_projections::ProjectionCursorV1 {
+                shard_id: idx as u32,
+                epoch: 7,
+                segment_seq: 3,
+                offset: 11,
+            });
+        }
+        meta
+    }
+
+    #[test]
+    fn projection_cursor_for_meta_maps_each_known_projection() {
+        let meta = meta_with_cursors();
+        for (idx, key) in [
+            "artifact_living_state",
+            "artifact_relations",
+            "pressure_events",
+            "artifact_dependents",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let cursor = projection_cursor_for_meta(&meta, key).expect("cursor");
+            assert_eq!(cursor.shard_id, idx as u32, "{key}");
+            assert_eq!(cursor.epoch, 7);
+            assert_eq!(cursor.segment_seq, 3);
+            assert_eq!(cursor.offset, 11);
+        }
+    }
+
+    #[test]
+    fn projection_cursor_for_meta_unknown_projection_is_none() {
+        assert!(projection_cursor_for_meta(&meta_with_cursors(), "not_a_projection").is_none());
+    }
+
+    #[test]
+    fn projection_cursor_for_meta_absent_cursor_is_none() {
+        let meta = corecrux_projections::ProjectionsMetaV1::empty_now();
+        assert!(projection_cursor_for_meta(&meta, "artifact_living_state").is_none());
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // add_snapshot_evidence_artifacts
+    // ══════════════════════════════════════════════════════════════════
+
+    const PROJECTION_FILES: [(&str, &str); 4] = [
+        ("artifact_living_state", "artifact_living_state.snapshot.ccxs"),
+        ("artifact_relations", "artifact_relations.snapshot.ccxs"),
+        ("pressure_events", "pressure_events.snapshot.ccxs"),
+        ("artifact_dependents", "artifact_dependents.snapshot.ccxs"),
+    ];
+
+    /// Materialise `shards/shard-NNNN/projections` with all four snapshots and
+    /// a matching `projections.meta.json`. With `tamper` the declared blake3
+    /// for `artifact_living_state` no longer matches the bytes on disk.
+    fn write_snapshot_shard(data_dir: &Path, shard_id: u32, tamper: bool) {
+        let proj_dir = data_dir
+            .join("shards")
+            .join(format!("shard-{shard_id:04}"))
+            .join("projections");
+        std::fs::create_dir_all(&proj_dir).expect("create projections dir");
+        let mut meta = corecrux_projections::ProjectionsMetaV1::empty_now();
+        for (key, file) in PROJECTION_FILES {
+            let bytes = format!("snapshot::{shard_id}::{key}").into_bytes();
+            std::fs::write(proj_dir.join(file), &bytes).expect("write snapshot");
+            let declared = if tamper && key == "artifact_living_state" {
+                "0".repeat(64)
+            } else {
+                blake3::hash(&bytes).to_hex().to_string()
+            };
+            let entry = match key {
+                "artifact_living_state" => &mut meta.artifact_living_state,
+                "artifact_relations" => &mut meta.artifact_relations,
+                "pressure_events" => &mut meta.pressure_events,
+                _ => &mut meta.artifact_dependents,
+            };
+            entry.snapshot_blake3 = Some(declared);
+            entry.cursor = Some(corecrux_projections::ProjectionCursorV1 {
+                shard_id,
+                epoch: 7,
+                segment_seq: 3,
+                offset: 11,
+            });
+        }
+        std::fs::write(
+            proj_dir.join("projections.meta.json"),
+            serde_json::to_vec_pretty(&meta).expect("serialize meta"),
+        )
+        .expect("write meta");
+    }
+
+    type SnapshotCall = (
+        BTreeMap<String, EvidenceArtifactDescriptorV1>,
+        BTreeMap<String, String>,
+        Vec<EvidenceRelationshipV1>,
+    );
+
+    fn run_add_snapshot(opts: &AuditPackOptionsV1, out_dir: &Path) -> Result<SnapshotCall, DynError> {
+        let mut artifacts = BTreeMap::new();
+        let mut summaries = BTreeMap::new();
+        let mut relationships = Vec::new();
+        add_snapshot_evidence_artifacts(
+            opts,
+            out_dir,
+            &pack_producer(),
+            &mut artifacts,
+            &mut summaries,
+            &mut relationships,
+        )?;
+        Ok((artifacts, summaries, relationships))
+    }
+
+    #[test]
+    fn add_snapshot_evidence_artifacts_binds_snapshots_and_cursors() {
+        let data = tempdir().expect("tempdir");
+        let out = tempdir().expect("tempdir");
+        write_snapshot_shard(data.path(), 0, false);
+        let mut opts = test_opts();
+        opts.data_dir = Some(data.path().to_path_buf());
+
+        let (artifacts, summaries, relationships) = run_add_snapshot(&opts, out.path()).expect("add snapshots");
+
+        assert_eq!(artifacts["snapshot_verify"].status, EvidenceStatusV1::Pass);
+        assert!(artifacts.contains_key("projection_meta_shard_0"));
+        let key = "projection_snapshot_0_artifact_living_state";
+        let descriptor = artifacts.get(key).expect("projection snapshot artifact");
+        // The copied artifact's hash is recomputed from the copied bytes.
+        let copied = std::fs::read(out.path().join(&descriptor.path)).expect("read copy");
+        assert_eq!(descriptor.blake3, blake3::hash(&copied).to_hex().to_string());
+        assert!(matches!(
+            descriptor.source_refs.first(),
+            Some(EvidenceSourceRefV1::ProjectionSnapshot { shard_id: 0, .. })
+        ));
+        assert!(summaries[key].contains("expected_blake3="));
+        assert!(relationships
+            .iter()
+            .any(|r| r.from == "snapshot_verify" && r.to == key && r.relation == "derived_from"));
+        assert!(relationships
+            .iter()
+            .any(|r| r.from == "projection_meta_shard_0" && r.relation == "describes"));
+    }
+
+    /// A snapshot whose bytes disagree with the hash declared in
+    /// `projections.meta.json` must land in the manifest as Fail. This is the
+    /// core manifest/content-mismatch guard for the pack.
+    #[test]
+    fn add_snapshot_evidence_artifacts_flags_hash_mismatch_as_fail() {
+        let data = tempdir().expect("tempdir");
+        let out = tempdir().expect("tempdir");
+        write_snapshot_shard(data.path(), 0, true);
+        let mut opts = test_opts();
+        opts.data_dir = Some(data.path().to_path_buf());
+
+        let (artifacts, summaries, _) = run_add_snapshot(&opts, out.path()).expect("add snapshots");
+        assert_eq!(artifacts["snapshot_verify"].status, EvidenceStatusV1::Fail);
+        assert_eq!(summaries["snapshot_verify"], "failed_shards=1");
+
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out.path().join("snapshot_verify.json")).expect("read report"))
+                .expect("parse report");
+        assert_eq!(report["ok"], false);
+        let reason = report["shards"][0]["projections"]
+            .as_array()
+            .expect("projections array")
+            .iter()
+            .find_map(|p| p["reason"].as_str())
+            .expect("a failing projection");
+        assert_eq!(reason, "SNAPSHOT_HASH_MISMATCH");
+    }
+
+    /// KNOWN BEHAVIOUR, pinned deliberately: a data dir with an empty `shards`
+    /// directory yields `snapshot_verify = Pass` because zero shards means
+    /// zero failed shards. Nothing was verified, yet the artifact reads clean.
+    #[test]
+    fn add_snapshot_evidence_artifacts_empty_shards_dir_reads_as_pass() {
+        let data = tempdir().expect("tempdir");
+        let out = tempdir().expect("tempdir");
+        std::fs::create_dir_all(data.path().join("shards")).expect("create shards dir");
+        let mut opts = test_opts();
+        opts.data_dir = Some(data.path().to_path_buf());
+
+        let (artifacts, _, relationships) = run_add_snapshot(&opts, out.path()).expect("add snapshots");
+        assert_eq!(
+            artifacts["snapshot_verify"].status,
+            EvidenceStatusV1::Pass,
+            "zero shards currently reads as a clean verification"
+        );
+        assert_eq!(artifacts.len(), 1);
+        assert!(relationships.is_empty());
+    }
+
+    /// Snapshot files listed in the meta but absent on disk are skipped for
+    /// binding, and the shard's verification is a Fail — the pack must not
+    /// claim to bind projections it never read.
+    #[test]
+    fn add_snapshot_evidence_artifacts_absent_snapshot_files_are_not_bound() {
+        let data = tempdir().expect("tempdir");
+        let out = tempdir().expect("tempdir");
+        let proj_dir = data.path().join("shards").join("shard-0000").join("projections");
+        std::fs::create_dir_all(&proj_dir).expect("create dir");
+        let mut meta = corecrux_projections::ProjectionsMetaV1::empty_now();
+        meta.artifact_living_state.snapshot_blake3 = Some("a".repeat(64));
+        std::fs::write(
+            proj_dir.join("projections.meta.json"),
+            serde_json::to_vec_pretty(&meta).expect("serialize"),
+        )
+        .expect("write meta");
+        let mut opts = test_opts();
+        opts.data_dir = Some(data.path().to_path_buf());
+
+        let (artifacts, _, _) = run_add_snapshot(&opts, out.path()).expect("add snapshots");
+        assert_eq!(artifacts["snapshot_verify"].status, EvidenceStatusV1::Fail);
+        assert!(artifacts.contains_key("projection_meta_shard_0"));
+        assert!(
+            !artifacts.keys().any(|k| k.starts_with("projection_snapshot_")),
+            "no snapshot may be bound when none exists on disk"
+        );
+    }
+
+    /// A shard directory with no `projections.meta.json` is an error, not an
+    /// empty binding: `load_projections_meta_v1` defaults to an empty meta but
+    /// the subsequent read of the file for copying fails.
+    #[test]
+    fn add_snapshot_evidence_artifacts_missing_meta_file_errors() {
+        let data = tempdir().expect("tempdir");
+        let out = tempdir().expect("tempdir");
+        std::fs::create_dir_all(data.path().join("shards").join("shard-0000").join("projections")).expect("create dir");
+        let mut opts = test_opts();
+        opts.data_dir = Some(data.path().to_path_buf());
+
+        assert!(run_add_snapshot(&opts, out.path()).is_err());
+    }
+
+    #[test]
+    fn add_snapshot_evidence_artifacts_without_data_dir_writes_skipped_report() {
+        let out = tempdir().expect("tempdir");
+        let (artifacts, summaries, relationships) = run_add_snapshot(&test_opts(), out.path()).expect("add snapshots");
+        assert_eq!(artifacts["snapshot_verify"].status, EvidenceStatusV1::Skipped);
+        assert!(!artifacts["snapshot_verify"].required);
+        assert!(summaries["snapshot_verify"].contains("requires --data-dir"));
+        assert!(relationships.is_empty());
+        assert!(out.path().join("snapshot_verify.json").exists());
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // add_receipt_evidence_artifacts
+    // ══════════════════════════════════════════════════════════════════
+
+    fn receipt_manifest_json(receipt_id: &str, tenant: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "export_schema": "corecrux.replay.export.v1",
+            "generated_at": "2026-02-11T00:00:00Z",
+            "tenant_id": tenant,
+            "receipt_id": receipt_id,
+            "corecrux_build": {"version": "1.0.0", "commit": "abc1234"},
+            "format": "zip",
+            "redaction": "none",
+            "include": ["body", "sig"],
+            "included_files": [],
+            "receipt_refs": {
+                "receipt_body_payload_hash": "aa".repeat(32),
+                "receipt_sig_event_ref": "sig-event-ref-1",
+            },
+            "corecrux_event_headers": [],
+        }))
+        .expect("serialize manifest")
+    }
+
+    fn run_add_receipt(opts: &AuditPackOptionsV1, out_dir: &Path) -> Result<(Option<String>, SnapshotCall), DynError> {
+        let mut artifacts = BTreeMap::new();
+        let mut summaries = BTreeMap::new();
+        let mut relationships = Vec::new();
+        let scope = add_receipt_evidence_artifacts(
+            opts,
+            out_dir,
+            &pack_producer(),
+            &mut artifacts,
+            &mut summaries,
+            &mut relationships,
+        )?;
+        Ok((scope, (artifacts, summaries, relationships)))
+    }
+
+    #[test]
+    fn add_receipt_evidence_artifacts_without_selector_is_a_noop() {
+        let out = tempdir().expect("tempdir");
+        let (scope, (artifacts, _, relationships)) = run_add_receipt(&test_opts(), out.path()).expect("no selector");
+        assert!(scope.is_none());
+        assert!(artifacts.is_empty());
+        assert!(relationships.is_empty());
+    }
+
+    /// `--offline` plus a receipt selector is a contradiction and must be
+    /// refused rather than quietly emitting a pack with no receipt evidence.
+    #[test]
+    fn add_receipt_evidence_artifacts_offline_with_selector_errors() {
+        let out = tempdir().expect("tempdir");
+        let mut opts = test_opts();
+        opts.receipt_id = Some("r1".to_string());
+
+        let err = run_add_receipt(&opts, out.path()).err().expect("must fail");
+        assert!(err.to_string().contains("remove --offline"), "{err}");
+    }
+
+    #[test]
+    fn add_receipt_evidence_artifacts_requires_tenant_id() {
+        let out = tempdir().expect("tempdir");
+        let mut opts = test_opts();
+        opts.offline = false;
+        opts.receipt_id = Some("r1".to_string());
+
+        let err = run_add_receipt(&opts, out.path()).err().expect("must fail");
+        assert!(err.to_string().contains("require --tenant-id"), "{err}");
+    }
+
+    #[test]
+    fn add_receipt_evidence_artifacts_propagates_fetch_failure() {
+        let out = tempdir().expect("tempdir");
+        let mut opts = test_opts();
+        opts.offline = false;
+        opts.corecrux_base = format!("http://127.0.0.1:{}", dead_port());
+        opts.tenant_id = Some("t1".to_string());
+        opts.receipt_id = Some("r1".to_string());
+
+        assert!(run_add_receipt(&opts, out.path()).is_err());
+    }
+
+    #[test]
+    fn add_receipt_evidence_artifacts_binds_bundle_manifest_and_verification() {
+        let out = tempdir().expect("tempdir");
+        let keyring = out.path().join("keyring.json");
+        std::fs::write(&keyring, b"{\"keys\":[]}").expect("write keyring");
+        let bundle = zip_bytes(&[
+            ("manifest.json", &receipt_manifest_json("rcpt-42", "t1")),
+            ("verification/report.json", b"{\"ok\":true}"),
+        ]);
+        let (port, handle) = serve_bytes_once(200, bundle.clone());
+
+        let mut opts = test_opts();
+        opts.offline = false;
+        opts.corecrux_base = format!("http://127.0.0.1:{port}");
+        opts.tenant_id = Some("t1".to_string());
+        opts.receipt_id = Some("rcpt-42".to_string());
+        opts.receipt_keyring = Some(keyring);
+
+        let (scope, (artifacts, summaries, relationships)) = run_add_receipt(&opts, out.path()).expect("bind receipt");
+        let _ = handle.join();
+
+        assert_eq!(scope.as_deref(), Some("rcpt-42"));
+        // The bundle artifact must hash the bytes actually written to disk.
+        assert_eq!(
+            artifacts["receipt_bundle"].blake3,
+            blake3::hash(&bundle).to_hex().to_string()
+        );
+        assert!(artifacts.contains_key("receipt_export_manifest"));
+        assert!(artifacts.contains_key("receipt_verification"));
+        assert!(artifacts.contains_key("receipt_keyring"));
+        assert!(summaries["receipt_bundle"].contains("selector=receipt"));
+        assert!(summaries["receipt_bundle"].contains("receipt_id=rcpt-42"));
+        assert!(matches!(
+            artifacts["receipt_bundle"].source_refs.first(),
+            Some(EvidenceSourceRefV1::Receipt { .. })
+        ));
+        assert!(relationships
+            .iter()
+            .any(|r| r.from == "receipt_verification" && r.to == "receipt_keyring" && r.relation == "verified_with"));
+        assert!(out.path().join("receipt_export.zip").exists());
+        assert!(out.path().join("receipt_verification_report.json").exists());
+    }
+
+    /// A bundle whose `manifest.json` is not a valid export manifest must be
+    /// rejected — the pack cannot cite a receipt it could not identify.
+    #[test]
+    fn add_receipt_evidence_artifacts_rejects_unparsable_bundle_manifest() {
+        let out = tempdir().expect("tempdir");
+        let bundle = zip_bytes(&[
+            ("manifest.json", b"{\"export_schema\":\"only-this-field\"}"),
+            ("verification/report.json", b"{}"),
+        ]);
+        let (port, handle) = serve_bytes_once(200, bundle);
+
+        let mut opts = test_opts();
+        opts.offline = false;
+        opts.corecrux_base = format!("http://127.0.0.1:{port}");
+        opts.tenant_id = Some("t1".to_string());
+        opts.answer_id = Some("ans-1".to_string());
+
+        let result = run_add_receipt(&opts, out.path());
+        let _ = handle.join();
+        assert!(result.is_err());
+    }
+
+    /// A bundle missing `verification/report.json` must fail rather than
+    /// producing a pack that silently omits the verification evidence.
+    #[test]
+    fn add_receipt_evidence_artifacts_rejects_bundle_without_verification_report() {
+        let out = tempdir().expect("tempdir");
+        let bundle = zip_bytes(&[("manifest.json", &receipt_manifest_json("rcpt-7", "t1"))]);
+        let (port, handle) = serve_bytes_once(200, bundle);
+
+        let mut opts = test_opts();
+        opts.offline = false;
+        opts.corecrux_base = format!("http://127.0.0.1:{port}");
+        opts.tenant_id = Some("t1".to_string());
+        opts.action_id = Some("act-1".to_string());
+
+        let result = run_add_receipt(&opts, out.path());
+        let _ = handle.join();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn add_receipt_evidence_artifacts_rejects_non_zip_response() {
+        let out = tempdir().expect("tempdir");
+        let (port, handle) = crate::test_support::serve_responses(vec![(200, "{\"not\":\"a zip\"}".to_string())]);
+
+        let mut opts = test_opts();
+        opts.offline = false;
+        opts.corecrux_base = format!("http://127.0.0.1:{port}");
+        opts.tenant_id = Some("t1".to_string());
+        opts.receipt_id = Some("r1".to_string());
+
+        let result = run_add_receipt(&opts, out.path());
+        let _ = handle.join();
+        assert!(result.is_err());
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // generate_audit_pack_v1 — end-to-end status propagation
+    // ══════════════════════════════════════════════════════════════════
+
+    /// An unreachable daemon must produce a Fail pack. The stream export
+    /// failure is captured as an issue in `ordering_parity.json`, and the
+    /// overall v2 index status must not read Pass.
+    #[test]
+    fn generate_audit_pack_marks_unreachable_daemon_as_fail() {
+        let out = tempdir().expect("tempdir");
+        let mut opts = test_opts();
+        opts.out_dir = Some(out.path().to_path_buf());
+        opts.offline = false;
+        opts.corecrux_base = format!("http://127.0.0.1:{}", dead_port());
+        opts.tenant_id = Some("t1".to_string());
+        opts.stream_type = Some("knowledge".to_string());
+        opts.stream_id = Some("s1".to_string());
+
+        let index = generate_audit_pack_v1(&opts).expect("generate pack");
+        assert_eq!(index.status, EvidenceStatusV1::Fail);
+
+        let ordering: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out.path().join("ordering_parity.json")).expect("read ordering"))
+                .expect("parse ordering");
+        assert_eq!(ordering["status"], "fail");
+        assert_eq!(ordering["issues"][0]["kind"], "stream_export_error");
+
+        let integrity: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out.path().join("integrity_scan.json")).expect("read integrity"))
+                .expect("parse integrity");
+        assert_eq!(integrity["status"], "fail");
+        assert_eq!(integrity["health_ok"], false);
+    }
+
+    /// The generator must refuse the offline + receipt-selector combination
+    /// rather than emitting a pack that quietly lacks receipt evidence.
+    #[test]
+    fn generate_audit_pack_offline_with_receipt_selector_errors() {
+        let out = tempdir().expect("tempdir");
+        let mut opts = test_opts();
+        opts.out_dir = Some(out.path().to_path_buf());
+        opts.receipt_id = Some("r1".to_string());
+
+        assert!(generate_audit_pack_v1(&opts).is_err());
+    }
+
+    #[test]
+    fn generate_audit_pack_rejects_conflicting_receipt_selectors() {
+        let out = tempdir().expect("tempdir");
+        let mut opts = test_opts();
+        opts.out_dir = Some(out.path().to_path_buf());
+        opts.offline = false;
+        opts.corecrux_base = format!("http://127.0.0.1:{}", dead_port());
+        opts.receipt_id = Some("r1".to_string());
+        opts.action_id = Some("a1".to_string());
+
+        let err = generate_audit_pack_v1(&opts).err().expect("must fail");
+        assert!(err.to_string().contains("use only one of"), "{err}");
+    }
+
+    /// The v2 index must describe the manifest it was written alongside: any
+    /// drift between `manifest_blake3`/`manifest_size_bytes` and the file on
+    /// disk would let a tampered manifest travel inside a valid-looking pack.
+    #[test]
+    fn generate_audit_pack_index_binds_manifest_hash_and_size() {
+        let out = tempdir().expect("tempdir");
+        let mut opts = test_opts();
+        opts.out_dir = Some(out.path().to_path_buf());
+
+        let index = generate_audit_pack_v1(&opts).expect("generate pack");
+        let manifest_bytes = std::fs::read(out.path().join(&index.manifest_path)).expect("read manifest");
+        assert_eq!(
+            index.manifest_blake3,
+            blake3::hash(&manifest_bytes).to_hex().to_string()
+        );
+        assert_eq!(index.manifest_size_bytes, manifest_bytes.len() as u64);
+
+        // Every summarised artifact must exist on disk with the recorded hash.
+        for (key, summary) in &index.artifact_summary {
+            let bytes = std::fs::read(out.path().join(&summary.path)).unwrap_or_else(|e| panic!("read {key}: {e}"));
+            assert_eq!(summary.blake3, blake3::hash(&bytes).to_hex().to_string(), "{key}");
+            assert_eq!(summary.size_bytes, bytes.len() as u64, "{key}");
+        }
+    }
+
+    /// Without `--data-dir` the pack is explicitly a reduced, "remote
+    /// compatible" artifact: the binding-mode report warns and the missing
+    /// capabilities list says so, instead of the pack looking fully bound.
+    #[test]
+    fn generate_audit_pack_without_data_dir_warns_on_local_binding_mode() {
+        let out = tempdir().expect("tempdir");
+        let mut opts = test_opts();
+        opts.out_dir = Some(out.path().to_path_buf());
+
+        let index = generate_audit_pack_v1(&opts).expect("generate pack");
+        assert_eq!(
+            index.artifact_summary["local_binding_mode"].status,
+            EvidenceStatusV1::Warn
+        );
+
+        let report: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(out.path().join("local_binding_mode.json")).expect("read binding mode"),
+        )
+        .expect("parse binding mode");
+        assert_eq!(report["status"], "warn");
+        assert_eq!(report["mode"], "remote_compatible");
+    }
+
+    /// With `--data-dir` the local-binding surface switches on, but a data dir
+    /// that hosts no control evidence must land as Warn: "nothing was hosted
+    /// locally" is not the same as "control state was verified".
+    #[test]
+    fn generate_audit_pack_with_data_dir_reports_unhosted_control_as_warn() {
+        let out = tempdir().expect("tempdir");
+        let data = tempdir().expect("tempdir");
+        std::fs::create_dir_all(data.path().join("shards")).expect("create shards dir");
+        let mut opts = test_opts();
+        opts.out_dir = Some(out.path().to_path_buf());
+        opts.data_dir = Some(data.path().to_path_buf());
+
+        let index = generate_audit_pack_v1(&opts).expect("generate pack");
+        assert_eq!(index.artifact_summary["control_verify"].status, EvidenceStatusV1::Warn);
+        assert_eq!(
+            index.artifact_summary["local_binding_mode"].status,
+            EvidenceStatusV1::Pass
+        );
+        // No control evidence is hosted, so no checkpoint/evidence artifacts.
+        assert!(!index.artifact_summary.contains_key("control_checkpoint"));
+        assert!(!index.artifact_summary.contains_key("control_evidence_stream"));
+
+        let manifest: EvidenceManifestV1 =
+            serde_json::from_slice(&std::fs::read(out.path().join("evidence_manifest.json")).expect("read manifest"))
+                .expect("parse manifest");
+        assert!(!manifest
+            .missing_capabilities
+            .contains(&"current_surface_skipped:control_checkpoint_binding".to_string()));
+
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out.path().join("control_verify.json")).expect("read report"))
+                .expect("parse report");
+        assert_eq!(report["hosted"], false);
+    }
+
+    #[test]
+    fn generate_audit_pack_creates_nested_out_dir() {
+        let out = tempdir().expect("tempdir");
+        let nested = out.path().join("a").join("b").join("pack");
+        let mut opts = test_opts();
+        opts.out_dir = Some(nested.clone());
+
+        generate_audit_pack_v1(&opts).expect("generate pack");
+        assert!(nested.join("evidence_manifest.json").exists());
     }
 }
