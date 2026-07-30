@@ -1,5 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 // Mutation-killing tests for src/append.rs (ExecPlan crux-storage-mutation-burndown-2026-07-22).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

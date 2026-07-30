@@ -32,10 +32,15 @@ count_sites() {
 
   # tests.rs is test-only but gated from its parent mod (out-of-file #[path]
   # decl), so it carries no in-file #[cfg(test)] for the scan to key on.
+  # mutants_tests_*.rs are the same case: one per-source-file mutation-killing
+  # module, each declared `#[cfg(test)] mod ...` from its crate root, so the
+  # gate is out-of-file and invisible to this scan. Excluded by name rather than
+  # absorbed into the baselines — inflating a baseline to cover test expects
+  # would permanently license that many new PRODUCTION unwrap sites.
   # metrics.rs is the allowlisted Prometheus register!() surface (docs/unwrap-triage.md).
-  # Both are excluded by name so the count reflects production code only.
+  # All are excluded by name so the count reflects production code only.
   find "$crate_dir" -type f -name '*.rs' ! -path '*/tests/*' \
-    ! -name 'tests.rs' ! -name 'metrics.rs' \
+    ! -name 'tests.rs' ! -name 'metrics.rs' ! -name 'mutants_tests_*.rs' \
     -exec awk '
       # Track brace depth so an inline #[cfg(test)] exempts only its own item,
       # not the rest of the file. Counting happens on the line-entry state so a
