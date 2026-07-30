@@ -42,6 +42,27 @@ Crux Daemon exposes three network surfaces by default:
 HTTP fact writes do not support `private=true`. Private facts and per-agent
 visibility are MCP-only features.
 
+### Work and Orchestrators
+
+Work and orchestrator records are authority-sensitive, tenant-scoped surfaces.
+In JWT modes, creator/updater/commenter identity and tenant come from verified
+claims; matching body fields are compatibility constraints, not an
+impersonation mechanism. A caller cannot list, read, mutate, comment on, attach
+members to, or resolve gates for another tenant.
+
+In local `off`/`dev_scopes` mode, an explicit passport header or matching body
+assertion is recorded as `operator:unverified:<id>`. It is not a verified human
+identity: work state changes always queue for review. Human gate decisions in
+authenticated modes require `facts:write`, a canonical JWT `passport_id`, and
+the work tenant; MCP agent tokens and `sub`-only JWTs cannot approve or reject.
+An unmapped MCP agent token is attributed as `agent:<token-name>` and is gated
+as automation; only an explicit `CRUX_AGENT_PASSPORTS` mapping may resolve it
+to a real passport id.
+
+The generic `/v1/entities/{kind}/{id}` and MCP `entity_*` APIs reject governed
+`orchestrator` records and omit them from unfiltered listings. Use the typed
+`/v1/orchestrators` routes so tenant and actor checks cannot be bypassed.
+
 ### Session Store
 
 | Method | Path | Description | Auth Scope |
@@ -243,6 +264,8 @@ Configured via `CORECRUXD_AUTH_MODE`:
 | `jwt_jwks` | JWT with JWKS key rotation | Production with key management |
 
 Scopes are passed via `Authorization: Bearer <token>` header. Required scopes are listed per endpoint above.
+`X-Corecrux-Passport-Id` is only an unverified local assertion in `off` and
+`dev_scopes`; production authority must come from verified token claims.
 
 ### Route authorization gate (`CORECRUXD_ROUTE_AUTH`)
 

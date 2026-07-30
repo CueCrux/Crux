@@ -296,6 +296,40 @@ impl McpContext {
         }
     }
 
+    /// Identity used when this MCP session exercises mutation authority through
+    /// daemon HTTP loopback.
+    ///
+    /// Private-fact ownership keeps the legacy raw token-name via
+    /// [`Self::scope_identity`]. Authority is deliberately stricter: an
+    /// unmapped agent is namespaced as `agent:<name>` so a token name cannot
+    /// collide with and inherit a real passport's policy. Only an explicit
+    /// agent-passport mapping resolves to a canonical passport id.
+    pub fn authority_identity(&self) -> Option<String> {
+        let name = self.agent.as_ref()?.name.as_str();
+        if self.agent_passports_enabled {
+            Some(
+                crate::agent_passport::resolve_agent_passport(name, &self.agent_passport_map)
+                    .unwrap_or_else(|| format!("agent:{name}")),
+            )
+        } else {
+            Some(format!("agent:{name}"))
+        }
+    }
+
+    /// Concrete tenant bound to the current MCP agent for loopback HTTP
+    /// authority. Mapped agent passports carry their configured collaboration
+    /// tenant; unmapped/flag-off callers are confined to `default`.
+    pub fn scope_tenant(&self) -> String {
+        if !self.agent_passports_enabled {
+            return "default".to_string();
+        }
+        self.agent
+            .as_ref()
+            .and_then(|agent| self.agent_passport_map.tenant_for(&agent.name))
+            .unwrap_or("default")
+            .to_string()
+    }
+
     /// Back-compat alias names for the caller's private-fact ownership under
     /// flag-ON (agent-passport M5). Empty when the flag is off (no rekeying
     /// happened, so no alias is needed).
@@ -759,6 +793,37 @@ mod tests {
             token,
             signing.verifying_key().to_bytes(),
         ))
+    }
+
+    #[test]
+    fn authority_identity_namespaces_unmapped_agents_without_rekeying_private_scope() {
+        let agent = crate::agent::AgentIdentity {
+            name: "personal-default".to_string(),
+            token_hash: [0u8; 32],
+        };
+        let unmapped = McpContext::new_default("test-node").with_agent(agent.clone());
+        assert_eq!(unmapped.scope_identity().as_deref(), Some("personal-default"));
+        assert_eq!(unmapped.authority_identity().as_deref(), Some("agent:personal-default"));
+
+        let flag_on_unmapped = McpContext::new_default("test-node")
+            .with_agent_passports(true, crate::agent_passport::AgentPassportMap::empty())
+            .with_agent(agent.clone());
+        assert_eq!(flag_on_unmapped.scope_identity().as_deref(), Some("personal-default"));
+        assert_eq!(
+            flag_on_unmapped.authority_identity().as_deref(),
+            Some("agent:personal-default")
+        );
+
+        let mapped = McpContext::new_default("test-node")
+            .with_agent_passports(
+                true,
+                crate::agent_passport::AgentPassportMap::from_pairs_str(
+                    "personal-default:automation-passport:tenant-a",
+                ),
+            )
+            .with_agent(agent);
+        assert_eq!(mapped.scope_identity().as_deref(), Some("automation-passport"));
+        assert_eq!(mapped.authority_identity().as_deref(), Some("automation-passport"));
     }
 
     fn rpc(method: &str, params: serde_json::Value) -> JsonRpcRequest {

@@ -241,6 +241,7 @@ pub(super) async fn post_tailscale_token(
     let sub = format!("ts:{login}");
     let claims = ScopedClaims {
         sub: &sub,
+        passport_id: None,
         scopes: &scope_refs,
         tenant_id: &principal.tenant_id,
         ttl_secs: ISSUED_TOKEN_TTL_SECS,

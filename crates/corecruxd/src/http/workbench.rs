@@ -238,15 +238,18 @@ fn ranked_open_work(
 ) -> Vec<Value> {
     let mut items = crate::work::list_work(store, project_id, None, Some(tenant_id), None);
 
-    // ExecPlan items are tenant-agnostic (the projection is per-root, not
-    // per-tenant), so they are appended rather than tenant-filtered — same
-    // treatment `/v1/work?source=all` gives them.
+    // The projection is per-root, but its WorkItem rows still use the work
+    // tenant contract (`None == default`). Match `/v1/work?source=all` and do
+    // not append default-tenant plans to another tenant's brief.
     if let Some(root) = crate::work_execplans::execplans_root_from_env() {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as u64);
         match crate::work_execplans::list_execplans(store, &root, now) {
-            Ok(plans) => items.extend(plans),
+            Ok(mut plans) => {
+                plans.retain(|work| crate::work::work_tenant_id(work) == tenant_id);
+                items.extend(plans);
+            }
             Err(err) => {
                 tracing::warn!(error = %err, root = %root.display(), "brief-execplan-aggregator-io-error");
             }

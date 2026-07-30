@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use crate::dispatch::McpContext;
 use crate::protocol::{JsonRpcError, INVALID_PARAMS};
 use crate::tools::coordination::{
-    loopback_base, loopback_delete, loopback_get, loopback_patch, loopback_post, text_content,
+    loopback_base, loopback_delete, loopback_get_scoped, loopback_patch, loopback_post, text_content,
 };
 
 pub const CREATE_ORCHESTRATOR_DESCRIPTION: &str =
@@ -40,6 +40,18 @@ fn required_str<'a>(args: &'a Value, key: &str, tool: &str) -> Result<&'a str, J
     })
 }
 
+fn authority_identity(ctx: &McpContext, tool: &str) -> Result<String, JsonRpcError> {
+    ctx.authority_identity().ok_or_else(|| JsonRpcError {
+        code: INVALID_PARAMS,
+        message: format!("{tool}: authenticated MCP authority is required"),
+        data: None,
+    })
+}
+
+fn claimed_identity_matches(ctx: &McpContext, claimed: &str, authority: &str) -> bool {
+    claimed == authority || ctx.scope_identity().as_deref() == Some(claimed)
+}
+
 fn urlencoding(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
@@ -51,18 +63,46 @@ fn urlencoding(s: &str) -> String {
 
 pub async fn handle_create_orchestrator(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let name = required_str(args, "name", "create_orchestrator")?;
-    let created_by = required_str(args, "created_by_passport", "create_orchestrator")?;
+    let claimed_created_by = required_str(args, "created_by_passport", "create_orchestrator")?;
+    let identity = authority_identity(ctx, "create_orchestrator")?;
+    if !claimed_identity_matches(ctx, claimed_created_by, &identity) {
+        return Err(JsonRpcError {
+            code: INVALID_PARAMS,
+            message: "create_orchestrator: created_by_passport does not match the authenticated MCP agent".to_string(),
+            data: None,
+        });
+    }
+    let tenant = ctx.scope_tenant();
+    if args
+        .get("tenant_id")
+        .and_then(Value::as_str)
+        .is_some_and(|requested| requested != tenant)
+    {
+        return Err(JsonRpcError {
+            code: INVALID_PARAMS,
+            message: "create_orchestrator: tenant_id does not match the authenticated MCP agent".to_string(),
+            data: None,
+        });
+    }
     let mut body = json!({
         "name": name,
-        "created_by_passport": created_by,
+        "created_by_passport": identity,
+        "tenant_id": tenant,
     });
-    for key in ["assignee_passport", "tenant_id", "state"] {
+    for key in ["assignee_passport", "state"] {
         if let Some(v) = args.get(key) {
             body[key] = v.clone();
         }
     }
     let base = loopback_base(ctx)?;
-    let (_, resp) = loopback_post(format!("{base}/v1/orchestrators"), body, true, ctx.scope_identity()).await?;
+    let (_, resp) = loopback_post(
+        format!("{base}/v1/orchestrators"),
+        body,
+        true,
+        ctx.authority_identity(),
+        Some(ctx.scope_tenant()),
+    )
+    .await?;
     Ok(text_content(serde_json::from_str(&resp).unwrap_or(Value::String(resp))))
 }
 
@@ -80,7 +120,8 @@ pub async fn handle_attach_to_orchestrator(args: &Value, ctx: &McpContext) -> Re
         format!("{base}/v1/orchestrators/{id}/members"),
         body,
         false,
-        ctx.scope_identity(),
+        ctx.authority_identity(),
+        Some(ctx.scope_tenant()),
     )
     .await?;
     Ok(text_content(serde_json::from_str(&resp).unwrap_or(Value::String(resp))))
@@ -91,16 +132,27 @@ pub async fn handle_detach_from_orchestrator(args: &Value, ctx: &McpContext) -> 
     let member = required_str(args, "member_ref", "detach_from_orchestrator")?;
     let base = loopback_base(ctx)?;
     let url = format!("{base}/v1/orchestrators/{id}/members/{}", urlencoding(member));
-    let (_, resp) = loopback_delete(url, ctx.scope_identity()).await?;
+    let (_, resp) = loopback_delete(url, ctx.authority_identity(), Some(ctx.scope_tenant())).await?;
     Ok(text_content(serde_json::from_str(&resp).unwrap_or(Value::String(resp))))
 }
 
 pub async fn handle_list_orchestrators(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
+    let tenant = ctx.scope_tenant();
+    if args
+        .get("tenant_id")
+        .and_then(Value::as_str)
+        .is_some_and(|requested| requested != tenant)
+    {
+        return Err(JsonRpcError {
+            code: INVALID_PARAMS,
+            message: "list_orchestrators: tenant_id does not match the authenticated MCP agent".to_string(),
+            data: None,
+        });
+    }
     let mut params = Vec::new();
-    for key in ["tenant_id", "state"] {
-        if let Some(v) = args.get(key).and_then(Value::as_str) {
-            params.push(format!("{key}={}", urlencoding(v)));
-        }
+    params.push(format!("tenant_id={}", urlencoding(&tenant)));
+    if let Some(state) = args.get("state").and_then(Value::as_str) {
+        params.push(format!("state={}", urlencoding(state)));
     }
     let qs = if params.is_empty() {
         String::new()
@@ -108,7 +160,12 @@ pub async fn handle_list_orchestrators(args: &Value, ctx: &McpContext) -> Result
         format!("?{}", params.join("&"))
     };
     let base = loopback_base(ctx)?;
-    let (_, resp) = loopback_get(format!("{base}/v1/orchestrators{qs}")).await?;
+    let (_, resp) = loopback_get_scoped(
+        format!("{base}/v1/orchestrators{qs}"),
+        ctx.authority_identity(),
+        Some(tenant),
+    )
+    .await?;
     Ok(text_content(serde_json::from_str(&resp).unwrap_or(Value::String(resp))))
 }
 
@@ -128,7 +185,13 @@ pub async fn handle_update_orchestrator(args: &Value, ctx: &McpContext) -> Resul
         });
     }
     let base = loopback_base(ctx)?;
-    let (_, resp) = loopback_patch(format!("{base}/v1/orchestrators/{id}"), body, ctx.scope_identity()).await?;
+    let (_, resp) = loopback_patch(
+        format!("{base}/v1/orchestrators/{id}"),
+        body,
+        ctx.authority_identity(),
+        Some(ctx.scope_tenant()),
+    )
+    .await?;
     Ok(text_content(serde_json::from_str(&resp).unwrap_or(Value::String(resp))))
 }
 
@@ -217,10 +280,23 @@ mod tests {
         serde_json::from_str(value["content"][0]["text"].as_str().expect("text content")).expect("json text")
     }
 
+    fn scoped_agent_context(base: String) -> McpContext {
+        McpContext::new_default("node-a")
+            .with_daemon_base_url(base)
+            .with_agent_passports(
+                true,
+                crate::agent_passport::AgentPassportMap::from_pairs_str("p1:p1:tenant-a"),
+            )
+            .with_agent(crate::agent::AgentIdentity {
+                name: "p1".to_string(),
+                token_hash: [0u8; 32],
+            })
+    }
+
     #[tokio::test]
     async fn orchestrator_handlers_call_loopback_endpoints() {
         let (base, stop, handle) = serve_orchestrator_loopback();
-        let ctx = McpContext::new_default("node-a").with_daemon_base_url(base.clone());
+        let ctx = scoped_agent_context(base.clone());
 
         let created = text_json(
             handle_create_orchestrator(

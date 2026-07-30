@@ -17,7 +17,7 @@ use crate::protocol::{JsonRpcError, INTERNAL_ERROR, INVALID_PARAMS};
 
 const SCOPES: &str = "admin:read,facts:write";
 
-use crate::tools::loopback_auth::loopback_bearer_token;
+use crate::tools::loopback_auth::{loopback_bearer_token, loopback_bearer_token_for_passport};
 
 pub const LIST_PROJECTS_DESCRIPTION: &str =
     "List all projects defined on this daemon. Each project carries a planning_target (a tenant or a github repo URL), a default_passport_id, and counts of members + working tenants.";
@@ -134,7 +134,19 @@ fn loopback_ok(status: u16, expect_201: bool) -> bool {
 }
 
 pub(crate) async fn loopback_get(url: String) -> Result<(u16, String), JsonRpcError> {
-    let bearer = loopback_bearer_token();
+    loopback_get_scoped(url, None, None).await
+}
+
+pub(crate) async fn loopback_get_scoped(
+    url: String,
+    passport: Option<String>,
+    tenant: Option<String>,
+) -> Result<(u16, String), JsonRpcError> {
+    let bearer = if passport.is_some() || tenant.is_some() {
+        loopback_bearer_token_for_passport(passport.as_deref(), tenant.as_deref())
+    } else {
+        loopback_bearer_token()
+    };
     let joined = tokio::task::spawn_blocking(move || {
         let agent = loopback_agent();
         let mut req = agent
@@ -143,6 +155,12 @@ pub(crate) async fn loopback_get(url: String) -> Result<(u16, String), JsonRpcEr
             .header("Accept", "application/json");
         if let Some(token) = &bearer {
             req = req.header("Authorization", &format!("Bearer {token}"));
+        }
+        if let Some(passport) = &passport {
+            req = req.header("X-Corecrux-Passport-Id", passport);
+        }
+        if let Some(tenant) = &tenant {
+            req = req.header("X-Corecrux-Tenant-Id", tenant);
         }
         req.call()
             .map(|mut r| (r.status().as_u16(), r.body_mut().read_to_string().unwrap_or_default()))
@@ -162,8 +180,9 @@ pub(crate) async fn loopback_post(
     body: Value,
     expect_201: bool,
     passport: Option<String>,
+    tenant: Option<String>,
 ) -> Result<(u16, String), JsonRpcError> {
-    let bearer = loopback_bearer_token();
+    let bearer = loopback_bearer_token_for_passport(passport.as_deref(), tenant.as_deref());
     let joined = tokio::task::spawn_blocking(move || {
         let agent = loopback_agent();
         let mut req = agent
@@ -174,12 +193,14 @@ pub(crate) async fn loopback_post(
         if let Some(token) = &bearer {
             req = req.header("Authorization", &format!("Bearer {token}"));
         }
-        // Forward the bound session passport so the daemon attributes the write
-        // to a real principal instead of falling back to "anonymous" (the
-        // loopback JWT's `sub` carries no passport claim). Honoured by
-        // `corecruxd::auth::http_passport_id`.
+        // Forward the bound session passport alongside the matching canonical
+        // JWT claim. The daemon treats the header only as a consistency check,
+        // never as independent impersonation authority.
         if let Some(pid) = &passport {
             req = req.header("X-Corecrux-Passport-Id", pid);
+        }
+        if let Some(tenant) = &tenant {
+            req = req.header("X-Corecrux-Tenant-Id", tenant);
         }
         req.send(body.to_string())
             .map(|mut r| (r.status().as_u16(), r.body_mut().read_to_string().unwrap_or_default()))
@@ -198,8 +219,9 @@ pub(crate) async fn loopback_patch(
     url: String,
     body: Value,
     passport: Option<String>,
+    tenant: Option<String>,
 ) -> Result<(u16, String), JsonRpcError> {
-    let bearer = loopback_bearer_token();
+    let bearer = loopback_bearer_token_for_passport(passport.as_deref(), tenant.as_deref());
     let joined = tokio::task::spawn_blocking(move || {
         let agent = loopback_agent();
         // PATCH was the ONE loopback helper missing the bearer token — every
@@ -216,6 +238,9 @@ pub(crate) async fn loopback_patch(
         if let Some(pid) = &passport {
             request = request.header("X-Corecrux-Passport-Id", pid);
         }
+        if let Some(tenant) = &tenant {
+            request = request.header("X-Corecrux-Tenant-Id", tenant);
+        }
         request
             .send(body.to_string())
             .map(|mut r| (r.status().as_u16(), r.body_mut().read_to_string().unwrap_or_default()))
@@ -230,8 +255,12 @@ pub(crate) async fn loopback_patch(
     }
 }
 
-pub(crate) async fn loopback_delete(url: String, passport: Option<String>) -> Result<(u16, String), JsonRpcError> {
-    let bearer = loopback_bearer_token();
+pub(crate) async fn loopback_delete(
+    url: String,
+    passport: Option<String>,
+    tenant: Option<String>,
+) -> Result<(u16, String), JsonRpcError> {
+    let bearer = loopback_bearer_token_for_passport(passport.as_deref(), tenant.as_deref());
     let joined = tokio::task::spawn_blocking(move || {
         let agent = loopback_agent();
         let mut request = agent
@@ -243,6 +272,9 @@ pub(crate) async fn loopback_delete(url: String, passport: Option<String>) -> Re
         }
         if let Some(pid) = &passport {
             request = request.header("X-Corecrux-Passport-Id", pid);
+        }
+        if let Some(tenant) = &tenant {
+            request = request.header("X-Corecrux-Tenant-Id", tenant);
         }
         request
             .call()
@@ -266,6 +298,18 @@ pub(crate) fn text_content(value: Value) -> Value {
     })
 }
 
+fn authority_identity(ctx: &McpContext, tool: &str) -> Result<String, JsonRpcError> {
+    ctx.authority_identity().ok_or_else(|| JsonRpcError {
+        code: INVALID_PARAMS,
+        message: format!("{tool}: authenticated MCP authority is required"),
+        data: None,
+    })
+}
+
+fn claimed_identity_matches(ctx: &McpContext, claimed: &str, authority: &str) -> bool {
+    claimed == authority || ctx.scope_identity().as_deref() == Some(claimed)
+}
+
 pub async fn handle_list_projects(_args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let base = loopback_base(ctx)?;
     let (_, body) = loopback_get(format!("{base}/v1/projects")).await?;
@@ -287,19 +331,32 @@ pub async fn handle_get_project_context(args: &Value, ctx: &McpContext) -> Resul
 }
 
 pub async fn handle_list_work(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
+    let tenant = ctx.scope_tenant();
+    if args
+        .get("tenant_id")
+        .and_then(Value::as_str)
+        .is_some_and(|requested| requested != tenant)
+    {
+        return Err(JsonRpcError {
+            code: INVALID_PARAMS,
+            message: "list_work: tenant_id does not match the authenticated MCP agent".to_string(),
+            data: None,
+        });
+    }
     let mut params = Vec::new();
-    for key in ["project_id", "state", "tenant_id", "assignee_passport"] {
+    for key in ["project_id", "state", "assignee_passport"] {
         if let Some(v) = args.get(key).and_then(|v| v.as_str()) {
             params.push(format!("{key}={}", urlencoding(v)));
         }
     }
+    params.push(format!("tenant_id={}", urlencoding(&tenant)));
     let qs = if params.is_empty() {
         String::new()
     } else {
         format!("?{}", params.join("&"))
     };
     let base = loopback_base(ctx)?;
-    let (_, body) = loopback_get(format!("{base}/v1/work{qs}")).await?;
+    let (_, body) = loopback_get_scoped(format!("{base}/v1/work{qs}"), ctx.authority_identity(), Some(tenant)).await?;
     Ok(text_content(serde_json::from_str(&body).unwrap_or(Value::String(body))))
 }
 
@@ -317,7 +374,7 @@ pub async fn handle_create_work(args: &Value, ctx: &McpContext) -> Result<Value,
         message: "create_work: title is required".to_string(),
         data: None,
     })?;
-    let created_by = args
+    let claimed_created_by = args
         .get("created_by_passport")
         .and_then(|v| v.as_str())
         .ok_or_else(|| JsonRpcError {
@@ -326,25 +383,46 @@ pub async fn handle_create_work(args: &Value, ctx: &McpContext) -> Result<Value,
                 .to_string(),
             data: None,
         })?;
+    let identity = authority_identity(ctx, "create_work")?;
+    if !claimed_identity_matches(ctx, claimed_created_by, &identity) {
+        return Err(JsonRpcError {
+            code: INVALID_PARAMS,
+            message: "create_work: created_by_passport does not match the authenticated MCP agent".to_string(),
+            data: None,
+        });
+    }
+    let tenant = ctx.scope_tenant();
+    if args
+        .get("tenant_id")
+        .and_then(Value::as_str)
+        .is_some_and(|requested| requested != tenant)
+    {
+        return Err(JsonRpcError {
+            code: INVALID_PARAMS,
+            message: "create_work: tenant_id does not match the authenticated MCP agent".to_string(),
+            data: None,
+        });
+    }
     let mut body = json!({
         "project_id": project_id,
         "title": title,
-        "created_by_passport": created_by,
+        "created_by_passport": identity,
+        "tenant_id": tenant,
     });
-    for key in [
-        "body",
-        "state",
-        "assignee_passport",
-        "tenant_id",
-        "linked_pr",
-        "linked_issue",
-    ] {
+    for key in ["body", "state", "assignee_passport", "linked_pr", "linked_issue"] {
         if let Some(v) = args.get(key) {
             body[key] = v.clone();
         }
     }
     let base = loopback_base(ctx)?;
-    let (_, resp_body) = loopback_post(format!("{base}/v1/work"), body, true, ctx.scope_identity()).await?;
+    let (_, resp_body) = loopback_post(
+        format!("{base}/v1/work"),
+        body,
+        true,
+        ctx.authority_identity(),
+        Some(ctx.scope_tenant()),
+    )
+    .await?;
     Ok(text_content(
         serde_json::from_str(&resp_body).unwrap_or(Value::String(resp_body)),
     ))
@@ -365,7 +443,7 @@ pub async fn handle_update_work_state(args: &Value, ctx: &McpContext) -> Result<
             .to_string(),
         data: None,
     })?;
-    let by = args
+    let claimed_by = args
         .get("by_passport")
         .and_then(|v| v.as_str())
         .ok_or_else(|| JsonRpcError {
@@ -373,9 +451,17 @@ pub async fn handle_update_work_state(args: &Value, ctx: &McpContext) -> Result<
             message: "update_work_state: by_passport is required".to_string(),
             data: None,
         })?;
+    let identity = authority_identity(ctx, "update_work_state")?;
+    if !claimed_identity_matches(ctx, claimed_by, &identity) {
+        return Err(JsonRpcError {
+            code: INVALID_PARAMS,
+            message: "update_work_state: by_passport does not match the authenticated MCP agent".to_string(),
+            data: None,
+        });
+    }
     let mut body = json!({
         "state": new_state,
-        "by_passport": by,
+        "by_passport": identity,
     });
     if let Some(reason) = args.get("blocker_reason") {
         body["blocker_reason"] = reason.clone();
@@ -384,7 +470,13 @@ pub async fn handle_update_work_state(args: &Value, ctx: &McpContext) -> Result<
         body["blocker_kind"] = kind.clone();
     }
     let base = loopback_base(ctx)?;
-    let (_, resp_body) = loopback_patch(format!("{base}/v1/work/{id}"), body, ctx.scope_identity()).await?;
+    let (_, resp_body) = loopback_patch(
+        format!("{base}/v1/work/{id}"),
+        body,
+        ctx.authority_identity(),
+        Some(ctx.scope_tenant()),
+    )
+    .await?;
     Ok(text_content(
         serde_json::from_str(&resp_body).unwrap_or(Value::String(resp_body)),
     ))
@@ -399,7 +491,7 @@ pub async fn handle_comment_on_work(args: &Value, ctx: &McpContext) -> Result<Va
             message: "comment_on_work: work_id is required".to_string(),
             data: None,
         })?;
-    let author = args
+    let claimed_author = args
         .get("author_passport")
         .and_then(|v| v.as_str())
         .ok_or_else(|| JsonRpcError {
@@ -412,8 +504,16 @@ pub async fn handle_comment_on_work(args: &Value, ctx: &McpContext) -> Result<Va
         message: "comment_on_work: body is required".to_string(),
         data: None,
     })?;
+    let identity = authority_identity(ctx, "comment_on_work")?;
+    if !claimed_identity_matches(ctx, claimed_author, &identity) {
+        return Err(JsonRpcError {
+            code: INVALID_PARAMS,
+            message: "comment_on_work: author_passport does not match the authenticated MCP agent".to_string(),
+            data: None,
+        });
+    }
     let payload = json!({
-        "author_passport": author,
+        "author_passport": identity,
         "body": body_text,
     });
     let base = loopback_base(ctx)?;
@@ -421,7 +521,8 @@ pub async fn handle_comment_on_work(args: &Value, ctx: &McpContext) -> Result<Va
         format!("{base}/v1/work/{id}/comments"),
         payload,
         true,
-        ctx.scope_identity(),
+        ctx.authority_identity(),
+        Some(ctx.scope_tenant()),
     )
     .await?;
     Ok(text_content(
@@ -431,6 +532,8 @@ pub async fn handle_comment_on_work(args: &Value, ctx: &McpContext) -> Result<Va
 
 pub async fn handle_status_feed(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let mut params = Vec::new();
+    let tenant = ctx.scope_tenant();
+    params.push(format!("tenant_id={}", urlencoding(&tenant)));
     if let Some(w) = args.get("work_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
         params.push(format!("work_id={}", urlencoding(w)));
     }
@@ -443,21 +546,33 @@ pub async fn handle_status_feed(args: &Value, ctx: &McpContext) -> Result<Value,
         format!("?{}", params.join("&"))
     };
     let base = loopback_base(ctx)?;
-    let (_, body) = loopback_get(format!("{base}/v1/status-feed{qs}")).await?;
+    let (_, body) = loopback_get_scoped(
+        format!("{base}/v1/status-feed{qs}"),
+        ctx.authority_identity(),
+        Some(tenant),
+    )
+    .await?;
     Ok(text_content(serde_json::from_str(&body).unwrap_or(Value::String(body))))
 }
 
 pub async fn handle_coord_status(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
-    let qs = match args
+    let tenant = ctx.scope_tenant();
+    let mut params = vec![format!("tenant_id={}", urlencoding(&tenant))];
+    if let Some(project_id) = args
         .get("project_id")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
     {
-        Some(pid) => format!("?project_id={}", urlencoding(pid)),
-        None => String::new(),
-    };
+        params.push(format!("project_id={}", urlencoding(project_id)));
+    }
+    let qs = format!("?{}", params.join("&"));
     let base = loopback_base(ctx)?;
-    let (_, body) = loopback_get(format!("{base}/v1/coord/active{qs}")).await?;
+    let (_, body) = loopback_get_scoped(
+        format!("{base}/v1/coord/active{qs}"),
+        ctx.authority_identity(),
+        Some(tenant),
+    )
+    .await?;
     Ok(text_content(serde_json::from_str(&body).unwrap_or(Value::String(body))))
 }
 
@@ -489,7 +604,8 @@ pub async fn handle_coord_announce(args: &Value, ctx: &McpContext) -> Result<Val
         format!("{base}/v1/coord/announce"),
         payload,
         false,
-        ctx.scope_identity(),
+        ctx.authority_identity(),
+        Some(ctx.scope_tenant()),
     )
     .await?;
     Ok(text_content(
@@ -594,10 +710,23 @@ mod tests {
         serde_json::from_str(value["content"][0]["text"].as_str().expect("text content")).expect("json text")
     }
 
+    fn scoped_agent_context(base: String, name: &str, tenant: &str) -> McpContext {
+        McpContext::new_default("node-a")
+            .with_daemon_base_url(base)
+            .with_agent_passports(
+                true,
+                crate::agent_passport::AgentPassportMap::from_pairs_str(&format!("{name}:{name}:{tenant}")),
+            )
+            .with_agent(crate::agent::AgentIdentity {
+                name: name.to_string(),
+                token_hash: [0u8; 32],
+            })
+    }
+
     #[tokio::test]
     async fn coordination_handlers_call_loopback_endpoints() {
         let (base, stop, handle) = serve_coordination_loopback();
-        let ctx = McpContext::new_default("node-a").with_daemon_base_url(base.clone());
+        let ctx = scoped_agent_context(base.clone(), "p1", "tenant-a");
 
         let projects = text_json(handle_list_projects(&json!({}), &ctx).await.expect("list projects"));
         assert_eq!(projects["projects"][0]["id"], "alpha");
@@ -792,7 +921,7 @@ mod tests {
             });
         let created = text_json(
             handle_create_work(
-                &json!({"project_id": "p", "title": "t", "created_by_passport": "ce:x"}),
+                &json!({"project_id": "p", "title": "t", "created_by_passport": "anthropic"}),
                 &ctx,
             )
             .await
@@ -800,8 +929,8 @@ mod tests {
         );
         stop_loopback(&base, stop, handle);
         assert_eq!(
-            created["seen_passport"], "anthropic",
-            "loopback POST must forward X-Corecrux-Passport-Id from the session"
+            created["seen_passport"], "agent:anthropic",
+            "unmapped MCP automation must use a namespaced authority header"
         );
     }
 
@@ -815,7 +944,7 @@ mod tests {
         std::env::set_var("CRUX_AGENT_TOKEN", "tok_test_patch_m3");
 
         let (base, stop, handle) = serve_patch_requires_auth();
-        let ctx = McpContext::new_default("node-a").with_daemon_base_url(base.clone());
+        let ctx = scoped_agent_context(base.clone(), "p1", "default");
         let res = handle_update_work_state(
             &json!({"work_id": "w1", "state": "in_progress", "by_passport": "p1"}),
             &ctx,
@@ -862,7 +991,7 @@ mod tests {
         // `detail`, not a bare "status 404". Disabling ureq's http_status_as_error
         // is what lets the body through.
         let (base, stop, handle) = serve_problem_json();
-        let ctx = McpContext::new_default("node-a").with_daemon_base_url(base.clone());
+        let ctx = scoped_agent_context(base.clone(), "p1", "default");
         let err = handle_create_work(
             &json!({"project_id": "ghost", "title": "t", "created_by_passport": "p1"}),
             &ctx,
@@ -944,7 +1073,14 @@ pub async fn handle_execplan_write(args: &Value, ctx: &McpContext) -> Result<Val
         }
     }
     let base = loopback_base(ctx)?;
-    let (_, resp_body) = loopback_post(format!("{base}/v1/execplans"), body, true, ctx.scope_identity()).await?;
+    let (_, resp_body) = loopback_post(
+        format!("{base}/v1/execplans"),
+        body,
+        true,
+        ctx.authority_identity(),
+        Some(ctx.scope_tenant()),
+    )
+    .await?;
     Ok(text_content(
         serde_json::from_str(&resp_body).unwrap_or(Value::String(resp_body)),
     ))

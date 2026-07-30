@@ -78,6 +78,8 @@ struct LoopbackClaims<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     aud: Option<&'a str>,
     sub: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    passport_id: Option<&'a str>,
     scopes: &'a [&'a str],
     tenant_id: &'a str,
     iat: u64,
@@ -118,6 +120,7 @@ fn mint_loopback_jwt_inner(
         aud,
         &ScopedClaims {
             sub: "mcp-loopback",
+            passport_id: None,
             scopes: LOOPBACK_SCOPES,
             tenant_id: "*",
             ttl_secs: JWT_TTL_SECS,
@@ -135,6 +138,10 @@ fn mint_loopback_jwt_inner(
 pub struct ScopedClaims<'a> {
     /// Token subject (the principal the credential acts as).
     pub sub: &'a str,
+    /// Optional canonical passport binding. Internal loopback mutations set
+    /// this to the MCP session's resolved passport so the daemon does not need
+    /// to treat `X-Corecrux-Passport-Id` as an impersonation override.
+    pub passport_id: Option<&'a str>,
     /// Granted scopes (the daemon's `scopes_from_claims` reads the `scopes` array).
     pub scopes: &'a [&'a str],
     /// Tenant binding. Use a concrete tenant id; `"*"` only for cross-tenant
@@ -158,6 +165,7 @@ pub fn mint_scoped_jwt_inner(
         iss,
         aud,
         sub: claims.sub,
+        passport_id: claims.passport_id,
         scopes: claims.scopes,
         tenant_id: claims.tenant_id,
         iat: now_secs,
@@ -224,6 +232,25 @@ pub fn loopback_bearer_token() -> Option<String> {
         return Some(jwt);
     }
     resolve_bearer_token(|name| std::env::var(name).ok())
+}
+
+/// Resolve a loopback bearer token bound to the supplied MCP-session
+/// passport. HS256 mode mints a short-lived token whose canonical
+/// `passport_id` claim matches the forwarded header; other modes retain the
+/// raw-token fallback and let the daemon apply their normal binding rules.
+pub fn loopback_bearer_token_for_passport(passport_id: Option<&str>, tenant_id: Option<&str>) -> Option<String> {
+    if passport_id.is_some() || tenant_id.is_some() {
+        if let Some(jwt) = mint_scoped_jwt_from_env(&ScopedClaims {
+            sub: "mcp-loopback",
+            passport_id,
+            scopes: LOOPBACK_SCOPES,
+            tenant_id: tenant_id.unwrap_or("default"),
+            ttl_secs: JWT_TTL_SECS,
+        }) {
+            return Some(jwt);
+        }
+    }
+    loopback_bearer_token()
 }
 
 /// Pure variant of the raw-token resolver used by tests; scans the env-var
@@ -370,6 +397,7 @@ mod tests {
             Some("crux.cuecrux.com"),
             &ScopedClaims {
                 sub: "ts:alice@example.com",
+                passport_id: Some("passport-alice"),
                 scopes: &["facts:write", "query:read"],
                 tenant_id: "acme",
                 ttl_secs: 300,
@@ -378,6 +406,7 @@ mod tests {
         .unwrap();
         let claims = verify_with_daemon_rules(&token, secret, Some("cuecrux-crux-mint"), Some("crux.cuecrux.com"));
         assert_eq!(claims["sub"], "ts:alice@example.com");
+        assert_eq!(claims["passport_id"], "passport-alice");
         assert_eq!(claims["tenant_id"], "acme");
         let scopes: Vec<&str> = claims["scopes"]
             .as_array()
@@ -404,6 +433,7 @@ mod tests {
             None,
             &ScopedClaims {
                 sub: "mcp-loopback",
+                passport_id: None,
                 scopes: LOOPBACK_SCOPES,
                 tenant_id: "*",
                 ttl_secs: JWT_TTL_SECS,
