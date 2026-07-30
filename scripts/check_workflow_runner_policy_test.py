@@ -94,6 +94,8 @@ class WorkflowRunnerPolicyTest(unittest.TestCase):
             on:
               pull_request:
               merge_group:
+            permissions:
+              contents: read
             jobs:
               test:
                 runs-on: ubuntu-latest
@@ -103,6 +105,300 @@ class WorkflowRunnerPolicyTest(unittest.TestCase):
             """,
         )
         self.assertEqual(self.errors(), [])
+
+    def test_untrusted_workflow_requires_exact_read_only_top_level_permissions(self) -> None:
+        self.workflow(
+            "ci.yml",
+            """
+            on: pull_request
+            jobs:
+              test:
+                runs-on: ubuntu-latest
+            """,
+        )
+        self.assert_rejected(
+            "top-level permissions exactly to contents: read"
+        )
+
+        self.workflow(
+            "ci.yml",
+            """
+            on: pull_request
+            permissions: write-all
+            jobs:
+              test:
+                runs-on: ubuntu-latest
+            """,
+        )
+        self.assert_rejected(
+            "top-level permissions exactly to contents: read"
+        )
+
+        self.workflow(
+            "ci.yml",
+            """
+            on: pull_request
+            permissions:
+              contents: read
+              issues: write
+            jobs:
+              test:
+                runs-on: ubuntu-latest
+            """,
+        )
+        self.assert_rejected(
+            "top-level permissions exactly to contents: read"
+        )
+
+    def test_untrusted_job_rejects_writes_and_unresolved_permission_forms(self) -> None:
+        self.workflow(
+            "ci.yml",
+            """
+            on: pull_request
+            permissions:
+              contents: read
+            jobs:
+              write:
+                runs-on: ubuntu-latest
+                permissions:
+                  contents: read
+                  issues: write
+            """,
+        )
+        self.assert_rejected("untrusted workflow job grants write permissions")
+
+        self.workflow(
+            "ci.yml",
+            """
+            on: pull_request
+            permissions:
+              contents: read
+            jobs:
+              write:
+                runs-on: ubuntu-latest
+                permissions: write-all
+            """,
+        )
+        self.assert_rejected("must be a literal block mapping")
+
+        self.workflow(
+            "ci.yml",
+            """
+            on: pull_request
+            permissions:
+              contents: read
+            jobs:
+              write:
+                runs-on: ubuntu-latest
+                permissions:
+                  contents: ${{ matrix.permission }}
+            """,
+        )
+        self.assert_rejected("unresolved/merged key or value")
+
+    def test_untrusted_job_rejects_every_github_write_scope(self) -> None:
+        write_scopes = (
+            "actions",
+            "attestations",
+            "checks",
+            "contents",
+            "deployments",
+            "discussions",
+            "id-token",
+            "issues",
+            "models",
+            "packages",
+            "pages",
+            "pull-requests",
+            "security-events",
+            "statuses",
+        )
+        for scope in write_scopes:
+            with self.subTest(scope=scope):
+                self.workflow(
+                    "ci.yml",
+                    f"""
+                    on: pull_request
+                    permissions:
+                      contents: read
+                    jobs:
+                      write:
+                        runs-on: ubuntu-latest
+                        permissions:
+                          {scope}: write
+                    """,
+                )
+                self.assert_rejected(
+                    "untrusted workflow job grants write permissions"
+                )
+
+    def test_untrusted_reusable_workflow_permissions_are_checked_recursively(self) -> None:
+        self.workflow(
+            "caller.yml",
+            """
+            on: pull_request
+            permissions:
+              contents: read
+            jobs:
+              call:
+                uses: ./.github/workflows/callee.yml
+            """,
+        )
+        self.workflow(
+            "callee.yml",
+            """
+            on: workflow_call
+            permissions:
+              contents: read
+            jobs:
+              unsafe:
+                runs-on: ubuntu-latest
+                permissions:
+                  packages: write
+            """,
+        )
+        self.assert_rejected("untrusted workflow job grants write permissions")
+
+        self.workflow(
+            "callee.yml",
+            """
+            on: workflow_call
+            jobs:
+              safe:
+                runs-on: ubuntu-latest
+            """,
+        )
+        self.assert_rejected(
+            "top-level permissions exactly to contents: read"
+        )
+
+    def test_rejects_permission_merge_keys_duplicates_and_guard_continuations(self) -> None:
+        self.workflow(
+            "ci.yml",
+            """
+            on: pull_request
+            permissions:
+              contents: read
+            jobs:
+              write:
+                runs-on: ubuntu-latest
+                permissions:
+                  contents: read
+                  contents: write
+                  <<: *privileged
+            """,
+        )
+        errors = self.errors()
+        self.assertTrue(
+            any("duplicate job permissions key" in error for error in errors)
+        )
+        self.assertTrue(
+            any("unresolved/merged key or value" in error for error in errors)
+        )
+
+        self.workflow(
+            "docs.yml",
+            """
+            on: [push, pull_request]
+            permissions:
+              contents: read
+            jobs:
+              deploy:
+                if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+                  || true
+                runs-on: ubuntu-latest
+                permissions:
+                  contents: read
+                  pages: write
+                  id-token: write
+            """,
+        )
+        self.assert_rejected(
+            "guard must exactly match its protected-event policy"
+        )
+
+    def test_untrusted_job_accepts_narrower_read_or_empty_permissions(self) -> None:
+        self.workflow(
+            "ci.yml",
+            """
+            on: pull_request
+            permissions:
+              contents: read
+            jobs:
+              read:
+                runs-on: ubuntu-latest
+                permissions:
+                  contents: read
+                  issues: none
+              empty:
+                runs-on: ubuntu-latest
+                permissions: {}
+            """,
+        )
+        self.assertEqual(self.errors(), [])
+
+    def test_accepts_exact_protected_privileged_job_exception(self) -> None:
+        self.workflow(
+            "docs.yml",
+            """
+            on: [push, pull_request, merge_group]
+            permissions:
+              contents: read
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+              deploy:
+                if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+                runs-on: ubuntu-latest
+                permissions:
+                  contents: read
+                  pages: write
+                  id-token: write
+            """,
+        )
+        self.assertEqual(self.errors(), [])
+
+    def test_rejects_weakened_privileged_job_guard_or_expanded_permissions(self) -> None:
+        self.workflow(
+            "docs.yml",
+            """
+            on: [push, pull_request, merge_group]
+            permissions:
+              contents: read
+            jobs:
+              deploy:
+                if: github.event_name != 'pull_request'
+                runs-on: ubuntu-latest
+                permissions:
+                  contents: read
+                  pages: write
+                  id-token: write
+            """,
+        )
+        self.assert_rejected(
+            "guard must exactly match its protected-event policy"
+        )
+
+        self.workflow(
+            "docs.yml",
+            """
+            on: [push, pull_request, merge_group]
+            permissions:
+              contents: read
+            jobs:
+              deploy:
+                if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+                runs-on: ubuntu-latest
+                permissions:
+                  contents: read
+                  pages: write
+                  id-token: write
+                  issues: write
+            """,
+        )
+        self.assert_rejected(
+            "permission set must exactly match its allowlisted minimum"
+        )
 
     def test_rejects_protected_scalar_and_list_labels_case_insensitively(self) -> None:
         self.workflow(

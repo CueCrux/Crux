@@ -44,6 +44,43 @@ TRUSTED_DYNAMIC_JOB_NAME_EXCEPTIONS = {
 }
 MAIN_REF_GUARD = "github.ref == 'refs/heads/main'"
 MAX_WORKFLOW_BYTES = 2 * 1024 * 1024
+PRIVILEGED_JOB_EXCEPTIONS = {
+    (".github/workflows/docker.yml", "build-and-push"): (
+        "(github.event_name == 'push' && (github.ref == 'refs/heads/main' || "
+        "startsWith(github.ref, 'refs/tags/v'))) || "
+        "(github.event_name == 'workflow_dispatch' && "
+        "github.ref == 'refs/heads/main')",
+        {
+            "contents": "read",
+            "packages": "write",
+            "security-events": "write",
+            "id-token": "write",
+        },
+    ),
+    (".github/workflows/docker.yml", "promote-release-aliases"): (
+        "github.event_name == 'workflow_run' && "
+        "github.event.workflow_run.conclusion == 'success' && "
+        "github.event.workflow_run.event == 'push' && "
+        "github.event.workflow_run.path == '.github/workflows/release.yml' && "
+        "github.event.workflow_run.head_repository.full_name == github.repository && "
+        "startsWith(github.event.workflow_run.head_branch, 'v')",
+        {"contents": "read", "packages": "write"},
+    ),
+    (".github/workflows/docs.yml", "deploy"): (
+        "github.ref == 'refs/heads/main' && github.event_name == 'push'",
+        {"contents": "read", "pages": "write", "id-token": "write"},
+    ),
+    (".github/workflows/sdk-python.yml", "publish"): (
+        "github.event_name == 'push' && "
+        "startsWith(github.ref, 'refs/tags/sdk-python-v')",
+        {"contents": "read", "id-token": "write"},
+    ),
+    (".github/workflows/sdk-typescript.yml", "publish"): (
+        "github.event_name == 'push' && "
+        "startsWith(github.ref, 'refs/tags/sdk-typescript-v')",
+        {"contents": "read", "id-token": "write"},
+    ),
+}
 
 HOSTED_RUNNER = re.compile(
     r"^(?:"
@@ -325,6 +362,75 @@ class WorkflowDocument:
                 continue
             lines[key] = line
             values[key] = value
+        return values
+
+    def job_child_values(self, job: Job, property_name: str) -> dict[str, str] | None:
+        """Parse one literal job-level mapping without YAML indirection."""
+        property_value = job.properties.get(property_name)
+        if property_value is None:
+            return None
+        property_line, inline_value = property_value
+        continuation = (
+            self.scalar_continuation(property_line, job.end)
+            if inline_value
+            else None
+        )
+        if inline_value:
+            if inline_value == "{}" and continuation is None:
+                return {}
+            self.error(
+                property_line.number,
+                f"job {property_name} must be a literal block mapping or {{}}",
+                job.name,
+            )
+            return None
+
+        values: dict[str, str] = {}
+        lines: dict[str, Line] = {}
+        for line in self.lines[property_line.number : job.end]:
+            if not line.content:
+                continue
+            if line.indent <= property_line.indent:
+                break
+            if line.indent != property_line.indent + 2:
+                self.error(
+                    line.number,
+                    f"job {property_name} contains unresolved nested configuration",
+                    job.name,
+                )
+                continue
+            entry = _mapping_entry(line.content)
+            if (
+                entry is None
+                or entry[0] == "<<"
+                or _has_indirection(entry[0])
+                or _has_indirection(entry[1])
+                or not entry[1]
+            ):
+                self.error(
+                    line.number,
+                    f"job {property_name} contains an unresolved/merged key or value",
+                    job.name,
+                )
+                continue
+            key, value = entry
+            if key in values:
+                self.error(
+                    line.number,
+                    f"duplicate job {property_name} key {key!r} "
+                    f"(first at line {lines[key].number})",
+                    job.name,
+                )
+                continue
+            lines[key] = line
+            values[key] = value
+        if not values:
+            self.error(
+                property_line.number,
+                f"job {property_name} mapping is empty; use literal {{}}",
+                job.name,
+            )
+            return None
         return values
 
     def jobs(self) -> list[Job]:
@@ -1026,6 +1132,68 @@ class RunnerPolicy:
             self._documents[path] = document
         return document
 
+    def _audit_untrusted_job_permissions(
+        self, document: WorkflowDocument, job: Job
+    ) -> None:
+        if "permissions" not in job.properties:
+            return
+        permissions = document.job_child_values(job, "permissions")
+        if permissions is None:
+            return
+        invalid = {
+            scope: value
+            for scope, value in permissions.items()
+            if value not in {"read", "write", "none"}
+        }
+        if invalid:
+            document.error(
+                job.properties["permissions"][0].number,
+                "untrusted job permissions must use only literal read, write, "
+                f"or none values, got {invalid!r}",
+                job.name,
+            )
+            return
+        writes = {scope for scope, value in permissions.items() if value == "write"}
+        if not writes:
+            return
+
+        exception = PRIVILEGED_JOB_EXCEPTIONS.get((document.relative, job.name))
+        if exception is None:
+            document.error(
+                job.properties["permissions"][0].number,
+                f"untrusted workflow job grants write permissions {sorted(writes)!r}",
+                job.name,
+            )
+            return
+        expected_guard, expected_permissions = exception
+        guard = job.properties.get("if")
+        guard_continuation = (
+            document.scalar_continuation(guard[0], job.end)
+            if guard is not None
+            else None
+        )
+        if (
+            guard is None
+            or guard_continuation is not None
+            or guard[1] != expected_guard
+        ):
+            document.error(
+                (
+                    guard_continuation.number
+                    if guard_continuation is not None
+                    else job.line.number
+                ),
+                "privileged job guard must exactly match its protected-event policy",
+                job.name,
+            )
+        if permissions != expected_permissions:
+            document.error(
+                job.properties["permissions"][0].number,
+                "privileged job permission set must exactly match its allowlisted "
+                f"minimum {expected_permissions!r}, got {permissions!r}",
+                job.name,
+            )
+
     def _audit_path(self, path: Path, *, force_untrusted: bool) -> None:
         key = (path, force_untrusted)
         if key in self._visited:
@@ -1141,9 +1309,22 @@ class RunnerPolicy:
                 f"{sorted(expected_events or ())!r}, got {sorted(events)!r}",
             )
 
+        if untrusted:
+            permissions = document.section_child_values("permissions")
+            if permissions != {"contents": "read"}:
+                document.error(
+                    document.sections.get(
+                        "permissions", Section("", Line(1, "", 0, ""), "", 0, 0)
+                    ).line.number,
+                    "untrusted workflows must set top-level permissions exactly "
+                    "to contents: read",
+                )
+
         for job in jobs:
             runner = job.properties.get("runs-on")
             reusable = job.properties.get("uses")
+            if untrusted:
+                self._audit_untrusted_job_permissions(document, job)
             job_display_name = job.properties.get("name")
             if job_display_name is not None:
                 name_line, name_value = job_display_name

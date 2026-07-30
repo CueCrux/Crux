@@ -21,7 +21,10 @@ retest tax with an equivalent, parallelised guarantee.
 It also has no configured bypass actors, requires one code-owner approval from
 someone other than the last pusher, and requires the trusted
 `Workflow runner policy` check. The check runs from the default-branch
-implementation and treats the candidate tree only as data.
+implementation and treats the candidate tree only as data. It validates both
+runner selection and effective token permissions: PR/merge workflows must
+default to `contents: read`, and only exact protected publish/deploy jobs may
+request narrowly allowlisted writes.
 
 ## Runner-policy bootstrap order
 

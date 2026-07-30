@@ -8,8 +8,13 @@ persistent `[self-hosted, hel1]` pool is reserved for reviewed `main` state in:
 - `.github/workflows/mutants.yml`
 
 The repository policy check rejects PR-reachable self-hosted, custom, dynamic,
-or unresolved runner selection. That check is a merge guard; the runner-group
-restriction below is the runtime security boundary.
+or unresolved runner selection. It also requires every PR/merge-reachable
+workflow to declare top-level `contents: read` and rejects job-level write
+permissions unless the job is an exact allowlisted publish/deploy job with its
+exact protected-event guard and minimum permission set. Build/test jobs never
+inherit Pages, package, Security-tab, or OIDC write authority from a mixed
+workflow. That check is a merge guard; the runner-group restriction below is
+the runtime security boundary.
 
 ## Mandatory legacy-host cutover
 

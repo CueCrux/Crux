@@ -10,6 +10,9 @@ on:
   # enabled on `main`.
   merge_group:
 
+permissions:
+  contents: read
+
 jobs:
   semver:
     name: Semver Compatibility
