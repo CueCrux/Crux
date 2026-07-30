@@ -2,6 +2,7 @@
 members = [
   "crates/corecrux-types",
   "crates/corecrux-secrets",
+  "crates/corecrux-billing",
   "crates/corecrux-frame",
   "crates/corecrux-proto",
   "crates/corecrux-receipts",

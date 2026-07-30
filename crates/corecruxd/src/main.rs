@@ -39,7 +39,11 @@ mod cost_attribution;
 // Default-off, append-only comped-wallet meter shared by the explicit spend
 // rail and metered capability paths.
 #[allow(dead_code)]
-mod credit_meter;
+// Extracted to the `corecrux-billing` crate; aliased so existing
+// `crate::credit_meter::…` call sites compile unchanged. The fail-closed
+// response to a poisoned meter lock stays in `http/credit_meter.rs` — the
+// ledger crate holds state, the handler owns the policy.
+use corecrux_billing::credit_meter;
 mod enrich_budget;
 // Dataplane store stubs: proprietary edition provides the real implementation.
 #[allow(dead_code)]

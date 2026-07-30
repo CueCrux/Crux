@@ -24,7 +24,7 @@ const DEFAULT_RESERVATION_TTL_SECS: u64 = 3_600;
 const STALE_RESERVATION_GC_REASON: &str = "stale_reservation_gc";
 
 #[derive(Debug, Error)]
-pub(crate) enum CreditMeterError {
+pub enum CreditMeterError {
     #[error("credit meter io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("credit meter json error at line {line}: {source}")]
@@ -82,7 +82,7 @@ pub(crate) enum CreditMeterError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct CreditReservation {
+pub struct CreditReservation {
     pub tenant_id: String,
     pub operation_id: String,
     pub reservation_id: String,
@@ -91,7 +91,7 @@ pub(crate) struct CreditReservation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct CreditSpend {
+pub struct CreditSpend {
     pub tenant_id: String,
     pub operation_id: String,
     pub reservation_id: String,
@@ -101,7 +101,7 @@ pub(crate) struct CreditSpend {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct PinnedCreditQuote {
+pub struct PinnedCreditQuote {
     pub schema: String,
     pub quote_id: String,
     pub tenant_id: String,
@@ -112,7 +112,7 @@ pub(crate) struct PinnedCreditQuote {
 }
 
 impl PinnedCreditQuote {
-    pub(crate) fn new(
+    pub fn new(
         quote_id: impl Into<String>,
         tenant_id: impl Into<String>,
         operation_id: impl Into<String>,
@@ -131,7 +131,7 @@ impl PinnedCreditQuote {
         }
     }
 
-    pub(crate) fn validate(&self) -> Result<(), CreditMeterError> {
+    pub fn validate(&self) -> Result<(), CreditMeterError> {
         if self.schema != QUOTE_SCHEMA_V1 {
             return Err(CreditMeterError::InvalidQuote {
                 reason: format!("schema must be {QUOTE_SCHEMA_V1}"),
@@ -164,7 +164,7 @@ impl PinnedCreditQuote {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct CreditSpendReceiptBodyV1 {
+pub struct CreditSpendReceiptBodyV1 {
     pub schema: String,
     pub receipt_id: String,
     pub tenant_id: String,
@@ -178,7 +178,7 @@ pub(crate) struct CreditSpendReceiptBodyV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct CreditSpendReceiptSignatureV1 {
+pub struct CreditSpendReceiptSignatureV1 {
     pub alg: String,
     pub signed_by: String,
     pub body_hash: String,
@@ -186,7 +186,7 @@ pub(crate) struct CreditSpendReceiptSignatureV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct CreditSpendReceiptEnvelopeV1 {
+pub struct CreditSpendReceiptEnvelopeV1 {
     pub body: CreditSpendReceiptBodyV1,
     pub receipt: CreditSpendReceiptSignatureV1,
 }
@@ -248,7 +248,7 @@ enum CreditMeterEvent {
 }
 
 #[derive(Debug)]
-pub(crate) struct CreditMeterStore {
+pub struct CreditMeterStore {
     path: PathBuf,
     wallets: BTreeMap<String, WalletState>,
     seed_events: BTreeMap<(String, String), u64>,
@@ -257,11 +257,11 @@ pub(crate) struct CreditMeterStore {
 }
 
 impl CreditMeterStore {
-    pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self, CreditMeterError> {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, CreditMeterError> {
         Self::open_with_reservation_ttl(path, DEFAULT_RESERVATION_TTL_SECS)
     }
 
-    pub(crate) fn open_with_reservation_ttl(
+    pub fn open_with_reservation_ttl(
         path: impl AsRef<Path>,
         reservation_ttl_secs: u64,
     ) -> Result<Self, CreditMeterError> {
@@ -278,13 +278,13 @@ impl CreditMeterStore {
         Ok(store)
     }
 
-    pub(crate) fn available_balance(&self, tenant_id: &str) -> u64 {
+    pub fn available_balance(&self, tenant_id: &str) -> u64 {
         self.wallets
             .get(tenant_id)
             .map_or(0, |wallet| wallet.balance.saturating_sub(wallet.reserved))
     }
 
-    pub(crate) fn seed_comped_wallet(
+    pub fn seed_comped_wallet(
         &mut self,
         tenant_id: &str,
         amount: u64,
@@ -306,7 +306,7 @@ impl CreditMeterStore {
         Ok(self.available_balance(tenant_id))
     }
 
-    pub(crate) fn reserve(
+    pub fn reserve(
         &mut self,
         tenant_id: &str,
         operation_id: &str,
@@ -378,7 +378,7 @@ impl CreditMeterStore {
             .ok_or(CreditMeterError::ReservationNotFound { reservation_id })
     }
 
-    pub(crate) fn spend(
+    pub fn spend(
         &mut self,
         tenant_id: &str,
         reservation_id: &str,
@@ -427,7 +427,7 @@ impl CreditMeterStore {
             })
     }
 
-    pub(crate) fn void_reservation(
+    pub fn void_reservation(
         &mut self,
         tenant_id: &str,
         reservation_id: &str,
@@ -655,7 +655,7 @@ fn current_unix_seconds() -> u64 {
         .unwrap_or(0)
 }
 
-pub(crate) fn mint_spend_receipt(
+pub fn mint_spend_receipt(
     quote: &PinnedCreditQuote,
     reservation: &CreditReservation,
     key: &crux_session::LocalPassportKey,
