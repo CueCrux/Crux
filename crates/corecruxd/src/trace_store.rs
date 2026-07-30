@@ -61,7 +61,7 @@ const DEFAULT_MAX_RECORDS: usize = 200_000;
 /// measured 399 bytes/span, which is the volume the M5 cost model prices as
 /// comfortable inside one Pro seat-block. The operator sets the real number.
 const DEFAULT_TENANT_CEILING: usize = 10_000_000;
-/// See [`retention_days`] — a placeholder pending the operator's decision.
+/// See [`retention_days`]. Decided 2026-07-30; Governance overrides to 365.
 const DEFAULT_RETENTION_DAYS: u64 = 90;
 
 /// A captured span plus the static symbol it was resolved to.
@@ -478,11 +478,17 @@ pub fn capture_release() -> String {
 
 /// Retention window in days.
 ///
-/// **Placeholder default.** The M0 pricing freeze left the window open as an
-/// operator decision (30 / 90 / 365), because it is what sets the P2 cost line.
-/// 90 is the middle option and is used so the mechanism is testable, NOT because
-/// it has been chosen — whoever sets the real number changes this and the
-/// pricing surface together.
+/// **90 days is the decided Pro default** (operator, 2026-07-30), not a
+/// placeholder. Chosen from the cost model rather than by splitting the range:
+/// 30 days makes release-over-release `trace_diff` useless to anyone shipping
+/// quarterly, which is the audience P2 is for; 365 makes retention the largest
+/// storage line on the account for a capability most teams query over weeks, not
+/// years. Governance buys 365 because compliance evidence is the case where the
+/// long tail is the product.
+///
+/// Anything user-facing that states this number must agree with the published
+/// price list — `/v1/code-intel/releases` reports the active window alongside
+/// the releases it retained, so a mismatch is visible rather than silent.
 pub fn retention_days() -> u64 {
     std::env::var(TRACE_RETENTION_DAYS_ENV)
         .ok()

@@ -16552,6 +16552,7 @@ async fn storybook_post_generate_then_get_latest() {
         State(state.clone()),
         Path("alpha".to_string()),
         dev_scope_headers("admin:read facts:write"),
+        Query(super::traces::OptionalTenantQuery::default()),
     )
     .await
     .into_response();
@@ -16600,6 +16601,7 @@ async fn storybook_post_generate_requires_facts_write() {
         State(state),
         Path("alpha".to_string()),
         dev_scope_headers("admin:read"), // missing facts:write
+        Query(super::traces::OptionalTenantQuery::default()),
     )
     .await
     .into_response();
@@ -20442,6 +20444,199 @@ async fn m2_token_without_tenant_claim_is_refused() {
     );
 }
 
+/// Every optional field populated, so no handler can refuse for a missing
+/// parameter and be mistaken for refusing on tenant grounds.
+fn m2_code_intel_query(tenant: &str, all_repos: bool) -> super::traces::CodeIntelQuery {
+    super::traces::CodeIntelQuery {
+        tenant_id: tenant.into(),
+        repo_id: Some("secret-repo".into()),
+        token_budget: 512,
+        entry_point: Some("main".into()),
+        symbol: Some("victim_symbol".into()),
+        release_a: Some("v1".into()),
+        release_b: Some("v2".into()),
+        all_repos,
+        trace_a: Some(1),
+        trace_b: Some(2),
+    }
+}
+
+/// The `/v1/code-intel/*` surface is the hosted Pro product this gate exists to
+/// protect — it is what answers from a customer's code graph. The original M2
+/// suite covered the three `/v1/repos` paths and none of these, so the eight
+/// paths that actually serve customer code were never adversarially tested.
+///
+/// Tenant B holds a valid token for its own tenant and names tenant A. Each path
+/// must refuse at the authorization boundary. `all_repos = true` is exercised
+/// separately because it takes a different data path — `repo_aggregate::
+/// aggregate_tenant` rather than a single `load_scan` — and it is precisely the
+/// cross-repo aggregation P1 sells.
+#[tokio::test]
+#[serial_test::serial]
+async fn m2_tenant_b_cannot_read_tenant_a_code_intel_paths() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    {
+        let mut store = state.fact_store.write().await;
+        seed_repo(&mut store, "tenant-a", "secret-repo", true);
+    }
+    let b = || m2_bearer_for("tenant-b", "admin:read");
+    let victim = || m2_code_intel_query("tenant-a", false);
+
+    macro_rules! assert_refused {
+        ($label:expr, $call:expr) => {{
+            let r = $call.await.into_response();
+            assert_eq!(
+                r.status(),
+                StatusCode::FORBIDDEN,
+                concat!($label, " leaked across tenants")
+            );
+        }};
+    }
+
+    assert_refused!(
+        "code_path",
+        super::traces::get_code_path(State(state.clone()), b(), Query(victim()))
+    );
+    assert_refused!(
+        "blast_radius",
+        super::traces::get_blast_radius(State(state.clone()), b(), Query(victim()))
+    );
+    assert_refused!(
+        "liveness",
+        super::traces::get_liveness(State(state.clone()), b(), Query(victim()))
+    );
+    assert_refused!(
+        "trace_diff",
+        super::traces::get_trace_diff(State(state.clone()), b(), Query(victim()))
+    );
+    // These two take RepoTenantQuery, not CodeIntelQuery — they are whole-tenant
+    // reads (retained span volume, release list), not per-symbol queries.
+    let victim_tenant = || super::repos::RepoTenantQuery {
+        tenant_id: "tenant-a".into(),
+    };
+    assert_refused!(
+        "span_volume",
+        super::traces::get_span_volume(State(state.clone()), b(), Query(victim_tenant()))
+    );
+    assert_refused!(
+        "releases",
+        super::traces::get_releases(State(state.clone()), b(), Query(victim_tenant()))
+    );
+    assert_refused!(
+        "dead_code_ladder",
+        super::traces::get_dead_code_ladder(State(state.clone()), b(), Query(victim()))
+    );
+    assert_refused!(
+        "repo_spatial",
+        super::traces::get_repo_spatial(
+            State(state.clone()),
+            Path("secret-repo".to_string()),
+            b(),
+            Query(super::repos::RepoTenantQuery {
+                tenant_id: "tenant-a".into(),
+            }),
+        )
+    );
+
+    // The cross-repo aggregate is the Pro capability, and a distinct data path.
+    assert_refused!(
+        "blast_radius(all_repos)",
+        super::traces::get_blast_radius(State(state.clone()), b(), Query(m2_code_intel_query("tenant-a", true)),)
+    );
+    assert_refused!(
+        "code_path(all_repos)",
+        super::traces::get_code_path(State(state.clone()), b(), Query(m2_code_intel_query("tenant-a", true)),)
+    );
+}
+
+/// `/v1/repos/dependents` resolves reverse dependency edges by ecosystem and
+/// package name. It was the one `/v1/repos` read the original suite missed.
+#[tokio::test]
+#[serial_test::serial]
+async fn m2_tenant_b_cannot_read_tenant_a_repo_dependents() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    {
+        let mut store = state.fact_store.write().await;
+        seed_repo(&mut store, "tenant-a", "secret-repo", true);
+    }
+    let r = super::repos::get_repo_dependents(
+        State(state.clone()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::repos::RepoDependentsQuery {
+            tenant_id: "tenant-a".into(),
+            ecosystem: "cargo".into(),
+            name: "serde".into(),
+            cursor: None,
+            limit: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        r.status(),
+        StatusCode::FORBIDDEN,
+        "repo dependents leaked across tenants"
+    );
+}
+
+/// Positive control for the code-intel refusals above.
+///
+/// Without this, that test would pass against a daemon that refuses every
+/// code-intel request for any reason at all. Tenant B naming *its own* tenant
+/// must clear the authorization boundary. It legitimately gets 404 (no scan
+/// registered) or 400 (parameter shape) — what matters is that it is **not**
+/// 403, which is the only status the isolation check produces.
+#[tokio::test]
+#[serial_test::serial]
+async fn m2_tenant_b_reaches_its_own_code_intel_paths() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    {
+        let mut store = state.fact_store.write().await;
+        seed_repo(&mut store, "tenant-b", "own-repo", true);
+    }
+    let b = || m2_bearer_for("tenant-b", "admin:read");
+    // Built fresh per call rather than cloned: CodeIntelQuery deliberately does
+    // not derive Clone, and this suite adds no production code.
+    let own = || {
+        let mut q = m2_code_intel_query("tenant-b", false);
+        q.repo_id = Some("own-repo".into());
+        q
+    };
+
+    for (label, status) in [
+        (
+            "code_path",
+            super::traces::get_code_path(State(state.clone()), b(), Query(own()))
+                .await
+                .into_response()
+                .status(),
+        ),
+        (
+            "blast_radius",
+            super::traces::get_blast_radius(State(state.clone()), b(), Query(own()))
+                .await
+                .into_response()
+                .status(),
+        ),
+        (
+            "dead_code_ladder",
+            super::traces::get_dead_code_ladder(State(state.clone()), b(), Query(own()))
+                .await
+                .into_response()
+                .status(),
+        ),
+    ] {
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{label}: isolation must not refuse a tenant reading its own code graph"
+        );
+    }
+}
+
 /// The runtime span plane **is** tenant-partitioned (M3).
 ///
 /// This test previously asserted the opposite. It was a deliberate tripwire on
@@ -20982,4 +21177,94 @@ async fn m4_a_pack_restores_headroom_without_touching_the_repos() {
     assert_eq!(after["over_allowance"], false, "a pack must clear the overage");
     assert_eq!(after["used"], 9, "buying a pack changes entitlement, not usage");
     assert_eq!(after["remaining"], 9);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// M3b — the three span-reading surfaces now honour a requested tenant.
+//
+// Gate: each names a tenant in the request and is covered by the M2 adversarial
+// pattern (tenant B refused against tenant A) with a positive control. Real
+// HS256 tokens, not DevScopes — DevScopes sets TenantAllow::Any and would make
+// these pass against a daemon with no isolation at all.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m3b_trace_list_refuses_a_tenant_the_caller_does_not_hold() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    let resp = super::traces::list_traces(
+        State(state.clone()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::TraceSpansQuery {
+            limit: Some(10),
+            trace_id: None,
+        }),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-a".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "naming another tenant must be refused, not silently answered"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m3b_trace_list_allows_the_tenant_the_caller_does_hold() {
+    // Positive control: the refusal above must not be a surface that refuses
+    // everything the moment a tenant is named.
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    let resp = super::traces::list_traces(
+        State(state.clone()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::TraceSpansQuery {
+            limit: Some(10),
+            trace_id: None,
+        }),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-b".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["tenant_id"], "tenant-b");
+    assert_eq!(
+        body["tenant_scope"], "request",
+        "a named tenant must report request scope, not the daemon fallback"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m3b_unbound_request_declares_the_daemon_fallback() {
+    // The fallback is legitimate on a single-tenant daemon and must be visible.
+    // A surface that answers from process configuration without saying so is
+    // what M2 was written to prevent.
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    let resp = super::traces::list_traces(
+        State(state.clone()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::TraceSpansQuery {
+            limit: Some(10),
+            trace_id: None,
+        }),
+        Query(super::traces::OptionalTenantQuery { tenant_id: None }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["tenant_scope"], "daemon-capture-tenant",
+        "an unbound read must declare that it answered for the capture tenant"
+    );
 }

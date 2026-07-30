@@ -29,6 +29,36 @@ fn open_store(state: &AppState) -> Option<crate::trace_store::TraceStore> {
     .ok()
 }
 
+/// Resolve which tenant a span-reading surface should answer for (M3b).
+///
+/// Returns `(tenant, bound)`. `bound = false` means no tenant was named and the
+/// daemon's capture tenant was used — the single-tenant-only path. Callers must
+/// surface that on the response; a surface that silently answers for the wrong
+/// tenant is exactly the defect M2 found.
+pub(super) fn runtime_tenant_for(_state: &AppState, _headers: &HeaderMap, requested: Option<&str>) -> (String, bool) {
+    match requested {
+        Some(t) if !t.trim().is_empty() => (t.to_string(), true),
+        _ => (crate::trace_store::TraceStore::capture_tenant(), false),
+    }
+}
+
+/// Optional tenant binding (M3b).
+///
+/// When `tenant_id` is supplied the request is authorised against *that* tenant
+/// and answered only from its spans — the hostable path. When it is absent the
+/// surface falls back to this daemon's own capture tenant, which is correct for
+/// a single-tenant local daemon and is **not** hostable, because every customer
+/// on a shared daemon would resolve to the same tenant.
+///
+/// The fallback is reported as `tenant_scope` on the response rather than left
+/// implicit: a surface that silently answers for the wrong tenant is the failure
+/// M2 was written to prevent, and "it looked like it worked" is how it ships.
+#[derive(Debug, Default, serde::Deserialize)]
+pub(super) struct OptionalTenantQuery {
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+}
+
 /// `GET /v1/traces/{trace_id}` — one persisted trace, spans resolved to symbols.
 ///
 /// This is the M4 read side: the ordered path a request actually took through
@@ -39,10 +69,23 @@ pub(super) async fn get_trace(
     State(state): State<AppState>,
     Path(trace_id): Path<String>,
     headers: HeaderMap,
+    Query(tq): Query<OptionalTenantQuery>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-        return problem.into_response();
-    }
+    let (tenant, bound) = match tq.tenant_id.as_deref() {
+        Some(t) => {
+            if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], t) {
+                return problem.into_response();
+            }
+            (t.to_string(), true)
+        }
+        None => {
+            if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+                return problem.into_response();
+            }
+            (crate::trace_store::TraceStore::capture_tenant(), false)
+        }
+    };
+
     let Ok(trace_id) = trace_id.parse::<u64>() else {
         return problem_response(StatusCode::BAD_REQUEST, "trace_id must be a u64");
     };
@@ -55,14 +98,7 @@ pub(super) async fn get_trace(
             ),
         );
     };
-    // Scoped to this daemon's own capture tenant. This surface has no tenant
-    // binding of its own (it authorises with `require_http_scopes`, not the
-    // per-tenant variant), so there is no requester tenant to honour. Pinning it
-    // to the capture tenant preserves single-tenant behaviour exactly and fails
-    // closed if this daemon ever holds more than one tenant's spans — it will
-    // simply not see them. Giving this surface real tenant binding is a
-    // prerequisite for hosting it (crux-code-intel-pro-hosted-surface M3).
-    match store.load_trace(trace_id, &crate::trace_store::TraceStore::capture_tenant()) {
+    match store.load_trace(trace_id, &tenant) {
         Ok(spans) if spans.is_empty() => problem_response(StatusCode::NOT_FOUND, "no such trace"),
         Ok(spans) => {
             let resolved = spans.iter().filter(|s| s.symbol_id.is_some()).count();
@@ -74,6 +110,8 @@ pub(super) async fn get_trace(
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
+                "tenant_id": tenant,
+                "tenant_scope": if bound { "request" } else { "daemon-capture-tenant" },
                     "trace_id": trace_id,
                     "span_count": spans.len(),
                     "resolved_symbols": resolved,
@@ -93,10 +131,22 @@ pub(super) async fn list_traces(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<TraceSpansQuery>,
+    Query(tq): Query<OptionalTenantQuery>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-        return problem.into_response();
-    }
+    let (list_tenant, list_bound) = match tq.tenant_id.as_deref() {
+        Some(t) => {
+            if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], t) {
+                return problem.into_response();
+            }
+            (t.to_string(), true)
+        }
+        None => {
+            if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+                return problem.into_response();
+            }
+            (crate::trace_store::TraceStore::capture_tenant(), false)
+        }
+    };
     let Some(store) = open_store(&state) else {
         return (
             StatusCode::OK,
@@ -104,23 +154,26 @@ pub(super) async fn list_traces(
                 "persist_enabled": false,
                 "traces": [],
                 "hint": format!("set {}=1 to persist traces", crate::trace_store::TRACE_PERSIST_ENV),
+                // Scope is a property of the request, not of whether persistence
+                // happens to be on — a caller must be able to tell which tenant
+                // it asked for regardless of the answer being empty.
+                "tenant_id": list_tenant,
+                "tenant_scope": if list_bound { "request" } else { "daemon-capture-tenant" },
             })),
         )
             .into_response();
     };
-    // Scoped to this daemon's own capture tenant. This surface has no tenant
-    // binding of its own (it authorises with `require_http_scopes`, not the
-    // per-tenant variant), so there is no requester tenant to honour. Pinning it
-    // to the capture tenant preserves single-tenant behaviour exactly and fails
-    // closed if this daemon ever holds more than one tenant's spans — it will
-    // simply not see them. Giving this surface real tenant binding is a
-    // prerequisite for hosting it (crux-code-intel-pro-hosted-surface M3).
-    match store.list_traces(query.limit.unwrap_or(100), &crate::trace_store::TraceStore::capture_tenant()) {
+    match store.list_traces(query.limit.unwrap_or(100), &list_tenant) {
         Ok(traces) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "persist_enabled": true,
                 "traces": traces.iter().map(|(id, n)| serde_json::json!({"trace_id": id, "span_count": n})).collect::<Vec<_>>(),
+                "tenant_id": list_tenant,
+                // `daemon-capture-tenant` means no tenant was named, so this
+                // answered for whatever tenant the process captures as. Correct
+                // locally, NOT hostable — see OptionalTenantQuery.
+                "tenant_scope": if list_bound { "request" } else { "daemon-capture-tenant" },
             })),
         )
             .into_response(),
@@ -326,6 +379,23 @@ pub(super) async fn get_code_path(
     };
     let spans = load_spans(&state, &q.tenant_id);
     let path = crate::code_intel::code_path(&spans, entry, q.token_budget);
+
+    if q.all_repos {
+        // This route reads the span window only — no static scan — and the window
+        // is already tenant-wide, so the answer *is* cross-repo whether or not the
+        // flag is set. Saying so beats accepting the flag and discarding it: a
+        // caller that sets `all_repos` and gets an unannotated single-repo-shaped
+        // body cannot tell "already aggregate" from "silently ignored".
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "aggregate": true,
+                "aggregate_basis": "runtime spans are tenant-wide; no static scan is consulted",
+                "path": path,
+            })),
+        )
+            .into_response();
+    }
     (StatusCode::OK, Json(path)).into_response()
 }
 
@@ -452,11 +522,31 @@ pub(super) async fn get_liveness(
     let Some(symbol) = q.symbol.as_deref() else {
         return problem_response(StatusCode::BAD_REQUEST, "symbol is required");
     };
+    let spans = load_spans(&state, &q.tenant_id);
+
+    if q.all_repos {
+        // P1. Liveness reads the static scan as well as the span window, so a
+        // single-repo scan answers "is this used" against one repo's references
+        // only — which is the wrong answer, not a partial one, when the caller
+        // lives elsewhere in the estate.
+        let (scan, repos) = crate::repo_aggregate::aggregate_tenant(&state, &q.tenant_id).await;
+        let l = crate::code_intel::liveness(&scan, &spans, symbol);
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "aggregate": true,
+                "repos": repos,
+                "liveness": l,
+                "precision": "superset: cross-repo edges resolve by symbol name",
+            })),
+        )
+            .into_response();
+    }
+
     let repo_id = q.repo_id.as_deref().unwrap_or("crux");
     let Some(scan) = load_scan(&state, &q.tenant_id, repo_id).await else {
         return problem_response(StatusCode::NOT_FOUND, "no scan for this repo; register it first");
     };
-    let spans = load_spans(&state, &q.tenant_id);
     let l = crate::code_intel::liveness(&scan, &spans, symbol);
     (StatusCode::OK, Json(l)).into_response()
 }
@@ -516,6 +606,20 @@ pub(super) async fn get_trace_diff(
     };
     let spans = load_spans(&state, &q.tenant_id);
     let d = crate::code_intel::trace_diff(&spans, a, b, q.token_budget);
+
+    if q.all_repos {
+        // Span-only, like code_path: the window is already tenant-wide, so this is
+        // annotated rather than silently dropping the flag.
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "aggregate": true,
+                "aggregate_basis": "runtime spans are tenant-wide; no static scan is consulted",
+                "diff": d,
+            })),
+        )
+            .into_response();
+    }
     (StatusCode::OK, Json(d)).into_response()
 }
 
@@ -537,11 +641,32 @@ pub(super) async fn get_dead_code_ladder(
     if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
         return problem.into_response();
     }
+    let spans = load_spans(&state, &q.tenant_id);
+
+    if q.all_repos {
+        // P1, and the highest-stakes aggregate on this surface. A symbol defined
+        // in repo A and referenced only from repo B is statically unreferenced
+        // *within A*, so a single-repo ladder reports it as dead. Someone acting
+        // on that deletes live code. Aggregating first is what makes the verdict
+        // safe to act on.
+        let (scan, repos) = crate::repo_aggregate::aggregate_tenant(&state, &q.tenant_id).await;
+        let ladder = crate::code_intel::dead_code_ladder(&scan, &spans, q.symbol.as_deref(), q.token_budget);
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "aggregate": true,
+                "repos": repos,
+                "ladder": ladder,
+                "precision": "superset: cross-repo edges resolve by symbol name",
+            })),
+        )
+            .into_response();
+    }
+
     let repo_id = q.repo_id.as_deref().unwrap_or("crux");
     let Some(scan) = load_scan(&state, &q.tenant_id, repo_id).await else {
         return problem_response(StatusCode::NOT_FOUND, "no scan for this repo; register it first");
     };
-    let spans = load_spans(&state, &q.tenant_id);
     let ladder = crate::code_intel::dead_code_ladder(&scan, &spans, q.symbol.as_deref(), q.token_budget);
     (StatusCode::OK, Json(ladder)).into_response()
 }
