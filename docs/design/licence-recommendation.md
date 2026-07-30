@@ -25,7 +25,7 @@ The recommendation at the time was to switch from the bespoke **CueCrux Communit
 - **Trademark:** separate; no grant via the licence (matches CCL §3.2).
 - **Contribution Licence:** preserve the CCL §3.1 dual-grant pattern as a project CLA, applied via a standard DCO or a one-line `CONTRIBUTING.md` clause referencing the same flow-through to the Change Licence.
 
-## Why this conversation now
+## Why this conversation happened (as of May 2026)
 
 An external code review of this repository in May 2026 identified the bespoke CCL as a real adoption speed bump:
 
@@ -37,7 +37,7 @@ Moving to BUSL keeps every substantive guarantee the operator cares about and tr
 
 ## Side-by-side: CCL v1.0 vs proposed BUSL 1.1 parameterisation
 
-| Concern | CCL v1.0 (today) | BUSL 1.1 (proposed) |
+| Concern | CCL v1.0 (in force at the time) | BUSL 1.1 (proposed) |
 |---|---|---|
 | **SPDX identifier** | None — repo shows "Other" / "Unknown" | `BUSL-1.1` (recognised; GitHub identifies it) |
 | **Change Date** | "Three years after each versioned release" (§Parameters) | Same — set as the `Change Date` parameter per release. |
