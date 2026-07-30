@@ -980,7 +980,60 @@
       return { t: 'exp', label: (lv.severity ? '● ' + String(lv.severity).toUpperCase() + '  ' : '') + lv.title, sub: lv.est_pct ? ('addresses ~' + Math.round(lv.est_pct) + '% of carried cost') : '', badge: lv.severity || 'lever', controls: [info('how', lv.detail || '')] };
     }) };
     if (!levers.controls.length) { levers.controls = [info('—', 'already lean')]; }
-    return [sel, head, where, levers, costTrend()];
+    var axis = costModelAxis(r);
+    return axis ? [sel, head, axis, where, levers, costTrend()] : [sel, head, where, levers, costTrend()];
+  }
+
+  // ---- The model/effort axis (cost-capture-repair plan, M1) ----------------
+  // Which model, at which effort setting, burned the context. Rendered from
+  // report.breakdown, which reconciles exactly to headline.measured_context_total.
+  //
+  // TWO RULES, and they are the point of the card rather than decoration:
+  //
+  //  1. Every effort figure is rendered WITH that model's effort coverage.
+  //     `effort` is absent on 61% of the measured corpus and its absence
+  //     correlates with model (100% / 100% / 22.5% / 9.4% on 2026-07-30), so a
+  //     bare per-effort number invites a cross-model comparison that is
+  //     confounded at source and that no sample size fixes.
+  //  2. `<synthetic>` is not a model. It is shown on its own row, never ranked
+  //     with real ones — neither charted nor silently dropped.
+  //
+  // Neither rule can be enforced by a test on this file, which is exactly why
+  // they are written here next to the code that would break them.
+  function costModelAxis(r) {
+    var b = r && r.breakdown;
+    if (!b || (!arr(b.models).length && !b.synthetic)) { return null; }
+    var total = (r.headline && r.headline.measured_context_total) || 0;
+    var pctOf = function (n) { return total > 0 ? (100 * n / total) : 0; };
+    var controls = [];
+    arr(b.models).forEach(function (m) {
+      var pct = pctOf(m.context_total || 0);
+      var cov = Math.round(m.effort_coverage_pct || 0);
+      var efforts = arr(m.efforts);
+      var covered = efforts.reduce(function (a, e) { return a + (e.context_total || 0); }, 0);
+      var sub = efforts.length
+        ? efforts.map(function (e) { return e.effort + ' ' + fmtNum(e.context_total) + ' (' + (e.turns || 0) + ')'; }).join('  ·  ')
+        : 'effort not recorded on any of these turns';
+      var kids = [
+        info('burn', fmtNum(m.context_total) + ' carried context · ' + (m.turns || 0) + ' turn(s) · ' + Math.round(pct) + '% of session'),
+        info('output', fmtNum(m.measured && m.measured.output) + ' tokens generated'),
+        info('by effort', sub),
+        // The coverage line is a sibling of the effort line, never a footnote:
+        // it says how much of this model's burn the effort rows account for.
+        info('effort coverage', cov + '% of this model’s turns carry an effort value — the rows above cover '
+          + fmtNum(covered) + ' of ' + fmtNum(m.context_total)
+          + (cov < 100 ? '. Do not compare this against another model’s effort: coverage is model-correlated, so the comparison is confounded at source.' : '.'))
+      ];
+      controls.push({ t: 'exp', label: m.model, sub: Math.round(pct) + '% · ' + fmtNum(m.context_total) + ' · effort coverage ' + cov + '%', badge: cov + '%', controls: kids });
+    });
+    if (b.synthetic) {
+      controls.push(info('<synthetic>', (b.synthetic.turns || 0) + ' generated records · ' + fmtNum(b.synthetic.context_total)
+        + ' — not a model, excluded from the ranking above'));
+    }
+    if (b.unattributed_context) {
+      controls.push(info('(unattributed)', fmtNum(b.unattributed_context) + ' — records carrying usage but no model id'));
+    }
+    return { h: 'Which model burned it', sub: 'per-model, and per-effort within a model — every effort figure carries its coverage', wide: true, controls: controls };
   }
 
   // ---- Engine mediation (M4) — read-only, daemon-mediated summary card ----

@@ -68,6 +68,31 @@ pub struct CostReport {
     /// unchanged on the wire.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub execplan_slugs: Vec<String>,
+    /// The model that took the most turns this session (normalised id; an
+    /// unrecognised id is carried verbatim). `None` for a transcript whose
+    /// records named no model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// That model's dominant `effort` setting, when its records carried one.
+    /// Read it against [`ModelBurn::effort_coverage_pct`] in [`Self::breakdown`]
+    /// — `effort` is absent on 61% of the measured corpus, and non-randomly so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// The session's modal working directory. Already in every transcript
+    /// record; previously parsed and discarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// The session's modal `gitBranch`. Parsed since the ExecPlan-attribution
+    /// work but consumed only as an internal slug-ranking tie-breaker; promoted
+    /// here so the report can say which branch the burn happened on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    /// Per-model burn, with per-effort burn *within* each model. Additive +
+    /// serde-default + skip-if-absent, like [`Self::execplan_slugs`]: an old
+    /// daemon ignores it, and a legacy report without it is unchanged on the
+    /// wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breakdown: Option<ModelBreakdown>,
     /// The screenshot-worthy top-line numbers.
     pub headline: Headline,
     /// The four measured `usage` totals summed across the session.
@@ -91,6 +116,72 @@ impl CostReport {
         self.generated_at = Some(ts.into());
         self
     }
+}
+
+/// Per-model burn for one session, plus the pieces that keep it honest.
+///
+/// `models` excludes `<synthetic>` — Claude Code's marker for records it
+/// generated itself, which is not a model and must not be charted as one. It is
+/// carried in [`Self::synthetic`] instead, so it is visible but never ranked.
+///
+/// **Reconciliation.** `Σ models[].context_total + synthetic.context_total +
+/// unattributed_context == Headline::measured_context_total`, exactly. Tested.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelBreakdown {
+    /// Real models, biggest burn first.
+    pub models: Vec<ModelBurn>,
+    /// The `<synthetic>` pseudo-model, when the transcript had any. Reported
+    /// separately rather than dropped, so the totals still add up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synthetic: Option<ModelBurn>,
+    /// Context from records that carried `usage` but named no model. Non-zero
+    /// only for older/partial transcripts; present so the sum reconciles.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unattributed_context: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// One model's share of a session's burn.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelBurn {
+    /// Normalised model id, or the raw string verbatim when unrecognised — a
+    /// new id becomes its own visible row rather than merging into an old one.
+    pub model: String,
+    /// Records attributed to this model.
+    pub turns: u64,
+    /// The four measured `usage` accumulators over those records.
+    pub measured: Measured,
+    /// Σ `cache_read + cache_creation + input` over those records.
+    pub context_total: u64,
+    /// Percentage of this model's turns that carried an `effort` value, 0..100.
+    ///
+    /// **Every surface rendering [`Self::efforts`] must render this beside it.**
+    /// `effort` is missing non-randomly — coverage ran 100% / 100% / 22.5% /
+    /// 9.4% by model across the 2026-07-30 corpus — so an effort figure without
+    /// its coverage invites a cross-model comparison that is confounded at
+    /// source. This is a publishing hazard, not a runtime one: it will not fail
+    /// a test, which is exactly why the number rides along in the type.
+    pub effort_coverage_pct: f64,
+    /// Per-effort burn *within* this model, biggest first. Empty when none of
+    /// this model's records carried an `effort`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub efforts: Vec<EffortBurn>,
+}
+
+/// One effort setting's share of a single model's burn.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EffortBurn {
+    /// `xhigh`, `high`, `max`, … carried verbatim.
+    pub effort: String,
+    /// Records at this effort.
+    pub turns: u64,
+    /// Σ context read over those records.
+    pub context_total: u64,
+    /// Σ `output_tokens` over those records.
+    pub output: u64,
 }
 
 /// The top-line numbers — the wedge. The headline metric is

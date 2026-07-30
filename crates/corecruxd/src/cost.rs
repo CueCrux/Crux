@@ -304,6 +304,11 @@ mod tests {
             started_at: None,
             ended_at: None,
             execplan_slugs: Vec::new(),
+            model: None,
+            effort: None,
+            cwd: None,
+            git_branch: None,
+            breakdown: None,
             headline: crux_cost::Headline {
                 assistant_turns: 10,
                 tasks: 2,

@@ -204,6 +204,11 @@ mod tests {
             started_at: None,
             ended_at: None,
             execplan_slugs: Vec::new(),
+            model: None,
+            effort: None,
+            cwd: None,
+            git_branch: None,
+            breakdown: None,
             headline: crux_cost::Headline {
                 assistant_turns: 10,
                 tasks: 1,
@@ -240,5 +245,139 @@ mod tests {
             fitted.report.top_blocks.len() < 25,
             "tight budget must drop some top_blocks"
         );
+    }
+
+    /// A transcript in the shape the real corpus has: two models, one of them
+    /// with partial `effort` coverage, plus a `<synthetic>` record.
+    fn transcript() -> String {
+        [
+            r#"{"type":"assistant","sessionId":"e2e","effort":"xhigh","cwd":"/w","gitBranch":"feat/axis","message":{"role":"assistant","model":"claude-opus-5","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":990},"content":[{"type":"text","text":"a"}]}}"#,
+            r#"{"type":"assistant","sessionId":"e2e","effort":"high","cwd":"/w","gitBranch":"feat/axis","message":{"role":"assistant","model":"claude-opus-5","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":490},"content":[{"type":"text","text":"b"}]}}"#,
+            r#"{"type":"assistant","sessionId":"e2e","cwd":"/w","message":{"role":"assistant","model":"claude-fable-5","usage":{"input_tokens":0,"output_tokens":1,"cache_read_input_tokens":100},"content":[{"type":"text","text":"c"}]}}"#,
+            r#"{"type":"assistant","sessionId":"e2e","message":{"role":"assistant","model":"<synthetic>","usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":7},"content":[{"type":"text","text":"d"}]}}"#,
+        ]
+        .join("\n")
+    }
+
+    /// End-to-end through the two handlers: analyse a real-shaped transcript,
+    /// POST it, GET it back, and assert the model/effort axis survived the round
+    /// trip intact and still reconciles.
+    ///
+    /// This is the cost lane's first integration coverage of any kind — the lane
+    /// named in the `SHARED-OBSERVABILITY` capability gap (`no_integration_tests`).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn post_then_get_round_trips_the_model_axis() {
+        std::env::set_var("CORECRUXD_FEATURE_COST_LENS", "1");
+        let state = crate::http::tests::test_app_state(1);
+        let report = crux_cost::analyze_str(&transcript(), "e2e.jsonl");
+        // The producer side must have found the axis at all.
+        assert_eq!(report.model.as_deref(), Some("claude-opus-5"));
+
+        let resp = post_cost_report(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(PostCostBody {
+                tenant_id: "default".to_owned(),
+                session_id: None,
+                report,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = get_cost_report(
+            State(state),
+            HeaderMap::new(),
+            Query(HashMap::from([
+                ("tenant_id".to_owned(), "default".to_owned()),
+                ("token_budget".to_owned(), "8000".to_owned()),
+                ("session".to_owned(), "e2e".to_owned()),
+            ])),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(v["has_report"], true);
+        let r = &v["report"]["report"];
+
+        assert_eq!(r["model"], "claude-opus-5");
+        assert_eq!(r["effort"], "xhigh");
+        assert_eq!(r["cwd"], "/w");
+        assert_eq!(r["git_branch"], "feat/axis");
+
+        let models = r["breakdown"]["models"].as_array().expect("models");
+        assert_eq!(models.len(), 2, "<synthetic> must not be ranked as a model");
+        assert_eq!(models[0]["model"], "claude-opus-5");
+        assert_eq!(models[0]["turns"], 2);
+        assert_eq!(models[0]["effort_coverage_pct"], 100.0);
+        // fable's single turn carried no effort — 0% coverage, no effort rows.
+        let fable = models.iter().find(|m| m["model"] == "claude-fable-5").expect("fable");
+        assert_eq!(fable["effort_coverage_pct"], 0.0);
+        assert!(
+            fable.get("efforts").is_none(),
+            "empty efforts must be skipped on the wire"
+        );
+        // Separated, not dropped.
+        assert_eq!(r["breakdown"]["synthetic"]["model"], "<synthetic>");
+        assert_eq!(r["breakdown"]["synthetic"]["turns"], 1);
+
+        // …and it still adds up after the round trip.
+        let summed: u64 = models
+            .iter()
+            .map(|m| m["context_total"].as_u64().unwrap_or(0))
+            .sum::<u64>()
+            + r["breakdown"]["synthetic"]["context_total"].as_u64().unwrap_or(0)
+            + r["breakdown"]["unattributed_context"].as_u64().unwrap_or(0);
+        assert_eq!(summed, r["headline"]["measured_context_total"].as_u64().unwrap_or(0));
+        std::env::remove_var("CORECRUXD_FEATURE_COST_LENS");
+    }
+
+    /// Wire compatibility in the direction that actually happens in the field: a
+    /// producer newer than the daemon. A legacy body with none of the axis
+    /// fields must still be accepted and read back unchanged.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_report_without_the_axis_still_posts_and_reads_back() {
+        std::env::set_var("CORECRUXD_FEATURE_COST_LENS", "1");
+        let state = crate::http::tests::test_app_state(1);
+        let body: PostCostBody = serde_json::from_value(serde_json::json!({
+            "tenant_id": "default",
+            "report": {
+                "schema": crux_cost::COST_REPORT_SCHEMA,
+                "session_id": "legacy", "source": "legacy.jsonl",
+                "headline": {"assistant_turns":1,"tasks":1,"segments":1,"context_tokens_per_turn":10,
+                             "cache_read_to_output_ratio":1.0,"measured_context_total":10,"prefix_pct":0.0},
+                "measured": {"input":10,"output":10,"cache_read":0,"cache_creation":0},
+                "buckets": [], "top_blocks": [], "levers": []
+            }
+        }))
+        .expect("a pre-axis report must still deserialise");
+        assert_eq!(
+            post_cost_report(State(state.clone()), HeaderMap::new(), Json(body))
+                .await
+                .status(),
+            StatusCode::CREATED
+        );
+
+        let resp = get_cost_report(
+            State(state),
+            HeaderMap::new(),
+            Query(HashMap::from([
+                ("tenant_id".to_owned(), "default".to_owned()),
+                ("token_budget".to_owned(), "8000".to_owned()),
+                ("session".to_owned(), "legacy".to_owned()),
+            ])),
+        )
+        .await;
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        let r = &v["report"]["report"];
+        assert_eq!(r["session_id"], "legacy");
+        for f in ["model", "effort", "cwd", "git_branch", "breakdown"] {
+            assert!(r.get(f).is_none(), "{f} must not be invented on a legacy report");
+        }
+        std::env::remove_var("CORECRUXD_FEATURE_COST_LENS");
     }
 }
