@@ -1105,6 +1105,7 @@ mod tests {
             symbol_id: None,
             join: "extracted".into(),
             tenant_id: String::new(),
+            release: String::new(),
             stored_at_unix_ms: 10,
         }];
         let graded = crate::code_intel::dead_code_verdicts(&ws, &spans);

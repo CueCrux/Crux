@@ -48,9 +48,21 @@ pub const TRACE_PERSIST_ENV: &str = "CORECRUXD_TRACE_PERSIST";
 pub const TRACE_FLUSH_SECS_ENV: &str = "CORECRUXD_TRACE_FLUSH_SECS";
 /// Retention cap: the store is truncated to the newest N records on rotate.
 pub const TRACE_MAX_RECORDS_ENV: &str = "CORECRUXD_TRACE_MAX_RECORDS";
+/// Per-tenant retained-span ceiling — the M5 margin guard.
+pub const TRACE_TENANT_CEILING_ENV: &str = "CORECRUXD_TRACE_TENANT_CEILING";
+/// Release label applied to spans captured by this daemon (M6).
+pub const TRACE_RELEASE_ENV: &str = "CORECRUXD_TRACE_RELEASE";
+/// Retention window in days — how long retained spans are kept (M6).
+pub const TRACE_RETENTION_DAYS_ENV: &str = "CORECRUXD_TRACE_RETENTION_DAYS";
 
 const DEFAULT_FLUSH_SECS: u64 = 10;
 const DEFAULT_MAX_RECORDS: usize = 200_000;
+/// Default per-tenant ceiling. 10M retained spans is ~800 MB gzipped at the
+/// measured 399 bytes/span, which is the volume the M5 cost model prices as
+/// comfortable inside one Pro seat-block. The operator sets the real number.
+const DEFAULT_TENANT_CEILING: usize = 10_000_000;
+/// See [`retention_days`] — a placeholder pending the operator's decision.
+const DEFAULT_RETENTION_DAYS: u64 = 90;
 
 /// A captured span plus the static symbol it was resolved to.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -79,6 +91,16 @@ pub struct StoredSpan {
     /// be a worse failure than the one this field fixes.
     #[serde(default)]
     pub tenant_id: String,
+    /// Release this span was captured under (M6).
+    ///
+    /// What makes `trace_diff` operational: "what executes now that did not
+    /// before a release" needs the two sides labelled, and a timestamp cannot
+    /// tell you which deploy a span belongs to when releases overlap.
+    ///
+    /// Empty means captured before release labelling, the same convention
+    /// `tenant_id` uses — it is a legacy marker, never a wildcard.
+    #[serde(default)]
+    pub release: String,
 }
 
 #[derive(Debug)]
@@ -94,6 +116,12 @@ pub struct FlushReport {
     pub ambiguous: usize,
     pub missed: usize,
     pub no_location: usize,
+    /// Spans refused because the tenant is at its retained-span ceiling (M5).
+    ///
+    /// Refused at ingest, never by deleting what is already stored: a customer
+    /// who hits the ceiling loses new capture, not the history they have already
+    /// been answering questions from.
+    pub refused_over_ceiling: usize,
 }
 
 impl TraceStore {
@@ -137,7 +165,15 @@ impl TraceStore {
             return Ok(report);
         }
 
+        // M5 ceiling. Counted once per flush batch, not per span: the read is
+        // O(store) and a flush is per-interval, so this is a bounded cost paid
+        // rarely rather than a per-span tax on the hot path.
+        let ceiling = tenant_ceiling();
+        let already = self.load_for_tenant(tenant_id).map(|v| v.len()).unwrap_or(0);
+        let mut headroom = ceiling.saturating_sub(already);
+
         let now = now_unix_ms();
+        let release = capture_release();
         let mut buf = String::with_capacity(spans.len() * 256);
 
         for span in spans {
@@ -172,12 +208,19 @@ impl TraceStore {
                 }
             };
 
+            if headroom == 0 {
+                report.refused_over_ceiling += 1;
+                continue;
+            }
+            headroom -= 1;
+
             let stored = StoredSpan {
                 span,
                 symbol_id,
                 join: join.to_string(),
                 stored_at_unix_ms: now,
                 tenant_id: tenant_id.to_string(),
+                release: release.clone(),
             };
             if let Ok(line) = serde_json::to_string(&stored) {
                 buf.push_str(&line);
@@ -243,6 +286,77 @@ impl TraceStore {
                 }
             })
             .collect())
+    }
+
+    /// Report one tenant's retained volume against the ceiling.
+    pub fn volume_for_tenant(&self, tenant_id: &str) -> std::io::Result<SpanVolume> {
+        let retained = self.load_for_tenant(tenant_id)?.len();
+        let ceiling = tenant_ceiling();
+        let pct = retained.saturating_mul(100) / ceiling.max(1);
+        Ok(SpanVolume {
+            tenant_id: tenant_id.to_string(),
+            retained,
+            ceiling,
+            pct_of_ceiling: pct,
+            approaching: pct >= APPROACH_PCT,
+            at_ceiling: retained >= ceiling,
+        })
+    }
+
+    /// Spans for one tenant captured under `release`.
+    pub fn load_for_release(&self, tenant_id: &str, release: &str) -> std::io::Result<Vec<StoredSpan>> {
+        Ok(self
+            .load_for_tenant(tenant_id)?
+            .into_iter()
+            .filter(|s| s.release == release)
+            .collect())
+    }
+
+    /// Distinct releases held for a tenant, oldest first, with span counts.
+    pub fn releases_for_tenant(&self, tenant_id: &str) -> std::io::Result<Vec<(String, usize)>> {
+        let mut first_seen: BTreeMap<String, (u64, usize)> = BTreeMap::new();
+        for s in self.load_for_tenant(tenant_id)? {
+            let e = first_seen.entry(s.release.clone()).or_insert((s.stored_at_unix_ms, 0));
+            e.0 = e.0.min(s.stored_at_unix_ms);
+            e.1 += 1;
+        }
+        let mut v: Vec<(String, u64, usize)> = first_seen.into_iter().map(|(r, (t, c))| (r, t, c)).collect();
+        v.sort_by_key(|(_, t, _)| *t);
+        Ok(v.into_iter().map(|(r, _, c)| (r, c)).collect())
+    }
+
+    /// Drop spans older than the retention window.
+    ///
+    /// **This deletes, and that is the difference from the M5 ceiling.** The
+    /// ceiling refuses *new* spans when a tenant is holding too many and never
+    /// removes history; retention removes history that is past its window. Two
+    /// limits on two axes — volume and age — and conflating them would mean
+    /// either a customer silently losing recent data to a volume cap, or a
+    /// tenant holding unbounded history because it stayed under one.
+    ///
+    /// Returns the number pruned.
+    pub fn prune_expired(&self, now_unix_ms_value: u64) -> std::io::Result<usize> {
+        let window_ms = retention_days().saturating_mul(24 * 60 * 60 * 1000);
+        let cutoff = now_unix_ms_value.saturating_sub(window_ms);
+        let all = self.load_all()?;
+        let keep: Vec<&StoredSpan> = all.iter().filter(|s| s.stored_at_unix_ms >= cutoff).collect();
+        if keep.len() == all.len() {
+            return Ok(0);
+        }
+        let pruned = all.len() - keep.len();
+        let tmp = self.path.with_extension("jsonl.tmp");
+        {
+            let mut f = OpenOptions::new().create(true).truncate(true).write(true).open(&tmp)?;
+            for s in keep {
+                if let Ok(line) = serde_json::to_string(s) {
+                    f.write_all(line.as_bytes())?;
+                    f.write_all(b"\n")?;
+                }
+            }
+            f.flush()?;
+        }
+        std::fs::rename(&tmp, &self.path)?;
+        Ok(pruned)
     }
 
     /// All spans of one trace, in capture order.
@@ -321,6 +435,59 @@ pub fn flush_interval_secs() -> u64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_FLUSH_SECS)
+        .max(1)
+}
+
+/// Retained spans one tenant may hold before new capture is refused.
+///
+/// **Distinct from `max_records`**, which rotates the whole store by dropping
+/// the oldest records. That is a local disk valve and it deletes. This is the
+/// hosted margin guard and it does not: on breach it stops admitting new spans
+/// and leaves retained history intact. Selling on repo count while the real cost
+/// is span volume is the plan's Constraint 1, and this is the limit that
+/// actually holds the cost line.
+pub fn tenant_ceiling() -> usize {
+    std::env::var(TRACE_TENANT_CEILING_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_TENANT_CEILING)
+        .max(1)
+}
+
+/// What one tenant is holding against its ceiling.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SpanVolume {
+    pub tenant_id: String,
+    pub retained: usize,
+    pub ceiling: usize,
+    /// Percent of ceiling used, rounded down.
+    pub pct_of_ceiling: usize,
+    /// At or past `APPROACH_PCT`. Surfaced so the customer sees it **before** it
+    /// bites rather than discovering it as missing data afterwards.
+    pub approaching: bool,
+    pub at_ceiling: bool,
+}
+
+/// Percent of ceiling at which the customer is warned.
+pub const APPROACH_PCT: usize = 80;
+
+/// This daemon's release label, defaulting to its own version.
+pub fn capture_release() -> String {
+    std::env::var(TRACE_RELEASE_ENV).unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string())
+}
+
+/// Retention window in days.
+///
+/// **Placeholder default.** The M0 pricing freeze left the window open as an
+/// operator decision (30 / 90 / 365), because it is what sets the P2 cost line.
+/// 90 is the middle option and is used so the mechanism is testable, NOT because
+/// it has been chosen — whoever sets the real number changes this and the
+/// pricing surface together.
+pub fn retention_days() -> u64 {
+    std::env::var(TRACE_RETENTION_DAYS_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_RETENTION_DAYS)
         .max(1)
 }
 
@@ -636,5 +803,224 @@ mod tests {
         let b = store.list_traces(100, "tenant-b").unwrap();
         assert_eq!(b.len(), 1);
         assert_eq!(b[0].0, 8);
+    }
+
+    // ── M5: the retained-span ceiling ───────────────────────────────────────
+    // Repo count is what the customer buys; span volume is what costs money.
+    // This is the limit that actually holds the cost line.
+
+    #[test]
+    #[serial_test::serial]
+    fn at_the_ceiling_new_spans_are_refused_and_retained_ones_survive() {
+        // The defining property: containment must not be achieved by deletion.
+        // A customer at the ceiling loses new capture, not the history their
+        // answers have been coming from.
+        std::env::set_var(TRACE_TENANT_CEILING_ENV, "3");
+        let dir = tempfile::tempdir().unwrap();
+        let store = TraceStore::open(dir.path().join("s.jsonl"), 1_000_000).unwrap();
+
+        let batch: Vec<_> = (0..3).map(|i| span("a", Some("a.rs"), Some(1), 1, i)).collect();
+        let r1 = store.append_resolved(batch, None, "t1").unwrap();
+        assert_eq!(r1.refused_over_ceiling, 0);
+        assert_eq!(store.load_for_tenant("t1").unwrap().len(), 3);
+
+        // Two more against a ceiling of three: both refused, nothing deleted.
+        let more: Vec<_> = (10..12).map(|i| span("b", Some("b.rs"), Some(1), 2, i)).collect();
+        let r2 = store.append_resolved(more, None, "t1").unwrap();
+        assert_eq!(
+            r2.refused_over_ceiling, 2,
+            "over-ceiling spans must be refused at ingest"
+        );
+        let kept = store.load_for_tenant("t1").unwrap();
+        assert_eq!(kept.len(), 3, "retained history must be untouched");
+        assert!(
+            kept.iter().all(|s| s.span.name == "a"),
+            "the ORIGINAL spans must survive; refusing new must not evict old"
+        );
+        std::env::remove_var(TRACE_TENANT_CEILING_ENV);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn one_tenants_ceiling_does_not_contain_another() {
+        // A noisy neighbour must not exhaust a quiet tenant's headroom — the
+        // ceiling is per account, which is the whole point of it being a margin
+        // guard rather than a global disk valve.
+        std::env::set_var(TRACE_TENANT_CEILING_ENV, "2");
+        let dir = tempfile::tempdir().unwrap();
+        let store = TraceStore::open(dir.path().join("s.jsonl"), 1_000_000).unwrap();
+
+        let noisy: Vec<_> = (0..5).map(|i| span("n", Some("n.rs"), Some(1), 1, i)).collect();
+        let rn = store.append_resolved(noisy, None, "noisy").unwrap();
+        assert_eq!(rn.refused_over_ceiling, 3);
+
+        let quiet = vec![span("q", Some("q.rs"), Some(1), 2, 99)];
+        let rq = store.append_resolved(quiet, None, "quiet").unwrap();
+        assert_eq!(rq.refused_over_ceiling, 0, "quiet tenant keeps its own headroom");
+        assert_eq!(store.load_for_tenant("quiet").unwrap().len(), 1);
+        assert_eq!(store.load_for_tenant("noisy").unwrap().len(), 2);
+        std::env::remove_var(TRACE_TENANT_CEILING_ENV);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn volume_warns_before_it_bites() {
+        // "Visible to the customer before it bites" is the gate. A limit whose
+        // first signal is missing data is a support ticket, not a limit.
+        std::env::set_var(TRACE_TENANT_CEILING_ENV, "10");
+        let dir = tempfile::tempdir().unwrap();
+        let store = TraceStore::open(dir.path().join("s.jsonl"), 1_000_000).unwrap();
+
+        let batch: Vec<_> = (0..8).map(|i| span("a", Some("a.rs"), Some(1), 1, i)).collect();
+        store.append_resolved(batch, None, "t1").unwrap();
+
+        let v = store.volume_for_tenant("t1").unwrap();
+        assert_eq!(v.retained, 8);
+        assert_eq!(v.ceiling, 10);
+        assert_eq!(v.pct_of_ceiling, 80);
+        assert!(v.approaching, "80% must warn");
+        assert!(!v.at_ceiling, "80% is not yet the limit — warning precedes refusal");
+        std::env::remove_var(TRACE_TENANT_CEILING_ENV);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_partially_full_batch_admits_what_fits() {
+        // Containment is per span, not per batch: a batch that straddles the
+        // ceiling stores the part that fits rather than discarding all of it.
+        std::env::set_var(TRACE_TENANT_CEILING_ENV, "4");
+        let dir = tempfile::tempdir().unwrap();
+        let store = TraceStore::open(dir.path().join("s.jsonl"), 1_000_000).unwrap();
+
+        let batch: Vec<_> = (0..6).map(|i| span("a", Some("a.rs"), Some(1), 1, i)).collect();
+        let r = store.append_resolved(batch, None, "t1").unwrap();
+        assert_eq!(r.refused_over_ceiling, 2);
+        assert_eq!(store.load_for_tenant("t1").unwrap().len(), 4);
+        std::env::remove_var(TRACE_TENANT_CEILING_ENV);
+    }
+
+    // ── M6: retention and release-over-release history ──────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn spans_are_labelled_with_the_release_that_captured_them() {
+        std::env::set_var(TRACE_RELEASE_ENV, "v1.4.0");
+        let dir = tempfile::tempdir().unwrap();
+        let store = TraceStore::open(dir.path().join("s.jsonl"), 1_000_000).unwrap();
+        store
+            .append_resolved(vec![span("a", Some("a.rs"), Some(1), 1, 1)], None, "t1")
+            .unwrap();
+        let got = store.load_for_tenant("t1").unwrap();
+        assert_eq!(got[0].release, "v1.4.0");
+        std::env::remove_var(TRACE_RELEASE_ENV);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn two_releases_are_separable_weeks_apart() {
+        // The M6 gate: compare v1.3 against v1.4, not two windows in the same
+        // afternoon. A timestamp cannot answer this when releases overlap.
+        let dir = tempfile::tempdir().unwrap();
+        let store = TraceStore::open(dir.path().join("s.jsonl"), 1_000_000).unwrap();
+
+        std::env::set_var(TRACE_RELEASE_ENV, "v1.3.0");
+        store
+            .append_resolved(vec![span("old_handler", Some("a.rs"), Some(1), 1, 1)], None, "t1")
+            .unwrap();
+        std::env::set_var(TRACE_RELEASE_ENV, "v1.4.0");
+        store
+            .append_resolved(vec![span("new_handler", Some("b.rs"), Some(1), 2, 2)], None, "t1")
+            .unwrap();
+        std::env::remove_var(TRACE_RELEASE_ENV);
+
+        let old = store.load_for_release("t1", "v1.3.0").unwrap();
+        let new = store.load_for_release("t1", "v1.4.0").unwrap();
+        assert_eq!(old.len(), 1);
+        assert_eq!(old[0].span.name, "old_handler");
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].span.name, "new_handler");
+
+        // "What executes now that did not before" — the question that makes the
+        // tool operational rather than a curiosity.
+        let names_old: std::collections::BTreeSet<_> = old.iter().map(|s| s.span.name.clone()).collect();
+        let names_new: std::collections::BTreeSet<_> = new.iter().map(|s| s.span.name.clone()).collect();
+        let appeared: Vec<_> = names_new.difference(&names_old).collect();
+        assert_eq!(appeared, vec![&"new_handler".to_string()]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn releases_are_listed_oldest_first_with_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TraceStore::open(dir.path().join("s.jsonl"), 1_000_000).unwrap();
+        std::env::set_var(TRACE_RELEASE_ENV, "v1.0.0");
+        store
+            .append_resolved(vec![span("a", Some("a.rs"), Some(1), 1, 1)], None, "t1")
+            .unwrap();
+        std::env::set_var(TRACE_RELEASE_ENV, "v2.0.0");
+        let two: Vec<_> = (0..2).map(|i| span("b", Some("b.rs"), Some(1), 2, i)).collect();
+        store.append_resolved(two, None, "t1").unwrap();
+        std::env::remove_var(TRACE_RELEASE_ENV);
+
+        let releases = store.releases_for_tenant("t1").unwrap();
+        assert_eq!(releases.len(), 2);
+        assert!(releases.iter().any(|(r, c)| r == "v1.0.0" && *c == 1));
+        assert!(releases.iter().any(|(r, c)| r == "v2.0.0" && *c == 2));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn retention_prunes_past_the_window_and_keeps_what_is_inside_it() {
+        // Retention DELETES — that is the difference from the M5 ceiling, which
+        // refuses new spans and never removes history. Two limits, two axes.
+        std::env::set_var(TRACE_RETENTION_DAYS_ENV, "30");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let day_ms: u64 = 24 * 60 * 60 * 1000;
+        let now: u64 = 1_000 * day_ms;
+
+        let mk = |name: &str, at: u64| {
+            serde_json::json!({
+                "trace_id": 1, "span_id": 1, "parent_span_id": null,
+                "name": name, "target": "t", "file": "f.rs", "line": 1,
+                "module_path": null, "duration_ns": 1, "depth": 0, "had_error": false,
+                "join": "miss", "stored_at_unix_ms": at, "tenant_id": "t1", "release": "v1"
+            })
+            .to_string()
+        };
+        // 10 days old (inside a 30-day window) and 60 days old (outside it).
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                mk("recent", now - 10 * day_ms),
+                mk("ancient", now - 60 * day_ms)
+            ),
+        )
+        .unwrap();
+        let store = TraceStore::open(path, 1_000_000).unwrap();
+
+        let pruned = store.prune_expired(now).unwrap();
+        assert_eq!(pruned, 1, "only the out-of-window span may be pruned");
+        let left = store.load_for_tenant("t1").unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].span.name, "recent", "in-window history must survive");
+        std::env::remove_var(TRACE_RETENTION_DAYS_ENV);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pruning_nothing_leaves_the_store_untouched() {
+        // A no-op prune must not rewrite the file — a rewrite is a crash window,
+        // and paying it for nothing is how retention loses data it should keep.
+        std::env::set_var(TRACE_RETENTION_DAYS_ENV, "3650");
+        let dir = tempfile::tempdir().unwrap();
+        let store = TraceStore::open(dir.path().join("s.jsonl"), 1_000_000).unwrap();
+        store
+            .append_resolved(vec![span("a", Some("a.rs"), Some(1), 1, 1)], None, "t1")
+            .unwrap();
+        assert_eq!(store.prune_expired(now_unix_ms()).unwrap(), 0);
+        assert_eq!(store.load_for_tenant("t1").unwrap().len(), 1);
+        std::env::remove_var(TRACE_RETENTION_DAYS_ENV);
     }
 }

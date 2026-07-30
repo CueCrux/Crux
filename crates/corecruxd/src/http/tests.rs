@@ -20475,6 +20475,7 @@ fn m2_runtime_span_plane_is_tenant_partitioned() {
         join: "miss".into(),
         stored_at_unix_ms: 0,
         tenant_id: "tenant-a".into(),
+        release: String::new(),
     };
     let encoded = serde_json::to_string(&span).expect("serialise");
     assert!(
@@ -20911,4 +20912,74 @@ async fn work_orchestrator_scope_composes_with_ranked() {
     )
     .await;
     assert!(empty["work"].as_array().expect("array").is_empty());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// M4 — soft cap behaviour. crux-code-intel-pro-hosted-surface-2026-07-28.
+//
+// The whole milestone is one property: going over the allowance must never
+// refuse anything. It is a commercial limit, and turning it into a technical one
+// would break a paying customer mid-sprint over a billing question.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn m4_registering_over_allowance_is_flagged_never_refused() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    // Fill the default allowance (5 base + 3 per seat at seats=1 = 8) exactly.
+    {
+        let mut store = state.fact_store.write().await;
+        for i in 0..8 {
+            seed_repo(&mut store, "tenant-a", &format!("r{i}"), true);
+        }
+    }
+    let at_limit = allowance_body(&state, "tenant-a", 1, 0).await;
+    assert_eq!(at_limit["used"], 8);
+    assert_eq!(at_limit["over_allowance"], false);
+
+    // The ninth. It must land, and the response must say the account is over.
+    {
+        let mut store = state.fact_store.write().await;
+        seed_repo(&mut store, "tenant-a", "the-ninth", true);
+    }
+    let over = allowance_body(&state, "tenant-a", 1, 0).await;
+    assert_eq!(over["used"], 9, "the ninth repo must be registered, not rejected");
+    assert_eq!(over["over_allowance"], true);
+    assert_eq!(over["over_by"], 1);
+
+    // And the repos that were already there keep answering — an over-allowance
+    // account loses no capability on what it already had.
+    let resp = super::repos::get_repos(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::RepoTenantQuery {
+            tenant_id: "tenant-a".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["repos"].as_array().map(Vec::len),
+        Some(9),
+        "existing repos must keep working while over allowance"
+    );
+}
+
+#[tokio::test]
+async fn m4_a_pack_restores_headroom_without_touching_the_repos() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        for i in 0..9 {
+            seed_repo(&mut store, "tenant-a", &format!("r{i}"), true);
+        }
+    }
+    let before = allowance_body(&state, "tenant-a", 1, 0).await;
+    assert_eq!(before["over_allowance"], true);
+
+    let after = allowance_body(&state, "tenant-a", 1, 1).await;
+    assert_eq!(after["over_allowance"], false, "a pack must clear the overage");
+    assert_eq!(after["used"], 9, "buying a pack changes entitlement, not usage");
+    assert_eq!(after["remaining"], 9);
 }

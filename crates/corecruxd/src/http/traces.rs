@@ -243,6 +243,18 @@ pub(super) struct CodeIntelQuery {
     pub entry_point: Option<String>,
     #[serde(default)]
     pub symbol: Option<String>,
+    /// Compare two releases rather than two trace ids (M6).
+    #[serde(default)]
+    pub release_a: Option<String>,
+    #[serde(default)]
+    pub release_b: Option<String>,
+    /// Answer across every enabled repo the tenant has registered, not just one.
+    ///
+    /// This is the Pro capability (P1): the arithmetic a local daemon cannot do,
+    /// because the callers live in repos its checkout has never seen. Defaults to
+    /// false, so the free single-repo answer is byte-for-byte unchanged.
+    #[serde(default)]
+    pub all_repos: bool,
     #[serde(default)]
     pub trace_a: Option<u64>,
     #[serde(default)]
@@ -286,6 +298,7 @@ pub(super) fn load_spans(state: &AppState, tenant_id: &str) -> Vec<crate::trace_
                 join: "unresolved_live".to_string(),
                 stored_at_unix_ms: 0,
                 tenant_id: tenant_id.to_string(),
+                release: String::new(),
             })
             .collect()
     })
@@ -316,6 +329,71 @@ pub(super) async fn get_code_path(
     (StatusCode::OK, Json(path)).into_response()
 }
 
+/// `GET /v1/code-intel/volume` — retained spans against the tenant's ceiling (M5).
+///
+/// The ceiling's gate is that containment is "visible to the customer before it
+/// bites". A limit whose first observable symptom is missing data is a support
+/// ticket, not a limit — so the counter is readable before the refusals start.
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn get_span_volume(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<super::repos::RepoTenantQuery>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
+        return problem.into_response();
+    }
+    let Some(store) = open_store(&state) else {
+        return problem_response(
+            StatusCode::CONFLICT,
+            format!(
+                "trace persistence is off; set {}=1",
+                crate::trace_store::TRACE_PERSIST_ENV
+            ),
+        );
+    };
+    match store.volume_for_tenant(&q.tenant_id) {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(err) => problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
+}
+
+/// `GET /v1/code-intel/releases` — releases this tenant holds history for (M6).
+///
+/// Release-over-release `trace_diff` is unusable without knowing which releases
+/// are actually retained; asking a caller to guess a label is asking them to
+/// discover the retention window by trial and error.
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn get_releases(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<super::repos::RepoTenantQuery>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
+        return problem.into_response();
+    }
+    let Some(store) = open_store(&state) else {
+        return problem_response(
+            StatusCode::CONFLICT,
+            format!(
+                "trace persistence is off; set {}=1",
+                crate::trace_store::TRACE_PERSIST_ENV
+            ),
+        );
+    };
+    match store.releases_for_tenant(&q.tenant_id) {
+        Ok(rs) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "releases": rs.iter().map(|(r, c)| serde_json::json!({"release": r, "spans": c})).collect::<Vec<_>>(),
+                "retention_days": crate::trace_store::retention_days(),
+            })),
+        )
+            .into_response(),
+        Err(err) => problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
+}
+
 /// `GET /v1/code-intel/blast-radius` — who breaks if this changes.
 #[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_blast_radius(
@@ -329,11 +407,34 @@ pub(super) async fn get_blast_radius(
     let Some(symbol) = q.symbol.as_deref() else {
         return problem_response(StatusCode::BAD_REQUEST, "symbol is required");
     };
+    let spans = load_spans(&state, &q.tenant_id);
+
+    if q.all_repos {
+        // P1: one graph across every enabled repo this tenant registered. Paths
+        // are repo-qualified by the aggregator so the answer says which repo each
+        // caller is in rather than leaving that to a second lookup.
+        let (scan, repos) = crate::repo_aggregate::aggregate_tenant(&state, &q.tenant_id).await;
+        let radius = crate::code_intel::blast_radius(&scan, &spans, symbol, q.token_budget);
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "aggregate": true,
+                "repos": repos,
+                "radius": radius,
+                // Named in the payload, not just the docs: references resolve by
+                // symbol name, so across repos two unrelated symbols sharing a
+                // name merge. Sound for "what might break", not precise enough to
+                // delete from without reading.
+                "precision": "superset: cross-repo edges resolve by symbol name",
+            })),
+        )
+            .into_response();
+    }
+
     let repo_id = q.repo_id.as_deref().unwrap_or("crux");
     let Some(scan) = load_scan(&state, &q.tenant_id, repo_id).await else {
         return problem_response(StatusCode::NOT_FOUND, "no scan for this repo; register it first");
     };
-    let spans = load_spans(&state, &q.tenant_id);
     let radius = crate::code_intel::blast_radius(&scan, &spans, symbol, q.token_budget);
     (StatusCode::OK, Json(radius)).into_response()
 }
@@ -370,8 +471,48 @@ pub(super) async fn get_trace_diff(
     if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
         return problem.into_response();
     }
+    // M6: release-over-release. "What executes now that did not before a
+    // release" is the question that makes this operational — two trace ids from
+    // the same afternoon cannot answer it.
+    if let (Some(ra), Some(rb)) = (q.release_a.as_deref(), q.release_b.as_deref()) {
+        let Some(store) = open_store(&state) else {
+            return problem_response(
+                StatusCode::CONFLICT,
+                format!(
+                    "trace persistence is off; set {}=1",
+                    crate::trace_store::TRACE_PERSIST_ENV
+                ),
+            );
+        };
+        let (Ok(sa), Ok(sb)) = (
+            store.load_for_release(&q.tenant_id, ra),
+            store.load_for_release(&q.tenant_id, rb),
+        ) else {
+            return problem_response(StatusCode::INTERNAL_SERVER_ERROR, "could not read release history");
+        };
+        let names = |v: &[crate::trace_store::StoredSpan]| -> std::collections::BTreeSet<String> {
+            v.iter().map(|s| s.span.name.clone()).collect()
+        };
+        let (na, nb) = (names(&sa), names(&sb));
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "release_a": ra,
+                "release_b": rb,
+                "spans_a": sa.len(),
+                "spans_b": sb.len(),
+                "appeared": nb.difference(&na).collect::<Vec<_>>(),
+                "disappeared": na.difference(&nb).collect::<Vec<_>>(),
+            })),
+        )
+            .into_response();
+    }
+
     let (Some(a), Some(b)) = (q.trace_a, q.trace_b) else {
-        return problem_response(StatusCode::BAD_REQUEST, "trace_a and trace_b are required");
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "provide trace_a and trace_b, or release_a and release_b",
+        );
     };
     let spans = load_spans(&state, &q.tenant_id);
     let d = crate::code_intel::trace_diff(&spans, a, b, q.token_budget);

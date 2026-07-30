@@ -94,6 +94,7 @@ mod projects;
 mod protocol_posture;
 mod redaction;
 mod relations;
+mod repo_aggregate;
 mod repo_allowance;
 mod repo_codegraph;
 mod repo_registry;
@@ -1129,6 +1130,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                         let store_guard = fact_store.read().await;
                                         cache.get(&store_guard, &tenant_id, &repo_id)
                                     };
+                                    // M6: enforce the retention window on every flush.
+                                    // A window nothing applies is not retention — it is a
+                                    // documented intention, and the store grows anyway.
+                                    match store.prune_expired(
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+                                    ) {
+                                        Ok(0) => {}
+                                        Ok(n) => info!(pruned = n, "trace-retention-pruned"),
+                                        Err(err) => tracing::warn!(?err, "trace-retention-prune-failed"),
+                                    }
                                     match store.append_resolved(spans, resolver.as_deref(), &tenant_id) {
                                         Ok(r) => info!(
                                             drained = r.spans_drained, resolved = r.resolved,

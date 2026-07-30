@@ -15,7 +15,7 @@
 // Every call is same-origin credentialed; the browser never holds a bearer
 // token (the daemon authenticates the session at its own origin).
 //
-// 186 read endpoints, generated from the route manifest.
+// 188 read endpoints, generated from the route manifest.
 
 /**
  * Append a plain query object to a path as a URL search string.
@@ -57,7 +57,9 @@ const LITERAL_GET_PATHS = Object.freeze({
   '/v1/code-intel/dead-code': true,
   '/v1/code-intel/liveness': true,
   '/v1/code-intel/path': true,
+  '/v1/code-intel/releases': true,
   '/v1/code-intel/trace-diff': true,
+  '/v1/code-intel/volume': true,
   '/v1/console/connections': true,
   '/v1/console/corecrux/graph/ego': true,
   '/v1/console/corecrux/graph/path': true,
@@ -259,8 +261,14 @@ const CruxApi = Object.freeze({
   codeIntelPath(query) {
     return fetch(withQuery(`/v1/code-intel/path`, query), { credentials: 'same-origin' });
   },
+  codeIntelReleases(query) {
+    return fetch(withQuery(`/v1/code-intel/releases`, query), { credentials: 'same-origin' });
+  },
   codeIntelTraceDiff(query) {
     return fetch(withQuery(`/v1/code-intel/trace-diff`, query), { credentials: 'same-origin' });
+  },
+  codeIntelVolume(query) {
+    return fetch(withQuery(`/v1/code-intel/volume`, query), { credentials: 'same-origin' });
   },
   consoleChunksByChunkDigest(chunkDigest, query) {
     return fetch(withQuery(`/v1/console/chunks/${encodeURIComponent(chunkDigest)}`, query), { credentials: 'same-origin' });

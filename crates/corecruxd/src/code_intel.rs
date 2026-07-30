@@ -453,6 +453,7 @@ mod tests {
             symbol_id: Some(format!("sym_{name}")),
             join: "extracted".into(),
             tenant_id: String::new(),
+            release: String::new(),
             stored_at_unix_ms: 1_000 + id,
         }
     }
