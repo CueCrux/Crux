@@ -70,6 +70,11 @@ pub struct McpContext {
     /// `agent`, this is already a passport/automation principal and must not be
     /// reinterpreted through the MCP agent-name mapping.
     pub(crate) bound_request_principal: Option<String>,
+    /// True only when the outer transport cryptographically verified that the
+    /// bound request principal is a canonical passport. A stable JWT subject
+    /// is still authoritative, but it must not be upgraded into a passport
+    /// claim when MCP tools call the daemon over loopback.
+    pub(crate) bound_request_principal_is_canonical_passport: bool,
     /// Distinguishes a native MCP context (`false`) from an outer transport
     /// that authenticated a request but could not bind a principal (`true`
     /// with `bound_request_principal = None`). Without this bit, an
@@ -78,6 +83,12 @@ pub struct McpContext {
     pub(crate) request_authority_bound: bool,
     /// Concrete tenant resolved by the authenticating transport.
     pub(crate) request_tenant: Option<String>,
+    /// Exact opaque bearer authenticated by the native MCP transport for this
+    /// request. It is retained only long enough for authority-sensitive
+    /// loopback calls (session mint + coordination announce) to use the same
+    /// immutable credential subject end to end. Debug output deliberately
+    /// never exposes this field.
+    pub(crate) request_loopback_bearer_token: Option<String>,
     /// Daemon data directory — needed by tools that read on-disk artifacts
     /// the HTTP routes produced (e.g. observation JSONL files). `None` in
     /// test contexts; populated by `corecruxd::main` from `AppState.data_dir`.
@@ -158,8 +169,10 @@ impl McpContext {
             rcx_router: None,
             tool_name_allowlist: None,
             bound_request_principal: None,
+            bound_request_principal_is_canonical_passport: false,
             request_authority_bound: false,
             request_tenant: None,
+            request_loopback_bearer_token: None,
             data_dir: None,
             passport_public_key_hex: None,
             entity_store: Arc::new(RwLock::new(EntityStore::new())),
@@ -200,8 +213,10 @@ impl McpContext {
             rcx_router: None,
             tool_name_allowlist: None,
             bound_request_principal: None,
+            bound_request_principal_is_canonical_passport: false,
             request_authority_bound: false,
             request_tenant: None,
+            request_loopback_bearer_token: None,
             data_dir: None,
             passport_public_key_hex: None,
             entity_store: Arc::new(RwLock::new(EntityStore::new())),
@@ -253,8 +268,10 @@ impl McpContext {
             rcx_router: self.rcx_router.clone(),
             tool_name_allowlist: self.tool_name_allowlist.clone(),
             bound_request_principal: self.bound_request_principal.clone(),
+            bound_request_principal_is_canonical_passport: self.bound_request_principal_is_canonical_passport,
             request_authority_bound: self.request_authority_bound,
             request_tenant: self.request_tenant.clone(),
+            request_loopback_bearer_token: self.request_loopback_bearer_token.clone(),
             data_dir: self.data_dir.clone(),
             passport_public_key_hex: self.passport_public_key_hex.clone(),
             entity_store: Arc::clone(&self.entity_store),
@@ -443,9 +460,32 @@ impl McpContext {
     /// intentionally separate from `agent`: an HTTP passport is not an MCP
     /// token-name and must not be remapped through `agent_passport_map`.
     pub fn with_request_authority(mut self, principal: Option<String>, tenant: impl Into<String>) -> Self {
+        self.bound_request_principal_is_canonical_passport = false;
         self.bound_request_principal = principal;
         self.request_authority_bound = true;
         self.request_tenant = Some(tenant.into());
+        self
+    }
+
+    /// Bind outer-transport authority while retaining whether the principal
+    /// was a canonical passport claim or only a stable credential subject.
+    pub fn with_request_authority_provenance(
+        mut self,
+        principal: Option<String>,
+        tenant: impl Into<String>,
+        canonical_passport: bool,
+    ) -> Self {
+        self.bound_request_principal_is_canonical_passport = principal.is_some() && canonical_passport;
+        self.bound_request_principal = principal;
+        self.request_authority_bound = true;
+        self.request_tenant = Some(tenant.into());
+        self
+    }
+
+    /// Retain the exact static MCP bearer for this request. This is transient
+    /// authority material, never serialized or included in `Debug`.
+    pub(crate) fn with_request_loopback_bearer_token(mut self, token: Option<String>) -> Self {
+        self.request_loopback_bearer_token = token;
         self
     }
 
@@ -459,6 +499,23 @@ impl McpContext {
     /// the daemon's shared MCP agent.
     pub fn request_principal(&self) -> Option<&str> {
         self.bound_request_principal.as_deref()
+    }
+
+    /// Whether [`Self::authority_identity`] denotes a canonical passport.
+    pub fn authority_is_canonical_passport(&self) -> bool {
+        if self.request_authority_bound {
+            return self.bound_request_principal.is_some() && self.bound_request_principal_is_canonical_passport;
+        }
+        let Some(agent) = self.agent.as_ref() else {
+            return false;
+        };
+        self.agent_passports_enabled
+            && crate::agent_passport::resolve_agent_passport(&agent.name, &self.agent_passport_map).is_some()
+    }
+
+    /// Exact static MCP bearer authenticated for this request, if any.
+    pub(crate) fn request_loopback_bearer_token(&self) -> Option<&str> {
+        self.request_loopback_bearer_token.as_deref()
     }
 
     /// Apply an immutable per-request exact-name ceiling. Dispatch and
@@ -704,7 +761,14 @@ async fn dispatch_tool_call(
             let result = crate::envelope::normalize_result_shape(result);
             JsonRpcResponse::success(id, result)
         }
-        Err(e) => JsonRpcResponse::error(id, e.code, e.message),
+        Err(error) => tool_error_response(id, error),
+    }
+}
+
+fn tool_error_response(id: Option<serde_json::Value>, error: crate::protocol::JsonRpcError) -> JsonRpcResponse {
+    match error.data {
+        Some(data) => JsonRpcResponse::error_with_data(id, error.code, error.message, data),
+        None => JsonRpcResponse::error(id, error.code, error.message),
     }
 }
 
@@ -977,6 +1041,21 @@ mod tests {
             method: method.to_string(),
             params,
         }
+    }
+
+    #[test]
+    fn tool_error_response_preserves_structured_data() {
+        let response = tool_error_response(
+            Some(json!(7)),
+            crate::protocol::JsonRpcError {
+                code: INVALID_PARAMS,
+                message: "daemon returned 403".to_string(),
+                data: Some(json!({"status": 403, "body": "forbidden"})),
+            },
+        );
+        let error = response.error.expect("JSON-RPC error");
+        assert_eq!(error.code, INVALID_PARAMS);
+        assert_eq!(error.data.as_ref().and_then(|data| data["status"].as_u64()), Some(403));
     }
 
     #[tokio::test]

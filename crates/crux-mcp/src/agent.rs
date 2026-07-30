@@ -10,12 +10,47 @@
 //! environment variables at startup.
 
 use std::env;
+use std::sync::OnceLock;
 
+use rand::Rng as _;
 use subtle::ConstantTimeEq;
 
 const MIN_AGENT_TOKEN_BYTES: usize = 32;
 const MAX_AGENT_TOKEN_BYTES: usize = 256;
 const MAX_AGENT_NAME_BYTES: usize = 64;
+
+/// Header used only by in-process MCP→daemon loopback calls. Its value proves
+/// that the registered agent bearer crossed the embedded MCP boundary; it is
+/// not derived from the bearer and cannot be forged by an external holder.
+pub const INTERNAL_LOOPBACK_AGENT_PROOF_HEADER: &str = "x-corecrux-internal-agent-proof";
+
+static INTERNAL_LOOPBACK_PROOF_KEY: OnceLock<[u8; 32]> = OnceLock::new();
+
+fn internal_loopback_proof_key() -> &'static [u8; 32] {
+    INTERNAL_LOOPBACK_PROOF_KEY.get_or_init(|| {
+        let mut key = [0_u8; 32];
+        rand::rng().fill_bytes(&mut key);
+        key
+    })
+}
+
+/// Mint an unforgeable process-local proof for one registered bearer.
+///
+/// This deliberately works only when MCP and corecruxd share a process. It
+/// lets the daemon preserve opaque agent-token provenance on its internal HTTP
+/// loopback without enabling those tokens on the public HTTP listener.
+pub fn internal_loopback_agent_proof(token: &str) -> String {
+    let mut hasher = blake3::Hasher::new_keyed(internal_loopback_proof_key());
+    hasher.update(b"cuecrux.internal-agent-loopback.v1\0");
+    hasher.update(blake3::hash(token.as_bytes()).as_bytes());
+    hex::encode(hasher.finalize().as_bytes())
+}
+
+/// Verify a process-local proof in constant time.
+pub fn verify_internal_loopback_agent_proof(token: &str, proof: &str) -> bool {
+    let expected = internal_loopback_agent_proof(token);
+    expected.as_bytes().ct_eq(proof.trim().as_bytes()).unwrap_u8() == 1
+}
 
 /// A registered agent identity.
 #[derive(Debug, Clone)]

@@ -2433,7 +2433,7 @@ pub(super) async fn get_console_sessions(
     headers: HeaderMap,
     Query(query): Query<ConsoleSessionsQuery>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_console_read(&state, &headers) {
+    if let Err(problem) = require_console_global_read(&state, &headers) {
         return problem.into_response();
     }
 
@@ -2743,7 +2743,7 @@ pub(super) async fn get_console_session_detail(
     Query(query): Query<ConsoleSessionDetailQuery>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_console_read(&state, &headers) {
+    if let Err(problem) = require_console_global_read(&state, &headers) {
         return problem.into_response();
     }
 
@@ -3230,6 +3230,23 @@ pub(super) async fn get_console_chunk_preview(
 #[allow(clippy::result_large_err)]
 fn require_console_read(state: &AppState, headers: &HeaderMap) -> Result<(), crate::problem::ProblemResponse> {
     require_http_scopes(&state.auth, headers, &["admin:read"])
+}
+
+#[allow(clippy::result_large_err)]
+fn require_console_global_read(state: &AppState, headers: &HeaderMap) -> Result<(), crate::problem::ProblemResponse> {
+    require_console_read(state, headers)?;
+    let context = crate::auth::passport_bound_context(&state.auth, headers)?;
+    if !context.has_global_tenant_authority() {
+        return Err(crate::problem::ProblemResponse(
+            corecrux_types::ProblemDetails::forbidden(
+                "the global console session inventory requires cross-tenant admin authority",
+            )
+            .with_extensions(serde_json::json!({
+                "code": "GLOBAL_TENANT_AUTHORITY_REQUIRED",
+            })),
+        ));
+    }
+    Ok(())
 }
 
 /// Opt-in for returning the raw agent token from `GET /v1/console/connections`.
@@ -3957,9 +3974,81 @@ mod session_detail_tests {
         super::super::tests::test_app_state(16)
     }
 
+    const JWT_SECRET: &[u8] = b"console-session-test-secret-at-least-32-bytes";
+    const JWT_ISSUER: &str = "console-session-tests";
+    const JWT_AUDIENCE: &str = "corecrux";
+
+    fn admin_headers(tenant: &str) -> HeaderMap {
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_secs()
+            .saturating_add(3_600);
+        let claims = json!({
+            "exp": exp,
+            "iss": JWT_ISSUER,
+            "aud": JWT_AUDIENCE,
+            "scope": "admin:read",
+            "sub": "console-admin",
+            "tenant_id": tenant,
+        });
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(JWT_SECRET),
+        )
+        .expect("test JWT");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().expect("bearer"),
+        );
+        headers
+    }
+
     async fn body_json(resp: Response) -> Value {
         let bytes = to_bytes(resp.into_body(), 1 << 20).await.expect("read body");
         serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    }
+
+    #[tokio::test]
+    async fn global_session_console_rejects_tenant_bound_admin() {
+        let mut state = st();
+        state.auth = crate::auth::Authz::test_hs256(JWT_SECRET, JWT_ISSUER, JWT_AUDIENCE);
+        state
+            .session_store
+            .write()
+            .await
+            .put("tenant-b-secret-session", json!({"secret": "tenant-b"}), None);
+
+        let list = get_console_sessions(
+            State(state.clone()),
+            admin_headers("tenant-a"),
+            Query(ConsoleSessionsQuery { include_archived: true }),
+        )
+        .await
+        .into_response();
+        assert_eq!(list.status(), StatusCode::FORBIDDEN);
+
+        let detail = get_console_session_detail(
+            State(state.clone()),
+            Query(ConsoleSessionDetailQuery {
+                key: "tenant-b-secret-session".to_string(),
+            }),
+            admin_headers("tenant-a"),
+        )
+        .await
+        .into_response();
+        assert_eq!(detail.status(), StatusCode::FORBIDDEN);
+
+        let global = get_console_sessions(
+            State(state),
+            admin_headers("*"),
+            Query(ConsoleSessionsQuery { include_archived: true }),
+        )
+        .await
+        .into_response();
+        assert_eq!(global.status(), StatusCode::OK);
     }
 
     /// Store a work-transition fact the way `work::transition_store_fact` does,

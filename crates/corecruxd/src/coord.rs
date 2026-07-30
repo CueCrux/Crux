@@ -54,6 +54,10 @@ pub const DEFAULT_INTENT_TTL_SECS: u64 = 14_400;
 /// can't pin a stale row on the board for a month.
 pub const MAX_TTL_SECS: u64 = 86_400;
 
+fn default_tenant_id() -> String {
+    "default".to_string()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CoordError {
     #[error(transparent)]
@@ -68,6 +72,11 @@ pub struct CoordIntent {
     pub project_id: String,
     pub session_id_hex: String,
     pub passport_id: String,
+    /// Tenant copied from the authoritative session binding. Legacy intent
+    /// rows predate this field and deserialize into `default`, where they
+    /// remain visible only to that tenant until the session re-announces.
+    #[serde(default = "default_tenant_id")]
+    pub tenant_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execplan_slug: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -101,7 +110,7 @@ impl CoordIntent {
 pub fn write_intent(store: &mut FactStore, intent: &CoordIntent) -> Result<(), CoordError> {
     let value = serde_json::to_string(intent)?;
     let mut sf = StoreFact {
-        tenant_hash: "default".to_string(),
+        tenant_hash: intent.tenant_id.clone(),
         entity: format!(
             "{COORD_ENTITY_PREFIX}::{}::{}",
             intent.project_id, intent.session_id_hex
@@ -119,17 +128,28 @@ pub fn write_intent(store: &mut FactStore, intent: &CoordIntent) -> Result<(), C
     Ok(())
 }
 
-/// List the latest intent per session, optionally scoped to one project.
+/// List the latest intent per session across tenants, optionally scoped to one
+/// project. Internal operator views use this compatibility form; request
+/// surfaces should prefer [`list_intents_for_tenant`].
 /// Includes expired intents — callers filter with [`CoordIntent::is_live`]
 /// (the active view does; an audit reader may want the stale ones).
 pub fn list_intents(store: &FactStore, project_id: Option<&str>) -> Vec<CoordIntent> {
+    list_intents_inner(store, project_id, None)
+}
+
+/// Request-safe intent read scoped to exactly one authorized tenant.
+pub fn list_intents_for_tenant(store: &FactStore, project_id: Option<&str>, tenant_id: &str) -> Vec<CoordIntent> {
+    list_intents_inner(store, project_id, Some(tenant_id))
+}
+
+fn list_intents_inner(store: &FactStore, project_id: Option<&str>, tenant_id: Option<&str>) -> Vec<CoordIntent> {
     let prefix = match project_id {
         Some(pid) => format!("{COORD_ENTITY_PREFIX}::{pid}::"),
         None => format!("{COORD_ENTITY_PREFIX}::"),
     };
     let result = store.query(&FactQuery {
         min_effective_confidence: None,
-        tenant_hash: None,
+        tenant_hash: tenant_id.map(str::to_string),
         query: None,
         entity: None,
         entity_prefix: Some(prefix),
@@ -142,7 +162,9 @@ pub fn list_intents(store: &FactStore, project_id: Option<&str>) -> Vec<CoordInt
             continue;
         }
         if let Ok(intent) = serde_json::from_str::<CoordIntent>(&fact.value) {
-            out.push(intent);
+            if tenant_id.is_none_or(|tenant_id| intent.tenant_id == tenant_id) {
+                out.push(intent);
+            }
         }
     }
     out.sort_by(|a, b| b.announced_at_unix_ms.cmp(&a.announced_at_unix_ms));
@@ -214,7 +236,10 @@ pub fn find_overlaps(
 ) -> Vec<OverlapWarning> {
     let mut out = Vec::new();
     for peer in peer_intents {
-        if peer.session_id_hex == announced.session_id_hex || !peer.is_live(now_unix_ms) {
+        if peer.tenant_id != announced.tenant_id
+            || peer.session_id_hex == announced.session_id_hex
+            || !peer.is_live(now_unix_ms)
+        {
             continue;
         }
         if let (Some(mine), Some(theirs)) = (announced.execplan_slug.as_deref(), peer.execplan_slug.as_deref()) {
@@ -260,7 +285,7 @@ pub fn find_overlaps(
         }
     }
     for lease in leases {
-        if lease.holder_passport == announced.passport_id {
+        if lease.tenant_id != announced.tenant_id || lease.holder_passport == announced.passport_id {
             continue;
         }
         let lease_path = lease_resource_path(&lease.resource);
@@ -346,6 +371,7 @@ pub struct LeaseSummary {
     pub resource: String,
     pub mode: String,
     pub holder_passport: String,
+    pub tenant_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub expires_at_unix_ms: i64,
@@ -403,6 +429,7 @@ pub fn assemble_active(
     intents: &[CoordIntent],
     leases: &[LeaseSummary],
     work_in_flight: Vec<crate::work::WorkItem>,
+    tenant_id: &str,
     project_id: Option<&str>,
     presence_ttl_secs: u64,
     now_unix_ms: u64,
@@ -410,6 +437,9 @@ pub fn assemble_active(
     let ttl_ms = presence_ttl_secs.saturating_mul(1000);
     let mut active_sessions = Vec::new();
     for b in bindings {
+        if b.tenant_id != tenant_id {
+            continue;
+        }
         let Some(&last_seen) = presence_by_passport.get(&b.passport_id) else {
             continue;
         };
@@ -424,7 +454,7 @@ pub fn assemble_active(
         }
         let intent = intents
             .iter()
-            .find(|i| i.session_id_hex == b.session_id_hex && i.is_live(now_unix_ms))
+            .find(|i| i.tenant_id == tenant_id && i.session_id_hex == b.session_id_hex && i.is_live(now_unix_ms))
             .cloned();
         // Per-session recency gate. Presence is passport-level and bindings
         // are kept forever (newest per session), so "passport live" alone
@@ -439,7 +469,7 @@ pub fn assemble_active(
         }
         let session_leases: Vec<LeaseSummary> = leases
             .iter()
-            .filter(|l| l.holder_passport == b.passport_id)
+            .filter(|l| l.tenant_id == tenant_id && l.holder_passport == b.passport_id)
             .cloned()
             .collect();
         active_sessions.push(CoordSessionView {
@@ -493,6 +523,7 @@ mod tests {
             project_id: "proj".to_string(),
             session_id_hex: session.to_string(),
             passport_id: "p".to_string(),
+            tenant_id: "personal".to_string(),
             execplan_slug: Some(slug.to_string()),
             milestone: None,
             deploy_target: None,
@@ -509,6 +540,7 @@ mod tests {
             resource: resource.to_string(),
             mode: "modify".to_string(),
             holder_passport: holder.to_string(),
+            tenant_id: "personal".to_string(),
             reason: None,
             expires_at_unix_ms: i64::MAX,
         }
@@ -553,7 +585,7 @@ mod tests {
         let mut presence = BTreeMap::new();
         presence.insert("p1".to_string(), now - 10_000); // 10s ago — live
         presence.insert("p2".to_string(), now - 2_000_000); // long gone (>15 min)
-        let view = assemble_active(&bindings, &presence, &[], &[], vec![], None, 900, now);
+        let view = assemble_active(&bindings, &presence, &[], &[], vec![], "personal", None, 900, now);
         assert_eq!(view.active_sessions.len(), 1);
         assert_eq!(view.active_sessions[0].session_id_hex, "aaaa");
         assert_eq!(view.active_sessions[0].active_until_unix_ms, now - 10_000 + 900_000);
@@ -563,7 +595,7 @@ mod tests {
     fn assemble_drops_sessions_with_no_presence_row() {
         let bindings = vec![binding("aaaa", "p1", None, 100)];
         let presence = BTreeMap::new();
-        let view = assemble_active(&bindings, &presence, &[], &[], vec![], None, 900, 1_000);
+        let view = assemble_active(&bindings, &presence, &[], &[], vec![], "personal", None, 900, 1_000);
         assert!(view.active_sessions.is_empty());
     }
 
@@ -579,7 +611,17 @@ mod tests {
         for p in ["p1", "p2", "p3"] {
             presence.insert(p.to_string(), now - 1_000);
         }
-        let view = assemble_active(&bindings, &presence, &[], &[], vec![], Some("proj"), 900, now);
+        let view = assemble_active(
+            &bindings,
+            &presence,
+            &[],
+            &[],
+            vec![],
+            "personal",
+            Some("proj"),
+            900,
+            now,
+        );
         let ids: Vec<&str> = view.active_sessions.iter().map(|s| s.session_id_hex.as_str()).collect();
         assert!(ids.contains(&"aaaa"), "project match kept");
         assert!(ids.contains(&"cccc"), "unscoped session kept");
@@ -601,7 +643,17 @@ mod tests {
             intent("bbbb", "expired-plan", now - 1), // expired — must not surface
         ];
         let leases = vec![lease("p1", "file://src/a.rs"), lease("p2", "tree://src/b")];
-        let view = assemble_active(&bindings, &presence, &intents, &leases, vec![], None, 900, now);
+        let view = assemble_active(
+            &bindings,
+            &presence,
+            &intents,
+            &leases,
+            vec![],
+            "personal",
+            None,
+            900,
+            now,
+        );
         let a = view
             .active_sessions
             .iter()
@@ -638,13 +690,13 @@ mod tests {
         let mut presence = BTreeMap::new();
         presence.insert("p1".to_string(), now - 1_000); // passport is live
                                                         // No intents: only the fresh boot shows.
-        let view = assemble_active(&bindings, &presence, &[], &[], vec![], None, 900, now);
+        let view = assemble_active(&bindings, &presence, &[], &[], vec![], "personal", None, 900, now);
         let ids: Vec<&str> = view.active_sessions.iter().map(|s| s.session_id_hex.as_str()).collect();
         assert_eq!(ids, vec!["fresh"], "stale bindings dropped: {ids:?}");
 
         // A live intent revives exactly that old session.
         let intents = vec![intent("old1", "still-working", now + 100_000)];
-        let view = assemble_active(&bindings, &presence, &intents, &[], vec![], None, 900, now);
+        let view = assemble_active(&bindings, &presence, &intents, &[], vec![], "personal", None, 900, now);
         let ids: Vec<&str> = view.active_sessions.iter().map(|s| s.session_id_hex.as_str()).collect();
         assert!(ids.contains(&"old1"), "live intent keeps old session: {ids:?}");
         assert!(!ids.contains(&"old2"), "intent-less old session still dropped");
@@ -758,7 +810,7 @@ mod tests {
         let mut presence = BTreeMap::new();
         presence.insert("p1".to_string(), now - 50_000);
         presence.insert("p2".to_string(), now - 1_000);
-        let view = assemble_active(&bindings, &presence, &[], &[], vec![], None, 900, now);
+        let view = assemble_active(&bindings, &presence, &[], &[], vec![], "personal", None, 900, now);
         assert_eq!(view.active_sessions[0].session_id_hex, "bbbb");
     }
 }
@@ -772,6 +824,7 @@ mod collision_signal_tests {
             project_id: "p".into(),
             session_id_hex: session.into(),
             passport_id: passport.into(),
+            tenant_id: "personal".into(),
             execplan_slug: slug.map(str::to_string),
             milestone: None,
             deploy_target: None,
@@ -801,6 +854,7 @@ mod collision_signal_tests {
             resource: "file://src/lib.rs".into(),
             mode: "modify".into(),
             holder_passport: "peer".into(),
+            tenant_id: "personal".into(),
             reason: None,
             expires_at_unix_ms: i64::MAX,
         }];

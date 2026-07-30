@@ -114,14 +114,14 @@ pub struct Authz {
     mode: AuthMode,
     jwt_hs256: Option<JwtHs256Config>,
     jwt_jwks: Option<JwtJwksConfig>,
-    /// Opt-in: under a JWT mode, also accept a registered MCP agent token
-    /// (`CRUX_AGENT_TOKENS`) on HTTP so a single credential unlocks both the
-    /// HTTP API and the MCP plane. `None` unless `CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS`
-    /// is enabled.
+    /// Under a JWT mode, recognize registered MCP agent tokens
+    /// (`CRUX_AGENT_TOKENS`) for authenticated in-process MCP→daemon loopback.
+    /// Direct HTTP acceptance remains opt-in via
+    /// `CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS`.
     agent_http: Option<AgentTokenHttpConfig>,
 }
 
-/// Opt-in HTTP acceptance of MCP agent tokens (see [`Authz::agent_http`]).
+/// HTTP recognition of MCP agent tokens (see [`Authz::agent_http`]).
 ///
 /// Agent tokens carry no claims, so every accepted agent token maps to the same
 /// operator-configured scope set + tenant binding (`CORECRUXD_AGENT_TOKEN_HTTP_SCOPES`
@@ -132,6 +132,7 @@ struct AgentTokenHttpConfig {
     scopes: BTreeSet<String>,
     tenants: TenantAllow,
     passport_map: Option<crux_mcp::agent_passport::AgentPassportMap>,
+    remote_http_allowed: bool,
 }
 
 /// Env flag enabling HTTP acceptance of MCP agent tokens. Default off.
@@ -143,11 +144,12 @@ fn env_truthy(name: &str) -> bool {
         .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
 }
 
-/// Build the agent-token HTTP config from env, or `None` if disabled / no tokens.
+/// Build the agent-token HTTP config from env, or `None` if no tokens exist.
+///
+/// The registry is loaded even when direct HTTP acceptance is disabled so the
+/// embedded MCP server can preserve opaque agent-token provenance on its
+/// authenticated loopback calls.
 fn build_agent_http_config() -> Option<AgentTokenHttpConfig> {
-    if !env_truthy(HTTP_ACCEPT_AGENT_TOKENS_ENV) {
-        return None;
-    }
     // Fail closed: if the agent-token env is present but invalid, `from_env`
     // returns Err. Treat that as "no usable registry" here (HTTP agent-token
     // auth stays disabled = deny); startup is independently gated in `main`.
@@ -171,13 +173,13 @@ fn build_agent_http_config() -> Option<AgentTokenHttpConfig> {
         scopes,
         tenants,
         passport_map,
+        remote_http_allowed: env_truthy(HTTP_ACCEPT_AGENT_TOKENS_ENV),
     })
 }
 
 fn default_agent_http_scopes() -> BTreeSet<String> {
     [
-        "admin:read",
-        "admin:write",
+        "facts:read",
         "facts:write",
         "query:read",
         "sessions:read",
@@ -207,9 +209,8 @@ fn tenant_allow_from_str(raw: &str) -> TenantAllow {
 }
 
 impl AgentTokenHttpConfig {
-    /// If `token` is a registered agent token, return an `AuthContext` carrying
-    /// the configured scopes + tenant binding, attributed to the agent name.
-    fn try_auth(&self, token: &str) -> Option<AuthContext> {
+    /// Resolve a registered token as an automation principal.
+    fn registered_context(&self, token: &str) -> Option<AuthContext> {
         self.registry.lookup(token).and_then(|agent| {
             // An opaque agent-token name is an automation principal, not a
             // passport. Namespace it unless the operator explicitly supplied
@@ -245,6 +246,25 @@ impl AgentTokenHttpConfig {
                 credential_is_agent_token: true,
             })
         })
+    }
+
+    /// Authenticate an embedded MCP→daemon call. Proof validation happens
+    /// before JWT parsing so a JWT-shaped registered token retains its native
+    /// agent identity on the internal credential rail.
+    fn try_internal_auth(&self, token: &str, proof: &str) -> Option<AuthContext> {
+        if !crux_mcp::agent::verify_internal_loopback_agent_proof(token, proof) {
+            return None;
+        }
+        self.registered_context(token)
+    }
+
+    /// Authenticate a direct HTTP caller only when the operator enabled that
+    /// compatibility rail.
+    fn try_remote_auth(&self, token: &str) -> Option<AuthContext> {
+        if !self.remote_http_allowed {
+            return None;
+        }
+        self.registered_context(token)
     }
 }
 
@@ -876,6 +896,9 @@ fn require_tenant_allowed(tenant_allow: &TenantAllow, tenant_id: &str) -> Result
 
 #[allow(clippy::result_large_err)]
 fn http_ctx(auth: &Authz, headers: &HeaderMap) -> Result<AuthContext, ProblemResponse> {
+    let internal_agent_proof = headers
+        .get(crux_mcp::agent::INTERNAL_LOOPBACK_AGENT_PROOF_HEADER)
+        .and_then(|value| value.to_str().ok());
     match auth.mode {
         AuthMode::Off => Ok(AuthContext {
             subject: None,
@@ -918,12 +941,19 @@ fn http_ctx(auth: &Authz, headers: &HeaderMap) -> Result<AuthContext, ProblemRes
                     }),
                 ))
             })?;
+            if let Some(context) = internal_agent_proof.and_then(|proof| {
+                auth.agent_http
+                    .as_ref()
+                    .and_then(|agent_http| agent_http.try_internal_auth(&token, proof))
+            }) {
+                return Ok(context);
+            }
             match verify_jwt_hs256(cfg, &token) {
                 Ok(ctx) => Ok(ctx),
                 Err(msg) => auth
                     .agent_http
                     .as_ref()
-                    .and_then(|a| a.try_auth(&token))
+                    .and_then(|a| a.try_remote_auth(&token))
                     .ok_or_else(|| {
                         ProblemResponse(ProblemDetails::unauthorized("invalid bearer token").with_extensions(
                             serde_json::json!({
@@ -949,12 +979,19 @@ fn http_ctx(auth: &Authz, headers: &HeaderMap) -> Result<AuthContext, ProblemRes
                     }),
                 ))
             })?;
+            if let Some(context) = internal_agent_proof.and_then(|proof| {
+                auth.agent_http
+                    .as_ref()
+                    .and_then(|agent_http| agent_http.try_internal_auth(&token, proof))
+            }) {
+                return Ok(context);
+            }
             match verify_jwt_jwks(cfg, &token) {
                 Ok(ctx) => Ok(ctx),
                 Err(msg) => auth
                     .agent_http
                     .as_ref()
-                    .and_then(|a| a.try_auth(&token))
+                    .and_then(|a| a.try_remote_auth(&token))
                     .ok_or_else(|| {
                         ProblemResponse(ProblemDetails::unauthorized("invalid bearer token").with_extensions(
                             serde_json::json!({
@@ -1179,6 +1216,36 @@ impl HttpScopeContext {
     /// four-eyes decision.
     pub(crate) fn credential_is_agent_token(&self) -> bool {
         self.credential_is_agent_token
+    }
+
+    /// Stable actor namespace for an authenticated authority-sensitive write.
+    /// A canonical passport claim retains its passport id; registered agent
+    /// tokens retain their mapped passport or `agent:<name>` automation id;
+    /// all other subject-only credentials are explicitly namespaced so their
+    /// `sub` cannot collide with a real passport of the same spelling.
+    pub(crate) fn verified_authority_actor(&self) -> Option<String> {
+        if self.canonical_passport_claim_verified {
+            return self
+                .passport_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|identity| !identity.is_empty())
+                .map(str::to_string);
+        }
+        if self.credential_is_agent_token {
+            return self
+                .passport_id
+                .as_deref()
+                .or(self.verified_credential_identity.as_deref())
+                .map(str::trim)
+                .filter(|identity| !identity.is_empty())
+                .map(str::to_string);
+        }
+        self.verified_credential_identity
+            .as_deref()
+            .map(str::trim)
+            .filter(|identity| !identity.is_empty())
+            .map(|identity| format!("principal:{identity}"))
     }
 
     /// Tenant to stamp on an HTTP write (OD-37). `Ok(None)` → default tenant.
@@ -1655,6 +1722,7 @@ mod tests {
         let context = passport_bound_context(&auth, &headers).expect("agent token context");
         assert_eq!(context.passport_id.as_deref(), Some("agent:drivew"));
         assert!(context.credential_is_agent_token());
+        assert_eq!(context.verified_authority_actor().as_deref(), Some("agent:drivew"));
 
         // A bogus bearer is still rejected.
         let mut bad = HeaderMap::new();
@@ -1750,6 +1818,134 @@ mod tests {
 
         std::env::remove_var("CORECRUXD_JWT_HS256_SECRET");
         std::env::remove_var("CRUX_AGENT_TOKENS");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn agent_token_accepted_only_with_process_local_proof_when_http_disabled() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+
+        const AGENT_TOK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
+        const OTHER_TOK: &str = "abcdef0123456789abcdef0123456789abcdef0123456789";
+        std::env::set_var("CORECRUXD_JWT_HS256_SECRET", TEST_HS256_SECRET);
+        std::env::remove_var(ALLOW_WEAK_HS256_SECRET_ENV);
+        std::env::remove_var("CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS");
+        std::env::set_var("CRUX_AGENT_TOKENS", format!("drivew:{AGENT_TOK},other:{OTHER_TOK}"));
+        std::env::set_var("CORECRUXD_AGENT_TOKEN_HTTP_SCOPES", "query:read");
+        std::env::set_var("CORECRUXD_AGENT_TOKEN_HTTP_TENANT", "tenant-a");
+
+        let auth = Authz::from_env(AuthMode::JwtHs256).expect("auth from env");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {AGENT_TOK}").parse().unwrap(),
+        );
+        assert!(require_http_scopes(&auth, &headers, &["query:read"]).is_err());
+
+        headers.insert(
+            crux_mcp::agent::INTERNAL_LOOPBACK_AGENT_PROOF_HEADER,
+            "random-untrusted-proof".parse().expect("random proof header"),
+        );
+        assert!(require_http_scopes(&auth, &headers, &["query:read"]).is_err());
+
+        headers.insert(
+            crux_mcp::agent::INTERNAL_LOOPBACK_AGENT_PROOF_HEADER,
+            crux_mcp::agent::internal_loopback_agent_proof(OTHER_TOK)
+                .parse()
+                .expect("cross-token proof header"),
+        );
+        assert!(require_http_scopes(&auth, &headers, &["query:read"]).is_err());
+
+        headers.insert(
+            crux_mcp::agent::INTERNAL_LOOPBACK_AGENT_PROOF_HEADER,
+            crux_mcp::agent::internal_loopback_agent_proof(AGENT_TOK)
+                .parse()
+                .expect("proof header"),
+        );
+        let context = passport_bound_context(&auth, &headers).expect("internal loopback accepted");
+        assert_eq!(context.passport_id.as_deref(), Some("agent:drivew"));
+        assert!(context.credential_is_agent_token());
+
+        for key in [
+            "CORECRUXD_JWT_HS256_SECRET",
+            "CRUX_AGENT_TOKENS",
+            "CORECRUXD_AGENT_TOKEN_HTTP_SCOPES",
+            "CORECRUXD_AGENT_TOKEN_HTTP_TENANT",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn valid_internal_proof_precedes_jwt_parsing_for_registered_jwt_shaped_token() {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+
+        std::env::set_var("CORECRUXD_JWT_HS256_SECRET", TEST_HS256_SECRET);
+        std::env::remove_var(ALLOW_WEAK_HS256_SECRET_ENV);
+        std::env::remove_var("CORECRUXD_JWT_ISS");
+        std::env::remove_var("CORECRUXD_JWT_AUD");
+        std::env::remove_var("CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS");
+        std::env::set_var("CORECRUXD_AGENT_TOKEN_HTTP_SCOPES", "query:read");
+        std::env::set_var("CORECRUXD_AGENT_TOKEN_HTTP_TENANT", "tenant-a");
+
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &serde_json::json!({
+                "sub": "agent:native",
+                "scope": "query:read",
+                "tenant_id": "tenant-a",
+                "exp": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_secs()
+                    + 3600,
+            }),
+            &EncodingKey::from_secret(TEST_HS256_SECRET.as_bytes()),
+        )
+        .expect("JWT-shaped agent token");
+        assert!(token.len() <= 256, "agent token policy must accept fixture");
+        std::env::set_var("CRUX_AGENT_TOKENS", format!("native:{token}"));
+
+        let auth = Authz::from_env(AuthMode::JwtHs256).expect("auth from env");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().expect("bearer header"),
+        );
+
+        let jwt_context = passport_bound_context(&auth, &headers).expect("ordinary JWT accepted");
+        assert!(!jwt_context.credential_is_agent_token());
+        assert_eq!(
+            jwt_context.verified_authority_actor().as_deref(),
+            Some("principal:agent:native")
+        );
+
+        headers.insert(
+            crux_mcp::agent::INTERNAL_LOOPBACK_AGENT_PROOF_HEADER,
+            crux_mcp::agent::internal_loopback_agent_proof(&token)
+                .parse()
+                .expect("proof header"),
+        );
+        let agent_context = passport_bound_context(&auth, &headers).expect("proved agent token accepted");
+        assert!(agent_context.credential_is_agent_token());
+        assert_eq!(
+            agent_context.verified_authority_actor().as_deref(),
+            Some("agent:native")
+        );
+
+        for key in [
+            "CORECRUXD_JWT_HS256_SECRET",
+            "CRUX_AGENT_TOKENS",
+            "CORECRUXD_AGENT_TOKEN_HTTP_SCOPES",
+            "CORECRUXD_AGENT_TOKEN_HTTP_TENANT",
+        ] {
+            std::env::remove_var(key);
+        }
     }
 
     #[test]
@@ -2037,6 +2233,22 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
                 "expected Off for alias '{alias}'"
             );
         }
+    }
+
+    #[test]
+    fn default_agent_http_scopes_are_automation_only() {
+        let scopes = default_agent_http_scopes();
+        for required in [
+            "facts:read",
+            "facts:write",
+            "query:read",
+            "sessions:read",
+            "sessions:write",
+        ] {
+            assert!(scopes.contains(required), "missing {required}");
+        }
+        assert!(!scopes.contains("admin:read"));
+        assert!(!scopes.contains("admin:write"));
     }
 
     #[test]
@@ -2798,6 +3010,25 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
         headers.insert("x-corecrux-passport-id", "passport-a".parse().unwrap());
         let ctx = passport_bound_context(&auth, &headers).expect("matching header");
         assert_eq!(ctx.passport_id.as_deref(), Some("passport-a"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn subject_only_jwt_cannot_collide_with_agent_token_authority_namespace() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+        let (auth, headers) = hs256_auth_headers(serde_json::json!({
+            "scope": "sessions:write",
+            "tenant_id": "t1",
+            "sub": "agent:drivew",
+        }));
+
+        let ctx = passport_bound_context(&auth, &headers).expect("subject-only JWT context");
+        assert_eq!(
+            ctx.verified_authority_actor().as_deref(),
+            Some("principal:agent:drivew")
+        );
+        assert_ne!(ctx.verified_authority_actor().as_deref(), Some("agent:drivew"));
     }
 
     #[test]

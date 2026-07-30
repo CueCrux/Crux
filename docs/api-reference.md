@@ -60,8 +60,9 @@ as automation; only an explicit `CRUX_AGENT_PASSPORTS` mapping may resolve it
 to a real passport id.
 
 The generic `/v1/entities/{kind}/{id}` and MCP `entity_*` APIs reject governed
-`orchestrator` records and omit them from unfiltered listings. Use the typed
-`/v1/orchestrators` routes so tenant and actor checks cannot be bypassed.
+`orchestrator` and `punchcard` records and omit both from unfiltered listings.
+Use the typed `/v1/orchestrators` and `/v1/punchcards` routes so tenant, actor,
+lease-owner, and force-release checks cannot be bypassed.
 
 ### Session Store
 

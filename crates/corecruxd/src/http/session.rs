@@ -30,6 +30,7 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq as _;
 
 use corecrux_projections::{SessionPlanSealedV1, CONTENT_TYPE_SESSION_BIN_V1, EVT_SESSION_PLAN_SEALED_V1};
 use crux_session::{
@@ -286,8 +287,9 @@ pub struct SessionHandshakeRequestWire {
     pub intent: Option<String>,
     #[serde(default)]
     pub hints: HandshakeHintsWire,
-    /// Optional project the agent is acting in. Stored alongside the session
-    /// binding; not validated until the project store ships.
+    /// Optional immutable coordination partition label. It is stored alongside
+    /// the session binding and must match later announcements. Tenant authority
+    /// is the security boundary; this label is not a project-membership grant.
     #[serde(default)]
     pub project_id: Option<String>,
     /// Optional tenant. Drives passport defaulting when `passport_id` is absent.
@@ -350,11 +352,27 @@ pub async fn get_active_sessions(State(state): State<AppState>, headers: HeaderM
     if let Err(problem) = crate::auth::require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
     }
+    let context = match crate::auth::passport_bound_context(&state.auth, &headers) {
+        Ok(context) => context,
+        Err(problem) => return problem.into_response(),
+    };
+    let tenant_filter = if context.has_global_tenant_authority() {
+        None
+    } else {
+        match context.resolve_authorized_tenant(None) {
+            Ok(tenant) => Some(tenant),
+            Err(problem) => return problem.into_response(),
+        }
+    };
     let store = state.fact_store.read().await;
-    let bindings = crate::session_bindings::list_bindings(&store);
-    // Uncapped totals — `bindings`/`count` are truncated at top_k: 200, which
-    // historically hid a binding-churn leak; surface the real figures.
-    let counts = crate::session_bindings::count_bindings(&store);
+    let bindings = match tenant_filter.as_deref() {
+        Some(tenant) => crate::session_bindings::list_bindings_for_tenant(&store, tenant),
+        None => crate::session_bindings::list_bindings(&store),
+    };
+    let counts = match tenant_filter.as_deref() {
+        Some(tenant) => crate::session_bindings::count_bindings_for_tenant(&store, tenant),
+        None => crate::session_bindings::count_bindings(&store),
+    };
     drop(store);
     (
         StatusCode::OK,
@@ -373,6 +391,7 @@ pub async fn get_active_sessions(State(state): State<AppState>, headers: HeaderM
 /// while continuing to decode older flat-graph plans from the sealed registry.
 pub async fn get_session_plan(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(session_id_hex): Path<String>,
     headers: HeaderMap,
 ) -> Response {
@@ -393,38 +412,42 @@ pub async fn get_session_plan(
         Ok(session_id) => session_id,
         Err(response) => return response,
     };
-    let entry = match services.registry.get(&session_id) {
-        Ok(Some(entry)) => entry,
-        Ok(None) => return problem(StatusCode::NOT_FOUND, "not_found", "session plan not found"),
-        Err(err) => {
-            return problem(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                format!("registry read failed: {err}"),
-            );
-        }
-    };
     let ctx = match crate::auth::passport_bound_context(&state.auth, &headers) {
         Ok(ctx) => ctx,
         Err(problem) => return problem.into_response(),
     };
-    if !ctx.has_scope("admin:read") {
+    let binding = {
         let store = state.fact_store.read().await;
-        let allowed = crate::session_bindings::list_bindings(&store)
-            .into_iter()
-            .any(|binding| {
-                binding.session_id_hex.eq_ignore_ascii_case(&session_id_hex)
-                    && ctx.passport_id.as_deref() == Some(binding.passport_id.as_str())
-            });
-        drop(store);
-        if !allowed {
-            return problem(
-                StatusCode::FORBIDDEN,
-                "forbidden",
-                "session plan is not bound to the request passport",
-            );
-        }
+        crate::session_bindings::get_binding(&store, &session_id_hex)
+    };
+    let Some(binding) = binding else {
+        return problem(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "session has no authoritative binding",
+        );
+    };
+    if let Err(problem) = ctx.resolve_authorized_tenant(Some(&binding.tenant_id)) {
+        return problem.into_response();
     }
+    let entry = if ctx.has_scope("admin:read") {
+        match services.registry.get(&session_id) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => return problem(StatusCode::NOT_FOUND, "not_found", "session plan not found"),
+            Err(err) => {
+                return problem(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    format!("registry read failed: {err}"),
+                );
+            }
+        }
+    } else {
+        match authorize_live_session_admission(&state, &headers, Some(peer.ip()), &session_id_hex, now_ms()) {
+            Ok((_, entry)) => entry,
+            Err(response) => return response,
+        }
+    };
     let plan = match crux_session::SessionPlan::from_canonical_cbor(&entry.plan_cbor) {
         Ok(plan) => plan,
         Err(err) => {
@@ -500,7 +523,7 @@ pub async fn post_session(State(state): State<AppState>, request: Request) -> Re
         .map(|ConnectInfo(address)| address.ip());
     let headers = parts.headers;
     let (passport, origin_install) = services.passport_cfg.synthesise();
-    let admission = match admission_identity(&state, &services, &headers, peer_ip, &passport.principal_id) {
+    let admission = match admission_identity(&state, &services, &headers, peer_ip, &passport.principal_id, true) {
         Ok(admission) => admission,
         Err(response) => {
             if let Some(metrics) = services.metrics.as_ref() {
@@ -531,7 +554,7 @@ pub async fn post_session(State(state): State<AppState>, request: Request) -> Re
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json");
 
-    let request: SessionHandshakeRequestWire = if content_type.starts_with("application/cbor") {
+    let mut request: SessionHandshakeRequestWire = if content_type.starts_with("application/cbor") {
         match crux_session::canonical::decode(&body)
             .ok()
             .and_then(|v| to_json_value(&v))
@@ -558,6 +581,116 @@ pub async fn post_session(State(state): State<AppState>, request: Request) -> Re
     };
 
     let prefer_cbor = should_prefer_cbor(&headers, &request.accepts);
+    if admission.verified {
+        let context = match crate::auth::passport_bound_context(&state.auth, &headers) {
+            Ok(context) => context,
+            Err(problem) => return problem.into_response(),
+        };
+        let claimed_passport = request
+            .passport_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if admission.canonical_passport_claim_verified {
+            if claimed_passport.is_some_and(|claimed| claimed != admission.actor_id) {
+                return problem(
+                    StatusCode::FORBIDDEN,
+                    "forbidden",
+                    "session body passport does not match the verified request passport",
+                );
+            }
+            request.passport_id = Some(admission.actor_id.clone());
+        } else {
+            if claimed_passport.is_some() {
+                return problem(
+                    StatusCode::FORBIDDEN,
+                    "forbidden",
+                    "session body passport requires a canonical verified passport claim",
+                );
+            }
+            // A verified credential with only a stable subject still owns the
+            // session via its admission key, but cannot self-assert a passport.
+            // The binding below records a namespaced automation principal.
+            request.passport_id = None;
+        }
+        let tenant_id = match context.resolve_authorized_tenant(request.tenant_id.as_deref()) {
+            Ok(tenant_id) => tenant_id,
+            Err(problem) => return problem.into_response(),
+        };
+        request.tenant_id = Some(tenant_id);
+    }
+    let prevalidated_binding = if admission.canonical_passport_claim_verified {
+        let store = state.fact_store.read().await;
+        match crate::session_bindings::resolve(
+            &store,
+            crate::session_bindings::ResolveInput {
+                session_id_hex: "pending",
+                project_id: request.project_id.clone(),
+                tenant_id: request.tenant_id.clone(),
+                passport_id: request.passport_id.clone(),
+                now_unix_ms: now_ms(),
+            },
+        ) {
+            Ok(binding) => binding,
+            Err(error) => {
+                return problem(
+                    StatusCode::FORBIDDEN,
+                    "forbidden",
+                    format!("verified session binding is not authorized: {error}"),
+                );
+            }
+        }
+    } else if admission.verified {
+        crate::session_bindings::SessionBinding {
+            session_id_hex: "pending".to_string(),
+            project_id: request.project_id.clone(),
+            tenant_id: request.tenant_id.clone().unwrap_or_else(|| "default".to_string()),
+            passport_id: admission.actor_id.clone(),
+            passport_category: "automation".to_string(),
+            agent_work_gate: true,
+            bound_at_unix_ms: now_ms(),
+        }
+    } else {
+        let claimed_passport = request
+            .passport_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        match (admission.asserted_id.as_deref(), claimed_passport) {
+            (Some(asserted), Some(claimed)) if asserted != claimed => {
+                return problem(
+                    StatusCode::FORBIDDEN,
+                    "forbidden",
+                    "session body passport does not match the local request identity assertion",
+                );
+            }
+            (None, Some(_)) => {
+                return problem(
+                    StatusCode::FORBIDDEN,
+                    "forbidden",
+                    "an unverified session body cannot establish passport authority",
+                );
+            }
+            _ => {}
+        }
+        let tenant_id = request
+            .tenant_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("default")
+            .to_string();
+        request.passport_id = None;
+        crate::session_bindings::SessionBinding {
+            session_id_hex: "pending".to_string(),
+            project_id: request.project_id.clone(),
+            tenant_id,
+            passport_id: admission.actor_id.clone(),
+            passport_category: "unverified".to_string(),
+            agent_work_gate: true,
+            bound_at_unix_ms: now_ms(),
+        }
+    };
 
     // One admission lock makes prune, quota checks, mint, seal, and insert a
     // linearizable transaction with respect to competing session creations.
@@ -656,7 +789,7 @@ pub async fn post_session(State(state): State<AppState>, request: Request) -> Re
     // registry must never hold a row that has no matching sealed event.
     let event = build_sealed_event_for_plan(&sealed);
     let entry = RegistryEntry::from_plan(&sealed.plan, sealed.canonical_cbor.clone())
-        .with_admission_keys(admission.principal_key, admission.ip_key);
+        .with_admission_keys(admission.principal_key.clone(), admission.ip_key.clone());
     let entry_bytes = match services.registry.entry_storage_bytes(&entry) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -778,29 +911,10 @@ pub async fn post_session(State(state): State<AppState>, request: Request) -> Re
     // session id, surface in response headers so MCP/HTTP clients can read it
     // without parsing the signed plan.
     let session_id_hex = hex::encode(sealed.plan.session_id);
-    let binding_result = {
-        let store = state.fact_store.read().await;
-        crate::session_bindings::resolve(
-            &store,
-            crate::session_bindings::ResolveInput {
-                session_id_hex: &session_id_hex,
-                project_id: request.project_id.clone(),
-                tenant_id: request.tenant_id.clone(),
-                passport_id: request.passport_id.clone(),
-                now_unix_ms: now_ms(),
-            },
-        )
-    };
-    let binding = match binding_result {
-        Ok(b) => Some(b),
-        Err(err) => {
-            tracing::warn!(
-                ?err,
-                "session binding resolution failed; session minted without binding"
-            );
-            None
-        }
-    };
+    let mut binding = prevalidated_binding;
+    binding.session_id_hex.clone_from(&session_id_hex);
+    binding.bound_at_unix_ms = now_ms();
+    let binding = Some(binding);
     if let Some(b) = binding.as_ref() {
         {
             let mut store = state.fact_store.write().await;
@@ -818,62 +932,160 @@ pub async fn post_session(State(state): State<AppState>, request: Request) -> Re
     build_plan_response(&sealed, prefer_cbor, binding.as_ref())
 }
 
+pub(crate) const UNVERIFIED_SESSION_AUTHORITY_PREFIX: &str = "operator:unverified:";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct AdmissionIdentity {
-    principal_key: String,
-    ip_key: String,
+pub(crate) struct AdmissionIdentity {
+    pub(crate) principal_key: String,
+    pub(crate) ip_key: String,
+    /// Durable authority used by coordination. In local development modes the
+    /// value is explicitly namespaced so an assertion cannot collide with a
+    /// cryptographically verified passport.
+    pub(crate) actor_id: String,
+    /// Optional raw identity assertion accepted only as a consistency check.
+    /// This keeps local MCP callers compatible while ensuring the assertion
+    /// never becomes the authority by itself.
+    pub(crate) asserted_id: Option<String>,
+    pub(crate) verified: bool,
+    /// True only when the verified credential carried the canonical
+    /// `passport_id` claim rather than a generic subject fallback.
+    pub(crate) canonical_passport_claim_verified: bool,
 }
 
 #[allow(clippy::result_large_err)]
-fn admission_identity(
+pub(crate) fn admission_identity(
     state: &AppState,
     services: &SessionServices,
     headers: &HeaderMap,
     peer_ip: Option<IpAddr>,
     local_principal_id: &str,
+    require_session_write: bool,
 ) -> Result<AdmissionIdentity, Response> {
     let client = super::ingress::effective_client_ip(headers, peer_ip, &services.trusted_proxy_cidrs);
     let local_loopback = super::ingress::is_direct_loopback_request(headers, peer_ip);
+    let has_authority_material = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| !value.trim().is_empty())
+        || headers
+            .get("x-corecrux-passport-id")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| !value.trim().is_empty())
+        || headers
+            .get("x-corecrux-scopes")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| !value.trim().is_empty());
 
-    let principal = if local_loopback {
-        format!("local:{local_principal_id}")
-    } else {
+    let local_bootstrap = || {
+        // Preserve the M13 admission-key input so cached direct-loopback
+        // sessions survive the M14 attribution hardening. Only the displayed
+        // actor is newly namespaced; the keyed owner remains installation-local.
+        let principal = format!("local:{local_principal_id}");
+        let actor_id = format!("{UNVERIFIED_SESSION_AUTHORITY_PREFIX}local:{local_principal_id}");
+        (principal, actor_id, None, false, false)
+    };
+
+    let (principal, actor_id, asserted_id, verified, canonical_passport_claim_verified) = if !local_loopback
+        || has_authority_material
+    {
         let context = crate::auth::passport_bound_context(&state.auth, headers).map_err(IntoResponse::into_response)?;
-        if !context.auth_enforced() || context.local_unverified_identity() {
-            return Err(ProblemResponse(
-                ProblemDetails::unauthorized(
-                    "remote session creation requires a cryptographically verified credential",
-                )
-                .with_extensions(serde_json::json!({
-                    "code": "SESSION_VERIFIED_CREDENTIAL_REQUIRED",
-                })),
-            )
-            .into_response());
-        }
-        if !context.has_scope("sessions:write") && !context.has_scope("admin:write") {
-            return Err(ProblemResponse(
-                ProblemDetails::forbidden("remote session creation requires sessions:write or admin:write")
+        if context.local_unverified_identity() {
+            if !local_loopback {
+                return Err(ProblemResponse(
+                    ProblemDetails::unauthorized(
+                        "remote session creation requires a cryptographically verified credential",
+                    )
                     .with_extensions(serde_json::json!({
-                        "code": "SESSION_WRITE_SCOPE_REQUIRED",
+                        "code": "SESSION_VERIFIED_CREDENTIAL_REQUIRED",
                     })),
-            )
-            .into_response());
-        }
-        context
-            .verified_credential_identity()
-            .map(str::trim)
-            .filter(|identity| !identity.is_empty())
-            .map(str::to_string)
-            .ok_or_else(|| {
-                ProblemResponse(
-                    ProblemDetails::unauthorized("verified credential does not contain a stable principal identity")
+                )
+                .into_response());
+            }
+            if let Some(asserted) = context
+                .passport_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|identity| !identity.is_empty())
+            {
+                let actor_id = format!("{UNVERIFIED_SESSION_AUTHORITY_PREFIX}{asserted}");
+                (actor_id.clone(), actor_id, Some(asserted.to_string()), false, false)
+            } else {
+                local_bootstrap()
+            }
+        } else {
+            if context.passport_override_used() {
+                return Err(ProblemResponse(
+                    ProblemDetails::forbidden("passport impersonation is not permitted for session authority")
+                        .with_extensions(serde_json::json!({
+                            "code": "SESSION_PASSPORT_OVERRIDE_FORBIDDEN",
+                        })),
+                )
+                .into_response());
+            }
+            if require_session_write && !context.has_scope("sessions:write") && !context.has_scope("admin:write") {
+                return Err(ProblemResponse(
+                    ProblemDetails::forbidden("session creation requires sessions:write or admin:write")
+                        .with_extensions(serde_json::json!({
+                            "code": "SESSION_WRITE_SCOPE_REQUIRED",
+                        })),
+                )
+                .into_response());
+            }
+            let credential_identity = context
+                .verified_credential_identity()
+                .map(str::trim)
+                .filter(|identity| !identity.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    ProblemResponse(
+                        ProblemDetails::unauthorized(
+                            "verified credential does not contain a stable principal identity",
+                        )
                         .with_extensions(serde_json::json!({
                             "code": "SESSION_VERIFIED_IDENTITY_REQUIRED",
                         })),
-                )
-                .into_response()
-            })?
+                    )
+                    .into_response()
+                })?;
+            let canonical_passport_claim_verified = context.canonical_passport_claim_verified();
+            let actor_id = context
+                .verified_authority_actor()
+                .unwrap_or_else(|| format!("principal:{credential_identity}"));
+            (
+                // Quota and immutable ownership keys use the resolved
+                // provenance-aware actor, not raw JWT `sub`. Otherwise an
+                // agent token and a subject-only JWT spelling the same
+                // `agent:<name>` would share a session owner key.
+                actor_id.clone(),
+                actor_id.clone(),
+                Some(actor_id),
+                true,
+                canonical_passport_claim_verified,
+            )
+        }
+    } else {
+        local_bootstrap()
     };
+
+    if !local_loopback && actor_id.starts_with(UNVERIFIED_SESSION_AUTHORITY_PREFIX) {
+        return Err(ProblemResponse(
+            ProblemDetails::unauthorized("remote session creation requires a cryptographically verified credential")
+                .with_extensions(serde_json::json!({
+                    "code": "SESSION_VERIFIED_CREDENTIAL_REQUIRED",
+                })),
+        )
+        .into_response());
+    }
+
+    if !local_loopback && principal.is_empty() {
+        return Err(ProblemResponse(
+            ProblemDetails::unauthorized("verified credential does not contain a stable principal identity")
+                .with_extensions(serde_json::json!({
+                    "code": "SESSION_VERIFIED_IDENTITY_REQUIRED",
+                })),
+        )
+        .into_response());
+    }
     let ip = client
         .key_ip
         .map_or_else(|| "missing-peer".to_string(), |ip| ip.to_string());
@@ -881,7 +1093,73 @@ fn admission_identity(
     Ok(AdmissionIdentity {
         principal_key: keyed_admission_key(&services.admission_key, b"principal", principal.as_bytes()),
         ip_key: keyed_admission_key(&services.admission_key, b"ip", ip.as_bytes()),
+        actor_id,
+        asserted_id,
+        verified,
+        canonical_passport_claim_verified,
     })
+}
+
+/// Authorize an ownership-sensitive operation against the immutable admission
+/// principal stored with a live session. Session-binding facts are useful
+/// display metadata, but they are not proof that the current request created
+/// the session.
+#[allow(clippy::result_large_err)]
+pub(crate) fn authorize_live_session_admission(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer_ip: Option<IpAddr>,
+    session_id_hex: &str,
+    now_unix_ms: u64,
+) -> Result<(AdmissionIdentity, RegistryEntry), Response> {
+    let services = state.session.as_ref().ok_or_else(|| {
+        problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "feature_disabled",
+            "session handshake feature is not enabled",
+        )
+    })?;
+    let session_id = parse_session_id_hex(session_id_hex)?;
+    let (local_passport, _) = services.passport_cfg.synthesise();
+    let authority = admission_identity(state, services, headers, peer_ip, &local_passport.principal_id, false)?;
+    let entry = services
+        .registry
+        .get(&session_id)
+        .map_err(|error| {
+            problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "session_registry_unavailable",
+                format!("session registry read failed: {error}"),
+            )
+        })?
+        .ok_or_else(|| problem(StatusCode::FORBIDDEN, "forbidden", "session is not active"))?;
+    if !entry.is_live(now_unix_ms) {
+        return Err(problem(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "session is closed or expired",
+        ));
+    }
+    let stored_key = entry.admission_principal_key.as_deref().ok_or_else(|| {
+        problem(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "legacy session has no ownership binding; mint a new session",
+        )
+    })?;
+    if stored_key
+        .as_bytes()
+        .ct_eq(authority.principal_key.as_bytes())
+        .unwrap_u8()
+        != 1
+    {
+        return Err(problem(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "session is owned by a different request principal",
+        ));
+    }
+    Ok((authority, entry))
 }
 
 fn keyed_admission_key(key: &[u8; 32], domain: &[u8], value: &[u8]) -> String {

@@ -15,9 +15,16 @@ use serde_json::{json, Value};
 use crate::dispatch::McpContext;
 use crate::protocol::{JsonRpcError, INTERNAL_ERROR, INVALID_PARAMS};
 
-const SCOPES: &str = "admin:read,facts:write";
+const SCOPES: &str = "admin:read,facts:write,sessions:write";
+const ADMIN_WRITE_SCOPES: &str = "admin:read,admin:write";
+const ADMIN_WRITE_JWT_SCOPES: &[&str] = &["admin:read", "admin:write"];
+const COORD_READ_SCOPES: &[&str] = &["sessions:read"];
+const COORD_WRITE_SCOPES: &[&str] = &["sessions:write"];
 
-use crate::tools::loopback_auth::{loopback_bearer_token, loopback_bearer_token_for_passport};
+use crate::tools::loopback_auth::{
+    loopback_bearer_token, loopback_bearer_token_for_passport, loopback_bearer_token_for_passport_with_scopes,
+    request_loopback_authority,
+};
 
 pub const LIST_PROJECTS_DESCRIPTION: &str =
     "List all projects defined on this daemon. Each project carries a planning_target (a tenant or a github repo URL), a default_passport_id, and counts of members + working tenants.";
@@ -215,6 +222,138 @@ pub(crate) async fn loopback_post(
     }
 }
 
+/// Ownership-sensitive loopback GET using the exact native MCP bearer or a
+/// provenance-preserving scoped JWT for an outer transport.
+pub(crate) async fn loopback_get_for_context(
+    url: String,
+    ctx: &McpContext,
+    scopes: &[&str],
+) -> Result<(u16, String), JsonRpcError> {
+    let authority = request_loopback_authority(ctx, scopes)?;
+    let scope_header = scopes.join(",");
+    let joined = tokio::task::spawn_blocking(move || {
+        let agent = loopback_agent();
+        let mut req = agent
+            .get(&url)
+            .header("X-Corecrux-Scopes", &scope_header)
+            .header("Accept", "application/json")
+            .header("X-Corecrux-Tenant-Id", &authority.tenant);
+        if let Some(token) = &authority.bearer {
+            req = req.header("Authorization", &format!("Bearer {token}"));
+        }
+        if let Some(proof) = &authority.agent_proof {
+            req = req.header(crate::agent::INTERNAL_LOOPBACK_AGENT_PROOF_HEADER, proof);
+        }
+        if let Some(passport) = &authority.passport_header {
+            req = req.header("X-Corecrux-Passport-Id", passport);
+        }
+        req.call()
+            .map(|mut response| {
+                (
+                    response.status().as_u16(),
+                    response.body_mut().read_to_string().unwrap_or_default(),
+                )
+            })
+            .map_err(|error| error.to_string())
+    })
+    .await;
+    let (status, body) = loopback_transport_result(joined)?;
+    if loopback_ok(status, false) {
+        Ok((status, body))
+    } else {
+        Err(loopback_status_error(status, &body))
+    }
+}
+
+/// Ownership-sensitive loopback POST using the same request authority as the
+/// session mint that produced the supplied session id.
+pub(crate) async fn loopback_post_for_context(
+    url: String,
+    body: Value,
+    expect_201: bool,
+    ctx: &McpContext,
+    scopes: &[&str],
+) -> Result<(u16, String), JsonRpcError> {
+    let authority = request_loopback_authority(ctx, scopes)?;
+    let scope_header = scopes.join(",");
+    let joined = tokio::task::spawn_blocking(move || {
+        let agent = loopback_agent();
+        let mut req = agent
+            .post(&url)
+            .header("X-Corecrux-Scopes", &scope_header)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header("X-Corecrux-Tenant-Id", &authority.tenant);
+        if let Some(token) = &authority.bearer {
+            req = req.header("Authorization", &format!("Bearer {token}"));
+        }
+        if let Some(proof) = &authority.agent_proof {
+            req = req.header(crate::agent::INTERNAL_LOOPBACK_AGENT_PROOF_HEADER, proof);
+        }
+        if let Some(passport) = &authority.passport_header {
+            req = req.header("X-Corecrux-Passport-Id", passport);
+        }
+        req.send(body.to_string())
+            .map(|mut response| {
+                (
+                    response.status().as_u16(),
+                    response.body_mut().read_to_string().unwrap_or_default(),
+                )
+            })
+            .map_err(|error| error.to_string())
+    })
+    .await;
+    let (status, response_body) = loopback_transport_result(joined)?;
+    if loopback_ok(status, expect_201) {
+        Ok((status, response_body))
+    } else {
+        Err(loopback_status_error(status, &response_body))
+    }
+}
+
+async fn loopback_admin_post(
+    url: String,
+    body: Value,
+    expect_201: bool,
+    passport: Option<String>,
+    tenant: Option<String>,
+) -> Result<(u16, String), JsonRpcError> {
+    let bearer =
+        loopback_bearer_token_for_passport_with_scopes(passport.as_deref(), tenant.as_deref(), ADMIN_WRITE_JWT_SCOPES);
+    let joined = tokio::task::spawn_blocking(move || {
+        let agent = loopback_agent();
+        let mut req = agent
+            .post(&url)
+            .header("X-Corecrux-Scopes", ADMIN_WRITE_SCOPES)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json");
+        if let Some(token) = &bearer {
+            req = req.header("Authorization", &format!("Bearer {token}"));
+        }
+        if let Some(pid) = &passport {
+            req = req.header("X-Corecrux-Passport-Id", pid);
+        }
+        if let Some(tenant) = &tenant {
+            req = req.header("X-Corecrux-Tenant-Id", tenant);
+        }
+        req.send(body.to_string())
+            .map(|mut response| {
+                (
+                    response.status().as_u16(),
+                    response.body_mut().read_to_string().unwrap_or_default(),
+                )
+            })
+            .map_err(|error| error.to_string())
+    })
+    .await;
+    let (status, response_body) = loopback_transport_result(joined)?;
+    if loopback_ok(status, expect_201) {
+        Ok((status, response_body))
+    } else {
+        Err(loopback_status_error(status, &response_body))
+    }
+}
+
 pub(crate) async fn loopback_patch(
     url: String,
     body: Value,
@@ -298,7 +437,7 @@ pub(crate) fn text_content(value: Value) -> Value {
     })
 }
 
-fn authority_identity(ctx: &McpContext, tool: &str) -> Result<String, JsonRpcError> {
+pub(crate) fn authority_identity(ctx: &McpContext, tool: &str) -> Result<String, JsonRpcError> {
     ctx.authority_identity().ok_or_else(|| JsonRpcError {
         code: INVALID_PARAMS,
         message: format!("{tool}: authenticated MCP authority is required"),
@@ -306,7 +445,7 @@ fn authority_identity(ctx: &McpContext, tool: &str) -> Result<String, JsonRpcErr
     })
 }
 
-fn claimed_identity_matches(ctx: &McpContext, claimed: &str, authority: &str) -> bool {
+pub(crate) fn claimed_identity_matches(ctx: &McpContext, claimed: &str, authority: &str) -> bool {
     claimed == authority || ctx.scope_identity().as_deref() == Some(claimed)
 }
 
@@ -567,16 +706,29 @@ pub async fn handle_coord_status(args: &Value, ctx: &McpContext) -> Result<Value
     }
     let qs = format!("?{}", params.join("&"));
     let base = loopback_base(ctx)?;
-    let (_, body) = loopback_get_scoped(
-        format!("{base}/v1/coord/active{qs}"),
-        ctx.authority_identity(),
-        Some(tenant),
-    )
-    .await?;
+    let (_, body) = loopback_get_for_context(format!("{base}/v1/coord/active{qs}"), ctx, COORD_READ_SCOPES).await?;
     Ok(text_content(serde_json::from_str(&body).unwrap_or(Value::String(body))))
 }
 
 pub async fn handle_coord_announce(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
+    let identity = ctx.authority_identity();
+    if let Some(claimed) = args
+        .get("by_passport")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if identity
+            .as_deref()
+            .is_none_or(|identity| !claimed_identity_matches(ctx, claimed, identity))
+        {
+            return Err(JsonRpcError {
+                code: INVALID_PARAMS,
+                message: "coord_announce: by_passport does not match the authenticated MCP authority".to_string(),
+                data: None,
+            });
+        }
+    }
     let mut payload = json!({});
     for key in ["session_id", "project_id"] {
         let v = args.get(key).and_then(|v| v.as_str()).ok_or_else(|| JsonRpcError {
@@ -587,7 +739,6 @@ pub async fn handle_coord_announce(args: &Value, ctx: &McpContext) -> Result<Val
         payload[key] = json!(v);
     }
     for key in [
-        "by_passport",
         "execplan_slug",
         "milestone",
         "deploy_target",
@@ -600,12 +751,12 @@ pub async fn handle_coord_announce(args: &Value, ctx: &McpContext) -> Result<Val
         }
     }
     let base = loopback_base(ctx)?;
-    let (_, resp_body) = loopback_post(
+    let (_, resp_body) = loopback_post_for_context(
         format!("{base}/v1/coord/announce"),
         payload,
         false,
-        ctx.authority_identity(),
-        Some(ctx.scope_tenant()),
+        ctx,
+        COORD_WRITE_SCOPES,
     )
     .await?;
     Ok(text_content(
@@ -637,6 +788,12 @@ mod tests {
     fn urlencoding_handles_special_chars() {
         assert_eq!(urlencoding("work::team"), "work%3A%3Ateam");
         assert_eq!(urlencoding("alphanum-123"), "alphanum-123");
+    }
+
+    #[test]
+    fn coordination_loopback_claims_only_session_scopes() {
+        assert_eq!(COORD_READ_SCOPES, &["sessions:read"]);
+        assert_eq!(COORD_WRITE_SCOPES, &["sessions:write"]);
     }
 
     fn serve_coordination_loopback() -> (String, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
@@ -721,6 +878,7 @@ mod tests {
                 name: name.to_string(),
                 token_hash: [0u8; 32],
             })
+            .with_request_loopback_bearer_token(Some(format!("test-token-{name}")))
     }
 
     #[tokio::test]
@@ -1042,6 +1200,39 @@ mod tests {
             INVALID_PARAMS
         );
     }
+
+    #[tokio::test]
+    async fn coord_announce_rejects_owner_spoof_but_preserves_anonymous_local_compatibility() {
+        let ctx = scoped_agent_context("http://127.0.0.1:9".to_string(), "owner-a", "tenant-a");
+        let error = handle_coord_announce(
+            &json!({
+                "session_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "project_id":"proj",
+                "by_passport":"owner-b"
+            }),
+            &ctx,
+        )
+        .await
+        .expect_err("spoofed owner");
+        assert_eq!(error.code, INVALID_PARAMS);
+        assert!(!error.message.contains("loopback"));
+
+        let anonymous = McpContext::new_default("anonymous").with_daemon_base_url("http://127.0.0.1:9");
+        let error = handle_coord_announce(
+            &json!({
+                "session_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "project_id":"proj"
+            }),
+            &anonymous,
+        )
+        .await
+        .expect_err("port 9 has no local daemon");
+        assert_eq!(error.code, INTERNAL_ERROR);
+        assert!(
+            error.message.contains("loopback transport"),
+            "anonymous native MCP is allowed to reach an auth-off local daemon"
+        );
+    }
 }
 
 pub const EXECPLAN_WRITE_DESCRIPTION: &str = "Write an ExecPlan and commit it. \
@@ -1053,6 +1244,7 @@ plan exists); pass the plan's current plan_content_hash to update it, so two ses
 plan cannot silently overwrite each other. push defaults to false.";
 
 pub async fn handle_execplan_write(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
+    let identity = authority_identity(ctx, "execplan_write")?;
     let slug = args.get("slug").and_then(|v| v.as_str()).ok_or_else(|| JsonRpcError {
         code: INVALID_PARAMS,
         message: "execplan_write: slug is required (the plan filename without .md)".to_string(),
@@ -1073,11 +1265,11 @@ pub async fn handle_execplan_write(args: &Value, ctx: &McpContext) -> Result<Val
         }
     }
     let base = loopback_base(ctx)?;
-    let (_, resp_body) = loopback_post(
+    let (_, resp_body) = loopback_admin_post(
         format!("{base}/v1/execplans"),
         body,
         true,
-        ctx.authority_identity(),
+        Some(identity),
         Some(ctx.scope_tenant()),
     )
     .await?;

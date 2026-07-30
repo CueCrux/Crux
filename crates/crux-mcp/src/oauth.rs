@@ -434,7 +434,6 @@ const OAUTH_READ_TOOLS: &[&str] = &[
     "get_bootstrap",
     "receipt_verify",
     "sync_status",
-    "coord_status",
 ];
 
 /// Read-only allowlist for hosted-client OAuth callers (default-deny). The MCP
@@ -671,6 +670,9 @@ mod tests {
         assert!(!oauth_request_allowed("tools/call", Some("store_fact")));
         assert!(!oauth_request_allowed("tools/call", Some("delete_fact")));
         assert!(!oauth_request_allowed("tools/call", Some("save_session")));
+        // Coordination reads traverse the daemon authority boundary. OAuth
+        // `mcp:read` is not promoted into ambient local signing authority.
+        assert!(!oauth_request_allowed("tools/call", Some("coord_status")));
         // tools/call with no tool name, unknown tool, unknown method -> denied
         assert!(!oauth_request_allowed("tools/call", None));
         assert!(!oauth_request_allowed("tools/call", Some("unknown_tool")));

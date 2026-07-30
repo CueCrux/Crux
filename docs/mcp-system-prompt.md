@@ -80,9 +80,20 @@ To name the current milestone for the hook, operators write a short label to `.a
 ### Live-session board (requires `CORECRUXD_COORD=1` on the daemon)
 For concurrent sessions sharing one source tree. Liveness is automatic (presence heartbeat + session binding); only the *focus declaration* is yours to make.
 - `coord_status(project_id?)` — Who else is live right now: per-session passport, heartbeat, declared focus (execplan/milestone/paths), punchcard leases held, plus work items in flight. Call at session start (the `session-start` hook injects a digest automatically) and before editing files another session may be touching.
-- `coord_announce(session_id, project_id, execplan_slug?, milestone?, paths?, note?, ttl_seconds?)` — Declare what this session is working on. Re-announce on focus change (it replaces); `ttl_seconds: 0` clears on the way out; default TTL 4 h. Stored as a private `__coord__::` fact attributed to your session's passport.
+- `coord_announce(session_id, project_id, by_passport?, execplan_slug?, milestone?, paths?, note?, ttl_seconds?)` — Declare what this session is working on. Pass the same `project_id` to `cuecrux_session` first; it is frozen as an opaque coordination partition label (tenant authority remains the security boundary). Re-announce on focus change (it replaces); `ttl_seconds: 0` clears on the way out; default TTL 4 h. Requires `sessions:write` (or `admin:write`) and ownership of the still-live session. The session binding supplies the passport and tenant; `by_passport`, when present, is only a consistency assertion and a mismatch is rejected.
 
 Protocol for multi-session work: announce your focus at boot and on every execplan/milestone switch → check `coord_status` before multi-file edits → take a `punch_in` lease (`tree://<dir>` or `file://<path>`) for paths you'll mutate → prefer `create_handoff` over letting leases/intents time out. Conflicts are advisory: a peer's intent or lease on your target path is a signal to coordinate via work-item comments, not a lock.
+
+Punchcard holder and tenant fields are also optional consistency assertions;
+the MCP authority always supplies both. `punch_in` takes `ttl_secs` (default
+1800, range 1–86400). Normal release is same-owner only. Cross-owner
+force-release is intentionally absent from MCP and is available only through
+the HTTP endpoint to an issuer-verified canonical passport claim with
+`admin:write` (opaque agent tokens are excluded),
+tenant authority, and `confirm=true`. In auth-off direct-loopback mode,
+anonymous compatibility callers share one explicitly unverified local
+principal; use authenticated session-aware clients when separate local
+sessions must conflict with one another.
 
 ## Observability
 - `sync_status()` — Check whether this node is local-only, sync-enabled, or degraded before planning remote integration work.

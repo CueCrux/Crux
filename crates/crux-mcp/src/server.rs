@@ -121,6 +121,11 @@ async fn handle_mcp_post(State(state): State<Arc<McpHttpState>>, headers: Header
         Err(problem) => return problem.into_response(),
     };
     let oauth_read_only = outcome.is_oauth();
+    let static_agent_bearer = if outcome.is_agent() {
+        bearer_token(&headers).map(str::to_string)
+    } else {
+        None
+    };
     let agent = outcome.into_identity();
     let incoming_session = match mcp_session_id_from_headers(&headers) {
         Ok(session_id) => session_id,
@@ -144,8 +149,10 @@ async fn handle_mcp_post(State(state): State<Arc<McpHttpState>>, headers: Header
             rcx_router: ctx.rcx_router.clone(),
             tool_name_allowlist: ctx.tool_name_allowlist.clone(),
             bound_request_principal: ctx.bound_request_principal.clone(),
+            bound_request_principal_is_canonical_passport: ctx.bound_request_principal_is_canonical_passport,
             request_authority_bound: ctx.request_authority_bound,
             request_tenant: ctx.request_tenant.clone(),
+            request_loopback_bearer_token: ctx.request_loopback_bearer_token.clone(),
             data_dir: ctx.data_dir.clone(),
             passport_public_key_hex: ctx.passport_public_key_hex.clone(),
             entity_store: Arc::clone(&ctx.entity_store),
@@ -158,7 +165,8 @@ async fn handle_mcp_post(State(state): State<Arc<McpHttpState>>, headers: Header
             revocation_enforced: ctx.revocation_enforced,
             dense_provider_factory: ctx.dense_provider_factory.clone(),
         }
-    };
+    }
+    .with_request_loopback_bearer_token(static_agent_bearer);
 
     // Parse the JSON-RPC request.
     let req: JsonRpcRequest = match serde_json::from_str(&body) {
@@ -409,6 +417,9 @@ enum AuthOutcome {
 impl AuthOutcome {
     fn is_oauth(&self) -> bool {
         matches!(self, AuthOutcome::OAuth(_))
+    }
+    fn is_agent(&self) -> bool {
+        matches!(self, AuthOutcome::Agent(_))
     }
     fn into_identity(self) -> Option<AgentIdentity> {
         match self {

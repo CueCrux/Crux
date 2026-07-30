@@ -1449,6 +1449,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "serial_test",
  "subtle",
  "tar",
  "tempfile",

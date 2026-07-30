@@ -86,8 +86,13 @@ fn mcp_unavailable_response() -> Response {
 /// Principal bound by the authenticating HTTP transport. Local development
 /// assertions are namespaced so they cannot collide with a verified passport.
 fn request_principal(ctx: &crate::auth::HttpScopeContext) -> Result<Option<String>, Box<crate::http::ProblemResponse>> {
+    let principal = if ctx.local_unverified_identity() {
+        ctx.passport_id.clone()
+    } else {
+        ctx.verified_authority_actor()
+    };
     principal_for_request(
-        ctx.passport_id.as_deref(),
+        principal.as_deref(),
         ctx.local_unverified_identity(),
         ctx.auth_enforced(),
     )
@@ -142,7 +147,7 @@ fn request_context_for_tenant(
         }),
         None => base.as_ref().clone(),
     }
-    .with_request_authority(principal.clone(), tenant);
+    .with_request_authority_provenance(principal.clone(), tenant, ctx.canonical_passport_claim_verified());
 
     if ctx.auth_enforced() {
         let crux_mcp::tools::HttpScopeToolPolicy::AllowOnly(tool_names) =
@@ -825,6 +830,67 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(state.fact_store.read().await.count(), before);
+
+        std::env::remove_var("CORECRUXD_JWT_HS256_SECRET");
+        std::env::remove_var("CORECRUXD_JWT_ISS");
+        std::env::remove_var("CORECRUXD_JWT_AUD");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn subject_only_jwt_private_scope_cannot_collide_with_native_agent_name() {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        const SECRET: &str = "0123456789abcdef0123456789abcdef";
+
+        std::env::set_var("CORECRUXD_JWT_HS256_SECRET", SECRET);
+        std::env::set_var("CORECRUXD_JWT_ISS", "corecrux-test");
+        std::env::set_var("CORECRUXD_JWT_AUD", "corecrux");
+        let state = shim_state_with_auth(AuthMode::JwtHs256);
+
+        #[derive(serde::Serialize)]
+        struct Claims<'a> {
+            exp: usize,
+            iss: &'a str,
+            aud: &'a str,
+            scope: &'a str,
+            tenant_id: &'a str,
+            sub: &'a str,
+        }
+        let claims = Claims {
+            exp: (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_secs()
+                + 3600) as usize,
+            iss: "corecrux-test",
+            aud: "corecrux",
+            scope: "facts:write",
+            tenant_id: "tenant-a",
+            sub: "openai",
+        };
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(SECRET.as_bytes()),
+        )
+        .expect("jwt");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().expect("authorization header"),
+        );
+        let auth_ctx = crate::auth::http_scope_context(&state.auth, &headers).expect("HTTP scope context");
+        let base = state.mcp_context.as_ref().expect("MCP context");
+        let subject_ctx = request_context(base, &auth_ctx).expect("bound subject context");
+        let native_ctx = base.with_agent(crux_mcp::agent::AgentIdentity {
+            name: "openai".to_string(),
+            token_hash: [7; 32],
+        });
+
+        assert_eq!(subject_ctx.scope_identity().as_deref(), Some("principal:openai"));
+        assert_eq!(subject_ctx.fact_actor().as_deref(), Some("principal:openai"));
+        assert_eq!(native_ctx.scope_identity().as_deref(), Some("openai"));
+        assert_ne!(subject_ctx.scope_identity(), native_ctx.scope_identity());
 
         std::env::remove_var("CORECRUXD_JWT_HS256_SECRET");
         std::env::remove_var("CORECRUXD_JWT_ISS");

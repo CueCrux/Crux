@@ -16,7 +16,7 @@ use crate::protocol::{JsonRpcError, INTERNAL_ERROR, INVALID_PARAMS};
 
 /// Entity kinds whose authority belongs to a typed governance surface. Generic
 /// substrate CRUD must neither read nor mutate them.
-pub const GOVERNED_ENTITY_KINDS: &[&str] = &["orchestrator"];
+pub const GOVERNED_ENTITY_KINDS: &[&str] = &["orchestrator", "punchcard"];
 
 pub fn is_governed_entity_kind(kind: &str) -> bool {
     GOVERNED_ENTITY_KINDS.contains(&kind)
@@ -296,5 +296,24 @@ mod tests {
         assert_eq!(governed.version, 1);
         assert!(!governed.deleted);
         assert_eq!(governed.payload["tenant_id"], "tenant-b");
+
+        for result in [
+            handle_entity_upsert(
+                &json!({
+                    "kind":"punchcard",
+                    "id":"pc_bypass",
+                    "payload":{"holder_passport":"attacker","status":"released"}
+                }),
+                &ctx,
+            )
+            .await,
+            handle_entity_delete(&json!({"kind":"punchcard","id":"pc_bypass"}), &ctx).await,
+        ] {
+            let error = result.expect_err("punchcards must be mutable only through their typed API");
+            assert_eq!(
+                error.data.as_ref().and_then(|data| data["code"].as_str()),
+                Some("GOVERNED_ENTITY_KIND")
+            );
+        }
     }
 }

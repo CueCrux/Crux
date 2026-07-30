@@ -16,6 +16,9 @@ use serde_json::{json, Value};
 
 use crate::dispatch::McpContext;
 use crate::protocol::{JsonRpcError, INTERNAL_ERROR, INVALID_PARAMS};
+use crate::tools::loopback_auth::request_loopback_authority;
+
+const SESSION_LOOPBACK_SCOPES: &[&str] = &["sessions:write"];
 
 /// Master-plan §6.1 description, used verbatim. Do not edit without
 /// updating the plan. Exposed as a constant so the tool listing in
@@ -37,6 +40,11 @@ pub fn tool_input_schema() -> Value {
                 "type": "string",
                 "description": "Optional intent hint, e.g. 'audit_review', 'document_ingest'."
             },
+            "project_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Optional immutable coordination partition label. Required before this session can call coord_announce; tenant authority remains the security boundary."
+            },
             "hints": {
                 "type": "object",
                 "properties": {
@@ -53,7 +61,7 @@ pub fn tool_input_schema() -> Value {
         },
         "additionalProperties": false,
         "examples": [
-            { "intent": "audit_review" },
+            { "intent": "audit_review", "project_id": "default" },
             { "hints": { "prefer_bulk": false } }
         ]
     })
@@ -97,6 +105,18 @@ pub async fn handle_cuecrux_session(args: &Value, ctx: &McpContext) -> Result<Va
             super::surface::record_intent(&passport_key, intent);
         }
     }
+    if let Some(project_id) = args.get("project_id") {
+        let project_id = project_id
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| JsonRpcError {
+                code: INVALID_PARAMS,
+                message: "cuecrux_session: project_id must be a non-empty string".into(),
+                data: None,
+            })?;
+        body.insert("project_id".into(), Value::String(project_id.to_string()));
+    }
     if let Some(hints) = args.get("hints").cloned() {
         if hints.is_object() {
             body.insert("hints".into(), hints);
@@ -110,7 +130,16 @@ pub async fn handle_cuecrux_session(args: &Value, ctx: &McpContext) -> Result<Va
     }
 
     let url = format!("{}/session", base_url.trim_end_matches('/'));
+    let authority = request_loopback_authority(ctx, SESSION_LOOPBACK_SCOPES)?;
+    if let Some(passport_id) = authority.passport_header.as_ref() {
+        body.insert("passport_id".into(), Value::String(passport_id.clone()));
+    }
+    body.insert("tenant_id".into(), Value::String(authority.tenant.clone()));
     let payload = Value::Object(body);
+    let bearer = authority.bearer;
+    let agent_proof = authority.agent_proof;
+    let passport_header = authority.passport_header;
+    let tenant = authority.tenant;
 
     // The HTTP round-trip is blocking; move it off the async runtime via
     // spawn_blocking so we don't stall the tokio reactor.
@@ -119,10 +148,22 @@ pub async fn handle_cuecrux_session(args: &Value, ctx: &McpContext) -> Result<Va
             .timeout_global(Some(std::time::Duration::from_secs(10)))
             .build()
             .into();
-        agent
+        let mut request = agent
             .post(&url)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
+            .header("X-Corecrux-Scopes", "sessions:write");
+        if let Some(token) = bearer.as_ref() {
+            request = request.header("Authorization", &format!("Bearer {token}"));
+        }
+        if let Some(proof) = agent_proof.as_ref() {
+            request = request.header(crate::agent::INTERNAL_LOOPBACK_AGENT_PROOF_HEADER, proof);
+        }
+        if let Some(passport_id) = passport_header.as_ref() {
+            request = request.header("X-Corecrux-Passport-Id", passport_id);
+        }
+        request = request.header("X-Corecrux-Tenant-Id", &tenant);
+        request
             .send(payload.to_string())
             .map(|mut r| (r.status().as_u16(), r.body_mut().read_to_string().unwrap_or_default()))
             .map_err(|e| e.to_string())
@@ -176,6 +217,11 @@ fn truncate(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_loopback_claims_only_session_write() {
+        assert_eq!(SESSION_LOOPBACK_SCOPES, &["sessions:write"]);
+    }
     use crate::dispatch::McpContext;
 
     #[test]

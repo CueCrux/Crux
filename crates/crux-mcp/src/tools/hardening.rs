@@ -108,16 +108,16 @@ pub async fn handle_route_access_matrix(_args: &Value, _ctx: &McpContext) -> Res
         {
             "route": "POST /v1/punchcards/*",
             "required_any_scope": ["facts:read/write", "admin:read/write"],
-            "passport_binding": "body holder fields must match request passport unless admin/passport override",
-            "tenant_binding": "advisory lease payload only",
-            "notes": "off mode remains local compatibility bypass"
+            "passport_binding": "holder is request-derived; body fields are equality assertions; cross-owner release is a separate issuer-verified canonical-passport admin route",
+            "tenant_binding": "request-derived and enforced before mutation or returning target state/details",
+            "notes": "off/dev identities are explicitly namespaced as unverified local actors"
         },
         {
             "route": "GET /v1/sessions/{id}/plan",
             "required_any_scope": ["sessions:read", "admin:read"],
-            "passport_binding": "non-admin reads must match persisted session binding",
-            "tenant_binding": "via session binding",
-            "notes": "admin:read can inspect all plans"
+            "passport_binding": "sessions:read proves immutable admission ownership; admin:read is tenant-scoped",
+            "tenant_binding": "authoritative session binding is authorized before registry data is returned",
+            "notes": "only global-tenant admin authority can inspect every tenant"
         }
     ]);
     Ok(text_with_structured("route access matrix", json!({"routes": routes})))

@@ -31,6 +31,9 @@ use base64::Engine as _;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::Serialize;
 
+use crate::dispatch::McpContext;
+use crate::protocol::{JsonRpcError, INTERNAL_ERROR};
+
 /// Env var names checked, in order, for a fallback opaque bearer token to
 /// attach when a JWT can't be minted.
 pub const LOOPBACK_TOKEN_ENV_VARS: &[&str] = &["CORECRUX_LOOPBACK_TOKEN", "CRUX_AGENT_TOKEN"];
@@ -46,11 +49,11 @@ pub const JWT_AUD_ENV: &str = "CORECRUXD_JWT_AUD";
 /// pattern (cross-tenant scope for internal loopback).
 const LOOPBACK_SCOPES: &[&str] = &[
     "admin:read",
-    "admin:write",
     "facts:write",
     "query:read",
     "receipts:read",
     "sessions:read",
+    "sessions:write",
 ];
 
 /// Lifetime of a minted JWT. Long enough to amortise the sign cost across
@@ -234,16 +237,121 @@ pub fn loopback_bearer_token() -> Option<String> {
     resolve_bearer_token(|name| std::env::var(name).ok())
 }
 
+/// Resolve only an operator-supplied opaque loopback token. Unlike
+/// [`loopback_bearer_token`], this never mints an ambient canonical JWT.
+pub(crate) fn raw_loopback_bearer_token() -> Option<String> {
+    resolve_bearer_token(|name| std::env::var(name).ok())
+}
+
+/// Authority material for session/coordination loopback calls. These calls
+/// are ownership-sensitive: native MCP requests retain the exact registered
+/// agent token so the daemon can preserve that credential rail. Re-minting it
+/// as a generic subject-only JWT would let another JWT with the same `sub`
+/// share its session ownership key. Outer transports receive a scoped JWT when
+/// an HS256 loopback signer is configured; local auth-off/dev-scopes calls use
+/// an explicit loopback identity assertion instead. Enforced auth modes reject
+/// that unsigned fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RequestLoopbackAuthority {
+    pub(crate) bearer: Option<String>,
+    pub(crate) agent_proof: Option<String>,
+    pub(crate) passport_header: Option<String>,
+    pub(crate) tenant: String,
+}
+
+pub(crate) fn request_loopback_authority(
+    ctx: &McpContext,
+    scopes: &[&str],
+) -> Result<RequestLoopbackAuthority, JsonRpcError> {
+    let tenant = ctx.scope_tenant();
+    if ctx.has_request_authority() {
+        let principal = ctx.request_principal().ok_or_else(|| JsonRpcError {
+            code: INTERNAL_ERROR,
+            message: "outer transport authenticated the request but did not bind a principal".to_string(),
+            data: None,
+        })?;
+        let canonical = ctx.authority_is_canonical_passport();
+        let bearer = mint_scoped_jwt_from_env(&ScopedClaims {
+            sub: principal,
+            passport_id: canonical.then_some(principal),
+            scopes,
+            tenant_id: &tenant,
+            ttl_secs: JWT_TTL_SECS,
+        });
+        if bearer.is_none() {
+            // Auth-off/dev-scopes daemons need no signed bearer: the direct
+            // loopback assertion and X-Corecrux-Scopes header retain their
+            // explicit local-development semantics. Enforced JWT/JWKS modes
+            // reject this fail-closed at the daemon boundary.
+            return Ok(RequestLoopbackAuthority {
+                bearer: None,
+                agent_proof: None,
+                passport_header: Some(principal.to_string()),
+                tenant,
+            });
+        }
+        return Ok(RequestLoopbackAuthority {
+            bearer,
+            agent_proof: None,
+            passport_header: canonical.then(|| principal.to_string()),
+            tenant,
+        });
+    }
+
+    if ctx.agent.is_some() {
+        let bearer = ctx
+            .request_loopback_bearer_token()
+            .map(str::to_string)
+            .ok_or_else(|| JsonRpcError {
+                code: INTERNAL_ERROR,
+                message: "ownership-sensitive native MCP loopback requires the exact authenticated agent token"
+                    .to_string(),
+                data: None,
+            })?;
+        return Ok(RequestLoopbackAuthority {
+            agent_proof: Some(crate::agent::internal_loopback_agent_proof(&bearer)),
+            bearer: Some(bearer),
+            // Even when the MCP registry maps this agent to a passport, the
+            // daemon must derive that mapping from the same verified token.
+            // Forwarding it as a request assertion would put an automation
+            // credential on the canonical human-passport rail.
+            passport_header: None,
+            tenant,
+        });
+    }
+    let canonical_passport = ctx
+        .authority_is_canonical_passport()
+        .then(|| ctx.authority_identity())
+        .flatten();
+    Ok(RequestLoopbackAuthority {
+        bearer: raw_loopback_bearer_token(),
+        agent_proof: None,
+        passport_header: canonical_passport,
+        tenant,
+    })
+}
+
 /// Resolve a loopback bearer token bound to the supplied MCP-session
 /// passport. HS256 mode mints a short-lived token whose canonical
 /// `passport_id` claim matches the forwarded header; other modes retain the
 /// raw-token fallback and let the daemon apply their normal binding rules.
 pub fn loopback_bearer_token_for_passport(passport_id: Option<&str>, tenant_id: Option<&str>) -> Option<String> {
+    loopback_bearer_token_for_passport_with_scopes(passport_id, tenant_id, LOOPBACK_SCOPES)
+}
+
+/// Mint loopback authority with an explicit least-privilege scope set. Callers
+/// that need a privileged daemon route must opt into that route's exact scope
+/// rather than inheriting ambient `admin:write`.
+pub(crate) fn loopback_bearer_token_for_passport_with_scopes(
+    passport_id: Option<&str>,
+    tenant_id: Option<&str>,
+    scopes: &[&str],
+) -> Option<String> {
     if passport_id.is_some() || tenant_id.is_some() {
         if let Some(jwt) = mint_scoped_jwt_from_env(&ScopedClaims {
-            sub: "mcp-loopback",
+            sub: passport_id.unwrap_or("mcp-loopback"),
             passport_id,
-            scopes: LOOPBACK_SCOPES,
+            scopes,
             tenant_id: tenant_id.unwrap_or("default"),
             ttl_secs: JWT_TTL_SECS,
         }) {
@@ -502,5 +610,111 @@ mod tests {
         let claims = verify_with_daemon_rules(&token, secret, None, None);
         assert_eq!(claims["nbf"].as_u64().unwrap(), mcp_now - 30);
         assert_eq!(claims["exp"].as_u64().unwrap() - claims["iat"].as_u64().unwrap(), 300);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn request_authority_preserves_native_and_outer_principal_provenance() {
+        use crate::agent::AgentIdentity;
+        use crate::agent_passport::AgentPassportMap;
+
+        let secret = "request-authority-test-secret-at-least-32-bytes";
+        std::env::set_var(JWT_SECRET_ENV, secret);
+        std::env::remove_var(JWT_ISS_ENV);
+        std::env::remove_var(JWT_AUD_ENV);
+        let scopes = &["sessions:write"];
+
+        let base = McpContext::new_default("node");
+        let unmapped = base
+            .with_agent(AgentIdentity {
+                name: "openai".to_string(),
+                token_hash: [1; 32],
+            })
+            .with_request_loopback_bearer_token(Some("opaque-native-token".to_string()));
+        let authority = request_loopback_authority(&unmapped, scopes).expect("unmapped authority");
+        assert_eq!(authority.bearer.as_deref(), Some("opaque-native-token"));
+        let proof = authority.agent_proof.as_deref().expect("native proof");
+        assert!(crate::agent::verify_internal_loopback_agent_proof(
+            "opaque-native-token",
+            proof
+        ));
+        assert!(!crate::agent::verify_internal_loopback_agent_proof(
+            "different-native-token",
+            proof
+        ));
+        assert!(authority.passport_header.is_none());
+
+        let mapped_base = McpContext::new_default("node")
+            .with_agent_passports(true, AgentPassportMap::from_pairs_str("openai:codex-work:tenant-a"));
+        let mapped = mapped_base
+            .with_agent(AgentIdentity {
+                name: "openai".to_string(),
+                token_hash: [2; 32],
+            })
+            .with_request_loopback_bearer_token(Some("opaque-mapped-token".to_string()));
+        let authority = request_loopback_authority(&mapped, scopes).expect("mapped authority");
+        assert_eq!(authority.bearer.as_deref(), Some("opaque-mapped-token"));
+        assert!(authority.agent_proof.is_some());
+        assert_eq!(authority.tenant, "tenant-a");
+        assert!(authority.passport_header.is_none());
+
+        let missing_exact = base.with_agent(AgentIdentity {
+            name: "openai".to_string(),
+            token_hash: [3; 32],
+        });
+        let error = request_loopback_authority(&missing_exact, scopes)
+            .expect_err("native ownership loopback must not mint generic JWT authority");
+        assert!(error.message.contains("exact authenticated agent token"));
+
+        let outer_subject = McpContext::new_default("node").with_request_authority_provenance(
+            Some("remote-sub".into()),
+            "tenant-b",
+            false,
+        );
+        let authority = request_loopback_authority(&outer_subject, scopes).expect("outer subject authority");
+        assert!(authority.agent_proof.is_none());
+        let claims = verify_with_daemon_rules(
+            authority.bearer.as_deref().expect("minted bearer"),
+            secret.as_bytes(),
+            None,
+            None,
+        );
+        assert_eq!(claims["sub"], "remote-sub");
+        assert!(claims.get("passport_id").is_none() || claims["passport_id"].is_null());
+        assert!(authority.passport_header.is_none());
+
+        let outer_passport =
+            McpContext::new_default("node").with_request_authority_provenance(Some("human-a".into()), "tenant-c", true);
+        let authority = request_loopback_authority(&outer_passport, scopes).expect("outer passport authority");
+        assert!(authority.agent_proof.is_none());
+        let claims = verify_with_daemon_rules(
+            authority.bearer.as_deref().expect("minted bearer"),
+            secret.as_bytes(),
+            None,
+            None,
+        );
+        assert_eq!(claims["sub"], "human-a");
+        assert_eq!(claims["passport_id"], "human-a");
+        assert_eq!(authority.passport_header.as_deref(), Some("human-a"));
+
+        std::env::remove_var(JWT_SECRET_ENV);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn outer_authority_without_signer_uses_local_only_assertion() {
+        for key in [JWT_SECRET_ENV, JWT_ISS_ENV, JWT_AUD_ENV] {
+            std::env::remove_var(key);
+        }
+        let outer = McpContext::new_default("node").with_request_authority_provenance(
+            Some("local-transport-subject".into()),
+            "tenant-a",
+            false,
+        );
+        let authority = request_loopback_authority(&outer, &["sessions:write"]).expect("local authority");
+        assert!(authority.bearer.is_none());
+        assert!(authority.agent_proof.is_none());
+        assert_eq!(authority.passport_header.as_deref(), Some("local-transport-subject"));
+        assert_eq!(authority.tenant, "tenant-a");
     }
 }

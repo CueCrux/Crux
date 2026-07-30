@@ -533,11 +533,6 @@ pub const TOOL_SURFACE: &[ToolSurfaceEntry] = &[
         marker: "[tier:local]",
     },
     ToolSurfaceEntry {
-        name: "force_release",
-        tier: ToolTier::Local,
-        marker: "[tier:local]",
-    },
-    ToolSurfaceEntry {
         name: "get_observation",
         tier: ToolTier::Local,
         marker: "[tier:local]",

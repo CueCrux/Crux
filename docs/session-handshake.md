@@ -44,6 +44,33 @@ per-IP keys use the same effective-client-IP decision as global ingress
 limiting. Both are stored as daemon-keyed BLAKE3 values, not raw identity or IP
 strings.
 
+The same daemon-keyed admission principal is retained with the session and is
+the ownership proof for later coordination writes. A binding fact is
+attribution metadata, not a bearer credential: `coord_announce` accepts only
+the principal that minted a still-live session. A canonical verified
+`passport_id` claim must resolve to an existing passport before the session is
+inserted. A verified subject-only JWT cannot assert a passport and is always
+bound to `principal:<sub>`, even when `sub` begins with `agent:`. Registered
+agent tokens use their explicit agent-passport mapping or the distinct
+`agent:<registry-name>` namespace. Any body or header passport override is
+rejected at this boundary, so a failed binding cannot leave a minted but
+unusable session behind.
+
+Native MCP ownership calls preserve the exact registered agent bearer and add
+a process-local proof before looping back to the daemon; this works without
+enabling direct HTTP agent-token acceptance. Authenticated outer transports
+receive a least-privilege scoped loopback JWT when an HS256 signer is
+configured. Auth-off/dev-scopes retain their explicit direct-loopback assertion
+semantics. A `jwt_jwks` deployment cannot mint an issuer JWT locally, so
+ownership-sensitive outer-transport tools currently fail closed on that path;
+the enforced-auth OpenAI shim does not allowlist those tools.
+
+An optional `project_id` is frozen into the binding and must match every later
+coordination announcement. It is an opaque coordination partition label, not a
+project-membership authorization or tenant grant; the verified tenant binding
+is the security boundary. Clients that announce focus should pass
+`project_id` to `cuecrux_session` when minting the session.
+
 Admission is serialized across expiry cleanup, quota checks, minting, event
 sealing, and registry insertion. Defaults are:
 

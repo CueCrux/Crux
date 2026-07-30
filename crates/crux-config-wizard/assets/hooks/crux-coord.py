@@ -14,9 +14,10 @@ Two things were not obvious and are encoded here so nobody has to rediscover the
    the Claude UUID records an intent that never joins presence, so the board stays
    empty and the announce looks like it worked. This is the whole bug.
 
-2. The coord_* MCP tools are tier-gated and are not advertised to a free/local
-   agent token, so an agent cannot announce over MCP. The HTTP routes accept the
-   same CRUX_AGENT_TOKEN. We therefore bind over MCP and announce over HTTP.
+2. Binding, announcing, and reading status use the MCP tools over one
+   authenticated transport. Native MCP calls preserve the exact registered
+   agent bearer and pair it with a process-local loopback proof; the credential
+   is never exposed to the tool payload.
 
 Verbs
 -----
@@ -27,6 +28,7 @@ Verbs
 Everything is advisory and fail-open: a coord outage must never block an edit.
 Reads the hook payload on stdin (Claude Code passes session_id / cwd / tool_input).
 """
+import hashlib
 import json
 import os
 import socket
@@ -34,11 +36,55 @@ import sys
 import urllib.error
 import urllib.request
 
-HTTP = os.environ.get("CRUX_HTTP_URL", "http://100.70.12.73:14800").rstrip("/")
-MCP = os.environ.get("CRUX_MCP_URL", "http://100.70.12.73:14801/mcp")
-TOKEN = os.environ.get("CRUX_AGENT_TOKEN", "")
-PROJECT = os.environ.get("CRUX_COORD_PROJECT", "crux")
-TTL = int(os.environ.get("CRUX_COORD_TTL_SECS", "900"))
+HOME = os.path.expanduser("~")
+ENV_FILE = os.path.join(HOME, ".config/cuecrux/env")
+MCP_TOKEN_FILE = os.path.join(HOME, ".config/cuecrux/crux-tokens/anthropic.mcp-token")
+
+
+def _load_env_file():
+    """Read simple KEY=VALUE settings without evaluating shell syntax."""
+    values = {}
+    try:
+        with open(ENV_FILE) as source:
+            for line in source:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if key.startswith("export "):
+                    key = key[7:].strip()
+                if key:
+                    values[key] = value.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return values
+
+
+def _read_registered_mcp_token():
+    try:
+        with open(MCP_TOKEN_FILE) as source:
+            return source.read().strip()
+    except OSError:
+        return ""
+
+
+_FILE_ENV = _load_env_file()
+
+
+def _setting(name, default=""):
+    return os.environ.get(name) or _FILE_ENV.get(name) or default
+
+
+MCP = _setting("CRUX_MCP_URL", "http://127.0.0.1:14801/mcp")
+# The MCP listener accepts its registered agent token, while the inherited
+# CRUX_AGENT_TOKEN may be the daemon HTTP JWT. Prefer the exact MCP credential.
+TOKEN = _read_registered_mcp_token() or _setting("CRUX_AGENT_TOKEN")
+PROJECT = _setting("CRUX_COORD_PROJECT", "crux")
+try:
+    TTL = int(_setting("CRUX_COORD_TTL_SECS", "14400"))
+except (TypeError, ValueError):
+    TTL = 14400
 CACHE = os.path.expanduser("~/.cache/crux-coord")
 TIMEOUT = 4  # a hook must not stall the session; coord is advisory
 
@@ -56,6 +102,59 @@ def _auth():
     return {"Authorization": f"Bearer {TOKEN}"} if TOKEN else {}
 
 
+class _McpError(Exception):
+    def __init__(self, error):
+        detail = error if isinstance(error, dict) else {}
+        data = detail.get("data") if isinstance(detail.get("data"), dict) else {}
+        super().__init__(str(detail.get("message") or "MCP tool call failed"))
+        self.status = data.get("status")
+
+
+def _mcp_call(name, arguments):
+    body = _post(
+        MCP,
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+         "params": {"name": name, "arguments": arguments}},
+        {**_auth(), "Accept": "application/json, text/event-stream"},
+    )
+    if not isinstance(body, dict):
+        raise _McpError({"message": "MCP returned a non-object response"})
+    if body.get("error"):
+        raise _McpError(body["error"])
+    return body
+
+
+def _extract_tool_json(body):
+    if not isinstance(body, dict):
+        return {}
+    result = body.get("result") or {}
+    if not isinstance(result, dict):
+        return {}
+    if isinstance(result.get("structuredContent"), dict):
+        return result["structuredContent"]
+    for item in result.get("content") or []:
+        try:
+            parsed = json.loads(item.get("text", ""))
+            if isinstance(parsed, dict):
+                return parsed
+        except (ValueError, AttributeError):
+            continue
+    return {}
+
+
+def _cache_path(claude_sid):
+    cache_key = hashlib.sha256(str(claude_sid or "unknown").encode("utf-8")).hexdigest()
+    return os.path.join(CACHE, f"{cache_key}.id")
+
+
+def _invalidate_bound_session(claude_sid):
+    path = _cache_path(claude_sid)
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
 def bound_session_id(claude_sid):
     """The cuecrux_session id for this Claude session, minted once and cached.
 
@@ -63,14 +162,12 @@ def bound_session_id(claude_sid):
     would scatter one agent across many phantom presence rows.
     """
     os.makedirs(CACHE, exist_ok=True)
-    path = os.path.join(CACHE, f"{claude_sid or 'unknown'}.id")
+    path = _cache_path(claude_sid)
     if os.path.exists(path):
         cached = open(path).read().strip()
         if cached:
             return cached
-    body = _post(MCP, {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                       "params": {"name": "cuecrux_session", "arguments": {"intent": "claude_code"}}},
-                 {**_auth(), "Accept": "application/json, text/event-stream"})
+    body = _mcp_call("cuecrux_session", {"intent": "claude_code", "project_id": PROJECT})
     sid = _extract_session_id(body)
     if sid:
         with open(path, "w") as fh:
@@ -80,49 +177,51 @@ def bound_session_id(claude_sid):
 
 def _extract_session_id(body):
     """cuecrux_session's id, wherever the MCP envelope put it."""
-    result = (body or {}).get("result") or {}
-    if isinstance(result.get("structuredContent"), dict):
-        sid = result["structuredContent"].get("session_id")
-        if sid:
-            return sid
-    for item in result.get("content") or []:
-        try:
-            return json.loads(item.get("text", "")).get("session_id")
-        except (ValueError, AttributeError):
-            continue
-    return None
+    return _extract_tool_json(body).get("session_id")
 
 
 def announce(hook, clear=False):
-    sid = bound_session_id(hook.get("session_id"))
-    if not sid:
-        return  # unbound: stay silent rather than write a presence row we cannot join
+    claude_sid = hook.get("session_id")
     cwd = hook.get("cwd") or os.getcwd()
-    _post(f"{HTTP}/v1/coord/announce", {
-        "session_id": sid,
-        "project_id": PROJECT,
-        "paths": [cwd],
-        # Paths are machine-local, so a second workstation with the same checkout
-        # path looks like a same-tree collision. Stamp the host so the operator can
-        # tell "the other PC has this repo open" from "another session on THIS box
-        # is editing the file I am about to write".
-        "note": f"claude-code {os.path.basename(cwd)} @{socket.gethostname()}",
-        "ttl_seconds": 0 if clear else TTL,
-    }, _auth())
+    for attempt in range(2):
+        sid = bound_session_id(claude_sid)
+        if not sid:
+            return  # unbound: stay silent rather than write a row we cannot join
+        try:
+            _mcp_call("coord_announce", {
+                "session_id": sid,
+                "project_id": PROJECT,
+                "paths": [cwd],
+                # Paths are machine-local, so a second workstation with the same checkout
+                # path looks like a same-tree collision. Stamp the host so the operator can
+                # tell "the other PC has this repo open" from "another session on THIS box
+                # is editing the file I am about to write".
+                "note": f"claude-code {os.path.basename(cwd)} @{socket.gethostname()}",
+                "ttl_seconds": 0 if clear else TTL,
+            })
+            return
+        except _McpError as error:
+            # M14 tightened session ownership/project binding. A cached M13 id
+            # can therefore be valid data but ineligible to announce. Invalidate
+            # once and mint a project-bound session with the same credential.
+            if error.status != 403 or attempt:
+                raise
+            _invalidate_bound_session(claude_sid)
 
 
 def check(hook):
     """Warn when a peer has declared the path this Edit/Write is about to touch."""
-    target = (hook.get("tool_input") or {}).get("file_path") or ""
+    tool_input = hook.get("tool_input")
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+    target = tool_input.get("file_path") or ""
     if not target:
         return
     mine = None
-    idfile = os.path.join(CACHE, f"{hook.get('session_id') or 'unknown'}.id")
+    idfile = _cache_path(hook.get("session_id"))
     if os.path.exists(idfile):
         mine = open(idfile).read().strip()
-    req = urllib.request.Request(f"{HTTP}/v1/coord/active", headers=_auth())
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-        data = json.loads(r.read().decode("utf-8", errors="replace"))
+    data = _extract_tool_json(_mcp_call("coord_status", {"project_id": PROJECT}))
     hits = []
     for s in data.get("active_sessions") or []:
         if s.get("session_id_hex") == mine:
@@ -156,6 +255,8 @@ def main():
     try:
         raw = sys.stdin.read() if not sys.stdin.isatty() else ""
         hook = json.loads(raw) if raw.strip() else {}
+        if not isinstance(hook, dict):
+            hook = {}
     except (ValueError, OSError):
         hook = {}
     try:
@@ -165,7 +266,7 @@ def main():
             check(hook)
         elif verb == "clear":
             announce(hook, clear=True)
-    except (urllib.error.URLError, OSError, ValueError, KeyError) as e:
+    except (_McpError, urllib.error.URLError, OSError, ValueError, TypeError, AttributeError, KeyError) as e:
         # Fail open, but say so — a silent failure here is what produced the
         # confident "0 sessions" this script exists to prevent.
         print(f"[crux-coord] {verb} unavailable: {type(e).__name__}", file=sys.stderr)

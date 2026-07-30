@@ -240,6 +240,17 @@ pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContra
         ));
     }
 
+    if method == "GET" && path == "/v1/sessions/active" {
+        return Some(RouteAuthContract::new(RouteAuthClass::AdminRead, &["admin:read"]));
+    }
+
+    if method == "GET" && path.starts_with("/v1/sessions/") && path.ends_with("/plan") {
+        return Some(RouteAuthContract::new(
+            RouteAuthClass::Read,
+            &["sessions:read", "admin:read"],
+        ));
+    }
+
     if path.starts_with("/v1/facts")
         || path.starts_with("/v1/sessions/")
         || path.starts_with("/v1/entities")
@@ -647,7 +658,36 @@ pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContra
         ));
     }
 
-    if path.starts_with("/v1/orchestrators") || path.starts_with("/v1/punchcards") {
+    if method == "POST" && path == "/v1/punchcards/check" {
+        return Some(RouteAuthContract::gated(
+            RouteAuthClass::FeatureGated,
+            &["facts:read", "admin:read"],
+            "CORECRUXD_PUNCHCARD",
+        ));
+    }
+
+    if method == "POST" && path.starts_with("/v1/punchcards/") && path.ends_with("/force-release") {
+        return Some(RouteAuthContract::gated(
+            RouteAuthClass::FeatureGated,
+            &["admin:write"],
+            "CORECRUXD_PUNCHCARD",
+        ));
+    }
+
+    if path.starts_with("/v1/punchcards") {
+        let scopes = if method == "GET" {
+            &["facts:read", "admin:read"][..]
+        } else {
+            &["facts:write", "admin:write"][..]
+        };
+        return Some(RouteAuthContract::gated(
+            RouteAuthClass::FeatureGated,
+            scopes,
+            "CORECRUXD_PUNCHCARD",
+        ));
+    }
+
+    if path.starts_with("/v1/orchestrators") {
         let scopes = if method == "GET" {
             &["facts:read", "admin:read"][..]
         } else {
@@ -1159,6 +1199,41 @@ mod tests {
             assert_eq!(contract.class, RouteAuthClass::AdminWrite, "{method} {path}");
             assert_eq!(contract.scopes, &["admin:write"], "{method} {path}");
         }
+    }
+
+    #[test]
+    fn coordination_and_force_release_scope_contracts_are_least_privilege() {
+        let announce = classify_route("POST", "/v1/coord/announce").expect("coord announce contract");
+        assert_eq!(announce.class, RouteAuthClass::FeatureGated);
+        assert_eq!(
+            announce.scopes,
+            &["admin:write", "sessions:write"],
+            "coordination writes must not accept the generic facts scope"
+        );
+
+        let force = classify_route("POST", "/v1/punchcards/{id}/force-release").expect("force-release contract");
+        assert_eq!(force.class, RouteAuthClass::FeatureGated);
+        assert_eq!(force.feature_gate, Some("CORECRUXD_PUNCHCARD"));
+        assert_eq!(
+            force.scopes,
+            &["admin:write"],
+            "cross-owner force release must require exact admin write authority"
+        );
+
+        let ordinary = classify_route("POST", "/v1/punchcards/acquire").expect("ordinary punchcard contract");
+        assert_eq!(ordinary.scopes, &["facts:write", "admin:write"]);
+        assert_eq!(ordinary.feature_gate, Some("CORECRUXD_PUNCHCARD"));
+
+        let check = classify_route("POST", "/v1/punchcards/check").expect("punchcard check contract");
+        assert_eq!(check.scopes, &["facts:read", "admin:read"]);
+        assert_eq!(check.feature_gate, Some("CORECRUXD_PUNCHCARD"));
+
+        let plan = classify_route("GET", "/v1/sessions/{session_id}/plan").expect("session plan contract");
+        assert_eq!(plan.scopes, &["sessions:read", "admin:read"]);
+
+        let active = classify_route("GET", "/v1/sessions/active").expect("active sessions contract");
+        assert_eq!(active.class, RouteAuthClass::AdminRead);
+        assert_eq!(active.scopes, &["admin:read"]);
     }
 
     #[test]

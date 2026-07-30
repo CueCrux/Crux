@@ -11688,6 +11688,10 @@ fn mint_test_verified_app_state(action_max_pending: usize) -> AppState {
 }
 
 fn mint_test_jwt_headers(scopes: &str, identity_claim: (&str, &str)) -> HeaderMap {
+    mint_test_jwt_headers_for_tenant(scopes, identity_claim, "default")
+}
+
+fn mint_test_jwt_headers_for_tenant(scopes: &str, identity_claim: (&str, &str), tenant_id: &str) -> HeaderMap {
     let exp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system time after epoch")
@@ -11698,7 +11702,7 @@ fn mint_test_jwt_headers(scopes: &str, identity_claim: (&str, &str)) -> HeaderMa
         "iss": MINT_TEST_ISSUER,
         "aud": MINT_TEST_AUDIENCE,
         "scope": scopes,
-        "tenant_id": "default",
+        "tenant_id": tenant_id,
     });
     claims[identity_claim.0] = serde_json::json!(identity_claim.1);
     let token = jsonwebtoken::encode(
@@ -13043,6 +13047,46 @@ async fn active_sessions_returns_seeded_bindings() {
 }
 
 #[tokio::test]
+async fn active_sessions_tenant_bound_admin_cannot_list_another_tenant() {
+    let mut state = mint_test_verified_app_state(16);
+    {
+        let mut store = state.fact_store.write().await;
+        for (session, tenant, passport) in [
+            ("aaaaaaaa", "tenant-a", "passport-a"),
+            ("bbbbbbbb", "tenant-b", "passport-b"),
+        ] {
+            crate::session_bindings::write_binding(
+                &mut store,
+                &crate::session_bindings::SessionBinding {
+                    session_id_hex: session.to_string(),
+                    project_id: Some("proj".to_string()),
+                    tenant_id: tenant.to_string(),
+                    passport_id: passport.to_string(),
+                    passport_category: "automation".to_string(),
+                    agent_work_gate: true,
+                    bound_at_unix_ms: 1,
+                },
+            )
+            .expect("write binding");
+        }
+    }
+    state.auth =
+        crate::auth::Authz::test_hs256(MINT_TEST_HS256_SECRET.as_bytes(), MINT_TEST_ISSUER, MINT_TEST_AUDIENCE);
+    let response = super::session::get_active_sessions(
+        State(state),
+        mint_test_jwt_headers_for_tenant("admin:read", ("sub", "admin-a"), "tenant-a"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["count"], 1);
+    assert_eq!(body["total_bindings"], 1);
+    assert_eq!(body["sessions"][0]["tenant_id"], "tenant-a");
+    assert!(!body.to_string().contains("tenant-b"));
+    assert!(!body.to_string().contains("passport-b"));
+}
+
+#[tokio::test]
 async fn active_sessions_requires_admin_read() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     let resp = super::session::get_active_sessions(State(state), HeaderMap::new()).await;
@@ -13114,6 +13158,11 @@ fn session_test_state(auth_mode: AuthMode, policy: super::session::SessionPolicy
         policy,
         [0xA5; 32],
     )));
+    {
+        let mut store = state.fact_store.try_write().expect("exclusive session test fact store");
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1)
+            .expect("seed session test passports");
+    }
     state
 }
 
@@ -13208,7 +13257,7 @@ async fn session_admission_rejects_missing_peer_and_untrusted_forwarded_loopback
         .body(axum::body::Body::from(SESSION_TEST_BODY))
         .expect("session request");
     *authenticated_request.headers_mut() =
-        session_test_headers(mint_test_verified_headers("sessions:write", "missing-peer-writer"));
+        session_test_headers(mint_test_verified_headers("sessions:write", "personal-default"));
     let authenticated_missing_peer = app.oneshot(authenticated_request).await.expect("router response");
     assert_eq!(authenticated_missing_peer.status(), StatusCode::OK);
 
@@ -13270,7 +13319,7 @@ async fn session_admission_requires_verified_write_scope_remotely() {
     let allowed = post_test_session(
         allowed_state,
         [203, 0, 113, 20],
-        mint_test_verified_headers("sessions:write", "session-writer"),
+        mint_test_verified_headers("sessions:write", "personal-default"),
     )
     .await;
     assert_eq!(allowed.status(), StatusCode::OK);
@@ -13304,7 +13353,36 @@ async fn session_admission_requires_verified_write_scope_remotely() {
 }
 
 #[tokio::test]
-async fn session_principal_quota_uses_verified_identity_not_ip_or_override() {
+async fn session_binding_authority_failures_precede_registry_and_event_mutation() {
+    let state = session_test_state(AuthMode::JwtHs256, session_test_policy());
+    let services = state.session.clone().expect("session services");
+
+    let unknown_passport = post_test_session(
+        state.clone(),
+        [203, 0, 113, 22],
+        mint_test_verified_headers("sessions:write", "not-a-stored-passport"),
+    )
+    .await;
+    assert_eq!(unknown_passport.status(), StatusCode::FORBIDDEN);
+
+    let subject_assertion = post_test_session_with_body(
+        state,
+        [203, 0, 113, 23],
+        mint_test_sub_only_headers("sessions:write", "subject-only"),
+        "application/json",
+        axum::body::Body::from(
+            br#"{"client_id":"test-agent","client_version":"0.1.0","accepts":["application/json"],"passport_id":"personal-default"}"#
+                .as_slice(),
+        ),
+    )
+    .await;
+    assert_eq!(subject_assertion.status(), StatusCode::FORBIDDEN);
+    assert_eq!(services.registry.active_count().expect("registry count"), 0);
+    assert_eq!(services.sealer.storage_bytes().expect("event bytes"), 0);
+}
+
+#[tokio::test]
+async fn session_principal_quota_uses_verified_identity_and_rejects_override() {
     let mut policy = session_test_policy();
     policy.max_per_principal = 1;
     let state = session_test_state(AuthMode::JwtHs256, policy);
@@ -13315,14 +13393,32 @@ async fn session_principal_quota_uses_verified_identity_not_ip_or_override() {
         HeaderValue::from_static("caller-selected-passport-a"),
     );
     let first = post_test_session(state.clone(), [203, 0, 113, 30], first_headers).await;
-    assert_eq!(first.status(), StatusCode::OK);
-
-    let mut second_headers = mint_test_verified_headers("admin:write", "credential-owner");
-    second_headers.insert(
-        "x-corecrux-passport-id",
-        HeaderValue::from_static("caller-selected-passport-b"),
+    assert_eq!(first.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        state
+            .session
+            .as_ref()
+            .expect("session services")
+            .registry
+            .active_count()
+            .expect("registry count"),
+        0,
+        "passport override denial must happen before session mutation"
     );
-    let second = post_test_session(state, [203, 0, 113, 31], second_headers).await;
+
+    let first = post_test_session(
+        state.clone(),
+        [203, 0, 113, 30],
+        mint_test_sub_only_headers("sessions:write", "credential-owner"),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let second = post_test_session(
+        state,
+        [203, 0, 113, 31],
+        mint_test_sub_only_headers("sessions:write", "credential-owner"),
+    )
+    .await;
     assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(second.headers().get(header::RETRY_AFTER).is_some());
     let body = json_body(second).await;
@@ -13418,6 +13514,14 @@ async fn concurrent_session_admission_consumes_exactly_one_remaining_slot() {
     )
     .expect("durable session services");
     state.session = Some(Arc::new(services));
+    {
+        let mut store = state
+            .fact_store
+            .try_write()
+            .expect("exclusive concurrent test fact store");
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1)
+            .expect("seed concurrent session passports");
+    }
 
     let first = post_test_session(
         state.clone(),
@@ -13470,8 +13574,9 @@ async fn session_plan_read_through_returns_sealed_v1_plan() {
 
     let read_resp = super::session::get_session_plan(
         State(state),
+        axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 41_100))),
         Path(session_id.clone()),
-        dev_scope_passport_headers("sessions:read", "personal-default"),
+        dev_scope_headers("sessions:read"),
     )
     .await;
     assert_eq!(read_resp.status(), StatusCode::OK);
@@ -13497,10 +13602,219 @@ async fn session_plan_read_through_returns_sealed_v1_plan() {
 }
 
 #[tokio::test]
+async fn session_plan_read_enforces_owner_and_tenant_even_for_tenant_admin() {
+    let mut state = mint_test_verified_app_state(16);
+    state.session = Some(Arc::new(super::session::SessionServices::local_default("node-a")));
+    let create = post_test_session(
+        state.clone(),
+        [127, 0, 0, 1],
+        mint_test_jwt_headers_for_tenant("sessions:write", ("sub", "owner-a"), "tenant-a"),
+    )
+    .await;
+    assert_eq!(create.status(), StatusCode::OK);
+    let session_id = create
+        .headers()
+        .get("x-cuecrux-session-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("session id")
+        .to_string();
+    let peer = || axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 41_100)));
+
+    let wrong_owner = super::session::get_session_plan(
+        State(state.clone()),
+        peer(),
+        Path(session_id.clone()),
+        mint_test_jwt_headers_for_tenant("sessions:read", ("sub", "owner-b"), "tenant-a"),
+    )
+    .await;
+    assert_eq!(wrong_owner.status(), StatusCode::FORBIDDEN);
+
+    let wrong_tenant_admin = super::session::get_session_plan(
+        State(state.clone()),
+        peer(),
+        Path(session_id.clone()),
+        mint_test_jwt_headers_for_tenant("admin:read", ("sub", "admin-b"), "tenant-b"),
+    )
+    .await;
+    assert_eq!(wrong_tenant_admin.status(), StatusCode::FORBIDDEN);
+
+    let owner = super::session::get_session_plan(
+        State(state),
+        peer(),
+        Path(session_id),
+        mint_test_jwt_headers_for_tenant("sessions:read", ("sub", "owner-a"), "tenant-a"),
+    )
+    .await;
+    let owner_status = owner.status();
+    let owner_body = json_body(owner).await;
+    assert_eq!(owner_status, StatusCode::OK, "owner denial: {owner_body}");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn subject_only_jwt_cannot_own_or_announce_agent_token_session() {
+    const AGENT_TOKEN: &str = "abcdef0123456789abcdef0123456789abcdef0123456789";
+    let _secret = EnvVarGuard::set("CORECRUXD_JWT_HS256_SECRET", MINT_TEST_HS256_SECRET);
+    let _issuer = EnvVarGuard::set("CORECRUXD_JWT_ISS", MINT_TEST_ISSUER);
+    let _audience = EnvVarGuard::set("CORECRUXD_JWT_AUD", MINT_TEST_AUDIENCE);
+    let _accept = EnvVarGuard::unset("CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS");
+    let _tokens = EnvVarGuard::set("CRUX_AGENT_TOKENS", &format!("openai:{AGENT_TOKEN}"));
+    let _scopes = EnvVarGuard::set(
+        "CORECRUXD_AGENT_TOKEN_HTTP_SCOPES",
+        "sessions:read sessions:write facts:read facts:write",
+    );
+    let _tenant = EnvVarGuard::set("CORECRUXD_AGENT_TOKEN_HTTP_TENANT", "tenant-a");
+    let _mapping_flag = EnvVarGuard::unset("CORECRUXD_AGENT_PASSPORTS");
+    let _mapping = EnvVarGuard::unset("CRUX_AGENT_PASSPORTS");
+
+    let mut state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    state.session = Some(Arc::new(super::session::SessionServices::local_default("node-a")));
+    let agent_headers = || {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {AGENT_TOKEN}")).expect("agent bearer"),
+        );
+        headers.insert(
+            crux_mcp::agent::INTERNAL_LOOPBACK_AGENT_PROOF_HEADER,
+            HeaderValue::from_str(&crux_mcp::agent::internal_loopback_agent_proof(AGENT_TOKEN)).expect("agent proof"),
+        );
+        headers
+    };
+    let create = post_test_session_with_body(
+        state.clone(),
+        [127, 0, 0, 1],
+        agent_headers(),
+        "application/json",
+        axum::body::Body::from(
+            r#"{"client_id":"test-agent","client_version":"0.1.0","accepts":["application/json"],"project_id":"proj","tenant_id":"tenant-a"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(create.status(), StatusCode::OK);
+    let session_id = create
+        .headers()
+        .get("x-cuecrux-session-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("session id")
+        .to_string();
+    {
+        let store = state.fact_store.read().await;
+        let binding = crate::session_bindings::get_binding(&store, &session_id).expect("session binding");
+        assert_eq!(binding.passport_id, "agent:openai");
+    }
+
+    let attacker_read = super::session::get_session_plan(
+        State(state.clone()),
+        axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 41_100))),
+        Path(session_id.clone()),
+        mint_test_jwt_headers_for_tenant("sessions:read", ("sub", "agent:openai"), "tenant-a"),
+    )
+    .await;
+    assert_eq!(attacker_read.status(), StatusCode::FORBIDDEN);
+
+    let owner_read = super::session::get_session_plan(
+        State(state.clone()),
+        axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 41_100))),
+        Path(session_id.clone()),
+        agent_headers(),
+    )
+    .await;
+    assert_eq!(owner_read.status(), StatusCode::OK);
+
+    let announce = || super::coord::AnnounceBody {
+        session_id: session_id.clone(),
+        project_id: "proj".to_string(),
+        by_passport: None,
+        execplan_slug: Some("plan-x".to_string()),
+        milestone: Some("M14".to_string()),
+        deploy_target: None,
+        paths: vec!["crates/corecruxd".to_string()],
+        note: None,
+        ttl_seconds: None,
+    };
+    let attacker_announce = super::coord::post_coord_announce(
+        State(state.clone()),
+        axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 41_100))),
+        mint_test_jwt_headers_for_tenant("sessions:write", ("sub", "agent:openai"), "tenant-a"),
+        Json(announce()),
+    )
+    .await
+    .into_response();
+    assert_eq!(attacker_announce.status(), StatusCode::FORBIDDEN);
+
+    let owner_announce = super::coord::post_coord_announce(
+        State(state),
+        axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 41_100))),
+        agent_headers(),
+        Json(announce()),
+    )
+    .await
+    .into_response();
+    assert_eq!(owner_announce.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn mapped_agent_token_creates_session_without_caller_passport_assertion() {
+    const AGENT_TOKEN: &str = "abcdef0123456789abcdef0123456789abcdef0123456789";
+    let _secret = EnvVarGuard::set("CORECRUXD_JWT_HS256_SECRET", MINT_TEST_HS256_SECRET);
+    let _issuer = EnvVarGuard::set("CORECRUXD_JWT_ISS", MINT_TEST_ISSUER);
+    let _audience = EnvVarGuard::set("CORECRUXD_JWT_AUD", MINT_TEST_AUDIENCE);
+    let _accept = EnvVarGuard::unset("CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS");
+    let _tokens = EnvVarGuard::set("CRUX_AGENT_TOKENS", &format!("openai:{AGENT_TOKEN}"));
+    let _scopes = EnvVarGuard::set(
+        "CORECRUXD_AGENT_TOKEN_HTTP_SCOPES",
+        "sessions:read sessions:write facts:read facts:write",
+    );
+    let _tenant = EnvVarGuard::set("CORECRUXD_AGENT_TOKEN_HTTP_TENANT", "tenant-a");
+    let _mapping_flag = EnvVarGuard::set("CORECRUXD_AGENT_PASSPORTS", "1");
+    let _mapping = EnvVarGuard::set("CRUX_AGENT_PASSPORTS", "openai:codex-work:tenant-a");
+
+    let mut state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    state.session = Some(Arc::new(super::session::SessionServices::local_default("node-a")));
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {AGENT_TOKEN}")).expect("agent bearer"),
+    );
+    headers.insert(
+        crux_mcp::agent::INTERNAL_LOOPBACK_AGENT_PROOF_HEADER,
+        HeaderValue::from_str(&crux_mcp::agent::internal_loopback_agent_proof(AGENT_TOKEN)).expect("agent proof"),
+    );
+
+    let create = post_test_session_with_body(
+        state.clone(),
+        [127, 0, 0, 1],
+        headers,
+        "application/json",
+        axum::body::Body::from(
+            r#"{"client_id":"test-agent","client_version":"0.1.0","accepts":["application/json"],"project_id":"proj","tenant_id":"tenant-a"}"#,
+        ),
+    )
+    .await;
+    let status = create.status();
+    let session_id = create
+        .headers()
+        .get("x-cuecrux-session-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let body = json_body(create).await;
+    assert_eq!(status, StatusCode::OK, "mapped-agent denial: {body}");
+
+    let store = state.fact_store.read().await;
+    let binding = crate::session_bindings::get_binding(&store, session_id.as_deref().expect("mapped-agent session id"))
+        .expect("mapped-agent session binding");
+    assert_eq!(binding.passport_id, "codex-work");
+    assert_eq!(binding.passport_category, "automation");
+}
+
+#[tokio::test]
 async fn session_plan_read_through_requires_session_scope() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     let resp = super::session::get_session_plan(
         State(state),
+        axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 41_100))),
         Path("00000000000000000000000000000000".to_string()),
         HeaderMap::new(),
     )

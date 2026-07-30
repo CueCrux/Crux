@@ -616,6 +616,78 @@ mod tests {
     const LB: &str = "/x/.local/bin";
 
     #[test]
+    fn coordination_hook_preserves_fail_open_and_safe_cache_contracts() {
+        assert!(
+            COORD_PY.contains("hashlib.sha256"),
+            "hook cache filenames must not contain raw external session ids"
+        );
+        for error_type in [
+            "_McpError",
+            "urllib.error.URLError",
+            "OSError",
+            "ValueError",
+            "TypeError",
+            "AttributeError",
+            "KeyError",
+        ] {
+            assert!(
+                COORD_PY.contains(error_type),
+                "{error_type} must stay inside the advisory fail-open boundary"
+            );
+        }
+        assert!(
+            COORD_PY.contains("error.status != 403"),
+            "an ownership denial must invalidate one stale cached session and remint"
+        );
+    }
+
+    #[test]
+    fn coordination_hook_direct_invocation_prefers_registered_mcp_token() {
+        let python_available = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !python_available {
+            return;
+        }
+
+        let home = tmp();
+        let config = home.join(".config/cuecrux");
+        let tokens = config.join("crux-tokens");
+        std::fs::create_dir_all(&tokens).unwrap();
+        std::fs::write(
+            config.join("env"),
+            "CRUX_MCP_URL=http://env.example:14801/mcp\nCRUX_AGENT_TOKEN=http-jwt\n",
+        )
+        .unwrap();
+        std::fs::write(tokens.join("anthropic.mcp-token"), "registered-mcp-token\n").unwrap();
+
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/hooks/crux-coord.py");
+        let probe = concat!(
+            "import json, runpy, sys; ",
+            "module = runpy.run_path(sys.argv[1], run_name='crux_coord_test'); ",
+            "print(json.dumps({'mcp': module['MCP'], 'token': module['TOKEN']}))"
+        );
+        let output = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(probe)
+            .arg(script)
+            .env("HOME", &home)
+            .env_remove("CRUX_MCP_URL")
+            .env("CRUX_AGENT_TOKEN", "inherited-http-jwt")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "direct hook import failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let selected: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(selected["mcp"], "http://env.example:14801/mcp");
+        assert_eq!(selected["token"], "registered-mcp-token");
+    }
+
+    #[test]
     fn hooks_block_observe_only_when_no_binary() {
         let w = Path::new("/x/crux-hook-env.sh");
         let lb = Path::new(LB);

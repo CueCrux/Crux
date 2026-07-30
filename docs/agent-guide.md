@@ -182,7 +182,9 @@ on both ports, survives daemon restarts, and works with native MCP clients that
 send a fixed bearer. An unmapped token acts as the namespaced automation
 principal `agent:<token-name>`; only an explicit `CRUX_AGENT_PASSPORTS` entry
 maps it to a real passport. Default off, so HTTP stays JWT-only unless you opt
-in.
+in. Embedded MCP ownership calls do not need this public compatibility flag:
+they preserve the exact registered bearer with a process-local proof, and the
+default automation scopes exclude `admin:read` and `admin:write`.
 
 Daemon-side rails 2 and 3 are opt-in and default off (see `config.example.env`:
 `CORECRUXD_TS_IDENTITY_ENABLED`, `CORECRUXD_DEVICE_GRANT_ENABLED`). Issuance mints

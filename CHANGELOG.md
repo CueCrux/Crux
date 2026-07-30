@@ -92,6 +92,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Session coordination and punchcard leases now derive authority from
+  authenticated state instead of caller-supplied identity fields.**
+  `coord_announce` requires `sessions:write` (or `admin:write`), proves that
+  the caller owns a still-live session using its daemon-keyed admission
+  principal, and stamps the stored session binding; `by_passport` is only an
+  optional equality assertion. Punchcard acquire/check/release similarly stamp
+  the authenticated principal and tenant, reject cross-owner or cross-tenant
+  attempts before mutation, and hide the governed `punchcard` kind from generic
+  entity CRUD. Cross-owner force release is no longer an MCP tool: the HTTP
+  route requires an issuer-authenticated canonical `passport_id` claim,
+  `admin:write`, tenant authority, and explicit confirmation. MCP loopback
+  tokens no longer carry ambient `admin:write`.
+  - MCP `punch_in` now accepts `ttl_secs` (1–86400) instead of the previously
+    advertised but ignored `expires_at_unix_ms`; holder and tenant fields are
+    optional consistency assertions.
+  - Existing local-development leases using unnamespaced holder ids are not
+    rewritten and expire under their existing TTL. Anonymous direct-loopback
+    compatibility is explicitly namespaced as `operator:unverified:*`; callers
+    needing per-session isolation must use an authenticated session-aware MCP
+    client.
 - **Public session bootstrap is bounded and source-aware.** `POST /session`
   remains anonymous only for a direct loopback socket without forwarding
   headers; proxied, remote, and missing-peer requests require a verified

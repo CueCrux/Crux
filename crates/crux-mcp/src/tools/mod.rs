@@ -1917,7 +1917,7 @@ pub fn list_tools_with_flags(
                 "properties": {
                     "session_id":    { "type": "string", "description": "Your bound session id (hex) — the one cuecrux_session minted." },
                     "project_id":    { "type": "string" },
-                    "by_passport":   { "type": "string", "description": "Optional; the session binding's passport wins when the session is bound." },
+                    "by_passport":   { "type": "string", "description": "Optional consistency assertion. Authority always comes from the authenticated live session binding; a mismatch is rejected." },
                     "execplan_slug": { "type": "string" },
                     "milestone":     { "type": "string" },
                     "deploy_target": { "type": "string", "description": "Optional deploy-axis focus (e.g. \"deploy:crux\"). When a live peer announces the same target, the response overlaps[] carries a deploy_target warning — serialise the deploy, don't double-cut. Advisory only." },
@@ -2475,7 +2475,7 @@ pub fn list_tools_with_flags(
                 ]
             }),
         },
-        // ── Punchcards (Package S scaffold) ────────────────────────
+        // ── Punchcards (coordination leases) ──────────────────────
         ToolDefinition {
             name: "punch_in".to_string(),
             description: punchcards::PUNCH_IN_DESCRIPTION.to_string(),
@@ -2483,15 +2483,15 @@ pub fn list_tools_with_flags(
                 "type": "object",
                 "properties": {
                     "resource":           { "type": "string", "description": "Resource to lease, e.g. file:///path or a deploy-target id." },
-                    "holder_passport":    { "type": "string", "description": "The passport acquiring the lease." },
+                    "holder_passport":    { "type": "string", "description": "Optional consistency assertion; the authenticated MCP authority is always the holder." },
                     "mode":               { "type": "string", "enum": ["modify","deploy"] },
-                    "tenant_id":          { "type": "string" },
+                    "tenant_id":          { "type": "string", "description": "Optional consistency assertion; the authenticated MCP tenant is always used." },
                     "reason":             { "type": "string" },
-                    "expires_at_unix_ms": { "type": "integer" }
+                    "ttl_secs":           { "type": "integer", "minimum": 1, "maximum": 86400, "description": "Requested lease lifetime in seconds (default 1800; clamped to 1..86400)." }
                 },
-                "required": ["resource", "holder_passport"],
+                "required": ["resource"],
                 "examples": [
-                    { "resource": "file:///home/x/main.rs", "holder_passport": "personal-default", "mode": "modify" }
+                    { "resource": "file:///home/x/main.rs", "mode": "modify", "ttl_secs": 900 }
                 ]
             }),
         },
@@ -2502,13 +2502,13 @@ pub fn list_tools_with_flags(
                 "type": "object",
                 "properties": {
                     "resource":           { "type": "string" },
-                    "holder_passport":    { "type": "string" },
+                    "holder_passport":    { "type": "string", "description": "Optional consistency assertion; the authenticated MCP authority must own the lease." },
                     "release_commit_sha": { "type": "string" },
-                    "tenant_id":          { "type": "string" }
+                    "tenant_id":          { "type": "string", "description": "Optional consistency assertion; the authenticated MCP tenant is always used." }
                 },
-                "required": ["resource", "holder_passport"],
+                "required": ["resource"],
                 "examples": [
-                    { "resource": "file:///home/x/main.rs", "holder_passport": "personal-default" }
+                    { "resource": "file:///home/x/main.rs" }
                 ]
             }),
         },
@@ -2520,27 +2520,10 @@ pub fn list_tools_with_flags(
                 "properties": {
                     "resource":        { "type": "string" },
                     "holder_passport": { "type": "string" },
-                    "tenant_id":       { "type": "string" },
+                    "tenant_id":       { "type": "string", "description": "Optional consistency assertion; results are always confined to the authenticated MCP tenant." },
                     "status":          { "type": "string", "enum": ["held","released","expired","force_released"] }
                 },
                 "examples": [ {}, { "status": "held" } ]
-            }),
-        },
-        ToolDefinition {
-            name: "force_release".to_string(),
-            description: punchcards::FORCE_RELEASE_DESCRIPTION.to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "punchcard_id": { "type": "string" },
-                    "confirm":      { "type": "boolean", "description": "Required true — force-release is destructive (Art.14)." },
-                    "reason":       { "type": "string" },
-                    "by_passport":  { "type": "string", "description": "Operator passport performing the override." }
-                },
-                "required": ["punchcard_id", "confirm"],
-                "examples": [
-                    { "punchcard_id": "pc_abc123", "confirm": true, "reason": "stale lease, holder offline" }
-                ]
             }),
         },
         ToolDefinition {
@@ -2551,7 +2534,7 @@ pub fn list_tools_with_flags(
                 "properties": {
                     "resource": { "type": "string", "description": "Resource URI: file://<path>, tree://<subtree>, or service://<name>." },
                     "mode":     { "type": "string", "enum": ["modify","deploy"] },
-                    "passport": { "type": "string", "description": "Probing passport; defaults to the calling passport." }
+                    "passport": { "type": "string", "description": "Optional consistency assertion; the authenticated MCP authority is always the probing passport." }
                 },
                 "required": ["resource"],
                 "examples": [
@@ -2811,8 +2794,8 @@ const FACT_WRITE_TOOLS: &[&str] = &["store_fact", "delete_fact"];
 
 /// Retrieval-only surface matching the daemon's `query:read` contract. This
 /// intentionally does not reuse OAuth `mcp:read`: OAuth also includes session,
-/// receipt, sync, and coordination reads whose daemon HTTP scopes are
-/// separate.
+/// receipt, and sync reads whose daemon HTTP scopes are separate; coordination
+/// is excluded because it crosses the daemon authority boundary.
 const QUERY_READ_TOOLS: &[&str] = &["query", "query_scan", "query_expand", "query_facts"];
 
 const SESSION_WRITE_TOOLS: &[&str] = &[
@@ -3004,8 +2987,8 @@ pub fn tool_output_docs() -> Value {
         { "tool": "update_work_state",  "output": "{ applied: bool, work?: WorkItem, queued?: { action_id, work_id, requested_by_passport, target_state, status: 'pending', requested_at_unix_ms } }" },
         { "tool": "comment_on_work",    "output": "{ id, work_id, author_passport, body, posted_at_unix_ms }" },
         { "tool": "status_feed",        "output": "{ enabled: bool, events: [{ work_id, verb: 'CLAIMED'|'BLOCKED'|'HUMAN_HOLD'|'RESUMED'|'DONE'|'FAILED', transition_id, from_state, to_state, by_passport, at_unix_ms }], note? }" },
-        { "tool": "coord_status",       "output": "{ now_unix_ms, presence_ttl_secs, project_id?, active_sessions: [{ session_id_hex, passport_id, tenant_id, project_id?, bound_at_unix_ms, last_seen_at_unix_ms, active_until_unix_ms, intent?: { execplan_slug?, milestone?, paths, note?, announced_at_unix_ms, expires_at_unix_ms }, leases?: [{ punchcard_id, resource, mode, holder_passport, expires_at_unix_ms }] }], work_in_flight: [WorkItem] }" },
-        { "tool": "coord_announce",     "output": "{ intent: { project_id, session_id_hex, passport_id, execplan_slug?, milestone?, deploy_target?, paths, note?, announced_at_unix_ms, expires_at_unix_ms }, cleared: bool, live_peer_intents: n, overlaps: [{ peer_session_id_hex, peer_passport_id, kind: execplan|deploy_target|intent_path|lease, theirs, yours }] } — surface any overlaps to the operator and coordinate before editing those paths or cutting that deploy" },
+        { "tool": "coord_status",       "output": "{ now_unix_ms, presence_ttl_secs, project_id?, active_sessions: [{ session_id_hex, passport_id, tenant_id, project_id?, bound_at_unix_ms, last_seen_at_unix_ms, active_until_unix_ms, intent?: { tenant_id, execplan_slug?, milestone?, paths, note?, announced_at_unix_ms, expires_at_unix_ms }, leases?: [{ punchcard_id, resource, mode, holder_passport, tenant_id, expires_at_unix_ms }] }], work_in_flight: [WorkItem] }" },
+        { "tool": "coord_announce",     "output": "{ intent: { project_id, session_id_hex, passport_id, tenant_id, execplan_slug?, milestone?, deploy_target?, paths, note?, announced_at_unix_ms, expires_at_unix_ms }, cleared: bool, live_peer_intents: n, overlaps: [{ peer_session_id_hex, peer_passport_id, kind: execplan|deploy_target|intent_path|lease, theirs, yours }] } — surface any overlaps to the operator and coordinate before editing those paths or cutting that deploy" },
         { "tool": "github_search",         "output": "{ count, facts: [{ entity, key, value, ... }] } — value strings hold JSON-encoded CommitRecord / PrRecord / IssueRecord / CommentRecord depending on the entity prefix." },
         { "tool": "github_recent_commits", "output": "{ count, facts: [Fact] } — entities are `github::owner/repo::commit/{sha}`; value JSON contains sha, message, author_name, author_login?, committed_at, parents[], html_url." },
         { "tool": "github_open_prs",       "output": "{ count, facts: [Fact] } — entities are `github::owner/repo::pr/{number}`; value JSON contains title, state, author_login?, head_sha, base_branch, body, merged_at?, closed_at?, html_url." },
@@ -3034,15 +3017,14 @@ pub fn tool_output_docs() -> Value {
         { "tool": "session_token_usage",     "output": "{ content: [...], passport, used, tokens_in, tokens_out, declared_budget_in, calls, estimator, limit?, pct? } — per-passport estimated token spend (~4 chars/token); limit/pct only when CORECRUXD_SESSION_TOKEN_BUDGET is set." },
         { "tool": "approval_request",        "output": "{ content: [...], request_id, status: 'pending'|'feature_disabled', risk_tier, tenant_id, feature_enabled } — pending entries also visible via list_work(state='pending_approval')." },
         { "tool": "approval_decide",         "output": "{ content: [...], ok, request_id, status: 'approved'|'rejected', reviewer_passport, decided_at, receipt_id, receipt_body_hash_hex, tenant_id, risk_tier } — non-operator callers receive a 403-style JSON-RPC error with `why_denied`." },
-        { "tool": "create_orchestrator",      "output": "Orchestrator record { id, name, assignee_passport, created_by_passport, tenant_id, state, members[], created_at_unix_ms, updated_at_unix_ms }. (Package S scaffold: daemon endpoint stubbed → 501 until the orchestrators plan ships.)" },
-        { "tool": "attach_to_orchestrator",   "output": "Updated orchestrator record with the member added. (Package S scaffold: 501 until shipped.)" },
-        { "tool": "detach_from_orchestrator", "output": "Updated orchestrator record with the member removed. (Package S scaffold: 501 until shipped.)" },
-        { "tool": "list_orchestrators",       "output": "{ count, orchestrators: [Orchestrator] }. (Package S scaffold: 501 until shipped.)" },
+        { "tool": "create_orchestrator",      "output": "Orchestrator record { id, name, assignee_passport, created_by_passport, tenant_id, state, members[], created_at_unix_ms, updated_at_unix_ms }." },
+        { "tool": "attach_to_orchestrator",   "output": "Updated tenant-scoped orchestrator record with the passport member added." },
+        { "tool": "detach_from_orchestrator", "output": "Updated tenant-scoped orchestrator record with the passport member removed." },
+        { "tool": "list_orchestrators",       "output": "{ count, orchestrators: [Orchestrator] } for the authenticated tenant." },
         { "tool": "update_orchestrator",      "output": "Updated orchestrator record { id, name, assignee_passport, state, members[], … } after a name/assignee/state change (state=archived closes it out)." },
-        { "tool": "punch_in",                 "output": "Punchcard lease record { id, resource, mode, holder_passport, tenant_id, status, acquired_at_unix_ms, expires_at_unix_ms?, receipt_acquire }. (Package S scaffold: 501 until the punchcard plan ships.)" },
-        { "tool": "punch_out",                "output": "Released punchcard record (status=released, released_at_unix_ms, release_commit_sha?, receipt_release). (Package S scaffold: 501 until shipped.)" },
-        { "tool": "list_punchcards",          "output": "{ count, punchcards: [Punchcard] }. (Package S scaffold: 501 until shipped.)" },
-        { "tool": "force_release",            "output": "Force-released punchcard record (status=force_released, force_released_by, receipt_release). Requires confirm=true (Art.14)." },
+        { "tool": "punch_in",                 "output": "Punchcard lease record { id, resource, mode, holder_passport, tenant_id, status, acquired_at_unix_ms, expires_at_unix_ms?, receipt_acquire }; a reentrant refresh may return reentrant:true and advisory_conflict." },
+        { "tool": "punch_out",                "output": "Released request-owned punchcard record (status=released, released_at_unix_ms, release_commit_sha?, receipt_release)." },
+        { "tool": "list_punchcards",          "output": "{ count, punchcards: [Punchcard] } for the authenticated tenant." },
         { "tool": "check_punchcard",          "output": "Lease probe { held_by_other, enforce, holder_passport, resource, mode, expires_at_unix_ms }. Always 200 (fail-open); the PreToolUse hook denies only when held_by_other && enforce." },
         { "tool": "register_repo",            "output": "Proxied POST /v1/repos: the registration { repo_id, tenant_id, root_path?, clone_url?, languages: [string], enabled, added_at_unix_ms, last_scan_id? }. Registering a local root_path runs a one-shot scan and sets last_scan_id; clone_url registration defers the scan." },
         { "tool": "list_repos",               "output": "Proxied GET /v1/repos?tenant_id=…: { repos: [{ repo_id, tenant_id, root_path?, clone_url?, languages, enabled, last_scan_id? }] } scoped to the caller's tenant." },
@@ -3202,11 +3184,11 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "detach_from_orchestrator" => orchestrators::handle_detach_from_orchestrator(args, ctx).await,
         "list_orchestrators" => orchestrators::handle_list_orchestrators(args, ctx).await,
         "update_orchestrator" => orchestrators::handle_update_orchestrator(args, ctx).await,
-        // Punchcards (Package S scaffold).
+        // Punchcards (coordination leases).
         "punch_in" => punchcards::handle_punch_in(args, ctx).await,
         "punch_out" => punchcards::handle_punch_out(args, ctx).await,
         "list_punchcards" => punchcards::handle_list_punchcards(args, ctx).await,
-        "force_release" => punchcards::handle_force_release(args, ctx).await,
+        "force_release" => punchcards::handle_force_release(args, ctx),
         "check_punchcard" => punchcards::handle_check_punchcard(args, ctx).await,
         // GitHub (Plan B G5).
         "github_search" => github::handle_github_search(args, ctx).await,
@@ -3349,7 +3331,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 132; // +1 execplan_write (source-of-truth plane M2: the one legal plan write path). +5 code_intel (code_path/blast_radius/liveness/trace_diff/dead_code, crux-codemap-agent-surface M1). +8 context_graph (3 storybook + 5 dossier, crux-storybook-dossier-agent-and-console-surface M2). // +1 engram_resolve +1 reuse_check (minimalism plane M2/M3). +2 register_repo + list_repos (repo-watch M3). +1 status_feed (open-engine-coordination-surfaces M3). +1 context_custody_audit (race-to-context positioning). +1 revoke_passport (passport-revocation M2). main 94 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check + 2 coord-plane: coord_status + coord_announce + session_token_usage (action-ledger M1)) + 2 session-archive (archive_session + unarchive_session) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard) + 1 activity (activity_recent, crux-dual-surface-activity-log M2) + 2 consolidation (memory_contradictions + memory_consolidate, audit-ii M4) + 1 session-mining (learn, token-efficiency M4) + 1 holdout (token_savings, token-efficiency cutover CO-4).
+    const TOOL_COUNT: usize = 131; // +1 execplan_write (source-of-truth plane M2: the one legal plan write path). +5 code_intel (code_path/blast_radius/liveness/trace_diff/dead_code, crux-codemap-agent-surface M1). +8 context_graph (3 storybook + 5 dossier, crux-storybook-dossier agent surface M2). +1 engram_resolve +1 reuse_check (minimalism plane M2/M3). +2 register_repo + list_repos (repo-watch M3). +1 status_feed (open-engine-coordination-surfaces M3). +1 context_custody_audit (race-to-context positioning). +1 revoke_passport (passport-revocation M2). The native MCP force-release tool was removed in M14: cross-owner release is HTTP-only issuer-verified canonical-passport admin authority.
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")
@@ -3583,6 +3565,28 @@ mod tests {
         // Coordination plane (2)
         assert!(names.contains(&"coord_status".to_string()));
         assert!(names.contains(&"coord_announce".to_string()));
+        assert!(
+            !names.contains(&"force_release".to_string()),
+            "cross-owner release is HTTP-only issuer-verified canonical-passport admin authority"
+        );
+    }
+
+    #[test]
+    fn punchcard_tool_schemas_keep_identity_assertions_optional_and_use_ttl_secs() {
+        let tools = list_tools();
+        let punch_in = tools
+            .iter()
+            .find(|tool| tool.name == "punch_in")
+            .expect("punch_in schema");
+        assert_eq!(punch_in.input_schema["required"], json!(["resource"]));
+        assert!(punch_in.input_schema["properties"].get("ttl_secs").is_some());
+        assert!(punch_in.input_schema["properties"].get("expires_at_unix_ms").is_none());
+
+        let punch_out = tools
+            .iter()
+            .find(|tool| tool.name == "punch_out")
+            .expect("punch_out schema");
+        assert_eq!(punch_out.input_schema["required"], json!(["resource"]));
     }
 
     #[test]

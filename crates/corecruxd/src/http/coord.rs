@@ -14,6 +14,9 @@
 //! All routes are gated by `CORECRUXD_COORD=1`; when the flag is off they
 //! return 404 so the surface is invisible rather than half-alive.
 
+use std::net::SocketAddr;
+
+use axum::extract::ConnectInfo;
 use serde_json::Value;
 
 use super::{
@@ -31,6 +34,8 @@ pub(super) struct ActiveQuery {
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct AnnounceBody {
     pub session_id: String,
+    /// Immutable coordination partition label selected at session mint. It is
+    /// not a project ACL grant; tenant authority remains the security boundary.
     pub project_id: String,
     /// Announcing passport. Optional — resolved from the session binding
     /// (authoritative) or the authenticated request passport when omitted.
@@ -71,7 +76,7 @@ fn coord_disabled_response() -> axum::response::Response {
 /// Live `held` punchcards from the substrate entity store, summarised for
 /// the active view. Read-only — the punchcard surface's own handlers sweep
 /// expired cards on acquire/list; here an expired card is simply filtered.
-async fn live_lease_summaries(state: &AppState, now_ms: i64) -> Vec<LeaseSummary> {
+async fn live_lease_summaries(state: &AppState, now_ms: i64, tenant_id: &str) -> Vec<LeaseSummary> {
     let store = state.entity_store.read().await;
     let query = corecrux_memory::EntityQuery {
         kind: Some(PUNCHCARD_KIND.to_string()),
@@ -83,6 +88,10 @@ async fn live_lease_summaries(state: &AppState, now_ms: i64) -> Vec<LeaseSummary
         .into_iter()
         .filter_map(|rec| {
             let p: &Value = &rec.payload;
+            let lease_tenant = p.get("tenant_id").and_then(Value::as_str).unwrap_or("default");
+            if lease_tenant != tenant_id {
+                return None;
+            }
             if p.get("status").and_then(Value::as_str) != Some("held") {
                 return None;
             }
@@ -103,6 +112,7 @@ async fn live_lease_summaries(state: &AppState, now_ms: i64) -> Vec<LeaseSummary
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
+                tenant_id: lease_tenant.to_string(),
                 reason: p.get("reason").and_then(Value::as_str).map(str::to_string),
                 expires_at_unix_ms: expires,
             })
@@ -125,10 +135,10 @@ pub(super) async fn get_coord_active(
         Ok(context) => context,
         Err(problem) => return problem.into_response(),
     };
-    if !context.has_scope("admin:read") {
+    if !context.has_scope("admin:read") && !context.has_scope("sessions:read") {
         return problem_response(
             StatusCode::FORBIDDEN,
-            "admin:read scope required for coordination status",
+            "admin:read or sessions:read scope required for coordination status",
         );
     }
     let tenant_id = match context.resolve_authorized_tenant(q.tenant_id.as_deref()) {
@@ -137,8 +147,8 @@ pub(super) async fn get_coord_active(
     };
     let now = now_unix_ms();
     let store = state.fact_store.read().await;
-    let bindings = crate::session_bindings::list_bindings(&store);
-    let intents = crate::coord::list_intents(&store, q.project_id.as_deref());
+    let bindings = crate::session_bindings::list_bindings_for_tenant(&store, &tenant_id);
+    let intents = crate::coord::list_intents_for_tenant(&store, q.project_id.as_deref(), &tenant_id);
     let mut work_in_flight = crate::work::list_work(
         &store,
         q.project_id.as_deref(),
@@ -155,7 +165,7 @@ pub(super) async fn get_coord_active(
     ));
     drop(store);
 
-    let leases = live_lease_summaries(&state, now as i64).await;
+    let leases = live_lease_summaries(&state, now as i64, &tenant_id).await;
 
     let presence_by_passport: std::collections::BTreeMap<String, u64> = state
         .presence
@@ -171,6 +181,7 @@ pub(super) async fn get_coord_active(
         &intents,
         &leases,
         work_in_flight,
+        &tenant_id,
         q.project_id.as_deref(),
         state.coord_presence_ttl_secs,
         now,
@@ -183,13 +194,14 @@ pub(super) async fn get_coord_active(
 #[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_coord_announce(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<AnnounceBody>,
 ) -> impl IntoResponse {
     if !state.coord_enabled {
         return coord_disabled_response();
     }
-    if let Err(problem) = require_http_any_scope(&state.auth, &headers, &["facts:write", "admin:write"]) {
+    if let Err(problem) = require_http_any_scope(&state.auth, &headers, &["sessions:write", "admin:write"]) {
         return problem.into_response();
     }
     if body.session_id.trim().is_empty() || body.project_id.trim().is_empty() {
@@ -200,33 +212,73 @@ pub(super) async fn post_coord_announce(
     }
 
     let now = now_unix_ms();
+    let session_id_hex = body.session_id.trim().to_ascii_lowercase();
+    let (authority, _) =
+        match super::session::authorize_live_session_admission(&state, &headers, Some(peer.ip()), &session_id_hex, now)
+        {
+            Ok(authorized) => authorized,
+            Err(response) => return response,
+        };
     let ttl_secs = body
         .ttl_seconds
         .unwrap_or(crate::coord::DEFAULT_INTENT_TTL_SECS)
         .min(crate::coord::MAX_TTL_SECS);
 
     let mut store = state.fact_store.write().await;
-    // Passport resolution order: session binding (authoritative) → explicit
-    // body passport → authenticated request passport. Never anonymous.
-    let passport_id = crate::session_bindings::get_binding(&store, body.session_id.trim())
-        .map(|b| b.passport_id)
-        .or_else(|| body.by_passport.clone().filter(|p| !p.trim().is_empty()))
-        .or_else(|| {
-            crate::auth::http_scope_context(&state.auth, &headers)
-                .ok()
-                .and_then(|ctx| ctx.passport_id)
-        });
-    let Some(passport_id) = passport_id else {
+    let Some(binding) = crate::session_bindings::get_binding(&store, &session_id_hex) else {
         return problem_response(
-            StatusCode::BAD_REQUEST,
-            "no passport: pass by_passport, bind the session, or authenticate with a passport header".to_string(),
+            StatusCode::FORBIDDEN,
+            "session has no authoritative binding; mint a new session".to_string(),
         );
     };
+    if authority.verified && authority.actor_id != binding.passport_id {
+        return problem_response(
+            StatusCode::FORBIDDEN,
+            "session binding does not match the verified request authority".to_string(),
+        );
+    }
+    if let Some(claimed) = body
+        .by_passport
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if claimed != binding.passport_id {
+            return problem_response(
+                StatusCode::FORBIDDEN,
+                "body passport does not match the session binding".to_string(),
+            );
+        }
+    }
+    match binding.project_id.as_deref() {
+        Some(project_id) if project_id == body.project_id.trim() => {}
+        Some(_) => {
+            return problem_response(
+                StatusCode::FORBIDDEN,
+                "body project does not match the session binding".to_string(),
+            );
+        }
+        None => {
+            return problem_response(
+                StatusCode::FORBIDDEN,
+                "session has no immutable coordination project label; mint a new session with project_id".to_string(),
+            );
+        }
+    }
+    let context = match crate::auth::passport_bound_context(&state.auth, &headers) {
+        Ok(context) => context,
+        Err(problem) => return problem.into_response(),
+    };
+    if let Err(problem) = context.resolve_authorized_tenant(Some(&binding.tenant_id)) {
+        return problem.into_response();
+    }
+    let include_global_plan_claims = !context.auth_enforced() || context.has_global_tenant_authority();
 
     let intent = CoordIntent {
         project_id: body.project_id.trim().to_string(),
-        session_id_hex: body.session_id.trim().to_string(),
-        passport_id,
+        session_id_hex,
+        passport_id: binding.passport_id,
+        tenant_id: binding.tenant_id,
         execplan_slug: body.execplan_slug.filter(|s| !s.trim().is_empty()),
         milestone: body.milestone.filter(|s| !s.trim().is_empty()),
         deploy_target: body.deploy_target.filter(|s| !s.trim().is_empty()),
@@ -241,7 +293,7 @@ pub(super) async fn post_coord_announce(
     // Advisory overlap check against the other live intents + held leases,
     // computed in the same call so the announcing session learns who it
     // collides with the moment it declares an execplan. Never blocking.
-    let peer_intents = crate::coord::list_intents(&store, Some(&intent.project_id));
+    let peer_intents = crate::coord::list_intents_for_tenant(&store, Some(&intent.project_id), &intent.tenant_id);
     drop(store);
     // Announcing IS a liveness signal: touch presence for the resolved
     // passport so the session shows on the board even when the caller's
@@ -253,16 +305,18 @@ pub(super) async fn post_coord_announce(
         .presence
         .touch(&intent.passport_id, "POST", "/v1/coord/announce")
         .await;
-    let leases = live_lease_summaries(&state, now as i64).await;
+    let leases = live_lease_summaries(&state, now as i64, &intent.tenant_id).await;
     let mut overlaps = crate::coord::find_overlaps(&intent, &peer_intents, &leases, now);
     // Fourth signal: two OPEN plans naming the same file. Unlike the other
     // three it needs neither an announcement nor a lease, so it is the only one
     // that sees a peer who has not announced and has not edited yet. Weakest
     // and last, and each warning says so via its `signal`.
-    overlaps.extend(crate::coord::find_plan_path_overlaps(
-        &intent,
-        &open_plan_path_claims(&state).await,
-    ));
+    if include_global_plan_claims {
+        overlaps.extend(crate::coord::find_plan_path_overlaps(
+            &intent,
+            &open_plan_path_claims(&state).await,
+        ));
+    }
     let peers = peer_intents
         .iter()
         .filter(|p| p.session_id_hex != intent.session_id_hex && p.is_live(now))
@@ -288,7 +342,24 @@ mod tests {
     use axum::body::to_bytes;
     use axum::extract::{Json as JsonExtract, Query as QueryExtract, State as StateExtract};
     use axum::response::Response;
+    use crux_session::RegistryEntry;
     use serde_json::json;
+
+    const SESSION_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SESSION_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const SESSION_D: &str = "dddddddddddddddddddddddddddddddd";
+
+    fn loopback_peer() -> ConnectInfo<SocketAddr> {
+        ConnectInfo("127.0.0.1:41000".parse().expect("loopback socket"))
+    }
+
+    fn coord_state() -> AppState {
+        let mut state = test_app_state(1);
+        state.session = Some(std::sync::Arc::new(
+            super::super::session::SessionServices::local_default("coord-test"),
+        ));
+        state
+    }
 
     async fn body_json(resp: Response) -> Value {
         let bytes = to_bytes(resp.into_body(), 1 << 20).await.expect("read body");
@@ -299,7 +370,7 @@ mod tests {
         AnnounceBody {
             session_id: session.to_string(),
             project_id: project.to_string(),
-            by_passport: Some("personal-default".to_string()),
+            by_passport: None,
             execplan_slug: Some("plan-x".to_string()),
             milestone: Some("M2".to_string()),
             deploy_target: None,
@@ -309,8 +380,119 @@ mod tests {
         }
     }
 
+    async fn seed_registry_with(
+        state: &AppState,
+        session: &str,
+        headers: &HeaderMap,
+        closed: bool,
+        include_owner_key: bool,
+    ) {
+        let decoded = hex::decode(session).expect("valid session hex");
+        let session_id = <[u8; 16]>::try_from(decoded.as_slice()).expect("16-byte session id");
+        let services = state.session.as_ref().expect("session services");
+        let (local_passport, _) = services.passport_cfg.synthesise();
+        let authority = super::super::session::admission_identity(
+            state,
+            services,
+            headers,
+            Some(loopback_peer().0.ip()),
+            &local_passport.principal_id,
+            true,
+        )
+        .expect("local admission identity");
+        services
+            .registry
+            .insert(RegistryEntry {
+                session_id,
+                principal_id: local_passport.principal_id,
+                capability_graph_hash: [0; 32],
+                plan_receipt_hash: [0; 32],
+                minted_at: now_unix_ms(),
+                expires_at: now_unix_ms().saturating_add(60_000),
+                origin: "test".to_string(),
+                origin_install: None,
+                plan_cbor: Vec::new(),
+                closed,
+                close_reason: None,
+                admission_principal_key: include_owner_key.then_some(authority.principal_key),
+                admission_ip_key: Some(authority.ip_key),
+            })
+            .expect("seed session registry");
+    }
+
+    async fn seed_registry_only(state: &AppState, session: &str) {
+        seed_registry_with(state, session, &HeaderMap::new(), false, true).await;
+    }
+
+    fn dev_headers(passport: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-corecrux-scopes", "sessions:write".parse().expect("scope header"));
+        headers.insert("x-corecrux-passport-id", passport.parse().expect("passport header"));
+        headers
+    }
+
+    const JWT_SECRET: &[u8] = b"coord-test-secret-at-least-32-bytes";
+    const JWT_ISSUER: &str = "coord-tests";
+    const JWT_AUDIENCE: &str = "corecrux";
+
+    fn jwt_headers(scopes: &str, passport: &str, subject: &str, tenant: &str) -> HeaderMap {
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_secs()
+            .saturating_add(3_600);
+        let claims = serde_json::json!({
+            "exp": exp,
+            "iss": JWT_ISSUER,
+            "aud": JWT_AUDIENCE,
+            "scope": scopes,
+            "sub": subject,
+            "passport_id": passport,
+            "tenant_id": tenant,
+        });
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(JWT_SECRET),
+        )
+        .expect("test JWT");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().expect("bearer header"),
+        );
+        headers
+    }
+
+    async fn seed_owned_session(state: &AppState, session: &str, project: &str, passport: &str, headers: &HeaderMap) {
+        seed_owned_session_in_tenant(state, session, project, passport, "default", headers).await;
+    }
+
+    async fn seed_owned_session_in_tenant(
+        state: &AppState,
+        session: &str,
+        project: &str,
+        passport: &str,
+        tenant: &str,
+        headers: &HeaderMap,
+    ) {
+        seed_registry_with(state, session, headers, false, true).await;
+        let binding = crate::session_bindings::SessionBinding {
+            session_id_hex: session.to_string(),
+            project_id: Some(project.to_string()),
+            tenant_id: tenant.to_string(),
+            passport_id: passport.to_string(),
+            passport_category: "automation".to_string(),
+            agent_work_gate: false,
+            bound_at_unix_ms: now_unix_ms(),
+        };
+        let mut store = state.fact_store.write().await;
+        crate::session_bindings::write_binding(&mut store, &binding).expect("write owned binding");
+    }
+
     /// Bind a session + touch presence so the active view has a live row.
     async fn seed_live_session(state: &AppState, session: &str, project: &str) {
+        seed_registry_only(state, session).await;
         {
             let mut store = state.fact_store.write().await;
             crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed passports");
@@ -319,7 +501,7 @@ mod tests {
                 crate::session_bindings::ResolveInput {
                     session_id_hex: session,
                     project_id: Some(project.to_string()),
-                    tenant_id: None,
+                    tenant_id: Some("default".to_string()),
                     passport_id: None,
                     now_unix_ms: now_unix_ms(),
                 },
@@ -327,15 +509,12 @@ mod tests {
             .expect("resolve binding");
             crate::session_bindings::write_binding(&mut store, &binding).expect("write binding");
         }
-        state
-            .presence
-            .touch("personal-default", "POST", "/v1/coord/announce")
-            .await;
+        state.presence.touch("work-default", "POST", "/v1/coord/announce").await;
     }
 
     #[tokio::test]
     async fn coord_disabled_returns_404() {
-        let mut state = test_app_state(1);
+        let mut state = coord_state();
         state.coord_enabled = false;
         let resp = get_coord_active(
             StateExtract(state.clone()),
@@ -350,8 +529,9 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let resp = post_coord_announce(
             StateExtract(state),
+            loopback_peer(),
             HeaderMap::new(),
-            JsonExtract(announce_body("aaaa", "proj")),
+            JsonExtract(announce_body(SESSION_A, "proj")),
         )
         .await
         .into_response();
@@ -360,14 +540,15 @@ mod tests {
 
     #[tokio::test]
     async fn announce_then_active_roundtrip_with_lease_join() {
-        let state = test_app_state(1);
-        seed_live_session(&state, "aaaa", "proj").await;
+        let state = coord_state();
+        seed_live_session(&state, SESSION_A, "proj").await;
 
         // Announce focus for the bound session.
         let resp = post_coord_announce(
             StateExtract(state.clone()),
+            loopback_peer(),
             HeaderMap::new(),
-            JsonExtract(announce_body("aaaa", "proj")),
+            JsonExtract(announce_body(SESSION_A, "proj")),
         )
         .await
         .into_response();
@@ -377,7 +558,7 @@ mod tests {
         assert_eq!(body["cleared"], false);
         // Binding is authoritative for the passport even though by_passport
         // was also supplied.
-        assert_eq!(body["intent"]["passport_id"], "personal-default");
+        assert_eq!(body["intent"]["passport_id"], "work-default");
 
         // Seed one held punchcard for the same passport (direct entity-store
         // write; the punchcard HTTP surface is env-gated and swept elsewhere).
@@ -392,14 +573,14 @@ mod tests {
                 "id": "pc_test1",
                 "resource": "tree://crates/corecruxd",
                 "mode": "modify",
-                "holder_passport": "personal-default",
+                "holder_passport": "work-default",
                 "tenant_id": "default",
                 "status": "held",
                 "acquired_at_unix_ms": 0,
                 "expires_at_unix_ms": i64::MAX,
             });
             estore
-                .upsert(PUNCHCARD_KIND, "pc_test1", payload, "personal-default", Some(&reg))
+                .upsert(PUNCHCARD_KIND, "pc_test1", payload, "work-default", Some(&reg))
                 .expect("seed punchcard");
         }
 
@@ -417,7 +598,7 @@ mod tests {
         let view = body_json(resp).await;
         let sessions = view["active_sessions"].as_array().expect("sessions array");
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0]["session_id_hex"], "aaaa");
+        assert_eq!(sessions[0]["session_id_hex"], SESSION_A);
         assert_eq!(sessions[0]["intent"]["execplan_slug"], "plan-x");
         assert_eq!(sessions[0]["intent"]["milestone"], "M2");
         let leases = sessions[0]["leases"].as_array().expect("leases array");
@@ -441,14 +622,19 @@ mod tests {
 
     #[tokio::test]
     async fn announce_zero_ttl_clears_intent() {
-        let state = test_app_state(1);
-        seed_live_session(&state, "bbbb", "proj").await;
+        let state = coord_state();
+        seed_live_session(&state, SESSION_B, "proj").await;
 
-        let mut body = announce_body("bbbb", "proj");
+        let mut body = announce_body(SESSION_B, "proj");
         body.ttl_seconds = Some(0);
-        let resp = post_coord_announce(StateExtract(state.clone()), HeaderMap::new(), JsonExtract(body))
-            .await
-            .into_response();
+        let resp = post_coord_announce(
+            StateExtract(state.clone()),
+            loopback_peer(),
+            HeaderMap::new(),
+            JsonExtract(body),
+        )
+        .await
+        .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_json(resp).await["cleared"], true);
 
@@ -473,16 +659,16 @@ mod tests {
         // Regression for the v0.4.3 deploy gap: bound + announced sessions
         // were invisible on the board because nothing had touched presence
         // for their passport (MCP traffic bypasses the presence middleware).
-        let state = test_app_state(1);
+        let state = coord_state();
         {
             let mut store = state.fact_store.write().await;
             crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed passports");
             let binding = crate::session_bindings::resolve(
                 &store,
                 crate::session_bindings::ResolveInput {
-                    session_id_hex: "dddd",
+                    session_id_hex: SESSION_D,
                     project_id: Some("proj".to_string()),
-                    tenant_id: None,
+                    tenant_id: Some("default".to_string()),
                     passport_id: None,
                     now_unix_ms: now_unix_ms(),
                 },
@@ -490,11 +676,13 @@ mod tests {
             .expect("resolve binding");
             crate::session_bindings::write_binding(&mut store, &binding).expect("write binding");
         }
+        seed_registry_only(&state, SESSION_D).await;
         // Deliberately NO presence.touch here — announce must provide it.
         let resp = post_coord_announce(
             StateExtract(state.clone()),
+            loopback_peer(),
             HeaderMap::new(),
-            JsonExtract(announce_body("dddd", "proj")),
+            JsonExtract(announce_body(SESSION_D, "proj")),
         )
         .await
         .into_response();
@@ -513,20 +701,26 @@ mod tests {
         let view = body_json(resp).await;
         let sessions = view["active_sessions"].as_array().expect("sessions array");
         assert_eq!(sessions.len(), 1, "announce alone must make the session live: {view}");
-        assert_eq!(sessions[0]["session_id_hex"], "dddd");
+        assert_eq!(sessions[0]["session_id_hex"], SESSION_D);
     }
 
     #[tokio::test]
     async fn announce_returns_peer_overlaps() {
-        let state = test_app_state(1);
-        seed_live_session(&state, "aaaa", "proj").await;
+        let state = coord_state();
+        seed_live_session(&state, SESSION_A, "proj").await;
+        seed_live_session(&state, SESSION_B, "proj").await;
 
         // Session A declares a directory focus.
-        let mut a = announce_body("aaaa", "proj");
+        let mut a = announce_body(SESSION_A, "proj");
         a.paths = vec!["crates/corecruxd/src".to_string()];
-        let resp = post_coord_announce(StateExtract(state.clone()), HeaderMap::new(), JsonExtract(a))
-            .await
-            .into_response();
+        let resp = post_coord_announce(
+            StateExtract(state.clone()),
+            loopback_peer(),
+            HeaderMap::new(),
+            JsonExtract(a),
+        )
+        .await
+        .into_response();
         assert_eq!(body_json(resp).await["overlaps"].as_array().map(Vec::len), Some(0));
 
         // A different passport holds a lease inside that directory.
@@ -554,10 +748,9 @@ mod tests {
 
         // Session B (unbound; explicit different passport) announces an
         // overlapping file under A's directory + the same execplan slug.
-        let mut b = announce_body("bbbb", "proj");
-        b.by_passport = Some("other-passport".to_string());
+        let mut b = announce_body(SESSION_B, "proj");
         b.paths = vec!["crates/corecruxd/src/coord.rs".to_string()];
-        let resp = post_coord_announce(StateExtract(state), HeaderMap::new(), JsonExtract(b))
+        let resp = post_coord_announce(StateExtract(state), loopback_peer(), HeaderMap::new(), JsonExtract(b))
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -571,20 +764,226 @@ mod tests {
             .collect();
         assert!(kinds.contains(&"execplan"), "same slug flagged: {kinds:?}");
         assert!(kinds.contains(&"intent_path"), "path containment flagged: {kinds:?}");
-        // B's own lease would be excluded, but this lease belongs to B's
-        // passport — so from B's announce it's self, not a conflict.
-        assert!(!kinds.contains(&"lease"), "own lease not flagged: {kinds:?}");
+        assert!(
+            !kinds.contains(&"lease"),
+            "the sibling http subtree does not overlap coord.rs: {kinds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn announce_rejects_cross_owner_and_body_spoof_before_writing() {
+        let mut state = coord_state();
+        state.auth = crate::auth::Authz::from_env(crate::auth::AuthMode::DevScopes).expect("dev auth");
+        let owner_headers = dev_headers("owner-a");
+        seed_owned_session(&state, SESSION_A, "proj", "owner-a", &owner_headers).await;
+
+        let mut body = announce_body(SESSION_A, "proj");
+        body.by_passport = Some("owner-a".to_string());
+        let resp = post_coord_announce(
+            StateExtract(state.clone()),
+            loopback_peer(),
+            dev_headers("owner-b"),
+            JsonExtract(body),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let mut spoofed = announce_body(SESSION_A, "proj");
+        spoofed.by_passport = Some("owner-b".to_string());
+        let resp = post_coord_announce(
+            StateExtract(state.clone()),
+            loopback_peer(),
+            owner_headers.clone(),
+            JsonExtract(spoofed),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let mut wrong_project = announce_body(SESSION_A, "other-project");
+        wrong_project.by_passport = Some("owner-a".to_string());
+        let resp = post_coord_announce(
+            StateExtract(state.clone()),
+            loopback_peer(),
+            owner_headers.clone(),
+            JsonExtract(wrong_project),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        {
+            let store = state.fact_store.read().await;
+            assert!(
+                crate::coord::list_intents(&store, None).is_empty(),
+                "denied announcements must not write an intent"
+            );
+        }
+
+        let mut uppercase = announce_body(&SESSION_A.to_ascii_uppercase(), "proj");
+        uppercase.by_passport = Some("owner-a".to_string());
+        let resp = post_coord_announce(
+            StateExtract(state.clone()),
+            loopback_peer(),
+            owner_headers,
+            JsonExtract(uppercase),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["intent"]["session_id_hex"], SESSION_A);
+    }
+
+    #[tokio::test]
+    async fn announce_rejects_closed_and_legacy_unowned_sessions() {
+        let state = coord_state();
+        seed_live_session(&state, SESSION_A, "proj").await;
+        let session_a = <[u8; 16]>::try_from(hex::decode(SESSION_A).expect("hex").as_slice()).expect("session");
+        state
+            .session
+            .as_ref()
+            .expect("session services")
+            .registry
+            .close(&session_a, "test")
+            .expect("close session");
+        let resp = post_coord_announce(
+            StateExtract(state.clone()),
+            loopback_peer(),
+            HeaderMap::new(),
+            JsonExtract(announce_body(SESSION_A, "proj")),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        seed_live_session(&state, SESSION_B, "proj").await;
+        seed_registry_with(&state, SESSION_B, &HeaderMap::new(), false, false).await;
+        let resp = post_coord_announce(
+            StateExtract(state.clone()),
+            loopback_peer(),
+            HeaderMap::new(),
+            JsonExtract(announce_body(SESSION_B, "proj")),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        {
+            let store = state.fact_store.read().await;
+            assert!(
+                crate::coord::list_intents(&store, None).is_empty(),
+                "closed and legacy sessions must not write intents"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn jwt_coord_status_and_announce_do_not_expose_another_tenant() {
+        let mut state = coord_state();
+        state.auth = crate::auth::Authz::test_hs256(JWT_SECRET, JWT_ISSUER, JWT_AUDIENCE);
+        let write_a = jwt_headers("sessions:write", "passport-a", "subject-a", "tenant-a");
+        let write_b = jwt_headers("sessions:write", "passport-b", "subject-b", "tenant-b");
+        seed_owned_session_in_tenant(&state, SESSION_A, "proj", "passport-a", "tenant-a", &write_a).await;
+        seed_owned_session_in_tenant(&state, SESSION_B, "proj", "passport-b", "tenant-b", &write_b).await;
+
+        let mut body_b = announce_body(SESSION_B, "proj");
+        body_b.note = Some("TENANT-B-SECRET-NOTE".to_string());
+        body_b.paths = vec!["TENANT-B-SECRET-PATH".to_string()];
+        let announced_b = post_coord_announce(
+            StateExtract(state.clone()),
+            loopback_peer(),
+            write_b,
+            JsonExtract(body_b),
+        )
+        .await
+        .into_response();
+        assert_eq!(announced_b.status(), StatusCode::OK);
+
+        {
+            let registry = state.kind_registry.read().await;
+            let registry_opt = registry.is_registered(PUNCHCARD_KIND).then_some(&*registry);
+            state
+                .entity_store
+                .write()
+                .await
+                .upsert(
+                    PUNCHCARD_KIND,
+                    "pc_tenant_b_secret",
+                    serde_json::json!({
+                        "id": "pc_tenant_b_secret",
+                        "resource": "TENANT-B-SECRET-LEASE",
+                        "mode": "modify",
+                        "holder_passport": "passport-b",
+                        "tenant_id": "tenant-b",
+                        "status": "held",
+                        "expires_at_unix_ms": now_unix_ms().saturating_add(60_000) as i64,
+                    }),
+                    "passport-b",
+                    registry_opt,
+                )
+                .expect("seed tenant B lease");
+        }
+
+        let announced_a = post_coord_announce(
+            StateExtract(state.clone()),
+            loopback_peer(),
+            write_a,
+            JsonExtract(announce_body(SESSION_A, "proj")),
+        )
+        .await
+        .into_response();
+        assert_eq!(announced_a.status(), StatusCode::OK);
+        let announced_a = body_json(announced_a).await;
+        assert_eq!(announced_a["live_peer_intents"], 0);
+        let announcement_text = announced_a.to_string();
+        for secret in [
+            SESSION_B,
+            "passport-b",
+            "TENANT-B-SECRET-NOTE",
+            "TENANT-B-SECRET-PATH",
+            "TENANT-B-SECRET-LEASE",
+        ] {
+            assert!(!announcement_text.contains(secret), "announce leaked {secret}");
+        }
+
+        let active_a = get_coord_active(
+            StateExtract(state),
+            QueryExtract(ActiveQuery {
+                project_id: Some("proj".to_string()),
+                tenant_id: Some("tenant-a".to_string()),
+            }),
+            jwt_headers("sessions:read", "passport-a", "subject-a", "tenant-a"),
+        )
+        .await
+        .into_response();
+        assert_eq!(active_a.status(), StatusCode::OK);
+        let active_text = body_json(active_a).await.to_string();
+        for secret in [
+            SESSION_B,
+            "passport-b",
+            "tenant-b",
+            "TENANT-B-SECRET-NOTE",
+            "TENANT-B-SECRET-PATH",
+            "TENANT-B-SECRET-LEASE",
+            "pc_tenant_b_secret",
+        ] {
+            assert!(!active_text.contains(secret), "active board leaked {secret}");
+        }
     }
 
     #[tokio::test]
     async fn announce_without_binding_or_passport_is_rejected() {
-        let state = test_app_state(1);
-        let mut body = announce_body("unbound", "proj");
+        let state = coord_state();
+        let mut body = announce_body("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "proj");
         body.by_passport = None;
-        let resp = post_coord_announce(StateExtract(state), HeaderMap::new(), JsonExtract(body))
-            .await
-            .into_response();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = post_coord_announce(
+            StateExtract(state),
+            loopback_peer(),
+            HeaderMap::new(),
+            JsonExtract(body),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 }
 

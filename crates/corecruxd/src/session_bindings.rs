@@ -92,48 +92,70 @@ pub fn write_binding(store: &mut FactStore, binding: &SessionBinding) -> Result<
 }
 
 pub fn list_bindings(store: &FactStore) -> Vec<SessionBinding> {
-    let result = store.query(&FactQuery {
-        min_effective_confidence: None,
-        tenant_hash: None,
-        query: None,
-        entity: None,
-        entity_prefix: Some(format!("{SESSION_BINDING_ENTITY_PREFIX}::")),
-        top_k: 200,
-        token_budget: None,
-    });
+    list_bindings_filtered(store, None)
+}
+
+/// List bindings for one authoritative tenant. Filtering happens before the
+/// 200-row response cap so churn in another tenant cannot starve this view.
+pub fn list_bindings_for_tenant(store: &FactStore, tenant_id: &str) -> Vec<SessionBinding> {
+    list_bindings_filtered(store, Some(tenant_id))
+}
+
+fn list_bindings_filtered(store: &FactStore, tenant_id: Option<&str>) -> Vec<SessionBinding> {
+    let prefix = format!("{SESSION_BINDING_ENTITY_PREFIX}::");
+    let facts = store
+        .all_facts()
+        .filter(|fact| fact.entity.starts_with(&prefix) && fact.key == SESSION_BINDING_RECORD_KEY)
+        .cloned()
+        .collect();
     let mut out = Vec::new();
-    for fact in crate::fact_helpers::dedup_latest(result.facts) {
-        if fact.key != SESSION_BINDING_RECORD_KEY {
+    for fact in crate::fact_helpers::dedup_latest(facts) {
+        if fact.deleted {
             continue;
         }
         if let Ok(b) = serde_json::from_str::<SessionBinding>(&fact.value) {
-            out.push(b);
+            if tenant_id.is_none_or(|tenant| b.tenant_id == tenant) {
+                out.push(b);
+            }
         }
     }
     out.sort_by(|a, b| b.bound_at_unix_ms.cmp(&a.bound_at_unix_ms));
+    out.truncate(200);
     out
 }
 
 /// Uncapped total of live session bindings with a per-passport breakdown.
 ///
-/// Unlike [`list_bindings`] (which caps at `top_k: 200`) this is O(n) over the
+/// Unlike [`list_bindings`] (which caps its result at 200) this is O(n) over the
 /// whole fact store and does not truncate — use it for leak / observability
 /// (e.g. spotting a churning client minting one binding per MCP `initialize`),
 /// not for listing. Deduplicates by entity (session id) and skips tombstones.
 pub fn count_bindings(store: &FactStore) -> BindingCounts {
+    count_bindings_filtered(store, None)
+}
+
+pub fn count_bindings_for_tenant(store: &FactStore, tenant_id: &str) -> BindingCounts {
+    count_bindings_filtered(store, Some(tenant_id))
+}
+
+fn count_bindings_filtered(store: &FactStore, tenant_id: Option<&str>) -> BindingCounts {
     let prefix = format!("{SESSION_BINDING_ENTITY_PREFIX}::");
-    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let facts = store
+        .all_facts()
+        .filter(|fact| fact.entity.starts_with(&prefix) && fact.key == SESSION_BINDING_RECORD_KEY)
+        .cloned()
+        .collect();
     let mut by_passport: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
     let mut total = 0u64;
-    for fact in store.all_facts() {
-        if fact.deleted || fact.key != SESSION_BINDING_RECORD_KEY || !fact.entity.starts_with(&prefix) {
+    for fact in crate::fact_helpers::dedup_latest(facts) {
+        if fact.deleted {
             continue;
         }
-        if !seen.insert(fact.entity.as_str()) {
-            continue;
-        }
-        total += 1;
         if let Ok(b) = serde_json::from_str::<SessionBinding>(&fact.value) {
+            if tenant_id.is_some_and(|tenant| b.tenant_id != tenant) {
+                continue;
+            }
+            total += 1;
             *by_passport.entry(b.passport_id).or_default() += 1;
         }
     }
@@ -231,6 +253,45 @@ mod tests {
     }
 
     #[test]
+    fn tenant_filter_runs_before_the_two_hundred_row_response_cap() {
+        let mut store = FactStore::new();
+        write_binding(
+            &mut store,
+            &SessionBinding {
+                session_id_hex: "tenant-a-old".to_string(),
+                project_id: Some("proj".to_string()),
+                tenant_id: "tenant-a".to_string(),
+                passport_id: "passport-a".to_string(),
+                passport_category: "automation".to_string(),
+                agent_work_gate: true,
+                bound_at_unix_ms: 1,
+            },
+        )
+        .expect("write tenant A binding");
+        for index in 0..201_u64 {
+            write_binding(
+                &mut store,
+                &SessionBinding {
+                    session_id_hex: format!("tenant-b-{index:03}"),
+                    project_id: Some("proj".to_string()),
+                    tenant_id: "tenant-b".to_string(),
+                    passport_id: "passport-b".to_string(),
+                    passport_category: "automation".to_string(),
+                    agent_work_gate: true,
+                    bound_at_unix_ms: 10_000 + index,
+                },
+            )
+            .expect("write tenant B binding");
+        }
+
+        let tenant_a = list_bindings_for_tenant(&store, "tenant-a");
+        assert_eq!(tenant_a.len(), 1);
+        assert_eq!(tenant_a[0].session_id_hex, "tenant-a-old");
+        assert_eq!(count_bindings_for_tenant(&store, "tenant-a").total, 1);
+        assert_eq!(count_bindings_for_tenant(&store, "tenant-b").total, 201);
+    }
+
+    #[test]
     fn resolve_falls_back_to_personal_default_when_nothing_supplied() {
         let dir = temp_dir("none");
         let mut store = FactStore::new();
@@ -312,5 +373,32 @@ mod tests {
         assert_eq!(got.project_id.as_deref(), Some("proj-x"));
         assert!(get_binding(&store, "zzzz").is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tombstoned_binding_is_absent_from_lists_counts_and_lookup() {
+        let mut store = FactStore::new();
+        let binding = SessionBinding {
+            session_id_hex: "deleted-session".to_string(),
+            project_id: Some("proj".to_string()),
+            tenant_id: "tenant-a".to_string(),
+            passport_id: "passport-a".to_string(),
+            passport_category: "automation".to_string(),
+            agent_work_gate: true,
+            bound_at_unix_ms: 100,
+        };
+        write_binding(&mut store, &binding).expect("write binding");
+        let fact_id = store
+            .all_facts()
+            .find(|fact| fact.entity == "__session_binding__::deleted-session")
+            .expect("binding fact")
+            .fact_id
+            .clone();
+        assert!(store.delete("default", &fact_id));
+
+        assert!(list_bindings(&store).is_empty());
+        assert!(list_bindings_for_tenant(&store, "tenant-a").is_empty());
+        assert_eq!(count_bindings(&store).total, 0);
+        assert!(get_binding(&store, "deleted-session").is_none());
     }
 }
