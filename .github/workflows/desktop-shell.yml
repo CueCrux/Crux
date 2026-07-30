@@ -426,11 +426,46 @@ jobs:
           # CommandExt::creation_flags, so the window still appears. Invisible on
           # Linux and to any compile-or-bundle job.
           # PROMOTE THIS TO ::error:: AND FAIL once the sidecar spawns windowless.
-          $sidecarWindow = @($sidecar | Where-Object { $_.MainWindowHandle -ne 0 })
-          if ($sidecarWindow.Count) {
-            Write-Host "::warning::the corecruxd sidecar owns a visible console window (MainWindowTitle: '$($sidecarWindow[0].MainWindowTitle)'). Users see a stray console beside the app. Fix: set CREATE_NO_WINDOW in spawn_sidecar."
+          #
+          # Do NOT check (Get-Process corecruxd).MainWindowHandle -- it is 0 even
+          # when the console is plainly on screen, which cost a false "windowless"
+          # pass here once. Since Win11/Server 2025 the console window belongs to
+          # the console HOST (WindowsTerminal/conhost), not to the child, so the
+          # child owns no window at all. Enumerate top-level windows instead and
+          # match the host window the console host titles after the child's
+          # command line.
+          # Built by -join rather than a here-string: a here-string's body and its
+          # closing '@ must sit at column 0, which cannot survive a YAML block
+          # scalar's indentation.
+          $sig = @(
+            '[DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr p);',
+            '[DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, System.Text.StringBuilder s, int n);',
+            '[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);',
+            '[DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr h, out int pid);',
+            'public delegate bool EnumWindowsProc(IntPtr h, IntPtr p);'
+          ) -join "`n"
+          Add-Type -Namespace Win32 -Name Wnd -MemberDefinition $sig
+          $found = New-Object System.Collections.ArrayList
+          $cb = [Win32.Wnd+EnumWindowsProc] {
+            param($h, $p)
+            if ([Win32.Wnd]::IsWindowVisible($h)) {
+              $sb = New-Object System.Text.StringBuilder 512
+              [void][Win32.Wnd]::GetWindowTextW($h, $sb, $sb.Capacity)
+              $title = $sb.ToString()
+              if ($title -like '*corecruxd*') {
+                $opid = 0; [void][Win32.Wnd]::GetWindowThreadProcessId($h, [ref]$opid)
+                $owner = (Get-Process -Id $opid -ErrorAction SilentlyContinue).Name
+                [void]$found.Add("'$title' owned by $owner (pid $opid)")
+              }
+            }
+            return $true
+          }
+          [void][Win32.Wnd]::EnumWindows($cb, [IntPtr]::Zero)
+          if ($found.Count) {
+            foreach ($f in $found) { Write-Host "sidecar console      : $f" }
+            Write-Host "::warning::the corecruxd sidecar has a visible console window. Users see a stray console beside the app for its whole lifetime. Fix: set CREATE_NO_WINDOW (0x08000000) via CommandExt::creation_flags in spawn_sidecar."
           } else {
-            Write-Host 'sidecar window       : none (spawned windowless)'
+            Write-Host 'sidecar console      : none (spawned windowless)'
           }
 
           if ($fail.Count) {
