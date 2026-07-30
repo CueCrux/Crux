@@ -26,6 +26,11 @@
 //!
 //! Gating: `CORECRUXD_OPENAI_SHIM=1`, default OFF → 404. Requires the MCP
 //! surface to be enabled (`AppState.mcp_context`); otherwise 503.
+//! Verified HTTP scopes are an additional exact-name ceiling over RCX:
+//! `query:read` is read-only, `facts:write` and `sessions:write` expose only
+//! their narrow mutation groups, and identity-bound `admin:write` receives
+//! only the audited tenant-aware union of those groups plus safe admin reads.
+//! New tools are default-denied for every authenticated HTTP scope.
 
 use std::sync::Arc;
 
@@ -78,20 +83,73 @@ fn mcp_unavailable_response() -> Response {
     .into_response()
 }
 
-/// Per-request MCP context: the shared shim context, bound to the caller's
-/// passport identity when one is bound to the request (scoping for private
-/// facts / actor stamping rides the same path as MCP bearer auth).
+/// Principal bound by the authenticating HTTP transport. Local development
+/// assertions are namespaced so they cannot collide with a verified passport.
+fn request_principal(ctx: &crate::auth::HttpScopeContext) -> Result<Option<String>, Box<crate::http::ProblemResponse>> {
+    principal_for_request(
+        ctx.passport_id.as_deref(),
+        ctx.local_unverified_identity(),
+        ctx.auth_enforced(),
+    )
+}
+
+fn principal_for_request(
+    passport_id: Option<&str>,
+    local_unverified_identity: bool,
+    auth_enforced: bool,
+) -> Result<Option<String>, Box<crate::http::ProblemResponse>> {
+    const LOCAL_PREFIX: &str = "local-unverified:";
+    const UNBOUND_SENTINEL: &str = "authenticated-unbound";
+
+    if !local_unverified_identity
+        && passport_id.is_some_and(|passport| passport == UNBOUND_SENTINEL || passport.starts_with(LOCAL_PREFIX))
+    {
+        return Err(Box::new(crate::http::ProblemResponse(
+            corecrux_types::ProblemDetails::forbidden("passport id uses a reserved OpenAI-shim identity namespace")
+                .with_extensions(json!({"code": "SHIM_PASSPORT_RESERVED"})),
+        )));
+    }
+
+    match passport_id {
+        Some(passport) if local_unverified_identity => Ok(Some(format!("{LOCAL_PREFIX}{passport}"))),
+        Some(passport) => Ok(Some(passport.to_string())),
+        None if !auth_enforced => Ok(Some(format!("{LOCAL_PREFIX}openai-shim"))),
+        None => Ok(None),
+    }
+}
+
+/// Per-request MCP context: intersect the shared daemon RCX surface with the
+/// verified HTTP scopes, and bind the transport-resolved principal + tenant
+/// directly so they are never reinterpreted as MCP agent aliases.
 fn request_context(
     base: &Arc<crux_mcp::dispatch::McpContext>,
     ctx: &crate::auth::HttpScopeContext,
-) -> crux_mcp::dispatch::McpContext {
-    match ctx.passport_id.as_deref() {
-        Some(passport) => base.with_agent(crux_mcp::agent::AgentIdentity {
-            name: passport.to_string(),
-            token_hash: *blake3::hash(passport.as_bytes()).as_bytes(),
+) -> Result<crux_mcp::dispatch::McpContext, Box<crate::http::ProblemResponse>> {
+    request_context_for_tenant(base, ctx, None)
+}
+
+fn request_context_for_tenant(
+    base: &Arc<crux_mcp::dispatch::McpContext>,
+    ctx: &crate::auth::HttpScopeContext,
+    requested_tenant: Option<&str>,
+) -> Result<crux_mcp::dispatch::McpContext, Box<crate::http::ProblemResponse>> {
+    let tenant = ctx.resolve_authorized_tenant(requested_tenant).map_err(Box::new)?;
+    let principal = request_principal(ctx)?;
+    let mut request = match principal.as_deref() {
+        Some(principal) => base.with_agent(crux_mcp::agent::AgentIdentity {
+            name: principal.to_string(),
+            token_hash: *blake3::hash(principal.as_bytes()).as_bytes(),
         }),
         None => base.as_ref().clone(),
     }
+    .with_request_authority(principal.clone(), tenant);
+
+    if ctx.auth_enforced() {
+        let crux_mcp::tools::HttpScopeToolPolicy::AllowOnly(tool_names) =
+            crux_mcp::tools::tool_policy_for_http_scopes(&ctx.scopes, principal.is_some());
+        request = request.with_tool_name_allowlist(tool_names);
+    }
+    Ok(request)
 }
 
 fn current_unix_seconds() -> u64 {
@@ -124,31 +182,63 @@ fn mcp_tool_to_openai(tool: &Value) -> Value {
 fn mint_invoke_receipt(
     state: &AppState,
     principal: &str,
+    tenant: &str,
     tool: &str,
     args: &Value,
+    decision: &str,
     outcome: &str,
 ) -> Result<String, String> {
+    let body = invoke_receipt_body(tenant, tool, args, decision, outcome);
+    let scoped = invoke_receipt_scope(principal, tenant);
+    append_one(state, &scoped, principal, body, None)
+        .map(|(resp, _tip)| resp.observation_id)
+        .map_err(|(_, msg)| msg)
+}
+
+fn invoke_receipt_scope(principal: &str, tenant: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"openai-shim-receipt-scope-v1");
+    hasher.update(&(principal.len() as u64).to_le_bytes());
+    hasher.update(principal.as_bytes());
+    hasher.update(&(tenant.len() as u64).to_le_bytes());
+    hasher.update(tenant.as_bytes());
+    format!("openai-shim::{}", hasher.finalize().to_hex())
+}
+
+fn invoke_receipt_body(tenant: &str, tool: &str, args: &Value, decision: &str, outcome: &str) -> PostObservationBody {
     let args_sha = format!(
         "blake3:{}",
         blake3::hash(&serde_json::to_vec(args).unwrap_or_default()).to_hex()
     );
-    let body = PostObservationBody {
+    PostObservationBody {
         kind: "tool_mediation".to_string(),
         provider: "openai-shim".to_string(),
         client_ts: None,
         payload: json!({
             "tool_server": "crux-mcp",
             "tool": tool,
+            "tenant_id": tenant,
             "args_sha": args_sha,
-            "decision": "allow",
+            "decision": decision,
             "outcome": outcome,
             "mediator": "openai-shim",
         }),
-    };
-    let scoped = format!("openai-shim::{principal}");
-    append_one(state, &scoped, principal, body, None)
-        .map(|(resp, _tip)| resp.observation_id)
-        .map_err(|(_, msg)| msg)
+    }
+}
+
+fn receipt_principal(ctx: &crux_mcp::dispatch::McpContext) -> String {
+    ctx.scope_identity()
+        .unwrap_or_else(|| "authenticated-unbound".to_string())
+}
+
+fn passport_override_response(ctx: &crate::auth::HttpScopeContext) -> Option<Response> {
+    ctx.passport_override_used().then(|| {
+        problem_response(
+            StatusCode::FORBIDDEN,
+            "passport impersonation is not permitted on the OpenAI shim".to_string(),
+        )
+        .into_response()
+    })
 }
 
 /// `GET /v1/openai/tools.json` — the active (token-filtered) MCP tool
@@ -177,11 +267,17 @@ pub(super) async fn get_tools_json(State(state): State<AppState>, headers: Heade
         Ok(ctx) => ctx,
         Err(problem) => return problem.into_response(),
     };
+    if let Some(response) = passport_override_response(&ctx) {
+        return response;
+    }
     let Some(base) = state.mcp_context.as_ref() else {
         return mcp_unavailable_response();
     };
 
-    let mcp_ctx = request_context(base, &ctx);
+    let mcp_ctx = match request_context(base, &ctx) {
+        Ok(ctx) => ctx,
+        Err(problem) => return (*problem).into_response(),
+    };
     let listing = crux_mcp::tools::list_tools_json_for_context(&mcp_ctx, current_unix_seconds()).await;
     let tools: Vec<Value> = listing
         .get("tools")
@@ -233,6 +329,9 @@ pub(super) async fn post_invoke(
         Ok(ctx) => ctx,
         Err(problem) => return problem.into_response(),
     };
+    if let Some(response) = passport_override_response(&ctx) {
+        return response;
+    }
     let Some(base) = state.mcp_context.as_ref() else {
         return mcp_unavailable_response();
     };
@@ -276,7 +375,11 @@ pub(super) async fn post_invoke(
 
     // Same dispatch path as MCP `tools/call`: RCX capability enforcement,
     // per-passport traces, result envelopes — single source of behaviour.
-    let mcp_ctx = request_context(base, &ctx);
+    let requested_tenant = args.get("tenant_id").and_then(Value::as_str);
+    let mcp_ctx = match request_context_for_tenant(base, &ctx, requested_tenant) {
+        Ok(ctx) => ctx,
+        Err(problem) => return (*problem).into_response(),
+    };
     let request = crux_mcp::protocol::JsonRpcRequest {
         jsonrpc: "2.0".to_string(),
         id: Some(json!(1)),
@@ -285,12 +388,25 @@ pub(super) async fn post_invoke(
     };
     let response = crux_mcp::dispatch::dispatch(request, &mcp_ctx, None).await;
 
-    let outcome = if response.error.is_none() { "ok" } else { "error" };
-    let principal = ctx.passport_id.clone().unwrap_or_else(|| "operator".to_string());
-    let (receipt_ref, receipt_error) = match mint_invoke_receipt(&state, &principal, &name, &args, outcome) {
-        Ok(id) => (Some(id), None),
-        Err(e) => (None, Some(e)),
+    let capability_denied = response
+        .error
+        .as_ref()
+        .is_some_and(|error| error.code == crux_mcp::dispatch::CAPABILITY_DENIED);
+    let decision = if capability_denied { "deny" } else { "allow" };
+    let outcome = if capability_denied {
+        "denied"
+    } else if response.error.is_none() {
+        "ok"
+    } else {
+        "error"
     };
+    let principal = receipt_principal(&mcp_ctx);
+    let tenant = mcp_ctx.scope_tenant();
+    let (receipt_ref, receipt_error) =
+        match mint_invoke_receipt(&state, &principal, &tenant, &name, &args, decision, outcome) {
+            Ok(id) => (Some(id), None),
+            Err(e) => (None, Some(e)),
+        };
 
     if let Some(err) = response.error {
         let status = if err.code == crux_mcp::dispatch::CAPABILITY_DENIED {
@@ -335,8 +451,7 @@ mod tests {
 
     /// A shim-enabled state whose MCP context SHARES the state's stores —
     /// the same wiring `main.rs` performs.
-    fn shim_state() -> AppState {
-        let mut state = test_app_state(1);
+    fn enable_shim(mut state: AppState) -> AppState {
         state.openai_shim_enabled = true;
         let mcp = crux_mcp::dispatch::McpContext::new_shared(
             state.node_id.clone(),
@@ -350,6 +465,14 @@ mod tests {
         state
     }
 
+    fn shim_state() -> AppState {
+        enable_shim(test_app_state(1))
+    }
+
+    fn shim_state_with_auth(mode: AuthMode) -> AppState {
+        enable_shim(test_app_state_with_auth(1, mode))
+    }
+
     fn invoke_body(name: &str, arguments: Value) -> InvokeBody {
         InvokeBody {
             name: Some(name.to_string()),
@@ -359,7 +482,11 @@ mod tests {
     }
 
     async fn invoke(state: &AppState, body: InvokeBody) -> (StatusCode, Value) {
-        let resp = post_invoke(StateExtract(state.clone()), HeaderMap::new(), JsonExtract(body))
+        invoke_with_headers(state, HeaderMap::new(), body).await
+    }
+
+    async fn invoke_with_headers(state: &AppState, headers: HeaderMap, body: InvokeBody) -> (StatusCode, Value) {
+        let resp = post_invoke(StateExtract(state.clone()), headers, JsonExtract(body))
             .await
             .into_response();
         let status = resp.status();
@@ -394,6 +521,344 @@ mod tests {
         .await
         .into_response();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    fn scoped_headers(scopes: &str, passport: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-corecrux-scopes", scopes.parse().expect("valid scopes header"));
+        if let Some(passport) = passport {
+            headers.insert(
+                "x-corecrux-passport-id",
+                passport.parse().expect("valid passport header"),
+            );
+        }
+        headers
+    }
+
+    #[tokio::test]
+    async fn query_read_listing_and_direct_calls_are_write_denied() {
+        let state = shim_state_with_auth(AuthMode::DevScopes);
+        let headers = scoped_headers("query:read", None);
+
+        let listed = get_tools_json(StateExtract(state.clone()), headers.clone())
+            .await
+            .into_response();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let body = body_json(listed).await;
+        let names: std::collections::BTreeSet<&str> = body["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect();
+        assert!(names.contains("query_facts"));
+        assert!(!names.contains("store_fact"));
+        assert!(!names.contains("save_session"));
+        assert!(!names.contains("punch_in"));
+        assert!(!names.contains("get_session"));
+        assert!(!names.contains("list_sessions"));
+        assert!(!names.contains("receipt_verify"));
+        assert!(!names.contains("sync_status"));
+        assert!(!names.contains("coord_status"));
+        assert!(!names.contains("get_bootstrap"));
+
+        let before = state.fact_store.read().await.count();
+        let (status, denied) = invoke_with_headers(
+            &state,
+            headers.clone(),
+            invoke_body("store_fact", json!({"entity": "blocked", "key": "k", "value": "v"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(denied["error"]["code"], crux_mcp::dispatch::CAPABILITY_DENIED);
+
+        let fragment = InvokeBody {
+            name: None,
+            arguments: None,
+            function: Some(json!({
+                "name": "store_fact",
+                "arguments": "{\"entity\":\"blocked-fragment\",\"key\":\"k\",\"value\":\"v\"}",
+            })),
+        };
+        let (status, _) = invoke_with_headers(&state, headers.clone(), fragment).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let (status, _) = invoke_with_headers(&state, headers, invoke_body("punch_in", json!({}))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(state.fact_store.read().await.count(), before);
+    }
+
+    #[tokio::test]
+    async fn fact_and_session_write_scopes_do_not_cross_authorize() {
+        let state = shim_state_with_auth(AuthMode::DevScopes);
+        let fact_headers = scoped_headers("facts:write", Some("writer"));
+        let session_headers = scoped_headers("sessions:write", Some("writer"));
+
+        let (status, _) =
+            invoke_with_headers(&state, fact_headers.clone(), invoke_body("save_session", json!({}))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let (status, _) = invoke_with_headers(
+            &state,
+            session_headers.clone(),
+            invoke_body("cuecrux_session", json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let (status, _) = invoke_with_headers(
+            &state,
+            session_headers,
+            invoke_body("store_fact", json!({"entity": "blocked", "key": "k", "value": "v"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let (status, stored) = invoke_with_headers(
+            &state,
+            fact_headers,
+            invoke_body("store_fact", json!({"entity": "allowed", "key": "k", "value": "v"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "bound fact write failed: {stored}");
+        let store = state.fact_store.read().await;
+        let fact = store
+            .all_facts()
+            .find(|fact| fact.entity == "allowed")
+            .expect("stored fact");
+        assert_eq!(fact.actor.as_deref(), Some("local-unverified:writer"));
+        assert_eq!(fact.tenant_hash, "default");
+    }
+
+    #[tokio::test]
+    async fn admin_read_cannot_invoke_tools_with_hidden_writes() {
+        let state = shim_state_with_auth(AuthMode::DevScopes);
+        let headers = scoped_headers("admin:read", Some("reader"));
+        let before = state.fact_store.read().await.count();
+
+        for tool in ["audit_config", "get_passport"] {
+            let (status, body) = invoke_with_headers(&state, headers.clone(), invoke_body(tool, json!({}))).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{tool}: {body}");
+            assert_eq!(body["error"]["code"], crux_mcp::dispatch::CAPABILITY_DENIED);
+        }
+        assert_eq!(state.fact_store.read().await.count(), before);
+    }
+
+    #[tokio::test]
+    async fn admin_write_is_an_exact_tenant_aware_subset() {
+        let state = shim_state_with_auth(AuthMode::DevScopes);
+        let headers = scoped_headers("admin:write", Some("admin"));
+
+        for tool in ["entity_get", "punch_in", "audit_config", "cuecrux_session"] {
+            let (status, body) = invoke_with_headers(&state, headers.clone(), invoke_body(tool, json!({}))).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{tool}: {body}");
+            assert_eq!(body["error"]["code"], crux_mcp::dispatch::CAPABILITY_DENIED);
+        }
+
+        let (status, stored) = invoke_with_headers(
+            &state,
+            headers,
+            invoke_body("store_fact", json!({"entity": "admin-safe", "key": "k", "value": "v"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{stored}");
+        let store = state.fact_store.read().await;
+        let fact = store
+            .all_facts()
+            .find(|fact| fact.entity == "admin-safe")
+            .expect("stored fact");
+        assert_eq!(fact.actor.as_deref(), Some("local-unverified:admin"));
+    }
+
+    #[tokio::test]
+    async fn authenticated_unbound_write_is_denied_without_operator_attribution() {
+        let state = shim_state_with_auth(AuthMode::DevScopes);
+        let headers = scoped_headers("facts:write", None);
+        let before = state.fact_store.read().await.count();
+
+        let (status, body) = invoke_with_headers(
+            &state,
+            headers,
+            invoke_body("store_fact", json!({"entity": "blocked", "key": "k", "value": "v"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["code"], crux_mcp::dispatch::CAPABILITY_DENIED);
+        assert_eq!(state.fact_store.read().await.count(), before);
+
+        let auth_ctx = crate::auth::http_scope_context(&state.auth, &scoped_headers("facts:write", None))
+            .expect("HTTP scope context");
+        let mcp_ctx =
+            request_context(state.mcp_context.as_ref().expect("MCP context"), &auth_ctx).expect("request context");
+        assert_eq!(receipt_principal(&mcp_ctx), "authenticated-unbound");
+        let receipt = invoke_receipt_body("default", "store_fact", &json!({}), "deny", "denied");
+        assert_eq!(receipt.payload["decision"], "deny");
+        assert_eq!(receipt.payload["tenant_id"], "default");
+        assert_ne!(receipt_principal(&mcp_ctx), "operator");
+        let legacy_operator_path =
+            crate::http::observations::observation_file_path(&state.data_dir, "openai-shim::operator");
+        assert!(!legacy_operator_path.exists());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn verified_http_tenant_rejects_cross_tenant_query_arguments() {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        const SECRET: &str = "0123456789abcdef0123456789abcdef";
+
+        std::env::set_var("CORECRUXD_JWT_HS256_SECRET", SECRET);
+        std::env::set_var("CORECRUXD_JWT_ISS", "corecrux-test");
+        std::env::set_var("CORECRUXD_JWT_AUD", "corecrux");
+        let state = shim_state_with_auth(AuthMode::JwtHs256);
+
+        #[derive(serde::Serialize)]
+        struct Claims<'a> {
+            exp: usize,
+            iss: &'a str,
+            aud: &'a str,
+            scope: &'a str,
+            tenant_id: &'a str,
+            passport_id: &'a str,
+        }
+        let claims = Claims {
+            exp: (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_secs()
+                + 3600) as usize,
+            iss: "corecrux-test",
+            aud: "corecrux",
+            scope: "query:read",
+            tenant_id: "tenant-a",
+            passport_id: "verified-openai",
+        };
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(SECRET.as_bytes()),
+        )
+        .expect("jwt");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().expect("authorization header"),
+        );
+
+        let (status, _) = invoke_with_headers(
+            &state,
+            headers.clone(),
+            invoke_body(
+                "query",
+                json!({"tenant_id": "tenant-b", "query": "blocked", "token_budget": 500}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let (status, body) = invoke_with_headers(
+            &state,
+            headers,
+            invoke_body(
+                "query",
+                json!({"tenant_id": "tenant-a", "query": "allowed", "token_budget": 500}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "same-tenant query failed: {body}");
+
+        std::env::remove_var("CORECRUXD_JWT_HS256_SECRET");
+        std::env::remove_var("CORECRUXD_JWT_ISS");
+        std::env::remove_var("CORECRUXD_JWT_AUD");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn verified_admin_cannot_override_shim_attribution() {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        const SECRET: &str = "0123456789abcdef0123456789abcdef";
+
+        std::env::set_var("CORECRUXD_JWT_HS256_SECRET", SECRET);
+        std::env::set_var("CORECRUXD_JWT_ISS", "corecrux-test");
+        std::env::set_var("CORECRUXD_JWT_AUD", "corecrux");
+        let state = shim_state_with_auth(AuthMode::JwtHs256);
+
+        #[derive(serde::Serialize)]
+        struct Claims<'a> {
+            exp: usize,
+            iss: &'a str,
+            aud: &'a str,
+            scope: &'a str,
+            tenant_id: &'a str,
+            passport_id: &'a str,
+        }
+        let claims = Claims {
+            exp: (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_secs()
+                + 3600) as usize,
+            iss: "corecrux-test",
+            aud: "corecrux",
+            scope: "admin:write",
+            tenant_id: "tenant-a",
+            passport_id: "admin-real",
+        };
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(SECRET.as_bytes()),
+        )
+        .expect("jwt");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().expect("authorization header"),
+        );
+        headers.insert("x-corecrux-passport-id", "victim".parse().expect("passport header"));
+
+        let before = state.fact_store.read().await.count();
+        let (status, _) = invoke_with_headers(
+            &state,
+            headers,
+            invoke_body("store_fact", json!({"entity": "blocked", "key": "k", "value": "v"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(state.fact_store.read().await.count(), before);
+
+        std::env::remove_var("CORECRUXD_JWT_HS256_SECRET");
+        std::env::remove_var("CORECRUXD_JWT_ISS");
+        std::env::remove_var("CORECRUXD_JWT_AUD");
+    }
+
+    #[test]
+    fn invoke_receipts_are_tenant_distinct() {
+        let tenant_a = invoke_receipt_body("tenant-a", "query", &json!({}), "allow", "ok");
+        let tenant_b = invoke_receipt_body("tenant-b", "query", &json!({}), "allow", "ok");
+        assert_eq!(tenant_a.payload["tenant_id"], "tenant-a");
+        assert_eq!(tenant_b.payload["tenant_id"], "tenant-b");
+        assert_ne!(
+            invoke_receipt_scope("same-passport", "tenant-a"),
+            invoke_receipt_scope("same-passport", "tenant-b")
+        );
+    }
+
+    #[test]
+    fn local_and_verified_principal_namespaces_cannot_collide() {
+        assert_eq!(
+            principal_for_request(Some("alice"), true, true)
+                .expect("local assertion")
+                .as_deref(),
+            Some("local-unverified:alice")
+        );
+        assert_eq!(
+            principal_for_request(Some("alice"), false, true)
+                .expect("verified passport")
+                .as_deref(),
+            Some("alice")
+        );
+        assert!(principal_for_request(Some("local-unverified:alice"), false, true).is_err());
+        assert!(principal_for_request(Some("authenticated-unbound"), false, true).is_err());
     }
 
     #[tokio::test]

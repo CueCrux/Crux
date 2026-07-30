@@ -357,19 +357,11 @@ pub async fn handle_memory_edit(args: &Value, ctx: &McpContext) -> Result<Value,
         });
     }
 
-    // Durable authorship (agent-passport M1), mirroring `handle_store_fact`:
-    // flag-ON resolve the agent token-name to a passport_id (falling back to the
-    // raw name so a flag-ON edit is never anonymous, QC.3); flag-OFF leave
-    // `None`. Without this the edited version carried `actor: null` while the
-    // original carried `claude-work`, silently breaking the attribution chain.
-    let actor: Option<String> = if ctx.agent_passports_enabled {
-        Some(
-            crate::agent_passport::resolve_agent_passport(agent_name, &ctx.agent_passport_map)
-                .unwrap_or_else(|| agent_name.to_string()),
-        )
-    } else {
-        None
-    };
+    // Durable authorship, mirroring `handle_store_fact`: a transport-bound
+    // principal wins; otherwise flag-ON resolves the agent token-name to a
+    // passport_id (falling back to the raw name so a flag-ON edit is never
+    // anonymous, QC.3), while flag-OFF leaves `None`.
+    let actor = ctx.fact_actor();
 
     // Whether the OLD fact is pinned for this agent (pin state is keyed by
     // fact_id, so an edit mints a new id and would otherwise drop the pin — and

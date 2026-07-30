@@ -2631,6 +2631,9 @@ pub(crate) async fn list_tools_json_for_context_with_mode(
         extension_tools.retain(|tool| allowed.contains(&tool.name));
     }
     tools.extend(extension_tools);
+    if ctx.tool_name_allowlist.is_some() {
+        tools.retain(|tool| ctx.permits_tool(&tool.name));
+    }
     // Surface shaping (dynamic-tool-surface M1/M3) runs LAST, after authz
     // filtering + extension merge, so it only ever narrows the already-authorised
     // set — it cannot widen authorisation. `Full` (the default) is the identity,
@@ -2793,6 +2796,74 @@ pub fn rcx_mcp_tool_capability(tool_name: &str) -> McpToolCapability {
         };
     }
     McpToolCapability::local_none(tool_name, capability)
+}
+
+/// Exact-name tool policy derived from daemon HTTP scopes. Every authenticated
+/// scope, including `admin:write`, remains an explicit default-deny allowlist:
+/// many legacy MCP tools are not yet tenant-aware, so a generic "all tools"
+/// grant would reintroduce the shared-daemon confused deputy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HttpScopeToolPolicy {
+    AllowOnly(HashSet<String>),
+}
+
+const FACT_WRITE_TOOLS: &[&str] = &["store_fact", "delete_fact"];
+
+/// Retrieval-only surface matching the daemon's `query:read` contract. This
+/// intentionally does not reuse OAuth `mcp:read`: OAuth also includes session,
+/// receipt, sync, and coordination reads whose daemon HTTP scopes are
+/// separate.
+const QUERY_READ_TOOLS: &[&str] = &["query", "query_scan", "query_expand", "query_facts"];
+
+const SESSION_WRITE_TOOLS: &[&str] = &[
+    "save_session",
+    "session_checkpoint",
+    "delete_session",
+    "archive_session",
+    "unarchive_session",
+];
+
+const ADMIN_READ_TOOLS: &[&str] = &[
+    "list_entities",
+    "fact_history",
+    "memory_forget_dry_run",
+    "memory_view",
+    "memory_history",
+    "memory_freshness",
+    "memory_sweep_candidates",
+    "memory_contradictions",
+    "route_access_matrix",
+    "auth_posture_audit",
+    "egress_policy_check",
+    "list_work",
+    "status_feed",
+    "kind_list",
+    "kind_get",
+    "list_orchestrators",
+];
+
+/// Convert verified daemon HTTP scopes into an exact MCP tool ceiling.
+///
+/// `allow_mutations` is false when the transport could not bind a caller
+/// principal. Write scopes are then inert, while any independently granted
+/// read scope remains usable.
+pub fn tool_policy_for_http_scopes(scopes: &[String], allow_mutations: bool) -> HttpScopeToolPolicy {
+    let has = |scope: &str| scopes.iter().any(|granted| granted == scope);
+    let mut allowed = HashSet::new();
+    let safe_admin_write = allow_mutations && has("admin:write");
+    if has("query:read") || has("admin:read") || safe_admin_write {
+        allowed.extend(QUERY_READ_TOOLS.iter().map(|name| (*name).to_string()));
+    }
+    if has("admin:read") || safe_admin_write {
+        allowed.extend(ADMIN_READ_TOOLS.iter().map(|name| (*name).to_string()));
+    }
+    if allow_mutations && (has("facts:write") || safe_admin_write) {
+        allowed.extend(FACT_WRITE_TOOLS.iter().map(|name| (*name).to_string()));
+    }
+    if allow_mutations && (has("sessions:write") || safe_admin_write) {
+        allowed.extend(SESSION_WRITE_TOOLS.iter().map(|name| (*name).to_string()));
+    }
+    HttpScopeToolPolicy::AllowOnly(allowed)
 }
 
 pub fn rcx_local_capabilities() -> Vec<String> {
@@ -3631,6 +3702,118 @@ mod tests {
         assert!(by_name("issue_passport").description.starts_with("[tier:hosted]"));
         assert!(by_name("sync_pull").description.starts_with("[tier:hosted]"));
         assert!(by_name("sync_push").description.starts_with("[tier:hosted]"));
+    }
+
+    #[test]
+    fn http_scope_tool_policy_is_default_deny_and_scope_separated() {
+        let query = tool_policy_for_http_scopes(&["query:read".to_string()], false);
+        let HttpScopeToolPolicy::AllowOnly(query) = query;
+        assert!(query.contains("query"));
+        assert!(query.contains("query_facts"));
+        assert!(!query.contains("store_fact"));
+        assert!(!query.contains("save_session"));
+        assert!(!query.contains("punch_in"));
+        assert!(!query.contains("get_session"));
+        assert!(!query.contains("list_sessions"));
+        assert!(!query.contains("receipt_verify"));
+        assert!(!query.contains("sync_status"));
+        assert!(!query.contains("coord_status"));
+        assert!(!query.contains("get_bootstrap"));
+
+        let facts = tool_policy_for_http_scopes(&["facts:write".to_string()], true);
+        let HttpScopeToolPolicy::AllowOnly(facts) = facts;
+        assert!(facts.contains("store_fact"));
+        assert!(facts.contains("delete_fact"));
+        assert!(!facts.contains("save_session"));
+        assert!(!facts.contains("punch_in"));
+
+        let sessions = tool_policy_for_http_scopes(&["sessions:write".to_string()], true);
+        let HttpScopeToolPolicy::AllowOnly(sessions) = sessions;
+        assert!(sessions.contains("save_session"));
+        assert!(!sessions.contains("store_fact"));
+        assert!(!sessions.contains("punch_in"));
+        assert!(!sessions.contains("cuecrux_session"));
+
+        let admin_read = tool_policy_for_http_scopes(&["admin:read".to_string()], true);
+        let HttpScopeToolPolicy::AllowOnly(admin_read) = admin_read;
+        assert!(!admin_read.contains("audit_config"));
+        assert!(!admin_read.contains("get_passport"));
+        assert!(!admin_read.contains("autonomy_contract"));
+        assert!(!admin_read.contains("engram_resolve"));
+        assert!(!admin_read.contains("get_gaps"));
+        assert!(!admin_read.contains("get_constraints"));
+        assert!(!admin_read.contains("check_constraints"));
+        assert!(!admin_read.contains("check_config_audit"));
+        assert!(!admin_read.contains("resolve_principal"));
+        assert!(!admin_read.contains("activity_recent"));
+        assert!(!admin_read.contains("list_punchcards"));
+        assert!(!admin_read.contains("check_punchcard"));
+        for unsafe_read in [
+            "artefact_get",
+            "artefact_list",
+            "list_observations",
+            "get_observation",
+            "verify_observation",
+            "get_agent_identity",
+            "context_custody_audit",
+            "list_projects",
+            "get_project_context",
+            "get_project_storybook",
+            "diff_project_storybook",
+            "get_project_dossiers",
+            "diff_project_dossiers",
+            "get_workspace_storyline",
+            "entity_get",
+            "entity_list",
+            "entity_history",
+            "edge_get",
+            "edge_list",
+            "tool_trace_recent",
+            "token_savings",
+            "session_token_usage",
+        ] {
+            assert!(!admin_read.contains(unsafe_read), "{unsafe_read}");
+        }
+    }
+
+    #[test]
+    fn http_scope_tool_policy_requires_identity_for_mutations() {
+        assert_eq!(
+            tool_policy_for_http_scopes(&["facts:write".to_string()], false),
+            HttpScopeToolPolicy::AllowOnly(HashSet::new())
+        );
+        assert_eq!(
+            tool_policy_for_http_scopes(&["sessions:write".to_string()], false),
+            HttpScopeToolPolicy::AllowOnly(HashSet::new())
+        );
+        assert_eq!(
+            tool_policy_for_http_scopes(&["admin:write".to_string()], false),
+            HttpScopeToolPolicy::AllowOnly(HashSet::new())
+        );
+        assert_eq!(
+            tool_policy_for_http_scopes(&["admin:write".to_string()], true),
+            tool_policy_for_http_scopes(
+                &[
+                    "query:read".to_string(),
+                    "admin:read".to_string(),
+                    "facts:write".to_string(),
+                    "sessions:write".to_string(),
+                ],
+                true,
+            )
+        );
+        let HttpScopeToolPolicy::AllowOnly(admin_write) =
+            tool_policy_for_http_scopes(&["admin:write".to_string()], true);
+        assert!(admin_write.contains("query"));
+        assert!(admin_write.contains("store_fact"));
+        assert!(admin_write.contains("save_session"));
+        assert!(!admin_write.contains("entity_get"));
+        assert!(!admin_write.contains("punch_in"));
+        assert!(!admin_write.contains("audit_config"));
+        assert_eq!(
+            tool_policy_for_http_scopes(&["unknown:scope".to_string()], true),
+            HttpScopeToolPolicy::AllowOnly(HashSet::new())
+        );
     }
 
     #[test]

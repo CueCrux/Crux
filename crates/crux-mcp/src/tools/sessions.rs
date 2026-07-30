@@ -8,14 +8,46 @@
 
 use serde_json::{json, Value};
 
-use crate::dispatch::McpContext;
+use crate::dispatch::{McpContext, CAPABILITY_DENIED};
 use crate::protocol::{JsonRpcError, INTERNAL_ERROR, INVALID_PARAMS};
 use crate::scope;
+
+fn request_identity_required() -> JsonRpcError {
+    JsonRpcError {
+        code: CAPABILITY_DENIED,
+        message: "session access requires a transport-bound principal".to_string(),
+        data: None,
+    }
+}
+
+fn stored_session_id(ctx: &McpContext, logical_session_id: &str) -> Result<String, JsonRpcError> {
+    if ctx.has_request_authority() {
+        let principal = ctx.request_principal().ok_or_else(request_identity_required)?;
+        return Ok(scope::request_scoped_session_id(
+            principal,
+            &ctx.scope_tenant(),
+            logical_session_id,
+        ));
+    }
+    Ok(scope::scoped_session_id(
+        scope::agent_name(ctx.agent.as_ref()),
+        logical_session_id,
+    ))
+}
+
+fn visible_session_id(ctx: &McpContext, stored_session_id: &str) -> Option<String> {
+    if ctx.has_request_authority() {
+        return ctx.request_principal().and_then(|principal| {
+            scope::visible_session_for_request(stored_session_id, principal, &ctx.scope_tenant())
+        });
+    }
+    scope::visible_session_for_agent(stored_session_id, scope::agent_name(ctx.agent.as_ref()))
+}
 
 /// `get_session` — retrieve session state by ID.
 pub async fn handle_get_session(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let session_id = require_str(args, "session_id")?;
-    let stored_session_id = scope::scoped_session_id(scope::agent_name(ctx.agent.as_ref()), session_id);
+    let stored_session_id = stored_session_id(ctx, session_id)?;
 
     let store = ctx.session_store.read().await;
     match store.get(&stored_session_id) {
@@ -45,7 +77,7 @@ pub async fn handle_save_session(args: &Value, ctx: &McpContext) -> Result<Value
     })?;
 
     let ttl_seconds = args.get("ttl_seconds").and_then(|v| v.as_u64());
-    let stored_session_id = scope::scoped_session_id(scope::agent_name(ctx.agent.as_ref()), session_id);
+    let stored_session_id = stored_session_id(ctx, session_id)?;
 
     // Stamp the authenticated writer onto the record itself. Until now the ONLY
     // identity trace on a saved session was the `__agent_session::<agent>::` key
@@ -85,7 +117,7 @@ pub async fn handle_session_checkpoint(args: &Value, ctx: &McpContext) -> Result
         });
     }
     let ttl_seconds = args.get("ttl_seconds").and_then(|v| v.as_u64());
-    let stored_session_id = scope::scoped_session_id(scope::agent_name(ctx.agent.as_ref()), session_id);
+    let stored_session_id = stored_session_id(ctx, session_id)?;
     let state = json!({
         "schema": "crux.session_checkpoint.v1",
         "session_id": session_id,
@@ -129,11 +161,14 @@ pub async fn handle_session_checkpoint(args: &Value, ctx: &McpContext) -> Result
 /// `include_archived` is true.
 pub async fn handle_list_sessions(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let include_archived = args.get("include_archived").and_then(Value::as_bool).unwrap_or(false);
+    if ctx.has_request_authority() && ctx.request_principal().is_none() {
+        return Err(request_identity_required());
+    }
     let store = ctx.session_store.read().await;
     let mut ids = store
         .list_filtered(include_archived)
         .into_iter()
-        .filter_map(|session_id| scope::visible_session_for_agent(session_id, scope::agent_name(ctx.agent.as_ref())))
+        .filter_map(|session_id| visible_session_id(ctx, session_id))
         .collect::<Vec<_>>();
     ids.sort();
 
@@ -152,7 +187,7 @@ pub async fn handle_list_sessions(args: &Value, ctx: &McpContext) -> Result<Valu
 /// `delete_session` — delete a session by ID.
 pub async fn handle_delete_session(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let session_id = require_str(args, "session_id")?;
-    let stored_session_id = scope::scoped_session_id(scope::agent_name(ctx.agent.as_ref()), session_id);
+    let stored_session_id = stored_session_id(ctx, session_id)?;
 
     let mut store = ctx.session_store.write().await;
     let deleted = store.try_delete(&stored_session_id).map_err(|err| JsonRpcError {
@@ -192,7 +227,7 @@ pub async fn handle_unarchive_session(args: &Value, ctx: &McpContext) -> Result<
 async fn set_session_archived(args: &Value, ctx: &McpContext, archived: bool) -> Result<Value, JsonRpcError> {
     let session_id = require_str(args, "session_id")?;
     let reason = args.get("reason").and_then(Value::as_str).map(str::to_string);
-    let stored_session_id = scope::scoped_session_id(scope::agent_name(ctx.agent.as_ref()), session_id);
+    let stored_session_id = stored_session_id(ctx, session_id)?;
 
     let mut store = ctx.session_store.write().await;
     let result = store
@@ -367,6 +402,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bob["content"][0]["text"].as_str().unwrap(), "no session found: shared");
+    }
+
+    #[tokio::test]
+    async fn request_sessions_are_isolated_by_verified_tenant() {
+        let base = test_ctx().with_agent(AgentIdentity {
+            name: "shared-daemon-agent".to_string(),
+            token_hash: [9u8; 32],
+        });
+        let tenant_a = base
+            .clone()
+            .with_request_authority(Some("verified-writer".to_string()), "tenant-a");
+        let tenant_b = base.with_request_authority(Some("verified-writer".to_string()), "tenant-b");
+
+        handle_save_session(&json!({"session_id": "shared", "state": {"tenant": "a"}}), &tenant_a)
+            .await
+            .unwrap();
+        handle_save_session(&json!({"session_id": "shared", "state": {"tenant": "b"}}), &tenant_b)
+            .await
+            .unwrap();
+
+        let a = handle_get_session(&json!({"session_id": "shared"}), &tenant_a)
+            .await
+            .unwrap();
+        let b = handle_get_session(&json!({"session_id": "shared"}), &tenant_b)
+            .await
+            .unwrap();
+        assert!(a["content"][0]["text"].as_str().unwrap().contains("\"a\""));
+        assert!(b["content"][0]["text"].as_str().unwrap().contains("\"b\""));
+        assert_eq!(tenant_a.session_store.read().await.list().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn request_session_access_requires_bound_principal() {
+        let ctx = test_ctx().with_request_authority(None, "tenant-a");
+        let err = handle_save_session(&json!({"session_id": "s1", "state": {}}), &ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, CAPABILITY_DENIED);
+        assert!(ctx.session_store.read().await.list().is_empty());
     }
 
     // ── list_sessions tests ─────────────────────────────────────────

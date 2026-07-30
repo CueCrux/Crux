@@ -5,6 +5,7 @@
 
 //! MCP method dispatcher — routes JSON-RPC requests to handlers.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -55,6 +56,28 @@ pub struct McpContext {
     pub daemon_base_url: Option<String>,
     /// Optional RCX router for token-gated MCP catalogue and tool dispatch.
     pub rcx_router: Option<Arc<RcxRouter>>,
+    /// Optional per-request tool ceiling. This is an additional,
+    /// fail-closed intersection with the RCX router, used by transports such
+    /// as the OpenAI HTTP shim that authenticate a narrower caller scope than
+    /// the daemon's shared MCP token. `None` preserves the native MCP surface;
+    /// `Some(empty)` permits no tool calls.
+    ///
+    /// Exact tool names are intentional: authorising by the underlying RCX
+    /// capability alone could accidentally admit a future write tool that
+    /// aliases an existing read capability.
+    pub(crate) tool_name_allowlist: Option<Arc<HashSet<String>>>,
+    /// Transport-verified principal bound directly to this request. Unlike
+    /// `agent`, this is already a passport/automation principal and must not be
+    /// reinterpreted through the MCP agent-name mapping.
+    pub(crate) bound_request_principal: Option<String>,
+    /// Distinguishes a native MCP context (`false`) from an outer transport
+    /// that authenticated a request but could not bind a principal (`true`
+    /// with `bound_request_principal = None`). Without this bit, an
+    /// authenticated-but-unbound HTTP caller could fall back to the daemon's
+    /// shared MCP agent identity.
+    pub(crate) request_authority_bound: bool,
+    /// Concrete tenant resolved by the authenticating transport.
+    pub(crate) request_tenant: Option<String>,
     /// Daemon data directory — needed by tools that read on-disk artifacts
     /// the HTTP routes produced (e.g. observation JSONL files). `None` in
     /// test contexts; populated by `corecruxd::main` from `AppState.data_dir`.
@@ -133,6 +156,10 @@ impl McpContext {
             node_id,
             daemon_base_url: None,
             rcx_router: None,
+            tool_name_allowlist: None,
+            bound_request_principal: None,
+            request_authority_bound: false,
+            request_tenant: None,
             data_dir: None,
             passport_public_key_hex: None,
             entity_store: Arc::new(RwLock::new(EntityStore::new())),
@@ -171,6 +198,10 @@ impl McpContext {
             node_id,
             daemon_base_url: None,
             rcx_router: None,
+            tool_name_allowlist: None,
+            bound_request_principal: None,
+            request_authority_bound: false,
+            request_tenant: None,
             data_dir: None,
             passport_public_key_hex: None,
             entity_store: Arc::new(RwLock::new(EntityStore::new())),
@@ -220,6 +251,10 @@ impl McpContext {
             handoff_key: self.handoff_key,
             daemon_base_url: self.daemon_base_url.clone(),
             rcx_router: self.rcx_router.clone(),
+            tool_name_allowlist: self.tool_name_allowlist.clone(),
+            bound_request_principal: self.bound_request_principal.clone(),
+            request_authority_bound: self.request_authority_bound,
+            request_tenant: self.request_tenant.clone(),
             data_dir: self.data_dir.clone(),
             passport_public_key_hex: self.passport_public_key_hex.clone(),
             entity_store: Arc::clone(&self.entity_store),
@@ -285,6 +320,9 @@ impl McpContext {
     /// Returns `None` for an unauthenticated caller (no agent identity) under
     /// either flag state — anonymous callers have no private scope.
     pub fn scope_identity(&self) -> Option<String> {
+        if self.request_authority_bound {
+            return self.bound_request_principal.clone();
+        }
         let name = self.agent.as_ref()?.name.as_str();
         if self.agent_passports_enabled {
             Some(
@@ -305,6 +343,9 @@ impl McpContext {
     /// collide with and inherit a real passport's policy. Only an explicit
     /// agent-passport mapping resolves to a canonical passport id.
     pub fn authority_identity(&self) -> Option<String> {
+        if self.request_authority_bound {
+            return self.bound_request_principal.clone();
+        }
         let name = self.agent.as_ref()?.name.as_str();
         if self.agent_passports_enabled {
             Some(
@@ -320,6 +361,9 @@ impl McpContext {
     /// authority. Mapped agent passports carry their configured collaboration
     /// tenant; unmapped/flag-off callers are confined to `default`.
     pub fn scope_tenant(&self) -> String {
+        if let Some(tenant) = &self.request_tenant {
+            return tenant.clone();
+        }
         if !self.agent_passports_enabled {
             return "default".to_string();
         }
@@ -345,6 +389,9 @@ impl McpContext {
     /// The alias is the caller's OWN raw name only — never another agent's — so
     /// it can never widen visibility to a different principal.
     pub fn scope_aliases(&self) -> Vec<String> {
+        if self.request_authority_bound {
+            return Vec::new();
+        }
         match (&self.agent, self.agent_passports_enabled) {
             (Some(agent), true) => {
                 // Only an alias when the resolved identity actually differs
@@ -390,6 +437,57 @@ impl McpContext {
     pub fn with_shared_rcx_router(mut self, router: Arc<RcxRouter>) -> Self {
         self.rcx_router = Some(router);
         self
+    }
+
+    /// Bind authority already verified by an outer transport. The principal is
+    /// intentionally separate from `agent`: an HTTP passport is not an MCP
+    /// token-name and must not be remapped through `agent_passport_map`.
+    pub fn with_request_authority(mut self, principal: Option<String>, tenant: impl Into<String>) -> Self {
+        self.bound_request_principal = principal;
+        self.request_authority_bound = true;
+        self.request_tenant = Some(tenant.into());
+        self
+    }
+
+    /// True when an outer transport established this request context, even if
+    /// that transport did not bind a principal.
+    pub fn has_request_authority(&self) -> bool {
+        self.request_authority_bound
+    }
+
+    /// Principal verified by the outer transport. This never falls back to
+    /// the daemon's shared MCP agent.
+    pub fn request_principal(&self) -> Option<&str> {
+        self.bound_request_principal.as_deref()
+    }
+
+    /// Apply an immutable per-request exact-name ceiling. Dispatch and
+    /// catalogue listing both enforce this set in addition to the base RCX
+    /// router, so it can only attenuate authority.
+    pub fn with_tool_name_allowlist(mut self, tool_names: impl IntoIterator<Item = String>) -> Self {
+        self.tool_name_allowlist = Some(Arc::new(tool_names.into_iter().collect()));
+        self
+    }
+
+    pub fn permits_tool(&self, tool_name: &str) -> bool {
+        self.tool_name_allowlist
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains(tool_name))
+    }
+
+    /// Durable actor for fact mutations. A transport-bound principal wins
+    /// regardless of the native MCP agent-passport feature flag.
+    pub fn fact_actor(&self) -> Option<String> {
+        if self.request_authority_bound {
+            return self.bound_request_principal.clone();
+        }
+        if !self.agent_passports_enabled {
+            return None;
+        }
+        self.agent.as_ref().map(|agent| {
+            crate::agent_passport::resolve_agent_passport(&agent.name, &self.agent_passport_map)
+                .unwrap_or_else(|| agent.name.clone())
+        })
     }
 }
 
@@ -673,8 +771,15 @@ async fn maybe_wrap_with_envelope(
 }
 
 fn enforce_rcx_tool_capability(id: Option<serde_json::Value>, name: &str, ctx: &McpContext) -> Option<JsonRpcResponse> {
-    let router = ctx.rcx_router.as_ref()?;
+    if !ctx.permits_tool(name) {
+        return Some(JsonRpcResponse::error(
+            id,
+            CAPABILITY_DENIED,
+            format!("MCP tool '{name}' is not permitted by the caller capability context"),
+        ));
+    }
     let tool = tools::rcx_mcp_tool_capability(name);
+    let router = ctx.rcx_router.as_ref()?;
     // Capture the capability before it moves into CallContext so a denial of a
     // metered service scope can carry an upsell hint (M3). Free local lanes are
     // never service scopes, so this is null for ordinary denials.
@@ -826,6 +931,45 @@ mod tests {
         assert_eq!(mapped.authority_identity().as_deref(), Some("automation-passport"));
     }
 
+    #[test]
+    fn request_authority_bypasses_agent_alias_mapping_and_binds_tenant_actor() {
+        let agent = crate::agent::AgentIdentity {
+            name: "openai".to_string(),
+            token_hash: [7u8; 32],
+        };
+        let ctx = McpContext::new_default("test-node")
+            .with_agent_passports(
+                true,
+                crate::agent_passport::AgentPassportMap::from_pairs_str("openai:codex-work:work"),
+            )
+            .with_agent(agent)
+            .with_request_authority(Some("verified-openai".to_string()), "tenant-a");
+
+        assert_eq!(ctx.scope_identity().as_deref(), Some("verified-openai"));
+        assert_eq!(ctx.authority_identity().as_deref(), Some("verified-openai"));
+        assert_eq!(ctx.fact_actor().as_deref(), Some("verified-openai"));
+        assert_eq!(ctx.scope_tenant(), "tenant-a");
+        assert!(ctx.scope_aliases().is_empty());
+    }
+
+    #[test]
+    fn unbound_request_authority_never_inherits_shared_daemon_agent() {
+        let ctx = McpContext::new_default("test-node")
+            .with_agent(crate::agent::AgentIdentity {
+                name: "shared-daemon-agent".to_string(),
+                token_hash: [8u8; 32],
+            })
+            .with_request_authority(None, "tenant-a");
+
+        assert!(ctx.has_request_authority());
+        assert!(ctx.request_principal().is_none());
+        assert!(ctx.scope_identity().is_none());
+        assert!(ctx.authority_identity().is_none());
+        assert!(ctx.fact_actor().is_none());
+        assert!(ctx.scope_aliases().is_empty());
+        assert_eq!(ctx.scope_tenant(), "tenant-a");
+    }
+
     fn rpc(method: &str, params: serde_json::Value) -> JsonRpcRequest {
         JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -912,6 +1056,55 @@ mod tests {
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
         assert_eq!(names, vec!["store_fact"]);
+    }
+
+    #[tokio::test]
+    async fn request_tool_allowlist_filters_listing_and_direct_dispatch() {
+        let ctx = test_ctx().with_tool_name_allowlist(["query_facts".to_string()]);
+        let listed = dispatch(rpc("tools/list", json!({})), &ctx, None).await;
+        let listed = listed.result.expect("tools/list result");
+        let names: Vec<&str> = listed["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["query_facts"]);
+
+        let denied = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "store_fact",
+                    "arguments": {"entity": "blocked", "key": "k", "value": "v"}
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        assert_eq!(denied.error.expect("capability denial").code, CAPABILITY_DENIED);
+        assert_eq!(ctx.fact_store.read().await.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn request_tool_allowlist_cannot_widen_base_rcx_router() {
+        let ctx = rcx_ctx_with_capabilities(vec!["crux-mcp.query_facts"])
+            .with_tool_name_allowlist(["store_fact".to_string()]);
+        let denied = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "store_fact",
+                    "arguments": {"entity": "blocked", "key": "k", "value": "v"}
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        assert_eq!(denied.error.expect("RCX denial").code, CAPABILITY_DENIED);
+        assert_eq!(ctx.fact_store.read().await.count(), 0);
     }
 
     #[tokio::test]

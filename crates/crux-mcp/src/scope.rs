@@ -11,6 +11,7 @@ use crate::agent::AgentIdentity;
 
 pub const AGENT_PRIVATE_ENTITY_PREFIX: &str = "__agent::";
 pub const AGENT_SESSION_PREFIX: &str = "__agent_session::";
+pub const REQUEST_SESSION_PREFIX: &str = "__request_session::";
 
 pub fn agent_name(agent: Option<&AgentIdentity>) -> Option<&str> {
     agent.map(|identity| identity.name.as_str())
@@ -133,10 +134,42 @@ pub fn split_scoped_session_id(stored_session_id: &str) -> Option<(&str, &str)> 
 }
 
 pub fn visible_session_for_agent(stored_session_id: &str, agent_name: Option<&str>) -> Option<String> {
+    // Request-authority sessions have a separate principal+tenant namespace
+    // and are never legacy/native MCP sessions, including for anonymous
+    // callers.
+    if stored_session_id.starts_with(REQUEST_SESSION_PREFIX) {
+        return None;
+    }
     if let Some((owner, logical)) = split_scoped_session_id(stored_session_id) {
         return (agent_name == Some(owner)).then(|| logical.to_string());
     }
     agent_name.is_none().then(|| stored_session_id.to_string())
+}
+
+fn request_session_owner(principal: &str, tenant: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"crux-mcp-request-session-v1");
+    hasher.update(&(principal.len() as u64).to_le_bytes());
+    hasher.update(principal.as_bytes());
+    hasher.update(&(tenant.len() as u64).to_le_bytes());
+    hasher.update(tenant.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+/// Scope an outer-transport session by both verified principal and concrete
+/// tenant. The hashed owner component avoids delimiter ambiguity and keeps
+/// tenant names out of storage keys.
+pub fn request_scoped_session_id(principal: &str, tenant: &str, logical_session_id: &str) -> String {
+    format!(
+        "{REQUEST_SESSION_PREFIX}{}::{logical_session_id}",
+        request_session_owner(principal, tenant)
+    )
+}
+
+pub fn visible_session_for_request(stored_session_id: &str, principal: &str, tenant: &str) -> Option<String> {
+    let rest = stored_session_id.strip_prefix(REQUEST_SESSION_PREFIX)?;
+    let (owner, logical) = rest.split_once("::")?;
+    (owner == request_session_owner(principal, tenant)).then(|| logical.to_string())
 }
 
 #[cfg(test)]
@@ -195,5 +228,20 @@ mod tests {
             Some("sess-42")
         );
         assert!(visible_session_for_agent(&stored, Some("bob")).is_none());
+    }
+
+    #[test]
+    fn request_sessions_are_principal_and_tenant_scoped() {
+        let tenant_a = request_scoped_session_id("alice", "tenant-a", "sess-42");
+        let tenant_b = request_scoped_session_id("alice", "tenant-b", "sess-42");
+        assert_ne!(tenant_a, tenant_b);
+        assert_eq!(
+            visible_session_for_request(&tenant_a, "alice", "tenant-a").as_deref(),
+            Some("sess-42")
+        );
+        assert!(visible_session_for_request(&tenant_a, "alice", "tenant-b").is_none());
+        assert!(visible_session_for_request(&tenant_a, "bob", "tenant-a").is_none());
+        assert!(visible_session_for_agent(&tenant_a, None).is_none());
+        assert!(visible_session_for_agent(&tenant_a, Some("alice")).is_none());
     }
 }

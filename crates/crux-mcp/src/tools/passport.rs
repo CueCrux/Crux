@@ -125,21 +125,16 @@ fn can_revoke(caller_key: &str, caller: &PassportRecord, target_key: &str, targe
 
 /// Resolve the entity-name component used to key this agent's MCP passport.
 ///
-/// Flag-OFF (or unmapped agent): the raw agent token-name — identical to the
-/// pre-M2 behaviour, so `__passport__::anthropic`.
+/// A transport-bound principal is already canonical and wins. Otherwise,
+/// flag-OFF (or unmapped agent) uses the raw agent token-name — identical to
+/// the pre-M2 behaviour, so `__passport__::anthropic`.
 ///
 /// Flag-ON + mapped agent (agent-passport M2): the resolved passport_id from
 /// [`McpContext::agent_passport_map`], e.g. `anthropic` → `claude-work`, so the
 /// passport is keyed to the same id M1 stamps as the fact `actor`. This keeps
 /// attribution and the passport in agreement.
 pub(crate) fn passport_key_name(ctx: &McpContext) -> Option<String> {
-    let agent_name = scope::agent_name(ctx.agent.as_ref())?;
-    if ctx.agent_passports_enabled {
-        if let Some(passport_id) = crate::agent_passport::resolve_agent_passport(agent_name, &ctx.agent_passport_map) {
-            return Some(passport_id);
-        }
-    }
-    Some(agent_name.to_string())
+    ctx.scope_identity()
 }
 
 /// Look up the calling agent's passport from the fact store.
@@ -347,7 +342,11 @@ async fn mint_passport(
 /// the passport map (those agents keep the pre-M2 "call issue_passport()"
 /// flow). Returns the (possibly freshly minted) record when one exists.
 pub(crate) async fn auto_issue_if_mapped(ctx: &McpContext) -> Option<PassportRecord> {
-    if !ctx.agent_passports_enabled {
+    // An outer transport principal is already canonical and must never be
+    // reinterpreted through the shared daemon MCP agent's alias map. Passport
+    // minting for that principal belongs to the transport's explicit write
+    // authority, not this native MCP convenience path.
+    if ctx.has_request_authority() || !ctx.agent_passports_enabled {
         return None;
     }
     let agent_name = scope::agent_name(ctx.agent.as_ref())?;

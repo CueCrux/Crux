@@ -132,7 +132,6 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
         .map(|s| s.to_string());
     let confidence = args.get("confidence").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
     let private = args.get("private").and_then(|v| v.as_bool()).unwrap_or(false);
-    let agent_name = scope::agent_name(ctx.agent.as_ref());
 
     // agent-passport M5: the *scope identity* is what private facts are keyed
     // by and matched against. Flag-OFF it is exactly `agent_name` (raw token-
@@ -206,21 +205,15 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
         (false, _) => entity_raw.to_string(),
     };
 
-    // Durable authorship (agent-passport M1). FLAG-GATED:
+    // Durable authorship (agent-passport M1 + transport authority):
+    // * A transport-bound principal is already authenticated and always wins.
     // * Flag OFF (default): `actor = None` — byte-for-byte the pre-M1 path.
     // * Flag ON: resolve the agent token-name (`anthropic`, `openai`, …) to a
     //   passport_id (`claude-work`, `codex-work`, …) via the context map. If
     //   the name is unmapped we fall back to the RAW agent name so a flag-ON
     //   write is NEVER anonymous (QC.3); only a truly unauthenticated caller
     //   (no agent identity) leaves `actor = None`.
-    let actor: Option<String> = if ctx.agent_passports_enabled {
-        agent_name.map(|name| {
-            crate::agent_passport::resolve_agent_passport(name, &ctx.agent_passport_map)
-                .unwrap_or_else(|| name.to_string())
-        })
-    } else {
-        None
-    };
+    let actor = ctx.fact_actor();
 
     // agent-passport M5: the entity the category check runs against. For a
     // private fact use the LOGICAL (pre-`__agent::`-prefix) entity; otherwise
