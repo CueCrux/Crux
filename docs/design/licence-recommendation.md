@@ -1,4 +1,4 @@
-# Licence Recommendation — switch CCL v1.0 → BUSL 1.1
+# Licence Recommendation (May 2026, NOT ADOPTED) — CCL v1.0 → BUSL 1.1
 
 > **SUPERSEDED (2026-07-29).** This recommendation was not adopted. The
 > repository relicensed from CCL v1.0 directly to **Apache License, Version
@@ -15,9 +15,9 @@
 
 > **This is engineering research, not a legal opinion.** The recommendation below is grounded in licence-text comparison and the published practice of comparable projects (MariaDB, CockroachDB, Sentry). Any licence change must be reviewed by counsel; this document is structured to be the input to that conversation, not a substitute for it.
 
-## Recommendation
+## The recommendation that was made (and not taken)
 
-Switch from the bespoke **CueCrux Community Licence (CCL v1.0)** to **Business Source License 1.1 (BUSL 1.1)**, with:
+The recommendation at the time was to switch from the bespoke **CueCrux Community Licence (CCL v1.0)** to **Business Source License 1.1 (BUSL 1.1)**, with:
 
 - **Change Date:** Three years after each versioned release.
 - **Change Licence:** Apache License, Version 2.0.
@@ -130,7 +130,7 @@ Used by Elastic, MongoDB (SSPL), Redis. **Rejected** because:
 | `entity` | `execplan:crux-licence-spdx-and-surface-2026-05-28` (planned, not yet created) |
 | `key` | `decision:licence-route` |
 | `value` | `{"chosen": "BUSL-1.1", "rationale": "see docs/design/licence-recommendation.md", "needs_legal_review": true, "commit_sha": "TBD-at-switch-time"}` |
-| Status | **Pending legal review.** Do not change `LICENCE.md` until counsel has signed off on the Additional Use Grant draft. |
+| Status | **Not adopted — closed 2026-07-29.** The repository relicensed to **Apache-2.0** (the CCL's own Change Licence) instead of to BUSL 1.1, so the fact record above was never created and the `chosen` value never became true. The licence in force is [`LICENSE`](../../LICENSE); `LICENCE.md` no longer exists. |
 
 ## What this document is NOT
 
