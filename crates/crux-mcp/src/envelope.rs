@@ -113,7 +113,8 @@ pub fn envelope_enabled() -> bool {
 
 /// Return true if the given entity name starts with any reserved prefix.
 pub fn is_reserved_entity(entity: &str) -> bool {
-    RESERVED_PREFIXES.iter().any(|p| entity.starts_with(p))
+    corecrux_memory::fact_privacy::daemon_owned_entity_prefix(entity).is_some()
+        || RESERVED_PREFIXES.iter().any(|p| entity.starts_with(p))
 }
 
 /// Freshness classifier for a single memory entry.
@@ -481,6 +482,21 @@ mod tests {
         McpContext::new_default("test-node-envelope")
     }
 
+    async fn seed_operator_fact(ctx: &McpContext, entity: &str, key: &str, value: &str) {
+        let mut store = ctx.fact_store.write().await;
+        store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: entity.to_string(),
+            key: key.to_string(),
+            value: value.to_string(),
+            source_receipt: Some("test:typed-operator-workflow".to_string()),
+            confidence: 1.0,
+            private: true,
+            horizon_class: None,
+            actor: Some("daemon:test".to_string()),
+        });
+    }
+
     #[test]
     fn envelope_flag_default_off() {
         // Hold the crate-wide test env lock so this sync test doesn't
@@ -526,18 +542,8 @@ mod tests {
         )
         .await
         .unwrap();
-        handle_store_fact(
-            &json!({"entity": "__ops::config-audit", "key": "sha256:abc", "value": "shipped"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
-        handle_store_fact(
-            &json!({"entity": "__bootstrap__::pattern:x", "key": "Retry", "value": "shipped"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        seed_operator_fact(&ctx, "__ops::config-audit", "sha256:abc", "shipped").await;
+        seed_operator_fact(&ctx, "__bootstrap__::pattern:x", "Retry", "shipped").await;
 
         let envelope = build_envelope_for_query_facts(&json!({"query": "shipped"}), &ctx).await;
         // Only project-alpha should appear.

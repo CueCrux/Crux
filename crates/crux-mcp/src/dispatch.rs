@@ -725,6 +725,23 @@ mod tests {
         McpContext::new_default("test-node")
     }
 
+    async fn seed_operator_fact(ctx: &McpContext, entity: &str, key: &str, value: &str) -> String {
+        let mut store = ctx.fact_store.write().await;
+        store
+            .store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: entity.to_string(),
+                key: key.to_string(),
+                value: value.to_string(),
+                source_receipt: Some("test:typed-operator-workflow".to_string()),
+                confidence: 1.0,
+                private: true,
+                horizon_class: None,
+                actor: Some("daemon:test".to_string()),
+            })
+            .fact_id
+    }
+
     fn rcx_ctx_with_capabilities(capabilities: Vec<&str>) -> McpContext {
         let now = current_unix_seconds();
         let signing = SigningKey::from_bytes(&[42u8; 32]);
@@ -1320,34 +1337,30 @@ mod tests {
 
         // Seed one public + two reserved-prefix facts. Capture each fact_id
         // so we can pass them into the ack tool.
-        let mut ids: Vec<String> = Vec::new();
-        for (entity, key) in [
-            ("project-y", "status"),
-            ("__ops::config-audit", "sha256:ack"),
-            ("__bootstrap__::pattern:retry", "Retry"),
-        ] {
-            let resp = dispatch(
-                rpc(
-                    "tools/call",
-                    json!({
-                        "name": "store_fact",
-                        "arguments": {"entity": entity, "key": key, "value": "shipped-ack"}
-                    }),
-                ),
-                &ctx,
-                None,
-            )
-            .await;
-            let text = resp.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
-            // "stored fact f_xxx (entity=..., key=..., ..."
-            let id = text
-                .trim_start_matches("stored fact ")
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .to_string();
-            ids.push(id);
-        }
+        let public = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "store_fact",
+                    "arguments": {"entity": "project-y", "key": "status", "value": "shipped-ack"}
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let text = public.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut ids = vec![text
+            .trim_start_matches("stored fact ")
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string()];
+        ids.push(seed_operator_fact(&ctx, "__ops::config-audit", "sha256:ack", "shipped-ack").await);
+        ids.push(seed_operator_fact(&ctx, "__bootstrap__::pattern:retry", "Retry", "shipped-ack").await);
 
         let resp = dispatch(
             rpc(

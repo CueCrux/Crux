@@ -340,6 +340,7 @@ pub(super) async fn get_agent_brief(
         "sessions": sessions,
         "active_constraints": constraints,
         "open_decisions": decisions,
+        "decision_integrity": "untrusted_annotation",
         "open_work": open_work,
         // The rows above are ranked, not merely filtered, and carry only the
         // cheap fields. Stated explicitly so a consumer knows the order is
@@ -664,6 +665,7 @@ pub(super) async fn post_handoff_v2(
         "target_agent": &body.target_agent,
         "constraints": constraints,
         "open_decisions": decisions,
+        "decision_integrity": "untrusted_annotation",
         "evidence_refs": &body.evidence_refs,
         "command_ledger_summary": command_summary,
         "next_actions": &body.next_actions,

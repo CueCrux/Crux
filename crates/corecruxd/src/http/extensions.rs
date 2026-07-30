@@ -821,7 +821,9 @@ pub(super) async fn invoke_extension_tool(
     if outcome.accepted_fact_writes > 0 {
         let mut store = state.fact_store.write().await;
         for w in &parsed.fact_writes {
-            if !grant.allowed_prefixes_write.iter().any(|p| w.entity.starts_with(p)) {
+            if crate::fact_privacy::generic_create_reserved_entity_prefix(&w.entity).is_some()
+                || !grant.allowed_prefixes_write.iter().any(|p| w.entity.starts_with(p))
+            {
                 continue; // already counted as dropped
             }
             let mut sf = corecrux_memory::fact_store::StoreFact {

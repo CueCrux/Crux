@@ -33,6 +33,9 @@ fail-closed predicate used before dispatch, in discovery, and for bind validatio
   hash_matches && error_code == "OK"` (boolean-AND, fail-closed).
 - Observes I4: recall filters `superseded_by.is_none()` by default
   (`src/tools/facts.rs`); `include_superseded=true` exposes the chain.
+- Generic fact, memory-edit, consolidation, and forget tools cannot create,
+  overwrite, or delete daemon-owned control namespaces; those records are
+  reachable only through their typed daemon workflows.
 
 ## Test & verify
 - `cargo test -p crux-mcp` (includes the `t1_regression` tenant-isolation suite)
@@ -45,3 +48,5 @@ fail-closed predicate used before dispatch, in discovery, and for bind validatio
 - New tools register in `src/tools/mod.rs` AND get a tier entry in
   `vaultcrux-local::tool_surface::TOOL_SURFACE` (unknown names default to Local).
 - Changes touching tenant scoping must keep `t1_regression` green — it is the merge bar.
+- Namespace checks must use `corecrux_memory::fact_privacy`; do not grow a
+  second MCP-only control-prefix list.

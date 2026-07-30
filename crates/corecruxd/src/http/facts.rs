@@ -175,7 +175,7 @@ fn raw_admin_write(ctx: &crate::auth::HttpScopeContext) -> bool {
 /// - The MCP write plane has no per-token tenant claim, so it uniformly stamps `default`
 ///   (no cross-tenant bypass); MCP-plane multi-tenancy is a scoped follow-up.
 #[allow(clippy::result_large_err)]
-fn tenant_hash_for_write_context(ctx: &crate::auth::HttpScopeContext) -> Result<String, Response> {
+pub(super) fn tenant_hash_for_write_context(ctx: &crate::auth::HttpScopeContext) -> Result<String, Response> {
     match ctx.resolve_write_tenant() {
         Ok(Some(tenant)) => Ok(tenant),
         Ok(None) => Ok(corecrux_memory::fact_store::default_tenant_hash()),
@@ -205,6 +205,10 @@ fn fact_visible_for_http_write(fact: &corecrux_memory::fact_store::Fact, ctx: &c
     raw_admin_write(ctx) || crux_mcp::scope::fact_visible_to_agent(fact, ctx.passport_id.as_deref())
 }
 
+fn logical_entity_for_target_policy(fact: &corecrux_memory::fact_store::Fact) -> &str {
+    crux_mcp::scope::split_private_entity(&fact.entity).map_or(&fact.entity, |(_, logical)| logical)
+}
+
 #[allow(clippy::result_large_err)]
 fn prepare_fact_write_checked(
     state: &AppState,
@@ -214,9 +218,9 @@ fn prepare_fact_write_checked(
 ) -> Result<corecrux_memory::fact_store::StoreFact, Response> {
     // Never trust a client-supplied tenant stamp; derive it from auth context.
     fact.tenant_hash = tenant_hash_for_write_context(ctx)?;
-    if let Some(prefix) = crate::fact_privacy::daemon_owned_entity_prefix(&fact.entity) {
+    if let Some(prefix) = crate::fact_privacy::generic_create_reserved_entity_prefix(&fact.entity) {
         return Err(ProblemResponse(
-            ProblemDetails::forbidden(format!("entity uses reserved daemon-owned prefix `{prefix}`")).with_extensions(
+            ProblemDetails::forbidden(format!("entity uses create-reserved prefix `{prefix}`")).with_extensions(
                 serde_json::json!({
                     "code": "RESERVED_ENTITY_PREFIX",
                     "entity": fact.entity,
@@ -578,8 +582,21 @@ pub(super) async fn delete_fact(
     } else {
         store.get_for_tenant(&fact_id, &tenant_hash)
     };
-    let visible = fact.is_some_and(|fact| fact_visible_for_http_write(fact, &ctx));
-    let deleted = if visible {
+    let visible_fact = fact.filter(|fact| fact_visible_for_http_write(fact, &ctx));
+    if let Some(prefix) = visible_fact
+        .and_then(|fact| crate::fact_privacy::daemon_owned_entity_prefix(logical_entity_for_target_policy(fact)))
+    {
+        return ProblemResponse(
+            ProblemDetails::forbidden(format!("fact belongs to reserved daemon-owned prefix `{prefix}`"))
+                .with_extensions(serde_json::json!({
+                    "code": "RESERVED_ENTITY_PREFIX",
+                    "fact_id": fact_id,
+                    "reserved_prefix": prefix,
+                })),
+        )
+        .into_response();
+    }
+    let deleted = if visible_fact.is_some() {
         match store.try_delete(&fact_id) {
             Ok(deleted) => deleted,
             Err(err) => return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),

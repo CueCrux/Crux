@@ -2451,7 +2451,7 @@ async fn put_fact_forces_reserved_prefix_private_before_store() {
     let state = test_app_state(16);
     let body = corecrux_memory::fact_store::StoreFact {
         tenant_hash: "default".to_string(),
-        entity: "__ops__::deploy".to_string(),
+        entity: "github::CueCrux/Crux::issue/1".to_string(),
         key: "status".to_string(),
         value: "ready".to_string(),
         source_receipt: None,
@@ -2466,7 +2466,10 @@ async fn put_fact_forces_reserved_prefix_private_before_store() {
         .into_response();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let store = state.fact_store.read().await;
-    let fact = store.all_facts().find(|fact| fact.entity == "__ops__::deploy").unwrap();
+    let fact = store
+        .all_facts()
+        .find(|fact| fact.entity == "github::CueCrux/Crux::issue/1")
+        .unwrap();
     assert!(fact.private);
 }
 
@@ -2476,7 +2479,7 @@ async fn put_facts_bulk_forces_reserved_prefix_private_before_store() {
     let body = vec![
         corecrux_memory::fact_store::StoreFact {
             tenant_hash: "default".to_string(),
-            entity: "__bootstrap__::patterns".to_string(),
+            entity: "github::CueCrux/Crux::issue/2".to_string(),
             key: "p1".to_string(),
             value: "pattern".to_string(),
             source_receipt: None,
@@ -2505,7 +2508,7 @@ async fn put_facts_bulk_forces_reserved_prefix_private_before_store() {
     let store = state.fact_store.read().await;
     let reserved = store
         .all_facts()
-        .find(|fact| fact.entity == "__bootstrap__::patterns")
+        .find(|fact| fact.entity == "github::CueCrux/Crux::issue/2")
         .unwrap();
     assert!(reserved.private);
     let public = store.all_facts().find(|fact| fact.entity == "public").unwrap();
@@ -2513,61 +2516,20 @@ async fn put_facts_bulk_forces_reserved_prefix_private_before_store() {
 }
 
 #[tokio::test]
-async fn put_fact_passport_rejects_daemon_owned_entity_prefix() {
+async fn put_fact_passport_rejects_every_create_reserved_entity_prefix() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     {
         let mut store = state.fact_store.write().await;
         crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
     }
-    let body = corecrux_memory::fact_store::StoreFact {
-        tenant_hash: "client-supplied-must-be-ignored".to_string(),
-        entity: "__legal_hold__::hold-1".to_string(),
-        key: "state".to_string(),
-        value: "attacker".to_string(),
-        source_receipt: None,
-        confidence: 1.0,
-        private: false,
-        horizon_class: None,
-        actor: None,
-    };
-
-    let resp = facts::put_fact(
-        State(state.clone()),
-        dev_scope_passport_headers("facts:write", "work-default"),
-        Json(body),
-    )
-    .await
-    .into_response();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    let body = json_body(resp).await;
-    assert_eq!(body["code"], "RESERVED_ENTITY_PREFIX");
-    assert_eq!(body["reserved_prefix"], "__legal_hold__::");
-    assert!(state
-        .fact_store
-        .read()
-        .await
-        .get_by_entity("__legal_hold__::hold-1")
-        .is_empty());
-}
-
-#[tokio::test]
-async fn put_facts_bulk_rejects_daemon_owned_entity_prefix_atomically() {
-    let state = test_app_state(16);
-    let body = vec![
-        corecrux_memory::fact_store::StoreFact {
-            tenant_hash: "default".to_string(),
-            entity: "public".to_string(),
-            key: "safe".to_string(),
-            value: "must-not-partially-store".to_string(),
-            source_receipt: None,
-            confidence: 1.0,
-            private: false,
-            horizon_class: None,
-            actor: None,
-        },
-        corecrux_memory::fact_store::StoreFact {
-            tenant_hash: "default".to_string(),
-            entity: "__incident__::incident-1".to_string(),
+    for prefix in corecrux_memory::fact_privacy::DAEMON_OWNED_ENTITY_PREFIXES
+        .iter()
+        .chain(corecrux_memory::fact_privacy::GENERIC_CREATE_RESERVED_PREFIXES)
+    {
+        let entity = format!("{prefix}attacker");
+        let body = corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "client-supplied-must-be-ignored".to_string(),
+            entity: entity.clone(),
             key: "state".to_string(),
             value: "attacker".to_string(),
             source_receipt: None,
@@ -2575,8 +2537,53 @@ async fn put_facts_bulk_rejects_daemon_owned_entity_prefix_atomically() {
             private: false,
             horizon_class: None,
             actor: None,
-        },
-    ];
+        };
+
+        let resp = facts::put_fact(
+            State(state.clone()),
+            dev_scope_passport_headers("facts:write", "work-default"),
+            Json(body),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "prefix {prefix}");
+        let body = json_body(resp).await;
+        assert_eq!(body["code"], "RESERVED_ENTITY_PREFIX");
+        assert_eq!(body["reserved_prefix"], *prefix);
+        assert!(state.fact_store.read().await.get_by_entity(&entity).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn put_facts_bulk_rejects_create_reserved_entity_prefix_atomically() {
+    let state = test_app_state(16);
+    let mut body = vec![corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "default".to_string(),
+        entity: "public".to_string(),
+        key: "safe".to_string(),
+        value: "must-not-partially-store".to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        private: false,
+        horizon_class: None,
+        actor: None,
+    }];
+    body.extend(
+        corecrux_memory::fact_privacy::DAEMON_OWNED_ENTITY_PREFIXES
+            .iter()
+            .chain(corecrux_memory::fact_privacy::GENERIC_CREATE_RESERVED_PREFIXES)
+            .map(|prefix| corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: format!("{prefix}attacker"),
+                key: "state".to_string(),
+                value: "attacker".to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            }),
+    );
 
     let resp = facts::put_facts_bulk(State(state.clone()), HeaderMap::new(), Json(body))
         .await
@@ -2584,7 +2591,10 @@ async fn put_facts_bulk_rejects_daemon_owned_entity_prefix_atomically() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     let body = json_body(resp).await;
     assert_eq!(body["code"], "RESERVED_ENTITY_PREFIX");
-    assert_eq!(body["reserved_prefix"], "__incident__::");
+    assert_eq!(
+        body["reserved_prefix"],
+        corecrux_memory::fact_privacy::DAEMON_OWNED_ENTITY_PREFIXES[0]
+    );
     assert_eq!(state.fact_store.read().await.all_facts().count(), 0);
 }
 
@@ -2675,6 +2685,35 @@ async fn delete_fact_not_found() {
         .await
         .into_response();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_fact_rejects_daemon_owned_control_record() {
+    let state = test_app_state(16);
+    let fact_id = {
+        let mut store = state.fact_store.write().await;
+        store
+            .store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: "__passport__::victim".to_string(),
+                key: "record".to_string(),
+                value: "trusted".to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: true,
+                horizon_class: None,
+                actor: None,
+            })
+            .fact_id
+    };
+
+    let resp = delete_fact(State(state.clone()), HeaderMap::new(), Path(fact_id.clone()))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = json_body(resp).await;
+    assert_eq!(body["code"], "RESERVED_ENTITY_PREFIX");
+    assert!(!state.fact_store.read().await.get(&fact_id).unwrap().deleted);
 }
 
 // ── Fact Store (GET /v1/facts/entity/{entity}) ──────────────────
@@ -3406,11 +3445,11 @@ async fn list_facts_as_of_excludes_newer_facts_and_paginates_exactly() {
 async fn list_facts_excludes_reserved_unless_requested() {
     let state = test_app_state(16);
     store_plain_fact(&state, "note", "k", "public-one").await;
-    // `__memory_pin::` is a RESERVED_ENTITY_PREFIXES entry that is NOT in the
-    // force-private DEFAULT_PRIVATE_PREFIXES, so it stays non-private and is
-    // visible once `include_reserved` is set (unlike `__work__::` etc., which
-    // are born private and never surface here).
-    store_plain_fact(&state, "__memory_pin::plan", "k", "reserved-one").await;
+    // Typed decision records are export-reserved but intentionally remain in
+    // the local shared query pool, so include_reserved can surface them.
+    // Daemon-control rows such as `__memory_pin::` are born private and never
+    // surface through this list.
+    store_plain_fact(&state, "__decisions__::plan", "k", "reserved-one").await;
 
     // Default: reserved hidden.
     let resp = facts::list_facts(State(state.clone()), HeaderMap::new(), Query(list_facts_params()))
@@ -9687,6 +9726,34 @@ async fn console_fact_add_then_search_round_trip() {
 }
 
 #[tokio::test]
+async fn console_fact_add_rejects_every_create_reserved_entity_prefix() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    for prefix in corecrux_memory::fact_privacy::DAEMON_OWNED_ENTITY_PREFIXES
+        .iter()
+        .chain(corecrux_memory::fact_privacy::GENERIC_CREATE_RESERVED_PREFIXES)
+    {
+        let entity = format!("{prefix}attacker");
+        let resp = console::post_console_fact_add(
+            State(state.clone()),
+            dev_scope_headers("facts:write"),
+            Json(console::ConsoleAddFactBody {
+                entity: entity.clone(),
+                key: "state".to_string(),
+                value: "attacker".to_string(),
+                confidence: 1.0,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "prefix {prefix}");
+        let body = json_body(resp).await;
+        assert_eq!(body["code"], "RESERVED_ENTITY_PREFIX");
+        assert_eq!(body["reserved_prefix"], *prefix);
+        assert!(state.fact_store.read().await.get_by_entity(&entity).is_empty());
+    }
+}
+
+#[tokio::test]
 async fn console_fact_add_requires_facts_write_scope() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     let resp = console::post_console_fact_add(
@@ -10113,7 +10180,7 @@ async fn put_fact_system_entity_exempt_from_passport_category() {
     }
     let body = corecrux_memory::fact_store::StoreFact {
         tenant_hash: "default".to_string(),
-        entity: "__bootstrap__::seed".to_string(),
+        entity: "__synthetic__::seed".to_string(),
         key: "x".to_string(),
         value: "v".to_string(),
         source_receipt: None,
@@ -10122,7 +10189,9 @@ async fn put_fact_system_entity_exempt_from_passport_category() {
         horizon_class: None,
         actor: None,
     };
-    // personal-default writing a __bootstrap__:: system entity must succeed.
+    // A non-control system namespace remains category-exempt. Daemon-owned
+    // namespaces such as __bootstrap__:: are rejected by the earlier authority
+    // boundary instead.
     let resp = facts::put_fact(
         State(state),
         dev_scope_passport_headers("facts:write", "personal-default"),
@@ -13191,6 +13260,89 @@ async fn engram_list_session_init_and_resolve_match_hosted_shape() {
         .as_str()
         .unwrap_or_default()
         .starts_with("local-engram-dispatch:"));
+}
+
+fn test_engram_upsert_body() -> super::engrams::UpsertEngramBody {
+    super::engrams::UpsertEngramBody {
+        version: "v1".to_string(),
+        intent_bucket: "developer_surface".to_string(),
+        query_pattern: Some("code|minimal".to_string()),
+        content: "operator-validated minimalism overlay".to_string(),
+        applicable_why: Some("local policy".to_string()),
+        capability_class_min: Some("capable".to_string()),
+        capability_class_max: Some("frontier".to_string()),
+        generated_class: None,
+        source_chunk_hashes: Vec::new(),
+        source_chunk_set_hash: None,
+        inherited_reason: None,
+        policy_hash: None,
+        enabled: true,
+    }
+}
+
+#[tokio::test]
+async fn typed_engram_upsert_validates_and_stamps_provenance() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::engrams::upsert_engram(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        Path("code-minimalism".to_string()),
+        Json(test_engram_upsert_body()),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = json_body(resp).await;
+    assert_eq!(body["schema"], "crux.local.engram_upsert.v1");
+    assert_eq!(body["name"], "code-minimalism");
+    assert!(body["actor"].as_str().is_some_and(|actor| !actor.is_empty()));
+    assert!(body["source_receipt"]
+        .as_str()
+        .unwrap_or_default()
+        .starts_with("engram-upsert:blake3:"));
+
+    let store = state.fact_store.read().await;
+    let rows = store.get_by_entity("__engram__::code-minimalism::v1");
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].private);
+    assert!(rows[0].actor.is_some());
+    assert!(rows[0].source_receipt.is_some());
+    let catalog = corecrux_memory::engrams::local_catalog_with_overlays(&store);
+    let overlay = catalog
+        .iter()
+        .find(|engram| engram.name == "code-minimalism" && engram.version == "v1")
+        .expect("validated overlay");
+    assert_eq!(overlay.content, "operator-validated minimalism overlay");
+}
+
+#[tokio::test]
+async fn typed_engram_upsert_rejects_wrong_scope_and_malformed_name() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let wrong_scope = super::engrams::upsert_engram(
+        State(state.clone()),
+        dev_scope_headers("facts:write"),
+        Path("code-minimalism".to_string()),
+        Json(test_engram_upsert_body()),
+    )
+    .await
+    .into_response();
+    assert_eq!(wrong_scope.status(), StatusCode::FORBIDDEN);
+
+    let malformed = super::engrams::upsert_engram(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        Path("../escape".to_string()),
+        Json(test_engram_upsert_body()),
+    )
+    .await
+    .into_response();
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    assert!(state
+        .fact_store
+        .read()
+        .await
+        .get_by_entity("__engram__::../escape::v1")
+        .is_empty());
 }
 
 #[tokio::test]
@@ -17682,6 +17834,7 @@ async fn wasm_summarise_extension_end_to_end_or_skip() {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             };
             crate::fact_privacy::enforce_global(&mut sf);
             store.store(sf);

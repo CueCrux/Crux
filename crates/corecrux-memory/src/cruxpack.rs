@@ -46,60 +46,76 @@ pub const CRUXPACK_SCHEMA_V1: &str = "crux.cruxpack.v1";
 /// provenance: `cruxpack:blake3:<64-hex>`.
 pub const CRUXPACK_SOURCE_RECEIPT_PREFIX: &str = "cruxpack:";
 
-/// Reserved born-private entity prefixes excluded from every export unless
+/// Reserved entity prefixes excluded from every export unless
 /// `include_private` is set.
 ///
-/// This is a superset of `corecruxd::fact_privacy::DEFAULT_PRIVATE_PREFIXES`
-/// (which flips these to `private: true` at ingest — the primary guard; this
-/// list is the belt-and-braces re-check for facts written before that
-/// enforcement existed) plus the CLI-side reserved prefixes from
-/// `corecruxctl::memory`. A corecruxd test asserts the daemon's default
-/// privacy policy stays a subset of this list, so a new born-private prefix
-/// cannot silently become exportable.
+/// This covers every canonical born-private prefix plus a small export-only
+/// tail for user-authored records that are intentionally queryable in the
+/// local shared fact pool. A drift test in `fact_privacy` prevents a new
+/// born-private namespace from becoming exportable.
 pub const CRUXPACK_RESERVED_PREFIXES: &[&str] = &[
-    // Auto-capture review-only candidates (M1) — must mirror the daemon
-    // born-private prefix in fact_privacy::DEFAULT_PRIVATE_PREFIXES.
-    "__candidate_fact__::",
+    "__action_enrichment_receipt__::",
     "__agent::",
     "__ops::",
     "__ops__::",
     "__ax__::",
     "__ax_session::",
+    "__answer_replay_capsule__::",
+    "__bootstrap__::",
+    "__candidate_fact__::",
+    "__consolidation_review__::",
     "__constraints__::",
-    "__project_layer__::",
-    "__plane__::",
-    "__plane_layer__::",
-    "__workspace__::",
-    "__workspace_scan__::",
-    "__storybook__::",
+    "__coord__::",
     "__dossier__::",
-    "__project_repo_link__::",
-    "__repo_registry__::",
-    "__repo_scan__::",
-    "__repo_codegraph_ids__::",
-    "__repo_extdeps__::",
+    "__engram__::",
     "__extension__::",
     "__extension_grant__::",
-    "__work__::",
-    "__work_transition__::",
-    "__workbench__::",
-    "__workbench::",
-    "__answer_replay_capsule__::",
-    "__passport__::",
-    "__mint_request__::",
-    "__session_binding__::",
-    "__coord__::",
+    "__gpu1_receipt__::",
     "__incident__::",
     "__legal_hold__::",
     "__legal_hold_receipt__::",
-    "__bootstrap__::",
-    "__project__::",
-    "__tenant_metadata__::",
-    "__sync__::",
     "__memory_pin::",
-    "__decisions__::",
+    "__mint_request__::",
+    "__orchestrator_receipt__::",
+    "__passport__::",
+    "__plane__::",
+    "__plane_layer__::",
+    "__project__::",
+    "__project_layer__::",
+    "__project_repo_link__::",
+    "__rcx_publish__::",
+    "__repo_codegraph_ids__::",
+    "__repo_extdeps__::",
+    "__repo_registry__::",
+    "__repo_scan__::",
+    "__result_envelope__::",
+    "__result_envelope_incident__::",
+    "__reverify_receipts__::",
+    "__session_binding__::",
+    "__storybook__::",
+    "__sync__::",
+    "__sync_tombstone__::",
+    "__sync_wipe_receipt__::",
+    "__tenant__::",
+    "__tenant_metadata__::",
+    "__tenant_mirror__::",
+    "__work__::",
+    "__work_comment__::",
+    "__work_gate__::",
+    "__work_transition__::",
+    "__workbench__::",
+    "__workspace__::",
+    "__workspace_scan__::",
+    "console:page:",
+    "console:tileboard:",
+    "console:tiledesign:",
+    "console:workspace:",
+    "__infra__::",
     "decisions::",
     "github::",
+    // Export-only: typed decision records remain queryable and handoff-safe
+    // in the local shared pool, but are excluded from packs by default.
+    "__decisions__::",
 ];
 
 /// Returns the reserved prefix covering `entity`, if any.
@@ -260,6 +276,9 @@ pub struct PrivateSummary {
     pub private_flagged: usize,
     /// Facts under a reserved born-private prefix, by prefix.
     pub by_reserved_prefix: BTreeMap<String, usize>,
+    /// Typed daemon-control facts excluded even when private export is
+    /// explicitly requested.
+    pub protected_excluded: usize,
     /// Facts excluded because they are deleted — NEVER exportable.
     pub deleted_excluded: usize,
 }
@@ -277,6 +296,9 @@ pub fn private_summary(store: &FactStore) -> PrivateSummary {
         } else if fact.private {
             summary.private_flagged += 1;
         }
+        if crate::fact_privacy::daemon_owned_entity_prefix(&fact.entity).is_some() {
+            summary.protected_excluded += 1;
+        }
     }
     summary
 }
@@ -286,10 +308,11 @@ pub fn private_summary(store: &FactStore) -> PrivateSummary {
 /// Exclusion rules per fact (Memory-Portability-v1 §3):
 /// 1. `deleted == true` → excluded **unconditionally** (erasure, Art. 17 —
 ///    aligned with `FactStore::export`'s `!f.deleted` sync filter, PR #187).
-/// 2. `private == true` → excluded unless `include_private`.
-/// 3. reserved prefix → excluded unless `include_private` (belt-and-braces
+/// 2. daemon-owned control namespace → excluded unconditionally.
+/// 3. `private == true` → excluded unless `include_private`.
+/// 4. reserved prefix → excluded unless `include_private` (belt-and-braces
 ///    with 2 — see [`CRUXPACK_RESERVED_PREFIXES`]).
-/// 4. `stored_at < since` → excluded when a since-filter is given.
+/// 5. `stored_at < since` → excluded when a since-filter is given.
 ///
 /// Output ordering is deterministic — facts sorted by
 /// `(entity, key, version, fact_id)`, sessions by `session_id` — so two
@@ -312,6 +335,10 @@ pub fn build_pack_sections(
             *summary.by_reserved_prefix.entry(prefix.to_string()).or_default() += 1;
         } else if fact.private {
             summary.private_flagged += 1;
+        }
+        if crate::fact_privacy::daemon_owned_entity_prefix(&fact.entity).is_some() {
+            summary.protected_excluded += 1;
+            continue;
         }
         if (fact.private || reserved.is_some()) && !opts.include_private {
             continue;
@@ -439,6 +466,14 @@ pub enum PackVerifyError {
     PrivateInconsistent,
     #[error("pack contains deleted facts — erased data must never travel in a pack")]
     DeletedFactsPresent,
+    #[error("pack contains fact entity '{entity}' in create-reserved namespace '{prefix}'")]
+    ReservedEntity { entity: String, prefix: String },
+    #[error("agent-private fact entity '{entity}' is malformed or is not marked private")]
+    InvalidAgentPrivateEntity { entity: String },
+    #[error("agent-private fact owner '{owner}' requires an explicit principal_map entry")]
+    AgentPrivateOwnerMappingRequired { owner: String },
+    #[error("agent-private fact owner mapping '{owner}' -> '{mapped}' is invalid")]
+    InvalidAgentPrivateOwnerMapping { owner: String, mapped: String },
     #[error("pack was exported for tenant '{pack_tenant}' but import targets tenant '{import_tenant}' (T.1)")]
     TenantMismatch { pack_tenant: String, import_tenant: String },
 }
@@ -619,11 +654,51 @@ pub fn plan_import(
             // verify_pack already rejects these; defence in depth.
             continue;
         }
-        if already_imported.contains(&(fact.entity.clone(), fact.key.clone(), fact.value.clone())) {
+        let entity = if let Some(rest) = fact.entity.strip_prefix("__agent::") {
+            if !fact.private {
+                return Err(PackVerifyError::InvalidAgentPrivateEntity {
+                    entity: fact.entity.clone(),
+                });
+            }
+            let (owner, logical) = rest
+                .split_once("::")
+                .filter(|(owner, logical)| !owner.is_empty() && !logical.is_empty())
+                .ok_or_else(|| PackVerifyError::InvalidAgentPrivateEntity {
+                    entity: fact.entity.clone(),
+                })?;
+            if let Some(prefix) = crate::fact_privacy::generic_create_reserved_entity_prefix(logical) {
+                return Err(PackVerifyError::ReservedEntity {
+                    entity: logical.to_string(),
+                    prefix: prefix.to_string(),
+                });
+            }
+            let mapped =
+                opts.principal_map
+                    .get(owner)
+                    .ok_or_else(|| PackVerifyError::AgentPrivateOwnerMappingRequired {
+                        owner: owner.to_string(),
+                    })?;
+            if mapped.trim().is_empty() || mapped.contains("::") {
+                return Err(PackVerifyError::InvalidAgentPrivateOwnerMapping {
+                    owner: owner.to_string(),
+                    mapped: mapped.clone(),
+                });
+            }
+            format!("__agent::{mapped}::{logical}")
+        } else {
+            if let Some(prefix) = crate::fact_privacy::generic_create_reserved_entity_prefix(&fact.entity) {
+                return Err(PackVerifyError::ReservedEntity {
+                    entity: fact.entity.clone(),
+                    prefix: prefix.to_string(),
+                });
+            }
+            fact.entity.clone()
+        };
+        if already_imported.contains(&(entity.clone(), fact.key.clone(), fact.value.clone())) {
             plan.skipped_duplicates += 1;
             continue;
         }
-        let collides = store.fact_history(&fact.entity, &fact.key).iter().any(|f| !f.deleted);
+        let collides = store.fact_history(&entity, &fact.key).iter().any(|f| !f.deleted);
         if collides {
             plan.collisions += 1;
         }
@@ -636,7 +711,7 @@ pub fn plan_import(
             .map(|a| opts.principal_map.get(a).cloned().unwrap_or_else(|| a.clone()));
         plan.to_store.push(StoreFact {
             tenant_hash: fact.tenant_hash.clone(),
-            entity: fact.entity.clone(),
+            entity,
             key: fact.key.clone(),
             value: fact.value.clone(),
             // Pack provenance replaces the original receipt ref — the
@@ -713,6 +788,13 @@ mod tests {
         sign_pack(manifest, sections, |hash| key.sign(hash).to_bytes()).expect("sign")
     }
 
+    fn sign_sections(sections: PackSections, opts: &ExportOptions) -> CruxPack {
+        let key = signing_key();
+        let (fpr, pub_hex) = signer_identity(&key);
+        let manifest = build_manifest(&sections, &fpr, &pub_hex, opts);
+        sign_pack(manifest, sections, |hash| key.sign(hash).to_bytes()).expect("sign")
+    }
+
     // ── The critical test: private facts never leave by default ─────────
 
     #[test]
@@ -731,6 +813,7 @@ mod tests {
         assert_eq!(sections.facts[0].entity, "project-alpha");
         assert_eq!(summary.private_flagged, 1);
         assert_eq!(summary.by_reserved_prefix.len(), 4);
+        assert_eq!(summary.protected_excluded, 3);
 
         // Belt-and-braces: no excluded value may appear anywhere in the
         // serialized pack bytes.
@@ -770,6 +853,21 @@ mod tests {
         assert_eq!(pack.sections.facts.len(), 2);
         assert!(pack.manifest.included_private);
         verify_pack(&pack).expect("verifies");
+    }
+
+    #[test]
+    fn include_private_still_excludes_daemon_control_records() {
+        let store = store_with(vec![sf(
+            "__passport__::operator",
+            "record",
+            r#"{"tier":"operator"}"#,
+            true,
+        )]);
+        let mut o = opts("local");
+        o.include_private = true;
+        let (sections, summary) = build_pack_sections(&store, None, &o);
+        assert!(sections.facts.is_empty());
+        assert_eq!(summary.protected_excluded, 1);
     }
 
     // ── Erasure survives the round-trip ──────────────────────────────────
@@ -930,6 +1028,146 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, PackVerifyError::TenantMismatch { .. }));
+    }
+
+    #[test]
+    fn import_rejects_daemon_owned_control_records_even_with_private_consent() {
+        let mut source = FactStore::new();
+        let forged = source.store(sf("__passport__::forged", "record", r#"{"tier":"operator"}"#, true));
+        let mut export = opts("local");
+        export.include_private = true;
+        let pack = sign_sections(
+            PackSections {
+                facts: vec![forged],
+                ..PackSections::default()
+            },
+            &export,
+        );
+        let target = FactStore::new();
+        let err = plan_import(
+            &pack,
+            &target,
+            None,
+            &ImportOptions {
+                tenant_id: "local".into(),
+                ..ImportOptions::default()
+            },
+        )
+        .expect_err("control records must not enter through cruxpack import");
+        assert!(matches!(
+            err,
+            PackVerifyError::ReservedEntity {
+                ref prefix,
+                ..
+            } if prefix == "__passport__::"
+        ));
+    }
+
+    #[test]
+    fn include_private_agent_fact_round_trips_through_explicit_owner_remap() {
+        let source = store_with(vec![sf("__agent::alice::notes", "decision", "keep local", true)]);
+        let mut export = opts("local");
+        export.include_private = true;
+        let pack = build_signed(&source, None, &export);
+        assert_eq!(pack.sections.facts.len(), 1);
+
+        let mut principal_map = BTreeMap::new();
+        principal_map.insert("alice".to_string(), "bob".to_string());
+        let mut target = FactStore::new();
+        let plan = plan_import(
+            &pack,
+            &target,
+            None,
+            &ImportOptions {
+                tenant_id: "local".into(),
+                principal_map,
+            },
+        )
+        .expect("explicit owner remap");
+        assert_eq!(plan.private_facts, 1);
+        assert_eq!(plan.to_store[0].entity, "__agent::bob::notes");
+        target.try_store_bulk(plan.to_store).expect("apply");
+        let imported = target.get_by_entity("__agent::bob::notes");
+        assert_eq!(imported.len(), 1);
+        assert!(imported[0].private);
+    }
+
+    #[test]
+    fn include_private_agent_fact_requires_explicit_owner_remap() {
+        let source = store_with(vec![sf("__agent::alice::notes", "decision", "keep local", true)]);
+        let mut export = opts("local");
+        export.include_private = true;
+        let pack = build_signed(&source, None, &export);
+
+        let err = plan_import(
+            &pack,
+            &FactStore::new(),
+            None,
+            &ImportOptions {
+                tenant_id: "local".into(),
+                ..ImportOptions::default()
+            },
+        )
+        .expect_err("owner remap is mandatory");
+        assert!(matches!(
+            err,
+            PackVerifyError::AgentPrivateOwnerMappingRequired { ref owner }
+                if owner == "alice"
+        ));
+    }
+
+    #[test]
+    fn import_rejects_public_agent_storage_wrapper() {
+        let mut source = FactStore::new();
+        let mut forged = source.store(sf("__agent::alice::notes", "decision", "spoofed", true));
+        forged.private = false;
+        let mut export = opts("local");
+        export.include_private = true;
+        let pack = sign_sections(
+            PackSections {
+                facts: vec![forged],
+                ..PackSections::default()
+            },
+            &export,
+        );
+        let err = plan_import(
+            &pack,
+            &FactStore::new(),
+            None,
+            &ImportOptions {
+                tenant_id: "local".into(),
+                ..ImportOptions::default()
+            },
+        )
+        .expect_err("public physical owner wrapper must be rejected");
+        assert!(matches!(err, PackVerifyError::InvalidAgentPrivateEntity { .. }));
+    }
+
+    #[test]
+    fn import_rejects_agent_wrapper_around_logical_control_entity() {
+        let source = store_with(vec![sf("__agent::alice::__passport__::forged", "record", "{}", true)]);
+        let mut export = opts("local");
+        export.include_private = true;
+        let pack = build_signed(&source, None, &export);
+        let mut principal_map = BTreeMap::new();
+        principal_map.insert("alice".to_string(), "bob".to_string());
+        let err = plan_import(
+            &pack,
+            &FactStore::new(),
+            None,
+            &ImportOptions {
+                tenant_id: "local".into(),
+                principal_map,
+            },
+        )
+        .expect_err("logical control entity must be rejected");
+        assert!(matches!(
+            err,
+            PackVerifyError::ReservedEntity {
+                ref prefix,
+                ..
+            } if prefix == "__passport__::"
+        ));
     }
 
     #[test]

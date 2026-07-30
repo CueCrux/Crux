@@ -45,6 +45,31 @@ for the Crux Daemon.
 - BLAKE3 hashes ensure **integrity** (tamper detection), not **confidentiality**.
 - Data at rest is **not encrypted**. Use filesystem-level encryption (LUKS, dm-crypt) if
   required by your threat model.
+- Daemon control records (passports, grants, work/gates, coordination, receipts,
+  tenant metadata, and related internal state) occupy reserved fact namespaces.
+  Generic HTTP/MCP writes and deletes, candidate promotion, extension/WASM
+  writes, remote sync, and CruxPack import reject those namespaces. Only the
+  owning typed daemon workflow may write them through the low-level store.
+- The canonical namespace policy lives in
+  `corecrux_memory::fact_privacy::{DEFAULT_PRIVATE_PREFIXES,
+  DAEMON_OWNED_ENTITY_PREFIXES, GENERIC_CREATE_RESERVED_PREFIXES}`. Control
+  records remain born-private even if a runtime sharing override names their
+  prefix. The `__agent::<owner>::` prefix is a daemon-assigned physical wrapper:
+  clients mutate the owner-visible logical entity and cannot create the wrapper
+  directly.
+- This boundary is prospective. Reclassifying a legacy row as private during
+  replay does not authenticate who originally wrote it. Operators upgrading a
+  store that may have accepted generic writes into a control namespace must
+  inventory and reissue those rows through their typed governance API before
+  relying on them as authoritative.
+- Engram overlays are control records: generic fact writes cannot address
+  `__engram__::`; authenticated `PUT /v1/engrams/{name}` with `admin:write`
+  validates the typed object and stamps daemon-owned actor, time, tenant,
+  privacy, and provenance fields.
+- Decision-tool rows deliberately remain compatibility annotations. Their
+  BLAKE3 value is a content identifier, not a signature or append-only proof;
+  consumers must require the `integrity: "untrusted_annotation"` contract and
+  must not use these rows as authorization decisions.
 
 ### Boundary 3: CROWN Receipts
 

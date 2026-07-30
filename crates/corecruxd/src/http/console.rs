@@ -1235,6 +1235,7 @@ fn consolidation_problem(err: corecrux_memory::fact_store::ConsolidationErrorV1)
         | ConsolidationErrorV1::TargetPinned(_)
         | ConsolidationErrorV1::TargetPrivate(_)
         | ConsolidationErrorV1::TargetReceiptLinked(_)
+        | ConsolidationErrorV1::TargetDaemonOwned { .. }
         | ConsolidationErrorV1::TargetHighConfidence { .. } => StatusCode::CONFLICT,
         ConsolidationErrorV1::Journal(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -2952,6 +2953,17 @@ pub(super) async fn post_console_fact_add(
     }
     if !(0.0..=1.0).contains(&body.confidence) {
         return problem_response(StatusCode::BAD_REQUEST, "confidence must be in [0.0, 1.0]");
+    }
+    if let Some(prefix) = crate::fact_privacy::generic_create_reserved_entity_prefix(entity) {
+        return crate::problem::ProblemResponse(
+            corecrux_types::ProblemDetails::forbidden(format!("entity uses create-reserved prefix `{prefix}`"))
+                .with_extensions(serde_json::json!({
+                    "code": "RESERVED_ENTITY_PREFIX",
+                    "entity": entity,
+                    "reserved_prefix": prefix,
+                })),
+        )
+        .into_response();
     }
 
     let mut store = state.fact_store.write().await;

@@ -220,6 +220,21 @@ pub(super) async fn post_result_envelope_import(
             "envelope facts must not be private (platform never emits private facts)",
         );
     }
+    if let Some((fact, prefix)) = facts_in.iter().find_map(|fact| {
+        crate::fact_privacy::generic_create_reserved_entity_prefix(&fact.entity).map(|prefix| (fact, prefix))
+    }) {
+        return crate::problem::ProblemResponse(
+            corecrux_types::ProblemDetails::forbidden(format!(
+                "result envelope fact uses create-reserved prefix `{prefix}`"
+            ))
+            .with_extensions(json!({
+                "code": "RESERVED_ENTITY_PREFIX",
+                "entity": fact.entity,
+                "reserved_prefix": prefix,
+            })),
+        )
+        .into_response();
+    }
     let facts_applied = {
         let mut store = state.fact_store.write().await;
         let reqs: Vec<StoreFact> = facts_in
@@ -458,6 +473,16 @@ mod tests {
         }
     }
 
+    fn resign_envelope(envelope: &mut ResultEnvelope, signing: &SigningKey) {
+        let content_hash =
+            result_envelope_content_hash(&envelope.payload, &envelope.companion_artifacts).expect("hash");
+        let raw = hex::decode(content_hash.strip_prefix("blake3:").unwrap()).unwrap();
+        let mut hash = [0_u8; 32];
+        hash.copy_from_slice(&raw);
+        envelope.blake3_content_hash = content_hash;
+        envelope.platform_signature.signature = hex::encode(signing.sign(&hash).to_bytes());
+    }
+
     async fn body_json(resp: Response) -> (StatusCode, serde_json::Value) {
         let status = resp.status();
         let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -524,6 +549,39 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let store = state.fact_store.read().await;
         assert!(store.get_by_entity("business::acme::person::ada").is_empty());
+    }
+
+    #[tokio::test]
+    async fn signed_envelope_cannot_import_control_facts_atomically() {
+        let (signing, _guard) = pin_platform_key();
+        let state = test_app_state(8);
+        let mut envelope = build_envelope(&signing, "job_control_forgery");
+        for prefix in corecrux_memory::fact_privacy::DAEMON_OWNED_ENTITY_PREFIXES
+            .iter()
+            .chain(corecrux_memory::fact_privacy::GENERIC_CREATE_RESERVED_PREFIXES)
+        {
+            envelope.payload.facts.push(EnvelopeFact {
+                entity: format!("{prefix}forged"),
+                key: "record".into(),
+                value: "attacker-controlled".into(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            });
+        }
+        resign_envelope(&mut envelope, &signing);
+
+        let resp = post_result_envelope_import(State(state.clone()), HeaderMap::new(), Json(envelope)).await;
+        let (status, body) = body_json(resp).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "body={body}");
+        assert_eq!(body["code"], "RESERVED_ENTITY_PREFIX");
+        assert_eq!(
+            state.fact_store.read().await.count(),
+            0,
+            "the safe leading fact and every control fact must be rejected atomically"
+        );
     }
 
     #[tokio::test]

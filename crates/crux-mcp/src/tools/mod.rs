@@ -1207,8 +1207,9 @@ pub fn list_tools_with_flags(
         // ── Decisions ─────────────────────────────────────────────
         ToolDefinition {
             name: "record_decision".to_string(),
-            description: "Record why a decision was made. Stores an append-only, \
-                          BLAKE3-hashed decision record as a fact. Queryable via \
+            description: "Record why a decision was made as a mutable, untrusted \
+                          annotation. Its BLAKE3 digest is a content identifier only, \
+                          not a signature or authorization decision. Queryable via \
                           query_facts with entity prefix __decisions__::."
                 .to_string(),
             input_schema: json!({
@@ -2899,7 +2900,7 @@ pub fn tool_output_docs() -> Value {
         { "tool": "resolve_principal",  "output": "{ content: [...], principal: { passport_id, category, tier, tier_rank: int, capabilities: [string], tenant_id, agent_work_gate: bool, resolved_via: 'session'|'passport'|'identity_link:<id>', federation_grant?: { capability, scope, allowed_capabilities } }, resolved_param: 'session_id'|'passport_id' } — loopback to GET /v1/principal/resolve; tenant-scoped server-side. agent→passport resolution parity for the MCP surface." },
         { "tool": "create_handoff",     "output": "{ package_json, content_hash, signature, relevant_fact_count }" },
         { "tool": "accept_handoff",     "output": "{ session_loaded, facts_loaded, verified: bool, task_record? }" },
-        { "tool": "record_decision",    "output": "{ decision_id, decision_hash, entity, action }" },
+        { "tool": "record_decision",    "output": "{ content: [...], structuredContent: { decision_id, content_hash: 'blake3:<hex>', integrity: 'untrusted_annotation', entity } } — mutable compatibility annotation; never authorization evidence." },
         { "tool": "declare_constraint", "output": "{ constraint_id, constraint_hash, constraint_type, assertion }" },
         { "tool": "get_constraints",    "output": "{ constraints: [{constraint_id, constraint_type, assertion, severity, status, created_at}], count }" },
         { "tool": "check_constraints",  "output": "{ verdict: pass|warn|block, matched_constraints: [{constraint_id, assertion, severity, match_score}] }" },
@@ -3548,6 +3549,30 @@ mod tests {
         assert!(by_name("query_scan").description.contains("scores and token counts"));
         assert!(by_name("get_gaps").description.contains("low-coverage queries"));
         assert!(by_name("store_fact").description.contains("private: true"));
+    }
+
+    #[test]
+    fn record_decision_catalogue_contract_is_explicitly_untrusted() {
+        let tools = list_tools();
+        let description = &tools
+            .iter()
+            .find(|tool| tool.name == "record_decision")
+            .expect("record_decision tool")
+            .description;
+        assert!(description.contains("untrusted"));
+        assert!(description.contains("content identifier only"));
+        assert!(!description.contains("append-only"));
+
+        let docs = tool_output_docs();
+        let output = docs
+            .as_array()
+            .expect("tool docs array")
+            .iter()
+            .find(|entry| entry["tool"] == "record_decision")
+            .and_then(|entry| entry["output"].as_str())
+            .expect("record_decision output contract");
+        assert!(output.contains("untrusted_annotation"));
+        assert!(output.contains("never authorization"));
     }
 
     #[test]

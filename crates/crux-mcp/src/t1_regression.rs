@@ -205,15 +205,15 @@ async fn t1_write_personal_passport_writes_personal_ok_but_work_blocked() {
 }
 
 #[tokio::test]
-async fn t1_write_system_entity_exempt() {
+async fn t1_write_non_control_system_entity_exempt() {
     let base = flag_on_base();
     seed_passport(&base, "claude-work", "work").await;
     let claude = agent(&base, "anthropic", 0);
 
-    // System entity (`__*__`) is exempt — a work passport may write it even
-    // though it is not "work"-categorised.
+    // A non-control system entity is exempt from category enforcement. Daemon
+    // control namespaces have a separate generic-write prohibition.
     handle_store_fact(
-        &json!({"entity": "__bootstrap__::pattern:retry", "key": "k", "value": "sys-ok"}),
+        &json!({"entity": "__synthetic__::pattern:retry", "key": "k", "value": "sys-ok"}),
         &claude,
     )
     .await
