@@ -4026,6 +4026,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The desktop shell no longer opens stray console windows on Windows.** Two
+  spawn sites, both console-subsystem binaries launched from a GUI-subsystem app
+  (`windows_subsystem = "windows"`) that has no console to inherit — so Windows
+  allocated a fresh console *window* for each:
+  - `spawn_sidecar` (`crux-shell-lifecycle`) launched the bundled `corecruxd`
+    with a visible console that sat beside the app for its entire lifetime.
+    Redirecting stdout/stderr into the sidecar log did not suppress it: the
+    streams and the window are independent.
+  - the Windows credential lookup (`crux-shell-connection`) shells out to
+    `powershell.exe` for the `PasswordVault` read, flashing a console on *every*
+    attach-profile activation and retry. `-NonInteractive` governs the prompt,
+    not the window.
+
+  Both now set `CREATE_NO_WINDOW` (`0x08000000`) via `CommandExt::creation_flags`.
+  `rundll32.exe`, used to open external links, is GUI-subsystem (verified from
+  its PE header) and needed no change.
+
+  Found by the new Windows GUI smoke lane on its first green run — the
+  assertions passed while the uploaded screenshot showed the console box. That
+  lane now fails if either window returns.
+
 - **A cold `cargo build` now completes on native Windows.** Three unrelated
   stops, none of which CI can see (every runner is Linux, and the release matrix
   is Linux + macOS — both unix):

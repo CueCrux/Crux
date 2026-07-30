@@ -262,6 +262,27 @@ pub fn spawn_sidecar(binary: &Path, config: SidecarConfig) -> io::Result<Sidecar
         cmd.env(k, v);
     }
 
+    // `corecruxd` is a console-subsystem binary, and the shell that spawns it is
+    // a GUI-subsystem app (`windows_subsystem = "windows"`) with no console to
+    // inherit. Windows therefore allocates a *fresh console window* for the
+    // child: a stray black box on the operator's desktop for as long as the app
+    // runs. Redirecting stdout/stderr above does not suppress it — the streams
+    // and the window are independent — so the flag is the only fix.
+    //
+    // Found by the Windows GUI smoke lane in `.github/workflows/desktop-shell.yml`,
+    // which is also what guards it: that job fails if a console window belonging
+    // to the sidecar reappears. There is no unit test because `Command` exposes
+    // no getter for creation flags, so the observable behaviour is the assertion.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        /// `CREATE_NO_WINDOW` (winbase.h): run the console child with no console
+        /// window. Not `DETACHED_PROCESS` — that also detaches the handles the
+        /// redirections above depend on.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
     let child = cmd.spawn()?;
 
     Ok(SidecarHandle {

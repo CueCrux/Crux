@@ -134,10 +134,20 @@ trying to watch.
 
 It asserts, on every desktop-touching PR: a window appears, an
 `msedgewebview2` host actually starts (so something rendered), the bundled
-`corecruxd` sidecar is spawned from the `externalBin` slot, the MSI installs
-per-machine and ships `corecruxd.exe` beside the app, and a graceful close reaps
-the sidecar. A desktop screenshot is uploaded as an artifact on every run,
-including failures.
+`corecruxd` sidecar is spawned from the `externalBin` slot **with no console
+window**, the MSI installs per-machine and ships `corecruxd.exe` beside the app,
+and a graceful close reaps the sidecar. A desktop screenshot is uploaded as an
+artifact on every run, including failures.
+
+The console-window assertion is there because the lane found that defect on its
+first green run: `corecruxd` is console-subsystem and the shell is
+GUI-subsystem, so without `CREATE_NO_WINDOW` Windows gave the sidecar a visible
+console — a stray black box beside the app for its whole lifetime, invisible to
+every Linux job. If you ever need to check this by hand, do **not** test
+`(Get-Process corecruxd).MainWindowHandle`: since Win11/Server 2025 the console
+window belongs to the console *host* (WindowsTerminal/conhost), not the child,
+so that property reads `0` while the window is plainly on screen. Enumerate
+top-level windows instead.
 
 It deliberately does **not** cover three things, so don't read a green run as
 covering them:
