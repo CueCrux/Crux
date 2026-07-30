@@ -1158,7 +1158,10 @@ fn test_rcx_router(capabilities: Vec<&str>) -> std::sync::Arc<crux_router::RcxRo
     ))
 }
 
-fn dev_scope_headers(scopes: &str) -> HeaderMap {
+/// `X-Corecrux-Scopes` header for [`AuthMode::DevScopes`] handler tests.
+/// `pub(super)` so sibling `http::*` modules with inline test blocks share one
+/// builder instead of re-declaring it per file.
+pub(super) fn dev_scope_headers(scopes: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(
         "x-corecrux-scopes",
