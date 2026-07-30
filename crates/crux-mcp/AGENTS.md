@@ -4,8 +4,9 @@
 
 Agent-facing MCP server: JSON-RPC 2.0 transport, tool dispatch, and an axum server
 speaking MCP Streamable HTTP. Hosted inside `corecruxd` (port 14801). ~42 tool modules,
-~33k LOC — index only. Agents authenticate via `CRUX_AGENT_TOKEN` (validated in `agent`
-before any dispatch).
+~33k LOC — index only. Agents authenticate through registered bearer tokens or
+hosted-client OAuth introspection; `agent::mcp_authentication_configured` is the shared
+fail-closed predicate used before dispatch, in discovery, and for bind validation.
 
 ## Where to start
 - `src/tools/mod.rs` — `ToolDefinition` + `list_tools` / `list_tools_local_surface`:

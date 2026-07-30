@@ -196,7 +196,7 @@ SPA — `dist/` only, not a cargo member — and is excluded below.)
 |---|---|---|---|---|
 | `corecruxd` | The Crux Daemon binary (HTTP / gRPC / MCP host, signing, auth) | *(binary)* — owns `build_segment_seal_receipt`, `sign_segment_seal_material` (`src/grpc.rs`) | — | 83.8k |
 | `corecruxctl` | CoreCrux CLI: `verify-store`, `replay`, `gaps` | *(binary)* — `verify_store`, `replay`, `gaps` modules (`src/`) | — | 33.1k |
-| `crux-mcp` | Agent-facing MCP server (JSON-RPC 2.0 + axum Streamable-HTTP); ~42 tool modules | `dispatch`, `router`/`with_rcx_router`/`with_agent_passports`, `crc_v1` | corecruxd | 33.1k |
+| `crux-mcp` | Agent-facing MCP server (JSON-RPC 2.0 + axum Streamable-HTTP); static-bearer/OAuth fail-closed auth; ~42 tool modules | `dispatch`, `router`/`with_rcx_router`/`with_agent_passports`, `mcp_authentication_configured`, `crc_v1` | corecruxd | 33.1k |
 | `crux-observe` | Self-observation layer: ops events + bootstrap docs → memory facts | `Redactor`/`redact_line`, `bootstrap_entity`/`ops_entity`, `self_observe_enabled` | crux-mcp, corecruxd | 2.7k |
 | `crux-observe-api` | Wire types for the agent audit-chain data contract | `NodeKind`, `RiskClass`, `StepStatus`, `ReasoningRef` | corecruxd | 0.8k |
 | `crux-integrations` | Declarative manifest contract for daemon integration packs | `IntegrationManifest`, `IntegrationEntry`, `EntryKind`, `SafetyPolicy` | corecruxctl, crux-mcp, corecruxd | 2.5k |
@@ -833,8 +833,10 @@ for the Crux Daemon.
    (`CORECRUXD_REPLICATION_AUTH_BEARER`).
 3. Prometheus metrics (`/metrics`) and health endpoints (`/healthz`, `/readyz`) are
    unauthenticated. Restrict access at the network level if exposing beyond localhost.
-4. MCP Streamable HTTP server-info discovery can remain public, but SSE stream
-   creation requires configured bearer auth when agent tokens are present.
+4. MCP Streamable HTTP requests fail closed whenever either registered bearer
+   tokens or hosted-client OAuth introspection is configured. This includes
+   server-info GET, SSE stream creation, and JSON-RPC POST; only an MCP daemon
+   with neither authentication rail configured permits anonymous access.
 5. Public `/v1/version` is redacted. Full operational version details live at
    `/v1/admin/version` behind `admin:read`.
 
