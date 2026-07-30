@@ -15,14 +15,25 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use base64::Engine as _;
+use rustls_pki_types::{pem::PemObject as _, CertificateDer, UnixTime};
 use serde::Serialize;
 use x509_cert::der::Decode as _;
+use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage as X509KeyUsage, KeyUsages};
 use x509_cert::Certificate;
 
 use corecrux_receipts::vault_pki_x509_signer::{
-    Config as SignerConfig, VaultPkiX509Signer, DEFAULT_LEAF_CERT_PATH, DEFAULT_LEAF_KEY_PATH, DEFAULT_ROOT_ANCHOR_PATH,
+    Config as SignerConfig, VaultPkiX509Signer, DEFAULT_LEAF_CERT_PATH, DEFAULT_LEAF_KEY_PATH,
+    DEFAULT_ROOT_ANCHOR_PATH, ENV_LEAF_CERT_PATH, ENV_ROOT_ANCHOR_PATH,
 };
 use corecrux_receipts::{parse_jumbf_base64, C2paSignedManifestV1};
+
+/// DER value bytes for id-kp-emailProtection (`1.3.6.1.5.5.7.3.4`).
+///
+/// The deployed Vault `c2pa-leaf` role and the repository's documented C2PA
+/// profile require this EKU. It is deliberately not treated as an arbitrary
+/// TLS server/client certificate usage.
+const C2PA_EMAIL_PROTECTION_EKU_DER: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x04];
+const C2PA_EMAIL_PROTECTION_EKU_OID: &str = "1.3.6.1.5.5.7.3.4";
 
 /// One certificate summarised for `c2pa-cert-status` output.
 #[derive(Debug, Clone, Serialize)]
@@ -56,14 +67,16 @@ pub struct StatusOptions {
 }
 
 pub fn cert_status(opts: &StatusOptions) -> Result<CertStatusReport, Box<dyn std::error::Error + Send + Sync>> {
-    let leaf_cert_path = opts
-        .leaf_cert_path
-        .clone()
-        .map_or_else(|| PathBuf::from(DEFAULT_LEAF_CERT_PATH), |p| p);
-    let root_anchor_path = opts
-        .root_anchor_path
-        .clone()
-        .map_or_else(|| PathBuf::from(DEFAULT_ROOT_ANCHOR_PATH), |p| p);
+    let leaf_cert_path = configured_path(
+        opts.leaf_cert_path.as_deref(),
+        ENV_LEAF_CERT_PATH,
+        DEFAULT_LEAF_CERT_PATH,
+    );
+    let root_anchor_path = configured_path(
+        opts.root_anchor_path.as_deref(),
+        ENV_ROOT_ANCHOR_PATH,
+        DEFAULT_ROOT_ANCHOR_PATH,
+    );
     let mut notes: Vec<String> = Vec::new();
 
     let leaf_pem = match std::fs::read_to_string(&leaf_cert_path) {
@@ -193,6 +206,10 @@ pub struct X509VerifyReport {
     pub canonical_hash_match: bool,
     pub signature_valid: bool,
     pub content_hash_match: Option<bool>,
+    /// `Some(true)` only when a complete cryptographic path validates at the
+    /// current time to the configured root anchor. Missing or invalid trust
+    /// material is `Some(false)`, never a success-producing `None`. `None` is
+    /// reserved for non-X.509/unsupported envelopes.
     pub chain_valid: Option<bool>,
     pub ok: bool,
     pub notes: Vec<String>,
@@ -210,7 +227,7 @@ pub fn c2pa_verify(opts: &X509VerifyOptions) -> Result<X509VerifyReport, Box<dyn
     let envelope_b64 = std::fs::read_to_string(&opts.manifest_path)?;
     let parsed = parse_jumbf_base64(envelope_b64.trim())?;
 
-    let (envelope_kind, chain_depth, chain_valid, anchor_sha256, signature_valid, notes) =
+    let (envelope_kind, chain_depth, chain_valid, anchor_sha256, signature_valid, mut notes) =
         if parsed.signature_alg == "ed25519" {
             // Defer to the legacy Ed25519 verifier path.
             let mut notes = vec![
@@ -256,10 +273,19 @@ pub fn c2pa_verify(opts: &X509VerifyOptions) -> Result<X509VerifyReport, Box<dyn
         let recomputed = blake3::hash(&content_bytes).to_hex().to_string();
         Some(recomputed == parsed.manifest.content_hash_blake3_hex)
     } else {
+        notes.push(
+            "content bytes were not supplied; ok covers the signed manifest and trust path, \
+             not binding to an external asset"
+                .to_string(),
+        );
         None
     };
 
-    let chain_pass = chain_valid.unwrap_or(true);
+    // An X.509 trust result is positive only when a configured anchor was
+    // loaded and a complete cryptographic path was built. `None` is retained
+    // in the report for non-X.509/unsupported envelopes, but it can never be a
+    // success shortcut.
+    let chain_pass = chain_valid == Some(true);
     let ok = canonical_hash_match && signature_valid && content_hash_match.unwrap_or(true) && chain_pass;
 
     Ok(X509VerifyReport {
@@ -327,66 +353,9 @@ fn verify_x509_envelope(
     // provenance path), so a manifest that verifies here verifies there.
     let signature_valid = verifying_key.verify(&parsed.canonical_body_bytes, &sig).is_ok();
 
-    let anchor_path_buf = anchor_path.map_or_else(|| PathBuf::from(DEFAULT_ROOT_ANCHOR_PATH), Path::to_path_buf);
-    let (chain_valid, anchor_sha256) = match std::fs::read_to_string(&anchor_path_buf) {
-        Ok(anchor_pem) => {
-            let anchor_pems = split_pem_certs(&anchor_pem);
-            if anchor_pems.is_empty() {
-                notes.push(format!(
-                    "anchor PEM at {} is empty — chain not validated",
-                    anchor_path_buf.display()
-                ));
-                (None, None)
-            } else {
-                let anchor_der = pem_cert_to_der(&anchor_pems[0])?;
-                let anchor_sha = sha256_fingerprint_colon(&anchor_der);
-                // Walk: each cert's issuer must equal the next cert's
-                // subject, ending at the anchor's subject. We're not
-                // cryptographically verifying intermediate signatures
-                // here — see notes — but we do check the chain
-                // links and reject mismatched names.
-                let mut valid = true;
-                let mut prev_issuer: Option<String> = Some(leaf.tbs_certificate().issuer().to_string());
-                for der in &chain_der[1..] {
-                    let cert = Certificate::from_der(der)?;
-                    let subj = cert.tbs_certificate().subject().to_string();
-                    if prev_issuer.as_deref() != Some(subj.as_str()) {
-                        valid = false;
-                        notes.push(format!(
-                            "chain break: expected subject {:?}, got {:?}",
-                            prev_issuer, subj
-                        ));
-                        break;
-                    }
-                    prev_issuer = Some(cert.tbs_certificate().issuer().to_string());
-                }
-                // Last-link check: prev_issuer must equal anchor subject.
-                let anchor_cert = Certificate::from_der(&anchor_der)?;
-                let anchor_subj = anchor_cert.tbs_certificate().subject().to_string();
-                if valid && prev_issuer.as_deref() != Some(anchor_subj.as_str()) {
-                    valid = false;
-                    notes.push(format!(
-                        "anchor subject {:?} does not match expected issuer {:?}",
-                        anchor_subj, prev_issuer
-                    ));
-                }
-                notes.push(
-                    "chain walk validates subject/issuer linkage to the anchor; intermediate signature \
-                     verification is delegated to platform CA libraries"
-                        .to_string(),
-                );
-                (Some(valid), Some(anchor_sha))
-            }
-        }
-        Err(e) => {
-            notes.push(format!(
-                "root anchor not readable at {}: {} — chain not validated",
-                anchor_path_buf.display(),
-                e
-            ));
-            (None, None)
-        }
-    };
+    let anchor_path_buf = configured_path(anchor_path, ENV_ROOT_ANCHOR_PATH, DEFAULT_ROOT_ANCHOR_PATH);
+    let (chain_valid, anchor_sha256) =
+        validate_chain_from_anchor_path(&chain_der, &anchor_path_buf, UnixTime::now(), &mut notes);
 
     Ok((
         "x509-p256".to_string(),
@@ -396,6 +365,178 @@ fn verify_x509_envelope(
         signature_valid,
         notes,
     ))
+}
+
+fn validate_chain_from_anchor_path(
+    chain_der: &[Vec<u8>],
+    anchor_path: &Path,
+    now: UnixTime,
+    notes: &mut Vec<String>,
+) -> (Option<bool>, Option<String>) {
+    let anchor_bytes = match std::fs::read(anchor_path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            notes.push(format!(
+                "root anchor not readable at {}: {err} — trust path rejected",
+                anchor_path.display()
+            ));
+            return (Some(false), None);
+        }
+    };
+    let anchor_certs =
+        match CertificateDer::pem_slice_iter(&anchor_bytes).collect::<Result<Vec<_>, rustls_pki_types::pem::Error>>() {
+            Ok(certs) => certs,
+            Err(err) => {
+                notes.push(format!(
+                    "root anchor at {} is not valid PEM: {err} — trust path rejected",
+                    anchor_path.display()
+                ));
+                return (Some(false), None);
+            }
+        };
+    if anchor_certs.len() != 1 {
+        notes.push(format!(
+            "root anchor at {} must contain exactly one certificate, found {} — trust path rejected",
+            anchor_path.display(),
+            anchor_certs.len()
+        ));
+        return (Some(false), None);
+    }
+    let anchor_der = anchor_certs[0].as_ref().to_vec();
+    let anchor_sha = sha256_fingerprint_colon(&anchor_der);
+    match validate_x509_path_at(chain_der, &anchor_der, now) {
+        Ok(()) => {
+            notes.push(
+                "cryptographic X.509 path validated to the configured anchor, including certificate \
+                 signatures, validity, CA constraints, and the C2PA signing usage profile; \
+                 revocation was not checked"
+                    .to_string(),
+            );
+            (Some(true), Some(anchor_sha))
+        }
+        Err(err) => {
+            notes.push(format!("X.509 trust path rejected: {err}"));
+            (Some(false), Some(anchor_sha))
+        }
+    }
+}
+
+fn configured_path(explicit: Option<&Path>, env_name: &str, default: &str) -> PathBuf {
+    explicit.map_or_else(
+        || {
+            std::env::var_os(env_name)
+                .filter(|value| !value.is_empty())
+                .map_or_else(|| PathBuf::from(default), PathBuf::from)
+        },
+        Path::to_path_buf,
+    )
+}
+
+fn validate_x509_path_at(chain_der: &[Vec<u8>], anchor_der: &[u8], now: UnixTime) -> Result<(), String> {
+    let leaf_der = chain_der
+        .first()
+        .ok_or_else(|| "x5chain contains no leaf certificate".to_string())?;
+    validate_leaf_profile(leaf_der, now)?;
+    for (index, intermediate_der) in chain_der.iter().enumerate().skip(1) {
+        validate_ca_profile(intermediate_der, now, &format!("intermediate certificate {index}"))?;
+    }
+    validate_ca_profile(anchor_der, now, "configured trust anchor")?;
+    if chain_der.iter().any(|cert| cert.as_slice() == anchor_der) {
+        return Err("x5chain must not contain the configured trust anchor".to_string());
+    }
+
+    let leaf = CertificateDer::from(leaf_der.as_slice());
+    let intermediates = chain_der[1..]
+        .iter()
+        .map(|cert| CertificateDer::from(cert.as_slice()))
+        .collect::<Vec<_>>();
+    let anchor_cert = CertificateDer::from(anchor_der);
+    let anchor = webpki::anchor_from_trusted_cert(&anchor_cert)
+        .map_err(|err| format!("invalid configured trust anchor: {err}"))?;
+    let end_entity =
+        webpki::EndEntityCert::try_from(&leaf).map_err(|err| format!("invalid leaf certificate: {err}"))?;
+    end_entity
+        .verify_for_usage(
+            &[webpki::ring::ECDSA_P256_SHA256],
+            &[anchor],
+            &intermediates,
+            now,
+            webpki::KeyUsage::required_if_present(C2PA_EMAIL_PROTECTION_EKU_DER),
+            None,
+            None,
+        )
+        .map_err(|err| format!("certificate signature/path validation failed: {err}"))?;
+    Ok(())
+}
+
+fn validate_leaf_profile(der: &[u8], now: UnixTime) -> Result<(), String> {
+    let cert = Certificate::from_der(der).map_err(|err| format!("leaf certificate parse failed: {err}"))?;
+    validate_cert_time(&cert, now, "leaf certificate")?;
+
+    let (_, constraints) = cert
+        .tbs_certificate()
+        .get_extension::<BasicConstraints>()
+        .map_err(|err| format!("leaf BasicConstraints is malformed: {err}"))?
+        .ok_or_else(|| "leaf certificate is missing BasicConstraints CA:FALSE".to_string())?;
+    if constraints.ca {
+        return Err("leaf certificate asserts BasicConstraints CA:TRUE".to_string());
+    }
+
+    let (key_usage_critical, key_usage) = cert
+        .tbs_certificate()
+        .get_extension::<X509KeyUsage>()
+        .map_err(|err| format!("leaf KeyUsage is malformed: {err}"))?
+        .ok_or_else(|| "leaf certificate is missing KeyUsage digitalSignature".to_string())?;
+    if !key_usage_critical || key_usage != X509KeyUsage(KeyUsages::DigitalSignature.into()) {
+        return Err("leaf KeyUsage must be critical and contain only digitalSignature".to_string());
+    }
+
+    let (_, extended_key_usage) = cert
+        .tbs_certificate()
+        .get_extension::<ExtendedKeyUsage>()
+        .map_err(|err| format!("leaf ExtendedKeyUsage is malformed: {err}"))?
+        .ok_or_else(|| "leaf certificate is missing ExtendedKeyUsage emailProtection".to_string())?;
+    if extended_key_usage.0.len() != 1 || extended_key_usage.0[0].to_string() != C2PA_EMAIL_PROTECTION_EKU_OID {
+        return Err("leaf ExtendedKeyUsage must contain only emailProtection".to_string());
+    }
+    Ok(())
+}
+
+fn validate_ca_profile(der: &[u8], now: UnixTime, label: &str) -> Result<(), String> {
+    let cert = Certificate::from_der(der).map_err(|err| format!("{label} parse failed: {err}"))?;
+    validate_cert_time(&cert, now, label)?;
+
+    let (constraints_critical, constraints) = cert
+        .tbs_certificate()
+        .get_extension::<BasicConstraints>()
+        .map_err(|err| format!("{label} BasicConstraints is malformed: {err}"))?
+        .ok_or_else(|| format!("{label} is missing BasicConstraints CA:TRUE"))?;
+    if !constraints_critical || !constraints.ca {
+        return Err(format!("{label} must assert critical BasicConstraints CA:TRUE"));
+    }
+
+    let (key_usage_critical, key_usage) = cert
+        .tbs_certificate()
+        .get_extension::<X509KeyUsage>()
+        .map_err(|err| format!("{label} KeyUsage is malformed: {err}"))?
+        .ok_or_else(|| format!("{label} is missing KeyUsage keyCertSign"))?;
+    if !key_usage_critical || !key_usage.key_cert_sign() {
+        return Err(format!("{label} must assert critical KeyUsage keyCertSign"));
+    }
+    Ok(())
+}
+
+fn validate_cert_time(cert: &Certificate, now: UnixTime, label: &str) -> Result<(), String> {
+    let validity = cert.tbs_certificate().validity();
+    let not_before = validity.not_before.to_unix_duration().as_secs();
+    let not_after = validity.not_after.to_unix_duration().as_secs();
+    if now.as_secs() < not_before {
+        return Err(format!("{label} is not valid yet"));
+    }
+    if now.as_secs() > not_after {
+        return Err(format!("{label} is expired"));
+    }
+    Ok(())
 }
 
 fn canonical_hash_matches(parsed: &C2paSignedManifestV1) -> bool {
@@ -512,7 +653,7 @@ mod tests {
     use super::*;
     use corecrux_receipts::vault_pki_x509_signer::{Config, VaultPkiX509Signer, VaultSignResponse};
     use corecrux_receipts::{build_c2pa_manifest_v1, sign_c2pa_manifest_via_signer, C2paManifestInputV1};
-    use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
+    use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
@@ -529,6 +670,7 @@ mod tests {
                 .distinguished_name
                 .push(rcgen::DnType::CommonName, "CueCrux C2PA Root TEST");
             params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
             let kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
             let cert = params.self_signed(&kp).unwrap();
             let root_pem = cert.pem();
@@ -536,7 +678,10 @@ mod tests {
             Self { root_issuer, root_pem }
         }
         fn sign_csr(&self, csr_pem: &str) -> String {
-            let csr_params = rcgen::CertificateSigningRequestParams::from_pem(csr_pem).unwrap();
+            let mut csr_params = rcgen::CertificateSigningRequestParams::from_pem(csr_pem).unwrap();
+            csr_params.params.is_ca = IsCa::ExplicitNoCa;
+            csr_params.params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+            csr_params.params.extended_key_usages = vec![ExtendedKeyUsagePurpose::EmailProtection];
             csr_params.signed_by(&self.root_issuer).unwrap().pem()
         }
     }
@@ -573,6 +718,73 @@ mod tests {
             )
         };
         VaultPkiX509Signer::with_post_fn(cfg, post_fn)
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestLeafProfile {
+        C2pa,
+        WrongKeyUsage,
+        WrongExtendedKeyUsage,
+    }
+
+    fn m6_test_time() -> UnixTime {
+        let timestamp = rcgen::date_time_ymd(2026, 7, 30).unix_timestamp();
+        UnixTime::since_unix_epoch(std::time::Duration::from_secs(timestamp as u64))
+    }
+
+    fn make_test_ca(
+        common_name: &str,
+        parent: Option<&rcgen::Issuer<'_, KeyPair>>,
+        is_ca: bool,
+    ) -> (rcgen::Issuer<'static, KeyPair>, Vec<u8>) {
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.distinguished_name.push(rcgen::DnType::CommonName, common_name);
+        params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2035, 1, 1);
+        params.is_ca = if is_ca {
+            IsCa::Ca(rcgen::BasicConstraints::Unconstrained)
+        } else {
+            IsCa::ExplicitNoCa
+        };
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let cert = match parent {
+            Some(parent) => params.signed_by(&key, parent).unwrap(),
+            None => params.self_signed(&key).unwrap(),
+        };
+        let cert_der = cert.der().to_vec();
+        (rcgen::Issuer::new(params, key), cert_der)
+    }
+
+    fn make_test_leaf(issuer: &rcgen::Issuer<'_, KeyPair>, profile: TestLeafProfile, expired: bool) -> Vec<u8> {
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "CueCrux C2PA leaf TEST");
+        params.is_ca = IsCa::ExplicitNoCa;
+        if expired {
+            params.not_before = rcgen::date_time_ymd(2019, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2020, 1, 1);
+        } else {
+            params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2030, 1, 1);
+        }
+        match profile {
+            TestLeafProfile::C2pa => {
+                params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+                params.extended_key_usages = vec![ExtendedKeyUsagePurpose::EmailProtection];
+            }
+            TestLeafProfile::WrongKeyUsage => {
+                params.key_usages = vec![KeyUsagePurpose::KeyEncipherment];
+                params.extended_key_usages = vec![ExtendedKeyUsagePurpose::EmailProtection];
+            }
+            TestLeafProfile::WrongExtendedKeyUsage => {
+                params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+                params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+            }
+        }
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        params.signed_by(&key, issuer).unwrap().der().to_vec()
     }
 
     #[test]
@@ -677,7 +889,7 @@ mod tests {
     }
 
     #[test]
-    fn c2pa_verify_with_missing_anchor_pins_chain_to_none() {
+    fn c2pa_verify_with_missing_anchor_fails_closed() {
         let tmp = TempDir::new().unwrap();
         let signer = make_signer(&tmp, TestPki::new());
         signer.regenerate_leaf().unwrap();
@@ -702,9 +914,132 @@ mod tests {
         .unwrap();
         // Signature still verifies against the leaf SPKI.
         assert!(report.signature_valid);
-        assert_eq!(report.chain_valid, None);
-        // OK because chain check is None (can't validate without anchor).
-        assert!(report.ok);
+        assert_eq!(report.chain_valid, Some(false));
+        assert!(!report.ok, "missing trust material must never be a success shortcut");
+        assert!(report.notes.iter().any(|note| note.contains("not readable")));
+    }
+
+    #[test]
+    fn c2pa_verify_with_malformed_anchor_fails_closed() {
+        let tmp = TempDir::new().unwrap();
+        let signer = make_signer(&tmp, TestPki::new());
+        signer.regenerate_leaf().unwrap();
+        let manifest = build_c2pa_manifest_v1(&C2paManifestInputV1 {
+            content_bytes: b"x",
+            content_type: None,
+            crown_receipt_id: "r",
+            signer_passport: "p",
+            claim_generator: "g",
+            manifest_id: "u",
+            when: "t",
+            model: None,
+        });
+        let signed = sign_c2pa_manifest_via_signer(manifest, &signer, "t").unwrap();
+        let manifest_file = tmp.path().join("env.jumbf");
+        std::fs::write(&manifest_file, signed.to_jumbf_base64()).unwrap();
+        let malformed_anchor = tmp.path().join("malformed-anchor.pem");
+        std::fs::write(&malformed_anchor, "not a certificate").unwrap();
+
+        let report = c2pa_verify(&X509VerifyOptions {
+            manifest_path: manifest_file,
+            content: None,
+            root_anchor_path: Some(malformed_anchor),
+        })
+        .unwrap();
+        assert!(report.signature_valid);
+        assert_eq!(report.chain_valid, Some(false));
+        assert!(!report.ok);
+        assert!(report.notes.iter().any(|note| note.contains("exactly one certificate")));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn configured_root_anchor_honors_env_and_explicit_precedence() {
+        let previous = std::env::var_os(ENV_ROOT_ANCHOR_PATH);
+        let env_path = PathBuf::from("/tmp/cuecrux-test-anchor-from-env.pem");
+        let explicit_path = PathBuf::from("/tmp/cuecrux-test-anchor-explicit.pem");
+        std::env::set_var(ENV_ROOT_ANCHOR_PATH, &env_path);
+
+        let from_env = configured_path(None, ENV_ROOT_ANCHOR_PATH, DEFAULT_ROOT_ANCHOR_PATH);
+        let from_explicit = configured_path(
+            Some(explicit_path.as_path()),
+            ENV_ROOT_ANCHOR_PATH,
+            DEFAULT_ROOT_ANCHOR_PATH,
+        );
+
+        if let Some(previous) = previous {
+            std::env::set_var(ENV_ROOT_ANCHOR_PATH, previous);
+        } else {
+            std::env::remove_var(ENV_ROOT_ANCHOR_PATH);
+        }
+        assert_eq!(from_env, env_path);
+        assert_eq!(from_explicit, explicit_path);
+    }
+
+    #[test]
+    fn x509_path_accepts_valid_root_intermediate_leaf_chain() {
+        let (root, root_der) = make_test_ca("CueCrux Root", None, true);
+        let (intermediate, intermediate_der) = make_test_ca("CueCrux Intermediate", Some(&root), true);
+        let leaf_der = make_test_leaf(&intermediate, TestLeafProfile::C2pa, false);
+
+        validate_x509_path_at(&[leaf_der, intermediate_der], &root_der, m6_test_time())
+            .expect("valid root/intermediate/leaf path");
+    }
+
+    #[test]
+    fn x509_path_rejects_forged_intermediate_with_matching_names() {
+        let (_trusted_root, trusted_root_der) = make_test_ca("Shared Root Name", None, true);
+        let (attacker_root, _attacker_root_der) = make_test_ca("Shared Root Name", None, true);
+        let (forged_intermediate, forged_intermediate_der) =
+            make_test_ca("Shared Intermediate Name", Some(&attacker_root), true);
+        let leaf_der = make_test_leaf(&forged_intermediate, TestLeafProfile::C2pa, false);
+
+        let err =
+            validate_x509_path_at(&[leaf_der, forged_intermediate_der], &trusted_root_der, m6_test_time()).unwrap_err();
+        assert!(
+            err.contains("signature/path validation"),
+            "issuer/subject names alone must not establish trust: {err}"
+        );
+    }
+
+    #[test]
+    fn x509_path_rejects_expired_leaf() {
+        let (root, root_der) = make_test_ca("CueCrux Root", None, true);
+        let (intermediate, intermediate_der) = make_test_ca("CueCrux Intermediate", Some(&root), true);
+        let expired_leaf = make_test_leaf(&intermediate, TestLeafProfile::C2pa, true);
+
+        let err = validate_x509_path_at(&[expired_leaf, intermediate_der], &root_der, m6_test_time()).unwrap_err();
+        assert!(err.contains("expired"), "{err}");
+    }
+
+    #[test]
+    fn x509_path_rejects_wrong_leaf_key_usage() {
+        let (root, root_der) = make_test_ca("CueCrux Root", None, true);
+        let (intermediate, intermediate_der) = make_test_ca("CueCrux Intermediate", Some(&root), true);
+        let wrong_usage_leaf = make_test_leaf(&intermediate, TestLeafProfile::WrongKeyUsage, false);
+
+        let err = validate_x509_path_at(&[wrong_usage_leaf, intermediate_der], &root_der, m6_test_time()).unwrap_err();
+        assert!(err.contains("KeyUsage"), "{err}");
+    }
+
+    #[test]
+    fn x509_path_rejects_wrong_leaf_extended_key_usage() {
+        let (root, root_der) = make_test_ca("CueCrux Root", None, true);
+        let (intermediate, intermediate_der) = make_test_ca("CueCrux Intermediate", Some(&root), true);
+        let wrong_usage_leaf = make_test_leaf(&intermediate, TestLeafProfile::WrongExtendedKeyUsage, false);
+
+        let err = validate_x509_path_at(&[wrong_usage_leaf, intermediate_der], &root_der, m6_test_time()).unwrap_err();
+        assert!(err.contains("ExtendedKeyUsage"), "{err}");
+    }
+
+    #[test]
+    fn x509_path_rejects_non_ca_intermediate() {
+        let (root, root_der) = make_test_ca("CueCrux Root", None, true);
+        let (non_ca_intermediate, intermediate_der) = make_test_ca("Not A CA Intermediate", Some(&root), false);
+        let leaf_der = make_test_leaf(&non_ca_intermediate, TestLeafProfile::C2pa, false);
+
+        let err = validate_x509_path_at(&[leaf_der, intermediate_der], &root_der, m6_test_time()).unwrap_err();
+        assert!(err.contains("BasicConstraints CA:TRUE"), "{err}");
     }
 
     // Quiet the `unused` warning for the deferred legacy-envelope hook

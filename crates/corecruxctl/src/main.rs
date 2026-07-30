@@ -720,16 +720,18 @@ enum Command {
 
     /// Verify a C2PA manifest produced by the X.509 signer. Detects
     /// whether the envelope carries an `x5chain` (vault-pki-p256) or
-    /// is a raw-Ed25519 legacy envelope, walks the X.509 chain to the
-    /// local anchor PEM, and verifies the leaf signature against the
-    /// canonical body bytes. Fully OFFLINE — no Vault round-trip.
+    /// is a raw-Ed25519 legacy envelope. For X.509, cryptographically
+    /// validates the path at the current system time to the configured
+    /// local anchor and verifies the leaf signature over the canonical
+    /// body. Fully OFFLINE — no Vault round-trip or revocation check.
     #[command(name = "c2pa-verify")]
     C2paVerify {
         /// Path to the JUMBF envelope file (base64-encoded JSON).
         #[arg(value_name = "FILE")]
         manifest_path: PathBuf,
-        /// Optional content bytes to re-hash for the content-hash
-        /// assertion check.
+        /// Optional content bytes to bind to the manifest by re-hashing.
+        /// If omitted, success covers the signed manifest and trust path,
+        /// not an external asset.
         #[arg(long, value_name = "PATH")]
         content: Option<PathBuf>,
         /// Local root anchor PEM. Defaults to the env-derived path.

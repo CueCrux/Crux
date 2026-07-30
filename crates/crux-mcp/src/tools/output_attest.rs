@@ -75,6 +75,13 @@ pub const X509_FEATURE_FLAG_ENV: &str = "CORECRUXD_FEATURE_C2PA_X509_SIGNER";
 pub const BACKEND_LOCAL_ED25519: &str = "local-ed25519";
 pub const BACKEND_VAULT_PKI_P256: &str = "vault-pki-p256";
 
+/// Deliberately non-default placeholder used by the verification command.
+///
+/// The repository does not currently install a public anchor with CLI
+/// packages. Requiring the operator to replace this path avoids silently
+/// selecting the daemon-local anchor or claiming an unshipped package asset.
+const TRUSTED_C2PA_ROOT_PLACEHOLDER: &str = "/path/to/operator-pinned-c2pa-root.pem";
+
 /// Optional override for the C2PA signer key — base64-encoded 32-byte
 /// Ed25519 secret. Defaults to the existing
 /// `CORECRUXD_WRITE_CONFIRMATION_SIGNING_KEY_B64` so the C2PA signer
@@ -101,6 +108,14 @@ pub fn output_attest_enabled() -> bool {
             !matches!(v.as_str(), "" | "0" | "false" | "off" | "no")
         }
         Err(_) => false,
+    }
+}
+
+fn verify_command(backend_x509: bool) -> String {
+    if backend_x509 {
+        format!("corecruxctl c2pa-verify <manifest_file> --root-anchor {TRUSTED_C2PA_ROOT_PLACEHOLDER}")
+    } else {
+        "corecruxctl output-verify <manifest_file>".to_string()
     }
 }
 
@@ -394,11 +409,7 @@ pub async fn handle_output_attest(args: &Value, ctx: &McpContext) -> Result<Valu
         "signer_backend": backend_name,
         "x5chain_pem": signed.x5chain_pem,
         "verify_url": verify_url,
-        "verify_command": if backend_x509 {
-            "corecruxctl c2pa-verify <manifest_file>"
-        } else {
-            "corecruxctl output-verify <manifest_file>"
-        },
+        "verify_command": verify_command(backend_x509),
         "ai_act_notice": "Engineering scaffolding aligned with EU AI Act Art. 50; legal conformity assessment remains the operator's responsibility.",
     });
     let text_summary = format!(
@@ -426,6 +437,15 @@ pub(crate) mod tests {
             name: "alice".to_string(),
             token_hash: [0u8; 32],
         })
+    }
+
+    #[test]
+    fn x509_verify_command_requires_explicit_operator_pinned_anchor() {
+        let command = verify_command(true);
+        assert!(command.contains(TRUSTED_C2PA_ROOT_PLACEHOLDER));
+        assert!(command.contains("--root-anchor"));
+        assert!(!command.contains("/var/lib/corecruxd"));
+        assert!(!command.contains("/usr/share/cuecrux"));
     }
 
     /// Shared with `dispatch::tests::envelope_omits_for_output_attest`

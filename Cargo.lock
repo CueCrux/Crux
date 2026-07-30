@@ -929,6 +929,8 @@ dependencies = [
  "postgres",
  "rand 0.10.2",
  "rcgen",
+ "rustls-pki-types",
+ "rustls-webpki",
  "serde",
  "serde_json",
  "serde_yaml",

@@ -124,14 +124,28 @@ Distribution channels:
 
 | Audience | Channel | Pin |
 |---|---|---|
-| End-users running `corecruxctl c2pa-verify` | Bundled with the CLI release at `/usr/share/cuecrux/c2pa-root.pem` | SHA-256 fingerprint above |
+| End-users running `corecruxctl c2pa-verify` | Operator-installed PEM obtained through an authenticated channel; pass its path with `--root-anchor` | SHA-256 fingerprint above |
 | Partner integrations | Out-of-band over a TLS-pinned channel (Slack DM, signed email, GPG-encrypted file) | SHA-256 fingerprint above |
 | Public CLI users | `https://cuecrux.com/.well-known/c2pa-anchor.pem` (TLS via Let's Encrypt) | SHA-256 fingerprint above |
 | Adobe Content Credentials Verify | Not accepted (requires commercial CA) — see §6 |
 
 Whatever channel: **the fingerprint must be displayed alongside the PEM**.
-Verifiers MUST refuse to trust a PEM whose fingerprint doesn't match the
-published value.
+The CLI treats the configured PEM as the root of trust and reports its
+`anchor_sha256`; it does not embed a globally pinned fingerprint. The operator
+or provisioning layer MUST compare that reported fingerprint with the
+out-of-band published value and refuse a mismatch.
+
+`corecruxctl c2pa-verify` resolves its trust anchor in this order:
+`--root-anchor`, `CORECRUXD_C2PA_ROOT_ANCHOR_PATH`, then the daemon-local
+default `/var/lib/corecruxd/c2pa-root.cert.pem`. End-user CLI packages therefore
+must pass the path of an operator-pinned certificate (as the emitted
+verification-command placeholder requires) or set the environment variable to
+that path. No current release package installs a public anchor automatically.
+
+Verification is offline and evaluates the certificate path at the verifier's
+current system time. The local clock and selected anchor file are trust inputs.
+CRL and OCSP revocation are not checked, even when a certificate contains a CRL
+distribution URL.
 
 ---
 
@@ -151,9 +165,12 @@ corecruxctl c2pa-rotate-leaf --json
 ```
 
 This calls `regenerate_leaf` directly; the new leaf replaces the old one
-atomically. Existing C2PA manifests signed by the previous leaf remain
-verifiable for as long as third parties retain the old leaf's public key
-(embedded in the `x5chain` header of those manifests).
+atomically. The previous leaf remains embedded in manifests and can still prove
+the manifest signature, but `corecruxctl c2pa-verify` accepts its trust path only
+while that leaf is valid at the verifier's current system time. Durable
+historical trust beyond certificate expiry requires a separately validated
+trusted timestamp; the manifest's `signed_at` field is not itself a trusted
+timestamp.
 
 ### 4.b Root rotation (manual, OPERATOR-GATED)
 
@@ -171,10 +188,13 @@ If the root is suspected compromised:
 5. **Document the incident** with
    `mcp__crux__store_fact(entity="incident:<date>", value={symptom, cause, fix_sha, repro_steps})`.
 
-Existing manifests signed by leaves under the OLD root remain verifiable
-only as long as the old anchor is in operator-controlled storage; after
-expiry of the last old leaf (max 30 days post-cutover), the old anchor
-should be archived and removed from active distribution channels.
+Existing manifests signed by leaves under the OLD root require an explicitly
+selected old anchor and a certificate path that is still valid at the
+verifier's current system time. After expiry of the last old leaf (max 30 days
+post-cutover), the old anchor should be archived and removed from active
+distribution channels. Historical verification after that point requires a
+separately validated trusted timestamp; do not substitute the unsigned
+manifest `signed_at` field.
 
 ---
 
