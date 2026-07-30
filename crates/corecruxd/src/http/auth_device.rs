@@ -11,8 +11,9 @@
 //!    interval, expires_in}`. The client shows `user_code` + `verification_uri`
 //!    to the human and begins polling.
 //! 2. The human opens `/activate` (served by `console.rs`), authenticates as a
-//!    console admin, enters the `user_code`, and approves — choosing the tenant +
-//!    scopes. `POST /v1/auth/device/approve` records the approver's choice.
+//!    console admin, enters the `user_code`, and approves — choosing one tenant
+//!    plus a scope subset already held by that admin.
+//!    `POST /v1/auth/device/approve` records the attenuated choice.
 //! 3. `POST /v1/auth/device/token` (poll) → `authorization_pending` /
 //!    `slow_down` / `expired_token` / `access_denied`, or, once approved,
 //!    `{access_token, refresh_token, expires_in, scopes}`. The `device_code` is
@@ -23,15 +24,16 @@
 //! Security posture (see ExecPlan Risks):
 //! - **Phishing:** short `user_code` TTL; `/activate` shows the requesting client
 //!   name; approval is bound to an authenticated console admin (`admin:write`).
-//! - **Tenant leakage (T.1):** the issued `tenant_id` + scopes come from the
-//!   *approver*, never from the polling client.
+//! - **Tenant leakage (T.1):** the issued `tenant_id` + scopes are a concrete
+//!   subset of the authenticated approver's verified grants, never authority
+//!   supplied by the polling client or approval form.
 //! - Gated behind `CORECRUXD_DEVICE_GRANT_ENABLED` (default off) ⇒ 404 disabled.
 //!
 //! Known limitation (M3): pending grants and refresh credentials live in a
 //! process-local registry — a daemon restart invalidates them. Persisting +
 //! externalising revocation is tracked for M5 hardening.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -39,6 +41,7 @@ use base64::Engine as _;
 use rand::Rng as _; // brings `fill_bytes` into scope (matches repo idiom)
 
 use super::auth_rails::{env_flag_enabled, ISSUED_TOKEN_TTL_SECS};
+use crate::auth::HttpScopeContext;
 use crux_mcp::tools::loopback_auth::{mint_scoped_jwt_from_env, ScopedClaims};
 
 use super::*;
@@ -272,13 +275,112 @@ fn activate_uri(headers: &HeaderMap) -> String {
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct DeviceApproveReq {
     pub user_code: String,
-    /// Tenant the issued token will be bound to (approver-chosen — T.1).
+    /// Desired tenant. The server requires it to be inside the approver's
+    /// verified tenant grant.
     pub tenant_id: String,
-    /// Scopes the approver grants.
+    /// Desired scopes. The server rejects any scope the approver does not hold.
     pub scopes: Vec<String>,
     /// Set true to deny instead of approve.
     #[serde(default)]
     pub deny: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttenuatedDeviceGrant {
+    tenant_id: String,
+    scopes: Vec<String>,
+}
+
+#[allow(clippy::result_large_err)]
+fn require_device_approver(context: &HttpScopeContext) -> Result<(), ProblemResponse> {
+    if !context.auth_enforced() {
+        return Err(ProblemResponse(
+            corecrux_types::ProblemDetails::forbidden("device approval requires enforced HTTP authentication")
+                .with_extensions(serde_json::json!({
+                    "code": "DEVICE_APPROVER_AUTH_REQUIRED",
+                })),
+        ));
+    }
+    if !context.has_scope("admin:write") {
+        return Err(ProblemResponse(
+            corecrux_types::ProblemDetails::forbidden("insufficient scopes").with_extensions(serde_json::json!({
+                "code": "MISSING_SCOPE",
+                "missingScopes": ["admin:write"],
+            })),
+        ));
+    }
+    // DevScopes is an explicit local-development rail. In production JWT
+    // modes, device approval is a human delegation boundary: an automation
+    // token, a device token (no canonical passport), a sub-only JWT, or an
+    // admin passport-header override must not mint a fresh credential chain.
+    if !context.local_unverified_identity()
+        && (context.credential_is_agent_token()
+            || context.passport_override_used()
+            || !context.canonical_passport_claim_verified())
+    {
+        return Err(ProblemResponse(
+            corecrux_types::ProblemDetails::forbidden(
+                "device approval requires the bearer token's canonical human passport",
+            )
+            .with_extensions(serde_json::json!({
+                "code": "DEVICE_APPROVER_HUMAN_REQUIRED",
+            })),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve one concrete tenant and a canonical scope subset from the verified
+/// approver context. Approval is delegation, not a fresh authority source:
+/// `admin:write` permits the decision but does not widen tenant or scope.
+#[allow(clippy::result_large_err)]
+fn attenuate_device_grant(
+    context: &HttpScopeContext,
+    requested_tenant: &str,
+    requested_scopes: &[String],
+) -> Result<AttenuatedDeviceGrant, ProblemResponse> {
+    require_device_approver(context)?;
+
+    let requested_tenant = requested_tenant.trim();
+    if requested_tenant.is_empty() || requested_tenant == "*" {
+        return Err(ProblemResponse(corecrux_types::ProblemDetails::bad_request(
+            "one concrete tenant_id is required to approve a device grant",
+        )));
+    }
+    let tenant_id = context.resolve_authorized_tenant(Some(requested_tenant))?;
+
+    let scopes: BTreeSet<String> = requested_scopes
+        .iter()
+        .map(|scope| scope.trim())
+        .filter(|scope| !scope.is_empty())
+        .map(str::to_string)
+        .collect();
+    if scopes.is_empty() {
+        return Err(ProblemResponse(corecrux_types::ProblemDetails::bad_request(
+            "at least one scope is required to approve",
+        )));
+    }
+
+    let unauthorized_scopes: Vec<String> = scopes
+        .iter()
+        .filter(|scope| !context.has_scope(scope))
+        .cloned()
+        .collect();
+    if !unauthorized_scopes.is_empty() {
+        return Err(ProblemResponse(
+            corecrux_types::ProblemDetails::forbidden("device grant scopes exceed approver authority").with_extensions(
+                serde_json::json!({
+                    "code": "DEVICE_GRANT_SCOPE_WIDENING",
+                    "unauthorizedScopes": unauthorized_scopes,
+                }),
+            ),
+        ));
+    }
+
+    Ok(AttenuatedDeviceGrant {
+        tenant_id,
+        scopes: scopes.into_iter().collect(),
+    })
 }
 
 #[tracing::instrument(level = "info", skip_all)]
@@ -290,27 +392,24 @@ pub(super) async fn post_device_approve(
     if !env_flag_enabled(DEVICE_ENABLED_ENV) {
         return device_disabled_response();
     }
-    // Approval is an admin action — bind to an authenticated console admin.
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
+    // Approval is delegation by an authenticated admin, not authority supplied
+    // by this request body.
+    let context = match http_scope_context(&state.auth, &headers) {
+        Ok(context) => context,
+        Err(problem) => return problem.into_response(),
+    };
+    if let Err(problem) = require_device_approver(&context) {
         return problem.into_response();
     }
     let user_code = req.user_code.trim().to_ascii_uppercase();
-    let tenant_id = req.tenant_id.trim().to_string();
-    if tenant_id.is_empty() {
-        return problem_response(
-            StatusCode::BAD_REQUEST,
-            "tenant_id is required to approve a device grant",
-        );
-    }
-    let scopes: Vec<String> = req
-        .scopes
-        .iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if !req.deny && scopes.is_empty() {
-        return problem_response(StatusCode::BAD_REQUEST, "at least one scope is required to approve");
-    }
+    let approved = if req.deny {
+        None
+    } else {
+        match attenuate_device_grant(&context, &req.tenant_id, &req.scopes) {
+            Ok(grant) => Some(grant),
+            Err(problem) => return problem.into_response(),
+        }
+    };
 
     let now = now_secs();
     let Ok(mut reg) = REGISTRY.lock() else {
@@ -327,13 +426,9 @@ pub(super) async fn post_device_approve(
         return problem_response(StatusCode::CONFLICT, "device grant is no longer pending");
     }
     let client_name = grant.client_name.clone();
-    grant.state = if req.deny {
-        GrantState::Denied
-    } else {
-        GrantState::Approved {
-            tenant_id: tenant_id.clone(),
-            scopes: scopes.clone(),
-        }
+    grant.state = match approved {
+        None => GrantState::Denied,
+        Some(AttenuatedDeviceGrant { tenant_id, scopes }) => GrantState::Approved { tenant_id, scopes },
     };
     (
         StatusCode::OK,
@@ -393,7 +488,8 @@ pub(super) async fn post_device_token(State(_state): State<AppState>, Json(req):
 }
 
 /// Mint an access token + create a revocable refresh credential for an approved
-/// grant. T.1: `tenant_id`/`scopes` are the approver's, passed in here.
+/// grant. T.1: `tenant_id`/`scopes` were attenuated against the approver before
+/// they reached the registry.
 fn issue_device_tokens(tenant_id: &str, scopes: &[String]) -> Response {
     let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
     let cred_id = uuid::Uuid::new_v4().simple().to_string();
@@ -539,6 +635,68 @@ pub(super) async fn post_device_revoke(State(_state): State<AppState>, Json(req)
 mod tests {
     use super::*;
 
+    const APPROVAL_TEST_SECRET: &[u8] = b"device-approval-test-secret-32-bytes";
+    const APPROVAL_TEST_ISSUER: &str = "corecrux-device-approval-test";
+    const APPROVAL_TEST_AUDIENCE: &str = "corecrux";
+
+    fn approval_context(claims: serde_json::Value, tenant_header: Option<&str>) -> HttpScopeContext {
+        approval_context_with_passport_header(claims, tenant_header, None)
+    }
+
+    fn approval_context_with_passport_header(
+        mut claims: serde_json::Value,
+        tenant_header: Option<&str>,
+        passport_header: Option<&str>,
+    ) -> HttpScopeContext {
+        let object = claims.as_object_mut().expect("claims object");
+        object.insert(
+            "exp".to_string(),
+            serde_json::json!(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system time after epoch")
+                    .as_secs()
+                    + 3_600
+            ),
+        );
+        object.insert("iss".to_string(), serde_json::json!(APPROVAL_TEST_ISSUER));
+        object.insert("aud".to_string(), serde_json::json!(APPROVAL_TEST_AUDIENCE));
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(APPROVAL_TEST_SECRET),
+        )
+        .expect("approval test JWT");
+        let auth = crate::auth::Authz::test_hs256(APPROVAL_TEST_SECRET, APPROVAL_TEST_ISSUER, APPROVAL_TEST_AUDIENCE);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).expect("bearer header"),
+        );
+        if let Some(tenant) = tenant_header {
+            headers.insert(
+                "x-corecrux-tenant-id",
+                HeaderValue::from_str(tenant).expect("tenant header"),
+            );
+        }
+        if let Some(passport) = passport_header {
+            headers.insert(
+                "x-corecrux-passport-id",
+                HeaderValue::from_str(passport).expect("passport header"),
+            );
+        }
+        http_scope_context(&auth, &headers).expect("verified approval context")
+    }
+
+    fn problem_code(problem: &ProblemResponse) -> Option<&str> {
+        problem
+            .0
+            .extensions
+            .as_ref()
+            .and_then(|extensions| extensions.get("code"))
+            .and_then(serde_json::Value::as_str)
+    }
+
     fn pending_grant(now: u64) -> DeviceGrant {
         DeviceGrant {
             user_code: "ABCD-2345".to_string(),
@@ -639,5 +797,222 @@ mod tests {
         reg.prune(now);
         assert!(reg.grants.is_empty());
         assert!(reg.by_user_code.is_empty());
+    }
+
+    #[test]
+    fn device_approval_accepts_only_an_admins_tenant_and_scope_subset() {
+        let context = approval_context(
+            serde_json::json!({
+                "scope": "admin:write query:read facts:write",
+                "tenant_id": "tenant-a",
+                "passport_id": "approver-1",
+            }),
+            None,
+        );
+        let grant = attenuate_device_grant(
+            &context,
+            " tenant-a ",
+            &[
+                "facts:write".to_string(),
+                " query:read ".to_string(),
+                "facts:write".to_string(),
+            ],
+        )
+        .expect("authorized subset");
+        assert_eq!(grant.tenant_id, "tenant-a");
+        assert_eq!(grant.scopes, vec!["facts:write", "query:read"]);
+    }
+
+    #[test]
+    fn device_approval_rejects_scope_widening() {
+        let context = approval_context(
+            serde_json::json!({
+                "scope": "admin:write query:read",
+                "tenant_id": "tenant-a",
+                "passport_id": "approver-1",
+            }),
+            None,
+        );
+        let error = attenuate_device_grant(
+            &context,
+            "tenant-a",
+            &["query:read".to_string(), "facts:write".to_string()],
+        )
+        .expect_err("facts:write exceeds approver authority");
+        assert_eq!(error.0.status, 403);
+        assert_eq!(problem_code(&error), Some("DEVICE_GRANT_SCOPE_WIDENING"));
+        assert_eq!(
+            error
+                .0
+                .extensions
+                .as_ref()
+                .and_then(|extensions| extensions.get("unauthorizedScopes")),
+            Some(&serde_json::json!(["facts:write"]))
+        );
+    }
+
+    #[test]
+    fn device_approval_rejects_tenant_widening_and_missing_tenant_claim() {
+        let context = approval_context(
+            serde_json::json!({
+                "scope": "admin:write query:read",
+                "tenant_id": "tenant-a",
+                "passport_id": "approver-1",
+            }),
+            None,
+        );
+        let wrong_tenant = attenuate_device_grant(&context, "tenant-b", &["query:read".to_string()])
+            .expect_err("tenant-b exceeds approver authority");
+        assert_eq!(wrong_tenant.0.status, 403);
+        assert_eq!(problem_code(&wrong_tenant), Some("TENANT_FORBIDDEN"));
+
+        let missing_tenant = approval_context(
+            serde_json::json!({
+                "scope": "admin:write query:read",
+                "passport_id": "approver-1",
+            }),
+            None,
+        );
+        let error = attenuate_device_grant(&missing_tenant, "default", &["query:read".to_string()])
+            .expect_err("authenticated device approval requires tenant authority");
+        assert_eq!(error.0.status, 403);
+        assert_eq!(problem_code(&error), Some("TENANT_CLAIM_MISSING"));
+    }
+
+    #[test]
+    fn device_approval_requires_unambiguous_multi_tenant_selection() {
+        let context = approval_context(
+            serde_json::json!({
+                "scope": "admin:write query:read",
+                "tenants": ["tenant-a", "tenant-b"],
+                "passport_id": "approver-1",
+            }),
+            None,
+        );
+        let ambiguous = attenuate_device_grant(&context, "", &["query:read".to_string()])
+            .expect_err("approval must choose one tenant");
+        assert_eq!(ambiguous.0.status, 400);
+
+        let grant =
+            attenuate_device_grant(&context, "tenant-b", &["query:read".to_string()]).expect("explicit allowed tenant");
+        assert_eq!(grant.tenant_id, "tenant-b");
+
+        let header_bound = approval_context(
+            serde_json::json!({
+                "scope": "admin:write query:read",
+                "tenants": ["tenant-a", "tenant-b"],
+                "passport_id": "approver-1",
+            }),
+            Some("tenant-a"),
+        );
+        let mismatch = attenuate_device_grant(&header_bound, "tenant-b", &["query:read".to_string()])
+            .expect_err("body and verified selector must agree");
+        assert_eq!(mismatch.0.status, 403);
+        assert_eq!(problem_code(&mismatch), Some("TENANT_SELECTOR_MISMATCH"));
+    }
+
+    #[test]
+    fn device_approval_allows_global_admin_only_for_an_explicit_tenant() {
+        let context = approval_context(
+            serde_json::json!({
+                "scope": "admin:write query:read",
+                "tenant_id": "*",
+                "passport_id": "approver-1",
+            }),
+            None,
+        );
+        let grant = attenuate_device_grant(&context, "tenant-new", &["query:read".to_string()])
+            .expect("global tenant authority with explicit tenant");
+        assert_eq!(grant.tenant_id, "tenant-new");
+
+        let ambiguous = attenuate_device_grant(&context, " ", &["query:read".to_string()])
+            .expect_err("global admin must still choose a tenant");
+        assert_eq!(ambiguous.0.status, 400);
+
+        let wildcard = attenuate_device_grant(&context, "*", &["query:read".to_string()])
+            .expect_err("issued token must bind one concrete tenant");
+        assert_eq!(wildcard.0.status, 400);
+    }
+
+    #[test]
+    fn device_approval_rejects_non_human_production_credentials() {
+        let device_context = approval_context(
+            serde_json::json!({
+                "scope": "admin:write query:read",
+                "tenant_id": "tenant-a",
+                "sub": "device:credential-id",
+            }),
+            None,
+        );
+        let error = attenuate_device_grant(&device_context, "tenant-a", &["query:read".to_string()])
+            .expect_err("device credentials cannot recursively approve");
+        assert_eq!(error.0.status, 403);
+        assert_eq!(problem_code(&error), Some("DEVICE_APPROVER_HUMAN_REQUIRED"));
+
+        let sub_only_context = approval_context(
+            serde_json::json!({
+                "scope": "admin:write query:read",
+                "tenant_id": "tenant-a",
+                "sub": "operator@example.test",
+            }),
+            None,
+        );
+        let error = attenuate_device_grant(&sub_only_context, "tenant-a", &["query:read".to_string()])
+            .expect_err("sub-only identity is not a canonical human passport");
+        assert_eq!(problem_code(&error), Some("DEVICE_APPROVER_HUMAN_REQUIRED"));
+
+        let override_context = approval_context_with_passport_header(
+            serde_json::json!({
+                "scope": "admin:write query:read",
+                "tenant_id": "tenant-a",
+                "passport_id": "approver-1",
+            }),
+            None,
+            Some("impersonated-approver"),
+        );
+        let error = attenuate_device_grant(&override_context, "tenant-a", &["query:read".to_string()])
+            .expect_err("passport override cannot satisfy the approval boundary");
+        assert_eq!(problem_code(&error), Some("DEVICE_APPROVER_HUMAN_REQUIRED"));
+    }
+
+    #[test]
+    fn device_approval_requires_admin_write_without_scope_implication() {
+        let context = approval_context(
+            serde_json::json!({
+                "scope": "query:read facts:write",
+                "tenant_id": "tenant-a",
+                "passport_id": "approver-1",
+            }),
+            None,
+        );
+        let error = attenuate_device_grant(&context, "tenant-a", &["query:read".to_string()])
+            .expect_err("delegation requires admin:write");
+        assert_eq!(error.0.status, 403);
+        assert_eq!(problem_code(&error), Some("MISSING_SCOPE"));
+    }
+
+    #[test]
+    fn device_approval_retains_explicit_dev_scopes_local_flow() {
+        let auth = crate::auth::Authz::from_env(crate::auth::AuthMode::DevScopes).expect("dev scopes auth");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-corecrux-scopes",
+            "admin:write query:read".parse().expect("scope header"),
+        );
+        let context = http_scope_context(&auth, &headers).expect("dev approval context");
+        let grant = attenuate_device_grant(&context, "local-dev", &["query:read".to_string()])
+            .expect("explicit dev-scopes flow");
+        assert_eq!(grant.tenant_id, "local-dev");
+        assert_eq!(grant.scopes, vec!["query:read"]);
+    }
+
+    #[test]
+    fn device_approval_rejects_auth_off_even_with_scope_bypass() {
+        let auth = crate::auth::Authz::from_env(crate::auth::AuthMode::Off).expect("off auth");
+        let context = http_scope_context(&auth, &HeaderMap::new()).expect("local auth-off context");
+        let error = attenuate_device_grant(&context, "default", &["admin:write".to_string()])
+            .expect_err("auth-off cannot approve durable bearer credentials");
+        assert_eq!(error.0.status, 403);
+        assert_eq!(problem_code(&error), Some("DEVICE_APPROVER_AUTH_REQUIRED"));
     }
 }

@@ -334,7 +334,8 @@ pub fn routes(enabled: bool) -> Router {
 /// `/activate` — operator approval page for the device-authorization grant.
 /// The form POSTs to `/v1/auth/device/approve` on the same origin; that endpoint
 /// is gated to an authenticated console admin (`admin:write`) and the
-/// approver-chosen tenant + scopes are what get minted (threat ref T.1).
+/// selected tenant + scopes are minted only after the server proves they are a
+/// subset of the approver's verified grants (threat ref T.1).
 async fn serve_activate() -> impl IntoResponse {
     Html(ACTIVATE_HTML)
 }
