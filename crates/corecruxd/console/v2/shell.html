@@ -3756,6 +3756,31 @@
   // session — on a local daemon that path 404s and the row stays [hidden] (the
   // M18 rule, preserved). Language is a placeholder (single locale).
   var ACCT_HOSTED = false;
+
+  // Where a signed-out user belongs. NOT '/' — on a hosted deployment the app
+  // origin 303s '/' straight to /console, so redirecting there after destroying
+  // the session returns the user to a console that still renders as signed in
+  // while every call behind it fails. Observed on app.cuecrux.com 2026-07-30,
+  // where it read as "log out does nothing".
+  //
+  // The console is served from app.<domain> and its front door is <domain>, so
+  // derive rather than hardcode: a self-hosted deployment lands on its own front
+  // door, not ours. If the host carries no `app.` prefix we cannot know the front
+  // door, so fall back to the console root and let the operator navigate — still
+  // better than a redirect that silently lands nowhere.
+  var SIGNED_OUT_HOME = (function () {
+    try {
+      var bare = location.host.replace(/^app\./, '');
+      if (bare && bare !== location.host) { return location.protocol + '//' + bare + '/'; }
+    } catch (e) { /* fall through */ }
+    return '/';
+  })();
+
+  /** Surface a failed log out instead of leaving the user guessing. */
+  function acctLogoutFailed(message) {
+    try { setHealth('bad', message); } catch (e) { /* health pill not mounted yet */ }
+  }
+
   function acctAction(acct) {
     if (acct === 'settings') { location.hash = '#/system/cx-settings'; }
     else if (acct === 'connections') { location.hash = '#/system/cx-connections'; }
@@ -3763,8 +3788,21 @@
     else if (acct === 'logout') {
       if (!window.CruxSession) { return; }
       window.CruxSession.logout()
-        .then(function (ok) { if (ok) { location.assign('/'); } else { console.warn('logout failed'); } })
-        .catch(function (err) { console.warn('logout unavailable', err); });
+        .then(function (ok) {
+          // Leave the app origin entirely. '/' here 303s straight back to
+          // /console, so the old redirect destroyed the session and then
+          // returned the user to a console that still LOOKS signed in — every
+          // subsequent call fails, and it reads as "log out does nothing".
+          // The signed-out home is the front door, on its own origin.
+          if (ok) { location.assign(SIGNED_OUT_HOME); return; }
+          acctLogoutFailed('Log out did not complete. Please try again.');
+        })
+        .catch(function (err) {
+          // Never fail silently: the session may or may not be gone, and the
+          // user has no way to tell from a console that renders identically.
+          acctLogoutFailed('Log out is unavailable right now. Please try again.');
+          if (window.console && console.warn) { console.warn('logout unavailable', err); }
+        });
     }
     // language — placeholder (single locale for now).
   }
