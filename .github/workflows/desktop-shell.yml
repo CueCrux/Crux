@@ -305,13 +305,14 @@ jobs:
 
       - name: install the MSI (per-machine, silent)
         run: |
+          $ev  = "$env:GITHUB_WORKSPACE\windows-gui-evidence"
           $msi = Get-ChildItem 'shells\desktop\app\target\release\bundle\msi\*.msi' -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $msi) {
             Write-Host '::error::cargo tauri build produced no .msi under target/release/bundle/msi'
             exit 1
           }
           Write-Host "installing $($msi.Name) ($([math]::Round($msi.Length/1MB,1)) MB)"
-          $log = "$env:GITHUB_WORKSPACE\windows-gui-evidence\msi-install.log"
+          $log = "$ev\msi-install.log"
           $p = Start-Process msiexec.exe -ArgumentList '/i', "`"$($msi.FullName)`"", '/qn', '/norestart', '/l*v', "`"$log`"" -Wait -PassThru
           Write-Host "msiexec exit: $($p.ExitCode)"
           # 0 = installed, 3010 = installed, reboot queued
@@ -319,24 +320,47 @@ jobs:
             Write-Host "::error::MSI install failed with exit $($p.ExitCode) -- see the msi-install.log artifact"
             exit 1
           }
-          $exe = Get-ChildItem 'C:\Program Files\Crux\Crux.exe', 'C:\Program Files (x86)\Crux\Crux.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $exe) {
-            $exe = Get-ChildItem 'C:\Program Files' -Recurse -Depth 2 -Filter 'Crux.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
-          }
-          if (-not $exe) {
-            Write-Host '::error::the MSI reported success but no installed Crux.exe was found'
+          # `productName` names the product, the install dir, and the Start Menu
+          # entry -- it is NOT the executable name. tauri.conf.json sets
+          # productName "Crux" but no mainBinaryName, so the shipped binary keeps
+          # the cargo bin name (crux-desktop-shell.exe). Read the product from
+          # config and the layout from the installer; hardcoding either is how
+          # this step failed the first time it ran for real.
+          $product = (Get-Content 'shells\desktop\app\tauri.conf.json' -Raw | ConvertFrom-Json).productName
+          $entry = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+                     Where-Object { $_.DisplayName -eq $product } | Select-Object -First 1
+          if (-not $entry) {
+            Write-Host "::error::msiexec reported success but registered no uninstall entry named '$product'"
             exit 1
           }
-          $dir = $exe.DirectoryName
-          Write-Host "installed to: $dir"
-          Get-ChildItem $dir | Format-Table Name, Length -AutoSize
-          # The bundled sidecar must ship beside the app, de-tripled.
+
+          # Record teardown facts BEFORE any assertion below can exit, or the
+          # cleanup step has nothing to act on and the box stays dirty for the
+          # next run. Uninstall by ProductCode rather than .msi path, so teardown
+          # does not depend on the build tree still being there.
+          (Split-Path $entry.PSPath -Leaf) | Out-File "$ev\product-code.txt" -Encoding ascii
+          $product | Out-File "$ev\product-name.txt" -Encoding ascii
+
+          $dir = if ($entry.InstallLocation) { $entry.InstallLocation.TrimEnd('\') } else { Join-Path $env:ProgramFiles $product }
+          Write-Host "product     : $product"
+          Write-Host "install dir : $dir"
+          Get-ChildItem $dir -ErrorAction SilentlyContinue | Format-Table Name, Length -AutoSize
+
+          $app = Get-ChildItem (Join-Path $dir '*.exe') -ErrorAction SilentlyContinue |
+                   Where-Object { $_.Name -ne 'corecruxd.exe' } | Select-Object -First 1
+          if (-not $app) {
+            Write-Host "::error::no application .exe found in $dir"
+            exit 1
+          }
+          Write-Host "app binary  : $($app.Name)"
+          $app.FullName | Out-File "$ev\app-exe.txt" -Encoding ascii
+
+          # The bundled sidecar must ship beside the app, de-tripled by the bundler.
           if (-not (Test-Path (Join-Path $dir 'corecruxd.exe'))) {
             Write-Host '::error::corecruxd.exe is missing from the install dir -- the externalBin sidecar was not bundled'
             exit 1
           }
-          "$($exe.FullName)" | Out-File "$env:GITHUB_WORKSPACE\windows-gui-evidence\installed-exe.txt" -Encoding ascii
-          "$($msi.FullName)" | Out-File "$env:GITHUB_WORKSPACE\windows-gui-evidence\msi-path.txt" -Encoding ascii
+          Write-Host 'MSI OK: installed per-machine, sidecar present beside the app'
 
       # The actual GUI assertions. Evidence (screenshot + process table) is
       # written before any assertion can fail, so a red run still uploads the
@@ -344,7 +368,7 @@ jobs:
       - name: launch the installed app and observe the desktop
         run: |
           $ev  = "$env:GITHUB_WORKSPACE\windows-gui-evidence"
-          $exe = (Get-Content "$ev\installed-exe.txt" -Raw).Trim()
+          $exe = (Get-Content "$ev\app-exe.txt" -Raw).Trim()
           Write-Host "launching $exe"
           $app = Start-Process $exe -PassThru
 
@@ -397,7 +421,9 @@ jobs:
       # legitimately orphan it, so only assert the reap when the close was clean.
       - name: graceful close reaps the bundled sidecar
         run: |
-          $proc = Get-Process Crux -ErrorAction SilentlyContinue
+          $ev   = "$env:GITHUB_WORKSPACE\windows-gui-evidence"
+          $name = [IO.Path]::GetFileNameWithoutExtension((Get-Content "$ev\app-exe.txt" -Raw).Trim())
+          $proc = Get-Process $name -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $proc) {
             Write-Host '::warning::the app was already gone; nothing to close'
             exit 0
@@ -423,17 +449,24 @@ jobs:
       - name: uninstall and clean up
         if: always()
         run: |
-          Get-Process Crux, corecruxd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-          $msiFile = "$env:GITHUB_WORKSPACE\windows-gui-evidence\msi-path.txt"
-          if (Test-Path $msiFile) {
-            $msi = (Get-Content $msiFile -Raw).Trim()
-            if ($msi -and (Test-Path $msi)) {
-              $p = Start-Process msiexec.exe -ArgumentList '/x', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
-              Write-Host "uninstall exit: $($p.ExitCode)"
-            }
+          $ev = "$env:GITHUB_WORKSPACE\windows-gui-evidence"
+          if (Test-Path "$ev\app-exe.txt") {
+            $name = [IO.Path]::GetFileNameWithoutExtension((Get-Content "$ev\app-exe.txt" -Raw).Trim())
+            Get-Process $name -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           }
-          if (Test-Path 'C:\Program Files\Crux') {
-            Write-Host '::warning::C:\Program Files\Crux still exists after uninstall'
+          Get-Process corecruxd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+          if (Test-Path "$ev\product-code.txt") {
+            $code = (Get-Content "$ev\product-code.txt" -Raw).Trim()
+            $p = Start-Process msiexec.exe -ArgumentList '/x', $code, '/qn', '/norestart' -Wait -PassThru
+            Write-Host "uninstall $code exit: $($p.ExitCode)"
+          } else {
+            Write-Host '::warning::no product-code.txt recorded, so nothing was uninstalled'
+          }
+
+          if (Test-Path "$ev\product-name.txt") {
+            $leftover = Join-Path $env:ProgramFiles (Get-Content "$ev\product-name.txt" -Raw).Trim()
+            if (Test-Path $leftover) { Write-Host "::warning::$leftover still exists after uninstall" }
           }
 
       - name: upload GUI smoke evidence
