@@ -30,7 +30,10 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 s="${CRUX_HOOKS_RECONCILE:-${here}/../reconcile-execplan-status.sh}"
 [ -x "$s" ] || exit 0
 
-CRUX_HTTP_URL="${CRUX_HTTP_URL:-http://127.0.0.1:14800}" \
-CRUX_EXECPLANS_ROOT="${CRUX_EXECPLANS_ROOT:-$HOME/CueCrux/PlanCrux/.agent/execplans}" \
-  "$s" --quiet 2>/dev/null || true
+# No default for the plan root: it lives in a private planning repo whose name
+# must not appear in this repository (CI gate: "No private-monorepo refs"). The
+# sweep already handles an unset root by reporting it could not verify the board,
+# which is the honest outcome — a wrong guess would report a false clean. Set
+# CRUX_EXECPLANS_ROOT in $HOME/.config/crux/hooks.env.
+CRUX_HTTP_URL="${CRUX_HTTP_URL:-http://127.0.0.1:14800}" "$s" --quiet 2>/dev/null || true
 exit 0
