@@ -196,6 +196,8 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/code-intel/trace-diff", methods: &["GET"], tag: "CodeIntel", auth: "admin-read", summary: "Where two traces diverge" },
     RouteEntry { path: "/v1/code-intel/releases", methods: &["GET"], tag: "CodeIntel", auth: "admin-read", summary: "Releases held for a tenant, with retention window" },
     RouteEntry { path: "/v1/code-intel/volume", methods: &["GET"], tag: "CodeIntel", auth: "admin-read", summary: "Retained spans against the tenant ceiling" },
+    RouteEntry { path: "/v1/code-intel/enrich", methods: &["POST"], tag: "CodeIntel", auth: "admin-write", summary: "LLM-enriched dead-code verdict, per-seat rate ceilinged" },
+    RouteEntry { path: "/v1/code-intel/enrich-budget", methods: &["GET"], tag: "CodeIntel", auth: "admin-read", summary: "Remaining enrichment headroom for a seat" },
     RouteEntry { path: "/v1/console/corecrux/graph/stats", methods: &["GET"], tag: "console-graph", auth: "admin-read", summary: "Console CoreCrux link-graph stats (read-only mediation proxy)" },
     RouteEntry { path: "/v1/console/corecrux/graph/resolve", methods: &["GET"], tag: "console-graph", auth: "admin-read", summary: "Console CoreCrux link-graph title resolve (read-only mediation proxy)" },
     RouteEntry { path: "/v1/console/corecrux/graph/ego", methods: &["GET"], tag: "console-graph", auth: "admin-read", summary: "Console CoreCrux link-graph ego expansion (read-only mediation proxy)" },

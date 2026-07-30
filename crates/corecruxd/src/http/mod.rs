@@ -314,6 +314,12 @@ pub struct AppState {
     /// 500 until restart; recovering potentially inconsistent money-path state
     /// could otherwise permit an untracked debit or compute without a debit.
     pub credit_meter: Option<Arc<std::sync::Mutex<crate::credit_meter::CreditMeterStore>>>,
+    /// Per-seat rate ceiling on LLM-enriched verdicts (M8).
+    ///
+    /// Always present, unlike `credit_meter`: the ceiling is a safety limit and
+    /// must hold whether or not billing is switched on. A daemon with the meter
+    /// off still refuses a runaway loop.
+    pub enrich_budgets: Arc<std::sync::Mutex<crate::enrich_budget::EnrichBudgets>>,
     /// G21b assembly cache over
     /// `corecrux_projections::assembly_cache::AssemblyCache` — memoizes
     /// assembled `/v1/context` bundles keyed by
@@ -996,6 +1002,11 @@ pub(crate) fn router_with_route_auth(
         .route("/v1/code-intel/liveness", get(self::traces::get_liveness))
         .route("/v1/code-intel/trace-diff", get(self::traces::get_trace_diff))
         .route("/v1/code-intel/volume", get(self::traces::get_span_volume))
+        .route("/v1/code-intel/enrich-budget", get(self::traces::get_enrich_budget))
+        .route(
+            "/v1/code-intel/enrich",
+            axum::routing::post(self::traces::post_enrich_verdict),
+        )
         .route("/v1/code-intel/releases", get(self::traces::get_releases))
         .route("/v1/code-intel/dead-code", get(self::traces::get_dead_code_ladder))
         .route("/v1/repos/{repo_id}/spatial", get(self::traces::get_repo_spatial))
