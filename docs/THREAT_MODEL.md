@@ -94,8 +94,10 @@ for the Crux Daemon.
    (`CORECRUXD_REPLICATION_AUTH_BEARER`).
 3. Prometheus metrics (`/metrics`) and health endpoints (`/healthz`, `/readyz`) are
    unauthenticated. Restrict access at the network level if exposing beyond localhost.
-4. MCP Streamable HTTP server-info discovery can remain public, but SSE stream
-   creation requires configured bearer auth when agent tokens are present.
+4. MCP Streamable HTTP requests fail closed whenever either registered bearer
+   tokens or hosted-client OAuth introspection is configured. This includes
+   server-info GET, SSE stream creation, and JSON-RPC POST; only an MCP daemon
+   with neither authentication rail configured permits anonymous access.
 5. Public `/v1/version` is redacted. Full operational version details live at
    `/v1/admin/version` behind `admin:read`.
 

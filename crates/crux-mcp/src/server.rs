@@ -28,6 +28,15 @@ use crate::sse::{RegisterError, Registration};
 const MCP_SESSION_HEADER: &str = "mcp-session-id";
 const MCP_SESSION_ID_MAX_LEN: usize = 128;
 
+/// HTTP transport state captures the authentication posture once at router
+/// construction. Tests can inject OAuth-only posture without mutating the
+/// process-wide introspector, while production uses the actual configured
+/// introspector.
+struct McpHttpState {
+    ctx: McpContext,
+    oauth_introspection_enabled: bool,
+}
+
 /// True when the request is a `tools/call` for `cuecrux_session` carrying a
 /// non-empty `intent` — the trigger that reshapes the `dynamic` surface and so
 /// warrants a `tools/list_changed` push (M3.5).
@@ -46,7 +55,14 @@ fn is_cuecrux_session_with_intent(req: &JsonRpcRequest) -> bool {
 
 /// Build the axum router with MCP endpoints.
 pub fn router(ctx: McpContext) -> axum::Router {
-    let state = Arc::new(ctx);
+    router_with_auth_posture(ctx, crate::oauth::introspection_enabled())
+}
+
+fn router_with_auth_posture(ctx: McpContext, oauth_introspection_enabled: bool) -> axum::Router {
+    let state = Arc::new(McpHttpState {
+        ctx,
+        oauth_introspection_enabled,
+    });
     axum::Router::new()
         .route("/mcp", post(handle_mcp_post))
         .route("/mcp", get(handle_mcp_get))
@@ -74,11 +90,18 @@ async fn handle_oauth_protected_resource() -> Response {
 /// daemon. **Launch default ON** — served unless `CRUX_AGENT_CARD=0`; the card
 /// describes the service only (no caller passport, no private facts), so it is
 /// safe to expose out of the box.
-async fn handle_agent_card(State(ctx): State<Arc<McpContext>>) -> Response {
+async fn handle_agent_card(State(state): State<Arc<McpHttpState>>) -> Response {
     if !agent_card_enabled() {
         return StatusCode::NOT_FOUND.into_response();
     }
-    (StatusCode::OK, Json(crate::agent_card::build_agent_card(&ctx))).into_response()
+    (
+        StatusCode::OK,
+        Json(crate::agent_card::build_agent_card_with_auth_posture(
+            &state.ctx,
+            state.oauth_introspection_enabled,
+        )),
+    )
+        .into_response()
 }
 
 /// agent-card M6: discovery-endpoint flag (`CRUX_AGENT_CARD`). Launch default
@@ -91,8 +114,9 @@ pub(crate) fn agent_card_enabled() -> bool {
 }
 
 /// `POST /mcp` — JSON-RPC 2.0 endpoint (MCP Streamable HTTP).
-async fn handle_mcp_post(State(ctx): State<Arc<McpContext>>, headers: HeaderMap, body: String) -> Response {
-    let outcome = match authenticate_agent(&ctx, &headers).await {
+async fn handle_mcp_post(State(state): State<Arc<McpHttpState>>, headers: HeaderMap, body: String) -> Response {
+    let ctx = &state.ctx;
+    let outcome = match authenticate_agent(ctx, &headers, state.oauth_introspection_enabled).await {
         Ok(outcome) => outcome,
         Err(problem) => return problem.into_response(),
     };
@@ -224,7 +248,8 @@ async fn handle_mcp_post(State(ctx): State<Arc<McpContext>>, headers: HeaderMap,
 /// - `Accept: text/event-stream` → open a server→client SSE stream for
 ///   notifications (M3.5: `tools/list_changed`), keyed by `Mcp-Session-Id`.
 /// - otherwise → static server-info discovery (unchanged).
-async fn handle_mcp_get(State(ctx): State<Arc<McpContext>>, req: axum::extract::Request) -> Response {
+async fn handle_mcp_get(State(state): State<Arc<McpHttpState>>, req: axum::extract::Request) -> Response {
+    let ctx = &state.ctx;
     let headers = req.headers();
     let peer_ip = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|ci| ci.0.ip());
     let wants_sse = headers
@@ -239,7 +264,7 @@ async fn handle_mcp_get(State(ctx): State<Arc<McpContext>>, req: axum::extract::
     // and therefore never saw the `WWW-Authenticate` challenge that tells it
     // where the Authorization Server is. Discovery has to be reachable, but the
     // challenge is the thing a probing client actually needs.
-    let auth = match authenticate_agent(&ctx, headers).await {
+    let auth = match authenticate_agent(ctx, headers, state.oauth_introspection_enabled).await {
         Ok(outcome) => outcome,
         Err(problem) => return problem.into_response(),
     };
@@ -392,12 +417,18 @@ impl AuthOutcome {
 /// Authenticate an MCP request. Order: (1) registered static agent token
 /// (unchanged legacy path), (2) hosted-client OAuth bearer via introspection
 /// (opt-in; only when configured), (3) reject unless this is a no-auth daemon.
-async fn authenticate_agent(ctx: &McpContext, headers: &HeaderMap) -> Result<AuthOutcome, UnauthorizedAgent> {
+async fn authenticate_agent(
+    ctx: &McpContext,
+    headers: &HeaderMap,
+    oauth_introspection_enabled: bool,
+) -> Result<AuthOutcome, UnauthorizedAgent> {
+    let authentication_configured =
+        crate::agent::mcp_authentication_configured(&ctx.agent_registry, oauth_introspection_enabled);
     let Some(token) = bearer_token(headers) else {
-        return if ctx.agent_registry.is_empty() {
-            Ok(AuthOutcome::Anonymous)
-        } else {
+        return if authentication_configured {
             Err(UnauthorizedAgent(AuthDenial::MissingToken))
+        } else {
+            Ok(AuthOutcome::Anonymous)
         };
     };
 
@@ -413,7 +444,7 @@ async fn authenticate_agent(ctx: &McpContext, headers: &HeaderMap) -> Result<Aut
     //    A denial here is specific (inactive / wrong scope / wrong audience) and
     //    is reported as such rather than folded into a bare 401.
     let mut oauth_denial = None;
-    if crate::oauth::introspection_enabled() {
+    if oauth_introspection_enabled {
         let token_owned = token.to_string();
         let introspection = tokio::task::spawn_blocking(move || {
             crate::oauth::shared_introspector().map(|i| i.introspect_cached(&token_owned))
@@ -438,10 +469,10 @@ async fn authenticate_agent(ctx: &McpContext, headers: &HeaderMap) -> Result<Aut
 
     // 3. Unknown bearer: anonymous only on a no-auth daemon, else refuse — with
     //    the OAuth reason when we have one, otherwise "this token is not valid".
-    if ctx.agent_registry.is_empty() && oauth_denial.is_none() {
-        Ok(AuthOutcome::Anonymous)
-    } else {
+    if authentication_configured {
         Err(UnauthorizedAgent(oauth_denial.unwrap_or(AuthDenial::InvalidToken)))
+    } else {
+        Ok(AuthOutcome::Anonymous)
     }
 }
 
@@ -591,11 +622,15 @@ mod tests {
     const TEST_AGENT_TOKEN: &str = "crux_at_0123456789abcdef01234567";
 
     fn test_app() -> axum::Router {
-        router(McpContext::new_default("test-node"))
+        router_with_auth_posture(McpContext::new_default("test-node"), false)
     }
 
     fn test_app_with_ctx(ctx: McpContext) -> axum::Router {
-        router(ctx)
+        router_with_auth_posture(ctx, false)
+    }
+
+    fn test_app_oauth_only() -> axum::Router {
+        router_with_auth_posture(McpContext::new_default("test-node"), true)
     }
 
     #[tokio::test]
@@ -817,6 +852,100 @@ mod tests {
             resp.status(),
             StatusCode::UNAUTHORIZED,
             "an unauthenticated GET must be challenged, not handed serverInfo"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_only_get_banner_requires_bearer() {
+        let resp = test_app_oauth_only()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/mcp")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "OAuth-only MCP must not expose authenticated discovery anonymously"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_only_sse_requires_bearer() {
+        let session_id = "oauth-only-missing-bearer";
+        let resp = test_app_oauth_only()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/mcp")
+                    .header("accept", "text/event-stream")
+                    .header("mcp-session-id", session_id)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(!crate::sse::is_registered(session_id));
+    }
+
+    #[tokio::test]
+    async fn oauth_only_post_requires_bearer() {
+        let body = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "store_fact",
+                "arguments": {
+                    "entity": "test:oauth-only",
+                    "key": "must-not-write",
+                    "value": "blocked"
+                }
+            }
+        }))
+        .unwrap();
+        let resp = test_app_oauth_only()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "OAuth-only MCP must challenge before the full dispatcher"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_only_unknown_bearer_is_invalid_token() {
+        let resp = test_app_oauth_only()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/mcp")
+                    .header("authorization", "Bearer unknown-oauth-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(
+            body["error"], "invalid_token",
+            "OAuth availability or token validation failures must never fall back to anonymous"
         );
     }
 

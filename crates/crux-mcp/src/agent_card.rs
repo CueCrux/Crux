@@ -75,22 +75,28 @@ pub struct AgentSkill {
 ///
 /// [`CORE_FLOOR`]: crate::tools::surface::CORE_FLOOR
 pub fn build_agent_card(ctx: &McpContext) -> AgentCard {
-    let auth_required = !ctx.agent_registry.is_empty();
-    let oauth = crate::oauth::introspection_enabled();
+    build_agent_card_with_auth_posture(ctx, crate::oauth::introspection_enabled())
+}
+
+pub(crate) fn build_agent_card_with_auth_posture(ctx: &McpContext, oauth: bool) -> AgentCard {
+    let static_bearer = !ctx.agent_registry.is_empty();
+    let auth_required = crate::agent::mcp_authentication_configured(&ctx.agent_registry, oauth);
 
     let mut modes = Vec::new();
-    if auth_required {
+    if static_bearer {
         modes.push("bearer-token".to_string());
     }
     if oauth {
         modes.push("oauth2".to_string());
     }
-    let scheme = if !auth_required {
-        "none"
-    } else if oauth {
+    let scheme = if static_bearer && oauth {
         "oauth2+bearer"
-    } else {
+    } else if oauth {
+        "oauth2"
+    } else if static_bearer {
         "bearer"
+    } else {
+        "none"
     }
     .to_string();
 
@@ -152,7 +158,7 @@ mod tests {
     #[test]
     fn card_no_auth_when_registry_empty() {
         let ctx = McpContext::new_default("node-x");
-        let card = build_agent_card(&ctx);
+        let card = build_agent_card_with_auth_posture(&ctx, false);
         assert_eq!(card.schema, AGENT_CARD_SCHEMA);
         assert_eq!(card.provider, "CueCrux");
         assert!(card.name.contains("node-x"));
@@ -168,16 +174,35 @@ mod tests {
     fn card_requires_bearer_when_registry_nonempty() {
         let mut ctx = McpContext::new_default("node-y");
         ctx.agent_registry = AgentRegistry::from_single_token("crux_at_0123456789abcdef01234567");
-        let card = build_agent_card(&ctx);
+        let card = build_agent_card_with_auth_posture(&ctx, false);
         assert!(card.authentication.required);
         assert_eq!(card.authentication.scheme, "bearer");
         assert!(card.authentication.modes.contains(&"bearer-token".to_string()));
     }
 
     #[test]
+    fn card_requires_oauth_when_registry_empty() {
+        let ctx = McpContext::new_default("node-oauth");
+        let card = build_agent_card_with_auth_posture(&ctx, true);
+        assert!(card.authentication.required);
+        assert_eq!(card.authentication.scheme, "oauth2");
+        assert_eq!(card.authentication.modes, vec!["oauth2"]);
+    }
+
+    #[test]
+    fn card_advertises_both_authentication_rails() {
+        let mut ctx = McpContext::new_default("node-both");
+        ctx.agent_registry = AgentRegistry::from_single_token("crux_at_0123456789abcdef01234567");
+        let card = build_agent_card_with_auth_posture(&ctx, true);
+        assert!(card.authentication.required);
+        assert_eq!(card.authentication.scheme, "oauth2+bearer");
+        assert_eq!(card.authentication.modes, vec!["bearer-token", "oauth2"]);
+    }
+
+    #[test]
     fn card_advertises_http_when_base_url_set() {
         let ctx = McpContext::new_default("n").with_daemon_base_url("http://127.0.0.1:14800");
-        let card = build_agent_card(&ctx);
+        let card = build_agent_card_with_auth_posture(&ctx, false);
         assert!(card.access.protocols.contains(&"http".to_string()));
         assert_eq!(card.access.base_url.as_deref(), Some("http://127.0.0.1:14800"));
     }
@@ -185,7 +210,7 @@ mod tests {
     #[test]
     fn card_serializes_camelcase_and_omits_empty_tags() {
         let ctx = McpContext::new_default("n");
-        let v = serde_json::to_value(build_agent_card(&ctx)).unwrap();
+        let v = serde_json::to_value(build_agent_card_with_auth_posture(&ctx, false)).unwrap();
         assert!(v.get("schema").is_some());
         assert!(v["access"].get("wellKnown").is_some(), "camelCase wellKnown");
         assert!(v.get("authentication").is_some());

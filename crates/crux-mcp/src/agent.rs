@@ -193,6 +193,15 @@ impl AgentRegistry {
     }
 }
 
+/// Return whether the MCP transport has any authentication rail configured.
+///
+/// This predicate is shared by request authentication, discovery metadata, and
+/// daemon bind validation so OAuth-only deployments cannot accidentally be
+/// treated as anonymous merely because the static-token registry is empty.
+pub fn mcp_authentication_configured(agent_registry: &AgentRegistry, oauth_introspection_enabled: bool) -> bool {
+    !agent_registry.is_empty() || oauth_introspection_enabled
+}
+
 fn is_safe_agent_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_AGENT_NAME_BYTES
@@ -252,6 +261,17 @@ mod tests {
         assert!(AgentRegistry::from_single_token("contains whitespace 0123456789abcdef").is_empty());
         assert!(AgentRegistry::from_single_token("contains:colon:0123456789abcdef").is_empty());
         assert_eq!(AgentRegistry::from_single_token(TOKEN_A).len(), 1);
+    }
+
+    #[test]
+    fn mcp_authentication_configured_covers_both_authentication_rails() {
+        let empty = AgentRegistry::empty();
+        let static_bearer = AgentRegistry::from_single_token(TOKEN_A);
+
+        assert!(!mcp_authentication_configured(&empty, false));
+        assert!(mcp_authentication_configured(&static_bearer, false));
+        assert!(mcp_authentication_configured(&empty, true));
+        assert!(mcp_authentication_configured(&static_bearer, true));
     }
 
     fn clear_agent_token_env() {

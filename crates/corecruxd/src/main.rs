@@ -346,10 +346,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         replication_auth_bearer_configured(),
     )
     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let mcp_auth_configured =
+        crux_mcp::agent::mcp_authentication_configured(&mcp_agent_registry, crux_mcp::oauth::introspection_enabled());
     validate_mcp_bind_posture(
         config.mcp_enabled,
         config.mcp_addr,
-        mcp_agent_registry.is_empty(),
+        mcp_auth_configured,
         insecure_dev_auth_bind_allowed(),
     )
     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -2135,15 +2137,15 @@ fn validate_network_auth_posture(
 fn validate_mcp_bind_posture(
     mcp_enabled: bool,
     mcp_addr: SocketAddr,
-    agent_registry_empty: bool,
+    authentication_configured: bool,
     allow_insecure_dev_auth_bind: bool,
 ) -> Result<(), String> {
-    if !mcp_enabled || mcp_addr.ip().is_loopback() || !agent_registry_empty || allow_insecure_dev_auth_bind {
+    if !mcp_enabled || mcp_addr.ip().is_loopback() || authentication_configured || allow_insecure_dev_auth_bind {
         return Ok(());
     }
 
     Err(format!(
-        "MCP may not bind to non-loopback address ({mcp_addr}) without CRUX_AGENT_TOKEN/CRUX_AGENT_TOKENS or CORECRUXD_ALLOW_INSECURE_DEV_AUTH_BIND=1"
+        "MCP may not bind to non-loopback address ({mcp_addr}) without CRUX_AGENT_TOKEN/CRUX_AGENT_TOKENS, OAuth introspection, or CORECRUXD_ALLOW_INSECURE_DEV_AUTH_BIND=1"
     ))
 }
 
@@ -3176,10 +3178,10 @@ mod tests {
         let err = validate_mcp_bind_posture(
             true,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 14801),
-            true,
+            false,
             false,
         )
-        .expect_err("non-loopback MCP without tokens should fail");
+        .expect_err("non-loopback MCP without authentication should fail");
         assert!(err.contains("CRUX_AGENT_TOKEN"));
     }
 
@@ -3188,10 +3190,21 @@ mod tests {
         validate_mcp_bind_posture(
             true,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 14801),
-            false,
+            true,
             false,
         )
-        .expect("configured MCP tokens should allow non-loopback bind");
+        .expect("configured MCP authentication should allow non-loopback bind");
+    }
+
+    #[test]
+    fn mcp_non_loopback_with_oauth_is_ok() {
+        validate_mcp_bind_posture(
+            true,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 14801),
+            true,
+            false,
+        )
+        .expect("configured OAuth introspection should allow non-loopback bind");
     }
 
     #[test]
@@ -3199,7 +3212,7 @@ mod tests {
         validate_mcp_bind_posture(
             false,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 14801),
-            true,
+            false,
             false,
         )
         .expect("disabled MCP should skip validation");
