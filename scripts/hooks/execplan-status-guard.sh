@@ -96,8 +96,14 @@ main() {
   # shape (work_execplans.rs: "only the leading Status token is authoritative").
   local val
   val="$(sed -E 's/^[[:space:]]*[Ss][Tt][Aa][Tt][Uu][Ss]:[[:space:]]*//' <<<"$line")"
+  # Terminal leading tokens, mirroring declared_status()'s Complete/Archived/
+  # Parked/Superseded arms (work_execplans.rs:457-476). The daemon's list is the
+  # authority: a plan the board already shows as `complete` must not nag here.
+  # `code-complete` is NOT matched by `complete*` — it was the omission that
+  # false-positived a plan the daemon had correctly derived as complete.
   case "${val,,}" in
-    complete*|completed*|superseded*|archived*|parked*|done*) exit 0 ;;
+    code-complete*|complete*|completed*|superseded*|archived*|parked*|done*) exit 0 ;;
+    deployed*|shipped*|landed*|merged*) exit 0 ;;
   esac
 
   line="$(sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' <<<"$line")"
@@ -112,6 +118,10 @@ self_test() {
   printf '# Fix widget\n\nStatus: In progress\n' >"$tmp/inprog.md"
   printf '# Fix widget\n\nStatus: Complete\n'    >"$tmp/donefile.md"
   printf '# Fix widget\n\nStatus: In progress (design complete; deploy human-gated)\n' >"$tmp/trailer.md"
+  # Terminal to the daemon (declared_status maps code-complete -> Complete) but
+  # not matched by `complete*`; this is the case that false-positived in the wild.
+  printf '# Fix widget\n\nStatus: Code-complete — done on branch foo, unmerged\n' >"$tmp/codecomplete.md"
+  printf '# Fix widget\n\nStatus: Shipped\n' >"$tmp/shipped.md"
 
   local fails=0
   check() { # name expected payload
@@ -129,6 +139,10 @@ self_test() {
     '{"tool_name":"mcp__crux__store_fact","tool_input":{"entity":"bench:foo","key":"decision:close","value":{"status":"done"}}}'
   check "e: 'complete' in trailer, leading token In progress -> 2" 2 \
     '{"tool_name":"mcp__crux__store_fact","tool_input":{"entity":"execplan:trailer","key":"decision:close","value":{"status":"done"}}}'
+  check "f: Code-complete is terminal to the daemon -> 0" 0 \
+    '{"tool_name":"mcp__crux__store_fact","tool_input":{"entity":"execplan:codecomplete","key":"decision:close","value":{"status":"done"}}}'
+  check "g: Shipped is terminal to the daemon -> 0" 0 \
+    '{"tool_name":"mcp__crux__store_fact","tool_input":{"entity":"execplan:shipped","key":"decision:close","value":{"status":"done"}}}'
 
   [[ $fails -eq 0 ]] && echo "SELF-TEST PASS" || { echo "SELF-TEST FAIL ($fails)"; return 1; }
 }
