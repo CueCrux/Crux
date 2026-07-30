@@ -84,6 +84,36 @@ pub fn aggregate(inputs: Vec<RepoScan>) -> WorkspaceScan {
         out.dead_code.extend(scan.dead_code);
     }
 
+    // Each repo's `dead_code` was computed against that repo alone, so a symbol
+    // defined in repo A and called only from repo B arrives here still flagged.
+    // Carrying those verdicts forward verbatim would emit a *wrong* answer under
+    // an `aggregate: true` badge, which is worse than the single-repo answer that
+    // at least does not claim to have looked across the estate. Someone acting on
+    // it deletes live code.
+    //
+    // Aggregation can only ever add callers, so it can only ever make a symbol
+    // less dead — the filter is one-directional by construction and can never
+    // introduce a new dead verdict.
+    let referenced: std::collections::HashSet<&str> = out
+        .files
+        .iter()
+        .flat_map(|f| f.references.iter())
+        .map(|r| r.to_symbol.as_str())
+        .collect();
+    let live_after_aggregation: Vec<String> = out
+        .dead_code
+        .iter()
+        .filter(|d| referenced.contains(d.name.as_str()))
+        .map(|d| d.name.clone())
+        .collect();
+    out.dead_code.retain(|d| !referenced.contains(d.name.as_str()));
+    if !live_after_aggregation.is_empty() {
+        tracing::debug!(
+            cleared = live_after_aggregation.len(),
+            "aggregation cleared dead-code verdicts that a sibling repo references"
+        );
+    }
+
     out
 }
 
@@ -230,6 +260,82 @@ mod tests {
         assert!(
             crossed_json.contains("repo-b/src/service.rs"),
             "and must say which repo it is in: {crossed_json}"
+        );
+    }
+
+    fn dead(file: &str, name: &str) -> crate::workspace_scan::DeadSymbol {
+        crate::workspace_scan::DeadSymbol {
+            crate_name: "c".into(),
+            module_path: "m".into(),
+            file_rel_path: file.into(),
+            line: 1,
+            kind: "fn".into(),
+            name: name.into(),
+            confidence: 0.9,
+            note: "no internal references".into(),
+        }
+    }
+
+    /// The highest-stakes aggregate on this surface, and the one #564 got wrong.
+    ///
+    /// repo-a defines `shared_fn` and, seeing no caller of its own, its scanner
+    /// flags it dead. repo-b calls it. `aggregate` used to `extend` the dead lists
+    /// verbatim, so the verdict survived aggregation and the API returned "dead"
+    /// under an `aggregate: true` badge — a wrong answer that reads as more
+    /// authoritative than the single-repo one. Someone acting on it deletes live
+    /// code.
+    #[test]
+    fn aggregation_clears_a_dead_verdict_a_sibling_repo_disproves() {
+        let a = scan_with(vec![], vec![sym("src/lib.rs", "shared_fn")]);
+        let mut a = a;
+        a.dead_code = vec![dead("src/lib.rs", "shared_fn")];
+        let b = scan_with(vec![file_with_ref("src/service.rs", "shared_fn", "b_handler")], vec![]);
+
+        // Single-repo: the verdict stands, because repo-a genuinely has no caller.
+        assert_eq!(a.dead_code.len(), 1, "precondition: repo-a flags it dead alone");
+
+        let agg = aggregate(vec![
+            RepoScan {
+                repo_id: "repo-a".into(),
+                scan: a,
+            },
+            RepoScan {
+                repo_id: "repo-b".into(),
+                scan: b,
+            },
+        ]);
+        assert!(
+            agg.dead_code.iter().all(|d| d.name != "shared_fn"),
+            "aggregation must clear a dead verdict that a sibling repo disproves, got {:?}",
+            agg.dead_code.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// The filter is one-directional: a symbol nothing references stays dead.
+    /// Without this, the test above would pass against an `aggregate` that simply
+    /// dropped every dead verdict.
+    #[test]
+    fn aggregation_keeps_a_dead_verdict_no_repo_disproves() {
+        let mut a = scan_with(vec![], vec![sym("src/lib.rs", "truly_dead")]);
+        a.dead_code = vec![dead("src/lib.rs", "truly_dead")];
+        let b = scan_with(
+            vec![file_with_ref("src/service.rs", "something_else", "b_handler")],
+            vec![],
+        );
+
+        let agg = aggregate(vec![
+            RepoScan {
+                repo_id: "repo-a".into(),
+                scan: a,
+            },
+            RepoScan {
+                repo_id: "repo-b".into(),
+                scan: b,
+            },
+        ]);
+        assert!(
+            agg.dead_code.iter().any(|d| d.name == "truly_dead"),
+            "aggregation must not launder a genuine dead verdict into life"
         );
     }
 
