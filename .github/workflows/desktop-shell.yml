@@ -204,6 +204,13 @@ jobs:
   #    must not gate the merge queue — but unlike the Linux jobs it can catch a
   #    Windows-only regression (dbb3897 fixed three that no Linux runner could
   #    see, and noted there was no Windows job to catch the next one).
+  #    KEEP EVERY `run:` BLOCK BELOW PURE ASCII. `shell: powershell` is Windows
+  #    PowerShell 5.1, which reads a BOM-less script as ANSI, not UTF-8. An em
+  #    dash (U+2014, `e2 80 94`) then decodes under CP1252 as `a-hat`, `euro`,
+  #    U+201D — and U+201D is a right *smart quote*, which PowerShell honours as
+  #    a string delimiter. One em dash inside a message string opens a string
+  #    that never closes: `TerminatorExpectedAtEndOfString`, before a single line
+  #    executes. YAML comments and step names are fine; only `run:` bodies parse.
   windows-gui-smoke:
     name: desktop GUI smoke (windows, interactive session)
     needs: changes
@@ -254,7 +261,7 @@ jobs:
           }
           $link = Get-ChildItem 'C:\Program Files*\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\x64\link.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
           Write-Host "MSVC link.exe     : $(if ($link) { $link.FullName } else { 'MISSING' })"
-          if (-not $link) { $fail += 'MSVC link.exe not found — install Visual Studio Build Tools 2022 with the VCTools workload' }
+          if (-not $link) { $fail += 'MSVC link.exe not found -- install Visual Studio Build Tools 2022 with the VCTools workload' }
 
           $wvKeys = @(
             'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}',
@@ -267,7 +274,7 @@ jobs:
 
           if ($fail.Count) {
             foreach ($f in $fail) { Write-Host "::error::$f" }
-            Write-Host "::error::Provision this runner with scripts/provision-windows-gui-runner.ps1 — see docs/self-hosted-runner.md."
+            Write-Host "::error::Provision this runner with scripts/provision-windows-gui-runner.ps1 -- see docs/self-hosted-runner.md."
             exit 1
           }
           Write-Host 'preflight OK: interactive desktop with a full Windows build toolchain'
@@ -309,7 +316,7 @@ jobs:
           Write-Host "msiexec exit: $($p.ExitCode)"
           # 0 = installed, 3010 = installed, reboot queued
           if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
-            Write-Host "::error::MSI install failed with exit $($p.ExitCode) — see the msi-install.log artifact"
+            Write-Host "::error::MSI install failed with exit $($p.ExitCode) -- see the msi-install.log artifact"
             exit 1
           }
           $exe = Get-ChildItem 'C:\Program Files\Crux\Crux.exe', 'C:\Program Files (x86)\Crux\Crux.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -325,7 +332,7 @@ jobs:
           Get-ChildItem $dir | Format-Table Name, Length -AutoSize
           # The bundled sidecar must ship beside the app, de-tripled.
           if (-not (Test-Path (Join-Path $dir 'corecruxd.exe'))) {
-            Write-Host '::error::corecruxd.exe is missing from the install dir — the externalBin sidecar was not bundled'
+            Write-Host '::error::corecruxd.exe is missing from the install dir -- the externalBin sidecar was not bundled'
             exit 1
           }
           "$($exe.FullName)" | Out-File "$env:GITHUB_WORKSPACE\windows-gui-evidence\installed-exe.txt" -Encoding ascii
@@ -375,7 +382,7 @@ jobs:
           Write-Host "main window title     : $(if ($window) { $window } else { 'NONE' })"
           if (-not $window) { $fail += 'no top-level window appeared (setup_shell builds the main window with visible:true)' }
           Write-Host "msedgewebview2 procs  : $($webview.Count)"
-          if (-not $webview.Count) { $fail += 'no msedgewebview2 process — the WebView2 host never started, so nothing rendered' }
+          if (-not $webview.Count) { $fail += 'no msedgewebview2 process -- the WebView2 host never started, so nothing rendered' }
           Write-Host "corecruxd sidecar     : $($sidecar.Count)"
           if (-not $sidecar.Count) { $fail += 'the bundled corecruxd sidecar was never spawned (default profile is bundled on a fresh box)' }
 
@@ -408,7 +415,7 @@ jobs:
           $orphans = @(Get-Process corecruxd -ErrorAction SilentlyContinue)
           Write-Host "corecruxd after exit: $($orphans.Count)"
           if ($orphans.Count) {
-            Write-Host '::error::the bundled corecruxd survived a graceful app exit — the lifecycle supervisor leaked a sidecar'
+            Write-Host '::error::the bundled corecruxd survived a graceful app exit -- the lifecycle supervisor leaked a sidecar'
             exit 1
           }
           Write-Host 'lifecycle OK: graceful close reaped the bundled sidecar'

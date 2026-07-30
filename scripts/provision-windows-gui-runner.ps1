@@ -1,7 +1,7 @@
 # Copyright (c) 2026 CueCrux Ltd.
 # Licensed under the Apache License, Version 2.0.
 #
-# provision-windows-gui-runner.ps1 — bootstrap a GUI-capable GitHub Actions
+# provision-windows-gui-runner.ps1 -- bootstrap a GUI-capable GitHub Actions
 # runner (the `[self-hosted, windows-gui]` labels) for the desktop shell's
 # Windows smoke lane in `.github/workflows/desktop-shell.yml`.
 #
@@ -15,7 +15,7 @@
 #   two configurations that otherwise look fine:
 #
 #     1. Server Core. There is no `explorer.exe` at all, and Core CANNOT be
-#        converted to Desktop Experience — that switch was removed after Server
+#        converted to Desktop Experience -- that switch was removed after Server
 #        2012 R2. It is a reinstall. Install image index 2 ("... Desktop
 #        Experience"), not index 1.
 #     2. A runner running as a Windows *service*, or as a scheduled task
@@ -71,7 +71,7 @@ Log "InstallationType = $installType"
 if ($installType -eq 'Server Core' -or -not (Test-Path 'C:\Windows\explorer.exe')) {
     Die @'
 This image is Server Core (no explorer.exe). Server Core cannot be converted to
-Desktop Experience — it is a reinstall. Rebuild the VM from install image
+Desktop Experience -- it is a reinstall. Rebuild the VM from install image
 INDEX 2 ("Windows Server 20xx ... Desktop Experience"); index 1 is Core.
 See docs/self-hosted-runner.md.
 '@
@@ -101,7 +101,7 @@ else {
 }
 
 # --------------------------------------------------------------------------
-# 2. never lock, blank, or sleep — a lock screen breaks GUI tests and
+# 2. never lock, blank, or sleep -- a lock screen breaks GUI tests and
 #    screenshots just as thoroughly as having no desktop at all
 # --------------------------------------------------------------------------
 $pol = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
@@ -134,7 +134,7 @@ Ok 'Server Manager and firewall notification popups suppressed'
 
 # --------------------------------------------------------------------------
 # 4. pre-assert the daemon's firewall rules
-#    This asserts RULE STATE. It does not test prompt behaviour — that remains a
+#    This asserts RULE STATE. It does not test prompt behaviour -- that remains a
 #    one-off human observation on a clean box.
 # --------------------------------------------------------------------------
 foreach ($r in @(@{ n = 'Crux corecruxd HTTP 14800'; p = 14800 }, @{ n = 'Crux corecruxd gRPC 14801'; p = 14801 })) {
@@ -192,7 +192,7 @@ if (Test-Path $vswhere) {
     $haveVc = [bool](& $vswhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
 }
 if (-not $haveVc) {
-    Log 'installing Visual Studio Build Tools 2022 (VCTools) — 10-20 min'
+    Log 'installing Visual Studio Build Tools 2022 (VCTools) -- 10-20 min'
     $vsExe = Join-Path $env:TEMP 'vs_BuildTools.exe'
     Invoke-WebRequest 'https://aka.ms/vs/17/release/vs_BuildTools.exe' -OutFile $vsExe -UseBasicParsing
     $p = Start-Process $vsExe -Wait -PassThru -ArgumentList @(
@@ -224,7 +224,7 @@ if (-not (Test-Path "$cargoBin\cargo-tauri.exe")) { Die 'cargo-tauri missing aft
 Ok "cargo-tauri: $(& "$cargoBin\cargo.exe" tauri --version)"
 
 # --------------------------------------------------------------------------
-# 6. the runner itself — interactive, NOT a service
+# 6. the runner itself -- interactive, NOT a service
 # --------------------------------------------------------------------------
 if (-not $RunnerToken) {
     Warn 'no -RunnerToken given; desktop and toolchain are ready but no runner was registered'
@@ -248,7 +248,7 @@ if (-not (Test-Path (Join-Path $RunnerDir 'config.cmd'))) {
 # Session 0, so every GUI assertion in the workflow would fail there.
 $svc = Get-CimInstance Win32_Service | Where-Object { $_.Name -match 'actions\.runner' }
 if ($svc) {
-    Warn "removing runner service $($svc.Name) — a service has no desktop"
+    Warn "removing runner service $($svc.Name) -- a service has no desktop"
     Push-Location $RunnerDir; & .\svc.cmd uninstall; Pop-Location
 }
 
@@ -290,7 +290,7 @@ if (-not $listener) { Die "Runner.Listener never started; check $RunnerDir\_diag
 $explorerSession = (Get-Process explorer -ErrorAction SilentlyContinue | Select-Object -First 1).SessionId
 Log "Runner.Listener session = $($listener.SessionId); explorer session = $explorerSession"
 if ($listener.SessionId -eq 0) {
-    Die 'Runner.Listener is in Session 0 — it has no desktop. Check that the task principal LogonType is Interactive and that autologon actually logged the user in.'
+    Die 'Runner.Listener is in Session 0 -- it has no desktop. Check that the task principal LogonType is Interactive and that autologon actually logged the user in.'
 }
 Ok "runner is live in interactive session $($listener.SessionId)"
 Ok 'provisioning complete'
