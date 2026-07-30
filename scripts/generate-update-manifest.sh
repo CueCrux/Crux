@@ -15,6 +15,10 @@
 set -euo pipefail
 
 TAG="${1:?usage: generate-update-manifest.sh vX.Y.Z}"
+if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+  echo "ERROR: release tag must be canonical vMAJOR.MINOR.PATCH (got: $TAG)" >&2
+  exit 64
+fi
 REPO="CueCrux/Crux"
 VERSION="${TAG#v}"
 BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
@@ -50,6 +54,8 @@ for suffix in "${SUFFIXES[@]}"; do
   # produced before the basename collision hardening.
   sha="$(awk -v f="$asset_name" '$2 == f || $2 == "*"f || $2 == "./"f {print $1}' "${WORK}/${manifest}")"
   [ -n "$sha" ] || { echo "ERROR: ${asset_name} not found in ${manifest}" >&2; exit 1; }
+  [[ "$sha" =~ ^[0-9a-fA-F]{64}$ ]] \
+    || { echo "ERROR: ${asset_name} has a non-SHA-256 digest in ${manifest}" >&2; exit 1; }
   artifacts="$(jq -c --arg n "$name" --arg a "$asset_name" --arg s "$sha" '. + [{name:$n, asset_name:$a, sha256:$s}]' <<<"$artifacts")"
 done
 

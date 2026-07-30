@@ -58,6 +58,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Standalone self-update now authenticates its manifest before trusting it.**
+  `crux self update` resolves an immutable release tag, bounds the manifest and
+  Sigstore bundle, and requires `cosign verify-blob` with the exact CueCrux
+  release-workflow identity and GitHub Actions issuer before JSON parsing.
+  Schema, tag/version, artifact mapping, and SHA-256 fields then receive strict
+  validation. Releases publish and self-verify a standard bundle with patched
+  Cosign 2.6.2; missing tooling or proof fails closed.
+
 - **A cold `cargo build` now completes on native Windows.** Three unrelated
   stops, none of which CI can see (every runner is Linux, and the release matrix
   is Linux + macOS — both unix):

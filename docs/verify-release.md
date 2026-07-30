@@ -45,6 +45,21 @@ Expected output: `Verified OK`. Repeat for `crux-<target>`,
 `corecruxctl-<target>`, `crux-hook-<target>`, the SBOM and the manifest (same
 flags, different filenames).
 
+For `update-manifest.json`, prefer the complete bundle published beside it:
+
+```bash
+cosign verify-blob \
+  --new-bundle-format=true \
+  --bundle update-manifest.json.sigstore.json \
+  --certificate-identity "https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/${TAG}" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  update-manifest.json
+```
+
+Use patched Cosign 2.6.2, 3.0.4, or a later compatible release. Crux's
+standalone updater requires this bundle and fails closed before parsing the
+manifest if verification cannot run.
+
 Before running the installer, verify `install.sh` with the same command and
 workflow identity, using `install.sh.pem` and `install.sh.sig`.
 

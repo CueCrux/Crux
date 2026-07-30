@@ -344,7 +344,7 @@ jobs:
               exit 1
             }
 
-          for asset in multiple.intoto.jsonl update-manifest.json; do
+          for asset in multiple.intoto.jsonl update-manifest.json update-manifest.json.sigstore.json; do
             jq -e --arg asset "$asset" \
               'any(.assets[]; .name == $asset)' <<<"$release" >/dev/null || {
                 echo "::error::Accepted release is missing required asset: $asset"
@@ -354,7 +354,7 @@ jobs:
 
           accepted_tags="$(gh api --paginate \
             "repos/$REPOSITORY/releases?per_page=100" \
-            --jq '.[] | select(.draft == false and .prerelease == false) | select(any(.assets[]; .name == "multiple.intoto.jsonl")) | select(any(.assets[]; .name == "update-manifest.json")) | .tag_name')"
+            --jq '.[] | select(.draft == false and .prerelease == false) | select(any(.assets[]; .name == "multiple.intoto.jsonl")) | select(any(.assets[]; .name == "update-manifest.json")) | select(any(.assets[]; .name == "update-manifest.json.sigstore.json")) | .tag_name')"
           highest_accepted="$(
             while IFS= read -r tag; do
               if [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
@@ -423,7 +423,7 @@ jobs:
           # completing while signature verification was in progress.
           accepted_tags="$(gh api --paginate \
             "repos/$REPOSITORY/releases?per_page=100" \
-            --jq '.[] | select(.draft == false and .prerelease == false) | select(any(.assets[]; .name == "multiple.intoto.jsonl")) | select(any(.assets[]; .name == "update-manifest.json")) | .tag_name')"
+            --jq '.[] | select(.draft == false and .prerelease == false) | select(any(.assets[]; .name == "multiple.intoto.jsonl")) | select(any(.assets[]; .name == "update-manifest.json")) | select(any(.assets[]; .name == "update-manifest.json.sigstore.json")) | .tag_name')"
           highest_accepted="$(
             while IFS= read -r tag; do
               if [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then

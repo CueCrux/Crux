@@ -101,6 +101,7 @@ vaultcrux-local = { path = "../vaultcrux-local" }
 
 wasmtime = { version = "47", default-features = false, features = ["cranelift", "runtime"], optional = true }
 sha2 = { workspace = true }
+tempfile = { workspace = true }
 # Witness (Track W / G1): Sigstore Rekor's hashedrekord verification requires
 # ECDSA P-256 (the daemon seal key is Ed25519), so the witness signs entries
 # with a dedicated P-256 key. Already a workspace dep via corecrux-receipts.
@@ -122,7 +123,6 @@ tree-sitter-php = "=0.24.2"
 corecrux-index = { path = "../corecrux-index" }
 rcgen = { workspace = true }
 serial_test = { workspace = true }
-tempfile = { workspace = true }
 wat = "1"
 
 [build-dependencies]

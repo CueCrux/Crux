@@ -118,6 +118,39 @@ require_marker ".github/workflows/release.yml" \
   'package-daemon-release.sh has already staged install.sh before generating'
 require_marker ".github/workflows/release.yml" \
   'bash scripts/assert-release-asset-basenames.sh dist'
+require_marker ".github/workflows/release.yml" \
+  "cosign-release: 'v2.6.2'"
+require_marker ".github/workflows/release.yml" \
+  '--bundle update-manifest.json.sigstore.json'
+require_marker ".github/workflows/release.yml" \
+  '--new-bundle-format=true'
+require_marker ".github/workflows/release.yml" \
+  '--certificate-identity "https://github.com/CueCrux/Crux/.github/workflows/release.yml@refs/tags/${GITHUB_REF_NAME}"'
+require_marker ".github/workflows/release.yml" \
+  '--certificate-oidc-issuer "https://token.actions.githubusercontent.com"'
+require_marker ".github/workflows/release.yml" \
+  'update-manifest.json.sigstore.json'
+require_marker ".github/workflows/docker.yml" \
+  'update-manifest.json.sigstore.json'
+
+release_workflow="$root/.github/workflows/release.yml"
+docker_workflow="$root/.github/workflows/docker.yml"
+if grep -Fq -- "cosign-release: 'v2.4.3'" "$release_workflow"; then
+  echo "release workflow retains vulnerable cosign 2.4.3" >&2
+  exit 1
+fi
+if [[ "$(grep -Fc -- "cosign-release: 'v2.6.2'" "$release_workflow")" -ne 2 ]]; then
+  echo "release workflow must pin both cosign installations to 2.6.2" >&2
+  exit 1
+fi
+if [[ "$(grep -Fc -- '--new-bundle-format=true' "$release_workflow")" -lt 2 ]]; then
+  echo "release workflow must generate and verify the new Sigstore bundle format" >&2
+  exit 1
+fi
+if [[ "$(grep -Fc -- 'update-manifest.json.sigstore.json' "$docker_workflow")" -lt 3 ]]; then
+  echo "Docker acceptance must require the update-manifest bundle at every monotonicity check" >&2
+  exit 1
+fi
 
 basename_fixture="$(mktemp -d)"
 mkdir -p "$basename_fixture/a" "$basename_fixture/b"
