@@ -4,9 +4,9 @@
 # `main` merge-queue ruleset
 
 `merge-queue-ruleset.json` is the versioned source of truth for the GitHub
-**merge queue** on `main`. It is **not applied automatically** — it is committed
-here for review and reproducibility. Enabling the queue (a gated cutover) is a
-separate, deliberate step.
+**merge queue and runner-policy merge guard** on `main`. It is **not applied
+automatically** — it is committed here for review and reproducibility. Applying
+or updating it is a separate, deliberate human-gated step.
 
 Full rationale, rollback, and milestone gates: ExecPlan
 `crux-ci-merge-queue-wiring-2026-06-26` (in `PlanCrux/.agent/execplans/`).
@@ -17,6 +17,31 @@ Tests the *speculative combined state* of stacked PRs ahead of time and merges
 them as a train, so PRs no longer have to re-test against `main` every time
 another PR lands. It replaces the `strict` ("require branches up to date")
 retest tax with an equivalent, parallelised guarantee.
+
+It also has no configured bypass actors, requires one code-owner approval from
+someone other than the last pusher, and requires the trusted
+`Workflow runner policy` check. The check runs from the default-branch
+implementation and treats the candidate tree only as data.
+
+## Runner-policy bootstrap order
+
+Do not add the required status context before the workflow has landed: the
+first PR cannot run a `pull_request_target` workflow that does not yet exist on
+its base branch.
+
+1. Restrict the persistent runner group to the three selected workflows pinned
+   to `refs/heads/main` (see `docs/self-hosted-runner.md`).
+2. Merge the initial runner-policy workflow/checker with existing protections
+   and explicit code-owner review.
+3. Confirm the push-to-main `Workflow runner policy` run succeeds.
+4. Apply/update this ruleset and confirm `bypass_actors` remains empty.
+5. Open a test PR and verify the check is required; then try deleting or
+   neutralising the policy workflow and confirm the trusted check fails.
+
+Any other protected long-lived base branch must carry the same trusted
+workflow and an equivalent required-check/ruleset. Otherwise do not accept PRs
+to that branch. The selected-workflow runner-group restriction remains the
+runtime boundary even when a merge guard is absent.
 
 ## Apply / inspect / disable (do not run without the M3 human gate)
 
@@ -50,28 +75,27 @@ gh api -X DELETE repos/CueCrux/Crux/rulesets/<id>
 
 ## Runner load (why `max_entries_to_build: 2`)
 
-All required-check jobs run on the finite self-hosted `[self-hosted, ci]` pool.
-A single **code-change** queue build fans out to ~9 non-trivial self-hosted jobs:
+All PR and merge-queue required checks now run on disposable GitHub-hosted
+workers. A single **code-change** queue build fans out to about 10 non-trivial
+jobs:
 
 - `ci.yml` — Lint, Test, MSRV, Coverage (4)
 - `docs.yml` — Build rustdoc (1; the Pages-deploy job is push+main-only and is skipped)
 - `audit.yml` — Cargo deny policy, Cargo audit, Licence check (3)
 - `semver.yml` — Semver Compatibility (1)
 
-With `max_entries_to_build: 2`, the queue demands **at most ~18 self-hosted
-jobs concurrently** — on top of any in-flight PR/push CI. This pool has a
-history of saturation/disk incidents, so the cap stays at 2 until headroom data
-(M3/M4) justifies raising it. Bump deliberately, one step at a time, watching
-concurrent-run counts.
+With `max_entries_to_build: 2`, the queue requests at most about 20 hosted jobs
+concurrently, on top of in-flight PR/push CI. Keep the cap at 2 until duration,
+hosted concurrency, and cost data justify raising it.
 
 ## Required checks the queue waits on
 
 Every one of these must fire on the `merge_group` event or the queue hangs
 (wired in PR #280): **Lint, Test, MSRV (1.88.0), Coverage** (`ci.yml`),
 **Build rustdoc** (`docs.yml`), **Cargo deny policy, Cargo audit, Licence
-check** (`audit.yml`), **Semver Compatibility** (`semver.yml`).
+check** (`audit.yml`), **Semver Compatibility** (`semver.yml`), and
+**Workflow runner policy** (`runner-policy.yml`).
 
-> **Caveat (OD-MQ-2):** the `ci:fallback` label escape hatch does **not** work
-> inside the queue — queue entries are not PRs and cannot be labelled. If the
-> self-hosted pool is down, *disable the ruleset* (above) so PRs merge directly
-> and the fallback path works, then re-enable when runners recover.
+The legacy `ci:fallback` label is additive and is not a security or
+merge-queue fallback. Do not disable the ruleset merely to bypass a red
+security-policy check.

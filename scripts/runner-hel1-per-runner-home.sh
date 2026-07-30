@@ -102,19 +102,30 @@ print_state() {
   done
 }
 
-# Ensure the per-runner home exists, seeded from the shared home's warm caches
-# (.cargo ~1.2G, .rustup ~1.6G) so toolchains/sccache stay warm. Idempotent.
+# A legacy PR runner's shared Cargo/Rustup homes are untrusted because PR code
+# previously ran with unrestricted root. New homes are empty by default. The
+# explicit seed override is only for a cache produced after a clean rebuild and
+# independently treated as trusted.
+TRUSTED_SEED="${CRUX_RUNNER_TRUSTED_SEED:-0}"
+
+# Ensure the per-runner home exists. Idempotent.
 seed_home() {
   local home="$1"
   if [ -d "$home" ]; then return 0; fi
-  log "creating $home (seeding .cargo/.rustup from $SHARED_HOME)"
+  log "creating clean runner home $home"
   install -d -o "$RUNNER_USER" -g "$RUNNER_USER" -m 0755 "$home"
-  local sub
-  for sub in .cargo .rustup; do
-    if [ -d "$SHARED_HOME/$sub" ] && [ ! -e "$home/$sub" ]; then
-      cp -a "$SHARED_HOME/$sub" "$home/$sub"
-    fi
-  done
+  if [ "$TRUSTED_SEED" = "1" ]; then
+    log "TRUSTED seed explicitly enabled from $SHARED_HOME"
+    local sub
+    for sub in .cargo .rustup; do
+      if [ -d "$SHARED_HOME/$sub" ] && [ ! -e "$home/$sub" ]; then
+        cp -a "$SHARED_HOME/$sub" "$home/$sub"
+      fi
+    done
+  else
+    install -d -o "$RUNNER_USER" -g "$RUNNER_USER" -m 0755 \
+      "$home/.cargo" "$home/.rustup"
+  fi
   chown -R "$RUNNER_USER:$RUNNER_USER" "$home"
 }
 

@@ -8,9 +8,9 @@
 # retried — only the documented sccache crash signatures fall through to
 # the second attempt.
 #
-# Background. The CueCrux self-hosted runner pool exports
-# `RUSTC_WRAPPER=/usr/local/bin/sccache` at the env level. When sccache's
-# server process dies under load it surfaces as one of:
+# Background. Some trusted local/protected runner environments export
+# `RUSTC_WRAPPER=/usr/local/bin/sccache`. When that optional cache server dies
+# under load it surfaces as one of:
 #   - `sccache: error: failed to execute compile`
 #   - `Connection reset by peer (os error 104)`
 #   - `Failed to read response header`

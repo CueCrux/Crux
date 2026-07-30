@@ -27,14 +27,10 @@ concurrency:
 jobs:
   build:
     name: Build rustdoc
-    runs-on: [self-hosted, hel1]
-    env:
-      CARGO_HOME: /home/gha-runner/.cargo
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-
       - name: Build documentation
         env:
           RUSTDOCFLAGS: "-D warnings"
@@ -74,7 +70,7 @@ jobs:
     name: Deploy to GitHub Pages
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     needs: build
-    runs-on: [self-hosted, hel1]
+    runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

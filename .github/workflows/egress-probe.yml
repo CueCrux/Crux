@@ -18,13 +18,14 @@
 #   ghcr.io (trivy-db)         200 or 401
 #   mirror.gcr.io (trivy-db)   200
 #
-# Not a required check. Runs when workflow/script supply-chain files change
-# and on manual dispatch.
+# Not a required check. It runs only from reviewed `main` state (after relevant
+# workflow/script changes land) or by a main-ref manual dispatch. Pull requests
+# are checked statically by runner-policy.yml and never reach this host.
 
 name: Supply-chain egress probe
 
 on:
-  pull_request:
+  push:
     branches: [main]
     paths:
       - ".github/workflows/**"
@@ -37,6 +38,7 @@ permissions:
 jobs:
   probe:
     name: Probe Sigstore + Trivy egress (self-hosted)
+    if: github.ref == 'refs/heads/main'
     runs-on: [self-hosted, hel1]
     timeout-minutes: 5
     steps:

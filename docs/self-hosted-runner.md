@@ -1,71 +1,132 @@
-# Self-hosted CI runner operator guide
+# Protected self-hosted runner operator guide
 
-The Crux Daemon CI matrix (`.github/workflows/ci.yml` jobs `Lint`, `Test`, `MSRV`, `Coverage`, plus the rustdoc / licence / advisory checks) runs on **self-hosted GitHub Actions runners** labelled `[self-hosted, ci]`. That choice is deliberate: the workspace builds 26 Rust crates, the full test suite takes ~10 minutes on a warm runner, and caching is reliable when CARGO_HOME is on stable disk.
+Pull-request and merge-queue code runs on disposable GitHub-hosted workers. The
+persistent `[self-hosted, hel1]` pool is reserved for reviewed `main` state in:
 
-This guide documents how to provision a fresh runner and how to recover when an existing one breaks.
+- `.github/workflows/coverage-attestation.yml`
+- `.github/workflows/egress-probe.yml`
+- `.github/workflows/mutants.yml`
 
-## When you'd reach for this guide
+The repository policy check rejects PR-reachable self-hosted, custom, dynamic,
+or unresolved runner selection. That check is a merge guard; the runner-group
+restriction below is the runtime security boundary.
 
-Any of these symptoms on a CI run:
+## Mandatory legacy-host cutover
 
-- `error: linker 'cc' not found` (the runner is missing the C build toolchain).
-- `sudo: a password is required` during `taiki-e/install-action` (the runner user lacks passwordless sudo, so the action can't install missing tools).
-- `error: failed to run custom build command for proc-macro2` and similar build-script crashes that have nothing to do with the code.
-- Every job in the matrix failing within 9–15 seconds of starting.
+Do not convert an existing PR runner in place. PR-controlled code previously
+ran on `hel1` with unrestricted passwordless root, so its OS, firmware-facing
+state, runner credentials, workspaces, Cargo/Rustup homes, sccache data, and
+other shared caches are not trustworthy after the policy change.
 
-The fix is at the OS level, not in the workflow.
+Before reusing persistent capacity:
+
+1. Disable and remove every old listener in GitHub.
+2. Reimage the host from trusted media; do not copy old runner homes, build
+   caches, tool binaries, workspaces, or system configuration into the image.
+3. Rotate any host, tailnet, deployment, or service credential that the old
+   runner could read.
+4. Configure the restricted runner group below.
+5. Create the unprivileged service account and install a checksum-verified
+   `rustup-init`/minimal Rust toolchain into its clean home.
+6. Run the provisioner, then register a new listener directly into that group.
+
+`scripts/provision-self-hosted-runner.sh` establishes the desired state on a
+clean host. It cannot prove or restore the integrity of a previously
+root-compromisable host.
+
+## Required GitHub runner-group policy
+
+Put every `hel1` listener in a non-default organization runner group. Configure
+the group for selected-repository access to `CueCrux/Crux`, then select only
+these workflow references:
+
+```text
+CueCrux/Crux/.github/workflows/coverage-attestation.yml@refs/heads/main
+CueCrux/Crux/.github/workflows/egress-probe.yml@refs/heads/main
+CueCrux/Crux/.github/workflows/mutants.yml@refs/heads/main
+```
+
+Keep `restricted_to_workflows=true`; do not grant the group to all workflows.
+GitHub requires the full workflow path and supports pinning it to a branch,
+tag, or full SHA. Only jobs directly defined in the selected workflow receive
+access. See [Managing access to self-hosted runners using
+groups](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/manage-access).
+
+On `main`, apply `.github/merge-queue-ruleset.json` after the bootstrap run. It
+requires the `Workflow runner policy` status, code-owner review, last-push
+approval, and has an empty bypass list. Keep `.github/` and both
+`scripts/check_workflow_runner_policy*.py` under required code-owner review.
+The ruleset README records the non-deadlocking first-merge sequence.
+
+If the repository is public and workflow-restricted groups are unavailable,
+do not register a persistent runner to it. Use GitHub-hosted workers or
+one-job ephemeral/JIT runners instead.
+
+## Service-account boundary
+
+The runner service account must have:
+
+- no `NOPASSWD` entry and no other non-interactive sudo policy;
+- no Docker socket or other root-equivalent host socket;
+- no production credentials, deploy keys, or cloud metadata access;
+- no production/Tailscale route unless the protected job explicitly requires
+  it and the route is separately constrained;
+- a dedicated work directory and externally retained job logs.
+
+The old `/etc/sudoers.d/gha-runner-nopasswd` grant was unrestricted root and
+must be disabled before the listener starts. The provision script moves that
+exact legacy file to a recoverable `.disabled` path and then refuses to pass if
+the account still has a non-interactive sudo policy.
+
+`scripts/runner-hel1-per-runner-home.sh` no longer seeds a new runner home from
+the shared legacy Cargo/Rustup caches by default. Its explicit
+`CRUX_RUNNER_TRUSTED_SEED=1` escape hatch is only for a cache created after a
+clean rebuild and verified as trusted.
 
 ## One-shot provision
 
-Get onto the runner host (SSH; the host is on Tailscale per `[[prod-ops-cheatsheet]]`). As a user with sudo:
+From a trusted checkout on the runner host:
 
 ```bash
-cd /path/to/Crux               # any checkout of this repo
-sudo bash scripts/provision-self-hosted-runner.sh
+cd /path/to/Crux
+sudo -E bash scripts/provision-self-hosted-runner.sh
 ```
 
-The script (also linked here for reference: `scripts/provision-self-hosted-runner.sh`):
-
-1. Installs the build toolchain (`build-essential`, `pkg-config`, `libssl-dev`, `clang`, `lld`, `curl`, `jq`, `git`, `cmake`, `protobuf-compiler`). Picks `apt-get` or `dnf` based on what's available.
-2. Writes `/etc/sudoers.d/gha-runner-nopasswd` with `gha-runner ALL=(ALL) NOPASSWD:ALL`. `taiki-e/install-action` needs this; without it the action retries `sudo` repeatedly and then bails after ~1 minute.
-3. Verifies `cc --version` runs and that `gha-runner` can `sudo -n true` without prompting.
-
-Override the runner user with `RUNNER_USER=alice sudo -E bash scripts/provision-self-hosted-runner.sh` if your installation uses a different account.
-
-After the script succeeds, restart the runner service so it picks up the new sudoers file:
+The script installs the native build toolchain, disables the legacy sudoers
+grant, verifies `cc`, verifies the account's trusted `rustup`/`cargo` bootstrap,
+and verifies that `gha-runner` cannot use non-interactive sudo. It deliberately
+does not download or execute a toolchain installer. Override the account when
+needed:
 
 ```bash
-sudo systemctl restart actions-runner.gha-runner.service   # systemd
-# or:
-sudo /home/gha-runner/actions-runner/svc.sh stop && sudo /home/gha-runner/actions-runner/svc.sh start
+RUNNER_USER=alice sudo -E bash scripts/provision-self-hosted-runner.sh
 ```
 
-## Detecting the broken state without an SSH
+Restart the listener only after both the local privilege check and the GitHub
+runner-group policy are in place:
 
-A new preflight step in every `ci.yml` job (`Preflight: verify build toolchain`) probes for `cc` + passwordless sudo before any expensive cargo work. When it fails, the log contains:
-
-```
-::error::Self-hosted runner is missing C build toolchain (cc not found).
-::error::Run scripts/provision-self-hosted-runner.sh on the runner host.
+```bash
+sudo systemctl restart actions-runner.gha-runner.service
 ```
 
-That's the cue to come back here.
+The protected coverage workflow also probes for `cc` before expensive work. It
+does not probe for or require sudo.
 
-## Unblock without a runner fix: the fallback workflow
+## Pull-request CI and the legacy fallback
 
-If you need to merge before the runner is fixed, every PR can opt into `ubuntu-latest` runners by adding the `ci:fallback` label. The workflow `.github/workflows/ci-fallback.yml` is identical to `ci.yml` except for the `runs-on` line.
-
-The fallback path is slower (cold caches every run, no CARGO_HOME on stable disk) and shouldn't become the default — it exists so an operator can ship one urgent PR without rebuilding the self-hosted runner first.
+`.github/workflows/ci.yml` is now the full disposable PR/merge-queue gate. The
+label-triggered `.github/workflows/ci-fallback.yml` is retained only as a
+compatibility diagnostic; it is additive, lacks full gate parity, and is not a
+security fallback.
 
 ## Historical incidents
 
-| Date | Symptom | Root cause | Fix |
+| Date | Symptom | Root cause | Current corrective control |
 |---|---|---|---|
-| 2026-05-19 | `cc not found` + `sudo password required` on Crux PR #84 | Runner image had no build-essential; gha-runner user lacked passwordless sudo. | Manual remediation (apt install + sudoers edit). Recorded as fact `incident:2026-05-19, key=crux-ci-runner-broken`. This script + runbook codify the durable fix. |
+| 2026-05-19 | `cc not found` and a sudo prompt on PR #84 | PR jobs ran on a persistent host and the proposed workaround granted the runner unrestricted root. | PR execution moved to disposable workers; protected runners are unprivileged and workflow/ref-restricted. |
 
 ## See also
 
-- Workflow: [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)
-- Fallback workflow: [`.github/workflows/ci-fallback.yml`](../.github/workflows/ci-fallback.yml)
+- Runner policy: [`.github/workflows/runner-policy.yml`](../.github/workflows/runner-policy.yml)
+- Primary CI: [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)
 - Provision script: [`scripts/provision-self-hosted-runner.sh`](../scripts/provision-self-hosted-runner.sh)
-- Ops cheatsheet (Tailscale SSH targets): `[[prod-ops-cheatsheet]]` in PlanCrux MEMORY.md

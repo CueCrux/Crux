@@ -34,7 +34,7 @@ jobs:
   # the full gate.
   changes:
     name: Detect change scope
-    runs-on: [self-hosted, hel1]
+    runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.scope.outputs.code }}
     steps:
@@ -90,45 +90,15 @@ jobs:
     name: Lint
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: [self-hosted, hel1]
-    env:
-      # Per-job CARGO_HOME isolates the cargo package-cache file lock so the
-      # four concurrent jobs on this self-hosted runner don't serialise
-      # through one mutex. See run 26575505389 (40m Coverage block, 1h28m
-      # Test job stuck, runner cancelled). github.job + github.run_id give
-      # a unique cache dir per job per run; the seed step below symlinks
-      # the toolchain binaries from the shared CARGO_HOME so cargo/rustc
-      # discovery keeps working without copying gigabytes.
-      CARGO_HOME: /home/gha-runner/.cargo-${{ github.job }}-${{ github.run_id }}
+    runs-on: ubuntu-latest
     steps:
-      - name: Seed per-job CARGO_HOME from shared toolchain
-        run: |
-          mkdir -p "$CARGO_HOME/bin"
-          for tool in /home/gha-runner/.cargo/bin/*; do
-            [ -e "$tool" ] || continue
-            ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
-          done
-          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v7
-      - name: Preflight (self-hosted runner toolchain)
-        run: |
-          set +e
-          MISSING=""
-          if ! command -v cc >/dev/null 2>&1; then MISSING="$MISSING cc"; fi
-          if ! sudo -n true 2>/dev/null; then MISSING="$MISSING passwordless-sudo"; fi
-          if [ -n "$MISSING" ]; then
-            echo "::error::Self-hosted runner is missing required tooling:$MISSING"
-            echo "::error::Run scripts/provision-self-hosted-runner.sh on the runner host."
-            echo "::error::Or add the ci:fallback label on this PR to use ubuntu-latest runners (see docs/self-hosted-runner.md)."
-            exit 1
-          fi
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: taiki-e/install-action@v2
         with:
           tool: typos-cli
-      - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - run: cargo fmt --check
       - run: typos
       - run: bash scripts/check-licence-headers.sh
@@ -136,47 +106,16 @@ jobs:
         run: bash scripts/unwrap-ratchet.sh
       - run: bash scripts/assert-daemon-release-boundary.sh
       - run: bash scripts/ci-cargo-with-fallback.sh clippy --workspace -- -D warnings
-      - name: Reclaim per-job CARGO_HOME
-        if: always()
-        # The per-job CARGO_HOME lives on the self-hosted runner's data disk and
-        # is unique per run; nothing reuses it afterwards. Without this it leaks
-        # a cache dir every run until the disk fills and the runner listeners
-        # crash-loop (incident 2026-06-15: 263 orphan dirs, 118 GiB, md3 100%).
-        run: rm -rf "$CARGO_HOME"
 
-  # ── Test, MSRV, Coverage: self-hosted ────────────────────────────────
+  # ── Test, MSRV, Coverage: disposable GitHub-hosted runners ───────────
   test:
     name: Test
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: [self-hosted, hel1]
-    env:
-      # See `lint` job above for the per-job CARGO_HOME rationale.
-      CARGO_HOME: /home/gha-runner/.cargo-${{ github.job }}-${{ github.run_id }}
+    runs-on: ubuntu-latest
     steps:
-      - name: Seed per-job CARGO_HOME from shared toolchain
-        run: |
-          mkdir -p "$CARGO_HOME/bin"
-          for tool in /home/gha-runner/.cargo/bin/*; do
-            [ -e "$tool" ] || continue
-            ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
-          done
-          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v7
-      - name: Preflight (self-hosted runner toolchain)
-        run: |
-          set +e
-          MISSING=""
-          if ! command -v cc >/dev/null 2>&1; then MISSING="$MISSING cc"; fi
-          if ! sudo -n true 2>/dev/null; then MISSING="$MISSING passwordless-sudo"; fi
-          if [ -n "$MISSING" ]; then
-            echo "::error::Self-hosted runner is missing required tooling:$MISSING"
-            echo "::error::Run scripts/provision-self-hosted-runner.sh on the runner host."
-            echo "::error::Or add the ci:fallback label on this PR to use ubuntu-latest runners (see docs/self-hosted-runner.md)."
-            exit 1
-          fi
       - uses: dtolnay/rust-toolchain@stable
-      - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - run: bash scripts/ci-cargo-with-fallback.sh build --workspace
       - name: HTTP auth boundary contracts
         run: bash scripts/ci-cargo-with-fallback.sh test -p corecruxd route_auth
@@ -264,23 +203,14 @@ jobs:
           echo "MCP tools/list returned: $TOOL_COUNT tools"
           [ "$TOOL_COUNT" -gt 0 ]
       # PR-time validation of the trust-surface release gates wired into
-      # release.yml (roadmap Phase 1.3). Only the receipt-tamper demo runs here:
-      # it's pure offline verification (no ports), so it's reliable on the shared
-      # persistent self-hosted runner. The no-phone-home check boots a daemon on
-      # fixed ports (MCP :24801) and collides with leftover daemons from earlier
-      # runs on this runner (AddrInUse) — it runs in release.yml on ephemeral
-      # ubuntu-latest, where the clean env is exactly the binary-install shape it
-      # asserts and there is no port leak.
+      # release.yml (roadmap Phase 1.3). The no-phone-home check remains in the
+      # release workflow because it exercises the packaged binary-install shape.
       - name: Trust-surface gate (receipt tamper)
         run: CORECRUXCTL=./target/debug/corecruxctl bash scripts/demo-receipt-tamper.sh
-      # Same rationale as the tamper gate: pure offline export+verify (no ports),
-      # reliable on the shared self-hosted runner. Self-runs the custody exit
-      # test — export a signed bundle, verify offline, reject a tamper.
+      # Pure offline export+verify: export a signed bundle, verify offline,
+      # reject a tamper.
       - name: Trust-surface gate (context custody exit test)
         run: CORECRUXCTL=./target/debug/corecruxctl bash scripts/assert-context-custody.sh
-      - name: Reclaim per-job CARGO_HOME
-        if: always()
-        run: rm -rf "$CARGO_HOME"  # see lint job — prevents data-disk leak
 
   # ── Hosted-surfaces ON-config tests ──────────────────────────────────
   # The `hosted-surfaces` feature is OFF in the default CE build, so the
@@ -292,72 +222,29 @@ jobs:
     name: Test (hosted-surfaces)
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: [self-hosted, hel1]
-    env:
-      # See `lint` job above for the per-job CARGO_HOME rationale.
-      CARGO_HOME: /home/gha-runner/.cargo-${{ github.job }}-${{ github.run_id }}
+    runs-on: ubuntu-latest
     steps:
-      - name: Seed per-job CARGO_HOME from shared toolchain
-        run: |
-          mkdir -p "$CARGO_HOME/bin"
-          for tool in /home/gha-runner/.cargo/bin/*; do
-            [ -e "$tool" ] || continue
-            ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
-          done
-          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - name: Test corecruxd with hosted-surfaces enabled
         run: bash scripts/ci-cargo-with-fallback.sh test -p corecruxd --features hosted-surfaces
-      - name: Reclaim per-job CARGO_HOME
-        if: always()
-        run: rm -rf "$CARGO_HOME"  # see lint job — prevents data-disk leak
 
   msrv:
     name: MSRV (1.88.0)
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: [self-hosted, hel1]
-    env:
-      # See `lint` job above for the per-job CARGO_HOME rationale.
-      CARGO_HOME: /home/gha-runner/.cargo-${{ github.job }}-${{ github.run_id }}
+    runs-on: ubuntu-latest
     steps:
-      - name: Seed per-job CARGO_HOME from shared toolchain
-        run: |
-          mkdir -p "$CARGO_HOME/bin"
-          for tool in /home/gha-runner/.cargo/bin/*; do
-            [ -e "$tool" ] || continue
-            ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
-          done
-          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v7
-      - name: Preflight (self-hosted runner toolchain)
-        run: |
-          set +e
-          MISSING=""
-          if ! command -v cc >/dev/null 2>&1; then MISSING="$MISSING cc"; fi
-          if ! sudo -n true 2>/dev/null; then MISSING="$MISSING passwordless-sudo"; fi
-          if [ -n "$MISSING" ]; then
-            echo "::error::Self-hosted runner is missing required tooling:$MISSING"
-            echo "::error::Run scripts/provision-self-hosted-runner.sh on the runner host (or add ci:fallback label)."
-            exit 1
-          fi
       - uses: dtolnay/rust-toolchain@1.88.0
-      - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - run: bash scripts/ci-cargo-with-fallback.sh build --workspace
-      - name: Reclaim per-job CARGO_HOME
-        if: always()
-        run: rm -rf "$CARGO_HOME"  # see lint job — prevents data-disk leak
 
   coverage:
     name: Coverage
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: [self-hosted, hel1]
+    runs-on: ubuntu-latest
     env:
-      # See `lint` job above for the per-job CARGO_HOME rationale.
-      CARGO_HOME: /home/gha-runner/.cargo-${{ github.job }}-${{ github.run_id }}
       # Coverage scope. The exclusion list is deliberately narrow — only code
       # that is not meaningfully unit-testable:
       #   * binary entry points: `main.rs` (#[tokio::main] bootstrap / clap
@@ -381,33 +268,13 @@ jobs:
       # (masking their true coverage) and are now IN scope and gated.
       COVERAGE_IGNORE_REGEX: '(.*/corecruxd/src/pool\.rs|.*/corecruxd/src/dataplane_store\.rs|.*/corecruxd/src/http/dataplane\.rs|.*/corecruxd/src/main\.rs|.*/corecruxctl/src/main\.rs|.*/crux-claude-hooks/src/main\.rs|.*/crux-claude-hooks/src/bin/crux_llm_shim\.rs|.*/crux-config-wizard/src/main\.rs|.*/crux-config-wizard/src/interactive\.rs)$'
     steps:
-      - name: Seed per-job CARGO_HOME from shared toolchain
-        run: |
-          mkdir -p "$CARGO_HOME/bin"
-          for tool in /home/gha-runner/.cargo/bin/*; do
-            [ -e "$tool" ] || continue
-            ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
-          done
-          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v7
-      - name: Preflight (self-hosted runner toolchain)
-        run: |
-          set +e
-          MISSING=""
-          if ! command -v cc >/dev/null 2>&1; then MISSING="$MISSING cc"; fi
-          if ! sudo -n true 2>/dev/null; then MISSING="$MISSING passwordless-sudo"; fi
-          if [ -n "$MISSING" ]; then
-            echo "::error::Self-hosted runner is missing required tooling:$MISSING"
-            echo "::error::Run scripts/provision-self-hosted-runner.sh on the runner host (or add ci:fallback label)."
-            exit 1
-          fi
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
-      - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - run: bash scripts/ci-cargo-with-fallback.sh build --bin corecruxd
       - name: Generate coverage reports
         run: |
@@ -473,6 +340,3 @@ jobs:
         with:
           name: coverage-report
           path: lcov.info
-      - name: Reclaim per-job CARGO_HOME
-        if: always()
-        run: rm -rf "$CARGO_HOME"  # see lint job — prevents data-disk leak

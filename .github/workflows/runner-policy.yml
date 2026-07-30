@@ -1,0 +1,58 @@
+# Copyright (c) 2026 CueCrux Ltd.
+# Licensed under the Apache License, Version 2.0.
+
+name: Workflow runner policy
+
+# pull_request_target deliberately loads this workflow from the trusted default
+# branch. Candidate files are checked out separately and parsed only as inert
+# data; no candidate script, action, hook, or executable is invoked.
+on:
+  pull_request_target:
+  merge_group:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runner-policy-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  runner-policy:
+    name: Workflow runner policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout trusted policy implementation
+        uses: actions/checkout@v7
+        with:
+          ref: refs/heads/main
+          path: policy
+          persist-credentials: false
+
+      - name: Checkout pull-request candidate as inert data
+        if: github.event_name == 'pull_request_target'
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: candidate
+          persist-credentials: false
+          submodules: false
+
+      - name: Checkout merge-queue or main candidate as inert data
+        if: github.event_name != 'pull_request_target'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: candidate
+          persist-credentials: false
+          submodules: false
+
+      - name: Test trusted parser
+        run: python3 policy/scripts/check_workflow_runner_policy_test.py
+
+      - name: Check candidate workflow runner policy
+        run: python3 policy/scripts/check_workflow_runner_policy.py --root candidate

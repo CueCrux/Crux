@@ -18,9 +18,9 @@ permissions:
 jobs:
   advisories:
     name: Cargo deny policy
-    runs-on: [self-hosted, hel1]
+    runs-on: ubuntu-latest
     env:
-      CARGO_HOME: /home/gha-runner/.cargo
+      CARGO_HOME: ${{ runner.temp }}/cargo-home
       CARGO_DENY_VERSION: 0.19.4
     steps:
       - uses: actions/checkout@v7
@@ -46,9 +46,9 @@ jobs:
 
   cargo-audit:
     name: Cargo audit
-    runs-on: [self-hosted, hel1]
+    runs-on: ubuntu-latest
     env:
-      CARGO_HOME: /home/gha-runner/.cargo
+      CARGO_HOME: ${{ runner.temp }}/cargo-home
       CARGO_AUDIT_VERSION: 0.22.1
     steps:
       - uses: actions/checkout@v7
@@ -71,9 +71,9 @@ jobs:
 
   licenses:
     name: Licence check
-    runs-on: [self-hosted, hel1]
+    runs-on: ubuntu-latest
     env:
-      CARGO_HOME: /home/gha-runner/.cargo
+      CARGO_HOME: ${{ runner.temp }}/cargo-home
       CARGO_DENY_VERSION: 0.19.4
     steps:
       - uses: actions/checkout@v7

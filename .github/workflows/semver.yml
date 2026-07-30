@@ -13,9 +13,7 @@ on:
 jobs:
   semver:
     name: Semver Compatibility
-    runs-on: [self-hosted, hel1]
-    env:
-      CARGO_HOME: /home/gha-runner/.cargo
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
@@ -24,7 +22,6 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-semver-checks
-      - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - name: Check semver (advisory)
         # ADVISORY, deliberately: "Semver Compatibility" is a required check on
         # main, so a hard failure here would wedge every PR. But the previous

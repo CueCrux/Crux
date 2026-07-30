@@ -17,10 +17,8 @@
 # target and libFuzzer args positionally). This wrapper runs the command
 # verbatim instead.
 #
-# Keeping sccache (rather than just unsetting RUSTC_WRAPPER in the job) matters:
-# the fuzz job builds each target in an isolated per-target CARGO_HOME with
-# CARGO_INCREMENTAL=0, so the shared sccache server is the ONLY cross-target
-# compile cache. We keep it for speed and fall back only when it crashes.
+# The wrapper is also safe on disposable hosted workers where sccache is absent:
+# the first command runs normally and the fallback path is never entered.
 #
 # Behaviour mirrors ci-cargo-with-fallback.sh:
 #   1. Run `"$@"` once, tee'ing output to a log.

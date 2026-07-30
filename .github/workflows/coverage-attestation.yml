@@ -13,9 +13,10 @@ permissions:
 jobs:
   coverage-attestation:
     name: Coverage attestation
+    if: github.ref == 'refs/heads/main'
     runs-on: [self-hosted, hel1]
     env:
-      CARGO_HOME: /home/gha-runner/.cargo-${{ github.job }}-${{ github.run_id }}
+      CARGO_HOME: ${{ runner.temp }}/cargo-${{ github.job }}-${{ github.run_id }}
       # Keep in lock-step with ci.yml's COVERAGE_IGNORE_REGEX (see the rationale
       # there). Excluded = binary entry points (main.rs for corecruxd/corecruxctl/
       # crux-claude-hooks/crux-config-wizard + crux_llm_shim), the interactive
@@ -28,26 +29,14 @@ jobs:
       CORECRUX_COVERAGE_ATTEST_SIGNING_KEY_B64: ${{ secrets.CORECRUX_COVERAGE_ATTEST_SIGNING_KEY_B64 }}
       CORECRUX_COVERAGE_ATTEST_KEY_ID: ${{ vars.CORECRUX_COVERAGE_ATTEST_KEY_ID || 'coverage-attest' }}
     steps:
-      - name: Seed per-job CARGO_HOME from shared toolchain
-        run: |
-          mkdir -p "$CARGO_HOME/bin"
-          for tool in /home/gha-runner/.cargo/bin/*; do
-            [ -e "$tool" ] || continue
-            ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
-          done
-          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-
       - uses: actions/checkout@v7
 
       - name: Preflight self-hosted runner
         run: |
-          set +e
-          MISSING=""
-          if ! command -v cc >/dev/null 2>&1; then MISSING="$MISSING cc"; fi
-          if ! sudo -n true 2>/dev/null; then MISSING="$MISSING passwordless-sudo"; fi
-          if [ -n "$MISSING" ]; then
-            echo "::error::Self-hosted runner is missing required tooling:$MISSING"
-            echo "::error::Run scripts/provision-self-hosted-runner.sh on the runner host (or add ci:fallback label)."
+          set -euo pipefail
+          if ! command -v cc >/dev/null 2>&1; then
+            echo "::error::Self-hosted runner is missing required tooling: cc"
+            echo "::error::Run scripts/provision-self-hosted-runner.sh on the runner host."
             exit 1
           fi
 

@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # provision-self-hosted-runner.sh — bootstrap a GitHub Actions self-hosted
-# runner (the `[self-hosted, ci]` label) for the Crux Daemon CI matrix.
+# runner (the `[self-hosted, hel1]` labels) for protected Crux workflows.
 #
-# Run ONCE on the runner host as a user with sudo. Idempotent: re-running is
-# safe and only patches what's missing. See `docs/self-hosted-runner.md` for
-# the operator runbook.
+# Run as root on the runner host. The service account remains unprivileged:
+# this script removes the legacy sudoers grant and fails if any other
+# non-interactive sudo policy still applies. See `docs/self-hosted-runner.md`.
+#
+# IMPORTANT: this is not an in-place compromise-remediation tool. Reimage any
+# host that previously executed PR code with the legacy NOPASSWD grant before
+# provisioning and registering a new protected listener.
 #
 # Symptoms this script prevents:
 #   - `error: linker 'cc' not found` during `cargo build`
-#   - `sudo: a password is required` during `taiki-e/install-action`
 #   - `error: failed to run custom build command for proc-macro2` (missing
 #     pkg-config / build-essential)
 #
@@ -25,13 +28,10 @@ ok()  { printf '\033[1;32m[ ok ]\033[0m %s\n' "$*"; }
 warn(){ printf '\033[1;33m[warn]\033[0m %s\n' "$*"; }
 
 ensure_root() {
-  if [[ "$(id -u)" -ne 0 ]] && ! sudo -n true 2>/dev/null; then
-    echo "ERROR: this script needs root or passwordless sudo."
-    echo "       run: sudo $0"
-    exit 1
-  fi
   if [[ "$(id -u)" -ne 0 ]]; then
-    exec sudo -E "$0" "$@"
+    echo "ERROR: this script must run as root."
+    echo "       run: sudo -E bash $0"
+    exit 1
   fi
 }
 
@@ -59,20 +59,33 @@ install_build_toolchain() {
   ok "build toolchain installed"
 }
 
-ensure_runner_sudo() {
-  log "ensuring $RUNNER_USER has passwordless sudo (for taiki-e/install-action)"
+revoke_legacy_runner_sudo() {
+  log "removing the legacy unrestricted sudo grant for $RUNNER_USER"
   if ! id "$RUNNER_USER" >/dev/null 2>&1; then
-    warn "user $RUNNER_USER does not exist on this host; skipping sudoers"
+    warn "user $RUNNER_USER does not exist on this host; no grant to revoke"
     return 0
   fi
-  local sudoers_file="/etc/sudoers.d/${RUNNER_USER}-nopasswd"
-  if [[ ! -f "$sudoers_file" ]]; then
-    echo "$RUNNER_USER ALL=(ALL) NOPASSWD:ALL" > "$sudoers_file"
-    chmod 0440 "$sudoers_file"
-    visudo -cf "$sudoers_file"
-    ok "wrote $sudoers_file"
+  local legacy_file="/etc/sudoers.d/${RUNNER_USER}-nopasswd"
+  local disabled_file="${legacy_file}.disabled"
+  if [[ -e "$legacy_file" ]]; then
+    if [[ -e "$disabled_file" ]]; then
+      echo "ERROR: cannot preserve $legacy_file: $disabled_file already exists"
+      echo "       inspect both files, remove the active grant, then rerun"
+      exit 1
+    fi
+    mv -- "$legacy_file" "$disabled_file"
+    ok "disabled $legacy_file (recoverable at $disabled_file)"
   else
-    ok "$sudoers_file already present"
+    ok "legacy sudoers grant is absent"
+  fi
+}
+
+require_runner_user() {
+  if ! id "$RUNNER_USER" >/dev/null 2>&1; then
+    echo "ERROR: runner service account $RUNNER_USER does not exist"
+    echo "       create the unprivileged account and install its trusted Rust toolchain"
+    echo "       before running this provisioner"
+    exit 1
   fi
 }
 
@@ -86,27 +99,50 @@ verify_cc() {
   ok "cc OK"
 }
 
-verify_runner_sudo() {
-  log "verifying $RUNNER_USER passwordless sudo"
-  if ! id "$RUNNER_USER" >/dev/null 2>&1; then
-    warn "no $RUNNER_USER user, skipping verify"
-    return 0
+verify_runner_toolchain() {
+  local runner_home
+  runner_home="$(getent passwd "$RUNNER_USER" | cut -d: -f6)"
+  if [[ -z "$runner_home" || ! -d "$runner_home" ]]; then
+    echo "ERROR: cannot resolve a real home for $RUNNER_USER"
+    exit 1
   fi
-  if sudo -u "$RUNNER_USER" sudo -n true 2>/dev/null; then
-    ok "$RUNNER_USER passwordless sudo OK"
-  else
-    echo "ERROR: $RUNNER_USER cannot sudo without password"
+  log "verifying trusted rustup/cargo bootstrap for $RUNNER_USER"
+  if ! sudo -u "$RUNNER_USER" -H env \
+    PATH="$runner_home/.cargo/bin:/usr/local/bin:/usr/bin:/bin" \
+    rustup --version >/dev/null 2>&1; then
+    echo "ERROR: rustup is not installed for $RUNNER_USER"
+    echo "       install a verified rustup-init build into the clean runner image"
     echo "       see $RUNBOOK_URL"
     exit 1
   fi
+  if ! sudo -u "$RUNNER_USER" -H env \
+    PATH="$runner_home/.cargo/bin:/usr/local/bin:/usr/bin:/bin" \
+    cargo --version >/dev/null 2>&1; then
+    echo "ERROR: cargo is not installed for $RUNNER_USER"
+    exit 1
+  fi
+  ok "$RUNNER_USER rustup/cargo bootstrap is available"
+}
+
+verify_runner_unprivileged() {
+  log "verifying $RUNNER_USER has no non-interactive sudo policy"
+  if sudo -u "$RUNNER_USER" -H sudo -n -l >/dev/null 2>&1; then
+    echo "ERROR: $RUNNER_USER still has a non-interactive sudo policy"
+    echo "       remove every NOPASSWD grant before starting the runner"
+    echo "       see $RUNBOOK_URL"
+    exit 1
+  fi
+  ok "$RUNNER_USER cannot use non-interactive sudo"
 }
 
 main() {
   ensure_root "$@"
+  require_runner_user
   install_build_toolchain
-  ensure_runner_sudo
+  revoke_legacy_runner_sudo
   verify_cc
-  verify_runner_sudo
+  verify_runner_toolchain
+  verify_runner_unprivileged
   echo
   ok "self-hosted runner provisioned. Restart the actions-runner service if it's running."
   echo "    runbook: $RUNBOOK_URL"

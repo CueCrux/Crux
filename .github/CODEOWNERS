@@ -15,3 +15,5 @@ crates/crux-mcp/ @myles
 
 # CI/CD
 .github/ @myles
+scripts/check_workflow_runner_policy.py @myles
+scripts/check_workflow_runner_policy_test.py @myles
