@@ -384,6 +384,13 @@ jobs:
             if ($window -and $webview.Count -and $sidecar.Count) { break }
           }
 
+          # Let the console settle before the screenshot. The loop above breaks the
+          # instant all three conditions hold, which can be ~3s in -- long before
+          # the webview has painted, making the artifact a picture of a blank
+          # window every time. This delay buys a representative image; it gates
+          # no assertion.
+          Start-Sleep -Seconds 10
+
           # --- evidence first ---
           Add-Type -AssemblyName System.Windows.Forms
           Add-Type -AssemblyName System.Drawing
@@ -409,6 +416,22 @@ jobs:
           if (-not $webview.Count) { $fail += 'no msedgewebview2 process -- the WebView2 host never started, so nothing rendered' }
           Write-Host "corecruxd sidecar     : $($sidecar.Count)"
           if (-not $sidecar.Count) { $fail += 'the bundled corecruxd sidecar was never spawned (default profile is bundled on a fresh box)' }
+
+          # KNOWN DEFECT, reported not enforced. corecruxd is a console-subsystem
+          # binary and the shell is a GUI-subsystem app (windows_subsystem =
+          # "windows") with no console to inherit, so Windows allocates a visible
+          # console window for the sidecar: a stray black box on the user's
+          # desktop for the app's lifetime. spawn_sidecar redirects stdout/stderr
+          # to a log but never sets CREATE_NO_WINDOW (0x08000000) via
+          # CommandExt::creation_flags, so the window still appears. Invisible on
+          # Linux and to any compile-or-bundle job.
+          # PROMOTE THIS TO ::error:: AND FAIL once the sidecar spawns windowless.
+          $sidecarWindow = @($sidecar | Where-Object { $_.MainWindowHandle -ne 0 })
+          if ($sidecarWindow.Count) {
+            Write-Host "::warning::the corecruxd sidecar owns a visible console window (MainWindowTitle: '$($sidecarWindow[0].MainWindowTitle)'). Users see a stray console beside the app. Fix: set CREATE_NO_WINDOW in spawn_sidecar."
+          } else {
+            Write-Host 'sidecar window       : none (spawned windowless)'
+          }
 
           if ($fail.Count) {
             foreach ($f in $fail) { Write-Host "::error::$f" }
