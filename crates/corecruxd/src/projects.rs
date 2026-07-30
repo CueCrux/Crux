@@ -353,7 +353,7 @@ pub fn delete_project(store: &mut FactStore, id: &str) -> Result<(), ProjectsErr
             let is_bare_record =
                 fact.entity == format!("{PROJECT_ENTITY_PREFIX}::{id}") && fact.key == PROJECT_RECORD_KEY;
             if is_sub_entity_prefix || is_bare_record {
-                store.delete(&fact.fact_id);
+                store.delete(&fact.tenant_hash, &fact.fact_id);
             }
         }
     }
@@ -411,7 +411,7 @@ pub fn remove_member(store: &mut FactStore, project_id: &str, passport_id: &str)
     });
     for fact in result.facts {
         if fact.key == PROJECT_RECORD_KEY {
-            store.delete(&fact.fact_id);
+            store.delete(&fact.tenant_hash, &fact.fact_id);
         }
     }
     Ok(())
@@ -462,7 +462,7 @@ pub fn remove_tenant(store: &mut FactStore, project_id: &str, tenant_id: &str) -
     });
     for fact in result.facts {
         if fact.key == PROJECT_RECORD_KEY {
-            store.delete(&fact.fact_id);
+            store.delete(&fact.tenant_hash, &fact.fact_id);
         }
     }
     Ok(())

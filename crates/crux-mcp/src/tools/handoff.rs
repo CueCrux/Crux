@@ -46,7 +46,7 @@ pub async fn handle_create_handoff(args: &Value, ctx: &McpContext) -> Result<Val
     let session_store = ctx.session_store.read().await;
     let fact_store = ctx.fact_store.read().await;
 
-    let signed = handoff::create_handoff(
+    let signed = handoff::create_handoff_for_tenant(
         &session_store,
         &fact_store,
         handoff::CreateHandoffRequest {
@@ -58,6 +58,7 @@ pub async fn handle_create_handoff(args: &Value, ctx: &McpContext) -> Result<Val
             message,
             task_record,
         },
+        &ctx.scope_tenant(),
         &ctx.handoff_key,
     )
     .map_err(|e| JsonRpcError {
@@ -106,11 +107,12 @@ pub async fn handle_accept_handoff(args: &Value, ctx: &McpContext) -> Result<Val
     let mut session_store = ctx.session_store.write().await;
     let mut fact_store = ctx.fact_store.write().await;
 
-    let result = handoff::accept_handoff(
+    let result = handoff::accept_handoff_for_tenant(
         &mut session_store,
         &mut fact_store,
         &signed,
         receiver_agent,
+        &ctx.scope_tenant(),
         &ctx.handoff_key,
     )
     .map_err(|e| JsonRpcError {

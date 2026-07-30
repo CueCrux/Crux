@@ -219,7 +219,7 @@ where
             ids.push_back(fact.fact_id.clone());
             while ids.len() > max_facts {
                 if let Some(old_id) = ids.pop_front() {
-                    store.delete(&old_id);
+                    store.delete("default", &old_id);
                 }
             }
         });

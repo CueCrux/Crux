@@ -179,9 +179,10 @@ pub async fn handle_memory_view(args: &Value, ctx: &McpContext) -> Result<Value,
     let aliases = ctx.scope_aliases();
     let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
 
+    let tenant_hash = ctx.scope_tenant();
     let q = FactQuery {
         min_effective_confidence: None,
-        tenant_hash: None,
+        tenant_hash: Some(tenant_hash.clone()),
         query: None,
         entity: entity.clone(),
         entity_prefix: None,
@@ -191,7 +192,7 @@ pub async fn handle_memory_view(args: &Value, ctx: &McpContext) -> Result<Value,
 
     let store = ctx.fact_store.read().await;
     let mut visible: Vec<Fact> = store
-        .all_facts()
+        .all_facts_for_tenant(&tenant_hash)
         .filter(|fact| fact_visible_in_memory_panel_id(fact, id_ref, &alias_refs))
         .filter(|fact| match &q.entity {
             Some(want) => scope::visible_entity_for_identity(fact, id_ref, &alias_refs)
@@ -240,7 +241,7 @@ pub async fn handle_memory_view(args: &Value, ctx: &McpContext) -> Result<Value,
     let pinned_ids: std::collections::HashSet<String> = if let Some(prefix) = &pin_prefix {
         let mut latest: std::collections::HashMap<String, (chrono::DateTime<chrono::Utc>, bool)> =
             std::collections::HashMap::new();
-        for f in store.all_facts() {
+        for f in store.all_facts_for_tenant(&tenant_hash) {
             if f.deleted || !f.entity.starts_with(prefix) || f.key != "pinned" {
                 continue;
             }
@@ -335,13 +336,17 @@ pub async fn handle_memory_edit(args: &Value, ctx: &McpContext) -> Result<Value,
     let id_ref = identity.as_deref();
     let aliases = ctx.scope_aliases();
     let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
+    let tenant_hash = ctx.scope_tenant();
 
     let mut store = ctx.fact_store.write().await;
-    let existing = store.get(fact_id).cloned().ok_or_else(|| JsonRpcError {
-        code: INVALID_PARAMS,
-        message: format!("fact not found: {fact_id}"),
-        data: Some(json!({"fact_id": fact_id})),
-    })?;
+    let existing = store
+        .get_for_tenant(fact_id, &tenant_hash)
+        .cloned()
+        .ok_or_else(|| JsonRpcError {
+            code: INVALID_PARAMS,
+            message: format!("fact not found: {fact_id}"),
+            data: Some(json!({"fact_id": fact_id})),
+        })?;
 
     if !fact_visible_in_memory_panel_id(&existing, id_ref, &alias_refs) {
         // Either reserved-prefix or not visible to this agent — refuse.
@@ -372,7 +377,7 @@ pub async fn handle_memory_edit(args: &Value, ctx: &McpContext) -> Result<Value,
     // under the read borrow before we mutate.
     let old_pin_entity = pin_entity(agent_name, fact_id);
     let was_pinned = store
-        .all_facts()
+        .all_facts_for_tenant(&tenant_hash)
         .filter(|f| !f.deleted && f.entity == old_pin_entity && f.key == "pinned")
         .max_by_key(|f| f.stored_at)
         .is_some_and(|f| f.value == "1" || f.value.eq_ignore_ascii_case("true"));
@@ -384,7 +389,7 @@ pub async fn handle_memory_edit(args: &Value, ctx: &McpContext) -> Result<Value,
     // audit trail is intact; the prior horizon_class is preserved so an edit
     // doesn't silently reset a pinned/overridden decay horizon.
     let req = StoreFact {
-        tenant_hash: "default".to_string(),
+        tenant_hash: tenant_hash.clone(),
         entity: existing.entity.clone(),
         key: existing.key.clone(),
         value: new_value.to_string(),
@@ -405,7 +410,7 @@ pub async fn handle_memory_edit(args: &Value, ctx: &McpContext) -> Result<Value,
     if was_pinned {
         let new_pin_entity = pin_entity(agent_name, &new_fact.fact_id);
         if let Err(err) = store.try_store(StoreFact {
-            tenant_hash: "default".to_string(),
+            tenant_hash: tenant_hash.clone(),
             entity: new_pin_entity,
             key: "pinned".to_string(),
             value: "1".to_string(),
@@ -462,13 +467,17 @@ pub async fn handle_memory_pin(args: &Value, ctx: &McpContext) -> Result<Value, 
     let id_ref = identity.as_deref();
     let aliases = ctx.scope_aliases();
     let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
+    let tenant_hash = ctx.scope_tenant();
 
     let mut store = ctx.fact_store.write().await;
-    let target = store.get(fact_id).cloned().ok_or_else(|| JsonRpcError {
-        code: INVALID_PARAMS,
-        message: format!("fact not found: {fact_id}"),
-        data: Some(json!({"fact_id": fact_id})),
-    })?;
+    let target = store
+        .get_for_tenant(fact_id, &tenant_hash)
+        .cloned()
+        .ok_or_else(|| JsonRpcError {
+            code: INVALID_PARAMS,
+            message: format!("fact not found: {fact_id}"),
+            data: Some(json!({"fact_id": fact_id})),
+        })?;
 
     if !fact_visible_in_memory_panel_id(&target, id_ref, &alias_refs) {
         return Err(JsonRpcError {
@@ -481,7 +490,7 @@ pub async fn handle_memory_pin(args: &Value, ctx: &McpContext) -> Result<Value, 
     let pin_entity_name = pin_entity(agent_name, fact_id);
     let value_str = if pinned { "1" } else { "0" };
     let req = StoreFact {
-        tenant_hash: "default".to_string(),
+        tenant_hash,
         entity: pin_entity_name.clone(),
         key: "pinned".to_string(),
         value: value_str.to_string(),
@@ -524,6 +533,7 @@ pub async fn handle_memory_history(args: &Value, ctx: &McpContext) -> Result<Val
     let key_arg = args.get("key").and_then(|v| v.as_str()).map(str::to_string);
     let fact_id_arg = args.get("fact_id").and_then(|v| v.as_str()).map(str::to_string);
     let agent_name = scope::agent_name(ctx.agent.as_ref());
+    let tenant_hash = ctx.scope_tenant();
 
     let store = ctx.fact_store.read().await;
 
@@ -531,7 +541,7 @@ pub async fn handle_memory_history(args: &Value, ctx: &McpContext) -> Result<Val
     let (entity, key) = match (entity_arg, key_arg, fact_id_arg) {
         (Some(e), Some(k), _) => (e, k),
         (_, _, Some(fid)) => {
-            let f = store.get(&fid).ok_or_else(|| JsonRpcError {
+            let f = store.get_for_tenant(&fid, &tenant_hash).ok_or_else(|| JsonRpcError {
                 code: INVALID_PARAMS,
                 message: format!("fact not found: {fid}"),
                 data: Some(json!({"fact_id": fid})),
@@ -557,7 +567,7 @@ pub async fn handle_memory_history(args: &Value, ctx: &McpContext) -> Result<Val
     }
 
     let mut history: Vec<&Fact> = store
-        .all_facts()
+        .all_facts_for_tenant(&tenant_hash)
         .filter(|f| f.key == key)
         .filter(|f| scope::entity_matches_for_agent(f, &entity, agent_name))
         .filter(|f| scope::fact_visible_to_agent(f, agent_name))

@@ -1131,6 +1131,12 @@ impl HttpScopeContext {
         self.scope_bypass || self.scopes.iter().any(|s| s == scope)
     }
 
+    /// Whether the verified credential is authorized across every tenant.
+    /// A tenant-bound admin scope is still tenant-bound.
+    pub(crate) fn has_global_tenant_authority(&self) -> bool {
+        matches!(self.tenants, TenantAllow::Any)
+    }
+
     /// Whether JWT authentication accepted a passport header that differs
     /// from the verified token identity. Most admin surfaces support this
     /// explicit override; sensitive human-approval boundaries can deny it.

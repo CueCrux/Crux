@@ -153,11 +153,11 @@ pub(super) fn require_session_write_ctx(
 }
 
 fn raw_admin_read(ctx: &crate::auth::HttpScopeContext) -> bool {
-    ctx.passport_id.is_none() && ctx.has_scope("admin:read")
+    ctx.passport_id.is_none() && ctx.has_scope("admin:read") && ctx.has_global_tenant_authority()
 }
 
 fn raw_admin_write(ctx: &crate::auth::HttpScopeContext) -> bool {
-    ctx.passport_id.is_none() && ctx.has_scope("admin:write")
+    ctx.passport_id.is_none() && ctx.has_scope("admin:write") && ctx.has_global_tenant_authority()
 }
 
 /// Resolve the trusted tenant stamp for an HTTP write (OD-37 / audit-v2 closeout M1).
@@ -596,8 +596,26 @@ pub(super) async fn delete_fact(
         )
         .into_response();
     }
-    let deleted = if visible_fact.is_some() {
-        match store.try_delete(&fact_id) {
+    if let Some(fact) = visible_fact {
+        if store.is_consolidation_canonical_for_tenant(&fact_id, &fact.tenant_hash) {
+            return ProblemResponse(
+                ProblemDetails::new(
+                    StatusCode::CONFLICT.as_u16(),
+                    "https://errors.cuecrux.com/conflict",
+                    "Conflict",
+                )
+                .with_detail("consolidation canonical must be retired through the dedicated undo surface")
+                .with_extensions(serde_json::json!({
+                    "code": "CONSOLIDATION_CANONICAL_REQUIRES_UNDO",
+                    "fact_id": fact_id,
+                })),
+            )
+            .into_response();
+        }
+    }
+    let delete_tenant = visible_fact.map(|fact| fact.tenant_hash.clone());
+    let deleted = if let Some(delete_tenant) = delete_tenant {
+        match store.try_delete(&delete_tenant, &fact_id) {
             Ok(deleted) => deleted,
             Err(err) => return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
         }
@@ -738,11 +756,16 @@ pub(super) async fn post_aggregate(
     headers: HeaderMap,
     Json(req): Json<corecrux_memory::fact_store::AggregateRequestV1>,
 ) -> impl IntoResponse {
-    if let Err(response) = require_fact_read_ctx(&state, &headers) {
-        return response;
-    }
+    let ctx = match require_fact_read_ctx(&state, &headers) {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    let tenant_hash = match ctx.resolve_authorized_tenant(None) {
+        Ok(tenant_hash) => tenant_hash,
+        Err(problem) => return problem.into_response(),
+    };
     let store = state.fact_store.read().await;
-    Json(store.aggregate_v1(&req)).into_response()
+    Json(store.aggregate_v1(&tenant_hash, &req)).into_response()
 }
 
 #[utoipa::path(
@@ -778,16 +801,20 @@ pub(super) async fn export_facts(
     let limit = params.limit.map_or(1000, |v| v.min(10000) as usize);
 
     let store = state.fact_store.read().await;
-    let mut result = store.export(since, cursor, limit);
+    let result = if raw_admin_read(&ctx) {
+        store.export(since, cursor, limit)
+    } else {
+        let tenant_hash = match ctx.resolve_authorized_tenant(None) {
+            Ok(tenant_hash) => tenant_hash,
+            Err(problem) => return problem.into_response(),
+        };
+        store.export_for_tenant(&tenant_hash, since, cursor, limit)
+    };
+    let mut result = result;
     if !raw_admin_read(&ctx) {
-        // Tenant predicate (audit-v2 closeout M1): export must not cross the tenant
-        // boundary. No-op while everything is `default`; a hard filter once real
-        // tenants are stamped. Passport/entity visibility is applied on top.
-        let tenant_hash = tenant_hash_for_read_context(&ctx);
         result.facts = result
             .facts
             .iter()
-            .filter(|fact| fact.tenant_hash == tenant_hash)
             .filter_map(|fact| render_fact_for_http(fact, &ctx))
             .collect();
     }

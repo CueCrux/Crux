@@ -268,6 +268,16 @@ impl Default for ExportOptions {
     }
 }
 
+/// Canonical physical tenant used by facts. `local` is the legacy CruxPack
+/// wire alias for the historical single-tenant `default` namespace.
+pub fn canonical_tenant_id(tenant_id: &str) -> &str {
+    if tenant_id == "local" {
+        "default"
+    } else {
+        tenant_id
+    }
+}
+
 /// What was *excluded* from (or, under `include_private`, opted into) a pack
 /// — the CLI prints this before asking for typed confirmation.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -285,8 +295,21 @@ pub struct PrivateSummary {
 
 /// Scan the store and report what the private gate would hold back.
 pub fn private_summary(store: &FactStore) -> PrivateSummary {
+    private_summary_matching(store, None)
+}
+
+/// Tenant-scoped private/export summary. Foreign-tenant rows are not counted
+/// because they are not candidates for this pack.
+pub fn private_summary_for_tenant(store: &FactStore, tenant_id: &str) -> PrivateSummary {
+    private_summary_matching(store, Some(canonical_tenant_id(tenant_id)))
+}
+
+fn private_summary_matching(store: &FactStore, tenant_id: Option<&str>) -> PrivateSummary {
     let mut summary = PrivateSummary::default();
     for fact in store.all_facts() {
+        if tenant_id.is_some_and(|tenant| fact.tenant_hash != tenant) {
+            continue;
+        }
         if fact.deleted {
             summary.deleted_excluded += 1;
             continue;
@@ -322,9 +345,13 @@ pub fn build_pack_sections(
     sessions: Option<&SessionStore>,
     opts: &ExportOptions,
 ) -> (PackSections, PrivateSummary) {
+    let tenant_id = canonical_tenant_id(&opts.tenant_id);
     let mut summary = PrivateSummary::default();
     let mut facts: Vec<Fact> = Vec::new();
     for fact in store.all_facts() {
+        if fact.tenant_hash != tenant_id {
+            continue;
+        }
         if fact.deleted {
             // Rule 1 — no flag overrides this.
             summary.deleted_excluded += 1;
@@ -353,7 +380,9 @@ pub fn build_pack_sections(
     facts.sort_by(|a, b| (&a.entity, &a.key, a.version, &a.fact_id).cmp(&(&b.entity, &b.key, b.version, &b.fact_id)));
 
     let mut session_states: Vec<SessionState> = Vec::new();
-    if opts.include_sessions {
+    // SessionState has no trustworthy tenant field. Until it does, only the
+    // legacy/default tenant may carry sessions in a tenant-bound pack.
+    if opts.include_sessions && tenant_id == "default" {
         if let Some(store) = sessions {
             let mut ids: Vec<String> = store
                 .list()
@@ -392,7 +421,7 @@ pub fn build_manifest(
         daemon_install_fpr: opts.daemon_install_fpr.clone(),
         passport_fpr: passport_fpr.to_string(),
         public_key_hex: public_key_hex.to_string(),
-        tenant_id: opts.tenant_id.clone(),
+        tenant_id: canonical_tenant_id(&opts.tenant_id).to_string(),
         exported_at: Utc::now().to_rfc3339(),
         since: opts.since.map(|t| t.to_rfc3339()),
         chain_head: opts.chain_head.clone(),
@@ -476,6 +505,14 @@ pub enum PackVerifyError {
     InvalidAgentPrivateOwnerMapping { owner: String, mapped: String },
     #[error("pack was exported for tenant '{pack_tenant}' but import targets tenant '{import_tenant}' (T.1)")]
     TenantMismatch { pack_tenant: String, import_tenant: String },
+    #[error("pack fact '{fact_id}' belongs to tenant '{fact_tenant}', not manifest tenant '{manifest_tenant}'")]
+    FactTenantMismatch {
+        fact_id: String,
+        fact_tenant: String,
+        manifest_tenant: String,
+    },
+    #[error("tenant '{tenant}' pack contains unscoped sessions")]
+    UnscopedSessions { tenant: String },
 }
 
 fn decode_content_hash(stated: &str) -> Result<[u8; 32], PackVerifyError> {
@@ -535,6 +572,24 @@ pub fn verify_pack(pack: &CruxPack) -> Result<[u8; 32], PackVerifyError> {
             .any(|f| f.private || reserved_prefix(&f.entity).is_some())
     {
         return Err(PackVerifyError::PrivateInconsistent);
+    }
+    let manifest_tenant = canonical_tenant_id(&pack.manifest.tenant_id);
+    if let Some(fact) = pack
+        .sections
+        .facts
+        .iter()
+        .find(|fact| canonical_tenant_id(&fact.tenant_hash) != manifest_tenant)
+    {
+        return Err(PackVerifyError::FactTenantMismatch {
+            fact_id: fact.fact_id.clone(),
+            fact_tenant: fact.tenant_hash.clone(),
+            manifest_tenant: pack.manifest.tenant_id.clone(),
+        });
+    }
+    if manifest_tenant != "default" && !pack.sections.sessions.is_empty() {
+        return Err(PackVerifyError::UnscopedSessions {
+            tenant: pack.manifest.tenant_id.clone(),
+        });
     }
 
     // 5) Recompute + compare content hash.
@@ -632,7 +687,9 @@ pub fn plan_import(
 ) -> Result<ImportPlan, PackVerifyError> {
     verify_pack(pack)?;
 
-    if pack.manifest.tenant_id != opts.tenant_id {
+    let pack_tenant = canonical_tenant_id(&pack.manifest.tenant_id);
+    let import_tenant = canonical_tenant_id(&opts.tenant_id);
+    if pack_tenant != import_tenant {
         return Err(PackVerifyError::TenantMismatch {
             pack_tenant: pack.manifest.tenant_id.clone(),
             import_tenant: opts.tenant_id.clone(),
@@ -643,7 +700,7 @@ pub fn plan_import(
 
     // Facts this exact pack already delivered (idempotent re-import).
     let already_imported: BTreeSet<(String, String, String)> = store
-        .all_facts()
+        .all_facts_for_tenant(import_tenant)
         .filter(|f| !f.deleted && f.source_receipt.as_deref() == Some(pack_ref.as_str()))
         .map(|f| (f.entity.clone(), f.key.clone(), f.value.clone()))
         .collect();
@@ -698,7 +755,10 @@ pub fn plan_import(
             plan.skipped_duplicates += 1;
             continue;
         }
-        let collides = store.fact_history(&entity, &fact.key).iter().any(|f| !f.deleted);
+        let collides = store
+            .fact_history(import_tenant, &entity, &fact.key)
+            .iter()
+            .any(|f| !f.deleted);
         if collides {
             plan.collisions += 1;
         }
@@ -710,7 +770,7 @@ pub fn plan_import(
             .as_ref()
             .map(|a| opts.principal_map.get(a).cloned().unwrap_or_else(|| a.clone()));
         plan.to_store.push(StoreFact {
-            tenant_hash: fact.tenant_hash.clone(),
+            tenant_hash: import_tenant.to_string(),
             entity,
             key: fact.key.clone(),
             value: fact.value.clone(),
@@ -777,6 +837,13 @@ mod tests {
             private,
             horizon_class: None,
             actor: Some("agent:test".into()),
+        }
+    }
+
+    fn sf_for_tenant(tenant: &str, entity: &str, key: &str, value: &str, private: bool) -> StoreFact {
+        StoreFact {
+            tenant_hash: tenant.to_string(),
+            ..sf(entity, key, value, private)
         }
     }
 
@@ -877,7 +944,7 @@ mod tests {
         let mut store = FactStore::new();
         let kept = store.store(sf("keep", "k", "kept-value", false));
         let erased = store.store(sf("erase", "k", "erased-pii-value", false));
-        store.delete(&erased.fact_id);
+        store.delete("default", &erased.fact_id);
 
         // Even with include_private (the widest export), deleted stays home.
         let mut o = opts("local");
@@ -1028,6 +1095,93 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, PackVerifyError::TenantMismatch { .. }));
+    }
+
+    #[test]
+    fn export_contains_only_the_manifest_tenant() {
+        let store = store_with(vec![
+            sf_for_tenant("tenant-a", "shared", "a", "a-value", false),
+            sf_for_tenant("tenant-b", "shared", "b", "b-value", false),
+        ]);
+
+        let (sections, summary) = build_pack_sections(&store, None, &opts("tenant-a"));
+        assert_eq!(sections.facts.len(), 1);
+        assert_eq!(sections.facts[0].tenant_hash, "tenant-a");
+        assert_eq!(sections.facts[0].value, "a-value");
+        assert_eq!(summary.private_flagged, 0);
+    }
+
+    #[test]
+    fn signed_mixed_tenant_pack_is_rejected_atomically() {
+        let source = store_with(vec![sf_for_tenant("tenant-a", "shared", "k", "a-value", false)]);
+        let mut sections = build_pack_sections(&source, None, &opts("tenant-a")).0;
+        let mut foreign = sections.facts[0].clone();
+        foreign.fact_id = "f_foreign".to_string();
+        foreign.tenant_hash = "tenant-b".to_string();
+        sections.facts.push(foreign);
+        let pack = sign_sections(sections, &opts("tenant-a"));
+
+        let err = plan_import(
+            &pack,
+            &FactStore::new(),
+            None,
+            &ImportOptions {
+                tenant_id: "tenant-a".to_string(),
+                ..ImportOptions::default()
+            },
+        )
+        .expect_err("mixed tenant rows must fail before any plan is returned");
+        assert!(matches!(err, PackVerifyError::FactTenantMismatch { .. }));
+    }
+
+    #[test]
+    fn local_alias_maps_to_default_and_import_collision_is_tenant_local() {
+        let source = store_with(vec![sf("shared", "k", "incoming", false)]);
+        let pack = build_signed(&source, None, &opts("local"));
+        assert_eq!(pack.manifest.tenant_id, "default");
+        verify_pack(&pack).expect("canonical default pack verifies");
+        let key = signing_key();
+        let mut legacy_manifest = pack.manifest.clone();
+        legacy_manifest.tenant_id = "local".to_string();
+        let legacy_pack = sign_pack(legacy_manifest, pack.sections.clone(), |hash| key.sign(hash).to_bytes())
+            .expect("legacy alias pack signs");
+        verify_pack(&legacy_pack).expect("signed local/default legacy pack remains valid");
+
+        let mut target = store_with(vec![sf_for_tenant(
+            "tenant-b",
+            "shared",
+            "k",
+            "foreign-local-value",
+            false,
+        )]);
+        let plan = plan_import(
+            &legacy_pack,
+            &target,
+            None,
+            &ImportOptions {
+                tenant_id: "local".to_string(),
+                ..ImportOptions::default()
+            },
+        )
+        .expect("legacy local alias imports into default");
+        assert_eq!(plan.collisions, 0);
+        assert_eq!(plan.to_store[0].tenant_hash, "default");
+        target.try_store_bulk(plan.to_store).unwrap();
+        assert_eq!(target.fact_history("default", "shared", "k").len(), 1);
+        assert_eq!(target.fact_history("tenant-b", "shared", "k").len(), 1);
+    }
+
+    #[test]
+    fn non_default_pack_cannot_carry_unscoped_sessions() {
+        let source = store_with(vec![sf_for_tenant("tenant-a", "shared", "k", "value", false)]);
+        let mut sessions = SessionStore::new();
+        sessions.put("session-a", serde_json::json!({"secret": true}), None);
+
+        let pack = build_signed(&source, Some(&sessions), &opts("tenant-a"));
+        assert!(
+            pack.sections.sessions.is_empty(),
+            "unscoped SessionState rows must not enter a non-default tenant pack"
+        );
     }
 
     #[test]
@@ -1194,7 +1348,7 @@ mod tests {
         // value is retired (reviewable), never destroyed.
         assert_eq!(stored[0].version, 2);
         assert!(stored[0].supersedes.is_some());
-        let history = target.fact_history("shared", "k");
+        let history = target.fact_history("default", "shared", "k");
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].value, "local-value"); // still present
         assert_eq!(history[0].superseded_by.as_deref(), Some(stored[0].fact_id.as_str()));
@@ -1290,7 +1444,7 @@ mod tests {
         store_a.store(sf("bench:lme-s", "baseline", "91.2%", false));
         store_a.store(sf("secret", "k", "private-stays-home", true));
         let dead = store_a.store(sf("gone", "k", "erased", false));
-        store_a.delete(&dead.fact_id);
+        store_a.delete("default", &dead.fact_id);
 
         let pack = build_signed(&store_a, None, &opts("local"));
 

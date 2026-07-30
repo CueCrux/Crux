@@ -704,7 +704,10 @@ mod tests {
         let new = store_fact(&state, "bench:lme-s", "baseline-2026", "91.7%").await;
         {
             let mut s = state.fact_store.write().await;
-            assert!(s.mark_superseded(&old.fact_id, &new.fact_id), "mark superseded");
+            assert!(
+                s.mark_superseded("default", &old.fact_id, &new.fact_id),
+                "mark superseded"
+            );
         }
         let bundle = get_bundle(&state, req(Some("bench:lme-s"), None, Some(2000))).await;
         let items = facts_items(&bundle);

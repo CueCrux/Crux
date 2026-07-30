@@ -107,7 +107,7 @@ pub fn run_memory_export(
     let store = FactStore::with_persistence(&args.data_dir)?;
     let sessions = SessionStore::with_persistence(&args.data_dir)?;
 
-    let scan = cruxpack::private_summary(&store);
+    let scan = cruxpack::private_summary_for_tenant(&store, &args.tenant);
     if args.include_private && !confirm_include_private(&scan) {
         return Err(MemoryPackError::ConfirmationDeclined);
     }
@@ -299,7 +299,7 @@ mod tests {
             horizon_class: None,
             actor: None,
         });
-        store.delete(&erased.fact_id);
+        store.delete("default", &erased.fact_id);
     }
 
     #[test]
