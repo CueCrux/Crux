@@ -169,14 +169,7 @@ fn scope_matches(scope: &ForgetScopeV1, fact: &Fact, before_ts: Option<DateTime<
             fact.entity.starts_with(&format!("__agent::{value}::"))
         }
         ForgetScopeV1::BeforeTimestamp { .. } => before_ts.is_some_and(|cutoff| fact.stored_at < cutoff),
-        ForgetScopeV1::TenantId { value } => {
-            // Tenant scope today is encoded into the entity name via
-            // `tenant:<id>::` or `personal::<id>::` / `business::<id>::`
-            // prefixes. Match either flavour.
-            fact.entity.starts_with(&format!("tenant:{value}::"))
-                || fact.entity.starts_with(&format!("personal::{value}::"))
-                || fact.entity.starts_with(&format!("business::{value}::"))
-        }
+        ForgetScopeV1::TenantId { value } => fact.tenant_hash == *value,
     }
 }
 
@@ -185,14 +178,18 @@ fn scope_matches(scope: &ForgetScopeV1, fact: &Fact, before_ts: Option<DateTime<
 /// caller's RAW agent name (the same keying `memory_pin`/`memory_view` use —
 /// out of agent-passport M5 scope). Returns empty for an unauthenticated
 /// caller. Used to honour the pin-survives-scoped-forget guarantee.
-fn pinned_fact_ids(store: &corecrux_memory::FactStore, agent_name: Option<&str>) -> std::collections::HashSet<String> {
+fn pinned_fact_ids(
+    store: &corecrux_memory::FactStore,
+    tenant_hash: &str,
+    agent_name: Option<&str>,
+) -> std::collections::HashSet<String> {
     let Some(agent) = agent_name else {
         return std::collections::HashSet::new();
     };
     let prefix = format!("{MEMORY_PIN_PREFIX}{agent}::");
     let mut latest: std::collections::HashMap<String, (chrono::DateTime<chrono::Utc>, bool)> =
         std::collections::HashMap::new();
-    for f in store.all_facts() {
+    for f in store.all_facts_for_tenant(tenant_hash) {
         if f.deleted || !f.entity.starts_with(&prefix) || f.key != "pinned" {
             continue;
         }
@@ -214,6 +211,7 @@ fn pinned_fact_ids(store: &corecrux_memory::FactStore, agent_name: Option<&str>)
 #[allow(clippy::too_many_arguments)]
 fn resolve_scope<'a>(
     store: &'a corecrux_memory::FactStore,
+    tenant_hash: &'a str,
     scope: &ForgetScopeV1,
     identity: Option<&str>,
     aliases: &[&str],
@@ -231,7 +229,7 @@ fn resolve_scope<'a>(
     // cannot. Flag-OFF `identity` is the raw agent name and `aliases` is empty,
     // so this is byte-for-byte the prior `scope::fact_visible_to_agent` call.
     let mut matches: Vec<&Fact> = store
-        .all_facts()
+        .all_facts_for_tenant(tenant_hash)
         .filter(|fact| !fact.deleted)
         .filter(|fact| !is_reserved(&fact.entity))
         .filter(|fact| scope::fact_visible_to_identity(fact, identity, aliases))
@@ -242,7 +240,7 @@ fn resolve_scope<'a>(
     // load-bearing. `include_pinned: true` overrides this for a true GDPR
     // Art.17 erasure (a pin protects convenience, not a legal-erasure block).
     if !include_pinned {
-        let pinned = pinned_fact_ids(store, agent_name);
+        let pinned = pinned_fact_ids(store, tenant_hash, agent_name);
         if !pinned.is_empty() {
             matches.retain(|fact| !pinned.contains(&fact.fact_id));
         }
@@ -326,10 +324,12 @@ pub async fn handle_memory_forget_dry_run(args: &Value, ctx: &McpContext) -> Res
     // Raw agent name drives the pin lookup (pins are keyed by raw name). Dry-run
     // mirrors the live forget's pin exclusion so preview == effect.
     let agent_name = scope::agent_name(ctx.agent.as_ref());
+    let tenant_hash = ctx.scope_tenant();
 
     let store = ctx.fact_store.read().await;
     let matches = resolve_scope(
         &store,
+        &tenant_hash,
         &scope,
         id_ref,
         &alias_refs,
@@ -424,11 +424,19 @@ where
             data: Some(json!({"param": "reason", "required": true})),
         });
     }
-    let tenant_id = args
-        .get("tenant_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("default")
-        .to_string();
+    let tenant_id = ctx.scope_tenant();
+    if let Some(requested) = args.get("tenant_id").and_then(|v| v.as_str()) {
+        if requested != tenant_id {
+            return Err(JsonRpcError {
+                code: crate::dispatch::CAPABILITY_DENIED,
+                message: "tenant_id does not match the authenticated MCP tenant".to_string(),
+                data: Some(json!({
+                    "error_code": "TENANT_FORBIDDEN",
+                    "tenant_id": requested,
+                })),
+            });
+        }
+    }
     let token_budget = args.get("token_budget").and_then(|v| v.as_u64()).map(|v| v as usize);
     // Pinned facts survive by default; `include_pinned: true` is the explicit
     // GDPR Art.17 override that erases them too.
@@ -441,6 +449,7 @@ where
         let store = ctx.fact_store.read().await;
         resolve_scope(
             &store,
+            &tenant_id,
             &scope,
             id_ref,
             &alias_refs,
@@ -511,6 +520,25 @@ fn forget_resolved_facts_under_lock(
     identity: Option<&str>,
     aliases: &[&str],
 ) -> Result<usize, JsonRpcError> {
+    let protected_consolidation_ids: Vec<String> = facts
+        .iter()
+        .filter(|fact| {
+            store.is_consolidation_canonical_for_tenant(&fact.fact_id, &fact.tenant_hash)
+                || store.is_active_consolidation_source_for_tenant(&fact.fact_id, &fact.tenant_hash)
+        })
+        .map(|fact| fact.fact_id.clone())
+        .collect();
+    if !protected_consolidation_ids.is_empty() {
+        return Err(JsonRpcError {
+            code: crate::dispatch::CAPABILITY_DENIED,
+            message: "memory_forget cannot partially retire an active consolidation; use dedicated undo".to_string(),
+            data: Some(json!({
+                "error_code": "CONSOLIDATION_REQUIRES_UNDO",
+                "fact_ids": protected_consolidation_ids,
+            })),
+        });
+    }
+
     let blocking_holds = blocking_legal_holds(store, facts);
     if !blocking_holds.is_empty() {
         return Err(legal_hold_active_error(facts, &blocking_holds));
@@ -521,14 +549,16 @@ fn forget_resolved_facts_under_lock(
         // Re-check visibility under the write lock; another concurrent
         // forget could have already soft-deleted this fact_id.
         let still_visible = store
-            .get(&fact.fact_id)
+            .get_for_tenant(&fact.fact_id, &fact.tenant_hash)
             .is_some_and(|current| !current.deleted && scope::fact_visible_to_identity(current, identity, aliases));
         if still_visible
-            && store.try_delete(&fact.fact_id).map_err(|err| JsonRpcError {
-                code: INTERNAL_ERROR,
-                message: "fact journal append failed".to_string(),
-                data: Some(json!({"error": err.to_string()})),
-            })?
+            && store
+                .try_delete(&fact.tenant_hash, &fact.fact_id)
+                .map_err(|err| JsonRpcError {
+                    code: INTERNAL_ERROR,
+                    message: "fact journal append failed".to_string(),
+                    data: Some(json!({"error": err.to_string()})),
+                })?
         {
             forgotten += 1;
         }
@@ -789,6 +819,93 @@ mod tests {
             .await
             .unwrap();
         assert!(q["content"][0]["text"].as_str().unwrap().contains("production-x"));
+    }
+
+    #[tokio::test]
+    async fn memory_forget_rejects_mixed_consolidation_scope_atomically() {
+        let _guard = FeatureFlagGuard::enabled().await;
+        let ctx = agent_ctx("alice");
+        let (ordinary_id, source_ids, canonical_id) = {
+            let mut store = ctx.fact_store.write().await;
+            let ordinary = store.store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: "test-fixture-consolidation-ordinary".to_string(),
+                key: "status".to_string(),
+                value: "keep".to_string(),
+                source_receipt: None,
+                confidence: 0.4,
+                private: false,
+                horizon_class: None,
+                actor: Some("alice".to_string()),
+            });
+            let first = store.store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: "test-fixture-consolidation-case".to_string(),
+                key: "status".to_string(),
+                value: "blocked".to_string(),
+                source_receipt: None,
+                confidence: 0.4,
+                private: false,
+                horizon_class: None,
+                actor: Some("alice".to_string()),
+            });
+            let second = store.store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: "test-fixture-consolidation-case".to_string(),
+                key: "status".to_string(),
+                value: "active".to_string(),
+                source_receipt: None,
+                confidence: 0.5,
+                private: false,
+                horizon_class: None,
+                actor: Some("alice".to_string()),
+            });
+            assert!(store.clear_superseded("default", &first.fact_id));
+            let report = store
+                .consolidate_facts_v1(
+                    "default",
+                    corecrux_memory::fact_store::ConsolidationRequestV1 {
+                        consolidation_id: "forget-atomicity".to_string(),
+                        entity: "test-fixture-consolidation-case".to_string(),
+                        key: "status".to_string(),
+                        canonical_value: "active".to_string(),
+                        target_fact_ids: vec![first.fact_id.clone(), second.fact_id.clone()],
+                        protected_fact_ids: vec![],
+                        confidence: 0.8,
+                        source_receipt: None,
+                        actor: Some("alice".to_string()),
+                        horizon_class: None,
+                        protected_confidence_floor: 0.99,
+                    },
+                )
+                .unwrap();
+            (
+                ordinary.fact_id,
+                vec![first.fact_id, second.fact_id],
+                report.receipt.canonical_fact_id,
+            )
+        };
+
+        let err = handle_memory_forget(
+            &json!({
+                "scope": {
+                    "type": "entity_prefix",
+                    "value": "test-fixture-consolidation-"
+                },
+                "reason": "must use dedicated consolidation undo",
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, crate::dispatch::CAPABILITY_DENIED);
+        assert_eq!(err.data.as_ref().unwrap()["error_code"], "CONSOLIDATION_REQUIRES_UNDO");
+
+        let store = ctx.fact_store.read().await;
+        for fact_id in source_ids.iter().chain([&ordinary_id, &canonical_id]) {
+            let fact = store.get_for_tenant(fact_id, "default").unwrap();
+            assert!(!fact.deleted, "{fact_id} must survive the rejected mixed forget");
+        }
     }
 
     #[tokio::test]

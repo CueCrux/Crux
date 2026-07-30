@@ -165,7 +165,8 @@ pub async fn handle_audit_export_bundle(args: &Value, ctx: &McpContext) -> Resul
         let mut out: Vec<Fact> = Vec::new();
         let mut tokens_used = 0usize;
         // Sort by (stored_at, fact_id) for deterministic bundles.
-        let mut all: Vec<&Fact> = store.all_facts().collect();
+        let tenant_hash = ctx.scope_tenant();
+        let mut all: Vec<&Fact> = store.all_facts_for_tenant(&tenant_hash).collect();
         all.sort_by(|a, b| a.stored_at.cmp(&b.stored_at).then_with(|| a.fact_id.cmp(&b.fact_id)));
         for fact in all {
             if let Some(since) = since_dt {

@@ -2759,6 +2759,73 @@ async fn delete_fact_rejects_daemon_owned_control_record() {
     assert!(!state.fact_store.read().await.get(&fact_id).unwrap().deleted);
 }
 
+#[tokio::test]
+async fn delete_fact_requires_dedicated_undo_for_consolidation_canonical() {
+    let state = test_app_state(16);
+    let (first_id, second_id, canonical_id) = {
+        let mut store = state.fact_store.write().await;
+        let first = store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "proj".to_string(),
+            key: "status".to_string(),
+            value: "blocked".to_string(),
+            source_receipt: None,
+            confidence: 0.2,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        let second = store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "proj".to_string(),
+            key: "status".to_string(),
+            value: "active".to_string(),
+            source_receipt: None,
+            confidence: 0.3,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        assert!(store.clear_superseded("default", &first.fact_id));
+        let report = store
+            .consolidate_facts_v1(
+                "default",
+                corecrux_memory::fact_store::ConsolidationRequestV1 {
+                    consolidation_id: "con-http-delete".to_string(),
+                    entity: "proj".to_string(),
+                    key: "status".to_string(),
+                    canonical_value: "settled".to_string(),
+                    target_fact_ids: vec![first.fact_id.clone(), second.fact_id.clone()],
+                    protected_fact_ids: vec![],
+                    confidence: 0.8,
+                    source_receipt: None,
+                    actor: Some("operator:unverified:test".to_string()),
+                    horizon_class: None,
+                    protected_confidence_floor: 0.99,
+                },
+            )
+            .unwrap();
+        (first.fact_id, second.fact_id, report.receipt.canonical_fact_id)
+    };
+
+    let resp = delete_fact(State(state.clone()), HeaderMap::new(), Path(canonical_id.clone()))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = json_body(resp).await;
+    assert_eq!(body["code"], "CONSOLIDATION_CANONICAL_REQUIRES_UNDO");
+    let store = state.fact_store.read().await;
+    assert!(store.get(&canonical_id).is_some());
+    assert_eq!(
+        store.get(&first_id).unwrap().superseded_by.as_deref(),
+        Some(canonical_id.as_str())
+    );
+    assert_eq!(
+        store.get(&second_id).unwrap().superseded_by.as_deref(),
+        Some(canonical_id.as_str())
+    );
+}
+
 // ── Fact Store (GET /v1/facts/entity/{entity}) ──────────────────
 
 #[tokio::test]
@@ -3525,7 +3592,7 @@ async fn list_facts_always_excludes_private_and_deleted() {
     let deleted_id = store_plain_fact(&state, "note", "gone", "deleted-value").await;
     {
         let mut store = state.fact_store.write().await;
-        store.delete(&deleted_id);
+        store.delete("default", &deleted_id);
         store.store(corecrux_memory::fact_store::StoreFact {
             tenant_hash: "default".to_string(),
             entity: crux_mcp::scope::private_entity_for_agent("alice", "notes"),
@@ -11027,7 +11094,7 @@ async fn console_review_contradictions_returns_factstore_candidates() {
             horizon_class: None,
             actor: None,
         });
-        assert!(store.clear_superseded(&first.fact_id));
+        assert!(store.clear_superseded("default", &first.fact_id));
         (first.fact_id, second.fact_id)
     };
 
@@ -11243,7 +11310,7 @@ async fn console_review_consolidation_supersedes_targets_with_actor() {
             horizon_class: None,
             actor: None,
         });
-        assert!(store.clear_superseded(&old.fact_id));
+        assert!(store.clear_superseded("default", &old.fact_id));
         (old.fact_id, newer.fact_id)
     };
 
@@ -11259,7 +11326,7 @@ async fn console_review_consolidation_supersedes_targets_with_actor() {
             protected_fact_ids: vec![],
             confidence: 0.8,
             source_receipt: None,
-            actor: None,
+            actor: Some("forged-body-actor".to_string()),
             horizon_class: Some(corecrux_memory::fact_store::HorizonClass::Stable),
             protected_confidence_floor: 0.99,
         }),
@@ -11284,7 +11351,12 @@ async fn console_review_consolidation_supersedes_targets_with_actor() {
     );
     assert_eq!(
         store.get(&canonical_id).unwrap().actor.as_deref(),
-        Some("passport:reviewer")
+        Some("operator:unverified:passport:reviewer")
+    );
+    assert_ne!(
+        store.get(&canonical_id).unwrap().actor.as_deref(),
+        Some("forged-body-actor"),
+        "body actor must never become signed or stored authority"
     );
 }
 
@@ -14124,6 +14196,144 @@ fn work_auth_missing_tenant_headers(passport_id: &str, scopes: &str) -> HeaderMa
         "scope": scopes,
         "passport_id": passport_id,
     }))
+}
+
+#[tokio::test]
+async fn fact_aggregate_requires_and_enforces_one_authorized_tenant() {
+    let state = work_auth_test_state(16);
+    {
+        let mut store = state.fact_store.write().await;
+        for (tenant, entity, value) in [
+            ("tenant-a", "metric:a1", "10"),
+            ("tenant-a", "metric:a2", "20"),
+            ("tenant-b", "metric:b1", "999"),
+        ] {
+            store.store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: tenant.to_string(),
+                entity: entity.to_string(),
+                key: "amount".to_string(),
+                value: value.to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            });
+        }
+    }
+    let request = corecrux_memory::fact_store::AggregateRequestV1 {
+        op: corecrux_memory::fact_store::AggregateOp::Count,
+        entity: None,
+        key: Some("amount".to_string()),
+        query: None,
+        as_of: None,
+        token_budget: None,
+    };
+
+    let a = facts::post_aggregate(
+        State(state.clone()),
+        work_auth_headers("tenant-a", None, "query:read"),
+        Json(request.clone()),
+    )
+    .await
+    .into_response();
+    assert_eq!(a.status(), StatusCode::OK);
+    assert_eq!(json_body(a).await["value"], serde_json::json!(2));
+
+    let b = facts::post_aggregate(
+        State(state.clone()),
+        work_auth_headers("tenant-b", None, "query:read"),
+        Json(request.clone()),
+    )
+    .await
+    .into_response();
+    assert_eq!(b.status(), StatusCode::OK);
+    assert_eq!(json_body(b).await["value"], serde_json::json!(1));
+
+    let missing = facts::post_aggregate(
+        State(state.clone()),
+        work_auth_missing_tenant_headers("passport-a", "query:read"),
+        Json(request.clone()),
+    )
+    .await
+    .into_response();
+    assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .saturating_add(3_600) as usize;
+    let multi_headers = work_auth_headers_from_claims(serde_json::json!({
+        "exp": exp,
+        "iss": WORK_AUTH_TEST_ISSUER,
+        "aud": WORK_AUTH_TEST_AUDIENCE,
+        "scope": "query:read",
+        "tenants": ["tenant-a", "tenant-b"],
+    }));
+    let ambiguous = facts::post_aggregate(State(state), multi_headers, Json(request))
+        .await
+        .into_response();
+    assert_eq!(ambiguous.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn fact_export_tenant_filter_precedes_pagination() {
+    let state = work_auth_test_state(16);
+    let (a1, a2) = {
+        let mut store = state.fact_store.write().await;
+        let put = |store: &mut corecrux_memory::FactStore, tenant: &str, entity: &str, value: &str| {
+            store.store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: tenant.to_string(),
+                entity: entity.to_string(),
+                key: "k".to_string(),
+                value: value.to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            })
+        };
+        put(&mut store, "tenant-b", "b1", "foreign-first");
+        let a1 = put(&mut store, "tenant-a", "a1", "a-first");
+        put(&mut store, "tenant-b", "b2", "foreign-middle");
+        let a2 = put(&mut store, "tenant-a", "a2", "a-second");
+        (a1, a2)
+    };
+
+    let page1 = facts::export_facts(
+        State(state.clone()),
+        work_auth_headers("tenant-a", None, "query:read"),
+        Query(ExportFactsParams {
+            since: None,
+            cursor: None,
+            limit: Some(1),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(page1.status(), StatusCode::OK);
+    let page1 = json_body(page1).await;
+    assert_eq!(page1["facts"][0]["fact_id"], a1.fact_id);
+    assert_eq!(page1["next_cursor"], a1.fact_id);
+    assert_eq!(page1["has_more"], true);
+
+    let page2 = facts::export_facts(
+        State(state),
+        work_auth_headers("tenant-a", None, "query:read"),
+        Query(ExportFactsParams {
+            since: None,
+            cursor: page1["next_cursor"].as_str().map(str::to_string),
+            limit: Some(1),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(page2.status(), StatusCode::OK);
+    let page2 = json_body(page2).await;
+    assert_eq!(page2["facts"][0]["fact_id"], a2.fact_id);
+    assert_eq!(page2["has_more"], false);
 }
 
 #[serial_test::serial]
@@ -19925,7 +20135,7 @@ async fn memory_import_collision_supersedes_never_overwrites() {
     assert_eq!(body["collisions_superseded"], 1);
 
     let store = state.fact_store.read().await;
-    let history = store.fact_history("shared", "k");
+    let history = store.fact_history("default", "shared", "k");
     assert_eq!(history.len(), 2, "local value retired, never destroyed");
     assert_eq!(history[0].value, "local-value");
     assert!(history[0].superseded_by.is_some());

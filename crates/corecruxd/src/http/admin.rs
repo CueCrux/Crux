@@ -2700,7 +2700,7 @@ mod compact_facts_tests {
         let mut fs = FactStore::with_persistence(dir.path()).unwrap();
         let deleted = fs.store(store_fact("erase-this-pii"));
         fs.store(store_fact("keep-this"));
-        fs.delete(&deleted.fact_id);
+        fs.delete("default", &deleted.fact_id);
         state.fact_store = std::sync::Arc::new(tokio::sync::RwLock::new(fs));
 
         // Pre-condition: deleted value is still on disk (the soft-delete leak).
@@ -2761,7 +2761,7 @@ mod compact_facts_tests {
         let mut fs = FactStore::with_persistence(dir.path()).unwrap();
         let deleted = fs.store(store_fact(SECRET));
         fs.store(store_fact("keep-this"));
-        fs.delete(&deleted.fact_id);
+        fs.delete("default", &deleted.fact_id);
         state.fact_store = std::sync::Arc::new(tokio::sync::RwLock::new(fs));
 
         let params = serde_json::json!({ "reason": "gdpr-erasure-test" });
@@ -2816,7 +2816,7 @@ mod compact_facts_tests {
 
         let mut fs = FactStore::with_persistence(dir.path()).unwrap();
         let d = fs.store(store_fact("verify-me-then-erase"));
-        fs.delete(&d.fact_id);
+        fs.delete("default", &d.fact_id);
         state.fact_store = std::sync::Arc::new(tokio::sync::RwLock::new(fs));
 
         let params = serde_json::json!({ "reason": "verify-test" });
@@ -2934,7 +2934,7 @@ mod compact_facts_tests {
                 actor: Some("p_legal".to_string()),
             })
             .unwrap();
-        assert!(fs.delete(&held.fact_id));
+        assert!(fs.delete("default", &held.fact_id));
         state.fact_store = std::sync::Arc::new(tokio::sync::RwLock::new(fs));
 
         let ordinary = serde_json::json!({"reason": "ordinary hard deletion"});

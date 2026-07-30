@@ -106,12 +106,17 @@ fn pinned_fact_ids(facts: &[Fact]) -> std::collections::HashSet<String> {
 ///
 /// Mirrors what the scheduler surfaces; factored out so it is testable
 /// without a running task. `limit` bounds the underlying pass.
-pub fn select_actionable_candidates(store: &FactStore, facts: &[Fact], limit: usize) -> Vec<ContradictionCandidateV1> {
+pub fn select_actionable_candidates(
+    store: &FactStore,
+    tenant_hash: &str,
+    facts: &[Fact],
+    limit: usize,
+) -> Vec<ContradictionCandidateV1> {
     let pinned = pinned_fact_ids(facts);
     let by_id: std::collections::HashMap<&str, &Fact> = facts.iter().map(|f| (f.fact_id.as_str(), f)).collect();
 
     store
-        .contradiction_candidates_v1(limit)
+        .contradiction_candidates_v1(tenant_hash, limit)
         .into_iter()
         .filter(|c| {
             // Keep the group only if some member is actionable (unprotected).
@@ -196,56 +201,70 @@ pub fn select_expiry_candidates(
 /// written — a clean store produces no noise).
 pub async fn run_review_once(store: &Arc<RwLock<FactStore>>, limit: usize) -> usize {
     let surfaced_at = Utc::now();
-    let (candidates, expiry_candidates, run_id) = {
+    let reviews = {
         let guard = store.read().await;
-        let facts: Vec<Fact> = guard.all_facts().cloned().collect();
-        let candidates = select_actionable_candidates(&guard, &facts, limit);
-        // P1 widen: also propose stale-past-horizon + low-confidence facts as
-        // (read-only) expiry proposals, using the SAME decay logic recall ranks
-        // by so "stale" means one thing across the daemon.
         let policy = decay::DecayPolicy::from_env();
-        let expiry_candidates = select_expiry_candidates(&facts, surfaced_at, policy, limit);
-        (
-            candidates,
-            expiry_candidates,
-            format!("run_{}", uuid::Uuid::new_v4().simple()),
-        )
+        let tenants: std::collections::BTreeSet<String> =
+            guard.all_facts().map(|fact| fact.tenant_hash.clone()).collect();
+        tenants
+            .into_iter()
+            .filter_map(|tenant_hash| {
+                let facts: Vec<Fact> = guard.all_facts_for_tenant(&tenant_hash).cloned().collect();
+                let candidates = select_actionable_candidates(&guard, &tenant_hash, &facts, limit);
+                // P1 widen: also propose stale-past-horizon + low-confidence
+                // facts, using the SAME decay logic recall ranks by.
+                let expiry_candidates = select_expiry_candidates(&facts, surfaced_at, policy, limit);
+                if candidates.is_empty() && expiry_candidates.is_empty() {
+                    None
+                } else {
+                    Some((
+                        tenant_hash,
+                        candidates,
+                        expiry_candidates,
+                        format!("run_{}", uuid::Uuid::new_v4().simple()),
+                    ))
+                }
+            })
+            .collect::<Vec<_>>()
     };
-    if candidates.is_empty() && expiry_candidates.is_empty() {
+    if reviews.is_empty() {
         return 0;
     }
 
-    let body = serde_json::json!({
-        "schema": "crux.consolidation_review.v1",
-        "run_id": run_id,
-        "surfaced_at": surfaced_at.to_rfc3339(),
-        "count": candidates.len(),
-        "expiry_count": expiry_candidates.len(),
-        "resolution": "explicit",
-        "note": "detect+surface only; resolve contradictions via memory_consolidate or the console review route; apply expiry proposals via POST /v1/console/review/expiries or per-fact delete",
-        "candidates": candidates,
-        "expiry_candidates": expiry_candidates,
-    });
-
-    // Append-only receipt fact. Stable (never decays) so an audit replay can
-    // always find the surfacing event; the scheduler is the only writer.
-    let req = StoreFact {
-        tenant_hash: "default".to_string(),
-        entity: format!("{REVIEW_ENTITY_PREFIX}{run_id}"),
-        key: "review".to_string(),
-        value: body.to_string(),
-        source_receipt: Some(run_id.clone()),
-        confidence: 1.0,
-        private: false,
-        horizon_class: Some(HorizonClass::Stable),
-        actor: Some("consolidation-scheduler".to_string()),
-    };
-
+    let mut surfaced = 0usize;
     let mut guard = store.write().await;
-    if let Err(err) = guard.try_store(req) {
-        tracing::warn!(?err, "consolidation-review-receipt-append-failed");
+    for (tenant_hash, candidates, expiry_candidates, run_id) in reviews {
+        surfaced += candidates.len() + expiry_candidates.len();
+        let body = serde_json::json!({
+            "schema": "crux.consolidation_review.v1",
+            "tenant_hash": tenant_hash,
+            "run_id": run_id,
+            "surfaced_at": surfaced_at.to_rfc3339(),
+            "count": candidates.len(),
+            "expiry_count": expiry_candidates.len(),
+            "resolution": "explicit",
+            "note": "detect+surface only; resolve contradictions via memory_consolidate or the console review route; apply expiry proposals via POST /v1/console/review/expiries or per-fact delete",
+            "candidates": candidates,
+            "expiry_candidates": expiry_candidates,
+        });
+        // Append-only receipt fact. Stable (never decays) so an audit replay can
+        // always find the surfacing event; the scheduler is the only writer.
+        let req = StoreFact {
+            tenant_hash,
+            entity: format!("{REVIEW_ENTITY_PREFIX}{run_id}"),
+            key: "review".to_string(),
+            value: body.to_string(),
+            source_receipt: Some(run_id),
+            confidence: 1.0,
+            private: false,
+            horizon_class: Some(HorizonClass::Stable),
+            actor: Some("consolidation-scheduler".to_string()),
+        };
+        if let Err(err) = guard.try_store(req) {
+            tracing::warn!(?err, "consolidation-review-receipt-append-failed");
+        }
     }
-    candidates.len() + expiry_candidates.len()
+    surfaced
 }
 
 /// Spawn the background consolidation-review task, mirroring
@@ -312,7 +331,7 @@ mod tests {
     fn seed_conflict(store: &mut FactStore, entity: &str, key: &str, conf: f32) -> (String, String) {
         let a = store_fact(store, entity, key, "enabled", conf, false);
         let b = store_fact(store, entity, key, "disabled", conf, false);
-        store.clear_superseded(&a.fact_id);
+        store.clear_superseded("default", &a.fact_id);
         (a.fact_id, b.fact_id)
     }
 
@@ -321,7 +340,7 @@ mod tests {
         let mut store = FactStore::new();
         seed_conflict(&mut store, "service:api", "enabled", 0.7);
         let facts: Vec<Fact> = store.all_facts().cloned().collect();
-        let surfaced = select_actionable_candidates(&store, &facts, 50);
+        let surfaced = select_actionable_candidates(&store, "default", &facts, 50);
         assert_eq!(surfaced.len(), 1, "one actionable contradiction");
         assert_eq!(surfaced[0].entity, "service:api");
     }
@@ -332,7 +351,7 @@ mod tests {
         // Both members at/above the protected floor → group is not actionable.
         seed_conflict(&mut store, "service:api", "enabled", 1.0);
         let facts: Vec<Fact> = store.all_facts().cloned().collect();
-        let surfaced = select_actionable_candidates(&store, &facts, 50);
+        let surfaced = select_actionable_candidates(&store, "default", &facts, 50);
         assert!(
             surfaced.is_empty(),
             "all-protected group must not be surfaced, got {surfaced:?}"
@@ -347,10 +366,10 @@ mod tests {
         // could consolidate the actionable one.
         let a = store_fact(&mut store, "svc", "on", "enabled", 1.0, false);
         let b = store_fact(&mut store, "svc", "on", "disabled", 0.5, false);
-        store.clear_superseded(&a.fact_id);
+        store.clear_superseded("default", &a.fact_id);
         let _ = b;
         let facts: Vec<Fact> = store.all_facts().cloned().collect();
-        let surfaced = select_actionable_candidates(&store, &facts, 50);
+        let surfaced = select_actionable_candidates(&store, "default", &facts, 50);
         assert_eq!(surfaced.len(), 1);
     }
 
@@ -376,7 +395,7 @@ mod tests {
             false,
         );
         let facts: Vec<Fact> = store.all_facts().cloned().collect();
-        let surfaced = select_actionable_candidates(&store, &facts, 50);
+        let surfaced = select_actionable_candidates(&store, "default", &facts, 50);
         assert!(surfaced.is_empty(), "both-pinned group must not be surfaced");
     }
 
