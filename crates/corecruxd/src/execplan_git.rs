@@ -34,8 +34,10 @@
 //!   Getting this wrong is silent — git clones happily into the wrong place and
 //!   the board simply stays empty — so a mismatch is validated and reported.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -45,8 +47,14 @@ pub const GIT_INTERVAL_ENV: &str = "CRUX_EXECPLANS_GIT_INTERVAL_SECS";
 pub const GIT_CHECKOUT_ENV: &str = "CRUX_EXECPLANS_GIT_CHECKOUT";
 
 const DEFAULT_BRANCH: &str = "main";
-/// A hung `git` on an unreachable remote must not wedge the refresh task.
+/// A hung `git` must not wedge the refresh task. Enforced as a wall-clock
+/// deadline in [`run_git_deadline`], which covers local invocations too —
+/// see that function for why the `GIT_HTTP_LOW_SPEED_*` pair never did.
 const GIT_TIMEOUT_SECS: u64 = 120;
+/// How often the deadline loop checks whether `git` has exited. Small enough
+/// that a fast command is not measurably delayed, large enough that a slow
+/// one does not spin a core.
+const GIT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitConfig {
@@ -108,6 +116,31 @@ impl SyncOutcome {
 }
 
 fn run_git(dir: Option<&Path>, args: &[&str]) -> Result<String, String> {
+    run_git_deadline(dir, args, Duration::from_secs(GIT_TIMEOUT_SECS))
+}
+
+/// Run `git` under a **wall-clock deadline**, killing it if it outlives one.
+///
+/// The `GIT_HTTP_LOW_SPEED_*` pair below is not a timeout. It is a
+/// smart-HTTP-transport stall detector: it aborts a transfer that has moved
+/// fewer than `LOW_SPEED_LIMIT` bytes/sec for `LOW_SPEED_TIME` seconds, and
+/// it is consulted by nothing else. An SSH remote does not read it, and a
+/// purely local invocation (`status`, `rev-parse`, `commit`, an index lock
+/// held by another process) never involves the transport at all. Those paths
+/// were therefore unbounded: `Command::output()` waits forever, and the
+/// refresh task that called it waited with it.
+///
+/// So the deadline is enforced here instead, and it covers every invocation
+/// rather than the HTTP ones alone. Both settings are kept: the stall
+/// detector still fails a dead HTTP transfer sooner than the hard deadline
+/// would, with a better error message.
+///
+/// Output is drained on separate threads for the duration. `try_wait` +
+/// piped stdio without concurrent readers deadlocks as soon as a child
+/// writes more than one pipe buffer — the child blocks on the write, the
+/// parent blocks on the clock, and neither ever moves. `git` is perfectly
+/// capable of emitting more than a pipe buffer.
+fn run_git_deadline(dir: Option<&Path>, args: &[&str], timeout: Duration) -> Result<String, String> {
     let mut cmd = Command::new("git");
     if let Some(d) = dir {
         cmd.current_dir(d);
@@ -119,12 +152,51 @@ fn run_git(dir: Option<&Path>, args: &[&str]) -> Result<String, String> {
     cmd.env("GIT_HTTP_LOW_SPEED_LIMIT", "1000");
     cmd.env("GIT_HTTP_LOW_SPEED_TIME", GIT_TIMEOUT_SECS.to_string());
     cmd.args(args);
-    let out = cmd.output().map_err(|e| format!("git {}: {e}", args.join(" ")))?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+    let mut child_stdout = child.stdout.take().ok_or_else(|| "git: no stdout pipe".to_string())?;
+    let mut child_stderr = child.stderr.take().ok_or_else(|| "git: no stderr pipe".to_string())?;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = child_stdout.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = child_stderr.read_to_end(&mut buf);
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    // Kill, then reap, so we do not leave a zombie behind.
+                    // The reader threads unblock on their own once the pipes
+                    // close; they are detached rather than joined so a wedged
+                    // child cannot make the deadline itself unbounded.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("git {} timed out after {}s", args.join(" "), timeout.as_secs()));
+                }
+                std::thread::sleep(GIT_POLL_INTERVAL);
+            }
+            Err(e) => return Err(format!("git {}: {e}", args.join(" "))),
+        }
+    };
+
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
         return Err(format!("git {} failed: {stderr}", args.join(" ")));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&stdout).trim().to_string())
 }
 
 fn is_git_repo(root: &Path) -> bool {
@@ -315,6 +387,66 @@ mod tests {
         let p = std::env::temp_dir().join(format!("crux-execplan-git-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         p
+    }
+
+    /// The deadline must fire on a *local* invocation. This is the case the
+    /// `GIT_HTTP_LOW_SPEED_*` pair never covered: no transport is involved,
+    /// so before the deadline existed this call would have blocked for the
+    /// full sleep — or, with a wedged index lock in production, forever.
+    ///
+    /// `!`-prefixed git aliases run through the shell, which gives a real
+    /// `git` process that is deterministically slow without needing a remote.
+    #[test]
+    fn run_git_kills_a_command_that_outlives_its_deadline() {
+        let repo = tmp("deadline");
+        seed_origin(&repo);
+
+        let started = Instant::now();
+        let err = run_git_deadline(
+            Some(&repo),
+            &["-c", "alias.crux-sleep=!sleep 30", "crux-sleep"],
+            Duration::from_millis(400),
+        )
+        .expect_err("a 30s command under a 400ms deadline must fail");
+        let elapsed = started.elapsed();
+
+        assert!(err.contains("timed out"), "expected a timeout error, got: {err}");
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "deadline did not actually bound the wait: {elapsed:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// The deadline must not change the behaviour of a command that finishes:
+    /// stdout is still captured and trimmed, and a failure still carries
+    /// git's stderr.
+    #[test]
+    fn run_git_deadline_preserves_success_and_failure_shapes() {
+        let repo = tmp("deadline-shapes");
+        seed_origin(&repo);
+
+        let branch = run_git_deadline(
+            Some(&repo),
+            &["rev-parse", "--abbrev-ref", "HEAD"],
+            Duration::from_secs(30),
+        )
+        .expect("rev-parse succeeds");
+        assert_eq!(branch, "main");
+
+        let err = run_git_deadline(Some(&repo), &["rev-parse", "no-such-ref"], Duration::from_secs(30))
+            .expect_err("an unknown ref must fail");
+        assert!(
+            err.contains("failed:"),
+            "expected git's stderr in the error, got: {err}"
+        );
+        assert!(
+            !err.contains("timed out"),
+            "a fast failure must not read as a timeout: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     /// Build a throwaway origin with one plan committed, and return its path.
