@@ -379,6 +379,23 @@ pub(super) async fn get_code_path(
     };
     let spans = load_spans(&state, &q.tenant_id);
     let path = crate::code_intel::code_path(&spans, entry, q.token_budget);
+
+    if q.all_repos {
+        // This route reads the span window only — no static scan — and the window
+        // is already tenant-wide, so the answer *is* cross-repo whether or not the
+        // flag is set. Saying so beats accepting the flag and discarding it: a
+        // caller that sets `all_repos` and gets an unannotated single-repo-shaped
+        // body cannot tell "already aggregate" from "silently ignored".
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "aggregate": true,
+                "aggregate_basis": "runtime spans are tenant-wide; no static scan is consulted",
+                "path": path,
+            })),
+        )
+            .into_response();
+    }
     (StatusCode::OK, Json(path)).into_response()
 }
 
@@ -505,11 +522,31 @@ pub(super) async fn get_liveness(
     let Some(symbol) = q.symbol.as_deref() else {
         return problem_response(StatusCode::BAD_REQUEST, "symbol is required");
     };
+    let spans = load_spans(&state, &q.tenant_id);
+
+    if q.all_repos {
+        // P1. Liveness reads the static scan as well as the span window, so a
+        // single-repo scan answers "is this used" against one repo's references
+        // only — which is the wrong answer, not a partial one, when the caller
+        // lives elsewhere in the estate.
+        let (scan, repos) = crate::repo_aggregate::aggregate_tenant(&state, &q.tenant_id).await;
+        let l = crate::code_intel::liveness(&scan, &spans, symbol);
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "aggregate": true,
+                "repos": repos,
+                "liveness": l,
+                "precision": "superset: cross-repo edges resolve by symbol name",
+            })),
+        )
+            .into_response();
+    }
+
     let repo_id = q.repo_id.as_deref().unwrap_or("crux");
     let Some(scan) = load_scan(&state, &q.tenant_id, repo_id).await else {
         return problem_response(StatusCode::NOT_FOUND, "no scan for this repo; register it first");
     };
-    let spans = load_spans(&state, &q.tenant_id);
     let l = crate::code_intel::liveness(&scan, &spans, symbol);
     (StatusCode::OK, Json(l)).into_response()
 }
@@ -569,6 +606,20 @@ pub(super) async fn get_trace_diff(
     };
     let spans = load_spans(&state, &q.tenant_id);
     let d = crate::code_intel::trace_diff(&spans, a, b, q.token_budget);
+
+    if q.all_repos {
+        // Span-only, like code_path: the window is already tenant-wide, so this is
+        // annotated rather than silently dropping the flag.
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "aggregate": true,
+                "aggregate_basis": "runtime spans are tenant-wide; no static scan is consulted",
+                "diff": d,
+            })),
+        )
+            .into_response();
+    }
     (StatusCode::OK, Json(d)).into_response()
 }
 
@@ -590,11 +641,32 @@ pub(super) async fn get_dead_code_ladder(
     if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
         return problem.into_response();
     }
+    let spans = load_spans(&state, &q.tenant_id);
+
+    if q.all_repos {
+        // P1, and the highest-stakes aggregate on this surface. A symbol defined
+        // in repo A and referenced only from repo B is statically unreferenced
+        // *within A*, so a single-repo ladder reports it as dead. Someone acting
+        // on that deletes live code. Aggregating first is what makes the verdict
+        // safe to act on.
+        let (scan, repos) = crate::repo_aggregate::aggregate_tenant(&state, &q.tenant_id).await;
+        let ladder = crate::code_intel::dead_code_ladder(&scan, &spans, q.symbol.as_deref(), q.token_budget);
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "aggregate": true,
+                "repos": repos,
+                "ladder": ladder,
+                "precision": "superset: cross-repo edges resolve by symbol name",
+            })),
+        )
+            .into_response();
+    }
+
     let repo_id = q.repo_id.as_deref().unwrap_or("crux");
     let Some(scan) = load_scan(&state, &q.tenant_id, repo_id).await else {
         return problem_response(StatusCode::NOT_FOUND, "no scan for this repo; register it first");
     };
-    let spans = load_spans(&state, &q.tenant_id);
     let ladder = crate::code_intel::dead_code_ladder(&scan, &spans, q.symbol.as_deref(), q.token_budget);
     (StatusCode::OK, Json(ladder)).into_response()
 }

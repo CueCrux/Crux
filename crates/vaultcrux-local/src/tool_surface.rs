@@ -379,9 +379,24 @@ pub const TOOL_SURFACE: &[ToolSurfaceEntry] = &[
     // Runtime code intelligence (crux-codemap-agent-surface M1). Local because
     // each one proxies a /v1/code-intel/* route on whichever daemon the client
     // is already connected to, reading that daemon's own workspace scan and
-    // trace store — no hosted control plane is involved. The Pro surface these
-    // could sit behind is specified in that plan's M5 and deliberately not
-    // built, so HostedGated would gate them on a plane that does not exist.
+    // trace store — no hosted control plane is involved.
+    //
+    // These stay Local for a narrower reason than the one originally written
+    // here. That comment said the Pro surface was "deliberately not built"; it is
+    // now built — `all_repos` on /v1/code-intel/* aggregates across a tenant's
+    // registered repos (crux-code-intel-pro-hosted-surface M3). What keeps these
+    // entries honest is that **the MCP tools do not expose `all_repos`**, so no
+    // MCP caller can reach the hosted capability through them.
+    //
+    // The HTTP routes are a different matter and are NOT gated by tier today.
+    // Per Constraint 3 of that plan ("tier alone decides") the aggregate path
+    // needs a per-tenant RcxTier check, which belongs to
+    // crux-pro-capabilities-rcx-entitled-2026-07-27. The process-wide
+    // `OperatingMode::includes_pro()` must NOT be used for it: on a multi-tenant
+    // daemon every tenant resolves to the same answer, which is the same
+    // process-configuration defect M3b exists to remove. **If `all_repos` is ever
+    // added to an MCP tool, that tool must become HostedGated in the same commit**
+    // — a missing entry silently grants it to Free.
     ToolSurfaceEntry {
         name: "code_blast_radius",
         tier: ToolTier::Local,
