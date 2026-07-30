@@ -16552,6 +16552,7 @@ async fn storybook_post_generate_then_get_latest() {
         State(state.clone()),
         Path("alpha".to_string()),
         dev_scope_headers("admin:read facts:write"),
+        Query(super::traces::OptionalTenantQuery::default()),
     )
     .await
     .into_response();
@@ -16600,6 +16601,7 @@ async fn storybook_post_generate_requires_facts_write() {
         State(state),
         Path("alpha".to_string()),
         dev_scope_headers("admin:read"), // missing facts:write
+        Query(super::traces::OptionalTenantQuery::default()),
     )
     .await
     .into_response();
@@ -20982,4 +20984,94 @@ async fn m4_a_pack_restores_headroom_without_touching_the_repos() {
     assert_eq!(after["over_allowance"], false, "a pack must clear the overage");
     assert_eq!(after["used"], 9, "buying a pack changes entitlement, not usage");
     assert_eq!(after["remaining"], 9);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// M3b — the three span-reading surfaces now honour a requested tenant.
+//
+// Gate: each names a tenant in the request and is covered by the M2 adversarial
+// pattern (tenant B refused against tenant A) with a positive control. Real
+// HS256 tokens, not DevScopes — DevScopes sets TenantAllow::Any and would make
+// these pass against a daemon with no isolation at all.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m3b_trace_list_refuses_a_tenant_the_caller_does_not_hold() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    let resp = super::traces::list_traces(
+        State(state.clone()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::TraceSpansQuery {
+            limit: Some(10),
+            trace_id: None,
+        }),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-a".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "naming another tenant must be refused, not silently answered"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m3b_trace_list_allows_the_tenant_the_caller_does_hold() {
+    // Positive control: the refusal above must not be a surface that refuses
+    // everything the moment a tenant is named.
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    let resp = super::traces::list_traces(
+        State(state.clone()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::TraceSpansQuery {
+            limit: Some(10),
+            trace_id: None,
+        }),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-b".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["tenant_id"], "tenant-b");
+    assert_eq!(
+        body["tenant_scope"], "request",
+        "a named tenant must report request scope, not the daemon fallback"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m3b_unbound_request_declares_the_daemon_fallback() {
+    // The fallback is legitimate on a single-tenant daemon and must be visible.
+    // A surface that answers from process configuration without saying so is
+    // what M2 was written to prevent.
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    let resp = super::traces::list_traces(
+        State(state.clone()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::TraceSpansQuery {
+            limit: Some(10),
+            trace_id: None,
+        }),
+        Query(super::traces::OptionalTenantQuery { tenant_id: None }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["tenant_scope"], "daemon-capture-tenant",
+        "an unbound read must declare that it answered for the capture tenant"
+    );
 }

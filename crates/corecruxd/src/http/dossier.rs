@@ -80,6 +80,7 @@ pub(super) async fn post_auto(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
     headers: HeaderMap,
+    Query(tenant_q): Query<super::traces::OptionalTenantQuery>,
 ) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read", "facts:write"]) {
         return problem.into_response();
@@ -89,14 +90,15 @@ pub(super) async fn post_auto(
     // The same window /v1/code-intel/dead-code answers from. Empty unless
     // CORECRUXD_TRACE_CAPTURE is on, in which case the dead-code claims stay
     // exactly as they were before the runtime tier existed.
-    // Scoped to this daemon's own capture tenant. This surface has no tenant
-    // binding of its own (it authorises with `require_http_scopes`, not the
-    // per-tenant variant), so there is no requester tenant to honour. Pinning it
-    // to the capture tenant preserves single-tenant behaviour exactly and fails
-    // closed if this daemon ever holds more than one tenant's spans — it will
-    // simply not see them. Giving this surface real tenant binding is a
-    // prerequisite for hosting it (crux-code-intel-pro-hosted-surface M3).
-    let spans = super::traces::load_spans(&state, &crate::trace_store::TraceStore::capture_tenant());
+    // M3b: the runtime tier is read for whichever tenant the request names. With
+    // no `tenant_id` this falls back to the daemon's capture tenant — correct on
+    // a single-tenant daemon and deliberately NOT hostable, because every
+    // customer on a shared daemon resolves to the same tenant. The fallback is
+    // reported on the response as `runtime_tenant_scope` rather than being left
+    // to be inferred.
+    let (runtime_tenant, runtime_bound) =
+        super::traces::runtime_tenant_for(&state, &headers, tenant_q.tenant_id.as_deref());
+    let spans = super::traces::load_spans(&state, &runtime_tenant);
     let store = state.fact_store.read().await;
     let dossier = match crate::dossier::generate_auto(
         &store,
@@ -114,7 +116,22 @@ pub(super) async fn post_auto(
     if let Err(err) = persist_dossier(&state.fact_store, &dossier).await {
         return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err);
     }
-    (StatusCode::OK, Json(dossier)).into_response()
+    // M3b: state the runtime tier's tenant scope in a header rather than the
+    // body — the body is a typed payload and existing clients must not break,
+    // but "which tenant did this answer for" cannot be left to inference.
+    (
+        StatusCode::OK,
+        [(
+            "x-crux-runtime-tenant-scope",
+            if runtime_bound {
+                "request"
+            } else {
+                "daemon-capture-tenant"
+            },
+        )],
+        Json(dossier),
+    )
+        .into_response()
 }
 
 #[tracing::instrument(level = "info", skip_all)]
@@ -1143,9 +1160,14 @@ mod tests {
     async fn post_auto_missing_project_is_404() {
         let st = state();
         let (status, _) = parts(
-            post_auto(State(st), Path("no-such-project".into()), HeaderMap::new())
-                .await
-                .into_response(),
+            post_auto(
+                State(st),
+                Path("no-such-project".into()),
+                HeaderMap::new(),
+                Query(crate::http::traces::OptionalTenantQuery::default()),
+            )
+            .await
+            .into_response(),
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
