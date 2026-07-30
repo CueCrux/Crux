@@ -39,6 +39,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use rand::Rng as _; // brings `fill_bytes` into scope (matches repo idiom)
+use subtle::ConstantTimeEq as _;
 
 use super::auth_rails::{env_flag_enabled, ISSUED_TOKEN_TTL_SECS};
 use crate::auth::HttpScopeContext;
@@ -543,11 +544,86 @@ pub(super) struct RefreshReq {
     pub refresh_token: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RefreshedDeviceAccess {
+    access_token: String,
+    tenant_id: String,
+    scopes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshAccessError {
+    RegistryUnavailable,
+    Unknown,
+    Revoked,
+    IssuanceUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RegistryUnavailable;
+
 /// Split a `cred_id.secret` refresh token into its parts.
 fn split_refresh(token: &str) -> Option<(&str, &str)> {
     token
         .split_once('.')
         .filter(|(id, secret)| !id.is_empty() && !secret.is_empty())
+}
+
+fn refresh_secrets_match(stored: &str, presented: &str) -> bool {
+    bool::from(stored.as_bytes().ct_eq(presented.as_bytes()))
+}
+
+/// Validate and mint while holding the credential registry lock. This gives
+/// refresh and revoke one ordering boundary: when revoke returns, no refresh
+/// that validated before it can still enter token issuance afterwards.
+fn refresh_device_credential<F>(
+    registry: &Mutex<DeviceRegistry>,
+    cred_id: &str,
+    secret: &str,
+    mint: F,
+) -> Result<RefreshedDeviceAccess, RefreshAccessError>
+where
+    F: FnOnce(&str, &[String]) -> Option<String>,
+{
+    let reg = registry.lock().map_err(|_| RefreshAccessError::RegistryUnavailable)?;
+    let Some(credential) = reg.refresh.get(cred_id) else {
+        return Err(RefreshAccessError::Unknown);
+    };
+    // Check the bearer secret before exposing whether a known credential has
+    // been revoked. The access-token subject discloses only `cred_id`.
+    if !refresh_secrets_match(&credential.secret, secret) {
+        return Err(RefreshAccessError::Unknown);
+    }
+    if credential.revoked {
+        return Err(RefreshAccessError::Revoked);
+    }
+    let access_token =
+        mint(&credential.tenant_id, &credential.scopes).ok_or(RefreshAccessError::IssuanceUnavailable)?;
+    let refreshed = RefreshedDeviceAccess {
+        access_token,
+        tenant_id: credential.tenant_id.clone(),
+        scopes: credential.scopes.clone(),
+    };
+    drop(reg);
+    Ok(refreshed)
+}
+
+/// RFC 7009-style idempotent revocation: unknown and incorrectly authenticated
+/// credentials both report `false`, and neither changes registry state.
+fn revoke_refresh_credential(
+    registry: &Mutex<DeviceRegistry>,
+    cred_id: &str,
+    secret: &str,
+) -> Result<bool, RegistryUnavailable> {
+    let mut reg = registry.lock().map_err(|_| RegistryUnavailable)?;
+    match reg.refresh.get_mut(cred_id) {
+        Some(credential) if refresh_secrets_match(&credential.secret, secret) => {
+            let was_active = !credential.revoked;
+            credential.revoked = true;
+            Ok(was_active)
+        }
+        _ => Ok(false),
+    }
 }
 
 #[tracing::instrument(level = "info", skip_all)]
@@ -558,35 +634,23 @@ pub(super) async fn post_device_refresh(State(_state): State<AppState>, Json(req
     let Some((cred_id, secret)) = split_refresh(req.refresh_token.trim()) else {
         return oauth_error(StatusCode::UNAUTHORIZED, "invalid_grant", "malformed refresh_token");
     };
-    // Validate under the lock; clone the principal, then mint outside it.
-    let principal = {
-        let Ok(reg) = REGISTRY.lock() else {
-            return problem_response(StatusCode::INTERNAL_SERVER_ERROR, "device registry unavailable");
-        };
-        match reg.refresh.get(cred_id) {
-            Some(cred) if !cred.revoked && cred.secret == secret => (cred.tenant_id.clone(), cred.scopes.clone()),
-            Some(cred) if cred.revoked => {
-                return oauth_error(
-                    StatusCode::UNAUTHORIZED,
-                    "invalid_grant",
-                    "refresh credential was revoked",
-                );
-            }
-            _ => return oauth_error(StatusCode::UNAUTHORIZED, "invalid_grant", "unknown refresh credential"),
-        }
-    };
-    let (tenant_id, scopes) = principal;
-    let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
-    let sub = format!("device:{cred_id}");
-    let claims = ScopedClaims {
-        sub: &sub,
-        passport_id: None,
-        scopes: &scope_refs,
-        tenant_id: &tenant_id,
-        ttl_secs: ISSUED_TOKEN_TTL_SECS,
-    };
-    match mint_scoped_jwt_from_env(&claims) {
-        Some(access_token) => (
+    let refreshed = refresh_device_credential(&REGISTRY, cred_id, secret, |tenant_id, scopes| {
+        let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
+        let sub = format!("device:{cred_id}");
+        mint_scoped_jwt_from_env(&ScopedClaims {
+            sub: &sub,
+            passport_id: None,
+            scopes: &scope_refs,
+            tenant_id,
+            ttl_secs: ISSUED_TOKEN_TTL_SECS,
+        })
+    });
+    match refreshed {
+        Ok(RefreshedDeviceAccess {
+            access_token,
+            tenant_id,
+            scopes,
+        }) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "access_token": access_token,
@@ -598,7 +662,18 @@ pub(super) async fn post_device_refresh(State(_state): State<AppState>, Json(req
             })),
         )
             .into_response(),
-        None => problem_response(
+        Err(RefreshAccessError::RegistryUnavailable) => {
+            problem_response(StatusCode::INTERNAL_SERVER_ERROR, "device registry unavailable")
+        }
+        Err(RefreshAccessError::Revoked) => oauth_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_grant",
+            "refresh credential was revoked",
+        ),
+        Err(RefreshAccessError::Unknown) => {
+            oauth_error(StatusCode::UNAUTHORIZED, "invalid_grant", "unknown refresh credential")
+        }
+        Err(RefreshAccessError::IssuanceUnavailable) => problem_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "token issuance requires CORECRUXD_JWT_HS256_SECRET (run the daemon in jwt_hs256 mode)",
         ),
@@ -610,21 +685,14 @@ pub(super) async fn post_device_revoke(State(_state): State<AppState>, Json(req)
     if !env_flag_enabled(DEVICE_ENABLED_ENV) {
         return device_disabled_response();
     }
-    let Some((cred_id, _secret)) = split_refresh(req.refresh_token.trim()) else {
+    let Some((cred_id, secret)) = split_refresh(req.refresh_token.trim()) else {
         // Idempotent: a malformed/absent token is already "not active".
         return (StatusCode::OK, Json(serde_json::json!({ "revoked": false }))).into_response();
     };
-    let revoked = {
-        let Ok(mut reg) = REGISTRY.lock() else {
+    let revoked = match revoke_refresh_credential(&REGISTRY, cred_id, secret) {
+        Ok(revoked) => revoked,
+        Err(RegistryUnavailable) => {
             return problem_response(StatusCode::INTERNAL_SERVER_ERROR, "device registry unavailable");
-        };
-        match reg.refresh.get_mut(cred_id) {
-            Some(cred) => {
-                let was_active = !cred.revoked;
-                cred.revoked = true;
-                was_active
-            }
-            None => false,
         }
     };
     (StatusCode::OK, Json(serde_json::json!({ "revoked": revoked }))).into_response()
@@ -771,6 +839,98 @@ mod tests {
         assert!(split_refresh("nodot").is_none());
         assert!(split_refresh(".secret").is_none());
         assert!(split_refresh("id.").is_none());
+    }
+
+    fn registry_with_refresh_credential() -> Mutex<DeviceRegistry> {
+        let mut registry = DeviceRegistry::default();
+        registry.refresh.insert(
+            "credential-id".to_string(),
+            RefreshCred {
+                tenant_id: "tenant-a".to_string(),
+                scopes: vec!["query:read".to_string()],
+                secret: "legitimate-secret".to_string(),
+                revoked: false,
+            },
+        );
+        Mutex::new(registry)
+    }
+
+    #[test]
+    fn refresh_revoke_requires_the_complete_secret_and_is_idempotent() {
+        let registry = registry_with_refresh_credential();
+
+        assert_eq!(
+            revoke_refresh_credential(&registry, "credential-id", "attacker-secret"),
+            Ok(false)
+        );
+        let refreshed =
+            refresh_device_credential(&registry, "credential-id", "legitimate-secret", |tenant_id, scopes| {
+                assert_eq!(tenant_id, "tenant-a");
+                assert_eq!(scopes, ["query:read"]);
+                Some("fresh-access-token".to_string())
+            })
+            .expect("wrong-secret revocation must leave the credential active");
+        assert_eq!(refreshed.access_token, "fresh-access-token");
+
+        assert_eq!(
+            revoke_refresh_credential(&registry, "credential-id", "legitimate-secret"),
+            Ok(true)
+        );
+        assert_eq!(
+            revoke_refresh_credential(&registry, "credential-id", "legitimate-secret"),
+            Ok(false)
+        );
+        assert_eq!(
+            revoke_refresh_credential(&registry, "credential-id", "attacker-secret"),
+            Ok(false)
+        );
+        assert_eq!(
+            refresh_device_credential(&registry, "credential-id", "attacker-secret", |_, _| Some(
+                "must-not-mint".to_string()
+            ),),
+            Err(RefreshAccessError::Unknown)
+        );
+        assert_eq!(
+            refresh_device_credential(&registry, "credential-id", "legitimate-secret", |_, _| Some(
+                "must-not-mint".to_string()
+            ),),
+            Err(RefreshAccessError::Revoked)
+        );
+    }
+
+    #[test]
+    fn revoke_waits_for_an_inflight_refresh_to_finish_minting() {
+        use std::sync::{mpsc, Arc, TryLockError};
+
+        let registry = Arc::new(registry_with_refresh_credential());
+        let refresh_registry = Arc::clone(&registry);
+        let (mint_started_tx, mint_started_rx) = mpsc::channel();
+        let (allow_mint_tx, allow_mint_rx) = mpsc::channel();
+        let refresh = std::thread::spawn(move || {
+            refresh_device_credential(&refresh_registry, "credential-id", "legitimate-secret", |_, _| {
+                mint_started_tx.send(()).expect("signal mint start");
+                allow_mint_rx.recv().expect("release mint");
+                Some("ordered-access-token".to_string())
+            })
+        });
+        mint_started_rx.recv().expect("refresh reached mint boundary");
+        assert!(
+            matches!(registry.try_lock(), Err(TryLockError::WouldBlock)),
+            "refresh must retain the registry ordering lock throughout token issuance"
+        );
+
+        let revoke_registry = Arc::clone(&registry);
+        let (revoke_started_tx, revoke_started_rx) = mpsc::channel();
+        let revoke = std::thread::spawn(move || {
+            revoke_started_tx.send(()).expect("signal revoke attempt");
+            revoke_refresh_credential(&revoke_registry, "credential-id", "legitimate-secret")
+        });
+        revoke_started_rx.recv().expect("revoke thread started");
+
+        allow_mint_tx.send(()).expect("finish refresh mint");
+        let refreshed = refresh.join().expect("refresh thread").expect("refresh succeeds");
+        assert_eq!(refreshed.access_token, "ordered-access-token");
+        assert_eq!(revoke.join().expect("revoke thread"), Ok(true));
     }
 
     #[test]
