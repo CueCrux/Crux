@@ -429,11 +429,30 @@ mod tests {
 
     #[test]
     fn pick_free_port_is_bindable() {
-        let p = pick_free_port().expect("pick a free port");
-        assert!(p > 0, "port must be nonzero");
-        // Released by pick_free_port, so it must be immediately re-bindable.
-        let l = TcpListener::bind((Ipv4Addr::LOCALHOST, p)).expect("re-bind picked port");
-        drop(l);
+        // `pick_free_port` binds :0, notes the port, and drops the listener, so the
+        // port is only *advisory*: anything on the machine can claim it in the gap
+        // before we re-bind — including sibling tests in this binary binding :0 in
+        // parallel. Asserting a single re-bind succeeds asserts something the OS
+        // does not promise, and it duly flaked in CI.
+        //
+        // Retry instead: the contract worth testing is that a picked port is
+        // *usually* immediately usable, so losing every one of several attempts
+        // means the helper is broken rather than merely unlucky. No sleep — a sleep
+        // would only widen the window for someone else to take the port.
+        const ATTEMPTS: usize = 5;
+        let mut last_err = None;
+        for _ in 0..ATTEMPTS {
+            let p = pick_free_port().expect("pick a free port");
+            assert!(p > 0, "port must be nonzero");
+            match TcpListener::bind((Ipv4Addr::LOCALHOST, p)) {
+                Ok(l) => {
+                    drop(l);
+                    return;
+                }
+                Err(e) => last_err = Some((p, e)),
+            }
+        }
+        panic!("no picked port was re-bindable in {ATTEMPTS} attempts; last: {last_err:?}");
     }
 
     // --- health probe --------------------------------------------------------
