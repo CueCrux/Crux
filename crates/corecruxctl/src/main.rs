@@ -654,8 +654,13 @@ enum Command {
         /// Restrict to entities starting with this prefix.
         #[arg(long)]
         scope_entity_prefix: Option<String>,
-        /// Operator-only: include reserved-prefix entries
-        /// (__agent::*, __ops::*, __bootstrap__::*).
+        /// Include ordinary private/export-sensitive entries after typed
+        /// per-invocation confirmation.
+        #[arg(long, default_value_t = false)]
+        include_private: bool,
+        /// Include daemon-owned control entries after the same typed
+        /// confirmation. Also enables ordinary private entries so one policy
+        /// governs the complete audit slice.
         #[arg(long, default_value_t = false)]
         include_reserved: bool,
         /// Optional caller label embedded in the manifest scope.
@@ -794,7 +799,8 @@ enum ContextCommand {
         /// Copy born-private facts into the bundle (Art.14 typed consent prompt).
         #[arg(long, default_value_t = false)]
         include_private: bool,
-        /// Operator-only: include reserved-prefix entries in the audit half.
+        /// Include daemon-owned entries in the audit half after typed
+        /// confirmation. They remain excluded from the portable-memory half.
         #[arg(long, default_value_t = false)]
         include_reserved: bool,
         /// Optional caller label embedded in the audit-bundle scope.
@@ -4570,19 +4576,37 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             since,
             until,
             scope_entity_prefix,
+            include_private,
             include_reserved,
             caller,
         } => {
             let data_dir = data_dir
                 .or_else(|| std::env::var("CORECRUXD_DATA_DIR").ok().map(PathBuf::from))
                 .ok_or("audit-export requires --data-dir or CORECRUXD_DATA_DIR")?;
+            let fact_policy = memory_pack::resolve_export_policy(
+                &data_dir,
+                None,
+                include_private || include_reserved,
+                include_reserved,
+                |summary| {
+                    print!("{}", memory_pack::render_private_summary(summary));
+                    print!("Type '{}' to proceed: ", memory_pack::INCLUDE_PRIVATE_CONFIRM_PHRASE);
+                    use std::io::Write as _;
+                    let _ = std::io::stdout().flush();
+                    let mut line = String::new();
+                    if std::io::stdin().read_line(&mut line).is_err() {
+                        return false;
+                    }
+                    line.trim() == memory_pack::INCLUDE_PRIVATE_CONFIRM_PHRASE
+                },
+            )?;
             let (facts, receipts, bundle_id) = audit_export::run_audit_export(audit_export::AuditExportArgs {
                 data_dir,
                 out: out.clone(),
                 since,
                 until,
                 scope_entity_prefix,
-                include_reserved,
+                fact_policy,
                 caller,
             })?;
             println!(

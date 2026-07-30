@@ -31,9 +31,9 @@
 //!
 //! Read-only against `--data-dir` (the `memory export` / `audit-export`
 //! precedent — safe while the daemon is up). Private facts are excluded by
-//! default; `--include-private` requires the same typed Art.14 consent as
-//! `memory export`. Reserved-prefix entries are excluded from the audit half
-//! unless `--include-reserved` (operator scope).
+//! default. `--include-private` and `--include-reserved` resolve once into the
+//! same typed Art.14 policy used by both components; either sensitive mode
+//! requires the exact per-invocation confirmation used by `memory export`.
 //!
 //! The signature is over a deterministic `signing_input` string (schema,
 //! passport fpr, generated_at, both component hashes, audit-verify ok) — not
@@ -131,33 +131,42 @@ fn build_signing_input(
     )
 }
 
-/// Run the one-shot context export. `confirm_include_private` is invoked (with
-/// the private-fact scan) only when `--include-private` is set; returning
-/// `false` aborts before anything is written — identical semantics to
-/// `memory export` (the closure is forwarded straight through).
+/// Run the one-shot context export. `confirm_sensitive_export` is invoked with
+/// the fact scan when either sensitive mode is requested; returning `false`
+/// aborts before any component is written.
 pub fn run_context_export(
     args: &ContextExportArgs,
-    confirm_include_private: impl FnOnce(&PrivateSummary) -> bool,
+    confirm_sensitive_export: impl FnOnce(&PrivateSummary) -> bool,
 ) -> Result<ContextExportReport, BoxErr> {
+    // The legacy `include_reserved` switch previously exposed every private
+    // audit value as a side effect. Resolve it as consent for both ordinary
+    // private and daemon-owned records, then pass this exact policy to both
+    // components.
+    let fact_policy = memory_pack::resolve_export_policy(
+        &args.data_dir,
+        None,
+        args.include_private || args.include_reserved,
+        args.include_reserved,
+        confirm_sensitive_export,
+    )?;
     std::fs::create_dir_all(&args.out_dir)?;
 
     let cruxpack_path = args.out_dir.join(MEMORY_PACK_FILE);
     let audit_bundle_path = args.out_dir.join(AUDIT_BUNDLE_FILE);
     let manifest_path = args.out_dir.join(MANIFEST_FILE);
 
-    // 1) facts + sessions → signed, re-importable cruxpack. This is the half
-    //    that honours the --include-private consent gate; if the operator
-    //    declines, run_memory_export returns ConfirmationDeclined and we abort
-    //    before writing the audit half or the manifest.
-    let mem = memory_pack::run_memory_export(
+    // 1) facts + sessions → signed, re-importable cruxpack. Daemon-control
+    //    rows remain non-portable even when the audit half has reserved
+    //    consent, because pack import rejects governed namespaces.
+    let mem = memory_pack::run_memory_export_with_policy(
         &MemoryExportArgs {
             data_dir: args.data_dir.clone(),
             out: cruxpack_path.clone(),
             tenant: args.tenant.clone(),
             since: args.since.clone(),
-            include_private: args.include_private,
+            include_private: fact_policy.includes_private(),
         },
-        confirm_include_private,
+        fact_policy,
     )?;
 
     // 2) fact journal + receipt references → signed, offline-verifiable bundle.
@@ -167,7 +176,7 @@ pub fn run_context_export(
         since: args.since.clone(),
         until: None,
         scope_entity_prefix: None,
-        include_reserved: args.include_reserved,
+        fact_policy,
         caller: args.caller.clone(),
     })?;
 
@@ -197,8 +206,8 @@ pub fn run_context_export(
         "tool": format!("corecruxctl {}", env!("CARGO_PKG_VERSION")),
         "tenant": args.tenant,
         "passport_fpr": key.passport_fpr(),
-        "include_private": args.include_private,
-        "include_reserved": args.include_reserved,
+        "include_private": fact_policy.includes_private(),
+        "include_reserved": fact_policy.includes_daemon_owned(),
         "components": [
             {
                 "name": MEMORY_PACK_FILE,
@@ -382,6 +391,8 @@ pub fn run_context_verify(bundle_dir: &Path) -> Result<ContextVerifyReport, BoxE
 mod tests {
     use super::*;
     use corecrux_memory::fact_store::{FactStore, StoreFact};
+    use corecrux_receipts::AuditEventV1;
+    use std::io::Read as _;
     use std::path::Path;
 
     fn seed(dir: &Path) {
@@ -408,6 +419,48 @@ mod tests {
             horizon_class: None,
             actor: None,
         });
+        store.store(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "__work__::context-test".into(),
+            key: "record".into(),
+            value: "daemon-value-stays-home".into(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        let deleted = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "deleted".into(),
+            key: "k".into(),
+            value: "deleted-value-stays-home".into(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        store.delete("default", &deleted.fact_id);
+    }
+
+    fn audit_events(bundle: &Path) -> Vec<AuditEventV1> {
+        let raw = std::fs::read(bundle.join(AUDIT_BUNDLE_FILE)).expect("read audit bundle");
+        let decoded = zstd::stream::decode_all(raw.as_slice()).expect("decode audit bundle");
+        let mut archive = tar::Archive::new(decoded.as_slice());
+        for entry in archive.entries().expect("entries") {
+            let mut entry = entry.expect("entry");
+            if entry.path().expect("path").as_ref() == Path::new("events.jsonl") {
+                let mut body = String::new();
+                entry.read_to_string(&mut body).expect("read events");
+                return body
+                    .lines()
+                    .filter(|line| !line.is_empty())
+                    .map(|line| serde_json::from_str(line).expect("event"))
+                    .collect();
+            }
+        }
+        panic!("events.jsonl missing");
     }
 
     fn export_to(bundle: &Path, data: &Path) -> ContextExportReport {
@@ -443,6 +496,16 @@ mod tests {
         assert_eq!(pack.manifest.counts.facts, 1);
         let pack_raw = std::fs::read_to_string(bundle.join(MEMORY_PACK_FILE)).expect("read pack");
         assert!(!pack_raw.contains("private-value-stays-home"), "private value leaked");
+        assert!(!pack_raw.contains("daemon-value-stays-home"), "daemon value leaked");
+        assert!(!pack_raw.contains("deleted-value-stays-home"), "deleted value leaked");
+
+        // Inspect the audit component itself: integrity verification is not a
+        // privacy assertion.
+        let audit = serde_json::to_string(&audit_events(&bundle)).expect("events json");
+        assert!(audit.contains("public-value"));
+        assert!(!audit.contains("private-value-stays-home"));
+        assert!(!audit.contains("daemon-value-stays-home"));
+        assert!(!audit.contains("deleted-value-stays-home"));
 
         // The custody proof verifies offline, on every axis.
         let v = run_context_verify(&bundle).expect("verify");
@@ -518,6 +581,86 @@ mod tests {
         );
         assert!(err.is_err(), "declined consent must abort");
         assert!(!bundle.join(MEMORY_PACK_FILE).exists());
+        assert!(!bundle.join(MANIFEST_FILE).exists());
+    }
+
+    #[test]
+    fn context_sensitive_modes_share_policy_and_never_export_deleted_plaintext() {
+        let data = tempfile::tempdir().expect("data");
+        seed(data.path());
+        let out = tempfile::tempdir().expect("out");
+
+        let private_bundle = out.path().join("private");
+        let private_report = run_context_export(
+            &ContextExportArgs {
+                data_dir: data.path().to_path_buf(),
+                out_dir: private_bundle.clone(),
+                tenant: "local".into(),
+                since: None,
+                include_private: true,
+                include_reserved: false,
+                caller: None,
+            },
+            |_| true,
+        )
+        .expect("private export");
+        assert_eq!(private_report.facts, 2);
+        assert_eq!(private_report.audit_facts, 2);
+        let private_audit = serde_json::to_string(&audit_events(&private_bundle)).expect("events");
+        assert!(private_audit.contains("private-value-stays-home"));
+        assert!(!private_audit.contains("daemon-value-stays-home"));
+        assert!(!private_audit.contains("deleted-value-stays-home"));
+
+        let reserved_bundle = out.path().join("reserved");
+        let reserved_report = run_context_export(
+            &ContextExportArgs {
+                data_dir: data.path().to_path_buf(),
+                out_dir: reserved_bundle.clone(),
+                tenant: "local".into(),
+                since: None,
+                include_private: false,
+                include_reserved: true,
+                caller: None,
+            },
+            |_| true,
+        )
+        .expect("reserved export");
+        assert_eq!(reserved_report.facts, 2, "daemon control rows are not portable");
+        assert_eq!(
+            reserved_report.audit_facts, 3,
+            "audit evidence may include confirmed daemon rows"
+        );
+        let reserved_pack = std::fs::read_to_string(reserved_bundle.join(MEMORY_PACK_FILE)).expect("pack");
+        assert!(!reserved_pack.contains("daemon-value-stays-home"));
+        assert!(!reserved_pack.contains("deleted-value-stays-home"));
+        let reserved_audit = serde_json::to_string(&audit_events(&reserved_bundle)).expect("events");
+        assert!(reserved_audit.contains("private-value-stays-home"));
+        assert!(reserved_audit.contains("daemon-value-stays-home"));
+        assert!(!reserved_audit.contains("deleted-value-stays-home"));
+    }
+
+    #[test]
+    fn include_reserved_consent_decline_aborts_before_any_component_write() {
+        let data = tempfile::tempdir().expect("data");
+        seed(data.path());
+        let out = tempfile::tempdir().expect("out");
+        let bundle = out.path().join("bundle");
+
+        let err = run_context_export(
+            &ContextExportArgs {
+                data_dir: data.path().to_path_buf(),
+                out_dir: bundle.clone(),
+                tenant: "local".into(),
+                since: None,
+                include_private: false,
+                include_reserved: true,
+                caller: None,
+            },
+            |_| false,
+        );
+        assert!(err.is_err());
+        assert!(!bundle.join(MEMORY_PACK_FILE).exists());
+        assert!(!bundle.join(AUDIT_BUNDLE_FILE).exists());
         assert!(!bundle.join(MANIFEST_FILE).exists());
     }
 }

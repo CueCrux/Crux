@@ -1445,10 +1445,13 @@ pub fn list_tools_with_flags(
                           self-contained, signed `tar.zst` bundle of every fact-event in \
                           the time window plus the cross-references to source receipts. \
                           The bundle re-verifies OFFLINE via `corecruxctl audit-verify` — \
-                          no daemon, no network. Reserved prefixes (__agent::*, __ops::*, \
-                          __bootstrap__::*) are filtered out unless the caller is \
-                          operator-tier (authenticated passport + scope.include_reserved). \
-                          REQUIRES `token_budget` (QC.2). Gated by \
+                          no daemon, no network. Deleted facts are never exported. Private \
+                          and daemon-owned facts are filtered by default; authenticated \
+                          callers must request the corresponding scope and provide the \
+                          exact per-call confirmation `include private`. Daemon-owned \
+                          scope additionally requires the canonical caller authority in \
+                          CORECRUXD_AUDIT_EXPORT_DAEMON_AUTHORITIES. REQUIRES \
+                          `token_budget` (QC.2). Gated by \
                           CORECRUXD_FEATURE_AUDIT_EXPORT=1 (default off)."
                 .to_string(),
             input_schema: json!({
@@ -1461,15 +1464,18 @@ pub fn list_tools_with_flags(
                         "description": "Optional scope filter.",
                         "properties": {
                             "entity_prefix":    { "type": "string",  "description": "Restrict to entities matching this prefix" },
-                            "include_reserved": { "type": "boolean", "description": "Operator-only: include reserved-prefix entries. Silently ignored for non-operator callers.", "default": false }
+                            "include_private":  { "type": "boolean", "description": "Include caller-visible private/export-sensitive entries. Requires exact confirmation.", "default": false },
+                            "include_reserved": { "type": "boolean", "description": "Include daemon-owned entries and ordinary private entries. Requires the canonical caller authority in CORECRUXD_AUDIT_EXPORT_DAEMON_AUTHORITIES plus exact confirmation; ignored for anonymous callers.", "default": false }
                         }
                     },
+                    "confirmation": { "type": "string", "description": "Required when an authenticated caller requests either sensitive scope; exact value: `include private`." },
                     "token_budget": { "type": "integer", "description": "REQUIRED — caps total tokens swept (QC.2)" }
                 },
                 "required": ["token_budget"],
                 "examples": [
                     { "token_budget": 4000, "since_ts": "2026-05-01T00:00:00Z" },
-                    { "token_budget": 8000, "since_ts": "2026-01-01T00:00:00Z", "until_ts": "2026-06-01T00:00:00Z", "scope": {"entity_prefix": "project-"} }
+                    { "token_budget": 8000, "since_ts": "2026-01-01T00:00:00Z", "until_ts": "2026-06-01T00:00:00Z", "scope": {"entity_prefix": "project-"} },
+                    { "token_budget": 8000, "scope": {"include_private": true}, "confirmation": "include private" }
                 ]
             }),
         },

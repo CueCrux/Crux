@@ -54,6 +54,7 @@ use crate::tools::forget::{handle_memory_forget, handle_memory_forget_dry_run};
 use crate::tools::freshness::{handle_memory_freshness, handle_memory_sweep_candidates};
 use crate::tools::memory::{handle_memory_edit, handle_memory_pin, handle_memory_view};
 use crate::tools::memory_use::handle_memory_acknowledge_use;
+use crate::tools::passport::PassportRecord;
 use crate::tools::query::handle_query;
 use corecrux_memory::fact_store::{ConsolidationRequestV1, StoreFact};
 
@@ -96,6 +97,32 @@ async fn seed_passport(ctx: &McpContext, id: &str, category: &str) {
         private: true,
         horizon_class: None,
         actor: None,
+    });
+}
+
+async fn seed_mcp_passport_tier(ctx: &McpContext, id: &str, tier: &str) {
+    let record = PassportRecord {
+        principal_id: format!("test::{id}"),
+        sponsor_id: None,
+        reputation_tier: tier.to_string(),
+        receipt_count: if tier == "trusted" { 500 } else { 0 },
+        issued_at: "2026-01-01T00:00:00Z".to_string(),
+        passport_hash: "test-only".to_string(),
+        tenant_group: Some(ctx.scope_tenant()),
+        revoked_at: None,
+        revoked_reason: None,
+    };
+    let mut store = ctx.fact_store.write().await;
+    store.store(StoreFact {
+        tenant_hash: ctx.scope_tenant(),
+        entity: format!("__passport__::{id}"),
+        key: "passport".to_string(),
+        value: serde_json::to_string(&record).unwrap(),
+        source_receipt: Some("test:mcp-passport-tier".to_string()),
+        confidence: 1.0,
+        private: true,
+        horizon_class: None,
+        actor: Some("daemon:test".to_string()),
     });
 }
 
@@ -1188,18 +1215,16 @@ async fn t1_memory_edit_and_pin_owner_can_other_cannot() {
 }
 
 /// audit_export_bundle: the converted identity-scoped per-fact visibility gate
-/// decides which NON-reserved facts a non-operator caller exports, while the
-/// `include_reserved` operator bypass is preserved.
+/// decides which non-daemon facts a non-operator caller exports, while
+/// `include_reserved` requires both exact confirmation and an exact
+/// operator-configured authority match.
 ///
 /// NOTE: `__agent::*` private facts are stripped by audit_export's reserved-
 /// prefix filter for non-operator callers BEFORE the visibility check, so a
-/// private fact only ever appears in an OPERATOR (`include_reserved=true`)
-/// export — where the visibility check is intentionally bypassed. The owner-can
-/// / other-cannot distinction that the identity conversion guarantees is
-/// therefore proven on the surface it actually governs: the operator export
-/// includes the owner's private fact (bypass preserved), and a non-operator
-/// export of EITHER passport excludes it (reserved filter preserved). The
-/// cross-passport private boundary itself is INVARIANT 2/3.
+/// private fact can appear in an operator (`include_reserved=true`, exact
+/// confirmation, configured authority) export where the visibility check is
+/// intentionally bypassed. A different passport with the same reputation tier
+/// is denied even when it supplies the public confirmation phrase.
 #[tokio::test]
 async fn t1_audit_export_owner_can_other_cannot() {
     let _g = t1_env_lock().lock().await;
@@ -1207,6 +1232,11 @@ async fn t1_audit_export_owner_can_other_cannot() {
     let td = tempfile::tempdir().unwrap();
     std::env::set_var("CORECRUXD_AUDIT_EXPORT_DIR", td.path());
     let (_base, claude, codex) = owner_other_fixture().await;
+    std::env::set_var(crate::tools::audit_export::DAEMON_EXPORT_AUTHORITIES_ENV, "claude-work");
+    seed_mcp_passport_tier(&claude, "claude-work", "trusted").await;
+    // Give the attacker the same self-service reputation tier. The
+    // operator-managed allowlist, not reputation, remains authoritative.
+    seed_mcp_passport_tier(&codex, "codex-work", "trusted").await;
 
     handle_store_fact(
         &json!({"entity": "audit-secrets", "key": "k", "value": "audit-needle", "private": true}),
@@ -1233,10 +1263,14 @@ async fn t1_audit_export_owner_can_other_cannot() {
         false
     }
 
-    // OWNER operator export (include_reserved=true) DOES include its private
-    // fact — the operator bypass is preserved by the conversion.
+    // OWNER operator export (confirmed include_reserved=true) DOES include its
+    // private fact — the explicit operator audit path is preserved.
     let owner_op = handle_audit_export_bundle(
-        &json!({"token_budget": 4000, "scope": {"include_reserved": true}}),
+        &json!({
+            "token_budget": 4000,
+            "scope": {"include_reserved": true},
+            "confirmation": corecrux_memory::fact_privacy::SENSITIVE_EXPORT_CONFIRM_PHRASE,
+        }),
         &claude,
     )
     .await
@@ -1244,7 +1278,7 @@ async fn t1_audit_export_owner_can_other_cannot() {
     assert_eq!(owner_op["scope"]["include_reserved"], true);
     assert!(
         bundle_contains(&owner_op, "audit-needle").await,
-        "operator export must include the owner's private fact (include_reserved bypass preserved)"
+        "confirmed operator export must include the owner's private fact"
     );
 
     // OWNER non-operator export EXCLUDES the private fact (reserved-prefix filter
@@ -1257,7 +1291,40 @@ async fn t1_audit_export_owner_can_other_cannot() {
         "non-operator export must not include the private fact (reserved filter preserved)"
     );
 
-    // DIFFERENT passport's non-operator export ALSO excludes it.
+    // Explicit ordinary-private consent includes the owner's fact without
+    // granting the daemon-owned/operator bypass.
+    let owner_private = handle_audit_export_bundle(
+        &json!({
+            "token_budget": 4000,
+            "scope": {"include_private": true},
+            "confirmation": corecrux_memory::fact_privacy::SENSITIVE_EXPORT_CONFIRM_PHRASE,
+        }),
+        &claude,
+    )
+    .await
+    .unwrap();
+    assert!(
+        bundle_contains(&owner_private, "audit-needle").await,
+        "the owner must be able to export its own private fact after confirmation"
+    );
+
+    // The same private consent cannot cross the owner boundary.
+    let other_private = handle_audit_export_bundle(
+        &json!({
+            "token_budget": 4000,
+            "scope": {"include_private": true},
+            "confirmation": corecrux_memory::fact_privacy::SENSITIVE_EXPORT_CONFIRM_PHRASE,
+        }),
+        &codex,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !bundle_contains(&other_private, "audit-needle").await,
+        "T.1: ordinary private consent must not expose another passport's fact"
+    );
+
+    // A different passport's public-only export also excludes it.
     let other_plain = handle_audit_export_bundle(&json!({"token_budget": 4000}), &codex)
         .await
         .unwrap();
@@ -1265,8 +1332,26 @@ async fn t1_audit_export_owner_can_other_cannot() {
         !bundle_contains(&other_plain, "audit-needle").await,
         "T.1: a different passport's non-operator export must not include the owner's private fact"
     );
+
+    // A different authenticated token cannot turn public confirmation into
+    // operator authority and bypass the owner-visibility boundary.
+    let other_reserved = handle_audit_export_bundle(
+        &json!({
+            "token_budget": 4000,
+            "scope": {"include_reserved": true},
+            "confirmation": corecrux_memory::fact_privacy::SENSITIVE_EXPORT_CONFIRM_PHRASE,
+        }),
+        &codex,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(other_reserved.code, crate::dispatch::CAPABILITY_DENIED);
+    assert!(other_reserved
+        .message
+        .contains(crate::tools::audit_export::DAEMON_EXPORT_AUTHORITIES_ENV));
     std::env::remove_var("CORECRUXD_FEATURE_AUDIT_EXPORT");
     std::env::remove_var("CORECRUXD_AUDIT_EXPORT_DIR");
+    std::env::remove_var(crate::tools::audit_export::DAEMON_EXPORT_AUTHORITIES_ENV);
 }
 
 /// Flag-OFF control for the converted handlers: with the flag OFF, the raw agent

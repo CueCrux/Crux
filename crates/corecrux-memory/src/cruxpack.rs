@@ -36,6 +36,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::fact_privacy::FactExportPolicy;
 use crate::fact_store::{Fact, FactStore, StoreFact};
 use crate::session_store::{SessionState, SessionStore};
 
@@ -46,8 +47,8 @@ pub const CRUXPACK_SCHEMA_V1: &str = "crux.cruxpack.v1";
 /// provenance: `cruxpack:blake3:<64-hex>`.
 pub const CRUXPACK_SOURCE_RECEIPT_PREFIX: &str = "cruxpack:";
 
-/// Reserved entity prefixes excluded from every export unless
-/// `include_private` is set.
+/// Reserved entity prefixes excluded from every export unless the resolved
+/// fact-export policy carries private consent.
 ///
 /// This covers every canonical born-private prefix plus a small export-only
 /// tail for user-authored records that are intentionally queryable in the
@@ -56,6 +57,7 @@ pub const CRUXPACK_SOURCE_RECEIPT_PREFIX: &str = "cruxpack:";
 pub const CRUXPACK_RESERVED_PREFIXES: &[&str] = &[
     "__action_enrichment_receipt__::",
     "__agent::",
+    "__agent_session::",
     "__ops::",
     "__ops__::",
     "__ax__::",
@@ -120,10 +122,7 @@ pub const CRUXPACK_RESERVED_PREFIXES: &[&str] = &[
 
 /// Returns the reserved prefix covering `entity`, if any.
 pub fn reserved_prefix(entity: &str) -> Option<&'static str> {
-    CRUXPACK_RESERVED_PREFIXES
-        .iter()
-        .find(|p| entity.starts_with(*p))
-        .copied()
+    crate::fact_privacy::export_sensitive_entity_prefix(entity)
 }
 
 /// Derive the passport fingerprint from a raw 32-byte ed25519 public key:
@@ -243,9 +242,9 @@ pub struct ExportOptions {
     pub tenant_id: String,
     /// Only facts stored at/after this instant.
     pub since: Option<DateTime<Utc>>,
-    /// Include `private: true` facts and reserved-prefix entities. The CLI
-    /// layer owns the typed-confirmation ceremony; this flag is the result.
-    pub include_private: bool,
+    /// Resolved per-invocation privacy policy. Boundary code owns the typed
+    /// confirmation ceremony; this value is its result.
+    pub fact_policy: FactExportPolicy,
     /// Include the sessions section (session ids starting `__` are always
     /// excluded).
     pub include_sessions: bool,
@@ -259,7 +258,7 @@ impl Default for ExportOptions {
         Self {
             tenant_id: "local".to_string(),
             since: None,
-            include_private: false,
+            fact_policy: FactExportPolicy::public_only(),
             include_sessions: true,
             tool: format!("corecrux-memory {}", env!("CARGO_PKG_VERSION")),
             daemon_install_fpr: None,
@@ -278,8 +277,8 @@ pub fn canonical_tenant_id(tenant_id: &str) -> &str {
     }
 }
 
-/// What was *excluded* from (or, under `include_private`, opted into) a pack
-/// — the CLI prints this before asking for typed confirmation.
+/// What was excluded from (or opted into by) a pack — the CLI prints this
+/// before asking for typed confirmation.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct PrivateSummary {
     /// Facts excluded (or opted in) because `private == true`.
@@ -332,9 +331,9 @@ fn private_summary_matching(store: &FactStore, tenant_id: Option<&str>) -> Priva
 /// 1. `deleted == true` → excluded **unconditionally** (erasure, Art. 17 —
 ///    aligned with `FactStore::export`'s `!f.deleted` sync filter, PR #187).
 /// 2. daemon-owned control namespace → excluded unconditionally.
-/// 3. `private == true` → excluded unless `include_private`.
-/// 4. reserved prefix → excluded unless `include_private` (belt-and-braces
-///    with 2 — see [`CRUXPACK_RESERVED_PREFIXES`]).
+/// 3. `private == true` → excluded unless the policy has private consent.
+/// 4. reserved prefix → excluded unless the policy has private consent
+///    (belt-and-braces with 2 — see [`CRUXPACK_RESERVED_PREFIXES`]).
 /// 5. `stored_at < since` → excluded when a since-filter is given.
 ///
 /// Output ordering is deterministic — facts sorted by
@@ -367,7 +366,7 @@ pub fn build_pack_sections(
             summary.protected_excluded += 1;
             continue;
         }
-        if (fact.private || reserved.is_some()) && !opts.include_private {
+        if !opts.fact_policy.allows(fact) {
             continue;
         }
         if let Some(since) = opts.since {
@@ -431,7 +430,7 @@ pub fn build_manifest(
             entities: sections.entities.len(),
             receipts: sections.receipts.len(),
         },
-        included_private: opts.include_private,
+        included_private: opts.fact_policy.includes_private(),
         tool: opts.tool.clone(),
     }
 }
@@ -915,7 +914,7 @@ mod tests {
             sf("secret-entity", "k", "v-private", true),
         ]);
         let mut o = opts("local");
-        o.include_private = true;
+        o.fact_policy = FactExportPolicy::confirmed(true, false);
         let pack = build_signed(&store, None, &o);
         assert_eq!(pack.sections.facts.len(), 2);
         assert!(pack.manifest.included_private);
@@ -931,7 +930,7 @@ mod tests {
             true,
         )]);
         let mut o = opts("local");
-        o.include_private = true;
+        o.fact_policy = FactExportPolicy::confirmed(true, false);
         let (sections, summary) = build_pack_sections(&store, None, &o);
         assert!(sections.facts.is_empty());
         assert_eq!(summary.protected_excluded, 1);
@@ -946,9 +945,9 @@ mod tests {
         let erased = store.store(sf("erase", "k", "erased-pii-value", false));
         store.delete("default", &erased.fact_id);
 
-        // Even with include_private (the widest export), deleted stays home.
+        // Even with private consent, deleted stays home.
         let mut o = opts("local");
-        o.include_private = true;
+        o.fact_policy = FactExportPolicy::confirmed(true, false);
         let (sections, summary) = build_pack_sections(&store, None, &o);
 
         assert_eq!(sections.facts.len(), 1);
@@ -1068,7 +1067,7 @@ mod tests {
     fn private_facts_without_manifest_stamp_rejected() {
         let store = store_with(vec![sf("e", "k", "v", true)]);
         let mut o = opts("local");
-        o.include_private = true;
+        o.fact_policy = FactExportPolicy::confirmed(true, false);
         let mut pack = build_signed(&store, None, &o);
         pack.manifest.included_private = false; // forge the stamp off
         assert!(matches!(
@@ -1189,7 +1188,7 @@ mod tests {
         let mut source = FactStore::new();
         let forged = source.store(sf("__passport__::forged", "record", r#"{"tier":"operator"}"#, true));
         let mut export = opts("local");
-        export.include_private = true;
+        export.fact_policy = FactExportPolicy::confirmed(true, false);
         let pack = sign_sections(
             PackSections {
                 facts: vec![forged],
@@ -1221,7 +1220,7 @@ mod tests {
     fn include_private_agent_fact_round_trips_through_explicit_owner_remap() {
         let source = store_with(vec![sf("__agent::alice::notes", "decision", "keep local", true)]);
         let mut export = opts("local");
-        export.include_private = true;
+        export.fact_policy = FactExportPolicy::confirmed(true, false);
         let pack = build_signed(&source, None, &export);
         assert_eq!(pack.sections.facts.len(), 1);
 
@@ -1250,7 +1249,7 @@ mod tests {
     fn include_private_agent_fact_requires_explicit_owner_remap() {
         let source = store_with(vec![sf("__agent::alice::notes", "decision", "keep local", true)]);
         let mut export = opts("local");
-        export.include_private = true;
+        export.fact_policy = FactExportPolicy::confirmed(true, false);
         let pack = build_signed(&source, None, &export);
 
         let err = plan_import(
@@ -1276,7 +1275,7 @@ mod tests {
         let mut forged = source.store(sf("__agent::alice::notes", "decision", "spoofed", true));
         forged.private = false;
         let mut export = opts("local");
-        export.include_private = true;
+        export.fact_policy = FactExportPolicy::confirmed(true, false);
         let pack = sign_sections(
             PackSections {
                 facts: vec![forged],
@@ -1301,7 +1300,7 @@ mod tests {
     fn import_rejects_agent_wrapper_around_logical_control_entity() {
         let source = store_with(vec![sf("__agent::alice::__passport__::forged", "record", "{}", true)]);
         let mut export = opts("local");
-        export.include_private = true;
+        export.fact_policy = FactExportPolicy::confirmed(true, false);
         let pack = build_signed(&source, None, &export);
         let mut principal_map = BTreeMap::new();
         principal_map.insert("alice".to_string(), "bob".to_string());

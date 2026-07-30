@@ -24,13 +24,14 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use corecrux_memory::cruxpack::{self, CruxPack, ExportOptions, PrivateSummary, CRUXPACK_SCHEMA_V1};
+use corecrux_memory::fact_privacy::{FactExportPolicy, SENSITIVE_EXPORT_CONFIRM_PHRASE};
 use corecrux_memory::fact_store::FactStore;
 use corecrux_memory::session_store::SessionStore;
 use crux_session::passport::LocalPassportKey;
 
 /// The exact phrase the operator must type to opt private facts into a pack
 /// (Art. 14: explicit per-invocation consent; no flag-only bypass).
-pub const INCLUDE_PRIVATE_CONFIRM_PHRASE: &str = "include private";
+pub const INCLUDE_PRIVATE_CONFIRM_PHRASE: &str = SENSITIVE_EXPORT_CONFIRM_PHRASE;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryPackError {
@@ -42,7 +43,7 @@ pub enum MemoryPackError {
     Passport(String),
     #[error("pack error: {0}")]
     Pack(#[from] corecrux_memory::cruxpack::PackVerifyError),
-    #[error("aborted: --include-private requires typing '{INCLUDE_PRIVATE_CONFIRM_PHRASE}' at the prompt")]
+    #[error("aborted: sensitive export requires typing '{INCLUDE_PRIVATE_CONFIRM_PHRASE}' at the prompt")]
     ConfirmationDeclined,
     #[error("memory import is disabled — set CRUX_MEMORY_IMPORT=1 on both the daemon and this CLI to enable")]
     ImportDisabled,
@@ -78,14 +79,14 @@ pub struct MemoryExportReport {
 pub fn render_private_summary(summary: &PrivateSummary) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
-    out.push_str("--include-private will copy the following born-private records into the pack:\n");
+    out.push_str("Sensitive export requested for the following local records:\n");
     let _ = writeln!(out, "  private-flagged facts: {}", summary.private_flagged);
     for (prefix, count) in &summary.by_reserved_prefix {
         let _ = writeln!(out, "  {prefix:<28} {count}");
     }
     let _ = writeln!(
         out,
-        "  (daemon-control facts: {} — ALWAYS excluded)",
+        "  (daemon-control facts: {} — audit inclusion requires reserved consent; always excluded from portable packs)",
         summary.protected_excluded
     );
     let _ = writeln!(
@@ -96,6 +97,30 @@ pub fn render_private_summary(summary: &PrivateSummary) -> String {
     out
 }
 
+/// Resolve request flags into the typed policy only after one explicit
+/// confirmation. `tenant=None` scans every fact candidate (used by audit
+/// exports); a tenant limits the summary to the portable-memory slice.
+pub fn resolve_export_policy(
+    data_dir: &Path,
+    tenant: Option<&str>,
+    include_private: bool,
+    include_daemon_owned: bool,
+    confirm_sensitive_export: impl FnOnce(&PrivateSummary) -> bool,
+) -> Result<FactExportPolicy, MemoryPackError> {
+    if !include_private && !include_daemon_owned {
+        return Ok(FactExportPolicy::public_only());
+    }
+    let store = FactStore::with_persistence(data_dir)?;
+    let scan = tenant.map_or_else(
+        || cruxpack::private_summary(&store),
+        |tenant_id| cruxpack::private_summary_for_tenant(&store, tenant_id),
+    );
+    if !confirm_sensitive_export(&scan) {
+        return Err(MemoryPackError::ConfirmationDeclined);
+    }
+    Ok(FactExportPolicy::confirmed(include_private, include_daemon_owned))
+}
+
 /// Run the export. `confirm_include_private` is invoked (with the scan
 /// summary) only when `--include-private` is set; returning `false` aborts
 /// before anything is written. The CLI wires this to a typed stdin prompt;
@@ -104,13 +129,25 @@ pub fn run_memory_export(
     args: &MemoryExportArgs,
     confirm_include_private: impl FnOnce(&PrivateSummary) -> bool,
 ) -> Result<MemoryExportReport, MemoryPackError> {
+    let policy = resolve_export_policy(
+        &args.data_dir,
+        Some(&args.tenant),
+        args.include_private,
+        false,
+        confirm_include_private,
+    )?;
+    run_memory_export_with_policy(args, policy)
+}
+
+/// Run the portable-memory export with an already resolved policy. Context
+/// export uses this so the exact same policy object also reaches its audit
+/// component.
+pub fn run_memory_export_with_policy(
+    args: &MemoryExportArgs,
+    policy: FactExportPolicy,
+) -> Result<MemoryExportReport, MemoryPackError> {
     let store = FactStore::with_persistence(&args.data_dir)?;
     let sessions = SessionStore::with_persistence(&args.data_dir)?;
-
-    let scan = cruxpack::private_summary_for_tenant(&store, &args.tenant);
-    if args.include_private && !confirm_include_private(&scan) {
-        return Err(MemoryPackError::ConfirmationDeclined);
-    }
 
     let since = match &args.since {
         Some(raw) => Some(
@@ -130,7 +167,7 @@ pub fn run_memory_export(
     let opts = ExportOptions {
         tenant_id: args.tenant.clone(),
         since,
-        include_private: args.include_private,
+        fact_policy: policy,
         include_sessions: true,
         tool: format!("corecruxctl {}", env!("CARGO_PKG_VERSION")),
         daemon_install_fpr: read_install_fpr(&args.data_dir),

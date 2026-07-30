@@ -1129,13 +1129,29 @@ and requires `key_class`. Verifiers reject any other version.
 | Field | Type | Notes |
 |---|---|---|
 | `entity_prefix` | string, optional | Included only when the export was prefix-scoped. |
-| `include_reserved` | boolean | Whether reserved-prefix entries were included. |
+| `include_private` | boolean, optional | Whether ordinary private/export-sensitive entries were included after explicit per-invocation confirmation. Omitted when false for compatibility. |
+| `include_reserved` | boolean | Whether daemon-owned entries were included after explicit per-invocation confirmation and an operator-configured authority check. |
 | `caller` | string, optional | Passport/operator label supplied by the caller. |
 
 ## Data Members
 
 `events.jsonl` contains one exported fact event per line. Each line is an object
 matching `AuditEventV1` in `corecrux-receipts`:
+
+Generic CLI, context, and MCP exporters apply one typed fact-export policy
+before constructing these events. Soft-deleted facts are always excluded;
+ordinary private/export-sensitive facts and daemon-owned facts require their
+separate confirmed policy classes. The `deleted` field remains in the wire
+shape for compatibility, but generic exports never emit an event where it is
+`true`. Legacy fact rows in the `__agent_session::` key space are daemon-owned,
+not ordinary private data, so private consent alone cannot cross an agent-owner
+boundary.
+
+For MCP exports, daemon-owned scope additionally fails closed unless the
+canonical caller authority is an exact comma-separated entry in
+`CORECRUXD_AUDIT_EXPORT_DAEMON_AUTHORITIES`. Mapped callers use their canonical
+passport id; unmapped/static-token callers use `agent:<token-name>`. There is no
+wildcard, and reputation or receipt-count tiers do not grant this authority.
 
 | Field | Type |
 |---|---|

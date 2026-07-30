@@ -69,6 +69,8 @@ anyhow = { workspace = true }
 [dev-dependencies]
 serial_test = { workspace = true }
 rcgen = { workspace = true, features = ["x509-parser"] }
+tar = { workspace = true }
+zstd = { workspace = true }
 
 [lints]
 workspace = true

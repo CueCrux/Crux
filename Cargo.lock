@@ -937,6 +937,7 @@ dependencies = [
  "serial_test",
  "sha2 0.11.0",
  "syn 3.0.3",
+ "tar",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
@@ -948,6 +949,7 @@ dependencies = [
  "x509-cert",
  "xxhash-rust",
  "zip",
+ "zstd",
 ]
 
 [[package]]

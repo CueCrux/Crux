@@ -19,10 +19,12 @@
 //! Constraints baked into the handler:
 //! - Feature flag `CORECRUXD_FEATURE_AUDIT_EXPORT=1`. Default OFF.
 //! - `token_budget` is REQUIRED (QC.2). Caps the number of facts swept.
-//! - Reserved prefixes (`__agent::*`, `__ops::*`, `__bootstrap__::*`) are
-//!   stripped UNLESS the caller is operator-tier (i.e. `scope.include_reserved`
-//!   set and an authenticated passport is present). Non-operator callers
-//!   silently get the filtered view (T.1, T.4).
+//! - Deleted plaintext is never exported.
+//! - Private/export-sensitive records are stripped unless an authenticated
+//!   caller requests them and supplies the exact per-invocation confirmation
+//!   phrase.
+//! - Daemon-owned records additionally require an authority in the
+//!   operator-configured allowlist; confirmation is consent, not authority.
 //! - `audit_export_bundle` does NOT opt into `tool_emits_envelope` — the
 //!   bundle IS the receipts surface; the envelope contract doesn't apply
 //!   (see master plan §"Cross-PR envelope-test interaction").
@@ -34,9 +36,10 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::dispatch::McpContext;
+use crate::dispatch::{McpContext, CAPABILITY_DENIED};
 use crate::protocol::{JsonRpcError, INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND};
 use crate::scope;
+use corecrux_memory::fact_privacy::{FactExportPolicy, SENSITIVE_EXPORT_CONFIRM_PHRASE};
 use corecrux_memory::fact_store::Fact;
 use corecrux_receipts::{
     build_bundle_v1, resolve_audit_export_signing_key, AuditBundleScopeV1, AuditEventV1, AuditReceiptRefV1,
@@ -52,19 +55,16 @@ pub const SIGNING_KEY_ENV: &str = corecrux_receipts::AUDIT_EXPORT_SIGNING_KEY_EN
 pub const SIGNING_KEY_ID_ENV: &str = corecrux_receipts::AUDIT_EXPORT_SIGNING_KEY_ID_ENV;
 /// Directory under which bundle artefacts are written.
 pub const EXPORT_DIR_ENV: &str = "CORECRUXD_AUDIT_EXPORT_DIR";
-
-/// Reserved-prefix filter — kept in lockstep with the same constant in
-/// `tools::forget` so the two surfaces never diverge.
-pub const RESERVED_PREFIXES: &[&str] = &["__agent::", "__ops::", "__bootstrap__::", "__agent_session::"];
+/// Comma-separated exact authority identities permitted to export
+/// daemon-owned facts. Values are matched against
+/// [`McpContext::authority_identity`], so mapped callers use their canonical
+/// passport id and unmapped/static-token callers use `agent:<token-name>`.
+pub const DAEMON_EXPORT_AUTHORITIES_ENV: &str = "CORECRUXD_AUDIT_EXPORT_DAEMON_AUTHORITIES";
 
 fn feature_enabled() -> bool {
     env::var(FEATURE_FLAG_ENV)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
-}
-
-fn is_reserved(entity: &str) -> bool {
-    RESERVED_PREFIXES.iter().any(|p| entity.starts_with(p))
 }
 
 fn parse_rfc3339_opt(args: &Value, key: &str) -> Result<Option<DateTime<Utc>>, JsonRpcError> {
@@ -88,6 +88,18 @@ fn export_dir() -> PathBuf {
         }
     }
     std::env::temp_dir().join("crux-audit-export")
+}
+
+fn daemon_export_authorised(ctx: &McpContext) -> bool {
+    let Some(identity) = ctx.authority_identity() else {
+        return false;
+    };
+    env::var(DAEMON_EXPORT_AUTHORITIES_ENV).is_ok_and(|configured| {
+        configured
+            .split(',')
+            .map(str::trim)
+            .any(|candidate| !candidate.is_empty() && candidate == identity)
+    })
 }
 
 /// `audit_export_bundle` handler. Returns:
@@ -131,10 +143,11 @@ pub async fn handle_audit_export_bundle(args: &Value, ctx: &McpContext) -> Resul
     let agent_name = scope::agent_name(ctx.agent.as_ref());
     // agent-passport M5: identity-scoped per-fact visibility so the OWNER of a
     // passport-keyed private fact can export its OWN fact (and a DIFFERENT
-    // passport cannot). The raw `agent_name` is still used for the operator
-    // `include_reserved` gate and the `caller` manifest field — those name the
-    // caller, not the fact owner. Flag-OFF identity == raw name + empty aliases,
-    // so the per-fact check below is byte-for-byte the prior agent-scoped path.
+    // passport cannot). The raw `agent_name` is still used to establish that
+    // the caller is authenticated and for the `caller` manifest field — those
+    // name the caller, not the fact owner. Flag-OFF identity == raw name +
+    // empty aliases, so the per-fact check below is byte-for-byte the prior
+    // agent-scoped path.
     let identity = ctx.scope_identity();
     let id_ref = identity.as_deref();
     let aliases = ctx.scope_aliases();
@@ -148,11 +161,48 @@ pub async fn handle_audit_export_bundle(args: &Value, ctx: &McpContext) -> Resul
         .get("include_reserved")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let requested_include_private = scope_arg
+        .get("include_private")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
-    // T.1/T.4 — only operator-tier (i.e. authenticated passport) callers
-    // may include reserved-prefix entries. Anonymous or non-operator
-    // callers silently get the filtered view.
-    let include_reserved = requested_include_reserved && agent_name.is_some();
+    // Preserve the prior anonymous behavior: a sensitive request without an
+    // authenticated identity is ignored and receives the public-only slice.
+    // Authenticated requests must complete the exact per-call confirmation.
+    let sensitive_requested = requested_include_private || requested_include_reserved;
+    if sensitive_requested
+        && agent_name.is_some()
+        && args.get("confirmation").and_then(Value::as_str) != Some(SENSITIVE_EXPORT_CONFIRM_PHRASE)
+    {
+        return Err(JsonRpcError {
+            code: INVALID_PARAMS,
+            message: format!("sensitive audit export requires confirmation={SENSITIVE_EXPORT_CONFIRM_PHRASE:?}"),
+            data: Some(json!({
+                "param": "confirmation",
+                "required_value": SENSITIVE_EXPORT_CONFIRM_PHRASE,
+            })),
+        });
+    }
+    if requested_include_reserved && agent_name.is_some() && !daemon_export_authorised(ctx) {
+        return Err(JsonRpcError {
+            code: CAPABILITY_DENIED,
+            message: format!(
+                "daemon-owned audit export requires an authority explicitly listed in {DAEMON_EXPORT_AUTHORITIES_ENV}"
+            ),
+            data: Some(json!({
+                "required_authority_env": DAEMON_EXPORT_AUTHORITIES_ENV,
+                "authority": ctx.authority_identity(),
+            })),
+        });
+    }
+    let fact_policy = if agent_name.is_some() {
+        FactExportPolicy::confirmed(
+            requested_include_private || requested_include_reserved,
+            requested_include_reserved,
+        )
+    } else {
+        FactExportPolicy::public_only()
+    };
 
     let now = Utc::now();
     let since_rfc3339 = since_dt.map_or_else(|| "1970-01-01T00:00:00Z".to_string(), |dt| dt.to_rfc3339());
@@ -184,14 +234,14 @@ pub async fn handle_audit_export_bundle(args: &Value, ctx: &McpContext) -> Resul
                     continue;
                 }
             }
-            if is_reserved(&fact.entity) && !include_reserved {
+            if !fact_policy.allows(fact) {
                 continue;
             }
             // Visibility — a non-operator caller never sees another
             // agent's private facts. Identity-scoped (M5) so the OWNER can
-            // export its own passport-keyed private fact. The `include_reserved`
-            // operator bypass is preserved unchanged.
-            if !scope::fact_visible_to_identity(fact, id_ref, &alias_refs) && !include_reserved {
+            // export its own passport-keyed private fact. Explicit daemon
+            // consent preserves the operator audit bypass.
+            if !scope::fact_visible_to_identity(fact, id_ref, &alias_refs) && !fact_policy.includes_daemon_owned() {
                 continue;
             }
             if tokens_used.saturating_add(fact.tokens) > token_budget && !out.is_empty() {
@@ -236,7 +286,8 @@ pub async fn handle_audit_export_bundle(args: &Value, ctx: &McpContext) -> Resul
     let bundle_id = format!("bundle-{}", Uuid::new_v4().simple());
     let scope_record = AuditBundleScopeV1 {
         entity_prefix: requested_entity_prefix,
-        include_reserved,
+        include_private: fact_policy.includes_private(),
+        include_reserved: fact_policy.includes_daemon_owned(),
         caller: agent_name.map(str::to_string),
     };
 
@@ -293,11 +344,12 @@ pub async fn handle_audit_export_bundle(args: &Value, ctx: &McpContext) -> Resul
     })?;
 
     let summary = format!(
-        "audit-bundle {bundle_id}: facts={} receipts={} since={} until={} include_reserved={} bytes_path={}",
+        "audit-bundle {bundle_id}: facts={} receipts={} since={} until={} include_private={} include_reserved={} bytes_path={}",
         built.manifest.fact_count,
         built.manifest.receipt_count,
         built.manifest.since,
         built.manifest.until,
+        scope_record.include_private,
         scope_record.include_reserved,
         out_path.display()
     );
@@ -324,6 +376,7 @@ mod tests {
     use crate::agent::AgentIdentity;
     use crate::dispatch::McpContext;
     use crate::tools::facts::handle_store_fact;
+    use crate::tools::passport::PassportRecord;
     use corecrux_receipts::{verify_bundle_v1, AuditBundleManifestV1};
 
     // Tests that flip the feature flag must serialise on the crate-wide
@@ -342,6 +395,7 @@ mod tests {
             let lock = flag_lock().lock().await;
             env::remove_var(SIGNING_KEY_ENV);
             env::remove_var(SIGNING_KEY_ID_ENV);
+            env::remove_var(DAEMON_EXPORT_AUTHORITIES_ENV);
             env::set_var(FEATURE_FLAG_ENV, "1");
             Self { _lock: lock }
         }
@@ -349,6 +403,7 @@ mod tests {
             let lock = flag_lock().lock().await;
             env::remove_var(SIGNING_KEY_ENV);
             env::remove_var(SIGNING_KEY_ID_ENV);
+            env::remove_var(DAEMON_EXPORT_AUTHORITIES_ENV);
             env::remove_var(FEATURE_FLAG_ENV);
             Self { _lock: lock }
         }
@@ -359,6 +414,7 @@ mod tests {
             env::remove_var(SIGNING_KEY_ENV);
             env::remove_var(SIGNING_KEY_ID_ENV);
             env::remove_var(EXPORT_DIR_ENV);
+            env::remove_var(DAEMON_EXPORT_AUTHORITIES_ENV);
         }
     }
 
@@ -385,8 +441,50 @@ mod tests {
         });
     }
 
+    async fn seed_mcp_passport_tier(ctx: &McpContext, passport_name: &str, tier: &str) {
+        let record = PassportRecord {
+            principal_id: format!("test::{passport_name}"),
+            sponsor_id: None,
+            reputation_tier: tier.to_string(),
+            receipt_count: if tier == "trusted" { 500 } else { 0 },
+            issued_at: "2026-01-01T00:00:00Z".to_string(),
+            passport_hash: "test-only".to_string(),
+            tenant_group: Some(ctx.scope_tenant()),
+            revoked_at: None,
+            revoked_reason: None,
+        };
+        let mut store = ctx.fact_store.write().await;
+        store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: ctx.scope_tenant(),
+            entity: format!("__passport__::{passport_name}"),
+            key: "passport".to_string(),
+            value: serde_json::to_string(&record).unwrap(),
+            source_receipt: Some("test:trusted-mcp-passport".to_string()),
+            confidence: 1.0,
+            private: true,
+            horizon_class: None,
+            actor: Some("daemon:test".to_string()),
+        });
+    }
+
     fn redirect_export_dir(td: &tempfile::TempDir) {
         env::set_var(EXPORT_DIR_ENV, td.path());
+    }
+
+    fn event_body(resp: &Value) -> String {
+        let raw = std::fs::read(resp["bytes_path"].as_str().unwrap()).unwrap();
+        let decoded = zstd::stream::decode_all(raw.as_slice()).unwrap();
+        let mut archive = tar::Archive::new(decoded.as_slice());
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap().as_ref() == std::path::Path::new("events.jsonl") {
+                let mut body = String::new();
+                use std::io::Read as _;
+                entry.read_to_string(&mut body).unwrap();
+                return body;
+            }
+        }
+        panic!("events.jsonl missing");
     }
 
     #[tokio::test]
@@ -488,19 +586,157 @@ mod tests {
         redirect_export_dir(&td);
 
         let ctx = agent_ctx("operator-1");
+        seed_mcp_passport_tier(&ctx, "operator-1", "trusted").await;
+        env::set_var(DAEMON_EXPORT_AUTHORITIES_ENV, "agent:operator-1");
         handle_store_fact(&json!({"entity": "project-x", "key": "k", "value": "v"}), &ctx)
             .await
             .unwrap();
         seed_operator_fact(&ctx, "__ops::config-audit", "sha256:abc", "ok").await;
 
         let resp = handle_audit_export_bundle(
-            &json!({"token_budget": 1000, "scope": {"include_reserved": true}}),
+            &json!({
+                "token_budget": 1000,
+                "scope": {"include_reserved": true},
+                "confirmation": SENSITIVE_EXPORT_CONFIRM_PHRASE,
+            }),
             &ctx,
         )
         .await
         .unwrap();
         assert_eq!(resp["scope"]["include_reserved"], true);
-        assert_eq!(resp["fact_count"], 2);
+        assert!(event_body(&resp).contains("__ops::config-audit"));
+    }
+
+    #[tokio::test]
+    async fn audit_export_sensitive_scope_requires_exact_confirmation() {
+        let _g = FeatureFlagGuard::enabled().await;
+        let ctx = agent_ctx("operator-1");
+        for confirmation in [None, Some("yes"), Some("include reserved")] {
+            let mut request = json!({
+                "token_budget": 1000,
+                "scope": {"include_reserved": true},
+            });
+            if let Some(value) = confirmation {
+                request["confirmation"] = json!(value);
+            }
+            let err = handle_audit_export_bundle(&request, &ctx).await.unwrap_err();
+            assert_eq!(err.code, INVALID_PARAMS);
+            assert_eq!(err.data.unwrap()["param"], "confirmation");
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_export_daemon_scope_requires_explicit_authority_after_confirmation() {
+        let _g = FeatureFlagGuard::enabled().await;
+        let ctx = agent_ctx("alice");
+        // Even a self-service reputation passport at the old trusted+
+        // threshold is not operator authority.
+        seed_mcp_passport_tier(&ctx, "alice", "trusted").await;
+        env::set_var(DAEMON_EXPORT_AUTHORITIES_ENV, "*,agent:mallory");
+
+        let err = handle_audit_export_bundle(
+            &json!({
+                "token_budget": 1000,
+                "scope": {"include_reserved": true},
+                "confirmation": SENSITIVE_EXPORT_CONFIRM_PHRASE,
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, CAPABILITY_DENIED);
+        assert!(err.message.contains(DAEMON_EXPORT_AUTHORITIES_ENV));
+    }
+
+    #[tokio::test]
+    async fn audit_export_policy_filters_private_daemon_and_deleted_values() {
+        let _g = FeatureFlagGuard::enabled().await;
+        let td = tempfile::tempdir().unwrap();
+        redirect_export_dir(&td);
+        let ctx = agent_ctx("alice");
+        seed_mcp_passport_tier(&ctx, "alice", "trusted").await;
+        env::set_var(DAEMON_EXPORT_AUTHORITIES_ENV, "agent:alice");
+
+        handle_store_fact(&json!({"entity": "public", "key": "k", "value": "needle-public"}), &ctx)
+            .await
+            .unwrap();
+        handle_store_fact(
+            &json!({"entity": "private", "key": "k", "value": "needle-private", "private": true}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        seed_operator_fact(&ctx, "__work__::w1", "record", "needle-daemon").await;
+        seed_operator_fact(
+            &ctx,
+            "__agent_session::bob::legacy",
+            "state",
+            "needle-other-agent-session",
+        )
+        .await;
+        {
+            let mut store = ctx.fact_store.write().await;
+            let deleted = store.store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: "deleted".to_string(),
+                key: "k".to_string(),
+                value: "needle-deleted".to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            });
+            store.delete("default", &deleted.fact_id);
+        }
+
+        let public = handle_audit_export_bundle(&json!({"token_budget": 4000}), &ctx)
+            .await
+            .unwrap();
+        let public_body = event_body(&public);
+        assert!(public_body.contains("needle-public"));
+        for excluded in [
+            "needle-private",
+            "needle-daemon",
+            "needle-other-agent-session",
+            "needle-deleted",
+        ] {
+            assert!(!public_body.contains(excluded), "{excluded} leaked without consent");
+        }
+
+        let private = handle_audit_export_bundle(
+            &json!({
+                "token_budget": 4000,
+                "scope": {"include_private": true},
+                "confirmation": SENSITIVE_EXPORT_CONFIRM_PHRASE,
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let private_body = event_body(&private);
+        assert!(private_body.contains("needle-private"));
+        assert!(!private_body.contains("needle-daemon"));
+        assert!(!private_body.contains("needle-other-agent-session"));
+        assert!(!private_body.contains("needle-deleted"));
+
+        let reserved = handle_audit_export_bundle(
+            &json!({
+                "token_budget": 4000,
+                "scope": {"include_reserved": true},
+                "confirmation": SENSITIVE_EXPORT_CONFIRM_PHRASE,
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let reserved_body = event_body(&reserved);
+        assert!(reserved_body.contains("needle-private"));
+        assert!(reserved_body.contains("needle-daemon"));
+        assert!(reserved_body.contains("needle-other-agent-session"));
+        assert!(!reserved_body.contains("needle-deleted"));
+        assert_eq!(reserved["scope"]["include_private"], true);
+        assert_eq!(reserved["scope"]["include_reserved"], true);
     }
 
     #[tokio::test]

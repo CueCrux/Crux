@@ -159,12 +159,21 @@ pub struct AuditBundleScopeV1 {
     /// If set, only entities matching this prefix were included.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entity_prefix: Option<String>,
+    /// True iff ordinary private or export-sensitive entries were included
+    /// after explicit per-invocation confirmation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub include_private: bool,
     /// True iff reserved-prefix entries (`__agent::*`, `__ops::*`,
-    /// `__bootstrap__::*`) were included (operator-tier export).
+    /// `__bootstrap__::*`, and the full daemon-owned registry) were included
+    /// after explicit per-invocation confirmation.
     pub include_reserved: bool,
     /// Free-form caller label (passport id or operator note).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub caller: Option<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Provenance class for the key that signed an audit bundle.
@@ -781,6 +790,7 @@ mod tests {
             generated_at_rfc3339: "2026-05-28T01:00:00Z".to_string(),
             scope: AuditBundleScopeV1 {
                 entity_prefix: None,
+                include_private: false,
                 include_reserved: false,
                 caller: Some("test-passport".to_string()),
             },

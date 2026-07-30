@@ -22,6 +22,7 @@
 //! ## Defaults
 //!
 //! - `__ax__::`              — agent cockpit (decisions, skills, snapshots, jobs)
+//! - `__agent_session::`     — legacy agent-scoped session key space
 //! - `__constraints__::`     — operator/agent constraints
 //! - `__project_layer__::`   — Vision / Goals / planes / etc.
 //! - `__work__::`            — work items
@@ -97,6 +98,7 @@ pub fn global_policy() -> &'static PrivacyPolicy {
 pub const DEFAULT_PRIVATE_PREFIXES: &[&str] = &[
     "__action_enrichment_receipt__::",
     "__agent::",
+    "__agent_session::",
     "__ops::",
     "__ops__::",
     "__ax__::",
@@ -167,6 +169,7 @@ pub const DEFAULT_PRIVATE_PREFIXES: &[&str] = &[
 /// calls.
 pub const DAEMON_OWNED_ENTITY_PREFIXES: &[&str] = &[
     "__action_enrichment_receipt__::",
+    "__agent_session::",
     "__ops::",
     "__ops__::",
     "__answer_replay_capsule__::",
@@ -227,6 +230,105 @@ pub const DAEMON_OWNED_ENTITY_PREFIXES: &[&str] = &[
 /// daemon control namespace would strand every ordinary private fact.
 pub const GENERIC_CREATE_RESERVED_PREFIXES: &[&str] = &["__agent::"];
 
+/// Export-only sensitive prefixes that are intentionally not born private.
+///
+/// `__decisions__::` rows are compatibility annotations rather than trusted
+/// daemon control state, but their operator-authored contents still require
+/// explicit consent before leaving the local store.
+pub const EXPORT_ONLY_SENSITIVE_PREFIXES: &[&str] = &["__decisions__::"];
+
+/// Exact per-invocation phrase accepted by CLI and MCP export surfaces.
+pub const SENSITIVE_EXPORT_CONFIRM_PHRASE: &str = "include private";
+
+/// Whether one class of sensitive fact has received explicit, per-invocation
+/// export consent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExportConsent {
+    #[default]
+    Exclude,
+    Confirmed,
+}
+
+/// One typed privacy decision shared by portable-memory and audit exports.
+///
+/// The policy is deliberately the result of a confirmation ceremony, not a
+/// request flag. Boundary code may construct `Confirmed` only after checking
+/// [`SENSITIVE_EXPORT_CONFIRM_PHRASE`] (or an equivalent typed UI action).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FactExportPolicy {
+    private: ExportConsent,
+    daemon_owned: ExportConsent,
+}
+
+/// Why a fact is included or excluded by [`FactExportPolicy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FactExportDecision {
+    Include,
+    ExcludeDeleted,
+    ExcludePrivate,
+    ExcludeDaemonOwned,
+}
+
+impl FactExportPolicy {
+    pub const fn public_only() -> Self {
+        Self {
+            private: ExportConsent::Exclude,
+            daemon_owned: ExportConsent::Exclude,
+        }
+    }
+
+    /// Construct the resolved policy after the caller has completed the
+    /// confirmation ceremony for each requested class.
+    pub const fn confirmed(include_private: bool, include_daemon_owned: bool) -> Self {
+        Self {
+            private: if include_private {
+                ExportConsent::Confirmed
+            } else {
+                ExportConsent::Exclude
+            },
+            daemon_owned: if include_daemon_owned {
+                ExportConsent::Confirmed
+            } else {
+                ExportConsent::Exclude
+            },
+        }
+    }
+
+    pub fn includes_private(self) -> bool {
+        self.private == ExportConsent::Confirmed
+    }
+
+    pub fn includes_daemon_owned(self) -> bool {
+        self.daemon_owned == ExportConsent::Confirmed
+    }
+
+    /// Apply erasure first, then the stronger daemon-control boundary, then
+    /// ordinary private/reserved classification.
+    pub fn decision(self, fact: &Fact) -> FactExportDecision {
+        if fact.deleted {
+            FactExportDecision::ExcludeDeleted
+        } else if daemon_owned_entity_prefix(&fact.entity).is_some() {
+            if self.includes_daemon_owned() {
+                FactExportDecision::Include
+            } else {
+                FactExportDecision::ExcludeDaemonOwned
+            }
+        } else if fact.private || export_sensitive_entity_prefix(&fact.entity).is_some() {
+            if self.includes_private() {
+                FactExportDecision::Include
+            } else {
+                FactExportDecision::ExcludePrivate
+            }
+        } else {
+            FactExportDecision::Include
+        }
+    }
+
+    pub fn allows(self, fact: &Fact) -> bool {
+        self.decision(fact) == FactExportDecision::Include
+    }
+}
+
 /// Return the daemon-owned prefix covering `entity`, if any.
 ///
 /// This is the canonical target-mutation guard after any physical owner
@@ -261,6 +363,20 @@ pub fn default_private_entity_prefix(entity: &str) -> Option<&'static str> {
         .iter()
         .copied()
         .find(|prefix| entity.starts_with(prefix))
+}
+
+/// Return the canonical private/reserved prefix covering an export candidate.
+///
+/// This includes the born-private registry plus the narrow export-only tail.
+/// Daemon-owned classification remains separate so callers can require the
+/// stronger consent class.
+pub fn export_sensitive_entity_prefix(entity: &str) -> Option<&'static str> {
+    default_private_entity_prefix(entity).or_else(|| {
+        EXPORT_ONLY_SENSITIVE_PREFIXES
+            .iter()
+            .copied()
+            .find(|prefix| entity.starts_with(prefix))
+    })
 }
 
 /// Return the daemon-owned prefix intersecting a requested prefix scope.
@@ -398,6 +514,13 @@ pub fn enforce(policy: &PrivacyPolicy, fact: &mut StoreFact) {
 mod tests {
     use super::*;
 
+    fn stored(entity: &str, private: bool) -> Fact {
+        let mut store = crate::FactStore::new();
+        let mut input = make(entity);
+        input.private = private;
+        store.store(input)
+    }
+
     fn make(entity: &str) -> StoreFact {
         StoreFact {
             tenant_hash: "default".to_string(),
@@ -430,6 +553,67 @@ mod tests {
         // strictly local, born private (coordination-plane ExecPlan T.1).
         assert!(p.is_always_private("__coord__::proj::deadbeef"));
         assert!(p.is_always_private("__incident__::inc_deadbeef"));
+    }
+
+    #[test]
+    fn fact_export_policy_separates_private_daemon_and_erasure_consent() {
+        let public = stored("project-public", false);
+        let private = stored("private-note", true);
+        let export_only = stored("__decisions__::legacy", false);
+        let legacy_session = stored("__agent_session::alice::legacy", false);
+        let daemon = stored("__work__::w1", false);
+        let mut deleted = stored("deleted-public", false);
+        deleted.deleted = true;
+
+        let public_only = FactExportPolicy::public_only();
+        assert!(public_only.allows(&public));
+        assert_eq!(public_only.decision(&private), FactExportDecision::ExcludePrivate);
+        assert_eq!(public_only.decision(&export_only), FactExportDecision::ExcludePrivate);
+        assert_eq!(
+            public_only.decision(&legacy_session),
+            FactExportDecision::ExcludeDaemonOwned
+        );
+        assert_eq!(public_only.decision(&daemon), FactExportDecision::ExcludeDaemonOwned);
+
+        let private_confirmed = FactExportPolicy::confirmed(true, false);
+        assert!(private_confirmed.allows(&private));
+        assert!(private_confirmed.allows(&export_only));
+        assert!(!private_confirmed.allows(&legacy_session));
+        assert!(!private_confirmed.allows(&daemon));
+
+        let all_confirmed = FactExportPolicy::confirmed(true, true);
+        assert!(all_confirmed.allows(&daemon));
+        assert!(all_confirmed.allows(&legacy_session));
+        for policy in [public_only, private_confirmed, all_confirmed] {
+            assert_eq!(policy.decision(&deleted), FactExportDecision::ExcludeDeleted);
+            assert!(!policy.allows(&deleted));
+        }
+    }
+
+    #[test]
+    fn export_sensitive_registry_covers_born_private_and_export_only_prefixes() {
+        for prefix in DEFAULT_PRIVATE_PREFIXES {
+            assert_eq!(export_sensitive_entity_prefix(prefix), Some(*prefix));
+        }
+        for prefix in EXPORT_ONLY_SENSITIVE_PREFIXES {
+            assert_eq!(export_sensitive_entity_prefix(prefix), Some(*prefix));
+            assert!(
+                crate::cruxpack::CRUXPACK_RESERVED_PREFIXES.contains(prefix),
+                "{prefix} missing from CruxPack compatibility registry"
+            );
+        }
+        for prefix in DAEMON_OWNED_ENTITY_PREFIXES {
+            let fact = stored(&format!("{prefix}policy-test"), false);
+            assert_eq!(
+                FactExportPolicy::public_only().decision(&fact),
+                FactExportDecision::ExcludeDaemonOwned
+            );
+            assert_eq!(
+                FactExportPolicy::confirmed(true, false).decision(&fact),
+                FactExportDecision::ExcludeDaemonOwned
+            );
+            assert!(FactExportPolicy::confirmed(true, true).allows(&fact));
+        }
     }
 
     #[test]

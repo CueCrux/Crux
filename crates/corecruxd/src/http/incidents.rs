@@ -832,6 +832,7 @@ async fn build_incident_bundle(
         generated_at_rfc3339: now.to_rfc3339(),
         scope: AuditBundleScopeV1 {
             entity_prefix: Some(case_fact.entity.clone()),
+            include_private: false,
             include_reserved: true,
             caller: Some(case.created_by.clone()),
         },

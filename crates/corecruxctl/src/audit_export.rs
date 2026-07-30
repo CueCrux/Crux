@@ -18,13 +18,12 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 
+use corecrux_memory::fact_privacy::FactExportPolicy;
 use corecrux_memory::FactStore;
 use corecrux_receipts::{
     build_bundle_v1, resolve_audit_export_signing_key, verify_bundle_with_trust_roots_v1, AuditBundleScopeV1,
     AuditEventV1, AuditReceiptRefV1, BuildBundleInputV1, VerifyReportV1, WitnessLogPublicKeyV1,
 };
-
-const RESERVED_PREFIXES: &[&str] = &["__agent::", "__ops::", "__bootstrap__::", "__agent_session::"];
 
 #[derive(Debug, Clone)]
 pub struct AuditExportArgs {
@@ -38,8 +37,8 @@ pub struct AuditExportArgs {
     pub until: Option<String>,
     /// Optional entity-prefix filter.
     pub scope_entity_prefix: Option<String>,
-    /// If set, include reserved-prefix entries (operator scope).
-    pub include_reserved: bool,
+    /// Resolved per-invocation sensitive-export policy.
+    pub fact_policy: FactExportPolicy,
     /// Caller label embedded in the manifest scope.
     pub caller: Option<String>,
 }
@@ -72,7 +71,7 @@ pub fn run_audit_export(args: AuditExportArgs) -> Result<(u64, u64, String), Box
                 continue;
             }
         }
-        if is_reserved(&fact.entity) && !args.include_reserved {
+        if !args.fact_policy.allows(fact) {
             continue;
         }
         events.push(AuditEventV1 {
@@ -99,7 +98,8 @@ pub fn run_audit_export(args: AuditExportArgs) -> Result<(u64, u64, String), Box
     let now = Utc::now();
     let scope_record = AuditBundleScopeV1 {
         entity_prefix: args.scope_entity_prefix,
-        include_reserved: args.include_reserved,
+        include_private: args.fact_policy.includes_private(),
+        include_reserved: args.fact_policy.includes_daemon_owned(),
         caller: args.caller,
     };
     let bundle_id = format!("bundle-{}", uuid::Uuid::new_v4().simple());
@@ -173,14 +173,58 @@ fn parse_rfc3339(value: Option<&str>) -> Result<Option<DateTime<Utc>>, Box<dyn s
     Ok(Some(dt))
 }
 
-fn is_reserved(entity: &str) -> bool {
-    RESERVED_PREFIXES.iter().any(|p| entity.starts_with(p))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use corecrux_memory::fact_store::StoreFact;
+    use std::io::Read as _;
+
+    fn seed_fact(store: &mut FactStore, entity: &str, value: &str, private: bool) -> corecrux_memory::Fact {
+        store.store(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: entity.to_string(),
+            key: "k".to_string(),
+            value: value.to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private,
+            horizon_class: None,
+            actor: None,
+        })
+    }
+
+    fn read_events(path: &Path) -> Vec<AuditEventV1> {
+        let raw = std::fs::read(path).unwrap();
+        let decoded = zstd::stream::decode_all(raw.as_slice()).unwrap();
+        let mut archive = tar::Archive::new(decoded.as_slice());
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap().as_ref() == Path::new("events.jsonl") {
+                let mut body = String::new();
+                entry.read_to_string(&mut body).unwrap();
+                return body
+                    .lines()
+                    .filter(|line| !line.is_empty())
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+            }
+        }
+        panic!("events.jsonl missing");
+    }
+
+    fn export_with_policy(data_dir: &Path, out: &Path, fact_policy: FactExportPolicy) -> Vec<AuditEventV1> {
+        run_audit_export(AuditExportArgs {
+            data_dir: data_dir.to_path_buf(),
+            out: out.to_path_buf(),
+            since: None,
+            until: None,
+            scope_entity_prefix: None,
+            fact_policy,
+            caller: Some("test".to_string()),
+        })
+        .unwrap();
+        read_events(out)
+    }
 
     #[test]
     fn export_then_verify_round_trip() {
@@ -222,7 +266,7 @@ mod tests {
             since: None,
             until: None,
             scope_entity_prefix: None,
-            include_reserved: false,
+            fact_policy: FactExportPolicy::public_only(),
             caller: Some("test-caller".to_string()),
         })
         .unwrap();
@@ -264,13 +308,105 @@ mod tests {
             since: None,
             until: None,
             scope_entity_prefix: None,
-            include_reserved: true,
+            fact_policy: FactExportPolicy::confirmed(true, true),
             caller: None,
         })
         .unwrap();
         assert_eq!(facts, 1);
         let report = run_audit_verify(&out, None).unwrap();
         assert!(report.ok);
+    }
+
+    #[test]
+    fn audit_events_apply_one_policy_and_never_emit_deleted_plaintext() {
+        let data_td = tempfile::tempdir().unwrap();
+        {
+            let mut store = FactStore::with_persistence(data_td.path()).unwrap();
+            seed_fact(&mut store, "project-public", "needle-public", false);
+            seed_fact(&mut store, "private-note", "needle-private", true);
+            seed_fact(&mut store, "github::org/private", "needle-github", false);
+            seed_fact(&mut store, "__decisions__::compat", "needle-decision", false);
+            seed_fact(
+                &mut store,
+                "__agent_session::alice::legacy",
+                "needle-agent-session",
+                false,
+            );
+            seed_fact(&mut store, "__agent::alice::note", "needle-agent", true);
+            for (entity, value) in [
+                ("__passport__::p1", "needle-passport"),
+                ("__extension__::e1", "needle-extension"),
+                ("__work__::w1", "needle-work"),
+                ("__constraints__::c1", "needle-constraint"),
+                ("__engram__::g1", "needle-engram"),
+            ] {
+                seed_fact(&mut store, entity, value, false);
+            }
+            let deleted = seed_fact(&mut store, "deleted-public", "needle-deleted", false);
+            store.delete("default", &deleted.fact_id);
+        }
+        let out_td = tempfile::tempdir().unwrap();
+
+        let public_events = export_with_policy(
+            data_td.path(),
+            &out_td.path().join("public.tar.zst"),
+            FactExportPolicy::public_only(),
+        );
+        assert_eq!(public_events.len(), 1);
+        assert_eq!(public_events[0].value, "needle-public");
+
+        let private_events = export_with_policy(
+            data_td.path(),
+            &out_td.path().join("private.tar.zst"),
+            FactExportPolicy::confirmed(true, false),
+        );
+        let private_json = serde_json::to_string(&private_events).unwrap();
+        for included in ["needle-private", "needle-github", "needle-decision", "needle-agent"] {
+            assert!(
+                private_json.contains(included),
+                "{included} should require and honor private consent"
+            );
+        }
+        for excluded in [
+            "needle-passport",
+            "needle-extension",
+            "needle-work",
+            "needle-constraint",
+            "needle-engram",
+            "needle-agent-session",
+            "needle-deleted",
+        ] {
+            assert!(
+                !private_json.contains(excluded),
+                "{excluded} crossed the stronger policy boundary"
+            );
+        }
+
+        let full_events = export_with_policy(
+            data_td.path(),
+            &out_td.path().join("full.tar.zst"),
+            FactExportPolicy::confirmed(true, true),
+        );
+        let full_json = serde_json::to_string(&full_events).unwrap();
+        for included in [
+            "needle-private",
+            "needle-github",
+            "needle-decision",
+            "needle-agent-session",
+            "needle-agent",
+            "needle-passport",
+            "needle-extension",
+            "needle-work",
+            "needle-constraint",
+            "needle-engram",
+        ] {
+            assert!(
+                full_json.contains(included),
+                "{included} missing after both consent classes"
+            );
+        }
+        assert!(!full_json.contains("needle-deleted"));
+        assert!(full_events.iter().all(|event| !event.deleted));
     }
 
     #[test]
@@ -299,7 +435,7 @@ mod tests {
             since: None,
             until: None,
             scope_entity_prefix: None,
-            include_reserved: false,
+            fact_policy: FactExportPolicy::public_only(),
             caller: None,
         })
         .unwrap();
