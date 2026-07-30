@@ -6,10 +6,10 @@
 //! M8 local-daemon to Core migration round-trip test.
 //!
 //! Master-plan Phase 8 gate: "full round trip — stand up a local-daemon install,
-//! open 10 sessions, make 100 invocations, upload to hosted, verify all
-//! 100 invocations under the new tenant."
+//! open 10 sessions, make 100 invocations, upload to hosted, and establish
+//! structural consistency for all 100 invocations under the new tenant."
 //!
-//! We don't run a real hosted API here (the hosted verifier is in TS
+//! We don't run a real hosted API here (the hosted structural checker is in TS
 //! and the bundle schema is JSON). What we CAN do in pure Rust:
 //!
 //!   1. Stand up a real local-daemon install (tempdir + durable services).
@@ -17,14 +17,14 @@
 //!   3. Build a [`CeExportBundle`] via
 //!      [`crux_session::export::build_bundle`].
 //!   4. Serialise the bundle to JSON (what the agent would POST).
-//!   5. Re-parse the bundle — the same code the hosted verifier does.
+//!   5. Re-parse the bundle — the same code the hosted checker does.
 //!   6. For each plan in the bundle:
 //!      - decode the canonical CBOR → SessionPlan
 //!      - recompute plan_receipt_hash → matches advertised hash
 //!   7. For each invocation receipt stored against each plan:
-//!      - verify_invocation_receipt(receipt, plan) → verified_overall
-//!   8. Assert: 10 plans exported, 10 plans re-verify, 100 invocations
-//!      replayed from the local event log, all chain-verify.
+//!      - verify_invocation_receipt(receipt, plan) → structurally_consistent
+//!   8. Assert: 10 plans exported, 10 plan hashes match, 100 invocations
+//!      replayed from the local event log, all structurally chain.
 //!
 //! The actual ed25519 countersignature + `CeInstallImportedV1` event is
 //! minted on the hosted side inside the `/v1/ce-import` route; that's
@@ -100,7 +100,7 @@ fn seal_invocation(plan: &SessionPlan, receipt: &crux_session::receipt::Invocati
 }
 
 #[test]
-fn ce_install_exports_verifiable_bundle() {
+fn ce_install_exports_structurally_consistent_bundle() {
     const PLANS: usize = 10;
     const INVOCATIONS_PER_PLAN: usize = 10;
 
@@ -189,15 +189,15 @@ fn ce_install_exports_verifiable_bundle() {
     );
 
     // ── Serialise (what the agent POSTs) + re-parse (what the hosted
-    //    side does before verifying). JSON round-trip must be lossless.
+    //    side does before structural checks). JSON round-trip must be lossless.
     let json = serde_json::to_string_pretty(&bundle).expect("serialise");
     let reparsed: CeExportBundle = serde_json::from_str(&json).expect("reparse");
     assert_eq!(reparsed.install_uuid, bundle.install_uuid);
     assert_eq!(reparsed.plans.len(), bundle.plans.len());
 
-    // ── Hosted-side chain verification ────────────────────────────────
-    let mut verified_plans = 0;
-    let mut verified_invocations = 0;
+    // ── Hosted-side structural chain checks ───────────────────────────
+    let mut consistent_plans = 0;
+    let mut structurally_consistent_invocations = 0;
     let mut principals = std::collections::HashSet::new();
 
     for plan_entry in &reparsed.plans {
@@ -215,9 +215,9 @@ fn ce_install_exports_verifiable_bundle() {
             plan_entry.session_id_hex
         );
         assert_eq!(plan.receipt.hash, recomputed);
-        verified_plans += 1;
+        consistent_plans += 1;
 
-        // 3. Chain-verify every invocation receipt we sealed for this
+        // 3. Check structural consistency for every invocation receipt we sealed for this
         // session. We pull them from the in-test collection because our
         // Local bundle builder currently emits plans only; the hosted side
         // will receive invocations via the same bundle once we extend
@@ -227,16 +227,16 @@ fn ce_install_exports_verifiable_bundle() {
             for receipt in receipts {
                 let verdict = verify_invocation_receipt(receipt, &plan);
                 assert!(
-                    verdict.verified_overall(),
+                    verdict.structurally_consistent(),
                     "invocation receipt failed to chain: {verdict:?}"
                 );
-                verified_invocations += 1;
+                structurally_consistent_invocations += 1;
             }
         }
     }
 
-    assert_eq!(verified_plans, PLANS);
-    assert_eq!(verified_invocations, PLANS * INVOCATIONS_PER_PLAN);
+    assert_eq!(consistent_plans, PLANS);
+    assert_eq!(structurally_consistent_invocations, PLANS * INVOCATIONS_PER_PLAN);
     assert_eq!(
         principals.len(),
         1,
@@ -252,10 +252,10 @@ fn ce_install_exports_verifiable_bundle() {
 }
 
 #[test]
-fn bundle_mixing_two_principals_is_rejected_by_verifier() {
+fn bundle_mixing_two_principals_is_rejected_by_import_guard() {
     // Models the guard in the hosted /v1/ce-import route. We synthesise
     // a bundle-shaped JSON body, then assert that our Rust-side helper
-    // (used by the TS verifier transitively) flags the mix. The Rust
+    // (used by the TS import guard transitively) flags the mix. The Rust
     // `build_bundle` always produces single-principal bundles by
     // construction, so we fabricate a two-principal bundle by hand.
     let data_dir = tempdir();
@@ -312,7 +312,7 @@ fn bundle_mixing_two_principals_is_rejected_by_verifier() {
 
     let principals: std::collections::HashSet<&str> = bundle.plans.iter().map(|p| p.principal_id.as_str()).collect();
     assert_eq!(principals.len(), 2, "we spliced in a second principal");
-    // The hosted verifier's guard: `principalSet.size !== 1 → reject`.
+    // The hosted import guard: `principalSet.size !== 1 → reject`.
     // We assert the precondition here; the TS-side route enforces the
     // policy in the /v1/ce-import handler.
 

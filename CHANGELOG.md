@@ -92,6 +92,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Invocation verification now names its actual trust level.**
+  `POST /invocation/verify` replaces the misleading `verified` field with
+  `structurally_consistent` and explicitly reports
+  `authenticity_verified: false`, `replay_checked: false`, and
+  `verification_scope: "local_structural_integrity"`. The Rust verdict helper
+  is likewise renamed from `verified_overall()` to
+  `structurally_consistent()`, and the Prometheus success label follows the
+  new name. These are intentional breaking changes: the local public route
+  checks hashes, parent linkage, capability, and channel, but does not verify a
+  signature, execution evidence, freshness, or replay.
 - **`.mcp.json` is gitignored.** MCP clients write the daemon's agent bearer
   token into that file at the repository root, where it was previously
   committable.

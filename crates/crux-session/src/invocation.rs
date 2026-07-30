@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0.
 // See LICENSE in the repository root.
 
-//! Invocation-receipt minting + verification (master-plan §8).
+//! Invocation-receipt minting + structural consistency checking (master-plan §8).
 //!
 //! Every Layer 2 bulk call and every Layer 3 MCP tool call executed under
 //! an active session produces an [`InvocationReceipt`]. This module:
@@ -11,9 +11,11 @@
 //! - [`mint_invocation_receipt`] — builds a fresh `InvocationReceipt` for a
 //!   just-completed call, chained to the parent plan by
 //!   `parent_plan_receipt_hash`.
-//! - [`verify_invocation_receipt`] — returns a [`InvocationVerdict`] per
-//!   master-plan §8.2. Violations of the `capability` / `channel` checks
-//!   are **flagged, not rejected** — audit must see the attempt.
+//! - [`verify_invocation_receipt`] — legacy-named API that returns a
+//!   structural [`InvocationVerdict`] per master-plan §8.2. It does not
+//!   authenticate a signature or check replay. Violations of the
+//!   `capability` / `channel` checks are **flagged, not rejected** — audit
+//!   must see the attempt.
 //! - `build_invocation_sealed_event` — builds a
 //!   [`crate::sealer::SealedEvent`] ready to hand to a segment sealer so
 //!   the invocation lands in the segment log.
@@ -67,9 +69,12 @@ pub fn mint_invocation_receipt(input: MintInvocation<'_>) -> InvocationReceipt {
 /// `parent_plan_receipt_hash` matches the supplied plan's hash.
 ///
 /// `capability_ok` / `channel_ok` cover (3) + (4). When either is `false`,
-/// the receipt is **flagged, not rejected** — `verified_overall` is only
-/// `true` when integrity, capability, and channel all pass. Flagged
-/// receipts are preserved as audit evidence.
+/// the receipt is **flagged, not rejected**. Flagged receipts are preserved
+/// as audit evidence.
+///
+/// This verdict is deliberately structural. It does not authenticate
+/// `receipt_signature`/`signer_kid`, validate the receipt's session identity,
+/// timestamps, input/output evidence, or outcome, and it has no replay state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvocationVerdict {
     pub integrity_ok: bool,
@@ -79,7 +84,11 @@ pub struct InvocationVerdict {
 }
 
 impl InvocationVerdict {
-    pub fn verified_overall(&self) -> bool {
+    /// Whether the receipt's self-hash and parent-plan link are consistent and
+    /// its capability/channel fit the supplied plan.
+    ///
+    /// This is not an authenticity, execution, freshness, or replay verdict.
+    pub fn structurally_consistent(&self) -> bool {
         self.integrity_ok && self.capability_ok && self.channel_ok
     }
 }
@@ -255,7 +264,7 @@ mod tests {
         let plan = sample_plan();
         let receipt = ok_receipt(&plan, "retrieve", "bulk");
         let verdict = verify_invocation_receipt(&receipt, &plan);
-        assert!(verdict.verified_overall(), "verdict: {verdict:?}");
+        assert!(verdict.structurally_consistent(), "verdict: {verdict:?}");
         assert!(verdict.governance_faults.is_empty());
     }
 
@@ -266,7 +275,7 @@ mod tests {
         let receipt = ok_receipt(&plan, "retrieve", "mcp");
         let verdict = verify_invocation_receipt(&receipt, &plan);
         assert!(verdict.channel_ok);
-        assert!(verdict.verified_overall());
+        assert!(verdict.structurally_consistent());
     }
 
     #[test]
@@ -275,7 +284,7 @@ mod tests {
         let receipt = ok_receipt(&plan, "not_in_graph", "mcp");
         let verdict = verify_invocation_receipt(&receipt, &plan);
         assert!(!verdict.capability_ok);
-        assert!(!verdict.verified_overall());
+        assert!(!verdict.structurally_consistent());
         assert!(verdict
             .governance_faults
             .iter()
@@ -291,7 +300,7 @@ mod tests {
         let receipt = ok_receipt(&plan, "journal_append", "bulk");
         let verdict = verify_invocation_receipt(&receipt, &plan);
         assert!(!verdict.channel_ok);
-        assert!(!verdict.verified_overall());
+        assert!(!verdict.structurally_consistent());
         assert!(verdict
             .governance_faults
             .iter()
@@ -325,5 +334,42 @@ mod tests {
         let verdict = verify_invocation_receipt(&receipt, &plan);
         assert!(!verdict.integrity_ok);
         assert!(verdict.governance_faults.iter().any(|f| f == "receipt_hash_mismatch"));
+    }
+
+    #[test]
+    fn signature_metadata_is_outside_structural_consistency() {
+        let plan = sample_plan();
+        let mut receipt = ok_receipt(&plan, "retrieve", "bulk");
+        receipt.receipt_signature = Some([0xA5; 64]);
+        receipt.signer_kid = Some("untrusted-kid-a".to_string());
+        assert!(
+            verify_invocation_receipt(&receipt, &plan).structurally_consistent(),
+            "well-shaped but unauthenticated signature metadata must not be elevated"
+        );
+
+        receipt.receipt_signature = Some([0x5A; 64]);
+        receipt.signer_kid = Some("untrusted-kid-b".to_string());
+        assert!(
+            verify_invocation_receipt(&receipt, &plan).structurally_consistent(),
+            "signature metadata is deliberately zeroed by the structural hash"
+        );
+    }
+
+    #[test]
+    fn structural_consistency_excludes_session_time_evidence_and_outcome_validation() {
+        let plan = sample_plan();
+        let mut receipt = ok_receipt(&plan, "retrieve", "bulk");
+        receipt.session_id = [0xFF; 16];
+        receipt.invoked_at = 9_000;
+        receipt.completed_at = 1;
+        receipt.input_hash = [0x31; 32];
+        receipt.output_hash = [0x41; 32];
+        receipt.outcome = "caller-asserted".to_string();
+        receipt.receipt_hash = receipt.compute_hash();
+
+        assert!(
+            verify_invocation_receipt(&receipt, &plan).structurally_consistent(),
+            "the structural verdict must not imply checks it does not perform"
+        );
     }
 }

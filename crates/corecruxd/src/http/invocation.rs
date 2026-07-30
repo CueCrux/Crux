@@ -11,7 +11,8 @@
 //! returns the verifier's verdict. Violations of (3)/(4) — capability
 //! not in graph, channel mismatch — are flagged but do NOT cause a
 //! non-200 response; the entire verdict is returned so the caller can
-//! decide what to do.
+//! decide what to do. This local route does not verify signature
+//! authenticity or maintain replay state.
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -29,6 +30,8 @@ use crux_session::{
 use super::session::problem;
 use super::AppState;
 
+const VERIFICATION_SCOPE: &str = "local_structural_integrity";
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct InvocationReceiptWire {
     pub invocation_id: String,
@@ -44,15 +47,23 @@ pub struct InvocationReceiptWire {
     #[serde(default)]
     pub cost_crux: Option<u64>,
     pub receipt_hash: String,
+    /// Accepted and shape-decoded for wire compatibility. The local structural
+    /// verifier does not authenticate this signature.
     #[serde(default)]
     pub receipt_signature: Option<String>,
+    /// Accepted for wire compatibility but not resolved to a trust root here.
     #[serde(default)]
     pub signer_kid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VerifyResponse {
-    pub verified: bool,
+    pub structurally_consistent: bool,
+    /// Always false on this local-integrity route: authenticity is not checked.
+    pub authenticity_verified: bool,
+    /// Always false: the route has no invocation-ID replay store.
+    pub replay_checked: bool,
+    pub verification_scope: &'static str,
     pub integrity_ok: bool,
     pub capability_ok: bool,
     pub channel_ok: bool,
@@ -64,7 +75,10 @@ pub struct VerifyResponse {
 impl From<(InvocationVerdict, bool, Option<String>)> for VerifyResponse {
     fn from((v, parent_found, principal): (InvocationVerdict, bool, Option<String>)) -> Self {
         Self {
-            verified: parent_found && v.verified_overall(),
+            structurally_consistent: parent_found && v.structurally_consistent(),
+            authenticity_verified: false,
+            replay_checked: false,
+            verification_scope: VERIFICATION_SCOPE,
             integrity_ok: v.integrity_ok,
             capability_ok: v.capability_ok,
             channel_ok: v.channel_ok,
@@ -106,7 +120,8 @@ pub async fn post_invocation_verify(State(state): State<AppState>, body: Bytes) 
 
     // Look up the parent plan. The default-trait impl returns None if the
     // registry has no index; in that case we report parent_plan_found:false
-    // so the caller sees the specific fault instead of a false "verified".
+    // so the caller sees the specific fault instead of false structural
+    // consistency.
     let entry = match services.registry.get_by_plan_hash(&receipt.parent_plan_receipt_hash) {
         Ok(Some(e)) => e,
         Ok(None) => {
@@ -145,8 +160,8 @@ pub async fn post_invocation_verify(State(state): State<AppState>, body: Bytes) 
 
     let verdict = verify_invocation_receipt(&receipt, &plan);
     if let Some(m) = services.metrics.as_ref() {
-        m.invocation_verify(if verdict.verified_overall() {
-            "verified"
+        m.invocation_verify(if verdict.structurally_consistent() {
+            "structurally_consistent"
         } else {
             "flagged"
         });
@@ -221,7 +236,10 @@ fn decode_sig(s: &str, field: &str) -> Result<[u8; 64], String> {
 #[allow(dead_code)]
 pub fn example_response() -> serde_json::Value {
     json!({
-        "verified": true,
+        "structurally_consistent": true,
+        "authenticity_verified": false,
+        "replay_checked": false,
+        "verification_scope": "local_structural_integrity",
         "integrity_ok": true,
         "capability_ok": true,
         "channel_ok": true,

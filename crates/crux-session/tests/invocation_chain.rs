@@ -3,12 +3,14 @@
 // Licensed under the Apache License, Version 2.0.
 // See LICENSE in the repository root.
 
-//! M4 chain-verification correspondence test.
+//! M4 structural-chain correspondence test.
 //!
 //! Master plan §12.1 Phase 4 gate: "10,000 MCP tool calls produce 10,000
-//! receipts, all chain-verifiable to their plans." We run a scaled-down
-//! version (500 calls across 5 plans, 100 calls each) to keep `cargo test`
-//! fast; the chaining property is identical regardless of volume.
+//! receipts, all chain-verifiable to their plans." This test interprets that
+//! historical wording as structural hash/link consistency, not authenticity.
+//! We run a scaled-down version (500 calls across 5 plans, 100 calls each) to
+//! keep `cargo test` fast; the chaining property is identical regardless of
+//! volume.
 
 use std::collections::HashSet;
 
@@ -96,7 +98,7 @@ fn seal_plan(plan: &SessionPlan, plan_cbor: &[u8], sealer: &dyn PlanSealer) {
 }
 
 #[test]
-fn n_invocations_chain_verify_against_parent_plans() {
+fn n_invocations_are_structurally_consistent_with_parent_plans() {
     const PLANS: usize = 5;
     const CALLS_PER_PLAN: usize = 100;
 
@@ -117,7 +119,7 @@ fn n_invocations_chain_verify_against_parent_plans() {
     // For each plan, simulate CALLS_PER_PLAN tool invocations, each of
     // which mints a receipt AND seals an InvocationReceiptedV1 event.
     // Every capability + channel combination is from the plan's graph,
-    // so all receipts should verify cleanly.
+    // so all receipts should be structurally consistent.
     let mut total_invocations = 0;
     for (plan, _) in &plans {
         for i in 0..CALLS_PER_PLAN {
@@ -158,12 +160,12 @@ fn n_invocations_chain_verify_against_parent_plans() {
                 })
                 .expect("seal invocation");
 
-            // (b) Independently verify the receipt against its parent plan
-            // via the same code path the `POST /invocation/verify` endpoint
-            // uses. All N receipts must chain.
+            // (b) Independently check the receipt against its parent plan via
+            // the same structural code path the `POST /invocation/verify`
+            // endpoint uses. All N receipts must chain.
             let verdict = verify_invocation_receipt(&receipt, plan);
             assert!(
-                verdict.verified_overall(),
+                verdict.structurally_consistent(),
                 "receipt {i} for plan {:?} failed to chain: {verdict:?}",
                 plan.session_id
             );
@@ -206,8 +208,8 @@ fn governance_fault_flags_but_does_not_reject() {
         .expect("insert");
 
     // Invoke a capability that is NOT in the plan's graph. Verifier
-    // returns `verified=false` but the receipt is still recorded in the
-    // sealer (audit sees the attempt) — master-plan §8.2.
+    // returns `structurally_consistent=false` but the receipt is still
+    // recorded in the sealer (audit sees the attempt) — master-plan §8.2.
     let mut receipt = mint_invocation_receipt(MintInvocation {
         invocation_id: random_ulid(),
         parent_plan: &plan,
@@ -229,7 +231,7 @@ fn governance_fault_flags_but_does_not_reject() {
 
     let verdict = verify_invocation_receipt(&receipt, &plan);
     assert!(!verdict.capability_ok);
-    assert!(!verdict.verified_overall());
+    assert!(!verdict.structurally_consistent());
     assert!(
         verdict
             .governance_faults

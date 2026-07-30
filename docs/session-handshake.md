@@ -4,7 +4,8 @@ Crux Daemon supports the VaultCrux Session Handshake v1 protocol — one endpoin
 and one MCP tool that together give an agent a receipted plan describing
 what it's allowed to do. This document is the operator-facing summary —
 where state lives on disk, what the wire formats look like, and how to
-verify a session plan or invocation receipt outside the daemon. The
+authenticate a session-plan signature or check an invocation receipt's
+structural consistency outside the daemon. The
 canonical protocol invariants are encoded in the `crux-session` crate
 ([crates/crux-session/src/lib.rs](../crates/crux-session/src/lib.rs)).
 
@@ -15,7 +16,8 @@ canonical protocol invariants are encoded in the `crux-session` crate
 - **One HTTP endpoint:** `POST /session` (unversioned path; local-daemon specific,
   matches master-plan §5.1).
 - **One verification endpoint:** `POST /invocation/verify`. Decodes a
-  hex-encoded invocation receipt and returns the governance verdict.
+  hex-encoded invocation receipt and returns a local structural-consistency
+  verdict. It does not authenticate the receipt or check replay.
 - **Durable session state** under `$CORECRUXD_DATA_DIR`:
   - `.install-uuid` — per-install random UUID; hashed into the principal.
   - `sessions/{session_id}.json` — one sealed plan per session.
@@ -116,7 +118,10 @@ Response:
 
 ```json
 {
-  "verified": true,
+  "structurally_consistent": true,
+  "authenticity_verified": false,
+  "replay_checked": false,
+  "verification_scope": "local_structural_integrity",
   "integrity_ok": true,
   "capability_ok": true,
   "channel_ok": true,
@@ -130,6 +135,16 @@ The endpoint returns `200` even when the verdict flags governance faults
 (wrong capability, wrong channel). Master-plan §8.2 — faults are
 evidence, not reasons to drop the receipt. The caller decides what
 enforcement to apply.
+
+`structurally_consistent: true` means only that the receipt self-hash and
+parent-plan hash match, and that its capability/channel fit the supplied plan.
+The local route does not authenticate `receipt_signature` or `signer_kid`,
+validate `session_id`, timestamps/expiry, input/output evidence, or outcome,
+and it keeps no invocation-ID replay state. Signature fields are accepted and
+shape-decoded for wire compatibility only. Repeating the same receipt can
+therefore return `structurally_consistent: true` again while
+`authenticity_verified` and `replay_checked` remain `false`. This public route
+does not authorize execution.
 
 ## On-disk format
 
@@ -162,11 +177,12 @@ assert_eq!(plan_receipt_hash(&plan), plan.receipt.hash);
 
 // Invocation-level chain:
 let verdict = verify_invocation_receipt(&receipt, &plan);
-assert!(verdict.verified_overall());
+assert!(verdict.structurally_consistent());
 ```
 
 The TypeScript mirror at `@cuecrux-shared/session` produces byte-identical
-canonical CBOR, so the same receipt verifies in either runtime.
+canonical CBOR, so the same structural hash can be reproduced in either
+runtime. Byte parity does not establish signer authenticity or replay safety.
 
 ## Feature flags
 

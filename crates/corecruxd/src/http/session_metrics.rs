@@ -24,7 +24,7 @@ pub struct SessionMetrics {
     pub plan_bytes: HistogramVec,                         // labels: encoding (cbor|json)
     pub invocation_receipts_total: CounterVec,            // labels: channel, capability, outcome
     pub invocation_receipt_latency_seconds: HistogramVec, // labels: channel, capability
-    pub invocation_verify_total: CounterVec,              // labels: outcome (verified|flagged|not_found)
+    pub invocation_verify_total: CounterVec,              // labels: outcome (structurally_consistent|flagged|not_found)
     pub plan_sealer_errors_total: Gauge,
     pub segment_seal_failures_total: Gauge,
 }
@@ -124,7 +124,10 @@ impl SessionMetrics {
             .expect("register invocation_receipt_latency");
 
         let invocation_verify_total = CounterVec::new(
-            Opts::new("vaultcrux_invocation_verify_total", "POST /invocation/verify outcomes"),
+            Opts::new(
+                "vaultcrux_invocation_verify_total",
+                "Invocation structural-check outcomes",
+            ),
             &["outcome"],
         )
         .expect("counter");
@@ -253,7 +256,7 @@ mod tests {
         metrics.handshake_failed("ce", "bad_request");
         metrics.handshake_seal_failure("ce");
         metrics.invocation_observe("bulk", "retrieve", "ok", 0.007);
-        metrics.invocation_verify("verified");
+        metrics.invocation_verify("structurally_consistent");
         metrics.active_set(42);
 
         let encoder = prometheus::TextEncoder::new();
@@ -266,7 +269,7 @@ mod tests {
             "vaultcrux_session_handshakes_total{origin=\"ce\",outcome=\"bad_request\"} 1",
             "vaultcrux_session_handshakes_total{origin=\"ce\",outcome=\"segment_seal_failed\"} 1",
             "vaultcrux_invocation_receipts_total{capability=\"retrieve\",channel=\"bulk\",outcome=\"ok\"} 1",
-            "vaultcrux_invocation_verify_total{outcome=\"verified\"} 1",
+            "vaultcrux_invocation_verify_total{outcome=\"structurally_consistent\"} 1",
             "vaultcrux_session_active 42",
         ] {
             assert!(

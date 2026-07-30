@@ -281,6 +281,14 @@ controlled by `CORECRUXD_ROUTE_AUTH` (read once at startup):
 | `shadow` | Evaluates the contract and logs a structured `route_auth_shadow_mismatch` warning on any would-deny, but never blocks. It is the derived default only for auth-off, loopback-only operation; otherwise it is an explicit migration override. |
 | `enforce` | Public routes (`/healthz`, `/readyz`, `/metrics`, `/session`, `/invocation/verify`, `/v1/openapi.json`, `/v1/version`, `/v1/witness/smoke`, and the `/v1/auth/*` bootstrap rails) pass with no auth headers. Every other route requires one of its contract scopes via the same primitive the handlers use. A route with **no** contract entry — or a request axum could not match to a route template — **fails closed with `403`**. |
 
+`POST /invocation/verify` being public does not make its result an
+authentication decision. It reports `structurally_consistent` for the local
+self-hash, parent link, capability, and channel checks, together with
+`authenticity_verified: false`, `replay_checked: false`, and
+`verification_scope: "local_structural_integrity"`. It does not validate the
+optional signature/key ID, session identity, timestamps, execution evidence,
+outcome, or uniqueness.
+
 With the variable unset, authentication enabled or a non-loopback listener
 selects `enforce`; only auth-off plus loopback derives `shadow`. An empty or
 unknown explicit value also selects `enforce` and emits a startup warning.

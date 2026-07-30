@@ -18,8 +18,8 @@ run cargo test -q -p corecrux-retrieval cat12_bm25_recall
 run cargo test -q -p corecrux-receipts verify_ed25519_ok_and_zip_deterministic
 run cargo test -q -p corecrux-projections rebuild_from_genesis_batch_size_1_matches_large_batch
 run cargo test -q -p corecrux-projections session_plans_by_principal
-run cargo test -q -p crux-session ce_full_parity_open_session_10_invocations_restart_verify
-run cargo test -q -p crux-session ce_install_exports_verifiable_bundle
+run cargo test -q -p crux-session ce_full_parity_open_session_10_invocations_restart_structural_consistency
+run cargo test -q -p crux-session ce_install_exports_structurally_consistent_bundle
 run cargo test -q -p corecruxd text_search
 run cargo test -q -p corecruxd get_receipt
 run cargo test -q -p corecruxd post_query_graph_expand_uses_http_dataplane_fake

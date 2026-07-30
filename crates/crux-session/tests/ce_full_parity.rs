@@ -8,7 +8,7 @@
 //! Master-plan Phase 6 gate: "Crux Daemon binary passes the same golden handshake
 //! tests as hosted with `mode: 'local'` substitutions. Crux Daemon integration
 //! test: open session → make 10 invocations → inspect segment log →
-//! verify all receipts."
+//! establish structural consistency for every receipt."
 //!
 //! Exercises the full Crux Daemon path using the durable (file-backed) wiring:
 //!
@@ -21,8 +21,8 @@
 //!        - the install UUID is the same,
 //!        - the session is findable in the registry,
 //!        - the sealer log contains 11 events (1 plan + 10 invocations),
-//!        - every invocation receipt verifies against the plan pulled
-//!          from the file registry,
+//!        - every invocation receipt is structurally consistent with the
+//!          plan pulled from the file registry,
 //!        - the file registry's `get_by_plan_hash` finds the parent.
 
 use std::collections::HashSet;
@@ -95,7 +95,7 @@ fn seal_invocation(plan: &SessionPlan, receipt: &crux_session::receipt::Invocati
 }
 
 #[test]
-fn ce_full_parity_open_session_10_invocations_restart_verify() {
+fn ce_full_parity_open_session_10_invocations_restart_structural_consistency() {
     let data_dir = tempdir();
 
     // ── Run 1: mint + seal + 10 invocations ───────────────────────────
@@ -197,14 +197,14 @@ fn ce_full_parity_open_session_10_invocations_restart_verify() {
         10
     );
 
-    // Every invocation event must chain-verify against the sealed plan
+    // Every invocation event must be structurally consistent with the sealed plan
     // pulled from the file registry.
     let plan = SessionPlan::from_canonical_cbor(&entry.plan_cbor).unwrap();
     for event in events.iter().filter(|e| e.event_type == EVT_INVOCATION_RECEIPTED_V1) {
         let decoded = InvocationReceiptedV1::decode_bin(&event.payload).unwrap();
         assert_eq!(decoded.parent_plan_receipt_hash, plan.receipt.hash);
-        // Re-mint the receipt from the event fields so the verifier has
-        // an `InvocationReceipt` to work with, then verify it against the
+        // Re-mint the receipt from the event fields so the structural checker
+        // has an `InvocationReceipt` to work with, then compare it with the
         // plan. (In a real replay we'd also store the receipt body; here
         // we're asserting the event-level chain.)
         let cap = plan
@@ -281,13 +281,14 @@ fn ce_golden_handshake_mode_is_local_across_restart() {
     .unwrap();
     assert_eq!(sealed.plan.receipt.mode, ReceiptMode::Local);
     assert!(sealed.plan.receipt.signature.is_none());
-    assert!(verify_invocation_receipt_sanity(&sealed.plan));
+    assert!(invocation_receipt_structural_consistency_sanity(&sealed.plan));
 
     std::fs::remove_dir_all(&data_dir).ok();
 }
 
-fn verify_invocation_receipt_sanity(plan: &SessionPlan) -> bool {
-    // Smoke-check that a freshly minted receipt verifies against the plan.
+fn invocation_receipt_structural_consistency_sanity(plan: &SessionPlan) -> bool {
+    // Smoke-check that a freshly minted receipt is structurally consistent
+    // with the plan.
     let cap = plan.capability_graph.first().expect("non-empty graph");
     let receipt = mint_invocation_receipt(MintInvocation {
         invocation_id: random_ulid(),
@@ -302,5 +303,5 @@ fn verify_invocation_receipt_sanity(plan: &SessionPlan) -> bool {
         cost_crux: None,
         signer_kid: None,
     });
-    verify_invocation_receipt(&receipt, plan).verified_overall()
+    verify_invocation_receipt(&receipt, plan).structurally_consistent()
 }

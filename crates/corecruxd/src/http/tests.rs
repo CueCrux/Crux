@@ -13152,7 +13152,10 @@ async fn invocation_verify_disabled_and_bad_request_paths() {
 #[tokio::test]
 async fn invocation_verify_parent_not_found_and_success_paths() {
     let mut state = test_app_state(16);
-    let services = Arc::new(super::session::SessionServices::local_default("node-a"));
+    let metrics_registry = Arc::new(prometheus::Registry::new());
+    let session_metrics = Arc::new(super::session_metrics::SessionMetrics::new(&metrics_registry));
+    let services =
+        Arc::new(super::session::SessionServices::local_default("node-a").with_metrics(session_metrics.clone()));
     state.session = Some(services.clone());
 
     let not_found_wire = serde_json::json!({
@@ -13178,9 +13181,20 @@ async fn invocation_verify_parent_not_found_and_success_paths() {
     .await;
     assert_eq!(not_found.status(), StatusCode::OK);
     let not_found_body = json_body(not_found).await;
-    assert_eq!(not_found_body["verified"], false);
+    assert_eq!(not_found_body["structurally_consistent"], false);
+    assert_eq!(not_found_body["authenticity_verified"], false);
+    assert_eq!(not_found_body["replay_checked"], false);
+    assert_eq!(not_found_body["verification_scope"], "local_structural_integrity");
+    assert!(not_found_body.get("verified").is_none());
     assert_eq!(not_found_body["parent_plan_found"], false);
     assert_eq!(not_found_body["governance_faults"][0], "parent_plan_not_found");
+    assert_eq!(
+        session_metrics
+            .invocation_verify_total
+            .with_label_values(&["not_found"])
+            .get(),
+        1.0
+    );
 
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -13229,18 +13243,88 @@ async fn invocation_verify_parent_not_found_and_success_paths() {
         "outcome": receipt.outcome,
         "cost_crux": receipt.cost_crux,
         "receipt_hash": hex::encode(receipt.receipt_hash),
-        "signer_kid": receipt.signer_kid
+        "receipt_signature": "aa".repeat(64),
+        "signer_kid": "caller-supplied-kid-a"
     });
     let ok = super::invocation::post_invocation_verify(
-        State(state),
+        State(state.clone()),
         axum::body::Bytes::from(serde_json::to_vec(&ok_wire).unwrap()),
     )
     .await;
     assert_eq!(ok.status(), StatusCode::OK);
     let ok_body = json_body(ok).await;
-    assert_eq!(ok_body["verified"], true);
+    assert_eq!(ok_body["structurally_consistent"], true);
+    assert_eq!(ok_body["authenticity_verified"], false);
+    assert_eq!(ok_body["replay_checked"], false);
+    assert_eq!(ok_body["verification_scope"], "local_structural_integrity");
+    assert!(ok_body.get("verified").is_none());
     assert_eq!(ok_body["parent_plan_found"], true);
     assert!(ok_body["parent_plan_principal_id"].as_str().unwrap().starts_with("ce:"));
+
+    // The route has no replay store: the exact same request is evaluated as
+    // structural consistency again, without claiming replay protection.
+    let replay = super::invocation::post_invocation_verify(
+        State(state.clone()),
+        axum::body::Bytes::from(serde_json::to_vec(&ok_wire).unwrap()),
+    )
+    .await;
+    let replay_body = json_body(replay).await;
+    assert_eq!(replay_body["structurally_consistent"], true);
+    assert_eq!(replay_body["replay_checked"], false);
+
+    // Signature bytes and key IDs are shape-decoded for compatibility but not
+    // authenticated by the local structural route.
+    let mut changed_signature_wire = ok_wire;
+    changed_signature_wire["receipt_signature"] = serde_json::json!("bb".repeat(64));
+    changed_signature_wire["signer_kid"] = serde_json::json!("caller-supplied-kid-b");
+    let changed_signature = super::invocation::post_invocation_verify(
+        State(state.clone()),
+        axum::body::Bytes::from(serde_json::to_vec(&changed_signature_wire).unwrap()),
+    )
+    .await;
+    let changed_signature_body = json_body(changed_signature).await;
+    assert_eq!(changed_signature_body["structurally_consistent"], true);
+    assert_eq!(changed_signature_body["authenticity_verified"], false);
+
+    // A structurally invalid receipt is preserved as evidence and labelled
+    // "flagged", never with the retired authenticity-sounding label.
+    let mut flagged_wire = changed_signature_wire;
+    flagged_wire["capability"] = serde_json::json!("not-in-parent-plan");
+    let flagged = super::invocation::post_invocation_verify(
+        State(state),
+        axum::body::Bytes::from(serde_json::to_vec(&flagged_wire).unwrap()),
+    )
+    .await;
+    assert_eq!(flagged.status(), StatusCode::OK);
+    let flagged_body = json_body(flagged).await;
+    assert_eq!(flagged_body["structurally_consistent"], false);
+
+    assert_eq!(
+        session_metrics
+            .invocation_verify_total
+            .with_label_values(&["structurally_consistent"])
+            .get(),
+        3.0
+    );
+    assert_eq!(
+        session_metrics
+            .invocation_verify_total
+            .with_label_values(&["flagged"])
+            .get(),
+        1.0
+    );
+    let mut metrics_buf = Vec::new();
+    prometheus::Encoder::encode(
+        &prometheus::TextEncoder::new(),
+        &metrics_registry.gather(),
+        &mut metrics_buf,
+    )
+    .unwrap();
+    let rendered_metrics = String::from_utf8(metrics_buf).unwrap();
+    assert!(rendered_metrics.contains("vaultcrux_invocation_verify_total{outcome=\"structurally_consistent\"} 3"));
+    assert!(rendered_metrics.contains("vaultcrux_invocation_verify_total{outcome=\"flagged\"} 1"));
+    assert!(rendered_metrics.contains("vaultcrux_invocation_verify_total{outcome=\"not_found\"} 1"));
+    assert!(!rendered_metrics.contains("outcome=\"verified\""));
 }
 
 #[tokio::test]

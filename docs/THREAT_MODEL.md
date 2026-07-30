@@ -125,6 +125,12 @@ for the Crux Daemon.
    with neither authentication rail configured permits anonymous access.
 5. Public `/v1/version` is redacted. Full operational version details live at
    `/v1/admin/version` behind `admin:read`.
+6. Public `POST /invocation/verify` is a local structural-integrity check, not
+   a receipt-authentication or anti-replay service. Its positive result covers
+   only the receipt self-hash, parent-plan link, capability, and channel.
+   Signature/key ID, session identity, timestamps, input/output evidence,
+   outcome, and invocation uniqueness are not validated; the response reports
+   `authenticity_verified: false` and `replay_checked: false`.
 
 ## Capability Token Trust and Revocation
 
