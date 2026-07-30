@@ -24,6 +24,18 @@ use serde::Deserialize;
 
 pub const RCX_CT_SPEC_VERSION: &str = "rcx-ct/1.0";
 pub const RCX_CT_DELEGATION_SPEC_VERSION: &str = "rcx-ct/1.1";
+/// Corrected tier vocabulary (`free | pro | governance`). Accepted *alongside*
+/// `rcx-ct/1.1`, never in place of it: the CruxEngine↔Rust byte-for-byte
+/// agreement (CruxEngine #103 / Crux #502) is pinned on 1.1 and replacing the
+/// constant would invalidate every delegation token already minted against it.
+pub const RCX_CT_GOVERNANCE_SPEC_VERSION: &str = "rcx-ct/1.2";
+/// Whether a spec version carries the delegation contract. Both `rcx-ct/1.1` and
+/// `rcx-ct/1.2` do; they differ only in the `tier` value set, which is validated
+/// by `RcxTier`'s own deserialiser and not by the delegation gate.
+pub fn is_delegation_spec_version(spec_version: &str) -> bool {
+    spec_version == RCX_CT_DELEGATION_SPEC_VERSION || spec_version == RCX_CT_GOVERNANCE_SPEC_VERSION
+}
+
 pub const RCX_CT_SIGNATURE_LEN: usize = 64;
 pub const RCX_CT_HASH_LEN: usize = 32;
 pub const RCX_CT_PUBLIC_KEY_LEN: usize = 32;
@@ -126,8 +138,7 @@ pub fn corecrux_premium_lane_capabilities(per_call_cost: u64) -> Vec<PermittedCa
 pub enum RcxTier {
     Free,
     Pro,
-    Team,
-    Enterprise,
+    Governance,
 }
 
 impl RcxTier {
@@ -135,8 +146,7 @@ impl RcxTier {
         match self {
             Self::Free => "free",
             Self::Pro => "pro",
-            Self::Team => "team",
-            Self::Enterprise => "enterprise",
+            Self::Governance => "governance",
         }
     }
 }
@@ -726,7 +736,7 @@ where
     let Some(policy) = token.delegation_policy.as_ref() else {
         return AttenuatedOutcome::DelegationNotPermitted;
     };
-    if token.spec_version != RCX_CT_DELEGATION_SPEC_VERSION
+    if !is_delegation_spec_version(&token.spec_version)
         || policy.presentation != DelegationPresentation::ProofOfPossession
         || policy.max_depth != 1
     {
@@ -1077,7 +1087,7 @@ impl RcxCapabilityToken {
     }
 
     pub fn requires_contextual_verification(&self) -> bool {
-        self.spec_version == RCX_CT_DELEGATION_SPEC_VERSION
+        is_delegation_spec_version(&self.spec_version)
             || self.delegation_policy.is_some()
             || self.delegation_envelope.is_some()
     }
@@ -1096,7 +1106,7 @@ impl RcxCapabilityToken {
         let Some(policy) = self.delegation_policy.as_ref() else {
             return Err(AttenuateError::DelegationNotPermitted);
         };
-        if self.spec_version != RCX_CT_DELEGATION_SPEC_VERSION
+        if !is_delegation_spec_version(&self.spec_version)
             || policy.presentation != DelegationPresentation::ProofOfPossession
             || policy.max_depth != 1
         {
@@ -1218,7 +1228,7 @@ impl RcxCapabilityToken {
         let mut issues = Vec::new();
         match (&*self.spec_version, &self.delegation_policy) {
             (RCX_CT_SPEC_VERSION, None) if self.delegation_envelope.is_none() => {}
-            (RCX_CT_DELEGATION_SPEC_VERSION, Some(policy)) => {
+            (RCX_CT_DELEGATION_SPEC_VERSION | RCX_CT_GOVERNANCE_SPEC_VERSION, Some(policy)) => {
                 let delegates_valid = !policy.allowed_delegate_fprs.is_empty()
                     && policy.allowed_delegate_fprs.len() <= RCX_MAX_DELEGATION_PRINCIPALS
                     && policy.allowed_delegate_fprs.iter().all(|fpr| valid_passport_fpr(fpr))
@@ -1275,16 +1285,13 @@ impl RcxCapabilityToken {
                 "at least one backend is required",
             ));
         }
-        if self.tier == RcxTier::Team && self.team_scope.is_none() {
-            issues.push(TokenValidationIssue::new(
-                "missing_team_scope",
-                "team tier tokens require team_scope",
-            ));
-        }
-        if self.tier == RcxTier::Enterprise && self.enterprise_scope.is_none() {
+        // `Team` had no product behind it, so its scope invariant is dropped rather
+        // than re-pointed. `team_scope` stays on the struct: removing the field would
+        // change the token's shape for every tier, not just the retired one.
+        if self.tier == RcxTier::Governance && self.enterprise_scope.is_none() {
             issues.push(TokenValidationIssue::new(
                 "missing_enterprise_scope",
-                "enterprise tier tokens require enterprise_scope",
+                "governance tier tokens require enterprise_scope",
             ));
         }
         if let Some(team_scope) = &self.team_scope {
@@ -2543,7 +2550,7 @@ mod tests {
         let delegate = SigningKey::from_bytes(&[3; 32]);
         let outsider = SigningKey::from_bytes(&[4; 32]);
         let mut base = delegation_enabled_fixture(&issuer, &subject, &delegate);
-        base.tier = RcxTier::Team;
+        base.tier = RcxTier::Pro;
         base.team_scope = Some(TeamScope {
             team_id: "team-1".to_string(),
             seat_id: None,
@@ -2872,7 +2879,7 @@ mod tests {
         let signing = SigningKey::from_bytes(&[7u8; 32]);
         let mut token = free_local_verified_fixture();
         token.token_id = "rcxct_team_0123456789abcdef".to_string();
-        token.tier = RcxTier::Team;
+        token.tier = RcxTier::Pro;
         token.team_scope = Some(TeamScope {
             team_id: "team-a".to_string(),
             seat_id: Some("seat-a".to_string()),
@@ -2914,7 +2921,7 @@ mod tests {
         let signing = SigningKey::from_bytes(&[7u8; 32]);
         let mut token = free_local_verified_fixture();
         token.token_id = "rcxct_enterprise_0123456789abcdef".to_string();
-        token.tier = RcxTier::Enterprise;
+        token.tier = RcxTier::Governance;
         token.enterprise_scope = Some(EnterpriseScope {
             customer_id: "customer-a".to_string(),
             contract_id: Some("contract-a".to_string()),
@@ -2954,6 +2961,91 @@ mod tests {
         let json = token.to_canonical_json();
         assert!(json.contains("\"enterprise_scope\""));
         assert!(json.contains("\"airgap\":true"));
+    }
+
+    // --- M1 tier taxonomy cutover (rcx-ct/1.2) -------------------------------
+    // ExecPlan crux-pro-capabilities-rcx-entitled-2026-07-27 M1. Exit criterion:
+    // no `team`/`enterprise` value survives, and `governance` is carried instead.
+
+    #[test]
+    fn retired_tier_values_do_not_deserialise_and_published_ladder_does() {
+        // The retired values must fail *parsing*, not merely compare unequal —
+        // that is what makes a stale token fail closed to FreeLocal rather than
+        // silently resolving to some default tier.
+        for retired in ["team", "enterprise"] {
+            let parsed = serde_json::from_str::<RcxTier>(&format!("\"{retired}\""));
+            assert!(parsed.is_err(), "retired tier `{retired}` must not deserialise");
+        }
+        for (wire, tier) in [
+            ("free", RcxTier::Free),
+            ("pro", RcxTier::Pro),
+            ("governance", RcxTier::Governance),
+        ] {
+            let parsed = serde_json::from_str::<RcxTier>(&format!("\"{wire}\""))
+                .unwrap_or_else(|e| panic!("published tier `{wire}` must deserialise: {e}"));
+            assert_eq!(parsed, tier);
+            assert_eq!(tier.as_str(), wire, "as_str must round-trip the wire value");
+        }
+    }
+
+    #[test]
+    fn governance_tier_requires_enterprise_scope_and_team_scope_is_unconstrained() {
+        let mut token = free_local_verified_fixture();
+        token.tier = RcxTier::Governance;
+        token.enterprise_scope = None;
+        let issues: Vec<_> = token
+            .validate_basic(1_776_989_601)
+            .issues
+            .into_iter()
+            .map(|i| i.code)
+            .collect();
+        assert!(
+            issues.iter().any(|c| c == "missing_enterprise_scope"),
+            "governance without enterprise_scope must be rejected, got {issues:?}"
+        );
+
+        // `Team` is gone, so no tier constrains `team_scope` any more. The field
+        // stays on the struct (removing it would change the shape for every tier),
+        // but a Pro token carrying one is structurally valid.
+        let mut pro = free_local_verified_fixture();
+        pro.tier = RcxTier::Pro;
+        assert!(
+            !pro.validate_basic(1_776_989_601)
+                .issues
+                .iter()
+                .any(|i| i.code == "missing_team_scope"),
+            "no missing_team_scope invariant should survive the cutover"
+        );
+    }
+
+    #[test]
+    fn spec_1_2_is_accepted_alongside_1_1_not_in_place_of_it() {
+        // Both delegation spec versions must satisfy the same gate. If 1.2 had
+        // replaced 1.1 rather than joining it, every delegation token already
+        // minted against 1.1 would fail closed — an entitlement outage.
+        assert!(is_delegation_spec_version(RCX_CT_DELEGATION_SPEC_VERSION));
+        assert!(is_delegation_spec_version(RCX_CT_GOVERNANCE_SPEC_VERSION));
+        assert!(!is_delegation_spec_version(RCX_CT_SPEC_VERSION));
+        assert!(!is_delegation_spec_version("rcx-ct/9.9"));
+
+        let issuer = SigningKey::from_bytes(&[1; 32]);
+        let subject = SigningKey::from_bytes(&[2; 32]);
+        let delegate = SigningKey::from_bytes(&[3; 32]);
+        let mut token = delegation_enabled_fixture(&issuer, &subject, &delegate);
+        token.spec_version = RCX_CT_GOVERNANCE_SPEC_VERSION.to_string();
+        token.signature.sig = issuer.sign(&token.token_hash()).to_bytes();
+
+        let issues: Vec<_> = token
+            .validate_basic(1_776_989_601)
+            .issues
+            .into_iter()
+            .map(|i| i.code)
+            .collect();
+        assert!(
+            !issues.iter().any(|c| c == "invalid_spec_version"),
+            "rcx-ct/1.2 must clear the delegation spec gate, got {issues:?}"
+        );
+        assert!(token.requires_contextual_verification());
     }
 }
 
