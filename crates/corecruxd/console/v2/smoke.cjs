@@ -1898,7 +1898,10 @@ function extractThemeVars(theme) {
   check(wb && wb.load && typeof wb.load.build === 'function', '[m13a] cx-workbench must have a live build (buildWorkbench)');
 
   // buildWorkbench wires the workbench GET read tools through the api.js GET client.
-  const WB_GET_METHODS = ['workbenchApiDrift', 'workbenchCommandLedger', 'workbenchReasoningTimeline', 'workbenchAuditTriage', 'workbenchBrief'];
+  // workbenchCommandLedger is deliberately gone: `ledger:history` is no longer a sold
+  // claim (no producer ever wrote a record), so the route 402s and the tile was removed.
+  // See ExecPlan crux-command-ledger-claim-truth-2026-07-30.
+  const WB_GET_METHODS = ['workbenchApiDrift', 'workbenchReasoningTimeline', 'workbenchAuditTriage', 'workbenchBrief'];
   WB_GET_METHODS.forEach(function (m) {
     check(pagesSrc.indexOf(m) >= 0, '[m13a] buildWorkbench must wire the GET read tool ' + m);
   });
@@ -1919,12 +1922,12 @@ function extractThemeVars(theme) {
   // Every workbench route the port wires live is an allowlisted GET in api.js
   // (LITERAL_GET_PATHS) — proof no wired op is a mutation route.
   const apiSrc = fs.readFileSync(path.join(DIR, 'api.js'), 'utf8');
-  ['/v1/workbench/contract', '/v1/workbench/api-drift', '/v1/workbench/command-ledger',
+  ['/v1/workbench/contract', '/v1/workbench/api-drift',
     '/v1/workbench/reasoning-timeline', '/v1/workbench/audit-triage', '/v1/workbench/brief'].forEach(function (p) {
     check(new RegExp("'" + p.replace(/[-/]/g, '\\$&') + "': true").test(apiSrc),
       '[m13a] wired workbench read ' + p + ' must be an allowlisted GET in api.js (never a mutation route)');
   });
-  notes.push('m13a workbench + control-diff: CONTROL_DIFF covers all 26 legacy CX pages; cx-workbench is native (loads /v1/workbench/contract + 5 live GET read tools via a GET-only self-loader); every newly-wired op is an allowlisted GET.');
+  notes.push('m13a workbench + control-diff: CONTROL_DIFF covers all 26 legacy CX pages; cx-workbench is native (loads /v1/workbench/contract + 4 live GET read tools via a GET-only self-loader); every newly-wired op is an allowlisted GET.');
 })();
 
 // =========================================================================

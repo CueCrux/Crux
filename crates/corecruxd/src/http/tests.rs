@@ -8394,8 +8394,8 @@ async fn workbench_brief_requires_enabled_pro_service() {
 }
 
 #[tokio::test]
-async fn workbench_context_pack_and_command_ledger_store_private_receipts() {
-    let state = pro_workbench_state(&["context_pack:budgeted", "ledger:history"]);
+async fn workbench_context_pack_stores_private_receipts() {
+    let state = pro_workbench_state(&["context_pack:budgeted"]);
     let shared = state.clone();
     {
         let mut store = shared.fact_store.write().await;
@@ -8434,43 +8434,6 @@ async fn workbench_context_pack_and_command_ledger_store_private_receipts() {
         .unwrap()
         .starts_with("workbench:context_pack:"));
 
-    let ledger_resp = super::workbench::post_command_ledger(
-        State(state.clone()),
-        HeaderMap::new(),
-        Json(super::workbench::CommandLedgerBody {
-            tenant_id: "business::acme".to_string(),
-            command: "cargo".to_string(),
-            args: vec!["test".to_string(), "-p".to_string(), "corecruxd".to_string()],
-            cwd: Some("/home/myles/CueCrux/Crux".to_string()),
-            exit_status: Some(0),
-            duration_ms: Some(42),
-            started_at_unix_ms: Some(100),
-            completed_at_unix_ms: Some(142),
-            stdout_hash: Some("blake3:stdout".to_string()),
-            stderr_hash: None,
-            linked_receipts: vec![pack["receipt"]["receipt_id"].as_str().unwrap().to_string()],
-            project_id: Some("alpha".to_string()),
-            work_id: Some("work-1".to_string()),
-        }),
-    )
-    .await;
-    assert_eq!(ledger_resp.status(), StatusCode::OK);
-
-    let list_resp = super::workbench::get_command_ledger(
-        State(state),
-        HeaderMap::new(),
-        Query(super::workbench::TenantWorkbenchQuery {
-            tenant_id: "business::acme".to_string(),
-            project_id: None,
-            limit: Some(10),
-        }),
-    )
-    .await;
-    assert_eq!(list_resp.status(), StatusCode::OK);
-    let list = json_body(list_resp).await;
-    assert_eq!(list["count"], 1);
-    assert_eq!(list["entries"][0]["record"]["command"], "cargo");
-
     let store = shared.fact_store.read().await;
     let facts = store.query(&corecrux_memory::fact_store::FactQuery {
         min_effective_confidence: None,
@@ -8481,8 +8444,76 @@ async fn workbench_context_pack_and_command_ledger_store_private_receipts() {
         top_k: 10,
         token_budget: None,
     });
-    assert_eq!(facts.facts.len(), 2);
+    assert_eq!(facts.facts.len(), 1);
     assert!(facts.facts.iter().all(|fact| fact.private));
+}
+
+/// `ledger:history` is not a sold claim, because nothing in the product ever
+/// writes a command-ledger record. `/v1/workbench/command-ledger` is still
+/// implemented and still routed — it simply cannot be enabled, so it answers
+/// `402 pro_service_not_enabled` in every mode.
+///
+/// This is the regression pin for re-adding the claim without a producer.
+/// If you are here because this test failed, land the producer first.
+/// ExecPlan: `crux-command-ledger-claim-truth-2026-07-30`.
+#[tokio::test]
+async fn workbench_command_ledger_is_not_a_sold_claim_without_a_producer() {
+    // Even asking for it explicitly cannot enable it: `ProductPosture::new`
+    // filters `enabled_pro_services` through `PRO_CAPABILITY_CLAIMS`.
+    let state = pro_workbench_state(&["ledger:history"]);
+    let posture = crate::product::ProductPosture::new(state.operating_mode, &state.enabled_pro_services);
+    assert!(
+        posture.enabled_pro_services.is_empty(),
+        "ledger:history must not survive the PRO_CAPABILITY_CLAIMS filter"
+    );
+
+    // It appears in no catalogue, so it can never be reported as
+    // `contracted_external` by `pro_claim_placements`.
+    assert!(!crate::product::PRO_CAPABILITY_CLAIMS.contains(&"ledger:history"));
+    assert!(!crate::product::DAEMON_IMPLEMENTED_PRO_CLAIMS.contains(&"ledger:history"));
+    assert!(!crate::product::HOSTED_CONTROL_PLANE_PRO_CLAIMS.contains(&"ledger:history"));
+    assert!(!posture
+        .capability_catalog
+        .pro_claim_placements
+        .iter()
+        .any(|placement| placement.claim == "ledger:history"));
+
+    let write_resp = super::workbench::post_command_ledger(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::workbench::CommandLedgerBody {
+            tenant_id: "business::acme".to_string(),
+            command: "cargo".to_string(),
+            args: vec!["test".to_string()],
+            cwd: None,
+            exit_status: Some(0),
+            duration_ms: Some(42),
+            started_at_unix_ms: Some(100),
+            completed_at_unix_ms: Some(142),
+            stdout_hash: None,
+            stderr_hash: None,
+            linked_receipts: Vec::new(),
+            project_id: None,
+            work_id: None,
+        }),
+    )
+    .await;
+    assert_eq!(write_resp.status(), StatusCode::PAYMENT_REQUIRED);
+    let write_body = json_body(write_resp).await;
+    assert_eq!(write_body["status"], "pro_service_not_enabled");
+    assert_eq!(write_body["capability"], "ledger:history");
+
+    let read_resp = super::workbench::get_command_ledger(
+        State(state),
+        HeaderMap::new(),
+        Query(super::workbench::TenantWorkbenchQuery {
+            tenant_id: "business::acme".to_string(),
+            project_id: None,
+            limit: Some(10),
+        }),
+    )
+    .await;
+    assert_eq!(read_resp.status(), StatusCode::PAYMENT_REQUIRED);
 }
 
 #[tokio::test]
