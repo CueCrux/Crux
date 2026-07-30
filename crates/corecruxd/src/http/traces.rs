@@ -243,6 +243,13 @@ pub(super) struct CodeIntelQuery {
     pub entry_point: Option<String>,
     #[serde(default)]
     pub symbol: Option<String>,
+    /// Answer across every enabled repo the tenant has registered, not just one.
+    ///
+    /// This is the Pro capability (P1): the arithmetic a local daemon cannot do,
+    /// because the callers live in repos its checkout has never seen. Defaults to
+    /// false, so the free single-repo answer is byte-for-byte unchanged.
+    #[serde(default)]
+    pub all_repos: bool,
     #[serde(default)]
     pub trace_a: Option<u64>,
     #[serde(default)]
@@ -286,6 +293,7 @@ pub(super) fn load_spans(state: &AppState, tenant_id: &str) -> Vec<crate::trace_
                 join: "unresolved_live".to_string(),
                 stored_at_unix_ms: 0,
                 tenant_id: tenant_id.to_string(),
+                release: String::new(),
             })
             .collect()
     })
@@ -329,11 +337,34 @@ pub(super) async fn get_blast_radius(
     let Some(symbol) = q.symbol.as_deref() else {
         return problem_response(StatusCode::BAD_REQUEST, "symbol is required");
     };
+    let spans = load_spans(&state, &q.tenant_id);
+
+    if q.all_repos {
+        // P1: one graph across every enabled repo this tenant registered. Paths
+        // are repo-qualified by the aggregator so the answer says which repo each
+        // caller is in rather than leaving that to a second lookup.
+        let (scan, repos) = crate::repo_aggregate::aggregate_tenant(&state, &q.tenant_id).await;
+        let radius = crate::code_intel::blast_radius(&scan, &spans, symbol, q.token_budget);
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "aggregate": true,
+                "repos": repos,
+                "radius": radius,
+                // Named in the payload, not just the docs: references resolve by
+                // symbol name, so across repos two unrelated symbols sharing a
+                // name merge. Sound for "what might break", not precise enough to
+                // delete from without reading.
+                "precision": "superset: cross-repo edges resolve by symbol name",
+            })),
+        )
+            .into_response();
+    }
+
     let repo_id = q.repo_id.as_deref().unwrap_or("crux");
     let Some(scan) = load_scan(&state, &q.tenant_id, repo_id).await else {
         return problem_response(StatusCode::NOT_FOUND, "no scan for this repo; register it first");
     };
-    let spans = load_spans(&state, &q.tenant_id);
     let radius = crate::code_intel::blast_radius(&scan, &spans, symbol, q.token_budget);
     (StatusCode::OK, Json(radius)).into_response()
 }
