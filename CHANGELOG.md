@@ -92,6 +92,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Public session bootstrap is bounded and source-aware.** `POST /session`
+  remains anonymous only for a direct loopback socket without forwarding
+  headers; proxied, remote, and missing-peer requests require a verified
+  `sessions:write` or `admin:write` credential. Daemon-keyed principal/IP
+  quotas, streaming body limits, serialized admission, TTL registry cleanup,
+  global row bounds, and hard registry/event-log byte caps fail closed with
+  explicit `429`/`507` responses. Closed rows retain quota until expiry, and
+  exhaustion cannot overrun either backend. Pre-existing over-cap or corrupt
+  durable state disables session creation instead of resetting quotas in an
+  ephemeral registry.
 - **Invocation verification now names its actual trust level.**
   `POST /invocation/verify` replaces the misleading `verified` field with
   `structurally_consistent` and explicitly reports

@@ -29,6 +29,47 @@ CBOR, no ed25519 signature. Local mode covers integrity; signed plans
 are a hosted-only thing because the local-daemon threat model trusts the local
 machine.
 
+## Admission boundary and limits
+
+Anonymous session bootstrap is permitted only from a direct loopback peer with
+no forwarded-client header. Every reverse-proxied request must authenticate,
+including one received from a peer in `CORECRUXD_TRUSTED_PROXY_CIDRS` that
+reports a loopback client. A request with no peer address is treated as remote.
+
+All other callers must present a cryptographically verified bearer credential
+with `sessions:write` or `admin:write`. `off` and `dev_scopes` identities never
+satisfy this remote boundary. Per-principal quota keys come from the immutable
+verified credential identity, before any privileged passport-header override;
+per-IP keys use the same effective-client-IP decision as global ingress
+limiting. Both are stored as daemon-keyed BLAKE3 values, not raw identity or IP
+strings.
+
+Admission is serialized across expiry cleanup, quota checks, minting, event
+sealing, and registry insertion. Defaults are:
+
+| Setting | Default | Behavior |
+|---|---:|---|
+| `CORECRUXD_SESSION_TTL_SECS` | 3600 | Retained lifetime; 60–86400 seconds. |
+| `CORECRUXD_SESSION_MAX_REQUEST_BYTES` | 65536 | Streaming request limit; 1 KiB–1 MiB. |
+| `CORECRUXD_SESSION_MAX_PER_PRINCIPAL` | 32 | Retained rows for one verified principal. |
+| `CORECRUXD_SESSION_MAX_PER_IP` | 64 | Retained rows for one effective client IP. |
+| `CORECRUXD_SESSION_MAX_TOTAL` | 1024 | Retained rows across the daemon. |
+| `CORECRUXD_SESSION_REGISTRY_MAX_BYTES` | 67108864 | Hard registry cap (64 MiB). |
+| `CORECRUXD_SESSION_EVENT_LOG_MAX_BYTES` | 536870912 | Hard append-only log cap (512 MiB). |
+
+Closed sessions retain their quota slot until TTL expiry, preventing
+close/create churn. Expired registry rows are removed before each admission and
+by a 60-second background reaper. Principal or IP exhaustion returns
+`429 application/problem+json` with `Retry-After`; global, registry-byte, or
+event-log exhaustion returns `507` and does not create a registry row.
+Durable registry corruption or pre-existing registry/event-log exhaustion
+disables session creation at startup instead of resetting quotas in memory.
+
+The event log is deliberately not TTL-pruned. At its hard cap, raise the limit
+and restart, or stop the daemon and rotate the complete log into retained
+operator-controlled archival storage before restarting with a fresh log.
+Never truncate or replace the active file while the daemon is running.
+
 ## Opening a session
 
 ```http
@@ -152,7 +193,7 @@ Crux Daemon is designed so that an operator can `jq` through state without
 spinning up a database:
 
 ```bash
-# Every session you've ever opened:
+# Registry rows retained within their TTL:
 ls "$CORECRUXD_DATA_DIR/sessions/"
 
 # Sealed events in write order (1 JSON line each):
@@ -160,7 +201,8 @@ cat "$CORECRUXD_DATA_DIR/session-events.jsonl" | jq -r .event_type | sort | uniq
 ```
 
 Session files are rewritten atomically (temp-file + rename) on every
-close/revoke; the event log is append-only and fsync'd per write.
+close/revoke and physically removed after TTL expiry; the event log is
+append-only, hard-capped, and fsync'd per write.
 
 ## Verifying a receipt offline
 

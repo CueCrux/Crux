@@ -832,22 +832,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         event_bus: corecrux_memory::events::EventBus::new(1024),
         session: {
             // Durable local-daemon wiring: persistent install UUID + file registry +
-            // file sealer under the configured data_dir. Falls back to the
-            // ephemeral (in-memory) wiring only if opening any of the three
-            // fails — tests are the expected consumer of the ephemeral
-            // path. Either way, the route is live.
+            // file sealer under the configured data_dir. Any durable-state
+            // error disables session creation: falling back to a fresh
+            // ephemeral registry would erase quota history and bypass caps.
             let mcp_url = format!("http://{}/mcp", config.http_addr);
+            let session_policy =
+                crate::http::session::SessionPolicy::from_env(config.ingress.trusted_proxy_cidrs.clone());
+            let session_admission_key = rcx_passport_key.derive_subkey("session-admission-quota-v1");
             // action-ledger M2: per-tool MCP dispatch metrics scrape via /metrics.
             crux_mcp::ledger::register_metrics(&metrics.registry());
             let session_metrics = Arc::new(crate::http::session_metrics::SessionMetrics::new(&metrics.registry()));
-            match crate::http::session::SessionServices::local_durable(&config.data_dir, node_id.clone(), mcp_url) {
+            match crate::http::session::SessionServices::local_durable(
+                &config.data_dir,
+                node_id.clone(),
+                mcp_url,
+                session_policy.clone(),
+                session_admission_key,
+            ) {
                 Ok(services) => Some(Arc::new(services.with_metrics(session_metrics))),
                 Err(err) => {
-                    tracing::warn!(?err, "durable session wiring failed; falling back to ephemeral");
-                    Some(Arc::new(
-                        crate::http::session::SessionServices::local_default(node_id.clone())
-                            .with_metrics(session_metrics),
-                    ))
+                    tracing::error!(?err, "durable session wiring failed; session creation disabled");
+                    None
                 }
             }
         },
@@ -1059,6 +1064,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Clone handles before state is moved into the router.
     let session_store_handle = state.session_store.clone();
+    let session_registry_handle = state.session.clone();
     let sync_fact_store_handle = state.fact_store.clone();
     // Ephemeral reserved-fact GC. Gated at spawn by CORECRUXD_EPHEMERAL_GC
     // (default OFF); the flag is read once at boot, so toggling requires a
@@ -1296,6 +1302,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             Ok(reaped) if reaped > 0 => tracing::info!(reaped, "session-ttl-reaper"),
                             Ok(_) => {}
                             Err(err) => tracing::warn!(?err, "session-ttl-reaper-journal-failed"),
+                        }
+                    }
+                    _ = rx.recv() => break,
+                }
+            }
+        });
+    }
+
+    // Session-plan registry TTL reaper. Admission also prunes synchronously,
+    // while this task bounds retained disk state during idle periods.
+    if let Some(session_services) = session_registry_handle {
+        let mut rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        match session_services
+                            .prune_expired(crate::ops_events::now_unix_ms())
+                            .await
+                        {
+                            Ok(reaped) if reaped > 0 => {
+                                tracing::info!(reaped, "session-plan-registry-ttl-reaper");
+                            }
+                            Ok(_) => {}
+                            Err(err) => {
+                                tracing::warn!(?err, "session-plan-registry-ttl-reaper-failed");
+                            }
                         }
                     }
                     _ = rx.recv() => break,

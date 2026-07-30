@@ -218,9 +218,9 @@ impl IntoResponse for InvalidPassportHeader {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ClientIpDecision {
-    key_ip: Option<IpAddr>,
-    exempt_ip: Option<IpAddr>,
+pub(crate) struct ClientIpDecision {
+    pub(crate) key_ip: Option<IpAddr>,
+    pub(crate) exempt_ip: Option<IpAddr>,
 }
 
 impl HttpRateLimiter {
@@ -306,38 +306,68 @@ impl HttpRateLimiter {
     }
 
     fn client_ip_decision(&self, headers: &HeaderMap, peer_ip: Option<IpAddr>) -> ClientIpDecision {
-        let Some(peer_ip) = peer_ip else {
-            return ClientIpDecision {
-                key_ip: None,
-                exempt_ip: None,
-            };
+        client_ip_decision_with_parsed(headers, peer_ip, &self.trusted_proxy_cidrs)
+    }
+}
+
+/// Resolve the same effective client IP and trust posture used by the global
+/// rate limiter. Forwarded chains are walked from the trusted socket peer
+/// toward the client, stopping at the first untrusted hop.
+pub(crate) fn parse_trusted_proxy_cidrs(values: &[String]) -> Vec<(IpAddr, u8)> {
+    parse_cidrs_with_label(values, "CORECRUXD_TRUSTED_PROXY_CIDRS")
+}
+
+pub(crate) fn effective_client_ip(
+    headers: &HeaderMap,
+    peer_ip: Option<IpAddr>,
+    trusted_proxy_cidrs: &[(IpAddr, u8)],
+) -> ClientIpDecision {
+    client_ip_decision_with_parsed(headers, peer_ip.map(normalize_ip), trusted_proxy_cidrs)
+}
+
+/// Anonymous bootstrap is intentionally narrower than forwarded-IP trust:
+/// only a direct loopback socket with no forwarding assertion is local.
+/// Reverse-proxied callers must authenticate even when the proxy is trusted.
+pub(crate) fn is_direct_loopback_request(headers: &HeaderMap, peer_ip: Option<IpAddr>) -> bool {
+    !has_forwarded_headers(headers) && peer_ip.map(normalize_ip).is_some_and(|ip| ip.is_loopback())
+}
+
+fn client_ip_decision_with_parsed(
+    headers: &HeaderMap,
+    peer_ip: Option<IpAddr>,
+    trusted_proxy_cidrs: &[(IpAddr, u8)],
+) -> ClientIpDecision {
+    let Some(peer_ip) = peer_ip else {
+        return ClientIpDecision {
+            key_ip: None,
+            exempt_ip: None,
         };
-        let peer_is_trusted_proxy = self.trusted_proxy_cidrs.iter().any(|cidr| cidr_contains(cidr, peer_ip));
-        let forwarded_present = has_forwarded_headers(headers);
+    };
+    let peer_is_trusted_proxy = trusted_proxy_cidrs.iter().any(|cidr| cidr_contains(cidr, peer_ip));
+    let forwarded_present = has_forwarded_headers(headers);
 
-        if peer_is_trusted_proxy {
-            if let Some(client_ip) = forwarded_client_ip(headers) {
-                return ClientIpDecision {
-                    key_ip: Some(client_ip),
-                    exempt_ip: Some(client_ip),
-                };
-            }
+    if peer_is_trusted_proxy {
+        if let Some(client_ip) = forwarded_client_ip(headers, peer_ip, trusted_proxy_cidrs) {
             return ClientIpDecision {
-                key_ip: Some(peer_ip),
-                // A configured proxy with absent/malformed forwarded headers is
-                // bucketed by proxy IP, but the proxy IP itself is not exempted.
-                exempt_ip: None,
+                key_ip: Some(client_ip),
+                exempt_ip: Some(client_ip),
             };
         }
-
-        ClientIpDecision {
+        return ClientIpDecision {
             key_ip: Some(peer_ip),
-            // Forwarded headers from untrusted peers are ignored and also
-            // suppress loopback/private exemptions. A same-host reverse proxy
-            // that is not in CORECRUXD_TRUSTED_PROXY_CIDRS gets one shared
-            // bucket instead of an unlimited loopback bypass.
-            exempt_ip: (!forwarded_present).then_some(peer_ip),
-        }
+            // A configured proxy with absent/malformed forwarded headers is
+            // bucketed by proxy IP, but the proxy IP itself is not exempted.
+            exempt_ip: None,
+        };
+    }
+
+    ClientIpDecision {
+        key_ip: Some(peer_ip),
+        // Forwarded headers from untrusted peers are ignored and also
+        // suppress loopback/private exemptions. A same-host reverse proxy
+        // that is not in CORECRUXD_TRUSTED_PROXY_CIDRS gets one shared
+        // bucket instead of an unlimited loopback bypass.
+        exempt_ip: (!forwarded_present).then_some(peer_ip),
     }
 }
 
@@ -361,38 +391,74 @@ fn has_forwarded_headers(headers: &HeaderMap) -> bool {
     headers.contains_key(FORWARDED_HEADER) || headers.contains_key(X_FORWARDED_FOR_HEADER)
 }
 
-fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
-    headers
-        .get(FORWARDED_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(parse_forwarded_header)
-        .or_else(|| {
-            headers
-                .get(X_FORWARDED_FOR_HEADER)
-                .and_then(|value| value.to_str().ok())
-                .and_then(parse_x_forwarded_for)
-        })
-        .map(normalize_ip)
+fn forwarded_client_ip(headers: &HeaderMap, peer_ip: IpAddr, trusted_proxy_cidrs: &[(IpAddr, u8)]) -> Option<IpAddr> {
+    let chain = forwarded_ip_chain(headers)?;
+    let mut current = peer_ip;
+    let mut advanced = false;
+    for candidate in chain.into_iter().rev() {
+        if !trusted_proxy_cidrs.iter().any(|cidr| cidr_contains(cidr, current)) {
+            break;
+        }
+        current = candidate;
+        advanced = true;
+    }
+    advanced.then_some(normalize_ip(current))
 }
 
-fn parse_forwarded_header(value: &str) -> Option<IpAddr> {
+fn forwarded_ip_chain(headers: &HeaderMap) -> Option<Vec<IpAddr>> {
+    let has_forwarded = headers.contains_key(FORWARDED_HEADER);
+    let has_x_forwarded_for = headers.contains_key(X_FORWARDED_FOR_HEADER);
+    // Two independently generated chains are ambiguous. Fail closed to the
+    // socket-peer bucket rather than choosing the more favorable assertion.
+    if has_forwarded == has_x_forwarded_for {
+        return None;
+    }
+
+    let mut chain = Vec::new();
+    if has_forwarded {
+        for value in headers.get_all(FORWARDED_HEADER) {
+            chain.extend(parse_forwarded_header_chain(value.to_str().ok()?)?);
+        }
+    } else {
+        for value in headers.get_all(X_FORWARDED_FOR_HEADER) {
+            chain.extend(parse_x_forwarded_for_chain(value.to_str().ok()?)?);
+        }
+    }
+    (!chain.is_empty()).then_some(chain)
+}
+
+fn parse_forwarded_header_chain(value: &str) -> Option<Vec<IpAddr>> {
+    let mut chain = Vec::new();
     for element in value.split(',') {
+        let mut element_ip = None;
         for part in element.split(';') {
             let Some((name, value)) = part.trim().split_once('=') else {
                 continue;
             };
             if name.trim().eq_ignore_ascii_case("for") {
-                if let Some(ip) = parse_forwarded_ip(value.trim()) {
-                    return Some(ip);
+                if element_ip.is_some() {
+                    return None;
                 }
+                element_ip = Some(parse_forwarded_ip(value.trim())?);
             }
         }
+        chain.push(element_ip?);
     }
-    None
+    Some(chain)
 }
 
+#[cfg(test)]
+fn parse_forwarded_header(value: &str) -> Option<IpAddr> {
+    parse_forwarded_header_chain(value)?.into_iter().next()
+}
+
+#[cfg(test)]
 fn parse_x_forwarded_for(value: &str) -> Option<IpAddr> {
-    value.split(',').find_map(|part| parse_forwarded_ip(part.trim()))
+    parse_x_forwarded_for_chain(value)?.into_iter().next()
+}
+
+fn parse_x_forwarded_for_chain(value: &str) -> Option<Vec<IpAddr>> {
+    value.split(',').map(|part| parse_forwarded_ip(part.trim())).collect()
 }
 
 fn parse_forwarded_ip(raw: &str) -> Option<IpAddr> {
@@ -574,7 +640,7 @@ fn content_length_exceeds(headers: &HeaderMap, limit: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use axum::body::{to_bytes, Body, Bytes};
-    use axum::http::{Request, StatusCode};
+    use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
     use axum::routing::post;
     use axum::Router;
     use tower::util::ServiceExt as _;
@@ -898,7 +964,8 @@ mod tests {
     use axum::extract::ConnectInfo;
 
     use super::{
-        normalize_ip, parse_cidr, parse_forwarded_header, parse_forwarded_ip, parse_x_forwarded_for, HttpRateLimiter,
+        effective_client_ip, normalize_ip, parse_cidr, parse_forwarded_header, parse_forwarded_ip,
+        parse_x_forwarded_for, HttpRateLimiter,
     };
 
     fn rate_cfg(rps: u64, burst: u64) -> IngressConfig {
@@ -1252,5 +1319,26 @@ mod tests {
             parse_forwarded_ip("203.0.113.71:1234"),
             Some("203.0.113.71".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn trusted_proxy_walks_forwarded_chains_right_to_left() {
+        let trusted = vec![parse_cidr("127.0.0.1/32").unwrap()];
+        let peer = Some("127.0.0.1".parse().unwrap());
+        let expected = Some("203.0.113.44".parse().unwrap());
+
+        for (name, value) in [
+            ("x-forwarded-for", "127.0.0.1, 203.0.113.44"),
+            ("forwarded", "for=127.0.0.1, for=203.0.113.44"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::HeaderName::from_static(name),
+                HeaderValue::from_static(value),
+            );
+            let decision = effective_client_ip(&headers, peer, &trusted);
+            assert_eq!(decision.key_ip, expected, "{name}");
+            assert_eq!(decision.exempt_ip, expected, "{name}");
+        }
     }
 }

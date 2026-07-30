@@ -972,6 +972,11 @@ fn http_ctx(auth: &Authz, headers: &HeaderMap) -> Result<AuthContext, ProblemRes
 pub struct HttpScopeContext {
     pub scopes: Vec<String>,
     pub passport_id: Option<String>,
+    /// Immutable identity authenticated by the credential, captured before a
+    /// privileged passport-header override can change `passport_id`. Resource
+    /// quotas and rate keys must use this value rather than caller-selected
+    /// body/header identity.
+    verified_credential_identity: Option<String>,
     auth_enforced: bool,
     /// Auth-off and DevScopes are explicit local-development modes. They can
     /// carry caller assertions, but those assertions are never verified
@@ -1131,6 +1136,13 @@ impl HttpScopeContext {
         self.scope_bypass || self.scopes.iter().any(|s| s == scope)
     }
 
+    /// Credential identity before any passport-header override. JWT `sub`
+    /// wins; credentials without one fall back to their verified passport or
+    /// namespaced agent-token identity.
+    pub(crate) fn verified_credential_identity(&self) -> Option<&str> {
+        self.verified_credential_identity.as_deref()
+    }
+
     /// Whether the verified credential is authorized across every tenant.
     /// A tenant-bound admin scope is still tenant-bound.
     pub(crate) fn has_global_tenant_authority(&self) -> bool {
@@ -1258,6 +1270,7 @@ pub fn http_tenant_selector(headers: &HeaderMap) -> Option<String> {
 pub fn passport_bound_context(auth: &Authz, headers: &HeaderMap) -> Result<HttpScopeContext, ProblemResponse> {
     let ctx = http_ctx(auth, headers)?;
     let verified_passport_id = ctx.passport_id.clone();
+    let verified_credential_identity = ctx.subject.clone().or_else(|| verified_passport_id.clone());
     let passport_id = bind_http_passport(auth.mode, &ctx, http_passport_id(headers))?;
     let passport_override_used =
         matches!(auth.mode, AuthMode::JwtHs256 | AuthMode::JwtJwks) && passport_id != verified_passport_id;
@@ -1265,6 +1278,7 @@ pub fn passport_bound_context(auth: &Authz, headers: &HeaderMap) -> Result<HttpS
     Ok(HttpScopeContext {
         scopes: ctx.scopes.into_iter().collect(),
         passport_id,
+        verified_credential_identity,
         auth_enforced: auth.mode != AuthMode::Off,
         local_unverified_identity: matches!(auth.mode, AuthMode::Off | AuthMode::DevScopes),
         passport_override_used,
@@ -2784,6 +2798,25 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
         headers.insert("x-corecrux-passport-id", "passport-a".parse().unwrap());
         let ctx = passport_bound_context(&auth, &headers).expect("matching header");
         assert_eq!(ctx.passport_id.as_deref(), Some("passport-a"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn passport_override_does_not_change_verified_credential_identity() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+        let (auth, mut headers) = hs256_auth_headers(serde_json::json!({
+            "scope": "admin:write",
+            "tenant_id": "t1",
+            "sub": "credential-owner",
+            "passport_id": "passport-a",
+        }));
+        headers.insert("x-corecrux-passport-id", "passport-b".parse().unwrap());
+
+        let ctx = passport_bound_context(&auth, &headers).expect("admin passport override");
+        assert_eq!(ctx.passport_id.as_deref(), Some("passport-b"));
+        assert_eq!(ctx.verified_credential_identity(), Some("credential-owner"));
+        assert!(ctx.passport_override_used());
     }
 
     #[test]

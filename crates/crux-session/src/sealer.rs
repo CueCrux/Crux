@@ -47,6 +47,10 @@ pub trait PlanSealer: Send + Sync {
     /// the event is safely on disk (or otherwise durable). The caller only
     /// writes to the session registry after this returns successfully.
     fn seal(&self, event: &SealedEvent) -> Result<(), SessionError>;
+    /// Bytes currently retained by this backend.
+    fn storage_bytes(&self) -> Result<u64, SessionError>;
+    /// Bytes this backend would add for `event`.
+    fn event_storage_bytes(&self, event: &SealedEvent) -> Result<u64, SessionError>;
 }
 
 /// Does nothing. Used only in legacy paths until the always-store rule is
@@ -58,17 +62,41 @@ impl PlanSealer for NoopSealer {
     fn seal(&self, _event: &SealedEvent) -> Result<(), SessionError> {
         Ok(())
     }
+
+    fn storage_bytes(&self) -> Result<u64, SessionError> {
+        Ok(0)
+    }
+
+    fn event_storage_bytes(&self, _event: &SealedEvent) -> Result<u64, SessionError> {
+        Ok(0)
+    }
 }
 
 /// Records every sealed event in a `Vec<SealedEvent>`. Thread-safe.
-#[derive(Default)]
 pub struct InMemorySealer {
     events: Mutex<Vec<SealedEvent>>,
+    max_bytes: u64,
+}
+
+impl Default for InMemorySealer {
+    fn default() -> Self {
+        Self {
+            events: Mutex::new(Vec::new()),
+            max_bytes: u64::MAX,
+        }
+    }
 }
 
 impl InMemorySealer {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn new_bounded(max_bytes: u64) -> Self {
+        Self {
+            events: Mutex::new(Vec::new()),
+            max_bytes,
+        }
     }
 
     /// Snapshot of all events ever sealed into this instance, in order.
@@ -95,9 +123,52 @@ impl PlanSealer for InMemorySealer {
             .events
             .lock()
             .map_err(|_: PoisonError<_>| SessionError::Encode("sealer mutex poisoned".into()))?;
+        let current = events_storage_bytes(&guard);
+        let attempted = in_memory_event_bytes(event);
+        if current.checked_add(attempted).unwrap_or(u64::MAX) > self.max_bytes {
+            return Err(SessionError::Capacity {
+                resource: "session event log",
+                limit: self.max_bytes,
+                current,
+                attempted,
+            });
+        }
         guard.push(event.clone());
         Ok(())
     }
+
+    fn storage_bytes(&self) -> Result<u64, SessionError> {
+        let guard = self
+            .events
+            .lock()
+            .map_err(|_: PoisonError<_>| SessionError::Encode("sealer mutex poisoned".into()))?;
+        Ok(events_storage_bytes(&guard))
+    }
+
+    fn event_storage_bytes(&self, event: &SealedEvent) -> Result<u64, SessionError> {
+        Ok(in_memory_event_bytes(event))
+    }
+}
+
+fn in_memory_event_bytes(event: &SealedEvent) -> u64 {
+    [
+        event.event_type.len(),
+        event.content_type.len(),
+        event.tenant_id.len(),
+        event.stream_type.len(),
+        event.stream_id.len(),
+        event.payload.len(),
+    ]
+    .into_iter()
+    .fold(0u64, |total, len| {
+        total.saturating_add(u64::try_from(len).unwrap_or(u64::MAX))
+    })
+}
+
+fn events_storage_bytes(events: &[SealedEvent]) -> u64 {
+    events
+        .iter()
+        .fold(0u64, |total, event| total.saturating_add(in_memory_event_bytes(event)))
 }
 
 // ─── FileSealer (M6): durable append-only event log on disk ──────────────
@@ -112,6 +183,7 @@ impl PlanSealer for InMemorySealer {
 /// Crux Daemon durable sealer: appends one JSON line per sealed event.
 pub struct FileSealer {
     path: PathBuf,
+    max_bytes: u64,
     /// Protects concurrent appenders. Each `seal` opens the file,
     /// appends, fsyncs, and closes — coarse but adequate at local-daemon scale
     /// (hundreds of events per session, not millions).
@@ -120,9 +192,28 @@ pub struct FileSealer {
 
 impl FileSealer {
     pub fn open(data_dir: &Path) -> Result<Self, SessionError> {
+        Self::open_bounded(data_dir, u64::MAX)
+    }
+
+    pub fn open_bounded(data_dir: &Path, max_bytes: u64) -> Result<Self, SessionError> {
         fs::create_dir_all(data_dir).map_err(|e| SessionError::Encode(format!("create data_dir: {e}")))?;
+        let path = data_dir.join("session-events.jsonl");
+        let current = match fs::metadata(&path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(SessionError::Encode(format!("stat event log: {error}"))),
+        };
+        if current > max_bytes {
+            return Err(SessionError::Capacity {
+                resource: "session event log",
+                limit: max_bytes,
+                current,
+                attempted: 0,
+            });
+        }
         Ok(Self {
-            path: data_dir.join("session-events.jsonl"),
+            path,
+            max_bytes,
             write_lock: Mutex::new(()),
         })
     }
@@ -177,19 +268,21 @@ pub struct StoredEvent {
 
 impl PlanSealer for FileSealer {
     fn seal(&self, event: &SealedEvent) -> Result<(), SessionError> {
-        let wire = SealedEventWire {
-            event_type: event.event_type.to_string(),
-            content_type: event.content_type.to_string(),
-            tenant_id: event.tenant_id.clone(),
-            stream_type: event.stream_type.clone(),
-            stream_id: event.stream_id.clone(),
-            payload_hex: hex::encode(&event.payload),
-        };
-        let line = serde_json::to_string(&wire).map_err(|e| SessionError::Encode(format!("serialise event: {e}")))?;
+        let line = encode_event_line(event)?;
         let _guard = self
             .write_lock
             .lock()
             .map_err(|_: PoisonError<_>| SessionError::Encode("sealer write-lock poisoned".into()))?;
+        let current = file_len_or_zero(&self.path)?;
+        let attempted = u64::try_from(line.len()).unwrap_or(u64::MAX).saturating_add(1);
+        if current.checked_add(attempted).unwrap_or(u64::MAX) > self.max_bytes {
+            return Err(SessionError::Capacity {
+                resource: "session event log",
+                limit: self.max_bytes,
+                current,
+                attempted,
+            });
+        }
         let mut f = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -199,6 +292,40 @@ impl PlanSealer for FileSealer {
         f.sync_all()
             .map_err(|e| SessionError::Encode(format!("fsync events file: {e}")))?;
         Ok(())
+    }
+
+    fn storage_bytes(&self) -> Result<u64, SessionError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_: PoisonError<_>| SessionError::Encode("sealer write-lock poisoned".into()))?;
+        file_len_or_zero(&self.path)
+    }
+
+    fn event_storage_bytes(&self, event: &SealedEvent) -> Result<u64, SessionError> {
+        Ok(u64::try_from(encode_event_line(event)?.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1))
+    }
+}
+
+fn encode_event_line(event: &SealedEvent) -> Result<String, SessionError> {
+    let wire = SealedEventWire {
+        event_type: event.event_type.to_string(),
+        content_type: event.content_type.to_string(),
+        tenant_id: event.tenant_id.clone(),
+        stream_type: event.stream_type.clone(),
+        stream_id: event.stream_id.clone(),
+        payload_hex: hex::encode(&event.payload),
+    };
+    serde_json::to_string(&wire).map_err(|e| SessionError::Encode(format!("serialise event: {e}")))
+}
+
+fn file_len_or_zero(path: &Path) -> Result<u64, SessionError> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(err) => Err(SessionError::Encode(format!("stat {}: {err}", path.display()))),
     }
 }
 
@@ -220,6 +347,14 @@ pub struct FailingSealer;
 impl PlanSealer for FailingSealer {
     fn seal(&self, _event: &SealedEvent) -> Result<(), SessionError> {
         Err(SessionError::Encode("segment seal forced to fail".into()))
+    }
+
+    fn storage_bytes(&self) -> Result<u64, SessionError> {
+        Ok(0)
+    }
+
+    fn event_storage_bytes(&self, event: &SealedEvent) -> Result<u64, SessionError> {
+        Ok(in_memory_event_bytes(event))
     }
 }
 
@@ -247,6 +382,24 @@ mod tests {
         assert_eq!(sealer.len(), 10);
         let all = sealer.events().unwrap();
         assert!(all.iter().all(|e| e.event_type == "corecrux.session.plan_sealed.v1"));
+    }
+
+    #[test]
+    fn in_memory_sealer_capacity_is_hard_and_non_overrunning() {
+        let event = sample_event();
+        let attempted = in_memory_event_bytes(&event);
+        let sealer = InMemorySealer::new_bounded(attempted);
+        sealer.seal(&event).unwrap();
+
+        assert!(matches!(
+            sealer.seal(&event),
+            Err(SessionError::Capacity {
+                resource: "session event log",
+                ..
+            })
+        ));
+        assert_eq!(sealer.storage_bytes().unwrap(), attempted);
+        assert_eq!(sealer.len(), 1);
     }
 
     #[test]
@@ -299,6 +452,47 @@ mod tests {
         sealer.seal(&sample_event()).unwrap();
         let events = sealer.read_all().unwrap();
         assert_eq!(events.len(), 4);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn file_sealer_capacity_is_hard_and_non_overrunning() {
+        let tmp = std::env::temp_dir().join(format!("crux-session-sealer-{}", rand::random::<u64>()));
+        let event = sample_event();
+        let sizing = FileSealer::open(&tmp).unwrap();
+        let attempted = sizing.event_storage_bytes(&event).unwrap();
+        drop(sizing);
+
+        let sealer = FileSealer::open_bounded(&tmp, attempted).unwrap();
+        sealer.seal(&event).unwrap();
+        assert!(matches!(
+            sealer.seal(&event),
+            Err(SessionError::Capacity {
+                resource: "session event log",
+                ..
+            })
+        ));
+        assert_eq!(sealer.storage_bytes().unwrap(), attempted);
+        assert_eq!(sealer.read_all().unwrap().len(), 1);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn file_sealer_rejects_preexisting_log_over_cap() {
+        let tmp = std::env::temp_dir().join(format!("crux-session-sealer-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("session-events.jsonl"), b"already too large").unwrap();
+
+        let result = FileSealer::open_bounded(&tmp, 4);
+        assert!(matches!(
+            result,
+            Err(SessionError::Capacity {
+                resource: "session event log",
+                limit: 4,
+                current: 17,
+                attempted: 0,
+            })
+        ));
         std::fs::remove_dir_all(&tmp).ok();
     }
 }

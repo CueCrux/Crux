@@ -20,20 +20,22 @@
 //! threat model (master-plan §5.3).
 
 use std::collections::HashSet;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Path, State};
+use axum::body::to_bytes;
+use axum::extract::{ConnectInfo, Path, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::{body::Bytes, Json};
+use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use corecrux_projections::{SessionPlanSealedV1, CONTENT_TYPE_SESSION_BIN_V1, EVT_SESSION_PLAN_SEALED_V1};
 use crux_session::{
     generator::GraphHints, handshake, Budget, Channels, FileSealer, FileSessionRegistry, HandshakeInputs,
     HandshakeRequest, InMemoryRegistry, InMemorySealer, LocalPassportConfig, NullSigner, PlanSealer, PlanSigner,
-    RegistryEntry, SealedEvent, SessionRegistry, DEFAULT_CATALOG,
+    RegistryEntry, RegistryError, SealedEvent, SessionError, SessionRegistry, DEFAULT_CATALOG,
 };
 use uuid::Uuid;
 
@@ -46,6 +48,90 @@ pub(super) fn problem(status: StatusCode, title: &str, detail: impl Into<String>
         ProblemDetails::new(status.as_u16(), "https://errors.cuecrux.com/session", title).with_detail(detail),
     )
     .into_response()
+}
+
+const DEFAULT_SESSION_TTL_SECS: u64 = 3_600;
+const DEFAULT_SESSION_MAX_REQUEST_BYTES: usize = 64 * 1024;
+const DEFAULT_SESSION_MAX_PER_PRINCIPAL: usize = 32;
+const DEFAULT_SESSION_MAX_PER_IP: usize = 64;
+const DEFAULT_SESSION_MAX_TOTAL: usize = 1_024;
+const DEFAULT_SESSION_REGISTRY_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_SESSION_EVENT_LOG_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Default-on resource and trust policy for `POST /session`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPolicy {
+    pub ttl_secs: u64,
+    pub max_request_bytes: usize,
+    pub max_per_principal: usize,
+    pub max_per_ip: usize,
+    pub max_total: usize,
+    pub registry_max_bytes: u64,
+    pub event_log_max_bytes: u64,
+    pub trusted_proxy_cidrs: Vec<String>,
+}
+
+impl Default for SessionPolicy {
+    fn default() -> Self {
+        Self {
+            ttl_secs: DEFAULT_SESSION_TTL_SECS,
+            max_request_bytes: DEFAULT_SESSION_MAX_REQUEST_BYTES,
+            max_per_principal: DEFAULT_SESSION_MAX_PER_PRINCIPAL,
+            max_per_ip: DEFAULT_SESSION_MAX_PER_IP,
+            max_total: DEFAULT_SESSION_MAX_TOTAL,
+            registry_max_bytes: DEFAULT_SESSION_REGISTRY_MAX_BYTES,
+            event_log_max_bytes: DEFAULT_SESSION_EVENT_LOG_MAX_BYTES,
+            trusted_proxy_cidrs: Vec::new(),
+        }
+    }
+}
+
+impl SessionPolicy {
+    pub fn from_env(trusted_proxy_cidrs: Vec<String>) -> Self {
+        Self {
+            ttl_secs: positive_env_u64("CORECRUXD_SESSION_TTL_SECS", DEFAULT_SESSION_TTL_SECS).clamp(60, 86_400),
+            max_request_bytes: positive_env_usize(
+                "CORECRUXD_SESSION_MAX_REQUEST_BYTES",
+                DEFAULT_SESSION_MAX_REQUEST_BYTES,
+            )
+            .clamp(1_024, 1024 * 1024),
+            max_per_principal: positive_env_usize(
+                "CORECRUXD_SESSION_MAX_PER_PRINCIPAL",
+                DEFAULT_SESSION_MAX_PER_PRINCIPAL,
+            )
+            .clamp(1, 1_000_000),
+            max_per_ip: positive_env_usize("CORECRUXD_SESSION_MAX_PER_IP", DEFAULT_SESSION_MAX_PER_IP)
+                .clamp(1, 1_000_000),
+            max_total: positive_env_usize("CORECRUXD_SESSION_MAX_TOTAL", DEFAULT_SESSION_MAX_TOTAL).clamp(1, 1_000_000),
+            registry_max_bytes: positive_env_u64(
+                "CORECRUXD_SESSION_REGISTRY_MAX_BYTES",
+                DEFAULT_SESSION_REGISTRY_MAX_BYTES,
+            )
+            .clamp(1024 * 1024, 1024 * 1024 * 1024 * 1024),
+            event_log_max_bytes: positive_env_u64(
+                "CORECRUXD_SESSION_EVENT_LOG_MAX_BYTES",
+                DEFAULT_SESSION_EVENT_LOG_MAX_BYTES,
+            )
+            .clamp(1024 * 1024, 1024 * 1024 * 1024 * 1024),
+            trusted_proxy_cidrs,
+        }
+    }
+}
+
+fn positive_env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn positive_env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }
 
 /// Subset of AppState actually used by the session route. Wrapping these
@@ -65,7 +151,10 @@ pub struct SessionServices {
     pub feature_flags: Arc<HashSet<String>>,
     pub mcp_url: String,
     pub bulk_url: Option<String>,
-    pub default_ttl_s: u64,
+    pub policy: Arc<SessionPolicy>,
+    trusted_proxy_cidrs: Arc<Vec<(IpAddr, u8)>>,
+    admission_key: Arc<[u8; 32]>,
+    admission_lock: Arc<tokio::sync::Mutex<()>>,
     /// Prometheus metric handles (master-plan §11). `None` disables
     /// emission — legacy paths that wire services without a Prometheus
     /// registry still work.
@@ -76,12 +165,27 @@ impl SessionServices {
     /// Ephemeral local-daemon wiring — `NullSigner` + `InMemorySealer` + `InMemoryRegistry`.
     /// Pre-M6 default; used only when the caller has no durable data
     /// directory (tests, smoke scripts). Sessions do not survive restart.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn local_default(node_id: impl Into<String>) -> Self {
         let install_uuid = node_id.into();
+        let admission_key = blake3::derive_key("cuecrux.session.admission.test-fallback.v1", install_uuid.as_bytes());
+        Self::local_default_with_policy(install_uuid, SessionPolicy::default(), admission_key)
+    }
+
+    pub fn local_default_with_policy(
+        install_uuid: impl Into<String>,
+        policy: SessionPolicy,
+        admission_key: [u8; 32],
+    ) -> Self {
+        let install_uuid = install_uuid.into();
+        let trusted_proxy_cidrs = super::ingress::parse_trusted_proxy_cidrs(&policy.trusted_proxy_cidrs);
         Self {
             signer: Arc::new(NullSigner),
-            sealer: Arc::new(InMemorySealer::new()),
-            registry: Arc::new(InMemoryRegistry::new()),
+            sealer: Arc::new(InMemorySealer::new_bounded(policy.event_log_max_bytes)),
+            registry: Arc::new(InMemoryRegistry::new_with_limits(
+                policy.registry_max_bytes,
+                policy.max_total,
+            )),
             passport_cfg: Arc::new(LocalPassportConfig {
                 install_uuid,
                 user: std::env::var("USER").unwrap_or_else(|_| "local".into()),
@@ -89,7 +193,10 @@ impl SessionServices {
             feature_flags: Arc::new(HashSet::new()),
             mcp_url: "http://localhost:14800/mcp".into(),
             bulk_url: None,
-            default_ttl_s: 3600,
+            policy: Arc::new(policy),
+            trusted_proxy_cidrs: Arc::new(trusted_proxy_cidrs),
+            admission_key: Arc::new(admission_key),
+            admission_lock: Arc::new(tokio::sync::Mutex::new(())),
             metrics: None,
         }
     }
@@ -99,19 +206,24 @@ impl SessionServices {
     /// (`data_dir/session-events.jsonl`). Sessions survive restart;
     /// the segment log is operator-inspectable with `jq`.
     ///
-    /// Called from `main.rs` whenever corecruxd has a configured
-    /// `data_dir`. Falls back to [`Self::local_default`] only when
-    /// opening persistent state fails.
+    /// Called from `main.rs` whenever corecruxd has a configured `data_dir`.
+    /// Persistent-state errors disable session creation rather than silently
+    /// resetting admission state in an ephemeral registry.
     pub fn local_durable(
         data_dir: &std::path::Path,
         node_id: impl Into<String>,
         mcp_url: impl Into<String>,
+        policy: SessionPolicy,
+        admission_key: [u8; 32],
     ) -> Result<Self, String> {
+        let trusted_proxy_cidrs = super::ingress::parse_trusted_proxy_cidrs(&policy.trusted_proxy_cidrs);
         let user = std::env::var("USER").unwrap_or_else(|_| "local".into());
         let passport_cfg =
             LocalPassportConfig::from_data_dir(data_dir, user).map_err(|e| format!("persistent passport: {e}"))?;
-        let registry = FileSessionRegistry::open(data_dir).map_err(|e| format!("file registry: {e}"))?;
-        let sealer = FileSealer::open(data_dir).map_err(|e| format!("file sealer: {e}"))?;
+        let registry = FileSessionRegistry::open_bounded(data_dir, policy.registry_max_bytes, policy.max_total)
+            .map_err(|e| format!("file registry: {e}"))?;
+        let sealer =
+            FileSealer::open_bounded(data_dir, policy.event_log_max_bytes).map_err(|e| format!("file sealer: {e}"))?;
         let _ = node_id; // retained for future node-scoped wiring
         Ok(Self {
             signer: Arc::new(NullSigner),
@@ -121,7 +233,10 @@ impl SessionServices {
             feature_flags: Arc::new(HashSet::new()),
             mcp_url: mcp_url.into(),
             bulk_url: None,
-            default_ttl_s: 3600,
+            policy: Arc::new(policy),
+            trusted_proxy_cidrs: Arc::new(trusted_proxy_cidrs),
+            admission_key: Arc::new(admission_key),
+            admission_lock: Arc::new(tokio::sync::Mutex::new(())),
             metrics: None,
         })
     }
@@ -131,6 +246,17 @@ impl SessionServices {
     pub fn with_metrics(mut self, metrics: Arc<super::session_metrics::SessionMetrics>) -> Self {
         self.metrics = Some(metrics);
         self
+    }
+
+    pub async fn prune_expired(&self, now_unix_ms: u64) -> Result<usize, RegistryError> {
+        let _guard = self.admission_lock.lock().await;
+        let report = self.registry.prune_expired(now_unix_ms)?;
+        if let Some(metrics) = self.metrics.as_ref() {
+            if let Ok(active) = self.registry.active_count() {
+                metrics.active_set(active as i64);
+            }
+        }
+        Ok(report.removed)
     }
 }
 
@@ -354,8 +480,8 @@ pub async fn get_session_plan(
 }
 
 /// `POST /session` — mint a session plan.
-#[tracing::instrument(level = "info", skip(state, headers, body))]
-pub async fn post_session(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+#[tracing::instrument(level = "info", skip(state, request))]
+pub async fn post_session(State(state): State<AppState>, request: Request) -> Response {
     let start = std::time::Instant::now();
     let services = match state.session.as_ref() {
         Some(s) => s.clone(),
@@ -364,6 +490,38 @@ pub async fn post_session(State(state): State<AppState>, headers: HeaderMap, bod
                 StatusCode::SERVICE_UNAVAILABLE,
                 "feature_disabled",
                 "session handshake feature is not enabled",
+            );
+        }
+    };
+    let (parts, body_stream) = request.into_parts();
+    let peer_ip = parts
+        .extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(address)| address.ip());
+    let headers = parts.headers;
+    let (passport, origin_install) = services.passport_cfg.synthesise();
+    let admission = match admission_identity(&state, &services, &headers, peer_ip, &passport.principal_id) {
+        Ok(admission) => admission,
+        Err(response) => {
+            if let Some(metrics) = services.metrics.as_ref() {
+                metrics.handshake_failed("ce", "authentication_required");
+            }
+            return response;
+        }
+    };
+    let body = match to_bytes(body_stream, services.policy.max_request_bytes).await {
+        Ok(body) => body,
+        Err(_) => {
+            if let Some(metrics) = services.metrics.as_ref() {
+                metrics.handshake_failed("ce", "body_too_large");
+            }
+            return problem(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                format!(
+                    "session handshake body exceeds {} bytes",
+                    services.policy.max_request_bytes
+                ),
             );
         }
     };
@@ -401,7 +559,57 @@ pub async fn post_session(State(state): State<AppState>, headers: HeaderMap, bod
 
     let prefer_cbor = should_prefer_cbor(&headers, &request.accepts);
 
-    let (passport, origin_install) = services.passport_cfg.synthesise();
+    // One admission lock makes prune, quota checks, mint, seal, and insert a
+    // linearizable transaction with respect to competing session creations.
+    let admission_guard = services.admission_lock.lock().await;
+    let admitted_at_ms = now_ms();
+    if let Err(error) = services.registry.prune_expired(admitted_at_ms) {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "session_registry_unavailable",
+            format!("expired-session cleanup failed: {error}"),
+        );
+    }
+    let usage = match services
+        .registry
+        .admission_usage(admitted_at_ms, &admission.principal_key, &admission.ip_key)
+    {
+        Ok(usage) => usage,
+        Err(error) => {
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "session_registry_unavailable",
+                format!("session admission usage failed: {error}"),
+            );
+        }
+    };
+    if usage.retained_for_principal >= services.policy.max_per_principal {
+        if let Some(metrics) = services.metrics.as_ref() {
+            metrics.handshake_failed("ce", "principal_quota");
+        }
+        return quota_response(
+            "principal",
+            retry_after_secs(usage.next_principal_expiry_ms, admitted_at_ms),
+        );
+    }
+    if usage.retained_for_ip >= services.policy.max_per_ip {
+        if let Some(metrics) = services.metrics.as_ref() {
+            metrics.handshake_failed("ce", "ip_quota");
+        }
+        return quota_response("ip", retry_after_secs(usage.next_ip_expiry_ms, admitted_at_ms));
+    }
+    if usage.retained_total >= services.policy.max_total {
+        if let Some(metrics) = services.metrics.as_ref() {
+            metrics.handshake_failed("ce", "global_capacity");
+        }
+        return capacity_response(
+            "session registry entries",
+            u64::try_from(services.policy.max_total).unwrap_or(u64::MAX),
+            u64::try_from(usage.retained_total).unwrap_or(u64::MAX),
+            1,
+        );
+    }
+
     let channels = Channels {
         bulk: services.bulk_url.clone(),
         mcp: services.mcp_url.clone(),
@@ -409,7 +617,7 @@ pub async fn post_session(State(state): State<AppState>, headers: HeaderMap, bod
     let budget = Budget {
         tokens_cap: None,
         crux_cap: None,
-        ttl_s: services.default_ttl_s,
+        ttl_s: services.policy.ttl_secs,
     };
 
     let handshake_request = HandshakeRequest {
@@ -417,12 +625,12 @@ pub async fn post_session(State(state): State<AppState>, headers: HeaderMap, bod
         channels,
         hints: GraphHints::from_request(request.hints.prefer_bulk)
             .with_hide_exclusions(request.hints.hide_exclusions.unwrap_or(false)),
-        session_ttl_s: services.default_ttl_s,
+        session_ttl_s: services.policy.ttl_secs,
         budget,
         origin: "ce".into(),
         origin_install: Some(origin_install),
         intent_hint: request.intent,
-        now_ms: now_ms(),
+        now_ms: admitted_at_ms,
     };
 
     let sealed = match handshake::mint(
@@ -447,28 +655,102 @@ pub async fn post_session(State(state): State<AppState>, headers: HeaderMap, bod
     // BEFORE writing to the registry. Any failure here is fatal — the
     // registry must never hold a row that has no matching sealed event.
     let event = build_sealed_event_for_plan(&sealed);
+    let entry = RegistryEntry::from_plan(&sealed.plan, sealed.canonical_cbor.clone())
+        .with_admission_keys(admission.principal_key, admission.ip_key);
+    let entry_bytes = match services.registry.entry_storage_bytes(&entry) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "session_registry_unavailable",
+                format!("session entry sizing failed: {error}"),
+            );
+        }
+    };
+    if usage.storage_bytes.checked_add(entry_bytes).unwrap_or(u64::MAX) > services.policy.registry_max_bytes {
+        if let Some(metrics) = services.metrics.as_ref() {
+            metrics.handshake_failed("ce", "registry_capacity");
+        }
+        return capacity_response(
+            "session registry bytes",
+            services.policy.registry_max_bytes,
+            usage.storage_bytes,
+            entry_bytes,
+        );
+    }
+    let event_bytes = match services.sealer.event_storage_bytes(&event) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "session_event_log_unavailable",
+                format!("session event sizing failed: {error}"),
+            );
+        }
+    };
+    let event_log_bytes = match services.sealer.storage_bytes() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "session_event_log_unavailable",
+                format!("session event usage failed: {error}"),
+            );
+        }
+    };
+    if event_log_bytes.checked_add(event_bytes).unwrap_or(u64::MAX) > services.policy.event_log_max_bytes {
+        if let Some(metrics) = services.metrics.as_ref() {
+            metrics.handshake_failed("ce", "event_log_capacity");
+        }
+        return capacity_response(
+            "session event log bytes",
+            services.policy.event_log_max_bytes,
+            event_log_bytes,
+            event_bytes,
+        );
+    }
     if let Err(e) = services.sealer.seal(&event) {
         if let Some(m) = services.metrics.as_ref() {
             m.handshake_seal_failure("ce");
         }
-        return problem(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "segment_seal_failed",
-            format!("segment log append failed: {e}"),
-        );
+        match e {
+            SessionError::Capacity {
+                resource,
+                limit,
+                current,
+                attempted,
+            } => return capacity_response(resource, limit, current, attempted),
+            other => {
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "segment_seal_failed",
+                    format!("segment log append failed: {other}"),
+                );
+            }
+        }
     }
 
-    let entry = RegistryEntry::from_plan(&sealed.plan, sealed.canonical_cbor.clone());
     if let Err(e) = services.registry.insert(entry) {
         if let Some(m) = services.metrics.as_ref() {
             m.handshake_failed("ce", "registry_insert_failed");
         }
-        return problem(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal_error",
-            format!("registry insert failed: {e}"),
-        );
+        match e {
+            RegistryError::Capacity {
+                resource,
+                limit,
+                current,
+                attempted,
+            } => return capacity_response(resource, limit, current, attempted),
+            other => {
+                return problem(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    format!("registry insert failed: {other}"),
+                );
+            }
+        }
     }
+    drop(admission_guard);
 
     if let Some(m) = services.metrics.as_ref() {
         let latency = start.elapsed().as_secs_f64();
@@ -534,6 +816,130 @@ pub async fn post_session(State(state): State<AppState>, headers: HeaderMap, bod
     }
 
     build_plan_response(&sealed, prefer_cbor, binding.as_ref())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AdmissionIdentity {
+    principal_key: String,
+    ip_key: String,
+}
+
+#[allow(clippy::result_large_err)]
+fn admission_identity(
+    state: &AppState,
+    services: &SessionServices,
+    headers: &HeaderMap,
+    peer_ip: Option<IpAddr>,
+    local_principal_id: &str,
+) -> Result<AdmissionIdentity, Response> {
+    let client = super::ingress::effective_client_ip(headers, peer_ip, &services.trusted_proxy_cidrs);
+    let local_loopback = super::ingress::is_direct_loopback_request(headers, peer_ip);
+
+    let principal = if local_loopback {
+        format!("local:{local_principal_id}")
+    } else {
+        let context = crate::auth::passport_bound_context(&state.auth, headers).map_err(IntoResponse::into_response)?;
+        if !context.auth_enforced() || context.local_unverified_identity() {
+            return Err(ProblemResponse(
+                ProblemDetails::unauthorized(
+                    "remote session creation requires a cryptographically verified credential",
+                )
+                .with_extensions(serde_json::json!({
+                    "code": "SESSION_VERIFIED_CREDENTIAL_REQUIRED",
+                })),
+            )
+            .into_response());
+        }
+        if !context.has_scope("sessions:write") && !context.has_scope("admin:write") {
+            return Err(ProblemResponse(
+                ProblemDetails::forbidden("remote session creation requires sessions:write or admin:write")
+                    .with_extensions(serde_json::json!({
+                        "code": "SESSION_WRITE_SCOPE_REQUIRED",
+                    })),
+            )
+            .into_response());
+        }
+        context
+            .verified_credential_identity()
+            .map(str::trim)
+            .filter(|identity| !identity.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                ProblemResponse(
+                    ProblemDetails::unauthorized("verified credential does not contain a stable principal identity")
+                        .with_extensions(serde_json::json!({
+                            "code": "SESSION_VERIFIED_IDENTITY_REQUIRED",
+                        })),
+                )
+                .into_response()
+            })?
+    };
+    let ip = client
+        .key_ip
+        .map_or_else(|| "missing-peer".to_string(), |ip| ip.to_string());
+
+    Ok(AdmissionIdentity {
+        principal_key: keyed_admission_key(&services.admission_key, b"principal", principal.as_bytes()),
+        ip_key: keyed_admission_key(&services.admission_key, b"ip", ip.as_bytes()),
+    })
+}
+
+fn keyed_admission_key(key: &[u8; 32], domain: &[u8], value: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new_keyed(key);
+    hasher.update(b"cuecrux.session.admission.v1\0");
+    hasher.update(domain);
+    hasher.update(b"\0");
+    hasher.update(value);
+    hex::encode(hasher.finalize().as_bytes())
+}
+
+fn retry_after_secs(next_expiry_ms: Option<u64>, now_ms: u64) -> u64 {
+    next_expiry_ms
+        .map_or(1, |expiry| expiry.saturating_sub(now_ms).saturating_add(999) / 1_000)
+        .max(1)
+}
+
+fn quota_response(quota: &'static str, retry_after: u64) -> Response {
+    let mut response = ProblemResponse(
+        ProblemDetails::new(
+            StatusCode::TOO_MANY_REQUESTS.as_u16(),
+            "https://errors.cuecrux.com/session-quota-exceeded",
+            "Session quota exceeded",
+        )
+        .with_detail(format!(
+            "the retained per-{quota} session limit is exhausted; retry after {retry_after}s"
+        ))
+        .with_extensions(serde_json::json!({
+            "code": "SESSION_QUOTA_EXCEEDED",
+            "quota": quota,
+        })),
+    )
+    .into_response();
+    if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+fn capacity_response(resource: &str, limit: u64, current: u64, attempted: u64) -> Response {
+    ProblemResponse(
+        ProblemDetails::new(
+            StatusCode::INSUFFICIENT_STORAGE.as_u16(),
+            "https://errors.cuecrux.com/session-capacity-exceeded",
+            "Session capacity exceeded",
+        )
+        .with_detail(format!(
+            "{resource} capacity is exhausted (limit={limit}, current={current}, attempted={attempted})"
+        ))
+        .with_extensions(serde_json::json!({
+            "code": "SESSION_CAPACITY_EXCEEDED",
+            "resource": resource,
+            "limit": limit,
+            "current": current,
+            "attempted": attempted,
+        })),
+    )
+    .into_response()
 }
 
 /// Translate a freshly-minted sealed plan into the

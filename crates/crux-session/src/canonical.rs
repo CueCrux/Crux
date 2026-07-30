@@ -26,6 +26,13 @@ const SIMPLE_FALSE: u8 = 0xF4;
 const SIMPLE_TRUE: u8 = 0xF5;
 const SIMPLE_NULL: u8 = 0xF6;
 
+/// Maximum container nesting accepted by the decoder.
+///
+/// Session-plan values are shallow. Keeping this finite prevents a
+/// byte-bounded but deeply nested hostile CBOR body from exhausting the
+/// process stack before schema validation runs.
+const MAX_CBOR_NESTING_DEPTH: usize = 64;
+
 /// A canonical-CBOR value restricted to the subset our schema needs.
 ///
 /// We build a tree of `CborValue` (no floats, no negative ints, no tags) and
@@ -124,7 +131,7 @@ fn write_head(major: u8, arg: u64, out: &mut Vec<u8>) {
 /// indefinite-length, non-shortest heads, and tags all error.
 pub fn decode(bytes: &[u8]) -> Result<CborValue, SessionError> {
     let mut cursor = Cursor { bytes, pos: 0 };
-    let value = read_value(&mut cursor)?;
+    let value = read_value(&mut cursor, 0)?;
     if cursor.pos != bytes.len() {
         return Err(SessionError::Decode(format!("trailing bytes at offset {}", cursor.pos)));
     }
@@ -161,7 +168,12 @@ impl Cursor<'_> {
     }
 }
 
-fn read_value(c: &mut Cursor) -> Result<CborValue, SessionError> {
+fn read_value(c: &mut Cursor, depth: usize) -> Result<CborValue, SessionError> {
+    if depth > MAX_CBOR_NESTING_DEPTH {
+        return Err(SessionError::Decode(format!(
+            "maximum cbor nesting depth {MAX_CBOR_NESTING_DEPTH} exceeded"
+        )));
+    }
     let first = c.take_u8()?;
     let major = first >> 5;
     let info = first & 0x1F;
@@ -195,7 +207,7 @@ fn read_value(c: &mut Cursor) -> Result<CborValue, SessionError> {
             let cap = (arg as usize).min(c.remaining());
             let mut items = Vec::with_capacity(cap);
             for _ in 0..arg {
-                items.push(read_value(c)?);
+                items.push(read_value(c, depth.saturating_add(1))?);
             }
             Ok(CborValue::Array(items))
         }
@@ -204,8 +216,9 @@ fn read_value(c: &mut Cursor) -> Result<CborValue, SessionError> {
             let cap = (arg as usize).min(c.remaining() / 2);
             let mut pairs = Vec::with_capacity(cap);
             for _ in 0..arg {
-                let key = read_value(c)?;
-                let value = read_value(c)?;
+                let child_depth = depth.saturating_add(1);
+                let key = read_value(c, child_depth)?;
+                let value = read_value(c, child_depth)?;
                 match key {
                     CborValue::Text(s) => pairs.push((s, value)),
                     _ => {
@@ -345,6 +358,21 @@ mod tests {
         let mut text = vec![0x60 | 0x1B]; // major 3, info 27 => 8-byte length
         text.extend_from_slice(&u64::MAX.to_be_bytes());
         assert!(decode(&text).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_excessive_container_nesting() {
+        let mut at_limit = vec![0x81; MAX_CBOR_NESTING_DEPTH];
+        at_limit.push(SIMPLE_NULL);
+        assert!(decode(&at_limit).is_ok());
+
+        let mut over_limit = vec![0x81; MAX_CBOR_NESTING_DEPTH + 1];
+        over_limit.push(SIMPLE_NULL);
+        let error = decode(&over_limit).expect_err("depth above the hard limit must fail");
+        assert!(
+            error.to_string().contains("maximum cbor nesting depth"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

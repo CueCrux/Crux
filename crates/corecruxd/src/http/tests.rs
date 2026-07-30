@@ -13049,6 +13049,407 @@ async fn active_sessions_requires_admin_read() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+const SESSION_TEST_BODY: &[u8] =
+    br#"{"client_id":"test-agent","client_version":"0.1.0","accepts":["application/json"],"intent":"audit"}"#;
+
+fn session_test_policy() -> super::session::SessionPolicy {
+    super::session::SessionPolicy {
+        ttl_secs: 3_600,
+        max_request_bytes: 64 * 1024,
+        max_per_principal: 32,
+        max_per_ip: 64,
+        max_total: 1_024,
+        registry_max_bytes: 64 * 1024 * 1024,
+        event_log_max_bytes: 512 * 1024 * 1024,
+        trusted_proxy_cidrs: Vec::new(),
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn session_policy_defaults_and_clamps_environment_overrides() {
+    const NAMES: [&str; 7] = [
+        "CORECRUXD_SESSION_TTL_SECS",
+        "CORECRUXD_SESSION_MAX_REQUEST_BYTES",
+        "CORECRUXD_SESSION_MAX_PER_PRINCIPAL",
+        "CORECRUXD_SESSION_MAX_PER_IP",
+        "CORECRUXD_SESSION_MAX_TOTAL",
+        "CORECRUXD_SESSION_REGISTRY_MAX_BYTES",
+        "CORECRUXD_SESSION_EVENT_LOG_MAX_BYTES",
+    ];
+    let _unset: Vec<EnvVarGuard> = NAMES.iter().map(|name| EnvVarGuard::unset(name)).collect();
+    assert_eq!(
+        super::session::SessionPolicy::from_env(Vec::new()),
+        session_test_policy()
+    );
+
+    let _overrides = [
+        EnvVarGuard::set("CORECRUXD_SESSION_TTL_SECS", "1"),
+        EnvVarGuard::set("CORECRUXD_SESSION_MAX_REQUEST_BYTES", "999999999"),
+        EnvVarGuard::set("CORECRUXD_SESSION_MAX_PER_PRINCIPAL", "2"),
+        EnvVarGuard::set("CORECRUXD_SESSION_MAX_PER_IP", "3"),
+        EnvVarGuard::set("CORECRUXD_SESSION_MAX_TOTAL", "4"),
+        EnvVarGuard::set("CORECRUXD_SESSION_REGISTRY_MAX_BYTES", "1"),
+        EnvVarGuard::set("CORECRUXD_SESSION_EVENT_LOG_MAX_BYTES", "1099511627777"),
+    ];
+    let policy = super::session::SessionPolicy::from_env(vec!["127.0.0.1/32".into()]);
+    assert_eq!(policy.ttl_secs, 60);
+    assert_eq!(policy.max_request_bytes, 1024 * 1024);
+    assert_eq!(policy.max_per_principal, 2);
+    assert_eq!(policy.max_per_ip, 3);
+    assert_eq!(policy.max_total, 4);
+    assert_eq!(policy.registry_max_bytes, 1024 * 1024);
+    assert_eq!(policy.event_log_max_bytes, 1024 * 1024 * 1024 * 1024);
+    assert_eq!(policy.trusted_proxy_cidrs, vec!["127.0.0.1/32"]);
+}
+
+fn session_test_state(auth_mode: AuthMode, policy: super::session::SessionPolicy) -> AppState {
+    let mut state = if auth_mode == AuthMode::JwtHs256 {
+        mint_test_verified_app_state(16)
+    } else {
+        test_app_state_with_auth(16, auth_mode)
+    };
+    state.session = Some(Arc::new(super::session::SessionServices::local_default_with_policy(
+        "node-session-admission-test",
+        policy,
+        [0xA5; 32],
+    )));
+    state
+}
+
+fn session_test_headers(mut headers: HeaderMap) -> HeaderMap {
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers
+}
+
+async fn post_test_session(state: AppState, ip: [u8; 4], headers: HeaderMap) -> Response {
+    post_test_session_with_body(
+        state,
+        ip,
+        headers,
+        "application/json",
+        axum::body::Body::from(SESSION_TEST_BODY),
+    )
+    .await
+}
+
+async fn post_test_session_with_body(
+    state: AppState,
+    ip: [u8; 4],
+    mut headers: HeaderMap,
+    content_type: &'static str,
+    body: axum::body::Body,
+) -> Response {
+    let mut request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/session")
+        .body(body)
+        .expect("session request");
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    *request.headers_mut() = headers;
+    request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((ip, 41_100))));
+    super::session::post_session(State(state), request).await
+}
+
+#[tokio::test]
+async fn session_admission_allows_anonymous_direct_loopback() {
+    let response = post_test_session(
+        session_test_state(AuthMode::Off, session_test_policy()),
+        [127, 0, 0, 1],
+        HeaderMap::new(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn session_admission_rejects_anonymous_remote_and_dev_scopes() {
+    let anonymous = post_test_session(
+        session_test_state(AuthMode::Off, session_test_policy()),
+        [203, 0, 113, 10],
+        HeaderMap::new(),
+    )
+    .await;
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+    let dev_scopes = post_test_session(
+        session_test_state(AuthMode::DevScopes, session_test_policy()),
+        [203, 0, 113, 11],
+        dev_scope_headers("sessions:write"),
+    )
+    .await;
+    assert_eq!(dev_scopes.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn session_admission_rejects_missing_peer_and_untrusted_forwarded_loopback() {
+    let state = session_test_state(AuthMode::JwtHs256, session_test_policy());
+    let app = router(state, test_case_store());
+    let missing_peer = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/session")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(SESSION_TEST_BODY))
+                .expect("session request"),
+        )
+        .await
+        .expect("router response");
+    assert_eq!(missing_peer.status(), StatusCode::UNAUTHORIZED);
+
+    let state = session_test_state(AuthMode::JwtHs256, session_test_policy());
+    let app = router(state, test_case_store());
+    let mut authenticated_request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/session")
+        .body(axum::body::Body::from(SESSION_TEST_BODY))
+        .expect("session request");
+    *authenticated_request.headers_mut() =
+        session_test_headers(mint_test_verified_headers("sessions:write", "missing-peer-writer"));
+    let authenticated_missing_peer = app.oneshot(authenticated_request).await.expect("router response");
+    assert_eq!(authenticated_missing_peer.status(), StatusCode::OK);
+
+    let mut spoofed_headers = HeaderMap::new();
+    spoofed_headers.insert("x-forwarded-for", HeaderValue::from_static("127.0.0.1"));
+    let spoofed = post_test_session(
+        session_test_state(AuthMode::Off, session_test_policy()),
+        [127, 0, 0, 1],
+        spoofed_headers,
+    )
+    .await;
+    assert_eq!(spoofed.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn session_admission_requires_auth_for_trusted_proxy_forwarded_loopback() {
+    let mut policy = session_test_policy();
+    policy.trusted_proxy_cidrs = vec!["127.0.0.1/32".into()];
+    let mut headers = HeaderMap::new();
+    headers.insert("x-forwarded-for", HeaderValue::from_static("127.0.0.1"));
+    let response = post_test_session(session_test_state(AuthMode::Off, policy), [127, 0, 0, 1], headers).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn session_admission_rejects_spoofed_leftmost_forwarded_loopback_chains() {
+    for (name, value) in [
+        ("x-forwarded-for", "127.0.0.1, 203.0.113.44"),
+        ("forwarded", "for=127.0.0.1, for=203.0.113.44"),
+    ] {
+        let mut policy = session_test_policy();
+        policy.trusted_proxy_cidrs = vec!["127.0.0.1/32".into()];
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HeaderName::from_static(name), HeaderValue::from_static(value));
+        let response = post_test_session(session_test_state(AuthMode::Off, policy), [127, 0, 0, 1], headers).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn session_cbor_excessive_nesting_fails_cleanly() {
+    let mut body = vec![0x81; 65];
+    body.push(0xF6);
+    let response = post_test_session_with_body(
+        session_test_state(AuthMode::Off, session_test_policy()),
+        [127, 0, 0, 1],
+        HeaderMap::new(),
+        "application/cbor",
+        axum::body::Body::from(body),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn session_admission_requires_verified_write_scope_remotely() {
+    let allowed_state = session_test_state(AuthMode::JwtHs256, session_test_policy());
+    let allowed_services = allowed_state.session.clone().expect("session services");
+    let allowed = post_test_session(
+        allowed_state,
+        [203, 0, 113, 20],
+        mint_test_verified_headers("sessions:write", "session-writer"),
+    )
+    .await;
+    assert_eq!(allowed.status(), StatusCode::OK);
+    let session_id: [u8; 16] = hex::decode(
+        allowed
+            .headers()
+            .get("x-cuecrux-session-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("session id header"),
+    )
+    .expect("session id hex")
+    .try_into()
+    .expect("session id length");
+    let entry = allowed_services
+        .registry
+        .get(&session_id)
+        .expect("registry read")
+        .expect("session entry");
+    assert_eq!(entry.admission_principal_key.as_deref().map(str::len), Some(64));
+    assert_ne!(entry.admission_principal_key.as_deref(), Some("session-writer"));
+    assert_eq!(entry.admission_ip_key.as_deref().map(str::len), Some(64));
+    assert_ne!(entry.admission_ip_key.as_deref(), Some("203.0.113.20"));
+
+    let denied = post_test_session(
+        session_test_state(AuthMode::JwtHs256, session_test_policy()),
+        [203, 0, 113, 21],
+        mint_test_verified_headers("query:read", "session-reader"),
+    )
+    .await;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn session_principal_quota_uses_verified_identity_not_ip_or_override() {
+    let mut policy = session_test_policy();
+    policy.max_per_principal = 1;
+    let state = session_test_state(AuthMode::JwtHs256, policy);
+
+    let mut first_headers = mint_test_verified_headers("admin:write", "credential-owner");
+    first_headers.insert(
+        "x-corecrux-passport-id",
+        HeaderValue::from_static("caller-selected-passport-a"),
+    );
+    let first = post_test_session(state.clone(), [203, 0, 113, 30], first_headers).await;
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let mut second_headers = mint_test_verified_headers("admin:write", "credential-owner");
+    second_headers.insert(
+        "x-corecrux-passport-id",
+        HeaderValue::from_static("caller-selected-passport-b"),
+    );
+    let second = post_test_session(state, [203, 0, 113, 31], second_headers).await;
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(second.headers().get(header::RETRY_AFTER).is_some());
+    let body = json_body(second).await;
+    assert_eq!(body["code"], "SESSION_QUOTA_EXCEEDED");
+    assert_eq!(body["quota"], "principal");
+}
+
+#[tokio::test]
+async fn session_ip_and_global_quotas_fail_closed() {
+    let mut ip_policy = session_test_policy();
+    ip_policy.max_per_ip = 1;
+    let ip_state = session_test_state(AuthMode::JwtHs256, ip_policy);
+    let first = post_test_session(
+        ip_state.clone(),
+        [203, 0, 113, 40],
+        mint_test_sub_only_headers("sessions:write", "principal-a"),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let second = post_test_session(
+        ip_state,
+        [203, 0, 113, 40],
+        mint_test_sub_only_headers("sessions:write", "principal-b"),
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body = json_body(second).await;
+    assert_eq!(body["quota"], "ip");
+
+    let mut global_policy = session_test_policy();
+    global_policy.max_total = 1;
+    let global_state = session_test_state(AuthMode::JwtHs256, global_policy);
+    let first = post_test_session(
+        global_state.clone(),
+        [203, 0, 113, 41],
+        mint_test_sub_only_headers("sessions:write", "principal-c"),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let second = post_test_session(
+        global_state,
+        [203, 0, 113, 42],
+        mint_test_sub_only_headers("sessions:write", "principal-d"),
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::INSUFFICIENT_STORAGE);
+    let body = json_body(second).await;
+    assert_eq!(body["code"], "SESSION_CAPACITY_EXCEEDED");
+    assert_eq!(body["resource"], "session registry entries");
+}
+
+#[tokio::test]
+async fn session_body_and_physical_capacity_limits_do_not_mutate_state() {
+    let mut body_policy = session_test_policy();
+    body_policy.max_request_bytes = 1;
+    let body_state = session_test_state(AuthMode::Off, body_policy);
+    let body_services = body_state.session.clone().expect("session services");
+    let oversized = post_test_session(body_state, [127, 0, 0, 1], HeaderMap::new()).await;
+    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(body_services.registry.active_count().unwrap(), 0);
+    assert_eq!(body_services.sealer.storage_bytes().unwrap(), 0);
+
+    let mut registry_policy = session_test_policy();
+    registry_policy.registry_max_bytes = 1;
+    let registry_state = session_test_state(AuthMode::Off, registry_policy);
+    let registry_services = registry_state.session.clone().expect("session services");
+    let exhausted = post_test_session(registry_state, [127, 0, 0, 1], HeaderMap::new()).await;
+    assert_eq!(exhausted.status(), StatusCode::INSUFFICIENT_STORAGE);
+    assert_eq!(registry_services.registry.active_count().unwrap(), 0);
+    assert_eq!(registry_services.sealer.storage_bytes().unwrap(), 0);
+
+    let mut event_policy = session_test_policy();
+    event_policy.event_log_max_bytes = 1;
+    let event_state = session_test_state(AuthMode::Off, event_policy);
+    let event_services = event_state.session.clone().expect("session services");
+    let exhausted = post_test_session(event_state, [127, 0, 0, 1], HeaderMap::new()).await;
+    assert_eq!(exhausted.status(), StatusCode::INSUFFICIENT_STORAGE);
+    assert_eq!(event_services.registry.active_count().unwrap(), 0);
+    assert_eq!(event_services.sealer.storage_bytes().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn concurrent_session_admission_consumes_exactly_one_remaining_slot() {
+    let mut state = mint_test_verified_app_state(16);
+    let mut policy = session_test_policy();
+    policy.max_total = 1;
+    let services = super::session::SessionServices::local_durable(
+        &state.data_dir,
+        "node-concurrent-session-test",
+        "http://127.0.0.1:14800/mcp",
+        policy,
+        [0x5A; 32],
+    )
+    .expect("durable session services");
+    state.session = Some(Arc::new(services));
+
+    let first = post_test_session(
+        state.clone(),
+        [203, 0, 113, 50],
+        mint_test_sub_only_headers("sessions:write", "concurrent-a"),
+    );
+    let second = post_test_session(
+        state.clone(),
+        [203, 0, 113, 51],
+        mint_test_sub_only_headers("sessions:write", "concurrent-b"),
+    );
+    let (first, second) = tokio::join!(first, second);
+    let statuses = [first.status(), second.status()];
+    assert_eq!(statuses.iter().filter(|status| **status == StatusCode::OK).count(), 1);
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::INSUFFICIENT_STORAGE)
+            .count(),
+        1
+    );
+
+    let event_log = std::fs::read_to_string(state.data_dir.join("session-events.jsonl")).expect("session event log");
+    assert_eq!(event_log.lines().count(), 1);
+    let registry_rows = std::fs::read_dir(state.data_dir.join("sessions"))
+        .expect("session registry")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("json"))
+        .count();
+    assert_eq!(registry_rows, 1);
+}
+
 #[tokio::test]
 async fn session_plan_read_through_returns_sealed_v1_plan() {
     let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
@@ -13057,16 +13458,7 @@ async fn session_plan_read_through_returns_sealed_v1_plan() {
         let mut store = state.fact_store.write().await;
         crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed passports");
     }
-    let mut headers = HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    let create_resp = super::session::post_session(
-        State(state.clone()),
-        headers,
-        axum::body::Bytes::from_static(
-            br#"{"client_id":"test-agent","client_version":"0.1.0","accepts":["application/json"],"intent":"audit"}"#,
-        ),
-    )
-    .await;
+    let create_resp = post_test_session(state.clone(), [127, 0, 0, 1], HeaderMap::new()).await;
     assert_eq!(create_resp.status(), StatusCode::OK);
     let session_id = create_resp
         .headers()
@@ -13196,16 +13588,7 @@ async fn invocation_verify_parent_not_found_and_success_paths() {
         1.0
     );
 
-    let mut headers = HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    let create = super::session::post_session(
-        State(state.clone()),
-        headers,
-        axum::body::Bytes::from_static(
-            br#"{"client_id":"test-agent","client_version":"0.1.0","accepts":["application/json"],"intent":"audit"}"#,
-        ),
-    )
-    .await;
+    let create = post_test_session(state.clone(), [127, 0, 0, 1], HeaderMap::new()).await;
     assert_eq!(create.status(), StatusCode::OK);
     let session_id_hex = create
         .headers()

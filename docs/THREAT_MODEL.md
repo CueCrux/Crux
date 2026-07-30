@@ -123,9 +123,18 @@ for the Crux Daemon.
    tokens or hosted-client OAuth introspection is configured. This includes
    server-info GET, SSE stream creation, and JSON-RPC POST; only an MCP daemon
    with neither authentication rail configured permits anonymous access.
-5. Public `/v1/version` is redacted. Full operational version details live at
+5. `POST /session` permits anonymous bootstrap only for a direct loopback
+   caller without forwarded headers. Every proxied, remote, or missing-peer
+   request requires a
+   cryptographically verified `sessions:write` or `admin:write` credential;
+   auth-off and dev-scope assertions are insufficient. Retained per-principal,
+   per-effective-IP, global, registry-byte, request-byte, and append-only
+   event-log bounds fail closed, including when pre-existing durable state is
+   already exhausted at startup. Quota attribution is stored only as
+   daemon-keyed hashes.
+6. Public `/v1/version` is redacted. Full operational version details live at
    `/v1/admin/version` behind `admin:read`.
-6. Public `POST /invocation/verify` is a local structural-integrity check, not
+7. Public `POST /invocation/verify` is a local structural-integrity check, not
    a receipt-authentication or anti-replay service. Its positive result covers
    only the receipt self-hash, parent-plan link, capability, and channel.
    Signature/key ID, session identity, timestamps, input/output evidence,
@@ -167,6 +176,13 @@ Use your reverse proxy (Caddy `rate_limit`, nginx `limit_req`, etc.) for
 route-specific resource protection. `X-Corecrux-Passport-Id` is not trusted as
 a pre-auth rate-limit key; unauthenticated callers cannot rotate it to obtain
 independent buckets.
+
+Session creation adds its own default-on retained-slot and storage ceilings.
+Closed rows remain charged until TTL expiry; expired registry rows are pruned,
+while the sealed-event log stays append-only and stops admission at its hard
+byte cap. This prevents caller-controlled identity, close churn, concurrent
+last-slot races, and unbounded durable growth from turning the public bootstrap
+surface into a storage-exhaustion primitive.
 
 Global request bodies default to 16 MiB. Bulk/import endpoints that need a
 larger envelope have explicit route-specific limits. The console embedding

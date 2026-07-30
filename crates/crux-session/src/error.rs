@@ -45,4 +45,12 @@ pub enum SessionError {
         expected: usize,
         actual: usize,
     },
+
+    #[error("{resource} capacity exceeded: limit={limit} current={current} attempted={attempted}")]
+    Capacity {
+        resource: &'static str,
+        limit: u64,
+        current: u64,
+        attempted: u64,
+    },
 }

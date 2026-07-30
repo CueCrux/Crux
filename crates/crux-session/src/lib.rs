@@ -62,6 +62,8 @@ pub use plan::{
     INVOCATION_RECEIPT_VERSION, SESSION_PLAN_VERSION,
 };
 pub use receipt::{plan_receipt_hash, verify_plan_signature, InvocationReceipt};
-pub use registry::{FileSessionRegistry, InMemoryRegistry, RegistryEntry, RegistryError, SessionRegistry};
+pub use registry::{
+    AdmissionUsage, FileSessionRegistry, InMemoryRegistry, PruneReport, RegistryEntry, RegistryError, SessionRegistry,
+};
 pub use sealer::{FailingSealer, FileSealer, InMemorySealer, NoopSealer, PlanSealer, SealedEvent, StoredEvent};
 pub use signer::{InProcessEd25519Signer, NullSigner, PlanSigner, Signed};
