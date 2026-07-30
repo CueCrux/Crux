@@ -447,6 +447,18 @@ pub fn flush_interval_secs() -> u64 {
 /// is span volume is the plan's Constraint 1, and this is the limit that
 /// actually holds the cost line.
 pub fn tenant_ceiling() -> usize {
+    // Tests override this per-thread rather than through the process environment.
+    // The ceiling is read by every `append_resolved`, so an env-based override is
+    // shared mutable state across a 2000-plus-test binary: a test that pins a low
+    // ceiling silently truncates any *other* test appending more spans than that,
+    // wherever it happens to be running. `serial_test` only orders tests that opt
+    // in, which leaves every un-marked reader exposed and makes correctness a
+    // matter of remembering to annotate. A thread-local is isolated by
+    // construction, so no test has to opt into anything.
+    #[cfg(test)]
+    if let Some(override_ceiling) = tests::ceiling_override() {
+        return override_ceiling.max(1);
+    }
     std::env::var(TRACE_TENANT_CEILING_ENV)
         .ok()
         .and_then(|v| v.parse().ok())
@@ -815,13 +827,45 @@ mod tests {
     // Repo count is what the customer buys; span volume is what costs money.
     // This is the limit that actually holds the cost line.
 
+    thread_local! {
+        /// Per-thread tenant-ceiling override, read by [`super::tenant_ceiling`].
+        static CEILING_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
+
+    pub(super) fn ceiling_override() -> Option<usize> {
+        CEILING_OVERRIDE.with(std::cell::Cell::get)
+    }
+
+    /// Pins the tenant ceiling for one test, on this thread only, and clears it on
+    /// drop — including on panic.
+    ///
+    /// Thread-local rather than `set_var`, so a low ceiling cannot truncate an
+    /// unrelated test appending spans on another thread. Clearing on drop matters
+    /// independently: a bare `set_var` … `remove_var` pair leaks its value to
+    /// everything that runs afterwards if an assertion between the two fails,
+    /// turning one real failure into a cascade of unrelated ones.
+    struct CeilingGuard;
+
+    impl CeilingGuard {
+        fn set(value: usize) -> Self {
+            CEILING_OVERRIDE.with(|c| c.set(Some(value)));
+            Self
+        }
+    }
+
+    impl Drop for CeilingGuard {
+        fn drop(&mut self) {
+            CEILING_OVERRIDE.with(|c| c.set(None));
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn at_the_ceiling_new_spans_are_refused_and_retained_ones_survive() {
         // The defining property: containment must not be achieved by deletion.
         // A customer at the ceiling loses new capture, not the history their
         // answers have been coming from.
-        std::env::set_var(TRACE_TENANT_CEILING_ENV, "3");
+        let _ceiling = CeilingGuard::set(3);
         let dir = tempfile::tempdir().unwrap();
         let store = TraceStore::open(dir.path().join("s.jsonl"), 1_000_000).unwrap();
 
@@ -843,7 +887,6 @@ mod tests {
             kept.iter().all(|s| s.span.name == "a"),
             "the ORIGINAL spans must survive; refusing new must not evict old"
         );
-        std::env::remove_var(TRACE_TENANT_CEILING_ENV);
     }
 
     #[test]
@@ -852,7 +895,7 @@ mod tests {
         // A noisy neighbour must not exhaust a quiet tenant's headroom — the
         // ceiling is per account, which is the whole point of it being a margin
         // guard rather than a global disk valve.
-        std::env::set_var(TRACE_TENANT_CEILING_ENV, "2");
+        let _ceiling = CeilingGuard::set(2);
         let dir = tempfile::tempdir().unwrap();
         let store = TraceStore::open(dir.path().join("s.jsonl"), 1_000_000).unwrap();
 
@@ -865,7 +908,6 @@ mod tests {
         assert_eq!(rq.refused_over_ceiling, 0, "quiet tenant keeps its own headroom");
         assert_eq!(store.load_for_tenant("quiet").unwrap().len(), 1);
         assert_eq!(store.load_for_tenant("noisy").unwrap().len(), 2);
-        std::env::remove_var(TRACE_TENANT_CEILING_ENV);
     }
 
     #[test]
@@ -873,7 +915,7 @@ mod tests {
     fn volume_warns_before_it_bites() {
         // "Visible to the customer before it bites" is the gate. A limit whose
         // first signal is missing data is a support ticket, not a limit.
-        std::env::set_var(TRACE_TENANT_CEILING_ENV, "10");
+        let _ceiling = CeilingGuard::set(10);
         let dir = tempfile::tempdir().unwrap();
         let store = TraceStore::open(dir.path().join("s.jsonl"), 1_000_000).unwrap();
 
@@ -886,7 +928,6 @@ mod tests {
         assert_eq!(v.pct_of_ceiling, 80);
         assert!(v.approaching, "80% must warn");
         assert!(!v.at_ceiling, "80% is not yet the limit — warning precedes refusal");
-        std::env::remove_var(TRACE_TENANT_CEILING_ENV);
     }
 
     #[test]
@@ -894,7 +935,7 @@ mod tests {
     fn a_partially_full_batch_admits_what_fits() {
         // Containment is per span, not per batch: a batch that straddles the
         // ceiling stores the part that fits rather than discarding all of it.
-        std::env::set_var(TRACE_TENANT_CEILING_ENV, "4");
+        let _ceiling = CeilingGuard::set(4);
         let dir = tempfile::tempdir().unwrap();
         let store = TraceStore::open(dir.path().join("s.jsonl"), 1_000_000).unwrap();
 
@@ -902,7 +943,6 @@ mod tests {
         let r = store.append_resolved(batch, None, "t1").unwrap();
         assert_eq!(r.refused_over_ceiling, 2);
         assert_eq!(store.load_for_tenant("t1").unwrap().len(), 4);
-        std::env::remove_var(TRACE_TENANT_CEILING_ENV);
     }
 
     // ── M6: retention and release-over-release history ──────────────────────
