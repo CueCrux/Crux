@@ -3,8 +3,9 @@
 How the Crux Daemon is tested, how coverage is measured and gated, and an honest
 account of why the gated number sits where it does.
 
-> **Snapshot (2026-06-18, `main`):** **4,489** test functions; **86.97%** gated
-> region coverage. CI is the source of truth — the live numbers are printed in
+> **Snapshot (2026-07-30, `main`):** **6,317** test functions; **88.49%** gated
+> region coverage (ungated, whole tree: **87.20%**).
+> CI is the source of truth — the live numbers are printed in
 > the [Coverage job](../.github/workflows/ci.yml) of every run and attested by
 > [`coverage-attestation.yml`](../.github/workflows/coverage-attestation.yml).
 
@@ -107,10 +108,21 @@ This is the honest part. 86.97% is what an *accurate* gate over the
    exhaustive error/IO-branch fan-out, not the invariants (see
    [`docs/agent/INVARIANTS.md`](agent/INVARIANTS.md)).
 
-2. **`corecruxd` is an ~87k-LOC surface.** Most handlers are covered, but a few
-   newer ones (`http/events.rs`, `http/infra.rs`, `http/policy.rs`) are still at
-   0% — they are *gated* (not excluded), so they are visible debt and natural
-   next targets, not hidden.
+2. **`corecruxd` is an ~87k-LOC surface.** Most handlers are covered. The three
+   that this doc previously recorded at 0% — `http/events.rs`, `http/infra.rs`,
+   `http/policy.rs` — were closed on 2026-07-30 and now sit at **95.4%**,
+   **98.8%** and **98.7%** region coverage respectively. They were *gated* (not
+   excluded) throughout, which is why they showed up as debt rather than
+   staying hidden. Remaining `corecruxd` debt is tracked per-file in the
+   Coverage job log.
+
+   A related trap worth knowing: **no CI job runs `cargo test -- --ignored`**, so
+   an `#[ignore]`d test contributes nothing to the gate. Two exist today —
+   `sse_session_survives_30s_idle` (>35s wall clock) and `witness_submit`'s live
+   Rekor probe. Both are ignored for good reasons, but the SSE endpoint's
+   *only* test was one of them, which is how a whole handler sat at 0% while
+   looking tested. Prefer a fast handler-level test alongside any long-running
+   or network-dependent one.
 
 3. **The denominator includes the test code itself.** `#[cfg(test)]` regions
    count toward the total, so each new test batch raises coverage by less than
