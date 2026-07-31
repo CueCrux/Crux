@@ -494,8 +494,13 @@ const ACTIVATE_HTML: &str = r#"<!doctype html>
 <script>
 var ADD_NEW = '__add_new__';
 function el(id) { return document.getElementById(id); }
+function isAddNewSelected() {
+  var select = el('tenant_sel');
+  var option = select.options[select.selectedIndex];
+  return Boolean(option && option.dataset.tenantAction === 'add');
+}
 function onTenantChange() {
-  var add = el('tenant_sel').value === ADD_NEW;
+  var add = isAddNewSelected();
   el('newrow').classList.toggle('show', add);
   if (add) el('tenant_new').focus();
 }
@@ -511,16 +516,26 @@ async function loadTenants() {
     if (r.redirected || !r.ok || ct.indexOf('application/json') < 0) { showSignin(); return; }
     var j = await r.json();
     var list = (j.tenants || (Array.isArray(j) ? j : [])).map(function (t) { return typeof t === 'string' ? t : t.tenant_id; }).filter(Boolean);
-    var html = list.length ? '' : '<option value="" disabled selected>No tenants yet — add one</option>';
-    list.forEach(function (t) { html += '<option value="' + t + '">' + t + '</option>'; });
-    html += '<option value="' + ADD_NEW + '">+ Add new tenant…</option>';
-    el('tenant_sel').innerHTML = html;
+    var select = el('tenant_sel');
+    select.replaceChildren();
+    if (!list.length) appendTenantOption(select, '', 'No tenants yet — add one', true, true, false);
+    list.forEach(function (t) { appendTenantOption(select, t, t, false, false, false); });
+    appendTenantOption(select, ADD_NEW, '+ Add new tenant…', false, false, true);
     onTenantChange();
   } catch (e) { showSignin(); }
 }
+function appendTenantOption(select, value, label, disabled, selected, addNew) {
+  var option = document.createElement('option');
+  option.value = value;
+  option.textContent = label;
+  option.disabled = disabled;
+  option.selected = selected;
+  if (addNew) option.dataset.tenantAction = 'add';
+  select.appendChild(option);
+}
 function currentTenant() {
   var v = el('tenant_sel').value;
-  return v === ADD_NEW ? el('tenant_new').value.trim() : v;
+  return isAddNewSelected() ? el('tenant_new').value.trim() : v;
 }
 async function decide(deny) {
   var out = el('result'), a = el('approve_btn'), d = el('deny_btn');
@@ -620,9 +635,9 @@ fn resolve_dev_html_path(base: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_console_body, BROWSER_SECURITY_HEADERS, CONSOLE_DEV_PATH_ENV, CONSOLE_V2_API_JS, CONSOLE_V2_HTML,
-        CONSOLE_V2_ICON_SVG, CONSOLE_V2_LINKGRAPH_MJS, CONSOLE_V2_MANIFEST, CONSOLE_V2_PAGES_JS, CONSOLE_V2_RENDER_JS,
-        CONSOLE_V2_SW_JS, CONTENT_SECURITY_POLICY,
+        resolve_console_body, ACTIVATE_HTML, BROWSER_SECURITY_HEADERS, CONSOLE_DEV_PATH_ENV, CONSOLE_V2_API_JS,
+        CONSOLE_V2_HTML, CONSOLE_V2_ICON_SVG, CONSOLE_V2_LINKGRAPH_MJS, CONSOLE_V2_MANIFEST, CONSOLE_V2_PAGES_JS,
+        CONSOLE_V2_RENDER_JS, CONSOLE_V2_SW_JS, CONTENT_SECURITY_POLICY,
     };
     use std::sync::Mutex;
 
@@ -836,6 +851,58 @@ mod tests {
         assert!(
             output.status.success(),
             "console/v2/smoke.cjs failed (exit {:?}):\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
+    fn activate_tenant_options_are_text_only() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        assert!(
+            !ACTIVATE_HTML.contains("innerHTML"),
+            "/activate must not parse tenant-controlled values as HTML"
+        );
+        for required in [
+            "document.createElement('option')",
+            "option.textContent = label",
+            "select.replaceChildren()",
+        ] {
+            assert!(
+                ACTIVATE_HTML.contains(required),
+                "/activate safe option construction is missing: {required}"
+            );
+        }
+
+        let Some(node) = find_node() else {
+            eprintln!(
+                "SKIP activate_tenant_options_are_text_only runtime smoke: `node` not found on PATH. \
+                 The structural no-innerHTML assertion still ran; install node to exercise hostile \
+                 tenant values against the mock DOM."
+            );
+            return;
+        };
+        let smoke = concat!(env!("CARGO_MANIFEST_DIR"), "/console/activate-dom-smoke.cjs");
+        let mut child = Command::new(node)
+            .arg(smoke)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|err| panic!("failed to spawn node for the /activate DOM smoke: {err}"));
+        child
+            .stdin
+            .take()
+            .expect("node smoke stdin")
+            .write_all(ACTIVATE_HTML.as_bytes())
+            .expect("write /activate HTML to node smoke");
+        let output = child.wait_with_output().expect("wait for /activate DOM smoke");
+        assert!(
+            output.status.success(),
+            "console/activate-dom-smoke.cjs failed (exit {:?}):\n--- stdout ---\n{}\n--- stderr ---\n{}",
             output.status.code(),
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
