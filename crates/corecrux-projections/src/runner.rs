@@ -165,6 +165,38 @@ impl ProjectionStoreV1 {
         let mut dependents_block_locs: BTreeMap<[u8; 32], ColdBlockLocV1> = BTreeMap::new();
         let mut ok = true;
 
+        // A snapshot that meta DECLARES but that is absent on disk must reset
+        // to genesis exactly as a corrupt one does. The `.filter(|_|
+        // …exists())` guards below skip the whole verification block when the
+        // file is gone, which left `ok = true`: the store was returned with
+        // the cursor intact and the state empty, so the next `tick` resumed
+        // past frames it had never applied. A deleted snapshot is silent data
+        // loss; it must not read the same as a clean load.
+        for (declared, path) in [
+            (
+                meta.artifact_living_state.snapshot_blake3.is_some(),
+                &files.living_snapshot_path,
+            ),
+            (
+                meta.artifact_relations.snapshot_blake3.is_some(),
+                &files.relations_snapshot_path,
+            ),
+            (
+                meta.artifact_dependents.snapshot_blake3.is_some(),
+                &files.dependents_snapshot_path,
+            ),
+            (
+                meta.pressure_events.snapshot_blake3.is_some(),
+                &files.pressure_snapshot_path,
+            ),
+        ] {
+            // This crate carries no logger by design; the genesis reset below
+            // is itself the signal, and `tick` re-derives the state.
+            if declared && !path.exists() {
+                ok = false;
+            }
+        }
+
         // Treat meta as source of truth; ignore snapshots whose blake3 doesn't match.
         if let Some(h) = meta
             .artifact_living_state
@@ -2018,6 +2050,103 @@ mod tests {
         // Second load should succeed (idempotent)
         let store2 = ProjectionStoreV1::load_or_init(&shard_dir, 1, 1).unwrap();
         assert_eq!(store2.shard_id, 1);
+    }
+
+    /// D-6 (inverted pin): when meta records a `snapshotBlake3` and an
+    /// advanced cursor but the snapshot FILE is gone, the
+    /// `.filter(|_| …exists())` guard skipped the whole verification block and
+    /// left `ok = true`. The store came back with the cursor intact and the
+    /// state empty, so the next `tick` resumed past frames it had never
+    /// applied. A *corrupt* snapshot already reset to genesis correctly; a
+    /// *deleted* one must too.
+    #[test]
+    fn load_or_init_missing_snapshot_file_resets_to_genesis() {
+        let tmp = TempDir::new().unwrap();
+        let shard_dir = tmp.path().join("shard-0001");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        let files = ProjectionFilesV1::for_shard_dir(&shard_dir);
+        std::fs::create_dir_all(&files.projections_dir).unwrap();
+
+        let mut meta = crate::meta::ProjectionsMetaV1::empty_now();
+        meta.commit_id = 12;
+        meta.artifact_living_state.snapshot_blake3 = Some("d".repeat(64));
+        meta.artifact_living_state.row_count = 500;
+        meta.artifact_living_state.cursor = Some(ProjectionCursorV1 {
+            shard_id: 1,
+            epoch: 1,
+            segment_seq: 7,
+            offset: 4_096,
+        });
+        store_projections_meta_v1(&files.meta_path, &meta).unwrap();
+        assert!(!files.living_snapshot_path.exists());
+
+        let store = ProjectionStoreV1::load_or_init(&shard_dir, 1, 1).unwrap();
+        assert!(store.state.living.is_empty(), "no rows were loaded");
+        assert_eq!(store.meta.commit_id, 0, "meta is reset alongside the empty state");
+        assert!(
+            store.cursor_from_meta().is_none(),
+            "the cursor must not survive a snapshot that could not be verified"
+        );
+    }
+
+    /// Same defect, sibling artifacts: a declared-but-absent relations,
+    /// dependents or pressure snapshot resets too.
+    #[test]
+    fn load_or_init_missing_sibling_snapshots_also_reset_to_genesis() {
+        for artifact in ["relations", "dependents", "pressure"] {
+            let tmp = TempDir::new().unwrap();
+            let shard_dir = tmp.path().join("shard-0001");
+            std::fs::create_dir_all(&shard_dir).unwrap();
+            let files = ProjectionFilesV1::for_shard_dir(&shard_dir);
+            std::fs::create_dir_all(&files.projections_dir).unwrap();
+
+            let mut meta = crate::meta::ProjectionsMetaV1::empty_now();
+            meta.commit_id = 9;
+            meta.artifact_living_state.cursor = Some(ProjectionCursorV1 {
+                shard_id: 1,
+                epoch: 1,
+                segment_seq: 3,
+                offset: 64,
+            });
+            match artifact {
+                "relations" => meta.artifact_relations.snapshot_blake3 = Some("a".repeat(64)),
+                "dependents" => meta.artifact_dependents.snapshot_blake3 = Some("b".repeat(64)),
+                _ => meta.pressure_events.snapshot_blake3 = Some("c".repeat(64)),
+            }
+            store_projections_meta_v1(&files.meta_path, &meta).unwrap();
+
+            let store = ProjectionStoreV1::load_or_init(&shard_dir, 1, 1).unwrap();
+            assert_eq!(store.meta.commit_id, 0, "{artifact}: meta is reset");
+            assert!(
+                store.cursor_from_meta().is_none(),
+                "{artifact}: the cursor must not survive"
+            );
+        }
+    }
+
+    /// Control: a meta that declares no snapshot at all is a clean cold start,
+    /// not a reset. The fix must fire only on *declared but absent*.
+    #[test]
+    fn load_or_init_without_a_declared_snapshot_keeps_its_cursor() {
+        let tmp = TempDir::new().unwrap();
+        let shard_dir = tmp.path().join("shard-0001");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        let files = ProjectionFilesV1::for_shard_dir(&shard_dir);
+        std::fs::create_dir_all(&files.projections_dir).unwrap();
+
+        let mut meta = crate::meta::ProjectionsMetaV1::empty_now();
+        meta.commit_id = 4;
+        meta.artifact_living_state.cursor = Some(ProjectionCursorV1 {
+            shard_id: 1,
+            epoch: 1,
+            segment_seq: 2,
+            offset: 128,
+        });
+        store_projections_meta_v1(&files.meta_path, &meta).unwrap();
+
+        let store = ProjectionStoreV1::load_or_init(&shard_dir, 1, 1).unwrap();
+        assert_eq!(store.meta.commit_id, 4);
+        assert_eq!(store.cursor_from_meta().expect("cursor survives").segment_seq, 2);
     }
 
     // ── write_atomic: empty data ────────────────────────────────────

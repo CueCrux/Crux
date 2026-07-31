@@ -178,7 +178,26 @@ pub fn execute(options: &IngestOptions) -> Result<IngestReport, DynErr> {
         .ok()
         .filter(|value| !value.trim().is_empty());
     for (index, request) in requests.iter().enumerate() {
+        let sent_documents = request.documents.len();
+        let sent_chunks: usize = request.documents.iter().map(|document| document.chunks.len()).sum();
         let response = post_request(&options.daemon_url, token.as_deref(), request)?;
+        // Reconcile sent against acknowledged. A 202 carrying `ingested: 0`
+        // for a two-document batch used to be copied straight into the report,
+        // which then claimed `files_ingested: 2, documents_sealed: 0` and
+        // returned `Ok`. `openclaw::import_run` in this crate already compares
+        // the two sides; this is the same shape.
+        if response.documents != sent_documents || response.ingested != sent_chunks {
+            return Err(format!(
+                "ingest batch {}/{} was accepted but the daemon acknowledged {} documents / {} chunks against {sent_documents} documents / {sent_chunks} chunks sent; \
+                 {} documents sealed in earlier batches",
+                index + 1,
+                requests.len(),
+                response.documents,
+                response.ingested,
+                report.documents_sealed,
+            )
+            .into());
+        }
         report.documents_sealed += response.documents;
         report.seals.push(BatchSeal {
             batch: index + 1,
@@ -905,6 +924,26 @@ mod tests {
         }
     }
 
+    // ── D-9: sent-vs-acknowledged reconciliation ──────────────────────────
+
+    fn two_document_corpus() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("a.txt"), "alpha body text\n").expect("a.txt");
+        std::fs::write(tmp.path().join("b.txt"), "beta body text\n").expect("b.txt");
+        tmp
+    }
+
+    fn options_for(dir: &Path, port: u16) -> IngestOptions {
+        IngestOptions {
+            path: dir.to_path_buf(),
+            tenant: "local".to_string(),
+            corpus: "docs".to_string(),
+            daemon_url: format!("http://127.0.0.1:{port}"),
+            dry_run: false,
+            embed: false,
+        }
+    }
+
     /// Parse the JSON body out of a captured raw request (`ureq` pretty-prints
     /// `send_json` bodies, so match on structure rather than raw substrings).
     fn body_json(raw: &str) -> serde_json::Value {
@@ -1372,5 +1411,83 @@ mod tests {
         opts.embed = true;
         let report = execute(&opts).unwrap();
         assert!(!report.embedded, "embedding is suppressed on a dry run");
+    }
+
+    /// D-9: `execute` copied the daemon's counts into its report without
+    /// comparing them to what it sent. A 202 carrying `ingested: 0` for a
+    /// two-document batch returned `Ok` with `files_ingested: 2,
+    /// documents_sealed: 0` — the operator was told the ingest succeeded and
+    /// nothing recorded that the documents never landed.
+    #[test]
+    fn an_acknowledged_zero_count_is_an_error_not_a_successful_report() {
+        let tmp = two_document_corpus();
+        let body = serde_json::json!({
+            "ingested": 0,
+            "documents": 0,
+            "frame_count": 0,
+            "sealed": true,
+            "segment_seq": 1,
+            "receipt_id": null,
+            "dense_vectors": 0,
+            "dense_dim": null,
+        })
+        .to_string();
+        let (port, handle) = crate::test_support::serve_responses(vec![(202, body)]);
+
+        let err = execute(&options_for(tmp.path(), port)).expect_err("a zero acknowledgement must not read as success");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("acknowledged 0 documents") && msg.contains("2 documents"),
+            "the error names both sides of the reconciliation: {msg}"
+        );
+        let _ = handle.join();
+    }
+
+    /// A partial acknowledgement is caught the same way — one of two documents
+    /// landing is not a success.
+    #[test]
+    fn a_partial_acknowledgement_is_an_error() {
+        let tmp = two_document_corpus();
+        let body = serde_json::json!({
+            "ingested": 1,
+            "documents": 1,
+            "frame_count": 1,
+            "sealed": true,
+            "segment_seq": 1,
+            "receipt_id": null,
+            "dense_vectors": 0,
+            "dense_dim": null,
+        })
+        .to_string();
+        let (port, handle) = crate::test_support::serve_responses(vec![(202, body)]);
+
+        let err =
+            execute(&options_for(tmp.path(), port)).expect_err("a partial acknowledgement must not read as success");
+        assert!(err.to_string().contains("acknowledged 1 documents"), "{err}");
+        let _ = handle.join();
+    }
+
+    /// Control: a matching acknowledgement still reports success.
+    #[test]
+    fn a_matching_acknowledgement_reports_success() {
+        let tmp = two_document_corpus();
+        let body = serde_json::json!({
+            "ingested": 2,
+            "documents": 2,
+            "frame_count": 2,
+            "sealed": true,
+            "segment_seq": 1,
+            "receipt_id": "abc",
+            "dense_vectors": 0,
+            "dense_dim": null,
+        })
+        .to_string();
+        let (port, handle) = crate::test_support::serve_responses(vec![(202, body)]);
+
+        let report = execute(&options_for(tmp.path(), port)).expect("matching counts succeed");
+        assert_eq!(report.files_ingested, 2);
+        assert_eq!(report.documents_sealed, 2);
+        assert_eq!(report.seals.len(), 1);
+        let _ = handle.join();
     }
 }
